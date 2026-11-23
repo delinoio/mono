@@ -30,9 +30,9 @@ import {
   OrganizationService,
 } from "@delino/ownsand-protos/v1/organization_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
-import { QueryClient } from "@tanstack/react-query";
+import { focusManager, QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
-import { createQueryClient } from "./api.ts";
+import { createQueryClient, invalidateServices } from "./api.ts";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { shortIdText } from "./components/ui.tsx";
@@ -335,6 +335,121 @@ describe("organizations", () => {
       screen.queryByText("Some organizations are not shown yet."),
     ).toBeNull();
     expect(state.tokens).toEqual(["", "page-2", "page-2"]);
+  });
+
+  /**
+   * Moves the focus away from the window and back, as a user does when they
+   * switch to another tab and return. React Query refetches a stale entry
+   * that has an observer when the focus returns.
+   */
+  async function refocusWindow() {
+    try {
+      await act(async () => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await settle(60);
+    } finally {
+      focusManager.setFocused(undefined);
+    }
+  }
+
+  test("does not request the failed page again when the window regains focus", async () => {
+    const { transport, state } = await pagedOrganizations([
+      [MOCK_IDS.acme],
+      [MOCK_IDS.northwind],
+    ]);
+    state.failPage = 2;
+    // The test client keeps no data fresh, so the focus refetches the entry
+    // unless the hook pauses it.
+    renderConsole("/", { transport });
+    expect(
+      await screen.findByText("Some organizations are not shown yet."),
+    ).toBeTruthy();
+    // The control plane would answer page 2 now, so a request that the
+    // console sends on its own would show Northwind Labs.
+    state.failPage = undefined;
+    await refocusWindow();
+    expect(state.tokens).toEqual(["", "page-2"]);
+    expect(screen.getByRole("link", { name: /Acme Robotics/ })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Northwind Labs/ })).toBeNull();
+    expect(
+      screen.getByText("Some organizations are not shown yet."),
+    ).toBeTruthy();
+    // Only the explicit retry requests the page, and it continues from the
+    // last loaded page.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    });
+    expect(
+      await screen.findByRole("link", { name: /Northwind Labs/ }),
+    ).toBeTruthy();
+    expect(state.tokens).toEqual(["", "page-2", "page-2"]);
+  });
+
+  test("retries the failed page from the switcher after the window regained focus", async () => {
+    const { transport, state } = await pagedOrganizations([
+      [MOCK_IDS.acme],
+      [MOCK_IDS.northwind],
+    ]);
+    state.failPage = 2;
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("combobox", { name: "Organization" }),
+      );
+    });
+    const retryOption = await screen.findByRole("option", {
+      name: /Some organizations did not load/,
+    });
+    state.failPage = undefined;
+    await refocusWindow();
+    expect(state.tokens).toEqual(["", "page-2"]);
+    expect(
+      screen.getByRole("option", { name: /Some organizations did not load/ }),
+    ).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(retryOption);
+    });
+    await settle(60);
+    expect(state.tokens).toEqual(["", "page-2", "page-2"]);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("combobox", { name: "Organization" }));
+    });
+    expect(
+      await screen.findByRole("option", { name: "Northwind Labs" }),
+    ).toBeTruthy();
+  });
+
+  test("refreshes the organizations from the first page after an invalidation that follows a failed page", async () => {
+    const { transport, state } = await pagedOrganizations([
+      [MOCK_IDS.acme],
+      [MOCK_IDS.northwind],
+    ]);
+    state.failPage = 2;
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    renderConsole("/", { transport, queryClient });
+    await screen.findByText("Some organizations are not shown yet.");
+    state.failPage = undefined;
+    await refocusWindow();
+    expect(state.tokens).toEqual(["", "page-2"]);
+    // A mutation of the OrganizationService invalidates the entry; the
+    // refetch starts at the first page and then follows the token.
+    await act(async () => {
+      await invalidateServices(queryClient, OrganizationService);
+    });
+    expect(
+      await screen.findByRole("link", { name: /Northwind Labs/ }),
+    ).toBeTruthy();
+    expect(state.tokens).toEqual(["", "page-2", "", "page-2"]);
+    expect(
+      screen.queryByText("Some organizations are not shown yet."),
+    ).toBeNull();
   });
 
   test("opens an organization's sandboxes and hides ended sandboxes by default", async () => {
