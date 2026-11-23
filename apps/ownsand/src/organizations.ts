@@ -3,43 +3,13 @@ import { useInfiniteQuery } from "@connectrpc/connect-query";
 import type { ConnectError } from "@connectrpc/connect";
 import type { Organization } from "@delino/ownsand-protos/v1/organization_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
-import { useCallback, useEffect, useMemo } from "react";
+import { useMemo } from "react";
 import { LIST_ORGANIZATIONS_REQUEST } from "./api.ts";
-
-/** The part of a cached query that tells which request failed. */
-interface QueryRequestState {
-  state: {
-    status: string;
-    fetchMeta: { fetchMore?: { direction: string } } | null;
-  };
-}
-
-/**
- * Whether the last request of the query failed on a later page.
- *
- * This is the state that `isFetchNextPageError` of the observer reports, but
- * read from the cached query, so an automatic refetch can ask it before it
- * starts.
- */
-function lastRequestFailedOnLaterPage(query: QueryRequestState): boolean {
-  return (
-    query.state.status === "error" &&
-    query.state.fetchMeta?.fetchMore?.direction === "forward"
-  );
-}
-
-/**
- * Lets React Query refetch the entry on its own trigger (window focus,
- * reconnect, mount of an observer) unless a later page failed.
- *
- * A refetch that succeeds reads the first page again and clears the error
- * flag, so the continuation effect of `useOrganizations` would then request
- * the failed page without the user's retry. Returning false keeps the flag
- * and the loaded pages until `retryLoadMore` or an invalidation runs.
- */
-function refetchUnlessLaterPageFailed(query: QueryRequestState): boolean {
-  return !lastRequestFailedOnLaterPage(query);
-}
+import {
+  FOLLOW_ALL_PAGES_OPTIONS,
+  uniqueRows,
+  useFollowAllPages,
+} from "./pagination.ts";
 
 /** The organizations of the caller, as the organization list and the switcher show them. */
 export interface OrganizationsResult {
@@ -87,48 +57,29 @@ export function useOrganizations(): OrganizationsResult {
     OrganizationService.method.listOrganizations,
     LIST_ORGANIZATIONS_REQUEST,
     {
-      pageParamKey: "pageToken",
+      ...FOLLOW_ALL_PAGES_OPTIONS,
       getNextPageParam: (last) => last.nextPageToken || undefined,
-      refetchOnWindowFocus: refetchUnlessLaterPageFailed,
-      refetchOnReconnect: refetchUnlessLaterPageFailed,
-      refetchOnMount: refetchUnlessLaterPageFailed,
     },
   );
-  const { data, hasNextPage, isFetching, isFetchNextPageError, fetchNextPage } =
-    query;
+  const pages = useFollowAllPages(query);
+  const { data } = query;
 
-  // Two surfaces observe the entry, and both run this effect in the same
-  // commit. `cancelRefetch: false` joins the request that is in flight
-  // instead of cancelling it and sending the same page again.
-  useEffect(() => {
-    if (hasNextPage && !isFetching && !isFetchNextPageError) {
-      void fetchNextPage({ cancelRefetch: false });
-    }
-  }, [hasNextPage, isFetching, isFetchNextPageError, fetchNextPage]);
-
-  const organizations = useMemo(() => {
-    // A membership change between two page requests can repeat an
-    // organization on the boundary; keep one row for each.
-    const byId = new Map<string, Organization>();
-    for (const page of data?.pages ?? []) {
-      for (const org of page.organizations) byId.set(org.organizationId, org);
-    }
-    return [...byId.values()];
-  }, [data]);
-
-  const retryLoadMore = useCallback(() => {
-    void fetchNextPage({ cancelRefetch: false });
-  }, [fetchNextPage]);
+  // A membership change between two page requests can repeat an
+  // organization on the boundary; keep one row for each.
+  const organizations = useMemo(
+    () =>
+      uniqueRows(
+        data?.pages.map((page) => page.organizations) ?? [],
+        (org) => org.organizationId,
+      ),
+    [data],
+  );
 
   return {
     organizations,
     isPending: query.isPending,
     isLoaded: data !== undefined,
-    error: isFetchNextPageError ? null : query.error,
-    isIncomplete: data !== undefined && hasNextPage,
-    isLoadingMore: query.isFetchingNextPage,
-    loadMoreError: isFetchNextPageError ? query.error : null,
-    retryLoadMore,
+    ...pages,
     refetch: () => query.refetch(),
   };
 }
