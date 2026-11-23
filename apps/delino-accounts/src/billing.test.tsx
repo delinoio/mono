@@ -272,6 +272,108 @@ describe("billing accounts", () => {
       expect.objectContaining({ name: "Acme Labs" }),
     ]);
   });
+
+  /** Renames the account in the fake API, like another member would. */
+  function renameElsewhere(api: ReturnType<typeof createFakeApi>, to: string) {
+    api.accounts.get(ACCOUNT_ID)!.name = to;
+  }
+
+  /** The Billing account name field of the Settings tab. */
+  function nameField() {
+    return screen.getByRole("textbox", {
+      name: "Billing account name",
+    }) as HTMLInputElement;
+  }
+
+  test("an unedited name field and the header follow a refetched account name", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    expect(nameField().value).toBe("Acme Robotics");
+
+    renameElsewhere(api, "Beta");
+    await refocus();
+
+    expect(
+      await screen.findByRole("heading", { name: "Beta", level: 1 }),
+    ).toBeTruthy();
+    expect(nameField().value).toBe("Beta");
+    await click(
+      within(nameField().closest("form")!).getByRole("button", {
+        name: "Save",
+      }),
+    );
+    await settle(60);
+    expect(calls(api, "UpdateBillingAccount")).toEqual([
+      expect.objectContaining({ name: "Beta" }),
+    ]);
+  });
+
+  test("the read-only name field of a viewer follows a refetched account name", async () => {
+    const { api } = await renderAccount(VIEWER);
+    await openTab("Settings");
+    expect(nameField().disabled).toBe(true);
+
+    renameElsewhere(api, "Beta");
+    await refocus();
+
+    expect(nameField().value).toBe("Beta");
+    expect(nameField().disabled).toBe(true);
+  });
+
+  test("a refetch keeps an unsaved name edit and a later save sends it", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    await type(nameField(), "Draft");
+
+    renameElsewhere(api, "Beta");
+    await refocus();
+
+    expect(
+      await screen.findByRole("heading", { name: "Beta", level: 1 }),
+    ).toBeTruthy();
+    expect(nameField().value).toBe("Draft");
+    await click(
+      within(nameField().closest("form")!).getByRole("button", {
+        name: "Save",
+      }),
+    );
+    await settle(60);
+    expect(calls(api, "UpdateBillingAccount")).toEqual([
+      expect.objectContaining({ name: "Draft" }),
+    ]);
+  });
+
+  test("a failed name save keeps the edit for a retry, then the field follows the saved name", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    await type(nameField(), "  Gamma  ");
+    const save = () =>
+      click(
+        within(nameField().closest("form")!).getByRole("button", {
+          name: "Save",
+        }),
+      );
+    api.failNext.set("UpdateBillingAccount", BACKGROUND_FAILURE);
+    await save();
+    await settle(60);
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(nameField().value).toBe("  Gamma  ");
+
+    await save();
+    await settle(60);
+    expect(calls(api, "UpdateBillingAccount")).toEqual([
+      expect.objectContaining({ name: "Gamma" }),
+      expect.objectContaining({ name: "Gamma" }),
+    ]);
+    expect(
+      await screen.findByRole("heading", { name: "Gamma", level: 1 }),
+    ).toBeTruthy();
+    expect(nameField().value).toBe("Gamma");
+
+    renameElsewhere(api, "Beta");
+    await refocus();
+    expect(nameField().value).toBe("Beta");
+  });
 });
 
 async function balanceText() {
