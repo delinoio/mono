@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -80,26 +81,111 @@ func TestBindingResponseCarriesSourceAddress(t *testing.T) {
 	}
 }
 
-func TestRateLimitPerSource(t *testing.T) {
-	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+// fakePacketConn is an in-memory net.PacketConn. ReadFrom returns the
+// datagrams queued with enqueue, each with the source address the test
+// chose, and WriteTo records the destination of every response. It lets a
+// test use several source IPs without binding loopback aliases, which are
+// not available on every CI platform (macOS binds only 127.0.0.1).
+type fakePacketConn struct {
+	in     chan fakeDatagram
+	closed chan struct{}
+	once   sync.Once
+
+	mu     sync.Mutex
+	writes []net.Addr
+}
+
+type fakeDatagram struct {
+	payload []byte
+	src     net.Addr
+}
+
+func newFakePacketConn() *fakePacketConn {
+	return &fakePacketConn{in: make(chan fakeDatagram, 64), closed: make(chan struct{})}
+}
+
+func (c *fakePacketConn) enqueue(payload []byte, src *net.UDPAddr) {
+	c.in <- fakeDatagram{payload: payload, src: src}
+}
+
+func (c *fakePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case d := <-c.in:
+		return copy(p, d.payload), d.src, nil
+	case <-c.closed:
+		return 0, nil, net.ErrClosed
 	}
+}
+
+func (c *fakePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes = append(c.writes, addr)
+	return len(p), nil
+}
+
+func (c *fakePacketConn) writtenTo() []net.Addr {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]net.Addr(nil), c.writes...)
+}
+
+func (c *fakePacketConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *fakePacketConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(192, 0, 2, 100), Port: 3478}
+}
+func (c *fakePacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *fakePacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *fakePacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+// The byte budget is per source IP: one source that exhausts its budget is
+// dropped, and a different source still gets a response. A single global
+// bucket would drop the second source and fail this test.
+func TestRateLimitPerSource(t *testing.T) {
+	pc := newFakePacketConn()
 	// A budget of about two responses and almost no refill.
 	s := New(slog.New(slog.NewJSONHandler(io.Discard, nil)), 1, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx, pc) }()
 	defer func() { cancel(); <-done }()
-	client, _ := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	defer client.Close()
+
+	first := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 4000}
+	second := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 4000}
 	for i := 0; i < 10; i++ {
 		req := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest)
-		_, _ = client.WriteTo(req.Raw, pc.LocalAddr())
+		pc.enqueue(req.Raw, first)
 	}
 	req, resp, limited := waitForOutcomes(s.Stats, 10, 5*time.Second)
 	if req != 10 || resp == 0 || resp > 3 || limited != req-resp {
-		t.Fatalf("requests %d, responses %d, limited %d", req, resp, limited)
+		t.Fatalf("first source: requests %d, responses %d, limited %d", req, resp, limited)
+	}
+
+	// The first source has no budget left; a different source is unaffected.
+	other := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest)
+	pc.enqueue(other.Raw, second)
+	req, resp2, limited2 := waitForOutcomes(s.Stats, 11, 5*time.Second)
+	if req != 11 || resp2 != resp+1 || limited2 != limited {
+		t.Fatalf("second source: requests %d, responses %d (was %d), limited %d (was %d); want one more response and no more drops",
+			req, resp2, resp, limited2, limited)
+	}
+	var toFirst, toSecond int
+	for _, addr := range pc.writtenTo() {
+		switch addr.String() {
+		case first.String():
+			toFirst++
+		case second.String():
+			toSecond++
+		default:
+			t.Fatalf("response sent to unexpected address %v", addr)
+		}
+	}
+	if int64(toFirst) != resp || toSecond != 1 {
+		t.Fatalf("responses addressed to %v: %d, to %v: %d; want %d and 1", first, toFirst, second, toSecond, resp)
 	}
 }
 
