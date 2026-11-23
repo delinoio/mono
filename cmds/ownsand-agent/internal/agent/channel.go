@@ -286,7 +286,10 @@ func (a *Agent) dispatch(chanCtx, agentCtx context.Context, c *conn, env *ownsan
 		if isUpdateCommand(m.Command) {
 			order = a.updater.NextOrder()
 		}
-		go a.handleCommand(chanCtx, agentCtx, m.Command, order)
+		// A create_snapshot command registers in the same way, so that a
+		// delete_snapshot command received next finds it.
+		claim := a.claimSnapshotCreate(m.Command)
+		go a.handleClaimedCommand(chanCtx, agentCtx, m.Command, order, claim)
 	case *ownsandv1.AgentEnvelope_Configuration:
 		cfg := m.Configuration
 		a.Sandboxes.SetLimits(cfg.GetLimits())

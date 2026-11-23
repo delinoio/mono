@@ -123,8 +123,10 @@ type Manager struct {
 	epoch     string
 	sandboxes map[string]*sandbox
 	snapshots map[string]*snapshot
-	// pending holds the snapshots whose capture runs now, by ID. They are
-	// not in snapshots, so they are not usable and not reported.
+	// pending holds the snapshots with a received create command that has
+	// not ended, by ID: the create waits for its sandbox or captures. They
+	// are not necessarily in snapshots, so they are not usable and not
+	// reported. See SnapshotCreateClaim.
 	pending map[string]*pendingSnapshot
 	// importLocks serializes the imports of one snapshot ID; see
 	// LockSnapshotImport.
