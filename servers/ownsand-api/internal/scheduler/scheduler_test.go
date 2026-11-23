@@ -274,3 +274,66 @@ func TestAllocatedVCPUBeyondInt32(t *testing.T) {
 		t.Fatalf("ranking = %v, %v", dec, err)
 	}
 }
+
+func windowsDevice(id string) Device {
+	d := linuxDevice(id)
+	d.HostOS = ownsandv1.HostOs_HOST_OS_WINDOWS
+	return d
+}
+
+func TestEffectiveMemoryMiB(t *testing.T) {
+	for _, tc := range []struct {
+		host      ownsandv1.HostOs
+		requested int64
+		want      int64
+	}{
+		{ownsandv1.HostOs_HOST_OS_WINDOWS, 511, 512},
+		{ownsandv1.HostOs_HOST_OS_WINDOWS, 512, 512},
+		{ownsandv1.HostOs_HOST_OS_WINDOWS, 1, 2},
+		{ownsandv1.HostOs_HOST_OS_WINDOWS, math.MaxInt64, math.MaxInt64}, // no overflow
+		{ownsandv1.HostOs_HOST_OS_LINUX, 511, 511},
+		{ownsandv1.HostOs_HOST_OS_MACOS, 511, 511},
+		{ownsandv1.HostOs_HOST_OS_UNSPECIFIED, 511, 511},
+	} {
+		if got := EffectiveMemoryMiB(tc.host, tc.requested); got != tc.want {
+			t.Errorf("EffectiveMemoryMiB(%v, %d) = %d, want %d", tc.host, tc.requested, got, tc.want)
+		}
+	}
+}
+
+// TestHyperVMemoryRounding checks that a Windows device compares the even
+// rounded memory with its limit, and other hosts the requested memory.
+func TestHyperVMemoryRounding(t *testing.T) {
+	req := linuxRequest()
+	req.MemoryMiB = 4095 // the device limit is 4096
+
+	// Rounds to 4096: fits exactly.
+	if _, err := Place(req, []Device{windowsDevice("w")}, now); err != nil {
+		t.Fatalf("odd request below an even limit: %v", err)
+	}
+	// Rounds to 4096 and exceeds an odd limit of 4095: permanent.
+	d := windowsDevice("w")
+	d.Limits.MemoryMib = 4095
+	if _, err := Place(req, []Device{d}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("odd request at an odd limit: %v", err)
+	}
+	// The same request and limit on Linux keep the requested size.
+	l := linuxDevice("l")
+	l.Limits.MemoryMib = 4095
+	if _, err := Place(req, []Device{l}, now); err != nil {
+		t.Fatalf("Linux placement: %v", err)
+	}
+	// Transient rule: the allocation (already rounded) plus the rounded
+	// request must fit.
+	d = windowsDevice("w")
+	d.Allocation = &ownsandv1.DeviceAllocation{MemoryMib: 1}
+	if _, err := Place(req, []Device{d}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("allocation plus rounded request above the limit: %v", err)
+	}
+	// An even request is not changed.
+	even := linuxRequest()
+	even.MemoryMiB = 4096
+	if _, err := Place(even, []Device{windowsDevice("w")}, now); err != nil {
+		t.Fatalf("even request at the limit: %v", err)
+	}
+}
