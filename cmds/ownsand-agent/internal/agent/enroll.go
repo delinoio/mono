@@ -37,10 +37,13 @@ const enrollLockWait = 45 * time.Second
 // one-time enrollment token. The key is written before the call, so a retry
 // after a lost response uses the same key, which the control plane accepts
 // with the same token until the token expires. The token is never written
-// or logged. The Enroll call has the deadline cp.EnrollTimeout (30 seconds
-// by default): a control plane that accepts the call and never answers ends
-// it with ErrEnrollTimeout, and the pending key stays for a retry. An earlier
-// deadline or cancellation of ctx ends the call at once, with its own error.
+// or logged. On Linux the key and its directory entries are flushed to
+// stable storage first (store.SaveIdentityDurable), and a failure to do so
+// ends the enrollment before the call. The Enroll call has the deadline
+// cp.EnrollTimeout (30 seconds by default): a control plane that accepts the
+// call and never answers ends it with ErrEnrollTimeout, and the pending key
+// stays for a retry. An earlier deadline or cancellation of ctx ends the call
+// at once, with its own error.
 //
 // The whole sequence (the identity read, the pending key write, the Enroll
 // call and the completion write) runs under the enrollment lock of the
@@ -73,7 +76,10 @@ func Enroll(ctx context.Context, st *store.Store, cp *cpclient.Client, token, na
 			return nil, gerr
 		}
 		id = &store.Identity{PrivateKeySeed: seed}
-		if err := st.SaveIdentity(id); err != nil {
+		// The key must be durable, directory entry included, before the
+		// call spends the one-time token. A failure ends the enrollment
+		// here, with the token unused.
+		if err := st.SaveIdentityDurable(id); err != nil {
 			return nil, err
 		}
 	default:
