@@ -16,9 +16,11 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// blockSnapshotRemoval makes the removal of the stored snapshot fail: it puts
-// a sentinel file into a read-only directory inside the snapshot directory,
-// so os.RemoveAll cannot delete it. The returned function restores the
+// blockSnapshotRemoval makes the removal of the stored snapshot fail: it makes
+// the snapshots directory read-only, so the snapshot directory itself cannot be
+// unlinked. A read-only directory inside the snapshot would not do: the
+// removal makes the directories of the tree writable again, because a copied
+// read-only disk must stay deletable. The returned function restores the
 // permissions. A test that needs the failure is skipped where permissions do
 // not stop the owner (Windows, or a root user).
 func blockSnapshotRemoval(t *testing.T, e *env, snapID string) (unblock func()) {
@@ -30,18 +32,12 @@ func blockSnapshotRemoval(t *testing.T, e *env, snapID string) (unblock func()) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	locked := filepath.Join(dir, "locked")
-	if err := os.MkdirAll(locked, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(locked, "sentinel"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(locked, 0o500); err != nil {
+	parent := filepath.Dir(dir)
+	if err := os.Chmod(parent, 0o500); err != nil {
 		t.Fatal(err)
 	}
 	var once sync.Once
-	unblock = func() { once.Do(func() { _ = os.Chmod(locked, 0o700) }) }
+	unblock = func() { once.Do(func() { _ = os.Chmod(parent, 0o700) }) }
 	t.Cleanup(unblock)
 	return unblock
 }

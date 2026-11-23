@@ -18,6 +18,7 @@ import {
   ConfirmDialog,
   Empty,
   FormDialog,
+  MorePagesNotice,
   PageHeader,
   QueryBoundary,
   SecretDialog,
@@ -25,6 +26,7 @@ import {
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import { invitationLink } from "../invitation.ts";
+import { membersBoundary, useMembers } from "../members.ts";
 import { can, canManageMember, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
 
@@ -40,10 +42,9 @@ export function MembersPage() {
   const queryClient = useQueryClient();
   const refresh = () =>
     invalidateServices(queryClient, MemberService, OrganizationService);
-  const members = useQuery(MemberService.method.listMembers, {
-    organizationId,
-    pageSize: 200,
-  });
+  // Read every page: a member that sorts after the first 200 would otherwise
+  // be missing from the list and could not get a role change or a removal.
+  const members = useMembers(organizationId);
   const updateRole = useMutation(MemberService.method.updateMemberRole, {
     onSuccess: refresh,
   });
@@ -73,65 +74,68 @@ export function MembersPage() {
           ) : undefined
         }
       />
-      <QueryBoundary query={members} loading="Loading members">
-        {(data) => (
-          <ul className="list" aria-label="Members">
-            {data.members.map((m) => {
-              const manageable = canManageMember(role, userId, m);
-              return (
-                <li key={m.userId} className="list-row">
-                  <div className="list-main">
-                    <span className="list-title">
-                      {displayName(m)}
-                      {m.userId === userId ? (
-                        <span className="muted"> (you)</span>
-                      ) : null}
-                    </span>
-                    <span className="muted">
-                      Joined {formatTime(m.joinTime)}
-                    </span>
-                  </div>
-                  {manageable ? (
-                    <div className="list-actions">
-                      <Select
-                        label={`Role of ${displayName(m)}`}
-                        value={String(m.role)}
-                        onValueChange={async (v) => {
-                          if (v === null || Number(v) === m.role) return;
-                          try {
-                            await updateRole.mutateAsync({
-                              organizationId,
-                              userId: m.userId,
-                              role: Number(v) as Role,
-                            });
-                            toast.success("The role is changed.");
-                          } catch (error) {
-                            toastError(error);
-                          }
-                        }}
-                      >
-                        <SelectOption value={String(Role.ADMIN)}>
-                          Admin
-                        </SelectOption>
-                        <SelectOption value={String(Role.MEMBER)}>
-                          Member
-                        </SelectOption>
-                      </Select>
-                      <Button
-                        variant={ButtonVariant.Danger}
-                        size={ButtonSize.Small}
-                        onClick={() => setRemoving(m)}
-                      >
-                        Remove
-                      </Button>
+      <QueryBoundary query={membersBoundary(members)} loading="Loading members">
+        {(loaded) => (
+          <>
+            <ul className="list" aria-label="Members">
+              {loaded.map((m) => {
+                const manageable = canManageMember(role, userId, m);
+                return (
+                  <li key={m.userId} className="list-row">
+                    <div className="list-main">
+                      <span className="list-title">
+                        {displayName(m)}
+                        {m.userId === userId ? (
+                          <span className="muted"> (you)</span>
+                        ) : null}
+                      </span>
+                      <span className="muted">
+                        Joined {formatTime(m.joinTime)}
+                      </span>
                     </div>
-                  ) : (
-                    <span className="role">{labels.role[m.role]}</span>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
+                    {manageable ? (
+                      <div className="list-actions">
+                        <Select
+                          label={`Role of ${displayName(m)}`}
+                          value={String(m.role)}
+                          onValueChange={async (v) => {
+                            if (v === null || Number(v) === m.role) return;
+                            try {
+                              await updateRole.mutateAsync({
+                                organizationId,
+                                userId: m.userId,
+                                role: Number(v) as Role,
+                              });
+                              toast.success("The role is changed.");
+                            } catch (error) {
+                              toastError(error);
+                            }
+                          }}
+                        >
+                          <SelectOption value={String(Role.ADMIN)}>
+                            Admin
+                          </SelectOption>
+                          <SelectOption value={String(Role.MEMBER)}>
+                            Member
+                          </SelectOption>
+                        </Select>
+                        <Button
+                          variant={ButtonVariant.Danger}
+                          size={ButtonSize.Small}
+                          onClick={() => setRemoving(m)}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    ) : (
+                      <span className="role">{labels.role[m.role]}</span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+            <MorePagesNotice noun="members" pages={members} />
+          </>
         )}
       </QueryBoundary>
       {can(role, Permission.ManageInvitations) ? <Invitations /> : null}

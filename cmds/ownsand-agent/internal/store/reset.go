@@ -20,7 +20,8 @@ import (
 // to delete one entry does not stop the deletion of the others: an entry that
 // stays (for example, a log file that another process holds open) must not
 // keep the identity on disk. ResetDir returns every failure joined into one
-// error.
+// error. Deletion goes through removeAll, so a read-only directory of a copied
+// tree does not stop it.
 func ResetDir(dir string) error {
 	if dir == "" {
 		return errors.New("store: state directory is required")
@@ -44,7 +45,7 @@ func ResetDir(dir string) error {
 	}
 	var errs []error
 	for _, e := range entries {
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+		if err := removeAll(filepath.Join(dir, e.Name())); err != nil {
 			errs = append(errs, err)
 		}
 	}

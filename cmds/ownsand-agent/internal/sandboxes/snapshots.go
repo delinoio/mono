@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/delinoio/mono/go/ownsand/validate"
+	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -268,7 +269,7 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 	m.logger.Info("snapshot creating", "snapshot_id", id, "sandbox_id", cmd.GetSandboxId())
 	info, err := m.rt.Snapshot(ctx, vm, filepath.Join(dir, contentDir))
 	if err != nil {
-		os.RemoveAll(dir)
+		fsutil.RemoveAll(dir)
 		m.logger.Error("snapshot failed", "snapshot_id", id, "sandbox_id", cmd.GetSandboxId(), "error", err)
 		if state == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && info.SourceState == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 			m.recordSourcePausedAfterSnapshot(sb)
@@ -298,7 +299,7 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 		MacOSHardwareModel: info.MacOSHardwareModel,
 	}}
 	if err := m.st.SaveSnapshot(snap.rec.SnapshotID, snap.rec); err != nil {
-		os.RemoveAll(dir)
+		fsutil.RemoveAll(dir)
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot record could not be saved")
 	}
 	// A delete can also arrive while the record is saved. Check again under
