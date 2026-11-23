@@ -145,6 +145,10 @@ type Manager struct {
 	// beforeIdleReports is a test hook that Tick calls after it collected the
 	// pending idle reports and released mu, before it publishes them.
 	beforeIdleReports func()
+	// removalHook is a test hook that removeSnapshot calls under hookMu
+	// before it deletes the stored copy; see SetSnapshotRemovalHookForTest.
+	hookMu      sync.Mutex
+	removalHook func(id string) error
 	// bg tracks the background sandbox ends (TTL expiries and unexpected
 	// VM exits). Add is called only under mu while closed is false, so
 	// that Close can wait for them.
