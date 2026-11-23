@@ -38,9 +38,11 @@ option go_package = "github.com/delinoio/mono/protos/delino/accounts/v1;accounts
 //   `UNSPECIFIED` in a required enum field with `invalid_argument`.
 // - List RPCs take `page_size` (0 selects the default 50; values above 200
 //   are lowered to 200; a negative value fails with `invalid_argument`) and
-//   an opaque `page_token` from the previous response. A token that the
-//   server did not issue for the same request fails with `invalid_argument`.
-//   An empty `next_page_token` means that no more results exist.
+//   an opaque `page_token` from the previous response. Clients must not
+//   construct or modify a token. A token that does not decode, or whose RPC,
+//   caller or billing-account scope or position is not valid for the request,
+//   fails with `invalid_argument`. An empty `next_page_token` means that no
+//   more results exist.
 // - For a request that names a billing account, a caller that is not a member
 //   of that account gets `not_found`, also when the account exists, so that
 //   callers cannot discover other billing accounts. A member whose role does
