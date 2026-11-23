@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -110,6 +111,41 @@ func (c *Client) WaitReady(ctx context.Context, interval time.Duration) (*ownsan
 func (c *Client) SetClock(ctx context.Context, t time.Time) error {
 	_, err := c.svc.SetClock(ctx, connect.NewRequest(&ownsandv1.SetClockRequest{Now: timestamppb.New(t)}))
 	return err
+}
+
+// SetClockOnce sets the guest clock to t over a one-use client and closes
+// every connection that the client dialed before it returns, on success and
+// on failure. Without the close, the discarded client keeps its idle
+// connection to the guest helper until the transport idle timeout ends.
+//
+// The helper closes the dialed connections itself and does not rely on
+// Client.Close alone: the transport frees the stream of a finished request
+// from its read loop, so CloseIdleConnections right after the response can
+// still see the connection as busy and keep it open.
+func SetClockOnce(ctx context.Context, dial Dialer, t time.Time) error {
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	c := New(func(ctx context.Context) (net.Conn, error) {
+		conn, err := dial(ctx)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		conns = append(conns, conn)
+		mu.Unlock()
+		return conn, nil
+	})
+	defer func() {
+		c.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+	return c.SetClock(ctx, t)
 }
 
 // Serve opens one Serve stream. The agent opens one stream per operation.
