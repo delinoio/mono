@@ -46,8 +46,19 @@ export function AuthContextProvider({
 /** Path of the sign-in callback route. */
 export const CALLBACK_PATH = "/callback";
 
+/** What the stored Logto sign-in session says about the visit of the callback. */
+export enum LogtoSignInRedirect {
+  /** No sign-in redirect for this address: nothing for the SDK to complete. */
+  None = "none",
+  /** A readable session names this address: the SDK completes the redirect. */
+  Pending = "pending",
+  /** A stored session cannot be read: malformed JSON or an invalid shape. */
+  Unreadable = "unreadable",
+}
+
 /**
- * Whether the Logto SDK has a sign-in redirect to complete at this address.
+ * Classifies the sign-in redirect that the Logto SDK has to complete at this
+ * address.
  *
  * `useHandleSignInCallback` reports nothing when no redirect is pending: no
  * loading state, no error and no callback. Its `isLoading` is also `false`
@@ -57,16 +68,22 @@ export const CALLBACK_PATH = "/callback";
  * `isSignInRedirected` (`@logto/client` 3.2.x) to the SDK's stored sign-in
  * session: a redirect is pending when `sessionStorage` holds the session of
  * the application (key `logto:<appId>:signInSession`, or the legacy key
- * `logto:<appId>`) and, when the session is readable, its `redirectUri`
- * equals the origin and path of this address. An unreadable session counts as
- * pending, because the hook then reports an error that the page shows. Remove
- * this check when `@logto/react` exposes the client or the pending state.
+ * `logto:<appId>`) and its `redirectUri` equals the origin and path of this
+ * address.
+ *
+ * A stored session that is not valid JSON, or whose `redirectUri`,
+ * `codeVerifier` or `state` is not a string, is `Unreadable`. The SDK throws
+ * for it before the hook starts its error handling, so the rejection never
+ * reaches the hook's `error` and the page would render nothing; the caller
+ * must show the failure itself and must not mount the hook. Remove this check
+ * when `@logto/react` exposes the client or the pending state, or reports
+ * this failure through the hook.
  */
-export function isLogtoSignInPending(
+export function readLogtoSignInRedirect(
   appId: string,
   location: Pick<Location, "origin" | "pathname">,
   storage: Pick<Storage, "getItem"> | undefined = browserSessionStorage(),
-): boolean {
+): LogtoSignInRedirect {
   let stored: string | null;
   try {
     const key = `logto:${appId}`;
@@ -75,20 +92,32 @@ export function isLogtoSignInPending(
       storage?.getItem(key) ??
       null;
   } catch {
-    return false;
+    return LogtoSignInRedirect.None;
   }
-  if (stored === null || stored === "") return false;
+  if (stored === null || stored === "") return LogtoSignInRedirect.None;
+  let session: unknown;
   try {
-    const session: unknown = JSON.parse(stored);
-    const redirectUri =
-      typeof session === "object" && session !== null
-        ? (session as { redirectUri?: unknown }).redirectUri
-        : undefined;
-    if (typeof redirectUri !== "string") return true;
-    return redirectUri === `${location.origin}${location.pathname}`;
+    session = JSON.parse(stored);
   } catch {
-    return true;
+    return LogtoSignInRedirect.Unreadable;
   }
+  if (!isSignInSession(session)) return LogtoSignInRedirect.Unreadable;
+  return session.redirectUri === `${location.origin}${location.pathname}`
+    ? LogtoSignInRedirect.Pending
+    : LogtoSignInRedirect.None;
+}
+
+/** The shape check of `isLogtoSignInSessionItem` in `@logto/client` 3.2.x. */
+function isSignInSession(
+  value: unknown,
+): value is { redirectUri: string; codeVerifier: string; state: string } {
+  if (typeof value !== "object" || value === null) return false;
+  const { redirectUri, codeVerifier, state } = value as Record<string, unknown>;
+  return (
+    typeof redirectUri === "string" &&
+    typeof codeVerifier === "string" &&
+    typeof state === "string"
+  );
 }
 
 function browserSessionStorage(): Storage | undefined {
