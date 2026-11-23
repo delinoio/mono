@@ -18,7 +18,13 @@ Copies raw PGDATA; same major version and platform required; cross-architecture 
 Requires base backup + continuous WAL archiving. Restores to any timestamp, transaction, or named restore point. Without PITR: restore only to backup time (potentially lose hours). With PITR: RPO = minutes. `archive_command` must return 0 ONLY when file is safely stored—premature 0 = data loss risk. `wal_level` must be `replica` or `logical` (not `minimal`).
 
 ## WAL Archiving
-`archive_mode=on`, `archive_command='test ! -f /archive/%f && cp %p /archive/%f'`. **Test archive command as postgres user** (not root) since permission issues are common. Monitor `pg_stat_archiver` for `failed_count`, `last_archived_time`. Archive failures prevent WAL recycling → disk fills.
+`archive_mode=on` plus an `archive_command` (or `archive_library`) that honors this contract. Prefer a dedicated archiver (pgBackRest, WAL-G or Barman) over a hand-written one-liner. **Do not use `test ! -f /archive/%f && cp %p /archive/%f`**: `cp` returning does not mean the data is durable, and the existence check treats every retry as a failure, even when an earlier attempt copied identical bytes, so archiving can stall on a file that is already stored. A custom archive script must:
+- **First archive** (destination absent): copy to a temporary name in the archive directory, fsync the file, rename it to the final name, fsync the directory, and only then exit 0.
+- **Retry** (destination already exists): compare the bytes with `%p` (for example `cmp`) and make sure the existing file is durable (fsync it and the directory) before exiting 0.
+- **Conflict** (same name, different bytes): exit nonzero and leave the existing file untouched.
+- **Any failure to write or to establish durability**: exit nonzero.
+
+**Test the archive command as the postgres OS user** (not root) since permission issues are common. Monitor `pg_stat_archiver` for `failed_count`, `last_archived_time`. Archive failures prevent WAL recycling → disk fills.
 
 ## Tool Comparison
 | Tool | Use case |
