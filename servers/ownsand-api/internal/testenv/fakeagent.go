@@ -5,6 +5,7 @@ package testenv
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 )
 
 // FakeAgent is an in-process device agent on the real agent channel. It
@@ -90,13 +92,36 @@ func (a *FakeAgent) Connect() {
 	a.Eventually("device online", func() bool { return a.Env.App.Service.Hub.Live(a.Device.ID) != nil })
 }
 
+// LeaseWaitTimeout bounds how long test setup waits for the instance lease.
+// It matches the bound of Eventually, so a lease that is never acquired
+// fails the test instead of stalling it until the package timeout.
+const LeaseWaitTimeout = 10 * time.Second
+
+// WaitForLease waits until the instance holds the lease and fails the test
+// with the lease error when it does not within LeaseWaitTimeout.
+func (e *Env) WaitForLease() {
+	e.T.Helper()
+	if err := waitForLease(e.App.Lease, LeaseWaitTimeout); err != nil {
+		e.T.Fatalf("instance lease not acquired: %v", err)
+	}
+}
+
+// waitForLease waits for l to be held for at most timeout. A timeout is
+// reported as a wrapped context.DeadlineExceeded that names the wait.
+func waitForLease(l *lease.Lease, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := l.Wait(ctx); err != nil {
+		return fmt.Errorf("waiting up to %s for the instance lease: %w", timeout, err)
+	}
+	return nil
+}
+
 // OpenChannel does what Connect does, but does not wait until the server
 // applied the state report, for a test where the report is expected to fail.
 func (a *FakeAgent) OpenChannel() {
 	a.T.Helper()
-	if err := a.Env.App.Lease.Wait(context.Background()); err != nil {
-		a.T.Fatal(err)
-	}
+	a.Env.WaitForLease()
 	cred := a.Env.SessionCredential(a.Device)
 	a.ctx, a.cancel = context.WithCancel(context.Background())
 	a.T.Cleanup(a.Close)
