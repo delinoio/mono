@@ -2771,3 +2771,84 @@ func TestFailedCreateCleanupStopsAfterClose(t *testing.T) {
 		t.Fatalf("Tick retried the clean-up after Close: %d runtime Delete calls", calls)
 	}
 }
+
+// TestBusyWhileVMStopIsPendingOrFailed checks that a DELETING sandbox keeps
+// the agent busy while its VM stop is running and after the stop failed,
+// because the VM may still be live, and stops counting once a retry confirmed
+// the stop.
+func TestBusyWhileVMStopIsPendingOrFailed(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	e.rt.mu.Lock()
+	e.rt.deleteStarted = make(chan struct{})
+	e.rt.deleteBlock = make(chan struct{})
+	e.rt.deleteFails = 1
+	started, block := e.rt.deleteStarted, e.rt.deleteBlock
+	e.rt.mu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+		done <- err
+	}()
+	<-started
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("state %v, want DELETING", s)
+	}
+	if !e.m.Busy() {
+		t.Fatal("not busy while the VM stop is pending")
+	}
+	// The injected failure ends the pending stop without confirming it.
+	close(block)
+	requireInternal(t, <-done)
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("state after failed stop %v, want DELETING", s)
+	}
+	if !e.m.Busy() {
+		t.Fatal("not busy after the VM stop failed")
+	}
+	// The retry confirms the stop and ends the record.
+	e.rt.mu.Lock()
+	e.rt.deleteBlock = nil
+	e.rt.mu.Unlock()
+	if _, err := e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("state after retry %v, want DELETED", s)
+	}
+	if e.m.Busy() {
+		t.Fatal("busy after the VM stop was confirmed")
+	}
+}
+
+// TestBusyUntilRestartCleanupConfirmsStop checks that a DELETING record from
+// before a restart keeps the agent busy while the runtime cannot confirm the
+// stop, and that a later start whose cleanup works ends it.
+func TestBusyUntilRestartCleanupConfirmsStop(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	e.rt.mu.Lock()
+	e.rt.deleteFails = 1
+	e.rt.mu.Unlock()
+	if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err == nil {
+		t.Fatal("delete succeeded despite the injected stop failure")
+	}
+	e.rt = newFakeRuntime()
+	e.rt.files[id] = true
+	e.rt.deleteFails = 1
+	e.restart()
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("state %v, want DELETING while the cleanup fails", s)
+	}
+	if !e.m.Busy() {
+		t.Fatal("not busy while the restart cleanup cannot confirm the stop")
+	}
+	e.restart()
+	if s, _ := e.m.State(id); !(s == ownsandv1.SandboxState_SANDBOX_STATE_DELETED || s == ownsandv1.SandboxState_SANDBOX_STATE_FAILED) {
+		t.Fatalf("state %v, want a terminal state", s)
+	}
+	if e.m.Busy() {
+		t.Fatal("busy after the restart cleanup confirmed the stop")
+	}
+}
