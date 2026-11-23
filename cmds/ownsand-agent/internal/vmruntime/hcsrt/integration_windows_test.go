@@ -326,7 +326,12 @@ func TestHyperVIntegration(t *testing.T) {
 			t.Fatalf("delete %v %v", en, err)
 		}
 	}
-	if ids, _ := rt.Running(context.Background()); len(ids) != 0 {
+	// The inventory must succeed: a failed enumeration is not proof that no VM runs.
+	ids, err = rt.Running(context.Background())
+	if err != nil {
+		t.Fatalf("list running VMs: %v", err)
+	}
+	if len(ids) != 0 {
 		t.Fatalf("VMs still run: %v", ids)
 	}
 }

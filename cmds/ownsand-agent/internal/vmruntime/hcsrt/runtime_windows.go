@@ -824,9 +824,23 @@ func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
 	return nil
 }
 
+// hcsLoadFunc and enumerateSystemsFunc are the HCS calls that Running makes.
+// They are variables only so that tests can inject a load failure and an
+// enumeration result without a Hyper-V host; remove them when the HCS calls
+// sit behind an interface.
+var (
+	hcsLoadFunc          = hcsLoad
+	enumerateSystemsFunc = enumerateSystems
+)
+
 // Running lists the sandboxes with a running or paused VM, including
 // compute systems of an earlier agent process (owner ownsand-agent), so
-// that the agent stops them after a restart.
+// that the agent stops them after a restart. When the HCS loads but the
+// enumeration of its compute systems fails, the inventory is incomplete:
+// Running then returns the IDs of the tracked VMs together with an error
+// that wraps the cause, so that a caller never takes a partial list for the
+// complete one. A host without the HCS DLL runs no VM, so a load failure is
+// not an error (the hyper-v check reports why).
 func (r *Runtime) Running(context.Context) ([]string, error) {
 	r.mu.Lock()
 	seen := map[string]bool{}
@@ -840,14 +854,13 @@ func (r *Runtime) Running(context.Context) ([]string, error) {
 		}
 	}
 	r.mu.Unlock()
-	if hcsLoad() != nil {
+	if hcsLoadFunc() != nil {
 		return ids, nil
 	}
-	systems, err := enumerateSystems(Owner)
+	systems, err := enumerateSystemsFunc(Owner)
 	if err != nil {
-		// Without HCS access no VM can run; the hyper-v check reports why.
 		r.logger.Warn("list compute systems failed", "error", err)
-		return ids, nil
+		return ids, fmt.Errorf("hcsrt: list compute systems: %w", err)
 	}
 	for _, s := range systems {
 		id, ok := strings.CutPrefix(s.ID, systemIDPrefix)

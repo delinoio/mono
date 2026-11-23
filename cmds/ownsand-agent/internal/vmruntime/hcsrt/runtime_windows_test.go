@@ -348,3 +348,100 @@ func TestResetVMDirStopsLeftoverSystemBeforeRemovingDir(t *testing.T) {
 		})
 	}
 }
+
+// stubInventory makes Running see the given HCS load result and compute
+// systems for the test, without a Hyper-V host.
+func stubInventory(t *testing.T, loadErr error, systems []systemProperties, enumErr error) {
+	t.Helper()
+	origLoad, origEnum := hcsLoadFunc, enumerateSystemsFunc
+	hcsLoadFunc = func() error { return loadErr }
+	enumerateSystemsFunc = func(owner string) ([]systemProperties, error) {
+		if owner != Owner {
+			t.Errorf("enumerated owner %q, want %q", owner, Owner)
+		}
+		return systems, enumErr
+	}
+	t.Cleanup(func() { hcsLoadFunc, enumerateSystemsFunc = origLoad, origEnum })
+}
+
+// newRunningTestRuntime returns a runtime that tracks one running VM
+// ("tracked") and one VM whose compute system already exited ("gone").
+func newRunningTestRuntime() *Runtime {
+	running := &vm{id: "tracked", exited: make(chan struct{})}
+	gone := &vm{id: "gone", exited: make(chan struct{})}
+	gone.markExited()
+	return &Runtime{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		vms:    map[string]*vm{"tracked": running, "gone": gone},
+	}
+}
+
+func TestRunningEnumerationFailureReturnsError(t *testing.T) {
+	cause := &hcsError{op: "HcsEnumerateComputeSystems", hr: 0x80070005}
+	for _, tc := range []struct {
+		name    string
+		tracked bool
+		wantIDs []string
+	}{
+		{"no tracked VM", false, []string{}},
+		{"one tracked VM", true, []string{"tracked"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubInventory(t, nil, nil, cause)
+			r := newRunningTestRuntime()
+			if !tc.tracked {
+				r.vms = map[string]*vm{}
+			}
+			ids, err := r.Running(t.Context())
+			if err == nil || !errors.Is(err, cause) {
+				t.Fatalf("Running error = %v, want it to wrap %v", err, cause)
+			}
+			if len(ids) != len(tc.wantIDs) || (len(ids) == 1 && ids[0] != tc.wantIDs[0]) {
+				t.Fatalf("Running IDs = %v, want %v", ids, tc.wantIDs)
+			}
+		})
+	}
+}
+
+func TestRunningListsSurvivorsOfThisOwner(t *testing.T) {
+	stubInventory(t, nil, []systemProperties{
+		{ID: systemIDPrefix + "survivor", Owner: Owner},
+		{ID: systemIDPrefix + "tracked", Owner: Owner},  // already tracked: listed once
+		{ID: systemIDPrefix + "survivor", Owner: Owner}, // duplicate entry
+		{ID: "other-" + "system", Owner: Owner},         // no sandbox prefix
+	}, nil)
+	ids, err := newRunningTestRuntime().Running(t.Context())
+	if err != nil {
+		t.Fatalf("Running = %v", err)
+	}
+	got := map[string]int{}
+	for _, id := range ids {
+		got[id]++
+	}
+	if len(got) != 2 || got["tracked"] != 1 || got["survivor"] != 1 {
+		t.Fatalf("Running IDs = %v, want tracked and survivor once each", ids)
+	}
+}
+
+func TestRunningEmptyEnumeration(t *testing.T) {
+	stubInventory(t, nil, nil, nil)
+	r := &Runtime{logger: slog.New(slog.NewTextHandler(io.Discard, nil)), vms: map[string]*vm{}}
+	ids, err := r.Running(t.Context())
+	if err != nil || len(ids) != 0 {
+		t.Fatalf("Running = %v, %v, want no IDs and no error", ids, err)
+	}
+}
+
+// TestRunningLoadFailureKeepsTrackedVMs checks that a host without the HCS
+// DLL is not an inventory error: no VM can run there, so the tracked VMs are
+// the complete list.
+func TestRunningLoadFailureKeepsTrackedVMs(t *testing.T) {
+	stubInventory(t, errors.New("computecore.dll is missing"), nil, errors.New("must not be called"))
+	ids, err := newRunningTestRuntime().Running(t.Context())
+	if err != nil {
+		t.Fatalf("Running = %v, want no error", err)
+	}
+	if len(ids) != 1 || ids[0] != "tracked" {
+		t.Fatalf("Running IDs = %v, want [tracked]", ids)
+	}
+}
