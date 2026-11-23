@@ -156,6 +156,10 @@ type vm struct {
 	net         *netstack.Network
 	netDone     chan struct{}
 	paused      bool
+	// stopUnconfirmed is set when a stop of the VM could not confirm that the
+	// compute system exited. The handle of that system is closed already, so
+	// the next stop reopens the system by its ID. It is guarded by mu.
+	stopUnconfirmed bool
 }
 
 func (v *vm) markExited() { v.exitOnce.Do(func() { close(v.exited) }) }
@@ -267,11 +271,13 @@ func removeAll(dir string) error {
 // with the sandbox ID can be left from a failed earlier attempt and hold its
 // disk open, so the system is stopped before the directory is removed.
 // Removing the directory first would fail with a sharing violation until
-// removeTimeout. An unknown stop outcome is only logged (by stopOrphan): the
-// create goes on, and the compute system creation reports the conflict if the
-// system is still there.
+// removeTimeout. An unknown stop outcome is only logged: the create goes on,
+// and the compute system creation reports the conflict if the system is still
+// there.
 func (r *Runtime) resetVMDir(sandboxID, dir string) error {
-	_ = r.stopOrphan(sandboxID)
+	if err := r.stopOrphan(sandboxID); err != nil {
+		r.logger.Warn("create goes on although the stop of a leftover compute system is not confirmed", "sandbox_id", sandboxID, "error", err)
+	}
 	if err := removeAll(dir); err != nil {
 		return err
 	}
@@ -308,10 +314,16 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	}
 	v := &vm{id: spec.SandboxID, dir: spec.Dir, guestOS: spec.GuestOS, network: spec.NetworkMode,
 		exited: make(chan struct{}), stopping: make(chan struct{})}
-	// cleanup releases everything of a failed create: the sandbox manager
-	// records the sandbox as FAILED and never calls Delete for it.
+	// cleanup releases everything of a failed create. When the stop of the VM
+	// is not confirmed, the VM may still run and hold its disk, so cleanup
+	// keeps the registration and the VM directory and only logs: Running,
+	// Close and the sandbox manager's retry of the failed create stop the VM
+	// again through Delete.
 	cleanup := func() {
-		r.stopVM(v)
+		if err := r.stopVM(v); err != nil {
+			r.logger.Error("failed create keeps the VM registration and directory because the stop is not confirmed", "sandbox_id", v.id, "error", err)
+			return
+		}
 		r.mu.Lock()
 		if r.vms[spec.SandboxID] == v {
 			delete(r.vms, spec.SandboxID)
@@ -671,36 +683,73 @@ func (r *Runtime) captureDisk(ctx context.Context, v *vm, dir string) (vmruntime
 	return vmruntime.SnapshotInfo{SizeBytes: st.Size()}, nil
 }
 
-// stopSystem terminates sys, waits until it exited and closes its handle.
-func (r *Runtime) stopSystem(sandboxID string, sys *system) {
-	if err := sys.terminate(); err != nil {
-		r.logger.Warn("terminate VM failed", "sandbox_id", sandboxID, "error", err)
+// errStopUnconfirmed marks a stop that could not confirm the exit of a compute
+// system. The system may still run and hold its disk, so the outcome is
+// unknown and a caller keeps the state and the files and retries the stop.
+var errStopUnconfirmed = errors.New("hcsrt: the exit of the compute system is not confirmed")
+
+// stopSystemTimeout is how long stopSystem waits for the exit event after it
+// asked the HCS to terminate the system. It is a variable only so that tests
+// can shorten the wait; it equals stopTimeout otherwise.
+var stopSystemTimeout = stopTimeout
+
+// stopSystem terminates sys, waits until it exited and closes its handle. It
+// returns nil only when the exit event arrived, whether or not the terminate
+// call itself failed; the exit event is the confirmation. Without it, closing
+// the last handle is no proof that the system ended, because another handle
+// owner may keep it alive, so stopSystem returns an error that wraps
+// errStopUnconfirmed (and the terminate error, if any) and leaves sys unmarked
+// as exited. The handle is closed either way; a retry reopens the system by
+// its ID.
+func (r *Runtime) stopSystem(sandboxID string, sys *system) error {
+	termErr := sys.terminate()
+	if termErr != nil {
+		r.logger.Warn("terminate VM failed", "sandbox_id", sandboxID, "error", termErr)
 	}
+	exited := false
 	select {
 	case <-sys.exited:
-	case <-time.After(stopTimeout):
-		r.logger.Error("VM did not stop", "sandbox_id", sandboxID)
+		exited = true
+	case <-time.After(stopSystemTimeout):
 	}
 	sys.close()
-	// The exit callback ends with the handle; a system whose exit event did
-	// not arrive counts as exited once its last handle is closed.
-	sys.markExited()
+	if exited {
+		return nil
+	}
+	r.logger.Error("VM did not stop", "sandbox_id", sandboxID)
+	if termErr != nil {
+		return fmt.Errorf("%w: sandbox %s: terminate: %w", errStopUnconfirmed, sandboxID, termErr)
+	}
+	return fmt.Errorf("%w: sandbox %s", errStopUnconfirmed, sandboxID)
 }
 
-// stopVM stops the VM of v, if it runs, and its network stack.
-func (r *Runtime) stopVM(v *vm) {
+// stopVM stops the VM of v, if it runs, and its network stack. It returns an
+// error that wraps errStopUnconfirmed (or the open error of a retry) when the
+// exit of the compute system is not confirmed. v then stays not exited and a
+// later call stops the system again by its ID.
+func (r *Runtime) stopVM(v *vm) error {
 	v.stopOnce.Do(func() { close(v.stopping) })
 	v.mu.Lock()
 	sys := v.sys
 	v.sys = nil
+	unconfirmed := v.stopUnconfirmed
 	stack, netDone := v.net, v.netDone
 	v.net, v.netDone = nil, nil
 	consoleDone := v.consoleDone
 	v.mu.Unlock()
-	if sys != nil {
-		r.stopSystem(v.id, sys)
-	} else {
-		// No compute system was created: nothing else closes exited.
+	var stopErr error
+	switch {
+	case sys != nil:
+		stopErr = r.stopSystem(v.id, sys)
+	case unconfirmed:
+		// An earlier stop closed the handle without a confirmed exit.
+		stopErr = r.stopOrphan(v.id)
+	}
+	v.mu.Lock()
+	v.stopUnconfirmed = stopErr != nil
+	v.mu.Unlock()
+	if stopErr == nil {
+		// A VM without a compute system has nothing else that closes exited.
 		v.markExited()
 	}
 	if stack != nil {
@@ -716,6 +765,7 @@ func (r *Runtime) stopVM(v *vm) {
 			r.logger.Warn("VM helper goroutine did not end", "sandbox_id", v.id)
 		}
 	}
+	return stopErr
 }
 
 // openSystemFunc opens a compute system by ID. It is a variable only so that
@@ -725,10 +775,11 @@ var openSystemFunc = openSystem
 
 // stopOrphan stops a compute system of the sandbox that no tracked VM owns,
 // for example one that an earlier agent process left. It returns nil when the
-// system is stopped or confirmed absent (not found or stopped already) and
-// an error when its state is unknown, for example when the open fails for
-// another reason, so a caller never takes an unknown state for an absent
-// system.
+// system is confirmed stopped or absent (not found or stopped already) and an
+// error when its state is unknown, so a caller never takes an unknown state
+// for an absent system. The state is unknown when the open fails for another
+// reason and when the system opened but its exit is not confirmed (the error
+// wraps errStopUnconfirmed).
 func (r *Runtime) stopOrphan(sandboxID string) error {
 	sys, err := openSystemFunc(systemID(sandboxID))
 	if err != nil {
@@ -739,21 +790,28 @@ func (r *Runtime) stopOrphan(sandboxID string) error {
 		return fmt.Errorf("hcsrt: open the compute system of sandbox %s: %w", sandboxID, err)
 	}
 	r.logger.Warn("stopping a compute system without a tracked VM", "sandbox_id", sandboxID)
-	r.stopSystem(sandboxID, sys)
-	return nil
+	return r.stopSystem(sandboxID, sys)
 }
 
 // Delete stops the VM of the sandbox and removes its files. When the stop
-// outcome of an untracked compute system is unknown, Delete returns the error
-// and keeps the VM directory: a VM that still runs may hold its disk, and the
-// sandbox manager retries the delete.
+// outcome of a compute system is unknown, whether the system is tracked or
+// not, Delete returns the error and keeps the registration and the VM
+// directory: a VM that still runs may hold its disk, and the sandbox manager
+// retries the delete.
 func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
 	r.mu.Lock()
 	v, ok := r.vms[sandboxID]
-	delete(r.vms, sandboxID)
 	r.mu.Unlock()
 	if ok {
-		r.stopVM(v)
+		if err := r.stopVM(v); err != nil {
+			r.logger.Warn("delete keeps the VM registration and directory because the exit of the compute system is not confirmed", "sandbox_id", sandboxID, "error", err)
+			return err
+		}
+		r.mu.Lock()
+		if r.vms[sandboxID] == v {
+			delete(r.vms, sandboxID)
+		}
+		r.mu.Unlock()
 	} else if hcsLoad() == nil {
 		if err := r.stopOrphan(sandboxID); err != nil {
 			r.logger.Warn("delete keeps the VM directory because the compute system state is unknown", "sandbox_id", sandboxID, "error", err)
