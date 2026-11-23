@@ -587,8 +587,13 @@ func TestLowercaseSandboxIDInSandboxUpdateWakesWaiter(t *testing.T) {
 	w := startDeleteWaiter(t, env, org, id)
 	deleted := agent.SetSandbox(id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER)
 	agent.SendUpdate(deleted)
-	if !w.wait(5*time.Second) || w.err != nil {
-		t.Fatalf("the delete did not return: %v", w.err)
+	// w.err and w.resp are written by the call goroutine before it closes
+	// w.done, so read them only after wait returned true.
+	if !w.wait(5 * time.Second) {
+		t.Fatal("the delete did not return within 5s; the watcher did not wake the waiter")
+	}
+	if w.err != nil {
+		t.Fatalf("the delete failed: %v", w.err)
 	}
 	if w.elapsed > watcherWakeBound {
 		t.Fatalf("the delete returned after %v; the watcher did not wake it", w.elapsed)
