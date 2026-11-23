@@ -296,7 +296,13 @@ func TestStaleExportResultCannotChangeRetry(t *testing.T) {
 	// The stale attempt can no longer get URLs on the new channel to write
 	// to its own prefix: URLs always address the current attempt.
 	requestUploadURLs(agent, snapID, "third-urls")
-	for _, u := range waitGrant(agent, "third-urls").GetPartUrls() {
+	// A denial or a partial grant has no URL to check, so it must fail here
+	// instead of passing the prefix check on an empty or short list.
+	thirdGrant := waitGrant(agent, "third-urls")
+	if thirdGrant.GetError() != nil || len(thirdGrant.GetPartUrls()) != 2 {
+		t.Fatalf("third grant = %v, want two URLs and no error", thirdGrant)
+	}
+	for _, u := range thirdGrant.GetPartUrls() {
 		if !strings.Contains(u.GetUrl(), attemptPrefixOf(org.ID, snapID, second)) {
 			t.Fatalf("URL %q addresses another attempt than the current one", u.GetUrl())
 		}
