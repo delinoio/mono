@@ -1037,27 +1037,63 @@ describe("file write", () => {
 
     test("an abort after the first chunk was acknowledged stops at the next source wait and sends no final chunk", async () => {
       const h = setup();
-      h.api.unary(RelayService, "WriteFile", (req) => ({
-        writeId: req.writeId,
-        offset: req.offset,
-        length: BigInt(req.data.length),
-        finished: false,
-        sizeBytes: 0n,
-      }));
+      // The first WriteFile response is held, so the test controls when the
+      // acknowledgment reaches the SDK relative to the third source read.
+      let releaseAck!: () => void;
+      const ackHeld = new Promise<void>((resolve) => {
+        releaseAck = resolve;
+      });
+      let writeEntered!: () => void;
+      const writeEnteredSignal = new Promise<void>((resolve) => {
+        writeEntered = resolve;
+      });
+      h.api.unary(RelayService, "WriteFile", async (req) => {
+        writeEntered();
+        await ackHeld;
+        return {
+          writeId: req.writeId,
+          offset: req.offset,
+          length: BigInt(req.data.length),
+          finished: false,
+          sizeBytes: 0n,
+        };
+      });
       const controller = new AbortController();
+      let thirdReadStarted = false;
+      let signalThirdRead!: () => void;
+      const thirdReadSignal = new Promise<void>((resolve) => {
+        signalThirdRead = resolve;
+      });
       async function* source() {
         yield new Uint8Array(1 << 20);
+        // The second piece completes the first chunk, which is then sent.
         yield new Uint8Array(1 << 20);
-        controller.abort(REASON);
+        // Only a read that follows the acknowledgment gets here.
+        thirdReadStarted = true;
+        signalThirdRead();
         await new Promise(() => {});
       }
-      await expect(
-        h.client
-          .sandbox(SANDBOX)
-          .writeFile("/f", source(), { signal: controller.signal }),
-      ).rejects.toBe(REASON);
+      const outcome = h.client
+        .sandbox(SANDBOX)
+        .writeFile("/f", source(), { signal: controller.signal })
+        .then(
+          () => "resolved",
+          (error) => error,
+        );
+      await writeEnteredSignal;
+      await h.clock.settle();
+      // The first chunk is in flight and unacknowledged: no third read yet.
+      expect(thirdReadStarted).toBe(false);
+      releaseAck();
+      await thirdReadSignal;
+      expect(thirdReadStarted).toBe(true);
+      controller.abort(REASON);
+      expect(await outcome).toBe(REASON);
       const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
-      expect(writes.every((w) => w.finish === undefined)).toBe(true);
+      expect(writes).toHaveLength(1);
+      expect(writes[0].offset).toBe(0n);
+      expect(writes[0].data).toHaveLength(1 << 20);
+      expect(writes[0].finish).toBeUndefined();
     });
 
     test("an unmodified stream write without an abort sends the same chunks", async () => {
