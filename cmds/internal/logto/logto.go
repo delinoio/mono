@@ -45,6 +45,13 @@ type DeviceAuthorization struct {
 	VerificationURIComplete string `json:"verification_uri_complete"`
 	ExpiresIn               int    `json:"expires_in"`
 	Interval                int    `json:"interval"`
+	// ExpiresAt is the local expiry deadline of the device code. It is not
+	// part of the response: StartDeviceAuthorization sets it to the time it
+	// received the response plus ExpiresIn, so time that passes before
+	// PollToken starts (for example while the caller writes the sign-in
+	// prompt) counts against the code lifetime. The zero value makes
+	// PollToken measure ExpiresIn from its own start.
+	ExpiresAt time.Time `json:"-"`
 }
 
 // Token is a token response.
@@ -157,19 +164,35 @@ func (c Config) StartDeviceAuthorization(ctx context.Context) (*DeviceAuthorizat
 	if da.DeviceCode == "" || da.UserCode == "" || da.VerificationURI == "" {
 		return nil, errors.New("logto: incomplete device authorization response")
 	}
+	da.ExpiresAt = time.Now().Add(da.lifetime())
 	return &da, nil
+}
+
+// defaultDeviceCodeLifetime is the code lifetime that applies when the
+// device authorization response has no positive expires_in.
+const defaultDeviceCodeLifetime = 10 * time.Minute
+
+// lifetime returns how long the device code lives after the response.
+func (da *DeviceAuthorization) lifetime() time.Duration {
+	if da.ExpiresIn <= 0 {
+		return defaultDeviceCodeLifetime
+	}
+	return time.Duration(da.ExpiresIn) * time.Second
 }
 
 // PollToken polls the token endpoint until the user signs in, denies the
 // request or the device code expires. It waits at least 5 seconds between
 // requests (more after slow_down); minInterval overrides that for tests.
 //
-// The local expiry deadline (expires_in of the device authorization, or 10
-// minutes when it is not positive) bounds the wait between requests and every
+// The local expiry deadline (expires_in seconds after the device
+// authorization response, or 10 minutes after it when expires_in is not
+// positive; see DeviceAuthorization.ExpiresAt) bounds the wait between requests and every
 // token request: PollToken starts no request at or after the deadline, cancels
 // a request that is still in flight at the deadline and returns ErrExpired.
 // A cancellation or deadline of ctx ends the polling earlier and is returned
-// as ctx.Err(), so callers can tell it from the expiry. The deadline applies
+// as ctx.Err(), so callers can tell it from the expiry. A code that has
+// already expired when PollToken starts returns ErrExpired without any
+// request. The deadline applies
 // only to the device grant: the returned token does not depend on it, and ctx
 // stays usable for the refresh grant afterwards.
 func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInterval time.Duration) (*Token, error) {
@@ -178,9 +201,9 @@ func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInter
 		minInterval = 5 * time.Second
 	}
 	interval = max(interval, minInterval)
-	deadline := time.Now().Add(time.Duration(da.ExpiresIn) * time.Second)
-	if da.ExpiresIn <= 0 {
-		deadline = time.Now().Add(10 * time.Minute)
+	deadline := da.ExpiresAt
+	if deadline.IsZero() {
+		deadline = time.Now().Add(da.lifetime())
 	}
 	pollCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -200,6 +223,11 @@ func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInter
 		"client_id":   {c.AppID},
 		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
 		"device_code": {da.DeviceCode},
+	}
+	// A code that expired before the polling started, or a caller context
+	// that is already done, sends no request.
+	if err := ended(nil); err != nil {
+		return nil, err
 	}
 	for {
 		t := time.NewTimer(interval)
