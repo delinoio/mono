@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -156,14 +157,110 @@ func (g *gateStore) waitEntered(t *testing.T) {
 	}
 }
 
-// assertBlocked fails when done is closed within a grace period, which means
-// the deletion did not wait for the signer.
-func assertBlocked(t *testing.T, what string, done <-chan error) {
+// blockedOnSignerQuery returns the PIDs of backends of the current database
+// whose query contains one of the statements ($1, as LIKE patterns) and that
+// wait for a lock held by the gated signer. The signer is the backend that is
+// idle in a transaction while it holds a row lock on the snapshots table (its
+// FOR SHARE lock): the signer runs more statements after the lock, so its
+// last statement does not identify it. Both sides are restricted to the
+// current database, so a backend of another database that runs the same
+// statements cannot match, and pg_blocking_pids ties the waiter to the signer
+// backend, so a waiter that another transaction blocks cannot match either.
+const blockedOnSignerQuery = `
+SELECT blocked.pid
+FROM pg_stat_activity AS signer, pg_stat_activity AS blocked
+WHERE signer.datname = current_database()
+  AND blocked.datname = current_database()
+  AND signer.state = 'idle in transaction'
+  AND EXISTS (
+    SELECT 1 FROM pg_locks AS l
+    WHERE l.pid = signer.pid AND l.granted AND l.locktype = 'relation'
+      AND l.mode = 'RowShareLock' AND l.relation = 'snapshots'::regclass
+      AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()))
+  AND blocked.pid <> signer.pid
+  AND blocked.wait_event_type = 'Lock'
+  AND blocked.query LIKE ANY($1)
+  AND signer.pid = ANY(pg_blocking_pids(blocked.pid))`
+
+// describeBackends lists the backends of the current database for a failure
+// message.
+func describeBackends(ctx context.Context, env *testenv.Env) string {
+	rows, err := env.DB.Pool.Query(ctx, `
+SELECT pid, state, COALESCE(wait_event_type, ''), pg_blocking_pids(pid)::text, query
+FROM pg_stat_activity
+WHERE datname = current_database() AND pid <> pg_backend_pid()
+ORDER BY pid`)
+	if err != nil {
+		return "list backends: " + err.Error()
+	}
+	defer rows.Close()
+	var b strings.Builder
+	for rows.Next() {
+		var (
+			pid                   int32
+			state, waitType, pids string
+			query                 string
+		)
+		if err := rows.Scan(&pid, &state, &waitType, &pids, &query); err != nil {
+			return b.String() + "scan backends: " + err.Error()
+		}
+		fmt.Fprintf(&b, "\n  pid=%d state=%q wait_event_type=%q blocked_by=%s query=%q", pid, state, waitType, pids, query)
+	}
+	if err := rows.Err(); err != nil {
+		return b.String() + "list backends: " + err.Error()
+	}
+	if b.Len() == 0 {
+		return "\n  (no backends)"
+	}
+	return b.String()
+}
+
+// waitDeletionBlocked waits until the deletion that runs in the background
+// (it reports on done) waits for the lock that the gated signer holds. It
+// polls pg_blocking_pids for a backend of the same database that runs one of
+// the statements and is blocked by the signer backend, so a deletion that has
+// not started yet, or a waiter that is unrelated to the signer, does not
+// satisfy it. It fails when done reports early (the deletion did not wait for
+// the signer), when a query fails, or when the observation times out.
+func waitDeletionBlocked(t *testing.T, env *testenv.Env, what string, done <-chan error, statements ...string) {
 	t.Helper()
-	select {
-	case err := <-done:
-		t.Fatalf("%s finished while a signer held the snapshot row (err = %v)", what, err)
-	case <-time.After(400 * time.Millisecond):
+	patterns := make([]string, len(statements))
+	for i, s := range statements {
+		patterns[i] = "%" + s + "%"
+	}
+	ctx := context.Background()
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		rows, err := env.DB.Pool.Query(ctx, blockedOnSignerQuery, patterns)
+		if err != nil {
+			t.Fatalf("%s: observe the lock wait: %v", what, err)
+		}
+		var blocked []int32
+		for rows.Next() {
+			var pid int32
+			if err := rows.Scan(&pid); err != nil {
+				rows.Close()
+				t.Fatalf("%s: scan the lock wait: %v", what, err)
+			}
+			blocked = append(blocked, pid)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			t.Fatalf("%s: observe the lock wait: %v", what, err)
+		}
+		if len(blocked) > 0 {
+			return
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("%s finished while a signer held the snapshot row (err = %v); backends:%s", what, err, describeBackends(ctx, env))
+		case <-timeout.C:
+			t.Fatalf("timed out waiting for %s to block on the signer; backends:%s", what, describeBackends(ctx, env))
+		case <-tick.C:
+		}
 	}
 }
 
@@ -258,7 +355,9 @@ func TestSnapshotDeletionWaitsForSigner(t *testing.T) {
 		_, err := org.OwnerClient.Snapshot.DeleteSnapshot(ctx, connect.NewRequest(&ownsandv1.DeleteSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID}))
 		done <- err
 	}()
-	assertBlocked(t, "DeleteSnapshot", done)
+	waitDeletionBlocked(t, env, "DeleteSnapshot", done,
+		"FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2 FOR UPDATE",
+		"DELETE FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2")
 	env.Clock.Advance(5 * time.Minute) // the signer is slow: it signs 5 minutes after it authorized
 	gate.open()
 	grant := waitGrant(agent, "sign-first")
@@ -350,7 +449,9 @@ func TestOrganizationDeletionWaitsForSigner(t *testing.T) {
 		_, err := org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: org.ID}))
 		done <- err
 	}()
-	assertBlocked(t, "DeleteOrganization", done)
+	waitDeletionBlocked(t, env, "DeleteOrganization", done,
+		"FROM snapshots WHERE device_id = $1 ORDER BY snapshot_id FOR UPDATE",
+		"DELETE FROM organizations WHERE organization_id = $1")
 	env.Clock.Advance(5 * time.Minute)
 	gate.open()
 	if err := <-done; err != nil {
