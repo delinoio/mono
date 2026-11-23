@@ -7,6 +7,7 @@ import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
 import { useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../../api.ts";
+import { useActionFailure } from "../../components/action-failure.tsx";
 import { useBillingAccount } from "../../components/shell.tsx";
 import {
   ConfirmDialog,
@@ -21,7 +22,7 @@ import {
   TOP_UP_MAX_USD_MICROS,
   TOP_UP_MIN_USD_MICROS,
 } from "../../forms.ts";
-import { errorMessage, formatDate, labels } from "../../format.ts";
+import { formatDate, labels } from "../../format.ts";
 import {
   CreditService,
   type Subscription,
@@ -216,6 +217,7 @@ function SubscriptionCard() {
   const { billingAccountId, role } = useBillingAccount();
   const queryClient = useQueryClient();
   const checkout = useCheckout();
+  const actionFailure = useActionFailure();
   const subscription = useQuery(
     CreditService.method.getSubscription,
     { billingAccountId },
@@ -337,6 +339,7 @@ function SubscriptionCard() {
         </p>
       ) : null}
       {startError !== undefined ? <ErrorNotice error={startError} /> : null}
+      {actionFailure.notice}
       {canPay ? (
         <div className="actions">
           {startable ? (
@@ -363,9 +366,10 @@ function SubscriptionCard() {
               onClick={async () => {
                 try {
                   await resume.mutateAsync({ billingAccountId });
+                  actionFailure.clear();
                   toast.success("The subscription continues.");
                 } catch (error) {
-                  toast.error(errorMessage(error));
+                  actionFailure.report(error);
                 }
               }}
             >

@@ -8,6 +8,7 @@ import { toast } from "delino-ui/toast";
 import { useState } from "react";
 import { invalidateServices } from "../../api.ts";
 import { useAuth } from "../../auth.tsx";
+import { useActionFailure } from "../../components/action-failure.tsx";
 import { useBillingAccount } from "../../components/shell.tsx";
 import {
   ConfirmDialog,
@@ -19,7 +20,7 @@ import {
   MorePages,
 } from "../../components/ui.tsx";
 import { checkEmail } from "../../forms.ts";
-import { errorMessage, formatDate, labels } from "../../format.ts";
+import { formatDate, labels } from "../../format.ts";
 import { useAllPages } from "../../paging.ts";
 import {
   type BillingAccountMember,
@@ -42,6 +43,7 @@ export function MembersSection() {
   const { userId } = useAuth();
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
+  const roleFailure = useActionFailure();
   const refresh = () => invalidateServices(queryClient, BillingAccountService);
   const members = useAllPages(
     BillingAccountService.method.listMembers,
@@ -85,6 +87,7 @@ export function MembersSection() {
           ) : null}
         </div>
         <RefetchNotice error={members.refreshError} onRetry={members.refetch} />
+        {roleFailure.notice}
         {members.isPending ? (
           <Loading label="Loading members" />
         ) : members.error ? (
@@ -119,9 +122,10 @@ export function MembersSection() {
                                 userId: m.userId,
                                 role: Number(v) as BillingAccountRole,
                               });
+                              roleFailure.clear();
                               toast.success("The role is changed.");
                             } catch (error) {
-                              toast.error(errorMessage(error));
+                              roleFailure.report(error);
                             }
                           }}
                         >
@@ -216,6 +220,7 @@ export function MembersSection() {
 function Invitations() {
   const { billingAccountId } = useBillingAccount();
   const queryClient = useQueryClient();
+  const revokeFailure = useActionFailure();
   const refresh = () => invalidateServices(queryClient, BillingAccountService);
   const list = useAllPages(
     BillingAccountService.method.listInvitations,
@@ -256,6 +261,7 @@ function Invitations() {
         </Button>
       </div>
       <RefetchNotice error={list.refreshError} onRetry={list.refetch} />
+      {revokeFailure.notice}
       {list.isPending ? (
         <Loading label="Loading invitations" />
       ) : list.error ? (
@@ -282,9 +288,10 @@ function Invitations() {
                         billingAccountId,
                         invitationId: i.invitationId,
                       });
+                      revokeFailure.clear();
                       toast.success("The invitation is revoked.");
                     } catch (error) {
-                      toast.error(errorMessage(error));
+                      revokeFailure.report(error);
                     }
                   }}
                 >

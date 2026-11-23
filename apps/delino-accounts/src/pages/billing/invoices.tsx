@@ -2,9 +2,9 @@
 import { useInfiniteQuery, useTransport } from "@connectrpc/connect-query";
 import { createClient } from "@connectrpc/connect";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
-import { toast } from "delino-ui/toast";
 import { useMemo } from "react";
 import { LIST_PAGE_SIZE } from "../../api.ts";
+import { useActionFailure } from "../../components/action-failure.tsx";
 import { useBillingAccount } from "../../components/shell.tsx";
 import {
   Empty,
@@ -12,7 +12,7 @@ import {
   Loading,
   RefetchNotice,
 } from "../../components/ui.tsx";
-import { errorMessage, formatDate, labels } from "../../format.ts";
+import { formatDate, labels } from "../../format.ts";
 import {
   CreditService,
   type Invoice,
@@ -73,6 +73,7 @@ export function InvoicesSection() {
     },
   );
   const list = invoices.data?.pages.flatMap((page) => page.invoices) ?? [];
+  const actionFailure = useActionFailure();
   const open = async (invoice: Invoice) => {
     const target = invoiceWindow.prepare();
     try {
@@ -81,9 +82,10 @@ export function InvoicesSection() {
         paddleTransactionId: invoice.paddleTransactionId,
       });
       target.navigate(res.invoiceUrl);
+      actionFailure.clear();
     } catch (error) {
       target.close();
-      toast.error(errorMessage(error));
+      actionFailure.report(error);
     }
   };
   return (
@@ -97,6 +99,7 @@ export function InvoicesSection() {
         error={invoices.isRefetchError ? invoices.error : undefined}
         onRetry={() => void invoices.refetch()}
       />
+      {actionFailure.notice}
       {invoices.isPending ? (
         <Loading label="Loading invoices" />
       ) : invoices.isLoadingError ? (
