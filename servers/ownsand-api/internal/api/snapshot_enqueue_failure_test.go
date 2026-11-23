@@ -13,10 +13,12 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
-// enqueueFailureDeadline is the RPC deadline of these tests. It is shorter
-// than the queue-full wait of the saturated channel, so the request context
-// ends first: the command send fails before enqueue and the channel stays
-// open.
+// enqueueFailureDeadline is the RPC deadline of the compensation tests that
+// still end their request by a deadline. It is shorter than the queue-full
+// wait of the saturated channel, so the request context ends first: the
+// command send fails before enqueue and the channel stays open. Tests that
+// need the committed state first cancel the request themselves instead (see
+// failRPCAfterCommit).
 const enqueueFailureDeadline = 100 * time.Millisecond
 
 func snapshotStateOf(t *testing.T, c *testenv.Clients, orgID, snapshotID string) ownsandv1.SnapshotState {
@@ -31,10 +33,12 @@ func snapshotStateOf(t *testing.T, c *testenv.Clients, orgID, snapshotID string)
 // TestCreateSnapshotEnqueueFailureLeavesNoCreatingRow checks that a
 // CreateSnapshot whose request ends before the command is queued does not
 // leave the committed CREATING record behind: the record becomes FAILED
-// even though the request context that caused the failure is done.
+// even though the request context that caused the failure is done. The test
+// cancels the request only after it observed the committed CREATING record,
+// so the outcome does not depend on how fast the request commits.
 func TestCreateSnapshotEnqueueFailureLeavesNoCreatingRow(t *testing.T) {
 	env := testenv.New(t)
-	env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
+	env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 	ctx := context.Background()
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
@@ -47,20 +51,25 @@ func TestCreateSnapshotEnqueueFailureLeavesNoCreatingRow(t *testing.T) {
 	waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 
 	saturate(t, env, agent)
-	rpcCtx, cancel := context.WithTimeout(ctx, enqueueFailureDeadline)
-	defer cancel()
-	if _, err := c.Snapshot.CreateSnapshot(rpcCtx, connect.NewRequest(&ownsandv1.CreateSnapshotRequest{OrganizationId: org.ID, SandboxId: sandboxID})); err == nil {
-		t.Fatal("CreateSnapshot on a saturated channel succeeded")
-	}
+	var snapID string
+	failRPCAfterCommit(t, "CreateSnapshot",
+		func(ctx context.Context) error {
+			_, err := c.Snapshot.CreateSnapshot(ctx, connect.NewRequest(&ownsandv1.CreateSnapshotRequest{OrganizationId: org.ID, SandboxId: sandboxID}))
+			return err
+		},
+		func() bool {
+			list, err := c.Snapshot.ListSnapshots(ctx, connect.NewRequest(&ownsandv1.ListSnapshotsRequest{OrganizationId: org.ID}))
+			if err != nil || len(list.Msg.GetSnapshots()) != 1 || list.Msg.GetSnapshots()[0].GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING {
+				return false
+			}
+			snapID = list.Msg.GetSnapshots()[0].GetSnapshotId()
+			return true
+		})
 
-	list, err := c.Snapshot.ListSnapshots(ctx, connect.NewRequest(&ownsandv1.ListSnapshotsRequest{OrganizationId: org.ID}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n := len(list.Msg.GetSnapshots()); n != 1 {
-		t.Fatalf("snapshots = %d, want the one record of the failed attempt", n)
-	}
-	snapID := list.Msg.GetSnapshots()[0].GetSnapshotId()
+	testenv.Eventually(t, "the same snapshot is the only record", func() bool {
+		list, err := c.Snapshot.ListSnapshots(ctx, connect.NewRequest(&ownsandv1.ListSnapshotsRequest{OrganizationId: org.ID}))
+		return err == nil && len(list.Msg.GetSnapshots()) == 1 && list.Msg.GetSnapshots()[0].GetSnapshotId() == snapID
+	})
 	testenv.Eventually(t, "snapshot FAILED", func() bool {
 		return snapshotStateOf(t, c, org.ID, snapID) == ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED
 	})
@@ -72,7 +81,7 @@ func TestCreateSnapshotEnqueueFailureLeavesNoCreatingRow(t *testing.T) {
 // attempt instead of returning the stranded EXPORTING state.
 func TestExportSnapshotEnqueueFailureAllowsRetry(t *testing.T) {
 	env := testenv.New(t)
-	env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
+	env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 	ctx := context.Background()
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
@@ -86,11 +95,7 @@ func TestExportSnapshotEnqueueFailureAllowsRetry(t *testing.T) {
 	snapID := plainSnapshot(t, org, sandboxID)
 
 	saturate(t, env, agent)
-	rpcCtx, cancel := context.WithTimeout(ctx, enqueueFailureDeadline)
-	defer cancel()
-	if _, err := c.Snapshot.ExportSnapshot(rpcCtx, connect.NewRequest(&ownsandv1.ExportSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID})); err == nil {
-		t.Fatal("ExportSnapshot on a saturated channel succeeded")
-	}
+	exportFailsAfterClaim(t, c, org.ID, snapID)
 	waitExportState(t, c, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
 	if ids := exportCommandIDs(agent); len(ids) != 0 {
 		t.Fatalf("export commands before the retry = %v", ids)

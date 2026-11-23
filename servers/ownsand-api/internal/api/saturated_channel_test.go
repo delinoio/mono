@@ -24,6 +24,61 @@ import (
 // saturationQueueFullWait is the shortened queue-full wait of these tests.
 const saturationQueueFullWait = 300 * time.Millisecond
 
+// saturationConfirmations is the number of consecutive timed-out fill sends
+// that saturate requires before it reports a full queue.
+const saturationConfirmations = 4
+
+// committedStateQueueFullWait is the queue-full wait of the tests that cancel
+// their request themselves. It is far longer than the tests, so a command
+// send on the saturated channel waits for room that never comes until the
+// test cancels the request, and the channel never closes on its own.
+const committedStateQueueFullWait = 30 * time.Second
+
+// rpcTimeout bounds the wait for a canceled RPC to return.
+const rpcTimeout = 10 * time.Second
+
+// failRPCAfterCommit calls rpc in a goroutine with a cancellable context,
+// waits until committed reports the state that the request commits before it
+// blocks on the saturated channel, then cancels the request and requires the
+// RPC to fail. The wait for the committed state polls through the caller's
+// own clients, so it does not depend on the request context or on how fast
+// the request authorizes and writes. The channel must be saturated, and its
+// queue-full wait must be longer than the test (committedStateQueueFullWait),
+// so the send is still waiting for room when the cancellation arrives. The
+// cancellation is also registered for cleanup.
+func failRPCAfterCommit(t *testing.T, what string, rpc func(ctx context.Context) error, committed func() bool) {
+	t.Helper()
+	rpcCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	rpcDone := make(chan error, 1)
+	go func() { rpcDone <- rpc(rpcCtx) }()
+	testenv.Eventually(t, what+" committed", committed)
+	cancel()
+	select {
+	case err := <-rpcDone:
+		if err == nil {
+			t.Fatalf("%s on a saturated channel succeeded", what)
+		}
+	case <-time.After(rpcTimeout):
+		t.Fatalf("%s did not return after its request was canceled", what)
+	}
+}
+
+// exportFailsAfterClaim calls ExportSnapshot on a saturated channel, waits
+// for the committed EXPORTING claim, then cancels the request, so the
+// command send fails before enqueue and the handler reaches its compensation.
+func exportFailsAfterClaim(t *testing.T, c *testenv.Clients, orgID, snapshotID string) {
+	t.Helper()
+	failRPCAfterCommit(t, "ExportSnapshot",
+		func(ctx context.Context) error {
+			_, err := c.Snapshot.ExportSnapshot(ctx, connect.NewRequest(&ownsandv1.ExportSnapshotRequest{OrganizationId: orgID, SnapshotId: snapshotID}))
+			return err
+		},
+		func() bool {
+			return snapshotExportState(t, c, orgID, snapshotID) == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING
+		})
+}
+
 // saturate stops the agent from reading its channel and fills the transport
 // and the outbound queue of its channel, so that the next Send waits for
 // room that never comes. The fill uses a caller deadline that is shorter
@@ -53,18 +108,28 @@ func saturate(t *testing.T, env *testenv.Env, agent *testenv.FakeAgent) {
 	big := &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{
 		StunUrls: []string{hex.EncodeToString(payload)},
 	}}}
+	// One send that times out is not proof of a full queue: on a loaded
+	// machine the writer goroutine can be descheduled for longer than the
+	// send deadline while it still drains, and the room that it frees later
+	// would let the send of the test succeed. The channel counts as
+	// saturated after several consecutive timeouts.
+	timeouts := 0
 	for i := 0; ; i++ {
-		if i > 2000 {
+		if i > 2000+saturationConfirmations {
 			t.Fatal("the stalled channel never filled")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), saturationQueueFullWait/4)
 		err := conn.Send(ctx, big)
 		cancel()
-		if errors.Is(err, context.DeadlineExceeded) {
-			return
-		}
-		if err != nil {
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			if timeouts++; timeouts >= saturationConfirmations {
+				return
+			}
+		case err != nil:
 			t.Fatalf("fill send %d: %v", i, err)
+		default:
+			timeouts = 0
 		}
 	}
 }
