@@ -545,6 +545,148 @@ describe("narrow screens", () => {
   });
 });
 
+// A name that is one 100-character word, the longest the console accepts. It
+// has no space to break at, so it must wrap inside its container.
+const LONG_NAME_PREFIX = "LONGNAME_";
+const LONG_NAME = LONG_NAME_PREFIX + "a".repeat(100 - LONG_NAME_PREFIX.length);
+
+describe("long names", () => {
+  test("wraps the title of a dialog instead of widening the panel", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/snapshots`);
+    await screen.getByRole("button", "Make template").first().tap();
+    // The template name field takes the initial focus.
+    await expect(screen.getByLabel("Template name")).toBeFocused();
+    await browser.keyboard.type(LONG_NAME);
+    await screen.getByRole("button", "Create template").tap();
+    // Wait for the form dialog to finish closing, because it keeps the page
+    // inert until then.
+    await expect(screen.getByRole("dialog", "Make a template")).toBeHidden();
+    await expect(
+      screen.getByText(LONG_NAME, { exact: false }).first(),
+    ).toBeVisible();
+
+    for (const width of [1280, 390]) {
+      await browser.setViewport({ width, height: 800 });
+      // The snapshot row contains the template rows, so it matches too. The
+      // template row is the last match in document order.
+      await screen
+        .getByRole("listitem")
+        .filter({ hasText: LONG_NAME })
+        .last()
+        .getByRole("button", "Delete")
+        .tap();
+      const dialog = screen.getByRole(
+        "alertdialog",
+        `Delete the template ${LONG_NAME}?`,
+      );
+      await expect(dialog).toBeVisible();
+      const m = await measureDialog(browser);
+      expect(m.panelScrollWidth).toBeLessThanOrEqual(m.panelClientWidth);
+      expect(m.titleScrollWidth).toBeLessThanOrEqual(m.titleClientWidth);
+      // The title wraps onto several lines.
+      expect(m.titleHeight).toBeGreaterThan(m.titleLineHeight * 2);
+      await browser.keyboard.press("Escape");
+      await expect(dialog).toBeHidden();
+    }
+  });
+
+  test("keeps a short dialog title on one line", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await browser.setViewport({ width: 390, height: 800 });
+    await app.open(`/orgs/${ACME}/snapshots`);
+    await screen.getByRole("button", "Delete").first().tap();
+    await expect(
+      screen.getByRole("alertdialog", "Delete this snapshot?"),
+    ).toBeVisible();
+    const m = await measureDialog(browser);
+    expect(m.titleHeight).toBeLessThanOrEqual(m.titleLineHeight * 1.5);
+  });
+
+  test("keeps the organization list inside the viewport", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    for (const width of [390, 320]) {
+      await app.open("/");
+      await browser.setViewport({ width, height: 844 });
+      await screen.getByRole("button", "Create organization").tap();
+      await expect(screen.getByLabel("Organization name")).toBeFocused();
+      await browser.keyboard.type(LONG_NAME);
+      await screen.getByRole("button", "Create").tap();
+      await expect(browser).toHaveURL(/\/orgs\/[0-9a-f-]+\/sandboxes$/);
+
+      await screen.getByRole("combobox", "Organization").tap();
+      await expect(screen.getByRole("listbox")).toBeVisible();
+      const m = await browser.evaluate(() => {
+        const popup = document.querySelector(".dui-select-content");
+        const box = popup?.getBoundingClientRect();
+        return {
+          left: box ? Math.round(box.left) : -1,
+          right: box ? Math.round(box.right) : -1,
+          viewportWidth: document.documentElement.clientWidth,
+        };
+      });
+      expect(m.left).toBeGreaterThanOrEqual(0);
+      expect(m.right).toBeLessThanOrEqual(m.viewportWidth);
+      // The whole name stays readable: it wraps instead of being cut off.
+      await expect(screen.getByRole("option", LONG_NAME)).toBeVisible();
+      await browser.keyboard.press("Escape");
+    }
+  });
+});
+
+interface DialogMetrics {
+  panelScrollWidth: number;
+  panelClientWidth: number;
+  titleScrollWidth: number;
+  titleClientWidth: number;
+  titleHeight: number;
+  titleLineHeight: number;
+}
+
+async function measureDialog(browser: {
+  evaluate<T extends import("e2e").JsonValue>(fn: () => T): Promise<T>;
+}): Promise<DialogMetrics> {
+  return browser.evaluate(() => {
+    const panel = document.querySelector(".dui-dialog-content[data-open]");
+    const title = panel?.querySelector(".dui-dialog-title");
+    if (!panel || !title) {
+      return {
+        panelScrollWidth: -1,
+        panelClientWidth: -1,
+        titleScrollWidth: -1,
+        titleClientWidth: -1,
+        titleHeight: -1,
+        titleLineHeight: -1,
+      };
+    }
+    const style = getComputedStyle(title);
+    return {
+      panelScrollWidth: panel.scrollWidth,
+      panelClientWidth: panel.clientWidth,
+      titleScrollWidth: title.scrollWidth,
+      titleClientWidth: title.clientWidth,
+      titleHeight: title.getBoundingClientRect().height,
+      titleLineHeight:
+        parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.2,
+    };
+  });
+}
+
 describe("design", () => {
   test(
     "keeps one primary action on the sandbox list",
