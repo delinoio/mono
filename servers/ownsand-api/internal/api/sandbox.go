@@ -504,10 +504,20 @@ func nonNil(m map[string]string) map[string]string {
 	return m
 }
 
+// importFlowContext returns the context that bounds the import and the create
+// send that follows it: the Timing.ImportWait deadline, unless a test replaced
+// it through the importContext hook.
+func (s *Service) importFlowContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if hook := s.importContext.Load(); hook != nil {
+		return (*hook)(parent)
+	}
+	return context.WithTimeout(parent, s.Timing.ImportWait)
+}
+
 // importThenCreate imports an exported snapshot on the selected device and
 // then sends the create command. A failed import fails the create.
 func (s *Service) importThenCreate(conn *hub.Conn, info commandInfo, src *resolvedSource, cmd *ownsandv1.CreateSandboxCommand) {
-	ctx, cancel := context.WithTimeout(conn.Context(), s.Timing.ImportWait)
+	ctx, cancel := s.importFlowContext(conn.Context())
 	defer cancel()
 	sn := src.snapshot.pb
 	importCmd := &ownsandv1.AgentCommand{CommandId: newID(), Command: &ownsandv1.AgentCommand_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotCommand{
