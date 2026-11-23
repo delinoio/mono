@@ -13,7 +13,7 @@ tags: postgres, mvcc, transactions, isolation, xid-wraparound, concurrency, seri
 - **REPEATABLE READ**: snapshot at first query; can cause serialization errors on write conflicts.
 - **SERIALIZABLE**: strongest; transactions appear serial; requires retry logic in app code.
 
-Readers never block writers; writers never block readers (only writer-writer conflicts on same row). No lock escalation — row locks never degrade to table locks.
+Ordinary snapshot reads (plain `SELECT`) and ordinary DML do not block each other through their normal row-data locks; only writers that touch the same row conflict. Locking reads such as `SELECT ... FOR UPDATE` and writes (or other lockers) can wait on each other for conflicting row locks on the same row, and a plain `SELECT` takes `ACCESS SHARE` on the table, so it waits behind a conflicting `ACCESS EXCLUSIVE` table lock (for example from DDL). No lock escalation — row locks never degrade to table locks.
 
 ## XID Wraparound
 
