@@ -347,10 +347,18 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 			fmt.Fprintf(stdout, "%s %s\n", c.bold("Removal:"), c.bad("in progress"))
 		}
 	}
+	// Only an absent status.json means the agent has not run. A file that
+	// cannot be read or decoded is an error: the report is skipped, the other
+	// sections still print, and the command exits with exitError.
+	code := exitOK
 	var s agent.Status
-	if err := st.LoadStatus(&s); err != nil {
+	switch err := st.LoadStatus(&s); {
+	case errors.Is(err, store.ErrNotFound):
 		fmt.Fprintf(stdout, "%s unknown (the agent has not run)\n", c.bold("Connection:"))
-	} else {
+	case err != nil:
+		fmt.Fprintln(stderr, "ownsand-agent: read status.json:", err)
+		code = exitError
+	default:
 		conn := c.bad("disconnected")
 		if s.Connected {
 			conn = c.ok("connected")
@@ -375,7 +383,7 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 	}
 	sort.Strings(snaps)
 	fmt.Fprintf(stdout, "%s %d\n", c.bold("Snapshots:"), len(snaps))
-	return exitOK
+	return code
 }
 
 // printCapabilities prints the capabilities of the last capability report
