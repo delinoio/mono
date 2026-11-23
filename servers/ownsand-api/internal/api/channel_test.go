@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -898,7 +899,14 @@ func TestHoldWithdrawsQueuedAgentUpdate(t *testing.T) {
 			}
 		}()
 		setPolicy(t, org, hold)
-		time.Sleep(500 * time.Millisecond)
+		// The policy change reaches the control event processor, which
+		// evaluates the update of the channel and blocks on the update lock.
+		// Wait until a goroutine is parked there before the lock is released;
+		// a fixed sleep cannot tell a blocked processor from a slow one.
+		awaitUpdateLockWait(t)
+		// The blocked decision sends nothing while the lock is held; a short
+		// bounded wait catches a withdrawal that would arrive early.
+		time.Sleep(100 * time.Millisecond)
 		if _, w := count(agent); w != 0 {
 			t.Fatalf("%d withdrawals while another decision held the channel", w)
 		}
@@ -906,6 +914,54 @@ func TestHoldWithdrawsQueuedAgentUpdate(t *testing.T) {
 		unlocked = true
 		agent.WaitFor("withdrawal after the decision ended", isWithdraw)
 	})
+}
+
+// goroutineStacks returns the stack traces of all goroutines.
+func goroutineStacks() string {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return string(buf[:n])
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
+// updateLockWaiters counts the goroutines in stacks that are parked on a
+// mutex inside an update evaluation, waiting for the update lock of a channel
+// (Service.evaluateUpdate calling Conn.LockUpdates). No production signal
+// reports a goroutine that waits for a sync.Mutex, so the test reads the
+// goroutine stacks. The match uses the two frames of this repository and the
+// blocked state in the goroutine header; the frames of the sync package differ
+// between Go versions, and the mutex Lock frame may be inlined, so it is not
+// matched.
+func updateLockWaiters(stacks string) int {
+	waiters := 0
+	for _, trace := range strings.Split(stacks, "\n\n") {
+		header, _, _ := strings.Cut(trace, "\n")
+		blocked := strings.Contains(header, "sync.Mutex.Lock") || strings.Contains(header, "semacquire")
+		if blocked && strings.Contains(trace, "(*Service).evaluateUpdate") && strings.Contains(trace, "(*Conn).LockUpdates") {
+			waiters++
+		}
+	}
+	return waiters
+}
+
+// awaitUpdateLockWait fails the test unless a goroutine reaches the wait for
+// the update lock of a channel before the deadline. It reports the stacks of
+// all goroutines on failure.
+func awaitUpdateLockWait(t *testing.T) {
+	t.Helper()
+	const deadline = 10 * time.Second
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		if updateLockWaiters(goroutineStacks()) > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no goroutine waited for the update lock within %s; goroutines:\n%s", deadline, goroutineStacks())
 }
 
 // TestAgentUpdateTargetOrdering checks which update target the control
