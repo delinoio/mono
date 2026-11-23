@@ -27,8 +27,12 @@ func TestHookExitCodes(t *testing.T) {
 
 func TestSocketPath(t *testing.T) {
 	none := func(string) string { return "" }
-	if got := SocketPath(none, "/run/tc1/hooks/spawn-runner"); got != "/run/tc1/sock" {
-		t.Fatalf("from the hook path: %q", got)
+	// SocketPath works with host paths, so build the expected path with the
+	// host's separators and an absolute root (a drive letter on Windows).
+	root := t.TempDir()
+	hook := filepath.Join(root, "hooks", "spawn-runner")
+	if got, want := SocketPath(none, hook), filepath.Join(root, "sock"); got != want {
+		t.Fatalf("from the hook path: %q, want %q", got, want)
 	}
 	env := func(k string) string {
 		if k == SocketEnv {
