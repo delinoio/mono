@@ -23,6 +23,7 @@ import {
 } from "./index.ts";
 import { waitForSnapshotReady, withCleanup } from "./testing/e2e-support.ts";
 import { expectCleanExit } from "./testing/exec-assert.ts";
+import { MarkerOffsetFinder } from "./testing/marker-offset.ts";
 
 const env = process.env;
 const apiUrl = env.OWNSAND_E2E_API_URL ?? "";
@@ -211,16 +212,22 @@ async function expectSuspended(
             const handle = sandbox.exec({
               command: ["/bin/sh", "-c", "echo one; sleep 2; echo two; exit 3"],
             });
-            let first = "";
+            // A stdout event is a buffered read: it can hold both lines, or
+            // end inside "one\n". Find the end of the first marker in the
+            // concatenated bytes and attach from that byte offset.
+            const finder = new MarkerOffsetFinder("one\n");
+            let markerEnd: number | undefined;
             for await (const event of handle) {
               if (event.type === ExecEventType.Stdout) {
-                first = decoder.decode(event.data);
-                break;
+                markerEnd = finder.push(event.data);
+                if (markerEnd !== undefined) {
+                  break;
+                }
               }
             }
-            expect(first).toBe("one\n");
+            expect(markerEnd).toBeDefined();
             const attached = sandbox.attachExec(handle.execId, {
-              stdoutOffset: BigInt(first.length),
+              stdoutOffset: BigInt(markerEnd ?? 0),
             });
             let rest = "";
             for await (const event of attached) {
