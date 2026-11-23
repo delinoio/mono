@@ -217,7 +217,11 @@ func (a *app) parseUntil(fs *flag.FlagSet, args []string, stopAfter int) ([]stri
 	for {
 		if err := fs.Parse(args); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
-				a.printFlags(fs)
+				// A failed write of the help (a full disk or a closed pipe)
+				// exits with 1 and the write error, as a failed result does.
+				if werr := a.printFlags(fs); werr != nil {
+					return nil, werr
+				}
 				return nil, &exitError{code: ExitOK}
 			}
 			return nil, usageErr("%s: %v", fs.Name(), err)
@@ -268,18 +272,23 @@ func endedWithTerminator(fs *flag.FlagSet, consumed []string) bool {
 	return false
 }
 
-func (a *app) printFlags(fs *flag.FlagSet) {
+// printFlags writes the help of fs to standard output and returns the first
+// write error.
+func (a *app) printFlags(fs *flag.FlagSet) error {
 	// The root flag set reads `ownsand --help` and `ownsand -h` before the
 	// command switch sees them, so it prints the full usage instead of the
 	// global flags under the name "ownsand ownsand".
 	if fs.Name() == rootFlagSetName {
-		a.usage(a.env.Stdout)
-		return
+		return a.usage(a.env.Stdout)
 	}
-	fmt.Fprintf(a.env.Stdout, "Usage: ownsand %s [flags]\n\nFlags:\n", fs.Name())
-	fs.SetOutput(a.env.Stdout)
+	// flag.FlagSet.PrintDefaults has no error result, so a stickyWriter keeps
+	// the first write error across the header and the flag lines.
+	w := &stickyWriter{w: a.env.Stdout}
+	fmt.Fprintf(w, "Usage: ownsand %s [flags]\n\nFlags:\n", fs.Name())
+	fs.SetOutput(w)
 	fs.PrintDefaults()
 	fs.SetOutput(io.Discard)
+	return w.err
 }
 
 func (a *app) applyGlobals() error {
@@ -311,14 +320,15 @@ func (a *app) run(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(rest) == 0 {
-		a.usage(a.env.Stderr)
+		// The usage goes to standard error on a usage error; a failed write
+		// there cannot be reported anywhere else, so it stays best-effort.
+		_ = a.usage(a.env.Stderr)
 		return &exitError{code: ExitUsage}
 	}
 	group := rest[0]
 	switch group {
 	case "help", "-h", "--help":
-		a.usage(a.env.Stdout)
-		return nil
+		return a.usage(a.env.Stdout)
 	case "login":
 		return a.login(ctx, rest[1:])
 	case "logout":
@@ -396,7 +406,9 @@ func init() {
 	}
 }
 
-func (a *app) usage(w io.Writer) {
+// usage writes the command usage to out and returns the first write error.
+func (a *app) usage(out io.Writer) error {
+	w := &stickyWriter{w: out}
 	fmt.Fprint(w, `Usage: ownsand [global flags] <command> <subcommand> [flags] [arguments]
 
 Commands:
@@ -423,6 +435,7 @@ Global flags:
 Authentication: OWNSAND_API_KEY selects an organization API key; otherwise
 the CLI uses the tokens that 'ownsand login' stored.
 `)
+	return w.err
 }
 
 // store returns the credential store.
