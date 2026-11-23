@@ -5,11 +5,15 @@ import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { toast } from "delino-ui/toast";
 import { EnrollmentTokenState } from "@delino/ownsand-protos/v1/common_pb";
-import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import {
+  type EnrollmentToken,
+  DeviceService,
+} from "@delino/ownsand-protos/v1/device_pb";
 import { useMemo, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
+  ConfirmDialog,
   Empty,
   FormDialog,
   MorePagesNotice,
@@ -17,7 +21,6 @@ import {
   QueryBoundary,
   SecretDialog,
   ShortId,
-  toastError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import {
@@ -63,6 +66,7 @@ export function EnrollmentTokensPage() {
   const [creating, setCreating] = useState(false);
   const [ttl, setTtl] = useState("1");
   const [token, setToken] = useState<string>();
+  const [revoking, setRevoking] = useState<EnrollmentToken>();
 
   return (
     <>
@@ -104,17 +108,7 @@ export function EnrollmentTokensPage() {
                         <Button
                           variant={ButtonVariant.Secondary}
                           size={ButtonSize.Small}
-                          onClick={async () => {
-                            try {
-                              await revoke.mutateAsync({
-                                organizationId,
-                                enrollmentTokenId: t.enrollmentTokenId,
-                              });
-                              toast.success("The token is revoked.");
-                            } catch (error) {
-                              toastError(error);
-                            }
-                          }}
+                          onClick={() => setRevoking(t)}
                         >
                           Revoke
                         </Button>
@@ -128,6 +122,20 @@ export function EnrollmentTokensPage() {
           )
         }
       </QueryBoundary>
+      <ConfirmDialog
+        open={revoking !== undefined}
+        onOpenChange={(open) => !open && setRevoking(undefined)}
+        title={`Revoke token ${revoking ? `${revoking.tokenPrefix}…` : ""}?`}
+        description="The token stops working at once. It cannot be restored; create a new token instead."
+        confirmLabel="Revoke token"
+        onConfirm={async () => {
+          await revoke.mutateAsync({
+            organizationId,
+            enrollmentTokenId: revoking!.enrollmentTokenId,
+          });
+          toast.success("The token is revoked.");
+        }}
+      />
       <FormDialog
         open={creating}
         onOpenChange={setCreating}

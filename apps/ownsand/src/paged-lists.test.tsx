@@ -169,6 +169,13 @@ describe("enrollment tokens list", () => {
       await act(async () => {
         fireEvent.click(within(last).getByRole("button", { name: "Revoke" }));
       });
+      // Revoking asks for a confirmation first.
+      const confirmation = await screen.findByRole("alertdialog", {}, WAIT);
+      await act(async () => {
+        fireEvent.click(
+          within(confirmation).getByRole("button", { name: "Revoke token" }),
+        );
+      });
       await waitFor(() => {
         const after = itemsOf("Enrollment tokens");
         expect(after).toHaveLength(ALL_ROWS + 1);

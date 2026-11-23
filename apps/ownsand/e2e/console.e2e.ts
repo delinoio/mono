@@ -208,6 +208,43 @@ describe("devices", () => {
     await expect(screen.getByText("studio-mac").first()).toBeVisible();
     await expect(screen.getByText("build-box-1")).toBeHidden();
   });
+
+  test("asks before it revokes a pending enrollment token", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/enrollment-tokens`);
+    await screen.getByRole("button", "Create token").tap();
+    await screen.getByRole("dialog").getByRole("button", "Create token").tap();
+    await screen.getByRole("button", "Done").tap();
+    await expect(
+      screen.getByRole("dialog", "Your new enrollment token"),
+    ).toBeHidden();
+    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+
+    await screen.getByRole("button", "Revoke").tap();
+    const dialog = screen.getByRole("alertdialog", "Revoke token ose_", {
+      exact: false,
+    });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("button", "Cancel")).toBeFocused();
+    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+
+    await browser.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+
+    await screen.getByRole("button", "Revoke").tap();
+    await screen
+      .getByRole("alertdialog", "Revoke token ose_", { exact: false })
+      .getByRole("button", "Revoke token")
+      .tap();
+    await expect(screen.getByText("The token is revoked.")).toBeVisible();
+    await expect(screen.getByText("Not used", { exact: false })).toBeHidden();
+  });
 });
 
 describe("roles", () => {

@@ -6,6 +6,7 @@ import { Select, SelectOption } from "delino-ui/select";
 import { toast } from "delino-ui/toast";
 import { InvitationState, Role } from "@delino/ownsand-protos/v1/common_pb";
 import {
+  type Invitation,
   type Member,
   MemberService,
 } from "@delino/ownsand-protos/v1/member_pb";
@@ -190,6 +191,7 @@ function Invitations() {
   const [creating, setCreating] = useState(false);
   const [inviteRole, setInviteRole] = useState(String(Role.MEMBER));
   const [link, setLink] = useState<string>();
+  const [revoking, setRevoking] = useState<Invitation>();
   const pending =
     list.data?.invitations.filter((i) => i.state === InvitationState.PENDING) ??
     [];
@@ -225,17 +227,7 @@ function Invitations() {
                   <Button
                     variant={ButtonVariant.Secondary}
                     size={ButtonSize.Small}
-                    onClick={async () => {
-                      try {
-                        await revoke.mutateAsync({
-                          organizationId,
-                          invitationId: i.invitationId,
-                        });
-                        toast.success("The invitation is revoked.");
-                      } catch (error) {
-                        toastError(error);
-                      }
-                    }}
+                    onClick={() => setRevoking(i)}
                   >
                     Revoke
                   </Button>
@@ -245,6 +237,20 @@ function Invitations() {
           )
         }
       </QueryBoundary>
+      <ConfirmDialog
+        open={revoking !== undefined}
+        onOpenChange={(open) => !open && setRevoking(undefined)}
+        title={`Revoke invitation ${revoking ? `${revoking.secretPrefix}…` : ""}?`}
+        description="The invitation link stops working at once. It cannot be restored; create a new link instead."
+        confirmLabel="Revoke invitation"
+        onConfirm={async () => {
+          await revoke.mutateAsync({
+            organizationId,
+            invitationId: revoking!.invitationId,
+          });
+          toast.success("The invitation is revoked.");
+        }}
+      />
       <FormDialog
         open={creating}
         onOpenChange={setCreating}
