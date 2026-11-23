@@ -23,6 +23,7 @@ import {
   exportArguments,
   exportEnvironment,
   FailureReason,
+  mergeEnvironment,
   parseArguments,
   parseExport,
   ProjectConfigFile,
@@ -406,6 +407,71 @@ test("exportEnvironment removes only the CLI logging variables", () => {
     }),
     { HOME: "/home/user", DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/bus" },
   );
+});
+
+test("mergeEnvironment on win32 replaces an inherited name that differs by case", () => {
+  // Both orders matter: Windows keeps the first spelling in sorted order, so
+  // the stale inherited spelling must not reach the child at all.
+  for (const [inheritedName, fetchedName] of [
+    ["FIXTURE_VALUE", "fixture_value"],
+    ["fixture_value", "FIXTURE_VALUE"],
+    ["Fixture_Value", "FIXTURE_VALUE"],
+    ["FIXTURE_VALUE", "FIXTURE_VALUE"],
+  ]) {
+    assert.deepEqual(
+      mergeEnvironment(
+        { [inheritedName]: "stale", UNRELATED: "kept", Unrelated2: "kept2" },
+        { [fetchedName]: "fresh" },
+        "win32",
+      ),
+      { UNRELATED: "kept", Unrelated2: "kept2", [fetchedName]: "fresh" },
+      `${inheritedName} inherited, ${fetchedName} fetched`,
+    );
+  }
+});
+
+test("mergeEnvironment on win32 removes every inherited spelling of a name", () => {
+  assert.deepEqual(
+    mergeEnvironment(
+      { FOO: "a", Foo: "b", foo: "c", BAR: "kept" },
+      { Foo: "fresh" },
+      "win32",
+    ),
+    { BAR: "kept", Foo: "fresh" },
+  );
+});
+
+test("mergeEnvironment keeps differently cased names distinct elsewhere", () => {
+  for (const platform of ["linux", "darwin"]) {
+    assert.deepEqual(
+      mergeEnvironment(
+        { FIXTURE_VALUE: "stale", other: "kept" },
+        { fixture_value: "fresh", OTHER: "x" },
+        platform,
+      ),
+      {
+        FIXTURE_VALUE: "stale",
+        other: "kept",
+        fixture_value: "fresh",
+        OTHER: "x",
+      },
+      platform,
+    );
+    // An exact-name override still replaces the inherited value.
+    assert.deepEqual(
+      mergeEnvironment({ A: "old", B: "kept" }, { A: "new" }, platform),
+      { A: "new", B: "kept" },
+    );
+  }
+});
+
+test("mergeEnvironment uses the host platform by default and keeps __proto__", () => {
+  const injected = Object.fromEntries([["__proto__", "own"]]);
+  const merged = mergeEnvironment({ KEPT: "1" }, injected);
+  assert.equal(Object.getPrototypeOf(merged), Object.prototype);
+  assert.equal(Object.hasOwn(merged, "__proto__"), true);
+  assert.deepEqual(Object.keys(merged), ["KEPT", "__proto__"]);
+  assert.deepEqual(mergeEnvironment({ A: "1" }, {}, "win32"), { A: "1" });
 });
 
 test("parseExport keeps valid names and skips reserved and invalid ones", () => {

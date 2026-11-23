@@ -201,6 +201,40 @@ export function exportEnvironment(env) {
   return result;
 }
 
+// Windows compares environment variable names without regard to case, and a
+// child process receives one value per name. JavaScript objects compare keys
+// exactly, so a platform-aware key makes `Path` and `PATH` one name on win32
+// while POSIX keeps differently cased names distinct.
+function nameKey(name, platform) {
+  return platform === "win32" ? name.toUpperCase() : name;
+}
+
+// Environment of the development command: the inherited environment with the
+// Infisical values added over it, as `infisical run` does. On win32 an
+// inherited name that differs from an Infisical name only by case is removed
+// first. Otherwise both spellings would reach the child, and Windows keeps
+// only the first one in sorted order, which can be the stale inherited value.
+// Other inherited variables stay untouched.
+export function mergeEnvironment(
+  inherited,
+  injected,
+  platform = process.platform,
+) {
+  const injectedKeys = new Set(
+    Object.keys(injected).map((name) => nameKey(name, platform)),
+  );
+  // `Object.fromEntries` and spread define own data properties, so a variable
+  // named `__proto__` stays an own property like in `parseExport`.
+  return {
+    ...Object.fromEntries(
+      Object.entries(inherited).filter(
+        ([name]) => !injectedKeys.has(nameKey(name, platform)),
+      ),
+    ),
+    ...injected,
+  };
+}
+
 // Arguments of the fetch.
 export function exportArguments(folder) {
   return [
@@ -400,8 +434,8 @@ async function main() {
       return 1;
     }
     // Infisical values replace inherited values of the same name, as
-    // `infisical run` does.
-    env = { ...process.env, ...fetched.variables };
+    // `infisical run` does; on Windows the names compare without case.
+    env = mergeEnvironment(process.env, fetched.variables);
     log({
       event: "dev_env_infisical",
       environment: DevelopmentEnvironment,
