@@ -3,6 +3,7 @@
 package billing
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -213,4 +214,132 @@ func TestCloseAccountMakesNoCheckoutCallWithoutOpenCheckout(t *testing.T) {
 	if n := f.patchTransactionRequests(); n != 0 {
 		t.Fatalf("%d transaction cancel requests, want 0", n)
 	}
+}
+
+func (f *fixture) cancelRequests() (immediate int) {
+	for _, r := range f.paddle.Requests() {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.Path, "/cancel") && r.Body["effective_from"] == string(paddle.EffectiveImmediately) {
+			immediate++
+		}
+	}
+	return immediate
+}
+
+func (f *fixture) getSubscriptionRequests() int {
+	n := 0
+	for _, r := range f.paddle.Requests() {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.Path, "/subscriptions/") {
+			n++
+		}
+	}
+	return n
+}
+
+var errLaterWrite = errors.New("a later write of the deletion failed")
+
+// Paddle confirms the cancellation, then a later write of the deletion
+// transaction fails and the local rows roll back. The retry has to complete
+// the local deletion from what Paddle reports: the subscription is canceled,
+// so the retry must not need a second cancellation, and the credit is
+// forfeited once.
+func TestCloseAccountRetryAfterRollbackReconcilesWithPaddle(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	subID := f.activate(acct)
+	f.grant(acct, LedgerManualTopUp, 25*usd)
+
+	err := f.db.InTx(ctx(), func(tx pgx.Tx) error {
+		if err := f.s.CloseAccount(ctx(), tx, acct); err != nil {
+			return err
+		}
+		return errLaterWrite
+	})
+	if !errors.Is(err, errLaterWrite) {
+		t.Fatalf("first attempt = %v", err)
+	}
+	if sub, _ := f.paddle.Subscription(subID); sub.Status != paddle.SubscriptionStatusCanceled {
+		t.Fatalf("Paddle subscription %s, want canceled by the first attempt", sub.Status)
+	}
+	// The rollback restored the local rows, and the credit is intact.
+	stored, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if stored.Status != SubscriptionActive || stored.PaddleSubscriptionID != subID {
+		t.Fatalf("stored subscription after the rollback = %s %q", stored.Status, stored.PaddleSubscriptionID)
+	}
+	f.wantLedger(acct, wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd})
+
+	if err := f.closeAccount(acct); err != nil {
+		t.Fatalf("retry = %v", err)
+	}
+	stored, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if stored.Status != SubscriptionCanceled {
+		t.Fatalf("stored status after the retry = %s", stored.Status)
+	}
+	f.wantLedger(acct,
+		wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd},
+		wantEntry{LedgerExpiry, -25 * usd, 0},
+	)
+	if f.getSubscriptionRequests() != 1 {
+		t.Fatalf("the retry made %d subscription reads, want 1", f.getSubscriptionRequests())
+	}
+
+	// A further attempt on the committed deletion finds the local
+	// subscription canceled and makes no Paddle call and no second forfeiture.
+	before := len(f.paddle.Requests())
+	if err := f.closeAccount(acct); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.paddle.Requests()) != before {
+		t.Fatal("a closed account called Paddle again")
+	}
+	f.wantLedger(acct,
+		wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd},
+		wantEntry{LedgerExpiry, -25 * usd, 0},
+	)
+}
+
+// When the retry cannot read the subscription at Paddle, or Paddle rejects
+// the cancellation of a subscription that is not canceled, the deletion fails
+// and changes nothing.
+func TestCloseAccountRetryAfterRollbackNeedsPaddleConfirmation(t *testing.T) {
+	setup := func(t *testing.T) (*fixture, string, string) {
+		f := newFixture(t)
+		acct := f.account()
+		subID := f.activate(acct)
+		f.grant(acct, LedgerManualTopUp, 25*usd)
+		return f, acct, subID
+	}
+	t.Run("read fails", func(t *testing.T) {
+		f, acct, subID := setup(t)
+		_ = f.db.InTx(ctx(), func(tx pgx.Tx) error {
+			if err := f.s.CloseAccount(ctx(), tx, acct); err != nil {
+				return err
+			}
+			return errLaterWrite
+		})
+		f.paddle.Fail("GET /subscriptions/", &paddletest.Failure{Status: http.StatusServiceUnavailable, Code: "unavailable"})
+		wantConnectCode(t, "retry", f.closeAccount(acct), connect.CodeUnavailable)
+		stored, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+		if stored.Status != SubscriptionActive || stored.PaddleSubscriptionID != subID {
+			t.Fatalf("stored subscription = %s", stored.Status)
+		}
+		f.wantLedger(acct, wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd})
+		// Paddle is readable again: the retry completes.
+		f.paddle.Fail("GET /subscriptions/", nil)
+		if err := f.closeAccount(acct); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("rejected while active", func(t *testing.T) {
+		f, acct, subID := setup(t)
+		f.paddle.Fail("POST /subscriptions/", &paddletest.Failure{Status: http.StatusBadRequest, Code: "subscription_locked_pending_changes"})
+		wantConnectCode(t, "close", f.closeAccount(acct), connect.CodeFailedPrecondition)
+		if sub, _ := f.paddle.Subscription(subID); sub.Status != paddle.SubscriptionStatusActive {
+			t.Fatalf("Paddle subscription %s", sub.Status)
+		}
+		stored, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+		if stored.Status != SubscriptionActive {
+			t.Fatalf("stored status = %s", stored.Status)
+		}
+		f.wantLedger(acct, wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd})
+	})
 }

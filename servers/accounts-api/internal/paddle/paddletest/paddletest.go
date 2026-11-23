@@ -307,6 +307,15 @@ func (s *Server) serveSubscription(w http.ResponseWriter, r *http.Request, parts
 			sub.UpdatedAt = now
 		}
 	case len(parts) == 3 && parts[2] == "cancel" && r.Method == http.MethodPost:
+		// Paddle documents only the success answer of a cancellation. The
+		// fake rejects the cancellation of a canceled subscription, the
+		// stricter of the possible behaviors, so that a retry after a lost
+		// confirmation has to read the subscription instead of repeating
+		// the cancellation.
+		if sub.Status == paddle.SubscriptionStatusCanceled {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"type": "request_error", "code": "subscription_update_when_canceled"}})
+			return
+		}
 		if body["effective_from"] == string(paddle.EffectiveImmediately) {
 			sub.Status = paddle.SubscriptionStatusCanceled
 			sub.CanceledAt = &now

@@ -396,10 +396,11 @@ func (s *Service) ResumeSubscription(ctx context.Context, tx pgx.Tx, accountID s
 // CloseAccount runs the billing part of DeleteBillingAccount in tx, which
 // holds the billing account lock: it cancels the Paddle subscription at once
 // (or, for a first checkout that no payment has completed yet, the checkout
-// transaction), forfeits the remaining credit with EXPIRY entries, fails queued automatic
-// top-ups and turns automatic top-up off. A Paddle failure fails the deletion
-// with unavailable (or failed_precondition when Paddle rejects the
-// cancellation), so the billing account stays as it was.
+// transaction), forfeits the remaining credit with EXPIRY entries, fails
+// queued automatic top-ups and turns automatic top-up off. A Paddle failure, or a 2xx answer
+// that does not confirm the cancellation, fails the deletion with unavailable
+// (or failed_precondition when Paddle rejects the cancellation), so the billing
+// account stays as it was.
 func (s *Service) CloseAccount(ctx context.Context, tx pgx.Tx, accountID string) error {
 	now := s.timestamp()
 	acct, err := lockAccount(ctx, tx, accountID)
@@ -416,24 +417,8 @@ func (s *Service) CloseAccount(ctx context.Context, tx pgx.Tx, accountID string)
 		}
 	}
 	if sub.PaddleSubscriptionID != "" && sub.Status != SubscriptionCanceled {
-		entity, err := s.paddle.CancelSubscription(ctx, sub.PaddleSubscriptionID, paddle.EffectiveImmediately)
-		switch outcome := paddle.Classify(err); outcome {
-		case paddle.OutcomeOK:
-			if _, err := s.applyPaddleSubscription(ctx, tx, acct, entity, now); err != nil {
-				return err
-			}
-		case paddle.OutcomeNotFound:
-			s.logger.WarnContext(ctx, "billing_subscription_missing_at_paddle",
-				slog.String("billing_account_id", accountID),
-				slog.String("paddle_subscription_id", sub.PaddleSubscriptionID))
-		default:
-			s.logger.WarnContext(ctx, "billing_paddle_call_failed",
-				slog.String("operation", "cancel_subscription_immediately"),
-				slog.String("billing_account_id", accountID),
-				slog.String("paddle_subscription_id", sub.PaddleSubscriptionID),
-				slog.String("paddle_error_code", paddle.ErrorCode(err)),
-				slog.Any("error", err))
-			return paddleError(err, "cancellation")
+		if err := s.cancelSubscriptionNow(ctx, tx, acct, sub, now); err != nil {
+			return err
 		}
 	}
 	if sub.exists {
@@ -472,6 +457,65 @@ func (s *Service) CloseAccount(ctx context.Context, tx pgx.Tx, accountID string)
 		slog.String("paddle_subscription_id", sub.PaddleSubscriptionID),
 		slog.Int64("forfeited_usd_micros", forfeited))
 	return nil
+}
+
+// cancelSubscriptionNow cancels the Paddle subscription of sub at once and
+// returns when Paddle canceled it, or does not know the subscription any more,
+// which counts as canceled. tx holds the billing account lock.
+//
+// The cancellation cannot be rolled back, but the transaction around it can:
+// a later local write of the deletion may fail after Paddle confirmed. The
+// local row then still shows the subscription as active, so the retry sends
+// the cancellation again. Paddle can answer that with a rejection, so a
+// rejection is checked against the subscription itself (`GET
+// /subscriptions/{id}`): a subscription that Paddle already shows as canceled
+// is the confirmation of the earlier attempt, and the retry completes the
+// local deletion once, without a second cancellation and without a second
+// forfeiture (the credit is forfeited in the same transaction that finally
+// commits). Paddle itself is the durable record of the earlier attempt; no
+// local marker is needed.
+func (s *Service) cancelSubscriptionNow(ctx context.Context, tx pgx.Tx, acct *accountState, sub Subscription, now time.Time) error {
+	entity, err := s.paddle.CancelSubscription(ctx, sub.PaddleSubscriptionID, paddle.EffectiveImmediately)
+	switch outcome := paddle.Classify(err); outcome {
+	case paddle.OutcomeOK:
+		_, err := s.applyPaddleSubscription(ctx, tx, acct, entity, now)
+		return err
+	case paddle.OutcomeNotFound:
+		s.logger.WarnContext(ctx, "billing_subscription_missing_at_paddle",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("paddle_subscription_id", sub.PaddleSubscriptionID))
+		return nil
+	default:
+		if outcome == paddle.OutcomeRejected {
+			current, getErr := s.paddle.GetSubscription(ctx, sub.PaddleSubscriptionID)
+			if getErr != nil {
+				// The state at Paddle is unknown, so the deletion can only be
+				// retried later.
+				s.logger.WarnContext(ctx, "billing_paddle_call_failed",
+					slog.String("operation", "get_subscription"),
+					slog.String("billing_account_id", acct.ID),
+					slog.String("paddle_subscription_id", sub.PaddleSubscriptionID),
+					slog.String("paddle_error_code", paddle.ErrorCode(getErr)),
+					slog.Any("error", getErr))
+				return paddleError(getErr, "cancellation")
+			}
+			if current.ID == sub.PaddleSubscriptionID && current.Status == paddle.SubscriptionStatusCanceled {
+				s.logger.InfoContext(ctx, "billing_subscription_cancellation_reconciled",
+					slog.String("billing_account_id", acct.ID),
+					slog.String("paddle_subscription_id", sub.PaddleSubscriptionID),
+					slog.String("paddle_error_code", paddle.ErrorCode(err)))
+				_, err := s.applyPaddleSubscription(ctx, tx, acct, current, now)
+				return err
+			}
+		}
+		s.logger.WarnContext(ctx, "billing_paddle_call_failed",
+			slog.String("operation", "cancel_subscription_immediately"),
+			slog.String("billing_account_id", acct.ID),
+			slog.String("paddle_subscription_id", sub.PaddleSubscriptionID),
+			slog.String("paddle_error_code", paddle.ErrorCode(err)),
+			slog.Any("error", err))
+		return paddleError(err, "cancellation")
+	}
 }
 
 // closePendingCheckout makes the open checkout transaction of a first
