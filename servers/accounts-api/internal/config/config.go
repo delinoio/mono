@@ -395,12 +395,19 @@ func stableKey(key string) bool {
 
 // httpURL checks that value is an absolute http or https URL with a host name
 // (a port alone such as https://:443 has none), without a query
-// or fragment and returns it without a trailing slash.
+// or fragment and returns it without a trailing slash. A port, when present,
+// must fit in 16 bits: url.Parse accepts any digit string, so a value such as
+// https://127.0.0.1:65536 would otherwise only fail on the first request.
 func httpURL(name, value string) (string, error) {
 	u, err := url.Parse(value)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil ||
 		u.RawQuery != "" || u.Fragment != "" || strings.Contains(value, "#") || strings.Contains(value, "?") {
 		return "", fmt.Errorf("%s must be an http or https URL", name)
+	}
+	if port := u.Port(); port != "" {
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			return "", fmt.Errorf("%s must be an http or https URL", name)
+		}
 	}
 	return strings.TrimRight(value, "/"), nil
 }
