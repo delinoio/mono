@@ -23,7 +23,11 @@ out="$1"
 size_mib="${2:-256}"
 repo="$(cd "$(dirname "$0")/../../../.." && pwd)"
 work="$(mktemp -d "${TMPDIR:-/tmp}/ownsand-rootfs.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
+# staged is the image under construction; it lives in the output directory so
+# the final rename stays on one file system. The trap removes it, so a failed
+# allocation or format leaves no staged file and never touches the output.
+staged=""
+trap 'rm -rf "$work"; if [ -n "$staged" ]; then rm -f "$staged"; fi' EXIT
 rootfs="$work/rootfs"
 
 busybox="${BUSYBOX:-$(command -v busybox || true)}"
@@ -75,7 +79,20 @@ printf 'root:x:0:\n' > "$rootfs/etc/group"
 printf 'sandbox\n' > "$rootfs/etc/hostname"
 : > "$rootfs/etc/resolv.conf"
 
-rm -f "$out"
-truncate -s "${size_mib}M" "$out"
-"$mkfs" -q -F -L ownsand-root -d "$rootfs" -E root_owner=0:0 "$out"
+# Build the image beside the output and publish it with one rename, so an
+# allocation or formatting failure leaves an earlier image byte for byte
+# unchanged and a first build that fails leaves nothing at the output path.
+if [ -d "$out" ]; then
+  # mv would move the image into a directory instead of replacing it.
+  echo "output path is a directory: $out" >&2
+  exit 1
+fi
+staged="$(mktemp "$(dirname -- "$out")/.$(basename -- "$out").XXXXXX")"
+# mktemp creates the file with mode 0600; give it the mode a plain redirect
+# would have (0666 minus the umask), as the image had before it was staged.
+chmod "$(printf '%03o' $((0666 & ~$(umask))))" "$staged"
+truncate -s "${size_mib}M" "$staged"
+"$mkfs" -q -F -L ownsand-root -d "$rootfs" -E root_owner=0:0 "$staged"
+mv -f -- "$staged" "$out"
+staged=""
 echo "wrote $out"
