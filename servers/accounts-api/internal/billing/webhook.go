@@ -515,7 +515,10 @@ func lockPurchase(ctx context.Context, tx pgx.Tx, transactionID string) error {
 // the adjustment, at most the credit of the purchase that is not refunded
 // yet; the balance can become negative. Paddle does not order its
 // notifications, so an adjustment whose purchase has no credit grant yet is
-// stored as pending, and the webhook that creates the grant applies it.
+// stored as pending, and the webhook that creates the grant applies it. The
+// removal first expires the credit that is due when the purchase and account
+// locks are held, so a grant that expired while the adjustment waited for
+// them is not consumed: its expiry is an EXPIRY entry before the REFUND entry.
 func (s *Service) onAdjustment(ctx context.Context, tx pgx.Tx, ev paddle.Event, now time.Time) (eventOutcome, error) {
 	var adj paddle.Adjustment
 	if err := json.Unmarshal(ev.Data, &adj); err != nil || adj.ID == "" {
@@ -577,6 +580,12 @@ func (s *Service) onAdjustment(ctx context.Context, tx pgx.Tx, ev paddle.Event, 
 		out.Result = webhookIgnored
 		return out, nil
 	}
+	// The wait for the two locks can take long, and the credit of a grant can
+	// expire during it. Read the clock again, so that the expiry check and
+	// the credit consumption of the adjustment use the time at which it holds
+	// the locks. The reading of applyEvent stays the time of the event record
+	// and of a pending row.
+	now = s.timestamp()
 	applied, err := s.applyAdjustment(ctx, tx, acct, grantID, pendingAdjustment{
 		ID: adj.ID, TransactionID: adj.TransactionID, Action: adj.Action, Amount: amount,
 	}, false, now)
