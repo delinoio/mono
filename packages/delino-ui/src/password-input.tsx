@@ -12,6 +12,7 @@ import {
 } from "@ui-sdk/react/password-input";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
+import { useForwardedAutoFocus } from "./dialog-context.ts";
 
 export type PasswordInputProps = Omit<
   React.ComponentProps<typeof PasswordInputRoot>,
@@ -81,6 +82,7 @@ export function PasswordInput({
   } = props as typeof props & {
     "data-autofocus"?: unknown;
   };
+  const forwardedAutoFocus = useForwardedAutoFocus(autoFocus);
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
   const hasDescription =
@@ -118,7 +120,7 @@ export function PasswordInput({
         <PasswordInputControl
           className="dui-password-input-control"
           placeholder={placeholder}
-          autoFocus={autoFocus}
+          autoFocus={forwardedAutoFocus}
           aria-describedby={ariaDescribedBy}
           aria-label={ariaLabel}
           aria-labelledby={ariaLabelledBy}

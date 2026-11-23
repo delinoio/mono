@@ -528,6 +528,140 @@ describe("API keys", () => {
   });
 });
 
+describe("dialog focus return", () => {
+  // A dialog with an autofocused input records its opener only after React
+  // autofocus has moved focus, so it used to leave focus on the page body.
+  // These tests press the opener with real focus first, as a keyboard user does.
+  async function press(opener: HTMLElement) {
+    await act(async () => {
+      opener.focus();
+      fireEvent.click(opener);
+    });
+    await settle(60);
+  }
+
+  async function escape() {
+    await act(async () => {
+      fireEvent.keyDown(document.activeElement as Element, { key: "Escape" });
+    });
+    await settle(60);
+  }
+
+  async function cancel(dialog: HTMLElement) {
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    });
+    await settle(60);
+  }
+
+  test("Create organization returns focus to its button after Escape and Cancel", async () => {
+    renderConsole("/");
+    await screen.findByRole("link", { name: /Acme Robotics/ });
+    const opener = screen.getByRole("button", { name: "Create organization" });
+
+    await press(opener);
+    const dialog = screen.getByRole("dialog", {
+      name: "Create an organization",
+    });
+    expect(document.activeElement).toBe(
+      within(dialog).getByRole("textbox", { name: "Organization name" }),
+    );
+    await escape();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+
+    await press(opener);
+    await cancel(
+      screen.getByRole("dialog", { name: "Create an organization" }),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+  });
+
+  test("Create API key returns focus to its button after Escape and Cancel", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`);
+    await screen.findByText(/ci-runner/);
+    const opener = screen.getByRole("button", { name: "Create API key" });
+
+    await press(opener);
+    const dialog = screen.getByRole("dialog", { name: "Create an API key" });
+    expect(document.activeElement).toBe(
+      within(dialog).getByRole("textbox", { name: "Name" }),
+    );
+    await escape();
+    expect(document.activeElement).toBe(opener);
+
+    await press(opener);
+    await cancel(screen.getByRole("dialog", { name: "Create an API key" }));
+    expect(document.activeElement).toBe(opener);
+  });
+
+  test("the one-time API key dialog returns focus to Create API key after Done and Escape", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`);
+    await screen.findByText(/ci-runner/);
+    const opener = screen.getByRole("button", { name: "Create API key" });
+
+    for (const close of ["Done", "Escape"]) {
+      await press(opener);
+      const form = screen.getByRole("dialog", { name: "Create an API key" });
+      await act(async () => {
+        fireEvent.input(within(form).getByRole("textbox", { name: "Name" }), {
+          target: { value: `key-${close}` },
+        });
+      });
+      await act(async () => {
+        fireEvent.click(
+          within(form).getByRole("button", { name: "Create key" }),
+        );
+      });
+      await settle(60);
+      const shown = await screen.findByRole("dialog", {
+        name: "Your new API key",
+      });
+      if (close === "Done") {
+        await act(async () => {
+          fireEvent.click(within(shown).getByRole("button", { name: "Done" }));
+        });
+        await settle(60);
+      } else {
+        await escape();
+      }
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(opener);
+    }
+  });
+
+  test("Make template returns focus to its button after Escape and Cancel", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/snapshots`);
+    const opener = await screen.findByRole("button", { name: "Make template" });
+
+    await press(opener);
+    const dialog = screen.getByRole("dialog", { name: "Make a template" });
+    expect(document.activeElement).toBe(
+      within(dialog).getByRole("textbox", { name: "Template name" }),
+    );
+    await escape();
+    expect(document.activeElement).toBe(opener);
+
+    await press(opener);
+    await cancel(screen.getByRole("dialog", { name: "Make a template" }));
+    expect(document.activeElement).toBe(opener);
+  });
+
+  test("Invite someone, a dialog without an autofocused input, still returns focus to its button", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/members`);
+    const opener = await screen.findByRole("button", {
+      name: "Invite someone",
+    });
+
+    await press(opener);
+    screen.getByRole("dialog", { name: "Invite someone" });
+    await escape();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+  });
+});
+
 describe("confirmation dialog errors", () => {
   /** A transport whose RevokeApiKey fails for the first `failures` calls. */
   function revokeTransport(failures: number) {

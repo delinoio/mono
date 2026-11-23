@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { readdirSync, readFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "@rstest/core";
-import type * as React from "react";
+import * as React from "react";
 import {
   act,
   cleanup,
@@ -701,6 +701,135 @@ describe("autoFocus inside Dialog", () => {
     render(<PasswordInput label="Password" autoFocus />);
 
     expect(document.activeElement).toBe(screen.getByLabelText("Password"));
+  });
+
+  // A controlled Dialog without a DialogTrigger, like the Create organization
+  // dialog of the OwnSand console: the opener is any button that sets `open`.
+  function ControlledDialog({ children }: { children?: React.ReactNode }) {
+    const [open, setOpen] = React.useState(false);
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          Open
+        </button>
+        <Dialog open={open} onOpenChange={setOpen}>
+          <DialogContent>
+            <DialogTitle>Create</DialogTitle>
+            {children}
+            <DialogActions>
+              <DialogClose>Cancel</DialogClose>
+            </DialogActions>
+          </DialogContent>
+        </Dialog>
+      </>
+    );
+  }
+
+  async function openControlled() {
+    const opener = screen.getByRole("button", { name: "Open" });
+    await act(async () => {
+      opener.focus();
+      fireEvent.click(opener);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    return opener;
+  }
+
+  async function settle() {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+  }
+
+  const FOCUS_RETURN_CASES: [string, React.ReactElement, () => HTMLElement][] =
+    [
+      [
+        "TextField",
+        <TextField label="Name" autoFocus />,
+        () => screen.getByRole("textbox", { name: "Name" }),
+      ],
+      [
+        "Textarea",
+        <Textarea label="Message" autoFocus />,
+        () => screen.getByRole("textbox", { name: "Message" }),
+      ],
+      [
+        "NumberInput",
+        <NumberInput label="Amount" autoFocus />,
+        () => screen.getByRole("textbox", { name: "Amount" }),
+      ],
+      [
+        "PasswordInput",
+        <PasswordInput label="Password" autoFocus />,
+        () => screen.getByLabelText("Password"),
+      ],
+    ];
+
+  for (const [name, element, getInput] of FOCUS_RETURN_CASES) {
+    test(`focuses a ${name} with autoFocus on open and returns focus to the opener on Escape`, async () => {
+      render(<ControlledDialog>{element}</ControlledDialog>);
+      const opener = await openControlled();
+
+      expect(document.activeElement).toBe(getInput());
+
+      await act(async () => {
+        fireEvent.keyDown(document.activeElement as Element, {
+          key: "Escape",
+        });
+      });
+      await settle();
+
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(opener);
+    });
+
+    test(`returns focus to the opener after Cancel with a ${name} with autoFocus`, async () => {
+      render(<ControlledDialog>{element}</ControlledDialog>);
+      const opener = await openControlled();
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      });
+      await settle();
+
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(opener);
+    });
+  }
+
+  test("returns focus to the opener after Escape when the input has no autoFocus", async () => {
+    render(
+      <ControlledDialog>
+        <TextField label="Name" />
+      </ControlledDialog>,
+    );
+    const opener = await openControlled();
+
+    await act(async () => {
+      fireEvent.keyDown(document.activeElement as Element, { key: "Escape" });
+    });
+    await settle();
+
+    expect(document.activeElement).toBe(opener);
+  });
+
+  test("returns focus to the DialogTrigger after Escape with an autoFocus input", async () => {
+    render(
+      <DialogWith>
+        <TextField label="Name" autoFocus />
+      </DialogWith>,
+    );
+    await openDialog();
+    const trigger = screen.getByRole("button", { name: "Open" });
+
+    await act(async () => {
+      fireEvent.keyDown(document.activeElement as Element, { key: "Escape" });
+    });
+    await settle();
+
+    expect(document.activeElement).toBe(trigger);
   });
 });
 

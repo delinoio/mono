@@ -11,6 +11,7 @@ import {
 import type * as React from "react";
 import { ButtonSize, ButtonVariant } from "./button.tsx";
 import { mergeClassName } from "./class-name.ts";
+import { InDialogContext } from "./dialog-context.ts";
 
 export { createDialogController } from "@ui-sdk/react/dialog";
 export type { DialogController } from "@ui-sdk/react/dialog";
@@ -45,7 +46,11 @@ export function Dialog(props: DialogProps) {
     modal?: unknown;
     presentation?: unknown;
   };
-  return <DialogRoot {...rest} />;
+  return (
+    <InDialogContext.Provider value={true}>
+      <DialogRoot {...rest} />
+    </InDialogContext.Provider>
+  );
 }
 
 type ButtonStyleProps = {
