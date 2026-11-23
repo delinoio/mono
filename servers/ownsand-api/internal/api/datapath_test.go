@@ -823,6 +823,11 @@ func TestRelayUnknownFrameKind(t *testing.T) {
 
 	reqOK, reqBad := newExec(org.ID, sandboxID), newExec(org.ID, sandboxID)
 	release := make(chan struct{})
+	// Release the healthy callback on every exit path so an early t.Fatal does
+	// not leave it blocked while the relay is torn down.
+	var releaseOnce sync.Once
+	releaseHealthy := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHealthy)
 	r.SetOnRequest(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
 		if f.GetExecRequest().GetExecId() == reqOK.GetExecId() {
 			// The healthy stream answers only after the other stream failed.
@@ -888,7 +893,7 @@ func TestRelayUnknownFrameKind(t *testing.T) {
 	}
 
 	// The other stream and the connection continue.
-	close(release)
+	releaseHealthy()
 	events, err := collectExec(t, ok)
 	if err != nil {
 		t.Fatalf("healthy stream: %v", err)
