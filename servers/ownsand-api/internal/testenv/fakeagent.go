@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -436,6 +438,7 @@ func (a *FakeAgent) DefaultAnswer(cmd *ownsandv1.AgentCommand) *ownsandv1.AgentC
 		for _, u := range grant.GetPartUrls() {
 			sum := sha256.Sum256([]byte(u.GetUrl()))
 			parts = append(parts, &ownsandv1.SnapshotPart{PartNumber: u.GetPartNumber(), SizeBytes: 1 << 20, Sha256: sum[:]})
+			a.uploadPart(u.GetUrl(), 1<<20)
 		}
 		return &ownsandv1.AgentCommandResult{Result: &ownsandv1.AgentCommandResult_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotResult{Parts: parts, SizeBytes: 2 << 20}}}
 	case *ownsandv1.AgentCommand_ImportSnapshot:
@@ -515,4 +518,20 @@ func Eventually(t testing.TB, what string, cond func() bool) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// uploadPart stores an object of size bytes under the key of a signed
+// in-memory upload URL (memory://PUT/<key>?expires=<unix>), as the real agent
+// uploads the part, so the export verifier finds the reported part. A control
+// plane whose object store is not an in-memory store gets no object.
+func (a *FakeAgent) uploadPart(signedURL string, size int64) {
+	store, ok := a.Env.opts.Objects.(interface{ PutSized(key string, size int64) })
+	if !ok {
+		return
+	}
+	u, err := url.Parse(signedURL)
+	if err != nil {
+		a.T.Fatalf("fake agent: parse upload URL: %v", err)
+	}
+	store.PutSized(strings.TrimPrefix(u.Path, "/"), size)
 }

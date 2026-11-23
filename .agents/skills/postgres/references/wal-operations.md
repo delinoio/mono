@@ -8,7 +8,7 @@ tags: postgres, wal, checkpoints, durability, crash-recovery, fsync, operations
 
 ## WAL Fundamentals
 
-Write-Ahead Logging: logs changes to `pg_wal/` **before** modifying data files. WAL segments are 16MB (fixed at initdb). On COMMIT, PostgreSQL fsyncs WAL to disk and returns SUCCESS — data files are updated lazily. WAL records are written for all changes (including uncommitted transactions and rollbacks). **Never disable `fsync` in production** — power loss without fsync risks unrecoverable data loss.
+Write-Ahead Logging: logs changes to `pg_wal/` **before** modifying data files. WAL segments are 16MB by default; `initdb --wal-segsize` sets another power-of-two size from 1MB to 1024MB, and only when the cluster is initialized. On COMMIT, PostgreSQL fsyncs WAL to disk and returns SUCCESS — data files are updated lazily. WAL records are written for all changes (including uncommitted transactions and rollbacks). **Never disable `fsync` in production** — power loss without fsync risks unrecoverable data loss.
 
 `wal_level`: `minimal` (crash recovery only), `replica` (default; replication + archiving), `logical` (logical replication).
 

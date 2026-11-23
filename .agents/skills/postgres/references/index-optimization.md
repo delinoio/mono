@@ -37,7 +37,7 @@ Indexes with identical definitions (after normalizing names) on the same table a
 SELECT
   schemaname || '.' || tablename AS table,
   array_agg(indexname) AS duplicate_indexes,
-  pg_size_pretty(sum(pg_relation_size((schemaname || '.' || indexname)::regclass))) AS total_size
+  pg_size_pretty(sum(pg_relation_size(format('%I.%I', schemaname, indexname)::regclass))) AS total_size
 FROM pg_indexes
 WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
 GROUP BY schemaname, tablename,
@@ -68,9 +68,9 @@ JOIN pg_index i ON s.indexrelid = i.indexrelid WHERE NOT i.indisvalid;
 | >10         | Audit required - significant write overhead |
 
 ```sql
-SELECT relname AS table, count(*) as index_count
+SELECT schemaname, relname AS table, count(*) as index_count
 FROM pg_stat_user_indexes
-GROUP BY relname
+GROUP BY schemaname, relname
 ORDER BY count(*) DESC;
 ```
 

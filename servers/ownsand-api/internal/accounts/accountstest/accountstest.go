@@ -10,6 +10,7 @@ package accountstest
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -62,9 +63,19 @@ type link struct {
 	status  *accountsv1.OrganizationBillingStatus
 }
 
+// usageKey identifies the usage of one organization and meter in one UTC
+// calendar month. The accounts API counts a report in the month in which its
+// window starts, so the month is part of the key.
 type usageKey struct {
 	org   string
 	meter accountsv1.Meter
+	month time.Time // first instant of the UTC month of the window start
+}
+
+// utcMonth returns the first instant of the UTC calendar month of t.
+func utcMonth(t time.Time) time.Time {
+	t = t.UTC()
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
 }
 
 // Server is a running fake delino-accounts API.
@@ -317,7 +328,7 @@ func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.
 			Duplicate: f.reported[key]}
 		if !f.reported[key] {
 			f.reported[key] = true
-			k := usageKey{org: r.GetOrganizationId(), meter: r.GetMeter()}
+			k := usageKey{org: r.GetOrganizationId(), meter: r.GetMeter(), month: utcMonth(r.GetWindowStart().AsTime())}
 			u := f.usage[k]
 			f.usage[k] = [2]int64{u[0] + r.GetQuantity(), u[1] + r.GetAmountUsdMicros()}
 			if l, ok := f.links[r.GetOrganizationId()]; ok {
@@ -425,6 +436,45 @@ func (h handler) UnlinkOrganization(_ context.Context, req *connect.Request[acco
 	return connect.NewResponse(&accountsv1.UnlinkOrganizationResponse{}), nil
 }
 
+// manageablePageToken is the content of a ListManageableBillingAccounts page
+// token. Like the token of accounts-api it is opaque to clients, remembers the
+// sort position (the last account ID returned) and is bound to the RPC and to
+// the user that listed, so a raw account ID or another user's token is
+// rejected.
+type manageablePageToken struct {
+	RPC   string `json:"rpc"`
+	Scope string `json:"scope"`
+	After string `json:"after"`
+}
+
+// errInvalidPageToken is the error of accounts-api for a page token that is
+// malformed or does not belong to the request.
+func errInvalidPageToken() error {
+	return connect.NewError(connect.CodeInvalidArgument, errors.New("page_token is not valid for this request"))
+}
+
+func encodeManageablePageToken(userID, after string) string {
+	raw, _ := json.Marshal(manageablePageToken{RPC: MethodListManageableBillingAccounts, Scope: userID, After: after})
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// decodeManageablePageToken returns the account ID after which the page of
+// userID resumes; an empty token is the first page.
+func decodeManageablePageToken(userID, token string) (string, error) {
+	if token == "" {
+		return "", nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return "", errInvalidPageToken()
+	}
+	var t manageablePageToken
+	if err := json.Unmarshal(raw, &t); err != nil || t.RPC != MethodListManageableBillingAccounts || t.Scope != userID || t.After == "" {
+		return "", errInvalidPageToken()
+	}
+	return t.After, nil
+}
+
 func (h handler) ListManageableBillingAccounts(_ context.Context, req *connect.Request[accountsv1.ListManageableBillingAccountsRequest]) (*connect.Response[accountsv1.ListManageableBillingAccountsResponse], error) {
 	f := h.f
 	if err := f.begin(MethodListManageableBillingAccounts); err != nil {
@@ -434,12 +484,17 @@ func (h handler) ListManageableBillingAccounts(_ context.Context, req *connect.R
 	if size <= 0 {
 		size = 50
 	}
+	userID := req.Msg.GetUserId()
+	after, err := decodeManageablePageToken(userID, req.Msg.GetPageToken())
+	if err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []*accountsv1.BillingAccount
 	for _, a := range f.accounts {
-		role := a.members[req.Msg.GetUserId()]
-		if (role == accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER || role == accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN) && a.id > req.Msg.GetPageToken() {
+		role := a.members[userID]
+		if (role == accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER || role == accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN) && a.id > after {
 			out = append(out, &accountsv1.BillingAccount{BillingAccountId: a.id, Name: a.name, CallerRole: role})
 		}
 	}
@@ -455,7 +510,7 @@ func (h handler) ListManageableBillingAccounts(_ context.Context, req *connect.R
 	next := ""
 	if len(out) > size {
 		out = out[:size]
-		next = out[size-1].GetBillingAccountId()
+		next = encodeManageablePageToken(userID, out[size-1].GetBillingAccountId())
 	}
 	return connect.NewResponse(&accountsv1.ListManageableBillingAccountsResponse{BillingAccounts: out, NextPageToken: next}), nil
 }
@@ -475,10 +530,10 @@ func (h handler) GetOrganizationBilling(_ context.Context, req *connect.Request[
 	a := f.accounts[l.account]
 	now := f.now().UTC()
 	resp := &accountsv1.GetOrganizationBillingResponse{BillingAccountId: a.id, BillingAccountName: a.name, BalanceUsdMicros: a.balance,
-		Status: proto.Clone(l.status).(*accountsv1.OrganizationBillingStatus), MonthStart: timestamppb.New(time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC))}
+		Status: proto.Clone(l.status).(*accountsv1.OrganizationBillingStatus), MonthStart: timestamppb.New(utcMonth(now))}
 	for _, m := range []accountsv1.Meter{accountsv1.Meter_METER_OWNSAND_RELAY_EGRESS, accountsv1.Meter_METER_OWNSAND_R2_STORAGE,
 		accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC, accountsv1.Meter_METER_OWNSAND_CLASS_B_RPC} {
-		u := f.usage[usageKey{org: org, meter: m}]
+		u := f.usage[usageKey{org: org, meter: m, month: utcMonth(now)}]
 		resp.MeterUsages = append(resp.MeterUsages, &accountsv1.MeterUsage{Meter: m, Quantity: u[0], AmountUsdMicros: u[1]})
 	}
 	return connect.NewResponse(resp), nil

@@ -340,10 +340,15 @@ func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, audit *auditLog, ser
 	}
 	// A new link takes effect when it holds both locks: read the clock
 	// again, because the caller read it before it waited for the billing
-	// account lock and for the organization lock. A report that committed
-	// as unattributed while this transaction waited then ends before the
-	// link time, and the link cannot reach back into the window of such a
-	// report. The audit event of the link uses the same time.
+	// account lock and for the organization lock. The locks order this
+	// transaction after a report that committed as unattributed while it
+	// waited; they do not order the clock against the end of that report's
+	// window, which may be up to maxWindowEndAheadOfServer after the server
+	// time. The link time can therefore still be before the window end, and
+	// the stored unattributed result stands (a retry replays it and charges
+	// nothing to this link). A link whose time is at or after the window end
+	// (link_time < window end is false) does not overlap the half-open
+	// window. The audit event of the link uses the same time.
 	now = h.timestamp()
 	if _, err := tx.Exec(ctx, `INSERT INTO organization_links (organization_link_id, service, organization_id,
 			billing_account_id, organization_name, link_time) VALUES ($1, $2, $3, $4, $5, $6)`,

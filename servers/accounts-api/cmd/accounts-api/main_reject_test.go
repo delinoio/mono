@@ -312,7 +312,7 @@ func TestNewServerLogsOneHeaderTimeoutForAPartialLineDuringShutdown(t *testing.T
 	case <-time.After(5 * time.Second):
 		t.Fatal("shutdown did not complete")
 	}
-	records := rejectedRecords(t, logs)
+	records := waitForRejectedRecords(t, logs, 1)
 	if len(records) != 1 {
 		t.Fatalf("got %d http_request_rejected records, want exactly 1: %s", len(records), logs.String())
 	}
@@ -376,7 +376,7 @@ func TestNewServerLogsPartialHeadTimeoutAfterKeepAliveRequest(t *testing.T) {
 	if rest, err := io.ReadAll(reader); err != nil || len(rest) != 0 {
 		t.Fatalf("read = %q, %v; want a silent close", rest, err)
 	}
-	records := rejectedRecords(t, logs)
+	records := waitForRejectedRecords(t, logs, 1)
 	if len(records) != 1 {
 		t.Fatalf("got %d http_request_rejected records, want exactly 1: %s", len(records), logs.String())
 	}
@@ -409,7 +409,7 @@ func TestNewServerPartialHeadBufferedWithAnAnsweredRequestKeepsItsStart(t *testi
 	if rest, err := io.ReadAll(reader); err != nil || len(rest) != 0 {
 		t.Fatalf("read = %q, %v; want a silent close", rest, err)
 	}
-	records := rejectedRecords(t, logs)
+	records := waitForRejectedRecords(t, logs, 1)
 	if len(records) != 1 {
 		t.Fatalf("got %d http_request_rejected records, want exactly 1: %s", len(records), logs.String())
 	}

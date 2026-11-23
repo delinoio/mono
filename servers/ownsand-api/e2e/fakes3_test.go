@@ -144,15 +144,17 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(data)
 	case r.Method == http.MethodGet && q.Get("list-type") == "2":
 		type content struct {
-			Key string `xml:"Key"`
+			Key  string `xml:"Key"`
+			Size int    `xml:"Size"`
 		}
 		var res struct {
 			XMLName     xml.Name  `xml:"ListBucketResult"`
 			Contents    []content `xml:"Contents"`
 			IsTruncated bool      `xml:"IsTruncated"`
 		}
+		sizes := f.sizes(q.Get("prefix"))
 		for _, k := range f.keys(q.Get("prefix")) {
-			res.Contents = append(res.Contents, content{Key: k})
+			res.Contents = append(res.Contents, content{Key: k, Size: sizes[k]})
 		}
 		w.Header().Set("Content-Type", "application/xml")
 		_ = xml.NewEncoder(w).Encode(res)

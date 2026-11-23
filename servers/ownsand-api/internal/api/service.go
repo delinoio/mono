@@ -172,6 +172,13 @@ type Timing struct {
 	OfflineSweep time.Duration
 	// CleanupPoll is the interval of the R2 clean-up worker.
 	CleanupPoll time.Duration
+	// ExportVerifyPoll is the interval of the export verifier (30 seconds);
+	// zero means the default.
+	ExportVerifyPoll time.Duration
+	// ExportVerifyDelay is the wait between the completion of an export and
+	// the first R2 listing of its attempt prefix (the signed URL lifetime, 15
+	// minutes); zero means the default.
+	ExportVerifyDelay time.Duration
 	// ImportWait bounds a snapshot import before the create.
 	ImportWait time.Duration
 	// CommandGrace is how long the server keeps the record of a command
@@ -220,6 +227,9 @@ func DefaultTiming() Timing {
 		CleanupPoll:      30 * time.Second,
 		ImportWait:       2 * time.Hour,
 		CommandGrace:     DefaultCommandGrace,
+
+		ExportVerifyPoll:  DefaultExportVerifyPoll,
+		ExportVerifyDelay: signedURLLifetime,
 
 		WriterDrainTimeout: DefaultWriterDrainTimeout,
 

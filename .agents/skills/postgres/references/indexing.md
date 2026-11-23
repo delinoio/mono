@@ -22,7 +22,7 @@ Put equality columns first, then range/sort columns:
 CREATE INDEX customer_order_status_created_idx ON customer_order (status, created_at);
 ```
 
-A composite index on `(a, b)` supports queries on `a` + `b` and `a` alone, but not `b` alone.
+A composite B-tree index on `(a, b)` is most efficient for filters on `a`, or on `a` and `b`. A filter on `b` alone can still use the index, usually less efficiently: PostgreSQL scans the whole index, which the planner rarely prefers over a sequential scan. PostgreSQL 18 can use a skip scan when the planner estimates it is cheaper, typically when `a` has few distinct values; the planner decides on cost. Check the plan with `EXPLAIN ANALYZE` before adding a separate index on `b`.
 
 ## Partial Indexes
 

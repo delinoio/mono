@@ -288,7 +288,11 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 				return err
 			}
 		}
-		if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED)); err != nil {
+		// The snapshot is importable and billed from the reported sizes at
+		// once; the export verifier checks them against R2 after the upload
+		// URLs of the attempt expired (see export_verify.go).
+		if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2, export_verified = false, export_verify_after = $3 WHERE snapshot_id = $1",
+			info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED), s.now().Add(s.exportVerifyDelay())); err != nil {
 			return err
 		}
 		s.Logger.InfoContext(ctx, "export_completed", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID), slog.Int("parts", len(result.GetParts())))

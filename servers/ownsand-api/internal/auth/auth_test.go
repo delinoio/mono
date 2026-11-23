@@ -522,6 +522,28 @@ func waitResult(t *testing.T, ch <-chan validateResult, within time.Duration) va
 	}
 }
 
+// parkedFetchStartTimeout bounds how long a test waits for the handler of the
+// parked JWKS fixture to receive a request.
+const parkedFetchStartTimeout = 5 * time.Second
+
+// waitFetchStart waits until the parked JWKS handler receives a request. The
+// handler only sends on started when the validator fetches, so a validator that
+// returns early (for example with ErrInvalidToken or because of the cooldown)
+// would otherwise leave the test blocked until the package timeout. early is the
+// pending validation result, or nil when the test has none; a result that
+// arrives before the fetch starts, and a missing fetch after
+// parkedFetchStartTimeout, fail the test with a message that names the fetch.
+func (e *parkedEnv) waitFetchStart(t *testing.T, what string, early <-chan validateResult) {
+	t.Helper()
+	select {
+	case <-e.p.started:
+	case r := <-early:
+		t.Fatalf("validation returned before the %s fetch started: sub=%q err=%v after %s", what, r.sub, r.err, r.dur)
+	case <-time.After(parkedFetchStartTimeout):
+		t.Fatalf("the %s fetch did not start within %s", what, parkedFetchStartTimeout)
+	}
+}
+
 func assertPending(t *testing.T, ch <-chan validateResult) {
 	t.Helper()
 	select {
@@ -542,7 +564,7 @@ func TestLogtoValidatorCachedKeyDoesNotWaitForStaleRefresh(t *testing.T) {
 	if r.err != nil || r.sub != "user-1" {
 		t.Fatalf("cached key during stale refresh: %+v", r)
 	}
-	<-e.p.started
+	e.waitFetchStart(t, "stale refresh", nil)
 	// More callers with a cached key use the key while the fetch runs, and
 	// none of them starts another fetch.
 	for i := 0; i < 3; i++ {
@@ -568,7 +590,7 @@ func TestLogtoValidatorCachedKeyDoesNotWaitForUnknownKeyFetch(t *testing.T) {
 	e.p.parked.Store(true)
 	// The caller with the unknown key ID waits for the parked fetch.
 	waiter := e.validateAsync(context.Background(), e.token(t, e.other))
-	<-e.p.started
+	e.waitFetchStart(t, "unknown key", waiter)
 	assertPending(t, waiter)
 	// The cached key validates at once during the fetch, with a fresh cache.
 	r := waitResult(t, e.validateAsync(context.Background(), e.token(t, e.known)), 2*time.Second)
@@ -595,7 +617,7 @@ func TestLogtoValidatorCanceledWaiterReturnsAndFetchContinues(t *testing.T) {
 	e.p.parked.Store(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	canceled := e.validateAsync(ctx, e.token(t, e.other))
-	<-e.p.started
+	e.waitFetchStart(t, "canceled waiter unknown key", canceled)
 	assertPending(t, canceled)
 	cancel()
 	r := waitResult(t, canceled, 2*time.Second)
@@ -655,7 +677,7 @@ func TestLogtoValidatorHungEndpointBlocksOnlyUncachedKeysForTheFetchTimeout(t *t
 	e.p.parked.Store(true)
 	start := time.Now()
 	hung := e.validateAsync(context.Background(), e.token(t, e.other))
-	<-e.p.started
+	e.waitFetchStart(t, "hung endpoint", hung)
 	// While the endpoint hangs, callers with a cached key are not blocked.
 	r := waitResult(t, e.validateAsync(context.Background(), e.token(t, e.known)), 2*time.Second)
 	if r.err != nil || r.sub != "user-1" {

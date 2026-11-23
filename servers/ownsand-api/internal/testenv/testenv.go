@@ -128,6 +128,7 @@ func New(t testing.TB, opts ...Option) *Env {
 		EventPoll:        50 * time.Millisecond,
 		OfflineSweep:     100 * time.Millisecond,
 		CleanupPoll:      time.Hour,
+		ExportVerifyPoll: time.Hour,
 		ImportWait:       10 * time.Second,
 	}
 	objects := objectstore.NewMemory(clock.Now)

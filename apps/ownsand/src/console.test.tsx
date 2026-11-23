@@ -1294,6 +1294,84 @@ describe("cached lists after a mutation that changes another service", () => {
     expect(calls.CreateSnapshot).toBe(1);
     expect(calls.ListDevices).toBe(before);
   });
+
+  describe("Take snapshot while a request is pending", () => {
+    /** A transport that holds each CreateSnapshot response until released. */
+    function holdingSnapshots() {
+      const mock = createMockTransport();
+      const held: Array<{ release(error?: ConnectError): void }> = [];
+      const transport: Transport = {
+        ...mock,
+        async unary(method, ...rest) {
+          if (method.name !== "CreateSnapshot") {
+            return mock.unary(method, ...rest);
+          }
+          await new Promise<void>((resolve, reject) => {
+            held.push({
+              release: (error) => (error ? reject(error) : resolve()),
+            });
+          });
+          return mock.unary(method, ...rest);
+        },
+      };
+      return { transport, held };
+    }
+
+    const take = async () => {
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Take snapshot" }),
+        );
+      });
+    };
+
+    for (const outcome of ["succeeds", "fails"] as const) {
+      test(`sends one request for repeated activations and accepts a new one after the first ${outcome}`, async () => {
+        const { transport, held } = holdingSnapshots();
+        const { calls } = renderCounting(
+          `/orgs/${MOCK_IDS.acme}/sandboxes/${MOCK_IDS.runningSandbox}`,
+          transport,
+        );
+        const button = await screen.findByRole("button", {
+          name: "Take snapshot",
+        });
+        await act(async () => {
+          // Mouse activations, then keyboard activations: a click event is
+          // what Enter and Space produce on a native button.
+          fireEvent.click(button);
+          fireEvent.click(button);
+          fireEvent.keyDown(button, { key: "Enter" });
+          fireEvent.click(button);
+          fireEvent.keyUp(button, { key: " " });
+          fireEvent.click(button);
+        });
+        await settle(100);
+        await take();
+        await settle(100);
+        expect(calls.CreateSnapshot).toBe(1);
+        expect(held).toHaveLength(1);
+
+        await act(async () => {
+          held[0]!.release(
+            outcome === "fails"
+              ? new ConnectError("the snapshot failed", Code.Unavailable)
+              : undefined,
+          );
+        });
+        await settle(100);
+        expect(calls.CreateSnapshot).toBe(1);
+
+        // The button accepts a new submission once the first one settled.
+        await take();
+        await settle(100);
+        expect(calls.CreateSnapshot).toBe(2);
+        await act(async () => {
+          held[1]!.release();
+        });
+        await settle(100);
+      });
+    }
+  });
 });
 
 describe("device limits", () => {

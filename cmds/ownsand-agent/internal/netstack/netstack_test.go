@@ -267,33 +267,36 @@ func TestNetworkCloseEndsEveryFlow(t *testing.T) {
 	}
 }
 
-// udpPair returns two connected loopback UDP sockets.
+// peerUDPConn is a loopback UDP socket that sends every datagram to one fixed
+// peer address. It stands for a connected socket without calling connect, so
+// it needs no port to be released and re-bound, and it works the same on every
+// platform. Reads, deadlines and Close come from the embedded socket.
+type peerUDPConn struct {
+	*net.UDPConn
+	peer *net.UDPAddr
+}
+
+func (c *peerUDPConn) Write(b []byte) (int, error) { return c.WriteToUDP(b, c.peer) }
+
+func (c *peerUDPConn) RemoteAddr() net.Addr { return c.peer }
+
+// udpPair returns two loopback UDP sockets that send to each other. Both
+// sockets stay bound to the port the system assigned them, and a cleanup
+// registered right after each bind closes them, also when the setup fails.
 func udpPair(t *testing.T) (net.Conn, net.Conn) {
 	t.Helper()
-	a, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
+	bind := func() *net.UDPConn {
+		t.Helper()
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
 	}
-	b, err := net.DialUDP("udp", nil, a.LocalAddr().(*net.UDPAddr))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Connect a to b, so both are connected sockets.
-	if _, err := b.Write([]byte("x")); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 1)
-	_, from, err := a.ReadFromUDP(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a.Close()
-	ac, err := net.DialUDP("udp", a.LocalAddr().(*net.UDPAddr), from)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ac.Close(); b.Close() })
-	return ac, b
+	a, b := bind(), bind()
+	return &peerUDPConn{UDPConn: a, peer: b.LocalAddr().(*net.UDPAddr)},
+		&peerUDPConn{UDPConn: b, peer: a.LocalAddr().(*net.UDPAddr)}
 }
 
 // A UDP flow whose datagrams go one way stays open while that direction is
