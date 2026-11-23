@@ -34,6 +34,7 @@ func TestDNSForwarder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer c.Close()
 	c.SetDeadline(time.Now().Add(5 * time.Second))
 	c.Write([]byte("query"))
 	buf := make([]byte, 64)
@@ -45,6 +46,7 @@ func TestDNSForwarder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tc.Close()
 	tc.SetDeadline(time.Now().Add(5 * time.Second))
 	tc.Write([]byte{0, 3, 'a', 'b', 'c'})
 	got := make([]byte, 5)
