@@ -56,6 +56,14 @@ type FakeAgent struct {
 	changed   chan struct{}
 	closed    chan struct{}
 	closeErr  error
+	// openMark is the number of envelopes that the agent had received when
+	// OpenChannel started its stream, and openSeq is the sequence of the
+	// state report that OpenChannel sent first. Together they identify the
+	// acknowledgement of this connection's own initial report: an
+	// acknowledgement that an earlier stream of the same agent received
+	// is before openMark.
+	openMark int
+	openSeq  uint64
 	// noRevocationAck, when set, makes the read loop skip the revocation
 	// acknowledgement (see SetAckRevocations).
 	noRevocationAck bool
@@ -88,10 +96,31 @@ func (e *Env) NewFakeAgent(d *Device) *FakeAgent {
 
 // Connect authenticates, opens the channel, sends the capability report
 // and a full state report, and waits until the server applied it.
+//
+// The wait is per connection, not per device: Connect returns only after
+// the server acknowledged this agent's own initial state report on its own
+// stream (matched by report sequence) and the channel that the hub holds for
+// the device is a reconciled channel other than the one that was current
+// before Connect. A device that already has a reconciled channel, as in a
+// replacement, therefore does not count as ready until the replacement
+// itself reconciled. The wait fails the test when the channel closes without
+// the acknowledgement, as after a failed first state report, and when the
+// acknowledgement does not arrive within the bound of WaitFor.
 func (a *FakeAgent) Connect() {
 	a.T.Helper()
+	before := a.Env.App.Service.Hub.Get(a.Device.ID)
 	a.OpenChannel()
-	a.Eventually("device online", func() bool { return a.Env.App.Service.Hub.Live(a.Device.ID) != nil })
+	a.mu.Lock()
+	from, seq := a.openMark, a.openSeq
+	a.mu.Unlock()
+	a.waitFrom(from, "the acknowledgement of the initial state report", func(e *ownsandv1.AgentEnvelope) bool {
+		ack := e.GetStateAck().GetStateReport()
+		return ack != nil && ack.GetReportSequence() == seq
+	}, a.closed)
+	a.Eventually("device online", func() bool {
+		live := a.Env.App.Service.Hub.Live(a.Device.ID)
+		return live != nil && live != before
+	})
 }
 
 // LeaseWaitTimeout bounds how long test setup waits for the instance lease.
@@ -126,6 +155,9 @@ func (a *FakeAgent) OpenChannel() {
 	a.Env.WaitForLease()
 	cred := a.Env.SessionCredential(a.Device)
 	a.ctx, a.cancel = context.WithCancel(context.Background())
+	a.mu.Lock()
+	a.openMark = len(a.received)
+	a.mu.Unlock()
 	a.T.Cleanup(a.Close)
 	a.stream = a.Env.Clients(cred).Agent.Channel(a.ctx)
 	a.closed = make(chan struct{})
@@ -133,7 +165,10 @@ func (a *FakeAgent) OpenChannel() {
 	a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CapabilityReport{CapabilityReport: &ownsandv1.CapabilityReport{
 		HostOs: a.HostOS, Arch: a.Arch, AgentVersion: a.AgentVersion, Capabilities: a.Capabilities,
 	}}})
-	a.SendStateReport()
+	seq := a.SendStateReport()
+	a.mu.Lock()
+	a.openSeq = seq
+	a.mu.Unlock()
 }
 
 // Close closes the channel.
@@ -199,10 +234,12 @@ func (a *FakeAgent) HasSnapshot(id string) bool {
 	return ok
 }
 
-// SendStateReport sends the agent's records.
-func (a *FakeAgent) SendStateReport() {
+// SendStateReport sends the agent's records and returns the report sequence
+// that the report carries, which the server's acknowledgement repeats.
+func (a *FakeAgent) SendStateReport() uint64 {
 	a.mu.Lock()
-	report := &ownsandv1.StateReport{ReportSequence: a.counter, StateEpoch: a.Device.Epoch}
+	seq := a.counter
+	report := &ownsandv1.StateReport{ReportSequence: seq, StateEpoch: a.Device.Epoch}
 	for _, e := range a.sandboxes {
 		report.Sandboxes = append(report.Sandboxes, proto.Clone(e).(*ownsandv1.SandboxStateEntry))
 	}
@@ -212,6 +249,7 @@ func (a *FakeAgent) SendStateReport() {
 	report.BuiltBaseImages = a.Capabilities.GetBuiltBaseImages()
 	a.mu.Unlock()
 	a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_StateReport{StateReport: report}})
+	return seq
 }
 
 // StallReadsAfter stops the agent from reading its channel right after it
@@ -469,8 +507,20 @@ func (a *FakeAgent) Received() []*ownsandv1.AgentEnvelope {
 // returns it.
 func (a *FakeAgent) WaitFor(what string, match func(*ownsandv1.AgentEnvelope) bool) *ownsandv1.AgentEnvelope {
 	a.T.Helper()
+	return a.waitFrom(0, what, match, nil)
+}
+
+// waitFrom is WaitFor over the envelopes from index from on, so that a wait
+// of one connection ignores the envelopes of an earlier stream. When abort is
+// closed, the wait scans the envelopes that were received before it and then
+// fails the test without waiting for the deadline: the read loop appends an
+// envelope before it closes the channel that it hands out as abort, so no
+// matching envelope can arrive later.
+func (a *FakeAgent) waitFrom(from int, what string, match func(*ownsandv1.AgentEnvelope) bool, abort <-chan struct{}) *ownsandv1.AgentEnvelope {
+	a.T.Helper()
 	deadline := time.After(10 * time.Second)
-	seen := 0
+	seen := from
+	aborted := false
 	for {
 		a.mu.Lock()
 		envs := a.received[seen:]
@@ -482,8 +532,14 @@ func (a *FakeAgent) WaitFor(what string, match func(*ownsandv1.AgentEnvelope) bo
 				return env
 			}
 		}
+		if aborted {
+			a.T.Fatalf("the channel closed while waiting for %s", what)
+			return nil
+		}
 		select {
 		case <-ch:
+		case <-abort:
+			aborted = true
 		case <-deadline:
 			a.T.Fatalf("timed out waiting for %s", what)
 			return nil
