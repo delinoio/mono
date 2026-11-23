@@ -96,6 +96,32 @@ func errorDetail(err error) *ownsandv1.ErrorDetail {
 // order is the update order that dispatch took when it received an update or
 // withdrawal command; it is zero for every other command.
 func (a *Agent) handleCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.AgentCommand, order uint64) {
+	a.handleClaimedCommand(chanCtx, agentCtx, cmd, order, nil)
+}
+
+// claimSnapshotCreate registers the receipt of a create_snapshot command in
+// receive order, before its goroutine starts, so that a delete_snapshot
+// command received right after it cancels the create even when the delete
+// goroutine runs first. It returns nil for every other command.
+func (a *Agent) claimSnapshotCreate(cmd *ownsandv1.AgentCommand) *sandboxes.SnapshotCreateClaim {
+	c, ok := cmd.GetCommand().(*ownsandv1.AgentCommand_CreateSnapshot)
+	if !ok {
+		return nil
+	}
+	return a.Sandboxes.ClaimSnapshotCreate(c.CreateSnapshot.GetSnapshotId())
+}
+
+// handleClaimedCommand is handleCommand for a command that dispatch already
+// registered: claim is the claim of a create_snapshot command, which this
+// function releases when the command ended. A create_snapshot command without
+// a claim takes its own.
+func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.AgentCommand, order uint64, claim *sandboxes.SnapshotCreateClaim) {
+	if claim == nil {
+		claim = a.claimSnapshotCreate(cmd)
+	}
+	if claim != nil {
+		defer claim.Release()
+	}
 	kind := commandKind(cmd)
 	logger := a.logger.With("command_id", cmd.GetCommandId(), "command", kind)
 	logger.Info("command received")
@@ -122,7 +148,7 @@ func (a *Agent) handleCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.
 		setSandboxResult(res, e)
 	case *ownsandv1.AgentCommand_CreateSnapshot:
 		var e *ownsandv1.SnapshotStateEntry
-		e, err = a.Sandboxes.CreateSnapshot(chanCtx, c.CreateSnapshot)
+		e, err = a.Sandboxes.CreateClaimedSnapshot(chanCtx, c.CreateSnapshot, claim)
 		if e != nil {
 			res.Result = &ownsandv1.AgentCommandResult_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotResult{Snapshot: e}}
 		}
