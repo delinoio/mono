@@ -480,8 +480,16 @@ func (s *Service) QueueExpiryNotices(ctx context.Context) error {
 			if noticed != nil {
 				return nil
 			}
+			// The lock waits above can cross the expiry. Read a fresh time
+			// under the locks: an expired grant gets no "expires in 7 days"
+			// notice and stays unmarked, because ExpireGrants removes its
+			// credit and the next run does not select it.
+			fresh := s.timestamp()
+			if !expire.After(fresh) {
+				return nil
+			}
 			if _, err := tx.Exec(ctx, `UPDATE credit_grants SET expiry_notice_time = $2 WHERE credit_grant_id = $1`,
-				r.GrantID, now); err != nil {
+				r.GrantID, fresh); err != nil {
 				return err
 			}
 			if acct.Deleted || remaining <= 0 {
@@ -490,7 +498,7 @@ func (s *Service) QueueExpiryNotices(ctx context.Context) error {
 			return s.enqueue(ctx, tx, acct.ID, NotifyCreditExpiry, "credit_expiry/"+r.GrantID, map[string]string{
 				notifyDetailAmount:     fmt.Sprint(remaining),
 				notifyDetailExpireTime: expire.UTC().Format(time.RFC3339Nano),
-			}, now)
+			}, fresh)
 		})
 		if err != nil {
 			return err

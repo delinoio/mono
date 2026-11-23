@@ -22,6 +22,7 @@ import {
   SandboxState,
 } from "./index.ts";
 import { waitForSnapshotReady, withCleanup } from "./testing/e2e-support.ts";
+import { expectCleanExit } from "./testing/exec-assert.ts";
 
 const env = process.env;
 const apiUrl = env.OWNSAND_E2E_API_URL ?? "";
@@ -324,7 +325,7 @@ async function expectSuspended(
             command: ["/bin/echo", "recovered"],
           });
           expect(decoder.decode(run.stdout)).toBe("recovered\n");
-          expect(run.result.kind).toBe(ExecResultKind.Exited);
+          expectCleanExit(run.result);
           expect(sameBytes(await sandbox.readFileBytes(path), data)).toBe(true);
         } finally {
           await setBilling(BillingControlStatus.Allowed);

@@ -234,10 +234,18 @@ function AutoTopUpForm({
           return;
         }
         setErrors({});
-        await update.mutateAsync({
+        const saved = await update.mutateAsync({
           billingAccountId,
           settings: checked.value,
         });
+        // An equivalent save (for example "50" for a saved $50.00) leaves the
+        // form key unchanged, so the key reset does not run and the typed text
+        // would stay. Show the saved values instead. A rejected save throws
+        // above, so its draft and error stay.
+        setEnabled(saved.settings?.enabled ?? checked.value.enabled);
+        setThreshold(amountText(saved.settings?.thresholdUsdMicros));
+        setAmount(amountText(saved.settings?.amountUsdMicros));
+        setMonthlyCap(amountText(saved.settings?.monthlyCapUsdMicros));
         await invalidateServices(queryClient, CreditService);
         toast.success("Automatic top-up is saved.");
       }}
