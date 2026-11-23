@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { createServer, type Server } from "node:net";
+import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
@@ -10,6 +13,8 @@ const FIXED_PORT = 13600;
 const LOOPBACK_HOST = "127.0.0.1";
 const EXIT_TIMEOUT_MS = 60_000;
 const APP_DIRECTORY = fileURLToPath(new URL("..", import.meta.url));
+
+const RSPRESS_PACKAGE = "@rspress/core";
 
 interface DevServerResult {
   exitCode: number | null;
@@ -41,13 +46,33 @@ const release = (holder: Server | undefined): Promise<void> =>
     holder.close(() => resolve());
   });
 
-// Runs `rspress dev` as the e2e runner does, from the app directory with an
-// argument array and no shell, and waits for it to exit. A server that
-// survives the timeout counts as a failure of the rule under test and is
-// killed.
+// Returns the absolute path of the Rspress CLI file that the app resolves
+// (`bin.rspress` of its `@rspress/core` package). The test starts that file
+// with the current Node executable: a bare `rspress` name is a `.cmd` shim on
+// Windows, which Node cannot start without a shell, and the file path also
+// does not depend on `PATH`.
+const rspressBin = (): string => {
+  const manifestPath = createRequire(
+    resolvePath(APP_DIRECTORY, "package.json"),
+  ).resolve(`${RSPRESS_PACKAGE}/package.json`);
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+    bin?: string | Record<string, string>;
+  };
+  const bin =
+    typeof manifest.bin === "string" ? manifest.bin : manifest.bin?.rspress;
+  if (bin === undefined) {
+    throw new Error(`${RSPRESS_PACKAGE} declares no rspress bin`);
+  }
+  return resolvePath(dirname(manifestPath), bin);
+};
+
+// Runs `rspress dev` from the app directory with an argument array and no
+// shell (through the CLI file that `rspressBin` resolves), and waits for it to
+// exit. A server that survives the timeout counts as a failure of the rule
+// under test and is killed.
 const runDevServer = (args: string[]): Promise<DevServerResult> =>
   new Promise((resolve, reject) => {
-    const child = spawn("rspress", ["dev", ...args], {
+    const child = spawn(process.execPath, [rspressBin(), "dev", ...args], {
       cwd: APP_DIRECTORY,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
