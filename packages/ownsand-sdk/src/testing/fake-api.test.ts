@@ -1,12 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, test } from "@rstest/core";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
+import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { Disconnect, Eof, Hang, Sleep } from "./fake-api.ts";
 import { ev, execMsg, setup } from "./harness.ts";
 
 const EXEC_URL = `https://ownsand.api.test/${RelayService.typeName}/Exec`;
 // One enveloped, empty request message.
 const REQUEST_BODY = new Uint8Array([0, 0, 0, 0, 0]);
+const GET_SANDBOX_URL = `https://ownsand.api.test/${SandboxService.typeName}/GetSandbox`;
+
+/** Calls GetSandbox with an empty request, a valid empty message. */
+function getSandbox(h: ReturnType<typeof setup>, signal?: AbortSignal) {
+  return h.api.fetch(GET_SANDBOX_URL, {
+    method: "POST",
+    headers: { "content-type": "application/proto" },
+    body: new Uint8Array(0),
+    signal,
+  });
+}
+
+/** Starts the Exec stream with an optional signal. */
+function openExec(h: ReturnType<typeof setup>, signal?: AbortSignal) {
+  return h.api.fetch(EXEC_URL, {
+    method: "POST",
+    headers: { "content-type": "application/connect+proto" },
+    body: REQUEST_BODY,
+    signal,
+  });
+}
 
 type Read = { at: number; flags: number | undefined };
 
@@ -117,13 +139,31 @@ describe("FakeApi stream scripts", () => {
 
     expect((await h.clock.run(readFrame())).flags).toBe(0);
     const pending = readFrame();
+    pending.catch(() => {});
     await h.clock.advance(50);
-    controller.abort(new Error("caller canceled"));
-    await h.clock.settle();
+    const reason = new Error("caller canceled");
+    controller.abort(reason);
+    // The pending read rejects with the abort reason instead of hanging.
+    await expect(pending).rejects.toBe(reason);
     // The script must not run past the sleeps once the call is aborted.
     await h.clock.advance(1_000);
     expect(reachedAfterSleeps).toBe(false);
+  });
+
+  test("errors the body of an aborted Sleep for a later read too", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield new Sleep(100);
+      yield execMsg(ev.accepted());
+    });
+    const { controller, reader, readFrame } = await open(h);
+
+    const pending = readFrame();
     pending.catch(() => {});
+    const reason = new Error("caller canceled");
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    await expect(reader.read()).rejects.toBe(reason);
   });
 
   test("stops the sleep loop when the reader cancels during a Sleep", async () => {
@@ -158,5 +198,93 @@ describe("FakeApi stream scripts", () => {
     await h.clock.advance(20);
     controller.abort(new Error("caller canceled"));
     await expect(pending).rejects.toThrow("caller canceled");
+  });
+});
+
+describe("FakeApi cancellation before dispatch", () => {
+  test("rejects an already aborted unary call without dispatching it", async () => {
+    const h = setup();
+    const indexes: number[] = [];
+    h.api.unary(SandboxService, "GetSandbox", (_req, call) => {
+      indexes.push(call.index);
+      return { sandbox: {} };
+    });
+    const reason = new Error("caller canceled");
+
+    await expect(getSandbox(h, AbortSignal.abort(reason))).rejects.toBe(reason);
+
+    expect(indexes).toEqual([]);
+    expect(h.api.callsOf("GetSandbox")).toHaveLength(0);
+    expect(h.api.fetchedUrls).toEqual([GET_SANDBOX_URL]);
+
+    // The canceled call consumed no index: the next call is the first one.
+    const response = await getSandbox(h);
+    expect(response.status).toBe(200);
+    expect(indexes).toEqual([0]);
+    expect(h.api.callsOf("GetSandbox")).toHaveLength(1);
+  });
+
+  test("rejects an already aborted streaming call without dispatching it", async () => {
+    const h = setup();
+    const indexes: number[] = [];
+    h.api.stream(RelayService, "Exec", function* (_req, call) {
+      indexes.push(call.index);
+      yield execMsg(ev.accepted());
+    });
+    const reason = new Error("caller canceled");
+
+    await expect(openExec(h, AbortSignal.abort(reason))).rejects.toBe(reason);
+
+    expect(indexes).toEqual([]);
+    expect(h.api.callsOf("Exec")).toHaveLength(0);
+    expect(h.api.fetchedUrls).toEqual([EXEC_URL]);
+
+    // The next live call starts the script at index 0 and streams normally.
+    const response = await openExec(h);
+    const reader = response.body!.getReader();
+    const first = await h.clock.run(reader.read());
+    expect(first.value![0]).toBe(0);
+    expect(indexes).toEqual([0]);
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+  });
+
+  test("dispatches nothing when a unary call aborts during the body read", async () => {
+    const h = setup();
+    const indexes: number[] = [];
+    h.api.unary(SandboxService, "GetSandbox", (_req, call) => {
+      indexes.push(call.index);
+      return { sandbox: {} };
+    });
+    const controller = new AbortController();
+    const reason = new Error("aborted while reading the body");
+
+    const pending = getSandbox(h, controller.signal);
+    // The body read has not finished yet: fetch is suspended at it.
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    expect(indexes).toEqual([]);
+    expect(h.api.callsOf("GetSandbox")).toHaveLength(0);
+
+    await getSandbox(h);
+    expect(indexes).toEqual([0]);
+  });
+
+  test("dispatches nothing when a streaming call aborts during the body read", async () => {
+    const h = setup();
+    const indexes: number[] = [];
+    h.api.stream(RelayService, "Exec", function* (_req, call) {
+      indexes.push(call.index);
+      yield execMsg(ev.accepted());
+    });
+    const controller = new AbortController();
+    const reason = new Error("aborted while reading the body");
+
+    const pending = openExec(h, controller.signal);
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    expect(indexes).toEqual([]);
+    expect(h.api.callsOf("Exec")).toHaveLength(0);
   });
 });

@@ -194,6 +194,12 @@ export class FakeApi {
           : input.url,
     );
     this.fetchedUrls.push(url.href);
+    // Like a real fetch, a call that is canceled before it is dispatched
+    // rejects with the signal's reason and reaches no handler. It must leave
+    // no call record and consume no per-method index, so the next live call
+    // sees the script start.
+    const signal = init?.signal ?? new AbortController().signal;
+    if (signal.aborted) throw signal.reason;
     const path = url.pathname;
     const method = METHODS.get(path);
     if (method === undefined) {
@@ -203,7 +209,8 @@ export class FakeApi {
     const body = new Uint8Array(
       await new Response(init?.body as BodyInit).arrayBuffer(),
     );
-    const signal = init?.signal ?? new AbortController().signal;
+    // The body read is asynchronous, so the caller can cancel during it.
+    if (signal.aborted) throw signal.reason;
     const index = this.#counts.get(path) ?? 0;
     this.#counts.set(path, index + 1);
     const call: CallContext = { headers, signal, index };
@@ -300,8 +307,15 @@ export class FakeApi {
             // A Sleep step enqueues nothing, and a web stream pulls again only
             // when a read is outstanding while a pull runs. Keep reading steps
             // in this pull so consecutive Sleep steps cannot stall the stream.
-            // Stop once the call is aborted or the reader cancelled.
-            if (signal.aborted || finished) return;
+            // Stop once the reader cancelled. When the call is aborted, error
+            // the body with the reason so a pending read rejects instead of
+            // hanging, and do not advance the script.
+            if (finished) return;
+            if (signal.aborted) {
+              finished = true;
+              controller.error(signal.reason);
+              return;
+            }
             continue;
           }
           if (step instanceof Disconnect) {
