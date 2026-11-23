@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -133,6 +134,14 @@ func TestReplaceDeviceLimitsAcceptsExplicitZero(t *testing.T) {
 		"memory_mib": func(l *ownsandv1.DeviceLimitsInput) { l.MemoryMib = i64(0) },
 		"disk_gib":   func(l *ownsandv1.DeviceLimitsInput) { l.DiskGib = i64(0) },
 	}
+	// The scheduler rejects the first limit the request exceeds, checked in
+	// the order vCPU, memory, disk. With one limit zeroed and the others
+	// large enough, exactly one check fires and its message is pinned here.
+	wantMessage := map[string]string{
+		"vcpu_count": "no device can run the sandbox: the request has more vCPUs than the device vCPU limit",
+		"memory_mib": "no device can run the sandbox: the request needs more memory than the device limit",
+		"disk_gib":   "no device can run the sandbox: the request needs more disk than the device limit",
+	}
 	for name, c := range clients {
 		for field, set := range zero {
 			baseEvents, baseAudits := deviceWriteCounts(t, env, org.ID, dev.ID)
@@ -155,10 +164,13 @@ func TestReplaceDeviceLimitsAcceptsExplicitZero(t *testing.T) {
 			}
 			// The device holds the stored zero, so it cannot take a sandbox that
 			// needs the resource (createReq needs 2 vCPUs, 1024 MiB and 10 GiB).
-			if _, err := org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID))); err == nil {
+			_, err = org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+			if err == nil {
 				t.Fatalf("%s: zero %s: a sandbox was placed on the device", name, field)
-			} else if code := testenv.Code(err); code == connect.CodeUnavailable || code == connect.CodeInternal || code == connect.CodeUnknown {
-				t.Fatalf("%s: zero %s: create sandbox = %v, want a placement rejection", name, field, err)
+			}
+			var ce *connect.Error
+			if code := testenv.Code(err); code != connect.CodeFailedPrecondition || !errors.As(err, &ce) || ce.Message() != wantMessage[field] {
+				t.Fatalf("%s: zero %s: create sandbox = %v (code %v), want %v: %q", name, field, err, code, connect.CodeFailedPrecondition, wantMessage[field])
 			}
 		}
 	}
