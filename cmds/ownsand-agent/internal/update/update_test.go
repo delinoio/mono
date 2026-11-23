@@ -973,6 +973,13 @@ func TestTransferReservationExcludesInstallation(t *testing.T) {
 	if ok, _ := u.TryInstall(); ok || inst.installed.Load() != 0 {
 		t.Fatal("installed while one transfer still runs")
 	}
+	// The wake channel holds one coalesced notification. The verified update
+	// and the first release already queued one, so drain it: the receive
+	// below must then prove that the last release queued a fresh one.
+	select {
+	case <-u.wake:
+	default:
+	}
 	second()
 	select {
 	case <-u.wake:
