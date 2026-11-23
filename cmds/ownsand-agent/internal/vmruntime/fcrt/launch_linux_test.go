@@ -130,9 +130,32 @@ func recvOrFatal(t *testing.T, ch <-chan struct{}, what string) {
 // observed. The destructive wait must not run until the callback returned.
 func TestStopSignalFinishesBeforeTheReaperReaps(t *testing.T) {
 	f := newFixture(t)
+	// The fixture's short stop timeout starts when the signal callback
+	// returns; this test controls the finalization timing, so a delay
+	// between the destructive wait and the release must not fail stop.
+	f.r.stopTimeout = barrierWait
+	// Cleanups run last-in-first-out. The join is registered before
+	// fakeLaunch so that it runs after the fake launch cleanup, which
+	// finishes the finalization and the reaper; the signal release is
+	// registered after fakeLaunch so that it runs first.
+	var stopDone chan struct{}
+	t.Cleanup(func() {
+		if stopDone == nil {
+			return
+		}
+		select {
+		case <-stopDone:
+		case <-time.After(barrierWait):
+			t.Error("the stop goroutine did not return during cleanup")
+		}
+	})
 	c := f.fakeLaunch("sb1", 321)
 	inSignal := make(chan struct{})
 	releaseSignal := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSignal) }) }
+	// An early exit of the test must still let the signal callback return.
+	t.Cleanup(release)
 	var signalled atomic.Int32
 	f.r.signalGroup = func(pid int) error {
 		signalled.Add(1)
@@ -144,7 +167,11 @@ func TestStopSignalFinishesBeforeTheReaperReaps(t *testing.T) {
 		return nil
 	}
 	stopErr := make(chan error, 1)
-	go func() { stopErr <- f.r.stop(c.v) }()
+	stopDone = make(chan struct{})
+	go func() {
+		defer close(stopDone)
+		stopErr <- f.r.stop(c.v)
+	}()
 	recvOrFatal(t, inSignal, "the signal callback")
 	c.exit(t)
 	select {
@@ -152,7 +179,7 @@ func TestStopSignalFinishesBeforeTheReaperReaps(t *testing.T) {
 		t.Fatal("the destructive wait ran inside the signal callback")
 	case <-time.After(settle):
 	}
-	close(releaseSignal)
+	release()
 	recvOrFatal(t, c.waitCalled, "the destructive wait")
 	if closed(c.l.exited) {
 		t.Fatal("completion published before the finalization")
