@@ -226,6 +226,54 @@ func TestLoadR2AndSTUN(t *testing.T) {
 	}
 }
 
+// TestLoadR2EndpointPath checks that an account endpoint with a path stops the
+// server at startup without echoing the endpoint, and that the root forms and
+// the all-unset form still load.
+func TestLoadR2EndpointPath(t *testing.T) {
+	setR2 := func(v map[string]string, endpoint string) {
+		v[EnvR2Endpoint], v[EnvR2Bucket], v[EnvR2AccessKeyID], v[EnvR2SecretAccessKey] = endpoint, "b", "k", "s"
+	}
+	for _, endpoint := range []string{
+		"https://acct.example.test/storage",
+		"https://acct.example.test/storage/",
+		"https://acct.example.test//",
+		"http://127.0.0.1:13100/s3",
+	} {
+		v := minimal()
+		setR2(v, endpoint)
+		_, err := Load(env(v))
+		if err == nil || !strings.Contains(err.Error(), EnvR2Endpoint) {
+			t.Errorf("%q: err = %v, want an error that names %s", endpoint, err, EnvR2Endpoint)
+			continue
+		}
+		if strings.Contains(err.Error(), "example.test") || strings.Contains(err.Error(), "127.0.0.1") || strings.Contains(err.Error(), "/s3") {
+			t.Errorf("%q: error %q contains the rejected value", endpoint, err)
+		}
+	}
+	for _, endpoint := range []string{
+		"https://acct.example.test",
+		"https://acct.example.test/",
+		"http://127.0.0.1:13100",
+		"http://127.0.0.1:13100/",
+	} {
+		v := minimal()
+		setR2(v, endpoint)
+		cfg, err := Load(env(v))
+		if err != nil || !cfg.R2.Enabled {
+			t.Errorf("%q: R2.Enabled = %v, err = %v", endpoint, cfg.R2.Enabled, err)
+		}
+	}
+	if cfg, err := Load(env(minimal())); err != nil || cfg.R2.Enabled {
+		t.Errorf("unset R2: R2.Enabled = %v, err = %v", cfg.R2.Enabled, err)
+	}
+	v := minimal()
+	setR2(v, "https://acct.example.test")
+	delete(v, EnvR2SecretAccessKey)
+	if _, err := Load(env(v)); err == nil {
+		t.Error("partial R2 configuration accepted")
+	}
+}
+
 func TestLoadSTUNRateBurst(t *testing.T) {
 	for _, value := range []string{"1", "63"} {
 		v := minimal()
@@ -479,6 +527,45 @@ func TestLoadAccountsAPIOriginQuery(t *testing.T) {
 		"https://accounts.api.delino.io/": "https://accounts.api.delino.io",
 		"http://127.0.0.1:18100":          "http://127.0.0.1:18100",
 		"http://127.0.0.1:18100/":         "http://127.0.0.1:18100",
+	} {
+		v := minimal()
+		v[EnvAccountsAPIOrigin] = origin
+		cfg, err := Load(env(v))
+		if err != nil || cfg.Accounts.APIOrigin != want {
+			t.Errorf("%q: origin = %q, err = %v, want %q", origin, cfg.Accounts.APIOrigin, err, want)
+		}
+	}
+}
+
+// TestLoadAccountsAPIOriginUserInfo checks that user information in the origin
+// stops the server at startup, and that the error names the variable without
+// echoing the credentials.
+func TestLoadAccountsAPIOriginUserInfo(t *testing.T) {
+	for _, origin := range []string{
+		"https://user@accounts.example.test",
+		"https://user:secret@accounts.example.test",
+		"https://user:secret@accounts.example.test/",
+		"https://:secret@accounts.example.test",
+		"https://@accounts.example.test",
+		"http://user:secret@127.0.0.1:18100",
+	} {
+		v := minimal()
+		v[EnvAccountsAPIOrigin] = origin
+		_, err := Load(env(v))
+		if err == nil || !strings.Contains(err.Error(), EnvAccountsAPIOrigin) {
+			t.Errorf("%q: err = %v, want an error that names %s", origin, err, EnvAccountsAPIOrigin)
+			continue
+		}
+		if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "user") {
+			t.Errorf("%q: error %q contains the credentials", origin, err)
+		}
+	}
+	for origin, want := range map[string]string{
+		"https://accounts.example.test":       "https://accounts.example.test",
+		"https://accounts.example.test/":      "https://accounts.example.test",
+		"https://accounts.example.test:8443":  "https://accounts.example.test:8443",
+		"https://accounts.example.test:8443/": "https://accounts.example.test:8443",
+		"http://127.0.0.1:18100/":             "http://127.0.0.1:18100",
 	} {
 		v := minimal()
 		v[EnvAccountsAPIOrigin] = origin

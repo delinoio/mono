@@ -368,7 +368,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		if cfg.R2.Bucket == "" || cfg.R2.Endpoint == "" || cfg.R2.AccessKeyID == "" || cfg.R2.SecretAccessKey == "" {
 			return Config{}, fmt.Errorf("%s, %s, %s and %s must be set together", EnvR2Endpoint, EnvR2Bucket, EnvR2AccessKeyID, EnvR2SecretAccessKey)
 		}
-		if err := validateURL(EnvR2Endpoint, cfg.R2.Endpoint); err != nil {
+		if err := validateR2Endpoint(cfg.R2.Endpoint); err != nil {
 			return Config{}, err
 		}
 		cfg.R2.Enabled = true
@@ -412,7 +412,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		u, err := url.Parse(v)
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
 			// A bare "?" leaves u.RawQuery empty and only sets u.ForceQuery, so check it too. The origin has no query, empty or not.
-			u.ForceQuery || u.Fragment != "" || strings.Contains(v, "#") {
+			// User information (user, user:password or an empty "@") is not part of an origin,
+			// and it would send credentials to the accounts API in every request URL.
+			u.ForceQuery || u.User != nil || u.Fragment != "" || strings.Contains(v, "#") {
 			return Config{}, fmt.Errorf("%s must be an origin such as https://accounts.api.delino.io", EnvAccountsAPIOrigin)
 		}
 		cfg.Accounts.APIOrigin = strings.TrimSuffix(v, "/")
@@ -474,6 +476,22 @@ func validateURL(name, value string) error {
 	u, err := url.Parse(value)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
 		return fmt.Errorf("%s must be an http or https URL", name)
+	}
+	return nil
+}
+
+// validateR2Endpoint requires an http or https account endpoint without a path.
+// The object store addresses objects as /<bucket>/<key> under the endpoint
+// host and replaces any path of the endpoint in some requests while it keeps
+// the path in others, so an endpoint with a path would send requests to
+// different locations. The error never includes the endpoint value.
+func validateR2Endpoint(value string) error {
+	if err := validateURL(EnvR2Endpoint, value); err != nil {
+		return err
+	}
+	// validateURL has already parsed value, so Parse cannot fail here.
+	if u, _ := url.Parse(value); u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("%s must be an account endpoint without a path such as https://<account>.r2.cloudflarestorage.com", EnvR2Endpoint)
 	}
 	return nil
 }
