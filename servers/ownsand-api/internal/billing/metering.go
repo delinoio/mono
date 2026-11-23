@@ -108,6 +108,9 @@ type Metering struct {
 	timing   Timing
 	metrics  *metrics
 	rec      *Recorder
+	// newTimer creates the idle timer of the reporter. It is always the real
+	// timer outside tests, which replace it to control when the timer fires.
+	newTimer func(time.Duration) reportTimer
 
 	flushMu  sync.Mutex
 	reportMu sync.Mutex
@@ -135,8 +138,24 @@ func New(opts Options) *Metering {
 	return &Metering{
 		db: opts.DB, logger: opts.Logger, now: opts.Now, held: opts.Held, client: opts.Client, statuses: opts.Statuses,
 		timing: timing, metrics: newMetrics(opts.Metrics), rec: NewRecorder(opts.Logger), kick: make(chan struct{}, 1),
+		newTimer: newRealReportTimer,
 	}
 }
+
+// reportTimer is the part of time.Timer that the reporter uses. It exists so
+// that a test can decide when the idle timer fires; production code always
+// uses the real timer.
+type reportTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+	Reset(d time.Duration) bool
+}
+
+type realReportTimer struct{ *time.Timer }
+
+func newRealReportTimer(d time.Duration) reportTimer { return realReportTimer{time.NewTimer(d)} }
+
+func (t realReportTimer) C() <-chan time.Time { return t.Timer.C }
 
 // Add records quantity units of meter for the organization at the given
 // time. It only updates memory; Flush writes the counts to Postgres.
@@ -211,13 +230,13 @@ func (m *Metering) runReport(ctx context.Context) {
 			slog.String("detail", "LOGTO_TOKEN_ENDPOINT, ACCOUNTS_M2M_CLIENT_ID and ACCOUNTS_M2M_CLIENT_SECRET are unset; metered usage stays in the outbox until a process with them reports it"))
 		return
 	}
-	timer := time.NewTimer(m.timing.Tick)
+	timer := m.newTimer(m.timing.Tick)
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-timer.C:
+		case <-timer.C():
 		case <-m.kick:
 		}
 		// An instance that does not hold the lease checks it again after one
@@ -237,7 +256,7 @@ func (m *Metering) runReport(ctx context.Context) {
 		}
 		if !timer.Stop() {
 			select {
-			case <-timer.C:
+			case <-timer.C():
 			default:
 			}
 		}
