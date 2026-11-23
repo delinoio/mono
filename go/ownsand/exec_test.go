@@ -1341,6 +1341,10 @@ func TestExecInterruptedAfterAcceptanceResumesSavedBudget(t *testing.T) {
 	}
 }
 
+// TestExecCallerCancellationEndsHeldContinuationEarlier cancels the caller
+// only after the relay has entered the held AttachExec continuation, so the
+// caller's cancellation (not a timer started before the exec, and not the
+// recovery deadline) is what ends the held call.
 func TestExecCallerCancellationEndsHeldContinuationEarlier(t *testing.T) {
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(5, 20*time.Millisecond)
@@ -1350,17 +1354,39 @@ func TestExecCallerCancellationEndsHeldContinuationEarlier(t *testing.T) {
 		}
 		return relayAction{holdOpen: true}
 	}
+	// The recovery window is far longer than the test waits, so the recovery
+	// deadline cannot be what ends the held call.
 	c := recoveryDeadlineClient(t, cp, 5*time.Second)
 	s := cp.handle(t, c)
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	start := time.Now()
-	_, err := s.Exec(ctx, ExecParams{Command: []string{"run"}})
-	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errRecoveryDeadline) {
-		t.Fatalf("want the caller's deadline, got %v", err)
+	errc := make(chan error, 1)
+	go func() {
+		_, err := s.Exec(ctx, ExecParams{Command: []string{"run"}})
+		errc <- err
+	}()
+	select {
+	case <-cp.heldEntered:
+	case err := <-errc:
+		t.Fatalf("Exec returned %v before the relay entered the held AttachExec", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the relay never entered the held AttachExec")
 	}
-	if time.Since(start) > time.Second {
-		t.Fatalf("cancellation took %v", time.Since(start))
+	canceledAt := time.Now()
+	cancel()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) || errors.Is(err, errRecoveryDeadline) {
+			t.Fatalf("want the caller's cancellation, got %v", err)
+		}
+		if d := time.Since(canceledAt); d > time.Second {
+			t.Fatalf("cancellation took %v", d)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Exec did not return after the caller's context ended")
+	}
+	if held := cp.heldDurations(); len(held) != 1 {
+		t.Fatalf("held streams %v, want exactly one that ended", held)
 	}
 }
 

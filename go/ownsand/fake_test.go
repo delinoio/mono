@@ -235,6 +235,11 @@ type fakeCP struct {
 	agent *fakeAgent
 	auths []string // Authorization headers seen
 	other []string // requests seen by nobody but the redirect target
+
+	// heldEntered receives one value each time a held relay stream starts
+	// (after the start is recorded), so a test can wait until the relay
+	// is inside the hold. It has room for 8 values and hold never blocks on it.
+	heldEntered chan struct{}
 }
 
 func newFakeCP(t testing.TB) *fakeCP {
@@ -250,6 +255,7 @@ func newFakeCP(t testing.TB) *fakeCP {
 		relayCalls: map[string]int{},
 		agent:      newFakeAgent(),
 	}
+	cp.heldEntered = make(chan struct{}, 8)
 	mux := http.NewServeMux()
 	opts := connect.WithInterceptors(&fakeAuth{cp: cp})
 	mux.Handle(ownsandv1connect.NewSandboxServiceHandler(&fakeSandboxes{cp: cp}, opts))
@@ -802,6 +808,10 @@ func (f *fakeRelay) hold(ctx context.Context, act relayAction, keepalive func() 
 	cp.mu.Lock()
 	cp.heldStarts = append(cp.heldStarts, time.Now())
 	cp.mu.Unlock()
+	select {
+	case cp.heldEntered <- struct{}{}:
+	default:
+	}
 	defer func() {
 		cp.mu.Lock()
 		cp.heldEnds = append(cp.heldEnds, time.Now())
