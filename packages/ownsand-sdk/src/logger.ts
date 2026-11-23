@@ -29,17 +29,38 @@ export interface LogRecord {
   queuedBytes?: number;
 }
 
-/** The SDK logs nothing unless the caller passes a logger. */
+/**
+ * The SDK logs nothing unless the caller passes a logger. The SDK never waits
+ * for a logger: a promise that the logger returns is not awaited, and its
+ * rejection is ignored.
+ */
 export type Logger = (record: LogRecord) => void;
 
-/** Calls the logger and ignores its failures. */
+/**
+ * Calls the logger and ignores its failures, whether it throws or returns a
+ * promise that rejects. It never waits for the logger.
+ */
 export function safeLog(logger: Logger | undefined, record: LogRecord): void {
   if (logger === undefined) {
     return;
   }
   try {
-    logger(record);
+    const result: unknown = logger(record);
+    if (isThenable(result)) {
+      // An async logger fails with a rejected promise, which no caller
+      // observes. Attach a handler so that the rejection is not reported as
+      // unhandled, and do not wait for the promise.
+      result.then(undefined, () => {});
+    }
   } catch {
     // A failing logger must not change the result of an operation.
   }
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
 }

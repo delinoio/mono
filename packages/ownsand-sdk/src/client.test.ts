@@ -411,6 +411,136 @@ describe("credentials", () => {
     expect(JSON.stringify(records)).not.toContain(API_KEY);
   });
 
+  describe("a logger that returns a promise", () => {
+    // Runs the body with an unhandledRejection listener and returns what it
+    // saw. Node reports an unhandled rejection after a macrotask turn, so wait
+    // for one before the listener is removed.
+    async function collectUnhandled(body: () => Promise<void>) {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (e: unknown) => unhandled.push(e);
+      process.on("unhandledRejection", onUnhandled);
+      try {
+        await body();
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+      }
+      return unhandled;
+    }
+
+    const rejecting: Array<[string, (r: LogRecord) => unknown]> = [
+      [
+        "an async function that throws",
+        async () => {
+          throw new Error("log sink failed");
+        },
+      ],
+      ["a rejected promise", () => Promise.reject(new Error("log sink down"))],
+      [
+        "a thenable that rejects",
+        () => ({
+          then: (_: unknown, onRejected: (e: unknown) => void) =>
+            onRejected(new Error("log sink down")),
+        }),
+      ],
+    ];
+
+    for (const [name, logger] of rejecting) {
+      test(`keeps a unary result and raises no unhandled rejection for ${name}`, async () => {
+        const h = setup({ logger: logger as (r: LogRecord) => void });
+        h.api.unary(SandboxService, "GetSandbox", () => ({ sandbox: {} }));
+        const unhandled = await collectUnhandled(async () => {
+          const res = await h.client.sandbox(SANDBOX).get();
+          expect(res).toBeDefined();
+        });
+        expect(unhandled).toEqual([]);
+      });
+
+      test(`keeps a unary error and raises no unhandled rejection for ${name}`, async () => {
+        const h = setup({ logger: logger as (r: LogRecord) => void });
+        h.api.unary(SandboxService, "GetSandbox", () => {
+          throw new ConnectError("plain failure", Code.Internal);
+        });
+        const unhandled = await collectUnhandled(async () => {
+          const error = await h.client
+            .sandbox(SANDBOX)
+            .get()
+            .catch((e) => e);
+          expect(error.code).toBe(Code.Internal);
+        });
+        expect(unhandled).toEqual([]);
+      });
+
+      test(`keeps a stream result and raises no unhandled rejection for ${name}`, async () => {
+        const h = setup();
+        const transport = createApiTransport({
+          origin: h.api.origin,
+          credential: { apiKey: API_KEY },
+          organizationId: ORG,
+          fetch: h.api.fetch,
+          logger: logger as (r: LogRecord) => void,
+          activity: new ActivityRegistry(),
+          now: () => 0,
+        });
+        h.api.stream(RelayService, "Exec", function* () {
+          yield execMsg(ev.accepted());
+          yield execMsg(ev.exited(0));
+        });
+        const unhandled = await collectUnhandled(async () => {
+          const res = await transport.stream(
+            RelayService.method.exec,
+            undefined,
+            undefined,
+            undefined,
+            (async function* () {
+              yield create(RelayService.method.exec.input, {});
+            })(),
+          );
+          const seen: unknown[] = [];
+          for await (const m of res.message) {
+            seen.push(m);
+          }
+          expect(seen).toHaveLength(2);
+        });
+        expect(unhandled).toEqual([]);
+      });
+    }
+
+    test("does not wait for a logger promise that never settles", async () => {
+      const records: LogRecord[] = [];
+      const h = setup({
+        logger: (r) => {
+          records.push(r);
+          return new Promise<void>(() => {}) as unknown as void;
+        },
+      });
+      h.api.unary(SandboxService, "GetSandbox", () => ({ sandbox: {} }));
+      await h.client.sandbox(SANDBOX).get();
+      expect(records).toEqual([
+        expect.objectContaining({ rpc: expect.stringContaining("GetSandbox") }),
+      ]);
+    });
+
+    test("still isolates a synchronous throw and keeps the record format", async () => {
+      const records: LogRecord[] = [];
+      const h = setup({
+        logger: (r) => {
+          records.push(r);
+          throw new Error("sync logger failure");
+        },
+      });
+      h.api.unary(SandboxService, "GetSandbox", () => ({ sandbox: {} }));
+      await h.client.sandbox(SANDBOX).get();
+      expect(records).toEqual([
+        expect.objectContaining({
+          rpc: "delino.ownsand.v1.SandboxService/GetSandbox",
+          code: "ok",
+        }),
+      ]);
+    });
+  });
+
   describe("streaming RPC outcomes", () => {
     const EXEC = "delino.ownsand.v1.RelayService/Exec";
 
