@@ -248,7 +248,8 @@ func TestExportFailUpdateZeroRowsIsResolved(t *testing.T) {
 		name string
 		// act changes the world while the compensation waits for its next
 		// attempt, and returns the channel that must stay open (nil when
-		// the old channel is the only one).
+		// the original channel, which the test captured before the
+		// saturation, is the one).
 		act func(t *testing.T, env *testenv.Env, org *testenv.Org, snapID string, agent *testenv.FakeAgent) (stay *hub.Conn)
 		// check verifies the row afterwards.
 		check func(t *testing.T, env *testenv.Env, org *testenv.Org, snapID string)
@@ -294,7 +295,11 @@ func TestExportFailUpdateZeroRowsIsResolved(t *testing.T) {
 				// state report fails the attempt (owner_channel_replaced).
 				agent.ResumeReads()
 				reconnect(agent)
-				return env.App.Service.Hub.Get(agent.Device.ID)
+				replacement := env.App.Service.Hub.Get(agent.Device.ID)
+				if replacement == nil {
+					t.Fatal("the replacement channel is missing")
+				}
+				return replacement
 			},
 			check: func(t *testing.T, env *testenv.Env, org *testenv.Org, snapID string) {
 				waitExportState(t, org.OwnerClient, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
@@ -310,7 +315,7 @@ func TestExportFailUpdateZeroRowsIsResolved(t *testing.T) {
 			env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 			org := env.NewOrg("alice")
 			c := org.OwnerClient
-			_, agent := setupAgent(t, env, org, nil)
+			dev, agent := setupAgent(t, env, org, nil)
 			created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
 			if err != nil {
 				t.Fatal(err)
@@ -318,6 +323,12 @@ func TestExportFailUpdateZeroRowsIsResolved(t *testing.T) {
 			sandboxID := created.Msg.GetSandbox().GetSandboxId()
 			waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 			snapID := plainSnapshot(t, org, sandboxID)
+			// The channel that the compensation must keep open when the
+			// scenario does not replace it.
+			orig := env.App.Service.Hub.Get(dev.ID)
+			if orig == nil {
+				t.Fatal("the device has no channel")
+			}
 			saturate(t, env, agent)
 			exportFailsAfterClaim(t, c, org.ID, snapID)
 			waitLog(t, env, `"msg":"export_fail_transition_retry"`)
@@ -332,9 +343,10 @@ func TestExportFailUpdateZeroRowsIsResolved(t *testing.T) {
 				t.Fatalf("a zero-row update was reported as failed:\n%s", logs)
 			}
 			sc.check(t, env, org, snapID)
-			if stay != nil {
-				connStaysOpen(t, stay)
+			if stay == nil {
+				stay = orig
 			}
+			connStaysOpen(t, stay)
 			if got := fault.calls(); got < 1 {
 				t.Fatalf("update calls = %d", got)
 			}
