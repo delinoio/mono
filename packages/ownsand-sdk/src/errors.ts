@@ -11,6 +11,16 @@ export class OwnSandError extends Error {
   override name = "OwnSandError";
 }
 
+/**
+ * The abort reason of a relay stream that the SDK closed after the consumer
+ * took its terminal event. It is internal: the RPC logger reads it to tell a
+ * completed call (`ok`) from one that the consumer or the caller cancelled,
+ * and no operation surfaces it.
+ */
+export class RelayStreamCompletedError extends OwnSandError {
+  override name = "RelayStreamCompletedError";
+}
+
 /** The client configuration is incomplete or invalid. */
 export class OwnSandConfigError extends OwnSandError {
   override name = "OwnSandConfigError";

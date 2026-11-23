@@ -10,6 +10,7 @@ import {
   OwnSandConfigError,
   OwnSandCredentialError,
   redactError,
+  RelayStreamCompletedError,
 } from "./errors.ts";
 import { type Logger, LogEvent, safeLog } from "./logger.ts";
 
@@ -418,13 +419,24 @@ function loggingInterceptor(options: ConnectionOptions): Interceptor {
         // signal is still live when the stream ends by itself, because
         // Connect ends the call only after the last read returns. An
         // aborted signal at completion therefore means the consumer or the
-        // caller ended the stream first.
+        // caller ended the stream first, except when the relay layer closed
+        // the stream after its terminal event: it then aborts with
+        // RelayStreamCompletedError, the call completed and the consumer
+        // only stopped reading. Connect surfaces that abort as a canceled
+        // error of the drained iterator, which is the abort's effect and not
+        // a failure of the call.
+        const closedAfterTerminal = (): boolean =>
+          req.signal.aborted &&
+          req.signal.reason instanceof RelayStreamCompletedError;
         let outcome = Code[Code.Canceled];
         try {
           yield* inner;
-          outcome = req.signal.aborted ? Code[Code.Canceled] : "ok";
+          outcome =
+            !req.signal.aborted || closedAfterTerminal()
+              ? "ok"
+              : Code[Code.Canceled];
         } catch (error) {
-          outcome = codeOf(error);
+          outcome = closedAfterTerminal() ? "ok" : codeOf(error);
           throw error;
         } finally {
           record(outcome);
