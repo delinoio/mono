@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "8f8a458dcea7fb65a6ec0df5548697df9dc9cbdbaf6dd7a3fba8f053cc4a4245",
+        "AGENTS.md": "c03a266d916fbb2754f2000d16071379df6370740091992125f4f98e03a5075f",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "9eafb2123d3b8b2aef41fba0db2648a3f4f49996f8c7c8bb2c86263befd8b48a",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -121,7 +121,7 @@
         "rules/rendering-hydration-no-flicker.md": "1fd45b1aebdc6a5b78604b8a84baf53e5e22ce2ca076dc643a249b8038b4c540",
         "rules/rendering-hydration-suppress-warning.md": "915bacb934e2927d84b37a3f3d225a47b309ac8f9e494ed2bcb66ce07c5676a2",
         "rules/rendering-resource-hints.md": "351b1095d641717b930f1b2253282b7120af3023bc74e06c17675168d4286864",
-        "rules/rendering-script-defer-async.md": "4cea07b7875ba7fc2c7465ff23b63a2bb334f90aaf2d9293d38d67b05fdb32ab",
+        "rules/rendering-script-defer-async.md": "f7e48df4cdf976c2b0d6f62900534fed8e743f42facc3eca03fef0f69cd767e0",
         "rules/rendering-svg-precision.md": "ed468533f6e95f622859c884b122cf21f9f593ed6bb3d500a54de4b9f9bcb9fb",
         "rules/rendering-usetransition-loading.md": "5903cea87bc6abe462861a74b8ae3a2e5ea344001a4bbd44d373be3b4b03c116",
         "rules/rerender-defer-reads.md": "234050a77faf50cb306be10a9e15bd4421134ab5907e75f13e6d78e2bd262dc9",
