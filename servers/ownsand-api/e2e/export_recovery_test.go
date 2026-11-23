@@ -107,8 +107,14 @@ func retryAndImport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Clie
 		t.Fatalf("CreateSandbox on the second device: %v", err)
 	}
 	defer restored.Close()
-	if info, err := restored.WaitStable(ctx); err != nil || info.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+	info, err := restored.WaitStable(ctx)
+	if err != nil || info.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		t.Fatalf("restored WaitStable = (%v, %v)", info.GetState(), err)
+	}
+	// The import must restore the snapshot on the requested second device;
+	// a sandbox placed on the source device would satisfy every other check.
+	if info.GetDeviceId() != s.agents[1].deviceID {
+		t.Fatalf("restored sandbox device = %q, want the second device %q", info.GetDeviceId(), s.agents[1].deviceID)
 	}
 	got, err := restored.ReadFileBytes(ctx, workDir(ctx, t, restored)+"/data.bin")
 	if err != nil || !bytes.Equal(got, data) {
