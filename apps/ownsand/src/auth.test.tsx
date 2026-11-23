@@ -2,7 +2,7 @@
 import { LogtoProvider } from "@logto/react";
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
 import { act, cleanup, render, screen } from "@testing-library/react";
-import { StrictMode, useEffect } from "react";
+import { StrictMode, useEffect, useState } from "react";
 import { isLogtoSignInPending, LogtoBridge, useAuth } from "./auth.tsx";
 import { pendingInvitation } from "./invitation.ts";
 import { LogtoCallbackPage } from "./pages/callback.tsx";
@@ -101,9 +101,18 @@ describe("LogtoBridge", () => {
 
 describe("LogtoCallbackPage", () => {
   /** Mounts the page like the console: under a Logto provider and the router. */
-  function renderCallback(options: { strict?: boolean } = {}) {
-    window.history.replaceState(null, "", "/callback");
+  function renderCallback(options: { strict?: boolean; url?: string } = {}) {
+    window.history.replaceState(null, "", options.url ?? "/callback");
     const navigations: string[] = [];
+    // The address that the first render sees, before any effect navigates.
+    const seenAtMount: string[] = [];
+    function MountProbe() {
+      const [first] = useState(
+        () => window.location.pathname + window.location.search,
+      );
+      seenAtMount.push(first);
+      return null;
+    }
     const onNavigate = (_from: Route, to: Route) => navigations.push(to.id);
     const page = (
       <LogtoProvider
@@ -111,12 +120,13 @@ describe("LogtoCallbackPage", () => {
         LogtoClientClass={FakeLogtoClient as never}
       >
         <RouterProvider onNavigate={onNavigate}>
+          <MountProbe />
           <LogtoCallbackPage appId={APP_ID} />
         </RouterProvider>
       </LogtoProvider>
     );
     render(options.strict ? <StrictMode>{page}</StrictMode> : page);
-    return { navigations };
+    return { navigations, seenAtMount };
   }
 
   async function settle(ms = 50) {
@@ -155,9 +165,14 @@ describe("LogtoCallbackPage", () => {
   });
 
   test("ignores a code and a state without a stored sign-in session", async () => {
-    window.history.replaceState(null, "", "/callback?code=x&state=y");
-    renderCallback();
+    const { navigations, seenAtMount } = renderCallback({
+      url: "/callback?code=x&state=y",
+    });
+    // The page mounted with the query, so the test exercises the redirect
+    // parameters and not an address that the helper had already reset.
+    expect(seenAtMount[0]).toBe("/callback?code=x&state=y");
     await settle();
+    expect(navigations).toEqual(["organizations"]);
     expect(window.location.pathname).toBe("/");
   });
 
