@@ -17,7 +17,7 @@ tags: postgres, storage, pgdata, toast, fillfactor, tablespaces, disk, operation
 
 ## Visibility Map and Free Space Map
 
-- **_vm** tracks all-visible pages — VACUUM skips these
+- **_vm** tracks all-visible and all-frozen status separately for each page. With page skipping enabled (the default; `DISABLE_PAGE_SKIPPING` turns it off), an ordinary VACUUM may skip all-visible pages. An aggressive VACUUM (needed to advance the relation's frozen transaction ID) scans all-visible pages that are not all-frozen, and it can skip only all-frozen pages. PostgreSQL 18 can also eagerly scan some skippable pages during an ordinary VACUUM to freeze them.
 - **_fsm** tracks free space per page — INSERT uses this to find pages with room
 - Both are small files but critical for performance
 
