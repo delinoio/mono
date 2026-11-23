@@ -39,6 +39,7 @@ type FakeRelay struct {
 	OnRequest func(s *RelayStream, f *ownsandv1.DataFrame)
 
 	mu       sync.Mutex
+	paused   chan struct{}
 	frames   []*ownsandv1.DataFrame
 	changed  chan struct{}
 	closed   chan struct{}
@@ -77,6 +78,7 @@ func (r *FakeRelay) SendFrame(f *ownsandv1.DataFrame) {
 
 // Close closes the connection.
 func (r *FakeRelay) Close() {
+	r.ResumeReads()
 	r.cancel()
 	r.sendMu.Lock()
 	_ = r.stream.CloseRequest()
@@ -91,9 +93,42 @@ func (r *FakeRelay) Close() {
 // Closed is closed when the connection ends.
 func (r *FakeRelay) Closed() <-chan struct{} { return r.closed }
 
+// PauseReads stops the fake agent from reading its connection after the frame
+// it is reading now, like an agent that stopped draining its network path.
+// The control plane's writer then blocks once the HTTP/2 flow control window
+// of the stream is full. Sending is not affected. ResumeReads undoes it.
+func (r *FakeRelay) PauseReads() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.paused == nil {
+		r.paused = make(chan struct{})
+	}
+}
+
+// ResumeReads lets the fake agent read its connection again.
+func (r *FakeRelay) ResumeReads() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.paused != nil {
+		close(r.paused)
+		r.paused = nil
+	}
+}
+
+// waitResumed blocks while reads are paused.
+func (r *FakeRelay) waitResumed() {
+	r.mu.Lock()
+	gate := r.paused
+	r.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+}
+
 func (r *FakeRelay) read() {
 	defer close(r.closed)
 	for {
+		r.waitResumed()
 		resp, err := r.stream.Receive()
 		if err != nil {
 			return

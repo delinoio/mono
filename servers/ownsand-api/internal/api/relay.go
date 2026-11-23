@@ -701,7 +701,22 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 		if r := f.GetFileWriteResult(); r != nil {
 			c.frames++
 			c.bytes += datapath.FrameCost(f)
-			c.stream.Consumed(ctx, f)
+			// Returning the credit of the result waits for room in the shared
+			// outbound queue of the agent connection, which a stalled agent can
+			// keep full. Bound that wait by the call deadline too, so a
+			// pending credit return cannot hold the call (and the stream's
+			// reserved close frame, which is queued only after this call
+			// returns) beyond the request deadline. The result counts as
+			// received either way: its frame and bytes are accounted above.
+			c.stream.Consumed(cctx, f)
+			if ctx.Err() != nil {
+				// The caller left first and keeps its precedence, as when
+				// Next fails.
+				return nil, ctx.Err()
+			}
+			if cctx.Err() != nil {
+				return nil, connect.NewError(connect.CodeDeadlineExceeded, errors.New("the write did not finish within the call deadline"))
+			}
 			return connect.NewResponse(r), nil
 		}
 	}
