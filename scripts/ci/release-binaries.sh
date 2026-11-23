@@ -433,7 +433,12 @@ assemble() {
     while IFS= read -r -u 4 file; do
       take "$repo_root/$file" "$assets/$name/$(basename "$file")"
     done 4< <(jq -r --arg name "$name" '.[] | select(.name == $name) | .licenseFiles[]' <<< "$BINARIES")
-    (cd "$assets/$name" && for file in *; do sha256_line "$file"; done) > "$assets/SHA256SUMS.tmp"
+    # Hash every top-level regular file, the same selection that
+    # `github_releases` uploads, so a dot-prefixed license file is covered
+    # (`*` does not match it). SHA256SUMS is the manifest itself: a copy from
+    # an earlier run in the same directory must not list itself.
+    (cd "$assets/$name" && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z |
+      while IFS= read -r -d '' file; do sha256_line "${file#./}"; done) > "$assets/SHA256SUMS.tmp"
     mv "$assets/SHA256SUMS.tmp" "$assets/$name/SHA256SUMS"
   done 3< <(binary_rows)
 }
