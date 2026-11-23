@@ -691,3 +691,247 @@ func TestStatusMetrics(t *testing.T) {
 		t.Fatal("ownsand_billing_pending_unlinks is not recorded")
 	}
 }
+
+// addPendingUnlink gives the organization a pending unlink that is due at
+// the current fake time, as TransferOwnership does.
+func (f *statusFixture) addPendingUnlink(t *testing.T, org string) {
+	t.Helper()
+	ctx := context.Background()
+	now := f.clock.Now()
+	if err := f.db.InTx(ctx, func(tx pgx.Tx) error {
+		_, former, _, err := billing.UnlinkTx(ctx, tx, org, billing.SourceTransfer, now)
+		if err != nil {
+			return err
+		}
+		return billing.AddPendingUnlinkTx(ctx, tx, org, former, now)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// pendingUnlink returns the retry state of the pending unlink of the
+// organization.
+func (f *statusFixture) pendingUnlink(t *testing.T, org string) (attempts int, next time.Time, ok bool) {
+	t.Helper()
+	err := f.db.Pool.QueryRow(context.Background(), "SELECT attempts, next_attempt_time FROM billing_pending_unlinks WHERE organization_id = $1", org).Scan(&attempts, &next)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, time.Time{}, false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return attempts, next, true
+}
+
+// lockOrganization starts a transaction that holds the organization row lock
+// until the returned function ends it. Statements that the test runs through
+// the returned transaction happen under the lock.
+func (f *statusFixture) lockOrganization(t *testing.T, org string) (tx pgx.Tx, finish func()) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := f.db.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR NO KEY UPDATE", org); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	var once sync.Once
+	finish = func() {
+		once.Do(func() {
+			if err := tx.Commit(ctx); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	t.Cleanup(func() {
+		once.Do(func() { _ = tx.Rollback(ctx) })
+	})
+	return tx, finish
+}
+
+// waitForLockWaiter blocks until a database session waits for a lock.
+func (f *statusFixture) waitForLockWaiter(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := f.db.Pool.QueryRow(context.Background(), "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("no session waits for the organization lock")
+}
+
+// goErr runs fn in a goroutine and returns a function that waits for its
+// error.
+func goErr(fn func() error) (wait func() error) {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	return func() error { return <-done }
+}
+
+// TestPendingUnlinkLockWait checks a retry that selected a due pending unlink
+// and then waited for the organization lock: it decides after the lock, with
+// the row as the lock holder left it and a clock reading that it takes after
+// the wait.
+func TestPendingUnlinkLockWait(t *testing.T) {
+	t0 := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	t.Run("moved into the future", func(t *testing.T) {
+		f := newStatusFixture(t, t0)
+		f.addOrg(t, org1)
+		f.link(t, org1, accountA)
+		f.addPendingUnlink(t, org1)
+		tx, finish := f.lockOrganization(t, org1)
+		wait := goErr(func() error { return f.statuses.RetryPendingUnlinks(ctx) })
+		f.waitForLockWaiter(t)
+		moved := t0.Add(time.Minute)
+		if _, err := tx.Exec(ctx, "UPDATE billing_pending_unlinks SET attempts = 1, next_attempt_time = $2 WHERE organization_id = $1", org1, moved); err != nil {
+			t.Fatal(err)
+		}
+		finish()
+		if err := wait(); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 0 {
+			t.Fatalf("UnlinkOrganization calls = %d, want 0", got)
+		}
+		if a, next, ok := f.pendingUnlink(t, org1); !ok || a != 1 || !next.Equal(moved) {
+			t.Fatalf("pending unlink after the wait: %d %v %v", a, next, ok)
+		}
+		if _, _, linked := f.fake.Link(org1); !linked {
+			t.Fatal("the link is gone before an unlink succeeded")
+		}
+	})
+
+	t.Run("removed", func(t *testing.T) {
+		f := newStatusFixture(t, t0)
+		f.addOrg(t, org1)
+		f.link(t, org1, accountA)
+		f.addPendingUnlink(t, org1)
+		tx, finish := f.lockOrganization(t, org1)
+		wait := goErr(func() error { return f.statuses.RetryPendingUnlinks(ctx) })
+		f.waitForLockWaiter(t)
+		if _, err := tx.Exec(ctx, "DELETE FROM billing_pending_unlinks WHERE organization_id = $1", org1); err != nil {
+			t.Fatal(err)
+		}
+		finish()
+		if err := wait(); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 0 {
+			t.Fatalf("UnlinkOrganization calls = %d, want 0", got)
+		}
+		if _, _, ok := f.pendingUnlink(t, org1); ok {
+			t.Fatal("the removed pending unlink came back")
+		}
+	})
+
+	t.Run("due while waiting", func(t *testing.T) {
+		f := newStatusFixture(t, t0)
+		f.addOrg(t, org1)
+		f.link(t, org1, accountA)
+		f.addPendingUnlink(t, org1)
+		due := t0.Add(10 * time.Second)
+		if _, err := f.db.Pool.Exec(ctx, "UPDATE billing_pending_unlinks SET attempts = 1, next_attempt_time = $2 WHERE organization_id = $1", org1, due); err != nil {
+			t.Fatal(err)
+		}
+		_, finish := f.lockOrganization(t, org1)
+		// The worker starts before the deadline and reads the clock again
+		// after the lock, when the deadline has passed.
+		wait := goErr(func() error { return f.statuses.UnlinkPending(ctx, org1) })
+		f.waitForLockWaiter(t)
+		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 0 {
+			t.Fatalf("UnlinkOrganization calls before the lock = %d, want 0", got)
+		}
+		f.clock.Set(due)
+		finish()
+		if err := wait(); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 1 {
+			t.Fatalf("UnlinkOrganization calls = %d, want 1", got)
+		}
+		if _, _, ok := f.pendingUnlink(t, org1); ok {
+			t.Fatal("the pending unlink stayed after a success")
+		}
+		if _, _, linked := f.fake.Link(org1); linked {
+			t.Fatal("delino-accounts still has the link")
+		}
+	})
+
+	// The immediate attempt after a commit holds the lock during its call. A
+	// worker that selected the same row waits for it.
+	immediate := func(t *testing.T, f *statusFixture) (workerErr func() error, gate *accountstest.Gate, attemptErr func() error) {
+		t.Helper()
+		gate = f.fake.Hold(accountstest.MethodUnlinkOrganization)
+		attemptErr = goErr(func() error { return f.statuses.UnlinkPending(ctx, org1) })
+		<-gate.Entered
+		workerErr = goErr(func() error { return f.statuses.RetryPendingUnlinks(ctx) })
+		f.waitForLockWaiter(t)
+		return workerErr, gate, attemptErr
+	}
+
+	t.Run("immediate attempt failed", func(t *testing.T) {
+		f := newStatusFixture(t, t0)
+		f.addOrg(t, org1)
+		f.link(t, org1, accountA)
+		f.addPendingUnlink(t, org1)
+		f.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+		workerErr, gate, attemptErr := immediate(t, f)
+		gate.Release()
+		if err := attemptErr(); err != nil {
+			t.Fatal(err)
+		}
+		if err := workerErr(); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 1 {
+			t.Fatalf("UnlinkOrganization calls = %d, want 1", got)
+		}
+		next := t0.Add(time.Second)
+		if a, got, ok := f.pendingUnlink(t, org1); !ok || a != 1 || !got.Equal(next) {
+			t.Fatalf("pending unlink after the failed attempt: %d %v %v", a, got, ok)
+		}
+		// Once the new deadline passes, the next retry sends the call.
+		f.fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+		f.clock.Set(next)
+		if err := f.statuses.RetryPendingUnlinks(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 2 {
+			t.Fatalf("UnlinkOrganization calls after the deadline = %d, want 2", got)
+		}
+		if _, _, ok := f.pendingUnlink(t, org1); ok {
+			t.Fatal("the pending unlink stayed after a success")
+		}
+	})
+
+	t.Run("immediate attempt succeeded", func(t *testing.T) {
+		f := newStatusFixture(t, t0)
+		f.addOrg(t, org1)
+		f.link(t, org1, accountA)
+		f.addPendingUnlink(t, org1)
+		workerErr, gate, attemptErr := immediate(t, f)
+		gate.Release()
+		if err := attemptErr(); err != nil {
+			t.Fatal(err)
+		}
+		if err := workerErr(); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 1 {
+			t.Fatalf("UnlinkOrganization calls = %d, want 1", got)
+		}
+		if _, _, ok := f.pendingUnlink(t, org1); ok {
+			t.Fatal("the pending unlink stayed after a success")
+		}
+	})
+}

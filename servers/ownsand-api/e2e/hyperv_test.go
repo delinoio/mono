@@ -37,7 +37,11 @@ func TestLifecycleHyperV(t *testing.T) {
 		"OWNSAND_AGENT_LINUX_ROOTFS=" + rootfs,
 	}})
 	for _, tr := range transports {
-		t.Run("sdk-"+tr.String(), func(t *testing.T) { sdkLifecycle(t, s, tr) })
+		// The Hyper-V runtime has no memory-state restore: it boots the
+		// snapshot disk cold.
+		t.Run("sdk-"+tr.String(), func(t *testing.T) {
+			sdkLifecycle(t, s, tr, ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT)
+		})
 		t.Run("cli-"+tr.String(), func(t *testing.T) { cliLifecycle(t, s, tr) })
 	}
 	t.Run("control-plane-restart", func(t *testing.T) { hyperVControlPlaneRestart(t, s) })
@@ -163,10 +167,17 @@ func hyperVAgentCrash(t *testing.T, s *stack) {
 		return info.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE
 	})
 	s.restartAgent(0)
-	info := waitSandboxState(ctx, t, sb, "FAILED", func(info *ownsandv1.Sandbox) bool {
-		return info.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_FAILED
+	// The reconciliation may report the end reason a moment after the state,
+	// so the wait covers both and a different end reason fails at the
+	// deadline with the last observed sandbox in the message.
+	info := waitSandboxState(ctx, t, sb, "FAILED with LOST_ON_DEVICE", func(info *ownsandv1.Sandbox) bool {
+		return info.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_FAILED &&
+			info.GetEndReason() == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE
 	})
 	t.Logf("sandbox after the agent restart: %v", info)
+	if got := info.GetEndReason(); got != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatalf("end reason of the sandbox after the agent restart = %v, want %v", got, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE)
+	}
 	requireNoComputeSystem(t, sb.ID())
 }
 
@@ -191,14 +202,31 @@ func hyperVDeviceRemoval(t *testing.T, s *stack) {
 	requireNoComputeSystem(t, sb.ID())
 	// A finished removal leaves the state directory empty: no VM disk,
 	// snapshot, image, record or device key.
+	left, err := remainingStatePaths(s.agents[0].stateDir)
+	if err != nil {
+		t.Fatalf("inspect the state directory %s: %v", s.agents[0].stateDir, err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("the state directory is not empty after the removal: %v", left)
+	}
+}
+
+// remainingStatePaths returns every path below root, without root itself. A
+// lookup or read error of root or of any entry is returned, so that an
+// unreadable or missing directory is never mistaken for an empty one.
+func remainingStatePaths(root string) ([]string, error) {
 	var left []string
-	_ = filepath.WalkDir(s.agents[0].stateDir, func(path string, d os.DirEntry, err error) error {
-		if err == nil && path != s.agents[0].stateDir {
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path != root {
 			left = append(left, path)
 		}
 		return nil
 	})
-	if len(left) != 0 {
-		t.Fatalf("the state directory is not empty after the removal: %v", left)
+	if err != nil {
+		return nil, err
 	}
+	return left, nil
 }

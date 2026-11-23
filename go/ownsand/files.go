@@ -122,7 +122,11 @@ type readAttempt struct {
 	size     int64
 	err      error
 	accepted bool
-	authErr  bool
+	// served reports that the agent served the read on this peer-to-peer
+	// attempt: it sent a file read event (a keepalive, a chunk or the end) or
+	// the accepted frame. It stays false on a relay attempt.
+	served  bool
+	authErr bool
 }
 
 func (op *readOp) dpErr(err error) error {
@@ -179,6 +183,19 @@ func (op *readOp) run(ctx context.Context) (int64, error) {
 			err = errNotAccepted
 		}
 		if sess != nil && s.dp.handleSessionError(sess, err) {
+			if (at.accepted || at.served) && isRoutineSessionEnd(err) {
+				// A routine session end (idle, the 1-hour expiry) or a
+				// retirement (another request's interrupted send tore a
+				// frame) of a read that the agent served (it sent a file
+				// read event, a keepalive included, or the accepted frame)
+				// shows that the operation reached the agent on its new
+				// session. It is not a failure, so a slow read can outlive
+				// any number of session expiries and retirements. Only
+				// failed sessions (a data channel failure, an end or a
+				// retirement before the agent served the read) count.
+				sessionErrors = 0
+				continue
+			}
 			sessionErrors++
 			if sessionErrors > 5 {
 				return op.next, op.dpErr(err)
@@ -281,11 +298,13 @@ func (op *readOp) p2pAttempt(ctx context.Context, sess *p2pSession) readAttempt 
 		}
 		switch f.GetKind() {
 		case ownsandv1.DataFrameKind_DATA_FRAME_KIND_FILE_READ_EVENT:
+			at.served = true
 			if op.handleEvent(f.GetFileReadEvent(), &at) {
 				return at
 			}
 		case ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED:
 			at.accepted = true
+			at.served = true
 		case ownsandv1.DataFrameKind_DATA_FRAME_KIND_ERROR:
 			at.err = errorFromDetail(f.GetError())
 			return at

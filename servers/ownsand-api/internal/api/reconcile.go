@@ -303,8 +303,9 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID, channelID 
 
 // reconcileSnapshotsTx removes the local copies that the report does not
 // list: an original copy of an exported snapshot keeps its record without a
-// device, any other snapshot record is deleted with its templates, and an
-// imported copy loses its copy row. Listed snapshots that the server still
+// device, a FAILED record (a create that failed) stays unchanged, any other
+// snapshot record is deleted with its templates, and an imported copy loses
+// its copy row. An unlisted record in CREATING becomes FAILED. Listed snapshots that the server still
 // has in CREATING take the reported fields, and a listed snapshot whose
 // export is EXPORTING under another channel than channelID (or under no
 // recorded channel) becomes EXPORT_FAILED with a clean-up job for the
@@ -403,6 +404,13 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID,
 			if _, err := tx.Exec(ctx, "UPDATE snapshots SET device_id = NULL WHERE snapshot_id = $1", sn.id); err != nil {
 				return 0, err
 			}
+			continue
+		}
+		if ownsandv1.SnapshotState(sn.state) == ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED {
+			// A failed create never produced a local copy, so the report has
+			// nothing to omit: the record stays in FAILED, as the outcome of
+			// the create, until DeleteSnapshot removes it. Without this case
+			// the second report that omits the record would delete it.
 			continue
 		}
 		if ownsandv1.SnapshotState(sn.state) == ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING {
