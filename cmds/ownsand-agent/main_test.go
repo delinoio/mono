@@ -339,6 +339,116 @@ func TestStatusUnreadableStatusFile(t *testing.T) {
 	}
 }
 
+// makeUnlistable removes every permission from the inventory directory at
+// path so that listing it fails. store.Open runs before the inventory reads
+// and fails on a path that is not a directory, so a permission change is the
+// way to make only the read fail. The test is skipped where the change has no
+// effect: on Windows (mode bits do not restrict directory reads) and for a
+// user that bypasses permission checks, such as root.
+func makeUnlistable(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Chmod(path, 0); err != nil {
+		t.Skipf("cannot remove directory permissions on this system: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o700) })
+	if _, err := os.ReadDir(path); err == nil {
+		t.Skip("directory permissions do not restrict reads on this system or for this user")
+	}
+}
+
+// Empty inventories are a successful read: both counts show 0 and exit 0.
+func TestStatusEmptyInventories(t *testing.T) {
+	statusFixture(t)
+	var out, errb bytes.Buffer
+	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+	if code != exitOK || !strings.Contains(out.String(), "Sandboxes: 0 records") || !strings.Contains(out.String(), "Snapshots: 0\n") || errb.Len() != 0 {
+		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	}
+}
+
+// Readable inventories keep their counts and exit 0, and only directory
+// entries count as snapshots.
+func TestStatusInventoryCounts(t *testing.T) {
+	st := statusFixture(t)
+	for _, name := range []string{"a.json", "b.json"} {
+		if err := os.WriteFile(st.Path(store.SandboxesDir, name), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(st.Path(store.SnapshotsDir, "snap-1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(st.Path(store.SnapshotsDir, "stray-file"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+	if code != exitOK || !strings.Contains(out.String(), "Sandboxes: 2 records") || !strings.Contains(out.String(), "Snapshots: 1\n") || errb.Len() != 0 {
+		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	}
+}
+
+// A sandbox record that cannot be read makes the count unavailable: the
+// partial count of the records read before it is not shown, the diagnostic
+// names the sandbox inventory, the snapshot count still prints and the exit
+// code is 1.
+func TestStatusUnreadableSandboxRecord(t *testing.T) {
+	st := statusFixture(t)
+	if err := os.WriteFile(st.Path(store.SandboxesDir, "a.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A dangling symlink lists as a file but fails to read. Creating a
+	// symlink needs a privilege on Windows, so the case is skipped there
+	// when the system refuses.
+	if err := os.Symlink(filepath.Join(st.Path(store.SandboxesDir), "missing-target"), st.Path(store.SandboxesDir, "b.json")); err != nil {
+		t.Skipf("cannot create a symlink on this system: %v", err)
+	}
+	var out, errb bytes.Buffer
+	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+	if code != exitError {
+		t.Fatalf("status exit code = %d, want %d (%q / %q)", code, exitError, out.String(), errb.String())
+	}
+	if !strings.Contains(out.String(), "Sandboxes: unavailable (") || strings.Contains(out.String(), "records") || !strings.Contains(out.String(), "Snapshots: 0\n") {
+		t.Fatalf("stdout = %q, want an unavailable sandbox count and the snapshot count", out.String())
+	}
+	if !strings.Contains(errb.String(), "ownsand-agent: read sandbox records:") {
+		t.Fatalf("stderr = %q, want a read sandbox records diagnostic", errb.String())
+	}
+}
+
+// A sandboxes directory that cannot be listed is the same failure.
+func TestStatusUnreadableSandboxDirectory(t *testing.T) {
+	st := statusFixture(t)
+	makeUnlistable(t, st.Path(store.SandboxesDir))
+	var out, errb bytes.Buffer
+	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+	if code != exitError || !strings.Contains(out.String(), "Sandboxes: unavailable (") || !strings.Contains(out.String(), "Snapshots: 0\n") || !strings.Contains(errb.String(), "ownsand-agent: read sandbox records:") {
+		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	}
+}
+
+// A snapshots directory that cannot be listed makes the snapshot count
+// unavailable (never 0): the diagnostic names the snapshot inventory, the
+// sandbox count still prints and the exit code is 1.
+func TestStatusUnreadableSnapshotDirectory(t *testing.T) {
+	st := statusFixture(t)
+	if err := os.WriteFile(st.Path(store.SandboxesDir, "a.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	makeUnlistable(t, st.Path(store.SnapshotsDir))
+	var out, errb bytes.Buffer
+	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+	if code != exitError {
+		t.Fatalf("status exit code = %d, want %d (%q / %q)", code, exitError, out.String(), errb.String())
+	}
+	if !strings.Contains(out.String(), "Sandboxes: 1 records") || !strings.Contains(out.String(), "Snapshots: unavailable") || strings.Contains(out.String(), "Snapshots: 0") {
+		t.Fatalf("stdout = %q, want the sandbox count and an unavailable snapshot count", out.String())
+	}
+	if !strings.Contains(errb.String(), "ownsand-agent: read snapshots:") {
+		t.Fatalf("stderr = %q, want a read snapshots diagnostic", errb.String())
+	}
+}
+
 // TestImageBuildResourceRanges runs the real flag parser: a value that does
 // not fit the conversion to bytes or to a 32-bit vCPU count is a usage error
 // that names its flag, for both guest OS values, and no state is created.
