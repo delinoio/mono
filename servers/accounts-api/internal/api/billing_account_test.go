@@ -614,10 +614,10 @@ func invitationRows(t *testing.T, env *testenv.Env, accountID string) []string {
 }
 
 // An audit event is logged only after its transaction committed. The
-// invitation_created event is recorded only after the email was accepted, so a
-// failed send, which revokes the invitation, leaves neither an
-// invitation_created row nor a log record, only the revocation with its reason.
-func TestInvitationCreateFailureLogsNoAuditEvent(t *testing.T) {
+// invitation_created event is stored with the invitation, before the email is
+// sent, so a failed send, which revokes the invitation, leaves the creation
+// record and row and then the revocation with its reason.
+func TestInvitationCreateFailureAuditsCreationThenRevocation(t *testing.T) {
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -633,11 +633,11 @@ func TestInvitationCreateFailureLogsNoAuditEvent(t *testing.T) {
 	if !strings.Contains(logs, `"msg":"invitation_email_failed"`) {
 		t.Errorf("no invitation_email_failed record:\n%s", logs)
 	}
-	if n := auditRecordCount(logs, api.AuditInvitationCreated); n != 0 {
-		t.Errorf("%d invitation_created audit records after a failed send, want 0", n)
+	if n := auditRecordCount(logs, api.AuditInvitationCreated); n != 1 {
+		t.Errorf("%d invitation_created audit records after a failed send, want 1", n)
 	}
-	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 0 {
-		t.Errorf("%d invitation_created audit rows after a failed send, want 0", n)
+	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 1 {
+		t.Errorf("%d invitation_created audit rows after a failed send, want 1", n)
 	}
 	if n := auditRecordCount(logs, api.AuditInvitationRevoked); n != 1 {
 		t.Errorf("%d invitation_revoked audit records after a failed send, want 1", n)
@@ -657,18 +657,18 @@ func TestInvitationCreateFailureLogsNoAuditEvent(t *testing.T) {
 		t.Errorf("%d emails after a failed send, want 0", n)
 	}
 
-	// The retry succeeds and logs exactly one creation record, with the new
+	// The retry succeeds and logs one more creation record, with the new
 	// invitation.
 	inv := invite(t, owner, accountID, "undelivered@example.com", roleViewer)
 	logs = env.Logs.String()
-	if n := auditRecordCount(logs, api.AuditInvitationCreated); n != 1 {
-		t.Fatalf("%d invitation_created audit records after a successful send, want 1", n)
+	if n := auditRecordCount(logs, api.AuditInvitationCreated); n != 2 {
+		t.Fatalf("%d invitation_created audit records after a successful retry, want 2", n)
 	}
 	if !strings.Contains(logs, `"invitation_id":"`+inv.GetInvitationId()+`"`) {
 		t.Errorf("no audit record carries invitation_id %s", inv.GetInvitationId())
 	}
-	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 1 {
-		t.Errorf("%d invitation_created audit rows, want 1", n)
+	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 2 {
+		t.Errorf("%d invitation_created audit rows, want 2", n)
 	}
 }
 
@@ -683,7 +683,7 @@ func TestInvitationDeliveryAfterCommit(t *testing.T) {
 	env.Directory.Set(guest.ID, directoryUser("guest@example.com"))
 
 	// At the time of the send, the invitation is committed and visible from
-	// another connection, and its creation is not audited yet.
+	// another connection, and its creation is audited already.
 	var seenAtSend []string
 	var createdAtSend int
 	env.Email.SetOnSend(func(email.Message) {
@@ -705,11 +705,12 @@ func TestInvitationDeliveryAfterCommit(t *testing.T) {
 	if got := strings.Join(seenAtSend, ","); got != "guest@example.com=revoked,guest@example.com=pending" {
 		t.Errorf("invitations visible at the send = %v, want the revoked one and the committed pending one", seenAtSend)
 	}
-	if createdAtSend != 0 {
-		t.Errorf("%d invitation_created rows at the send, want 0", createdAtSend)
+	// The revoked invitation and the pending one each have a creation event.
+	if createdAtSend != 2 {
+		t.Errorf("%d invitation_created rows at the send, want 2", createdAtSend)
 	}
-	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 1 {
-		t.Errorf("%d invitation_created rows after the send, want 1", n)
+	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 2 {
+		t.Errorf("%d invitation_created rows after the send, want 2", n)
 	}
 
 	// One email for one invitation ID, with that ID in the idempotency key.
