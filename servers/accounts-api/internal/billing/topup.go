@@ -501,9 +501,13 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if acct.Deleted || sub.PaddleSubscriptionID == "" || !sub.Manageable() {
+			if acct.Deleted {
 				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureNoSubscription, now)
 			}
+			// Revalidate the settings before the subscription: a top-up
+			// that the current settings no longer allow is not a failed
+			// charge, even when the subscription is canceled too, so it must
+			// not count as a failed automatic top-up or send a failure email.
 			if reason, err := s.obsoleteReason(ctx, tx, acct.ID, claimed, now); err != nil {
 				return err
 			} else if reason != "" {
@@ -513,6 +517,9 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 					slog.String("reason", reason),
 					slog.Int64("amount_usd_micros", claimed.Amount))
 				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureSettingsChanged, now)
+			}
+			if sub.PaddleSubscriptionID == "" || !sub.Manageable() {
+				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureNoSubscription, now)
 			}
 			claimed.PaddleSubscriptionID = sub.PaddleSubscriptionID
 			claimed.Status = TopUpCharging
