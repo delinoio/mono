@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -57,12 +58,42 @@ func deleteSnapshotRPC(t *testing.T, org *testenv.Org, snapID string) {
 // local copy, as the real agent does before it reports success.
 func startWithheldImport(t *testing.T, org *testenv.Org, snapID, devID string, agentB *testenv.FakeAgent, importID func() string) string {
 	t.Helper()
-	if _, err := org.OwnerClient.Sandbox.CreateSandbox(context.Background(), connect.NewRequest(importCreateReq(org.ID, snapID, devID))); err != nil {
+	_, cmdID := startWithheldImportSandbox(t, org, snapID, devID, agentB, importID)
+	return cmdID
+}
+
+// startWithheldImportSandbox behaves like startWithheldImport and also returns
+// the ID of the sandbox that the create request made.
+func startWithheldImportSandbox(t *testing.T, org *testenv.Org, snapID, devID string, agentB *testenv.FakeAgent, importID func() string) (sandboxID, cmdID string) {
+	t.Helper()
+	created, err := org.OwnerClient.Sandbox.CreateSandbox(context.Background(), connect.NewRequest(importCreateReq(org.ID, snapID, devID)))
+	if err != nil {
 		t.Fatal(err)
 	}
 	agentB.WaitFor("import command", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetImportSnapshot() != nil })
 	agentB.AddSnapshot(readySnapshotEntry(snapID))
-	return importID()
+	return created.Msg.GetSandbox().GetSandboxId(), importID()
+}
+
+// importResultLogged reports whether the server logged an agent_command_result
+// record for the import command cmdID of snapID with the given result code.
+func importResultLogged(env *testenv.Env, cmdID, snapID, result string) bool {
+	for _, line := range strings.Split(env.Logs.String(), "\n") {
+		var rec struct {
+			Msg        string `json:"msg"`
+			CommandID  string `json:"command_id"`
+			Command    string `json:"command"`
+			Result     string `json:"result"`
+			SnapshotID string `json:"snapshot_id"`
+		}
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if rec.Msg == "agent_command_result" && rec.Command == "import_snapshot" && rec.CommandID == cmdID && rec.Result == result && rec.SnapshotID == snapID {
+			return true
+		}
+	}
+	return false
 }
 
 // TestImportResultAfterSnapshotDeletionSendsDelete checks that an import
@@ -223,18 +254,28 @@ func TestImportResultKeepsExistingCopyRow(t *testing.T) {
 }
 
 // TestFailedImportRegistersNoCopy checks that an import error registers no
-// copy row and sends no delete command.
+// copy row and sends no delete command. The test first waits, within the
+// bounded Eventually timeout, until the server processed the error result for
+// the import command: it logged the result and failed the requested sandbox
+// with CREATE_FAILED. The absence of side effects is asserted only after that,
+// so a result that the server dropped or did not match fails the test.
 func TestFailedImportRegistersNoCopy(t *testing.T) {
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	snapID, devB, agentB := importFixture(t, env, org)
 	importID := withholdImportResult(agentB)
-	cmdID := startWithheldImport(t, org, snapID, devB.ID, agentB, importID)
+	sandboxID, cmdID := startWithheldImportSandbox(t, org, snapID, devB.ID, agentB, importID)
 
 	agentB.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: &ownsandv1.AgentCommandResult{
 		CommandId: cmdID, Error: &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, Message: "import failed"},
 	}}})
-	time.Sleep(500 * time.Millisecond)
+	testenv.Eventually(t, "the import error result is logged", func() bool {
+		return importResultLogged(env, cmdID, snapID, ownsandv1.ErrorCode_ERROR_CODE_INTERNAL.String())
+	})
+	sb := waitState(t, org.OwnerClient, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_FAILED)
+	if got := sb.GetEndReason(); got != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+		t.Fatalf("end reason after a failed import = %v, want CREATE_FAILED", got)
+	}
 	if n := copyRowCount(t, env, snapID, devB.ID); n != 0 {
 		t.Fatalf("copy rows after a failed import = %d, want 0", n)
 	}
