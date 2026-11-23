@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "5658fb2a5d186f746a66de070d36288172c90aa03cc7687e10056880d45d9ef2",
+        "AGENTS.md": "e0bc6942ba26a55d0daac369a46d21727bbec0e592216d4f021ed5ce57b7df11",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "9eafb2123d3b8b2aef41fba0db2648a3f4f49996f8c7c8bb2c86263befd8b48a",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -109,7 +109,7 @@
         "rules/js-hoist-regexp.md": "f9e9aef2f7c2307dd7310f283df85dcada45fc43e9bb941b0c3aa414dec21ec4",
         "rules/js-index-maps.md": "5df1bdc2cfabb2c98abd55d26762e5c18189535c2e686184f426082e62920391",
         "rules/js-length-check-first.md": "8b54a311c826b299272f29187fc58bc55772a04c4a72eeb29456ee96dc9fc624",
-        "rules/js-min-max-loop.md": "87dfb67e2f39df6ad8bcfb5b78c5fb364d3c07554ad188a202408d99f3763421",
+        "rules/js-min-max-loop.md": "640ca5e73d1ae83db4972af37c9bc5da7eefc2b4210393c7f88ff0eb88e4ca97",
         "rules/js-request-idle-callback.md": "ee08f83905b4011abbc33d594033157d77561b5bbd9b36b04f0f409581ffec32",
         "rules/js-set-map-lookups.md": "a7fd781a6ba9ad49065961b6f9a90ef486bf6b648390e1a08704025f98e1642b",
         "rules/js-tosorted-immutable.md": "d0a5e1b0fec48a0a81397957e2f068e224329f7c42cb5feeed8aae6fa64025e8",

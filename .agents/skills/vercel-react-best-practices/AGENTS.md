@@ -3702,7 +3702,8 @@ function getOldestAndNewest(projects: Project[]) {
   
   for (let i = 1; i < projects.length; i++) {
     if (projects[i].updatedAt < oldest.updatedAt) oldest = projects[i]
-    if (projects[i].updatedAt > newest.updatedAt) newest = projects[i]
+    // >= keeps the last maximum, like the stable sort's last element
+    if (projects[i].updatedAt >= newest.updatedAt) newest = projects[i]
   }
   
   return { oldest, newest }
