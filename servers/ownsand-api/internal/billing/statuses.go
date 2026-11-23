@@ -392,13 +392,14 @@ var ErrUnlinkFailed = errors.New("billing: UnlinkOrganization failed")
 // must hold the organization row lock (FOR NO KEY UPDATE or stronger) when
 // the organization exists. It deletes the pending row after delino-accounts
 // accepted the unlink. When the call fails, it records the next attempt
-// time in tx and returns an error that wraps the Connect error and
-// ErrUnlinkFailed. It sends nothing, leaves the row intact and returns
-// ErrLinkInProgress while the row is a link attempt whose LinkOrganization
-// call can still be running (link_call_deadline) or a pending unlink that a
-// takeover of such an attempt guards until the call can no longer run
-// (unlink_not_before). Every caller, the retry of the lease holder and the
-// synchronous link and unlink RPCs alike, therefore honours the same guard.
+// time in tx (the time of the failure plus the back-off of the attempt) and
+// returns an error that wraps the Connect error and ErrUnlinkFailed. It
+// sends nothing, leaves the row intact and returns ErrLinkInProgress while
+// the row is a link attempt whose LinkOrganization call can still be running
+// (link_call_deadline) or a pending unlink that a takeover of such an
+// attempt guards until the call can no longer run (unlink_not_before). Every
+// caller, the retry of the lease holder and the synchronous link and unlink
+// RPCs alike, therefore honours the same guard.
 func (s *Statuses) UnlinkPendingTx(ctx context.Context, tx pgx.Tx, orgID string, now time.Time) error {
 	var account string
 	var attempts int
@@ -420,7 +421,10 @@ func (s *Statuses) UnlinkPendingTx(ctx context.Context, tx pgx.Tx, orgID string,
 	_, cerr := s.client.UnlinkOrganization(cctx, connect.NewRequest(&accountsv1.UnlinkOrganizationRequest{Service: ServiceID, OrganizationId: orgID}))
 	cancel()
 	if cerr != nil {
-		next := now.Add(s.unlinkBackoff(attempts + 1))
+		// The back-off starts when the call failed, not at the caller's
+		// earlier reading of the clock: the wait for the organization lock
+		// and the call itself must not consume the delay.
+		next := s.now().Add(s.unlinkBackoff(attempts + 1))
 		if _, err := tx.Exec(ctx, "UPDATE billing_pending_unlinks SET attempts = attempts + 1, next_attempt_time = $2 WHERE organization_id = $1", orgID, next); err != nil {
 			return err
 		}
