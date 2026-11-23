@@ -15,6 +15,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -137,13 +138,24 @@ func (s *stack) waitLocalSnapshotGone(t *testing.T, a agentProc, snapshotID stri
 func TestLifecycleSDK(t *testing.T) {
 	s := newStack(t)
 	for _, tr := range transports {
-		t.Run(tr.String(), func(t *testing.T) { sdkLifecycle(t, s, tr) })
+		// The process runtime has no memory state: a snapshot restore always
+		// copies the snapshot files and starts a new process.
+		t.Run(tr.String(), func(t *testing.T) {
+			sdkLifecycle(t, s, tr, ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT)
+		})
 	}
 }
 
 // sdkLifecycle drives the full sandbox lifecycle through the Go SDK on one
-// forced transport.
-func sdkLifecycle(t *testing.T, s *stack, tr ownsand.Transport) {
+// forced transport. wantRestore lists the restore paths that the sandbox
+// created from the snapshot may report; the test fails when the control plane
+// reports any other path. A runtime that must restore the memory state passes
+// only MEMORY_STATE, so that a cold boot of the snapshot disk, which also
+// yields a running sandbox that holds the file, is rejected.
+func sdkLifecycle(t *testing.T, s *stack, tr ownsand.Transport, wantRestore ...ownsandv1.SandboxRestorePath) {
+	if len(wantRestore) == 0 {
+		t.Fatal("sdkLifecycle needs at least one expected restore path")
+	}
 	ctx := s.ctx(5 * time.Minute)
 	c := s.apiKeyClient(tr)
 	sb, err := c.CreateSandbox(ctx, createParams())
@@ -213,8 +225,12 @@ func sdkLifecycle(t *testing.T, s *stack, tr ownsand.Transport) {
 		t.Fatalf("CreateSandbox from snapshot: %v", err)
 	}
 	defer restored.Close()
-	if info, err := restored.WaitStable(ctx); err != nil || info.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-		t.Fatalf("restored WaitStable = (%v, %v)", info.GetState(), err)
+	restoredInfo, err := restored.WaitStable(ctx)
+	if err != nil || restoredInfo.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("restored WaitStable = (%v, %v)", restoredInfo.GetState(), err)
+	}
+	if !slices.Contains(wantRestore, restoredInfo.GetRestorePath()) {
+		t.Fatalf("restored sandbox restore path %v, want one of %v", restoredInfo.GetRestorePath(), wantRestore)
 	}
 	// The restored sandbox has its own root; the file came with the
 	// snapshot.

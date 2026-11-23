@@ -5,6 +5,8 @@ package e2e
 import (
 	"os"
 	"testing"
+
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // TestLifecycleFirecracker runs the Go SDK lifecycle with the agent's
@@ -26,6 +28,11 @@ func TestLifecycleFirecracker(t *testing.T) {
 		"OWNSAND_AGENT_LINUX_ROOTFS=" + rootfs,
 	}})
 	for _, tr := range transports {
-		t.Run(tr.String(), func(t *testing.T) { sdkLifecycle(t, s, tr) })
+		// The restored sandbox has the vCPU count, memory, disk and network
+		// mode of the snapshot, so the runtime must restore the memory state;
+		// a cold boot of the snapshot disk fails the test.
+		t.Run(tr.String(), func(t *testing.T) {
+			sdkLifecycle(t, s, tr, ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE)
+		})
 	}
 }
