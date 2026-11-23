@@ -1560,9 +1560,29 @@ type gateLease struct {
 	hub  interface{ CloseAll(error) }
 
 	// entered receives once when an admission reaches the gate; the
-	// admission continues after proceed is closed.
+	// admission continues after proceed is closed. Close proceed only
+	// through release, so that a normal release and a cleanup release never
+	// close it twice.
 	entered chan struct{}
 	proceed chan struct{}
+
+	releaseOnce sync.Once
+	// parked counts the admissions that wait at the gate.
+	parked atomic.Int32
+}
+
+// release lets every admission at the gate, and every later one, continue.
+// It is idempotent.
+func (g *gateLease) release() {
+	g.releaseOnce.Do(func() { close(g.proceed) })
+}
+
+// waitUnparked waits, bounded by testenv.Eventually, until no admission waits
+// at the gate. A test calls it after release so that server cleanup, which
+// waits for the handlers, cannot hang on a parked admission.
+func (g *gateLease) waitUnparked(t testing.TB) {
+	t.Helper()
+	testenv.Eventually(t, "no admission parked at the gate", func() bool { return g.parked.Load() == 0 })
 }
 
 func (g *gateLease) Held() bool {
@@ -1573,8 +1593,15 @@ func (g *gateLease) Held() bool {
 
 func (g *gateLease) WhileHeld(fn func()) bool {
 	if g.entered != nil {
-		g.entered <- struct{}{}
+		g.parked.Add(1)
+		// Neither step blocks after release, even when entered is already
+		// full from an earlier admission that nobody consumed.
+		select {
+		case g.entered <- struct{}{}:
+		case <-g.proceed:
+		}
 		<-g.proceed
+		g.parked.Add(-1)
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -1677,6 +1704,14 @@ func TestChannelAdmissionAfterLeaseLoss(t *testing.T) {
 
 	gate := &gateLease{held: true, entered: make(chan struct{}, 1), proceed: make(chan struct{})}
 	former := newInstance(t, env, gate)
+	// Release the gate on every exit path, including a t.Fatal before the
+	// admission reaches it. Cleanups run last-in first-out, so this runs
+	// before the server cleanup that newInstance registered and that waits
+	// for the handler.
+	t.Cleanup(func() {
+		gate.release()
+		gate.waitUnparked(t)
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1692,7 +1727,7 @@ func TestChannelAdmissionAfterLeaseLoss(t *testing.T) {
 		t.Fatal("the admission did not reach the ownership step")
 	}
 	gate.lose()
-	close(gate.proceed)
+	gate.release()
 
 	r := awaitReceive(t, "the admission result", first)
 	if r.err == nil {
@@ -1703,6 +1738,53 @@ func TestChannelAdmissionAfterLeaseLoss(t *testing.T) {
 	}
 	if former.app.Service.Hub.Get(dev.ID) != nil || len(former.app.Service.Hub.All()) != 0 {
 		t.Fatal("the hub holds a channel that was admitted after lease loss")
+	}
+}
+
+// TestGateLeaseRelease checks that release unblocks a parked admission and
+// every later one, also when entered is full, and that a second release does
+// not panic.
+func TestGateLeaseRelease(t *testing.T) {
+	gate := &gateLease{held: true, entered: make(chan struct{}, 1), proceed: make(chan struct{})}
+	t.Cleanup(gate.release)
+
+	done := make(chan bool, 2)
+	go func() { done <- gate.WhileHeld(func() {}) }()
+	select {
+	case <-gate.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the admission did not reach the gate")
+	}
+	if got := gate.parked.Load(); got != 1 {
+		t.Fatalf("parked admissions = %d, want 1", got)
+	}
+	select {
+	case <-done:
+		t.Fatal("the admission passed the gate before release")
+	default:
+	}
+	gate.release()
+	gate.release()
+	gate.waitUnparked(t)
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("the released admission was refused although the lease is held")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the released admission did not return")
+	}
+
+	// A late admission, with the entered signal already unconsumed, passes.
+	gate.entered <- struct{}{}
+	go func() { done <- gate.WhileHeld(func() {}) }()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("the late admission was refused although the lease is held")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the late admission stayed blocked after release")
 	}
 }
 
