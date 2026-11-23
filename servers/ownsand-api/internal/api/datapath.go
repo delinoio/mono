@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -92,6 +93,12 @@ type DataPlane struct {
 	// an existing reservation and is about to wait for its outcome; nil does
 	// nothing. Tests use it to know that a concurrent call is waiting.
 	grantWaitObserver func(grantID string)
+	// afterWriteResultDequeued is a test hook that WriteFile calls with the
+	// call-deadline context after it took the agent's write result off the
+	// stream queue and before it checks that deadline. It lets a test hold the
+	// handler between the two until the deadline has expired. It is nil in
+	// production.
+	afterWriteResultDequeued atomic.Pointer[func(cctx context.Context)]
 }
 
 // SetGrantWaitObserver sets a callback that AuthorizeRelay calls just before
