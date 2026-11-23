@@ -266,6 +266,129 @@ func TestReadFileResumesOnNewSession(t *testing.T) {
 	}
 }
 
+// checkReadRequests checks that every read request that reached the agent
+// used one read_id and the offsets of want, in order.
+func checkReadRequests(t *testing.T, cp *fakeCP, want []int64) {
+	t.Helper()
+	reqs := cp.agent.readRequests()
+	if len(reqs) != len(want) {
+		t.Fatalf("%d read requests, want %d", len(reqs), len(want))
+	}
+	for i, r := range reqs {
+		if r.GetReadId() != reqs[0].GetReadId() {
+			t.Fatalf("request %d used read_id %s, want %s", i, r.GetReadId(), reqs[0].GetReadId())
+		}
+		if r.GetOffset() != want[i] {
+			t.Fatalf("request %d used offset %d, want %d", i, r.GetOffset(), want[i])
+		}
+	}
+}
+
+// TestReadFileServedSessionRetirementsDoNotHitFailureCap checks that a read
+// outlives more session retirements than the failure cap of 5 allows when the
+// agent served the read of every retired session (here with a keepalive
+// event): a retirement is not a failure. The replacement session stays
+// peer-to-peer and continues the same read_id at the same offset.
+func TestReadFileServedSessionRetirementsDoNotHitFailureCap(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.readChunk = 10
+	want := randomBytes(t, 95)
+	cp.agent.setFile("/f", want)
+	s := cp.handle(t, cp.client(t, TransportAuto))
+	retire := retireInstalledSession(s)
+	cp.p2pScript = func(n int) p2pAction {
+		if n <= quietRotations {
+			return p2pAction{afterReadKeepalive: retire}
+		}
+		return p2pAction{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	got, err := s.ReadFileBytes(ctx, "/f")
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("read: %v", err)
+	}
+	if cp.openSessionCount() != quietRotations+1 {
+		t.Fatalf("%d sessions, want %d", cp.openSessionCount(), quietRotations+1)
+	}
+	if s.Transport() != p2pTransport {
+		t.Fatalf("transport %v, want peer-to-peer", s.Transport())
+	}
+	if len(cp.authRequests()) != 0 {
+		t.Fatal("a retirement moved the read to the relay")
+	}
+	offsets := make([]int64, quietRotations+1)
+	checkReadRequests(t, cp, offsets)
+}
+
+// TestReadFileServedRetirementsContinueAtDeliveredOffset checks that the
+// retirements of served sessions after some bytes arrived continue the read at
+// the next undelivered offset, so the caller receives each byte once.
+func TestReadFileServedRetirementsContinueAtDeliveredOffset(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.readChunk = 10
+	want := randomBytes(t, 95)
+	cp.agent.setFile("/f", want)
+	s := cp.handle(t, cp.client(t, TransportAuto))
+	retire := retireInstalledSession(s)
+	cp.p2pScript = func(n int) p2pAction {
+		switch {
+		case n == 1:
+			// Deliver the first chunk (10 bytes), then end the session.
+			return p2pAction{endAfter: 1, reason: ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED}
+		case n <= quietRotations+1:
+			return p2pAction{afterReadKeepalive: retire}
+		}
+		return p2pAction{}
+	}
+	var buf bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	size, err := s.ReadFile(ctx, "/f", &buf)
+	if err != nil || size != int64(len(want)) || !bytes.Equal(buf.Bytes(), want) {
+		t.Fatalf("read: size %d, %v", size, err)
+	}
+	if cp.openSessionCount() != quietRotations+2 {
+		t.Fatalf("%d sessions, want %d", cp.openSessionCount(), quietRotations+2)
+	}
+	if len(cp.authRequests()) != 0 {
+		t.Fatal("a retirement moved the read to the relay")
+	}
+	offsets := make([]int64, quietRotations+2)
+	for i := 1; i < len(offsets); i++ {
+		offsets[i] = 10
+	}
+	checkReadRequests(t, cp, offsets)
+}
+
+// TestReadFileRepeatedUnservedSessionRetirementsHitFailureCap checks that a
+// retirement before the agent served the read still counts as a failure: six
+// of them in a row end the read with a data path error.
+func TestReadFileRepeatedUnservedSessionRetirementsHitFailureCap(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.setFile("/f", randomBytes(t, 20))
+	s := cp.handle(t, cp.client(t, TransportAuto))
+	retire := retireInstalledSession(s)
+	cp.p2pScript = func(int) p2pAction { return p2pAction{onRequest: retire} }
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := s.ReadFileBytes(ctx, "/f")
+	var dp *DataPathError
+	if !errors.As(err, &dp) {
+		t.Fatalf("want a DataPathError, got %v", err)
+	}
+	var retired *errSessionRetired
+	if !errors.As(err, &retired) {
+		t.Fatalf("want the retirement as the cause, got %v", err)
+	}
+	if got := cp.openSessionCount(); got != 6 {
+		t.Fatalf("%d sessions, want 6 (the sixth failure ends the read)", got)
+	}
+	if got := s.Transport(); got != p2pTransport {
+		t.Fatalf("transport %v, want peer-to-peer", got)
+	}
+}
+
 // prefixWriter accepts at most accept bytes on its failing call, then returns
 // err with the accepted count, as an io.Writer may (a short write with an
 // error). Earlier calls accept everything.

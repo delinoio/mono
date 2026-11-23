@@ -130,13 +130,20 @@ type p2pAction struct {
 	endAfterStarted bool
 	// onRequest, when set, runs once the agent has the exec (started for an
 	// exec request, looked up for an attach) and before it serves any
-	// frame; the request then gets no frame. A test uses it to end or retire
-	// the session before the agent served the request.
+	// frame; the request then gets no frame (a file read request runs it as
+	// soon as the agent has the request). A test uses it to end or retire the
+	// session before the agent served the request.
 	onRequest func()
 	// afterStarted, when set, runs after the agent sent the started event
 	// of an exec, so a test can end or retire the session after the agent
 	// served the continuation.
 	afterStarted func()
+	// afterReadKeepalive, when set, answers a file read request with one
+	// keepalive event and then runs the callback instead of serving the read:
+	// the agent served the read, so a test can end or retire the session
+	// after the agent served it and before any chunk arrives. The request
+	// gets no further frame.
+	afterReadKeepalive func()
 	// raw, when set, answers the request with this frame only.
 	raw func(streamID uint64, sandboxID string) *ownsandv1.DataFrame
 }
@@ -1049,6 +1056,7 @@ type fakeAgent struct {
 	readChunk int
 	watchers  []chan struct{}
 	writeReqs []*ownsandv1.WriteFileRequest
+	readReqs  []*ownsandv1.ReadFileRequest
 }
 
 type fakeWrite struct {
@@ -1176,7 +1184,22 @@ func (a *fakeAgent) serveExec(ctx context.Context, cp *fakeCP, e *fakeExec, outO
 
 const fakeKeepalive = 100 * time.Millisecond
 
+// recordRead keeps a copy of a read request that reached the agent.
+func (a *fakeAgent) recordRead(req *ownsandv1.ReadFileRequest) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.readReqs = append(a.readReqs, proto.Clone(req).(*ownsandv1.ReadFileRequest))
+}
+
+// readRequests returns the read requests that reached the agent, in order.
+func (a *fakeAgent) readRequests() []*ownsandv1.ReadFileRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]*ownsandv1.ReadFileRequest(nil), a.readReqs...)
+}
+
 func (a *fakeAgent) serveRead(req *ownsandv1.ReadFileRequest, send func(*ownsandv1.FileReadEvent) error) error {
+	a.recordRead(req)
 	a.mu.Lock()
 	snap, ok := a.reads[req.GetReadId()]
 	if !ok {
@@ -1376,6 +1399,17 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 			errFrame(err)
 		}
 	case ownsandv1.DataFrameKind_DATA_FRAME_KIND_FILE_READ_REQUEST:
+		if act.onRequest != nil {
+			cp.agent.recordRead(f.GetFileReadRequest())
+			act.onRequest()
+			return
+		}
+		if act.afterReadKeepalive != nil {
+			cp.agent.recordRead(f.GetFileReadRequest())
+			_ = s.send(frame(&ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}}}))
+			act.afterReadKeepalive()
+			return
+		}
 		if !cp.holdAgent(s.ctx, "read") {
 			return
 		}
