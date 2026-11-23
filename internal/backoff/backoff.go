@@ -21,6 +21,12 @@ type Backoff struct {
 func (b *Backoff) Next() time.Duration {
 	if b.cur == 0 {
 		b.cur = b.Min
+		// Max also bounds the first step when it is positive and below Min.
+		// A nonpositive Max keeps the previous behavior (no cap on the
+		// first step).
+		if b.Max > 0 && b.Max < b.Min {
+			b.cur = b.Max
+		}
 	} else {
 		b.cur = min(b.cur*2, b.Max)
 	}
