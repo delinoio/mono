@@ -38,6 +38,7 @@ import {
 } from "@delino/ownsand-protos/v1/organization_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { focusManager, QueryClient } from "@tanstack/react-query";
+import { toast } from "delino-ui/toast";
 import { Console } from "./App.tsx";
 import { createQueryClient, invalidateServices } from "./api.ts";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
@@ -125,6 +126,15 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  // The toaster and its screen reader announcers are module state outside
+  // the rendered tree: a toast or an announcement of one test must not
+  // appear in the document of the next one.
+  toast.dismiss();
+  for (const announcer of document.querySelectorAll(
+    "[data-ui-sdk-announcer]",
+  )) {
+    announcer.textContent = "";
+  }
 });
 
 describe("organizations", () => {
@@ -1384,6 +1394,35 @@ describe("cached lists after a mutation that changes another service", () => {
   });
 });
 
+/**
+ * A transport that holds the responses of chosen calls until the test
+ * releases them, and counts the calls of every method. `hold` receives the
+ * method name and its 1-based call number.
+ */
+function holdingTransport(hold: (method: string, call: number) => boolean) {
+  const mock = createMockTransport();
+  const calls: Record<string, number> = {};
+  const held: Record<
+    string,
+    Array<{ release(error?: ConnectError): void }>
+  > = {};
+  const transport: Transport = {
+    ...mock,
+    async unary(method, ...rest) {
+      calls[method.name] = (calls[method.name] ?? 0) + 1;
+      if (hold(method.name, calls[method.name]!)) {
+        await new Promise<void>((resolve, reject) => {
+          (held[method.name] ??= []).push({
+            release: (error) => (error ? reject(error) : resolve()),
+          });
+        });
+      }
+      return mock.unary(method, ...rest);
+    },
+  };
+  return { transport, calls, held };
+}
+
 describe("device limits", () => {
   test("saves an explicit zero with the strict RPC", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
@@ -1566,6 +1605,221 @@ describe("device limits", () => {
     expect(replaced[0]?.memoryMib).toBe(0n);
     expect(replaced[0]?.vcpuCount).toBe(16);
     expect(replaced[0]?.diskGib).toBe(500n);
+  });
+
+  describe("while a save is pending", () => {
+    const click = async () => {
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Save limits" }));
+      });
+    };
+    const LIMIT_FIELDS = [
+      "vCPU limit",
+      "Memory limit (MiB)",
+      "Disk limit (GiB)",
+    ];
+
+    for (const outcome of ["succeeds", "fails"] as const) {
+      test(`sends one request for repeated submissions and accepts a new one after the first ${outcome}`, async () => {
+        const { transport, calls, held } = holdingTransport(
+          (method) => method === "ReplaceDeviceLimits",
+        );
+        renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+          transport,
+        });
+        const disk = await screen.findByLabelText("Disk limit (GiB)");
+        await settle();
+        await commit(disk, "123");
+        const button = screen.getByRole("button", { name: "Save limits" });
+        await act(async () => {
+          // Two submissions in the same tick, before React renders the
+          // disabled button, then more activations while it is disabled.
+          fireEvent.click(button);
+          fireEvent.click(button);
+          fireEvent.submit(button.closest("form")!);
+        });
+        await click();
+        await settle(60);
+        expect(calls.ReplaceDeviceLimits).toBe(1);
+        expect(held.ReplaceDeviceLimits).toHaveLength(1);
+        expect(
+          (
+            screen.getByRole("button", {
+              name: "Save limits",
+            }) as HTMLButtonElement
+          ).disabled,
+        ).toBe(true);
+        for (const label of LIMIT_FIELDS) {
+          expect(
+            (screen.getByLabelText(label) as HTMLInputElement).disabled,
+          ).toBe(true);
+        }
+
+        await act(async () => {
+          held.ReplaceDeviceLimits![0]!.release(
+            outcome === "fails"
+              ? new ConnectError("the save failed", Code.Unavailable)
+              : undefined,
+          );
+        });
+        await settle(100);
+        expect(calls.ReplaceDeviceLimits).toBe(1);
+        // The form is usable again and shows the draft (a failure) or the
+        // saved value (a success).
+        for (const label of LIMIT_FIELDS) {
+          expect(
+            (screen.getByLabelText(label) as HTMLInputElement).disabled,
+          ).toBe(false);
+        }
+        expect(
+          (screen.getByLabelText("Disk limit (GiB)") as HTMLInputElement).value,
+        ).toBe("123");
+        await click();
+        await settle(60);
+        expect(calls.ReplaceDeviceLimits).toBe(2);
+        await act(async () => {
+          held.ReplaceDeviceLimits![1]!.release();
+        });
+        await settle(100);
+      });
+    }
+
+    test("keeps the form disabled until the refetch after the save has settled", async () => {
+      // The first GetDevice call loads the page; the next one is the refetch
+      // that follows the save.
+      const { transport, calls, held } = holdingTransport(
+        (method, call) => method === "GetDevice" && call > 1,
+      );
+      renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+        transport,
+      });
+      const disk = await screen.findByLabelText("Disk limit (GiB)");
+      await settle();
+      await commit(disk, "123");
+      await click();
+      await settle(100);
+      expect(calls.ReplaceDeviceLimits).toBe(1);
+      expect(held.GetDevice).toHaveLength(1);
+      // The save is done and its readback is still running: the form stays
+      // disabled, so no edit can be made that the readback would overwrite.
+      const button = screen.getByRole("button", {
+        name: "Save limits",
+      }) as HTMLButtonElement;
+      expect(button.disabled).toBe(true);
+      expect((disk as HTMLInputElement).disabled).toBe(true);
+      expect((disk as HTMLInputElement).value).toBe("123");
+      await click();
+      await settle(60);
+      expect(calls.ReplaceDeviceLimits).toBe(1);
+
+      await act(async () => {
+        held.GetDevice![0]!.release();
+      });
+      await settle(100);
+      expect(button.disabled).toBe(false);
+      expect((disk as HTMLInputElement).disabled).toBe(false);
+      expect((disk as HTMLInputElement).value).toBe("123");
+    });
+  });
+});
+
+describe("agent version policy while a save is pending", () => {
+  const SETTINGS = `/orgs/${MOCK_IDS.acme}/settings`;
+  const save = async () => {
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    });
+  };
+  const pin = async (version: string) => {
+    await act(async () => {
+      fireEvent.click(screen.getByText("Pin a version"));
+    });
+    const field = await screen.findByLabelText("Pinned version");
+    await act(async () => {
+      fireEvent.input(field, { target: { value: version } });
+      fireEvent.blur(field);
+    });
+    return field as HTMLInputElement;
+  };
+
+  for (const outcome of ["succeeds", "fails"] as const) {
+    test(`sends one request for repeated submissions and accepts a new one after the first ${outcome}`, async () => {
+      const { transport, calls, held } = holdingTransport(
+        (method) => method === "UpdateAgentVersionPolicy",
+      );
+      renderConsole(SETTINGS, { transport });
+      await screen.findByRole("heading", { name: "Agent version policy" });
+      await settle(60);
+      const field = await pin("1.4.2");
+      const button = screen.getByRole("button", { name: "Save policy" });
+      await act(async () => {
+        // Two submissions in the same tick, before React renders the
+        // disabled button, then another one while it is disabled.
+        fireEvent.click(button);
+        fireEvent.click(button);
+        fireEvent.submit(button.closest("form")!);
+      });
+      await save();
+      await settle(60);
+      expect(calls.UpdateAgentVersionPolicy).toBe(1);
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+      expect(field.disabled).toBe(true);
+
+      await act(async () => {
+        held.UpdateAgentVersionPolicy![0]!.release(
+          outcome === "fails"
+            ? new ConnectError("the save failed", Code.Unavailable)
+            : undefined,
+        );
+      });
+      await settle(100);
+      expect(calls.UpdateAgentVersionPolicy).toBe(1);
+      // The form is usable again and keeps the version in both outcomes: the
+      // draft after a failure, the saved policy after a success.
+      expect((button as HTMLButtonElement).disabled).toBe(false);
+      expect(field.disabled).toBe(false);
+      expect(field.value).toBe("1.4.2");
+      await save();
+      await settle(60);
+      expect(calls.UpdateAgentVersionPolicy).toBe(2);
+      await act(async () => {
+        held.UpdateAgentVersionPolicy![1]!.release();
+      });
+      await settle(100);
+    });
+  }
+
+  test("keeps the form disabled until the refetch after the save has settled", async () => {
+    // The first call loads the page; the next one is the refetch that
+    // follows the save.
+    const { transport, calls, held } = holdingTransport(
+      (method, call) => method === "GetAgentVersionPolicy" && call > 1,
+    );
+    renderConsole(SETTINGS, { transport });
+    await screen.findByRole("heading", { name: "Agent version policy" });
+    await settle(60);
+    const field = await pin("1.4.2");
+    await save();
+    await settle(100);
+    expect(calls.UpdateAgentVersionPolicy).toBe(1);
+    expect(held.GetAgentVersionPolicy).toHaveLength(1);
+    const button = screen.getByRole("button", {
+      name: "Save policy",
+    }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(field.disabled).toBe(true);
+    expect(field.value).toBe("1.4.2");
+    await save();
+    await settle(60);
+    expect(calls.UpdateAgentVersionPolicy).toBe(1);
+
+    await act(async () => {
+      held.GetAgentVersionPolicy![0]!.release();
+    });
+    await settle(100);
+    expect(button.disabled).toBe(false);
+    expect(field.disabled).toBe(false);
+    expect(field.value).toBe("1.4.2");
   });
 });
 

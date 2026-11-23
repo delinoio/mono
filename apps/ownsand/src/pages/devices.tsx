@@ -13,7 +13,7 @@ import {
 } from "@delino/ownsand-protos/v1/device_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
@@ -175,6 +175,15 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   const [overcommit, setOvercommit] = useState("100");
   const [confirmRemove, setConfirmRemove] = useState(false);
   const device = query.data?.device;
+  // `update.isPending` lasts until the refetch that follows the save has
+  // settled (the mutation awaits `onSuccess`), so it also covers the moment
+  // when the effect below copies the saved limits into the form. The fields
+  // are disabled for that whole window, so the readback cannot erase an edit
+  // that the user makes after the submit. `saving` is the synchronous guard
+  // for a second submit in the same tick, before React renders the disabled
+  // button.
+  const saving = useRef(false);
+  const pending = update.isPending;
 
   useEffect(() => {
     if (device?.limits === undefined) return;
@@ -207,6 +216,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
+    if (saving.current) return;
     // ReplaceDeviceLimits needs every value. A blank field is not zero: the
     // form asks for the value instead of sending a silent zero.
     const input = deviceLimitsInput({
@@ -221,6 +231,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
       return;
     }
     setFieldError(null);
+    saving.current = true;
     try {
       await update.mutateAsync({
         organizationId,
@@ -229,7 +240,10 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
       });
       toast.success("The device limits are saved.");
     } catch (error) {
+      // The draft stays as the user left it and the form is usable again.
       toastError(error);
+    } finally {
+      saving.current = false;
     }
   };
 
@@ -276,7 +290,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
               onValueChange={edit(DeviceLimitField.Vcpu, setVcpu)}
               min={0}
               error={errorOf(DeviceLimitField.Vcpu)}
-              disabled={!admin}
+              disabled={!admin || pending}
             />
             <TextField
               label="Memory limit (MiB)"
@@ -284,7 +298,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
               onValueChange={edit(DeviceLimitField.Memory, setMemory)}
               inputMode="numeric"
               error={errorOf(DeviceLimitField.Memory)}
-              disabled={!admin}
+              disabled={!admin || pending}
             />
             <TextField
               label="Disk limit (GiB)"
@@ -292,14 +306,14 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
               onValueChange={edit(DeviceLimitField.Disk, setDisk)}
               inputMode="numeric"
               error={errorOf(DeviceLimitField.Disk)}
-              disabled={!admin}
+              disabled={!admin || pending}
             />
           </div>
           <Select
             label="vCPU overcommit"
             value={overcommit}
             onValueChange={(v) => v && setOvercommit(v)}
-            disabled={!admin}
+            disabled={!admin || pending}
           >
             {OVERCOMMIT_PERCENTAGES.map((p) => (
               <SelectOption key={p} value={String(p)}>
@@ -316,7 +330,9 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
           </p>
           {admin ? (
             <div className="actions">
-              <Button type="submit">Save limits</Button>
+              <Button type="submit" disabled={pending}>
+                Save limits
+              </Button>
             </div>
           ) : null}
         </form>

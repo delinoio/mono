@@ -17,7 +17,7 @@ import {
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
@@ -78,6 +78,15 @@ function AgentPolicy() {
   const [versionError, setVersionError] = useState<string>();
   const editable = can(role, Permission.ChangeAgentVersionPolicy);
   const current = policy.data?.policy;
+  // `update.isPending` lasts until the refetch that follows the save has
+  // settled (the mutation awaits `onSuccess`), so it also covers the moment
+  // when the effect below copies the saved policy into the form. The fields
+  // are disabled for that whole window, so the readback cannot erase an edit
+  // that the user makes after the submit. `saving` is the synchronous guard
+  // for a second submit in the same tick, before React renders the disabled
+  // button.
+  const saving = useRef(false);
+  const pending = update.isPending;
 
   useEffect(() => {
     if (current === undefined) return;
@@ -87,10 +96,12 @@ function AgentPolicy() {
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
+    if (saving.current) return;
     if (Number(mode) === AgentVersionPolicyMode.PIN && version.trim() === "") {
       setVersionError("Enter the agent version to pin, for example 1.4.2.");
       return;
     }
+    saving.current = true;
     try {
       await update.mutateAsync({
         organizationId,
@@ -100,7 +111,10 @@ function AgentPolicy() {
       });
       toast.success("The agent version policy is saved.");
     } catch (error) {
+      // The draft stays as the user left it and the form is usable again.
       toastError(error);
+    } finally {
+      saving.current = false;
     }
   };
 
@@ -119,7 +133,7 @@ function AgentPolicy() {
               onValueChange={(v: unknown) =>
                 typeof v === "string" && setMode(v)
               }
-              disabled={!editable}
+              disabled={!editable || pending}
             >
               {MODES.map((m) => (
                 <SegmentedControlItem key={m} value={String(m)}>
@@ -136,7 +150,7 @@ function AgentPolicy() {
                   setVersionError(undefined);
                 }}
                 error={versionError}
-                disabled={!editable}
+                disabled={!editable || pending}
               />
             ) : null}
             {current?.updateTime ? (
@@ -146,7 +160,9 @@ function AgentPolicy() {
             ) : null}
             {editable ? (
               <div className="actions">
-                <Button type="submit">Save policy</Button>
+                <Button type="submit" disabled={pending}>
+                  Save policy
+                </Button>
               </div>
             ) : (
               <p className="muted">Only admins can change the policy.</p>
