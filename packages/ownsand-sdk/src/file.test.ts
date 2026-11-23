@@ -47,6 +47,55 @@ describe("file read", () => {
     );
   });
 
+  test("rejects with DataLoss and does not retry when the end event reports a different size", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "ReadFile", function* () {
+      yield file.accepted();
+      yield file.chunk(0, "hello");
+      yield file.end(7);
+    });
+    const failure = await h.clock
+      .run(h.client.sandbox(SANDBOX).readFileBytes("/etc/motd"))
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect(failure).toBeInstanceOf(DataPathError);
+    expect((failure as DataPathError).code).toBe(Code.DataLoss);
+    expect((failure as DataPathError).message).toContain(
+      "file read ended at a size that differs from the delivered bytes",
+    );
+    expect(h.api.callsOf("ReadFile")).toHaveLength(1);
+  });
+
+  test("streams the delivered chunks before the size mismatch rejects the iteration", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "ReadFile", function* () {
+      yield file.accepted();
+      yield file.chunk(0, "hello");
+      yield file.end(7);
+    });
+    const seen: string[] = [];
+    const failure = await h.clock
+      .run(
+        (async () => {
+          for await (const chunk of h.client
+            .sandbox(SANDBOX)
+            .readFile("/etc/motd")) {
+            seen.push(text(chunk));
+          }
+        })(),
+      )
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect(seen).toEqual(["hello"]);
+    expect(failure).toBeInstanceOf(DataPathError);
+    expect((failure as DataPathError).code).toBe(Code.DataLoss);
+    expect(h.api.callsOf("ReadFile")).toHaveLength(1);
+  });
+
   test("resumes at the next offset with the same read_id after an abrupt disconnect", async () => {
     const h = setup();
     h.api.stream(RelayService, "ReadFile", function* (req, call) {

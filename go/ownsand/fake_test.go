@@ -1054,9 +1054,12 @@ type fakeAgent struct {
 	reads     map[string][]byte
 	writes    map[string]*fakeWrite
 	readChunk int
-	watchers  []chan struct{}
-	writeReqs []*ownsandv1.WriteFileRequest
-	readReqs  []*ownsandv1.ReadFileRequest
+	// endSizeDelta is added to the size that serveRead reports in the final
+	// FileReadEnd event. Zero reports the real size.
+	endSizeDelta int64
+	watchers     []chan struct{}
+	writeReqs    []*ownsandv1.WriteFileRequest
+	readReqs     []*ownsandv1.ReadFileRequest
 }
 
 type fakeWrite struct {
@@ -1212,6 +1215,7 @@ func (a *fakeAgent) serveRead(req *ownsandv1.ReadFileRequest, send func(*ownsand
 		a.reads[req.GetReadId()] = snap
 	}
 	chunk := a.readChunk
+	endSizeDelta := a.endSizeDelta
 	a.mu.Unlock()
 	for off := req.GetOffset(); off < int64(len(snap)); {
 		end := min(off+int64(chunk), int64(len(snap)))
@@ -1220,7 +1224,7 @@ func (a *fakeAgent) serveRead(req *ownsandv1.ReadFileRequest, send func(*ownsand
 		}
 		off = end
 	}
-	return send(&ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_End{End: &ownsandv1.FileReadEnd{SizeBytes: int64(len(snap))}}})
+	return send(&ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_End{End: &ownsandv1.FileReadEnd{SizeBytes: int64(len(snap)) + endSizeDelta}}})
 }
 
 func (a *fakeAgent) write(req *ownsandv1.WriteFileRequest, grantDigest []byte) (*ownsandv1.WriteFileResponse, error) {
@@ -1458,6 +1462,14 @@ func (a *fakeAgent) file(path string) ([]byte, bool) {
 	defer a.mu.Unlock()
 	b, ok := a.files[path]
 	return b, ok
+}
+
+// setEndSizeDelta makes later reads report a final size that differs from the
+// bytes that they sent by delta.
+func (a *fakeAgent) setEndSizeDelta(delta int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.endSizeDelta = delta
 }
 
 func (a *fakeAgent) setFile(path string, b []byte) {
