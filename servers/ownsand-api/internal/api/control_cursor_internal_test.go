@@ -381,3 +381,120 @@ func TestControlProcessedCursor(t *testing.T) {
 		t.Fatalf("cursor with an empty table = %d, %v; want 0, true", id, ok)
 	}
 }
+
+// ownershipLease is a LeaseHolder with a switchable ownership flag.
+type ownershipLease struct{ held bool }
+
+func (l *ownershipLease) Held() bool { return l.held }
+
+func (l *ownershipLease) WhileHeld(fn func()) bool {
+	if !l.held {
+		return false
+	}
+	fn()
+	return true
+}
+
+// admit runs the channel admission step of Service.admitChannel with a
+// registration that counts its runs.
+func admit(s *Service) (admitted bool, registered int) {
+	admitted = s.admitChannel(func() { registered++ })
+	return admitted, registered
+}
+
+// TestControlBaselineGatesChannelAdmission checks that a channel is refused
+// while the lease is held but the control event baseline is unset, at the
+// first acquisition and after a loss, and admitted once the event processor
+// stored the baseline.
+func TestControlBaselineGatesChannelAdmission(t *testing.T) {
+	h := newCursorHarness(t, 0)
+	lease := &ownershipLease{held: true}
+	h.c.S.Lease = lease
+	h.c.S.BaselineReady = h.c.baselineReady
+
+	// The first read at acquisition fails: the lease is held, the cursor is
+	// unset, and no channel is admitted or registered.
+	h.acquire(0, errors.New("database unavailable"))
+	if ok, n := admit(h.c.S); ok || n != 0 {
+		t.Fatalf("admitted = %v, registered = %d with an unset baseline; want refused", ok, n)
+	}
+
+	// The retry by the event processor fails too, then succeeds.
+	h.c.processEvents(context.Background())
+	if ok, n := admit(h.c.S); ok || n != 0 {
+		t.Fatalf("admitted = %v, registered = %d after a failed retry; want refused", ok, n)
+	}
+	h.latestErr = nil
+	h.latest = 5
+	h.c.processEvents(context.Background())
+	if ok, n := admit(h.c.S); !ok || n != 1 {
+		t.Fatalf("admitted = %v, registered = %d after the baseline; want admitted once", ok, n)
+	}
+
+	// A loss clears the baseline, and the next period starts refusing again
+	// until its own baseline exists.
+	h.c.LeaseLost()
+	if ok, n := admit(h.c.S); ok || n != 0 {
+		t.Fatalf("admitted = %v, registered = %d after the loss; want refused", ok, n)
+	}
+	h.acquire(5, nil)
+	if ok, n := admit(h.c.S); !ok || n != 1 {
+		t.Fatalf("admitted = %v, registered = %d after reacquisition; want admitted once", ok, n)
+	}
+
+	// Without the lease, a stored baseline admits nothing.
+	lease.held = false
+	if ok, n := admit(h.c.S); ok || n != 0 {
+		t.Fatalf("admitted = %v, registered = %d without the lease; want refused", ok, n)
+	}
+}
+
+// TestControlBaselineAdmissionRefusedWhileFirstReadPending checks that the
+// baseline is also unset while the first read of the period is in flight, so
+// a channel that connects during the read is refused.
+func TestControlBaselineAdmissionRefusedWhileFirstReadPending(t *testing.T) {
+	h := newCursorHarness(t, 0)
+	h.c.S.Lease = &ownershipLease{held: true}
+	h.c.S.BaselineReady = h.c.baselineReady
+	refusedDuringRead := false
+	h.interceptFirstLatestID(func() (int64, error) {
+		ok, n := admit(h.c.S)
+		refusedDuringRead = !ok && n == 0
+		return 3, nil
+	})
+	h.latest = 3
+	h.c.LeaseAcquired(context.Background())
+	if !refusedDuringRead {
+		t.Fatal("a channel was admitted while the first baseline read was in flight")
+	}
+	if ok, n := admit(h.c.S); !ok || n != 1 {
+		t.Fatalf("admitted = %v, registered = %d after the read; want admitted once", ok, n)
+	}
+}
+
+// TestControlBaselineAdmissionWithoutGate checks that a service without a
+// control worker (nil BaselineReady) keeps admitting while the lease is held.
+func TestControlBaselineAdmissionWithoutGate(t *testing.T) {
+	s := &Service{Lease: &ownershipLease{held: true}}
+	if ok, n := admit(s); !ok || n != 1 {
+		t.Fatalf("admitted = %v, registered = %d without a gate; want admitted once", ok, n)
+	}
+}
+
+// TestControlWiresBaselineGate checks that NewControl installs the gate, and
+// that the gate follows the cursor of that control worker.
+func TestControlWiresBaselineGate(t *testing.T) {
+	s := &Service{Hub: hub.New(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Lease: &ownershipLease{held: true}}
+	c := NewControl(s)
+	c.latestID = func(context.Context) (int64, error) { return 4, nil }
+	if s.BaselineReady == nil {
+		t.Fatal("NewControl did not install the baseline gate")
+	}
+	if ok, _ := admit(s); ok {
+		t.Fatal("a channel was admitted before the control worker stored a baseline")
+	}
+	c.LeaseAcquired(context.Background())
+	if ok, n := admit(s); !ok || n != 1 {
+		t.Fatalf("admitted = %v, registered = %d after the baseline; want admitted once", ok, n)
+	}
+}

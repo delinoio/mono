@@ -150,6 +150,21 @@ func (s *Service) sendDeleteSnapshot(ctx context.Context, conn *hub.Conn, orgID,
 	}
 }
 
+// admitChannel runs register only while the instance holds the lease and the
+// control event baseline of the lease period is established, as one step
+// under the ownership lock of the lease. It reports whether register ran.
+func (s *Service) admitChannel(register func()) bool {
+	admitted := false
+	s.Lease.WhileHeld(func() {
+		if s.BaselineReady != nil && !s.BaselineReady() {
+			return
+		}
+		register()
+		admitted = true
+	})
+	return admitted
+}
+
 // Channel serves the agent channel: a Connect bidirectional stream of
 // AgentEnvelope messages over HTTP/2 with the `osd_` credential (recorded
 // transport decision).
@@ -170,7 +185,14 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 	// database I/O, before it takes the ownership lock. The step under the
 	// lock is in-memory only, so the lock never waits for that I/O and is
 	// released before any database or stream I/O below.
-	conn := h.Hub.RegisterAdmitted(ctx, p.ID, p.OrganizationID, h.Lease.WhileHeld)
+	//
+	// The same step also requires the control event baseline of the lease
+	// period (Service.BaselineReady): a channel that observed the device
+	// state or limits before the baseline could miss a control event that
+	// committed between that observation and the baseline, because the
+	// event processor only dispatches events after the baseline. The agent
+	// reconnects through its backoff until the baseline exists.
+	conn := h.Hub.RegisterAdmitted(ctx, p.ID, p.OrganizationID, h.admitChannel)
 	if conn == nil {
 		return errUnavailable("this instance does not accept agent channels now")
 	}
