@@ -133,6 +133,16 @@ export function Slider({
         disabled={disabled}
         value={value}
         defaultValue={defaultValue}
+        // The range overrides the id of the label with `labelId`, but the UI
+        // SDK derives the default `aria-labelledby` of the group from the id
+        // that it predicts for the label, which no element has. Without this
+        // prop the group has a dangling reference in static markup. It comes
+        // before `{...props}` so a caller `aria-labelledby` wins, and it is
+        // skipped for a caller `aria-label`, which `aria-labelledby` would
+        // override. A single thumb keeps the label id of the UI SDK.
+        aria-labelledby={
+          isRange && props["aria-label"] === undefined ? labelId : undefined
+        }
         {...props}
       >
         {(state) => {
