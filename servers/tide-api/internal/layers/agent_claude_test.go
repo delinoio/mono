@@ -332,9 +332,13 @@ func TestClaudeOrchestratorRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, "the orchestrator stops without a profile", func() bool { return third.Exited() && len(w.orch.Running()) == 0 })
-	if _, err := os.Stat(filepath.Dir(third.Arg("--hooks-dir"))); !os.IsNotExist(err) {
-		t.Fatalf("the run directory stays: %v", err)
-	}
+	// The watch removes the run directory after the process has exited and
+	// the hook socket has closed, so wait for the removal as well.
+	runDir := filepath.Dir(third.Arg("--hooks-dir"))
+	eventually(t, "the run directory is removed", func() bool {
+		_, err := os.Stat(runDir)
+		return os.IsNotExist(err)
+	})
 }
 
 // TestClaudeOrganizationDeletion: deleting the organization stops the
