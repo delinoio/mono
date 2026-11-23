@@ -225,6 +225,12 @@ func (s *Service) verifySignedNonce(ctx context.Context, tx pgx.Tx, deviceID str
 	if !auth.VerifyDeviceSignature(rec.publicKey, purpose, nonce, signature) {
 		return rec, errUnauthenticated("invalid signature")
 	}
+	// Check ran before this transaction waited for the device row lock, so the
+	// nonce can have expired meanwhile. Validate the deadline again at the
+	// locked point, before the nonce is consumed.
+	if auth.NonceExpired(s.now(), expiry) {
+		return rec, errUnauthenticated("invalid or expired nonce")
+	}
 	tag, err := tx.Exec(ctx, "INSERT INTO consumed_nonces (nonce_sha256, expire_time) VALUES ($1, $2) ON CONFLICT DO NOTHING", auth.NonceHash(nonce), expiry)
 	if err != nil {
 		return rec, err
