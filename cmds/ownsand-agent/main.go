@@ -368,13 +368,27 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 		fmt.Fprintf(stdout, "%s %s %s\n", c.bold("Update:"), s.UpdateState, s.UpdateTarget)
 		printCapabilities(stdout, s, c)
 	}
+	// A failed inventory read is an error, never a smaller count: the partial
+	// result is discarded, the line shows the count as unavailable, the
+	// diagnostic names the inventory on standard error, and the command exits
+	// with exitError after both inventory lines have printed.
 	var sandboxes []string
-	_ = st.LoadSandboxes(func(b []byte) error {
+	if err := st.LoadSandboxes(func(b []byte) error {
 		sandboxes = append(sandboxes, string(b))
 		return nil
-	})
-	fmt.Fprintf(stdout, "%s %d records\n", c.bold("Sandboxes:"), len(sandboxes))
-	entries, _ := os.ReadDir(st.Path(store.SnapshotsDir))
+	}); err != nil {
+		fmt.Fprintf(stdout, "%s %s\n", c.bold("Sandboxes:"), c.bad(fmt.Sprintf("unavailable (%v)", err)))
+		fmt.Fprintln(stderr, "ownsand-agent: read sandbox records:", err)
+		code = exitError
+	} else {
+		fmt.Fprintf(stdout, "%s %d records\n", c.bold("Sandboxes:"), len(sandboxes))
+	}
+	entries, err := os.ReadDir(st.Path(store.SnapshotsDir))
+	if err != nil {
+		fmt.Fprintf(stdout, "%s %s\n", c.bold("Snapshots:"), c.bad("unavailable"))
+		fmt.Fprintln(stderr, "ownsand-agent: read snapshots:", err)
+		return exitError
+	}
 	var snaps []string
 	for _, e := range entries {
 		if e.IsDir() {
