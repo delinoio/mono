@@ -69,7 +69,7 @@ The console stores nothing except the Logto SDK session state in the browser. It
 
 ## Security
 
-- Secrets appear once and are never stored by the console, except the short `sessionStorage` use of an invitation secret during the sign-in redirect described in [Interfaces and Contracts](#interfaces-and-contracts).
+- Secrets appear once and are never stored by the console, except the short `sessionStorage` use of an invitation secret during the sign-in redirect described in [Interfaces and Contracts](#interfaces-and-contracts). The dialog opens with the focus on `Copy` (a `data-autofocus` attribute), not on `Done`, so one Enter or Space copies the secret and keeps the dialog open; one `Tab` reaches `Done`, and `Done`, `Esc` and a click outside still close it. The order of the buttons does not change.
 - Destructive actions (device removal, API key revocation, organization deletion, ownership transfer and billing unlink) need an explicit confirmation step.
 - The console shows no exec output or file contents; it has no exec or file features in this version.
 

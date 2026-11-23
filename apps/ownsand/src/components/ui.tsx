@@ -409,7 +409,11 @@ export function SecretDialog({
         {hint ? <p className="muted">{hint}</p> : null}
         <DialogActions>
           <DialogClose>Done</DialogClose>
-          <Button onClick={copy}>Copy</Button>
+          {/* `data-autofocus` makes the SDK focus Copy on open; Done stays
+              first in the DOM and visual order. */}
+          <Button onClick={copy} data-autofocus="">
+            Copy
+          </Button>
         </DialogActions>
       </DialogContent>
     </Dialog>

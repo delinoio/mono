@@ -155,6 +155,14 @@ describe("API keys", () => {
     await expect(dialog).toContainText("appears only once");
     await expect(dialog).toContainText("osk_");
 
+    // The focus starts on Copy, so Enter copies and keeps the dialog open;
+    // one Tab reaches Done.
+    await expect(screen.getByRole("button", "Copy")).toBeFocused();
+    await browser.keyboard.press("Enter");
+    await expect(dialog).toBeVisible();
+    await browser.keyboard.press("Tab");
+    await expect(screen.getByRole("button", "Done")).toBeFocused();
+
     await browser.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
     await expect(screen.getByText("nightly-ci · Active")).toBeVisible();
