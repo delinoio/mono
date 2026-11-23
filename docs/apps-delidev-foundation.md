@@ -66,7 +66,10 @@ The scaffold stores no app data. CEF keeps its Chromium profile (cookies, cache 
 - `DELIDEV_LOG` holds `tracing` filter directives. The default is `info`, which is also used when the value is empty or not valid.
 - ANSI color is on by default. A non-empty `NO_COLOR` turns it off.
 - `run()` logs one `starting delidev` event with the version, runtime, platform and operating system.
-- Android and iOS do not show the process stderr. A platform log sink for mobile is not part of the scaffold.
+- iOS debug builds: the `tauri::mobile_entry_point` expansion calls `tauri::log_stdout()` before the app entry point, which redirects stdout and stderr into pipes. Tauri's Swift logger forwards each captured chunk to Apple unified logging with an `[stderr]` prefix, so the `tracing` output of `logging::init` reaches unified logging. The Swift logger is enabled only in debug builds.
+- iOS release builds: Tauri still installs the redirector, but its Swift logger is off by default, so the process stderr is not visible. Release builds emit nothing to unified logging by default.
+- Android does not show the process stderr. A platform log sink for Android is not part of the scaffold.
+- The native log visibility on iOS and Android has not been verified on a device or simulator. These statements come from the pinned Tauri sources.
 - Logs must not contain access tokens, ID tokens or payment details.
 
 ## Build and Test

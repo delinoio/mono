@@ -28,8 +28,16 @@ fn log_filter(value: Option<&str>) -> EnvFilter {
 /// Installs the structured stderr logger.
 ///
 /// ANSI color is on by default. A non-empty `NO_COLOR` turns it off
-/// (<https://no-color.org>). Android and iOS do not show the process stderr;
-/// a platform log sink for mobile is not part of the scaffold.
+/// (<https://no-color.org>).
+///
+/// On iOS debug builds, the `tauri::mobile_entry_point` expansion redirects
+/// stdout and stderr into pipes before the app entry point runs, and the Tauri
+/// Swift logger forwards each captured chunk to Apple unified logging with an
+/// `[stderr]` prefix, so this logger's output reaches unified logging. That
+/// logger is off by default in iOS release builds, so the process stderr is not
+/// visible there. Android does not show the process stderr, and a platform log
+/// sink is not part of the scaffold. The native log visibility is not verified
+/// on a device or simulator; it follows from the pinned Tauri sources.
 pub fn init() {
     let filter = log_filter(std::env::var(LOG_FILTER_ENV).ok().as_deref());
     let ansi = std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
