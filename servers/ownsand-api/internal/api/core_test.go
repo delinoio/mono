@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,8 @@ func TestOrganizationLifecycleAndPagination(t *testing.T) {
 		ids = append(ids, resp.Msg.GetOrganization().GetOrganizationId())
 	}
 	var listed []string
+	var pageSizes []int
+	var nextTokens []string
 	token := ""
 	for {
 		resp, err := alice.Organization.ListOrganizations(ctx, connect.NewRequest(&ownsandv1.ListOrganizationsRequest{PageSize: 2, PageToken: token}))
@@ -52,9 +55,22 @@ func TestOrganizationLifecycleAndPagination(t *testing.T) {
 		for _, o := range resp.Msg.GetOrganizations() {
 			listed = append(listed, o.GetOrganizationId())
 		}
+		pageSizes = append(pageSizes, len(resp.Msg.GetOrganizations()))
 		token = resp.Msg.GetNextPageToken()
+		nextTokens = append(nextTokens, token)
 		if token == "" {
 			break
+		}
+		if len(pageSizes) > len(ids) {
+			t.Fatalf("pagination did not terminate: page sizes %v", pageSizes)
+		}
+	}
+	if want := []int{2, 2, 1}; !slices.Equal(pageSizes, want) {
+		t.Fatalf("page sizes = %v, want %v", pageSizes, want)
+	}
+	for i, next := range nextTokens {
+		if last := i == len(nextTokens)-1; last == (next != "") {
+			t.Fatalf("page %d next page token = %q; want a token on every page except the last (tokens %q)", i, next, nextTokens)
 		}
 	}
 	if strings.Join(listed, ",") != strings.Join(ids, ",") {
