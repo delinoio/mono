@@ -1929,6 +1929,167 @@ describe("peer-to-peer data path", () => {
       expect(readOffsets(p.rtc)[0]).toBe(0n);
     });
 
+    describe("a channel failure that an old session reports late", () => {
+      /**
+       * Three chunks of a read, no end frame, and an exec that starts and
+       * exits at once; `execStarted` leaves an exec running instead.
+       */
+      function stallingAgent(execStarted = false): FakeAgent {
+        const file = source(3 << 10);
+        return (frame, peer) => {
+          if (frame.payload.case === "execRequest") {
+            execEvent(peer, frame.streamId, ev.started());
+            if (!execStarted) {
+              execEvent(peer, frame.streamId, ev.exited(0));
+            }
+            return;
+          }
+          if (frame.payload.case !== "fileReadRequest") return;
+          for (let at = 0; at < file.length; at += 1 << 10) {
+            peer.send({
+              streamId: frame.streamId,
+              sandboxId: SANDBOX,
+              kind: DataFrameKind.FILE_READ_EVENT,
+              payload: {
+                case: "fileReadEvent",
+                value: {
+                  event: {
+                    case: "chunk",
+                    value: {
+                      offset: BigInt(at),
+                      data: file.subarray(at, at + (1 << 10)),
+                    },
+                  },
+                },
+              },
+            });
+          }
+        };
+      }
+
+      /**
+       * Starts a read that pauses after its first chunk. The old channel then
+       * fails while two chunks are buffered, so the read learns about the
+       * failure only after its consumer resumes.
+       */
+      async function pausedReadThatLosesItsChannel(p: FakeWebRtcHarness) {
+        const sandbox = p.h.client.sandbox(SANDBOX);
+        const wait = gate();
+        let chunks = 0;
+        const done = (async () => {
+          for await (const _ of sandbox.readFile("/big")) {
+            if (++chunks === 1) await wait.promise;
+          }
+          return "completed";
+        })().catch((e: unknown) => e);
+        await p.h.clock.advance(1000);
+        expect(chunks).toBe(1);
+        expect(p.rtc.channels).toHaveLength(1);
+        p.rtc.peers[0]!.fail();
+        await p.h.clock.settle();
+        return { sandbox, wait, done };
+      }
+
+      test("a forced peer-to-peer handle returns the error and keeps the healthy replacement", async () => {
+        const p = p2pSetup(stallingAgent(), {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h, rtc } = p;
+        const { sandbox, wait, done } = await pausedReadThatLosesItsChannel(p);
+        // Another operation opens the replacement session while the read of
+        // the old session still waits for its consumer.
+        await h.clock.run(sandbox.run({ command: ["a"] }));
+        expect(rtc.channels).toHaveLength(2);
+        wait.open();
+        const error = await h.clock.run(done);
+        expect(error).toBeInstanceOf(DataPathError);
+        expect((error as DataPathError).code).toBe(Code.Unavailable);
+        expect((error as DataPathError).cause).toBeInstanceOf(
+          PeerUnavailableError,
+        );
+        // The late failure did not retire the replacement.
+        expect(rtc.channels[1]!.readyState).toBe("open");
+        await h.clock.run(sandbox.run({ command: ["b"] }));
+        expect(rtc.channels).toHaveLength(2);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(2);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+
+      test("a failure of the installed session still retires it and a later operation reconnects", async () => {
+        const p = p2pSetup(stallingAgent(), {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h, rtc } = p;
+        const { sandbox, wait, done } = await pausedReadThatLosesItsChannel(p);
+        // No other operation replaced the session: the failed one is still
+        // the installed session when the read reports the failure.
+        wait.open();
+        const error = await h.clock.run(done);
+        expect(error).toBeInstanceOf(DataPathError);
+        expect((error as DataPathError).code).toBe(Code.Unavailable);
+        expect(rtc.channels).toHaveLength(1);
+        await h.clock.run(sandbox.run({ command: ["b"] }));
+        expect(rtc.channels).toHaveLength(2);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+
+      test("an automatic handle still falls back to the relay and does not close the replacement session", async () => {
+        const p = p2pSetup(stallingAgent());
+        const { h, rtc } = p;
+        h.api.stream(RelayService, "ReadFile", function* () {
+          yield file.accepted();
+          yield file.chunk(0, "relay");
+          yield file.end(5);
+        });
+        const { sandbox, wait, done } = await pausedReadThatLosesItsChannel(p);
+        await h.clock.run(sandbox.run({ command: ["a"] }));
+        expect(rtc.channels).toHaveLength(2);
+        wait.open();
+        // The read continues on the relay from its delivered offset.
+        await h.clock.run(done);
+        expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+        // The stale failure does not close the session of the other operation.
+        expect(rtc.channels[1]!.readyState).toBe("open");
+      });
+
+      test("an exec of an old session that fails late keeps the healthy replacement", async () => {
+        const p = p2pSetup(stallingAgent(true), {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h, rtc } = p;
+        const sandbox = h.client.sandbox(SANDBOX);
+        const wait = gate();
+        let events = 0;
+        const done = (async () => {
+          for await (const _ of sandbox.exec({ command: ["x"] })) {
+            if (++events === 1) await wait.promise;
+          }
+          return "completed";
+        })().catch((e: unknown) => e);
+        await h.clock.advance(1000);
+        expect(events).toBe(1);
+        rtc.peers[0]!.fail();
+        await h.clock.settle();
+        // A read opens the replacement session.
+        const read = sandbox.readFileBytes("/big").catch((e: unknown) => e);
+        await h.clock.advance(1000);
+        expect(rtc.channels).toHaveLength(2);
+        wait.open();
+        const error = await h.clock.run(done);
+        expect(error).toBeInstanceOf(DataPathError);
+        expect(rtc.channels[1]!.readyState).toBe("open");
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        // Settle the read that waits for its end frame.
+        rtc.peers[1]!.fail();
+        await h.clock.run(read);
+      });
+    });
+
     test("a burst below both limits is queued without failing the stream", async () => {
       // 64 frames of 1 KiB: the chunks and the end frame reach 64 frames at
       // the most, below 8 MiB.

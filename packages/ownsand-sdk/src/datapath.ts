@@ -240,13 +240,22 @@ export class DataPathSelector {
    * `OwnSandHandleClosedError` (also on a forced `PEER_TO_PEER` transport),
    * and the handle stays on peer-to-peer so later operations reject with the
    * same error.
+   *
+   * `session` is the session that the failing operation used; the setup of a
+   * session that failed to open passes none. A failure of a session that the
+   * handle has already replaced is late news: it retires nothing, so the
+   * healthy replacement stays installed for other operations. A forced
+   * `PEER_TO_PEER` transport still returns the failure to the caller of the
+   * old session, and an automatic handle still moves to the relay.
    */
-  peerFailed(cause: unknown): void {
+  peerFailed(cause: unknown, session?: PeerSession): void {
     if (this.#closed) {
       throw new OwnSandHandleClosedError();
     }
-    this.#session?.close();
-    this.#session = undefined;
+    if (session === undefined || this.#session === session) {
+      this.#session?.close();
+      this.#session = undefined;
+    }
     if (this.#forced === DataPathTransport.PEER_TO_PEER) {
       throw new DataPathError("peer-to-peer data path failed", {
         code: Code.Unavailable,

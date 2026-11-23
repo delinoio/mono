@@ -335,7 +335,7 @@ export async function* runExec(
       continue;
     }
     if (failure instanceof PeerUnavailableError) {
-      selector.peerFailed(failure);
+      selector.peerFailed(failure, session);
       window.fail();
       mode = Mode.Attach;
       continue;

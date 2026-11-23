@@ -152,7 +152,7 @@ export async function* runReadFile(
       continue;
     }
     if (failure instanceof PeerUnavailableError) {
-      selector.peerFailed(failure);
+      selector.peerFailed(failure, session);
       window.fail();
       continue;
     }
