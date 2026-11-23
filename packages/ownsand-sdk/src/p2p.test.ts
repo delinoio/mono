@@ -688,6 +688,51 @@ describe("peer-to-peer data path", () => {
     expect(h.api.callsOf("OpenSession")).toHaveLength(1);
   });
 
+  test("moves the handle to the relay when the agent reports its session capacity as resource_exhausted", async () => {
+    const { h } = p2pSetup(() => {});
+    h.api.unary(DataPathService, "OpenSession", () => {
+      throw new ConnectError(
+        "agent peer-to-peer session capacity reached",
+        Code.ResourceExhausted,
+      );
+    });
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const result = await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+  });
+
+  test("a forced PEER_TO_PEER transport reports a resource_exhausted OpenSession as unavailable", async () => {
+    const { h } = p2pSetup(() => {}, {
+      transport: DataPathTransport.PEER_TO_PEER,
+    });
+    h.api.unary(DataPathService, "OpenSession", () => {
+      throw new ConnectError(
+        "agent peer-to-peer session capacity reached",
+        Code.ResourceExhausted,
+      );
+    });
+    const error = await h.clock
+      .run(
+        h.client
+          .sandbox(SANDBOX)
+          .exec({ command: ["x"] })
+          .wait(),
+      )
+      .catch((e) => e);
+    // A forced PEER_TO_PEER handle reports a setup failure as an unavailable
+    // data path error and never asks for a relay grant.
+    expect(error).toBeInstanceOf(DataPathError);
+    expect((error as DataPathError).code).toBe(Code.Unavailable);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+  });
+
   describe("when the WebRTC constructor throws", () => {
     /** A peer connection constructor that throws, with the throw recorded. */
     function throwingWebRtc(

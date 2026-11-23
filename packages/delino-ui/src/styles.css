@@ -359,6 +359,7 @@
     margin: 0 0 8px;
     font-size: 20px;
     font-weight: 700;
+    overflow-wrap: anywhere;
   }
 
   .dui-dialog-description {
@@ -635,6 +636,7 @@
   .dui-select-content {
     box-sizing: border-box;
     min-width: var(--anchor-width);
+    max-width: calc(100vw - 16px);
     max-height: min(320px, var(--available-height));
     overflow-y: auto;
     margin: 0;
@@ -665,6 +667,7 @@
     padding: 0 10px;
     border-radius: 8px;
     font-size: 15px;
+    overflow-wrap: anywhere;
     cursor: pointer;
   }
 

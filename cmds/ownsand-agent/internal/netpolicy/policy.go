@@ -196,12 +196,38 @@ func dnsAcceptRules(assignments []TapGateway) string {
 	return sb.String()
 }
 
+// linkAcceptRules returns the input chain rules that accept the link-local
+// configuration traffic of each assigned tap, one group of three rules per
+// tap sorted by tap, each rule naming its own tap:
+//
+//   - DHCPv4 from the unspecified address or the guest address of the
+//     assignment to the gateway address of the assignment or the limited
+//     broadcast address (UDP port 68 to 67);
+//   - DHCPv6 from a link-local source to the All_DHCP_Relay_Agents_and_Servers
+//     address (UDP port 546 to 547);
+//   - IPv6 neighbor and router discovery with hop limit 255 to a link-local
+//     or link-scope multicast address, the only form that RFC 4861 accepts.
+//
+// A packet from a tap that matches none of them, and every packet from a tap
+// without a valid assignment, falls to the final drop of the input chain.
+// An invalid assignment renders no rule.
+func linkAcceptRules(assignments []TapGateway) string {
+	var sb strings.Builder
+	for _, a := range sortedAssignments(assignments) {
+		fmt.Fprintf(&sb, "\t\tiifname %q ip saddr { 0.0.0.0, %s } ip daddr { %s, 255.255.255.255 } udp sport 68 udp dport 67 accept\n", a.Tap, a.Guest, a.Gateway)
+		fmt.Fprintf(&sb, "\t\tiifname %q ip6 saddr fe80::/10 ip6 daddr ff02::1:2 udp sport 546 udp dport 547 accept\n", a.Tap)
+		fmt.Fprintf(&sb, "\t\tiifname %q ip6 hoplimit 255 ip6 daddr { fe80::/10, ff02::/16 } icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept\n", a.Tap)
+	}
+	return sb.String()
+}
+
 // sourceGuardRules returns the forward chain rules that drop an IPv4 packet
 // from an assigned tap whose source address is not the guest address of
 // that assignment, so that a guest cannot forward packets with the address
 // of another sandbox or of the host. DHCPv4 from 0.0.0.0 is delivered to
 // the host and hits the input chain only, and `ip saddr` does not match
-// IPv6 packets, so neither is affected. An invalid assignment renders no
+// IPv6 packets, so neither is affected (the forward chain drops all IPv6
+// packets from a tap in a separate rule). An invalid assignment renders no
 // rule.
 func sourceGuardRules(assignments []TapGateway) string {
 	var sb strings.Builder
@@ -215,13 +241,23 @@ func sourceGuardRules(assignments []TapGateway) string {
 // atomically. Guests reach only the internet: packets to blocked prefixes
 // are dropped in forward, packets to the host itself are dropped in input
 // except DNS from the guest address of each sandbox on its tap to that
-// sandbox's own gateway address (assignments), DHCP and IPv6 neighbor and
-// router discovery on the guest link, inbound connections to guests are
+// sandbox's own gateway address (assignments), DHCPv4, DHCPv6 and IPv6
+// neighbor and router discovery that each name one sandbox tap and match the
+// addresses of the guest link (linkAcceptRules), inbound connections to guests are
 // dropped, and guest traffic leaves through NAT. DNS to any other host
 // address, such as the LAN address or the gateway of another sandbox, and
 // DNS from another source address, falls through to the drop. IPv4 packets
 // from a sandbox tap with a source other than the guest address of that
-// sandbox are dropped in forward.
+// sandbox are dropped in forward, and so are all IPv6 packets from a sandbox
+// tap, because guests get no IPv6 address in this version: such a packet
+// has a spoofed source, and the blocked6 drop alone would forward it to any
+// destination outside the blocked prefixes. IPv6 neighbor and router
+// discovery on the guest link hit the input chain only and are unaffected.
+// The DNS forwarder listens on the gateway addresses without binding to a
+// device, so the input chain also drops every packet to GuestSubnet that
+// arrives on an interface other than a sandbox tap or the loopback
+// interface (for example a LAN peer that routes the guest subnet through the
+// host); the rule follows every accept and precedes the final tap drop.
 func Ruleset(v4, v6 []netip.Prefix, assignments []TapGateway) string {
 	tap := TapPrefix + "*"
 	return fmt.Sprintf(`table inet %[1]s
@@ -241,14 +277,13 @@ table inet %[1]s {
 	}
 	chain input {
 		type filter hook input priority filter - 10; policy accept;
-%[6]s		iifname "%[4]s" udp sport 68 udp dport 67 accept
-		iifname "%[4]s" udp sport 546 udp dport 547 accept
-		iifname "%[4]s" icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+%[6]s%[8]s		iifname != "lo" iifname != "%[4]s" ip daddr %[5]s drop
 		iifname "%[4]s" drop
 	}
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
-%[7]s		iifname "%[4]s" ip daddr @blocked4 drop
+%[7]s		iifname "%[4]s" meta nfproto ipv6 drop
+		iifname "%[4]s" ip daddr @blocked4 drop
 		iifname "%[4]s" ip6 daddr @blocked6 drop
 		oifname "%[4]s" ct state established,related accept
 		oifname "%[4]s" drop
@@ -258,7 +293,7 @@ table inet %[1]s {
 		ip saddr %[5]s oifname != "%[4]s" masquerade
 	}
 }
-`, TableName, joinPrefixes(v4), joinPrefixes(v6), tap, GuestSubnet, dnsAcceptRules(assignments), sourceGuardRules(assignments))
+`, TableName, joinPrefixes(v4), joinPrefixes(v6), tap, GuestSubnet, dnsAcceptRules(assignments), sourceGuardRules(assignments), linkAcceptRules(assignments))
 }
 
 // Link is the /30 link of one sandbox.

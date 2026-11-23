@@ -87,15 +87,22 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	d.mu.Lock()
 	closed, stun := d.closed, append([]string(nil), d.stunURLs...)
 	_, dup := d.sessions[offer.GetSessionId()]
+	// Cheap early check; the authoritative one shares the critical section
+	// that inserts the session, below. A full data plane leaves a pending
+	// tombstone for the caller's next attempt.
+	full := !closed && !dup && len(d.sessions) >= d.limits.MaxSessions
 	// A revocation that arrived before this offer registered its session
 	// already ended it: the tombstone is consumed by the offer it names.
-	preRevoked := !closed && !dup && offer.GetSessionId() != "" && d.revoked.take(offer.GetSessionId(), time.Now())
+	preRevoked := !closed && !dup && !full && offer.GetSessionId() != "" && d.revoked.take(offer.GetSessionId(), time.Now())
 	d.mu.Unlock()
 	if closed {
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
 	}
 	if dup || offer.GetSessionId() == "" || offer.GetSdp() == "" {
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "offer needs a new session ID and an SDP body")
+	}
+	if full {
+		return d.rejectSessionCapacity(offer)
 	}
 	if preRevoked {
 		logger.Warn("session revoked before its offer was handled", "cancellation_reason", ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED.String())
@@ -141,14 +148,18 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	// no session; the tombstone check shares this critical section with the
 	// insertion, so a revocation either left a tombstone here or finds the
 	// session in the map.
-	preRevoked = !closed && !dup && d.revoked.take(s.id, time.Now())
-	if !closed && !dup && !preRevoked {
+	full = !closed && !dup && len(d.sessions) >= d.limits.MaxSessions
+	preRevoked = !closed && !dup && !full && d.revoked.take(s.id, time.Now())
+	if !closed && !dup && !full && !preRevoked {
 		d.sessions[s.id] = s
 	}
 	d.mu.Unlock()
-	if closed || dup || preRevoked {
+	if closed || dup || full || preRevoked {
 		cancel()
 		pc.Close()
+		if full {
+			return d.rejectSessionCapacity(offer)
+		}
 		if preRevoked {
 			logger.Warn("session revoked before it was registered", "cancellation_reason", ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED.String())
 			return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session ended before it was answered")
@@ -274,6 +285,13 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	return &ownsandv1.SignalingAnswer{SessionId: s.id, Sdp: pc.LocalDescription().SDP}
 }
 
+// rejectSessionCapacity answers an offer that arrives while the data plane
+// holds the maximum number of sessions. It creates no peer connection.
+func (d *DataPlane) rejectSessionCapacity(offer *ownsandv1.SignalingOffer) *ownsandv1.SignalingAnswer {
+	d.sessionRejected.note(d.logger, time.Now(), "session", offer.GetSessionId(), offer.GetSandboxId(), d.limits.MaxSessions)
+	return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, sessionCapacityMessage)
+}
+
 // offerDeadline returns the deadline of the session lifetime that the offer
 // carries, measured from received. It uses expires_in and falls back to the
 // absolute expire_time. The result is not after received when the lifetime
@@ -375,6 +393,15 @@ func (s *session) onFrame(f *ownsandv1.DataFrame) {
 	if _, busy := s.streams[id]; busy {
 		s.mu.Unlock()
 		s.errorFrame(id, ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "stream already carries a request")
+		return
+	}
+	// The limit counts the streams that carry a request. A rejected request
+	// registers nothing and starts no goroutine, so it neither keeps the
+	// session out of the idle rule nor holds a slot; the session stays open.
+	if len(s.streams) >= s.d.limits.MaxStreamsPerSession {
+		s.mu.Unlock()
+		s.d.streamRejected.note(s.d.logger, time.Now(), "stream", s.id, s.sandboxID, s.d.limits.MaxStreamsPerSession)
+		s.errorFrame(id, ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, streamCapacityMessage)
 		return
 	}
 	ctx, cancel := context.WithCancel(s.ctx)

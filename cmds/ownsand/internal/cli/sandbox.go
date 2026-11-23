@@ -385,7 +385,7 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 			return usageErr("%v", err)
 		}
 		if ctx.Err() != nil {
-			return &exitError{code: 130, msg: "interrupted; the command keeps running in the sandbox"}
+			return &exitError{code: ExitInterrupted, msg: "interrupted; the command keeps running in the sandbox"}
 		}
 		var lw *localWriteError
 		if errors.As(err, &lw) {
@@ -863,7 +863,10 @@ func (a *app) fileWrite(ctx context.Context, name string, args []string) error {
 		return err
 	}
 	defer s.Close()
-	var r io.Reader = a.env.Stdin
+	// Standard input can block without data, for example on a terminal, and a
+	// blocked read cannot observe ctx: read it through a reader that returns
+	// when an interrupt cancels ctx.
+	var r io.Reader = newCtxReader(ctx, a.env.Stdin)
 	if *from != "" {
 		f, err := os.Open(*from)
 		if err != nil {
@@ -876,6 +879,9 @@ func (a *app) fileWrite(ctx context.Context, name string, args []string) error {
 	if err != nil {
 		if validate.IsValidationError(err) {
 			return usageErr("%v", err)
+		}
+		if ctx.Err() != nil {
+			return &exitError{code: ExitInterrupted, msg: "interrupted; the write was not finished"}
 		}
 		return err
 	}

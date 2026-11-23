@@ -58,6 +58,9 @@ type Options struct {
 	InterfaceFilter func(string) bool
 	// Limits of the relay; zero values use DefaultRelayLimits.
 	Limits RelayLimits
+	// Limits of the peer-to-peer sessions; zero values use
+	// DefaultSessionLimits.
+	SessionLimits SessionLimits
 }
 
 // Timing holds the session and relay durations.
@@ -124,6 +127,11 @@ type DataPlane struct {
 	opts   Options
 	timing Timing
 	logger *slog.Logger
+	// limits are the resolved peer-to-peer session limits; the rejection
+	// logs rate-limit the warning of each kind.
+	limits          SessionLimits
+	sessionRejected limitRejectLog
+	streamRejected  limitRejectLog
 
 	mu       sync.Mutex
 	stunURLs []string
@@ -142,7 +150,7 @@ func New(opts Options) *DataPlane {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	d := &DataPlane{opts: opts, timing: opts.Timing.withDefaults(), logger: opts.Logger, sessions: map[string]*session{}}
+	d := &DataPlane{opts: opts, timing: opts.Timing.withDefaults(), logger: opts.Logger, limits: opts.SessionLimits.withDefaults(), sessions: map[string]*session{}}
 	d.relay = newRelay(d)
 	return d
 }

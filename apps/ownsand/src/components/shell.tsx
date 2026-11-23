@@ -120,7 +120,19 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
         <div className="org-switcher">
           <Select
             label="Organization"
-            value={organizationId}
+            placeholder="Choose an organization"
+            value={
+              // An organization that is not in a complete list (a deleted or
+              // foreign one) shows the placeholder, not its raw ID. While the
+              // list still loads or a later page failed, the organization may
+              // just be unloaded, so the current value stays.
+              !orgs.isIncomplete &&
+              !orgs.organizations.some(
+                (o) => o.organizationId === organizationId,
+              )
+                ? null
+                : organizationId
+            }
             onValueChange={(value) => {
               if (value === null) return;
               if (value === RETRY_ORGANIZATIONS) {
@@ -187,7 +199,11 @@ export function OrgShell({
     // (`not_found`, `permission_denied`, `unauthenticated`): replace the
     // layout. A transient failure of a refetch keeps the layout mounted, so
     // open dialogs and typed values survive; the notice below reports it.
-    body = <ErrorNotice error={org.error} onRetry={() => void org.refetch()} />;
+    body = (
+      <ErrorNotice error={org.error} onRetry={() => void org.refetch()}>
+        <Link to="/">Go to your organizations</Link>
+      </ErrorNotice>
+    );
   } else {
     const organization = org.data.organization!;
     const role = organization.callerRole;

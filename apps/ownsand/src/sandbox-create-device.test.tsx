@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: Apache-2.0
+import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  screen,
+  within,
+} from "@testing-library/react";
+import { Code, ConnectError } from "@connectrpc/connect";
+import type { Transport } from "@connectrpc/connect";
+import { DeviceState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  deviceOptionLabel,
+  errorMessage,
+  offlineDeviceMessage,
+} from "./format.ts";
+import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
+import { renderConsole, settle } from "./test-support.tsx";
+
+beforeEach(() => {
+  window.sessionStorage.clear();
+  window.localStorage.clear();
+});
+
+afterEach(() => {
+  cleanup();
+});
+
+const OFFLINE_NOTICE =
+  'studio-mac is offline, so the sandbox cannot start on it. Choose another device or "Any device that fits", or try again when it is back online.';
+
+describe("device option label and offline notice helpers", () => {
+  test("deviceOptionLabel appends the state name in parentheses", () => {
+    expect(deviceOptionLabel("build-box-1", DeviceState.ONLINE)).toBe(
+      "build-box-1 (Online)",
+    );
+    expect(deviceOptionLabel("studio-mac", DeviceState.OFFLINE)).toBe(
+      "studio-mac (Offline)",
+    );
+    expect(deviceOptionLabel("old", DeviceState.REMOVED)).toBe("old (Removed)");
+    expect(deviceOptionLabel("x", DeviceState.UNSPECIFIED)).toBe("x (Unknown)");
+    // A state value that this build does not know reads as Unknown.
+    expect(deviceOptionLabel("x", 99 as DeviceState)).toBe("x (Unknown)");
+  });
+
+  test("offlineDeviceMessage names the device and the ways out", () => {
+    expect(offlineDeviceMessage("studio-mac")).toBe(OFFLINE_NOTICE);
+  });
+
+  test("errorMessage keeps the generic text for Unavailable", () => {
+    expect(errorMessage(new ConnectError("x", Code.Unavailable))).toBe(
+      "OwnSand is not available right now. Try again in a moment.",
+    );
+  });
+});
+
+describe("create sandbox device select", () => {
+  async function openForm(transport: Transport) {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Create sandbox" }),
+      );
+    });
+    await settle(60);
+    return screen.findByRole("dialog", { name: "Create a sandbox" });
+  }
+
+  async function chooseDevice(dialog: HTMLElement, name: string) {
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Device" }));
+    });
+    const option = (await screen.findAllByRole("option")).find(
+      (o) => o.textContent === name,
+    )!;
+    expect(option).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(option);
+    });
+  }
+
+  async function create(dialog: HTMLElement) {
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(60);
+  }
+
+  test("lists each device with its state, keeps the order and shows the same text in the trigger", async () => {
+    const dialog = await openForm(createMockTransport());
+    const trigger = within(dialog).getByRole("combobox", { name: "Device" });
+    await act(async () => {
+      fireEvent.click(trigger);
+    });
+    const texts = (await screen.findAllByRole("option")).map(
+      (o) => o.textContent,
+    );
+    expect(texts).toEqual([
+      "Any device that fits",
+      "build-box-1 (Online)",
+      "studio-mac (Offline)",
+    ]);
+    await act(async () => {
+      fireEvent.click(
+        (screen.getAllByRole("option") as HTMLElement[]).find(
+          (o) => o.textContent === "studio-mac (Offline)",
+        )!,
+      );
+    });
+    expect(trigger.textContent).toContain("studio-mac (Offline)");
+  });
+
+  test("names the offline device when the create is Unavailable and keeps the dialog and key", async () => {
+    const mock = createMockTransport();
+    const keys: string[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          keys.push((rest[3] as { idempotencyKey: string }).idempotencyKey);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    const dialog = await openForm(transport);
+    await chooseDevice(dialog, "studio-mac (Offline)");
+    await create(dialog);
+    expect(dialog.isConnected).toBe(true);
+    expect(dialog.querySelector(".notice-error")?.textContent).toContain(
+      OFFLINE_NOTICE,
+    );
+    expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}/sandboxes`);
+    await create(dialog);
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+    // The device stays selected after the failure.
+    expect(
+      within(dialog).getByRole("combobox", { name: "Device" }).textContent,
+    ).toContain("studio-mac (Offline)");
+  });
+
+  test("keeps the generic Unavailable text when the device is online", async () => {
+    const mock = createMockTransport();
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          return Promise.reject(new ConnectError("down", Code.Unavailable));
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    const dialog = await openForm(transport);
+    await chooseDevice(dialog, "build-box-1 (Online)");
+    await create(dialog);
+    const text = dialog.querySelector(".notice-error")?.textContent ?? "";
+    expect(text).toContain(
+      errorMessage(new ConnectError("", Code.Unavailable)),
+    );
+    expect(text).not.toContain("is offline");
+  });
+
+  test("keeps the generic Unavailable text for automatic placement", async () => {
+    const mock = createMockTransport();
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          return Promise.reject(new ConnectError("down", Code.Unavailable));
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    const dialog = await openForm(transport);
+    await create(dialog);
+    const text = dialog.querySelector(".notice-error")?.textContent ?? "";
+    expect(text).toContain(
+      errorMessage(new ConnectError("", Code.Unavailable)),
+    );
+    expect(text).not.toContain("is offline");
+  });
+
+  test("keeps another error code for an offline device unchanged", async () => {
+    const mock = createMockTransport();
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          return Promise.reject(new ConnectError("busy", Code.Internal));
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    const dialog = await openForm(transport);
+    await chooseDevice(dialog, "studio-mac (Offline)");
+    await create(dialog);
+    const text = dialog.querySelector(".notice-error")?.textContent ?? "";
+    expect(text).toContain(errorMessage(new ConnectError("", Code.Internal)));
+    expect(text).not.toContain("is offline");
+  });
+});

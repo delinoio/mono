@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -40,9 +41,16 @@ type Control struct {
 	// Seams of the event processor. NewControl sets them to the database
 	// functions; tests replace them to interleave lease transitions with a
 	// batch deterministically.
-	latestID    func(ctx context.Context) (int64, error)
-	readEvents  func(ctx context.Context, after int64, limit int) ([]events.Event, error)
-	handleEvent func(ctx context.Context, e events.Event)
+	latestID   func(ctx context.Context) (int64, error)
+	readEvents func(ctx context.Context, after int64, limit int) ([]events.Event, error)
+	// handleEvent delivers one event. A non-nil error means the event could
+	// not be handled for a transient reason and must be delivered again:
+	// processEvents stops the batch at that event and the next poll reads
+	// from it. A nil return means the event is done or deliberately skipped.
+	handleEvent func(ctx context.Context, e events.Event) error
+	// loadDeleteTarget reads the sandbox of a delete event. NewControl sets
+	// it to loadSandbox on the pool; tests replace it to fail the lookup.
+	loadDeleteTarget func(ctx context.Context, orgID, sandboxID string) (*sandboxRow, error)
 }
 
 // NewControl returns the background worker of s and installs s.Notify.
@@ -53,6 +61,9 @@ func NewControl(s *Service) *Control {
 		return events.After(ctx, s.DB.Pool, after, limit)
 	}
 	c.handleEvent = c.handle
+	c.loadDeleteTarget = func(ctx context.Context, orgID, sandboxID string) (*sandboxRow, error) {
+		return loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+	}
 	s.Notify = c.Kick
 	s.BaselineReady = c.baselineReady
 	return c
@@ -195,6 +206,14 @@ func (c *Control) runEvents(ctx context.Context) {
 // its next read, its next delivery and its cursor store, so it neither
 // delivers an event of a newer period nor replaces the cursor that
 // LeaseAcquired stored. Deliveries that already returned are not undone.
+//
+// When handleEvent returns an error for an event, the batch stops at that
+// event: the cursor is stored up to the event before it (under the same
+// generation check) and the next poll reads again from the failed event, so
+// the events before it are not delivered twice and the events after it wait
+// until it is handled. A failure that never clears therefore holds back the
+// later events and the janitor's cleanup (it deletes only up to the cursor)
+// for as long as it lasts; there is no retry bound.
 func (c *Control) processEvents(ctx context.Context) {
 	c.mu.Lock()
 	cursor, gen := c.cursor, c.cursorGen
@@ -219,21 +238,43 @@ func (c *Control) processEvents(ctx context.Context) {
 				c.S.Logger.Info("control_event_batch_superseded", slog.Int64("cursor", cursor))
 				return
 			}
-			c.handleEvent(ctx, e)
+			if err := c.handleEvent(ctx, e); err != nil {
+				// The cursor stays at the event before e, so the next poll
+				// delivers e again. A canceled context is a shutdown, not a
+				// failure of the event.
+				if ctx.Err() == nil {
+					c.S.Logger.Warn("control_event_retry",
+						slog.Int64("event_id", e.ID),
+						slog.Int("kind", int(e.Kind)),
+						slog.String("sandbox_id", e.SandboxID),
+						slog.String("device_id", e.DeviceID),
+						slog.Any("error", err))
+				}
+				c.storeCursor(gen, cursor)
+				return
+			}
 			cursor = e.ID
 		}
-		c.mu.Lock()
-		if c.cursorGen != gen {
-			c.mu.Unlock()
-			c.S.Logger.Info("control_event_batch_superseded", slog.Int64("cursor", cursor))
+		if !c.storeCursor(gen, cursor) {
 			return
 		}
-		c.cursor = cursor
-		c.mu.Unlock()
 		if len(batch) < 500 {
 			return
 		}
 	}
+}
+
+// storeCursor stores cursor as the processed cursor when no lease transition
+// ran since the batch copied generation gen, and reports whether it did.
+func (c *Control) storeCursor(gen uint64, cursor int64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cursorGen != gen {
+		c.S.Logger.Info("control_event_batch_superseded", slog.Int64("cursor", cursor))
+		return false
+	}
+	c.cursor = cursor
+	return true
 }
 
 // cursorCurrent reports whether no lease transition stored the cursor since
@@ -244,7 +285,10 @@ func (c *Control) cursorCurrent(gen uint64) bool {
 	return c.cursorGen == gen
 }
 
-func (c *Control) handle(ctx context.Context, e events.Event) {
+// handle delivers one control event. It returns an error only for a failure
+// that a later attempt can recover from (see Control.handleEvent); every
+// other outcome, including a skipped event, returns nil.
+func (c *Control) handle(ctx context.Context, e events.Event) error {
 	s := c.S
 	switch e.Kind {
 	case events.KindDeviceConfigChanged:
@@ -262,11 +306,26 @@ func (c *Control) handle(ctx context.Context, e events.Event) {
 	case events.KindSandboxDeleteRequested:
 		conn := s.Hub.Live(e.DeviceID)
 		if conn == nil {
-			return
+			return nil
 		}
-		sb, err := loadSandbox(ctx, s.DB.Pool, e.OrganizationID, e.SandboxID, false)
-		if err != nil || isTerminal(sb.AgentState) || !sb.DeletePending {
-			return
+		c.mu.Lock()
+		load := c.loadDeleteTarget
+		c.mu.Unlock()
+		sb, err := load(ctx, e.OrganizationID, e.SandboxID)
+		if err != nil {
+			if connect.CodeOf(err) == connect.CodeNotFound {
+				// The row is gone: the delete is obsolete and must not
+				// block later events.
+				return nil
+			}
+			// Any other lookup error is transient (for example a database
+			// error): a skip would advance the cursor past a delete that
+			// no agent received, and a repeated DeleteSandbox writes no
+			// new event while the delete is pending.
+			return err
+		}
+		if isTerminal(sb.AgentState) || !sb.DeletePending {
+			return nil
 		}
 		s.sendDelete(ctx, conn, e.OrganizationID, pendingDelete{sandboxID: sb.ID, reason: sb.DeleteEndReason})
 	case events.KindSnapshotDeleted:
@@ -276,7 +335,7 @@ func (c *Control) handle(ctx context.Context, e events.Event) {
 	case events.KindDeviceRemoved:
 		conn := s.Hub.Get(e.DeviceID)
 		if conn == nil {
-			return
+			return nil
 		}
 		// The clean-up command goes out first; the nil envelope makes the
 		// writer close the channel after it.
@@ -291,6 +350,7 @@ func (c *Control) handle(ctx context.Context, e events.Event) {
 			s.DataPath.HandleEvent(ctx, e)
 		}
 	}
+	return nil
 }
 
 // expireCommands removes the command records whose channel closed longer
