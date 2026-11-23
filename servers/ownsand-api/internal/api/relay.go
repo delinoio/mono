@@ -441,11 +441,19 @@ type streamEvents struct {
 // request deadline, which the request gate counted from the stream_id
 // allocation, so the upload of the request body already used part of it.
 // onWritten, when set, receives the bytes of the frame on the agent
-// connection once the relay wrote it.
-func (p *DataPlane) sendRequest(ctx context.Context, c *relayCall, f *ownsandv1.DataFrame, deadline time.Time, onWritten func(int64)) error {
+// connection once the relay wrote it. When confirmed is set, sendRequest
+// returns only after the connection writer finished sending the frame, so
+// the request deadline also covers the wait behind a blocked writer and the
+// caller can start a timer for the agent's reply at the return; otherwise it
+// returns when the frame is queued.
+func (p *DataPlane) sendRequest(ctx context.Context, c *relayCall, f *ownsandv1.DataFrame, deadline time.Time, onWritten func(int64), confirmed bool) error {
 	rctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	if err := c.stream.SendMetered(rctx, f, onWritten); err != nil {
+	send := c.stream.SendMetered
+	if confirmed {
+		send = c.stream.SendConfirmed
+	}
+	if err := send(rctx, f, onWritten); err != nil {
 		if errors.Is(err, relay.ErrConnClosed) {
 			return errUnavailable("the relay connection closed")
 		}
@@ -481,9 +489,12 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 		c.stream.Close(sendClose)
 		p.logCall(ctx, c, err)
 	}()
-	// Keepalives also cover the request upload and the wait for credit.
+	// Keepalives also cover the request upload and the wait for credit. The
+	// request counts as forwarded only when the connection writer sent it, so
+	// the acceptance timeout below never runs while the frame still waits
+	// behind a blocked writer; that wait stays under the request deadline.
 	uploadDone := make(chan error, 1)
-	go func() { uploadDone <- p.sendRequest(ctx, c, request, deadline, nil) }()
+	go func() { uploadDone <- p.sendRequest(ctx, c, request, deadline, nil, true) }()
 	tick := min(p.Timing.Keepalive, p.Timing.Acceptance) / 4
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
@@ -702,7 +713,7 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 	// Droplet on the agent's relay connection.
 	orgID := c.grant.OrgID
 	egress := func(n int64) { h.S.recordUsage(orgID, ownsandv1.BillingMeter_BILLING_METER_RELAY_EGRESS, n) }
-	if err := h.sendRequest(cctx, c, datapath.MustNewFrame(0, "", m), deadline, egress); err != nil {
+	if err := h.sendRequest(cctx, c, datapath.MustNewFrame(0, "", m), deadline, egress, false); err != nil {
 		return nil, err
 	}
 	for {
