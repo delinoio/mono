@@ -18,6 +18,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
 import { SubscriptionStatus } from "@delino/accounts-protos/v1/credit_pb";
 import { pendingInvitation } from "./invitation.ts";
+import { afterSignInPath } from "./pages/callback.tsx";
 import {
   ACCOUNT_ID,
   ADMIN,
@@ -1502,6 +1503,85 @@ describe("invitation acceptance", () => {
     expect(window.location.pathname).toBe(ACCOUNT_PATH);
     expect(calls(api, "AcceptInvitation")).toHaveLength(2);
   });
+
+  test.each([
+    { outcome: "succeeds", registered: true },
+    { outcome: "fails", registered: false },
+  ])(
+    "a replacement link keeps its stored token for the sign-in return when the earlier request $outcome meanwhile",
+    async ({ registered }) => {
+      const api = createFakeApi();
+      api.userId = OUTSIDER;
+      // The earlier link joins another account, so its late success cannot
+      // block the acceptance of the replacement link.
+      addBillingAccounts(api, 1);
+      const earlierAccountId = [...api.accounts.keys()].find(
+        (id) => id !== ACCOUNT_ID,
+      )!;
+      if (registered) {
+        api.invitationTokens.set(EARLIER_INVITATION_TOKEN, {
+          accountId: earlierAccountId,
+          role: BillingAccountRole.ADMIN,
+        });
+      }
+      // Hold the request of the earlier link so that it settles after the
+      // replacement link started its sign-in redirect.
+      let release!: () => void;
+      api.gates.set(
+        `AcceptInvitation:${EARLIER_INVITATION_TOKEN}`,
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      );
+      const { signIns } = renderApp(
+        `/billing/invitations/accept#token=${EARLIER_INVITATION_TOKEN}`,
+        { api },
+      );
+      await click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+      // The session of the replacement link has ended.
+      api.failNext.set(
+        "AcceptInvitation",
+        new ConnectError("token expired", Code.Unauthenticated),
+      );
+      await act(async () => {
+        window.location.hash = `token=${INVITATION_TOKEN}`;
+        window.dispatchEvent(new HashChangeEvent("hashchange"));
+      });
+      await settle(30);
+      await click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+      await settle(30);
+      await click(screen.getByRole("button", { name: "Sign in with Delino" }));
+      expect(signIns).toHaveLength(1);
+      expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
+
+      // The earlier request settles during the sign-in redirect.
+      release();
+      await settle(60);
+      expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
+      expect(window.location.pathname).toBe("/billing/invitations/accept");
+
+      // The sign-in return opens the invitation route, and the next
+      // acceptance submits the replacement token.
+      expect(afterSignInPath()).toBe("/billing/invitations/accept");
+      cleanup();
+      renderApp("/billing/invitations/accept", { api });
+      await click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+      await settle(60);
+      expect(calls(api, "AcceptInvitation")).toEqual([
+        expect.objectContaining({ invitationToken: EARLIER_INVITATION_TOKEN }),
+        expect.objectContaining({ invitationToken: INVITATION_TOKEN }),
+        expect.objectContaining({ invitationToken: INVITATION_TOKEN }),
+      ]);
+      expect(window.location.pathname).toBe(ACCOUNT_PATH);
+      expect(pendingInvitation.read()).toBeUndefined();
+    },
+  );
 
   test("keeps the stored token for the sign-in return when the fragment is empty", async () => {
     pendingInvitation.save(INVITATION_TOKEN);

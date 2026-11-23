@@ -144,7 +144,14 @@ export function InvitationPage({ configured }: { configured: boolean }) {
               // stays so that the user can try again after, for example,
               // signing in with the invited address.
             } finally {
-              pendingInvitation.clear();
+              // A newer link owns the stored token once it replaced this
+              // attempt: it may have saved its token for a sign-in redirect
+              // that is still in progress. Opening that link already deleted
+              // the token of this attempt, and leaving the flow deletes the
+              // rest.
+              if (clicked === currentAttempt.current) {
+                pendingInvitation.clear();
+              }
             }
           }}
         >
