@@ -9,8 +9,8 @@ import { useBillingAccount } from "../../components/shell.tsx";
 import {
   Empty,
   ErrorNotice,
+  InfiniteListNotice,
   Loading,
-  RefetchNotice,
 } from "../../components/ui.tsx";
 import { formatDate, labels } from "../../format.ts";
 import {
@@ -95,10 +95,7 @@ export function InvoicesSection() {
         Paddle is the merchant of record and issues the invoices. Amounts
         exclude tax.
       </p>
-      <RefetchNotice
-        error={invoices.isRefetchError ? invoices.error : undefined}
-        onRetry={() => void invoices.refetch()}
-      />
+      <InfiniteListNotice list={invoices} />
       {actionFailure.notice}
       {invoices.isPending ? (
         <Loading label="Loading invoices" />

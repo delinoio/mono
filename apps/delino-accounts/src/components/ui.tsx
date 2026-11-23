@@ -122,6 +122,51 @@ export function RefetchNotice({
 }
 
 /**
+ * The part of a TanStack infinite query result that `InfiniteListNotice`
+ * reads. Any `useInfiniteQuery` result satisfies it.
+ */
+export interface InfiniteListState {
+  error: unknown;
+  isRefetchError: boolean;
+  isFetchNextPageError: boolean;
+  refetch: () => unknown;
+  fetchNextPage: (options?: { cancelRefetch?: boolean }) => unknown;
+}
+
+/**
+ * The notice of a list that the user reads on with a button. It keeps the
+ * loaded rows and shows one of two failures above them:
+ *
+ * - A failed refresh of the loaded pages (`isRefetchError`) retries with
+ *   `refetch`, which reads the list again from the first page.
+ * - A failed request for the next page (`isFetchNextPageError`) retries with
+ *   `fetchNextPage`, which requests the failed cursor again and appends the
+ *   rows once. TanStack Query excludes this failure from `isRefetchError`,
+ *   so the notice has to read it separately.
+ *
+ * A failed first request is not handled here: it replaces the section with
+ * an `ErrorNotice`. An `Unauthenticated` failure offers the sign-in action
+ * in both cases, like `ErrorNotice`. Render it in the same tree position in
+ * every state, like `RefetchNotice`.
+ */
+export function InfiniteListNotice({ list }: { list: InfiniteListState }) {
+  if (list.isFetchNextPageError) {
+    return (
+      <RefetchNotice
+        error={list.error}
+        onRetry={() => void list.fetchNextPage({ cancelRefetch: false })}
+      />
+    );
+  }
+  return (
+    <RefetchNotice
+      error={list.isRefetchError ? list.error : undefined}
+      onRetry={() => void list.refetch()}
+    />
+  );
+}
+
+/**
  * The state of the pages after the first one: a short loading line while
  * later pages load and an error with a retry that resumes at the failed page.
  * The items of the earlier pages stay visible above it.
