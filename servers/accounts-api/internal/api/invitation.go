@@ -110,31 +110,32 @@ func scanInvitation(row pgx.Row) (invitation, error) {
 
 // Why an undelivered invitation is revoked. The value is stored in the
 // details of the invitation_revoked audit event.
-const (
-	revokeReasonDeliveryFailed = "delivery_failed"
-	revokeReasonAuditFailed    = "audit_failed"
-)
+const revokeReasonDeliveryFailed = "delivery_failed"
 
-// invitationFollowUpTimeout bounds the transactions that run after the email
-// was sent or failed. They run detached from the request context, so a client
-// that disconnects during the send does not leave an undelivered invitation
+// invitationFollowUpTimeout bounds the transaction that runs after a failed
+// send. It runs detached from the request context, so a client that
+// disconnects during the send does not leave an undelivered invitation
 // pending.
 const invitationFollowUpTimeout = 10 * time.Second
 
 // CreateInvitation invites an email address and sends the invitation email.
 // Owner and admin only.
 //
-// The email is sent only after the transaction that inserts the invitation has
-// committed, so a rolled-back transaction never sends an email for an
-// invitation that does not exist. A second transaction then either records the
-// invitation_created audit event (the email was accepted) or revokes the
-// invitation under the account lock (the send failed) and the RPC fails with
-// unavailable. A failed send therefore leaves a revoked invitation, which no
-// longer blocks a new invitation for the address, and no invitation_created
-// audit event. The Resend idempotency key `invitation/<invitation_id>` keeps a
-// retried send of the same invitation to one email. A crash between the commit
-// and the send leaves a pending invitation without an email; an owner or admin
-// revokes it and invites again.
+// The invitation and its invitation_created audit event are stored in one
+// transaction under the account lock, so a committed invitation always has its
+// creation audit and no later step can fail the RPC for an invitation that
+// someone may already have accepted. The email is sent only after that
+// transaction has committed, so a rolled-back transaction never sends an email
+// for an invitation that does not exist. When the send fails, a second
+// transaction revokes the invitation under the account lock (the
+// invitation_revoked audit event with the reason delivery_failed) and the RPC
+// fails with unavailable. A failed send therefore leaves a revoked invitation,
+// which no longer blocks a new invitation for the address, and the audit
+// history invitation_created followed by invitation_revoked. The Resend
+// idempotency key `invitation/<invitation_id>` keeps a retried send of the same
+// invitation to one email. A crash between the commit and the send leaves a
+// pending invitation without an email; an owner or admin revokes it and invites
+// again.
 func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *connect.Request[accountsv1.CreateInvitationRequest]) (*connect.Response[accountsv1.CreateInvitationResponse], error) {
 	userID, err := callerUserID(ctx)
 	if err != nil {
@@ -166,6 +167,7 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 		CreateTime: now, ExpireTime: now.Add(InvitationLifetime),
 	}
 	var msg email.Message
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err := loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -189,6 +191,12 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 			id, accountID, hash, addr, emailKey(addr), string(role), userID, inv.CreateTime, inv.ExpireTime); err != nil {
 			return err
 		}
+		if err := h.recordAudit(ctx, tx, audit, now, auditEvent{
+			BillingAccountID: accountID, Kind: AuditInvitationCreated, ActorUserID: userID, InvitationID: id,
+			Details: map[string]string{"role": string(role)},
+		}); err != nil {
+			return err
+		}
 		msg, err = email.InvitationMessage(email.Invitation{
 			InvitationID:       id,
 			BillingAccountID:   accountID,
@@ -204,30 +212,16 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 		return nil, h.internal(ctx, "create_invitation", err)
 	}
 
-	// The invitation is committed. Send the email outside any transaction.
+	// The invitation and its creation audit event are committed.
+	h.flushAudit(ctx, audit)
+
+	// Send the email outside any transaction.
 	if err := h.email.Send(ctx, msg); err != nil {
 		h.logger.WarnContext(ctx, "invitation_email_failed",
 			slog.String("billing_account_id", accountID), slog.String("invitation_id", id))
 		h.revokeUndelivered(ctx, inv, userID, revokeReasonDeliveryFailed)
 		return nil, unavailable("the invitation email could not be sent; try again later")
 	}
-
-	// The email was accepted: record the creation. If that fails, the
-	// invitation is revoked so that every pending invitation has its
-	// invitation_created audit event.
-	followUp, cancel := invitationFollowUpContext(ctx)
-	defer cancel()
-	audit := &auditLog{}
-	if err := h.db.InTx(followUp, func(tx pgx.Tx) error {
-		return h.recordAudit(followUp, tx, audit, now, auditEvent{
-			BillingAccountID: accountID, Kind: AuditInvitationCreated, ActorUserID: userID, InvitationID: id,
-			Details: map[string]string{"role": string(role)},
-		})
-	}); err != nil {
-		h.revokeUndelivered(ctx, inv, userID, revokeReasonAuditFailed)
-		return nil, h.internal(ctx, "create_invitation", err)
-	}
-	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.CreateInvitationResponse{Invitation: inv.proto(now)}), nil
 }
 
