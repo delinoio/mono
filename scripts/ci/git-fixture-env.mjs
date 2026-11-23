@@ -14,8 +14,11 @@
 // LEFTHOOK* variable (LEFTHOOK=0, LEFTHOOK_EXCLUDE, LEFTHOOK_OUTPUT,
 // LEFTHOOK_CONFIG, ...), which would disable, skip or reconfigure the
 // generated hooks. Callers that need a Lefthook variable, such as
-// LEFTHOOK_BIN, set it on the returned environment. Shared by the scripts/ci
-// test suites; this module is not a test file, so
+// LEFTHOOK_BIN, set it on the returned environment. Environment variable names
+// are case-insensitive on Windows, where a copy of `process.env` keeps the
+// original spelling (`Git_Dir`, `Lefthook`), so the names are matched without
+// regard to case there and case-sensitively on every other platform. Shared by
+// the scripts/ci test suites; this module is not a test file, so
 // `node --test scripts/ci/*.test.mjs` does not collect it.
 // Mutates and returns `env`.
 import { execFileSync } from "node:child_process";
@@ -64,10 +67,13 @@ export function assertSupportedGitVersion() {
   gitVersionChecked = true;
 }
 
-export function isolateGitEnvironment(env) {
+// `platform` selects the name matching rules and exists so tests can exercise
+// the Windows behavior on any host.
+export function isolateGitEnvironment(env, platform = process.platform) {
   assertSupportedGitVersion();
   for (const name of Object.keys(env)) {
-    if (name.startsWith("GIT_") || name.startsWith("LEFTHOOK")) {
+    const comparable = platform === "win32" ? name.toUpperCase() : name;
+    if (comparable.startsWith("GIT_") || comparable.startsWith("LEFTHOOK")) {
       delete env[name];
     }
   }

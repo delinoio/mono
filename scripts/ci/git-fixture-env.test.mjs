@@ -69,6 +69,50 @@ test("isolation returns the documented environment and drops ambient GIT_* and L
   });
 });
 
+test("isolation drops mixed-case GIT_* and LEFTHOOK* variables on Windows and keeps explicit settings", () => {
+  const env = isolateGitEnvironment(
+    {
+      Path: "C:\\Windows",
+      Git_Dir: ".",
+      git_index_file: "index.lock",
+      Git_Config_Count: "9",
+      Lefthook: "0",
+      lefthook_bin: "C:\\somewhere\\lefthook.exe",
+      GITHUB_TOKEN: "kept",
+      UNRELATED: "kept",
+    },
+    "win32",
+  );
+  env.LEFTHOOK_BIN = "C:\\explicit\\lefthook.exe";
+  assert.deepEqual(env, {
+    Path: "C:\\Windows",
+    GITHUB_TOKEN: "kept",
+    UNRELATED: "kept",
+    GIT_CONFIG_GLOBAL: nullDevice,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "core.excludesFile",
+    GIT_CONFIG_VALUE_0: nullDevice,
+    GIT_CONFIG_KEY_1: "core.attributesFile",
+    GIT_CONFIG_VALUE_1: nullDevice,
+    LEFTHOOK_BIN: "C:\\explicit\\lefthook.exe",
+  });
+});
+
+test("isolation matches variable names case-sensitively on other platforms", () => {
+  for (const platform of ["linux", "darwin"]) {
+    const env = isolateGitEnvironment(
+      { Git_Dir: ".", Lefthook: "0", GIT_DIR: "/somewhere", LEFTHOOK: "0" },
+      platform,
+    );
+    assert.equal(env.Git_Dir, ".");
+    assert.equal(env.Lefthook, "0");
+    assert.equal("GIT_DIR" in env, false);
+    assert.equal("LEFTHOOK" in env, false);
+  }
+});
+
 test("isolation ignores the global ignore file under XDG_CONFIG_HOME", (t) => {
   const xdg = xdgConfigDirectory(t, "*.json\n", "*.dat -text\n");
   const { cwd, git } = repository(t, { XDG_CONFIG_HOME: xdg });
