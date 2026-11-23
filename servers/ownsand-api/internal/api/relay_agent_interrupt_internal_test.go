@@ -162,9 +162,15 @@ func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
 				elapsed time.Duration
 				// inFlight is set when a server stream.Send still ran after Run returned.
 				inFlight bool
+				// sendBlocked is set when a relay send was seen blocked, with
+				// no send completing for sendBlockedWindow, before Run returned.
+				sendBlocked bool
 			}
 			handled := make(chan result, 1)
 			senderDone := make(chan struct{})
+			// sendsStarted and sendsCompleted count the sender's relay sends. A
+			// send that started and did not complete is blocked on the agent.
+			var sendsStarted, sendsCompleted atomic.Int64
 			handler := connect.NewBidiStreamHandler(ownsandv1connect.RelayAgentServiceConnectProcedure,
 				func(ctx context.Context, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
 					start := time.Now()
@@ -182,13 +188,50 @@ func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
 						_, _ = rand.Read(data)
 						chunk := &ownsandv1.WriteFileRequest{Data: data}
 						for {
+							sendsStarted.Add(1)
 							if err := s.Send(ctx, datapath.MustNewFrame(0, "", chunk)); err != nil {
+								return
+							}
+							sendsCompleted.Add(1)
+						}
+					}()
+					// Watch the sender while Run serves the connection: the send must
+					// block before the idle timeout closes the relay connection, which
+					// ends the send. Afterwards a blocked send cannot be told from one
+					// that never started.
+					const sendBlockedWindow = 100 * time.Millisecond
+					runDone := make(chan struct{})
+					observed := make(chan bool, 1)
+					go func() {
+						ticker := time.NewTicker(10 * time.Millisecond)
+						defer ticker.Stop()
+						var lastCompleted int64 = -1
+						var since time.Time
+						for {
+							select {
+							case <-runDone:
+								observed <- false
+								return
+							case <-ticker.C:
+							}
+							completed := sendsCompleted.Load()
+							if sendsStarted.Load() <= completed {
+								lastCompleted = -1
+								continue
+							}
+							if completed != lastCompleted {
+								lastCompleted, since = completed, time.Now()
+								continue
+							}
+							if time.Since(since) >= sendBlockedWindow {
+								observed <- true
 								return
 							}
 						}
 					}()
 					err = serveRelayConn(ctx, conn, stream)
-					handled <- result{err: err, elapsed: time.Since(start), inFlight: sendInFlight()}
+					close(runDone)
+					handled <- result{err: err, elapsed: time.Since(start), inFlight: sendInFlight(), sendBlocked: <-observed}
 					return nil
 				})
 			var protocols http.Protocols
@@ -240,6 +283,9 @@ func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
 				}
 				if r.elapsed > 10*time.Second {
 					t.Fatalf("the connection closed after %v", r.elapsed)
+				}
+				if !r.sendBlocked {
+					t.Fatal("no relay send blocked before the idle timeout closed the connection")
 				}
 				if stalled != nil && stalled.blocked.Load() == 0 {
 					t.Fatal("no server socket write blocked")
