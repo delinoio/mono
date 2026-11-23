@@ -37,7 +37,7 @@ Indexes with identical definitions (after normalizing names) on the same table a
 SELECT
   schemaname || '.' || tablename AS table,
   array_agg(indexname) AS duplicate_indexes,
-  pg_size_pretty(sum(pg_relation_size((schemaname || '.' || indexname)::regclass))) AS total_size
+  pg_size_pretty(sum(pg_relation_size(format('%I.%I', schemaname, indexname)::regclass))) AS total_size
 FROM pg_indexes
 WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
 GROUP BY schemaname, tablename,
