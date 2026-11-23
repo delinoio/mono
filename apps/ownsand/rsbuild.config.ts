@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 import { defineConfig } from "@rsbuild/core";
 import { pluginReact } from "@rsbuild/plugin-react";
-import { normalizeMockFlag, readConsoleConfig } from "./src/config.ts";
+import { normalizeMockFlag } from "./src/config.ts";
+import { pluginConsoleConfig } from "./src/config-plugin.ts";
 
-// Fail the build and the dev server early when the configuration is not
-// valid, and refuse the mock API in a production build. The Rsbuild CLI
-// loads `.env*` files into `process.env` before this file;
-// `src/build-config.ts` inlines the same values into the client bundle.
-readConsoleConfig(process.env, {
-  production: process.env.NODE_ENV === "production",
-});
-
+// `pluginConsoleConfig` fails the build and the dev server early when the
+// configuration is not valid, and refuses the mock API in a build whose
+// resolved mode is production. The Rsbuild CLI loads `.env*` files into
+// `process.env` before this file; `src/build-config.ts` inlines the same
+// values into the client bundle.
 export default defineConfig({
-  plugins: [pluginReact()],
+  plugins: [pluginConsoleConfig(process.env), pluginReact()],
   source: {
     define: {
       // Always inline the mock setting, also when it is unset, so the
