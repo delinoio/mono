@@ -5,12 +5,19 @@
 // - the SDK logs nothing by default, so sources do not call `console`;
 // - the SDK never imports code from `servers/`.
 import { readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // URL.pathname is a URL path (percent-encoded, with a leading slash before a
 // Windows drive letter), not a filesystem path, so convert the file URL.
-const root = fileURLToPath(new URL("../src/", import.meta.url));
+// An optional first argument replaces the default source root so that tests
+// can lint fixture trees.
+const root = process.argv[2]
+  ? resolve(process.argv[2])
+  : fileURLToPath(new URL("../src/", import.meta.url));
+// The header line ends in LF or CRLF: a checkout with `core.autocrlf=true`
+// converts every source to CRLF.
+const spdxHeader = /^\/\/ SPDX-License-Identifier: Apache-2\.0\r?\n/;
 const failures = [];
 
 function walk(dir) {
@@ -27,7 +34,7 @@ function walk(dir) {
 function check(path) {
   const name = relative(root, path);
   const source = readFileSync(path, "utf8");
-  if (!source.startsWith("// SPDX-License-Identifier: Apache-2.0\n")) {
+  if (!spdxHeader.test(source)) {
     failures.push(`${name}: missing the Apache-2.0 SPDX header`);
   }
   if (!name.endsWith(".test.ts") && /\bconsole\s*\./.test(source)) {
