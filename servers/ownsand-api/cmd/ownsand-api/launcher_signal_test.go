@@ -258,6 +258,10 @@ func startLauncher(t *testing.T, databaseURL string, port int) *launcherProc {
 		"DATABASE_URL="+databaseURL,
 		"LOGTO_ISSUER=http://127.0.0.1:9/oidc",
 		"STUN_ADDR=127.0.0.1:0",
+		// An empty value turns the metrics listener off, so a METRICS_ADDR
+		// of a running local dev server in the parent environment cannot
+		// make the launched server fail to bind it.
+		"METRICS_ADDR=",
 		// The test asserts the INFO server_shutdown_completed record, so it
 		// must not inherit a LOG_LEVEL of warn or error from the parent.
 		"LOG_LEVEL=info",

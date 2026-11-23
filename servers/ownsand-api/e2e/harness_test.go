@@ -673,6 +673,13 @@ func (s *stack) startAPI(env []string) {
 			"ADDR=" + addr,
 			"STUN_ADDR=" + stunAddr,
 			"STUN_URLS=stun:" + stunAddr,
+			// No e2e test reads /metrics, and the process inherits the
+			// environment of the test run: a METRICS_ADDR of a running
+			// local dev server would make the control plane fail to bind
+			// it on every attempt. An empty value turns the listener off
+			// (exec keeps the last value of a duplicate key). A fixture
+			// that needs metrics can set its own METRICS_ADDR in env.
+			"METRICS_ADDR=",
 		}, env...)
 		name := "api"
 		if attempt > 1 {
