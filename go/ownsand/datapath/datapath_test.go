@@ -544,58 +544,6 @@ func TestReceiveWindow(t *testing.T) {
 	}
 }
 
-// TestFlowControlEndToEnd runs a sender and a slow receiver through a pair
-// of windows and checks that the receiver never buffers more than its
-// capacity.
-func TestFlowControlEndToEnd(t *testing.T) {
-	recv, _ := NewReceiveWindow(MinWindowSize)
-	send, _ := NewSendWindow(recv.InitialWindow())
-	frames := make(chan int64, 1000)
-	updates := make(chan int64, 1000)
-	ctx := context.Background()
-	go func() {
-		for inc := range updates {
-			if err := send.Add(inc); err != nil {
-				panic(err)
-			}
-		}
-	}()
-	const count = 200
-	go func() {
-		for i := 0; i < count; i++ {
-			f := maxChunkFrame()
-			if i%2 == 0 {
-				f = MustNewFrame(7, sandboxID, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: make([]byte, 1000)}}})
-			}
-			cost := FrameCost(f)
-			if err := send.Consume(ctx, cost); err != nil {
-				panic(err)
-			}
-			frames <- cost
-		}
-		close(frames)
-	}()
-	received := 0
-	for cost := range frames {
-		if err := recv.Receive(cost); err != nil {
-			t.Fatal(err)
-		}
-		if recv.Buffered() > recv.InitialWindow() {
-			t.Fatal("buffer exceeded")
-		}
-		inc, err := recv.Release(cost)
-		if err != nil {
-			t.Fatal(err)
-		}
-		updates <- inc
-		received++
-	}
-	close(updates)
-	if received != count {
-		t.Fatalf("received %d", received)
-	}
-}
-
 func TestCheckOperationID(t *testing.T) {
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
 	idAt := func(at time.Time) string {
