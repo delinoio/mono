@@ -3310,7 +3310,15 @@ const caddyImage = `caddy:2.11.9@sha256:${"c".repeat(64)}`;
 //                 fails (for example `start`).
 //   STUB_NO_IMAGE set when the pinned image is not local: `docker image
 //                 inspect` fails, as for an image that was never pulled.
-function runCaddy(t, { inspect, fail, noImage, args } = {}) {
+//   STUB_STATE    the container state that the readiness check reads
+//                 (default `running`); STUB_STATE_GONE makes that read fail.
+//   STUB_WGET_FAILS  the number of readiness probes that fail before one
+//                 succeeds, or `always`.
+// The readiness wait runs with a short deadline and interval.
+function runCaddy(
+  t,
+  { inspect, fail, noImage, args, state, gone, wgetFails, env: extra } = {},
+) {
   const dir = scratch(t);
   const bin = join(dir, "bin");
   mkdirSync(bin);
@@ -3323,9 +3331,26 @@ function runCaddy(t, { inspect, fail, noImage, args } = {}) {
   exit 1
 fi
 case "$1" in
-  inspect) [[ -n "\${STUB_INSPECT:-}" ]] && echo "$STUB_INSPECT" || exit 1 ;;
+  inspect)
+    if [[ "$3" == "{{.State.Status}}" ]]; then
+      [[ -z "\${STUB_STATE_GONE:-}" ]] || { echo "Error: No such object: caddy" >&2; exit 1; }
+      echo "\${STUB_STATE:-running}"
+    else
+      [[ -n "\${STUB_INSPECT:-}" ]] && echo "$STUB_INSPECT" || exit 1
+    fi
+    ;;
   image)
     if [[ "$2" == "inspect" && -n "\${STUB_NO_IMAGE:-}" ]]; then exit 1; fi
+    ;;
+  exec)
+    if [[ "$*" == *wget* ]]; then
+      count="$(cat "$STUB_DIR/wget.count" 2> /dev/null || echo 0)"
+      echo $((count + 1)) > "$STUB_DIR/wget.count"
+      if [[ "\${STUB_WGET_FAILS:-0}" == always ]] || (( count < \${STUB_WGET_FAILS:-0} )); then
+        echo "wget: can't connect to remote host" >&2
+        exit 1
+      fi
+    fi
     ;;
 esac`,
   );
@@ -3334,6 +3359,12 @@ esac`,
   if (inspect !== undefined) env.STUB_INSPECT = inspect;
   if (fail !== undefined) env.STUB_FAIL = fail;
   if (noImage) env.STUB_NO_IMAGE = "1";
+  if (state !== undefined) env.STUB_STATE = state;
+  if (gone) env.STUB_STATE_GONE = "1";
+  if (wgetFails !== undefined) env.STUB_WGET_FAILS = String(wgetFails);
+  env.START_CADDY_READY_TIMEOUT = "2";
+  env.START_CADDY_READY_INTERVAL = "0.1";
+  Object.assign(env, extra);
   const result = spawnSync(
     "bash",
     [startCaddy, ...(args ?? [caddyImage, "/srv/delino", "delino"])],
@@ -3351,6 +3382,9 @@ esac`,
 const caddyRun = `docker run --detach --name caddy --network delino --restart unless-stopped --publish 80:80 --publish 443:443 --publish 443:443/udp --volume /srv/delino/caddy:/etc/caddy:ro --volume caddy-data:/data --volume caddy-config:/config ${caddyImage}`;
 const caddyInspect =
   "docker inspect --format {{.Config.Image}} {{.State.Running}} caddy";
+const caddyState = "docker inspect --format {{.State.Status}} caddy";
+const caddyProbe =
+  "docker exec caddy wget -q -T 2 -O /dev/null http://127.0.0.1:2019/config/";
 const caddyImageInspect = `docker image inspect ${caddyImage}`;
 const caddyPull = `docker pull ${caddyImage}`;
 const caddyReload =
@@ -3364,6 +3398,8 @@ test("start-caddy creates a missing container", { skip }, (t) => {
     caddyImageInspect,
     "docker rm --force caddy",
     caddyRun,
+    caddyState,
+    caddyProbe,
   ]);
 });
 
@@ -3376,7 +3412,12 @@ test("start-caddy reloads a running container", { skip }, (t) => {
 test("start-caddy starts a stopped container", { skip }, (t) => {
   const result = runCaddy(t, { inspect: `${caddyImage} false` });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(result.calls, [caddyInspect, "docker start caddy"]);
+  assert.deepEqual(result.calls, [
+    caddyInspect,
+    "docker start caddy",
+    caddyState,
+    caddyProbe,
+  ]);
 });
 
 test("start-caddy recreates a container with another image", { skip }, (t) => {
@@ -3387,7 +3428,14 @@ test("start-caddy recreates a container with another image", { skip }, (t) => {
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(
       result.calls,
-      [caddyInspect, caddyImageInspect, "docker rm --force caddy", caddyRun],
+      [
+        caddyInspect,
+        caddyImageInspect,
+        "docker rm --force caddy",
+        caddyRun,
+        caddyState,
+        caddyProbe,
+      ],
       running,
     );
   }
@@ -3413,6 +3461,8 @@ test(
           caddyPull,
           "docker rm --force caddy",
           caddyRun,
+          caddyState,
+          caddyProbe,
         ],
         String(inspect),
       );
@@ -3644,3 +3694,95 @@ test(
     assert.deepEqual(result.calls, []);
   },
 );
+
+test("start-caddy waits until Caddy answers its admin API", { skip }, (t) => {
+  for (const inspect of [undefined, `${caddyImage} false`]) {
+    const result = runCaddy(t, { inspect, wgetFails: 2 });
+    const label = String(inspect);
+    assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+    const probes = result.calls.filter((call) => call === caddyProbe);
+    assert.equal(probes.length, 3, label);
+    assert.equal(
+      result.calls.filter((call) => call === caddyState).length,
+      3,
+      label,
+    );
+  }
+});
+
+test(
+  "start-caddy fails at once for a container that is not running",
+  {
+    skip,
+  },
+  (t) => {
+    for (const inspect of [undefined, `${caddyImage} false`]) {
+      for (const state of ["exited", "dead", "restarting"]) {
+        const result = runCaddy(t, { inspect, state });
+        const label = `${inspect} ${state}`;
+        assert.notEqual(result.status, 0, label);
+        assert.match(result.stderr, new RegExp(`container is ${state}`), label);
+        assert.match(result.stderr, /docker logs caddy/, label);
+        assert.deepEqual(
+          result.calls.filter((call) => call === caddyProbe),
+          [],
+          label,
+        );
+        assert.equal(
+          result.calls.filter((call) => call === caddyState).length,
+          1,
+          label,
+        );
+      }
+    }
+  },
+);
+
+test("start-caddy fails when Caddy never answers", { skip }, (t) => {
+  for (const inspect of [undefined, `${caddyImage} false`]) {
+    const result = runCaddy(t, { inspect, wgetFails: "always" });
+    const label = String(inspect);
+    assert.notEqual(result.status, 0, label);
+    assert.match(result.stderr, /did not answer its admin API/, label);
+    assert.match(result.stderr, /within 2 seconds/, label);
+    assert.match(result.stderr, /container state is running/, label);
+    assert.match(result.stderr, /docker logs caddy/, label);
+    const probes = result.calls.filter((call) => call === caddyProbe).length;
+    // The deadline bounds the attempts: at least two, far below an
+    // unbounded loop.
+    assert.ok(probes >= 2 && probes <= 60, `${label}: ${probes} probes`);
+  }
+});
+
+test("start-caddy fails when the container disappears", { skip }, (t) => {
+  const result = runCaddy(t, { gone: true });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /cannot read the state of the caddy container/);
+  assert.match(result.stderr, /docker logs caddy/);
+  assert.deepEqual(
+    result.calls.filter((call) => call === caddyProbe),
+    [],
+  );
+});
+
+test("start-caddy does not wait on the reload path", { skip }, (t) => {
+  const result = runCaddy(t, {
+    inspect: `${caddyImage} true`,
+    state: "exited",
+    wgetFails: "always",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, [caddyInspect, caddyReload]);
+});
+
+test("start-caddy rejects a bad readiness setting", { skip }, (t) => {
+  for (const env of [
+    { START_CADDY_READY_TIMEOUT: "soon" },
+    { START_CADDY_READY_INTERVAL: "-1" },
+  ]) {
+    const result = runCaddy(t, { env });
+    assert.equal(result.status, 2, JSON.stringify(env));
+    assert.match(result.stderr, /START_CADDY_READY_TIMEOUT/);
+    assert.deepEqual(result.calls, []);
+  }
+});

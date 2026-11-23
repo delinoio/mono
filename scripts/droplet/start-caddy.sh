@@ -27,6 +27,23 @@
 #     started container reads the Caddyfile that `provision.sh` just wrote.
 #   - The container uses the pinned image and is running: reload the
 #     configuration without recreating it.
+# After the create and start paths the script waits until the new Caddy
+# process answers its admin API, because a successful `docker run` or
+# `docker start` only means that Docker accepted the start: Caddy can still
+# fail to load the Caddyfile or an imported route file and exit. The probe
+# runs `wget` inside the container against http://127.0.0.1:2019/config/ (the
+# loopback admin endpoint in the container's network namespace, so no port is
+# published) and discards the body. Each attempt first reads the container
+# state; a container that is exited, dead or restarting fails the script at
+# once, and so does a container that does not answer within 30 seconds. The
+# failure message names the state and points to `docker logs caddy`. The
+# reload path does not wait: the running process already answered and
+# `caddy reload` validates the new configuration itself.
+#
+# Environment (optional, for tests and slow hosts):
+#   START_CADDY_READY_TIMEOUT   seconds to wait for the admin API; default 30.
+#   START_CADDY_READY_INTERVAL  seconds between attempts; default 1.
+#
 # A failing `docker pull`, `docker run`, `docker start` or `docker exec` fails
 # the script with the Docker diagnostic on standard error.
 set -euo pipefail
@@ -43,6 +60,53 @@ fi
 caddy_image="$1"
 root="$2"
 network="$3"
+ready_timeout="${START_CADDY_READY_TIMEOUT:-30}"
+ready_interval="${START_CADDY_READY_INTERVAL:-1}"
+if [[ ! "$ready_timeout" =~ ^[0-9]+$ ]] || [[ ! "$ready_interval" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "error: START_CADDY_READY_TIMEOUT and START_CADDY_READY_INTERVAL must be numbers of seconds." >&2
+  exit 2
+fi
+
+# Waits until the Caddy process of the `caddy` container answers its admin
+# API. Returns non-zero with a diagnostic when the container is not running
+# (exited, dead, restarting and so on) or does not answer before the deadline.
+wait_ready() {
+  local deadline=$((SECONDS + ready_timeout))
+  local state attempts=0
+  # `timeout` bounds one attempt when `docker exec` itself hangs; `wget -T`
+  # bounds the HTTP request. Without `timeout` only the latter applies.
+  local -a bound=()
+  if command -v timeout > /dev/null 2>&1; then
+    bound=(timeout 10)
+  fi
+  while :; do
+    if ! state="$(docker inspect --format '{{.State.Status}}' caddy 2>&1)"; then
+      echo "error: cannot read the state of the caddy container: $state" >&2
+      echo "Run \`docker logs caddy\` and \`docker ps --all\` for details." >&2
+      return 1
+    fi
+    case "$state" in
+      running)
+        attempts=$((attempts + 1))
+        if "${bound[@]}" docker exec caddy wget -q -T 2 -O /dev/null http://127.0.0.1:2019/config/ > /dev/null 2>&1; then
+          return 0
+        fi
+        ;;
+      created) ;;
+      *)
+        echo "error: the caddy container is $state, not running; Caddy exited before it answered its admin API." >&2
+        echo "Run \`docker logs caddy\` to see why Caddy stopped (for example an invalid Caddyfile or route file)." >&2
+        return 1
+        ;;
+    esac
+    if (( SECONDS >= deadline )); then
+      echo "error: Caddy did not answer its admin API (http://127.0.0.1:2019/config/) within ${ready_timeout} seconds; the container state is $state after $attempts probe attempts." >&2
+      echo "Run \`docker logs caddy\` to see why Caddy is not ready." >&2
+      return 1
+    fi
+    sleep "$ready_interval"
+  done
+}
 
 # A missing container makes `docker inspect` fail, which leaves both values
 # empty and selects the create path below.
@@ -68,8 +132,10 @@ if [[ "$current_image" != "$caddy_image" ]]; then
     --volume caddy-data:/data \
     --volume caddy-config:/config \
     "$caddy_image"
+  wait_ready
 elif [[ "$running" != "true" ]]; then
   docker start caddy
+  wait_ready
 else
   docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 fi

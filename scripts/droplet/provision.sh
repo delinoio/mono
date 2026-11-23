@@ -18,7 +18,9 @@
 #   - brings the Caddy reverse proxy to the running state with
 #     start-caddy.sh: it creates the container, starts a stopped one, or
 #     reloads a running one, and recreates it only when the pinned image
-#     changes. Caddy terminates TLS for every server host name with
+#     changes. After a create or a start it waits until Caddy answers its
+#     admin API, so a Caddy that exited on a bad configuration fails the
+#     script. Caddy terminates TLS for every server host name with
 #     automatic Let's Encrypt certificates.
 #
 # It does not configure the DigitalOcean Cloud Firewall, the registry login
@@ -125,6 +127,9 @@ log "Start the Caddy reverse proxy"
 # image, starts a stopped one that has the pinned image and reloads a running
 # one that has it. The container is recreated only when its image changed, so
 # the certificates in the `caddy-data` volume and the open connections stay.
+# After a create or a start the helper waits until Caddy answers its local
+# admin API and fails when Caddy exited or does not answer within 30 seconds;
+# `set -e` then ends this script before the `Done` message.
 # The helper is resolved from this script, so provisioning works from any
 # current directory.
 "$(dirname "${BASH_SOURCE[0]}")/start-caddy.sh" "$caddy_image" "$root" "$network"
