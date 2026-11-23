@@ -334,33 +334,69 @@ func TestWaitSandboxCancelledWaiterLeavesOtherWaiter(t *testing.T) {
 	req := func() *connect.Request[ownsandv1.DeleteSandboxRequest] {
 		return connect.NewRequest(&ownsandv1.DeleteSandboxRequest{OrganizationId: org.ID, SandboxId: id})
 	}
-	cancelCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	firstDone := make(chan error, 1)
-	go func() { _, err := c.Sandbox.DeleteSandbox(cancelCtx, req()); firstDone <- err }()
+	// The service also polls the row once a second, so a one-second bound alone
+	// cannot tell a notification wake from a poll wake. The poll ticker of a
+	// waiter starts after the waiter's call starts, so no poll wake can come
+	// earlier than one poll period after the call started. A call that returns
+	// sooner was therefore woken by the change notification. The attempt is
+	// abandoned and repeated, without having changed the sandbox, when the
+	// fixture needs too long to reach the point where the update is sent; a slow
+	// runner then costs retries and not a false result.
+	const (
+		pollPeriod = time.Second            // fixed in Service.waitSandbox
+		sendBudget = 300 * time.Millisecond // latest start of the update, after the call started
+		attempts   = 20
+	)
 	type result struct {
-		resp *connect.Response[ownsandv1.DeleteSandboxResponse]
-		err  error
+		resp    *connect.Response[ownsandv1.DeleteSandboxResponse]
+		err     error
+		elapsed time.Duration
 	}
-	secondDone := make(chan result, 1)
-	go func() { r, err := c.Sandbox.DeleteSandbox(ctx, req()); secondDone <- result{r, err} }()
-	testenv.Eventually(t, "two watchers", func() bool { return env.App.Service.WatcherCount() == 2 })
-	cancel()
-	if err := <-firstDone; err == nil {
-		t.Fatal("cancelled delete succeeded")
-	}
-	testenv.Eventually(t, "one watcher", func() bool { return env.App.Service.WatcherCount() == 1 })
-	deleted := agent.SetSandbox(id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER)
-	agent.SendUpdate(deleted)
-	select {
-	case r := <-secondDone:
-		if r.err != nil || r.resp.Msg.GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
-			t.Fatalf("second delete: %v %v", r.resp, r.err)
+	for attempt := 1; attempt <= attempts; attempt++ {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		secondCtx, cancelSecond := context.WithCancel(ctx)
+		firstDone := make(chan error, 1)
+		go func() { _, err := c.Sandbox.DeleteSandbox(cancelCtx, req()); firstDone <- err }()
+		secondDone := make(chan result, 1)
+		t0 := time.Now()
+		go func() {
+			r, err := c.Sandbox.DeleteSandbox(secondCtx, req())
+			secondDone <- result{r, err, time.Since(t0)}
+		}()
+		testenv.Eventually(t, "two watchers", func() bool { return env.App.Service.WatcherCount() == 2 })
+		cancel()
+		if err := <-firstDone; err == nil {
+			t.Fatal("cancelled delete succeeded")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("second waiter was not woken")
+		testenv.Eventually(t, "one watcher", func() bool { return env.App.Service.WatcherCount() == 1 })
+		if since := time.Since(t0); since > sendBudget {
+			t.Logf("attempt %d: fixture needed %v before the update, over %v; repeating", attempt, since, sendBudget)
+			cancelSecond()
+			if r := <-secondDone; r.err == nil {
+				t.Fatal("abandoned delete succeeded without an update")
+			}
+			testenv.Eventually(t, "no watchers", func() bool { return env.App.Service.WatcherCount() == 0 })
+			continue
+		}
+		deleted := agent.SetSandbox(id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER)
+		agent.SendUpdate(deleted)
+		select {
+		case r := <-secondDone:
+			if r.err != nil || r.resp.Msg.GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+				t.Fatalf("second delete: %v %v", r.resp, r.err)
+			}
+			if r.elapsed >= pollPeriod {
+				t.Fatalf("second delete returned after %v, not before the first poll at %v after it started: it was not woken by the change notification", r.elapsed, pollPeriod)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("second waiter was not woken")
+		}
+		cancelSecond()
+		cancel()
+		testenv.Eventually(t, "no watchers", func() bool { return env.App.Service.WatcherCount() == 0 })
+		return
 	}
-	testenv.Eventually(t, "no watchers", func() bool { return env.App.Service.WatcherCount() == 0 })
+	t.Fatalf("the fixture never reached the update within %v of the second call in %d attempts", sendBudget, attempts)
 }
 
 func TestRevisionRuleAndAbsorbingStates(t *testing.T) {
