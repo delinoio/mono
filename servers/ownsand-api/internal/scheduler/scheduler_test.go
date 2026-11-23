@@ -396,3 +396,86 @@ func TestOutboundNetworkCheck(t *testing.T) {
 		t.Fatalf("another failed check: %v", err)
 	}
 }
+
+// macSnapshot is an exported macOS snapshot that mac "holder" took.
+func macSnapshot(exported bool) *Snapshot {
+	return &Snapshot{ID: "s", DeviceID: "holder", Exported: exported, HostOS: ownsandv1.HostOs_HOST_OS_MACOS, Arch: ownsandv1.Arch_ARCH_ARM64,
+		GuestOS: ownsandv1.GuestOs_GUEST_OS_MACOS, MacOSHardwareModel: []byte("model-b")}
+}
+
+func macSnapshotRequest(s *Snapshot) Request {
+	return Request{VCPUCount: 4, MemoryMiB: 8192, DiskGiB: 80, GuestOS: ownsandv1.GuestOs_GUEST_OS_MACOS, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE, Snapshot: s}
+}
+
+// TestMacOSSnapshotUnknownModel checks that a destination that omits the
+// hardware model of an exported macOS snapshot is unknown, not unsupported:
+// it is eligible and imports first, an automatic placement prefers a device
+// that reports the model, and a device that holds the snapshot keeps the
+// membership rule.
+func TestMacOSSnapshotUnknownModel(t *testing.T) {
+	snap := macSnapshot(true)
+	req := macSnapshotRequest(snap)
+	holder := macDevice("holder") // holds the snapshot and lists model-a only
+	unknown := macDevice("a-unknown")
+	reporting := macDevice("b-reporting")
+	reporting.Capabilities.MacosHardwareModels = [][]byte{[]byte("model-a"), []byte("model-b")}
+
+	// An explicit destination that omits the model is eligible and imports.
+	pinned := req
+	pinned.DeviceID = "a-unknown"
+	dec, err := Place(pinned, []Device{holder, unknown, reporting}, now)
+	if err != nil || dec.DeviceID != "a-unknown" || !dec.NeedsImport {
+		t.Fatalf("explicit unknown device = %+v, %v", dec, err)
+	}
+
+	// The unknown device has the lowest load and the lowest ID, and still
+	// loses to a device that reports support.
+	reporting.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: 8, MemoryMib: 16384, DiskGib: 160}
+	dec, err = Place(req, []Device{unknown, reporting}, now)
+	if err != nil || dec.DeviceID != "b-reporting" || !dec.NeedsImport {
+		t.Fatalf("preference for the reporting device = %+v, %v", dec, err)
+	}
+
+	// Without a qualifying device, unknown devices run it, ranked by load
+	// and then by ID.
+	other := macDevice("c-unknown")
+	other.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: 2}
+	unknown.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: 4}
+	dec, err = Place(req, []Device{unknown, other}, now)
+	if err != nil || dec.DeviceID != "c-unknown" || !dec.NeedsImport {
+		t.Fatalf("unknown devices only = %+v, %v", dec, err)
+	}
+	// A transient condition on the reporting device leaves the unknown device.
+	busy := reporting
+	busy.Online = false
+	dec, err = Place(req, []Device{busy, unknown}, now)
+	if err != nil || dec.DeviceID != "a-unknown" {
+		t.Fatalf("reporting device offline = %+v, %v", dec, err)
+	}
+
+	// The device that holds the snapshot keeps the membership rule: it
+	// lists model-a only, so it is a permanent mismatch for model-b.
+	local := req
+	local.DeviceID = "holder"
+	if _, err := Place(local, []Device{holder}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("holder without the model: %v", err)
+	}
+	// So does a device with an imported copy.
+	copied := macSnapshot(true)
+	copied.CopyDeviceIDs = []string{"a-unknown"}
+	if _, err := Place(macSnapshotRequest(copied), []Device{unknown}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("copy holder without the model: %v", err)
+	}
+
+	// An unexported snapshot runs only where it is, and a request without
+	// a model has no unknown devices.
+	if _, err := Place(macSnapshotRequest(macSnapshot(false)), []Device{unknown}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("unexported snapshot on another device: %v", err)
+	}
+	noModel := macSnapshot(true)
+	noModel.MacOSHardwareModel = nil
+	dec, err = Place(macSnapshotRequest(noModel), []Device{unknown, reporting}, now)
+	if err != nil || dec.DeviceID != "a-unknown" {
+		t.Fatalf("snapshot without a model = %+v, %v", dec, err)
+	}
+}
