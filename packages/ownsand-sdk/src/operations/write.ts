@@ -298,15 +298,26 @@ async function sendChunk(
   signal: AbortSignal | undefined,
 ): Promise<WriteFileResponse> {
   const window = new RecoveryWindow(ctx.clock);
+  // The failure that started or last extended the recovery window. A retry
+  // that finds the window used up after the back-off sleep, the transport
+  // selection or the grant acquisition ends with it instead of sending.
+  let lastFailure: unknown;
+  const throwIfWindowUsedUp = (): void => {
+    if (window.active && window.remainingMs() <= 0) {
+      throw lastFailure;
+    }
+  };
   for (;;) {
     throwIfAborted(signal);
     const session = await selector.select(signal);
     let failure: unknown;
     if (session !== undefined) {
+      throwIfWindowUsedUp();
       try {
         return await session.writeFile(request, signal);
       } catch (error) {
         failure = error;
+        lastFailure = error;
       }
       throwIfAborted(signal);
       if (failure instanceof SessionEndedError) {
@@ -326,6 +337,9 @@ async function sendChunk(
       signal,
       window.active ? window : undefined,
     );
+    // A kept grant is returned without consulting the budget, and a back-off
+    // sleep can wake late: no WriteFile starts after the window ran out.
+    throwIfWindowUsedUp();
     grants.streamStarted();
     try {
       return await relayCallWithDeadline(
@@ -337,6 +351,7 @@ async function sendChunk(
       );
     } catch (error) {
       failure = error;
+      lastFailure = error;
     } finally {
       grants.streamEnded();
     }
@@ -345,6 +360,7 @@ async function sendChunk(
     // which the write_id rules make safe. The grant decision and the
     // recovery rules must see the same (wrapped) failure.
     const retryable = asRetryableDeadline(failure);
+    lastFailure = retryable;
     grants.discardFor(retryable);
     await recoverOrThrow(ctx, window, retryable, signal);
   }
