@@ -564,6 +564,65 @@ func (m *Manager) LockSnapshotImport(ctx context.Context, id string) (func(), er
 	}, nil
 }
 
+// errImportRefusedRemoving is the refusal of a snapshot import once the
+// device removal started.
+func errImportRefusedRemoving() *CommandError {
+	return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the device is being removed; snapshot imports are refused")
+}
+
+// BeginSnapshotImport registers a snapshot import with the device-removal
+// fence before the import changes any snapshot directory. It refuses with
+// FAILED_PRECONDITION once RemoveAll started. The caller calls the returned
+// function after its last snapshot write, including the removal of partial
+// content. RemoveAll waits for every registered import, so that an import
+// either published before the removal (and the removal deletes it) or is
+// refused and writes nothing.
+func (m *Manager) BeginSnapshotImport() (func(), error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.removing {
+		return nil, errImportRefusedRemoving()
+	}
+	m.imports++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			m.imports--
+			if m.imports == 0 && m.importsDrained != nil {
+				close(m.importsDrained)
+				m.importsDrained = nil
+			}
+		})
+	}, nil
+}
+
+// fenceSnapshotImports sets the device-removal fence and waits until the
+// registered snapshot imports ended. The wait ends with ctx; the fence stays
+// set then, and the retry of the removal waits again. The imports end
+// promptly because the removal cancels the channel context of their
+// commands.
+func (m *Manager) fenceSnapshotImports(ctx context.Context) error {
+	m.mu.Lock()
+	m.removing = true
+	if m.imports == 0 {
+		m.mu.Unlock()
+		return nil
+	}
+	if m.importsDrained == nil {
+		m.importsDrained = make(chan struct{})
+	}
+	drained := m.importsDrained
+	m.mu.Unlock()
+	select {
+	case <-drained:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // ImportDir returns the snapshot directory that an import fills; its
 // content goes into the "content" subdirectory.
 func (m *Manager) ImportDir(id string) (string, error) {
@@ -571,7 +630,10 @@ func (m *Manager) ImportDir(id string) (string, error) {
 }
 
 // AddImportedSnapshot records an imported snapshot as ready after its
-// content was verified and extracted into ImportDir(id)/content.
+// content was verified and extracted into ImportDir(id)/content. It refuses
+// once the device removal started: the check, the save and the insert run
+// under mu, so that no record is written after the removal fenced the
+// imports. The caller removes the content of a refused import.
 func (m *Manager) AddImportedSnapshot(entry *ownsandv1.SnapshotStateEntry) (*ownsandv1.SnapshotStateEntry, error) {
 	dir, err := m.st.SnapshotDir(entry.GetSnapshotId())
 	if err != nil {
@@ -590,12 +652,15 @@ func (m *Manager) AddImportedSnapshot(entry *ownsandv1.SnapshotStateEntry) (*own
 		SizeBytes:          entry.GetSizeBytes(),
 		MacOSHardwareModel: entry.GetMacosHardwareModel(),
 	}}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.removing {
+		return nil, errImportRefusedRemoving()
+	}
 	if err := m.st.SaveSnapshot(snap.rec.SnapshotID, snap.rec); err != nil {
 		return nil, fmt.Errorf("sandboxes: save imported snapshot: %w", err)
 	}
-	m.mu.Lock()
 	m.snapshots[snap.rec.SnapshotID] = snap
-	m.mu.Unlock()
 	return snap.entry(), nil
 }
 

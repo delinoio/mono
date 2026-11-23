@@ -231,6 +231,17 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, Message: err.Error()}
 	}
 	snapshotID := entry.GetSnapshotId()
+	// Register with the device-removal fence before any lock wait, transfer
+	// write or directory change. The device removal waits for the registered
+	// imports before it wipes the local data and refuses new ones, so that
+	// no import creates snapshot metadata or directories after the wipe. The
+	// registration ends last, after the deferred cleanup of partial content.
+	endRemovalFence, err := a.Sandboxes.BeginSnapshotImport()
+	if err != nil {
+		a.logger.Warn("snapshot import refused", "snapshot_id", snapshotID, "error", err)
+		return nil, err
+	}
+	defer endRemovalFence()
 	unlock, err := a.Sandboxes.LockSnapshotImport(ctx, snapshotID)
 	if err != nil {
 		a.logger.Warn("snapshot import stopped while it waited for another import of the same snapshot", "snapshot_id", snapshotID, "error", err)
@@ -301,6 +312,9 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	if err := ctx.Err(); err != nil {
 		a.logger.Warn("snapshot import stopped before publication", "snapshot_id", snapshotID, "error", err)
 		return nil, err
+	}
+	if a.beforeSnapshotPublishHook != nil {
+		a.beforeSnapshotPublishHook()
 	}
 	e, err := a.Sandboxes.AddImportedSnapshot(entry)
 	if err != nil {

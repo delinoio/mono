@@ -129,12 +129,25 @@ type Manager struct {
 	// importLocks serializes the imports of one snapshot ID; see
 	// LockSnapshotImport.
 	importLocks map[string]*importLock
-	limits      *ownsandv1.DeviceLimits
-	reports     map[uint64]map[string]uint64
-	outbox      Outbox
-	execs       ExecTracker
-	gate        CreateGate
-	closed      bool
+	// removing is the device-removal fence: RemoveAll sets it before it
+	// waits for the running snapshot imports and wipes the local data, and
+	// nothing clears it, because the removal notice is final (a failed
+	// removal retries in the same process or after a restart that sets the
+	// fence again). While it is set, BeginSnapshotImport and
+	// AddImportedSnapshot refuse, so that no import creates snapshot
+	// metadata or directories after the wipe. imports counts the imports
+	// that passed BeginSnapshotImport and did not end; importsDrained is
+	// closed (and cleared) when the count reaches zero while a RemoveAll
+	// waits for it.
+	removing       bool
+	imports        int
+	importsDrained chan struct{}
+	limits         *ownsandv1.DeviceLimits
+	reports        map[uint64]map[string]uint64
+	outbox         Outbox
+	execs          ExecTracker
+	gate           CreateGate
+	closed         bool
 	// cleanupPending holds the IDs of the sandboxes whose create failed in
 	// the runtime. The runtime reports a failed create as clean, but a
 	// runtime whose stop failed keeps the VM handle and files for a later
@@ -1329,6 +1342,9 @@ func (m *Manager) Entries() []*ownsandv1.SandboxStateEntry {
 // retry deletes the sandbox again; a retry after a complete clean-up is a
 // no-op.
 func (m *Manager) RemoveAll(ctx context.Context) error {
+	if err := m.fenceSnapshotImports(ctx); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	sbs := make([]*sandbox, 0, len(m.sandboxes))
 	for _, sb := range m.sandboxes {
