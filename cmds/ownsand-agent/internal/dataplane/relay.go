@@ -120,7 +120,13 @@ type rconn struct {
 	// flushDeadline bounds closeAfterFlush; zero uses Timing's default.
 	flushDeadline time.Duration
 	lastRecv      atomic.Int64
-	lastSend      atomic.Int64
+	// lastSend is the monotonic reading (see monotonicNow) of the last
+	// successful send, so a wall-clock step never changes when the
+	// keepalive is due. lastRecv still holds wall-clock Unix nanoseconds.
+	lastSend atomic.Int64
+	// clock replaces monotonicNow for this connection in tests; nil uses
+	// monotonicNow.
+	clock func() time.Duration
 	// probeFailed is set before an unanswered echo probe cancels the
 	// connection; only then does the loop dial again without back-off.
 	probeFailed atomic.Bool
@@ -510,9 +516,8 @@ func (r *relay) connectOnce(ch agent.Channel, openedAt *time.Time) (bool, error)
 	defer cancel()
 	c := &rconn{gen: ch.Generation(), out: make(chan *ownsandv1.DataFrame, 256), ctx: ctx, cancel: cancel, flushDeadline: r.d.timing.FlushDeadline,
 		streams: map[uint64]*rstream{}, kinds: map[ownsandv1.DataFrameKind]bool{}}
-	now := time.Now().UnixNano()
-	c.lastRecv.Store(now)
-	c.lastSend.Store(now)
+	c.lastRecv.Store(time.Now().UnixNano())
+	c.markSent()
 	// The channel can change while the credential is fetched. A
 	// connection of a replaced or closed channel would serve no grant, and
 	// channelLost closes only the installed connection, so the loop
@@ -564,7 +569,7 @@ func (r *relay) connectOnce(ch agent.Channel, openedAt *time.Time) (bool, error)
 					cancel()
 					return
 				}
-				c.lastSend.Store(time.Now().UnixNano())
+				c.markSent()
 			}
 		}
 	}()
@@ -662,18 +667,41 @@ func awaitTeardown(writerDone <-chan struct{}, recvErr <-chan error) {
 // connection, so a blocking keepalive enqueue would deadlock it. A
 // periodic keepalive that finds no free slot is skipped, because the
 // queued frames already show the connection is in use and the next tick
-// offers it again.
+// offers it again. The keepalive interval counts monotonic time since the
+// last successful send; only the receive timeout still reads the wall
+// clock through now.
 func (r *relay) watchdogTick(c *rconn, now time.Time) bool {
 	if now.Sub(time.Unix(0, c.lastRecv.Load())) >= r.d.timing.ReceiveTimeout {
 		return true
 	}
-	if now.Sub(time.Unix(0, c.lastSend.Load())) >= r.d.timing.KeepaliveInterval {
+	if c.sinceSend() >= r.d.timing.KeepaliveInterval {
 		if !c.tryEnqueue(keepaliveFrame(false)) {
 			r.d.logger.Debug("relay keepalive skipped because the outbound queue is full")
 		}
 	}
 	return false
 }
+
+// monotonicBase anchors monotonicNow. time.Now carries a monotonic reading,
+// and time.Since uses it, so the result ignores wall-clock steps.
+var monotonicBase = time.Now()
+
+// monotonicNow returns the monotonic time elapsed since the process
+// anchored monotonicBase.
+func monotonicNow() time.Duration { return time.Since(monotonicBase) }
+
+func (c *rconn) monoNow() time.Duration {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return monotonicNow()
+}
+
+// markSent records a successful send on the monotonic clock.
+func (c *rconn) markSent() { c.lastSend.Store(int64(c.monoNow())) }
+
+// sinceSend returns the monotonic time since the last successful send.
+func (c *rconn) sinceSend() time.Duration { return c.monoNow() - time.Duration(c.lastSend.Load()) }
 
 func keepaliveFrame(echo bool) *ownsandv1.DataFrame {
 	return &ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE,
