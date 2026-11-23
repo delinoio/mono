@@ -637,7 +637,12 @@ describe("long names", () => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${ACME}/snapshots`);
-    await screen.getByRole("button", "Make template").first().tap();
+    // The row button is named by its row ("Make template from snapshot ..."),
+    // so match the start of the name.
+    await screen
+      .getByRole("button", "Make template", { exact: false })
+      .first()
+      .tap();
     // The template name field takes the initial focus.
     await expect(screen.getByLabel("Template name")).toBeFocused();
     await browser.keyboard.type(LONG_NAME);
@@ -657,7 +662,7 @@ describe("long names", () => {
         .getByRole("listitem")
         .filter({ hasText: LONG_NAME })
         .last()
-        .getByRole("button", "Delete")
+        .getByRole("button", "Delete template", { exact: false })
         .tap();
       const dialog = screen.getByRole(
         "alertdialog",
@@ -682,10 +687,12 @@ describe("long names", () => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
     await browser.setViewport({ width: 390, height: 800 });
-    await app.open(`/orgs/${ACME}/snapshots`);
-    await screen.getByRole("button", "Delete").first().tap();
+    // The snapshot dialog title now carries the snapshot short ID and wraps at
+    // this width, so the device dialog stands for a short title.
+    await app.open(`/orgs/${ACME}/devices/${BUILD_BOX}`);
+    await screen.getByRole("button", "Remove device").tap();
     await expect(
-      screen.getByRole("alertdialog", "Delete this snapshot?"),
+      screen.getByRole("alertdialog", "Remove build-box-1?"),
     ).toBeVisible();
     const m = await measureDialog(browser);
     expect(m.titleHeight).toBeLessThanOrEqual(m.titleLineHeight * 1.5);
