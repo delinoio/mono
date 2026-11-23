@@ -19,10 +19,10 @@ const ext4IocResizeFS = 0x40086610
 const ext4SuperMagic = 0xEF53
 
 // growRoot grows a mounted ext4 root file system online to the size of its
-// block device. The runtimes enlarge a sandbox disk image to the requested
-// disk size without resizing its file system (macOS and Windows hosts have
-// no e2fsprogs), so the guest grows it at boot. It changes nothing when the
-// file system already fills the device.
+// block device. Every host runtime enlarges a sandbox disk image to the
+// requested disk size without resizing its file system (a host never runs a
+// file system tool on a guest-controlled image), so the guest grows it at
+// boot. It changes nothing when the file system already fills the device.
 func growRoot() error {
 	var fs unix.Statfs_t
 	if err := unix.Statfs("/", &fs); err != nil {
