@@ -33,7 +33,12 @@
 // with an unprivileged proxy). When WEB_ORIGIN is unset, empty or only ASCII
 // white space, invitation links point to https://accounts.delino.localhost. A
 // proxy on a custom PORTLESS_PORT adds that port to the URL; set CORS_ORIGINS
-// and WEB_ORIGIN to it there.
+// and WEB_ORIGIN to it there. On Windows, where environment variable names are
+// case-insensitive, an existing `cors_origins` or `Web_Origin` counts as the
+// setting: the launcher keeps a nonempty value and writes a default into that
+// same entry, so the server never receives a second spelling. On POSIX only the
+// exact uppercase names count and differently cased names stay distinct
+// variables.
 //
 // Child processes use explicit argument arrays and `shell: false` according to
 // the repository environment contract. Other configuration, standard streams
@@ -81,22 +86,67 @@ const isUnset = (value) =>
 // Windows-specific signal design.
 const ownProcessGroup = process.platform !== "win32";
 
+// Finds the entries of `name` (an uppercase variable name) in a plain copy of
+// the environment. A plain object compares keys exactly, but Windows treats
+// names that differ only by case as one variable and Node then keeps only one
+// spelling for the child, so a default added under the uppercase name could
+// replace an explicit lowercase value. POSIX keeps differently cased names
+// distinct.
+function envAliases(env, name, platform) {
+  const matches =
+    platform === "win32"
+      ? (key) => key.toUpperCase() === name
+      : (key) => key === name;
+  // Sorted like the entries that Node sorts before it builds the Windows
+  // environment block, so the choice below is the same on every run.
+  return Object.keys(env).filter(matches).sort();
+}
+
+// Applies `value` to `name` unless the environment already has a nonempty
+// value, and keeps exactly one entry for the setting. Mutates `env`.
+function applyEnvDefault(env, name, value, platform) {
+  const aliases = envAliases(env, name, platform);
+  const key =
+    aliases.find((alias) => !isUnset(env[alias])) ?? aliases[0] ?? name;
+  for (const alias of aliases) if (alias !== key) delete env[alias];
+  if (isUnset(env[key])) env[key] = value;
+}
+
+// Builds the environment of the build and the server: a copy of `baseEnv`
+// with the development defaults for the settings that are unset. Exported for
+// the launcher tests, which run it with both platform rules.
+export function resolveChildEnv(baseEnv, platform = process.platform) {
+  const env = { ...baseEnv };
+  applyEnvDefault(
+    env,
+    "CORS_ORIGINS",
+    [ProductionWebOrigin, ...DevelopmentWebOrigins].join(","),
+    platform,
+  );
+  applyEnvDefault(env, "WEB_ORIGIN", DevelopmentInvitationOrigin, platform);
+  return env;
+}
+
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const binaryName =
   process.platform === "win32" ? "accounts-api.exe" : "accounts-api";
 
 let received = null;
 let activeChild = null;
-const handlers = Object.values(ForwardedSignal).map((signal) => {
-  const handler = () => {
-    received ??= signal;
-    console.error(JSON.stringify({ event: "accounts_api_dev_signal", signal }));
-    // Between phases there is no child; the phase boundary checks `received`.
-    activeChild?.kill(signal);
-  };
-  process.on(signal, handler);
-  return [signal, handler];
-});
+function installSignalHandlers() {
+  return Object.values(ForwardedSignal).map((signal) => {
+    const handler = () => {
+      received ??= signal;
+      console.error(
+        JSON.stringify({ event: "accounts_api_dev_signal", signal }),
+      );
+      // Between phases there is no child; the phase boundary checks `received`.
+      activeChild?.kill(signal);
+    };
+    process.on(signal, handler);
+    return [signal, handler];
+  });
+}
 
 // Runs one child with inherited stdio and resolves with its exit status once
 // it has exited: its exit code, or the shell convention for a fatal signal.
@@ -136,13 +186,7 @@ async function main() {
     );
     return 0;
   }
-  const env = { ...process.env };
-  if (isUnset(env.CORS_ORIGINS)) {
-    env.CORS_ORIGINS = [ProductionWebOrigin, ...DevelopmentWebOrigins].join(
-      ",",
-    );
-  }
-  if (isUnset(env.WEB_ORIGIN)) env.WEB_ORIGIN = DevelopmentInvitationOrigin;
+  const env = resolveChildEnv(process.env);
   const buildDir = await mkdtemp(join(tmpdir(), "accounts-api-dev-"));
   try {
     // A signal during the `mkdtemp` await above found no child to forward to
@@ -171,13 +215,22 @@ async function main() {
   }
 }
 
-try {
-  process.exitCode = await main();
-} catch (error) {
-  console.error(
-    JSON.stringify({ event: "accounts_api_dev_failed", error: String(error) }),
-  );
-  process.exitCode = 1;
-} finally {
-  for (const [signal, handler] of handlers) process.off(signal, handler);
+// Run only when started as the entry point, so the launcher tests can import
+// the helpers above without starting a build. import.meta.main needs Node.js
+// 24.2 or later, as the launchers in scripts/dev do.
+if (import.meta.main) {
+  const handlers = installSignalHandlers();
+  try {
+    process.exitCode = await main();
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        event: "accounts_api_dev_failed",
+        error: String(error),
+      }),
+    );
+    process.exitCode = 1;
+  } finally {
+    for (const [signal, handler] of handlers) process.off(signal, handler);
+  }
 }
