@@ -125,6 +125,40 @@ func (r *FakeRelay) waitResumed() {
 	}
 }
 
+// observe records one received frame and updates the per-stream bookkeeping.
+// It returns the stream that the frame belongs to (nil when it is unknown or
+// retired), whether the frame opened the stream, whether it is the first
+// request frame of an active stream, and the channel that the caller closes to
+// wake the waiters of WaitFrame.
+//
+// A RelayStreamClose or error frame ends the stream, like the real agent,
+// which removes a stream when it finishes it. The fake then drops the stream
+// and its first-request bookkeeping, so a request frame that arrives later
+// does not reach OnRequest. The frame itself stays in the history.
+func (r *FakeRelay) observe(f *ownsandv1.DataFrame) (s *RelayStream, opened, first bool, ch chan struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.frames = append(r.frames, f)
+	ch = r.changed
+	r.changed = make(chan struct{})
+	id := f.GetStreamId()
+	s = r.streams[id]
+	switch {
+	case f.GetRelayStreamOpen() != nil:
+		s = &RelayStream{ID: id, GrantID: f.GetRelayStreamOpen().GetGrantId(), SandboxID: f.GetSandboxId(), relay: r}
+		r.streams[id] = s
+		opened = true
+	case f.GetRelayStreamClose() != nil || f.GetError() != nil:
+		delete(r.streams, id)
+		delete(r.received, id)
+		s = nil
+	case s != nil && datapath.IsRequestKind(f.GetKind()) && !r.received[id]:
+		r.received[id] = true
+		first = true
+	}
+	return s, opened, first, ch
+}
+
 func (r *FakeRelay) read() {
 	defer close(r.closed)
 	for {
@@ -134,23 +168,10 @@ func (r *FakeRelay) read() {
 			return
 		}
 		f := resp.GetFrame()
-		r.mu.Lock()
-		r.frames = append(r.frames, f)
-		ch := r.changed
-		r.changed = make(chan struct{})
-		s := r.streams[f.GetStreamId()]
-		first := false
-		if f.GetRelayStreamOpen() != nil {
-			s = &RelayStream{ID: f.GetStreamId(), GrantID: f.GetRelayStreamOpen().GetGrantId(), SandboxID: f.GetSandboxId(), relay: r}
-			r.streams[s.ID] = s
-		} else if s != nil && datapath.IsRequestKind(f.GetKind()) && !r.received[s.ID] {
-			r.received[s.ID] = true
-			first = true
-		}
-		r.mu.Unlock()
+		s, opened, first, ch := r.observe(f)
 		close(ch)
 		switch {
-		case f.GetRelayStreamOpen() != nil:
+		case opened:
 			r.SendFrame(datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RelayWindowUpdate{IncrementBytes: r.Window}))
 		case first:
 			r.mu.Lock()
