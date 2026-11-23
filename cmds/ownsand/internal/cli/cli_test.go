@@ -1335,17 +1335,19 @@ func TestInt32FlagBoundariesAreAccepted(t *testing.T) {
 	if res := r.run("org", "list", "--page-size", "2147483647"); res.code != 0 {
 		t.Fatalf("largest page size: %+v", res)
 	}
-	if res := r.run("sandbox", "create", "--image", "linux", "--idle-ttl", "10m", "--max-ttl", "1h", "--vcpu", "2147483647", "--memory", "512", "--disk", "5"); res.code != ExitUsage && res.code != 0 {
-		// The server (or SDK validation) may reject the huge count, but the
-		// value must reach the request unchanged and not wrap.
-		t.Logf("create with the largest vCPU: %+v", res)
+	// The SDK accepts any positive vCPU count and the fake server creates the
+	// sandbox, so the command must succeed and send exactly one request whose
+	// vCPU count is the largest int32 value, unwrapped.
+	if res := r.run("sandbox", "create", "--image", "linux", "--idle-ttl", "10m", "--max-ttl", "1h", "--vcpu", "2147483647", "--memory", "512", "--disk", "5"); res.code != ExitOK {
+		t.Fatalf("create with the largest vCPU: %+v", res)
 	}
 	r.f.mu.Lock()
 	defer r.f.mu.Unlock()
-	for _, req := range r.f.creat {
-		if req.GetResources().GetVcpuCount() != 2147483647 {
-			t.Fatalf("vCPU count %d, want 2147483647", req.GetResources().GetVcpuCount())
-		}
+	if len(r.f.creat) != 1 {
+		t.Fatalf("captured %d CreateSandbox requests, want 1", len(r.f.creat))
+	}
+	if got := r.f.creat[0].GetResources().GetVcpuCount(); got != 2147483647 {
+		t.Fatalf("vCPU count %d, want 2147483647", got)
 	}
 }
 
