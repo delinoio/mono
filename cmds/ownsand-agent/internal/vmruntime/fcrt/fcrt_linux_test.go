@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -75,6 +76,13 @@ func TestVsockHandshake(t *testing.T) {
 // never does.
 func delayedAckPeer(t *testing.T) (v *vm, accepted chan struct{}, release chan struct{}, closed chan error) {
 	t.Helper()
+	return delayedAckPeerAfter(t, 0)
+}
+
+// delayedAckPeerAfter is delayedAckPeer whose accept loop starts only after
+// startDelay, to model a peer goroutine that the scheduler runs late.
+func delayedAckPeerAfter(t *testing.T, startDelay time.Duration) (v *vm, accepted chan struct{}, release chan struct{}, closed chan error) {
+	t.Helper()
 	dir := t.TempDir()
 	f, _ := os.Open(dir)
 	t.Cleanup(func() { f.Close() })
@@ -88,6 +96,7 @@ func delayedAckPeer(t *testing.T) (v *vm, accepted chan struct{}, release chan s
 	release = make(chan struct{})
 	closed = make(chan error, 1)
 	go func() {
+		time.Sleep(startDelay)
 		c, err := l.Accept()
 		if err != nil {
 			return
@@ -162,22 +171,102 @@ func TestVsockHandshakeCancelDuringAck(t *testing.T) {
 	}
 }
 
+// manualDeadlineContext is a context that reports a deadline and expires only
+// when the test calls expire, with the error context.DeadlineExceeded. A real
+// timer would race the scheduling of the peer goroutine, so the test fires the
+// deadline itself once it knows where the handshake is.
+type manualDeadlineContext struct {
+	context.Context
+	deadline time.Time
+	done     chan struct{}
+	once     sync.Once
+	mu       sync.Mutex
+	err      error
+}
+
+func newManualDeadlineContext() *manualDeadlineContext {
+	return &manualDeadlineContext{
+		Context:  context.Background(),
+		deadline: time.Now().Add(time.Hour),
+		done:     make(chan struct{}),
+	}
+}
+
+func (m *manualDeadlineContext) Deadline() (time.Time, bool) { return m.deadline, true }
+func (m *manualDeadlineContext) Done() <-chan struct{}       { return m.done }
+
+func (m *manualDeadlineContext) Err() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.err
+}
+
+func (m *manualDeadlineContext) expire() {
+	m.once.Do(func() {
+		m.mu.Lock()
+		m.err = context.DeadlineExceeded
+		m.mu.Unlock()
+		close(m.done)
+	})
+}
+
+// TestVsockHandshakeDeadlineDuringAck expires the deadline only after the peer
+// reported the CONNECT line and while it withholds the acknowledgement, so the
+// expiry provably happens during the acknowledgement wait whenever the peer
+// goroutine runs.
 func TestVsockHandshakeDeadlineDuringAck(t *testing.T) {
-	v, accepted, _, _ := delayedAckPeer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	c, err := v.Dial(ctx)
-	if c != nil {
-		c.Close()
-		t.Fatal("a timed-out dial returned a connection")
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Dial error %v, want context.DeadlineExceeded", err)
-	}
-	select {
-	case <-accepted:
-	default:
-		t.Fatal("peer never saw the CONNECT line")
+	for _, tc := range []struct {
+		name       string
+		startDelay time.Duration
+	}{
+		{"prompt peer", 0},
+		{"late peer", 300 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, accepted, _, closed := delayedAckPeerAfter(t, tc.startDelay)
+			ctx := newManualDeadlineContext()
+			type result struct {
+				c   net.Conn
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				c, err := v.Dial(ctx)
+				done <- result{c, err}
+			}()
+			select {
+			case <-accepted:
+			case r := <-done:
+				if r.c != nil {
+					r.c.Close()
+				}
+				t.Fatalf("Dial returned (%v) before the peer saw the CONNECT line", r.err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("peer never saw the CONNECT line")
+			}
+			// The peer holds the acknowledgement, so Dial is now waiting for it.
+			ctx.expire()
+			select {
+			case r := <-done:
+				if r.c != nil {
+					r.c.Close()
+					t.Fatal("a timed-out dial returned a connection")
+				}
+				if !errors.Is(r.err, context.DeadlineExceeded) {
+					t.Fatalf("Dial error %v, want context.DeadlineExceeded", r.err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Dial did not return after the deadline expired")
+			}
+			select {
+			case err := <-closed:
+				if err != io.EOF {
+					t.Fatalf("peer read %v, want io.EOF after the dialer closed", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("peer did not see the connection close")
+			}
+		})
 	}
 }
 
