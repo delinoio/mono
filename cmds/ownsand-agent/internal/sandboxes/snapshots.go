@@ -113,8 +113,11 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	id := cmd.GetSnapshotId()
 	m.mu.Lock()
 	if snap, ok := m.snapshots[id]; ok {
+		// Read the snapshot before the unlock: a delete writes
+		// snap.deleting under m.mu.
+		entry, err := existingSnapshotEntry(snap)
 		m.mu.Unlock()
-		return existingSnapshotEntry(snap)
+		return entry, err
 	}
 	sb, ok := m.sandboxes[cmd.GetSandboxId()]
 	m.mu.Unlock()
@@ -128,8 +131,11 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	// A duplicate create that waited for the sandbox lock finds the
 	// snapshot that the first create published.
 	if snap, ok := m.snapshots[id]; ok {
+		// Read the snapshot before the unlock: a delete writes
+		// snap.deleting under m.mu.
+		entry, err := existingSnapshotEntry(snap)
 		m.mu.Unlock()
-		return existingSnapshotEntry(snap)
+		return entry, err
 	}
 	m.mu.Unlock()
 	if state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
@@ -263,6 +269,8 @@ func (m *Manager) recordSourcePausedAfterSnapshot(sb *sandbox) {
 // existingSnapshotEntry answers a create for a snapshot ID that the device
 // already holds. A copy that a delete or a failed removal marked is not
 // returned as ready: the create fails until the removal finished.
+// The caller holds Manager.mu, because the function reads snap.deleting and
+// snap.rec, which a delete and a removal change under it.
 func existingSnapshotEntry(snap *snapshot) (*ownsandv1.SnapshotStateEntry, error) {
 	if !snap.usable() {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "snapshot is being deleted")
