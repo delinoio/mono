@@ -422,12 +422,13 @@ func TestEnrollment(t *testing.T) {
 	org := env.NewOrg("alice")
 	owner := org.OwnerClient
 	agent := env.Clients("").Agent
-	newToken := func(ttl time.Duration) string {
+	// newToken creates an enrollment token and returns its secret and its ID.
+	newToken := func(ttl time.Duration) (string, string) {
 		resp, err := owner.Device.CreateEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(ttl)}))
 		if err != nil {
 			t.Fatal(err)
 		}
-		return resp.Msg.GetEnrollmentToken()
+		return resp.Msg.GetEnrollmentToken(), resp.Msg.GetToken().GetEnrollmentTokenId()
 	}
 	enroll := func(token string, pub ed25519.PublicKey) (*ownsandv1.EnrollResponse, error) {
 		resp, err := agent.Enroll(ctx, connect.NewRequest(&ownsandv1.EnrollRequest{
@@ -444,7 +445,10 @@ func TestEnrollment(t *testing.T) {
 	if _, err := owner.Device.CreateEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(25 * time.Hour)})); testenv.Code(err) != connect.CodeInvalidArgument {
 		t.Fatalf("ttl over 24h: %v", err)
 	}
-	token := newToken(time.Hour)
+	token, usedID := newToken(time.Hour)
+	if usedID == "" {
+		t.Fatal("created token has no ID")
+	}
 	first, err := enroll(token, pub)
 	if err != nil {
 		t.Fatal(err)
@@ -462,27 +466,44 @@ func TestEnrollment(t *testing.T) {
 		t.Fatalf("reuse: %v", err)
 	}
 	// Revoked token.
-	revoked := newToken(time.Hour)
-	list, _ := owner.Device.ListEnrollmentTokens(ctx, connect.NewRequest(&ownsandv1.ListEnrollmentTokensRequest{OrganizationId: org.ID}))
+	revoked, pendingID := newToken(time.Hour)
+	list, err := owner.Device.ListEnrollmentTokens(ctx, connect.NewRequest(&ownsandv1.ListEnrollmentTokensRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := map[string]*ownsandv1.EnrollmentToken{}
 	for _, tk := range list.Msg.GetTokens() {
-		if tk.GetState() == ownsandv1.EnrollmentTokenState_ENROLLMENT_TOKEN_STATE_PENDING {
-			if _, err := owner.Device.RevokeEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.RevokeEnrollmentTokenRequest{OrganizationId: org.ID, EnrollmentTokenId: tk.GetEnrollmentTokenId()})); err != nil {
-				t.Fatal(err)
-			}
-		} else if tk.GetState() == ownsandv1.EnrollmentTokenState_ENROLLMENT_TOKEN_STATE_USED {
-			if tk.GetDeviceId() != first.GetDeviceId() {
-				t.Fatalf("used token device = %s", tk.GetDeviceId())
-			}
-			if _, err := owner.Device.RevokeEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.RevokeEnrollmentTokenRequest{OrganizationId: org.ID, EnrollmentTokenId: tk.GetEnrollmentTokenId()})); testenv.Code(err) != connect.CodeFailedPrecondition {
-				t.Fatalf("revoke used token: %v", err)
-			}
-		}
+		listed[tk.GetEnrollmentTokenId()] = tk
+	}
+	// The list must contain the used token with its device, and the pending token.
+	usedRow, ok := listed[usedID]
+	if !ok {
+		t.Fatalf("used token %s missing from the list", usedID)
+	}
+	if usedRow.GetState() != ownsandv1.EnrollmentTokenState_ENROLLMENT_TOKEN_STATE_USED {
+		t.Fatalf("used token state = %v", usedRow.GetState())
+	}
+	if usedRow.GetDeviceId() != first.GetDeviceId() {
+		t.Fatalf("used token device = %s, want %s", usedRow.GetDeviceId(), first.GetDeviceId())
+	}
+	if _, err := owner.Device.RevokeEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.RevokeEnrollmentTokenRequest{OrganizationId: org.ID, EnrollmentTokenId: usedID})); testenv.Code(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("revoke used token: %v", err)
+	}
+	pendingRow, ok := listed[pendingID]
+	if !ok {
+		t.Fatalf("pending token %s missing from the list", pendingID)
+	}
+	if pendingRow.GetState() != ownsandv1.EnrollmentTokenState_ENROLLMENT_TOKEN_STATE_PENDING {
+		t.Fatalf("pending token state = %v", pendingRow.GetState())
+	}
+	if _, err := owner.Device.RevokeEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.RevokeEnrollmentTokenRequest{OrganizationId: org.ID, EnrollmentTokenId: pendingID})); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := enroll(revoked, pub2); testenv.Code(err) != connect.CodeUnauthenticated {
 		t.Fatalf("revoked: %v", err)
 	}
 	// Expired token.
-	expired := newToken(time.Minute)
+	expired, _ := newToken(time.Minute)
 	env.Clock.Advance(2 * time.Minute)
 	if _, err := enroll(expired, pub2); testenv.Code(err) != connect.CodeUnauthenticated {
 		t.Fatalf("expired: %v", err)
@@ -491,7 +512,8 @@ func TestEnrollment(t *testing.T) {
 	if _, err := enroll("ose_nope", pub2); testenv.Code(err) != connect.CodeUnauthenticated {
 		t.Fatalf("garbage: %v", err)
 	}
-	if _, err := enroll(newToken(time.Hour), pub2[:10]); testenv.Code(err) != connect.CodeInvalidArgument {
+	shortKeyToken, _ := newToken(time.Hour)
+	if _, err := enroll(shortKeyToken, pub2[:10]); testenv.Code(err) != connect.CodeInvalidArgument {
 		t.Fatalf("short key: %v", err)
 	}
 	// The new device starts with zero limits and 100 percent overcommit.
