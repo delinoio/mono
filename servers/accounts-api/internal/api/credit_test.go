@@ -349,6 +349,44 @@ func TestDeleteBillingAccountRetryAfterRollback(t *testing.T) {
 	}
 }
 
+// A 2xx answer of Paddle that does not confirm the cancellation (here an empty
+// entity and another subscription) fails DeleteBillingAccount with unavailable
+// and leaves the account, the subscription and the credit as they were. The
+// retry after a confirmed answer completes the deletion.
+func TestDeleteBillingAccountRequiresConfirmedCancellation(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	subID := subscribe(t, env, f)
+	before := balanceOf(t, env, f.Owner.ID, f.AccountID).GetBalanceUsdMicros()
+	del := func() error {
+		_, err := f.Owner.Client.DeleteBillingAccount(ctx(), connect.NewRequest(&accountsv1.DeleteBillingAccountRequest{BillingAccountId: f.AccountID}))
+		return err
+	}
+	for name, body := range map[string]string{
+		"empty entity":       `{"data":{}}`,
+		"other subscription": `{"data":{"id":"sub_other","status":"canceled"}}`,
+		"not canceled":       `{"data":{"id":"` + subID + `","status":"active"}}`,
+	} {
+		env.Paddle.Respond("POST /subscriptions/", http.StatusOK, body)
+		wantCode(t, del(), connect.CodeUnavailable)
+		if _, err := f.Owner.Client.GetBillingAccount(ctx(), connect.NewRequest(&accountsv1.GetBillingAccountRequest{BillingAccountId: f.AccountID})); err != nil {
+			t.Fatalf("%s: the billing account is gone after a failed deletion: %v", name, err)
+		}
+		if got := balanceOf(t, env, f.Owner.ID, f.AccountID).GetBalanceUsdMicros(); got != before || before == 0 {
+			t.Fatalf("%s: balance = %d, want %d (non-zero)", name, got, before)
+		}
+		var status string
+		if err := env.DB.Pool.QueryRow(ctx(), `SELECT status FROM subscriptions WHERE billing_account_id = $1`, f.AccountID).Scan(&status); err != nil || status == "canceled" {
+			t.Fatalf("%s: local subscription = %q, %v; want it unchanged", name, status, err)
+		}
+	}
+	env.Paddle.Respond("POST /subscriptions/", 0, "")
+	wantCode(t, del(), 0)
+	if sub, _ := env.Paddle.Subscription(subID); sub.Status != paddle.SubscriptionStatusCanceled {
+		t.Fatalf("Paddle subscription after the deletion = %s", sub.Status)
+	}
+}
+
 func TestManualTopUp(t *testing.T) {
 	env := testenv.New(t)
 	f := newFixture(t, env)

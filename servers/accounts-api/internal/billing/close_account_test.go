@@ -343,3 +343,84 @@ func TestCloseAccountRetryAfterRollbackNeedsPaddleConfirmation(t *testing.T) {
 		f.wantLedger(acct, wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd})
 	})
 }
+
+// The immediate cancellation must be confirmed. A 2xx answer without the
+// canceled subscription of the account leaves the account, the subscription
+// and the credit as they were and fails with unavailable, so the owner can
+// retry; a confirmed cancellation and an explicit not-found still complete the
+// deletion.
+func TestCloseAccountRequiresConfirmedCancellation(t *testing.T) {
+	const canceled = `{"data":{"id":"%ID%","status":"canceled"}}`
+	for name, tc := range map[string]struct {
+		status int
+		body   string
+		want   connect.Code
+	}{
+		"null entity":             {http.StatusOK, `{"data":null}`, connect.CodeUnavailable},
+		"empty entity":            {http.StatusOK, `{"data":{}}`, connect.CodeUnavailable},
+		"missing data":            {http.StatusOK, `{}`, connect.CodeUnavailable},
+		"not JSON":                {http.StatusOK, `ok`, connect.CodeUnavailable},
+		"other subscription":      {http.StatusOK, `{"data":{"id":"sub_other","status":"canceled"}}`, connect.CodeUnavailable},
+		"status active":           {http.StatusOK, `{"data":{"id":"%ID%","status":"active"}}`, connect.CodeUnavailable},
+		"scheduled cancellation":  {http.StatusOK, `{"data":{"id":"%ID%","status":"active","scheduled_change":{"action":"cancel","effective_at":"2099-01-01T00:00:00Z"}}}`, connect.CodeUnavailable},
+		"missing status":          {http.StatusOK, `{"data":{"id":"%ID%"}}`, connect.CodeUnavailable},
+		"unknown status":          {http.StatusOK, `{"data":{"id":"%ID%","status":"archived"}}`, connect.CodeUnavailable},
+		"accepted without entity": {http.StatusAccepted, `{"data":{}}`, connect.CodeUnavailable},
+		"confirmed":               {http.StatusOK, canceled, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			subID := f.activate(acct)
+			f.grant(acct, LedgerManualTopUp, 25*usd)
+			f.paddle.Respond("POST /subscriptions/", tc.status, strings.ReplaceAll(tc.body, "%ID%", subID))
+
+			err := f.closeAccount(acct)
+			stored, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+			if tc.want == 0 {
+				if err != nil || stored.Status != SubscriptionCanceled {
+					t.Fatalf("closeAccount = %v, stored status %s; want a completed deletion", err, stored.Status)
+				}
+				f.wantLedger(acct,
+					wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd},
+					wantEntry{LedgerExpiry, -25 * usd, 0},
+				)
+				return
+			}
+			wantConnectCode(t, "close account", err, tc.want)
+			if stored.Status != SubscriptionActive || stored.PaddleSubscriptionID != subID {
+				t.Fatalf("stored subscription = %s %q, want it unchanged", stored.Status, stored.PaddleSubscriptionID)
+			}
+			f.wantLedger(acct, wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd})
+			if f.balance(acct) != 25*usd {
+				t.Fatalf("balance = %d, want the credit intact", f.balance(acct))
+			}
+			// The Paddle answer is fine again: the retry completes.
+			f.paddle.Respond("POST /subscriptions/", 0, "")
+			if err := f.closeAccount(acct); err != nil {
+				t.Fatalf("retry = %v", err)
+			}
+		})
+	}
+}
+
+// An explicit not-found of the subscription at Paddle still completes the
+// deletion.
+func TestCloseAccountCompletesWhenPaddleDoesNotKnowTheSubscription(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.grant(acct, LedgerManualTopUp, 25*usd)
+	f.paddle.Fail("POST /subscriptions/", &paddletest.Failure{Status: http.StatusNotFound, Code: "not_found"})
+	if err := f.closeAccount(acct); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if stored.Status != SubscriptionCanceled {
+		t.Fatalf("stored status %s", stored.Status)
+	}
+	f.wantLedger(acct,
+		wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd},
+		wantEntry{LedgerExpiry, -25 * usd, 0},
+	)
+}
