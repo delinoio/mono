@@ -225,27 +225,31 @@ func TestVsockHandshakeRefused(t *testing.T) {
 	}
 }
 
+// TestVsockHandshakeClearsDeadline covers the Dial branch that installs its
+// own socket deadline (a ctx without a deadline) and checks that Dial clears
+// that deadline once the handshake succeeds. The test never sets a deadline on
+// the returned connection, so a leftover deadline makes the read time out.
 func TestVsockHandshakeClearsDeadline(t *testing.T) {
+	old := vsockHandshakeTimeout
+	vsockHandshakeTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { vsockHandshakeTimeout = old })
+
 	v, accepted, release, _ := delayedAckPeer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
+	// The peer acknowledges at once; the idle connection then gets one byte
+	// after the handshake timeout has passed.
 	go func() {
 		<-accepted
 		close(release)
 	}()
-	c, err := v.Dial(ctx)
+	c, err := v.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	// Outlive the context deadline: a leftover socket deadline would make the
-	// read fail with a timeout instead of waiting for the idle peer.
-	time.Sleep(500 * time.Millisecond)
-	c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	_, err = c.Read(make([]byte, 1))
-	var ne net.Error
-	if !errors.As(err, &ne) || !ne.Timeout() {
-		t.Fatalf("read error %v, want the new read deadline", err)
+	// Outlive the handshake timeout, so a leftover socket deadline has expired.
+	time.Sleep(3 * vsockHandshakeTimeout)
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatalf("write after the handshake timeout: %v", err)
 	}
 }
 

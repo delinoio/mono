@@ -268,6 +268,11 @@ func (v *vm) path(name string) string {
 	return fmt.Sprintf("/proc/self/fd/%d/%s", v.dirFile.Fd(), name)
 }
 
+// vsockHandshakeTimeout bounds the vsock handshake of a Dial whose ctx has no
+// deadline. It is a variable only so that a test can shorten it; production
+// code never assigns it.
+var vsockHandshakeTimeout = 10 * time.Second
+
 // Dial connects to the guest helper through the Firecracker vsock device:
 // it connects to the device's unix socket and asks for the guest port. A
 // canceled ctx aborts the handshake promptly and closes the connection, and a
@@ -283,7 +288,7 @@ func (v *vm) Dial(ctx context.Context) (net.Conn, error) {
 	// same instant could fire before ctx reports its error, and the handshake
 	// would then fail with a socket timeout in place of the context error.
 	if _, ok := ctx.Deadline(); !ok {
-		c.SetDeadline(time.Now().Add(10 * time.Second))
+		c.SetDeadline(time.Now().Add(vsockHandshakeTimeout))
 	}
 	// DialContext watches ctx only while connecting. Expire the deadline when
 	// ctx is done, so a blocked handshake read or write returns at once.
