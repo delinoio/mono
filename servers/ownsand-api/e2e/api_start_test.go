@@ -52,3 +52,32 @@ func shouldRetryAPIStart(err error, attempt int, logs *logSink, name string) boo
 		attempt < apiStartAttempts &&
 		logs.hasStartupFailure(name, startupFailureReasonAddressInUse)
 }
+
+// hasServerStarted reports whether the process name logged a server_started
+// record whose addr is exactly addr. server_started is logged after the
+// process bound its HTTP listener, and addr is the address that the listener
+// reports, in the same text form as the address that freeTCPPort returns. A
+// record of another process name or another address does not match.
+func (l *logSink) hasServerStarted(name, addr string) bool {
+	prefix := name + ": "
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.lines {
+		text, ok := strings.CutPrefix(line, prefix)
+		if !ok {
+			continue
+		}
+		var event struct {
+			Msg  string `json:"msg"`
+			Addr string `json:"addr"`
+		}
+		// Lines that are not JSON log records are not events.
+		if json.Unmarshal([]byte(text), &event) != nil {
+			continue
+		}
+		if event.Msg == "server_started" && event.Addr == addr {
+			return true
+		}
+	}
+	return false
+}
