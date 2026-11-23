@@ -253,12 +253,21 @@ export function fakeWebRtc(
 
     async setRemoteDescription(): Promise<void> {
       if (options.neverOpen) return;
-      void clock.sleep(options.openDelayMs ?? 50).then(() => {
+      const open = () => {
         if (this.channel && this.channel.readyState === "connecting") {
           this.channel.readyState = "open";
           this.channel.emit("open");
         }
-      });
+      };
+      const delay = options.openDelayMs ?? 50;
+      if (delay === 0) {
+        // A zero delay must not go through the virtual clock: a zero-length
+        // timer still waits for the clock to advance, but the documented
+        // contract is that the channel is open when this call resolves.
+        open();
+        return;
+      }
+      void clock.sleep(delay).then(open);
     }
 
     close(): void {
