@@ -2330,18 +2330,50 @@ describe("billing banner", () => {
     }
   }
 
-  test("shows on every organization page", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
-      transport: createMockTransport({
-        billing: { [MOCK_IDS.acme]: MockBillingState.BlockedLinked },
-      }),
+  // Every organization route, with the level-one heading that proves the
+  // requested page (not a loading or error state) rendered.
+  const ORGANIZATION_ROUTES = [
+    { name: "sandboxes", path: "sandboxes", heading: "Sandboxes" },
+    { name: "devices", path: "devices", heading: "Devices" },
+    { name: "members", path: "members", heading: "Members" },
+    {
+      name: "enrollment tokens",
+      path: "enrollment-tokens",
+      heading: "Enrollment tokens",
+    },
+    { name: "API keys", path: "api-keys", heading: "API keys" },
+    { name: "snapshots", path: "snapshots", heading: "Snapshots" },
+    { name: "settings", path: "settings", heading: "Settings" },
+    {
+      name: "the seeded sandbox",
+      path: `sandboxes/${MOCK_IDS.runningSandbox}`,
+      heading: "Sandbox",
+    },
+    {
+      name: "the seeded device",
+      path: `devices/${MOCK_IDS.buildBox}`,
+      heading: /build-box/,
+    },
+  ] as const;
+
+  for (const route of ORGANIZATION_ROUTES) {
+    test(`shows on ${route.name}`, async () => {
+      renderConsole(`/orgs/${MOCK_IDS.acme}/${route.path}`, {
+        transport: createMockTransport({
+          userId: MOCK_USER,
+          billing: { [MOCK_IDS.acme]: MockBillingState.BlockedLinked },
+        }),
+      });
+      expect(
+        await screen.findByRole("heading", { name: route.heading, level: 1 }),
+      ).toBeTruthy();
+      expect(
+        await screen.findByRole("region", {
+          name: "This organization is blocked",
+        }),
+      ).toBeTruthy();
     });
-    expect(
-      await screen.findByRole("region", {
-        name: "This organization is blocked",
-      }),
-    ).toBeTruthy();
-  });
+  }
 });
 
 describe("billing errors", () => {
