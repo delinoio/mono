@@ -1,0 +1,192 @@
+// SPDX-License-Identifier: Apache-2.0
+import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import { Code, ConnectError, type Transport } from "@connectrpc/connect";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { toast } from "delino-ui/toast";
+import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
+import { holdingTransport, renderConsole } from "./test-support.tsx";
+
+/** The longest wait for one condition; a loaded CI runner needs more than one second. */
+const WAIT = { timeout: 10_000 };
+
+const ADMIN = "user-admin-jun";
+const SETTINGS = `/orgs/${MOCK_IDS.acme}/settings`;
+
+beforeEach(() => {
+  window.sessionStorage.clear();
+  window.localStorage.clear();
+});
+
+afterEach(() => {
+  cleanup();
+  toast.dismiss();
+});
+
+/**
+ * A transport whose GetBillingUsage fails with `unavailable` while
+ * `state.failUsage` is set. It records every request per method name.
+ */
+function usageFailingTransport(mock: Transport = createMockTransport()) {
+  const state = { failUsage: true, calls: {} as Record<string, number> };
+  const transport: Transport = {
+    ...mock,
+    async unary(method, ...rest) {
+      state.calls[method.name] = (state.calls[method.name] ?? 0) + 1;
+      if (method.name === "GetBillingUsage" && state.failUsage) {
+        throw new ConnectError("usage is unavailable", Code.Unavailable);
+      }
+      return mock.unary(method, ...rest);
+    },
+  };
+  return { transport, state };
+}
+
+const billing = () => screen.findByRole("region", { name: "Billing" });
+
+async function click(element: HTMLElement) {
+  await act(async () => {
+    fireEvent.click(element);
+  });
+}
+
+describe("the unlink action without usage", () => {
+  test("the owner can unlink while the usage is loading", async () => {
+    const { transport, calls } = holdingTransport(["GetBillingUsage"]);
+    renderConsole(SETTINGS, { transport });
+    const section = await billing();
+    await within(section).findByRole("status", {
+      name: "Loading the billing usage",
+    });
+    await waitFor(() => expect(calls.GetBillingUsage).toHaveLength(1), WAIT);
+    const unlink = within(section).getByRole("button", {
+      name: "Unlink billing account",
+    });
+    await click(unlink);
+    const dialog = await screen.findByRole("alertdialog");
+    expect(
+      within(dialog).getByRole("heading", {
+        name: "Unlink the billing account?",
+      }),
+    ).toBeTruthy();
+    await act(async () => {
+      for (const call of calls.GetBillingUsage) call.settle();
+    });
+  });
+
+  test("the owner can open the confirmation after a usage error, and the retry stays", async () => {
+    const { transport, state } = usageFailingTransport();
+    renderConsole(SETTINGS, { transport });
+    const section = await billing();
+    const retry = await within(section).findByRole("button", {
+      name: "Try again",
+    });
+    const unlink = within(section).getByRole("button", {
+      name: "Unlink billing account",
+    });
+    await click(unlink);
+    const dialog = await screen.findByRole("alertdialog");
+    expect(
+      within(dialog).getByRole("heading", {
+        name: "Unlink the billing account?",
+      }),
+    ).toBeTruthy();
+    await click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(
+      () => expect(screen.queryByRole("alertdialog")).toBeNull(),
+      WAIT,
+    );
+    expect(state.calls.UnlinkBillingAccount).toBeUndefined();
+
+    // The retry loads the usage, and the unlink action stays.
+    state.failUsage = false;
+    await click(retry);
+    await within(section).findByText("Acme Robotics billing", undefined, WAIT);
+    expect(
+      within(section).getByRole("button", { name: "Unlink billing account" }),
+    ).toBeTruthy();
+    expect(
+      within(section).queryByRole("button", { name: "Try again" }),
+    ).toBeNull();
+  });
+
+  test("confirming after a usage error unlinks once and shows the unlinked view", async () => {
+    const { transport, state } = usageFailingTransport();
+    renderConsole(SETTINGS, { transport });
+    const section = await billing();
+    await click(
+      await within(section).findByRole("button", {
+        name: "Unlink billing account",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    await click(
+      within(dialog).getByRole("button", { name: "Unlink billing account" }),
+    );
+    await within(section).findByRole(
+      "button",
+      { name: "Link a billing account" },
+      WAIT,
+    );
+    expect(state.calls.UnlinkBillingAccount).toBe(1);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(
+      within(section).queryByRole("button", { name: "Unlink billing account" }),
+    ).toBeNull();
+    expect(
+      within(section).queryByRole("button", { name: "Try again" }),
+    ).toBeNull();
+  });
+
+  test("a failed unlink keeps the confirmation open with the error", async () => {
+    const base = usageFailingTransport();
+    const transport: Transport = {
+      ...base.transport,
+      async unary(method, ...rest) {
+        if (method.name === "UnlinkBillingAccount") {
+          throw new ConnectError("the unlink failed", Code.Unavailable);
+        }
+        return base.transport.unary(method, ...rest);
+      },
+    };
+    renderConsole(SETTINGS, { transport });
+    const section = await billing();
+    await click(
+      await within(section).findByRole("button", {
+        name: "Unlink billing account",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    await click(
+      within(dialog).getByRole("button", { name: "Unlink billing account" }),
+    );
+    await waitFor(
+      () =>
+        expect(
+          screen.getByRole("alertdialog").querySelector(".notice-error"),
+        ).not.toBeNull(),
+      { timeout: 3000 },
+    );
+    expect(
+      within(section).queryByRole("button", { name: "Link a billing account" }),
+    ).toBeNull();
+  });
+
+  test("an admin has no unlink action after a usage error", async () => {
+    const { transport } = usageFailingTransport(
+      createMockTransport({ userId: ADMIN }),
+    );
+    renderConsole(SETTINGS, { transport });
+    const section = await billing();
+    await within(section).findByRole("button", { name: "Try again" });
+    expect(
+      within(section).queryByRole("button", { name: "Unlink billing account" }),
+    ).toBeNull();
+  });
+});

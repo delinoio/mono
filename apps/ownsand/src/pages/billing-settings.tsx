@@ -115,54 +115,64 @@ export function BillingSection() {
         No billing account is linked. The organization owner must link one.
       </p>
     );
-  } else if (usage.isPending) {
-    body = <Loading label="Loading the billing usage" />;
-  } else if (usage.data === undefined || showsFullError(usage)) {
-    body = (
-      <ErrorNotice error={usage.error} onRetry={() => void usage.refetch()} />
-    );
   } else {
-    const data = usage.data;
-    const total = data.meterUsages.reduce(
-      (sum, u) => sum + u.amountUsdMicros,
-      0n,
-    );
+    // Linked: the usage portion depends on `GetBillingUsage`, but the owner's
+    // unlink action must not, so a loading or failed usage request keeps it.
+    let usageBody;
+    if (usage.isPending) {
+      usageBody = <Loading label="Loading the billing usage" />;
+    } else if (usage.data === undefined || showsFullError(usage)) {
+      usageBody = (
+        <ErrorNotice error={usage.error} onRetry={() => void usage.refetch()} />
+      );
+    } else {
+      const data = usage.data;
+      const total = data.meterUsages.reduce(
+        (sum, u) => sum + u.amountUsdMicros,
+        0n,
+      );
+      usageBody = (
+        <>
+          <dl className="details details-flat">
+            <Detail term="Billing account">{data.billingAccountName}</Detail>
+            <Detail term="Balance">
+              {formatUsdMicros(data.balanceUsdMicros)}
+              {data.balanceUsdMicros < 0n ? " (debt)" : null}
+            </Detail>
+            <Detail term={`Cost in ${utcMonth(data.monthStart)} (UTC)`}>
+              {formatUsdMicros(total)}
+            </Detail>
+          </dl>
+          <div className="table-wrap">
+            <table className="table" aria-label="Usage this month">
+              <thead>
+                <tr>
+                  <th scope="col">Meter</th>
+                  <th scope="col">Usage</th>
+                  <th scope="col">Cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.meterUsages.map((u) => (
+                  <tr key={u.meter}>
+                    <td>{labels.billingMeter[u.meter]}</td>
+                    <td>{meterQuantity(u)}</td>
+                    <td>{formatUsageCostUsdMicros(u.amountUsdMicros)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="muted">
+            Usage of about the last 10 minutes is not included yet. R2 storage
+            shows in GiB-months of 730 hours.
+          </p>
+        </>
+      );
+    }
     body = (
       <div className="form">
-        <dl className="details details-flat">
-          <Detail term="Billing account">{data.billingAccountName}</Detail>
-          <Detail term="Balance">
-            {formatUsdMicros(data.balanceUsdMicros)}
-            {data.balanceUsdMicros < 0n ? " (debt)" : null}
-          </Detail>
-          <Detail term={`Cost in ${utcMonth(data.monthStart)} (UTC)`}>
-            {formatUsdMicros(total)}
-          </Detail>
-        </dl>
-        <div className="table-wrap">
-          <table className="table" aria-label="Usage this month">
-            <thead>
-              <tr>
-                <th scope="col">Meter</th>
-                <th scope="col">Usage</th>
-                <th scope="col">Cost</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.meterUsages.map((u) => (
-                <tr key={u.meter}>
-                  <td>{labels.billingMeter[u.meter]}</td>
-                  <td>{meterQuantity(u)}</td>
-                  <td>{formatUsageCostUsdMicros(u.amountUsdMicros)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <p className="muted">
-          Usage of about the last 10 minutes is not included yet. R2 storage
-          shows in GiB-months of 730 hours.
-        </p>
+        {usageBody}
         {owner ? (
           <div className="actions">
             <Button
