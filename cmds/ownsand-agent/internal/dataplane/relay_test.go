@@ -920,8 +920,24 @@ func TestRelayProbeUsesMonotonicClock(t *testing.T) {
 // plane does not read the stream, so HTTP/2 flow control stops it) and no
 // inbound bytes, the agent cancels the connection at the receive timeout
 // and dials again.
+//
+// The test first proves that precondition on the first connection: its
+// outbound queue is full and its writer is blocked inside Send (the time of
+// the last successful send stops advancing while the queue stays full). A
+// silent connection with a spare queue would also redial at the receive
+// timeout, so a missing precondition fails the test with its own message
+// instead of passing on the redial.
 func TestRelayWatchdogRedialsWhenWriterIsBlocked(t *testing.T) {
-	e := newRelayEnv(t, Timing{KeepaliveInterval: 100 * time.Millisecond, ReceiveTimeout: 1500 * time.Millisecond, ProbeIdle: time.Hour}, RelayLimits{})
+	const (
+		keepalive      = 100 * time.Millisecond
+		receiveTimeout = 2 * time.Second
+		// setupBound limits each wait for a precondition. It only guards
+		// against a hang, because the control plane feeds the connection
+		// with keepalives during the setup, so the receive timeout cannot
+		// expire before the precondition holds.
+		setupBound = 20 * time.Second
+	)
+	e := newRelayEnv(t, Timing{KeepaliveInterval: keepalive, ReceiveTimeout: receiveTimeout, ProbeIdle: time.Hour}, RelayLimits{})
 	var stalled atomic.Bool
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
@@ -946,15 +962,95 @@ func TestRelayWatchdogRedialsWhenWriterIsBlocked(t *testing.T) {
 		}
 		return nil
 	})
-	req := e.execReq("/bin/sh", "-c", "head -c 64000000 /dev/zero")
+	// The output (1 GB) and the credit window (1 GiB) are far larger than
+	// what 256 queued frames hold, whatever the size of the output chunks,
+	// so the outbound queue fills on a loaded machine too.
+	req := e.execReq("/bin/sh", "-c", "head -c 1000000000 /dev/zero")
 	g := e.execGrant(req)
 	// The connection loss ends the stream of g and releases it; this second
 	// grant stays live, so the agent has a reason to dial again.
 	e.execGrant(e.execReq("/bin/true"))
 	rc := <-e.conns
 	waitFor(t, "stalled relay handler", stalled.Load)
-	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamOpen{GrantId: g.GetGrantId(), InitialWindowBytes: 64 << 20}))
+	e.dp.relay.mu.Lock()
+	first := e.dp.relay.conn
+	e.dp.relay.mu.Unlock()
+	if first == nil {
+		t.Fatal("setup: no relay connection is installed after the first handler stalled")
+	}
+	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamOpen{GrantId: g.GetGrantId(), InitialWindowBytes: 1 << 30}))
 	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+
+	// The first handler is silent, and the receive timeout counts from the
+	// last inbound byte, so keepalives of the control plane keep the
+	// connection alive until both preconditions are proven. The feed stops
+	// before the watchdog check, from which on the connection is silent.
+	stopFeed := make(chan struct{})
+	feedDone := make(chan struct{})
+	var stopOnce sync.Once
+	stopKeepalives := func() {
+		stopOnce.Do(func() { close(stopFeed) })
+		<-feedDone
+	}
+	t.Cleanup(stopKeepalives)
+	go func() {
+		defer close(feedDone)
+		ticker := time.NewTicker(keepalive)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopFeed:
+				return
+			case <-ticker.C:
+				if err := rc.stream.Send(&ownsandv1.ConnectResponse{Frame: keepaliveFrame(false)}); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	// Precondition 1: the sandbox output fills the outbound queue, because
+	// the writer no longer drains it.
+	setupDeadline := time.Now().Add(setupBound)
+	pollSetup := func(what string, cond func() bool) {
+		t.Helper()
+		for !cond() {
+			select {
+			case <-e.conns:
+				t.Fatalf("setup: the agent dialed again while waiting: %s", what)
+			default:
+			}
+			if time.Now().After(setupDeadline) {
+				t.Fatalf("setup: %s within %s (queue %d of %d, last send %s ago)",
+					what, setupBound, len(first.out), cap(first.out), first.sinceSend())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	pollSetup("the first connection outbound queue never filled", func() bool { return len(first.out) == cap(first.out) })
+
+	// Precondition 2: the writer is blocked mid-send. The queue is full and
+	// no send succeeds for two keepalive intervals. A writer that only
+	// waits on an empty queue would not leave the queue full.
+	lastSend := first.lastSend.Load()
+	pollSetup("the first connection writer never proved blocked in Send", func() bool {
+		if cur := first.lastSend.Load(); cur != lastSend {
+			// A send completed, so the writer was still draining: restart
+			// the observation from the new send time.
+			lastSend = cur
+			return false
+		}
+		return len(first.out) == cap(first.out) && first.sinceSend() >= 2*keepalive
+	})
+
+	// The watchdog cancels the blocked connection at the receive timeout,
+	// and the spare grant makes the agent dial again.
+	stopKeepalives()
+	select {
+	case <-first.ctx.Done():
+	case <-time.After(3 * receiveTimeout):
+		t.Fatal("the watchdog did not cancel the blocked connection after the receive timeout")
+	}
 	select {
 	case <-e.conns:
 	case <-time.After(15 * time.Second):
