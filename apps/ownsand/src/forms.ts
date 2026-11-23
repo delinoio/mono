@@ -174,8 +174,9 @@ export interface DeviceLimitsForm {
  * Builds the ReplaceDeviceLimits input of the device form. The RPC needs
  * every value, and a blank input is not zero: it returns the message to show
  * for the first blank field, so the form never sends a silent zero. An
- * explicit zero is a value. A memory or disk limit must be a whole number
- * from 0 to 9223372036854775807 and keeps its exact value.
+ * explicit zero is a value. The vCPU limit must be a whole number from 0 to
+ * 2147483647 (the `int32` of the request). A memory or disk limit must be a
+ * whole number from 0 to 9223372036854775807 and keeps its exact value.
  */
 export function deviceLimitsInput(
   form: DeviceLimitsForm,
@@ -194,6 +195,18 @@ export function deviceLimitsInput(
     return {
       error: `${blank[1]} is required. Enter 0 to allow none.`,
       field: blank[0],
+    };
+  }
+  // The vCPU limit is an int32 on the wire: the generated serializer throws on
+  // anything else, which the page would show as the generic notice.
+  if (
+    !Number.isInteger(form.vcpu) ||
+    form.vcpu! < 0 ||
+    form.vcpu! > MAX_INT32
+  ) {
+    return {
+      error: `vCPU limit must be a whole number from 0 to ${MAX_INT32}.`,
+      field: DeviceLimitField.Vcpu,
     };
   }
   if ("error" in memory) {
