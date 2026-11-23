@@ -13,6 +13,7 @@ package validate
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -36,6 +37,11 @@ const (
 	// MaxLabelKeySize and MaxLabelValueSize are byte limits.
 	MaxLabelKeySize   = 63
 	MaxLabelValueSize = 255
+	// MaxDiskGiB is the largest resources.disk_gib. The control plane and the
+	// device agent convert disk_gib to a byte count in a signed 64-bit
+	// integer (disk_gib << 30), so a larger value would wrap to a negative or
+	// smaller size.
+	MaxDiskGiB int64 = math.MaxInt64 >> 30
 	// MaxTTL is the largest max_ttl (exactly 7 days is valid).
 	MaxTTL = 7 * 24 * time.Hour
 	// DefaultPageSize and MaxPageSize apply to every list RPC.
@@ -343,7 +349,8 @@ func TTL(idle, maxTTL *durationpb.Duration) error {
 }
 
 // Resources checks that vcpu_count, memory_mib and disk_gib are present and
-// greater than zero.
+// greater than zero, and that disk_gib is at most MaxDiskGiB so that its byte
+// count fits in a signed 64-bit integer.
 func Resources(r *ownsandv1.Resources) error {
 	if r == nil {
 		return fail("resources", "is required")
@@ -356,6 +363,9 @@ func Resources(r *ownsandv1.Resources) error {
 	}
 	if r.GetDiskGib() <= 0 {
 		return fail("resources.disk_gib", "must be greater than zero")
+	}
+	if r.GetDiskGib() > MaxDiskGiB {
+		return fail("resources.disk_gib", "must be at most %d", MaxDiskGiB)
 	}
 	return nil
 }

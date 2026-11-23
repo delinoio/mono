@@ -4,6 +4,7 @@ package validate
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -263,6 +264,14 @@ func TestResourcesSourceNetwork(t *testing.T) {
 	wantInvalid(t, "zero vcpu", Resources(&ownsandv1.Resources{MemoryMib: 1, DiskGib: 1}), "resources.vcpu_count")
 	wantInvalid(t, "zero memory", Resources(&ownsandv1.Resources{VcpuCount: 1, DiskGib: 1}), "resources.memory_mib")
 	wantInvalid(t, "zero disk", Resources(&ownsandv1.Resources{VcpuCount: 1, MemoryMib: 1}), "resources.disk_gib")
+	if got, want := MaxDiskGiB, int64(8589934591); got != want {
+		t.Fatalf("MaxDiskGiB = %d, want %d", got, want)
+	}
+	if err := Resources(&ownsandv1.Resources{VcpuCount: 1, MemoryMib: 1, DiskGib: MaxDiskGiB}); err != nil {
+		t.Fatalf("largest disk: %v", err)
+	}
+	wantInvalid(t, "disk one over", Resources(&ownsandv1.Resources{VcpuCount: 1, MemoryMib: 1, DiskGib: MaxDiskGiB + 1}), "resources.disk_gib")
+	wantInvalid(t, "disk max int64", Resources(&ownsandv1.Resources{VcpuCount: 1, MemoryMib: 1, DiskGib: math.MaxInt64}), "resources.disk_gib")
 
 	if err := SandboxSource(&ownsandv1.SandboxSource{Source: &ownsandv1.SandboxSource_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_LINUX}}); err != nil {
 		t.Fatal(err)
