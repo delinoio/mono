@@ -88,28 +88,35 @@ function isRunning(pid) {
   }
 }
 
-// Remembers the launcher's current children (the build or the server). Call it
-// while the launcher is alive: once the launcher dies, its children are
-// reparented and `pgrep -P <launcher pid>` no longer finds them.
+// Remembers the launcher's current children (the supervisor of the build or the
+// server) and their children (the build or the server). Call it while the
+// launcher is alive: once the launcher dies, its children are reparented and
+// `pgrep -P <launcher pid>` no longer finds them.
 function recordChildren(run) {
-  for (const pid of childPids(run.child.pid)) run.childPids.add(pid);
+  for (const pid of childPids(run.child.pid)) {
+    run.childPids.add(pid);
+    for (const grandchild of childPids(pid)) run.childPids.add(grandchild);
+  }
 }
 
 // Kills everything a launcher test may have left behind. The launcher runs each
-// child (the build and the server) in its own process group (see dev.mjs), so
-// signalling the launcher's group never reaches them; they are killed by pid
-// instead. Recorded pids cover children that outlived a launcher that died
-// first; a fresh sweep covers a child started since the last record. Children
-// go first, while the launcher is still alive, so none is orphaned. The pids are
-// recorded moments earlier in the same test, so a pid reused by an unrelated
-// process is not a practical risk.
+// child (the build and the server) under a supervisor in a process group of its
+// own (see dev.mjs), so signalling the launcher's group never reaches them; the
+// recorded pids and their groups are killed instead. The supervisor leads its
+// group, so killing the group of a recorded pid ends the supervisor and the
+// server together (for the server's pid the group kill finds no group and the
+// pid kill ends it). Children go first, while the launcher is still alive. The
+// pids are recorded moments earlier in the same test, so a pid reused by an
+// unrelated process is not a practical risk.
 function stopLauncher(run) {
   recordChildren(run);
   for (const pid of run.childPids) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // The process is already gone.
+    for (const target of [-pid, pid]) {
+      try {
+        process.kill(target, "SIGKILL");
+      } catch {
+        // The process or its group is already gone.
+      }
     }
   }
   try {
@@ -122,7 +129,8 @@ function stopLauncher(run) {
 
 // Starts the launcher in its own process group so a test can signal the group
 // of the launcher itself. The launcher's children are not in that group, so
-// cleanup (`stopLauncher`) kills them by pid. The temporary build output goes
+// cleanup (`stopLauncher`) kills them by pid and group. The dev-forced-stop
+// tests cover a launcher that dies. The temporary build output goes
 // to a test-owned TMPDIR.
 // Configuration that lets the real server start without external services.
 // The server opens its database pool lazily and skips the migrations with
@@ -678,35 +686,6 @@ test(
     await waitGone(run, pids, "the server to be killed");
     await assertNoListener(port);
     assert.equal(existsSync(run.tmp), false, "the test TMPDIR was not removed");
-  },
-);
-
-test(
-  "the test cleanup kills a server orphaned by a dead launcher",
-  { skip, timeout: Timeout * 2 },
-  async (t) => {
-    const port = await freePort();
-    const run = startLauncher(t, { port });
-    await waitReady(run);
-    const pids = [...run.childPids];
-    assert.ok(pids.length > 0, "the server pid was not recorded");
-
-    // Killing the launcher's own process group does not reach the server, which
-    // runs in a group of its own: it survives as an orphan and keeps the port.
-    // `pgrep -P <launcher pid>` can no longer find it, so the pid recorded
-    // while the launcher was alive is what cleanup has to use.
-    // `run.exited` is not awaited: the orphan holds the launcher's stdio pipes
-    // open, so the launcher's "close" event waits for the orphan to exit.
-    process.kill(-run.child.pid, "SIGKILL");
-    await waitGone(run, [run.child.pid], "the launcher to die");
-    assert.deepEqual(childPids(run.child.pid), []);
-    assert.ok(pids.every(isRunning), "the server did not outlive the launcher");
-    assert.equal(await portInUse(port), true, "the orphan stopped listening");
-
-    stopLauncher(run);
-
-    await waitGone(run, pids, "the orphaned server to be killed");
-    await assertNoListener(port);
   },
 );
 
