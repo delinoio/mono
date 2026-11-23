@@ -15,6 +15,12 @@
 #   because both paths are on one file system, so no build ever sees a
 #   partial archive, and a download that fails or does not match the checksum
 #   leaves the published path (and any valid archive there) untouched.
+# - A directory at the archive path is an error that the helper never fixes:
+#   it exits non-zero, names the path and leaves the directory, its contents
+#   and the rest of the cache untouched. The final rename uses mv -T (GNU
+#   coreutils, which the Debian build container provides) so that a directory
+#   that appears after the check also fails the rename; a plain mv would move
+#   the archive into the directory and report success.
 #
 # The helper needs no lock: concurrent fills each publish a verified archive
 # with identical content. A lock would not help either, because flock is
@@ -39,6 +45,10 @@ verify() {
   echo "$sha256  $1" | sha256sum -c --quiet - >/dev/null 2>&1
 }
 
+if [ -d "$archive" ]; then
+  echo "the kernel source path $archive is a directory; remove it and run the build again" >&2
+  exit 1
+fi
 if [ -f "$archive" ] && verify "$archive"; then
   echo "using the cached kernel source $archive" >&2
   exit 0
@@ -61,5 +71,8 @@ if ! verify "$tmp"; then
 fi
 # mktemp creates the file with mode 0600; a published archive is readable.
 chmod 0644 "$tmp"
-mv -f "$tmp" "$archive"
+# -T treats $archive as the destination file and never as a directory to move
+# $tmp into; the rename fails when a directory appeared there since the check
+# above, and the EXIT trap then removes $tmp.
+mv -f -T "$tmp" "$archive"
 echo "cached the kernel source $archive" >&2
