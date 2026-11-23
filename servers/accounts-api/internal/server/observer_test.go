@@ -85,9 +85,9 @@ func TestObserverParsesRequestSequences(t *testing.T) {
 			[]pendingSummary{{"POST", "/a", false}, {"GET", "/b", false}},
 		},
 		{
-			"connection close ends the stream",
+			"connection close flag alone does not end the stream",
 			"GET /a HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n" + get("/b"),
-			[]pendingSummary{{"GET", "/a", false}},
+			[]pendingSummary{{"GET", "/a", false}, {"GET", "/b", false}},
 		},
 		{"malformed request line stops parsing", get("/a") + "NOT A REQUEST\r\n\r\n" + get("/b"), []pendingSummary{{"GET", "/a", false}}},
 		{"leading empty line stops parsing", "\r\n" + get("/a"), nil},

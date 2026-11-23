@@ -352,8 +352,15 @@ func (o *connObserver) finishHead() {
 	o.pending = append(o.pending, observed)
 
 	switch {
-	case req.Close || observed.expectFailed:
-		// net/http closes the connection after this request, or after the 417.
+	case observed.expectFailed:
+		// net/http answers this request with a 417 and closes the connection.
+		// req.Close is deliberately not a stop condition: net/http computes it
+		// from every Connection header value, but decides separately whether
+		// it reuses the connection (for HTTP/1.0 it looks only at the first
+		// Connection value), so a request with the close flag can still be
+		// followed by requests on the same connection. A real close needs no
+		// handling here: net/http reads nothing after it, so the queued
+		// requests behind it never get a handler call or a 417.
 		o.stop()
 	case len(req.TransferEncoding) == 1 && req.TransferEncoding[0] == "chunked":
 		o.phase = phaseChunkSize
