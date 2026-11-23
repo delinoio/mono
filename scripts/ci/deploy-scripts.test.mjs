@@ -25,6 +25,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { spawnProcessGroup } from "./fixture-process.mjs";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -3295,22 +3296,13 @@ test(
 
 // Starts droplet-deploy.sh without waiting for it, for the fixtures that run
 // several deployments at once. The promise resolves with the exit status and
-// the output; the process is killed when the test ends.
+// the output; the process and its process group are killed when the test ends,
+// so that a blocked stub does not keep the test runner alive after a failure.
 function startDroplet(t, setup, args, env = {}) {
-  const child = spawn("bash", ["-s", "--", ...args], {
+  const { child, done } = spawnProcessGroup(t, "bash", ["-s", "--", ...args], {
     env: setup.spawnEnv(env),
-    stdio: ["pipe", "pipe", "pipe"],
   });
-  t.after(() => child.kill("SIGKILL"));
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk) => (stdout += chunk));
-  child.stderr.on("data", (chunk) => (stderr += chunk));
   child.stdin.end(readFileSync(dropletDeploy, "utf8"));
-  const done = new Promise((resolve, reject) => {
-    child.on("error", reject);
-    child.on("close", (status) => resolve({ status, stdout, stderr }));
-  });
   return { child, done };
 }
 
