@@ -89,7 +89,8 @@ func stableKey(key string) bool {
 	return true
 }
 
-// MeterFromKey returns the meter of a stable identifier.
+// MeterFromKey returns the meter of a stable identifier. Only the canonical
+// key of a meter (see MeterKey) is accepted.
 func MeterFromKey(key string) (accountsv1.Meter, bool) {
 	service, meter, ok := strings.Cut(key, ".")
 	// Exactly one ".", and both parts hold only a-z, 0-9 and "_": the
@@ -102,7 +103,14 @@ func MeterFromKey(key string) (accountsv1.Meter, bool) {
 	if !ok || v == 0 {
 		return accountsv1.Meter_METER_UNSPECIFIED, false
 	}
-	return accountsv1.Meter(v), true
+	// The enum name does not record where the separator was: the key
+	// "ownsand_relay.egress" maps to the same value as the canonical
+	// "ownsand.relay_egress". Accept only the byte-exact canonical key.
+	m := accountsv1.Meter(v)
+	if canonical, _, ok := MeterKey(m); !ok || canonical != key {
+		return accountsv1.Meter_METER_UNSPECIFIED, false
+	}
+	return m, true
 }
 
 // ServiceMeters returns the meters of a service in Meter order.
