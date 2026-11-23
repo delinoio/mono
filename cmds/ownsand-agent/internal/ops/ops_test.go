@@ -804,11 +804,25 @@ func TestExecContextCanceledWhenForwardingEnds(t *testing.T) {
 	// Control: a running exec keeps its context live.
 	running := e.execReq("/bin/sh", "-c", "sleep 60")
 	rs := &sink{}
+	// Cancelling the context ends the forwarding of the exec, and with it the
+	// handler goroutine, when the test fails before the sandbox ends.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	rdone := make(chan ops.Outcome, 1)
 	go func() {
-		rdone <- e.d.Handle(context.Background(), ops.Request{Frame: datapath.MustNewFrame(1, e.sandbox, running), SandboxID: e.sandbox}, rs)
+		rdone <- e.d.Handle(ctx, ops.Request{Frame: datapath.MustNewFrame(1, e.sandbox, running), SandboxID: e.sandbox}, rs)
 	}()
-	for !e.d.HasRunningExec(e.sandbox) {
+	// The handler returns early when the exec is not admitted, so the wait
+	// also watches its outcome and reports why it ended.
+	for deadline := time.Now().Add(waitBound); !e.d.HasRunningExec(e.sandbox); {
+		select {
+		case out := <-rdone:
+			t.Fatalf("exec handler returned before the exec started: finished %v error %v", out.Finished, out.Error)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("exec did not start within %v", waitBound)
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if err, kept := e.d.ExecContextErr(running.GetExecId()); !kept || err != nil {
@@ -852,7 +866,9 @@ func TestExecContextCanceledWhenForwardingEnds(t *testing.T) {
 	if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: e.sandbox}); err != nil {
 		t.Fatal(err)
 	}
-	<-rdone
+	if _, ok := awaitOutcome(rdone, waitBound); !ok {
+		t.Fatalf("exec handler did not return within %v after the sandbox ended", waitBound)
+	}
 }
 
 // faultySandboxes gives the dispatcher a guest client whose dialer a test
