@@ -1301,6 +1301,168 @@ func TestBillingLinkStaleCompletionDoesNothing(t *testing.T) {
 	}
 }
 
+// TestBillingTakeoverGuardBlocksOwnerRequests checks that the guard of a
+// taken-over link attempt holds for the synchronous paths too: while the
+// call of the old attempt can still be running, an unlink or a replacement
+// link of the new owner sends no UnlinkOrganization and keeps the pending
+// cleanup row; once the guard expires, the next request removes the old
+// remote link and the new owner links.
+func TestBillingTakeoverGuardBlocksOwnerRequests(t *testing.T) {
+	f := newLinkAttemptFixture(t, "tess")
+	ctx := context.Background()
+	gate := f.fake.Hold(accountstest.MethodLinkOrganization)
+	done := make(chan error, 1)
+	go func() { done <- f.link(f.org.OwnerClient, billingAccountA) }()
+	<-gate.Entered
+	if _, err := f.org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: f.org.ID, UserId: f.org.Admin})); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRows(t, 0, 1)
+	var guard *time.Time
+	if err := f.env.DB.Pool.QueryRow(ctx, "SELECT unlink_not_before FROM billing_pending_unlinks WHERE organization_id = $1", f.org.ID).Scan(&guard); err != nil {
+		t.Fatal(err)
+	}
+	if guard == nil || !guard.After(f.env.Clock.Now()) {
+		t.Fatalf("unlink_not_before = %v, want a time after now", guard)
+	}
+
+	newOwner := f.env.User(f.org.Admin)
+	f.fake.AddAccount(billingAccountB, "New owner", map[string]accountsv1.BillingAccountRole{f.org.Admin: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	for i := 0; i < 2; i++ {
+		if err := f.unlink(newOwner); testenv.Code(err) != connect.CodeUnavailable {
+			t.Fatalf("unlink in the grace period: %v, want unavailable", err)
+		}
+		if err := f.link(newOwner, billingAccountB); testenv.Code(err) != connect.CodeUnavailable {
+			t.Fatalf("replacement link in the grace period: %v, want unavailable", err)
+		}
+		f.env.Clock.Advance(10 * time.Second) // still inside the 30-second guard of a running call
+	}
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 0 {
+		t.Fatalf("UnlinkOrganization calls in the grace period = %d, want 0", n)
+	}
+	f.wantRows(t, 0, 1)
+
+	// The old call lands; its completion cannot record the link.
+	gate.Release()
+	if err := <-done; testenv.Code(err) != connect.CodeAborted {
+		t.Fatalf("old completion: %v, want aborted", err)
+	}
+	f.wantLocalLink(t, false)
+	f.wantRemoteLink(t, true)
+	if err := f.unlink(newOwner); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("unlink before the guard expired: %v, want unavailable", err)
+	}
+	f.wantRows(t, 0, 1)
+
+	// After the guard expired, the new owner's link sends the old unlink and links.
+	f.env.Clock.Advance(time.Minute)
+	if err := f.link(newOwner, billingAccountB); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 1 {
+		t.Fatalf("UnlinkOrganization calls after the guard expired = %d, want 1", n)
+	}
+	if account, _, ok := f.fake.Link(f.org.ID); !ok || account != billingAccountB {
+		t.Fatalf("remote link = %q, %v, want the new owner's account", account, ok)
+	}
+	f.wantRows(t, 0, 0)
+}
+
+// holdPendingUnlinkOfNewOwner leaves a due pending unlink of a lost link
+// attempt of the organization and returns the gate that holds its
+// UnlinkOrganization call and a channel for the result of the new owner's
+// link of billingAccountB, which has to send that unlink first inside its
+// first transaction.
+func (f *linkAttemptFixture) holdPendingUnlinkOfNewOwner(t *testing.T) (*accountstest.Gate, <-chan error) {
+	t.Helper()
+	ctx := context.Background()
+	f.loseLinkResponse(t)
+	f.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	if _, err := f.org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: f.org.ID, UserId: f.org.Admin})); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+	f.wantRemoteLink(t, true)
+	f.wantRows(t, 0, 1)
+	f.env.Clock.Advance(time.Hour)
+	f.fake.AddAccount(billingAccountB, "New owner", map[string]accountsv1.BillingAccountRole{f.org.Admin: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	gate := f.fake.Hold(accountstest.MethodUnlinkOrganization)
+	t.Cleanup(gate.Release)
+	done := make(chan error, 1)
+	go func() { done <- f.link(f.env.User(f.org.Admin), billingAccountB) }()
+	<-gate.Entered
+	return gate, done
+}
+
+// TestBillingLinkExpiredBeforeDispatchStartsNoCall checks that a link whose
+// first transaction took longer than the call window starts no
+// LinkOrganization call: the persisted call deadline no longer protects a
+// call that starts now from the cleanup worker. The attempt row is removed
+// because no call was made, and a prompt retry links.
+func TestBillingLinkExpiredBeforeDispatchStartsNoCall(t *testing.T) {
+	f := newLinkAttemptFixture(t, "uma")
+	gate, done := f.holdPendingUnlinkOfNewOwner(t)
+	linkCalls := f.fake.Calls(accountstest.MethodLinkOrganization)
+	// The pending unlink in the first transaction takes a minute; the
+	// recorded deadline was computed from the time before it.
+	f.env.Clock.Advance(time.Minute)
+	gate.Release()
+	if err := <-done; testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("link after a delayed first transaction: %v, want unavailable", err)
+	}
+	if n := f.fake.Calls(accountstest.MethodLinkOrganization); n != linkCalls {
+		t.Fatalf("LinkOrganization calls = %d, want %d: a call started from an expired attempt", n, linkCalls)
+	}
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 2 {
+		t.Fatalf("UnlinkOrganization calls = %d, want 2 (the failed one and the one that the link sent first)", n)
+	}
+	f.wantRows(t, 0, 0)
+	f.wantRemoteLink(t, false)
+	f.wantLocalLink(t, false)
+
+	// A prompt link of the same request completes normally.
+	if err := f.link(f.env.User(f.org.Admin), billingAccountB); err != nil {
+		t.Fatal(err)
+	}
+	if account, _, ok := f.fake.Link(f.org.ID); !ok || account != billingAccountB {
+		t.Fatalf("remote link = %q, %v, want the new owner's account", account, ok)
+	}
+	f.wantRows(t, 0, 0)
+}
+
+// TestBillingLinkBoundsCallToRemainingWindow checks that a link that starts
+// late but inside its window bounds the call to the time that remains, so
+// the call ends before the cleanup can remove the attempt row: the stalled
+// call fails fast, the row stays for the reconciliation and no cleanup
+// removes it while the call could still run.
+func TestBillingLinkBoundsCallToRemainingWindow(t *testing.T) {
+	f := newLinkAttemptFixture(t, "vera")
+	ctx := context.Background()
+	gate, done := f.holdPendingUnlinkOfNewOwner(t)
+	// 100 ms of the 15-second call window remain at the dispatch.
+	f.env.Clock.Advance(billing.LinkCallTimeout - 100*time.Millisecond)
+	linkGate := f.fake.Hold(accountstest.MethodLinkOrganization)
+	t.Cleanup(linkGate.Release)
+	gate.Release()
+	select {
+	case err := <-done:
+		if testenv.Code(err) != connect.CodeUnavailable {
+			t.Fatalf("link with a stalled call: %v, want unavailable", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stalled call was not bounded to the remaining window")
+	}
+	// The call was cut short, so the row stays and the lease holder removes
+	// whatever the call may still create, after the first back-off.
+	f.wantRows(t, 1, 1)
+	linkGate.Release()
+	f.env.Clock.Advance(time.Minute)
+	if err := f.env.App.Billing.RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRows(t, 0, 0)
+}
+
 // linkUpstreamOnly links the organization to billingAccountA on
 // delino-accounts without any local trace: no cached link and no record, as a
 // link that an earlier release lost.
