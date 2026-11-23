@@ -250,24 +250,43 @@ describe("an access token that is no header value", () => {
     expect(error.message).toContain("[redacted]");
   });
 
-  test("still sends a token with only edge whitespace and redacts its trimmed form", async () => {
-    const { h, client } = tokenSetup(() => "sentinel-edge \n");
-    h.api.unary(SandboxService, "GetSandbox", (_req, call) => {
-      throw new ConnectError(
-        `rejected ${call.headers.get("authorization")}`,
-        Code.Unauthenticated,
+  test.each([
+    ["leading spaces", "  sentinel-edge"],
+    ["a leading line feed", "\nsentinel-edge"],
+    ["a trailing space and line feed", "sentinel-edge \n"],
+    ["both edges", " \r\n sentinel-edge \t\n"],
+  ])(
+    "sends a token with %s as the bare token and redacts it",
+    async (_name, token) => {
+      const { h, client } = tokenSetup(() => token);
+      h.api.unary(SandboxService, "GetSandbox", (_req, call) => {
+        throw new ConnectError(
+          `rejected ${call.headers.get("authorization")}`,
+          Code.Unauthenticated,
+        );
+      });
+      const error: any = await client
+        .sandbox(SANDBOX)
+        .get()
+        .catch((e) => e);
+      expect(h.api.calls).toHaveLength(1);
+      expect(h.api.calls[0]!.headers.get("authorization")).toBe(
+        "Bearer sentinel-edge",
       );
-    });
-    const error: any = await client
-      .sandbox(SANDBOX)
-      .get()
+      expect(error.code).toBe(Code.Unauthenticated);
+      expect(chainText(error)).not.toContain("sentinel-edge");
+    },
+  );
+
+  test("still rejects a token whose interior holds a line break after edge whitespace", async () => {
+    const { h, client } = tokenSetup(() => "  sentinel-head\nsentinel-tail \n");
+    const error: any = await h.clock
+      .run(client.sandbox(SANDBOX).get())
       .catch((e) => e);
-    expect(h.api.calls).toHaveLength(1);
-    expect(h.api.calls[0]!.headers.get("authorization")).toBe(
-      "Bearer sentinel-edge",
-    );
-    expect(error.code).toBe(Code.Unauthenticated);
-    expect(chainText(error)).not.toContain("sentinel-edge");
+    expect(error.message).toContain("accessToken returned an invalid token");
+    expect(chainText(error)).not.toContain("sentinel");
+    expect(classifyFailure(error)).toBe(FailureClass.Terminal);
+    expect(h.api.calls).toHaveLength(0);
   });
 });
 
