@@ -592,8 +592,10 @@ func newManualConn(t *testing.T, timing Timing, queue int) (*relay, *rconn) {
 func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
 	r, c := newManualConn(t, Timing{KeepaliveInterval: time.Second, ReceiveTimeout: time.Minute}, 2)
 	now := time.Now()
+	mono := time.Hour
+	c.clock = func() time.Duration { return mono }
 	c.lastRecv.Store(now.UnixNano())
-	c.lastSend.Store(now.Add(-time.Hour).UnixNano())
+	c.lastSend.Store(0)
 	payload := &ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_SUPPORTED_FRAME_KINDS}
 	for i := 0; i < cap(c.out); i++ {
 		if err := c.enqueue(payload); err != nil {
@@ -624,7 +626,7 @@ func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
 		t.Fatalf("queued frame %v, want a plain keepalive", f)
 	}
 	// A keepalive that is not due is not sent.
-	c.lastSend.Store(now.UnixNano())
+	c.markSent()
 	r.watchdogTick(c, now)
 	if len(c.out) != 0 {
 		t.Fatalf("keepalive sent before it was due: %d queued", len(c.out))
@@ -633,10 +635,64 @@ func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
 	for i := 0; i < cap(c.out); i++ {
 		c.enqueue(payload)
 	}
-	c.lastSend.Store(now.Add(-time.Hour).UnixNano())
+	c.lastSend.Store(0)
 	c.lastRecv.Store(now.Add(-2 * time.Minute).UnixNano())
 	if !r.watchdogTick(c, now) {
 		t.Fatal("watchdog did not report the receive timeout with a full queue")
+	}
+}
+
+// TestRelayWatchdogKeepaliveUsesMonotonicClock checks that the keepalive
+// interval follows monotonic time and ignores wall-clock steps, that a
+// successful send resets it, and that a full queue skips it without waiting.
+func TestRelayWatchdogKeepaliveUsesMonotonicClock(t *testing.T) {
+	r, c := newManualConn(t, Timing{KeepaliveInterval: 30 * time.Second, ReceiveTimeout: time.Hour}, 2)
+	var mono time.Duration
+	c.clock = func() time.Duration { return mono }
+	wall := time.Now()
+	c.lastRecv.Store(wall.UnixNano())
+	c.markSent()
+
+	// 5 s of monotonic time with the wall clock 65 s ahead: not due.
+	mono = 5 * time.Second
+	if r.watchdogTick(c, wall.Add(65*time.Second)) || len(c.out) != 0 {
+		t.Fatalf("keepalive sent after 5 s of monotonic time: %d queued", len(c.out))
+	}
+	// 30 s of monotonic time with the wall clock moved back: due exactly once.
+	mono = 30 * time.Second
+	if r.watchdogTick(c, wall.Add(-time.Hour)) {
+		t.Fatal("watchdog timed out a connection with recent inbound bytes")
+	}
+	if len(c.out) != 1 {
+		t.Fatalf("%d keepalives queued, want 1", len(c.out))
+	}
+	if f := <-c.out; f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE {
+		t.Fatalf("queued frame %v, want a keepalive", f)
+	}
+	// A successful send resets the interval.
+	c.markSent()
+	mono = 59 * time.Second
+	r.watchdogTick(c, wall)
+	if len(c.out) != 0 {
+		t.Fatalf("keepalive sent before the interval after a send: %d queued", len(c.out))
+	}
+	mono = 60 * time.Second
+	r.watchdogTick(c, wall)
+	if len(c.out) != 1 {
+		t.Fatalf("%d keepalives queued at the interval after a send, want 1", len(c.out))
+	}
+	// A full queue skips the due keepalive and returns at once.
+	c.enqueue(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_SUPPORTED_FRAME_KINDS})
+	mono = 120 * time.Second
+	done := make(chan struct{})
+	go func() { r.watchdogTick(c, wall); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchdog waited on the full outbound queue")
+	}
+	if len(c.out) != cap(c.out) {
+		t.Fatalf("full queue changed: %d queued", len(c.out))
 	}
 }
 
