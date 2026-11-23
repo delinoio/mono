@@ -706,6 +706,17 @@ func TestRelayConnectionRules(t *testing.T) {
 	r3 := agent.ConnectRelay(serveExec)
 	stop3 := keepAlive(r3)
 	defer stop3()
+	// ConnectRelay does not wait for the server, and a connection that the
+	// server rejected before it registered also reports Closed. The echo
+	// proves that r3 is registered, so the close below is caused by the agent
+	// channel.
+	r3.SendFrame(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE, Payload: &ownsandv1.DataFrame_RelayKeepalive{RelayKeepalive: &ownsandv1.RelayKeepalive{EchoRequested: true}}})
+	r3.WaitFrame("keepalive on the third connection", func(f *ownsandv1.DataFrame) bool { return f.GetRelayKeepalive() != nil })
+	select {
+	case <-r3.Closed():
+		t.Fatal("the third connection closed before its agent channel")
+	default:
+	}
 	agent.Close()
 	select {
 	case <-r3.Closed():
