@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { OwnSandClient } from "./client.ts";
@@ -13,7 +13,10 @@ import {
 } from "./errors.ts";
 import { BaseImage, SandboxState } from "@delino/ownsand-protos/v1/common_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
-import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
+import {
+  CreateSandboxRequestSchema,
+  SandboxService,
+} from "@delino/ownsand-protos/v1/sandbox_pb";
 import { API_KEY, ORG, SANDBOX, setup } from "./testing/harness.ts";
 
 const HOUR = 3_600_000;
@@ -514,6 +517,9 @@ describe("transport failures keep their classification through the client redact
     async (_name, _kind, credential, fail) => {
       const h = setup();
       let failed = 0;
+      // Idempotency keys observed at the fetch boundary, including the
+      // attempt that the adapter drops before it reaches the fake API.
+      const keys: string[] = [];
       const client = new OwnSandClient({
         origin: h.api.origin,
         ...credential,
@@ -523,8 +529,16 @@ describe("transport failures keep their classification through the client redact
         env: {},
         fetch: async (input, init) => {
           const url = typeof input === "string" ? input : String(input);
-          if (url.endsWith("/CreateSandbox") && failed++ === 0) {
-            throw fail();
+          if (url.endsWith("/CreateSandbox")) {
+            if (!(init?.body instanceof Uint8Array)) {
+              throw new Error("expected a binary unary request body");
+            }
+            keys.push(
+              fromBinary(CreateSandboxRequestSchema, init.body).idempotencyKey,
+            );
+            if (failed++ === 0) {
+              throw fail();
+            }
           }
           return h.api.fetch(input, init);
         },
@@ -535,6 +549,9 @@ describe("transport failures keep their classification through the client redact
       const sandbox = await h.clock.run(client.createSandbox(validCreate));
       expect(sandbox.sandboxId).toBe(SANDBOX);
       expect(failed).toBe(2);
+      expect(keys).toHaveLength(2);
+      expect(keys[0]).not.toBe("");
+      expect(keys[1]).toBe(keys[0]);
       expect(h.api.callsOf("CreateSandbox")).toHaveLength(1);
     },
   );
