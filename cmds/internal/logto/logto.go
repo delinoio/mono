@@ -16,9 +16,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -91,7 +94,34 @@ func (c Config) client() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return &http.Client{Timeout: 30 * time.Second}
+	return defaultClient()
+}
+
+const (
+	// defaultRequestTimeout bounds a whole request of the default client.
+	defaultRequestTimeout = 30 * time.Second
+	// defaultDialTimeout bounds establishing the connection of the default
+	// client. It must stay below defaultRequestTimeout: the overall client
+	// timeout would otherwise end a stuck connect first, with an error that
+	// holds no *net.OpError, and PollToken could not tell the connection
+	// timeout (which it backs off on) from a response timeout.
+	defaultDialTimeout = 10 * time.Second
+)
+
+// defaultClient returns the shared client that is used when
+// Config.HTTPClient is nil.
+var defaultClient = sync.OnceValue(func() *http.Client {
+	return newDefaultClient(defaultDialTimeout)
+})
+
+// newDefaultClient returns a client with the overall defaultRequestTimeout
+// and a connect timeout of dialTimeout. It clones http.DefaultTransport, so
+// the proxy, TLS handshake and HTTP/2 settings stay the same.
+func newDefaultClient(dialTimeout time.Duration) *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
+	tr.DialContext = dialer.DialContext
+	return &http.Client{Timeout: defaultRequestTimeout, Transport: tr}
 }
 
 func (c Config) endpoint(path string) string {
@@ -183,6 +213,9 @@ func (da *DeviceAuthorization) lifetime() time.Duration {
 // PollToken polls the token endpoint until the user signs in, denies the
 // request or the device code expires. It waits at least 5 seconds between
 // requests (more after slow_down); minInterval overrides that for tests.
+// A timeout while the connection to the endpoint is established doubles the
+// interval for the later requests (RFC 8628 section 3.5); any other
+// transport failure ends the polling.
 //
 // The local expiry deadline (expires_in seconds after the device
 // authorization response, or 10 minutes after it when expires_in is not
@@ -248,7 +281,18 @@ func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInter
 		}
 		var oe *Error
 		if !errors.As(err, &oe) {
-			return nil, ended(err)
+			if stop := ended(nil); stop != nil {
+				return nil, stop
+			}
+			if !isDialTimeout(err) {
+				return nil, err
+			}
+			// RFC 8628 section 3.5: back off after a connection timeout
+			// and keep the longer interval for the later polls.
+			if interval <= maxPollInterval/2 {
+				interval *= 2
+			}
+			continue
 		}
 		switch oe.Code {
 		case "authorization_pending":
@@ -262,6 +306,20 @@ func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInter
 			return nil, err
 		}
 	}
+}
+
+// maxPollInterval stops the connection-timeout backoff of PollToken from
+// overflowing; the device code expiry ends the polling long before.
+const maxPollInterval = time.Duration(math.MaxInt64 / 4)
+
+// isDialTimeout reports whether err is a timeout while the connection to the
+// token endpoint was being established. A timeout of a response or of the
+// body (Op "read" or the client timeout after the connection was made) is
+// not one. The caller must check the caller and device-grant contexts first:
+// a dial that ends at their deadline also reports a timeout.
+func isDialTimeout(err error) bool {
+	var oe *net.OpError
+	return errors.As(err, &oe) && oe.Op == "dial" && oe.Timeout()
 }
 
 // Refresh exchanges a refresh token for an access token of the configured
