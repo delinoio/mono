@@ -618,9 +618,15 @@ func TestRemovedDeviceAfterOrganizationDeletion(t *testing.T) {
 		t.Fatalf("authenticate after organization deletion: %v, %v", resp, err)
 	}
 	var audits, jobs, orgs int
-	_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND action = 18 AND end_reason = 5", org.ID).Scan(&audits)
-	_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM r2_cleanup_jobs WHERE prefix = $1", "organizations/"+org.ID+"/").Scan(&jobs)
-	_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM organizations WHERE organization_id = $1", org.ID).Scan(&orgs)
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND action = 18 AND end_reason = 5", org.ID).Scan(&audits); err != nil {
+		t.Fatalf("count audit events: %v", err)
+	}
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM r2_cleanup_jobs WHERE prefix = $1", "organizations/"+org.ID+"/").Scan(&jobs); err != nil {
+		t.Fatalf("count r2 cleanup jobs: %v", err)
+	}
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM organizations WHERE organization_id = $1", org.ID).Scan(&orgs); err != nil {
+		t.Fatalf("count organizations: %v", err)
+	}
 	if audits != 1 || jobs != 1 || orgs != 0 {
 		t.Fatalf("sandbox audits = %d, cleanup jobs = %d, organizations = %d", audits, jobs, orgs)
 	}
