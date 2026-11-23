@@ -5,6 +5,7 @@ import {
   chmodSync,
   existsSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   writeFileSync,
@@ -713,6 +714,135 @@ test(
     await waitGone(run, pids, "the server to be killed");
     await assertNoListener(port);
     assert.equal(existsSync(run.tmp), false, "the test TMPDIR was not removed");
+  },
+);
+
+// A fake `go` whose build leaves a background `sleep` in the build's process
+// group, like the signal fixtures do, but never cleans it up itself: only the
+// test teardown can end it. It publishes "<shell pid> <sleep pid>" in a file of
+// a test-owned directory (written to a temporary name first and renamed, so a
+// reader never sees a partial line). The sleep inherits the launcher's output
+// pipes, so the launcher's `close` event cannot settle while it runs; its length
+// is far above every test timeout, so a teardown that misses it fails the test
+// instead of waiting it out. With `ignoreTerm` the shell and the sleep ignore
+// SIGTERM (an ignored disposition survives exec), so the supervisor's SIGTERM
+// after the launcher died does not end them and only a group SIGKILL does.
+function backgroundDescendantFixture(t, { ignoreTerm = false } = {}) {
+  const markerDir = mkdtempSync(join(tmpdir(), "accounts-api-marker-"));
+  const pidsFile = join(markerDir, "pids");
+  const script = [
+    ...(ignoreTerm ? ["trap '' TERM"] : []),
+    "sleep 300 &",
+    'echo "$$ $!" > "$PIDS_FILE.tmp" && mv "$PIDS_FILE.tmp" "$PIDS_FILE"',
+    "wait",
+  ].join("\n");
+  const fixture = {
+    pids: [],
+    env: { PIDS_FILE: pidsFile },
+    pathPrefix: fakeGo(t, script),
+    // Resolves once the fake build has published its pids and records them.
+    async waitForPids(run) {
+      await waitFor(run, () => existsSync(pidsFile), "the build descendant");
+      fixture.pids = readFileSync(pidsFile, "utf8")
+        .trim()
+        .split(" ")
+        .map(Number);
+      return fixture.pids;
+    },
+  };
+  // Independent of the launcher cleanup under test: a failed assertion must not
+  // leak the sleep, so this ends the recorded processes and the build's group
+  // on its own. Its own failure to find them (already gone) is not an error.
+  t.after(() => {
+    const groups = fixture.pids.map((pid) => {
+      try {
+        return Number(
+          execFileSync("ps", ["-o", "pgid=", "-p", String(pid)], {
+            encoding: "utf8",
+          }).trim(),
+        );
+      } catch {
+        return 0;
+      }
+    });
+    for (const target of [
+      ...groups.filter(Boolean).map((g) => -g),
+      ...fixture.pids,
+    ]) {
+      try {
+        process.kill(target, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+    rmSync(markerDir, { recursive: true, force: true });
+  });
+  return fixture;
+}
+
+// Resolves once the launcher's `close` event fired, which needs every output
+// pipe closed. A leftover descendant that holds a pipe keeps it pending.
+async function waitClosed(run) {
+  let closed = false;
+  run.exited.then(() => (closed = true));
+  await waitFor(run, () => closed, "the launcher's output pipes to close");
+}
+
+test(
+  "the test cleanup kills a background descendant of the build group",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const port = await freePort();
+    const fixture = backgroundDescendantFixture(t);
+    const run = startLauncher(t, {
+      port,
+      env: fixture.env,
+      pathPrefix: fixture.pathPrefix,
+    });
+    const pids = await fixture.waitForPids(run);
+    assert.ok(pids.every(isRunning), "the fake build did not start");
+
+    // No signal reaches the fake build's trap or the launcher beforehand: the
+    // shell and the sleep end only through the cleanup's group kill.
+    stopLauncher(run);
+
+    await waitClosed(run);
+    await waitGone(run, pids, "the build and its descendant to be killed");
+    assert.equal(existsSync(run.tmp), false, "the test TMPDIR was not removed");
+    await assertNoListener(port);
+  },
+);
+
+test(
+  "the test cleanup kills a recorded build group after the launcher died",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const port = await freePort();
+    // The shell and the sleep ignore the supervisor's SIGTERM, so after the
+    // launcher died they live until the supervisor's SIGKILL, five seconds later.
+    const fixture = backgroundDescendantFixture(t, { ignoreTerm: true });
+    const run = startLauncher(t, {
+      port,
+      env: fixture.env,
+      pathPrefix: fixture.pathPrefix,
+    });
+    const pids = await fixture.waitForPids(run);
+    recordChildren(run);
+    assert.ok(run.childPids.size > 0, "no child of the launcher was recorded");
+
+    // The launcher's own group holds the launcher only, so the build group, with
+    // the descendant that holds the output pipes, survives its death.
+    process.kill(-run.child.pid, "SIGKILL");
+    assert.ok(pids.every(isRunning), "the build group ended with the launcher");
+
+    // The launcher is gone, so the cleanup finds no children of it and has only
+    // the recorded pids to work with.
+    stopLauncher(run);
+
+    await waitClosed(run);
+    await waitGone(run, pids, "the build and its descendant to be killed");
+    assert.equal(existsSync(run.tmp), false, "the test TMPDIR was not removed");
+    await assertNoListener(port);
   },
 );
 
