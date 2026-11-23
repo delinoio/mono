@@ -22,11 +22,29 @@ fi
 exit 0
 `
 
-// stubFile is a file replacement that reports every file as statically
-// linked, because the script rejects a busybox that file does not call static
-// and the stub busybox is a shell script.
+// stubFile is a file replacement. It describes its last argument as
+// $STUB_FILE_DESCRIPTION (default "statically linked") because the script
+// rejects a busybox that file does not call static and the stub busybox is a
+// shell script. Like the real file, it describes a symbolic link as a link
+// unless -L is given, and it prints "cannot open" and exits 0 for a missing
+// target.
 const stubFile = `#!/usr/bin/env bash
-echo "$1: ELF 64-bit LSB executable, statically linked"
+follow=0
+target=""
+for arg in "$@"; do
+  case "$arg" in
+    -L) follow=1 ;;
+    --) ;;
+    *) target="$arg" ;;
+  esac
+done
+if [ "$follow" = 0 ] && [ -L "$target" ]; then
+  echo "$target: symbolic link to $(readlink "$target")"
+elif [ ! -e "$target" ]; then
+  echo "$target: cannot open ('No such file or directory')"
+else
+  echo "$target: ELF 64-bit LSB executable, ${STUB_FILE_DESCRIPTION:-statically linked}"
+fi
 `
 
 // rootfsBuild is one prepared run of build-rootfs.sh.
@@ -178,4 +196,62 @@ func TestWorkingAppletListingBuildsTheImage(t *testing.T) {
 		t.Fatalf("image size = %d, want %d", info.Size(), 8<<20)
 	}
 	b.requireNoScratch()
+}
+
+func TestBusyboxLinkageCheck(t *testing.T) {
+	if _, err := exec.LookPath("mkfs.ext4"); err != nil {
+		if _, statErr := os.Stat("/usr/sbin/mkfs.ext4"); statErr != nil {
+			t.Skip("mkfs.ext4 is not available")
+		}
+	}
+	const applets = "STUB_APPLETS=sh\nls\nbusybox\ninit"
+	cases := []struct {
+		name        string
+		description string
+		link        bool
+		dangling    bool
+		wantBuild   bool
+	}{
+		{name: "static", description: "statically linked", wantBuild: true},
+		{name: "static-pie", description: "static-pie linked", wantBuild: true},
+		{name: "symlink to static", description: "statically linked", link: true, wantBuild: true},
+		{name: "symlink to static-pie", description: "static-pie linked", link: true, wantBuild: true},
+		{name: "dynamic", description: "dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2"},
+		{name: "symlink to dynamic", description: "dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2", link: true},
+		{name: "dangling symlink", description: "statically linked", link: true, dangling: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newRootfsBuild(t)
+			busybox := filepath.Join(b.dir, "bin", "busybox")
+			if tc.link {
+				target := busybox
+				if tc.dangling {
+					target = filepath.Join(b.dir, "missing-busybox")
+				}
+				link := filepath.Join(b.dir, "busybox-link")
+				if err := os.Symlink(target, link); err != nil {
+					t.Fatal(err)
+				}
+				busybox = link
+			}
+			out, err := b.run(applets, "BUSYBOX="+busybox, "STUB_FILE_DESCRIPTION="+tc.description)
+			if tc.wantBuild {
+				if err != nil {
+					t.Fatalf("the build failed: %v\n%s", err, out)
+				}
+				if _, statErr := os.Stat(b.out); statErr != nil {
+					t.Fatalf("the build wrote no image: %v", statErr)
+				}
+				return
+			}
+			requireFailure(t, out, err)
+			if !strings.Contains(out, "busybox must be statically linked") {
+				t.Fatalf("output lacks the linkage message:\n%s", out)
+			}
+			if _, statErr := os.Stat(b.out); !os.IsNotExist(statErr) {
+				t.Fatalf("the failed build left an output file: %v", statErr)
+			}
+		})
+	}
 }
