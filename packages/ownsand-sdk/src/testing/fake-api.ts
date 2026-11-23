@@ -194,6 +194,12 @@ export class FakeApi {
           : input.url,
     );
     this.fetchedUrls.push(url.href);
+    // Like a real fetch, a call that is canceled before it is dispatched
+    // rejects with the signal's reason and reaches no handler. It must leave
+    // no call record and consume no per-method index, so the next live call
+    // sees the script start.
+    const signal = init?.signal ?? new AbortController().signal;
+    if (signal.aborted) throw signal.reason;
     const path = url.pathname;
     const method = METHODS.get(path);
     if (method === undefined) {
@@ -203,7 +209,8 @@ export class FakeApi {
     const body = new Uint8Array(
       await new Response(init?.body as BodyInit).arrayBuffer(),
     );
-    const signal = init?.signal ?? new AbortController().signal;
+    // The body read is asynchronous, so the caller can cancel during it.
+    if (signal.aborted) throw signal.reason;
     const index = this.#counts.get(path) ?? 0;
     this.#counts.set(path, index + 1);
     const call: CallContext = { headers, signal, index };
