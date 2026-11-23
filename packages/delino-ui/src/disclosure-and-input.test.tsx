@@ -1519,6 +1519,15 @@ describe("Skeleton", () => {
     expect(circle).toContain("justify-self: flex-start");
   });
 
+  test("keeps a circle from shrinking in a constrained flex row", () => {
+    // happy-dom computes no layout, so the stylesheet text is checked. A flex
+    // item has `flex-shrink: 1` and a zero automatic minimum width, so a row
+    // with less room than the diameter would narrow the circle below its size.
+    expect(block(".dui-skeleton[data-circle]")).toContain("flex-shrink: 0");
+    // A rectangular Skeleton keeps the default and can still shrink.
+    expect(block(".dui-skeleton")).not.toContain("flex-shrink");
+  });
+
   test("lets the caller style win over the circle diameter", () => {
     const { container } = render(<Skeleton circle style={{ width: "24px" }} />);
 
