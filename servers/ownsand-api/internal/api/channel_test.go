@@ -1300,8 +1300,11 @@ func TestSnapshotsTemplatesAndExport(t *testing.T) {
 	env.Clock.Advance(16 * time.Minute)
 	env.App.Control.RunCleanupOnce(ctx)
 	var jobs int
-	_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM r2_cleanup_jobs").Scan(&jobs)
-	if got := env.Objects.DeletedPrefixes(); len(got) != 2 || jobs != 0 {
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM r2_cleanup_jobs").Scan(&jobs); err != nil {
+		t.Fatalf("count cleanup jobs: %v", err)
+	}
+	// Both sweeps use the snapshot prefix and the finished job is deleted.
+	if got := env.Objects.DeletedPrefixes(); len(got) != 2 || got[0] != prefix || got[1] != prefix || jobs != 0 {
 		t.Fatalf("final sweep = %v, jobs left = %d", got, jobs)
 	}
 }
@@ -1316,7 +1319,9 @@ func TestOrganizationDeletionFinalSweepRetries(t *testing.T) {
 	env.Objects.SetFail(errFake)
 	env.App.Control.RunCleanupOnce(ctx)
 	var attempts int
-	_ = env.DB.Pool.QueryRow(ctx, "SELECT attempts FROM r2_cleanup_jobs").Scan(&attempts)
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT attempts FROM r2_cleanup_jobs").Scan(&attempts); err != nil {
+		t.Fatalf("read cleanup job attempts: %v", err)
+	}
 	if attempts != 1 || len(env.Objects.DeletedPrefixes()) != 0 {
 		t.Fatalf("attempts = %d", attempts)
 	}
@@ -1324,8 +1329,13 @@ func TestOrganizationDeletionFinalSweepRetries(t *testing.T) {
 	env.Clock.Advance(20 * time.Minute)
 	env.App.Control.RunCleanupOnce(ctx)
 	var jobs int
-	_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM r2_cleanup_jobs").Scan(&jobs)
-	if got := env.Objects.DeletedPrefixes(); len(got) != 2 || got[0] != "organizations/"+org.ID+"/" || jobs != 0 {
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM r2_cleanup_jobs").Scan(&jobs); err != nil {
+		t.Fatalf("count cleanup jobs: %v", err)
+	}
+	// The failed attempt deleted nothing; the first and the final sweep then
+	// both use the organization prefix and the finished job is deleted.
+	orgPrefix := "organizations/" + org.ID + "/"
+	if got := env.Objects.DeletedPrefixes(); len(got) != 2 || got[0] != orgPrefix || got[1] != orgPrefix || jobs != 0 {
 		t.Fatalf("sweeps = %v, jobs = %d", got, jobs)
 	}
 }
