@@ -5,6 +5,8 @@ package api_test
 import (
 	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -435,18 +437,33 @@ func TestUppercaseSandboxIDInCommandResultWakesWaiter(t *testing.T) {
 	waitState(t, c, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 	// The agent answers the delete after the waiter registered, with the
 	// uppercase spelling of the ID.
+	//
+	// The callback blocks on release. Release it on every exit path: a test
+	// that fails while it waits for the watcher (for example, when
+	// startDeleteWaiter times out) would otherwise leave the callback and the
+	// in-flight DeleteSandbox running past the test. Cleanups run last in,
+	// first out, so this one runs before the environment shuts down.
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseCallback := func() { releaseOnce.Do(func() { close(release) }) }
+	var started, exited atomic.Int32
+	t.Cleanup(func() {
+		releaseCallback()
+		testenv.Eventually(t, "delete command callback returned", func() bool { return exited.Load() == started.Load() })
+	})
 	agent.SetOnCommand(func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
 		if cmd.GetDeleteSandbox() == nil {
 			return fa.DefaultAnswer(cmd)
 		}
+		started.Add(1)
+		defer exited.Add(1)
 		<-release
 		res := fa.DefaultAnswer(cmd)
 		res.GetSandbox().Sandbox = withUpperID(t, res.GetSandbox().GetSandbox())
 		return res
 	})
 	w := startDeleteWaiter(t, env, org, id)
-	close(release)
+	releaseCallback()
 	if !w.wait(5 * time.Second) {
 		t.Fatal("the delete did not return")
 	}
