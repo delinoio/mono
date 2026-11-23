@@ -28,7 +28,17 @@ var _ ownsandv1connect.MemberServiceHandler = MemberHandler{}
 const invitationColumns = `invitation_id::text, organization_id::text, role, secret_prefix, created_by_kind, created_by_id,
 	create_time, expire_time, accept_time, revoke_time`
 
+// scanInvitation decodes an invitation row and derives its state from the
+// current clock.
 func (s *Service) scanInvitation(row pgx.Row) (*ownsandv1.Invitation, error) {
+	return s.scanInvitationAt(row, s.now())
+}
+
+// scanInvitationAt decodes an invitation row and derives its state as of now.
+// A caller that selects rows with a time predicate passes the cutoff of that
+// predicate, so that the state of a selected row cannot disagree with the
+// selection when the clock moves between the query and the decode.
+func (s *Service) scanInvitationAt(row pgx.Row, now time.Time) (*ownsandv1.Invitation, error) {
 	var inv ownsandv1.Invitation
 	var role, kind int16
 	var createdBy string
@@ -46,7 +56,7 @@ func (s *Service) scanInvitation(row pgx.Row) (*ownsandv1.Invitation, error) {
 		inv.State = ownsandv1.InvitationState_INVITATION_STATE_ACCEPTED
 	case revoked != nil:
 		inv.State = ownsandv1.InvitationState_INVITATION_STATE_REVOKED
-	case !s.now().Before(expires):
+	case !now.Before(expires):
 		inv.State = ownsandv1.InvitationState_INVITATION_STATE_EXPIRED
 	default:
 		inv.State = ownsandv1.InvitationState_INVITATION_STATE_PENDING
@@ -115,16 +125,20 @@ func (h MemberHandler) ListInvitations(ctx context.Context, req *connect.Request
 	if err != nil {
 		return nil, err
 	}
+	// One cutoff selects the rows and derives their state, so every returned
+	// invitation is pending as of the cutoff even when the clock passes an
+	// expiry while the page is read.
+	cutoff := h.now()
 	rows, err := h.DB.Pool.Query(ctx, `SELECT `+invitationColumns+` FROM invitations
 		WHERE organization_id = $1 AND invitation_id > $2 AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $3
-		ORDER BY invitation_id LIMIT $4`, orgID, afterKey(after), h.now(), limit)
+		ORDER BY invitation_id LIMIT $4`, orgID, afterKey(after), cutoff, limit)
 	if err != nil {
 		return nil, h.internal(ctx, "list invitations", err)
 	}
 	defer rows.Close()
 	resp := &ownsandv1.ListInvitationsResponse{}
 	for rows.Next() {
-		inv, err := h.scanInvitation(rows)
+		inv, err := h.scanInvitationAt(rows, cutoff)
 		if err != nil {
 			return nil, h.internal(ctx, "list invitations", err)
 		}
