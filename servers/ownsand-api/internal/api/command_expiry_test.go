@@ -22,6 +22,24 @@ func withholdAll(a *testenv.FakeAgent) {
 	a.SetOnCommand(func(*testenv.FakeAgent, *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult { return nil })
 }
 
+// waitPauseCommandID waits for the pause command of the sandbox on the fake
+// agent and returns its command ID. PauseSandbox can return before the fake
+// agent's read loop recorded the command (the API stops waiting once its
+// command wait ends or the command is queued), so the return of the RPC is
+// not proof of receipt. A missing command fails through the bounded wait of
+// WaitFor.
+func waitPauseCommandID(t *testing.T, agent *testenv.FakeAgent, sandboxID string) string {
+	t.Helper()
+	env := agent.WaitFor("pause command of sandbox "+sandboxID, func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCommand().GetPauseSandbox().GetSandboxId() == sandboxID
+	})
+	id := env.GetCommand().GetCommandId()
+	if id == "" {
+		t.Fatal("the pause command has no command ID")
+	}
+	return id
+}
+
 func commandExpiryTiming() *api.Timing {
 	return &api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 300 * time.Millisecond, EventPoll: 50 * time.Millisecond, OfflineSweep: 50 * time.Millisecond,
 		CleanupPoll: time.Hour, ImportWait: time.Second, CommandGrace: api.DefaultCommandGrace}
@@ -121,15 +139,7 @@ func TestClosingOldGenerationKeepsReplacementCommands(t *testing.T) {
 	if got := svc.PendingCommands(); got != 2 {
 		t.Fatalf("pending commands with both channels = %d, want 2", got)
 	}
-	var commandB string
-	for _, cmd := range agentB.Commands() {
-		if cmd.GetPauseSandbox() != nil {
-			commandB = cmd.GetCommandId()
-		}
-	}
-	if commandB == "" {
-		t.Fatal("channel B received no pause command")
-	}
+	commandB := waitPauseCommandID(t, agentB, sandboxID)
 
 	// A's command expires; B's stays.
 	env.Clock.Advance(api.DefaultCommandGrace + time.Second)
@@ -165,15 +175,7 @@ func pauseWithLostResult(t *testing.T, env *testenv.Env, org *testenv.Org) (*tes
 	if _, err := c.Sandbox.PauseSandbox(ctx, connect.NewRequest(&ownsandv1.PauseSandboxRequest{OrganizationId: org.ID, SandboxId: sandboxID})); err != nil {
 		t.Fatal(err)
 	}
-	var commandID string
-	for _, cmd := range agentA.Commands() {
-		if cmd.GetPauseSandbox() != nil {
-			commandID = cmd.GetCommandId()
-		}
-	}
-	if commandID == "" {
-		t.Fatal("no pause command")
-	}
+	commandID := waitPauseCommandID(t, agentA, sandboxID)
 	agentA.Close()
 	testenv.Eventually(t, "the close marked the pause command", func() bool { return countLogs(env, `"commands_marked_for_expiry":1`) == 1 })
 	agentB := env.NewFakeAgent(dev)
@@ -264,15 +266,7 @@ func TestWrongDeviceResultKeepsPendingCommand(t *testing.T) {
 	if _, err := c.Sandbox.PauseSandbox(ctx, connect.NewRequest(&ownsandv1.PauseSandboxRequest{OrganizationId: org.ID, SandboxId: sandboxID})); err != nil {
 		t.Fatal(err)
 	}
-	var commandID string
-	for _, cmd := range agentA.Commands() {
-		if cmd.GetPauseSandbox() != nil {
-			commandID = cmd.GetCommandId()
-		}
-	}
-	if commandID == "" {
-		t.Fatal("device A received no pause command")
-	}
+	commandID := waitPauseCommandID(t, agentA, sandboxID)
 	if got := svc.PendingCommands(); got != 1 {
 		t.Fatalf("pending commands after the pause = %d, want 1", got)
 	}
