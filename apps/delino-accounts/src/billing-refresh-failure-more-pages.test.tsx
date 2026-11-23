@@ -83,13 +83,16 @@ test("a failed refresh of a partially loaded list pauses the continuation until 
   expect(rows()).toHaveLength(200);
   expect(pageTokens(api)).toEqual(["", "p1"]);
 
-  // A refocus refresh now fails on page one.
+  // A reconnect refresh now fails on page one. A focus of the tab does not
+  // refresh a list that waits for the retry of a failed later page (see
+  // billing-focus-after-continuation-failure.test.tsx), but a reconnect does.
   api.failNext.set(
     "ListBillingAccounts",
     new ConnectError("busy", Code.ResourceExhausted),
   );
   await act(async () => {
-    window.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("offline"));
+    window.dispatchEvent(new Event("online"));
   });
   const notice = (await screen.findByText(REFRESH_NOTICE)).closest(
     '[role="alert"]',
