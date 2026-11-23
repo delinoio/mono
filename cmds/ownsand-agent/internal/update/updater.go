@@ -344,7 +344,7 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
 		return err
 	}
-	if c, _ := semver.CompareStrings(target, u.opts.Running); c == 0 {
+	if c, err := semver.CompareStrings(target, u.opts.Running); err == nil && c == 0 {
 		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
 		return nil
 	}
@@ -375,7 +375,7 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	// The control plane decides lower targets: a pinned version or a
 	// revocation recovery. The agent cannot see the organization policy,
 	// so it installs the verified target that the control plane sent.
-	if c, _ := semver.CompareStrings(target, u.opts.Running); c < 0 {
+	if c, err := semver.CompareStrings(target, u.opts.Running); err == nil && c < 0 {
 		u.opts.Logger.Info("agent update installs a lower version", "target_version", target, "revocation_recovery", cmd.GetRevocationRecovery())
 	}
 	u.mu.Lock()
