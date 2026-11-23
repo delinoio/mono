@@ -264,6 +264,7 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 			// parts by number, so the database would reject the second
 			// insert and abort the transaction instead of failing the attempt.
 			seen := make(map[int32]struct{}, len(result.GetParts()))
+			var highest int32
 			for _, part := range result.GetParts() {
 				if part.GetPartNumber() < 1 || part.GetPartNumber() > maxSnapshotParts || len(part.GetSha256()) != 32 || part.GetSizeBytes() < 0 {
 					reason = "invalid_part"
@@ -274,6 +275,18 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 					break
 				}
 				seen[part.GetPartNumber()] = struct{}{}
+				highest = max(highest, part.GetPartNumber())
+			}
+			// The numbers must also form the contiguous set 1..N: a restore
+			// reads the manifest in ascending order and the agent rejects
+			// an ordered list that does not start at 1 and rise by one, so
+			// a snapshot with a gap or a first number above 1 could never
+			// be imported. Every number is unique and within 1..10000
+			// here, so the set is exactly 1..N when the highest number
+			// equals the part count. The order of the reported parts does
+			// not matter.
+			if reason == "" && int(highest) != len(result.GetParts()) {
+				reason = "invalid_part"
 			}
 		}
 		if reason != "" {
