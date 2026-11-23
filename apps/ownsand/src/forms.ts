@@ -90,6 +90,9 @@ export function resourceErrors(input: ResourceInput): {
 
 const utf8 = new TextEncoder();
 
+/** U+0000, which `go/ownsand/validate` rejects in a label key or value. */
+const NUL = "\u0000";
+
 /**
  * Parses labels written as one `key=value` pair per line. Labels must not
  * contain secrets: every member and API key can read them.
@@ -105,9 +108,18 @@ export function parseLabels(
     if (line === "") continue;
     const at = line.indexOf("=");
     if (at <= 0)
-      return { error: `Write each label as key=value: "${line.slice(0, 40)}"` };
+      return {
+        // A NUL character in the echo would make the message unreadable.
+        error: `Write each label as key=value: "${line.slice(0, 40).replaceAll(NUL, "")}"`,
+      };
     const key = line.slice(0, at).trim();
     const value = line.slice(at + 1).trim();
+    // The control plane rejects U+0000 in a label because PostgreSQL cannot
+    // store it, so the form reports it before it sends the request.
+    if (key.includes(NUL))
+      return { error: "A label key must not contain a NUL character." };
+    if (value.includes(NUL))
+      return { error: "A label value must not contain a NUL character." };
     if (utf8.encode(key).length > 63)
       return { error: "A label key has at most 63 bytes." };
     if (utf8.encode(value).length > 255)
