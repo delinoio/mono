@@ -16,11 +16,15 @@ import (
 )
 
 // Control runs the lease holder's background work: the control event
-// processor, the offline sweep and the R2 clean-up worker.
+// processor, the offline sweep, the R2 clean-up worker and the export
+// verifier.
 type Control struct {
 	S *Service
 
 	kick chan struct{}
+
+	// noExportVerifyStore logs once that the verifier has no object store.
+	noExportVerifyStore sync.Once
 
 	mu sync.Mutex
 	// cursor is the last processed control event; -1 means unset.
@@ -140,10 +144,11 @@ func (leaseLostError) Error() string { return "the instance released the lease" 
 // Run runs the workers until ctx ends.
 func (c *Control) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() { defer wg.Done(); c.runEvents(ctx) }()
 	go func() { defer wg.Done(); c.runOfflineSweep(ctx) }()
 	go func() { defer wg.Done(); c.runCleanup(ctx) }()
+	go func() { defer wg.Done(); c.runExportVerifier(ctx) }()
 	wg.Wait()
 }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 
-// Package objectstore signs URLs for snapshot export parts and deletes
-// object prefixes in Cloudflare R2 through its S3-compatible API. The
+// Package objectstore signs URLs for snapshot export parts and lists and
+// deletes object prefixes in Cloudflare R2 through its S3-compatible API. The
 // signer is pluggable: tests use Memory. The owning contract is the Storage
 // section of docs/servers-ownsand-api-foundation.md.
 package objectstore
@@ -23,12 +23,22 @@ import (
 	"time"
 )
 
-// Store issues signed URLs and deletes prefixes.
+// Object is one listed object: its key and its size in bytes.
+type Object struct {
+	Key  string
+	Size int64
+}
+
+// Store issues signed URLs, lists prefixes and deletes them.
 type Store interface {
 	// PresignPut returns a signed upload URL of key that expires after ttl.
 	PresignPut(key string, ttl time.Duration) (string, time.Time, error)
 	// PresignGet returns a signed download URL of key.
 	PresignGet(key string, ttl time.Duration) (string, time.Time, error)
+	// ListPrefix returns every object whose key starts with prefix, with its
+	// size, in key order. It returns an error, never a partial list, when
+	// the store cannot deliver the complete listing.
+	ListPrefix(ctx context.Context, prefix string) ([]Object, error)
 	// DeletePrefix deletes every object whose key starts with prefix.
 	DeletePrefix(ctx context.Context, prefix string) error
 }
@@ -205,20 +215,23 @@ func (r *R2) do(ctx context.Context, method string, u *url.URL) (*http.Response,
 
 type listResult struct {
 	Contents []struct {
-		Key string `xml:"Key"`
+		Key  string `xml:"Key"`
+		Size int64  `xml:"Size"`
 	} `xml:"Contents"`
 	IsTruncated           bool   `xml:"IsTruncated"`
 	NextContinuationToken string `xml:"NextContinuationToken"`
 }
 
-// DeletePrefix lists the objects under prefix (ListObjectsV2) and deletes
-// them one by one. It returns the first error; the caller retries.
-func (r *R2) DeletePrefix(ctx context.Context, prefix string) error {
+// ListPrefix lists the objects under prefix (ListObjectsV2, following the
+// continuation tokens) and implements Store. A truncated page without a
+// continuation token is an error: the listing would silently miss objects.
+func (r *R2) ListPrefix(ctx context.Context, prefix string) ([]Object, error) {
+	var objects []Object
 	token := ""
 	for {
 		u, err := url.Parse(strings.TrimSuffix(r.Endpoint, "/") + "/" + r.Bucket)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		q := url.Values{"list-type": {"2"}, "prefix": {prefix}}
 		if token != "" {
@@ -227,39 +240,55 @@ func (r *R2) DeletePrefix(ctx context.Context, prefix string) error {
 		u.RawQuery = q.Encode()
 		resp, err := r.do(ctx, http.MethodGet, u)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 		_ = resp.Body.Close()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("objectstore: list status %d", resp.StatusCode)
+			return nil, fmt.Errorf("objectstore: list status %d", resp.StatusCode)
 		}
 		var list listResult
 		if err := xml.Unmarshal(body, &list); err != nil {
-			return err
+			return nil, err
 		}
 		for _, obj := range list.Contents {
-			ou, err := r.objectURL(obj.Key)
-			if err != nil {
-				return err
-			}
-			resp, err := r.do(ctx, http.MethodDelete, ou)
-			if err != nil {
-				return err
-			}
-			_ = resp.Body.Close()
-			if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
-				return fmt.Errorf("objectstore: delete status %d", resp.StatusCode)
-			}
+			objects = append(objects, Object{Key: obj.Key, Size: obj.Size})
 		}
-		if !list.IsTruncated || list.NextContinuationToken == "" {
-			return nil
+		if !list.IsTruncated {
+			return objects, nil
+		}
+		if list.NextContinuationToken == "" {
+			return nil, errors.New("objectstore: truncated list without a continuation token")
 		}
 		token = list.NextContinuationToken
 	}
+}
+
+// DeletePrefix lists the objects under prefix with ListPrefix and deletes
+// them one by one. It returns the first error; the caller retries.
+func (r *R2) DeletePrefix(ctx context.Context, prefix string) error {
+	objects, err := r.ListPrefix(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	for _, obj := range objects {
+		ou, err := r.objectURL(obj.Key)
+		if err != nil {
+			return err
+		}
+		resp, err := r.do(ctx, http.MethodDelete, ou)
+		if err != nil {
+			return err
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("objectstore: delete status %d", resp.StatusCode)
+		}
+	}
+	return nil
 }
 
 // Memory is an in-memory Store for tests. Signed URLs have the form
@@ -269,9 +298,16 @@ type Memory struct {
 	Objects map[string][]byte
 	// Deleted records every DeletePrefix call.
 	Deleted []string
+	// Sizes holds the size of an object that PutSized added without
+	// content; Objects holds the others.
+	Sizes map[string]int64
 	// Fail makes DeletePrefix fail while it is set.
 	Fail error
-	Now  func() time.Time
+	// ListFail makes ListPrefix fail while it is set.
+	ListFail error
+	// Lists records every ListPrefix call.
+	Lists []string
+	Now   func() time.Time
 }
 
 // NewMemory returns an empty store.
@@ -279,7 +315,7 @@ func NewMemory(now func() time.Time) *Memory {
 	if now == nil {
 		now = time.Now
 	}
-	return &Memory{Objects: map[string][]byte{}, Now: now}
+	return &Memory{Objects: map[string][]byte{}, Sizes: map[string]int64{}, Now: now}
 }
 
 func (m *Memory) sign(method, key string, ttl time.Duration) (string, time.Time, error) {
@@ -310,7 +346,74 @@ func (m *Memory) DeletePrefix(_ context.Context, prefix string) error {
 			delete(m.Objects, k)
 		}
 	}
+	for k := range m.Sizes {
+		if strings.HasPrefix(k, prefix) {
+			delete(m.Sizes, k)
+		}
+	}
 	return nil
+}
+
+// ListPrefix implements Store.
+func (m *Memory) ListPrefix(_ context.Context, prefix string) ([]Object, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Lists = append(m.Lists, prefix)
+	if m.ListFail != nil {
+		return nil, m.ListFail
+	}
+	var out []Object
+	for k, v := range m.Objects {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, Object{Key: k, Size: int64(len(v))})
+		}
+	}
+	for k, size := range m.Sizes {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, Object{Key: k, Size: size})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
+}
+
+// PutObject adds or replaces the object key with data.
+func (m *Memory) PutObject(key string, data []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.Sizes, key)
+	m.Objects[key] = data
+}
+
+// PutSized adds or replaces the object key with an object of size bytes
+// that the store does not keep in memory.
+func (m *Memory) PutSized(key string, size int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.Objects, key)
+	m.Sizes[key] = size
+}
+
+// RemoveObject deletes the object key, if any.
+func (m *Memory) RemoveObject(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.Objects, key)
+	delete(m.Sizes, key)
+}
+
+// ListCalls returns the number of ListPrefix calls so far.
+func (m *Memory) ListCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.Lists)
+}
+
+// SetListFail sets or clears the ListPrefix failure.
+func (m *Memory) SetListFail(err error) {
+	m.mu.Lock()
+	m.ListFail = err
+	m.mu.Unlock()
 }
 
 // DeletedPrefixes returns a copy of the recorded DeletePrefix calls.

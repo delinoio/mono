@@ -4,6 +4,7 @@ package objectstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -138,5 +139,100 @@ func TestDeletePrefix(t *testing.T) {
 	}
 	if len(objects) != 1 || !objects["organizations/other/x"] {
 		t.Fatalf("remaining = %v", objects)
+	}
+}
+
+// listServer serves the ListObjectsV2 pages that pages maps by continuation
+// token ("" is the first page) and records every request token.
+func listServer(t *testing.T, prefix string, pages map[string]string) (*R2, *[]string) {
+	t.Helper()
+	var mu sync.Mutex
+	var tokens []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		query := req.URL.Query()
+		token := query.Get("continuation-token")
+		tokens = append(tokens, token)
+		body, ok := pages[token]
+		if req.Method != http.MethodGet || query.Get("list-type") != "2" || query.Get("prefix") != prefix || !ok || len(tokens) > len(pages) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return &R2{Endpoint: srv.URL, Bucket: "bucket", AccessKeyID: "k", SecretAccessKey: "s"}, &tokens
+}
+
+// TestListPrefixFollowsContinuationTokens lists two pages and checks that
+// every key and its size is returned in order.
+func TestListPrefixFollowsContinuationTokens(t *testing.T) {
+	const prefix = "organizations/o/snapshots/s/attempts/a/"
+	r, tokens := listServer(t, prefix, map[string]string{
+		"": `<ListBucketResult><Contents><Key>` + prefix + `1</Key><Size>5242880</Size></Contents>` +
+			`<IsTruncated>true</IsTruncated><NextContinuationToken>page-2</NextContinuationToken></ListBucketResult>`,
+		"page-2": `<ListBucketResult><Contents><Key>` + prefix + `2</Key><Size>17</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>`,
+	})
+	got, err := r.ListPrefix(context.Background(), prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Object{{Key: prefix + "1", Size: 5 << 20}, {Key: prefix + "2", Size: 17}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("objects = %v, want %v", got, want)
+	}
+	if !slices.Equal(*tokens, []string{"", "page-2"}) {
+		t.Fatalf("continuation tokens = %q", *tokens)
+	}
+}
+
+// TestListPrefixRejectsIncompleteListing checks that a truncated page without
+// a continuation token and a failed request return an error instead of a
+// partial list.
+func TestListPrefixRejectsIncompleteListing(t *testing.T) {
+	const prefix = "p/"
+	r, _ := listServer(t, prefix, map[string]string{
+		"": `<ListBucketResult><Contents><Key>p/1</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult>`,
+	})
+	if got, err := r.ListPrefix(context.Background(), prefix); err == nil {
+		t.Fatalf("ListPrefix = %v, want an error for a truncated page without a token", got)
+	}
+	if got, err := r.ListPrefix(context.Background(), "other/"); err == nil {
+		t.Fatalf("ListPrefix of an unexpected prefix = %v, want the status error", got)
+	}
+}
+
+// TestMemoryListPrefix checks the listing of the in-memory store: sorted
+// objects of the prefix with their sizes, replacement, the call counter and
+// the injected failure.
+func TestMemoryListPrefix(t *testing.T) {
+	m := NewMemory(nil)
+	m.PutObject("a/2", []byte("xy"))
+	m.PutSized("a/1", 1<<30)
+	m.PutObject("b/1", []byte("z"))
+	got, err := m.ListPrefix(context.Background(), "a/")
+	if err != nil || !slices.Equal(got, []Object{{Key: "a/1", Size: 1 << 30}, {Key: "a/2", Size: 2}}) {
+		t.Fatalf("ListPrefix = (%v, %v)", got, err)
+	}
+	m.PutSized("a/2", 7)
+	m.PutObject("a/1", []byte("q"))
+	got, _ = m.ListPrefix(context.Background(), "a/")
+	if !slices.Equal(got, []Object{{Key: "a/1", Size: 1}, {Key: "a/2", Size: 7}}) {
+		t.Fatalf("after replacement = %v", got)
+	}
+	if m.ListCalls() != 2 {
+		t.Fatalf("ListCalls = %d, want 2", m.ListCalls())
+	}
+	m.SetListFail(errors.New("boom"))
+	if _, err := m.ListPrefix(context.Background(), "a/"); err == nil {
+		t.Fatal("ListPrefix succeeded while it was set to fail")
+	}
+	if err := m.DeletePrefix(context.Background(), "a/"); err != nil {
+		t.Fatal(err)
+	}
+	m.SetListFail(nil)
+	if got, _ := m.ListPrefix(context.Background(), "a/"); len(got) != 0 {
+		t.Fatalf("after DeletePrefix = %v", got)
 	}
 }

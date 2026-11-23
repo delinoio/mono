@@ -783,3 +783,60 @@ func TestSandboxTTLMigrationKeepsMillisecondRows(t *testing.T) {
 		}
 	}
 }
+
+// exportVerificationMigration is the version of
+// 0013_snapshot_export_verification.sql.
+const exportVerificationMigration = 13
+
+// TestExportVerificationMigrationKeepsExportedRows upgrades a database at the
+// schema of migration 0012 that holds an EXPORTED snapshot and checks that
+// the row is unverified without a verification time (the verifier schedules
+// it), that the previous release's statements, which know neither column,
+// still insert snapshots and mark them EXPORTED, and that the columns accept
+// the values of the new release.
+func TestExportVerificationMigrationKeepsExportedRows(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, exportVerificationMigration-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	const org = "018f0000-0000-7000-8000-0000000000d1"
+	const before, after = "018f0000-0000-7000-8000-0000000000e1", "018f0000-0000-7000-8000-0000000000e2"
+	if _, err := d.Pool.Exec(ctx, "INSERT INTO organizations (organization_id, name, create_time) VALUES ($1, 'org', now())", org); err != nil {
+		t.Fatal(err)
+	}
+	const oldInsert = `INSERT INTO snapshots (snapshot_id, organization_id, source_sandbox_id, state, export_state, guest_os, host_os, arch,
+		vcpu_count, memory_mib, disk_gib, network_mode, created_by_kind, created_by_id, create_time)
+		VALUES ($1, $2, $1, 1, 3, 1, 1, 1, 1, 512, 8, 1, 1, 'u', now())`
+	if _, err := d.Pool.Exec(ctx, oldInsert, before, org); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, testenv.Discard()); err != nil {
+		t.Fatal(err)
+	}
+	// The previous release keeps serving during a rolling deployment: it
+	// inserts and exports snapshots without the new columns.
+	if _, err := d.Pool.Exec(ctx, oldInsert, after, org); err != nil {
+		t.Fatalf("insert with the previous column list: %v", err)
+	}
+	if _, err := d.Pool.Exec(ctx, "UPDATE snapshots SET export_state = 2 WHERE snapshot_id = $1", after); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool.Exec(ctx, "UPDATE snapshots SET export_state = 3 WHERE snapshot_id = $1", after); err != nil {
+		t.Fatalf("export with the previous statement: %v", err)
+	}
+	for _, id := range []string{before, after} {
+		var verified bool
+		var verifyAfter *time.Time
+		if err := d.Pool.QueryRow(ctx, "SELECT export_verified, export_verify_after FROM snapshots WHERE snapshot_id = $1", id).Scan(&verified, &verifyAfter); err != nil {
+			t.Fatal(err)
+		}
+		if verified || verifyAfter != nil {
+			t.Fatalf("snapshot %s = verified %v, verify_after %v, want unverified without a time", id, verified, verifyAfter)
+		}
+	}
+	if _, err := d.Pool.Exec(ctx, "UPDATE snapshots SET export_verified = true, export_verify_after = now() WHERE snapshot_id = $1", after); err != nil {
+		t.Fatalf("store the verification: %v", err)
+	}
+}
