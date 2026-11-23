@@ -690,6 +690,109 @@ func TestFailedAttachLeavesNoDNSException(t *testing.T) {
 	}
 }
 
+// An attach whose own refresh fails after an independent refresh (the
+// periodic poll or another attach) applied its staged DNS assignment still
+// removes the DNS rules of its tap before it returns, and keeps the rules of
+// the other taps.
+func TestFailedAttachRemovesDNSRulesAppliedByIndependentRefresh(t *testing.T) {
+	m, _ := newFakeManager(t)
+	applied, _ := useRealRefresh(m)
+	seeded, _, err := m.Attach("sandbox-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		mu          sync.Mutex
+		routeReads  int
+		wantRoutes  = errors.New("route read failed")
+		routesRead  = make(chan struct{})
+		releaseRead = make(chan struct{})
+		attachReady = make(chan struct{})
+	)
+	m.hostRoutes = func() ([]Route, []netip.Prefix, error) {
+		mu.Lock()
+		routeReads++
+		n := routeReads
+		mu.Unlock()
+		switch n {
+		case 1:
+			// The independent refresh holds the refresh lock and has read
+			// its routes. It reads the assignments only after the attach
+			// staged its own.
+			close(routesRead)
+			<-releaseRead
+			return nil, nil, nil
+		case 2:
+			// The refresh of the failing attach.
+			return nil, nil, wantRoutes
+		default:
+			return nil, nil, nil
+		}
+	}
+	refresh := m.refresh
+	m.refresh = func() error {
+		select {
+		case <-attachReady:
+		default:
+			// The attach staged its assignment and starts its refresh,
+			// which waits for the independent refresh.
+			close(attachReady)
+		}
+		return refresh()
+	}
+
+	independent := make(chan error, 1)
+	go func() { independent <- m.Refresh() }()
+	waitFor := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	waitFor(routesRead, "the independent refresh to read the routes")
+
+	attachErr := make(chan error, 1)
+	go func() {
+		_, _, err := m.Attach("sandbox-b")
+		attachErr <- err
+	}()
+	waitFor(attachReady, "the attach to stage its assignment")
+	close(releaseRead)
+
+	for _, ch := range []chan error{independent, attachErr} {
+		select {
+		case err := <-ch:
+			if ch == independent && err != nil {
+				t.Fatalf("independent refresh: %v", err)
+			}
+			if ch == attachErr && !errors.Is(err, wantRoutes) {
+				t.Fatalf("Attach error = %v, want the route read error", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for the refreshes to finish")
+		}
+	}
+
+	scripts := applied()
+	if len(scripts) != 3 {
+		t.Fatalf("want 3 applied rulesets (seed, independent refresh, rollback), got %d", len(scripts))
+	}
+	if got := dnsRuleLines(scripts[1]); len(got) != 4 {
+		t.Fatalf("independent refresh applied DNS rules %q, want the rules of both taps", got)
+	}
+	if got, want := dnsRuleLines(scripts[2]), dnsRulesFor(seeded); !slices.Equal(got, want) {
+		t.Fatalf("DNS rules after the failed attach = %q, want only those of the seeded tap %q", got, want)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.gateways) != 1 || m.gateways[TapName(seeded.Index)].Tap == "" {
+		t.Fatalf("staged assignments after the failed attach = %v, want only the seeded tap", m.gateways)
+	}
+}
+
 // useIPRouteDump replaces the `ip` route dump for the test.
 func useIPRouteDump(t *testing.T, dump func() ([]byte, error)) {
 	t.Helper()
