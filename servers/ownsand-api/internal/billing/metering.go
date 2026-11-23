@@ -251,10 +251,23 @@ func (m *Metering) runReport(ctx context.Context) {
 // flush. (Known limit: when the commit outcome is unknown, for example
 // because the connection broke during the commit, the retry can count those
 // counts twice.)
-func (m *Metering) Flush(ctx context.Context) error {
+func (m *Metering) Flush(ctx context.Context) error { return m.flush(ctx, false) }
+
+// FlushFinal writes the counts that are still in memory and closes the
+// recorder in the same step: a count that an RPC adds afterwards is logged
+// as `billing_usage_dropped_after_final_flush` and never written. Call it
+// once, as the last write before the process exits.
+func (m *Metering) FlushFinal(ctx context.Context) error { return m.flush(ctx, true) }
+
+func (m *Metering) flush(ctx context.Context, final bool) error {
 	m.flushMu.Lock()
 	defer m.flushMu.Unlock()
-	counts := m.rec.take()
+	var counts map[counterKey]int64
+	if final {
+		counts = m.rec.takeAndClose()
+	} else {
+		counts = m.rec.take()
+	}
 	if len(counts) == 0 {
 		return nil
 	}

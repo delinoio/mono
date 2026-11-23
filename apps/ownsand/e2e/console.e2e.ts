@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, test } from "@e2e-dev/web";
-import { expect } from "e2e";
+import { expect, type Screen } from "e2e";
 
 // The suite runs the development server with PUBLIC_OWNSAND_MOCK_API=true
 // (see e2e.config.ts): an in-browser fake control plane and a fake signed-in
@@ -310,6 +310,238 @@ describe("invitations", () => {
     await expect(screen.getByText("you are already a member")).toBeVisible();
     await expect(screen.getByRole("button", "Accept invitation")).toBeVisible();
     await expect(browser).toHaveURL("/invitations/accept");
+  });
+});
+
+// Layout metrics of the current page. `overflow` is true when the document
+// scrolls horizontally. `clientWidth` (not `innerWidth`) is the comparison
+// width: a classic vertical scrollbar takes space from it, so the document of
+// a page that fits has `scrollWidth === clientWidth`, below `innerWidth`.
+// `offscreen` lists the visible interactive controls that reach beyond the
+// viewport, except controls inside a `.table-wrap` or the section list, which
+// scroll inside themselves on purpose.
+interface LayoutMetrics {
+  scrollWidth: number;
+  clientWidth: number;
+  navListScrollWidth: number;
+  navListClientWidth: number;
+  navListLinksReachable: boolean;
+  navColumnWidth: number;
+  navListFlexDirection: string;
+  offscreen: string[];
+}
+
+async function measureLayout(browser: {
+  evaluate<T extends import("e2e").JsonValue>(fn: () => T): Promise<T>;
+}): Promise<LayoutMetrics> {
+  return browser.evaluate(() => {
+    const doc = document.documentElement;
+    const nav = document.querySelector(".sidenav");
+    const list = document.querySelector(".sidenav ul");
+    const offscreen: string[] = [];
+    for (const el of Array.from(
+      document.querySelectorAll("a, button, input, select, textarea"),
+    )) {
+      if (el.closest(".table-wrap") || el.closest(".sidenav ul")) continue;
+      const box = el.getBoundingClientRect();
+      if (box.width === 0 || box.height === 0) continue;
+      if (box.right > doc.clientWidth + 0.5 || box.left < -0.5) {
+        offscreen.push(
+          `${el.tagName.toLowerCase()} "${(el.textContent ?? "").trim().slice(0, 40)}" right=${Math.round(box.right)}`,
+        );
+      }
+    }
+    // Every section link must be reachable: either inside the viewport or
+    // inside the scrollable list, so scrolling the list to its end shows it.
+    let reachable = true;
+    if (list) {
+      const listBox = list.getBoundingClientRect();
+      for (const a of Array.from(list.querySelectorAll("a"))) {
+        const box = a.getBoundingClientRect();
+        const start = box.left - listBox.left + list.scrollLeft;
+        if (start < -0.5 || start + box.width > list.scrollWidth + 0.5) {
+          reachable = false;
+        }
+      }
+      if (listBox.left < -0.5 || listBox.right > doc.clientWidth + 0.5) {
+        reachable = false;
+      }
+    }
+    return {
+      scrollWidth: doc.scrollWidth,
+      clientWidth: doc.clientWidth,
+      navListScrollWidth: list ? list.scrollWidth : 0,
+      navListClientWidth: list ? list.clientWidth : 0,
+      navListLinksReachable: reachable,
+      navColumnWidth: nav ? Math.round(nav.getBoundingClientRect().width) : 0,
+      navListFlexDirection: list ? getComputedStyle(list).display : "",
+      offscreen,
+    };
+  });
+}
+
+// Widths of the narrow layout (`max-width: 760px`) and the pages that the
+// console shows to each role. A page counts as loaded when its heading or button is visible.
+const NARROW_WIDTHS = [320, 360, 390, 430, 600, 760];
+interface PageUnderTest {
+  path: string;
+  // Heading of a section page, or button of a detail page.
+  heading?: string;
+  button?: string;
+}
+const OWNER_PAGES: PageUnderTest[] = [
+  { path: "sandboxes", heading: "Sandboxes" },
+  { path: "snapshots", heading: "Snapshots" },
+  { path: "devices", heading: "Devices" },
+  { path: "members", heading: "Members" },
+  { path: "enrollment-tokens", heading: "Enrollment tokens" },
+  { path: "api-keys", heading: "API keys" },
+  { path: "settings", heading: "Settings" },
+  { path: "sandboxes/0193a000-0000-7000-8000-0000000000a1", button: "Pause" },
+  { path: "sandboxes/0193a000-0000-7000-8000-0000000000a2", button: "Resume" },
+  { path: `devices/${BUILD_BOX}`, button: "Remove device" },
+];
+const MEMBER_PAGES: PageUnderTest[] = [
+  { path: "sandboxes", heading: "Sandboxes" },
+  { path: "snapshots", heading: "Snapshots" },
+  { path: "devices", heading: "Devices" },
+];
+
+async function expectLoaded(
+  screen: Screen,
+  page: PageUnderTest,
+): Promise<void> {
+  if (page.heading !== undefined) {
+    await expect(
+      screen.getByRole("heading", page.heading, { level: 1 }),
+    ).toBeVisible();
+  } else if (page.button !== undefined) {
+    await expect(screen.getByRole("button", page.button)).toBeVisible();
+  }
+}
+
+describe("narrow screens", () => {
+  test("fits every organization page of an owner in 320 to 760 px", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+
+    for (const width of NARROW_WIDTHS) {
+      await browser.setViewport({ width, height: 844 });
+      for (const page of OWNER_PAGES) {
+        await app.open(`/orgs/${ACME}/${page.path}`);
+        await expectLoaded(screen, page);
+        const m = await measureLayout(browser);
+        const where = `${width}px ${page.path}`;
+        expect(
+          m.scrollWidth,
+          `${where}: document scrolls sideways`,
+        ).toBeLessThanOrEqual(m.clientWidth);
+        expect(m.offscreen, `${where}: controls outside the viewport`).toEqual(
+          [],
+        );
+        expect(m.navListLinksReachable, `${where}: section links`).toBe(true);
+      }
+    }
+  });
+
+  test("fits every organization page of a member in 320 to 760 px", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+
+    for (const width of NARROW_WIDTHS) {
+      await browser.setViewport({ width, height: 844 });
+      for (const page of MEMBER_PAGES) {
+        await app.open(`/orgs/${NORTHWIND}/${page.path}`);
+        await expectLoaded(screen, page);
+        const m = await measureLayout(browser);
+        const where = `${width}px ${page.path}`;
+        expect(
+          m.scrollWidth,
+          `${where}: document scrolls sideways`,
+        ).toBeLessThanOrEqual(m.clientWidth);
+        expect(m.offscreen, `${where}: controls outside the viewport`).toEqual(
+          [],
+        );
+        expect(m.navListLinksReachable, `${where}: section links`).toBe(true);
+      }
+    }
+  });
+
+  test("scrolls the section list inside itself at 390 px", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await browser.setViewport({ width: 390, height: 844 });
+    await app.open(`/orgs/${ACME}/members`);
+    await expect(
+      screen.getByRole("heading", "Members", { level: 1 }),
+    ).toBeVisible();
+
+    const m = await measureLayout(browser);
+    expect(m.navListScrollWidth).toBeGreaterThan(m.navListClientWidth);
+    expect(m.navListClientWidth).toBeLessThanOrEqual(m.clientWidth);
+  });
+
+  test("keeps the side column and the vertical list from 761 px", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+
+    for (const width of [761, 1024]) {
+      await browser.setViewport({ width, height: 800 });
+      await app.open(`/orgs/${ACME}/members`);
+      await expect(
+        screen.getByRole("heading", "Members", { level: 1 }),
+      ).toBeVisible();
+      const m = await measureLayout(browser);
+      expect(m.scrollWidth).toBeLessThanOrEqual(m.clientWidth);
+      expect(m.navColumnWidth).toBe(220);
+      // The list is vertical: it does not scroll sideways.
+      expect(m.navListScrollWidth).toBeLessThanOrEqual(m.navListClientWidth);
+      expect(m.navListFlexDirection).not.toBe("flex");
+    }
+  });
+
+  test("fits the organization list at 320 px", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await browser.setViewport({ width: 320, height: 640 });
+    await expect(
+      screen.getByRole("heading", "Organizations", { level: 1 }),
+    ).toBeVisible();
+    const m = await measureLayout(browser);
+    expect(m.scrollWidth).toBeLessThanOrEqual(m.clientWidth);
+  });
+
+  test("fits the invitation page at 320 px", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await browser.setViewport({ width: 320, height: 640 });
+    await app.open(`/invitations/accept#secret=${INVITATION_SECRET}`);
+    await expect(screen.getByRole("button", "Sign in to accept")).toBeVisible();
+    const m = await measureLayout(browser);
+    expect(m.scrollWidth).toBeLessThanOrEqual(m.clientWidth);
   });
 });
 

@@ -511,11 +511,13 @@ func (h BillingHandler) UnlinkBillingAccount(ctx context.Context, req *connect.R
 			return errNotFound("organization")
 		}
 		if !cur.Linked() {
-			// No local link, but a link attempt with an unknown outcome, or an
-			// unlink that delino-accounts has not confirmed, may have left a
-			// link there: send it now. Without a row there is nothing to
-			// remove, and the call is idempotent.
-			if err := h.Billing.UnlinkPendingTx(ctx, tx, orgID, h.now()); err != nil {
+			// No local link, but a link attempt with an unknown outcome, an
+			// unlink that delino-accounts has not confirmed, or a link that
+			// left no local trace at all may have left a link there. The
+			// absence of a local record is not proof that delino-accounts has
+			// no link, so the call is always sent (it is idempotent) and the
+			// RPC fails when delino-accounts cannot confirm it.
+			if err := h.Billing.ConfirmUnlinkedTx(ctx, tx, orgID, h.now()); err != nil {
 				return pendingUnlinkError(err)
 			}
 			st = cur
@@ -547,8 +549,13 @@ func (h BillingHandler) UnlinkBillingAccount(ctx context.Context, req *connect.R
 // transaction of TransferOwnership or DeleteOrganization and records a
 // pending unlink for delino-accounts. An organization without a local link
 // can still have a link attempt with an unknown outcome; its record becomes
-// the pending unlink. It returns the change and whether an unlink is
-// pending; after the commit, finishBillingUnlink sends it.
+// the pending unlink. An organization with neither a link nor an attempt
+// record can still be linked on delino-accounts without any local trace, so
+// the pending unlink is recorded without a billing account; only when
+// delino-accounts is not configured, nothing is recorded, because no unlink
+// could be sent and the organization was never linked. It returns the change
+// and whether an unlink is pending; after the commit, finishBillingUnlink
+// sends it.
 func (s *Service) removeBillingLinkTx(ctx context.Context, tx pgx.Tx, orgID, source string) (billing.Change, bool, error) {
 	if s.Billing == nil {
 		return billing.Change{}, false, nil
@@ -560,7 +567,16 @@ func (s *Service) removeBillingLinkTx(ctx context.Context, tx pgx.Tx, orgID, sou
 	}
 	if former == "" {
 		taken, err := billing.TakeOverLinkAttemptTx(ctx, tx, orgID, now)
-		return billing.Change{}, taken, err
+		if err != nil || taken {
+			return billing.Change{}, taken, err
+		}
+		if s.Billing.Client() == nil {
+			return billing.Change{}, false, nil
+		}
+		if err := billing.AddPendingUnlinkTx(ctx, tx, orgID, "", now); err != nil {
+			return billing.Change{}, false, err
+		}
+		return billing.Change{}, true, nil
 	}
 	if err := billing.AddPendingUnlinkTx(ctx, tx, orgID, former, now); err != nil {
 		return billing.Change{}, false, err

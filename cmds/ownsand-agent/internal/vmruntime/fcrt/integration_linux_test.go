@@ -292,7 +292,18 @@ func TestFirecrackerIntegration(t *testing.T) {
 	if blocks, err := strconv.ParseInt(fieldOr(fields, 1), 10, 64); err != nil || blocks < 3<<19 {
 		t.Fatalf("larger-disk root file system %q", dfOut)
 	}
-	for _, id := range []string{sb.GetSandboxId(), restored.GetSandboxId(), cold.GetSandboxId(), grown.GetSandboxId()} {
+	// A base-image create with a larger disk grows the image file on the host
+	// only; the guest helper grows the root file system online at boot.
+	baseGrown := e.createSized("", 256, 2, false)
+	if baseGrown.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_BASE_IMAGE {
+		t.Fatalf("larger-disk base-image restore path %v", baseGrown.GetRestorePath())
+	}
+	baseDf, _ := e.exec(baseGrown.GetSandboxId(), "/bin/sh", "-c", "df -k / | tail -1")
+	baseFields := strings.Fields(baseDf)
+	if blocks, err := strconv.ParseInt(fieldOr(baseFields, 1), 10, 64); err != nil || blocks < 3<<19 {
+		t.Fatalf("larger-disk base-image root file system %q", baseDf)
+	}
+	for _, id := range []string{sb.GetSandboxId(), restored.GetSandboxId(), cold.GetSandboxId(), grown.GetSandboxId(), baseGrown.GetSandboxId()} {
 		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
 			t.Fatalf("delete %v %v", en, err)
 		}

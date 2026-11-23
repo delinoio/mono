@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -46,9 +47,51 @@ const (
 	writeByteTimeout  = 30 * time.Second
 )
 
-// usageFlushTimeout bounds the last usage counter write after the HTTP
-// drain.
+// usageFlushTimeout bounds the whole usage finish after the HTTP drain: the
+// wait for the requests that can still record usage (at most
+// usageDrainTimeout of it) and the last usage counter write, which gets the
+// rest.
 const usageFlushTimeout = 10 * time.Second
+
+// usageDrainTimeout bounds the wait for requests that can still record usage
+// after the HTTP drain. A handler that never exits cannot hold the shutdown
+// longer than this; the service then reports an incomplete drain.
+const usageDrainTimeout = 5 * time.Second
+
+// errUsageDrainIncomplete is returned by run when requests that can record
+// usage were still running when the usage drain ended, so the final flush
+// may miss their usage.
+var errUsageDrainIncomplete = errors.New("usage drain incomplete")
+
+// usageFinisher is the part of the application that finishes usage metering
+// at shutdown.
+type usageFinisher interface {
+	DrainUsage(ctx context.Context) error
+	FlushUsageFinal(ctx context.Context) error
+}
+
+// finishUsage runs after the HTTP server stopped. RPCs that ended during the
+// HTTP drain recorded usage after the metering worker stopped, so it waits
+// (bounded by drainTimeout) for the requests that can still record usage,
+// then writes the counts and closes the recorder within the flush timeout.
+// It returns errUsageDrainIncomplete when the drain ended before those
+// requests finished: their usage may be lost and a count that arrives after
+// the flush is logged by the recorder.
+func finishUsage(a usageFinisher, logger *slog.Logger, flushTimeout, drainTimeout time.Duration) error {
+	flushCtx, cancel := context.WithTimeout(context.Background(), flushTimeout)
+	defer cancel()
+	var incomplete error
+	drainCtx, cancelDrain := context.WithTimeout(flushCtx, drainTimeout)
+	if derr := a.DrainUsage(drainCtx); derr != nil {
+		logger.Error("usage_drain_incomplete", slog.Any("error", derr))
+		incomplete = fmt.Errorf("%w: %w", errUsageDrainIncomplete, derr)
+	}
+	cancelDrain()
+	if ferr := a.FlushUsageFinal(flushCtx); ferr != nil {
+		logger.Error("usage_final_flush_failed", slog.Any("error", ferr))
+	}
+	return incomplete
+}
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
@@ -188,17 +231,11 @@ func run() error {
 		slog.String("client_address_mode", string(cfg.ClientAddressMode)), slog.String("metrics_addr", metricsAddr), slog.Bool("usage_reporting", cfg.Accounts.Enabled),
 		slog.Bool("otlp_metrics_export", tel.MetricsExport), slog.Bool("otlp_logs_export", tel.LogsExport))
 	err = serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait)
-	// RPCs that ended during the drain recorded usage after the metering
-	// worker stopped; write it before the process exits.
-	flushCtx, cancel := context.WithTimeout(context.Background(), usageFlushTimeout)
-	defer cancel()
-	if ferr := a.FlushUsage(flushCtx); ferr != nil {
-		logger.Error("usage_final_flush_failed", slog.Any("error", ferr))
-	}
+	usageErr := finishUsage(a, logger, usageFlushTimeout, usageDrainTimeout)
 	if metricsSrv != nil {
 		_ = metricsSrv.Close()
 	}
-	return err
+	return errors.Join(err, usageErr)
 }
 
 // newMetricsServer returns the internal Prometheus listener. It serves only

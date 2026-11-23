@@ -173,13 +173,36 @@ func nullTime(t time.Time) *time.Time {
 	return &t
 }
 
-// resolveAccount finds the billing account of a Paddle entity: first through
-// the checkout transactions and subscriptions that accounts-api recorded,
-// then through a top-up ID of a one-time charge, and last through the
-// `billing_account_id` custom data. The custom data is only a fallback,
-// because a checkout opened in the browser can carry any custom data; it
-// still names a billing account that exists.
-func resolveAccount(ctx context.Context, tx pgx.Tx, transactionID, subscriptionID, topUpID string, custom map[string]any) (string, error) {
+// accountSource names the lookup that matched the billing account of a Paddle
+// entity.
+type accountSource int
+
+const (
+	// accountSourceNone means that no lookup matched.
+	accountSourceNone accountSource = iota
+	// accountSourceCheckout is a checkout transaction that accounts-api
+	// recorded in paddle_checkouts.
+	accountSourceCheckout
+	// accountSourceSubscription is a subscription that accounts-api recorded
+	// in paddle_subscriptions.
+	accountSourceSubscription
+	// accountSourceTopUp is a top-up that accounts-api recorded.
+	accountSourceTopUp
+	// accountSourceCustomData is the `billing_account_id` custom data, which
+	// a checkout that anyone opens in the browser can set to any value.
+	accountSourceCustomData
+)
+
+// resolveAccount finds the billing account of a Paddle entity and the lookup
+// that matched: first through the checkout transactions and subscriptions
+// that accounts-api recorded, then through a top-up ID of a one-time charge,
+// and last through the `billing_account_id` custom data. The custom data is
+// only a fallback, because a checkout opened in the browser can carry any
+// custom data; it still names a billing account that exists. Only the
+// recorded lookups may bind a subscription to a billing account, so callers
+// must not change subscription state when the source is
+// accountSourceCustomData.
+func resolveAccount(ctx context.Context, tx pgx.Tx, transactionID, subscriptionID, topUpID string, custom map[string]any) (string, accountSource, error) {
 	lookup := func(query, key string) (string, error) {
 		if key == "" {
 			return "", nil
@@ -191,25 +214,32 @@ func resolveAccount(ctx context.Context, tx pgx.Tx, transactionID, subscriptionI
 		}
 		return id, err
 	}
-	candidates := []struct{ query, key string }{
-		{`SELECT billing_account_id::text FROM paddle_checkouts WHERE paddle_transaction_id = $1`, transactionID},
-		{`SELECT billing_account_id::text FROM paddle_subscriptions WHERE paddle_subscription_id = $1`, subscriptionID},
+	type candidate struct {
+		query, key string
+		source     accountSource
+	}
+	candidates := []candidate{
+		{`SELECT billing_account_id::text FROM paddle_checkouts WHERE paddle_transaction_id = $1`, transactionID, accountSourceCheckout},
+		{`SELECT billing_account_id::text FROM paddle_subscriptions WHERE paddle_subscription_id = $1`, subscriptionID, accountSourceSubscription},
 	}
 	if uuidv7.Valid(topUpID) {
-		candidates = append(candidates, struct{ query, key string }{
-			`SELECT billing_account_id::text FROM top_ups WHERE top_up_id = $1::uuid`, strings.ToLower(topUpID)})
+		candidates = append(candidates, candidate{
+			`SELECT billing_account_id::text FROM top_ups WHERE top_up_id = $1::uuid`, strings.ToLower(topUpID), accountSourceTopUp})
 	}
 	if id := paddle.CustomString(custom, paddle.CustomDataBillingAccountID); uuidv7.Valid(id) {
-		candidates = append(candidates, struct{ query, key string }{
-			`SELECT billing_account_id::text FROM billing_accounts WHERE billing_account_id = $1::uuid`, strings.ToLower(id)})
+		candidates = append(candidates, candidate{
+			`SELECT billing_account_id::text FROM billing_accounts WHERE billing_account_id = $1::uuid`, strings.ToLower(id), accountSourceCustomData})
 	}
 	for _, c := range candidates {
 		id, err := lookup(c.query, c.key)
-		if err != nil || id != "" {
-			return id, err
+		if err != nil {
+			return "", accountSourceNone, err
+		}
+		if id != "" {
+			return id, c.source, nil
 		}
 	}
-	return "", nil
+	return "", accountSourceNone, nil
 }
 
 // chargeTopUpID returns the `top_up_id` custom data of the first item price
@@ -277,7 +307,7 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, ev padd
 		return out, err
 	}
 	topUpID := chargeTopUpID(txn)
-	accountID, err := resolveAccount(ctx, tx, txn.ID, txn.SubscriptionID, topUpID, txn.CustomData)
+	accountID, source, err := resolveAccount(ctx, tx, txn.ID, txn.SubscriptionID, topUpID, txn.CustomData)
 	if err != nil {
 		return out, err
 	}
@@ -349,7 +379,15 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, ev padd
 		}, now); err != nil {
 			return out, err
 		}
-		if err := s.activateFromPayment(ctx, tx, acct, txn, now); err != nil {
+		if source == accountSourceCustomData {
+			// The custom data of a checkout that the browser opened can name
+			// any billing account, so it may add credit but never binds or
+			// activates a subscription.
+			s.logger.WarnContext(ctx, "billing_subscription_payment_unbound",
+				slog.String("paddle_event_id", ev.EventID), slog.String("billing_account_id", accountID),
+				slog.String("paddle_subscription_id", txn.SubscriptionID),
+				slog.String("paddle_transaction_id", txn.ID))
+		} else if err := s.activateFromPayment(ctx, tx, acct, txn, now); err != nil {
 			return out, err
 		}
 	default:
@@ -374,7 +412,7 @@ func (s *Service) onPaymentFailed(ctx context.Context, tx pgx.Tx, ev paddle.Even
 	}
 	out := eventOutcome{TransactionID: txn.ID}
 	topUpID := chargeTopUpID(txn)
-	accountID, err := resolveAccount(ctx, tx, txn.ID, txn.SubscriptionID, topUpID, txn.CustomData)
+	accountID, source, err := resolveAccount(ctx, tx, txn.ID, txn.SubscriptionID, topUpID, txn.CustomData)
 	if err != nil || accountID == "" {
 		out.Result = webhookUnmatched
 		return out, err
@@ -400,7 +438,9 @@ func (s *Service) onPaymentFailed(ctx context.Context, tx pgx.Tx, ev paddle.Even
 	case txn.Origin == paddle.OriginWeb || txn.Origin == paddle.OriginAPI || acct.Deleted:
 		out.Result = webhookIgnored
 		return out, nil
-	case txn.SubscriptionID != "":
+	case txn.SubscriptionID != "" && source == accountSourceSubscription:
+		// Only the recorded subscription of the billing account sends the
+		// email; custom data alone can name any account.
 		s.logger.WarnContext(ctx, "billing_subscription_payment_failed",
 			slog.String("billing_account_id", accountID),
 			slog.String("paddle_subscription_id", txn.SubscriptionID),
@@ -423,13 +463,23 @@ func (s *Service) onSubscription(ctx context.Context, tx pgx.Tx, ev paddle.Event
 	if err := json.Unmarshal(ev.Data, &entity); err != nil || entity.ID == "" {
 		return eventOutcome{Result: webhookInvalidPayload}, nil
 	}
-	accountID, err := resolveAccount(ctx, tx, entity.TransactionID, entity.ID, "", entity.CustomData)
+	accountID, source, err := resolveAccount(ctx, tx, entity.TransactionID, entity.ID, "", entity.CustomData)
 	if err != nil || accountID == "" {
 		if err == nil {
 			s.logger.WarnContext(ctx, "billing_paddle_event_unmatched",
 				slog.String("paddle_event_id", ev.EventID), slog.String("paddle_subscription_id", entity.ID))
 		}
 		return eventOutcome{Result: webhookUnmatched}, err
+	}
+	if source == accountSourceCustomData {
+		// Only a recorded checkout transaction or subscription binds a
+		// subscription to a billing account. The custom data of a checkout
+		// opened in the browser can name any account.
+		s.logger.WarnContext(ctx, "billing_subscription_unbound",
+			slog.String("paddle_event_id", ev.EventID), slog.String("billing_account_id", accountID),
+			slog.String("paddle_subscription_id", entity.ID),
+			slog.String("paddle_transaction_id", entity.TransactionID))
+		return eventOutcome{Result: webhookUnmatched}, nil
 	}
 	out := eventOutcome{BillingAccountID: accountID, TransactionID: entity.TransactionID}
 	acct, err := lockAccount(ctx, tx, accountID)

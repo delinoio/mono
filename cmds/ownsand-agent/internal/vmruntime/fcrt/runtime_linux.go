@@ -979,10 +979,16 @@ func tool(name string) string {
 	return name
 }
 
-// growDisk grows the disk image to size bytes and resizes its ext4 file
-// system offline (e2fsck and resize2fs of e2fsprogs). A smaller size keeps
-// the image.
+// growDisk grows the disk image file to size bytes and leaves a larger or
+// equal image unchanged. It only extends the sparse file: it never parses or
+// runs a file system tool on the image, because the image holds
+// guest-controlled ext4 metadata that the host must not interpret as root.
+// The guest helper grows the mounted root file system online to the block
+// device size at every boot (cmds/ownsand-guest, EXT4_IOC_RESIZE_FS).
 func growDisk(ctx context.Context, path string, size int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	st, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -990,23 +996,7 @@ func growDisk(ctx context.Context, path string, size int64) error {
 	if size <= st.Size() {
 		return nil
 	}
-	if err := os.Truncate(path, size); err != nil {
-		return err
-	}
-	// e2fsck exits with 1 when it corrected the file system. Only exit codes
-	// 0 and 1 let the resize continue: ExitCode reports -1 when a signal
-	// ended e2fsck (for example the context kill or the OOM killer), and a
-	// check that did not finish leaves the file system in an unknown state.
-	if out, err := exec.CommandContext(ctx, tool("e2fsck"), "-fy", path).CombinedOutput(); err != nil {
-		var ee *exec.ExitError
-		if ctx.Err() != nil || !errors.As(err, &ee) || ee.ExitCode() != 1 {
-			return fmt.Errorf("e2fsck: %v: %s", err, bytes.TrimSpace(out))
-		}
-	}
-	if out, err := exec.CommandContext(ctx, tool("resize2fs"), path).CombinedOutput(); err != nil {
-		return fmt.Errorf("resize2fs: %v: %s", err, bytes.TrimSpace(out))
-	}
-	return nil
+	return os.Truncate(path, size)
 }
 
 // NewRuntime returns the runtime as a vmruntime.Runtime.

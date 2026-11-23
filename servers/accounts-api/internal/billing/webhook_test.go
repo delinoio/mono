@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -436,8 +437,7 @@ func TestLateEventDoesNotReplaceNewCheckout(t *testing.T) {
 // TestLateActiveEventDoesNotReplaceNewCheckout checks that a late event of an
 // earlier subscription, in any status, leaves the row of a new open checkout
 // PENDING, also when its updated_at is after the cancellation, and that the
-// subscription of the checkout transaction still completes it. A PENDING row
-// without a checkout transaction accepts the first entity.
+// subscription of the checkout transaction still completes it.
 func TestLateActiveEventDoesNotReplaceNewCheckout(t *testing.T) {
 	for _, status := range []string{
 		paddle.SubscriptionStatusActive, paddle.SubscriptionStatusTrialing,
@@ -602,10 +602,15 @@ func TestDifferentSubscriptionDoesNotReplaceManageableRow(t *testing.T) {
 			acct := f.account()
 			cur := f.activate(acct)
 			f.webhook("subscription.updated", map[string]any{"id": cur, "status": status, "updated_at": f.clock.Now()})
+			// A subscription event binds the billing account only through a
+			// recorded subscription, never through custom data, so the other
+			// subscription is recorded first, as a late payment of it would.
 			other := f.paddle.NewID("sub")
+			f.tx(func(tx pgx.Tx) error {
+				return recordPaddleSubscription(ctx(), tx, other, acct, f.s.timestamp())
+			})
 			if got := f.webhookResult("subscription.updated", map[string]any{
 				"id": other, "status": "active", "updated_at": f.clock.Now().Add(time.Hour),
-				"custom_data": map[string]any{paddle.CustomDataBillingAccountID: acct},
 			}); got != webhookIgnored {
 				t.Fatalf("event result = %q, want %q", got, webhookIgnored)
 			}
@@ -622,28 +627,36 @@ func TestDifferentSubscriptionDoesNotReplaceManageableRow(t *testing.T) {
 }
 
 // TestUpdateBeforeCreatedActivatesNewCheckout checks that an update of the
-// new subscription that arrives before its subscription.created is accepted,
-// because its ID was not recorded before.
+// new subscription that arrives before its subscription.created matches only
+// through custom data and so leaves the checkout PENDING, and that the
+// subscription.created event of the checkout transaction completes it.
 func TestUpdateBeforeCreatedActivatesNewCheckout(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
 	oldSub := f.activate(acct)
 	f.webhook("subscription.canceled", map[string]any{"id": oldSub, "status": "canceled", "updated_at": f.clock.Now()})
-	f.checkout(acct)
+	txnID := f.checkout(acct)
 	newSub := f.paddle.NewID("sub")
 	f.webhook("subscription.updated", map[string]any{
 		"id": newSub, "status": "active", "updated_at": f.clock.Now().Add(time.Minute),
 		"custom_data": map[string]any{paddle.CustomDataBillingAccountID: acct},
 	})
 	sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
-	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != newSub {
-		t.Fatalf("subscription = %+v", sub)
+	if sub.Status != SubscriptionPending || sub.CheckoutTransactionID != txnID || sub.PaddleSubscriptionID != "" {
+		t.Fatalf("subscription after the early update = %+v", sub)
+	}
+	f.webhook("subscription.created", map[string]any{
+		"id": newSub, "status": "active", "transaction_id": txnID, "updated_at": f.clock.Now().Add(time.Minute),
+	})
+	sub, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != newSub || sub.CheckoutTransactionID != "" {
+		t.Fatalf("subscription after subscription.created = %+v", sub)
 	}
 }
 
 // TestPendingWithoutCheckoutAcceptsFirstEntity checks that a PENDING row
-// without a checkout transaction accepts the first entity of an earlier
-// subscription.
+// without a checkout transaction does not accept an entity that matches only
+// through custom data.
 func TestPendingWithoutCheckoutAcceptsFirstEntity(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
@@ -656,8 +669,114 @@ func TestPendingWithoutCheckoutAcceptsFirstEntity(t *testing.T) {
 		"custom_data": map[string]any{paddle.CustomDataBillingAccountID: acct},
 	})
 	sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
-	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != first {
+	if sub.Status != SubscriptionPending || sub.PaddleSubscriptionID != "" {
 		t.Fatalf("subscription = %+v", sub)
+	}
+	if n := f.count(`SELECT count(*) FROM paddle_subscriptions WHERE paddle_subscription_id = $1`, first); n != 0 {
+		t.Fatalf("paddle_subscriptions has %d rows for the unbound subscription", n)
+	}
+}
+
+// TestCustomDataDoesNotBindSubscription checks that custom data, which a
+// checkout opened in the browser can set to any billing account, never binds
+// a subscription: a subscription event whose transaction and subscription
+// IDs the server did not record changes no subscription row, records no
+// subscription and is stored as unmatched.
+func TestCustomDataDoesNotBindSubscription(t *testing.T) {
+	for _, name := range []string{"NONE", "CANCELED", "PENDING"} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			pendingTxn := ""
+			switch name {
+			case "CANCELED":
+				oldSub := f.activate(acct)
+				f.webhook("subscription.canceled", map[string]any{"id": oldSub, "status": "canceled", "updated_at": f.clock.Now()})
+			case "PENDING":
+				pendingTxn = f.checkout(acct)
+			}
+			before, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+			logs := f.captureLogs()
+
+			forged := f.paddle.NewID("sub")
+			forgedTxn := f.paddle.NewID("txn")
+			if code := f.webhook("subscription.created", map[string]any{
+				"id": forged, "status": "active", "transaction_id": forgedTxn, "updated_at": f.clock.Now().Add(time.Minute),
+				"custom_data": map[string]any{paddle.CustomDataBillingAccountID: acct},
+			}); code != http.StatusOK {
+				t.Fatal(code)
+			}
+			after, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("subscription changed from %+v to %+v", before, after)
+			}
+			if n := f.count(`SELECT count(*) FROM paddle_subscriptions WHERE paddle_subscription_id = $1`, forged); n != 0 {
+				t.Fatalf("paddle_subscriptions has %d rows for the unbound subscription", n)
+			}
+			if n := f.count(`SELECT count(*) FROM paddle_events WHERE result = 'unmatched' AND billing_account_id IS NULL`); n != 1 {
+				t.Fatalf("%d unmatched events without a billing account, want 1", n)
+			}
+			if !strings.Contains(logs.String(), "billing_subscription_unbound") ||
+				!strings.Contains(logs.String(), `"paddle_subscription_id":"`+forged+`"`) ||
+				!strings.Contains(logs.String(), `"paddle_transaction_id":"`+forgedTxn+`"`) ||
+				!strings.Contains(logs.String(), `"billing_account_id":"`+acct+`"`) {
+				t.Fatalf("logs do not name the unbound subscription: %s", logs)
+			}
+			// The victim can still start a subscription.
+			again := f.checkout(acct)
+			if name == "PENDING" && again != pendingTxn {
+				t.Fatalf("second StartSubscription = %s, want the open checkout %s", again, pendingTxn)
+			}
+			if again == "" {
+				t.Fatal("StartSubscription returned no checkout")
+			}
+		})
+	}
+}
+
+// TestCustomDataPaymentOnlyAddsCredit checks that a subscription payment that
+// matches only through custom data adds its credit once, but neither records
+// nor activates its subscription, and that its failed renewal sends no email.
+func TestCustomDataPaymentOnlyAddsCredit(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	logs := f.captureLogs()
+	forgedSub := f.paddle.NewID("sub")
+	payment := paddletest.Transaction(paddletest.TransactionData{
+		ID: "txn_forged", SubscriptionID: forgedSub, Origin: paddle.OriginWeb, BillingAccountID: acct,
+		PriceID: priceID, SubtotalCents: 1000,
+	})
+	for range 2 { // Paddle retries: the credit is added once
+		if code := f.webhook(paddle.EventTransactionCompleted, payment); code != http.StatusOK {
+			t.Fatal(code)
+		}
+	}
+	f.wantLedger(acct, wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd})
+	sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if sub.Status != SubscriptionNone || sub.PaddleSubscriptionID != "" {
+		t.Fatalf("subscription = %+v", sub)
+	}
+	if n := f.count(`SELECT count(*) FROM paddle_subscriptions WHERE paddle_subscription_id = $1`, forgedSub); n != 0 {
+		t.Fatalf("paddle_subscriptions has %d rows for the unbound subscription", n)
+	}
+	if !strings.Contains(logs.String(), "billing_subscription_payment_unbound") {
+		t.Fatalf("logs do not name the unbound payment: %s", logs)
+	}
+	// StartSubscription still succeeds.
+	if f.checkout(acct) == "" {
+		t.Fatal("StartSubscription returned no checkout")
+	}
+
+	// A failed renewal that matches only through custom data sends no email.
+	f.webhook(paddle.EventTransactionPaymentFailed, paddletest.Transaction(paddletest.TransactionData{
+		ID: "txn_forged_renew", SubscriptionID: f.paddle.NewID("sub"), Origin: paddle.OriginSubscriptionRecurring,
+		BillingAccountID: acct, PriceID: priceID, SubtotalCents: 1000, Status: "past_due",
+	}))
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if msgs := f.email.Messages(); len(msgs) != 0 {
+		t.Fatalf("emails %+v", msgs)
 	}
 }
 
@@ -720,8 +839,9 @@ func TestLatePaymentOfEarlierSubscriptionKeepsNewCheckout(t *testing.T) {
 }
 
 // TestPaymentActivatesPendingRowWithoutCheckoutTransaction checks the case
-// where the payment arrives before any checkout was recorded: the first
-// verified subscription payment activates the pending row.
+// where the payment arrives before any checkout was recorded: a payment that
+// matches only through custom data adds its credit but leaves the pending
+// row PENDING.
 func TestPaymentActivatesPendingRowWithoutCheckoutTransaction(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
@@ -736,7 +856,10 @@ func TestPaymentActivatesPendingRowWithoutCheckoutTransaction(t *testing.T) {
 	}
 	f.wantLedger(acct, wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd})
 	sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
-	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != subID {
+	if sub.Status != SubscriptionPending || sub.PaddleSubscriptionID != "" {
 		t.Fatalf("subscription = %+v", sub)
+	}
+	if n := f.count(`SELECT count(*) FROM paddle_subscriptions WHERE paddle_subscription_id = $1`, subID); n != 0 {
+		t.Fatalf("paddle_subscriptions has %d rows for the unbound subscription", n)
 	}
 }

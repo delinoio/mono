@@ -44,14 +44,21 @@ type topUp struct {
 	Status               TopUpStatus
 	PaddleSubscriptionID string
 	CreateTime           time.Time
+	// FailureReason is the reason of a failed top-up, or empty.
+	FailureReason FailureReason
+	// ProviderAcceptTime is when Paddle accepted the charge, or nil without
+	// evidence of acceptance. A timeout keeps it, so it tells an accepted
+	// charge that timed out from one whose result stayed unknown.
+	ProviderAcceptTime *time.Time
 }
 
 const topUpColumns = `top_up_id::text, billing_account_id::text, kind, amount_usd_micros, status,
-	COALESCE(paddle_subscription_id, ''), create_time`
+	COALESCE(paddle_subscription_id, ''), create_time, COALESCE(failure_reason, ''), provider_accept_time`
 
 func scanTopUp(row pgx.Row) (topUp, error) {
 	var t topUp
-	err := row.Scan(&t.ID, &t.BillingAccountID, &t.Kind, &t.Amount, &t.Status, &t.PaddleSubscriptionID, &t.CreateTime)
+	err := row.Scan(&t.ID, &t.BillingAccountID, &t.Kind, &t.Amount, &t.Status, &t.PaddleSubscriptionID, &t.CreateTime,
+		&t.FailureReason, &t.ProviderAcceptTime)
 	return t, err
 }
 
@@ -111,9 +118,10 @@ func (s *Service) queueAutoTopUp(ctx context.Context, tx pgx.Tx, acct *accountSt
 	if err != nil {
 		return false, err
 	}
+	// cap_time starts at the queue time; the claim moves it to the claim time.
 	if _, err := tx.Exec(ctx, `INSERT INTO top_ups (top_up_id, billing_account_id, kind, amount_usd_micros, status,
-			paddle_subscription_id, create_time, update_time)
-		VALUES ($1, $2, 'auto', $3, 'pending', $4, $5, $5)`, id, acct.ID, st.AutoAmount, sub.PaddleSubscriptionID, now); err != nil {
+			paddle_subscription_id, create_time, update_time, cap_time)
+		VALUES ($1, $2, 'auto', $3, 'pending', $4, $5, $5, $5)`, id, acct.ID, st.AutoAmount, sub.PaddleSubscriptionID, now); err != nil {
 		return false, err
 	}
 	s.logger.InfoContext(ctx, "billing_auto_top_up_queued",
@@ -201,6 +209,18 @@ func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key s
 		case TopUpCharged, TopUpCompleted:
 			return nil
 		case TopUpFailed:
+			// A timeout also fails a top-up that Paddle accepted; the
+			// payment webhook may still add its credit. The recorded
+			// acceptance tells it from a charge whose result stayed unknown
+			// (or a legacy row without that evidence), which keeps the
+			// caller waiting. Every other reason is a provider rejection or
+			// a failed payment.
+			if t.FailureReason == FailureTimedOut {
+				if t.ProviderAcceptTime != nil {
+					return nil
+				}
+				return unavailable("the result of the first request with this idempotency_key is not known yet; try again later")
+			}
 			return failedPrecondition("the payment provider rejected the top-up")
 		default:
 			return unavailable("the result of the first request with this idempotency_key is not known yet; try again later")
@@ -305,7 +325,10 @@ func (s *Service) charge(ctx context.Context, t topUp) (paddle.Outcome, error) {
 		}
 		switch outcome {
 		case paddle.OutcomeOK:
-			_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charged', update_time = $2
+			// provider_accept_time records that Paddle accepted the charge. A
+			// later timeout fails the top-up but keeps it, so a repeated
+			// manual top-up key still knows the charge was accepted.
+			_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charged', provider_accept_time = $2, update_time = $2
 				WHERE top_up_id = $1 AND status = 'charging'`, t.ID, now)
 			return err
 		case paddle.OutcomeUnknown:
@@ -443,14 +466,15 @@ func (s *Service) completeTopUp(ctx context.Context, tx pgx.Tx, t topUp, transac
 // transaction revalidates the current settings, because an owner or admin
 // may have changed them after the top-up was queued: a pending top-up that
 // the current settings no longer allow fails as settings_changed without a
-// Paddle call and without counting as a failed automatic top-up. Top-ups
-// that already left pending (charging, charged or unknown) are not touched.
+// Paddle call and without counting as a failed automatic top-up. The claim
+// also moves the cap time of the top-up to the claim time, so the top-up
+// counts toward the monthly cap of the UTC month of the claim and not of the
+// month in which it was queued. Top-ups that already left pending (charging,
+// charged or unknown) are not touched.
 func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 	for range 100 {
-		var candidate topUp
-		err := s.db.Pool.QueryRow(ctx, `SELECT `+topUpColumns+` FROM top_ups WHERE status = 'pending'
-			ORDER BY create_time LIMIT 1`).Scan(&candidate.ID, &candidate.BillingAccountID, &candidate.Kind,
-			&candidate.Amount, &candidate.Status, &candidate.PaddleSubscriptionID, &candidate.CreateTime)
+		candidate, err := scanTopUp(s.db.Pool.QueryRow(ctx, `SELECT `+topUpColumns+` FROM top_ups WHERE status = 'pending'
+			ORDER BY create_time LIMIT 1`))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -491,7 +515,11 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 			claimed.PaddleSubscriptionID = sub.PaddleSubscriptionID
 			claimed.Status = TopUpCharging
 			ok = true
-			_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charging', paddle_subscription_id = $2, update_time = $3
+			// now is the one claim time: the cap check above and the cap
+			// month of the claimed top-up use it, so the top-up counts in
+			// the UTC month in which the cap allowed it.
+			_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charging', paddle_subscription_id = $2, update_time = $3,
+					cap_time = $3
 				WHERE top_up_id = $1`, claimed.ID, claimed.PaddleSubscriptionID, now)
 			return err
 		})

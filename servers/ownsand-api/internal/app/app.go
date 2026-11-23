@@ -276,3 +276,14 @@ func (a *App) Run(ctx context.Context) {
 // FlushUsage writes the usage counts that are still in memory, for example
 // the counts of RPCs that ended during the HTTP drain after Run returned.
 func (a *App) FlushUsage(ctx context.Context) error { return a.Metering.Flush(ctx) }
+
+// DrainUsage waits until the requests that can record usage have recorded it
+// and ended, or ctx ends; see api.Service.DrainUsage. Call it after the HTTP
+// server stopped and before FlushUsageFinal.
+func (a *App) DrainUsage(ctx context.Context) error { return a.Service.DrainUsage(ctx) }
+
+// FlushUsageFinal writes the usage counts that are still in memory and
+// closes the usage recorder, so a count that arrives later is logged as
+// dropped instead of being kept unseen. Call it once, as the last usage
+// write before the process exits.
+func (a *App) FlushUsageFinal(ctx context.Context) error { return a.Metering.FlushFinal(ctx) }

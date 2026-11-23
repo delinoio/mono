@@ -484,8 +484,10 @@ h2 {
     --app-gap: 16px;
   }
 
+  /* A bare 1fr has an automatic minimum of its content, which is the width of
+     the nowrap section list, so the track would grow past the viewport. */
   .org-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .sidenav ul {

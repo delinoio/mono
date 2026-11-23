@@ -1196,6 +1196,107 @@ describe("Select", () => {
     expect(trigger.textContent).toContain("Editor");
   });
 
+  describe("option text", () => {
+    function renderInterpolated() {
+      const os = "Linux";
+      const name = "node-24-toolchain";
+      return render(
+        <Select label="Source" defaultValue="base:1">
+          <SelectOption value="base:1">{os} base image</SelectOption>
+          <SelectOption value="template:t1">Template: {name}</SelectOption>
+        </Select>,
+      );
+    }
+
+    test("shows interpolated children in the trigger before and after hover and focus", async () => {
+      renderInterpolated();
+      const trigger = screen.getByRole("combobox", { name: "Source" });
+      expect(trigger.textContent).toContain("Linux base image");
+
+      await act(async () => {
+        fireEvent.pointerEnter(trigger);
+        fireEvent.mouseEnter(trigger);
+      });
+      expect(trigger.textContent).toContain("Linux base image");
+      expect(trigger.textContent).not.toContain("base:1");
+
+      await act(async () => {
+        fireEvent.focus(trigger);
+      });
+      expect(trigger.textContent).toContain("Linux base image");
+      expect(trigger.textContent).not.toContain("base:1");
+    });
+
+    test("shows interpolated children in the option list", async () => {
+      renderInterpolated();
+      const trigger = screen.getByRole("combobox", { name: "Source" });
+      await act(async () => {
+        fireEvent.click(trigger);
+      });
+      expect(
+        screen.getAllByRole("option").map((option) => option.textContent),
+      ).toEqual(["Linux base image", "Template: node-24-toolchain"]);
+      expect(trigger.textContent).toContain("Linux base image");
+
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("option", { name: "Template: node-24-toolchain" }),
+        );
+      });
+      expect(trigger.textContent).toContain("Template: node-24-toolchain");
+    });
+
+    test("prefers an explicit label over the children", () => {
+      render(
+        <Select label="Role" defaultValue="editor">
+          <SelectOption value="editor" label="Editor label">
+            Editor {"children"}
+          </SelectOption>
+        </Select>,
+      );
+      const trigger = screen.getByRole("combobox", { name: "Role" });
+      expect(trigger.textContent).toContain("Editor label");
+    });
+
+    test("reads the text of nested elements and numbers", () => {
+      const slot = 2;
+      render(
+        <>
+          <Select label="Nested" defaultValue="a">
+            <SelectOption value="a">
+              <span>
+                Nested <strong>text</strong>
+              </span>
+            </SelectOption>
+          </Select>
+          <Select label="Slot" defaultValue="s">
+            <SelectOption value="s">Slot {slot}</SelectOption>
+          </Select>
+        </>,
+      );
+      expect(
+        screen.getByRole("combobox", { name: "Nested" }).textContent,
+      ).toContain("Nested text");
+      expect(
+        screen.getByRole("combobox", { name: "Slot" }).textContent,
+      ).toContain("Slot 2");
+    });
+
+    test("keeps showing the value for an option without text", () => {
+      render(
+        <Select label="Empty" defaultValue="raw-value">
+          <SelectOption value="raw-value">
+            {null}
+            {false}
+          </SelectOption>
+        </Select>,
+      );
+      expect(
+        screen.getByRole("combobox", { name: "Empty" }).textContent,
+      ).toContain("raw-value");
+    });
+  });
+
   test("insets the trigger with logical padding so right-to-left keeps 14px on the value side", () => {
     const rule = block(".dui-select");
     expect(rule).toContain("padding-inline: 14px 12px");

@@ -117,6 +117,10 @@ type Service struct {
 	// BillingService read; nil turns billing enforcement off.
 	Billing *billing.Statuses
 
+	// usageWriters counts the requests that can still record usage, so the
+	// shutdown can wait for them before the final usage flush.
+	usageWriters usageGate
+
 	// afterConfigLimitsRead is a test hook that sendConfiguration calls after
 	// it read the device limits and before it queues the message. It is nil in
 	// production.

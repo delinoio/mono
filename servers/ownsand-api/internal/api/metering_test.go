@@ -311,3 +311,29 @@ func TestRelayEgressMetering(t *testing.T) {
 		t.Fatalf("WriteFile egress = %d, want 1..%d", egress, upper)
 	}
 }
+
+// TestFinalUsageFlushClosesRecorder checks the shutdown order: the usage of
+// a finished RPC is written by the final flush, and an RPC that records usage
+// after the final flush adds nothing to the counter rows.
+func TestFinalUsageFlushClosesRecorder(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	if _, err := org.OwnerClient.Organization.GetOrganization(ctx, connect.NewRequest(&ownsandv1.GetOrganizationRequest{OrganizationId: org.ID})); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.App.DrainUsage(ctx); err != nil {
+		t.Fatalf("DrainUsage with no request running = %v", err)
+	}
+	if err := env.App.FlushUsageFinal(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := map[ownsandv1.BillingMeter]int64{meterClassA: 3, meterClassB: 1}
+	expectUsage(t, env, org.ID, want)
+
+	// A count that arrives after the final flush is dropped, not kept.
+	if _, err := org.OwnerClient.Organization.GetOrganization(ctx, connect.NewRequest(&ownsandv1.GetOrganizationRequest{OrganizationId: org.ID})); err != nil {
+		t.Fatal(err)
+	}
+	expectUsage(t, env, org.ID, want)
+}

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"io"
@@ -289,17 +290,13 @@ func TestAPIClientErrors(t *testing.T) {
 }
 
 func TestGrowDisk(t *testing.T) {
-	mkfs := tool("mkfs.ext4")
-	if _, err := os.Stat(mkfs); err != nil {
-		t.Skip("mkfs.ext4 not installed")
-	}
 	img := filepath.Join(t.TempDir(), "disk.ext4")
-	if err := os.WriteFile(img, nil, 0o600); err != nil {
+	content := make([]byte, 16<<20)
+	if _, err := rand.Read(content); err != nil {
 		t.Fatal(err)
 	}
-	os.Truncate(img, 16<<20)
-	if out, err := exec.Command(mkfs, "-q", "-F", img).CombinedOutput(); err != nil {
-		t.Fatalf("mkfs: %v %s", err, out)
+	if err := os.WriteFile(img, content, 0o600); err != nil {
+		t.Fatal(err)
 	}
 	cp := img + ".copy"
 	if err := copyDisk(context.Background(), img, cp); err != nil {
@@ -308,87 +305,117 @@ func TestGrowDisk(t *testing.T) {
 	if err := growDisk(context.Background(), cp, 64<<20); err != nil {
 		t.Fatal(err)
 	}
-	if st, _ := os.Stat(cp); st.Size() != 64<<20 {
-		t.Fatalf("size %d", st.Size())
-	}
-	// A smaller size keeps the image.
-	if err := growDisk(context.Background(), cp, 1<<20); err != nil {
+	got, err := os.ReadFile(cp)
+	if err != nil {
 		t.Fatal(err)
 	}
-}
-
-// TestGrowDiskE2fsckOutcome runs growDisk with stub e2fsck and resize2fs
-// tools on PATH. Only e2fsck exit codes 0 and 1 may reach resize2fs; a
-// signal-terminated e2fsck (ExitCode -1) and any other exit code must fail
-// before resize2fs runs.
-func TestGrowDiskE2fsckOutcome(t *testing.T) {
-	cases := []struct {
-		name      string
-		e2fsck    string
-		wantErr   string
-		wantRsize bool
-	}{
-		{name: "clean", e2fsck: "exit 0", wantRsize: true},
-		{name: "corrected", e2fsck: "exit 1", wantRsize: true},
-		{name: "uncorrected", e2fsck: "echo bad >&2; exit 4", wantErr: "exit status 4"},
-		{name: "operational", e2fsck: "exit 8", wantErr: "exit status 8"},
-		{name: "signal", e2fsck: "kill -9 $$", wantErr: "signal: killed"},
+	if len(got) != 64<<20 {
+		t.Fatalf("size %d", len(got))
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			bin := t.TempDir()
-			marker := filepath.Join(bin, "resize2fs.ran")
-			writeStub := func(name, body string) {
-				if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
-					t.Fatal(err)
-				}
-			}
-			writeStub("e2fsck", tc.e2fsck)
-			writeStub("resize2fs", "touch '"+marker+"'")
-			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-			img := filepath.Join(t.TempDir(), "disk.ext4")
-			if err := os.WriteFile(img, make([]byte, 1<<20), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			err := growDisk(context.Background(), img, 4<<20)
-			_, statErr := os.Stat(marker)
-			ran := statErr == nil
-			if tc.wantErr == "" && err != nil {
-				t.Fatalf("growDisk: %v", err)
-			}
-			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), "e2fsck") || !strings.Contains(err.Error(), tc.wantErr)) {
-				t.Fatalf("growDisk error %v, want e2fsck %q", err, tc.wantErr)
-			}
-			if ran != tc.wantRsize {
-				t.Fatalf("resize2fs ran %v, want %v", ran, tc.wantRsize)
-			}
-		})
+	if !bytes.Equal(got[:16<<20], content) {
+		t.Fatal("growDisk changed the existing image content")
+	}
+	for i, b := range got[16<<20:] {
+		if b != 0 {
+			t.Fatalf("grown region byte %d is %d, want 0", i, b)
+		}
+	}
+	// A smaller or equal size keeps the image unchanged.
+	for _, size := range []int64{1 << 20, 64 << 20} {
+		if err := growDisk(context.Background(), cp, size); err != nil {
+			t.Fatal(err)
+		}
+		after, err := os.ReadFile(cp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(after, got) {
+			t.Fatalf("growDisk to %d changed the image", size)
+		}
 	}
 }
 
-// TestGrowDiskCanceledE2fsck covers a context that ends while e2fsck runs.
-func TestGrowDiskCanceledE2fsck(t *testing.T) {
+// TestGrowDiskKeepsExt4Image grows a real ext4 image and checks that the
+// existing bytes stay identical: the host extends the file only, and the
+// guest helper grows the file system online.
+func TestGrowDiskKeepsExt4Image(t *testing.T) {
+	mkfs := tool("mkfs.ext4")
+	if _, err := os.Stat(mkfs); err != nil {
+		t.Skip("mkfs.ext4 not installed")
+	}
+	img := filepath.Join(t.TempDir(), "disk.ext4")
+	if err := os.WriteFile(img, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(img, 16<<20); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(mkfs, "-q", "-F", img).CombinedOutput(); err != nil {
+		t.Fatalf("mkfs: %v %s", err, out)
+	}
+	before, err := os.ReadFile(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := img + ".copy"
+	if err := copyDisk(context.Background(), img, cp); err != nil {
+		t.Fatal(err)
+	}
+	if err := growDisk(context.Background(), cp, 64<<20); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 64<<20 || !bytes.Equal(after[:16<<20], before) {
+		t.Fatalf("grown ext4 image size %d or content changed", len(after))
+	}
+}
+
+// TestGrowDiskRunsNoFilesystemTool puts stub e2fsck, resize2fs and mkfs tools
+// on PATH. growDisk must never run a file system tool on the disk image.
+func TestGrowDiskRunsNoFilesystemTool(t *testing.T) {
 	bin := t.TempDir()
-	marker := filepath.Join(bin, "resize2fs.ran")
-	if err := os.WriteFile(filepath.Join(bin, "e2fsck"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(bin, "resize2fs"), []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o755); err != nil {
-		t.Fatal(err)
+	marker := filepath.Join(bin, "tool.ran")
+	for _, name := range []string{"e2fsck", "resize2fs", "tune2fs", "debugfs", "mkfs.ext4"} {
+		body := "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n"
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	img := filepath.Join(t.TempDir(), "disk.ext4")
 	if err := os.WriteFile(img, make([]byte, 1<<20), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	err := growDisk(ctx, img, 4<<20)
-	if err == nil || !strings.Contains(err.Error(), "e2fsck") {
-		t.Fatalf("growDisk error %v, want e2fsck failure", err)
+	if err := growDisk(context.Background(), img, 4<<20); err != nil {
+		t.Fatal(err)
 	}
-	if _, statErr := os.Stat(marker); statErr == nil {
-		t.Fatal("resize2fs ran after e2fsck was canceled")
+	if st, err := os.Stat(img); err != nil || st.Size() != 4<<20 {
+		t.Fatalf("image %v %v", st, err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("growDisk ran a file system tool")
+	}
+}
+
+// TestGrowDiskErrors covers a missing image and a canceled context.
+func TestGrowDiskErrors(t *testing.T) {
+	if err := growDisk(context.Background(), filepath.Join(t.TempDir(), "missing"), 4<<20); err == nil {
+		t.Fatal("growDisk of a missing image succeeded")
+	}
+	img := filepath.Join(t.TempDir(), "disk.ext4")
+	if err := os.WriteFile(img, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := growDisk(ctx, img, 4<<20); !errors.Is(err, context.Canceled) {
+		t.Fatalf("growDisk error %v, want context canceled", err)
+	}
+	if st, _ := os.Stat(img); st.Size() != 1<<20 {
+		t.Fatalf("canceled growDisk changed the image size to %d", st.Size())
 	}
 }
 
