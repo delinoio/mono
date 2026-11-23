@@ -18,17 +18,28 @@ func appendLines(logs *logSink, lines ...string) {
 func TestWaitLogMessagesDelayedRecords(t *testing.T) {
 	logs := &logSink{}
 	appendLines(logs, `api: {"level":"INFO","msg":"billing_sandbox_paused"}`)
+	done := make(chan []string, 1)
 	go func() {
-		time.Sleep(150 * time.Millisecond)
-		appendLines(logs, `api: {"level":"INFO","msg":"billing_sandbox_resumed"}`)
+		done <- logs.waitForLogMessages(context.Background(), "api", 10*time.Second, "billing_sandbox_paused", "billing_sandbox_resumed")
 	}()
-	start := time.Now()
-	missing := logs.waitForLogMessages(context.Background(), "api", 10*time.Second, "billing_sandbox_paused", "billing_sandbox_resumed")
-	if len(missing) != 0 {
-		t.Fatalf("missing = %q, want none", missing)
+	// The waiter must stay pending while the second record is missing. The
+	// bound spans several polling intervals, so the waiter scans at least once;
+	// it is not a minimum elapsed time of the wait, which scheduling delay
+	// could break.
+	select {
+	case missing := <-done:
+		t.Fatalf("the wait ended with missing = %q before the second record arrived", missing)
+	case <-time.After(8 * logWaitInterval):
 	}
-	if elapsed := time.Since(start); elapsed < 100*time.Millisecond || elapsed > 5*time.Second {
-		t.Fatalf("the wait took %s, want it to end soon after the delayed record", elapsed)
+	appendLines(logs, `api: {"level":"INFO","msg":"billing_sandbox_resumed"}`)
+	// The upper bound only guards against a hang.
+	select {
+	case missing := <-done:
+		if len(missing) != 0 {
+			t.Fatalf("missing = %q, want none", missing)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wait did not end after the second record arrived")
 	}
 }
 
