@@ -22,9 +22,12 @@ const userNames = users
 **Correct (1 iteration, no intermediate array):**
 
 ```typescript
-const userNames = users.flatMap(user =>
-  user.isActive ? [user.name] : []
-)
+const userNames = users.flatMap(user => {
+  if (!user.isActive) return []
+  const name = user.name
+  // Skip falsy names (such as '') exactly like filter(Boolean) does
+  return name ? [name] : []
+})
 ```
 
 **More examples:**
@@ -37,9 +40,11 @@ const emails = responses
   .filter(Boolean)
 
 // After
-const emails = responses.flatMap(r =>
-  r.success ? [r.data.email] : []
-)
+const emails = responses.flatMap(r => {
+  if (!r.success) return []
+  const email = r.data.email
+  return email ? [email] : []
+})
 
 // Parse and filter valid numbers
 // Before
