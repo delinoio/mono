@@ -186,6 +186,14 @@ function Composer({
 ```tsx
 const ComposerContext = createContext<ComposerContextValue | null>(null)
 
+function useComposerContext() {
+  const context = use(ComposerContext)
+  if (context === null) {
+    throw new Error('Composer components must be rendered inside <Composer.Provider>')
+  }
+  return context
+}
+
 function ComposerProvider({ children, state, actions, meta }: ProviderProps) {
   return (
     <ComposerContext value={{ state, actions, meta }}>
@@ -203,7 +211,7 @@ function ComposerInput() {
     state,
     actions: { update },
     meta: { inputRef },
-  } = use(ComposerContext)
+  } = useComposerContext()
   return (
     <TextInput
       ref={inputRef}
@@ -216,7 +224,7 @@ function ComposerInput() {
 function ComposerSubmit() {
   const {
     actions: { submit },
-  } = use(ComposerContext)
+  } = useComposerContext()
   return <Button onPress={submit}>Send</Button>
 }
 
