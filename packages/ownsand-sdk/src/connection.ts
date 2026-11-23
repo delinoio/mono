@@ -46,6 +46,23 @@ export function processEnv(): Env {
 }
 
 /**
+ * Reports whether the text after the authority of a special-scheme URL is
+ * empty or a single "/". The URL parser removes dot segments, so a path such as
+ * "/subdir/.." or "/." reads as "/" after parsing; this check reads the raw
+ * text instead. Like the URL parser, it ignores leading and trailing C0
+ * control characters and spaces, drops tabs and line breaks, and treats "\\" as
+ * a path separator.
+ */
+function rawPathIsRoot(raw: string): boolean {
+  const text = raw
+    .replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "")
+    .replace(/[\t\n\r]/g, "");
+  const afterScheme = text.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:[/\\]*/, "");
+  const tail = afterScheme.slice(afterScheme.search(/[/\\?#]|$/));
+  return tail === "" || tail === "/";
+}
+
+/**
  * Validates an API origin and returns it in canonical form. It must be an
  * http or https origin without credentials, path, query or fragment.
  */
@@ -68,7 +85,8 @@ export function resolveApiOrigin(value: string | undefined): string {
     url.search !== "" ||
     url.hash !== "" ||
     raw.includes("?") ||
-    raw.includes("#")
+    raw.includes("#") ||
+    !rawPathIsRoot(raw)
   ) {
     throw new OwnSandConfigError(
       "origin must not have a path, query or fragment",
