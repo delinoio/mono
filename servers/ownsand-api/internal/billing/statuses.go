@@ -393,20 +393,24 @@ var ErrUnlinkFailed = errors.New("billing: UnlinkOrganization failed")
 // the organization exists. It deletes the pending row after delino-accounts
 // accepted the unlink. When the call fails, it records the next attempt
 // time in tx and returns an error that wraps the Connect error and
-// ErrUnlinkFailed. It sends nothing and returns ErrLinkInProgress while the
-// row is a link attempt whose LinkOrganization call can still be running.
+// ErrUnlinkFailed. It sends nothing, leaves the row intact and returns
+// ErrLinkInProgress while the row is a link attempt whose LinkOrganization
+// call can still be running (link_call_deadline) or a pending unlink that a
+// takeover of such an attempt guards until the call can no longer run
+// (unlink_not_before). Every caller, the retry of the lease holder and the
+// synchronous link and unlink RPCs alike, therefore honours the same guard.
 func (s *Statuses) UnlinkPendingTx(ctx context.Context, tx pgx.Tx, orgID string, now time.Time) error {
 	var account string
 	var attempts int
-	var running *time.Time
-	err := tx.QueryRow(ctx, "SELECT COALESCE(billing_account_id::text, ''), attempts, link_call_deadline FROM billing_pending_unlinks WHERE organization_id = $1 FOR UPDATE", orgID).Scan(&account, &attempts, &running)
+	var running, guard *time.Time
+	err := tx.QueryRow(ctx, "SELECT COALESCE(billing_account_id::text, ''), attempts, link_call_deadline, unlink_not_before FROM billing_pending_unlinks WHERE organization_id = $1 FOR UPDATE", orgID).Scan(&account, &attempts, &running, &guard)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if running != nil && running.After(now) {
+	if (running != nil && running.After(now)) || (guard != nil && guard.After(now)) {
 		return ErrLinkInProgress
 	}
 	if s.client == nil {

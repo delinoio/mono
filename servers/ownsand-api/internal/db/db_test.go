@@ -840,3 +840,46 @@ func TestExportVerificationMigrationKeepsExportedRows(t *testing.T) {
 		t.Fatalf("store the verification: %v", err)
 	}
 }
+
+// pendingUnlinkGuardMigration is the version of
+// 0014_billing_pending_unlink_guard.sql.
+const pendingUnlinkGuardMigration = 14
+
+// TestPendingUnlinkGuardMigrationKeepsRows upgrades a database at the schema
+// of migration 0013 that holds a pending unlink, and checks that the row has
+// no guard, that the previous release's column list still writes rows
+// without one, and that the column accepts a guard time.
+func TestPendingUnlinkGuardMigrationKeepsRows(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, pendingUnlinkGuardMigration-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	const oldInsert = `INSERT INTO billing_pending_unlinks (organization_id, billing_account_id, create_time, attempts, next_attempt_time)
+		VALUES ($1, '018f0000-0000-7000-8000-0000000000b1', now(), 4, now())`
+	org1, org2 := "018f0000-0000-7000-8000-0000000000d1", "018f0000-0000-7000-8000-0000000000d2"
+	if _, err := d.Pool.Exec(ctx, oldInsert, org1); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, testenv.Discard()); err != nil {
+		t.Fatal(err)
+	}
+	// The previous release keeps serving during a rolling deployment.
+	if _, err := d.Pool.Exec(ctx, oldInsert, org2); err != nil {
+		t.Fatalf("insert with the previous column list: %v", err)
+	}
+	for _, org := range []string{org1, org2} {
+		var attempts int
+		var guard *time.Time
+		if err := d.Pool.QueryRow(ctx, "SELECT attempts, unlink_not_before FROM billing_pending_unlinks WHERE organization_id = $1", org).Scan(&attempts, &guard); err != nil {
+			t.Fatal(err)
+		}
+		if attempts != 4 || guard != nil {
+			t.Fatalf("pending unlink %s = %d attempts, guard %v, want 4 without a guard", org, attempts, guard)
+		}
+	}
+	if _, err := d.Pool.Exec(ctx, "UPDATE billing_pending_unlinks SET unlink_not_before = now() + interval '30 seconds' WHERE organization_id = $1", org1); err != nil {
+		t.Fatalf("store the guard: %v", err)
+	}
+}

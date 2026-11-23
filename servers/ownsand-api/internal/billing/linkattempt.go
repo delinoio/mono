@@ -82,11 +82,14 @@ func (s *Statuses) AbandonLinkAttempt(ctx context.Context, q db.Querier, orgID, 
 // TakeOverLinkAttemptTx turns the link attempt of the organization into a
 // plain pending unlink in tx, which must hold the organization row lock. The
 // unlink is not sent before the call of the attempt has returned or timed
-// out, so it cannot overtake the call. It reports whether an attempt
-// existed. A completion of the old attempt finds no row with its ID and
-// records no link.
+// out, so it cannot overtake the call: the call deadline moves to
+// unlink_not_before, which every send of the row honours (the retry of the
+// lease holder and the synchronous link and unlink RPCs alike), and to
+// next_attempt_time. It reports whether an attempt existed. A completion of
+// the old attempt finds no row with its ID and records no link.
 func TakeOverLinkAttemptTx(ctx context.Context, tx pgx.Tx, orgID string, now time.Time) (bool, error) {
 	tag, err := tx.Exec(ctx, `UPDATE billing_pending_unlinks SET link_attempt_id = NULL, link_call_deadline = NULL, attempts = 0,
+		unlink_not_before = greatest($2::timestamptz, COALESCE(link_call_deadline, $2::timestamptz)),
 		next_attempt_time = greatest($2::timestamptz, COALESCE(link_call_deadline, $2::timestamptz))
 		WHERE organization_id = $1 AND link_attempt_id IS NOT NULL`, orgID, now)
 	if err != nil {
