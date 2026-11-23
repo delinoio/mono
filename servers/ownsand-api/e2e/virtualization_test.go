@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // The opt-in variables of the agent's Virtualization.framework integration
@@ -48,6 +50,14 @@ func TestLifecycleVirtualization(t *testing.T) {
 	}
 	s := newStack(t, stackOptions{agentEnv: virtualizationAgentEnv(t, kernel, rootfs)})
 	for _, tr := range transports {
-		t.Run(tr.String(), func(t *testing.T) { sdkLifecycle(t, s, tr) })
+		// Memory-state restore depends on the host architecture (it needs
+		// Apple silicon), so the test accepts either restore path of a
+		// snapshot and rejects only BASE_IMAGE, which means that the sandbox
+		// ignored the snapshot.
+		t.Run(tr.String(), func(t *testing.T) {
+			sdkLifecycle(t, s, tr,
+				ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE,
+				ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT)
+		})
 	}
 }

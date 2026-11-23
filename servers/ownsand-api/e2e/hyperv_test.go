@@ -37,7 +37,11 @@ func TestLifecycleHyperV(t *testing.T) {
 		"OWNSAND_AGENT_LINUX_ROOTFS=" + rootfs,
 	}})
 	for _, tr := range transports {
-		t.Run("sdk-"+tr.String(), func(t *testing.T) { sdkLifecycle(t, s, tr) })
+		// The Hyper-V runtime has no memory-state restore: it boots the
+		// snapshot disk cold.
+		t.Run("sdk-"+tr.String(), func(t *testing.T) {
+			sdkLifecycle(t, s, tr, ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT)
+		})
 		t.Run("cli-"+tr.String(), func(t *testing.T) { cliLifecycle(t, s, tr) })
 	}
 	t.Run("control-plane-restart", func(t *testing.T) { hyperVControlPlaneRestart(t, s) })
