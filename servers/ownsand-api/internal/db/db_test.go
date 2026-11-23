@@ -673,6 +673,56 @@ func TestLinkAttemptMigrationKeepsPendingUnlinks(t *testing.T) {
 	}
 }
 
+// optionalPendingUnlinkAccountMigration is the version of
+// 0012_billing_pending_unlink_optional_account.sql.
+const optionalPendingUnlinkAccountMigration = 12
+
+// TestPendingUnlinkOptionalAccountMigrationKeepsRows upgrades a database at
+// the schema of migration 0011 that holds pending unlinks, and checks that
+// the rows keep their billing account, that a row without a billing account
+// is accepted afterwards, and that the previous release's column list still
+// writes rows.
+func TestPendingUnlinkOptionalAccountMigrationKeepsRows(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, optionalPendingUnlinkAccountMigration-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	const account = "018f0000-0000-7000-8000-0000000000b1"
+	const oldInsert = `INSERT INTO billing_pending_unlinks (organization_id, billing_account_id, create_time, attempts, next_attempt_time)
+		VALUES ($1, '` + account + `', now(), 3, now())`
+	org1, org2, org3 := "018f0000-0000-7000-8000-0000000000d1", "018f0000-0000-7000-8000-0000000000d2", "018f0000-0000-7000-8000-0000000000d3"
+	if _, err := d.Pool.Exec(ctx, oldInsert, org1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO billing_pending_unlinks (organization_id, create_time, next_attempt_time) VALUES ($1, now(), now())`, org3); err == nil {
+		t.Fatal("a pending unlink without a billing account was accepted before the migration")
+	}
+	if err := d.Migrate(ctx, testenv.Discard()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool.Exec(ctx, oldInsert, org2); err != nil {
+		t.Fatalf("insert with the previous column list: %v", err)
+	}
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO billing_pending_unlinks (organization_id, create_time, next_attempt_time) VALUES ($1, now(), now())`, org3); err != nil {
+		t.Fatalf("insert without a billing account: %v", err)
+	}
+	for org, want := range map[string]string{org1: account, org2: account, org3: ""} {
+		var got *string
+		var attempts int
+		if err := d.Pool.QueryRow(ctx, "SELECT billing_account_id::text, attempts FROM billing_pending_unlinks WHERE organization_id = $1", org).Scan(&got, &attempts); err != nil {
+			t.Fatal(err)
+		}
+		if (want == "") != (got == nil) || (got != nil && *got != want) {
+			t.Fatalf("billing account of %s = %v, want %q", org, got, want)
+		}
+		if want != "" && attempts != 3 {
+			t.Fatalf("attempts of %s = %d, want 3", org, attempts)
+		}
+	}
+}
+
 // sandboxTTLMigration is the version of 0011_sandbox_ttl_nanoseconds.sql.
 const sandboxTTLMigration = 11
 
