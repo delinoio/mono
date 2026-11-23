@@ -15,6 +15,8 @@ import {
   ErrorNotice,
   RefetchNotice,
   FormDialog,
+  formInvalid,
+  formSubmitted,
   Loading,
   MorePages,
 } from "../../components/ui.tsx";
@@ -306,7 +308,7 @@ function Invitations() {
           const checked = checkEmail(email);
           if (!checked.ok) {
             setEmailError(checked.error);
-            return;
+            return formInvalid();
           }
           setEmailError(undefined);
           await create.mutateAsync({
@@ -314,8 +316,12 @@ function Invitations() {
             email: checked.value,
             role: Number(inviteRole) as BillingAccountRole,
           });
-          openInvite(false);
-          toast.success(`An invitation is sent to ${checked.value}.`);
+          // The list refreshes in the mutation's `onSuccess` for every sent
+          // invitation; the close, reset and toast belong to this opening.
+          return formSubmitted(() => {
+            openInvite(false);
+            toast.success(`An invitation is sent to ${checked.value}.`);
+          });
         }}
       >
         <TextField

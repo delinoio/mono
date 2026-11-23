@@ -9,7 +9,13 @@ import {
   screen,
 } from "@testing-library/react";
 import { useState } from "react";
-import { ConfirmDialog, FormDialog } from "./ui.tsx";
+import {
+  ConfirmDialog,
+  FormDialog,
+  type FormSubmission,
+  formInvalid,
+  formSubmitted,
+} from "./ui.tsx";
 
 afterEach(cleanup);
 
@@ -55,7 +61,11 @@ function ConfirmHarness({ onConfirm }: { onConfirm: () => Promise<unknown> }) {
   );
 }
 
-function FormHarness({ onSubmit }: { onSubmit: () => Promise<unknown> }) {
+function FormHarness({
+  onSubmit,
+}: {
+  onSubmit: () => Promise<FormSubmission | unknown>;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -66,13 +76,22 @@ function FormHarness({ onSubmit }: { onSubmit: () => Promise<unknown> }) {
         open={open}
         title="Create it"
         submitLabel="Create"
-        onSubmit={onSubmit}
+        // A resolved test promise stands for a successful request; a test that
+        // needs another outcome resolves with a `FormSubmission` itself.
+        onSubmit={async () => {
+          const value = await onSubmit();
+          return isFormSubmission(value) ? value : formSubmitted();
+        }}
         onOpenChange={setOpen}
       >
         <p>Fields</p>
       </FormDialog>
     </>
   );
+}
+
+function isFormSubmission(value: unknown): value is FormSubmission {
+  return typeof value === "object" && value !== null && "outcome" in value;
 }
 
 function openDialog() {
@@ -243,6 +262,90 @@ describe("FormDialog", () => {
     second.reject(failure("current failure"));
     await settle();
     expect(screen.getByText(/current failure/)).toBeTruthy();
+    expect(submitButton().disabled).toBe(false);
+  });
+});
+
+describe("FormDialog success effects", () => {
+  function submitButton() {
+    return screen.getByRole("button", { name: "Create" }) as HTMLButtonElement;
+  }
+
+  /** A request that the test settles with a submission by hand. */
+  function deferredSubmission() {
+    let resolve!: (submission: FormSubmission) => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<FormSubmission>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  test("runs the effects of a success of the current opening once", async () => {
+    const pending = deferredSubmission();
+    const effects: string[] = [];
+    render(<FormHarness onSubmit={() => pending.promise} />);
+    openDialog();
+    fireEvent.click(submitButton());
+    pending.resolve(formSubmitted(() => effects.push("done")));
+    await settle();
+    expect(effects).toEqual(["done"]);
+  });
+
+  test("skips the effects of a success that arrives while the dialog is closed", async () => {
+    const pending = deferredSubmission();
+    const effects: string[] = [];
+    render(<FormHarness onSubmit={() => pending.promise} />);
+    openDialog();
+    fireEvent.click(submitButton());
+    closeDialog();
+    pending.resolve(formSubmitted(() => effects.push("done")));
+    await settle();
+    expect(effects).toEqual([]);
+  });
+
+  test("skips the effects of an earlier success after a reopen and keeps the current submission pending", async () => {
+    const first = deferredSubmission();
+    const second = deferredSubmission();
+    const attempts = [first, second];
+    let calls = 0;
+    const effects: string[] = [];
+    render(<FormHarness onSubmit={() => attempts[calls++]!.promise} />);
+    openDialog();
+    fireEvent.click(submitButton());
+    closeDialog();
+    openDialog();
+    fireEvent.click(submitButton());
+    expect(calls).toBe(2);
+    first.resolve(formSubmitted(() => effects.push("first")));
+    await settle();
+    expect(effects).toEqual([]);
+    // The dialog is still open and its own submission is still pending.
+    expect(submitButton().disabled).toBe(true);
+    second.resolve(formSubmitted(() => effects.push("second")));
+    await settle();
+    expect(effects).toEqual(["second"]);
+  });
+
+  test("runs no effects for invalid input or a failure and keeps the dialog open", async () => {
+    const first = deferredSubmission();
+    const second = deferredSubmission();
+    const attempts = [first, second];
+    let calls = 0;
+    const effects: string[] = [];
+    render(<FormHarness onSubmit={() => attempts[calls++]!.promise} />);
+    openDialog();
+    fireEvent.click(submitButton());
+    first.resolve(formInvalid());
+    await settle();
+    expect(effects).toEqual([]);
+    expect(submitButton().disabled).toBe(false);
+    fireEvent.click(submitButton());
+    second.reject(failure("backend refused"));
+    await settle();
+    expect(effects).toEqual([]);
+    expect(screen.getByText(/backend refused/)).toBeTruthy();
     expect(submitButton().disabled).toBe(false);
   });
 });
