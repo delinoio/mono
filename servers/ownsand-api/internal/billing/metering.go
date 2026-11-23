@@ -245,12 +245,23 @@ func (m *Metering) runReport(ctx context.Context) {
 	}
 }
 
+// FlushReceiptRetention is how long the receipt of a committed flush batch
+// stays in Postgres before the janitor deletes it. A batch that a flush
+// retries is safe while the retry runs within this time of the batch's
+// first attempt; the retry of an older batch whose first attempt was
+// committed but not acknowledged could count it twice (Metering logs
+// `billing_usage_flush_batch_stale` for such a retry). The bound is far
+// above the 10-second lifetime of the final flush and the 30-second flush
+// interval, and a process that cannot reach Postgres for this long is
+// restarted by the deployment long before.
+const FlushReceiptRetention = 7 * 24 * time.Hour
+
 // Flush adds the in-memory counts of this instance to the shared counter
 // rows. A count of a window that was sealed meanwhile moves to the oldest
-// open window. After a failure the counts stay in memory for the next
-// flush. (Known limit: when the commit outcome is unknown, for example
-// because the connection broke during the commit, the retry can count those
-// counts twice.)
+// open window. The counts go in batches with a receipt ID: after a failure,
+// including a commit whose outcome is unknown because the connection broke,
+// the next flush retries the same batch under the same ID, and Postgres
+// applies it at most once. Counts that arrive meanwhile form the next batch.
 func (m *Metering) Flush(ctx context.Context) error { return m.flush(ctx, false) }
 
 // FlushFinal writes the counts that are still in memory and closes the
@@ -262,36 +273,81 @@ func (m *Metering) FlushFinal(ctx context.Context) error { return m.flush(ctx, t
 func (m *Metering) flush(ctx context.Context, final bool) error {
 	m.flushMu.Lock()
 	defer m.flushMu.Unlock()
-	var counts map[counterKey]int64
 	if final {
-		counts = m.rec.takeAndClose()
-	} else {
-		counts = m.rec.take()
+		// Seal the live counters and close the recorder in one step, so a
+		// failed final flush keeps its batch for the retry of the caller.
+		if err := m.rec.sealBatch(true, m.now()); err != nil {
+			m.logger.Error("billing_usage_flush_failed", slog.Any("error", err))
+			return err
+		}
 	}
-	if len(counts) == 0 {
-		return nil
+	sealedLive := final
+	for {
+		b := m.rec.firstPending()
+		if b == nil {
+			if sealedLive {
+				return nil
+			}
+			// Batches that failed earlier are written first; the live counters
+			// become the next batch.
+			if err := m.rec.sealBatch(false, m.now()); err != nil {
+				m.logger.Error("billing_usage_flush_failed", slog.Any("error", err))
+				return err
+			}
+			sealedLive = true
+			continue
+		}
+		if err := m.applyBatch(ctx, b); err != nil {
+			return err
+		}
+		m.rec.ack(b)
+	}
+}
+
+// applyBatch writes one batch in one transaction that first records the
+// batch ID as a receipt. A receipt that exists already shows that an earlier
+// attempt committed this batch, so the batch adds nothing now: this keeps
+// the retry of a lost commit response from counting the batch twice, and
+// keeps it from adding to a window that was sealed after the first attempt.
+func (m *Metering) applyBatch(ctx context.Context, b *flushBatch) error {
+	if age := m.now().Sub(b.created); age > FlushReceiptRetention {
+		// The janitor may have deleted the receipt of an earlier, unacknowledged
+		// attempt of this batch, so this write is no longer protected.
+		m.logger.Warn("billing_usage_flush_batch_stale", slog.String("batch_id", b.id), slog.Duration("age", age), slog.Duration("retention", FlushReceiptRetention))
 	}
 	var moved []counterKey
 	var sealedBefore time.Time
+	duplicate := false
 	err := m.db.InTx(ctx, func(tx pgx.Tx) error {
 		var err error
 		if sealedBefore, err = lockSealStateShared(ctx, tx); err != nil {
 			return err
 		}
-		moved, err = addCounters(ctx, tx, sealedBefore, counts)
+		fresh, err := insertFlushReceipt(ctx, tx, b.id, m.now())
+		if err != nil {
+			return err
+		}
+		if !fresh {
+			duplicate = true
+			return nil
+		}
+		moved, err = addCounters(ctx, tx, sealedBefore, b.counts)
 		return err
 	})
 	if err != nil {
-		m.rec.restore(counts)
 		add(m.metrics.flushFailures)
-		m.logger.Warn("billing_usage_flush_failed", slog.Int("counters", len(counts)), slog.Any("error", err))
+		m.logger.Warn("billing_usage_flush_failed", slog.String("batch_id", b.id), slog.Int("counters", len(b.counts)), slog.Any("error", err))
 		return err
+	}
+	if duplicate {
+		m.logger.Warn("billing_usage_flush_batch_already_applied", slog.String("batch_id", b.id), slog.Int("counters", len(b.counts)))
+		return nil
 	}
 	for _, k := range moved {
 		m.logger.Warn("billing_usage_late_count_moved", slog.String("organization_id", k.org), slog.String("meter", MeterID(k.meter)),
-			slog.Time("window_start", k.windowStart()), slog.Time("moved_to_window_start", sealedBefore), slog.Int64("quantity", counts[k]))
+			slog.Time("window_start", k.windowStart()), slog.Time("moved_to_window_start", sealedBefore), slog.Int64("quantity", b.counts[k]))
 	}
-	m.logger.Debug("billing_usage_flushed", slog.Int("counters", len(counts)))
+	m.logger.Debug("billing_usage_flushed", slog.String("batch_id", b.id), slog.Int("counters", len(b.counts)))
 	return nil
 }
 

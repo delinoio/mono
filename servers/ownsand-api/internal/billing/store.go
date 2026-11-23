@@ -90,6 +90,18 @@ func addCounters(ctx context.Context, tx pgx.Tx, sealedBefore time.Time, counts 
 	return moved, err
 }
 
+// insertFlushReceipt records the ID of a flush batch in the transaction that
+// applies it and reports whether the receipt is new. A receipt that exists
+// already means that an earlier transaction committed the batch, so the
+// caller must not apply it again.
+func insertFlushReceipt(ctx context.Context, tx pgx.Tx, batchID string, now time.Time) (bool, error) {
+	tag, err := tx.Exec(ctx, "INSERT INTO usage_flush_receipts (batch_id, create_time) VALUES ($1, $2) ON CONFLICT (batch_id) DO NOTHING", batchID, now)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // storageCounts returns the R2 storage byte-seconds of every organization
 // with exported snapshots for one window: the part sizes of each snapshot in
 // the export state EXPORTED, times the window length in seconds.

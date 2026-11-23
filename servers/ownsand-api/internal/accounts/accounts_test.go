@@ -146,6 +146,38 @@ func receive(t *testing.T, ch <-chan tokenResult, what string) tokenResult {
 	}
 }
 
+// entryTimeout bounds how long a test waits for the fake token endpoint to
+// receive a request.
+const entryTimeout = 5 * time.Second
+
+// entryError waits until the fake token endpoint announces a request on
+// entered. It returns a diagnostic instead when the refresh returned before
+// reaching the endpoint (result holds the early token result) or no request
+// arrived within timeout.
+func entryError(entered <-chan struct{}, result <-chan tokenResult, phase string, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-entered:
+		return nil
+	case r := <-result:
+		return fmt.Errorf("the token refresh returned before the endpoint received %s (token %q, error %v)", phase, r.token, r.err)
+	case <-timer.C:
+		return fmt.Errorf("the token endpoint did not receive %s within %s", phase, timeout)
+	}
+}
+
+// awaitEntry fails the test with a bounded diagnostic when the expected
+// request does not reach the fake token endpoint. Without it, a refresh that
+// exits early would leave the test blocked on entered until the package
+// timeout.
+func awaitEntry(t *testing.T, entered <-chan struct{}, result <-chan tokenResult, phase string) {
+	t.Helper()
+	if err := entryError(entered, result, phase, entryTimeout); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // waitForFlightWaiters blocks until n callers wait on the token request in
 // progress, so a test acts only after a second caller joined the flight.
 func waitForFlightWaiters(t *testing.T, src *TokenSource, n int) {
@@ -165,7 +197,7 @@ func TestTokenSourceWaiterCancelDoesNotEndTheSharedRefresh(t *testing.T) {
 	src := newSource(t, ts, c)
 
 	first := tokenAsync(src, context.Background())
-	<-ts.entered // the first caller's request is held open
+	awaitEntry(t, ts.entered, first, "the first caller's request")
 	waiterCtx, cancel := context.WithCancel(context.Background())
 	waiter := tokenAsync(src, waiterCtx)
 	waitForFlightWaiters(t, src, 2) // the waiter joined the request before it is cancelled
@@ -200,7 +232,7 @@ func TestTokenSourceCallersShareOneRefreshAndTheCache(t *testing.T) {
 	src := newSource(t, ts, c)
 
 	first := tokenAsync(src, context.Background())
-	<-ts.entered
+	awaitEntry(t, ts.entered, first, "the first caller's request")
 	second := tokenAsync(src, context.Background())
 	waitForFlightWaiters(t, src, 2) // the second caller joined the request before it is released
 	ts.release()
@@ -232,10 +264,10 @@ func TestTokenSourceInvalidateDuringRefreshStartsANewRefresh(t *testing.T) {
 	src := newSource(t, ts, c)
 
 	stale := tokenAsync(src, context.Background())
-	<-ts.entered
+	awaitEntry(t, ts.entered, stale, "the first request")
 	src.Invalidate()
 	fresh := tokenAsync(src, context.Background())
-	<-ts.entered // the invalidated source started a second request
+	awaitEntry(t, ts.entered, fresh, "a second request after the invalidation")
 	ts.release()
 	receive(t, stale, "the caller of the invalidated request")
 	r := receive(t, fresh, "the caller of the new request")
@@ -409,5 +441,34 @@ func TestTokenSourceIgnoresDecodeErrorOfAnErrorResponse(t *testing.T) {
 	ts.body = `not json`
 	if _, err := src.Token(context.Background()); !errors.As(err, &te) || te.Status != http.StatusBadRequest || te.Code != "" {
 		t.Fatalf("error with an undecodable body = %v", err)
+	}
+}
+
+func TestEntryErrorReportsAnEarlyRefreshResult(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	result := make(chan tokenResult, 1)
+	result <- tokenResult{err: errors.New("token endpoint unreachable")}
+	err := entryError(entered, result, "the first request", time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "returned before the endpoint received the first request") || !strings.Contains(err.Error(), "error token endpoint unreachable") {
+		t.Fatalf("diagnostic = %v", err)
+	}
+}
+
+func TestEntryErrorReportsAMissingRequest(t *testing.T) {
+	start := time.Now()
+	err := entryError(make(chan struct{}, 1), make(chan tokenResult, 1), "a second request", 20*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "did not receive a second request") {
+		t.Fatalf("diagnostic = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("the wait was not bounded: %s", elapsed)
+	}
+}
+
+func TestEntryErrorAcceptsAnAnnouncedRequest(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	entered <- struct{}{}
+	if err := entryError(entered, make(chan tokenResult, 1), "a request", time.Minute); err != nil {
+		t.Fatalf("diagnostic = %v", err)
 	}
 }

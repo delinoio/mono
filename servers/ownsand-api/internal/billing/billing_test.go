@@ -163,7 +163,7 @@ func TestRecorder(t *testing.T) {
 	r.Add(org, classB, at, -3)
 	r.Add("not-a-uuid", classB, at, 1)
 	r.Add(org, unspecMtr, at, 1)
-	counts := r.take()
+	counts := takeBatch(t, r)
 	w := WindowStart(at).Unix()
 	want := map[counterKey]int64{
 		{org, classA, w}:       3,
@@ -178,12 +178,53 @@ func TestRecorder(t *testing.T) {
 			t.Errorf("counts[%v] = %d, want %d", k, counts[k], v)
 		}
 	}
-	if r.Pending() != 0 || r.take() != nil {
-		t.Fatal("take left counters behind")
+	if r.Pending() != 0 || takeBatch(t, r) != nil {
+		t.Fatal("sealing left counters behind")
 	}
-	r.Add(org, classA, at, 1)
-	r.restore(counts)
-	if got := r.take()[counterKey{org, classA, w}]; got != 4 {
-		t.Fatalf("restored count = %d", got)
+}
+
+// takeBatch seals the live counters into a batch, acknowledges it as a
+// successful flush would and returns its counters (nil without counters).
+func takeBatch(t *testing.T, r *Recorder) map[counterKey]int64 {
+	t.Helper()
+	if err := r.sealBatch(false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	b := r.firstPending()
+	if b == nil {
+		return nil
+	}
+	r.ack(b)
+	return b.counts
+}
+
+// TestRecorderBatchSurvivesAFailedFlush checks that a pending batch keeps its
+// ID and counters until it is acknowledged, and that counts recorded
+// meanwhile form a separate live batch instead of joining it.
+func TestRecorderBatchSurvivesAFailedFlush(t *testing.T) {
+	r := NewRecorder(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	org := "0190f3a4-0000-7000-8000-000000000001"
+	at := time.Date(2026, 11, 21, 10, 2, 0, 0, time.UTC)
+	k := counterKey{org, classA, WindowStart(at).Unix()}
+	r.Add(org, classA, at, 4)
+	if err := r.sealBatch(false, at); err != nil {
+		t.Fatal(err)
+	}
+	first := r.firstPending()
+	id := first.id
+	r.Add(org, classA, at, 3) // arrives while the batch is pending
+	if err := r.sealBatch(false, at); err != nil {
+		t.Fatal(err)
+	}
+	if again := r.firstPending(); again != first || again.id != id || again.counts[k] != 4 {
+		t.Fatalf("pending batch changed: %+v", again)
+	}
+	if r.Pending() != 2 {
+		t.Fatalf("pending counters = %d, want 2", r.Pending())
+	}
+	r.ack(first)
+	second := r.firstPending()
+	if second == nil || second.id == id || second.counts[k] != 3 {
+		t.Fatalf("second batch = %+v", second)
 	}
 }

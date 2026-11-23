@@ -342,7 +342,7 @@ func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error)
 	if m.openHook != nil {
 		m.openHook()
 	}
-	in, err := os.Open(src)
+	in, err := openSource(src)
 	if err != nil {
 		return 0, 0, fsError("read", err)
 	}

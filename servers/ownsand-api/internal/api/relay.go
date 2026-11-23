@@ -452,6 +452,11 @@ func (p *DataPlane) sendRequest(ctx context.Context, c *relayCall, f *ownsandv1.
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if errors.Is(err, relay.ErrStreamClosed) {
+			// The stream ended (the agent ended it, or the RPC closed it)
+			// before the request frame was queued; this is not a deadline.
+			return errUnavailable("the relay stream closed")
+		}
 		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("the request was not forwarded within the request deadline"))
 	}
 	return nil

@@ -620,7 +620,45 @@ func (s *Stream) SendMetered(ctx context.Context, f *ownsandv1.DataFrame, onWrit
 			return err
 		}
 	}
-	return s.conn.enqueueFrame(ctx, outFrame{frame: f, onWritten: onWritten})
+	return s.enqueueFrame(ctx, outFrame{frame: f, onWritten: onWritten})
+}
+
+// enqueueFrame queues an ordinary frame of this stream. It waits for one of
+// the connection's outboundQueue tokens like Conn.enqueueFrame, and then
+// inserts the frame only while the stream is open: the check and the insert
+// happen under s.mu, which closeWith also holds when it sets closed, so a
+// frame can never enter the queue behind the stream's final frame. A frame of
+// a closed stream returns its token, is not queued (its onWritten callback
+// never runs) and fails with ErrStreamClosed. The insert never blocks, because
+// the token guarantees room; the wait for the token happens outside s.mu.
+func (s *Stream) enqueueFrame(ctx context.Context, of outFrame) error {
+	c := s.conn
+	if s.isClosed() {
+		return ErrStreamClosed
+	}
+	select {
+	case c.slots <- struct{}{}:
+	case <-c.ctx.Done():
+		return ErrConnClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		<-c.slots
+		return ErrStreamClosed
+	}
+	// The token guarantees room, see Conn.enqueueFrame.
+	c.out <- of
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Stream) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 // push queues a frame from the agent. Frames that consume credit are bounded
@@ -707,7 +745,9 @@ func (s *Stream) Consumed(ctx context.Context, f *ownsandv1.DataFrame) {
 	if err != nil || inc == 0 {
 		return
 	}
-	_ = s.conn.enqueue(ctx, datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RelayWindowUpdate{IncrementBytes: inc}))
+	// A closed stream returns ErrStreamClosed: the agent ended the stream on
+	// its side already, so the window update has no receiver.
+	_ = s.enqueueFrame(ctx, outFrame{frame: datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RelayWindowUpdate{IncrementBytes: inc})})
 }
 
 // Close removes the stream from its connection. sendClose sends a relay

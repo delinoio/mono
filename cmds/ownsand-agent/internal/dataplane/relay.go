@@ -239,18 +239,40 @@ func (b countingBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// connCtxKey keys the relay connection that issued a request in the
+// request context.
+type connCtxKey struct{}
+
+// withConn returns ctx bound to the relay connection c. connectOnce passes
+// it to Connect, so countingTransport counts the bytes of that request's
+// response for c and for no other connection.
+func withConn(ctx context.Context, c *rconn) context.Context {
+	return context.WithValue(ctx, connCtxKey{}, c)
+}
+
+// countingTransport counts the response bytes of a request for the relay
+// connection that its context carries (see withConn). The connection is
+// bound when the request is issued, not looked up when a read completes: a
+// read of a retired response can finish after the loop installed a
+// replacement connection (awaitTeardown waits at most teardownGrace for the
+// old goroutines), and it must not refresh the replacement's receive clock.
+// A request without a bound connection is not counted.
 type countingTransport struct {
 	base http.RoundTripper
-	note func()
 }
 
 func (t countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req)
 	if err == nil && resp.Body != nil {
-		resp.Body = countingBody{ReadCloser: resp.Body, note: t.note}
+		if c, _ := req.Context().Value(connCtxKey{}).(*rconn); c != nil {
+			resp.Body = countingBody{ReadCloser: resp.Body, note: c.noteRecv}
+		}
 	}
 	return resp, err
 }
+
+// noteRecv records that bytes of this connection's response arrived.
+func (c *rconn) noteRecv() { c.lastRecv.Store(time.Now().UnixNano()) }
 
 func newRelay(d *DataPlane) *relay {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -260,20 +282,11 @@ func newRelay(d *DataPlane) *relay {
 		if base == nil {
 			base = http.DefaultTransport
 		}
-		hc := &http.Client{Transport: countingTransport{base: base, note: r.noteBytes}}
+		hc := &http.Client{Transport: countingTransport{base: base}}
 		r.client = ownsandv1connect.NewRelayAgentServiceClient(hc, d.opts.APIURL, connect.WithReadMaxBytes(datapath.MaxFrameSize+(64<<10)))
 	}
 	go r.housekeeping()
 	return r
-}
-
-func (r *relay) noteBytes() {
-	r.mu.Lock()
-	c := r.conn
-	r.mu.Unlock()
-	if c != nil {
-		c.lastRecv.Store(time.Now().UnixNano())
-	}
 }
 
 func (r *relay) poke() {
@@ -545,7 +558,7 @@ func (r *relay) connectOnce(ch agent.Channel, openedAt *time.Time) (bool, error)
 	*openedAt = r.idleFrom
 	r.mu.Unlock()
 	defer r.connClosed(c)
-	stream := r.client.Connect(ctx)
+	stream := r.client.Connect(withConn(ctx, c))
 	cpclient.SetBearer(stream.RequestHeader(), cred)
 	guestclient.CloseOnDone(ctx, stream)
 
