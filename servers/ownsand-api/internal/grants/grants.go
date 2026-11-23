@@ -278,6 +278,16 @@ func (r *Registry) Ack(grantID string, result ownsandv1.RelayGrantResult, replac
 	if g == nil || g.State != Pending {
 		return
 	}
+	// A pending grant is admittable only inside its admission window
+	// (ExpireAt + AdmissionTolerance), the same deadline sweepLocked applies.
+	// An acknowledgement at or after it must not install a grant that
+	// Admittable would reject at once: remove it through the ordinary removal
+	// path, so waiters see OutcomeRemoved, and the authorization ID and any
+	// predecessor link are released.
+	if !r.Now().Before(g.ExpireAt.Add(AdmissionTolerance)) {
+		r.removeLocked(grantID, OutcomeRemoved)
+		return
+	}
 	switch result {
 	case ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED:
 	case ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_REJECTED_GRANT_LIMIT:
