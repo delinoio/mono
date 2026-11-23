@@ -87,12 +87,19 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	d.mu.Lock()
 	closed, stun := d.closed, append([]string(nil), d.stunURLs...)
 	_, dup := d.sessions[offer.GetSessionId()]
+	// A revocation that arrived before this offer registered its session
+	// already ended it: the tombstone is consumed by the offer it names.
+	preRevoked := !closed && !dup && offer.GetSessionId() != "" && d.revoked.take(offer.GetSessionId(), time.Now())
 	d.mu.Unlock()
 	if closed {
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
 	}
 	if dup || offer.GetSessionId() == "" || offer.GetSdp() == "" {
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "offer needs a new session ID and an SDP body")
+	}
+	if preRevoked {
+		logger.Warn("session revoked before its offer was handled", "cancellation_reason", ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED.String())
+		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session ended before it was answered")
 	}
 	if state, ok := d.opts.Sandboxes.State(offer.GetSandboxId()); !ok || state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is not running on this device")
@@ -130,13 +137,22 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	d.mu.Lock()
 	_, dup = d.sessions[s.id]
 	closed = d.closed
-	if !closed && !dup {
+	// A revocation that arrived while the peer connection was created found
+	// no session; the tombstone check shares this critical section with the
+	// insertion, so a revocation either left a tombstone here or finds the
+	// session in the map.
+	preRevoked = !closed && !dup && d.revoked.take(s.id, time.Now())
+	if !closed && !dup && !preRevoked {
 		d.sessions[s.id] = s
 	}
 	d.mu.Unlock()
-	if closed || dup {
+	if closed || dup || preRevoked {
 		cancel()
 		pc.Close()
+		if preRevoked {
+			logger.Warn("session revoked before it was registered", "cancellation_reason", ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED.String())
+			return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session ended before it was answered")
+		}
 		if closed {
 			return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
 		}

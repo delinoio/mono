@@ -80,6 +80,8 @@ export async function* runReadFile(
             isAccepted: (response) =>
               response.event?.event?.case === "accepted",
           },
+          undefined,
+          (response) => response.event?.event?.case === "end",
         )) {
           yield response.event;
         }

@@ -404,15 +404,5 @@ func (s *Store) WipeLocalData() error {
 // holds open) must not keep the identity on disk. Reset returns every
 // failure joined into one error.
 func (s *Store) Reset() error {
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return err
-	}
-	var errs []error
-	for _, e := range entries {
-		if err := removeAll(filepath.Join(s.dir, e.Name())); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
+	return ResetDir(s.dir)
 }

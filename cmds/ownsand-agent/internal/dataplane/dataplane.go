@@ -128,8 +128,11 @@ type DataPlane struct {
 	mu       sync.Mutex
 	stunURLs []string
 	sessions map[string]*session
-	relay    *relay
-	closed   bool
+	// revoked holds the IDs of sessions that a revocation named before they
+	// were registered (see tombstones.go).
+	revoked tombstones
+	relay   *relay
+	closed  bool
 }
 
 var _ agent.DataPath = (*DataPlane)(nil)
@@ -178,9 +181,16 @@ func (d *DataPlane) Revoke(_ agent.Channel, rev *ownsandv1.SessionRevocation) {
 	case *ownsandv1.SessionRevocation_SessionId:
 		d.mu.Lock()
 		s := d.sessions[t.SessionId]
+		if s == nil && t.SessionId != "" {
+			// The offer for this session is not registered yet (or never
+			// arrives): remember the revocation so that Offer refuses it.
+			d.revoked.add(t.SessionId, time.Now())
+		}
 		d.mu.Unlock()
 		if s != nil {
 			s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED)
+		} else if t.SessionId != "" {
+			d.logger.Info("revocation of a session that is not registered; remembered until its offer or expiry", "session_id", t.SessionId)
 		}
 	case *ownsandv1.SessionRevocation_RelayGrantId:
 		d.relay.revoke(t.RelayGrantId)

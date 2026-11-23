@@ -217,6 +217,12 @@ export async function* runExec(
               response.event?.event?.case === "accepted",
           },
           hold,
+          (response) => {
+            const kind = response.event?.event?.case;
+            return (
+              kind === "exited" || kind === "failed" || kind === "sandboxEnded"
+            );
+          },
         ),
       );
     } else {

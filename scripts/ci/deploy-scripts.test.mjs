@@ -1842,6 +1842,14 @@ test(
         LOGTO_ENDPOINT: "https://auth.example.com",
         DOCS_LOGTO_APP_ID: "",
       }),
+      // Blank values: the consoles trim them, so they count as unset.
+      ...[" ", "\t", " \t ", "\r\n", "\u00a0", "\ufeff", "\u3000"].map(
+        (blank) =>
+          JSON.stringify({
+            LOGTO_ENDPOINT: "https://auth.example.com",
+            DOCS_LOGTO_APP_ID: blank,
+          }),
+      ),
       JSON.stringify({
         LOGTO_ENDPOINT: "https://auth.example.com",
         DOCS_LOGTO_APP_ID: "a\u0000b",
@@ -1857,7 +1865,7 @@ test(
       assert.equal(result.status, 1, variables);
       assert.match(
         result.stderr,
-        /::error::The build of docs needs repository variables that are not set, are empty or contain NUL: .*PUBLIC_LOGTO_APP_ID \(repository variable DOCS_LOGTO_APP_ID\)/,
+        /::error::The build of docs needs repository variables that are not set, are blank or contain NUL: .*PUBLIC_LOGTO_APP_ID \(repository variable DOCS_LOGTO_APP_ID\)/,
         variables,
       );
       assert.deepEqual(result.calls, [""], variables);

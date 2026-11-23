@@ -158,6 +158,64 @@ func mergeEnv(inherited []string, req map[string]string, fold func(string) strin
 	return out
 }
 
+// envValue returns the value of key in KEY=VALUE entries. Keys compare
+// through fold, and the last matching entry wins, as in os/exec.
+func envValue(env []string, key string, fold func(string) string) (string, bool) {
+	want := fold(key)
+	value, found := "", false
+	for _, kv := range env {
+		// Start at index 1 so Windows drive keys such as "=C:" parse.
+		for i := 1; i < len(kv); i++ {
+			if kv[i] == '=' {
+				if fold(kv[:i]) == want {
+					value, found = kv[i+1:], true
+				}
+				break
+			}
+		}
+	}
+	return value, found
+}
+
+// newCommand returns the command for argv with env as its environment, where
+// env is commandEnv(reqEnv). os/exec resolves a bare program name when it
+// builds the command, with the PATH of the helper process, which is before
+// the request variables apply. When the request sets PATH, resolve a bare
+// name with the PATH of env instead, without changing the environment of the
+// helper process: the request PATH is an overlay on the helper environment,
+// like every other request variable. A request without PATH, a name with a
+// path separator and an empty name keep the os/exec lookup, which maps a
+// missing program to PROGRAM_NOT_FOUND through startFailure. The command
+// still runs the program directly, without a shell, and keeps the requested
+// name as argv[0].
+func newCommand(argv []string, reqEnv map[string]string, env []string) *exec.Cmd {
+	name := argv[0]
+	if name == "" || hasPathSeparator(name) || !requestSetsPath(reqEnv) {
+		return exec.Command(name, argv[1:]...)
+	}
+	// Like exec.Command, keep a lookup error in Err so that Start reports it.
+	path, err := lookPathIn(name, env)
+	if path == "" {
+		path = name
+	}
+	return &exec.Cmd{Path: path, Args: argv, Err: err}
+}
+
+// requestSetsPath reports whether the request environment names PATH, with
+// the key comparison of the guest OS.
+func requestSetsPath(reqEnv map[string]string) bool {
+	want := envKeyFold(pathEnvKey)
+	for k := range reqEnv {
+		if envKeyFold(k) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// pathEnvKey is the canonical name of the program search path variable.
+const pathEnvKey = "PATH"
+
 func startFailure(err error) *ownsandv1.ExecEvent {
 	switch {
 	case errors.Is(err, exec.ErrNotFound), errors.Is(err, fs.ErrNotExist):
@@ -181,9 +239,10 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 			return
 		}
 	}
-	cmd := exec.Command(req.GetCommand()[0], req.GetCommand()[1:]...)
+	env := commandEnv(req.GetEnv())
+	cmd := newCommand(req.GetCommand(), req.GetEnv(), env)
 	cmd.Dir = req.GetWorkingDirectory()
-	cmd.Env = commandEnv(req.GetEnv())
+	cmd.Env = env
 	cmd.Stdout = outputWriter(l.WriteStdout)
 	cmd.Stderr = outputWriter(l.WriteStderr)
 	cmd.WaitDelay = pipeWaitDelay

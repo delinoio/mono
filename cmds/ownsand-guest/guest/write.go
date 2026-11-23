@@ -45,6 +45,14 @@ func wireToFileMode(wire uint32) fs.FileMode {
 	return mode
 }
 
+// renameFile and openStagingFile are the rename into place and the reopen of
+// a retained staging file; tests replace them to fail one call, because
+// directory permissions cannot fail the reopen of a file the owner can open.
+var (
+	renameFile      = os.Rename
+	openStagingFile = os.OpenFile
+)
+
 // span is a written byte range [start, end).
 type span struct{ start, end int64 }
 
@@ -232,6 +240,11 @@ func (m *writeManager) apply(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteF
 		}
 		return e.result, nil
 	}
+	// A failed finish can leave the staging file closed; reopen it before the
+	// chunk or the finish uses it.
+	if err := e.ensureOpen(); err != nil {
+		return nil, err
+	}
 	if err := e.writeChunk(req.GetOffset(), req.GetData()); err != nil {
 		// A rejected chunk does not extend the lifetime of the write: both the
 		// live time and the recovery record keep the last accepted chunk time.
@@ -280,7 +293,8 @@ func (e *writeEntry) writeChunk(off int64, data []byte) error {
 		return nil
 	}
 	if e.file == nil {
-		// A failed finish could not reopen the staging file.
+		// apply reopens the staging file before it writes a chunk; this
+		// guards a caller that skipped ensureOpen.
 		return errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write: staging file is not open")
 	}
 	end := off + int64(len(data))
@@ -320,6 +334,57 @@ func mergeSpan(ranges []span, s span) []span {
 	return out
 }
 
+// ensureOpen reopens the retained staging file of an unfinished write whose
+// file is closed. A finish whose rename failed closes the file; when the
+// reopen after that failure also fails, the write would otherwise stay
+// without a file until it expires. The written ranges are not touched: the
+// bytes are in the retained file.
+//
+// A staging file that does not exist any more (or that somebody replaced, so
+// it no longer has the identity of the file the helper created) cannot be
+// recovered, and the write is retired: it is marked gone, so the sweep removes
+// its record, and the call fails with not_found. Any other failure is
+// temporary and leaves the write as it is for the next call.
+func (e *writeEntry) ensureOpen() error {
+	if e.file != nil || e.finished {
+		return nil
+	}
+	if err := restoreStagingMode(e.tmp); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return e.retire()
+		}
+		return fsError("write", err)
+	}
+	f, err := openStagingFile(e.tmp, os.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return e.retire()
+		}
+		return fsError("write", err)
+	}
+	if e.identity != nil {
+		current, err := identityOfFile(f)
+		if err != nil {
+			f.Close()
+			return fsError("write", err)
+		}
+		if current != *e.identity {
+			f.Close()
+			return e.retire()
+		}
+	}
+	e.file = f
+	return nil
+}
+
+// retire marks the write gone and returns the not_found outcome. The sweep
+// removes the record (and a staging file that still has the recorded
+// identity) and remembers the write_id as expired.
+func (e *writeEntry) retire() error {
+	e.gone = true
+	return errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write staging file is gone")
+}
+
 // complete checks that the written ranges cover exactly [0, size), applies
 // the mode and renames the temporary file into place.
 func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
@@ -329,8 +394,8 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 	if !covered {
 		return errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "written ranges do not cover exactly [0, size_bytes)")
 	}
-	if e.file == nil {
-		return errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write: staging file is not open")
+	if err := e.ensureOpen(); err != nil {
+		return err
 	}
 	if err := e.file.Truncate(size); err != nil {
 		return fsError("write", err)
@@ -344,19 +409,18 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 	if err := e.file.Close(); err != nil {
 		return fsError("write", err)
 	}
-	if err := os.Rename(e.tmp, e.target); err != nil {
+	if err := renameFile(e.tmp, e.target); err != nil {
 		// Reopen so a retry of the finish can try again. The mode of the
 		// finish is already on the staging file, and a mode without the owner
 		// write bit (0444) would make the reopen fail for an unprivileged
-		// guest user. Restore a writable mode first; the retry applies the
-		// requested mode again before it renames.
+		// guest user, so ensureOpen restores a writable mode first; the retry
+		// applies the requested mode again before it renames. A failed reopen
+		// is not final: ensureOpen runs again at the start of every later
+		// chunk or finish of the write.
 		e.file = nil
-		if chmodErr := restoreStagingMode(e.tmp); chmodErr != nil {
-			return fsError("write", err)
-		}
-		if f, openErr := os.OpenFile(e.tmp, os.O_RDWR, 0); openErr == nil {
-			e.file = f
-		}
+		// The reopen error is not reported: the caller gets the rename error,
+		// and the next call repeats the reopen and reports its own error.
+		_ = e.ensureOpen()
 		return fsError("write", err)
 	}
 	e.file = nil

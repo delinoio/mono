@@ -40,6 +40,19 @@ readonly ts_targets=(
   "delino/tide"
 )
 
+# The scratch directory that the EXIT trap removes. It is a script-global
+# because the functions that create it exit the script directly, and the trap
+# runs after their locals are gone. The trap text never contains the path, so
+# a temporary path with spaces, quotes or other shell metacharacters is safe.
+scratch_dir=""
+
+cleanup() {
+  if [[ -n "$scratch_dir" ]]; then
+    rm -rf -- "$scratch_dir"
+  fi
+}
+trap cleanup EXIT
+
 buf() {
   (cd "$protos_dir" && go run "${BUF_MODULE}@${BUF_VERSION}" "$@")
 }
@@ -81,10 +94,8 @@ generate() {
   # a failing generator or a missing TypeScript plugin leaves every committed
   # binding untouched. buf_generate_ts exits the script on a missing plugin;
   # the EXIT trap still removes the temporary directory then.
-  local tmp
-  tmp="$(mktemp -d)"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" EXIT
+  scratch_dir="$(mktemp -d)"
+  local tmp="$scratch_dir"
   local go_out="$tmp/go"
   mkdir -p "$go_out"
   buf generate --output "$go_out"
@@ -150,10 +161,8 @@ check() {
     echo "protos: schemas are not formatted; run scripts/protos.sh generate" >&2
     exit 1
   fi
-  local tmp
-  tmp="$(mktemp -d)"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" EXIT
+  scratch_dir="$(mktemp -d)"
+  local tmp="$scratch_dir"
   local go_out="$tmp/go"
   mkdir -p "$go_out"
   buf generate --output "$go_out"
@@ -196,10 +205,8 @@ breaking() {
   fi
   # Extract the base schemas with git archive instead of a buf Git input,
   # because a buf Git input cannot read a linked worktree's `.git` file.
-  local tmp
-  tmp="$(mktemp -d)"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" EXIT
+  scratch_dir="$(mktemp -d)"
+  local tmp="$scratch_dir"
   git -C "$root" archive --format=tar "$base" -- protos | tar -x -C "$tmp"
   buf breaking --against "$tmp/protos"
   echo "protos: no breaking changes against $base"
