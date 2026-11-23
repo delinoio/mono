@@ -21,7 +21,7 @@
         "references/mvcc-transactions.md": "d852c5104a815ceb631fe13062da627f6de07a8592be5b45e855cc3a7f777958",
         "references/mvcc-vacuum.md": "8488330653b4156dcb42b1a21850e4aced51b9a4edbffef142ed04fb3236c63e",
         "references/optimization-checklist.md": "7babe582af123bc5e9772cb4c311914093a07faf3a18aa4d0ff8f85abc673c99",
-        "references/partitioning.md": "b48d7b8ec554f0536a7125fedfb38db122aec1d095b7bbc7b0e657bd2ad58805",
+        "references/partitioning.md": "35b36d2e843b38383f3939e1bbaf77744f3d3f94e1ce51794b73b42270d2ba70",
         "references/pgbouncer-configuration.md": "c89c7998e36c6b886029c1819aa633ab5d116bb362fa44b862f4e432c848cac1",
         "references/process-architecture.md": "0845e6c26c4272b9fb2be43e7676b35e169a3de12a5041131ccbb2c308342ff2",
         "references/ps-cli-api-insights.md": "e0560165c3832c0b9f469089e9b31ee2e543ac67828499b5ddd73b8fcbee4ec9",
