@@ -283,32 +283,73 @@ async function redactCall(
   };
 }
 
+/**
+ * Applies the client organization to the request of one call. A unary call
+ * carries its request message directly. A server-streaming call also marks
+ * the request as a stream, but carries exactly one message inside an async
+ * iterable, so that message is read and filled in the same way. The public
+ * RPCs have no client-streaming or bidirectional method.
+ */
 function organizationInterceptor(defaultOrg: string | undefined): Interceptor {
-  return (next) => async (req) => {
-    if (req.stream) {
-      // Every public RPC is unary or server-streaming, so the request is
-      // never a client stream.
-      return next(req);
-    }
-    if (!("organizationId" in req.method.input.field)) {
-      return next(req);
-    }
-    const message = req.message as { organizationId?: string };
+  const fill = (
+    methodName: string,
+    message: { organizationId?: string },
+  ): { organizationId?: string } => {
     if (message.organizationId !== undefined && message.organizationId !== "") {
-      return next(req);
+      return message;
     }
     if (defaultOrg === undefined || defaultOrg === "") {
       throw new ConnectError(
-        `${req.method.name} needs an organization: set organizationId on the client, ${EnvVar.Organization}, or the request`,
+        `${methodName} needs an organization: set organizationId on the client, ${EnvVar.Organization}, or the request`,
         Code.InvalidArgument,
       );
     }
+    return { ...message, organizationId: defaultOrg };
+  };
+  return (next) => async (req) => {
+    if (!("organizationId" in req.method.input.field)) {
+      return next(req);
+    }
+    if (req.stream) {
+      if (req.method.methodKind !== "server_streaming") {
+        return next(req);
+      }
+      // Read the single request before the call starts, so a missing
+      // organization fails the call locally and before any fetch.
+      const source = req.message[Symbol.asyncIterator]();
+      const first = await source.next();
+      if (first.done === true) {
+        return next({ ...req, message: (async function* () {})() });
+      }
+      const filled = fill(
+        req.method.name,
+        first.value as { organizationId?: string },
+      );
+      return next({
+        ...req,
+        message: (async function* () {
+          try {
+            yield filled as typeof first.value;
+            // A server-streaming request has no further message.
+            for (;;) {
+              const more = await source.next();
+              if (more.done === true) {
+                return;
+              }
+              yield more.value;
+            }
+          } finally {
+            await source.return?.();
+          }
+        })(),
+      });
+    }
     return next({
       ...req,
-      message: {
-        ...message,
-        organizationId: defaultOrg,
-      } as unknown as typeof req.message,
+      message: fill(
+        req.method.name,
+        req.message as { organizationId?: string },
+      ) as unknown as typeof req.message,
     });
   };
 }
