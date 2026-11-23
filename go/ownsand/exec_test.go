@@ -819,12 +819,29 @@ func TestAttachNotFoundAfterStartedIsUnknownOutcome(t *testing.T) {
 
 func testTruncation(t *testing.T, tr Transport) {
 	cp := newFakeCP(t)
-	gate := make(chan struct{})
+	// A failing fixture must end within a test-local deadline, and every
+	// fixture wait below is bounded by this context.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	// received closes when the SDK has delivered the first stdout chunk
+	// (aaaa) to the caller; dropped closes once the agent has dropped its
+	// first retained bytes. The agent drops only after the SDK received
+	// aaaa, and the SDK callback holds the stream until the drop happened,
+	// so the interruption and the resumed stream always sample the output
+	// after the drop, regardless of scheduling.
+	received := make(chan struct{})
+	dropped := make(chan struct{})
+	var receivedOnce sync.Once
 	cp.agent.run = func(_ []string, e *fakeExec) {
 		e.write(0, []byte("aaaa"))
-		<-gate
+		select {
+		case <-received:
+		case <-ctx.Done():
+			return
+		}
 		e.write(0, []byte("bbbb"))
 		e.drop(0, 6) // the agent keeps only the last bytes
+		close(dropped)
 		e.write(0, []byte("cccc"))
 		e.finish(exitedEvent(0))
 	}
@@ -843,14 +860,24 @@ func testTruncation(t *testing.T, tr Transport) {
 			return p2pAction{}
 		}
 	}
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		close(gate)
-	}()
 	c := cp.client(t, tr)
 	s := cp.handle(t, c)
 	r := &recorder{}
-	res, err := s.Exec(context.Background(), ExecParams{Command: []string{"x"}, OnEvent: r.on})
+	onEvent := func(ev ExecEvent) error {
+		if err := r.on(ev); err != nil {
+			return err
+		}
+		if ev.Kind == ExecEventStdout && ev.Offset == 0 {
+			receivedOnce.Do(func() { close(received) })
+			select {
+			case <-dropped:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+	res, err := s.Exec(ctx, ExecParams{Command: []string{"x"}, OnEvent: onEvent})
 	if err != nil {
 		t.Fatal(err)
 	}
