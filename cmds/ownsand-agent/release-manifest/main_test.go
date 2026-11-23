@@ -248,6 +248,42 @@ func TestAddReleaseRejections(t *testing.T) {
 	}
 }
 
+func TestReleaseVersionRejectsOversizedComponents(t *testing.T) {
+	const oversized = "9223372036854775808"
+	for _, v := range []string{oversized + ".0.0", "1." + oversized + ".0", "1.0." + oversized} {
+		if err := checkReleaseVersion(v); err == nil {
+			t.Errorf("checkReleaseVersion(%q) accepted an oversized component", v)
+		}
+		manifestJSON := `{"schema":1,"releases":[{"version":"` + v + `","default":true,"artifacts":[{"platform":"linux-amd64","url":"https://example.test/a","sha256":"` + strings.Repeat("a", 64) + `"}]}],"revoked_versions":[]}`
+		if _, err := decodeManifest([]byte(manifestJSON)); err == nil {
+			t.Errorf("decodeManifest accepted release version %q", v)
+		}
+
+		// The first release has no current manifest to compare with, so
+		// only the version check can refuse it, and it must refuse before
+		// the tool writes any output.
+		f := newFixture(t)
+		art := f.artifacts(t, "a", "x", PlatformLinuxAmd64)
+		out := filepath.Join(f.dir, "out.json")
+		if err := f.addRelease(t, "", v, art, out, "linux-amd64"); err == nil {
+			t.Errorf("first release %q accepted", v)
+		}
+		if _, err := os.Stat(out); !os.IsNotExist(err) {
+			t.Errorf("a rejected first release %q wrote %s", v, out)
+		}
+	}
+	for _, v := range []string{"0.0.0", "1.2.3", "10.20.30", "9223372036854775807.0.0"} {
+		if err := checkReleaseVersion(v); err != nil {
+			t.Errorf("checkReleaseVersion(%q) = %v, want nil", v, err)
+		}
+	}
+	for _, v := range []string{"v1.2.3", "1.2.3-rc.1", "01.2.3", "1.2", "1.2.3.4", ""} {
+		if err := checkReleaseVersion(v); err == nil {
+			t.Errorf("checkReleaseVersion(%q) accepted an invalid spelling", v)
+		}
+	}
+}
+
 func TestDecodeManifestRejectsUnknownFields(t *testing.T) {
 	if _, err := decodeManifest([]byte(`{"schema":1,"releases":[],"revoked_versions":[],"channels":[]}`)); err == nil {
 		t.Fatal("unknown field accepted")
