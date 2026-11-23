@@ -108,6 +108,7 @@ export function EnrollmentTokensPage() {
                         <Button
                           variant={ButtonVariant.Secondary}
                           size={ButtonSize.Small}
+                          aria-label={`Revoke enrollment token ${t.tokenPrefix}`}
                           onClick={() => setRevoking(t)}
                         >
                           Revoke

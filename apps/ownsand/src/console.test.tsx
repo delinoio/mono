@@ -682,7 +682,9 @@ describe("dialog focus return", () => {
 
   test("Make template returns focus to its button after Escape and Cancel", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/snapshots`);
-    const opener = await screen.findByRole("button", { name: "Make template" });
+    const opener = (
+      await screen.findAllByRole("button", { name: /^Make template/ })
+    )[0]!;
 
     await press(opener);
     const dialog = screen.getByRole("dialog", { name: "Make a template" });
@@ -868,7 +870,7 @@ describe("confirmation dialog requests", () => {
   async function openRevokeOf(name: string) {
     const row = screen.getByText(new RegExp(`^${name} `)).closest("li")!;
     await act(async () => {
-      fireEvent.click(within(row).getByRole("button", { name: "Revoke" }));
+      fireEvent.click(within(row).getByRole("button", { name: /^Revoke/ }));
     });
     await settle();
     return screen.findByRole("alertdialog", { name: `Revoke ${name}?` });
@@ -3165,7 +3167,7 @@ describe("leaving and deleting an organization", () => {
     });
     const row = (await screen.findByText("user-member-ada")).closest("li")!;
     await act(async () => {
-      fireEvent.click(within(row).getByRole("button", { name: "Remove" }));
+      fireEvent.click(within(row).getByRole("button", { name: /^Remove/ }));
     });
     await confirmIn("Remove member");
     await settle(300);
@@ -3585,7 +3587,9 @@ describe("enrollment token expiry", () => {
     const pending = await rowOf();
     expect(pending?.textContent).toContain("Not used");
     expect(
-      within(pending as HTMLElement).getByRole("button", { name: "Revoke" }),
+      within(pending as HTMLElement).getByRole("button", {
+        name: /^Revoke/,
+      }),
     ).toBeTruthy();
 
     cleanup();
@@ -3593,7 +3597,7 @@ describe("enrollment token expiry", () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/enrollment-tokens`, { transport });
     const expired = (await rowOf()) as HTMLElement;
     expect(expired.textContent).toContain("Expired");
-    expect(within(expired).queryByRole("button", { name: "Revoke" })).toBe(
+    expect(within(expired).queryByRole("button", { name: /^Revoke/ })).toBe(
       null,
     );
   });

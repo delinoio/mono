@@ -225,7 +225,9 @@ describe("devices", () => {
     ).toBeHidden();
     await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
 
-    await screen.getByRole("button", "Revoke").tap();
+    await screen
+      .getByRole("button", "Revoke enrollment token ose_", { exact: false })
+      .tap();
     const dialog = screen.getByRole("alertdialog", "Revoke token ose_", {
       exact: false,
     });
@@ -237,7 +239,9 @@ describe("devices", () => {
     await expect(dialog).toBeHidden();
     await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
 
-    await screen.getByRole("button", "Revoke").tap();
+    await screen
+      .getByRole("button", "Revoke enrollment token ose_", { exact: false })
+      .tap();
     await screen
       .getByRole("alertdialog", "Revoke token ose_", { exact: false })
       .getByRole("button", "Revoke token")

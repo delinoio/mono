@@ -27,6 +27,7 @@ import {
   PageHeader,
   QueryBoundary,
   ShortId,
+  shortIdText,
   toastError,
 } from "../components/ui.tsx";
 import { formatBytes, formatTime, labels } from "../format.ts";
@@ -115,6 +116,7 @@ export function SnapshotsPage() {
                         <Button
                           variant={ButtonVariant.Secondary}
                           size={ButtonSize.Small}
+                          aria-label={`Export snapshot ${shortIdText(s.snapshotId)}`}
                           onClick={async () => {
                             try {
                               await exportSnapshot.mutateAsync({
@@ -134,6 +136,7 @@ export function SnapshotsPage() {
                         <Button
                           variant={ButtonVariant.Secondary}
                           size={ButtonSize.Small}
+                          aria-label={`Make template from snapshot ${shortIdText(s.snapshotId)}`}
                           onClick={() => setTemplateFrom(s)}
                         >
                           Make template
@@ -142,6 +145,7 @@ export function SnapshotsPage() {
                       <Button
                         variant={ButtonVariant.Danger}
                         size={ButtonSize.Small}
+                        aria-label={`Delete snapshot ${shortIdText(s.snapshotId)}`}
                         onClick={() => setDeletingSnapshot(s)}
                       >
                         Delete
@@ -176,6 +180,7 @@ export function SnapshotsPage() {
                     <Button
                       variant={ButtonVariant.Danger}
                       size={ButtonSize.Small}
+                      aria-label={`Delete template ${t.name} from snapshot ${shortIdText(t.snapshotId)}`}
                       onClick={() => setDeletingTemplate(t)}
                     >
                       Delete
@@ -222,7 +227,7 @@ export function SnapshotsPage() {
       <ConfirmDialog
         open={deletingSnapshot !== undefined}
         onOpenChange={(open) => !open && setDeletingSnapshot(undefined)}
-        title="Delete this snapshot?"
+        title={`Delete the snapshot ${deletingSnapshot ? shortIdText(deletingSnapshot.snapshotId) : ""}?`}
         description="Delete its templates first. Sandboxes made from it keep running."
         confirmLabel="Delete snapshot"
         onConfirm={() =>

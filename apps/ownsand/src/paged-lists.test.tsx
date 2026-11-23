@@ -167,7 +167,7 @@ describe("enrollment tokens list", () => {
       expect(last.textContent).toContain("Not used");
 
       await act(async () => {
-        fireEvent.click(within(last).getByRole("button", { name: "Revoke" }));
+        fireEvent.click(within(last).getByRole("button", { name: /^Revoke/ }));
       });
       // Revoking asks for a confirmation first.
       const confirmation = await screen.findByRole("alertdialog", {}, WAIT);
@@ -184,7 +184,7 @@ describe("enrollment tokens list", () => {
       const after = itemsOf("Enrollment tokens");
       expect(
         within(after[after.length - 1]!).queryByRole("button", {
-          name: "Revoke",
+          name: /^Revoke/,
         }),
       ).toBeNull();
     },
@@ -345,7 +345,7 @@ describe("API keys list", () => {
       expect(last.textContent).toContain("late-key");
 
       await act(async () => {
-        fireEvent.click(within(last).getByRole("button", { name: "Revoke" }));
+        fireEvent.click(within(last).getByRole("button", { name: /^Revoke/ }));
       });
       const dialog = await screen.findByRole(
         "alertdialog",
@@ -367,7 +367,7 @@ describe("API keys list", () => {
       const after = itemsOf("API keys");
       expect(
         within(after[after.length - 1]!).queryByRole("button", {
-          name: "Revoke",
+          name: /^Revoke/,
         }),
       ).toBeNull();
     },

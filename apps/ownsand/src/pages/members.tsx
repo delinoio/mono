@@ -123,6 +123,7 @@ export function MembersPage() {
                         <Button
                           variant={ButtonVariant.Danger}
                           size={ButtonSize.Small}
+                          aria-label={`Remove ${displayName(m)}`}
                           onClick={() => setRemoving(m)}
                         >
                           Remove
@@ -227,6 +228,7 @@ function Invitations() {
                   <Button
                     variant={ButtonVariant.Secondary}
                     size={ButtonSize.Small}
+                    aria-label={`Revoke ${labels.role[i.role]} invitation ${i.secretPrefix}`}
                     onClick={() => setRevoking(i)}
                   >
                     Revoke
