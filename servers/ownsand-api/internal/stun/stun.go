@@ -14,6 +14,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +36,9 @@ type Server struct {
 	Limiter *ratelimit.Limiter
 
 	requests, responses, limited, invalid atomic.Int64
+
+	// statsStopped, when set, is called when the stats logger exits (tests).
+	statsStopped func()
 }
 
 // New returns a server whose responses to one source address stay within
@@ -139,13 +143,31 @@ func unknownRequired(req *pionstun.Message) pionstun.UnknownAttributes {
 	return unknown
 }
 
-// Serve answers binding requests on pc until ctx ends.
+// Serve answers binding requests on pc until ctx ends. It always closes pc
+// and stops its helper goroutines (the connection closer and the stats
+// logger) before it returns, also when a read fails while ctx is still
+// active, so a failed STUN worker does not keep the UDP socket bound or leave
+// goroutines running until the process exits. A read error with an active
+// ctx is returned; a read error after ctx ended returns nil.
 func (s *Server) Serve(ctx context.Context, pc net.PacketConn) error {
+	// The helpers run on a context that Serve owns and cancels on every
+	// return path; ctx alone would end them only on process shutdown.
+	runCtx, cancel := context.WithCancel(ctx)
+	var helpers sync.WaitGroup
+	defer func() {
+		cancel()
+		helpers.Wait()
+	}()
+	helpers.Add(2)
 	go func() {
-		<-ctx.Done()
+		defer helpers.Done()
+		<-runCtx.Done()
 		_ = pc.Close()
 	}()
-	go s.logStats(ctx)
+	go func() {
+		defer helpers.Done()
+		s.logStats(runCtx)
+	}()
 	buf := make([]byte, maxDatagram)
 	for {
 		n, addr, err := pc.ReadFrom(buf)
@@ -176,6 +198,9 @@ func (s *Server) Serve(ctx context.Context, pc net.PacketConn) error {
 }
 
 func (s *Server) logStats(ctx context.Context) {
+	if s.statsStopped != nil {
+		defer s.statsStopped()
+	}
 	t := time.NewTicker(statsInterval)
 	defer t.Stop()
 	for {
