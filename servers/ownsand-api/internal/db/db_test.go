@@ -456,6 +456,9 @@ func TestLegacyWriterTrigger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Release the pooled connection on any exit before the commit; the pool
+	// cleanup waits for checked-out connections. A no-op after the commit.
+	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx, legacyOrg, legacyTx, created); err != nil {
 		t.Fatal(err)
 	}
