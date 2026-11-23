@@ -18,9 +18,9 @@
 # proxy reload of every service: a reload applies the whole shared Caddyfile,
 # so two runs that interleave could restore a route that another run replaced.
 #
-# Steps: pull the image by digest, start a new container next to the running
-# one under its own unique network alias (it does not join the alias of the
-# running one), wait until `GET /healthz` returns a success status, write the
+# Steps: read a fresh deployment identifier, pull the image by digest, start a
+# new container next to the running one under its own unique network alias (it
+# does not join the alias of the running one), wait until `GET /healthz` returns a success status, write the
 # reverse proxy route to the new alias and reload the proxy, and only then
 # stop the old container. The proxy route selects the old container until the
 # reload succeeds, so a container that is starting or unhealthy never receives
@@ -54,6 +54,22 @@
 # replacement; when it did not, the script restores the stopped containers as
 # above.
 #
+# Every deployment reads a fresh identifier under the service lock, before it
+# runs any `docker` command: a UUID that the kernel generates for each read
+# (`/proc/sys/kernel/random/uuid`), without its hyphens (32 lowercase hex
+# characters). The container name is `<service>-<UTC timestamp>-<last 12 digest
+# characters>-<identifier>` and the network alias is the first 30 characters of
+# the service name (without a trailing hyphen), a hyphen and the identifier, so
+# the alias is a DNS label of at most 63 characters. The clock second and the
+# digest do not make a name unique: a retry of the same image within the same
+# second would otherwise get the name of the serving container, and so would
+# a service with the same long name prefix on the shared network. When the
+# identifier cannot be read or is not 32 hex characters, the script fails before
+# it changes a container, the route or the state files. As a second guard, it
+# fails the same way when a container with the new name already exists, so that
+# the cleanup of a failed start, which removes a container by name, can only
+# ever remove a container that this run created.
+#
 # Arguments:
 #   service   Droplet service name: container name prefix, label value and
 #             env file name. A deployment by an earlier version of this
@@ -76,6 +92,8 @@
 #   DROPLET_NETWORK         Docker network of the proxy and the servers
 #                           (default delino).
 #   DROPLET_PROXY           reverse proxy container name (default caddy).
+#   DROPLET_ID_SOURCE       file that yields a fresh UUID on every read (default
+#                           /proc/sys/kernel/random/uuid). Tests replace it.
 #   DROPLET_HEALTH_TIMEOUT  seconds to wait for the health check (default 120).
 #   DROPLET_STOP_TIMEOUT    seconds between SIGTERM and SIGKILL when the old
 #                           container stops (default 30).
@@ -155,6 +173,7 @@ main() {
   local stop_timeout="${DROPLET_STOP_TIMEOUT:-30}"
   local lock_timeout="${DROPLET_LOCK_TIMEOUT:-600}"
   local proxy_lock_timeout="${DROPLET_PROXY_LOCK_TIMEOUT:-$lock_timeout}"
+  local id_source="${DROPLET_ID_SOURCE:-/proc/sys/kernel/random/uuid}"
   local env_file="$root/env/$service.env"
   local site="$root/caddy/sites/$service.caddy"
   local state="$root/state/$service"
@@ -182,6 +201,21 @@ main() {
     fail "another deployment of $service held $state.lock for $lock_timeout seconds; nothing was changed. Run the deployment again when it has finished."
   fi
 
+  # The deployment identifier makes the container name and the network alias
+  # unique. Read it before the first `docker` command, so that a failure
+  # changes nothing. The redirect error of a missing file is silenced because
+  # the message below names the file.
+  local deployment_id=""
+  # `read` returns non-zero for a last line without a newline but still sets
+  # the variable, so a non-empty value counts as read.
+  { [[ -r "$id_source" ]] && { IFS= read -r deployment_id < "$id_source" || [[ -n "$deployment_id" ]]; }; } 2> /dev/null ||
+    fail "could not read the deployment identifier from $id_source; nothing was changed."
+  deployment_id="${deployment_id//-/}"
+  deployment_id="${deployment_id,,}"
+  if [[ ! "$deployment_id" =~ ^[0-9a-f]{32}$ ]]; then
+    fail "$id_source did not yield a UUID; nothing was changed."
+  fi
+
   echo "Pull $image"
   docker pull --quiet "$image"
 
@@ -198,10 +232,21 @@ main() {
       old+=("$old_id")
     fi
   done <<< "$old_ids"
-  local stamp new upstream
-  stamp="$(date -u +%Y%m%d%H%M%S)-${image: -12}"
-  new="$service-$stamp"
-  upstream="$(upstream_alias "$service" "$stamp")"
+  local new upstream
+  new="$service-$(date -u +%Y%m%d%H%M%S)-${image: -12}-$deployment_id"
+  upstream="$(upstream_alias "$service" "$deployment_id")"
+  # The identifier makes a duplicate name practically impossible, but a failed
+  # `docker run` or `docker create` is followed by a removal by name. Refuse
+  # to start when the name is taken (a frozen identifier source, or a
+  # container that was created by hand), so that the removal can only ever
+  # name a container of this run. The caller holds the service lock, so no
+  # other deployment of the service creates a container meanwhile.
+  local taken
+  taken="$(docker ps --all --quiet --filter "name=^/$new\$")" ||
+    fail "could not check whether a container named $new exists; nothing was changed."
+  if [[ -n "$taken" ]]; then
+    fail "a container named $new already exists; nothing was changed."
+  fi
   # The replacement takes no `--network-alias "$service"`. The running
   # container keeps that alias (and the route still names it), and Docker DNS
   # would hand out the replacement address with the shared alias while the
@@ -451,16 +496,16 @@ record_state() {
 
 # Prints the unique network alias of a replacement container. The alias is a
 # DNS label, which has at most 63 characters, but a service name can use all of
-# them. The alias keeps the first 35 characters of the service name (without a
-# trailing hyphen) and appends a hyphen and the 27-character stamp (a 14-digit
-# timestamp, a hyphen and 12 digest characters), so it is at most 63
-# characters long and differs in every deployment.
+# them. The alias keeps the first 30 characters of the service name (without a
+# trailing hyphen) and appends a hyphen and the 32-character deployment
+# identifier, so it is at most 63 characters long and differs in every
+# deployment, also between services with the same name prefix.
 upstream_alias() {
-  local prefix="${1:0:35}" stamp="$2"
+  local prefix="${1:0:30}" id="$2"
   while [[ "$prefix" == *- ]]; do
     prefix="${prefix%-}"
   done
-  echo "$prefix-$stamp"
+  echo "$prefix-$id"
 }
 
 # Prints the log tail of a replacement that failed, then removes it. A failed
