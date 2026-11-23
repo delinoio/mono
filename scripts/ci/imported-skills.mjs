@@ -22,7 +22,10 @@
 //   lock entry (which only the CLI should write) and the manifest change
 //   together;
 // - every file of the directory has the SHA-256 recorded in the manifest, and
-//   the directory holds no file that the manifest does not list.
+//   the directory holds no file that the manifest does not list;
+// - the directory holds no symbolic link. The check never follows a link: a
+//   link (relative, absolute or dangling) is an unsupported entry, because
+//   neither the manifest hash nor `git` content review covers its target.
 //
 // The manifest `scripts/ci/imported-skills.manifest.json` is the baseline of
 // the reviewed local corrections. A deliberate correction of an imported skill
@@ -60,6 +63,7 @@ export const ProblemKind = Object.freeze({
   FileMissing: "file-missing",
   FileChanged: "file-changed",
   FileUnexpected: "file-unexpected",
+  SymlinkUnsupported: "symlink-unsupported",
 });
 
 // The lock entry fields that the check compares with the manifest snapshot and
@@ -84,21 +88,32 @@ export function hashFile(path) {
   return createHash("sha256").update(normalized).digest("hex");
 }
 
-// Relative POSIX paths of every file below `directory`, sorted.
-function listFiles(directory) {
+// Relative POSIX paths of every regular file and of every symbolic link below
+// `directory`, each sorted. A `Dirent` of a symbolic link is neither a file
+// nor a directory, so the walk records it separately and neither recurses into
+// nor stats its target (a dangling or looping link must not fail the walk).
+function listEntries(directory) {
   const files = [];
+  const symlinks = [];
   const walk = (current) => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
-      if (entry.isDirectory()) {
+      const relativePath = relative(directory, path).split(sep).join("/");
+      if (entry.isSymbolicLink()) {
+        symlinks.push(relativePath);
+      } else if (entry.isDirectory()) {
         walk(path);
       } else if (entry.isFile()) {
-        files.push(relative(directory, path).split(sep).join("/"));
+        files.push(relativePath);
       }
     }
   };
   walk(directory);
-  return files.sort();
+  return { files: files.sort(), symlinks: symlinks.sort() };
+}
+
+function symlinkMessage(directoryPath, file) {
+  return `${directoryPath}/${file} is a symbolic link, which an imported skill directory does not support; replace it with a regular file or remove it`;
 }
 
 function readJson(path) {
@@ -170,8 +185,16 @@ export function buildManifest(root) {
     if (!existsSync(directory) || !statSync(directory).isDirectory()) {
       throw new Error(`${SkillsDirectory}/${name} does not exist`);
     }
+    const entries = listEntries(directory);
+    if (entries.symlinks.length > 0) {
+      throw new Error(
+        entries.symlinks
+          .map((file) => symlinkMessage(`${SkillsDirectory}/${name}`, file))
+          .join("; "),
+      );
+    }
     const files = {};
-    for (const file of listFiles(directory)) {
+    for (const file of entries.files) {
       files[file] = hashFile(join(directory, file));
     }
     skills[name] = { lock: snapshotOf(entry), files };
@@ -304,7 +327,14 @@ export function verifyImportedSkills(root) {
         );
       }
     }
-    const actual = listFiles(directory);
+    const { files: actual, symlinks } = listEntries(directory);
+    for (const file of symlinks) {
+      report(
+        ProblemKind.SymlinkUnsupported,
+        symlinkMessage(directoryPath, file),
+        { skill: name, path: file },
+      );
+    }
     for (const file of Object.keys(baseline.files).sort()) {
       if (!actual.includes(file)) {
         report(
