@@ -63,7 +63,7 @@ func main() {
 
 // run serves the GuestService until ctx ends. openLog returns the log
 // output for the state directory; nil logs to standard error.
-func run(ctx context.Context, args []string, openLog func(stateDir string) (io.Writer, error)) int {
+func run(ctx context.Context, args []string, openLog func(stateDir string) (logOutput, error)) int {
 	fs := flag.NewFlagSet("ownsand-guest", flag.ContinueOnError)
 	listen := fs.String("listen", envOr(envListen, guestlisten.DefaultSpec), "listener spec: vsock://:<port>, hvsock://<service GUID>, unix://<path> or tcp://<host:port> (env "+envListen+")")
 	stateDir := fs.String("state-dir", envOr(envStateDir, defaultStateDir()), "directory for read snapshots and write records on the guest disk (env "+envStateDir+")")
@@ -84,14 +84,24 @@ func run(ctx context.Context, args []string, openLog func(stateDir string) (io.W
 		return 2
 	}
 	var logOut io.Writer = os.Stderr
+	var notes []func(*slog.Logger)
 	if openLog != nil {
-		w, err := openLog(*stateDir)
+		out, err := openLog(*stateDir)
 		if err != nil {
 			return 1
 		}
-		logOut = w
+		if out.Close != nil {
+			// Registered first, so that it runs after every other deferred
+			// call of run, which still log.
+			defer out.Close()
+		}
+		logOut = out.W
+		notes = out.Notes
 	}
 	logger := slog.New(slog.NewJSONHandler(logOut, &slog.HandlerOptions{Level: level})).With("component", "ownsand-guest")
+	for _, note := range notes {
+		note(logger)
+	}
 	var mode guest.ClockMode
 	switch *clock {
 	case "set":

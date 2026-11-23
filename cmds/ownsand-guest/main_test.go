@@ -134,7 +134,7 @@ func startHelper(t *testing.T, sock, stateDir string) *helperProcess {
 	go func() {
 		defer close(h.finished)
 		h.code <- run(ctx, []string{"--listen", "unix://" + sock, "--state-dir", stateDir, "--clock", "ignore"},
-			func(string) (io.Writer, error) { return h.log, nil })
+			func(string) (logOutput, error) { return logOutput{W: h.log}, nil })
 	}()
 	t.Cleanup(func() {
 		cancel()

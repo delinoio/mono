@@ -5,9 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,14 +17,6 @@ import (
 // LocalSystem service serviceName (see
 // cmds/ownsand-agent/internal/imagebuild/windows_windows.go).
 const serviceName = "ownsand-guest"
-
-// Log file of the service in the state directory. A service has no
-// standard error, so the service logs to this file; at start a file larger
-// than logRotateBytes moves to logFile + ".1".
-const (
-	logFile        = "guest.log"
-	logRotateBytes = 16 << 20
-)
 
 // serviceStopTimeout bounds the wait for the server after a stop request.
 const serviceStopTimeout = 20 * time.Second
@@ -101,16 +91,10 @@ func (h *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, 
 	}
 }
 
-// openServiceLog opens the service log in the state directory.
-func openServiceLog(stateDir string) (io.Writer, error) {
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return nil, err
-	}
-	path := filepath.Join(stateDir, logFile)
-	if st, err := os.Stat(path); err == nil && st.Size() > logRotateBytes {
-		_ = os.Rename(path, path+".1")
-	}
-	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+// openServiceLog opens the service log in the state directory (see
+// openLogFile).
+func openServiceLog(stateDir string) (logOutput, error) {
+	return openLogFile(stateDir, logRotateBytes)
 }
 
 // runFlushVolumes flushes every fixed volume with FlushFileBuffers on the
