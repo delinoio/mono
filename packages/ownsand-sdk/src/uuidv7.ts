@@ -19,27 +19,38 @@ export class UuidV7Generator {
   }
 
   next(): string {
+    // Work on local candidates and commit them to the generator state only
+    // after the bytes are encoded. A clock reading outside the 48-bit
+    // timestamp range makes the encoding throw, and the generator must then
+    // keep its previous state so that it recovers once the clock does.
     let ms = Math.floor(this.#nowMs());
+    if (!Number.isFinite(ms)) {
+      // NaN would pass the comparisons below and be encoded as timestamp 0.
+      throw new RangeError("clock returned a non-finite timestamp");
+    }
+    let counter: number;
     if (ms <= this.#lastMs) {
       // Same millisecond, or a wall clock that went back: keep the last
       // timestamp and advance the counter so values stay increasing.
       ms = this.#lastMs;
-      this.#counter++;
-      if (this.#counter > 0xfff) {
+      counter = this.#counter + 1;
+      if (counter > 0xfff) {
         ms++;
-        this.#counter = randomBytes(2).readUInt16BE(0) & 0x7ff;
+        counter = randomBytes(2).readUInt16BE(0) & 0x7ff;
       }
     } else {
       // Start the counter in the lower half so that it has room to grow.
-      this.#counter = randomBytes(2).readUInt16BE(0) & 0x7ff;
+      counter = randomBytes(2).readUInt16BE(0) & 0x7ff;
     }
-    this.#lastMs = ms;
     const bytes = randomBytes(16);
     bytes.writeUIntBE(ms, 0, 6);
-    bytes[6] = 0x70 | ((this.#counter >> 8) & 0x0f);
-    bytes[7] = this.#counter & 0xff;
+    bytes[6] = 0x70 | ((counter >> 8) & 0x0f);
+    bytes[7] = counter & 0xff;
     bytes[8] = 0x80 | (bytes[8]! & 0x3f);
-    return formatUuid(bytes);
+    const id = formatUuid(bytes);
+    this.#lastMs = ms;
+    this.#counter = counter;
+    return id;
   }
 }
 
