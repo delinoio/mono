@@ -105,9 +105,15 @@ function NameSettings() {
   const { billingAccountId, name, role } = useBillingAccount();
   const queryClient = useQueryClient();
   const update = useMutation(BillingAccountService.method.updateBillingAccount);
-  const [value, setValue] = useState(name);
+  // Only the user's unsaved edit is local state. A pristine field (no draft)
+  // shows the fetched name, so it follows refetches, also when read-only.
+  const [draft, setDraft] = useState<string>();
   const [error, setError] = useState<string>();
   const editable = can(role, Permission.ManageMembers);
+  // The draft ends once the fetched name equals it: either the user typed the
+  // current name back, or the refetch after a save delivered the saved name.
+  if (draft !== undefined && draft === name) setDraft(undefined);
+  const value = draft ?? name;
   return (
     <SettingsForm
       title="Name"
@@ -121,6 +127,9 @@ function NameSettings() {
         }
         setError(undefined);
         await update.mutateAsync({ billingAccountId, name: checked.value });
+        // Show the saved (trimmed) name until the refetch delivers it, so the
+        // field neither flashes the old name nor reverts if the refetch fails.
+        setDraft(checked.value);
         await invalidateServices(queryClient, BillingAccountService);
         toast.success("The name is saved.");
       }}
@@ -128,7 +137,7 @@ function NameSettings() {
       <TextField
         label="Billing account name"
         value={value}
-        onChange={(event) => setValue(event.target.value)}
+        onChange={(event) => setDraft(event.target.value)}
         error={error}
         disabled={!editable}
         autoComplete="off"
