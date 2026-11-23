@@ -510,11 +510,27 @@ func (s *Service) removeDeviceTx(ctx context.Context, tx pgx.Tx, orgID, deviceID
 	if _, err := tx.Exec(ctx, "DELETE FROM snapshot_copies WHERE device_id = $1", deviceID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, "UPDATE snapshots SET device_id = NULL WHERE device_id = $1 AND export_state = $2",
-		deviceID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED)); err != nil {
+	// Lock every snapshot row of the device before reading any export
+	// state. An export result holds its row FOR UPDATE while it moves the
+	// snapshot to EXPORTED, so the lock waits for an export that is
+	// committing, and the states read below stay stable until this
+	// transaction ends. Without the lock, an export that finishes between
+	// the UPDATE and the SELECT below would be deleted as a local-only
+	// snapshot together with its R2 objects. The rows are locked in ID order
+	// so that two transactions that lock several snapshots cannot deadlock.
+	lockRows, err := tx.Query(ctx, "SELECT snapshot_id FROM snapshots WHERE device_id = $1 ORDER BY snapshot_id FOR UPDATE", deviceID)
+	if err != nil {
 		return err
 	}
-	rows, err := tx.Query(ctx, "SELECT snapshot_id::text FROM snapshots WHERE device_id = $1", deviceID)
+	lockRows.Close()
+	if err := lockRows.Err(); err != nil {
+		return err
+	}
+	exported := int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED)
+	if _, err := tx.Exec(ctx, "UPDATE snapshots SET device_id = NULL WHERE device_id = $1 AND export_state = $2", deviceID, exported); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, "SELECT snapshot_id::text FROM snapshots WHERE device_id = $1 AND export_state <> $2", deviceID, exported)
 	if err != nil {
 		return err
 	}

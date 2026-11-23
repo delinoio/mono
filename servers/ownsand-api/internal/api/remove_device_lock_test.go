@@ -4,11 +4,13 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
@@ -175,5 +177,96 @@ func TestRemoveDeviceAfterOrganizationDeletion(t *testing.T) {
 	}
 	if want := env.Clock.Now().Add(-time.Minute); !r.removeTime.Equal(want) {
 		t.Fatalf("remove_time = %v, want the deletion's %v", r.removeTime, want)
+	}
+}
+
+// snapshotOnDevice creates a running sandbox on the device and a READY
+// snapshot of it, and returns the snapshot ID.
+func snapshotOnDevice(t *testing.T, org *testenv.Org) string {
+	t.Helper()
+	created, err := org.OwnerClient.Sandbox.CreateSandbox(context.Background(), connect.NewRequest(createReq(org.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxID := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, org.OwnerClient, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	return plainSnapshot(t, org, sandboxID)
+}
+
+// snapshotRow reads the device link and the export state of a snapshot. The
+// record is absent when found is false.
+func snapshotRow(t *testing.T, env *testenv.Env, snapshotID string) (deviceID *string, export ownsandv1.SnapshotExportState, found bool) {
+	t.Helper()
+	var state int16
+	err := env.DB.Pool.QueryRow(context.Background(), "SELECT device_id::text, export_state FROM snapshots WHERE snapshot_id = $1", snapshotID).Scan(&deviceID, &state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, 0, false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deviceID, ownsandv1.SnapshotExportState(state), true
+}
+
+// TestRemoveDevicePreservesSnapshotExportedDuringRemoval holds the row lock
+// of a snapshot whose export is still running, starts the removal of its
+// device and then lets the export finish. The removal must keep the exported
+// snapshot, without a local copy and without a clean-up job. A snapshot that
+// was never exported is deleted with the device.
+func TestRemoveDevicePreservesSnapshotExportedDuringRemoval(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	dev, _ := setupAgent(t, env, org, nil)
+	exporting := snapshotOnDevice(t, org)
+	local := snapshotOnDevice(t, org)
+	if _, err := env.DB.Pool.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1",
+		exporting, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The export result transaction: it holds the snapshot row until it
+	// commits the EXPORTED state.
+	holder, err := env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, "SELECT 1 FROM snapshots WHERE snapshot_id = $1 FOR UPDATE", exporting); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- removeDevice(org, dev.ID) }()
+	waitForLockWaiterCount(t, env, 1)
+	if _, err := holder.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1",
+		exporting, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED)); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		requireNoDeadlock(t, "RemoveDevice", err)
+		t.Fatalf("RemoveDevice failed: %v", err)
+	}
+
+	deviceID, export, found := snapshotRow(t, env, exporting)
+	if !found {
+		t.Fatal("the snapshot that finished exporting during the removal was deleted")
+	}
+	if deviceID != nil || export != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED {
+		t.Fatalf("snapshot device_id = %v, export state = %s, want no device and EXPORTED", deviceID, export)
+	}
+	if copies := copyDevices(t, env, exporting); len(copies) != 0 {
+		t.Fatalf("exported snapshot keeps local copies on %v", copies)
+	}
+	if jobs := cleanupJobs(t, env); len(jobs) != 0 {
+		t.Fatalf("clean-up jobs = %v, want none for a preserved snapshot", jobs)
+	}
+	if _, _, found := snapshotRow(t, env, local); found {
+		t.Fatal("the local-only snapshot of the removed device was kept")
+	}
+	if r := readRemovalRecords(t, env, org.ID, dev.ID); r.removeAudits != 1 || r.removeEvents != 1 {
+		t.Fatalf("removal records = %+v, want one audit event and one control event", r)
 	}
 }
