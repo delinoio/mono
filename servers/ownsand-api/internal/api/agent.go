@@ -134,19 +134,24 @@ func (h AgentHandler) Enroll(ctx context.Context, req *connect.Request[ownsandv1
 			return errEnrollmentInvalid()
 		}
 		setRPCOrganization(ctx, orgID)
+		// A consumed token is valid for a retry only with its recorded device
+		// and public key. Reject any other use like an expired or revoked
+		// token, before billing, so a caller that cannot use the token never
+		// sees the organization's billing state.
+		retry := used != nil && deviceID != "" && auth.HashEqual(usedKey, m.GetPublicKey())
+		if used != nil && !retry {
+			return errEnrollmentInvalid()
+		}
 		// Billing enforcement for the token's organization; the token was
 		// validated above, and no record changed yet.
 		if err := h.checkBilling(ctx, tx, orgID, restrictWhenBlocked); err != nil {
 			return err
 		}
-		if used != nil {
+		if retry {
 			// A retry with the same token and public key gets the same device,
 			// so an agent that lost the first response can continue.
-			if deviceID != "" && auth.HashEqual(usedKey, m.GetPublicKey()) {
-				resp = &ownsandv1.EnrollResponse{DeviceId: deviceID, OrganizationId: orgID}
-				return nil
-			}
-			return errEnrollmentInvalid()
+			resp = &ownsandv1.EnrollResponse{DeviceId: deviceID, OrganizationId: orgID}
+			return nil
 		}
 		deviceID = newID()
 		if _, err := tx.Exec(ctx, `INSERT INTO devices (device_id, organization_id, public_key, name, host_os, arch, agent_version, state, create_time)
