@@ -32,12 +32,14 @@ import {
 import { useOrg } from "../components/shell.tsx";
 import {
   Empty,
+  ErrorNotice,
   FormDialog,
   Loading,
   PageHeader,
   QueryBoundary,
   SandboxStateBadge,
   ShortId,
+  isTerminalError,
   shortIdText,
 } from "../components/ui.tsx";
 import { formatMib, formatTime, labels } from "../format.ts";
@@ -83,6 +85,21 @@ export function SandboxesPage() {
     },
   );
   const sandboxes = list.data?.pages.flatMap((p) => p.sandboxes) ?? [];
+  // A failed "Show more" request is not a failed refresh of the list: the
+  // loaded rows stay, and the error and its retry sit next to the button
+  // (`QueryBoundary` would offer `refetch`, which reads the first page again
+  // and never requests the failed continuation token). A terminal error
+  // (`not_found`, `permission_denied`, `unauthenticated`) still takes the
+  // boundary's full-error path, like every other list.
+  const nextPageFailed =
+    list.isFetchNextPageError && !isTerminalError(list.error);
+  const boundaryQuery = {
+    data: list.data,
+    error: nextPageFailed ? null : list.error,
+    isPending: list.isPending,
+    isFetching: list.isFetching,
+    refetch: list.refetch,
+  };
 
   return (
     <>
@@ -126,7 +143,7 @@ export function SandboxesPage() {
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
-      <QueryBoundary query={list} loading="Loading sandboxes">
+      <QueryBoundary query={boundaryQuery} loading="Loading sandboxes">
         {() =>
           sandboxes.length === 0 ? (
             <Empty title="No sandboxes match">
@@ -161,10 +178,19 @@ export function SandboxesPage() {
           )
         }
       </QueryBoundary>
+      {nextPageFailed && !list.isFetchingNextPage ? (
+        <ErrorNotice
+          error={list.error}
+          // `cancelRefetch: false` joins a request that is already in flight
+          // instead of cancelling it and sending the same page twice.
+          onRetry={() => void list.fetchNextPage({ cancelRefetch: false })}
+        />
+      ) : null}
       {list.hasNextPage ? (
         <Button
           variant={ButtonVariant.Secondary}
-          onClick={() => void list.fetchNextPage()}
+          disabled={list.isFetchingNextPage}
+          onClick={() => void list.fetchNextPage({ cancelRefetch: false })}
         >
           Show more
         </Button>
