@@ -68,9 +68,9 @@ JOIN pg_index i ON s.indexrelid = i.indexrelid WHERE NOT i.indisvalid;
 | >10         | Audit required - significant write overhead |
 
 ```sql
-SELECT relname AS table, count(*) as index_count
+SELECT schemaname, relname AS table, count(*) as index_count
 FROM pg_stat_user_indexes
-GROUP BY relname
+GROUP BY schemaname, relname
 ORDER BY count(*) DESC;
 ```
 
