@@ -977,14 +977,20 @@
     min-width: 0;
   }
 
+  /* `.dui-toast` hides overflow, so a long unbroken token (an email address or
+     a URL) in the title or description would be clipped. `anywhere` breaks it
+     at the toast width. Unlike `break-word`, it also lowers the min-content
+     size, so the text column and the action button still fit. */
   .dui-toast-title {
     font-size: 15px;
     font-weight: 600;
+    overflow-wrap: anywhere;
   }
 
   .dui-toast-description {
     opacity: 0.8;
     font-size: 13px;
+    overflow-wrap: anywhere;
   }
 
   /* The UI SDK treats `toast-close` as an icon-only button: it fixes a 28px
