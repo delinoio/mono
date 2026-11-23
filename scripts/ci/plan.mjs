@@ -205,6 +205,12 @@ const goTestdata = /^(?:go|cmds|internal|servers)\/(?:.+\/)?testdata\//;
 // launcher test (`dev.test.mjs`) and the accounts-api launcher run no Go test.
 const ownsandApiLauncher = "servers/ownsand-api/scripts/dev.mjs";
 
+// The Linux root filesystem builder of the device agent image. Its Go test
+// `cmds/ownsand-agent/images/linux/build-rootfs_test.go` executes the script
+// with Bash, so a change to the builder alone must select the Go checks. The
+// sibling kernel scripts and `kernelcache_test.go` stay unselected.
+const rootfsBuilder = "cmds/ownsand-agent/images/linux/build-rootfs.sh";
+
 // Go sources, module files, protobuf schema inputs and the inputs of the
 // OwnSand end-to-end suite select the repository Go checks.
 export function isGoInput(path) {
@@ -219,6 +225,7 @@ export function isGoInput(path) {
     goMigrations.some((prefix) => path.startsWith(prefix)) ||
     path === relayDigestVectors ||
     path === ownsandApiLauncher ||
+    path === rootfsBuilder ||
     goTestdata.test(path)
   );
 }
