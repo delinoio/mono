@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -196,8 +197,61 @@ func newRuntime(t *testing.T) *Runtime {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = rt.Close() })
+	closeRuntimeOnCleanup(t, rt)
 	return rt
+}
+
+// closeRuntimeOnCleanup closes rt when the test ends and then kills every
+// helper that Close left alive.
+//
+// Close ends with an error, and leaves the helper alive and stopped, when the
+// helper is not observed stopped (see stopHelper). Every helper writes to the
+// stderr of the test binary, so one that outlives the test keeps the pipe of
+// `go test` open: go test prints PASS and then waits the 1m WaitDelay before it
+// reports "Test I/O incomplete" and fails the package. The sweep makes sure
+// that no helper survives a test, and the error makes the test fail instead of
+// leaving the leak to the next run.
+func closeRuntimeOnCleanup(t *testing.T, rt *Runtime) {
+	t.Helper()
+	// Cleanups run last to first: register the sweep first so that it runs
+	// after Close.
+	t.Cleanup(func() {
+		rt.mu.Lock()
+		leftover := make([]*vm, 0, len(rt.vms))
+		for _, v := range rt.vms {
+			leftover = append(leftover, v)
+		}
+		rt.mu.Unlock()
+		for _, v := range leftover {
+			if v.hasExited() {
+				continue
+			}
+			t.Errorf("helper of sandbox %s outlived Close; killing it", v.id)
+			_ = signalGroup(v.cmd, sigKill)
+			select {
+			case <-v.exited:
+			case <-time.After(10 * time.Second):
+				t.Errorf("helper of sandbox %s did not exit after SIGKILL", v.id)
+			}
+		}
+	})
+	t.Cleanup(func() {
+		if err := rt.Close(); err != nil {
+			t.Errorf("close the runtime: %v", err)
+		}
+	})
+}
+
+// useStopSeams installs observe as the observation of the helper's state and
+// wait as the wait for the helper to stop (see vm.observeStopped and
+// vm.stopWait), and removes both when the test ends. The cleanup of the
+// runtime stops the helper through the same fields, so a seam that stayed
+// installed would make that stop wait for a helper that never reports stopped,
+// give up with the helper stopped and alive, and leak it.
+func useStopSeams(t *testing.T, h *vm, observe func(context.Context, int) (bool, error), wait time.Duration) {
+	t.Helper()
+	h.observeStopped, h.stopWait = observe, wait
+	t.Cleanup(func() { h.observeStopped, h.stopWait = nil, 0 })
 }
 
 // TestRelativeGuestBinaryResolvesAgainstAgentDirectory checks that a relative
@@ -224,7 +278,7 @@ func TestRelativeGuestBinaryResolvesAgainstAgentDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = rt.Close() })
+	closeRuntimeOnCleanup(t, rt)
 	v := createSandbox(t, rt)
 	if err := rt.Delete(context.Background(), v.SandboxID()); err != nil {
 		t.Fatal(err)
@@ -593,7 +647,7 @@ func TestPauseEnumeratesOnlyAfterHelperIsObservedStopped(t *testing.T) {
 			}
 		}
 	})
-	h.observeStopped = observe
+	useStopSeams(t, h, observe, 0)
 	if err := rt.Pause(context.Background(), m); err != nil {
 		t.Fatal(err)
 	}
@@ -603,7 +657,7 @@ func TestPauseEnumeratesOnlyAfterHelperIsObservedStopped(t *testing.T) {
 	for _, pid := range []int{h.cmd.Process.Pid, shell, sleeper} {
 		waitState(t, "process after Pause", pid, "T")
 	}
-	h.observeStopped = nil
+	useStopSeams(t, h, nil, 0)
 	if err := rt.Resume(context.Background(), m); err != nil {
 		t.Fatal(err)
 	}
@@ -624,8 +678,7 @@ func TestPauseRollsBackWhenHelperDoesNotStop(t *testing.T) {
 	helperPID := h.cmd.Process.Pid
 	var signals []syscall.Signal
 	h.onSignal = func(sig syscall.Signal) { signals = append(signals, sig) }
-	h.stopWait = 100 * time.Millisecond
-	h.observeStopped = func(context.Context, int) (bool, error) { return false, nil }
+	useStopSeams(t, h, func(context.Context, int) (bool, error) { return false, nil }, 100*time.Millisecond)
 
 	err = rt.Pause(context.Background(), m)
 	if err == nil || !strings.Contains(err.Error(), "did not stop") {
@@ -640,8 +693,7 @@ func TestPauseRollsBackWhenHelperDoesNotStop(t *testing.T) {
 	}
 
 	// A later Pause works once the helper is observed stopped.
-	h.observeStopped = nil
-	h.stopWait = 0
+	useStopSeams(t, h, nil, 0)
 	if err := rt.Pause(context.Background(), m); err != nil {
 		t.Fatal(err)
 	}
@@ -665,8 +717,7 @@ func TestDeleteFailsWhenHelperDoesNotStop(t *testing.T) {
 	helperPID := h.cmd.Process.Pid
 	var signals []syscall.Signal
 	h.onSignal = func(sig syscall.Signal) { signals = append(signals, sig) }
-	h.stopWait = 100 * time.Millisecond
-	h.observeStopped = func(context.Context, int) (bool, error) { return false, nil }
+	useStopSeams(t, h, func(context.Context, int) (bool, error) { return false, nil }, 100*time.Millisecond)
 
 	err = rt.Delete(context.Background(), m.SandboxID())
 	if err == nil || !strings.Contains(err.Error(), "did not stop") {
@@ -690,8 +741,7 @@ func TestDeleteFailsWhenHelperDoesNotStop(t *testing.T) {
 		waitState(t, "worker after the failed Delete", pid, "S", "R")
 	}
 
-	h.observeStopped = nil
-	h.stopWait = 0
+	useStopSeams(t, h, nil, 0)
 	if err := rt.Delete(context.Background(), m.SandboxID()); err != nil {
 		t.Fatalf("retried Delete: %v", err)
 	}
@@ -710,10 +760,10 @@ func TestWaitHelperStoppedExitedHelper(t *testing.T) {
 	rt := newRuntime(t)
 	m := createSandbox(t, rt)
 	h := killHelperAndWait(t, rt, m)
-	h.observeStopped = func(context.Context, int) (bool, error) {
+	useStopSeams(t, h, func(context.Context, int) (bool, error) {
 		t.Error("observed a reaped helper")
 		return false, nil
-	}
+	}, 0)
 	start := time.Now()
 	if err := h.waitHelperStopped(context.Background()); err != nil {
 		t.Fatal(err)
@@ -733,11 +783,13 @@ func TestWaitHelperStoppedEndsWhenHelperExitsDuringWait(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.stopWait = 10 * time.Second
-	h.observeStopped = func(context.Context, int) (bool, error) {
-		go func() { _ = syscall.Kill(h.cmd.Process.Pid, syscall.SIGKILL) }()
+	// Kill the helper once, from the first observation: the helper cannot be
+	// reaped before it was killed, so the process ID is still its own.
+	var kill sync.Once
+	useStopSeams(t, h, func(context.Context, int) (bool, error) {
+		kill.Do(func() { go func() { _ = syscall.Kill(h.cmd.Process.Pid, syscall.SIGKILL) }() })
 		return false, nil
-	}
+	}, 10*time.Second)
 	if err := h.waitHelperStopped(context.Background()); err != nil {
 		t.Fatalf("wait for a helper that exits: %v", err)
 	}
@@ -757,13 +809,12 @@ func TestWaitHelperStoppedReportsObservationError(t *testing.T) {
 		t.Fatal(err)
 	}
 	cause := errors.New("ps is broken")
-	h.stopWait = 50 * time.Millisecond
-	h.observeStopped = func(context.Context, int) (bool, error) { return false, cause }
+	useStopSeams(t, h, func(context.Context, int) (bool, error) { return false, cause }, 50*time.Millisecond)
 	if err := h.waitHelperStopped(context.Background()); !errors.Is(err, cause) {
 		t.Errorf("wait with a failing observation = %v; want it to wrap %v", err, cause)
 	}
 
-	h.stopWait = 10 * time.Second
+	useStopSeams(t, h, h.observeStopped, 10*time.Second)
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	start := time.Now()
@@ -898,9 +949,21 @@ func TestDeleteRetryAfterListingFailure(t *testing.T) {
 	}
 	helperPID := h.cmd.Process.Pid
 
-	// An empty PATH makes the `ps` command of the process listing fail.
+	// An empty PATH makes the `ps` command of the process listing fail. The
+	// observation of the stopped helper also runs `ps` on macOS, so it gets the
+	// original PATH; without that, the Delete would wait the whole
+	// helperStopTimeout for a stop that it cannot observe, and fail before it
+	// lists the workers.
 	oldPath := os.Getenv("PATH")
-	if err := os.Setenv("PATH", t.TempDir()); err != nil {
+	emptyPath := t.TempDir()
+	useStopSeams(t, h, func(ctx context.Context, pid int) (bool, error) {
+		if err := os.Setenv("PATH", oldPath); err != nil {
+			return false, err
+		}
+		defer os.Setenv("PATH", emptyPath)
+		return helperStopped(ctx, pid)
+	}, 0)
+	if err := os.Setenv("PATH", emptyPath); err != nil {
 		t.Fatal(err)
 	}
 	err = rt.Delete(context.Background(), v.SandboxID())
@@ -920,6 +983,7 @@ func TestDeleteRetryAfterListingFailure(t *testing.T) {
 		waitState(t, "worker after the failed Delete", pid, "S", "R", "T")
 	}
 
+	useStopSeams(t, h, nil, 0)
 	if err := rt.Delete(context.Background(), v.SandboxID()); err != nil {
 		t.Fatalf("retried Delete: %v", err)
 	}
@@ -1298,7 +1362,7 @@ func TestDeleteUntrackedRemovesSandboxFiles(t *testing.T) {
 	// The helper of an earlier agent process ends with that process; this
 	// test stops it with the earlier runtime after the restarted runtime
 	// removed the files.
-	t.Cleanup(func() { _ = earlier.Close() })
+	closeRuntimeOnCleanup(t, earlier)
 	userFile := filepath.Join(vmsDir, id, rootDir, "user-file.txt")
 	if err := os.WriteFile(userFile, []byte("data"), 0o600); err != nil {
 		t.Fatal(err)
