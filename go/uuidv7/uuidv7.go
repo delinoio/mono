@@ -26,6 +26,20 @@ var ErrInvalid = errors.New("uuidv7: not a canonical UUID v7")
 // maxUnixMillis is the largest timestamp that the 48-bit field holds.
 const maxUnixMillis = 1<<48 - 1
 
+// Time.UnixMilli is undefined outside the int64 range, so a far-future time
+// can wrap to a small valid-looking value. Both generators therefore compare
+// the time itself against these bounds before they convert it to
+// milliseconds. unixEpoch is the inclusive lower bound and timestampLimit is
+// the exclusive upper bound: the first instant that the 48-bit field cannot
+// hold. Every instant inside the final millisecond stays valid.
+var (
+	unixEpoch      = time.UnixMilli(0)
+	timestampLimit = time.UnixMilli(maxUnixMillis + 1)
+)
+
+// errTimestampRange reports a time that the 48-bit timestamp field cannot hold.
+var errTimestampRange = errors.New("uuidv7: timestamp out of range")
+
 // Generator creates UUID v7 values that increase strictly within one
 // process. It fills the 12-bit rand_a field with a counter that starts from
 // a random value at each new millisecond (RFC 9562, section 6.2, method 1)
@@ -87,11 +101,18 @@ func (g *Generator) New() (UUID, error) {
 	if _, err := io.ReadFull(g.random, id[6:]); err != nil {
 		return UUID{}, fmt.Errorf("uuidv7: read random bytes: %w", err)
 	}
-	ms := g.now().UnixMilli()
-	if ms < 0 {
-		ms = 0
+	now := g.now()
+	// Reject a far-future reading before the millisecond conversion, which
+	// wraps for such times. This runs after the entropy read and before any
+	// state change, so a rejected call leaves the generator state unchanged.
+	if !now.Before(timestampLimit) {
+		return UUID{}, errTimestampRange
 	}
-	current := uint64(ms)
+	// A clock before the Unix epoch is clamped to 0 ms.
+	var current uint64
+	if !now.Before(unixEpoch) {
+		current = uint64(now.UnixMilli())
+	}
 
 	timestamp, counter := g.lastMs, g.counter
 	switch {
@@ -110,7 +131,7 @@ func (g *Generator) New() (UUID, error) {
 		}
 	}
 	if timestamp > maxUnixMillis {
-		return UUID{}, errors.New("uuidv7: timestamp out of range")
+		return UUID{}, errTimestampRange
 	}
 	g.started = true
 	g.lastMs = timestamp
@@ -135,15 +156,14 @@ func FromTime(t time.Time, random io.Reader) (UUID, error) {
 	if random == nil {
 		random = rand.Reader
 	}
-	ms := t.UnixMilli()
-	if ms < 0 || ms > maxUnixMillis {
-		return UUID{}, errors.New("uuidv7: timestamp out of range")
+	if t.Before(unixEpoch) || !t.Before(timestampLimit) {
+		return UUID{}, errTimestampRange
 	}
 	var id UUID
 	if _, err := io.ReadFull(random, id[6:]); err != nil {
 		return UUID{}, fmt.Errorf("uuidv7: read random bytes: %w", err)
 	}
-	timestamp := uint64(ms)
+	timestamp := uint64(t.UnixMilli())
 	for i := 0; i < 6; i++ {
 		id[i] = byte(timestamp >> (40 - 8*i))
 	}

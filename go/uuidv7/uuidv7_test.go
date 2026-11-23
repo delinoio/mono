@@ -364,3 +364,132 @@ func TestGeneratorOutOfRangeClockKeepsState(t *testing.T) {
 		}
 	})
 }
+
+// wrapsToOneMs is a far-future time whose UnixMilli conversion wraps around
+// the int64 range to 1, so a check that runs after the conversion accepts it.
+func wrapsToOneMs() time.Time {
+	return time.Unix(18_446_744_073_709_551, 617_000_000)
+}
+
+func TestFromTimeTimestampBounds(t *testing.T) {
+	const wantErr = "uuidv7: timestamp out of range"
+	limit := time.UnixMilli(maxUnixMillis + 1)
+
+	rejected := map[string]time.Time{
+		"far future that wraps to a small millisecond value": wrapsToOneMs(),
+		"exclusive upper bound":                              limit,
+		"one nanosecond before the epoch":                    time.UnixMilli(0).Add(-time.Nanosecond),
+		"negative millisecond":                               time.UnixMilli(-1),
+	}
+	for name, at := range rejected {
+		t.Run("rejects "+name, func(t *testing.T) {
+			id, err := FromTime(at, bytes.NewReader(make([]byte, 10)))
+			if err == nil || err.Error() != wantErr {
+				t.Fatalf("error = %v, want %q", err, wantErr)
+			}
+			if id != (UUID{}) {
+				t.Fatalf("id = %s, want the zero value", id)
+			}
+		})
+	}
+
+	accepted := map[string]time.Time{
+		"epoch":                                 time.UnixMilli(0),
+		"last instant before bound":             limit.Add(-time.Nanosecond),
+		"first instant of the last millisecond": time.UnixMilli(maxUnixMillis),
+	}
+	for name, at := range accepted {
+		t.Run("accepts "+name, func(t *testing.T) {
+			id, err := FromTime(at, bytes.NewReader(make([]byte, 10)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !Valid(id.String()) {
+				t.Fatalf("%s is not valid", id)
+			}
+			if want := at.UnixMilli(); id.Time().UnixMilli() != want {
+				t.Fatalf("time = %d ms, want %d ms", id.Time().UnixMilli(), want)
+			}
+		})
+	}
+}
+
+func TestGeneratorTimestampBounds(t *testing.T) {
+	const wantErr = "uuidv7: timestamp out of range"
+	limit := time.UnixMilli(maxUnixMillis + 1)
+
+	t.Run("rejects a far-future clock that wraps and keeps state", func(t *testing.T) {
+		now := time.UnixMilli(1_700_000_000_000)
+		g := NewGenerator(func() time.Time { return now }, zeroReader{})
+		first, err := g.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantMs, wantCounter := g.lastMs, g.counter
+
+		now = wrapsToOneMs()
+		if id, err := g.New(); err == nil || err.Error() != wantErr || id != (UUID{}) {
+			t.Fatalf("id = %s, error = %v, want zero value and %q", id, err, wantErr)
+		}
+		if !g.started || g.lastMs != wantMs || g.counter != wantCounter {
+			t.Fatalf("state changed by a rejected reading: started=%v lastMs=%d counter=%d", g.started, g.lastMs, g.counter)
+		}
+
+		// A later valid reading in the same millisecond counts up exactly once.
+		now = time.UnixMilli(1_700_000_000_000)
+		next, err := g.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g.counter != wantCounter+1 {
+			t.Fatalf("counter = %d, want %d", g.counter, wantCounter+1)
+		}
+		if next.String() <= first.String() {
+			t.Fatalf("value after a rejected reading does not sort after the last one: %s <= %s", next, first)
+		}
+	})
+
+	t.Run("rejects a far-future first clock without starting", func(t *testing.T) {
+		g := NewGenerator(func() time.Time { return wrapsToOneMs() }, zeroReader{})
+		if _, err := g.New(); err == nil || err.Error() != wantErr {
+			t.Fatalf("error = %v, want %q", err, wantErr)
+		}
+		if g.started || g.lastMs != 0 || g.counter != 0 {
+			t.Fatalf("state changed by a rejected reading: started=%v lastMs=%d counter=%d", g.started, g.lastMs, g.counter)
+		}
+	})
+
+	t.Run("rejects the exclusive upper bound", func(t *testing.T) {
+		g := NewGenerator(func() time.Time { return limit }, zeroReader{})
+		if _, err := g.New(); err == nil || err.Error() != wantErr {
+			t.Fatalf("error = %v, want %q", err, wantErr)
+		}
+		if g.started {
+			t.Fatal("generator started by a rejected reading")
+		}
+	})
+
+	t.Run("accepts the last instant before the bound", func(t *testing.T) {
+		g := NewGenerator(func() time.Time { return limit.Add(-time.Nanosecond) }, zeroReader{})
+		id, err := g.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := id.Time().UnixMilli(); got != maxUnixMillis {
+			t.Fatalf("time = %d ms, want %d ms", got, int64(maxUnixMillis))
+		}
+	})
+
+	t.Run("clamps a pre-epoch clock to the epoch", func(t *testing.T) {
+		for _, at := range []time.Time{time.UnixMilli(-1), time.UnixMilli(0).Add(-time.Nanosecond), time.Unix(-9_000_000_000_000, 0)} {
+			g := NewGenerator(func() time.Time { return at }, zeroReader{})
+			id, err := g.New()
+			if err != nil {
+				t.Fatalf("%v: %v", at, err)
+			}
+			if !id.Time().Equal(time.UnixMilli(0)) {
+				t.Fatalf("%v: timestamp = %v, want the Unix epoch", at, id.Time())
+			}
+		}
+	})
+}
