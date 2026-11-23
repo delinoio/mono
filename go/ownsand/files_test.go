@@ -907,6 +907,95 @@ func TestWriteFileRetries(t *testing.T) {
 	}
 }
 
+// writeRetryFixture opens one FileWrite on a relay-only client and returns the
+// pieces that a test needs to drive writeOp directly.
+func writeRetryFixture(t *testing.T, cp *fakeCP, window time.Duration) (*FileWrite, *ownsandv1.WriteFileRequest) {
+	t.Helper()
+	c := recoveryDeadlineClient(t, cp, window)
+	s := cp.handle(t, c)
+	fw, err := s.OpenFileWrite(FileWriteParams{WriteID: mustID(t), Path: "/w"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: fw.op.id, Data: []byte("data"), Path: fw.path, BindingSalt: fw.salt, Finish: &ownsandv1.WriteFileFinish{SizeBytes: 4, Mode: 0o644}}
+	return fw, req
+}
+
+func TestWriteFileRelayAttemptStartsNoRetryAfterRecoveryWindow(t *testing.T) {
+	cp := newFakeCP(t)
+	fw, req := writeRetryFixture(t, cp, 50*time.Millisecond)
+	// A valid grant makes ensure succeed without a renewal, so the window
+	// state alone decides whether the attempt starts.
+	if err := fw.op.grant.authorize(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	last := connect.NewError(connect.CodeUnavailable, errors.New("agent unavailable"))
+	rec := newRecovery(fw.s.c.timing.recoveryWindow)
+	rec.fail(last)
+	time.Sleep(2 * fw.s.c.timing.recoveryWindow)
+	res, authErr, err := fw.op.relayAttempt(context.Background(), req, rec)
+	if res != nil || !authErr || !errors.Is(err, errRecoveryDeadline) || !errors.Is(err, last) {
+		t.Fatalf("want a terminal errRecoveryDeadline that wraps the last failure, got res=%v authErr=%v err=%v", res, authErr, err)
+	}
+	// send maps a terminal result through dpErr while the caller context is
+	// active; the caller's own context error keeps precedence there.
+	var dp *DataPathError
+	if wrapped := fw.op.dpErr(err); !errors.As(wrapped, &dp) || !errors.Is(wrapped, errRecoveryDeadline) || !errors.Is(wrapped, last) {
+		t.Fatalf("want a DataPathError that wraps errRecoveryDeadline and the last failure, got %v", wrapped)
+	}
+	if n := cp.relayCount("WriteFile"); n != 0 {
+		t.Fatalf("%d WriteFile calls after the window ended, want 0", n)
+	}
+}
+
+func TestWriteFileRelayAttemptStartsInitialWriteWithInactiveWindow(t *testing.T) {
+	cp := newFakeCP(t)
+	fw, req := writeRetryFixture(t, cp, 300*time.Millisecond)
+	// A window that never started is not part of a recovery, however much
+	// time has passed since it was created.
+	rec := newRecovery(10 * time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
+	res, authErr, err := fw.op.relayAttempt(context.Background(), req, rec)
+	if err != nil || authErr || res == nil {
+		t.Fatalf("initial attempt: res=%v authErr=%v err=%v", res, authErr, err)
+	}
+	if n := cp.relayCount("WriteFile"); n != 1 {
+		t.Fatalf("%d WriteFile calls, want 1", n)
+	}
+}
+
+func TestWriteFileRetryStartedBeforeDeadlineMayFinishAfterIt(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.relayScript = func(_ string, n int) relayAction {
+		switch n {
+		case 1:
+			return relayAction{err: connect.NewError(connect.CodeUnavailable, errors.New("agent unavailable"))}
+		case 2:
+			// The retry starts inside the window and answers after it.
+			return relayAction{delay: 400 * time.Millisecond}
+		}
+		return relayAction{}
+	}
+	c := recoveryDeadlineClient(t, cp, 150*time.Millisecond)
+	s := cp.handle(t, c)
+	if err := s.WriteFileBytes(context.Background(), "/w", []byte("data"), WriteOptions{}); err != nil {
+		t.Fatalf("a retry that started in time must finish: %v", err)
+	}
+	if n := cp.relayCount("WriteFile"); n != 2 {
+		t.Fatalf("%d WriteFile calls, want 2", n)
+	}
+	ids := map[string]bool{}
+	for _, r := range cp.agent.writeRequests() {
+		ids[r.GetWriteId()] = true
+	}
+	if len(ids) != 1 {
+		t.Fatal("the retry must keep the write_id")
+	}
+	if string(must(cp.agent.file("/w"))) != "data" {
+		t.Fatal("content differs")
+	}
+}
+
 func TestWriteFileRenewsGrantBeforeChunk(t *testing.T) {
 	cp := newFakeCP(t)
 	// The grant would expire during the next call (write call limit plus

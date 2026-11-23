@@ -744,6 +744,14 @@ func (op *writeOp) relayAttempt(ctx context.Context, req *ownsandv1.WriteFileReq
 	if err := op.grant.ensure(ctx, t.writeCallLimit+t.streamMargin, rec); err != nil {
 		return nil, true, err
 	}
+	if rec.streamBudget() < 0 {
+		// The recovery window ended while the grant was renewed: start no
+		// retry. The initial attempt has no active window, so it never takes
+		// this path, and a retry that starts in time may still finish after
+		// the window. Return the error as an authorization-class (terminal)
+		// result so that send does not classify, back off or retry it.
+		return nil, true, rec.deadlineErr()
+	}
 	defer op.grant.streamEnded()
 	actx, cancel := context.WithTimeoutCause(ctx, t.writeAttemptDeadline, errAttemptDeadline)
 	defer cancel()
