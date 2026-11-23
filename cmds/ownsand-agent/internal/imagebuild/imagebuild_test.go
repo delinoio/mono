@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -28,8 +29,29 @@ func TestParseGuestOS(t *testing.T) {
 	if _, err := ParseGuestOS("plan9"); err == nil || errors.Is(err, ErrUnsupported) {
 		t.Fatalf("unknown guest OS: %v", err)
 	}
-	if got, err := ParseGuestOS(""); got != DefaultGuestOS() && err == nil {
-		t.Fatalf("default guest OS %v", got)
+
+	// The empty input resolves per host: the host guest OS and no error where
+	// the host can build images, and an unspecified guest OS with
+	// ErrUnsupported elsewhere. Both values are checked independently, so a
+	// wrong value fails even when the other one is right.
+	var (
+		wantOS          ownsandv1.GuestOs
+		wantUnsupported bool
+	)
+	switch runtime.GOOS {
+	case "darwin":
+		wantOS = ownsandv1.GuestOs_GUEST_OS_MACOS
+	case "windows":
+		wantOS = ownsandv1.GuestOs_GUEST_OS_WINDOWS
+	default:
+		wantOS = ownsandv1.GuestOs_GUEST_OS_UNSPECIFIED
+		wantUnsupported = true
+	}
+	got, err := ParseGuestOS("")
+	gotUnsupported := errors.Is(err, ErrUnsupported)
+	if got != wantOS || gotUnsupported != wantUnsupported || (err != nil) != wantUnsupported {
+		t.Fatalf("ParseGuestOS(\"\") on %s = (%v, unsupported=%t, err=nil:%t); want (%v, unsupported=%t, err=nil:%t)",
+			runtime.GOOS, got, gotUnsupported, err == nil, wantOS, wantUnsupported, !wantUnsupported)
 	}
 }
 
