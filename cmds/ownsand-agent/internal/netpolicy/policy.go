@@ -201,7 +201,8 @@ func dnsAcceptRules(assignments []TapGateway) string {
 // that assignment, so that a guest cannot forward packets with the address
 // of another sandbox or of the host. DHCPv4 from 0.0.0.0 is delivered to
 // the host and hits the input chain only, and `ip saddr` does not match
-// IPv6 packets, so neither is affected. An invalid assignment renders no
+// IPv6 packets, so neither is affected (the forward chain drops all IPv6
+// packets from a tap in a separate rule). An invalid assignment renders no
 // rule.
 func sourceGuardRules(assignments []TapGateway) string {
 	var sb strings.Builder
@@ -221,7 +222,11 @@ func sourceGuardRules(assignments []TapGateway) string {
 // address, such as the LAN address or the gateway of another sandbox, and
 // DNS from another source address, falls through to the drop. IPv4 packets
 // from a sandbox tap with a source other than the guest address of that
-// sandbox are dropped in forward.
+// sandbox are dropped in forward, and so are all IPv6 packets from a sandbox
+// tap, because guests get no IPv6 address in this version: such a packet
+// has a spoofed source, and the blocked6 drop alone would forward it to any
+// destination outside the blocked prefixes. IPv6 neighbor and router
+// discovery on the guest link hit the input chain only and are unaffected.
 func Ruleset(v4, v6 []netip.Prefix, assignments []TapGateway) string {
 	tap := TapPrefix + "*"
 	return fmt.Sprintf(`table inet %[1]s
@@ -248,7 +253,8 @@ table inet %[1]s {
 	}
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
-%[7]s		iifname "%[4]s" ip daddr @blocked4 drop
+%[7]s		iifname "%[4]s" meta nfproto ipv6 drop
+		iifname "%[4]s" ip daddr @blocked4 drop
 		iifname "%[4]s" ip6 daddr @blocked6 drop
 		oifname "%[4]s" ct state established,related accept
 		oifname "%[4]s" drop

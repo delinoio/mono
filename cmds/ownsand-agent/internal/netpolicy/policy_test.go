@@ -193,7 +193,8 @@ func forwardChain(t *testing.T, rs string) []string {
 // The forward chain drops IPv4 packets from each tap whose source is not
 // the guest address of that tap, ahead of every other rule that accepts or
 // matches guest traffic; the blocked-set drops, the reply accept and the
-// final drop to the guest link stay.
+// final drop to the guest link stay. All IPv6 from a tap is dropped after the
+// guards and before the blocked-set drops.
 func TestRulesetForwardDropsForeignSourceFromTap(t *testing.T) {
 	v4, v6 := Blocked(nil, nil)
 	a := TapGateway{Tap: TapName(2), Gateway: netip.MustParseAddr("172.30.0.9"), Guest: netip.MustParseAddr("172.30.0.10")}
@@ -203,6 +204,7 @@ func TestRulesetForwardDropsForeignSourceFromTap(t *testing.T) {
 	want := []string{
 		`iifname "osb-00000000001" ip saddr != 172.30.0.6 drop`,
 		`iifname "osb-00000000002" ip saddr != 172.30.0.10 drop`,
+		`iifname "osb-*" meta nfproto ipv6 drop`,
 		`iifname "osb-*" ip daddr @blocked4 drop`,
 		`iifname "osb-*" ip6 daddr @blocked6 drop`,
 		`oifname "osb-*" ct state established,related accept`,
