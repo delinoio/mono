@@ -235,7 +235,9 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 	var env struct {
 		Data json.RawMessage `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &env); err != nil || len(env.Data) == 0 {
+	// A JSON null entity is as absent as a missing data member: decoding it
+	// into out is a no-op that would return a zero entity as a success.
+	if err := json.Unmarshal(raw, &env); err != nil || len(env.Data) == 0 || bytes.Equal(bytes.TrimSpace(env.Data), []byte("null")) {
 		return errors.New("paddle response is not valid")
 	}
 	if err := json.Unmarshal(env.Data, out); err != nil {

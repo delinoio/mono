@@ -124,6 +124,63 @@ func TestClientCheckoutRejectsATransactionWithoutID(t *testing.T) {
 	}
 }
 
+// A success answer whose data member is the JSON null has no entity. Every
+// call that decodes an entity fails with an unknown outcome instead of
+// returning a zero entity, while a valid entity still decodes.
+func TestClientRejectsANullEntity(t *testing.T) {
+	ctx := context.Background()
+	client, fake := newClient(t)
+	fake.SetSubscription(paddle.Subscription{ID: "sub_1", Status: paddle.SubscriptionStatusActive})
+	for name, tc := range map[string]struct {
+		key  string
+		call func() error
+	}{
+		"create checkout": {"POST /transactions", func() error {
+			_, err := client.CreateCheckoutTransaction(ctx, "pri_sub", paddle.CustomData{})
+			return err
+		}},
+		"get subscription": {"GET /subscriptions", func() error {
+			_, err := client.GetSubscription(ctx, "sub_1")
+			return err
+		}},
+		"cancel subscription": {"POST /subscriptions", func() error {
+			_, err := client.CancelSubscription(ctx, "sub_1", paddle.EffectiveNextBillingPeriod)
+			return err
+		}},
+		"remove scheduled change": {"PATCH /subscriptions", func() error {
+			_, err := client.RemoveScheduledChange(ctx, "sub_1")
+			return err
+		}},
+		"one-time charge": {"POST /subscriptions", func() error {
+			_, err := client.CreateOneTimeCharge(ctx, "sub_1", paddle.Charge{ProductID: "pro", AmountCents: 2500, Description: "xx"})
+			return err
+		}},
+		"invoice": {"GET /transactions", func() error {
+			_, err := client.InvoiceURL(ctx, "txn_1")
+			return err
+		}},
+	} {
+		for _, body := range []string{`{"data":null}`, `{"data": null }`} {
+			t.Run(name+" "+body, func(t *testing.T) {
+				fake.Respond(tc.key, http.StatusOK, body)
+				defer fake.Respond(tc.key, 0, "")
+				err := tc.call()
+				if err == nil || paddle.Classify(err) != paddle.OutcomeUnknown {
+					t.Fatalf("call = %v, want an unknown outcome", err)
+				}
+			})
+		}
+	}
+
+	// Valid entities, including one whose nested members are null, decode.
+	fake.Respond("GET /subscriptions", http.StatusOK,
+		`{"data":{"id":"sub_1","status":"active","scheduled_change":null,"current_billing_period":null}}`)
+	sub, err := client.GetSubscription(ctx, "sub_1")
+	if err != nil || sub.ID != "sub_1" || sub.ScheduledChange != nil || sub.CurrentBillingPeriod != nil {
+		t.Fatalf("GetSubscription = %+v, %v", sub, err)
+	}
+}
+
 func TestClientOneTimeCharge(t *testing.T) {
 	client, fake := newClient(t)
 	ctx := context.Background()

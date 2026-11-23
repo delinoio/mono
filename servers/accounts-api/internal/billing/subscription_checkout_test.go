@@ -102,3 +102,26 @@ func TestStartSubscriptionReusesThePendingCheckout(t *testing.T) {
 		t.Fatalf("checkout rows = %d, want 1", n)
 	}
 }
+
+// A null entity in the success answer is not a transaction: the start call
+// fails with the provider-unavailable answer and stores nothing.
+func TestStartSubscriptionRejectsANullTransaction(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.paddle.Respond("POST /transactions", http.StatusCreated, `{"data":null}`)
+
+	_, err := f.startCheckout(acct)
+	var connectErr *connect.Error
+	if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeUnavailable {
+		t.Fatalf("StartSubscription error = %v, want unavailable", err)
+	}
+	if n := f.createTransactionRequests(); n != 1 {
+		t.Fatalf("create requests = %d, want 1", n)
+	}
+	if n := f.checkoutRows(acct); n != 0 {
+		t.Fatalf("checkout rows = %d, want 0", n)
+	}
+	if sub, err := LoadSubscription(ctx(), f.db.Pool, acct, false); err != nil || sub.exists {
+		t.Fatalf("subscription = %+v, %v; want unsaved", sub, err)
+	}
+}
