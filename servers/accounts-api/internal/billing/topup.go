@@ -44,14 +44,21 @@ type topUp struct {
 	Status               TopUpStatus
 	PaddleSubscriptionID string
 	CreateTime           time.Time
+	// FailureReason is the reason of a failed top-up, or empty.
+	FailureReason FailureReason
+	// ProviderAcceptTime is when Paddle accepted the charge, or nil without
+	// evidence of acceptance. A timeout keeps it, so it tells an accepted
+	// charge that timed out from one whose result stayed unknown.
+	ProviderAcceptTime *time.Time
 }
 
 const topUpColumns = `top_up_id::text, billing_account_id::text, kind, amount_usd_micros, status,
-	COALESCE(paddle_subscription_id, ''), create_time`
+	COALESCE(paddle_subscription_id, ''), create_time, COALESCE(failure_reason, ''), provider_accept_time`
 
 func scanTopUp(row pgx.Row) (topUp, error) {
 	var t topUp
-	err := row.Scan(&t.ID, &t.BillingAccountID, &t.Kind, &t.Amount, &t.Status, &t.PaddleSubscriptionID, &t.CreateTime)
+	err := row.Scan(&t.ID, &t.BillingAccountID, &t.Kind, &t.Amount, &t.Status, &t.PaddleSubscriptionID, &t.CreateTime,
+		&t.FailureReason, &t.ProviderAcceptTime)
 	return t, err
 }
 
@@ -202,6 +209,18 @@ func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key s
 		case TopUpCharged, TopUpCompleted:
 			return nil
 		case TopUpFailed:
+			// A timeout also fails a top-up that Paddle accepted; the
+			// payment webhook may still add its credit. The recorded
+			// acceptance tells it from a charge whose result stayed unknown
+			// (or a legacy row without that evidence), which keeps the
+			// caller waiting. Every other reason is a provider rejection or
+			// a failed payment.
+			if t.FailureReason == FailureTimedOut {
+				if t.ProviderAcceptTime != nil {
+					return nil
+				}
+				return unavailable("the result of the first request with this idempotency_key is not known yet; try again later")
+			}
 			return failedPrecondition("the payment provider rejected the top-up")
 		default:
 			return unavailable("the result of the first request with this idempotency_key is not known yet; try again later")
@@ -306,7 +325,10 @@ func (s *Service) charge(ctx context.Context, t topUp) (paddle.Outcome, error) {
 		}
 		switch outcome {
 		case paddle.OutcomeOK:
-			_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charged', update_time = $2
+			// provider_accept_time records that Paddle accepted the charge. A
+			// later timeout fails the top-up but keeps it, so a repeated
+			// manual top-up key still knows the charge was accepted.
+			_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charged', provider_accept_time = $2, update_time = $2
 				WHERE top_up_id = $1 AND status = 'charging'`, t.ID, now)
 			return err
 		case paddle.OutcomeUnknown:
@@ -451,10 +473,8 @@ func (s *Service) completeTopUp(ctx context.Context, tx pgx.Tx, t topUp, transac
 // charged or unknown) are not touched.
 func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 	for range 100 {
-		var candidate topUp
-		err := s.db.Pool.QueryRow(ctx, `SELECT `+topUpColumns+` FROM top_ups WHERE status = 'pending'
-			ORDER BY create_time LIMIT 1`).Scan(&candidate.ID, &candidate.BillingAccountID, &candidate.Kind,
-			&candidate.Amount, &candidate.Status, &candidate.PaddleSubscriptionID, &candidate.CreateTime)
+		candidate, err := scanTopUp(s.db.Pool.QueryRow(ctx, `SELECT `+topUpColumns+` FROM top_ups WHERE status = 'pending'
+			ORDER BY create_time LIMIT 1`))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
