@@ -26,7 +26,7 @@ This contract owns the Connect RPC schemas of [`tide`](project-tide.md) in the p
 - List RPCs use `page_size` (default 50, maximum 200) and an opaque `page_token`.
 - Every public RPC is unary or server-streaming. tide has no client-streaming or bidirectional RPC.
 - Errors use Connect error codes. Detail messages never contain credentials.
-- Credential fields exist only in request messages of set operations. Response messages carry `credential_set` (bool) and `credential_set_at` instead. The only exception is the personal API key secret in the `CreateApiKey` response.
+- Stored credential fields exist only in request messages of set operations. Response messages carry `credential_set` (bool) and `credential_set_at` instead. The only exceptions are the two one-time secrets: the personal API key secret in `CreateApiKeyResponse` and the invitation secret in `CreateInvitationResponse`.
 - `DevSessionService` RPCs accept a Logto access token or a personal API key. Every other service accepts only a Logto access token.
 - Enum value names follow the buf `STANDARD` lint rule: each value has the upper-snake-case enum name as its prefix (for example `REQUEST_STATE_QUEUED`, `OWN_SAND_LINK_STATE_ACTIVE` and `GIT_HUB_INSTALLATION_STATE_ACTIVE`). The tables below list the values without the prefix.
 - A server-streaming RPC returns a `<Rpc>Response` message that wraps its event, so that every RPC has its own response type.
@@ -167,8 +167,8 @@ The schemas define no storage. The [control plane contract](servers-tide-api-fou
 
 ## Security
 
-- No response message carries a credential, a JIT configuration or a work order. The only secret in a response is the personal API key secret in `CreateApiKeyResponse`.
-- Invitation secrets appear only in the `CreateInvitation` response.
+- No response message carries a credential, a JIT configuration or a work order. The only secrets in responses are the personal API key secret (`CreateApiKeyResponse.secret`) and the invitation secret (`CreateInvitationResponse.invitation_secret`). Each is returned once, and `ListApiKeys` and `ListInvitations` omit them.
+- The invitation secret is an input of `AcceptInvitation`: the request field `AcceptInvitationRequest.invitation_secret`.
 - Exec environment values are request fields that the server neither stores nor logs.
 
 ## Logging
