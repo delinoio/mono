@@ -29,8 +29,9 @@ import { type ConsumerHold, watchedRelayStream } from "../relay/stream.ts";
 import { uuidV7TimestampMs } from "../uuidv7.ts";
 import {
   isNotFound,
+  RecoveryDeadlineError,
   recoverOrThrow,
-  sandboxState,
+  sandboxStateWithin,
   waitForSandboxToResume,
 } from "./common.ts";
 
@@ -135,6 +136,9 @@ export async function* runExec(
   let complete = true;
   let stdoutNext = plan.stdoutOffset;
   let stderrNext = plan.stderrOffset;
+  // The last failure that fed the recovery window. A state lookup that the
+  // window cuts off ends the operation with it.
+  let lastRelayFailure: unknown;
 
   const attachRequest = (): AttachExecRequest =>
     create(AttachExecRequestSchema, {
@@ -336,6 +340,7 @@ export async function* runExec(
     }
     if (failure instanceof PeerUnavailableError) {
       selector.peerFailed(failure, session);
+      lastRelayFailure = failure;
       window.fail();
       mode = Mode.Attach;
       continue;
@@ -351,8 +356,14 @@ export async function* runExec(
       // request (the same exec_id makes this safe).
       let current;
       try {
-        current = await sandboxState(ctx, signal);
-      } catch {
+        current = await sandboxStateWithin(ctx, signal, window);
+      } catch (error) {
+        throwIfAborted(signal);
+        if (error instanceof RecoveryDeadlineError) {
+          // The lookup outlasted the recovery window: end with the window's
+          // last relay failure and send no further request.
+          throw lastRelayFailure ?? failure;
+        }
         current = undefined;
       }
       if (current?.state === SandboxState.PAUSED) {
@@ -388,6 +399,7 @@ export async function* runExec(
       continue;
     }
     if (onRelay) grants.discardFor(failure);
+    lastRelayFailure = failure;
     await recoverOrThrow(ctx, window, failure, signal);
     mode = Mode.Attach;
   }

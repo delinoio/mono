@@ -7,8 +7,9 @@ import {
 } from "@delino/ownsand-protos/v1/common_pb";
 import { LogEvent, safeLog } from "../logger.ts";
 import type { OperationContext } from "../relay/context.ts";
-import { Timing } from "../relay/context.ts";
+import { Timing, throwIfAborted } from "../relay/context.ts";
 import type { RecoveryWindow } from "../relay/recovery.ts";
+import { linkedController } from "../relay/stream.ts";
 
 /** Reports whether the error is a Connect `not_found`. */
 export function isNotFound(error: unknown): error is ConnectError {
@@ -83,6 +84,62 @@ export async function sandboxState(
     state: sandbox?.state ?? SandboxState.UNSPECIFIED,
     endReason: sandbox?.endReason ?? SandboxEndReason.UNSPECIFIED,
   };
+}
+
+/**
+ * The abort reason of a state lookup that the recovery window cut off. It is
+ * private to this module's callers: `sandboxStateWithin` throws it, and the
+ * caller replaces it with the last relay failure of the window.
+ */
+export class RecoveryDeadlineError extends Error {
+  override name = "RecoveryDeadlineError";
+}
+
+/**
+ * Reads the sandbox state once, bounded by the relay recovery window. While
+ * the window is active, a lookup that is still pending when the window's
+ * remaining time has passed is aborted and throws `RecoveryDeadlineError`.
+ * The lookup does not run when the window has no time left. A caller abort
+ * cancels the lookup and rejects with the caller's own reason. An inactive
+ * window does not bound the lookup.
+ */
+export async function sandboxStateWithin(
+  ctx: OperationContext,
+  signal: AbortSignal | undefined,
+  window: RecoveryWindow,
+): Promise<{ state: SandboxState; endReason: SandboxEndReason }> {
+  const remaining = window.active
+    ? window.remainingMs()
+    : Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(remaining)) {
+    return sandboxState(ctx, signal);
+  }
+  if (remaining <= 0) {
+    throwIfAborted(signal);
+    throw new RecoveryDeadlineError("the recovery window has no time left");
+  }
+  const { controller, dispose } = linkedController(signal);
+  const stop = new AbortController();
+  const deadline = new RecoveryDeadlineError(
+    "the sandbox state lookup outlasted the recovery window",
+  );
+  ctx.clock.sleep(remaining, stop.signal).then(
+    () => controller.abort(deadline),
+    () => {},
+  );
+  try {
+    return await sandboxState(ctx, controller.signal);
+  } catch (error) {
+    // The caller's abort wins over the deadline.
+    throwIfAborted(signal);
+    if (controller.signal.reason === deadline) {
+      throw deadline;
+    }
+    throw error;
+  } finally {
+    stop.abort();
+    dispose();
+  }
 }
 
 /**
