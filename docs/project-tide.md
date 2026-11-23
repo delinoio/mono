@@ -28,7 +28,7 @@ Paths marked `planned` do not exist yet. Create each path, its workspace members
 - `apps/tide/` (`planned`): Rsbuild React web console served at `https://tide.delino.io`.
 - `cmds/tide/`: Go command-line interface. The same binary serves the `tide mcp` MCP server for coding agents.
 - `protos/delino/tide/`: the workspace package `@delino/tide-protos` with the Connect RPC schemas in `v1/`, the committed Go bindings and the committed TypeScript bindings.
-- `packages/tide-sdk/` (`planned`): TypeScript SDK.
+- `packages/tide-sdk/`: TypeScript SDK (workspace package `tide-sdk`).
 - `go/tide/`: Go SDK, with the test fake `go/tide/tidetest`. It is under `go/` because external users import it (see the [workflow contract](repository-workflow-contract.md#public-go-packages)).
 
 The project has one hosted server deployable (the control plane on the shared DigitalOcean Droplet), one static site (the web console) and one distributed program (the CLI). tide distributes no device program: OwnSand owns every program that runs on a device. The project has no `crates` paths.

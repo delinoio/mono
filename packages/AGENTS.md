@@ -14,5 +14,5 @@
 - [Repository workflow](../docs/repository-workflow-contract.md)
 - `packages/delino-ui/`: [project index](../docs/project-delino-ui.md) and [foundation contract](../docs/packages-delino-ui-foundation.md)
 - `packages/ownsand-sdk/`: [project index](../docs/project-ownsand.md) and [SDK foundation contract](../docs/packages-ownsand-sdk-foundation.md)
-- `packages/tide-sdk/` (`planned`): [project index](../docs/project-tide.md) and [SDK foundation contract](../docs/packages-tide-sdk-foundation.md)
+- `packages/tide-sdk/`: [project index](../docs/project-tide.md) and [SDK foundation contract](../docs/packages-tide-sdk-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.
