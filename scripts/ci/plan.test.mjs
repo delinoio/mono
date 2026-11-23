@@ -668,6 +668,11 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "go/ownsand/relaybinding/testdata/request-digest-vectors.json",
     "servers/ownsand-api/scripts/dev.mjs",
     "cmds/ownsand-agent/images/linux/build-rootfs.sh",
+    "cmds/ownsand-agent/images/linux/fetch-kernel-source.sh",
+    "cmds/ownsand-agent/images/linux/fetch-kernel.sh",
+    "cmds/ownsand-agent/images/linux/build-kernel.sh",
+    "cmds/ownsand-agent/images/linux/build-image.sh",
+    "cmds/ownsand-agent/package.json",
     "go/example/testdata/case.golden",
     "cmds/example/internal/testdata/input.json",
     "internal/example/testdata/input.txt",
@@ -696,11 +701,12 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   // Go-built server. The launcher test and the accounts-api launcher are not.
   f.write("servers/ownsand-api/scripts/dev.test.mjs");
   f.write("servers/accounts-api/scripts/dev.mjs");
-  // Only the root filesystem builder is a Go input; the kernel scripts and
-  // the builder of another image directory are not.
-  f.write("cmds/ownsand-agent/images/linux/fetch-kernel.sh");
-  f.write("cmds/ownsand-agent/images/linux/build-kernel.sh");
+  // The image scripts that a Go test runs are Go inputs; the kernel
+  // configuration, which no Go test reads, and the builder of another image
+  // directory are not.
+  f.write("cmds/ownsand-agent/images/linux/kernel.config");
   f.write("cmds/ownsand-agent/images/other/build-rootfs.sh");
+  f.write("cmds/ownsand-agent/images/other/fetch-kernel-source.sh");
   f.write(".github/workflows/deploy.yml");
   f.write("docs/testdata/example.json");
   f.write("go/example/mytestdata/example.json");
@@ -717,15 +723,43 @@ test("the ownsand-api launcher selects the Go checks and the workspace jobs", (t
   assert.equal(selected.e2e, false);
 });
 
-test("the root filesystem builder selects only the Go checks", (t) => {
+for (const script of [
+  "build-image.sh",
+  "build-kernel.sh",
+  "build-rootfs.sh",
+  "fetch-kernel-source.sh",
+  "fetch-kernel.sh",
+]) {
+  test(`the image script ${script} selects only the Go checks`, (t) => {
+    const f = fixture(t);
+    f.write(`cmds/ownsand-agent/images/linux/${script}`);
+    const selected = plan(f.cwd, f.base, f.commit());
+    assert.equal(selected.go, true);
+    assert.equal(selected.workspace, false);
+    assert.equal(selected.rust, false);
+    assert.equal(selected.e2e, false);
+    assert.equal(selected.workflows, false);
+    assert.equal(selected.fixtures, false);
+    assert.equal(selected.format, false);
+  });
+}
+
+test("the device agent package manifest selects the Go checks with the workspace and fixtures", (t) => {
   const f = fixture(t);
-  f.write("cmds/ownsand-agent/images/linux/build-rootfs.sh");
+  f.write("cmds/ownsand-agent/package.json");
   const selected = plan(f.cwd, f.base, f.commit());
   assert.equal(selected.go, true);
-  assert.equal(selected.workspace, false);
-  assert.equal(selected.rust, false);
+  assert.equal(selected.workspace, true);
+  assert.equal(selected.fixtures, true);
   assert.equal(selected.e2e, false);
-  assert.equal(selected.workflows, false);
+});
+
+test("the kernel configuration selects no check", (t) => {
+  const f = fixture(t);
+  f.write("cmds/ownsand-agent/images/linux/kernel.config");
+  const selected = plan(f.cwd, f.base, f.commit());
+  assert.equal(selected.go, false);
+  assert.equal(selected.workspace, false);
   assert.equal(selected.fixtures, false);
 });
 
