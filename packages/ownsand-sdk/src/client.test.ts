@@ -1204,6 +1204,18 @@ describe("createSandbox", () => {
 
     test("leaves no listener on the caller's signal and no timer after the create", async () => {
       const h = setup();
+      // The retry-window timer only aborts a private controller, so advancing
+      // the clock cannot show a leaked timer. Count the sleeps that have not
+      // settled instead: the window timer settles only when its controller is
+      // aborted or its time is up.
+      let pending = 0;
+      const sleep = h.clock.sleep.bind(h.clock);
+      h.clock.sleep = (ms, signal) => {
+        pending++;
+        return sleep(ms, signal).finally(() => {
+          pending--;
+        });
+      };
       recorded(h, (call) => {
         if (call.index === 0) throw new LostResponse();
         return created;
@@ -1213,9 +1225,9 @@ describe("createSandbox", () => {
       await h.clock.run(
         h.client.createSandbox({ ...validCreate, signal: abort.signal }),
       );
+      await h.clock.settle();
       expect(getEventListeners(abort.signal, "abort")).toHaveLength(before);
-      // A pending window timer would make this advance fire it.
-      await h.clock.advance(120_000);
+      expect(pending).toBe(0);
     });
   });
 
