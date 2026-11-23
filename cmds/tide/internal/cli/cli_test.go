@@ -1,0 +1,381 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/delinoio/mono/cmds/internal/credstore"
+	"github.com/delinoio/mono/go/tide/tidetest"
+	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+)
+
+type fixture struct {
+	t   *testing.T
+	srv *tidetest.Server
+	org string
+	cfg string
+	env map[string]string
+	wd  string
+}
+
+// newFixture starts a fake tide-api and stores Logto tokens that the fake
+// accepts, so commands run without a Logto tenant.
+func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	srv := tidetest.New()
+	t.Cleanup(srv.Close)
+	org := srv.AddOrganization("acme").GetOrganizationId()
+	cfg := t.TempDir()
+	st := credstore.Store{Dir: cfg, Program: "tide"}
+	if err := st.Save(&credstore.Credentials{
+		LogtoEndpoint: "https://logto.example.com", AppID: "app", Resource: DefaultLogtoResource,
+		RefreshToken: "refresh", AccessToken: srv.AccessToken, AccessTokenExpiry: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return &fixture{t: t, srv: srv, org: org, cfg: cfg, wd: t.TempDir(), env: map[string]string{
+		EnvAPIURL: srv.URL, EnvConfigDir: cfg, EnvNoColor: "1",
+	}}
+}
+
+type result struct {
+	code           int
+	stdout, stderr string
+}
+
+func (f *fixture) run(stdin string, args ...string) result {
+	f.t.Helper()
+	var out, errb bytes.Buffer
+	code := Run(context.Background(), Env{
+		Args: args, Stdin: strings.NewReader(stdin), Stdout: &out, Stderr: &errb,
+		LookupEnv: func(k string) (string, bool) { v, ok := f.env[k]; return v, ok },
+		Getwd:     func() (string, error) { return f.wd, nil },
+	})
+	return result{code: code, stdout: out.String(), stderr: errb.String()}
+}
+
+func (f *fixture) ok(stdin string, args ...string) result {
+	f.t.Helper()
+	r := f.run(stdin, args...)
+	if r.code != 0 {
+		f.t.Fatalf("tide %v exited %d: %s%s", args, r.code, r.stdout, r.stderr)
+	}
+	return r
+}
+
+func TestUsageErrors(t *testing.T) {
+	f := newFixture(t)
+	for _, args := range [][]string{
+		{}, {"nope"}, {"org"}, {"org", "nope"}, {"--output", "yaml", "org", "list"},
+		{"org", "create"}, {"org", "create", "a", "b"}, {"profile", "create", "--vcpu", "99999999999", "--name", "x"},
+		{"profile", "create", "--name", "x", "--kind", "bad", "--os", "linux"}, {"session", "exec", "id"},
+		{"session", "create", "linux", "--wait", "soon"}, {"mcp", "--pass-env", "BAD-NAME"},
+	} {
+		if r := f.run("", args...); r.code != ExitUsage {
+			t.Errorf("tide %v exited %d, want 2: %s", args, r.code, r.stderr)
+		}
+	}
+	if r := f.run("", "org", "list", "--org"); r.code != ExitUsage {
+		t.Errorf("missing flag value exited %d", r.code)
+	}
+	if r := f.ok("", "help"); !strings.Contains(r.stdout, "session") || !strings.Contains(r.stdout, "org-settings") {
+		t.Errorf("help: %s", r.stdout)
+	}
+	if r := f.ok("", "session", "exec", "--help"); !strings.Contains(r.stdout, "-timeout") {
+		t.Errorf("subcommand help: %s", r.stdout)
+	}
+	// A command that needs an organization fails before any request.
+	if r := f.run("", "member", "list"); r.code != ExitUsage || !strings.Contains(r.stderr, "tide org use") {
+		t.Errorf("no organization: %d %s", r.code, r.stderr)
+	}
+}
+
+func TestCredentialPrecedenceAndErrors(t *testing.T) {
+	f := newFixture(t)
+	f.ok("", "--org", f.org, "session", "list")
+	if f.srv.LastCredential() != tidetest.CredentialAccessToken {
+		t.Fatal("the stored Logto token was not used")
+	}
+	f.env[EnvAPIKey] = f.srv.APIKey
+	f.ok("", "--org", f.org, "session", "list")
+	if f.srv.LastCredential() != tidetest.CredentialAPIKey {
+		t.Fatal("TIDE_API_KEY did not take precedence")
+	}
+	r := f.run("", "org", "list")
+	if r.code != ExitError || !strings.Contains(r.stderr, "permission_denied") {
+		t.Fatalf("org list with an API key = %d %s", r.code, r.stderr)
+	}
+	if strings.Contains(r.stderr, f.srv.APIKey) || strings.Contains(r.stdout, f.srv.APIKey) {
+		t.Fatal("the API key was printed")
+	}
+	delete(f.env, EnvAPIKey)
+
+	// Without stored tokens or an API key, the error says what to do.
+	f.env[EnvConfigDir] = t.TempDir()
+	r = f.run("", "org", "list")
+	if r.code != ExitError || !strings.Contains(r.stderr, "tide login") || !strings.Contains(r.stderr, EnvAPIKey) {
+		t.Fatalf("no credential = %d %s", r.code, r.stderr)
+	}
+	f.env[EnvConfigDir] = f.cfg
+
+	// A server error exits 1 with the Connect code.
+	r = f.run("", "--org", f.org, "request", "get", "missing")
+	if r.code != ExitError || !strings.Contains(r.stderr, "not_found") {
+		t.Fatalf("server error = %d %s", r.code, r.stderr)
+	}
+	// A network error exits 1.
+	f.env[EnvAPIURL] = "http://127.0.0.1:1"
+	if r := f.run("", "org", "list"); r.code != ExitError {
+		t.Fatalf("network error = %d %s", r.code, r.stderr)
+	}
+}
+
+func TestCredentialInput(t *testing.T) {
+	f := newFixture(t)
+	f.ok("ownsand-key-from-stdin\n", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org")
+	if _, key := f.srv.OwnSandLink(f.org); key != "ownsand-key-from-stdin" {
+		t.Fatalf("stdin key = %q", key)
+	}
+	file := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(file, []byte("ownsand-key-from-file\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := f.ok("", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org", "--api-key-file", file)
+	if _, key := f.srv.OwnSandLink(f.org); key != "ownsand-key-from-file" {
+		t.Fatalf("file key = %q", key)
+	}
+	if strings.Contains(r.stdout+r.stderr, "ownsand-key-from-file") {
+		t.Fatal("the credential was printed")
+	}
+	if r := f.run("", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org"); r.code != ExitUsage {
+		t.Fatalf("empty stdin = %d", r.code)
+	}
+	// There is no flag that takes a credential value.
+	if r := f.run("", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org", "--api-key", "k"); r.code != ExitUsage {
+		t.Fatalf("--api-key accepted: %d", r.code)
+	}
+
+	f.ok(`{"environment_key": "ek", "webhook_secret": "ws"}`, "--org", f.org, "integration", "create", "--vendor", "openai-codex", "--name", "codex")
+	_, reqs := f.srv.Integrations()
+	if c := reqs[0].GetOpenaiCodexCredentials(); c.GetEnvironmentKey() != "ek" || c.GetWebhookSecret() != "ws" {
+		t.Fatalf("integration credentials = %v", c)
+	}
+	r = f.run("not json super-secret", "--org", f.org, "integration", "create", "--vendor", "cursor", "--name", "c")
+	if r.code != ExitUsage || strings.Contains(r.stderr, "super-secret") {
+		t.Fatalf("invalid credentials = %d %s", r.code, r.stderr)
+	}
+}
+
+func TestOutputFormats(t *testing.T) {
+	f := newFixture(t)
+	r := f.ok("", "org", "list")
+	if !strings.Contains(r.stdout, "NAME") && !strings.Contains(r.stdout, "name") || !strings.Contains(r.stdout, "acme") {
+		t.Fatalf("table = %s", r.stdout)
+	}
+	r = f.ok("", "--output", "json", "org", "list")
+	var list struct {
+		Organizations []map[string]any `json:"organizations"`
+	}
+	if err := json.Unmarshal([]byte(r.stdout), &list); err != nil || len(list.Organizations) != 1 || list.Organizations[0]["organization_id"] != f.org {
+		t.Fatalf("json = %s %v", r.stdout, err)
+	}
+
+	// api-key create prints only the secret on stdout in text mode.
+	r = f.ok("", "--org", f.org, "api-key", "create", "--name", "agent")
+	secret := strings.TrimSpace(r.stdout)
+	if !strings.HasPrefix(secret, "tide_") || strings.Contains(r.stdout, "agent") || !strings.Contains(r.stderr, "agent") {
+		t.Fatalf("secret output: stdout %q stderr %q", r.stdout, r.stderr)
+	}
+	r = f.ok("", "--org", f.org, "--output", "json", "api-key", "create", "--name", "agent2")
+	var key map[string]any
+	if err := json.Unmarshal([]byte(r.stdout), &key); err != nil || !strings.HasPrefix(key["secret"].(string), "tide_") || key["name"] != "agent2" {
+		t.Fatalf("json secret = %s", r.stdout)
+	}
+	r = f.ok("", "--org", f.org, "api-key", "list")
+	if strings.Contains(r.stdout, secret) {
+		t.Fatal("api-key list printed a secret")
+	}
+
+	// Color is on by default and off with --no-color or NO_COLOR.
+	delete(f.env, EnvNoColor)
+	if r := f.run("", "nope"); !strings.Contains(r.stderr, "\x1b[") {
+		t.Fatalf("no color by default: %q", r.stderr)
+	}
+	if r := f.run("", "--no-color", "nope"); strings.Contains(r.stderr, "\x1b[") {
+		t.Fatalf("color with --no-color: %q", r.stderr)
+	}
+}
+
+func TestOrgUseAndSettings(t *testing.T) {
+	f := newFixture(t)
+	other := f.srv.AddOrganization("other").GetOrganizationId()
+	f.ok("", "org", "use", f.org)
+	r := f.ok("", "org", "list")
+	if !strings.Contains(r.stdout, "* ") && !strings.Contains(r.stdout, "*  ") {
+		t.Fatalf("selected organization not marked: %s", r.stdout)
+	}
+	f.ok("", "member", "list")
+	if r := f.run("", "org", "use", "missing"); r.code != ExitError {
+		t.Fatalf("org use of an unknown organization = %d", r.code)
+	}
+	r = f.ok("", "--output", "json", "org-settings", "get")
+	if strings.TrimSpace(r.stdout) != "{}" {
+		t.Fatalf("settings = %s", r.stdout)
+	}
+	f.ok("", "org-settings", "set-dev-session-limit", "2")
+	r = f.ok("", "org-settings", "get")
+	if !strings.Contains(r.stdout, "max_dev_sessions_per_user: 2") {
+		t.Fatalf("settings = %s", r.stdout)
+	}
+	f.ok("", "org-settings", "clear-dev-session-limit")
+	if r := f.ok("", "org-settings", "get"); !strings.Contains(r.stdout, "none") {
+		t.Fatalf("cleared settings = %s", r.stdout)
+	}
+	if r := f.run("", "org-settings", "set-dev-session-limit", "0"); r.code != ExitUsage {
+		t.Fatalf("limit 0 = %d", r.code)
+	}
+	// TIDE_ORG and --org override the stored organization.
+	f.env[EnvOrganization] = other
+	r = f.ok("", "--output", "json", "member", "list")
+	if !strings.Contains(r.stdout, other) {
+		t.Fatalf("TIDE_ORG not used: %s", r.stdout)
+	}
+	r = f.ok("", "--org", f.org, "--output", "json", "member", "list")
+	if !strings.Contains(r.stdout, f.org) {
+		t.Fatalf("--org not used: %s", r.stdout)
+	}
+}
+
+func TestStatus(t *testing.T) {
+	f := newFixture(t)
+	f.srv.AddRequest(&tidev1.Request{RequestId: "r1", OrganizationId: f.org, State: tidev1.RequestState_REQUEST_STATE_QUEUED, Kind: tidev1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB})
+	f.srv.AddRunner(&tidev1.Runner{RunnerId: "n1", OrganizationId: f.org, State: tidev1.RunnerState_RUNNER_STATE_BUSY})
+	f.srv.AddDevice(&tidev1.DeviceCapacity{OwnsandDeviceId: "d1", Name: "mac-mini", State: tidev1.DeviceState_DEVICE_STATE_ONLINE})
+	r := f.ok("", "--org", f.org, "status")
+	for _, want := range []string{"1 queued", "busy: 1", "mac-mini", "github-job"} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("status lacks %q: %s", want, r.stdout)
+		}
+	}
+	r = f.ok("", "--org", f.org, "--output", "json", "status")
+	var st map[string]any
+	if err := json.Unmarshal([]byte(r.stdout), &st); err != nil || st["runners_by_state"].(map[string]any)["busy"] != float64(1) {
+		t.Fatalf("status json = %s %v", r.stdout, err)
+	}
+	if r := f.run("", "--org", f.org, "request", "cancel", "r1"); r.code != 0 {
+		t.Fatalf("cancel = %d %s", r.code, r.stderr)
+	}
+}
+
+func TestSessionCommands(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake guest runs POSIX sh commands")
+	}
+	f := newFixture(t)
+	ws := filepath.Join(t.TempDir(), "work")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.srv.AddDevSessionProfile(f.org, "linux", tidev1.GuestOs_GUEST_OS_LINUX, ws)
+	f.env[EnvAPIKey] = f.srv.APIKey
+	f.env[EnvOrganization] = f.org
+
+	r := f.ok("", "session", "profiles")
+	if !strings.Contains(r.stdout, "linux") || !strings.Contains(r.stdout, ws) {
+		t.Fatalf("profiles = %s", r.stdout)
+	}
+	f.srv.NewSessionState = tidev1.RequestState_REQUEST_STATE_QUEUED
+	f.srv.PromoteAfterGets = 2
+	r = f.ok("", "--output", "json", "session", "create", "linux", "--label", "ci", "--wait", "30s")
+	var ds map[string]any
+	if err := json.Unmarshal([]byte(r.stdout), &ds); err != nil || ds["state"] != "REQUEST_STATE_RUNNING" {
+		t.Fatalf("create --wait = %s", r.stdout)
+	}
+	id := ds["dev_session_id"].(string)
+	if r := f.run("", "session", "create", "missing"); r.code != ExitError || !strings.Contains(r.stderr, "not_found") {
+		t.Fatalf("unknown profile = %d %s", r.code, r.stderr)
+	}
+	f.srv.PromoteAfterGets = 0
+	queued := strings.TrimSpace(f.ok("", "--output", "json", "session", "create", "linux").stdout)
+	var q map[string]any
+	_ = json.Unmarshal([]byte(queued), &q)
+	if r := f.run("", "session", "wait", q["dev_session_id"].(string), "--timeout", "100ms"); r.code != ExitError || !strings.Contains(r.stderr, "still queued") {
+		t.Fatalf("wait timeout = %d %s", r.code, r.stderr)
+	}
+	r = f.ok("", "session", "list")
+	if !strings.Contains(r.stdout, id) {
+		t.Fatalf("list = %s", r.stdout)
+	}
+
+	// Exit status propagation.
+	r = f.run("", "session", "exec", id, "--", "sh", "-c", "echo out; echo err >&2; exit 3")
+	if r.code != 3 || r.stdout != "out\n" || r.stderr != "err\n" {
+		t.Fatalf("exec = %d %q %q", r.code, r.stdout, r.stderr)
+	}
+	if r := f.run("", "session", "exec", "--env", "X=1", id, "sh", "-c", `test "$X" = 1`); r.code != 0 {
+		t.Fatalf("exec env = %d %s", r.code, r.stderr)
+	}
+	if r := f.run("", "session", "exec", id, "--", "sh", "-c", "kill -TERM $$"); r.code != ExitSignalBase+15 {
+		t.Fatalf("signal exit = %d", r.code)
+	}
+	if r := f.run("", "session", "exec", id, "--", "tide-no-such-program"); r.code != ExitCommandNotStart {
+		t.Fatalf("missing program = %d %s", r.code, r.stderr)
+	}
+	if r := f.run("", "session", "exec", "--timeout", "100ms", id, "--", "sleep", "5"); r.code != ExitExecTimedOut {
+		t.Fatalf("timeout = %d", r.code)
+	}
+	r = f.run("", "--output", "json", "session", "exec", id, "--", "sh", "-c", "echo hi; exit 7")
+	lines := strings.Split(strings.TrimSpace(r.stdout), "\n")
+	var last map[string]any
+	_ = json.Unmarshal([]byte(lines[len(lines)-1]), &last)
+	if r.code != 0 || last["event"] != "exited" || last["exit_code"] != float64(7) || !strings.Contains(r.stdout, `"data":"hi\n"`) {
+		t.Fatalf("json exec = %d %s", r.code, r.stdout)
+	}
+
+	// Sync and download.
+	if _, err := exec.LookPath("git"); err == nil {
+		repo := f.wd
+		cmd := exec.Command("git", "-C", repo, "init", "-q")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git init: %s", out)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "hello.txt"), []byte("hello"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r = f.ok("", "session", "sync", id)
+		if !strings.Contains(r.stdout, "Uploaded 1") {
+			t.Fatalf("sync = %s %s", r.stdout, r.stderr)
+		}
+		r = f.ok("", "--output", "json", "session", "sync", id, ".", "--force")
+		if !strings.Contains(r.stdout, `"skipped":1`) {
+			t.Fatalf("second sync = %s", r.stdout)
+		}
+		r = f.ok("", "session", "download", id, "hello.txt", "copy.txt")
+		if b, err := os.ReadFile(filepath.Join(repo, "copy.txt")); err != nil || string(b) != "hello" {
+			t.Fatalf("download = %s %v", r.stdout, err)
+		}
+	}
+	if r := f.run("", "session", "download", id, "missing", "x"); r.code != ExitError || !strings.Contains(r.stderr, "not_found") {
+		t.Fatalf("download missing = %d %s", r.code, r.stderr)
+	}
+
+	// A session that is not running rejects commands with exit status 1.
+	f.srv.SetSessionState(id, tidev1.RequestState_REQUEST_STATE_STARTING)
+	if r := f.run("", "session", "exec", id, "--", "true"); r.code != ExitError || !strings.Contains(r.stderr, "failed_precondition") {
+		t.Fatalf("exec in a starting session = %d %s", r.code, r.stderr)
+	}
+	r = f.ok("", "--output", "json", "session", "delete", id)
+	if !strings.Contains(r.stdout, "REQUEST_STATE_ENDED") {
+		t.Fatalf("delete = %s", r.stdout)
+	}
+}

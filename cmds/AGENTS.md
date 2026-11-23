@@ -44,5 +44,5 @@
 - [Repository licensing](../docs/repository-license-contract.md)
 - `cmds/ownsand-guest/` and `cmds/ownsand-agent/`: [project index](../docs/project-ownsand.md) and [device agent foundation contract](../docs/cmds-ownsand-agent-foundation.md)
 - `cmds/ownsand/`: [project index](../docs/project-ownsand.md) and [CLI foundation contract](../docs/cmds-ownsand-cli-foundation.md)
-- `cmds/tide/` (`planned`): [project index](../docs/project-tide.md) and [CLI foundation contract](../docs/cmds-tide-cli-foundation.md)
+- `cmds/tide/`: [project index](../docs/project-tide.md) and [CLI foundation contract](../docs/cmds-tide-cli-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.

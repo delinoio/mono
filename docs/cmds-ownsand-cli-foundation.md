@@ -2,7 +2,7 @@
 
 ## Scope
 
-This contract owns the OwnSand command-line interface, component `ownsand-cli`, of [`ownsand`](project-ownsand.md) at `cmds/ownsand/`. The binary name is `ownsand`. The entry point is `cmds/ownsand/main.go`; `cmds/ownsand/internal/cli` holds the commands, `internal/credstore` the credential file and `internal/logto` the Logto device flow. The CLI uses Apache-2.0 and must not import code from `servers/`.
+This contract owns the OwnSand command-line interface, component `ownsand-cli`, of [`ownsand`](project-ownsand.md) at `cmds/ownsand/`. The binary name is `ownsand`. The entry point is `cmds/ownsand/main.go`; `cmds/ownsand/internal/cli` holds the commands. The credential file (`cmds/internal/credstore`) and the Logto device flow (`cmds/internal/logto`) are shared with the [tide CLI](cmds-tide-cli-foundation.md). The CLI uses Apache-2.0 and must not import code from `servers/`.
 
 The device agent has its own commands; the [agent contract](cmds-ownsand-agent-foundation.md#commands) owns them.
 

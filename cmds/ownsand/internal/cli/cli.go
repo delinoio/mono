@@ -19,7 +19,7 @@ import (
 
 	"connectrpc.com/connect"
 
-	"github.com/delinoio/mono/cmds/ownsand/internal/credstore"
+	"github.com/delinoio/mono/cmds/internal/credstore"
 	ownsand "github.com/delinoio/mono/go/ownsand"
 	"github.com/delinoio/mono/go/ownsand/validate"
 )
@@ -422,13 +422,13 @@ the CLI uses the tokens that 'ownsand login' stored.
 // store returns the credential store.
 func (a *app) store() (credstore.Store, error) {
 	if dir := a.getenv(EnvConfigDir); dir != "" {
-		return credstore.Store{Dir: dir}, nil
+		return credstore.Store{Dir: dir, Program: "ownsand"}, nil
 	}
-	dir, err := credstore.DefaultDir()
+	dir, err := credstore.DefaultDir("ownsand")
 	if err != nil {
 		return credstore.Store{}, err
 	}
-	return credstore.Store{Dir: dir}, nil
+	return credstore.Store{Dir: dir, Program: "ownsand"}, nil
 }
 
 func (a *app) apiURL() string {

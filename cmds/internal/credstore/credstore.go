@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package credstore stores the Logto tokens of the ownsand CLI in a file in
-// the user configuration directory that only the user can read: mode 0600
-// (directory 0700) on Linux and macOS, a protected user-only ACL on
-// Windows. OS keychain storage is not used; see
-// docs/cmds-ownsand-cli-foundation.md.
+// Package credstore stores the Logto tokens of a command-line program (the
+// ownsand and tide CLIs) in a file in the user configuration directory that
+// only the user can read: mode 0600 (directory 0700) on Linux and macOS, a
+// protected user-only ACL on Windows. OS keychain storage is not used; see
+// docs/cmds-ownsand-cli-foundation.md and docs/cmds-tide-cli-foundation.md.
 package credstore
 
 import (
@@ -65,15 +65,18 @@ func NewSessionID() (string, error) {
 // Store is a credential file in one directory.
 type Store struct {
 	Dir string
+	// Program is the command name that error messages tell the user to run
+	// (for example "ownsand"). Empty uses generic messages.
+	Program string
 }
 
-// DefaultDir returns <user config dir>/ownsand.
-func DefaultDir() (string, error) {
+// DefaultDir returns <user config dir>/<program>.
+func DefaultDir(program string) (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("credstore: user configuration directory: %w", err)
 	}
-	return filepath.Join(base, "ownsand"), nil
+	return filepath.Join(base, program), nil
 }
 
 // Path returns the credential file path.
@@ -91,7 +94,10 @@ func (s Store) Load() (*Credentials, error) {
 	var c Credentials
 	if err := json.Unmarshal(b, &c); err != nil {
 		// Never include the file content: it holds tokens.
-		return nil, errors.New("credstore: the credential file is not valid; run ownsand logout and ownsand login")
+		if s.Program == "" {
+			return nil, errors.New("credstore: the credential file is not valid; sign out and sign in again")
+		}
+		return nil, fmt.Errorf("credstore: the credential file is not valid; run %s logout and %s login", s.Program, s.Program)
 	}
 	return &c, nil
 }

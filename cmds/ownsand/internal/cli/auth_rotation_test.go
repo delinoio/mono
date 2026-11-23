@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/delinoio/mono/cmds/ownsand/internal/credstore"
+	"github.com/delinoio/mono/cmds/internal/credstore"
 )
 
 // rotatingLogto is a mock Logto issuer that rotates refresh tokens like the
