@@ -52,7 +52,7 @@ More: [PlanetScale Insights docs](https://planetscale.com/docs/postgres/monitori
 
 ## Optimization Checklist
 
-- Remove unused indexes (0 scans)
+- Review indexes with 0 scans as removal candidates only after a representative statistics window (check `stats_reset` and the server start time). Never treat primary, unique or other constraint-backed indexes as unused because of their scan count; see [optimization-checklist.md](optimization-checklist.md) and [index-optimization.md](index-optimization.md)
 - Remove duplicate indexes
 - Archive audit/log tables >10 GB
 - Review tables >100 GB for partitioning
