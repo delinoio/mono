@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -32,19 +33,79 @@ func TestParseGuestOS(t *testing.T) {
 	}
 }
 
+// minimalWindowsAMD64PE is the smallest image debug/pe accepts as an amd64
+// executable: an MZ header whose e_lfanew (offset 0x3c) points at 0x40, the
+// "PE\0\0" signature, and a COFF file header with machine 0x8664 and no
+// sections or optional header.
+func minimalWindowsAMD64PE() []byte {
+	b := make([]byte, 96)
+	b[0], b[1] = 'M', 'Z'
+	b[0x3c] = 0x40
+	copy(b[0x40:], "PE\x00\x00")
+	b[0x44], b[0x45] = 0x64, 0x86 // IMAGE_FILE_MACHINE_AMD64, little endian
+	return b
+}
+
+// TestBuildChecksTheGuestBinary runs on every host without an ISO, an IPSW or
+// a hypervisor: each case fails inside Build before any image work starts,
+// and each asserts the exact diagnostic so that a skipped check cannot pass
+// on the error that the unsupported-host stubs return.
 func TestBuildChecksTheGuestBinary(t *testing.T) {
 	dir := t.TempDir()
-	notExe := filepath.Join(dir, "ownsand-guest")
-	if err := os.WriteFile(notExe, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	script := filepath.Join(dir, "ownsand-guest")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, guest := range []ownsandv1.GuestOs{ownsandv1.GuestOs_GUEST_OS_MACOS, ownsandv1.GuestOs_GUEST_OS_WINDOWS} {
-		err := Build(context.Background(), Options{ImagesDir: dir, GuestOS: guest, ISO: "x.iso", GuestBinary: notExe})
-		if err == nil {
-			t.Fatalf("%v: a script was accepted as the guest helper", guest)
-		}
+	pePath := filepath.Join(dir, "ownsand-guest.exe")
+	if err := os.WriteFile(pePath, minimalWindowsAMD64PE(), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if err := Build(context.Background(), Options{ImagesDir: dir, GuestOS: ownsandv1.GuestOs_GUEST_OS_WINDOWS, GuestBinary: notExe}); err == nil {
-		t.Fatal("a Windows build without an ISO started")
+	// The missing-ISO case is only meaningful when the helper itself is valid.
+	if err := checkWindowsAMD64(pePath); err != nil {
+		t.Fatalf("the PE fixture is not accepted as a Windows amd64 executable: %v", err)
+	}
+	if err := checkWindowsAMD64(script); err == nil {
+		t.Fatal("a script was accepted as a Windows executable")
+	}
+	if err := checkDarwinARM64(script); err == nil {
+		t.Fatal("a script was accepted as a macOS executable")
+	}
+
+	tests := []struct {
+		name       string
+		opts       Options
+		wantPrefix string
+		wantExact  string
+	}{
+		{
+			name:       "macOS rejects a script as the guest helper",
+			opts:       Options{GuestOS: ownsandv1.GuestOs_GUEST_OS_MACOS, IPSW: filepath.Join(dir, "missing.ipsw"), GuestBinary: script},
+			wantPrefix: "imagebuild: the guest helper " + script + " is not a macOS executable: ",
+		},
+		{
+			name:       "Windows rejects a script as the guest helper",
+			opts:       Options{GuestOS: ownsandv1.GuestOs_GUEST_OS_WINDOWS, ISO: filepath.Join(dir, "missing.iso"), GuestBinary: script},
+			wantPrefix: "imagebuild: the guest helper " + script + " is not a Windows executable: ",
+		},
+		{
+			name:      "Windows without an ISO is rejected with a valid helper",
+			opts:      Options{GuestOS: ownsandv1.GuestOs_GUEST_OS_WINDOWS, GuestBinary: pePath},
+			wantExact: "imagebuild: a Windows image build needs --iso <path to a Windows ISO>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.opts.ImagesDir = t.TempDir()
+			err := Build(context.Background(), tt.opts)
+			if err == nil {
+				t.Fatal("Build succeeded")
+			}
+			if tt.wantExact != "" && err.Error() != tt.wantExact {
+				t.Fatalf("Build error = %q; want exactly %q", err.Error(), tt.wantExact)
+			}
+			if !strings.HasPrefix(err.Error(), tt.wantPrefix) {
+				t.Fatalf("Build error = %q; want prefix %q", err.Error(), tt.wantPrefix)
+			}
+		})
 	}
 }
