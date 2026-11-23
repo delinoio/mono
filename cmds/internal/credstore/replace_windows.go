@@ -44,6 +44,37 @@ func replaceFile(src, dst string) error {
 	}
 }
 
+// removeRetryTimeout bounds the retries of a removal that another program
+// blocks for a short time. It is a variable so that tests can shorten it.
+var removeRetryTimeout = replaceRetryTimeout
+
+// removeRetrySleep pauses between two removal attempts. Tests replace it.
+var removeRetrySleep = time.Sleep
+
+// removeFile deletes path and retries for up to removeRetryTimeout while the
+// removal fails with access denied or a sharing violation. A missing file is
+// success, any other error returns at once, and after the timeout the last
+// removal error is returned.
+//
+// Workaround: on Windows, DeleteFile fails with ERROR_SHARING_VIOLATION or
+// ERROR_ACCESS_DENIED while another program holds the file open without
+// FILE_SHARE_DELETE, for the same antivirus and indexer reasons as in
+// replaceFile. The retry applies only to the credential file removal on
+// Windows. Remove it together with the replaceFile retry.
+func removeFile(path string) error {
+	deadline := time.Now().Add(removeRetryTimeout)
+	for {
+		err := os.Remove(path)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if !isTransientReplaceError(err) || time.Now().After(deadline) {
+			return err
+		}
+		removeRetrySleep(replaceRetryInterval)
+	}
+}
+
 func isTransientReplaceError(err error) bool {
 	return errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_SHARING_VIOLATION)
 }
