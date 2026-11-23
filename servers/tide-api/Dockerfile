@@ -2,7 +2,9 @@
 #
 # Runtime image of tide-api. The image build context contains the
 # `dist/tide-api` binary (linux/amd64, CGO disabled), `servers/LICENSE` as
-# `LICENSE` and the Go toolchain license as `GO-LICENSE`, like accounts-api.
+# `LICENSE`, the Go toolchain license as `GO-LICENSE` and the license files of
+# the linked third-party Go modules as `THIRD-PARTY-LICENSES.txt`, like
+# accounts-api.
 # The `deploy` field of package.json makes the Droplet deployment proxy h2c
 # to the container (see docs/servers-tide-api-foundation.md, Runtime and
 # Language).
@@ -57,6 +59,8 @@ COPY --from=claude /claude/claude /usr/local/bin/claude
 COPY LICENSE /usr/share/licenses/tide-api/LICENSE
 # BSD-3-Clause notice of the statically linked Go standard library and runtime.
 COPY GO-LICENSE /usr/share/licenses/tide-api/GO-LICENSE
+# Licenses of the third-party Go modules that the binary links.
+COPY THIRD-PARTY-LICENSES.txt /usr/share/licenses/tide-api/THIRD-PARTY-LICENSES.txt
 # The license notice of Claude Code (the notice of its npm package README).
 COPY --from=claude /claude/NOTICE /usr/share/licenses/claude/NOTICE
 # The pinned claude build is the only one that runs: the orchestrator gets

@@ -2,7 +2,9 @@
 #
 # Runtime image of ownsand-api. The image build context contains the
 # `dist/ownsand-api` binary (linux/amd64, CGO disabled), `servers/LICENSE` as
-# `LICENSE` and the Go toolchain license as `GO-LICENSE`, like accounts-api.
+# `LICENSE`, the Go toolchain license as `GO-LICENSE` and the license files of
+# the linked third-party Go modules as `THIRD-PARTY-LICENSES.txt`, like
+# accounts-api.
 # The `deploy` field of package.json makes the Droplet deployment publish UDP
 # port 3478 for STUN and proxy h2c to the container (see
 # docs/servers-ownsand-api-foundation.md, Runtime and Language).
@@ -12,6 +14,8 @@ COPY dist/ownsand-api /usr/local/bin/ownsand-api
 COPY LICENSE /usr/share/licenses/ownsand-api/LICENSE
 # BSD-3-Clause notice of the statically linked Go standard library and runtime.
 COPY GO-LICENSE /usr/share/licenses/ownsand-api/GO-LICENSE
+# Licenses of the third-party Go modules that the binary links.
+COPY THIRD-PARTY-LICENSES.txt /usr/share/licenses/ownsand-api/THIRD-PARTY-LICENSES.txt
 # A loopback-bound STUN listener cannot receive datagrams that Docker forwards
 # from a published UDP port, so the image listens on the wildcard address. The
 # standalone binary keeps its loopback default; an explicit STUN_ADDR wins.
