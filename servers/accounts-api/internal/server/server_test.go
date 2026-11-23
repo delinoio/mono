@@ -671,11 +671,14 @@ func TestRequestLogBytesForHead(t *testing.T) {
 		wantStatus     int
 		wantBytes      float64
 		wantBodyLength int
+		// wantContentLength is the Content-Length of the representation: the
+		// same for HEAD as for the equivalent GET.
+		wantContentLength int64
 	}{
-		{http.MethodGet, "/healthz", http.StatusOK, 16, 16},
-		{http.MethodHead, "/healthz", http.StatusOK, 0, 0},
-		{http.MethodGet, "/unknown", http.StatusNotFound, 19, 19},
-		{http.MethodHead, "/unknown", http.StatusNotFound, 0, 0},
+		{http.MethodGet, "/healthz", http.StatusOK, 16, 16, 16},
+		{http.MethodHead, "/healthz", http.StatusOK, 0, 0, 16},
+		{http.MethodGet, "/unknown", http.StatusNotFound, 19, 19, 19},
+		{http.MethodHead, "/unknown", http.StatusNotFound, 0, 0, 19},
 	} {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			handler, logs := newTestHandler(t)
@@ -703,8 +706,8 @@ func TestRequestLogBytesForHead(t *testing.T) {
 			}
 			// The response headers must be unchanged for HEAD: the same
 			// Content-Length as the GET, without a body.
-			if tc.method == http.MethodHead && resp.ContentLength <= 0 {
-				t.Errorf("HEAD Content-Length = %d, want the GET body length", resp.ContentLength)
+			if tc.method == http.MethodHead && resp.ContentLength != tc.wantContentLength {
+				t.Errorf("HEAD Content-Length = %d, want %d (the GET body length)", resp.ContentLength, tc.wantContentLength)
 			}
 			// Close waits for in-flight handlers, so the record is complete.
 			ts.Close()
