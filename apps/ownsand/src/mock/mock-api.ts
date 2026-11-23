@@ -1279,13 +1279,20 @@ export function createMockTransport(
           createTime: ts(),
           keyPrefix: value.slice(0, 8),
         });
-        org.apiKeys.unshift(apiKey);
+        // The control plane lists in ascending ID order (UUID v7), so a new key
+        // is last.
+        org.apiKeys.push(apiKey);
         return { apiKey, apiKeySecret: value };
       },
       listApiKeys(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
-        return { apiKeys: org.apiKeys };
+        const { page, nextPageToken } = pageOf(
+          org.apiKeys,
+          req,
+          (k) => k.apiKeyId,
+        );
+        return { apiKeys: page, nextPageToken };
       },
       revokeApiKey(req) {
         const { org, role } = membership(req.organizationId);

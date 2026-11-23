@@ -17,6 +17,7 @@ import {
   SandboxEndReason,
   SandboxState,
 } from "@delino/ownsand-protos/v1/common_pb";
+import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
@@ -1083,6 +1084,71 @@ describe("mock enrollment token list paging", () => {
     const client = createClient(DeviceService, createMockTransport());
     const error = await client
       .listEnrollmentTokens({ organizationId, pageToken: "unknown" })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+  });
+});
+
+describe("mock API key list paging", () => {
+  const organizationId = MOCK_IDS.acme;
+
+  async function withKeys(count: number) {
+    const client = createClient(ApiKeyService, createMockTransport());
+    const ids: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const { apiKey } = await client.createApiKey({
+        organizationId,
+        name: `key-${i}`,
+      });
+      ids.push(apiKey!.apiKeyId);
+    }
+    return { client, ids };
+  }
+
+  test("returns the first 50 rows by default and a token after a full page", async () => {
+    const { client } = await withKeys(60);
+    const first = await client.listApiKeys({ organizationId });
+    expect(first.apiKeys).toHaveLength(50);
+    expect(first.nextPageToken).not.toBe("");
+    const second = await client.listApiKeys({
+      organizationId,
+      pageToken: first.nextPageToken,
+    });
+    // One seeded and 60 created keys.
+    expect(second.apiKeys).toHaveLength(11);
+    expect(second.nextPageToken).toBe("");
+  });
+
+  test("walks every page once, in creation order, and lists a new key last", async () => {
+    const { client, ids } = await withKeys(5);
+    const walked: string[] = [];
+    let pageToken = "";
+    do {
+      const page = await client.listApiKeys({
+        organizationId,
+        pageSize: 2,
+        pageToken,
+      });
+      walked.push(...page.apiKeys.map((k) => k.apiKeyId));
+      pageToken = page.nextPageToken;
+    } while (pageToken !== "");
+    expect(walked).toHaveLength(6);
+    expect(new Set(walked).size).toBe(6);
+    expect(walked.slice(1)).toEqual(ids);
+  });
+
+  test("caps a page at 200 rows", async () => {
+    const { client } = await withKeys(205);
+    const page = await client.listApiKeys({ organizationId, pageSize: 1000 });
+    expect(page.apiKeys).toHaveLength(200);
+    expect(page.nextPageToken).not.toBe("");
+  });
+
+  test("rejects a token that names no row", async () => {
+    const client = createClient(ApiKeyService, createMockTransport());
+    const error = await client
+      .listApiKeys({ organizationId, pageToken: "unknown" })
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ConnectError);
     expect((error as ConnectError).code).toBe(Code.InvalidArgument);
