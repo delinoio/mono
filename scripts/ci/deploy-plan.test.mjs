@@ -1408,6 +1408,11 @@ test("repository deployables use the documented targets", () => {
       .needs,
     ["accounts-api"],
   );
+  // tide-api calls ownsand-api, so ownsand-api deploys first.
+  assert.deepEqual(
+    packages.find((p) => p.manifest.name === "tide-api").manifest.deploy.needs,
+    ["ownsand-api"],
+  );
   assert.deepEqual(
     result.staticSites.map((d) => [d.name, d.project, d.output]),
     [

@@ -8,7 +8,10 @@
     "service": "tide-api",
     "hostname": "tide.api.delino.io",
     "port": 8080,
-    "upstreamProtocol": "h2c"
+    "upstreamProtocol": "h2c",
+    "needs": [
+      "ownsand-api"
+    ]
   },
   "scripts": {
     "build": "go build -buildvcs=false -o dist/tide-api ./cmd/tide-api",
