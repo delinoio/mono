@@ -30,6 +30,10 @@ import {
 } from "react";
 import { billingReasonOf } from "../api.ts";
 import { useAuth } from "../auth.tsx";
+import {
+  focusPageHeadingAfterClose,
+  focusPendingPageHeading,
+} from "./focus.ts";
 import { ACCOUNTS_URL } from "../config.ts";
 import { errorMessage, labels } from "../format.ts";
 import type { FollowedPages } from "../pagination.ts";
@@ -43,10 +47,14 @@ export function PageHeader({
   description?: ReactNode;
   action?: ReactNode;
 }) {
+  // A navigation that found no heading yet focuses this one once it mounts.
+  useEffect(focusPendingPageHeading, []);
   return (
     <header className="page-header">
       <div>
-        <h1>{title}</h1>
+        {/* `tabIndex` -1 makes the heading a focus target for the fallback
+            after a dialog or a navigation; it stays out of the Tab order. */}
+        <h1 tabIndex={-1}>{title}</h1>
         {description ? <p className="muted">{description}</p> : null}
       </div>
       {action ? <div className="page-header-action">{action}</div> : null}
@@ -393,6 +401,7 @@ export function SecretDialog({
       onOpenChange={(open) => {
         if (!open) onClose();
       }}
+      onOpenChangeComplete={focusPageHeadingAfterClose}
     >
       <DialogContent>
         <DialogTitle>{title}</DialogTitle>
@@ -517,6 +526,7 @@ export function ConfirmDialog({
   return (
     <AlertDialog
       open={open}
+      onOpenChangeComplete={focusPageHeadingAfterClose}
       onOpenChange={(next) => {
         if (!next) {
           dialogOpening.end();
@@ -610,6 +620,7 @@ export function FormDialog({
   return (
     <Dialog
       open={open}
+      onOpenChangeComplete={focusPageHeadingAfterClose}
       onOpenChange={(next) => {
         if (!next) {
           dialogOpening.end();

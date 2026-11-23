@@ -249,6 +249,35 @@ describe("devices", () => {
     await expect(screen.getByText("The token is revoked.")).toBeVisible();
     await expect(screen.getByText("Not used", { exact: false })).toBeHidden();
   });
+
+  test("moves the focus to the page heading after a confirmed removal", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/members`);
+    const heading = screen.getByRole("heading", "Members", { level: 1 });
+    await expect(heading).toHaveAttribute("tabindex", "-1");
+
+    // Escape keeps the focus on the opener.
+    const remove = screen.getByRole("button", "Remove Jun Park");
+    await remove.focus();
+    await browser.keyboard.press("Enter");
+    await expect(screen.getByRole("alertdialog")).toBeVisible();
+    await browser.keyboard.press("Escape");
+    await expect(remove).toBeFocused();
+
+    // A confirmed removal deletes the opener, so the heading gets the focus.
+    await browser.keyboard.press("Enter");
+    await screen
+      .getByRole("alertdialog")
+      .getByRole("button", "Remove member")
+      .tap();
+    await expect(screen.getByText("Jun Park")).toBeHidden();
+    await expect(heading).toBeFocused();
+  });
 });
 
 describe("roles", () => {
