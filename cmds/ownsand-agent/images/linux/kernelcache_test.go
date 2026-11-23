@@ -35,6 +35,8 @@ const (
 // so the overlap does not depend on timing), then writes $STUB_BODY to the
 // -o file. With STUB_PARTIAL set it writes only the first bytes and fails
 // with the curl exit status 18 (partial file), like an interrupted download.
+// With STUB_MKDIR set it first creates that directory, like another process
+// that puts a directory at the archive path during the download.
 const stubCurl = `#!/usr/bin/env bash
 out=""
 while [ "$#" -gt 0 ]; do
@@ -44,6 +46,9 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 echo call >> "$STUB_CALLS"
+if [ -n "${STUB_MKDIR:-}" ]; then
+  mkdir -p "$STUB_MKDIR"
+fi
 if [ -n "${STUB_BARRIER:-}" ]; then
   : > "$STUB_BARRIER/started.$$"
   for _ in $(seq 1 600); do
@@ -241,6 +246,63 @@ func TestChecksumMismatchPublishesNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(f.archive()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the archive path exists after a failed verification: %v", err)
+	}
+	f.requireNoLeftovers()
+}
+
+func TestDirectoryAtArchivePathIsRejected(t *testing.T) {
+	f := newFill(t)
+	sentinel := filepath.Join(f.archive(), "sentinel")
+	if err := os.MkdirAll(f.archive(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := f.body("good", goodBody)
+	out, err := f.run(body)
+	if err == nil {
+		t.Fatalf("fill succeeded with a directory at the archive path\n%s", out)
+	}
+	if !strings.Contains(out, f.archive()) || !strings.Contains(out, "is a directory") {
+		t.Fatalf("output does not name the directory path:\n%s", out)
+	}
+	if got := f.callCount(); got != 0 {
+		t.Fatalf("downloader calls = %d, want 0", got)
+	}
+	// The directory holds its sentinel and nothing else: no temporary
+	// download was moved into it.
+	entries, err := os.ReadDir(f.archive())
+	if err != nil {
+		t.Fatalf("read the directory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "sentinel" {
+		t.Fatalf("the directory changed: %v", entries)
+	}
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "keep" {
+		t.Fatalf("the sentinel changed: %q, %v", got, err)
+	}
+	// Nothing beside the directory either.
+	f.requireNoLeftovers()
+}
+
+// A directory that appears at the archive path after the early check (a
+// race with another process) must also fail the publication and must not
+// receive the archive. The stub curl creates the directory during the
+// download, which is after the early check and before the rename.
+func TestDirectoryAppearingBeforePublishIsRejected(t *testing.T) {
+	f := newFill(t)
+	body := f.body("good", goodBody)
+	out, err := f.run(body, "STUB_MKDIR="+f.archive())
+	if err == nil {
+		t.Fatalf("fill succeeded although a directory took the archive path\n%s", out)
+	}
+	entries, err := os.ReadDir(f.archive())
+	if err != nil {
+		t.Fatalf("read the directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("the archive or a temporary file was moved into the directory: %v", entries)
 	}
 	f.requireNoLeftovers()
 }
