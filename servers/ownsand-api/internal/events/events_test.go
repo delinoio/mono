@@ -164,6 +164,42 @@ func TestSeveralEventsInOneTransaction(t *testing.T) {
 	}
 }
 
+// waitForAdvisoryLockWait polls pg_stat_activity from a separate connection
+// until the backend pid waits for an advisory lock. It fails the test when
+// the commit finishes first or the wait is not observed within the deadline.
+func waitForAdvisoryLockWait(t *testing.T, d *db.DB, pid int, committed <-chan error) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waitType, waitEvent *string
+		describe := func(v *string) string {
+			if v == nil {
+				return "none"
+			}
+			return *v
+		}
+		err := d.Pool.QueryRow(ctx,
+			"SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1", pid,
+		).Scan(&waitType, &waitEvent)
+		if err != nil {
+			t.Fatalf("read the wait event of backend %d: %v", pid, err)
+		}
+		if waitType != nil && waitEvent != nil && *waitType == "Lock" && *waitEvent == "advisory" {
+			return
+		}
+		select {
+		case err := <-committed:
+			t.Fatalf("B committed without waiting for the event lock while A held it: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backend %d did not wait for the advisory event lock within 10s (wait event %s/%s)", pid, describe(waitType), describe(waitEvent))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestCommitsOfEventWritersAreSerialized forces the trigger of one
 // transaction to run before its commit (SET CONSTRAINTS ALL IMMEDIATE): that
 // transaction then holds the advisory lock until it commits, so the commit
@@ -184,12 +220,19 @@ func TestCommitsOfEventWritersAreSerialized(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, txB, devB)
+	var pidB int
+	if err := txB.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidB); err != nil {
+		t.Fatal(err)
+	}
 	committed := make(chan error, 1)
 	go func() { committed <- txB.Commit(ctx) }()
+	// Wait until the backend of B reports that it waits for an advisory
+	// lock. A sleep alone would also pass when B committed only after A.
+	waitForAdvisoryLockWait(t, d, pidB, committed)
 	select {
 	case err := <-committed:
 		t.Fatalf("B committed while A held the event lock: %v", err)
-	case <-time.After(300 * time.Millisecond):
+	default:
 	}
 	if got, _ := poll(t, d, start); len(got) != 0 {
 		t.Fatalf("poll while A is committing = %v, want none", got)
