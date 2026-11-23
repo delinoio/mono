@@ -33,6 +33,14 @@ import (
 // status and the Connect error code of the response ("" for a success).
 func rawPost(t *testing.T, env *testenv.Env, procedure, contentType, encoding, bearer string, body []byte) (int, string) {
 	t.Helper()
+	status, code, _ := rawPostError(t, env, procedure, contentType, encoding, bearer, body)
+	return status, code
+}
+
+// rawPostError is rawPost that also returns the Connect error message of the
+// response ("" for a success).
+func rawPostError(t *testing.T, env *testenv.Env, procedure, contentType, encoding, bearer string, body []byte) (int, string, string) {
+	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, env.Server.URL+procedure, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -51,15 +59,16 @@ func rawPost(t *testing.T, env *testenv.Env, procedure, contentType, encoding, b
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusOK {
-		return resp.StatusCode, ""
+		return resp.StatusCode, "", ""
 	}
 	var e struct {
-		Code string `json:"code"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
 	}
 	if err := json.Unmarshal(data, &e); err != nil {
 		t.Fatalf("POST %s: status %d with a body that is no Connect error: %q", procedure, resp.StatusCode, data)
 	}
-	return resp.StatusCode, e.Code
+	return resp.StatusCode, e.Code, e.Message
 }
 
 func gzipBytes(t *testing.T, b []byte) []byte {
@@ -168,11 +177,13 @@ func TestRequestSizeLimit(t *testing.T) {
 		}
 	})
 	t.Run("a message of exactly the limit is read", func(t *testing.T) {
-		// The padded enroll request is invalid, which the handler reports
-		// after it read the message; the size limit does not.
-		status, code := rawPost(t, env, enroll, "application/proto", "", "", enrollRequestOfSize(t, api.MaxRequestBytes))
-		if code == "resource_exhausted" {
-			t.Fatalf("a message of exactly %d bytes was rejected: status %d", api.MaxRequestBytes, status)
+		// The padded enroll request carries no public key, which the handler
+		// reports after it read the message; the size limit does not. Pin
+		// the exact validation error so that any failure before the handler
+		// (authentication, content type, a server error) fails the test.
+		status, code, message := rawPostError(t, env, enroll, "application/proto", "", "", enrollRequestOfSize(t, api.MaxRequestBytes))
+		if status != http.StatusBadRequest || code != "invalid_argument" || !strings.Contains(message, "invalid public_key") {
+			t.Fatalf("a message of exactly %d bytes: status %d code %q message %q, want 400 invalid_argument with the public_key validation message from the handler", api.MaxRequestBytes, status, code, message)
 		}
 	})
 }
