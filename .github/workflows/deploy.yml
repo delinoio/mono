@@ -643,13 +643,11 @@ jobs:
         env:
           BINARIES: ${{ needs.plan.outputs.binaries }}
         run: scripts/ci/release-binaries.sh assemble "$RUNNER_TEMP/artifacts" "$RUNNER_TEMP/assets"
-      - name: Create the GitHub Releases
+      - name: Check for update manifests
+        id: manifests
         env:
           BINARIES: ${{ needs.plan.outputs.binaries }}
-          SHA: ${{ needs.plan.outputs.sha }}
-          REPOSITORY: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
-        run: scripts/ci/release-binaries.sh github-releases "$RUNNER_TEMP/assets"
+        run: scripts/ci/release-binaries.sh has-manifests
       - name: Download the current release manifests
         env:
           BINARIES: ${{ needs.plan.outputs.binaries }}
@@ -670,6 +668,33 @@ jobs:
           RELEASE_MANIFEST_TOOL: ${{ runner.temp }}/artifacts/tools/release-manifest
           OWNSAND_AGENT_RELEASE_SIGNING_KEY: ${{ secrets.OWNSAND_AGENT_RELEASE_SIGNING_KEY }}
         run: scripts/ci/release-binaries.sh sign-manifests "$RUNNER_TEMP/manifests"
+      - name: Create the GitHub Releases
+        # After the signed manifest is prepared and signed, so that every check
+        # against it (staged digests, existing assets of a version the manifest
+        # already lists) runs before the first change to a GitHub Release.
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/release-binaries.sh github-releases "$RUNNER_TEMP/assets" "$RUNNER_TEMP/manifests"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        # The signed manifests, to restore the bucket by hand when an upload
+        # stopped between the manifest and its signature. Saved after signing
+        # and before the first R2 upload, and required for a release with an
+        # update manifest: when the artifact cannot be stored, the job stops
+        # before either upload instead of leaving a half-written pair without
+        # a recovery copy. A release without an update manifest has no
+        # manifests and skips the step. The name carries the attempt: an
+        # artifact name is unique within a run, and a rerun keeps the run ID,
+        # so a fixed name would fail the upload of a later attempt and hide
+        # the files of the attempt that wrote the incomplete pair.
+        if: steps.manifests.outputs.has_manifests == 'true'
+        with:
+          name: release-manifests-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/manifests
+          if-no-files-found: error
+          retention-days: 30
       - name: Upload the manifests
         env:
           BINARIES: ${{ needs.plan.outputs.binaries }}
@@ -678,12 +703,3 @@ jobs:
           RELEASES_R2_SECRET_ACCESS_KEY: ${{ secrets.RELEASES_R2_SECRET_ACCESS_KEY }}
           RELEASES_R2_BUCKET: ${{ secrets.RELEASES_R2_BUCKET }}
         run: scripts/ci/release-binaries.sh upload-manifests "$RUNNER_TEMP/manifests"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        # The signed manifests, to restore the bucket by hand when an upload
-        # stopped between the manifest and its signature.
-        if: always()
-        with:
-          name: release-manifests
-          path: ${{ runner.temp }}/manifests
-          if-no-files-found: ignore
-          retention-days: 30

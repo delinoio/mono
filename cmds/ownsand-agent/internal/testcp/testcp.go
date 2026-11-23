@@ -77,6 +77,25 @@ type Server struct {
 	stallNext  bool
 	stallCh    bool
 	stallAuth  bool
+	stallEnr   bool
+	enrollKeys []ed25519.PublicKey
+}
+
+// EnrollPublicKeys returns the public key of every Enroll call that reached
+// the fake, in order, including a call that stalled.
+func (s *Server) EnrollPublicKeys() []ed25519.PublicKey {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ed25519.PublicKey(nil), s.enrollKeys...)
+}
+
+// StallNextEnroll makes the fake accept the next Enroll call and never
+// answer it. The call ends when its client gives up. Later calls answer
+// normally.
+func (s *Server) StallNextEnroll() {
+	s.mu.Lock()
+	s.stallEnr = true
+	s.mu.Unlock()
 }
 
 // StallNextCreateChallenge makes the fake accept the next CreateChallenge
@@ -161,7 +180,14 @@ func randomToken(prefix string) string {
 }
 
 // Enroll implements AgentService.
-func (s *Server) Enroll(_ context.Context, req *connect.Request[ownsandv1.EnrollRequest]) (*connect.Response[ownsandv1.EnrollResponse], error) {
+func (s *Server) Enroll(ctx context.Context, req *connect.Request[ownsandv1.EnrollRequest]) (*connect.Response[ownsandv1.EnrollResponse], error) {
+	s.mu.Lock()
+	s.enrollKeys = append(s.enrollKeys, append(ed25519.PublicKey(nil), req.Msg.GetPublicKey()...))
+	s.mu.Unlock()
+	if s.stalled(&s.stallEnr) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if req.Msg.GetEnrollmentToken() != Token || len(req.Msg.GetPublicKey()) != ed25519.PublicKeySize {
 		return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("invalid enrollment token"))
 	}
