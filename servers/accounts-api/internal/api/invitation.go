@@ -161,10 +161,12 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 	if err != nil {
 		return nil, h.internal(ctx, "create_invitation", err)
 	}
-	now := h.timestamp()
+	// The creation and expiry times are read inside the transaction, after the
+	// account lock, so a wait for the lock cannot leave them behind the clock
+	// of the pending check and the stored row.
+	var now time.Time
 	inv := invitation{
 		ID: id, BillingAccountID: accountID, Email: addr, Role: role, InviterUserID: userID,
-		CreateTime: now, ExpireTime: now.Add(InvitationLifetime),
 	}
 	var msg email.Message
 	audit := &auditLog{}
@@ -176,6 +178,8 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 		if err := require(account, PermissionManage); err != nil {
 			return err
 		}
+		now = h.timestamp()
+		inv.CreateTime, inv.ExpireTime = now, now.Add(InvitationLifetime)
 		var pending bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM billing_account_invitations
 			WHERE billing_account_id = $1 AND email_key = $2 AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $3)`,
