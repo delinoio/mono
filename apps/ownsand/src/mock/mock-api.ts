@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
+import {
+  clone,
+  create,
+  type MessageInitShape,
+  toBinary,
+} from "@bufbuild/protobuf";
 import {
   type Duration,
   type Timestamp,
   timestampFromMs,
+  timestampMs,
 } from "@bufbuild/protobuf/wkt";
 import {
   Code,
@@ -1070,7 +1076,23 @@ export function createMockTransport(
       listEnrollmentTokens(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
-        return { tokens: org.tokens };
+        // The control plane derives EXPIRED when it reads an unused, unrevoked
+        // token at or after its expiry. The stored record stays PENDING, so the
+        // list returns a copy and a later revoke still finds a pending token.
+        const at = now();
+        return {
+          tokens: org.tokens.map((t) =>
+            t.state === EnrollmentTokenState.PENDING &&
+            t.expireTime !== undefined &&
+            at >= timestampMs(t.expireTime)
+              ? (() => {
+                  const expired = clone(EnrollmentTokenSchema, t);
+                  expired.state = EnrollmentTokenState.EXPIRED;
+                  return expired;
+                })()
+              : t,
+          ),
+        };
       },
       revokeEnrollmentToken(req) {
         const { org, role } = membership(req.organizationId);

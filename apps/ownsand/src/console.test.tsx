@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  rs,
+  test,
+} from "@rstest/core";
 import { create } from "@bufbuild/protobuf";
 import { StrictMode } from "react";
 import {
@@ -3263,5 +3270,48 @@ describe("a failed refetch of loaded data", () => {
     ).toBeTruthy();
     expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
     expect(screen.queryByText(/ci-runner/)).toBeNull();
+  });
+});
+
+describe("enrollment token expiry", () => {
+  afterEach(() => {
+    rs.useRealTimers();
+  });
+
+  test("a refreshed list shows an expired token as Expired without a Revoke button", async () => {
+    const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+    // Only Date is faked: the page and its queries keep real timers. The UI
+    // offers whole-hour lifetimes, so the test creates a one-second token
+    // through the same transport and moves the clock past it.
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(t0);
+    const transport = createMockTransport();
+    const { token } = await createClient(
+      DeviceService,
+      transport,
+    ).createEnrollmentToken({
+      organizationId: MOCK_IDS.acme,
+      ttl: { seconds: 1n },
+    });
+    const rowOf = async () =>
+      within(await screen.findByRole("list", { name: "Enrollment tokens" }))
+        .getAllByRole("listitem")
+        .find((row) => row.textContent?.includes(token!.tokenPrefix));
+
+    renderConsole(`/orgs/${MOCK_IDS.acme}/enrollment-tokens`, { transport });
+    const pending = await rowOf();
+    expect(pending?.textContent).toContain("Not used");
+    expect(
+      within(pending as HTMLElement).getByRole("button", { name: "Revoke" }),
+    ).toBeTruthy();
+
+    cleanup();
+    rs.setSystemTime(t0 + 2000);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/enrollment-tokens`, { transport });
+    const expired = (await rowOf()) as HTMLElement;
+    expect(expired.textContent).toContain("Expired");
+    expect(within(expired).queryByRole("button", { name: "Revoke" })).toBe(
+      null,
+    );
   });
 });

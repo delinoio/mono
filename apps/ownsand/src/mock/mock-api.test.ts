@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
-import { describe, expect, test } from "@rstest/core";
+import { afterEach, describe, expect, rs, test } from "@rstest/core";
 import {
   BillingMeter,
   BillingPhase,
@@ -10,6 +10,7 @@ import {
   BaseImage,
   BillingReason,
   DeviceState,
+  EnrollmentTokenState,
   ErrorDetailSchema,
   GuestOs,
   Role,
@@ -843,5 +844,91 @@ describe("mock updateMemberRole", () => {
     expect(error).toBeInstanceOf(ConnectError);
     expect((error as ConnectError).code).toBe(Code.PermissionDenied);
     expect(await rolesOf(client)).toEqual(before);
+  });
+});
+
+describe("mock enrollment token expiry", () => {
+  const organizationId = MOCK_IDS.acme;
+  const T0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+
+  afterEach(() => {
+    rs.useRealTimers();
+  });
+
+  const createShortToken = async (
+    client: ReturnType<typeof createClient<typeof DeviceService>>,
+    seconds: number,
+  ) => {
+    const { token } = await client.createEnrollmentToken({
+      organizationId,
+      ttl: { seconds: BigInt(seconds) },
+    });
+    return token!.enrollmentTokenId;
+  };
+  const stateOf = async (
+    client: ReturnType<typeof createClient<typeof DeviceService>>,
+    id: string,
+  ) => {
+    const { tokens } = await client.listEnrollmentTokens({ organizationId });
+    return tokens.find((t) => t.enrollmentTokenId === id)?.state;
+  };
+
+  test("an unused token is PENDING before expiry and EXPIRED at and after it", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(T0);
+    const client = createClient(DeviceService, createMockTransport());
+    const id = await createShortToken(client, 1);
+
+    expect(await stateOf(client, id)).toBe(EnrollmentTokenState.PENDING);
+    rs.setSystemTime(T0 + 999);
+    expect(await stateOf(client, id)).toBe(EnrollmentTokenState.PENDING);
+    rs.setSystemTime(T0 + 1000);
+    expect(await stateOf(client, id)).toBe(EnrollmentTokenState.EXPIRED);
+    rs.setSystemTime(T0 + 2000);
+    expect(await stateOf(client, id)).toBe(EnrollmentTokenState.EXPIRED);
+  });
+
+  test("the list returns a copy and keeps the stored record and the order", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(T0);
+    const client = createClient(DeviceService, createMockTransport());
+    const first = await createShortToken(client, 1);
+    const second = await createShortToken(client, 3600);
+    const idsOf = async () =>
+      (await client.listEnrollmentTokens({ organizationId })).tokens.map(
+        (t) => t.enrollmentTokenId,
+      );
+    const before = await idsOf();
+    expect(before.slice(0, 2)).toEqual([second, first]);
+
+    rs.setSystemTime(T0 + 2000);
+    expect(await idsOf()).toEqual(before);
+    expect(await stateOf(client, first)).toBe(EnrollmentTokenState.EXPIRED);
+    expect(await stateOf(client, second)).toBe(EnrollmentTokenState.PENDING);
+
+    // The stored record is still pending, so the clock moving back shows it.
+    rs.setSystemTime(T0);
+    expect(await stateOf(client, first)).toBe(EnrollmentTokenState.PENDING);
+  });
+
+  test("a used and a revoked token keep their state after expiry", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(T0);
+    const client = createClient(DeviceService, createMockTransport());
+    const revoked = await createShortToken(client, 1);
+    await client.revokeEnrollmentToken({
+      organizationId,
+      enrollmentTokenId: revoked,
+    });
+    const used = (
+      await client.listEnrollmentTokens({ organizationId })
+    ).tokens.find((t) => t.state === EnrollmentTokenState.USED);
+    expect(used).toBeDefined();
+
+    rs.setSystemTime(T0 + 3 * 24 * 3600 * 1000);
+    expect(await stateOf(client, revoked)).toBe(EnrollmentTokenState.REVOKED);
+    expect(await stateOf(client, used!.enrollmentTokenId)).toBe(
+      EnrollmentTokenState.USED,
+    );
   });
 });
