@@ -412,7 +412,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		u, err := url.Parse(v)
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
 			// A bare "?" leaves u.RawQuery empty and only sets u.ForceQuery, so check it too. The origin has no query, empty or not.
-			u.ForceQuery || u.Fragment != "" || strings.Contains(v, "#") {
+			// User information (user, user:password or an empty "@") is not part of an origin,
+			// and it would send credentials to the accounts API in every request URL.
+			u.ForceQuery || u.User != nil || u.Fragment != "" || strings.Contains(v, "#") {
 			return Config{}, fmt.Errorf("%s must be an origin such as https://accounts.api.delino.io", EnvAccountsAPIOrigin)
 		}
 		cfg.Accounts.APIOrigin = strings.TrimSuffix(v, "/")
