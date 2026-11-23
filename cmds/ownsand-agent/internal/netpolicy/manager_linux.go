@@ -249,15 +249,18 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 	m.mu.Unlock()
 	link, _ := LinkFor(idx)
 	tap := TapName(idx)
-	// applied is true once a refresh succeeded with this sandbox's DNS
-	// assignment staged, so that the ruleset may hold its exception.
-	applied := false
+	// staged is true once this sandbox's DNS assignment is in m.gateways.
+	// From then on any refresh may apply it, including a refresh that runs
+	// independently of this attach (the periodic poll or another attach), so
+	// the ruleset may hold the exception even when this attach's own refresh
+	// failed.
+	staged := false
 	fail := func(err error) (Link, string, error) {
 		// A failed attach leaves no DNS exception: unstage the assignment
-		// and, when a refresh already applied it, apply the ruleset
-		// without it.
+		// and, when it was staged, apply the ruleset without it. The refresh
+		// does nothing when the ruleset never held the exception.
 		m.unstage(tap)
-		if applied {
+		if staged {
 			if rerr := m.refresh(); rerr != nil {
 				m.logger.Error("network policy refresh after failed setup failed", "sandbox_id", sandboxID, "tap", tap, "error", rerr)
 			}
@@ -283,11 +286,11 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 	}
 	m.mu.Lock()
 	m.gateways[tap] = TapGateway{Tap: tap, Gateway: link.Gateway, Guest: link.Guest}
+	staged = true
 	m.mu.Unlock()
 	if err := m.refresh(); err != nil {
 		return fail(err)
 	}
-	applied = true
 	dns, err := m.startDNS(netip.AddrPortFrom(link.Gateway, 53), HostResolver("/etc/resolv.conf"), m.logger)
 	if err != nil {
 		return fail(fmt.Errorf("netpolicy: start DNS forwarder: %w", err))
