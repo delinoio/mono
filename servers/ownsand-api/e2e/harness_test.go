@@ -691,11 +691,20 @@ func (s *stack) startAPI(env []string) {
 }
 
 // restartAPI starts the control plane again on the same address over the
-// same database.
+// same database and waits until the replacement process itself is healthy.
+//
+// The wait stops at once when the replacement exits, and an answer on the
+// address counts only after the replacement logged "server_started", which
+// it does after it bound the listener. Another server that holds the address
+// therefore cannot stand in for the replacement.
 func (s *stack) restartAPI() {
 	s.t.Helper()
-	s.api = startProcess(s.t, s.logs, "api-restarted", s.apiEnv, filepath.Join(s.bins, "ownsand-api"))
-	s.waitHealthy()
+	const name = "api-restarted"
+	s.api = startProcess(s.t, s.logs, name, s.apiEnv, filepath.Join(s.bins, "ownsand-api"))
+	owned := func() bool { return s.logs.hasLogMessage(name, "server_started") }
+	if err := pollReadyWhile(s.apiURL+"/healthz", healthStartupBudget, s.api.done, owned); err != nil {
+		s.t.Fatalf("the restarted control plane did not become healthy: %v", err)
+	}
 }
 
 func randomSuffix(t *testing.T) string {
@@ -719,13 +728,6 @@ const healthStartupBudget = 60 * time.Second
 // healthPollInterval is the delay between health probes.
 const healthPollInterval = 200 * time.Millisecond
 
-func (s *stack) waitHealthy() {
-	s.t.Helper()
-	if err := pollHealthy(s.apiURL+"/healthz", healthStartupBudget); err != nil {
-		s.t.Fatalf("the control plane did not become healthy: %v", err)
-	}
-}
-
 // pollHealthy probes url until it answers 200. The budget covers the HTTP
 // requests too, so a connection that is accepted but never answered cannot
 // outlive it.
@@ -742,6 +744,26 @@ var errProcessExited = errors.New("the process exited")
 // from another server on the same port does not count. A nil exited never
 // closes.
 func pollHealthyWhile(url string, budget time.Duration, exited <-chan struct{}) error {
+	return pollReadyWhile(url, budget, exited, nil)
+}
+
+// errNotOwned describes a healthy answer that the probed process cannot be
+// shown to have given yet.
+var errNotOwned = errors.New("answered 200 before the process reported that it owns the listener")
+
+// pollReadyWhile is pollHealthyWhile with a process-ownership check: when
+// owned is not nil, a 200 counts only after owned reports true. owned is how
+// the caller shows that the probed process itself bound the listener, for
+// example by its "server_started" log record, so a 200 from another server
+// that holds the address does not count even before the probed process has
+// exited.
+//
+// The exit channel is consulted before a 200 is accepted, so a server that
+// answers while the probed process is already gone never wins the race with
+// the exit. The error of a timeout keeps the last observed status: the final
+// probe usually ends with the context deadline, and that error must not hide
+// it.
+func pollReadyWhile(url string, budget time.Duration, exited <-chan struct{}, owned func() bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	var lastErr error
@@ -754,13 +776,21 @@ func pollHealthyWhile(url string, budget time.Duration, exited <-chan struct{}) 
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return nil
+				select {
+				case <-exited:
+					return fmt.Errorf("%w before it became healthy (last probe: answered 200 from another listener)", errProcessExited)
+				default:
+				}
+				if owned == nil || owned() {
+					return nil
+				}
+				err = errNotOwned
+			} else {
+				err = fmt.Errorf("unexpected status %d", resp.StatusCode)
 			}
-			err = fmt.Errorf("unexpected status %d", resp.StatusCode)
 		}
 		// A probe that ended because the budget expired carries no news about
-		// the process; keep the earlier error, such as the last status, so the
-		// timeout error still reports it.
+		// the process; keep the earlier error, such as the last status.
 		if ctx.Err() == nil || lastErr == nil {
 			lastErr = err
 		}

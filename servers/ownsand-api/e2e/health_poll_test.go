@@ -111,3 +111,63 @@ func TestPollHealthyWhileStopsWhenTheProcessExited(t *testing.T) {
 		t.Fatalf("pollHealthyWhile took %s, want it to stop when the process exited", d)
 	}
 }
+
+// A 200 from another server on the address does not count when the probed
+// process exited, even though that answer arrives at once: the exit channel
+// is consulted before the 200 is accepted.
+func TestPollHealthyWhileIgnoresA200AfterTheProcessExited(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	exited := make(chan struct{})
+	close(exited)
+
+	start := time.Now()
+	err := pollHealthyWhile(srv.URL, 10*time.Second, exited)
+	if !errors.Is(err, errProcessExited) {
+		t.Fatalf("pollHealthyWhile = %v, want errProcessExited", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("pollHealthyWhile took %s, want it to stop when the process exited", d)
+	}
+}
+
+// A 200 counts only after the process shows that it owns the listener, so
+// another server that holds the address cannot stand in for it while the
+// process is still running.
+func TestPollReadyWhileWaitsForOwnership(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var checks atomic.Int32
+	owned := func() bool { return checks.Add(1) > 3 }
+	if err := pollReadyWhile(srv.URL, 10*time.Second, nil, owned); err != nil {
+		t.Fatalf("pollReadyWhile: %v", err)
+	}
+	if got := checks.Load(); got != 4 {
+		t.Fatalf("ownership checks = %d, want 4 (the 200 must not count before the process owns the listener)", got)
+	}
+}
+
+// A process that never owns the listener fails when it exits, promptly and
+// with the process-exit error, although another server answers 200.
+func TestPollReadyWhileFailsPromptlyWhenTheProcessExitsUnowned(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	exited := make(chan struct{})
+	time.AfterFunc(300*time.Millisecond, func() { close(exited) })
+
+	start := time.Now()
+	err := pollReadyWhile(srv.URL, 10*time.Second, exited, func() bool { return false })
+	if !errors.Is(err, errProcessExited) {
+		t.Fatalf("pollReadyWhile = %v, want errProcessExited", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("pollReadyWhile took %s, want it to stop when the process exited", d)
+	}
+}
