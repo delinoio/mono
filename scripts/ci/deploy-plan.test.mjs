@@ -1398,6 +1398,7 @@ test("repository deployables use the documented targets", () => {
         "h2c",
         "3478",
       ],
+      ["tide-api", "tide-api", "tide.api.delino.io", "8080", "h2c", "none"],
     ],
   );
   // The billing rollout deploys accounts-api before ownsand-api.

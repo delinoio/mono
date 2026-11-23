@@ -396,6 +396,8 @@ importers:
 
   servers/ownsand-api: {}
 
+  servers/tide-api: {}
+
 packages:
 
   '@ai-sdk/gateway@4.0.150':

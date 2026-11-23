@@ -181,12 +181,13 @@ const goWorkspaceInputs = new Set([
   "pnpm-workspace.yaml",
 ]);
 
-// The accounts-api and ownsand-api schema migrations, embedded into each
-// service and applied by the Postgres-backed tests (and the OwnSand end-to-end
-// suite) that the go-test job runs.
+// The accounts-api, ownsand-api and tide-api schema migrations, embedded into
+// each service and applied by the Postgres-backed tests (and the OwnSand
+// end-to-end suite) that the go-test job runs.
 const goMigrations = [
   "servers/accounts-api/internal/db/migrations/",
   "servers/ownsand-api/internal/db/migrations/",
+  "servers/tide-api/internal/db/migrations/",
 ];
 
 // The relay request digest vectors are read by the Go relaybinding tests and by

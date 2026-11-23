@@ -2,14 +2,14 @@
 
 ## Scope
 
-This contract owns the `tide-api` control plane of [`tide`](project-tide.md) at `servers/tide-api/` (`planned`). The control plane is the system of record for tide organizations, memberships, OwnSand links, GitHub installations, agent integrations, runner profiles, requests, runners, personal API keys and audit events. It receives demand from GitHub, from the agent vendors and from users who ask for dev sessions, keeps one queue per organization, creates and deletes runners through the OwnSand API, and starts the runner programs in them. For dev sessions, it relays the owner's commands and file transfers to the OwnSand data path.
+This contract owns the `tide-api` control plane of [`tide`](project-tide.md) at `servers/tide-api/`. The control plane is the system of record for tide organizations, memberships, OwnSand links, GitHub installations, agent integrations, runner profiles, requests, runners, personal API keys and audit events. It receives demand from GitHub, from the agent vendors and from users who ask for dev sessions, keeps one queue per organization, creates and deletes runners through the OwnSand API, and starts the runner programs in them. For dev sessions, it relays the owner's commands and file transfers to the OwnSand data path.
 
 The control plane runs no sandbox and stores no runner output, dev session command output or dev session file contents. It is licensed under `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md).
 
-Planned layout, following the `accounts-api` server conventions:
+Layout, following the `accounts-api` server conventions:
 
-- `servers/tide-api/cmd/tide-api/`: process entry point. The same binary also serves the Claude Code `spawn-runner` hook command.
-- `servers/tide-api/internal/`: configuration, HTTP and Connect handlers, authentication, authorization, personal API keys, the OwnSand client, the GitHub App client, the vendor adapters, the queue and dispatcher, runner lifecycle, the dev session relay, webhooks, secrets, metrics, storage and audit packages.
+- `servers/tide-api/cmd/tide-api/`: process entry point. The same binary also serves the Claude Code `spawn-runner` hook command (`planned`).
+- `servers/tide-api/internal/`: `config` (configuration), `server` (the HTTP handler, `GET /healthz` and CORS), `api` (the Connect handlers, the authentication interceptor, authorization, personal API keys, audit events, rate limits and the extension hooks), `auth` (Logto access tokens and the `tide_` and `tdi_` secrets), `authz` (the authorization matrix), `secrets` (credential encryption), `ratelimit`, `lease` (the instance lease and the lease-scoped components), `jobs` (the daily jobs), `db` (the Postgres pool and the migrations, with the `dbtest` harness), `app` (the wiring and the extension registry) and `testenv` (in-process integration tests). The OwnSand client, the GitHub App client, the vendor adapters, the queue and dispatcher, runner lifecycle, the dev session relay, webhooks and metrics packages are `planned`.
 - `servers/tide-api/package.json`, `turbo.json`, `.env.example` and `Dockerfile`: workspace wiring, the `deploy` field and the container image.
 
 ## Runtime and Language
@@ -20,7 +20,8 @@ Planned layout, following the `accounts-api` server conventions:
 - Deployment target: a Docker container on the shared DigitalOcean Droplet, deployed by the [deployment workflow](repository-workflow-contract.md#deployment-workflow) with the `deploy` target `droplet`, like `accounts-api`. Production origin: `https://tide.api.delino.io`. The Caddy reverse proxy terminates TLS and proxies to the container. tide needs no public port other than HTTPS.
 - Container image: the image contains the `claude` binary at a pinned version of at least 2.1.224, because the [Claude Code adapter](#claude-code) runs the Claude Code orchestrator in the container.
 - Database: PlanetScale Postgres, according to the repository defaults.
-- Development ports (`planned`): `127.0.0.1:18400` for HTTP and `127.0.0.1:19400` for metrics. Add them to the [environment contract](repository-environment-contract.md) in the change that adds the development launcher.
+- Development ports: `127.0.0.1:18400` for HTTP (the default of `ADDR`) and `127.0.0.1:19400` for metrics (the development launcher sets `METRICS_ADDR` when it is unset). The [environment contract](repository-environment-contract.md#process-boundaries) lists them.
+- Lease-scoped components: a later layer registers each background component (the dispatcher, a vendor watcher, a Claude Code orchestrator, a reconciler) with the extension registry of `servers/tide-api/internal/app`. The lease holder starts the components when it acquires the lease, restarts a component that returns early with exponential backoff (1 second to 1 minute) and stops all components before it releases or loses the lease. The daily jobs (retention deletes and re-encryption after a key rotation) are one such component: they run when the instance acquires the lease and then every 24 hours.
 
 ## Users and Operators
 
@@ -41,7 +42,8 @@ Planned layout, following the `accounts-api` server conventions:
 ### Authentication
 
 - Every public RPC accepts a Logto access token for the API resource `https://tide.api.delino.io`. The server validates the signature, issuer, expiry, audience and required scopes according to the [authentication contract](repository-auth-contract.md#token-validation), and rejects ID tokens.
-- The RPCs of `DevSessionService` also accept a [personal API key](#personal-api-keys) in the `Authorization: Bearer` header. Every other RPC rejects a personal API key with `permission_denied`. The server tells the two credentials apart by the `tide_` prefix.
+- The RPCs of `DevSessionService` also accept a [personal API key](#personal-api-keys) in the `Authorization: Bearer` header. Every other RPC rejects a personal API key with `permission_denied`. The server tells the two credentials apart by the `tide_` prefix. An invalid personal API key gets `unauthenticated` on every RPC.
+- Logto registration (recorded decision): the API resource `https://tide.api.delino.io` defines the scope `tide:use`, and every RPC requires it in the access token. Roles in an organization come from tide's own memberships, not from token scopes. The [web console](apps-tide-console-foundation.md) and the [CLI](cmds-tide-cli-foundation.md) request access tokens for this resource with this scope. The server rejects a token whose `typ` is not `at+jwt` (ID tokens) and a machine-to-machine token whose `sub` equals its `client_id`, like `ownsand-api`. The control plane needs no Logto application for token validation.
 - The webhook endpoints accept no Logto token. They accept only deliveries with a valid sender signature; see [Webhooks](#webhooks).
 
 ### Authorization
@@ -181,8 +183,10 @@ An agent integration holds the vendor credentials and settings of one vendor acc
 - Every member can create personal API keys for themselves in an organization with `ApiKeyService.CreateApiKey`, with a name (1 to 64 characters) and an optional expiry time. A key without an expiry stays valid until it is revoked. Each user lists and revokes only their own keys.
 - Secret format: `tide_` followed by 32 random bytes from a cryptographically secure source in unpadded base64url, like the [OwnSand API keys](servers-ownsand-api-foundation.md#authentication). `CreateApiKey` returns the secret once.
 - The server stores only the SHA-256 hash of the secret and a short non-secret prefix for display. A lookup hashes the presented value, loads the row by that hash and compares the stored hash in constant time. A value with the `tide_` prefix but a wrong shape gets `unauthenticated`.
-- A revoked or expired key gets `unauthenticated`. The server records the last use time of each key with at most one write per key per minute.
-- When a membership ends (removal by an admin or leaving), the server revokes every key of that user in that organization in the same transaction. It then ends the user's dev sessions of the organization as described in [Dev sessions](#dev-sessions).
+- A revoked or expired key gets `unauthenticated`. The server records the last use time of each key with at most one write per key per minute. Only an accepted use counts: a valid key that an RPC other than `DevSessionService` rejects does not change the last use time.
+- The display prefix is `tide_` and the first 4 characters after it, like the invitation display prefix (`tdi_` and 4 characters). The rate limit of authentication failures keys on it.
+- When a membership ends (removal by an admin or leaving), the server revokes every key of that user in that organization in the same transaction. It then ends the user's dev sessions of the organization as described in [Dev sessions](#dev-sessions). The dev session layer does this through the membership end hook of the core: one step in the same transaction and one step after the commit.
+- Organization deletion revokes every key of the organization and records an `API_KEY_REVOKED` audit event for each, then deletes the keys with the organization.
 
 ### Dev sessions
 
@@ -302,6 +306,8 @@ The Go SDK implements download for the CLI and the MCP server. Download copies a
 ### Secrets
 
 - Organization credentials are the OwnSand API key and the credentials of each agent integration. Claude Code work orders of queued requests use the same encryption. The server encrypts each one with AES-256-GCM before it stores it. The encryption key comes from the service secret `TIDE_SECRET_KEYS`, which holds one or more keys with IDs. Each stored value records the ID of its key, so that the operator can add a new key and re-encrypt stored values.
+- `TIDE_SECRET_KEYS` format (recorded decision): a comma-separated list of `<key ID>:<key>` entries. A key ID is 1 to 32 ASCII letters, digits, `-` or `_`, and a key is 32 random bytes in base64 (standard or URL alphabet, with or without padding). The first entry is the primary key, which encrypts every new value; the server decrypts with every listed key. Each value is bound to its owner with GCM associated data (for example the kind of credential and the organization ID), so a value copied to another row does not decrypt.
+- Key rotation: the operator adds the new key as the first entry and keeps the old keys after it, and deploys. The daily re-encryption jobs of the lease holder, which each layer that stores encrypted values registers, re-encrypt the values of the old keys with the primary key and log how many they changed. When no value uses an old key, the operator removes it and deploys again. A missing or invalid `TIDE_SECRET_KEYS` stops the server at startup.
 - The API accepts credentials only in set operations and never returns them. Read operations return only whether a credential is set and when it was set.
 - The GitHub App ID, private key, client ID, client secret and webhook secret are service secrets of the deployment, according to the [environment contract](repository-environment-contract.md).
 - The server decrypts a credential only for the call that uses it, and passes a runner credential only to the runner that needs it, as the [agent integrations table](#agent-integrations) shows. The OwnSand API key, the GitHub App private key, the Claude Code environment key, the Devin API token and the OpenAI webhook secret never enter a runner.
@@ -354,9 +360,11 @@ The server records audit events for: organization creation and deletion, ownersh
 
 `DeleteOrganization` revokes every personal API key of the organization, ends every queued request with `CANCELED`, deletes every runner as described in [Runner lifecycle](#runner-lifecycle), stops the Claude Code orchestrators and vendor watchers of the organization, removes the GitHub installation links, and then deletes the stored credentials. tide cannot uninstall the GitHub App; the console tells the owner to uninstall it in GitHub.
 
+- Each layer does its part through an organization deletion hook of the core, registered in the order above: a step before the deletion transaction that may call OwnSand or GitHub (a failure stops the deletion and keeps the organization, so the step is idempotent), a step in the transaction under the organization row lock, and a step after the commit. The core then revokes the personal API keys, records the audit events and deletes the organization row with its memberships, invitations and keys.
+
 ## Storage
 
-- PlanetScale Postgres tables (`planned`): organizations (with the organization settings), memberships, invitations, OwnSand links, GitHub installations, agent integrations, runner profiles, requests (with the dev session owner and label), runners, personal API keys (hash, display prefix, owner, name, expiry, last use, revocation), webhook deliveries, the lease and audit events.
+- PlanetScale Postgres tables: organizations (with the organization settings), memberships, invitations, OwnSand links, GitHub installations, agent integrations, runner profiles, requests (with the dev session owner and label), runners, personal API keys (hash, display prefix, owner, name, expiry, last use, revocation), webhook deliveries, the lease and audit events. The core migration `00001_core.sql` creates the organizations, memberships, invitations, personal API keys, audit events and the lease; OwnSand links, GitHub installations, agent integrations, runner profiles, requests, runners and webhook deliveries are `planned`. Each later layer adds its own migration with the next free five-digit version, and its organization tables reference the organization with `ON DELETE CASCADE`, so organization deletion removes them.
 - Requests store the vendor or GitHub key (GitHub job ID, Claude Code session ID, Cursor or Devin request ID, OpenAI session and environment ID) with a unique constraint per organization and source, so that a repeated event or claim cannot create a second request.
 - Webhook delivery IDs are kept for 7 days.
 - Retention of ended records (recorded decision): an ended request (including an ended dev session) and an ended runner are kept for 30 days after they end, and then a daily job of the lease holder deletes them. This is the same period as for ended OwnSand sandboxes.
@@ -364,6 +372,30 @@ The server records audit events for: organization creation and deletion, ownersh
 - Migration tool (recorded decision): [goose](https://github.com/pressly/goose) (`github.com/pressly/goose/v3`), like `accounts-api`, with SQL migrations embedded from `servers/tide-api/internal/db/migrations/`. Migrations are forward-only, as in `accounts-api`.
 - Backup policy (recorded decision): the default automatic backups of PlanetScale Postgres, with no custom backup schedule. A backup is made every 12 hours and kept for 2 days, and point-in-time recovery is available in that period ([PlanetScale Postgres backups](https://planetscale.com/docs/postgres/backups)).
 - tide stores no runner output, no dev session command, environment, output or file content, and no JIT configuration. It stores a Claude Code work order only encrypted and only until the runner of the request is `BUSY` or the request ends; see [Claude Code](#claude-code).
+
+## Configuration
+
+The server reads these environment variables without a service prefix. Empty values count as unset. A value that fails validation stops the server at startup, and the error never contains a secret value.
+
+| Variable                      | Required | Default                      | Rule                                                                                                           |
+| ----------------------------- | -------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `ADDR`                        | no       | `127.0.0.1:18400`            | `host:port` of the HTTP/1.1 and h2c listener. The deployment sets it.                                          |
+| `LOG_LEVEL`                   | no       | `info`                       | `debug`, `info`, `warn` or `error`.                                                                            |
+| `DATABASE_URL`                | yes      |                              | Postgres connection URL.                                                                                       |
+| `RUN_MIGRATIONS`              | no       | `true`                       | Apply the embedded migrations at startup.                                                                      |
+| `LOGTO_ISSUER`                | yes      |                              | Logto issuer, `<tenant endpoint>/oidc`.                                                                        |
+| `LOGTO_JWKS_URL`              | no       | `LOGTO_ISSUER` + `/jwks`     | Key set URL.                                                                                                   |
+| `LOGTO_JWKS_FILE`             | no       | empty                        | Local key set file instead of the URL, for end-to-end test issuers.                                            |
+| `LOGTO_AUDIENCE`              | no       | `https://tide.api.delino.io` | Expected `aud`.                                                                                                |
+| `CORS_ORIGINS`                | no       | `https://tide.delino.io`     | Comma-separated browser origins.                                                                               |
+| `TRUST_PROXY_CLIENT_ADDRESS`  | no       | `false`                      | Client address from the last `X-Forwarded-For` entry, as in OwnSand.                                           |
+| `ALLOW_DIRECT_CLIENT_ADDRESS` | no       | `false`                      | Client address from the TCP peer when the proxy setting is off. The development launcher sets `true`.          |
+| `TIDE_SECRET_KEYS`            | yes      |                              | Service secret; see [Secrets](#secrets).                                                                       |
+| `METRICS_ADDR`                | no       | empty (listener off)         | `host:port` of the internal metrics listener. The development launcher sets `127.0.0.1:19400`.                 |
+| `OTEL_*`                      | no       | empty (no OTLP export)       | Standard OpenTelemetry variables, read by the SDK through the shared telemetry package, as for `accounts-api`. |
+
+- Later layers add the GitHub App, vendor and OwnSand settings to this table with their implementation.
+- Member display names: `ListMembers` reads them through an optional display name source. The `delino-accounts` API has no display name RPC yet, as the [OwnSand contract](servers-ownsand-api-foundation.md#dependencies-and-integrations) records, so tide-api has no client or configuration for it and returns empty display names until that RPC exists.
 
 ## Security
 
@@ -392,6 +424,7 @@ The server records audit events for: organization creation and deletion, ownersh
 ## Build and Test
 
 - Package scripts wrap the Go toolchain like `accounts-api`. Before finishing a change, run `pnpm exec turbo run test --filter=tide-api`, `go vet ./...` and the `gofmt` check from `servers/AGENTS.md`.
+- Postgres-backed tests (the `db`, `lease`, `jobs` and `api` integration tests) use `TIDE_TEST_DATABASE_URL`, a Postgres URL whose user may create databases. Each test creates and drops its own database; without the variable, these tests skip. The CI `go-test` job sets it. A local run: `TIDE_TEST_DATABASE_URL=postgres://postgres:<password>@127.0.0.1:<port>/postgres?sslmode=disable pnpm exec turbo run test --filter=tide-api`, for example against a `postgres:17` container.
 - Unit tests: queue order, coverage counting for GitHub profiles, warm runner rules, maximum queue wait, retry after runner start failure, runner profile validation (including `workspace_path`), webhook signature checks and duplicate deliveries, credential encryption with key rotation, the authorization matrix (including personal API keys on every service and dev session owner checks), personal API key format, hashing, expiry and revocation, the per-user dev session limit, and dev session end reasons.
 - Integration tests with fakes of `ownsand-api`, the GitHub API and each vendor API: full request lifecycles for each workload kind and vendor, `unavailable` and `failed_precondition` from OwnSand, lost webhook deliveries with redelivery, cancelled jobs with surplus runner removal, vendor watch reconnects, a dev session that waits in the queue and starts, exec stream rotation and attach, relayed file reads and writes, dev session deletion by the owner and by an admin, TTL expiry, and the end of a membership with running dev sessions and keys.
 - Acceptance (manual, recorded in the pull request or Linear issue): the [project success criterion](project-tide.md#goal) with a real GitHub organization, real vendor accounts and real Linux, macOS and Windows devices. Keep fake-based results separate from real acceptance.
