@@ -98,11 +98,16 @@ export function useFollowAllPages(query: PagedQuery): FollowedPages {
   // Several surfaces can observe one entry, and all of them run this effect
   // in the same commit. `cancelRefetch: false` joins the request that is in
   // flight instead of cancelling it and sending the same page again.
+  //
+  // `data` is a dependency because a response can arrive before React renders
+  // the fetching state of the request before it. Then `hasNextPage` and
+  // `isFetching` have the same values in two commits, and only the new page
+  // tells the effect to request the page after it.
   useEffect(() => {
     if (hasNextPage && !isFetching && !isFetchNextPageError) {
       void fetchNextPage({ cancelRefetch: false });
     }
-  }, [hasNextPage, isFetching, isFetchNextPageError, fetchNextPage]);
+  }, [data, hasNextPage, isFetching, isFetchNextPageError, fetchNextPage]);
 
   const retryLoadMore = useCallback(() => {
     void fetchNextPage({ cancelRefetch: false });
