@@ -265,17 +265,36 @@ function SubscriptionCard() {
   const [startError, setStartError] = useState<unknown>();
   const canPay = can(role, Permission.ManagePayments);
 
+  // One controller per mounted view of this billing account. Leaving the
+  // view aborts it, so a subscription start whose response arrives later does
+  // not open a checkout for an account the user no longer looks at. The
+  // controller is created in the effect so that StrictMode's extra
+  // setup and cleanup leaves a live controller for the mounted view.
+  const viewAbort = useRef<AbortController | undefined>(undefined);
+  useEffect(() => {
+    const controller = new AbortController();
+    viewAbort.current = controller;
+    return () => controller.abort();
+  }, [billingAccountId]);
+
   const startCheckout = async () => {
     setStartError(undefined);
     if (checkout === undefined) return;
+    const signal = viewAbort.current?.signal;
     try {
       const res = await start.mutateAsync({ billingAccountId });
+      // A stale request still refreshes the reads of its own account.
       await refresh();
+      if (signal?.aborted) return;
       // The subscription stays PENDING until the verified payment webhook,
       // so the page reads it again when the checkout closes.
-      await checkout.open(res.paddleTransactionId, () => void refresh());
+      await checkout.open(
+        res.paddleTransactionId,
+        () => void refresh(),
+        signal,
+      );
     } catch (error) {
-      setStartError(error);
+      if (!signal?.aborted) setStartError(error);
     }
   };
 
