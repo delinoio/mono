@@ -24,7 +24,11 @@ function processOrders(orders: Order[], users: User[]) {
 
 ```typescript
 function processOrders(orders: Order[], users: User[]) {
-  const userById = new Map(users.map(u => [u.id, u]))
+  // IDs are strings. Keep the first user per ID, like users.find() does
+  const userById = new Map<string, User>()
+  for (const user of users) {
+    if (!userById.has(user.id)) userById.set(user.id, user)
+  }
 
   return orders.map(order => ({
     ...order,
@@ -33,5 +37,5 @@ function processOrders(orders: Order[], users: User[]) {
 }
 ```
 
-Build map once (O(n)), then all lookups are O(1).
+Build map once (O(n)), then all lookups are O(1). Inserting only when the ID is absent keeps the first match for a duplicate ID, which is what `.find()` returns; `new Map(users.map(u => [u.id, u]))` would keep the last one.
 For 1000 orders × 1000 users: 1M ops → 2K ops.
