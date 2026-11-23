@@ -13,21 +13,44 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 )
 
 // CopyTree copies the regular files, directories and symbolic links of src
-// into dst, which must not exist yet.
+// into dst, which must not exist yet. Every copied file and directory ends
+// with the permission bits of its source, whatever the umask of the process
+// is; see CopyTreeContext.
 func CopyTree(src, dst string) error {
 	return CopyTreeContext(context.Background(), src, dst)
+}
+
+// dirMode is a directory that CopyTreeContext created and whose final
+// permission bits it applies after the copy.
+type dirMode struct {
+	path string
+	perm fs.FileMode
 }
 
 // CopyTreeContext is CopyTree that stops with the context error before each
 // entry and between the chunks of a file once ctx is done. The entries that it
 // copied before the stop stay in dst; the caller removes them.
+//
+// The permission bits of a copied file are those of its source: CopyFile sets
+// them explicitly, so the umask does not clear any. A directory is created
+// owner-writable, so that its entries can be copied into it, and receives its
+// source permission bits only after the whole tree is copied, deepest
+// directories first; a read-only source directory therefore copies with its
+// content and ends read-only. A copy that fails or stops early skips this
+// step and leaves the directories that it created owner-writable, so that the
+// caller's removal of the partial copy does not meet a read-only directory.
+//
+// On Windows a directory keeps the mode that the create call gives it: the
+// read-only attribute of a directory has no effect on its entries there.
 func CopyTreeContext(ctx context.Context, src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+	var dirs []dirMode
+	err := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -45,7 +68,11 @@ func CopyTreeContext(ctx context.Context, src, dst string) error {
 		}
 		switch {
 		case d.IsDir():
-			return os.MkdirAll(target, info.Mode().Perm()|0o700)
+			if err := os.MkdirAll(target, info.Mode().Perm()|0o700); err != nil {
+				return err
+			}
+			dirs = append(dirs, dirMode{path: target, perm: info.Mode().Perm()})
+			return nil
 		case info.Mode()&fs.ModeSymlink != 0:
 			link, err := os.Readlink(path)
 			if err != nil {
@@ -58,9 +85,24 @@ func CopyTreeContext(ctx context.Context, src, dst string) error {
 		// Sockets, devices and pipes are not part of a snapshot.
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	// The walk visits a directory before its entries, so the reverse order
+	// changes the mode of a directory after the modes of its entries.
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := os.Chmod(dirs[i].path, dirs[i].perm); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// CopyFile copies one regular file.
+// CopyFile copies one regular file. The copy has the permission bits perm
+// whatever the umask of the process is.
 func CopyFile(src, dst string, perm fs.FileMode) error {
 	return copyFile(context.Background(), src, dst, perm)
 }
@@ -78,6 +120,13 @@ func copyFile(ctx context.Context, src, dst string, perm fs.FileMode) error {
 		return err
 	}
 	if _, err := CopyContext(ctx, out, in); err != nil {
+		out.Close()
+		return err
+	}
+	// OpenFile applies the umask to perm, so set the mode explicitly. A file
+	// that is not owner-writable has been written already, so this is the
+	// first point at which it can become read-only.
+	if err := out.Chmod(perm); err != nil {
 		out.Close()
 		return err
 	}
