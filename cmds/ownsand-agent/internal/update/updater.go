@@ -268,14 +268,25 @@ func (u *Updater) clearPendingLocked() {
 
 // recordRunningRevocation stores whether a verified manifest revokes the
 // running version, on behalf of the command with the given order. A command
-// that a newer one superseded leaves the value to the newer command.
-func (u *Updater) recordRunningRevocation(order uint64, revoked bool) {
+// that a newer one superseded leaves the value to the newer command. A
+// revoked running version also moves the reported state to
+// REVOKED_PENDING_IDLE with the target at once, so the heartbeat tells the
+// control plane to stop placing sandboxes while the artifact still downloads
+// and not only after it finished.
+func (u *Updater) recordRunningRevocation(order uint64, revoked bool, target string) {
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	if u.applied != order {
+		u.mu.Unlock()
 		return
 	}
 	u.revokedRunning = revoked
+	if !revoked {
+		u.mu.Unlock()
+		return
+	}
+	u.state, u.target = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE, target
+	u.mu.Unlock()
+	u.opts.Logger.Info("agent update state", "update_state", ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE.String(), "target_version", target)
 }
 
 func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, error) {
@@ -458,7 +469,7 @@ func (u *Updater) download(ctx context.Context, target string, order uint64) (*M
 	// so record it now and not when the artifact is published: a withdrawal
 	// that arrives during the artifact download must already see it and leave
 	// the revocation recovery alone.
-	u.recordRunningRevocation(order, m.Revoked(u.opts.Running))
+	u.recordRunningRevocation(order, m.Revoked(u.opts.Running), target)
 	if m.Revoked(target) {
 		return nil, "", ErrRevoked
 	}
@@ -528,8 +539,15 @@ func (u *Updater) fail(target, artifact string) {
 	u.artifact = ""
 	// revokedRunning is deliberately kept: it describes the running version
 	// from a verified manifest, not the failed install attempt, so creates stay
-	// blocked until a later install replaces the revoked version.
-	u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
+	// blocked until a later install replaces the revoked version. The reported
+	// state follows it: a device that runs a revoked version stays
+	// REVOKED_PENDING_IDLE after the failure so the control plane keeps
+	// placing no sandboxes on it, as for a failed download.
+	if u.revokedRunning {
+		u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
+	} else {
+		u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
+	}
 	u.target = target
 	u.mu.Unlock()
 }
