@@ -342,7 +342,7 @@ function seed(): Map<string, OrgState> {
   );
   acme.invitations.push({
     invitation: create(InvitationSchema, {
-      invitationId: uuidV7(),
+      invitationId: newMockId(),
       organizationId: MOCK_IDS.acme,
       role: Role.MEMBER,
       state: InvitationState.PENDING,
@@ -496,7 +496,7 @@ function seed(): Map<string, OrgState> {
   );
   acme.tokens.push(
     create(EnrollmentTokenSchema, {
-      enrollmentTokenId: uuidV7(),
+      enrollmentTokenId: newMockId(),
       organizationId: MOCK_IDS.acme,
       state: EnrollmentTokenState.USED,
       createTime: ts(-3 * 24 * HOUR),
@@ -508,7 +508,7 @@ function seed(): Map<string, OrgState> {
   );
   acme.apiKeys.push(
     create(ApiKeySchema, {
-      apiKeyId: uuidV7(),
+      apiKeyId: newMockId(),
       organizationId: MOCK_IDS.acme,
       name: "ci-runner",
       state: ApiKeyState.ACTIVE,
@@ -531,7 +531,7 @@ function seed(): Map<string, OrgState> {
   );
   contoso.invitations.push({
     invitation: create(InvitationSchema, {
-      invitationId: uuidV7(),
+      invitationId: newMockId(),
       organizationId: MOCK_IDS.contoso,
       role: Role.MEMBER,
       state: InvitationState.PENDING,
@@ -691,32 +691,102 @@ function placeSandbox(
   return device;
 }
 
+const PAGE_TOKEN_PREFIX = "v1:";
+const UUID_V7 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** The timestamp of the seeded IDs, so that a created ID sorts after them. */
+const SEEDED_ID_MS = 0x0193a0000000;
+let lastIdMs = 0;
+let idCounter = 0;
+
 /**
- * One page of a list, like the control plane: 50 rows by default, at most
- * 200, in the order of `rows` (the control plane lists in ascending ID
- * order), with a continuation token whenever a page is full, even when no
- * row follows. The token is the ID of the last row, and a token that names
- * no row fails with `invalid_argument`.
+ * A UUID v7 that is strictly greater than every ID the mock created before,
+ * like the control plane generator (a 12-bit counter after the timestamp), so
+ * that the ascending ID order of a list is the creation order even for rows
+ * created in one millisecond. A clock that runs backwards, or before the
+ * seeded IDs, does not move a created ID before an older one.
+ */
+function newMockId(): string {
+  let ms = Math.max(Date.now(), lastIdMs, SEEDED_ID_MS + 1);
+  if (ms === lastIdMs) {
+    idCounter += 1;
+    if (idCounter > 0xfff) {
+      ms += 1;
+      idCounter = 0;
+    }
+  } else {
+    idCounter = 0;
+  }
+  lastIdMs = ms;
+  const id = uuidV7(ms).split("");
+  const counter = idCounter.toString(16).padStart(3, "0");
+  // Characters 15..17 hold the 12 random bits after the version nibble (14).
+  id.splice(15, 3, ...counter);
+  return id.join("");
+}
+
+/**
+ * One page of a list, like the control plane: rows in ascending ID order, 50
+ * rows by default and at most 200 (a negative size fails with
+ * `invalid_argument`), starting after the row ID that the opaque page token
+ * names, and a continuation token whenever a page is full, even when no row
+ * follows. The token is the unpadded base64url form of `v1:` and the ID of
+ * the last row; a token that is not that form of a UUID v7 fails with
+ * `invalid_argument`. A token names a position, not a row, so it keeps
+ * working after the row it names is deleted.
  */
 function pageOf<T>(
   rows: readonly T[],
   req: { pageSize: number; pageToken: string },
   idOf: (row: T) => string,
 ): { page: T[]; nextPageToken: string } {
-  const pageSize = req.pageSize === 0 ? 50 : Math.min(req.pageSize, 200);
-  const after = req.pageToken
-    ? rows.findIndex((row) => idOf(row) === req.pageToken)
-    : -1;
-  if (req.pageToken && after === -1) {
-    throw new ConnectError("invalid page_token", Code.InvalidArgument);
+  if (req.pageSize < 0) {
+    throw new ConnectError("invalid page_size", Code.InvalidArgument);
   }
-  const page = rows.slice(after + 1, after + 1 + pageSize);
+  const pageSize = req.pageSize === 0 ? 50 : Math.min(req.pageSize, 200);
+  let after = "";
+  if (req.pageToken !== "") {
+    after = decodePageToken(req.pageToken);
+  }
+  const page = rows
+    .filter((row) => after === "" || idOf(row).toLowerCase() > after)
+    .sort((a, b) => {
+      const x = idOf(a).toLowerCase();
+      const y = idOf(b).toLowerCase();
+      return x < y ? -1 : x > y ? 1 : 0;
+    })
+    .slice(0, pageSize);
   const last = page.at(-1);
   return {
     page,
     nextPageToken:
-      page.length === pageSize && last !== undefined ? idOf(last) : "",
+      page.length === pageSize && last !== undefined
+        ? encodePageToken(idOf(last))
+        : "",
   };
+}
+
+function encodePageToken(id: string): string {
+  return btoa(PAGE_TOKEN_PREFIX + id.toLowerCase())
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function decodePageToken(token: string): string {
+  const invalid = new ConnectError("invalid page_token", Code.InvalidArgument);
+  if (!/^[A-Za-z0-9_-]+$/.test(token)) throw invalid;
+  let raw: string;
+  try {
+    raw = atob(token.replace(/-/g, "+").replace(/_/g, "/"));
+  } catch {
+    throw invalid;
+  }
+  if (!raw.startsWith(PAGE_TOKEN_PREFIX)) throw invalid;
+  const after = raw.slice(PAGE_TOKEN_PREFIX.length);
+  if (!UUID_V7.test(after)) throw invalid;
+  return after.toLowerCase();
 }
 
 export function createMockTransport(
@@ -736,7 +806,7 @@ export function createMockTransport(
     for (let i = 0; i < (options.extraEnrollmentTokens ?? 0); i++) {
       acmeOrg.tokens.push(
         create(EnrollmentTokenSchema, {
-          enrollmentTokenId: uuidV7(),
+          enrollmentTokenId: newMockId(),
           organizationId: MOCK_IDS.acme,
           state: EnrollmentTokenState.PENDING,
           createdBy: { kind: PrincipalKind.USER, id: userId },
@@ -749,7 +819,7 @@ export function createMockTransport(
     for (let i = 0; i < (options.extraApiKeys ?? 0); i++) {
       acmeOrg.apiKeys.push(
         create(ApiKeySchema, {
-          apiKeyId: uuidV7(),
+          apiKeyId: newMockId(),
           organizationId: MOCK_IDS.acme,
           name: `key-${i}`,
           state: ApiKeyState.ACTIVE,
@@ -966,7 +1036,7 @@ export function createMockTransport(
         const name = req.name.trim();
         if (name === "")
           throw new ConnectError("name is required", Code.InvalidArgument);
-        const id = uuidV7();
+        const id = newMockId();
         const org = emptyOrg(id, name);
         org.members.push(member(id, userId, Role.OWNER, "Mina Kim"));
         orgs.set(id, org);
@@ -1025,7 +1095,7 @@ export function createMockTransport(
         }
         const value = secret("osi");
         const invitation = create(InvitationSchema, {
-          invitationId: uuidV7(),
+          invitationId: newMockId(),
           organizationId: req.organizationId,
           role: req.role,
           state: InvitationState.PENDING,
@@ -1148,7 +1218,7 @@ export function createMockTransport(
         }
         const value = secret("ose");
         const token = create(EnrollmentTokenSchema, {
-          enrollmentTokenId: uuidV7(),
+          enrollmentTokenId: newMockId(),
           organizationId: req.organizationId,
           state: EnrollmentTokenState.PENDING,
           createdBy: { kind: PrincipalKind.USER, id: userId },
@@ -1342,7 +1412,7 @@ export function createMockTransport(
           throw new ConnectError("name is required", Code.InvalidArgument);
         const value = secret("osk");
         const apiKey = create(ApiKeySchema, {
-          apiKeyId: uuidV7(),
+          apiKeyId: newMockId(),
           organizationId: req.organizationId,
           name: req.name.trim(),
           state: ApiKeyState.ACTIVE,
@@ -1423,7 +1493,7 @@ export function createMockTransport(
           );
         }
         const sandbox = create(SandboxSchema, {
-          sandboxId: uuidV7(),
+          sandboxId: newMockId(),
           organizationId: req.organizationId,
           deviceId: device.deviceId,
           state: SandboxState.RUNNING,
@@ -1528,7 +1598,7 @@ export function createMockTransport(
           );
         }
         const snapshot = create(SnapshotSchema, {
-          snapshotId: uuidV7(),
+          snapshotId: newMockId(),
           organizationId: req.organizationId,
           sourceSandboxId: s.sandboxId,
           deviceId: s.deviceId,
@@ -1550,13 +1620,21 @@ export function createMockTransport(
       },
       listSnapshots(req) {
         const { org } = membership(req.organizationId);
-        return {
-          snapshots: org.snapshots.filter(
+        const filtered = org.snapshots
+          .filter(
             (s) =>
               req.sandboxId === undefined ||
               s.sourceSandboxId === req.sandboxId,
-          ),
-        };
+          )
+          .filter(
+            (s) => req.deviceId === undefined || s.deviceId === req.deviceId,
+          );
+        const { page, nextPageToken } = pageOf(
+          filtered,
+          req,
+          (s) => s.snapshotId,
+        );
+        return { snapshots: page, nextPageToken };
       },
       deleteSnapshot(req) {
         const { org } = membership(req.organizationId);
@@ -1586,7 +1664,7 @@ export function createMockTransport(
         if (req.name.trim() === "")
           throw new ConnectError("name is required", Code.InvalidArgument);
         const template = create(TemplateSchema, {
-          templateId: uuidV7(),
+          templateId: newMockId(),
           organizationId: req.organizationId,
           name: req.name.trim(),
           snapshotId: req.snapshotId,
