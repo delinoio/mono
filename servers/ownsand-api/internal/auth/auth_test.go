@@ -372,22 +372,41 @@ func TestLogtoValidatorCallerCancelDoesNotAbortFetch(t *testing.T) {
 		started: make(chan struct{}, 1),
 	}
 	srv := httptest.NewServer(o)
-	defer srv.Close()
+	// Cleanups run last-in-first-out: the caller is canceled and the parked
+	// handler is released exactly once before the server closes, so
+	// srv.Close never waits on a handler that nothing will release, on any
+	// exit path including a failed wait below.
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	var releaseOnce sync.Once
+	releaseHandler := func() { releaseOnce.Do(func() { close(o.block) }) }
+	t.Cleanup(func() {
+		cancel()
+		releaseHandler()
+	})
 	now := time.Now()
 	v := NewLogtoValidator(LogtoConfig{Issuer: o.f.issuer, Audience: "https://ownsand.api.delino.io", JWKSURL: srv.URL, Now: func() time.Time { return now }})
 	token := o.f.sign(t, "at+jwt", outageClaims(o.f, now))
-	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
 		_, err := v.Validate(ctx, token)
 		done <- err
 	}()
-	<-o.started
+	if err := waitForJWKSStart(o.started, done, jwksStartTimeout); err != nil {
+		t.Fatal(err)
+	}
 	cancel()
-	// The shared fetch keeps running after the caller left.
-	time.Sleep(50 * time.Millisecond)
-	close(o.block)
-	<-done
+	// The shared fetch keeps running after the caller left: the canceled
+	// caller returns on its own while the handler is still parked.
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("canceled caller result = %v, want ErrInvalidToken", err)
+		}
+	case <-time.After(jwksStartTimeout):
+		t.Fatal("canceled caller did not return while the JWKS fetch was parked")
+	}
+	releaseHandler()
 	if sub, err := v.Validate(context.Background(), token); err != nil || sub != "user-1" {
 		t.Fatalf("live caller after mid-flight cancel: %q %v", sub, err)
 	}
