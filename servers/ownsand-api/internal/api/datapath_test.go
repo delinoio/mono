@@ -489,11 +489,20 @@ func TestAuthorizeRelayRules(t *testing.T) {
 	// pending grant and a retry with the same authorization_id returns it.
 	heldCh := make(chan *ownsandv1.RelayGrant, 1)
 	agent.SetOnGrant(func(g *ownsandv1.RelayGrant) *ownsandv1.RelayGrantAck { heldCh <- g; return nil })
-	if _, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq)); testenv.Code(err) != connect.CodeUnavailable {
+	// The callback stays installed until the grant arrived: without it, a
+	// grant that arrives late is acknowledged by the fake agent default.
+	t.Cleanup(func() { agent.SetOnGrant(nil) })
+	_, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+	if testenv.Code(err) != connect.CodeUnavailable {
 		t.Fatalf("no ack: %v", err)
 	}
+	var held *ownsandv1.RelayGrant
+	select {
+	case held = <-heldCh:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("AuthorizeRelay returned [%v] without delivering the grant to the agent", err)
+	}
 	agent.SetOnGrant(nil)
-	held := <-heldCh
 	agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrantAck{RelayGrantAck: &ownsandv1.RelayGrantAck{GrantId: held.GetGrantId(), Result: ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED}}})
 	testenv.Eventually(t, "late ack", func() bool { return env.App.Plane.Grants.Admittable(held.GetGrantId()) != nil })
 	retry, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
@@ -706,6 +715,17 @@ func TestRelayConnectionRules(t *testing.T) {
 	r3 := agent.ConnectRelay(serveExec)
 	stop3 := keepAlive(r3)
 	defer stop3()
+	// ConnectRelay does not wait for the server, and a connection that the
+	// server rejected before it registered also reports Closed. The echo
+	// proves that r3 is registered, so the close below is caused by the agent
+	// channel.
+	r3.SendFrame(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE, Payload: &ownsandv1.DataFrame_RelayKeepalive{RelayKeepalive: &ownsandv1.RelayKeepalive{EchoRequested: true}}})
+	r3.WaitFrame("keepalive on the third connection", func(f *ownsandv1.DataFrame) bool { return f.GetRelayKeepalive() != nil })
+	select {
+	case <-r3.Closed():
+		t.Fatal("the third connection closed before its agent channel")
+	default:
+	}
 	agent.Close()
 	select {
 	case <-r3.Closed():
@@ -1147,6 +1167,55 @@ func TestAuthorizeRelayReplacementEnqueueFailure(t *testing.T) {
 	})
 }
 
+// installPredecessorReleaseHook installs a grant sender hook that, before it
+// queues the grant, makes the agent release the grant prev (when release is
+// set) and waits up to wait until the registry has freed it. The hook runs on
+// an RPC handler goroutine, where a fatal test helper such as
+// testenv.Eventually must not run: FailNow ends the calling goroutine with
+// runtime.Goexit, which skips the enqueue and the handler's cleanup. A wait
+// that times out returns an error from the hook instead, which takes the
+// ordinary grant-enqueue failure path, and records the diagnostic. The
+// returned function reports the recorded diagnostic to the test goroutine,
+// because the server redacts a sender error from the RPC error.
+func installPredecessorReleaseHook(env *testenv.Env, agent *testenv.FakeAgent, prev string, release bool, wait time.Duration) func() error {
+	var (
+		mu       sync.Mutex
+		hookFail error
+	)
+	env.App.Plane.SetGrantSender(func(ctx context.Context, conn *hub.Conn, e *ownsandv1.AgentEnvelope) error {
+		if release {
+			agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrantRelease{RelayGrantRelease: &ownsandv1.RelayGrantRelease{GrantId: prev}}})
+		}
+		deadline := time.NewTimer(wait)
+		defer deadline.Stop()
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for env.App.Plane.Grants.Get(prev) != nil {
+			select {
+			case <-tick.C:
+			case <-deadline.C:
+				err := fmt.Errorf("the predecessor %s stayed registered %v after its release", prev, wait)
+				mu.Lock()
+				hookFail = err
+				mu.Unlock()
+				return err
+			case <-ctx.Done():
+				err := fmt.Errorf("waiting for the release of the predecessor %s: %w", prev, ctx.Err())
+				mu.Lock()
+				hookFail = err
+				mu.Unlock()
+				return err
+			}
+		}
+		return conn.Send(ctx, e)
+	})
+	return func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		return hookFail
+	}
+}
+
 // TestAuthorizeRelayKeepsPredecessorAfterRelease covers a predecessor that the
 // agent releases after the replacement message was built and before it is
 // queued: the queued grant keeps its original replaces_grant_id, and the
@@ -1171,13 +1240,14 @@ func TestAuthorizeRelayKeepsPredecessorAfterRelease(t *testing.T) {
 	rep.ReplacesGrantId = &prev
 	// The sender hook runs after the message is built and before it is
 	// queued: release the predecessor through the agent channel there.
-	env.App.Plane.SetGrantSender(func(ctx context.Context, conn *hub.Conn, e *ownsandv1.AgentEnvelope) error {
-		agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrantRelease{RelayGrantRelease: &ownsandv1.RelayGrantRelease{GrantId: prev}}})
-		testenv.Eventually(t, "predecessor released", func() bool { return env.App.Plane.Grants.Get(prev) == nil })
-		return conn.Send(ctx, e)
-	})
+	hookErr := installPredecessorReleaseHook(env, agent, prev, true, 10*time.Second)
 	repl, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(rep))
 	if err != nil {
+		// The server redacts the sender error, so the hook's own diagnostic
+		// is the more precise failure.
+		if err := hookErr(); err != nil {
+			t.Fatal(err)
+		}
 		t.Fatalf("replacement: %v", err)
 	}
 	g := agent.WaitFor("replacement grant", func(e *ownsandv1.AgentEnvelope) bool { return e.GetRelayGrant().GetGrantId() == repl.Msg.GetGrantId() }).GetRelayGrant()
@@ -1186,6 +1256,42 @@ func TestAuthorizeRelayKeepsPredecessorAfterRelease(t *testing.T) {
 	}
 	if env.App.Plane.Grants.Get(prev) != nil || env.App.Plane.Grants.Admittable(repl.Msg.GetGrantId()) == nil {
 		t.Fatal("the registry did not free the predecessor and install the successor")
+	}
+}
+
+// TestAuthorizeRelayReportsPredecessorReleaseTimeout covers a predecessor that
+// stays registered: the sender hook returns an error on the RPC handler
+// goroutine, the grant takes the enqueue failure path, and the diagnostic
+// reaches the test goroutine.
+func TestAuthorizeRelayReportsPredecessorReleaseTimeout(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org, _, sandboxID := runningSandbox(t, env)
+	c := org.OwnerClient
+	req := newExec(org.ID, sandboxID)
+	authID, _ := uuidv7.NewString()
+	areq := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: authID}
+	first, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := first.Msg.GetGrantId()
+	repID, _ := uuidv7.NewString()
+	rep := proto.Clone(areq).(*ownsandv1.AuthorizeRelayRequest)
+	rep.AuthorizationId = repID
+	rep.ReplacesGrantId = &prev
+	// The agent never releases the predecessor.
+	hookErr := installPredecessorReleaseHook(env, nil, prev, false, 200*time.Millisecond)
+	if _, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(rep)); err == nil {
+		t.Fatal("the replacement succeeded although the predecessor was never released")
+	}
+	err = hookErr()
+	if err == nil || !strings.Contains(err.Error(), prev) {
+		t.Fatalf("the hook did not report the predecessor timeout: %v", err)
+	}
+	if env.App.Plane.Grants.Get(prev) == nil {
+		t.Fatal("the predecessor was removed although the agent never released it")
 	}
 }
 
