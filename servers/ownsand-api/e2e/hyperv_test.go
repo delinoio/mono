@@ -163,10 +163,17 @@ func hyperVAgentCrash(t *testing.T, s *stack) {
 		return info.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE
 	})
 	s.restartAgent(0)
-	info := waitSandboxState(ctx, t, sb, "FAILED", func(info *ownsandv1.Sandbox) bool {
-		return info.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_FAILED
+	// The reconciliation may report the end reason a moment after the state,
+	// so the wait covers both and a different end reason fails at the
+	// deadline with the last observed sandbox in the message.
+	info := waitSandboxState(ctx, t, sb, "FAILED with LOST_ON_DEVICE", func(info *ownsandv1.Sandbox) bool {
+		return info.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_FAILED &&
+			info.GetEndReason() == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE
 	})
 	t.Logf("sandbox after the agent restart: %v", info)
+	if got := info.GetEndReason(); got != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatalf("end reason of the sandbox after the agent restart = %v, want %v", got, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE)
+	}
 	requireNoComputeSystem(t, sb.ID())
 }
 
