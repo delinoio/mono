@@ -8,6 +8,14 @@
 # kernel was first downloaded. A kernel built and signed by the OwnSand
 # release process replaces it before the first release.
 #
+# The download goes to a unique temporary file next to <output-vmlinux> and is
+# verified before it is published, so fetches that run at the same time (two
+# builds, a retry beside a slow run) never share a staging file. The rename
+# that publishes it is atomic because both paths are on one file system. A
+# download that fails or does not match the checksum leaves an existing
+# <output-vmlinux> untouched, and the temporary file is removed whatever way
+# the script ends.
+#
 # Usage: fetch-kernel.sh <output-vmlinux>
 set -euo pipefail
 
@@ -21,8 +29,14 @@ if [ "$(uname -m)" != "x86_64" ]; then
   echo "only the x86_64 kernel is pinned" >&2
   exit 1
 fi
-tmp="$1.download"
+tmp="$(mktemp "$1.download.XXXXXX")"
+# Remove the temporary file whatever way the script ends, also on a signal.
+trap 'rm -f "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 curl -fsSL -o "$tmp" "$url"
 echo "$sha256  $tmp" | sha256sum -c --quiet -
-mv "$tmp" "$1"
+# mktemp creates the file with mode 0600; a published kernel is readable.
+chmod 0644 "$tmp"
+mv -f "$tmp" "$1"
 echo "wrote $1"
