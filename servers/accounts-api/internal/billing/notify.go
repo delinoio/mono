@@ -24,6 +24,17 @@ const (
 	notificationMaxAttempts = 10
 	// notificationMaxBackoff bounds the wait between attempts.
 	notificationMaxBackoff = time.Hour
+	// notificationLease is how long a claimed notification stays hidden from
+	// the other workers. It exceeds workerRunTimeout, so a live pass keeps its
+	// lease; a pass that crashed releases the notification when the lease
+	// ends.
+	notificationLease = 5 * time.Minute
+	// notificationDeferDelay is the wait of a notification whose pass ended
+	// early, before its next attempt.
+	notificationDeferDelay = time.Minute
+	// notificationSettleTimeout bounds each write that records the result of a
+	// send or a pass after the pass context ended.
+	notificationSettleTimeout = 10 * time.Second
 )
 
 // enqueue records a notification in tx. The deduplication key makes it
@@ -64,72 +75,103 @@ type notification struct {
 	Attempts         int
 }
 
-// DeliverNotifications sends the due notifications. Each runs in its own
-// transaction that locks the notification row (SKIP LOCKED, so several
-// instances never deliver one notification at once) and records every
-// recipient that received it, so a retry sends only to the others. The
+// DeliverNotifications sends the due notifications. A notification is
+// claimed in a short transaction that locks its row (SKIP LOCKED) and moves
+// next_attempt_time forward by notificationLease. The moved time is the lease:
+// no other instance picks the notification before it, so several instances
+// never deliver one notification at once, and the lease needs no row lock
+// during the sends. Each send commits its own recipient row right after it,
+// so a pass that ends early (the worker deadline, a shutdown or a crash)
+// keeps the progress, and a retry sends only to the other recipients. The
 // Resend idempotency key `<dedup key>/<user ID>` also covers a crash between
-// the send and the commit.
+// a send and its recipient row.
 func (s *Service) DeliverNotifications(ctx context.Context) error {
 	for range 100 {
-		var found bool
-		err := s.db.InTx(ctx, func(tx pgx.Tx) error {
-			now := s.timestamp()
-			var n notification
-			var details []byte
-			var kind string
-			err := tx.QueryRow(ctx, `SELECT notification_id::text, billing_account_id::text, kind, dedup_key, details, attempts
-				FROM billing_notifications
-				WHERE send_time IS NULL AND abandon_time IS NULL AND next_attempt_time <= $1
-				ORDER BY next_attempt_time LIMIT 1 FOR UPDATE SKIP LOCKED`, now).Scan(
-				&n.ID, &n.BillingAccountID, &kind, &n.DedupKey, &details, &n.Attempts)
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			found = true
-			n.Kind = NotificationKind(kind)
-			if err := json.Unmarshal(details, &n.Details); err != nil {
-				return err
-			}
-			return s.deliver(ctx, tx, n, now)
-		})
+		n, ok, err := s.claimNotification(ctx)
 		if err != nil {
 			return err
 		}
-		if !found {
+		if !ok {
 			return nil
+		}
+		if err := s.deliver(ctx, n); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// deliver sends one notification to every owner and admin that did not get
-// it yet and records the result in tx.
-func (s *Service) deliver(ctx context.Context, tx pgx.Tx, n notification, now time.Time) error {
+// claimNotification locks the next due notification and leases it. It
+// reports false when none is due.
+func (s *Service) claimNotification(ctx context.Context) (notification, bool, error) {
+	var n notification
+	found := false
+	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+		now := s.timestamp()
+		var details []byte
+		var kind string
+		err := tx.QueryRow(ctx, `SELECT notification_id::text, billing_account_id::text, kind, dedup_key, details, attempts
+			FROM billing_notifications
+			WHERE send_time IS NULL AND abandon_time IS NULL AND next_attempt_time <= $1
+			ORDER BY next_attempt_time LIMIT 1 FOR UPDATE SKIP LOCKED`, now).Scan(
+			&n.ID, &n.BillingAccountID, &kind, &n.DedupKey, &details, &n.Attempts)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		n.Kind = NotificationKind(kind)
+		if err := json.Unmarshal(details, &n.Details); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE billing_notifications SET next_attempt_time = $2 WHERE notification_id = $1`,
+			n.ID, now.Add(notificationLease)); err != nil {
+			return err
+		}
+		found = true
+		return nil
+	})
+	return n, found, err
+}
+
+// settle runs a write that records the outcome of work that already
+// happened: a send that went out, or the result of a whole pass. It does not
+// follow the cancellation of ctx, because an expired worker deadline must not
+// discard that work, but it is bounded by notificationSettleTimeout.
+func (s *Service) settle(ctx context.Context, fn func(ctx context.Context) error) error {
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), notificationSettleTimeout)
+	defer cancel()
+	return fn(settleCtx)
+}
+
+// deliver sends the leased notification n to every owner and admin that did
+// not get it yet and records the result.
+func (s *Service) deliver(ctx context.Context, n notification) error {
 	var name string
 	var deleted bool
-	if err := tx.QueryRow(ctx, `SELECT name, delete_time IS NOT NULL FROM billing_accounts WHERE billing_account_id = $1`,
+	if err := s.db.Pool.QueryRow(ctx, `SELECT name, delete_time IS NOT NULL FROM billing_accounts WHERE billing_account_id = $1`,
 		n.BillingAccountID).Scan(&name, &deleted); err != nil {
-		return err
+		return s.interruptedOr(ctx, n, err)
 	}
 	if deleted {
-		_, err := tx.Exec(ctx, `UPDATE billing_notifications SET abandon_time = $2 WHERE notification_id = $1`, n.ID, now)
-		return err
+		return s.settle(ctx, func(ctx context.Context) error {
+			_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET abandon_time = $2 WHERE notification_id = $1`,
+				n.ID, s.timestamp())
+			return err
+		})
 	}
-	rows, err := tx.Query(ctx, `SELECT m.user_id FROM billing_account_members m
+	rows, err := s.db.Pool.Query(ctx, `SELECT m.user_id FROM billing_account_members m
 		WHERE m.billing_account_id = $1 AND m.role IN ('owner', 'admin')
 			AND NOT EXISTS (SELECT 1 FROM billing_notification_deliveries d
 				WHERE d.notification_id = $2 AND d.user_id = m.user_id)
 		ORDER BY m.user_id`, n.BillingAccountID, n.ID)
 	if err != nil {
-		return err
+		return s.interruptedOr(ctx, n, err)
 	}
 	recipients, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	if err != nil {
-		return err
+		return s.interruptedOr(ctx, n, err)
 	}
 	lines := noticeLines(n)
 	// A failure for one recipient does not stop the others: a recipient that
@@ -137,15 +179,19 @@ func (s *Service) deliver(ctx context.Context, tx pgx.Tx, n notification, now ti
 	// the email before the notification is abandoned. failed keeps the first
 	// error for the retry bookkeeping and the log; every later error still
 	// counts in the email metrics. A canceled or expired context stops the
-	// loop, because every later call would fail the same way.
+	// loop, because every later call would fail the same way; the
+	// notification is then deferred, not counted as a failed attempt.
 	var failed error
 	failedRecipients := 0
 	for _, userID := range recipients {
 		if ctx.Err() != nil {
-			break
+			return s.deferNotification(ctx, n)
 		}
 		user, err := s.directory.User(ctx, userID)
 		if err != nil && !errors.Is(err, directory.ErrUserNotFound) {
+			if ctx.Err() != nil {
+				return s.deferNotification(ctx, n)
+			}
 			failedRecipients++
 			if failed == nil {
 				failed = fmt.Errorf("read recipient profile: %w", err)
@@ -166,6 +212,12 @@ func (s *Service) deliver(ctx context.Context, tx pgx.Tx, n notification, now ti
 				return err
 			}
 			if err := s.email.Send(ctx, msg); err != nil {
+				if ctx.Err() != nil {
+					// The pass ended while the send was in flight, so the
+					// outcome is unknown. The next attempt sends again with
+					// the same idempotency key.
+					return s.deferNotification(ctx, n)
+				}
 				s.metrics.Email(string(n.Kind), "failed")
 				failedRecipients++
 				if failed == nil {
@@ -175,15 +227,59 @@ func (s *Service) deliver(ctx context.Context, tx pgx.Tx, n notification, now ti
 			}
 			s.metrics.Email(string(n.Kind), "sent")
 		}
+		// Record the recipient at once, so a pass that ends early keeps it.
 		// A recipient without a primary email is recorded too, so it is not
 		// read again on a retry.
-		if _, err := tx.Exec(ctx, `INSERT INTO billing_notification_deliveries (notification_id, user_id, send_time)
-			VALUES ($1, $2, $3)`, n.ID, userID, now); err != nil {
+		if err := s.settle(ctx, func(ctx context.Context) error {
+			_, err := s.db.Pool.Exec(ctx, `INSERT INTO billing_notification_deliveries (notification_id, user_id, send_time)
+				VALUES ($1, $2, $3) ON CONFLICT (notification_id, user_id) DO NOTHING`, n.ID, userID, s.timestamp())
+			return err
+		}); err != nil {
 			return err
 		}
 	}
+	return s.settle(ctx, func(ctx context.Context) error {
+		return s.finish(ctx, n, failed, failedRecipients)
+	})
+}
+
+// interruptedOr defers n when err is the effect of a pass context that ended,
+// and returns err otherwise.
+func (s *Service) interruptedOr(ctx context.Context, n notification, err error) error {
+	if ctx.Err() != nil {
+		return s.deferNotification(ctx, n)
+	}
+	return err
+}
+
+// deferNotification ends the pass of an interrupted notification. The
+// recipients that are not recorded stay pending, the attempt count stays as
+// it is, and the notification waits notificationDeferDelay, so that a
+// notification that became due meanwhile runs first and the same one does
+// not block the queue. It returns the error of ctx.
+func (s *Service) deferNotification(ctx context.Context, n notification) error {
+	err := s.settle(ctx, func(ctx context.Context) error {
+		_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET next_attempt_time = $2 WHERE notification_id = $1`,
+			n.ID, s.timestamp().Add(notificationDeferDelay))
+		return err
+	})
+	s.logger.WarnContext(ctx, "billing_notification_deferred",
+		slog.String("billing_account_id", n.BillingAccountID),
+		slog.String("kind", string(n.Kind)),
+		slog.String("notification_id", n.ID),
+		slog.Any("error", err))
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+// finish records the result of a pass that reached every recipient: sent, or
+// failed for failedRecipients of them with the first error failed.
+func (s *Service) finish(ctx context.Context, n notification, failed error, failedRecipients int) error {
+	now := s.timestamp()
 	if failed == nil {
-		_, err := tx.Exec(ctx, `UPDATE billing_notifications SET send_time = $2, attempts = attempts + 1
+		_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET send_time = $2, attempts = attempts + 1
 			WHERE notification_id = $1`, n.ID, now)
 		if err == nil {
 			s.logger.InfoContext(ctx, "billing_notification_sent",
@@ -207,7 +303,7 @@ func (s *Service) deliver(ctx context.Context, tx pgx.Tx, n notification, now ti
 		slog.Bool("abandoned", abandon != nil),
 		slog.Int("failed_recipients", failedRecipients),
 		slog.Any("error", failed))
-	_, err = tx.Exec(ctx, `UPDATE billing_notifications SET attempts = $2, next_attempt_time = $3, abandon_time = $4
+	_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET attempts = $2, next_attempt_time = $3, abandon_time = $4
 		WHERE notification_id = $1`, n.ID, attempts, now.Add(backoff), abandon)
 	return err
 }
