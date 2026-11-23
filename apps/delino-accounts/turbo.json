@@ -22,6 +22,13 @@
         "PUBLIC_PADDLE_ENVIRONMENT"
       ],
       "inputs": ["$TURBO_DEFAULT$", ".env", ".env.*"]
+    },
+    "test": {
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/apps/*/e2e.config.ts",
+        "$TURBO_ROOT$/apps/*/.env.example"
+      ]
     }
   }
 }
