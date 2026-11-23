@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
+	"github.com/delinoio/mono/go/ownsand/validate"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -659,6 +661,32 @@ func TestCreateLimits(t *testing.T) {
 	cmd.Limits = &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 4096, DiskGib: 20, VcpuOvercommitPercent: 200}
 	if _, err := e.m.Create(context.Background(), cmd); err != nil {
 		t.Fatalf("overcommit: %v", err)
+	}
+}
+
+// TestCreateRejectsDiskThatOverflowsBytes sends a disk_gib whose byte count
+// does not fit in a signed 64-bit integer. The agent rejects it as
+// INVALID_ARGUMENT that names resources.disk_gib, before the limit check, the
+// free disk probe and the runtime see it, and keeps no record.
+func TestCreateRejectsDiskThatOverflowsBytes(t *testing.T) {
+	e := newEnv(t)
+	for _, disk := range []int64{validate.MaxDiskGiB + 1, math.MaxInt64} {
+		cmd := e.createCmd(1, time.Hour, time.Hour)
+		cmd.Resources.DiskGib = disk
+		// A huge device limit proves that the rejection comes from the
+		// validation and not from the capacity check.
+		cmd.Limits = &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 4096, DiskGib: math.MaxInt64, VcpuOvercommitPercent: 100}
+		_, err := e.m.Create(context.Background(), cmd)
+		var ce *CommandError
+		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT || !strings.Contains(ce.Error(), "resources.disk_gib") {
+			t.Fatalf("disk_gib %d: err = %v, want INVALID_ARGUMENT naming resources.disk_gib", disk, err)
+		}
+	}
+	if n := e.rt.startCount(); n != 0 {
+		t.Fatalf("runtime starts = %d, want 0", n)
+	}
+	if n := len(e.m.Entries()); n != 0 {
+		t.Fatalf("entries = %d, want 0", n)
 	}
 }
 
