@@ -384,8 +384,16 @@ func (c *Client) CreateCheckoutTransaction(ctx context.Context, priceID string, 
 		"custom_data":     custom,
 	}
 	var txn Transaction
-	err := c.do(ctx, http.MethodPost, "/transactions", body, &txn)
-	return txn, err
+	if err := c.do(ctx, http.MethodPost, "/transactions", body, &txn); err != nil {
+		return txn, err
+	}
+	// A 2xx answer whose transaction has no ID cannot open a checkout and
+	// must not be stored. The answer is as malformed as a body that is not
+	// JSON, so Classify reports an unknown outcome, like the decoder errors.
+	if txn.ID == "" {
+		return Transaction{}, errors.New("paddle response is not valid")
+	}
+	return txn, nil
 }
 
 // GetSubscription reads a subscription (`GET /subscriptions/{id}`).

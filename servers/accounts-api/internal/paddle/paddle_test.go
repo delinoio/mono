@@ -102,6 +102,28 @@ func TestClientCheckoutAndSubscription(t *testing.T) {
 	}
 }
 
+// A success answer whose transaction has no ID is a malformed answer: the
+// outcome is unknown and no empty transaction is returned.
+func TestClientCheckoutRejectsATransactionWithoutID(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty object": `{"data":{}}`,
+		"empty ID":     `{"data":{"id":""}}`,
+		"no ID":        `{"data":{"status":"draft"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			client, fake := newClient(t)
+			fake.Respond("POST /transactions", http.StatusCreated, body)
+			txn, err := client.CreateCheckoutTransaction(context.Background(), "pri_sub", paddle.CustomData{})
+			if err == nil || paddle.Classify(err) != paddle.OutcomeUnknown {
+				t.Fatalf("CreateCheckoutTransaction = %+v, %v; want an unknown outcome", txn, err)
+			}
+			if txn.ID != "" || len(fake.Requests()) != 1 {
+				t.Fatalf("transaction = %+v after %d requests", txn, len(fake.Requests()))
+			}
+		})
+	}
+}
+
 func TestClientOneTimeCharge(t *testing.T) {
 	client, fake := newClient(t)
 	ctx := context.Background()
