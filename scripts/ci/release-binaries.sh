@@ -195,6 +195,7 @@ build() {
     *) usage ;;
   esac
   local name version dir binary platform asset target ldflags variable printed
+  local version_error version_status
   local host filter
   host="$(go env GOHOSTOS < /dev/null)-$(go env GOHOSTARCH < /dev/null)"
   # jq filters of platforms_of; `$is_cgo` is a jq variable.
@@ -242,10 +243,21 @@ build() {
         go build -trimpath -buildvcs=false -ldflags "$ldflags" -o "$target/$asset" "./$dir" < /dev/null
       # `-trimpath` keeps `-ldflags` out of the build information, so run
       # the executable of the host platform: a binary with a version
-      # variable prints the version with its `version` command.
+      # variable prints exactly the version with its `version` command and
+      # exits with 0. Standard output must equal the version (a trailing
+      # newline aside), so `11.2.3` does not pass for `1.2.3`; standard
+      # error is only a diagnostic.
       if [[ -n "$variable" && "$platform" == "$host" ]]; then
-        printed="$("$target/$asset" version < /dev/null 2>&1 || true)"
-        if [[ "$printed" != *"$version"* ]]; then
+        version_error="$(mktemp)"
+        version_status=0
+        printed="$("$target/$asset" version < /dev/null 2> "$version_error")" || version_status=$?
+        if (( version_status != 0 )); then
+          echo "::error::$target/$asset version exited with status $version_status (printed ${printed:-nothing}, standard error: $(tr '\n' ' ' < "$version_error")), not 0 with the version $version." >&2
+          rm -f "$version_error"
+          exit 1
+        fi
+        rm -f "$version_error"
+        if [[ "$printed" != "$version" ]]; then
           echo "::error::$target/$asset version printed ${printed:-nothing}, not the version $version." >&2
           exit 1
         fi

@@ -508,10 +508,13 @@ test(
   "build runs the host executable to check the version",
   { skip },
   async (t) => {
-    // The go stub writes an executable script that prints its own text, which
-    // holds the -ldflags value.
+    // The go stub writes an executable script that prints the version of the
+    // -X value of its -ldflags (exactly, because the build compares the whole
+    // output), or, for a missing value, text without the version.
     const executable =
-      'printf \'#!/usr/bin/env bash\\necho "%s"\\n\' "binary $GOOS-$GOARCH $CGO_ENABLED $ldflags" > "$out"; chmod 755 "$out" ;;';
+      'printf \'#!/usr/bin/env bash\\necho "%s"\\n\' "${ldflags##*=}" > "$out"; chmod 755 "$out" ;;';
+    const unversioned =
+      'printf \'#!/usr/bin/env bash\\necho "%s"\\n\' "binary $GOOS-$GOARCH $CGO_ENABLED" > "$out"; chmod 755 "$out" ;;';
     await t.test("recorded", (t) => {
       const f = fixture(t);
       writeFileSync(
@@ -529,10 +532,7 @@ test(
       const f = fixture(t);
       writeFileSync(
         join(f.dir, "bin/go"),
-        stubs.go.replace(
-          /printf 'binary.*"\$out" ;;/,
-          executable.replace("$ldflags", ""),
-        ),
+        stubs.go.replace(/printf 'binary.*"\$out" ;;/, unversioned),
       );
       const result = f.run(
         ["build", "cross", join(f.dir, "out")],
