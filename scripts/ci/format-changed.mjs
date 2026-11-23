@@ -586,29 +586,141 @@ function runBatch(cwd, args) {
   });
 }
 
+// Most paths one Rstack process receives. Bounds the argument count on every
+// platform, so a long selection never grows one command without limit.
+const MaxPathsPerBatch = 50;
+
+// Windows `CreateProcessW` accepts a command line of at most 32,767 UTF-16
+// code units, and that count includes the terminating NUL. Other platforms are
+// bounded by the (much larger) argument-size limit of the kernel, so they keep
+// only the path-count cap.
+const WindowsCommandLineLimit = 32767;
+
+export class CommandLineTooLongError extends Error {
+  constructor(displayName, limit) {
+    super(
+      `Path cannot fit in one formatter command line of ${limit} UTF-16 code units: ${displayName}. Shorten the path (or its directory names) so the formatter can address it.`,
+    );
+    this.name = "CommandLineTooLongError";
+    this.path = displayName;
+    this.limit = limit;
+  }
+}
+
+// Length in UTF-16 code units of one argument as libuv serializes it into a
+// Windows command line (`quote_cmd_arg` in libuv `src/win/process.c`, which is
+// what `child_process.spawn` uses with `shell: false`): an empty argument
+// becomes `""`; an argument without space, tab or double quote is copied as
+// is (backslashes included); any other argument is wrapped in double quotes,
+// every double quote gets a backslash, and each run of backslashes directly
+// before a double quote or the closing quote is doubled. JS string length
+// counts UTF-16 code units, which is the unit the Windows limit uses.
+export function windowsQuotedLength(arg) {
+  if (arg.length === 0) return 2;
+  if (!/[ \t"]/u.test(arg)) return arg.length;
+  if (!/["\\]/u.test(arg)) return arg.length + 2;
+  // Walk backwards like libuv: a backslash is doubled while the run of
+  // backslashes ends at the closing quote or at a double quote.
+  let length = 2;
+  let quoteHit = true;
+  for (let index = arg.length - 1; index >= 0; index--) {
+    const char = arg[index];
+    length += 1;
+    if (quoteHit && char === "\\") {
+      length += 1;
+    } else if (char === '"') {
+      quoteHit = true;
+      length += 1;
+    } else {
+      quoteHit = false;
+    }
+  }
+  return length;
+}
+
+// Splits `names` (repository-relative paths, in order) into batches that each
+// fit one Rstack command line: at most `maxPaths` paths and, when `limit` is
+// finite, a serialized command line of at most `limit` UTF-16 code units. The
+// serialized line is the quoted `executable`, each fixed argument and each
+// `./`-prefixed path, separated by single spaces, plus the terminating NUL.
+// Order is preserved and each path appears in exactly one batch. A path that
+// cannot fit even alone throws `CommandLineTooLongError` naming it.
+export function splitBatches(
+  executable,
+  fixedArgs,
+  names,
+  {
+    platform = process.platform,
+    limit = platform === "win32" ? WindowsCommandLineLimit : Infinity,
+    maxPaths = MaxPathsPerBatch,
+  } = {},
+) {
+  const quoted = (arg) => windowsQuotedLength(arg);
+  // The NUL terminator counts against the limit.
+  const fixed =
+    quoted(executable) +
+    fixedArgs.reduce((total, arg) => total + 1 + quoted(arg), 0) +
+    1;
+  const batches = [];
+  let current = [];
+  let length = fixed;
+  for (const name of names) {
+    const added = 1 + quoted(`./${name}`);
+    if (fixed + added > limit) {
+      throw new CommandLineTooLongError(displayPath(name), limit);
+    }
+    if (current.length >= maxPaths || length + added > limit) {
+      batches.push(current);
+      current = [];
+      length = fixed;
+    }
+    current.push(name);
+    length += added;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
 // Runs every Rstack batch and returns `{ status, signal }`. `signal` is the
 // first forwarded signal (null when none); a stopped run reports the shell
 // convention `128 + signal` as `status` and starts no further batch. Callers
 // that must tell a stopped run from a failed check read `signal`, because a
 // signal exit code is indistinguishable from a check status by value alone.
-async function runFormatterBatches(start, paths, mode) {
+// `options.commandLineLimit` and `options.onBatch` are test seams: the first
+// replaces the platform command-line limit, the second observes each batch's
+// paths before its process starts.
+async function runFormatterBatches(start, paths, mode, options = {}) {
   if (!Object.values(Mode).includes(mode))
     throw new Error("Unknown formatting mode");
   if (!paths.length) return { status: 0, signal: null };
   // Selected paths are repository-root-relative, so Rstack must run there too.
   const cwd = repositoryRoot(start);
   const entry = rstackEntry();
+  const fixedArgs = [
+    entry,
+    "fmt",
+    `--${mode}`,
+    "--no-cache",
+    "--no-error-on-unmatched-pattern",
+  ];
+  // Bound argv size (path count and, on Windows, serialized length) before any
+  // process starts, so an unaddressable path fails before a partial run, and
+  // prefix paths so leading dashes and negation characters cannot become CLI
+  // flags or exclusion patterns. Rstack resolves files first.
+  const batches = splitBatches(
+    process.execPath,
+    fixedArgs,
+    paths,
+    options.commandLineLimit === undefined
+      ? {}
+      : { limit: options.commandLineLimit },
+  );
   let status = 0;
-  // Bound argv size and prefix paths so leading dashes and negation characters
-  // cannot become CLI flags or exclusion patterns. Rstack resolves files first.
-  for (let index = 0; index < paths.length; index += 50) {
+  for (const batch of batches) {
+    options.onBatch?.(batch);
     const { status: batchStatus, signal } = await runBatch(cwd, [
-      entry,
-      "fmt",
-      `--${mode}`,
-      "--no-cache",
-      "--no-error-on-unmatched-pattern",
-      ...paths.slice(index, index + 50).map((name) => `./${name}`),
+      ...fixedArgs,
+      ...batch.map((name) => `./${name}`),
     ]);
     // A stopped run must not start another batch; report the shell convention
     // for the received signal instead of the child's own status.
@@ -618,8 +730,13 @@ async function runFormatterBatches(start, paths, mode) {
   return { status, signal: null };
 }
 
-export async function runFormatter(start, paths, mode = Mode.Check) {
-  return (await runFormatterBatches(start, paths, mode)).status;
+export async function runFormatter(
+  start,
+  paths,
+  mode = Mode.Check,
+  options = {},
+) {
+  return (await runFormatterBatches(start, paths, mode, options)).status;
 }
 
 // CI is enabled when the variable is set to anything except an empty value or
