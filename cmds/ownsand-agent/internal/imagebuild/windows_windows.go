@@ -236,7 +236,17 @@ func applyImage(ctx context.Context, logger *slog.Logger, disk, scratch, wim str
 		return fmt.Errorf("imagebuild: bcdboot failed: %w: %s", err, out)
 	}
 	logger.Info("boot files written")
-	password, err := randomPassword()
+	return installSetupFiles(logger, d.Windows, guestBinary, lang, randomPassword)
+}
+
+// installSetupFiles writes the answer file, SetupComplete.cmd and the guest
+// helper below the applied Windows partition root. newPassword supplies the
+// administrator password for the answer file; the build passes
+// randomPassword. It never logs the password. It needs no Windows image,
+// elevation or VM, so a test can run it against a temporary directory.
+func installSetupFiles(logger *slog.Logger, root, guestBinary, lang string, newPassword func() (string, error)) error {
+	win := root + `\Windows`
+	password, err := newPassword()
 	if err != nil {
 		return err
 	}
@@ -255,7 +265,7 @@ func applyImage(ctx context.Context, logger *slog.Logger, disk, scratch, wim str
 		return fmt.Errorf("imagebuild: read the guest helper: %w", err)
 	}
 	// hcsrt.WindowsGuestBinary below the Windows partition root.
-	if err := writeFile(filepath.Join(d.Windows+`\`, hcsrt.WindowsGuestBinary[len(`C:\`):]), guest); err != nil {
+	if err := writeFile(filepath.Join(root+`\`, hcsrt.WindowsGuestBinary[len(`C:\`):]), guest); err != nil {
 		return err
 	}
 	logger.Info("answer file, SetupComplete.cmd and guest helper installed", "guest_binary_bytes", len(guest))
