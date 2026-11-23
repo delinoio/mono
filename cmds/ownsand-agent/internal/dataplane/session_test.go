@@ -7,6 +7,8 @@ package dataplane
 import (
 	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -230,6 +232,117 @@ func TestSessionIdleAndLabel(t *testing.T) {
 	// Offers for a sandbox that is not running are rejected.
 	if a := dp.Offer(context.Background(), ch, &ownsandv1.SignalingOffer{SessionId: newID(t), SandboxId: newID(t), ExpiresIn: durationpb.New(time.Hour), Sdp: sdp}); a.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
 		t.Fatalf("unknown sandbox %v", a)
+	}
+}
+
+// idleSession opens a session with a long idle time, so the watcher never
+// ends it during the test, and returns it with its caller.
+func idleSession(t *testing.T, w *world, idle time.Duration) (*caller, *session) {
+	t.Helper()
+	dp := newPlane(w, Timing{SessionIdle: idle})
+	ch := newChannel(1)
+	dp.ChannelOpened(ch)
+	c, id := w.session(t, dp, ch, time.Hour)
+	dp.mu.Lock()
+	s := dp.sessions[id]
+	dp.mu.Unlock()
+	if s == nil {
+		t.Fatal("session not registered")
+	}
+	return c, s
+}
+
+func (s *session) setActivity(at time.Time) {
+	s.mu.Lock()
+	s.activity = at
+	s.mu.Unlock()
+}
+
+func (s *session) endState() (bool, ownsandv1.SessionEndReason) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ended, s.endReason
+}
+
+// Activity or an open request keeps the idle transition from ending the
+// session, and the session ends again once both are gone and the idle time
+// has passed.
+func TestSessionIdleEndNeedsQuietAndNoOpenRequest(t *testing.T) {
+	w := newWorld(t)
+	c, s := idleSession(t, w, time.Hour)
+
+	// A frame within the idle time keeps the session open.
+	if s.endIdle() {
+		t.Fatal("a session with recent activity ended as idle")
+	}
+	// An open request keeps it open although the last frame is old.
+	s.setActivity(time.Now().Add(-2 * time.Hour))
+	s.mu.Lock()
+	s.streams[99] = func() {}
+	s.mu.Unlock()
+	if s.endIdle() {
+		t.Fatal("a session with an open request ended as idle")
+	}
+	if ended, _ := s.endState(); ended {
+		t.Fatal("session ended")
+	}
+	// Activity after the check that found it idle restarts the idle time.
+	s.mu.Lock()
+	delete(s.streams, 99)
+	s.mu.Unlock()
+	s.touch()
+	if s.endIdle() {
+		t.Fatal("a session touched just now ended as idle")
+	}
+	// A quiet session without a request ends with IDLE.
+	s.setActivity(time.Now().Add(-2 * time.Hour))
+	if !s.endIdle() {
+		t.Fatal("a quiet session did not end as idle")
+	}
+	if ended, reason := s.endState(); !ended || reason != ownsandv1.SessionEndReason_SESSION_END_REASON_IDLE {
+		t.Fatalf("ended %v reason %v", ended, reason)
+	}
+	c.waitClosed()
+	if s.endIdle() {
+		t.Fatal("an ended session ended again")
+	}
+}
+
+// Once the idle transition won, a request cannot register a stream or reach
+// the dispatcher.
+func TestSessionRejectsRequestAfterIdleEnd(t *testing.T) {
+	w := newWorld(t)
+	c, s := idleSession(t, w, time.Hour)
+	s.setActivity(time.Now().Add(-2 * time.Hour))
+	if !s.endIdle() {
+		t.Fatal("a quiet session did not end as idle")
+	}
+	marker := filepath.Join(t.TempDir(), "ran")
+	s.onFrame(datapath.MustNewFrame(7, w.sandbox, w.execReq("/bin/sh", "-c", "touch '"+marker+"'")))
+	s.mu.Lock()
+	open := len(s.streams)
+	s.mu.Unlock()
+	if open != 0 {
+		t.Fatalf("%d streams registered after the idle end", open)
+	}
+	c.waitClosed()
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("request reached the dispatcher after the idle end")
+	}
+}
+
+// The expiry path ends the session unconditionally, also while a request is
+// open and the session is not idle.
+func TestSessionExpiryEndsBusySession(t *testing.T) {
+	w := newWorld(t)
+	_, s := idleSession(t, w, time.Hour)
+	s.mu.Lock()
+	s.streams[99] = func() {}
+	s.mu.Unlock()
+	s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED)
+	if ended, reason := s.endState(); !ended || reason != ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED {
+		t.Fatalf("ended %v reason %v", ended, reason)
 	}
 }
 
