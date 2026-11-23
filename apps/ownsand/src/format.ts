@@ -223,7 +223,12 @@ export function formatBytes(bytes: bigint | number): string {
   return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
 }
 
-/** Formats a protobuf Duration as hours and minutes. */
+/**
+ * Formats a protobuf Duration as days, hours and minutes. A positive
+ * duration below one second (`seconds` 0 and `nanos` > 0) shows in whole
+ * milliseconds, for example `500 ms`, or `<1 ms` below one millisecond, so
+ * it never reads as `0 s`. Other values keep their whole-second text.
+ */
 export function formatDuration(duration: Duration | undefined): string {
   if (duration === undefined) return "—";
   const total = Number(duration.seconds);
@@ -234,7 +239,13 @@ export function formatDuration(duration: Duration | undefined): string {
   if (days > 0) parts.push(`${days} d`);
   if (hours > 0) parts.push(`${hours} h`);
   if (minutes > 0) parts.push(`${minutes} min`);
-  if (parts.length === 0) parts.push(`${total % 60} s`);
+  if (parts.length === 0) {
+    if (total === 0 && duration.nanos > 0) {
+      const millis = Math.floor(duration.nanos / 1e6);
+      return millis > 0 ? `${millis} ms` : "<1 ms";
+    }
+    parts.push(`${total % 60} s`);
+  }
   return parts.join(" ");
 }
 
