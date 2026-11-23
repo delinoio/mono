@@ -649,6 +649,34 @@ function placeSandbox(
   return device;
 }
 
+/**
+ * One page of a list, like the control plane: 50 rows by default, at most
+ * 200, in the order of `rows` (the control plane lists in ascending ID
+ * order), with a continuation token whenever a page is full, even when no
+ * row follows. The token is the ID of the last row, and a token that names
+ * no row fails with `invalid_argument`.
+ */
+function pageOf<T>(
+  rows: readonly T[],
+  req: { pageSize: number; pageToken: string },
+  idOf: (row: T) => string,
+): { page: T[]; nextPageToken: string } {
+  const pageSize = req.pageSize === 0 ? 50 : Math.min(req.pageSize, 200);
+  const after = req.pageToken
+    ? rows.findIndex((row) => idOf(row) === req.pageToken)
+    : -1;
+  if (req.pageToken && after === -1) {
+    throw new ConnectError("invalid page_token", Code.InvalidArgument);
+  }
+  const page = rows.slice(after + 1, after + 1 + pageSize);
+  const last = page.at(-1);
+  return {
+    page,
+    nextPageToken:
+      page.length === pageSize && last !== undefined ? idOf(last) : "",
+  };
+}
+
 export function createMockTransport(
   options: MockTransportOptions = {},
 ): Transport {
@@ -878,10 +906,6 @@ export function createMockTransport(
         return { organization: withRole(org.organization, role) };
       },
       listOrganizations(req) {
-        // Mirror the control plane: 50 rows by default, at most 200, in a
-        // stable order, with a continuation token whenever a page is full,
-        // even when no row follows. The token is the ID of the last row.
-        const pageSize = req.pageSize === 0 ? 50 : Math.min(req.pageSize, 200);
         const all = [...orgs.values()]
           .map((org) => ({
             org,
@@ -889,21 +913,12 @@ export function createMockTransport(
           }))
           .filter((x) => x.m !== undefined)
           .map((x) => withRole(x.org.organization, x.m!.role));
-        const after = req.pageToken
-          ? all.findIndex((o) => o.organizationId === req.pageToken)
-          : -1;
-        if (req.pageToken && after === -1) {
-          throw new ConnectError("invalid page_token", Code.InvalidArgument);
-        }
-        const organizations = all.slice(after + 1, after + 1 + pageSize);
-        const last = organizations.at(-1);
-        return {
-          organizations,
-          nextPageToken:
-            organizations.length === pageSize && last !== undefined
-              ? last.organizationId
-              : "",
-        };
+        const { page, nextPageToken } = pageOf(
+          all,
+          req,
+          (o) => o.organizationId,
+        );
+        return { organizations: page, nextPageToken };
       },
       deleteOrganization(req) {
         const { role } = membership(req.organizationId);
@@ -1070,7 +1085,9 @@ export function createMockTransport(
           expireTime: ts(ttl),
           tokenPrefix: value.slice(0, 8),
         });
-        org.tokens.unshift(token);
+        // The control plane lists in ascending ID order (UUID v7), so a new
+        // token is last.
+        org.tokens.push(token);
         return { token, enrollmentToken: value };
       },
       listEnrollmentTokens(req) {
@@ -1080,8 +1097,13 @@ export function createMockTransport(
         // token at or after its expiry. The stored record stays PENDING, so the
         // list returns a copy and a later revoke still finds a pending token.
         const at = now();
+        const { page, nextPageToken } = pageOf(
+          org.tokens,
+          req,
+          (t) => t.enrollmentTokenId,
+        );
         return {
-          tokens: org.tokens.map((t) =>
+          tokens: page.map((t) =>
             t.state === EnrollmentTokenState.PENDING &&
             t.expireTime !== undefined &&
             at >= timestampMs(t.expireTime)
@@ -1092,6 +1114,7 @@ export function createMockTransport(
                 })()
               : t,
           ),
+          nextPageToken,
         };
       },
       revokeEnrollmentToken(req) {

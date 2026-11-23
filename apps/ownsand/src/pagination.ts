@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ConnectError } from "@connectrpc/connect";
 import { useCallback, useEffect } from "react";
+import type { BoundaryQuery } from "./components/ui.tsx";
 
 /** The part of a cached query that tells which request failed. */
 interface QueryRequestState {
@@ -129,4 +130,27 @@ export function uniqueRows<T>(
     for (const row of rows) byId.set(idOf(row), row);
   }
   return [...byId.values()];
+}
+
+/**
+ * The query that `QueryBoundary` reads for a list that follows its pages: the
+ * error of a later page is not the boundary's error, because the list shows
+ * the loaded rows and `MorePagesNotice` offers the retry of that page.
+ */
+export function boundaryOf<TData>(
+  query: {
+    data: TData | undefined;
+    isPending: boolean;
+    isFetching: boolean;
+    refetch: () => unknown;
+  },
+  pages: Pick<FollowedPages, "error">,
+): BoundaryQuery<TData> {
+  return {
+    data: query.data,
+    error: pages.error,
+    isPending: query.isPending,
+    isFetching: query.isFetching,
+    refetch: query.refetch,
+  };
 }
