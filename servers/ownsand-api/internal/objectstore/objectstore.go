@@ -394,6 +394,14 @@ func (m *Memory) PutSized(key string, size int64) {
 	m.Sizes[key] = size
 }
 
+// RemoveObject deletes the object key, if any.
+func (m *Memory) RemoveObject(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.Objects, key)
+	delete(m.Sizes, key)
+}
+
 // ListCalls returns the number of ListPrefix calls so far.
 func (m *Memory) ListCalls() int {
 	m.mu.Lock()

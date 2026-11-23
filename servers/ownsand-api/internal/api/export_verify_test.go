@@ -1,0 +1,224 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package api_test
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
+)
+
+// verifyDelay is the wait between an export and its first R2 listing.
+const verifyDelay = 15 * time.Minute
+
+// exportVerifyFixture is an exported snapshot of the fake agent: two parts of
+// 1 MiB under the prefix of its attempt.
+type exportVerifyFixture struct {
+	env    *testenv.Env
+	org    *testenv.Org
+	snapID string
+	// prefix is the attempt prefix; part1 and part2 are the keys of its parts.
+	prefix, part1, part2 string
+	// exportedAt is the clock reading at the end of the export.
+	exportedAt time.Time
+}
+
+func newExportVerifyFixture(t *testing.T) *exportVerifyFixture {
+	t.Helper()
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	setupAgent(t, env, org, nil)
+	exportedAt := env.Clock.Now()
+	snapID := exportedSnapshot(t, org)
+	command, _ := exportColumns(t, env, snapID)
+	prefix := attemptPrefixOf(org.ID, snapID, command)
+	return &exportVerifyFixture{env: env, org: org, snapID: snapID, prefix: prefix, part1: prefix + "1", part2: prefix + "2", exportedAt: exportedAt}
+}
+
+// verification returns the export state and the verification columns.
+func (f *exportVerifyFixture) verification(t *testing.T) (state ownsandv1.SnapshotExportState, verified bool, after *time.Time) {
+	t.Helper()
+	var export int16
+	if err := f.env.DB.Pool.QueryRow(context.Background(), "SELECT export_state, export_verified, export_verify_after FROM snapshots WHERE snapshot_id = $1", f.snapID).
+		Scan(&export, &verified, &after); err != nil {
+		t.Fatal(err)
+	}
+	return ownsandv1.SnapshotExportState(export), verified, after
+}
+
+// run advances the clock by d and makes one verifier pass.
+func (f *exportVerifyFixture) run(d time.Duration) {
+	f.env.Clock.Advance(d)
+	f.env.App.Control.RunExportVerifyOnce(context.Background())
+}
+
+func (f *exportVerifyFixture) wantExported(t *testing.T, verified bool) {
+	t.Helper()
+	if state, got, _ := f.verification(t); state != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED || got != verified {
+		t.Fatalf("export state %v, verified %v; want EXPORTED, verified %v", state, got, verified)
+	}
+}
+
+func (f *exportVerifyFixture) wantLog(t *testing.T, parts ...string) {
+	t.Helper()
+	logs := f.env.Logs.String()
+	for _, p := range parts {
+		if !strings.Contains(logs, p) {
+			t.Fatalf("logs lack %s", p)
+		}
+	}
+}
+
+// wantFailed checks that the verification failed the export for reason: the
+// snapshot is EXPORT_FAILED, its manifest is gone and a clean-up job covers
+// the attempt prefix.
+func (f *exportVerifyFixture) wantFailed(t *testing.T, reason string) {
+	t.Helper()
+	if state, _, _ := f.verification(t); state != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED {
+		t.Fatalf("export state = %v, want EXPORT_FAILED", state)
+	}
+	if got := len(manifestHashes(t, f.env, f.snapID)); got != 0 {
+		t.Fatalf("manifest has %d parts after the failure, want none", got)
+	}
+	if _, ok := cleanupJobs(t, f.env)[f.prefix]; !ok {
+		t.Fatalf("no clean-up job for %s: %v", f.prefix, cleanupJobs(t, f.env))
+	}
+	f.wantLog(t, `"msg":"export_verification_failed"`, `"reason":"`+reason+`"`, `"snapshot_id":"`+f.snapID+`"`)
+}
+
+// TestExportVerificationPassesMatchingParts checks that the export becomes
+// verified once, never lists R2 before export_verify_after and never lists a
+// verified row again, even when an object is replaced later.
+func TestExportVerificationPassesMatchingParts(t *testing.T) {
+	f := newExportVerifyFixture(t)
+	if state, verified, after := f.verification(t); state != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED || verified || after == nil || !after.Equal(f.exportedAt.Add(verifyDelay)) {
+		t.Fatalf("after the export: state %v, verified %v, verify_after %v; want EXPORTED, unverified, %v", state, verified, after, f.exportedAt.Add(verifyDelay))
+	}
+	// Too early: one second before export_verify_after nothing is listed.
+	f.run(verifyDelay - time.Second)
+	if got := f.env.Objects.ListCalls(); got != 0 {
+		t.Fatalf("listed %d times before export_verify_after", got)
+	}
+	f.wantExported(t, false)
+
+	f.run(time.Second)
+	f.wantExported(t, true)
+	if got := f.env.Objects.ListCalls(); got != 1 {
+		t.Fatalf("list calls = %d, want 1", got)
+	}
+	f.wantLog(t, `"msg":"export_verified"`, `"snapshot_id":"`+f.snapID+`"`)
+
+	// A verified row is never listed again, so a later replacement changes
+	// nothing.
+	f.env.Objects.PutSized(f.part1, 9<<20)
+	f.run(time.Hour)
+	f.wantExported(t, true)
+	if got := f.env.Objects.ListCalls(); got != 1 {
+		t.Fatalf("list calls = %d after verification, want 1", got)
+	}
+	if got := len(manifestHashes(t, f.env, f.snapID)); got != 2 {
+		t.Fatalf("manifest has %d parts, want 2", got)
+	}
+}
+
+// TestExportVerificationFailsMismatchingParts checks that a size difference,
+// an unlisted object and a missing part each fail the export, delete the
+// manifest, start the attempt prefix clean-up and allow a new export.
+func TestExportVerificationFailsMismatchingParts(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+		tamper func(f *exportVerifyFixture)
+	}{
+		{"size difference", "size_mismatch", func(f *exportVerifyFixture) { f.env.Objects.PutSized(f.part2, 1<<20+1) }},
+		{"late replacement", "size_mismatch", func(f *exportVerifyFixture) { f.env.Objects.PutObject(f.part1, make([]byte, 7)) }},
+		{"unlisted object", "unlisted_object", func(f *exportVerifyFixture) { f.env.Objects.PutSized(f.prefix+"3", 1) }},
+		{"missing part", "missing_part", func(f *exportVerifyFixture) { f.env.Objects.RemoveObject(f.part2) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newExportVerifyFixture(t)
+			tc.tamper(f)
+			f.run(verifyDelay)
+			f.wantFailed(t, tc.reason)
+
+			// The clean-up job deletes the attempt prefix, and a new export
+			// starts a new verification.
+			f.env.App.Control.RunCleanupOnce(context.Background())
+			if got := f.env.Objects.DeletedPrefixes(); len(got) != 1 || got[0] != f.prefix {
+				t.Fatalf("clean-up sweeps = %v, want %s", got, f.prefix)
+			}
+			if got := exportSnapshotRPC(t, f.org.OwnerClient, f.org.ID, f.snapID); got != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING {
+				t.Fatalf("retry state = %v", got)
+			}
+			waitExportState(t, f.org.OwnerClient, f.org.ID, f.snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED)
+			f.wantExported(t, false)
+			f.run(verifyDelay)
+			f.wantExported(t, true)
+		})
+	}
+}
+
+// TestExportVerificationRetriesAfterR2Failure checks that an R2 listing error
+// changes nothing and that a later pass verifies the export.
+func TestExportVerificationRetriesAfterR2Failure(t *testing.T) {
+	f := newExportVerifyFixture(t)
+	f.env.Objects.SetListFail(errors.New("r2 is down"))
+	f.run(verifyDelay)
+	f.wantExported(t, false)
+	if got := len(manifestHashes(t, f.env, f.snapID)); got != 2 {
+		t.Fatalf("manifest has %d parts after an R2 failure, want 2", got)
+	}
+	if got := len(cleanupJobs(t, f.env)); got != 0 {
+		t.Fatalf("%d clean-up jobs after an R2 failure, want none", got)
+	}
+	f.wantLog(t, `"msg":"export_verification_retry"`, `"reason":"r2_list_failed"`)
+
+	f.env.Objects.SetListFail(nil)
+	f.run(time.Minute)
+	f.wantExported(t, true)
+}
+
+// TestExportVerificationWithoutObjectStore checks that a control plane
+// without R2 changes nothing.
+func TestExportVerificationWithoutObjectStore(t *testing.T) {
+	f := newExportVerifyFixture(t)
+	f.env.App.Service.Objects = nil
+	f.run(verifyDelay)
+	f.run(time.Hour)
+	f.wantExported(t, false)
+	f.wantLog(t, `"msg":"export_verification_retry"`, `"reason":"r2_not_configured"`)
+}
+
+// TestExportVerificationSchedulesRowsWithoutTime checks that a row without
+// export_verify_after (exported before the migration, or by a release that
+// does not set it) is first scheduled for the upload URL lifetime after it is
+// seen, and verified only then.
+func TestExportVerificationSchedulesRowsWithoutTime(t *testing.T) {
+	f := newExportVerifyFixture(t)
+	if _, err := f.env.DB.Pool.Exec(context.Background(), "UPDATE snapshots SET export_verified = false, export_verify_after = NULL WHERE snapshot_id = $1", f.snapID); err != nil {
+		t.Fatal(err)
+	}
+	// Long after the export, the first sight only schedules the row.
+	f.run(24 * time.Hour)
+	if got := f.env.Objects.ListCalls(); got != 0 {
+		t.Fatalf("listed %d times at the first sight of the row", got)
+	}
+	seen := f.env.Clock.Now()
+	if _, verified, after := f.verification(t); verified || after == nil || !after.Equal(seen.Add(verifyDelay)) {
+		t.Fatalf("verified %v, verify_after %v; want unverified and %v", verified, after, seen.Add(verifyDelay))
+	}
+	f.run(verifyDelay - time.Second)
+	if got := f.env.Objects.ListCalls(); got != 0 {
+		t.Fatalf("listed %d times before the scheduled time", got)
+	}
+	f.run(time.Second)
+	f.wantExported(t, true)
+	if got := f.env.Objects.ListCalls(); got != 1 {
+		t.Fatalf("list calls = %d, want 1", got)
+	}
+}
