@@ -25,7 +25,7 @@ import {
   useAuth,
 } from "./auth.tsx";
 import { OrgShell, TopBar } from "./components/shell.tsx";
-import { PageHeader } from "./components/ui.tsx";
+import { PageHeader, SignInFailureNotice } from "./components/ui.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { pendingInvitation } from "./invitation.ts";
 import { ApiKeysPage } from "./pages/api-keys.tsx";
@@ -128,6 +128,7 @@ const NOT_CONFIGURED: Auth = {
   isAuthenticated: false,
   userId: undefined,
   signIn: async () => {},
+  signInFailed: false,
   signOut: async () => {},
   getAccessToken: async () => undefined,
 };
@@ -245,7 +246,10 @@ function SignIn({ configured }: { configured: boolean }) {
         Run sandboxes on the devices your team already owns.
       </p>
       {configured ? (
-        <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
+        <>
+          <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
+          <SignInFailureNotice />
+        </>
       ) : (
         <p role="alert">{SIGN_IN_NOT_CONFIGURED}</p>
       )}

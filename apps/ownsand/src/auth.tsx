@@ -7,6 +7,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { API_RESOURCE, type LogtoSettings } from "./config.ts";
@@ -18,7 +19,18 @@ export interface Auth {
   isAuthenticated: boolean;
   /** The Logto user ID (`sub`) of the signed-in user. */
   userId: string | undefined;
+  /**
+   * Starts the sign-in redirect. It never rejects: the Logto SDK reports a
+   * failure before the redirect (for example an unreachable tenant) through
+   * `signInFailed`.
+   */
   signIn(): Promise<void>;
+  /**
+   * Whether the latest `signIn` call failed before the redirect started. The
+   * next `signIn` call clears it, and an error of another SDK request (a
+   * token request or the callback) never sets it.
+   */
+  signInFailed: boolean;
   signOut(): Promise<void>;
   /** A current access token for the control plane API resource. */
   getAccessToken(): Promise<string | undefined>;
@@ -160,6 +172,18 @@ export function LogtoAuthProvider({
 }
 
 /**
+ * One `signIn` call. `baseline` is the SDK error before the call, so that an
+ * earlier error never counts as this attempt's failure. `failed` stays
+ * `undefined` until the SDK call resolved and the SDK error state of that
+ * render was compared with the baseline.
+ */
+interface SignInAttempt {
+  baseline: unknown;
+  settled: boolean;
+  failed: boolean | undefined;
+}
+
+/**
  * Adapts the Logto SDK state to `Auth`. Exported for tests, which render it
  * inside a `LogtoProvider` with a fake client.
  */
@@ -172,9 +196,30 @@ export function LogtoBridge({ children }: { children: ReactNode }) {
     isLoading: sdkLoading,
     getIdTokenClaims,
     getAccessToken,
+    error: sdkError,
     signIn,
     signOut,
   } = logto;
+  // The SDK `signIn` never rejects. It stores a failure in the provider's
+  // `error` state, which the SDK never clears, and resolves. The bridge
+  // therefore compares that state with its value at the start of the attempt:
+  // a new error object that appears while the attempt runs is the failure of
+  // that attempt, and a token or callback error after the attempt settled is
+  // not. Each failure creates a new error object.
+  const sdkErrorRef = useRef(sdkError);
+  sdkErrorRef.current = sdkError;
+  const attemptCount = useRef(0);
+  const [attempt, setAttempt] = useState<SignInAttempt | undefined>();
+  useEffect(() => {
+    // The SDK sets its error before the promise of `signIn` resolves, so the
+    // render that sees `settled` also sees the error of the attempt.
+    if (attempt?.settled && attempt.failed === undefined) {
+      setAttempt({
+        ...attempt,
+        failed: sdkError !== undefined && sdkError !== attempt.baseline,
+      });
+    }
+  }, [attempt, sdkError]);
   // The SDK sets `isLoading` for every token request, not only while it
   // restores the session. The console unmounts its pages while `isLoading`
   // is true, so each page that requested a token unmounted itself, mounted
@@ -197,7 +242,17 @@ export function LogtoBridge({ children }: { children: ReactNode }) {
       isLoading: sdkLoading && !initialized,
       isAuthenticated,
       userId,
-      signIn: () => signIn(window.location.origin + CALLBACK_PATH),
+      signIn: async () => {
+        const id = ++attemptCount.current;
+        const baseline = sdkErrorRef.current;
+        setAttempt({ baseline, settled: false, failed: undefined });
+        await signIn(window.location.origin + CALLBACK_PATH);
+        // A newer attempt replaced this one while it ran.
+        if (id === attemptCount.current) {
+          setAttempt({ baseline, settled: true, failed: undefined });
+        }
+      },
+      signInFailed: attempt?.failed === true,
       signOut: async () => {
         // A pending invitation secret must not outlive the session.
         pendingInvitation.clear();
@@ -211,6 +266,7 @@ export function LogtoBridge({ children }: { children: ReactNode }) {
       initialized,
       isAuthenticated,
       userId,
+      attempt?.failed,
       signIn,
       signOut,
       getAccessToken,
@@ -262,6 +318,7 @@ export function MockAuthProvider({ children }: { children: ReactNode }) {
       isAuthenticated: signedIn,
       userId: signedIn ? MOCK_USER_ID : undefined,
       signIn,
+      signInFailed: false,
       signOut,
       getAccessToken: async () => (signedIn ? "mock-access-token" : undefined),
     }),
