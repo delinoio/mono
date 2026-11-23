@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1226,6 +1227,15 @@ func serveObserved(t *testing.T, handler http.HandlerFunc) (string, *lockedBuffe
 // example to set the timeouts, before it starts serving.
 func serveObservedWith(t *testing.T, handler http.HandlerFunc, configure func(*http.Server)) (string, *lockedBuffer) {
 	t.Helper()
+	addr, logs := serveObservedOn(t, handler, configure, nil)
+	return addr, logs
+}
+
+// serveObservedOn is serveObservedWith with a hook that wraps the TCP listener
+// before ObserveListener sees it, so that a test controls the bytes that each
+// read of the connection returns. A nil wrap serves the plain listener.
+func serveObservedOn(t *testing.T, handler http.HandlerFunc, configure func(*http.Server), wrap func(net.Listener) net.Listener) (string, *lockedBuffer) {
+	t.Helper()
 	logs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1244,16 +1254,126 @@ func serveObservedWith(t *testing.T, handler http.HandlerFunc, configure func(*h
 	if configure != nil {
 		configure(srv)
 	}
+	var served net.Listener = listener
+	if wrap != nil {
+		served = wrap(listener)
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = srv.Serve(ObserveListener(listener, logger))
+		_ = srv.Serve(ObserveListener(served, logger))
 	}()
 	t.Cleanup(func() {
 		_ = srv.Close()
 		<-done
 	})
 	return listener.Addr().String(), logs
+}
+
+// readBoundary selects how the next keep-alive read of a connection is cut.
+type readBoundary int32
+
+const (
+	// readBoundaryOff leaves the reads of the connection as TCP delivers them.
+	readBoundaryOff readBoundary = iota
+	// readBoundaryFullPrebuffer makes the next read that net/http issues with
+	// its 4096-byte connection buffer return a full buffer, which is what its
+	// Peek(4) wait after a response buffers when a large head arrives at once.
+	readBoundaryFullPrebuffer
+	// readBoundaryShortPrebuffer makes that read return at most
+	// shortPrebufferBytes, about one TCP segment, and holds the rest back for
+	// the reads after it.
+	readBoundaryShortPrebuffer
+)
+
+const (
+	// connReadBufferBytes is the size of the buffer that net/http reads a
+	// connection through.
+	connReadBufferBytes = 4096
+	// shortPrebufferBytes is the first read of a head that arrived in several
+	// TCP segments of a typical 1500-byte path MTU.
+	shortPrebufferBytes = 1460
+)
+
+// readBoundaries wraps the connections that a listener accepts so that a test
+// decides how much of the head that follows a response the keep-alive wait of
+// net/http buffers. Without it the amount depends on how the kernel splits the
+// bytes of one write into reads, which differs between machines and runs.
+type readBoundaries struct {
+	net.Listener
+	mode atomic.Int32
+}
+
+// set arms the next qualifying read of any accepted connection. Call it after
+// the response before the head and before writing that head: net/http is
+// already blocked in the read at that moment, and the mode applies when that
+// read returns.
+func (l *readBoundaries) set(mode readBoundary) {
+	l.mode.Store(int32(mode))
+}
+
+func (l *readBoundaries) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &boundedConn{Conn: conn, owner: l}, nil
+}
+
+type boundedConn struct {
+	net.Conn
+	owner *readBoundaries
+	// held is the part of an earlier read that a short read held back. Only
+	// the goroutine that reads the connection touches it.
+	held []byte
+}
+
+func (c *boundedConn) Read(p []byte) (int, error) {
+	if len(c.held) > 0 {
+		n := copy(p, c.held)
+		c.held = c.held[n:]
+		return n, nil
+	}
+	n, err := c.Conn.Read(p)
+	// Only the read through the full connection buffer is the keep-alive wait;
+	// the one-byte background read during a handler must not use up the mode.
+	if n == 0 || err != nil || len(p) < connReadBufferBytes {
+		return n, err
+	}
+	switch readBoundary(c.owner.mode.Load()) {
+	case readBoundaryFullPrebuffer:
+		if !c.owner.mode.CompareAndSwap(int32(readBoundaryFullPrebuffer), int32(readBoundaryOff)) {
+			return n, nil
+		}
+		if n < connReadBufferBytes {
+			more, err := io.ReadFull(c.Conn, p[n:connReadBufferBytes])
+			n += more
+			if err != nil {
+				return n, err
+			}
+		}
+	case readBoundaryShortPrebuffer:
+		if !c.owner.mode.CompareAndSwap(int32(readBoundaryShortPrebuffer), int32(readBoundaryOff)) {
+			return n, nil
+		}
+		if n > shortPrebufferBytes {
+			c.held = append([]byte(nil), p[shortPrebufferBytes:n]...)
+			n = shortPrebufferBytes
+		}
+	}
+	return n, nil
+}
+
+// serveObservedBounded is serveObservedWith on a listener whose reads the test
+// controls through the returned readBoundaries.
+func serveObservedBounded(t *testing.T, handler http.HandlerFunc, configure func(*http.Server)) (string, *lockedBuffer, *readBoundaries) {
+	t.Helper()
+	var bounds *readBoundaries
+	addr, logs := serveObservedOn(t, handler, configure, func(listener net.Listener) net.Listener {
+		bounds = &readBoundaries{Listener: listener}
+		return bounds
+	})
+	return addr, logs, bounds
 }
 
 func countRecords(logs *lockedBuffer, msg string) int {
@@ -2089,11 +2209,14 @@ func TestKeepAliveHeadBeyondTheFirstHeadLimit(t *testing.T) {
 	for _, over := range []int{1, 904, 4096} {
 		size := maxObservedHeadBytes + over
 		t.Run("later 417 is logged, head "+strconv.Itoa(over)+" bytes over the first head limit", func(t *testing.T) {
-			addr, logs := serveObserved(t, handler)
+			addr, logs, bounds := serveObservedBounded(t, handler, nil)
 			conn, reader := dial(t, addr)
 			if got := roundTrip(t, conn, reader, first); got != http.StatusOK {
 				t.Fatalf("first status = %d, want 200", got)
 			}
+			// net/http buffers a full 4096 bytes of the head in its keep-alive
+			// wait, so it does not charge them to the head's limit.
+			bounds.set(readBoundaryFullPrebuffer)
 			if got := roundTrip(t, conn, reader, headOfSize("/big", size, "")); got != http.StatusOK {
 				t.Fatalf("big status = %d, want 200 (net/http serves a head of %d bytes here)", got, size)
 			}
@@ -2114,13 +2237,14 @@ func TestKeepAliveHeadBeyondTheFirstHeadLimit(t *testing.T) {
 	}
 
 	t.Run("later header read timeout is logged", func(t *testing.T) {
-		addr, logs := serveObservedWith(t, handler, func(srv *http.Server) {
+		addr, logs, bounds := serveObservedBounded(t, handler, func(srv *http.Server) {
 			srv.ReadHeaderTimeout = headerTimeout
 		})
 		conn, reader := dial(t, addr)
 		if got := roundTrip(t, conn, reader, first); got != http.StatusOK {
 			t.Fatalf("first status = %d, want 200", got)
 		}
+		bounds.set(readBoundaryFullPrebuffer)
 		if got := roundTrip(t, conn, reader, headOfSize("/big", maxObservedHeadBytes+5000-4096, "")); got != http.StatusOK {
 			t.Fatalf("big status = %d, want 200", got)
 		}
@@ -2157,6 +2281,42 @@ func TestKeepAliveHeadBeyondTheFirstHeadLimit(t *testing.T) {
 		}
 	})
 
+	t.Run("a head that needs the full prebuffer is a 431 after a short read", func(t *testing.T) {
+		addr, logs, bounds := serveObservedBounded(t, handler, nil)
+		conn, reader := dial(t, addr)
+		if got := roundTrip(t, conn, reader, first); got != http.StatusOK {
+			t.Fatalf("first status = %d, want 200", got)
+		}
+		// Only about one TCP segment of the head is buffered before net/http
+		// reads it, so it charges all but that part to the head: the largest
+		// head that a full prebuffer accepts is too large now. The 431 closes
+		// the connection, so the request after the head must not be logged.
+		bounds.set(readBoundaryShortPrebuffer)
+		request := headOfSize("/big", maxObservedFollowUpHeadBytes, "") + pony
+		if got := roundTrip(t, conn, reader, request); got != http.StatusRequestHeaderFieldsTooLarge {
+			t.Fatalf("status = %d, want 431", got)
+		}
+		// The server closes the connection after the 431: reading to the end
+		// returns before the deadline instead of waiting for another response.
+		if _, err := io.ReadAll(reader); err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				t.Fatalf("the connection stayed open after the 431")
+			}
+		}
+		waitFor(logs, "http_request_rejected", 1)
+		records := rejectedRecords(t, logs)
+		if len(records) != 1 || records[0].Reason != string(RejectionHeaderTooLarge) || records[0].Status != http.StatusRequestHeaderFieldsTooLarge {
+			t.Fatalf("rejected records = %+v, want one request_header_too_large 431: %s", records, logs.String())
+		}
+		if got := countRecords(logs, "http_request"); got != 1 {
+			t.Errorf("http_request records = %d, want only the first request: %s", got, logs.String())
+		}
+		if strings.Contains(logs.String(), `"path":"/missing"`) || strings.Contains(logs.String(), `"path":"/big"`) {
+			t.Errorf("a record was written for a request that net/http rejected or never read: %s", logs.String())
+		}
+	})
+
 	t.Run("a fresh connection keeps the first head limit", func(t *testing.T) {
 		for _, tc := range []struct {
 			size int
@@ -2174,13 +2334,14 @@ func TestKeepAliveHeadBeyondTheFirstHeadLimit(t *testing.T) {
 	})
 
 	t.Run("a stall in the middle of a line after a large head is a malformed request", func(t *testing.T) {
-		addr, logs := serveObservedWith(t, handler, func(srv *http.Server) {
+		addr, logs, bounds := serveObservedBounded(t, handler, func(srv *http.Server) {
 			srv.ReadHeaderTimeout = headerTimeout
 		})
 		conn, reader := dial(t, addr)
 		if got := roundTrip(t, conn, reader, first); got != http.StatusOK {
 			t.Fatalf("first status = %d, want 200", got)
 		}
+		bounds.set(readBoundaryFullPrebuffer)
 		if got := roundTrip(t, conn, reader, headOfSize("/big", maxObservedHeadBytes+904, "")); got != http.StatusOK {
 			t.Fatalf("big status = %d, want 200", got)
 		}
