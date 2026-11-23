@@ -13,6 +13,9 @@
 #   CHANGESET_BLOBS      JSON object that maps each planned changeset id to
 #                        its Git blob SHA at the plan. A retry after `main`
 #                        moved stops when one of them changed or is gone.
+#   GITHUB_RUN_ID        optional run ID; the version commit records it
+#                        (`Deployment run:`), so that `release-recovery.sh`
+#                        binds a landed release to the run that made it.
 #   GITHUB_STEP_SUMMARY  optional summary file.
 #   DEPLOY_RELEASE_MAX_ATTEMPTS  optional push attempts (default 3).
 set -euo pipefail
@@ -63,6 +66,9 @@ trap 'rm -f "$message_file"' EXIT
 {
   printf 'chore(release): version deployed packages\n\n'
   printf 'Deployed revision: %s\n' "$SHA"
+  if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+    printf 'Deployment run: %s\n' "$GITHUB_RUN_ID"
+  fi
   if (( ${#tags[@]} > 0 )); then
     printf '\n'
     printf -- '- %s\n' "${tags[@]}"
