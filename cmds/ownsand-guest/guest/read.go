@@ -93,9 +93,14 @@ type readManager struct {
 	// dir is the snapshot directory of this manager: a directory with a
 	// unique name inside the reads directory of the state directory (see
 	// newReadManager).
-	dir       string
-	entries   map[string]*readEntry
-	expired   map[string]time.Time
+	dir     string
+	entries map[string]*readEntry
+	expired map[string]time.Time
+	// pending maps a read_id to the snapshot path whose removal failed. It is
+	// independent of expired: sweep retries the removal on every run until it
+	// succeeds or the file is already gone, also after the read_id left the
+	// expired memory. Guarded by mu.
+	pending   map[string]string
 	now       func() time.Time
 	retention time.Duration
 	logger    *slog.Logger
@@ -115,6 +120,9 @@ type readManager struct {
 	// openSnapshot opens a snapshot file for reading chunks; nil means
 	// os.Open. Tests replace it to stall a chunk read.
 	openSnapshot func(path string) (snapshotFile, error)
+	// removeFile removes a snapshot file; nil means os.Remove. Tests replace
+	// it to fail a removal.
+	removeFile func(path string) error
 }
 
 // open opens the snapshot file at path for one read call.
@@ -149,6 +157,7 @@ func newReadManager(root string, now func() time.Time, logger *slog.Logger) (*re
 		dir:       dir,
 		entries:   map[string]*readEntry{},
 		expired:   map[string]time.Time{},
+		pending:   map[string]string{},
 		now:       now,
 		retention: OperationRetention,
 		logger:    logger,
@@ -214,6 +223,17 @@ func (m *readManager) begin(readID, path string) (*readEntry, error) {
 		}
 		e.open++
 		return e, nil
+	}
+	// A removal that failed for an earlier snapshot of this read_id is still
+	// pending once the expired memory ended. The new snapshot uses the same
+	// path, so settle the old removal first; otherwise a later retry would
+	// delete the live snapshot.
+	if path, ok := m.pending[readID]; ok {
+		m.removeSnapshot(readID, path)
+		if _, ok := m.pending[readID]; ok {
+			return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE,
+				"read: the earlier snapshot of this read_id could not be removed yet")
+		}
 	}
 	e := &readEntry{
 		path:     nativePath(path),
@@ -430,8 +450,25 @@ func sourceUnchanged(before os.FileInfo, in *os.File, src string) bool {
 }
 
 // removeSnapshot removes the snapshot file of readID. The caller holds m.mu.
+// A failure keeps the path in m.pending, so that a later sweep retries it;
+// success or an already absent file clears it. The warning is logged once per
+// pending removal, so retries of a persistent failure do not repeat it.
 func (m *readManager) removeSnapshot(readID, snapshot string) {
-	if err := os.Remove(snapshot); err != nil && !errors.Is(err, os.ErrNotExist) {
+	remove := m.removeFile
+	if remove == nil {
+		remove = os.Remove
+	}
+	_, retry := m.pending[readID]
+	err := remove(snapshot)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		delete(m.pending, readID)
+		if retry {
+			m.logger.Info("read snapshot removed after retry", "read_id", readID)
+		}
+		return
+	}
+	m.pending[readID] = snapshot
+	if !retry {
 		// The error is reduced to its reason: the helper never logs paths.
 		m.logger.Warn("remove read snapshot failed", "read_id", readID, "error", sanitizedError(err))
 	}
@@ -462,6 +499,16 @@ func (m *readManager) sweep(now time.Time) {
 		m.removeSnapshot(id, e.snapshot)
 		m.expired[id] = now
 		m.logger.Info("read expired", "read_id", id)
+	}
+	// Retry removals that failed earlier, whether or not the read_id is still
+	// in the expired memory. An id with a live entry cannot be pending (begin
+	// settles the removal first); skip it anyway, so that a retry can never
+	// delete the snapshot of an active or still prepared read.
+	for id, path := range m.pending {
+		if _, live := m.entries[id]; live {
+			continue
+		}
+		m.removeSnapshot(id, path)
 	}
 	for id, at := range m.expired {
 		if now.Sub(at) >= ExpiredMemory {

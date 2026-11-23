@@ -14,6 +14,9 @@
 #
 # A lock file `state/<service>.lock` (`flock`) serializes deployments and
 # rollbacks of one service: a second run waits until the first one ends.
+# A second lock file `state/.proxy.lock` serializes the route change and the
+# proxy reload of every service: a reload applies the whole shared Caddyfile,
+# so two runs that interleave could restore a route that another run replaced.
 #
 # Steps: pull the image by digest, start a new container next to the running
 # one under its own unique network alias (it does not join the alias of the
@@ -79,6 +82,11 @@
 #   DROPLET_LOCK_TIMEOUT    seconds to wait for a running deployment of the
 #                           same service to finish before the script gives up
 #                           without a change (default 600).
+#   DROPLET_PROXY_LOCK_TIMEOUT
+#                           seconds to wait for another service to finish its
+#                           route change and proxy reload before the script
+#                           gives up without changing the route (default: the
+#                           value of DROPLET_LOCK_TIMEOUT).
 set -euo pipefail
 
 # The whole script is one function that the last line calls with standard
@@ -146,6 +154,7 @@ main() {
   local health_timeout="${DROPLET_HEALTH_TIMEOUT:-120}"
   local stop_timeout="${DROPLET_STOP_TIMEOUT:-30}"
   local lock_timeout="${DROPLET_LOCK_TIMEOUT:-600}"
+  local proxy_lock_timeout="${DROPLET_PROXY_LOCK_TIMEOUT:-$lock_timeout}"
   local env_file="$root/env/$service.env"
   local site="$root/caddy/sites/$service.caddy"
   local state="$root/state/$service"
@@ -261,16 +270,35 @@ main() {
     fi
   fi
 
-  # A signal during the route switch is only recorded: the route file and the
-  # proxy reload run as one step, and restoring the previous containers after
-  # a switch that succeeded would remove the replacement that the route names.
+  # One route change and proxy reload at a time on the Droplet. `caddy reload`
+  # adapts and applies the whole Caddyfile with every `sites/*.caddy` file, so
+  # a run of another service that adapts it between this run's route install
+  # and a rejected reload could apply, or restore, an obsolete route. The lock
+  # is taken after the service lock (never the other way round, so no deadlock)
+  # and before the first route file is touched, and it stays held until the
+  # reload succeeded or the route file is restored. A run that cannot take it
+  # changes no route file and takes the same failure path as a rejected
+  # route. It waits before the signal traps below are set, so that a signal
+  # ends the wait like it ends any other step before the route switch.
   local pending_signal=""
-  if (( ${#publish[@]} > 0 )); then
-    trap 'pending_signal=TERM' TERM
-    trap 'pending_signal=INT' INT
-    trap 'pending_signal=HUP' HUP
+  local proxy_lock_fd="" route_switched=""
+  if acquire_proxy_lock "$root/state/.proxy.lock" "$proxy_lock_timeout" "$service" proxy_lock_fd; then
+    # A signal during the route switch is only recorded: the route file and
+    # the proxy reload run as one step, and restoring the previous containers
+    # after a switch that succeeded would remove the replacement that the
+    # route names.
+    if (( ${#publish[@]} > 0 )); then
+      trap 'pending_signal=TERM' TERM
+      trap 'pending_signal=INT' INT
+      trap 'pending_signal=HUP' HUP
+    fi
+    if write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol"; then
+      route_switched=1
+    fi
+    # Closing the descriptor releases the lock; the route file is final now.
+    exec {proxy_lock_fd}>&-
   fi
-  if ! write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol"; then
+  if [[ -z "$route_switched" ]]; then
     discard_replacement "$new"
     if (( ${#stopped[@]} > 0 )); then
       restart_previous "${stopped[@]}"
@@ -472,13 +500,35 @@ wait_healthy() {
   return 1
 }
 
+# Takes the lock that serializes the route changes and proxy reloads of all
+# services (see the call in `main`). `$1` is the lock file, `$2` the timeout in
+# seconds, `$3` the service name for the message and `$4` the name of the
+# variable that receives the file descriptor, which the caller closes to
+# release the lock. The kernel also releases it when the script exits. The
+# caller evaluates this function as an `if` condition, so every step checks
+# its own status. Changes no route file.
+acquire_proxy_lock() {
+  local lock_file="$1" timeout="$2" service="$3" fd
+  if ! { exec {fd}> "$lock_file"; } 2> /dev/null; then
+    echo "::error::could not open the proxy lock file $lock_file." >&2
+    return 1
+  fi
+  if ! flock --wait "$timeout" "$fd"; then
+    echo "::error::another deployment held the proxy lock $lock_file for $timeout seconds; the route of $service was not changed. Run the deployment again when it has finished." >&2
+    exec {fd}>&-
+    return 1
+  fi
+  printf -v "$4" '%s' "$fd"
+}
+
 # Writes the reverse proxy route of the service to the unique alias of its
 # replacement container and reloads the proxy. The caller evaluates this function as an `if` condition, which
 # disables `set -e` inside it, so every step checks its own status and names
 # the failed operation. The previous route stays in place until the new route
 # is complete (the new route goes to a temporary file that `mv` renames over
 # the route file), and the proxy reloads only after that. Restores the
-# previous route when the proxy rejects the new one.
+# previous route when the proxy rejects the new one. The caller holds the
+# proxy lock (`acquire_proxy_lock`) for the whole call.
 write_route() {
   local site="$1" service="$2" upstream="$3" port="$4" hostname="$5" proxy="$6" protocol="$7"
   local route

@@ -671,9 +671,9 @@ export function createFakeApi(): FakeApi {
 export const numbered = (n: number) => String(n).padStart(4, "0");
 
 /**
- * Adds billing accounts that the signed-in user owns, named `Account 0001`
- * and so on, after the seeded account. They hold no members, invitations or
- * linked organizations beyond their owner.
+ * Adds billing accounts that the signed-in user (`api.userId` when called)
+ * owns, named `Account 0001` and so on, after the seeded account. They hold
+ * no members, invitations or linked organizations beyond that owner.
  */
 export function addBillingAccounts(api: FakeApi, count: number) {
   for (let n = 1; n <= count; n++) {
@@ -685,7 +685,7 @@ export function addBillingAccounts(api: FakeApi, count: number) {
       members: [
         {
           billingAccountId: id,
-          userId: OWNER,
+          userId: api.userId,
           role: BillingAccountRole.OWNER,
           displayName: "Olivia Owner",
           createTime: ts(),
