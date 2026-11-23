@@ -560,9 +560,14 @@ func TestDNSForwarderRefusesConnAcceptedDuringClose(t *testing.T) {
 	// default 30-second deadline.
 	up := startTCPUpstream(t, func(c net.Conn) { io.Copy(io.Discard, c) })
 	hook, paused, resume := pauseAfterAdmit()
-	defer resume()
 	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 2, afterAdmit: hook})
-	defer f.Close()
+	// Release the hook before Close: Close waits for serveTCP, which stays
+	// blocked in the hook until resume runs, so a t.Fatal between "paused" and
+	// the explicit resume would otherwise hang the test in Close.
+	defer func() {
+		resume()
+		f.Close()
+	}()
 
 	c, err := net.Dial("tcp", f.Addr().String())
 	if err != nil {
@@ -608,9 +613,14 @@ func TestDNSForwarderRefusesConnAcceptedDuringClose(t *testing.T) {
 func TestDNSForwarderRefusesConnAcceptedDuringCloseAtCapacity(t *testing.T) {
 	up := startTCPUpstream(t, func(c net.Conn) { io.Copy(io.Discard, c) })
 	hook, paused, resume := pauseAfterAdmit()
-	defer resume()
 	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, afterAdmit: hook})
-	defer f.Close()
+	// Release the hook before Close: Close waits for serveTCP, which stays
+	// blocked in the hook until resume runs, so a t.Fatal between "paused" and
+	// the explicit resume would otherwise hang the test in Close.
+	defer func() {
+		resume()
+		f.Close()
+	}()
 
 	// The only slot is held by the paused connection; a second connection is
 	// refused at capacity and does not disturb the paused one.
@@ -794,6 +804,8 @@ func TestDNSForwarderCloseDuringDialEndsUpstreamConn(t *testing.T) {
 	})
 	dialing := make(chan struct{})
 	finish := make(chan struct{})
+	var finishOnce sync.Once
+	release := func() { finishOnce.Do(func() { close(finish) }) }
 	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
 		close(dialing)
 		<-finish
@@ -802,7 +814,14 @@ func TestDNSForwarderCloseDuringDialEndsUpstreamConn(t *testing.T) {
 		return d.DialContext(context.Background(), network, address)
 	}
 	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, dial: dial})
-	defer f.Close()
+	// Release the blocked dial before Close: Close waits for the worker that
+	// waits on finish, so an early t.Fatal would otherwise hang the test in
+	// Close. The release is idempotent; the normal flow releases it explicitly
+	// once the cancellation is observed.
+	defer func() {
+		release()
+		f.Close()
+	}()
 
 	c := dnsTCPConn(t, f, "late")
 	requireClosedWithin(t, "dial start", dialing, 5*time.Second)
@@ -816,7 +835,7 @@ func TestDNSForwarderCloseDuringDialEndsUpstreamConn(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	close(finish)
+	release()
 	requireClosedWithin(t, "Close", done, 3*time.Second)
 	requireClosedWithin(t, "upstream EOF", upstreamEOF, 2*time.Second)
 	c.SetReadDeadline(time.Now().Add(2 * time.Second))
