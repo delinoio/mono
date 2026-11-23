@@ -168,20 +168,30 @@ export function InfiniteListNotice({ list }: { list: InfiniteListState }) {
 
 /**
  * The state of the pages after the first one: a short loading line while
- * later pages load and an error with a retry that resumes at the failed page.
- * The items of the earlier pages stay visible above it.
+ * later pages load and an error with a retry that resumes at the failed page,
+ * or the sign-in action when the session ended. The items of the earlier pages
+ * stay visible above it.
  */
 export function MorePages({ pages }: { pages: AllPages<unknown> }) {
   if (pages.continuationError !== undefined) {
+    // An ended session cannot recover through a retry, so offer the sign-in
+    // action instead, like `ErrorNotice`. The loaded rows stay either way.
+    const unauthenticated =
+      pages.continuationError instanceof ConnectError &&
+      pages.continuationError.code === Code.Unauthenticated;
     return (
       <div className="notice notice-error" role="alert">
         <p>Some items did not load. {errorMessage(pages.continuationError)}</p>
-        <Button
-          variant={ButtonVariant.Secondary}
-          onClick={pages.retryContinuation}
-        >
-          Try again
-        </Button>
+        {unauthenticated ? (
+          <SignInAgainButton onSignIn={undefined} />
+        ) : (
+          <Button
+            variant={ButtonVariant.Secondary}
+            onClick={pages.retryContinuation}
+          >
+            Try again
+          </Button>
+        )}
       </div>
     );
   }
