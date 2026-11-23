@@ -54,7 +54,22 @@ func NewControl(s *Service) *Control {
 	}
 	c.handleEvent = c.handle
 	s.Notify = c.Kick
+	s.BaselineReady = c.baselineReady
 	return c
+}
+
+// baselineReady reports whether the cursor of the current lease period is
+// set. Agent channel admission requires it (Service.BaselineReady): the
+// baseline then precedes everything that a channel reads, so a control event
+// that commits after a channel observed the device state or limits is after
+// the baseline and the event processor delivers it. LeaseLost clears the
+// cursor, so a later lease period starts without a baseline again. The
+// check takes only c.mu, and no code path takes the lease lock while it
+// holds c.mu, so it is safe inside Lease.WhileHeld.
+func (c *Control) baselineReady() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cursor >= 0
 }
 
 // Kick asks the event processor to poll now.
@@ -71,6 +86,9 @@ func (c *Control) Kick() {
 // lease cancels ctx at the confirmed expiry of the ownership period, so the
 // database read cannot delay the loss transition; a failed read leaves the
 // cursor unset and the event processor repeats it while the lease is held.
+// The lease is already held while this runs, but agent channels are refused
+// until the cursor is stored (baselineReady), so no channel is admitted
+// before the baseline.
 func (c *Control) LeaseAcquired(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

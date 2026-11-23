@@ -94,6 +94,16 @@ type Service struct {
 	// Agent channel dependencies.
 	Hub   *hub.Hub
 	Lease LeaseHolder
+	// BaselineReady, when set, reports whether the lease holder's control
+	// event baseline (the cursor) is established for the current lease
+	// period. Channel admission runs it inside Lease.WhileHeld and refuses a
+	// channel while it reports false, so every channel observes the state
+	// and the device limits after the baseline: an event at or before the
+	// baseline is visible to what the channel reads, and an event after it
+	// reaches the channel through the event processor. It must be in-memory
+	// work that does not call the lease. NewControl installs it; nil admits
+	// whenever the lease is held.
+	BaselineReady func() bool
 	// Objects signs snapshot part URLs and deletes R2 prefixes; nil when R2
 	// is not configured.
 	Objects objectstore.Store

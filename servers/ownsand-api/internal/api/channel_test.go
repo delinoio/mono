@@ -1621,6 +1621,9 @@ func newInstance(t *testing.T, env *testenv.Env, lease api.LeaseHolder) *instanc
 		g.hub = a.Service.Hub
 	}
 	a.Service.Lease = lease
+	// The instance runs no control worker, so it never stores a control event
+	// baseline; the stub lease decides admission alone.
+	a.Service.BaselineReady = nil
 	srv := httptest.NewUnstartedServer(a.Handler())
 	srv.EnableHTTP2 = true
 	srv.StartTLS()
