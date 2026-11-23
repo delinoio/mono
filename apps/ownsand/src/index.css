@@ -263,6 +263,13 @@ h2 {
   background: var(--dui-color-surface);
 }
 
+/* The wrapper is a focusable scroll region, so it shows the same ring as a
+   link for keyboard focus and none for a mouse click. */
+.table-wrap:focus-visible {
+  outline: 2px solid var(--dui-color-focus-ring);
+  outline-offset: 2px;
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;

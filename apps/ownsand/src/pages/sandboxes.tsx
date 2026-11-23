@@ -39,6 +39,7 @@ import {
   QueryBoundary,
   SandboxStateBadge,
   ShortId,
+  TableRegion,
   isTerminalError,
   shortIdText,
 } from "../components/ui.tsx";
@@ -150,7 +151,7 @@ export function SandboxesPage() {
               Create a sandbox, or change the filters.
             </Empty>
           ) : (
-            <div className="table-wrap">
+            <TableRegion label="Sandbox list">
               <table className="table">
                 <thead>
                   <tr>
@@ -174,7 +175,7 @@ export function SandboxesPage() {
                   ))}
                 </tbody>
               </table>
-            </div>
+            </TableRegion>
           )
         }
       </QueryBoundary>

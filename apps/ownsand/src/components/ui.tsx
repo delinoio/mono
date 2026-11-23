@@ -329,6 +329,25 @@ export function Empty({
   );
 }
 
+/**
+ * The horizontally scrolling wrapper of a table. The name and `tabIndex` make
+ * the scroll region reachable and operable with the keyboard (arrow keys
+ * scroll it once it has focus) and announce it to screen readers.
+ */
+export function TableRegion({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="table-wrap" role="region" aria-label={label} tabIndex={0}>
+      {children}
+    </div>
+  );
+}
+
 const SANDBOX_BADGE: Partial<Record<SandboxState, BadgeVariant>> = {
   [SandboxState.RUNNING]: BadgeVariant.Accent,
   [SandboxState.FAILED]: BadgeVariant.Danger,
