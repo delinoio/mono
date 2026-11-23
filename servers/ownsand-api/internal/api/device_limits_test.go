@@ -80,8 +80,8 @@ func TestReplaceDeviceLimitsRequiresEveryField(t *testing.T) {
 				t.Errorf("%s: omit %s: %v", name, tc.field, err)
 			}
 			got, err := org.OwnerClient.Device.GetDevice(ctx, connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: dev.ID}))
-			if err != nil || !proto.Equal(got.Msg.GetDevice().GetLimits(), wantLimits) {
-				t.Errorf("%s: omit %s: stored limits = %v, %v", name, tc.field, got.Msg.GetDevice().GetLimits(), err)
+			if problem := readbackLimitsProblem(got, err, wantLimits); problem != "" {
+				t.Errorf("%s: omit %s: %s", name, tc.field, problem)
 			}
 			if e, a := deviceWriteCounts(t, env, org.ID, dev.ID); e != baseEvents || a != baseAudits {
 				t.Errorf("%s: omit %s: events = %d, audits = %d, want %d, %d", name, tc.field, e, a, baseEvents, baseAudits)
@@ -156,8 +156,8 @@ func TestReplaceDeviceLimitsAcceptsExplicitZero(t *testing.T) {
 				t.Fatalf("%s: zero %s: response limits = %v, want %v", name, field, resp.Msg.GetDevice().GetLimits(), want)
 			}
 			got, err := org.OwnerClient.Device.GetDevice(ctx, connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: dev.ID}))
-			if err != nil || !proto.Equal(got.Msg.GetDevice().GetLimits(), want) {
-				t.Fatalf("%s: zero %s: stored limits = %v, %v", name, field, got.Msg.GetDevice().GetLimits(), err)
+			if problem := readbackLimitsProblem(got, err, want); problem != "" {
+				t.Fatalf("%s: zero %s: %s", name, field, problem)
 			}
 			if e, a := deviceWriteCounts(t, env, org.ID, dev.ID); e != baseEvents+1 || a != baseAudits+1 {
 				t.Fatalf("%s: zero %s: events = %d, audits = %d, want %d, %d", name, field, e, a, baseEvents+1, baseAudits+1)
@@ -195,8 +195,8 @@ func TestReplaceDeviceLimitsUpdatesAllFour(t *testing.T) {
 		t.Fatalf("device = %v", d)
 	}
 	got, err := org.OwnerClient.Device.GetDevice(ctx, connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: dev.ID}))
-	if err != nil || !proto.Equal(got.Msg.GetDevice().GetLimits(), want) {
-		t.Fatalf("stored = %v, %v", got.Msg.GetDevice().GetLimits(), err)
+	if problem := readbackLimitsProblem(got, err, want); problem != "" {
+		t.Fatal(problem)
 	}
 	if e, a := deviceWriteCounts(t, env, org.ID, dev.ID); e != baseEvents+1 || a != baseAudits+1 {
 		t.Fatalf("events = %d, audits = %d, want %d, %d", e, a, baseEvents+1, baseAudits+1)
