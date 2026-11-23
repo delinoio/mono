@@ -1160,12 +1160,18 @@ describe("chunkSource", () => {
 
   test("keeps a yielded chunk when the caller overwrites its buffer afterwards", async () => {
     const input = new Uint8Array([1, 1, 1, 1, 2, 2, 2, 2, 3]);
-    const seen: number[][] = [];
+    // Retain the yielded views themselves and read them only after the loop:
+    // a chunk that aliased the input would show the overwritten bytes.
+    const views: Uint8Array[] = [];
     for await (const c of chunkSource(input, 4)) {
-      seen.push([...c.data]);
+      views.push(c.data);
       input.fill(9);
     }
-    expect(seen).toEqual([[1, 1, 1, 1], [2, 2, 2, 2], [3]]);
+    expect(views.map((view) => [...view])).toEqual([
+      [1, 1, 1, 1],
+      [2, 2, 2, 2],
+      [3],
+    ]);
   });
 
   test("copies a bounded volume for large single-piece and split inputs", async () => {
