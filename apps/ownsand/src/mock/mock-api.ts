@@ -1090,6 +1090,14 @@ export function createMockTransport(
       transferOwnership(req) {
         const { org, role } = membership(req.organizationId);
         requireOwner(role);
+        // Like the control plane, the owner cannot transfer to themselves;
+        // this runs before any lookup or change.
+        if (req.userId === userId) {
+          throw new ConnectError(
+            "invalid user_id: the caller is already the owner",
+            Code.InvalidArgument,
+          );
+        }
         const target = org.members.find((m) => m.userId === req.userId);
         if (target === undefined)
           throw new ConnectError("member not found", Code.NotFound);
