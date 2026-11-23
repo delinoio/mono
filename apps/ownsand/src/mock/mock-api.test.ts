@@ -17,11 +17,17 @@ import {
   SandboxState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { uuidV7 } from "../uuid.ts";
-import { createMockTransport, MOCK_IDS, MockBillingState } from "./mock-api.ts";
+import {
+  createMockTransport,
+  MOCK_IDS,
+  MOCK_USER,
+  MockBillingState,
+} from "./mock-api.ts";
 
 describe("mock device list", () => {
   const organizationId = MOCK_IDS.acme;
@@ -753,5 +759,89 @@ describe("mock organization list paging", () => {
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ConnectError);
     expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+  });
+});
+
+describe("mock updateMemberRole", () => {
+  const organizationId = MOCK_IDS.acme;
+  const ada = "user-member-ada";
+
+  const rolesOf = async (client: ReturnType<typeof memberClient>) => {
+    const { members } = await client.listMembers({ organizationId });
+    return members.map((m) => [m.userId, m.role]);
+  };
+  const memberClient = (transport = createMockTransport()) =>
+    createClient(MemberService, transport);
+
+  test("rejects an omitted role before the member lookup", async () => {
+    const client = memberClient();
+    const before = await rolesOf(client);
+    const error = await client
+      .updateMemberRole({ organizationId, userId: ada })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+    expect(await rolesOf(client)).toEqual(before);
+  });
+
+  for (const [name, role] of [
+    ["an unspecified role", Role.UNSPECIFIED],
+    ["an unknown numeric role", 99 as Role],
+    ["the owner role", Role.OWNER],
+  ] as const) {
+    test(`rejects ${name} and changes nothing`, async () => {
+      const client = memberClient();
+      const before = await rolesOf(client);
+      const error = await client
+        .updateMemberRole({ organizationId, userId: ada, role })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+      expect(await rolesOf(client)).toEqual(before);
+    });
+  }
+
+  test("validates the role before it looks the member up", async () => {
+    const error = await memberClient()
+      .updateMemberRole({
+        organizationId,
+        userId: "user-unknown",
+        role: Role.OWNER,
+      })
+      .catch((e: unknown) => e);
+    expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+  });
+
+  test("still changes a member between admin and member", async () => {
+    const client = memberClient();
+    const promoted = await client.updateMemberRole({
+      organizationId,
+      userId: ada,
+      role: Role.ADMIN,
+    });
+    expect(promoted.member?.role).toBe(Role.ADMIN);
+    const demoted = await client.updateMemberRole({
+      organizationId,
+      userId: ada,
+      role: Role.MEMBER,
+    });
+    expect(demoted.member?.role).toBe(Role.MEMBER);
+    const { members } = await client.listMembers({ organizationId });
+    expect(members.find((m) => m.userId === ada)?.role).toBe(Role.MEMBER);
+  });
+
+  test("a valid role for the current owner is PermissionDenied", async () => {
+    const client = memberClient();
+    const before = await rolesOf(client);
+    const error = await client
+      .updateMemberRole({
+        organizationId,
+        userId: MOCK_USER,
+        role: Role.MEMBER,
+      })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).code).toBe(Code.PermissionDenied);
+    expect(await rolesOf(client)).toEqual(before);
   });
 });

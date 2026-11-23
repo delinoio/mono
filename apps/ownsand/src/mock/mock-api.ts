@@ -927,7 +927,7 @@ export function createMockTransport(
         requireAdmin(role);
         if (req.role !== Role.ADMIN && req.role !== Role.MEMBER) {
           throw new ConnectError(
-            "role must be admin or member",
+            "invalid role: must be ROLE_ADMIN or ROLE_MEMBER; use TransferOwnership for the owner",
             Code.InvalidArgument,
           );
         }
@@ -997,10 +997,19 @@ export function createMockTransport(
       updateMemberRole(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
+        // Mirrors the real API: only admin and member can be assigned. An
+        // omitted, unspecified, unknown or owner role is rejected before the
+        // member lookup, so nothing is read or changed.
+        if (req.role !== Role.ADMIN && req.role !== Role.MEMBER) {
+          throw new ConnectError(
+            "invalid role: must be ROLE_ADMIN or ROLE_MEMBER; use TransferOwnership for the owner",
+            Code.InvalidArgument,
+          );
+        }
         const target = org.members.find((m) => m.userId === req.userId);
         if (target === undefined)
           throw new ConnectError("member not found", Code.NotFound);
-        if (target.role === Role.OWNER || req.role === Role.OWNER) {
+        if (target.role === Role.OWNER) {
           throw new ConnectError(
             "use ownership transfer for the owner",
             Code.PermissionDenied,
