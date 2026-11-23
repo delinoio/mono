@@ -581,41 +581,78 @@ test(
   },
 );
 
+// A fake `go` for the tests that signal the launcher during the build. It
+// installs its signal trap before it publishes the ready marker, so a test that
+// waits for the marker never signals a build that cannot handle the signal yet.
+// On the signal it completes a build and exits 0: it writes a runnable program
+// to the -o path, then records "build-ok" as its last step. The program records
+// "executed" when it starts. The markers live in a test-owned directory outside
+// the launcher's TMPDIR (which the launcher's own cleanup assertion inspects).
+// The launcher reports the signal status whether or not the build succeeded and
+// whether or not the built program ran, so the tests assert both markers:
+// without them a failed build and a launcher that runs the program after the
+// signal would pass every other assertion.
+function signalDuringBuildFixture(t, signal) {
+  const markerDir = mkdtempSync(join(tmpdir(), "accounts-api-marker-"));
+  t.after(() => rmSync(markerDir, { recursive: true, force: true }));
+  const markers = {
+    ready: join(markerDir, "trap-ready"),
+    buildOk: join(markerDir, "build-ok"),
+    executed: join(markerDir, "executed"),
+  };
+  const program = `#!${process.execPath}
+require("node:fs").writeFileSync(${JSON.stringify(markers.executed)}, "");
+`;
+  const script = [
+    'while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done',
+    "sleep 60 &",
+    "pid=$!",
+    "finish() {",
+    "  kill $pid",
+    `  cat > "$out" <<'PROGRAM'\n${program}PROGRAM`,
+    '  chmod 755 "$out" && touch "$BUILD_OK"',
+    "  exit 0",
+    "}",
+    `trap finish ${signal}`,
+    'touch "$READY"',
+    "wait $pid",
+  ].join("\n");
+  return {
+    markers,
+    env: { READY: markers.ready, BUILD_OK: markers.buildOk },
+    pathPrefix: fakeGo(t, script),
+  };
+}
+
+function assertBuiltAndNeverRan(markers) {
+  assert.equal(
+    existsSync(markers.buildOk),
+    true,
+    "the signal handler did not complete a successful build",
+  );
+  assert.equal(
+    existsSync(markers.executed),
+    false,
+    "the built program ran after the signal",
+  );
+}
+
 test(
   "SIGTERM during the build never starts the server",
   { skip, timeout: Timeout * 2 },
   async (t) => {
     const port = await freePort();
-    const markerDir = mkdtempSync(join(tmpdir(), "accounts-api-marker-"));
-    t.after(() => rmSync(markerDir, { recursive: true, force: true }));
-    const marker = join(markerDir, "go-started");
-    // The fake go waits, then on SIGTERM completes a real build and exits 0.
-    // A launcher that ignored the termination would start the server next.
-    const realGo = join(
-      execFileSync("go", ["env", "GOROOT"], { encoding: "utf8" }).trim(),
-      "bin",
-      "go",
-    );
-    const run = startLauncher(t, {
-      port,
-      env: { REAL_GO: realGo, MARKER: marker },
-      pathPrefix: fakeGo(
-        t,
-        [
-          'touch "$MARKER"',
-          "sleep 60 &",
-          "pid=$!",
-          'trap \'kill $pid; exec "$REAL_GO" "$@"\' TERM',
-          "wait $pid",
-        ].join("\n"),
-      ),
-    });
-    await waitFor(run, () => existsSync(marker), "the build to start");
+    // The fake go waits, then on SIGTERM completes a build and exits 0. A
+    // launcher that ignored the termination would run the built program next.
+    const { markers, env, pathPrefix } = signalDuringBuildFixture(t, "TERM");
+    const run = startLauncher(t, { port, env, pathPrefix });
+    await waitFor(run, () => existsSync(markers.ready), "the build trap");
 
     process.kill(run.child.pid, "SIGTERM");
     const { code } = await run.exited;
 
     assert.equal(code, StatusSigterm, run.stderr);
+    assertBuiltAndNeverRan(markers);
     assert.doesNotMatch(run.stdout, /"server_started"/);
     await assertNoListener(port);
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
@@ -627,37 +664,18 @@ test(
   { skip, timeout: Timeout * 2 },
   async (t) => {
     const port = await freePort();
-    const markerDir = mkdtempSync(join(tmpdir(), "accounts-api-marker-"));
-    t.after(() => rmSync(markerDir, { recursive: true, force: true }));
-    const marker = join(markerDir, "go-started");
-    // The fake go waits, then on SIGQUIT completes a real build and exits 0.
-    // A launcher that ignored the signal would start the server next.
-    const realGo = join(
-      execFileSync("go", ["env", "GOROOT"], { encoding: "utf8" }).trim(),
-      "bin",
-      "go",
-    );
-    const run = startLauncher(t, {
-      port,
-      env: { REAL_GO: realGo, MARKER: marker },
-      pathPrefix: fakeGo(
-        t,
-        [
-          'touch "$MARKER"',
-          "sleep 60 &",
-          "pid=$!",
-          'trap \'kill $pid; exec "$REAL_GO" "$@"\' QUIT',
-          "wait $pid",
-        ].join("\n"),
-      ),
-    });
-    await waitFor(run, () => existsSync(marker), "the build to start");
+    // The fake go waits, then on SIGQUIT completes a build and exits 0. A
+    // launcher that ignored the signal would run the built program next.
+    const { markers, env, pathPrefix } = signalDuringBuildFixture(t, "QUIT");
+    const run = startLauncher(t, { port, env, pathPrefix });
+    await waitFor(run, () => existsSync(markers.ready), "the build trap");
 
     process.kill(-run.child.pid, "SIGQUIT");
     const { code } = await run.exited;
 
     assert.equal(code, StatusSigquit, run.stderr);
     assert.equal(countEvents(run.stderr, "accounts_api_dev_signal"), 1);
+    assertBuiltAndNeverRan(markers);
     assert.doesNotMatch(run.stdout, /"server_started"/);
     await assertNoListener(port);
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
