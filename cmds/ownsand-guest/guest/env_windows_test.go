@@ -23,6 +23,9 @@ func TestExecEnvWindows(t *testing.T) {
 		}
 	}
 	if !sawRequest || !sawOther {
-		t.Fatalf("request=%v other=%v env=%q", sawRequest, sawOther, env)
+		// Report only the two booleans: env is the merged process environment
+		// and inherits whatever credentials the runner carries, so it must not
+		// reach test logs.
+		t.Fatalf("request override kept=%v, unrelated variable kept=%v", sawRequest, sawOther)
 	}
 }
