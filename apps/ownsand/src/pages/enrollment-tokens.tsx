@@ -103,11 +103,15 @@ export function EnrollmentTokensPage() {
         onOpenChange={setCreating}
         title="Create an enrollment token"
         submitLabel="Create token"
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           const res = await create.mutateAsync({
             organizationId,
             ttl: { seconds: BigInt(Number(ttl) * 3600) },
           });
+          // The list refreshes either way (`onSuccess`). A request of a
+          // dismissed opening neither closes the form of a later opening nor
+          // shows its token; the token stays listed and can be revoked.
+          if (!opening.isCurrent()) return;
           setCreating(false);
           setToken(res.enrollmentToken);
         }}

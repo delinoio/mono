@@ -262,9 +262,13 @@ function OwnerActions() {
         title={`Delete ${name}?`}
         description="Every sandbox ends and every device is removed. This cannot be undone."
         confirmLabel="Delete organization"
-        onConfirm={async () => {
+        onConfirm={async (opening) => {
           await remove.mutateAsync({ organizationId });
-          navigate("/");
+          // Only the opening that asked for the deletion redirects; after a
+          // dismissal the user stays on the page they went to. The refresh
+          // runs either way, after the navigation decision, so a redirected
+          // user does not refetch the deleted organization's queries.
+          if (opening.isCurrent()) navigate("/");
           void invalidateServices(queryClient, OrganizationService);
         }}
       />

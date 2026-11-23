@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useMutation } from "@connectrpc/connect-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { Badge } from "delino-ui/badge";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { type FormEvent, useState } from "react";
+import { invalidateServices } from "../api.ts";
 import { TopBar } from "../components/shell.tsx";
 import {
   Empty,
@@ -21,6 +23,7 @@ import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 /** Route `organizations`: the organization list, creation and invitations. */
 export function OrganizationsPage() {
   const { navigate } = useRouter();
+  const queryClient = useQueryClient();
   const orgs = useOrganizations();
   const create = useMutation(OrganizationService.method.createOrganization);
   const [creating, setCreating] = useState(false);
@@ -123,9 +126,15 @@ export function OrganizationsPage() {
           setCreating(open);
           if (!open) setName("");
         }}
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           const res = await create.mutateAsync({ name: name.trim() });
-          await orgs.refetch();
+          // The list and the switcher refresh in the background. The console
+          // opens the new organization from the `CreateOrganization`
+          // response instead of waiting for the list refetch.
+          void invalidateServices(queryClient, OrganizationService);
+          // A request of a dismissed opening neither closes the form of a
+          // later opening nor moves the user away from the page they went to.
+          if (!opening.isCurrent()) return;
           setCreating(false);
           setName("");
           navigate(

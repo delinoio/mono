@@ -197,12 +197,15 @@ export function SnapshotsPage() {
         }}
         title="Make a template"
         submitLabel="Create template"
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           await createTemplate.mutateAsync({
             organizationId,
             snapshotId: templateFrom!.snapshotId,
             name: templateName.trim(),
           });
+          // The list refreshes either way (`onSuccess`). A request of a
+          // dismissed opening does not close the form of a later opening.
+          if (!opening.isCurrent()) return;
           setTemplateFrom(undefined);
           setTemplateName("");
         }}

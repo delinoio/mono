@@ -305,7 +305,7 @@ function CreateSandboxDialog({
         onOpenChange(next);
         if (!next) reset();
       }}
-      onSubmit={async () => {
+      onSubmit={async (opening) => {
         const next: Record<string, string> = {};
         const ttl = ttlErrors({ idleMinutes, maxHours });
         if (ttl.idle) next.idle = ttl.idle;
@@ -331,9 +331,14 @@ function CreateSandboxDialog({
           labels: parsed.labels,
         });
         // A new sandbox changes the allocation of its device. The device
-        // queries are marked stale for their next view and not awaited.
+        // and sandbox queries are marked stale and refetched in the
+        // background; the dialog closes and the detail page opens from the
+        // created sandbox without waiting for the list refetch.
         void invalidateServices(queryClient, DeviceService);
-        await invalidateServices(queryClient, SandboxService);
+        void invalidateServices(queryClient, SandboxService);
+        // A request of a dismissed opening neither closes the form of a
+        // later opening nor moves the user away from the page they went to.
+        if (!opening.isCurrent()) return;
         onOpenChange(false);
         reset();
         navigate(

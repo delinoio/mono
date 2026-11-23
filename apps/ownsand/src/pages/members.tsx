@@ -151,14 +151,17 @@ export function MembersPage() {
         title="Leave this organization?"
         description="You lose access to its devices and sandboxes. An admin can invite you again."
         confirmLabel="Leave organization"
-        onConfirm={async () => {
+        onConfirm={async (opening) => {
           await leave.mutateAsync({
             organizationId,
             userId: userId ?? "",
           });
-          navigate("/");
-          // After the navigation, so only the organization list at `/`
-          // refetches, and it is not awaited.
+          // Only the opening that asked to leave redirects; after a
+          // dismissal the user stays on the page they went to.
+          if (opening.isCurrent()) navigate("/");
+          // After the navigation decision, so a redirected user refetches
+          // only the organization list at `/`. It is not awaited and runs
+          // for a dismissed opening too.
           void refresh();
         }}
       />
@@ -244,11 +247,15 @@ function Invitations() {
         title="Invite someone"
         description="You get a one-time link that works for 7 days. Send it to the person you invite."
         submitLabel="Create link"
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           const res = await create.mutateAsync({
             organizationId,
             role: Number(inviteRole) as Role,
           });
+          // The list refreshes either way (`onSuccess`). A request of a
+          // dismissed opening neither closes the form of a later opening nor
+          // shows its link; the invitation stays listed and can be revoked.
+          if (!opening.isCurrent()) return;
           setCreating(false);
           setLink(invitationLink(window.location.origin, res.invitationSecret));
         }}
