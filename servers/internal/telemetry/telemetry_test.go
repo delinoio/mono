@@ -92,9 +92,10 @@ func TestPrometheusNames(t *testing.T) {
 
 // otlpServer records the OTLP/HTTP requests it receives.
 type otlpServer struct {
-	mu    sync.Mutex
-	paths []string
-	logs  []string
+	mu      sync.Mutex
+	paths   []string
+	headers []http.Header
+	logs    []string
 }
 
 func (s *otlpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -111,6 +112,7 @@ func (s *otlpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.paths = append(s.paths, r.URL.Path)
+	s.headers = append(s.headers, r.Header.Clone())
 	if r.URL.Path == "/v1/logs" {
 		var req collogspb.ExportLogsServiceRequest
 		if err := proto.Unmarshal(data, &req); err == nil {
@@ -130,6 +132,7 @@ func (s *otlpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // TestOTLPExport checks that OTEL_EXPORTER_OTLP_ENDPOINT turns on the export
 // of metrics and of the log records at or above the logger level.
 func TestOTLPExport(t *testing.T) {
+	clearOTLPEnv(t)
 	ctx := context.Background()
 	collector := &otlpServer{}
 	srv := httptest.NewServer(collector)
@@ -297,5 +300,56 @@ func TestShutdownWithoutLogExport(t *testing.T) {
 	defer collector.mu.Unlock()
 	if !slices.Contains(collector.paths, "/v1/metrics") || slices.Contains(collector.paths, "/v1/logs") {
 		t.Errorf("OTLP paths = %v", collector.paths)
+	}
+}
+
+// TestOTLPExportIgnoresInheritedSettings checks that OTLP settings that the
+// test process inherits (signal-specific endpoints, generic and
+// signal-specific headers and compression) cannot redirect or alter the export
+// of the fixture tests: they reach the fixture collector alone, without the
+// inherited headers.
+func TestOTLPExportIgnoresInheritedSettings(t *testing.T) {
+	alternate := &otlpServer{}
+	altSrv := httptest.NewServer(alternate)
+	defer altSrv.Close()
+	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", altSrv.URL+"/v1/metrics")
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", altSrv.URL+"/v1/logs")
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "X-Inherited=generic")
+	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_HEADERS", "X-Inherited=metrics")
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "X-Inherited=logs")
+	t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip")
+	clearOTLPEnv(t)
+
+	ctx := context.Background()
+	collector := &otlpServer{}
+	srv := httptest.NewServer(collector)
+	defer srv.Close()
+	t.Setenv(EnvOTLPEndpoint, srv.URL)
+
+	tel, err := New(ctx, Options{ServiceName: "test-api", Stdout: io.Discard, Level: slog.LevelInfo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counter, _ := tel.MeterProvider.Meter("test").Int64Counter("test_events")
+	counter.Add(ctx, 1)
+	tel.Logger.Info("exported")
+	if err := tel.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	alternate.mu.Lock()
+	if len(alternate.paths) != 0 {
+		t.Errorf("the alternate collector received %v, want no request", alternate.paths)
+	}
+	alternate.mu.Unlock()
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	if !slices.Contains(collector.paths, "/v1/metrics") || !slices.Contains(collector.paths, "/v1/logs") {
+		t.Errorf("OTLP paths = %v", collector.paths)
+	}
+	for i, h := range collector.headers {
+		if v := h.Get("X-Inherited"); v != "" {
+			t.Errorf("request %d to %s carries the inherited header X-Inherited=%s", i, collector.paths[i], v)
+		}
 	}
 }
