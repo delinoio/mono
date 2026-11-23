@@ -674,15 +674,9 @@ func TestWithdrawDuringDownloadNeverInstalls(t *testing.T) {
 
 	// The commands take their orders in receive order, as the agent does.
 	updateOrder := u.NextOrder()
-	// Cancelling the context when the test ends stops a download that an early
-	// failure left running.
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	done := make(chan error, 1)
-	go func() {
-		done <- u.HandleOrdered(ctx, &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}, updateOrder)
-	}()
-	gate.awaitStarted(t)
+	// The worker is cancelled and joined when the test ends.
+	done, _ := startUpdateWorker(t, u, &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}, updateOrder)
+	gate.awaitStartedOrEnd(t, done)
 	if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING {
 		t.Fatalf("state %v", s)
 	}
@@ -819,15 +813,9 @@ func TestWithdrawDuringDownloadKeepsSignedRevocation(t *testing.T) {
 	u.opts.HTTP = &http.Client{Transport: gate}
 
 	updateOrder := u.NextOrder()
-	// Cancelling the context when the test ends stops a download that an early
-	// failure left running.
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	done := make(chan error, 1)
-	go func() {
-		done <- u.HandleOrdered(ctx, &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0", RevocationRecovery: true}, updateOrder)
-	}()
-	gate.awaitStarted(t)
+	// The worker is cancelled and joined when the test ends.
+	done, _ := startUpdateWorker(t, u, &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0", RevocationRecovery: true}, updateOrder)
+	gate.awaitStartedOrEnd(t, done)
 	if err := u.WithdrawOrdered(u.NextOrder()); !errors.Is(err, ErrRunningRevoked) {
 		t.Fatalf("withdrawal during the download of a revocation recovery: %v", err)
 	}
