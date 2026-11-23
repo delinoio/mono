@@ -539,6 +539,16 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 		// frame received at or after the deadline is not forwarded; the caller
 		// resumes from its last delivered offsets.
 		if accepted && !now.Before(rotateAt) {
+			// A frame that is already queued, or an empty wake that wins the
+			// select against the request context, reaches this branch although
+			// the request has ended. Next returns queued frames before it looks
+			// at the context, so the context must be checked again here: the
+			// caller that cancelled (or whose deadline passed) must not get an
+			// OK rotation, which the call meter would count as a completed
+			// billable stream.
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return nil // rotation: OK status without a final event
 		}
 		if f == nil {
