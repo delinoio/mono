@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +40,54 @@ func TestPresignAWSVector(t *testing.T) {
 	}
 	if _, _, err := r.presign(http.MethodGet, "x", 8*24*time.Hour, time.Now()); err == nil {
 		t.Fatal("a lifetime over 7 days was accepted")
+	}
+}
+
+// TestPresignExpiryMatchesSignedValues checks that the returned expiry equals
+// the X-Amz-Date plus X-Amz-Expires encoded in the URL when the signing clock
+// has a fractional second.
+func TestPresignExpiryMatchesSignedValues(t *testing.T) {
+	now := time.Date(2026, 1, 2, 12, 0, 0, 900_000_000, time.UTC)
+	r := &R2{
+		Endpoint:        "https://acct.r2.cloudflarestorage.com",
+		Bucket:          "snapshots",
+		AccessKeyID:     "k",
+		SecretAccessKey: "s",
+		Now:             func() time.Time { return now },
+	}
+	for _, tc := range []struct {
+		name string
+		sign func(key string, ttl time.Duration) (string, time.Time, error)
+	}{
+		{"put", r.PresignPut},
+		{"get", r.PresignGet},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			signed, exp, err := tc.sign("organizations/o/snapshots/s/parts/1", 15*time.Minute+500*time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, err := url.Parse(signed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			q := u.Query()
+			date, err := time.Parse(amzDateFormat, q.Get("X-Amz-Date"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			seconds, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := date.Add(time.Duration(seconds) * time.Second)
+			if !exp.Equal(want) {
+				t.Fatalf("expiry = %v, signed date plus expires = %v", exp, want)
+			}
+			if want := time.Date(2026, 1, 2, 12, 15, 0, 0, time.UTC); !exp.Equal(want) {
+				t.Fatalf("expiry = %v, want %v", exp, want)
+			}
+		})
 	}
 }
 

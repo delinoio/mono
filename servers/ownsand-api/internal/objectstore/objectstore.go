@@ -148,7 +148,9 @@ func (r *R2) objectURL(key string) (*url.URL, error) {
 }
 
 // presign builds a query-string signed URL (SigV4 with UNSIGNED-PAYLOAD and
-// only the host header signed).
+// only the host header signed). The returned expiry is derived from the signed
+// X-Amz-Date and X-Amz-Expires values, so it matches what the storage service
+// enforces even when the clock has a fractional second.
 func (r *R2) presign(method, key string, ttl time.Duration, now time.Time) (string, time.Time, error) {
 	if ttl <= 0 || ttl > maxPresignTTL {
 		return "", time.Time{}, errors.New("objectstore: invalid signed URL lifetime")
@@ -157,20 +159,24 @@ func (r *R2) presign(method, key string, ttl time.Duration, now time.Time) (stri
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	amzDate := now.Format(amzDateFormat)
+	// X-Amz-Date has one-second resolution and X-Amz-Expires counts whole
+	// seconds, so truncate both before computing the expiry.
+	signedAt := now.UTC().Truncate(time.Second)
+	expires := int64(ttl / time.Second)
+	amzDate := signedAt.Format(amzDateFormat)
 	date := amzDate[:8]
 	scope := date + "/" + r.region() + "/" + service + "/aws4_request"
 	q := url.Values{}
 	q.Set("X-Amz-Algorithm", algorithm)
 	q.Set("X-Amz-Credential", r.AccessKeyID+"/"+scope)
 	q.Set("X-Amz-Date", amzDate)
-	q.Set("X-Amz-Expires", fmt.Sprint(int64(ttl/time.Second)))
+	q.Set("X-Amz-Expires", fmt.Sprint(expires))
 	q.Set("X-Amz-SignedHeaders", "host")
 	canonical := strings.Join([]string{method, u.RawPath, canonicalQuery(q), "host:" + u.Host + "\n", "host", unsignedBody}, "\n")
 	toSign := strings.Join([]string{algorithm, amzDate, scope, sha256Hex([]byte(canonical))}, "\n")
 	q.Set("X-Amz-Signature", hex.EncodeToString(hmacSHA256(r.signingKey(date), toSign)))
 	u.RawQuery = canonicalQuery(q)
-	return u.String(), now.Add(ttl), nil
+	return u.String(), signedAt.Add(time.Duration(expires) * time.Second), nil
 }
 
 // PresignPut implements Store.
