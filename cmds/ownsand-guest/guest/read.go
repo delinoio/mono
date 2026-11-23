@@ -27,6 +27,23 @@ const (
 	ExpiredMemory = 30 * time.Minute
 )
 
+// snapshotCopyChunk is how many bytes one copy step moves before the worker
+// checks whether the manager was closed. The step is a LimitedReader copy, so
+// the kernel copy offload (copy_file_range) stays in use.
+const snapshotCopyChunk = 16 << 20
+
+// readCloseGrace is how long Close waits for in-flight snapshot workers. A
+// blocking stat or open of a stalled source cannot be cancelled, so the wait
+// is bounded; after it, the unique snapshot directory fences the worker (see
+// readManager.close). Tests shorten it.
+var readCloseGrace = 2 * time.Second
+
+// errReadsClosed is the error of a snapshot that the shutdown of the helper
+// ended, or of a read that starts after it.
+func errReadsClosed() error {
+	return errorf(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "read: the helper is shutting down")
+}
+
 // SnapshotKind says how a read snapshot was made.
 type SnapshotKind int
 
@@ -70,13 +87,22 @@ type readEntry struct {
 
 // readManager keeps one private snapshot per read_id.
 type readManager struct {
-	mu        sync.Mutex
+	mu sync.Mutex
+	// dir is the snapshot directory of this manager: a directory with a
+	// unique name inside the reads directory of the state directory (see
+	// newReadManager).
 	dir       string
 	entries   map[string]*readEntry
 	expired   map[string]time.Time
 	now       func() time.Time
 	retention time.Duration
 	logger    *slog.Logger
+	// closed is set by close and guarded by mu; once it is set, no worker
+	// creates a snapshot file and begin fails. stop is closed together with
+	// it and ends the copy of a running worker; wg counts the workers.
+	closed bool
+	stop   chan struct{}
+	wg     sync.WaitGroup
 	// copyHook runs between the copy and the second check, and forceCopy
 	// skips the reflink attempt; tests use them.
 	copyHook  func()
@@ -97,16 +123,27 @@ func (m *readManager) open(path string) (snapshotFile, error) {
 	return os.Open(path)
 }
 
-func newReadManager(dir string, now func() time.Time, logger *slog.Logger) (*readManager, error) {
+// newReadManager clears root and creates the snapshot directory of the new
+// manager in it with a unique name. The unique name is the fence against a
+// worker of an earlier manager that outlived its close: the worker keeps
+// absolute paths into its own snapshot directory, which this function's
+// RemoveAll deleted and never recreates under that name, so the worker
+// cannot create or remove anything in the new manager's directory.
+func newReadManager(root string, now func() time.Time, logger *slog.Logger) (*readManager, error) {
 	// Snapshots of an earlier helper process are unreachable: no read_id
 	// state survives a restart.
-	if err := os.RemoveAll(dir); err != nil {
+	if err := os.RemoveAll(root); err != nil {
 		return nil, fmt.Errorf("guest: clear read snapshots: %w", err)
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, fmt.Errorf("guest: create read snapshot directory: %w", err)
+	}
+	dir, err := os.MkdirTemp(root, "snapshots-")
+	if err != nil {
 		return nil, fmt.Errorf("guest: create read snapshot directory: %w", err)
 	}
 	return &readManager{
+		stop:      make(chan struct{}),
 		dir:       dir,
 		entries:   map[string]*readEntry{},
 		expired:   map[string]time.Time{},
@@ -123,6 +160,9 @@ func (m *readManager) begin(readID, path string) (*readEntry, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return nil, errReadsClosed()
+	}
 	if _, gone := m.expired[readID]; gone {
 		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "read expired")
 	}
@@ -140,8 +180,47 @@ func (m *readManager) begin(readID, path string) (*readEntry, error) {
 		open:     1,
 	}
 	m.entries[readID] = e
+	// Add under mu, so that close never waits while a worker is added.
+	m.wg.Add(1)
 	go m.prepare(readID, e)
 	return e, nil
+}
+
+// close ends the snapshot work of this manager. After it returns, begin
+// fails and no worker creates a snapshot file. It stops the copy of running
+// workers, which remove their partial output, and waits for them for at most
+// grace, so that the caller can release the state directory lock afterwards.
+// It reports whether every worker ended.
+//
+// Behavior when source I/O is still pending (decision): a blocking stat or
+// open of the source cannot be cancelled, so close does not wait for it
+// beyond grace. Such a worker is harmless to a replacement helper: it cannot
+// create a file after the closed flag was set, and its removals address its
+// own unique snapshot directory only. Its open handles can keep that old
+// directory on Windows until they close. A handler that waits for the
+// snapshot is released by its own cancellation, not by close. close is safe
+// to call more than once.
+func (m *readManager) close(grace time.Duration) bool {
+	m.mu.Lock()
+	if !m.closed {
+		m.closed = true
+		close(m.stop)
+	}
+	m.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		m.logger.Warn("read snapshot workers still running after close", "grace_ms", grace.Milliseconds())
+		return false
+	}
 }
 
 // end ends one call. A failed snapshot is forgotten when its last call
@@ -169,6 +248,7 @@ func (m *readManager) end(readID string, e *readEntry) {
 // last call ended removes the entry here, and a failure published before it
 // is removed by end(). Either way a retry of the read_id snapshots again.
 func (m *readManager) prepare(readID string, e *readEntry) {
+	defer m.wg.Done()
 	kind, size, err := m.makeSnapshot(e.path, e.snapshot)
 	if err != nil {
 		os.Remove(e.snapshot)
@@ -230,7 +310,15 @@ func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error)
 	if inInfo, err := in.Stat(); err != nil || !inInfo.Mode().IsRegular() || !os.SameFile(before, inInfo) {
 		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
+	// Check and create under mu, so that close cannot interleave: once close
+	// set the flag, no snapshot file is created.
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return 0, 0, errReadsClosed()
+	}
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	m.mu.Unlock()
 	if err != nil {
 		return 0, 0, fsError("read snapshot", err)
 	}
@@ -245,9 +333,23 @@ func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error)
 		}
 		return SnapshotKindReflink, st.Size(), nil
 	}
-	n, err := io.Copy(out, in)
-	if err != nil {
-		return 0, 0, fsError("read snapshot", err)
+	// Copy in steps, so that close ends the copy and prepare removes the
+	// partial output before the lock of the state directory is released.
+	var n int64
+	for {
+		select {
+		case <-m.stop:
+			return 0, 0, errReadsClosed()
+		default:
+		}
+		c, err := io.CopyN(out, in, snapshotCopyChunk)
+		n += c
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return 0, 0, fsError("read snapshot", err)
+		}
 	}
 	if m.copyHook != nil {
 		m.copyHook()
@@ -302,6 +404,9 @@ func (m *readManager) removeSnapshot(readID, snapshot string) {
 func (m *readManager) sweep(now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
 	for id, e := range m.entries {
 		if e.open > 0 || now.Sub(e.lastEnd) < m.retention {
 			continue
