@@ -120,10 +120,21 @@ type Conn struct {
 	// wireBytes is set by SetWireBytes before Run starts.
 	wireBytes func() int64
 
+	// clk supplies the monotonic readings of the idle and keepalive timers and
+	// the wall timestamps of the observers (see connClock).
+	clk connClock
+	// lastRecv and lastSend are the monotonic readings (clk.mono, in
+	// nanoseconds) of the last received frame and the last sent frame. The
+	// idle and keepalive thresholds use them, so wall-clock steps do not
+	// change them.
 	lastRecv atomic.Int64
 	lastSend atomic.Int64
-	// lastLarge is when the connection last received a large frame of an
-	// open stream (zero before the first one); see LargeFrameBytes.
+	// lastRecvWall is the wall timestamp (Unix nanoseconds) that belongs to
+	// lastRecv, for LastReceive.
+	lastRecvWall atomic.Int64
+	// lastLarge is the wall timestamp (Unix nanoseconds) of the last large
+	// frame that the connection received on an open stream (zero before the
+	// first one); see LargeFrameBytes.
 	lastLarge atomic.Int64
 
 	// openGate serializes Open: a holder allocates a stream_id and enqueues
@@ -161,6 +172,12 @@ type outFrame struct {
 // NewConn returns a connection for the device bound to an agent channel
 // generation.
 func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits) *Conn {
+	return newConnWithClock(parent, deviceID, gen, limits, newSystemClock())
+}
+
+// newConnWithClock is NewConn with an injected clock, so tests can step the
+// wall clock and advance the monotonic clock independently.
+func newConnWithClock(parent context.Context, deviceID string, gen uint64, limits Limits, clk connClock) *Conn {
 	if limits.MaxQueuedControlFrames <= 0 {
 		limits.MaxQueuedControlFrames = defaultMaxQueuedControlFrames
 	}
@@ -170,10 +187,10 @@ func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits)
 	ctx, cancel := context.WithCancelCause(parent)
 	reserved := max(limits.MaxStreamsPerConn, 0)
 	c := &Conn{DeviceID: deviceID, Generation: gen, limits: limits, out: make(chan outFrame, outboundQueue+reserved),
-		slots: make(chan struct{}, outboundQueue), ctx: ctx, cancel: cancel, openGate: make(chan struct{}, 1), streams: map[uint64]*Stream{}, perGrant: map[string]int{}}
-	now := time.Now().UnixNano()
-	c.lastRecv.Store(now)
-	c.lastSend.Store(now)
+		slots: make(chan struct{}, outboundQueue), ctx: ctx, cancel: cancel, openGate: make(chan struct{}, 1), streams: map[uint64]*Stream{}, perGrant: map[string]int{}, clk: clk}
+	c.lastRecv.Store(int64(clk.mono()))
+	c.lastSend.Store(int64(clk.mono()))
+	c.lastRecvWall.Store(clk.wall().UnixNano())
 	return c
 }
 
@@ -243,7 +260,8 @@ func (c *Conn) StreamCount() int {
 }
 
 // LastReceive returns when the connection last received a frame.
-func (c *Conn) LastReceive() time.Time { return time.Unix(0, c.lastRecv.Load()) }
+// It returns a wall timestamp; the idle timeout does not use it (see lastRecv).
+func (c *Conn) LastReceive() time.Time { return time.Unix(0, c.lastRecvWall.Load()) }
 
 // LargeFrameBytes is the encoded size from which a received stream frame
 // counts as large. The control plane cannot see a frame in transit, because
@@ -358,7 +376,7 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 		for {
 			select {
 			case <-ticker.C:
-				if time.Since(time.Unix(0, c.lastRecv.Load())) > c.limits.IdleTimeout {
+				if c.clk.mono()-time.Duration(c.lastRecv.Load()) > c.limits.IdleTimeout {
 					c.Close(ErrIdle)
 					return
 				}
@@ -382,15 +400,15 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 					c.Close(err)
 					return
 				}
-				c.lastSend.Store(time.Now().UnixNano())
+				c.lastSend.Store(int64(c.clk.mono()))
 			case <-ticker.C:
-				now := time.Now()
-				if now.Sub(time.Unix(0, c.lastSend.Load())) >= c.limits.Keepalive {
+				now := c.clk.mono()
+				if now-time.Duration(c.lastSend.Load()) >= c.limits.Keepalive {
 					if err := guardedSend(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
 						c.Close(err)
 						return
 					}
-					c.lastSend.Store(now.UnixNano())
+					c.lastSend.Store(int64(now))
 				}
 			case <-c.ctx.Done():
 				return
@@ -405,7 +423,8 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 				c.Close(err)
 				return
 			}
-			c.lastRecv.Store(time.Now().UnixNano())
+			c.lastRecv.Store(int64(c.clk.mono()))
+			c.lastRecvWall.Store(c.clk.wall().UnixNano())
 			if err := c.dispatch(f); err != nil {
 				c.Close(err)
 				return
@@ -465,7 +484,7 @@ func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
 		return nil
 	}
 	if size >= LargeFrameBytes {
-		c.lastLarge.Store(time.Now().UnixNano())
+		c.lastLarge.Store(c.clk.wall().UnixNano())
 	}
 	if err := datapath.ValidateFrame(f); err != nil {
 		var unknown *datapath.UnknownKindError
