@@ -278,12 +278,26 @@ export function validateExecId(field: string, value: string): void {
 }
 
 /**
- * Checks a stream or file offset: it must not be negative. Mirrors the Go
- * validator, which rejects a negative `int64` offset.
+ * The largest offset that the wire carries: the offset fields are signed
+ * 64-bit integers, and a `bigint` above this value is only rejected by the
+ * protobuf encoder after the session or relay grant exists.
+ */
+const MAX_OFFSET = 2n ** 63n - 1n;
+
+/**
+ * Checks a stream or file offset: it must not be negative and must not exceed
+ * the largest signed 64-bit integer. Mirrors the Go validator, whose `int64`
+ * offset cannot exceed the upper bound.
  */
 export function validateOffset(field: string, value: bigint): void {
   if (value < 0n) {
     throw new OwnSandValidationError(field, "must not be negative");
+  }
+  if (value > MAX_OFFSET) {
+    throw new OwnSandValidationError(
+      field,
+      "must not exceed 9223372036854775807",
+    );
   }
 }
 
