@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
@@ -368,51 +369,70 @@ func TestWaitIgnoresExpiredAcquisition(t *testing.T) {
 // confirmed expiry, so a callback that waits on I/O (a database read) returns
 // then, and the loss transition runs OnLose right after it instead of after
 // the full I/O timeout.
+//
+// The scenario runs in a synctest bubble, so the clock is virtual: the expiry
+// cannot pass before the renewal goroutine reaches the acquisition check, no
+// matter how the scheduler or the CI load delays it, and the deadline checks
+// are exact instead of tolerance windows.
 func TestLeaseAcquireCallbackBoundedByExpiry(t *testing.T) {
-	l, lost := newTestLease()
-	expireAt := time.Now().Add(200 * time.Millisecond)
-	var deadline time.Time
-	var hasDeadline bool
-	started := make(chan struct{})
-	returned := make(chan time.Time, 1)
-	l.OnAcquire = func(ctx context.Context) {
-		deadline, hasDeadline = ctx.Deadline()
-		close(started)
-		// Stand-in for a database read that runs until its context ends.
-		select {
-		case <-ctx.Done():
-		case <-time.After(10 * time.Second):
+	synctest.Test(t, func(t *testing.T) {
+		l, lost := newTestLease()
+		begin := time.Now()
+		expireAt := begin.Add(200 * time.Millisecond)
+		var deadline time.Time
+		var hasDeadline bool
+		started := make(chan struct{})
+		returned := make(chan time.Time, 1)
+		l.OnAcquire = func(ctx context.Context) {
+			deadline, hasDeadline = ctx.Deadline()
+			close(started)
+			// Stand-in for a database read that runs until its context ends.
+			select {
+			case <-ctx.Done():
+			case <-time.After(10 * time.Second):
+			}
+			returned <- time.Now()
 		}
-		returned <- time.Now()
-	}
-	l.init()
-	applied := make(chan struct{})
-	go func() {
-		defer close(applied)
-		l.applyRenewal(context.Background(), 0, true, "", expireAt)
-	}()
-	<-started
-	// The context is a timeout of the remaining time, so its deadline can
-	// differ from the expiry by the time that the call took.
-	if !hasDeadline || deadline.Sub(expireAt) > 50*time.Millisecond {
-		t.Fatalf("the acquisition context has deadline %v (set: %v), want the expiry %v", deadline, hasDeadline, expireAt)
-	}
+		l.init()
+		// Cancelling the run context ends the callback on every path, so a
+		// failure does not leave a goroutine blocked in the bubble.
+		runCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		applied := make(chan struct{})
+		go func() {
+			defer close(applied)
+			l.applyRenewal(runCtx, 0, true, "", expireAt)
+		}()
+		// The timeout is virtual time, so a callback that never starts fails
+		// here instead of hanging until the package timeout.
+		select {
+		case <-started:
+		case <-applied:
+			t.Fatal("OnAcquire was not called: the renewal finished without an acquisition")
+		case <-time.After(5 * time.Second):
+			t.Fatal("OnAcquire did not start: the renewal goroutine never reached the acquisition callback")
+		}
+		// The clock has not moved, so the timeout of the remaining time ends
+		// exactly at the confirmed expiry.
+		if !hasDeadline || !deadline.Equal(expireAt) {
+			t.Fatalf("the acquisition context has deadline %v (set: %v), want the expiry %v", deadline, hasDeadline, expireAt)
+		}
 
-	// The watcher's expiry check waits for the callback, which ends at the
-	// expiry; OnLose runs right after, well before the 10 second I/O bound.
-	begin := time.Now()
-	time.Sleep(time.Until(expireAt) + 10*time.Millisecond)
-	l.expireIfDue()
-	<-applied
-	if took := time.Since(begin); took > 2*time.Second {
-		t.Fatalf("the loss transition took %v after the acquisition started, want about the expiry", took)
-	}
-	if end := <-returned; end.Sub(expireAt) > time.Second {
-		t.Fatalf("the callback returned %v after the expiry", end.Sub(expireAt))
-	}
-	if l.Held() || lost.Load() != 1 {
-		t.Fatalf("held %v, OnLose ran %d times, want not held and once", l.Held(), lost.Load())
-	}
+		// The watcher's expiry check waits for the callback, which ends at the
+		// expiry; OnLose runs right after, well before the 10 second I/O bound.
+		time.Sleep(expireAt.Sub(time.Now()) + 10*time.Millisecond)
+		l.expireIfDue()
+		<-applied
+		if end := <-returned; !end.Equal(expireAt) {
+			t.Fatalf("the callback returned at %v, want the expiry %v", end, expireAt)
+		}
+		if took := time.Since(begin); took != 210*time.Millisecond {
+			t.Fatalf("the loss transition ended %v after the acquisition started, want 210ms (the expiry plus the sleep margin)", took)
+		}
+		if l.Held() || lost.Load() != 1 {
+			t.Fatalf("held %v, OnLose ran %d times, want not held and once", l.Held(), lost.Load())
+		}
+	})
 }
 
 // TestLeaseRenewalExtendsOwnership checks that a renewal before the deadline
