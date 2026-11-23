@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+import { runInNewContext } from "node:vm";
+import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
+import { encodeMessages } from "./codec.ts";
 import {
   billingReasonOf,
   DataPathError,
@@ -20,6 +23,7 @@ import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
 import {
   type DataFrame,
   DataFrameKind,
+  DataFrameSchema,
 } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
@@ -40,6 +44,7 @@ import {
   ev,
   execMsg,
   file,
+  type Harness,
   SANDBOX,
   setup,
   text,
@@ -52,15 +57,42 @@ function p2pSetup(
     logger?: Logger;
     /** Virtual time that the OpenSession call takes. */
     openSessionMs?: number;
+    /**
+     * Hides the request signal from the fake OpenSession endpoint, so an abort
+     * of the caller cannot cut the call short and the scripted outcome (a late
+     * answer or error) really reaches the SDK after the abort. The default
+     * fake rejects an aborted unary call at once, like a real fetch.
+     */
+    ignoreOpenSessionAbort?: boolean;
+    /** Authenticates with this callback instead of the default API key. */
+    accessToken?: () => string | Promise<string>;
   } = {},
 ) {
   let rtc: FakeWebRtc | undefined;
-  const h = setup((clock) => {
+  const h: Harness = setup((clock) => {
     rtc = fakeWebRtc(clock, agent, options);
     return {
       webrtc: { RTCPeerConnection: rtc.RTCPeerConnection },
       transport: options.transport,
       logger: options.logger,
+      ...(options.accessToken !== undefined
+        ? { apiKey: undefined, accessToken: options.accessToken }
+        : {}),
+      ...(options.ignoreOpenSessionAbort
+        ? {
+            fetch: (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+              h.api.fetch(
+                input,
+                String(
+                  typeof input === "string" || input instanceof URL
+                    ? input
+                    : input.url,
+                ).endsWith("/OpenSession")
+                  ? { ...init, signal: undefined }
+                  : init,
+              ),
+          }
+        : {}),
     };
   });
   h.api.unary(DataPathService, "GetIceServers", () => ({
@@ -799,6 +831,118 @@ describe("peer-to-peer data path", () => {
       expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
     });
   }
+
+  describe("binary data channel messages of any realm", () => {
+    /** A Uint8Array that a `node:vm` context built, so `instanceof` misses it. */
+    const foreignBytes = (bytes: Uint8Array): Uint8Array =>
+      runInNewContext("(src) => Uint8Array.from(src)")(bytes) as Uint8Array;
+    /** A view of `bytes` inside a larger foreign buffer with sentinel bytes. */
+    const foreignView = (bytes: Uint8Array): Uint8Array => {
+      const padded = foreignBytes(
+        new Uint8Array([
+          ...Array(7).fill(0xee),
+          ...bytes,
+          ...Array(5).fill(0xdd),
+        ]),
+      );
+      return padded.subarray(7, 7 + bytes.length);
+    };
+    const localView = (bytes: Uint8Array): Uint8Array => {
+      const padded = new Uint8Array([
+        ...Array(7).fill(0xee),
+        ...bytes,
+        ...Array(5).fill(0xdd),
+      ]);
+      return padded.subarray(7, 7 + bytes.length);
+    };
+
+    const valid: [string, (bytes: Uint8Array) => unknown][] = [
+      ["a same-realm ArrayBuffer", (b) => b.slice().buffer],
+      ["a same-realm Uint8Array", (b) => b.slice()],
+      ["a same-realm Uint8Array view", localView],
+      ["a cross-realm ArrayBuffer", (b) => foreignBytes(b).buffer],
+      ["a cross-realm Uint8Array", foreignBytes],
+      ["a cross-realm Uint8Array view", foreignView],
+    ];
+    const invalid: [string, (bytes: Uint8Array) => unknown][] = [
+      ["a string", () => "not binary"],
+      ["a same-realm DataView", (b) => new DataView(b.slice().buffer)],
+      [
+        "a cross-realm DataView",
+        (b) =>
+          runInNewContext("(src) => new DataView(Uint8Array.from(src).buffer)")(
+            b,
+          ),
+      ],
+    ];
+
+    /** An agent that answers an exec with raw messages that `wrap` builds. */
+    function rawAgent(
+      channelOf: () => { receive(data: unknown): void },
+      wrap: (bytes: Uint8Array) => unknown,
+    ): FakeAgent {
+      return (frame) => {
+        if (frame.kind !== DataFrameKind.EXEC_REQUEST) return;
+        for (const event of [ev.started(), ev.stdout(0, "ok"), ev.exited(0)]) {
+          const reply = create(DataFrameSchema, {
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.EXEC_EVENT,
+            payload: { case: "execEvent", value: { event } },
+          });
+          for (const message of encodeMessages(reply)) {
+            // A copy, so that no message shares bytes with the encoder.
+            channelOf().receive(wrap(message.slice()));
+          }
+        }
+      };
+    }
+
+    for (const [name, wrap] of valid) {
+      test(`${name} reaches the decoder and leaves the session usable`, async () => {
+        const holder: { p?: ReturnType<typeof p2pSetup> } = {};
+        const p = p2pSetup(
+          rawAgent(() => holder.p!.rtc.channels[0]!, wrap),
+          { transport: DataPathTransport.PEER_TO_PEER },
+        );
+        holder.p = p;
+        const { h, rtc } = p;
+        const sandbox = h.client.sandbox(SANDBOX);
+        const first = await h.clock.run(sandbox.run({ command: ["a"] }));
+        expect(text(first.stdout)).toBe("ok");
+        expect(first.result.kind).toBe(ExecResultKind.Exited);
+        // The same session serves the next operation.
+        const second = await h.clock.run(sandbox.run({ command: ["b"] }));
+        expect(text(second.stdout)).toBe("ok");
+        expect(rtc.channels).toHaveLength(1);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
+    }
+
+    for (const [name, wrap] of invalid) {
+      test(`${name} ends the session as a non-binary message`, async () => {
+        const holder: { p?: ReturnType<typeof p2pSetup> } = {};
+        const p = p2pSetup(
+          rawAgent(() => holder.p!.rtc.channels[0]!, wrap),
+          { transport: DataPathTransport.PEER_TO_PEER },
+        );
+        holder.p = p;
+        const { h } = p;
+        const sandbox = h.client.sandbox(SANDBOX);
+        const error = await h.clock
+          .run(sandbox.run({ command: ["a"] }))
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(DataPathError);
+        const cause = (error as DataPathError).cause;
+        expect(cause).toBeInstanceOf(PeerUnavailableError);
+        expect((cause as Error).message).toBe(
+          "non-binary data channel message",
+        );
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
+    }
+  });
 
   describe("when GetIceServers fails", () => {
     const relayOperations = {
@@ -1785,6 +1929,167 @@ describe("peer-to-peer data path", () => {
       expect(readOffsets(p.rtc)[0]).toBe(0n);
     });
 
+    describe("a channel failure that an old session reports late", () => {
+      /**
+       * Three chunks of a read, no end frame, and an exec that starts and
+       * exits at once; `execStarted` leaves an exec running instead.
+       */
+      function stallingAgent(execStarted = false): FakeAgent {
+        const file = source(3 << 10);
+        return (frame, peer) => {
+          if (frame.payload.case === "execRequest") {
+            execEvent(peer, frame.streamId, ev.started());
+            if (!execStarted) {
+              execEvent(peer, frame.streamId, ev.exited(0));
+            }
+            return;
+          }
+          if (frame.payload.case !== "fileReadRequest") return;
+          for (let at = 0; at < file.length; at += 1 << 10) {
+            peer.send({
+              streamId: frame.streamId,
+              sandboxId: SANDBOX,
+              kind: DataFrameKind.FILE_READ_EVENT,
+              payload: {
+                case: "fileReadEvent",
+                value: {
+                  event: {
+                    case: "chunk",
+                    value: {
+                      offset: BigInt(at),
+                      data: file.subarray(at, at + (1 << 10)),
+                    },
+                  },
+                },
+              },
+            });
+          }
+        };
+      }
+
+      /**
+       * Starts a read that pauses after its first chunk. The old channel then
+       * fails while two chunks are buffered, so the read learns about the
+       * failure only after its consumer resumes.
+       */
+      async function pausedReadThatLosesItsChannel(p: FakeWebRtcHarness) {
+        const sandbox = p.h.client.sandbox(SANDBOX);
+        const wait = gate();
+        let chunks = 0;
+        const done = (async () => {
+          for await (const _ of sandbox.readFile("/big")) {
+            if (++chunks === 1) await wait.promise;
+          }
+          return "completed";
+        })().catch((e: unknown) => e);
+        await p.h.clock.advance(1000);
+        expect(chunks).toBe(1);
+        expect(p.rtc.channels).toHaveLength(1);
+        p.rtc.peers[0]!.fail();
+        await p.h.clock.settle();
+        return { sandbox, wait, done };
+      }
+
+      test("a forced peer-to-peer handle returns the error and keeps the healthy replacement", async () => {
+        const p = p2pSetup(stallingAgent(), {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h, rtc } = p;
+        const { sandbox, wait, done } = await pausedReadThatLosesItsChannel(p);
+        // Another operation opens the replacement session while the read of
+        // the old session still waits for its consumer.
+        await h.clock.run(sandbox.run({ command: ["a"] }));
+        expect(rtc.channels).toHaveLength(2);
+        wait.open();
+        const error = await h.clock.run(done);
+        expect(error).toBeInstanceOf(DataPathError);
+        expect((error as DataPathError).code).toBe(Code.Unavailable);
+        expect((error as DataPathError).cause).toBeInstanceOf(
+          PeerUnavailableError,
+        );
+        // The late failure did not retire the replacement.
+        expect(rtc.channels[1]!.readyState).toBe("open");
+        await h.clock.run(sandbox.run({ command: ["b"] }));
+        expect(rtc.channels).toHaveLength(2);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(2);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+
+      test("a failure of the installed session still retires it and a later operation reconnects", async () => {
+        const p = p2pSetup(stallingAgent(), {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h, rtc } = p;
+        const { sandbox, wait, done } = await pausedReadThatLosesItsChannel(p);
+        // No other operation replaced the session: the failed one is still
+        // the installed session when the read reports the failure.
+        wait.open();
+        const error = await h.clock.run(done);
+        expect(error).toBeInstanceOf(DataPathError);
+        expect((error as DataPathError).code).toBe(Code.Unavailable);
+        expect(rtc.channels).toHaveLength(1);
+        await h.clock.run(sandbox.run({ command: ["b"] }));
+        expect(rtc.channels).toHaveLength(2);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+
+      test("an automatic handle still falls back to the relay and does not close the replacement session", async () => {
+        const p = p2pSetup(stallingAgent());
+        const { h, rtc } = p;
+        h.api.stream(RelayService, "ReadFile", function* () {
+          yield file.accepted();
+          yield file.chunk(0, "relay");
+          yield file.end(5);
+        });
+        const { sandbox, wait, done } = await pausedReadThatLosesItsChannel(p);
+        await h.clock.run(sandbox.run({ command: ["a"] }));
+        expect(rtc.channels).toHaveLength(2);
+        wait.open();
+        // The read continues on the relay from its delivered offset.
+        await h.clock.run(done);
+        expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+        // The stale failure does not close the session of the other operation.
+        expect(rtc.channels[1]!.readyState).toBe("open");
+      });
+
+      test("an exec of an old session that fails late keeps the healthy replacement", async () => {
+        const p = p2pSetup(stallingAgent(true), {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h, rtc } = p;
+        const sandbox = h.client.sandbox(SANDBOX);
+        const wait = gate();
+        let events = 0;
+        const done = (async () => {
+          for await (const _ of sandbox.exec({ command: ["x"] })) {
+            if (++events === 1) await wait.promise;
+          }
+          return "completed";
+        })().catch((e: unknown) => e);
+        await h.clock.advance(1000);
+        expect(events).toBe(1);
+        rtc.peers[0]!.fail();
+        await h.clock.settle();
+        // A read opens the replacement session.
+        const read = sandbox.readFileBytes("/big").catch((e: unknown) => e);
+        await h.clock.advance(1000);
+        expect(rtc.channels).toHaveLength(2);
+        wait.open();
+        const error = await h.clock.run(done);
+        expect(error).toBeInstanceOf(DataPathError);
+        expect(rtc.channels[1]!.readyState).toBe("open");
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        // Settle the read that waits for its end frame.
+        rtc.peers[1]!.fail();
+        await h.clock.run(read);
+      });
+    });
+
     test("a burst below both limits is queued without failing the stream", async () => {
       // 64 frames of 1 KiB: the chunks and the end frame reach 64 frames at
       // the most, below 8 MiB.
@@ -2075,6 +2380,99 @@ describe("peer-to-peer data path", () => {
       expect(rtc.frames).toHaveLength(1);
     });
 
+    describe("a first message that fails on a channel that is not open", () => {
+      function installRelayRead(h: Harness) {
+        h.api.stream(RelayService, "ReadFile", function* () {
+          yield file.accepted();
+          yield file.chunk(0, "relay");
+          yield file.end(5);
+        });
+      }
+
+      for (const readyState of ["closing", "closed"]) {
+        test(`a ${readyState} channel moves an automatic handle to the relay before its close event`, async () => {
+          const p = p2pSetup(writeAgent());
+          const { h, rtc } = p;
+          const { sandbox, channel } = await warmUp(p);
+          installRelayRead(h);
+          // The close event of the channel has not arrived: the session is
+          // still installed, but every send fails.
+          channel.readyState = readyState;
+          const bytes = await h.clock.run(sandbox.readFileBytes("/a"));
+          expect(text(bytes)).toBe("relay");
+          expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+          const reads = h.api.callsOf("ReadFile");
+          expect(reads).toHaveLength(1);
+          expect(
+            (reads[0]!.request as unknown as { offset: bigint }).offset,
+          ).toBe(0n);
+          // No second peer was opened, and the next operation uses the relay.
+          expect(rtc.channels).toHaveLength(1);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+          await h.clock.run(sandbox.readFileBytes("/a"));
+          expect(h.api.callsOf("ReadFile")).toHaveLength(2);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(2);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+          expect(rtc.channels).toHaveLength(1);
+        });
+      }
+
+      test("a forced peer-to-peer handle returns the unavailable error and no relay authorization", async () => {
+        const p = p2pSetup(writeAgent(), {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h } = p;
+        const { sandbox, channel } = await warmUp(p);
+        installRelayRead(h);
+        channel.readyState = "closing";
+        const error = await h.clock
+          .run(sandbox.readFileBytes("/a"))
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(DataPathError);
+        expect((error as DataPathError).code).toBe(Code.Unavailable);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(h.api.callsOf("ReadFile")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+
+      test("the send failure is the cause of the peer failure", async () => {
+        const p = p2pSetup(writeAgent(), {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h } = p;
+        const { sandbox, channel } = await warmUp(p);
+        channel.readyState = "closing";
+        const error = await h.clock
+          .run(sandbox.readFileBytes("/a"))
+          .catch((e) => e);
+        const peerFailure = (error as DataPathError).cause;
+        expect(peerFailure).toBeInstanceOf(PeerUnavailableError);
+        expect(((peerFailure as Error).cause as Error).message).toBe(
+          "channel not open",
+        );
+      });
+
+      test("a first message that fails on a channel that is still open keeps the session", async () => {
+        const p = p2pSetup(writeAgent());
+        const { h, rtc } = p;
+        const { sandbox, channel } = await warmUp(p);
+        channel.sendError = new Error("OperationError: send queue is full");
+        const error = await h.clock
+          .run(sandbox.run({ command: ["a"] }))
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain("send queue is full");
+        channel.sendError = undefined;
+        // The session is not retired: the next write uses it.
+        await h.clock.run(sandbox.writeFile("/b", "x"));
+        expect(rtc.channels).toHaveLength(1);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+    });
+
     test("a caller aborted while its first message waits for the buffer sends nothing", async () => {
       const p = p2pSetup(writeAgent());
       const { h, rtc } = p;
@@ -2167,6 +2565,67 @@ describe("peer-to-peer data path", () => {
       expect(rtc.channels).toHaveLength(2);
       expect(messages).toBe(0);
     });
+
+    test("a session end releases the backpressured sender and the queued senders even if the old channel emits no event", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      // The channel that the session closes emits neither `close` nor
+      // `bufferedamountlow`, as a channel of a closed peer connection can.
+      channel.suppressCloseEvent = true;
+      let messages = 0;
+      channel.afterSend = () => {
+        messages++;
+        // The buffer stays full after each fragment, so the sender must wait.
+        channel.bufferedAmount = FULL;
+      };
+      channel.bufferedAmount = FULL;
+      const waiting = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      const queued = sandbox
+        .writeFile("/b", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      await h.clock.settle();
+      // One fragment of the first frame goes out when the buffer drains once.
+      channel.drain();
+      await h.clock.settle();
+      expect(messages).toBe(1);
+      rtc.peers[0]!.endSession(SessionEndReason.UNSPECIFIED);
+      // No timer is pending and the channel never signals again: only the
+      // session end can release the senders.
+      const results = await h.clock.run(Promise.all([waiting, queued]));
+      for (const result of results) {
+        expect(result).not.toBeInstanceOf(Error);
+      }
+      // The old channel sent no further fragment after the end; both writes
+      // completed on one replacement session.
+      expect(messages).toBe(1);
+      expect(channel.readyState).toBe("closed");
+      expect(rtc.channels).toHaveLength(2);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+
+    test("closing the handle releases a backpressured sender even if the channel emits no event", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.suppressCloseEvent = true;
+      channel.bufferedAmount = FULL;
+      const waiting = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      const queued = sandbox
+        .writeFile("/b", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      await h.clock.settle();
+      sandbox.close();
+      const results = await h.clock.run(Promise.all([waiting, queued]));
+      for (const result of results) {
+        expect(result).toBeInstanceOf(OwnSandHandleClosedError);
+      }
+    });
   });
 
   describe("closing the sandbox handle", () => {
@@ -2203,14 +2662,22 @@ describe("peer-to-peer data path", () => {
     });
 
     test("a session that opens after the close is closed and never installed", async () => {
-      const { h, rtc } = p2pSetup(exiting, { openSessionMs: 5_000 });
+      const { h, rtc } = p2pSetup(exiting, {
+        openSessionMs: 5_000,
+        ignoreOpenSessionAbort: true,
+      });
       const sandbox = h.client.sandbox(SANDBOX);
       const pending = sandbox.run({ command: ["a"] }).catch((e) => e);
-      // 100 ms of gathering, then OpenSession is in flight.
+      // 100 ms of gathering, then OpenSession is in flight and still waits for
+      // its scripted answer.
       await h.clock.advance(1_000);
       expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(rtc.connections).toHaveLength(1);
       sandbox.close();
       const error = await h.clock.run(pending);
+      // The successful answer reached the SDK only after the close (the call
+      // runs to its scripted end because the abort signal is hidden from it).
+      expect(h.clock.now()).toBeGreaterThanOrEqual(5_000);
       expect(error).toBeInstanceOf(OwnSandHandleClosedError);
       expect(rtc.channels[0]!.readyState).toBe("closed");
       expect(rtc.frames).toHaveLength(0);
@@ -2221,25 +2688,172 @@ describe("peer-to-peer data path", () => {
         h.clock.run(sandbox.run({ command: ["b"] })),
       ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
       expect(rtc.connections).toHaveLength(1);
+      expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
       expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(rtc.frames).toHaveLength(0);
     });
 
     test("a Canceled error from OpenSession after the close still ends with the closed error", async () => {
-      const { h, rtc } = p2pSetup(exiting);
+      const { h, rtc } = p2pSetup(exiting, { ignoreOpenSessionAbort: true });
+      let delivered = 0;
       h.api.unary(DataPathService, "OpenSession", async () => {
         await h.clock.sleep(5_000);
+        delivered++;
         throw new ConnectError("canceled", Code.Canceled);
       });
       const sandbox = h.client.sandbox(SANDBOX);
       const pending = sandbox.run({ command: ["a"] }).catch((e) => e);
       await h.clock.advance(1_000);
+      // OpenSession is in flight and has not delivered its outcome yet.
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(delivered).toBe(0);
       sandbox.close();
+      expect(delivered).toBe(0);
       expect(await h.clock.run(pending)).toBeInstanceOf(
         OwnSandHandleClosedError,
       );
+      // The explicit Canceled outcome reached the SDK after the close.
+      expect(delivered).toBe(1);
       expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
       expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
       expect(rtc.channels[0]!.readyState).toBe("closed");
+      expect(rtc.frames).toHaveLength(0);
+      await expect(
+        h.clock.run(sandbox.run({ command: ["b"] })),
+      ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+      expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    });
+
+    describe("from the access token callback of the first request", () => {
+      const TOKEN = "osk_test_0123456789abcdef";
+
+      test("a synchronous abort ends with the exact reason even if the token never resolves", async () => {
+        const reason = new Error("caller cancelled");
+        const controller = new AbortController();
+        let release!: (token: string) => void;
+        const { h, rtc } = p2pSetup(exiting, {
+          accessToken: () => {
+            controller.abort(reason);
+            return new Promise<string>((resolve) => (release = resolve));
+          },
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const pending = sandbox
+          .run({ command: ["a"], signal: controller.signal })
+          .catch((e) => e);
+        // The abort is prompt: no timer and no token is needed.
+        expect(await h.clock.run(pending)).toBe(reason);
+        // A token that arrives after the abort starts no RPC.
+        release(TOKEN);
+        await h.clock.settle();
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(0);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(rtc.connections).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+
+      test("the last waiter that aborts cancels the setup and a later caller starts a fresh one", async () => {
+        const controller = new AbortController();
+        let calls = 0;
+        const { h } = p2pSetup(exiting, {
+          accessToken: () => {
+            if (calls++ === 0) {
+              controller.abort(new Error("first caller cancelled"));
+              return new Promise<string>(() => {});
+            }
+            return TOKEN;
+          },
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        await h.clock.run(
+          sandbox
+            .run({ command: ["a"], signal: controller.signal })
+            .catch((e) => e),
+        );
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(0);
+        const run = await h.clock.run(sandbox.run({ command: ["b"] }));
+        expect(run.result.kind).toBe(ExecResultKind.Exited);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
+
+      test("an abort of one of two callers that share the setup leaves the other served", async () => {
+        const controller = new AbortController();
+        const reason = new Error("first caller cancelled");
+        let release!: (token: string) => void;
+        let calls = 0;
+        const { h } = p2pSetup(exiting, {
+          // Only the first request waits for its token; later requests of the
+          // shared setup get one at once.
+          accessToken: () =>
+            calls++ === 0 ? new Promise<string>((r) => (release = r)) : TOKEN,
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const first = sandbox
+          .run({ command: ["a"], signal: controller.signal })
+          .catch((e) => e);
+        const second = sandbox.run({ command: ["b"] });
+        await h.clock.settle();
+        controller.abort(reason);
+        expect(await h.clock.run(first)).toBe(reason);
+        release(TOKEN);
+        const run = await h.clock.run(second);
+        expect(run.result.kind).toBe(ExecResultKind.Exited);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      });
+
+      test("a synchronous close aborts the setup and ends with the closed error", async () => {
+        let sandbox!: Sandbox;
+        let release!: (token: string) => void;
+        let calls = 0;
+        const { h, rtc } = p2pSetup(exiting, {
+          accessToken: () => {
+            calls++;
+            sandbox.close();
+            return new Promise<string>((resolve) => (release = resolve));
+          },
+        });
+        sandbox = h.client.sandbox(SANDBOX);
+        const withSignal = sandbox
+          .run({ command: ["a"], signal: new AbortController().signal })
+          .catch((e) => e);
+        const error = await h.clock.run(withSignal);
+        expect(error).toBeInstanceOf(OwnSandHandleClosedError);
+        // A late token starts no RPC and no relay fallback follows.
+        release(TOKEN);
+        await h.clock.settle();
+        expect(calls).toBe(1);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(0);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(rtc.connections).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+        // A later peer operation rejects before GetIceServers.
+        await expect(
+          h.clock.run(sandbox.run({ command: ["b"] })),
+        ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+        expect(calls).toBe(1);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(0);
+      });
+
+      test("a synchronous close ends a caller without a signal too", async () => {
+        let sandbox!: Sandbox;
+        const { h } = p2pSetup(exiting, {
+          accessToken: () => {
+            sandbox.close();
+            return new Promise<string>(() => {});
+          },
+        });
+        sandbox = h.client.sandbox(SANDBOX);
+        await expect(
+          h.clock.run(sandbox.run({ command: ["a"] })),
+        ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
     });
 
     test("close is idempotent and a closed handle rejects before GetIceServers", async () => {

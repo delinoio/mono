@@ -99,22 +99,56 @@ export class DataPathSelector {
       return this.#session;
     }
     throwIfAborted(signal);
-    const setup = (this.#setup ??= this.#startSetup());
-    return this.#join(setup, signal);
+    let setup = this.#setup;
+    let run: (() => void) | undefined;
+    if (setup === undefined) {
+      ({ setup, run } = this.#createSetup());
+      this.#setup = setup;
+    }
+    // Register the caller before the setup runs: the setup calls user code (an
+    // access token callback) synchronously, and that code can abort the caller
+    // or close the handle before this method regains control. Both must find
+    // the published setup and the waiting caller.
+    const joined = this.#join(setup, signal);
+    run?.();
+    return joined;
   }
 
-  #startSetup(): SessionSetup {
+  /**
+   * Creates a setup that does not run yet. The caller publishes it, joins it
+   * and then calls `run`; the setup clears itself from `#setup` when it
+   * settles.
+   */
+  #createSetup(): { setup: SessionSetup; run: () => void } {
     const controller = new AbortController();
+    let resolve!: (session: PeerSession | undefined) => void;
+    let reject!: (error: unknown) => void;
     const setup: SessionSetup = {
       controller,
       waiters: 0,
-      promise: this.#open(controller.signal).finally(() => {
-        if (this.#setup === setup) {
-          this.#setup = undefined;
-        }
+      promise: new Promise<PeerSession | undefined>((res, rej) => {
+        resolve = res;
+        reject = rej;
       }),
     };
-    return setup;
+    const clear = () => {
+      if (this.#setup === setup) {
+        this.#setup = undefined;
+      }
+    };
+    const run = () => {
+      this.#open(controller.signal).then(
+        (session) => {
+          clear();
+          resolve(session);
+        },
+        (error: unknown) => {
+          clear();
+          reject(error);
+        },
+      );
+    };
+    return { setup, run };
   }
 
   /** Waits for a shared setup until it settles or the caller aborts. */
@@ -157,10 +191,14 @@ export class DataPathSelector {
   async #open(signal: AbortSignal): Promise<PeerSession | undefined> {
     try {
       const session = await PeerSession.open(this.#ctx, this.#Peer!, signal);
-      if (signal.aborted) {
-        // The setup finished at the moment that its last caller aborted.
+      if (signal.aborted || this.#closed) {
+        // The setup finished at the moment that its last caller aborted or
+        // the handle closed. The close aborts the setup signal too; the
+        // `#closed` check is a second guard so a session never outlives it.
         session.close();
-        throw signal.reason;
+        throw this.#closed && !signal.aborted
+          ? new OwnSandHandleClosedError()
+          : signal.reason;
       }
       this.#session = session;
       this.#log(DataPathTransport.PEER_TO_PEER);
@@ -202,13 +240,22 @@ export class DataPathSelector {
    * `OwnSandHandleClosedError` (also on a forced `PEER_TO_PEER` transport),
    * and the handle stays on peer-to-peer so later operations reject with the
    * same error.
+   *
+   * `session` is the session that the failing operation used; the setup of a
+   * session that failed to open passes none. A failure of a session that the
+   * handle has already replaced is late news: it retires nothing, so the
+   * healthy replacement stays installed for other operations. A forced
+   * `PEER_TO_PEER` transport still returns the failure to the caller of the
+   * old session, and an automatic handle still moves to the relay.
    */
-  peerFailed(cause: unknown): void {
+  peerFailed(cause: unknown, session?: PeerSession): void {
     if (this.#closed) {
       throw new OwnSandHandleClosedError();
     }
-    this.#session?.close();
-    this.#session = undefined;
+    if (session === undefined || this.#session === session) {
+      this.#session?.close();
+      this.#session = undefined;
+    }
     if (this.#forced === DataPathTransport.PEER_TO_PEER) {
       throw new DataPathError("peer-to-peer data path failed", {
         code: Code.Unavailable,

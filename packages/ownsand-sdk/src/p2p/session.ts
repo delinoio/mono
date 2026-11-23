@@ -28,6 +28,7 @@ import {
   type WriteFileRequest,
   type WriteFileResponse,
 } from "@delino/ownsand-protos/v1/data_frame_pb";
+import { isArrayBuffer, isUint8Array } from "../binary.ts";
 import { LogEvent, safeLog } from "../logger.ts";
 import {
   type OperationContext,
@@ -138,6 +139,13 @@ export class PeerSession {
   readonly #streams = new Map<bigint, AsyncQueue<DataFrame>>();
   #nextStreamId = 1n;
   #ended: Error | undefined;
+  /**
+   * Wake-up callbacks of the senders that wait for the send buffer to drain.
+   * The session end wakes them itself: a channel that the session closes
+   * locally (or whose peer connection closes) is not guaranteed to emit
+   * `close` or `bufferedamountlow`, and the senders would wait forever.
+   */
+  readonly #bufferWaiters = new Set<() => void>();
   /** Tail of the send queue; a frame sends after the previous one finished. */
   #sendTail: Promise<void> = Promise.resolve();
 
@@ -475,8 +483,22 @@ export class PeerSession {
         this.#channel.send(message);
       } catch (error) {
         if (index === 0) {
-          // Nothing of this frame is on the byte stream, so the session
-          // stays usable and the caller sees the send failure.
+          if (this.#channel.readyState !== "open") {
+            // A channel that is closing or closed fails every send, and the
+            // close event that would retire the session may not have arrived
+            // yet. Retire it now, so the failure is a peer failure that moves
+            // an automatic handle to the relay instead of a send error that
+            // leaves a dead session installed.
+            this.#terminate(
+              new PeerUnavailableError("data channel is not open", {
+                cause: error,
+              }),
+            );
+            throw this.#ended;
+          }
+          // Nothing of this frame is on the byte stream and the channel is
+          // still open, so the session stays usable and the caller sees the
+          // send failure.
           throw error;
         }
         // A prefix of the frame is already queued, so no later frame can
@@ -495,17 +517,19 @@ export class PeerSession {
   }
 
   /**
-   * Resolves when the send buffer drains, the channel closes or the optional
-   * signal aborts.
+   * Resolves when the send buffer drains, the channel closes, the session
+   * ends or the optional signal aborts.
    */
   #waitForBufferLow(signal?: AbortSignal): Promise<void> {
     return new Promise<void>((resolve) => {
       const done = () => {
+        this.#bufferWaiters.delete(done);
         this.#channel.removeEventListener("bufferedamountlow", done);
         this.#channel.removeEventListener("close", done);
         signal?.removeEventListener("abort", done);
         resolve();
       };
+      this.#bufferWaiters.add(done);
       this.#channel.addEventListener("bufferedamountlow", done);
       this.#channel.addEventListener("close", done);
       signal?.addEventListener("abort", done, { once: true });
@@ -514,12 +538,16 @@ export class PeerSession {
 
   #onMessage(event: unknown): void {
     const data = (event as { data?: unknown }).data;
-    const bytes =
-      data instanceof ArrayBuffer
-        ? new Uint8Array(data)
-        : data instanceof Uint8Array
-          ? data
-          : undefined;
+    // Binary data of any realm: `instanceof` misses an ArrayBuffer or a
+    // Uint8Array that another realm built (for example a WebRTC
+    // implementation in a `node:vm` context). A Uint8Array supplies only the
+    // bytes of its own view; any other type (a string, a DataView) ends the
+    // session.
+    const bytes = isArrayBuffer(data)
+      ? new Uint8Array(data)
+      : isUint8Array(data)
+        ? data
+        : undefined;
     if (bytes === undefined) {
       this.#terminate(
         new PeerUnavailableError("non-binary data channel message"),
@@ -621,6 +649,11 @@ export class PeerSession {
       return;
     }
     this.#ended = error;
+    // Wake the senders that wait for buffer space; they see the end and stop
+    // without a further send. The queued senders behind them follow in turn.
+    for (const wake of [...this.#bufferWaiters]) {
+      wake();
+    }
     for (const queue of this.#streams.values()) {
       queue.fail(error);
     }
