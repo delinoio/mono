@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -170,8 +171,8 @@ func (m *manifest) validate() error {
 				return fmt.Errorf("release %s lists platform %s twice", r.Version, a.Platform)
 			}
 			platformsSeen[a.Platform] = true
-			if !strings.HasPrefix(a.URL, "https://") {
-				return fmt.Errorf("release %s: artifact URL %q is not an https URL", r.Version, a.URL)
+			if err := checkHTTPSURL(a.URL); err != nil {
+				return fmt.Errorf("release %s: artifact URL %q: %w", r.Version, a.URL, err)
 			}
 			if !sha256Hex.MatchString(a.SHA256) {
 				return fmt.Errorf("release %s: artifact SHA-256 %q is not lowercase hex", r.Version, a.SHA256)
@@ -182,6 +183,25 @@ func (m *manifest) validate() error {
 		if _, err := semver.Parse(v); err != nil {
 			return fmt.Errorf("revoked version %q: %w", v, err)
 		}
+	}
+	return nil
+}
+
+// checkHTTPSURL parses raw and requires an absolute https URL with a host
+// that url.Parse accepts, so that a hostless ("https:///x") or malformed
+// (a space in the host, an invalid percent escape or port) URL cannot reach a
+// signed manifest. Queries and fragments are not judged here: a complete
+// artifact URL may carry a query, and newRelease refuses both in a prefix.
+func checkHTTPSURL(raw string) error {
+	if !strings.HasPrefix(raw, "https://") || strings.ContainsAny(raw, " \t\r\n") {
+		return errors.New("is not an https URL")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("is not a valid URL")
+	}
+	if u.Scheme != "https" || u.Opaque != "" || u.Hostname() == "" {
+		return errors.New("has no host")
 	}
 	return nil
 }
@@ -234,9 +254,15 @@ func newRelease(in releaseInput) (release, error) {
 	if len(in.Platforms) == 0 {
 		return release{}, errors.New("no platforms")
 	}
+	// A prefix cannot carry a query or fragment: the asset name is appended
+	// to it, so the name would land inside the query or fragment. Checking
+	// the raw text also refuses an empty "?" or "#", which url.Parse drops.
 	prefix := strings.TrimSuffix(in.URLPrefix, "/")
-	if !strings.HasPrefix(prefix, "https://") || strings.ContainsAny(prefix, " \t\r\n") {
-		return release{}, fmt.Errorf("URL prefix %q is not an https URL", in.URLPrefix)
+	if strings.ContainsAny(prefix, "?#") {
+		return release{}, fmt.Errorf("URL prefix %q must not contain a query or fragment", in.URLPrefix)
+	}
+	if err := checkHTTPSURL(prefix); err != nil {
+		return release{}, fmt.Errorf("URL prefix %q: %w", in.URLPrefix, err)
 	}
 	r := release{Version: in.Version, Default: true}
 	seen := map[Platform]bool{}
