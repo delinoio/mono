@@ -1353,9 +1353,7 @@ func TestChannelNeedsLease(t *testing.T) {
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
-	if err := env.App.Lease.Wait(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	env.WaitForLease()
 	// A second instance on the same database does not get the lease and
 	// refuses agent channels.
 	second, err := app.New(app.Options{DB: env.DB, Logger: env.Logger, Now: env.Clock.Now, Logto: nil})
@@ -1566,9 +1564,7 @@ func TestChannelRegisteredBeforeLeaseLossCloses(t *testing.T) {
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
-	if err := env.App.Lease.Wait(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	env.WaitForLease()
 	agent := env.NewFakeAgent(dev)
 	agent.Connect()
 	conn := env.App.Service.Hub.Get(dev.ID)
