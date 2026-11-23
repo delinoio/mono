@@ -46,9 +46,12 @@ func runCapturingStderr(t *testing.T, args []string) (int, string) {
 
 func TestRunRejectsInvalidLogLevel(t *testing.T) {
 	for _, level := range []string{"ınfo", "ınfo+1", "info+1", "warn-2", "İNFO", "verbose"} {
-		// An invalid level must stop run before it starts a listener, so
-		// an unreachable listen spec makes any later step fail visibly.
-		code, stderr := runCapturingStderr(t, []string{"--log-level", level, "--listen", "unix://" + t.TempDir() + "/guest.sock"})
+		// An invalid level must stop run before it starts a listener. If a
+		// level wrongly passes validation, run reaches the invalid clock
+		// mode check and exits with code 2 before it listens or opens
+		// state, so the stderr assertion fails promptly instead of the
+		// test serving forever.
+		code, stderr := runCapturingStderr(t, []string{"--log-level", level, "--clock", "bogus"})
 		if code != 2 {
 			t.Errorf("log level %q: exit code %d, want 2", level, code)
 		}
