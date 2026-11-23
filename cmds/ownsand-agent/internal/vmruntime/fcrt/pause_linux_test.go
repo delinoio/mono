@@ -26,6 +26,8 @@ type recorder struct {
 	events []string
 	// rejectResume makes the fake API answer a Resumed state with an error.
 	rejectResume bool
+	// omitExitStatus makes the fake guest end an exec without an exit status.
+	omitExitStatus bool
 }
 
 func (r *recorder) add(e string) {
@@ -53,7 +55,8 @@ func (r *recorder) list() []string {
 	return append([]string(nil), r.events...)
 }
 
-// fakeGuest answers every exec with a zero exit.
+// fakeGuest answers every exec with a zero exit, or with no exit status when
+// the recorder sets omitExitStatus.
 type fakeGuest struct {
 	ownsandv1connect.UnimplementedGuestServiceHandler
 	rec *recorder
@@ -70,8 +73,12 @@ func (g *fakeGuest) Serve(_ context.Context, s *connect.BidiStream[ownsandv1.Ser
 			continue
 		}
 		g.rec.add("exec " + strings.Join(exec.GetCommand(), " "))
+		exited := &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0}}
+		if g.rec.omitExitStatus {
+			exited = &ownsandv1.ExecExited{}
+		}
 		if err := s.Send(&ownsandv1.ServeResponse{Frame: datapath.MustNewFrame(req.GetFrame().GetStreamId(), exec.GetSandboxId(),
-			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{}}})}); err != nil {
+			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: exited}})}); err != nil {
 			return nil
 		}
 	}
@@ -164,10 +171,7 @@ func startFakeVM(t *testing.T, r *Runtime, id string, rec *recorder) *vm {
 // disk-only snapshot of the paused sandbox holds the writes completed
 // before the pause; Snapshot of the paused VM does not resume it.
 func TestPauseFlushesGuestBeforeFreezing(t *testing.T) {
-	r, err := New(Options{Logger: quiet()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := newFlushCheckedRuntime(t)
 	rec := &recorder{}
 	v := startFakeVM(t, r, "s1", rec)
 	ctx := context.Background()
@@ -199,10 +203,7 @@ func TestPauseFlushesGuestBeforeFreezing(t *testing.T) {
 
 // A snapshot of a running VM flushes, pauses, copies and resumes it.
 func TestSnapshotOfRunningVMFlushesOnce(t *testing.T) {
-	r, err := New(Options{Logger: quiet()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := newFlushCheckedRuntime(t)
 	rec := &recorder{}
 	v := startFakeVM(t, r, "s2", rec)
 	v.network = ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND
@@ -221,10 +222,7 @@ func TestSnapshotOfRunningVMFlushesOnce(t *testing.T) {
 // A resume that Firecracker rejects after a completed capture fails the
 // snapshot, so no READY record is saved for a VM that stays paused.
 func TestSnapshotReportsResumeFailure(t *testing.T) {
-	r, err := New(Options{Logger: quiet()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := newFlushCheckedRuntime(t)
 	rec := &recorder{rejectResume: true}
 	v := startFakeVM(t, r, "s3", rec)
 	v.network = ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND
@@ -246,10 +244,7 @@ func TestSnapshotReportsResumeFailure(t *testing.T) {
 // A capture error stays the result when the resume that follows fails too,
 // and the runtime still attempts the resume.
 func TestSnapshotCaptureErrorWinsOverResumeFailure(t *testing.T) {
-	r, err := New(Options{Logger: quiet()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := newFlushCheckedRuntime(t)
 	rec := &recorder{rejectResume: true}
 	v := startFakeVM(t, r, "s4", rec)
 	v.network = ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND
@@ -270,10 +265,7 @@ func TestSnapshotCaptureErrorWinsOverResumeFailure(t *testing.T) {
 // Firecracker accepts a resume: the runtime still tracks it as paused, so the
 // explicit resume that follows reaches the Firecracker API and continues it.
 func TestExplicitResumeAfterSnapshotResumeFailure(t *testing.T) {
-	r, err := New(Options{Logger: quiet()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := newFlushCheckedRuntime(t)
 	rec := &recorder{rejectResume: true}
 	v := startFakeVM(t, r, "s5", rec)
 	v.network = ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND
