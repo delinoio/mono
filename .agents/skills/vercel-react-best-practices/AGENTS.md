@@ -956,7 +956,7 @@ Reference: [https://github.com/isaacs/node-lru-cache](https://github.com/isaacs/
 
 **Impact: HIGH (avoids repeated file/network I/O per request)**
 
-When loading static assets (fonts, logos, images, config files) in route handlers or server functions, hoist the I/O operation to module level. Module-level code runs once when the module is first imported, not on every request. This eliminates redundant file system reads or network fetches that would otherwise run on every invocation.
+When loading static assets (fonts, logos, images, config files) in route handlers or server functions, hoist the I/O operation to module level. Cache the loaded data in module scope so it is read once per module instance, not on every request. Start asynchronous loads lazily on the first request and cache the promise: a promise created at import time has no rejection handler until a request awaits it, so a load that fails before the first request becomes an unhandled rejection. This eliminates redundant file system reads or network fetches that would otherwise run on every invocation.
 
 **Incorrect: reads font file on every request**
 
@@ -985,24 +985,32 @@ export async function GET(request: Request) {
 }
 ```
 
-**Correct: loads once at module initialization**
+**Correct: loads once on the first request and caches the promise**
 
 ```typescript
 // app/api/og/route.tsx
 import { ImageResponse } from 'next/og'
 
-// Module-level: runs ONCE when module is first imported
-const fontData = fetch(
-  new URL('./fonts/Inter.ttf', import.meta.url)
-).then(res => res.arrayBuffer())
+// Module-level cache: the first request starts the load, later and
+// concurrent requests reuse the same promise. Importing this module
+// starts no I/O.
+let assets: Promise<{ font: ArrayBuffer; logo: ArrayBuffer }> | undefined
 
-const logoData = fetch(
-  new URL('./images/logo.png', import.meta.url)
-).then(res => res.arrayBuffer())
+function loadAssets() {
+  return (assets ??= Promise.all([
+    fetch(new URL('./fonts/Inter.ttf', import.meta.url)).then(res =>
+      res.arrayBuffer()
+    ),
+    fetch(new URL('./images/logo.png', import.meta.url)).then(res =>
+      res.arrayBuffer()
+    ),
+  ]).then(([font, logo]) => ({ font, logo })))
+}
 
 export async function GET(request: Request) {
-  // Await the already-started promises
-  const [font, logo] = await Promise.all([fontData, logoData])
+  // Awaiting right away means a failed load rejects this request
+  // instead of surfacing as an unhandled rejection
+  const { font, logo } = await loadAssets()
 
   return new ImageResponse(
     <div style={{ fontFamily: 'Inter' }}>
@@ -1059,25 +1067,33 @@ export async function processRequest(data: Data) {
 }
 ```
 
-**Correct: hoists config and template to module level**
+**Correct: caches config and template at module level**
 
 ```typescript
 import fs from 'node:fs/promises'
 
-const configPromise = fs
-  .readFile('./config.json', 'utf-8')
-  .then(JSON.parse)
-const templatePromise = fs.readFile('./template.html', 'utf-8')
+function readStaticFiles() {
+  return Promise.all([
+    fs.readFile('./config.json', 'utf-8').then(JSON.parse),
+    fs.readFile('./template.html', 'utf-8'),
+  ]).then(([config, template]) => ({ config, template }))
+}
+
+// Started by the first call, shared by concurrent and later calls
+let staticFiles: ReturnType<typeof readStaticFiles> | undefined
+
+function loadStaticFiles() {
+  return (staticFiles ??= readStaticFiles())
+}
 
 export async function processRequest(data: Data) {
-  const [config, template] = await Promise.all([
-    configPromise,
-    templatePromise,
-  ])
+  const { config, template } = await loadStaticFiles()
 
   return render(template, data, config)
 }
 ```
+
+The cached promise lives as long as the module instance. If a load fails (a missing file, malformed JSON, a failed fetch), the rejected promise stays cached and every later request rejects with the same error until the module is reloaded. To retry after a failure, clear the cache variable (for example `staticFiles = undefined`) in a `catch` around the awaited call.
 
 When to use this pattern:
 
