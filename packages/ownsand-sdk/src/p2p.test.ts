@@ -40,6 +40,7 @@ import {
   ev,
   execMsg,
   file,
+  type Harness,
   SANDBOX,
   setup,
   text,
@@ -52,15 +53,37 @@ function p2pSetup(
     logger?: Logger;
     /** Virtual time that the OpenSession call takes. */
     openSessionMs?: number;
+    /**
+     * Hides the request signal from the fake OpenSession endpoint, so an abort
+     * of the caller cannot cut the call short and the scripted outcome (a late
+     * answer or error) really reaches the SDK after the abort. The default
+     * fake rejects an aborted unary call at once, like a real fetch.
+     */
+    ignoreOpenSessionAbort?: boolean;
   } = {},
 ) {
   let rtc: FakeWebRtc | undefined;
-  const h = setup((clock) => {
+  const h: Harness = setup((clock) => {
     rtc = fakeWebRtc(clock, agent, options);
     return {
       webrtc: { RTCPeerConnection: rtc.RTCPeerConnection },
       transport: options.transport,
       logger: options.logger,
+      ...(options.ignoreOpenSessionAbort
+        ? {
+            fetch: (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+              h.api.fetch(
+                input,
+                String(
+                  typeof input === "string" || input instanceof URL
+                    ? input
+                    : input.url,
+                ).endsWith("/OpenSession")
+                  ? { ...init, signal: undefined }
+                  : init,
+              ),
+          }
+        : {}),
     };
   });
   h.api.unary(DataPathService, "GetIceServers", () => ({
@@ -2203,14 +2226,22 @@ describe("peer-to-peer data path", () => {
     });
 
     test("a session that opens after the close is closed and never installed", async () => {
-      const { h, rtc } = p2pSetup(exiting, { openSessionMs: 5_000 });
+      const { h, rtc } = p2pSetup(exiting, {
+        openSessionMs: 5_000,
+        ignoreOpenSessionAbort: true,
+      });
       const sandbox = h.client.sandbox(SANDBOX);
       const pending = sandbox.run({ command: ["a"] }).catch((e) => e);
-      // 100 ms of gathering, then OpenSession is in flight.
+      // 100 ms of gathering, then OpenSession is in flight and still waits for
+      // its scripted answer.
       await h.clock.advance(1_000);
       expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(rtc.connections).toHaveLength(1);
       sandbox.close();
       const error = await h.clock.run(pending);
+      // The successful answer reached the SDK only after the close (the call
+      // runs to its scripted end because the abort signal is hidden from it).
+      expect(h.clock.now()).toBeGreaterThanOrEqual(5_000);
       expect(error).toBeInstanceOf(OwnSandHandleClosedError);
       expect(rtc.channels[0]!.readyState).toBe("closed");
       expect(rtc.frames).toHaveLength(0);
@@ -2221,25 +2252,41 @@ describe("peer-to-peer data path", () => {
         h.clock.run(sandbox.run({ command: ["b"] })),
       ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
       expect(rtc.connections).toHaveLength(1);
+      expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
       expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(rtc.frames).toHaveLength(0);
     });
 
     test("a Canceled error from OpenSession after the close still ends with the closed error", async () => {
-      const { h, rtc } = p2pSetup(exiting);
+      const { h, rtc } = p2pSetup(exiting, { ignoreOpenSessionAbort: true });
+      let delivered = 0;
       h.api.unary(DataPathService, "OpenSession", async () => {
         await h.clock.sleep(5_000);
+        delivered++;
         throw new ConnectError("canceled", Code.Canceled);
       });
       const sandbox = h.client.sandbox(SANDBOX);
       const pending = sandbox.run({ command: ["a"] }).catch((e) => e);
       await h.clock.advance(1_000);
+      // OpenSession is in flight and has not delivered its outcome yet.
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(delivered).toBe(0);
       sandbox.close();
+      expect(delivered).toBe(0);
       expect(await h.clock.run(pending)).toBeInstanceOf(
         OwnSandHandleClosedError,
       );
+      // The explicit Canceled outcome reached the SDK after the close.
+      expect(delivered).toBe(1);
       expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
       expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
       expect(rtc.channels[0]!.readyState).toBe("closed");
+      expect(rtc.frames).toHaveLength(0);
+      await expect(
+        h.clock.run(sandbox.run({ command: ["b"] })),
+      ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+      expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
     });
 
     test("close is idempotent and a closed handle rejects before GetIceServers", async () => {
