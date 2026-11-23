@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
-import { describe, expect, test } from "@rstest/core";
+import { afterEach, describe, expect, rs, test } from "@rstest/core";
 import {
   BillingMeter,
   BillingPhase,
@@ -10,6 +10,7 @@ import {
   BaseImage,
   BillingReason,
   DeviceState,
+  EnrollmentTokenState,
   ErrorDetailSchema,
   GuestOs,
   Role,
@@ -17,11 +18,17 @@ import {
   SandboxState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { uuidV7 } from "../uuid.ts";
-import { createMockTransport, MOCK_IDS, MockBillingState } from "./mock-api.ts";
+import {
+  createMockTransport,
+  MOCK_IDS,
+  MOCK_USER,
+  MockBillingState,
+} from "./mock-api.ts";
 
 describe("mock device list", () => {
   const organizationId = MOCK_IDS.acme;
@@ -753,5 +760,244 @@ describe("mock organization list paging", () => {
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ConnectError);
     expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+  });
+});
+
+describe("mock updateMemberRole", () => {
+  const organizationId = MOCK_IDS.acme;
+  const ada = "user-member-ada";
+
+  const rolesOf = async (client: ReturnType<typeof memberClient>) => {
+    const { members } = await client.listMembers({ organizationId });
+    return members.map((m) => [m.userId, m.role]);
+  };
+  const memberClient = (transport = createMockTransport()) =>
+    createClient(MemberService, transport);
+
+  test("rejects an omitted role before the member lookup", async () => {
+    const client = memberClient();
+    const before = await rolesOf(client);
+    const error = await client
+      .updateMemberRole({ organizationId, userId: ada })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+    expect(await rolesOf(client)).toEqual(before);
+  });
+
+  for (const [name, role] of [
+    ["an unspecified role", Role.UNSPECIFIED],
+    ["an unknown numeric role", 99 as Role],
+    ["the owner role", Role.OWNER],
+  ] as const) {
+    test(`rejects ${name} and changes nothing`, async () => {
+      const client = memberClient();
+      const before = await rolesOf(client);
+      const error = await client
+        .updateMemberRole({ organizationId, userId: ada, role })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+      expect(await rolesOf(client)).toEqual(before);
+    });
+  }
+
+  test("validates the role before it looks the member up", async () => {
+    const error = await memberClient()
+      .updateMemberRole({
+        organizationId,
+        userId: "user-unknown",
+        role: Role.OWNER,
+      })
+      .catch((e: unknown) => e);
+    expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+  });
+
+  test("still changes a member between admin and member", async () => {
+    const client = memberClient();
+    const promoted = await client.updateMemberRole({
+      organizationId,
+      userId: ada,
+      role: Role.ADMIN,
+    });
+    expect(promoted.member?.role).toBe(Role.ADMIN);
+    const demoted = await client.updateMemberRole({
+      organizationId,
+      userId: ada,
+      role: Role.MEMBER,
+    });
+    expect(demoted.member?.role).toBe(Role.MEMBER);
+    const { members } = await client.listMembers({ organizationId });
+    expect(members.find((m) => m.userId === ada)?.role).toBe(Role.MEMBER);
+  });
+
+  test("a valid role for the current owner is PermissionDenied", async () => {
+    const client = memberClient();
+    const before = await rolesOf(client);
+    const error = await client
+      .updateMemberRole({
+        organizationId,
+        userId: MOCK_USER,
+        role: Role.MEMBER,
+      })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).code).toBe(Code.PermissionDenied);
+    expect(await rolesOf(client)).toEqual(before);
+  });
+});
+
+describe("mock enrollment token expiry", () => {
+  const organizationId = MOCK_IDS.acme;
+  const T0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+
+  afterEach(() => {
+    rs.useRealTimers();
+  });
+
+  const createShortToken = async (
+    client: ReturnType<typeof createClient<typeof DeviceService>>,
+    seconds: number,
+  ) => {
+    const { token } = await client.createEnrollmentToken({
+      organizationId,
+      ttl: { seconds: BigInt(seconds) },
+    });
+    return token!.enrollmentTokenId;
+  };
+  const stateOf = async (
+    client: ReturnType<typeof createClient<typeof DeviceService>>,
+    id: string,
+  ) => {
+    const { tokens } = await client.listEnrollmentTokens({ organizationId });
+    return tokens.find((t) => t.enrollmentTokenId === id)?.state;
+  };
+
+  test("an unused token is PENDING before expiry and EXPIRED at and after it", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(T0);
+    const client = createClient(DeviceService, createMockTransport());
+    const id = await createShortToken(client, 1);
+
+    expect(await stateOf(client, id)).toBe(EnrollmentTokenState.PENDING);
+    rs.setSystemTime(T0 + 999);
+    expect(await stateOf(client, id)).toBe(EnrollmentTokenState.PENDING);
+    rs.setSystemTime(T0 + 1000);
+    expect(await stateOf(client, id)).toBe(EnrollmentTokenState.EXPIRED);
+    rs.setSystemTime(T0 + 2000);
+    expect(await stateOf(client, id)).toBe(EnrollmentTokenState.EXPIRED);
+  });
+
+  test("the list returns a copy and keeps the stored record and the order", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(T0);
+    const client = createClient(DeviceService, createMockTransport());
+    const first = await createShortToken(client, 1);
+    const second = await createShortToken(client, 3600);
+    const idsOf = async () =>
+      (await client.listEnrollmentTokens({ organizationId })).tokens.map(
+        (t) => t.enrollmentTokenId,
+      );
+    const before = await idsOf();
+    expect(before.slice(0, 2)).toEqual([second, first]);
+
+    rs.setSystemTime(T0 + 2000);
+    expect(await idsOf()).toEqual(before);
+    expect(await stateOf(client, first)).toBe(EnrollmentTokenState.EXPIRED);
+    expect(await stateOf(client, second)).toBe(EnrollmentTokenState.PENDING);
+
+    // The stored record is still pending, so the clock moving back shows it.
+    rs.setSystemTime(T0);
+    expect(await stateOf(client, first)).toBe(EnrollmentTokenState.PENDING);
+  });
+
+  test("a used and a revoked token keep their state after expiry", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(T0);
+    const client = createClient(DeviceService, createMockTransport());
+    const revoked = await createShortToken(client, 1);
+    await client.revokeEnrollmentToken({
+      organizationId,
+      enrollmentTokenId: revoked,
+    });
+    const used = (
+      await client.listEnrollmentTokens({ organizationId })
+    ).tokens.find((t) => t.state === EnrollmentTokenState.USED);
+    expect(used).toBeDefined();
+
+    rs.setSystemTime(T0 + 3 * 24 * 3600 * 1000);
+    expect(await stateOf(client, revoked)).toBe(EnrollmentTokenState.REVOKED);
+    expect(await stateOf(client, used!.enrollmentTokenId)).toBe(
+      EnrollmentTokenState.USED,
+    );
+  });
+});
+
+describe("mock revokeEnrollmentToken", () => {
+  const organizationId = MOCK_IDS.acme;
+
+  test("revokes a pending token and a repeated revoke returns it again", async () => {
+    const client = createClient(DeviceService, createMockTransport());
+    const { token } = await client.createEnrollmentToken({
+      organizationId,
+      ttl: { seconds: 3600n },
+    });
+    const enrollmentTokenId = token!.enrollmentTokenId;
+    expect(token?.state).toBe(EnrollmentTokenState.PENDING);
+
+    const first = await client.revokeEnrollmentToken({
+      organizationId,
+      enrollmentTokenId,
+    });
+    expect(first.token?.state).toBe(EnrollmentTokenState.REVOKED);
+    expect(first.token?.enrollmentTokenId).toBe(enrollmentTokenId);
+
+    const second = await client.revokeEnrollmentToken({
+      organizationId,
+      enrollmentTokenId,
+    });
+    expect(second.token?.state).toBe(EnrollmentTokenState.REVOKED);
+    expect(second.token?.enrollmentTokenId).toBe(enrollmentTokenId);
+
+    const { tokens } = await client.listEnrollmentTokens({ organizationId });
+    expect(
+      tokens.filter((t) => t.enrollmentTokenId === enrollmentTokenId),
+    ).toHaveLength(1);
+    expect(
+      tokens.find((t) => t.enrollmentTokenId === enrollmentTokenId)?.state,
+    ).toBe(EnrollmentTokenState.REVOKED);
+  });
+
+  test("a used token still fails with FailedPrecondition and stays used", async () => {
+    const client = createClient(DeviceService, createMockTransport());
+    const { tokens } = await client.listEnrollmentTokens({ organizationId });
+    const used = tokens.find((t) => t.state === EnrollmentTokenState.USED);
+    expect(used).toBeDefined();
+
+    const error = await client
+      .revokeEnrollmentToken({
+        organizationId,
+        enrollmentTokenId: used!.enrollmentTokenId,
+      })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).code).toBe(Code.FailedPrecondition);
+
+    const after = await client.listEnrollmentTokens({ organizationId });
+    expect(
+      after.tokens.find((t) => t.enrollmentTokenId === used!.enrollmentTokenId)
+        ?.state,
+    ).toBe(EnrollmentTokenState.USED);
+  });
+
+  test("an unknown token is NotFound", async () => {
+    const client = createClient(DeviceService, createMockTransport());
+    const error = await client
+      .revokeEnrollmentToken({
+        organizationId,
+        enrollmentTokenId: uuidV7(),
+      })
+      .catch((e: unknown) => e);
+    expect((error as ConnectError).code).toBe(Code.NotFound);
   });
 });
