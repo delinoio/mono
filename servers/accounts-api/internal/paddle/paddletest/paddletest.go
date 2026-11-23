@@ -42,6 +42,13 @@ type Failure struct {
 	Truncate bool
 }
 
+// rawResponse is a verbatim answer that replaces the normal handling of a
+// request.
+type rawResponse struct {
+	status int
+	body   string
+}
+
 // Server is the fake Paddle API.
 type Server struct {
 	URL string
@@ -51,12 +58,13 @@ type Server struct {
 	subscriptions map[string]*paddle.Subscription
 	chargeFailure *Failure
 	failures      map[string]*Failure
+	raw           map[string]rawResponse
 	seq           atomic.Int64
 }
 
 // New starts a fake Paddle API that stops when the test ends.
 func New(t testing.TB) *Server {
-	s := &Server{subscriptions: map[string]*paddle.Subscription{}, failures: map[string]*Failure{}}
+	s := &Server{subscriptions: map[string]*paddle.Subscription{}, failures: map[string]*Failure{}, raw: map[string]rawResponse{}}
 	srv := httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(srv.Close)
 	s.URL = srv.URL
@@ -105,6 +113,21 @@ func (s *Server) Fail(key string, f *Failure) {
 		return
 	}
 	s.failures[key] = f
+}
+
+// Respond makes every following request whose `<method> <path prefix>`
+// matches key answer with the status and the verbatim body, for example
+// `POST /transactions` with `{"data":null}`, to exercise malformed success
+// answers. A failure set with Fail or FailCharges takes precedence. An empty
+// body removes the override.
+func (s *Server) Respond(key string, status int, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if body == "" {
+		delete(s.raw, key)
+		return
+	}
+	s.raw[key] = rawResponse{status: status, body: body}
 }
 
 // Requests returns the recorded requests in order.
@@ -173,9 +196,25 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	if failure == nil && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/charge") {
 		failure = s.chargeFailure
 	}
+	var override *rawResponse
+	if failure == nil {
+		for key, o := range s.raw {
+			method, prefix, _ := strings.Cut(key, " ")
+			if method == r.Method && strings.HasPrefix(r.URL.Path, prefix) {
+				o := o
+				override = &o
+			}
+		}
+	}
 	s.mu.Unlock()
 	if failure != nil {
 		writeError(w, r, failure)
+		return
+	}
+	if override != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(override.status)
+		_, _ = io.WriteString(w, override.body)
 		return
 	}
 

@@ -235,7 +235,9 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 	var env struct {
 		Data json.RawMessage `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &env); err != nil || len(env.Data) == 0 {
+	// A JSON null entity is as absent as a missing data member: decoding it
+	// into out is a no-op that would return a zero entity as a success.
+	if err := json.Unmarshal(raw, &env); err != nil || len(env.Data) == 0 || bytes.Equal(bytes.TrimSpace(env.Data), []byte("null")) {
 		return errors.New("paddle response is not valid")
 	}
 	if err := json.Unmarshal(env.Data, out); err != nil {
@@ -384,8 +386,16 @@ func (c *Client) CreateCheckoutTransaction(ctx context.Context, priceID string, 
 		"custom_data":     custom,
 	}
 	var txn Transaction
-	err := c.do(ctx, http.MethodPost, "/transactions", body, &txn)
-	return txn, err
+	if err := c.do(ctx, http.MethodPost, "/transactions", body, &txn); err != nil {
+		return txn, err
+	}
+	// A 2xx answer whose transaction has no ID cannot open a checkout and
+	// must not be stored. The answer is as malformed as a body that is not
+	// JSON, so Classify reports an unknown outcome, like the decoder errors.
+	if txn.ID == "" {
+		return Transaction{}, errors.New("paddle response is not valid")
+	}
+	return txn, nil
 }
 
 // GetSubscription reads a subscription (`GET /subscriptions/{id}`).
