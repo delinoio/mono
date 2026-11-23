@@ -217,7 +217,8 @@ func (s Store) write(c *Credentials) error {
 
 // Delete removes the stored credentials under the store lock. It succeeds
 // when none exist. The lock file stays: removing it would let two processes
-// lock different files.
+// lock different files. On Windows, a short-lived handle of another program
+// on the credential file delays the removal, so removeFile retries it.
 func (s Store) Delete() error {
 	if _, err := os.Stat(s.Dir); errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -227,7 +228,7 @@ func (s Store) Delete() error {
 		return err
 	}
 	defer unlock()
-	err = os.Remove(s.Path())
+	err = removeFile(s.Path())
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("credstore: delete: %w", err)
 	}
