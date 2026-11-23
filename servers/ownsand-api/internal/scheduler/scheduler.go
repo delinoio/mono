@@ -211,7 +211,11 @@ func Evaluate(req Request, d Device, now time.Time) (Outcome, string) {
 	if allocatedVCPU(alloc)+int64(req.VCPUCount) > validate.EffectiveVCPULimit(limits) {
 		return Transient, "running sandboxes hold the vCPU capacity"
 	}
-	if alloc.GetMemoryMib()+memory > limits.GetMemoryMib() {
+	// The Permanent memory check above guarantees memory <= the limit, so
+	// the subtraction cannot overflow. Do not add the allocation and the
+	// request: an agent-reported allocation near MaxInt64 would wrap negative
+	// and pass the check.
+	if alloc.GetMemoryMib() > limits.GetMemoryMib()-memory {
 		return Transient, "running sandboxes hold the memory capacity"
 	}
 	if alloc.GetDiskGib()+req.DiskGiB > limits.GetDiskGib() {

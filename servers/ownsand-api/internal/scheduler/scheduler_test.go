@@ -404,6 +404,67 @@ func TestHyperVMemoryRounding(t *testing.T) {
 	}
 }
 
+// TestMemoryCapacityCheck checks the transient memory rule over the whole
+// range of the agent-reported allocation, including values where the sum of
+// the allocation and the request does not fit in a signed 64-bit integer.
+func TestMemoryCapacityCheck(t *testing.T) {
+	const limit = 4096
+	for _, tc := range []struct {
+		name      string
+		allocated int64
+		request   int64
+		limit     int64
+		want      Outcome
+	}{
+		{"empty device", 0, 1024, limit, Eligible},
+		{"exact fit", limit - 1024, 1024, limit, Eligible},
+		{"full device and a zero-sized remainder", limit, 0, limit, Eligible},
+		{"one MiB over", limit - 1023, 1024, limit, Transient},
+		{"allocation above a lowered limit", limit + 1, 1024, limit, Transient},
+		{"allocation of the largest int64", math.MaxInt64, 1024, limit, Transient},
+		{"allocation one below the largest int64", math.MaxInt64 - 1, 2, limit, Transient},
+		{"largest allocation with the largest limit and request", math.MaxInt64, 1, math.MaxInt64, Transient},
+		{"exact fit at the largest limit", math.MaxInt64 - 1024, 1024, math.MaxInt64, Eligible},
+		{"one over at the largest limit", math.MaxInt64 - 1023, 1024, math.MaxInt64, Transient},
+		{"request above the total", 0, limit + 1, limit, Permanent},
+		{"request above the total with a huge allocation", math.MaxInt64, limit + 1, limit, Permanent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := linuxRequest()
+			req.MemoryMiB = tc.request
+			d := linuxDevice("d")
+			d.Limits.MemoryMib = tc.limit
+			d.Allocation = &ownsandv1.DeviceAllocation{MemoryMib: tc.allocated}
+			got, reason := Evaluate(req, d, now)
+			if got != tc.want {
+				t.Fatalf("Evaluate = %v (%q), want %v", got, reason, tc.want)
+			}
+			switch tc.want {
+			case Transient:
+				if reason != "running sandboxes hold the memory capacity" {
+					t.Fatalf("reason = %q", reason)
+				}
+			case Permanent:
+				if reason != "the request needs more memory than the device limit" {
+					t.Fatalf("reason = %q", reason)
+				}
+			}
+		})
+	}
+
+	// Place maps the outcomes to the API codes.
+	req := linuxRequest()
+	d := linuxDevice("d")
+	d.Allocation = &ownsandv1.DeviceAllocation{MemoryMib: math.MaxInt64}
+	if _, err := Place(req, []Device{d}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("huge allocation: %v", err)
+	}
+	req.MemoryMiB = d.Limits.MemoryMib + 1
+	if _, err := Place(req, []Device{d}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("request above the total: %v", err)
+	}
+}
+
 // outboundNetworkDevice reports the outbound-network check as passed or
 // failed.
 func outboundNetworkDevice(id string, passed bool) Device {
