@@ -145,7 +145,10 @@ func TestInvitations(t *testing.T) {
 		t.Fatalf("used invitation: %v", err)
 	}
 	// Revoked.
-	inv2, _ := owner.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_ADMIN}))
+	inv2, err := owner.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_ADMIN}))
+	if err != nil {
+		t.Fatalf("create invitation for the revocation case: %v", err)
+	}
 	if _, err := owner.Member.RevokeInvitation(ctx, connect.NewRequest(&ownsandv1.RevokeInvitationRequest{OrganizationId: org.ID, InvitationId: inv2.Msg.GetInvitation().GetInvitationId()})); err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +156,10 @@ func TestInvitations(t *testing.T) {
 		t.Fatalf("revoked invitation: %v", err)
 	}
 	// Expired after 7 days.
-	inv3, _ := owner.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_MEMBER}))
+	inv3, err := owner.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_MEMBER}))
+	if err != nil {
+		t.Fatalf("create invitation for the expiry case: %v", err)
+	}
 	env.Clock.Advance(7*24*time.Hour + time.Second)
 	if _, err := env.User("dave").Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{InvitationSecret: inv3.Msg.GetInvitationSecret()})); testenv.Code(err) != connect.CodeNotFound {
 		t.Fatalf("expired invitation: %v", err)
