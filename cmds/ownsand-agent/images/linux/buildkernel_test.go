@@ -155,8 +155,8 @@ func (b *kernelBuild) wantCacheMount(dir string) {
 	}
 }
 
-// realPath resolves symbolic links of a directory the way `cd && pwd` does,
-// for example /var to /private/var on macOS.
+// realPath resolves symbolic links of a directory the way the script's
+// `cd && pwd -P` does, for example /var to /private/var on macOS.
 func realPath(t *testing.T, dir string) string {
 	t.Helper()
 	resolved, err := filepath.EvalSymlinks(dir)
