@@ -1647,33 +1647,72 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 // TestRelayStreamCloseCancelsBlockedRequestAccepted checks that the request
 // accepted notice waits on the stream context: a close frame ends the wait and
 // the notice is never queued afterwards.
+//
+// The grant starts unopened and the one-slot queue stays full with the
+// original keepalive. The test proves with a probe context (see
+// waitProbeContext) that the notice reached its wait on the stream context
+// with a live stream and a full queue before it delivers the close. A close
+// that arrived earlier would take the early return of enqueueCtx and pass
+// without the wait. After the close, the dispatcher must return while the
+// queue is still full, which a wait on the connection context would not allow
+// because nothing cancels the connection. Every wait has a bound that only
+// guards against a hang.
 func TestRelayStreamCloseCancelsBlockedRequestAccepted(t *testing.T) {
-	w := newWorld(t)
+	const bound = 10 * time.Second
 	f, g, st := blockedSendFixture(t)
-	f.r.d.opts.Dispatcher = w.d
-	req := w.execReq("/bin/sh", "-c", "sleep 30")
-	g.sandboxID = w.sandbox
-	g.opID = req.GetExecId()
-	g.digest = relaybinding.ExecDigest(req)
 	f.r.mu.Lock()
-	f.r.ch = g.ch
+	g.opened = false
 	f.r.mu.Unlock()
+	probe := newWaitProbeContext(st.ctx)
+	st.ctx = probe
+	d := &acceptNoticeDispatcher{probe: probe, accepted: make(chan struct{})}
+	f.r.d.opts.Dispatcher = d
+	req := &ownsandv1.ExecRequest{OrganizationId: orgID, SandboxId: g.sandboxID, ExecId: newID(t), Command: []string{"/bin/true"}, BindingSalt: make([]byte, 32)}
 
-	f.r.onFrame(f.c, datapath.MustNewFrame(st.id, w.sandbox, req))
+	f.r.onFrame(f.c, datapath.MustNewFrame(st.id, g.sandboxID, req))
 	// The dispatcher accepted the request and now waits to queue the notice.
-	waitFor(t, "accepted request", func() bool {
-		f.r.mu.Lock()
-		defer f.r.mu.Unlock()
-		return g.opened
-	})
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-probe.waited:
+	case <-time.After(bound):
+		t.Fatal("the request accepted notice never reached its wait on the stream context")
+	}
+	f.r.mu.Lock()
+	opened := g.opened
+	f.r.mu.Unlock()
+	if !opened {
+		t.Fatal("the accepted request did not open the grant")
+	}
+	if probe.Context.Err() != nil {
+		t.Fatal("the stream was already closed when the notice began to wait")
+	}
 	if len(f.c.out) != cap(f.c.out) {
 		t.Fatalf("the notice was queued on a full queue: %d frames", len(f.c.out))
 	}
+	if st.recv.Buffered() == 0 {
+		t.Fatal("the request frame is not buffered while the dispatcher runs")
+	}
+	select {
+	case <-d.accepted:
+		t.Fatal("the notice returned before the stream closed")
+	default:
+	}
 
 	f.r.onFrame(f.c, closeFrame(st.id))
-	<-f.c.out
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-d.accepted:
+	case <-time.After(bound):
+		t.Fatal("the stream close did not end the wait of the request accepted notice")
+	}
+	// The dispatcher returns and the relay frees the request frame, still
+	// with a full queue: the notice was dropped, not queued.
+	waitFor(t, "the dispatcher to return", func() bool { return st.recv.Buffered() == 0 })
+	if len(f.c.out) != cap(f.c.out) {
+		t.Fatalf("the queue changed after the close: %d frames", len(f.c.out))
+	}
+	// Only the keepalive that filled the queue remains.
+	if first := <-f.c.out; first.GetKind() != keepaliveFrame(false).GetKind() {
+		t.Fatalf("queued frame %v", first)
+	}
 	if len(f.c.out) != 0 {
 		t.Fatalf("a frame of the closed stream was queued after the close: %d frames", len(f.c.out))
 	}
