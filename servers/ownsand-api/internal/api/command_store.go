@@ -21,7 +21,9 @@ type pendingCommand struct {
 	info commandInfo
 	// closedAt is when the channel that carried the command closed, or the
 	// zero time while that channel is open. The record expires
-	// DefaultCommandGrace (Timing.CommandGrace) after closedAt.
+	// DefaultCommandGrace (Timing.CommandGrace) after closedAt. Every time
+	// that commandStore receives is a Service.commandRetentionNow reading
+	// (elapsed time on a fixed origin), never a wall-clock time.
 	closedAt time.Time
 }
 

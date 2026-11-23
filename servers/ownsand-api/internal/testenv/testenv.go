@@ -54,6 +54,9 @@ func (fakeLogto) Validate(_ context.Context, raw string) (string, error) {
 type Clock struct {
 	mu  sync.Mutex
 	now time.Time
+	// elapsed is the monotonic reading that Advance moves with now and
+	// StepWall leaves alone.
+	elapsed time.Duration
 }
 
 // Now returns the current test time.
@@ -63,8 +66,25 @@ func (c *Clock) Now() time.Time {
 	return c.now
 }
 
-// Advance moves the clock forward.
+// Advance moves the clock forward: wall time and elapsed time both pass.
 func (c *Clock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.elapsed += d
+	c.mu.Unlock()
+}
+
+// Elapsed returns the elapsed (monotonic) time of the clock, the source of
+// the command retention window.
+func (c *Clock) Elapsed() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.elapsed
+}
+
+// StepWall corrects the wall time by d (negative d steps it back) without
+// elapsed time passing, as an NTP step or a manual clock change does.
+func (c *Clock) StepWall(d time.Duration) {
 	c.mu.Lock()
 	c.now = c.now.Add(d)
 	c.mu.Unlock()
@@ -136,9 +156,12 @@ func New(t testing.TB, opts ...Option) *Env {
 		DB:     database,
 		Logger: logger,
 		Now:    clock.Now,
-		Logto:  fakeLogto{},
-		Limits: &limits,
-		Timing: &timing,
+		// The command retention window follows the test clock's elapsed
+		// time, so Advance moves it and StepWall does not.
+		CommandElapsed: clock.Elapsed,
+		Logto:          fakeLogto{},
+		Limits:         &limits,
+		Timing:         &timing,
 		// Tests connect to the server directly, so the TCP peer is the client.
 		ClientAddressMode: config.ClientAddressDirect,
 		Objects:           objects,

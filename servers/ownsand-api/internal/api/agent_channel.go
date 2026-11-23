@@ -117,7 +117,7 @@ func (s *Service) sendCommand(ctx context.Context, conn *hub.Conn, info commandI
 	}
 	info.deviceID = conn.DeviceID
 	info.generation = conn.Generation
-	s.commands.add(cmd.CommandId, info, conn, s.now())
+	s.commands.add(cmd.CommandId, info, conn, s.commandRetentionNow())
 	if err := conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}); err != nil {
 		s.commands.remove(cmd.CommandId)
 		return "", err
@@ -231,7 +231,7 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 		// here, so a concurrent sendCommand either stored its record before
 		// this call (and is marked) or sees the closed channel (and starts
 		// the expiry itself).
-		expiring := h.commands.markClosed(conn.DeviceID, conn.Generation, h.now())
+		expiring := h.commands.markClosed(conn.DeviceID, conn.Generation, h.commandRetentionNow())
 		stalled := false
 		select {
 		case <-writerDone:
@@ -520,7 +520,7 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 // handleCommandResult applies the effect of a command result and hands it
 // to a waiting RPC.
 func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *ownsandv1.AgentCommandResult) {
-	info, outcome := s.commands.take(res.GetCommandId(), conn.DeviceID, s.now(), s.commandGrace())
+	info, outcome := s.commands.take(res.GetCommandId(), conn.DeviceID, s.commandRetentionNow(), s.commandGrace())
 	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()), slog.String("channel_id", conn.ID))
 	switch outcome {
 	case takeUnknown:
