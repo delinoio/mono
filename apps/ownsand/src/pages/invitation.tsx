@@ -138,13 +138,21 @@ export function InvitationPage({ configured }: { configured: boolean }) {
         <Button
           onClick={async () => {
             const attempt = currentAttempt.current;
+            // Whether the attempt still belongs to the shown invitation,
+            // read the moment its request settles: the navigation below
+            // unmounts the page and so ends the attempt, and a current
+            // success must still delete its stored copy.
+            let current = false;
             try {
-              const res = await accept.mutateAsync({
-                invitationSecret: secret,
-              });
+              let res;
+              try {
+                res = await accept.mutateAsync({ invitationSecret: secret });
+              } finally {
+                current = attempt === currentAttempt.current;
+              }
               // The server request is not aborted. Only a result that still
               // belongs to the shown invitation may change the route.
-              if (attempt !== currentAttempt.current) {
+              if (!current) {
                 return;
               }
               navigate(
@@ -160,7 +168,12 @@ export function InvitationPage({ configured }: { configured: boolean }) {
               // the invitation unused when AcceptInvitation fails. Only the
               // stored copy is deleted (below).
             } finally {
-              pendingInvitation.clear();
+              // The stored secret may belong to a newer link whose sign-in
+              // redirect is pending. A settled request of an earlier link
+              // must not delete it.
+              if (current) {
+                pendingInvitation.clear();
+              }
             }
           }}
         >
