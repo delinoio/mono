@@ -143,6 +143,12 @@ type Service struct {
 	// production.
 	afterConfigLimitsRead atomic.Pointer[func(deviceID string)]
 
+	// importContext is a test hook that importThenCreate calls to build the
+	// context that bounds the whole import flow instead of the
+	// Timing.ImportWait deadline. It lets a test decide when the deadline
+	// expires without waiting on the wall clock. It is nil in production.
+	importContext atomic.Pointer[func(parent context.Context) (context.Context, context.CancelFunc)]
+
 	watch    sandboxWatch
 	commands commandStore // pending commands by command ID
 	// imports holds the snapshot imports that importThenCreate waits for;

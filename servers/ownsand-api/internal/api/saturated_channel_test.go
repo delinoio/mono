@@ -303,11 +303,21 @@ func TestImportSendDeadlineFailsCreate(t *testing.T) {
 
 // TestImportCreateSendDeadlineFailsCreate checks the same for the create
 // command that follows a successful import: the import result arrives, the
-// channel is then saturated, and the create send outlasts the deadline.
+// channel is already saturated, and the create send is still waiting for room
+// when the import deadline expires. The test expires the deadline itself,
+// only after it observed that wait, so it does not depend on how long the
+// saturation takes.
 func TestImportCreateSendDeadlineFailsCreate(t *testing.T) {
-	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: 6 * time.Second}
+	// ImportWait is far longer than the test: the import flow context is
+	// replaced below and only the test expires it.
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: time.Hour}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	env.App.Service.Hub.QueueFullWait = 30 * time.Second
+	var sandboxID atomic.Value
+	expiry := env.App.Service.UseManualImportExpiryForTest(func() string {
+		id, _ := sandboxID.Load().(string)
+		return id
+	})
 	org := env.NewOrg("alice")
 	snapID, devB, agentB := importFixture(t, env, org)
 	var importCmdID atomic.Value
@@ -322,14 +332,42 @@ func TestImportCreateSendDeadlineFailsCreate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	id := created.Msg.GetSandbox().GetSandboxId()
+	sandboxID.Store(id)
 	testenv.Eventually(t, "import command received", func() bool { return importCmdID.Load() != nil })
 	saturate(t, env, agentB)
 	agentB.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: &ownsandv1.AgentCommandResult{
 		CommandId: importCmdID.Load().(string), Result: &ownsandv1.AgentCommandResult_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotResult{}},
 	}}})
-	assertImportCreateFailed(t, org, created.Msg.GetSandbox().GetSandboxId(), devB.ID)
-	// The create send itself reported the deadline, not the wait timer.
-	if !strings.Contains(env.Logs.String(), "agent_command_send_failed") {
-		t.Fatal("the create send did not fail on the import deadline")
+	// The import succeeded and the create send waits for room in the full
+	// queue. Only now does the import deadline expire.
+	select {
+	case <-expiry.CreateSendWaiting():
+	case <-time.After(rpcTimeout):
+		t.Fatal("the create send did not wait on the full queue")
 	}
+	if sb := getSandbox(t, org.OwnerClient, org.ID, id); sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_CREATING {
+		t.Fatalf("sandbox before the deadline = %v, want CREATING", sb.GetState())
+	}
+	expiry.Expire()
+	assertImportCreateFailed(t, org, id, devB.ID)
+	// The create send itself reported the deadline for this sandbox, not the
+	// wait of the import result.
+	testenv.Eventually(t, "create send failure logged", func() bool {
+		return logHasSendFailure(env.Logs.String(), id)
+	})
+	if conn := env.App.Service.Hub.Get(devB.ID); conn == nil || conn.Context().Err() != nil {
+		t.Fatal("the channel must stay connected")
+	}
+}
+
+// logHasSendFailure reports whether a log line records a failed command send
+// for the sandbox with the context deadline as its error.
+func logHasSendFailure(logs, sandboxID string) bool {
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "agent_command_send_failed") && strings.Contains(line, sandboxID) && strings.Contains(line, context.DeadlineExceeded.Error()) {
+			return true
+		}
+	}
+	return false
 }
