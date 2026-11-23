@@ -308,7 +308,11 @@ func TestFirecrackerIntegration(t *testing.T) {
 			t.Fatalf("delete %v %v", en, err)
 		}
 	}
-	if ids, _ := rt.Running(context.Background()); len(ids) != 0 {
+	ids, err := rt.Running(context.Background())
+	if err != nil {
+		t.Fatalf("Running: %v (ids %v)", err, ids)
+	}
+	if len(ids) != 0 {
 		t.Fatalf("microVMs still run: %v", ids)
 	}
 }

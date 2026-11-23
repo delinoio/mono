@@ -528,7 +528,11 @@ func TestDeleteTrackedWaitsForExit(t *testing.T) {
 	if !f.exists(v.dir) {
 		t.Fatal("VM directory removed while the process lives")
 	}
-	if ids, _ := f.r.Running(context.Background()); len(ids) != 1 {
+	ids, err := f.r.Running(context.Background())
+	if err != nil {
+		t.Fatalf("Running: %v (ids %v)", err, ids)
+	}
+	if len(ids) != 1 {
 		t.Fatalf("Running %v, want the surviving VM", ids)
 	}
 	if _, err := v.dirFile.Stat(); err != nil {
@@ -708,7 +712,10 @@ func TestRealProcessOrphanCleanup(t *testing.T) {
 	} else {
 		p.handle.close()
 	}
-	ids, _ := r.Running(context.Background())
+	ids, err := r.Running(context.Background())
+	if err != nil {
+		t.Fatalf("Running: %v (ids %v)", err, ids)
+	}
 	if len(ids) != 1 || ids[0] != "owned" {
 		t.Fatalf("Running %v", ids)
 	}
