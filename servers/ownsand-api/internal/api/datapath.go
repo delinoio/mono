@@ -49,6 +49,11 @@ const (
 	revocationTargetRelayGrant revocationTarget = "relay_grant"
 )
 
+// abandonRevocationTimeout bounds the enqueue of the revocation that
+// OpenSession sends for a session whose caller canceled or whose signaling
+// wait timed out after the offer was sent.
+const abandonRevocationTimeout = 2 * time.Second
+
 // revocation is a session revocation that waits for its acknowledgement.
 type revocation struct {
 	deviceID string
@@ -416,6 +421,29 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 		h.mu.Unlock()
 		return nil, err
 	}
+	// abandon ends a session whose offer the agent has received (the send
+	// succeeded) but whose caller stopped waiting: the request was canceled
+	// or the agent did not answer in time. The agent may still set the
+	// session up, or may have set it up already, so the server revokes it on
+	// the channel generation that signaled it. The revocation does not use
+	// the request context, which is canceled in the first case, and has a
+	// short bound of its own, because the pending revocation record, not the
+	// enqueue, owns the delivery. When a revocation event removed the session
+	// first, HandleEvent already sent its revocation.
+	abandon := func(cause string, err error) (*connect.Response[ownsandv1.OpenSessionResponse], error) {
+		h.mu.Lock()
+		_, pending := h.sessions[sess.id]
+		delete(h.sessions, sess.id)
+		h.mu.Unlock()
+		if pending {
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abandonRevocationTimeout)
+			defer cancel()
+			h.S.Logger.WarnContext(rctx, "data_path_session_abandoned", slog.String("session_id", sess.id), slog.String("sandbox_id", sb.ID),
+				slog.String("device_id", sess.deviceID), slog.String("cause", cause))
+			h.sendRevocation(rctx, sess.deviceID, sess.gen, revocationTargetSession, sess.expireAt, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_SessionId{SessionId: sess.id}})
+		}
+		return nil, err
+	}
 	// Authorize again after registering, as the contract requires.
 	if _, _, err := h.S.reauthorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return fail(err)
@@ -448,11 +476,11 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 		return connect.NewResponse(&ownsandv1.OpenSessionResponse{SessionId: sess.id, SdpAnswer: ans.GetSdp(), ExpireTime: ts(sess.expireAt),
 			ExpiresIn: durationpb.New(sess.expireAt.Sub(h.S.now()))}), nil
 	case <-timer.C:
-		return fail(errUnavailable("the agent did not answer the offer"))
+		return abandon("signaling_timeout", errUnavailable("the agent did not answer the offer"))
 	case <-conn.Done():
 		return fail(errUnavailable("the agent channel closed"))
 	case <-ctx.Done():
-		return fail(ctx.Err())
+		return abandon("request_canceled", ctx.Err())
 	}
 }
 
