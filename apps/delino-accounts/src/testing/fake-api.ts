@@ -506,6 +506,14 @@ export function createFakeApi(): FakeApi {
         if (target === undefined) {
           throw new ConnectError("member not found", Code.NotFound);
         }
+        // Like the production service, protection follows the current role,
+        // so it also covers an owner made by transferOwnership.
+        if (target.role === BillingAccountRole.OWNER) {
+          throw new ConnectError(
+            "the owner's role cannot be changed; transfer the ownership instead",
+            Code.FailedPrecondition,
+          );
+        }
         target.role = req.role;
         return { member: target };
       },
@@ -514,6 +522,16 @@ export function createFakeApi(): FakeApi {
         const { account, self } = load(req.billingAccountId);
         if (req.userId !== api.userId && !PAYMENT_ROLES.has(self.role)) {
           throw new ConnectError("permission denied", Code.PermissionDenied);
+        }
+        const target = account.members.find((m) => m.userId === req.userId);
+        if (target === undefined) {
+          throw new ConnectError("member not found", Code.NotFound);
+        }
+        if (target.role === BillingAccountRole.OWNER) {
+          throw new ConnectError(
+            "the owner cannot be removed; transfer the ownership first",
+            Code.FailedPrecondition,
+          );
         }
         account.members = account.members.filter(
           (m) => m.userId !== req.userId,
