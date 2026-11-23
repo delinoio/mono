@@ -108,7 +108,10 @@ type Runtime interface {
 	Kind() config.RuntimeKind
 	Capabilities(ctx context.Context) Capabilities
 	// Create boots a VM. It returns when the guest helper answers
-	// CheckReady, or with an error after which no VM is left.
+	// CheckReady, or with an error after which no VM is left running for
+	// the sandbox. A runtime whose stop of a failed create failed keeps the
+	// VM handle and files instead; the sandbox manager then calls Delete
+	// again until it succeeds.
 	Create(ctx context.Context, spec Spec) (VM, error)
 	// Pause stops the vCPUs and keeps the memory.
 	Pause(ctx context.Context, vm VM) error

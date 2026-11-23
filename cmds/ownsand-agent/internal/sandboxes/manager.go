@@ -135,6 +135,15 @@ type Manager struct {
 	execs       ExecTracker
 	gate        CreateGate
 	closed      bool
+	// cleanupPending holds the IDs of the sandboxes whose create failed in
+	// the runtime. The runtime reports a failed create as clean, but a
+	// runtime whose stop failed keeps the VM handle and files for a later
+	// stop (see the runtime Create contract); Tick calls the idempotent
+	// runtime Delete for each ID until it succeeds. cleanupInFlight holds
+	// the IDs whose Delete runs now. Both are in memory only: the next agent
+	// start reconciles through the runtime.
+	cleanupPending  map[string]struct{}
+	cleanupInFlight map[string]struct{}
 	// runningAttempts and runningBackoff bound the retries of the first
 	// RUNNING commit of a create; see publishRunning. Tests override them.
 	runningAttempts int
@@ -183,7 +192,7 @@ func New(ctx context.Context, opts Options) (*Manager, error) {
 	m := &Manager{
 		st: opts.Store, rt: opts.Runtime, logger: opts.Logger, now: opts.Now, freeDisk: opts.FreeDisk,
 		runningAttempts: DefaultRunningAttempts, runningBackoff: DefaultRunningBackoff,
-		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, pending: map[string]*pendingSnapshot{}, importLocks: map[string]*importLock{}, reports: map[uint64]map[string]uint64{},
+		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, pending: map[string]*pendingSnapshot{}, cleanupPending: map[string]struct{}{}, cleanupInFlight: map[string]struct{}{}, importLocks: map[string]*importLock{}, reports: map[uint64]map[string]uint64{},
 	}
 	agentState, err := m.st.UpdateAgent(func(a *store.AgentState) error {
 		if a.StateEpoch == "" {
@@ -677,6 +686,12 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 			m.mu.Unlock()
 			return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "sandbox was deleted during its create")
 		}
+		// The runtime cleans up a failed create itself, but a runtime whose
+		// stop failed keeps the VM handle and files. Tick retries the stop
+		// until the runtime Delete succeeds.
+		m.mu.Lock()
+		m.cleanupPending[id] = struct{}{}
+		m.mu.Unlock()
 		entry, uerr := m.update(sb, func(r *Record) {
 			r.State = ownsandv1.SandboxState_SANDBOX_STATE_FAILED
 			r.EndReason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED
@@ -1087,9 +1102,27 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			unacked = append(unacked, sb.rec.Entry(m.epoch))
 		}
 	}
+	// Collect the failed creates whose runtime clean-up still has to be
+	// confirmed. A sandbox with a live record owns its VM: its own end calls
+	// the runtime Delete, so the retry waits until that record is terminal
+	// or dropped.
+	var cleanups []string
+	for id := range m.cleanupPending {
+		if _, running := m.cleanupInFlight[id]; running {
+			continue
+		}
+		if sb, ok := m.sandboxes[id]; ok && sb.rec.Live() {
+			continue
+		}
+		m.cleanupInFlight[id] = struct{}{}
+		cleanups = append(cleanups, id)
+	}
 	outbox := m.outbox
-	m.bg.Add(len(expired))
+	m.bg.Add(len(expired) + len(cleanups))
 	m.mu.Unlock()
+	for _, id := range cleanups {
+		go m.retryCreateCleanup(ctx, id)
+	}
 	for _, e := range expired {
 		if e.retry {
 			m.logger.Info("retrying the end of a lost sandbox", "sandbox_id", e.sb.rec.SandboxID, "end_reason", e.reason.String())
@@ -1116,6 +1149,27 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			outbox.SendSandboxUpdate(e)
 		}
 	}
+}
+
+// retryCreateCleanup calls the runtime Delete for a failed create. The runtime
+// Delete is idempotent: it stops a VM that the failed create kept and removes
+// its files, and it succeeds when nothing is left. A success releases the ID;
+// a failure keeps it for the next Tick. The caller registered the call in
+// m.bg and m.cleanupInFlight.
+func (m *Manager) retryCreateCleanup(ctx context.Context, id string) {
+	defer m.bg.Done()
+	err := m.rt.Delete(ctx, id)
+	m.mu.Lock()
+	delete(m.cleanupInFlight, id)
+	if err == nil {
+		delete(m.cleanupPending, id)
+	}
+	m.mu.Unlock()
+	if err != nil {
+		m.logger.Warn("clean-up of a failed create incomplete; the next tick retries it", "sandbox_id", id, "error", err)
+		return
+	}
+	m.logger.Info("clean-up of a failed create complete", "sandbox_id", id)
 }
 
 // idleReportableLocked reports whether sb is still the live, registered
