@@ -60,6 +60,8 @@ function p2pSetup(
      * fake rejects an aborted unary call at once, like a real fetch.
      */
     ignoreOpenSessionAbort?: boolean;
+    /** Authenticates with this callback instead of the default API key. */
+    accessToken?: () => string | Promise<string>;
   } = {},
 ) {
   let rtc: FakeWebRtc | undefined;
@@ -69,6 +71,9 @@ function p2pSetup(
       webrtc: { RTCPeerConnection: rtc.RTCPeerConnection },
       transport: options.transport,
       logger: options.logger,
+      ...(options.accessToken !== undefined
+        ? { apiKey: undefined, accessToken: options.accessToken }
+        : {}),
       ...(options.ignoreOpenSessionAbort
         ? {
             fetch: (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
@@ -2380,6 +2385,137 @@ describe("peer-to-peer data path", () => {
       ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
       expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
       expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    });
+
+    describe("from the access token callback of the first request", () => {
+      const TOKEN = "osk_test_0123456789abcdef";
+
+      test("a synchronous abort ends with the exact reason even if the token never resolves", async () => {
+        const reason = new Error("caller cancelled");
+        const controller = new AbortController();
+        let release!: (token: string) => void;
+        const { h, rtc } = p2pSetup(exiting, {
+          accessToken: () => {
+            controller.abort(reason);
+            return new Promise<string>((resolve) => (release = resolve));
+          },
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const pending = sandbox
+          .run({ command: ["a"], signal: controller.signal })
+          .catch((e) => e);
+        // The abort is prompt: no timer and no token is needed.
+        expect(await h.clock.run(pending)).toBe(reason);
+        // A token that arrives after the abort starts no RPC.
+        release(TOKEN);
+        await h.clock.settle();
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(0);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(rtc.connections).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+
+      test("the last waiter that aborts cancels the setup and a later caller starts a fresh one", async () => {
+        const controller = new AbortController();
+        let calls = 0;
+        const { h } = p2pSetup(exiting, {
+          accessToken: () => {
+            if (calls++ === 0) {
+              controller.abort(new Error("first caller cancelled"));
+              return new Promise<string>(() => {});
+            }
+            return TOKEN;
+          },
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        await h.clock.run(
+          sandbox
+            .run({ command: ["a"], signal: controller.signal })
+            .catch((e) => e),
+        );
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(0);
+        const run = await h.clock.run(sandbox.run({ command: ["b"] }));
+        expect(run.result.kind).toBe(ExecResultKind.Exited);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
+
+      test("an abort of one of two callers that share the setup leaves the other served", async () => {
+        const controller = new AbortController();
+        const reason = new Error("first caller cancelled");
+        let release!: (token: string) => void;
+        let calls = 0;
+        const { h } = p2pSetup(exiting, {
+          // Only the first request waits for its token; later requests of the
+          // shared setup get one at once.
+          accessToken: () =>
+            calls++ === 0 ? new Promise<string>((r) => (release = r)) : TOKEN,
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const first = sandbox
+          .run({ command: ["a"], signal: controller.signal })
+          .catch((e) => e);
+        const second = sandbox.run({ command: ["b"] });
+        await h.clock.settle();
+        controller.abort(reason);
+        expect(await h.clock.run(first)).toBe(reason);
+        release(TOKEN);
+        const run = await h.clock.run(second);
+        expect(run.result.kind).toBe(ExecResultKind.Exited);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      });
+
+      test("a synchronous close aborts the setup and ends with the closed error", async () => {
+        let sandbox!: Sandbox;
+        let release!: (token: string) => void;
+        let calls = 0;
+        const { h, rtc } = p2pSetup(exiting, {
+          accessToken: () => {
+            calls++;
+            sandbox.close();
+            return new Promise<string>((resolve) => (release = resolve));
+          },
+        });
+        sandbox = h.client.sandbox(SANDBOX);
+        const withSignal = sandbox
+          .run({ command: ["a"], signal: new AbortController().signal })
+          .catch((e) => e);
+        const error = await h.clock.run(withSignal);
+        expect(error).toBeInstanceOf(OwnSandHandleClosedError);
+        // A late token starts no RPC and no relay fallback follows.
+        release(TOKEN);
+        await h.clock.settle();
+        expect(calls).toBe(1);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(0);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(rtc.connections).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+        // A later peer operation rejects before GetIceServers.
+        await expect(
+          h.clock.run(sandbox.run({ command: ["b"] })),
+        ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+        expect(calls).toBe(1);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(0);
+      });
+
+      test("a synchronous close ends a caller without a signal too", async () => {
+        let sandbox!: Sandbox;
+        const { h } = p2pSetup(exiting, {
+          accessToken: () => {
+            sandbox.close();
+            return new Promise<string>(() => {});
+          },
+        });
+        sandbox = h.client.sandbox(SANDBOX);
+        await expect(
+          h.clock.run(sandbox.run({ command: ["a"] })),
+        ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
     });
 
     test("close is idempotent and a closed handle rejects before GetIceServers", async () => {
