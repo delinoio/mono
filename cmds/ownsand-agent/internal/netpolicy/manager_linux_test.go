@@ -502,16 +502,20 @@ func TestAttachDuringPendingDetachKeepsDistinctTap(t *testing.T) {
 	}
 	release := make(chan struct{})
 	closing := make(chan struct{}, 1)
+	openRelease := onceFunc(release)
 	h.mu.Lock()
 	h.dnsRelease = release
 	h.dnsClosing = closing
 	h.mu.Unlock()
 	done := detachAsync(m, idA)
+	releaseOnCleanup(t, openRelease, done)
 	waitFor(t, closing, "DNS close start")
-	_, tapB, err := m.Attach(idB)
-	if err != nil {
-		t.Fatalf("Attach(%s): %v", idB, err)
-	}
+	// Later DNS forwarders must not block.
+	h.mu.Lock()
+	h.dnsRelease, h.dnsClosing = nil, nil
+	h.mu.Unlock()
+	linkB := awaitAttach(t, attachAsync(m, idB), idB, "Attach while the detach is pending")
+	tapB := TapName(linkB.Index)
 	if tapB == tapA {
 		t.Fatalf("pending and new attachment share the tap %q", tapA)
 	}
@@ -521,7 +525,7 @@ func TestAttachDuringPendingDetachKeepsDistinctTap(t *testing.T) {
 	if !present {
 		t.Fatalf("the pending tap %q was deleted by the new attach", tapA)
 	}
-	close(release)
+	openRelease()
 	waitFor(t, done, "Detach")
 }
 
