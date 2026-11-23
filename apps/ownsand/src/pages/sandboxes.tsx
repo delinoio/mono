@@ -331,9 +331,11 @@ function CreateSandboxDialog({
           labels: parsed.labels,
         });
         // A new sandbox changes the allocation of its device. The device
-        // queries are marked stale for their next view and not awaited.
+        // and sandbox queries are marked stale and refetched in the
+        // background; the dialog closes and the detail page opens from the
+        // created sandbox without waiting for the list refetch.
         void invalidateServices(queryClient, DeviceService);
-        await invalidateServices(queryClient, SandboxService);
+        void invalidateServices(queryClient, SandboxService);
         onOpenChange(false);
         reset();
         navigate(
