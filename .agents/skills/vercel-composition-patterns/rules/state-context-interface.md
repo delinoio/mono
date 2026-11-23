@@ -41,7 +41,7 @@ interface ComposerActions {
 }
 
 interface ComposerMeta {
-  inputRef: React.RefObject<TextInput>
+  inputRef: React.RefObject<TextInput | null>
 }
 
 interface ComposerContextValue {
@@ -80,7 +80,7 @@ function ComposerInput() {
 // Provider A: Local state for ephemeral forms
 function ForwardMessageProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState(initialState)
-  const inputRef = useRef(null)
+  const inputRef = useRef<TextInput>(null)
   const submit = useForwardMessage()
 
   return (
@@ -99,7 +99,7 @@ function ForwardMessageProvider({ children }: { children: React.ReactNode }) {
 // Provider B: Global synced state for channels
 function ChannelProvider({ channelId, children }: Props) {
   const { state, update, submit } = useGlobalChannel(channelId)
-  const inputRef = useRef(null)
+  const inputRef = useRef<TextInput>(null)
 
   return (
     <ComposerContext
