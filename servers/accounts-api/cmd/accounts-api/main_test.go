@@ -500,9 +500,32 @@ func TestNewServerDisablesGeneralOptionsHandler(t *testing.T) {
 // address and the captured logs.
 func startRequestLogServer(t *testing.T) (string, *syncBuffer) {
 	t.Helper()
+	addr, logs, _ := startRequestLogServerWithClosed(t)
+	return addr, logs
+}
+
+// startRequestLogServerWithClosed is startRequestLogServer and also returns a
+// channel that receives one value each time the server has finished handling a
+// closed connection, that is after the production ConnState hook has run for
+// http.StateClosed. A test that must assert the absence of a record after a
+// client disconnect waits on it instead of sleeping.
+func startRequestLogServerWithClosed(t *testing.T) (string, *syncBuffer, <-chan struct{}) {
+	t.Helper()
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	srv := newServer(server.NewHandler(logger), logger)
+
+	closed := make(chan struct{}, 16)
+	productionConnState := srv.ConnState
+	srv.ConnState = func(c net.Conn, state http.ConnState) {
+		productionConnState(c, state)
+		if state == http.StateClosed {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
 
 	listener := newTestListener(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -512,7 +535,7 @@ func startRequestLogServer(t *testing.T) (string, *syncBuffer) {
 		cancel()
 		<-done
 	})
-	return listener.Addr().String(), logs
+	return listener.Addr().String(), logs, closed
 }
 
 // requestRecords decodes the http_request records among the JSON log lines.

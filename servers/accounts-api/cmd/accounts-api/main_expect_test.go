@@ -363,14 +363,20 @@ func TestNewServerDoesNotLogRequestsThatNetHTTPNeverReaches(t *testing.T) {
 	})
 
 	t.Run("client leaves before the response", func(t *testing.T) {
-		addr, logs := startRequestLogServer(t)
+		addr, logs, closed := startRequestLogServerWithClosed(t)
 		conn := dialRaw(t, addr)
 		// Half of a head never completes: no request, no record.
 		if _, err := io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: test\r\nExpect: a-pony\r\n"); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 		_ = conn.Close()
-		time.Sleep(50 * time.Millisecond)
+		// The server handles the disconnect asynchronously: assert only after
+		// it has run the connection-closed hook, not after a fixed delay.
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("server did not finish handling the disconnect; logs: %s", logs.String())
+		}
 		if records := requestRecords(t, logs); len(records) != 0 {
 			t.Errorf("records = %v, want none for an incomplete request", records)
 		}
