@@ -391,6 +391,7 @@ func (s *Service) failTopUp(ctx context.Context, tx pgx.Tx, acct *accountState, 
 		}
 		return s.enqueue(ctx, tx, acct.ID, NotifyPaymentFailed, "payment_failed/top_up/"+t.ID, map[string]string{
 			notifyDetailPaymentScope: notifyScopeTopUp,
+			notifyDetailTopUpID:      t.ID,
 			notifyDetailTopUpKind:    string(t.Kind),
 			notifyDetailAmount:       fmt.Sprint(t.Amount),
 			notifyDetailReason:       string(reason),
@@ -414,6 +415,7 @@ func (s *Service) failTopUp(ctx context.Context, tx pgx.Tx, acct *accountState, 
 	}
 	if err := s.enqueue(ctx, tx, acct.ID, NotifyPaymentFailed, "payment_failed/top_up/"+t.ID, map[string]string{
 		notifyDetailPaymentScope: notifyScopeTopUp,
+		notifyDetailTopUpID:      t.ID,
 		notifyDetailTopUpKind:    string(t.Kind),
 		notifyDetailAmount:       fmt.Sprint(t.Amount),
 		notifyDetailReason:       string(reason),
