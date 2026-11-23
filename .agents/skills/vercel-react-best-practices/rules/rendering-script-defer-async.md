@@ -59,10 +59,11 @@ export default function Page() {
   return (
     <>
       <Script src="https://example.com/analytics.js" strategy="afterInteractive" />
-      <Script src="/scripts/utils.js" strategy="beforeInteractive" />
     </>
   )
 }
 ```
+
+`strategy="beforeInteractive"` does not work in a page component. A site-wide script that must load before the page becomes interactive belongs in the App Router root layout or, for the Pages Router, in `pages/_document.js`.
 
 Reference: [MDN - Script element](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script#defer)

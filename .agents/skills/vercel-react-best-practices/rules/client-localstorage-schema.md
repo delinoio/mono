@@ -44,6 +44,9 @@ function loadConfig() {
 // Migration from v1 to v2
 function migrate() {
   try {
+    // A v2 value is current: never overwrite it with the stale v1 config
+    if (localStorage.getItem(`userConfig:${VERSION}`) !== null) return
+
     const v1 = localStorage.getItem('userConfig:v1')
     if (v1) {
       const old = JSON.parse(v1)

@@ -674,7 +674,11 @@ Preload heavy bundles before they're needed to reduce perceived latency.
 function EditorButton({ onClick }: { onClick: () => void }) {
   const preload = () => {
     if (typeof window !== 'undefined') {
-      void import('./monaco-editor')
+      // Best effort: handle a failed chunk load here so it is not an
+      // unhandled rejection. Opening the editor still loads it on demand
+      void import('./monaco-editor').catch(error => {
+        console.warn('Editor preload failed', error)
+      })
     }
   }
 
@@ -696,7 +700,13 @@ function EditorButton({ onClick }: { onClick: () => void }) {
 function FlagsProvider({ children, flags }: Props) {
   useEffect(() => {
     if (flags.editorEnabled && typeof window !== 'undefined') {
-      void import('./monaco-editor').then(mod => mod.init())
+      // The catch covers a failed import, an init() that throws and a
+      // promise returned by init() that rejects
+      void import('./monaco-editor')
+        .then(mod => mod.init())
+        .catch(error => {
+          console.warn('Editor preload failed', error)
+        })
     }
   }, [flags.editorEnabled])
 
@@ -707,6 +717,8 @@ function FlagsProvider({ children, flags }: Props) {
 ```
 
 The `typeof window !== 'undefined'` check prevents bundling preloaded modules for SSR, optimizing server bundle size and build speed.
+
+Preloading is best effort: a failed preload is only logged, and the explicit path that opens the editor (the `onClick` handler above) still loads the module on demand and reports its own errors.
 
 ---
 
@@ -956,7 +968,7 @@ Reference: [https://github.com/isaacs/node-lru-cache](https://github.com/isaacs/
 
 **Impact: HIGH (avoids repeated file/network I/O per request)**
 
-When loading static assets (fonts, logos, images, config files) in route handlers or server functions, hoist the I/O operation to module level. Module-level code runs once when the module is first imported, not on every request. This eliminates redundant file system reads or network fetches that would otherwise run on every invocation.
+When loading static assets (fonts, logos, images, config files) in route handlers or server functions, hoist the I/O operation to module level. Cache the loaded data in module scope so it is read once per module instance, not on every request. Start asynchronous loads lazily on the first request and cache the promise: a promise created at import time has no rejection handler until a request awaits it, so a load that fails before the first request becomes an unhandled rejection. This eliminates redundant file system reads or network fetches that would otherwise run on every invocation.
 
 **Incorrect: reads font file on every request**
 
@@ -985,24 +997,32 @@ export async function GET(request: Request) {
 }
 ```
 
-**Correct: loads once at module initialization**
+**Correct: loads once on the first request and caches the promise**
 
 ```typescript
 // app/api/og/route.tsx
 import { ImageResponse } from 'next/og'
 
-// Module-level: runs ONCE when module is first imported
-const fontData = fetch(
-  new URL('./fonts/Inter.ttf', import.meta.url)
-).then(res => res.arrayBuffer())
+// Module-level cache: the first request starts the load, later and
+// concurrent requests reuse the same promise. Importing this module
+// starts no I/O.
+let assets: Promise<{ font: ArrayBuffer; logo: ArrayBuffer }> | undefined
 
-const logoData = fetch(
-  new URL('./images/logo.png', import.meta.url)
-).then(res => res.arrayBuffer())
+function loadAssets() {
+  return (assets ??= Promise.all([
+    fetch(new URL('./fonts/Inter.ttf', import.meta.url)).then(res =>
+      res.arrayBuffer()
+    ),
+    fetch(new URL('./images/logo.png', import.meta.url)).then(res =>
+      res.arrayBuffer()
+    ),
+  ]).then(([font, logo]) => ({ font, logo })))
+}
 
 export async function GET(request: Request) {
-  // Await the already-started promises
-  const [font, logo] = await Promise.all([fontData, logoData])
+  // Awaiting right away means a failed load rejects this request
+  // instead of surfacing as an unhandled rejection
+  const { font, logo } = await loadAssets()
 
   return new ImageResponse(
     <div style={{ fontFamily: 'Inter' }}>
@@ -1059,25 +1079,33 @@ export async function processRequest(data: Data) {
 }
 ```
 
-**Correct: hoists config and template to module level**
+**Correct: caches config and template at module level**
 
 ```typescript
 import fs from 'node:fs/promises'
 
-const configPromise = fs
-  .readFile('./config.json', 'utf-8')
-  .then(JSON.parse)
-const templatePromise = fs.readFile('./template.html', 'utf-8')
+function readStaticFiles() {
+  return Promise.all([
+    fs.readFile('./config.json', 'utf-8').then(JSON.parse),
+    fs.readFile('./template.html', 'utf-8'),
+  ]).then(([config, template]) => ({ config, template }))
+}
+
+// Started by the first call, shared by concurrent and later calls
+let staticFiles: ReturnType<typeof readStaticFiles> | undefined
+
+function loadStaticFiles() {
+  return (staticFiles ??= readStaticFiles())
+}
 
 export async function processRequest(data: Data) {
-  const [config, template] = await Promise.all([
-    configPromise,
-    templatePromise,
-  ])
+  const { config, template } = await loadStaticFiles()
 
   return render(template, data, config)
 }
 ```
+
+The cached promise lives as long as the module instance. If a load fails (a missing file, malformed JSON, a failed fetch), the rejected promise stays cached and every later request rejects with the same error until the module is reloaded. To retry after a failure, clear the cache variable (for example `staticFiles = undefined`) in a `catch` around the awaited call.
 
 When to use this pattern:
 
@@ -1441,15 +1469,19 @@ const keyCallbacks = new Map<string, Set<() => void>>()
 function useKeyboardShortcut(key: string, callback: () => void) {
   // Register this callback in the Map
   useEffect(() => {
+    // A Set stores one entry per function reference, so wrap the callback:
+    // consumers that share a function still get their own registration
+    const registration = () => callback()
+
     if (!keyCallbacks.has(key)) {
       keyCallbacks.set(key, new Set())
     }
-    keyCallbacks.get(key)!.add(callback)
+    keyCallbacks.get(key)!.add(registration)
 
     return () => {
       const set = keyCallbacks.get(key)
       if (set) {
-        set.delete(callback)
+        set.delete(registration)
         if (set.size === 0) {
           keyCallbacks.delete(key)
         }
@@ -1613,6 +1645,9 @@ function loadConfig() {
 // Migration from v1 to v2
 function migrate() {
   try {
+    // A v2 value is current: never overwrite it with the stale v1 config
+    if (localStorage.getItem(`userConfig:${VERSION}`) !== null) return
+
     const v1 = localStorage.getItem('userConfig:v1')
     if (v1) {
       const old = JSON.parse(v1)
@@ -2188,7 +2223,7 @@ function FilteredList({ items }: { items: Item[] }) {
 }
 
 function UserProfile() {
-  // JSON.parse runs on every render
+  // Browser-only: reads localStorage. JSON.parse runs on every render
   const [settings, setSettings] = useState(
     JSON.parse(localStorage.getItem('settings') || '{}')
   )
@@ -2208,6 +2243,9 @@ function FilteredList({ items }: { items: Item[] }) {
   return <SearchResults index={searchIndex} query={query} />
 }
 
+// Browser-only: reads localStorage during the initial render. Use it in a
+// client-only component or a client-rendered app (for example a Vite SPA),
+// never in a component that is also server-rendered.
 function UserProfile() {
   // JSON.parse runs only on initial render
   const [settings, setSettings] = useState(() => {
@@ -2219,7 +2257,32 @@ function UserProfile() {
 }
 ```
 
-Use lazy initialization when computing initial values from localStorage/sessionStorage, building data structures (indexes, maps), reading from the DOM, or performing heavy transformations.
+The lazy initializer runs during the component's initial render. When the component is server-rendered, that render happens on the server, where `localStorage` does not exist, so the initializer throws. Even where `localStorage` exists, reading it during the first render can make the first client render differ from the server HTML.
+
+**Correct: server-rendered, deterministic first render with saved settings loaded after hydration**
+
+```tsx
+const defaultSettings: Settings = {}
+
+function UserProfile() {
+  // Same defaults on the server and on the first client render
+  const [settings, setSettings] = useState<Settings>(defaultSettings)
+
+  useEffect(() => {
+    // Effects run only in the browser, after hydration
+    try {
+      const stored = localStorage.getItem('settings')
+      if (stored) setSettings(JSON.parse(stored))
+    } catch {}
+  }, [])
+
+  return <SettingsForm settings={settings} onChange={setSettings} />
+}
+```
+
+When no `settings` key is stored, the defaults stay. The pure `buildSearchIndex` lazy initializer above is safe to server-render because it reads no browser API.
+
+Use lazy initialization when computing initial values from localStorage/sessionStorage or the DOM (in browser-only components; see the server-rendered variant above), building data structures (indexes, maps), or performing heavy transformations.
 
 For simple primitives (`useState(0)`), direct references (`useState(props.value)`), or cheap literals (`useState({})`), the function form is unnecessary.
 
@@ -2410,7 +2473,15 @@ function LoadingSpinner() {
       height="24" 
       viewBox="0 0 24 24"
     >
-      <circle cx="12" cy="12" r="10" stroke="currentColor" />
+      <circle
+        cx="12"
+        cy="12"
+        r="10"
+        stroke="currentColor"
+        strokeWidth="2"
+        fill="none"
+        strokeDasharray="47 16"
+      />
     </svg>
   )
 }
@@ -2421,13 +2492,21 @@ function LoadingSpinner() {
 ```tsx
 function LoadingSpinner() {
   return (
-    <div className="animate-spin">
+    <div className="inline-flex animate-spin">
       <svg 
         width="24" 
         height="24" 
         viewBox="0 0 24 24"
       >
-        <circle cx="12" cy="12" r="10" stroke="currentColor" />
+        <circle
+          cx="12"
+          cy="12"
+          r="10"
+          stroke="currentColor"
+          strokeWidth="2"
+          fill="none"
+          strokeDasharray="47 16"
+        />
       </svg>
     </div>
   )
@@ -2540,7 +2619,7 @@ npx svgo --precision=1 --multipass icon.svg
 
 **Impact: MEDIUM (avoids visual flicker and hydration errors)**
 
-When rendering content that depends on client-side storage (localStorage, cookies), avoid both SSR breakage and post-hydration flickering by injecting a synchronous script that updates the DOM before React hydrates.
+When rendering content that depends on client-side storage (localStorage, cookies), avoid both SSR breakage and post-hydration flickering by injecting a synchronous script in the document head that sets the value before any body markup can paint and before React hydrates.
 
 **Incorrect: breaks SSR**
 
@@ -2583,34 +2662,38 @@ function ThemeWrapper({ children }: { children: ReactNode }) {
 
 Component first renders with default value (`light`), then updates after hydration, causing a visible flash of incorrect content.
 
-**Correct: no flicker, expected mismatch suppressed**
+**Correct: theme set in the head before body markup streams, expected mismatch suppressed**
 
 ```tsx
-function ThemeWrapper({ children }: { children: ReactNode }) {
+function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <>
-      <div id="theme-wrapper" suppressHydrationWarning>
-        {children}
-      </div>
-      <script
-        dangerouslySetInnerHTML={{
-          __html: `
-            (function() {
-              try {
-                var theme = localStorage.getItem('theme') || 'light';
-                var el = document.getElementById('theme-wrapper');
-                if (el) el.className = theme;
-              } catch (e) {}
-            })();
-          `,
-        }}
-      />
-    </>
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        {/* Classic inline script: no async, defer or type="module" */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              (function() {
+                try {
+                  var theme = localStorage.getItem('theme') || 'light';
+                  document.documentElement.setAttribute('data-theme', theme);
+                } catch (e) {}
+              })();
+            `,
+          }}
+        />
+        <style>{`
+          body { background: #fff; color: #111; }
+          html[data-theme='dark'] body { background: #111; color: #eee; }
+        `}</style>
+      </head>
+      <body>{children}</body>
+    </html>
   )
 }
 ```
 
-The inline script executes synchronously before showing the element, ensuring the DOM already has the correct value. The script deliberately sets the wrapper's `className` before hydration, so the DOM differs from the initial JSX by that one attribute; `suppressHydrationWarning` on the wrapper silences the expected attribute warning. It covers only that element's own attributes, so do not add it to children.
+The bootstrap is a classic inline script in the document head, before the `<body>`. A classic script blocks the HTML parser, so it runs before any theme-dependent body markup is streamed or painted, and the first paint already uses the stored theme (or the `light` fallback when nothing is stored or storage throws). Do not use `async`, `defer` or `type="module"`, which run later, and do not place the script after the themed markup: the browser can paint the default theme first. The script sets one attribute on `document.documentElement`, so the server-rendered `<html>` differs from the DOM by that attribute. Put `suppressHydrationWarning` only on the `<html>` element that React owns and whose attribute the script changes; it covers only that element's own attributes, so do not add it to the body or other children. React keeps the attribute the script set during hydration, so the bootstrap theme survives without a mismatch warning.
 
 This pattern is especially useful for theme toggles, user preferences, authentication states, and any client-only data that should render immediately without flashing default values.
 
@@ -2717,11 +2800,12 @@ export default function Page() {
   return (
     <>
       <Script src="https://example.com/analytics.js" strategy="afterInteractive" />
-      <Script src="/scripts/utils.js" strategy="beforeInteractive" />
     </>
   )
 }
 ```
+
+`strategy="beforeInteractive"` does not work in a page component. A site-wide script that must load before the page becomes interactive belongs in the App Router root layout or, for the Pages Router, in `pages/_document.js`.
 
 Reference: [https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script#defer](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script#defer)
 
@@ -2900,7 +2984,14 @@ function SearchResults() {
     const requestId = ++latestRequest.current
 
     startTransition(async () => {
-      const data = await fetchResults(value)
+      let data
+      try {
+        data = await fetchResults(value)
+      } catch (error) {
+        // A newer search superseded this request: its failure is stale
+        if (requestId !== latestRequest.current) return
+        throw error
+      }
       // React orders state updates, not async responses: ignore stale ones
       if (requestId !== latestRequest.current) return
       // Updates after an await need their own startTransition
@@ -2926,7 +3017,7 @@ function SearchResults() {
 
 - **Better responsiveness**: Keeps the UI responsive during updates
 
-- **Stale response guard**: The request id check keeps a slow earlier response from replacing newer results
+- **Stale response guard**: The request id check keeps a slow earlier response from replacing newer results, and ignores the failure of a superseded request while the current request still rethrows to the error boundary
 
 Reference: [https://react.dev/reference/react/useTransition](https://react.dev/reference/react/useTransition)
 
@@ -3069,7 +3160,11 @@ function processOrders(orders: Order[], users: User[]) {
 
 ```typescript
 function processOrders(orders: Order[], users: User[]) {
-  const userById = new Map(users.map(u => [u.id, u]))
+  // IDs are strings. Keep the first user per ID, like users.find() does
+  const userById = new Map<string, User>()
+  for (const user of users) {
+    if (!userById.has(user.id)) userById.set(user.id, user)
+  }
 
   return orders.map(order => ({
     ...order,
@@ -3078,7 +3173,7 @@ function processOrders(orders: Order[], users: User[]) {
 }
 ```
 
-Build map once (O(n)), then all lookups are O(1).
+Build map once (O(n)), then all lookups are O(1). Inserting only when the ID is absent keeps the first match for a duplicate ID, which is what `.find()` returns; `new Map(users.map(u => [u.id, u]))` would keep the last one.
 
 For 1000 orders × 1000 users: 1M ops → 2K ops.
 
@@ -3554,9 +3649,12 @@ const userNames = users
 **Correct: 1 iteration, no intermediate array**
 
 ```typescript
-const userNames = users.flatMap(user =>
-  user.isActive ? [user.name] : []
-)
+const userNames = users.flatMap(user => {
+  if (!user.isActive) return []
+  const name = user.name
+  // Skip falsy names (such as '') exactly like filter(Boolean) does
+  return name ? [name] : []
+})
 ```
 
 **More examples:**
@@ -3569,9 +3667,11 @@ const emails = responses
   .filter(Boolean)
 
 // After
-const emails = responses.flatMap(r =>
-  r.success ? [r.data.email] : []
-)
+const emails = responses.flatMap(r => {
+  if (!r.success) return []
+  const email = r.data.email
+  return email ? [email] : []
+})
 
 // Parse and filter valid numbers
 // Before
@@ -3653,7 +3753,8 @@ function getOldestAndNewest(projects: Project[]) {
   
   for (let i = 1; i < projects.length; i++) {
     if (projects[i].updatedAt < oldest.updatedAt) oldest = projects[i]
-    if (projects[i].updatedAt > newest.updatedAt) newest = projects[i]
+    // >= keeps the last maximum, like the stable sort's last element
+    if (projects[i].updatedAt >= newest.updatedAt) newest = projects[i]
   }
   
   return { oldest, newest }
