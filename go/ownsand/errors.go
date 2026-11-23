@@ -170,6 +170,11 @@ func classify(ctx context.Context, err error) (failureKind, time.Duration) {
 		// carries no terminal status, so it is a transport interruption.
 		return failInterrupted, 0
 	}
+	if errors.Is(err, errInvalidCredential) {
+		// The credential cannot be sent as a header on any attempt, so a
+		// retry, a recovery or the relay cannot succeed.
+		return failTerminal, 0
+	}
 	var fe *frameError
 	explicit := errors.As(err, &fe) || connect.IsWireError(err)
 	if !explicit {

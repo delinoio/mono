@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"golang.org/x/net/http/httpguts"
 )
 
 // credential produces the bearer value of a request.
@@ -22,12 +23,40 @@ type credential interface {
 
 type staticCredential string
 
-func (s staticCredential) bearer(context.Context) (string, error) { return string(s), nil }
+func (s staticCredential) bearer(context.Context) (string, error) {
+	if err := checkBearer(string(s)); err != nil {
+		return "", &errLocalCredential{cause: err}
+	}
+	return string(s), nil
+}
+
+// errInvalidCredential reports a credential that is not a valid HTTP header
+// field value, for example one that contains a newline or another control
+// character. Go's HTTP transport rejects such a header before it sends the
+// request, and the Connect client reports that rejection as an unavailable
+// status, which the SDK would take for a transport interruption: it would
+// retry, start recovery or move the handle to the relay although every
+// attempt fails the same way. The SDK therefore checks the value first and
+// ends the operation with this error. The message never contains the
+// credential.
+var errInvalidCredential = errors.New("ownsand: the credential is not a valid HTTP Authorization header value: remove control characters such as newlines from the API key or the token")
+
+// checkBearer returns errInvalidCredential when "Bearer "+tok cannot be sent
+// as an Authorization header value. An empty token is the concern of the
+// callers.
+func checkBearer(tok string) error {
+	if !httpguts.ValidHeaderFieldValue("Bearer " + tok) {
+		return errInvalidCredential
+	}
+	return nil
+}
 
 type tokenCredential TokenSource
 
 // errLocalCredential marks a failure to produce the bearer value on this
-// machine: the token source returned an error or an empty token. No request
+// machine: the token source returned an error, an empty token or a value that
+// is not a valid Authorization header value (errInvalidCredential), or the
+// fixed API key is not a valid header value. No request
 // left the process, so the failure says nothing about the control plane or
 // the data path. The data path router therefore ends the operation with it
 // and neither falls back to the relay nor moves the handle off peer-to-peer;
@@ -49,6 +78,9 @@ func (t tokenCredential) bearer(ctx context.Context) (string, error) {
 	}
 	if tok == "" {
 		return "", &errLocalCredential{cause: errors.New("ownsand: token source returned an empty token")}
+	}
+	if err := checkBearer(tok); err != nil {
+		return "", &errLocalCredential{cause: err}
 	}
 	return tok, nil
 }
