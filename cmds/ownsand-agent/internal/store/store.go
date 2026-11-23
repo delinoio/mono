@@ -83,7 +83,8 @@ func (s *Store) Path(elem ...string) string {
 }
 
 // WriteFileAtomic replaces path with data: it writes a temporary file in the
-// same directory, syncs it and renames it into place.
+// same directory, syncs it and renames it into place. On Windows the rename
+// retries for a short time while a reader holds the destination open.
 func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -105,7 +106,7 @@ func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	return replaceFile(tmp.Name(), path)
 }
 
 func (s *Store) writeJSON(path string, v any) error {
