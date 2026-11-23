@@ -186,6 +186,14 @@ function Composer({
 ```tsx
 const ComposerContext = createContext<ComposerContextValue | null>(null)
 
+function useComposerContext() {
+  const context = use(ComposerContext)
+  if (context === null) {
+    throw new Error('Composer components must be rendered inside <Composer.Provider>')
+  }
+  return context
+}
+
 function ComposerProvider({ children, state, actions, meta }: ProviderProps) {
   return (
     <ComposerContext value={{ state, actions, meta }}>
@@ -203,7 +211,7 @@ function ComposerInput() {
     state,
     actions: { update },
     meta: { inputRef },
-  } = use(ComposerContext)
+  } = useComposerContext()
   return (
     <TextInput
       ref={inputRef}
@@ -216,7 +224,7 @@ function ComposerInput() {
 function ComposerSubmit() {
   const {
     actions: { submit },
-  } = use(ComposerContext)
+  } = useComposerContext()
   return <Button onPress={submit}>Send</Button>
 }
 
@@ -282,9 +290,9 @@ function ChannelComposer({ channelId }: { channelId: string }) {
     <Composer.Frame>
       <Composer.Input
         value={state.input}
-        onChange={(text) => sync.updateInput(text)}
+        onChange={(text) => updateInput(text)}
       />
-      <Composer.Submit onPress={() => sync.submit()} />
+      <Composer.Submit onPress={() => submit()} />
     </Composer.Frame>
   )
 }
@@ -421,7 +429,7 @@ interface ComposerActions {
 }
 
 interface ComposerMeta {
-  inputRef: React.RefObject<TextInput>
+  inputRef: React.RefObject<TextInput | null>
 }
 
 interface ComposerContextValue {
@@ -431,6 +439,15 @@ interface ComposerContextValue {
 }
 
 const ComposerContext = createContext<ComposerContextValue | null>(null)
+
+// Read the context in one place so every consumer gets the narrowed value
+function useComposerContext() {
+  const context = use(ComposerContext)
+  if (context === null) {
+    throw new Error('Composer components must be rendered inside a composer provider')
+  }
+  return context
+}
 ```
 
 **UI components consume the interface, not the implementation:**
@@ -441,7 +458,7 @@ function ComposerInput() {
     state,
     actions: { update },
     meta,
-  } = use(ComposerContext)
+  } = useComposerContext()
 
   // This component works with ANY provider that implements the interface
   return (
@@ -460,7 +477,7 @@ function ComposerInput() {
 // Provider A: Local state for ephemeral forms
 function ForwardMessageProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState(initialState)
-  const inputRef = useRef(null)
+  const inputRef = useRef<TextInput>(null)
   const submit = useForwardMessage()
 
   return (
@@ -479,7 +496,7 @@ function ForwardMessageProvider({ children }: { children: React.ReactNode }) {
 // Provider B: Global synced state for channels
 function ChannelProvider({ channelId, children }: Props) {
   const { state, update, submit } = useGlobalChannel(channelId)
-  const inputRef = useRef(null)
+  const inputRef = useRef<TextInput>(null)
 
   return (
     <ComposerContext
@@ -548,13 +565,13 @@ function ForwardMessageDialog() {
 function ForwardButton() {
   const {
     actions: { submit },
-  } = use(ComposerContext)
+  } = useComposerContext()
   return <Button onPress={submit}>Forward</Button>
 }
 
 // This preview lives OUTSIDE Composer.Frame but can read composer's state!
 function MessagePreview() {
-  const { state } = use(ComposerContext)
+  const { state } = useComposerContext()
   return <Preview message={state.input} attachments={state.attachments} />
 }
 ```
