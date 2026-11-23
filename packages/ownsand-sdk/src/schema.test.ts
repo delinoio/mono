@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+import { readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { DescEnum, DescFile } from "@bufbuild/protobuf";
 import { describe, expect, test } from "@rstest/core";
 import { file_delino_ownsand_v1_agent } from "@delino/ownsand-protos/v1/agent_pb";
@@ -40,6 +42,10 @@ const files: DescFile[] = [
   file_delino_ownsand_v1_snapshot,
 ];
 
+const generatedDir = fileURLToPath(
+  new URL("../../../protos/delino/ownsand/v1/", import.meta.url),
+);
+
 function enumsOf(file: DescFile): DescEnum[] {
   const out: DescEnum[] = [...file.enums];
   const visit = (messages: DescFile["messages"]) => {
@@ -54,24 +60,23 @@ function enumsOf(file: DescFile): DescEnum[] {
 
 describe("generated TypeScript bindings", () => {
   test("cover every schema file of delino.ownsand.v1", () => {
-    expect(files.map((f) => f.name).sort()).toEqual(
-      [
-        "agent",
-        "api_key",
-        "audit",
-        "billing",
-        "common",
-        "data_frame",
-        "data_path",
-        "device",
-        "guest",
-        "member",
-        "organization",
-        "relay",
-        "sandbox",
-        "snapshot",
-      ].map((n) => `delino/ownsand/v1/${n}`),
-    );
+    // The expected inventory comes from the generated files on disk, not from
+    // a second hand-maintained list, so a new schema file that is not
+    // registered in `files` fails here and names the missing file.
+    const generated = readdirSync(generatedDir)
+      .filter((name) => name.endsWith("_pb.ts"))
+      .map((name) => `delino/ownsand/v1/${name.slice(0, -"_pb.ts".length)}`)
+      .sort();
+    const registered = files.map((f) => f.name).sort();
+    const duplicated = registered.filter((n, i) => registered.indexOf(n) !== i);
+    const missing = generated.filter((n) => !registered.includes(n));
+    const extra = registered.filter((n) => !generated.includes(n));
+    expect({ missing, extra, duplicated }).toEqual({
+      missing: [],
+      extra: [],
+      duplicated: [],
+    });
+    expect(registered).toEqual(generated);
   });
 
   test("every enum has the zero value <ENUM>_UNSPECIFIED", () => {
