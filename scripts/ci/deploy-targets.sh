@@ -104,19 +104,22 @@ deploy_servers() {
 # Prints the build environment of one site as NUL-terminated `NAME=value`
 # entries: each `deploy.buildEnv` entry with the value of the repository
 # variable that it names. Fails with one error that names every missing or
-# empty variable, so a production site is never built without, for example,
-# its sign-in configuration. GitHub variable names are case-insensitive.
+# blank variable, so a production site is never built without, for example,
+# its sign-in configuration. GitHub variable names are case-insensitive. A
+# blank value (empty, or only characters that JavaScript `String.prototype.trim`
+# removes) counts as missing, because the consoles trim such a value and then
+# treat the setting as unconfigured. The value itself is passed on unchanged.
 site_build_env() {
   local name="$1" variables="$2" missing
   missing="$(jq -r --arg name "$name" --argjson vars "$variables" '
     ($vars | with_entries(.key |= ascii_upcase)) as $v
     | .[] | select(.name == $name) | (.buildEnv // {}) | to_entries[]
     | select(($v[.value | ascii_upcase] | type) != "string"
-        or $v[.value | ascii_upcase] == ""
+        or ($v[.value | ascii_upcase] | test("[^\t\n\u000b\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]") | not)
         or ($v[.value | ascii_upcase] | contains("\u0000")))
     | "\(.key) (repository variable \(.value))"' <<< "$SITES" | paste -sd, -)"
   if [[ -n "$missing" ]]; then
-    echo "::error::The build of $name needs repository variables that are not set, are empty or contain NUL: ${missing//,/, }" >&2
+    echo "::error::The build of $name needs repository variables that are not set, are blank or contain NUL: ${missing//,/, }" >&2
     return 1
   fi
   jq -j --arg name "$name" --argjson vars "$variables" '
