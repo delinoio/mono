@@ -34,6 +34,11 @@ export function InvitationPage({ configured }: { configured: boolean }) {
   // unmount of the page replaces it, so the late success of an earlier
   // request does not navigate away from what the user sees.
   const currentAttempt = useRef(0);
+  // Keys the accept button by invitation attempt. The button keeps its
+  // pending state until the click promise of the request that it sent
+  // settles, so a replacement link remounts it. Without that, the button of
+  // the new link would stay pending behind the request of the earlier link.
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     return () => {
@@ -48,6 +53,7 @@ export function InvitationPage({ configured }: { configured: boolean }) {
       if (next !== undefined) {
         currentAttempt.current += 1;
         resetAccept();
+        setAttempt((n) => n + 1);
         setToken(next);
       }
     };
@@ -116,13 +122,14 @@ export function InvitationPage({ configured }: { configured: boolean }) {
       ) : null}
       <div className="actions">
         <Button
+          key={attempt}
           onClick={async () => {
-            const attempt = currentAttempt.current;
+            const clicked = currentAttempt.current;
             try {
               const res = await accept.mutateAsync({
                 invitationToken: token,
               });
-              if (attempt !== currentAttempt.current) {
+              if (clicked !== currentAttempt.current) {
                 return;
               }
               navigate(
