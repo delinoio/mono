@@ -213,8 +213,15 @@ func TestFailedInstallKeepsRunningRevocation(t *testing.T) {
 			if restarts.Load() != 0 {
 				t.Fatal("restarted after a failed install")
 			}
-			if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED {
-				t.Fatalf("state %v", s)
+			// A revoked running version stays REVOKED_PENDING_IDLE after the
+			// failed install, as after a failed download, so the heartbeat keeps
+			// the control plane from placing sandboxes on the device.
+			wantState := ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
+			if tc.wantRevoked {
+				wantState = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
+			}
+			if s, _ := u.State(); s != wantState {
+				t.Fatalf("state %v, want %v", s, wantState)
 			}
 			release, err := u.BeginCreate()
 			if tc.wantRevoked {
@@ -833,6 +840,11 @@ func TestWithdrawDuringDownloadKeepsSignedRevocation(t *testing.T) {
 	}
 	if _, err := u.BeginCreate(); !errors.Is(err, ErrRunningRevoked) {
 		t.Fatalf("create while the manifest revokes the running version: %v", err)
+	}
+	// The heartbeat state must agree with the create admission while the
+	// artifact is still downloading.
+	if s, target := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE || target != "1.1.0" {
+		t.Fatalf("state during the download %v %q", s, target)
 	}
 	gate.open()
 	if err := awaitDone(t, done); err != nil {
