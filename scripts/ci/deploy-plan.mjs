@@ -211,9 +211,14 @@ function binaryFields(name, deploy, dir) {
       typeof publicUrl !== "string" ||
       url?.protocol !== "https:" ||
       url.href !== publicUrl ||
+      url.username !== "" ||
+      url.password !== "" ||
       url.pathname !== `/${objectKey}` ||
       url.search !== "" ||
-      url.hash !== ""
+      url.hash !== "" ||
+      // A URL parser drops a bare `?` or `#` delimiter, so it leaves `search`
+      // and `hash` empty. Compare the exact canonical string to reject them.
+      publicUrl !== `https://${url.host}/${objectKey}`
     ) {
       throw new DeployPlanError(
         `${name}: deploy.updateManifest.publicUrl must be https://<host>/${objectKey}`,

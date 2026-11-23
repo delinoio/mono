@@ -1649,6 +1649,42 @@ test("invalid github-release fields fail", async (t) => {
       },
       /deploy\.updateManifest\.publicUrl/,
     ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "https://x.test/tool/m.json?",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl must be https:\/\/<host>\/tool\/m\.json/,
+    ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "https://x.test/tool/m.json#",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl must be https:\/\/<host>\/tool\/m\.json/,
+    ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "https://test-user@x.test/tool/m.json",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl must be https:\/\/<host>\/tool\/m\.json/,
+    ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "https://test-user:secret@x.test/tool/m.json",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl must be https:\/\/<host>\/tool\/m\.json/,
+    ],
     [{ updateManifest: null }, /deploy\.updateManifest\.objectKey/],
   ];
   for (const [fields, message] of cases) {
