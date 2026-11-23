@@ -16,6 +16,13 @@ export function isNotFound(error: unknown): error is ConnectError {
   return error instanceof ConnectError && error.code === Code.NotFound;
 }
 
+/** Reports whether the error is a Connect `failed_precondition`. */
+export function isFailedPrecondition(error: unknown): error is ConnectError {
+  return (
+    error instanceof ConnectError && error.code === Code.FailedPrecondition
+  );
+}
+
 /**
  * Reports whether the error is the `not_found` that the guest helper or the
  * agent returns for a `read_id` that expired ("read expired", or "operation

@@ -28,6 +28,7 @@ import { RecoveryWindow } from "../relay/recovery.ts";
 import { type ConsumerHold, watchedRelayStream } from "../relay/stream.ts";
 import { uuidV7TimestampMs } from "../uuidv7.ts";
 import {
+  isFailedPrecondition,
   isNotFound,
   RecoveryDeadlineError,
   recoverOrThrow,
@@ -139,6 +140,39 @@ export async function* runExec(
   // The last failure that fed the recovery window. A state lookup that the
   // window cuts off ends the operation with it.
   let lastRelayFailure: unknown;
+  // Whether the `ExecRequest` of this iteration is a resend after AttachExec
+  // answered not_found, and not the first send of the request.
+  let resending = false;
+
+  /**
+   * The sandbox is paused and the exec did not start: the pause may outlast
+   * the recovery window, so the window ends and the SDK waits for the
+   * sandbox to resume. Returns the result when the sandbox ended instead; it
+   * returns undefined when the identical request can be resent.
+   */
+  const resumeFromPause = async (
+    cause: unknown,
+  ): Promise<ExecResult | undefined> => {
+    window.end();
+    const waited = await waitForSandboxToResume(ctx, signal);
+    if (!waited.resumed) {
+      return {
+        kind: ExecResultKind.SandboxEnded,
+        reason: waited.reason,
+        complete,
+      };
+    }
+    if (
+      ctx.clock.wallNow() - uuidV7TimestampMs(plan.execId) >=
+      Timing.operationIdLifetimeMs
+    ) {
+      throw new DataPathError(
+        "the exec did not start before its exec_id expired",
+        { code: Code.DeadlineExceeded, cause },
+      );
+    }
+    return undefined;
+  };
 
   const attachRequest = (): AttachExecRequest =>
     create(AttachExecRequestSchema, {
@@ -367,24 +401,8 @@ export async function* runExec(
         current = undefined;
       }
       if (current?.state === SandboxState.PAUSED) {
-        window.end();
-        const waited = await waitForSandboxToResume(ctx, signal);
-        if (!waited.resumed) {
-          return {
-            kind: ExecResultKind.SandboxEnded,
-            reason: waited.reason,
-            complete,
-          };
-        }
-        if (
-          ctx.clock.wallNow() - uuidV7TimestampMs(plan.execId) >=
-          Timing.operationIdLifetimeMs
-        ) {
-          throw new DataPathError(
-            "the exec did not start before its exec_id expired",
-            { code: Code.DeadlineExceeded, cause: failure },
-          );
-        }
+        const ended = await resumeFromPause(failure);
+        if (ended !== undefined) return ended;
       } else if (
         current?.state === SandboxState.DELETED ||
         current?.state === SandboxState.FAILED
@@ -395,8 +413,45 @@ export async function* runExec(
           complete,
         };
       }
+      resending = true;
       mode = Mode.Exec;
       continue;
+    }
+    if (
+      isFailedPrecondition(failure) &&
+      mode === Mode.Exec &&
+      resending &&
+      !started &&
+      request !== undefined
+    ) {
+      // The agent rejected the resend. A sandbox that paused meanwhile
+      // rejects it with failed_precondition: wait for the resume as for a
+      // paused sandbox that has no exec record, then resend the identical
+      // request. Any other state, or a failed lookup, keeps the original
+      // error.
+      let current;
+      try {
+        current = await sandboxStateWithin(ctx, signal, window);
+      } catch {
+        throwIfAborted(signal);
+        current = undefined;
+      }
+      if (current?.state === SandboxState.PAUSED) {
+        const ended = await resumeFromPause(failure);
+        if (ended !== undefined) return ended;
+        mode = Mode.Exec;
+        continue;
+      }
+      if (
+        current?.state === SandboxState.DELETED ||
+        current?.state === SandboxState.FAILED
+      ) {
+        return {
+          kind: ExecResultKind.SandboxEnded,
+          reason: current.endReason,
+          complete,
+        };
+      }
     }
     if (onRelay) grants.discardFor(failure);
     lastRelayFailure = failure;
