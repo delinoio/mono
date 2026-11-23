@@ -40,6 +40,11 @@ out_dir="$(cd "$(dirname "$out")" && pwd)"
 out_name="$(basename "$out")"
 cache="${OWNSAND_KERNEL_CACHE:-$HOME/.cache/ownsand-kernel}"
 mkdir -p "$cache"
+# Docker reads a -v source without a slash as the name of a named volume, so
+# a bare name such as kernel-cache would hide the host archives. The absolute
+# path always names the host directory. A failure here stops the script
+# (set -e) before docker runs.
+cache="$(cd "$cache" && pwd)"
 
 docker run --rm \
   -v "$here:/src:ro" \
