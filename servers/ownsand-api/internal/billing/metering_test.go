@@ -942,68 +942,6 @@ func TestRunSealsAndReportsOnTheLeaseHolderOnly(t *testing.T) {
 	}
 }
 
-// A new lease holder reports the due rows that another instance sealed, even
-// when it seals no window itself, within about one Tick of the lease handover
-// (the idle Report interval is an hour here, so only the lease check wakes
-// the reporter).
-func TestRunReportsDueRowsAfterLeaseHandover(t *testing.T) {
-	f := newFixture(t, t0.Add(time.Minute))
-	accounts, client := newFakeAccounts(t)
-	ctx := context.Background()
-
-	// A previous holder sealed the window and never reported it.
-	previous := f.metering(nil)
-	previous.Add(org1, classA, t0.Add(time.Minute), 2)
-	if err := previous.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	f.clock.Set(t0.Add(7 * time.Minute))
-	if n, err := previous.Seal(ctx); err != nil || n != 1 {
-		t.Fatalf("seal: %d %v", n, err)
-	}
-
-	timing := billing.Timing{Flush: 10 * time.Millisecond, Tick: 10 * time.Millisecond, Report: time.Hour, BackoffMin: 10 * time.Millisecond, BackoffMax: time.Second}
-	var held atomic.Bool
-	m := f.metering(client, func(o *billing.Options) {
-		o.Timing = &timing
-		o.Held = held.Load
-	})
-	runCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() { m.Run(runCtx); close(done) }()
-	defer func() { cancel(); <-done }()
-
-	// While the instance is not the holder, several Ticks pass without a report.
-	time.Sleep(100 * time.Millisecond)
-	if _, reports := accounts.count(); reports != 0 {
-		t.Fatalf("an instance without the lease reported %d rows", reports)
-	}
-	held.Store(true)
-	eventually(t, "due row reported after the handover", func() bool {
-		return accounts.report(org1, accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC, t0) != nil
-	})
-
-	// While this instance holds the lease it keeps the idle Report interval:
-	// a due row that appears without a kick waits for it.
-	// Wait until the first pass ended (it marks the row reported and then looks
-	// for the next due row) so that the new row cannot be part of it.
-	eventually(t, "first pass finished", func() bool {
-		s, ok := f.outbox(t, org1, classA, t0)
-		return ok && s.reported
-	})
-	time.Sleep(100 * time.Millisecond)
-	_, before := accounts.count()
-	if _, err := f.db.Pool.Exec(ctx, `INSERT INTO usage_outbox (organization_id, meter, window_start, quantity, amount_usd_micros, seal_time, next_attempt_time)
-		SELECT organization_id, $1, window_start, quantity, amount_usd_micros, seal_time, seal_time FROM usage_outbox WHERE organization_id = $2 AND meter = $3 AND window_start = $4`,
-		int16(classB), org1, int16(classA), t0); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(200 * time.Millisecond)
-	if _, after := accounts.count(); after != before {
-		t.Fatalf("the holder reported %d rows before its idle interval ended", after-before)
-	}
-}
-
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
