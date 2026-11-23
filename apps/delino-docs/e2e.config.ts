@@ -2,6 +2,7 @@
 import type { E2EConfig } from "e2e";
 import { web } from "@e2e-dev/web";
 import { gateway } from "ai";
+import { rspressBin } from "./e2e/rspress-bin";
 
 export default {
   projectId: "delino-docs",
@@ -14,8 +15,18 @@ export default {
         // with the fixed development port used by `pnpm dev`.
         url: "http://127.0.0.1:0",
         command: {
-          executable: "rspress",
-          args: ["dev", "--host", "127.0.0.1", "--port", "{port}"],
+          // The Rspress CLI file runs on the Node executable, because the
+          // runner starts the command without a shell and cannot start the
+          // `rspress` command shim of Windows.
+          executable: process.execPath,
+          args: [
+            rspressBin(),
+            "dev",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "{port}",
+          ],
           log: ".e2e/logs/app.log",
         },
       },
