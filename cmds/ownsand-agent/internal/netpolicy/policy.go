@@ -227,6 +227,11 @@ func sourceGuardRules(assignments []TapGateway) string {
 // has a spoofed source, and the blocked6 drop alone would forward it to any
 // destination outside the blocked prefixes. IPv6 neighbor and router
 // discovery on the guest link hit the input chain only and are unaffected.
+// The DNS forwarder listens on the gateway addresses without binding to a
+// device, so the input chain also drops every packet to GuestSubnet that
+// arrives on an interface other than a sandbox tap or the loopback
+// interface (for example a LAN peer that routes the guest subnet through the
+// host); the rule follows every accept and precedes the final tap drop.
 func Ruleset(v4, v6 []netip.Prefix, assignments []TapGateway) string {
 	tap := TapPrefix + "*"
 	return fmt.Sprintf(`table inet %[1]s
@@ -249,6 +254,7 @@ table inet %[1]s {
 %[6]s		iifname "%[4]s" udp sport 68 udp dport 67 accept
 		iifname "%[4]s" udp sport 546 udp dport 547 accept
 		iifname "%[4]s" icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+		iifname != "lo" iifname != "%[4]s" ip daddr %[5]s drop
 		iifname "%[4]s" drop
 	}
 	chain forward {
