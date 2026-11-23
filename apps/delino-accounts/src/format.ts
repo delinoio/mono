@@ -195,6 +195,13 @@ export function formatMonth(value: UtcMonth): string {
 }
 
 /**
+ * The `resource_exhausted` message of `CreateInvitation` when the inviter or
+ * the address reached its limit in 24 hours (the contract of
+ * `servers/accounts-api`).
+ */
+export const INVITATION_LIMIT_MESSAGE = "too many invitations; try again later";
+
+/**
  * A short, plain message for an RPC error. It never includes request data
  * or credentials, only the server's message for validation errors.
  */
@@ -214,7 +221,12 @@ export function errorMessage(error: unknown): string {
     case Code.Unavailable:
       return "Delino Accounts is not available right now. Try again in a moment.";
     case Code.ResourceExhausted:
-      return "Too many requests. Wait a moment and try again.";
+      // Only the invitation limit has a message that is written for the
+      // reader. Other resource_exhausted messages, such as the request size
+      // limit, are technical, so they keep the generic text.
+      return error.rawMessage === INVITATION_LIMIT_MESSAGE
+        ? error.rawMessage
+        : "Too many requests. Wait a moment and try again.";
     case Code.InvalidArgument:
     case Code.FailedPrecondition:
       return error.rawMessage || "The request is not valid.";
