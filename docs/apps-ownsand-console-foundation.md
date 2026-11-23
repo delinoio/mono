@@ -90,6 +90,7 @@ The console sends no logs to a service in this version. Browser console messages
 - Dependencies (exact pins, each released at least two weeks before it was pinned; record `pnpm audit` results in the pull request): `@connectrpc/connect` `2.3.0`, `@connectrpc/connect-web` `2.3.0`, `@connectrpc/connect-query` `2.3.1`, `@tanstack/react-query` `5.106.1`, `@bufbuild/protobuf` `2.16.0`, `@logto/react` `4.1.3`, React `19.3.1`; development: the Rsbuild, Rstest, Testing Library, `happy-dom` and e2e versions of `delino-accounts` and `delino-ui`.
 - Shared UI: [`delino-ui`](packages-delino-ui-foundation.md).
 - `delino-accounts`: link target for account settings and for billing management. The console never calls the `delino-accounts` API; the control plane reads the billing data for it.
+- Global anchor styles: the unlayered `a`, `a:hover` and `a:focus-visible` rules in `src/index.css` use `a:where(:not(.dui-button))`, which excludes Button anchors and keeps the specificity of the plain `a` rules (one-class rules such as `.list-link` and `.button-link` still win), so the "Open billing" toast action (a `delino-ui` `Button` rendered as an anchor) keeps white text on the accent background in light and dark mode, while other links keep the link color and the hover underline. `src/anchor-style-guard.test.ts` guards the selectors and `e2e/toast-action-color.e2e.ts` and `e2e/anchor-rule-specificity.e2e.ts` check the computed colors.
 
 ## Change Triggers
 
