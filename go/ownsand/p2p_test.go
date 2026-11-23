@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -56,6 +58,111 @@ func multiFragmentFrame(t *testing.T, sess *p2pSession, id uint64) *ownsandv1.Da
 	return f
 }
 
+// readyPoll is how often awaitReady re-checks its condition. The wait is
+// bounded by the caller's context, not by this interval.
+const readyPoll = time.Millisecond
+
+// awaitReady waits until ready reports true and returns an error that names
+// the phase otherwise. It stops with a distinct error when the worker reports
+// completion on done first (the worker exited before the phase was reached)
+// and when ctx ends first (the phase never arrived). ready is checked before
+// the other outcomes, so a phase that was reached always wins.
+func awaitReady(ctx context.Context, phase string, ready func() bool, done <-chan error) error {
+	tick := time.NewTicker(readyPoll)
+	defer tick.Stop()
+	for {
+		if ready() {
+			return nil
+		}
+		select {
+		case err := <-done:
+			return fmt.Errorf("the worker exited before %s: %v", phase, err)
+		case <-ctx.Done():
+			return fmt.Errorf("%s never arrived: %w", phase, ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
+// awaitWorker returns the result of the worker on done, or an error that names
+// the phase when ctx ends first.
+func awaitWorker(ctx context.Context, phase string, done <-chan error) (error, error) {
+	select {
+	case err := <-done:
+		return err, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("the worker did not finish %s: %w", phase, ctx.Err())
+	}
+}
+
+// closed reports whether ch is closed, without blocking.
+func closed(ch <-chan struct{}) func() bool {
+	return func() bool {
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+// requireReady fails the test with the phase-specific diagnostic of awaitReady.
+func requireReady(t *testing.T, ctx context.Context, phase string, ready func() bool, done <-chan error) {
+	t.Helper()
+	if err := awaitReady(ctx, phase, ready, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// requireWorker returns the worker result or fails the test with the
+// phase-specific diagnostic of awaitWorker.
+func requireWorker(t *testing.T, ctx context.Context, phase string, done <-chan error) error {
+	t.Helper()
+	res, err := awaitWorker(ctx, phase, done)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+// streamCount returns the number of streams that the session has registered.
+func streamCount(sess *p2pSession) int {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return len(sess.streams)
+}
+
+// manualDeadlineCtx is a context that reports context.DeadlineExceeded after
+// expire is called. A test uses it where a real timer would race with the
+// observation of the state that the deadline interrupts: it expires the
+// context only after the test observed that state. It ends with its parent
+// as well, and then reports the parent's error.
+type manualDeadlineCtx struct {
+	context.Context
+	cancel  context.CancelFunc
+	expired atomic.Bool
+}
+
+func newManualDeadlineCtx(parent context.Context) *manualDeadlineCtx {
+	inner, cancel := context.WithCancel(parent)
+	return &manualDeadlineCtx{Context: inner, cancel: cancel}
+}
+
+// expire ends the context with context.DeadlineExceeded. The flag is set
+// before the cancellation, so a reader that sees Done closed sees the error.
+func (c *manualDeadlineCtx) expire() {
+	c.expired.Store(true)
+	c.cancel()
+}
+
+func (c *manualDeadlineCtx) Err() error {
+	if err := c.Context.Err(); err != nil && c.expired.Load() {
+		return context.DeadlineExceeded
+	}
+	return c.Context.Err()
+}
+
 // TestSendCancelledBeforeFirstFragmentKeepsSession checks that a cancelled
 // send that wrote nothing leaves the session usable: the next frame is
 // decoded by the peer.
@@ -70,12 +177,15 @@ func TestSendCancelledBeforeFirstFragmentKeepsSession(t *testing.T) {
 	}
 	waiting := holdSendAt(sess, 1)
 
+	// Build the frame here: a worker goroutine must not call t.Fatal.
+	frame := multiFragmentFrame(t, sess, 1)
 	sendCtx, cancelSend := context.WithCancel(ctx)
+	defer cancelSend()
 	errc := make(chan error, 1)
-	go func() { errc <- sess.send(sendCtx, multiFragmentFrame(t, sess, 1)) }()
-	<-waiting
+	go func() { errc <- sess.send(sendCtx, frame) }()
+	requireReady(t, ctx, "the send waiting on the full buffer", closed(waiting), errc)
 	cancelSend()
-	if err := <-errc; !errors.Is(err, context.Canceled) {
+	if err := requireWorker(t, ctx, "after the send was canceled", errc); !errors.Is(err, context.Canceled) {
 		t.Fatalf("send: want context.Canceled, got %v", err)
 	}
 	if sess.isDone() {
@@ -110,12 +220,15 @@ func TestSendCancelledAfterFirstFragmentRetiresSession(t *testing.T) {
 	}
 	waiting := holdSendAt(sess, 2)
 
+	// Build the frame here: a worker goroutine must not call t.Fatal.
+	frame := multiFragmentFrame(t, sess, 1)
 	sendCtx, cancelSend := context.WithCancel(ctx)
+	defer cancelSend()
 	errc := make(chan error, 1)
-	go func() { errc <- sess.send(sendCtx, multiFragmentFrame(t, sess, 1)) }()
-	<-waiting
+	go func() { errc <- sess.send(sendCtx, frame) }()
+	requireReady(t, ctx, "the send waiting on the full buffer", closed(waiting), errc)
 	cancelSend()
-	if err := <-errc; !errors.Is(err, context.Canceled) {
+	if err := requireWorker(t, ctx, "after the send was canceled", errc); !errors.Is(err, context.Canceled) {
 		t.Fatalf("send: want context.Canceled, got %v", err)
 	}
 	if !sess.isDone() {
@@ -154,17 +267,13 @@ func TestSendCancelledAfterFirstFragmentRetiresSession(t *testing.T) {
 func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
 	cases := []struct {
 		name string
-		mk   func(parent context.Context) (context.Context, func(), error)
 		want error
+		// end makes the request context done after the request waits for the
+		// send turn.
+		end func(cancel context.CancelFunc, deadline *manualDeadlineCtx)
 	}{
-		{"canceled", func(p context.Context) (context.Context, func(), error) {
-			c, cancel := context.WithCancel(p)
-			return c, cancel, nil
-		}, context.Canceled},
-		{"deadline", func(p context.Context) (context.Context, func(), error) {
-			c, cancel := context.WithTimeout(p, 50*time.Millisecond)
-			return c, cancel, nil
-		}, context.DeadlineExceeded},
+		{"canceled", context.Canceled, func(cancel context.CancelFunc, _ *manualDeadlineCtx) { cancel() }},
+		{"deadline", context.DeadlineExceeded, func(_ context.CancelFunc, deadline *manualDeadlineCtx) { deadline.expire() }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -186,46 +295,38 @@ func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
 				}
 			}
 			defer releaseTurn()
-			reqCtx, stop, _ := tc.mk(ctx)
-			defer stop()
+			// Both contexts end only on the test's signal, after the request
+			// registered its stream. A real timer could expire before the
+			// registration is observed and remove the stream between polls.
+			cancelCtx, cancelReq := context.WithCancel(ctx)
+			defer cancelReq()
+			deadlineCtx := newManualDeadlineCtx(ctx)
+			defer deadlineCtx.cancel()
+			reqCtx := context.Context(cancelCtx)
+			if tc.want == context.DeadlineExceeded {
+				reqCtx = deadlineCtx
+			}
+			// Build the request here: a worker goroutine must not call t.Fatal.
+			req := &ownsandv1.WriteFileRequest{WriteId: mustID(t), Path: "/never", Data: []byte("x")}
 			errc := make(chan error, 1)
 			go func() {
-				_, err := sess.openStream(reqCtx, &ownsandv1.WriteFileRequest{WriteId: mustID(t), Path: "/never", Data: []byte("x")})
+				_, err := sess.openStream(reqCtx, req)
 				errc <- err
 			}()
 			// Wait until the stream is registered, then make the context done
 			// while the request still waits for the send turn.
-			for {
-				sess.mu.Lock()
-				n := len(sess.streams)
-				sess.mu.Unlock()
-				if n == 1 {
-					break
-				}
-				time.Sleep(time.Millisecond)
-			}
-			if tc.want == context.Canceled {
-				stop()
-			}
-			<-reqCtx.Done()
+			requireReady(t, ctx, "the request registering its stream", func() bool { return streamCount(sess) == 1 }, errc)
+			tc.end(cancelReq, deadlineCtx)
 			// The request must return while the turn is still held: it
 			// observes its own context and does not wait for the sender.
-			select {
-			case err := <-errc:
-				if !errors.Is(err, tc.want) {
-					t.Fatalf("openStream: want %v, got %v", tc.want, err)
-				}
-			case <-time.After(15 * time.Second):
-				t.Fatal("openStream did not return while the send turn was held")
+			if err := requireWorker(t, ctx, "while the send turn was held", errc); !errors.Is(err, tc.want) {
+				t.Fatalf("openStream: want %v, got %v", tc.want, err)
 			}
 			releaseTurn()
 			if sess.isDone() {
 				t.Fatal("the session ended")
 			}
-			sess.mu.Lock()
-			n := len(sess.streams)
-			sess.mu.Unlock()
-			if n != 0 {
+			if n := streamCount(sess); n != 0 {
 				t.Fatalf("%d streams left", n)
 			}
 			want := []byte("after")
@@ -242,6 +343,78 @@ func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
 				t.Fatalf("%d sessions opened, want 1", n)
 			}
 		})
+	}
+}
+
+// TestAwaitReadyDiagnostics checks that the fixture waits end with a message
+// that names the phase when the worker exits first, when the phase never
+// arrives, and when the worker does not finish.
+func TestAwaitReadyDiagnostics(t *testing.T) {
+	never := func() bool { return false }
+	live, cancelLive := context.WithCancel(context.Background())
+	defer cancelLive()
+	ended, cancelEnded := context.WithCancel(context.Background())
+	cancelEnded()
+
+	t.Run("ready wins over an exited worker and an ended context", func(t *testing.T) {
+		done := make(chan error, 1)
+		done <- errors.New("worker failed")
+		if err := awaitReady(ended, "phase-a", func() bool { return true }, done); err != nil {
+			t.Fatalf("ready phase: %v", err)
+		}
+	})
+	t.Run("worker exits before readiness", func(t *testing.T) {
+		done := make(chan error, 1)
+		done <- errors.New("boom")
+		err := awaitReady(live, "phase-b", never, done)
+		if err == nil || !strings.Contains(err.Error(), "worker exited before phase-b") || !strings.Contains(err.Error(), "boom") {
+			t.Fatalf("got %v, want the early exit with the worker error", err)
+		}
+	})
+	t.Run("readiness never arrives", func(t *testing.T) {
+		err := awaitReady(ended, "phase-c", never, make(chan error))
+		if err == nil || !strings.Contains(err.Error(), "phase-c never arrived") || !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want the missing milestone", err)
+		}
+	})
+	t.Run("worker does not finish", func(t *testing.T) {
+		_, err := awaitWorker(ended, "phase-d", make(chan error))
+		if err == nil || !strings.Contains(err.Error(), "did not finish phase-d") {
+			t.Fatalf("got %v, want the unfinished worker", err)
+		}
+	})
+	t.Run("worker finishes", func(t *testing.T) {
+		done := make(chan error, 1)
+		want := errors.New("result")
+		done <- want
+		got, err := awaitWorker(live, "phase-e", done)
+		if err != nil || got != want {
+			t.Fatalf("got %v, %v, want the worker result", got, err)
+		}
+	})
+}
+
+// TestManualDeadlineCtx checks that the context reports the deadline error
+// only after expire, and the parent's error when the parent ends first.
+func TestManualDeadlineCtx(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	c := newManualDeadlineCtx(parent)
+	defer c.cancel()
+	if err := c.Err(); err != nil {
+		t.Fatalf("before expire: %v", err)
+	}
+	c.expire()
+	<-c.Done()
+	if err := c.Err(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("after expire: %v", err)
+	}
+
+	c2 := newManualDeadlineCtx(parent)
+	defer c2.cancel()
+	cancelParent()
+	<-c2.Done()
+	if err := c2.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("after the parent ended: %v", err)
 	}
 }
 
