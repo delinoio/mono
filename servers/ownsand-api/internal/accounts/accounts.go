@@ -199,6 +199,26 @@ func (s *TokenSource) Invalidate() {
 	s.mu.Unlock()
 }
 
+// InvalidateToken drops the cached token after the API rejected rejected,
+// the token that the failed call sent. It never waits for a token request.
+//
+// The rejection can arrive late: when several calls carry the same token and
+// the API rejects them one after the other, the first rejection drops the
+// token and a call caches a replacement before the later rejections arrive.
+// A rejection of a token that is no longer the cached token therefore changes
+// nothing: it keeps the replacement and a replacement request in progress, so
+// the next call does not need the token endpoint. A rejection of the cached
+// token behaves like Invalidate.
+func (s *TokenSource) InvalidateToken(rejected string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rejected == "" || s.token != rejected {
+		return
+	}
+	s.token, s.refreshAt = "", time.Time{}
+	s.flight = nil
+}
+
 // errMalformedTokenResponse reports a successful token response that is not a
 // valid token response document. It never carries response content.
 var errMalformedTokenResponse = errors.New("token endpoint returned a malformed token response")
@@ -283,7 +303,9 @@ func (b bearerInterceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
 		req.Header().Set("Authorization", "Bearer "+token)
 		resp, err := next(ctx, req)
 		if connect.CodeOf(err) == connect.CodeUnauthenticated {
-			b.tokens.Invalidate()
+			// Bind the invalidation to the token that this call sent, so a late
+			// rejection never drops a newer token.
+			b.tokens.InvalidateToken(token)
 		}
 		return resp, err
 	}
