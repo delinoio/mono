@@ -379,6 +379,19 @@ importers:
         specifier: 6.0.3
         version: 6.0.3
 
+  protos/delino/tide:
+    dependencies:
+      '@bufbuild/protobuf':
+        specifier: 2.16.0
+        version: 2.16.0
+    devDependencies:
+      '@bufbuild/protoc-gen-es':
+        specifier: 2.16.0
+        version: 2.16.0(@bufbuild/protobuf@2.16.0)
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+
   servers/accounts-api: {}
 
   servers/ownsand-api: {}
