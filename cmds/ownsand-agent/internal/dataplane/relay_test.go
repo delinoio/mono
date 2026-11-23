@@ -970,7 +970,16 @@ func TestRelayWatchdogRedialsWhenWriterIsBlocked(t *testing.T) {
 	// The connection loss ends the stream of g and releases it; this second
 	// grant stays live, so the agent has a reason to dial again.
 	e.execGrant(e.execReq("/bin/true"))
-	rc := <-e.conns
+	// Receive the connection directly: e.conn() would also wait for a frame
+	// that this custom handler never queues. A bounded wait turns a
+	// connection that never arrives into a diagnostic instead of the outer
+	// test timeout.
+	var rc *relayConn
+	select {
+	case rc = <-e.conns:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no initial relay connection")
+	}
 	waitFor(t, "stalled relay handler", stalled.Load)
 	e.dp.relay.mu.Lock()
 	first := e.dp.relay.conn
