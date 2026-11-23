@@ -63,9 +63,19 @@ type link struct {
 	status  *accountsv1.OrganizationBillingStatus
 }
 
+// usageKey identifies the usage of one organization and meter in one UTC
+// calendar month. The accounts API counts a report in the month in which its
+// window starts, so the month is part of the key.
 type usageKey struct {
 	org   string
 	meter accountsv1.Meter
+	month time.Time // first instant of the UTC month of the window start
+}
+
+// utcMonth returns the first instant of the UTC calendar month of t.
+func utcMonth(t time.Time) time.Time {
+	t = t.UTC()
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
 }
 
 // Server is a running fake delino-accounts API.
@@ -318,7 +328,7 @@ func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.
 			Duplicate: f.reported[key]}
 		if !f.reported[key] {
 			f.reported[key] = true
-			k := usageKey{org: r.GetOrganizationId(), meter: r.GetMeter()}
+			k := usageKey{org: r.GetOrganizationId(), meter: r.GetMeter(), month: utcMonth(r.GetWindowStart().AsTime())}
 			u := f.usage[k]
 			f.usage[k] = [2]int64{u[0] + r.GetQuantity(), u[1] + r.GetAmountUsdMicros()}
 			if l, ok := f.links[r.GetOrganizationId()]; ok {
@@ -520,10 +530,10 @@ func (h handler) GetOrganizationBilling(_ context.Context, req *connect.Request[
 	a := f.accounts[l.account]
 	now := f.now().UTC()
 	resp := &accountsv1.GetOrganizationBillingResponse{BillingAccountId: a.id, BillingAccountName: a.name, BalanceUsdMicros: a.balance,
-		Status: proto.Clone(l.status).(*accountsv1.OrganizationBillingStatus), MonthStart: timestamppb.New(time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC))}
+		Status: proto.Clone(l.status).(*accountsv1.OrganizationBillingStatus), MonthStart: timestamppb.New(utcMonth(now))}
 	for _, m := range []accountsv1.Meter{accountsv1.Meter_METER_OWNSAND_RELAY_EGRESS, accountsv1.Meter_METER_OWNSAND_R2_STORAGE,
 		accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC, accountsv1.Meter_METER_OWNSAND_CLASS_B_RPC} {
-		u := f.usage[usageKey{org: org, meter: m}]
+		u := f.usage[usageKey{org: org, meter: m, month: utcMonth(now)}]
 		resp.MeterUsages = append(resp.MeterUsages, &accountsv1.MeterUsage{Meter: m, Quantity: u[0], AmountUsdMicros: u[1]})
 	}
 	return connect.NewResponse(resp), nil
