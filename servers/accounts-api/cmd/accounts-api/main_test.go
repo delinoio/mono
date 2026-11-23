@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -141,38 +142,146 @@ func startServe(ctx context.Context, t *testing.T, handler http.Handler, timeout
 	return srv, listener.Addr().String(), done
 }
 
+// handlerStartTimeout bounds how long a drain test waits for its request to
+// reach the handler before it reports a diagnostic instead of hanging.
+const handlerStartTimeout = 5 * time.Second
+
+// response is the client-side result of one background GET.
+type response struct {
+	status int
+	body   string
+	err    error
+}
+
+// getWithEarlyError sends one GET to addr in the background. The full result arrives on
+// responded. When the request fails or answers with anything but 200 OK, the
+// cause also arrives on requestErr, so a caller waiting for the handler to start
+// can stop early. Both channels are buffered, so the goroutine never blocks.
+func getWithEarlyError(addr string) (responded <-chan response, requestErr <-chan error) {
+	resultCh := make(chan response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result := response{}
+		resp, err := http.Get("http://" + addr + "/")
+		if err != nil {
+			result.err = err
+		} else {
+			defer resp.Body.Close()
+			body, readErr := io.ReadAll(resp.Body)
+			result = response{status: resp.StatusCode, body: string(body), err: readErr}
+		}
+		resultCh <- result
+		switch {
+		case result.err != nil:
+			errCh <- result.err
+		case result.status != http.StatusOK:
+			errCh <- fmt.Errorf("unexpected status %d", result.status)
+		}
+	}()
+	return resultCh, errCh
+}
+
+// awaitHandlerStarted waits until the handler signals started. It returns a
+// diagnostic error when the request fails first, serve exits first or timeout
+// elapses, so a request that never reaches the handler cannot hang the test.
+func awaitHandlerStarted(started <-chan struct{}, requestErr <-chan error, done <-chan error, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-started:
+		return nil
+	case err := <-requestErr:
+		return fmt.Errorf("request failed before the handler started: %w", err)
+	case err := <-done:
+		return fmt.Errorf("serve returned before the handler started: %v", err)
+	case <-timer.C:
+		return fmt.Errorf("handler did not start within %v", timeout)
+	}
+}
+
+func TestAwaitHandlerStartedReturnsNilOnceHandlerStarted(t *testing.T) {
+	started := make(chan struct{})
+	close(started)
+	if err := awaitHandlerStarted(started, make(chan error), make(chan error), time.Second); err != nil {
+		t.Fatalf("awaitHandlerStarted = %v, want nil", err)
+	}
+}
+
+func TestAwaitHandlerStartedReportsEarlyRequestError(t *testing.T) {
+	cause := errors.New("connection refused")
+	requestErr := make(chan error, 1)
+	requestErr <- cause
+	err := awaitHandlerStarted(make(chan struct{}), requestErr, make(chan error), time.Minute)
+	if !errors.Is(err, cause) {
+		t.Fatalf("awaitHandlerStarted = %v, want it to wrap %v", err, cause)
+	}
+}
+
+func TestAwaitHandlerStartedReportsEarlyServeExit(t *testing.T) {
+	for _, serveErr := range []error{nil, errors.New("accept failed")} {
+		done := make(chan error, 1)
+		done <- serveErr
+		err := awaitHandlerStarted(make(chan struct{}), make(chan error), done, time.Minute)
+		if err == nil || !strings.Contains(err.Error(), "serve returned before the handler started") {
+			t.Fatalf("awaitHandlerStarted with serve result %v = %v, want a serve-exit diagnostic", serveErr, err)
+		}
+	}
+}
+
+func TestAwaitHandlerStartedTimesOut(t *testing.T) {
+	begin := time.Now()
+	err := awaitHandlerStarted(make(chan struct{}), make(chan error), make(chan error), 50*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "did not start") {
+		t.Fatalf("awaitHandlerStarted = %v, want a timeout diagnostic", err)
+	}
+	if elapsed := time.Since(begin); elapsed > 5*time.Second {
+		t.Fatalf("awaitHandlerStarted took %v, want it bounded by its timeout", elapsed)
+	}
+}
+
+// A request to an address with no listener never reaches a handler. The wait
+// must surface the client error within the bound instead of hanging.
+func TestAwaitHandlerStartedReportsFailedRequestToClosedListener(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	_, requestErr := getWithEarlyError(addr)
+	err = awaitHandlerStarted(make(chan struct{}), requestErr, make(chan error), handlerStartTimeout)
+	if err == nil || !strings.Contains(err.Error(), "request failed before the handler started") {
+		t.Fatalf("awaitHandlerStarted = %v, want a request-failure diagnostic", err)
+	}
+}
+
 func TestServeDrainsInFlightRequestWithoutCancellingItsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	// Release the handler on every exit path, including an early Fatalf, so it
+	// never stays blocked after the test ends.
+	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHandler)
 	handlerCtxErr := make(chan error, 1)
 	srv, addr, done := startServe(ctx, t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(started)
+		startOnce.Do(func() { close(started) })
 		<-release
 		handlerCtxErr <- r.Context().Err()
 		_, _ = io.WriteString(w, "completed")
 	}), 5*time.Second)
 
-	type response struct {
-		status int
-		body   string
-		err    error
-	}
-	responded := make(chan response, 1)
-	go func() {
-		resp, err := http.Get("http://" + addr + "/")
-		if err != nil {
-			responded <- response{err: err}
-			return
-		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		responded <- response{status: resp.StatusCode, body: string(body), err: err}
-	}()
+	responded, requestErr := getWithEarlyError(addr)
 
-	<-started
+	if err := awaitHandlerStarted(started, requestErr, done, handlerStartTimeout); err != nil {
+		t.Fatal(err)
+	}
 	cancel() // the shutdown trigger
 
 	// Shutdown must wait for the in-flight request instead of returning.
@@ -182,7 +291,7 @@ func TestServeDrainsInFlightRequestWithoutCancellingItsContext(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	close(release)
+	releaseHandler()
 	if err := <-handlerCtxErr; err != nil {
 		t.Fatalf("request context error during drain = %v, want nil", err)
 	}
@@ -213,21 +322,29 @@ func TestServeCancelsRequestContextOnlyAfterShutdownDeadline(t *testing.T) {
 	defer cancel()
 
 	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	// Release the handler on every exit path, including an early Fatalf, so it
+	// never stays blocked after the test ends. The expected path is the request
+	// context cancellation at the shutdown deadline.
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	cancelledAt := make(chan time.Time, 1)
 	_, addr, done := startServe(ctx, t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(started)
-		<-r.Context().Done()
-		cancelledAt <- time.Now()
+		startOnce.Do(func() { close(started) })
+		select {
+		case <-r.Context().Done():
+			cancelledAt <- time.Now()
+		case <-release:
+		}
 	}), timeout)
 
-	go func() {
-		resp, err := http.Get("http://" + addr + "/")
-		if err == nil {
-			_ = resp.Body.Close()
-		}
-	}()
+	// The request is expected to fail once the shutdown deadline cuts it off, so
+	// only its early failure is used, to stop waiting for the handler.
+	_, requestErr := getWithEarlyError(addr)
 
-	<-started
+	if err := awaitHandlerStarted(started, requestErr, done, handlerStartTimeout); err != nil {
+		t.Fatal(err)
+	}
 	shutdownStartedAt := time.Now()
 	cancel()
 
