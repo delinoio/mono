@@ -69,11 +69,16 @@ func TestRunWaitsForInterruptedSend(t *testing.T) {
 }
 
 func TestRunInterruptsBlockedSendOfIdleConnection(t *testing.T) {
-	c := NewConn(context.Background(), "device", 1, testLimits)
+	// The clock stands still until the send is blocked, so the idle interval
+	// starts only then.
+	c, clk := newIdleTestConn(t)
 	send, interrupt, entered, returned := interruptibleSend()
+	// Release the blocked send when the test fails before Run interrupts it.
+	t.Cleanup(func() { _ = interrupt() })
 	c.SetSendInterrupt(interrupt)
 	done := runConn(c, blockingRecv(c), send)
-	<-entered
+	awaitIdleSendEntry(t, entered, done)
+	clk.advance(testLimits.IdleTimeout + time.Millisecond)
 	if err := waitRun(t, done, 5*time.Second); !errors.Is(err, ErrIdle) {
 		t.Fatalf("Run = %v, want %v", err, ErrIdle)
 	}

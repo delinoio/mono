@@ -66,18 +66,20 @@ func waitRun(t *testing.T, done <-chan error, within time.Duration) error {
 }
 
 func TestRunClosesIdleConnectionWhileSendBlocks(t *testing.T) {
-	c := NewConn(context.Background(), "device", 1, testLimits)
+	// The clock stands still until the send is blocked and the stream is open,
+	// so the idle interval starts only then.
+	c, clk := newIdleTestConn(t)
 	send, entered := blockedSend(t)
 	done := runConn(c, blockingRecv(c), send)
-	<-entered
-	s, err := c.Open(context.Background(), "grant", "sandbox")
-	if err != nil {
-		t.Fatal(err)
-	}
+	awaitIdleSendEntry(t, entered, done)
+	s := openStream(t, c)
+	clk.advance(testLimits.IdleTimeout + time.Millisecond)
 	if err := waitRun(t, done, time.Second); !errors.Is(err, ErrIdle) {
 		t.Fatalf("Run = %v, want ErrIdle", err)
 	}
-	if _, err := s.Next(context.Background(), nil); !errors.Is(err, ErrIdle) {
+	nextCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := s.Next(nextCtx, nil); !errors.Is(err, ErrIdle) {
 		t.Fatalf("stream error = %v, want ErrIdle", err)
 	}
 	if c.StreamCount() != 0 {
