@@ -28,6 +28,9 @@ type Recorder struct {
 
 	mu     sync.Mutex
 	counts map[counterKey]int64
+	// closed is set by takeAndClose: the final snapshot of the process was
+	// taken, so a later Add can no longer reach Postgres.
+	closed bool
 }
 
 // NewRecorder returns an empty recorder.
@@ -54,6 +57,14 @@ func (r *Recorder) Add(orgID string, meter ownsandv1.BillingMeter, at time.Time,
 	}
 	k := counterKey{org: id.String(), meter: meter, window: WindowStart(at).Unix()}
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		// The final flush already took its snapshot, so this count cannot be
+		// written. Report it instead of keeping it in memory unseen.
+		r.logger.Error("billing_usage_dropped_after_final_flush", slog.String("organization_id", k.org), slog.String("meter", MeterID(meter)),
+			slog.Time("window_start", k.windowStart()), slog.Int64("quantity", quantity))
+		return
+	}
 	r.counts[k] = saturatingAdd(r.counts[k], quantity)
 	r.mu.Unlock()
 }
@@ -62,6 +73,21 @@ func (r *Recorder) Add(orgID string, meter ownsandv1.BillingMeter, at time.Time,
 func (r *Recorder) take() map[counterKey]int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if len(r.counts) == 0 {
+		return nil
+	}
+	out := r.counts
+	r.counts = map[counterKey]int64{}
+	return out
+}
+
+// takeAndClose removes and returns every counter and closes the recorder in
+// one step, so every Add either lands in the returned snapshot or is
+// rejected and logged by Add.
+func (r *Recorder) takeAndClose() map[counterKey]int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closed = true
 	if len(r.counts) == 0 {
 		return nil
 	}

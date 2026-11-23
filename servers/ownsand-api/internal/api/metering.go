@@ -4,8 +4,11 @@ package api
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +23,94 @@ import (
 // implements it.
 type UsageRecorder interface {
 	Add(orgID string, meter ownsandv1.BillingMeter, at time.Time, quantity int64)
+}
+
+// ErrUsageDrainIncomplete is returned by DrainUsage when requests that can
+// still record usage did not end before the context ended.
+var ErrUsageDrainIncomplete = errors.New("api: requests that record usage did not finish")
+
+// usageGate counts the requests that can still record usage. A request
+// enters before its handler runs and leaves after it recorded its usage, so
+// waiting for the count to reach zero orders the final usage flush after
+// every such request. The zero value is ready to use.
+type usageGate struct {
+	mu      sync.Mutex
+	n       int
+	waiters []chan struct{}
+}
+
+// enter registers one request and returns the function that ends it.
+func (g *usageGate) enter() (leave func()) {
+	g.mu.Lock()
+	g.n++
+	g.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			g.n--
+			if g.n == 0 {
+				for _, w := range g.waiters {
+					close(w)
+				}
+				g.waiters = nil
+			}
+		})
+	}
+}
+
+// wait blocks until no request is registered or ctx ends. It returns the
+// number of requests that were still registered when it returned.
+func (g *usageGate) wait(ctx context.Context) int {
+	g.mu.Lock()
+	if g.n == 0 {
+		g.mu.Unlock()
+		return 0
+	}
+	w := make(chan struct{})
+	g.waiters = append(g.waiters, w)
+	g.mu.Unlock()
+	select {
+	case <-w:
+		return 0
+	case <-ctx.Done():
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.n
+	}
+}
+
+// enterUsage registers a request that can record usage; the returned
+// function ends it and is safe to call more than once. Without metering it
+// registers nothing.
+func (s *Service) enterUsage() (leave func()) {
+	if s.Usage == nil {
+		return func() {}
+	}
+	return s.usageWriters.enter()
+}
+
+// enterBilledRPC registers an RPC of a billed class. An RPC that is never
+// billed (such as the long-lived agent channel) records no usage, so it
+// does not hold the shutdown drain.
+func (s *Service) enterBilledRPC(procedure string) (leave func()) {
+	if _, billed := billing.ClassifyRPC(procedure).Meter(); !billed {
+		return func() {}
+	}
+	return s.enterUsage()
+}
+
+// DrainUsage waits until every request that can record usage has recorded
+// it and ended, or ctx ends. It returns ErrUsageDrainIncomplete, wrapped
+// with the number of requests that are still running, when ctx ends first.
+// Call it after the HTTP server stopped accepting requests and before the
+// final usage flush.
+func (s *Service) DrainUsage(ctx context.Context) error {
+	if left := s.usageWriters.wait(ctx); left > 0 {
+		return fmt.Errorf("%w: %d still running", ErrUsageDrainIncomplete, left)
+	}
+	return nil
 }
 
 // recordUsage records usage when metering is wired.
@@ -72,6 +163,8 @@ func (m *meterInterceptor) meter(ctx context.Context, procedure string, err erro
 
 func (m *meterInterceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
 	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		leave := m.s.enterBilledRPC(req.Spec().Procedure)
+		defer leave()
 		resp, err := next(ctx, req)
 		m.meter(ctx, req.Spec().Procedure, err)
 		return resp, err
@@ -84,6 +177,8 @@ func (m *meterInterceptor) WrapStreamingClient(next connect.StreamingClientFunc)
 
 func (m *meterInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
 	return func(ctx context.Context, conn connect.StreamingHandlerConn) error {
+		leave := m.s.enterBilledRPC(conn.Spec().Procedure)
+		defer leave()
 		err := next(ctx, conn)
 		m.meter(ctx, conn.Spec().Procedure, err)
 		return err
@@ -132,6 +227,9 @@ func (w *egressWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 // RelayService request. Wrap the RelayService handler with it.
 func (p *DataPlane) MeterRelayEgress(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The egress writer records until the handler returns.
+		leave := p.S.enterUsage()
+		defer leave()
 		meter := &relayEgress{s: p.S}
 		ctx := context.WithValue(r.Context(), relayEgressKey{}, meter)
 		next.ServeHTTP(&egressWriter{ResponseWriter: w, meter: meter}, r.WithContext(ctx))
