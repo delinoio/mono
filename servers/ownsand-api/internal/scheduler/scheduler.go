@@ -38,13 +38,16 @@ type Snapshot struct {
 	// DeviceID holds the original local copy; empty when none does.
 	DeviceID string
 	// CopyDeviceIDs hold imported copies.
-	CopyDeviceIDs  []string
-	Exported       bool
-	HostOS         ownsandv1.HostOs
-	Arch           ownsandv1.Arch
-	GuestOS        ownsandv1.GuestOs
-	VCPUCount      int32
-	MemoryMiB      int64
+	CopyDeviceIDs []string
+	Exported      bool
+	HostOS        ownsandv1.HostOs
+	Arch          ownsandv1.Arch
+	GuestOS       ownsandv1.GuestOs
+	VCPUCount     int32
+	MemoryMiB     int64
+	// DiskGiB is the persisted disk size of the snapshot. A memory-state
+	// restore needs a request with exactly this disk size.
+	DiskGiB        int64
 	NetworkMode    ownsandv1.NetworkMode
 	HasMemoryState bool
 	// MacOSHardwareModel is the opaque hardware model of a macOS snapshot.
@@ -208,7 +211,11 @@ func Evaluate(req Request, d Device, now time.Time) (Outcome, string) {
 	if allocatedVCPU(alloc)+int64(req.VCPUCount) > validate.EffectiveVCPULimit(limits) {
 		return Transient, "running sandboxes hold the vCPU capacity"
 	}
-	if alloc.GetMemoryMib()+memory > limits.GetMemoryMib() {
+	// The Permanent memory check above guarantees memory <= the limit, so
+	// the subtraction cannot overflow. Do not add the allocation and the
+	// request: an agent-reported allocation near MaxInt64 would wrap negative
+	// and pass the check.
+	if alloc.GetMemoryMib() > limits.GetMemoryMib()-memory {
 		return Transient, "running sandboxes hold the memory capacity"
 	}
 	if alloc.GetDiskGib()+req.DiskGiB > limits.GetDiskGib() {
@@ -274,7 +281,7 @@ func holds(s *Snapshot, deviceID string) bool {
 func memoryRestore(req Request, deviceID string) bool {
 	s := req.Snapshot
 	return s != nil && s.HasMemoryState && s.DeviceID == deviceID &&
-		req.VCPUCount == s.VCPUCount && req.MemoryMiB == s.MemoryMiB && req.NetworkMode == s.NetworkMode
+		req.VCPUCount == s.VCPUCount && req.MemoryMiB == s.MemoryMiB && req.DiskGiB == s.DiskGiB && req.NetworkMode == s.NetworkMode
 }
 
 // allocatedVCPU returns the exact allocated vCPUs. The 64-bit total is

@@ -322,7 +322,7 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 				ID: sn.GetSnapshotId(), DeviceID: sn.GetDeviceId(), CopyDeviceIDs: src.copies,
 				Exported: sn.GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED,
 				HostOS:   sn.GetHostOs(), Arch: sn.GetArch(), GuestOS: sn.GetGuestOs(), VCPUCount: sn.GetResources().GetVcpuCount(),
-				MemoryMiB: sn.GetResources().GetMemoryMib(), NetworkMode: sn.GetNetworkMode(), HasMemoryState: sn.GetHasMemoryState(),
+				MemoryMiB: sn.GetResources().GetMemoryMib(), DiskGiB: sn.GetResources().GetDiskGib(), NetworkMode: sn.GetNetworkMode(), HasMemoryState: sn.GetHasMemoryState(),
 				MacOSHardwareModel: sn.GetMacosHardwareModel(),
 			}
 			if sn.GetGuestOs() == ownsandv1.GuestOs_GUEST_OS_MACOS {

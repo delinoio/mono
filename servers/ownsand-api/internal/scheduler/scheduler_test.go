@@ -177,7 +177,7 @@ func TestMacOSRules(t *testing.T) {
 
 func TestSnapshotPlacement(t *testing.T) {
 	snap := &Snapshot{ID: "s", DeviceID: "d2", HostOS: ownsandv1.HostOs_HOST_OS_LINUX, Arch: ownsandv1.Arch_ARCH_AMD64, GuestOS: ownsandv1.GuestOs_GUEST_OS_LINUX,
-		VCPUCount: 2, MemoryMiB: 1024, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, HasMemoryState: true}
+		VCPUCount: 2, MemoryMiB: 1024, DiskGiB: 10, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, HasMemoryState: true}
 	req := linuxRequest()
 	req.BaseImage = 0
 	req.Snapshot = snap
@@ -206,6 +206,72 @@ func TestSnapshotPlacement(t *testing.T) {
 	req.DeviceID = "d0"
 	if _, err := Place(req, []Device{arm}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
 		t.Fatalf("arch mismatch: %v", err)
+	}
+}
+
+// A memory-state restore needs the snapshot's disk size: a larger disk boots
+// cold, so it must not take the source-device priority.
+func TestSnapshotPlacementLargerDisk(t *testing.T) {
+	snap := &Snapshot{ID: "s", DeviceID: "d2", HostOS: ownsandv1.HostOs_HOST_OS_LINUX, Arch: ownsandv1.Arch_ARCH_AMD64, GuestOS: ownsandv1.GuestOs_GUEST_OS_LINUX,
+		VCPUCount: 2, MemoryMiB: 1024, DiskGiB: 10, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, HasMemoryState: true}
+	req := linuxRequest()
+	req.BaseImage = 0
+	req.Snapshot = snap
+	d1, d2 := linuxDevice("d1"), linuxDevice("d2")
+	d2.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: 2}
+	devices := []Device{d1, d2}
+
+	// Equal disk: the heavier source device keeps the memory restore.
+	snap.Exported = true
+	dec, err := Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d2" || !dec.MemoryRestore || dec.NeedsImport {
+		t.Fatalf("equal disk: %+v %v", dec, err)
+	}
+
+	// Larger disk, exported: the least loaded device runs it, with an import
+	// and without a memory restore.
+	req.DiskGiB = 20
+	dec, err = Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d1" || dec.MemoryRestore || !dec.NeedsImport {
+		t.Fatalf("larger disk, exported: %+v %v", dec, err)
+	}
+	// With a tie in share, the lowest ID wins and the source holds the copy.
+	d2.Allocation = nil
+	dec, err = Place(req, []Device{d1, d2}, now)
+	if err != nil || dec.DeviceID != "d1" || dec.MemoryRestore || !dec.NeedsImport {
+		t.Fatalf("larger disk, tie: %+v %v", dec, err)
+	}
+	d2.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: 2}
+	// A device that holds an imported copy needs no import.
+	snap.CopyDeviceIDs = []string{"d1"}
+	dec, err = Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d1" || dec.MemoryRestore || dec.NeedsImport {
+		t.Fatalf("larger disk, copy: %+v %v", dec, err)
+	}
+	snap.CopyDeviceIDs = nil
+
+	// Larger disk, not exported: only the source device, cold.
+	snap.Exported = false
+	dec, err = Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d2" || dec.MemoryRestore || dec.NeedsImport {
+		t.Fatalf("larger disk, not exported: %+v %v", dec, err)
+	}
+
+	// Explicit device selection keeps its rules.
+	snap.Exported = true
+	req.DeviceID = "d2"
+	dec, err = Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d2" || dec.MemoryRestore || dec.NeedsImport {
+		t.Fatalf("larger disk, explicit source device: %+v %v", dec, err)
+	}
+	req.DeviceID = "d1"
+	dec, err = Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d1" || dec.MemoryRestore || !dec.NeedsImport {
+		t.Fatalf("larger disk, explicit other device: %+v %v", dec, err)
+	}
+	snap.Exported = false
+	if _, err := Place(req, devices, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("larger disk, explicit device without a copy: %v", err)
 	}
 }
 
@@ -335,6 +401,67 @@ func TestHyperVMemoryRounding(t *testing.T) {
 	even.MemoryMiB = 4096
 	if _, err := Place(even, []Device{windowsDevice("w")}, now); err != nil {
 		t.Fatalf("even request at the limit: %v", err)
+	}
+}
+
+// TestMemoryCapacityCheck checks the transient memory rule over the whole
+// range of the agent-reported allocation, including values where the sum of
+// the allocation and the request does not fit in a signed 64-bit integer.
+func TestMemoryCapacityCheck(t *testing.T) {
+	const limit = 4096
+	for _, tc := range []struct {
+		name      string
+		allocated int64
+		request   int64
+		limit     int64
+		want      Outcome
+	}{
+		{"empty device", 0, 1024, limit, Eligible},
+		{"exact fit", limit - 1024, 1024, limit, Eligible},
+		{"full device and a zero-sized remainder", limit, 0, limit, Eligible},
+		{"one MiB over", limit - 1023, 1024, limit, Transient},
+		{"allocation above a lowered limit", limit + 1, 1024, limit, Transient},
+		{"allocation of the largest int64", math.MaxInt64, 1024, limit, Transient},
+		{"allocation one below the largest int64", math.MaxInt64 - 1, 2, limit, Transient},
+		{"largest allocation with the largest limit and request", math.MaxInt64, 1, math.MaxInt64, Transient},
+		{"exact fit at the largest limit", math.MaxInt64 - 1024, 1024, math.MaxInt64, Eligible},
+		{"one over at the largest limit", math.MaxInt64 - 1023, 1024, math.MaxInt64, Transient},
+		{"request above the total", 0, limit + 1, limit, Permanent},
+		{"request above the total with a huge allocation", math.MaxInt64, limit + 1, limit, Permanent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := linuxRequest()
+			req.MemoryMiB = tc.request
+			d := linuxDevice("d")
+			d.Limits.MemoryMib = tc.limit
+			d.Allocation = &ownsandv1.DeviceAllocation{MemoryMib: tc.allocated}
+			got, reason := Evaluate(req, d, now)
+			if got != tc.want {
+				t.Fatalf("Evaluate = %v (%q), want %v", got, reason, tc.want)
+			}
+			switch tc.want {
+			case Transient:
+				if reason != "running sandboxes hold the memory capacity" {
+					t.Fatalf("reason = %q", reason)
+				}
+			case Permanent:
+				if reason != "the request needs more memory than the device limit" {
+					t.Fatalf("reason = %q", reason)
+				}
+			}
+		})
+	}
+
+	// Place maps the outcomes to the API codes.
+	req := linuxRequest()
+	d := linuxDevice("d")
+	d.Allocation = &ownsandv1.DeviceAllocation{MemoryMib: math.MaxInt64}
+	if _, err := Place(req, []Device{d}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("huge allocation: %v", err)
+	}
+	req.MemoryMiB = d.Limits.MemoryMib + 1
+	if _, err := Place(req, []Device{d}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("request above the total: %v", err)
 	}
 }
 
