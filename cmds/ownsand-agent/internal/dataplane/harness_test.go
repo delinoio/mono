@@ -31,17 +31,26 @@ import (
 var guestBinary string
 
 func TestMain(m *testing.M) {
+	os.Exit(run(m))
+}
+
+// run builds the guest helper into a scratch directory, runs the tests and
+// returns the process exit code. The scratch directory is removed on every
+// path, including a failed build, because the deferred cleanup runs before
+// TestMain calls os.Exit.
+func run(m *testing.M) int {
 	dir, err := os.MkdirTemp("", "ownsand-dataplane-test-")
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "create guest helper scratch directory: %v\n", err)
+		return 1
 	}
+	defer os.RemoveAll(dir)
 	guestBinary = filepath.Join(dir, "ownsand-guest")
 	if out, err := exec.Command("go", "build", "-o", guestBinary, "github.com/delinoio/mono/cmds/ownsand-guest").CombinedOutput(); err != nil {
-		panic(fmt.Sprintf("build guest helper: %v\n%s", err, out))
+		fmt.Fprintf(os.Stderr, "build guest helper: %v\n%s", err, out)
+		return 1
 	}
-	code := m.Run()
-	os.RemoveAll(dir)
-	os.Exit(code)
+	return m.Run()
 }
 
 const orgID = "0192f4b6-7c3a-7def-8abc-0123456789ab"
