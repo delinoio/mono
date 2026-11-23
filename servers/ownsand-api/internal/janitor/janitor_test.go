@@ -49,20 +49,54 @@ func TestRetentionJobs(t *testing.T) {
 		}
 		return n
 	}
+	// Counts alone cannot tell which row survived, so each job also checks
+	// that the expired row is gone and its fresh counterpart is present.
+	exists := func(sql string, args ...any) bool {
+		t.Helper()
+		var ok bool
+		if err := d.Pool.QueryRow(ctx, "SELECT EXISTS ("+sql+")", args...).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
 	if n := count("SELECT count(*) FROM consumed_nonces"); n != 1 {
 		t.Fatalf("nonces = %d", n)
+	}
+	if exists("SELECT 1 FROM consumed_nonces WHERE nonce_sha256 = '\\x01'") {
+		t.Fatal("expired nonce \\x01 survived")
+	}
+	if !exists("SELECT 1 FROM consumed_nonces WHERE nonce_sha256 = '\\x02'") {
+		t.Fatal("fresh nonce \\x02 was deleted")
 	}
 	if n := count("SELECT count(*) FROM audit_events"); n != 1 {
 		t.Fatalf("audit events = %d", n)
 	}
+	if exists("SELECT 1 FROM audit_events WHERE audit_event_id = '01900000-0000-7000-8000-000000000001'") {
+		t.Fatal("expired audit event ...0001 survived")
+	}
+	if !exists("SELECT 1 FROM audit_events WHERE audit_event_id = '01900000-0000-7000-8000-000000000002'") {
+		t.Fatal("fresh audit event ...0002 was deleted")
+	}
 	if n := count("SELECT count(*) FROM devices"); n != 1 {
 		t.Fatalf("tombstones = %d", n)
+	}
+	if exists("SELECT 1 FROM devices WHERE device_id = '01900000-0000-7000-8000-000000000003'") {
+		t.Fatal("expired device tombstone ...0003 survived")
+	}
+	if !exists("SELECT 1 FROM devices WHERE device_id = '01900000-0000-7000-8000-000000000004'") {
+		t.Fatal("fresh device tombstone ...0004 was deleted")
 	}
 	if n := count("SELECT count(*) FROM usage_outbox WHERE meter IN (2, 3)"); n != 2 || count("SELECT count(*) FROM usage_outbox") != 2 {
 		t.Fatalf("usage outbox = %d", n)
 	}
 	if n := count("SELECT count(*) FROM usage_storage_samples"); n != 1 {
 		t.Fatalf("storage samples = %d", n)
+	}
+	if exists("SELECT 1 FROM usage_storage_samples WHERE window_start = $1", now.Add(-25*time.Hour)) {
+		t.Fatal("expired storage sample (now-25h) survived")
+	}
+	if !exists("SELECT 1 FROM usage_storage_samples WHERE window_start = $1", now.Add(-23*time.Hour)) {
+		t.Fatal("fresh storage sample (now-23h) was deleted")
 	}
 }
 
