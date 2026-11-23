@@ -485,6 +485,108 @@ func TestWriteFileObservesCancellationBeforeReadingTheSource(t *testing.T) {
 	}
 }
 
+// scriptedReader serves one scripted read per call. A read after the script
+// returns the sentinel error errScriptedReaderExhausted so that an unexpected
+// extra source call is visible.
+type scriptedReader struct {
+	steps []func(p []byte) (int, error)
+	reads int
+}
+
+var errScriptedReaderExhausted = errors.New("scripted reader: unexpected extra read")
+
+func (s *scriptedReader) Read(p []byte) (int, error) {
+	i := s.reads
+	s.reads++
+	if i >= len(s.steps) {
+		return 0, errScriptedReaderExhausted
+	}
+	return s.steps[i](p)
+}
+
+// fullChunk fills p with the byte b and reports a read that fills p.
+func fullChunk(b byte) func(p []byte) (int, error) {
+	return func(p []byte) (int, error) {
+		for i := range p {
+			p[i] = b
+		}
+		return len(p), nil
+	}
+}
+
+func TestWriteFileObservesCancellationInsideAChunkFill(t *testing.T) {
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		t.Run(tr.String(), func(t *testing.T) {
+			t.Run("partial first read", func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, tr))
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				src := &scriptedReader{steps: []func([]byte) (int, error){
+					func(p []byte) (int, error) { p[0] = 'x'; cancel(); return 1, nil },
+				}}
+				n, err := s.WriteFile(ctx, "/out", src, WriteOptions{})
+				if !errors.Is(err, context.Canceled) || n != 0 {
+					t.Fatalf("got %d, %v, want 0 and context.Canceled", n, err)
+				}
+				if src.reads != 1 {
+					t.Fatalf("source read %d times, want 1", src.reads)
+				}
+				if got := len(cp.agent.writeRequests()); got != 0 {
+					t.Fatalf("%d write requests reached the agent", got)
+				}
+			})
+			t.Run("partial read-ahead after an acknowledged chunk", func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, tr))
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				src := &scriptedReader{steps: []func([]byte) (int, error){
+					fullChunk('a'),
+					fullChunk('b'),
+					func(p []byte) (int, error) { p[0] = 'c'; cancel(); return 1, nil },
+				}}
+				n, err := s.WriteFile(ctx, "/out", src, WriteOptions{})
+				if !errors.Is(err, context.Canceled) || n != int64(datapath.MaxFileChunkSize) {
+					t.Fatalf("got %d, %v, want %d and context.Canceled", n, err, datapath.MaxFileChunkSize)
+				}
+				if src.reads != 3 {
+					t.Fatalf("source read %d times, want 3", src.reads)
+				}
+				reqs := cp.agent.writeRequests()
+				if len(reqs) != 1 || reqs[0].GetFinish() != nil {
+					t.Fatalf("got %d write requests, want one nonfinal chunk", len(reqs))
+				}
+			})
+			t.Run("short reads without cancellation upload everything", func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, tr))
+				want := randomBytes(t, 3*datapath.MaxFileChunkSize/2)
+				// iotest.OneByteReader-style behavior at a larger step: every
+				// Read returns at most 4096 bytes.
+				src := &shortReader{r: bytes.NewReader(want), max: 4096}
+				n, err := s.WriteFile(context.Background(), "/out", src, WriteOptions{})
+				if err != nil || n != int64(len(want)) {
+					t.Fatalf("got %d, %v, want %d and no error", n, err, len(want))
+				}
+			})
+		})
+	}
+}
+
+// shortReader returns at most max bytes per Read.
+type shortReader struct {
+	r   io.Reader
+	max int
+}
+
+func (s *shortReader) Read(p []byte) (int, error) {
+	if len(p) > s.max {
+		p = p[:s.max]
+	}
+	return s.r.Read(p)
+}
+
 func TestWriteFileRejectsOutOfRangeModeBeforeUpload(t *testing.T) {
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
