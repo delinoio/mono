@@ -2123,6 +2123,7 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
 // --- droplet-deploy.sh -----------------------------------------------------
 
 const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
+const dropletDeploymentUuid = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
 const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(64)}`;
 
 // Runs droplet-deploy.sh the way deploy-targets.sh does (`bash -s` with the
@@ -2174,6 +2175,9 @@ function setupDroplet(
   mkdirSync(join(deployRoot, "env"), { recursive: true });
   mkdirSync(join(deployRoot, "caddy", "sites"), { recursive: true });
   writeFileSync(join(dir, "calls.log"), "");
+  // The deployment identifier that droplet-deploy.sh reads (a fixed UUID, and
+  // a file that exists on every platform).
+  writeFileSync(join(dir, "id-source"), `${dropletDeploymentUuid}\n`);
   // `null` leaves the env file out.
   if (envFile !== null) {
     writeFileSync(join(deployRoot, "env", `${args[0]}.env`), envFile);
@@ -2201,6 +2205,8 @@ fi
 case "$1" in
   ps)
     [[ "\${STUB_PS_EXIT:-0}" == 0 ]] || exit "\$STUB_PS_EXIT"
+    # The name check before the start: no container has the new name.
+    [[ "$*" != *"--filter name="* ]] || exit 0
     printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
   inspect)
     case "$3" in
@@ -2249,6 +2255,7 @@ esac`,
     PATH: `${bin}${delimiter}${baseEnv.PATH}`,
     STUB_DIR: dir,
     DROPLET_ROOT: deployRoot,
+    DROPLET_ID_SOURCE: join(dir, "id-source"),
     DROPLET_HEALTH_TIMEOUT: "3",
     ...env,
   });
@@ -2286,6 +2293,7 @@ test(
     assert.deepEqual(commands(result.calls), [
       "docker pull",
       "docker ps",
+      "docker ps",
       "docker run",
       "docker inspect",
       "docker inspect",
@@ -2301,7 +2309,7 @@ test(
     // The replacement joins a unique alias, never the alias of the running
     // container, so the live route cannot reach it before the health check.
     const alias = run.match(/--network-alias (\S+)/)[1];
-    assert.match(alias, /^api-\d{14}-e{12}$/);
+    assert.equal(alias, `api-${dropletDeploymentUuid.replaceAll("-", "")}`);
     assert.ok(!/--network-alias api /.test(run), run);
     for (const part of [
       `--network delino --network-alias ${alias}`,
@@ -2371,9 +2379,11 @@ test(
       const run = result.calls.find((call) => call.startsWith("docker run"));
       const alias = run.match(/--network-alias (\S+)/)[1];
       assert.match(alias, /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/, service);
-      assert.match(alias, /-\d{14}-e{12}$/, service);
+      assert.ok(
+        alias.endsWith(`-${dropletDeploymentUuid.replaceAll("-", "")}`),
+      );
       assert.ok(!alias.includes("--"), alias);
-      assert.ok(alias.startsWith(service.slice(0, 35).replace(/-+$/, "")));
+      assert.ok(alias.startsWith(service.slice(0, 30).replace(/-+$/, "")));
       assert.ok(
         result
           .read(`caddy/sites/${service}.caddy`)
@@ -2454,6 +2464,7 @@ test(
       "docker pull",
       "docker ps",
       "docker ps",
+      "docker ps",
       "docker create",
       "docker stop",
       "docker start",
@@ -2469,7 +2480,8 @@ test(
     ]);
     const running = result.calls.filter((call) => call.startsWith("docker ps"));
     assert.ok(running[0].includes("--all"), running[0]);
-    assert.ok(!running[1].includes("--all"), running[1]);
+    assert.ok(running[1].includes("--filter name=^/api-"), running[1]);
+    assert.ok(!running[2].includes("--all"), running[2]);
     const create = result.calls.find((call) =>
       call.startsWith("docker create"),
     );
@@ -3074,14 +3086,21 @@ test(
       assert.equal(result.status, 1, `${label}: ${result.stderr}`);
       assert.match(
         result.stderr,
-        /::error::api-\d{14}-e{12} did not start; the previous container keeps serving\./,
+        /::error::api-\d{14}-e{12}-[0-9a-f]{32} did not start; the previous container keeps serving\./,
         label,
       );
       // Docker's own diagnostic stays visible.
       assert.match(result.stderr, /OCI runtime create failed/, label);
       assert.deepEqual(
         commands(result.calls),
-        ["docker pull", "docker ps", "docker run", "docker logs", "docker rm"],
+        [
+          "docker pull",
+          "docker ps",
+          "docker ps",
+          "docker run",
+          "docker logs",
+          "docker rm",
+        ],
         label,
       );
       assert.match(result.calls.at(-1), /^docker rm --force api-/, label);
@@ -3110,10 +3129,11 @@ test(
     assert.equal(result.status, 1, result.stderr);
     assert.match(
       result.stderr,
-      /::error::api-\d{14}-e{12} was not created; the previous containers keep serving\./,
+      /::error::api-\d{14}-e{12}-[0-9a-f]{32} was not created; the previous containers keep serving\./,
     );
     assert.deepEqual(commands(result.calls), [
       "docker pull",
+      "docker ps",
       "docker ps",
       "docker ps",
       "docker create",
