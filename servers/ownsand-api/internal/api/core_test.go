@@ -863,22 +863,43 @@ func TestAuditAndLogRedaction(t *testing.T) {
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
 	cred := env.SessionCredential(dev)
-	tok, _ := org.OwnerClient.Device.CreateEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(time.Hour)}))
-	inv, _ := org.OwnerClient.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_MEMBER}))
+	tok, err := org.OwnerClient.Device.CreateEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(time.Hour)}))
+	if err != nil {
+		t.Fatalf("create enrollment token: %v", err)
+	}
+	inv, err := org.OwnerClient.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_MEMBER}))
+	if err != nil {
+		t.Fatalf("create invitation: %v", err)
+	}
+
+	// The same five synthetic credentials are checked against the logs and
+	// against every column of each audit row. Failure messages name only the
+	// credential category, never the value or the row.
+	secrets := []struct{ name, value string }{
+		{"api key", org.APIKey},
+		{"device credential", cred},
+		{"enrollment token", tok.Msg.GetEnrollmentToken()},
+		{"invitation", inv.Msg.GetInvitationSecret()},
+		{"user token", testenv.UserToken(org.Owner)},
+	}
+	for _, s := range secrets {
+		if s.value == "" {
+			t.Fatalf("%s is empty", s.name)
+		}
+	}
 
 	logs := env.Logs.String()
-	for name, secret := range map[string]string{
-		"api key": org.APIKey, "device credential": cred, "enrollment token": tok.Msg.GetEnrollmentToken(),
-		"invitation": inv.Msg.GetInvitationSecret(), "user token": testenv.UserToken(org.Owner),
-	} {
-		if secret == "" || strings.Contains(logs, secret) {
-			t.Fatalf("%s appears in the logs or is empty", name)
+	for _, s := range secrets {
+		if strings.Contains(logs, s.value) {
+			t.Fatalf("%s appears in the logs", s.name)
 		}
 	}
 	if !strings.Contains(logs, `"procedure":"/delino.ownsand.v1.OrganizationService/CreateOrganization"`) {
 		t.Fatalf("missing RPC log record")
 	}
-	rows, err := env.DB.Pool.Query(ctx, "SELECT action FROM audit_events WHERE organization_id = $1 ORDER BY create_time, audit_event_id", org.ID)
+	// to_jsonb serializes every column of the row, so a credential stored in
+	// any text column (actor_id, target_id, request_id, ...) is detected.
+	rows, err := env.DB.Pool.Query(ctx, "SELECT action, to_jsonb(audit_events)::text FROM audit_events WHERE organization_id = $1 ORDER BY create_time, audit_event_id", org.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -886,8 +907,19 @@ func TestAuditAndLogRedaction(t *testing.T) {
 	seen := map[ownsandv1.AuditAction]int{}
 	for rows.Next() {
 		var a int16
-		_ = rows.Scan(&a)
+		var row string
+		if err := rows.Scan(&a, &row); err != nil {
+			t.Fatalf("scan audit row: %v", err)
+		}
+		for _, s := range secrets {
+			if strings.Contains(row, s.value) {
+				t.Fatalf("%s appears in an audit row with action %v", s.name, ownsandv1.AuditAction(a))
+			}
+		}
 		seen[ownsandv1.AuditAction(a)]++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate audit rows: %v", err)
 	}
 	for _, want := range []ownsandv1.AuditAction{
 		ownsandv1.AuditAction_AUDIT_ACTION_ORGANIZATION_CREATED,
