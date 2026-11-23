@@ -117,7 +117,14 @@ function CreateBillingAccountDialog({
         }
         setError(undefined);
         const res = await create.mutateAsync({ name: checked.value });
-        await invalidateServices(queryClient, BillingAccountService);
+        // Refresh the cached lists in the background. The dialog must not wait
+        // for a read of the list: a stalled refetch would keep it open with a
+        // disabled button although the account exists. The refetch reports its
+        // failure through the query state, so the catch only keeps an
+        // unexpected rejection from becoming an unhandled one.
+        void invalidateServices(queryClient, BillingAccountService).catch(
+          () => undefined,
+        );
         // Close and navigate only when this opening is still current.
         return formSubmitted(() => {
           reset(false);
