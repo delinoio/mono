@@ -221,7 +221,10 @@ func (b *gatedBody) Close() error { return nil }
 // replacement's receive timeout and echo probe keep their own bytes. A read
 // of the active response, also a partial frame, still refreshes its own clock.
 func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
-	retired, active := &rconn{}, &rconn{}
+	// A fixed monotonic clock makes the refresh visible and deterministic.
+	const readAt = 2 * time.Hour
+	clock := func() time.Duration { return readAt }
+	retired, active := &rconn{clock: clock}, &rconn{clock: clock}
 	r := &relay{conn: retired}
 	bodies := map[*rconn]*gatedBody{retired: newGatedBody("late"), active: newGatedBody("par")}
 	hc := &http.Client{Transport: countingTransport{base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -259,7 +262,7 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 	r.mu.Unlock()
 	activeBody := open(active)
 
-	old := time.Now().Add(-time.Hour).UnixNano()
+	old := int64(time.Hour)
 	retired.lastRecv.Store(old)
 	active.lastRecv.Store(old)
 	close(bodies[retired].release)
@@ -721,10 +724,9 @@ func newManualConn(t *testing.T, timing Timing, queue int) (*relay, *rconn) {
 // keepalive once it is due.
 func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
 	r, c := newManualConn(t, Timing{KeepaliveInterval: time.Second, ReceiveTimeout: time.Minute}, 2)
-	now := time.Now()
 	mono := time.Hour
 	c.clock = func() time.Duration { return mono }
-	c.lastRecv.Store(now.UnixNano())
+	c.markRecv()
 	c.lastSend.Store(0)
 	payload := &ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_SUPPORTED_FRAME_KINDS}
 	for i := 0; i < cap(c.out); i++ {
@@ -733,7 +735,7 @@ func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
 		}
 	}
 	done := make(chan bool, 1)
-	go func() { done <- r.watchdogTick(c, now) }()
+	go func() { done <- r.watchdogTick(c) }()
 	select {
 	case timedOut := <-done:
 		if timedOut {
@@ -748,7 +750,7 @@ func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
 	// A free slot and a due keepalive: the keepalive is sent, after the
 	// queued payload frames.
 	<-c.out
-	if r.watchdogTick(c, now) {
+	if r.watchdogTick(c) {
 		t.Fatal("watchdog timed out a connection with recent inbound bytes")
 	}
 	<-c.out
@@ -757,7 +759,7 @@ func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
 	}
 	// A keepalive that is not due is not sent.
 	c.markSent()
-	r.watchdogTick(c, now)
+	r.watchdogTick(c)
 	if len(c.out) != 0 {
 		t.Fatalf("keepalive sent before it was due: %d queued", len(c.out))
 	}
@@ -766,8 +768,8 @@ func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
 		c.enqueue(payload)
 	}
 	c.lastSend.Store(0)
-	c.lastRecv.Store(now.Add(-2 * time.Minute).UnixNano())
-	if !r.watchdogTick(c, now) {
+	c.lastRecv.Store(int64(mono - 2*time.Minute))
+	if !r.watchdogTick(c) {
 		t.Fatal("watchdog did not report the receive timeout with a full queue")
 	}
 }
@@ -779,18 +781,17 @@ func TestRelayWatchdogKeepaliveUsesMonotonicClock(t *testing.T) {
 	r, c := newManualConn(t, Timing{KeepaliveInterval: 30 * time.Second, ReceiveTimeout: time.Hour}, 2)
 	var mono time.Duration
 	c.clock = func() time.Duration { return mono }
-	wall := time.Now()
-	c.lastRecv.Store(wall.UnixNano())
+	c.markRecv()
 	c.markSent()
 
-	// 5 s of monotonic time with the wall clock 65 s ahead: not due.
+	// 5 s of monotonic time: not due.
 	mono = 5 * time.Second
-	if r.watchdogTick(c, wall.Add(65*time.Second)) || len(c.out) != 0 {
+	if r.watchdogTick(c) || len(c.out) != 0 {
 		t.Fatalf("keepalive sent after 5 s of monotonic time: %d queued", len(c.out))
 	}
-	// 30 s of monotonic time with the wall clock moved back: due exactly once.
+	// 30 s of monotonic time: due exactly once.
 	mono = 30 * time.Second
-	if r.watchdogTick(c, wall.Add(-time.Hour)) {
+	if r.watchdogTick(c) {
 		t.Fatal("watchdog timed out a connection with recent inbound bytes")
 	}
 	if len(c.out) != 1 {
@@ -802,12 +803,12 @@ func TestRelayWatchdogKeepaliveUsesMonotonicClock(t *testing.T) {
 	// A successful send resets the interval.
 	c.markSent()
 	mono = 59 * time.Second
-	r.watchdogTick(c, wall)
+	r.watchdogTick(c)
 	if len(c.out) != 0 {
 		t.Fatalf("keepalive sent before the interval after a send: %d queued", len(c.out))
 	}
 	mono = 60 * time.Second
-	r.watchdogTick(c, wall)
+	r.watchdogTick(c)
 	if len(c.out) != 1 {
 		t.Fatalf("%d keepalives queued at the interval after a send, want 1", len(c.out))
 	}
@@ -815,7 +816,7 @@ func TestRelayWatchdogKeepaliveUsesMonotonicClock(t *testing.T) {
 	c.enqueue(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_SUPPORTED_FRAME_KINDS})
 	mono = 120 * time.Second
 	done := make(chan struct{})
-	go func() { r.watchdogTick(c, wall); close(done) }()
+	go func() { r.watchdogTick(c); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -823,6 +824,94 @@ func TestRelayWatchdogKeepaliveUsesMonotonicClock(t *testing.T) {
 	}
 	if len(c.out) != cap(c.out) {
 		t.Fatalf("full queue changed: %d queued", len(c.out))
+	}
+}
+
+// TestRelayReceiveTimeoutUsesMonotonicClock checks that the receive timeout
+// follows the elapsed time on the connection's monotonic clock. The injected
+// clock is the only time source the watchdog reads, so a wall-clock step in
+// either direction cannot move the decision. A received byte, also one of an
+// incomplete frame (noteRecv), restarts the interval.
+func TestRelayReceiveTimeoutUsesMonotonicClock(t *testing.T) {
+	r, c := newManualConn(t, Timing{KeepaliveInterval: time.Hour, ReceiveTimeout: time.Minute}, 2)
+	mono := time.Hour
+	c.clock = func() time.Duration { return mono }
+	c.markRecv()
+
+	mono += time.Minute - time.Nanosecond
+	if r.watchdogTick(c) {
+		t.Fatal("watchdog timed out the connection before the receive timeout")
+	}
+	mono += time.Nanosecond
+	if !r.watchdogTick(c) {
+		t.Fatal("watchdog did not time out the connection at the receive timeout")
+	}
+	// A partial frame arrives: noteRecv is what the counting body calls.
+	c.noteRecv()
+	if r.watchdogTick(c) {
+		t.Fatal("received bytes did not restart the receive timeout")
+	}
+	mono += 30 * time.Second
+	if r.watchdogTick(c) {
+		t.Fatal("watchdog timed out the connection 30 s after the last byte")
+	}
+	mono += 30 * time.Second
+	if !r.watchdogTick(c) {
+		t.Fatal("watchdog did not time out the connection 60 s after the last byte")
+	}
+}
+
+// TestRelayProbeUsesMonotonicClock checks that the echo probe starts only
+// after ProbeIdle of monotonic time without a byte, and that a byte counts
+// as an answer exactly when it arrived at or after the probe on the same
+// clock. An unanswered probe cancels the connection after ProbeTimeout.
+func TestRelayProbeUsesMonotonicClock(t *testing.T) {
+	r, c := newManualConn(t, Timing{ProbeIdle: 30 * time.Second, ProbeTimeout: 10 * time.Millisecond}, 2)
+	mono := time.Hour
+	c.clock = func() time.Duration { return mono }
+	c.markRecv()
+
+	mono += 30*time.Second - time.Nanosecond
+	r.probe(c)
+	if len(c.out) != 0 {
+		t.Fatalf("probe sent an echo before ProbeIdle: %d queued", len(c.out))
+	}
+
+	mono += time.Nanosecond
+	r.probe(c)
+	select {
+	case f := <-c.out:
+		if f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE || !f.GetRelayKeepalive().GetEchoRequested() {
+			t.Fatalf("queued frame %v, want an echo request", f)
+		}
+	default:
+		t.Fatal("probe sent no echo after ProbeIdle")
+	}
+
+	// No byte arrives: the probe timeout cancels the connection.
+	select {
+	case <-c.ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("an unanswered echo probe did not cancel the connection")
+	}
+	if !c.probeFailed.Load() {
+		t.Fatal("the lost connection was not marked as a probe failure")
+	}
+
+	// The answer rule on the monotonic clock.
+	sent := mono
+	c.lastRecv.Store(int64(sent - time.Nanosecond))
+	if c.receivedSince(sent) {
+		t.Fatal("a byte before the probe counted as an answer")
+	}
+	c.lastRecv.Store(int64(sent))
+	if !c.receivedSince(sent) {
+		t.Fatal("a byte at the probe time did not count as an answer")
+	}
+	mono += time.Second
+	c.noteRecv()
+	if !c.receivedSince(sent) {
+		t.Fatal("a byte after the probe did not count as an answer")
 	}
 }
 
@@ -1358,7 +1447,7 @@ func TestRelayProbeWithFullQueueSkipsEchoAndKeepsTimeout(t *testing.T) {
 		f := newRevokeFixture(t, 2)
 		f.r.d.timing = timing.withDefaults()
 		f.r.d.logger = slog.New(slog.NewJSONHandler(f.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		f.c.lastRecv.Store(time.Now().Add(-time.Hour).UnixNano())
+		f.c.lastRecv.Store(int64(f.c.monoNow() - time.Hour))
 		f.fillQueue()
 
 		within(t, "probe", func() { f.r.probe(f.c) })
@@ -1370,7 +1459,7 @@ func TestRelayProbeWithFullQueueSkipsEchoAndKeepsTimeout(t *testing.T) {
 			t.Fatalf("skipped echo logged %d times, want once:\n%s", n, f.logs.String())
 		}
 		if answered {
-			f.c.lastRecv.Store(time.Now().UnixNano())
+			f.c.markRecv()
 		}
 		time.Sleep(500 * time.Millisecond)
 		if answered {

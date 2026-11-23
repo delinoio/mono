@@ -119,10 +119,12 @@ type rconn struct {
 	cancel context.CancelFunc
 	// flushDeadline bounds closeAfterFlush; zero uses Timing's default.
 	flushDeadline time.Duration
-	lastRecv      atomic.Int64
-	// lastSend is the monotonic reading (see monotonicNow) of the last
-	// successful send, so a wall-clock step never changes when the
-	// keepalive is due. lastRecv still holds wall-clock Unix nanoseconds.
+	// lastRecv is the monotonic reading (see monotonicNow) of the last byte
+	// received, so a wall-clock step never changes when the receive timeout
+	// or the echo probe is due.
+	lastRecv atomic.Int64
+	// lastSend is the monotonic reading of the last successful send, so a
+	// wall-clock step never changes when the keepalive is due.
 	lastSend atomic.Int64
 	// clock replaces monotonicNow for this connection in tests; nil uses
 	// monotonicNow.
@@ -272,7 +274,7 @@ func (t countingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 }
 
 // noteRecv records that bytes of this connection's response arrived.
-func (c *rconn) noteRecv() { c.lastRecv.Store(time.Now().UnixNano()) }
+func (c *rconn) noteRecv() { c.markRecv() }
 
 func newRelay(d *DataPlane) *relay {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -373,11 +375,10 @@ func (r *relay) grant(ch agent.Channel, pg *ownsandv1.RelayGrant) *ownsandv1.Rel
 // a full queue (a blocked writer) skips the echo and the timeout still runs,
 // because a connection that moves no byte in that time is lost anyway.
 func (r *relay) probe(c *rconn) {
-	last := time.Unix(0, c.lastRecv.Load())
-	if time.Since(last) < r.d.timing.ProbeIdle {
+	if c.sinceRecv() < r.d.timing.ProbeIdle {
 		return
 	}
-	sent := time.Now()
+	sent := c.monoNow()
 	if !c.tryEnqueue(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE, Payload: &ownsandv1.DataFrame_RelayKeepalive{RelayKeepalive: &ownsandv1.RelayKeepalive{EchoRequested: true}}}) {
 		r.d.logger.Debug("relay echo probe skipped because the outbound queue is full", "generation", c.gen)
 	}
@@ -385,7 +386,7 @@ func (r *relay) probe(c *rconn) {
 		select {
 		case <-c.ctx.Done():
 		case <-time.After(r.d.timing.ProbeTimeout):
-			if time.Unix(0, c.lastRecv.Load()).Before(sent) {
+			if !c.receivedSince(sent) {
 				r.d.logger.Warn("relay connection did not answer the echo probe; reconnecting")
 				c.probeFailed.Store(true)
 				c.cancel()
@@ -529,7 +530,7 @@ func (r *relay) connectOnce(ch agent.Channel, openedAt *time.Time) (bool, error)
 	defer cancel()
 	c := &rconn{gen: ch.Generation(), out: make(chan *ownsandv1.DataFrame, 256), ctx: ctx, cancel: cancel, flushDeadline: r.d.timing.FlushDeadline,
 		streams: map[uint64]*rstream{}, kinds: map[ownsandv1.DataFrameKind]bool{}}
-	c.lastRecv.Store(time.Now().UnixNano())
+	c.markRecv()
 	c.markSent()
 	// The channel can change while the credential is fetched. A
 	// connection of a replaced or closed channel would serve no grant, and
@@ -601,7 +602,7 @@ func (r *relay) connectOnce(ch agent.Channel, openedAt *time.Time) (bool, error)
 				recvErr <- err
 				return
 			}
-			c.lastRecv.Store(time.Now().UnixNano())
+			c.markRecv()
 			if f := resp.GetFrame(); f != nil {
 				r.onFrame(c, f)
 			}
@@ -622,7 +623,7 @@ func (r *relay) connectOnce(ch agent.Channel, openedAt *time.Time) (bool, error)
 			return c.probeFailed.Load() && r.ctx.Err() == nil, errors.New("dataplane: relay connection canceled")
 		case <-tick.C:
 			now := time.Now()
-			if r.watchdogTick(c, now) {
+			if r.watchdogTick(c) {
 				cancel()
 				awaitTeardown(writerDone, recvErr)
 				return true, errors.New("dataplane: relay connection received nothing within the receive timeout")
@@ -680,11 +681,11 @@ func awaitTeardown(writerDone <-chan struct{}, recvErr <-chan error) {
 // connection, so a blocking keepalive enqueue would deadlock it. A
 // periodic keepalive that finds no free slot is skipped, because the
 // queued frames already show the connection is in use and the next tick
-// offers it again. The keepalive interval counts monotonic time since the
-// last successful send; only the receive timeout still reads the wall
-// clock through now.
-func (r *relay) watchdogTick(c *rconn, now time.Time) bool {
-	if now.Sub(time.Unix(0, c.lastRecv.Load())) >= r.d.timing.ReceiveTimeout {
+// offers it again. The receive timeout counts monotonic time since the
+// last received byte and the keepalive interval counts monotonic time since
+// the last successful send, so a wall-clock step changes neither.
+func (r *relay) watchdogTick(c *rconn) bool {
+	if c.sinceRecv() >= r.d.timing.ReceiveTimeout {
 		return true
 	}
 	if c.sinceSend() >= r.d.timing.KeepaliveInterval {
@@ -712,6 +713,20 @@ func (c *rconn) monoNow() time.Duration {
 
 // markSent records a successful send on the monotonic clock.
 func (c *rconn) markSent() { c.lastSend.Store(int64(c.monoNow())) }
+
+// markRecv records that bytes arrived on the monotonic clock. Bytes of an
+// incomplete frame count too, because the receive timeout measures liveness
+// of the connection, not completed frames.
+func (c *rconn) markRecv() { c.lastRecv.Store(int64(c.monoNow())) }
+
+// sinceRecv returns the monotonic time since the last received byte.
+func (c *rconn) sinceRecv() time.Duration { return c.monoNow() - time.Duration(c.lastRecv.Load()) }
+
+// receivedSince reports whether a byte arrived at or after the monotonic
+// reading mark.
+func (c *rconn) receivedSince(mark time.Duration) bool {
+	return time.Duration(c.lastRecv.Load()) >= mark
+}
 
 // sinceSend returns the monotonic time since the last successful send.
 func (c *rconn) sinceSend() time.Duration { return c.monoNow() - time.Duration(c.lastSend.Load()) }
