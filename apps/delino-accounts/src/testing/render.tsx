@@ -17,13 +17,20 @@ export const TEST_CONFIG: AccountsConfig = {
 /** A checkout that records the transactions it opens. */
 export function fakeCheckout(): Checkout & {
   opened: string[];
+  /** The signal of every `open` call, in call order. */
+  signals: (AbortSignal | undefined)[];
   close(): void;
 } {
   let onClosed: (() => void) | undefined;
   const opened: string[] = [];
+  const signals: (AbortSignal | undefined)[] = [];
   return {
     opened,
-    async open(transactionId, closed) {
+    signals,
+    async open(transactionId, closed, signal) {
+      signals.push(signal);
+      // Like the Paddle adapter, an aborted request opens nothing.
+      if (signal?.aborted) return;
       opened.push(transactionId);
       onClosed = closed;
     },

@@ -577,8 +577,9 @@ export function createFakeApi(): FakeApi {
           subscription: subscription(load(req.billingAccountId).account),
         };
       },
-      startSubscription(req) {
+      async startSubscription(req) {
         record("StartSubscription", req);
+        await awaitDeferredCall(api, "StartSubscription");
         const { account } = load(req.billingAccountId, PAYMENT_ROLES);
         account.subscription = {
           status: SubscriptionStatus.PENDING,

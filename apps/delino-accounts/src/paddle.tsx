@@ -12,8 +12,17 @@ export interface Checkout {
    * Opens the checkout overlay for `transactionId` (`txn_...`) and calls
    * `onClosed` when the user closes it or the payment completes. Rejects
    * when Paddle.js cannot load.
+   *
+   * When `signal` aborts before the checkout opens, including while Paddle.js
+   * still loads, the call resolves without installing the event callback or
+   * opening the overlay. The shared Paddle.js load is not canceled, so a later
+   * call reuses it.
    */
-  open(transactionId: string, onClosed: () => void): Promise<void>;
+  open(
+    transactionId: string,
+    onClosed: () => void,
+    signal?: AbortSignal,
+  ): Promise<void>;
 }
 
 /** The Paddle.js v2 (Paddle Billing) script that defines `PaddleBillingV1`. */
@@ -82,7 +91,7 @@ export function createPaddleCheckout(settings: PaddleSettings): Checkout {
     return paddle;
   }
   return {
-    async open(transactionId, onClosed) {
+    async open(transactionId, onClosed, signal) {
       loading ??= load();
       const attempt = loading;
       let paddle: Paddle;
@@ -92,6 +101,9 @@ export function createPaddleCheckout(settings: PaddleSettings): Checkout {
         if (loading === attempt) loading = undefined;
         throw error;
       }
+      // The caller left while Paddle.js loaded: the wait above is the second
+      // point at which a stale request can reach the overlay.
+      if (signal?.aborted) return;
       onEvent = (name) => {
         if (name === "checkout.closed" || name === "checkout.completed") {
           onClosed();

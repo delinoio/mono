@@ -170,4 +170,85 @@ describe("createPaddleCheckout", () => {
     expect(inserted).toHaveLength(1);
     expect(paddle.options).toHaveLength(1);
   });
+
+  describe("when the caller aborts", () => {
+    function eventCallback() {
+      return paddle.options[0]!.eventCallback as (event: {
+        name?: string;
+      }) => void;
+    }
+
+    test("opens nothing and installs no callback when the signal aborts while Paddle.js loads", async () => {
+      const checkout = newCheckout();
+      const controller = new AbortController();
+      let staleClosed = 0;
+      const stale = checkout.open(
+        "txn_stale",
+        () => staleClosed++,
+        controller.signal,
+      );
+      const script = await insertedScript(0);
+      controller.abort();
+      installPaddleGlobal();
+      script.dispatchEvent(new Event("load"));
+      await stale;
+      expect(paddle.opened).toEqual([]);
+      // The shared load finished and initialized Paddle.js once.
+      expect(paddle.options).toHaveLength(1);
+      eventCallback()({ name: "checkout.closed" });
+      expect(staleClosed).toBe(0);
+
+      // A later valid attempt reuses the loader and opens its transaction.
+      let closed = 0;
+      await checkout.open("txn_current", () => closed++);
+      expect(inserted).toHaveLength(1);
+      expect(paddle.options).toHaveLength(1);
+      expect(paddle.opened).toEqual([{ transactionId: "txn_current" }]);
+      eventCallback()({ name: "checkout.closed" });
+      expect(closed).toBe(1);
+      expect(staleClosed).toBe(0);
+    });
+
+    test("does not replace the callback of the open checkout with a stale attempt", async () => {
+      const checkout = newCheckout();
+      let currentClosed = 0;
+      const current = checkout.open("txn_current", () => currentClosed++);
+      const controller = new AbortController();
+      let staleClosed = 0;
+      const stale = checkout.open(
+        "txn_stale",
+        () => staleClosed++,
+        controller.signal,
+      );
+      const script = await insertedScript(0);
+      controller.abort();
+      installPaddleGlobal();
+      script.dispatchEvent(new Event("load"));
+      await Promise.all([current, stale]);
+      expect(paddle.opened).toEqual([{ transactionId: "txn_current" }]);
+      eventCallback()({ name: "checkout.completed" });
+      expect(currentClosed).toBe(1);
+      expect(staleClosed).toBe(0);
+    });
+
+    test("keeps the loader available after a stale attempt whose load failed", async () => {
+      const checkout = newCheckout();
+      const controller = new AbortController();
+      const stale = checkout.open("txn_stale", () => {}, controller.signal);
+      const staleAssertion = expect(stale).rejects.toThrow(
+        "Failed to load Paddle.js",
+      );
+      const first = await insertedScript(0);
+      controller.abort();
+      first.dispatchEvent(new Event("error"));
+      await staleAssertion;
+
+      const retry = checkout.open("txn_current", () => {});
+      const second = await insertedScript(1);
+      installPaddleGlobal();
+      second.dispatchEvent(new Event("load"));
+      await retry;
+      expect(paddle.opened).toEqual([{ transactionId: "txn_current" }]);
+    });
+  });
 });
