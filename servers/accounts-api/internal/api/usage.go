@@ -346,7 +346,9 @@ func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, audit *auditLog, ser
 	// window, which may be up to maxWindowEndAheadOfServer after the server
 	// time. The link time can therefore still be before the window end, and
 	// the stored unattributed result stands (a retry replays it and charges
-	// nothing to this link). The audit event of the link uses the same time.
+	// nothing to this link). A link whose time is at or after the window end
+	// (link_time < window end is false) does not overlap the half-open
+	// window. The audit event of the link uses the same time.
 	now = h.timestamp()
 	if _, err := tx.Exec(ctx, `INSERT INTO organization_links (organization_link_id, service, organization_id,
 			billing_account_id, organization_name, link_time) VALUES ($1, $2, $3, $4, $5, $6)`,
