@@ -96,6 +96,9 @@ type Agent struct {
 	// statusWriteHook, when set by a test, runs inside writeStatus after
 	// statusMu is taken and before the file is written.
 	statusWriteHook func()
+	// beforeSnapshotPublishHook, when set by a test, runs in importSnapshot
+	// after the content was written and before the ready entry is published.
+	beforeSnapshotPublishHook func()
 }
 
 // New builds the agent and reconciles its local state.
