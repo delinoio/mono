@@ -736,6 +736,14 @@ describe("top-up", () => {
 
 describe("usage", () => {
   test("shows the monthly summary with sub-cent costs and the ledger", async () => {
+    // Pin only the clock, at the first day of a UTC month that follows a
+    // different year, so the component, the fake API and the assertions agree
+    // on the month. Timers stay real so requests and effects settle normally;
+    // the file-level afterEach restores the real clock, also on a failure.
+    rs.useFakeTimers({
+      now: new Date("2027-01-01T12:00:00Z"),
+      toFake: ["Date"],
+    });
     const { api } = await renderAccount(VIEWER);
     await openTab("Usage");
     expect((await screen.findByLabelText("Usage total")).textContent).toBe(
@@ -759,15 +767,11 @@ describe("usage", () => {
     await settle(60);
     expect(await screen.findByText("No usage in this month")).toBeTruthy();
     const months = calls(api, "ListUsageSummary");
-    const now = new Date();
-    const previous = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1),
+    expect(months[0]).toEqual(
+      expect.objectContaining({ year: 2027, month: 1 }),
     );
     expect(months.at(-1)).toEqual(
-      expect.objectContaining({
-        year: previous.getUTCFullYear(),
-        month: previous.getUTCMonth() + 1,
-      }),
+      expect.objectContaining({ year: 2026, month: 12 }),
     );
   });
 });
