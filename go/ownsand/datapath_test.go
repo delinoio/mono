@@ -770,6 +770,110 @@ func TestForcedPeerToPeerFailedPreconditionReturnsTheError(t *testing.T) {
 	}
 }
 
+// canceledStatus is a canceled status that the control plane sends on the
+// wire. It is a failure of the control plane, not a cancellation by the
+// caller, whose context is still live.
+func canceledStatus() error {
+	return connect.NewError(connect.CodeCanceled, errors.New("canceled by the server"))
+}
+
+// failSetupStage makes the fake control plane answer the request of stage with
+// err.
+func failSetupStage(cp *fakeCP, stage stalledStage, err error) {
+	if stage == stageGetIceServers {
+		cp.iceGate = make(chan struct{})
+		cp.gateErr = err
+		return
+	}
+	cp.mu.Lock()
+	cp.openErr = err
+	cp.mu.Unlock()
+}
+
+// TestWireCanceledStatusMovesToRelay checks that a canceled status from
+// GetIceServers or OpenSession, with a live caller context, is a failure of the
+// control plane like any other: the operation succeeds on the relay and the
+// handle moves to the relay.
+func TestWireCanceledStatusMovesToRelay(t *testing.T) {
+	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
+		t.Run(string(stage), func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			failSetupStage(cp, stage, canceledStatus())
+			s := cp.handle(t, cp.client(t, TransportAuto))
+
+			res, err := execOnce(t, s)
+			if err != nil {
+				t.Fatalf("exec: %v", err)
+			}
+			if res.Transport != relayTransport {
+				t.Fatalf("transport %v, want relay", res.Transport)
+			}
+			if !s.usesRelay() {
+				t.Fatal("the handle did not move to the relay")
+			}
+			if n := len(cp.authRequests()); n == 0 {
+				t.Fatal("the relay was not used")
+			}
+		})
+	}
+}
+
+// TestForcedPeerToPeerWireCanceledStatusReturnsTheError checks that a forced
+// peer-to-peer handle returns the canceled status of either setup step with
+// its code and asks for no relay grant.
+func TestForcedPeerToPeerWireCanceledStatusReturnsTheError(t *testing.T) {
+	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
+		t.Run(string(stage), func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			failSetupStage(cp, stage, canceledStatus())
+			s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+
+			_, err := execOnce(t, s)
+			if got := connect.CodeOf(err); got != connect.CodeCanceled {
+				t.Fatalf("code %v, want canceled (err %v)", got, err)
+			}
+			if errors.Is(err, context.Canceled) {
+				t.Fatalf("a wire canceled status was reported as the caller's cancellation: %v", err)
+			}
+			if n := len(cp.authRequests()); n != 0 {
+				t.Fatalf("%d AuthorizeRelay calls, want 0", n)
+			}
+		})
+	}
+}
+
+// TestCallerCanceledDuringSetupEndsTheOperation checks that a cancellation by
+// the caller while GetIceServers or OpenSession is in flight stays terminal:
+// the operation returns the context error and asks for no relay grant.
+func TestCallerCanceledDuringSetupEndsTheOperation(t *testing.T) {
+	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
+		t.Run(string(stage), func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			stallSetup(t, cp, stage)
+			s := cp.handle(t, cp.client(t, TransportAuto))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ch := startExec(ctx, s)
+			waitGate(t, cp, map[stalledStage]string{stageGetIceServers: "ice", stageOpenSession: "open"}[stage])
+			cancel()
+			r := waitExec(t, ch)
+			if !errors.Is(r.err, context.Canceled) {
+				t.Fatalf("exec error %v, want context.Canceled", r.err)
+			}
+			if n := len(cp.authRequests()); n != 0 {
+				t.Fatalf("%d AuthorizeRelay calls, want 0", n)
+			}
+			if s.usesRelay() {
+				t.Fatal("the handle moved to the relay on a caller cancellation")
+			}
+		})
+	}
+}
+
 // TestGetIceServersTerminalErrorsEndTheOperation checks that the errors that
 // are terminal for OpenSession are terminal for GetIceServers too.
 func TestGetIceServersTerminalErrorsEndTheOperation(t *testing.T) {

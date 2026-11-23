@@ -165,9 +165,13 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 	var openErr *errP2POpen
 	if !errors.As(err, &openErr) {
 		// OpenSession or GetIceServers failed. An authorization error ends
-		// the operations; other errors mean the session cannot open.
+		// the operations; other errors mean the session cannot open. A
+		// canceled status is not an authorization error: a cancellation by
+		// the caller was returned above (callerDeadlineEnded), so a canceled
+		// status that is left was sent by the control plane and is a setup
+		// failure like any other.
 		switch connect.CodeOf(err) {
-		case connect.CodeUnauthenticated, connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeInvalidArgument, connect.CodeCanceled:
+		case connect.CodeUnauthenticated, connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeInvalidArgument:
 			return nil, err
 		case connect.CodeFailedPrecondition:
 			if !fromOpenSession {
