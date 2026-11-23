@@ -577,6 +577,13 @@ export interface MockTransportOptions {
    * row.
    */
   extraApiKeys?: number;
+  /**
+   * How many running sandboxes, labelled `extra=<index>`, to add to the Acme
+   * organization after the seeded ones, on the seeded `build-box` device with
+   * the settings of the seeded running sandbox. A test uses this to fill more
+   * than one page of sandboxes without a request for each row.
+   */
+  extraSandboxes?: number;
 }
 
 /** The capability fields of a seeded device that a fixture can replace. */
@@ -815,6 +822,19 @@ export function createMockTransport(
           tokenPrefix: `ose_${String(i).padStart(4, "0")}`,
         }),
       );
+    }
+    const template = acmeOrg.sandboxes.find(
+      (s) => s.sandboxId === MOCK_IDS.runningSandbox,
+    );
+    for (
+      let i = 0;
+      template !== undefined && i < (options.extraSandboxes ?? 0);
+      i++
+    ) {
+      const extra = clone(SandboxSchema, template);
+      extra.sandboxId = newMockId();
+      extra.labels = { extra: String(i) };
+      acmeOrg.sandboxes.push(extra);
     }
     for (let i = 0; i < (options.extraApiKeys ?? 0); i++) {
       acmeOrg.apiKeys.push(
@@ -1527,7 +1547,7 @@ export function createMockTransport(
         const { org } = membership(req.organizationId);
         const ended = (s: Sandbox) =>
           s.state === SandboxState.DELETED || s.state === SandboxState.FAILED;
-        const sandboxes = org.sandboxes
+        const filtered = org.sandboxes
           .filter(
             (s) => req.includeEnded || req.state !== undefined || !ended(s),
           )
@@ -1535,7 +1555,12 @@ export function createMockTransport(
           .filter(
             (s) => req.deviceId === undefined || s.deviceId === req.deviceId,
           );
-        return { sandboxes };
+        const { page, nextPageToken } = pageOf(
+          filtered,
+          req,
+          (s) => s.sandboxId,
+        );
+        return { sandboxes: page, nextPageToken };
       },
       deleteSandbox(req) {
         const { org } = membership(req.organizationId);
