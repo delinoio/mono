@@ -13,7 +13,7 @@ import {
 } from "@delino/ownsand-protos/v1/device_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { type FormEvent, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
@@ -138,6 +138,17 @@ export function DevicesPage() {
 }
 
 /**
+ * The unsaved edits of the device limits form. A field that is `undefined`
+ * is untouched; `vcpu` is `null` when the user blanked the input.
+ */
+interface DeviceLimitsDraft {
+  vcpu?: number | null;
+  memory?: string;
+  disk?: string;
+  overcommit?: string;
+}
+
+/**
  * Route `device`: the per-device admin settings. Admins change the limits
  * (including vCPU overcommit) and remove the device; members read them.
  */
@@ -162,36 +173,24 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
       return invalidateServices(queryClient, DeviceService);
     },
   });
-  const [vcpu, setVcpu] = useState<number | null>(null);
-  // Memory and disk are the digits of the stored int64 limits: a number
-  // cannot hold a value above 2^53 exactly, so saving another limit would
-  // otherwise round them.
-  const [memory, setMemory] = useState("");
-  const [disk, setDisk] = useState("");
+  // The fields the user has edited and not saved yet. A field that is absent
+  // (`undefined`) is untouched and shows the fetched limit, so a refresh
+  // that changes the limits updates it and never replaces an edit.
+  const [draft, setDraft] = useState<DeviceLimitsDraft>({});
   const [fieldError, setFieldError] = useState<{
     field: DeviceLimitField;
     message: string;
   } | null>(null);
-  const [overcommit, setOvercommit] = useState("100");
   const [confirmRemove, setConfirmRemove] = useState(false);
   const device = query.data?.device;
   // `update.isPending` lasts until the refetch that follows the save has
   // settled (the mutation awaits `onSuccess`), so it also covers the moment
-  // when the effect below copies the saved limits into the form. The fields
-  // are disabled for that whole window, so the readback cannot erase an edit
-  // that the user makes after the submit. `saving` is the synchronous guard
-  // for a second submit in the same tick, before React renders the disabled
-  // button.
+  // when the saved limits are read back. The fields are disabled for that
+  // whole window, so no edit can be made between the submit and the clearing
+  // of the saved draft. `saving` is the synchronous guard for a second
+  // submit in the same tick, before React renders the disabled button.
   const saving = useRef(false);
   const pending = update.isPending;
-
-  useEffect(() => {
-    if (device?.limits === undefined) return;
-    setVcpu(device.limits.vcpuCount);
-    setMemory(String(device.limits.memoryMib));
-    setDisk(String(device.limits.diskGib));
-    setOvercommit(String(device.limits.vcpuOvercommitPercent || 100));
-  }, [device?.limits]);
 
   if (query.isPending) return <Loading label="Loading the device" />;
   if (query.data === undefined || showsFullError(query))
@@ -201,6 +200,17 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   const d = device!;
   const admin =
     can(role, Permission.ManageDevices) && d.state !== DeviceState.REMOVED;
+  // The shown value of each field is its edit, else the fetched limit.
+  // Memory and disk are the digits of the stored int64 limits: a number
+  // cannot hold a value above 2^53 exactly, so saving another limit would
+  // otherwise round them.
+  const vcpu =
+    draft.vcpu !== undefined ? draft.vcpu : (d.limits?.vcpuCount ?? null);
+  const memory = draft.memory ?? (d.limits ? String(d.limits.memoryMib) : "");
+  const disk = draft.disk ?? (d.limits ? String(d.limits.diskGib) : "");
+  const overcommit =
+    draft.overcommit ??
+    (d.limits ? String(d.limits.vcpuOvercommitPercent || 100) : "100");
   const effective = effectiveVcpuLimit(vcpu ?? 0, Number(overcommit));
 
   const errorOf = (field: DeviceLimitField) =>
@@ -208,9 +218,9 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
 
   // Editing a field clears its error: the message describes the old value.
   const edit =
-    <T,>(field: DeviceLimitField, set: (value: T) => void) =>
-    (value: T) => {
-      set(value);
+    <K extends keyof DeviceLimitsDraft>(field: DeviceLimitField, key: K) =>
+    (value: NonNullable<DeviceLimitsDraft[K]> | null) => {
+      setDraft((current) => ({ ...current, [key]: value }));
       setFieldError((current) => (current?.field === field ? null : current));
     };
 
@@ -238,6 +248,16 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
         deviceId,
         limits: input.limits,
       });
+      // The saved values are now the fetched limits: drop the edits that
+      // they came from. An edit that differs from what was submitted stays.
+      setDraft((current) => ({
+        vcpu:
+          current.vcpu === input.limits.vcpuCount ? undefined : current.vcpu,
+        memory: current.memory === memory ? undefined : current.memory,
+        disk: current.disk === disk ? undefined : current.disk,
+        overcommit:
+          current.overcommit === overcommit ? undefined : current.overcommit,
+      }));
       toast.success("The device limits are saved.");
     } catch (error) {
       // The draft stays as the user left it and the form is usable again.
@@ -287,7 +307,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
             <NumberInput
               label="vCPU limit"
               value={vcpu}
-              onValueChange={edit(DeviceLimitField.Vcpu, setVcpu)}
+              onValueChange={edit(DeviceLimitField.Vcpu, "vcpu")}
               min={0}
               error={errorOf(DeviceLimitField.Vcpu)}
               disabled={!admin || pending}
@@ -295,7 +315,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
             <TextField
               label="Memory limit (MiB)"
               value={memory}
-              onValueChange={edit(DeviceLimitField.Memory, setMemory)}
+              onValueChange={edit(DeviceLimitField.Memory, "memory")}
               inputMode="numeric"
               error={errorOf(DeviceLimitField.Memory)}
               disabled={!admin || pending}
@@ -303,7 +323,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
             <TextField
               label="Disk limit (GiB)"
               value={disk}
-              onValueChange={edit(DeviceLimitField.Disk, setDisk)}
+              onValueChange={edit(DeviceLimitField.Disk, "disk")}
               inputMode="numeric"
               error={errorOf(DeviceLimitField.Disk)}
               disabled={!admin || pending}
@@ -312,7 +332,9 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
           <Select
             label="vCPU overcommit"
             value={overcommit}
-            onValueChange={(v) => v && setOvercommit(v)}
+            onValueChange={(v) =>
+              v && setDraft((c) => ({ ...c, overcommit: v }))
+            }
             disabled={!admin || pending}
           >
             {OVERCOMMIT_PERCENTAGES.map((p) => (
