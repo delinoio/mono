@@ -131,6 +131,17 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 		c.logger.DebugContext(ctx, "ownsand data path session opened", "sandbox_id", d.s.id, "session_id", sess.sessionID, "transport", "peer-to-peer", "duration", time.Since(start))
 		return sess, nil
 	}
+	var localCredErr *errLocalCredential
+	if ctx.Err() == nil && errors.As(err, &localCredErr) {
+		// The token source failed on this machine, before any request left
+		// the process. The relay needs the same credential, so the error ends
+		// the operation: no AuthorizeRelay call and no change of the handle's
+		// transport, and a later operation sets the session up again once
+		// the token source recovers. A caller context that ended keeps
+		// priority below, as for every other setup step.
+		c.logger.DebugContext(ctx, "ownsand data path setup ended by a local credential failure", "sandbox_id", d.s.id)
+		return nil, err
+	}
 	if cerr := callerDeadlineEnded(ctx, err, c.timing.callerDeadlineSkew); cerr != nil {
 		// The caller's context ended first; it stays authoritative and
 		// starts no relay recovery.
