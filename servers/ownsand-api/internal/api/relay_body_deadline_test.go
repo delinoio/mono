@@ -312,6 +312,35 @@ func TestRelayBudgetCoversUpload(t *testing.T) {
 	}
 	id := streamOf(r, grant)
 	r.WaitFrame("stream close", func(f *ownsandv1.DataFrame) bool { return f.GetStreamId() == id && f.GetRelayStreamClose() != nil })
+
+	// The call must have failed because the agent never answered, not because
+	// the relay gave up before it forwarded the upload: the agent has to have
+	// received the write chunk, and before the deadline closed the stream.
+	chunkAt, closeAt := -1, -1
+	for i, f := range r.Frames() {
+		if f.GetStreamId() != id {
+			continue
+		}
+		if f.GetFileWriteChunk() != nil && chunkAt < 0 {
+			chunkAt = i
+			chunk := f.GetFileWriteChunk()
+			if chunk.GetWriteId() == "" || chunk.GetOffset() != 0 || string(chunk.GetData()) != "chunk" {
+				t.Fatalf("the forwarded write chunk is %v, want the uploaded data %q at offset 0", chunk, "chunk")
+			}
+		}
+		if f.GetRelayStreamClose() != nil && closeAt < 0 {
+			closeAt = i
+		}
+	}
+	if chunkAt < 0 {
+		t.Fatalf("the agent never received the file write chunk of stream %d", id)
+	}
+	if closeAt < 0 || chunkAt > closeAt {
+		t.Fatalf("the file write chunk (frame %d) did not arrive before the stream close (frame %d)", chunkAt, closeAt)
+	}
+	if n := countRequestFrames(r, id); n != 1 {
+		t.Fatalf("the agent received %d request frames for stream %d, want exactly the write chunk", n, id)
+	}
 }
 
 // TestRelayGateRejectsBeforeBody checks that a caller with an invalid grant is
