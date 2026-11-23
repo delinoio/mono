@@ -262,6 +262,44 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	}
 }
 
+// Deleting a billing account whose first checkout is still open cancels the
+// checkout transaction at Paddle, so a late payment cannot create a
+// subscription for the deleted account. A Paddle failure fails the deletion
+// and leaves the account and its open checkout.
+func TestDeleteBillingAccountCancelsPendingCheckout(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	started, err := env.Credit(f.Owner.ID).StartSubscription(ctx(), connect.NewRequest(&accountsv1.StartSubscriptionRequest{BillingAccountId: f.AccountID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	txnID := started.Msg.GetPaddleTransactionId()
+	del := func() error {
+		_, err := f.Owner.Client.DeleteBillingAccount(ctx(), connect.NewRequest(&accountsv1.DeleteBillingAccountRequest{BillingAccountId: f.AccountID}))
+		return err
+	}
+
+	env.Paddle.Fail("PATCH /transactions/", &paddletest.Failure{Status: http.StatusServiceUnavailable, Code: "unavailable"})
+	wantCode(t, del(), connect.CodeUnavailable)
+	if _, err := f.Owner.Client.GetBillingAccount(ctx(), connect.NewRequest(&accountsv1.GetBillingAccountRequest{BillingAccountId: f.AccountID})); err != nil {
+		t.Fatalf("the billing account is gone after a failed deletion: %v", err)
+	}
+	var checkouts int
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM paddle_checkouts WHERE billing_account_id = $1 AND paddle_transaction_id = $2`,
+		f.AccountID, txnID).Scan(&checkouts); err != nil || checkouts != 1 {
+		t.Fatalf("checkout records = %d, %v", checkouts, err)
+	}
+	if txn, _ := env.Paddle.Transaction(txnID); txn.Status != paddle.TransactionStatusDraft {
+		t.Fatalf("Paddle transaction after the failed deletion = %s", txn.Status)
+	}
+
+	env.Paddle.Fail("PATCH /transactions/", nil)
+	wantCode(t, del(), 0)
+	if txn, _ := env.Paddle.Transaction(txnID); txn.Status != paddle.TransactionStatusCanceled {
+		t.Fatalf("Paddle transaction after the deletion = %s", txn.Status)
+	}
+}
+
 func TestManualTopUp(t *testing.T) {
 	env := testenv.New(t)
 	f := newFixture(t, env)

@@ -398,6 +398,39 @@ func (c *Client) CreateCheckoutTransaction(ctx context.Context, priceID string, 
 	return txn, nil
 }
 
+// Transaction status values of Paddle
+// (https://developer.paddle.com/api-reference/transactions/overview).
+const (
+	TransactionStatusDraft     = "draft"
+	TransactionStatusReady     = "ready"
+	TransactionStatusBilled    = "billed"
+	TransactionStatusPaid      = "paid"
+	TransactionStatusCompleted = "completed"
+	TransactionStatusCanceled  = "canceled"
+	TransactionStatusPastDue   = "past_due"
+)
+
+// GetTransaction reads a transaction (`GET /transactions/{id}`).
+func (c *Client) GetTransaction(ctx context.Context, id string) (Transaction, error) {
+	var txn Transaction
+	err := c.do(ctx, http.MethodGet, "/transactions/"+url.PathEscape(id), nil, &txn)
+	return txn, err
+}
+
+// CancelTransaction cancels a transaction that has not been paid (`PATCH
+// /transactions/{id}` with `status: canceled`,
+// https://developer.paddle.com/api-reference/transactions/update-transaction).
+// Paddle allows the change for the statuses `draft`, `ready`, `billed` and
+// `past_due`; it rejects a completed transaction. The caller must check that
+// the answer names the transaction and has the status `canceled`: a 2xx answer
+// is not a confirmation by itself.
+func (c *Client) CancelTransaction(ctx context.Context, id string) (Transaction, error) {
+	var txn Transaction
+	err := c.do(ctx, http.MethodPatch, "/transactions/"+url.PathEscape(id),
+		map[string]any{"status": TransactionStatusCanceled}, &txn)
+	return txn, err
+}
+
 // GetSubscription reads a subscription (`GET /subscriptions/{id}`).
 func (c *Client) GetSubscription(ctx context.Context, id string) (Subscription, error) {
 	var sub Subscription

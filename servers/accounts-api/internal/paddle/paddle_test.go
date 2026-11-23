@@ -102,6 +102,38 @@ func TestClientCheckoutAndSubscription(t *testing.T) {
 	}
 }
 
+func TestClientTransactionCancellation(t *testing.T) {
+	client, fake := newClient(t)
+	ctx := context.Background()
+	txn, err := client.CreateCheckoutTransaction(ctx, "pri_sub", paddle.CustomData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.GetTransaction(ctx, txn.ID)
+	if err != nil || got.ID != txn.ID || got.Status != paddle.TransactionStatusDraft {
+		t.Fatalf("GetTransaction = %+v, %v", got, err)
+	}
+	canceled, err := client.CancelTransaction(ctx, txn.ID)
+	if err != nil || canceled.ID != txn.ID || canceled.Status != paddle.TransactionStatusCanceled {
+		t.Fatalf("CancelTransaction = %+v, %v", canceled, err)
+	}
+	reqs := fake.Requests()
+	last := reqs[len(reqs)-1]
+	if last.Method != http.MethodPatch || last.Path != "/transactions/"+txn.ID || last.Body["status"] != "canceled" || len(last.Body) != 1 {
+		t.Fatalf("cancel request = %+v", last)
+	}
+	// Paddle rejects the change of a canceled or completed transaction.
+	if _, err := client.CancelTransaction(ctx, txn.ID); paddle.Classify(err) != paddle.OutcomeRejected {
+		t.Fatalf("second CancelTransaction = %v, want a rejection", err)
+	}
+	if _, err := client.GetTransaction(ctx, "txn_missing"); paddle.Classify(err) != paddle.OutcomeNotFound {
+		t.Fatalf("GetTransaction(missing) = %v", err)
+	}
+	if _, err := client.CancelTransaction(ctx, "txn_missing"); paddle.Classify(err) != paddle.OutcomeNotFound {
+		t.Fatalf("CancelTransaction(missing) = %v", err)
+	}
+}
+
 // A success answer whose transaction has no ID is a malformed answer: the
 // outcome is unknown and no empty transaction is returned.
 func TestClientCheckoutRejectsATransactionWithoutID(t *testing.T) {
