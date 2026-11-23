@@ -6,6 +6,41 @@ import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { useCallback, useEffect, useMemo } from "react";
 import { LIST_ORGANIZATIONS_REQUEST } from "./api.ts";
 
+/** The part of a cached query that tells which request failed. */
+interface QueryRequestState {
+  state: {
+    status: string;
+    fetchMeta: { fetchMore?: { direction: string } } | null;
+  };
+}
+
+/**
+ * Whether the last request of the query failed on a later page.
+ *
+ * This is the state that `isFetchNextPageError` of the observer reports, but
+ * read from the cached query, so an automatic refetch can ask it before it
+ * starts.
+ */
+function lastRequestFailedOnLaterPage(query: QueryRequestState): boolean {
+  return (
+    query.state.status === "error" &&
+    query.state.fetchMeta?.fetchMore?.direction === "forward"
+  );
+}
+
+/**
+ * Lets React Query refetch the entry on its own trigger (window focus,
+ * reconnect, mount of an observer) unless a later page failed.
+ *
+ * A refetch that succeeds reads the first page again and clears the error
+ * flag, so the continuation effect of `useOrganizations` would then request
+ * the failed page without the user's retry. Returning false keeps the flag
+ * and the loaded pages until `retryLoadMore` or an invalidation runs.
+ */
+function refetchUnlessLaterPageFailed(query: QueryRequestState): boolean {
+  return !lastRequestFailedOnLaterPage(query);
+}
+
 /** The organizations of the caller, as the organization list and the switcher show them. */
 export interface OrganizationsResult {
   /** Every organization that the loaded pages hold, in the server's order. */
@@ -43,7 +78,9 @@ export interface OrganizationsResult {
  * `invalidateServices(OrganizationService)` refetches it from the first
  * page. A failed later-page request stops the loop and surfaces as
  * `loadMoreError` with `isIncomplete`; `retryLoadMore` continues from the
- * last loaded page.
+ * last loaded page. While that failure stands, a window focus, a reconnect
+ * or a new observer does not refetch the entry, so only `retryLoadMore` or
+ * an invalidation requests a page again.
  */
 export function useOrganizations(): OrganizationsResult {
   const query = useInfiniteQuery(
@@ -52,6 +89,9 @@ export function useOrganizations(): OrganizationsResult {
     {
       pageParamKey: "pageToken",
       getNextPageParam: (last) => last.nextPageToken || undefined,
+      refetchOnWindowFocus: refetchUnlessLaterPageFailed,
+      refetchOnReconnect: refetchUnlessLaterPageFailed,
+      refetchOnMount: refetchUnlessLaterPageFailed,
     },
   );
   const { data, hasNextPage, isFetching, isFetchNextPageError, fetchNextPage } =
