@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -193,9 +194,10 @@ func TestRelayBodyDeadline(t *testing.T) {
 					t.Fatalf("the agent received a request frame %v of the stream %d", f.GetKind(), id)
 				}
 			}
-			testenv.Eventually(t, "relay_rpc log record of the stalled call", func() bool {
-				return strings.Contains(env.Logs.String(), `"code":"deadline_exceeded"`) && strings.Contains(env.Logs.String(), grant)
-			})
+			// One record must carry the grant and the code together: the
+			// earlier cases of this test leave deadline_exceeded records of
+			// their own grants in the same log.
+			waitRelayRPC(t, env, grant, connect.CodeDeadlineExceeded)
 		})
 		t.Run(tc.name+"/slow upload within the budget", func(t *testing.T) {
 			grant, err := tc.call(t, env, org, sandboxID, 200*time.Millisecond)
@@ -212,6 +214,61 @@ func TestRelayBodyDeadline(t *testing.T) {
 				t.Fatalf("request frames of stream %d = %d, want 1", id, got)
 			}
 		})
+	}
+}
+
+// relayRPCRecord is the part of a relay_rpc log record that the tests match.
+type relayRPCRecord struct {
+	Msg       string `json:"msg"`
+	GrantID   string `json:"grant_id"`
+	Code      string `json:"code"`
+	Procedure string `json:"procedure"`
+}
+
+// relayRPCRecords parses every relay_rpc record of the server log, one record
+// per log line.
+func relayRPCRecords(env *testenv.Env) []relayRPCRecord {
+	var out []relayRPCRecord
+	for _, line := range strings.Split(env.Logs.String(), "\n") {
+		var rec relayRPCRecord
+		if json.Unmarshal([]byte(line), &rec) != nil || rec.Msg != "relay_rpc" {
+			continue
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+// relayRPCLines returns the relay_rpc log lines of the grant, for a failure
+// message.
+func relayRPCLines(env *testenv.Env, grant string) []string {
+	var out []string
+	for _, line := range strings.Split(env.Logs.String(), "\n") {
+		var rec relayRPCRecord
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Msg == "relay_rpc" && rec.GrantID == grant {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// waitRelayRPC waits, within 10 s, for one relay_rpc log record that carries
+// both grant_id grant and the code. It fails with the relay_rpc records of the
+// grant when no such record appears.
+func waitRelayRPC(t *testing.T, env *testenv.Env, grant string, code connect.Code) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		for _, rec := range relayRPCRecords(env) {
+			if rec.GrantID == grant && rec.Code == code.String() {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for one relay_rpc log record with grant_id %s and code %s; relay_rpc records of the grant:\n%s",
+				grant, code, strings.Join(relayRPCLines(env, grant), "\n"))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
