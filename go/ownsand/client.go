@@ -164,7 +164,9 @@ func New(opts Options) (*Client, error) {
 	}
 	base = strings.TrimRight(base, "/")
 	origin, err := url.Parse(base)
-	if err != nil || origin.Host == "" || (origin.Scheme != "https" && origin.Scheme != "http") {
+	// Hostname drops the port, so "http://:18300" has a nonempty Host but no
+	// hostname.
+	if err != nil || origin.Hostname() == "" || (origin.Scheme != "https" && origin.Scheme != "http") {
 		return nil, fmt.Errorf("ownsand: invalid base URL: want an http or https origin")
 	}
 	// url.Parse drops an empty fragment and records a bare "?" only as
