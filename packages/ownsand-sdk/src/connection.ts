@@ -217,16 +217,18 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
  * hold) ends the call with a terminal credential error without a request.
  * The error never holds the token: the `TypeError` of `Headers.set` quotes
  * the whole value, so it is neither passed on nor kept as a cause. Only edge
- * whitespace is allowed; the header normalization drops it.
+ * whitespace is allowed; it is trimmed before the header is built, so the
+ * header holds exactly the bare token.
  */
 function setAuthorization(headers: Headers, secret: string): void {
   const invalid = () =>
     new OwnSandCredentialError("accessToken returned an invalid token");
-  if (/[\r\n\0]/.test(secret.trim())) {
+  const token = secret.trim();
+  if (/[\r\n\0]/.test(token)) {
     throw invalid();
   }
   try {
-    headers.set("Authorization", `Bearer ${secret}`);
+    headers.set("Authorization", `Bearer ${token}`);
   } catch {
     throw invalid();
   }
