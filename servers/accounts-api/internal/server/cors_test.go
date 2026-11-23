@@ -60,13 +60,17 @@ func TestCORS(t *testing.T) {
 // no default port) and keeps other ports distinct.
 func TestCORSMatchesBrowserSerializedOrigin(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	h := NewHandler(logger, WithCORSOrigins([]string{"https://accounts.delino.io", "http://accounts.delino.localhost:8080"}))
+	h := NewHandler(logger, WithCORSOrigins([]string{"https://accounts.delino.io", "http://accounts.delino.localhost:8080", "http://127.0.0.1:3000"}))
 	for origin, want := range map[string]int{
 		"https://accounts.delino.io":            http.StatusNoContent,
 		"http://accounts.delino.localhost:8080": http.StatusNoContent,
 		"https://accounts.delino.io:8443":       http.StatusForbidden,
 		"http://accounts.delino.localhost":      http.StatusForbidden,
 		"http://accounts.delino.io":             http.StatusForbidden,
+		// config.Load stores http://127.1:3000 as this origin, which a browser sends.
+		"http://127.0.0.1:3000": http.StatusNoContent,
+		"http://127.0.0.1:3001": http.StatusForbidden,
+		"http://127.0.0.2:3000": http.StatusForbidden,
 	} {
 		req := httptest.NewRequest(http.MethodOptions, "/x/y", nil)
 		req.Header.Set("Origin", origin)
