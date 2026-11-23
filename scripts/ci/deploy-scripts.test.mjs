@@ -2069,6 +2069,9 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_RUN_EXIT   exit code of `docker run` (default 0), printed with a
 //                 Docker diagnostic when not 0.
 //   STUB_CREATE_EXIT exit code of `docker create` (default 0), like STUB_RUN_EXIT.
+//   STUB_BLOCK_ON  glob that a `docker` call (its arguments joined by spaces)
+//                 must match to block until `<scratch>/release-docker` exists,
+//                 so that a test can send a signal while the call runs.
 // `stubs` adds stub commands (name -> shell body) that shadow system tools, and
 // `prepare(deployRoot)` changes the scratch state before the run.
 function setupDroplet(
@@ -2110,7 +2113,10 @@ function setupDroplet(
   shellStub(
     bin,
     "docker",
-    `case "$1" in
+    `if [[ -n "\${STUB_BLOCK_ON:-}" && "$*" == \$STUB_BLOCK_ON ]]; then
+  while [[ ! -e "$STUB_DIR/release-docker" ]]; do sleep 0.05; done
+fi
+case "$1" in
   ps)
     [[ "\${STUB_PS_EXIT:-0}" == 0 ]] || exit "\$STUB_PS_EXIT"
     printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
@@ -2466,6 +2472,174 @@ test(
       restartFailed.stderr,
       /docker start failed for the previous container old1/,
     );
+  },
+);
+
+// A signal that ends a deployment with UDP ports between the first stop and
+// the route switch must leave the service as it was before the deployment.
+// The `curl` stub blocks the health check (STUB_BLOCK) so that the signal
+// arrives while the replacement waits for it; Bash runs its trap when that
+// foreground command returns, so the test releases the check after the signal.
+test(
+  "droplet deploy starts the old container again when a signal ends a replacement with UDP ports before the route switch",
+  { skip },
+  async (t) => {
+    const route = "# old route\n";
+    for (const [signal, status] of [
+      ["SIGTERM", 143],
+      ["SIGINT", 130],
+      ["SIGHUP", 129],
+    ]) {
+      const setup = setupDroplet(t, udpArgs, {
+        old: ["old1", "old2"],
+        route,
+        state: `${olderImage}\n`,
+        stubs: { curl: blockingCurl },
+      });
+      const run = startDroplet(t, setup, udpArgs, { STUB_BLOCK: "1" });
+      await waitFor(
+        () => setup.calls().some((call) => call.startsWith("curl")),
+        `${signal}: the health check of the replacement`,
+      );
+      run.child.kill(signal);
+      writeFileSync(join(setup.dir, "release"), "");
+      const result = await run.done;
+      assert.equal(result.status, status, `${signal}: ${result.stderr}`);
+      assert.match(
+        result.stderr,
+        new RegExp(`received ${signal} before the route`),
+        signal,
+      );
+      const calls = setup.calls();
+      assert.deepEqual(calls.slice(-3), [
+        calls.at(-3),
+        "docker start old1",
+        "docker start old2",
+      ]);
+      assert.match(calls.at(-3), /^docker rm --force api-/, signal);
+      assert.ok(!calls.some((call) => call.startsWith("docker exec")), signal);
+      assert.equal(setup.read("caddy/sites/api.caddy"), route, signal);
+      assert.equal(setup.read("state/api.current"), `${olderImage}\n`, signal);
+    }
+  },
+);
+
+test(
+  "droplet deploy names a previous container that does not start again after a signal",
+  { skip },
+  async (t) => {
+    const setup = setupDroplet(t, udpArgs, {
+      old: ["old1"],
+      stubs: { curl: blockingCurl },
+    });
+    const run = startDroplet(t, setup, udpArgs, {
+      STUB_BLOCK: "1",
+      STUB_START_FAIL: "old1",
+    });
+    await waitFor(
+      () => setup.calls().some((call) => call.startsWith("curl")),
+      "the health check of the replacement",
+    );
+    run.child.kill("SIGTERM");
+    writeFileSync(join(setup.dir, "release"), "");
+    const result = await run.done;
+    assert.equal(result.status, 143, result.stderr);
+    assert.match(
+      result.stderr,
+      /docker start failed for the previous container old1; old1 does not serve/,
+    );
+  },
+);
+
+test(
+  "droplet deploy keeps the replacement when a signal arrives during the route switch",
+  { skip },
+  async (t) => {
+    const route = "# old route\n";
+    const setup = setupDroplet(t, udpArgs, {
+      old: ["old1"],
+      route,
+      state: `${olderImage}\n`,
+    });
+    const run = startDroplet(t, setup, udpArgs, {
+      STUB_BLOCK_ON: "exec *",
+    });
+    await waitFor(
+      () => setup.calls().some((call) => call.startsWith("docker exec")),
+      "the proxy reload",
+    );
+    run.child.kill("SIGTERM");
+    writeFileSync(join(setup.dir, "release-docker"), "");
+    const result = await run.done;
+    assert.equal(result.status, 143, result.stderr);
+    assert.match(result.stderr, /received SIGTERM during the route switch/);
+    const calls = setup.calls();
+    // The route names the replacement, which stays; the previous containers
+    // stay stopped and the state files name the replacement.
+    assert.notEqual(setup.read("caddy/sites/api.caddy"), route);
+    assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+    assert.equal(setup.read("state/api.previous"), `${olderImage}\n`);
+    assert.ok(!calls.some((call) => call.startsWith("docker rm --force")));
+    assert.ok(!calls.some((call) => call === "docker start old1"));
+  },
+);
+
+test(
+  "droplet deploy restores the previous containers when a signal arrives during a failed route switch",
+  { skip },
+  async (t) => {
+    const route = "# old route\n";
+    const setup = setupDroplet(t, udpArgs, {
+      old: ["old1"],
+      route,
+      state: `${olderImage}\n`,
+    });
+    const run = startDroplet(t, setup, udpArgs, {
+      STUB_BLOCK_ON: "exec *",
+      STUB_RELOAD: "1",
+    });
+    await waitFor(
+      () => setup.calls().some((call) => call.startsWith("docker exec")),
+      "the proxy reload",
+    );
+    run.child.kill("SIGTERM");
+    writeFileSync(join(setup.dir, "release-docker"), "");
+    const result = await run.done;
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /previous containers were started again/);
+    assert.equal(setup.calls().at(-1), "docker start old1");
+    assert.equal(setup.read("caddy/sites/api.caddy"), route);
+    assert.equal(setup.read("state/api.current"), `${olderImage}\n`);
+  },
+);
+
+test(
+  "droplet deploy does not start the old container again when a signal arrives after the route switch",
+  { skip },
+  async (t) => {
+    const setup = setupDroplet(t, udpArgs, {
+      old: ["old1"],
+      state: `${olderImage}\n`,
+    });
+    // `docker rm old1` is the cleanup after the route switch.
+    const run = startDroplet(t, setup, udpArgs, { STUB_BLOCK_ON: "rm old1" });
+    await waitFor(
+      () => setup.calls().some((call) => call === "docker rm old1"),
+      "the cleanup of the previous container",
+    );
+    run.child.kill("SIGTERM");
+    // Without a trap the signal ends the script at once, but the blocked stub
+    // keeps the output pipes open, so the stub is released shortly after the
+    // signal. A script that ignored the signal would then finish normally and
+    // not end by the signal.
+    await sleep(300);
+    writeFileSync(join(setup.dir, "release-docker"), "");
+    const result = await run.done;
+    assert.equal(result.status, null);
+    const calls = setup.calls();
+    assert.ok(!calls.some((call) => call === "docker start old1"));
+    assert.ok(!calls.some((call) => call.startsWith("docker rm --force")));
+    assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
   },
 );
 
