@@ -457,9 +457,13 @@ func (m *Manager) SetLimits(l *ownsandv1.DeviceLimits) {
 	}
 }
 
-// Busy reports whether a sandbox is creating, running or paused; an update
-// installs only when not busy. Snapshot transfers reserve the device with the
-// updater and are not counted here.
+// Busy reports whether a sandbox is creating, running or paused, or is
+// deleting with a VM stop that has not been confirmed; an update installs
+// only when not busy. A DELETING record whose runtime Delete is still running
+// or failed (sb.stopped is false) may still have a live VM, so it keeps the
+// agent busy until a Delete returns nil or startup reconciliation ends the
+// record. Snapshot transfers reserve the device with the updater and are not
+// counted here.
 func (m *Manager) Busy() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -467,6 +471,10 @@ func (m *Manager) Busy() bool {
 		switch sb.rec.State {
 		case ownsandv1.SandboxState_SANDBOX_STATE_CREATING, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED:
 			return true
+		case ownsandv1.SandboxState_SANDBOX_STATE_DELETING:
+			if !sb.stopped {
+				return true
+			}
 		}
 	}
 	return false

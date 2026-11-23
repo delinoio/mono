@@ -110,7 +110,8 @@ type Options struct {
 	Platform    string
 	Running     string
 	Installer   Installer
-	// Busy reports sandboxes in creating, running or paused state. Snapshot
+	// Busy reports sandboxes in creating, running or paused state, and
+	// sandboxes in deleting state whose VM stop is not confirmed. Snapshot
 	// transfers are not part of it: they reserve the device with
 	// Updater.BeginTransfer.
 	Busy func() bool
