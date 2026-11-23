@@ -352,6 +352,11 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			}
 			cfg.STUNURLs = append(cfg.STUNURLs, u)
 		}
+		// splitList drops blank items, so a delimiter-only value such as ","
+		// leaves no URL. Reject it instead of publishing an empty STUN list.
+		if len(cfg.STUNURLs) == 0 {
+			return Config{}, fmt.Errorf("%s must list stun: URLs with a host", EnvSTUNURLs)
+		}
 	}
 	cfg.R2 = R2{
 		Endpoint:        get(EnvR2Endpoint),

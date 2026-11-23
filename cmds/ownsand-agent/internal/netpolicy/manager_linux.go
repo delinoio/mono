@@ -33,10 +33,17 @@ type dnsCloser interface {
 // nftables table of the agent current. It needs CAP_NET_ADMIN and the `ip`
 // (iproute2) and `nft` commands.
 type Manager struct {
-	logger   *slog.Logger
-	mu       sync.Mutex
-	attached map[string]*attachment
-	used     map[int]bool
+	logger *slog.Logger
+	mu     sync.Mutex
+	// refreshMu serializes Refresh from the route read to the apply, so
+	// that a refresh that read older routes cannot apply after a refresh
+	// that read newer ones. Lock order: refreshMu before mu. Nothing that
+	// holds mu waits for refreshMu, and CleanupHost never takes refreshMu:
+	// it only advances cleanups, which a refresh in flight checks before it
+	// applies.
+	refreshMu sync.Mutex
+	attached  map[string]*attachment
+	used      map[int]bool
 	// gateways holds the DNS exception of each tap (the key) that the
 	// ruleset renders: Attach stages it before the first policy refresh of
 	// the sandbox and removes it when the attachment fails or ends.
@@ -185,7 +192,11 @@ func HostRoutes() ([]Route, []netip.Prefix, error) {
 
 // Refresh recomputes the ruleset from the host routes and the current DNS
 // assignments of the attached sandboxes and applies it when it changed.
+// Concurrent calls run one after the other, so the ruleset of the call that
+// read the routes last is the one that stays applied.
 func (m *Manager) Refresh() error {
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
 	m.mu.Lock()
 	cleanups := m.cleanups
 	m.mu.Unlock()

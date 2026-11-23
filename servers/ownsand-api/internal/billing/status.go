@@ -410,7 +410,8 @@ func AddPendingUnlinkTx(ctx context.Context, tx pgx.Tx, orgID, billingAccountID 
 		VALUES ($1, NULLIF($2, '')::uuid, $3, 0, $3) ON CONFLICT (organization_id) DO UPDATE SET
 		billing_account_id = COALESCE(excluded.billing_account_id, billing_pending_unlinks.billing_account_id),
 		create_time = excluded.create_time, attempts = 0,
-		next_attempt_time = greatest(excluded.next_attempt_time, COALESCE(billing_pending_unlinks.link_call_deadline, excluded.next_attempt_time)),
+		unlink_not_before = greatest(billing_pending_unlinks.unlink_not_before, billing_pending_unlinks.link_call_deadline),
+		next_attempt_time = greatest(excluded.next_attempt_time, billing_pending_unlinks.unlink_not_before, billing_pending_unlinks.link_call_deadline),
 		link_attempt_id = NULL, link_call_deadline = NULL`, orgID, billingAccountID, now)
 	return err
 }

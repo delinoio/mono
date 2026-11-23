@@ -39,12 +39,36 @@ var ErrLinkInProgress = errors.New("billing: a link attempt is in progress")
 // BeginLinkAttemptTx records the link attempt attemptID of the organization
 // to billingAccountID in tx, which must hold the organization row lock. The
 // organization must have no pending unlink row (the caller sends and
-// deletes it first). The attempt counts as running until the call deadline.
-func BeginLinkAttemptTx(ctx context.Context, tx pgx.Tx, orgID, attemptID, billingAccountID string, now time.Time) error {
+// deletes it first). The attempt counts as running until the call deadline,
+// which it returns: LinkCallBudget admits the call only while it can end
+// before that deadline, so the cleanup cannot overtake it.
+func BeginLinkAttemptTx(ctx context.Context, tx pgx.Tx, orgID, attemptID, billingAccountID string, now time.Time) (time.Time, error) {
 	deadline := now.Add(LinkCallTimeout + linkCallGrace)
 	_, err := tx.Exec(ctx, `INSERT INTO billing_pending_unlinks (organization_id, billing_account_id, create_time, attempts, next_attempt_time, link_attempt_id, link_call_deadline)
 		VALUES ($1, $2, $3, 0, $4, $5, $4)`, orgID, billingAccountID, now, deadline, attemptID)
-	return err
+	return deadline, err
+}
+
+// LinkCallBudget returns how long the LinkOrganization call of an attempt
+// with the persisted call deadline may run when it is dispatched at now: at
+// most LinkCallTimeout, and short enough that the call and the time that
+// delino-accounts can still need after the client gave up end before the
+// deadline, after which a cleanup may remove the attempt row. A budget of
+// zero or less means the call must not be started: the attempt is too old
+// for a call to end before its row can be removed.
+func LinkCallBudget(deadline, now time.Time) time.Duration {
+	return min(LinkCallTimeout, deadline.Add(-linkCallGrace).Sub(now))
+}
+
+// LinkAttemptRunning reports whether the row of the organization still
+// carries the attempt attemptID with a running call: no unlink, ownership
+// transfer, deletion, newer attempt or cleanup took it over or removed it.
+// A call must not be started for an attempt that is not running.
+func LinkAttemptRunning(ctx context.Context, q db.Querier, orgID, attemptID string) (bool, error) {
+	var running bool
+	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM billing_pending_unlinks
+		WHERE organization_id = $1 AND link_attempt_id = $2 AND link_call_deadline IS NOT NULL)`, orgID, attemptID).Scan(&running)
+	return running, err
 }
 
 // CompleteLinkAttemptTx removes the link attempt from tx, which must hold the
@@ -82,11 +106,14 @@ func (s *Statuses) AbandonLinkAttempt(ctx context.Context, q db.Querier, orgID, 
 // TakeOverLinkAttemptTx turns the link attempt of the organization into a
 // plain pending unlink in tx, which must hold the organization row lock. The
 // unlink is not sent before the call of the attempt has returned or timed
-// out, so it cannot overtake the call. It reports whether an attempt
-// existed. A completion of the old attempt finds no row with its ID and
-// records no link.
+// out, so it cannot overtake the call: the call deadline moves to
+// unlink_not_before, which every send of the row honours (the retry of the
+// lease holder and the synchronous link and unlink RPCs alike), and to
+// next_attempt_time. It reports whether an attempt existed. A completion of
+// the old attempt finds no row with its ID and records no link.
 func TakeOverLinkAttemptTx(ctx context.Context, tx pgx.Tx, orgID string, now time.Time) (bool, error) {
 	tag, err := tx.Exec(ctx, `UPDATE billing_pending_unlinks SET link_attempt_id = NULL, link_call_deadline = NULL, attempts = 0,
+		unlink_not_before = greatest($2::timestamptz, COALESCE(link_call_deadline, $2::timestamptz)),
 		next_attempt_time = greatest($2::timestamptz, COALESCE(link_call_deadline, $2::timestamptz))
 		WHERE organization_id = $1 AND link_attempt_id IS NOT NULL`, orgID, now)
 	if err != nil {

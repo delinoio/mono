@@ -205,6 +205,8 @@ func TestLoadSTUNURLs(t *testing.T) {
 		{"hostname default port", "stun:example.com", true},
 		{"bracketed IPv6", "stun:[::1]:3478", true},
 		{"list", "stun:a:3478, stun:[::1]:3478", true},
+		{"delimiter only", ",", false},
+		{"blank items only", " , ", false},
 		{"hostless", "stun:", false},
 		{"hostless after valid", "stun:a:3478, stun:", false},
 		{"hostless with port", "stun::3478", false},
@@ -230,6 +232,19 @@ func TestLoadSTUNURLs(t *testing.T) {
 				t.Fatalf("error = %q, want %q (no URL echo)", err, want)
 			}
 		})
+	}
+}
+
+func TestLoadSTUNURLsDefault(t *testing.T) {
+	cfg, err := Load(env(minimal()))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.STUNURLs) != 1 || cfg.STUNURLs[0] != DefaultSTUNURL {
+		t.Fatalf("STUNURLs = %v, want [%s]", cfg.STUNURLs, DefaultSTUNURL)
+	}
+	if DefaultSTUNURL != "stun:ownsand.api.delino.io:3478" {
+		t.Fatalf("DefaultSTUNURL = %q", DefaultSTUNURL)
 	}
 }
 

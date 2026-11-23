@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/delinoio/mono/go/uuidv7"
@@ -24,6 +25,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/ratelimit"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
@@ -210,6 +212,90 @@ func pendingInvitation(t *testing.T, env *testenv.Env, invitationID string) bool
 	return pending
 }
 
+// membershipInsertBlockedBy reports whether a membership insert of the
+// current database waits on a lock held by the backend with the given PID.
+// pg_stat_activity is cluster-wide, so the query also pins the database and
+// the blocking backend: a blocked insert of another test database on the same
+// server, or one blocked by another transaction, does not count.
+func membershipInsertBlockedBy(ctx context.Context, pool queryRower, blockerPID int32) (bool, error) {
+	var blocked bool
+	err := pool.QueryRow(ctx, `SELECT EXISTS (
+	SELECT 1 FROM pg_stat_activity
+	WHERE datname = current_database()
+	AND wait_event_type = 'Lock'
+	AND query LIKE 'INSERT INTO memberships%'
+	AND $1 = ANY(pg_blocking_pids(pid)))`, blockerPID).Scan(&blocked)
+	return blocked, err
+}
+
+// queryRower is the part of a pgx pool that membershipInsertBlockedBy needs.
+type queryRower interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// An unrelated membership insert that waits on a lock in another database of
+// the same server must not satisfy the race fixture's synchronization check.
+func TestMembershipInsertBlockedByIgnoresOtherDatabases(t *testing.T) {
+	env := testenv.New(t)
+	other := dbtest.New(t)
+	ctx := context.Background()
+	// A table whose name matches the fixture's query prefix stands in for an
+	// unrelated membership insert in the other database.
+	if _, err := other.Pool.Exec(ctx, "CREATE TABLE memberships_probe (id int PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	otherTx, err := other.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherTx.Rollback(ctx)
+	if _, err := otherTx.Exec(ctx, "INSERT INTO memberships_probe (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	waiter := make(chan error, 1)
+	go func() {
+		_, err := other.Pool.Exec(ctx, "INSERT INTO memberships_probe (id) VALUES (1)")
+		waiter <- err
+	}()
+	// The former cluster-wide predicate matches the unrelated waiter.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var legacy bool
+		if err := env.DB.Pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO memberships%')").Scan(&legacy); err != nil {
+			t.Fatal(err)
+		}
+		if legacy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the unrelated insert never blocked in the other database")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	tx, err := env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	var txPID int32
+	if err := tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&txPID); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := membershipInsertBlockedBy(ctx, env.DB.Pool, txPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked {
+		t.Fatal("an insert blocked in another database released the fixture")
+	}
+	if err := otherTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-waiter; err == nil || !strings.Contains(err.Error(), "23505") {
+		t.Fatalf("unrelated waiter after the commit: %v, want a unique violation", err)
+	}
+}
+
 // A concurrent acceptance by the same user, which loses the race on the
 // membership unique index, gets already_exists and leaves its invitation
 // unused and unaudited.
@@ -243,10 +329,16 @@ func TestInvitationsConcurrentAcceptByMember(t *testing.T) {
 		_, err := env.User("erin").Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{InvitationSecret: invB.Msg.GetInvitationSecret()}))
 		result <- err
 	}()
+	// Wait until the second acceptance itself waits on the lock that tx
+	// holds, so that no other waiter on the server can release the fixture.
+	var txPID int32
+	if err := tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&txPID); err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		var blocked bool
-		if err := env.DB.Pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO memberships%')").Scan(&blocked); err != nil {
+		blocked, err := membershipInsertBlockedBy(ctx, env.DB.Pool, txPID)
+		if err != nil {
 			t.Fatal(err)
 		}
 		if blocked {

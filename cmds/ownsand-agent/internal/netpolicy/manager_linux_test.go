@@ -893,6 +893,60 @@ func TestManagerRefreshInFlightDuringCleanupHost(t *testing.T) {
 	}
 }
 
+// Two concurrent refreshes run one after the other: the second does not
+// read the routes before the first finished, so the older route snapshot
+// cannot be applied after the newer one.
+func TestManagerRefreshSerializesRouteSnapshots(t *testing.T) {
+	m, _ := newFakeManager(t)
+	applied, _ := useRealRefresh(m)
+	first := []netip.Prefix{netip.MustParsePrefix("10.1.0.0/16")}
+	second := []netip.Prefix{netip.MustParsePrefix("10.2.0.0/16")}
+	var reads atomic.Int32
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondEntered := make(chan struct{})
+	m.hostRoutes = func() ([]Route, []netip.Prefix, error) {
+		switch reads.Add(1) {
+		case 1:
+			close(firstEntered)
+			<-releaseFirst
+			return nil, first, nil
+		default:
+			close(secondEntered)
+			return nil, second, nil
+		}
+	}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- m.Refresh() }()
+	waitFor(t, firstEntered, "the first route read")
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- m.Refresh() }()
+	select {
+	case <-secondEntered:
+		t.Fatal("the second refresh read the routes while the first was in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Refresh: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second Refresh: %v", err)
+	}
+	v4, v6 := Blocked(nil, second)
+	want := Ruleset(v4, v6, nil)
+	m.mu.Lock()
+	got := m.rules
+	m.mu.Unlock()
+	if got != want {
+		t.Fatalf("cached rules are not the ruleset of the second route snapshot:\n%s", got)
+	}
+	scripts := applied()
+	if len(scripts) != 2 || scripts[len(scripts)-1] != want {
+		t.Fatalf("applied %d scripts, the last one is not the second snapshot", len(scripts))
+	}
+}
+
 // Every tap and the table are deleted, and the clean-up reports no error.
 func TestCleanupHostDeletesEverything(t *testing.T) {
 	f := &fakeCleanupHost{taps: []string{"osb-00000000001", "osb-00000000002"}}
