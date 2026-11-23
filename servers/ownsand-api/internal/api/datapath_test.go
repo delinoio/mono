@@ -1450,6 +1450,7 @@ func TestRelayRotationWithQueuedFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	classABefore := usageOf(t, env, org.ID)[meterClassA]
 	es, err := env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(context.Background(), connect.NewRequest(req))
 	if err != nil {
 		t.Fatal(err)
@@ -1458,6 +1459,10 @@ func TestRelayRotationWithQueuedFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rotation with queued frames: %v", err)
 	}
+	// A rotation ends with OK, so the call meter counts the stream once. The
+	// handler records the usage just after the client read the end of the
+	// stream.
+	testenv.Eventually(t, "rotated stream counted once", func() bool { return usageOf(t, env, org.ID)[meterClassA] == classABefore+1 })
 	// The events are the accepted notice and the output before the deadline.
 	if len(events) != 2 || events[0].GetAccepted() == nil || string(events[1].GetStdout().GetData()) != "before" {
 		t.Fatalf("events = %v, want only the events before the deadline", events)
