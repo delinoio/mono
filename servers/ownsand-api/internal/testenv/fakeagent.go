@@ -86,6 +86,14 @@ func (e *Env) NewFakeAgent(d *Device) *FakeAgent {
 // and a full state report, and waits until the server applied it.
 func (a *FakeAgent) Connect() {
 	a.T.Helper()
+	a.OpenChannel()
+	a.Eventually("device online", func() bool { return a.Env.App.Service.Hub.Live(a.Device.ID) != nil })
+}
+
+// OpenChannel does what Connect does, but does not wait until the server
+// applied the state report, for a test where the report is expected to fail.
+func (a *FakeAgent) OpenChannel() {
+	a.T.Helper()
 	if err := a.Env.App.Lease.Wait(context.Background()); err != nil {
 		a.T.Fatal(err)
 	}
@@ -99,7 +107,6 @@ func (a *FakeAgent) Connect() {
 		HostOs: a.HostOS, Arch: a.Arch, AgentVersion: a.AgentVersion, Capabilities: a.Capabilities,
 	}}})
 	a.SendStateReport()
-	a.Eventually("device online", func() bool { return a.Env.App.Service.Hub.Live(a.Device.ID) != nil })
 }
 
 // Close closes the channel.
