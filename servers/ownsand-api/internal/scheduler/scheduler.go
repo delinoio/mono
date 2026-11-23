@@ -27,6 +27,11 @@ const MaxMacOSGuests = 2
 // new sandboxes, so that a busy device can drain and install an update.
 const MaxPendingIdle = 24 * time.Hour
 
+// CheckOutboundNetwork is the check_id of the hypervisor check that an agent
+// reports for OUTBOUND networking. The agent runtimes report the same id
+// (see cmds/ownsand-agent/internal/vmruntime); keep them in step.
+const CheckOutboundNetwork = "outbound-network"
+
 // Snapshot describes a snapshot or template source.
 type Snapshot struct {
 	ID string
@@ -167,6 +172,9 @@ func Evaluate(req Request, d Device, now time.Time) (Outcome, string) {
 			!slices.ContainsFunc(caps.GetMacosHardwareModels(), func(m []byte) bool { return bytes.Equal(m, s.MacOSHardwareModel) }) {
 			return Permanent, "the device does not support the snapshot's macOS hardware model"
 		}
+		if req.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND && outboundNetworkFailed(caps) {
+			return Permanent, "the device cannot provide outbound networking"
+		}
 	}
 
 	// Transient rules.
@@ -229,6 +237,14 @@ func EffectiveMemoryMiB(hostOS ownsandv1.HostOs, requested int64) int64 {
 		return requested + 1
 	}
 	return requested
+}
+
+// outboundNetworkFailed reports whether the device explicitly reports a
+// failed outbound network check. A report without the check does not fail.
+func outboundNetworkFailed(caps *ownsandv1.DeviceCapabilities) bool {
+	return slices.ContainsFunc(caps.GetHypervisorChecks(), func(c *ownsandv1.HypervisorCheck) bool {
+		return c.GetCheckId() == CheckOutboundNetwork && !c.GetPassed()
+	})
 }
 
 func holds(s *Snapshot, deviceID string) bool {

@@ -337,3 +337,62 @@ func TestHyperVMemoryRounding(t *testing.T) {
 		t.Fatalf("even request at the limit: %v", err)
 	}
 }
+
+// outboundNetworkDevice reports the outbound-network check as passed or
+// failed.
+func outboundNetworkDevice(id string, passed bool) Device {
+	d := linuxDevice(id)
+	d.Capabilities.HypervisorChecks = []*ownsandv1.HypervisorCheck{
+		{CheckId: "linux-base-image", Passed: true},
+		{CheckId: CheckOutboundNetwork, Passed: passed, Detail: "OUTBOUND sandboxes need CAP_NET_ADMIN, ip and nft"},
+	}
+	return d
+}
+
+// TestOutboundNetworkCheck checks that a device that reports a failed
+// outbound-network check never gets an OUTBOUND sandbox, whatever its load.
+func TestOutboundNetworkCheck(t *testing.T) {
+	failed, passed := outboundNetworkDevice("a-failed", false), outboundNetworkDevice("b-passed", true)
+	// The failed device has the lower load and the lower ID, and still loses.
+	passed.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: 2}
+	dec, err := Place(linuxRequest(), []Device{failed, passed}, now)
+	if err != nil || dec.DeviceID != "b-passed" {
+		t.Fatalf("auto placement = %+v, %v", dec, err)
+	}
+
+	// A lone failed device and a pinned failed device are permanent mismatches.
+	if _, err := Place(linuxRequest(), []Device{failed}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("lone failed device: %v", err)
+	}
+	pinned := linuxRequest()
+	pinned.DeviceID = "a-failed"
+	if _, err := Place(pinned, []Device{failed, passed}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("pinned failed device: %v", err)
+	}
+	// The permanent rule decides the code even when a transient condition
+	// also holds.
+	offline := outboundNetworkDevice("offline", false)
+	offline.Online = false
+	if _, err := Place(linuxRequest(), []Device{offline}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("offline failed device: %v", err)
+	}
+
+	// NONE requests do not need the check.
+	none := linuxRequest()
+	none.NetworkMode = ownsandv1.NetworkMode_NETWORK_MODE_NONE
+	dec, err = Place(none, []Device{failed, passed}, now)
+	if err != nil || dec.DeviceID != "a-failed" {
+		t.Fatalf("NONE request = %+v, %v", dec, err)
+	}
+
+	// A report without the check, and an empty report, stay eligible.
+	omitted := linuxDevice("omitted")
+	if _, err := Place(linuxRequest(), []Device{omitted}, now); err != nil {
+		t.Fatalf("report without the check: %v", err)
+	}
+	other := linuxDevice("other")
+	other.Capabilities.HypervisorChecks = []*ownsandv1.HypervisorCheck{{CheckId: "linux-base-image", Passed: false}}
+	if _, err := Place(linuxRequest(), []Device{other}, now); err != nil {
+		t.Fatalf("another failed check: %v", err)
+	}
+}
