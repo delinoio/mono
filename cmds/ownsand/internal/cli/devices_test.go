@@ -63,9 +63,11 @@ func TestDeviceRowsAllocatedVCPU(t *testing.T) {
 			alloc: &ownsandv1.DeviceAllocation{VcpuCount: 3, VcpuTotalCount: total(3)},
 			want:  "3/0 vCPU",
 		},
+		// The legacy count is non-zero so that treating a present zero total as
+		// absent falls back to it and fails this case.
 		{
 			name:  "present zero total",
-			alloc: &ownsandv1.DeviceAllocation{VcpuTotalCount: total(0)},
+			alloc: &ownsandv1.DeviceAllocation{VcpuCount: 7, VcpuTotalCount: total(0)},
 			want:  "0/0 vCPU",
 		},
 		{
