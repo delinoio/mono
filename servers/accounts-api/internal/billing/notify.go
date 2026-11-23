@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -161,6 +162,23 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 			return err
 		})
 	}
+	if stale, err := s.staleTopUpFailure(ctx, n); err != nil {
+		return s.interruptedOr(ctx, n, err)
+	} else if stale {
+		return s.settle(ctx, func(ctx context.Context) error {
+			if _, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET abandon_time = $2 WHERE notification_id = $1`,
+				n.ID, s.timestamp()); err != nil {
+				return err
+			}
+			s.logger.InfoContext(ctx, "billing_notification_suppressed",
+				slog.String("billing_account_id", n.BillingAccountID),
+				slog.String("kind", string(n.Kind)),
+				slog.String("notification_id", n.ID),
+				slog.String("top_up_id", topUpNotificationID(n)),
+				slog.String("reason", "top_up_completed"))
+			return nil
+		})
+	}
 	rows, err := s.db.Pool.Query(ctx, `SELECT m.user_id FROM billing_account_members m
 		WHERE m.billing_account_id = $1 AND m.role IN ('owner', 'admin')
 			AND NOT EXISTS (SELECT 1 FROM billing_notification_deliveries d
@@ -241,6 +259,48 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 	return s.settle(ctx, func(ctx context.Context) error {
 		return s.finish(ctx, n, failed, failedRecipients)
 	})
+}
+
+// topUpNotificationPrefix is the deduplication key prefix of a top-up failure
+// notification; the top-up ID follows it.
+const topUpNotificationPrefix = "payment_failed/top_up/"
+
+// topUpNotificationID returns the ID of the top-up that a payment-failed
+// top-up notification reports, or "" for any other notification. A
+// notification queued before the details carried the ID has it only in its
+// deduplication key.
+//
+// Workaround scope: the deduplication key fallback exists for rows that are
+// already queued. Remove it once no queued row without notifyDetailTopUpID
+// can exist (all such rows are sent or abandoned after a release that writes
+// the detail).
+func topUpNotificationID(n notification) string {
+	if n.Kind != NotifyPaymentFailed || n.Details[notifyDetailPaymentScope] != notifyScopeTopUp {
+		return ""
+	}
+	if id := n.Details[notifyDetailTopUpID]; id != "" {
+		return id
+	}
+	return strings.TrimPrefix(n.DedupKey, topUpNotificationPrefix)
+}
+
+// staleTopUpFailure reports whether n is a payment-failed notification of a
+// top-up that completed after the failure was queued, which a late verified
+// webhook can do. Such a notice would tell the owners that no credit was
+// added when it was. The read does not lock the top-up, so a completion that
+// commits after this read but before the send still lets the email go out;
+// closing that window would need the send inside the top-up transaction.
+func (s *Service) staleTopUpFailure(ctx context.Context, n notification) (bool, error) {
+	id := topUpNotificationID(n)
+	if id == "" {
+		return false, nil
+	}
+	var completed bool
+	err := s.db.Pool.QueryRow(ctx, `SELECT status = 'completed' FROM top_ups WHERE top_up_id::text = $1`, id).Scan(&completed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return completed, err
 }
 
 // interruptedOr defers n when err is the effect of a pass context that ended,

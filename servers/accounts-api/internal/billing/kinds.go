@@ -146,6 +146,7 @@ const (
 	NotifyOrganizationBlocked    NotificationKind = "organization_blocked"
 	NotifyOrganizationSuspended  NotificationKind = "organization_suspended"
 	notifyDetailTopUpKind                         = "top_up_kind"
+	notifyDetailTopUpID                           = "top_up_id"
 	notifyDetailAmount                            = "amount_usd_micros"
 	notifyDetailReason                            = "reason"
 	notifyDetailThreshold                         = "threshold_usd_micros"
