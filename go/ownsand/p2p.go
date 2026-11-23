@@ -500,8 +500,15 @@ func (s *p2pSession) openStream(ctx context.Context, payload proto.Message) (*p2
 }
 
 // recv returns the next frame of the stream, or the stream's failure or the
-// session's end error after the queued frames.
+// session's end error after the queued frames. A caller whose context is done
+// receives the context error and no frame, even when frames are queued: a
+// canceled caller must not run further callbacks or writes for them. Only the
+// context ends the receive early; a stream failure or session end still
+// delivers the frames that were queued before it to a caller that is active.
 func (st *p2pStream) recv(ctx context.Context) (*ownsandv1.DataFrame, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	select {
 	case f := <-st.ch:
 		return f, nil
