@@ -786,7 +786,7 @@ func TestBillingRPCs(t *testing.T) {
 			t.Fatalf("unlink = %v", b)
 		}
 	}
-	if fake.Calls(accountstest.MethodUnlinkOrganization) != 2 { // one failed, one accepted; the repeated unlink sends nothing
+	if fake.Calls(accountstest.MethodUnlinkOrganization) != 3 { // one failed, one accepted; the repeated unlink confirms with delino-accounts again
 		t.Fatalf("UnlinkOrganization calls = %d", fake.Calls(accountstest.MethodUnlinkOrganization))
 	}
 }
@@ -1023,7 +1023,8 @@ func TestBillingLinkLostResponseThenRejectedRetry(t *testing.T) {
 
 // TestBillingUnlinkRemovesUnconfirmedLink checks that an explicit unlink
 // removes the remote link of an attempt that has no cached account ID, and
-// stays idempotent without a record.
+// stays idempotent: a repeated unlink confirms with delino-accounts again,
+// even though no record is left.
 func TestBillingUnlinkRemovesUnconfirmedLink(t *testing.T) {
 	f := newLinkAttemptFixture(t, "lena")
 	f.loseLinkResponse(t)
@@ -1037,13 +1038,15 @@ func TestBillingUnlinkRemovesUnconfirmedLink(t *testing.T) {
 	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != before+1 {
 		t.Fatalf("UnlinkOrganization calls = %d, want %d", n, before+1)
 	}
-	// A second unlink has nothing to remove and sends nothing.
+	// A second unlink has no record to work off, but still confirms with
+	// delino-accounts.
 	if err := f.unlink(f.org.OwnerClient); err != nil {
 		t.Fatal(err)
 	}
-	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != before+1 {
-		t.Fatalf("UnlinkOrganization calls after a repeated unlink = %d, want %d", n, before+1)
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != before+2 {
+		t.Fatalf("UnlinkOrganization calls after a repeated unlink = %d, want %d", n, before+2)
 	}
+	f.wantRows(t, 0, 0)
 	// While delino-accounts is down, the unlink fails and the record stays.
 	f2 := newLinkAttemptFixture(t, "lena2")
 	f2.loseLinkResponse(t)
@@ -1240,4 +1243,141 @@ func TestBillingLinkStaleCompletionDoesNothing(t *testing.T) {
 	if account, _, ok := f.fake.Link(f.org.ID); !ok || account != billingAccountB {
 		t.Fatalf("remote link after the new owner's link = %q, %v", account, ok)
 	}
+}
+
+// linkUpstreamOnly links the organization to billingAccountA on
+// delino-accounts without any local trace: no cached link and no record, as a
+// link that an earlier release lost.
+func (f *linkAttemptFixture) linkUpstreamOnly(t *testing.T) {
+	t.Helper()
+	if _, err := f.fake.Client().LinkOrganization(context.Background(), connect.NewRequest(&accountsv1.LinkOrganizationRequest{
+		Service: billing.ServiceID, OrganizationId: f.org.ID, BillingAccountId: billingAccountA, UserId: f.org.Owner, OrganizationName: "untraced"})); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, true)
+	f.wantLocalLink(t, false)
+	f.wantRows(t, 0, 0)
+}
+
+// TestBillingUnlinkRemovesUntracedLink checks that an owner's unlink removes
+// a link that delino-accounts holds although OwnSand has neither a cached
+// link nor a record, fails while delino-accounts cannot confirm, is
+// repeatable, lets the owner link another billing account afterwards, and
+// that a caller without the owner role triggers no upstream unlink.
+func TestBillingUnlinkRemovesUntracedLink(t *testing.T) {
+	f := newLinkAttemptFixture(t, "ruth")
+	f.fake.AddAccount(billingAccountB, "Second of ruth", map[string]accountsv1.BillingAccountRole{f.org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	f.linkUpstreamOnly(t)
+	calls := f.fake.Calls(accountstest.MethodUnlinkOrganization)
+
+	// A caller without the owner role sends nothing upstream.
+	if err := f.unlink(f.env.User(f.org.Admin)); testenv.Code(err) != connect.CodePermissionDenied {
+		t.Fatalf("unlink by an admin: %v", err)
+	}
+	if err := f.unlink(f.env.User(f.org.Member)); testenv.Code(err) != connect.CodePermissionDenied {
+		t.Fatalf("unlink by a member: %v", err)
+	}
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != calls {
+		t.Fatalf("UnlinkOrganization calls after unauthorized unlinks = %d, want %d", n, calls)
+	}
+	f.wantRemoteLink(t, true)
+
+	// While delino-accounts cannot confirm, the RPC fails and nothing stays
+	// recorded locally.
+	f.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	if err := f.unlink(f.org.OwnerClient); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("unlink while delino-accounts is down: %v", err)
+	}
+	f.wantRemoteLink(t, true)
+	f.wantRows(t, 0, 0)
+	f.fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+
+	// The unlink removes the untraced link, and repeating it succeeds.
+	for range 2 {
+		if err := f.unlink(f.org.OwnerClient); err != nil {
+			t.Fatal(err)
+		}
+		f.wantRemoteLink(t, false)
+		f.wantRows(t, 0, 0)
+	}
+	if err := f.link(f.org.OwnerClient, billingAccountB); err != nil {
+		t.Fatalf("link another billing account after the unlink: %v", err)
+	}
+	f.wantRemoteLink(t, true)
+	f.wantLocalLink(t, true)
+}
+
+// TestBillingTransferAndDeletionRemoveUntracedLink checks that an ownership
+// transfer and an organization deletion record a durable pending unlink by
+// organization ID when the former billing account is unknown, that the
+// pending unlink survives a failure and a restart and drains before the new
+// owner's link, and that a retry that runs after the new owner linked
+// removes nothing of the new link.
+func TestBillingTransferAndDeletionRemoveUntracedLink(t *testing.T) {
+	ctx := context.Background()
+	// Transfer: the unlink works at once.
+	f := newLinkAttemptFixture(t, "sara")
+	f.linkUpstreamOnly(t)
+	if _, err := f.org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: f.org.ID, UserId: f.org.Admin})); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, false)
+	f.wantRows(t, 0, 0)
+
+	// Transfer while delino-accounts is down: the row has no billing account,
+	// survives a restart and blocks the new owner's link until it is sent.
+	g := newLinkAttemptFixture(t, "tara")
+	g.fake.AddAccount(billingAccountB, "New owner", map[string]accountsv1.BillingAccountRole{g.org.Admin: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	g.linkUpstreamOnly(t)
+	g.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	if _, err := g.org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: g.org.ID, UserId: g.org.Admin})); err != nil {
+		t.Fatal(err)
+	}
+	g.wantRemoteLink(t, true)
+	g.wantRows(t, 0, 1)
+	var account *string
+	if err := g.env.DB.Pool.QueryRow(ctx, "SELECT billing_account_id::text FROM billing_pending_unlinks WHERE organization_id = $1", g.org.ID).Scan(&account); err != nil || account != nil {
+		t.Fatalf("billing_account_id of the pending unlink = %v, %v; want NULL", account, err)
+	}
+	newOwner := g.env.User(g.org.Admin)
+	linkB := connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: g.org.ID, BillingAccountId: billingAccountB})
+	if _, err := newOwner.Billing.LinkBillingAccount(ctx, linkB); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("link with a pending unlink while delino-accounts is down: %v", err)
+	}
+	g.fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+	g.env.Clock.Advance(time.Hour)
+	if err := g.restart().RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	g.wantRemoteLink(t, false)
+	g.wantRows(t, 0, 0)
+	if _, err := newOwner.Billing.LinkBillingAccount(ctx, linkB); err != nil {
+		t.Fatalf("new owner link: %v", err)
+	}
+	// A retry pass after the new link has no row left and removes nothing.
+	g.env.Clock.Advance(time.Hour)
+	if err := g.restart().RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if account, _, ok := g.fake.Link(g.org.ID); !ok || account != billingAccountB {
+		t.Fatalf("the new owner's link after a retry pass = %q, %v", account, ok)
+	}
+
+	// Deletion while delino-accounts is down: the row outlives the
+	// organization and the lease holder removes the untraced link.
+	h := newLinkAttemptFixture(t, "ursa")
+	h.linkUpstreamOnly(t)
+	h.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	if _, err := h.org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: h.org.ID})); err != nil {
+		t.Fatal(err)
+	}
+	h.wantRemoteLink(t, true)
+	h.wantRows(t, 0, 1)
+	h.fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+	h.env.Clock.Advance(time.Hour)
+	if err := h.restart().RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.wantRemoteLink(t, false)
+	h.wantRows(t, 0, 0)
 }

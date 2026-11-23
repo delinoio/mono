@@ -362,6 +362,28 @@ func (s *Statuses) UnlinkPending(ctx context.Context, orgID string) error {
 	})
 }
 
+// ConfirmUnlinkedTx makes sure that delino-accounts has no link for the
+// organization when the organization has no local link: it sends the pending
+// unlink of the organization, or, when there is none, an UnlinkOrganization
+// call that is idempotent on delino-accounts. A cached link or a link
+// attempt record is not a precondition, because delino-accounts can hold a
+// link that left no local trace. It records a pending unlink without a
+// billing account first and lets UnlinkPendingTx send and delete it, so it
+// has the errors, the locking rules and the ordering of UnlinkPendingTx
+// (ErrLinkInProgress while a link attempt can still be running). tx must
+// hold the organization row lock. When it returns an error, the caller rolls
+// tx back, which removes the row that it recorded.
+func (s *Statuses) ConfirmUnlinkedTx(ctx context.Context, tx pgx.Tx, orgID string, now time.Time) error {
+	if s.client == nil {
+		return ErrReportingDisabled
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO billing_pending_unlinks (organization_id, create_time, attempts, next_attempt_time)
+		VALUES ($1, $2, 0, $2) ON CONFLICT (organization_id) DO NOTHING`, orgID, now); err != nil {
+		return err
+	}
+	return s.UnlinkPendingTx(ctx, tx, orgID, now)
+}
+
 // ErrUnlinkFailed marks a failed UnlinkOrganization call whose retry is
 // recorded.
 var ErrUnlinkFailed = errors.New("billing: UnlinkOrganization failed")
@@ -377,7 +399,7 @@ func (s *Statuses) UnlinkPendingTx(ctx context.Context, tx pgx.Tx, orgID string,
 	var account string
 	var attempts int
 	var running *time.Time
-	err := tx.QueryRow(ctx, "SELECT billing_account_id::text, attempts, link_call_deadline FROM billing_pending_unlinks WHERE organization_id = $1 FOR UPDATE", orgID).Scan(&account, &attempts, &running)
+	err := tx.QueryRow(ctx, "SELECT COALESCE(billing_account_id::text, ''), attempts, link_call_deadline FROM billing_pending_unlinks WHERE organization_id = $1 FOR UPDATE", orgID).Scan(&account, &attempts, &running)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}

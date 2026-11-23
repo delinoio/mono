@@ -397,12 +397,18 @@ func UnlinkTx(ctx context.Context, tx pgx.Tx, orgID, source string, now time.Tim
 }
 
 // AddPendingUnlinkTx records that UnlinkOrganization must still be sent for
-// the organization, whose link to billingAccountID was removed locally. A
-// link attempt row of the organization becomes a plain pending unlink whose
-// first send waits for the call of the attempt.
+// the organization, whose link to billingAccountID was removed locally. An
+// empty billingAccountID records a pending unlink for an organization whose
+// former billing account is unknown (the column is NULL): delino-accounts
+// can still hold a link that left no local trace, and UnlinkOrganization
+// needs only the organization ID. A link attempt row of the organization
+// becomes a plain pending unlink whose first send waits for the call of the
+// attempt. An existing account of the row is kept when billingAccountID is
+// empty.
 func AddPendingUnlinkTx(ctx context.Context, tx pgx.Tx, orgID, billingAccountID string, now time.Time) error {
 	_, err := tx.Exec(ctx, `INSERT INTO billing_pending_unlinks (organization_id, billing_account_id, create_time, attempts, next_attempt_time)
-		VALUES ($1, $2, $3, 0, $3) ON CONFLICT (organization_id) DO UPDATE SET billing_account_id = excluded.billing_account_id,
+		VALUES ($1, NULLIF($2, '')::uuid, $3, 0, $3) ON CONFLICT (organization_id) DO UPDATE SET
+		billing_account_id = COALESCE(excluded.billing_account_id, billing_pending_unlinks.billing_account_id),
 		create_time = excluded.create_time, attempts = 0,
 		next_attempt_time = greatest(excluded.next_attempt_time, COALESCE(billing_pending_unlinks.link_call_deadline, excluded.next_attempt_time)),
 		link_attempt_id = NULL, link_call_deadline = NULL`, orgID, billingAccountID, now)
