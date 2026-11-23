@@ -622,16 +622,21 @@ func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
 		OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: authID}
 	receivedCh := make(chan *ownsandv1.RelayGrant, 1)
 	agent.SetOnGrant(func(g *ownsandv1.RelayGrant) *ownsandv1.RelayGrantAck { receivedCh <- g; return nil })
+	// The cleanup cancels the call when the test fails before it returns.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := org.OwnerClient.DataPath.AuthorizeRelay(context.Background(), connect.NewRequest(areq))
+		_, err := org.OwnerClient.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
 		errCh <- err
 	}()
-	received := <-receivedCh
+	received, err := awaitRelayGrant(receivedCh, errCh, time.After(10*time.Second))
+	if err != nil {
+		t.Fatalf("waiting for the relay grant: %v", err)
+	}
 	// The channel closes while the caller waits, well before the
 	// acknowledgement timeout, so the removal of the pending grant ends the wait.
 	agent.Close()
-	var err error
 	select {
 	case err = <-errCh:
 	case <-time.After(10 * time.Second):
