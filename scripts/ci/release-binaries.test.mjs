@@ -220,8 +220,8 @@ esac
 `,
 };
 
-function fixture(t) {
-  const dir = mkdtempSync(join(tmpdir(), "release-binaries-"));
+function fixture(t, parent = tmpdir()) {
+  const dir = mkdtempSync(join(parent, "release-binaries-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const bin = join(dir, "bin");
   for (const [name, content] of Object.entries(stubs)) {
@@ -512,88 +512,136 @@ function darwinBuilds(f) {
   return input;
 }
 
-test(
-  "sign-macos signs with the hardened runtime and notarizes every darwin executable",
-  { skip },
-  (t) => {
-    const f = fixture(t);
-    const input = darwinBuilds(f);
-    const out = join(f.dir, "signed");
-    const result = f.run(["sign-macos", input, out], appleEnv);
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(
-      readFileSync(
+// Escapes `value` for a literal match inside a RegExp.
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+}
+
+// The scenario runs in the system temporary directory and in a directory whose
+// name contains spaces, because the signing paths come from RUNNER_TEMP and the
+// output directory, and each must stay one argument of the signing tools.
+for (const [label, spaced] of [
+  ["", false],
+  [" in a temporary directory with spaces", true],
+]) {
+  test(
+    `sign-macos signs with the hardened runtime and notarizes every darwin executable${label}`,
+    { skip },
+    (t) => {
+      let parent = tmpdir();
+      if (spaced) {
+        const base = mkdtempSync(join(tmpdir(), "release-binaries-parent-"));
+        t.after(() => rmSync(base, { recursive: true, force: true }));
+        parent = join(base, "temp with spaces");
+        mkdirSync(parent);
+      }
+      const f = fixture(t, parent);
+      // The plain scenario inherits TMPDIR, which may itself contain spaces.
+      if (spaced) assert.ok(f.dir.includes(" "));
+      const input = darwinBuilds(f);
+      const out = join(f.dir, "signed");
+      const work = join(f.runnerTemp, "macos-signing");
+      const keychain = escapeRegExp(join(work, "release.keychain-db"));
+      const agentTarget = escapeRegExp(
         join(out, "ownsand-agent/ownsand-agent-darwin-arm64"),
-        "utf8",
-      ),
-      "agent\n",
-    );
-    assert.match(
-      result.log,
-      new RegExp(
-        `codesign --force --sign Developer ID Application: Delino \\(TEAM123\\) --keychain \\S+ --options runtime --timestamp --identifier io\\.delino\\.ownsand-agent --entitlements ${root.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}/?cmds/ownsand-agent/entitlements\\.plist`,
-      ),
-    );
-    // The CLI has no entitlements.
-    assert.match(
-      result.log,
-      /codesign --force .* --identifier io\.delino\.ownsand \S+\/ownsand-darwin-amd64$/m,
-    );
-    assert.match(
-      result.log,
-      /xcrun notarytool submit \S+ownsand-agent-darwin-arm64\.zip --key \S+ --key-id KEYID --issuer issuer --wait --timeout 45m --output-format json/,
-    );
-    assert.match(
-      result.log,
-      /codesign -vvvv -R=notarized --check-notarization \S+\/ownsand-agent-darwin-arm64$/m,
-    );
-    assert.match(
-      result.log,
-      /codesign -vvvv -R=notarized --check-notarization \S+\/ownsand-darwin-amd64$/m,
-    );
-    assert.doesNotMatch(result.log, /spctl/);
-    // The password and the key are never command-line arguments of a tool
-    // other than `security import`, and the keychain is deleted.
-    assert.doesNotMatch(
-      result.log.replace(/security import .*\n/, ""),
-      /p12-password/,
-    );
-    assert.match(result.log, /security delete-keychain/);
-    // The job keychain goes first in the search list, before signing, with
-    // each existing entry as its own argument, and the saved list comes back
-    // before the keychain is deleted.
-    const lines = result.log.split("\n");
-    const added = lines.findIndex((l) =>
-      /^security list-keychains -d user -s \S+\/macos-signing\/release\.keychain-db \/Users\/runner\/Library\/Keychains\/login\.keychain-db \/Users\/runner\/Library\/Keychains\/other keychain\.keychain-db$/.test(
-        l,
-      ),
-    );
-    const firstSign = lines.findIndex((l) => l.startsWith("codesign --force"));
-    const restored = lines.findIndex(
-      (l) =>
-        l ===
-        "security-args [list-keychains] [-d] [user] [-s] [/Users/runner/Library/Keychains/login.keychain-db] [/Users/runner/Library/Keychains/other keychain.keychain-db]",
-    );
-    assert.ok(
-      lines.some((l) =>
-        /^security-args \[list-keychains\] \[-d\] \[user\] \[-s\] \[\S+\/release\.keychain-db\] \[\/Users\/runner\/Library\/Keychains\/login\.keychain-db\] \[\/Users\/runner\/Library\/Keychains\/other keychain\.keychain-db\]$/.test(
-          l,
+      );
+      const cliTarget = escapeRegExp(
+        join(out, "ownsand-cli/ownsand-darwin-amd64"),
+      );
+      const result = f.run(["sign-macos", input, out], appleEnv);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(
+        readFileSync(
+          join(out, "ownsand-agent/ownsand-agent-darwin-arm64"),
+          "utf8",
         ),
-      ),
-      "each search list entry is its own argument",
-    );
-    const deleted = lines.findIndex((l) =>
-      l.startsWith("security delete-keychain"),
-    );
-    assert.ok(added >= 0 && added < firstSign, "keychain added before signing");
-    assert.ok(
-      restored > firstSign && restored < deleted,
-      "list restored before deletion",
-    );
-    assert.equal(existsSync(join(f.runnerTemp, "macos-signing")), false);
-    assert.match(result.summary, /notarization `submission-1` Accepted/);
-  },
-);
+        "agent\n",
+      );
+      assert.match(
+        result.log,
+        new RegExp(
+          `^codesign --force --sign Developer ID Application: Delino \\(TEAM123\\) --keychain ${keychain} --options runtime --timestamp --identifier io\\.delino\\.ownsand-agent --entitlements ${escapeRegExp(root)}/?cmds/ownsand-agent/entitlements\\.plist ${agentTarget}$`,
+          "m",
+        ),
+      );
+      // The CLI has no entitlements.
+      assert.match(
+        result.log,
+        new RegExp(
+          `^codesign --force --sign Developer ID Application: Delino \\(TEAM123\\) --keychain ${keychain} --options runtime --timestamp --identifier io\\.delino\\.ownsand ${cliTarget}$`,
+          "m",
+        ),
+      );
+      assert.match(
+        result.log,
+        new RegExp(
+          `^xcrun notarytool submit ${escapeRegExp(join(work, "ownsand-agent-darwin-arm64.zip"))} --key ${escapeRegExp(join(work, "notary-key.p8"))} --key-id KEYID --issuer issuer --wait --timeout 45m --output-format json$`,
+          "m",
+        ),
+      );
+      assert.match(
+        result.log,
+        new RegExp(
+          `^codesign -vvvv -R=notarized --check-notarization ${agentTarget}$`,
+          "m",
+        ),
+      );
+      assert.match(
+        result.log,
+        new RegExp(
+          `^codesign -vvvv -R=notarized --check-notarization ${cliTarget}$`,
+          "m",
+        ),
+      );
+      assert.doesNotMatch(result.log, /spctl/);
+      // The password and the key are never command-line arguments of a tool
+      // other than `security import`, and the keychain is deleted.
+      assert.doesNotMatch(
+        result.log.replace(/security import .*\n/, ""),
+        /p12-password/,
+      );
+      assert.match(result.log, /security delete-keychain/);
+      // The job keychain goes first in the search list, before signing, with
+      // each existing entry as its own argument, and the saved list comes back
+      // before the keychain is deleted.
+      const lines = result.log.split("\n");
+      const added = lines.findIndex((l) =>
+        new RegExp(
+          `^security list-keychains -d user -s ${keychain} /Users/runner/Library/Keychains/login\\.keychain-db /Users/runner/Library/Keychains/other keychain\\.keychain-db$`,
+        ).test(l),
+      );
+      const firstSign = lines.findIndex((l) =>
+        l.startsWith("codesign --force"),
+      );
+      const restored = lines.findIndex(
+        (l) =>
+          l ===
+          "security-args [list-keychains] [-d] [user] [-s] [/Users/runner/Library/Keychains/login.keychain-db] [/Users/runner/Library/Keychains/other keychain.keychain-db]",
+      );
+      assert.ok(
+        lines.some((l) =>
+          new RegExp(
+            `^security-args \\[list-keychains\\] \\[-d\\] \\[user\\] \\[-s\\] \\[${keychain}\\] \\[/Users/runner/Library/Keychains/login\\.keychain-db\\] \\[/Users/runner/Library/Keychains/other keychain\\.keychain-db\\]$`,
+          ).test(l),
+        ),
+        "each search list entry is its own argument",
+      );
+      const deleted = lines.findIndex((l) =>
+        l.startsWith("security delete-keychain"),
+      );
+      assert.ok(
+        added >= 0 && added < firstSign,
+        "keychain added before signing",
+      );
+      assert.ok(
+        restored > firstSign && restored < deleted,
+        "list restored before deletion",
+      );
+      assert.equal(existsSync(work), false);
+      assert.match(result.summary, /notarization `submission-1` Accepted/);
+    },
+  );
+}
 
 test(
   "sign-macos fails on a rejected notarization and prints the log",
