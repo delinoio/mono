@@ -47,7 +47,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "72285ffa8191b20a622aa7552461447e22e855ac1a01388a01e905e81a71b45c",
+        "AGENTS.md": "a922fadf2fcf39f64e38ee5d9d4f9ce4ee8214b548fd925038a3cb7d5f0cbaf9",
         "NOTICE": "695327eeb9dddf8e0a618a8e7d359d376f0393dfcfef1d55c38599f891267446",
         "README.md": "85915a43a6f0b4efe525e3cf6398dd866166da2025837c4460468a24a940da94",
         "SKILL.md": "e38e0eaa609316b10423a9a138ed95e35099accd3f735585295c8a8f165c28a3",
@@ -59,7 +59,7 @@
         "rules/patterns-explicit-variants.md": "8c19e596e61807549d01ce8c6954c6358199f97a8511c0c02c625ec0efda8c0e",
         "rules/react19-no-forwardref.md": "881830adb7534c4b2d70db426556646ad9837f5478f744f35641f635ada22227",
         "rules/state-context-interface.md": "09e73afbf9285fa416679cc864a287b9e8b821d0969272ab784295386d8c9bc3",
-        "rules/state-decouple-implementation.md": "9b79898a679f4675f0f73046477c11c3d73b7ea9ae41751759bdaf800a8d0056",
+        "rules/state-decouple-implementation.md": "f2b3c71a489552750818dddb64b85cb9bcda5189b3c37695a53c80ce708b20d5",
         "rules/state-lift-state.md": "74c54038a6c554c748fe31cec673b80861b5d920b7553cf78cdf10d18b4b759b"
       }
     },
