@@ -147,17 +147,25 @@ export function SignInFailureNotice() {
  * The Logto SDK keeps reporting the user as signed in after a failed token
  * refresh, so the signed-out view never shows. `onSignIn` replaces the
  * default `auth.signIn()` for a page that must prepare the redirect first.
+ * A `not_found` or `invalid_argument` error never offers a retry either: the
+ * same request fails the same way, so the button would be futile. `children`
+ * (for example a link out of the page) render after the buttons.
  */
 export function ErrorNotice({
   error,
   onRetry,
   onSignIn,
+  children,
 }: {
   error: unknown;
   onRetry?: () => void;
   onSignIn?: () => void | Promise<void>;
+  children?: ReactNode;
 }) {
   const billing = billingReasonOf(error) !== undefined;
+  const retryFutile =
+    error instanceof ConnectError &&
+    (error.code === Code.NotFound || error.code === Code.InvalidArgument);
   const unauthenticated =
     error instanceof ConnectError && error.code === Code.Unauthenticated;
   return (
@@ -167,11 +175,12 @@ export function ErrorNotice({
       </p>
       {unauthenticated ? (
         <SignInButton onSignIn={onSignIn} />
-      ) : onRetry && !billing ? (
+      ) : onRetry && !billing && !retryFutile ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
           Try again
         </Button>
       ) : null}
+      {children}
     </div>
   );
 }
