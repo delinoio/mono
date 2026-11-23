@@ -4,6 +4,7 @@ import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { useState } from "react";
 import { LIST_PAGE_SIZE } from "../../api.ts";
 import { useBillingAccount } from "../../components/shell.tsx";
+import { useCurrentUtcMonth } from "../../current-utc-month.ts";
 import {
   Empty,
   ErrorNotice,
@@ -20,7 +21,6 @@ import {
   meterLabel,
   serviceLabel,
   type UtcMonth,
-  utcMonthOf,
 } from "../../format.ts";
 import {
   CreditService,
@@ -46,7 +46,8 @@ function monthIndex(value: UtcMonth): number {
 
 function UsageSummary() {
   const { billingAccountId } = useBillingAccount();
-  const [now] = useState(() => utcMonthOf(new Date()));
+  // The upper limit of the picker follows the clock; the selected month does not.
+  const now = useCurrentUtcMonth();
   const [month, setMonth] = useState<UtcMonth>(now);
   const summary = useInfiniteQuery(
     BillingUsageService.method.listUsageSummary,
