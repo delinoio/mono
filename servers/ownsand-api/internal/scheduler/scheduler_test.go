@@ -177,7 +177,7 @@ func TestMacOSRules(t *testing.T) {
 
 func TestSnapshotPlacement(t *testing.T) {
 	snap := &Snapshot{ID: "s", DeviceID: "d2", HostOS: ownsandv1.HostOs_HOST_OS_LINUX, Arch: ownsandv1.Arch_ARCH_AMD64, GuestOS: ownsandv1.GuestOs_GUEST_OS_LINUX,
-		VCPUCount: 2, MemoryMiB: 1024, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, HasMemoryState: true}
+		VCPUCount: 2, MemoryMiB: 1024, DiskGiB: 10, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, HasMemoryState: true}
 	req := linuxRequest()
 	req.BaseImage = 0
 	req.Snapshot = snap
@@ -206,6 +206,72 @@ func TestSnapshotPlacement(t *testing.T) {
 	req.DeviceID = "d0"
 	if _, err := Place(req, []Device{arm}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
 		t.Fatalf("arch mismatch: %v", err)
+	}
+}
+
+// A memory-state restore needs the snapshot's disk size: a larger disk boots
+// cold, so it must not take the source-device priority.
+func TestSnapshotPlacementLargerDisk(t *testing.T) {
+	snap := &Snapshot{ID: "s", DeviceID: "d2", HostOS: ownsandv1.HostOs_HOST_OS_LINUX, Arch: ownsandv1.Arch_ARCH_AMD64, GuestOS: ownsandv1.GuestOs_GUEST_OS_LINUX,
+		VCPUCount: 2, MemoryMiB: 1024, DiskGiB: 10, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, HasMemoryState: true}
+	req := linuxRequest()
+	req.BaseImage = 0
+	req.Snapshot = snap
+	d1, d2 := linuxDevice("d1"), linuxDevice("d2")
+	d2.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: 2}
+	devices := []Device{d1, d2}
+
+	// Equal disk: the heavier source device keeps the memory restore.
+	snap.Exported = true
+	dec, err := Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d2" || !dec.MemoryRestore || dec.NeedsImport {
+		t.Fatalf("equal disk: %+v %v", dec, err)
+	}
+
+	// Larger disk, exported: the least loaded device runs it, with an import
+	// and without a memory restore.
+	req.DiskGiB = 20
+	dec, err = Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d1" || dec.MemoryRestore || !dec.NeedsImport {
+		t.Fatalf("larger disk, exported: %+v %v", dec, err)
+	}
+	// With a tie in share, the lowest ID wins and the source holds the copy.
+	d2.Allocation = nil
+	dec, err = Place(req, []Device{d1, d2}, now)
+	if err != nil || dec.DeviceID != "d1" || dec.MemoryRestore || !dec.NeedsImport {
+		t.Fatalf("larger disk, tie: %+v %v", dec, err)
+	}
+	d2.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: 2}
+	// A device that holds an imported copy needs no import.
+	snap.CopyDeviceIDs = []string{"d1"}
+	dec, err = Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d1" || dec.MemoryRestore || dec.NeedsImport {
+		t.Fatalf("larger disk, copy: %+v %v", dec, err)
+	}
+	snap.CopyDeviceIDs = nil
+
+	// Larger disk, not exported: only the source device, cold.
+	snap.Exported = false
+	dec, err = Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d2" || dec.MemoryRestore || dec.NeedsImport {
+		t.Fatalf("larger disk, not exported: %+v %v", dec, err)
+	}
+
+	// Explicit device selection keeps its rules.
+	snap.Exported = true
+	req.DeviceID = "d2"
+	dec, err = Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d2" || dec.MemoryRestore || dec.NeedsImport {
+		t.Fatalf("larger disk, explicit source device: %+v %v", dec, err)
+	}
+	req.DeviceID = "d1"
+	dec, err = Place(req, devices, now)
+	if err != nil || dec.DeviceID != "d1" || dec.MemoryRestore || !dec.NeedsImport {
+		t.Fatalf("larger disk, explicit other device: %+v %v", dec, err)
+	}
+	snap.Exported = false
+	if _, err := Place(req, devices, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("larger disk, explicit device without a copy: %v", err)
 	}
 }
 
