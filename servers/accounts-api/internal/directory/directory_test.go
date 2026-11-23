@@ -22,6 +22,11 @@ import (
 func TestLogtoUser(t *testing.T) {
 	var tokens, rejectFirst atomic.Int32
 	rejectFirst.Store(1)
+	// firstAuth and retryAuth record the Authorization header of the forced-401
+	// request and of the retry, so the test can prove the retry used the
+	// replacement token and not the rejected one.
+	var authMu sync.Mutex
+	var firstAuth, retryAuth string
 	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -40,10 +45,16 @@ func TestLogtoUser(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "tok" + string(rune('0'+n)), "expires_in": 3600})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/users/u1":
 			if rejectFirst.CompareAndSwap(1, 0) {
+				authMu.Lock()
+				firstAuth = r.Header.Get("Authorization")
+				authMu.Unlock()
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
-			if r.Header.Get("Authorization") != "Bearer tok2" && r.Header.Get("Authorization") != "Bearer tok1" {
+			authMu.Lock()
+			retryAuth = r.Header.Get("Authorization")
+			authMu.Unlock()
+			if retryAuth != "Bearer tok2" {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
@@ -72,6 +83,15 @@ func TestLogtoUser(t *testing.T) {
 	}
 	if tokens.Load() != 2 {
 		t.Fatalf("token requests = %d, want 2 (one renewal after 401)", tokens.Load())
+	}
+	authMu.Lock()
+	gotFirst, gotRetry := firstAuth, retryAuth
+	authMu.Unlock()
+	if gotFirst != "Bearer tok1" {
+		t.Fatalf("rejected request Authorization = %q, want %q", gotFirst, "Bearer tok1")
+	}
+	if gotRetry != "Bearer tok2" {
+		t.Fatalf("retry Authorization = %q, want the replacement token %q", gotRetry, "Bearer tok2")
 	}
 	user, err = l.User(ctx, "u2")
 	if err != nil || user != (directory.User{}) {
