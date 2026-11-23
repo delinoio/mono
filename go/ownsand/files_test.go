@@ -49,6 +49,47 @@ func TestReadFileBothTransports(t *testing.T) {
 	}
 }
 
+// TestReadFileFinalSizeMismatch checks that a read whose end event reports a
+// size that differs from the delivered bytes fails with a DataPathError and
+// does not retry, and that a matching size still succeeds.
+func TestReadFileFinalSizeMismatch(t *testing.T) {
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		t.Run(tr.String(), func(t *testing.T) {
+			cp := newFakeCP(t)
+			want := randomBytes(t, 20)
+			cp.agent.setFile("/f", want)
+			s := cp.handle(t, cp.client(t, tr))
+
+			cp.agent.setEndSizeDelta(3)
+			var out bytes.Buffer
+			_, err := s.ReadFile(context.Background(), "/f", &out)
+			var dp *DataPathError
+			if !errors.As(err, &dp) {
+				t.Fatalf("want a DataPathError, got %v", err)
+			}
+			wantMsg := fmt.Sprintf("file read ended at %d bytes but reported %d", len(want), len(want)+3)
+			if !strings.Contains(err.Error(), wantMsg) {
+				t.Fatalf("error %q does not contain %q", err, wantMsg)
+			}
+			if !bytes.Equal(out.Bytes(), want) {
+				t.Fatalf("delivered %d bytes, want %d", out.Len(), len(want))
+			}
+			if n := len(cp.agent.readRequests()); n != 1 {
+				t.Fatalf("%d read requests, want 1: a size mismatch must not retry", n)
+			}
+
+			cp.agent.setEndSizeDelta(0)
+			got, err := s.ReadFileBytes(context.Background(), "/f")
+			if err != nil {
+				t.Fatalf("a matching size must succeed: %v", err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("got %d bytes, want %d", len(got), len(want))
+			}
+		})
+	}
+}
+
 func TestReadFileResumesWithSameReadID(t *testing.T) {
 	cases := map[string]func(cp *fakeCP){
 		"relay disconnect after a chunk": func(cp *fakeCP) {
