@@ -111,9 +111,10 @@ func (s *Service) queueAutoTopUp(ctx context.Context, tx pgx.Tx, acct *accountSt
 	if err != nil {
 		return false, err
 	}
+	// cap_time starts at the queue time; the claim moves it to the claim time.
 	if _, err := tx.Exec(ctx, `INSERT INTO top_ups (top_up_id, billing_account_id, kind, amount_usd_micros, status,
-			paddle_subscription_id, create_time, update_time)
-		VALUES ($1, $2, 'auto', $3, 'pending', $4, $5, $5)`, id, acct.ID, st.AutoAmount, sub.PaddleSubscriptionID, now); err != nil {
+			paddle_subscription_id, create_time, update_time, cap_time)
+		VALUES ($1, $2, 'auto', $3, 'pending', $4, $5, $5, $5)`, id, acct.ID, st.AutoAmount, sub.PaddleSubscriptionID, now); err != nil {
 		return false, err
 	}
 	s.logger.InfoContext(ctx, "billing_auto_top_up_queued",
@@ -443,8 +444,11 @@ func (s *Service) completeTopUp(ctx context.Context, tx pgx.Tx, t topUp, transac
 // transaction revalidates the current settings, because an owner or admin
 // may have changed them after the top-up was queued: a pending top-up that
 // the current settings no longer allow fails as settings_changed without a
-// Paddle call and without counting as a failed automatic top-up. Top-ups
-// that already left pending (charging, charged or unknown) are not touched.
+// Paddle call and without counting as a failed automatic top-up. The claim
+// also moves the cap time of the top-up to the claim time, so the top-up
+// counts toward the monthly cap of the UTC month of the claim and not of the
+// month in which it was queued. Top-ups that already left pending (charging,
+// charged or unknown) are not touched.
 func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 	for range 100 {
 		var candidate topUp
@@ -491,7 +495,11 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 			claimed.PaddleSubscriptionID = sub.PaddleSubscriptionID
 			claimed.Status = TopUpCharging
 			ok = true
-			_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charging', paddle_subscription_id = $2, update_time = $3
+			// now is the one claim time: the cap check above and the cap
+			// month of the claimed top-up use it, so the top-up counts in
+			// the UTC month in which the cap allowed it.
+			_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charging', paddle_subscription_id = $2, update_time = $3,
+					cap_time = $3
 				WHERE top_up_id = $1`, claimed.ID, claimed.PaddleSubscriptionID, now)
 			return err
 		})
