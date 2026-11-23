@@ -249,9 +249,19 @@ func (d *dataPath) sessionFailed(sess *p2pSession) {
 	sess.close()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.sess == sess {
-		d.sess = nil
+	d.sessionFailedLocked(sess)
+}
+
+// sessionFailedLocked forgets sess and moves the handle to the relay unless
+// the transport is forced. It changes the route only when sess is still the
+// installed session: a session that another operation or a lookup already
+// replaced or forgot has no say over the route of its replacement. The caller
+// holds d.mu.
+func (d *dataPath) sessionFailedLocked(sess *p2pSession) {
+	if d.sess != sess {
+		return
 	}
+	d.sess = nil
 	if d.s.c.transport != TransportPeerToPeer && !d.relay {
 		d.relay = true
 		d.inUse = ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY
@@ -264,6 +274,26 @@ func (d *dataPath) sessionFailed(sess *p2pSession) {
 func (d *dataPath) sessionEnded(sess *p2pSession) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.sess == sess {
+		d.sess = nil
+	}
+}
+
+// settleDoneSessionLocked applies the terminal cause of the installed
+// session sess, which an idle handle observes in lookup because no operation
+// passes the error to handleSessionError: a channel failure moves the handle
+// to the relay (unless the transport is forced), and a session end, a
+// retirement or a close by the caller only forgets the session. The caller
+// holds d.mu and has seen sess.done closed, so sess.endErr is final (end
+// writes it before it closes done).
+func (d *dataPath) settleDoneSessionLocked(sess *p2pSession) {
+	var failed *errP2PFailed
+	if errors.As(sess.endErr, &failed) {
+		d.s.c.logger.Debug("ownsand data path session failed while idle", "sandbox_id", d.s.id, "session_id", sess.sessionID)
+		d.sessionFailedLocked(sess)
+		return
+	}
+	d.s.c.logger.Debug("ownsand data path session ended while idle", "sandbox_id", d.s.id, "session_id", sess.sessionID)
 	if d.sess == sess {
 		d.sess = nil
 	}
@@ -287,12 +317,21 @@ func (d *dataPath) current() ownsandv1.DataPathTransport {
 func (d *dataPath) lookup() (sess *p2pSession, relay bool, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	switch {
-	case d.closed:
+	if d.closed {
 		return nil, false, errHandleClosed
+	}
+	// A session that ended while no operation used it still carries its
+	// terminal cause. Apply it here, under the handle lock and only to the
+	// session that is installed now, so that an idle failure moves an
+	// automatic handle to the relay exactly as a failure during an operation
+	// does, and a routine end leaves direct setup available.
+	if d.sess != nil && d.sess.isDone() {
+		d.settleDoneSessionLocked(d.sess)
+	}
+	switch {
 	case d.relay:
 		return nil, true, nil
-	case d.sess != nil && !d.sess.isDone():
+	case d.sess != nil:
 		return d.sess, false, nil
 	}
 	return nil, false, nil
