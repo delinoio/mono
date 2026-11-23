@@ -1162,39 +1162,22 @@ func TestAcceptInvitationExpiresWhileWaitingForAccountLock(t *testing.T) {
 	members, accepted, audits := acceptanceRows(t, env, accountID)
 
 	// During the lookup, a second transaction takes the account lock. Once
-	// the acceptance blocks on it, the clock passes the expiry and the second
-	// transaction commits.
-	released := make(chan error, 1)
+	// the fixture has observed the acceptance statement blocked by that
+	// transaction, the clock passes the expiry and the transaction commits.
+	// When the fixture cannot observe the wait, it rolls the transaction back
+	// without moving the clock, and the test fails below.
+	var holder <-chan lockHolderResult
 	env.Directory.SetOnUser(func() {
 		env.Directory.SetOnUser(nil)
-		tx, err := env.DB.Pool.Begin(ctx())
-		if err != nil {
-			released <- err
-			return
-		}
-		if _, err := tx.Exec(ctx(), `SELECT 1 FROM billing_accounts WHERE billing_account_id = $1 FOR UPDATE`, accountID); err != nil {
-			_ = tx.Rollback(ctx())
-			released <- err
-			return
-		}
-		go func() {
-			defer func() { released <- tx.Commit(ctx()) }()
-			deadline := time.Now().Add(10 * time.Second)
-			for time.Now().Before(deadline) {
-				var waiting bool
-				err := env.DB.Pool.QueryRow(ctx(), `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-					WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FOR UPDATE%' AND pid <> pg_backend_pid())`).Scan(&waiting)
-				if err == nil && waiting {
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-			env.Clock.Advance(api.InvitationLifetime + time.Second)
-		}()
+		holder = holdAccountLock(env, accountID, func() { env.Clock.Advance(api.InvitationLifetime + time.Second) })
 	})
 	_, err := accept(invitee, token)
-	if rerr := <-released; rerr != nil {
-		t.Fatalf("lock holder: %v", rerr)
+	env.Directory.SetOnUser(nil)
+	if holder == nil {
+		t.Fatal("the directory hook did not run, so no lock was held")
+	}
+	if res := <-holder; res.waitErr != nil || res.commitErr != nil {
+		t.Fatalf("lock holder: wait error %v, release error %v", res.waitErr, res.commitErr)
 	}
 	wantCode(t, err, connect.CodeFailedPrecondition)
 
