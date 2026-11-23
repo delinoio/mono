@@ -5,6 +5,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -583,24 +584,70 @@ func TestOpenReturnsWhenConnectionClosesWhileWaitingForGate(t *testing.T) {
 	}
 }
 
+// waitCreditWait waits until a goroutine that the test named by creator
+// started is blocked in a send credit wait (SendMetered calling
+// datapath.SendWindow.Consume). A sleep cannot show that: the goroutine may
+// not have reached the wait yet, or it may never get there.
+func waitCreditWait(t *testing.T, creator string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		buf := make([]byte, 1<<16)
+		for {
+			n := runtime.Stack(buf, true)
+			if n < len(buf) {
+				buf = buf[:n]
+				break
+			}
+			buf = make([]byte, 2*len(buf))
+		}
+		for _, g := range strings.Split(string(buf), "\n\n") {
+			if strings.Contains(g, "(*SendWindow).Consume") && strings.Contains(g, "(*Stream).SendMetered") &&
+				strings.Contains(g, creator) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no send of %s reached its credit wait within %v", creator, within)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestCreditWaitDoesNotDelayAnotherStream shows that a sender that waits for
-// the agent's credit does not hold the open gate or the queue.
+// the agent's credit does not hold the open gate or the queue. Every wait is
+// bounded, so a stall fails the test and cancels the waiting send at once.
 func TestCreditWaitDoesNotDelayAnotherStream(t *testing.T) {
+	const within = 2 * time.Second
 	c := NewConn(context.Background(), "device", 1, testLimits)
 	waiting := openStream(t, c)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Cancel on every exit, also when a step below fails, so that the
+	// waiting send never outlives the test.
+	t.Cleanup(cancel)
 	sent := make(chan error, 1)
 	go func() {
 		sent <- waiting.Send(ctx, datapath.MustNewFrame(0, "", &ownsandv1.ExecRequest{}))
 	}()
-	time.Sleep(20 * time.Millisecond) // the agent granted no credit
-	other, err := c.Open(context.Background(), "grant-b", "sandbox")
-	if err != nil {
-		t.Fatal(err)
+	// The agent granted no credit: the send must reach its credit wait
+	// before the other stream is tested.
+	waitCreditWait(t, "TestCreditWaitDoesNotDelayAnotherStream", within)
+
+	other := waitOpen(t, openAsync(context.Background(), c, "grant-b"), within)
+	if other.err != nil {
+		t.Fatal(other.err)
 	}
-	if err := other.Send(context.Background(), datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
-		t.Fatal(err)
+	otherSent := make(chan error, 1)
+	go func() {
+		otherSent <- other.s.Send(context.Background(), datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{}))
+	}()
+	select {
+	case err := <-otherSent:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(within):
+		t.Fatalf("Send on another stream did not return within %v while a send waits for credit", within)
 	}
 	select {
 	case err := <-sent:
@@ -608,8 +655,13 @@ func TestCreditWaitDoesNotDelayAnotherStream(t *testing.T) {
 	default:
 	}
 	cancel()
-	if err := <-sent; !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled credit wait = %v, want context.Canceled", err)
+	select {
+	case err := <-sent:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled credit wait = %v, want context.Canceled", err)
+		}
+	case <-time.After(within):
+		t.Fatalf("canceled credit wait did not return within %v", within)
 	}
 }
 
