@@ -91,8 +91,8 @@ func (h *CreditHandler) GetBalance(ctx context.Context, req *connect.Request[acc
 	return connect.NewResponse(resp), nil
 }
 
-// ListLedgerEntries lists ledger entries, newest first. Every member may
-// call it.
+// ListLedgerEntries lists ledger entries, newest first by create_time and
+// then by descending ID. Every member may call it.
 func (h *CreditHandler) ListLedgerEntries(ctx context.Context, req *connect.Request[accountsv1.ListLedgerEntriesRequest]) (*connect.Response[accountsv1.ListLedgerEntriesResponse], error) {
 	const rpc = "ListLedgerEntries"
 	size, err := pageSize(req.Msg.GetPageSize())
@@ -115,14 +115,32 @@ func (h *CreditHandler) ListLedgerEntries(ctx context.Context, req *connect.Requ
 	if _, err := h.read(ctx, accountID, PermissionRead); err != nil {
 		return nil, h.internal(ctx, "list_ledger_entries", err)
 	}
-	entries, err := billing.ListLedger(ctx, h.db.Pool, accountID, tok.After, size+1)
+	var entries []billing.LedgerEntry
+	if tok.After != "" && tok.AfterTime == 0 {
+		// A token issued before ledger entries were ordered by create_time
+		// carries only an ID. It resumes the legacy descending-ID traversal
+		// with its original index and its next tokens stay ID-only, so a
+		// traversal started by the previous release finishes in one order.
+		entries, err = billing.ListLedger(ctx, h.db.Pool, accountID, tok.After, size+1)
+	} else {
+		var afterTime time.Time
+		if tok.After != "" {
+			afterTime = time.UnixMicro(tok.AfterTime).UTC()
+		}
+		entries, err = billing.ListLedgerByTime(ctx, h.db.Pool, accountID, afterTime, tok.After, size+1)
+	}
 	if err != nil {
 		return nil, h.internal(ctx, "list_ledger_entries", err)
 	}
 	resp := &accountsv1.ListLedgerEntriesResponse{}
 	if len(entries) > size {
 		entries = entries[:size]
-		resp.NextPageToken = encodePageToken(pageToken{RPC: rpc, Scope: accountID, After: entries[size-1].ID})
+		last := entries[size-1]
+		next := pageToken{RPC: rpc, Scope: accountID, After: last.ID}
+		if tok.After == "" || tok.AfterTime != 0 {
+			next.AfterTime = last.CreateTime.UnixMicro()
+		}
+		resp.NextPageToken = encodePageToken(next)
 	}
 	for _, e := range entries {
 		resp.LedgerEntries = append(resp.LedgerEntries, e.Proto())
