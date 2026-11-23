@@ -256,7 +256,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	root := filepath.Join(dir, rootDir)
 	restore := ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_BASE_IMAGE
 	if spec.Snapshot != nil {
-		if err := fsutil.CopyTree(filepath.Join(spec.Snapshot.Dir, diskDir), root); err != nil {
+		// The copy of a large snapshot disk can run for a long time, so it
+		// stops with the context error once ctx is done; the partial copy is
+		// removed with the sandbox directory and no helper starts.
+		if err := fsutil.CopyTreeContext(ctx, filepath.Join(spec.Snapshot.Dir, diskDir), root); err != nil {
 			os.RemoveAll(dir)
 			return nil, fmt.Errorf("processrt: restore snapshot disk: %w", err)
 		}
@@ -274,6 +277,17 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		os.RemoveAll(dir)
 		removeSocketDir(v)
 		return nil, err
+	}
+	// A restore that was canceled after the last copied entry, or while the
+	// socket was prepared, must not start a helper. Only a restore checks
+	// here: the readiness wait below reports a canceled start of any other
+	// sandbox after the helper started and cleans it up.
+	if spec.Snapshot != nil {
+		if err := ctx.Err(); err != nil {
+			os.RemoveAll(dir)
+			removeSocketDir(v)
+			return nil, fmt.Errorf("processrt: restore snapshot canceled before the helper started: %w", err)
+		}
 	}
 	cmd := exec.Command(r.guestBinary,
 		"--listen", "unix://"+v.socket,

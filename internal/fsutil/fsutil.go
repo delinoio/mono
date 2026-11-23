@@ -20,8 +20,18 @@ import (
 // CopyTree copies the regular files, directories and symbolic links of src
 // into dst, which must not exist yet.
 func CopyTree(src, dst string) error {
+	return CopyTreeContext(context.Background(), src, dst)
+}
+
+// CopyTreeContext is CopyTree that stops with the context error before each
+// entry and between the chunks of a file once ctx is done. The entries that it
+// copied before the stop stay in dst; the caller removes them.
+func CopyTreeContext(ctx context.Context, src, dst string) error {
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		rel, err := filepath.Rel(src, path)
@@ -43,7 +53,7 @@ func CopyTree(src, dst string) error {
 			}
 			return os.Symlink(link, target)
 		case info.Mode().IsRegular():
-			return CopyFile(path, target, info.Mode().Perm())
+			return copyFile(ctx, path, target, info.Mode().Perm())
 		}
 		// Sockets, devices and pipes are not part of a snapshot.
 		return nil
@@ -52,6 +62,12 @@ func CopyTree(src, dst string) error {
 
 // CopyFile copies one regular file.
 func CopyFile(src, dst string, perm fs.FileMode) error {
+	return copyFile(context.Background(), src, dst, perm)
+}
+
+// copyFile is CopyFile that stops with the context error at the next chunk
+// once ctx is done.
+func copyFile(ctx context.Context, src, dst string, perm fs.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -61,7 +77,7 @@ func CopyFile(src, dst string, perm fs.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if _, err := CopyContext(ctx, out, in); err != nil {
 		out.Close()
 		return err
 	}

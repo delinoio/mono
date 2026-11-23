@@ -666,6 +666,140 @@ func TestFailedStartCleanupDoesNotNeedProcessListing(t *testing.T) {
 	}
 }
 
+// errAfterContext reports context.Canceled from its Err method after the
+// first n calls, so a test cancels the snapshot copy at a fixed entry
+// without timing.
+type errAfterContext struct {
+	context.Context
+	left int
+}
+
+func (c *errAfterContext) Err() error {
+	if c.left <= 0 {
+		return context.Canceled
+	}
+	c.left--
+	return nil
+}
+
+// snapshotSource writes a snapshot with files disk files and returns it.
+func snapshotSource(t *testing.T, files int) *vmruntime.SnapshotSource {
+	t.Helper()
+	snapDir := t.TempDir()
+	disk := filepath.Join(snapDir, diskDir)
+	if err := os.MkdirAll(disk, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := range files {
+		if err := os.WriteFile(filepath.Join(disk, fmt.Sprintf("f%d", i)), []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &vmruntime.SnapshotSource{SnapshotID: "snap", Dir: snapDir}
+}
+
+// helperProcessesOf returns the lines of the process listing that mention dir.
+func helperProcessesOf(t *testing.T, dir string) []string {
+	t.Helper()
+	out, err := exec.Command("ps", "-axo", "command").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, dir) {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// TestCanceledSnapshotRestoreStartsNoHelper checks that a restore that is
+// canceled during the snapshot copy, or right after it, returns the context
+// error, removes the partial sandbox directory and starts no helper.
+func TestCanceledSnapshotRestoreStartsNoHelper(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files int
+		// calls is the number of Err calls that pass before the cancellation.
+		calls int
+	}{
+		// The root entry and two files pass; the third file sees the cancellation.
+		{name: "during the copy", files: 20, calls: 4},
+		// Only the root entry is copied; the check before the helper start sees it.
+		{name: "after the copy", files: 0, calls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newRuntime(t)
+			id, err := uuidv7.NewString()
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec := vmruntime.Spec{
+				SandboxID: id,
+				Dir:       longSandboxDir(t),
+				GuestOS:   hostGuestOS,
+				BaseImage: hostBaseImage,
+				Snapshot:  snapshotSource(t, tc.files),
+			}
+			// A private, short TMPDIR receives the socket directory. It is
+			// set after the fixtures above, which live in the test's own
+			// temporary directory.
+			tmp, err := os.MkdirTemp("", "pt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.RemoveAll(tmp) })
+			t.Setenv("TMPDIR", tmp)
+			_, err = rt.Create(&errAfterContext{Context: context.Background(), left: tc.calls}, spec)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Create error = %v; want context.Canceled", err)
+			}
+			if _, err := rt.lookup(id); err == nil {
+				t.Error("sandbox is tracked after the canceled restore")
+			}
+			if _, err := os.Stat(spec.Dir); !os.IsNotExist(err) {
+				t.Errorf("sandbox directory after the canceled restore: %v; want it removed", err)
+			}
+			if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+				t.Errorf("TMPDIR entries after the canceled restore: %v, %v; want none", entries, err)
+			}
+			if lines := helperProcessesOf(t, spec.Dir); len(lines) != 0 {
+				t.Errorf("helper processes after the canceled restore: %v", lines)
+			}
+		})
+	}
+}
+
+// TestSnapshotRestoreStartsAndWaitsForGuest checks that an uncanceled restore
+// copies the snapshot disk, starts the helper and returns when it is ready.
+func TestSnapshotRestoreStartsAndWaitsForGuest(t *testing.T) {
+	rt := newRuntime(t)
+	id, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := vmruntime.Spec{
+		SandboxID: id,
+		Dir:       longSandboxDir(t),
+		GuestOS:   hostGuestOS,
+		BaseImage: hostBaseImage,
+		Snapshot:  snapshotSource(t, 5),
+	}
+	if _, err := rt.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(spec.Dir, rootDir, "f4")); err != nil {
+		t.Errorf("snapshot file missing from the restored root: %v", err)
+	}
+	if lines := helperProcessesOf(t, spec.Dir); len(lines) == 0 {
+		t.Error("no helper process runs after the restore")
+	}
+	if err := rt.Delete(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestRelativeSandboxDirectoryKeepsHelperRecordsOutsideRoot checks that a
 // sandbox directory given as a relative path (a relative agent state
 // directory) gives the helper records (guest-state) the same place as an
