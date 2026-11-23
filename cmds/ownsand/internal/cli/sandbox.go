@@ -612,7 +612,7 @@ func (a *app) fileRead(ctx context.Context, name string, args []string) error {
 	var w io.Writer = a.env.Stdout
 	var dst *downloadTarget
 	if *to != "" {
-		if dst, err = openDownloadTarget(*to); err != nil {
+		if dst, err = openDownloadTarget(ctx, *to); err != nil {
 			return err
 		}
 		w = dst.f
@@ -647,12 +647,12 @@ type downloadTarget struct {
 	tmp string
 }
 
-func openDownloadTarget(to string) (*downloadTarget, error) {
+func openDownloadTarget(ctx context.Context, to string) (*downloadTarget, error) {
 	path := to
 	info, err := os.Stat(to)
 	switch {
 	case err == nil && !info.Mode().IsRegular():
-		f, err := os.OpenFile(to, os.O_WRONLY, 0)
+		f, err := openWriteOnlyOrCancel(ctx, to)
 		if err != nil {
 			return nil, err
 		}
@@ -700,6 +700,39 @@ func openDownloadTarget(to string) (*downloadTarget, error) {
 		return &downloadTarget{f: f, path: path, tmp: tmp}, nil
 	}
 	return nil, fmt.Errorf("create a temporary file beside %s: too many name collisions", to)
+}
+
+// openWriteOnlyOrCancel opens an existing file that is not a regular file for
+// writing. Opening a FIFO for writing blocks until a reader opens it, and
+// open(2) does not observe a context, so the open runs in its own goroutine
+// and a cancelled ctx ends the wait with ctx.Err(). The goroutine stays
+// blocked in open(2) until a reader appears or the process exits (the command
+// ends right after the cancellation); when the open succeeds after the
+// cancellation, the goroutine closes the file, so no descriptor leaks in a
+// long-lived caller.
+func openWriteOnlyOrCancel(ctx context.Context, to string) (*os.File, error) {
+	type opened struct {
+		f   *os.File
+		err error
+	}
+	// The channel has room for the one result, so the goroutine never blocks
+	// on a send that nobody receives.
+	ch := make(chan opened, 1)
+	go func() {
+		f, err := os.OpenFile(to, os.O_WRONLY, 0)
+		ch <- opened{f, err}
+	}()
+	select {
+	case o := <-ch:
+		return o.f, o.err
+	case <-ctx.Done():
+		go func() {
+			if o := <-ch; o.f != nil {
+				_ = o.f.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
 }
 
 // maxSymlinkHops bounds the links that resolveMissingTarget follows. It is
