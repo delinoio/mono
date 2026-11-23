@@ -123,12 +123,23 @@ func (f *fill) archive() string {
 	return filepath.Join(f.cache, "linux-"+kernelVersion+".tar.xz")
 }
 
+// seed publishes data as a world-readable archive, as an earlier build does.
 func (f *fill) seed(data []byte) {
+	f.t.Helper()
+	f.seedMode(data, 0o644)
+}
+
+// seedMode writes the archive with exactly mode. The explicit chmod defeats
+// the process umask, which would otherwise narrow the mode WriteFile applies.
+func (f *fill) seedMode(data []byte, mode os.FileMode) {
 	f.t.Helper()
 	if err := os.MkdirAll(f.cache, 0o755); err != nil {
 		f.t.Fatal(err)
 	}
-	if err := os.WriteFile(f.archive(), data, 0o644); err != nil {
+	if err := os.WriteFile(f.archive(), data, mode); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.Chmod(f.archive(), mode); err != nil {
 		f.t.Fatal(err)
 	}
 }
@@ -162,8 +173,9 @@ func (f *fill) callCount() int {
 	return strings.Count(string(data), "call\n")
 }
 
-// requireArchive checks that the published archive holds exactly want and
-// that the cache directory holds nothing else (no temporary file is left).
+// requireArchive checks that the archive holds exactly want and that the
+// cache directory holds nothing else (no temporary file is left). It does not
+// check the mode: a reused archive keeps whatever mode it was seeded with.
 func (f *fill) requireArchive(want []byte) {
 	f.t.Helper()
 	got, err := os.ReadFile(f.archive())
@@ -173,6 +185,14 @@ func (f *fill) requireArchive(want []byte) {
 	if string(got) != string(want) {
 		f.t.Fatalf("the published archive holds %q, want %q", got, want)
 	}
+	f.requireNoLeftovers()
+}
+
+// requirePublishedArchive checks requireArchive and that the helper published
+// the archive world readable, which only a fresh publish has to guarantee.
+func (f *fill) requirePublishedArchive(want []byte) {
+	f.t.Helper()
+	f.requireArchive(want)
 	info, err := os.Stat(f.archive())
 	if err != nil {
 		f.t.Fatal(err)
@@ -180,7 +200,18 @@ func (f *fill) requireArchive(want []byte) {
 	if info.Mode().Perm()&0o444 != 0o444 {
 		f.t.Fatalf("the published archive has mode %v, want it world readable", info.Mode().Perm())
 	}
-	f.requireNoLeftovers()
+}
+
+// requireArchiveMode checks that the archive still has exactly mode.
+func (f *fill) requireArchiveMode(mode os.FileMode) {
+	f.t.Helper()
+	info, err := os.Stat(f.archive())
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if info.Mode().Perm() != mode {
+		f.t.Fatalf("the archive has mode %v, want %v", info.Mode().Perm(), mode)
+	}
 }
 
 func (f *fill) requireNoLeftovers() {
@@ -202,7 +233,7 @@ func TestColdCacheDownloadsAndPublishesOnce(t *testing.T) {
 	if out, err := f.run(body); err != nil {
 		t.Fatalf("fill: %v\n%s", err, out)
 	}
-	f.requireArchive(goodBody)
+	f.requirePublishedArchive(goodBody)
 	if got := f.callCount(); got != 1 {
 		t.Fatalf("downloader calls = %d, want 1", got)
 	}
@@ -210,12 +241,14 @@ func TestColdCacheDownloadsAndPublishesOnce(t *testing.T) {
 
 func TestValidCachedArchiveIsReusedWithoutDownload(t *testing.T) {
 	f := newFill(t)
-	f.seed(goodBody)
+	// A cache hit never rewrites the archive, so it keeps a restrictive mode.
+	f.seedMode(goodBody, 0o600)
 	body := f.body("good", goodBody)
 	if out, err := f.run(body); err != nil {
 		t.Fatalf("fill: %v\n%s", err, out)
 	}
 	f.requireArchive(goodBody)
+	f.requireArchiveMode(0o600)
 	if got := f.callCount(); got != 0 {
 		t.Fatalf("downloader calls = %d, want 0", got)
 	}
@@ -228,7 +261,7 @@ func TestInvalidCachedArchiveIsReplacedInTheSameRun(t *testing.T) {
 	if out, err := f.run(body); err != nil {
 		t.Fatalf("fill: %v\n%s", err, out)
 	}
-	f.requireArchive(goodBody)
+	f.requirePublishedArchive(goodBody)
 	if got := f.callCount(); got != 1 {
 		t.Fatalf("downloader calls = %d, want 1", got)
 	}
@@ -346,7 +379,7 @@ func TestOverlappingColdFillsBothEndWithTheVerifiedArchive(t *testing.T) {
 			t.Fatalf("fill %d: %v\n%s", i, errs[i], outputs[i])
 		}
 	}
-	f.requireArchive(goodBody)
+	f.requirePublishedArchive(goodBody)
 	if got := f.callCount(); got != 2 {
 		t.Fatalf("downloader calls = %d, want 2 (both fills downloaded at once)", got)
 	}
@@ -376,5 +409,5 @@ func TestFailedFillNeverReplacesAnArchiveAnotherFillPublished(t *testing.T) {
 	if badErr == nil {
 		t.Fatalf("the fill with the wrong download succeeded\n%s", badOut)
 	}
-	f.requireArchive(goodBody)
+	f.requirePublishedArchive(goodBody)
 }
