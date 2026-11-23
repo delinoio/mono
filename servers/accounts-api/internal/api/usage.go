@@ -392,7 +392,6 @@ func (h *UsageHandler) UnlinkOrganization(ctx context.Context, req *connect.Requ
 	if !ok {
 		return connect.NewResponse(&accountsv1.UnlinkOrganizationResponse{}), nil
 	}
-	now := h.timestamp()
 	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		// The billing account lock comes first, as for every change of a
@@ -400,6 +399,13 @@ func (h *UsageHandler) UnlinkOrganization(ctx context.Context, req *connect.Requ
 		if err := billing.LockAccount(ctx, tx, current.BillingAccountID); err != nil {
 			return err
 		}
+		// Read the clock only now: the wait for the lock can span the start
+		// of a usage window, and a time from before the wait would end the
+		// link before a window that began while the unlink was waiting, which
+		// would then not be attributed to the account. Like a new link, the
+		// unlink takes its time (and the time of its audit event) after it
+		// holds the lock.
+		now := h.timestamp()
 		tag, err := tx.Exec(ctx, `UPDATE organization_links SET unlink_time = GREATEST($2, link_time)
 			WHERE organization_link_id = $1 AND unlink_time IS NULL`, current.LinkID, now)
 		if err != nil || tag.RowsAffected() == 0 {
