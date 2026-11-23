@@ -25,6 +25,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/go/ownsand/validate"
 	"github.com/delinoio/mono/go/uuidv7"
+	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -1410,7 +1411,7 @@ func (m *Manager) RemoveAll(ctx context.Context) error {
 
 // removeDirIfExists removes a directory tree.
 func removeDirIfExists(dir string) error {
-	if err := os.RemoveAll(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := fsutil.RemoveAll(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil

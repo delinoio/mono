@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package fsutil copies directory trees and packs them into tar streams
-// for snapshots.
+// Package fsutil copies directory trees, removes them again and packs them
+// into tar streams for snapshots.
 package fsutil
 
 import (
@@ -82,6 +82,47 @@ func copyFile(ctx context.Context, src, dst string, perm fs.FileMode) error {
 		return err
 	}
 	return out.Close()
+}
+
+// RemoveAll removes path and the tree below it like os.RemoveAll. A tree that
+// CopyTree copied from a read-only source keeps the read-only directory modes,
+// and a process without the privilege to override them cannot delete the
+// entries of such a directory. When the first attempt fails with a permission
+// error, RemoveAll therefore grants the owner read, write and search access on
+// every directory of the tree (symbolic links are not followed) and removes
+// the tree again. It returns the error of that second attempt, so a tree that
+// stays undeletable (for example because its parent directory is read-only)
+// is still reported. A missing path is not an error.
+func RemoveAll(path string) error {
+	err := os.RemoveAll(path)
+	if err == nil || !errors.Is(err, fs.ErrPermission) {
+		return err
+	}
+	makeDirsWritable(path)
+	return os.RemoveAll(path)
+}
+
+// makeDirsWritable adds the owner read, write and search bits to every
+// directory at or below path. It ignores errors: the removal that follows
+// reports whatever still blocks it.
+func makeDirsWritable(path string) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	const need = 0o700
+	if info.Mode().Perm()&need != need {
+		_ = os.Chmod(path, info.Mode().Perm()|need)
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			makeDirsWritable(filepath.Join(path, e.Name()))
+		}
+	}
 }
 
 // TreeSize returns the total size of the regular files under dir.

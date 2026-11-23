@@ -30,7 +30,16 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/delinoio/mono/internal/fsutil"
 )
+
+// removeAll deletes a tree for the Store. It is fsutil.RemoveAll, which also
+// deletes a snapshot copy that kept the read-only directory modes of its
+// source. It is a variable so that a test can make one removal fail: a
+// read-only directory inside the tree no longer fails it. Production code
+// never assigns it.
+var removeAll = fsutil.RemoveAll
 
 // File and directory names inside the state directory.
 const (
@@ -315,7 +324,7 @@ func (s *Store) DeleteSnapshot(id string) error {
 	if err != nil {
 		return err
 	}
-	return os.RemoveAll(dir)
+	return removeAll(dir)
 }
 
 // transferArchivePattern matches the temporary archives that snapxfer creates
@@ -344,7 +353,7 @@ func (s *Store) LoadSnapshots(decode func(data []byte) error) error {
 		}
 		data, err := os.ReadFile(s.Path(SnapshotsDir, e.Name(), snapshotRecord))
 		if errors.Is(err, fs.ErrNotExist) {
-			if err := os.RemoveAll(s.Path(SnapshotsDir, e.Name())); err != nil {
+			if err := removeAll(s.Path(SnapshotsDir, e.Name())); err != nil {
 				return err
 			}
 			continue
@@ -374,7 +383,7 @@ func (s *Store) LoadExecs(v any) error {
 // agent.json.
 func (s *Store) WipeLocalData() error {
 	for _, sub := range []string{SandboxesDir, SnapshotsDir, VMsDir, ImagesDir, UpdateDir} {
-		if err := os.RemoveAll(s.Path(sub)); err != nil {
+		if err := removeAll(s.Path(sub)); err != nil {
 			return err
 		}
 		if err := os.MkdirAll(s.Path(sub), 0o700); err != nil {
@@ -401,7 +410,7 @@ func (s *Store) Reset() error {
 	}
 	var errs []error
 	for _, e := range entries {
-		if err := os.RemoveAll(filepath.Join(s.dir, e.Name())); err != nil {
+		if err := removeAll(filepath.Join(s.dir, e.Name())); err != nil {
 			errs = append(errs, err)
 		}
 	}
