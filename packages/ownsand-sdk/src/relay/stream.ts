@@ -83,10 +83,31 @@ export function linkedController(signal: AbortSignal | undefined): {
  */
 export class ConsumerHold {
   #released = false;
+  #claimed: boolean;
   readonly #listeners = new Set<() => void>();
+
+  /**
+   * A hold starts claimed. An exec handle that starts its stream before the
+   * caller iterates creates an unclaimed hold: the event that the stream
+   * yielded ahead of any reader is not held by anyone, so the idle limit
+   * still applies to it until the first reader claims it.
+   */
+  constructor(options: { claimed?: boolean } = {}) {
+    this.#claimed = options.claimed ?? true;
+  }
 
   get released(): boolean {
     return this.#released;
+  }
+
+  /** Whether a consumer holds the current event, so the idle clock pauses. */
+  get active(): boolean {
+    return this.#claimed && !this.#released;
+  }
+
+  /** The first reader takes the event that the stream yielded ahead of it. */
+  claim(): void {
+    this.#claimed = true;
   }
 
   release(): void {
@@ -145,7 +166,7 @@ export async function* watchedRelayStream<T>(
   });
   const watcher = (async () => {
     for (;;) {
-      const held = holding && hold?.released !== true;
+      const held = holding && (hold === undefined || hold.active);
       const wait = held
         ? Timing.streamIdleMs
         : lastActivity + Timing.streamIdleMs - clock.now();
