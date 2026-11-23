@@ -2207,7 +2207,7 @@ function FilteredList({ items }: { items: Item[] }) {
 }
 
 function UserProfile() {
-  // JSON.parse runs on every render
+  // Browser-only: reads localStorage. JSON.parse runs on every render
   const [settings, setSettings] = useState(
     JSON.parse(localStorage.getItem('settings') || '{}')
   )
@@ -2227,6 +2227,9 @@ function FilteredList({ items }: { items: Item[] }) {
   return <SearchResults index={searchIndex} query={query} />
 }
 
+// Browser-only: reads localStorage during the initial render. Use it in a
+// client-only component or a client-rendered app (for example a Vite SPA),
+// never in a component that is also server-rendered.
 function UserProfile() {
   // JSON.parse runs only on initial render
   const [settings, setSettings] = useState(() => {
@@ -2238,7 +2241,32 @@ function UserProfile() {
 }
 ```
 
-Use lazy initialization when computing initial values from localStorage/sessionStorage, building data structures (indexes, maps), reading from the DOM, or performing heavy transformations.
+The lazy initializer runs during the component's initial render. When the component is server-rendered, that render happens on the server, where `localStorage` does not exist, so the initializer throws. Even where `localStorage` exists, reading it during the first render can make the first client render differ from the server HTML.
+
+**Correct: server-rendered, deterministic first render with saved settings loaded after hydration**
+
+```tsx
+const defaultSettings: Settings = {}
+
+function UserProfile() {
+  // Same defaults on the server and on the first client render
+  const [settings, setSettings] = useState<Settings>(defaultSettings)
+
+  useEffect(() => {
+    // Effects run only in the browser, after hydration
+    try {
+      const stored = localStorage.getItem('settings')
+      if (stored) setSettings(JSON.parse(stored))
+    } catch {}
+  }, [])
+
+  return <SettingsForm settings={settings} onChange={setSettings} />
+}
+```
+
+When no `settings` key is stored, the defaults stay. The pure `buildSearchIndex` lazy initializer above is safe to server-render because it reads no browser API.
+
+Use lazy initialization when computing initial values from localStorage/sessionStorage or the DOM (in browser-only components; see the server-rendered variant above), building data structures (indexes, maps), or performing heavy transformations.
 
 For simple primitives (`useState(0)`), direct references (`useState(props.value)`), or cheap literals (`useState({})`), the function form is unnecessary.
 

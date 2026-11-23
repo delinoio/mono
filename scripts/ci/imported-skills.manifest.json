@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "21b98f5912ead9043bed0b49f67946ce44b9d2425a163d1dc06993ed05eb774a",
+        "AGENTS.md": "588b330f08f42d2efe182999f5cfe57bc9bb139dc8aa20e0dc74a6bfca31aa25",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "9eafb2123d3b8b2aef41fba0db2648a3f4f49996f8c7c8bb2c86263befd8b48a",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -129,7 +129,7 @@
         "rules/rerender-derived-state-no-effect.md": "cb11ec76f50aa7b6847269f02d79b120c889a30d9ecd2c1d578f75144419c77a",
         "rules/rerender-derived-state.md": "1c326bb67b01fb084eb00c8911b0a7cff54681c2315b629f88e49b64eaa6481d",
         "rules/rerender-functional-setstate.md": "5e68df6b2ae8058e67f476ff1ac67bde159f5a9d18df439e46eabcdeb7b52e58",
-        "rules/rerender-lazy-state-init.md": "4ae844740f266fc8cbf050701230286624a2440ec5be67b9a63d9edc3c580573",
+        "rules/rerender-lazy-state-init.md": "4bd7dcaeee8a77dbef38f6f39614048fee715a1dada77da39644caed8a365fac",
         "rules/rerender-memo-with-default-value.md": "96b72c57abc1c57a50d5c535cb0575800756ecdbe3ae376ba83c84f518d08526",
         "rules/rerender-memo.md": "1f258990c2f27ff6256b3cc5c43300631bb3f0d81f749aed08d07fcdcc131dd1",
         "rules/rerender-move-effect-to-event.md": "abc2cbf167bee056743023351e96806a411d3398da8802093620aecf0721f029",
