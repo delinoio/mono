@@ -729,7 +729,6 @@ func (s *Service) ReconcilePendingAdjustments(ctx context.Context) error {
 // a credit grant.
 func (s *Service) reconcilePurchase(ctx context.Context, transactionID string) error {
 	return s.db.InTx(ctx, func(tx pgx.Tx) error {
-		now := s.timestamp()
 		if err := lockPurchase(ctx, tx, transactionID); err != nil {
 			return err
 		}
@@ -757,6 +756,10 @@ func (s *Service) reconcilePurchase(ctx context.Context, transactionID string) e
 		if pending == 0 {
 			return nil
 		}
+		// Read the clock only now that the purchase lock and the account lock
+		// are held: a grant that expired while this task waited for them must
+		// be expired first and must not be consumed.
+		now := s.timestamp()
 		if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, transactionID, now); err != nil {
 			return err
 		}
