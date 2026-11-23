@@ -20,12 +20,17 @@ type Semver struct {
 // Parse parses "1.2.3", "v1.2.3" or "1.2.3-rc.1". Each numeric component
 // must be a non-empty run of ASCII digits without a leading zero (a lone
 // "0" is valid) that fits in an int, and a "-" must be followed by a
-// non-empty pre-release suffix. A sign, a zero-padded component or an
-// empty suffix is rejected, so that distinct strings do not compare equal.
+// non-empty pre-release suffix. The suffix is one or more dot-separated
+// identifiers; each identifier is non-empty, uses only ASCII letters, digits
+// and "-", and, when it is all digits, has no leading zero (a lone "0" is
+// valid), as in SemVer 2.0.0 section 9. Build metadata ("+") is not
+// supported. A sign, a zero-padded component, an empty suffix or an invalid
+// identifier is rejected, so that distinct strings do not compare equal
+// (without the check, "1.2.3-rc." and "1.2.3-rc" would).
 func Parse(s string) (Semver, error) {
 	s = strings.TrimPrefix(s, "v")
 	core, pre, hasPre := strings.Cut(s, "-")
-	if hasPre && pre == "" {
+	if hasPre && !validPre(pre) {
 		return Semver{}, fmt.Errorf("semver: %q is not MAJOR.MINOR.PATCH", s)
 	}
 	parts := strings.Split(core, ".")
@@ -41,6 +46,31 @@ func Parse(s string) (Semver, error) {
 		nums[i] = n
 	}
 	return Semver{Major: nums[0], Minor: nums[1], Patch: nums[2], Pre: pre}, nil
+}
+
+// validPre reports whether pre is a valid non-empty pre-release suffix: dot
+// separated identifiers of ASCII letters, digits and "-", where an
+// all-digit identifier has no leading zero.
+func validPre(pre string) bool {
+	for {
+		id, rest, more := strings.Cut(pre, ".")
+		if id == "" {
+			return false
+		}
+		for i := 0; i < len(id); i++ {
+			c := id[i]
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '-') {
+				return false
+			}
+		}
+		if len(id) > 1 && id[0] == '0' && isNumeric(id) {
+			return false
+		}
+		if !more {
+			return true
+		}
+		pre = rest
+	}
 }
 
 // parseComponent parses one numeric version component: ASCII digits only,

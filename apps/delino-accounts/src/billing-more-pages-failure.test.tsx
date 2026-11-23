@@ -10,6 +10,7 @@ import {
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { addBillingAccounts, createFakeApi } from "./testing/fake-api.ts";
+import { listRows } from "./testing/list-rows.ts";
 import { renderApp } from "./testing/render.tsx";
 
 /**
@@ -49,10 +50,7 @@ async function renderFailingSecondPage(failure: ConnectError) {
   const notice = (await screen.findByText(/Some items did not load/)).closest(
     '[role="alert"]',
   ) as HTMLElement;
-  const rows = () =>
-    within(screen.getByRole("list", { name: "Billing accounts" })).getAllByRole(
-      "listitem",
-    );
+  const rows = () => listRows("Billing accounts");
   return { api, signIns, notice, rows };
 }
 
