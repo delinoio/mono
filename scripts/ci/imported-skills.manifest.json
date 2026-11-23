@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "cf1a18618289640d62269185679a89be565acb53fcf892adebaec283a11d511c",
+        "AGENTS.md": "21b98f5912ead9043bed0b49f67946ce44b9d2425a163d1dc06993ed05eb774a",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "9eafb2123d3b8b2aef41fba0db2648a3f4f49996f8c7c8bb2c86263befd8b48a",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -96,7 +96,7 @@
         "rules/bundle-dynamic-imports.md": "401817a7369f315fc5a68a1095742ff7d53d0461906880dc9d64a41495ee1986",
         "rules/bundle-preload.md": "d1f7cc28da7cd5ab249acd287edc5b761afcfb194e9cb62cd44c5f3543db2de2",
         "rules/client-event-listeners.md": "242a873349febc1ce685e85617994784dbab92c2eaa68aed7fed5a83e7680e93",
-        "rules/client-localstorage-schema.md": "49b3b43eca6137dde3516fb4848dbd5b41a2d92e0b56e72b15ea63493db70caf",
+        "rules/client-localstorage-schema.md": "34141c691626fdf96f96d257fe2fba959dbf6e174f154e50223a7796fc932f3c",
         "rules/client-passive-event-listeners.md": "1f35016f9053de69e884ee9be00654e37979c2ca85f5e57764dc2626ff7acb4b",
         "rules/client-swr-dedup.md": "177911c203725c6fb691a18ff31d4588f74d5b5fd152197f8dfb162f7aee2ac6",
         "rules/js-batch-dom-css.md": "480b891b9eaf96e929dc1e964274a4828e3a78009b7d00ccd965a0d425215959",
