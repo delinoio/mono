@@ -154,6 +154,10 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
             s.state === SandboxState.PAUSED ? (
               <Button
                 variant={ButtonVariant.Secondary}
+                // The Promise that `onClick` returns keeps the button pending
+                // until the request and the refresh settle, so repeated
+                // activations send one request (see the "Take snapshot while
+                // a request is pending" test). Do not drop the return value.
                 onClick={() =>
                   act(
                     () => snapshot.mutateAsync(ids),
