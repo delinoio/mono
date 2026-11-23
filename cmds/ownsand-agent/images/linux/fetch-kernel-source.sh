@@ -15,6 +15,13 @@
 #   because both paths are on one file system, so no build ever sees a
 #   partial archive, and a download that fails or does not match the checksum
 #   leaves the published path (and any valid archive there) untouched.
+# - A directory at the archive path is an error that the helper never fixes:
+#   it exits non-zero, names the path and leaves the directory, its contents
+#   and the rest of the cache untouched. A directory that appears after the
+#   check is caught after the final rename: a plain mv then moved the archive
+#   into the directory, so the helper removes that copy again and fails. It
+#   avoids mv -T, which only GNU coreutils supports (the BSD mv of macOS
+#   hosts, where the tests also run, rejects it).
 #
 # The helper needs no lock: concurrent fills each publish a verified archive
 # with identical content. A lock would not help either, because flock is
@@ -39,6 +46,10 @@ verify() {
   echo "$sha256  $1" | sha256sum -c --quiet - >/dev/null 2>&1
 }
 
+if [ -d "$archive" ]; then
+  echo "the kernel source path $archive is a directory; remove it and run the build again" >&2
+  exit 1
+fi
 if [ -f "$archive" ] && verify "$archive"; then
   echo "using the cached kernel source $archive" >&2
   exit 0
@@ -61,5 +72,15 @@ if ! verify "$tmp"; then
 fi
 # mktemp creates the file with mode 0600; a published archive is readable.
 chmod 0644 "$tmp"
+# When a directory appeared at $archive since the check above, mv moves $tmp
+# into it under its own name instead of replacing it. Portable mv has no
+# option to refuse that (-T is GNU only), so detect it afterwards, remove the
+# copy the move left in the directory and fail. The directory ends up as it
+# was before.
 mv -f "$tmp" "$archive"
+if [ -d "$archive" ]; then
+  rm -f "$archive/${tmp##*/}"
+  echo "the kernel source path $archive became a directory; remove it and run the build again" >&2
+  exit 1
+fi
 echo "cached the kernel source $archive" >&2
