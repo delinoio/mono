@@ -89,6 +89,12 @@ export interface FakeChannelControl {
    * a value that is not binary.
    */
   receive(data: unknown): void;
+  /**
+   * Makes `close()` end the channel without a `close` event. The WebRTC
+   * specification says that closing the peer connection closes its channels
+   * without the usual close procedure, so a real channel can skip the event.
+   */
+  suppressCloseEvent: boolean;
   /** Sets `bufferedAmount` and emits `bufferedamountlow`, as a drained buffer. */
   drain(bufferedAmount?: number): void;
 }
@@ -118,6 +124,7 @@ class FakeChannel
   bufferedAmountLowThreshold = 0;
   readonly label: string;
   sendError: Error | undefined;
+  suppressCloseEvent = false;
   onSend: (bytes: Uint8Array) => void = () => {};
   afterSend: (bytes: Uint8Array) => void = () => {};
 
@@ -145,6 +152,7 @@ class FakeChannel
   close(): void {
     if (this.readyState === "closed") return;
     this.readyState = "closed";
+    if (this.suppressCloseEvent) return;
     queueMicrotask(() => this.emit("close"));
   }
 }

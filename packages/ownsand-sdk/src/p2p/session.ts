@@ -139,6 +139,13 @@ export class PeerSession {
   readonly #streams = new Map<bigint, AsyncQueue<DataFrame>>();
   #nextStreamId = 1n;
   #ended: Error | undefined;
+  /**
+   * Wake-up callbacks of the senders that wait for the send buffer to drain.
+   * The session end wakes them itself: a channel that the session closes
+   * locally (or whose peer connection closes) is not guaranteed to emit
+   * `close` or `bufferedamountlow`, and the senders would wait forever.
+   */
+  readonly #bufferWaiters = new Set<() => void>();
   /** Tail of the send queue; a frame sends after the previous one finished. */
   #sendTail: Promise<void> = Promise.resolve();
 
@@ -510,17 +517,19 @@ export class PeerSession {
   }
 
   /**
-   * Resolves when the send buffer drains, the channel closes or the optional
-   * signal aborts.
+   * Resolves when the send buffer drains, the channel closes, the session
+   * ends or the optional signal aborts.
    */
   #waitForBufferLow(signal?: AbortSignal): Promise<void> {
     return new Promise<void>((resolve) => {
       const done = () => {
+        this.#bufferWaiters.delete(done);
         this.#channel.removeEventListener("bufferedamountlow", done);
         this.#channel.removeEventListener("close", done);
         signal?.removeEventListener("abort", done);
         resolve();
       };
+      this.#bufferWaiters.add(done);
       this.#channel.addEventListener("bufferedamountlow", done);
       this.#channel.addEventListener("close", done);
       signal?.addEventListener("abort", done, { once: true });
@@ -640,6 +649,11 @@ export class PeerSession {
       return;
     }
     this.#ended = error;
+    // Wake the senders that wait for buffer space; they see the end and stop
+    // without a further send. The queued senders behind them follow in turn.
+    for (const wake of [...this.#bufferWaiters]) {
+      wake();
+    }
     for (const queue of this.#streams.values()) {
       queue.fail(error);
     }

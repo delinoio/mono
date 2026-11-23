@@ -2565,6 +2565,67 @@ describe("peer-to-peer data path", () => {
       expect(rtc.channels).toHaveLength(2);
       expect(messages).toBe(0);
     });
+
+    test("a session end releases the backpressured sender and the queued senders even if the old channel emits no event", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      // The channel that the session closes emits neither `close` nor
+      // `bufferedamountlow`, as a channel of a closed peer connection can.
+      channel.suppressCloseEvent = true;
+      let messages = 0;
+      channel.afterSend = () => {
+        messages++;
+        // The buffer stays full after each fragment, so the sender must wait.
+        channel.bufferedAmount = FULL;
+      };
+      channel.bufferedAmount = FULL;
+      const waiting = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      const queued = sandbox
+        .writeFile("/b", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      await h.clock.settle();
+      // One fragment of the first frame goes out when the buffer drains once.
+      channel.drain();
+      await h.clock.settle();
+      expect(messages).toBe(1);
+      rtc.peers[0]!.endSession(SessionEndReason.UNSPECIFIED);
+      // No timer is pending and the channel never signals again: only the
+      // session end can release the senders.
+      const results = await h.clock.run(Promise.all([waiting, queued]));
+      for (const result of results) {
+        expect(result).not.toBeInstanceOf(Error);
+      }
+      // The old channel sent no further fragment after the end; both writes
+      // completed on one replacement session.
+      expect(messages).toBe(1);
+      expect(channel.readyState).toBe("closed");
+      expect(rtc.channels).toHaveLength(2);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+
+    test("closing the handle releases a backpressured sender even if the channel emits no event", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.suppressCloseEvent = true;
+      channel.bufferedAmount = FULL;
+      const waiting = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      const queued = sandbox
+        .writeFile("/b", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      await h.clock.settle();
+      sandbox.close();
+      const results = await h.clock.run(Promise.all([waiting, queued]));
+      for (const result of results) {
+        expect(result).toBeInstanceOf(OwnSandHandleClosedError);
+      }
+    });
   });
 
   describe("closing the sandbox handle", () => {
