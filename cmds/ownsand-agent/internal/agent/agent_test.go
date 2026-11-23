@@ -234,8 +234,12 @@ func TestChannelLifecycleCommandsAndRemoval(t *testing.T) {
 	h.wait(0, "revocation ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetRevocationAck().GetRevocationId() == "r1" })
 
 	// Without heartbeat acknowledgements the agent reconnects and sends a
-	// new state report.
+	// new state report. The agent sends a state report only when a channel
+	// opens, so every report at or after this cursor belongs to the
+	// reconnect. Sample the cursor before the trigger: sampling it after the
+	// reconnect can skip past the new report when a heartbeat follows it.
 	channels := cp.Channels()
+	cursor := cp.Received()
 	cp.SetAck(false, true)
 	deadline := time.Now().Add(10 * time.Second)
 	for cp.Channels() == channels {
@@ -245,8 +249,7 @@ func TestChannelLifecycleCommandsAndRemoval(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	cp.SetAck(true, true)
-	n := cp.Received()
-	h.wait(n-1, "state report after reconnect", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	h.wait(cursor, "state report after reconnect", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
 
 	res = h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSandbox{DeleteSandbox: &ownsandv1.DeleteSandboxCommand{SandboxId: sandboxID}}})
 	if res.GetSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
