@@ -146,6 +146,19 @@ func receive(t *testing.T, ch <-chan tokenResult, what string) tokenResult {
 	}
 }
 
+// waitForFlightWaiters blocks until n callers wait on the token request in
+// progress, so a test acts only after a second caller joined the flight.
+func waitForFlightWaiters(t *testing.T, src *TokenSource, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for src.flightWaiters() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d callers did not wait on the token request (have %d)", n, src.flightWaiters())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestTokenSourceWaiterCancelDoesNotEndTheSharedRefresh(t *testing.T) {
 	c := &clock{now: time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)}
 	ts := &tokenServer{t: t, expires: 3600, block: make(chan struct{}), entered: make(chan struct{}, 4)}
@@ -155,6 +168,7 @@ func TestTokenSourceWaiterCancelDoesNotEndTheSharedRefresh(t *testing.T) {
 	<-ts.entered // the first caller's request is held open
 	waiterCtx, cancel := context.WithCancel(context.Background())
 	waiter := tokenAsync(src, waiterCtx)
+	waitForFlightWaiters(t, src, 2) // the waiter joined the request before it is cancelled
 	cancel()
 	// The cancelled waiter returns while the request is still held open.
 	if r := receive(t, waiter, "the cancelled waiter"); !errors.Is(r.err, context.Canceled) || r.token != "" {
@@ -188,6 +202,7 @@ func TestTokenSourceCallersShareOneRefreshAndTheCache(t *testing.T) {
 	first := tokenAsync(src, context.Background())
 	<-ts.entered
 	second := tokenAsync(src, context.Background())
+	waitForFlightWaiters(t, src, 2) // the second caller joined the request before it is released
 	ts.release()
 	for name, ch := range map[string]<-chan tokenResult{"first": first, "second": second} {
 		if r := receive(t, ch, name); r.err != nil || r.token != "token-1" {
