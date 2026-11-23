@@ -45,6 +45,11 @@ import {
   setup,
   text,
 } from "./testing/harness.ts";
+import {
+  expectTransportInterruption,
+  expectUnacceptedStreamEnd,
+  expectWindowExhausted,
+} from "./testing/recovery-assert.ts";
 
 const MIN = 60_000;
 
@@ -676,10 +681,15 @@ describe("exec over the relay", () => {
           .wait(),
       )
       .catch((e) => e);
-    expect(error).toBeDefined();
-    expect(h.clock.now() - started).toBeLessThanOrEqual(61_000);
+    // The operation ends with the failure of the last stream, not with a
+    // helper error such as the virtual clock's deadlock.
+    expectUnacceptedStreamEnd(error);
+    // The Exec call and every AttachExec call fail; each failure but the
+    // last one waits one back-off delay.
+    const attaches = h.api.callsOf("AttachExec").length;
+    expect(attaches).toBeGreaterThan(2);
+    expectWindowExhausted(h.clock.now() - started, attaches);
     expect(h.api.callsOf("Exec")).toHaveLength(1);
-    expect(h.api.callsOf("AttachExec").length).toBeGreaterThan(2);
   });
 
   test("cancels an accepted stream that receives no byte for 90 seconds and continues", async () => {
@@ -740,7 +750,9 @@ describe("exec over the relay", () => {
       yield execMsg(ev.started());
       yield new Disconnect();
     });
-    h.api.stream(RelayService, "AttachExec", async function* () {
+    let continuation: AbortSignal | undefined;
+    h.api.stream(RelayService, "AttachExec", async function* (_req, call) {
+      continuation = call.signal;
       // Keepalives every 30 seconds but never `accepted`, then a disconnect.
       for (let i = 0; i < 3; i++) {
         yield attachMsg(ev.keepalive());
@@ -756,9 +768,15 @@ describe("exec over the relay", () => {
           .wait(),
       )
       .catch((e) => e);
-    expect(error).toBeDefined();
-    // One continuation of about 90 seconds already exceeds the window.
+    // The recovery timer keeps running while only keepalives arrive, so the
+    // window ends the continuation at 60 seconds, before its own 90-second
+    // script (and its disconnect) could finish.
+    expect(error).toBeInstanceOf(AcceptanceDeadlineError);
+    expect(error.code).toBe(Code.Unavailable);
+    expect(h.clock.now()).toBeGreaterThanOrEqual(MIN);
+    expect(h.clock.now()).toBeLessThan(90_000);
     expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+    expect(continuation?.aborted).toBe(true);
   });
 
   describe("a recovery continuation that the agent does not accept", () => {
@@ -915,9 +933,14 @@ describe("exec over the relay", () => {
           .wait(),
       )
       .catch((e) => e);
-    expect(error).toBeDefined();
-    expect(h.clock.now()).toBeLessThanOrEqual(61_000);
-    expect(h.api.callsOf("AttachExec").length).toBeGreaterThanOrEqual(2);
+    // The operation ends with the last transport interruption, not with a
+    // helper error such as the virtual clock's deadlock.
+    expectTransportInterruption(error);
+    // The Exec call and every AttachExec call end in a disconnect; each
+    // failure but the last one waits one back-off delay.
+    const attaches = h.api.callsOf("AttachExec").length;
+    expect(attaches).toBeGreaterThanOrEqual(2);
+    expectWindowExhausted(h.clock.now(), attaches);
   });
 
   test("waits for a paused sandbox that resumes after 90 seconds before started", async () => {

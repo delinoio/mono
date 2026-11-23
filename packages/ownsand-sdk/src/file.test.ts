@@ -19,6 +19,10 @@ import {
   Trickle,
 } from "./testing/fake-api.ts";
 import { file, SANDBOX, setup, text } from "./testing/harness.ts";
+import {
+  expectTransportInterruption,
+  expectWindowExhausted,
+} from "./testing/recovery-assert.ts";
 import type { VirtualClock } from "./testing/virtual-clock.ts";
 import { uuidV7TimestampMs } from "./uuidv7.ts";
 import { validateGuestPath } from "./validate.ts";
@@ -202,12 +206,14 @@ describe("file read", () => {
     const error = await h.clock
       .run(h.client.sandbox(SANDBOX).readFileBytes("/data"))
       .catch((e) => e);
-    expect(error).toBeDefined();
-    expect(h.clock.now()).toBeLessThanOrEqual(61_000);
-    const offsets = h.api
-      .callsOf("ReadFile")
-      .slice(1)
-      .map((c) => (c.request as any).offset);
+    // The operation ends with the last transport interruption, not with a
+    // helper error such as the virtual clock's deadlock.
+    expectTransportInterruption(error);
+    // Every call ends in a failure and every failure but the last one waits
+    // one back-off delay; the last one finds no time left in the window.
+    const calls = h.api.callsOf("ReadFile");
+    expectWindowExhausted(h.clock.now(), calls.length - 1);
+    const offsets = calls.slice(1).map((c) => (c.request as any).offset);
     expect(new Set(offsets)).toEqual(new Set([1n]));
   });
 
