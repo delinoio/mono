@@ -414,6 +414,16 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			r.logger.Info("microVM restored from memory state", "sandbox_id", v.id)
 			return v, nil
 		}
+		// A canceled or expired caller context shows up as an ordinary
+		// restore error (the process start and the snapshot load both use
+		// ctx). The caller no longer wants the sandbox, so the cold boot
+		// below must not start a replacement process: fail the create with
+		// the context error and let cleanup stop the first process.
+		if cerr := ctx.Err(); cerr != nil {
+			r.logger.Warn("memory-state restore ended with the create context; not booting cold", "sandbox_id", v.id, "error", cerr)
+			cleanup()
+			return nil, fmt.Errorf("fcrt: restore memory state: %w", cerr)
+		}
 		// The hypervisor could not read the saved state: boot the snapshot
 		// disk cold.
 		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
