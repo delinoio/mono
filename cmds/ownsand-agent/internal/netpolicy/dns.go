@@ -40,6 +40,10 @@ const (
 // open.
 const DefaultDNSTCPDeadline = 30 * time.Second
 
+// dnsUDPUpstreamTimeout bounds the upstream dial of one forwarded UDP query
+// and, separately, the exchange on the upstream socket (write and read).
+const dnsUDPUpstreamTimeout = 5 * time.Second
+
 // dnsRejectLogInterval is the minimum time between two rejection log records
 // of one transport. Rejections in between only increase the count that the
 // next record reports.
@@ -77,6 +81,10 @@ type dnsLimits struct {
 	// makes a slow dial reproducible; production leaves it nil and dials with
 	// a net.Dialer.
 	dial func(ctx context.Context, network, address string) (net.Conn, error)
+	// dialUDP, when set, replaces the upstream UDP dial. It is a test hook
+	// that makes a dial that blocks, or that returns during Close,
+	// reproducible; production leaves it nil and dials with a net.Dialer.
+	dialUDP func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // dnsRejectLog logs rejections of one transport at most once per interval,
@@ -274,12 +282,27 @@ func (f *DNSForwarder) serveUDP() {
 		go func() {
 			defer f.wg.Done()
 			defer func() { <-f.udpSlots }()
-			c, err := net.DialTimeout("udp", f.upstream, 5*time.Second)
+			// The dial ends with the 5-second timeout or when Close cancels
+			// f.ctx, whichever is first.
+			ctx, cancel := context.WithTimeout(f.ctx, dnsUDPUpstreamTimeout)
+			defer cancel()
+			dial := f.limits.dialUDP
+			if dial == nil {
+				var d net.Dialer
+				dial = d.DialContext
+			}
+			c, err := dial(ctx, "udp", f.upstream)
 			if err != nil {
 				return
 			}
 			defer c.Close()
-			c.SetDeadline(time.Now().Add(5 * time.Second))
+			// Close cancels f.ctx: close the upstream socket then, so the read
+			// below ends even when the resolver stays silent. AfterFunc runs
+			// at once when f.ctx ended during the dial, so a socket that the
+			// dial returned during Close is closed too.
+			stop := context.AfterFunc(f.ctx, func() { c.Close() })
+			defer stop()
+			c.SetDeadline(time.Now().Add(dnsUDPUpstreamTimeout))
 			if _, err := c.Write(query); err != nil {
 				return
 			}
