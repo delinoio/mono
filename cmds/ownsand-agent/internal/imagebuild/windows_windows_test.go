@@ -6,9 +6,13 @@ import (
 	"bytes"
 	"encoding/xml"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/hcsrt"
 )
 
 func TestSelectEdition(t *testing.T) {
@@ -153,25 +157,55 @@ func TestUnattendXML(t *testing.T) {
 	}
 }
 
-// TestBuildLogsHoldNoPassword checks that the step logs of the answer-file
-// code path never carry the password: the only log statement near it logs
-// the guest binary size.
+// TestBuildLogsHoldNoPassword runs the production answer-file install step
+// against a temporary directory with a synthetic password and checks that
+// its log events, the generated SetupComplete.cmd and every other log line
+// never carry the password. It needs no Windows image, elevation or VM.
 func TestBuildLogsHoldNoPassword(t *testing.T) {
+	const password = "Synthetic-Pw-9f3a1c7e!"
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	password, err := randomPassword()
+	root := t.TempDir()
+	guest := bytes.Repeat([]byte{0xAB}, 1234)
+	guestPath := filepath.Join(t.TempDir(), "ownsand-guest.exe")
+	if err := os.WriteFile(guestPath, guest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newPassword := func() (string, error) { return password, nil }
+	if err := installSetupFiles(logger, root, guestPath, "en-US", newPassword); err != nil {
+		t.Fatal(err)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "answer file, SetupComplete.cmd and guest helper installed") ||
+		!strings.Contains(logs, "guest_binary_bytes=1234") {
+		t.Errorf("install event missing or wrong guest size: %s", logs)
+	}
+	if strings.Contains(logs, password) {
+		t.Errorf("log holds the password: %s", logs)
+	}
+	script, err := os.ReadFile(filepath.Join(root, "Windows", "Setup", "Scripts", "SetupComplete.cmd"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := unattendXML(unattendSettings{Language: "en-US", Password: password}); err != nil {
+	if strings.Contains(string(script), password) {
+		t.Error("SetupComplete.cmd holds the password")
+	}
+	if string(script) != setupCompleteCmd() {
+		t.Errorf("SetupComplete.cmd differs from setupCompleteCmd:\n%s", script)
+	}
+	answer, err := os.ReadFile(filepath.Join(root, "Windows", "Panther", "unattend.xml"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	logger.Info("answer file, SetupComplete.cmd and guest helper installed", "guest_binary_bytes", 1)
-	if strings.Contains(buf.String(), password) {
-		t.Fatal("log holds the password")
+	if !strings.Contains(string(answer), password) {
+		t.Error("unattend.xml lacks the synthetic password")
 	}
-	if strings.Contains(setupCompleteCmd(), password) {
-		t.Fatal("SetupComplete.cmd holds the password")
+	installed, err := os.ReadFile(filepath.Join(root, hcsrt.WindowsGuestBinary[len(`C:\`):]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(installed, guest) {
+		t.Error("guest helper copy differs from the source")
 	}
 }
 
