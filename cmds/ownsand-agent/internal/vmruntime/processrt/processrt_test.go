@@ -14,8 +14,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -454,6 +456,322 @@ func TestResumeFailureKeepsSandboxStopped(t *testing.T) {
 	waitState(t, "helper after the retried Resume", helperPID, "S", "R")
 	for _, pid := range []int{shell, sleeper} {
 		waitState(t, "worker after the retried Resume", pid, "S", "R")
+	}
+}
+
+func TestParseProcStatState(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+		want byte
+	}{
+		{"running", "42 (ownsand-guest) S 1 42 42 0 -1", 'S'},
+		{"stopped", "42 (ownsand-guest) T 1 42 42 0 -1\n", 'T'},
+		{"name with spaces and parentheses", "42 (a b) T) T 1 42", 'T'},
+		{"zombie", "42 (x) Z 1 42", 'Z'},
+	} {
+		got, err := parseProcStatState([]byte(tc.data))
+		if err != nil || got != tc.want {
+			t.Errorf("%s: parseProcStatState = %q, %v; want %q", tc.name, got, err, tc.want)
+		}
+	}
+	for _, bad := range []string{"", "42 x S 1", "42 (x)", "42 (x) ST 1"} {
+		if _, err := parseProcStatState([]byte(bad)); err == nil {
+			t.Errorf("parseProcStatState(%q) succeeded; want an error", bad)
+		}
+	}
+}
+
+func TestStateIsStopped(t *testing.T) {
+	for _, state := range []byte("TtZXx") {
+		if !stateIsStopped(state) {
+			t.Errorf("stateIsStopped(%q) = false; want true", state)
+		}
+	}
+	for _, state := range []byte("SRDIW") {
+		if stateIsStopped(state) {
+			t.Errorf("stateIsStopped(%q) = true; want false", state)
+		}
+	}
+}
+
+// TestHelperStoppedObservesRealHelper checks the observation of a real helper
+// process through both the /proc reader and the `ps` reader: a running helper
+// is not stopped, a SIGSTOP stops it, a SIGCONT runs it again, and a reaped
+// process counts as stopped. On macOS only the `ps` reader runs; the format of
+// its state column there is verified by a cross-compiling vet only.
+func TestHelperStoppedObservesRealHelper(t *testing.T) {
+	rt := newRuntime(t)
+	m := createSandbox(t, rt)
+	h, err := rt.lookup(m.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := h.cmd.Process.Pid
+	readers := map[string]func() (bool, error){
+		"ps": func() (bool, error) { return psStopped(context.Background(), pid) },
+	}
+	if runtime.GOOS == "linux" {
+		readers["proc"] = func() (bool, error) { return procThreadsStopped(pid) }
+		readers["helperStopped"] = func() (bool, error) { return helperStopped(context.Background(), pid) }
+	}
+	wait := func(name string, want bool, read func() (bool, error)) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			got, err := read()
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if got == want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: stopped = %v; want %v", name, got, want)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	for name, read := range readers {
+		wait(name+" running helper", false, read)
+	}
+	if err := h.signalHelper(sigStop); err != nil {
+		t.Fatal(err)
+	}
+	for name, read := range readers {
+		wait(name+" stopped helper", true, read)
+	}
+	if err := h.signalHelper(sigCont); err != nil {
+		t.Fatal(err)
+	}
+	for name, read := range readers {
+		wait(name+" continued helper", false, read)
+	}
+	if err := rt.Delete(context.Background(), m.SandboxID()); err != nil {
+		t.Fatal(err)
+	}
+	for name, read := range readers {
+		wait(name+" deleted helper", true, read)
+	}
+}
+
+// countingObserver returns an observer that reports the helper as not
+// stopped for the first falseCalls calls and then delegates to the real
+// observation, and a function that returns the number of calls. onFalse runs
+// before each call that reports not stopped.
+func countingObserver(falseCalls int, onFalse func(call int)) (func(context.Context, int) (bool, error), func() int) {
+	var calls atomic.Int32
+	observe := func(ctx context.Context, pid int) (bool, error) {
+		n := int(calls.Add(1))
+		if n <= falseCalls {
+			if onFalse != nil {
+				onFalse(n)
+			}
+			return false, nil
+		}
+		return helperStopped(ctx, pid)
+	}
+	return observe, func() int { return int(calls.Load()) }
+}
+
+// TestPauseEnumeratesOnlyAfterHelperIsObservedStopped checks that Pause does
+// not stop the exec workers before it observes the helper stopped: while the
+// observation still reports a running helper, the worker keeps running, and
+// the worker stops only after the observation succeeded.
+func TestPauseEnumeratesOnlyAfterHelperIsObservedStopped(t *testing.T) {
+	rt := newRuntime(t)
+	m := createSandbox(t, rt)
+	shell, sleeper := startWorker(t, m)
+	h, err := rt.lookup(m.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	observe, calls := countingObserver(3, func(call int) {
+		for _, pid := range []int{shell, sleeper} {
+			if state := processState(t, pid); strings.HasPrefix(state, "T") {
+				t.Errorf("worker %d stopped (state %q) before the helper was observed stopped (call %d)", pid, state, call)
+			}
+		}
+	})
+	h.observeStopped = observe
+	if err := rt.Pause(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls(); got != 4 {
+		t.Errorf("observations of the helper = %d; want 4 (three not stopped, one stopped)", got)
+	}
+	for _, pid := range []int{h.cmd.Process.Pid, shell, sleeper} {
+		waitState(t, "process after Pause", pid, "T")
+	}
+	h.observeStopped = nil
+	if err := rt.Resume(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "worker after Resume", shell, "S", "R")
+}
+
+// TestPauseRollsBackWhenHelperDoesNotStop checks that a Pause whose helper is
+// never observed stopped fails, signals no worker, and continues the helper
+// again, so that the sandbox is not frozen.
+func TestPauseRollsBackWhenHelperDoesNotStop(t *testing.T) {
+	rt := newRuntime(t)
+	m := createSandbox(t, rt)
+	shell, sleeper := startWorker(t, m)
+	h, err := rt.lookup(m.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperPID := h.cmd.Process.Pid
+	var signals []syscall.Signal
+	h.onSignal = func(sig syscall.Signal) { signals = append(signals, sig) }
+	h.stopWait = 100 * time.Millisecond
+	h.observeStopped = func(context.Context, int) (bool, error) { return false, nil }
+
+	err = rt.Pause(context.Background(), m)
+	if err == nil || !strings.Contains(err.Error(), "did not stop") {
+		t.Fatalf("Pause = %v; want a did-not-stop error", err)
+	}
+	if want := []syscall.Signal{syscall.SIGSTOP, syscall.SIGCONT}; !reflect.DeepEqual(signals, want) {
+		t.Errorf("signals to the helper = %v; want %v", signals, want)
+	}
+	waitState(t, "helper after the failed Pause", helperPID, "S", "R")
+	for _, pid := range []int{shell, sleeper} {
+		waitState(t, "worker after the failed Pause", pid, "S", "R")
+	}
+
+	// A later Pause works once the helper is observed stopped.
+	h.observeStopped = nil
+	h.stopWait = 0
+	if err := rt.Pause(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range []int{helperPID, shell, sleeper} {
+		waitState(t, "process after the second Pause", pid, "T")
+	}
+}
+
+// TestDeleteFailsWhenHelperDoesNotStop checks that a Delete whose helper is
+// never observed stopped returns an error, kills neither the workers nor the
+// helper, keeps the sandbox tracked and reports no cleanup, and that a retry
+// completes the cleanup.
+func TestDeleteFailsWhenHelperDoesNotStop(t *testing.T) {
+	rt := newRuntime(t)
+	m := createSandbox(t, rt)
+	shell, sleeper := startWorker(t, m)
+	h, err := rt.lookup(m.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperPID := h.cmd.Process.Pid
+	var signals []syscall.Signal
+	h.onSignal = func(sig syscall.Signal) { signals = append(signals, sig) }
+	h.stopWait = 100 * time.Millisecond
+	h.observeStopped = func(context.Context, int) (bool, error) { return false, nil }
+
+	err = rt.Delete(context.Background(), m.SandboxID())
+	if err == nil || !strings.Contains(err.Error(), "did not stop") {
+		t.Fatalf("Delete = %v; want a did-not-stop error", err)
+	}
+	for _, sig := range signals {
+		if sig == syscall.SIGKILL {
+			t.Fatalf("signals to the helper = %v; want no SIGKILL while the helper is not observed stopped", signals)
+		}
+	}
+	if _, err := rt.lookup(m.SandboxID()); err != nil {
+		t.Fatalf("sandbox after the failed Delete: %v; want it tracked", err)
+	}
+	if _, err := os.Stat(h.dir); err != nil {
+		t.Errorf("sandbox directory after the failed Delete: %v; want it kept", err)
+	}
+	if h.hasExited() {
+		t.Fatal("the helper died although it was not observed stopped")
+	}
+	for _, pid := range []int{shell, sleeper} {
+		waitState(t, "worker after the failed Delete", pid, "S", "R")
+	}
+
+	h.observeStopped = nil
+	h.stopWait = 0
+	if err := rt.Delete(context.Background(), m.SandboxID()); err != nil {
+		t.Fatalf("retried Delete: %v", err)
+	}
+	for _, pid := range []int{shell, sleeper, helperPID} {
+		waitState(t, "process after the retried Delete", pid, "")
+	}
+	if _, err := rt.lookup(m.SandboxID()); err == nil {
+		t.Error("sandbox is still tracked after the retried Delete")
+	}
+}
+
+// TestWaitHelperStoppedExitedHelper checks that a reaped helper counts as
+// stopped without any observation, because the observation would address a
+// process ID that another process can hold.
+func TestWaitHelperStoppedExitedHelper(t *testing.T) {
+	rt := newRuntime(t)
+	m := createSandbox(t, rt)
+	h := killHelperAndWait(t, rt, m)
+	h.observeStopped = func(context.Context, int) (bool, error) {
+		t.Error("observed a reaped helper")
+		return false, nil
+	}
+	start := time.Now()
+	if err := h.waitHelperStopped(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("wait for a reaped helper took %s; want it to return at once", elapsed)
+	}
+}
+
+// TestWaitHelperStoppedEndsWhenHelperExitsDuringWait checks that a helper
+// that exits while the runtime waits for its stop ends the wait without an
+// error.
+func TestWaitHelperStoppedEndsWhenHelperExitsDuringWait(t *testing.T) {
+	rt := newRuntime(t)
+	m := createSandbox(t, rt)
+	h, err := rt.lookup(m.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.stopWait = 10 * time.Second
+	h.observeStopped = func(context.Context, int) (bool, error) {
+		go func() { _ = syscall.Kill(h.cmd.Process.Pid, syscall.SIGKILL) }()
+		return false, nil
+	}
+	if err := h.waitHelperStopped(context.Background()); err != nil {
+		t.Fatalf("wait for a helper that exits: %v", err)
+	}
+	if !h.hasExited() {
+		t.Error("wait ended before the helper exited")
+	}
+}
+
+// TestWaitHelperStoppedReportsObservationError checks that an observation
+// that keeps failing ends in a timeout error that names the cause, and that a
+// canceled context ends the wait at once.
+func TestWaitHelperStoppedReportsObservationError(t *testing.T) {
+	rt := newRuntime(t)
+	m := createSandbox(t, rt)
+	h, err := rt.lookup(m.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("ps is broken")
+	h.stopWait = 50 * time.Millisecond
+	h.observeStopped = func(context.Context, int) (bool, error) { return false, cause }
+	if err := h.waitHelperStopped(context.Background()); !errors.Is(err, cause) {
+		t.Errorf("wait with a failing observation = %v; want it to wrap %v", err, cause)
+	}
+
+	h.stopWait = 10 * time.Second
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if err := h.waitHelperStopped(canceled); !errors.Is(err, context.Canceled) {
+		t.Errorf("wait with a canceled context = %v; want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("wait with a canceled context took %s; want it to return at once", elapsed)
 	}
 }
 

@@ -27,3 +27,6 @@ var hostGuestOS, hostBaseImage = ownsandv1.GuestOs_GUEST_OS_WINDOWS, ownsandv1.B
 func descendantGroups(context.Context, int) ([]int, error) { return nil, errors.ErrUnsupported }
 
 func signalGroupID(int, syscall.Signal) error { return errors.ErrUnsupported }
+
+// helperStopped exists only so that this package compiles on Windows.
+func helperStopped(context.Context, int) (bool, error) { return false, errors.ErrUnsupported }

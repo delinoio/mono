@@ -74,6 +74,110 @@ func descendantGroups(ctx context.Context, rootPID int) ([]int, error) {
 	return groupsBelow(procs, rootPID, exclude), nil
 }
 
+// helperStopped reports whether the process pid is stopped (by SIGSTOP) or
+// dead, so that it starts no further child. A process that no longer exists
+// counts as stopped.
+//
+// On Linux it reads the state of every thread of the process from /proc: the
+// helper is multi-threaded, and a group stop is complete only when every
+// thread stopped, although the main thread can report the stop first. On
+// macOS, and on a Linux host without a readable /proc, it reads the state of
+// the process from `ps`. ctx bounds the `ps` command.
+func helperStopped(ctx context.Context, pid int) (bool, error) {
+	if runtime.GOOS == "linux" {
+		if stopped, err := procThreadsStopped(pid); err == nil {
+			return stopped, nil
+		} else if !errors.Is(err, errProcUnavailable) {
+			return false, err
+		}
+	}
+	return psStopped(ctx, pid)
+}
+
+// errProcUnavailable reports that /proc does not describe processes.
+var errProcUnavailable = errors.New("/proc is unavailable")
+
+// procThreadsStopped reports whether every thread of pid is stopped or dead
+// according to /proc. A process that does not exist is stopped.
+func procThreadsStopped(pid int) (bool, error) {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		return false, errProcUnavailable
+	}
+	taskDir := "/proc/" + strconv.Itoa(pid) + "/task"
+	tids, err := os.ReadDir(taskDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", taskDir, err)
+	}
+	for _, tid := range tids {
+		data, err := os.ReadFile(taskDir + "/" + tid.Name() + "/stat")
+		if errors.Is(err, os.ErrNotExist) {
+			// The thread ended between the listing and the read.
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("read thread state: %w", err)
+		}
+		state, err := parseProcStatState(data)
+		if err != nil {
+			return false, err
+		}
+		if !stateIsStopped(state) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// parseProcStatState returns the state letter of the contents of
+// /proc/<pid>/stat: the first field after the last ')', because the command
+// name between the parentheses can hold spaces and parentheses.
+func parseProcStatState(data []byte) (byte, error) {
+	end := bytes.LastIndexByte(data, ')')
+	if end < 0 {
+		return 0, errors.New("unexpected /proc stat format: no command name")
+	}
+	fields := bytes.Fields(data[end+1:])
+	if len(fields) == 0 || len(fields[0]) != 1 {
+		return 0, errors.New("unexpected /proc stat format: no state")
+	}
+	return fields[0][0], nil
+}
+
+// stateIsStopped reports whether a process state letter means that the
+// process runs no code: stopped (T, t) or dead (Z, X, x).
+func stateIsStopped(state byte) bool {
+	switch state {
+	case 'T', 't', 'Z', 'X', 'x':
+		return true
+	}
+	return false
+}
+
+// psStopped reports whether `ps -o stat= -p pid` shows a stopped or dead
+// process. `ps` exits with status 1 and prints nothing for a process that does
+// not exist; that process counts as stopped. A `ps` that cannot run is an
+// error.
+func psStopped(ctx context.Context, pid int) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, psTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(bytes.TrimSpace(out)) == 0 && ctx.Err() == nil {
+			return true, nil
+		}
+		return false, fmt.Errorf("ps: %w", err)
+	}
+	stat := bytes.TrimSpace(out)
+	if len(stat) == 0 {
+		return true, nil
+	}
+	return stateIsStopped(stat[0]), nil
+}
+
 // process is one row of the process listing.
 type process struct{ pid, ppid, pgid int }
 

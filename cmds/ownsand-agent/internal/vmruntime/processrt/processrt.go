@@ -48,6 +48,14 @@ const ReadyTimeout = 30 * time.Second
 // stopTimeout bounds the wait for a killed helper to be reaped.
 const stopTimeout = 10 * time.Second
 
+// helperStopTimeout bounds the wait until the kernel has stopped the helper
+// after the runtime sent it SIGSTOP, and helperStopPoll is the interval between
+// two observations of the helper's state.
+const (
+	helperStopTimeout = 5 * time.Second
+	helperStopPoll    = 10 * time.Millisecond
+)
+
 // errHelperExited reports that the guest helper of a sandbox was reaped. The
 // operating system may have given its process ID, and so its process group ID,
 // to an unrelated process, so the runtime sends no signal to that group.
@@ -183,6 +191,13 @@ type vm struct {
 	// signal that signalHelper sends to the helper's group, so that a test
 	// can assert the signal order that a race would otherwise hide.
 	onSignal func(syscall.Signal)
+	// observeStopped and stopWait are test seams: they are nil and zero in
+	// production. observeStopped replaces the observation of the helper's
+	// state (helperStopped), so that a test can separate the delivery of
+	// SIGSTOP from the moment the runtime observes it. stopWait replaces
+	// helperStopTimeout.
+	observeStopped func(ctx context.Context, pid int) (bool, error)
+	stopWait       time.Duration
 }
 
 func (v *vm) SandboxID() string                         { return v.id }
@@ -218,6 +233,66 @@ func (v *vm) signalHelper(sig syscall.Signal) error {
 		v.onSignal(sig)
 	}
 	return signalGroup(v.cmd, sig)
+}
+
+// waitHelperStopped waits until the helper has been observed stopped, or has
+// exited, after the caller sent it SIGSTOP.
+//
+// A signal that signalHelper sent is only queued when the call returns: the
+// helper keeps running until the kernel delivers it, so it can still handle a
+// request and start an exec worker. A process listing taken before the stop
+// would miss that worker, and Pause would leave it running and Delete would
+// leave it orphaned after the helper died. Waiting until the helper is
+// stopped makes the listing complete, because a stopped helper starts no
+// further worker.
+//
+// A helper that was reaped counts as stopped: it starts no worker, and the
+// runtime sends no signal to it (see signalHelper). The wait ends with an
+// error when ctx ends or the helper does not stop within helperStopTimeout.
+// The last observation error is part of that error, so that a missing `ps`
+// is not reported as a helper that ignored the signal.
+func (v *vm) waitHelperStopped(ctx context.Context) error {
+	if v.cmd == nil || v.cmd.Process == nil {
+		return nil
+	}
+	timeout := helperStopTimeout
+	if v.stopWait > 0 {
+		timeout = v.stopWait
+	}
+	observe := helperStopped
+	if v.observeStopped != nil {
+		observe = v.observeStopped
+	}
+	pid := v.cmd.Process.Pid
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(helperStopPoll)
+	defer ticker.Stop()
+	var observeErr error
+	for {
+		// Check for an exit before every observation: the process ID of a
+		// reaped helper can belong to another process.
+		if v.hasExited() {
+			return nil
+		}
+		stopped, err := observe(ctx, pid)
+		if err == nil && stopped {
+			return nil
+		}
+		observeErr = err
+		select {
+		case <-v.exited:
+			return nil
+		case <-ctx.Done():
+			return fmt.Errorf("processrt: wait for the helper of sandbox %s to stop: %w", v.id, ctx.Err())
+		case <-timer.C:
+			if observeErr != nil {
+				return fmt.Errorf("processrt: sandbox %s helper did not stop within %s: %w", v.id, timeout, observeErr)
+			}
+			return fmt.Errorf("processrt: sandbox %s helper did not stop within %s", v.id, timeout)
+		case <-ticker.C:
+		}
+	}
 }
 
 // ignoreExited drops errHelperExited from err. A rollback that finds the
@@ -382,8 +457,9 @@ func (r *Runtime) lookup(id string) (*vm, error) {
 //
 // The guest helper starts every exec in a process group of its own, so a
 // signal to the helper's group does not reach the exec workers. Pause stops
-// the helper's group first, so that the helper cannot start another worker
-// while Pause enumerates the process tree, and then stops each worker group.
+// the helper's group first and waits until the helper is observed stopped, so
+// that the helper cannot start another worker while Pause enumerates the
+// process tree, and then stops each worker group.
 //
 // A failed Pause rolls back: the caller keeps the sandbox in the running
 // state when Pause fails, and a later Resume of that state does not reach the
@@ -398,13 +474,20 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err := v.signalHelper(sigStop); err != nil {
 		return fmt.Errorf("processrt: pause sandbox %s: %w", v.id, err)
 	}
-	groups, err := r.execGroups(ctx, v)
+	// SIGSTOP is only queued when signalHelper returns, so the helper can
+	// still start a worker. Enumerate the process tree after the stop took
+	// effect.
+	var groups []int
+	err = v.waitHelperStopped(ctx)
+	if err == nil {
+		groups, err = r.execGroups(ctx, v)
+	}
 	if err == nil {
 		err = r.signalGroups(v, groups, sigStop)
 	}
 	if err != nil {
-		// groups is empty when the enumeration failed, so only the helper
-		// was stopped. A group that was not stopped ignores SIGCONT.
+		// groups is empty when the wait or the enumeration failed, so only
+		// the helper was stopped. A group that was not stopped ignores SIGCONT.
 		rollbackErr := errors.Join(r.signalGroups(v, groups, sigCont), ignoreExited(v.signalHelper(sigCont)))
 		if rollbackErr != nil {
 			r.logger.Error("process sandbox pause rollback failed; the sandbox may stay stopped", "sandbox_id", v.id, "error", rollbackErr)
@@ -637,15 +720,24 @@ func (r *Runtime) removeSandbox(v *vm) error {
 	return nil
 }
 
-// stopHelper kills the exec workers below the helper and then the helper, and
-// waits until the helper is reaped. It returns early without killing the
-// helper when it cannot kill the workers.
+// stopHelper stops the helper, kills the exec workers below it and then the
+// helper, and waits until the helper is reaped. It returns early without
+// killing the helper when the helper does not stop or it cannot kill the
+// workers.
 func (r *Runtime) stopHelper(ctx context.Context, v *vm) error {
 	// Stop the helper first so that it cannot start another worker while the
 	// process tree is enumerated, then kill the workers and the helper. A stop
 	// error must not keep the helper alive.
 	_ = v.signalHelper(sigStop)
-	// WithoutCancel: see Delete. The listing has its own timeout.
+	// WithoutCancel: see Delete. The wait and the listing have timeouts of
+	// their own. The signal is only queued: enumerate the tree after the
+	// helper is observed stopped, or a worker that the helper starts in
+	// between would survive the kill. A helper that does not stop leaves the
+	// helper alive and tracked, and a retry of Delete completes the cleanup.
+	if err := v.waitHelperStopped(context.WithoutCancel(ctx)); err != nil {
+		r.logger.Error("process sandbox helper did not stop; delete can be retried", "sandbox_id", v.id, "error", err)
+		return err
+	}
 	if err := r.signalDescendants(context.WithoutCancel(ctx), v, sigKill); err != nil {
 		r.logger.Error("process sandbox exec workers may keep running; delete can be retried", "sandbox_id", v.id, "error", err)
 		return err
