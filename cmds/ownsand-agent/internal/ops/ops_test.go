@@ -511,13 +511,89 @@ func TestExecSandboxEnded(t *testing.T) {
 // state check of an exec and its admission.
 type pausedSandboxes struct {
 	*sandboxes.Manager
-	once     sync.Once
-	observed chan struct{}
-	release  chan struct{}
+	once        sync.Once
+	releaseOnce sync.Once
+	observed    chan struct{}
+	release     chan struct{}
 }
 
 func newPausedSandboxes(m *sandboxes.Manager) *pausedSandboxes {
 	return &pausedSandboxes{Manager: m, observed: make(chan struct{}), release: make(chan struct{})}
+}
+
+// Release lets the paused State call return. It is idempotent, so a test can
+// release the gate on its success path and again from t.Cleanup.
+func (p *pausedSandboxes) Release() {
+	p.releaseOnce.Do(func() { close(p.release) })
+}
+
+// gateOutcome is the result of waiting for a handler to reach a pause gate.
+type gateOutcome int
+
+const (
+	// gateReached means the handler reached the gate and is paused there.
+	gateReached gateOutcome = iota
+	// gateHandlerReturned means the handler returned before it reached the gate.
+	gateHandlerReturned
+	// gateTimedOut means the handler neither reached the gate nor returned
+	// within the bound.
+	gateTimedOut
+)
+
+// awaitGate waits until observed is closed, the handler reports its result on
+// done, or bound elapses, so a handler that returns early or never reaches the
+// gate fails its test and does not hang it until the test binary times out. A
+// result received from done is returned with gateHandlerReturned.
+func awaitGate[T any](observed <-chan struct{}, done <-chan T, bound time.Duration) (gateOutcome, T) {
+	var zero T
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-observed:
+		return gateReached, zero
+	case r := <-done:
+		return gateHandlerReturned, r
+	case <-timer.C:
+		return gateTimedOut, zero
+	}
+}
+
+func TestAwaitGate(t *testing.T) {
+	t.Run("reached", func(t *testing.T) {
+		observed := make(chan struct{})
+		close(observed)
+		if got, _ := awaitGate(observed, make(chan int, 1), time.Second); got != gateReached {
+			t.Fatalf("outcome %v", got)
+		}
+	})
+	t.Run("handler returned early", func(t *testing.T) {
+		done := make(chan int, 1)
+		done <- 7
+		got, r := awaitGate(make(chan struct{}), done, time.Second)
+		if got != gateHandlerReturned || r != 7 {
+			t.Fatalf("outcome %v result %v", got, r)
+		}
+	})
+	t.Run("never reached", func(t *testing.T) {
+		start := time.Now()
+		if got, _ := awaitGate(make(chan struct{}), make(chan int, 1), 20*time.Millisecond); got != gateTimedOut {
+			t.Fatalf("outcome %v", got)
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("wait was not bounded")
+		}
+	})
+}
+
+func TestPausedSandboxesReleaseIsIdempotent(t *testing.T) {
+	p := newPausedSandboxes(nil)
+	p.Release()
+	p.Release()
+	select {
+	case <-p.release:
+	default:
+		t.Fatal("gate was not released")
+	}
 }
 
 func (p *pausedSandboxes) State(id string) (ownsandv1.SandboxState, bool) {
@@ -569,6 +645,9 @@ func TestExecAdmissionRacesSandboxEnd(t *testing.T) {
 					return gate
 				},
 			})
+			// Release the gate on every exit of the test, so a handler that is
+			// paused in State cannot outlive a failed test and hang the package.
+			t.Cleanup(gate.Release)
 			req := e.execReq("/bin/sh", "-c", "sleep 60")
 			type result struct {
 				out      ops.Outcome
@@ -580,9 +659,14 @@ func TestExecAdmissionRacesSandboxEnd(t *testing.T) {
 				out, frames, accepted := e.handle(req, nil)
 				done <- result{out, frames, accepted}
 			}()
-			<-gate.observed
+			switch outcome, early := awaitGate(gate.observed, done, waitBound); outcome {
+			case gateHandlerReturned:
+				t.Fatalf("exec handler returned before reaching the state gate: %+v", early)
+			case gateTimedOut:
+				t.Fatalf("exec handler never reached the state gate within %v", waitBound)
+			}
 			tc.end(t, e, mgrClk)
-			close(gate.release)
+			gate.Release()
 			var r result
 			select {
 			case r = <-done:
