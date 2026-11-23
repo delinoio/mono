@@ -151,14 +151,17 @@ export function MembersPage() {
         title="Leave this organization?"
         description="You lose access to its devices and sandboxes. An admin can invite you again."
         confirmLabel="Leave organization"
-        onConfirm={async () => {
+        onConfirm={async (opening) => {
           await leave.mutateAsync({
             organizationId,
             userId: userId ?? "",
           });
-          navigate("/");
-          // After the navigation, so only the organization list at `/`
-          // refetches, and it is not awaited.
+          // Only the opening that asked to leave redirects; after a
+          // dismissal the user stays on the page they went to.
+          if (opening.isCurrent()) navigate("/");
+          // After the navigation decision, so a redirected user refetches
+          // only the organization list at `/`. It is not awaited and runs
+          // for a dismissed opening too.
           void refresh();
         }}
       />

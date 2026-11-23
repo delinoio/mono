@@ -342,9 +342,14 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
         title={`Remove ${d.name || "this device"}?`}
         description="Its sandboxes end and it can no longer connect. To use the machine again, enroll it as a new device."
         confirmLabel="Remove device"
-        onConfirm={async () => {
+        onConfirm={async (opening) => {
           await remove.mutateAsync({ organizationId, deviceId });
-          navigate(routePath({ id: RouteId.Devices, organizationId }));
+          // The redirect belongs to the opening that asked for the removal.
+          // After a dismissal the user is on another page, which stays. The
+          // mutation's own invalidation has already run.
+          if (opening.isCurrent()) {
+            navigate(routePath({ id: RouteId.Devices, organizationId }));
+          }
         }}
       />
     </>

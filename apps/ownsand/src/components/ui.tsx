@@ -378,8 +378,26 @@ export function SecretDialog({
 }
 
 /**
+ * One opening of a dialog, as its request callback sees it. A dialog opening
+ * ends on dismissal, a controlled close and unmount, and a request that
+ * settles later can ask whether its opening is still the current one before
+ * it changes anything that belongs to the opening: the route, the close of
+ * the dialog, a secret display. Work that belongs to the data and not to the
+ * opening, such as cache invalidation, runs whatever the answer is.
+ */
+export interface DialogOpening {
+  /** Whether the opening that started the request is still the current one. */
+  isCurrent(): boolean;
+}
+
+/**
  * An explicit confirmation step for a destructive action. The cancel
  * button comes first and gets the focus; Escape closes the dialog.
+ *
+ * `onConfirm` receives the opening that started the request. A caller that
+ * redirects after the request succeeds does so only while the opening is
+ * current, so a request that settles after Escape, Cancel or a click outside
+ * does not move the user away from the page they went to since.
  */
 export function ConfirmDialog({
   open,
@@ -393,7 +411,7 @@ export function ConfirmDialog({
   title: string;
   description: ReactNode;
   confirmLabel: string;
-  onConfirm: () => Promise<unknown>;
+  onConfirm: (opening: DialogOpening) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
 }) {
   const [error, setError] = useState<unknown>();
@@ -427,7 +445,7 @@ export function ConfirmDialog({
     // A retry removes the notice of the previous failure.
     setError(undefined);
     try {
-      await onConfirm();
+      await onConfirm({ isCurrent: () => opening.current === mine });
       if (opening.current === mine) onOpenChange(false);
     } catch (e) {
       if (opening.current === mine) setError(e);
