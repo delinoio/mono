@@ -242,7 +242,9 @@ func TestServiceAndMeterKeys(t *testing.T) {
 	if _, _, ok := MeterKey(accountsv1.Meter_METER_UNSPECIFIED); ok {
 		t.Error("MeterKey(UNSPECIFIED) is ok")
 	}
-	for _, bad := range []string{"", "ownsand", "ownsand.unknown", "OWNSAND.RELAY_EGRESS", "unspecified.", "ownſand.relay_egress", "ownsand.relay_egreſs", "ownsand.r2_ſtorage", "ownsand.claſſ_a_rpc", "ownsand.relay_egress.x", ".relay_egress", "ownsand."} {
+	for _, bad := range []string{"", "ownsand", "ownsand.unknown", "OWNSAND.RELAY_EGRESS", "unspecified.", "ownſand.relay_egress", "ownsand.relay_egreſs", "ownsand.r2_ſtorage", "ownsand.claſſ_a_rpc", "ownsand.relay_egress.x", ".relay_egress", "ownsand.",
+		// The separator is in the wrong place: the enum name matches, the canonical key does not.
+		"ownsand_relay.egress", "ownsand_relay_egress", "ownsand_r2.storage", "ownsand_class.a_rpc", "ownsand.relay_egress ", " ownsand.relay_egress", "ownsand.relay_egress\n"} {
 		if _, ok := MeterFromKey(bad); ok {
 			t.Errorf("MeterFromKey(%q) is ok", bad)
 		}
