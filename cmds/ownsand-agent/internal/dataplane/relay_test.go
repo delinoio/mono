@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -85,6 +86,12 @@ type relayEnv struct {
 }
 
 func newRelayEnv(t *testing.T, timing Timing, limits RelayLimits) *relayEnv {
+	return newRelayEnvWrapped(t, timing, limits, nil)
+}
+
+// newRelayEnvWrapped is newRelayEnv with wrap applied to the HTTP transport
+// that the relay client uses, so a test can observe its requests.
+func newRelayEnvWrapped(t *testing.T, timing Timing, limits RelayLimits, wrap func(http.RoundTripper) http.RoundTripper) *relayEnv {
 	e := &relayEnv{}
 	w := newWorld(t)
 	cp := testcp.New(t)
@@ -103,6 +110,9 @@ func newRelayEnv(t *testing.T, timing Timing, limits RelayLimits) *relayEnv {
 	hc, err := cpclient.NewHTTPClient(cp.URL, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if wrap != nil {
+		hc.Transport = wrap(hc.Transport)
 	}
 	dp := New(Options{
 		Dispatcher: w.d, Sandboxes: w.m, Logger: logger(), Timing: timing, Limits: limits,
@@ -175,6 +185,126 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// roundTripFunc adapts a function to http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// gatedBody is a response body whose Read blocks until release is closed and
+// then returns data, so a test completes a read at a chosen moment.
+type gatedBody struct {
+	started chan struct{}
+	release chan struct{}
+	data    []byte
+	once    sync.Once
+}
+
+func newGatedBody(data string) *gatedBody {
+	return &gatedBody{started: make(chan struct{}), release: make(chan struct{}), data: []byte(data)}
+}
+
+func (b *gatedBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return copy(p, b.data), nil
+}
+
+func (b *gatedBody) Close() error { return nil }
+
+// TestRelayLateReadOfRetiredResponseKeepsReplacementClock checks that the
+// receive clock follows the connection that issued the request: a read of
+// the retired connection's response that completes after the replacement
+// connection was installed refreshes the retired connection only, so the
+// replacement's receive timeout and echo probe keep their own bytes. A read
+// of the active response, also a partial frame, still refreshes its own clock.
+func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
+	retired, active := &rconn{}, &rconn{}
+	r := &relay{conn: retired}
+	bodies := map[*rconn]*gatedBody{retired: newGatedBody("late"), active: newGatedBody("par")}
+	hc := &http.Client{Transport: countingTransport{base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		c, _ := req.Context().Value(connCtxKey{}).(*rconn)
+		return &http.Response{StatusCode: http.StatusOK, Body: bodies[c], Request: req}, nil
+	})}}
+	open := func(c *rconn) io.ReadCloser {
+		req, err := http.NewRequestWithContext(withConn(context.Background(), c), http.MethodPost, "http://relay.test/connect", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := hc.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.Body
+	}
+	retiredBody := open(retired)
+	read := func(body io.ReadCloser) <-chan struct{} {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if _, err := body.Read(make([]byte, 16)); err != nil {
+				t.Errorf("read: %v", err)
+			}
+		}()
+		return done
+	}
+	// The retired response has a read in flight while the loop installs the
+	// replacement connection.
+	lateRead := read(retiredBody)
+	<-bodies[retired].started
+	r.mu.Lock()
+	r.conn = active
+	r.mu.Unlock()
+	activeBody := open(active)
+
+	old := time.Now().Add(-time.Hour).UnixNano()
+	retired.lastRecv.Store(old)
+	active.lastRecv.Store(old)
+	close(bodies[retired].release)
+	<-lateRead
+	if got := active.lastRecv.Load(); got != old {
+		t.Fatalf("a late read of the retired response moved the replacement's receive clock by %v", time.Duration(got-old))
+	}
+	if retired.lastRecv.Load() == old {
+		t.Fatal("a read did not refresh the receive clock of the connection that issued the request")
+	}
+
+	// A partial frame of the active response refreshes the active clock
+	// before any frame is decoded.
+	activeRead := read(activeBody)
+	<-bodies[active].started
+	if active.lastRecv.Load() != old {
+		t.Fatal("the receive clock moved before any byte arrived")
+	}
+	close(bodies[active].release)
+	<-activeRead
+	if active.lastRecv.Load() == old {
+		t.Fatal("a read of the active response did not refresh its receive clock")
+	}
+}
+
+// TestRelayConnectBindsResponseBodyToConnection checks that connectOnce binds
+// the Connect request to the connection that it installs, so the byte
+// counting of its response reaches that connection.
+func TestRelayConnectBindsResponseBodyToConnection(t *testing.T) {
+	var bound atomic.Pointer[rconn]
+	e := newRelayEnvWrapped(t, Timing{}, RelayLimits{}, func(base http.RoundTripper) http.RoundTripper {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if c, _ := req.Context().Value(connCtxKey{}).(*rconn); c != nil {
+				bound.Store(c)
+			}
+			return base.RoundTrip(req)
+		})
+	})
+	e.execGrant(e.execReq("/bin/true"))
+	e.conn()
+	e.dp.relay.mu.Lock()
+	installed := e.dp.relay.conn
+	e.dp.relay.mu.Unlock()
+	if installed == nil || bound.Load() != installed {
+		t.Fatalf("the Connect request is bound to %p, the installed connection is %p", bound.Load(), installed)
 	}
 }
 
