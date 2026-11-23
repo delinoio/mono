@@ -293,9 +293,20 @@ func TestRunClosesConnectionOnControlFlood(t *testing.T) {
 	if err := waitRun(t, done, time.Second); !errors.Is(err, ErrControlFlood) {
 		t.Fatalf("Run = %v, want ErrControlFlood", err)
 	}
-	if _, err := s.Next(context.Background(), nil); err != nil && !errors.Is(err, ErrControlFlood) {
-		// Queued frames drain first; the stream error follows.
-		t.Fatalf("stream error = %v", err)
+	// Queued frames drain first; the stream error follows. The queue holds at
+	// most MaxQueuedControlFrames frames, so a bounded loop reaches the error.
+	// The deadline only guards against a hang: Next never blocks while frames
+	// are queued or the stream has failed.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var streamErr error
+	for i := 0; i <= limits.MaxQueuedControlFrames; i++ {
+		if _, streamErr = s.Next(ctx, nil); streamErr != nil {
+			break
+		}
+	}
+	if !errors.Is(streamErr, ErrControlFlood) {
+		t.Fatalf("stream error is not ErrControlFlood (nil = no terminal error after the queue drained)")
 	}
 }
 
