@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/janitor"
@@ -152,27 +153,50 @@ func TestControlEventsBoundByProcessedCursor(t *testing.T) {
 // TestControlEventsWiredToLeaseHolderCursor runs the janitor with the cursor
 // accessor of a running control plane: once the lease holder processed an
 // event and the retention passed, the event goes.
+//
+// The test proves dispatch, not only the cursor value. The lease holder
+// starts its cursor at the newest event when it acquires the lease, so an
+// event that is committed before that point satisfies a cursor check without
+// the event processor ever delivering it. The test waits for the cursor to
+// exist first, then commits an event with an observable handler effect (a
+// connected agent receives a new configuration) and requires that effect.
 func TestControlEventsWiredToLeaseHolderCursor(t *testing.T) {
 	env := testenv.New(t)
 	ctx := context.Background()
-	if err := events.Write(ctx, env.DB.Pool, events.Event{Kind: events.KindDeviceConfigChanged}); err != nil {
+	org := env.NewOrg("alice")
+	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	agent := env.NewFakeAgent(dev)
+	agent.Connect()
+	agent.WaitFor("initial configuration", func(e *ownsandv1.AgentEnvelope) bool { return e.GetConfiguration() != nil })
+
+	// The lease holder initialized its cursor: from here on only the event
+	// processor can move the cursor over a newer event.
+	cursor := env.App.Control.ProcessedCursor
+	testenv.Eventually(t, "the lease holder cursor", func() bool { _, ok := cursor(); return ok })
+	initial, _ := cursor()
+	configurations := func() int {
+		n := 0
+		for _, e := range agent.Received() {
+			if e.GetConfiguration() != nil {
+				n++
+			}
+		}
+		return n
+	}
+	before := configurations()
+
+	if err := events.Write(ctx, env.DB.Pool, events.Event{Kind: events.KindDeviceConfigChanged, OrganizationID: org.ID, DeviceID: dev.ID}); err != nil {
 		t.Fatal(err)
 	}
 	newest, err := events.LatestID(ctx, env.DB.Pool)
-	if err != nil || newest == 0 {
-		t.Fatalf("newest event = %d, %v", newest, err)
+	if err != nil || newest <= initial {
+		t.Fatalf("newest event = %d (cursor at start %d), %v", newest, initial, err)
 	}
-	cursor := env.App.Control.ProcessedCursor
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if id, ok := cursor(); ok && id >= newest {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the lease holder did not process the event")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// The handler sends the configuration to the device channel, and the
+	// cursor moves over the event.
+	testenv.Eventually(t, "the handler to send the configuration of the new event", func() bool { return configurations() > before })
+	testenv.Eventually(t, "the cursor to reach the new event", func() bool { id, ok := cursor(); return ok && id >= newest })
+
 	// The event is processed but younger than the retention.
 	janitor.RunOnce(ctx, env.DB, testenv.Discard(), env.Clock.Now(), cursor)
 	if got, _ := events.LatestID(ctx, env.DB.Pool); got != newest {
