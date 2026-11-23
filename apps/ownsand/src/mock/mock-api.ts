@@ -1090,6 +1090,14 @@ export function createMockTransport(
       transferOwnership(req) {
         const { org, role } = membership(req.organizationId);
         requireOwner(role);
+        // Like the control plane, the owner cannot transfer to themselves;
+        // this runs before any lookup or change.
+        if (req.userId === userId) {
+          throw new ConnectError(
+            "invalid user_id: the caller is already the owner",
+            Code.InvalidArgument,
+          );
+        }
         const target = org.members.find((m) => m.userId === req.userId);
         if (target === undefined)
           throw new ConnectError("member not found", Code.NotFound);
@@ -1151,6 +1159,12 @@ export function createMockTransport(
               i.invitation.state === InvitationState.PENDING,
           );
           if (entry === undefined) continue;
+          // Like the control plane, an invitation at or after its expiry is
+          // indistinguishable from an unknown secret, and the check runs
+          // before the membership check.
+          const { expireTime } = entry.invitation;
+          if (expireTime !== undefined && now() >= timestampMs(expireTime))
+            continue;
           if (org.members.some((m) => m.userId === userId)) {
             throw new ConnectError(
               "you are already a member",
