@@ -360,8 +360,10 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 		}
 		switch ev.Kind {
 		case ownsand.ExecEventStdout:
-			_, err := a.env.Stdout.Write(ev.Data)
-			return err
+			if _, err := a.env.Stdout.Write(ev.Data); err != nil {
+				return &localWriteError{err: err}
+			}
+			return nil
 		case ownsand.ExecEventStderr:
 			_, err := a.env.Stderr.Write(ev.Data)
 			return err
@@ -384,6 +386,13 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 		}
 		if ctx.Err() != nil {
 			return &exitError{code: 130, msg: "interrupted; the command keeps running in the sandbox"}
+		}
+		var lw *localWriteError
+		if errors.As(err, &lw) {
+			// The local standard output rejected the guest output. The data
+			// path worked, so this is an ordinary CLI error (exit 1 with the
+			// write error on standard error), like a failed result write.
+			return lw.err
 		}
 		var dp *ownsand.DataPathError
 		if !errors.As(err, &dp) {
@@ -876,3 +885,10 @@ func (a *app) fileWrite(ctx context.Context, name string, args []string) error {
 	fmt.Fprintf(a.env.Stderr, "Wrote %d bytes.\n", n)
 	return nil
 }
+
+// localWriteError marks a failed write of guest output to the local standard
+// output, so that exec does not report it as a data path failure.
+type localWriteError struct{ err error }
+
+func (e *localWriteError) Error() string { return e.err.Error() }
+func (e *localWriteError) Unwrap() error { return e.err }
