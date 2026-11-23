@@ -51,28 +51,43 @@ export const SIGN_IN_NOT_CONFIGURED =
 /** Path of the sign-in callback route. */
 export const CALLBACK_PATH = "/callback";
 
+/** What the SDK's stored sign-in session says about this address. */
+export enum SignInSessionState {
+  /** No redirect is pending: there is no stored session, or it is for another address. */
+  None = "none",
+  /** A readable session names this address, so the SDK completes a redirect. */
+  Pending = "pending",
+  /** The stored session cannot be read, so the SDK hook would reject. */
+  Invalid = "invalid",
+}
+
 /**
- * Whether the Logto SDK has a sign-in redirect to complete at this address.
+ * The state of the SDK's stored sign-in session at this address.
  *
  * `useHandleSignInCallback` reports nothing when no redirect is pending: no
  * loading state, no error and no callback. Its `isLoading` is also `false`
  * for a render while a real redirect starts, so the hook state cannot tell
  * the two cases apart, and `@logto/react` exposes neither the client nor its
- * `isSignInRedirected` method. The console therefore applies the same rule
- * as `isSignInRedirected` (`@logto/client` 3.2.x) to the SDK's stored
- * sign-in session: a redirect is pending when `sessionStorage` holds the
- * session of the application (key `logto:<appId>:signInSession`, or the
- * legacy key `logto:<appId>`) and, when the session is readable, its
- * `redirectUri` equals the origin and path of this address. An unreadable
- * session counts as pending, because the hook then reports an error that the
- * page shows. Remove this check when `@logto/react` exposes the client or
- * the pending state.
+ * `isSignInRedirected` method. The console therefore applies the same rules
+ * as `getSignInSession` and `isSignInRedirected` (`@logto/client` 3.2.x) to
+ * the SDK's stored sign-in session: `sessionStorage` holds the session of
+ * the application under the key `logto:<appId>:signInSession`, or under the
+ * legacy key `logto:<appId>`. A missing or empty value is `None`. A value that
+ * is not JSON, or not an object whose `redirectUri`, `codeVerifier` and
+ * `state` are all strings, is `Invalid`: the client throws on it, and the hook
+ * of `@logto/react` awaits `isSignInRedirected` outside its error handling, so
+ * the failure would be an unhandled rejection and the page would stay blank
+ * instead of showing the sign-in error. A valid session is `Pending` when its
+ * `redirectUri` equals the origin and path of this address, and `None`
+ * otherwise. A storage that throws counts as `None`. Remove this check when
+ * `@logto/react` exposes the client or the pending state, or handles an
+ * invalid session itself.
  */
-export function isLogtoSignInPending(
+export function logtoSignInSessionState(
   appId: string,
   location: Pick<Location, "origin" | "pathname">,
   storage: Pick<Storage, "getItem"> | undefined = browserSessionStorage(),
-): boolean {
+): SignInSessionState {
   let stored: string | null;
   try {
     const key = `logto:${appId}`;
@@ -81,20 +96,32 @@ export function isLogtoSignInPending(
       storage?.getItem(key) ??
       null;
   } catch {
-    return false;
+    return SignInSessionState.None;
   }
-  if (stored === null || stored === "") return false;
+  if (stored === null || stored === "") return SignInSessionState.None;
+  let session: unknown;
   try {
-    const session: unknown = JSON.parse(stored);
-    const redirectUri =
-      typeof session === "object" && session !== null
-        ? (session as { redirectUri?: unknown }).redirectUri
-        : undefined;
-    if (typeof redirectUri !== "string") return true;
-    return redirectUri === `${location.origin}${location.pathname}`;
+    session = JSON.parse(stored);
   } catch {
-    return true;
+    return SignInSessionState.Invalid;
   }
+  if (typeof session !== "object" || session === null) {
+    return SignInSessionState.Invalid;
+  }
+  const { redirectUri, codeVerifier, state } = session as Record<
+    string,
+    unknown
+  >;
+  if (
+    typeof redirectUri !== "string" ||
+    typeof codeVerifier !== "string" ||
+    typeof state !== "string"
+  ) {
+    return SignInSessionState.Invalid;
+  }
+  return redirectUri === `${location.origin}${location.pathname}`
+    ? SignInSessionState.Pending
+    : SignInSessionState.None;
 }
 
 function browserSessionStorage(): Storage | undefined {

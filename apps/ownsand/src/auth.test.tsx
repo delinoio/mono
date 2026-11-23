@@ -3,7 +3,12 @@ import { LogtoProvider } from "@logto/react";
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { StrictMode, useEffect, useState } from "react";
-import { isLogtoSignInPending, LogtoBridge, useAuth } from "./auth.tsx";
+import {
+  LogtoBridge,
+  logtoSignInSessionState,
+  SignInSessionState,
+  useAuth,
+} from "./auth.tsx";
 import { pendingInvitation } from "./invitation.ts";
 import { LogtoCallbackPage } from "./pages/callback.tsx";
 import { type Route, RouterProvider } from "./router.tsx";
@@ -101,7 +106,9 @@ describe("LogtoBridge", () => {
 
 describe("LogtoCallbackPage", () => {
   /** Mounts the page like the console: under a Logto provider and the router. */
-  function renderCallback(options: { strict?: boolean; url?: string } = {}) {
+  function renderCallback(
+    options: { strict?: boolean; url?: string; realClient?: boolean } = {},
+  ) {
     window.history.replaceState(null, "", options.url ?? "/callback");
     const navigations: string[] = [];
     // The address that the first render sees, before any effect navigates.
@@ -117,7 +124,9 @@ describe("LogtoCallbackPage", () => {
     const page = (
       <LogtoProvider
         config={{ endpoint: "https://logto.test", appId: APP_ID }}
-        LogtoClientClass={FakeLogtoClient as never}
+        LogtoClientClass={
+          options.realClient ? undefined : (FakeLogtoClient as never)
+        }
       >
         <RouterProvider onNavigate={onNavigate}>
           <MountProbe />
@@ -232,62 +241,142 @@ describe("LogtoCallbackPage", () => {
     );
     expect(pendingInvitation.read()).toBeUndefined();
   });
+
+  describe("with a stored sign-in session that the SDK cannot read", () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    beforeEach(() => {
+      unhandled.length = 0;
+      process.on("unhandledRejection", onUnhandled);
+    });
+    afterEach(() => {
+      process.off("unhandledRejection", onUnhandled);
+    });
+
+    const unreadable: Array<[string, string]> = [
+      ["text that is not JSON", "{not json"],
+      ["an object without fields", "{}"],
+      [
+        "a session without a redirect URI",
+        JSON.stringify({ codeVerifier: "v", state: "s" }),
+      ],
+      [
+        "a session with a field that is not a string",
+        JSON.stringify({
+          redirectUri: "http://localhost/callback",
+          codeVerifier: 1,
+          state: "s",
+        }),
+      ],
+    ];
+    for (const [name, value] of unreadable) {
+      test(`shows the error notice, stays, and drops the invitation secret for ${name}`, async () => {
+        window.sessionStorage.setItem(SIGN_IN_SESSION_KEY, value);
+        pendingInvitation.save("osi_pending");
+        const { navigations } = renderCallback({
+          url: "/callback?code=x&state=y",
+          realClient: true,
+          strict: true,
+        });
+        await settle(100);
+        expect(screen.getByRole("alert").textContent).toContain(
+          "Something went wrong",
+        );
+        expect(window.location.pathname).toBe("/callback");
+        expect(navigations).toEqual([]);
+        expect(pendingInvitation.read()).toBeUndefined();
+        // Let a rejection that the SDK hook would raise reach the process.
+        await settle(100);
+        expect(unhandled).toEqual([]);
+      });
+    }
+  });
 });
 
-describe("isLogtoSignInPending", () => {
+describe("logtoSignInSessionState", () => {
   const location = { origin: "https://console.test", pathname: "/callback" };
   const session = (redirectUri: string) =>
     JSON.stringify({ redirectUri, codeVerifier: "v", state: "s" });
+  const state = logtoSignInSessionState;
   const storage = (items: Record<string, string>) => ({
     getItem: (key: string) => items[key] ?? null,
   });
 
   test("is false without a stored session", () => {
-    expect(isLogtoSignInPending("app", location, storage({}))).toBe(false);
-    expect(isLogtoSignInPending("app", location, undefined)).toBe(false);
+    expect(state("app", location, storage({}))).toBe(SignInSessionState.None);
+    expect(state("app", location, undefined)).toBe(SignInSessionState.None);
   });
 
   test("is true when the session redirect URI is this address", () => {
     const items = {
       "logto:app:signInSession": session("https://console.test/callback"),
     };
-    expect(isLogtoSignInPending("app", location, storage(items))).toBe(true);
+    expect(state("app", location, storage(items))).toBe(
+      SignInSessionState.Pending,
+    );
   });
 
   test("reads the legacy session key", () => {
     const items = { "logto:app": session("https://console.test/callback") };
-    expect(isLogtoSignInPending("app", location, storage(items))).toBe(true);
+    expect(state("app", location, storage(items))).toBe(
+      SignInSessionState.Pending,
+    );
   });
 
   test("ignores the session of another application", () => {
     const items = {
       "logto:other:signInSession": session("https://console.test/callback"),
     };
-    expect(isLogtoSignInPending("app", location, storage(items))).toBe(false);
+    expect(state("app", location, storage(items))).toBe(
+      SignInSessionState.None,
+    );
   });
 
   test("is false when the session belongs to another address", () => {
     const items = {
       "logto:app:signInSession": session("https://console.test/other"),
     };
-    expect(isLogtoSignInPending("app", location, storage(items))).toBe(false);
+    expect(state("app", location, storage(items))).toBe(
+      SignInSessionState.None,
+    );
   });
 
-  test("is true for a session that is not readable, so the hook reports it", () => {
+  test("is invalid for a session that the SDK cannot read", () => {
+    const unreadable = [
+      "{not json",
+      "{}",
+      "null",
+      "[]",
+      '"text"',
+      JSON.stringify({ codeVerifier: "v", state: "s" }),
+      JSON.stringify({
+        redirectUri: "https://console.test/callback",
+        state: "s",
+      }),
+      JSON.stringify({
+        redirectUri: "https://console.test/callback",
+        codeVerifier: "v",
+      }),
+      JSON.stringify({
+        redirectUri: "https://console.test/callback",
+        codeVerifier: 1,
+        state: "s",
+      }),
+    ];
+    for (const value of unreadable) {
+      expect(
+        state("app", location, storage({ "logto:app:signInSession": value })),
+      ).toBe(SignInSessionState.Invalid);
+      expect(state("app", location, storage({ "logto:app": value }))).toBe(
+        SignInSessionState.Invalid,
+      );
+    }
+  });
+
+  test("is none for an empty stored value", () => {
     expect(
-      isLogtoSignInPending(
-        "app",
-        location,
-        storage({ "logto:app:signInSession": "{not json" }),
-      ),
-    ).toBe(true);
-    expect(
-      isLogtoSignInPending(
-        "app",
-        location,
-        storage({ "logto:app:signInSession": "{}" }),
-      ),
-    ).toBe(true);
+      state("app", location, storage({ "logto:app:signInSession": "" })),
+    ).toBe(SignInSessionState.None);
   });
 
   test("is false when the storage throws", () => {
@@ -296,7 +385,7 @@ describe("isLogtoSignInPending", () => {
         throw new Error("blocked");
       },
     };
-    expect(isLogtoSignInPending("app", location, throwing)).toBe(false);
+    expect(state("app", location, throwing)).toBe(SignInSessionState.None);
   });
 });
 
