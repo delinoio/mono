@@ -452,15 +452,35 @@ func (s *session) watch(deadline time.Time) {
 			s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED)
 			return
 		case <-tick.C:
-			s.mu.Lock()
-			idle := len(s.streams) == 0 && time.Since(s.activity) >= s.d.timing.SessionIdle
-			s.mu.Unlock()
-			if idle {
-				s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_IDLE)
+			if s.endIdle() {
 				return
 			}
 		}
 	}
+}
+
+// idleLocked reports whether the session has no open request and no frame
+// activity for the idle time. The caller holds s.mu.
+func (s *session) idleLocked() bool {
+	return len(s.streams) == 0 && time.Since(s.activity) >= s.d.timing.SessionIdle
+}
+
+// endIdle ends the session with the idle reason when it is idle. It
+// evaluates the idle predicate and starts the end in one critical section,
+// so a request admitted or a frame written before that section keeps the
+// session open, and a request that arrives after it finds the session
+// ended and never registers or reaches the dispatcher. It reports whether
+// it ended the session.
+func (s *session) endIdle() bool {
+	s.mu.Lock()
+	if s.ended || !s.idleLocked() {
+		s.mu.Unlock()
+		return false
+	}
+	t := s.beginEndLocked(ownsandv1.SessionEndReason_SESSION_END_REASON_IDLE)
+	s.mu.Unlock()
+	s.finishEnd(t)
+	return true
 }
 
 // end closes the session. With a reason, it first sends a session-end
@@ -471,6 +491,23 @@ func (s *session) end(reason ownsandv1.SessionEndReason) {
 		s.mu.Unlock()
 		return
 	}
+	t := s.beginEndLocked(reason)
+	s.mu.Unlock()
+	s.finishEnd(t)
+}
+
+// sessionEnd is the state that the transition into the ended state captures
+// for the teardown.
+type sessionEnd struct {
+	reason            ownsandv1.SessionEndReason
+	open              []uint64
+	dc                *webrtc.DataChannel
+	remainingAtAnswer time.Duration
+}
+
+// beginEndLocked moves the session into the ended state. The caller holds
+// s.mu and has checked that s.ended is false.
+func (s *session) beginEndLocked(reason ownsandv1.SessionEndReason) sessionEnd {
 	s.ended = true
 	s.endReason = reason
 	close(s.stop)
@@ -478,9 +515,12 @@ func (s *session) end(reason ownsandv1.SessionEndReason) {
 	for id := range s.streams {
 		open = append(open, id)
 	}
-	dc := s.dc
-	remainingAtAnswer := s.remainingAtAnswer
-	s.mu.Unlock()
+	return sessionEnd{reason: reason, open: open, dc: s.dc, remainingAtAnswer: s.remainingAtAnswer}
+}
+
+// finishEnd tears the ended session down. It runs without s.mu.
+func (s *session) finishEnd(t sessionEnd) {
+	reason, open, dc, remainingAtAnswer := t.reason, t.open, t.dc, t.remainingAtAnswer
 	if reason != ownsandv1.SessionEndReason_SESSION_END_REASON_UNSPECIFIED && dc != nil {
 		// Closing stop above made every waiting operation send return, so
 		// write gets sendMu without waiting for a stalled channel.
