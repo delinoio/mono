@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { toast } from "delino-ui/toast";
 import { EnrollmentTokenState } from "@delino/ownsand-protos/v1/common_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   Empty,
   FormDialog,
+  MorePagesNotice,
   PageHeader,
   QueryBoundary,
   SecretDialog,
@@ -19,6 +20,12 @@ import {
   toastError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
+import {
+  FOLLOW_ALL_PAGES_OPTIONS,
+  boundaryOf,
+  uniqueRows,
+  useFollowAllPages,
+} from "../pagination.ts";
 
 /** Token lifetimes that the console offers; the maximum is 24 hours. */
 const TTL_HOURS = [1, 6, 12, 24] as const;
@@ -28,10 +35,25 @@ export function EnrollmentTokensPage() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, DeviceService);
-  const list = useQuery(DeviceService.method.listEnrollmentTokens, {
-    organizationId,
-    pageSize: 200,
-  });
+  // The control plane lists tokens in ascending ID order, so a new token is on
+  // the last page. Read every page, or it could not be revoked from here.
+  const list = useInfiniteQuery(
+    DeviceService.method.listEnrollmentTokens,
+    { organizationId, pageSize: 200, pageToken: "" },
+    {
+      ...FOLLOW_ALL_PAGES_OPTIONS,
+      getNextPageParam: (last) => last.nextPageToken || undefined,
+    },
+  );
+  const pages = useFollowAllPages(list);
+  const tokens = useMemo(
+    () =>
+      uniqueRows(
+        list.data?.pages.map((page) => page.tokens) ?? [],
+        (t) => t.enrollmentTokenId,
+      ),
+    [list.data],
+  );
   const create = useMutation(DeviceService.method.createEnrollmentToken, {
     onSuccess: refresh,
   });
@@ -49,52 +71,60 @@ export function EnrollmentTokensPage() {
         description="A token adds exactly one device to this organization. It works once and expires within 24 hours."
         action={<Button onClick={() => setCreating(true)}>Create token</Button>}
       />
-      <QueryBoundary query={list} loading="Loading enrollment tokens">
-        {(data) =>
-          data.tokens.length === 0 ? (
+      <QueryBoundary
+        query={boundaryOf(list, pages)}
+        loading="Loading enrollment tokens"
+      >
+        {() =>
+          tokens.length === 0 && !pages.isIncomplete ? (
             <Empty title="No enrollment tokens" />
           ) : (
-            <ul className="list" aria-label="Enrollment tokens">
-              {data.tokens.map((t) => (
-                <li key={t.enrollmentTokenId} className="list-row">
-                  <div className="list-main">
-                    <span className="list-title">
-                      <code>{t.tokenPrefix}…</code> ·{" "}
-                      {labels.tokenState[t.state]}
-                    </span>
-                    <span className="muted">
-                      Created {formatTime(t.createTime)} · expires{" "}
-                      {formatTime(t.expireTime)}
-                      {t.deviceId ? (
-                        <>
-                          {" "}
-                          · device <ShortId id={t.deviceId} />
-                        </>
+            <>
+              {tokens.length > 0 ? (
+                <ul className="list" aria-label="Enrollment tokens">
+                  {tokens.map((t) => (
+                    <li key={t.enrollmentTokenId} className="list-row">
+                      <div className="list-main">
+                        <span className="list-title">
+                          <code>{t.tokenPrefix}…</code> ·{" "}
+                          {labels.tokenState[t.state]}
+                        </span>
+                        <span className="muted">
+                          Created {formatTime(t.createTime)} · expires{" "}
+                          {formatTime(t.expireTime)}
+                          {t.deviceId ? (
+                            <>
+                              {" "}
+                              · device <ShortId id={t.deviceId} />
+                            </>
+                          ) : null}
+                        </span>
+                      </div>
+                      {t.state === EnrollmentTokenState.PENDING ? (
+                        <Button
+                          variant={ButtonVariant.Secondary}
+                          size={ButtonSize.Small}
+                          onClick={async () => {
+                            try {
+                              await revoke.mutateAsync({
+                                organizationId,
+                                enrollmentTokenId: t.enrollmentTokenId,
+                              });
+                              toast.success("The token is revoked.");
+                            } catch (error) {
+                              toastError(error);
+                            }
+                          }}
+                        >
+                          Revoke
+                        </Button>
                       ) : null}
-                    </span>
-                  </div>
-                  {t.state === EnrollmentTokenState.PENDING ? (
-                    <Button
-                      variant={ButtonVariant.Secondary}
-                      size={ButtonSize.Small}
-                      onClick={async () => {
-                        try {
-                          await revoke.mutateAsync({
-                            organizationId,
-                            enrollmentTokenId: t.enrollmentTokenId,
-                          });
-                          toast.success("The token is revoked.");
-                        } catch (error) {
-                          toastError(error);
-                        }
-                      }}
-                    >
-                      Revoke
-                    </Button>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              <MorePagesNotice noun="enrollment tokens" pages={pages} />
+            </>
           )
         }
       </QueryBoundary>

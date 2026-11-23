@@ -32,6 +32,7 @@ import { billingReasonOf } from "../api.ts";
 import { useAuth } from "../auth.tsx";
 import { ACCOUNTS_URL } from "../config.ts";
 import { errorMessage, labels } from "../format.ts";
+import type { FollowedPages } from "../pagination.ts";
 
 export function PageHeader({
   title,
@@ -273,6 +274,44 @@ export function QueryBoundary<T>({
       {children(query.data as T)}
     </>
   );
+}
+
+/**
+ * The state of the pages that a list has not loaded yet: a status while the
+ * console follows the continuation token, and the error with a retry when a
+ * later page failed. It renders nothing when the list is complete.
+ *
+ * `noun` is the plural of the listed object, for example "API keys".
+ */
+export function MorePagesNotice({
+  noun,
+  pages,
+}: {
+  noun: string;
+  pages: Pick<
+    FollowedPages,
+    "isIncomplete" | "loadMoreError" | "retryLoadMore"
+  >;
+}) {
+  if (pages.loadMoreError) {
+    return (
+      <>
+        <p className="muted">Some {noun} are not shown yet.</p>
+        <ErrorNotice
+          error={pages.loadMoreError}
+          onRetry={pages.retryLoadMore}
+        />
+      </>
+    );
+  }
+  if (pages.isIncomplete) {
+    return (
+      <p className="muted" role="status">
+        Loading more {noun}
+      </p>
+    );
+  }
+  return null;
 }
 
 export function Empty({

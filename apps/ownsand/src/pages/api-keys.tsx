@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
@@ -8,28 +8,50 @@ import {
   type ApiKey,
   ApiKeyService,
 } from "@delino/ownsand-protos/v1/api_key_pb";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Empty,
   FormDialog,
+  MorePagesNotice,
   PageHeader,
   QueryBoundary,
   SecretDialog,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
+import {
+  FOLLOW_ALL_PAGES_OPTIONS,
+  boundaryOf,
+  uniqueRows,
+  useFollowAllPages,
+} from "../pagination.ts";
 
 /** Route `api-keys`: create, list and revoke organization API keys. */
 export function ApiKeysPage() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, ApiKeyService);
-  const list = useQuery(ApiKeyService.method.listApiKeys, {
-    organizationId,
-    pageSize: 200,
-  });
+  // The control plane lists keys in ascending ID order, so a new key is on the
+  // last page. Read every page, or it could not be revoked from here.
+  const list = useInfiniteQuery(
+    ApiKeyService.method.listApiKeys,
+    { organizationId, pageSize: 200, pageToken: "" },
+    {
+      ...FOLLOW_ALL_PAGES_OPTIONS,
+      getNextPageParam: (last) => last.nextPageToken || undefined,
+    },
+  );
+  const pages = useFollowAllPages(list);
+  const apiKeys = useMemo(
+    () =>
+      uniqueRows(
+        list.data?.pages.map((page) => page.apiKeys) ?? [],
+        (k) => k.apiKeyId,
+      ),
+    [list.data],
+  );
   const create = useMutation(ApiKeyService.method.createApiKey, {
     onSuccess: refresh,
   });
@@ -51,35 +73,40 @@ export function ApiKeysPage() {
           <Button onClick={() => setCreating(true)}>Create API key</Button>
         }
       />
-      <QueryBoundary query={list} loading="Loading API keys">
-        {(data) =>
-          data.apiKeys.length === 0 ? (
+      <QueryBoundary query={boundaryOf(list, pages)} loading="Loading API keys">
+        {() =>
+          apiKeys.length === 0 && !pages.isIncomplete ? (
             <Empty title="No API keys" />
           ) : (
-            <ul className="list" aria-label="API keys">
-              {data.apiKeys.map((k) => (
-                <li key={k.apiKeyId} className="list-row">
-                  <div className="list-main">
-                    <span className="list-title">
-                      {k.name} · {labels.apiKeyState[k.state]}
-                    </span>
-                    <span className="muted">
-                      <code>{k.keyPrefix}…</code> · created{" "}
-                      {formatTime(k.createTime)}
-                    </span>
-                  </div>
-                  {k.state === ApiKeyState.ACTIVE ? (
-                    <Button
-                      variant={ButtonVariant.Danger}
-                      size={ButtonSize.Small}
-                      onClick={() => setRevoking(k)}
-                    >
-                      Revoke
-                    </Button>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
+            <>
+              {apiKeys.length > 0 ? (
+                <ul className="list" aria-label="API keys">
+                  {apiKeys.map((k) => (
+                    <li key={k.apiKeyId} className="list-row">
+                      <div className="list-main">
+                        <span className="list-title">
+                          {k.name} · {labels.apiKeyState[k.state]}
+                        </span>
+                        <span className="muted">
+                          <code>{k.keyPrefix}…</code> · created{" "}
+                          {formatTime(k.createTime)}
+                        </span>
+                      </div>
+                      {k.state === ApiKeyState.ACTIVE ? (
+                        <Button
+                          variant={ButtonVariant.Danger}
+                          size={ButtonSize.Small}
+                          onClick={() => setRevoking(k)}
+                        >
+                          Revoke
+                        </Button>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              <MorePagesNotice noun="API keys" pages={pages} />
+            </>
           )
         }
       </QueryBoundary>
