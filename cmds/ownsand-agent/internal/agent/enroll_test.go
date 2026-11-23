@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/cpclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/identity"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
@@ -133,4 +134,65 @@ func TestEnrollEarlierCallerDeadlineWins(t *testing.T) {
 		t.Fatalf("enroll took %s", took)
 	}
 	requirePendingKey(t, st)
+}
+
+// TestEnrollDeadlineClassification checks, without timers racing, which
+// deadline an error from the Enroll call is attributed to. The server can
+// answer deadline_exceeded before the client's own timers fire, so the
+// caller's context can still be live when the error arrives.
+func TestEnrollDeadlineClassification(t *testing.T) {
+	serverDeadline := connect.NewError(connect.CodeDeadlineExceeded, errors.New("deadline exceeded"))
+	other := connect.NewError(connect.CodeUnavailable, errors.New("down"))
+
+	t.Run("earlier caller deadline with a live context and server code", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		rctx, rcancel := context.WithTimeout(ctx, time.Hour)
+		defer rcancel()
+		if enrollDeadlineEnded(ctx, rctx, serverDeadline) {
+			t.Fatal("a server deadline_exceeded under an earlier caller deadline counted as the enrollment timeout")
+		}
+	})
+	t.Run("equal deadlines belong to the caller", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
+		defer cancel()
+		deadline, _ := ctx.Deadline()
+		rctx, rcancel := context.WithDeadline(ctx, deadline)
+		defer rcancel()
+		if enrollDeadlineEnded(ctx, rctx, serverDeadline) {
+			t.Fatal("equal deadlines counted as the enrollment timeout")
+		}
+	})
+	t.Run("expired caller context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		rctx, rcancel := context.WithTimeout(ctx, time.Hour)
+		defer rcancel()
+		cancel()
+		if enrollDeadlineEnded(ctx, rctx, context.Canceled) {
+			t.Fatal("a cancelled caller context counted as the enrollment timeout")
+		}
+	})
+	t.Run("no caller deadline and server code", func(t *testing.T) {
+		rctx, rcancel := context.WithTimeout(context.Background(), time.Hour)
+		defer rcancel()
+		if !enrollDeadlineEnded(context.Background(), rctx, serverDeadline) {
+			t.Fatal("the enrollment deadline answered by the server did not count as the enrollment timeout")
+		}
+	})
+	t.Run("earlier enrollment deadline with a later caller deadline", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+		defer cancel()
+		rctx, rcancel := context.WithTimeout(ctx, time.Minute)
+		defer rcancel()
+		if !enrollDeadlineEnded(ctx, rctx, serverDeadline) {
+			t.Fatal("the earlier enrollment deadline did not count as the enrollment timeout")
+		}
+	})
+	t.Run("other errors", func(t *testing.T) {
+		rctx, rcancel := context.WithTimeout(context.Background(), time.Hour)
+		defer rcancel()
+		if enrollDeadlineEnded(context.Background(), rctx, other) {
+			t.Fatal("an unrelated error counted as the enrollment timeout")
+		}
+	})
 }

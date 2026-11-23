@@ -68,13 +68,15 @@ func Enroll(ctx context.Context, st *store.Store, cp *cpclient.Client, token, na
 		AgentVersion:    version.Version,
 	}))
 	if err != nil {
-		// The enrollment deadline ended the call, and not the caller's
-		// context. The server sees the same deadline through the Connect
-		// timeout header and can answer deadline_exceeded just before the
-		// client timer fires, so that code counts as the deadline too.
-		if ctx.Err() == nil && (errors.Is(rctx.Err(), context.DeadlineExceeded) || connect.CodeOf(err) == connect.CodeDeadlineExceeded) {
+		if enrollDeadlineEnded(ctx, rctx, err) {
 			logger.Error("enrollment timed out", "timeout", cp.EnrollTimeout().String())
 			return nil, fmt.Errorf("agent: enroll: no answer within %s: %w: %w", cp.EnrollTimeout(), ErrEnrollTimeout, context.DeadlineExceeded)
+		}
+		if connect.CodeOf(err) == connect.CodeDeadlineExceeded && !errors.Is(err, context.DeadlineExceeded) && callerDeadlineFirst(ctx, rctx) {
+			// The server answered the caller's own deadline before the client
+			// timer fired, so the error carries no context error. Report the
+			// caller's deadline as the context error.
+			err = fmt.Errorf("%w: %w", err, context.DeadlineExceeded)
 		}
 		logger.Error("enrollment failed", "code", connect.CodeOf(err).String())
 		return nil, fmt.Errorf("agent: enroll: %w", err)
@@ -96,4 +98,32 @@ func Enroll(ctx context.Context, st *store.Store, cp *cpclient.Client, token, na
 	}
 	logger.Info("enrolled", "device_id", id.DeviceID, "organization_id", id.OrganizationID)
 	return id, nil
+}
+
+// callerDeadlineFirst reports whether the caller's context ends the call no
+// later than the enrollment deadline. rctx derives from ctx, so its deadline
+// is the earlier of the two and equals the caller's when the caller's is
+// earlier or equal.
+func callerDeadlineFirst(ctx, rctx context.Context) bool {
+	callerDeadline, ok := ctx.Deadline()
+	if !ok {
+		return false
+	}
+	enrollDeadline, _ := rctx.Deadline()
+	return !callerDeadline.After(enrollDeadline)
+}
+
+// enrollDeadlineEnded reports whether the enrollment deadline, and not the
+// caller's context, ended the Enroll call with err. The server sees the
+// deadline through the Connect timeout header and can answer
+// deadline_exceeded just before the client timer fires, so that code counts
+// as a deadline too. It does not say whose deadline it was, and the caller's
+// context can still look live at that moment. Comparing the two deadlines
+// does not depend on which timer fires first: a caller deadline that is
+// earlier than or equal to the enrollment deadline is the caller's.
+func enrollDeadlineEnded(ctx, rctx context.Context, err error) bool {
+	if ctx.Err() != nil || callerDeadlineFirst(ctx, rctx) {
+		return false
+	}
+	return errors.Is(rctx.Err(), context.DeadlineExceeded) || connect.CodeOf(err) == connect.CodeDeadlineExceeded
 }
