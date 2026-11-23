@@ -96,6 +96,7 @@ export function ApiKeysPage() {
                         <Button
                           variant={ButtonVariant.Danger}
                           size={ButtonSize.Small}
+                          aria-label={`Revoke API key ${k.name} (${k.keyPrefix})`}
                           onClick={() => setRevoking(k)}
                         >
                           Revoke

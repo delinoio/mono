@@ -150,7 +150,12 @@ describe("long names", () => {
     const name = longName("TPLNAME_");
     await signIn(screen, () => app.open("/"));
     await app.open(`/orgs/${ACME}/snapshots`);
-    await screen.getByRole("button", "Make template").first().tap();
+    // The row button is named by its row ("Make template from snapshot ..."),
+    // so match the start of the name.
+    await screen
+      .getByRole("button", "Make template", { exact: false })
+      .first()
+      .tap();
     await expect(screen.getByLabel("Template name")).toBeFocused();
     await browser.keyboard.type(name);
     await screen.getByRole("button", "Create template").tap();

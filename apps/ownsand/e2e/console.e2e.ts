@@ -155,6 +155,14 @@ describe("API keys", () => {
     await expect(dialog).toContainText("appears only once");
     await expect(dialog).toContainText("osk_");
 
+    // The focus starts on Copy, so Enter copies and keeps the dialog open;
+    // one Tab reaches Done.
+    await expect(screen.getByRole("button", "Copy")).toBeFocused();
+    await browser.keyboard.press("Enter");
+    await expect(dialog).toBeVisible();
+    await browser.keyboard.press("Tab");
+    await expect(screen.getByRole("button", "Done")).toBeFocused();
+
     await browser.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
     await expect(screen.getByText("nightly-ci · Active")).toBeVisible();
@@ -199,6 +207,76 @@ describe("devices", () => {
     await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
     await expect(screen.getByText("studio-mac").first()).toBeVisible();
     await expect(screen.getByText("build-box-1")).toBeHidden();
+  });
+
+  test("asks before it revokes a pending enrollment token", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/enrollment-tokens`);
+    await screen.getByRole("button", "Create token").tap();
+    await screen.getByRole("dialog").getByRole("button", "Create token").tap();
+    await screen.getByRole("button", "Done").tap();
+    await expect(
+      screen.getByRole("dialog", "Your new enrollment token"),
+    ).toBeHidden();
+    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+
+    await screen
+      .getByRole("button", "Revoke enrollment token ose_", { exact: false })
+      .tap();
+    const dialog = screen.getByRole("alertdialog", "Revoke token ose_", {
+      exact: false,
+    });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("button", "Cancel")).toBeFocused();
+    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+
+    await browser.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+
+    await screen
+      .getByRole("button", "Revoke enrollment token ose_", { exact: false })
+      .tap();
+    await screen
+      .getByRole("alertdialog", "Revoke token ose_", { exact: false })
+      .getByRole("button", "Revoke token")
+      .tap();
+    await expect(screen.getByText("The token is revoked.")).toBeVisible();
+    await expect(screen.getByText("Not used", { exact: false })).toBeHidden();
+  });
+
+  test("moves the focus to the page heading after a confirmed removal", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/members`);
+    const heading = screen.getByRole("heading", "Members", { level: 1 });
+    await expect(heading).toHaveAttribute("tabindex", "-1");
+
+    // Escape keeps the focus on the opener.
+    const remove = screen.getByRole("button", "Remove Jun Park");
+    await remove.focus();
+    await browser.keyboard.press("Enter");
+    await expect(screen.getByRole("alertdialog")).toBeVisible();
+    await browser.keyboard.press("Escape");
+    await expect(remove).toBeFocused();
+
+    // A confirmed removal deletes the opener, so the heading gets the focus.
+    await browser.keyboard.press("Enter");
+    await screen
+      .getByRole("alertdialog")
+      .getByRole("button", "Remove member")
+      .tap();
+    await expect(screen.getByText("Jun Park")).toBeHidden();
+    await expect(heading).toBeFocused();
   });
 });
 
@@ -559,7 +637,12 @@ describe("long names", () => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${ACME}/snapshots`);
-    await screen.getByRole("button", "Make template").first().tap();
+    // The row button is named by its row ("Make template from snapshot ..."),
+    // so match the start of the name.
+    await screen
+      .getByRole("button", "Make template", { exact: false })
+      .first()
+      .tap();
     // The template name field takes the initial focus.
     await expect(screen.getByLabel("Template name")).toBeFocused();
     await browser.keyboard.type(LONG_NAME);
@@ -579,7 +662,7 @@ describe("long names", () => {
         .getByRole("listitem")
         .filter({ hasText: LONG_NAME })
         .last()
-        .getByRole("button", "Delete")
+        .getByRole("button", "Delete template", { exact: false })
         .tap();
       const dialog = screen.getByRole(
         "alertdialog",
@@ -604,10 +687,12 @@ describe("long names", () => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
     await browser.setViewport({ width: 390, height: 800 });
-    await app.open(`/orgs/${ACME}/snapshots`);
-    await screen.getByRole("button", "Delete").first().tap();
+    // The snapshot dialog title now carries the snapshot short ID and wraps at
+    // this width, so the device dialog stands for a short title.
+    await app.open(`/orgs/${ACME}/devices/${BUILD_BOX}`);
+    await screen.getByRole("button", "Remove device").tap();
     await expect(
-      screen.getByRole("alertdialog", "Delete this snapshot?"),
+      screen.getByRole("alertdialog", "Remove build-box-1?"),
     ).toBeVisible();
     const m = await measureDialog(browser);
     expect(m.titleHeight).toBeLessThanOrEqual(m.titleLineHeight * 1.5);

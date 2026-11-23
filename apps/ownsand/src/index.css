@@ -164,6 +164,12 @@ h2 {
   padding: var(--app-gap);
 }
 
+/* The heading is a programmatic focus target (tabindex -1) after a dialog
+   closes or the page changes; it is not interactive, so it draws no ring. */
+h1[tabindex="-1"]:focus {
+  outline: none;
+}
+
 .page-header {
   display: flex;
   flex-wrap: wrap;

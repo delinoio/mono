@@ -29,7 +29,7 @@ interface Form {
   name: string;
   path: string;
   /** The button that opens the form. */
-  opener: string;
+  opener: string | RegExp;
   /** The title of the form dialog and the name of its submit button. */
   dialog: string;
   submit: string;
@@ -89,7 +89,7 @@ const FORMS: Form[] = [
   {
     name: "template",
     path: `/orgs/${MOCK_IDS.acme}/snapshots`,
-    opener: "Make template",
+    opener: /^Make template/,
     dialog: "Make a template",
     submit: "Create template",
     method: "CreateTemplate",

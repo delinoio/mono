@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { focusPageHeadingAfterNavigation } from "./components/focus.ts";
 
 /** Stable route IDs of the console contract. */
 export enum RouteId {
@@ -197,6 +198,16 @@ export function RouterProvider({
     },
     [onNavigate],
   );
+  // After an in-console navigation, a keyboard user whose focus was in the
+  // page that went away (a removed dialog opener, a deleted organization)
+  // would start at the top of the document. The first render and a
+  // navigation that kept the focus on an element are left alone.
+  const shownPathname = useRef(pathname);
+  useEffect(() => {
+    if (shownPathname.current === pathname) return;
+    shownPathname.current = pathname;
+    focusPageHeadingAfterNavigation();
+  }, [pathname]);
   const value = useMemo(
     () => ({ route: parseRoute(pathname), navigate }),
     [pathname, navigate],
