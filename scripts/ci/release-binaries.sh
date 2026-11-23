@@ -21,8 +21,11 @@
 #                                 downloaded artifacts (<artifacts>/release and
 #                                 <artifacts>/signed), adds the license files
 #                                 of the checkout and writes SHA256SUMS.
-#   github-releases <assets>      publish job, GH_TOKEN: checks each tag and
-#                                 creates or completes its GitHub Release.
+#   github-releases <assets> <dir>  publish job, GH_TOKEN: checks each tag, the
+#                                 staged files and the existing assets against
+#                                 the signed manifest in <dir> (after
+#                                 prepare-manifests), then creates or completes
+#                                 its GitHub Release.
 #   fetch-manifests <dir>         publish job, RELEASES_R2_*: downloads the
 #                                 current manifest and signature.
 #   prepare-manifests <dir> <assets>  publish job, no secrets: adds the
@@ -66,7 +69,7 @@ repo_root="$(cd "$here/../.." && pwd)"
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 usage() {
-  echo "usage: $0 build <cross|cgo> <out> | sign-macos <in> <out> | assemble <artifacts> <assets> | github-releases <assets> | fetch-manifests <dir> | prepare-manifests <dir> <assets> | sign-manifests <dir> | upload-manifests <dir>" >&2
+  echo "usage: $0 build <cross|cgo> <out> | sign-macos <in> <out> | assemble <artifacts> <assets> | github-releases <assets> <manifests> | fetch-manifests <dir> | prepare-manifests <dir> <assets> | sign-manifests <dir> | upload-manifests <dir>" >&2
   exit 2
 }
 
@@ -464,37 +467,137 @@ check_tag() {
   fi
 }
 
-github_releases() {
-  local assets="$1"
-  require_binaries
-  require_env REPOSITORY SHA GH_TOKEN
-  echo "## GitHub Releases" >> "$summary"
-  local name version dir binary tag files view notes
+# Prints the SHA-256 of a file.
+sha256_of() {
+  local line
+  line="$(sha256_line "$1")"
+  echo "${line%% *}"
+}
+
+# Prints "<asset name><TAB><sha256>" for every artifact that the signed
+# manifest lists for a version, nothing for a version it does not list. The
+# asset name is the last segment of the recorded download URL.
+signed_assets() {
+  local manifest="$1" version="$2"
+  jq -r --arg version "$version" '.releases[] | select(.version == $version) | .artifacts[] | [(.url | split("/") | last), .sha256] | @tsv' "$manifest"
+}
+
+# Checks, before any GitHub mutation, the release of every planned binary
+# against the signed manifest that `fetch-manifests` downloaded and
+# `prepare-manifests` verified with the agent's built-in keys. A version that
+# the signed manifest already lists is immutable: an agent that follows the
+# manifest checks the recorded URL against the signed SHA-256, so an asset
+# there must keep its bytes. The staged files and every existing asset that the
+# manifest references must match the signed digests, or the run fails with the
+# tag and the asset name.
+#
+# Fills the arrays that `github_releases` reads: `listed` (name -> 1 when the
+# signed manifest lists the version), `release_json` (name -> the existing
+# release) and `existing_assets` (name -> the asset names of the release).
+check_release_assets() {
+  local assets="$1" manifests="$2"
+  local name version dir binary tag key current asset digest staged remote work
+  local -A signed
+  work="$(mktemp -d)"
   while IFS=$'\t' read -r -u 3 name version dir binary; do
     tag="$name@$version"
     check_tag "$tag"
-    mapfile -t files < <(find "$assets/$name" -maxdepth 1 -type f -print | sort)
-    if (( ${#files[@]} == 0 )); then
+    if [[ -z "$(find "$assets/$name" -maxdepth 1 -type f -print -quit)" ]]; then
       echo "::error::No assets for $tag; run assemble first." >&2
       exit 1
     fi
-    if view="$(gh release view "$tag" --repo "$REPOSITORY" --json isDraft --jq .isDraft < /dev/null 2>&1)"; then
-      # A rerun after a failed later step: the release exists; replace the
-      # assets with the ones of this run.
-      echo "::notice::Release $tag exists; uploading its assets again."
-      gh release upload "$tag" --repo "$REPOSITORY" --clobber "${files[@]}" < /dev/null
-      if [[ "$view" == true ]]; then
+    if release_json[$name]="$(gh release view "$tag" --repo "$REPOSITORY" --json isDraft,assets < /dev/null 2>&1)"; then
+      existing_assets[$name]="$(jq -r '.assets[].name' <<< "${release_json[$name]}")"
+    elif [[ "${release_json[$name]}" == *"release not found"* ]]; then
+      unset "release_json[$name]"
+    else
+      echo "::error::Could not read release $tag: ${release_json[$name]}" >&2
+      exit 1
+    fi
+    key="$(field_of "$name" manifestObjectKey)"
+    [[ -n "$key" ]] || continue
+    if [[ ! -f "$manifests/$name/manifest.json" ]]; then
+      echo "::error::$manifests/$name/manifest.json is missing; run fetch-manifests and prepare-manifests first." >&2
+      exit 1
+    fi
+    current="$manifests/$name/current.json"
+    [[ -f "$current" ]] || continue
+    signed=()
+    while IFS=$'\t' read -r asset digest; do
+      [[ -n "$asset" ]] && signed[$asset]="$digest"
+    done < <(signed_assets "$current" "$version")
+    (( ${#signed[@]} > 0 )) || continue
+    listed[$name]=1
+    for asset in "${!signed[@]}"; do
+      staged="$assets/$name/$asset"
+      if [[ ! -f "$staged" ]]; then
+        echo "::error::The signed manifest lists $asset for $tag, but this run staged no such asset." >&2
+        exit 1
+      fi
+      if [[ "$(sha256_of "$staged")" != "${signed[$asset]}" ]]; then
+        echo "::error::The staged $asset of $tag differs from the SHA-256 that the signed manifest records. A listed version is never rebuilt; release a new version." >&2
+        exit 1
+      fi
+      if grep -Fxq -- "$asset" <<< "${existing_assets[$name]:-}"; then
+        remote="$work/$name-$asset"
+        gh release download "$tag" --repo "$REPOSITORY" --pattern "$asset" --output "$remote" < /dev/null
+        if [[ "$(sha256_of "$remote")" != "${signed[$asset]}" ]]; then
+          echo "::error::The existing $asset of $tag does not match the SHA-256 that the signed manifest records. Do not overwrite it; restore the recorded asset by hand." >&2
+          exit 1
+        fi
+        rm -f "$remote"
+      fi
+    done
+  done 3< <(binary_rows)
+  rm -rf "$work"
+}
+
+# Publishes the GitHub Release of every planned binary. All checks run first:
+# no asset changes before every tag, staged file and existing asset is
+# checked. For a version that the signed manifest lists, assets are only added
+# (never overwritten) and the existing ones are reused; any other existing
+# release is completed with the assets of this run, as before.
+github_releases() {
+  local assets="$1" manifests="$2"
+  require_binaries
+  require_env REPOSITORY SHA GH_TOKEN
+  echo "## GitHub Releases" >> "$summary"
+  local -A listed=() release_json=() existing_assets=()
+  check_release_assets "$assets" "$manifests"
+  local name version dir binary tag files file missing draft notes
+  while IFS=$'\t' read -r -u 3 name version dir binary; do
+    tag="$name@$version"
+    mapfile -t files < <(find "$assets/$name" -maxdepth 1 -type f -print | sort)
+    if [[ -n "${release_json[$name]:-}" ]]; then
+      draft="$(jq -r '.isDraft' <<< "${release_json[$name]}")"
+      if [[ -n "${listed[$name]:-}" ]]; then
+        # The signed manifest records the URLs of this version: keep every
+        # existing asset and add only the missing ones without overwriting.
+        missing=()
+        for file in "${files[@]}"; do
+          if ! grep -Fxq -- "$(basename "$file")" <<< "${existing_assets[$name]:-}"; then
+            missing+=("$file")
+          fi
+        done
+        echo "::notice::Release $tag is listed in the signed manifest; keeping its existing assets."
+        if (( ${#missing[@]} > 0 )); then
+          gh release upload "$tag" --repo "$REPOSITORY" "${missing[@]}" < /dev/null
+        fi
+      else
+        # A rerun after a failed later step, for a version that no signed
+        # manifest lists yet: replace the assets with the ones of this run.
+        echo "::notice::Release $tag exists; uploading its assets again."
+        gh release upload "$tag" --repo "$REPOSITORY" --clobber "${files[@]}" < /dev/null
+      fi
+      if [[ "$draft" == true ]]; then
         gh release edit "$tag" --repo "$REPOSITORY" --draft=false < /dev/null
       fi
-    elif [[ "$view" == *"release not found"* ]]; then
+    else
       notes="Release of \`$name\` $version from $SHA. See [the changelog](https://github.com/$REPOSITORY/blob/$name%40$version/$dir/CHANGELOG.md). Verify the downloads with \`SHA256SUMS\`."
       # Not the repository's "latest" release: the tags of every package
       # share one release list.
       gh release create "$tag" --repo "$REPOSITORY" --verify-tag --title "$tag" \
         --notes "$notes" --latest=false "${files[@]}" < /dev/null
-    else
-      echo "::error::Could not read release $tag: $view" >&2
-      exit 1
     fi
     echo "- [\`$tag\`](https://github.com/$REPOSITORY/releases/tag/$name%40$version): ${#files[@]} assets" >> "$summary"
   done 3< <(binary_rows)
@@ -644,8 +747,8 @@ upload_manifests() {
 
 command="${1:-}"
 case "$command" in
-  build | sign-macos | assemble | prepare-manifests) (( $# == 3 )) || usage ;;
-  github-releases | fetch-manifests | sign-manifests | upload-manifests) (( $# == 2 )) || usage ;;
+  build | sign-macos | assemble | prepare-manifests | github-releases) (( $# == 3 )) || usage ;;
+  fetch-manifests | sign-manifests | upload-manifests) (( $# == 2 )) || usage ;;
   *) usage ;;
 esac
 
@@ -653,7 +756,7 @@ case "$command" in
   build) build "$2" "$3" ;;
   sign-macos) sign_macos "$2" "$3" ;;
   assemble) assemble "$2" "$3" ;;
-  github-releases) github_releases "$2" ;;
+  github-releases) github_releases "$2" "$3" ;;
   fetch-manifests) fetch_manifests "$2" ;;
   prepare-manifests) prepare_manifests "$2" "$3" ;;
   sign-manifests) sign_manifests "$2" ;;

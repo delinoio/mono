@@ -643,13 +643,6 @@ jobs:
         env:
           BINARIES: ${{ needs.plan.outputs.binaries }}
         run: scripts/ci/release-binaries.sh assemble "$RUNNER_TEMP/artifacts" "$RUNNER_TEMP/assets"
-      - name: Create the GitHub Releases
-        env:
-          BINARIES: ${{ needs.plan.outputs.binaries }}
-          SHA: ${{ needs.plan.outputs.sha }}
-          REPOSITORY: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
-        run: scripts/ci/release-binaries.sh github-releases "$RUNNER_TEMP/assets"
       - name: Download the current release manifests
         env:
           BINARIES: ${{ needs.plan.outputs.binaries }}
@@ -670,6 +663,16 @@ jobs:
           RELEASE_MANIFEST_TOOL: ${{ runner.temp }}/artifacts/tools/release-manifest
           OWNSAND_AGENT_RELEASE_SIGNING_KEY: ${{ secrets.OWNSAND_AGENT_RELEASE_SIGNING_KEY }}
         run: scripts/ci/release-binaries.sh sign-manifests "$RUNNER_TEMP/manifests"
+      - name: Create the GitHub Releases
+        # After the signed manifest is prepared and signed, so that every check
+        # against it (staged digests, existing assets of a version the manifest
+        # already lists) runs before the first change to a GitHub Release.
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/release-binaries.sh github-releases "$RUNNER_TEMP/assets" "$RUNNER_TEMP/manifests"
       - name: Upload the manifests
         env:
           BINARIES: ${{ needs.plan.outputs.binaries }}

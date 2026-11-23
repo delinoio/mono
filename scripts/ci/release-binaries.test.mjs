@@ -6,6 +6,7 @@
 // stubbed release manifest tool.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -124,10 +125,47 @@ if [[ "$1" == api ]]; then
   jq -r "$4" "$file"
   exit 0
 fi
+# A GitHub Release is $STUB_DIR/release-<tag> (the \`--json isDraft,assets\`
+# answer) and the asset bytes in $STUB_DIR/release-assets/<tag>/<name>.
 if [[ "$1 $2" == "release view" ]]; then
   if [[ -f "$STUB_DIR/release-$3" ]]; then cat "$STUB_DIR/release-$3"; exit 0; fi
   echo "release not found" >&2
   exit 1
+fi
+if [[ "$1 $2" == "release download" ]]; then
+  tag="$3" pattern="" out=""
+  shift 3
+  while (( $# > 0 )); do
+    case "$1" in
+      --pattern) pattern="$2"; shift ;;
+      --output) out="$2"; shift ;;
+    esac
+    shift
+  done
+  cp "$STUB_DIR/release-assets/$tag/$pattern" "$out"
+  exit 0
+fi
+if [[ "$1 $2" == "release upload" ]]; then
+  tag="$3" clobber="" files=()
+  shift 3
+  while (( $# > 0 )); do
+    case "$1" in
+      --repo) shift ;;
+      --clobber) clobber=1 ;;
+      *) files+=("$1") ;;
+    esac
+    shift
+  done
+  # Like gh: an asset that exists is replaced only with --clobber.
+  for file in "\${files[@]}"; do
+    target="$STUB_DIR/release-assets/$tag/$(basename "$file")"
+    if [[ -f "$target" && -z "$clobber" ]]; then
+      echo "a release asset named $(basename "$file") already exists (HTTP 422)" >&2
+      exit 1
+    fi
+    mkdir -p "$(dirname "$target")"
+    cp "$file" "$target"
+  done
 fi
 `,
   // Serves the R2 S3 API from $STUB_DIR/r2/<bucket>/<key> and the public
@@ -940,6 +978,50 @@ function assembled(f) {
   return assets;
 }
 
+// The manifest directory after `fetch-manifests` and `prepare-manifests`: the
+// candidate manifest, and the signed current manifest when `current` lists
+// versions as `{ version, artifacts: { <asset>: <bytes> } }`.
+function prepared(f, current) {
+  const dir = join(f.dir, "manifests");
+  write(join(dir, "ownsand-agent/manifest.json"), "{}\n");
+  if (current) {
+    write(
+      join(dir, "ownsand-agent/current.json"),
+      JSON.stringify({
+        schema: 1,
+        releases: current.map(({ version, artifacts }) => ({
+          version,
+          artifacts: Object.entries(artifacts).map(([asset, bytes]) => ({
+            platform: "linux-amd64",
+            url: `https://github.com/owner/repo/releases/download/ownsand-agent%40${version}/${asset}`,
+            sha256: sha256Of(bytes),
+          })),
+        })),
+      }),
+    );
+    write(join(dir, "ownsand-agent/current.json.sig"), "sig\n");
+  }
+  return dir;
+}
+
+const sha256Of = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
+// An existing GitHub Release of the stub: `assets` maps names to bytes.
+function remoteRelease(f, tag, { draft = false, assets = {} } = {}) {
+  write(
+    join(f.dir, `release-${tag}`),
+    JSON.stringify({
+      isDraft: draft,
+      assets: Object.keys(assets).map((name) => ({ name })),
+    }),
+  );
+  for (const [name, bytes] of Object.entries(assets)) {
+    write(join(f.dir, "release-assets", tag, name), bytes);
+  }
+}
+
+const releaseWrites = /^gh release (create|upload|edit|delete) /m;
+
 test(
   "github-releases creates a release for each checked tag",
   { skip },
@@ -947,7 +1029,7 @@ test(
     const f = fixture(t);
     tagApi(f, "ownsand-agent@0.1.0");
     tagApi(f, "ownsand-cli@0.0.1");
-    const result = f.run(["github-releases", assembled(f)]);
+    const result = f.run(["github-releases", assembled(f), prepared(f)]);
     assert.equal(result.status, 0, result.stderr);
     assert.match(
       result.log,
@@ -959,13 +1041,23 @@ test(
 );
 
 test(
-  "github-releases completes an existing release on a rerun",
+  "github-releases completes an unfinished draft of an unlisted version",
   { skip },
   (t) => {
     const f = fixture(t);
     tagApi(f, "ownsand-agent@0.1.0");
-    writeFileSync(join(f.dir, "release-ownsand-agent@0.1.0"), "true\n");
-    const result = f.run(["github-releases", assembled(f)], {}, [agent]);
+    // The draft holds stale bytes and no signed manifest lists the version, so
+    // nothing references the asset yet: the assets of this run replace it.
+    remoteRelease(f, "ownsand-agent@0.1.0", {
+      draft: true,
+      assets: { "ownsand-agent-linux-amd64": "stale\n" },
+    });
+    const manifests = prepared(f, [
+      { version: "0.0.9", artifacts: { "ownsand-agent-linux-amd64": "old\n" } },
+    ]);
+    const result = f.run(["github-releases", assembled(f), manifests], {}, [
+      agent,
+    ]);
     assert.equal(result.status, 0, result.stderr);
     assert.match(
       result.log,
@@ -976,6 +1068,193 @@ test(
       /gh release edit ownsand-agent@0\.1\.0 --repo owner\/repo --draft=false/,
     );
     assert.doesNotMatch(result.log, /gh release create/);
+  },
+);
+
+test(
+  "github-releases keeps the assets of a version that the signed manifest lists",
+  { skip },
+  async (t) => {
+    const listedAssets = { "ownsand-agent-linux-amd64": "a\n" };
+    const manifestOf = (f) =>
+      prepared(f, [{ version: "0.1.0", artifacts: listedAssets }]);
+    await t.test("identical retry reuses every asset", (t) => {
+      const f = fixture(t);
+      tagApi(f, "ownsand-agent@0.1.0");
+      remoteRelease(f, "ownsand-agent@0.1.0", {
+        assets: { ...listedAssets, SHA256SUMS: "sums\n" },
+      });
+      const result = f.run(
+        ["github-releases", assembled(f), manifestOf(f)],
+        {},
+        [agent],
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.doesNotMatch(result.log, releaseWrites);
+      assert.doesNotMatch(result.log, /--clobber/);
+      assert.match(result.stdout, /keeping its existing assets/);
+    });
+    await t.test(
+      "an unfinished draft is published without a re-upload",
+      (t) => {
+        const f = fixture(t);
+        tagApi(f, "ownsand-agent@0.1.0");
+        remoteRelease(f, "ownsand-agent@0.1.0", {
+          draft: true,
+          assets: { ...listedAssets, SHA256SUMS: "sums\n" },
+        });
+        const result = f.run(
+          ["github-releases", assembled(f), manifestOf(f)],
+          {},
+          [agent],
+        );
+        assert.equal(result.status, 0, result.stderr);
+        assert.doesNotMatch(result.log, /gh release (create|upload|delete)/);
+        assert.match(
+          result.log,
+          /gh release edit ownsand-agent@0\.1\.0 .*--draft=false/,
+        );
+      },
+    );
+    await t.test("a missing asset is restored without overwriting", (t) => {
+      const f = fixture(t);
+      tagApi(f, "ownsand-agent@0.1.0");
+      remoteRelease(f, "ownsand-agent@0.1.0", {
+        assets: { SHA256SUMS: "sums\n" },
+      });
+      const result = f.run(
+        ["github-releases", assembled(f), manifestOf(f)],
+        {},
+        [agent],
+      );
+      assert.equal(result.status, 0, result.stderr);
+      const uploads = result.log.match(/^gh release upload .*$/gm) ?? [];
+      assert.equal(uploads.length, 1);
+      assert.match(uploads[0], /ownsand-agent-linux-amd64$/);
+      assert.doesNotMatch(uploads[0], /--clobber|SHA256SUMS/);
+      assert.doesNotMatch(result.log, /gh release (create|edit|delete)/);
+      assert.equal(
+        readFileSync(
+          join(f.dir, "release-assets/ownsand-agent@0.1.0/SHA256SUMS"),
+          "utf8",
+        ),
+        "sums\n",
+      );
+    });
+    await t.test("a deleted release is recreated from matching bytes", (t) => {
+      const f = fixture(t);
+      tagApi(f, "ownsand-agent@0.1.0");
+      const result = f.run(
+        ["github-releases", assembled(f), manifestOf(f)],
+        {},
+        [agent],
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.log, /gh release create ownsand-agent@0\.1\.0 /);
+      assert.doesNotMatch(result.log, /--clobber/);
+    });
+  },
+);
+
+test(
+  "github-releases fails before any change when bytes differ from the signed manifest",
+  { skip },
+  async (t) => {
+    // The CLI comes first in the plan: its release must not be created before
+    // the checks of the agent that follows it have passed.
+    const plan = [cli, agent];
+    await t.test("staged bytes differ", (t) => {
+      const f = fixture(t);
+      tagApi(f, "ownsand-agent@0.1.0");
+      tagApi(f, "ownsand-cli@0.0.1");
+      const manifests = prepared(f, [
+        {
+          version: "0.1.0",
+          artifacts: { "ownsand-agent-linux-amd64": "signed\n" },
+        },
+      ]);
+      const result = f.run(
+        ["github-releases", assembled(f), manifests],
+        {},
+        plan,
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stderr,
+        /The staged ownsand-agent-linux-amd64 of ownsand-agent@0\.1\.0 differs from the SHA-256 that the signed manifest records/,
+      );
+      assert.doesNotMatch(result.log, releaseWrites);
+    });
+    await t.test("an existing asset has other bytes", (t) => {
+      const f = fixture(t);
+      tagApi(f, "ownsand-agent@0.1.0");
+      tagApi(f, "ownsand-cli@0.0.1");
+      remoteRelease(f, "ownsand-agent@0.1.0", {
+        assets: { "ownsand-agent-linux-amd64": "tampered\n" },
+      });
+      const manifests = prepared(f, [
+        { version: "0.1.0", artifacts: { "ownsand-agent-linux-amd64": "a\n" } },
+      ]);
+      const result = f.run(
+        ["github-releases", assembled(f), manifests],
+        {},
+        plan,
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stderr,
+        /The existing ownsand-agent-linux-amd64 of ownsand-agent@0\.1\.0 does not match the SHA-256 that the signed manifest records/,
+      );
+      assert.doesNotMatch(result.log, releaseWrites);
+      assert.equal(
+        readFileSync(
+          join(
+            f.dir,
+            "release-assets/ownsand-agent@0.1.0/ownsand-agent-linux-amd64",
+          ),
+          "utf8",
+        ),
+        "tampered\n",
+      );
+    });
+    await t.test("the manifest lists an asset that was not staged", (t) => {
+      const f = fixture(t);
+      tagApi(f, "ownsand-agent@0.1.0");
+      tagApi(f, "ownsand-cli@0.0.1");
+      const manifests = prepared(f, [
+        {
+          version: "0.1.0",
+          artifacts: { "ownsand-agent-darwin-arm64": "d\n" },
+        },
+      ]);
+      const result = f.run(
+        ["github-releases", assembled(f), manifests],
+        {},
+        plan,
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stderr,
+        /lists ownsand-agent-darwin-arm64 for ownsand-agent@0\.1\.0, but this run staged no such asset/,
+      );
+      assert.doesNotMatch(result.log, releaseWrites);
+    });
+    await t.test("prepare-manifests did not run", (t) => {
+      const f = fixture(t);
+      tagApi(f, "ownsand-agent@0.1.0");
+      tagApi(f, "ownsand-cli@0.0.1");
+      const result = f.run(
+        ["github-releases", assembled(f), join(f.dir, "manifests")],
+        {},
+        plan,
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stderr,
+        /manifest\.json is missing; run fetch-manifests and prepare-manifests first/,
+      );
+      assert.doesNotMatch(result.log, releaseWrites);
+    });
   },
 );
 
@@ -999,7 +1278,11 @@ test(
       await t.test(label, (t) => {
         const f = fixture(t);
         setup(f);
-        const result = f.run(["github-releases", assembled(f)], {}, [agent]);
+        const result = f.run(
+          ["github-releases", assembled(f), prepared(f)],
+          {},
+          [agent],
+        );
         assert.notEqual(result.status, 0);
         assert.match(result.stderr, message);
         assert.doesNotMatch(result.log, /gh release (create|upload)/);
@@ -1273,6 +1556,32 @@ function publishSteps() {
   return job.split(/^ {6}- /m).slice(1);
 }
 
+test("publish-binaries checks the signed manifest before it changes a release", () => {
+  const steps = publishSteps();
+  const index = (needle) => steps.findIndex((step) => step.includes(needle));
+  const order = [
+    "release-binaries.sh assemble",
+    "release-binaries.sh fetch-manifests",
+    "release-binaries.sh prepare-manifests",
+    "release-binaries.sh sign-manifests",
+    "release-binaries.sh github-releases",
+    "release-binaries.sh upload-manifests",
+  ].map(index);
+  assert.ok(
+    order.every((position) => position >= 0),
+    order.join(),
+  );
+  assert.deepEqual(
+    order,
+    [...order].sort((a, b) => a - b),
+  );
+  // The release step reads the prepared manifest directory.
+  assert.match(
+    steps[order[4]],
+    /github-releases "\$RUNNER_TEMP\/assets" "\$RUNNER_TEMP\/manifests"/,
+  );
+});
+
 test("publish-binaries saves the manifests under an attempt-specific name", () => {
   const steps = publishSteps();
   const saves = steps.filter((step) =>
@@ -1316,6 +1625,8 @@ test("malformed plans and arguments fail", { skip }, async (t) => {
       [],
       ["build", "cross"],
       ["build", "other", "out"],
+      // `github-releases` needs the manifest directory as well.
+      ["github-releases", "assets"],
       ["publish", "x"],
     ]) {
       const result = f.run(args);
