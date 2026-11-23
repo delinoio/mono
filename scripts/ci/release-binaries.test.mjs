@@ -851,6 +851,30 @@ test(
 );
 
 test(
+  "a repeated assemble into the same directory keeps SHA256SUMS verifiable and free of itself",
+  { skip },
+  (t) => {
+    const f = fixture(t);
+    const assets = join(f.dir, "assets");
+    const assemble = hiddenLicenseCheckout(f);
+    const dir = join(assets, "ownsand-cli");
+    let previous;
+    for (const run of ["first", "second", "third"]) {
+      const result = assemble(assets);
+      assert.equal(result.status, 0, `${run}: ${result.stderr}`);
+      const sums = readFileSync(join(dir, "SHA256SUMS"), "utf8");
+      const names = listedNames(sums);
+      assert.ok(!names.includes("SHA256SUMS"), `${run}: lists itself`);
+      assert.equal(new Set(names).size, names.length, `${run}: duplicates`);
+      const check = sha256Check(dir);
+      assert.equal(check.status, 0, `${run}: ${check.stdout}${check.stderr}`);
+      if (previous !== undefined) assert.equal(sums, previous);
+      previous = sums;
+    }
+  },
+);
+
+test(
   "assemble rejects missing, extra and linked artifact entries",
   { skip },
   async (t) => {
