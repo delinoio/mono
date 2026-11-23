@@ -24,6 +24,7 @@ import (
 	"github.com/delinoio/mono/cmds/internal/credstore"
 	"github.com/delinoio/mono/cmds/internal/logto"
 	ownsand "github.com/delinoio/mono/go/ownsand"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 type result struct {
@@ -792,8 +793,21 @@ func TestSandboxCreateWaitsAndSendsFlags(t *testing.T) {
 		t.Fatalf("%+v", res)
 	}
 	r.f.mu.Lock()
+	if len(r.f.creat) != 1 {
+		n := len(r.f.creat)
+		r.f.mu.Unlock()
+		t.Fatalf("captured %d CreateSandbox requests, want 1", n)
+	}
 	req := r.f.creat[0]
 	r.f.mu.Unlock()
+	// The getters are nil-safe, so a missing placement fails here with a
+	// message instead of a panic.
+	if got := req.GetPlacement().GetHostOs(); got != ownsandv1.HostOs_HOST_OS_LINUX {
+		t.Fatalf("placement.host_os %v, want %v (placement %v)", got, ownsandv1.HostOs_HOST_OS_LINUX, req.GetPlacement())
+	}
+	if got := req.GetPlacement().GetArch(); got != ownsandv1.Arch_ARCH_AMD64 {
+		t.Fatalf("placement.arch %v, want %v (placement %v)", got, ownsandv1.Arch_ARCH_AMD64, req.GetPlacement())
+	}
 	if req.GetMaxTtl().AsDuration() != 7*24*time.Hour || req.GetNetwork().GetMode().String() != "NETWORK_MODE_NONE" || req.GetLabels()["team"] != "ci" || len(req.GetIdempotencyKey()) != 36 {
 		t.Fatalf("request %v", req)
 	}
