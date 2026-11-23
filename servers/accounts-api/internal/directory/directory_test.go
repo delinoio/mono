@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -256,5 +257,139 @@ func TestLogtoCachedTokenIsReusedUntilExpiry(t *testing.T) {
 	}
 	if got := s.tokens.Load(); got != 2 {
 		t.Fatalf("token requests = %d, want 2 after the token entered the refresh margin", got)
+	}
+}
+
+// waitWaiters waits until n callers have started or joined the running token
+// refresh.
+func waitWaiters(t *testing.T, l *directory.Logto, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for l.RefreshWaiters() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh waiters = %d, want %d", l.RefreshWaiters(), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestLogtoFailedRefreshIsSharedByJoinedCallers(t *testing.T) {
+	var tokens atomic.Int32
+	started := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oidc/token":
+			// The first request is held and fails; later ones succeed.
+			if tokens.Add(1) == 1 {
+				started <- struct{}{}
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					return
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "tok", "expires_in": 3600})
+		case "/api/users/u1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "u1", "primaryEmail": "a@example.com", "name": "Ann"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	defer unblock()
+	l := directory.NewLogto(directory.LogtoConfig{
+		Endpoint: srv.URL, ClientID: "m2m", ClientSecret: "s3cret",
+		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	})
+
+	const callers = 3
+	results := make([]<-chan userResult, 0, callers)
+	results = append(results, startUser(context.Background(), l))
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("token request did not start")
+	}
+	for i := 1; i < callers; i++ {
+		results = append(results, startUser(context.Background(), l))
+	}
+	// Every caller has joined the failing refresh before it ends.
+	waitWaiters(t, l, callers)
+	unblock()
+	for i, ch := range results {
+		r := receive(t, ch, "caller")
+		if r.err == nil || errors.Is(r.err, directory.ErrUserNotFound) || !strings.Contains(r.err.Error(), "503") {
+			t.Fatalf("caller %d error = %v, want the shared 503 token error", i, r.err)
+		}
+	}
+	if got := tokens.Load(); got != 1 {
+		t.Fatalf("token requests = %d, want 1 for the failed burst", got)
+	}
+
+	// A lookup that starts after the failure retries and caches the token.
+	if r := receive(t, startUser(context.Background(), l), "retry"); r.err != nil || r.user.Name != "Ann" {
+		t.Fatalf("retry = %+v, want the user", r)
+	}
+	if got := tokens.Load(); got != 2 {
+		t.Fatalf("token requests after retry = %d, want 2", got)
+	}
+	if r := receive(t, startUser(context.Background(), l), "cached"); r.err != nil || r.user.Name != "Ann" {
+		t.Fatalf("cached lookup = %+v, want the user", r)
+	}
+	if got := tokens.Load(); got != 2 {
+		t.Fatalf("token requests after cached lookup = %d, want 2 (the token must be reused)", got)
+	}
+}
+
+func TestLogtoCanceledWaiterDoesNotAffectSharedFailure(t *testing.T) {
+	var tokens atomic.Int32
+	started := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens.Add(1)
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	defer unblock()
+	l := directory.NewLogto(directory.LogtoConfig{
+		Endpoint: srv.URL, ClientID: "m2m", ClientSecret: "s3cret",
+		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	})
+
+	leader := startUser(context.Background(), l)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("token request did not start")
+	}
+	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	waiter := startUser(waiterCtx, l)
+	other := startUser(context.Background(), l)
+	waitWaiters(t, l, 3)
+	cancelWaiter()
+	if r := receive(t, waiter, "canceled waiter"); !errors.Is(r.err, context.Canceled) {
+		t.Fatalf("canceled waiter error = %v, want context.Canceled", r.err)
+	}
+	unblock()
+	for name, ch := range map[string]<-chan userResult{"leader": leader, "other": other} {
+		if r := receive(t, ch, name); r.err == nil || !strings.Contains(r.err.Error(), "503") {
+			t.Fatalf("%s error = %v, want the shared 503 token error", name, r.err)
+		}
+	}
+	if got := tokens.Load(); got != 1 {
+		t.Fatalf("token requests = %d, want 1", got)
 	}
 }
