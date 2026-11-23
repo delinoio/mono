@@ -76,11 +76,22 @@ type Logto struct {
 	accessToken string
 	expiresAt   time.Time
 
-	// refreshGate admits one token refresh at a time. It is a channel with
-	// capacity one and not a mutex so that a caller waits for it with its
-	// context: a caller that is canceled while another refresh runs returns
-	// at once.
-	refreshGate chan struct{}
+	// inflight is the token refresh that is running, or nil. It is guarded
+	// by mu. Callers that need a token while it is set join it and share its
+	// result, also when it fails, so that a burst of lookups sends one token
+	// request and not one request per caller.
+	inflight *tokenRefresh
+}
+
+// tokenRefresh is one token request that every caller of a burst shares.
+type tokenRefresh struct {
+	// done is closed after token and err are set.
+	done  chan struct{}
+	token string
+	err   error
+	// waiters counts the callers that started or joined the refresh. It is
+	// guarded by Logto.mu and read by tests only.
+	waiters int
 }
 
 // NewLogto returns a Management API client. It fetches no token until the
@@ -96,7 +107,7 @@ func NewLogto(cfg LogtoConfig) *Logto {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Logto{cfg: cfg, refreshGate: make(chan struct{}, 1)}
+	return &Logto{cfg: cfg}
 }
 
 type tokenResponse struct {
@@ -104,63 +115,54 @@ type tokenResponse struct {
 	ExpiresIn   int64  `json:"expires_in"`
 }
 
-// cachedToken returns the cached access token while it is outside the refresh
-// margin.
-func (l *Logto) cachedToken() (string, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.accessToken != "" && l.cfg.Now().Before(l.expiresAt.Add(-tokenRefreshMargin)) {
-		return l.accessToken, true
-	}
-	return "", false
-}
-
-type tokenResult struct {
-	token string
-	err   error
-}
-
 // token returns a cached Management API access token or fetches a new one.
-// Concurrent callers share one refresh. A caller whose context ends while it
-// waits for the refresh returns the context error; the refresh itself keeps
-// running for the other callers.
+// Concurrent callers share one refresh and its result, the error of a failed
+// refresh included. A caller whose context ends while it waits for the
+// refresh returns the context error; the refresh itself keeps running for the
+// other callers. A caller that needs a token after a failed refresh has ended
+// starts a new one.
 func (l *Logto) token(ctx context.Context) (string, error) {
-	if token, ok := l.cachedToken(); ok {
+	l.mu.Lock()
+	if l.accessToken != "" && l.cfg.Now().Before(l.expiresAt.Add(-tokenRefreshMargin)) {
+		token := l.accessToken
+		l.mu.Unlock()
 		return token, nil
 	}
+	refresh := l.inflight
+	if refresh == nil {
+		if err := ctx.Err(); err != nil {
+			l.mu.Unlock()
+			return "", err
+		}
+		refresh = &tokenRefresh{done: make(chan struct{})}
+		l.inflight = refresh
+		go l.runRefresh(context.WithoutCancel(ctx), refresh)
+	}
+	refresh.waiters++
+	l.mu.Unlock()
+
 	select {
-	case l.refreshGate <- struct{}{}:
+	case <-refresh.done:
+		return refresh.token, refresh.err
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-	// Another caller can have refreshed the token while this one waited.
-	if token, ok := l.cachedToken(); ok {
-		<-l.refreshGate
-		return token, nil
-	}
-	if err := ctx.Err(); err != nil {
-		<-l.refreshGate
-		return "", err
-	}
-	// The goroutine owns the gate until the refresh ends, so that a caller
-	// that stops waiting cannot let a second refresh start in parallel.
-	done := make(chan tokenResult, 1)
-	go func() {
-		defer func() { <-l.refreshGate }()
-		// The refresh serves every waiting caller, so the cancellation of
-		// the caller that started it must not abort it; only the timeout
-		// bounds it.
-		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tokenFetchTimeout)
-		defer cancel()
-		token, err := l.fetchToken(fetchCtx)
-		done <- tokenResult{token: token, err: err}
-	}()
-	select {
-	case result := <-done:
-		return result.token, result.err
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
+}
+
+// runRefresh fetches a token for every caller that waits on refresh and
+// publishes the result. The refresh serves every waiting caller, so the
+// cancellation of the caller that started it must not abort it (the caller
+// passes a context detached from its cancellation); only the timeout bounds
+// it.
+func (l *Logto) runRefresh(ctx context.Context, refresh *tokenRefresh) {
+	ctx, cancel := context.WithTimeout(ctx, tokenFetchTimeout)
+	defer cancel()
+	token, err := l.fetchToken(ctx)
+	l.mu.Lock()
+	refresh.token, refresh.err = token, err
+	l.inflight = nil
+	l.mu.Unlock()
+	close(refresh.done)
 }
 
 // fetchToken requests a new access token and caches it. It holds no lock
