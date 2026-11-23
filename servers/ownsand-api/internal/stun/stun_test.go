@@ -364,7 +364,9 @@ func TestUnknownRequiredErrorUsesByteBudget(t *testing.T) {
 	if n, _, err := client.ReadFrom(make([]byte, 1500)); err == nil {
 		t.Fatalf("error reply of %d bytes sent over the budget", n)
 	}
-	if reqs, resps, limited := s.Stats(); reqs != 1 || resps != 0 || limited != 1 {
+	// The read timeout does not synchronize with the server's counter
+	// updates, so wait for the completed outcome before asserting totals.
+	if reqs, resps, limited := waitForOutcomes(s.Stats, 1, 5*time.Second); reqs != 1 || resps != 0 || limited != 1 {
 		t.Fatalf("requests %d, responses %d, limited %d", reqs, resps, limited)
 	}
 }
