@@ -182,6 +182,10 @@ func (s *TokenSource) Invalidate() {
 	s.mu.Unlock()
 }
 
+// errMalformedTokenResponse reports a successful token response that is not a
+// valid token response document. It never carries response content.
+var errMalformedTokenResponse = errors.New("token endpoint returned a malformed token response")
+
 func (s *TokenSource) fetch(ctx context.Context) (string, time.Duration, error) {
 	form := url.Values{
 		"grant_type": {"client_credentials"},
@@ -212,9 +216,17 @@ func (s *TokenSource) fetch(ctx context.Context) (string, time.Duration, error) 
 		ExpiresIn   int64  `json:"expires_in"`
 		Error       string `json:"error"`
 	}
-	_ = json.Unmarshal(body, &tr)
+	// encoding/json keeps decoding after a type mismatch, so a body such as
+	// {"access_token":"t","expires_in":"3600"} leaves a usable access token
+	// next to a zero lifetime. The decode error is therefore only ignored for
+	// an error response, where just the filtered OAuth code is used.
+	decodeErr := json.Unmarshal(body, &tr)
 	if resp.StatusCode != http.StatusOK {
 		return "", 0, &TokenError{Status: resp.StatusCode, Code: oauthCode(tr.Error)}
+	}
+	if decodeErr != nil {
+		// A fixed message: the decode error can quote response content.
+		return "", 0, errMalformedTokenResponse
 	}
 	if tr.AccessToken == "" || (tr.TokenType != "" && !strings.EqualFold(tr.TokenType, "Bearer")) {
 		return "", 0, errors.New("token endpoint returned no bearer access token")

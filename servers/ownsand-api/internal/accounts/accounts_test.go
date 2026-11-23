@@ -39,6 +39,9 @@ type tokenServer struct {
 	expires  int64
 	status   int
 	errorStr string
+	// When body is set, a response writes it instead of the default valid
+	// token response or OAuth error body.
+	body string
 	// When block is set, a request announces itself on entered and then
 	// waits until block is closed.
 	block       chan struct{}
@@ -70,7 +73,15 @@ func (s *tokenServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if s.status != 0 {
 		w.WriteHeader(s.status)
+		if s.body != "" {
+			_, _ = w.Write([]byte(s.body))
+			return
+		}
 		_, _ = fmt.Fprintf(w, `{"error":%q,"error_description":"secret-description"}`, s.errorStr)
+		return
+	}
+	if s.body != "" {
+		_, _ = w.Write([]byte(s.body))
 		return
 	}
 	_, _ = fmt.Fprintf(w, `{"access_token":"token-%d","token_type":"Bearer","expires_in":%d,"scope":"accounts:report-usage"}`, n, s.expires)
@@ -301,5 +312,87 @@ func TestUsageClientSendsTokenAndDropsRejectedToken(t *testing.T) {
 	ts.status = http.StatusServiceUnavailable
 	if _, err := client.ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{})); connect.CodeOf(err) != connect.CodeUnavailable {
 		t.Fatalf("token failure: %v", err)
+	}
+}
+
+func TestTokenSourceRejectsMalformedSuccessfulResponse(t *testing.T) {
+	bodies := map[string]string{
+		"expires_in as a string":    `{"access_token":"leaked-token","token_type":"Bearer","expires_in":"3600"}`,
+		"token_type as a number":    `{"access_token":"leaked-token","token_type":7,"expires_in":3600}`,
+		"access_token as an object": `{"access_token":{"v":"leaked-token"},"token_type":"Bearer","expires_in":3600}`,
+		"truncated document":        `{"access_token":"leaked-token","token_type":"Bearer"`,
+	}
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			c := &clock{now: time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)}
+			ts := &tokenServer{t: t, expires: 3600, body: body}
+			src := newSource(t, ts, c)
+			ctx := context.Background()
+			tok, err := src.Token(ctx)
+			if err == nil || tok != "" {
+				t.Fatalf("token = %q, %v", tok, err)
+			}
+			var te *TokenError
+			if errors.As(err, &te) {
+				t.Fatalf("a malformed 200 response is no OAuth error: %v", err)
+			}
+			for _, leak := range []string{"leaked-token", "s&cret", "3600", "Bearer"} {
+				if strings.Contains(err.Error(), leak) {
+					t.Fatalf("the error leaks %q: %v", leak, err)
+				}
+			}
+			// Nothing was cached: the next call asks the endpoint again,
+			// and a valid response then succeeds.
+			if _, err := src.Token(ctx); err == nil || ts.calls.Load() != 2 {
+				t.Fatalf("second call: %v (calls %d)", err, ts.calls.Load())
+			}
+			ts.body = ""
+			if tok, err := src.Token(ctx); err != nil || tok != "token-3" {
+				t.Fatalf("token after a valid response = %q, %v", tok, err)
+			}
+			if tok, _ := src.Token(ctx); tok != "token-3" || ts.calls.Load() != 3 {
+				t.Fatalf("valid token is cached: %q (calls %d)", tok, ts.calls.Load())
+			}
+		})
+	}
+}
+
+func TestTokenSourceAcceptsValidDocumentWithoutTokenTypeOrExpiry(t *testing.T) {
+	c := &clock{now: time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)}
+	ts := &tokenServer{t: t, body: `{"access_token":"plain-token"}`}
+	src := newSource(t, ts, c)
+	ctx := context.Background()
+	if tok, err := src.Token(ctx); err != nil || tok != "plain-token" {
+		t.Fatalf("token = %q, %v", tok, err)
+	}
+	// A missing expiry caches the token for 2*refreshMargin, refreshed
+	// at half of that (one minute).
+	c.Advance(refreshMargin - time.Second)
+	if _, err := src.Token(ctx); err != nil || ts.calls.Load() != 1 {
+		t.Fatalf("within the brief lifetime: %v (calls %d)", err, ts.calls.Load())
+	}
+	c.Advance(time.Second)
+	if _, err := src.Token(ctx); err != nil || ts.calls.Load() != 2 {
+		t.Fatalf("after the brief lifetime: %v (calls %d)", err, ts.calls.Load())
+	}
+}
+
+func TestTokenSourceIgnoresDecodeErrorOfAnErrorResponse(t *testing.T) {
+	c := &clock{now: time.Now()}
+	ts := &tokenServer{t: t, status: http.StatusBadRequest, errorStr: "invalid_scope"}
+	src := newSource(t, ts, c)
+	var te *TokenError
+	if _, err := src.Token(context.Background()); !errors.As(err, &te) || te.Status != http.StatusBadRequest || te.Code != "invalid_scope" {
+		t.Fatalf("error = %v", err)
+	}
+	// A type mismatch next to a valid code still yields the code, and an
+	// undecodable body yields none, without a decode diagnostic.
+	ts.body = `{"error":"invalid_client","expires_in":"x"}`
+	if _, err := src.Token(context.Background()); !errors.As(err, &te) || te.Code != "invalid_client" {
+		t.Fatalf("error with a type mismatch = %v", err)
+	}
+	ts.body = `not json`
+	if _, err := src.Token(context.Background()); !errors.As(err, &te) || te.Status != http.StatusBadRequest || te.Code != "" {
+		t.Fatalf("error with an undecodable body = %v", err)
 	}
 }
