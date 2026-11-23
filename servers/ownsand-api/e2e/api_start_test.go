@@ -3,9 +3,11 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
+	"testing"
 )
 
 // startupFailureReasonAddressInUse is the stable startup_failure_reason that
@@ -80,4 +82,19 @@ func (l *logSink) hasServerStarted(name, addr string) bool {
 		}
 	}
 	return false
+}
+
+// requireAPILogMessages is requireLogMessages for the control plane that runs
+// now. startAPI names the process api on the first attempt and api-attempt<N>
+// after a retry on new ports, and restartAPI names it api-restarted, so a test
+// must not pass a literal process name: it reads the log of s.api.
+func (s *stack) requireAPILogMessages(ctx context.Context, t *testing.T, msgs ...string) {
+	t.Helper()
+	s.logs.requireLogMessages(ctx, t, s.api.name, msgs...)
+}
+
+// apiHasLineContaining reports whether the control plane that runs now logged
+// a line that contains text.
+func (s *stack) apiHasLineContaining(text string) bool {
+	return s.logs.hasLineContaining(s.api.name, text)
 }
