@@ -915,6 +915,22 @@ func TestGetOrganizationBillingAndUsageViews(t *testing.T) {
 	}
 }
 
+// pinMidMonth moves the clock to noon UTC on the 15th of the current month,
+// or of the next month when that moment has passed. A test that reads usage
+// by the clock month and by the month of its windows calls it before the
+// fixture exists. Otherwise the 15-minute advance of sameMonthWindows
+// crosses a month end when the test starts shortly before the end of a UTC
+// month, and GetOrganizationBilling then reads a month that has none of
+// the windows.
+func pinMidMonth(env *testenv.Env) {
+	now := env.Clock.Now().UTC()
+	target := time.Date(now.Year(), now.Month(), 15, 12, 0, 0, 0, time.UTC)
+	if !target.After(now) {
+		target = target.AddDate(0, 1, 0)
+	}
+	env.Clock.Advance(target.Sub(now))
+}
+
 // sameMonthWindows advances the clock and returns two usage windows that
 // start in the same UTC calendar month, the later one first.
 func sameMonthWindows(env *testenv.Env) (w, earlier time.Time) {
@@ -983,6 +999,7 @@ func storedSum(t *testing.T, env *testenv.Env, column, org string, meter account
 // the stored rows stay exact.
 func TestUsageQuantitySumSaturates(t *testing.T) {
 	env := testenv.New(t)
+	pinMidMonth(env)
 	f := newFixture(t, env)
 	subscribe(t, env, f)
 	org1, org2 := newOrg(t), newOrg(t)
@@ -1038,6 +1055,7 @@ func TestUsageQuantitySumSaturates(t *testing.T) {
 // because the ledger rejects a deduction that overflows the balance.
 func TestUsageAmountSumSaturates(t *testing.T) {
 	env := testenv.New(t)
+	pinMidMonth(env)
 	f := newFixture(t, env)
 	subscribe(t, env, f)
 	org := newOrg(t)
