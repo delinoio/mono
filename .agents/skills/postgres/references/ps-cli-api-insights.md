@@ -20,17 +20,17 @@ pscale api "<endpoint>" [--method POST] [--field key=value] [--org <org>]
 
 ```bash
 # Create a new report
-pscale api "organizations/{org}/databases/{db}/branches/{branch}/query-patterns-reports" \
+pscale api "organizations/{org}/databases/{db}/branches/{branch}/query-patterns" \
   --method POST --org my-org
 
-# Check status (poll until state=complete)
-pscale api "organizations/{org}/databases/{db}/branches/{branch}/query-patterns-reports/{id}/status"
+# Check status (poll while state=pending; download when state=completed; stop when state=failed)
+pscale api "organizations/{org}/databases/{db}/branches/{branch}/query-patterns/{id}"
 
 # Download completed report
-pscale api "organizations/{org}/databases/{db}/branches/{branch}/query-patterns-reports/{id}"
+pscale api "organizations/{org}/databases/{db}/branches/{branch}/query-patterns/{id}/download"
 
 # List all reports
-pscale api "organizations/{org}/databases/{db}/branches/{branch}/query-patterns-reports"
+pscale api "organizations/{org}/databases/{db}/branches/{branch}/query-patterns"
 ```
 
 ## Schema Analysis

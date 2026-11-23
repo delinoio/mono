@@ -34,7 +34,7 @@ Configure with `synchronous_standby_names`. Use `ANY N` for quorum or `FIRST N` 
 
 ## Quorum and Failure
 
-`FIRST 2 (s1, s2, s3)` is priority-based: waits for the 2 highest-priority connected standbys (s1+s2; s3 takes over only if one disconnects). `ANY 2 (s1, s2, s3)` is quorum-based: waits for any 2. With either, if only 1 is healthy, commits hang. Provision at least N+1 standbys: need 2 confirmations → provision 3. PostgreSQL never commits unless required standbys confirm — no inconsistency, but clients may timeout.
+`FIRST 2 (s1, s2, s3)` is priority-based: waits for the 2 highest-priority connected standbys (s1+s2; s3 takes over only if one disconnects). `ANY 2 (s1, s2, s3)` is quorum-based: waits for any 2. With either, if only 1 is healthy, commits hang. Provision at least N+1 standbys: need 2 confirmations → provision 3. With a synchronous policy in effect, a backend commits locally first and then waits for the required standby confirmations, so a missing required standby delays the client response after the local commit. Cancelling the wait (query cancel or backend termination) ends it with a warning but does not roll back the local commit: the transaction stays committed on the primary and replication is unconfirmed. The client must reconcile an ambiguous outcome (check whether the write exists, or use an idempotency key) before retrying a non-idempotent write. `synchronous_commit` still controls how far each commit waits (see the levels above).
 
 ## Failover
 

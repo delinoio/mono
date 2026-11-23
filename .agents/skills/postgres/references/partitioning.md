@@ -60,7 +60,7 @@ CREATE TABLE customer_order_default PARTITION OF customer_order DEFAULT;  -- cat
 
 - Use `pg_partman` (extension) to automate partition creation and cleanup.
 - Use `DETACH PARTITION` to remove a partition while retaining it as a standalone table (e.g., for archiving).
-- Use `DETACH PARTITION ... CONCURRENTLY` (PG 14+) to avoid `ACCESS EXCLUSIVE` locks on the parent table.
+- Use `DETACH PARTITION ... CONCURRENTLY` (PG 14+) to avoid `ACCESS EXCLUSIVE` locks on the parent table. It cannot be used when the partitioned table has a default partition, even if you are detaching a different partition (PostgreSQL raises `cannot detach partitions concurrently when a default partition exists`). In that case use ordinary `DETACH PARTITION`, which works with a default partition but takes an `ACCESS EXCLUSIVE` lock on the parent table.
 - Drop old partitions for data retention instead of `DELETE` to avoid vacuum overhead and bloat.
 - Create future partitions ahead of time to avoid insert failures.
 - **Always confirm with a human before detaching or dropping partitions.** These are destructive actions — detaching removes data from the partitioned table, and dropping permanently deletes the data.
