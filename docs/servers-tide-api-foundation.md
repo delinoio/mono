@@ -37,6 +37,8 @@ Layout, following the `accounts-api` server conventions:
 
 List handlers validate enum filters after authorization and before querying the list. See the [Connect RPC API contract](protos-tide-api-contract.md#general-rules).
 
+The shared handler error mapper preserves existing Connect errors. It maps a context deadline to `deadline_exceeded` with `request deadline exceeded` and context cancellation to `canceled` with `request canceled`, including wrapped causes. It logs unexpected errors and returns `internal` with `internal error`.
+
 - Business APIs: the public services of the [protos contract](protos-tide-api-contract.md).
 - Webhook endpoints: see [Webhooks](#webhooks).
 - Operational endpoints: `GET /healthz` without authentication returns `200` with `{"status":"ok"}` while the process can serve HTTP requests. `GET /metrics` on `METRICS_ADDR` serves the metrics in the Prometheus format; see [Metrics](#metrics).
