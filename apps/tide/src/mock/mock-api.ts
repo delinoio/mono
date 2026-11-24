@@ -1352,18 +1352,25 @@ export function createMockTransport(
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
         const i = findIntegration(org, req.agentIntegrationId);
+        let name = i.name;
         if (hasPath(req.updateMask, "name")) {
-          const name = req.name.trim();
+          name = req.name.trim();
           if (name === "" || name.length > 64)
             throw new ConnectError(
               "name must have 1 to 64 characters",
               Code.InvalidArgument,
             );
-          i.name = name;
         }
-        if (hasPath(req.updateMask, "settings")) i.settings = req.settings;
-        if (hasPath(req.updateMask, "credentials")) {
-          i.credentials = credentialStates(i.vendor, i.credentials, req);
+        const settings = hasPath(req.updateMask, "settings")
+          ? req.settings
+          : i.settings;
+        const replaceCredentials = hasPath(req.updateMask, "credentials");
+        const credentials = replaceCredentials
+          ? credentialStates(i.vendor, i.credentials, req)
+          : i.credentials;
+
+        Object.assign(i, { name, settings, credentials });
+        if (replaceCredentials) {
           audit(
             org,
             AuditAction.AGENT_INTEGRATION_CREDENTIALS_REPLACED,

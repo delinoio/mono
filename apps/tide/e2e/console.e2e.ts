@@ -88,6 +88,43 @@ describe("overview", () => {
 });
 
 describe("integrations", () => {
+  test("saves a Cursor integration name, pool, and credential together", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}/integrations`);
+    await screen.getByRole("button", "Create agent integration").tap();
+    await screen.getByRole("combobox", "Vendor").tap();
+    await screen.getByRole("option", "Cursor").tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.type("cursor-before");
+    await screen.getByLabel("Cursor self-hosted pool name").tap();
+    await browser.keyboard.type("pool-before");
+    await screen.getByLabel("Service account API key").tap();
+    await browser.keyboard.type("synthetic-cursor-before");
+    await screen.getByRole("button", "Create integration").tap();
+
+    await screen.getByRole("button", "Edit").tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("cursor-after");
+    await screen.getByLabel("Cursor self-hosted pool name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("pool-after");
+    await screen.getByLabel("Service account API key").tap();
+    await browser.keyboard.type("synthetic-cursor-after");
+    await screen.getByRole("button", "Save changes").tap();
+
+    const row = screen
+      .getByRole("listitem")
+      .filter({ hasText: "cursor-after" });
+    await expect(row).toContainText("Cursor self-hosted pool name: pool-after");
+    await expect(row).toContainText("Service account API key: Set at");
+  });
+
   test("links OwnSand and shows only when the key was set", async ({
     app,
     screen,
