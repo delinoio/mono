@@ -719,22 +719,38 @@ func TestMergeSpan(t *testing.T) {
 	}
 }
 
-// blockedReadManager returns a read manager whose copy blocks in the copy
-// hook until release is closed. started receives one value per copy that
-// reaches the hook.
-func blockedReadManager(t *testing.T) (m *readManager, started chan struct{}, release chan struct{}) {
+// newReadPreparationGate pauses workers at a hook until release or cleanup.
+func newReadPreparationGate(t *testing.T) (hook func(), started <-chan struct{}, release func()) {
+	reached := make(chan struct{}, 4)
+	released := make(chan struct{})
+	release = sync.OnceFunc(func() { close(released) })
+	t.Cleanup(release)
+	return func() {
+		reached <- struct{}{}
+		<-released
+	}, reached, release
+}
+
+func newPreparationTestReadManager(t *testing.T, now func() time.Time) *readManager {
 	t.Helper()
-	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), time.Now, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), now, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	started = make(chan struct{}, 4)
-	release = make(chan struct{})
 	m.forceCopy = true
-	m.copyHook = func() {
-		started <- struct{}{}
-		<-release
-	}
+	t.Cleanup(func() {
+		if !m.close(readCloseGrace) {
+			t.Error("snapshot workers did not finish before removing test files")
+		}
+	})
+	return m
+}
+
+// blockedReadManager pauses workers after copying the source file.
+func blockedReadManager(t *testing.T) (m *readManager, started <-chan struct{}, release func()) {
+	t.Helper()
+	m = newPreparationTestReadManager(t, time.Now)
+	m.copyHook, started, release = newReadPreparationGate(t)
 	return m, started, release
 }
 
@@ -750,6 +766,89 @@ func waitClosed(t *testing.T, ch <-chan struct{}) {
 func waitStarted(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
 	waitClosed(t, ch)
+}
+
+func TestReadPreparationGateCleanup(t *testing.T) {
+	for _, phase := range []struct {
+		name  string
+		setup func(*readManager, func())
+	}{
+		{"before-open", func(m *readManager, hook func()) { m.openHook = hook }},
+		{"after-copy", func(m *readManager, hook func()) { m.copyHook = hook }},
+	} {
+		for _, scenario := range []struct {
+			name       string
+			late       bool
+			concurrent bool
+		}{
+			{name: "blocked-worker"},
+			{name: "late-worker", late: true},
+			{name: "concurrent-release", concurrent: true},
+		} {
+			t.Run(phase.name+"/"+scenario.name, func(t *testing.T) {
+				m := newPreparationTestReadManager(t, time.Now)
+				const contents = "0123456789"
+				src := filepath.Join(t.TempDir(), "src")
+				if err := os.WriteFile(src, []byte(contents), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				begin := func(t *testing.T) *readEntry {
+					t.Helper()
+					e, err := m.begin("read-gate-cleanup", src)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return e
+				}
+				var entry *readEntry
+				var started <-chan struct{}
+				var release func()
+				releaseReturned := make(chan struct{})
+				if !t.Run("gate", func(t *testing.T) {
+					var hook func()
+					hook, started, release = newReadPreparationGate(t)
+					phase.setup(m, hook)
+					if scenario.late {
+						return
+					}
+					entry = begin(t)
+					waitStarted(t, started)
+					select {
+					case <-entry.ready:
+						t.Fatal("snapshot became ready while preparation was paused")
+					default:
+					}
+					if scenario.concurrent {
+						releasing := make(chan struct{})
+						t.Cleanup(func() { close(releasing) })
+						go func() {
+							<-releasing
+							release()
+							close(releaseReturned)
+						}()
+					}
+				}) {
+					return
+				}
+				if scenario.late {
+					entry = begin(t)
+					waitStarted(t, started)
+				}
+				waitClosed(t, entry.ready)
+				if scenario.concurrent {
+					waitClosed(t, releaseReturned)
+				}
+				release()
+				if entry.err != nil {
+					t.Fatalf("snapshot failed: %v", entry.err)
+				}
+				got, err := os.ReadFile(entry.snapshot)
+				if err != nil || string(got) != contents {
+					t.Fatalf("snapshot: %q, %v", got, err)
+				}
+			})
+		}
+	}
 }
 
 func (m *readManager) hasEntry(readID string) bool {
@@ -778,7 +877,7 @@ func TestReadFailureAfterLastCallEndedIsForgotten(t *testing.T) {
 	if err := os.WriteFile(path, []byte("after, longer"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	close(release)
+	release()
 	waitClosed(t, e.ready)
 	if e.err == nil {
 		t.Fatal("expected the snapshot to fail")
@@ -826,7 +925,7 @@ func TestReadFailureReachesWaitingCall(t *testing.T) {
 	if err := os.WriteFile(path, []byte("after, longer"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	close(release)
+	release()
 	waitClosed(t, second.ready)
 	if second.err == nil {
 		t.Fatal("waiting call did not receive the failure")
@@ -855,7 +954,7 @@ func TestReadSuccessAfterLastCallEndedIsKept(t *testing.T) {
 	}
 	waitStarted(t, started)
 	m.end(readID, e)
-	close(release)
+	release()
 	waitClosed(t, e.ready)
 	if e.err != nil {
 		t.Fatalf("snapshot failed: %v", e.err)
@@ -908,24 +1007,12 @@ func (c *readTestClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-// preOpenReadManager returns a read manager with a controllable clock whose
-// snapshot worker blocks before it opens the source, so before it creates the
-// snapshot file, until release is closed. started receives one value per
-// worker that reaches the hook.
-func preOpenReadManager(t *testing.T) (m *readManager, clock *readTestClock, started chan struct{}, release chan struct{}) {
+// preOpenReadManager pauses workers before they open the source file.
+func preOpenReadManager(t *testing.T) (m *readManager, clock *readTestClock, started <-chan struct{}, release func()) {
 	t.Helper()
 	clock = &readTestClock{now: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)}
-	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), clock.Now, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	started = make(chan struct{}, 4)
-	release = make(chan struct{})
-	m.forceCopy = true
-	m.openHook = func() {
-		started <- struct{}{}
-		<-release
-	}
+	m = newPreparationTestReadManager(t, clock.Now)
+	m.openHook, started, release = newReadPreparationGate(t)
 	return m, clock, started, release
 }
 
@@ -974,7 +1061,7 @@ func TestReadSweepKeepsSnapshotInPreparation(t *testing.T) {
 	}
 	m.end(readID, retry)
 	clock.Advance(time.Minute)
-	close(release)
+	release()
 	waitClosed(t, e.ready)
 	if e.err != nil {
 		t.Fatalf("snapshot failed: %v", e.err)
@@ -1029,7 +1116,7 @@ func TestReadSweepKeepsFailingSnapshotInPreparation(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	close(release)
+	release()
 	waitClosed(t, e.ready)
 	if e.err == nil {
 		t.Fatal("expected the snapshot to fail")
@@ -1059,7 +1146,7 @@ func TestReadSnapshotOfForgottenEntryIsRemoved(t *testing.T) {
 	m.mu.Lock()
 	delete(m.entries, readID)
 	m.mu.Unlock()
-	close(release)
+	release()
 	waitClosed(t, e.ready)
 	if e.err == nil {
 		t.Fatal("expected the snapshot of a forgotten entry to fail")
