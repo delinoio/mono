@@ -21,13 +21,24 @@ import {
   Code,
   ConnectError,
   createClient,
+  createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
+import type { MessageInitShape } from "@bufbuild/protobuf";
 import { createQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
-import { AuditService } from "@delino/tide-protos/v1/audit_pb";
-import { Role } from "@delino/tide-protos/v1/common_pb";
+import { AuditAction, AuditService } from "@delino/tide-protos/v1/audit_pb";
+import {
+  RequestState,
+  Role,
+  RunnerState,
+} from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
+import {
+  type ListMembersRequest,
+  MemberService,
+} from "@delino/tide-protos/v1/member_pb";
+import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import {
   type ListRunnerProfilesRequest,
   RunnerProfileService,
@@ -35,6 +46,7 @@ import {
 import {
   type ListRequestsRequest,
   type ListRunnersRequest,
+  type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/tide-protos/v1/work_pb";
 import { QueryClient } from "@tanstack/react-query";
@@ -205,6 +217,292 @@ describe("organizations", () => {
     ).toBe("https://ownsand.delino.io");
   });
 });
+
+// The full roster renders 200 rows, and its first render can exceed the default timeout in CI.
+describe("organization member pagination", () => {
+  const laterMemberId = "mock-user-nora";
+  const waitForRoster = { timeout: 10_000 };
+
+  async function rosterFixture({
+    failToken,
+    emptyLastPage = false,
+    beforeContinuation,
+  }: {
+    failToken?: string;
+    emptyLastPage?: boolean;
+    beforeContinuation?: Promise<void>;
+  } = {}) {
+    const mock = createMockTransport();
+    const memberApi = createClient(MemberService, mock);
+    const organizationApi = createClient(OrganizationService, mock);
+    const { members } = await memberApi.listMembers({
+      organizationId: MOCK_IDS.acme,
+      pageSize: 200,
+    });
+    const laterMember = {
+      organizationId: MOCK_IDS.acme,
+      userId: laterMemberId,
+      role: Role.MEMBER,
+    };
+    if (!emptyLastPage)
+      members.push({ ...members[0]!, ...laterMember, displayName: "" });
+
+    const lists: ListMembersRequest[] = [];
+    const updateRole = rs.fn(memberApi.updateMemberRole);
+    const remove = rs.fn(memberApi.removeMember);
+    const transfer = rs.fn(organizationApi.transferOwnership);
+    const roster = createRouterTransport((router) => {
+      router.service(MemberService, {
+        async listMembers(req) {
+          lists.push(req);
+          if (req.organizationId !== MOCK_IDS.acme) {
+            return memberApi.listMembers(req);
+          }
+          if (req.pageToken === "p2") await beforeContinuation;
+          if (req.pageToken === failToken) {
+            failToken = undefined;
+            throw new ConnectError("ListMembers failed", Code.Internal);
+          }
+          return req.pageToken === ""
+            ? { members: members.slice(0, 200), nextPageToken: "p2" }
+            : {
+                // A member may repeat across pages. The first occurrence
+                // determines where the row appears.
+                members: members.length > 200 ? members.slice(199) : [],
+              };
+        },
+        async updateMemberRole(req) {
+          const result = await updateRole(req);
+          const member = members.find((member) => member.userId === req.userId);
+          if (member) member.role = req.role;
+          return result;
+        },
+        async removeMember(req) {
+          const result = await remove(req);
+          const index = members.findIndex(
+            (member) => member.userId === req.userId,
+          );
+          if (index !== -1) members.splice(index, 1);
+          return result;
+        },
+      });
+      router.service(OrganizationService, {
+        transferOwnership: (req) => transfer(req),
+      });
+    });
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...args) {
+        return [
+          "ListMembers",
+          "UpdateMemberRole",
+          "RemoveMember",
+          "TransferOwnership",
+        ].includes(method.name)
+          ? roster.unary(method, ...args)
+          : mock.unary(method, ...args);
+      },
+    };
+    return { transport, lists, updateRole, remove, transfer };
+  }
+
+  function memberRows() {
+    return within(screen.getByRole("list", { name: "Members" })).getAllByRole(
+      "listitem",
+    );
+  }
+
+  function tokens(lists: ListMembersRequest[]) {
+    return lists.map(({ pageToken }) => pageToken);
+  }
+
+  async function openOwnerPicker() {
+    await click(await screen.findByRole("combobox", { name: "New owner" }));
+  }
+
+  test.each(["role change", "removal"])(
+    "loads a 201st member once and refreshes after %s",
+    async (mutation) => {
+      const { transport, lists, updateRole, remove } = await rosterFixture();
+      renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
+      const row = (
+        await screen.findByText(laterMemberId, {}, waitForRoster)
+      ).closest("li")!;
+      expect(memberRows()).toHaveLength(201);
+      expect(memberRows()[199]?.textContent).toContain("Roster member 199");
+      expect(memberRows()[200]).toBe(row);
+      expect(tokens(lists)).toEqual(["", "p2"]);
+      expect(lists.every(({ pageSize }) => pageSize === 200)).toBe(true);
+
+      const target = { organizationId: MOCK_IDS.acme, userId: laterMemberId };
+      if (mutation === "role change") {
+        await click(
+          within(row).getByRole("combobox", {
+            name: `Role of ${laterMemberId}`,
+          }),
+        );
+        await click(await screen.findByRole("option", { name: "Admin" }));
+        await waitFor(() => {
+          expect(within(row).getByRole("combobox").textContent).toContain(
+            "Admin",
+          );
+        });
+        expect(updateRole).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({ ...target, role: Role.ADMIN }),
+        );
+      } else {
+        await click(within(row).getByRole("button", { name: "Remove" }));
+        const dialog = await screen.findByRole("alertdialog", {
+          name: `Remove ${laterMemberId}?`,
+        });
+        await click(
+          within(dialog).getByRole("button", { name: "Remove member" }),
+        );
+        await waitFor(() =>
+          expect(screen.queryByText(laterMemberId)).toBeNull(),
+        );
+        expect(remove).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining(target),
+        );
+        expect(memberRows()).toHaveLength(200);
+      }
+      expect(tokens(lists)).toEqual(["", "p2", "", "p2"]);
+    },
+  );
+
+  test("transfers to a later member and refreshes the former owner's permissions", async () => {
+    const { transport, transfer, lists } = await rosterFixture();
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
+    await waitFor(() => expect(tokens(lists)).toEqual(["", "p2"]));
+    await openOwnerPicker();
+    expect(screen.queryByRole("option", { name: "Mina Kim" })).toBeNull();
+    await click(await screen.findByRole("option", { name: laterMemberId }));
+    await click(screen.getByRole("button", { name: "Transfer" }));
+    const dialog = await screen.findByRole("alertdialog", {
+      name: `Make ${laterMemberId} the owner?`,
+    });
+    await click(
+      within(dialog).getByRole("button", { name: "Transfer ownership" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("heading", { name: "Transfer ownership" }),
+      ).toBeNull(),
+    );
+    expect(transfer).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        organizationId: MOCK_IDS.acme,
+        userId: laterMemberId,
+      }),
+    );
+    expect(tokens(lists)).toEqual(["", "p2", "", "p2"]);
+  });
+
+  test("shares loaded pages and retries a failed continuation from either view", async () => {
+    let releaseContinuation!: () => void;
+    const beforeContinuation = new Promise<void>((resolve) => {
+      releaseContinuation = resolve;
+    });
+    const { transport, lists } = await rosterFixture({
+      failToken: "p2",
+      beforeContinuation,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
+    expect(
+      await screen.findByText("Loading more members", {}, waitForRoster),
+    ).toBeTruthy();
+    expect(memberRows()).toHaveLength(200);
+    releaseContinuation();
+
+    expect(
+      await screen.findByText(
+        "Some members are not shown yet.",
+        {},
+        waitForRoster,
+      ),
+    ).toBeTruthy();
+    expect(memberRows()).toHaveLength(200);
+    await click(screen.getByRole("link", { name: "Settings" }));
+    expect(
+      await screen.findByText(
+        "Some members are not shown yet.",
+        {},
+        waitForRoster,
+      ),
+    ).toBeTruthy();
+    await openOwnerPicker();
+    expect(
+      await screen.findByRole("option", { name: "Ada Park" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("option", { name: laterMemberId })).toBeNull();
+    await act(async () => {
+      fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+    });
+
+    await click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() =>
+      expect(screen.queryByText("Some members are not shown yet.")).toBeNull(),
+    );
+    await openOwnerPicker();
+    expect(
+      await screen.findAllByRole("option", { name: laterMemberId }),
+    ).toHaveLength(1);
+    expect(tokens(lists)).toEqual(["", "p2", "p2"]);
+  });
+
+  test.each(["members", "settings"])(
+    "retries a first-page error in %s",
+    async (section) => {
+      const { transport, lists } = await rosterFixture({
+        failToken: "",
+        emptyLastPage: true,
+      });
+      renderConsole(`/orgs/${MOCK_IDS.acme}/${section}`, { transport });
+      await click(await screen.findByRole("button", { name: "Try again" }));
+      await waitFor(() => expect(tokens(lists)).toEqual(["", "", "p2"]));
+      await waitFor(() =>
+        expect(screen.queryByText("Loading more members")).toBeNull(),
+      );
+      if (section === "members") {
+        expect(memberRows()).toHaveLength(200);
+      } else {
+        await openOwnerPicker();
+        expect(
+          await screen.findByRole("option", { name: "Roster member 199" }),
+        ).toBeTruthy();
+      }
+    },
+  );
+
+  test("isolates the roster and transfer permissions when switching organizations", async () => {
+    const { transport, lists } = await rosterFixture({ emptyLastPage: true });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
+    await screen.findByText("Roster member 199", {}, waitForRoster);
+    await waitFor(() =>
+      expect(screen.queryByText("Loading more members")).toBeNull(),
+    );
+    await click(screen.getByRole("combobox", { name: "Organization" }));
+    await click(await screen.findByRole("option", { name: "Globex" }));
+    await waitFor(() => expect(memberRows()).toHaveLength(2));
+    expect(screen.queryByText("Roster member 199")).toBeNull();
+    expect(
+      lists.map(({ organizationId, pageToken }) => [organizationId, pageToken]),
+    ).toEqual([
+      [MOCK_IDS.acme, ""],
+      [MOCK_IDS.acme, "p2"],
+      [MOCK_IDS.globex, ""],
+    ]);
+    await click(screen.getByRole("link", { name: "Settings" }));
+    expect(
+      screen.getByRole("heading", { name: "Dev sessions per user" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", { name: "Transfer ownership" }),
+    ).toBeNull();
+    expect(lists).toHaveLength(3);
+  });
+}, 20_000);
 
 describe("failed requests", () => {
   function failingTransport(methodName: string, code: Code): Transport {
@@ -1045,6 +1343,99 @@ describe("overview", () => {
     ).toBeTruthy();
   });
 
+  test.each([false, true])(
+    "keeps the last snapshot after a terminal stream error (after an automatic reconnect: %s)",
+    async (afterReconnect) => {
+      let failStream!: () => void;
+      const streamFailure = new Promise<void>((resolve) => {
+        failStream = resolve;
+      });
+      let completeSnapshot!: () => void;
+      const replacementSnapshot = new Promise<void>((resolve) => {
+        completeSnapshot = resolve;
+      });
+      let streams = 0;
+      const queue = createRouterTransport((router) => {
+        router.service(WorkService, {
+          async *watchQueue(): AsyncGenerator<
+            MessageInitShape<typeof WatchQueueResponseSchema>
+          > {
+            const stream = ++streams;
+            if (stream === 1) {
+              yield {
+                event: {
+                  case: "request",
+                  value: { requestId: "queued", state: RequestState.QUEUED },
+                },
+              };
+              yield {
+                event: {
+                  case: "runner",
+                  value: { runnerId: "warm", state: RunnerState.WARM },
+                },
+              };
+              yield { event: { case: "snapshotComplete", value: {} } };
+              await streamFailure;
+              if (afterReconnect) {
+                throw new ConnectError("retryable error", Code.Unavailable);
+              }
+            }
+            if (stream === (afterReconnect ? 2 : 1)) {
+              throw new ConnectError("internal error", Code.Internal);
+            }
+            await replacementSnapshot;
+            yield { event: { case: "snapshotComplete", value: {} } };
+          },
+        });
+      });
+      const mock = createMockTransport();
+      const transport: Transport = {
+        ...mock,
+        stream: (method, ...rest) =>
+          (method.name === "WatchQueue" ? queue : mock).stream(method, ...rest),
+      };
+      renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
+
+      const status = within(
+        await screen.findByRole("status", { name: "Queue updates" }),
+      );
+      const warmCount = () =>
+        screen.getByText("Warm", { selector: "dt" }).nextElementSibling
+          ?.textContent;
+      const live = await status.findByText("Live");
+      expect(live.getAttribute("data-variant")).toBe("accent");
+      expect(screen.getByText("queued")).toBeTruthy();
+      expect(warmCount()).toBe("1");
+
+      await act(async () => failStream());
+      const disconnected = await status.findByText(
+        "Disconnected",
+        {},
+        { timeout: 3000 },
+      );
+      expect(disconnected.getAttribute("data-variant")).toBe("neutral");
+      expect(screen.getByText("Something went wrong. Try again.")).toBeTruthy();
+      const retry = screen.getByRole("button", { name: "Try again" });
+      expect(screen.getByText("queued")).toBeTruthy();
+      expect(warmCount()).toBe("1");
+      expect(streams).toBe(afterReconnect ? 2 : 1);
+
+      await click(retry);
+      expect(status.getByText("Reconnecting")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+      expect(screen.getByText("queued")).toBeTruthy();
+      expect(warmCount()).toBe("1");
+      expect(streams).toBe(afterReconnect ? 3 : 2);
+
+      await act(async () => completeSnapshot());
+      expect(status.getByText("Live").getAttribute("data-variant")).toBe(
+        "accent",
+      );
+      expect(screen.getByText("No request is waiting")).toBeTruthy();
+      expect(warmCount()).toBe("0");
+    },
+  );
+
   test("guides the first setup of a new organization", async () => {
     renderConsole(`/orgs/${MOCK_IDS.globex}`);
     expect(await screen.findByText("Set up tide")).toBeTruthy();
@@ -1061,7 +1452,130 @@ describe("overview", () => {
   });
 });
 
+describe("audit", () => {
+  function auditActions(table: HTMLElement) {
+    return within(table)
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => within(row).getAllByRole("cell")[1]!.textContent);
+  }
+
+  test("shows the seeded audit events newest first", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/audit`);
+
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    expect(auditActions(table)).toEqual([
+      "Dev session created",
+      "OwnSand link set",
+    ]);
+  });
+
+  test("shows a request cancellation before the seeded audit events", async () => {
+    const transport = createMockTransport();
+    await createClient(WorkService, transport).cancelRequest({
+      organizationId: MOCK_IDS.acme,
+      requestId: MOCK_IDS.queuedJob,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/audit`, { transport });
+
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    expect(auditActions(table)).toEqual([
+      "Request canceled",
+      "Dev session created",
+      "OwnSand link set",
+    ]);
+  });
+
+  test("lists one audit event per page in newest-first order", async () => {
+    const client = createClient(AuditService, createMockTransport());
+    const organizationId = MOCK_IDS.acme;
+    const all = await client.listAuditEvents({ organizationId });
+    const first = await client.listAuditEvents({ organizationId, pageSize: 1 });
+    expect(first.nextPageToken).not.toBe("");
+    const second = await client.listAuditEvents({
+      organizationId,
+      pageSize: 1,
+      pageToken: first.nextPageToken,
+    });
+
+    expect(first.events.map((event) => event.action)).toEqual([
+      AuditAction.DEV_SESSION_CREATED,
+    ]);
+    expect(second.events.map((event) => event.action)).toEqual([
+      AuditAction.OWNSAND_LINK_SET,
+    ]);
+    expect([...first.events, ...second.events]).toEqual(all.events);
+    expect(second.nextPageToken).toBe("");
+  });
+});
+
 describe("work", () => {
+  test("shows active requests in queue order and can include ended requests", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/requests`);
+    const table = await screen.findByRole("table", { name: "Requests" });
+    const requestIds = (table: HTMLElement) =>
+      within(table)
+        .getAllByRole("row")
+        .slice(1)
+        .map((row) => row.querySelector("code")?.title);
+    const active = [
+      MOCK_IDS.runningJob,
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.queuedAgent,
+      MOCK_IDS.queuedDev,
+    ];
+    expect(requestIds(table)).toEqual(active);
+
+    await click(screen.getByRole("checkbox", { name: "Show ended requests" }));
+
+    const updatedTable = await screen.findByRole("table", {
+      name: "Requests",
+    });
+    expect(requestIds(updatedTable)).toEqual([...active, MOCK_IDS.endedJob]);
+  });
+
+  test("pages active requests before ended requests in descending end time", async () => {
+    const client = createClient(WorkService, createMockTransport());
+    const organizationId = MOCK_IDS.acme;
+    const time = Date.now();
+    const clock = rs.spyOn(Date, "now").mockReturnValue(time);
+    try {
+      await client.cancelRequest({
+        organizationId,
+        requestId: MOCK_IDS.queuedJob,
+      });
+      clock.mockReturnValue(time + 1);
+      await client.cancelRequest({
+        organizationId,
+        requestId: MOCK_IDS.queuedAgent,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+
+    const expected = [
+      MOCK_IDS.runningJob,
+      MOCK_IDS.queuedDev,
+      MOCK_IDS.queuedAgent,
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.endedJob,
+    ];
+    let pageToken = "";
+    for (const [index, requestId] of expected.entries()) {
+      const page = await client.listRequests({
+        organizationId,
+        includeEnded: true,
+        pageSize: 1,
+        pageToken,
+      });
+      expect(page.requests.map((request) => request.requestId)).toEqual([
+        requestId,
+      ]);
+      pageToken = page.nextPageToken;
+      expect(pageToken === "").toBe(index === expected.length - 1);
+    }
+  });
+
   test("canceling a request needs a confirmation", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/requests`);
     const table = await screen.findByRole("table", { name: "Requests" });
@@ -1141,6 +1655,309 @@ describe("personal API key pages", () => {
       await screen.findByText(new RegExp(`agent-${PAGE_SIZE} `)),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+  });
+});
+
+describe("failed query refreshes", () => {
+  const keyPath = `/orgs/${MOCK_IDS.acme}/api-keys`;
+  const refreshNotice = /The last refresh failed/;
+  const seededKey = /claude-on-laptop/;
+
+  function queryFixture(methodName: string, fixtureNextPage?: string) {
+    const mock = createMockTransport();
+    const pageTokens: string[] = [];
+    let failure: Error | undefined;
+    let failContinuationOnly = false;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (method.name !== methodName) return mock.unary(method, ...args);
+        const token = (args[3] as { pageToken?: string }).pageToken ?? "";
+        pageTokens.push(token);
+        if (failure !== undefined && (!failContinuationOnly || token !== "")) {
+          throw failure;
+        }
+        const response = await mock.unary(method, ...args);
+        if (fixtureNextPage !== undefined && token === "") {
+          Object.assign(response.message, { nextPageToken: fixtureNextPage });
+        }
+        return response;
+      },
+    };
+    return {
+      transport,
+      pageTokens,
+      fail(error: Error | undefined, continuationOnly = false) {
+        failure = error;
+        failContinuationOnly = continuationOnly;
+      },
+    };
+  }
+
+  async function refetch(queryClient: QueryClient) {
+    await act(async () => {
+      await queryClient.refetchQueries({ type: "active" });
+    });
+  }
+
+  for (const [name, error] of [
+    ["unavailable", new ConnectError("offline", Code.Unavailable)],
+    ["network error", new TypeError("Failed to fetch")],
+    ["internal", new ConnectError("internal", Code.Internal)],
+    ["deadline", new ConnectError("deadline", Code.DeadlineExceeded)],
+  ] as const) {
+    test(`keeps the layout and typed form value after an organization refresh fails with ${name}`, async () => {
+      const fixture = queryFixture("GetOrganization");
+      const client = renderConsole(keyPath, fixture);
+      await screen.findByText(seededKey);
+      const nav = screen.getByRole("navigation", { name: "Organization" });
+      await click(screen.getByRole("button", { name: "Create API key" }));
+      const dialog = screen.getByRole("dialog");
+      const input = within(dialog).getByRole<HTMLInputElement>("textbox", {
+        name: "Name",
+      });
+      await type(input, "deploy-bot");
+
+      fixture.fail(error);
+      await refetch(client);
+
+      const notice = await screen.findByText(refreshNotice);
+      expect(nav.isConnected).toBe(true);
+      expect(screen.getByText(seededKey)).toBeTruthy();
+      expect(screen.getByRole("dialog")).toBe(dialog);
+      expect(within(dialog).getByRole("textbox", { name: "Name" })).toBe(input);
+      expect(input.value).toBe("deploy-bot");
+
+      fixture.fail(undefined);
+      await click(
+        within(notice.closest('[role="alert"]') as HTMLElement).getByRole(
+          "button",
+          {
+            name: "Try again",
+            hidden: true,
+          },
+        ),
+      );
+      expect(screen.queryByText(refreshNotice)).toBeNull();
+      expect(input.value).toBe("deploy-bot");
+    });
+  }
+
+  test("keeps the one-time secret dialog after an organization refresh fails", async () => {
+    const fixture = queryFixture("GetOrganization");
+    const client = renderConsole(keyPath, fixture);
+    await screen.findByText(seededKey);
+    await click(screen.getByRole("button", { name: "Create API key" }));
+    await type(screen.getByRole("textbox", { name: "Name" }), "deploy-bot");
+    await click(screen.getByRole("button", { name: "Create key" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Your new personal API key",
+    });
+    const secret = dialog.querySelector("code");
+    expect(secret?.textContent).toMatch(/^tide_/);
+
+    fixture.fail(new ConnectError("refresh failed", Code.Internal));
+    await refetch(client);
+
+    await screen.findByText(refreshNotice);
+    expect(
+      screen.getByRole("dialog", { name: "Your new personal API key" }),
+    ).toBe(dialog);
+    expect(dialog.querySelector("code")).toBe(secret);
+  });
+
+  for (const [code, message] of [
+    [Code.NotFound, "It was not found, or you no longer have access to it."],
+    [Code.PermissionDenied, "You do not have permission to do this."],
+    [Code.Unauthenticated, "Your session ended. Sign in again."],
+  ] as const) {
+    test(`shows a full organization error for ${Code[code]} after loading`, async () => {
+      const fixture = queryFixture("GetOrganization");
+      const client = renderConsole(keyPath, fixture);
+      await screen.findByText(seededKey);
+
+      fixture.fail(new ConnectError("organization unavailable", code));
+      await refetch(client);
+
+      expect(await screen.findByText(message)).toBeTruthy();
+      if (code === Code.Unauthenticated) {
+        expect(
+          screen.getByRole("button", { name: "Sign in with Delino" }),
+        ).toBeTruthy();
+        expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+      } else {
+        expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+      }
+      expect(
+        screen.queryByRole("navigation", { name: "Organization" }),
+      ).toBeNull();
+      expect(screen.queryByText(seededKey)).toBeNull();
+      expect(screen.queryByText(refreshNotice)).toBeNull();
+    });
+  }
+
+  for (const method of ["GetOrganization", "ListApiKeys"]) {
+    test(`shows a full error when the first ${method} request fails`, async () => {
+      const fixture = queryFixture(method);
+      fixture.fail(new ConnectError("offline", Code.Unavailable));
+      renderConsole(keyPath, fixture);
+
+      expect(
+        await screen.findByText(/tide is not available right now/),
+      ).toBeTruthy();
+      expect(screen.queryByText(refreshNotice)).toBeNull();
+      expect(screen.queryByText(seededKey)).toBeNull();
+      expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+    });
+  }
+
+  for (const [path, method, loadedText] of [
+    ["/", "ListOrganizations", "Acme Robotics"],
+    [`/orgs/${MOCK_IDS.acme}`, "GetCapacity", "build-box"],
+    [
+      `/orgs/${MOCK_IDS.acme}/profiles`,
+      "ListRunnerProfiles",
+      "tide-linux-build",
+    ],
+    [`/orgs/${MOCK_IDS.acme}/members`, "ListMembers", "Ada Park"],
+    [
+      `/orgs/${MOCK_IDS.acme}/members`,
+      "ListInvitations",
+      "No pending invitations",
+    ],
+    [
+      `/orgs/${MOCK_IDS.acme}/integrations`,
+      "GetOwnSandLink",
+      "Manage devices in the OwnSand console",
+    ],
+    [
+      `/orgs/${MOCK_IDS.acme}/integrations`,
+      "ListGitHubInstallations",
+      "acme-robotics · Active",
+    ],
+    [
+      `/orgs/${MOCK_IDS.acme}/integrations`,
+      "ListAgentIntegrations",
+      "codex-prod · OpenAI Codex",
+    ],
+  ] as const) {
+    test(`keeps ${method} content after a transient error and replaces it after a terminal error`, async () => {
+      const fixture = queryFixture(method);
+      const client = renderConsole(path, fixture);
+      const content = await screen.findByText(loadedText);
+
+      fixture.fail(new ConnectError("offline", Code.Internal));
+      await refetch(client);
+
+      await screen.findByText(refreshNotice);
+      expect(screen.getByText(loadedText)).toBe(content);
+
+      fixture.fail(new ConnectError("access revoked", Code.PermissionDenied));
+      await refetch(client);
+
+      await screen.findByText(/You do not have permission to do this\.$/);
+      expect(screen.queryByText(loadedText)).toBeNull();
+      expect(screen.queryByText(refreshNotice)).toBeNull();
+    });
+  }
+
+  test("keeps the selected runner group after a refresh fails inside the dialog", async () => {
+    const fixture = queryFixture("ListGitHubRunnerGroups");
+    const client = renderConsole(
+      `/orgs/${MOCK_IDS.acme}/integrations`,
+      fixture,
+    );
+    await click(
+      await screen.findByRole("button", { name: "Change runner group" }),
+    );
+    const dialog = screen.getByRole("dialog");
+    const group = await within(dialog).findByRole("combobox", {
+      name: "Runner group",
+    });
+
+    fixture.fail(new ConnectError("offline", Code.Internal));
+    await refetch(client);
+
+    await within(dialog).findByText(refreshNotice);
+    expect(within(dialog).getByRole("combobox", { name: "Runner group" })).toBe(
+      group,
+    );
+    fixture.fail(undefined);
+    await click(within(dialog).getByRole("button", { name: "Try again" }));
+    expect(screen.getByRole("dialog")).toBe(dialog);
+    expect(within(dialog).queryByText(refreshNotice)).toBeNull();
+  });
+
+  const infiniteLists = [
+    ["api-keys", "ListApiKeys", "list", "Personal API keys"],
+    ["audit", "ListAuditEvents", "table", "Audit events"],
+    ["requests", "ListRequests", "table", "Requests"],
+    ["runners", "ListRunners", "table", "Runners"],
+    ["dev-sessions", "ListDevSessions", "table", "Dev sessions"],
+  ] as const;
+
+  for (const [route, method, role, name] of infiniteLists) {
+    test(`keeps ${route} loaded when a background refresh fails`, async () => {
+      const fixture = queryFixture(method);
+      const client = renderConsole(`/orgs/${MOCK_IDS.acme}/${route}`, fixture);
+      const list = await screen.findByRole(role, { name });
+
+      fixture.fail(new ConnectError("offline", Code.Internal));
+      await refetch(client);
+
+      await screen.findByText(refreshNotice);
+      expect(screen.getByRole(role, { name })).toBe(list);
+      fixture.fail(undefined);
+      await click(screen.getByRole("button", { name: "Try again" }));
+      expect(screen.queryByText(refreshNotice)).toBeNull();
+      expect(screen.getByRole(role, { name })).toBe(list);
+    });
+
+    test(`retries the failed ${route} continuation with its original page token`, async () => {
+      const fixture = queryFixture(method, "50");
+      renderConsole(`/orgs/${MOCK_IDS.acme}/${route}`, fixture);
+      const list = await screen.findByRole(role, { name });
+
+      fixture.fail(
+        new ConnectError("continuation failed", Code.Internal),
+        true,
+      );
+      await click(screen.getByRole("button", { name: "Show more" }));
+      expect(
+        await screen.findByText("Something went wrong. Try again."),
+      ).toBeTruthy();
+      expect(screen.queryByText(refreshNotice)).toBeNull();
+      expect(screen.getByRole(role, { name })).toBe(list);
+
+      fixture.fail(undefined);
+      await click(screen.getByRole("button", { name: "Try again" }));
+      expect(fixture.pageTokens).toEqual(["", "50", "50"]);
+      expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+      expect(screen.getByRole(role, { name })).toBe(list);
+    });
+  }
+
+  test("replaces an infinite list after a terminal continuation error", async () => {
+    const fixture = queryFixture("ListApiKeys", "50");
+    renderConsole(keyPath, fixture);
+    await screen.findByText(seededKey);
+
+    fixture.fail(
+      new ConnectError("access revoked", Code.PermissionDenied),
+      true,
+    );
+    await click(screen.getByRole("button", { name: "Show more" }));
+
+    expect(
+      await screen.findByText("You do not have permission to do this."),
+    ).toBeTruthy();
+    expect(screen.queryByText(seededKey)).toBeNull();
+    expect(screen.queryByText(refreshNotice)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+    fixture.fail(undefined);
+    await click(screen.getByRole("button", { name: "Try again" }));
+    expect(fixture.pageTokens).toEqual(["", "50", ""]);
+    expect(await screen.findByText(seededKey)).toBeTruthy();
   });
 });
 

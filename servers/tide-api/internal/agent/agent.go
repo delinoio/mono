@@ -307,8 +307,8 @@ type claimLock struct {
 	users int
 }
 
-// lockVendorRequest locks the claim and release calls of one vendor request
-// and returns the unlock function. The vendor APIs identify a claim only by
+// lockVendorRequest serializes claim, release and loss handling for one
+// vendor request and returns the unlock function. The vendor APIs identify a claim only by
 // the vendor request ID (Cursor `claims/{id}/release`, Devin
 // `devins/{session_id}/release`), so a release of an earlier claim that
 // runs after the claim of a follow-up would end the follow-up's claim.

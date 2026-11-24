@@ -12,7 +12,11 @@ import {
   PageHeader,
   SignInFailureNotice,
 } from "../components/ui.tsx";
-import { openInvitationFromAddress, pendingInvitation } from "../invitation.ts";
+import {
+  openInvitationFromAddress,
+  pendingInvitation,
+  takeSecretFromAddress,
+} from "../invitation.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
 /**
@@ -25,13 +29,14 @@ import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 export function InvitationPage({ configured }: { configured: boolean }) {
   const auth = useAuth();
   const { navigate } = useRouter();
-  const [secret, setSecret] = useState<string | undefined>(() => {
-    const fromAddress = openInvitationFromAddress(
-      window.location,
-      window.history,
-    );
-    return fromAddress ?? pendingInvitation.read();
-  });
+  const [invitation, setInvitation] = useState(() => ({
+    secret:
+      openInvitationFromAddress(window.location, window.history) ??
+      pendingInvitation.read(),
+    generation: 0,
+  }));
+  const { secret, generation } = invitation;
+  const currentInvitation = useRef(invitation);
   const queryClient = useQueryClient();
   const accept = useMutation(MemberService.method.acceptInvitation, {
     // Joining changes the caller's organizations and their members, so the
@@ -58,15 +63,19 @@ export function InvitationPage({ configured }: { configured: boolean }) {
   }, []);
 
   useEffect(() => {
-    // A new link opened while the page is shown. The error of the previous
-    // link does not apply to it.
     const onHash = () => {
-      const next = openInvitationFromAddress(window.location, window.history);
-      if (next !== undefined) {
-        currentAttempt.current += 1;
-        resetAccept();
-        setSecret(next);
+      const secret = takeSecretFromAddress(window.location, window.history);
+      if (secret === undefined || secret === currentInvitation.current.secret) {
+        return;
       }
+      // A different link gets its own button and mutation state. The
+      // previous button may still be waiting for its request to settle.
+      currentAttempt.current += 1;
+      const next = { secret, generation: currentAttempt.current };
+      currentInvitation.current = next;
+      pendingInvitation.clear();
+      resetAccept();
+      setInvitation(next);
     };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
@@ -136,7 +145,11 @@ export function InvitationPage({ configured }: { configured: boolean }) {
       ) : null}
       <div className="actions">
         <Button
+          key={generation}
           onClick={async () => {
+            if (invitation !== currentInvitation.current) {
+              return;
+            }
             const attempt = currentAttempt.current;
             // Whether the attempt still belongs to the shown invitation,
             // read the moment its request settles: the navigation below
