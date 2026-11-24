@@ -552,7 +552,16 @@ const chunkLimit = 32 << 10
 // serve sends the events of p from the given offsets until the final
 // event, the end of ctx, or the stream event limit.
 func (g *guest) serve(ctx context.Context, p *proc, so, se int64, send func(*tidev1.DevSessionExecEvent) error) error {
-	if err := send(&tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Started{Started: &tidev1.DevSessionExecStarted{ExecId: p.execID, StartTime: timestamppb.New(p.start)}}}); err != nil {
+	limit := g.s.ExecStreamEventLimit
+	sent := 0
+	sendEvent := func(ev *tidev1.DevSessionExecEvent) (stop bool, err error) {
+		if err := send(ev); err != nil {
+			return true, err
+		}
+		sent++
+		return limit > 0 && sent >= limit, nil
+	}
+	if stop, err := sendEvent(&tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Started{Started: &tidev1.DevSessionExecStarted{ExecId: p.execID, StartTime: timestamppb.New(p.start)}}}); stop {
 		return err
 	}
 	offs := [2]int64{so, se}
@@ -561,14 +570,12 @@ func (g *guest) serve(ctx context.Context, p *proc, so, se int64, send func(*tid
 		offs[0] = max(offs[0], p.out[0].base)
 		offs[1] = max(offs[1], p.out[1].base)
 		p.mu.Unlock()
-		if err := send(&tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_OutputTruncated{OutputTruncated: &tidev1.DevSessionExecOutputTruncated{StdoutOffset: offs[0], StderrOffset: offs[1]}}}); err != nil {
+		if stop, err := sendEvent(&tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_OutputTruncated{OutputTruncated: &tidev1.DevSessionExecOutputTruncated{StdoutOffset: offs[0], StderrOffset: offs[1]}}}); stop {
 			return err
 		}
 	} else {
 		p.mu.Unlock()
 	}
-	limit := g.s.ExecStreamEventLimit
-	sent := 0
 	for {
 		p.mu.Lock()
 		var ev *tidev1.DevSessionExecEvent
@@ -601,7 +608,8 @@ func (g *guest) serve(ctx context.Context, p *proc, so, se int64, send func(*tid
 		switch {
 		case ev != nil:
 		case final != nil:
-			return send(final)
+			_, err := sendEvent(final)
+			return err
 		default:
 			select {
 			case <-ctx.Done():
@@ -610,12 +618,8 @@ func (g *guest) serve(ctx context.Context, p *proc, so, se int64, send func(*tid
 				continue
 			}
 		}
-		if err := send(ev); err != nil {
+		if stop, err := sendEvent(ev); stop {
 			return err
-		}
-		sent++
-		if limit > 0 && sent >= limit {
-			return nil
 		}
 	}
 }

@@ -276,9 +276,11 @@ func TestExecAttachAfterStreamRotation(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
 	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
-	srv.ExecStreamEventLimit = 1
+	srv.ExecStreamEventLimit = 2
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	var got collected
-	res, err := c.Exec(context.Background(), ExecParams{
+	res, err := c.Exec(ctx, ExecParams{
 		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
 		Command: []string{"sh", "-c", `for i in 1 2 3 4 5 6; do echo "out $i"; echo "err $i" >&2; sleep 0.01; done; exit 3`},
 		OnEvent: got.on,
@@ -290,16 +292,17 @@ func TestExecAttachAfterStreamRotation(t *testing.T) {
 		t.Fatalf("result = %+v", res)
 	}
 	wantOut := "out 1\nout 2\nout 3\nout 4\nout 5\nout 6\n"
-	if got.stdout.String() != wantOut || !strings.Contains(got.stderr.String(), "err 6") || got.started != 1 {
+	wantErr := "err 1\nerr 2\nerr 3\nerr 4\nerr 5\nerr 6\n"
+	if got.stdout.String() != wantOut || got.stderr.String() != wantErr || got.started != 1 {
 		t.Fatalf("stdout %q stderr %q started %d", got.stdout.String(), got.stderr.String(), got.started)
 	}
-	if res.StdoutOffset != int64(len(wantOut)) {
-		t.Fatalf("stdout offset %d", res.StdoutOffset)
+	if res.StdoutOffset != int64(len(wantOut)) || res.StderrOffset != int64(len(wantErr)) {
+		t.Fatalf("stdout offset %d, stderr offset %d", res.StdoutOffset, res.StderrOffset)
 	}
-	if n := srv.Calls("/delino.tide.v1.DevSessionService/AttachDevSessionExec"); n < 2 {
+	if n := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); n < 2 {
 		t.Fatalf("attach calls = %d, want several", n)
 	}
-	if n := srv.Calls("/delino.tide.v1.DevSessionService/ExecDevSession"); n != 1 {
+	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); n != 1 {
 		t.Fatalf("exec calls = %d, want 1", n)
 	}
 	reqs := srv.ExecRequests()
@@ -312,10 +315,12 @@ func TestExecReportsLostOutput(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
 	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
-	srv.ExecStreamEventLimit = 1
+	srv.ExecStreamEventLimit = 2
 	srv.OutputKeepBytes = 8
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	var got collected
-	res, err := c.Exec(context.Background(), ExecParams{
+	res, err := c.Exec(ctx, ExecParams{
 		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
 		Command: []string{"sh", "-c", `echo first; sleep 0.2; echo 0123456789abcdefghij; sleep 0.2; echo end`},
 		OnEvent: got.on,
@@ -323,8 +328,8 @@ func TestExecReportsLostOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Incomplete || len(got.truncated) == 0 {
-		t.Fatalf("result incomplete=%v truncated=%v", res.Incomplete, got.truncated)
+	if res.Kind != ExecResultExited || res.ExitCode == nil || *res.ExitCode != 0 || !res.Incomplete || len(got.truncated) == 0 {
+		t.Fatalf("result = %+v, truncation = %v", res, got.truncated)
 	}
 	tr := got.truncated[0].MissingStdout
 	if tr.Empty() || tr.From < int64(len("first\n")) {
@@ -332,6 +337,12 @@ func TestExecReportsLostOutput(t *testing.T) {
 	}
 	if !strings.HasSuffix(got.stdout.String(), "end\n") {
 		t.Fatalf("stdout %q", got.stdout.String())
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); n == 0 {
+		t.Fatal("expected an attach after rotation")
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); n != 1 {
+		t.Fatalf("exec calls = %d, want 1", n)
 	}
 }
 
@@ -388,16 +399,32 @@ func TestExecErrors(t *testing.T) {
 		t.Fatalf("attach after cancel: %q %+v %v", got.stdout.String(), res, err)
 	}
 
-	// A transient failure of the first stream continues with attach, and
-	// the command runs once.
-	srv.Fail("/delino.tide.v1.DevSessionService/AttachDevSessionExec", connect.NewError(connect.CodeUnavailable, errors.New("restart")))
-	srv.ExecStreamEventLimit = 1
+	// After rotation, a transient failure of the first attach is retried
+	// without running the command again.
+	execCalls := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure)
+	attachCalls := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure)
+	srv.Fail(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure, connect.NewError(connect.CodeUnavailable, errors.New("restart")))
+	srv.ExecStreamEventLimit = 2
+	retryCtx, cancelRetry := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelRetry()
 	got = collected{}
-	res, err = c.Exec(ctx, ExecParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), Command: []string{"sh", "-c", "echo a; echo b"}, OnEvent: got.on})
-	if err != nil || got.stdout.String() != "a\nb\n" {
-		t.Fatalf("retry: %q %v", got.stdout.String(), err)
+	res, err = c.Exec(retryCtx, ExecParams{
+		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+		Command: []string{"sh", "-c", "echo a; echo b; echo retry >&2"},
+		OnEvent: got.on,
+	})
+	if err != nil || res.Kind != ExecResultExited || res.ExitCode == nil || *res.ExitCode != 0 || res.Incomplete {
+		t.Fatalf("retry result = %+v, error = %v", res, err)
 	}
-	_ = res
+	if got.stdout.String() != "a\nb\n" || got.stderr.String() != "retry\n" {
+		t.Fatalf("retry stdout = %q, stderr = %q", got.stdout.String(), got.stderr.String())
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure) - attachCalls; n < 2 {
+		t.Fatalf("attach calls = %d, want at least 2", n)
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure) - execCalls; n != 1 {
+		t.Fatalf("exec calls = %d, want 1", n)
+	}
 }
 
 func mkdir(p string) error { return os.MkdirAll(p, 0o755) }
