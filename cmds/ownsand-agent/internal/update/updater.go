@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sync"
 	"time"
@@ -142,8 +144,8 @@ type Updater struct {
 	applied uint64
 }
 
-// New returns an updater. It confirms an installation of the previous
-// process: the running version must equal the recorded target.
+// New removes abandoned downloads and confirms any installation that the
+// previous process recorded. The running version must equal the recorded target.
 func New(opts Options) (*Updater, error) {
 	if opts.HTTP == nil {
 		opts.HTTP = http.DefaultClient
@@ -152,6 +154,7 @@ func New(opts Options) (*Updater, error) {
 		opts.Logger = slog.Default()
 	}
 	u := &Updater{opts: opts, state: ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, wake: make(chan struct{}, 1)}
+	u.removeAbandonedArtifacts()
 	st, err := opts.Store.LoadAgent()
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, err
@@ -170,6 +173,44 @@ func New(opts Options) (*Updater, error) {
 		}
 	}
 	return u, nil
+}
+
+// These patterns match the file names from download and store.WriteFileAtomic,
+// including names with newlines that older agents could download.
+var (
+	artifactName     = regexp.MustCompile(`(?s)^ownsand-agent-.+-[0-9]+$`)
+	artifactTempName = regexp.MustCompile(`(?s)^\.ownsand-agent-.+-[0-9]+\.tmp-[0-9]+$`)
+)
+
+// The queue lives in memory, so a new process cannot install files left by
+// an earlier one. Each state directory belongs to one running agent.
+func (u *Updater) removeAbandonedArtifacts() {
+	dir := u.opts.Store.Path(store.UpdateDir)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		u.opts.Logger.Warn("update directory listing failed", "error", err)
+		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.Type().IsRegular() || !(artifactName.MatchString(name) || artifactTempName.MatchString(name)) {
+			continue
+		}
+		size := int64(-1)
+		if info, err := entry.Info(); err == nil {
+			size = info.Size()
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				u.opts.Logger.Warn("abandoned update artifact removal failed", "name", name, "error", err)
+			}
+			continue
+		}
+		u.opts.Logger.Info("abandoned update artifact removed", "name", name, "size_bytes", size)
+	}
 }
 
 // State returns the update state and the target version for heartbeats.
