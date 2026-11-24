@@ -116,8 +116,22 @@ func TestSnapshotExportImport(t *testing.T) {
 	// 12 MiB of random data makes a tar stream of three 5 MiB parts with
 	// the process runtime (see wantExportParts).
 	data := randomBytes(t, 12<<20)
-	if _, err := src.WriteFile(ctx, workDir(ctx, t, src)+"/data.bin", bytes.NewReader(data), ownsand.WriteOptions{}); err != nil {
+	file := "/data.bin"
+	if s.processRuntime {
+		_, stderr, res := execCollect(ctx, t, src, "mkdir", "read-only")
+		if exitCode(res) != 0 {
+			t.Fatalf("mkdir read-only: %s (%+v)", stderr, res)
+		}
+		file = "/read-only/data.bin"
+	}
+	if _, err := src.WriteFile(ctx, workDir(ctx, t, src)+file, bytes.NewReader(data), ownsand.WriteOptions{}); err != nil {
 		t.Fatalf("WriteFile: %v", err)
+	}
+	if s.processRuntime {
+		_, stderr, res := execCollect(ctx, t, src, "/bin/sh", "-c", "chmod 0664 read-only/data.bin && chmod 0555 read-only")
+		if exitCode(res) != 0 {
+			t.Fatalf("set source modes: %s (%+v)", stderr, res)
+		}
 	}
 	snap, err := src.Snapshot(ctx)
 	if err != nil {
@@ -153,9 +167,15 @@ func TestSnapshotExportImport(t *testing.T) {
 	if err != nil || info.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING || info.GetDeviceId() != b.deviceID {
 		t.Fatalf("restored WaitStable = (%v on %s, %v)", info.GetState(), info.GetDeviceId(), err)
 	}
-	got, err := restored.ReadFileBytes(ctx, workDir(ctx, t, restored)+"/data.bin")
+	got, err := restored.ReadFileBytes(ctx, workDir(ctx, t, restored)+file)
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("restored ReadFile = (%d bytes, %v)", len(got), err)
+	}
+	if s.processRuntime {
+		stdout, stderr, res := execCollect(ctx, t, restored, "stat", "-c", "%a", "read-only", "read-only/data.bin")
+		if exitCode(res) != 0 || stdout != "555\n664\n" {
+			t.Errorf("restored modes = %q, want 0555 and 0664 (%s, %+v)", stdout, stderr, res)
+		}
 	}
 	for _, sb := range []*ownsand.Sandbox{restored, src} {
 		if _, err := sb.Delete(ctx); err != nil {

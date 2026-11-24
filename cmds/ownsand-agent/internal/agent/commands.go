@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
@@ -15,6 +14,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/update"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/go/ownsand/validate"
+	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -323,27 +323,26 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	published := false
 	defer func() {
 		if !published {
-			os.RemoveAll(dir)
+			if err := fsutil.RemoveAll(dir); err != nil {
+				a.logger.Error("unpublished snapshot cleanup failed", "snapshot_id", snapshotID, "error", err)
+			}
 		}
 	}()
 	// Remove leftovers of an earlier attempt that a crash interrupted. No
 	// ready copy exists here: the check above ran under the lock.
-	os.RemoveAll(dir)
+	if err := fsutil.RemoveAll(dir); err != nil {
+		return nil, fmt.Errorf("remove stale snapshot import: %w", err)
+	}
 	if err := a.transfer.Import(ctx, snapshotID, cmd.GetParts(), filepath.Join(dir, "content")); err != nil {
 		a.logger.Error("snapshot import failed", "snapshot_id", snapshotID, "error", err)
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS, Message: "snapshot import failed its download or hash check"}
 	}
-	// A channel that closed while the import renamed the staged content must
-	// not publish a ready entry: the deferred removal drops the content.
-	if err := ctx.Err(); err != nil {
-		a.logger.Warn("snapshot import stopped before publication", "snapshot_id", snapshotID, "error", err)
-		return nil, err
-	}
 	if a.beforeSnapshotPublishHook != nil {
 		a.beforeSnapshotPublishHook()
 	}
-	e, err := a.Sandboxes.AddImportedSnapshot(entry)
+	e, err := a.Sandboxes.AddImportedSnapshot(ctx, entry)
 	if err != nil {
+		a.logger.Warn("snapshot import stopped before publication", "snapshot_id", snapshotID, "error", err)
 		return nil, err
 	}
 	published = true

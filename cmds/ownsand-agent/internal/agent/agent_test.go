@@ -40,6 +40,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/processrt"
 	"github.com/delinoio/mono/go/uuidv7"
+	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -757,15 +758,30 @@ func newImportFixture(t *testing.T, hook func(r *http.Request) int) *importFixtu
 // newImportFixtureWith is newImportFixture with options that tweak the agent.
 func newImportFixtureWith(t *testing.T, hook func(r *http.Request) int, tweak func(*Options)) *importFixture {
 	t.Helper()
+	return newImportFixtureWithSource(t, hook, tweak, nil)
+}
+
+func newImportFixtureWithSource(t *testing.T, hook func(r *http.Request) int, tweak func(*Options), prepare func(root string)) *importFixture {
+	t.Helper()
 	cp := testcp.New(t)
 	b := bucketWithHook(t, hook)
 	cp.SetSignedURLBase(b.URL)
 	st, id := enrollDevice(t, cp)
+	if prepare != nil {
+		t.Cleanup(func() {
+			if err := fsutil.RemoveAll(st.Dir()); err != nil {
+				t.Errorf("remove fixture state: %v", err)
+			}
+		})
+	}
 	h := startWith(t, cp, st, id, tweak)
 	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
 	sandboxID, _ := uuidv7.NewString()
 	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
 		t.Fatal(res.GetError())
+	}
+	if prepare != nil {
+		prepare(st.Path(store.VMsDir, sandboxID, "root"))
 	}
 	snapID, _ := uuidv7.NewString()
 	res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}})
@@ -1007,6 +1023,82 @@ func TestImportStopsWithItsChannelContext(t *testing.T) {
 		t.Fatalf("import after the cancelled one = %v", res)
 	}
 	f.requireRestorable(t, id)
+}
+
+func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
+	f := newImportFixtureWithSource(t, nil, nil, func(root string) {
+		dir := filepath.Join(root, "read-only")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "note"), []byte("snapshot fixture\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+	})
+	a := f.h.agent
+	for _, name := range []string{"ready record write fails", "channel context ends"} {
+		t.Run(name, func(t *testing.T) {
+			id, _ := uuidv7.NewString()
+			cmd := f.stage(t, id, false).GetImportSnapshot()
+			dir, err := f.h.st.SnapshotDir(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			a.beforeSnapshotPublishHook = func() {
+				ro := filepath.Join(dir, "content", "disk", "read-only")
+				info, err := os.Stat(ro)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := info.Mode().Perm(); got != 0o555 {
+					t.Errorf("renamed directory: mode %04o, want 0555", got)
+				}
+				if _, err := os.Stat(filepath.Join(ro, "note")); err != nil {
+					t.Fatal(err)
+				}
+				if name == "channel context ends" {
+					cancel()
+				} else if err := os.Mkdir(filepath.Join(dir, "record.json"), 0o700); err != nil {
+					// The ready record cannot replace a directory.
+					t.Fatal(err)
+				}
+			}
+			defer func() { a.beforeSnapshotPublishHook = nil }()
+			_, err = a.importSnapshot(ctx, cmd)
+			if name == "channel context ends" {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("import error = %v, want context.Canceled", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "save imported snapshot") {
+				t.Fatalf("import error = %v, want a ready record write failure", err)
+			}
+			if _, _, ok := a.Sandboxes.SnapshotContent(id); ok {
+				t.Error("an aborted import left a ready snapshot")
+			}
+			if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unpublished snapshot directory remains: %v", err)
+			}
+			a.beforeSnapshotPublishHook = nil
+			if entry, err := a.importSnapshot(context.Background(), cmd); err != nil || entry.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+				t.Fatalf("retry import = (%v, %v), want a ready snapshot", entry, err)
+			}
+			content, _, ok := a.Sandboxes.SnapshotContent(id)
+			if !ok {
+				t.Fatal("the retry did not publish the snapshot")
+			}
+			if _, err := os.Stat(filepath.Join(dir, "record.json")); err != nil {
+				t.Fatalf("ready snapshot record: %v", err)
+			}
+			if got, err := os.ReadFile(filepath.Join(content, "disk", "read-only", "note")); err != nil || string(got) != "snapshot fixture\n" {
+				t.Fatalf("retried snapshot content = %q, %v", got, err)
+			}
+		})
+	}
 }
 
 // TestImportWithCanceledContextAbortsEvenWithFreeLockAndReadyCopy checks that

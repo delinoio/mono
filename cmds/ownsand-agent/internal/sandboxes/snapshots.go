@@ -724,8 +724,9 @@ func (m *Manager) ImportDir(id string) (string, error) {
 // content was verified and extracted into ImportDir(id)/content. It refuses
 // once the device removal started: the check, the save and the insert run
 // under mu, so that no record is written after the removal fenced the
-// imports. The caller removes the content of a refused import.
-func (m *Manager) AddImportedSnapshot(entry *ownsandv1.SnapshotStateEntry) (*ownsandv1.SnapshotStateEntry, error) {
+// imports. It also checks the channel context before and after saving the
+// record. The caller removes the record and content of an unpublished import.
+func (m *Manager) AddImportedSnapshot(ctx context.Context, entry *ownsandv1.SnapshotStateEntry) (*ownsandv1.SnapshotStateEntry, error) {
 	dir, err := m.st.SnapshotDir(entry.GetSnapshotId())
 	if err != nil {
 		return nil, err
@@ -748,8 +749,14 @@ func (m *Manager) AddImportedSnapshot(entry *ownsandv1.SnapshotStateEntry) (*own
 	if m.removing {
 		return nil, errImportRefusedRemoving()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := m.st.SaveSnapshot(snap.rec.SnapshotID, snap.rec); err != nil {
 		return nil, fmt.Errorf("sandboxes: save imported snapshot: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	m.snapshots[snap.rec.SnapshotID] = snap
 	return snap.entry(), nil
