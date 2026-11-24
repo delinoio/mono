@@ -4,6 +4,7 @@ package relay
 
 import (
 	"context"
+	"time"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -20,10 +21,26 @@ import (
 // returns ErrConnClosed, also when the writer failed). A frame that is queued
 // when ctx ends may still be written later; the caller then closes the stream.
 func (s *Stream) SendConfirmed(ctx context.Context, f *ownsandv1.DataFrame, onWritten func(n int64)) error {
+	return s.sendConfirmed(ctx, f, onWritten, 0)
+}
+
+// SendForAcceptance forwards a server-streaming request. The connection
+// writer starts the acceptance window when it finishes the send.
+func (s *Stream) SendForAcceptance(ctx context.Context, f *ownsandv1.DataFrame, timeout time.Duration) error {
+	return s.sendConfirmed(ctx, f, nil, timeout)
+}
+
+type writeWaiter struct {
+	stream     *Stream
+	acceptance time.Duration
+	written    chan error
+}
+
+func (s *Stream) sendConfirmed(ctx context.Context, f *ownsandv1.DataFrame, onWritten func(n int64), acceptance time.Duration) error {
 	written := make(chan error, 1)
 	// Register before the frame can reach the writer. The pointer identifies
 	// the frame, and a caller never queues the same frame twice.
-	s.conn.writeWaiters.Store(f, written)
+	s.conn.writeWaiters.Store(f, writeWaiter{stream: s, acceptance: acceptance, written: written})
 	defer s.conn.writeWaiters.Delete(f)
 	if err := s.SendMetered(ctx, f, onWritten); err != nil {
 		return err
@@ -58,12 +75,16 @@ func (s *Stream) confirmResult(err error) error {
 }
 
 // writeConfirmed reports the result of the send of f to the SendConfirmed
-// caller that waits for it, if any. The writer calls it after each send, so
-// the lookup must stay cheap and must never block.
+// caller that waits for it, if any. Start the acceptance window before
+// reporting success. The writer does not wait for the caller.
 func (c *Conn) writeConfirmed(f *ownsandv1.DataFrame, err error) {
 	if v, ok := c.writeWaiters.Load(f); ok {
+		w := v.(writeWaiter)
+		if err == nil && w.acceptance > 0 {
+			w.stream.startAcceptance(w.acceptance)
+		}
 		select {
-		case v.(chan error) <- err:
+		case w.written <- err:
 		default:
 		}
 	}

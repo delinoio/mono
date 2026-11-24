@@ -120,10 +120,10 @@ type Conn struct {
 	// wireBytes is set by SetWireBytes before Run starts.
 	wireBytes func() int64
 
-	// clk supplies the monotonic readings of the idle and keepalive timers and
-	// the wall timestamps of the observers (see connClock).
-	clk connClock
-	// lastRecv and lastSend are the monotonic readings (clk.mono, in
+	// clk supplies monotonic readings for deadlines and wall timestamps
+	// for observers.
+	clk Clock
+	// lastRecv and lastSend are the monotonic readings (clk.Elapsed, in
 	// nanoseconds) of the last received frame and the last sent frame. The
 	// idle and keepalive thresholds use them, so wall-clock steps do not
 	// change them.
@@ -157,10 +157,9 @@ type Conn struct {
 	perGrant  map[string]int
 	peerKinds map[ownsandv1.DataFrameKind]bool
 
-	// writeWaiters maps a frame that SendConfirmed queued to the channel on
-	// which the writer reports the result of its send (see writeConfirmed).
-	// The queue and the outFrame stay unchanged for every other sender.
-	writeWaiters sync.Map // *ownsandv1.DataFrame -> chan error
+	// writeWaiters registers frames whose send the caller needs the writer
+	// to confirm.
+	writeWaiters sync.Map // *ownsandv1.DataFrame -> writeWaiter
 }
 
 // outFrame is a frame in the outbound queue. final marks a stream's final
@@ -177,12 +176,15 @@ type outFrame struct {
 // NewConn returns a connection for the device bound to an agent channel
 // generation.
 func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits) *Conn {
-	return newConnWithClock(parent, deviceID, gen, limits, newSystemClock())
+	return NewConnWithClock(parent, deviceID, gen, limits, nil)
 }
 
-// newConnWithClock is NewConn with an injected clock, so tests can step the
-// wall clock and advance the monotonic clock independently.
-func newConnWithClock(parent context.Context, deviceID string, gen uint64, limits Limits, clk connClock) *Conn {
+// NewConnWithClock is NewConn with an injected clock. A nil clock uses
+// the system clock.
+func NewConnWithClock(parent context.Context, deviceID string, gen uint64, limits Limits, clk Clock) *Conn {
+	if clk == nil {
+		clk = newSystemClock()
+	}
 	if limits.MaxQueuedControlFrames <= 0 {
 		limits.MaxQueuedControlFrames = defaultMaxQueuedControlFrames
 	}
@@ -193,9 +195,9 @@ func newConnWithClock(parent context.Context, deviceID string, gen uint64, limit
 	reserved := max(limits.MaxStreamsPerConn, 0)
 	c := &Conn{DeviceID: deviceID, Generation: gen, limits: limits, out: make(chan outFrame, outboundQueue+reserved),
 		slots: make(chan struct{}, outboundQueue), ctx: ctx, cancel: cancel, openGate: make(chan struct{}, 1), streams: map[uint64]*Stream{}, perGrant: map[string]int{}, clk: clk}
-	c.lastRecv.Store(int64(clk.mono()))
-	c.lastSend.Store(int64(clk.mono()))
-	c.lastRecvWall.Store(clk.wall().UnixNano())
+	c.lastRecv.Store(int64(clk.Elapsed()))
+	c.lastSend.Store(int64(clk.Elapsed()))
+	c.lastRecvWall.Store(clk.Now().UnixNano())
 	return c
 }
 
@@ -390,7 +392,7 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 		for {
 			select {
 			case <-ticker.C:
-				if c.clk.mono()-time.Duration(c.lastRecv.Load()) > c.limits.IdleTimeout {
+				if c.clk.Elapsed()-time.Duration(c.lastRecv.Load()) > c.limits.IdleTimeout {
 					c.Close(ErrIdle)
 					return
 				}
@@ -414,9 +416,9 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 					c.Close(err)
 					return
 				}
-				c.lastSend.Store(int64(c.clk.mono()))
+				c.lastSend.Store(int64(c.clk.Elapsed()))
 			case <-ticker.C:
-				now := c.clk.mono()
+				now := c.clk.Elapsed()
 				if now-time.Duration(c.lastSend.Load()) >= c.limits.Keepalive {
 					if err := guardedSend(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
 						c.Close(err)
@@ -437,8 +439,8 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 				c.Close(err)
 				return
 			}
-			c.lastRecv.Store(int64(c.clk.mono()))
-			c.lastRecvWall.Store(c.clk.wall().UnixNano())
+			c.lastRecv.Store(int64(c.clk.Elapsed()))
+			c.lastRecvWall.Store(c.clk.Now().UnixNano())
 			if err := c.dispatch(f); err != nil {
 				c.Close(err)
 				return
@@ -492,13 +494,13 @@ func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
 	}
 	c.mu.Lock()
 	s := c.streams[f.GetStreamId()]
+	if s != nil && size >= LargeFrameBytes && !s.isClosed() {
+		c.recordLargeReceive()
+	}
 	c.mu.Unlock()
 	if s == nil {
 		// A late frame of a closed stream is dropped.
 		return nil
-	}
-	if size >= LargeFrameBytes {
-		c.lastLarge.Store(c.clk.wall().UnixNano())
 	}
 	if err := datapath.ValidateFrame(f); err != nil {
 		var unknown *datapath.UnknownKindError
@@ -539,6 +541,8 @@ type Stream struct {
 	conn      *Conn
 	recv      *datapath.ReceiveWindow
 	send      *datapath.SendWindow
+
+	acceptance acceptanceWait // protected by conn.mu
 
 	mu    sync.Mutex
 	queue []*ownsandv1.DataFrame

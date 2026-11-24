@@ -59,6 +59,11 @@ type Clock struct {
 	elapsed time.Duration
 }
 
+// NewClock starts a test clock at the current wall time and zero elapsed time.
+func NewClock() *Clock {
+	return &Clock{now: time.Now().UTC().Truncate(time.Millisecond)}
+}
+
 // Now returns the current test time.
 func (c *Clock) Now() time.Time {
 	c.mu.Lock()
@@ -150,7 +155,7 @@ func (withoutPeriodicRevocationSweep) SweepExpired(context.Context) {}
 func newEnv(t testing.TB, skipPeriodicRevocationSweep bool, opts ...Option) *Env {
 	t.Helper()
 	database := dbtest.New(t)
-	clock := &Clock{now: time.Now().UTC().Truncate(time.Millisecond)}
+	clock := NewClock()
 	logs := &SafeBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	// Generous limits so tests are not rate-limited unless they test it.

@@ -47,7 +47,10 @@ const MaxRequestBytes = 2 << 20
 const _ = uint(MaxRequestBytes - datapath.MaxFrameSize - 1)
 
 // RelayAgentHandler serves RelayAgentService.
-type RelayAgentHandler struct{ *DataPlane }
+type RelayAgentHandler struct {
+	*DataPlane
+	Clock relay.Clock
+}
 
 var _ ownsandv1connect.RelayAgentServiceHandler = RelayAgentHandler{}
 
@@ -63,7 +66,7 @@ func (h RelayAgentHandler) Connect(ctx context.Context, stream *connect.BidiStre
 	if hc == nil {
 		return errUnavailable("the device has no agent channel on this instance")
 	}
-	conn := relay.NewConn(ctx, p.ID, hc.Generation, h.Limits)
+	conn := relay.NewConnWithClock(ctx, p.ID, hc.Generation, h.Limits, h.Clock)
 	log := h.S.Logger.With(slog.String("device_id", p.ID), slog.Uint64("generation", hc.Generation))
 	// The channel lookup above and the registration are separate steps; a
 	// reconnect can install a newer channel and its relay connection between
@@ -159,7 +162,6 @@ type relayCall struct {
 	procedure string
 	grant     *grants.Grant
 	stream    *relay.Stream
-	conn      *relay.Conn
 	start     time.Time
 	frames    int
 	bytes     int64
@@ -347,7 +349,7 @@ func (p *DataPlane) open(ctx context.Context, procedure string, header http.Head
 		}
 		return nil, errUnavailable("the relay connection closed")
 	}
-	return &relayCall{procedure: procedure, grant: g, stream: s, conn: conn, start: time.Now()}, nil
+	return &relayCall{procedure: procedure, grant: g, stream: s, start: time.Now()}, nil
 }
 
 // admissionContextError maps the end of the RPC context during relay
@@ -441,19 +443,20 @@ type streamEvents struct {
 // request deadline, which the request gate counted from the stream_id
 // allocation, so the upload of the request body already used part of it.
 // onWritten, when set, receives the bytes of the frame on the agent
-// connection once the relay wrote it. When confirmed is set, sendRequest
-// returns only after the connection writer finished sending the frame, so
-// the request deadline also covers the wait behind a blocked writer and the
-// caller can start a timer for the agent's reply at the return; otherwise it
-// returns when the frame is queued.
-func (p *DataPlane) sendRequest(ctx context.Context, c *relayCall, f *ownsandv1.DataFrame, deadline time.Time, onWritten func(int64), confirmed bool) error {
+// connection once the relay wrote it. When acceptance is positive, the writer
+// starts the acceptance window after sending the frame and sendRequest waits
+// for that confirmation. Otherwise sendRequest returns when the frame is
+// queued.
+func (p *DataPlane) sendRequest(ctx context.Context, c *relayCall, f *ownsandv1.DataFrame, deadline time.Time, onWritten func(int64), acceptance time.Duration) error {
 	rctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	send := c.stream.SendMetered
-	if confirmed {
-		send = c.stream.SendConfirmed
+	var err error
+	if acceptance > 0 {
+		err = c.stream.SendForAcceptance(rctx, f, acceptance)
+	} else {
+		err = c.stream.SendMetered(rctx, f, onWritten)
 	}
-	if err := send(rctx, f, onWritten); err != nil {
+	if err != nil {
 		if errors.Is(err, relay.ErrConnClosed) {
 			return errUnavailable("the relay connection closed")
 		}
@@ -499,14 +502,13 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 	// the acceptance timeout below never runs while the frame still waits
 	// behind a blocked writer; that wait stays under the request deadline.
 	uploadDone := make(chan error, 1)
-	go func() { uploadDone <- p.sendRequest(ctx, c, request, deadline, nil, true) }()
+	go func() { uploadDone <- p.sendRequest(ctx, c, request, deadline, nil, p.Timing.Acceptance) }()
 	tick := min(p.Timing.Keepalive, p.Timing.Acceptance) / 4
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	lastEmit := time.Now()
 	accepted := false
 	forwarded := false
-	var acceptBy time.Time
 	rotateAt := c.stream.Started.Add(p.Timing.Rotation)
 	for {
 		if !forwarded {
@@ -516,7 +518,6 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 					return err
 				}
 				forwarded = true
-				acceptBy = time.Now().Add(p.Timing.Acceptance)
 			default:
 			}
 		}
@@ -552,18 +553,8 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 			return nil // rotation: OK status without a final event
 		}
 		if f == nil {
-			if forwarded && !accepted {
-				// Only a large frame extends the wait: the notice cannot overtake
-				// it. Keepalives and small frames never do, so they cannot keep
-				// a stalled admission alive.
-				if last := c.conn.LastLargeReceive(); !last.IsZero() {
-					if until := last.Add(p.Timing.Acceptance); until.After(acceptBy) {
-						acceptBy = until
-					}
-				}
-				if !now.Before(acceptBy) {
-					return errUnavailable("the agent did not accept the request")
-				}
+			if !accepted && c.stream.AcceptanceExpired() {
+				return errUnavailable("the agent did not accept the request")
 			}
 			if now.Sub(lastEmit) >= p.Timing.Keepalive {
 				if err := ev.keepalive(); err != nil {
@@ -580,6 +571,7 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 		if f.GetKind() == ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED {
 			if !accepted {
 				accepted = true
+				c.stream.MarkAccepted()
 				if err := ev.accepted(); err != nil {
 					return err
 				}
@@ -728,7 +720,7 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 	// Droplet on the agent's relay connection.
 	orgID := c.grant.OrgID
 	egress := func(n int64) { h.S.recordUsage(orgID, ownsandv1.BillingMeter_BILLING_METER_RELAY_EGRESS, n) }
-	if err := h.sendRequest(cctx, c, datapath.MustNewFrame(0, "", m), deadline, egress, false); err != nil {
+	if err := h.sendRequest(cctx, c, datapath.MustNewFrame(0, "", m), deadline, egress, 0); err != nil {
 		return nil, err
 	}
 	for {

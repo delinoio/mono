@@ -13,7 +13,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// stepClock is a connClock that a test moves by hand: the wall reading and the
+// stepClock is a Clock that a test moves by hand: the wall reading and the
 // monotonic reading change only when the test changes them, independently of
 // each other, so a test can step the wall clock without monotonic time
 // passing and the other way round.
@@ -28,8 +28,8 @@ func newStepClock() *stepClock {
 	return k
 }
 
-func (k *stepClock) wall() time.Time     { return time.Unix(0, k.wallNanos.Load()) }
-func (k *stepClock) mono() time.Duration { return time.Duration(k.monoNanos.Load()) }
+func (k *stepClock) Now() time.Time         { return time.Unix(0, k.wallNanos.Load()) }
+func (k *stepClock) Elapsed() time.Duration { return time.Duration(k.monoNanos.Load()) }
 
 // stepWall moves the wall clock by d (negative d moves it back); monotonic
 // time does not move.
@@ -79,7 +79,7 @@ type stepConn struct {
 func runStepConn(t *testing.T, limits Limits) *stepConn {
 	t.Helper()
 	clk := newStepClock()
-	c := newConnWithClock(context.Background(), "device", 1, limits, clk)
+	c := NewConnWithClock(context.Background(), "device", 1, limits, clk)
 	sc := &stepConn{c: c, clk: clk, recvCh: make(chan *ownsandv1.DataFrame), sent: make(chan *ownsandv1.DataFrame, 64)}
 	recv := func() (*ownsandv1.DataFrame, error) {
 		select {
@@ -155,7 +155,7 @@ func (sc *stepConn) awaitStoredSend(t *testing.T, f *ownsandv1.DataFrame) {
 		t.Fatal(err)
 	}
 	sc.awaitFrame(t)
-	awaitStepValue(t, "lastSend", &sc.c.lastSend, int64(sc.clk.mono()))
+	awaitStepValue(t, "lastSend", &sc.c.lastSend, int64(sc.clk.Elapsed()))
 }
 
 // deliver hands a frame to the connection and waits until the receive time
@@ -167,7 +167,7 @@ func (sc *stepConn) deliver(t *testing.T, f *ownsandv1.DataFrame) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the connection did not take a received frame within 2s")
 	}
-	awaitStepValue(t, "lastRecv", &sc.c.lastRecv, int64(sc.clk.mono()))
+	awaitStepValue(t, "lastRecv", &sc.c.lastRecv, int64(sc.clk.Elapsed()))
 }
 
 func awaitStepValue(t *testing.T, name string, v *atomic.Int64, want int64) {
@@ -296,7 +296,7 @@ func TestObserversReturnWallTimestamps(t *testing.T) {
 	limits.IdleTimeout = time.Hour
 	sc := runStepConn(t, limits)
 	sc.awaitFrame(t)
-	opened := sc.clk.wall()
+	opened := sc.clk.Now()
 	if got := sc.c.LastReceive(); !got.Equal(opened) {
 		t.Fatalf("LastReceive of a new connection = %v, want its wall start %v", got, opened)
 	}
@@ -307,7 +307,7 @@ func TestObserversReturnWallTimestamps(t *testing.T) {
 
 	sc.clk.advance(time.Second)
 	sc.clk.stepWall(-time.Hour)
-	want := sc.clk.wall()
+	want := sc.clk.Now()
 	sc.deliver(t, stepKeepaliveFrame())
 	if got := sc.c.LastReceive(); !got.Equal(want) {
 		t.Fatalf("LastReceive = %v, want the wall time %v of the received frame", got, want)
@@ -316,7 +316,7 @@ func TestObserversReturnWallTimestamps(t *testing.T) {
 	large := datapath.MustNewFrame(s.ID, "sandbox", &ownsandv1.ExecEvent{
 		Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: make([]byte, 2*LargeFrameBytes)}}})
 	sc.clk.stepWall(2 * time.Hour)
-	wantLarge := sc.clk.wall()
+	wantLarge := sc.clk.Now()
 	if err := sc.c.dispatch(large); err != nil {
 		t.Fatal(err)
 	}
@@ -328,13 +328,52 @@ func TestObserversReturnWallTimestamps(t *testing.T) {
 // TestSystemClockMeasuresElapsedMonotonicTime checks the production clock.
 func TestSystemClockMeasuresElapsedMonotonicTime(t *testing.T) {
 	clk := newSystemClock()
-	first := clk.mono()
+	first := clk.Elapsed()
 	time.Sleep(5 * time.Millisecond)
-	second := clk.mono()
+	second := clk.Elapsed()
 	if first < 0 || second < first+5*time.Millisecond {
 		t.Fatalf("mono = %v then %v, want elapsed time since creation to grow by at least 5ms", first, second)
 	}
-	if d := time.Since(clk.wall()); d < 0 || d > time.Second {
+	if d := time.Since(clk.Now()); d < 0 || d > time.Second {
 		t.Fatalf("wall is %v behind the current time", d)
+	}
+}
+
+// TestAcceptanceExtensionsAreMonotonic checks that every in-window receipt
+// extends the deadline, even when the handler has not checked it yet.
+func TestAcceptanceExtensionsAreMonotonic(t *testing.T) {
+	clock := newStepClock()
+	c := NewConnWithClock(t.Context(), "device", 1, testLimits, clock)
+	t.Cleanup(func() { c.Close(errors.New("test finished")) })
+	waiting := openStream(t, c)
+	other, err := c.Open(t.Context(), "other-grant", "sandbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	large := datapath.MustNewFrame(other.ID, other.SandboxID, &ownsandv1.ExecEvent{
+		Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: make([]byte, LargeFrameBytes)}},
+	})
+	receiveLarge := func() {
+		t.Helper()
+		if err := c.dispatch(large); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	waiting.startAcceptance(30 * time.Second)
+	clock.advance(10 * time.Second)
+	clock.stepWall(time.Hour)
+	receiveLarge() // Deadline moves from elapsed second 30 to 40.
+	clock.advance(25 * time.Second)
+	clock.stepWall(-2 * time.Hour)
+	receiveLarge() // Deadline moves from elapsed second 40 to 65.
+	clock.advance(30*time.Second - time.Nanosecond)
+	if waiting.AcceptanceExpired() {
+		t.Fatal("acceptance expired before the extended deadline")
+	}
+	clock.advance(time.Nanosecond)
+	receiveLarge() // A receipt at the deadline cannot restart the wait.
+	if !waiting.AcceptanceExpired() {
+		t.Fatal("a receipt at the deadline revived the acceptance wait")
 	}
 }
