@@ -919,17 +919,40 @@ describe("createSandbox", () => {
     },
   );
 
-  test("accepts other control characters in labels", async () => {
+  test.each([
+    ["key", { "\ud800": "first", "\ufffd": "second", example: "valid" }],
+    ["value", { example: "label-value\udfff" }],
+  ] as const)(
+    "rejects a lone surrogate in a label %s before the request",
+    async (_name, labels) => {
+      const h = setup();
+      h.api.unary(SandboxService, "CreateSandbox", () => ({
+        sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
+      }));
+      await expect(
+        h.client.createSandbox({ ...validCreate, labels }),
+      ).rejects.toMatchObject({
+        name: "OwnSandValidationError",
+        field: "labels",
+        message: "labels must be valid UTF-8",
+      });
+      expect(h.api.calls).toHaveLength(0);
+    },
+  );
+
+  test("preserves well-formed Unicode and other control characters in labels", async () => {
     const h = setup();
     h.api.unary(SandboxService, "CreateSandbox", () => ({
       sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
     }));
-    await h.client.createSandbox({
-      ...validCreate,
-      labels: { "k\u0001": "a\u0001b\n" },
-    });
+    const labels = {
+      "k\u0001": "a\u0001b\n",
+      "key😀": "\ufffd",
+      "key\ufffd": "😀",
+    };
+    await h.client.createSandbox({ ...validCreate, labels });
     const req = h.api.callsOf("CreateSandbox")[0]!.request as any;
-    expect(req.labels).toEqual({ "k\u0001": "a\u0001b\n" });
+    expect(req.labels).toEqual(labels);
   });
 
   const MAX_INT64 = 2n ** 63n - 1n;
