@@ -1226,6 +1226,19 @@ func TestEnrollRetriesAfterOriginWriteFailure(t *testing.T) {
 // TestWithdrawAgentUpdateCommand checks that the agent answers the withdrawal
 // command with success when no update is queued, and keeps reporting the
 // UP_TO_DATE update state.
+func TestNewRemovesAbandonedUpdateDownload(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	artifact := st.Path(store.UpdateDir, "ownsand-agent-1.1.0-1")
+	if err := os.WriteFile(artifact, []byte("abandoned update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newAgent(t, cp, st, id, nil)
+	if _, err := os.Lstat(artifact); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat abandoned download: %v, want not exist", err)
+	}
+}
+
 func TestWithdrawAgentUpdateCommand(t *testing.T) {
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
