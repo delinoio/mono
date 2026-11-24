@@ -38,6 +38,7 @@ const (
 	guestEnvDeletes       = "TIDE_SYNC_DELETE_LIST"
 	guestEnvReplaceFiles  = "TIDE_SYNC_REPLACE_FILE_LIST"
 	guestEnvPrunes        = "TIDE_SYNC_PRUNE_LIST"
+	guestEnvAliasPrunes   = "TIDE_SYNC_PRUNE_ALIAS_LIST"
 	guestEnvLinks         = "TIDE_SYNC_LINK_LIST"
 	guestEnvPath          = "TIDE_DOWNLOAD_PATH"
 	guestEnvDLArchive     = "TIDE_DOWNLOAD_ARCHIVE"
@@ -77,9 +78,18 @@ if [ -n "$TIDE_SYNC_REPLACE_FILE_LIST" ]; then
   done' tide < "$TIDE_SYNC_REPLACE_FILE_LIST"
 fi
 if [ -n "$TIDE_SYNC_PRUNE_LIST" ]; then xargs -0 sh -c 'for d do if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir -- "$d" || exit 1; fi; done' tide < "$TIDE_SYNC_PRUNE_LIST"; fi
+if [ -n "$TIDE_SYNC_PRUNE_ALIAS_LIST" ]; then
+  # With -0 and -x, Apple xargs passes one path per invocation even with -n 3.
+  xargs -0 -n 3 sh -c '
+    [ "$#" -eq 3 ] || exit 255
+    old=$1 incoming=$2 d=$3
+    if [ ! -L "$old" ] && [ ! -L "$incoming" ] && [ -d "$old" ] && [ "$old" -ef "$incoming" ]; then
+      if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir -- "$d" || exit 255; fi
+    fi' tide < "$TIDE_SYNC_PRUNE_ALIAS_LIST"
+fi
 if [ -n "$TIDE_SYNC_ARCHIVE" ]; then tar -x -m -o -f "$TIDE_SYNC_ARCHIVE"; fi`,
 	opCleanup: `status=0
-for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_REPLACE_FILE_LIST" "$TIDE_SYNC_PRUNE_LIST"; do
+for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_REPLACE_FILE_LIST" "$TIDE_SYNC_PRUNE_LIST" "$TIDE_SYNC_PRUNE_ALIAS_LIST"; do
   if [ -n "$f" ]; then rm -f "$f" || status=1; fi
 done
 if [ -n "$TIDE_SYNC_LOCK" ]; then rm -rf "$TIDE_SYNC_LOCK" || status=1; fi

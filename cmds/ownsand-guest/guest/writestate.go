@@ -31,8 +31,9 @@ import (
 // Record lifecycle:
 //  1. The staging file is created exclusively, then its record is written
 //     (temporary file and rename). A crash between the sync and the rename of
-//     this first save leaves only the temporary record; the next start
-//     promotes it when it is complete and valid.
+//     this first save leaves only the temporary record. The next start
+//     attempts to promote a complete, valid record and loads it from the
+//     temporary path if promotion fails.
 //  2. Each accepted chunk replaces the record to refresh the time of the last
 //     chunk. A failure only logs: the next chunk or the sweep tries again.
 //  3. A finish removes the record after the rename into place.
@@ -104,8 +105,8 @@ func sanitizedError(err error) string {
 	return err.Error()
 }
 
-// recordPath returns the record file of a write, or "" when the manager does
-// not keep records.
+// recordPath returns the canonical record path of a write. It returns an
+// empty string when the manager does not keep records.
 func (m *writeManager) recordPath(writeID string) string {
 	if m.dir == "" {
 		return ""
@@ -113,12 +114,12 @@ func (m *writeManager) recordPath(writeID string) string {
 	return filepath.Join(m.dir, writeRecordName(writeID))
 }
 
-// saveRecord writes the record of e atomically. durable also syncs the file;
+// saveWriteRecord writes the record of e atomically. durable also syncs the file;
 // a refresh skips the sync, because a stale time after a power loss only
 // expires the staging file earlier, and the helper process exiting loses
 // nothing that is in the page cache.
-func (m *writeManager) saveRecord(e *writeEntry, durable bool) error {
-	path := m.recordPath(e.id)
+func saveWriteRecord(e *writeEntry, durable bool) error {
+	path := e.recordPath
 	if path == "" || e.identity == nil {
 		return nil
 	}
@@ -165,9 +166,8 @@ func (m *writeManager) saveRecord(e *writeEntry, durable bool) error {
 	return nil
 }
 
-// removeRecord removes the record of a write; a missing record is fine.
-func (m *writeManager) removeRecord(writeID string) error {
-	path := m.recordPath(writeID)
+// removeWriteRecord removes a record if it exists.
+func removeWriteRecord(path string) error {
 	if path == "" {
 		return nil
 	}
@@ -181,7 +181,7 @@ func (m *writeManager) removeRecord(writeID string) error {
 // fails the write: the upload still works, only its cleanup after a helper
 // restart is lost.
 func (m *writeManager) persistRecord(e *writeEntry, durable bool) {
-	if err := m.saveRecord(e, durable); err != nil {
+	if err := saveWriteRecord(e, durable); err != nil {
 		m.logger.Warn("save write record failed", "write_id", e.id, "error", sanitizedError(err))
 	}
 }
@@ -190,12 +190,14 @@ func (m *writeManager) persistRecord(e *writeEntry, durable bool) {
 // the lookup.
 var lstatStaging = os.Lstat
 
-// loadRecords registers the writes of an earlier helper process. A complete
-// temporary record without a canonical record is promoted first (see
-// settleTempRecords). A record whose file is confirmed gone is dropped; a record whose file lookup fails
-// for another reason is kept and registered; a record that cannot be read is
-// removed; the time of the last chunk is clamped to now, because the guest
-// clock may have been set backwards since the record was written.
+// promoteWriteRecord renames a first record at startup. Tests replace it to
+// fail promotion while leaving normal record saves and removals available.
+var promoteWriteRecord = os.Rename
+
+// loadRecords registers the writes of an earlier helper process. It loads a
+// validated first record from its temporary path if promotion fails. It drops
+// unreadable records and records whose staging file is confirmed gone. It
+// clamps the last chunk time to now to handle a guest clock set backwards.
 func (m *writeManager) loadRecords() error {
 	if m.dir == "" {
 		return nil
@@ -206,7 +208,7 @@ func (m *writeManager) loadRecords() error {
 	// Settle the temporary records first: ReadDir sorts "<hash>.json" before
 	// "<hash>.json.tmp", so a record that this pass promotes would be missed by
 	// a single pass over the directory.
-	m.settleTempRecords()
+	unpromoted := m.settleTempRecords()
 	items, err := os.ReadDir(m.dir)
 	if err != nil {
 		return fmt.Errorf("guest: read write record directory: %w", err)
@@ -215,26 +217,34 @@ func (m *writeManager) loadRecords() error {
 	for _, item := range items {
 		name := item.Name()
 		path := filepath.Join(m.dir, name)
+		var rec writeRecord
 		switch {
 		case strings.HasSuffix(name, writeRecordTempSuffix):
-			// settleTempRecords handled every temporary record; one that is
-			// left here could not be removed and stays for the next start.
-			continue
-		case !strings.HasSuffix(name, writeRecordSuffix):
-			continue
-		}
-		rec, err := readWriteRecord(path)
-		if err != nil || rec.WriteID == "" || writeRecordName(rec.WriteID) != name {
-			m.logger.Warn("drop unreadable write record", "error", recordLoadError(err))
-			if err := os.Remove(path); err != nil {
-				m.logger.Warn("remove unreadable write record failed", "error", sanitizedError(err))
+			var ok bool
+			rec, ok = unpromoted[name]
+			if !ok {
+				continue
 			}
+		case strings.HasSuffix(name, writeRecordSuffix):
+			// Keep canonical precedence if the canonical file appeared since
+			// the first pass. ReadDir lists it before its temporary name.
+			delete(unpromoted, name+".tmp")
+			var err error
+			rec, err = readWriteRecord(path)
+			if err != nil || rec.WriteID == "" || writeRecordName(rec.WriteID) != name {
+				m.logger.Warn("drop unreadable write record", "error", recordLoadError(err))
+				if err := os.Remove(path); err != nil {
+					m.logger.Warn("remove unreadable write record failed", "error", sanitizedError(err))
+				}
+				continue
+			}
+		default:
 			continue
 		}
 		if _, err := lstatStaging(rec.TmpPath); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				m.logger.Info("drop write record without staging file", "write_id", rec.WriteID)
-				if err := m.removeRecord(rec.WriteID); err != nil {
+				if err := removeWriteRecord(path); err != nil {
 					m.logger.Warn("remove write record failed", "write_id", rec.WriteID, "error", sanitizedError(err))
 				}
 				continue
@@ -251,11 +261,12 @@ func (m *writeManager) loadRecords() error {
 		}
 		identity := rec.Identity
 		m.entries[rec.WriteID] = &writeEntry{
-			id:        rec.WriteID,
-			tmp:       rec.TmpPath,
-			identity:  &identity,
-			lastChunk: last,
-			recovered: true,
+			id:         rec.WriteID,
+			tmp:        rec.TmpPath,
+			identity:   &identity,
+			lastChunk:  last,
+			recordPath: path,
+			recovered:  true,
 		}
 		m.logger.Info("write recovered after restart", "write_id", rec.WriteID)
 	}
@@ -271,14 +282,15 @@ func (m *writeManager) loadRecords() error {
 // record of a staging file that exists. A complete, valid temporary record
 // whose content belongs to its name is promoted to the canonical name, and the
 // normal load checks (staging file lookup, identity at cleanup) apply to it.
-// Any other temporary file is removed; only the temporary file itself is
-// touched, never the staging file that a record names.
-func (m *writeManager) settleTempRecords() {
+// If promotion fails, keep the temporary file and return its validated record
+// for loading. Remove invalid temporary records without touching staging files.
+func (m *writeManager) settleTempRecords() map[string]writeRecord {
 	items, err := os.ReadDir(m.dir)
 	if err != nil {
 		// loadRecords reports the same failure for its own read.
-		return
+		return nil
 	}
+	unpromoted := make(map[string]writeRecord)
 	for _, item := range items {
 		name := item.Name()
 		if !strings.HasSuffix(name, writeRecordTempSuffix) {
@@ -303,17 +315,18 @@ func (m *writeManager) settleTempRecords() {
 			m.removeTempRecord(tempPath)
 			continue
 		}
-		if err := os.Rename(tempPath, canonicalPath); err != nil {
+		if err := promoteWriteRecord(tempPath, canonicalPath); err != nil {
 			m.logger.Warn("promote write record temporary file failed", "write_id", rec.WriteID, "error", sanitizedError(err))
-			m.removeTempRecord(tempPath)
+			unpromoted[name] = rec
 			continue
 		}
 		m.logger.Info("promoted write record temporary file", "write_id", rec.WriteID)
 	}
+	return unpromoted
 }
 
 func (m *writeManager) removeTempRecord(path string) {
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := removeWriteRecord(path); err != nil {
 		m.logger.Warn("remove write record temporary file failed", "error", sanitizedError(err))
 	}
 }
@@ -367,7 +380,7 @@ func (m *writeManager) cleanup(e *writeEntry) error {
 			return err
 		}
 	}
-	return m.removeRecord(e.id)
+	return removeWriteRecord(e.recordPath)
 }
 
 // removeStaging removes the staging file of e. A file at the staging path

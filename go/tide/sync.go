@@ -279,8 +279,10 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	var replacedFiles []string
 	if !windows {
 		applyEnv[guestEnvReplaceFiles] = ""
+		applyEnv[guestEnvAliasPrunes] = ""
 		strictDeletes, replacedFiles = splitSyncDeletions(deleted, changed)
 	}
+	prunes, aliasPrunes := pruneDirs(deleted, changed, osys == tidev1.GuestOs_GUEST_OS_MACOS)
 	for _, list := range []struct {
 		suffix string
 		env    string
@@ -288,7 +290,8 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	}{
 		{".delete", guestEnvDeletes, strictDeletes},
 		{".replace", guestEnvReplaceFiles, replacedFiles},
-		{".prune", guestEnvPrunes, pruneDirs(deleted, changed)},
+		{".prune", guestEnvPrunes, prunes},
+		{".prune-alias", guestEnvAliasPrunes, aliasPrunes},
 	} {
 		if len(list.paths) == 0 {
 			continue
@@ -534,27 +537,38 @@ func splitSyncDeletions(deleted []string, changed []localFile) (strict, replaced
 	return strict, replacedFiles
 }
 
-// pruneDirs returns the guest directories that the apply command removes
-// after the deletions and before the extraction. The deletions remove only
-// files, so a deleted entry a/b/old leaves the directories a/b and a, and
-// the guest tar cannot then extract a new file or link at a. For each
-// deleted path below the path of a changed file or link, the result holds
-// the directories from the parent of the deleted path up to that path.
-// The guest removes only empty directories, so files that the guest created
-// there stay and make the apply fail. Deeper directories come first.
-func pruneDirs(deleted []string, changed []localFile) []string {
-	incoming := map[string]bool{}
-	for _, f := range changed {
-		incoming[f.rel] = true
+// pruneDirs lists the directories to remove after the deletions and before
+// extraction, deeper directories first. An alias candidate adds three paths
+// to the alias list: the old ancestor, the incoming spelling, and the
+// directory to remove. The guest checks that both spellings name the same
+// directory before it prunes an alias candidate.
+func pruneDirs(deleted []string, changed []localFile, matchAliases bool) (exact, aliases []string) {
+	if len(deleted) == 0 || len(changed) == 0 {
+		return nil, nil
 	}
-	dirs := map[string]bool{}
+	key := func(p string) string {
+		if matchAliases {
+			return foldCase(p)
+		}
+		return p
+	}
+	incoming := map[string]string{}
+	for _, f := range changed {
+		incoming[key(f.rel)] = f.rel
+	}
+	type alias struct{ old, incoming string }
+	dirs := map[string]alias{}
 	for _, d := range deleted {
 		var chain []string
 		for dir := path.Dir(d); dir != "."; dir = path.Dir(dir) {
 			chain = append(chain, dir)
-			if incoming[dir] {
+			if replacement, ok := incoming[key(dir)]; ok {
+				var names alias
+				if replacement != dir {
+					names = alias{old: dir, incoming: replacement}
+				}
 				for _, c := range chain {
-					dirs[c] = true
+					dirs[c] = names
 				}
 				break
 			}
@@ -571,7 +585,14 @@ func pruneDirs(deleted []string, changed []localFile) []string {
 		}
 		return out[i] < out[j]
 	})
-	return out
+	for _, d := range out {
+		if names := dirs[d]; names.old != "" {
+			aliases = append(aliases, names.old, names.incoming, d)
+		} else {
+			exact = append(exact, d)
+		}
+	}
+	return exact, aliases
 }
 
 // largest returns the n largest regular files of files.
