@@ -6,9 +6,12 @@ import { describe, expect, test } from "@rstest/core";
 import { encodeMessages } from "./codec.ts";
 import {
   billingReasonOf,
+  classifyFailure,
   DataPathError,
+  FailureClass,
   InvalidFrameError,
   OwnSandConfigError,
+  OwnSandCredentialError,
   OwnSandHandleClosedError,
   OwnSandValidationError,
 } from "./errors.ts";
@@ -596,6 +599,105 @@ describe("peer-to-peer data path", () => {
     }
     expect(h.api.calls).toHaveLength(0);
     expect(rtc.connections).toHaveLength(0);
+  });
+
+  describe.each([
+    { mode: "auto", transport: undefined },
+    { mode: "forced peer", transport: DataPathTransport.PEER_TO_PEER },
+  ])("local peer setup credentials ($mode)", ({ transport }) => {
+    const token = "osk_test_0123456789abcdef";
+
+    describe.each([
+      { rpc: "GetIceServers", iceCalls: 0 },
+      { rpc: "OpenSession", iceCalls: 1 },
+    ])("$rpc", ({ iceCalls }) => {
+      test.each([
+        {
+          failure: "throws",
+          accessToken: () => {
+            throw new Error("token source failed");
+          },
+        },
+        {
+          failure: "rejects",
+          accessToken: () => Promise.reject(new Error("token source failed")),
+        },
+        { failure: "returns an empty token", accessToken: () => "" },
+      ])(
+        "keeps peer routing when the callback $failure",
+        async ({ accessToken }) => {
+          let tokenCalls = 0;
+          const { h, rtc } = p2pSetup(exitingAgent, {
+            transport,
+            accessToken: () =>
+              ++tokenCalls === iceCalls + 1 ? accessToken() : token,
+          });
+          const sandbox = h.client.sandbox(SANDBOX);
+          const error = await h.clock
+            .run(sandbox.run({ command: ["x"] }))
+            .catch((error: unknown) => error);
+
+          expect(error).toBeInstanceOf(ConnectError);
+          expect((error as ConnectError).cause).toBeInstanceOf(
+            OwnSandCredentialError,
+          );
+          expect(classifyFailure(error)).toBe(FailureClass.Terminal);
+          expect(h.api.callsOf("GetIceServers")).toHaveLength(iceCalls);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+          expect(rtc.connections).toHaveLength(iceCalls);
+          expect(rtc.closedConnections).toBe(iceCalls);
+          expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+
+          const run = await h.clock.run(sandbox.run({ command: ["x"] }));
+          expect(run.result.kind).toBe(ExecResultKind.Exited);
+          expect(h.api.callsOf("GetIceServers")).toHaveLength(iceCalls + 1);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+          expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+        },
+      );
+    });
+  });
+
+  test("retries peer setup after a local token failure following a session end", async () => {
+    let peer: FakeAgentPeer | undefined;
+    let tokenCalls = 0;
+    const { h, rtc } = p2pSetup(
+      (frame, activePeer) => {
+        peer = activePeer;
+        exitingAgent(frame, activePeer);
+      },
+      {
+        accessToken: () =>
+          ++tokenCalls === 3 ? "" : "osk_test_0123456789abcdef",
+      },
+    );
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(sandbox.run({ command: ["x"] }));
+    peer!.endSession(SessionEndReason.EXPIRED);
+    await h.clock.settle();
+
+    const error = await h.clock
+      .run(sandbox.run({ command: ["x"] }))
+      .catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).cause).toBeInstanceOf(
+      OwnSandCredentialError,
+    );
+    expect(classifyFailure(error)).toBe(FailureClass.Terminal);
+    expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    expect(rtc.closedConnections).toBe(1);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+
+    const run = await h.clock.run(sandbox.run({ command: ["x"] }));
+    expect(run.result.kind).toBe(ExecResultKind.Exited);
+    expect(h.api.callsOf("GetIceServers")).toHaveLength(2);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
   });
 
   test("ends the operation when a new session cannot be authorized", async () => {
