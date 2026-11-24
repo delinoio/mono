@@ -32,6 +32,7 @@ import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Detail,
+  ErrorNotice,
   MorePagesNotice,
   PageHeader,
   QueryBoundary,
@@ -224,11 +225,16 @@ function OwnerActions() {
   const [target, setTarget] = useState<string | null>(null);
   const [confirmTransfer, setConfirmTransfer] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  if (members.terminalLoadMoreError && (target !== null || confirmTransfer)) {
+    // Discard the selection and its confirmation when the list loses access.
+    setTarget(null);
+    setConfirmTransfer(false);
+  }
+
   const candidates = members.members.filter((m) => m.role !== Role.OWNER);
-  const targetName = (() => {
-    const m = candidates.find((c) => c.userId === target);
-    return m ? m.displayName || m.userId : "";
-  })();
+  const selectedMember = candidates.find((m) => m.userId === target);
+  const targetName =
+    selectedMember?.displayName || selectedMember?.userId || "";
 
   return (
     <>
@@ -237,28 +243,37 @@ function OwnerActions() {
         <p className="muted">
           The new owner gets every permission. You become an admin.
         </p>
-        <div className="inline-form">
-          <Select
-            label="New owner"
-            placeholder="Choose a member"
-            value={target}
-            onValueChange={setTarget}
-          >
-            {candidates.map((m) => (
-              <SelectOption key={m.userId} value={m.userId}>
-                {m.displayName || m.userId}
-              </SelectOption>
-            ))}
-          </Select>
-          <Button
-            variant={ButtonVariant.Secondary}
-            disabled={target === null}
-            onClick={() => setConfirmTransfer(true)}
-          >
-            Transfer
-          </Button>
-        </div>
-        <MorePagesNotice noun="members" pages={members} />
+        {members.terminalLoadMoreError ? (
+          <ErrorNotice
+            error={members.terminalLoadMoreError}
+            onRetry={() => void members.refetch()}
+          />
+        ) : (
+          <>
+            <div className="inline-form">
+              <Select
+                label="New owner"
+                placeholder="Choose a member"
+                value={target}
+                onValueChange={setTarget}
+              >
+                {candidates.map((m) => (
+                  <SelectOption key={m.userId} value={m.userId}>
+                    {m.displayName || m.userId}
+                  </SelectOption>
+                ))}
+              </Select>
+              <Button
+                variant={ButtonVariant.Secondary}
+                disabled={target === null}
+                onClick={() => setConfirmTransfer(true)}
+              >
+                Transfer
+              </Button>
+            </div>
+            <MorePagesNotice noun="members" pages={members} />
+          </>
+        )}
       </section>
       <section className="section danger-zone" aria-labelledby="delete-title">
         <h2 id="delete-title">Delete organization</h2>
@@ -278,9 +293,13 @@ function OwnerActions() {
         title={`Make ${targetName} the owner?`}
         description="You become an admin. Only the new owner can give ownership back. The transfer removes the billing link, so the organization is blocked until the new owner links a billing account."
         confirmLabel="Transfer ownership"
-        onConfirm={() =>
-          transfer.mutateAsync({ organizationId, userId: target! })
-        }
+        onConfirm={async () => {
+          if (members.terminalLoadMoreError || target === null) return;
+          await transfer.mutateAsync({
+            organizationId,
+            userId: target,
+          });
+        }}
       />
       <ConfirmDialog
         open={confirmDelete}

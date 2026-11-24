@@ -15,6 +15,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import {
@@ -54,6 +55,7 @@ import {
   MOCK_USER,
   MockBillingState,
 } from "./mock/mock-api.ts";
+import { holdingTransport as holdPagedTransport } from "./test-support.tsx";
 
 /** The seeded Acme invitation, which the mock user cannot accept: already a member. */
 const MOCK_ACME_INVITATION_SECRET = "osi_7f3a_unused";
@@ -359,6 +361,62 @@ describe("organizations", () => {
     expect(
       screen.queryByRole("option", { name: /Some organizations did not load/ }),
     ).toBeNull();
+  });
+
+  test("hides loaded organizations in the switcher and list after a terminal continuation error", async () => {
+    const paged = await pagedOrganizations([
+      [MOCK_IDS.acme],
+      [MOCK_IDS.northwind],
+    ]);
+    const { transport, calls } = holdPagedTransport(
+      ["ListOrganizations"],
+      () => true,
+      paged.transport,
+    );
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+    await waitFor(() => expect(calls.ListOrganizations).toHaveLength(1));
+    await act(async () => calls.ListOrganizations![0]!.settle());
+    const switcher = await screen.findByRole("combobox", {
+      name: "Organization",
+    });
+    await act(async () => fireEvent.click(switcher));
+    expect(
+      await screen.findByRole("option", { name: "Acme Robotics" }),
+    ).toBeTruthy();
+
+    await act(async () =>
+      calls.ListOrganizations![1]!.settle(
+        new ConnectError("the page failed", Code.Unauthenticated),
+      ),
+    );
+    await waitFor(() => expect(switcher.isConnected).toBe(false));
+    expect(screen.queryByRole("option", { name: "Acme Robotics" })).toBeNull();
+    expect(
+      screen.queryByRole("option", { name: /Some organizations did not load/ }),
+    ).toBeNull();
+    expect(
+      screen.getByRole("navigation", { name: "Organization" }),
+    ).toBeTruthy();
+
+    await act(async () =>
+      fireEvent.click(screen.getByRole("link", { name: "OwnSand" })),
+    );
+    expect(
+      await screen.findByText("Your session ended. Sign in again."),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("list", { name: "Your organizations" }),
+    ).toBeNull();
+    expect(
+      screen.queryByText("Some organizations are not shown yet."),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Sign in with Delino" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Create organization" }),
+    ).toBeTruthy();
+    expect(calls.ListOrganizations).toHaveLength(2);
   });
 
   test("keeps the loaded organizations and offers Try again on the list when a later page fails", async () => {
