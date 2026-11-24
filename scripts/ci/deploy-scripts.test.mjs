@@ -3847,6 +3847,9 @@ const caddyImage = `caddy:2.11.9@sha256:${"c".repeat(64)}`;
 //                 (default `running`); STUB_STATE_GONE makes that read fail.
 //   STUB_WGET_FAILS  the number of readiness probes that fail before one
 //                 succeeds, or `always`.
+//   STUB_STATE_DELAY stalls the state read.
+//   STUB_WGET_DELAY delays the admin probe.
+//   STUB_WGET_IGNORES_TERM makes the probe and its sleep ignore SIGTERM.
 // The readiness wait runs with a short deadline and interval.
 function runCaddy(
   t,
@@ -3858,7 +3861,7 @@ function runCaddy(
     state,
     gone,
     wgetFails,
-    simulateClock,
+    allowLateProbe,
     env: extra,
   } = {},
 ) {
@@ -3876,6 +3879,9 @@ fi
 case "$1" in
   inspect)
     if [[ "$3" == "{{.State.Status}}" ]]; then
+      # A child sleep can keep the captured output pipe open if Bash job
+      # control puts it in a separate process group.
+      if [[ -n "\${STUB_STATE_DELAY:-}" ]]; then exec sleep "$STUB_STATE_DELAY"; fi
       [[ -z "\${STUB_STATE_GONE:-}" ]] || { echo "Error: No such object: caddy" >&2; exit 1; }
       echo "\${STUB_STATE:-running}"
     else
@@ -3887,6 +3893,8 @@ case "$1" in
     ;;
   exec)
     if [[ "$*" == *wget* ]]; then
+      if [[ -n "\${STUB_WGET_IGNORES_TERM:-}" ]]; then trap '' TERM; fi
+      if [[ -n "\${STUB_WGET_DELAY:-}" ]]; then sleep "$STUB_WGET_DELAY"; fi
       count="$(cat "$STUB_DIR/wget.count" 2> /dev/null || echo 0)"
       echo $((count + 1)) > "$STUB_DIR/wget.count"
       if [[ "\${STUB_WGET_FAILS:-0}" == always ]] || (( count < \${STUB_WGET_FAILS:-0} )); then
@@ -3907,16 +3915,24 @@ esac`,
   if (wgetFails !== undefined) env.STUB_WGET_FAILS = String(wgetFails);
   env.START_CADDY_READY_TIMEOUT = "2";
   env.START_CADDY_READY_INTERVAL = "0.1";
-  if (simulateClock) {
-    // Replace Bash's wall clock with a counter advanced by each sleep.
-    env.BASH_ENV = join(dir, "clock.bash");
+  if (allowLateProbe) {
+    // Let the probe return success past the deadline to test the final check.
+    env.BASH_ENV = join(dir, "timeout.bash");
     writeFileSync(
       env.BASH_ENV,
-      "unset SECONDS\nSECONDS=0\nsleep() { SECONDS=$((SECONDS + $1)); }\n",
+      `timeout() {
+        if [[ "$3" == docker && "$4" == exec ]]; then
+          shift 2
+          "$@"
+        else
+          command timeout "$@"
+        fi
+      }
+`,
     );
-    env.START_CADDY_READY_INTERVAL = "1";
   }
   Object.assign(env, extra);
+  const startedAt = performance.now();
   const result = spawnSync(
     "bash",
     [startCaddy, ...(args ?? [caddyImage, "/srv/delino", "delino"])],
@@ -3924,6 +3940,7 @@ esac`,
   );
   return {
     ...result,
+    elapsedMs: performance.now() - startedAt,
     calls: readFileSync(join(dir, "calls.log"), "utf8")
       .trim()
       .split("\n")
@@ -4448,36 +4465,91 @@ test("start-caddy fails when Caddy never answers", { skip }, (t) => {
   }
 });
 
-test("start-caddy uses decimal readiness deadlines", { skip }, (t) => {
-  for (const [timeout, seconds] of [
-    ["010", 10],
-    ["10", 10],
-    ["000", 0],
-    ["0", 0],
-    [undefined, 30],
-  ]) {
-    const label = timeout ?? "default";
+test(
+  "start-caddy skips readiness commands at a zero deadline",
+  { skip },
+  (t) => {
+    for (const timeout of ["0", "000"]) {
+      const result = runCaddy(t, {
+        inspect: `${caddyImage} false`,
+        env: { START_CADDY_READY_TIMEOUT: timeout },
+      });
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, new RegExp(`within ${timeout} seconds`));
+      assert.match(result.stderr, /container state is unavailable/);
+      assert.deepEqual(result.calls, [caddyInspect, "docker start caddy"]);
+    }
+  },
+);
+
+test("start-caddy accepts a probe before the deadline", { skip }, (t) => {
+  const result = runCaddy(t, {
+    inspect: `${caddyImage} false`,
+    env: { START_CADDY_READY_TIMEOUT: "1", STUB_WGET_DELAY: "0.2" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, [
+    caddyInspect,
+    "docker start caddy",
+    caddyState,
+    caddyProbe,
+  ]);
+});
+
+for (const { name, env, wgetFails, allowLateProbe, state, attempts } of [
+  {
+    name: "a stalled inspect",
+    env: { STUB_STATE_DELAY: "8" },
+    state: "unavailable",
+    attempts: [],
+  },
+  {
+    name: "a slow admin response",
+    env: { STUB_WGET_DELAY: "3" },
+    state: "running",
+    attempts: [caddyProbe],
+  },
+  {
+    name: "an admin probe that ignores SIGTERM",
+    env: { STUB_WGET_DELAY: "8", STUB_WGET_IGNORES_TERM: "1" },
+    state: "running",
+    attempts: [caddyProbe],
+  },
+  {
+    name: "a retry interval longer than the remaining budget",
+    env: { START_CADDY_READY_INTERVAL: "8" },
+    wgetFails: "always",
+    state: "running",
+    attempts: [caddyProbe],
+  },
+  {
+    name: "a successful probe that returns after the deadline",
+    env: { STUB_WGET_DELAY: "1.2" },
+    allowLateProbe: true,
+    state: "running",
+    attempts: [caddyProbe],
+  },
+]) {
+  test(`start-caddy enforces the deadline with ${name}`, { skip }, (t) => {
     const result = runCaddy(t, {
       inspect: `${caddyImage} false`,
-      wgetFails: "always",
-      simulateClock: true,
-      env: { START_CADDY_READY_TIMEOUT: timeout },
+      wgetFails,
+      allowLateProbe,
+      env: { START_CADDY_READY_TIMEOUT: "1", ...env },
     });
-    assert.equal(result.status, 1, label);
-    assert.match(result.stderr, /did not answer its admin API/, label);
-    assert.match(
-      result.stderr,
-      new RegExp(`within ${timeout ?? seconds} seconds`),
-      label,
-    );
-    // The initial probe runs at second 0, even with a zero-second budget.
-    assert.equal(
-      result.calls.filter((call) => call === caddyProbe).length,
-      seconds + 1,
-      label,
-    );
-  }
-});
+    assert.equal(result.status, 1, result.stderr);
+    assert.ok(result.elapsedMs < 3_000, `took ${result.elapsedMs} ms`);
+    assert.match(result.stderr, /within 1 seconds/);
+    assert.match(result.stderr, new RegExp(`container state is ${state}`));
+    assert.match(result.stderr, /docker logs caddy/);
+    assert.deepEqual(result.calls, [
+      caddyInspect,
+      "docker start caddy",
+      caddyState,
+      ...attempts,
+    ]);
+  });
+}
 
 test("start-caddy fails when the container disappears", { skip }, (t) => {
   const result = runCaddy(t, { gone: true });
