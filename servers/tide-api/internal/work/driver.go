@@ -406,31 +406,34 @@ func (e *Engine) sandboxEnded(ctx context.Context, runnerID string, reason ownsa
 
 // followProgram follows the runner program with AttachExec. The SDK
 // resumes the stream after each relay rotation; when the result arrives,
-// the request ends as the adapter says and tide deletes the sandbox. When
-// tide misses the exit (for example, the exec result expired), the
-// profile's idle_ttl deletes the sandbox.
+// the request ends as the adapter says and tide deletes the sandbox. The
+// follower keeps the result until the exit transaction succeeds or its
+// context ends. When tide misses the exit (for example, the exec result
+// expired), the profile's idle_ttl deletes the sandbox.
 func (e *Engine) followProgram(ctx context.Context, client ownsandclient.Client, r *Runner) {
+	var result *ownsand.ExecResult
 	for ctx.Err() == nil {
-		res, err := client.AttachExec(ctx, r.SandboxID, r.ProgramExecID, ownsand.AttachParams{OnEvent: func(ownsand.ExecEvent) error { return nil }})
-		if err != nil {
-			if ctx.Err() != nil || isCode(err, connect.CodeNotFound) {
+		if result == nil {
+			res, err := client.AttachExec(ctx, r.SandboxID, r.ProgramExecID, ownsand.AttachParams{OnEvent: func(ownsand.ExecEvent) error { return nil }})
+			if isCode(err, connect.CodeNotFound) {
 				return
 			}
-			t := time.NewTimer(e.timing.SandboxPoll)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return
-			case <-t.C:
+			if err == nil {
+				result = res
 			}
-			continue
 		}
-		e.programExited(ctx, r.ID, res)
-		return
+		if result != nil && e.programExited(ctx, r.ID, result) == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(e.timing.SandboxPoll):
+		}
 	}
 }
 
-func (e *Engine) programExited(ctx context.Context, runnerID string, res *ownsand.ExecResult) {
+func (e *Engine) programExited(ctx context.Context, runnerID string, res *ownsand.ExecResult) error {
 	var orgID string
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		r, err := e.lockRunner(ctx, tx, runnerID)
@@ -458,12 +461,16 @@ func (e *Engine) programExited(ctx context.Context, runnerID string, res *ownsan
 		return err
 	})
 	if err != nil {
-		e.svc.Logger.WarnContext(ctx, "runner_program_exit_failed", slog.String("runner_id", runnerID), slog.Any("error", err))
+		if ctx.Err() == nil {
+			e.svc.Logger.WarnContext(ctx, "runner_program_exit_failed", slog.String("runner_id", runnerID), slog.Any("error", err))
+		}
+		return err
 	}
 	e.kickRunner(runnerID)
 	if orgID != "" {
 		e.Kick(orgID)
 	}
+	return nil
 }
 
 // stepDeleting deletes the sandbox and ends the runner.

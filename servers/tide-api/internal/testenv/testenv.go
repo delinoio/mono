@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -207,6 +208,32 @@ func New(t testing.TB, opts ...Option) *Env {
 		srv.Close()
 	})
 	return &Env{T: t, DB: database, App: a, Server: srv, Clock: clock, Logs: logs, SecretKey: key}
+}
+
+// FailProgramExitCommits makes PostgreSQL abort transactions that move a
+// runner to DELETING for WORK_DONE. The returned function restores commits.
+func (e *Env) FailProgramExitCommits() func() {
+	e.T.Helper()
+	ctx := e.T.Context()
+	if _, err := e.DB.Pool.Exec(ctx, fmt.Sprintf(`
+		CREATE FUNCTION fail_program_exit() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'injected program exit commit failure' USING ERRCODE = '40001';
+		END;
+		$$;
+		CREATE CONSTRAINT TRIGGER fail_program_exit
+			AFTER UPDATE ON runners DEFERRABLE INITIALLY DEFERRED
+			FOR EACH ROW WHEN (NEW.state = %d AND NEW.end_reason = %d)
+			EXECUTE FUNCTION fail_program_exit();`,
+		tidev1.RunnerState_RUNNER_STATE_DELETING, tidev1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE)); err != nil {
+		e.T.Fatal(err)
+	}
+	return func() {
+		e.T.Helper()
+		if _, err := e.DB.Pool.Exec(ctx, "DROP TRIGGER fail_program_exit ON runners"); err != nil {
+			e.T.Fatal(err)
+		}
+	}
 }
 
 // Clients are the Connect clients of one credential.
