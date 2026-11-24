@@ -5,12 +5,20 @@ import { logtoSignInSessionState, SignInSessionState } from "../auth.tsx";
 import { ErrorNotice, Loading } from "../components/ui.tsx";
 import { RouteId, routePath, useRouter } from "../router.tsx";
 
-/** Route `callback` with Logto: completes a pending sign-in redirect or returns home. */
+const UNREADABLE_SESSION = new Error(
+  "The saved sign-in session is not readable",
+);
+
+/** Complete a pending redirect, show its error notice, or leave an idle callback. */
 export function LogtoCallbackPage({ appId }: { appId: string }) {
   // Capture the state before the SDK can complete and remove the session.
   const [state] = useState(() =>
     logtoSignInSessionState(appId, window.location),
   );
+  // The SDK checks the session before its callback error handler runs.
+  if (state === SignInSessionState.Invalid) {
+    return <ErrorNotice error={UNREADABLE_SESSION} />;
+  }
   if (state === SignInSessionState.None) return <LeaveCallback />;
   return <CompleteSignIn />;
 }

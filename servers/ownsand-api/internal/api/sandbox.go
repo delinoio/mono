@@ -813,15 +813,11 @@ func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxI
 		return nil, err
 	}
 	if !pause {
-		sb, err := h.pauseOrResumeSandbox(ctx, orgID, sandboxID, false, nil, nil)
+		sb, err := h.pauseOrResumeSandbox(ctx, orgID, sandboxID, false, pauseOrResumeHooks{})
 		if err != nil {
 			return nil, err
 		}
 		return sb.proto(), nil
-	}
-	clearMark := func() error {
-		_, err := h.DB.Pool.Exec(ctx, "UPDATE sandboxes SET paused_by_billing = false WHERE sandbox_id = $1 AND paused_by_billing", sandboxID)
-		return err
 	}
 	// The ordering lock is only taken for a sandbox of the caller's
 	// organization, so a caller cannot make another organization's pause or
@@ -830,9 +826,14 @@ func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxI
 		return nil, h.internal(ctx, "load sandbox", err)
 	}
 	var sb *sandboxRow
-	err = h.withSandboxOrder(ctx, sandboxID, func() error {
+	err = h.withSandboxOrder(ctx, sandboxID, func(conn *pgx.Conn) error {
 		var err error
-		sb, err = h.pauseOrResumeSandbox(ctx, orgID, sandboxID, true, clearMark, clearMark)
+		sb, err = h.pauseOrResumeSandbox(ctx, orgID, sandboxID, true, pauseOrResumeHooks{
+			enqueue: func(send func() error) error {
+				return h.enqueueCallerPause(ctx, conn, orgID, sandboxID, send)
+			},
+			onSettled: func() error { return clearBillingPauseMark(ctx, conn, orgID, sandboxID) },
+		})
 		return err
 	})
 	var lockErr *orderLockError
@@ -845,20 +846,59 @@ func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxI
 	return sb.proto(), nil
 }
 
+func clearBillingPauseMark(ctx context.Context, q db.Querier, orgID, sandboxID string) error {
+	_, err := q.Exec(ctx, "UPDATE sandboxes SET paused_by_billing = false WHERE organization_id = $1 AND sandbox_id = $2 AND paused_by_billing", orgID, sandboxID)
+	return err
+}
+
+const callerPauseFinishTimeout = 5 * time.Second
+
+// enqueueCallerPause stages the ownership change on the connection that holds
+// the sandbox ordering lock. Finalize it before waiting for the agent result,
+// whose reconciliation can need the same row.
+func (s *Service) enqueueCallerPause(ctx context.Context, conn *pgx.Conn, orgID, sandboxID string, send func() error) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return s.internal(ctx, "prepare PauseSandbox", err)
+	}
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), callerPauseFinishTimeout)
+		defer cancel()
+		if err := tx.Rollback(rollbackCtx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			s.Logger.WarnContext(rollbackCtx, "caller_pause_rollback_failed", slog.String("sandbox_id", sandboxID), slog.Any("error", err))
+		}
+	}()
+	if err := clearBillingPauseMark(ctx, tx, orgID, sandboxID); err != nil {
+		return s.internal(ctx, "prepare PauseSandbox", err)
+	}
+	if err := send(); err != nil {
+		return err
+	}
+	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), callerPauseFinishTimeout)
+	defer cancel()
+	if err := tx.Commit(commitCtx); err != nil {
+		// The command is already queued. Keep its record for reconciliation.
+		s.Logger.ErrorContext(commitCtx, "internal_error", slog.String("op", "commit PauseSandbox"), slog.Any("error", err))
+		return connect.NewError(connect.CodeInternal, errors.New("internal error"))
+	}
+	return nil
+}
+
+type pauseOrResumeHooks struct {
+	// beforeSend rechecks billing eligibility. errBillingStale drops obsolete
+	// work and passes through to the worker.
+	beforeSend func() error
+	// enqueue wraps the send so a caller pause can commit its ownership
+	// change only after the queue accepts the command.
+	enqueue func(send func() error) error
+	// onSettled takes ownership when no command is needed.
+	onSettled func() error
+}
+
 // pauseOrResumeSandbox pauses (pause true) or resumes an authorized sandbox
 // through its device's agent channel and waits up to the command wait for
-// the result. PauseSandbox, ResumeSandbox and the billing suspension worker
-// share it. onSend runs right before the command is sent, only when the
-// sandbox is in the source state; errBillingStale from it drops the command
-// and is returned as is. onSettled runs instead when the sandbox is already
-// in the destination state and no command is needed; a failure of it is an
-// internal error, so the call never reports a success that its caller's
-// preparation did not complete. Either hook can be nil. orgID and sandboxID
-// must be canonical.
-func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID string, pause bool, onSend, onSettled func() error) (*sandboxRow, error) {
-	if onSend == nil {
-		onSend = func() error { return nil }
-	}
+// the result. orgID and sandboxID must be canonical.
+func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID string, pause bool, hooks pauseOrResumeHooks) (*sandboxRow, error) {
 	sb, err := loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
 	if err != nil {
 		return nil, s.internal(ctx, "load sandbox", err)
@@ -873,8 +913,8 @@ func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID str
 	}
 	state, _ := sb.shownState()
 	if state == to {
-		if onSettled != nil {
-			if err := onSettled(); err != nil {
+		if hooks.onSettled != nil {
+			if err := hooks.onSettled(); err != nil {
 				return nil, s.internal(ctx, "prepare "+rpc, err)
 			}
 		}
@@ -887,18 +927,28 @@ func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID str
 	if conn == nil {
 		return nil, errUnavailable("the sandbox's device has no live agent channel")
 	}
-	if err := onSend(); err != nil {
-		if errors.Is(err, errBillingStale) {
-			// The billing worker's recheck dropped obsolete work; it is not an
-			// internal error.
-			return nil, err
+	if hooks.beforeSend != nil {
+		if err := hooks.beforeSend(); err != nil {
+			if errors.Is(err, errBillingStale) {
+				return nil, err
+			}
+			return nil, s.internal(ctx, "prepare "+rpc, err)
 		}
-		return nil, s.internal(ctx, "prepare "+rpc, err)
 	}
 	wait := s.Hub.Commands.Register(cmd.CommandId)
 	defer s.Hub.Commands.Cancel(cmd.CommandId)
-	if _, err := s.sendCommand(ctx, conn, info, cmd); err != nil {
-		return nil, errUnavailable("the agent channel closed")
+	send := func() error {
+		if _, err := s.sendCommand(ctx, conn, info, cmd); err != nil {
+			return errUnavailable("the agent channel closed")
+		}
+		return nil
+	}
+	enqueue := send
+	if hooks.enqueue != nil {
+		enqueue = func() error { return hooks.enqueue(send) }
+	}
+	if err := enqueue(); err != nil {
+		return nil, err
 	}
 	timer := time.NewTimer(s.Timing.CommandWait)
 	defer timer.Stop()

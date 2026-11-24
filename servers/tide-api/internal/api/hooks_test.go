@@ -7,6 +7,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -209,5 +210,76 @@ func TestLeaseComponents(t *testing.T) {
 	}
 	if !env.App.Lease.Held() {
 		t.Fatal("lease not held")
+	}
+}
+
+// TestLeaseUsesDatabaseTime gives the holder and contender app clocks that
+// disagree with PostgreSQL and moves the local deadline independently.
+func TestLeaseUsesDatabaseTime(t *testing.T) {
+	start := time.Now()
+	var elapsed atomic.Int64
+	var contenderOptions app.Options
+	env := testenv.New(t, func(o *app.Options) {
+		contenderOptions = *o
+		o.Now = func() time.Time { return start.Add(-time.Hour) }
+		o.LeaseDeadlineNow = func() time.Time { return start.Add(time.Duration(elapsed.Load())) }
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := env.App.Lease.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	checkTTL := func() {
+		t.Helper()
+		var seconds float64
+		err := env.DB.Pool.QueryRow(ctx,
+			"SELECT extract(epoch FROM expire_time - now()) FROM instance_leases WHERE lease_name = $1", lease.Name).Scan(&seconds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if remaining := time.Duration(seconds * float64(time.Second)); remaining > lease.TTL || remaining < lease.TTL-5*time.Second {
+			t.Fatalf("database expiry is %v from now, want about %v", remaining, lease.TTL)
+		}
+	}
+	checkTTL()
+
+	contenderOptions.InstanceID = "contender"
+	skew := time.Hour
+	contenderOptions.Now = func() time.Time { return start.Add(skew) }
+	contender, err := app.New(contenderOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held, err := contender.Lease.TryAcquire(ctx); err != nil || held {
+		t.Fatalf("contender with a fast app clock took a live lease: held %v, error %v", held, err)
+	}
+
+	setExpiry := func(offset time.Duration) {
+		t.Helper()
+		tag, err := env.DB.Pool.Exec(ctx,
+			"UPDATE instance_leases SET expire_time = now() + make_interval(secs => $2) WHERE lease_name = $1", lease.Name, offset.Seconds())
+		if err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("set lease expiry: updated %d rows, error %v", tag.RowsAffected(), err)
+		}
+	}
+	setExpiry(lease.RenewInterval)
+	if held, err := env.App.Lease.TryAcquire(ctx); err != nil || !held {
+		t.Fatalf("holder could not renew: held %v, error %v", held, err)
+	}
+	checkTTL()
+
+	elapsed.Store(int64(lease.TTL))
+	if env.App.Lease.Held() {
+		t.Fatal("holder kept local ownership at its confirmed deadline")
+	}
+	setExpiry(-time.Second)
+	skew = -time.Hour
+	if held, err := contender.Lease.TryAcquire(ctx); err != nil || !held {
+		t.Fatalf("contender with a slow app clock could not take an expired lease: held %v, error %v", held, err)
+	}
+	checkTTL()
+	if held, err := env.App.Lease.TryAcquire(ctx); err != nil || held {
+		t.Fatalf("previous holder reclaimed a live lease: held %v, error %v", held, err)
 	}
 }

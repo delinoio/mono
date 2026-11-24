@@ -63,8 +63,11 @@ export enum SignInSessionState {
 /**
  * The Logto callback hook is idle both before a redirect starts and when
  * there is no redirect to complete. Read the SDK's pending session using
- * the same keys and URI check as the client. Remove this check when
- * `@logto/react` exposes the client or the pending state.
+ * the same keys, field checks and URI check as the client. The hook also
+ * checks the session outside its error handler and rejects if it is unreadable.
+ * Replace this reader when `@logto/react` exposes enough callback state to
+ * distinguish idle, pending and unreadable sessions. Remove the unreadable
+ * session guard when the hook handles that error itself.
  */
 export function logtoSignInSessionState(
   appId: string,

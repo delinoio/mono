@@ -1474,7 +1474,7 @@ func TestRelayRotationWithQueuedFrames(t *testing.T) {
 	}
 }
 
-// sweepRevocationsNow runs the periodic revocation sweep and returns the
+// sweepRevocationsNow calls the revocation sweep directly and returns the
 // number of pending revocations that remain.
 func sweepRevocationsNow(env *testenv.Env) int {
 	env.App.Plane.SweepExpired(context.Background())
@@ -1521,7 +1521,7 @@ func TestUnacknowledgedSessionRevocationExpires(t *testing.T) {
 // plus the delivery margin), and OpenSession sweeps it without the periodic
 // worker.
 func TestUnacknowledgedGrantRevocationExpires(t *testing.T) {
-	env := testenv.New(t)
+	env := testenv.NewWithoutPeriodicRevocationSweep(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
 	agent.SetAckRevocations(false)
@@ -1542,11 +1542,14 @@ func TestUnacknowledgedGrantRevocationExpires(t *testing.T) {
 		t.Fatalf("pending revocations one second before the grant stops being revocable = %d, want 1", n)
 	}
 	env.Clock.Advance(time.Second)
+	if n := env.App.Plane.PendingRevocations(); n != 1 {
+		t.Fatalf("pending revocations at the grant expiry before OpenSession = %d, want 1", n)
+	}
 	// An OpenSession of another principal runs the sweep.
 	if _, err := org.OwnerClient.DataPath.OpenSession(ctx, connect.NewRequest(&ownsandv1.OpenSessionRequest{OrganizationId: org.ID, SandboxId: sandboxID, SdpOffer: "v=0"})); err != nil {
 		t.Fatal(err)
 	}
 	if n := env.App.Plane.PendingRevocations(); n != 0 {
-		t.Fatalf("pending revocations when the grant stops being revocable = %d, want 0", n)
+		t.Fatalf("pending revocations after OpenSession at the grant expiry = %d, want 0", n)
 	}
 }
