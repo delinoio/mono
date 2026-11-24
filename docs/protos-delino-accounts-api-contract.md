@@ -104,6 +104,10 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 - Field limits: billing account names are 1 to 100 Unicode code points after the server removes white space at the start and the end, without control characters. Invitation email addresses are `local@domain` with at most 254 bytes. A request `user_id` is 1 to 256 bytes of valid UTF-8 without a NUL (`U+0000`) character; other control characters are allowed because the ID is opaque. `LinkOrganization.organization_name` is at most 200 bytes of UTF-8 without control characters and may be empty. Other values fail with `invalid_argument`.
 - Invitation tokens: `bai_` followed by 32 random bytes in unpadded base64url. The token appears only in the invitation email link and in `AcceptInvitationRequest.invitation_token`. `accounts-api` stores only its SHA-256 hash.
 
+### Subscription checkout
+
+- While the subscription is `PENDING`, `StartSubscription` reuses a verified payable checkout or returns a replacement if Paddle confirms that the original is canceled or missing. An inconclusive lookup or a payment awaiting its verified webhook returns retryable `unavailable` and preserves the pending checkout.
+
 ### Top-ups
 
 - `CreateTopUp` charges `amount_usd_micros` with Paddle `POST /subscriptions/{id}/charge` (`effective_from: immediately`). The amount is at least $25 and at most $10,000, in whole cents; other values fail with `invalid_argument`. The call fails with `failed_precondition` unless the subscription is `ACTIVE`, and with `failed_precondition` (a message without payment data) when Paddle rejects the charge; Paddle unavailability fails with `unavailable`.
