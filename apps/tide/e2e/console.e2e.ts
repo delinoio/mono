@@ -167,6 +167,58 @@ describe("organization layout", () => {
   });
 });
 
+describe("organization member pagination", () => {
+  test("keeps loaded members visible and transfers ownership to a member from the next page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${ACME}/members`);
+    await expect(
+      screen.getByText("Some members are not shown yet."),
+    ).toBeVisible();
+    await expect(screen.getByText("Mina Kim", { exact: false })).toBeVisible();
+
+    await screen.getByRole("link", "Settings").tap();
+    await expect(
+      screen.getByText("Some members are not shown yet."),
+    ).toBeVisible();
+    await screen.getByRole("button", "Try again").tap();
+
+    const picker = screen.getByRole("combobox", "New owner");
+    await picker.tap();
+    await expect(screen.getByRole("option", "Mina Kim")).toBeHidden();
+    await screen.getByRole("option", "Nora Lee").tap();
+    await screen.getByRole("button", "Transfer").tap();
+    await expect(
+      screen.getByRole("alertdialog", "Make Nora Lee the owner?"),
+    ).toBeVisible();
+    await screen.getByRole("button", "Transfer ownership").tap();
+    await expect(
+      screen.getByRole("heading", "Transfer ownership"),
+    ).toBeHidden();
+
+    await screen.getByRole("link", "Members").tap();
+    await expect(browser).toHaveURL(`/orgs/${ACME}/members`);
+    await expect(screen.getByText("Nora Lee")).toBeVisible();
+    const role = await browser.evaluate(
+      () =>
+        Array.from(
+          document.querySelectorAll('[aria-label="Members"] .list-row'),
+        )
+          .find(
+            (row) =>
+              row.querySelector(".list-title")?.textContent === "Nora Lee",
+          )
+          ?.querySelector(".role")?.textContent ?? null,
+    );
+    expect(role).toBe("Owner");
+  });
+});
+
 describe("overview", () => {
   test("shows the live queue and the device pool", async ({
     app,

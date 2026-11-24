@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/servers/tide-api/internal/db"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
@@ -875,6 +877,183 @@ func TestStalledCreateSandbox(t *testing.T) {
 	}
 }
 
+func TestWatchQueueSnapshotReplay(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		openFirst bool
+		openLast  bool
+		endedRows int
+	}{
+		{name: "open oldest", openFirst: true, endedRows: 300},
+		{name: "open newest", openLast: true, endedRows: 300},
+		{name: "no open rows", endedRows: 300},
+		{name: "open oldest with large history", openFirst: true, endedRows: 1500},
+		{name: "open newest with large history", openLast: true, endedRows: 1500},
+		{name: "no open rows with large history", endedRows: 1500},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w := newWorkWorld(t, devsession.Timing{})
+			q := w.env.DB.Pool
+			other := w.env.NewOrg("other")
+			seedWatchRequests(t, q, other.ID, "other", tidev1.RequestState_REQUEST_STATE_RUNNING, 1)
+
+			if test.openFirst {
+				seedWatchRequests(t, q, w.org.ID, "open", tidev1.RequestState_REQUEST_STATE_RUNNING, 1)
+			}
+			seedWatchRequests(t, q, w.org.ID, "historical", tidev1.RequestState_REQUEST_STATE_ENDED, test.endedRows)
+			if _, err := q.Exec(t.Context(), `INSERT INTO runners
+				(runner_id, organization_id, runner_profile_id, kind, guest_os, state, idempotency_key,
+				 create_request, create_time, update_time, end_time)
+				SELECT gen_random_uuid(), $1, gen_random_uuid(), $2, $3, $4, gen_random_uuid(), '',
+				 now(), now(), now() FROM generate_series(1, 3)`,
+				w.org.ID, int16(tidev1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION),
+				int16(tidev1.GuestOs_GUEST_OS_LINUX), int16(tidev1.RunnerState_RUNNER_STATE_DELETED)); err != nil {
+				t.Fatal(err)
+			}
+			if test.openLast {
+				seedWatchRequests(t, q, w.org.ID, "open", tidev1.RequestState_REQUEST_STATE_RUNNING, 1)
+			}
+
+			var keys []string
+			if test.openFirst || test.openLast {
+				keys = []string{"open-1"}
+			}
+			watch, cancel := openQueueWatch(t, w, keys...)
+			assertQueueWatchIdle(t, watch, cancel)
+		})
+	}
+}
+
+func TestWatchQueueSnapshotReplayChanges(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	q := w.env.DB.Pool
+	seedWatchRequests(t, q, w.org.ID, "open", tidev1.RequestState_REQUEST_STATE_RUNNING, 2)
+	watch, cancel := openQueueWatch(t, w, "open-1", "open-2")
+
+	endWatchRequest(t, q, w.org.ID, "open-1")
+	expectWatchEnd(t, watch, "open-1")
+	seedWatchRequests(t, q, w.org.ID, "new-terminal", tidev1.RequestState_REQUEST_STATE_ENDED, 1)
+	expectWatchEnd(t, watch, "new-terminal-1")
+
+	// Advance the change sequence by more than the previous replay window.
+	if _, err := q.Exec(t.Context(), "SELECT nextval('work_change_seq') FROM generate_series(1, 1100)"); err != nil {
+		t.Fatal(err)
+	}
+	seedWatchRequests(t, q, w.org.ID, "advance", tidev1.RequestState_REQUEST_STATE_ENDED, 1)
+	expectWatchEnd(t, watch, "advance-1")
+	endWatchRequest(t, q, w.org.ID, "open-2")
+	expectWatchEnd(t, watch, "open-2")
+	assertQueueWatchIdle(t, watch, cancel)
+}
+
+func TestWatchQueueLateCommit(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		beforeSnapshot bool
+	}{
+		{name: "in flight at snapshot", beforeSnapshot: true},
+		{name: "in flight during poll"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w := newWorkWorld(t, devsession.Timing{})
+			q := w.env.DB.Pool
+			seedWatchRequests(t, q, w.org.ID, "open", tidev1.RequestState_REQUEST_STATE_RUNNING, 1)
+			ctx := t.Context()
+			tx, err := q.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if test.beforeSnapshot {
+				endWatchRequest(t, tx, w.org.ID, "open-1")
+				seedWatchRequests(t, q, w.org.ID, "historical", tidev1.RequestState_REQUEST_STATE_ENDED, 1)
+			}
+			watch, cancel := openQueueWatch(t, w, "open-1")
+			if !test.beforeSnapshot {
+				endWatchRequest(t, tx, w.org.ID, "open-1")
+				seedWatchRequests(t, q, w.org.ID, "advance", tidev1.RequestState_REQUEST_STATE_ENDED, 1)
+				expectWatchEnd(t, watch, "advance-1")
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			expectWatchEnd(t, watch, "open-1")
+			assertQueueWatchIdle(t, watch, cancel)
+		})
+	}
+}
+
+// Running requests with no runner stay open until the test changes them.
+func seedWatchRequests(t *testing.T, q db.Querier, orgID, prefix string, state tidev1.RequestState, count int) {
+	t.Helper()
+	if _, err := q.Exec(t.Context(), `INSERT INTO requests
+		(request_id, organization_id, runner_profile_id, kind, source, source_key, state, priority,
+		 queue_time, queue_deadline, create_time, update_time, end_time)
+		SELECT gen_random_uuid(), $1, gen_random_uuid(), $2, 99, $3 || '-' || n, $4, $5,
+		 now(), now() + interval '1 hour', now(), now(), CASE WHEN $4::smallint = $6 THEN now() END
+		FROM generate_series(1, $7) AS n`, orgID, int16(tidev1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION),
+		prefix, int16(state), int16(tidev1.Priority_PRIORITY_NORMAL), int16(tidev1.RequestState_REQUEST_STATE_ENDED), count); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func endWatchRequest(t *testing.T, q db.Querier, orgID, key string) {
+	t.Helper()
+	if tag, err := q.Exec(t.Context(), `UPDATE requests SET state = $3, end_time = now()
+		WHERE organization_id = $1 AND source_key = $2`, orgID, key, int16(tidev1.RequestState_REQUEST_STATE_ENDED)); err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("end request %s: %v, %v", key, tag, err)
+	}
+}
+
+func openQueueWatch(t *testing.T, w *workWorld, requestKeys ...string) (*connect.ServerStreamForClient[tidev1.WatchQueueResponse], context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	t.Cleanup(cancel)
+	watch, err := w.env.User(w.org.Member).Work.WatchQueue(ctx, connect.NewRequest(&tidev1.WatchQueueRequest{OrganizationId: w.org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for watch.Receive() {
+		msg := watch.Msg()
+		if msg.GetSnapshotComplete() != nil {
+			if !slices.Equal(keys, requestKeys) {
+				t.Fatalf("snapshot keys %v, want %v", keys, requestKeys)
+			}
+			return watch, cancel
+		}
+		req := msg.GetRequest()
+		if req == nil || req.GetState() != tidev1.RequestState_REQUEST_STATE_RUNNING {
+			t.Fatalf("unexpected snapshot event: %v", msg)
+		}
+		keys = append(keys, req.GetSourceKey())
+	}
+	t.Fatalf("snapshot did not complete: %v", watch.Err())
+	return nil, nil
+}
+
+func expectWatchEnd(t *testing.T, watch *connect.ServerStreamForClient[tidev1.WatchQueueResponse], key string) {
+	t.Helper()
+	if !watch.Receive() {
+		t.Fatalf("no terminal event for %s: %v", key, watch.Err())
+	}
+	got := watch.Msg().GetRequest()
+	if got.GetSourceKey() != key || got.GetState() != tidev1.RequestState_REQUEST_STATE_ENDED {
+		t.Fatalf("want terminal event for %s, got %v", key, watch.Msg())
+	}
+}
+
+func assertQueueWatchIdle(t *testing.T, watch *connect.ServerStreamForClient[tidev1.WatchQueueResponse], cancel context.CancelFunc) {
+	t.Helper()
+	// Read across three default poll intervals to catch delayed replays.
+	timer := time.AfterFunc(3200*time.Millisecond, cancel)
+	defer timer.Stop()
+	if watch.Receive() {
+		t.Fatalf("unexpected event after snapshot_complete: %v", watch.Msg())
+	}
+	wantCode(t, "idle watch at cancellation", watch.Err(), connect.CodeCanceled)
+}
+
 // TestWatchQueueRemovedRunner: a CREATING runner that the dispatcher removes
 // after OwnSand had no capacity is sent once more as DELETED, so a watch
 // does not keep it.
@@ -948,7 +1127,7 @@ func TestWatchQueueCommitOrder(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
 			defer cancel()
-			watch := openQueueWatch(t, ctx, env, org)
+			watch := startQueueWatch(t, ctx, env, org)
 			expectQueueWatchState(t, nextQueueWatchEvent(t, watch), target, watchRequestOpen, watchRunnerOpen)
 			expectQueueWatchState(t, nextQueueWatchEvent(t, watch), later, watchRequestOpen, watchRunnerOpen)
 			if msg := nextQueueWatchEvent(t, watch); msg.GetSnapshotComplete() == nil {
@@ -1116,7 +1295,7 @@ func endQueueWatchRow(t *testing.T, ctx context.Context, tx pgx.Tx, id string, r
 	return seq
 }
 
-func openQueueWatch(t *testing.T, ctx context.Context, env *testenv.Env, org testenv.Org) *connect.ServerStreamForClient[tidev1.WatchQueueResponse] {
+func startQueueWatch(t *testing.T, ctx context.Context, env *testenv.Env, org testenv.Org) *connect.ServerStreamForClient[tidev1.WatchQueueResponse] {
 	t.Helper()
 	watch, err := env.User(org.Member).Work.WatchQueue(ctx, connect.NewRequest(&tidev1.WatchQueueRequest{OrganizationId: org.ID}))
 	if err != nil {
