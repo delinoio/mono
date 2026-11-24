@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -186,6 +187,85 @@ func TestWaitLimit(t *testing.T) {
 	}
 	if waitDur, err := h.server.waitDuration(nil); err != nil || waitDur != MaxWait {
 		t.Fatalf("default wait = %v %v", waitDur, err)
+	}
+}
+
+func TestWaitSessionDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		waitSeconds   *int
+		callerTimeout time.Duration
+	}{
+		{name: "default wait"},
+		{name: "positive wait", waitSeconds: new(1)},
+		{name: "zero wait", waitSeconds: new(0)},
+		{name: "zero wait with earlier caller deadline", waitSeconds: new(0), callerTimeout: 200 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			handler := connect.NewUnaryHandler(tidev1connect.DevSessionServiceGetDevSessionProcedure,
+				func(ctx context.Context, _ *connect.Request[tidev1.GetDevSessionRequest]) (*connect.Response[tidev1.GetDevSessionResponse], error) {
+					if calls.Add(1) != 1 {
+						return nil, connect.NewError(connect.CodeInternal, errors.New("unexpected second lookup"))
+					}
+					<-ctx.Done()
+					return nil, ctx.Err()
+				})
+			upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.callerTimeout > 0 {
+					timeout := r.Header.Get("Connect-Timeout-Ms")
+					ms, err := strconv.ParseInt(timeout, 10, 64)
+					if err != nil || ms <= 0 || ms > tc.callerTimeout.Milliseconds() {
+						t.Errorf("GetDevSession timeout = %q ms, want at most %v", timeout, tc.callerTimeout)
+					}
+				}
+				// Stall until the client cancels the request.
+				r.Header.Del("Connect-Timeout-Ms")
+				handler.ServeHTTP(w, r)
+			}))
+			upstream.Config.Protocols = new(http.Protocols)
+			upstream.Config.Protocols.SetUnencryptedHTTP2(true)
+			upstream.Start()
+			t.Cleanup(upstream.Close)
+			h := newHarness(t, Config{maxWait: 500 * time.Millisecond, Client: func() (*tide.Client, error) {
+				return tide.New(tide.Options{BaseURL: upstream.URL, APIKey: "test-key"})
+			}})
+			if tc.callerTimeout > 0 {
+				ctx, cancel := context.WithTimeout(t.Context(), tc.callerTimeout)
+				defer cancel()
+				_, _, err := h.server.waitSession(ctx, nil, waitSessionArgs{
+					SessionID: "test-session", WaitSeconds: tc.waitSeconds,
+				})
+				if err == nil || !strings.HasPrefix(err.Error(), "deadline_exceeded:") || ctx.Err() != context.DeadlineExceeded {
+					t.Errorf("wait_session = %v, caller context = %v", err, ctx.Err())
+				}
+			} else {
+				// The outer MCP context stays live past the tool deadline.
+				ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+				defer cancel()
+				args := map[string]any{"session_id": "test-session"}
+				if tc.waitSeconds != nil {
+					args["wait_seconds"] = *tc.waitSeconds
+				}
+				result, err := h.session.CallTool(ctx, &mcp.CallToolParams{Name: "wait_session", Arguments: args})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var message string
+				if len(result.Content) > 0 {
+					if content, ok := result.Content[0].(*mcp.TextContent); ok {
+						message = content.Text
+					}
+				}
+				if !result.IsError || !strings.HasPrefix(message, "deadline_exceeded:") {
+					t.Errorf("wait_session = %q (isError %v), want deadline_exceeded tool error", message, result.IsError)
+				}
+			}
+			if got := calls.Load(); got != 1 {
+				t.Errorf("GetDevSession calls = %d, want 1", got)
+			}
+		})
 	}
 }
 
