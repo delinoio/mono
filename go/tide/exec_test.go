@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -311,6 +312,34 @@ func TestExecAttachAfterStreamRotation(t *testing.T) {
 	}
 }
 
+func TestExecNotFoundAfterStreamRotation(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	// End the first stream immediately after Started, then reject the attach.
+	srv.ExecStreamEventLimit = 1
+	srv.Fail(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure, connect.NewError(connect.CodeNotFound, errors.New("exec not found")))
+
+	var got collected
+	_, err := c.Exec(t.Context(), ExecParams{
+		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+		Command: []string{"true"}, OnEvent: got.on,
+	})
+	var se *ExecStreamError
+	if !errors.As(err, &se) || connect.CodeOf(se.Err) != connect.CodeNotFound {
+		t.Fatalf("exec error = %v, want ExecStreamError wrapping not_found", err)
+	}
+	if !se.Started || se.OutcomeUnknown || got.started != 1 {
+		t.Fatalf("stream error = %+v, started = %t, outcome unknown = %t, start callbacks = %d", se, se.Started, se.OutcomeUnknown, got.started)
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); n != 1 {
+		t.Fatalf("exec calls = %d, want 1", n)
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); n != 1 {
+		t.Fatalf("attach calls = %d, want 1", n)
+	}
+}
+
 func TestExecReportsLostOutput(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
@@ -346,6 +375,69 @@ func TestExecReportsLostOutput(t *testing.T) {
 	}
 }
 
+func TestExecTimeoutValidation(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	params := ExecParams{
+		OrganizationID: org,
+		DevSessionID:   ds.GetDevSessionId(),
+		Command:        []string{"true"},
+	}
+
+	t.Run("negative", func(t *testing.T) {
+		p := params
+		p.Timeout = -time.Nanosecond
+		callbacks := 0
+		p.OnEvent = func(ExecEvent) error {
+			callbacks++
+			return nil
+		}
+		res, err := c.Exec(t.Context(), p)
+		if res != nil || connect.CodeOf(err) != connect.CodeInvalidArgument || connect.IsWireError(err) {
+			t.Errorf("Exec returned (%+v, %v), want a nil result and a local invalid_argument error", res, err)
+		}
+		if calls := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); calls != 0 {
+			t.Errorf("start calls = %d, want 0", calls)
+		}
+		if calls := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); calls != 0 {
+			t.Errorf("attach calls = %d, want 0", calls)
+		}
+		if callbacks != 0 {
+			t.Errorf("callback calls = %d, want 0", callbacks)
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{name: "zero", timeout: 0},
+		{name: "positive", timeout: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := params
+			p.Timeout = tc.timeout
+			before := len(srv.ExecRequests())
+			if _, err := c.Exec(t.Context(), p); err != nil {
+				t.Fatal(err)
+			}
+			requests := srv.ExecRequests()
+			if got := len(requests) - before; got != 1 {
+				t.Fatalf("start requests = %d, want 1", got)
+			}
+			timeout := requests[before].GetTimeout()
+			if tc.timeout == 0 {
+				if timeout != nil {
+					t.Fatalf("timeout = %v, want an absent field", timeout)
+				}
+			} else if timeout == nil || timeout.AsDuration() != tc.timeout {
+				t.Fatalf("timeout = %v, want %s", timeout, tc.timeout)
+			}
+		})
+	}
+}
+
 func TestExecErrors(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
@@ -371,14 +463,23 @@ func TestExecErrors(t *testing.T) {
 	srv.SetSessionState(ds.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
 
 	// An unknown exec on attach reports an unknown outcome.
-	_, err = c.AttachExec(ctx, AttachParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), ExecID: "missing"})
-	if !errors.As(err, &se) || connect.CodeOf(err) != connect.CodeNotFound {
-		t.Fatalf("attach missing: %v", err)
+	var got collected
+	_, err = c.AttachExec(ctx, AttachParams{
+		OrganizationID: org, DevSessionID: ds.GetDevSessionId(), ExecID: "missing",
+		StdoutOffset: 10, StderrOffset: 30, OnEvent: got.on,
+	})
+	if !errors.As(err, &se) || connect.CodeOf(se.Err) != connect.CodeNotFound {
+		t.Fatalf("attach error = %v, want ExecStreamError wrapping not_found", err)
+	}
+	if se.ExecID != "missing" || se.StdoutOffset != 10 || se.StderrOffset != 30 {
+		t.Fatalf("attach error = %+v, want exec ID missing and offsets (10, 30)", se)
+	}
+	if se.Started || !se.OutcomeUnknown || got.started != 0 {
+		t.Fatalf("started = %t, outcome unknown = %t, start callbacks = %d", se.Started, se.OutcomeUnknown, got.started)
 	}
 
 	// A cancelled caller gets the offsets to continue with.
 	cctx, cancel := context.WithCancel(ctx)
-	var got collected
 	_, err = c.Exec(cctx, ExecParams{
 		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
 		Command: []string{"sh", "-c", "echo hello; sleep 0.5; echo world"},
@@ -424,6 +525,92 @@ func TestExecErrors(t *testing.T) {
 	}
 	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure) - execCalls; n != 1 {
 		t.Fatalf("exec calls = %d, want 1", n)
+	}
+}
+
+func TestFakeExecCloseStopsGroup(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("the fake guest stops exec process groups on Linux and macOS")
+	}
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	// Redirect the child's descriptors so closing the exec stream cannot
+	// affect whether the child survives. Bound its lifetime on failure.
+	const command = `
+sh -c '
+	: > ready
+	i=0
+	while [ "$i" -lt 200 ]; do
+		if [ -e release ]; then
+			: > survived
+			exit
+		fi
+		i=$((i + 1))
+		sleep 0.025
+	done
+' </dev/null >/dev/null 2>&1 &
+wait
+`
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Exec(ctx, ExecParams{
+			OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+			Command: []string{"sh", "-c", command},
+		})
+		done <- err
+	}()
+	workspace := ds.GetWorkspacePath()
+	ready := filepath.Join(workspace, "ready")
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		_, err := os.Stat(ready)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("exec finished before the child was ready: %v", err)
+		case <-ctx.Done():
+			t.Fatal("child did not become ready")
+		case <-tick.C:
+		}
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("server did not close")
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("exec did not finish after Close: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("exec did not finish after Close")
+	}
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		t.Fatal("deadline expired while checking for the survival marker")
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "survived")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("survival marker after Close: stat returned %v, want not exist", err)
 	}
 }
 

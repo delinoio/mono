@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { Role } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
-import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import { useEffect, useRef, useState } from "react";
-import { invalidateServices, LIST_ORGANIZATIONS_REQUEST } from "../api.ts";
+import { invalidateServices } from "../api.ts";
 import { TopBar } from "../components/shell.tsx";
 import { ErrorNotice, Loading, PageHeader } from "../components/ui.tsx";
 import {
@@ -15,6 +14,7 @@ import {
   parseGitHubCallback,
   stripCallbackFromAddress,
 } from "../github-callback.ts";
+import { useOrganizations } from "../organizations.ts";
 import { can, Permission } from "../roles.ts";
 import { Link, orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
 
@@ -34,13 +34,14 @@ export function GitHubSetupPage() {
   useEffect(() => {
     stripCallbackFromAddress(window.location, window.history);
   }, []);
-  const orgs = useQuery(
-    OrganizationService.method.listOrganizations,
-    LIST_ORGANIZATIONS_REQUEST,
-  );
-  const adminOrgs = (orgs.data?.organizations ?? []).filter((o) =>
-    can(o.callerRole, Permission.ManageIntegrations),
-  );
+  const orgs = useOrganizations(callback !== undefined);
+  const loadingOrgs = orgs.isPending || orgs.fetchStatus !== "idle";
+  const adminOrgs =
+    orgs.isSuccess && !loadingOrgs
+      ? orgs.data.filter((o) =>
+          can(o.callerRole, Permission.ManageIntegrations),
+        )
+      : [];
   const link = useMutation(GitHubService.method.linkGitHubInstallation, {
     onSuccess: () => invalidateServices(queryClient, GitHubService),
   });
@@ -90,7 +91,7 @@ export function GitHubSetupPage() {
         <Link to="/">Go to your organizations</Link>
       </div>
     );
-  } else if (orgs.isPending) {
+  } else if (loadingOrgs) {
     body = <Loading label="Loading your organizations" />;
   } else if (orgs.error) {
     body = (

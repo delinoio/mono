@@ -205,10 +205,9 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 		// order of DeleteOrganization. The first read takes no lock and only
 		// names the organization; every condition is checked again under
 		// both locks.
-		now := h.NowUTC()
 		var preOrgID string
 		err := tx.QueryRow(ctx, `SELECT organization_id::text FROM invitations
-			WHERE secret_sha256 = $1 AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $2`, hash, now).Scan(&preOrgID)
+			WHERE secret_sha256 = $1 AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $2`, hash, h.NowUTC()).Scan(&preOrgID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return errInvitationInvalid()
 		}
@@ -225,17 +224,22 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 		var invID, orgID, orgName string
 		var role int16
 		var stored []byte
-		var orgCreated time.Time
+		var orgCreated, expireTime time.Time
 		var maxDev *int32
-		err = tx.QueryRow(ctx, `SELECT i.invitation_id::text, i.organization_id::text, i.role, i.secret_sha256, o.name, o.create_time, o.max_dev_sessions_per_user
+		err = tx.QueryRow(ctx, `SELECT i.invitation_id::text, i.organization_id::text, i.role, i.secret_sha256, o.name, o.create_time, o.max_dev_sessions_per_user, i.expire_time
 			FROM invitations i JOIN organizations o ON o.organization_id = i.organization_id
-			WHERE i.secret_sha256 = $1 AND i.accept_time IS NULL AND i.revoke_time IS NULL AND i.expire_time > $2
-			FOR UPDATE OF i`, hash, now).Scan(&invID, &orgID, &role, &stored, &orgName, &orgCreated, &maxDev)
+			WHERE i.secret_sha256 = $1 AND i.accept_time IS NULL AND i.revoke_time IS NULL
+			FOR UPDATE OF i`, hash).Scan(&invID, &orgID, &role, &stored, &orgName, &orgCreated, &maxDev, &expireTime)
 		if errors.Is(err, pgx.ErrNoRows) || (err == nil && !auth.HashEqual(stored, hash)) {
 			return errInvitationInvalid()
 		}
 		if err != nil {
 			return err
+		}
+		// The invitation can expire while the transaction waits for either lock.
+		now := h.NowUTC()
+		if !now.Before(expireTime) {
+			return errInvitationInvalid()
 		}
 		SetRPCOrganization(ctx, orgID)
 		membershipID := NewID()

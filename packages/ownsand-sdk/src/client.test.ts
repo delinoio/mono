@@ -22,6 +22,7 @@ import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
+import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { ExecResultKind } from "./operations/exec.ts";
 import { type LogRecord } from "./logger.ts";
 import { execBinding, requestDigest } from "./digest.ts";
@@ -126,6 +127,71 @@ describe("client construction", () => {
 });
 
 describe("organization", () => {
+  test("uses OWNSAND_ORG when the client option is empty", async () => {
+    const h = setup({ organizationId: "", env: { OWNSAND_ORG: ORG } });
+    h.api.unary(SnapshotService, "GetSnapshot", (req) => ({
+      snapshot: { snapshotId: req.snapshotId },
+    }));
+
+    expect(h.client.organizationId).toBe(ORG);
+    await h.client.getSnapshot("snapshot");
+    expect(h.api.callsOf("GetSnapshot")).toMatchObject([
+      { request: { organizationId: ORG } },
+    ]);
+  });
+
+  test("uses the client organization for empty helper overrides", async () => {
+    const h = setup();
+    h.api.unary(SandboxService, "CreateSandbox", () => ({
+      sandbox: { sandboxId: SANDBOX },
+    }));
+    h.api.unary(SnapshotService, "GetSnapshot", (req) => ({
+      snapshot: { snapshotId: req.snapshotId },
+    }));
+    h.api.unary(SnapshotService, "DeleteSnapshot", () => ({}));
+    h.api.unary(SnapshotService, "ExportSnapshot", (req) => ({
+      snapshot: { snapshotId: req.snapshotId },
+    }));
+    h.api.unary(SnapshotService, "CreateTemplate", () => ({
+      template: { templateId: "template" },
+    }));
+    h.api.unary(SnapshotService, "DeleteTemplate", () => ({}));
+
+    expect(
+      h.client.sandbox(SANDBOX, { organizationId: "" }).organizationId,
+    ).toBe(ORG);
+    const created = await h.clock.run(
+      h.client.createSandbox({ ...validCreate, organizationId: "" }),
+    );
+    expect(created.organizationId).toBe(ORG);
+    await h.client.getSnapshot("snapshot", "");
+    await h.client.deleteSnapshot("snapshot", "");
+    await h.client.exportSnapshot("snapshot", "");
+    await h.client.createTemplate("snapshot", "name", "");
+    await h.client.deleteTemplate("template", "");
+    await h.client.getSnapshot("snapshot", "other-org");
+
+    expect(h.api.calls).toMatchObject([
+      { method: "CreateSandbox", request: { organizationId: ORG } },
+      { method: "GetSnapshot", request: { organizationId: ORG } },
+      { method: "DeleteSnapshot", request: { organizationId: ORG } },
+      { method: "ExportSnapshot", request: { organizationId: ORG } },
+      { method: "CreateTemplate", request: { organizationId: ORG } },
+      { method: "DeleteTemplate", request: { organizationId: ORG } },
+      { method: "GetSnapshot", request: { organizationId: "other-org" } },
+    ]);
+  });
+
+  test("rejects a helper call locally when the option and OWNSAND_ORG are empty", async () => {
+    const h = setup({ organizationId: "", env: { OWNSAND_ORG: "" } });
+
+    expect(h.client.organizationId).toBeUndefined();
+    await expect(h.client.getSnapshot("snapshot", "")).rejects.toThrow(
+      OwnSandConfigError,
+    );
+    expect(h.api.calls).toHaveLength(0);
+  });
+
   test("fills the default organization and lets a call override it", async () => {
     const h = setup();
     h.api.unary(MemberService, "ListMembers", () => ({}));
@@ -853,17 +919,40 @@ describe("createSandbox", () => {
     },
   );
 
-  test("accepts other control characters in labels", async () => {
+  test.each([
+    ["key", { "\ud800": "first", "\ufffd": "second", example: "valid" }],
+    ["value", { example: "label-value\udfff" }],
+  ] as const)(
+    "rejects a lone surrogate in a label %s before the request",
+    async (_name, labels) => {
+      const h = setup();
+      h.api.unary(SandboxService, "CreateSandbox", () => ({
+        sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
+      }));
+      await expect(
+        h.client.createSandbox({ ...validCreate, labels }),
+      ).rejects.toMatchObject({
+        name: "OwnSandValidationError",
+        field: "labels",
+        message: "labels must be valid UTF-8",
+      });
+      expect(h.api.calls).toHaveLength(0);
+    },
+  );
+
+  test("preserves well-formed Unicode and other control characters in labels", async () => {
     const h = setup();
     h.api.unary(SandboxService, "CreateSandbox", () => ({
       sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
     }));
-    await h.client.createSandbox({
-      ...validCreate,
-      labels: { "k\u0001": "a\u0001b\n" },
-    });
+    const labels = {
+      "k\u0001": "a\u0001b\n",
+      "key😀": "\ufffd",
+      "key\ufffd": "😀",
+    };
+    await h.client.createSandbox({ ...validCreate, labels });
     const req = h.api.callsOf("CreateSandbox")[0]!.request as any;
-    expect(req.labels).toEqual({ "k\u0001": "a\u0001b\n" });
+    expect(req.labels).toEqual(labels);
   });
 
   const MAX_INT64 = 2n ** 63n - 1n;
@@ -894,12 +983,6 @@ describe("createSandbox", () => {
       { memoryMib: 2n ** 63n },
       "resources.memory_mib",
     ],
-    ["a fractional disk size", { diskGib: 0.5 }, "resources.disk_gib"],
-    ["a NaN disk size", { diskGib: NaN }, "resources.disk_gib"],
-    ["a zero disk size", { diskGib: 0 }, "resources.disk_gib"],
-    ["a negative disk size", { diskGib: -5 }, "resources.disk_gib"],
-    ["a disk size of 2**63", { diskGib: 2 ** 63 }, "resources.disk_gib"],
-    ["a disk size of 2n**63n", { diskGib: 2n ** 63n }, "resources.disk_gib"],
   ])("rejects %s before the request", async (_name, resources, field) => {
     const h = setup();
     const error = await h.client
@@ -913,21 +996,58 @@ describe("createSandbox", () => {
     expect(h.api.calls).toHaveLength(0);
   });
 
+  test.each([
+    ["a number one GiB above the disk limit", 8_589_934_592],
+    ["a bigint one GiB above the disk limit", 8_589_934_592n],
+    ["a disk size of 2n**40n", 2n ** 40n],
+    ["the signed int64 maximum as a disk size", MAX_INT64],
+    ["an unsafe number disk size", Number.MAX_SAFE_INTEGER + 1],
+    ["a fractional disk size", 0.5],
+    ["a NaN disk size", NaN],
+    ["a disk size of 2**63", 2 ** 63],
+    ["a disk size of 2n**63n", 2n ** 63n],
+  ])("rejects %s before the request", async (_name, diskGib) => {
+    const h = setup();
+    const error = await h.client
+      .createSandbox({
+        ...validCreate,
+        resources: { ...goodResources, diskGib },
+      })
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(OwnSandValidationError);
+    expect(error.field).toBe("resources.disk_gib");
+    expect(error.message).toBe(
+      "resources.disk_gib must be an integer from 1 to 8589934591",
+    );
+    expect(h.api.calls).toHaveLength(0);
+  });
+
   test("keeps the zero and negative resource messages", async () => {
     const h = setup();
     const messages = await Promise.all(
-      [{ vcpuCount: 0 }, { memoryMib: -1 }, { diskGib: 0n }].map((resources) =>
+      [
+        { vcpuCount: 0 },
+        { memoryMib: -1 },
+        { diskGib: 0 },
+        { diskGib: 0n },
+        { diskGib: -1 },
+      ].map((resources) =>
         h.client
           .createSandbox({
             ...validCreate,
             resources: { ...goodResources, ...resources },
-          } as never)
+          })
           .catch((e) => e.message),
       ),
     );
-    for (const message of messages) {
-      expect(message).toContain("must be greater than zero");
-    }
+    expect(messages).toEqual([
+      "resources.vcpu_count must be greater than zero",
+      "resources.memory_mib must be greater than zero",
+      "resources.disk_gib must be greater than zero",
+      "resources.disk_gib must be greater than zero",
+      "resources.disk_gib must be greater than zero",
+    ]);
+    expect(h.api.calls).toHaveLength(0);
   });
 
   test("never puts the rejected resource value in the error", async () => {
@@ -956,12 +1076,12 @@ describe("createSandbox", () => {
       "the largest safe integer sizes",
       {
         memoryMib: Number.MAX_SAFE_INTEGER,
-        diskGib: Number.MAX_SAFE_INTEGER,
+        diskGib: 8_589_934_591,
       },
       {
         vcpuCount: 2,
         memoryMib: BigInt(Number.MAX_SAFE_INTEGER),
-        diskGib: BigInt(Number.MAX_SAFE_INTEGER),
+        diskGib: 8_589_934_591n,
       },
     ],
     [
@@ -971,8 +1091,23 @@ describe("createSandbox", () => {
     ],
     [
       "the largest bigint sizes",
-      { memoryMib: MAX_INT64, diskGib: MAX_INT64 },
-      { vcpuCount: 2, memoryMib: MAX_INT64, diskGib: MAX_INT64 },
+      { memoryMib: MAX_INT64, diskGib: 8_589_934_591n },
+      { vcpuCount: 2, memoryMib: MAX_INT64, diskGib: 8_589_934_591n },
+    ],
+    [
+      "the disk limit as a number",
+      { memoryMib: 4096, diskGib: 8_589_934_591 },
+      { vcpuCount: 2, memoryMib: 4096n, diskGib: 8_589_934_591n },
+    ],
+    [
+      "the disk limit as a bigint",
+      { memoryMib: 4096n, diskGib: 8_589_934_591n },
+      { vcpuCount: 2, memoryMib: 4096n, diskGib: 8_589_934_591n },
+    ],
+    [
+      "the memory limit with a small disk",
+      { memoryMib: MAX_INT64, diskGib: 1n },
+      { vcpuCount: 2, memoryMib: MAX_INT64, diskGib: 1n },
     ],
     [
       "a bigint size next to a number size",

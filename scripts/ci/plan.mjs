@@ -22,6 +22,8 @@ const fixtureInputs = new Set([
   ".changeset/config.json",
   ".github/workflows/deploy.yml",
   ".github/workflows/CI.yml",
+  // The deploy fixtures check the single `queue` exception.
+  ".github/actionlint.yaml",
   ".nvmrc",
   "package.json",
   "pnpm-lock.yaml",
