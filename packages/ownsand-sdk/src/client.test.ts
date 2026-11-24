@@ -68,6 +68,29 @@ describe("client construction", () => {
     expect(() => new OwnSandClient({ env: {} })).toThrow(OwnSandConfigError);
   });
 
+  test("rejects a whitespace-only explicit API key", () => {
+    expect(
+      () =>
+        new OwnSandClient({ apiKey: "   ", env: { OWNSAND_API_KEY: API_KEY } }),
+    ).toThrow(new OwnSandConfigError("apiKey must not be empty"));
+  });
+
+  test("treats a whitespace-only OWNSAND_API_KEY as unset", () => {
+    const env = { OWNSAND_API_KEY: "   " };
+    expect(() => new OwnSandClient({ env })).toThrow(
+      new OwnSandConfigError(
+        "no credential: pass apiKey or accessToken, or set OWNSAND_API_KEY",
+      ),
+    );
+  });
+
+  test("uses an explicit API key when OWNSAND_API_KEY contains only whitespace", async () => {
+    const h = setup({ apiKey: "osk_valid", env: { OWNSAND_API_KEY: "   " } });
+    await h.client.sandbox(SANDBOX).get();
+    const [call] = h.api.callsOf("GetSandbox");
+    expect(call!.headers.get("authorization")).toBe("Bearer osk_valid");
+  });
+
   test("uses the production origin by default and rejects origins with a path or credentials", () => {
     expect(resolveApiOrigin(undefined)).toBe(DEFAULT_API_ORIGIN);
     expect(resolveApiOrigin("http://127.0.0.1:8300/")).toBe(
