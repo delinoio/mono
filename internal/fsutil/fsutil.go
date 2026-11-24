@@ -38,13 +38,12 @@ type dirMode struct {
 // copied before the stop stay in dst; the caller removes them.
 //
 // The permission bits of a copied file are those of its source: CopyFile sets
-// them explicitly, so the umask does not clear any. A directory is created
-// owner-writable, so that its entries can be copied into it, and receives its
-// source permission bits only after the whole tree is copied, deepest
-// directories first; a read-only source directory therefore copies with its
-// content and ends read-only. A copy that fails or stops early skips this
-// step and leaves the directories that it created owner-writable, so that the
-// caller's removal of the partial copy does not meet a read-only directory.
+// them explicitly, so the umask does not clear any. Each newly created
+// directory, including missing parents of dst, gets owner read, write, and
+// search access before the copy uses it. Copied directories receive their
+// source permission bits after the whole tree is copied, deepest first.
+// A copy that stops during the walk keeps that temporary owner access so
+// the caller can remove the partial tree.
 //
 // On Windows a directory keeps the mode that the create call gives it: the
 // read-only attribute of a directory has no effect on its entries there.
@@ -68,7 +67,7 @@ func CopyTreeContext(ctx context.Context, src, dst string) error {
 		}
 		switch {
 		case d.IsDir():
-			if err := os.MkdirAll(target, info.Mode().Perm()|0o700); err != nil {
+			if err := mkdirCopyDir(target, info.Mode().Perm()); err != nil {
 				return err
 			}
 			dirs = append(dirs, dirMode{path: target, perm: info.Mode().Perm()})
@@ -99,6 +98,45 @@ func CopyTreeContext(ctx context.Context, src, dst string) error {
 		}
 	}
 	return nil
+}
+
+// mkdirCopyDir creates missing components in order so that a restrictive
+// umask cannot prevent creation of the next component.
+func mkdirCopyDir(path string, perm fs.FileMode) error {
+	const ownerAccess = 0o700
+	if runtime.GOOS == "windows" {
+		return os.MkdirAll(path, perm|ownerAccess)
+	}
+	if info, err := os.Stat(path); err == nil {
+		if info.IsDir() {
+			return nil
+		}
+		return &fs.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
+	}
+	if parent := filepath.Dir(path); parent != path {
+		if err := mkdirCopyDir(parent, perm); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(path, perm|ownerAccess); err != nil {
+		if info, statErr := os.Lstat(path); statErr == nil && info.IsDir() {
+			return nil
+		}
+		return err
+	}
+	// Keep the group and other permissions that the kernel set at creation.
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	mode := info.Mode()
+	if !mode.IsDir() {
+		return &fs.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
+	}
+	if mode&ownerAccess == ownerAccess {
+		return nil
+	}
+	return os.Chmod(path, mode|ownerAccess)
 }
 
 // CopyFile copies one regular file. The copy has the permission bits perm
