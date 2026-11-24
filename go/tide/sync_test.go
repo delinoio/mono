@@ -244,6 +244,119 @@ func TestSyncLimits(t *testing.T) {
 	}
 }
 
+func TestSyncManifestLimitCandidate(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	dir := newRepo(t, map[string]string{"old.txt": "old"}, nil, "")
+	ctx := context.Background()
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	ws := ds.GetWorkspacePath()
+	previous, err := os.ReadFile(ws + manifestSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	git(t, dir, "rm", "-q", "old.txt")
+	// The JSON key for a&b.txt contains a Unicode escape. Count encoded bytes.
+	entries := make(map[string]manifestEntry)
+	for name, contents := range map[string]string{"a&b.txt": "a", "new.txt": "new"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256([]byte(contents))
+		entries[name] = manifestEntry{Size: int64(len(contents)), SHA256: hex.EncodeToString(sum[:]), Mode: modeFile}
+	}
+	want, err := json.Marshal(manifest{Version: manifestVersion, Files: entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writesBefore, execsBefore := srv.Calls(writeProc), srv.Calls(execProc)
+	_, err = c.sync(ctx, params, int64(len(want)-1))
+	if connect.CodeOf(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "candidate manifest exceeds the size limit") {
+		t.Fatalf("oversized candidate manifest: %v", err)
+	}
+	if srv.Calls(writeProc) != writesBefore || srv.Calls(execProc) != execsBefore {
+		t.Fatal("oversized candidate manifest caused an upload or a guest command")
+	}
+	if got, err := os.ReadFile(ws + manifestSuffix); err != nil || !bytes.Equal(got, previous) {
+		t.Fatalf("previous manifest changed: %q, %v", got, err)
+	}
+	if got := readGuest(t, ds, "old.txt"); got != "old" {
+		t.Fatalf("previous guest file changed: %q", got)
+	}
+
+	res, err := c.sync(ctx, params, int64(len(want)))
+	if err != nil || res.Uploaded != 2 || res.Deleted != 1 {
+		t.Fatalf("sync at the limit = %+v, %v", res, err)
+	}
+	if got, err := os.ReadFile(ws + manifestSuffix); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("manifest at the limit = %q, %v", got, err)
+	}
+	res, err = c.sync(ctx, params, int64(len(want)))
+	if err != nil || res.Uploaded != 0 || res.Skipped != 2 {
+		t.Fatalf("incremental sync at the limit = %+v, %v", res, err)
+	}
+}
+
+func TestSyncManifestLimitGuest(t *testing.T) {
+	needPOSIX(t)
+	for _, name := range []string{"initial read", "read under the lock"} {
+		t.Run(name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			dir := newRepo(t, map[string]string{"a.txt": "local"}, nil, "")
+			ctx := context.Background()
+			ws := ds.GetWorkspacePath()
+			guestFile := filepath.Join(ws, "a.txt")
+			if err := os.WriteFile(guestFile, []byte("guest"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			const limit = 200
+			body := []byte(`{"version":1,"files":{}}`)
+			atLimit := append(bytes.Clone(body), bytes.Repeat([]byte(" "), limit-len(body))...)
+			oversized := append(bytes.Clone(atLimit), ' ')
+			start := oversized
+			wantExecs := 0
+			if name == "read under the lock" {
+				start = atLimit
+				wantExecs = 2 // lock and cleanup
+				srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+					if req.GetEnv()[guestEnvForce] != "" {
+						// Another sync replaces the manifest before this sync takes the lock.
+						if err := os.WriteFile(ws+manifestSuffix, oversized, 0o644); err != nil {
+							t.Error(err)
+						}
+					}
+				}
+			}
+			if err := os.WriteFile(ws+manifestSuffix, start, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res, err := c.sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}, limit)
+			if res != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "guest manifest exceeds the size limit") {
+				t.Fatalf("oversized guest manifest = %+v, %v", res, err)
+			}
+			if writes, execs := srv.Calls(writeProc), srv.Calls(execProc); writes != 0 || execs != wantExecs {
+				t.Fatalf("got %d uploads and %d execs, want 0 uploads and %d execs", writes, execs, wantExecs)
+			}
+			if got, err := os.ReadFile(ws + manifestSuffix); err != nil || !bytes.Equal(got, oversized) {
+				t.Fatalf("oversized manifest changed: %q, %v", got, err)
+			}
+			if got := readGuest(t, ds, "a.txt"); got != "guest" {
+				t.Fatalf("guest file changed: %q", got)
+			}
+			if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("sync lock after failure: %v", err)
+			}
+		})
+	}
+}
+
 func TestSyncCaseCollisionsAndWindowsNames(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
@@ -791,6 +904,43 @@ func TestLinkOutcome(t *testing.T) {
 	failed, warnings = linkOutcome(links, &guestResult{linkFailures: []string{"l2"}, outputLost: true})
 	if len(failed) != 3 || len(warnings) != 3 {
 		t.Fatalf("incomplete output: failed %v warnings %q", failed, warnings)
+	}
+}
+
+func TestLinkOutcomeInSyncManifest(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_WINDOWS)
+	dir := newRepo(t, nil, nil, "")
+	if err := os.Symlink("target", filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Emulate the Windows command results on the fake POSIX guest.
+	bin := t.TempDir()
+	script := `#!/bin/sh
+set -eu
+if [ -n "${TIDE_SYNC_FORCE-}" ]; then
+    mkdir "$TIDE_SYNC_LOCK"
+elif [ -n "${TIDE_SYNC_WORKSPACE-}" ]; then
+    test -s "$TIDE_SYNC_LINK_LIST"
+    echo 'TIDE-LINK-FAILED link'
+else
+    rm -f "$TIDE_SYNC_LINK_LIST"
+    rmdir "$TIDE_SYNC_LOCK"
+fi
+`
+	if err := os.WriteFile(filepath.Join(bin, "powershell.exe"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	res, err := c.Sync(context.Background(), params)
+	if err != nil || res.Uploaded != 0 || !slices.Equal(res.Warnings, []string{"link: the guest could not create the symbolic link"}) {
+		t.Fatalf("sync with a failed Windows link = %+v, %v", res, err)
+	}
+	if m := guestManifest(t, ds); len(m.Files) != 0 {
+		t.Fatalf("manifest contains the failed link: %+v", m)
 	}
 }
 
