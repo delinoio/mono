@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -42,6 +44,7 @@ import (
 	"github.com/delinoio/mono/go/uuidv7"
 	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
 
 var guestBinary string
@@ -351,6 +354,67 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	requireEmptyStateDir(t, st)
 }
 
+func TestFreeDiskCapabilityAndAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		free int64
+		fits bool
+	}{
+		{"saturated capacity", math.MaxInt64, true},
+		{"insufficient capacity", (1 << 30) - 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := testcp.New(t)
+			var downloadStarted atomic.Bool
+			b := bucketWithHook(t, func(r *http.Request) int {
+				if r.Method == http.MethodGet {
+					downloadStarted.Store(true)
+				}
+				return http.StatusNotFound
+			})
+			cp.SetSignedURLBase(b.URL)
+			st, id := enrollDevice(t, cp)
+			h := startWith(t, cp, st, id, func(opts *Options) {
+				opts.FreeDisk = func() (int64, error) { return tc.free, nil }
+			})
+			env, _ := h.wait(0, "capability report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil })
+			if got := env.GetCapabilityReport().GetCapabilities().GetFreeDiskBytes(); got != tc.free {
+				t.Fatalf("reported free disk = %d, want %d", got, tc.free)
+			}
+			h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+
+			sandboxID, _ := uuidv7.NewString()
+			create := h.command(createCommand(sandboxID))
+			if tc.fits {
+				if create.GetError() != nil || create.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+					t.Fatalf("create with %d free bytes = %v, want a running sandbox", tc.free, create)
+				}
+			} else if err := create.GetError(); err.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED ||
+				err.GetMessage() != "free disk of the state directory does not fit the sandbox disk" {
+				t.Fatalf("create with %d free bytes = %v, want insufficient disk", tc.free, create)
+			}
+
+			// The part metadata declares 1 GiB. The bucket returns 404 so
+			// the test can check admission without transferring 1 GiB.
+			snapshotID, _ := uuidv7.NewString()
+			res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ImportSnapshot{
+				ImportSnapshot: &ownsandv1.ImportSnapshotCommand{
+					Snapshot: &ownsandv1.SnapshotStateEntry{SnapshotId: snapshotID},
+					Parts:    []*ownsandv1.SnapshotPart{{PartNumber: 1, SizeBytes: 1 << 30, Sha256: make([]byte, sha256.Size)}},
+				},
+			}})
+			if tc.fits {
+				if res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS || !downloadStarted.Load() {
+					t.Fatalf("import with %d free bytes = %v, want a download attempt", tc.free, res)
+				}
+			} else if err := res.GetError(); err.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED ||
+				err.GetMessage() != "free disk does not fit the snapshot import" || downloadStarted.Load() {
+				t.Fatalf("import with %d free bytes = %v, want insufficient disk before download", tc.free, res)
+			}
+		})
+	}
+}
+
 // TestStatusRecordsCapabilities checks that the status file holds the
 // capabilities of the capability report that the agent sent, so that
 // `ownsand-agent status` can print the hypervisor checks.
@@ -432,6 +496,121 @@ func TestRemovalNoticeAtAuthenticate(t *testing.T) {
 		t.Fatal("removal not confirmed")
 	}
 	requireEmptyStateDir(t, st)
+}
+
+// createAdmissionGate holds a create before the manager can register it.
+type createAdmissionGate struct {
+	entered, resume, finished chan struct{}
+}
+
+func (g createAdmissionGate) BeginCreate() (func(), error) {
+	close(g.entered)
+	<-g.resume
+	return func() { close(g.finished) }, nil
+}
+
+// confirmRemovalGate holds the removal RPC before the control plane accepts it.
+type confirmRemovalGate struct {
+	ownsandv1connect.AgentServiceClient
+	entered, resume chan struct{}
+	once            sync.Once
+}
+
+func (g *confirmRemovalGate) ConfirmRemoval(ctx context.Context, req *connect.Request[ownsandv1.ConfirmRemovalRequest]) (*connect.Response[ownsandv1.ConfirmRemovalResponse], error) {
+	g.once.Do(func() { close(g.entered) })
+	select {
+	case <-g.resume:
+		return g.AgentServiceClient.ConfirmRemoval(ctx, req)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestDeviceRemovalFencesDispatchedCreate(t *testing.T) {
+	for _, name := range []string{"cleanup-command", "authenticate-notice"} {
+		t.Run(name, func(t *testing.T) {
+			cp := testcp.New(t)
+			st, id := enrollDevice(t, cp)
+			confirm := confirmRemovalGate{entered: make(chan struct{}), resume: make(chan struct{})}
+			h := startWith(t, cp, st, id, func(o *Options) {
+				confirm.AgentServiceClient = o.Control.Agent
+				o.Control.Agent = &confirm
+			})
+			h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+			admittedID, _ := uuidv7.NewString()
+			if res := h.command(createCommand(admittedID)); res.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+				t.Fatalf("create before removal: %v", res)
+			}
+
+			gate := createAdmissionGate{entered: make(chan struct{}), resume: make(chan struct{}), finished: make(chan struct{})}
+			h.agent.Sandboxes.SetCreateGate(gate)
+			resumeCreate := sync.OnceFunc(func() { close(gate.resume) })
+			t.Cleanup(resumeCreate)
+			lateID, _ := uuidv7.NewString()
+			cmd := createCommand(lateID)
+			cmd.CommandId, _ = uuidv7.NewString()
+			if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}) {
+				t.Fatal("could not send the late create")
+			}
+			select {
+			case <-gate.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("late create did not reach the gate")
+			}
+
+			cp.MarkRemoved(id.DeviceID)
+			if name == "cleanup-command" {
+				cmdID, _ := uuidv7.NewString()
+				cmd := &ownsandv1.AgentCommand{CommandId: cmdID, Command: &ownsandv1.AgentCommand_CleanUp{CleanUp: &ownsandv1.CleanUpCommand{}}}
+				if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}) {
+					t.Fatal("could not send the clean-up command")
+				}
+			} else {
+				cp.Current().Close()
+			}
+			select {
+			case <-confirm.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("agent did not reach removal confirmation")
+			}
+			if state, err := st.LoadAgent(); err != nil || !state.Removal.CleanupDone {
+				t.Fatalf("clean-up was not recorded before confirmation: %+v, %v", state, err)
+			}
+
+			resumeCreate()
+			select {
+			case <-gate.finished:
+			case <-time.After(10 * time.Second):
+				t.Fatal("late create did not finish")
+			}
+			if entries := h.agent.Sandboxes.Entries(); len(entries) != 0 {
+				t.Errorf("sandboxes at removal confirmation: %v, want none", entries)
+			}
+			if running, err := h.agent.rt.Running(t.Context()); err != nil || len(running) != 0 {
+				t.Errorf("running sandboxes at removal confirmation: %v, %v", running, err)
+			}
+			for _, sandboxID := range []string{admittedID, lateID} {
+				if _, err := os.Stat(st.Path(store.SandboxesDir, sandboxID+".json")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("sandbox %s record at removal confirmation: %v, want absent", sandboxID, err)
+				}
+			}
+
+			close(confirm.resume)
+			select {
+			case err := <-h.errc:
+				h.errc <- err
+				if !errors.Is(err, ErrRemoved) {
+					t.Fatalf("run returned %v, want ErrRemoved", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("agent did not finish removal")
+			}
+			if cp.Confirms() != 1 {
+				t.Fatal("removal was not confirmed")
+			}
+			requireEmptyStateDir(t, st)
+		})
+	}
 }
 
 // hostCleanerRuntime is a runtime with host resources outside the state
@@ -1263,19 +1442,23 @@ type updateEnv struct {
 	block    bool
 	keys     []ed25519.PublicKey
 	manifest string
+	install  func(string) error
 }
 
-func (e *updateEnv) Install(string) error {
+func (e *updateEnv) Install(path string) error {
 	if e.installs.Add(1) == 1 {
 		close(e.entered)
 	}
 	if e.block {
 		<-e.unblock
 	}
+	if e.install != nil {
+		return e.install(path)
+	}
 	return nil
 }
 
-func newUpdateEnv(t *testing.T, block bool) *updateEnv {
+func newUpdateEnv(t *testing.T, block bool, revokedVersions ...string) *updateEnv {
 	t.Helper()
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	e := &updateEnv{entered: make(chan struct{}), unblock: make(chan struct{}), block: block, keys: []ed25519.PublicKey{pub}}
@@ -1284,7 +1467,7 @@ func newUpdateEnv(t *testing.T, block bool) *updateEnv {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	sum := sha256.Sum256(artifact)
-	manifest, _ := json.Marshal(update.Manifest{Schema: 1, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
+	manifest, _ := json.Marshal(update.Manifest{Schema: 1, RevokedVersions: revokedVersions, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
 	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, manifest))
 	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, _ *http.Request) { w.Write(manifest) })
 	mux.HandleFunc("/manifest.json.sig", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(sig)) })
@@ -1939,6 +2122,116 @@ func (r *retainedCreateRuntime) calls() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.deleteCalls
+}
+
+func TestRemovalRetriesRetainedFailedCreate(t *testing.T) {
+	testRemovalRetriesRetainedFailedCreate(t, func(_ *store.Store, o *Options) vmruntime.Runtime {
+		return o.Runtime
+	}, nil)
+}
+
+func testRemovalRetriesRetainedFailedCreate(t *testing.T, runtimeForStore func(*store.Store, *Options) vmruntime.Runtime, configureCreate func(*ownsandv1.CreateSandboxCommand)) {
+	t.Helper()
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	confirm := confirmRemovalGate{entered: make(chan struct{}), resume: make(chan struct{})}
+	var rt *retainedCreateRuntime
+	a := newAgent(t, cp, st, id, func(o *Options) {
+		rt = &retainedCreateRuntime{Runtime: runtimeForStore(st, o), failDeletes: 1}
+		o.Runtime = rt
+		confirm.AgentServiceClient = o.Control.Agent
+		o.Control.Agent = &confirm
+	})
+	t.Cleanup(a.shutdown)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+
+	sandboxID, _ := uuidv7.NewString()
+	cmd := createCommand(sandboxID).GetCreateSandbox()
+	if configureCreate != nil {
+		configureCreate(cmd)
+	}
+	a.Sandboxes.SetLimits(limits)
+	entry, err := a.Sandboxes.Create(ctx, cmd)
+	if err == nil || entry.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+		t.Fatalf("create result %v, %v, want a failed create", entry, err)
+	}
+	a.Sandboxes.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: sandboxID, Revision: entry.GetRevision()})
+	if _, ok := a.Sandboxes.State(sandboxID); ok {
+		t.Fatal("terminal acknowledgement kept the sandbox record")
+	}
+
+	vmDir := st.Path(store.VMsDir, sandboxID)
+	localImage := st.Path(store.ImagesDir, "keep-until-wipe")
+	if err := os.WriteFile(localImage, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cp.MarkRemoved(id.DeviceID)
+	remove := func() <-chan error {
+		done := make(chan error, 1)
+		go func() {
+			defer close(done)
+			done <- a.removeDevice(ctx)
+		}()
+		t.Cleanup(func() { <-done })
+		return done
+	}
+	select {
+	case err := <-remove():
+		if err == nil || errors.Is(err, ErrRemoved) || rt.calls() != 1 {
+			t.Fatalf("first removal = %v, Delete calls = %d, want an injected stop failure", err, rt.calls())
+		}
+	case <-confirm.entered:
+		t.Fatal("removal attempted confirmation with the retained VM still running")
+	case <-ctx.Done():
+		t.Fatal("first removal did not return")
+	}
+	if state, err := st.LoadAgent(); err != nil || !state.Removal.NoticeReceived || state.Removal.CleanupDone {
+		t.Fatalf("state after the failed stop: %+v, %v", state, err)
+	}
+	if running, err := rt.Running(ctx); err != nil || len(running) != 1 || running[0] != sandboxID {
+		t.Fatalf("VMs after the failed stop = %v, %v, want the retained VM", running, err)
+	}
+	for _, path := range []string{vmDir, localImage} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("local data after the failed stop: %v", err)
+		}
+	}
+	t.Log("Failed deletion left the acknowledged VM running and preserved local data. Removal did not attempt confirmation.")
+
+	retried := remove()
+	select {
+	case <-confirm.entered:
+	case err := <-retried:
+		t.Fatalf("removal retry failed before confirmation: %v", err)
+	case <-ctx.Done():
+		t.Fatal("removal retry did not reach confirmation")
+	}
+	if state, err := st.LoadAgent(); err != nil || !state.Removal.CleanupDone {
+		t.Fatalf("state at confirmation: %+v, %v", state, err)
+	}
+	if running, err := rt.Running(ctx); err != nil || len(running) != 0 || rt.calls() != 2 {
+		t.Fatalf("VMs at confirmation = %v, %v, Delete calls = %d", running, err, rt.calls())
+	}
+	for _, path := range []string{vmDir, localImage} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat at confirmation: %v, want %s absent", err, path)
+		}
+	}
+	close(confirm.resume)
+	select {
+	case err := <-retried:
+		if !errors.Is(err, ErrRemoved) {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("removal retry did not finish")
+	}
+	if cp.Confirms() != 1 {
+		t.Fatalf("removal confirmations = %d, want 1", cp.Confirms())
+	}
+	requireEmptyStateDir(t, st)
+	t.Log("The retry stopped the retained VM and wiped local data before the control plane accepted confirmation.")
 }
 
 // TestFailedCreateRetainedVMIsStoppedByRunningAgent checks that a running

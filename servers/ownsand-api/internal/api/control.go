@@ -340,6 +340,9 @@ func (c *Control) handle(ctx context.Context, e events.Event) error {
 			s.sendDeleteSnapshot(ctx, conn, e.OrganizationID, e.SnapshotID)
 		}
 	case events.KindDeviceRemoved:
+		if s.DataPath != nil {
+			s.DataPath.HandleEvent(ctx, e)
+		}
 		conn := s.Hub.Get(e.DeviceID)
 		if conn == nil {
 			return nil
@@ -353,7 +356,7 @@ func (c *Control) handle(ctx context.Context, e events.Event) error {
 	}
 	if s.DataPath != nil {
 		switch e.Kind {
-		case events.KindAPIKeyRevoked, events.KindMembershipEnded, events.KindSandboxDeleted, events.KindOrganizationDeleted, events.KindDeviceRemoved:
+		case events.KindAPIKeyRevoked, events.KindMembershipEnded, events.KindSandboxDeleted, events.KindOrganizationDeleted:
 			s.DataPath.HandleEvent(ctx, e)
 		}
 	}
@@ -386,8 +389,8 @@ func (c *Control) runOfflineSweep(ctx context.Context) {
 		// the lease: a record outlives the lease only when its channel closed
 		// at the lease release, and it must expire then too.
 		c.S.expireCommands(ctx)
-		// Pending revocations are bound to channels of this instance, so
-		// they expire without the lease as well.
+		// Pending revocations are bound to channels of this instance.
+		// Sweep them even when the instance no longer holds the lease.
 		if c.S.DataPath != nil {
 			c.S.DataPath.SweepExpired(ctx)
 		}

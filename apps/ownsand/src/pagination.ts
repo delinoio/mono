@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-import type { ConnectError } from "@connectrpc/connect";
 import { useCallback, useEffect } from "react";
 import { type BoundaryQuery, isTerminalError } from "./components/ui.tsx";
 
@@ -18,7 +17,9 @@ interface QueryRequestState {
  * read from the cached query, so an automatic refetch can ask it before it
  * starts.
  */
-function lastRequestFailedOnLaterPage(query: QueryRequestState): boolean {
+export function lastRequestFailedOnLaterPage(
+  query: QueryRequestState,
+): boolean {
   return (
     query.state.status === "error" &&
     query.state.fetchMeta?.fetchMore?.direction === "forward"
@@ -53,7 +54,7 @@ export const FOLLOW_ALL_PAGES_OPTIONS = {
 /** The part of an infinite query result that `useFollowAllPages` reads. */
 export interface PagedQuery {
   data: unknown;
-  error: ConnectError | null;
+  error: Error | null;
   hasNextPage: boolean;
   isFetching: boolean;
   isFetchingNextPage: boolean;
@@ -70,13 +71,13 @@ export interface FollowedPages {
   /** Whether the console is loading a later page now. */
   isLoadingMore: boolean;
   /** The transient error of the last later-page request. */
-  loadMoreError: ConnectError | null;
+  loadMoreError: Error | null;
   /** Loads the pages that are missing again after `loadMoreError`. */
   retryLoadMore: () => void;
   /** The terminal error of the last later-page request. */
-  terminalLoadMoreError: ConnectError | null;
+  terminalLoadMoreError: Error | null;
   /** The full-list error, excluding transient later-page errors. */
-  error: ConnectError | null;
+  error: Error | null;
 }
 
 /**
@@ -90,7 +91,10 @@ export interface FollowedPages {
  * terminal error replaces the list. Automatic refetch triggers leave the
  * failed query in place (see `FOLLOW_ALL_PAGES_OPTIONS`).
  */
-export function useFollowAllPages(query: PagedQuery): FollowedPages {
+export function useFollowAllPages(
+  query: PagedQuery,
+  enabled = true,
+): FollowedPages {
   const { data, hasNextPage, isFetching, isFetchNextPageError, fetchNextPage } =
     query;
 
@@ -103,10 +107,17 @@ export function useFollowAllPages(query: PagedQuery): FollowedPages {
   // `isFetching` have the same values in two commits, and only the new page
   // tells the effect to request the page after it.
   useEffect(() => {
-    if (hasNextPage && !isFetching && !isFetchNextPageError) {
+    if (enabled && hasNextPage && !isFetching && !isFetchNextPageError) {
       void fetchNextPage({ cancelRefetch: false });
     }
-  }, [data, hasNextPage, isFetching, isFetchNextPageError, fetchNextPage]);
+  }, [
+    data,
+    enabled,
+    hasNextPage,
+    isFetching,
+    isFetchNextPageError,
+    fetchNextPage,
+  ]);
 
   const continuationError = isFetchNextPageError ? query.error : null;
   const terminalLoadMoreError = isTerminalError(continuationError)
