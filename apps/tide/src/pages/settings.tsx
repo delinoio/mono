@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "@bufbuild/protobuf";
 import { FieldMaskSchema } from "@bufbuild/protobuf/wkt";
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { Button, ButtonVariant } from "delino-ui/button";
@@ -11,10 +11,12 @@ import { Role } from "@delino/tide-protos/v1/common_pb";
 import { MemberService } from "@delino/tide-protos/v1/member_pb";
 import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import { type FormEvent, useState } from "react";
-import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
+import { invalidateServices } from "../api.ts";
+import { MemberListStatus } from "../components/member-list-status.tsx";
 import { useOrg } from "../components/shell.tsx";
 import { ConfirmDialog, ErrorNotice, PageHeader } from "../components/ui.tsx";
 import { devSessionLimitError } from "../forms.ts";
+import { displayName, useMembers } from "../members.ts";
 import { can, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
 
@@ -100,10 +102,7 @@ function OwnerActions() {
   const { organizationId, name } = useOrg();
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
-  const members = useQuery(MemberService.method.listMembers, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const roster = useMembers(organizationId);
   const transfer = useMutation(OrganizationService.method.transferOwnership, {
     onSuccess: () =>
       invalidateServices(queryClient, OrganizationService, MemberService),
@@ -114,12 +113,8 @@ function OwnerActions() {
   const [target, setTarget] = useState<string | null>(null);
   const [confirmTransfer, setConfirmTransfer] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const candidates =
-    members.data?.members.filter((m) => m.role !== Role.OWNER) ?? [];
-  const targetName = (() => {
-    const m = candidates.find((c) => c.userId === target);
-    return m ? m.displayName || m.userId : "";
-  })();
+  const candidates = roster.members.filter((m) => m.role !== Role.OWNER);
+  const candidate = candidates.find((m) => m.userId === target);
 
   return (
     <>
@@ -128,22 +123,24 @@ function OwnerActions() {
         <p className="muted">
           The new owner gets every permission. You become an admin.
         </p>
+        <MemberListStatus roster={roster} />
         <div className="inline-form">
           <Select
+            disabled={!roster.hasData}
             label="New owner"
             placeholder="Choose a member"
-            value={target}
+            value={candidate?.userId ?? null}
             onValueChange={setTarget}
           >
             {candidates.map((m) => (
               <SelectOption key={m.userId} value={m.userId}>
-                {m.displayName || m.userId}
+                {displayName(m)}
               </SelectOption>
             ))}
           </Select>
           <Button
             variant={ButtonVariant.Secondary}
-            disabled={target === null}
+            disabled={candidate === undefined}
             onClick={() => setConfirmTransfer(true)}
           >
             Transfer
@@ -167,13 +164,13 @@ function OwnerActions() {
         </Button>
       </section>
       <ConfirmDialog
-        open={confirmTransfer}
+        open={confirmTransfer && candidate !== undefined}
         onOpenChange={setConfirmTransfer}
-        title={`Make ${targetName} the owner?`}
+        title={`Make ${candidate ? displayName(candidate) : ""} the owner?`}
         description="You become an admin. Only the new owner can give ownership back."
         confirmLabel="Transfer ownership"
         onConfirm={() =>
-          transfer.mutateAsync({ organizationId, userId: target! })
+          transfer.mutateAsync({ organizationId, userId: candidate!.userId })
         }
       />
       <ConfirmDialog

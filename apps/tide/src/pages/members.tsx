@@ -10,6 +10,7 @@ import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import { useState } from "react";
 import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
 import { useAuth } from "../auth.tsx";
+import { MemberListStatus } from "../components/member-list-status.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
@@ -23,12 +24,9 @@ import {
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import { invitationLink } from "../invitation.ts";
+import { displayName, useMembers } from "../members.ts";
 import { can, canManageMember, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
-
-function displayName(m: Member): string {
-  return m.displayName !== "" ? m.displayName : m.userId;
-}
 
 /** Route `members`: members, roles, leaving and invitations. */
 export function MembersPage() {
@@ -38,10 +36,7 @@ export function MembersPage() {
   const queryClient = useQueryClient();
   const refresh = () =>
     invalidateServices(queryClient, MemberService, OrganizationService);
-  const members = useQuery(MemberService.method.listMembers, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const roster = useMembers(organizationId);
   const updateRole = useMutation(MemberService.method.updateMemberRole, {
     onSuccess: refresh,
   });
@@ -67,16 +62,10 @@ export function MembersPage() {
           ) : undefined
         }
       />
-      {members.isPending ? (
-        <Loading label="Loading members" />
-      ) : members.error ? (
-        <ErrorNotice
-          error={members.error}
-          onRetry={() => void members.refetch()}
-        />
-      ) : (
+      <MemberListStatus roster={roster} />
+      {roster.hasData ? (
         <ul className="list" aria-label="Members">
-          {members.data.members.map((m) => {
+          {roster.members.map((m) => {
             const manageable = canManageMember(role, userId, m);
             return (
               <li key={m.userId} className="list-row">
@@ -130,7 +119,7 @@ export function MembersPage() {
             );
           })}
         </ul>
-      )}
+      ) : null}
       {can(role, Permission.ManageInvitations) ? <Invitations /> : null}
       <ConfirmDialog
         open={removing !== undefined}
