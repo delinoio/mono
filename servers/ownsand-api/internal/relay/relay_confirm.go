@@ -4,6 +4,7 @@ package relay
 
 import (
 	"context"
+	"time"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -15,21 +16,24 @@ import (
 // example the acceptance timeout of a relay request, because a frame that
 // waits in the queue behind a blocked writer is not yet visible to the agent.
 //
+// If acceptance is positive, the writer also starts the stream's acceptance
+// window when the send succeeds.
+//
 // The wait for credit, for a place in the queue and for the writer all end
 // when ctx ends (it returns the context error) or the connection closes (it
 // returns ErrConnClosed, also when the writer failed). A frame that is queued
 // when ctx ends may still be written later; the caller then closes the stream.
-func (s *Stream) SendConfirmed(ctx context.Context, f *ownsandv1.DataFrame, onWritten func(n int64)) error {
-	written := make(chan error, 1)
+func (s *Stream) SendConfirmed(ctx context.Context, f *ownsandv1.DataFrame, onWritten func(n int64), acceptance time.Duration) error {
+	w := &confirmedWrite{stream: s, acceptance: acceptance, done: make(chan error, 1)}
 	// Register before the frame can reach the writer. The pointer identifies
 	// the frame, and a caller never queues the same frame twice.
-	s.conn.writeWaiters.Store(f, written)
+	s.conn.writeWaiters.Store(f, w)
 	defer s.conn.writeWaiters.Delete(f)
 	if err := s.SendMetered(ctx, f, onWritten); err != nil {
 		return err
 	}
 	select {
-	case err := <-written:
+	case err := <-w.done:
 		return s.confirmResult(err)
 	case <-ctx.Done():
 	case <-s.conn.Done():
@@ -37,7 +41,7 @@ func (s *Stream) SendConfirmed(ctx context.Context, f *ownsandv1.DataFrame, onWr
 	// A result that arrived together with the end of ctx or of the
 	// connection wins, so a completed send is never reported as a failure.
 	select {
-	case err := <-written:
+	case err := <-w.done:
 		return s.confirmResult(err)
 	default:
 	}
@@ -57,14 +61,32 @@ func (s *Stream) confirmResult(err error) error {
 	return nil
 }
 
-// writeConfirmed reports the result of the send of f to the SendConfirmed
-// caller that waits for it, if any. The writer calls it after each send, so
-// the lookup must stay cheap and must never block.
-func (c *Conn) writeConfirmed(f *ownsandv1.DataFrame, err error) {
-	if v, ok := c.writeWaiters.Load(f); ok {
-		select {
-		case v.(chan error) <- err:
-		default:
-		}
+type confirmedWrite struct {
+	stream     *Stream
+	acceptance time.Duration
+	done       chan error
+}
+
+// sendMeasured sends the frame and reports metering and confirmed sends. For
+// a confirmed send, it starts the acceptance window as soon as the transport
+// send returns, before reporting the result to the waiting goroutine.
+func (c *Conn) sendMeasured(of outFrame, send func(*ownsandv1.DataFrame) error) error {
+	v, ok := c.writeWaiters.Load(of.frame)
+	if !ok {
+		return c.sendCounted(of, send)
 	}
+	w := v.(*confirmedWrite)
+	err := c.sendCounted(of, func(f *ownsandv1.DataFrame) error {
+		err := send(f)
+		if err == nil && w.acceptance > 0 {
+			c.mu.Lock()
+			completedAt := c.clk.mono()
+			w.stream.acceptance.window = w.acceptance
+			w.stream.acceptance.deadline = completedAt + w.acceptance
+			c.mu.Unlock()
+		}
+		return err
+	})
+	w.done <- err
+	return err
 }

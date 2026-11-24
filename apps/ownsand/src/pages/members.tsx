@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
@@ -11,7 +11,7 @@ import {
   MemberService,
 } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useAuth } from "../auth.tsx";
 import { useOrg } from "../components/shell.tsx";
@@ -28,6 +28,12 @@ import {
 import { formatTime, labels } from "../format.ts";
 import { invitationLink } from "../invitation.ts";
 import { membersBoundary, useMembers } from "../members.ts";
+import {
+  FOLLOW_ALL_PAGES_OPTIONS,
+  boundaryOf,
+  uniqueRows,
+  useFollowAllPages,
+} from "../pagination.ts";
 import { can, canManageMember, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
 
@@ -58,6 +64,10 @@ export function MembersPage() {
   const leave = useMutation(MemberService.method.removeMember);
   const [removing, setRemoving] = useState<Member>();
   const [leaving, setLeaving] = useState(false);
+
+  if (members.terminalLoadMoreError && removing !== undefined) {
+    setRemoving(undefined);
+  }
 
   return (
     <>
@@ -179,10 +189,23 @@ function Invitations() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, MemberService);
-  const list = useQuery(MemberService.method.listInvitations, {
-    organizationId,
-    pageSize: 200,
-  });
+  const list = useInfiniteQuery(
+    MemberService.method.listInvitations,
+    { organizationId, pageSize: 200, pageToken: "" },
+    {
+      ...FOLLOW_ALL_PAGES_OPTIONS,
+      getNextPageParam: (last) => last.nextPageToken || undefined,
+    },
+  );
+  const pages = useFollowAllPages(list);
+  const pending = useMemo(
+    () =>
+      uniqueRows(
+        list.data?.pages.map((page) => page.invitations) ?? [],
+        (invitation) => invitation.invitationId,
+      ).filter((invitation) => invitation.state === InvitationState.PENDING),
+    [list.data],
+  );
   const create = useMutation(MemberService.method.createInvitation, {
     onSuccess: refresh,
   });
@@ -193,9 +216,9 @@ function Invitations() {
   const [inviteRole, setInviteRole] = useState(String(Role.MEMBER));
   const [link, setLink] = useState<string>();
   const [revoking, setRevoking] = useState<Invitation>();
-  const pending =
-    list.data?.invitations.filter((i) => i.state === InvitationState.PENDING) ??
-    [];
+  if (pages.terminalLoadMoreError && revoking !== undefined) {
+    setRevoking(undefined);
+  }
 
   return (
     <section className="section" aria-labelledby="invitations-title">
@@ -208,34 +231,42 @@ function Invitations() {
           Invite someone
         </Button>
       </div>
-      <QueryBoundary query={list} loading="Loading invitations">
+      <QueryBoundary
+        query={boundaryOf(list, pages)}
+        loading="Loading invitations"
+      >
         {() =>
-          pending.length === 0 ? (
+          pending.length === 0 && !pages.isIncomplete ? (
             <Empty title="No pending invitations" />
           ) : (
-            <ul className="list" aria-label="Pending invitations">
-              {pending.map((i) => (
-                <li key={i.invitationId} className="list-row">
-                  <div className="list-main">
-                    <span className="list-title">
-                      {labels.role[i.role]} invitation{" "}
-                      <code>{i.secretPrefix}…</code>
-                    </span>
-                    <span className="muted">
-                      Expires {formatTime(i.expireTime)}
-                    </span>
-                  </div>
-                  <Button
-                    variant={ButtonVariant.Secondary}
-                    size={ButtonSize.Small}
-                    aria-label={`Revoke ${labels.role[i.role]} invitation ${i.secretPrefix}`}
-                    onClick={() => setRevoking(i)}
-                  >
-                    Revoke
-                  </Button>
-                </li>
-              ))}
-            </ul>
+            <>
+              {pending.length > 0 ? (
+                <ul className="list" aria-label="Pending invitations">
+                  {pending.map((i) => (
+                    <li key={i.invitationId} className="list-row">
+                      <div className="list-main">
+                        <span className="list-title">
+                          {labels.role[i.role]} invitation{" "}
+                          <code>{i.secretPrefix}…</code>
+                        </span>
+                        <span className="muted">
+                          Expires {formatTime(i.expireTime)}
+                        </span>
+                      </div>
+                      <Button
+                        variant={ButtonVariant.Secondary}
+                        size={ButtonSize.Small}
+                        aria-label={`Revoke ${labels.role[i.role]} invitation ${i.secretPrefix}`}
+                        onClick={() => setRevoking(i)}
+                      >
+                        Revoke
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              <MorePagesNotice noun="pending invitations" pages={pages} />
+            </>
           )
         }
       </QueryBoundary>

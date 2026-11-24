@@ -4,6 +4,7 @@ package work
 
 import (
 	"context"
+	"time"
 
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -158,6 +159,9 @@ type Guest struct {
 	Request *Request // nil for a runner without a request
 	// Profile is the runner's profile, or nil when it was deleted.
 	Profile *profile.Profile
+	// SandboxMaxTTL is the stored creation-time TTL for an agent session
+	// at Start, or zero if it could not be read.
+	SandboxMaxTTL time.Duration
 }
 
 // Exec runs one command in the guest and waits for its result.

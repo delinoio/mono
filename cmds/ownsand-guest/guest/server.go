@@ -77,9 +77,15 @@ type Server struct {
 	execs  *execManager
 	reads  *readManager
 	writes *writeManager
-	// lock is the exclusive ownership of the state directory; Close
-	// releases it.
-	lock *stateLock
+	lock   *stateLock
+
+	closeOnce sync.Once
+	// writeMu guards admission and coordinates lock release between Close
+	// and the last writer. File operations run without holding writeMu.
+	writeMu      sync.Mutex
+	writesClosed bool
+	activeWrites int
+	readsFenced  bool
 }
 
 var _ ownsandv1connect.GuestServiceHandler = (*Server)(nil)
@@ -137,17 +143,53 @@ func New(cfg Config) (*Server, error) {
 	}, nil
 }
 
-// Close ends the read snapshot work and then releases the lock of the state
-// directory. Call it after Run returned; a replacement server on the same
-// directory then starts. Before the lock is released, Close makes further
-// writes of snapshot workers impossible: it waits for them for a bounded
-// time and fences any worker that is stuck in source I/O (see
-// readManager.close). It is safe to call more than once. The lock also ends
-// with the process.
+// Close stops admitting writes and fences read snapshot workers. Call it
+// after Run returns. If all writes and write sweeps have finished, Close
+// releases the state directory lock before returning. Otherwise the last
+// operation releases it when it finishes. Concurrent calls are safe.
 func (s *Server) Close() error {
-	s.reads.close(readCloseGrace)
-	s.lock.release()
+	s.closeOnce.Do(func() {
+		s.writeMu.Lock()
+		s.writesClosed = true
+		s.writeMu.Unlock()
+
+		s.reads.close(readCloseGrace)
+
+		s.writeMu.Lock()
+		s.readsFenced = true
+		if s.activeWrites == 0 {
+			s.lock.release()
+		}
+		s.writeMu.Unlock()
+	})
 	return nil
+}
+
+func (s *Server) beginWrite() bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.writesClosed {
+		return false
+	}
+	s.activeWrites++
+	return true
+}
+
+func (s *Server) endWrite() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.activeWrites--
+	if s.readsFenced && s.activeWrites == 0 {
+		s.lock.release()
+	}
+}
+
+func (s *Server) applyWrite(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteFileResponse, error) {
+	if !s.beginWrite() {
+		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "write: the helper is shutting down")
+	}
+	defer s.endWrite()
+	return s.writes.apply(req)
 }
 
 // GuestOS returns the GuestOs of the running operating system.
@@ -279,7 +321,7 @@ func (s *Server) handle(ctx context.Context, out *frameSender, f *ownsandv1.Data
 	case *ownsandv1.DataFrame_FileReadRequest:
 		s.serveRead(ctx, out, f, p.FileReadRequest)
 	case *ownsandv1.DataFrame_FileWriteChunk:
-		resp, err := s.writes.apply(p.FileWriteChunk)
+		resp, err := s.applyWrite(p.FileWriteChunk)
 		if err != nil {
 			s.sendError(out, f, err)
 			return
@@ -507,5 +549,9 @@ func (s *Server) Sweep() {
 	now := s.now()
 	s.execs.sweep(now)
 	s.reads.sweep(now)
+	if !s.beginWrite() {
+		return
+	}
+	defer s.endWrite()
 	s.writes.sweep(now)
 }

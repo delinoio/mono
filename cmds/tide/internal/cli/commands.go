@@ -577,6 +577,16 @@ func addIntegrationFlags(fs *flag.FlagSet, create bool) *integrationFlags {
 	return f
 }
 
+func (f *integrationFlags) validateVendorSettings(v tidev1.AgentVendor) error {
+	if f.poolName.set && v != tidev1.AgentVendor_AGENT_VENDOR_CURSOR {
+		return usageErr("--pool-name applies only to cursor")
+	}
+	if f.outpostName.set && v != tidev1.AgentVendor_AGENT_VENDOR_DEVIN {
+		return usageErr("--outpost-name applies only to devin")
+	}
+	return nil
+}
+
 // integrationSettings returns the settings oneof value for the vendor.
 func integrationSettings(v tidev1.AgentVendor, f *integrationFlags) any {
 	switch v {
@@ -641,6 +651,9 @@ func (a *app) integrationCreate(ctx context.Context, name string, args []string)
 	}
 	vendor, err := parseEnum("vendor", f.vendor.v, vendorValues)
 	if err != nil {
+		return err
+	}
+	if err := f.validateVendorSettings(vendor); err != nil {
 		return err
 	}
 	if f.name.v == "" {
@@ -744,6 +757,9 @@ func (a *app) integrationUpdate(ctx context.Context, name string, args []string)
 		return err
 	}
 	vendor := cur.Msg.GetIntegration().GetVendor()
+	if err := f.validateVendorSettings(vendor); err != nil {
+		return err
+	}
 	req := &tidev1.UpdateAgentIntegrationRequest{OrganizationId: org, AgentIntegrationId: rest[0], UpdateMask: &fieldmaskpb.FieldMask{}}
 	if f.name.set {
 		req.Name = f.name.v

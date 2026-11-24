@@ -4,6 +4,8 @@ package api_test
 
 import (
 	"context"
+	"encoding/base64"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
+	"github.com/delinoio/mono/servers/tide-api/internal/auth"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 )
 
@@ -166,6 +169,12 @@ func TestInvitationsAndMembers(t *testing.T) {
 	carol := env.User("carol")
 	_, err = carol.Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{InvitationSecret: "tdi_bad"}))
 	wantCode(t, "malformed secret", err, connect.CodeNotFound)
+	missing, err := auth.NewSecret(auth.SecretInvitation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = carol.Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{InvitationSecret: missing.Value}))
+	wantCode(t, "missing invitation", err, connect.CodeNotFound)
 	acc, err := carol.Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{InvitationSecret: secret}))
 	if err != nil || acc.Msg.GetMember().GetRole() != tidev1.Role_ROLE_MEMBER || acc.Msg.GetOrganization().GetOrganizationId() != org.ID {
 		t.Fatalf("accept: %v %v", acc, err)
@@ -183,6 +192,8 @@ func TestInvitationsAndMembers(t *testing.T) {
 	}
 	_, err = owner.Member.RevokeInvitation(ctx, connect.NewRequest(&tidev1.RevokeInvitationRequest{OrganizationId: org.ID, InvitationId: inv2.Msg.GetInvitation().GetInvitationId()}))
 	wantCode(t, "revoke twice", err, connect.CodeFailedPrecondition)
+	_, err = env.User("dave").Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{InvitationSecret: inv2.Msg.GetInvitationSecret()}))
+	wantCode(t, "revoked invitation", err, connect.CodeNotFound)
 	inv3, _ := owner.Member.CreateInvitation(ctx, connect.NewRequest(&tidev1.CreateInvitationRequest{OrganizationId: org.ID, Role: tidev1.Role_ROLE_MEMBER}))
 	env.Clock.Advance(7 * 24 * time.Hour)
 	_, err = env.User("erin").Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{InvitationSecret: inv3.Msg.GetInvitationSecret()}))
@@ -239,6 +250,120 @@ func TestInvitationsAndMembers(t *testing.T) {
 		if got := countAction(actions, a); got != want {
 			t.Errorf("%v events = %d, want %d", a, got, want)
 		}
+	}
+}
+
+func TestListInvitationsUsesOneCutoff(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	ctx := auth.WithPrincipal(context.Background(), auth.Principal{Kind: auth.PrincipalUser, UserID: org.Owner})
+	created, err := env.User(org.Owner).Member.CreateInvitation(ctx, connect.NewRequest(&tidev1.CreateInvitationRequest{
+		OrganizationId: org.ID, Role: tidev1.Role_ROLE_MEMBER,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv := created.Msg.GetInvitation()
+	expiry := inv.GetExpireTime().AsTime()
+	calls := 0
+	handler := api.MemberHandler{Service: &api.Service{
+		DB:     env.DB,
+		Logger: env.App.Service.Logger,
+		Now: func() time.Time {
+			calls++
+			if calls == 1 {
+				return expiry.Add(-time.Second)
+			}
+			return expiry
+		},
+	}}
+
+	resp, err := handler.ListInvitations(ctx, connect.NewRequest(&tidev1.ListInvitationsRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := resp.Msg.GetInvitations()
+	if len(got) != 1 || got[0].GetInvitationId() != inv.GetInvitationId() || got[0].GetState() != tidev1.InvitationState_INVITATION_STATE_PENDING {
+		t.Fatalf("before expiry, got %v, want %s pending", got, inv.GetInvitationId())
+	}
+	if calls != 1 {
+		t.Fatalf("clock calls for the first page = %d, want 1", calls)
+	}
+	resp, err = handler.ListInvitations(ctx, connect.NewRequest(&tidev1.ListInvitationsRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Msg.GetInvitations(); len(got) != 0 {
+		t.Fatalf("at expiry, got %v, want no invitations", got)
+	}
+}
+
+func TestListInvitationsPaginatesOnlyPendingInvitations(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	member := env.User(org.Owner).Member
+	var secrets []string
+	create := func() *tidev1.CreateInvitationResponse {
+		t.Helper()
+		resp, err := member.CreateInvitation(ctx, connect.NewRequest(&tidev1.CreateInvitationRequest{
+			OrganizationId: org.ID, Role: tidev1.Role_ROLE_MEMBER,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		secrets = append(secrets, resp.Msg.GetInvitationSecret())
+		return resp.Msg
+	}
+	create()
+	env.Clock.Advance(api.InvitationLifetime + time.Second)
+	first := create()
+	accepted := create()
+	if _, err := env.User("carol").Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{
+		InvitationSecret: accepted.GetInvitationSecret(),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	revoked := create()
+	if _, err := member.RevokeInvitation(ctx, connect.NewRequest(&tidev1.RevokeInvitationRequest{
+		OrganizationId: org.ID, InvitationId: revoked.GetInvitation().GetInvitationId(),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	second := create()
+	ids := []string{first.GetInvitation().GetInvitationId(), second.GetInvitation().GetInvitationId()}
+	slices.Sort(ids)
+
+	token := ""
+	for _, id := range ids {
+		resp, err := member.ListInvitations(ctx, connect.NewRequest(&tidev1.ListInvitationsRequest{
+			OrganizationId: org.ID, PageSize: 1, PageToken: token,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := resp.Msg.GetInvitations()
+		if len(got) != 1 || got[0].GetInvitationId() != id || got[0].GetState() != tidev1.InvitationState_INVITATION_STATE_PENDING {
+			t.Fatalf("page after %q, got %v, want %s pending", token, got, id)
+		}
+		for _, secret := range secrets {
+			if strings.Contains(resp.Msg.String(), secret) {
+				t.Fatal("list response contains an invitation secret")
+			}
+		}
+		token = resp.Msg.GetNextPageToken()
+		if want := base64.RawURLEncoding.EncodeToString([]byte("v1:" + id)); token != want {
+			t.Fatalf("page token = %q, want %q", token, want)
+		}
+	}
+	resp, err := member.ListInvitations(ctx, connect.NewRequest(&tidev1.ListInvitationsRequest{
+		OrganizationId: org.ID, PageSize: 1, PageToken: token,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Msg.GetInvitations()) != 0 || resp.Msg.GetNextPageToken() != "" {
+		t.Fatalf("last page returned %d invitations and token %q", len(resp.Msg.GetInvitations()), resp.Msg.GetNextPageToken())
 	}
 }
 

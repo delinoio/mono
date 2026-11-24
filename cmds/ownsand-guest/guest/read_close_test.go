@@ -61,12 +61,8 @@ func TestReadWorkerCannotCreateAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := newCloseTestServer(t, dir)
-	started := make(chan struct{}, 1)
-	release := make(chan struct{})
-	first.reads.openHook = func() {
-		started <- struct{}{}
-		<-release
-	}
+	hook, started, release := newReadPreparationGate(t)
+	first.reads.openHook = hook
 	const readID = "read-close-create"
 	e, err := first.reads.begin(readID, src)
 	if err != nil {
@@ -83,7 +79,7 @@ func TestReadWorkerCannotCreateAfterClose(t *testing.T) {
 	}
 
 	second := newCloseTestServer(t, dir)
-	close(release)
+	release()
 	waitClosed(t, e.ready)
 	first.reads.wg.Wait()
 	var op *opError
@@ -109,12 +105,8 @@ func TestReadCloseWaitsForWorkerWithinGrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := newCloseTestServer(t, dir)
-	started := make(chan struct{}, 1)
-	release := make(chan struct{})
-	srv.reads.openHook = func() {
-		started <- struct{}{}
-		<-release
-	}
+	hook, started, release := newReadPreparationGate(t)
+	srv.reads.openHook = hook
 	e, err := srv.reads.begin("read-close-wait", src)
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +114,7 @@ func TestReadCloseWaitsForWorkerWithinGrace(t *testing.T) {
 	waitStarted(t, started)
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		close(release)
+		release()
 	}()
 	if !srv.reads.close(readCloseGrace) {
 		t.Fatal("close gave up although the worker ended within the grace")
@@ -146,13 +138,9 @@ func TestReadLateCleanupKeepsReplacementSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := newCloseTestServer(t, dir)
-	started := make(chan struct{}, 1)
-	release := make(chan struct{})
+	hook, started, release := newReadPreparationGate(t)
 	// The worker pauses after its copy, so it already created its file.
-	first.reads.copyHook = func() {
-		started <- struct{}{}
-		<-release
-	}
+	first.reads.copyHook = hook
 	const readID = "read-retry"
 	e1, err := first.reads.begin(readID, src)
 	if err != nil {
@@ -178,7 +166,7 @@ func TestReadLateCleanupKeepsReplacementSnapshot(t *testing.T) {
 	if err := os.WriteFile(src, []byte("changed after the copy"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	close(release)
+	release()
 	waitClosed(t, e1.ready)
 	first.reads.wg.Wait()
 	if e1.err == nil {

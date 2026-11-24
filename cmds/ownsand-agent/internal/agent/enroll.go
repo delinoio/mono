@@ -38,16 +38,16 @@ const enrollLockWait = 45 * time.Second
 // after a lost response uses the same key, which the control plane accepts
 // with the same token until the token expires. The token is never written
 // or logged. On Linux the key and its directory entries are flushed to
-// stable storage first (store.SaveIdentityDurable), and a failure to do so
-// ends the enrollment before the call. The Enroll call has the deadline
-// cp.EnrollTimeout (30 seconds by default): a control plane that accepts the
-// call and never answers ends it with ErrEnrollTimeout, and the pending key
-// stays for a retry. An earlier deadline or cancellation of ctx ends the call
-// at once, with its own error.
+// stable storage before the call. A retry flushes the directory entries
+// again, and a flush failure ends enrollment before the call. The Enroll call
+// has the deadline cp.EnrollTimeout (30 seconds by default): a control plane
+// that accepts the call and never answers ends it with ErrEnrollTimeout, and
+// the pending key stays for a retry. An earlier deadline or cancellation of
+// ctx ends the call at once, with its own error.
 //
-// The whole sequence (the identity read, the pending key write, the Enroll
-// call and the completion write) runs under the enrollment lock of the
-// state directory, so two commands never use different pending keys for one
+// The whole sequence (the identity read, the pending key write or flush,
+// the Enroll call and the completion write) runs under the state directory's
+// enrollment lock, so two commands never use different pending keys for one
 // attempt and a later command cannot replace the key or the completed
 // identity of an earlier one. A command that finds the lock held waits up to
 // 45 seconds, reads the identity the holder left (a pending key that it then
@@ -69,7 +69,9 @@ func Enroll(ctx context.Context, st *store.Store, cp *cpclient.Client, token, na
 	case err == nil && id.DeviceID != "":
 		return nil, ErrAlreadyEnrolled
 	case err == nil:
-		// A pending key of an interrupted enrollment.
+		if err := st.SyncPendingIdentityDirectories(); err != nil {
+			return nil, err
+		}
 	case errors.Is(err, store.ErrNotFound):
 		_, seed, gerr := identity.Generate()
 		if gerr != nil {

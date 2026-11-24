@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 
 	"connectrpc.com/connect"
 )
@@ -38,6 +39,8 @@ const manifestVersion = 1
 type manifest struct {
 	Version int                      `json:"version"`
 	Files   map[string]manifestEntry `json:"files"`
+	// PathsValidated records that the SDK validated the UTF-8 of each path.
+	PathsValidated bool `json:"paths_validated,omitempty"`
 }
 
 // manifestEntry is one synced path. SHA256 is the hash of the file content,
@@ -150,13 +153,31 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 	return out, nil
 }
 
-// readLocalFile hashes one listed path. ok is false for a tracked path that
-// no longer exists locally (it then counts as deleted) or that is now a
-// directory.
+// readLocalFile hashes one listed path. Missing paths, directories, and paths
+// below a file or symbolic link are absent from the local file list.
 func readLocalFile(dir, rel, indexMode string) (localFile, bool, error) {
+	// Lstat follows symbolic links in parent components, so check each
+	// parent from the root outwards before looking up the final component.
+	for i := range rel {
+		if rel[i] != '/' {
+			continue
+		}
+		parent := filepath.Join(dir, filepath.FromSlash(rel[:i]))
+		info, err := os.Lstat(parent)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return localFile{}, false, nil
+		}
+		if err != nil {
+			return localFile{}, false, err
+		}
+		if info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return localFile{}, false, nil
+		}
+	}
+
 	full := filepath.Join(dir, filepath.FromSlash(rel))
 	info, err := os.Lstat(full)
-	if errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		return localFile{}, false, nil
 	}
 	if err != nil {

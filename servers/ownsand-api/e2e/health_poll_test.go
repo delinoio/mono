@@ -91,45 +91,76 @@ func TestPollHealthyReportsLastStatusOnTimeout(t *testing.T) {
 	}
 }
 
-// A server that answers on the probed port does not count when the probed
-// process exited: another process can hold a port that the process could
-// not bind.
-func TestPollHealthyWhileStopsWhenTheProcessExited(t *testing.T) {
+func TestPollReadyWhileSkipsTheProbeWhenTheProcessAlreadyExited(t *testing.T) {
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer srv.Close()
-	exited := make(chan struct{})
-	close(exited)
-
-	start := time.Now()
-	err := pollHealthyWhile(srv.URL, 10*time.Second, exited)
-	if !errors.Is(err, errProcessExited) {
-		t.Fatalf("pollHealthyWhile = %v, want errProcessExited", err)
-	}
-	if d := time.Since(start); d > 5*time.Second {
-		t.Fatalf("pollHealthyWhile took %s, want it to stop when the process exited", d)
-	}
-}
-
-// A 200 from another server on the address does not count when the probed
-// process exited, even though that answer arrives at once: the exit channel
-// is consulted before the 200 is accepted.
-func TestPollHealthyWhileIgnoresA200AfterTheProcessExited(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 	exited := make(chan struct{})
 	close(exited)
 
-	start := time.Now()
-	err := pollHealthyWhile(srv.URL, 10*time.Second, exited)
-	if !errors.Is(err, errProcessExited) {
-		t.Fatalf("pollHealthyWhile = %v, want errProcessExited", err)
+	if err := pollReadyWhile(srv.URL, 10*time.Second, exited, nil); !errors.Is(err, errProcessExited) {
+		t.Fatalf("pollReadyWhile = %v, want errProcessExited", err)
 	}
-	if d := time.Since(start); d > 5*time.Second {
-		t.Fatalf("pollHealthyWhile took %s, want it to stop when the process exited", d)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("calls = %d, want 0", got)
+	}
+}
+
+func TestPollReadyWhileCancelsAHungRequestOnProcessExit(t *testing.T) {
+	arrived := make(chan struct{})
+	canceled := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(arrived)
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	defer srv.Close()
+
+	exited := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- pollReadyWhile(srv.URL, 10*time.Second, exited, func() bool { return false })
+	}()
+
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the server")
+	}
+	close(exited)
+
+	timeout := time.After(5 * time.Second)
+	select {
+	case err := <-result:
+		if !errors.Is(err, errProcessExited) {
+			t.Fatalf("pollReadyWhile = %v, want errProcessExited", err)
+		}
+	case <-timeout:
+		t.Fatal("pollReadyWhile did not stop after the process exited")
+	}
+	select {
+	case <-canceled:
+	case <-timeout:
+		t.Fatal("the server did not observe request cancellation")
+	}
+}
+
+func TestPollReadyWhileRejectsA200WhenTheProcessExitsDuringTheOwnershipCheck(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	exited := make(chan struct{})
+	owned := func() bool {
+		close(exited)
+		return true
+	}
+	if err := pollReadyWhile(srv.URL, 10*time.Second, exited, owned); !errors.Is(err, errProcessExited) {
+		t.Fatalf("pollReadyWhile = %v, want errProcessExited", err)
 	}
 }
 

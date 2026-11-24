@@ -7,12 +7,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"path"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 
@@ -80,13 +82,16 @@ type SyncResult struct {
 //  2. The guest manifest <workspace_path>.tide-sync.json lists the synced
 //     paths with size, SHA-256 and mode; a missing or unreadable manifest
 //     counts as empty.
-//  3. New and changed files are uploaded; manifest paths that are no longer
+//  3. New and changed files are uploaded. Manifest paths that are no longer
 //     listed are deleted. Guest files that are not in the manifest stay.
+//     With an older manifest that lacks UTF-8 validation, sync leaves an
+//     absent path with U+FFFD on the guest and drops its entry with a warning.
 //  4. A changed file above 100 MiB or changed files above 2 GiB in total
 //     fail the sync before any upload (*LimitError).
-//  5. Paths that differ only in case (Windows and macOS guests) and paths
-//     that are not valid on Windows (Windows guests) fail the sync before
-//     any upload (*PathRuleError).
+//  5. Paths that are not valid UTF-8 (all guests), paths that differ only
+//     in case (Windows and macOS guests), and paths that are not valid on
+//     Windows (Windows guests) fail before the lock and any upload
+//     (*PathRuleError).
 //  6. The lock directory <workspace_path>.tide-sync.lock is created with one
 //     exec; an existing lock fails with ErrSyncLocked unless Force is set.
 //  7. The changed files go in one tar archive next to the workspace, which
@@ -117,6 +122,20 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Check UTF-8 before comparing names or reading the guest manifest.
+	paths := make([]string, 0, len(local.files))
+	var invalidUTF8 [][]string
+	for _, f := range local.files {
+		paths = append(paths, f.rel)
+		if !utf8.ValidString(f.rel) {
+			invalidUTF8 = append(invalidUTF8, []string{f.rel})
+		}
+	}
+	if len(invalidUTF8) > 0 {
+		return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleInvalidUTF8, Paths: invalidUTF8})
+	}
+
 	old, err := c.readManifest(ctx, s)
 	if err != nil {
 		return nil, err
@@ -126,11 +145,7 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Step 5: path rules for every local path.
-	paths := make([]string, 0, len(local.files))
-	for _, f := range local.files {
-		paths = append(paths, f.rel)
-	}
+	// The remaining path rules depend on the guest OS.
 	if osys == tidev1.GuestOs_GUEST_OS_WINDOWS || osys == tidev1.GuestOs_GUEST_OS_MACOS {
 		if groups := caseCollisions(paths); len(groups) > 0 {
 			return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleCaseCollision, Paths: groups})
@@ -189,7 +204,7 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	// differs from the first one.
 	if cur, err := c.readManifest(ctx, s); err != nil {
 		return nil, err
-	} else if !maps.Equal(cur.Files, old.Files) {
+	} else if cur.PathsValidated != old.PathsValidated || !maps.Equal(cur.Files, old.Files) {
 		c.logger.DebugContext(ctx, "tide sync manifest changed before the lock", "dev_session_id", s.GetDevSessionId())
 		if plan, err = planSync(local, cur); err != nil {
 			return nil, err
@@ -241,21 +256,28 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 			return nil, err
 		}
 	}
-	if len(deleted) > 0 {
-		list := guestSibling(s, ".tide-sync-"+syncID+".delete")
-		applyEnv[guestEnvDeletes] = list
-		cleanupEnv[guestEnvDeletes] = list
-		n, err := c.writeGuestFile(ctx, s, list, 0o644, bytes.NewReader(pathList(deleted, windows)), nil)
-		res.BytesSent += n
-		if err != nil {
-			return nil, err
-		}
+	strictDeletes := deleted
+	var replacedFiles []string
+	if !windows {
+		applyEnv[guestEnvReplaceFiles] = ""
+		strictDeletes, replacedFiles = splitSyncDeletions(deleted, changed)
 	}
-	if prunes := pruneDirs(deleted, changed); len(prunes) > 0 {
-		list := guestSibling(s, ".tide-sync-"+syncID+".prune")
-		applyEnv[guestEnvPrunes] = list
-		cleanupEnv[guestEnvPrunes] = list
-		n, err := c.writeGuestFile(ctx, s, list, 0o644, bytes.NewReader(pathList(prunes, windows)), nil)
+	for _, list := range []struct {
+		suffix string
+		env    string
+		paths  []string
+	}{
+		{".delete", guestEnvDeletes, strictDeletes},
+		{".replace", guestEnvReplaceFiles, replacedFiles},
+		{".prune", guestEnvPrunes, pruneDirs(deleted, changed)},
+	} {
+		if len(list.paths) == 0 {
+			continue
+		}
+		listPath := guestSibling(s, ".tide-sync-"+syncID+list.suffix)
+		applyEnv[list.env] = listPath
+		cleanupEnv[list.env] = listPath
+		n, err := c.writeGuestFile(ctx, s, listPath, 0o644, bytes.NewReader(pathList(list.paths, windows)), nil)
 		res.BytesSent += n
 		if err != nil {
 			return nil, err
@@ -280,20 +302,24 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	}
 
 	report(TransferProgress{Phase: TransferApplying, BytesDone: res.BytesSent, BytesTotal: res.BytesSent})
-	ar, err := c.runGuest(ctx, s, opApply, applyEnv)
-	if err != nil {
-		return nil, err
-	}
-	if ar.exitCode != 0 {
-		return nil, ar.failure(opApply)
-	}
-	failedLinks, warnings := linkOutcome(links, ar)
-	res.Warnings = append(res.Warnings, warnings...)
-	if ar.outputLost && len(links) > 0 {
-		c.logger.WarnContext(ctx, "tide sync apply output incomplete; links left out of the manifest", "dev_session_id", s.GetDevSessionId(), "links", len(links))
+	var failedLinks map[string]bool
+	if plan.hasFileChanges() {
+		ar, err := c.runGuest(ctx, s, opApply, applyEnv)
+		if err != nil {
+			return nil, err
+		}
+		if ar.exitCode != 0 {
+			return nil, ar.failure(opApply)
+		}
+		var warnings []string
+		failedLinks, warnings = linkOutcome(links, ar)
+		res.Warnings = append(res.Warnings, warnings...)
+		if ar.outputLost && len(links) > 0 {
+			c.logger.WarnContext(ctx, "tide sync apply output incomplete; links left out of the manifest", "dev_session_id", s.GetDevSessionId(), "links", len(links))
+		}
 	}
 
-	next := manifest{Version: manifestVersion, Files: map[string]manifestEntry{}}
+	next := manifest{Version: manifestVersion, Files: map[string]manifestEntry{}, PathsValidated: true}
 	for _, f := range local.files {
 		if failedLinks[f.rel] {
 			// Left out, so the next sync tries the link again.
@@ -310,6 +336,9 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	}
 	res.Uploaded = len(changed) - len(failedLinks)
 	res.Deleted = len(deleted)
+	for _, rel := range plan.ambiguousDeletes {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("%q: skipped deletion because an older SDK may have replaced invalid UTF-8 bytes when it recorded this path", rel))
+	}
 	succeeded = true
 
 	cr, err := c.runGuest(ctx, s, opCleanup, cleanupEnv)
@@ -374,13 +403,23 @@ func linkOutcome(links []localFile, r *guestResult) (map[string]bool, []string) 
 // syncPlan is what a sync changes in the guest for one manifest.
 type syncPlan struct {
 	// res holds the skipped counts and the submodules.
-	res          *SyncResult
-	changed      []localFile
-	deleted      []string
-	changedTotal int64
+	res              *SyncResult
+	changed          []localFile
+	deleted          []string
+	ambiguousDeletes []string
+	changedTotal     int64
 }
 
-func (p *syncPlan) empty() bool { return len(p.changed) == 0 && len(p.deleted) == 0 }
+func (p *syncPlan) hasFileChanges() bool { return len(p.changed) > 0 || len(p.deleted) > 0 }
+
+func (p *syncPlan) empty() bool { return !p.hasFileChanges() && len(p.ambiguousDeletes) == 0 }
+
+// ambiguousPath identifies entries from older clients that may have been
+// written by encoding/json with invalid bytes replaced by U+FFFD. Keep this
+// check as long as sync can read manifests from clients without validation.
+func (m manifest) ambiguousPath(rel string) bool {
+	return !m.PathsValidated && strings.ContainsRune(rel, utf8.RuneError)
+}
 
 // planSync compares the local files with the guest manifest old (steps 3
 // and 4): the new and changed files, the deleted manifest paths and the
@@ -390,7 +429,8 @@ func planSync(local *localList, old manifest) (*syncPlan, error) {
 	current := map[string]bool{}
 	for _, f := range local.files {
 		current[f.rel] = true
-		if prev, ok := old.Files[f.rel]; ok && prev == f.entry {
+		// Re-upload an ambiguous entry before claiming it as a validated path.
+		if prev, ok := old.Files[f.rel]; ok && prev == f.entry && !old.ambiguousPath(f.rel) {
 			plan.res.Skipped++
 			continue
 		}
@@ -404,11 +444,17 @@ func planSync(local *localList, old manifest) (*syncPlan, error) {
 		skippedDirs[d] = true
 	}
 	for rel := range old.Files {
-		if !current[rel] && !skippedDirs[rel] {
+		if current[rel] || skippedDirs[rel] {
+			continue
+		}
+		if old.ambiguousPath(rel) {
+			plan.ambiguousDeletes = append(plan.ambiguousDeletes, rel)
+		} else {
 			plan.deleted = append(plan.deleted, rel)
 		}
 	}
 	sort.Strings(plan.deleted)
+	sort.Strings(plan.ambiguousDeletes)
 
 	var big []PathSize
 	for _, f := range plan.changed {
@@ -444,6 +490,29 @@ func pathList(paths []string, windows bool) []byte {
 		}
 	}
 	return b.Bytes()
+}
+
+// splitSyncDeletions separates former files that the POSIX archive needs
+// as directories. If the manifest write failed after apply, those paths may
+// already be directories and must stay in place when the SDK retries.
+func splitSyncDeletions(deleted []string, changed []localFile) (strict, replacedFiles []string) {
+	if len(deleted) == 0 || len(changed) == 0 {
+		return deleted, nil
+	}
+	parents := map[string]bool{}
+	for _, f := range changed {
+		for dir := path.Dir(f.rel); dir != "." && !parents[dir]; dir = path.Dir(dir) {
+			parents[dir] = true
+		}
+	}
+	for _, rel := range deleted {
+		if parents[rel] {
+			replacedFiles = append(replacedFiles, rel)
+		} else {
+			strict = append(strict, rel)
+		}
+	}
+	return strict, replacedFiles
 }
 
 // pruneDirs returns the guest directories that the apply command removes

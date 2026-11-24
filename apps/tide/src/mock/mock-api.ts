@@ -93,7 +93,12 @@ import {
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/tide-protos/v1/work_pb";
-import { TERMINAL_REQUEST_STATES, TERMINAL_RUNNER_STATES } from "../format.ts";
+import {
+  compareTimestamps,
+  TERMINAL_REQUEST_STATES,
+  TERMINAL_RUNNER_STATES,
+} from "../format.ts";
+import { compareQueueOrder } from "../queue.ts";
 import { uuidV7 } from "../uuid.ts";
 
 /**
@@ -229,7 +234,10 @@ function profile(
   return p;
 }
 
-function seed(userId: string): Map<string, OrgState> {
+function seed(
+  userId: string,
+  runnerProfileCount: number,
+): Map<string, OrgState> {
   const orgs = new Map<string, OrgState>();
 
   const acme = emptyOrg(MOCK_IDS.acme, "Acme Robotics");
@@ -308,16 +316,16 @@ function seed(userId: string): Map<string, OrgState> {
       updateTime: ts(-6 * 86400),
     }),
   );
+  const linuxBuild = profile(MOCK_IDS.acme, {
+    runnerProfileId: MOCK_IDS.linuxProfile,
+    name: "linux-build",
+    workloadKind: WorkloadKind.GITHUB_JOB,
+    guestOs: GuestOs.LINUX,
+    source: { case: "baseImage", value: GuestOs.LINUX },
+    priority: Priority.HIGH,
+    warmCount: 1,
+  });
   acme.profiles.push(
-    profile(MOCK_IDS.acme, {
-      runnerProfileId: MOCK_IDS.linuxProfile,
-      name: "linux-build",
-      workloadKind: WorkloadKind.GITHUB_JOB,
-      guestOs: GuestOs.LINUX,
-      source: { case: "baseImage", value: GuestOs.LINUX },
-      priority: Priority.HIGH,
-      warmCount: 1,
-    }),
     profile(MOCK_IDS.acme, {
       runnerProfileId: MOCK_IDS.codexProfile,
       name: "codex-linux",
@@ -341,6 +349,23 @@ function seed(userId: string): Map<string, OrgState> {
       priority: Priority.NORMAL,
     }),
   );
+  if (runnerProfileCount > 3) {
+    acme.profiles.push(
+      ...Array.from({ length: runnerProfileCount - 3 }, (_, index) =>
+        profile(MOCK_IDS.acme, {
+          runnerProfileId: uuidV7(),
+          name: `fixture-linux-${index + 1}`,
+          workloadKind: WorkloadKind.GITHUB_JOB,
+          guestOs: GuestOs.LINUX,
+          source: { case: "baseImage", value: GuestOs.LINUX },
+          priority: Priority.NORMAL,
+        }),
+      ),
+      linuxBuild,
+    );
+  } else {
+    acme.profiles.unshift(linuxBuild);
+  }
   acme.requests.push(
     create(RequestSchema, {
       requestId: MOCK_IDS.queuedJob,
@@ -651,6 +676,7 @@ function seed(userId: string): Map<string, OrgState> {
 function page<T>(
   items: readonly T[],
   req: { pageSize: number; pageToken: string },
+  continueAfterFullPage = false,
 ): { items: T[]; nextPageToken: string } {
   if (req.pageSize < 0 || req.pageSize > 200) {
     throw new ConnectError(
@@ -664,7 +690,10 @@ function page<T>(
     throw new ConnectError("invalid page_token", Code.InvalidArgument);
   }
   const slice = items.slice(start, start + size);
-  const next = start + size < items.length ? String(start + size) : "";
+  const hasNextPage = continueAfterFullPage
+    ? slice.length === size
+    : start + size < items.length;
+  const next = hasNextPage ? String(start + size) : "";
   return { items: slice, nextPageToken: next };
 }
 
@@ -675,6 +704,8 @@ function hasPath(mask: FieldMask | undefined, path: string): boolean {
 export interface MockTransportOptions {
   /** The signed-in user. Default: `MOCK_USER`. */
   userId?: string;
+  /** The Acme runner profile count. Larger lists put linux-build last. */
+  runnerProfileCount?: number;
   /**
    * Ends each WatchQueue stream after its snapshot and this many
    * milliseconds, like the control plane before 14 minutes. Default: the
@@ -692,9 +723,12 @@ export function createMockTransport(
   options: MockTransportOptions = {},
 ): Transport {
   const userId = options.userId ?? MOCK_USER;
-  const orgs = seed(userId);
+  const orgs = seed(userId, options.runnerProfileCount ?? 3);
   const watchers = new Map<string, Set<Watcher>>();
-  const issuedStates = new Map<string, string>();
+  const issuedStates = new Map<
+    string,
+    { organizationId: string; expiresAtMs: number }
+  >();
 
   const membership = (orgId: string): { org: OrgState; role: Role } => {
     const org = orgs.get(orgId);
@@ -1170,10 +1204,14 @@ export function createMockTransport(
         const { role } = membership(req.organizationId);
         requireAdmin(role);
         const state = secret("state");
-        issuedStates.set(state, req.organizationId);
+        const expiresAtMs = now() + 600_000;
+        issuedStates.set(state, {
+          organizationId: req.organizationId,
+          expiresAtMs,
+        });
         return {
           url: `https://github.com/apps/tide/installations/new?state=${encodeURIComponent(state)}`,
-          expireTime: ts(600),
+          expireTime: timestampFromMs(expiresAtMs),
         };
       },
       linkGitHubInstallation(req) {
@@ -1184,11 +1222,14 @@ export function createMockTransport(
             "code and state are required",
             Code.InvalidArgument,
           );
-        // The mock accepts the state "mock-state" for the development server
-        // and the e2e suite, and every state that it issued for this
-        // organization. Each state is single-use.
+        // The development server and the e2e suite can use the fixed
+        // "mock-state" fixture. Issued states are single-use.
         const issued = issuedStates.get(req.state);
-        if (req.state !== "mock-state" && issued !== req.organizationId)
+        if (
+          req.state !== "mock-state" &&
+          (issued?.organizationId !== req.organizationId ||
+            now() >= issued.expiresAtMs)
+        )
           throw new ConnectError(
             "the installation state is not valid or has expired",
             Code.FailedPrecondition,
@@ -1310,7 +1351,7 @@ export function createMockTransport(
           );
         if (org.integrations.some((i) => i.name === name))
           throw new ConnectError(
-            "an integration with this name exists",
+            "an agent integration with this name exists",
             Code.AlreadyExists,
           );
         if (req.vendor === AgentVendor.UNSPECIFIED)
@@ -1352,18 +1393,32 @@ export function createMockTransport(
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
         const i = findIntegration(org, req.agentIntegrationId);
+        let name = i.name;
         if (hasPath(req.updateMask, "name")) {
-          const name = req.name.trim();
+          name = req.name.trim();
           if (name === "" || name.length > 64)
             throw new ConnectError(
               "name must have 1 to 64 characters",
               Code.InvalidArgument,
             );
-          i.name = name;
+          if (
+            org.integrations.some((other) => other !== i && other.name === name)
+          )
+            throw new ConnectError(
+              "an agent integration with this name exists",
+              Code.AlreadyExists,
+            );
         }
-        if (hasPath(req.updateMask, "settings")) i.settings = req.settings;
-        if (hasPath(req.updateMask, "credentials")) {
-          i.credentials = credentialStates(i.vendor, i.credentials, req);
+        const settings = hasPath(req.updateMask, "settings")
+          ? req.settings
+          : i.settings;
+        const replaceCredentials = hasPath(req.updateMask, "credentials");
+        const credentials = replaceCredentials
+          ? credentialStates(i.vendor, i.credentials, req)
+          : i.credentials;
+
+        Object.assign(i, { name, settings, credentials });
+        if (replaceCredentials) {
           audit(
             org,
             AuditAction.AGENT_INTEGRATION_CREDENTIALS_REPLACED,
@@ -1451,7 +1506,7 @@ export function createMockTransport(
             req.workloadKind === WorkloadKind.UNSPECIFIED ||
             p.workloadKind === req.workloadKind,
         );
-        const p = page(items, req);
+        const p = page(items, req, true);
         return { profiles: p.items, nextPageToken: p.nextPageToken };
       },
       updateRunnerProfile(req) {
@@ -1520,6 +1575,17 @@ export function createMockTransport(
           }
         }
         validateProfile(next);
+        if (
+          org.profiles.some(
+            (other) =>
+              other.runnerProfileId !== p.runnerProfileId &&
+              other.name === next.name,
+          )
+        )
+          throw new ConnectError(
+            "a runner profile with this name exists",
+            Code.AlreadyExists,
+          );
         if (next.workloadKind === WorkloadKind.GITHUB_JOB)
           next.githubLabel = `tide-${next.name}`;
         next.updateTime = ts();
@@ -1570,13 +1636,19 @@ export function createMockTransport(
     router.service(WorkService, {
       listRequests(req) {
         const { org } = membership(req.organizationId);
-        const active = org.requests.filter(
-          (r) => !TERMINAL_REQUEST_STATES.has(r.state),
-        );
-        const ended = org.requests.filter((r) =>
-          TERMINAL_REQUEST_STATES.has(r.state),
-        );
-        const items = [...active, ...(req.includeEnded ? ended : [])].filter(
+        const active = org.requests
+          .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
+          .sort(compareQueueOrder);
+        const ended = req.includeEnded
+          ? org.requests
+              .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
+              .sort(
+                (a, b) =>
+                  compareTimestamps(b.endedAt, a.endedAt) ||
+                  a.requestId.localeCompare(b.requestId),
+              )
+          : [];
+        const items = [...active, ...ended].filter(
           (r) =>
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
@@ -1897,7 +1969,12 @@ export function createMockTransport(
     router.service(AuditService, {
       listAuditEvents(req) {
         const { org } = membership(req.organizationId);
-        const p = page(org.audit, req);
+        const events = org.audit.toSorted(
+          (a, b) =>
+            compareTimestamps(b.createTime, a.createTime) ||
+            b.auditEventId.localeCompare(a.auditEventId),
+        );
+        const p = page(events, req);
         return { events: p.items, nextPageToken: p.nextPageToken };
       },
     });

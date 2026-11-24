@@ -181,6 +181,7 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 		return err
 	}
 	cursor := ""
+	listedPending := make(map[string]struct{})
 	for {
 		q := url.Values{"outpost": {outpost}, "phase": {"pending"}, "first": {"200"}}
 		if cursor != "" {
@@ -190,8 +191,23 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 		if err := c.Do(ctx, "list_queue", http.MethodGet, "/opbeta/outposts/devins", q, nil, &page); err != nil {
 			return err
 		}
+		stalled := page.HasNextPage && (page.Cursor == "" || page.Cursor == cursor)
 		for i := range page.Items {
-			v.handle(ctx, w, c, outpost, "MODIFIED", &page.Items[i])
+			e := &page.Items[i]
+			if e.Status.Phase == "pending" && e.matchesOutpost(outpost) {
+				sid := e.Metadata.SessionID
+				// A stalled page can repeat pending entries that tide already saw.
+				if _, listed := listedPending[sid]; stalled && listed {
+					continue
+				}
+				listedPending[sid] = struct{}{}
+			}
+			v.handle(ctx, w, c, outpost, "MODIFIED", e)
+		}
+		if stalled {
+			w.Logger.WarnContext(ctx, "devin_queue_pagination_stalled", slog.String("outpost_id", outpost),
+				slog.Bool("request_cursor_present", cursor != ""), slog.Bool("response_cursor_present", page.Cursor != ""))
+			break
 		}
 		if page.Cursor != "" {
 			cursor = page.Cursor
@@ -219,6 +235,10 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 	return err
 }
 
+func (e *Entry) matchesOutpost(outpost string) bool {
+	return e.Metadata.OutpostID == "" || e.Metadata.OutpostID == outpost
+}
+
 // handle applies one queue entry state (at-least-once, so idempotent):
 //
 //   - a pending entry is admitted (claimed, or claimed again with the same
@@ -228,7 +248,7 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 //   - an entry that another acceptor claimed, or a DELETED entry, ends a
 //     QUEUED tide request with CANCELED_BY_SOURCE.
 func (v *Vendor) handle(ctx context.Context, w *agent.Watch, c *vendorhttp.Client, outpost, typ string, e *Entry) {
-	if e.Metadata.OutpostID != "" && e.Metadata.OutpostID != outpost {
+	if !e.matchesOutpost(outpost) {
 		return
 	}
 	sid := e.Metadata.SessionID

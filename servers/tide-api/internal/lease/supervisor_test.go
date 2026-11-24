@@ -62,7 +62,7 @@ func TestSupervisorStartStop(t *testing.T) {
 func TestSupervisorWithLease(t *testing.T) {
 	database := dbtest.New(t)
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	l := &Lease{DB: database, InstanceID: "a", Now: time.Now, Logger: logger, renewEvery: 20 * time.Millisecond, poll: 5 * time.Millisecond}
+	l := &Lease{DB: database, InstanceID: "a", Logger: logger, renewEvery: 20 * time.Millisecond, poll: 5 * time.Millisecond}
 	s := &Supervisor{Logger: logger}
 	started := make(chan struct{}, 1)
 	var running atomic.Bool

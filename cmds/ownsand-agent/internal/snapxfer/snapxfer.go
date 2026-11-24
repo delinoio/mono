@@ -20,7 +20,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 
 	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -235,12 +234,21 @@ func (t *Transfer) Import(ctx context.Context, snapshotID string, parts []*ownsa
 		return err
 	}
 	staging := contentDir + ".importing"
-	os.RemoveAll(staging)
+	if err := fsutil.RemoveAll(staging); err != nil {
+		return fmt.Errorf("snapxfer: remove stale import staging: %w", err)
+	}
+	renamed := false
+	defer func() {
+		if !renamed {
+			if err := fsutil.RemoveAll(staging); err != nil {
+				t.Logger.Error("snapshot import staging cleanup failed", "snapshot_id", snapshotID, "error", err)
+			}
+		}
+	}()
 	if err := os.MkdirAll(staging, 0o700); err != nil {
 		return err
 	}
 	if err := fsutil.ReadTarContext(ctx, tmp, staging); err != nil {
-		os.RemoveAll(staging)
 		return fmt.Errorf("snapxfer: extract snapshot: %w", err)
 	}
 	if t.afterExtract != nil {
@@ -248,17 +256,12 @@ func (t *Transfer) Import(ctx context.Context, snapshotID string, parts []*ownsa
 	}
 	// The last checkpoint before the content becomes visible.
 	if err := ctx.Err(); err != nil {
-		os.RemoveAll(staging)
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(contentDir), 0o700); err != nil {
-		os.RemoveAll(staging)
 		return err
 	}
 	if err := os.Rename(staging, contentDir); err != nil {
-		os.RemoveAll(staging)
 		return err
 	}
+	renamed = true
 	return nil
 }
 

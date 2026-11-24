@@ -10,12 +10,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
@@ -41,6 +43,11 @@ type claudeWorld struct {
 
 func newClaudeWorld(t *testing.T, guest tidev1.GuestOs, expectedSpawn time.Duration) *claudeWorld {
 	t.Helper()
+	return newClaudeWorldWithProfile(t, agentProfileProto("claude-agents", "", guest, time.Hour), expectedSpawn)
+}
+
+func newClaudeWorldWithProfile(t *testing.T, profile *tidev1.RunnerProfile, expectedSpawn time.Duration) *claudeWorld {
+	t.Helper()
 	orch := claudefake.New(t)
 	w := newAgentWorld(t, layers.Options{Claude: claude.Options{Start: orch.Start, HookPath: claudeHookPath, ExpectedSpawn: expectedSpawn,
 		StopTimeout: time.Second}})
@@ -50,7 +57,8 @@ func newClaudeWorld(t *testing.T, guest tidev1.GuestOs, expectedSpawn time.Durat
 		Settings:    &tidev1.CreateAgentIntegrationRequest_ClaudeCode{ClaudeCode: &tidev1.ClaudeCodeSettings{}},
 		Credentials: &tidev1.CreateAgentIntegrationRequest_ClaudeCodeCredentials{ClaudeCodeCredentials: &tidev1.ClaudeCodeCredentials{EnvironmentKey: claudeEnvKey}},
 	})
-	cw.profileID = w.createProfile(t, agentProfileProto("claude-agents", cw.integrationID, guest, time.Hour))
+	profile.AgentIntegrationId = cw.integrationID
+	cw.profileID = w.createProfile(t, profile)
 	cw.proc(t)
 	return cw
 }
@@ -196,6 +204,82 @@ func TestClaudeSessionLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(logs, `"msg":"claude_spawn_request"`) || !strings.Contains(logs, `"result":"duplicate"`) {
 		t.Fatal("spawn requests are not logged")
+	}
+}
+
+func TestClaudeRunnerStoredTTL(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		profileTTL time.Duration
+		elapsed    time.Duration
+		corrupt    bool
+	}{
+		{name: "raised profile TTL", profileTTL: 8 * time.Hour},
+		{name: "lowered profile TTL", profileTTL: 30 * time.Minute},
+		{name: "under a minute away", profileTTL: 8 * time.Hour, elapsed: 54*time.Minute + time.Second},
+		{name: "corrupt create request", profileTTL: 8 * time.Hour, corrupt: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			profile := agentProfileProto("claude-agents", "", tidev1.GuestOs_GUEST_OS_LINUX, time.Hour)
+			profile.WarmCount = 1
+			profile.IdleTtl = durationpb.New(15 * time.Minute)
+			profile.MaxTtl = durationpb.New(time.Hour)
+			w := newClaudeWorldWithProfile(t, profile, 0)
+			user := w.env.User(w.org.Admin)
+			var warm *tidev1.Runner
+			eventually(t, "one warm runner", func() bool {
+				resp, err := user.Work.ListRunners(ctx, connect.NewRequest(&tidev1.ListRunnersRequest{
+					OrganizationId: w.org.ID, RunnerProfileId: w.profileID,
+					States: []tidev1.RunnerState{tidev1.RunnerState_RUNNER_STATE_WARM},
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if runners := resp.Msg.GetRunners(); len(runners) == 1 {
+					warm = runners[0]
+					return true
+				}
+				return false
+			})
+			if _, err := user.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+				OrganizationId: w.org.ID, RunnerProfileId: w.profileID,
+				Profile: &tidev1.RunnerProfile{MaxTtl: durationpb.New(tc.profileTTL)}, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"max_ttl"}},
+			})); err != nil {
+				t.Fatal(err)
+			}
+			if tc.corrupt {
+				if _, err := w.env.DB.Pool.Exec(ctx, "UPDATE runners SET create_request = $2 WHERE runner_id = $1", warm.GetRunnerId(), []byte{0xff}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w.env.Clock.Advance(tc.elapsed)
+			if code, stderr := w.proc(t).Spawn(claudefake.Spawn{OrderID: "order-ttl", SessionID: "session_ttl", WorkOrder: claudeWorkOrder}); code != 0 {
+				t.Fatalf("spawn exited %d: %s", code, stderr)
+			}
+			req := w.requestBySource(t, "order-ttl")
+			req = w.waitRequest(t, req.GetRequestId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+			if req.GetRunnerId() != warm.GetRunnerId() {
+				t.Fatalf("request got runner %s, want warm runner %s", req.GetRunnerId(), warm.GetRunnerId())
+			}
+			script := w.guest.startScript(warm.GetOwnsandSandboxId())
+			if script == "" {
+				t.Fatal("no runner start script")
+			}
+			if tc.corrupt || tc.elapsed > 0 {
+				if strings.Contains(script, "'--retire-at'") {
+					t.Errorf("unexpected retirement argument in %s", script)
+				}
+			} else {
+				retireAt := strconv.FormatInt(warm.GetCreatedAt().AsTime().Add(55*time.Minute).Unix(), 10)
+				if !strings.Contains(script, "'--retire-at' '"+retireAt+"'") {
+					t.Errorf("want --retire-at %s in %s", retireAt, script)
+				}
+			}
+			if tc.corrupt && !strings.Contains(w.env.Logs.String(), "runner_create_request_load_failed") {
+				t.Error("no warning for corrupt create request")
+			}
+		})
 	}
 }
 
@@ -363,7 +447,8 @@ func TestClaudeOrganizationDeletion(t *testing.T) {
 // TestClaudeRealProcesses runs the production path with real processes: a
 // shell script in place of claude starts the tide-api binary through the
 // spawn-runner link in its hooks directory with only the documented hook
-// variables, and the hook stores the request over the socket and exits 0.
+// variables. The hooks store requests over the socket and exit 0 during
+// the normal run and after the orchestrator receives SIGTERM.
 func TestClaudeRealProcesses(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the tide-api binary")
@@ -381,10 +466,13 @@ while [ $# -gt 0 ]; do
   shift
 done
 printf '%s' '`+claudeWorkOrder+`' > '`+scratch+`/wo'
-env -i PATH=/usr/bin:/bin CLAUDE_RUNNER_ORDER_ID=order-real CLAUDE_RUNNER_SESSION_ID=session_real \
-  CLAUDE_RUNNER_WORK_ORDER_FILE='`+scratch+`/wo' "$hooks/spawn-runner" 2>'`+scratch+`/stderr'
-echo $? > '`+scratch+`/code'
-trap 'exit 0' TERM
+spawn() {
+  env -i PATH=/usr/bin:/bin CLAUDE_RUNNER_ORDER_ID="$1" CLAUDE_RUNNER_SESSION_ID=session_real \
+    CLAUDE_RUNNER_WORK_ORDER_FILE='`+scratch+`/wo' "$hooks/spawn-runner" 2>"`+scratch+`/$2.stderr"
+  echo $? > "`+scratch+`/$2.code"
+}
+trap 'spawn order-drain drain; exit 0' TERM
+spawn order-real normal
 while :; do sleep 0.05; done
 `), 0o755); err != nil {
 		t.Fatal(err)
@@ -400,14 +488,30 @@ while :; do sleep 0.05; done
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
 	})
 	w.createProfile(t, agentProfileProto("claude-agents", id, tidev1.GuestOs_GUEST_OS_LINUX, time.Hour))
-	eventually(t, "the hook exit code", func() bool {
-		b, err := os.ReadFile(filepath.Join(scratch, "code"))
-		return err == nil && strings.TrimSpace(string(b)) != ""
-	})
-	code, _ := os.ReadFile(filepath.Join(scratch, "code"))
-	stderr, _ := os.ReadFile(filepath.Join(scratch, "stderr"))
-	if strings.TrimSpace(string(code)) != "0" {
-		t.Fatalf("hook exit %s: %s", code, stderr)
+	checkHook := func(phase, order string) {
+		t.Helper()
+		var code string
+		eventually(t, "the "+phase+" hook exit code", func() bool {
+			b, err := os.ReadFile(filepath.Join(scratch, phase+".code"))
+			code = strings.TrimSpace(string(b))
+			return err == nil && code != ""
+		})
+		if code != "0" {
+			stderr, _ := os.ReadFile(filepath.Join(scratch, phase+".stderr"))
+			t.Fatalf("%s hook exit %s: %s", phase, code, stderr)
+		}
+		w.requestBySource(t, order)
 	}
-	w.requestBySource(t, "order-real")
+	checkHook("normal", "order-real")
+	// Rotating the credential stops the orchestrator while the profile still
+	// serves requests, so a hook invoked during the drain can store its order.
+	w.env.Clock.Advance(time.Second)
+	if _, err := w.env.User(w.org.Admin).Integration.UpdateAgentIntegration(t.Context(), connect.NewRequest(&tidev1.UpdateAgentIntegrationRequest{
+		OrganizationId: w.org.ID, AgentIntegrationId: id,
+		Credentials: &tidev1.UpdateAgentIntegrationRequest_ClaudeCodeCredentials{ClaudeCodeCredentials: &tidev1.ClaudeCodeCredentials{EnvironmentKey: "sk-ant-new-key"}},
+		UpdateMask:  &fieldmaskpb.FieldMask{Paths: []string{"credentials"}},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	checkHook("drain", "order-drain")
 }
