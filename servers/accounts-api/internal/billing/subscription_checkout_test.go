@@ -5,10 +5,14 @@ package billing
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
+	"github.com/delinoio/mono/servers/accounts-api/internal/paddle/paddletest"
 )
 
 // startCheckout runs StartSubscription in its own transaction, as the RPC
@@ -81,8 +85,6 @@ func TestStartSubscriptionRejectsAnUnusableTransaction(t *testing.T) {
 	}
 }
 
-// A valid transaction is stored and returned again while the subscription is
-// pending, without another Paddle call.
 func TestStartSubscriptionReusesThePendingCheckout(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
@@ -91,15 +93,111 @@ func TestStartSubscriptionReusesThePendingCheckout(t *testing.T) {
 	if err != nil || first == "" {
 		t.Fatalf("first start = %q, %v", first, err)
 	}
-	second, err := f.startCheckout(acct)
-	if err != nil || second != first {
-		t.Fatalf("second start = %q, %v; want %q", second, err, first)
+	for _, status := range []string{paddle.TransactionStatusDraft, paddle.TransactionStatusReady, paddle.TransactionStatusBilled} {
+		t.Run(status, func(t *testing.T) {
+			f.paddle.SetTransactionStatus(first, status)
+			id, err := f.startCheckout(acct)
+			if err != nil || id != first {
+				t.Fatalf("repeat start = %q, %v, want %q", id, err, first)
+			}
+		})
 	}
 	if n := f.createTransactionRequests(); n != 1 {
 		t.Fatalf("create requests = %d, want 1", n)
 	}
 	if n := f.checkoutRows(acct); n != 1 {
 		t.Fatalf("checkout rows = %d, want 1", n)
+	}
+}
+
+func TestStartSubscriptionReplacesMissingCheckout(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	first, err := f.startCheckout(acct)
+	if err != nil || first == "" {
+		t.Fatalf("first start = %q, %v", first, err)
+	}
+	f.paddle.Fail("GET /transactions/"+first, &paddletest.Failure{Status: http.StatusNotFound, Code: paddle.CodeNotFound})
+
+	replacement, err := f.startCheckout(acct)
+	if err != nil || replacement == "" || replacement == first {
+		t.Fatalf("replacement start = %q, %v, want a new checkout", replacement, err)
+	}
+	sub, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if err != nil || sub.Status != SubscriptionPending || sub.CheckoutTransactionID != replacement {
+		t.Fatalf("subscription = %+v, %v, want pending checkout %q", sub, err, replacement)
+	}
+	if n := f.createTransactionRequests(); n != 2 {
+		t.Fatalf("create requests = %d, want 2", n)
+	}
+	if n := f.checkoutRows(acct); n != 2 {
+		t.Fatalf("checkout rows = %d, want 2", n)
+	}
+}
+
+func TestStartSubscriptionPreservesUnconfirmedCheckout(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{"provider unavailable", `{"error":{"code":"unavailable"}}`, http.StatusServiceUnavailable},
+		{"wrong error code on 404", `{"error":{"code":"route_not_found"}}`, http.StatusNotFound},
+		{"empty 404", "Not Found", http.StatusNotFound},
+		{"malformed response", "{", http.StatusOK},
+		{"missing ID", `{"data":{"status":"canceled"}}`, http.StatusOK},
+		{"mismatched canceled ID", `{"data":{"id":"txn_other","status":"canceled"}}`, http.StatusOK},
+		{"missing status", `{"data":{"id":"{id}"}}`, http.StatusOK},
+		{"unknown status", `{"data":{"id":"{id}","status":"unknown","collection_mode":"automatic"}}`, http.StatusOK},
+		{"missing collection mode", `{"data":{"id":"{id}","status":"draft"}}`, http.StatusOK},
+		{"manual collection", `{"data":{"id":"{id}","status":"draft","collection_mode":"manual"}}`, http.StatusOK},
+		{"paid", `{"data":{"id":"{id}","status":"paid","collection_mode":"automatic"}}`, http.StatusOK},
+		{"completed", `{"data":{"id":"{id}","status":"completed","collection_mode":"automatic"}}`, http.StatusOK},
+		{"past due transaction", `{"data":{"id":"{id}","status":"past_due","collection_mode":"automatic"}}`, http.StatusOK},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			first, err := f.startCheckout(acct)
+			if err != nil || first == "" {
+				t.Fatalf("first start = %q, %v", first, err)
+			}
+			f.paddle.Respond("GET /transactions/"+first, tt.status, strings.ReplaceAll(tt.body, "{id}", first))
+
+			id, err := f.startCheckout(acct)
+			if id != "" || connect.CodeOf(err) != connect.CodeUnavailable {
+				t.Fatalf("repeat start = %q, %v, want unavailable", id, err)
+			}
+			sub, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+			if err != nil || sub.Status != SubscriptionPending || sub.CheckoutTransactionID != first {
+				t.Fatalf("subscription = %+v, %v, want unchanged pending checkout %q", sub, err, first)
+			}
+			if n := f.createTransactionRequests(); n != 1 {
+				t.Fatalf("create requests = %d, want 1", n)
+			}
+			if n := f.checkoutRows(acct); n != 1 {
+				t.Fatalf("checkout rows = %d, want 1", n)
+			}
+		})
+	}
+}
+
+func TestStartSubscriptionRejectsExistingSubscription(t *testing.T) {
+	for _, status := range []SubscriptionStatus{SubscriptionActive, SubscriptionPastDue} {
+		t.Run(string(status), func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			f.tx(func(tx pgx.Tx) error {
+				return saveSubscription(ctx(), tx, acct, Subscription{Status: status}, "", f.s.timestamp())
+			})
+
+			if id, err := f.startCheckout(acct); id != "" || connect.CodeOf(err) != connect.CodeAlreadyExists {
+				t.Fatalf("start = %q, %v, want already_exists", id, err)
+			}
+			if calls := f.paddle.Requests(); len(calls) != 0 {
+				t.Fatalf("Paddle calls = %v, want none", calls)
+			}
+		})
 	}
 }
 

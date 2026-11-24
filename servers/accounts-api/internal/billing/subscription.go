@@ -297,11 +297,45 @@ func paddleError(err error, action string) error {
 	}
 }
 
+// pendingCheckoutPayable checks whether an existing checkout can be reused.
+// A false result without an error confirms that it can be replaced.
+func (s *Service) pendingCheckoutPayable(ctx context.Context, accountID, transactionID string) (bool, error) {
+	current, err := s.paddle.GetTransaction(ctx, transactionID)
+	if err != nil {
+		if paddle.Classify(err) == paddle.OutcomeNotFound && paddle.ErrorCode(err) == paddle.CodeNotFound {
+			return false, nil
+		}
+		s.logger.WarnContext(ctx, "billing_paddle_call_failed",
+			slog.String("operation", "get_checkout_transaction"),
+			slog.String("billing_account_id", accountID),
+			slog.String("paddle_transaction_id", transactionID),
+			slog.String("paddle_error_code", paddle.ErrorCode(err)),
+			slog.Any("error", err))
+		return false, unavailable("the payment provider is unavailable; try again later")
+	}
+	if current.ID == transactionID {
+		switch current.Status {
+		case paddle.TransactionStatusCanceled:
+			return false, nil
+		case paddle.TransactionStatusDraft, paddle.TransactionStatusReady, paddle.TransactionStatusBilled:
+			if current.CollectionMode == paddle.CollectionModeAutomatic {
+				return true, nil
+			}
+		case paddle.TransactionStatusPaid, paddle.TransactionStatusCompleted:
+			return false, unavailable("the checkout payment is being confirmed; try again later")
+		}
+	}
+	s.logger.WarnContext(ctx, "billing_checkout_transaction_unconfirmed",
+		slog.String("billing_account_id", accountID),
+		slog.String("paddle_transaction_id", transactionID))
+	return false, unavailable("the payment provider is unavailable; try again later")
+}
+
 // StartSubscription returns the checkout transaction of the subscription.
-// tx holds the billing account lock. While the subscription is PENDING it
-// returns the open checkout transaction again; with ACTIVE or PAST_DUE it
-// fails with already_exists. Otherwise it creates a Paddle transaction for
-// the subscription price with the billing account ID in its custom data.
+// tx holds the billing account lock. With ACTIVE or PAST_DUE, the call fails
+// with already_exists. While PENDING, it reuses a checkout Paddle confirms is
+// payable and replaces one Paddle confirms is canceled or missing. If there
+// is no checkout, it creates a Paddle transaction for the subscription price.
 // created reports whether a new checkout was created.
 func (s *Service) StartSubscription(ctx context.Context, tx pgx.Tx, accountID string) (txnID string, sub Subscription, created bool, err error) {
 	now := s.timestamp()
@@ -314,7 +348,13 @@ func (s *Service) StartSubscription(ctx context.Context, tx pgx.Tx, accountID st
 		return "", Subscription{}, false, alreadyExists("the billing account already has a subscription")
 	case SubscriptionPending:
 		if sub.CheckoutTransactionID != "" {
-			return sub.CheckoutTransactionID, sub, false, nil
+			payable, err := s.pendingCheckoutPayable(ctx, accountID, sub.CheckoutTransactionID)
+			if err != nil {
+				return "", Subscription{}, false, err
+			}
+			if payable {
+				return sub.CheckoutTransactionID, sub, false, nil
+			}
 		}
 	}
 	txn, err := s.paddle.CreateCheckoutTransaction(ctx, s.priceID, paddle.CustomData{paddle.CustomDataBillingAccountID: accountID})
