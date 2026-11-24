@@ -28,7 +28,15 @@ import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
 import { AuditService } from "@delino/tide-protos/v1/audit_pb";
 import { Role } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
-import { RunnerProfileService } from "@delino/tide-protos/v1/runner_profile_pb";
+import {
+  type ListRunnerProfilesRequest,
+  RunnerProfileService,
+} from "@delino/tide-protos/v1/runner_profile_pb";
+import {
+  type ListRequestsRequest,
+  type ListRunnersRequest,
+  WorkService,
+} from "@delino/tide-protos/v1/work_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
@@ -738,6 +746,113 @@ describe("GitHub setup callback", () => {
 });
 
 describe("runner profiles", () => {
+  test("follows the token after a full second page to an empty terminal page", async () => {
+    const mock = createMockTransport({ runnerProfileCount: 400 });
+    const pages: ListRunnerProfilesRequest[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...args) {
+        if (
+          method.name === RunnerProfileService.method.listRunnerProfiles.name
+        ) {
+          pages.push(args[3] as ListRunnerProfilesRequest);
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, { transport });
+
+    const list = await screen.findByRole("list", { name: "Runner profiles" });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(400);
+    expect(rows[0]?.textContent).toContain("codex-linux");
+    expect(rows[399]?.textContent).toContain("linux-build");
+    expect(
+      pages.map(({ organizationId, pageSize, pageToken }) => [
+        organizationId,
+        pageSize,
+        pageToken,
+      ]),
+    ).toEqual([
+      [MOCK_IDS.acme, 200, ""],
+      [MOCK_IDS.acme, 200, "200"],
+      [MOCK_IDS.acme, 200, "400"],
+    ]);
+  });
+
+  test("keeps work visible after a continuation fails and retries the full list", async () => {
+    const mock = createMockTransport({ runnerProfileCount: 201 });
+    const pages: string[] = [];
+    const selectedProfiles: string[] = [];
+    let fail = true;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (
+          method.name === RunnerProfileService.method.listRunnerProfiles.name
+        ) {
+          const { pageSize, pageToken } = args[3] as ListRunnerProfilesRequest;
+          if (pageSize === MAX_PAGE_SIZE) {
+            pages.push(pageToken);
+            if (pageToken !== "" && fail) {
+              fail = false;
+              throw new ConnectError("continuation failed", Code.Internal);
+            }
+          }
+        }
+        if (
+          method.name === WorkService.method.listRequests.name ||
+          method.name === WorkService.method.listRunners.name
+        ) {
+          const { runnerProfileId } = args[3] as
+            ListRequestsRequest | ListRunnersRequest;
+          if (runnerProfileId) selectedProfiles.push(runnerProfileId);
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}/requests`, {
+      transport,
+      staleTime: 10_000,
+    });
+
+    const error = (
+      await screen.findByText(/^Could not load runner profiles/)
+    ).closest<HTMLElement>('[role="alert"]')!;
+    const requests = await screen.findByRole("table", { name: "Requests" });
+    const waitingJob = within(requests).getByRole("row", {
+      name: /test \(ubuntu\)/,
+    });
+    expect(within(waitingJob).queryByText("linux-build")).toBeNull();
+    const filter = screen.getByRole<HTMLButtonElement>("combobox", {
+      name: "Runner profile",
+    });
+    expect(filter.disabled).toBe(true);
+
+    await click(within(error).getByRole("button", { name: "Try again" }));
+    expect(await within(waitingJob).findByText("linux-build")).toBeTruthy();
+    expect(filter.disabled).toBe(false);
+    await click(filter);
+    await click(await screen.findByRole("option", { name: "linux-build" }));
+
+    await click(screen.getByRole("link", { name: "Runners" }));
+    const runners = await screen.findByRole("table", { name: "Runners" });
+    expect(within(runners).getAllByText("linux-build")).toHaveLength(2);
+    await click(screen.getByRole("combobox", { name: "Runner profile" }));
+    await click(await screen.findByRole("option", { name: "linux-build" }));
+
+    await click(screen.getByRole("link", { name: "Overview" }));
+    const queue = await screen.findByRole("table", {
+      name: "Waiting requests",
+    });
+    expect(within(queue).getByText("linux-build")).toBeTruthy();
+    expect(pages).toEqual(["", "200", "", "200"]);
+    expect(selectedProfiles).toEqual([
+      MOCK_IDS.linuxProfile,
+      MOCK_IDS.linuxProfile,
+    ]);
+  });
+
   test("shows the runs-on label of GitHub job profiles", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
     const label = await screen.findByLabelText("runs-on label of linux-build");

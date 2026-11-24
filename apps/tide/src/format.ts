@@ -170,9 +170,12 @@ export function queueWaitMs(
   return Math.max(0, until - queued);
 }
 
-export function errorMessage(error: unknown): string {
+export function errorMessage(
+  error: unknown,
+  fallback = "Something went wrong. Try again.",
+): string {
   if (!(error instanceof ConnectError)) {
-    return "Something went wrong. Try again.";
+    return fallback;
   }
   switch (error.code) {
     case Code.Unauthenticated:
@@ -191,7 +194,7 @@ export function errorMessage(error: unknown): string {
     case Code.FailedPrecondition:
       return error.rawMessage || "The request is not valid.";
     default:
-      return "Something went wrong. Try again.";
+      return fallback;
   }
 }
 
