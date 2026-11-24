@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create } from "@bufbuild/protobuf";
+import { create, toBinary } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { describe, expect, test } from "@rstest/core";
 import {
@@ -11,6 +11,10 @@ import {
   RunnerState,
   WorkloadKind,
 } from "@delino/tide-protos/v1/common_pb";
+import {
+  CreateRunnerProfileRequestSchema,
+  UpdateRunnerProfileRequestSchema,
+} from "@delino/tide-protos/v1/runner_profile_pb";
 import { RequestSchema, RunnerSchema } from "@delino/tide-protos/v1/work_pb";
 import { WatchQueueEventKind } from "tide-sdk";
 import { nextSetupStep, SetupStep } from "./components/setup.tsx";
@@ -158,6 +162,108 @@ describe("roles", () => {
 });
 
 describe("runner profile form", () => {
+  test.each([
+    {
+      field: "vcpuCount",
+      max: 1024,
+      oversized: 3_000_000_000,
+      requiredMessage: "Enter at least 1 vCPU.",
+      rangeMessage: "Enter a whole number of vCPUs from 1 to 1024.",
+    },
+    {
+      field: "memoryMib",
+      max: 16_777_216,
+      oversized: 1e19,
+      requiredMessage: "Enter the memory in MiB.",
+      rangeMessage: "Enter a whole number of MiB from 1 to 16777216.",
+    },
+    {
+      field: "diskGib",
+      max: 1_048_576,
+      oversized: 1e19,
+      requiredMessage: "Enter the disk size in GiB.",
+      rangeMessage: "Enter a whole number of GiB from 1 to 1048576.",
+    },
+  ] as const)(
+    "validates whole numbers and limits for $field",
+    ({ field, max, oversized, requiredMessage, rangeMessage }) => {
+      const form = { ...emptyProfileForm(), name: "linux-build" };
+      for (const value of [null, 0, -1]) {
+        expect(profileErrors({ ...form, [field]: value }, undefined)).toEqual({
+          [field]: requiredMessage,
+        });
+      }
+      for (const value of [1.5, max + 1, oversized]) {
+        expect(profileErrors({ ...form, [field]: value }, undefined)).toEqual({
+          [field]: rangeMessage,
+        });
+      }
+      for (const value of [1, max]) {
+        expect(profileErrors({ ...form, [field]: value }, undefined)).toEqual(
+          {},
+        );
+      }
+    },
+  );
+
+  test("compares the idle TTL only when both TTLs are valid", () => {
+    const form = { ...emptyProfileForm(), name: "linux-build", maxTtlHours: 1 };
+    expect(profileErrors({ ...form, idleTtlMinutes: 61 }, undefined)).toEqual({
+      idleTtlMinutes: "The idle TTL must not be longer than the maximum TTL.",
+    });
+    for (const idleTtlMinutes of [59.5, 60]) {
+      expect(profileErrors({ ...form, idleTtlMinutes }, undefined)).toEqual({});
+    }
+    for (const maxTtlHours of [null, 0, -1, 200]) {
+      expect(
+        profileErrors(
+          { ...form, maxTtlHours, idleTtlMinutes: 1_000_000 },
+          undefined,
+        ),
+      ).toEqual({
+        maxTtlHours: expect.any(String),
+      });
+    }
+    expect(profileErrors({ ...form, idleTtlMinutes: null }, undefined)).toEqual(
+      {
+        idleTtlMinutes: "Enter an idle TTL greater than zero.",
+      },
+    );
+  });
+
+  test.each([
+    { vcpuCount: 1, memoryMib: 1, diskGib: 1 },
+    { vcpuCount: 1024, memoryMib: 16_777_216, diskGib: 1_048_576 },
+  ])(
+    "serializes create and update at resource limits ($vcpuCount vCPUs)",
+    (resources) => {
+      const form = {
+        ...emptyProfileForm(),
+        name: "linux-build",
+        idleTtlMinutes: 59.5,
+        maxQueueWaitMinutes: 1.5,
+        ...resources,
+      };
+      expect(profileErrors(form, undefined)).toEqual({});
+      const profile = profileFromForm(form);
+      expect(() =>
+        toBinary(
+          CreateRunnerProfileRequestSchema,
+          create(CreateRunnerProfileRequestSchema, { profile }),
+        ),
+      ).not.toThrow();
+      expect(() =>
+        toBinary(
+          UpdateRunnerProfileRequestSchema,
+          create(UpdateRunnerProfileRequestSchema, {
+            profile,
+            updateMask: profileUpdateMask(emptyProfileForm(), form),
+          }),
+        ),
+      ).not.toThrow();
+    },
+  );
+
   test("requires workspace_path for DEV_SESSION profiles in the guest OS syntax", () => {
     const values = {
       ...emptyProfileForm(),

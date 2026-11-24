@@ -26,6 +26,7 @@ import {
 import { createQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
+import { RunnerProfileService } from "@delino/tide-protos/v1/runner_profile_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
@@ -559,6 +560,85 @@ describe("GitHub setup callback", () => {
 });
 
 describe("runner profiles", () => {
+  test.each(["create", "edit"] as const)(
+    "keeps the %s dialog open without sending a request for invalid resources",
+    async (mode) => {
+      const mock = createMockTransport();
+      const saveProfile = rs.fn();
+      const transport: Transport = {
+        ...mock,
+        async unary(method, ...args) {
+          if (
+            method.name ===
+              RunnerProfileService.method.createRunnerProfile.name ||
+            method.name === RunnerProfileService.method.updateRunnerProfile.name
+          ) {
+            saveProfile();
+          }
+          return mock.unary(method, ...args);
+        },
+      };
+      renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, { transport });
+
+      const creating = mode === "create";
+      if (creating) {
+        await click(
+          await screen.findByRole("button", { name: "Create runner profile" }),
+        );
+      } else {
+        const label = await screen.findByLabelText(
+          "runs-on label of linux-build",
+        );
+        const profile = label.closest("li")!;
+        await click(within(profile).getByRole("button", { name: "Edit" }));
+      }
+      const dialog = await screen.findByRole("dialog", {
+        name: creating ? "Create a runner profile" : "Edit linux-build",
+      });
+      const form = within(dialog);
+      if (creating) {
+        await type(form.getByRole("textbox", { name: "Name" }), "bounds-test");
+      }
+      const resources = [
+        [
+          "vCPUs",
+          "3000000000",
+          "Enter a whole number of vCPUs from 1 to 1024.",
+        ],
+        [
+          "Memory (MiB)",
+          "10000000000000000000",
+          "Enter a whole number of MiB from 1 to 16777216.",
+        ],
+        [
+          "Disk (GiB)",
+          "1048577",
+          "Enter a whole number of GiB from 1 to 1048576.",
+        ],
+      ] as const;
+      for (const [label, value] of resources) {
+        const input = form.getByLabelText(label);
+        await type(input, value);
+        fireEvent.blur(input);
+      }
+      await click(
+        form.getByRole("button", {
+          name: creating ? "Create profile" : "Save changes",
+        }),
+      );
+
+      for (const [label, , message] of resources) {
+        expect(form.getByLabelText(label).getAttribute("aria-invalid")).toBe(
+          "true",
+        );
+        expect(form.getByText(message)).toBeTruthy();
+      }
+      expect(form.queryByText("Something went wrong. Try again.")).toBeNull();
+      expect(screen.getByRole("dialog")).toBe(dialog);
+      expect(saveProfile).not.toHaveBeenCalled();
+    },
+  );
+
   test("shows the runs-on label of GitHub job profiles", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
     const label = await screen.findByLabelText("runs-on label of linux-build");
