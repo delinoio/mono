@@ -42,6 +42,7 @@ import {
   ErrorNotice,
   FormDialog,
   Loading,
+  MorePagesNotice,
   PageHeader,
   QueryBoundary,
   SandboxStateBadge,
@@ -50,6 +51,7 @@ import {
   isTerminalError,
   shortIdText,
 } from "../components/ui.tsx";
+import { useDevices } from "../devices.ts";
 import {
   deviceOptionLabel,
   formatMib,
@@ -70,14 +72,11 @@ export function SandboxesPage() {
   const [deviceId, setDeviceId] = useState<string>(ALL);
   const [includeEnded, setIncludeEnded] = useState(false);
   const [creating, setCreating] = useState(false);
-  const devices = useQuery(DeviceService.method.listDevices, {
-    organizationId,
-    pageSize: 200,
-  });
+  const deviceList = useDevices(organizationId);
+  const { devices } = deviceList;
   const deviceNames = useMemo(
-    () =>
-      new Map((devices.data?.devices ?? []).map((d) => [d.deviceId, d.name])),
-    [devices.data],
+    () => new Map(devices.map((d) => [d.deviceId, d.name])),
+    [devices],
   );
   const transport = useTransport();
   const listOptions = createInfiniteQueryOptions(
@@ -166,7 +165,7 @@ export function SandboxesPage() {
           onValueChange={(v) => setDeviceId(v ?? ALL)}
         >
           <SelectOption value={ALL}>All devices</SelectOption>
-          {(devices.data?.devices ?? []).map((d) => (
+          {devices.map((d) => (
             <SelectOption key={d.deviceId} value={d.deviceId}>
               {d.name}
             </SelectOption>
@@ -178,6 +177,7 @@ export function SandboxesPage() {
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
+      {creating ? null : <DeviceListNotice list={deviceList} />}
       <QueryBoundary query={boundaryQuery} loading="Loading sandboxes">
         {() =>
           sandboxes.length === 0 ? (
@@ -225,8 +225,20 @@ export function SandboxesPage() {
           Show more
         </Button>
       ) : null}
-      <CreateSandboxDialog open={creating} onOpenChange={setCreating} />
+      <CreateSandboxDialog
+        open={creating}
+        onOpenChange={setCreating}
+        deviceList={deviceList}
+      />
     </>
+  );
+}
+
+function DeviceListNotice({ list }: { list: ReturnType<typeof useDevices> }) {
+  return (
+    <QueryBoundary query={list.boundary} loading="Loading devices">
+      {() => <MorePagesNotice noun="devices" pages={list.pages} />}
+    </QueryBoundary>
   );
 }
 
@@ -307,11 +319,14 @@ function sourceOf(value: string) {
 function CreateSandboxDialog({
   open,
   onOpenChange,
+  deviceList,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  deviceList: ReturnType<typeof useDevices>;
 }) {
   const { organizationId } = useOrg();
+  const { devices } = deviceList;
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
   const templates = useQuery(
@@ -321,11 +336,6 @@ function CreateSandboxDialog({
   );
   const snapshots = useQuery(
     SnapshotService.method.listSnapshots,
-    { organizationId, pageSize: 200 },
-    { enabled: open },
-  );
-  const devices = useQuery(
-    DeviceService.method.listDevices,
     { organizationId, pageSize: 200 },
     { enabled: open },
   );
@@ -395,7 +405,7 @@ function CreateSandboxDialog({
           const selected =
             device === ALL
               ? undefined
-              : devices.data?.devices.find((d) => d.deviceId === device);
+              : devices.find((d) => d.deviceId === device);
           if (
             error instanceof ConnectError &&
             error.code === Code.Unavailable &&
@@ -529,13 +539,14 @@ function CreateSandboxDialog({
           onValueChange={(v) => setDevice(v ?? ALL)}
         >
           <SelectOption value={ALL}>Any device that fits</SelectOption>
-          {(devices.data?.devices ?? []).map((d) => (
+          {devices.map((d) => (
             <SelectOption key={d.deviceId} value={d.deviceId}>
               {deviceOptionLabel(d.name, d.state)}
             </SelectOption>
           ))}
         </Select>
       </div>
+      {open ? <DeviceListNotice list={deviceList} /> : null}
       <Textarea
         label="Labels"
         description="One key=value per line. Every member and API key can read labels, so never put secrets in them."

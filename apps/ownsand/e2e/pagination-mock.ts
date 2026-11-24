@@ -38,9 +38,12 @@ export function createMockTransport(): Transport {
     methodName !== null && Object.hasOwn(lists, methodName)
       ? lists[methodName as keyof typeof lists]
       : undefined;
+  // Devices use the base mock's control-plane page size and cursor.
+  const pageDevices = methodName === "ListDevices";
   // Seed enough rows to split the selected list across two pages.
   const base = createBaseMock({
     extraApiKeys: Number(methodName === "ListApiKeys"),
+    extraDevices: pageDevices ? 199 : 0,
     extraEnrollmentTokens: Number(methodName === "ListEnrollmentTokens"),
   });
   return {
@@ -49,7 +52,10 @@ export function createMockTransport(): Transport {
       if (method.name === "ListOrganizations") {
         await failOrganizationListIfConfigured();
       }
-      if (method.name !== methodName || pagination === undefined) {
+      if (
+        method.name !== methodName ||
+        (!pageDevices && pagination === undefined)
+      ) {
         return base.unary(
           method,
           signal,
@@ -59,7 +65,6 @@ export function createMockTransport(): Transport {
           contextValues,
         );
       }
-      const { field, firstPageSize } = pagination;
       const request = input as typeof input & { pageToken?: string };
       const token = request.pageToken ?? "";
       const tokens = JSON.parse(
@@ -70,7 +75,7 @@ export function createMockTransport(): Transport {
         JSON.stringify([...tokens, token]),
       );
       if (token !== "") {
-        if (token !== CONTINUATION) {
+        if (!pageDevices && token !== CONTINUATION) {
           throw new ConnectError(
             "Unexpected continuation token",
             Code.InvalidArgument,
@@ -94,6 +99,17 @@ export function createMockTransport(): Transport {
         }
       }
 
+      if (pagination === undefined) {
+        return base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+      }
+      const { field, firstPageSize } = pagination;
       const response = await base.unary(
         method,
         signal,
