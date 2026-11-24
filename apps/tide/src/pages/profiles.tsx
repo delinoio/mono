@@ -22,10 +22,11 @@ import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   CopyValue,
-  ErrorNotice,
   FormDialog,
   Loading,
   PageHeader,
+  QueryBoundary,
+  showsFullError,
 } from "../components/ui.tsx";
 import {
   emptyProfileForm,
@@ -59,23 +60,25 @@ export function ProfilesPage() {
   const admin = can(role, Permission.ManageRunnerProfiles);
   const list = useRunnerProfiles(organizationId);
   const agentIntegrations = useAgentIntegrations(organizationId);
-  const { integrations } = agentIntegrations;
+  const { integrations, query: integrationQuery } = agentIntegrations;
+  const integrationsUnavailable = showsFullError(integrationQuery);
   const integrationNames = useMemo(
     () =>
       new Map(
-        integrations.map((i) => [
-          i.agentIntegrationId,
-          `${i.name} (${labels.vendor[i.vendor]})`,
-        ]),
+        integrationsUnavailable
+          ? []
+          : integrations.map((i) => [
+              i.agentIntegrationId,
+              `${i.name} (${labels.vendor[i.vendor]})`,
+            ]),
       ),
-    [integrations],
+    [integrations, integrationsUnavailable],
   );
   const remove = useMutation(RunnerProfileService.method.deleteRunnerProfile, {
     onSuccess: () => refreshRunnerProfiles(queryClient),
   });
   const [editing, setEditing] = useState<RunnerProfile | "new">();
   const [deleting, setDeleting] = useState<RunnerProfile>();
-  const profiles = list.data ?? [];
 
   return (
     <>
@@ -90,91 +93,96 @@ export function ProfilesPage() {
           ) : undefined
         }
       />
-      {agentIntegrations.error ? (
-        <ErrorNotice
-          error={agentIntegrations.error}
-          onRetry={agentIntegrations.retry}
-        />
+      {integrationQuery.error ? (
+        <QueryBoundary
+          query={integrationQuery}
+          loading="Loading agent integrations"
+        >
+          {() => null}
+        </QueryBoundary>
       ) : null}
-      {list.isPending ? (
-        <Loading label="Loading runner profiles" />
-      ) : list.error ? (
-        <ErrorNotice
-          title="Could not load runner profiles."
-          error={list.error}
-          onRetry={() => void list.refetch()}
-        />
-      ) : profiles.length === 0 ? (
-        <SetupEmpty organizationId={organizationId} title="No runner profiles">
-          {admin
-            ? "Create a runner profile to start runners for your work."
-            : "Ask an admin to create a runner profile."}
-        </SetupEmpty>
-      ) : (
-        <ul className="list" aria-label="Runner profiles">
-          {profiles.map((p) => (
-            <li key={p.runnerProfileId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">
-                  {p.name} · {labels.workloadKind[p.workloadKind]} ·{" "}
-                  {labels.guestOs[p.guestOs]}
-                </span>
-                <span className="muted">
-                  {p.source.case === "ownsandTemplateId"
-                    ? `Template ${p.source.value}`
-                    : "Base image"}{" "}
-                  · {p.resources?.vcpuCount ?? 0} vCPU ·{" "}
-                  {String(p.resources?.memoryMib ?? 0n)} MiB ·{" "}
-                  {String(p.resources?.diskGib ?? 0n)} GiB · priority{" "}
-                  {labels.priority[p.priority].toLowerCase()} · warm{" "}
-                  {p.warmCount} · queue wait at most{" "}
-                  {formatDuration(p.maxQueueWait)}
-                </span>
-                {p.workloadKind === WorkloadKind.GITHUB_JOB &&
-                p.githubLabel !== "" ? (
-                  <span>
-                    runs-on:{" "}
-                    <CopyValue
-                      label={`runs-on label of ${p.name}`}
-                      value={p.githubLabel}
-                    />
-                  </span>
-                ) : null}
-                {p.workloadKind === WorkloadKind.AGENT_SESSION ? (
-                  <span className="muted">
-                    Integration:{" "}
-                    {integrationNames.get(p.agentIntegrationId) ??
-                      p.agentIntegrationId}
-                  </span>
-                ) : null}
-                {p.workloadKind === WorkloadKind.DEV_SESSION ? (
-                  <span className="muted">
-                    Workspace: <code>{p.workspacePath}</code>
-                  </span>
-                ) : null}
-              </div>
-              {admin ? (
-                <div className="list-actions">
-                  <Button
-                    variant={ButtonVariant.Secondary}
-                    size={ButtonSize.Small}
-                    onClick={() => setEditing(p)}
-                  >
-                    Edit
-                  </Button>
-                  <Button
-                    variant={ButtonVariant.Danger}
-                    size={ButtonSize.Small}
-                    onClick={() => setDeleting(p)}
-                  >
-                    Delete
-                  </Button>
-                </div>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      )}
+      <QueryBoundary
+        query={list}
+        loading="Loading runner profiles"
+        errorTitle="Could not load runner profiles."
+      >
+        {(profiles) => {
+          return profiles.length === 0 ? (
+            <SetupEmpty
+              organizationId={organizationId}
+              title="No runner profiles"
+            >
+              {admin
+                ? "Create a runner profile to start runners for your work."
+                : "Ask an admin to create a runner profile."}
+            </SetupEmpty>
+          ) : (
+            <ul className="list" aria-label="Runner profiles">
+              {profiles.map((p) => (
+                <li key={p.runnerProfileId} className="list-row">
+                  <div className="list-main">
+                    <span className="list-title">
+                      {p.name} · {labels.workloadKind[p.workloadKind]} ·{" "}
+                      {labels.guestOs[p.guestOs]}
+                    </span>
+                    <span className="muted">
+                      {p.source.case === "ownsandTemplateId"
+                        ? `Template ${p.source.value}`
+                        : "Base image"}{" "}
+                      · {p.resources?.vcpuCount ?? 0} vCPU ·{" "}
+                      {String(p.resources?.memoryMib ?? 0n)} MiB ·{" "}
+                      {String(p.resources?.diskGib ?? 0n)} GiB · priority{" "}
+                      {labels.priority[p.priority].toLowerCase()} · warm{" "}
+                      {p.warmCount} · queue wait at most{" "}
+                      {formatDuration(p.maxQueueWait)}
+                    </span>
+                    {p.workloadKind === WorkloadKind.GITHUB_JOB &&
+                    p.githubLabel !== "" ? (
+                      <span>
+                        runs-on:{" "}
+                        <CopyValue
+                          label={`runs-on label of ${p.name}`}
+                          value={p.githubLabel}
+                        />
+                      </span>
+                    ) : null}
+                    {p.workloadKind === WorkloadKind.AGENT_SESSION ? (
+                      <span className="muted">
+                        Integration:{" "}
+                        {integrationNames.get(p.agentIntegrationId) ??
+                          p.agentIntegrationId}
+                      </span>
+                    ) : null}
+                    {p.workloadKind === WorkloadKind.DEV_SESSION ? (
+                      <span className="muted">
+                        Workspace: <code>{p.workspacePath}</code>
+                      </span>
+                    ) : null}
+                  </div>
+                  {admin ? (
+                    <div className="list-actions">
+                      <Button
+                        variant={ButtonVariant.Secondary}
+                        size={ButtonSize.Small}
+                        onClick={() => setEditing(p)}
+                      >
+                        Edit
+                      </Button>
+                      <Button
+                        variant={ButtonVariant.Danger}
+                        size={ButtonSize.Small}
+                        onClick={() => setDeleting(p)}
+                      >
+                        Delete
+                      </Button>
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          );
+        }}
+      </QueryBoundary>
       {editing !== undefined ? (
         <ProfileDialog
           profile={editing === "new" ? undefined : editing}
@@ -218,7 +226,7 @@ function ProfileDialog({
   );
   const [values, setValues] = useState<ProfileFormValues>(initial);
   const [errors, setErrors] = useState<ProfileErrors>({});
-  const { integrations, error, isLoading, retry } = agentIntegrations;
+  const { integrations, isLoadingMore, query } = agentIntegrations;
   const refresh = () => refreshRunnerProfiles(queryClient);
   const createProfile = useMutation(
     RunnerProfileService.method.createRunnerProfile,
@@ -235,9 +243,12 @@ function ProfileDialog({
     setValues((v) => ({ ...v, [key]: value }));
     setErrors((e) => ({ ...e, [key]: undefined }));
   };
-  const vendor = integrations.find(
-    (i) => i.agentIntegrationId === values.agentIntegrationId,
-  )?.vendor;
+  const integrationsUnavailable = showsFullError(query);
+  const vendor = integrationsUnavailable
+    ? undefined
+    : integrations.find(
+        (i) => i.agentIntegrationId === values.agentIntegrationId,
+      )?.vendor;
   const creating = profile === undefined;
 
   return (
@@ -252,6 +263,10 @@ function ProfileDialog({
           : "Changes apply to runners that start after the change."
       }
       submitLabel={creating ? "Create profile" : "Save changes"}
+      submitDisabled={
+        values.workloadKind === WorkloadKind.AGENT_SESSION &&
+        (query.isPending || integrationsUnavailable)
+      }
       onSubmit={async () => {
         const found = profileErrors(values, vendor);
         if (Object.keys(found).length > 0) {
@@ -316,30 +331,35 @@ function ProfileDialog({
         </Select>
       </div>
       {values.workloadKind === WorkloadKind.AGENT_SESSION ? (
-        <>
-          {error ? <ErrorNotice error={error} onRetry={retry} /> : null}
-          {isLoading ? <Loading label="Loading agent integrations" /> : null}
-          <Select
-            label="Agent integration"
-            value={
-              values.agentIntegrationId === ""
-                ? null
-                : values.agentIntegrationId
-            }
-            onValueChange={(v) => v && set("agentIntegrationId", v)}
-            error={errors.agentIntegrationId}
-            disabled={!creating}
-          >
-            {integrations.map((i) => (
-              <SelectOption
-                key={i.agentIntegrationId}
-                value={i.agentIntegrationId}
+        <QueryBoundary query={query} loading="Loading agent integrations">
+          {() => (
+            <>
+              {isLoadingMore ? (
+                <Loading label="Loading agent integrations" />
+              ) : null}
+              <Select
+                label="Agent integration"
+                value={
+                  values.agentIntegrationId === ""
+                    ? null
+                    : values.agentIntegrationId
+                }
+                onValueChange={(v) => v && set("agentIntegrationId", v)}
+                error={errors.agentIntegrationId}
+                disabled={!creating}
               >
-                {`${i.name} (${labels.vendor[i.vendor]})`}
-              </SelectOption>
-            ))}
-          </Select>
-        </>
+                {integrations.map((i) => (
+                  <SelectOption
+                    key={i.agentIntegrationId}
+                    value={i.agentIntegrationId}
+                  >
+                    {`${i.name} (${labels.vendor[i.vendor]})`}
+                  </SelectOption>
+                ))}
+              </Select>
+            </>
+          )}
+        </QueryBoundary>
       ) : null}
       {values.workloadKind === WorkloadKind.DEV_SESSION ? (
         <TextField

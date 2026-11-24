@@ -252,6 +252,20 @@ function seed(
     member(MOCK_IDS.acme, OTHER_ADMIN, Role.ADMIN, "Ada Park"),
     member(MOCK_IDS.acme, OTHER_MEMBER, Role.MEMBER, ""),
   );
+  // Fill the first page and give the console one more member to load.
+  for (let index = acme.members.length; index < 200; index++) {
+    acme.members.push(
+      member(
+        MOCK_IDS.acme,
+        `mock-user-roster-${index}`,
+        Role.MEMBER,
+        `Roster member ${index}`,
+      ),
+    );
+  }
+  acme.members.push(
+    member(MOCK_IDS.acme, "mock-user-nora", Role.MEMBER, "Nora Lee"),
+  );
   acme.link = create(OwnSandLinkSchema, {
     organizationId: MOCK_IDS.acme,
     ownsandOrganizationId: MOCK_IDS.ownsandAcme,
@@ -771,6 +785,7 @@ export function createMockTransport(
     options.runnerProfileCount ?? 3,
     options.agentIntegrationPageSize,
   );
+  let failAcmeContinuation = true;
   const watchers = new Map<string, Set<Watcher>>();
   const issuedStates = new Map<
     string,
@@ -1110,7 +1125,22 @@ export function createMockTransport(
       listMembers(req) {
         const { org } = membership(req.organizationId);
         const p = page(org.members, req);
-        return { members: p.items, nextPageToken: p.nextPageToken };
+        if (
+          req.organizationId === MOCK_IDS.acme &&
+          req.pageToken !== "" &&
+          failAcmeContinuation
+        ) {
+          // Let the browser fixture exercise the manual retry of a later page.
+          failAcmeContinuation = false;
+          throw new ConnectError("mock member page failure", Code.Internal);
+        }
+        // Like ListMembers on the server, a full page can be followed by an
+        // empty terminal page.
+        const nextPageToken =
+          p.items.length === (req.pageSize || 50)
+            ? String(Number(req.pageToken) + p.items.length)
+            : "";
+        return { members: p.items, nextPageToken };
       },
       updateMemberRole(req) {
         const { org, role } = membership(req.organizationId);

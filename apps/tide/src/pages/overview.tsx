@@ -17,6 +17,7 @@ import {
   ErrorNotice,
   Loading,
   PageHeader,
+  QueryBoundary,
   ShortId,
   StateBadge,
 } from "../components/ui.tsx";
@@ -44,6 +45,7 @@ const LIVE_TEXT: Record<LiveState, string> = {
   [LiveState.Connecting]: "Connecting",
   [LiveState.Live]: "Live",
   [LiveState.Reconnecting]: "Reconnecting",
+  [LiveState.Disconnected]: "Disconnected",
 };
 
 /** How often the waiting time of queued requests is redrawn. */
@@ -84,7 +86,10 @@ export function OverviewPage() {
           dispatch(event);
         }
       } catch (error) {
-        if (!abort.signal.aborted) setStreamError(error);
+        if (!abort.signal.aborted) {
+          dispatch({ kind: QueueViewActionKind.StreamFailed });
+          setStreamError(error);
+        }
       }
     })();
     return () => abort.abort();
@@ -229,40 +234,37 @@ export function OverviewPage() {
             </>
           ) : null}
         </p>
-        {capacity.isPending ? (
-          <Loading label="Loading the device pool" />
-        ) : capacity.error ? (
-          <ErrorNotice
-            error={capacity.error}
-            onRetry={() => void capacity.refetch()}
-          />
-        ) : capacity.data.devices.length === 0 ? (
-          <Empty title="No devices">
-            Link an OwnSand organization with devices, or enroll a device in the
-            OwnSand console.
-          </Empty>
-        ) : (
-          <div className="table-wrap">
-            <table className="table" aria-label="Devices">
-              <thead>
-                <tr>
-                  <th scope="col">Device</th>
-                  <th scope="col">State</th>
-                  <th scope="col">Platform</th>
-                  <th scope="col">vCPUs</th>
-                  <th scope="col">Memory</th>
-                  <th scope="col">Disk</th>
-                  <th scope="col">tide runners</th>
-                </tr>
-              </thead>
-              <tbody>
-                {capacity.data.devices.map((d) => (
-                  <DeviceRow key={d.ownsandDeviceId} device={d} />
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+        <QueryBoundary query={capacity} loading="Loading the device pool">
+          {(data) =>
+            data.devices.length === 0 ? (
+              <Empty title="No devices">
+                Link an OwnSand organization with devices, or enroll a device in
+                the OwnSand console.
+              </Empty>
+            ) : (
+              <div className="table-wrap">
+                <table className="table" aria-label="Devices">
+                  <thead>
+                    <tr>
+                      <th scope="col">Device</th>
+                      <th scope="col">State</th>
+                      <th scope="col">Platform</th>
+                      <th scope="col">vCPUs</th>
+                      <th scope="col">Memory</th>
+                      <th scope="col">Disk</th>
+                      <th scope="col">tide runners</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.devices.map((d) => (
+                      <DeviceRow key={d.ownsandDeviceId} device={d} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )
+          }
+        </QueryBoundary>
       </section>
     </>
   );

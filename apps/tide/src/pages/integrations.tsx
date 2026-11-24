@@ -38,11 +38,12 @@ import {
   CopyValue,
   Detail,
   Empty,
-  ErrorNotice,
   FormDialog,
   Loading,
   PageHeader,
+  QueryBoundary,
   StateBadge,
+  showsFullError,
   toastError,
 } from "../components/ui.tsx";
 import { ownsandDevicesUrl } from "../config.ts";
@@ -104,70 +105,73 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
       <div className="section-header">
         <h2 id="ownsand-title">OwnSand link</h2>
       </div>
-      {link.isPending ? (
-        <Loading label="Loading the OwnSand link" />
-      ) : link.error ? (
-        <ErrorNotice error={link.error} onRetry={() => void link.refetch()} />
-      ) : current === undefined ? (
-        <div className="empty">
-          <p className="empty-title">OwnSand is not linked</p>
-          <p className="muted">
-            First step: link the OwnSand organization whose devices run your
-            work, with an organization API key from the OwnSand console.
-          </p>
-          {admin ? (
-            <Button onClick={() => setDialog("link")}>Link OwnSand</Button>
-          ) : (
-            <p className="muted">Ask an admin to link OwnSand.</p>
-          )}
-        </div>
-      ) : (
-        <>
-          <dl className="details details-flat">
-            <Detail term="OwnSand organization">
-              <code>{current.ownsandOrganizationId}</code>
-            </Detail>
-            <Detail term="State">
-              <StateBadge
-                text={labels.ownSandLinkState[current.state]}
-                tone={
-                  current.state === OwnSandLinkState.INVALID
-                    ? BadgeVariant.Danger
-                    : BadgeVariant.Accent
-                }
-              />
-            </Detail>
-            <Detail term="API key">
-              {credentialText(current.credentialSet, current.credentialSetAt)}
-            </Detail>
-            <Detail term="Devices">
-              <a
-                href={ownsandDevicesUrl(current.ownsandOrganizationId)}
-                target="_blank"
-                rel="noreferrer"
-              >
-                Manage devices in the OwnSand console
-              </a>
-            </Detail>
-          </dl>
-          {admin ? (
-            <div className="actions">
-              <Button
-                variant={ButtonVariant.Secondary}
-                onClick={() => setDialog("replace")}
-              >
-                Replace API key
-              </Button>
-              <Button
-                variant={ButtonVariant.Danger}
-                onClick={() => setRemoving(true)}
-              >
-                Remove link
-              </Button>
+      <QueryBoundary query={link} loading="Loading the OwnSand link">
+        {() =>
+          current === undefined ? (
+            <div className="empty">
+              <p className="empty-title">OwnSand is not linked</p>
+              <p className="muted">
+                First step: link the OwnSand organization whose devices run your
+                work, with an organization API key from the OwnSand console.
+              </p>
+              {admin ? (
+                <Button onClick={() => setDialog("link")}>Link OwnSand</Button>
+              ) : (
+                <p className="muted">Ask an admin to link OwnSand.</p>
+              )}
             </div>
-          ) : null}
-        </>
-      )}
+          ) : (
+            <>
+              <dl className="details details-flat">
+                <Detail term="OwnSand organization">
+                  <code>{current.ownsandOrganizationId}</code>
+                </Detail>
+                <Detail term="State">
+                  <StateBadge
+                    text={labels.ownSandLinkState[current.state]}
+                    tone={
+                      current.state === OwnSandLinkState.INVALID
+                        ? BadgeVariant.Danger
+                        : BadgeVariant.Accent
+                    }
+                  />
+                </Detail>
+                <Detail term="API key">
+                  {credentialText(
+                    current.credentialSet,
+                    current.credentialSetAt,
+                  )}
+                </Detail>
+                <Detail term="Devices">
+                  <a
+                    href={ownsandDevicesUrl(current.ownsandOrganizationId)}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Manage devices in the OwnSand console
+                  </a>
+                </Detail>
+              </dl>
+              {admin ? (
+                <div className="actions">
+                  <Button
+                    variant={ButtonVariant.Secondary}
+                    onClick={() => setDialog("replace")}
+                  >
+                    Replace API key
+                  </Button>
+                  <Button
+                    variant={ButtonVariant.Danger}
+                    onClick={() => setRemoving(true)}
+                  >
+                    Remove link
+                  </Button>
+                </div>
+              ) : null}
+            </>
+          )
+        }
+      </QueryBoundary>
       <FormDialog
         open={dialog !== undefined}
         onOpenChange={(open) => !open && close()}
@@ -248,7 +252,6 @@ function GitHubSection({ admin }: { admin: boolean }) {
   });
   const [unlinking, setUnlinking] = useState<GitHubInstallation>();
   const [grouping, setGrouping] = useState<GitHubInstallation>();
-  const installations = list.data?.installations ?? [];
 
   const connect = async () => {
     try {
@@ -278,54 +281,55 @@ function GitHubSection({ admin }: { admin: boolean }) {
         runs-on label names a runner profile. Install the tide GitHub App on a
         GitHub organization; GitHub then returns to this console.
       </p>
-      {list.isPending ? (
-        <Loading label="Loading GitHub installations" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : installations.length === 0 ? (
-        <Empty title="No GitHub organization is connected">
-          {admin
-            ? "Connect GitHub to run GitHub Actions jobs, or create an agent integration below."
-            : "Ask an admin to connect GitHub."}
-        </Empty>
-      ) : (
-        <ul className="list" aria-label="GitHub installations">
-          {installations.map((i) => (
-            <li key={i.installationId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">
-                  {i.githubAccountLogin} ·{" "}
-                  {labels.gitHubInstallationState[i.state]}
-                </span>
-                <span className="muted">
-                  Runner group: {i.runnerGroupName || "Default"} · linked{" "}
-                  {formatTime(i.createTime)}
-                </span>
-              </div>
-              {admin ? (
-                <div className="list-actions">
-                  {i.state === GitHubInstallationState.ACTIVE ? (
-                    <Button
-                      variant={ButtonVariant.Secondary}
-                      size={ButtonSize.Small}
-                      onClick={() => setGrouping(i)}
-                    >
-                      Change runner group
-                    </Button>
+      <QueryBoundary query={list} loading="Loading GitHub installations">
+        {(data) => {
+          const { installations } = data;
+          return installations.length === 0 ? (
+            <Empty title="No GitHub organization is connected">
+              {admin
+                ? "Connect GitHub to run GitHub Actions jobs, or create an agent integration below."
+                : "Ask an admin to connect GitHub."}
+            </Empty>
+          ) : (
+            <ul className="list" aria-label="GitHub installations">
+              {installations.map((i) => (
+                <li key={i.installationId} className="list-row">
+                  <div className="list-main">
+                    <span className="list-title">
+                      {i.githubAccountLogin} ·{" "}
+                      {labels.gitHubInstallationState[i.state]}
+                    </span>
+                    <span className="muted">
+                      Runner group: {i.runnerGroupName || "Default"} · linked{" "}
+                      {formatTime(i.createTime)}
+                    </span>
+                  </div>
+                  {admin ? (
+                    <div className="list-actions">
+                      {i.state === GitHubInstallationState.ACTIVE ? (
+                        <Button
+                          variant={ButtonVariant.Secondary}
+                          size={ButtonSize.Small}
+                          onClick={() => setGrouping(i)}
+                        >
+                          Change runner group
+                        </Button>
+                      ) : null}
+                      <Button
+                        variant={ButtonVariant.Danger}
+                        size={ButtonSize.Small}
+                        onClick={() => setUnlinking(i)}
+                      >
+                        Unlink
+                      </Button>
+                    </div>
                   ) : null}
-                  <Button
-                    variant={ButtonVariant.Danger}
-                    size={ButtonSize.Small}
-                    onClick={() => setUnlinking(i)}
-                  >
-                    Unlink
-                  </Button>
-                </div>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      )}
+                </li>
+              ))}
+            </ul>
+          );
+        }}
+      </QueryBoundary>
       {grouping !== undefined ? (
         <RunnerGroupDialog
           installation={grouping}
@@ -373,7 +377,7 @@ function RunnerGroupDialog({
       title="Change the runner group"
       description="GitHub's runner group settings control which repositories can use the tide runners."
       submitLabel="Save"
-      submitDisabled={groups.data === undefined}
+      submitDisabled={groups.data === undefined || showsFullError(groups)}
       onSubmit={async () => {
         await update.mutateAsync({
           organizationId,
@@ -383,29 +387,24 @@ function RunnerGroupDialog({
         onClose();
       }}
     >
-      {groups.isPending ? (
-        <Loading label="Loading runner groups" />
-      ) : groups.error ? (
-        <ErrorNotice
-          error={groups.error}
-          onRetry={() => void groups.refetch()}
-        />
-      ) : (
-        <Select
-          label="Runner group"
-          value={group}
-          onValueChange={(v) => v && setGroup(v)}
-        >
-          {groups.data.runnerGroups.map((g) => (
-            <SelectOption
-              key={String(g.githubRunnerGroupId)}
-              value={String(g.githubRunnerGroupId)}
-            >
-              {`${g.name}${g.isDefault ? " (default)" : ""} · ${g.visibility}`}
-            </SelectOption>
-          ))}
-        </Select>
-      )}
+      <QueryBoundary query={groups} loading="Loading runner groups">
+        {(data) => (
+          <Select
+            label="Runner group"
+            value={group}
+            onValueChange={(v) => v && setGroup(v)}
+          >
+            {data.runnerGroups.map((g) => (
+              <SelectOption
+                key={String(g.githubRunnerGroupId)}
+                value={String(g.githubRunnerGroupId)}
+              >
+                {`${g.name}${g.isDefault ? " (default)" : ""} · ${g.visibility}`}
+              </SelectOption>
+            ))}
+          </Select>
+        )}
+      </QueryBoundary>
     </FormDialog>
   );
 }
@@ -558,7 +557,7 @@ function settingValue(i: AgentIntegration): string {
 function AgentIntegrationsSection({ admin }: { admin: boolean }) {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
-  const { integrations, isLoading, error, retry } =
+  const { integrations, hasNextPage, isLoadingMore, query } =
     useAgentIntegrations(organizationId);
   const remove = useMutation(
     AgentIntegrationService.method.deleteAgentIntegration,
@@ -586,67 +585,73 @@ function AgentIntegrationsSection({ admin }: { admin: boolean }) {
         An agent integration holds the account or pool of one coding-agent
         vendor. Agent session runner profiles name one integration.
       </p>
-      {error ? <ErrorNotice error={error} onRetry={retry} /> : null}
-      {isLoading ? <Loading label="Loading agent integrations" /> : null}
-      {integrations.length === 0 && !isLoading && !error ? (
-        <Empty title="No agent integrations">
-          {admin
-            ? "Create an integration for Claude Code, Cursor, OpenAI Codex or Devin to run their sessions, or connect GitHub above."
-            : "Ask an admin to create an agent integration."}
-        </Empty>
-      ) : null}
-      {integrations.length > 0 ? (
-        <ul className="list" aria-label="Agent integrations">
-          {integrations.map((i) => (
-            <li key={i.agentIntegrationId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">
-                  {i.name} · {labels.vendor[i.vendor]}
-                </span>
-                {settingLabel(i.vendor) !== undefined ? (
-                  <span className="muted">
-                    {settingLabel(i.vendor)}: {settingValue(i)}
-                  </span>
-                ) : null}
-                {i.credentials.map((c) => (
-                  <span className="muted" key={c.credential}>
-                    {labels.credential[c.credential]}:{" "}
-                    {credentialText(c.credentialSet, c.credentialSetAt)}
-                  </span>
+      <QueryBoundary query={query} loading="Loading agent integrations">
+        {() => (
+          <>
+            {isLoadingMore ? (
+              <Loading label="Loading agent integrations" />
+            ) : null}
+            {integrations.length === 0 && !hasNextPage ? (
+              <Empty title="No agent integrations">
+                {admin
+                  ? "Create an integration for Claude Code, Cursor, OpenAI Codex or Devin to run their sessions, or connect GitHub above."
+                  : "Ask an admin to create an agent integration."}
+              </Empty>
+            ) : integrations.length > 0 ? (
+              <ul className="list" aria-label="Agent integrations">
+                {integrations.map((i) => (
+                  <li key={i.agentIntegrationId} className="list-row">
+                    <div className="list-main">
+                      <span className="list-title">
+                        {i.name} · {labels.vendor[i.vendor]}
+                      </span>
+                      {settingLabel(i.vendor) !== undefined ? (
+                        <span className="muted">
+                          {settingLabel(i.vendor)}: {settingValue(i)}
+                        </span>
+                      ) : null}
+                      {i.credentials.map((c) => (
+                        <span className="muted" key={c.credential}>
+                          {labels.credential[c.credential]}:{" "}
+                          {credentialText(c.credentialSet, c.credentialSetAt)}
+                        </span>
+                      ))}
+                      {i.vendor === AgentVendor.OPENAI_CODEX &&
+                      i.webhookUrl !== "" ? (
+                        <span>
+                          Webhook URL to register in the OpenAI project:{" "}
+                          <CopyValue
+                            label={`webhook URL of ${i.name}`}
+                            value={i.webhookUrl}
+                          />
+                        </span>
+                      ) : null}
+                    </div>
+                    {admin ? (
+                      <div className="list-actions">
+                        <Button
+                          variant={ButtonVariant.Secondary}
+                          size={ButtonSize.Small}
+                          onClick={() => setEditing(i)}
+                        >
+                          Edit
+                        </Button>
+                        <Button
+                          variant={ButtonVariant.Danger}
+                          size={ButtonSize.Small}
+                          onClick={() => setDeleting(i)}
+                        >
+                          Delete
+                        </Button>
+                      </div>
+                    ) : null}
+                  </li>
                 ))}
-                {i.vendor === AgentVendor.OPENAI_CODEX &&
-                i.webhookUrl !== "" ? (
-                  <span>
-                    Webhook URL to register in the OpenAI project:{" "}
-                    <CopyValue
-                      label={`webhook URL of ${i.name}`}
-                      value={i.webhookUrl}
-                    />
-                  </span>
-                ) : null}
-              </div>
-              {admin ? (
-                <div className="list-actions">
-                  <Button
-                    variant={ButtonVariant.Secondary}
-                    size={ButtonSize.Small}
-                    onClick={() => setEditing(i)}
-                  >
-                    Edit
-                  </Button>
-                  <Button
-                    variant={ButtonVariant.Danger}
-                    size={ButtonSize.Small}
-                    onClick={() => setDeleting(i)}
-                  >
-                    Delete
-                  </Button>
-                </div>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      ) : null}
+              </ul>
+            ) : null}
+          </>
+        )}
+      </QueryBoundary>
       {editing !== undefined ? (
         <IntegrationDialog
           integration={editing === "new" ? undefined : editing}

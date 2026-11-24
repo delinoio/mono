@@ -40,7 +40,8 @@ const APIKeyPrefix = "tide_"
 // TokenSource returns the current credential: a Logto access token for the
 // API resource https://tide.api.delino.io, or a personal API key. The SDK
 // calls it before every RPC, so it should cache a token until shortly
-// before it expires.
+// before it expires. An empty token or a failure other than a network or
+// context error produces a [CredentialError].
 type TokenSource func(ctx context.Context) (string, error)
 
 // Options configures a Client.

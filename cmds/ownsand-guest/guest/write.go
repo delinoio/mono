@@ -81,6 +81,8 @@ type writeEntry struct {
 	// identity is the identity of the staging file that the helper created;
 	// nil when the platform has none, which also means that no record is kept.
 	identity *fileIdentity
+	// recordPath is the canonical or retained temporary record location.
+	recordPath string
 	// recovered marks a write of an earlier helper process: it has a staging
 	// file but no open file and no written ranges, so it can only expire.
 	recovered bool
@@ -201,7 +203,15 @@ func (m *writeManager) entry(req *ownsandv1.WriteFileRequest) (*writeEntry, erro
 	if err != nil {
 		return nil, fsError("write", err)
 	}
-	e := &writeEntry{id: id, path: bound, target: target, tmp: tmp, file: f, lastChunk: m.now()}
+	e := &writeEntry{
+		id:         id,
+		path:       bound,
+		target:     target,
+		tmp:        tmp,
+		file:       f,
+		lastChunk:  m.now(),
+		recordPath: m.recordPath(id),
+	}
 	if identity, err := identityOfFile(f); err == nil {
 		e.identity = &identity
 		m.persistRecord(e, true)
@@ -267,7 +277,7 @@ func (m *writeManager) apply(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteF
 	// The staging file is the target now. A failure keeps the record, which
 	// the next start drops (its staging file is gone) and the sweep removes
 	// after the retention time.
-	if err := m.removeRecord(req.GetWriteId()); err != nil {
+	if err := removeWriteRecord(e.recordPath); err != nil {
 		m.logger.Warn("remove write record failed", "write_id", req.GetWriteId(), "error", sanitizedError(err))
 	}
 	resp.Finished = true

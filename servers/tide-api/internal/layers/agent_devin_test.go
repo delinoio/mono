@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -12,6 +13,8 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent"
@@ -171,6 +174,228 @@ func TestDevinClaimRelease(t *testing.T) {
 	}
 	if w.devin.Releases("ses-lost") != 0 {
 		t.Fatal("tide released another acceptor's claim")
+	}
+}
+
+func (w *devinWorld) warmRunner(t *testing.T) *tidev1.Runner {
+	t.Helper()
+	ctx := t.Context()
+	_, err := w.env.User(w.org.Admin).Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+		OrganizationId: w.org.ID, RunnerProfileId: w.profileID,
+		Profile: &tidev1.RunnerProfile{WarmCount: 1}, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"warm_count"}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var warm *tidev1.Runner
+	eventually(t, "a warm Devin runner", func() bool {
+		resp, err := w.env.User(w.org.Owner).Work.ListRunners(ctx, connect.NewRequest(&tidev1.ListRunnersRequest{
+			OrganizationId: w.org.ID, States: []tidev1.RunnerState{tidev1.RunnerState_RUNNER_STATE_WARM},
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Msg.GetRunners()) == 0 {
+			return false
+		}
+		warm = resp.Msg.GetRunners()[0]
+		return true
+	})
+	return warm
+}
+
+func (w *devinWorld) assertClaim(t *testing.T, requestID string, want agent.ClaimState) {
+	t.Helper()
+	claim, err := w.l.Agents.Claim(t.Context(), requestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.State != want {
+		t.Fatalf("claim state = %v, want %v", claim.State, want)
+	}
+}
+
+func (w *devinWorld) assertNoRelease(t *testing.T, sessionID string) {
+	t.Helper()
+	if calls := w.devin.ReleaseAttempts(sessionID); calls != 0 {
+		t.Fatalf("vendor release calls = %d, want 0", calls)
+	}
+	if len(w.devin.Messages(sessionID)) != 0 {
+		t.Fatal("tide sent an operator message for a lost claim")
+	}
+}
+
+func TestDevinClaimLossAfterDispatchWins(t *testing.T) {
+	w := newDevinWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	warm := w.warmRunner(t)
+	ctx := t.Context()
+	// Pause dispatch after it locks the request but before it commits STARTING.
+	_, err := w.env.DB.Pool.Exec(ctx, fmt.Sprintf(`
+		CREATE FUNCTION pause_devin_binding() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			PERFORM pg_advisory_xact_lock(42);
+			RETURN NEW;
+		END $$;
+		CREATE TRIGGER pause_devin_binding BEFORE UPDATE OF state ON requests
+		FOR EACH ROW WHEN (OLD.state IS DISTINCT FROM NEW.state AND NEW.state = %d)
+		EXECUTE FUNCTION pause_devin_binding();`, tidev1.RequestState_REQUEST_STATE_STARTING))
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitBinding := holdTx(t, w.env, "SELECT pg_advisory_xact_lock(42)")
+	const sid = "ses-dispatch-wins"
+	w.devin.AddSession(sid, true)
+	req := w.requestBySource(t, sid)
+	id := req.GetRequestId()
+	waitForLockWaiter(t, w.env)
+	// Keep the claim change uncommitted until the fake guest starts.
+	commitClaim := holdTx(t, w.env, "SELECT 1 FROM agent_claims WHERE request_id = $1 FOR UPDATE", id)
+	// Use a separate connection to observe the locks. The two fixture
+	// transactions, dispatch and claim loss can fill the default pool.
+	observer, err := pgx.ConnectConfig(ctx, w.env.DB.Pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close(ctx)
+	w.devin.ClaimElsewhere(sid)
+	eventually(t, "the loss event waits after looking up the claim", func() bool {
+		var waiting bool
+		err := observer.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'
+			AND (query LIKE '%FROM requests WHERE request_id = $1 FOR UPDATE%' OR query LIKE 'UPDATE agent_claims SET state%'))`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return waiting
+	})
+	commitBinding()
+	w.waitRunner(t, warm.GetRunnerId(), tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)
+	commitClaim()
+	eventually(t, "the lost claim is released locally", func() bool {
+		claim, err := w.l.Agents.Claim(ctx, id)
+		return err == nil && claim.State == agent.ClaimReleased
+	})
+	r := w.request(t, id)
+	if r.GetState() != tidev1.RequestState_REQUEST_STATE_STARTING || r.GetRunnerId() != warm.GetRunnerId() {
+		t.Fatalf("claim loss changed the assigned request: %v", r)
+	}
+	w.finishDevinRequestAfterLoss(t, id, sid, warm)
+}
+
+func TestDevinClaimLossWhileRunning(t *testing.T) {
+	w := newDevinWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	const sid = "ses-running"
+	w.devin.AddSession(sid, true)
+	req := w.requestBySource(t, sid)
+	id := req.GetRequestId()
+	started := w.waitRequest(t, id, tidev1.RequestState_REQUEST_STATE_STARTING)
+	runner := w.waitRunner(t, started.GetRunnerId(), tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)
+	w.devin.SetSessionStatus(sid, "running")
+	w.waitRequest(t, id, tidev1.RequestState_REQUEST_STATE_RUNNING)
+	w.devin.DeleteSession(sid)
+	eventually(t, "the lost claim is released locally", func() bool {
+		claim, err := w.l.Agents.Claim(t.Context(), id)
+		return err == nil && claim.State == agent.ClaimReleased
+	})
+	r := w.request(t, id)
+	if r.GetState() != tidev1.RequestState_REQUEST_STATE_RUNNING || r.GetRunnerId() != runner.GetRunnerId() {
+		t.Fatalf("claim loss changed the running request: %v", r)
+	}
+	w.finishDevinRequestAfterLoss(t, id, sid, runner)
+}
+
+func (w *devinWorld) finishDevinRequestAfterLoss(t *testing.T, id, sid string, runner *tidev1.Runner) {
+	t.Helper()
+	w.guest.exitProgram(runner.GetOwnsandSandboxId(), 0)
+	ended := w.waitRequest(t, id, tidev1.RequestState_REQUEST_STATE_ENDED)
+	if ended.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_COMPLETED || ended.GetRunnerId() != runner.GetRunnerId() {
+		t.Fatalf("program exit did not complete the assigned request: %v", ended)
+	}
+	w.waitRunner(t, runner.GetRunnerId(), tidev1.RunnerState_RUNNER_STATE_DELETED)
+	w.assertNoRelease(t, sid)
+}
+
+func TestDevinClaimLossBeforeDispatchWins(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lost func(*devinfake.Fake, string)
+	}{
+		{"deleted", (*devinfake.Fake).DeleteSession},
+		{"other_acceptor", (*devinfake.Fake).ClaimElsewhere},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newDevinWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			warm := w.warmRunner(t)
+			// Dispatch selects the warm runner and waits for its lock.
+			resumeDispatch := holdTx(t, w.env, "SELECT 1 FROM runners WHERE runner_id = $1 FOR UPDATE", warm.GetRunnerId())
+			const sid = "ses-loss-wins"
+			w.devin.AddSession(sid, true)
+			req := w.requestBySource(t, sid)
+			id := req.GetRequestId()
+			waitForLockWaiter(t, w.env)
+			w.assertClaim(t, id, agent.ClaimHeld)
+
+			tc.lost(w.devin, sid)
+			canceled := w.waitRequest(t, id, tidev1.RequestState_REQUEST_STATE_CANCELED)
+			if canceled.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE || canceled.GetRunnerId() != "" {
+				t.Fatalf("unexpected cancellation: %v", canceled)
+			}
+			w.assertClaim(t, id, agent.ClaimReleased)
+			resumeDispatch()
+
+			tc.lost(w.devin, sid)
+			stays(t, "the canceled request and the unassigned warm runner", func() bool {
+				return proto.Equal(w.request(t, id), canceled) &&
+					w.runner(t, warm.GetRunnerId()).GetState() == tidev1.RunnerState_RUNNER_STATE_WARM
+			})
+			w.assertNoRelease(t, sid)
+		})
+	}
+}
+
+func TestDevinClaimLossRollsBack(t *testing.T) {
+	for _, tc := range []struct {
+		table string
+		state int16
+	}{
+		{"agent_claims", int16(agent.ClaimReleased)},
+		{"requests", int16(tidev1.RequestState_REQUEST_STATE_CANCELED)},
+	} {
+		t.Run(tc.table, func(t *testing.T) {
+			w := newDevinWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			w.full()
+			ctx := t.Context()
+			const sid = "ses-rollback"
+			w.devin.AddSession(sid, true)
+			req := w.requestBySource(t, sid)
+			id := req.GetRequestId()
+			_, err := w.env.DB.Pool.Exec(ctx, fmt.Sprintf(
+				"ALTER TABLE %s ADD CONSTRAINT reject_devin_loss CHECK (state <> %d) NOT VALID", tc.table, tc.state))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			w.devin.DeleteSession(sid)
+			eventually(t, "the loss write fails", func() bool {
+				return strings.Contains(w.env.Logs.String(), "reject_devin_loss")
+			})
+			r := w.request(t, id)
+			if r.GetState() != tidev1.RequestState_REQUEST_STATE_QUEUED || r.GetRunnerId() != "" {
+				t.Fatalf("failed loss changed the request: %v", r)
+			}
+			w.assertClaim(t, id, agent.ClaimHeld)
+
+			if _, err := w.env.DB.Pool.Exec(ctx, "ALTER TABLE "+tc.table+" DROP CONSTRAINT reject_devin_loss"); err != nil {
+				t.Fatal(err)
+			}
+			w.devin.DeleteSession(sid)
+			canceled := w.waitRequest(t, id, tidev1.RequestState_REQUEST_STATE_CANCELED)
+			if canceled.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE {
+				t.Fatalf("retry did not cancel the request: %v", canceled)
+			}
+			w.assertClaim(t, id, agent.ClaimReleased)
+			w.assertNoRelease(t, sid)
+		})
 	}
 }
 

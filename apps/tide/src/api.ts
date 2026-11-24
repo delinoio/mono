@@ -72,14 +72,16 @@ export function useAgentIntegrations(organizationId: string) {
         data?.pages.flatMap((page) => page.integrations) ?? EMPTY_INTEGRATIONS,
       [data],
     ),
-    isLoading: isPending || (hasNextPage && !error),
-    error,
-    retry: () => {
-      if (isFetchNextPageError) {
-        void fetchNextPage({ cancelRefetch: false });
-      } else {
-        void refetch({ cancelRefetch: false });
-      }
+    hasNextPage,
+    isLoadingMore: hasNextPage && !error,
+    query: {
+      data,
+      error,
+      isFetching,
+      isFetchNextPageError,
+      isPending,
+      refetch: () => refetch({ cancelRefetch: false }),
+      retryNextPage: () => void fetchNextPage({ cancelRefetch: false }),
     },
   };
 }

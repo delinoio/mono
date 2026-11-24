@@ -20,9 +20,9 @@ import { SetupEmpty } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
-  ErrorNotice,
-  Loading,
+  ListPagination,
   PageHeader,
+  QueryBoundary,
   ShortId,
   StateBadge,
 } from "../components/ui.tsx";
@@ -86,7 +86,6 @@ export function DevSessionsPage() {
     onSuccess: () =>
       invalidateServices(queryClient, DevSessionService, WorkService),
   });
-  const sessions = list.data?.pages.flatMap((p) => p.devSessions) ?? [];
 
   return (
     <>
@@ -111,91 +110,85 @@ export function DevSessionsPage() {
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
-      {list.isPending ? (
-        <Loading label="Loading dev sessions" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : sessions.length === 0 ? (
-        <SetupEmpty organizationId={organizationId} title="No dev sessions">
-          Create a dev session with <code>tide session create</code> or the tide
-          MCP server, with a dev session runner profile.{" "}
-          <Link to={orgPath(RouteId.ApiKeys, organizationId)}>
-            Create a personal API key
-          </Link>{" "}
-          for a coding agent.
-        </SetupEmpty>
-      ) : (
-        <div className="table-wrap">
-          <table className="table" aria-label="Dev sessions">
-            <thead>
-              <tr>
-                <th scope="col">Dev session</th>
-                <th scope="col">Owner</th>
-                <th scope="col">Profile</th>
-                <th scope="col">Guest OS</th>
-                <th scope="col">State</th>
-                <th scope="col">End reason</th>
-                <th scope="col">Queued</th>
-                <th scope="col">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sessions.map((s) => {
-                const ended = TERMINAL_REQUEST_STATES.has(s.state);
-                return (
-                  <tr key={s.devSessionId}>
-                    <td>
-                      {s.label !== "" ? `${s.label} ` : null}
-                      <ShortId id={s.devSessionId} />
-                    </td>
-                    <td>
-                      {memberName(names, s.ownerUserId)}
-                      {s.ownerUserId === userId ? (
-                        <span className="muted"> (you)</span>
-                      ) : null}
-                    </td>
-                    <td>
-                      {s.runnerProfileName || (
-                        <ShortId id={s.runnerProfileId} />
-                      )}
-                    </td>
-                    <td>{labels.guestOs[s.guestOs]}</td>
-                    <td>
-                      <StateBadge
-                        text={labels.requestState[s.state]}
-                        tone={requestStateTone(s.state)}
-                      />
-                    </td>
-                    <td>
-                      {ended ? labels.requestEndReason[s.endReason] : "—"}
-                    </td>
-                    <td>{formatTime(s.queuedAt)}</td>
-                    <td>
-                      {!ended && canDeleteDevSession(role, userId, s) ? (
-                        <Button
-                          variant={ButtonVariant.Danger}
-                          size={ButtonSize.Small}
-                          onClick={() => setDeleting(s)}
-                        >
-                          Delete
-                        </Button>
-                      ) : null}
-                    </td>
+      <QueryBoundary query={list} loading="Loading dev sessions">
+        {(data) => {
+          const sessions = data.pages.flatMap((p) => p.devSessions);
+          return sessions.length === 0 ? (
+            <SetupEmpty organizationId={organizationId} title="No dev sessions">
+              Create a dev session with <code>tide session create</code> or the
+              tide MCP server, with a dev session runner profile.{" "}
+              <Link to={orgPath(RouteId.ApiKeys, organizationId)}>
+                Create a personal API key
+              </Link>{" "}
+              for a coding agent.
+            </SetupEmpty>
+          ) : (
+            <div className="table-wrap">
+              <table className="table" aria-label="Dev sessions">
+                <thead>
+                  <tr>
+                    <th scope="col">Dev session</th>
+                    <th scope="col">Owner</th>
+                    <th scope="col">Profile</th>
+                    <th scope="col">Guest OS</th>
+                    <th scope="col">State</th>
+                    <th scope="col">End reason</th>
+                    <th scope="col">Queued</th>
+                    <th scope="col">Actions</th>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-      {list.hasNextPage ? (
-        <Button
-          variant={ButtonVariant.Secondary}
-          onClick={() => void list.fetchNextPage()}
-        >
-          Show more
-        </Button>
-      ) : null}
+                </thead>
+                <tbody>
+                  {sessions.map((s) => {
+                    const ended = TERMINAL_REQUEST_STATES.has(s.state);
+                    return (
+                      <tr key={s.devSessionId}>
+                        <td>
+                          {s.label !== "" ? `${s.label} ` : null}
+                          <ShortId id={s.devSessionId} />
+                        </td>
+                        <td>
+                          {memberName(names, s.ownerUserId)}
+                          {s.ownerUserId === userId ? (
+                            <span className="muted"> (you)</span>
+                          ) : null}
+                        </td>
+                        <td>
+                          {s.runnerProfileName || (
+                            <ShortId id={s.runnerProfileId} />
+                          )}
+                        </td>
+                        <td>{labels.guestOs[s.guestOs]}</td>
+                        <td>
+                          <StateBadge
+                            text={labels.requestState[s.state]}
+                            tone={requestStateTone(s.state)}
+                          />
+                        </td>
+                        <td>
+                          {ended ? labels.requestEndReason[s.endReason] : "—"}
+                        </td>
+                        <td>{formatTime(s.queuedAt)}</td>
+                        <td>
+                          {!ended && canDeleteDevSession(role, userId, s) ? (
+                            <Button
+                              variant={ButtonVariant.Danger}
+                              size={ButtonSize.Small}
+                              onClick={() => setDeleting(s)}
+                            >
+                              Delete
+                            </Button>
+                          ) : null}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          );
+        }}
+      </QueryBoundary>
+      <ListPagination query={list} />
       <ConfirmDialog
         open={deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}

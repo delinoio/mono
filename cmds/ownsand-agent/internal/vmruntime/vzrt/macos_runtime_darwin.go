@@ -91,8 +91,15 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 	src := r.opts.MacOSImage
 	if spec.Snapshot != nil {
 		src = spec.Snapshot.Dir
-	} else if model, detail := r.macOSImage(); model == nil {
-		return nil, fmt.Errorf("%w: %s", vmruntime.ErrUnsupported, detail)
+	} else {
+		if model, detail := r.macOSImage(); model == nil {
+			return nil, fmt.Errorf("%w: %s", vmruntime.ErrUnsupported, detail)
+		}
+		if meta, err := images.Resolve(src); err == nil {
+			if spec.Resources.GetVcpuCount() < meta.MinimumCPUCount || spec.Resources.GetMemoryMib() < meta.MinimumMemoryMiB {
+				return nil, fmt.Errorf("%w: macOS guests need at least %d vCPUs and %d MiB of memory", vmruntime.ErrUnsupported, meta.MinimumCPUCount, meta.MinimumMemoryMiB)
+			}
+		}
 	}
 	model, err := os.ReadFile(filepath.Join(src, images.MacOSHardwareModel))
 	if err != nil {
@@ -100,11 +107,6 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 	}
 	if !macOSHardwareModelSupported(model) {
 		return nil, fmt.Errorf("%w: this Mac does not support the hardware model of the macOS guest", vmruntime.ErrUnsupported)
-	}
-	if meta, err := images.Resolve(r.opts.MacOSImage); err == nil {
-		if spec.Resources.GetVcpuCount() < meta.MinimumCPUCount || spec.Resources.GetMemoryMib() < meta.MinimumMemoryMiB {
-			return nil, fmt.Errorf("%w: macOS guests need at least %d vCPUs and %d MiB of memory", vmruntime.ErrUnsupported, meta.MinimumCPUCount, meta.MinimumMemoryMiB)
-		}
 	}
 	start := time.Now()
 	if err := os.RemoveAll(spec.Dir); err != nil {
