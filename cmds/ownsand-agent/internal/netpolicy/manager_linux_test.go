@@ -260,19 +260,36 @@ func onceFunc(ch chan struct{}) func() {
 	return func() { once.Do(func() { close(ch) }) }
 }
 
-// releaseOnCleanup opens a held fixture gate and then waits for the Detach
-// that it blocks when the test ends, so an assertion that fails first cannot
-// leave the worker blocked.
-func releaseOnCleanup(t *testing.T, open func(), done <-chan struct{}) {
+// releaseOnCleanup opens a held fixture gate before waiting for the worker
+// it blocks, even if a fatal assertion ends the test early.
+func releaseOnCleanup(t *testing.T, open func(), done <-chan struct{}, worker string) {
 	t.Helper()
 	t.Cleanup(func() {
 		open()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			t.Error("Detach did not return after the held fixture was released")
+			t.Errorf("%s did not return after the held fixture was released", worker)
 		}
 	})
+}
+
+// startGatedWorker registers cleanup before starting the worker. Closing done
+// publishes its result and lets both the test and cleanup observe completion.
+func startGatedWorker(t *testing.T, open func(), worker string, run func() error) func() error {
+	t.Helper()
+	done := make(chan struct{})
+	var err error
+	releaseOnCleanup(t, open, done, worker)
+	go func() {
+		err = run()
+		close(done)
+	}()
+	return func() error {
+		t.Helper()
+		waitFor(t, done, worker)
+		return err
+	}
 }
 
 // A normal attach configures the tap and serves DNS on the gateway of the
@@ -335,7 +352,7 @@ func TestDetachReservesLinkUntilDNSClosed(t *testing.T) {
 	h.dnsClosing, h.dnsRelease = closing, release
 	h.mu.Unlock()
 	done := detachAsync(m, "sandbox-a")
-	releaseOnCleanup(t, openRelease, done)
+	releaseOnCleanup(t, openRelease, done, "Detach")
 	waitFor(t, closing, "DNS close to start")
 	// Later DNS forwarders must not block.
 	h.mu.Lock()
@@ -364,7 +381,7 @@ func TestDetachReservesLinkUntilTapDeleted(t *testing.T) {
 	h.delStarted, h.delRelease = started, release
 	h.mu.Unlock()
 	done := detachAsync(m, "sandbox-a")
-	releaseOnCleanup(t, openRelease, done)
+	releaseOnCleanup(t, openRelease, done, "Detach")
 	waitFor(t, started, "tap deletion to start")
 	// Later deletions must not block.
 	h.mu.Lock()
@@ -508,7 +525,7 @@ func TestAttachDuringPendingDetachKeepsDistinctTap(t *testing.T) {
 	h.dnsClosing = closing
 	h.mu.Unlock()
 	done := detachAsync(m, idA)
-	releaseOnCleanup(t, openRelease, done)
+	releaseOnCleanup(t, openRelease, done, "Detach")
 	waitFor(t, closing, "DNS close start")
 	// Later DNS forwarders must not block.
 	h.mu.Lock()
@@ -710,6 +727,7 @@ func TestFailedAttachRemovesDNSRulesAppliedByIndependentRefresh(t *testing.T) {
 		releaseRead = make(chan struct{})
 		attachReady = make(chan struct{})
 	)
+	openRelease := onceFunc(releaseRead)
 	m.hostRoutes = func() ([]Route, []netip.Prefix, error) {
 		mu.Lock()
 		routeReads++
@@ -742,38 +760,21 @@ func TestFailedAttachRemovesDNSRulesAppliedByIndependentRefresh(t *testing.T) {
 		return refresh()
 	}
 
-	independent := make(chan error, 1)
-	go func() { independent <- m.Refresh() }()
-	waitFor := func(ch <-chan struct{}, what string) {
-		t.Helper()
-		select {
-		case <-ch:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for %s", what)
-		}
-	}
-	waitFor(routesRead, "the independent refresh to read the routes")
+	waitIndependent := startGatedWorker(t, openRelease, "independent refresh", m.Refresh)
+	waitFor(t, routesRead, "the independent refresh to read the routes")
 
-	attachErr := make(chan error, 1)
-	go func() {
+	waitAttach := startGatedWorker(t, openRelease, "Attach(sandbox-b)", func() error {
 		_, _, err := m.Attach("sandbox-b")
-		attachErr <- err
-	}()
-	waitFor(attachReady, "the attach to stage its assignment")
-	close(releaseRead)
+		return err
+	})
+	waitFor(t, attachReady, "the attach to stage its assignment")
+	openRelease()
 
-	for _, ch := range []chan error{independent, attachErr} {
-		select {
-		case err := <-ch:
-			if ch == independent && err != nil {
-				t.Fatalf("independent refresh: %v", err)
-			}
-			if ch == attachErr && !errors.Is(err, wantRoutes) {
-				t.Fatalf("Attach error = %v, want the route read error", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for the refreshes to finish")
-		}
+	if err := waitIndependent(); err != nil {
+		t.Fatalf("independent refresh: %v", err)
+	}
+	if err := waitAttach(); !errors.Is(err, wantRoutes) {
+		t.Fatalf("Attach error = %v, want the route read error", err)
 	}
 
 	scripts := applied()
@@ -969,20 +970,20 @@ func TestManagerRefreshInFlightDuringCleanupHost(t *testing.T) {
 	m.Detach("sandbox-a")
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	openRelease := onceFunc(release)
 	m.hostRoutes = func() ([]Route, []netip.Prefix, error) {
 		close(entered)
 		<-release
 		return nil, nil, nil
 	}
-	done := make(chan error, 1)
-	go func() { done <- m.Refresh() }()
-	<-entered
+	waitRefresh := startGatedWorker(t, openRelease, "Refresh during CleanupHost", m.Refresh)
+	waitFor(t, entered, "the route read before CleanupHost")
 	if err := m.CleanupHost(); err != nil {
 		t.Fatalf("CleanupHost: %v", err)
 	}
 	n := len(applied())
-	close(release)
-	if err := <-done; err != nil {
+	openRelease()
+	if err := waitRefresh(); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	if got := len(applied()); got != n {
@@ -1008,6 +1009,7 @@ func TestManagerRefreshSerializesRouteSnapshots(t *testing.T) {
 	firstEntered := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	secondEntered := make(chan struct{})
+	openRelease := onceFunc(releaseFirst)
 	m.hostRoutes = func() ([]Route, []netip.Prefix, error) {
 		switch reads.Add(1) {
 		case 1:
@@ -1019,21 +1021,19 @@ func TestManagerRefreshSerializesRouteSnapshots(t *testing.T) {
 			return nil, second, nil
 		}
 	}
-	firstDone := make(chan error, 1)
-	go func() { firstDone <- m.Refresh() }()
+	waitFirst := startGatedWorker(t, openRelease, "first Refresh", m.Refresh)
 	waitFor(t, firstEntered, "the first route read")
-	secondDone := make(chan error, 1)
-	go func() { secondDone <- m.Refresh() }()
+	waitSecond := startGatedWorker(t, openRelease, "second Refresh", m.Refresh)
 	select {
 	case <-secondEntered:
 		t.Fatal("the second refresh read the routes while the first was in flight")
 	case <-time.After(100 * time.Millisecond):
 	}
-	close(releaseFirst)
-	if err := <-firstDone; err != nil {
+	openRelease()
+	if err := waitFirst(); err != nil {
 		t.Fatalf("first Refresh: %v", err)
 	}
-	if err := <-secondDone; err != nil {
+	if err := waitSecond(); err != nil {
 		t.Fatalf("second Refresh: %v", err)
 	}
 	v4, v6 := Blocked(nil, second)
