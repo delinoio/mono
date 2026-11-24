@@ -210,14 +210,19 @@ func (m *Metering) runTick(ctx context.Context) {
 				_, _ = m.SampleStorage(ctx)
 			}
 			if n, err := m.Seal(ctx); err == nil && n > 0 {
-				m.kickReport()
+				m.WakeReporter()
 			}
 		}
 		_ = m.RefreshMetrics(ctx)
 	}
 }
 
-func (m *Metering) kickReport() {
+// WakeReporter queues a report pass without waiting for the reporter.
+// The reporter checks the lease before it sends a batch.
+func (m *Metering) WakeReporter() {
+	if !m.ReportingEnabled() {
+		return
+	}
 	select {
 	case m.kick <- struct{}{}:
 	default:
@@ -239,11 +244,9 @@ func (m *Metering) runReport(ctx context.Context) {
 		case <-timer.C():
 		case <-m.kick:
 		}
-		// An instance that does not hold the lease checks it again after one
-		// Tick, so a new holder reports the due rows that an earlier holder
-		// left in the outbox without waiting for the idle Report interval.
-		// The holder waits the longer Report interval, or until the next
-		// row is due.
+		// A lease acquisition or seal can interrupt the wait. An instance
+		// without the lease checks again after one Tick. The holder waits
+		// the longer Report interval or until the next row is due.
 		wait := m.timing.Tick
 		if m.held() {
 			wait = m.timing.Report
