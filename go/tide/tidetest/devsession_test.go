@@ -4,8 +4,12 @@ package tidetest
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -17,6 +21,90 @@ import (
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
+
+func TestWriteDevSessionFileRejectsNegativeOffsets(t *testing.T) {
+	const writeID, fileName = "write-offset", "out.txt"
+	workspace := t.TempDir()
+	s := New()
+	t.Cleanup(s.Close)
+	org := s.AddOrganization("write test").GetOrganizationId()
+	profile := s.AddDevSessionProfile(org, "write", tidev1.GuestOs_GUEST_OS_LINUX, workspace)
+	client := tidev1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+	ctx := t.Context()
+	session, err := client.CreateDevSession(ctx, listTestRequest(&tidev1.CreateDevSessionRequest{
+		OrganizationId: org, RunnerProfileId: profile.GetRunnerProfileId(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := session.Msg.GetDevSession().GetDevSessionId()
+	write := func(offset int64, data string, final bool) (*connect.Response[tidev1.WriteDevSessionFileResponse], error) {
+		return client.WriteDevSessionFile(ctx, listTestRequest(&tidev1.WriteDevSessionFileRequest{
+			OrganizationId: org, DevSessionId: sessionID, WriteId: writeID, Path: fileName,
+			Offset: offset, Data: []byte(data), Final: final,
+		}))
+	}
+	requireInvalid := func(t *testing.T, offset int64, err error, want string) {
+		t.Helper()
+		var rpcErr *connect.Error
+		if !errors.As(err, &rpcErr) || rpcErr.Code() != connect.CodeInvalidArgument || rpcErr.Message() != want {
+			t.Errorf("offset %d: got %v, want InvalidArgument (%s)", offset, err, want)
+		}
+	}
+	checkNegativeOffsets := func(t *testing.T) {
+		for _, chunk := range []struct {
+			offset int64
+			data   string
+			final  bool
+		}{
+			{-1, "x", false},
+			{-3, "xyz", true},
+			{-5, "0123456789", false},
+			{math.MinInt64, "", true},
+		} {
+			_, err := write(chunk.offset, chunk.data, chunk.final)
+			requireInvalid(t, chunk.offset, err, "invalid offset: must not be negative")
+		}
+	}
+	requireWrite := func(offset int64, data string, final bool) {
+		t.Helper()
+		res, err := write(offset, data, final)
+		if err != nil {
+			t.Fatalf("write at offset %d: %v", offset, err)
+		}
+		if res.Msg.GetFinished() != final || (final && res.Msg.GetSizeBytes() != offset+int64(len(data))) {
+			t.Fatalf("unexpected response to write at offset %d: %v", offset, res.Msg)
+		}
+	}
+
+	t.Run("new write", func(t *testing.T) {
+		checkNegativeOffsets(t)
+		s.guest.mu.Lock()
+		_, exists := s.guest.writes[writeID]
+		s.guest.mu.Unlock()
+		if exists {
+			t.Error("a rejected request created a pending write")
+		}
+	})
+	requireWrite(0, "abc", false)
+	t.Run("pending write", checkNegativeOffsets)
+	_, err = write(4, "x", false)
+	requireInvalid(t, 4, err, "chunk at offset 4 does not continue the write at 3")
+	_, err = write(0, "xyz", false)
+	requireInvalid(t, 0, err, "chunk at offset 0 does not continue the write at 3")
+	requireWrite(3, "def", false)
+	requireWrite(0, "abc", false)
+	requireWrite(6, "ghi", true)
+	t.Run("finished write", checkNegativeOffsets)
+
+	data, err := os.ReadFile(filepath.Join(workspace, fileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "abcdefghi" {
+		t.Errorf("got file contents %q, want abcdefghi", data)
+	}
+}
 
 func TestListDevSessionsFilters(t *testing.T) {
 	const (

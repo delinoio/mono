@@ -358,6 +358,9 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 	if m.GetWriteId() == "" || len(m.GetData()) > 1<<20 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("write_id is required and a chunk holds at most 1 MiB"))
 	}
+	if m.GetOffset() < 0 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid offset: must not be negative"))
+	}
 	g := d.s.guest
 	g.mu.Lock()
 	defer g.mu.Unlock()
