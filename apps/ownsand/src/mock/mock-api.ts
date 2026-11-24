@@ -577,6 +577,8 @@ export interface MockTransportOptions {
    * row.
    */
   extraApiKeys?: number;
+  /** Pending invitations to add after the seeded Acme invitation. */
+  extraInvitations?: number;
   /** Online Linux devices to add after the two seeded Acme devices. */
   extraDevices?: number;
   /** Ready snapshots to add after the seeded Acme snapshot. */
@@ -828,6 +830,16 @@ export function createMockTransport(
       template.templateId = newMockId();
       template.name = `Template ${String(i + 2).padStart(3, "0")}`;
       acmeOrg.templates.push(template);
+    }
+    const seededInvitation = acmeOrg.invitations[0]!.invitation;
+    for (let i = 0; i < (options.extraInvitations ?? 0); i++) {
+      const invitation = clone(InvitationSchema, seededInvitation);
+      invitation.invitationId = newMockId();
+      invitation.secretPrefix = `osi_${String(i).padStart(4, "0")}`;
+      acmeOrg.invitations.push({
+        invitation,
+        secret: `${invitation.secretPrefix}_unused`,
+      });
     }
     for (let i = 0; i < (options.extraEnrollmentTokens ?? 0); i++) {
       acmeOrg.tokens.push(
@@ -1180,7 +1192,12 @@ export function createMockTransport(
               expireTime !== undefined &&
               timestampMs(expireTime) > cutoff,
           );
-        return { invitations };
+        const { page, nextPageToken } = pageOf(
+          invitations,
+          req,
+          (invitation) => invitation.invitationId,
+        );
+        return { invitations: page, nextPageToken };
       },
       revokeInvitation(req) {
         const { org, role } = membership(req.organizationId);
