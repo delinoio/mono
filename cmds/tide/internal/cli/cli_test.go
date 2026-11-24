@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,19 +18,23 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
+
 	"github.com/delinoio/mono/cmds/internal/credstore"
 	"github.com/delinoio/mono/go/tide"
 	"github.com/delinoio/mono/go/tide/tidetest"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
 
 type fixture struct {
-	t   *testing.T
-	srv *tidetest.Server
-	org string
-	cfg string
-	env map[string]string
-	wd  string
+	t          *testing.T
+	srv        *tidetest.Server
+	org        string
+	cfg        string
+	env        map[string]string
+	wd         string
+	httpClient *http.Client
 }
 
 // newFixture starts a fake tide-api and stores Logto tokens that the fake
@@ -236,11 +241,17 @@ func TestSessionExecJSONResumesBufferedUTF8(t *testing.T) {
 
 func (f *fixture) run(stdin string, args ...string) result {
 	f.t.Helper()
+	return f.runContext(context.Background(), stdin, args...)
+}
+
+func (f *fixture) runContext(ctx context.Context, stdin string, args ...string) result {
+	f.t.Helper()
 	var out, errb bytes.Buffer
-	code := Run(context.Background(), Env{
+	code := Run(ctx, Env{
 		Args: args, Stdin: strings.NewReader(stdin), Stdout: &out, Stderr: &errb,
-		LookupEnv: func(k string) (string, bool) { v, ok := f.env[k]; return v, ok },
-		Getwd:     func() (string, error) { return f.wd, nil },
+		LookupEnv:  func(k string) (string, bool) { v, ok := f.env[k]; return v, ok },
+		Getwd:      func() (string, error) { return f.wd, nil },
+		HTTPClient: f.httpClient,
 	})
 	return result{code: code, stdout: out.String(), stderr: errb.String()}
 }
@@ -576,4 +587,105 @@ func TestSessionCommands(t *testing.T) {
 	if !strings.Contains(r.stdout, "REQUEST_STATE_ENDED") {
 		t.Fatalf("delete = %s", r.stdout)
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestSessionCreateWaitFailures(t *testing.T) {
+	const getSession = tidev1connect.DevSessionServiceGetDevSessionProcedure
+	const queued = tidev1.RequestState_REQUEST_STATE_QUEUED
+	const starting = tidev1.RequestState_REQUEST_STATE_STARTING
+	denied := connect.NewError(connect.CodePermissionDenied, errors.New("nope"))
+	unavailable := make([]error, 50)
+	for i := range unavailable {
+		unavailable[i] = connect.NewError(connect.CodeUnavailable, errors.New("unavailable"))
+	}
+
+	for _, tc := range []struct {
+		name     string
+		wait     string
+		faults   []error
+		state    tidev1.RequestState
+		cancel   bool
+		stderr   string
+		maxPolls int
+	}{
+		{name: "deadline before first read", wait: "300ms", faults: unavailable, state: queued, stderr: "error: the dev session is still queued after 300ms\n", maxPolls: 1},
+		{name: "first poll fails", wait: "30s", faults: []error{denied}, state: queued, stderr: "error: permission_denied: nope\n", maxPolls: 1},
+		{name: "later poll fails", wait: "30s", faults: []error{nil, denied}, state: starting, stderr: "error: permission_denied: nope\n", maxPolls: 2},
+		{name: "parent canceled", wait: "30s", state: starting, cancel: true, stderr: "error: context canceled\n", maxPolls: 1},
+	} {
+		for _, format := range []string{"text", "json"} {
+			t.Run(tc.name+"/"+format, func(t *testing.T) {
+				t.Parallel()
+				f := newFixture(t)
+				f.env[EnvOrganization] = f.org
+				f.srv.AddDevSessionProfile(f.org, "linux", tidev1.GuestOs_GUEST_OS_LINUX, f.wd)
+				f.srv.NewSessionState = queued
+				f.srv.Fail(getSession, tc.faults...)
+
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				// Return a different state from polling so the test can distinguish it from creation.
+				if tc.state == starting {
+					f.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						if r.URL.Path == getSession {
+							if f.srv.Calls(getSession) == 0 {
+								session := f.srv.Sessions()[0]
+								f.srv.SetSessionState(session.GetDevSessionId(), starting)
+							} else if tc.cancel {
+								// The SDK has received the first response when it starts the second poll.
+								cancel()
+								return nil, r.Context().Err()
+							}
+						}
+						return http.DefaultTransport.RoundTrip(r)
+					})}
+				}
+
+				r := f.runContext(ctx, "", "--output", format, "session", "create", "linux", "--wait", tc.wait)
+				if r.code != ExitError || r.stderr != tc.stderr {
+					t.Fatalf("create --wait = %d, stderr %q, want %d and %q", r.code, r.stderr, ExitError, tc.stderr)
+				}
+				sessions := f.srv.Sessions()
+				if len(sessions) != 1 {
+					t.Fatalf("created %d sessions, want one", len(sessions))
+				}
+				id := sessions[0].GetDevSessionId()
+				if format == "json" {
+					var session struct {
+						ID    string `json:"dev_session_id"`
+						State string `json:"state"`
+					}
+					if err := json.Unmarshal([]byte(r.stdout), &session); err != nil || session.ID != id || session.State != tc.state.String() {
+						t.Fatalf("create --wait JSON = %q (%v), want %s in %s", r.stdout, err, id, tc.state)
+					}
+				} else if strings.Count(r.stdout, "dev_session_id: "+id+"\n") != 1 || !strings.Contains(r.stdout, "\nstate: "+tc.state.String()+"\n") {
+					t.Fatalf("create --wait text = %q, want %s in %s", r.stdout, id, tc.state)
+				}
+				if got := f.srv.Calls(getSession); got > tc.maxPolls {
+					t.Errorf("got %d polls, want at most %d", got, tc.maxPolls)
+				}
+				if got := f.srv.Calls(tidev1connect.DevSessionServiceDeleteDevSessionProcedure); got != 0 {
+					t.Errorf("got %d deletes, want none", got)
+				}
+			})
+		}
+	}
+
+	t.Run("explicit wait deadline before first read", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t)
+		f.env[EnvOrganization] = f.org
+		f.srv.AddDevSessionProfile(f.org, "linux", tidev1.GuestOs_GUEST_OS_LINUX, f.wd)
+		f.srv.NewSessionState = queued
+		f.ok("", "session", "create", "linux")
+		id := f.srv.Sessions()[0].GetDevSessionId()
+		f.srv.Fail(getSession, unavailable...)
+		if r := f.run("", "session", "wait", id, "--timeout", "300ms"); r.code != ExitError || r.stdout != "" || r.stderr != "error: context deadline exceeded\n" {
+			t.Fatalf("session wait = %d, stdout %q, stderr %q", r.code, r.stdout, r.stderr)
+		}
+	})
 }
