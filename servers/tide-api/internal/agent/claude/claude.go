@@ -535,13 +535,13 @@ func (v *Vendor) Start(ctx context.Context, g *work.Guest, in integration.Integr
 // Program returns the runner program: one session (--capacity 1) with the
 // work order in SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET, the base directory
 // in the guest home, no health listener, an idle release after IdleRelease
-// minutes (the runner then exits 0) and, when the profile has a max_ttl, a
-// retirement retireMargin before the sandbox's max_ttl.
+// minutes (the runner then exits 0), and retirement retireMargin before the
+// deadline from the stored sandbox TTL when that retirement is still possible.
 func Program(dir string, g *work.Guest, now time.Time) agent.Program {
 	args := []string{"claude", "self-hosted-runner", "--capacity", "1", "--base-dir", agent.HomeArg + runnerBaseDir, "--health-port", "0",
 		"--release-idle-session-min", strconv.Itoa(IdleRelease)}
-	if g.Profile != nil && g.Profile.MaxTTL > 0 {
-		if retire := g.Runner.CreateTime.Add(g.Profile.MaxTTL - retireMargin); retire.After(now.Add(time.Minute)) {
+	if g.SandboxMaxTTL > 0 {
+		if retire := g.Runner.CreateTime.Add(g.SandboxMaxTTL - retireMargin); retire.After(now.Add(time.Minute)) {
 			args = append(args, "--retire-at", strconv.FormatInt(retire.Unix(), 10))
 		}
 	}

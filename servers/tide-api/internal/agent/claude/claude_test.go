@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -112,16 +113,37 @@ func TestInstallScript(t *testing.T) {
 
 func TestProgramRetireAt(t *testing.T) {
 	created := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
-	g := &work.Guest{Runner: &work.Runner{ID: "r1", CreateTime: created}, Profile: &profile.Profile{MaxTTL: 4 * time.Hour}}
-	p := Program("/tmp/tide-runner-r1", g, created.Add(time.Minute))
-	args := strings.Join(p.Args, " ")
-	want := "--retire-at " + strconv.FormatInt(created.Add(4*time.Hour-retireMargin).Unix(), 10)
-	if !strings.Contains(args, "--capacity 1") || !strings.Contains(args, want) || p.CredentialEnv != "SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET" {
-		t.Fatalf("program %q", args)
-	}
-	// A max_ttl that already passed adds no retirement.
-	p = Program("/tmp/tide-runner-r1", g, created.Add(5*time.Hour))
-	if strings.Contains(strings.Join(p.Args, " "), "--retire-at") {
-		t.Fatalf("retire-at in the past: %q", p.Args)
+	retireAt := strconv.FormatInt(created.Add(55*time.Minute).Unix(), 10)
+	for _, tc := range []struct {
+		name      string
+		profile   *profile.Profile
+		storedTTL time.Duration
+		elapsed   time.Duration
+		want      string
+	}{
+		{"raised profile TTL", &profile.Profile{MaxTTL: 8 * time.Hour}, time.Hour, time.Minute, retireAt},
+		{"lowered profile TTL", &profile.Profile{MaxTTL: 30 * time.Minute}, time.Hour, time.Minute, retireAt},
+		{"deleted profile", nil, time.Hour, time.Minute, retireAt},
+		{"over a minute away", nil, time.Hour, 54*time.Minute - time.Second, retireAt},
+		{"exactly a minute away", nil, time.Hour, 54 * time.Minute, ""},
+		{"under a minute away", nil, time.Hour, 54*time.Minute + time.Second, ""},
+		{"in the past", nil, time.Hour, 56 * time.Minute, ""},
+		{"unavailable sandbox TTL", &profile.Profile{MaxTTL: time.Hour}, 0, time.Minute, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := &work.Guest{Runner: &work.Runner{ID: "r1", CreateTime: created}, Profile: tc.profile, SandboxMaxTTL: tc.storedTTL}
+			p := Program("/tmp/tide-runner-r1", g, created.Add(tc.elapsed))
+			if !strings.Contains(strings.Join(p.Args, " "), "--capacity 1") || p.CredentialEnv != "SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET" {
+				t.Fatalf("unexpected program %q", p.Args)
+			}
+			index := slices.Index(p.Args, "--retire-at")
+			if tc.want == "" {
+				if index >= 0 {
+					t.Fatalf("unexpected --retire-at in %q", p.Args)
+				}
+			} else if index < 0 || index+1 == len(p.Args) || p.Args[index+1] != tc.want {
+				t.Fatalf("want --retire-at %s in %q", tc.want, p.Args)
+			}
+		})
 	}
 }
