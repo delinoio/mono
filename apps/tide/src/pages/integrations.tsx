@@ -27,7 +27,11 @@ import {
 import { OwnSandLinkService } from "@delino/tide-protos/v1/ownsand_link_pb";
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import { useState } from "react";
-import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
+import {
+  invalidateServices,
+  MAX_PAGE_SIZE,
+  useAgentIntegrations,
+} from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
@@ -35,6 +39,7 @@ import {
   Detail,
   Empty,
   FormDialog,
+  Loading,
   PageHeader,
   QueryBoundary,
   StateBadge,
@@ -552,10 +557,8 @@ function settingValue(i: AgentIntegration): string {
 function AgentIntegrationsSection({ admin }: { admin: boolean }) {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
-  const list = useQuery(AgentIntegrationService.method.listAgentIntegrations, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const { integrations, hasNextPage, isLoadingMore, query } =
+    useAgentIntegrations(organizationId);
   const remove = useMutation(
     AgentIntegrationService.method.deleteAgentIntegration,
     {
@@ -582,68 +585,72 @@ function AgentIntegrationsSection({ admin }: { admin: boolean }) {
         An agent integration holds the account or pool of one coding-agent
         vendor. Agent session runner profiles name one integration.
       </p>
-      <QueryBoundary query={list} loading="Loading agent integrations">
-        {(data) => {
-          const { integrations } = data;
-          return integrations.length === 0 ? (
-            <Empty title="No agent integrations">
-              {admin
-                ? "Create an integration for Claude Code, Cursor, OpenAI Codex or Devin to run their sessions, or connect GitHub above."
-                : "Ask an admin to create an agent integration."}
-            </Empty>
-          ) : (
-            <ul className="list" aria-label="Agent integrations">
-              {integrations.map((i) => (
-                <li key={i.agentIntegrationId} className="list-row">
-                  <div className="list-main">
-                    <span className="list-title">
-                      {i.name} · {labels.vendor[i.vendor]}
-                    </span>
-                    {settingLabel(i.vendor) !== undefined ? (
-                      <span className="muted">
-                        {settingLabel(i.vendor)}: {settingValue(i)}
+      <QueryBoundary query={query} loading="Loading agent integrations">
+        {() => (
+          <>
+            {isLoadingMore ? (
+              <Loading label="Loading agent integrations" />
+            ) : null}
+            {integrations.length === 0 && !hasNextPage ? (
+              <Empty title="No agent integrations">
+                {admin
+                  ? "Create an integration for Claude Code, Cursor, OpenAI Codex or Devin to run their sessions, or connect GitHub above."
+                  : "Ask an admin to create an agent integration."}
+              </Empty>
+            ) : integrations.length > 0 ? (
+              <ul className="list" aria-label="Agent integrations">
+                {integrations.map((i) => (
+                  <li key={i.agentIntegrationId} className="list-row">
+                    <div className="list-main">
+                      <span className="list-title">
+                        {i.name} · {labels.vendor[i.vendor]}
                       </span>
-                    ) : null}
-                    {i.credentials.map((c) => (
-                      <span className="muted" key={c.credential}>
-                        {labels.credential[c.credential]}:{" "}
-                        {credentialText(c.credentialSet, c.credentialSetAt)}
-                      </span>
-                    ))}
-                    {i.vendor === AgentVendor.OPENAI_CODEX &&
-                    i.webhookUrl !== "" ? (
-                      <span>
-                        Webhook URL to register in the OpenAI project:{" "}
-                        <CopyValue
-                          label={`webhook URL of ${i.name}`}
-                          value={i.webhookUrl}
-                        />
-                      </span>
-                    ) : null}
-                  </div>
-                  {admin ? (
-                    <div className="list-actions">
-                      <Button
-                        variant={ButtonVariant.Secondary}
-                        size={ButtonSize.Small}
-                        onClick={() => setEditing(i)}
-                      >
-                        Edit
-                      </Button>
-                      <Button
-                        variant={ButtonVariant.Danger}
-                        size={ButtonSize.Small}
-                        onClick={() => setDeleting(i)}
-                      >
-                        Delete
-                      </Button>
+                      {settingLabel(i.vendor) !== undefined ? (
+                        <span className="muted">
+                          {settingLabel(i.vendor)}: {settingValue(i)}
+                        </span>
+                      ) : null}
+                      {i.credentials.map((c) => (
+                        <span className="muted" key={c.credential}>
+                          {labels.credential[c.credential]}:{" "}
+                          {credentialText(c.credentialSet, c.credentialSetAt)}
+                        </span>
+                      ))}
+                      {i.vendor === AgentVendor.OPENAI_CODEX &&
+                      i.webhookUrl !== "" ? (
+                        <span>
+                          Webhook URL to register in the OpenAI project:{" "}
+                          <CopyValue
+                            label={`webhook URL of ${i.name}`}
+                            value={i.webhookUrl}
+                          />
+                        </span>
+                      ) : null}
                     </div>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
-          );
-        }}
+                    {admin ? (
+                      <div className="list-actions">
+                        <Button
+                          variant={ButtonVariant.Secondary}
+                          size={ButtonSize.Small}
+                          onClick={() => setEditing(i)}
+                        >
+                          Edit
+                        </Button>
+                        <Button
+                          variant={ButtonVariant.Danger}
+                          size={ButtonSize.Small}
+                          onClick={() => setDeleting(i)}
+                        >
+                          Delete
+                        </Button>
+                      </div>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </>
+        )}
       </QueryBoundary>
       {editing !== undefined ? (
         <IntegrationDialog

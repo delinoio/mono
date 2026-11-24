@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { NumberInput } from "delino-ui/number-input";
 import { Select, SelectOption } from "delino-ui/select";
 import { TextField } from "delino-ui/text-field";
-import { AgentIntegrationService } from "@delino/tide-protos/v1/agent_integration_pb";
 import {
   GuestOs,
   NetworkMode,
@@ -17,15 +16,17 @@ import {
   RunnerProfileService,
 } from "@delino/tide-protos/v1/runner_profile_pb";
 import { useMemo, useState } from "react";
-import { MAX_PAGE_SIZE } from "../api.ts";
+import { useAgentIntegrations } from "../api.ts";
 import { SetupEmpty } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   CopyValue,
   FormDialog,
+  Loading,
   PageHeader,
   QueryBoundary,
+  showsFullError,
 } from "../components/ui.tsx";
 import {
   emptyProfileForm,
@@ -58,19 +59,20 @@ export function ProfilesPage() {
   const queryClient = useQueryClient();
   const admin = can(role, Permission.ManageRunnerProfiles);
   const list = useRunnerProfiles(organizationId);
-  const integrations = useQuery(
-    AgentIntegrationService.method.listAgentIntegrations,
-    { organizationId, pageSize: MAX_PAGE_SIZE },
-  );
+  const agentIntegrations = useAgentIntegrations(organizationId);
+  const { integrations, query: integrationQuery } = agentIntegrations;
+  const integrationsUnavailable = showsFullError(integrationQuery);
   const integrationNames = useMemo(
     () =>
       new Map(
-        (integrations.data?.integrations ?? []).map((i) => [
-          i.agentIntegrationId,
-          `${i.name} (${labels.vendor[i.vendor]})`,
-        ]),
+        integrationsUnavailable
+          ? []
+          : integrations.map((i) => [
+              i.agentIntegrationId,
+              `${i.name} (${labels.vendor[i.vendor]})`,
+            ]),
       ),
-    [integrations.data],
+    [integrations, integrationsUnavailable],
   );
   const remove = useMutation(RunnerProfileService.method.deleteRunnerProfile, {
     onSuccess: () => refreshRunnerProfiles(queryClient),
@@ -91,6 +93,14 @@ export function ProfilesPage() {
           ) : undefined
         }
       />
+      {integrationQuery.error ? (
+        <QueryBoundary
+          query={integrationQuery}
+          loading="Loading agent integrations"
+        >
+          {() => null}
+        </QueryBoundary>
+      ) : null}
       <QueryBoundary
         query={list}
         loading="Loading runner profiles"
@@ -176,6 +186,7 @@ export function ProfilesPage() {
       {editing !== undefined ? (
         <ProfileDialog
           profile={editing === "new" ? undefined : editing}
+          agentIntegrations={agentIntegrations}
           onClose={() => setEditing(undefined)}
         />
       ) : null}
@@ -199,9 +210,11 @@ export function ProfilesPage() {
 /** The create and edit dialog of a runner profile. */
 function ProfileDialog({
   profile,
+  agentIntegrations,
   onClose,
 }: {
   profile: RunnerProfile | undefined;
+  agentIntegrations: ReturnType<typeof useAgentIntegrations>;
   onClose: () => void;
 }) {
   const { organizationId } = useOrg();
@@ -213,10 +226,7 @@ function ProfileDialog({
   );
   const [values, setValues] = useState<ProfileFormValues>(initial);
   const [errors, setErrors] = useState<ProfileErrors>({});
-  const integrations = useQuery(
-    AgentIntegrationService.method.listAgentIntegrations,
-    { organizationId, pageSize: MAX_PAGE_SIZE },
-  );
+  const { integrations, isLoadingMore, query } = agentIntegrations;
   const refresh = () => refreshRunnerProfiles(queryClient);
   const createProfile = useMutation(
     RunnerProfileService.method.createRunnerProfile,
@@ -233,9 +243,12 @@ function ProfileDialog({
     setValues((v) => ({ ...v, [key]: value }));
     setErrors((e) => ({ ...e, [key]: undefined }));
   };
-  const vendor = integrations.data?.integrations.find(
-    (i) => i.agentIntegrationId === values.agentIntegrationId,
-  )?.vendor;
+  const integrationsUnavailable = showsFullError(query);
+  const vendor = integrationsUnavailable
+    ? undefined
+    : integrations.find(
+        (i) => i.agentIntegrationId === values.agentIntegrationId,
+      )?.vendor;
   const creating = profile === undefined;
 
   return (
@@ -250,6 +263,10 @@ function ProfileDialog({
           : "Changes apply to runners that start after the change."
       }
       submitLabel={creating ? "Create profile" : "Save changes"}
+      submitDisabled={
+        values.workloadKind === WorkloadKind.AGENT_SESSION &&
+        (query.isPending || integrationsUnavailable)
+      }
       onSubmit={async () => {
         const found = profileErrors(values, vendor);
         if (Object.keys(found).length > 0) {
@@ -314,24 +331,35 @@ function ProfileDialog({
         </Select>
       </div>
       {values.workloadKind === WorkloadKind.AGENT_SESSION ? (
-        <Select
-          label="Agent integration"
-          value={
-            values.agentIntegrationId === "" ? null : values.agentIntegrationId
-          }
-          onValueChange={(v) => v && set("agentIntegrationId", v)}
-          error={errors.agentIntegrationId}
-          disabled={!creating}
-        >
-          {(integrations.data?.integrations ?? []).map((i) => (
-            <SelectOption
-              key={i.agentIntegrationId}
-              value={i.agentIntegrationId}
-            >
-              {`${i.name} (${labels.vendor[i.vendor]})`}
-            </SelectOption>
-          ))}
-        </Select>
+        <QueryBoundary query={query} loading="Loading agent integrations">
+          {() => (
+            <>
+              {isLoadingMore ? (
+                <Loading label="Loading agent integrations" />
+              ) : null}
+              <Select
+                label="Agent integration"
+                value={
+                  values.agentIntegrationId === ""
+                    ? null
+                    : values.agentIntegrationId
+                }
+                onValueChange={(v) => v && set("agentIntegrationId", v)}
+                error={errors.agentIntegrationId}
+                disabled={!creating}
+              >
+                {integrations.map((i) => (
+                  <SelectOption
+                    key={i.agentIntegrationId}
+                    value={i.agentIntegrationId}
+                  >
+                    {`${i.name} (${labels.vendor[i.vendor]})`}
+                  </SelectOption>
+                ))}
+              </Select>
+            </>
+          )}
+        </QueryBoundary>
       ) : null}
       {values.workloadKind === WorkloadKind.DEV_SESSION ? (
         <TextField

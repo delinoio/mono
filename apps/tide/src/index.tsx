@@ -21,6 +21,7 @@ async function start() {
     import.meta.env.PUBLIC_TIDE_MOCK_API === "true" &&
     CONSOLE_CONFIG.authMode === AuthMode.Mock
       ? (await import("./mock/mock-api.ts")).createMockTransport({
+          agentIntegrationPageSize: 200,
           runnerProfileCount: 201,
         })
       : undefined;

@@ -128,6 +128,7 @@ interface BoundaryQuery<T> {
   isFetching: boolean;
   isFetchNextPageError?: boolean;
   refetch: () => unknown;
+  retryNextPage?: () => void;
 }
 
 export function showsFullError(query: BoundaryQuery<unknown>): boolean {
@@ -188,6 +189,11 @@ export function QueryBoundary<T>({
     <>
       {query.error != null && !query.isFetchNextPageError ? (
         <RefreshFailedNotice query={query} />
+      ) : null}
+      {query.isFetchNextPageError &&
+      !query.isFetching &&
+      query.retryNextPage ? (
+        <ErrorNotice error={query.error} onRetry={query.retryNextPage} />
       ) : null}
       {children(query.data)}
     </>

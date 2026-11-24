@@ -349,6 +349,29 @@ describe("requests", () => {
 });
 
 describe("integrations", () => {
+  test("opens management actions for an integration on the next page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+    const integration = screen
+      .getByRole("list", "Agent integrations")
+      .getByRole("listitem")
+      .filter({ hasText: "claude-team · Claude Code" });
+
+    await integration.getByRole("button", "Edit").tap();
+    await expect(screen.getByRole("dialog", "Edit claude-team")).toBeVisible();
+    await browser.keyboard.press("Escape");
+
+    await integration.getByRole("button", "Delete").tap();
+    await expect(
+      screen.getByRole("alertdialog", "Delete claude-team?"),
+    ).toBeVisible();
+  });
+
   test("keeps the integration edit dialog open after a duplicate rename", async ({
     app,
     screen,
@@ -579,7 +602,7 @@ describe("runner profiles", () => {
       .tap();
     await expect(renamedProfile).toBeHidden();
     await expect(
-      profiles.getByRole("listitem").filter({ hasText: "fixture-linux-198 ·" }),
+      profiles.getByRole("listitem").filter({ hasText: "fixture-linux-197 ·" }),
     ).toBeVisible();
 
     await screen.getByRole("button", "Create runner profile").tap();
@@ -681,6 +704,44 @@ describe("runner profiles", () => {
     await expect(dialog).toBeHidden();
     const row = screen.getByRole("listitem").filter({ hasText: "bounds-test" });
     await expect(row).toContainText("1024 vCPU · 16777216 MiB · 1048576 GiB");
+  });
+});
+
+describe("runner profiles", () => {
+  test("creates an agent-session profile with an integration on the next page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+    await expect(
+      screen.getByText("Integration: claude-team (Claude Code)"),
+    ).toBeVisible();
+    await screen.getByRole("button", "Create runner profile").tap();
+    await expect(screen.getByLabel("Name")).toBeFocused();
+    await browser.keyboard.type("claude-later");
+    await screen.getByRole("combobox", "Workload kind").tap();
+    await screen.getByRole("option", "Agent session").tap();
+    await screen.getByRole("combobox", "Agent integration").tap();
+    await screen.getByRole("option", "claude-team (Claude Code)").tap();
+
+    await screen.getByRole("combobox", "Guest OS").tap();
+    await screen.getByRole("option", "Windows").tap();
+    await screen.getByRole("button", "Create profile").tap();
+    await expect(
+      screen.getByText(
+        "The vendor of this integration does not run on this guest OS.",
+      ),
+    ).toBeVisible();
+
+    await screen.getByRole("combobox", "Guest OS").tap();
+    await screen.getByRole("option", "Linux").tap();
+    await screen.getByRole("button", "Create profile").tap();
+    await expect(
+      screen.getByRole("listitem").filter({ hasText: "claude-later" }),
+    ).toContainText("Integration: claude-team (Claude Code)");
   });
 });
 
