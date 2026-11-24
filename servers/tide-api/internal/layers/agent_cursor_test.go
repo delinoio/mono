@@ -282,6 +282,67 @@ func TestCursorClaimEndsBeforeRunner(t *testing.T) {
 	eventually(t, "the watch stops without a profile", func() bool { return w.cursor.Streams() == 0 })
 }
 
+func TestCursorClaimExpiresAtRunnerBinding(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		raceSweep bool
+	}{
+		{"binding", false},
+		{"competing_sweep", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			wait, resume := holdCreateSandbox(t, w.fake, 1)
+			const key = "bc-binding-deadline"
+			w.cursor.AddRequest(key, true)
+			wait()
+			req := w.requestBySource(t, key)
+			if _, ok := w.cursor.Claim(key); !ok || req.GetState() != tidev1.RequestState_REQUEST_STATE_QUEUED {
+				t.Fatalf("expected a held claim and queued request, got %v", req)
+			}
+
+			if tc.raceSweep {
+				commit := holdTx(t, w.env, "SELECT 1 FROM requests WHERE request_id = $1 FOR UPDATE", req.GetRequestId())
+				w.env.Clock.Advance(time.Hour)
+				resume()
+				waitForLockWaiter(t, w.env)
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					w.l.Engine.Pass(ctx, w.org.ID)
+				}()
+				eventually(t, "binding and the sweep both wait for the request lock", func() bool {
+					var n int
+					err := w.env.DB.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+						WHERE datname = current_database() AND wait_event_type = 'Lock'
+						AND query LIKE '%FROM requests WHERE request_id = $1 FOR UPDATE%'`).Scan(&n)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return n == 2
+				})
+				commit()
+				<-done
+			} else {
+				w.env.Clock.Advance(time.Hour)
+				resume()
+			}
+
+			assertQueueExpiry(t, w.waitRequest(t, req.GetRequestId(), tidev1.RequestState_REQUEST_STATE_EXPIRED))
+			eventually(t, "the claim is released after expiry", func() bool {
+				claim, err := w.l.Agents.Claim(ctx, req.GetRequestId())
+				message, ok := w.cursor.Failed(key)
+				return err == nil && claim.State == agent.ClaimReleased && ok && strings.Contains(message, "maximum queue wait")
+			})
+			assertUnusedSandboxDeleted(t, w.fake, w.osOrg)
+			if got := w.cursor.FailAttempts(key); got != 1 {
+				t.Fatalf("vendor failure notifications: %d, want 1", got)
+			}
+		})
+	}
+}
+
 func TestCursorClaimRejectedWithoutEligibleDevice(t *testing.T) {
 	w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
