@@ -19,7 +19,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 
@@ -396,6 +398,181 @@ func TestSyncCaseCollisionsAndWindowsNames(t *testing.T) {
 	}
 	if srv.Calls(writeProc) != writes {
 		t.Fatal("a rejected sync uploaded")
+	}
+}
+
+func TestSyncInvalidUTF8(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	dir := newRepo(t, map[string]string{"ok.txt": "ok"}, nil, "")
+	const bad = "bad\xffname.txt"
+	badPath := filepath.Join(dir, bad)
+	if err := os.WriteFile(badPath, []byte("new"), 0o644); err != nil {
+		if errors.Is(err, fs.ErrInvalid) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.EILSEQ) {
+			t.Skipf("the local file system rejected a non-UTF-8 file name: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if got := PathRuleInvalidUTF8.String(); got != "invalid_utf8" {
+		t.Fatalf("rule identifier = %q", got)
+	}
+	linux := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	for _, guestOS := range []tidev1.GuestOs{
+		tidev1.GuestOs_GUEST_OS_LINUX, tidev1.GuestOs_GUEST_OS_MACOS, tidev1.GuestOs_GUEST_OS_WINDOWS,
+	} {
+		t.Run(guestOS.String(), func(t *testing.T) {
+			ds := linux
+			if guestOS != tidev1.GuestOs_GUEST_OS_LINUX {
+				ds = newSession(t, c, srv, org, guestOS)
+			}
+			reads, writes, execs := len(srv.ReadRequests()), srv.Calls(writeProc), srv.Calls(execProc)
+			_, err := c.Sync(context.Background(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir, Force: true})
+			var pe *PathRuleError
+			if connect.CodeOf(err) != connect.CodeFailedPrecondition || !errors.As(err, &pe) ||
+				pe.Rule != PathRuleInvalidUTF8 || len(pe.Paths) != 1 || !slices.Equal(pe.Paths[0], []string{bad}) {
+				t.Fatalf("invalid UTF-8 error = %v, path error = %+v", err, pe)
+			}
+			if msg := err.Error(); !utf8.ValidString(msg) || !strings.Contains(msg, strconv.Quote(bad)) {
+				t.Fatalf("error must quote the path and contain valid UTF-8: %q", msg)
+			}
+			if len(srv.ReadRequests()) != reads || srv.Calls(writeProc) != writes || srv.Calls(execProc) != execs {
+				t.Fatal("a rejected sync read or wrote files or ran guest commands")
+			}
+			if _, err := os.Stat(ds.GetWorkspacePath() + manifestSuffix); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("manifest must be absent after rejection: %v", err)
+			}
+		})
+	}
+
+	const valid = "ü.txt"
+	if err := os.Rename(badPath, filepath.Join(dir, valid)); err != nil {
+		t.Fatal(err)
+	}
+	params := SyncParams{OrganizationID: org, DevSessionID: linux.GetDevSessionId(), LocalDir: dir}
+	res, err := c.Sync(context.Background(), params)
+	if err != nil || res.Uploaded != 2 || res.Deleted != 0 || res.Skipped != 0 {
+		t.Fatalf("sync after rename = %+v, %v", res, err)
+	}
+	writes, execs := srv.Calls(writeProc), srv.Calls(execProc)
+	for range 2 {
+		res, err = c.Sync(context.Background(), params)
+		if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 2 || res.BytesSent != 0 {
+			t.Fatalf("unchanged sync = %+v, %v", res, err)
+		}
+	}
+	if srv.Calls(writeProc) != writes || srv.Calls(execProc) != execs {
+		t.Fatal("an unchanged sync wrote files or ran guest commands")
+	}
+	if m := guestManifest(t, linux); !m.PathsValidated || m.Files[valid].Mode != modeFile {
+		t.Fatalf("manifest did not record the valid path %q: %+v", valid, m)
+	}
+}
+
+func TestSyncLegacyAmbiguousUTF8Manifest(t *testing.T) {
+	needPOSIX(t)
+	for _, scenario := range []struct {
+		name              string
+		localHasPath      bool
+		clearMarkerOnLock bool
+	}{
+		{name: "drop stale entry without applying"},
+		{name: "replan when only the validation marker changes", clearMarkerOnLock: true},
+		{name: "reupload matching local file before managing it", localHasPath: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			ws := ds.GetWorkspacePath()
+			const raw = "entry-\xff.txt"
+			const replacement = "entry-\ufffd.txt"
+			tracked := map[string]string{"ok.txt": "ok"}
+			if scenario.localHasPath {
+				tracked[replacement] = "old local"
+			}
+			dir := newRepo(t, tracked, nil, "")
+			for name, contents := range map[string]string{"ok.txt": "ok", replacement: "guest created", raw: "old local"} {
+				if err := os.WriteFile(filepath.Join(ws, name), []byte(contents), 0o644); err != nil {
+					if name == raw && (errors.Is(err, fs.ErrInvalid) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.EILSEQ)) {
+						t.Skipf("the guest file system rejected a non-UTF-8 file name: %v", err)
+					}
+					t.Fatal(err)
+				}
+			}
+			okHash := sha256.Sum256([]byte("ok"))
+			oldHash := sha256.Sum256([]byte("old local"))
+			m := manifest{
+				Version: manifestVersion,
+				Files: map[string]manifestEntry{
+					"ok.txt":    {Size: 2, SHA256: hex.EncodeToString(okHash[:]), Mode: modeFile},
+					replacement: {Size: 9, SHA256: hex.EncodeToString(oldHash[:]), Mode: modeFile},
+				},
+				PathsValidated: scenario.clearMarkerOnLock,
+			}
+			writeManifest := func(m manifest) error {
+				body, err := json.Marshal(m)
+				if err != nil {
+					return err
+				}
+				return os.WriteFile(ws+manifestSuffix, body, 0o644)
+			}
+			if err := writeManifest(m); err != nil {
+				t.Fatal(err)
+			}
+			if scenario.clearMarkerOnLock {
+				srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+					if req.GetEnv()[guestEnvForce] != "" {
+						legacy := m
+						legacy.PathsValidated = false
+						if err := writeManifest(legacy); err != nil {
+							t.Error(err)
+						}
+					}
+				}
+			}
+			ctx := context.Background()
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			writes, execs := srv.Calls(writeProc), srv.Calls(execProc)
+			res, err := c.Sync(ctx, params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := guestManifest(t, ds)
+			if !next.PathsValidated || next.Version != manifestVersion || next.Files["ok.txt"].Mode != modeFile {
+				t.Fatalf("updated manifest = %+v", next)
+			}
+			if res.Deleted != 0 || res.Skipped != 1 || readGuest(t, ds, raw) != "old local" {
+				t.Fatalf("sync must preserve the raw-byte guest file and skip ok.txt: %+v", res)
+			}
+			if scenario.localHasPath {
+				if res.Uploaded != 1 || len(res.Warnings) != 0 || next.Files[replacement].Mode != modeFile ||
+					readGuest(t, ds, replacement) != "old local" {
+					t.Fatalf("sync must reupload the selected U+FFFD path: %+v, manifest %+v", res, next)
+				}
+				if err := os.Remove(filepath.Join(dir, replacement)); err != nil {
+					t.Fatal(err)
+				}
+				res, err = c.Sync(ctx, params)
+				if err != nil || res.Deleted != 1 || len(res.Warnings) != 0 {
+					t.Fatalf("deletion from a validated manifest = %+v, %v", res, err)
+				}
+				if _, err := os.Stat(filepath.Join(ws, replacement)); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("validated U+FFFD path must be deleted: %v", err)
+				}
+				return
+			}
+			if res.Uploaded != 0 || res.BytesSent != 0 || len(res.Warnings) != 1 ||
+				!strings.Contains(res.Warnings[0], strconv.Quote(replacement)) || len(next.Files) != 1 ||
+				readGuest(t, ds, replacement) != "guest created" {
+				t.Fatalf("sync must warn, preserve the guest file and drop the stale entry: %+v, manifest %+v", res, next)
+			}
+			if srv.Calls(writeProc)-writes != 1 || srv.Calls(execProc)-execs != 2 {
+				t.Fatal("a manifest-only update must write the manifest and only run lock and cleanup commands")
+			}
+			res, err = c.Sync(ctx, params)
+			if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 1 || len(res.Warnings) != 0 {
+				t.Fatalf("unchanged sync after dropping the stale entry = %+v, %v", res, err)
+			}
+		})
 	}
 }
 
