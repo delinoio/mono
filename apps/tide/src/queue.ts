@@ -19,6 +19,8 @@ export enum LiveState {
    * last state until the new snapshot is complete.
    */
   Reconnecting = "reconnecting",
+  /** The stream stopped with an error. The view keeps the last state. */
+  Disconnected = "disconnected",
 }
 
 /** The live queue view: non-terminal requests and runners by ID. */
@@ -41,11 +43,13 @@ export enum QueueViewActionKind {
    * manual retry. The new stream starts with a snapshot and without a `Gap`.
    */
   Restart = "restart",
+  StreamFailed = "stream_failed",
 }
 
 /** An action of the queue view reducer. */
 export type QueueViewAction =
-  WatchQueueEvent | { kind: QueueViewActionKind.Restart };
+  | WatchQueueEvent
+  | { kind: QueueViewActionKind.Restart | QueueViewActionKind.StreamFailed };
 
 /** A new view before the first snapshot. */
 export function initialQueueView(): QueueView {
@@ -85,6 +89,10 @@ export function applyQueueEvent(
   event: QueueViewAction,
 ): QueueView {
   switch (event.kind) {
+    case QueueViewActionKind.StreamFailed:
+      return view.live === LiveState.Connecting
+        ? view
+        : { ...view, live: LiveState.Disconnected, pending: undefined };
     case QueueViewActionKind.Restart:
       return {
         ...view,

@@ -44,6 +44,7 @@ const LIVE_TEXT: Record<LiveState, string> = {
   [LiveState.Connecting]: "Connecting",
   [LiveState.Live]: "Live",
   [LiveState.Reconnecting]: "Reconnecting",
+  [LiveState.Disconnected]: "Disconnected",
 };
 
 /** How often the waiting time of queued requests is redrawn. */
@@ -84,7 +85,10 @@ export function OverviewPage() {
           dispatch(event);
         }
       } catch (error) {
-        if (!abort.signal.aborted) setStreamError(error);
+        if (!abort.signal.aborted) {
+          dispatch({ kind: QueueViewActionKind.StreamFailed });
+          setStreamError(error);
+        }
       }
     })();
     return () => abort.abort();

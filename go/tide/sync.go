@@ -37,8 +37,8 @@ const (
 	lockSuffix     = ".tide-sync.lock"
 )
 
-// manifestReadLimit bounds the manifest that sync reads.
-const manifestReadLimit int64 = 256 << 20
+// syncManifestLimit bounds the encoded manifest that sync reads and writes.
+const syncManifestLimit int64 = 256 << 20
 
 // cleanupTimeout bounds the guest clean-up after a failed sync or download.
 const cleanupTimeout = 30 * time.Second
@@ -81,13 +81,16 @@ type SyncResult struct {
 //     in LocalDir; submodules and nested repositories are skipped.
 //  2. The guest manifest <workspace_path>.tide-sync.json lists the synced
 //     paths with size, SHA-256 and mode; a missing or unreadable manifest
-//     counts as empty. An absent workspace also invalidates its manifest.
+//     counts as empty unless it exceeds the manifest size limit. If the
+//     lock command finds a missing workspace, sync replans against an
+//     empty manifest.
 //  3. New and changed files are uploaded. Manifest paths that are no longer
 //     listed are deleted. Guest files that are not in the manifest stay.
 //     With an older manifest that lacks UTF-8 validation, sync leaves an
 //     absent path with U+FFFD on the guest and drops its entry with a warning.
 //  4. A changed file above 100 MiB or changed files above 2 GiB in total
-//     fail the sync before any upload (*LimitError).
+//     fail the sync before any upload (*LimitError). A guest or candidate
+//     manifest above 256 MiB fails with failed_precondition.
 //  5. Paths that are not valid UTF-8 (all guests), paths that differ only
 //     in case (Windows and macOS guests), and paths that are not valid on
 //     Windows (Windows guests) fail before the lock and any upload
@@ -105,6 +108,10 @@ type SyncResult struct {
 // old manifest unless apply removed a stale one during workspace recovery.
 // In either case, the next sync sends the same files again.
 func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
+	return c.sync(ctx, p, syncManifestLimit)
+}
+
+func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*SyncResult, error) {
 	report := func(tp TransferProgress) {
 		if p.Progress != nil {
 			p.Progress(tp)
@@ -137,7 +144,7 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 		return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleInvalidUTF8, Paths: invalidUTF8})
 	}
 
-	old, err := c.readManifest(ctx, s)
+	old, err := c.readManifest(ctx, s, manifestLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -166,6 +173,20 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	if plan.empty() {
 		report(TransferProgress{Phase: TransferDone})
 		return plan.res, nil
+	}
+
+	// Check the encoded manifest before taking the lock or uploading anything.
+	// Apply can only make it smaller by leaving out failed Windows links.
+	next := manifest{Version: manifestVersion, Files: make(map[string]manifestEntry, len(local.files)), PathsValidated: true}
+	for _, f := range local.files {
+		next.Files[f.rel] = f.entry
+	}
+	body, err := json.Marshal(next)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > manifestLimit {
+		return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sync candidate manifest exceeds the size limit of %d bytes (encoded size %d bytes)", manifestLimit, len(body)))
 	}
 
 	// Step 6: the lock.
@@ -202,13 +223,12 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 		}
 	}()
 
-	// Another sync can write the manifest after the first read and release
-	// its lock before this sync takes it. The plan is therefore made again
-	// from the manifest that the lock now protects when that manifest
-	// differs from the first one.
+	// Another sync can write the manifest before this sync takes the lock.
+	// Reread it under the lock when the workspace exists. When the workspace
+	// is missing, plan against an empty manifest to restore all local files.
 	var cur manifest
 	if !workspaceMissing {
-		cur, err = c.readManifest(ctx, s)
+		cur, err = c.readManifest(ctx, s, manifestLimit)
 		if err != nil {
 			return nil, err
 		}
@@ -341,17 +361,15 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 		}
 	}
 
-	next := manifest{Version: manifestVersion, Files: map[string]manifestEntry{}, PathsValidated: true}
-	for _, f := range local.files {
-		if failedLinks[f.rel] {
-			// Left out, so the next sync tries the link again.
-			continue
+	if len(failedLinks) > 0 {
+		// Leave out failed links so the next sync tries them again.
+		for rel := range failedLinks {
+			delete(next.Files, rel)
 		}
-		next.Files[f.rel] = f.entry
-	}
-	body, err := json.Marshal(next)
-	if err != nil {
-		return nil, err
+		body, err = json.Marshal(next)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if _, err := c.writeGuestFile(ctx, s, guestSibling(s, manifestSuffix), 0o644, bytes.NewReader(body), nil); err != nil {
 		return nil, err
@@ -372,15 +390,18 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 }
 
 // readManifest reads the guest manifest. A missing or unreadable manifest
-// counts as empty; only a cancelled caller and errors that also stop every
-// later step of the sync (credential, permission and session state errors)
-// end the sync.
-func (c *Client) readManifest(ctx context.Context, s *tidev1.DevSession) (manifest, error) {
+// counts as empty. An oversized manifest, cancellation, and credential,
+// permission or session state errors end the sync.
+func (c *Client) readManifest(ctx context.Context, s *tidev1.DevSession, manifestLimit int64) (manifest, error) {
 	var b bytes.Buffer
-	_, err := c.readGuestFile(ctx, s, guestSibling(s, manifestSuffix), manifestReadLimit, &b, nil)
+	_, err := c.readGuestFile(ctx, s, guestSibling(s, manifestSuffix), manifestLimit, &b, nil)
 	if err != nil {
 		if ctx.Err() != nil {
 			return manifest{}, ctx.Err()
+		}
+		var limitError *LimitError
+		if errors.As(err, &limitError) {
+			return manifest{}, localError(connect.CodeFailedPrecondition, fmt.Errorf("sync guest manifest exceeds the size limit of %d bytes", manifestLimit))
 		}
 		switch connect.CodeOf(err) {
 		case connect.CodeUnauthenticated, connect.CodePermissionDenied, connect.CodeFailedPrecondition:
