@@ -108,6 +108,14 @@ The control plane serves every public service at `https://tide.api.delino.io`. E
 
 Use `resources` to replace all resource values. Use `resources.vcpu_count`, `resources.memory_mib` or `resources.disk_gib` to change individual values. The server keeps the current value of each omitted resource and validates the resulting profile.
 
+When the OwnSand link is `ACTIVE`, `CreateRunnerProfile` checks template sources. `UpdateRunnerProfile` checks a template source when the template ID changes or the mask includes `guest_os`. A missing or `INVALID` link skips this check. If the check fails, the RPC saves no profile changes.
+
+- OwnSand `not_found` or a guest OS mismatch returns `invalid_argument`.
+- OwnSand `unauthenticated` or `permission_denied` returns `failed_precondition` with `OwnSand rejected the organization's OwnSand API key`. Only `unauthenticated` marks the link `INVALID` if the rejected key is still the stored key.
+- OwnSand `resource_exhausted` returns `resource_exhausted` with the OwnSand message prefixed by `OwnSand: `.
+- OwnSand `unavailable` or `deadline_exceeded` returns `unavailable` with `OwnSand is unavailable; try again`.
+- Other OwnSand Connect errors return `internal` with `internal error`. Local request cancellation returns `canceled`.
+
 ### Agent integration messages
 
 `AgentIntegration` has `agent_integration_id`, `vendor`, `name`, a vendor settings `oneof` and the credential state: one `AgentCredentialState` (`AgentCredential`, `credential_set` and `credential_set_at`) for each credential of the vendor. Create and update requests carry the credentials in a vendor credentials `oneof`; `UpdateAgentIntegration` uses a field mask with the paths `name`, `settings` and `credentials`, and replaces only the non-empty credential fields. The settings and credentials per vendor:
