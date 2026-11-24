@@ -197,6 +197,132 @@ func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
 	}
 }
 
+func TestSyncSkipsStaleSymlinkDescendants(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ctx := context.Background()
+	const (
+		replacement = "src/former"
+		descendant  = replacement + "/inner/file.txt"
+		target      = "../target"
+		targetFile  = "target/inner/file.txt"
+	)
+	for _, tc := range []struct {
+		name          string
+		targetContent string
+		ignored       bool
+	}{
+		{name: "matching target content", targetContent: "old"},
+		{name: "different target content", targetContent: "new"},
+		{name: "ignored link", targetContent: "old", ignored: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := newRepo(t, map[string]string{
+				descendant:     "old",
+				targetFile:     tc.targetContent,
+				"src/keep.txt": "keep",
+			}, nil, "")
+			if err := os.Symlink(targetFile, filepath.Join(dir, "standalone")); err != nil {
+				t.Fatal(err)
+			}
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(ctx, params); err != nil {
+				t.Fatal(err)
+			}
+			old := guestManifest(t, ds)
+			indexPath := filepath.Join(dir, ".git", "index")
+			indexBefore, err := os.ReadFile(indexPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.ignored {
+				exclude := filepath.Join(dir, ".git", "info", "exclude")
+				if err := os.WriteFile(exclude, []byte("/"+replacement+"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			link := filepath.Join(dir, replacement)
+			if err := os.RemoveAll(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+
+			local, err := listLocalFiles(ctx, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected := make(map[string]localFile, len(local.files))
+			for _, f := range local.files {
+				selected[f.rel] = f
+			}
+			if _, ok := selected[descendant]; ok {
+				t.Fatalf("selection includes stale path %q", descendant)
+			}
+			for _, rel := range []string{"src/keep.txt", targetFile, "standalone"} {
+				if f, ok := selected[rel]; !ok || f.entry != old.Files[rel] {
+					t.Fatalf("selection changed %q: %+v", rel, f)
+				}
+			}
+			f, hasLink := selected[replacement]
+			if tc.ignored && hasLink {
+				t.Fatalf("selection includes ignored link %q", replacement)
+			}
+			if !tc.ignored && (!hasLink || f.entry.Mode != modeSymlink || f.target != target) {
+				t.Fatalf("selection for %q = %+v", replacement, f)
+			}
+
+			plan, err := planSync(local, old)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(plan.deleted, []string{descendant}) {
+				t.Fatalf("planned deletions = %v, want [%s]", plan.deleted, descendant)
+			}
+			var wantChanges []localFile
+			if !tc.ignored {
+				wantChanges = []localFile{f}
+			}
+			if !slices.Equal(plan.changed, wantChanges) {
+				t.Fatalf("planned changes = %+v, want %+v", plan.changed, wantChanges)
+			}
+
+			res, err := c.Sync(ctx, params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Uploaded != len(wantChanges) || res.Deleted != 1 {
+				t.Fatalf("second sync = %+v", res)
+			}
+			m := guestManifest(t, ds)
+			if _, ok := m.Files[descendant]; ok {
+				t.Fatalf("guest manifest still includes %q", descendant)
+			}
+			if _, ok := m.Files[replacement]; ok != hasLink {
+				t.Fatalf("guest manifest link %q present = %t, want %t", replacement, ok, hasLink)
+			}
+			if hasLink {
+				if got, err := os.Readlink(filepath.Join(ds.GetWorkspacePath(), replacement)); err != nil || got != target {
+					t.Fatalf("guest symbolic link = %q, %v", got, err)
+				}
+			}
+			if got := readGuest(t, ds, targetFile); got != tc.targetContent {
+				t.Fatalf("guest target content = %q, want %q", got, tc.targetContent)
+			}
+			indexAfter, err := os.ReadFile(indexPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(indexBefore, indexAfter) {
+				t.Fatal("sync changed the Git index")
+			}
+		})
+	}
+}
+
 func TestSyncSkipsSubmodulesAndNeedsGit(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
