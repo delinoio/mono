@@ -544,6 +544,12 @@ export function createFakeApi(): FakeApi {
           req.billingAccountId,
           new Set([BillingAccountRole.OWNER]),
         );
+        if (req.userId === self.userId) {
+          throw new ConnectError(
+            "user_id must name another member",
+            Code.InvalidArgument,
+          );
+        }
         const target = account.members.find((m) => m.userId === req.userId);
         if (target === undefined) {
           throw new ConnectError("member not found", Code.NotFound);
