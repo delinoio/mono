@@ -80,6 +80,7 @@ A personal API key authorizes as its user in the organization of the key. The se
 - A personal API key can call only the dev session rows and nothing else; it cannot create, list or revoke API keys.
 - An organization has exactly one `owner`, with the same ownership rules as OwnSand.
 - Invitations are one-time secrets that expire after 7 days. The server stores only their hashes.
+- `AcceptInvitation` checks expiry after locking the organization and invitation rows. It returns `not_found` if the check reaches or passes the expiry time. A successful acceptance uses the time of that check for the membership join and invitation acceptance timestamps.
 
 ### OwnSand link
 

@@ -169,6 +169,12 @@ func TestInvitationsAndMembers(t *testing.T) {
 	carol := env.User("carol")
 	_, err = carol.Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{InvitationSecret: "tdi_bad"}))
 	wantCode(t, "malformed secret", err, connect.CodeNotFound)
+	missing, err := auth.NewSecret(auth.SecretInvitation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = carol.Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{InvitationSecret: missing.Value}))
+	wantCode(t, "missing invitation", err, connect.CodeNotFound)
 	acc, err := carol.Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{InvitationSecret: secret}))
 	if err != nil || acc.Msg.GetMember().GetRole() != tidev1.Role_ROLE_MEMBER || acc.Msg.GetOrganization().GetOrganizationId() != org.ID {
 		t.Fatalf("accept: %v %v", acc, err)
@@ -186,6 +192,8 @@ func TestInvitationsAndMembers(t *testing.T) {
 	}
 	_, err = owner.Member.RevokeInvitation(ctx, connect.NewRequest(&tidev1.RevokeInvitationRequest{OrganizationId: org.ID, InvitationId: inv2.Msg.GetInvitation().GetInvitationId()}))
 	wantCode(t, "revoke twice", err, connect.CodeFailedPrecondition)
+	_, err = env.User("dave").Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{InvitationSecret: inv2.Msg.GetInvitationSecret()}))
+	wantCode(t, "revoked invitation", err, connect.CodeNotFound)
 	inv3, _ := owner.Member.CreateInvitation(ctx, connect.NewRequest(&tidev1.CreateInvitationRequest{OrganizationId: org.ID, Role: tidev1.Role_ROLE_MEMBER}))
 	env.Clock.Advance(7 * 24 * time.Hour)
 	_, err = env.User("erin").Member.AcceptInvitation(ctx, connect.NewRequest(&tidev1.AcceptInvitationRequest{InvitationSecret: inv3.Msg.GetInvitationSecret()}))
