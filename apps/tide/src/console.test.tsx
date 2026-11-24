@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  rs,
+  test,
+} from "@rstest/core";
 import {
   act,
   cleanup,
@@ -8,12 +15,18 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { createClient, type Transport } from "@connectrpc/connect";
+import {
+  Code,
+  ConnectError,
+  createClient,
+  type Transport,
+} from "@connectrpc/connect";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
+import { ErrorNotice } from "./components/ui.tsx";
 import { AuthMode } from "./config.ts";
 import {
   createMockTransport,
@@ -34,6 +47,7 @@ function renderConsole(
   path: string,
   options: {
     signedIn?: boolean;
+    signIn?: Auth["signIn"];
     transport?: Transport;
     mock?: MockTransportOptions;
   } = {},
@@ -44,7 +58,7 @@ function renderConsole(
     isLoading: false,
     isAuthenticated: signedIn,
     userId: signedIn ? MOCK_USER : undefined,
-    signIn: async () => {},
+    signIn: options.signIn ?? (async () => {}),
     signOut: async () => {},
     getAccessToken: async () => "token",
   };
@@ -128,6 +142,66 @@ describe("organizations", () => {
         .getByRole("link", { name: "OwnSand console" })
         .getAttribute("href"),
     ).toBe("https://ownsand.delino.io");
+  });
+});
+
+describe("failed requests", () => {
+  function failingTransport(methodName: string, code: Code): Transport {
+    const mock = createMockTransport();
+    return {
+      ...mock,
+      async unary(method, ...args) {
+        if (method.name === methodName) {
+          throw new ConnectError("Request failed", code);
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+  }
+
+  test.each([
+    ["/", "ListOrganizations"],
+    [`/orgs/${MOCK_IDS.acme}`, "GetOrganization"],
+  ])("offers sign-in when the session ends on %s", async (path, method) => {
+    const signIn = rs.fn(async () => {});
+    renderConsole(path, {
+      signIn,
+      transport: failingTransport(method, Code.Unauthenticated),
+    });
+
+    expect(
+      await screen.findByText("Your session ended. Sign in again."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(signIn).not.toHaveBeenCalled();
+
+    const button = screen.getByRole("button", { name: "Sign in with Delino" });
+    await click(button);
+    expect(signIn).toHaveBeenCalledTimes(1);
+    await click(button);
+    expect(signIn).toHaveBeenCalledTimes(2);
+  });
+
+  test("offers retry when the API is unavailable", async () => {
+    renderConsole("/", {
+      transport: failingTransport("ListOrganizations", Code.Unavailable),
+    });
+
+    expect(
+      await screen.findByRole("button", { name: "Try again" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Sign in with Delino" }),
+    ).toBeNull();
+  });
+
+  test("renders a generic notice without an auth provider", () => {
+    const retry = rs.fn();
+    render(<ErrorNotice error={new Error("Request failed")} onRetry={retry} />);
+
+    expect(screen.getByText("Something went wrong. Try again.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(retry).toHaveBeenCalledTimes(1);
   });
 });
 
