@@ -368,12 +368,16 @@ func (h *Handler) GetCapacity(ctx context.Context, req *connect.Request[tidev1.G
 	resp := &tidev1.GetCapacityResponse{}
 	for _, d := range devices {
 		l, a := d.GetLimits(), d.GetAllocation()
+		allocatedVCPU := int64(a.GetVcpuCount())
+		if a != nil && a.VcpuTotalCount != nil {
+			allocatedVCPU = a.GetVcpuTotalCount()
+		}
 		resp.Devices = append(resp.Devices, &tidev1.DeviceCapacity{
 			OwnsandDeviceId: d.GetDeviceId(), Name: d.GetName(), State: deviceState(d.GetState()),
 			HostOs: label(d.GetHostOs(), "HOST_OS_"), Arch: label(d.GetArch(), "ARCH_"),
 			Limits:             &tidev1.DeviceLimits{VcpuCount: l.GetVcpuCount(), MemoryMib: l.GetMemoryMib(), DiskGib: l.GetDiskGib(), VcpuOvercommitPercent: l.GetVcpuOvercommitPercent()},
 			EffectiveVcpuLimit: d.GetEffectiveVcpuLimitCount(),
-			Allocation:         &tidev1.DeviceAllocation{VcpuCount: int64(a.GetVcpuCount()), MemoryMib: a.GetMemoryMib(), DiskGib: a.GetDiskGib(), MacosGuestCount: a.GetMacosGuestCount()},
+			Allocation:         &tidev1.DeviceAllocation{VcpuCount: allocatedVCPU, MemoryMib: a.GetMemoryMib(), DiskGib: a.GetDiskGib(), MacosGuestCount: a.GetMacosGuestCount()},
 			Runners:            counts[d.GetDeviceId()],
 		})
 	}
