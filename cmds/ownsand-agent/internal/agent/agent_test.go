@@ -1380,19 +1380,23 @@ type updateEnv struct {
 	block    bool
 	keys     []ed25519.PublicKey
 	manifest string
+	install  func(string) error
 }
 
-func (e *updateEnv) Install(string) error {
+func (e *updateEnv) Install(path string) error {
 	if e.installs.Add(1) == 1 {
 		close(e.entered)
 	}
 	if e.block {
 		<-e.unblock
 	}
+	if e.install != nil {
+		return e.install(path)
+	}
 	return nil
 }
 
-func newUpdateEnv(t *testing.T, block bool) *updateEnv {
+func newUpdateEnv(t *testing.T, block bool, revokedVersions ...string) *updateEnv {
 	t.Helper()
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	e := &updateEnv{entered: make(chan struct{}), unblock: make(chan struct{}), block: block, keys: []ed25519.PublicKey{pub}}
@@ -1401,7 +1405,7 @@ func newUpdateEnv(t *testing.T, block bool) *updateEnv {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	sum := sha256.Sum256(artifact)
-	manifest, _ := json.Marshal(update.Manifest{Schema: 1, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
+	manifest, _ := json.Marshal(update.Manifest{Schema: 1, RevokedVersions: revokedVersions, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
 	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, manifest))
 	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, _ *http.Request) { w.Write(manifest) })
 	mux.HandleFunc("/manifest.json.sig", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(sig)) })
