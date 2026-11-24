@@ -296,13 +296,20 @@ func (c *Control) handle(ctx context.Context, e events.Event) error {
 			_ = s.sendConfiguration(ctx, conn)
 		}
 	case events.KindAgentPolicyChanged:
+		var retryErr error
 		for _, conn := range s.Hub.All() {
-			if conn.OrganizationID == e.OrganizationID && conn.Reconciled() {
-				if err := s.evaluateUpdate(ctx, conn); err != nil {
-					s.Logger.Warn("agent_update_evaluation_failed", slog.String("device_id", conn.DeviceID), slog.Any("error", err))
-				}
+			if conn.OrganizationID != e.OrganizationID || s.Hub.Live(conn.DeviceID) != conn {
+				continue
+			}
+			// Keep delivering to healthy channels. If a send closes the
+			// channel or a replacement has taken over, reconciliation on
+			// the next channel handles the policy.
+			if err := s.evaluateUpdate(ctx, conn); err != nil && s.Hub.Live(conn.DeviceID) == conn {
+				s.Logger.WarnContext(ctx, "agent_update_evaluation_failed", slog.String("device_id", conn.DeviceID), slog.Any("error", err))
+				retryErr = err
 			}
 		}
+		return retryErr
 	case events.KindSandboxDeleteRequested:
 		conn := s.Hub.Live(e.DeviceID)
 		if conn == nil {
