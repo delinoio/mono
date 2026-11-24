@@ -3,8 +3,14 @@ import { fileURLToPath } from "node:url";
 import { mergeRsbuildConfig } from "@rsbuild/core";
 import consoleConfig from "../rsbuild.config.ts";
 
-// Only the browser suite can select a synthetic continuation failure.
+// The browser suite serves RPC fixtures and can select a synthetic continuation failure.
 export default mergeRsbuildConfig(consoleConfig, {
+  source: {
+    entry: {
+      index: "./src/index.tsx",
+      "sandbox-idempotency": "./e2e/sandbox-idempotency-fixture.ts",
+    },
+  },
   resolve: {
     alias: {
       "./mock/mock-api.ts$": fileURLToPath(

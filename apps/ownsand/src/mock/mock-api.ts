@@ -217,10 +217,12 @@ interface OrgState {
   sandboxes: Sandbox[];
   /**
    * Create idempotency bookkeeping, kept apart from the user-visible sandbox
-   * labels. Maps an idempotency key to the sandbox it created and to the
-   * encoded request it is bound to, like the real API.
+   * labels. Each key reserves the sandbox and encoded request for 24 hours.
    */
-  createKeys: Map<string, { sandboxId: string; request: string }>;
+  createKeys: Map<
+    string,
+    { sandboxId: string; request: string; expiresAtMs: number }
+  >;
   snapshots: Snapshot[];
   templates: Template[];
   policy: AgentVersionPolicy;
@@ -1524,8 +1526,9 @@ export function createMockTransport(
           toBinary(CreateSandboxRequestSchema, canonical),
           (b) => b.toString(16).padStart(2, "0"),
         ).join("");
+        const nowMs = now();
         const known = org.createKeys.get(req.idempotencyKey);
-        if (known !== undefined) {
+        if (known !== undefined && known.expiresAtMs > nowMs) {
           // Same as the real API: a known key bound to other parameters fails.
           if (known.request !== request) {
             throw new ConnectError(
@@ -1569,6 +1572,7 @@ export function createMockTransport(
         org.createKeys.set(req.idempotencyKey, {
           sandboxId: sandbox.sandboxId,
           request,
+          expiresAtMs: nowMs + DAY_MS,
         });
         return { sandbox };
       },
