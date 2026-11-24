@@ -146,6 +146,111 @@ func TestWebhookSubscriptionPaymentAndReplay(t *testing.T) {
 	}
 }
 
+func TestPaddleWebhookPreservesSuspensionAfterAccountLock(t *testing.T) {
+	testPaddleWebhookAcrossSuspensionDeadline(t, true)
+}
+
+func TestPaddleWebhookSuspendsAfterAccountLock(t *testing.T) {
+	testPaddleWebhookAcrossSuspensionDeadline(t, false)
+}
+
+func testPaddleWebhookAcrossSuspensionDeadline(t *testing.T, workerSuspends bool) {
+	t.Helper()
+	f := newFixture(t)
+	accountID := f.account()
+	subID := f.activate(accountID)
+	storedUpdate := f.clock.Now()
+	if code := f.webhook("subscription.updated", paddle.Subscription{
+		ID: subID, Status: paddle.SubscriptionStatusPastDue, UpdatedAt: storedUpdate,
+	}); code != http.StatusOK {
+		t.Fatalf("seed subscription webhook: status %d", code)
+	}
+	org := f.link(accountID, "Acme")
+	blocked := f.wantStatus(org, StatusBlocked, ReasonNoActiveSubscription)
+	startedAt := blocked.SuspendTime.Add(-time.Microsecond)
+	f.clock.Set(startedAt)
+
+	updatedAt := storedUpdate.Add(time.Hour)
+	wantResult := webhookApplied
+	if workerSuspends {
+		updatedAt = storedUpdate.Add(-time.Hour)
+		wantResult = webhookIgnored
+	}
+	const eventID = "evt_waiting_for_account"
+	body := paddletest.Event(eventID, "subscription.updated", startedAt, paddle.Subscription{
+		ID: subID, Status: paddle.SubscriptionStatusPastDue, UpdatedAt: updatedAt,
+	})
+	signature := paddle.SignatureHeaderValue(whSecret, startedAt, body)
+	response := make(chan int, 1)
+	wantSequence := blocked.Sequence + 1
+	f.tx(func(tx pgx.Tx) error {
+		if err := LockAccount(ctx(), tx, accountID); err != nil {
+			return err
+		}
+		go func() {
+			response <- f.deliver(body, signature)
+		}()
+		f.waitForAccountLockWait()
+		f.clock.Set(*blocked.SuspendTime)
+		if workerSuspends {
+			// Use the holding transaction to record the suspension before
+			// the waiting webhook can acquire the account lock.
+			if err := f.s.SyncStatuses(ctx(), tx, accountID); err != nil {
+				return err
+			}
+			suspended, ok, err := CurrentStatus(ctx(), tx, "ownsand", org)
+			if err != nil || !ok || suspended.Status != StatusSuspended || suspended.Sequence != wantSequence {
+				t.Fatalf("worker suspension: %+v, found %v, error %v", suspended, ok, err)
+			}
+		}
+		return nil
+	})
+	if code := <-response; code != http.StatusOK {
+		t.Fatalf("waiting subscription webhook: status %d", code)
+	}
+
+	var result string
+	var processTime time.Time
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT result, process_time FROM paddle_events WHERE paddle_event_id = $1`,
+		eventID).Scan(&result, &processTime); err != nil {
+		t.Fatal(err)
+	}
+	if result != wantResult || !processTime.Equal(startedAt) {
+		t.Fatalf("webhook result %s at %s, want %s at %s", result, processTime, wantResult, startedAt)
+	}
+	suspended := f.wantStatus(org, StatusSuspended, blocked.Reason)
+	if !sameTime(suspended.BlockedSince, blocked.BlockedSince) || !sameTime(suspended.SuspendTime, blocked.SuspendTime) ||
+		suspended.Sequence != wantSequence {
+		t.Fatalf("suspension after webhook: %+v, want block start %v, deadline %v and sequence %d",
+			suspended, blocked.BlockedSince, blocked.SuspendTime, wantSequence)
+	}
+
+	renewal := paddletest.Event("evt_renewal", paddle.EventTransactionCompleted, f.clock.Now(),
+		paddletest.Transaction(paddletest.TransactionData{
+			ID: "txn_renewal", SubscriptionID: subID, Origin: paddle.OriginSubscriptionRecurring,
+			PriceID: priceID, SubtotalCents: 1000, PeriodEnd: f.clock.Now().AddDate(0, 1, 0),
+		}))
+	renewalSignature := paddle.SignatureHeaderValue(whSecret, f.clock.Now(), renewal)
+	if code := f.deliver(renewal, renewalSignature); code != http.StatusOK {
+		t.Fatalf("renewal webhook: status %d", code)
+	}
+	sub, err := LoadSubscription(ctx(), f.db.Pool, accountID, false)
+	if err != nil || sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != subID {
+		t.Fatalf("subscription after renewal: %+v, error %v", sub, err)
+	}
+	allowed := f.wantStatus(org, StatusAllowed, ReasonNone)
+	if allowed.Sequence != suspended.Sequence+1 {
+		t.Fatalf("sequence after renewal = %d, want %d", allowed.Sequence, suspended.Sequence+1)
+	}
+	if code := f.deliver(renewal, renewalSignature); code != http.StatusOK {
+		t.Fatalf("renewal replay: status %d", code)
+	}
+	if replay := f.wantStatus(org, StatusAllowed, ReasonNone); replay.Sequence != allowed.Sequence {
+		t.Fatalf("sequence after renewal replay = %d, want %d", replay.Sequence, allowed.Sequence)
+	}
+	f.wantLedger(accountID, wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd})
+}
+
 func TestWebhookRefundAndChargeback(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
@@ -800,6 +905,76 @@ func TestCustomDataPaymentOnlyAddsCredit(t *testing.T) {
 	if msgs := f.email.Messages(); len(msgs) != 0 {
 		t.Fatalf("emails %+v", msgs)
 	}
+}
+
+func TestLatePaymentOfEarlierSubscriptionKeepsCanceledReplacement(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	org := f.link(acct, "Organization")
+	cancelTime := f.clock.Now()
+	oldSub, _, before := f.canceledReplacement(acct, cancelTime)
+	if before.PaddleUpdateTime == nil || !before.PaddleUpdateTime.Equal(cancelTime) {
+		t.Fatalf("canceled replacement update time = %v, want %v", before.PaddleUpdateTime, cancelTime)
+	}
+	f.wantStatus(org, StatusBlocked, ReasonNoActiveSubscription)
+	logs := f.captureLogs()
+	eventsBefore := f.eventCount()
+
+	lateTxnID := f.paddle.NewID("txn")
+	data := paddletest.Transaction(paddletest.TransactionData{
+		ID: lateTxnID, SubscriptionID: oldSub, Origin: paddle.OriginSubscriptionRecurring,
+		PriceID: priceID, SubtotalCents: 1000, PeriodEnd: f.clock.Now().AddDate(0, 1, 0),
+	})
+	body := paddletest.Event("evt_late_renewal", paddle.EventTransactionCompleted, f.clock.Now(), data)
+	sig := paddle.SignatureHeaderValue(whSecret, f.clock.Now(), body)
+	for range 2 {
+		if code := f.deliver(body, sig); code != http.StatusOK {
+			t.Fatalf("late payment webhook status = %d, want %d", code, http.StatusOK)
+		}
+		f.wantLedger(acct, wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd})
+		after, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+		if err != nil || !reflect.DeepEqual(after, before) {
+			t.Fatalf("subscription after the late payment = %+v, %v, want %+v", after, err, before)
+		}
+		f.wantStatus(org, StatusBlocked, ReasonNoActiveSubscription)
+	}
+	if got := f.eventCount(); got != eventsBefore+1 {
+		t.Fatalf("recorded events = %d, want %d", got, eventsBefore+1)
+	}
+	if got := f.count(`SELECT count(*) FROM paddle_subscriptions
+		WHERE paddle_subscription_id = $1 AND billing_account_id = $2`, oldSub, acct); got != 1 {
+		t.Fatalf("mapped subscriptions for the renewal = %d, want 1", got)
+	}
+	var ignoredLogs []string
+	for line := range strings.Lines(logs.String()) {
+		if strings.Contains(line, `"msg":"billing_subscription_payment_ignored"`) {
+			ignoredLogs = append(ignoredLogs, line)
+		}
+	}
+	if len(ignoredLogs) != 1 ||
+		!strings.Contains(ignoredLogs[0], `"billing_account_id":"`+acct+`"`) ||
+		!strings.Contains(ignoredLogs[0], `"paddle_subscription_id":"`+oldSub+`"`) ||
+		!strings.Contains(ignoredLogs[0], `"paddle_transaction_id":"`+lateTxnID+`"`) ||
+		!strings.Contains(ignoredLogs[0], `"reason":"different_canceled_subscription"`) {
+		t.Fatalf("ignored activation logs = %q, want one with the account, subscription, transaction, and reason fields", ignoredLogs)
+	}
+
+	txnID := f.checkout(acct)
+	pending, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if err != nil || txnID == "" || pending.Status != SubscriptionPending || pending.CheckoutTransactionID != txnID {
+		t.Fatalf("subscription after StartSubscription = %+v, %v (transaction %q)", pending, err, txnID)
+	}
+	newSub := f.paddle.NewID("sub")
+	if code := f.webhook(paddle.EventTransactionCompleted, paddletest.Transaction(paddletest.TransactionData{
+		ID: txnID, SubscriptionID: newSub, Origin: paddle.OriginWeb, PriceID: priceID, SubtotalCents: 1000,
+	})); code != http.StatusOK {
+		t.Fatalf("checkout payment webhook status = %d, want %d", code, http.StatusOK)
+	}
+	active, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if err != nil || active.Status != SubscriptionActive || active.PaddleSubscriptionID != newSub || active.CheckoutTransactionID != "" {
+		t.Fatalf("subscription after the checkout payment = %+v, %v, want active subscription %q", active, err, newSub)
+	}
+	f.wantStatus(org, StatusAllowed, ReasonNone)
 }
 
 // TestLatePaymentOfEarlierSubscriptionKeepsNewCheckout checks that the

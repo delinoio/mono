@@ -95,8 +95,8 @@ type Engine struct {
 
 	mu      sync.Mutex
 	drivers map[string]chan struct{}
-	// initialWarmCreates holds runner IDs while the dispatcher calls CreateSandbox.
-	initialWarmCreates sync.Map
+	// initialCreates holds runner IDs while the dispatcher calls CreateSandbox.
+	initialCreates sync.Map
 	// runCtx and runWG belong to the running reconciler component.
 	runCtx context.Context
 	runWG  *sync.WaitGroup
@@ -264,7 +264,8 @@ type NewRequest struct {
 // CreateRequest creates a QUEUED request in tx, or returns the existing
 // request of the same organization, source and source key (created is then
 // false), so a repeated event or claim never creates a second request. The
-// caller kicks the dispatcher after the commit (Service.WorkChanged).
+// caller holds the organization and profile share locks, in that order,
+// and kicks the dispatcher after the commit (Service.WorkChanged).
 func (e *Engine) CreateRequest(ctx context.Context, tx pgx.Tx, n NewRequest) (*Request, bool, error) {
 	p := n.Profile
 	id := n.RequestID

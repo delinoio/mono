@@ -7,9 +7,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -231,5 +233,89 @@ func TestWithAttachedDiskDetachesAfterCancel(t *testing.T) {
 	}
 	if d := f.deadlines[last]; d.IsZero() || time.Until(d) > detachTimeout {
 		t.Fatalf("detach context deadline = %v, want one within %v", d, detachTimeout)
+	}
+}
+
+func TestDataVolumeUnmountBeforeDetach(t *testing.T) {
+	const data = "disk5s1"
+	for _, tc := range []struct {
+		name        string
+		cancelBuild bool
+		stall       bool
+		failDetach  bool
+	}{
+		{name: "provisioning canceled and unmount times out", cancelBuild: true, stall: true},
+		{name: "unmount times out and normal detach fails", stall: true, failDetach: true},
+		{name: "successful provisioning and cleanup"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mnt := filepath.Join(t.TempDir(), "mnt")
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				f := &fakeHdiutil{attachOut: attachPlist}
+				if tc.failDetach {
+					f.detachErrs = []error{errors.New("resource busy")}
+				}
+				run := func(toolCtx context.Context, name string, args ...string) ([]byte, error) {
+					if name == hdiutilPath {
+						if args[0] == "detach" && toolCtx.Err() != nil {
+							t.Fatalf("detach started with a canceled context: %v", toolCtx.Err())
+						}
+						return f.run(toolCtx, name, args...)
+					}
+					f.calls = append(f.calls, append([]string{name}, args...))
+					if args[0] != "unmount" {
+						return nil, nil
+					}
+					if err := toolCtx.Err(); err != nil {
+						t.Fatalf("unmount started with a canceled context: %v", err)
+					}
+					if deadline, ok := toolCtx.Deadline(); !ok || time.Until(deadline) != unmountTimeout {
+						t.Fatalf("unmount deadline = %v, want a fresh %v deadline", deadline, unmountTimeout)
+					}
+					if tc.stall {
+						<-toolCtx.Done()
+						return nil, errors.New("signal: killed")
+					}
+					return nil, nil
+				}
+				provisionErr := errors.New("enable ownership: context canceled")
+				err := withAttachedDisk(ctx, run, "/build/disk.img", discardLogger(), func(string) error {
+					return withMountedDataVolume(ctx, run, data, mnt, func() error {
+						if tc.cancelBuild {
+							cancel()
+							return provisionErr
+						}
+						return nil
+					})
+				})
+				switch {
+				case tc.cancelBuild:
+					if err != provisionErr {
+						t.Fatalf("error = %v, want the original error %v", err, provisionErr)
+					}
+				case tc.stall:
+					if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "unmount the guest Data volume") {
+						t.Fatalf("error = %v, want a Data volume unmount timeout", err)
+					}
+				default:
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
+				}
+				want := [][]string{
+					{diskutilPath, "mount", "-mountPoint", mnt, data},
+					{diskutilPath, "unmount", data},
+					{hdiutilPath, "detach", "/dev/disk4"},
+				}
+				if tc.failDetach {
+					want = append(want, []string{hdiutilPath, "detach", "-force", "/dev/disk4"})
+				}
+				if got := f.calls[1:]; !reflect.DeepEqual(got, want) {
+					t.Fatalf("calls after attach = %v, want %v", got, want)
+				}
+			})
+		})
 	}
 }

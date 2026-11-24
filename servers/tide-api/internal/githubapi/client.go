@@ -492,8 +492,9 @@ func (d Delivery) Succeeded() bool {
 // FailedDeliveries lists the failed deliveries of the app webhook that
 // GitHub delivered at or after since, newest first, with
 // GET /app/hook/deliveries?status=failure and the Link cursor. The list
-// stops at the first page entry older than since; GitHub lists the newest
-// first, although the docs do not state the order explicitly.
+// stops at the end of the listing or on a page with an entry older than since.
+// GitHub lists the newest first, although the docs do not state the order
+// explicitly.
 func (c *Client) FailedDeliveries(ctx context.Context, since time.Time) ([]Delivery, error) {
 	jwt, err := c.AppJWT()
 	if err != nil {
@@ -501,13 +502,18 @@ func (c *Client) FailedDeliveries(ctx context.Context, since time.Time) ([]Deliv
 	}
 	next := c.api("/app/hook/deliveries?" + url.Values{"per_page": {"100"}, "status": {"failure"}}.Encode())
 	var out []Delivery
-	for page := 0; next != "" && page < 100; page++ {
+	visited := make(map[string]struct{})
+	for next != "" {
+		if _, seen := visited[next]; seen {
+			return nil, errors.New("github list_hook_deliveries: pagination cycle")
+		}
+		visited[next] = struct{}{}
 		var items []Delivery
 		h, err := c.do(ctx, request{op: "list_hook_deliveries", method: http.MethodGet, url: next, auth: jwt, ok: []int{http.StatusOK}, out: &items})
 		if err != nil {
 			return nil, err
 		}
-		done := len(items) == 0
+		done := false
 		for _, d := range items {
 			if d.DeliveredAt.Before(since) {
 				done = true

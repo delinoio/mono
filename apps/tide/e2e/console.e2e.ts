@@ -9,9 +9,28 @@ const ACME = "0193b000-0000-7000-8000-000000000001";
 const NORTHWIND = "0193b000-0000-7000-8000-000000000002";
 const CONTOSO = "0193b000-0000-7000-8000-000000000003";
 const GLOBEX = "0193b000-0000-7000-8000-000000000004";
+const UNKNOWN_ORG = "0193b000-0000-7000-8000-0000000000ff";
 const INVITATION_SECRET = "tdi_mock_contoso_invitation";
 
 describe("sign-in", () => {
+  test("returns to sign-in from a direct mock callback visit", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/callback");
+
+    await expect(browser).toHaveURL(/\/$/);
+    await expect(
+      screen.getByRole("button", "Sign in with Delino"),
+    ).toBeVisible();
+    await expect(
+      screen.getByText(
+        "Sign-in did not start. Check your connection and try again.",
+      ),
+    ).toBeHidden();
+  });
+
   test("signs in and lists the mock organizations in resolved development mode", async ({
     app,
     screen,
@@ -35,6 +54,24 @@ describe("sign-in", () => {
 });
 
 describe("organizations", () => {
+  test("offers retry when the organization cannot be found", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${UNKNOWN_ORG}`);
+
+    await expect(
+      screen.getByText("It was not found, or you no longer have access to it."),
+    ).toBeVisible();
+    await expect(screen.getByRole("button", "Try again")).toBeVisible();
+    await expect(
+      screen.getByRole("button", "Sign in with Delino"),
+    ).toBeHidden();
+  });
+
   test("creates an organization from a dialog that focuses its only input", async ({
     app,
     screen,
@@ -50,6 +87,9 @@ describe("organizations", () => {
 
     await expect(browser).toHaveURL(/\/orgs\/[0-9a-f-]+$/);
     await expect(screen.getByText("Set up tide")).toBeVisible();
+    await expect(screen.getByRole("combobox", "Organization")).toContainText(
+      "Fabrikam",
+    );
   });
 });
 
@@ -131,7 +171,11 @@ describe("organization layout", () => {
 });
 
 describe("overview", () => {
-  test("shows the live queue and the device pool", async ({ app, screen }) => {
+  test("shows the live queue and the device pool", async ({
+    app,
+    browser,
+    screen,
+  }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${ACME}`);
@@ -145,6 +189,19 @@ describe("overview", () => {
     await expect(screen.getByRole("table", "Waiting requests")).toContainText(
       "GitHub job",
     );
+    const waitingKinds = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          'table[aria-label="Waiting requests"] tbody td:nth-child(3)',
+        ),
+        (cell) => cell.textContent,
+      ),
+    );
+    expect(waitingKinds).toEqual([
+      "GitHub job",
+      "Agent session",
+      "Dev session",
+    ]);
     await expect(screen.getByRole("table", "Devices")).toContainText(
       "build-box",
     );
@@ -168,6 +225,69 @@ describe("overview", () => {
 });
 
 describe("integrations", () => {
+  test("keeps the integration edit dialog open after a duplicate rename", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+    await screen
+      .getByRole("listitem")
+      .filter({ hasText: "claude-team" })
+      .getByRole("button", "Edit")
+      .tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("codex-prod");
+    await screen.getByRole("button", "Save changes").tap();
+
+    await expect(screen.getByRole("dialog", "Edit claude-team")).toBeVisible();
+    await expect(
+      screen.getByText("an agent integration with this name exists"),
+    ).toBeVisible();
+    await expect(screen.getByText("codex-prod · OpenAI Codex")).toBeVisible();
+    await expect(screen.getByText("claude-team · Claude Code")).toBeVisible();
+  });
+
+  test("saves a Cursor integration name, pool, and credential together", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}/integrations`);
+    await screen.getByRole("button", "Create agent integration").tap();
+    await screen.getByRole("combobox", "Vendor").tap();
+    await screen.getByRole("option", "Cursor").tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.type("cursor-before");
+    await screen.getByLabel("Cursor self-hosted pool name").tap();
+    await browser.keyboard.type("pool-before");
+    await screen.getByLabel("Service account API key").tap();
+    await browser.keyboard.type("synthetic-cursor-before");
+    await screen.getByRole("button", "Create integration").tap();
+
+    await screen.getByRole("button", "Edit").tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("cursor-after");
+    await screen.getByLabel("Cursor self-hosted pool name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("pool-after");
+    await screen.getByLabel("Service account API key").tap();
+    await browser.keyboard.type("synthetic-cursor-after");
+    await screen.getByRole("button", "Save changes").tap();
+
+    const row = screen
+      .getByRole("listitem")
+      .filter({ hasText: "cursor-after" });
+    await expect(row).toContainText("Cursor self-hosted pool name: pool-after");
+    await expect(row).toContainText("Service account API key: Set at");
+  });
+
   test("links OwnSand and shows only when the key was set", async ({
     app,
     screen,
@@ -200,14 +320,181 @@ describe("integrations", () => {
     );
 
     await expect(browser).toHaveURL("/github/setup");
+    const setupHistoryLength = await browser.evaluate(
+      () => window.history.length,
+    );
     await screen.getByRole("combobox", "tide organization").tap();
     await screen.getByRole("option", "Globex (admin)").tap();
     await screen.getByRole("button", "Link installation").tap();
 
     await expect(browser).toHaveURL(`/orgs/${GLOBEX}/integrations`);
+    expect(await browser.evaluate(() => window.history.length)).toBe(
+      setupHistoryLength,
+    );
     await expect(
       screen.getByText("github-org-51000001", { exact: false }),
     ).toBeVisible();
+  });
+
+  test("an expired GitHub callback stays on setup and shows restart guidance", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}/integrations`);
+
+    await browser.evaluate(() => {
+      const issuedAt = Date.now();
+      Date.now = () => issuedAt;
+      // Simulate the GitHub redirect in the same document so the callback
+      // uses the in-memory transport that issued the state.
+      window.navigation.addEventListener(
+        "navigate",
+        (event) => {
+          const destination = new URL(event.destination.url);
+          if (destination.origin !== "https://github.com") return;
+          event.preventDefault();
+          const state = destination.searchParams.get("state");
+          if (!state) throw new Error("Expected an issued state");
+          const query = new URLSearchParams({
+            installation_id: "51000002",
+            code: "fixture-code",
+            state,
+          });
+          Date.now = () => issuedAt + 600_000;
+          setTimeout(() => {
+            window.history.pushState(null, "", `/github/setup?${query}`);
+            window.dispatchEvent(new PopStateEvent("popstate"));
+          }, 0);
+        },
+        { once: true },
+      );
+      return null;
+    });
+    await screen.getByRole("button", "Connect GitHub").tap();
+    await screen.getByRole("combobox", "tide organization").tap();
+    await screen.getByRole("option", "Globex (admin)").tap();
+    await screen.getByRole("button", "Link installation").tap();
+
+    await expect(
+      screen.getByText("Start the installation again from the integrations", {
+        exact: false,
+      }),
+    ).toBeVisible();
+    await expect(browser).toHaveURL("/github/setup");
+  });
+});
+
+describe("runner profiles", () => {
+  test("uses a later profile across pages and refreshes after profile changes", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+
+    const profiles = screen.getByRole("list", "Runner profiles");
+    const laterProfile = profiles.getByRole("listitem").filter({
+      hasText: "linux-build ·",
+    });
+    await expect(laterProfile).toBeVisible();
+    await expect(laterProfile.getByRole("button", "Delete")).toBeVisible();
+    expect(
+      await browser.evaluate(
+        () =>
+          document.querySelectorAll('ul[aria-label="Runner profiles"] > li')
+            .length,
+      ),
+    ).toBe(201);
+
+    await laterProfile.getByRole("button", "Edit").tap();
+    const edit = screen.getByRole("dialog", "Edit linux-build");
+    await edit.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("linux-build-renamed");
+    await edit.getByRole("button", "Save changes").tap();
+    await expect(laterProfile).toBeHidden();
+
+    for (const page of ["Requests", "Runners"]) {
+      await screen.getByRole("link", page).tap();
+      await expect(screen.getByRole("table", page)).toContainText(
+        "linux-build-renamed",
+      );
+      const filter = screen.getByRole("combobox", "Runner profile");
+      await filter.tap();
+      await screen.getByRole("option", "linux-build-renamed").tap();
+      await expect(filter).toContainText("linux-build-renamed");
+      await expect(screen.getByRole("table", page)).toContainText(
+        "linux-build-renamed",
+      );
+    }
+    await screen.getByRole("link", "Overview").tap();
+    await expect(screen.getByRole("table", "Waiting requests")).toContainText(
+      "linux-build-renamed",
+    );
+
+    await screen.getByRole("link", "Runner profiles").tap();
+    await screen.getByRole("combobox", "Organization").tap();
+    await screen.getByRole("option", "Northwind Labs").tap();
+    await expect(profiles).toContainText("mac-build");
+    await expect(profiles).not.toContainText("linux-build-renamed");
+
+    await screen.getByRole("combobox", "Organization").tap();
+    await screen.getByRole("option", "Acme Robotics").tap();
+    const renamedProfile = profiles.getByRole("listitem").filter({
+      hasText: "linux-build-renamed ·",
+    });
+    await renamedProfile.getByRole("button", "Delete").tap();
+    await screen
+      .getByRole("alertdialog", "Delete linux-build-renamed?")
+      .getByRole("button", "Delete profile")
+      .tap();
+    await expect(renamedProfile).toBeHidden();
+    await expect(
+      profiles.getByRole("listitem").filter({ hasText: "fixture-linux-198 ·" }),
+    ).toBeVisible();
+
+    await screen.getByRole("button", "Create runner profile").tap();
+    const create = screen.getByRole("dialog", "Create a runner profile");
+    await create.getByLabel("Name").tap();
+    await browser.keyboard.type("new-linux");
+    await create.getByRole("button", "Create profile").tap();
+    await expect(
+      profiles.getByRole("listitem").filter({ hasText: "new-linux ·" }),
+    ).toBeVisible();
+  });
+
+  test("keeps the edit dialog open when a runner profile name already exists", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+
+    const profile = screen
+      .getByRole("listitem")
+      .filter({ hasText: "linux-build ·" });
+    await profile.getByRole("button", "Edit").tap();
+    const dialog = screen.getByRole("dialog", "Edit linux-build");
+    await dialog.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("codex-linux");
+    await dialog.getByRole("button", "Save changes").tap();
+
+    await expect(dialog).toBeVisible();
+    await expect(
+      dialog.getByText("a runner profile with this name exists"),
+    ).toBeVisible();
+    await dialog.getByRole("button", "Cancel").tap();
+    await expect(profile.getByLabel("runs-on label of linux-build")).toHaveText(
+      "tide-linux-build",
+    );
   });
 });
 
@@ -238,6 +525,32 @@ describe("personal API keys", () => {
   });
 });
 
+describe("API key revocation", () => {
+  test("Cancel keeps the key active", async ({ app, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    const revoke = screen.getByRole("button", "Revoke", { exact: true });
+    const dialog = screen.getByRole("alertdialog", "Revoke claude-on-laptop?");
+
+    await revoke.tap();
+    await dialog.getByRole("button", "Cancel").tap();
+    await expect(dialog).toBeHidden();
+    await expect(screen.getByText("claude-on-laptop · Active")).toBeVisible();
+  });
+
+  test("confirming revokes the key", async ({ app, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    await screen.getByRole("button", "Revoke", { exact: true }).tap();
+    const dialog = screen.getByRole("alertdialog", "Revoke claude-on-laptop?");
+    await dialog.getByRole("button", "Revoke key").tap();
+    await expect(dialog).toBeHidden();
+    await expect(screen.getByText("claude-on-laptop · Revoked")).toBeVisible();
+  });
+});
+
 describe("invitations", () => {
   test("accepts an invitation link and removes the secret from the address", async ({
     app,
@@ -246,13 +559,19 @@ describe("invitations", () => {
   }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
-    await app.open(`/invitations/accept#secret=${INVITATION_SECRET}`);
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await screen.getByLabel("Invitation link or secret").tap();
+    await browser.keyboard.type(INVITATION_SECRET);
+    await screen.getByRole("button", "Continue").tap();
 
     await expect(browser).toHaveURL("/invitations/accept");
     await screen.getByRole("button", "Join organization").tap();
 
     await expect(browser).toHaveURL(`/orgs/${CONTOSO}`);
     await expect(screen.getByRole("navigation", "Organization")).toContainText(
+      "Contoso",
+    );
+    await expect(screen.getByRole("combobox", "Organization")).toContainText(
       "Contoso",
     );
   });

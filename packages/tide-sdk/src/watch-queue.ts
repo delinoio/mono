@@ -76,7 +76,8 @@ export interface WatchQueueOptions {
  * - Keepalive messages are not yielded.
  * - A status that is the server's answer (for example `permission_denied`
  *   or `not_found`) ends the iteration with that `ConnectError`.
- * - The signal ends the iteration without an error.
+ * - Aborting the signal closes the stream and ends the iteration without
+ *   an error. The helper discards any buffered responses after abort.
  */
 export async function* watchQueue(
   work: WatchQueueCaller,
@@ -85,7 +86,7 @@ export async function* watchQueue(
   const clock = options.clock ?? systemClock;
   const signal = options.signal;
   let failures = 0;
-  for (;;) {
+  while (!abortedBy(signal)) {
     let cause: unknown;
     let snapshotComplete = false;
     try {
@@ -94,6 +95,9 @@ export async function* watchQueue(
         { signal },
       );
       for await (const message of stream) {
+        if (abortedBy(signal)) {
+          return;
+        }
         const event = message.event;
         switch (event.case) {
           case "request":
@@ -135,6 +139,9 @@ export async function* watchQueue(
         return;
       }
       throw error;
+    }
+    if (abortedBy(signal)) {
+      return;
     }
     yield {
       kind: WatchQueueEventKind.Gap,

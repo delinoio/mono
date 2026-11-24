@@ -112,34 +112,62 @@ func TestDNSForwarderCloseEndsBlockedUDPDial(t *testing.T) {
 }
 
 func TestDNSForwarderCloseDuringUDPDialClosesSocket(t *testing.T) {
-	// The dial finishes while Close runs: the socket that it returns must
-	// still be closed, and the worker must not wait for a reply.
-	sock := newCloseTrackedConn()
-	dialing := make(chan struct{})
-	finish := make(chan struct{})
-	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
-		close(dialing)
-		<-finish
-		// Ignore ctx on purpose: a dial can succeed just as Close cancels it.
-		return sock, nil
-	}
-	f := startTestDNS(t, "127.0.0.1:1", slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, dialUDP: dial})
-	defer f.Close()
+	type exitPoint int
+	const (
+		beforeClose exitPoint = iota
+		duringClose
+		afterSocketClose
+	)
+	for _, tc := range []struct {
+		name string
+		exit exitPoint
+	}{
+		{"cleanup before Close", beforeClose},
+		{"cleanup during Close", duringClose},
+		{"live socket returned after cancellation", afterSocketClose},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sock := newCloseTrackedConn()
+			dialing := make(chan struct{})
+			finish := make(chan struct{})
+			releaseDial := sync.OnceFunc(func() { close(finish) })
+			dial := func(context.Context, string, string) (net.Conn, error) {
+				close(dialing)
+				<-finish
+				// A dial can succeed just as Close cancels its context.
+				return sock, nil
+			}
+			f := startTestDNS(t, "127.0.0.1:1", slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, dialUDP: dial})
+			// A second Close can return while the first still waits for workers.
+			startClose := sync.OnceValue(func() <-chan struct{} { return closeInBackground(f) })
+			t.Cleanup(func() {
+				// Close waits for the dial. Release it even if it has yet to start.
+				releaseDial()
+				// Unblock the fixture read if the forwarder leaves it open.
+				sock.Close()
+				requireClosedWithin(t, "Close during cleanup", startClose(), udpShutdownBound)
+				if n := len(f.udpSlots); n != 0 {
+					t.Fatalf("udp slots in use after cleanup: %d", n)
+				}
+			})
 
-	dnsUDPQuery(t, f, "late")
-	requireClosedWithin(t, "dial start", dialing, 5*time.Second)
-	done := closeInBackground(f)
-	// Wait until Close has cancelled the forwarder context, then let the dial
-	// return a live socket.
-	select {
-	case <-f.ctx.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("Close did not cancel the forwarder context")
-	}
-	close(finish)
-	requireClosedWithin(t, "Close", done, udpShutdownBound)
-	requireClosedWithin(t, "socket close", sock.closed, 2*time.Second)
-	if n := len(f.udpSlots); n != 0 {
-		t.Fatalf("udp slots in use after Close: %d", n)
+			dnsUDPQuery(t, f, "late")
+			requireClosedWithin(t, "dial start", dialing, 5*time.Second)
+			if tc.exit == beforeClose {
+				return
+			}
+			done := startClose()
+			// The dial returns a live socket only after Close cancels the forwarder.
+			requireClosedWithin(t, "forwarder cancellation", f.ctx.Done(), 5*time.Second)
+			if tc.exit == duringClose {
+				return
+			}
+			releaseDial()
+			requireClosedWithin(t, "Close", done, udpShutdownBound)
+			requireClosedWithin(t, "socket close", sock.closed, 2*time.Second)
+			if n := len(f.udpSlots); n != 0 {
+				t.Fatalf("udp slots in use after Close: %d", n)
+			}
+		})
 	}
 }
