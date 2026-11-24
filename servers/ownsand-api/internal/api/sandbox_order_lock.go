@@ -62,13 +62,13 @@ func (e *orderLockError) Unwrap() error { return e.err }
 // it, sends the command and waits for the agent's result under the lock,
 // and the caller pause clears the mark and reads the sandbox state under the
 // same lock. A pause that starts while a resume is in flight therefore waits
-// until the resume result is reconciled, and a resume that starts after the
-// pause finds the mark gone and sends nothing.
+// until the resume result is reconciled. A resume that starts after a caller
+// pause took ownership finds the mark gone and sends nothing.
 //
-// The lock is held on one dedicated connection. When the lock cannot be
-// released, the connection is closed instead of being returned to the pool,
-// because Postgres then releases the lock with the session.
-func (s *Service) withSandboxOrder(ctx context.Context, sandboxID string, fn func() error) error {
+// The callback can use the connection that holds the lock for a short
+// transaction. When the lock cannot be released, the connection is closed
+// so Postgres releases the lock with the session.
+func (s *Service) withSandboxOrder(ctx context.Context, sandboxID string, fn func(*pgx.Conn) error) error {
 	if err := s.orderSlots.acquire(ctx, s.DB.Pool.Config().MaxConns); err != nil {
 		return &orderLockError{err}
 	}
@@ -94,7 +94,7 @@ func (s *Service) withSandboxOrder(ctx context.Context, sandboxID string, fn fun
 		}
 		conn.Release()
 	}()
-	return fn()
+	return fn(conn.Conn())
 }
 
 // discardOrderConn closes a connection that may still hold a sandbox

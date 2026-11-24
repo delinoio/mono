@@ -172,6 +172,7 @@ describe("continuation errors", () => {
       const notice = screen.getByText("Some organizations are not shown yet.");
       const nextRow = screen.getByRole("link", "Northwind Labs Member");
       await expect(notice).toBeVisible();
+      await expect(screen.getByText(/The last refresh failed/)).toBeHidden();
       await expect(
         screen.getByRole("link", "Acme Robotics Owner"),
       ).toBeVisible();

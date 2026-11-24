@@ -366,6 +366,12 @@ func (e *Engine) assignWarm(ctx context.Context, req *Request, warm *Runner) (bo
 		if err := api.LockOrganizationShare(ctx, tx, req.OrganizationID); err != nil {
 			return err
 		}
+		if err := profile.LockShare(ctx, tx, req.OrganizationID, warm.ProfileID); err != nil {
+			if isCode(err, connect.CodeNotFound) {
+				return nil
+			}
+			return err
+		}
 		r, err := e.lockRunner(ctx, tx, warm.ID)
 		if err != nil || r.State != runWarm || r.RequestID != "" {
 			return err
@@ -481,6 +487,15 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 				return errWarmDeferred
 			}
 			if err := e.allowWarmCreate(ctx, tx, r); err != nil {
+				return err
+			}
+		} else if !bind {
+			// Pool runners remain unbound even when queued work prompts
+			// their creation. Deletion must see their reservations too.
+			if err := profile.LockShare(ctx, tx, p.OrganizationID, p.ID); err != nil {
+				if isCode(err, connect.CodeNotFound) {
+					return errSkip
+				}
 				return err
 			}
 		}
@@ -608,7 +623,7 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, dispatchRequest *Re
 		} else if expired != nil {
 			e.releaseClaim(ctx, expired)
 		}
-		e.startFailed(ctx, r.ID, createSandboxRejected)
+		e.startFailed(ctx, r, createSandboxRejected)
 		return createFailed
 	default:
 		// The response may be lost: the runner stays CREATING with its key,

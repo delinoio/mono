@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code } from "@connectrpc/connect";
 import { describe, test } from "@e2e-dev/web";
 import { expect, type Screen } from "e2e";
 
@@ -101,6 +102,116 @@ describe("organizations", () => {
     await expect(
       screen.getByRole("button", "Create organization"),
     ).toBeFocused();
+  });
+});
+
+describe("organization list errors", () => {
+  const refreshNotice = /The last refresh failed/;
+  const listName = "Your organizations";
+
+  async function failOnWindowFocus(code: Code) {
+    sessionStorage.setItem("ownsand-e2e-organization-list-error", String(code));
+    const now = Date.now;
+    // Treat the list as stale when React Query handles the visibility event.
+    Date.now = () => now() + 11_000;
+    try {
+      window.dispatchEvent(new Event("visibilitychange"));
+      // React Query checks staleness after resuming paused mutations.
+      await Promise.resolve();
+    } finally {
+      Date.now = now;
+    }
+    return true;
+  }
+
+  test("keeps loaded rows while retrying a failed refresh", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    const acme = screen.getByRole("link", "Acme Robotics Owner");
+    const northwind = screen.getByRole("link", "Northwind Labs Member");
+    await expect(northwind).toBeVisible();
+
+    await browser.evaluate(failOnWindowFocus, Code.Unavailable);
+
+    const notice = screen.getByText(refreshNotice);
+    await expect(notice).toBeVisible();
+    await expect(acme).toBeVisible();
+    await expect(northwind).toBeVisible();
+    await app.screenshot("organization-refresh-failed");
+
+    await browser.evaluate(() => {
+      sessionStorage.setItem("ownsand-e2e-organization-list-error", "hold");
+      return true;
+    });
+    const retry = screen.getByRole("button", "Try again");
+    await retry.tap();
+    await expect(retry).toHaveAttribute("disabled", "");
+    await expect(acme).toBeVisible();
+    await expect(northwind).toBeVisible();
+    await app.screenshot("organization-refresh-retrying");
+
+    await browser.evaluate(() => {
+      sessionStorage.removeItem("ownsand-e2e-organization-list-error");
+      window.dispatchEvent(new Event("ownsand-e2e-release-organization-list"));
+      return true;
+    });
+    await expect(notice).toBeHidden();
+    await expect(acme).toBeVisible();
+    await expect(northwind).toBeVisible();
+    await app.screenshot("organization-refresh-recovered");
+  });
+
+  test("replaces the list when the session ends during a refresh", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    const list = screen.getByRole("list", listName);
+    await expect(list).toBeVisible();
+
+    await browser.evaluate(failOnWindowFocus, Code.Unauthenticated);
+
+    await expect(
+      screen.getByText("Your session ended. Sign in again."),
+    ).toBeVisible();
+    await expect(
+      screen.getByRole("button", "Sign in with Delino"),
+    ).toBeVisible();
+    await expect(list).toBeHidden();
+    await expect(screen.getByText(refreshNotice)).toBeHidden();
+    await app.screenshot("organization-refresh-ended-session");
+  });
+
+  test("shows a full error when the first organization request fails", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate((code) => {
+      sessionStorage.setItem(
+        "ownsand-e2e-organization-list-error",
+        String(code),
+      );
+      return true;
+    }, Code.Unavailable);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+
+    await expect(
+      screen.getByText(
+        "OwnSand is not available right now. Try again in a moment.",
+      ),
+    ).toBeVisible();
+    await expect(screen.getByRole("button", "Try again")).toBeVisible();
+    await expect(screen.getByRole("list", listName)).toBeHidden();
+    await expect(screen.getByText(refreshNotice)).toBeHidden();
+    await app.screenshot("organization-first-load-failed");
   });
 });
 
@@ -257,6 +368,16 @@ describe("devices", () => {
     await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
     await expect(screen.getByText("studio-mac").first()).toBeVisible();
     await expect(screen.getByText("build-box-1")).toBeHidden();
+
+    await screen.getByRole("link", "Sandboxes", { exact: true }).tap();
+    const sandbox = screen.getByRole("link", "0193a000…00a1");
+    await expect(sandbox).toBeHidden();
+    await screen.getByRole("checkbox", "Show ended sandboxes").tap();
+    await sandbox.tap();
+    await expect(screen.getByText("Deleted", { exact: true })).toBeVisible();
+    await expect(
+      screen.getByText("Device removed", { exact: true }),
+    ).toBeVisible();
   });
 
   test("asks before it revokes a pending enrollment token", async ({

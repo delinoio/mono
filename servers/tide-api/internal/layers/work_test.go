@@ -18,6 +18,7 @@ import (
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/profile"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 )
 
@@ -100,6 +101,128 @@ func TestWarmRunnersAndReclaim(t *testing.T) {
 	// Warm runners wait while a request is uncovered: no warm runner comes
 	// back while the pool is full.
 	stays(t, "no warm runner while full", func() bool { return w.fake.Active(w.osOrg) <= 2 })
+}
+
+func TestWarmReservationDuringProfileDeletion(t *testing.T) {
+	t.Run("stale dispatch cannot reserve", func(t *testing.T) {
+		w := newWorkWorld(t, devsession.Timing{})
+		ctx := context.Background()
+		liveID := w.createProfile(t, devProfileProto("live", 0, 0))
+		deletedID := w.createProfile(t, devProfileProto("to-delete", 0, 0))
+		// The dispatch order is by profile ID. Block its first sandbox call
+		// so the pass retains the deleted profile in its snapshot.
+		if liveID > deletedID {
+			liveID, deletedID = deletedID, liveID
+		}
+		creating, release := make(chan struct{}, 1), make(chan struct{}, 1)
+		defer close(release)
+		w.fake.SetCreateHook(func(ctx context.Context) error {
+			select {
+			case creating <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		enableWarmProfiles(t, w, liveID, deletedID)
+		select {
+		case <-creating:
+		case <-time.After(5 * time.Second):
+			t.Fatal("dispatch did not reach the first profile")
+		}
+		if _, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: deletedID,
+		})); err != nil {
+			t.Fatal(err)
+		}
+		w.fake.SetCreateHook(nil)
+		// Let the captured call proceed and observe the surviving profile.
+		release <- struct{}{}
+		eventually(t, "surviving profile warms", func() bool {
+			return profileRunnerCount(t, w, liveID, tidev1.RunnerState_RUNNER_STATE_WARM) == 1
+		})
+		stays(t, "stale profile creates no runner or sandbox", func() bool {
+			var n int
+			if err := w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM runners WHERE runner_profile_id = $1", deletedID).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n == 0 && w.fake.Calls("CreateSandbox") == 1
+		})
+	})
+
+	t.Run("deletion catches late reservation", func(t *testing.T) {
+		w := newWorkWorld(t, devsession.Timing{})
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		prepared, continueDelete := make(chan struct{}), make(chan struct{})
+		w.l.Profiles.OnDeletion(profile.DeletionHook{
+			Name: "test gate after work cleanup",
+			Prepare: func(ctx context.Context, _, _ string) error {
+				close(prepared)
+				select {
+				case <-continueDelete:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		})
+		profileID := w.createProfile(t, devProfileProto("to-delete", 0, 0))
+		done := make(chan error, 1)
+		go func() {
+			_, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+				OrganizationId: w.org.ID, RunnerProfileId: profileID,
+			}))
+			done <- err
+		}()
+		select {
+		case <-prepared:
+		case <-ctx.Done():
+			t.Fatal("deletion did not complete the initial cleanup")
+		}
+		// OwnSand commits the sandbox but Tide has no sandbox ID until it
+		// can recover the result by replaying the stored idempotency key.
+		w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+			o.CreateResponseError = connect.NewError(connect.CodeDeadlineExceeded, context.DeadlineExceeded)
+		})
+		enableWarmProfiles(t, w, profileID)
+		eventually(t, "late reservation holds a sandbox", func() bool {
+			return w.fake.Active(w.osOrg) == 1
+		})
+		var runnerID string
+		if err := w.env.DB.Pool.QueryRow(ctx, `SELECT runner_id::text FROM runners
+			WHERE runner_profile_id = $1 AND request_id IS NULL AND ownsand_sandbox_id IS NULL`, profileID).Scan(&runnerID); err != nil {
+			t.Fatal(err)
+		}
+		close(continueDelete)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if r := w.runner(t, runnerID); r.GetState() != tidev1.RunnerState_RUNNER_STATE_DELETING ||
+			r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP {
+			t.Fatalf("late reservation after profile deletion: %v", r)
+		}
+		w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateResponseError = nil })
+		eventually(t, "late runner and its sandbox are deleted", func() bool {
+			return w.runner(t, runnerID).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED && w.fake.Active(w.osOrg) == 0
+		})
+		if n := len(w.fake.Sandboxes(w.osOrg)); n != 1 {
+			t.Fatalf("got %d sandboxes, want one by idempotency key", n)
+		}
+	})
+}
+
+func enableWarmProfiles(t *testing.T, w *workWorld, ids ...string) {
+	t.Helper()
+	// Make all profiles eligible in the same dispatch snapshot.
+	if _, err := w.env.DB.Pool.Exec(context.Background(), "UPDATE runner_profiles SET warm_count = 1 WHERE runner_profile_id::text = ANY($1)", ids); err != nil {
+		t.Fatal(err)
+	}
+	w.l.Engine.Kick(w.org.ID)
 }
 
 func TestWarmCreateRejectionDoesNotSpin(t *testing.T) {

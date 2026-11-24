@@ -1398,6 +1398,7 @@ export function createMockTransport(
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
         const device = findDevice(org, req.deviceId);
+        const endTime = ts();
         device.state = DeviceState.REMOVED;
         for (const s of org.sandboxes) {
           if (
@@ -1406,6 +1407,7 @@ export function createMockTransport(
           ) {
             s.state = SandboxState.DELETED;
             s.endReason = SandboxEndReason.DEVICE_REMOVED;
+            s.endTime = endTime;
           }
         }
         // Like the real control plane, delete the records of snapshots that
