@@ -95,7 +95,10 @@ type sandbox struct {
 	ending bool
 	// stopped is true once an end attempt stopped the VM and told the exec
 	// tracker, so a retry after a later failure does not repeat them.
-	stopped        bool
+	stopped bool
+	// endState preserves the selected terminal state once stopped is true.
+	// The DELETING record already holds its end reason.
+	endState       ownsandv1.SandboxState
 	idleDirty      bool
 	lastIdleReport time.Time
 }
@@ -312,7 +315,7 @@ func (m *Manager) reconcile(ctx context.Context) error {
 		}
 		state := finalStateFor(reason)
 		m.logger.Info("sandbox ended while the agent was stopped", "sandbox_id", id, "state", state.String(), "end_reason", reason.String())
-		if err := m.commitLocked(sb, func(r *Record) {
+		if err := m.commitLocked(&sb.rec, func(r *Record) {
 			r.State = state
 			r.EndReason = reason
 		}); err != nil {
@@ -348,15 +351,15 @@ func (m *Manager) nextRevision() (uint64, error) {
 
 // commitLocked applies change to the record with a new revision and saves
 // it. The caller holds m.mu or has exclusive access.
-func (m *Manager) commitLocked(sb *sandbox, change func(*Record)) error {
+func (m *Manager) commitLocked(rec *Record, change func(*Record)) error {
 	rev, err := m.nextRevision()
 	if err != nil {
 		return fmt.Errorf("sandboxes: persist revision: %w", err)
 	}
-	change(&sb.rec)
-	sb.rec.Revision = rev
-	sb.rec.Acked = false
-	if err := m.st.SaveSandbox(sb.rec.SandboxID, sb.rec); err != nil {
+	change(rec)
+	rec.Revision = rev
+	rec.Acked = false
+	if err := m.st.SaveSandbox(rec.SandboxID, rec); err != nil {
 		return fmt.Errorf("sandboxes: save record: %w", err)
 	}
 	return nil
@@ -383,20 +386,24 @@ func (m *Manager) updateIf(sb *sandbox, guard func() bool, change func(*Record))
 		return nil, errSandboxGone
 	}
 	before := sb.rec.State
-	err := m.commitLocked(sb, change)
+	err := m.commitLocked(&sb.rec, change)
 	entry := sb.rec.Entry(m.epoch)
 	outbox := m.outbox
 	m.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
+	m.sendUpdate(outbox, before, entry)
+	return entry, nil
+}
+
+func (m *Manager) sendUpdate(outbox Outbox, before ownsandv1.SandboxState, entry *ownsandv1.SandboxStateEntry) {
 	if before != entry.GetState() {
 		m.logger.Info("sandbox state changed", "sandbox_id", entry.GetSandboxId(), "state", entry.GetState().String(), "end_reason", entry.GetEndReason().String(), "revision", entry.GetRevision().GetCounter())
 	}
 	if outbox != nil {
 		outbox.SendSandboxUpdate(entry)
 	}
-	return entry, nil
 }
 
 func (m *Manager) get(id string) (*sandbox, bool) {
@@ -678,7 +685,7 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	sb.cmdMu.Lock()
 	defer sb.cmdMu.Unlock()
 	m.sandboxes[id] = sb
-	err := m.commitLocked(sb, func(*Record) {})
+	err := m.commitLocked(&sb.rec, func(*Record) {})
 	if err != nil {
 		// The record was never saved and no VM exists yet. Unpublish the
 		// in-memory sandbox so that it does not count against the limits,
@@ -865,6 +872,7 @@ func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.Sa
 	sb.ending = true
 	guest := sb.guest
 	execs := m.execs
+	stopped := sb.stopped
 	if sb.rec.Terminal() {
 		entry := sb.rec.Entry(m.epoch)
 		m.mu.Unlock()
@@ -881,19 +889,16 @@ func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.Sa
 		}
 		m.mu.Unlock()
 	}()
-	if _, err := m.update(sb, func(r *Record) {
-		if r.State == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
-			r.PausedAtEnd = true
-		}
-		r.State = ownsandv1.SandboxState_SANDBOX_STATE_DELETING
-		r.EndReason = reason
-	}); err != nil {
-		return nil, err
-	}
-	m.mu.Lock()
-	stopped := sb.stopped
-	m.mu.Unlock()
 	if !stopped {
+		if _, err := m.update(sb, func(r *Record) {
+			if r.State == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+				r.PausedAtEnd = true
+			}
+			r.State = ownsandv1.SandboxState_SANDBOX_STATE_DELETING
+			r.EndReason = reason
+		}); err != nil {
+			return nil, err
+		}
 		if err := m.rt.Delete(ctx, sb.rec.SandboxID); err != nil {
 			m.logger.Error("runtime delete failed", "sandbox_id", sb.rec.SandboxID, "error", err)
 			return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "sandbox VM could not be stopped")
@@ -906,12 +911,31 @@ func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.Sa
 		}
 		m.mu.Lock()
 		sb.vm, sb.guest, sb.stopped = nil, nil, true
+		sb.endState = state
 		m.mu.Unlock()
 	}
-	return m.update(sb, func(r *Record) {
-		r.State = state
-		r.EndReason = reason
+	return m.commitEnd(sb)
+}
+
+// commitEnd keeps the saved DELETING record visible until the terminal save
+// succeeds. The caller holds sb.cmdMu.
+func (m *Manager) commitEnd(sb *sandbox) (*ownsandv1.SandboxStateEntry, error) {
+	m.mu.Lock()
+	rec := sb.rec
+	err := m.commitLocked(&rec, func(r *Record) {
+		r.State = sb.endState
 	})
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	before := sb.rec.State
+	sb.rec.State, sb.rec.Revision, sb.rec.Acked = rec.State, rec.Revision, rec.Acked
+	entry := sb.rec.Entry(m.epoch)
+	outbox := m.outbox
+	m.mu.Unlock()
+	m.sendUpdate(outbox, before, entry)
+	return entry, nil
 }
 
 // Delete runs a delete command. It is idempotent; a delete before the
@@ -934,7 +958,7 @@ func (m *Manager) Delete(ctx context.Context, cmd *ownsandv1.DeleteSandboxComman
 		// find it terminal and report success although a restart would lose
 		// it, and a delayed create would then start the sandbox.
 		m.sandboxes[id] = sb
-		err := m.commitLocked(sb, func(*Record) {})
+		err := m.commitLocked(&sb.rec, func(*Record) {})
 		if err != nil {
 			// Unpublish the unsaved marker, as Create does for its
 			// record, so that a retry of the delete saves it again.
