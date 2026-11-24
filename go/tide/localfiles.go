@@ -38,6 +38,8 @@ const manifestVersion = 1
 type manifest struct {
 	Version int                      `json:"version"`
 	Files   map[string]manifestEntry `json:"files"`
+	// PathsValidated records that the SDK validated the UTF-8 of each path.
+	PathsValidated bool `json:"paths_validated,omitempty"`
 }
 
 // manifestEntry is one synced path. SHA256 is the hash of the file content,
