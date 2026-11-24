@@ -6,17 +6,22 @@ package vzrt_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
@@ -129,27 +134,39 @@ func newMacOSEnv(t *testing.T, image string) (*env, vmruntime.Runtime) {
 	return e, r
 }
 
+// cloneMacOSImageForIntegration keeps the supplied image intact while the
+// test replaces and removes its local copy of the metadata.
+func cloneMacOSImageForIntegration(t *testing.T, source string) (string, images.Metadata) {
+	t.Helper()
+	meta, err := images.ReadMetadata(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := t.TempDir()
+	for _, name := range []string{images.MacOSDisk, images.MacOSAuxStorage, images.MacOSHardwareModel} {
+		if err := unix.Clonefile(filepath.Join(source, name), filepath.Join(image, name), 0); err != nil {
+			t.Fatalf("clone base image file %s (set TMPDIR to the image's APFS volume): %v", name, err)
+		}
+	}
+	if err := images.WriteMetadata(image, meta); err != nil {
+		t.Fatal(err)
+	}
+	return image, meta
+}
+
 func TestVirtualizationMacOSIntegration(t *testing.T) {
 	image := os.Getenv(envMacOSImage)
 	if image == "" {
 		t.Skipf("set %s to a built macOS image directory and sign the test binary", envMacOSImage)
 	}
+	image, original := cloneMacOSImageForIntegration(t, image)
 	e, r := newMacOSEnv(t, image)
 	m := e.m
-
-	// Too little memory for the restore image's minimum fails before a VM
-	// starts.
-	small := &ownsandv1.Resources{VcpuCount: 1, MemoryMib: 1024, DiskGib: macDiskGiB}
-	id, _ := uuidv7.NewString()
-	now := time.Now()
-	if entry, err := m.Create(context.Background(), &ownsandv1.CreateSandboxCommand{
-		SandboxId: id, Source: &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_MACOS},
-		Resources: small, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE, GuestOs: ownsandv1.GuestOs_GUEST_OS_MACOS,
-		IdleTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(time.Hour), CreateTime: timestamppb.New(now),
-		MaxDeadline: timestamppb.New(now.Add(time.Hour)),
-		Limits:      &ownsandv1.DeviceLimits{VcpuCount: 16, MemoryMib: 32768, DiskGib: 512, VcpuOvercommitPercent: 100},
-	}); err == nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED {
-		t.Fatalf("undersized macOS create: %v %v", entry, err)
+	deleteSandbox := func(id string) {
+		t.Helper()
+		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			t.Fatalf("delete %v %v", en, err)
+		}
 	}
 
 	sb := e.mustCreateMacOS("", ownsandv1.NetworkMode_NETWORK_MODE_NONE, false)
@@ -206,26 +223,99 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 		t.Fatalf("third macOS guest started: %v", entry)
 	}
 	for _, id := range []string{sb.GetSandboxId(), cold.GetSandboxId()} {
-		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
-			t.Fatalf("delete %v %v", en, err)
-		}
+		deleteSandbox(id)
 	}
 	// With the source gone, the memory state restores with the snapshot's
 	// identifier.
-	restored := e.mustCreateMacOS(snapID, ownsandv1.NetworkMode_NETWORK_MODE_NONE, true)
-	if snap.GetHasMemoryState() && restored.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE {
-		t.Fatalf("restore path %v", restored.GetRestorePath())
+	coldPath := ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT
+	eligiblePath := coldPath
+	if snap.GetHasMemoryState() {
+		eligiblePath = ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE
 	}
-	if out, _ := e.exec(restored.GetSandboxId(), "/bin/cat", "/var/root/marker"); out != "state\n" {
-		t.Fatalf("restored sandbox %q", out)
+	checkRestore := func(memoryRestore bool, want ownsandv1.SandboxRestorePath) {
+		t.Helper()
+		restored := e.mustCreateMacOS(snapID, ownsandv1.NetworkMode_NETWORK_MODE_NONE, memoryRestore)
+		if got := restored.GetRestorePath(); got != want {
+			t.Fatalf("restore path %v, want %v", got, want)
+		}
+		if out, _ := e.exec(restored.GetSandboxId(), "/bin/cat", "/var/root/marker"); out != "state\n" {
+			t.Fatalf("restored sandbox %q", out)
+		}
+		deleteSandbox(restored.GetSandboxId())
 	}
-	ids := []string{restored.GetSandboxId()}
+	t.Log("restore with original base image metadata")
+	checkRestore(false, coldPath)
+	checkRestore(true, eligiblePath)
 
-	for _, id := range ids {
-		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
-			t.Fatalf("delete %v %v", en, err)
+	id, _ := uuidv7.NewString()
+	spec := vmruntime.Spec{
+		SandboxID:   id,
+		Dir:         filepath.Join(t.TempDir(), id),
+		Resources:   &ownsandv1.Resources{VcpuCount: macVCPUs, MemoryMib: macMemMiB, DiskGib: macDiskGiB},
+		NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE,
+		GuestOS:     ownsandv1.GuestOs_GUEST_OS_MACOS,
+		BaseImage:   ownsandv1.BaseImage_BASE_IMAGE_MACOS,
+	}
+	for _, tc := range []struct {
+		name   string
+		cpu    int32
+		memory int64
+	}{
+		{name: "CPU", cpu: macVCPUs + 1, memory: macMemMiB},
+		{name: "memory", cpu: macVCPUs, memory: macMemMiB + 1},
+	} {
+		meta := original
+		meta.MinimumCPUCount, meta.MinimumMemoryMiB = tc.cpu, tc.memory
+		if err := images.WriteMetadata(image, meta); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.Create(context.Background(), spec); !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), "macOS guests need at least") {
+			t.Fatalf("base image create below %s minimum: %v", tc.name, err)
 		}
 	}
+	t.Log("base image create rejected below each recorded minimum")
+
+	replacement := original
+	replacement.MinimumCPUCount, replacement.MinimumMemoryMiB = macVCPUs+1, macMemMiB+1
+	if err := images.WriteMetadata(image, replacement); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("restore with higher base image minimums")
+	checkRestore(false, coldPath)
+	checkRestore(true, eligiblePath)
+
+	if err := os.Remove(filepath.Join(image, images.MetadataFile)); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("restore without base image metadata")
+	checkRestore(false, coldPath)
+	checkRestore(true, eligiblePath)
+
+	invalidSnapshot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(invalidSnapshot, images.MacOSHardwareModel), []byte("invalid model"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec.BaseImage = ownsandv1.BaseImage_BASE_IMAGE_UNSPECIFIED
+	spec.Snapshot = &vmruntime.SnapshotSource{Dir: invalidSnapshot}
+	if _, err := r.Create(context.Background(), spec); !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), "does not support the hardware model") {
+		t.Fatalf("snapshot create with unsupported hardware model: %v", err)
+	}
+	if _, err := os.Stat(spec.Dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unsupported hardware model reached disk preparation: %v", err)
+	}
+	t.Log("snapshot hardware model rejected before disk preparation")
+
+	snapshotDir, _, ok := m.SnapshotContent(snapID)
+	if !ok {
+		t.Fatal("snapshot content missing")
+	}
+	spec.Snapshot.Dir = snapshotDir
+	spec.Resources.VcpuCount = math.MaxInt32
+	if _, err := r.Create(context.Background(), spec); err == nil || !strings.Contains(err.Error(), "invalid macOS VM configuration") {
+		t.Fatalf("snapshot create with invalid native configuration: %v", err)
+	}
+	t.Log("invalid snapshot VM configuration rejected by Virtualization.framework")
+
 	if ids, _ := r.Running(context.Background()); len(ids) != 0 {
 		t.Fatalf("VMs still run: %v", ids)
 	}
