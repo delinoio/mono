@@ -333,6 +333,13 @@ describe("queue view", () => {
     expect(view.requests.size).toBe(0);
   });
 
+  test("keeps the loading state when the stream fails before the first snapshot", () => {
+    const view = initialQueueView();
+    expect(
+      applyQueueEvent(view, { kind: QueueViewActionKind.StreamFailed }),
+    ).toBe(view);
+  });
+
   test("keeps the last state across a gap and replaces it with the new snapshot", () => {
     let view = initialQueueView();
     view = applyQueueEvent(view, {
