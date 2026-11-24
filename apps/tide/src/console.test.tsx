@@ -76,6 +76,7 @@ function renderConsole(
     isAuthenticated: signedIn,
     userId: signedIn ? MOCK_USER : undefined,
     signIn: options.signIn ?? (async () => {}),
+    signInFailed: false,
     signOut: async () => {},
     getAccessToken: async () => "token",
   };
