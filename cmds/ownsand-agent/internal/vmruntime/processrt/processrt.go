@@ -603,8 +603,8 @@ func (r *Runtime) Snapshot(_ context.Context, m vmruntime.VM, dir string) (vmrun
 // exec workers below the helper, and removes the sandbox files.
 //
 // The runtime keeps the sandbox tracked until the helper is reaped and the
-// sandbox directory is removed. The helper is the only handle to the exec
-// workers below it, so a failure before the helper is killed (the process
+// socket and sandbox directories are removed. The helper is the only handle to
+// the exec workers below it, so a failure before the helper is killed (the process
 // listing, a signal to a worker group) returns an error and leaves the helper
 // alive and the sandbox tracked, and a retry of Delete completes the cleanup.
 // A failure leaves the helper stopped, because a continued helper could start
@@ -617,7 +617,7 @@ func (r *Runtime) Snapshot(_ context.Context, m vmruntime.VM, dir string) (vmrun
 //
 // A helper that was reaped already (it crashed or was killed from outside)
 // receives no signal, because its process ID may belong to another process
-// now; Delete only removes the sandbox directory then.
+// now; Delete only removes the directories then.
 func (r *Runtime) Delete(ctx context.Context, sandboxID string) error {
 	r.mu.Lock()
 	v, ok := r.vms[sandboxID]
@@ -706,10 +706,14 @@ func (r *Runtime) removeUntracked(sandboxID string) error {
 }
 
 // removeSandbox removes the files of a sandbox whose helper was reaped,
-// including its socket directory, and then stops tracking it. A failed
-// removal keeps the sandbox tracked.
+// including its socket directory, and then stops tracking it. Remove the
+// socket directory first to preserve its on-disk record for a retry if that
+// removal fails.
 func (r *Runtime) removeSandbox(v *vm) error {
-	if err := errors.Join(fsutil.RemoveAll(v.dir), removeSocketDir(v)); err != nil {
+	if err := removeSocketDir(v); err != nil {
+		return err
+	}
+	if err := fsutil.RemoveAll(v.dir); err != nil {
 		return err
 	}
 	r.mu.Lock()
