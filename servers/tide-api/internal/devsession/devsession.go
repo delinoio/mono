@@ -31,6 +31,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/app"
 	"github.com/delinoio/mono/servers/tide-api/internal/authz"
 	"github.com/delinoio/mono/servers/tide-api/internal/db"
+	"github.com/delinoio/mono/servers/tide-api/internal/profile"
 	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
@@ -258,17 +259,7 @@ func (h *Handler) CreateDevSession(ctx context.Context, req *connect.Request[tid
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		// A shared lock of the profile row until the commit: a concurrent
-		// DeleteRunnerProfile, which locks the row FOR UPDATE before its
-		// hook cancels the queued requests, either waits and cancels this
-		// request too, or deletes the row first and this call fails with
-		// not_found.
-		var locked int
-		if err := tx.QueryRow(ctx, "SELECT 1 FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR SHARE",
-			c.OrganizationID, profileID).Scan(&locked); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return api.ErrNotFound("runner profile")
-			}
+		if err := profile.LockShare(ctx, tx, c.OrganizationID, profileID); err != nil {
 			return err
 		}
 		p, err := h.e.Profiles().Get(ctx, tx, c.OrganizationID, profileID)
@@ -278,13 +269,14 @@ func (h *Handler) CreateDevSession(ctx context.Context, req *connect.Request[tid
 		if p.Kind != tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION {
 			return api.ErrInvalidf("invalid runner_profile_id: the profile is not a DEV_SESSION profile")
 		}
-		var limit *int32
+		var locked int
 		if err := tx.QueryRow(ctx, "SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE", c.OrganizationID, c.UserID).Scan(&locked); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return api.ErrNotFound("organization")
 			}
 			return err
 		}
+		var limit *int32
 		if err := tx.QueryRow(ctx, "SELECT max_dev_sessions_per_user FROM organizations WHERE organization_id = $1", c.OrganizationID).Scan(&limit); err != nil {
 			return err
 		}

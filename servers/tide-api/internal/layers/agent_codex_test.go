@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
@@ -59,6 +60,41 @@ func newCodexWorld(t *testing.T, guest tidev1.GuestOs) *codexWorld {
 func (w *codexWorld) deliver(t *testing.T, id string, body []byte) int {
 	t.Helper()
 	return w.sender.Send(t, codexfake.Delivery{ID: id, Body: body})
+}
+
+func TestCreateDirectDuringProfileChange(t *testing.T) {
+	for _, tc := range []struct {
+		name, change string
+		args         []any
+	}{
+		{"deleted", "DELETE FROM runner_profiles WHERE runner_profile_id = $1", nil},
+		{"integration changed", "UPDATE runner_profiles SET agent_integration_id = NULL WHERE runner_profile_id = $1", nil},
+		{"kind changed", "UPDATE runner_profiles SET workload_kind = $2 WHERE runner_profile_id = $1", []any{int16(tidev1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newCodexWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			ctx := t.Context()
+			in, err := w.l.Integrations.Get(ctx, w.env.DB.Pool, w.org.ID, w.integrationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			args := append([]any{w.profileID}, tc.args...)
+			commit := holdTx(t, w.env, tc.change, args...)
+			done := make(chan error, 1)
+			go func() {
+				done <- w.env.DB.InTx(ctx, func(tx pgx.Tx) error {
+					_, _, err := w.l.Agents.CreateDirectTx(ctx, tx, w.l.Codex, in, agent.DirectDemand{VendorRequestID: "sess_profile_changed"})
+					return err
+				})
+			}()
+			waitForLockWaiter(t, w.env)
+			commit()
+			if err := <-done; !errors.Is(err, agent.ErrNoProfile) {
+				t.Fatalf("create direct: %v, want ErrNoProfile", err)
+			}
+			w.assertNoRequestsOrClaims(t)
+		})
+	}
 }
 
 // TestCodexSessionLifecycle: an environment_connection webhook makes tide

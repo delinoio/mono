@@ -166,6 +166,19 @@ func (ps *Profiles) Get(ctx context.Context, q db.Querier, orgID, id string) (*P
 	return p, err
 }
 
+// LockShare holds a shared profile row lock until the transaction ends.
+// The caller must lock the organization first, as DeleteRunnerProfile does.
+// Deletion either finds the committed request or removes the profile before
+// the caller can create a request.
+func LockShare(ctx context.Context, tx pgx.Tx, orgID, id string) error {
+	var locked int
+	err := tx.QueryRow(ctx, "SELECT 1 FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR SHARE", orgID, id).Scan(&locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return api.ErrNotFound("runner profile")
+	}
+	return err
+}
+
 // ListAll returns every profile of the organization.
 func (ps *Profiles) ListAll(ctx context.Context, q db.Querier, orgID string) ([]*Profile, error) {
 	rows, err := q.Query(ctx, "SELECT "+profileColumns+" FROM runner_profiles WHERE organization_id = $1 ORDER BY runner_profile_id", orgID)

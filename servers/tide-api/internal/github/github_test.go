@@ -828,6 +828,119 @@ func TestJobWaitsForDeactivation(t *testing.T) {
 	}
 }
 
+func TestJobWaitsForProfileChange(t *testing.T) {
+	for _, tc := range []struct {
+		name, action, change string
+	}{
+		{"queued after delete", "queued", "DELETE FROM runner_profiles WHERE runner_profile_id = $1"},
+		{"in progress after delete", "in_progress", "DELETE FROM runner_profiles WHERE runner_profile_id = $1"},
+		{"completed after delete", "completed", "DELETE FROM runner_profiles WHERE runner_profile_id = $1"},
+		{"queued after rename", "queued", "UPDATE runner_profiles SET name = 'renamed' WHERE runner_profile_id = $1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newGHWorld(t, worldOpts{manualDispatch: true})
+			w.link(t, 501, "acme")
+			profileID := w.createProfile(t, ghProfile("linux", 0))
+			ctx := t.Context()
+			tx, err := w.env.DB.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			if _, err := tx.Exec(ctx, "SELECT 1 FROM runner_profiles WHERE runner_profile_id = $1 FOR UPDATE", profileID); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan int, 1)
+			go func() {
+				_, status := w.gh.Send("workflow_job", job(tc.action, 501, 60, tideLinux, ""))
+				done <- status
+			}()
+			eventually(t, "delivery to wait for the profile lock", func() bool {
+				select {
+				case status := <-done:
+					t.Fatalf("delivery finished before the profile changed (status %d)", status)
+				default:
+				}
+				var waiting bool
+				if err := w.env.DB.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+					WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)))`, tx.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				return waiting
+			})
+			if _, err := tx.Exec(ctx, tc.change, profileID); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if status := <-done; status != http.StatusNoContent {
+				t.Fatalf("status %d, want %d", status, http.StatusNoContent)
+			}
+			if !strings.Contains(w.env.Logs.String(), `"detail":"labels match no runner profile"`) {
+				t.Error("delivery did not report that the labels match no runner profile")
+			}
+			if got := len(w.requests(t)); got != 0 {
+				t.Errorf("%d requests, want none", got)
+			}
+			var jobs int
+			if err := w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM github_jobs WHERE organization_id = $1", w.org.ID).Scan(&jobs); err != nil || jobs != 0 {
+				t.Errorf("%d GitHub jobs, want none (query error %v)", jobs, err)
+			}
+		})
+	}
+}
+
+func TestQueuedJobsShareProfileLock(t *testing.T) {
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	w.link(t, 501, "acme")
+	profileID := w.createProfile(t, ghProfile("linux", 0))
+	ctx := t.Context()
+	tx, err := w.env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM runner_profiles WHERE runner_profile_id = $1 FOR SHARE", profileID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 2)
+	for _, id := range []int64{60, 61} {
+		go func() {
+			_, status := w.gh.Send("workflow_job", job("queued", 501, id, tideLinux, ""))
+			done <- status
+		}()
+	}
+	timeout := time.After(10 * time.Second)
+	for range 2 {
+		select {
+		case status := <-done:
+			if status != http.StatusNoContent {
+				t.Fatalf("status %d, want %d", status, http.StatusNoContent)
+			}
+		case <-timeout:
+			t.Fatal("queued jobs did not finish while a shared profile lock was held")
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+		OrganizationId: w.org.ID, RunnerProfileId: profileID,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	requests := w.requests(t)
+	if len(requests) != 2 {
+		t.Fatalf("%d requests, want 2", len(requests))
+	}
+	for _, r := range requests {
+		if r.GetState() != tidev1.RequestState_REQUEST_STATE_CANCELED || r.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_PROFILE_DELETED {
+			t.Errorf("request state %v and end reason %v, want CANCELED and PROFILE_DELETED", r.GetState(), r.GetEndReason())
+		}
+	}
+}
+
 // TestInstallationSuspendedAndDeleted: suspend and deleted make the link
 // inactive, cancel its queued requests and delete its waiting runners;
 // unsuspend makes it ACTIVE again.
