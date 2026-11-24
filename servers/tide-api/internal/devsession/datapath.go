@@ -66,7 +66,11 @@ func (s *execSender) idle() time.Duration {
 func convertEvent(ev ownsand.ExecEvent) *tidev1.DevSessionExecEvent {
 	switch ev.Kind {
 	case ownsand.ExecEventStarted:
-		return &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Started{Started: &tidev1.DevSessionExecStarted{ExecId: ev.ExecID, StartTime: timestamppb.Now()}}}
+		started := &tidev1.DevSessionExecStarted{ExecId: ev.ExecID}
+		if ev.StartTime != nil {
+			started.StartTime = timestamppb.New(*ev.StartTime)
+		}
+		return &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Started{Started: started}}
 	case ownsand.ExecEventStdout:
 		return &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Stdout{Stdout: &tidev1.DevSessionExecOutput{Offset: ev.Offset, Data: ev.Data}}}
 	case ownsand.ExecEventStderr:
@@ -83,7 +87,10 @@ func convertEvent(ev ownsand.ExecEvent) *tidev1.DevSessionExecEvent {
 func resultEvent(res *ownsand.ExecResult) (*tidev1.DevSessionExecEvent, string) {
 	switch res.Kind {
 	case ownsand.ExecResultExited:
-		ex := &tidev1.DevSessionExecExited{TimedOut: res.TimedOut, EndTime: timestamppb.Now()}
+		ex := &tidev1.DevSessionExecExited{TimedOut: res.TimedOut}
+		if res.EndTime != nil {
+			ex.EndTime = timestamppb.New(*res.EndTime)
+		}
 		switch {
 		case res.ExitCode != nil:
 			ex.Status = &tidev1.DevSessionExecExited_ExitCode{ExitCode: *res.ExitCode}

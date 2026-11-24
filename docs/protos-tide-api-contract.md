@@ -137,6 +137,10 @@ When the OwnSand link is `ACTIVE`, `CreateRunnerProfile` checks template sources
 - `ExecDevSessionResponse` and `AttachDevSessionExecResponse` wrap one `DevSessionExecEvent`. `DevSessionExecEvent` is a `oneof` of `keepalive`, `started`, `output_truncated` (first available offsets), `stdout` and `stderr` (`offset` and `data`), `exited` (`oneof` of `exit_code` or `signal`, and `timed_out`), `failed` (`ExecFailureReason` and a message) and `sandbox_ended` (the OwnSand end reason as text). It copies the meaning of the OwnSand exec events and does not import OwnSand schemas.
 - `ReadDevSessionFileRequest`: `organization_id`, `dev_session_id`, `read_id`, `path` and `offset`; the stream carries chunks with `offset` and `data`, and a final message with `size_bytes`. `WriteDevSessionFileRequest`: `organization_id`, `dev_session_id`, `write_id`, `path`, `offset`, `data`, `mode` and `final`. The RPC returns `invalid_argument` if `offset` is negative. Every chunk of a file uses the same `write_id`; the file appears at the path only after the `final` chunk, and the written chunks must then cover the whole file. The response returns the written range and, after the final chunk, `finished` and `size_bytes`.
 
+#### Dev session exec events
+
+The `started.start_time` and `exited.end_time` fields carry the guest's original timestamps with nanosecond precision. When `AttachDevSessionExec` replays a retained event, it returns the same timestamp, even after the command ends. If the guest timestamp is missing or invalid, the corresponding field is absent. The event still carries its other fields, including the exit status and timeout flag for `exited`. The Unix epoch is a valid timestamp and remains present.
+
 ### Audit messages
 
 - `AuditEvent`: `audit_event_id`, `action` (`AuditAction`), `actor_user_id`, `actor_api_key_id` when the actor used a personal API key, `target_kind` (`AuditTargetKind`), `target_id`, `subject_user_id` (the dev session owner for dev session events and the affected member for membership events) and `create_time`. `ListAuditEvents` returns the newest events first.
