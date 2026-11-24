@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
+import type {
+  ListInvitationsResponse,
+  RevokeInvitationRequest,
+} from "@delino/ownsand-protos/v1/member_pb";
 import { SnapshotExportState } from "@delino/ownsand-protos/v1/common_pb";
 import type { CreateSandboxRequest } from "@delino/ownsand-protos/v1/sandbox_pb";
 import type {
@@ -66,14 +70,18 @@ export function createMockTransport(): Transport {
     methodName !== null && Object.hasOwn(lists, methodName)
       ? lists[methodName as keyof typeof lists]
       : undefined;
-  // Devices use the base mock's control-plane page size and cursor.
+  // These lists use the base mock's control-plane page size and cursor.
   const pageDevices = methodName === "ListDevices";
+  const pageInvitations = methodName === "ListInvitations";
   const pageSources = methodName === "SnapshotSources";
   // Seed enough rows to split the selected list across two pages.
   const base = createBaseMock({
     extraApiKeys: Number(methodName === "ListApiKeys"),
     extraDevices: pageDevices ? 199 : 0,
     extraEnrollmentTokens: Number(methodName === "ListEnrollmentTokens"),
+    extraInvitations: pageInvitations
+      ? Number(sessionStorage.getItem("ownsand-e2e-extra-invitations") ?? 200)
+      : 0,
     extraSnapshots: pageSources ? 200 : 0,
     extraTemplates: pageSources ? 200 : 0,
   });
@@ -82,6 +90,28 @@ export function createMockTransport(): Transport {
     async unary(method, signal, timeout, header, input, contextValues) {
       if (method.name === "ListOrganizations") {
         await failOrganizationListIfConfigured();
+      }
+      if (
+        pageInvitations &&
+        method.name === "CreateInvitation" &&
+        sessionStorage.getItem("ownsand-e2e-hold-invitation") === "true"
+      ) {
+        await new Promise<void>((resolve) => {
+          window.addEventListener(
+            "ownsand-e2e-release-invitation",
+            () => resolve(),
+            { once: true },
+          );
+          sessionStorage.setItem("ownsand-e2e-invitation-held", "true");
+        });
+      }
+      if (pageInvitations && method.name === "RevokeInvitation") {
+        const { organizationId, invitationId } =
+          input as unknown as RevokeInvitationRequest;
+        sessionStorage.setItem(
+          "ownsand-e2e-revoked-invitation",
+          JSON.stringify({ organizationId, invitationId }),
+        );
       }
       if (pageSources && method.name === "CreateSandbox") {
         const { source } = input as unknown as CreateSandboxRequest;
@@ -148,7 +178,7 @@ export function createMockTransport(): Transport {
       }
       if (
         method.name !== methodName ||
-        (!pageDevices && pagination === undefined)
+        (!pageDevices && !pageInvitations && pagination === undefined)
       ) {
         return base.unary(
           method,
@@ -163,7 +193,7 @@ export function createMockTransport(): Transport {
       const token = request.pageToken ?? "";
       recordToken("ownsand-e2e-page-tokens", token);
       if (token !== "") {
-        if (!pageDevices && token !== CONTINUATION) {
+        if (pagination !== undefined && token !== CONTINUATION) {
           throw new ConnectError(
             "Unexpected continuation token",
             Code.InvalidArgument,
@@ -173,7 +203,7 @@ export function createMockTransport(): Transport {
       }
 
       if (pagination === undefined) {
-        return base.unary(
+        const response = await base.unary(
           method,
           signal,
           timeout,
@@ -181,6 +211,18 @@ export function createMockTransport(): Transport {
           input,
           contextValues,
         );
+        if (pageInvitations && token !== "") {
+          const { invitations } =
+            response.message as unknown as ListInvitationsResponse;
+          const later = invitations[0];
+          if (later) {
+            sessionStorage.setItem(
+              "ownsand-e2e-later-invitation",
+              later.invitationId,
+            );
+          }
+        }
+        return response;
       }
       const { field, firstPageSize } = pagination;
       const response = await base.unary(
