@@ -91,7 +91,8 @@ func (a *Agent) runChannel(ctx context.Context) error {
 	}
 	if res.Removal != nil {
 		a.logger.Info("authentication returned a removal notice")
-		return a.removeDevice(ctx)
+		a.requestRemoval()
+		return nil
 	}
 	a.logger.Info("authenticated", "device_id", a.DeviceID(), "credential_expires_in_s", int64(res.Session.ExpiresIn.Seconds()))
 
@@ -280,6 +281,13 @@ func (a *Agent) dispatch(chanCtx, agentCtx context.Context, c *conn, env *ownsan
 			a.Sandboxes.AckSandboxUpdate(ack.SandboxUpdate)
 		}
 	case *ownsandv1.AgentEnvelope_Command:
+		if _, ok := m.Command.GetCommand().(*ownsandv1.AgentCommand_CleanUp); ok {
+			// Signal removal before the channel can exit and Run decides
+			// whether to restart. The clean-up command only queues a reply
+			// and closes admission here.
+			a.handleClaimedCommand(chanCtx, agentCtx, m.Command, 0, nil)
+			return
+		}
 		// An update or withdrawal command takes its order here, in receive
 		// order, because the commands run in separate goroutines.
 		var order uint64

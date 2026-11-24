@@ -87,6 +87,7 @@ type Agent struct {
 	urlGrantTimeout time.Duration
 	restart         chan struct{}
 	removal         chan struct{}
+	removalOnce     sync.Once
 	status          Status
 
 	// statusMu serializes the status file writes and fences them during
@@ -126,7 +127,7 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 		opts: opts, logger: opts.Logger, key: key, st: opts.Store, cp: opts.Control, rt: opts.Runtime,
 		urlWaiters: map[string]chan *ownsandv1.SignedUrlGrant{},
 		restart:    make(chan struct{}, 1),
-		removal:    make(chan struct{}, 1),
+		removal:    make(chan struct{}),
 	}
 	a.Sandboxes, err = sandboxes.New(ctx, sandboxes.Options{Store: opts.Store, Runtime: opts.Runtime, Logger: opts.Logger})
 	if err != nil {
@@ -199,10 +200,7 @@ func (a *Agent) NewDeviceSession(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if res.Removal != nil {
-		select {
-		case a.removal <- struct{}{}:
-		default:
-		}
+		a.requestRemoval()
 		return "", errors.New("agent: the device was removed")
 	}
 	return res.Session.Credential, nil
@@ -235,24 +233,27 @@ func (a *Agent) Run(ctx context.Context) error {
 	}()
 	chCtx, chCancel := context.WithCancel(ctx)
 	defer chCancel()
-	errc := make(chan error, 1)
-	go func() { errc <- a.channelLoop(chCtx) }()
+	channelDone := make(chan struct{})
+	go func() {
+		defer close(channelDone)
+		a.channelLoop(chCtx)
+	}()
+	var err error
 	select {
-	case err := <-errc:
-		cancel()
-		return err
 	case <-a.restart:
-		cancel()
-		<-errc
-		return ErrRestart
+		err = ErrRestart
 	case <-a.removal:
-		// The control plane closes the channel after the clean-up command.
-		chCancel()
-		<-errc
-		return a.removeDevice(ctx)
 	case <-ctx.Done():
-		<-errc
-		return nil
+	}
+	chCancel()
+	<-channelDone
+	// Check again after the channel stops in case it requested removal while
+	// the restart or context cancellation was also ready.
+	select {
+	case <-a.removal:
+		return a.removeDevice(ctx)
+	default:
+		return err
 	}
 }
 
@@ -267,16 +268,17 @@ func (a *Agent) shutdown() {
 
 // channelLoop keeps one agent channel open, with back-off between
 // attempts.
-func (a *Agent) channelLoop(ctx context.Context) error {
+func (a *Agent) channelLoop(ctx context.Context) {
 	b := backoff.Backoff{Min: a.opts.BackoffMin, Max: a.opts.BackoffMax}
 	for {
 		started := time.Now()
 		err := a.runChannel(ctx)
-		if errors.Is(err, ErrRemoved) || ctx.Err() != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return err
+		select {
+		case <-a.removal:
+			return
+		case <-ctx.Done():
+			return
+		default:
 		}
 		if time.Since(started) > time.Minute {
 			b.Reset()
@@ -284,7 +286,7 @@ func (a *Agent) channelLoop(ctx context.Context) error {
 		delay := b.Next()
 		a.logger.Warn("agent channel closed; reconnecting", "error", errString(err), "retry_in_ms", delay.Milliseconds())
 		if backoff.Sleep(ctx, delay) != nil {
-			return nil
+			return
 		}
 	}
 }
