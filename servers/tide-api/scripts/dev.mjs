@@ -8,9 +8,10 @@
 // exit and removes the build output. A signal before the server starts stops
 // the launcher without starting the server.
 //
-// The server needs Postgres and TIDE_SECRET_KEYS. An empty value (empty or
-// only whitespace) counts as unset for DATABASE_URL, CORS_ORIGINS,
-// ALLOW_DIRECT_CLIENT_ADDRESS and METRICS_ADDR, as it does for the server.
+// The server needs Postgres and TIDE_SECRET_KEYS. A value that is empty or
+// consists only of ASCII white space counts as unset for DATABASE_URL,
+// CORS_ORIGINS, ALLOW_DIRECT_CLIENT_ADDRESS and METRICS_ADDR, as it does for
+// the server.
 // When DATABASE_URL is unset, the launcher prints a `tide_api_dev_skipped`
 // record and exits with status 0 instead of failing, so the root `pnpm dev`
 // keeps running the other development servers on machines without a
@@ -49,6 +50,11 @@ const DevelopmentConsoleOrigins = Object.freeze([
 ]);
 const ProductionConsoleOrigin = "https://tide.delino.io";
 const DevelopmentMetricsAddr = "127.0.0.1:19400";
+
+// Match the server's ASCII white space rule when deciding whether a value is unset.
+const AsciiWhiteSpaceOnly = /^[\t\n\v\f\r ]*$/;
+const isUnset = (value) =>
+  value === undefined || AsciiWhiteSpaceOnly.test(value);
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const binaryName = process.platform === "win32" ? "tide-api.exe" : "tide-api";
@@ -89,8 +95,7 @@ function run(command, args, env) {
 const stoppedStatus = () => signalExitCode(received);
 
 async function main() {
-  // An empty value counts as unset, as it does for the server.
-  if (!process.env.DATABASE_URL?.trim()) {
+  if (isUnset(process.env.DATABASE_URL)) {
     console.error(
       JSON.stringify({
         event: "tide_api_dev_skipped",
@@ -100,13 +105,13 @@ async function main() {
     return 0;
   }
   const env = { ...process.env };
-  if (!env.ALLOW_DIRECT_CLIENT_ADDRESS?.trim()) {
+  if (isUnset(env.ALLOW_DIRECT_CLIENT_ADDRESS)) {
     env.ALLOW_DIRECT_CLIENT_ADDRESS = "true";
   }
-  if (!env.METRICS_ADDR?.trim()) {
+  if (isUnset(env.METRICS_ADDR)) {
     env.METRICS_ADDR = DevelopmentMetricsAddr;
   }
-  if (!env.CORS_ORIGINS?.trim()) {
+  if (isUnset(env.CORS_ORIGINS)) {
     env.CORS_ORIGINS = [
       ProductionConsoleOrigin,
       ...DevelopmentConsoleOrigins,

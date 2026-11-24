@@ -544,7 +544,7 @@ The server records audit events for: organization creation and deletion, ownersh
 
 ## Configuration
 
-The server reads these environment variables without a service prefix. Empty values count as unset. A value that fails validation stops the server at startup, and the error never contains a secret value.
+The server reads these environment variables without a service prefix. It removes only ASCII white space from the start and end of each configuration value. Empty values count as unset. A value that fails validation stops the server at startup, and the error never contains a secret value.
 
 | Variable                      | Required | Default                         | Rule                                                                                                           |
 | ----------------------------- | -------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------- |
@@ -603,6 +603,7 @@ The server reads these environment variables without a service prefix. Empty val
 
 ## Build and Test
 
+- The development launcher treats empty values and values made only of ASCII white space (space, tab, line feed, vertical tab, form feed and carriage return) as unset for `DATABASE_URL`, `CORS_ORIGINS`, `ALLOW_DIRECT_CLIENT_ADDRESS` and `METRICS_ADDR`. This matches the server's configuration rule. The launcher passes values made only of U+00A0 or U+3000 to the server unchanged.
 - Package scripts wrap the Go toolchain like `accounts-api`. Before finishing a change, run `pnpm exec turbo run test --filter=tide-api`, `go vet ./...` and the `gofmt` check from `servers/AGENTS.md`.
 - Postgres-backed tests (the `db`, `lease`, `jobs` and `api` integration tests) use `TIDE_TEST_DATABASE_URL`, a Postgres URL whose user may create databases. Each test creates and drops its own database; without the variable, these tests skip. The CI `go-test` job sets it. A local run: `TIDE_TEST_DATABASE_URL=postgres://postgres:<password>@127.0.0.1:<port>/postgres?sslmode=disable pnpm exec turbo run test --filter=tide-api`, for example against a `postgres:17` container.
 - The database fixture fails the owning test if cleanup cannot open the admin connection or drop the generated database. The diagnostic includes the failed operation and database name and omits connection details and raw driver errors.
