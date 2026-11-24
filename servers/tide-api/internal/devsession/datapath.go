@@ -315,10 +315,19 @@ func (h *Handler) ReadDevSessionFile(ctx context.Context, req *connect.Request[t
 			return w.sendErr
 		}
 		log.WarnContext(ctx, "dev_session_read_failed", slog.String("code", ownsandclient.Code(err)), slog.Int64("bytes", w.bytes))
-		return ownsandError(err)
+		return fileTransferError(err)
 	}
 	log.InfoContext(ctx, "dev_session_file_read", slog.Int64("bytes", w.bytes), slog.Int64("size_bytes", size), slog.Int64("duration_ms", time.Since(start).Milliseconds()))
 	return stream.Send(&tidev1.ReadDevSessionFileResponse{Event: &tidev1.ReadDevSessionFileResponse_End{End: &tidev1.DevSessionFileEnd{SizeBytes: size}}})
+}
+
+func fileTransferError(err error) error {
+	var ce *connect.Error
+	if errors.As(err, &ce) && ce.Code() == connect.CodePermissionDenied &&
+		ce.Message() == "request does not match the recorded operation" {
+		return api.ErrPrecondition("Restart the file transfer from the beginning with a new operation ID.")
+	}
+	return ownsandError(err)
 }
 
 // writes keeps the OwnSand FileWrite of each write_id on this instance
@@ -442,7 +451,7 @@ func (h *Handler) WriteDevSessionFile(ctx context.Context, req *connect.Request[
 			// The write expired in the guest; a new write_id starts again.
 			h.writes.drop(key)
 		}
-		return nil, ownsandError(err)
+		return nil, fileTransferError(err)
 	}
 	h.e.Metrics().TransferBytes("upload", strings.TrimPrefix(sess.guestOS.String(), "GUEST_OS_"), int64(len(m.GetData())))
 	log.InfoContext(ctx, "dev_session_file_write", slog.Int("size", len(m.GetData())), slog.Bool("final", m.GetFinal()), slog.Int64("duration_ms", time.Since(start).Milliseconds()))
