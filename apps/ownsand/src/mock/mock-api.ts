@@ -1138,7 +1138,16 @@ export function createMockTransport(
       listInvitations(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
-        return { invitations: org.invitations.map((i) => i.invitation) };
+        const cutoff = now();
+        const invitations = org.invitations
+          .map(({ invitation }) => invitation)
+          .filter(
+            ({ state, expireTime }) =>
+              state === InvitationState.PENDING &&
+              expireTime !== undefined &&
+              timestampMs(expireTime) > cutoff,
+          );
+        return { invitations };
       },
       revokeInvitation(req) {
         const { org, role } = membership(req.organizationId);
