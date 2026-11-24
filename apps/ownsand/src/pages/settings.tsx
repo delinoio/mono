@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { create } from "@bufbuild/protobuf";
+import {
+  createConnectQueryKey,
+  useMutation,
+  useQuery,
+  useTransport,
+} from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonVariant } from "delino-ui/button";
 import {
@@ -14,10 +20,13 @@ import {
   AgentVersionPolicyMode,
   Role,
 } from "@delino/ownsand-protos/v1/common_pb";
-import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import {
+  DeviceService,
+  GetAgentVersionPolicyResponseSchema,
+} from "@delino/ownsand-protos/v1/device_pb";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { type FormEvent, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
@@ -67,39 +76,49 @@ export function SettingsPage() {
 function AgentPolicy() {
   const { organizationId, role } = useOrg();
   const queryClient = useQueryClient();
+  const transport = useTransport();
   const policy = useQuery(DeviceService.method.getAgentVersionPolicy, {
     organizationId,
   });
   const update = useMutation(DeviceService.method.updateAgentVersionPolicy, {
-    onSuccess: () => invalidateServices(queryClient, DeviceService),
+    onSuccess: ({ policy }, { organizationId }) => {
+      if (policy !== undefined) {
+        // Use the confirmed policy if the readback fails.
+        queryClient.setQueryData(
+          createConnectQueryKey({
+            schema: DeviceService.method.getAgentVersionPolicy,
+            input: { organizationId },
+            transport,
+            cardinality: "finite",
+          }),
+          create(GetAgentVersionPolicyResponseSchema, { policy }),
+        );
+      }
+      return invalidateServices(queryClient, DeviceService);
+    },
   });
-  const [mode, setMode] = useState(
-    String(AgentVersionPolicyMode.FOLLOW_DEFAULT),
-  );
-  const [version, setVersion] = useState("");
+  const [draft, setDraft] = useState<{
+    mode?: AgentVersionPolicyMode;
+    version?: string;
+  }>({});
   const [versionError, setVersionError] = useState<string>();
   const editable = can(role, Permission.ChangeAgentVersionPolicy);
   const current = policy.data?.policy;
-  // `update.isPending` lasts until the refetch that follows the save has
-  // settled (the mutation awaits `onSuccess`), so it also covers the moment
-  // when the effect below copies the saved policy into the form. The fields
-  // are disabled for that whole window, so the readback cannot erase an edit
-  // that the user makes after the submit. `saving` is the synchronous guard
-  // for a second submit in the same tick, before React renders the disabled
-  // button.
+  const mode =
+    draft.mode ?? (current?.mode || AgentVersionPolicyMode.FOLLOW_DEFAULT);
+  const version = draft.version ?? current?.pinnedVersion ?? "";
+  const pinnedVersion = version.trim();
+  const isPin = mode === AgentVersionPolicyMode.PIN;
+  // The mutation stays pending through the readback. The fields stay disabled
+  // until the submitted draft is cleared. The ref guards a second submission
+  // in the same tick, before React disables the button.
   const saving = useRef(false);
   const pending = update.isPending;
-
-  useEffect(() => {
-    if (current === undefined) return;
-    setMode(String(current.mode || AgentVersionPolicyMode.FOLLOW_DEFAULT));
-    setVersion(current.pinnedVersion);
-  }, [current]);
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
     if (saving.current) return;
-    if (Number(mode) === AgentVersionPolicyMode.PIN && version.trim() === "") {
+    if (isPin && pinnedVersion === "") {
       setVersionError("Enter the agent version to pin, for example 1.4.2.");
       return;
     }
@@ -107,10 +126,11 @@ function AgentPolicy() {
     try {
       await update.mutateAsync({
         organizationId,
-        mode: Number(mode) as AgentVersionPolicyMode,
-        pinnedVersion:
-          Number(mode) === AgentVersionPolicyMode.PIN ? version.trim() : "",
+        mode,
+        pinnedVersion: isPin ? pinnedVersion : "",
       });
+      setDraft({});
+      setVersionError(undefined);
       toast.success("The agent version policy is saved.");
     } catch (error) {
       // The draft stays as the user left it and the form is usable again.
@@ -131,10 +151,15 @@ function AgentPolicy() {
           <form className="form" onSubmit={save}>
             <SegmentedControl
               aria-label="Update mode"
-              value={mode}
-              onValueChange={(v: unknown) =>
-                typeof v === "string" && setMode(v)
-              }
+              value={String(mode)}
+              onValueChange={(value) => {
+                const selectedMode = MODES.find(
+                  (candidate) => String(candidate) === value,
+                );
+                if (selectedMode !== undefined) {
+                  setDraft((draft) => ({ ...draft, mode: selectedMode }));
+                }
+              }}
               disabled={!editable || pending}
             >
               {MODES.map((m) => (
@@ -143,15 +168,15 @@ function AgentPolicy() {
                 </SegmentedControlItem>
               ))}
             </SegmentedControl>
-            {Number(mode) === AgentVersionPolicyMode.PIN ? (
+            {isPin ? (
               <TextField
                 label="Pinned version"
                 value={version}
                 onValueChange={(v) => {
-                  setVersion(v);
+                  setDraft((draft) => ({ ...draft, version: v }));
                   setVersionError(undefined);
                 }}
-                error={versionError}
+                error={pinnedVersion === "" ? versionError : undefined}
                 disabled={!editable || pending}
               />
             ) : null}
