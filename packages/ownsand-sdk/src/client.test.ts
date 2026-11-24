@@ -894,12 +894,6 @@ describe("createSandbox", () => {
       { memoryMib: 2n ** 63n },
       "resources.memory_mib",
     ],
-    ["a fractional disk size", { diskGib: 0.5 }, "resources.disk_gib"],
-    ["a NaN disk size", { diskGib: NaN }, "resources.disk_gib"],
-    ["a zero disk size", { diskGib: 0 }, "resources.disk_gib"],
-    ["a negative disk size", { diskGib: -5 }, "resources.disk_gib"],
-    ["a disk size of 2**63", { diskGib: 2 ** 63 }, "resources.disk_gib"],
-    ["a disk size of 2n**63n", { diskGib: 2n ** 63n }, "resources.disk_gib"],
   ])("rejects %s before the request", async (_name, resources, field) => {
     const h = setup();
     const error = await h.client
@@ -913,21 +907,58 @@ describe("createSandbox", () => {
     expect(h.api.calls).toHaveLength(0);
   });
 
+  test.each([
+    ["a number one GiB above the disk limit", 8_589_934_592],
+    ["a bigint one GiB above the disk limit", 8_589_934_592n],
+    ["a disk size of 2n**40n", 2n ** 40n],
+    ["the signed int64 maximum as a disk size", MAX_INT64],
+    ["an unsafe number disk size", Number.MAX_SAFE_INTEGER + 1],
+    ["a fractional disk size", 0.5],
+    ["a NaN disk size", NaN],
+    ["a disk size of 2**63", 2 ** 63],
+    ["a disk size of 2n**63n", 2n ** 63n],
+  ])("rejects %s before the request", async (_name, diskGib) => {
+    const h = setup();
+    const error = await h.client
+      .createSandbox({
+        ...validCreate,
+        resources: { ...goodResources, diskGib },
+      })
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(OwnSandValidationError);
+    expect(error.field).toBe("resources.disk_gib");
+    expect(error.message).toBe(
+      "resources.disk_gib must be an integer from 1 to 8589934591",
+    );
+    expect(h.api.calls).toHaveLength(0);
+  });
+
   test("keeps the zero and negative resource messages", async () => {
     const h = setup();
     const messages = await Promise.all(
-      [{ vcpuCount: 0 }, { memoryMib: -1 }, { diskGib: 0n }].map((resources) =>
+      [
+        { vcpuCount: 0 },
+        { memoryMib: -1 },
+        { diskGib: 0 },
+        { diskGib: 0n },
+        { diskGib: -1 },
+      ].map((resources) =>
         h.client
           .createSandbox({
             ...validCreate,
             resources: { ...goodResources, ...resources },
-          } as never)
+          })
           .catch((e) => e.message),
       ),
     );
-    for (const message of messages) {
-      expect(message).toContain("must be greater than zero");
-    }
+    expect(messages).toEqual([
+      "resources.vcpu_count must be greater than zero",
+      "resources.memory_mib must be greater than zero",
+      "resources.disk_gib must be greater than zero",
+      "resources.disk_gib must be greater than zero",
+      "resources.disk_gib must be greater than zero",
+    ]);
+    expect(h.api.calls).toHaveLength(0);
   });
 
   test("never puts the rejected resource value in the error", async () => {
@@ -956,12 +987,12 @@ describe("createSandbox", () => {
       "the largest safe integer sizes",
       {
         memoryMib: Number.MAX_SAFE_INTEGER,
-        diskGib: Number.MAX_SAFE_INTEGER,
+        diskGib: 8_589_934_591,
       },
       {
         vcpuCount: 2,
         memoryMib: BigInt(Number.MAX_SAFE_INTEGER),
-        diskGib: BigInt(Number.MAX_SAFE_INTEGER),
+        diskGib: 8_589_934_591n,
       },
     ],
     [
@@ -971,8 +1002,23 @@ describe("createSandbox", () => {
     ],
     [
       "the largest bigint sizes",
-      { memoryMib: MAX_INT64, diskGib: MAX_INT64 },
-      { vcpuCount: 2, memoryMib: MAX_INT64, diskGib: MAX_INT64 },
+      { memoryMib: MAX_INT64, diskGib: 8_589_934_591n },
+      { vcpuCount: 2, memoryMib: MAX_INT64, diskGib: 8_589_934_591n },
+    ],
+    [
+      "the disk limit as a number",
+      { memoryMib: 4096, diskGib: 8_589_934_591 },
+      { vcpuCount: 2, memoryMib: 4096n, diskGib: 8_589_934_591n },
+    ],
+    [
+      "the disk limit as a bigint",
+      { memoryMib: 4096n, diskGib: 8_589_934_591n },
+      { vcpuCount: 2, memoryMib: 4096n, diskGib: 8_589_934_591n },
+    ],
+    [
+      "the memory limit with a small disk",
+      { memoryMib: MAX_INT64, diskGib: 1n },
+      { vcpuCount: 2, memoryMib: MAX_INT64, diskGib: 1n },
     ],
     [
       "a bigint size next to a number size",
