@@ -6,15 +6,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/delinoio/mono/cmds/internal/credstore"
+	"github.com/delinoio/mono/go/tide"
 	"github.com/delinoio/mono/go/tide/tidetest"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 )
@@ -51,6 +55,183 @@ func newFixture(t *testing.T) *fixture {
 type result struct {
 	code           int
 	stdout, stderr string
+}
+
+type execJSONLine struct {
+	Event  string `json:"event"`
+	Offset int64  `json:"offset"`
+	Data   string `json:"data"`
+}
+
+func parseExecJSONLines(t *testing.T, output string) []execJSONLine {
+	t.Helper()
+	var got []execJSONLine
+	for line := range strings.SplitSeq(strings.TrimSuffix(output, "\n"), "\n") {
+		var event execJSONLine
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode exec event %q: %v", line, err)
+		}
+		got = append(got, event)
+	}
+	return got
+}
+
+func checkExecJSONLines(t *testing.T, output string, want ...execJSONLine) {
+	t.Helper()
+	got := parseExecJSONLines(t, output)
+	if !slices.Equal(got, want) {
+		t.Fatalf("exec events = %+v, want %+v", got, want)
+	}
+}
+
+func TestExecJSONDecodesUTF8AcrossChunks(t *testing.T) {
+	stdout, stderr := tide.ExecEventStdout, tide.ExecEventStderr
+	var output bytes.Buffer
+	w := execWriter{a: &app{fmt: FormatJSON, env: Env{Stdout: &output}}}
+	for _, ev := range []tide.ExecEvent{
+		{Kind: stdout, Offset: 0, Data: []byte("h\xc3")},
+		{Kind: stderr, Offset: 0, Data: []byte("\xe2")},
+		{Kind: stdout, Offset: 2, Data: []byte("\xa9 \xe2\x82")},
+		{Kind: stderr, Offset: 1, Data: []byte("\x82\xac")},
+		{Kind: stdout, Offset: 6, Data: []byte("\xac")},
+		{Kind: stdout, Offset: 7, Data: []byte("\xffa\xe2\x82")},
+		{Kind: stderr, Offset: 3, Data: []byte("\xc3")},
+		{Kind: tide.ExecEventOutputTruncated, MissingStdout: tide.ByteRange{From: 11, To: 13}},
+		{Kind: stderr, Offset: 4, Data: []byte("\xa9")},
+		{Kind: stdout, Offset: 13, Data: []byte("\xacz\xf0")},
+		{Kind: stdout, Offset: 17, Data: []byte("b")},
+	} {
+		ev.ExecID = "exec"
+		if err := w.event(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkExecJSONLines(t, output.String(),
+		execJSONLine{Event: "stdout", Offset: 0, Data: "h"},
+		execJSONLine{Event: "stdout", Offset: 1, Data: "é "},
+		execJSONLine{Event: "stderr", Offset: 0, Data: "€"},
+		execJSONLine{Event: "stdout", Offset: 4, Data: "€"},
+		execJSONLine{Event: "stdout", Offset: 7, Data: "�a"},
+		execJSONLine{Event: "stdout", Offset: 9, Data: "�"},
+		execJSONLine{Event: "output_truncated"},
+		execJSONLine{Event: "stderr", Offset: 3, Data: "é"},
+		execJSONLine{Event: "stdout", Offset: 13, Data: "�z"},
+		execJSONLine{Event: "stdout", Offset: 15, Data: "�"},
+		execJSONLine{Event: "stdout", Offset: 17, Data: "b"},
+	)
+}
+
+func TestExecJSONFlushesUTF8BeforeResult(t *testing.T) {
+	for _, tc := range []struct {
+		event string
+		err   error
+	}{
+		{event: "exited"},
+		{event: "stream_error", err: &tide.ExecStreamError{
+			ExecID: "exec", StdoutOffset: 2, StderrOffset: 2, Err: errors.New("stream broke"),
+		}},
+	} {
+		t.Run(tc.event, func(t *testing.T) {
+			var output bytes.Buffer
+			a := &app{fmt: FormatJSON, env: Env{Stdout: &output}, logger: slog.Default()}
+			w := execWriter{a: a}
+			for _, ev := range []tide.ExecEvent{
+				{Kind: tide.ExecEventStdout, ExecID: "exec", Data: []byte("\xe2\x82")},
+				{Kind: tide.ExecEventStderr, ExecID: "exec", Data: []byte("x\xe2")},
+			} {
+				if err := w.event(ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			res := &tide.ExecResult{Kind: tide.ExecResultExited, ExecID: "exec", StdoutOffset: 2, StderrOffset: 2}
+			err := a.finishExec(context.Background(), "session", &w, res, tc.err)
+			if tc.err != nil {
+				var exit *exitError
+				if !errors.As(err, &exit) || exit.code != ExitDataPath {
+					t.Fatalf("finishExec = %v, want exit %d", err, ExitDataPath)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			checkExecJSONLines(t, output.String(),
+				execJSONLine{Event: "stderr", Offset: 0, Data: "x"},
+				execJSONLine{Event: "stdout", Offset: 0, Data: "�"},
+				execJSONLine{Event: "stderr", Offset: 1, Data: "�"},
+				execJSONLine{Event: tc.event},
+			)
+		})
+	}
+}
+
+type interruptExecOutput struct {
+	bytes.Buffer
+	cancel context.CancelFunc
+}
+
+func (w *interruptExecOutput) Write(p []byte) (int, error) {
+	n, err := w.Buffer.Write(p)
+	if bytes.Contains(w.Bytes(), []byte(`"event":"stdout"`)) && bytes.Contains(w.Bytes(), []byte(`"event":"stderr"`)) {
+		w.cancel()
+	}
+	return n, err
+}
+
+func TestSessionExecJSONResumesBufferedUTF8(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake guest runs POSIX sh commands")
+	}
+	f := newFixture(t)
+	f.srv.AddDevSessionProfile(f.org, "linux", tidev1.GuestOs_GUEST_OS_LINUX, f.wd)
+	f.env[EnvAPIKey] = f.srv.APIKey
+	f.env[EnvOrganization] = f.org
+	var session struct {
+		ID string `json:"dev_session_id"`
+	}
+	if err := json.Unmarshal([]byte(f.ok("", "--output", "json", "session", "create", "linux").stdout), &session); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stdout := &interruptExecOutput{cancel: cancel}
+	var stderr bytes.Buffer
+	// Wait for a local file so the continuation cannot reach the first CLI call.
+	const command = `printf 'a\342\202'; printf 'ok' >&2; while [ ! -f resume ]; do sleep 0.1; done; printf '\254'`
+	code := Run(ctx, Env{
+		Args:      []string{"--output", "json", "session", "exec", session.ID, "--", "sh", "-c", command},
+		Stdout:    stdout,
+		Stderr:    &stderr,
+		LookupEnv: func(k string) (string, bool) { v, ok := f.env[k]; return v, ok },
+	})
+	if code != ExitInterrupted {
+		t.Fatalf("interrupted exec = %d %s", code, stderr.String())
+	}
+	// The two guest pipes can become readable in either order.
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("interrupted exec events = %s", stdout.String())
+	}
+	if strings.Contains(lines[1], `"event":"stdout"`) {
+		lines[1], lines[2] = lines[2], lines[1]
+	}
+	checkExecJSONLines(t, strings.Join(lines, "\n"),
+		execJSONLine{Event: "started"},
+		execJSONLine{Event: "stderr", Offset: 0, Data: "ok"},
+		execJSONLine{Event: "stdout", Offset: 0, Data: "a"},
+	)
+	_, hint, ok := strings.Cut(stderr.String(), "Continue with: tide ")
+	if !ok || !strings.HasSuffix(strings.TrimSpace(hint), "--stdout-offset 1 --stderr-offset 2") {
+		t.Fatalf("attach hint = %s", stderr.String())
+	}
+	if err := os.WriteFile(filepath.Join(f.wd, "resume"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := append([]string{"--output", "json"}, strings.Fields(hint)...)
+	attached := f.ok("", args...)
+	checkExecJSONLines(t, attached.stdout,
+		execJSONLine{Event: "stdout", Offset: 1, Data: "€"},
+		execJSONLine{Event: "exited"},
+	)
 }
 
 func (f *fixture) run(stdin string, args ...string) result {
@@ -142,15 +323,18 @@ func TestCredentialPrecedenceAndErrors(t *testing.T) {
 
 func TestCredentialInput(t *testing.T) {
 	f := newFixture(t)
-	f.ok("ownsand-key-from-stdin\n", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org")
+	r := f.ok("ownsand-key-from-stdin\n", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org")
 	if _, key := f.srv.OwnSandLink(f.org); key != "ownsand-key-from-stdin" {
 		t.Fatalf("stdin key = %q", key)
+	}
+	if strings.Contains(r.stdout+r.stderr, "ownsand-key-from-stdin") {
+		t.Fatal("the credential from stdin was printed")
 	}
 	file := filepath.Join(t.TempDir(), "key")
 	if err := os.WriteFile(file, []byte("ownsand-key-from-file\r\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r := f.ok("", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org", "--api-key-file", file)
+	r = f.ok("", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org", "--api-key-file", file)
 	if _, key := f.srv.OwnSandLink(f.org); key != "ownsand-key-from-file" {
 		t.Fatalf("file key = %q", key)
 	}
@@ -340,6 +524,20 @@ func TestSessionCommands(t *testing.T) {
 	_ = json.Unmarshal([]byte(lines[len(lines)-1]), &last)
 	if r.code != 0 || last["event"] != "exited" || last["exit_code"] != float64(7) || !strings.Contains(r.stdout, `"data":"hi\n"`) {
 		t.Fatalf("json exec = %d %s", r.code, r.stdout)
+	}
+	const splitUTF8 = `printf 'a\342\202'; sleep 0.5; printf '\254z'`
+	r = f.ok("", "--output", "json", "session", "exec", id, "--", "sh", "-c", splitUTF8)
+	var joined strings.Builder
+	for _, event := range parseExecJSONLines(t, r.stdout) {
+		if event.Event == "stdout" {
+			joined.WriteString(event.Data)
+		}
+	}
+	if joined.String() != "a€z" {
+		t.Fatalf("JSON exec events = %s", r.stdout)
+	}
+	if r := f.ok("", "session", "exec", id, "--", "sh", "-c", splitUTF8); r.stdout != "a€z" {
+		t.Fatalf("text exec stdout = %q", r.stdout)
 	}
 
 	// Sync and download.

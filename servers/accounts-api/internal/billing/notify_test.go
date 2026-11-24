@@ -187,41 +187,122 @@ func TestNotificationConcurrentWorkersSkipLeased(t *testing.T) {
 	acct := f.account()
 	id := f.queueNotice(acct, "credit_expiry/concurrent")
 
+	workersCtx, cancelWorkers := context.WithTimeout(t.Context(), 15*time.Second)
+	type secondWorkerKey struct{}
+	secondCtx := context.WithValue(workersCtx, secondWorkerKey{}, true)
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	var once sync.Once
+	releaseFirst := sync.OnceFunc(func() { close(release) })
+	unexpectedSend := make(chan error, 1)
 	var mu sync.Mutex
+	firstSendStarted := false
 	inFlight, maxInFlight := 0, 0
 	f.s.email = &hookSender{next: f.email, before: func(ctx context.Context, _ email.Message) error {
+		secondWorker := ctx.Value(secondWorkerKey{}) == true
 		mu.Lock()
 		inFlight++
 		maxInFlight = max(maxInFlight, inFlight)
+		firstSend := !secondWorker && !firstSendStarted
+		if firstSend {
+			firstSendStarted = true
+		}
 		mu.Unlock()
 		defer func() {
 			mu.Lock()
 			inFlight--
 			mu.Unlock()
 		}()
-		once.Do(func() {
+		if secondWorker {
+			err := fmt.Errorf("second worker reached the sender while the first worker was held")
+			select {
+			case unexpectedSend <- err:
+			default:
+			}
+			return err
+		}
+		if firstSend {
 			close(entered)
-			<-release
-		})
-		return nil
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		}
+		return ctx.Err()
 	}}
 
-	done := make(chan error, 1)
-	go func() { done <- f.s.DeliverNotifications(ctx()) }()
-	<-entered
+	var firstResult, secondResult <-chan error
+	t.Cleanup(func() {
+		cancelWorkers()
+		releaseFirst()
+		// Notification settlement can continue after worker cancellation.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		join := func(name string, result <-chan error) {
+			if result == nil {
+				return
+			}
+			select {
+			case <-result:
+			case <-cleanupCtx.Done():
+				t.Errorf("timed out waiting for the %s worker to exit during cleanup", name)
+			}
+		}
+		join("first", firstResult)
+		join("second", secondResult)
+	})
+	startWorker := func(ctx context.Context) <-chan error {
+		result := make(chan error, 1)
+		go func() { result <- f.s.DeliverNotifications(ctx) }()
+		return result
+	}
+
+	firstResult = startWorker(workersCtx)
+	select {
+	case <-entered:
+	case err := <-firstResult:
+		firstResult = nil
+		if err != nil {
+			t.Fatalf("first worker exited before reaching the sender: %v", err)
+		}
+		t.Fatal("first worker exited before reaching the sender")
+	case <-workersCtx.Done():
+		t.Fatal("timed out waiting for the first worker to reach the sender")
+	}
+
 	// The second worker runs while the first one is blocked in a send.
-	if err := f.s.DeliverNotifications(ctx()); err != nil {
+	secondResult = startWorker(secondCtx)
+	select {
+	case err := <-unexpectedSend:
 		t.Fatal(err)
+	case err := <-secondResult:
+		secondResult = nil
+		// The send signal and the result can both be ready.
+		select {
+		case sendErr := <-unexpectedSend:
+			t.Fatal(sendErr)
+		default:
+		}
+		if err != nil {
+			t.Fatalf("second worker failed: %v", err)
+		}
+		if workersCtx.Err() != nil {
+			t.Fatal("worker deadline expired while the first sender was held")
+		}
+	case <-workersCtx.Done():
+		t.Fatal("timed out waiting for the second worker to exit")
 	}
 	if got := len(f.email.Messages()); got != 0 {
 		t.Fatalf("the second worker sent %d emails for a leased notification", got)
 	}
-	close(release)
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	releaseFirst()
+	select {
+	case err := <-firstResult:
+		firstResult = nil
+		if err != nil {
+			t.Fatalf("first worker failed: %v", err)
+		}
+	case <-workersCtx.Done():
+		t.Fatal("timed out waiting for the first worker to exit after release")
 	}
 	st := f.noticeState(id)
 	if !st.Sent || st.Attempts != 1 || len(st.Recipients) != 2 {

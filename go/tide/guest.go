@@ -30,15 +30,16 @@ import (
 
 // Environment variable names of the guest commands.
 const (
-	guestEnvLock      = "TIDE_SYNC_LOCK"
-	guestEnvForce     = "TIDE_SYNC_FORCE"
-	guestEnvWorkspace = "TIDE_SYNC_WORKSPACE"
-	guestEnvArchive   = "TIDE_SYNC_ARCHIVE"
-	guestEnvDeletes   = "TIDE_SYNC_DELETE_LIST"
-	guestEnvPrunes    = "TIDE_SYNC_PRUNE_LIST"
-	guestEnvLinks     = "TIDE_SYNC_LINK_LIST"
-	guestEnvPath      = "TIDE_DOWNLOAD_PATH"
-	guestEnvDLArchive = "TIDE_DOWNLOAD_ARCHIVE"
+	guestEnvLock         = "TIDE_SYNC_LOCK"
+	guestEnvForce        = "TIDE_SYNC_FORCE"
+	guestEnvWorkspace    = "TIDE_SYNC_WORKSPACE"
+	guestEnvArchive      = "TIDE_SYNC_ARCHIVE"
+	guestEnvDeletes      = "TIDE_SYNC_DELETE_LIST"
+	guestEnvReplaceFiles = "TIDE_SYNC_REPLACE_FILE_LIST"
+	guestEnvPrunes       = "TIDE_SYNC_PRUNE_LIST"
+	guestEnvLinks        = "TIDE_SYNC_LINK_LIST"
+	guestEnvPath         = "TIDE_DOWNLOAD_PATH"
+	guestEnvDLArchive    = "TIDE_DOWNLOAD_ARCHIVE"
 )
 
 // exitLocked is the exit code of the lock command when the lock exists.
@@ -61,10 +62,20 @@ exit 1`,
 mkdir -p "$TIDE_SYNC_WORKSPACE"
 cd "$TIDE_SYNC_WORKSPACE"
 if [ -n "$TIDE_SYNC_DELETE_LIST" ]; then xargs -0 rm -f -- < "$TIDE_SYNC_DELETE_LIST"; fi
+if [ -n "$TIDE_SYNC_REPLACE_FILE_LIST" ]; then
+  xargs -0 sh -c 'for p do
+    if [ ! -L "$p" ] && [ -d "$p" ]; then continue; fi
+    rm -f -- "$p" || exit 1
+  done' tide < "$TIDE_SYNC_REPLACE_FILE_LIST"
+fi
 if [ -n "$TIDE_SYNC_PRUNE_LIST" ]; then xargs -0 sh -c 'for d do if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir -- "$d" || exit 1; fi; done' tide < "$TIDE_SYNC_PRUNE_LIST"; fi
 if [ -n "$TIDE_SYNC_ARCHIVE" ]; then tar -x -m -o -f "$TIDE_SYNC_ARCHIVE"; fi`,
-	opCleanup: `for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_PRUNE_LIST"; do if [ -n "$f" ]; then rm -f "$f"; fi; done
-if [ -n "$TIDE_SYNC_LOCK" ]; then rm -rf "$TIDE_SYNC_LOCK"; fi`,
+	opCleanup: `status=0
+for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_REPLACE_FILE_LIST" "$TIDE_SYNC_PRUNE_LIST"; do
+  if [ -n "$f" ]; then rm -f "$f" || status=1; fi
+done
+if [ -n "$TIDE_SYNC_LOCK" ]; then rm -rf "$TIDE_SYNC_LOCK" || status=1; fi
+exit "$status"`,
 	opProbe: `p="$TIDE_DOWNLOAD_PATH"
 if [ -d "$p" ]; then
   tar -c -f "$TIDE_DOWNLOAD_ARCHIVE" -C "$p" . || exit 1
@@ -128,11 +139,27 @@ if ($env:TIDE_SYNC_LINK_LIST) {
 }
 exit 0`,
 	opCleanup: `$ProgressPreference = 'SilentlyContinue'
+$status = 0
 foreach ($f in @($env:TIDE_SYNC_ARCHIVE, $env:TIDE_SYNC_DELETE_LIST, $env:TIDE_SYNC_PRUNE_LIST, $env:TIDE_SYNC_LINK_LIST)) {
-  if ($f -and (Test-Path -LiteralPath $f)) { Remove-Item -LiteralPath $f -Force }
+  try {
+    if ($f -and (Test-Path -LiteralPath $f -ErrorAction Stop)) {
+      Remove-Item -LiteralPath $f -Force -ErrorAction Stop
+    }
+  } catch {
+    $status = 1
+    Write-Error -ErrorRecord $_ -ErrorAction Continue
+  }
 }
-if ($env:TIDE_SYNC_LOCK -and (Test-Path -LiteralPath $env:TIDE_SYNC_LOCK)) { Remove-Item -LiteralPath $env:TIDE_SYNC_LOCK -Recurse -Force }
-exit 0`,
+$l = $env:TIDE_SYNC_LOCK
+try {
+  if ($l -and (Test-Path -LiteralPath $l -ErrorAction Stop)) {
+    Remove-Item -LiteralPath $l -Recurse -Force -ErrorAction Stop
+  }
+} catch {
+  $status = 1
+  Write-Error -ErrorRecord $_ -ErrorAction Continue
+}
+exit $status`,
 	opProbe: `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $p = $env:TIDE_DOWNLOAD_PATH
@@ -146,7 +173,15 @@ if (Test-Path -LiteralPath $p -PathType Container) {
   exit 66
 }`,
 	opRemoveArchive: `$ProgressPreference = 'SilentlyContinue'
-if (Test-Path -LiteralPath $env:TIDE_DOWNLOAD_ARCHIVE) { Remove-Item -LiteralPath $env:TIDE_DOWNLOAD_ARCHIVE -Force }
+$f = $env:TIDE_DOWNLOAD_ARCHIVE
+try {
+  if ($f -and (Test-Path -LiteralPath $f -ErrorAction Stop)) {
+    Remove-Item -LiteralPath $f -Force -ErrorAction Stop
+  }
+} catch {
+  Write-Error -ErrorRecord $_ -ErrorAction Continue
+  exit 1
+}
 exit 0`,
 }
 

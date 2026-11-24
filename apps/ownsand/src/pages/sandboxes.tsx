@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
-  useInfiniteQuery,
+  createInfiniteQueryOptions,
   useMutation,
-  useQuery,
+  useTransport,
 } from "@connectrpc/connect-query";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { useQueryClient } from "@tanstack/react-query";
+import {
+  hashKey,
+  useInfiniteQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { Badge } from "delino-ui/badge";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { Checkbox } from "delino-ui/checkbox";
@@ -24,8 +28,7 @@ import {
   type Sandbox,
   SandboxService,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
-import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   invalidateServices,
   POLL_INTERVAL_MS,
@@ -37,6 +40,7 @@ import {
   ErrorNotice,
   FormDialog,
   Loading,
+  MorePagesNotice,
   PageHeader,
   QueryBoundary,
   SandboxStateBadge,
@@ -45,6 +49,7 @@ import {
   isTerminalError,
   shortIdText,
 } from "../components/ui.tsx";
+import { useDevices } from "../devices.ts";
 import {
   deviceOptionLabel,
   formatMib,
@@ -54,6 +59,7 @@ import {
 } from "../format.ts";
 import { parseLabels, resourceErrors, ttlErrors } from "../forms.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
+import { useSnapshots, useTemplates } from "../snapshot-lists.ts";
 import { uuidV7 } from "../uuid.ts";
 
 const ALL = "all";
@@ -65,16 +71,14 @@ export function SandboxesPage() {
   const [deviceId, setDeviceId] = useState<string>(ALL);
   const [includeEnded, setIncludeEnded] = useState(false);
   const [creating, setCreating] = useState(false);
-  const devices = useQuery(DeviceService.method.listDevices, {
-    organizationId,
-    pageSize: 200,
-  });
+  const deviceList = useDevices(organizationId);
+  const { devices } = deviceList;
   const deviceNames = useMemo(
-    () =>
-      new Map((devices.data?.devices ?? []).map((d) => [d.deviceId, d.name])),
-    [devices.data],
+    () => new Map(devices.map((d) => [d.deviceId, d.name])),
+    [devices],
   );
-  const list = useInfiniteQuery(
+  const transport = useTransport();
+  const listOptions = createInfiniteQueryOptions(
     SandboxService.method.listSandboxes,
     {
       organizationId,
@@ -85,14 +89,34 @@ export function SandboxesPage() {
       includeEnded,
     },
     {
+      transport,
       pageParamKey: "pageToken",
       getNextPageParam: (last) => last.nextPageToken || undefined,
-      refetchInterval: (q) =>
-        q.state.data?.pages.some((p) => p.sandboxes.some(sandboxSettling))
-          ? POLL_INTERVAL_MS
-          : false,
     },
   );
+  const list = useInfiniteQuery({
+    ...listOptions,
+    refetchInterval: (q) =>
+      q.state.data?.pages.some((p) => p.sandboxes.some(sandboxSettling))
+        ? POLL_INTERVAL_MS
+        : false,
+  });
+  const listKey = hashKey(listOptions.queryKey);
+  const pendingNextPages = useRef(new Set<string>());
+
+  async function requestNextPage() {
+    const pending = pendingNextPages.current;
+    if (pending.has(listKey)) return;
+
+    // Supersede a background refresh. Guard the continuation before React
+    // can disable the button, and hold the guard for this query until it settles.
+    pending.add(listKey);
+    try {
+      await list.fetchNextPage({ cancelRefetch: true });
+    } finally {
+      pending.delete(listKey);
+    }
+  }
   const sandboxes = list.data?.pages.flatMap((p) => p.sandboxes) ?? [];
   // A failed "Show more" request is not a failed refresh of the list: the
   // loaded rows stay, and the error and its retry sit next to the button
@@ -140,7 +164,7 @@ export function SandboxesPage() {
           onValueChange={(v) => setDeviceId(v ?? ALL)}
         >
           <SelectOption value={ALL}>All devices</SelectOption>
-          {(devices.data?.devices ?? []).map((d) => (
+          {devices.map((d) => (
             <SelectOption key={d.deviceId} value={d.deviceId}>
               {d.name}
             </SelectOption>
@@ -152,6 +176,7 @@ export function SandboxesPage() {
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
+      {creating ? null : <DeviceListNotice list={deviceList} />}
       <QueryBoundary query={boundaryQuery} loading="Loading sandboxes">
         {() =>
           sandboxes.length === 0 ? (
@@ -188,24 +213,31 @@ export function SandboxesPage() {
         }
       </QueryBoundary>
       {nextPageFailed && !list.isFetchingNextPage ? (
-        <ErrorNotice
-          error={list.error}
-          // `cancelRefetch: false` joins a request that is already in flight
-          // instead of cancelling it and sending the same page twice.
-          onRetry={() => void list.fetchNextPage({ cancelRefetch: false })}
-        />
+        <ErrorNotice error={list.error} onRetry={requestNextPage} />
       ) : null}
       {list.hasNextPage ? (
         <Button
           variant={ButtonVariant.Secondary}
           disabled={list.isFetchingNextPage}
-          onClick={() => void list.fetchNextPage({ cancelRefetch: false })}
+          onClick={requestNextPage}
         >
           Show more
         </Button>
       ) : null}
-      <CreateSandboxDialog open={creating} onOpenChange={setCreating} />
+      <CreateSandboxDialog
+        open={creating}
+        onOpenChange={setCreating}
+        deviceList={deviceList}
+      />
     </>
+  );
+}
+
+function DeviceListNotice({ list }: { list: ReturnType<typeof useDevices> }) {
+  return (
+    <QueryBoundary query={list.boundary} loading="Loading devices">
+      {() => <MorePagesNotice noun="devices" pages={list.pages} />}
+    </QueryBoundary>
   );
 }
 
@@ -286,27 +318,21 @@ function sourceOf(value: string) {
 function CreateSandboxDialog({
   open,
   onOpenChange,
+  deviceList,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  deviceList: ReturnType<typeof useDevices>;
 }) {
   const { organizationId } = useOrg();
+  const { devices } = deviceList;
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
-  const templates = useQuery(
-    SnapshotService.method.listTemplates,
-    { organizationId, pageSize: 200 },
-    { enabled: open },
-  );
-  const snapshots = useQuery(
-    SnapshotService.method.listSnapshots,
-    { organizationId, pageSize: 200 },
-    { enabled: open },
-  );
-  const devices = useQuery(
-    DeviceService.method.listDevices,
-    { organizationId, pageSize: 200 },
-    { enabled: open },
+  const templates = useTemplates(organizationId, "picker", open);
+  const snapshots = useSnapshots(organizationId, "picker", open);
+  const readySnapshots = useMemo(
+    () => snapshots.rows.filter((s) => s.state === SnapshotState.READY),
+    [snapshots.rows],
   );
   const create = useMutation(SandboxService.method.createSandbox);
   // One idempotency key per logical create: a retry after a lost response
@@ -322,6 +348,14 @@ function CreateSandboxDialog({
   const [device, setDevice] = useState(ALL);
   const [labelText, setLabelText] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const sourceRequest = sourceOf(source);
+  const { case: sourceKind, value: sourceValue } = sourceRequest.source;
+  const sourceAvailable =
+    sourceKind === "baseImage" ||
+    (sourceKind === "templateId" &&
+      templates.rows.some((t) => t.templateId === sourceValue)) ||
+    (sourceKind === "snapshotId" &&
+      readySnapshots.some((s) => s.snapshotId === sourceValue));
 
   const reset = () => {
     setIdempotencyKey(uuidV7());
@@ -336,6 +370,7 @@ function CreateSandboxDialog({
       wide
       description="Choose the source, resources and time limits. There is no default TTL."
       submitLabel="Create"
+      submitDisabled={!sourceAvailable}
       onOpenChange={(next) => {
         onOpenChange(next);
         if (!next) reset();
@@ -355,7 +390,7 @@ function CreateSandboxDialog({
           res = await create.mutateAsync({
             organizationId,
             idempotencyKey,
-            source: sourceOf(source),
+            source: sourceRequest,
             resources: {
               vcpuCount: vcpu!,
               memoryMib: BigInt(memory!),
@@ -374,7 +409,7 @@ function CreateSandboxDialog({
           const selected =
             device === ALL
               ? undefined
-              : devices.data?.devices.find((d) => d.deviceId === device);
+              : devices.find((d) => d.deviceId === device);
           if (
             error instanceof ConnectError &&
             error.code === Code.Unavailable &&
@@ -410,14 +445,15 @@ function CreateSandboxDialog({
         );
       }}
     >
-      {templates.isPending || snapshots.isPending ? (
+      {templates.boundary.isPending || snapshots.boundary.isPending ? (
         // Render the source picker once its options are known, so the
         // trigger shows the selected option's name from the start.
         <Loading label="Loading sources" />
       ) : (
         <Select
           label="Source"
-          value={source}
+          value={sourceAvailable ? source : null}
+          placeholder="Choose a source"
           onValueChange={(v) => v && setSource(v)}
         >
           {[BaseImage.LINUX, BaseImage.MACOS, BaseImage.WINDOWS].map((b) => (
@@ -425,22 +461,27 @@ function CreateSandboxDialog({
               {labels.baseImage[b]} base image
             </SelectOption>
           ))}
-          {(templates.data?.templates ?? []).map((t) => (
+          {templates.rows.map((t) => (
             <SelectOption key={t.templateId} value={`template:${t.templateId}`}>
               Template: {t.name}
             </SelectOption>
           ))}
-          {(snapshots.data?.snapshots ?? [])
-            .filter((s) => s.state === SnapshotState.READY)
-            .map((s) => (
-              <SelectOption
-                key={s.snapshotId}
-                value={`snapshot:${s.snapshotId}`}
-              >
-                {`Snapshot ${shortIdText(s.snapshotId)} · ${formatTime(s.createTime)}`}
-              </SelectOption>
-            ))}
+          {readySnapshots.map((s) => (
+            <SelectOption key={s.snapshotId} value={`snapshot:${s.snapshotId}`}>
+              {`Snapshot ${shortIdText(s.snapshotId)} · ${formatTime(s.createTime)}`}
+            </SelectOption>
+          ))}
         </Select>
+      )}
+      {templates.boundary.isPending ? null : (
+        <QueryBoundary query={templates.boundary} loading="Loading templates">
+          {() => <MorePagesNotice noun="templates" pages={templates.pages} />}
+        </QueryBoundary>
+      )}
+      {snapshots.boundary.isPending ? null : (
+        <QueryBoundary query={snapshots.boundary} loading="Loading snapshots">
+          {() => <MorePagesNotice noun="snapshots" pages={snapshots.pages} />}
+        </QueryBoundary>
       )}
       <div className="field-row">
         <NumberInput
@@ -508,13 +549,14 @@ function CreateSandboxDialog({
           onValueChange={(v) => setDevice(v ?? ALL)}
         >
           <SelectOption value={ALL}>Any device that fits</SelectOption>
-          {(devices.data?.devices ?? []).map((d) => (
+          {devices.map((d) => (
             <SelectOption key={d.deviceId} value={d.deviceId}>
               {deviceOptionLabel(d.name, d.state)}
             </SelectOption>
           ))}
         </Select>
       </div>
+      {open ? <DeviceListNotice list={deviceList} /> : null}
       <Textarea
         label="Labels"
         description="One key=value per line. Every member and API key can read labels, so never put secrets in them."

@@ -62,6 +62,8 @@ type Fake struct {
 	// JITGate, when set, runs before a generate-jitconfig call is served,
 	// without the fake lock, so a test can hold a runner start there.
 	JITGate func()
+	// DeleteGate runs before the fake serves a runner deletion, without the fake lock.
+	DeleteGate func(runnerID int64)
 }
 
 // Installation is a fake installation.
@@ -168,6 +170,11 @@ func (f *Fake) RunnerByName(name string) (Runner, bool) {
 	return Runner{}, false
 }
 
+// ForgetRunner removes a registration outside the REST API.
+func (f *Fake) ForgetRunner(id int64) {
+	f.Update(func() { delete(f.runners, id) })
+}
+
 // SetBusy marks a runner busy (it took a job), so a removal gets 422.
 func (f *Fake) SetBusy(name string, busy bool) {
 	f.Update(func() {
@@ -241,7 +248,9 @@ func (f *Fake) verifyJWT(r *http.Request) bool {
 }
 
 func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
-	if strings.HasSuffix(r.URL.Path, "/generate-jitconfig") {
+	p := r.URL.Path
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if strings.HasSuffix(p, "/generate-jitconfig") {
 		f.mu.Lock()
 		gate := f.JITGate
 		f.mu.Unlock()
@@ -249,10 +258,17 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			gate()
 		}
 	}
+	if r.Method == http.MethodDelete && len(parts) == 5 && parts[0] == "orgs" && parts[2] == "actions" && parts[3] == "runners" {
+		f.mu.Lock()
+		gate := f.DeleteGate
+		f.mu.Unlock()
+		if gate != nil {
+			id, _ := strconv.ParseInt(parts[4], 10, 64)
+			gate(id)
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p := r.URL.Path
-	parts := strings.Split(strings.Trim(p, "/"), "/")
 	count := func(op string) { f.calls[op]++ }
 	switch {
 	case r.Method == http.MethodPost && len(parts) == 4 && parts[0] == "app" && parts[1] == "installations" && parts[3] == "access_tokens":

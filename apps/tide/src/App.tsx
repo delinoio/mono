@@ -92,6 +92,7 @@ const NOT_CONFIGURED: Auth = {
   isAuthenticated: false,
   userId: undefined,
   signIn: async () => {},
+  signInFailed: false,
   signOut: async () => {},
   getAccessToken: async () => undefined,
 };
@@ -130,16 +131,11 @@ function Routes({ config }: { config: ConsoleConfig }) {
   const configured =
     config.authMode === AuthMode.Mock || config.logto !== undefined;
   if (route.id === RouteId.Callback) {
-    // Without a Logto registration there is no provider for the Logto
-    // callback hook, which would render nothing. Show the notice instead.
-    if (!configured) {
-      return <SignIn configured={false} />;
+    if (config.authMode === AuthMode.Mock) return <MockCallbackPage />;
+    if (config.logto !== undefined) {
+      return <LogtoCallbackPage appId={config.logto.appId} />;
     }
-    return config.authMode === AuthMode.Mock ? (
-      <MockCallbackPage />
-    ) : (
-      <LogtoCallbackPage />
-    );
+    return <SignIn configured={false} />;
   }
   if (auth.isLoading) {
     return null;
@@ -229,7 +225,14 @@ function SignIn({
       </p>
       {notice !== undefined && configured ? <p>{notice}</p> : null}
       {configured ? (
-        <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
+        <>
+          <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
+          {auth.signInFailed ? (
+            <p role="alert">
+              Sign-in did not start. Check your connection and try again.
+            </p>
+          ) : null}
+        </>
       ) : (
         <p role="alert">{SIGN_IN_NOT_CONFIGURED}</p>
       )}

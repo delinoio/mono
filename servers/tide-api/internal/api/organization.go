@@ -143,7 +143,8 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 		return nil, err
 	}
 	d := OrganizationDeletion{OrganizationID: pre.OrganizationID, Actor: pre.Principal}
-	if err := h.organizationDeletionPrepare(ctx, d); err != nil {
+	prepared, err := h.organizationDeletionPrepare(ctx, d)
+	if err != nil {
 		return nil, h.Internal(ctx, "prepare organization deletion", err)
 	}
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
@@ -151,7 +152,7 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 		if err != nil {
 			return err
 		}
-		if err := h.organizationDeletionInTx(ctx, tx, d); err != nil {
+		if err := organizationDeletionInTx(ctx, tx, prepared); err != nil {
 			return err
 		}
 		if _, err := h.revokeAPIKeysTx(ctx, tx, c.OrganizationID, "", c.Principal); err != nil {
@@ -167,10 +168,10 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 		return err
 	})
 	if err != nil {
-		h.organizationDeletionAbort(ctx, d, len(h.Hooks.OrganizationDeletion))
+		organizationDeletionAbort(ctx, prepared)
 		return nil, h.Internal(ctx, "delete organization", err)
 	}
-	h.organizationDeletionAfterCommit(ctx, d)
+	h.organizationDeletionAfterCommit(ctx, d, prepared)
 	return connect.NewResponse(&tidev1.DeleteOrganizationResponse{}), nil
 }
 

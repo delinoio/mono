@@ -101,6 +101,8 @@ func (e *APIError) Error() string {
 // Error codes that the server distinguishes
 // (https://developer.paddle.com/errors/overview).
 const (
+	// CodeNotFound means the requested entity does not exist.
+	CodeNotFound = "not_found"
 	// CodePaymentDeclined: a one-time charge with `on_payment_failure:
 	// prevent_change` whose immediate payment failed
 	// (https://developer.paddle.com/errors/subscriptions/subscription_payment_declined).
@@ -272,6 +274,7 @@ const (
 type Transaction struct {
 	ID             string            `json:"id"`
 	Status         string            `json:"status"`
+	CollectionMode string            `json:"collection_mode"`
 	CustomerID     string            `json:"customer_id"`
 	SubscriptionID string            `json:"subscription_id"`
 	Origin         string            `json:"origin"`
@@ -382,7 +385,7 @@ func (s Subscription) CancelsAtPeriodEnd() bool {
 func (c *Client) CreateCheckoutTransaction(ctx context.Context, priceID string, custom CustomData) (Transaction, error) {
 	body := map[string]any{
 		"items":           []map[string]any{{"price_id": priceID, "quantity": 1}},
-		"collection_mode": "automatic",
+		"collection_mode": CollectionModeAutomatic,
 		"custom_data":     custom,
 	}
 	var txn Transaction
@@ -397,6 +400,9 @@ func (c *Client) CreateCheckoutTransaction(ctx context.Context, priceID string, 
 	}
 	return txn, nil
 }
+
+// CollectionModeAutomatic lets Paddle collect payment through checkout.
+const CollectionModeAutomatic = "automatic"
 
 // Transaction status values of Paddle
 // (https://developer.paddle.com/api-reference/transactions/overview).

@@ -9,12 +9,13 @@
 // end-to-end test is skipped unless the OwnSand end-to-end suite starts it).
 
 /**
- * Accumulates stdout chunks and finds the first occurrence of a marker, even
- * when the marker is split across chunks.
+ * Finds the first occurrence of a marker in stdout, even when the marker is
+ * split across chunks.
  */
 export class MarkerOffsetFinder {
   private readonly marker: Uint8Array;
   private bytes = new Uint8Array(0);
+  private firstMarkerEnd: number | undefined;
 
   constructor(marker: string) {
     this.marker = new TextEncoder().encode(marker);
@@ -24,21 +25,26 @@ export class MarkerOffsetFinder {
   }
 
   /**
-   * Appends a chunk. Returns the byte offset directly after the first marker
-   * in all bytes pushed so far, or undefined when the marker has not been
-   * seen yet.
+   * Returns the byte offset directly after the first marker in all chunks
+   * pushed so far, or undefined until a match is found.
    */
   push(chunk: Uint8Array): number | undefined {
-    // The marker cannot end before the previous bytes plus this chunk, so a
-    // search that starts one marker length before the new chunk finds every
-    // new match and, because earlier pushes found none, the first one.
+    if (this.firstMarkerEnd !== undefined) {
+      return this.firstMarkerEnd;
+    }
+
+    // Earlier pushes found no match. Start at the earliest byte where a
+    // marker could start and still end in the new chunk.
     const searchFrom = Math.max(0, this.bytes.length - this.marker.length + 1);
     const next = new Uint8Array(this.bytes.length + chunk.length);
     next.set(this.bytes, 0);
     next.set(chunk, this.bytes.length);
     this.bytes = next;
     const index = indexOf(this.bytes, this.marker, searchFrom);
-    return index < 0 ? undefined : index + this.marker.length;
+    if (index >= 0) {
+      this.firstMarkerEnd = index + this.marker.length;
+    }
+    return this.firstMarkerEnd;
   }
 }
 
