@@ -724,20 +724,27 @@ func (op *writeOp) send(ctx context.Context, req *ownsandv1.WriteFileRequest) (*
 }
 
 func (op *writeOp) p2pAttempt(ctx context.Context, sess *p2pSession, req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteFileResponse, error) {
-	st, err := sess.openStream(ctx, proto.Clone(req))
-	if err != nil {
-		return nil, err
-	}
-	defer st.close()
 	actx, cancel := context.WithTimeoutCause(ctx, op.s.c.timing.writeAttemptDeadline, errAttemptDeadline)
 	defer cancel()
+	attemptErr := func(err error) error {
+		if callerErr := ctx.Err(); callerErr != nil {
+			return callerErr
+		}
+		if context.Cause(actx) == errAttemptDeadline {
+			return errAttemptDeadline
+		}
+		return err
+	}
+
+	st, err := sess.openStream(actx, proto.Clone(req))
+	if err != nil {
+		return nil, attemptErr(err)
+	}
+	defer st.close()
 	for {
 		f, err := st.recv(actx)
 		if err != nil {
-			if errors.Is(context.Cause(actx), errAttemptDeadline) && ctx.Err() == nil {
-				return nil, errAttemptDeadline
-			}
-			return nil, err
+			return nil, attemptErr(err)
 		}
 		switch f.GetKind() {
 		case ownsandv1.DataFrameKind_DATA_FRAME_KIND_FILE_WRITE_RESULT:
