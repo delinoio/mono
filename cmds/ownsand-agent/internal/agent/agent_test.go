@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -351,6 +352,67 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	a.setConnected(true)
 	a.setConnected(false)
 	requireEmptyStateDir(t, st)
+}
+
+func TestFreeDiskCapabilityAndAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		free int64
+		fits bool
+	}{
+		{"saturated capacity", math.MaxInt64, true},
+		{"insufficient capacity", (1 << 30) - 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := testcp.New(t)
+			var downloadStarted atomic.Bool
+			b := bucketWithHook(t, func(r *http.Request) int {
+				if r.Method == http.MethodGet {
+					downloadStarted.Store(true)
+				}
+				return http.StatusNotFound
+			})
+			cp.SetSignedURLBase(b.URL)
+			st, id := enrollDevice(t, cp)
+			h := startWith(t, cp, st, id, func(opts *Options) {
+				opts.FreeDisk = func() (int64, error) { return tc.free, nil }
+			})
+			env, _ := h.wait(0, "capability report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil })
+			if got := env.GetCapabilityReport().GetCapabilities().GetFreeDiskBytes(); got != tc.free {
+				t.Fatalf("reported free disk = %d, want %d", got, tc.free)
+			}
+			h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+
+			sandboxID, _ := uuidv7.NewString()
+			create := h.command(createCommand(sandboxID))
+			if tc.fits {
+				if create.GetError() != nil || create.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+					t.Fatalf("create with %d free bytes = %v, want a running sandbox", tc.free, create)
+				}
+			} else if err := create.GetError(); err.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED ||
+				err.GetMessage() != "free disk of the state directory does not fit the sandbox disk" {
+				t.Fatalf("create with %d free bytes = %v, want insufficient disk", tc.free, create)
+			}
+
+			// The part metadata declares 1 GiB. The bucket returns 404 so
+			// the test can check admission without transferring 1 GiB.
+			snapshotID, _ := uuidv7.NewString()
+			res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ImportSnapshot{
+				ImportSnapshot: &ownsandv1.ImportSnapshotCommand{
+					Snapshot: &ownsandv1.SnapshotStateEntry{SnapshotId: snapshotID},
+					Parts:    []*ownsandv1.SnapshotPart{{PartNumber: 1, SizeBytes: 1 << 30, Sha256: make([]byte, sha256.Size)}},
+				},
+			}})
+			if tc.fits {
+				if res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS || !downloadStarted.Load() {
+					t.Fatalf("import with %d free bytes = %v, want a download attempt", tc.free, res)
+				}
+			} else if err := res.GetError(); err.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED ||
+				err.GetMessage() != "free disk does not fit the snapshot import" || downloadStarted.Load() {
+				t.Fatalf("import with %d free bytes = %v, want insufficient disk before download", tc.free, res)
+			}
+		})
+	}
 }
 
 // TestStatusRecordsCapabilities checks that the status file holds the
