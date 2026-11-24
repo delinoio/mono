@@ -317,19 +317,15 @@ func TestVsockHandshakeRefused(t *testing.T) {
 // TestVsockHandshakeClearsDeadline covers the Dial branch that installs its
 // own socket deadline (a ctx without a deadline) and checks that Dial clears
 // that deadline once the handshake succeeds. The test never sets a deadline on
-// the returned connection, so a leftover deadline makes the read time out.
+// the returned connection, so a leftover deadline makes the write time out.
 func TestVsockHandshakeClearsDeadline(t *testing.T) {
 	old := vsockHandshakeTimeout
 	vsockHandshakeTimeout = 100 * time.Millisecond
 	t.Cleanup(func() { vsockHandshakeTimeout = old })
 
-	v, accepted, release, _ := delayedAckPeer(t)
-	// The peer acknowledges at once; the idle connection then gets one byte
-	// after the handshake timeout has passed.
-	go func() {
-		<-accepted
-		close(release)
-	}()
+	v, _, release, _ := delayedAckPeer(t)
+	// The peer can acknowledge as soon as it reads the CONNECT line.
+	close(release)
 	c, err := v.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
