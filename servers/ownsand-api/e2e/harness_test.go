@@ -1008,8 +1008,8 @@ type cliResult struct {
 }
 
 // cli runs the ownsand CLI with the API key and the organization.
-func (s *stack) cli(transport ownsand.Transport, stdin io.Reader, args ...string) cliResult {
-	s.t.Helper()
+func (s *stack) cli(t *testing.T, transport ownsand.Transport, stdin io.Reader, args ...string) cliResult {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, filepath.Join(s.bins, "ownsand"), args...)
@@ -1018,7 +1018,7 @@ func (s *stack) cli(transport ownsand.Transport, stdin io.Reader, args ...string
 		"OWNSAND_API_KEY="+s.apiKey,
 		"OWNSAND_ORG="+s.orgID,
 		"OWNSAND_TRANSPORT="+transport.String(),
-		"OWNSAND_CONFIG_DIR="+s.t.TempDir(),
+		"OWNSAND_CONFIG_DIR="+t.TempDir(),
 		"NO_COLOR=1",
 	)
 	var stdout, stderr bytes.Buffer
@@ -1030,7 +1030,7 @@ func (s *stack) cli(transport ownsand.Transport, stdin io.Reader, args ...string
 	if err != nil {
 		ee, ok := err.(*exec.ExitError)
 		if !ok {
-			s.t.Fatalf("ownsand %v: %v", args, err)
+			t.Fatalf("ownsand %v: %v", args, err)
 		}
 		code = ee.ExitCode()
 	}
