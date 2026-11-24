@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -400,12 +401,14 @@ func (s *Server) deleteSession(ctx context.Context, _ *mcp.CallToolRequest, in s
 
 // Exec.
 
+const maxExecTimeoutSeconds = math.MaxInt64 / int64(time.Second)
+
 type execArgs struct {
 	SessionID      string            `json:"session_id" jsonschema:"the dev session ID"`
 	Command        []string          `json:"command" jsonschema:"the argument array; the first element is the program"`
 	Cwd            string            `json:"cwd,omitempty" jsonschema:"working directory: an absolute guest path or a path relative to the workspace path"`
 	Env            map[string]string `json:"env,omitempty" jsonschema:"environment variables for the command"`
-	TimeoutSeconds int               `json:"timeout_seconds,omitempty" jsonschema:"stop the command after this many seconds; 0 means no timeout"`
+	TimeoutSeconds int64             `json:"timeout_seconds,omitempty" jsonschema:"seconds before stopping the command, 0 to 9223372036 inclusive, 0 means no timeout"`
 	WaitSeconds    *int              `json:"wait_seconds,omitempty" jsonschema:"seconds to wait for the command to end, 0 to 50, default 50"`
 }
 
@@ -631,6 +634,9 @@ func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) 
 	}
 	if in.TimeoutSeconds < 0 {
 		return nil, execResult{}, invalid("timeout_seconds must not be negative")
+	}
+	if in.TimeoutSeconds > maxExecTimeoutSeconds {
+		return nil, execResult{}, invalid("timeout_seconds must be between 0 and %d", maxExecTimeoutSeconds)
 	}
 	c, err := s.client()
 	if err != nil {

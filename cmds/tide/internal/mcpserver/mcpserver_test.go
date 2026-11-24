@@ -186,6 +186,46 @@ func TestWaitLimit(t *testing.T) {
 	}
 }
 
+func TestExecTimeoutRange(t *testing.T) {
+	needPOSIX(t)
+	h := newHarness(t, Config{})
+	args := map[string]any{"session_id": h.running(), "command": []string{"sh", "-c", "exit 0"}}
+
+	for _, seconds := range []int64{-1, 9223372037, 18446744074} {
+		args["timeout_seconds"] = seconds
+		if text, isErr := h.call("exec", args, nil); !isErr || !strings.HasPrefix(text, "invalid_argument:") {
+			t.Errorf("timeout_seconds %d = %q, isError = %v", seconds, text, isErr)
+		}
+		if got := len(h.srv.ExecRequests()); got != 0 {
+			t.Fatalf("timeout_seconds %d sent %d exec requests", seconds, got)
+		}
+	}
+
+	args["timeout_seconds"] = int64(9223372036)
+	if text, isErr := h.call("exec", args, nil); isErr {
+		t.Fatalf("maximum timeout: %s", text)
+	}
+	requests := h.srv.ExecRequests()
+	if len(requests) != 1 {
+		t.Fatalf("got %d exec requests, want 1", len(requests))
+	}
+	if got := requests[0].GetTimeout().AsDuration(); got != 9223372036*time.Second {
+		t.Fatalf("maximum timeout = %v, want 9223372036 seconds", got)
+	}
+
+	args["timeout_seconds"] = 0
+	if text, isErr := h.call("exec", args, nil); isErr {
+		t.Fatalf("zero timeout: %s", text)
+	}
+	requests = h.srv.ExecRequests()
+	if len(requests) != 2 {
+		t.Fatalf("got %d exec requests, want 2", len(requests))
+	}
+	if requests[1].GetTimeout() != nil {
+		t.Fatalf("zero timeout sent %v, want absent field", requests[1].GetTimeout())
+	}
+}
+
 func TestExecWithinAndBeyondWait(t *testing.T) {
 	needPOSIX(t)
 	h := newHarness(t, Config{})
