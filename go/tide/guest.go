@@ -152,11 +152,27 @@ if ($env:TIDE_SYNC_LINK_LIST) {
 }
 exit 0`,
 	opCleanup: `$ProgressPreference = 'SilentlyContinue'
+$status = 0
 foreach ($f in @($env:TIDE_SYNC_ARCHIVE, $env:TIDE_SYNC_DELETE_LIST, $env:TIDE_SYNC_PRUNE_LIST, $env:TIDE_SYNC_LINK_LIST)) {
-  if ($f -and (Test-Path -LiteralPath $f)) { Remove-Item -LiteralPath $f -Force }
+  try {
+    if ($f -and (Test-Path -LiteralPath $f -ErrorAction Stop)) {
+      Remove-Item -LiteralPath $f -Force -ErrorAction Stop
+    }
+  } catch {
+    $status = 1
+    Write-Error -ErrorRecord $_ -ErrorAction Continue
+  }
 }
-if ($env:TIDE_SYNC_LOCK -and (Test-Path -LiteralPath $env:TIDE_SYNC_LOCK)) { Remove-Item -LiteralPath $env:TIDE_SYNC_LOCK -Recurse -Force }
-exit 0`,
+$l = $env:TIDE_SYNC_LOCK
+try {
+  if ($l -and (Test-Path -LiteralPath $l -ErrorAction Stop)) {
+    Remove-Item -LiteralPath $l -Recurse -Force -ErrorAction Stop
+  }
+} catch {
+  $status = 1
+  Write-Error -ErrorRecord $_ -ErrorAction Continue
+}
+exit $status`,
 	opProbe: `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $p = $env:TIDE_DOWNLOAD_PATH
@@ -170,7 +186,15 @@ if (Test-Path -LiteralPath $p -PathType Container) {
   exit 66
 }`,
 	opRemoveArchive: `$ProgressPreference = 'SilentlyContinue'
-if (Test-Path -LiteralPath $env:TIDE_DOWNLOAD_ARCHIVE) { Remove-Item -LiteralPath $env:TIDE_DOWNLOAD_ARCHIVE -Force }
+$f = $env:TIDE_DOWNLOAD_ARCHIVE
+try {
+  if ($f -and (Test-Path -LiteralPath $f -ErrorAction Stop)) {
+    Remove-Item -LiteralPath $f -Force -ErrorAction Stop
+  }
+} catch {
+  Write-Error -ErrorRecord $_ -ErrorAction Continue
+  exit 1
+}
 exit 0`,
 }
 

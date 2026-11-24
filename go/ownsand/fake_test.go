@@ -1059,6 +1059,7 @@ type fakeAgent struct {
 	mu        sync.Mutex
 	execs     map[string]*fakeExec
 	run       func(cmd []string, e *fakeExec)
+	startTime *timestamppb.Timestamp
 	execChunk int
 	files     map[string][]byte
 	reads     map[string][]byte
@@ -1144,7 +1145,7 @@ func (a *fakeAgent) startExec(_ *fakeCP, req *ownsandv1.ExecRequest) *fakeExec {
 }
 
 func (a *fakeAgent) serveExec(ctx context.Context, cp *fakeCP, e *fakeExec, outOff, errOff int64, send func(*ownsandv1.ExecEvent) error) error {
-	if err := send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Started{Started: &ownsandv1.ExecStarted{ExecId: e.id}}}); err != nil {
+	if err := send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Started{Started: &ownsandv1.ExecStarted{ExecId: e.id, StartTime: a.startTime}}}); err != nil {
 		return err
 	}
 	off := [2]int64{outOff, errOff}

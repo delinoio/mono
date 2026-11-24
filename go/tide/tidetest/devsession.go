@@ -419,6 +419,7 @@ type guest struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	mu       sync.Mutex
+	closed   bool
 	execs    map[string]*proc
 	writes   map[string]*pendingWrite
 	requests []*tidev1.ExecDevSessionRequest
@@ -435,6 +436,9 @@ func newGuest(s *Server) *guest {
 }
 
 func (g *guest) close() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
 	g.cancel()
 	g.wg.Wait()
 }
@@ -484,6 +488,10 @@ func (p *proc) finish(ev *tidev1.DevSessionExecEvent) {
 // start starts a local process for the exec request.
 func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) (*proc, error) {
 	g.mu.Lock()
+	if g.closed {
+		g.mu.Unlock()
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the fake guest is closed"))
+	}
 	if g.execs[req.GetExecId()] != nil {
 		g.mu.Unlock()
 		return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("the exec_id is in use"))
@@ -491,6 +499,8 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 	p := &proc{session: ds.GetDevSessionId(), execID: req.GetExecId(), changed: make(chan struct{}), start: time.Now(), keep: g.s.OutputKeepBytes}
 	g.execs[req.GetExecId()] = p
 	g.requests = append(g.requests, proto.CloneOf(req))
+	// Register the exec before close can stop admission and wait.
+	g.wg.Add(1)
 	g.mu.Unlock()
 
 	dir := ds.GetWorkspacePath()
@@ -499,6 +509,7 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 	}
 	failed := func(reason tidev1.ExecFailureReason, msg string) (*proc, error) {
 		p.finish(&tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Failed{Failed: &tidev1.DevSessionExecFailed{Reason: reason, Message: msg}}})
+		g.wg.Done()
 		return p, nil
 	}
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
@@ -509,7 +520,7 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 	if t := req.GetTimeout(); t != nil {
 		ctx, cancel = context.WithTimeout(ctx, t.AsDuration())
 	}
-	cmd := exec.CommandContext(ctx, req.GetCommand()[0], req.GetCommand()[1:]...)
+	cmd := newExecCommand(ctx, req.GetCommand())
 	cmd.Dir = dir
 	cmd.Env = os.Environ()
 	for k, v := range req.GetEnv() {
@@ -528,7 +539,6 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 		}
 		return failed(tidev1.ExecFailureReason_EXEC_FAILURE_REASON_OTHER, err.Error())
 	}
-	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
 		defer cancel()

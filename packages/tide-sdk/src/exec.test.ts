@@ -45,6 +45,7 @@ const err = (offset: number, data: string): EventInit => ({
   value: { offset: BigInt(offset), data: text.encode(data) },
 });
 const started: EventInit = { case: "started", value: { execId: "x" } };
+const keepalive: EventInit = { case: "keepalive", value: {} };
 const exited = (code: number): EventInit => ({
   case: "exited",
   value: { status: { case: "exitCode", value: BigInt(code) } },
@@ -204,7 +205,7 @@ describe("exec helper", () => {
 
   test("continues with AttachDevSessionExec after each stream end and reports lost output", async () => {
     const { server, execs, attachRequests } = execServer(
-      [started, out(0, "hel"), { case: "keepalive", value: {} }],
+      [started, out(0, "hel"), keepalive],
       [
         // The new stream repeats the start event and part of the delivered
         // output, then fails.
@@ -212,6 +213,7 @@ describe("exec helper", () => {
           started,
           out(0, "hello"),
           err(0, "e"),
+          keepalive,
           new ConnectError("relay restarting", Code.Unavailable),
         ],
         // The agent no longer keeps stdout bytes 5 to 8.
@@ -339,6 +341,96 @@ describe("exec helper", () => {
     expect(execs.length).toBe(1);
     expect(attachRequests.length).toBe(1);
   });
+
+  test.each(["with", "without"])(
+    "keeps the startup error after keepalives and attach NotFound %s an attach keepalive",
+    async (attachKeepalive) => {
+      const notFound = new ConnectError("unknown exec", Code.NotFound);
+      const { server, execs, attachRequests } = execServer(
+        [keepalive, new ConnectError("overloaded", Code.Unavailable)],
+        [attachKeepalive === "with" ? [keepalive, notFound] : [notFound]],
+      );
+      const stream = client(server.fetch).execDevSession(execInput);
+      expect(await stream.next()).toMatchObject({
+        done: false,
+        value: {
+          kind: ExecEventKind.Reattached,
+          stdoutOffset: 0n,
+          stderrOffset: 0n,
+        },
+      });
+      await expect(stream.next()).rejects.toMatchObject({
+        code: Code.Unavailable,
+        rawMessage: "overloaded",
+      });
+      expect(execs).toHaveLength(1);
+      expect(attachRequests).toHaveLength(1);
+      expect(attachRequests[0]).toMatchObject({
+        execId: execs[0]!.execId,
+        stdoutOffset: 0n,
+        stderrOffset: 0n,
+      });
+    },
+  );
+
+  test("surfaces attach NotFound after a command starts", async () => {
+    const { server, execs, attachRequests } = execServer(
+      [started, keepalive, new ConnectError("overloaded", Code.Unavailable)],
+      [[new ConnectError("unknown exec", Code.NotFound)]],
+    );
+    const stream = client(server.fetch).execDevSession(execInput);
+    expect((await stream.next()).value).toMatchObject({
+      kind: ExecEventKind.Started,
+    });
+    expect((await stream.next()).value).toMatchObject({
+      kind: ExecEventKind.Reattached,
+    });
+    await expect(stream.next()).rejects.toMatchObject({
+      code: Code.NotFound,
+      rawMessage: "unknown exec",
+    });
+    expect(execs).toHaveLength(1);
+    expect(attachRequests).toHaveLength(1);
+  });
+
+  test.each([
+    [3, [1_000, 2_000, 4_000, 1_000]],
+    [7, [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 1_000]],
+  ])(
+    "backs off after %i keepalive-only failures and resets after Started",
+    async (keepaliveFailures: number, expectedSleeps: number[]) => {
+      const unavailable = new ConnectError("overloaded", Code.Unavailable);
+      const keepaliveOnly = [keepalive, unavailable];
+      const { server, execs, attachRequests } = execServer(keepaliveOnly, [
+        ...Array.from({ length: keepaliveFailures - 1 }, () => keepaliveOnly),
+        [started, unavailable],
+        [exited(0)],
+      ]);
+      const clock = new RecordingClock();
+      const events: string[] = [];
+      for await (const event of client(server.fetch, clock).execDevSession(
+        execInput,
+      )) {
+        events.push(describeEvent(event));
+      }
+      expect(clock.sleeps).toEqual(expectedSleeps);
+      expect(events).toEqual([
+        ...Array.from({ length: keepaliveFailures }, () => "reattach 0 0"),
+        "started",
+        "reattach 0 0",
+        "exited 0",
+      ]);
+      expect(execs).toHaveLength(1);
+      expect(attachRequests).toHaveLength(keepaliveFailures + 1);
+      for (const request of attachRequests) {
+        expect(request).toMatchObject({
+          execId: execs[0]!.execId,
+          stdoutOffset: 0n,
+          stderrOffset: 0n,
+        });
+      }
+    },
+  );
 
   test("ends with the server's error and keeps its code", async () => {
     const { server } = execServer(

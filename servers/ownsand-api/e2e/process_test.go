@@ -23,6 +23,8 @@ type helperMode string
 const (
 	// helperExit writes the output and exits with status 0.
 	helperExit helperMode = "exit"
+	// helperFail writes the output and exits with status 1.
+	helperFail helperMode = "fail"
 	// helperBlock writes the output and waits until it is signaled.
 	helperBlock helperMode = "block"
 	// helperTerminate waits for SIGTERM and logs that it received the signal.
@@ -51,6 +53,9 @@ func TestHelperProcess(t *testing.T) {
 	os.Stderr.WriteString("err-1\nerr-final")
 	if mode == helperBlock {
 		time.Sleep(time.Minute)
+	}
+	if mode == helperFail {
+		os.Exit(1)
 	}
 	os.Exit(0)
 }
