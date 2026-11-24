@@ -286,7 +286,19 @@ func (e *Engine) stepPreparing(ctx context.Context, client ownsandclient.Client,
 // stepStart runs Adapter.Start (lifecycle step 3).
 func (e *Engine) stepStart(ctx context.Context, client ownsandclient.Client, r *Runner) {
 	a := e.adapters[r.Kind]
-	res, err := a.Start(ctx, e.guest(ctx, client, r))
+	g := e.guest(ctx, client, r)
+	if r.Kind == tidev1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION {
+		req, err := e.storedCreateRequest(ctx, r.ID)
+		if err == nil {
+			err = req.GetMaxTtl().CheckValid()
+		}
+		if err != nil {
+			e.svc.Logger.WarnContext(ctx, "runner_create_request_load_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		} else {
+			g.SandboxMaxTTL = req.GetMaxTtl().AsDuration()
+		}
+	}
+	res, err := a.Start(ctx, g)
 	if err != nil {
 		if ctx.Err() == nil {
 			e.svc.Logger.WarnContext(ctx, "runner_start_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
