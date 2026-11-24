@@ -333,17 +333,12 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 		a.logger.Error("snapshot import failed", "snapshot_id", snapshotID, "error", err)
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS, Message: "snapshot import failed its download or hash check"}
 	}
-	// A channel that closed while the import renamed the staged content must
-	// not publish a ready entry: the deferred removal drops the content.
-	if err := ctx.Err(); err != nil {
-		a.logger.Warn("snapshot import stopped before publication", "snapshot_id", snapshotID, "error", err)
-		return nil, err
-	}
 	if a.beforeSnapshotPublishHook != nil {
 		a.beforeSnapshotPublishHook()
 	}
-	e, err := a.Sandboxes.AddImportedSnapshot(entry)
+	e, err := a.Sandboxes.AddImportedSnapshot(ctx, entry)
 	if err != nil {
+		a.logger.Warn("snapshot import could not publish", "snapshot_id", snapshotID, "error", err)
 		return nil, err
 	}
 	published = true
