@@ -108,7 +108,8 @@ func TestGetIceServersAndOpenSession(t *testing.T) {
 	org, agent, sandboxID := runningSandbox(t, env)
 	key := env.Clients(org.APIKey)
 	ice, err := key.DataPath.GetIceServers(ctx, connect.NewRequest(&ownsandv1.GetIceServersRequest{OrganizationId: org.ID}))
-	if err != nil || len(ice.Msg.GetIceServers()) != 1 || ice.Msg.GetIceServers()[0].GetUrls()[0] != "stun:127.0.0.1:3478" {
+	if err != nil || len(ice.Msg.GetIceServers()) != 1 ||
+		len(ice.Msg.GetIceServers()[0].GetUrls()) == 0 || ice.Msg.GetIceServers()[0].GetUrls()[0] != "stun:127.0.0.1:3478" {
 		t.Fatalf("ice servers: %v %v", ice, err)
 	}
 	resp, err := key.DataPath.OpenSession(ctx, connect.NewRequest(&ownsandv1.OpenSessionRequest{OrganizationId: org.ID, SandboxId: sandboxID, SdpOffer: "v=0 secret-offer"}))
