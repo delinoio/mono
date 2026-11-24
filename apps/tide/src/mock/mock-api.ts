@@ -93,7 +93,12 @@ import {
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/tide-protos/v1/work_pb";
-import { TERMINAL_REQUEST_STATES, TERMINAL_RUNNER_STATES } from "../format.ts";
+import {
+  compareTimestamps,
+  TERMINAL_REQUEST_STATES,
+  TERMINAL_RUNNER_STATES,
+} from "../format.ts";
+import { compareQueueOrder } from "../queue.ts";
 import { uuidV7 } from "../uuid.ts";
 
 /**
@@ -1631,13 +1636,19 @@ export function createMockTransport(
     router.service(WorkService, {
       listRequests(req) {
         const { org } = membership(req.organizationId);
-        const active = org.requests.filter(
-          (r) => !TERMINAL_REQUEST_STATES.has(r.state),
-        );
-        const ended = org.requests.filter((r) =>
-          TERMINAL_REQUEST_STATES.has(r.state),
-        );
-        const items = [...active, ...(req.includeEnded ? ended : [])].filter(
+        const active = org.requests
+          .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
+          .sort(compareQueueOrder);
+        const ended = req.includeEnded
+          ? org.requests
+              .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
+              .sort(
+                (a, b) =>
+                  compareTimestamps(b.endedAt, a.endedAt) ||
+                  a.requestId.localeCompare(b.requestId),
+              )
+          : [];
+        const items = [...active, ...ended].filter(
           (r) =>
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
@@ -1958,7 +1969,12 @@ export function createMockTransport(
     router.service(AuditService, {
       listAuditEvents(req) {
         const { org } = membership(req.organizationId);
-        const p = page(org.audit, req);
+        const events = org.audit.toSorted(
+          (a, b) =>
+            compareTimestamps(b.createTime, a.createTime) ||
+            b.auditEventId.localeCompare(a.auditEventId),
+        );
+        const p = page(events, req);
         return { events: p.items, nextPageToken: p.nextPageToken };
       },
     });
