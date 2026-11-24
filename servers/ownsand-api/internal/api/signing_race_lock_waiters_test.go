@@ -5,8 +5,13 @@ package api_test
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
@@ -20,6 +25,7 @@ import (
 func holdAndBlockForShare(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	if _, err := pool.Exec(ctx, "CREATE TABLE lock_probe (id int PRIMARY KEY)"); err != nil {
 		t.Fatal(err)
 	}
@@ -30,27 +36,31 @@ func holdAndBlockForShare(t *testing.T, pool *pgxpool.Pool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var waiter pgx.Tx
+	var done chan struct{}
+	t.Cleanup(func() {
+		// Release the row lock and let the waiter finish using its transaction.
+		_ = holder.Rollback(context.Background())
+		if done != nil {
+			<-done
+		}
+		if waiter != nil {
+			_ = waiter.Rollback(context.Background())
+		}
+	})
 	if _, err := holder.Exec(ctx, "SELECT 1 FROM lock_probe WHERE id = 1 FOR UPDATE"); err != nil {
 		t.Fatal(err)
 	}
-	waiter, err := pool.Begin(ctx)
+	waiter, err = pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan struct{})
+	done = make(chan struct{})
 	go func() {
 		defer close(done)
 		// The statement blocks until the holder ends; its result is irrelevant.
 		_, _ = waiter.Exec(ctx, "SELECT 1 FROM lock_probe WHERE id = 1 FOR SHARE")
 	}()
-	t.Cleanup(func() {
-		// Rolling the holder back releases the lock; canceling the context
-		// covers a waiter that has not started yet.
-		_ = holder.Rollback(context.Background())
-		<-done
-		cancel()
-		_ = waiter.Rollback(context.Background())
-	})
 	testenv.Eventually(t, "the FOR SHARE statement waits for the row lock", func() bool {
 		n, err := queryForShareLockWaiters(ctx, pool)
 		if err != nil {
@@ -94,4 +104,86 @@ func TestForShareLockWaitersReportQueryError(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("a canceled query returned n = %d, and its error does not wrap context.Canceled", n)
 	}
+}
+
+const (
+	signingLockFailureEnv = "OWNSAND_TEST_SIGNING_LOCK_FAILURE"
+	waiterBeginError      = "injected waiter begin error"
+	signingLockPoolClosed = "signing lock fixture pool closed"
+)
+
+func TestForShareLockWaitersCleanUpAfterSetupError(t *testing.T) {
+	if failure := os.Getenv(signingLockFailureEnv); failure != "" {
+		failSigningLockFixtureSetup(t, failure)
+		return
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name      string
+		wantError string
+	}{
+		{name: "holder_statement", wantError: "SQLSTATE 25006"},
+		{name: "waiter_begin", wantError: waiterBeginError},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Own the database in the parent so it can be dropped if the child hangs.
+			databaseURL := dbtest.NewURL(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, executable,
+				"-test.run=^TestForShareLockWaitersCleanUpAfterSetupError$", "-test.v", "-test.timeout=30s")
+			cmd.Env = append(cmd.Environ(), signingLockFailureEnv+"="+tt.name, dbtest.EnvTestDatabaseURL+"="+databaseURL)
+			output, err := cmd.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("fixture subprocess timed out: %s", output)
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+				t.Fatalf("fixture subprocess should fail with exit code 1, got %v: %s", err, output)
+			}
+			for _, want := range []string{tt.wantError, signingLockPoolClosed} {
+				if !strings.Contains(string(output), want) {
+					t.Fatalf("fixture subprocess output is missing %q: %s", want, output)
+				}
+			}
+		})
+	}
+}
+
+func failSigningLockFixtureSetup(t *testing.T, failure string) {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(dbtest.URL(t))
+	if err != nil {
+		t.Fatal("parse signing lock fixture database configuration")
+	}
+	config.MaxConns = 3
+	config.MinConns = 0
+	config.MinIdleConns = 0
+	var checkouts int
+	config.PrepareConn = func(ctx context.Context, conn *pgx.Conn) (bool, error) {
+		checkouts++
+		// The first two checkouts create the table and insert the row.
+		if checkouts == 3 && failure == "holder_statement" {
+			_, err := conn.Exec(ctx, "SET default_transaction_read_only = on")
+			return err == nil, err
+		}
+		if checkouts == 4 && failure == "waiter_begin" {
+			return false, errors.New(waiterBeginError)
+		}
+		return true, nil
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		pool.Close()
+		t.Log(signingLockPoolClosed)
+	})
+
+	holdAndBlockForShare(t, pool)
 }
