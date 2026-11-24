@@ -48,11 +48,12 @@
 # number. Bash runs a trap only after the foreground command (`docker` or
 # `curl`) returns, so the handler waits for that command, which the stop
 # timeout and the 5-second `curl` limit bound. `SIGKILL` cannot be caught and
-# still leaves the containers stopped. A signal during the route switch waits
-# until the route switch has finished: when the route switched, the script
-# records the state and exits without a restart, because the route names the
-# replacement; when it did not, the script restores the stopped containers as
-# above.
+# still leaves the containers stopped. For both HTTP-only and UDP deployments,
+# the script defers these signals during the route switch and image-state
+# publication. When the reload succeeds, the script records the state and
+# exits with the signal status before cleanup. When the reload fails, the
+# script restores the route file and removes the replacement, then restarts
+# any containers that it stopped for UDP and reports the route failure.
 #
 # Every deployment reads a fresh identifier under the service lock, before it
 # runs any `docker` command: a UUID that the kernel generates for each read
@@ -328,15 +329,11 @@ main() {
   local pending_signal=""
   local proxy_lock_fd="" route_switched=""
   if acquire_proxy_lock "$root/state/.proxy.lock" "$proxy_lock_timeout" "$service" proxy_lock_fd; then
-    # A signal during the route switch is only recorded: the route file and
-    # the proxy reload run as one step, and restoring the previous containers
-    # after a switch that succeeded would remove the replacement that the
-    # route names.
-    if (( ${#publish[@]} > 0 )); then
-      trap 'pending_signal=TERM' TERM
-      trap 'pending_signal=INT' INT
-      trap 'pending_signal=HUP' HUP
-    fi
+    # Defer signals until a rejected route is restored and its replacement
+    # removed, or until a successful switch is recorded in the state files.
+    trap 'pending_signal=TERM' TERM
+    trap 'pending_signal=INT' INT
+    trap 'pending_signal=HUP' HUP
     if write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol"; then
       route_switched=1
     fi
@@ -355,12 +352,14 @@ main() {
   # The proxy routes to the replacement now, so it is the deployed image.
   # Record it before the cleanup: a failed cleanup must not leave the state
   # files naming the image that the route no longer serves.
-  # The route switched, so the replacement is the deployed image and a signal
-  # no longer restores the previous containers.
-  trap - TERM INT HUP
   record_state "$state" "$image" || fail "the route of $service now serves $image, but the state files $state.current and $state.previous were not updated."
+  trap - TERM INT HUP
   if [[ -n "$pending_signal" ]]; then
-    echo "::error::received SIG$pending_signal during the route switch; the route of $service serves $new, so the previous containers stay stopped and their cleanup was skipped. Deploy the same image again to finish the cleanup." >&2
+    local previous_status="any running previous containers keep running"
+    if (( ${#publish[@]} > 0 )); then
+      previous_status="the previous containers stay stopped"
+    fi
+    echo "::error::received SIG$pending_signal during the route switch or image-state publication. The route of $service serves $new, $previous_status, and cleanup was skipped. Deploy the same image again to finish the cleanup." >&2
     exit $((128 + $(signal_number "$pending_signal")))
   fi
 
