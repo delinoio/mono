@@ -3,19 +3,164 @@
 package claude
 
 import (
+	"bytes"
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/servers/tide-api/internal/agent"
 	"github.com/delinoio/mono/servers/tide-api/internal/profile"
 	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
+
+type acceptUnixFunc func() (*net.UnixConn, error)
+
+func (f acceptUnixFunc) AcceptUnix() (*net.UnixConn, error) { return f() }
+
+func TestClaudeHookAcceptRecovers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Claude orchestrators run on Linux and macOS")
+	}
+	// Keep the run directory short, as Watch does for the real socket.
+	dir, err := os.MkdirTemp("", "tc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, socketName)
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	w := &agent.Watch{Logger: slog.New(slog.NewJSONHandler(&logs, nil)).With("agent_integration_id", "test-integration")}
+	attempts := 0
+	listener := acceptUnixFunc(func() (*net.UnixConn, error) {
+		attempts++
+		if attempts == 1 || attempts == 3 {
+			return nil, os.NewSyscallError("accept", syscall.EMFILE)
+		}
+		return ln.AcceptUnix()
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&Vendor{}).serve(t.Context(), w, listener)
+	}()
+	for range 2 {
+		// A pre-warming request exercises the real hook exchange without a store.
+		reply, err := exchange(socket, hookRequest{OrderID: "order"})
+		if err != nil {
+			t.Error(err)
+			break
+		}
+		if reply.Result != HookReject {
+			t.Errorf("hook result = %q, want %q", reply.Result, HookReject)
+			break
+		}
+	}
+	_ = ln.Close()
+	<-done
+
+	var failures int
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if !strings.Contains(line, `"msg":"claude_hook_accept_failed"`) {
+			continue
+		}
+		failures++
+		for _, field := range []string{
+			`"level":"ERROR"`, `"agent_integration_id":"test-integration"`, syscall.EMFILE.Error(),
+			fmt.Sprintf(`"retry_in":%d`, hookAcceptBackoffMin.Nanoseconds()),
+		} {
+			if !strings.Contains(line, field) {
+				t.Errorf("accept log is missing %q: %s", field, line)
+			}
+		}
+	}
+	if failures != 2 {
+		t.Fatalf("logged %d accept failures, want 2", failures)
+	}
+}
+
+func TestClaudeHookAcceptClosed(t *testing.T) {
+	var logs bytes.Buffer
+	w := &agent.Watch{Logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+	attempts := 0
+	listener := acceptUnixFunc(func() (*net.UnixConn, error) {
+		attempts++
+		if attempts > 1 {
+			t.Fatal("serve retried a closed listener")
+		}
+		return nil, &net.OpError{Op: "accept", Net: "unix", Err: net.ErrClosed}
+	})
+	(&Vendor{}).serve(t.Context(), w, listener)
+	if attempts != 1 || logs.Len() != 0 {
+		t.Fatalf("closed listener: %d accepts and %q logs, want one accept and no logs", attempts, logs.String())
+	}
+}
+
+func TestClaudeHookAcceptBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		w := &agent.Watch{Logger: slog.New(slog.DiscardHandler)}
+		delays := []time.Duration{5, 10, 20, 40, 80, 160, 320, 640, 1000, 1000}
+		attempts := make(chan time.Time, len(delays)+2)
+		listener := acceptUnixFunc(func() (*net.UnixConn, error) {
+			select {
+			case attempts <- time.Now():
+			case <-ctx.Done():
+			}
+			return nil, syscall.EMFILE
+		})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			(&Vendor{}).serve(ctx, w, listener)
+		}()
+		synctest.Wait()
+		if len(attempts) != 1 {
+			t.Fatalf("got %d initial accept attempts, want one", len(attempts))
+		}
+		previous := <-attempts
+		for i, ms := range delays {
+			delay := ms * time.Millisecond
+			time.Sleep(delay - time.Nanosecond)
+			synctest.Wait()
+			if len(attempts) != 0 {
+				t.Fatalf("accept retried before the %s delay", delay)
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			if len(attempts) != 1 {
+				t.Fatalf("got %d accept attempts at retry %d, want one", len(attempts), i+1)
+			}
+			retry := <-attempts
+			if got := retry.Sub(previous); got != delay {
+				t.Fatalf("retry %d followed after %s, want %s", i+1, got, delay)
+			}
+			previous = retry
+		}
+		beforeCancel := time.Now()
+		cancel()
+		<-done
+		if !time.Now().Equal(beforeCancel) || len(attempts) != 0 {
+			t.Fatal("cancel did not stop the retry wait immediately")
+		}
+	})
+}
 
 func TestHookExitCodes(t *testing.T) {
 	for r, want := range map[HookResult]int{HookStored: 0, HookDuplicate: 0, HookRetry: 1, HookReject: 2, "unknown": 1} {

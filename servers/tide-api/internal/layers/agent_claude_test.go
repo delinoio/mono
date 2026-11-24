@@ -363,7 +363,8 @@ func TestClaudeOrganizationDeletion(t *testing.T) {
 // TestClaudeRealProcesses runs the production path with real processes: a
 // shell script in place of claude starts the tide-api binary through the
 // spawn-runner link in its hooks directory with only the documented hook
-// variables, and the hook stores the request over the socket and exits 0.
+// variables. The hooks store requests over the socket and exit 0 during
+// the normal run and after the orchestrator receives SIGTERM.
 func TestClaudeRealProcesses(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the tide-api binary")
@@ -381,10 +382,13 @@ while [ $# -gt 0 ]; do
   shift
 done
 printf '%s' '`+claudeWorkOrder+`' > '`+scratch+`/wo'
-env -i PATH=/usr/bin:/bin CLAUDE_RUNNER_ORDER_ID=order-real CLAUDE_RUNNER_SESSION_ID=session_real \
-  CLAUDE_RUNNER_WORK_ORDER_FILE='`+scratch+`/wo' "$hooks/spawn-runner" 2>'`+scratch+`/stderr'
-echo $? > '`+scratch+`/code'
-trap 'exit 0' TERM
+spawn() {
+  env -i PATH=/usr/bin:/bin CLAUDE_RUNNER_ORDER_ID="$1" CLAUDE_RUNNER_SESSION_ID=session_real \
+    CLAUDE_RUNNER_WORK_ORDER_FILE='`+scratch+`/wo' "$hooks/spawn-runner" 2>"`+scratch+`/$2.stderr"
+  echo $? > "`+scratch+`/$2.code"
+}
+trap 'spawn order-drain drain; exit 0' TERM
+spawn order-real normal
 while :; do sleep 0.05; done
 `), 0o755); err != nil {
 		t.Fatal(err)
@@ -400,14 +404,30 @@ while :; do sleep 0.05; done
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
 	})
 	w.createProfile(t, agentProfileProto("claude-agents", id, tidev1.GuestOs_GUEST_OS_LINUX, time.Hour))
-	eventually(t, "the hook exit code", func() bool {
-		b, err := os.ReadFile(filepath.Join(scratch, "code"))
-		return err == nil && strings.TrimSpace(string(b)) != ""
-	})
-	code, _ := os.ReadFile(filepath.Join(scratch, "code"))
-	stderr, _ := os.ReadFile(filepath.Join(scratch, "stderr"))
-	if strings.TrimSpace(string(code)) != "0" {
-		t.Fatalf("hook exit %s: %s", code, stderr)
+	checkHook := func(phase, order string) {
+		t.Helper()
+		var code string
+		eventually(t, "the "+phase+" hook exit code", func() bool {
+			b, err := os.ReadFile(filepath.Join(scratch, phase+".code"))
+			code = strings.TrimSpace(string(b))
+			return err == nil && code != ""
+		})
+		if code != "0" {
+			stderr, _ := os.ReadFile(filepath.Join(scratch, phase+".stderr"))
+			t.Fatalf("%s hook exit %s: %s", phase, code, stderr)
+		}
+		w.requestBySource(t, order)
 	}
-	w.requestBySource(t, "order-real")
+	checkHook("normal", "order-real")
+	// Rotating the credential stops the orchestrator while the profile still
+	// serves requests, so a hook invoked during the drain can store its order.
+	w.env.Clock.Advance(time.Second)
+	if _, err := w.env.User(w.org.Admin).Integration.UpdateAgentIntegration(t.Context(), connect.NewRequest(&tidev1.UpdateAgentIntegrationRequest{
+		OrganizationId: w.org.ID, AgentIntegrationId: id,
+		Credentials: &tidev1.UpdateAgentIntegrationRequest_ClaudeCodeCredentials{ClaudeCodeCredentials: &tidev1.ClaudeCodeCredentials{EnvironmentKey: "sk-ant-new-key"}},
+		UpdateMask:  &fieldmaskpb.FieldMask{Paths: []string{"credentials"}},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	checkHook("drain", "order-drain")
 }
