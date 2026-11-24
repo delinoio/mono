@@ -635,7 +635,7 @@ describe("invitations", () => {
     );
   });
 
-  test("shows the error of a failed acceptance and keeps the accept button", async ({
+  test("accepts a different link opened on the same page after an invitation error", async ({
     app,
     screen,
     browser,
@@ -647,6 +647,16 @@ describe("invitations", () => {
     await expect(screen.getByText("you are already a member")).toBeVisible();
     await expect(screen.getByRole("button", "Accept invitation")).toBeVisible();
     await expect(browser).toHaveURL("/invitations/accept");
+
+    await browser.evaluate((secret) => {
+      window.location.hash = `secret=${secret}`;
+      return true;
+    }, INVITATION_SECRET);
+    await expect(screen.getByText("you are already a member")).toBeHidden();
+    await expect(browser).toHaveURL("/invitations/accept");
+    await screen.getByRole("button", "Accept invitation").tap();
+
+    await expect(browser).toHaveURL(`/orgs/${CONTOSO}/sandboxes`);
   });
 });
 

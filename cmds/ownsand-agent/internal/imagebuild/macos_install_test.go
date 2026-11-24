@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"testing"
 	"testing/synctest"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/vzrt"
 )
 
 type fakeMacOSInstallation struct {
@@ -17,6 +19,7 @@ type fakeMacOSInstallation struct {
 	progressCanceled bool
 	closed           bool
 	stopVM           bool
+	closeErr         error
 }
 
 func (i *fakeMacOSInstallation) completion() <-chan error   { return i.done }
@@ -27,9 +30,10 @@ func (i *fakeMacOSInstallation) cancel() {
 	i.progressCanceled = i.acceptsCancel
 }
 
-func (i *fakeMacOSInstallation) close(stopVM bool) {
+func (i *fakeMacOSInstallation) close(stopVM bool) error {
 	i.closed = true
 	i.stopVM = stopVM
+	return i.closeErr
 }
 
 func TestMacOSInstallCanceledBeforeStart(t *testing.T) {
@@ -125,6 +129,38 @@ func TestMacOSInstallReturnsNativeResult(t *testing.T) {
 			if !installation.closed || installation.stopVM != (tc.err == nil) || installation.cancelRequests != 0 {
 				t.Errorf("closed = %t, stop VM = %t, cancellation requests = %d",
 					installation.closed, installation.stopVM, installation.cancelRequests)
+			}
+		})
+	}
+}
+
+func TestMacOSInstallReportsUnconfirmedStop(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel bool
+	}{
+		{name: "successful install"},
+		{name: "canceled install", cancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			installation := &fakeMacOSInstallation{
+				done:     make(chan error, 1),
+				closeErr: vzrt.ErrVMMayRun,
+			}
+			err := runMacOSInstall(ctx, func(context.Context) (macOSInstallation, error) {
+				if tc.cancel {
+					cancel()
+				}
+				installation.done <- nil
+				return installation, nil
+			}, slog.New(slog.DiscardHandler))
+			if !errors.Is(err, vzrt.ErrVMMayRun) || errors.Is(err, context.Canceled) != tc.cancel {
+				t.Errorf("installation error = %v, want unconfirmed stop (canceled = %t)", err, tc.cancel)
+			}
+			if !installation.closed || !installation.stopVM {
+				t.Errorf("closed = %t, stop VM = %t, want both true", installation.closed, installation.stopVM)
 			}
 		})
 	}

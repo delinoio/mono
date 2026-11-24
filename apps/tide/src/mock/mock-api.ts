@@ -93,7 +93,12 @@ import {
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/tide-protos/v1/work_pb";
-import { TERMINAL_REQUEST_STATES, TERMINAL_RUNNER_STATES } from "../format.ts";
+import {
+  compareTimestamps,
+  TERMINAL_REQUEST_STATES,
+  TERMINAL_RUNNER_STATES,
+} from "../format.ts";
+import { compareQueueOrder } from "../queue.ts";
 import { uuidV7 } from "../uuid.ts";
 
 /**
@@ -125,8 +130,9 @@ export const MOCK_IDS = {
   linuxProfile: "0193b000-0000-7000-8000-0000000000b1",
   codexProfile: "0193b000-0000-7000-8000-0000000000b2",
   devProfile: "0193b000-0000-7000-8000-0000000000b3",
+  claudeProfile: "0193b000-0000-7000-8000-0000000000b4",
   codexIntegration: "0193b000-0000-7000-8000-0000000000c1",
-  claudeIntegration: "0193b000-0000-7000-8000-0000000000c2",
+  claudeIntegration: "0193b002-0000-7000-8000-0000000000c2",
   installation: "0193b000-0000-7000-8000-0000000000d1",
   queuedJob: "0193b000-0000-7000-8000-0000000000e1",
   queuedAgent: "0193b000-0000-7000-8000-0000000000e2",
@@ -232,6 +238,7 @@ function profile(
 function seed(
   userId: string,
   runnerProfileCount: number,
+  agentIntegrationPageSize: number | undefined,
 ): Map<string, OrgState> {
   const orgs = new Map<string, OrgState>();
 
@@ -244,6 +251,20 @@ function seed(
     member(MOCK_IDS.acme, userId, Role.OWNER, "Mina Kim"),
     member(MOCK_IDS.acme, OTHER_ADMIN, Role.ADMIN, "Ada Park"),
     member(MOCK_IDS.acme, OTHER_MEMBER, Role.MEMBER, ""),
+  );
+  // Fill the first page and give the console one more member to load.
+  for (let index = acme.members.length; index < 200; index++) {
+    acme.members.push(
+      member(
+        MOCK_IDS.acme,
+        `mock-user-roster-${index}`,
+        Role.MEMBER,
+        `Roster member ${index}`,
+      ),
+    );
+  }
+  acme.members.push(
+    member(MOCK_IDS.acme, "mock-user-nora", Role.MEMBER, "Nora Lee"),
   );
   acme.link = create(OwnSandLinkSchema, {
     organizationId: MOCK_IDS.acme,
@@ -294,6 +315,21 @@ function seed(
       createTime: ts(-8 * 86400),
       updateTime: ts(-8 * 86400),
     }),
+  );
+  // Put claude-team on the second page of the console's integration list.
+  const firstIntegrationPageSize = agentIntegrationPageSize ?? 1;
+  for (let index = 2; index <= firstIntegrationPageSize; index += 1) {
+    acme.integrations.push(
+      create(AgentIntegrationSchema, {
+        agentIntegrationId: `0193b001-0000-7000-8000-${index.toString(16).padStart(12, "0")}`,
+        organizationId: MOCK_IDS.acme,
+        vendor: AgentVendor.CURSOR,
+        name: `cursor-pool-${index}`,
+        settings: { case: "cursor", value: { poolName: `pool-${index}` } },
+      }),
+    );
+  }
+  acme.integrations.push(
     create(AgentIntegrationSchema, {
       agentIntegrationId: MOCK_IDS.claudeIntegration,
       organizationId: MOCK_IDS.acme,
@@ -344,17 +380,32 @@ function seed(
       priority: Priority.NORMAL,
     }),
   );
+  if (agentIntegrationPageSize !== undefined) {
+    acme.profiles.push(
+      profile(MOCK_IDS.acme, {
+        runnerProfileId: MOCK_IDS.claudeProfile,
+        name: "claude-linux",
+        workloadKind: WorkloadKind.AGENT_SESSION,
+        agentIntegrationId: MOCK_IDS.claudeIntegration,
+        guestOs: GuestOs.LINUX,
+        source: { case: "baseImage", value: GuestOs.LINUX },
+        priority: Priority.NORMAL,
+      }),
+    );
+  }
   if (runnerProfileCount > 3) {
     acme.profiles.push(
-      ...Array.from({ length: runnerProfileCount - 3 }, (_, index) =>
-        profile(MOCK_IDS.acme, {
-          runnerProfileId: uuidV7(),
-          name: `fixture-linux-${index + 1}`,
-          workloadKind: WorkloadKind.GITHUB_JOB,
-          guestOs: GuestOs.LINUX,
-          source: { case: "baseImage", value: GuestOs.LINUX },
-          priority: Priority.NORMAL,
-        }),
+      ...Array.from(
+        { length: runnerProfileCount - acme.profiles.length - 1 },
+        (_, index) =>
+          profile(MOCK_IDS.acme, {
+            runnerProfileId: uuidV7(),
+            name: `fixture-linux-${index + 1}`,
+            workloadKind: WorkloadKind.GITHUB_JOB,
+            guestOs: GuestOs.LINUX,
+            source: { case: "baseImage", value: GuestOs.LINUX },
+            priority: Priority.NORMAL,
+          }),
       ),
       linuxBuild,
     );
@@ -635,6 +686,15 @@ function seed(
       createTime: ts(-40 * 86400),
     }),
   );
+  northwind.integrations.push(
+    create(AgentIntegrationSchema, {
+      agentIntegrationId: "0193b000-0000-7000-8000-0000000000c3",
+      organizationId: MOCK_IDS.northwind,
+      vendor: AgentVendor.CLAUDE_CODE,
+      name: "northwind-claude",
+      settings: { case: "claudeCode", value: {} },
+    }),
+  );
   orgs.set(MOCK_IDS.northwind, northwind);
 
   const contoso = emptyOrg(MOCK_IDS.contoso, "Contoso");
@@ -701,6 +761,8 @@ export interface MockTransportOptions {
   userId?: string;
   /** The Acme runner profile count. Larger lists put linux-build last. */
   runnerProfileCount?: number;
+  /** Caps integration pages and seeds a profile that uses the second page. */
+  agentIntegrationPageSize?: number;
   /**
    * Ends each WatchQueue stream after its snapshot and this many
    * milliseconds, like the control plane before 14 minutes. Default: the
@@ -718,7 +780,12 @@ export function createMockTransport(
   options: MockTransportOptions = {},
 ): Transport {
   const userId = options.userId ?? MOCK_USER;
-  const orgs = seed(userId, options.runnerProfileCount ?? 3);
+  const orgs = seed(
+    userId,
+    options.runnerProfileCount ?? 3,
+    options.agentIntegrationPageSize,
+  );
+  let failAcmeContinuation = true;
   const watchers = new Map<string, Set<Watcher>>();
   const issuedStates = new Map<
     string,
@@ -1058,7 +1125,22 @@ export function createMockTransport(
       listMembers(req) {
         const { org } = membership(req.organizationId);
         const p = page(org.members, req);
-        return { members: p.items, nextPageToken: p.nextPageToken };
+        if (
+          req.organizationId === MOCK_IDS.acme &&
+          req.pageToken !== "" &&
+          failAcmeContinuation
+        ) {
+          // Let the browser fixture exercise the manual retry of a later page.
+          failAcmeContinuation = false;
+          throw new ConnectError("mock member page failure", Code.Internal);
+        }
+        // Like ListMembers on the server, a full page can be followed by an
+        // empty terminal page.
+        const nextPageToken =
+          p.items.length === (req.pageSize || 50)
+            ? String(Number(req.pageToken) + p.items.length)
+            : "";
+        return { members: p.items, nextPageToken };
       },
       updateMemberRole(req) {
         const { org, role } = membership(req.organizationId);
@@ -1381,7 +1463,13 @@ export function createMockTransport(
       },
       listAgentIntegrations(req) {
         const { org } = membership(req.organizationId);
-        const p = page(org.integrations, req);
+        const p = page(org.integrations, {
+          pageToken: req.pageToken,
+          pageSize:
+            req.pageSize === 200
+              ? (options.agentIntegrationPageSize ?? req.pageSize)
+              : req.pageSize,
+        });
         return { integrations: p.items, nextPageToken: p.nextPageToken };
       },
       updateAgentIntegration(req) {
@@ -1631,13 +1719,19 @@ export function createMockTransport(
     router.service(WorkService, {
       listRequests(req) {
         const { org } = membership(req.organizationId);
-        const active = org.requests.filter(
-          (r) => !TERMINAL_REQUEST_STATES.has(r.state),
-        );
-        const ended = org.requests.filter((r) =>
-          TERMINAL_REQUEST_STATES.has(r.state),
-        );
-        const items = [...active, ...(req.includeEnded ? ended : [])].filter(
+        const active = org.requests
+          .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
+          .sort(compareQueueOrder);
+        const ended = req.includeEnded
+          ? org.requests
+              .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
+              .sort(
+                (a, b) =>
+                  compareTimestamps(b.endedAt, a.endedAt) ||
+                  a.requestId.localeCompare(b.requestId),
+              )
+          : [];
+        const items = [...active, ...ended].filter(
           (r) =>
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
@@ -1958,7 +2052,12 @@ export function createMockTransport(
     router.service(AuditService, {
       listAuditEvents(req) {
         const { org } = membership(req.organizationId);
-        const p = page(org.audit, req);
+        const events = org.audit.toSorted(
+          (a, b) =>
+            compareTimestamps(b.createTime, a.createTime) ||
+            b.auditEventId.localeCompare(a.auditEventId),
+        );
+        const p = page(events, req);
         return { events: p.items, nextPageToken: p.nextPageToken };
       },
     });

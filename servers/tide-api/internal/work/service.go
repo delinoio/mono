@@ -20,6 +20,7 @@ import (
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/authz"
+	"github.com/delinoio/mono/servers/tide-api/internal/db"
 )
 
 // Stream limits of WatchQueue (protos contract).
@@ -27,6 +28,7 @@ const (
 	watchKeepalive = 25 * time.Second
 	watchLifetime  = 13*time.Minute + 30*time.Second
 	watchPoll      = time.Second
+	watchWindow    = 1000
 )
 
 // Handler serves WorkService.
@@ -180,7 +182,7 @@ func (h *Handler) CancelRequest(ctx context.Context, req *connect.Request[tidev1
 		// Check the state under the row lock that the end takes, so a
 		// dispatch or another cancellation that changes the request
 		// meanwhile is seen.
-		cur, err := e.lockRequest(ctx, tx, id)
+		cur, err := e.LockRequest(ctx, tx, id)
 		if err != nil {
 			return err
 		}
@@ -416,6 +418,13 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.Wa
 	removable := map[string]*tidev1.Runner{}
 	var cursor, removed int64
 	emit := func(rows []watchRow) error {
+		var reqs []*tidev1.Request
+		for _, r := range rows {
+			if req := r.msg.GetRequest(); req != nil && sent[r.id] < r.seq {
+				reqs = append(reqs, req)
+			}
+		}
+		e.decorate(ctx, c.OrganizationID, reqs...)
 		for _, r := range rows {
 			if sent[r.id] >= r.seq {
 				continue
@@ -477,23 +486,16 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.Wa
 		}
 		return nil
 	}
-	snapshot, err := h.watchRows(ctx, c.OrganizationID, 0, true)
+	snapshot, cursor, err := h.watchSnapshot(ctx, c.OrganizationID, sent)
 	if err != nil {
 		return s.Internal(ctx, "watch queue", err)
 	}
 	if err := emit(snapshot); err != nil {
 		return err
 	}
-	if cursor == 0 {
-		if err := s.DB.Pool.QueryRow(ctx, "SELECT COALESCE(GREATEST((SELECT max(change_seq) FROM requests WHERE organization_id = $1), (SELECT max(change_seq) FROM runners WHERE organization_id = $1)), 0)",
-			c.OrganizationID).Scan(&cursor); err != nil {
-			return s.Internal(ctx, "watch queue", err)
-		}
-	}
 	if err := send(&tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_SnapshotComplete{SnapshotComplete: &tidev1.WatchQueueSnapshotComplete{}}}); err != nil {
 		return err
 	}
-	const window = 1000
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	lastSend := time.Now()
@@ -508,7 +510,7 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.Wa
 			return ctx.Err()
 		case <-ticker.C:
 		}
-		rows, err := h.watchRows(ctx, c.OrganizationID, max(cursor-window, 0), false)
+		rows, err := watchRows(ctx, s.DB.Pool, c.OrganizationID, max(cursor-watchWindow, 0), false)
 		if err != nil {
 			if ctx.Err() != nil {
 				continue
@@ -530,7 +532,7 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.Wa
 			lastSend = time.Now()
 		}
 		for id, seq := range sent {
-			if seq < cursor-window {
+			if seq < cursor-watchWindow {
 				delete(sent, id)
 			}
 		}
@@ -549,10 +551,53 @@ type watchRow struct {
 	msg *tidev1.WatchQueueResponse
 }
 
+// watchSnapshot reads the open rows and the initial cursor from one database
+// view. It marks terminal versions in the poll window as seen without sending
+// them. Versions that commit later remain eligible for delivery in that window.
+func (h *Handler) watchSnapshot(ctx context.Context, orgID string, sent map[string]int64) ([]watchRow, int64, error) {
+	var snapshot []watchRow
+	var cursor int64
+	opts := pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}
+	err := pgx.BeginTxFunc(ctx, h.e.svc.DB.Pool, opts, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(GREATEST(
+			(SELECT max(change_seq) FROM requests WHERE organization_id = $1),
+			(SELECT max(change_seq) FROM runners WHERE organization_id = $1)), 0)`,
+			orgID).Scan(&cursor); err != nil {
+			return err
+		}
+		var err error
+		snapshot, err = watchRows(ctx, tx, orgID, 0, true)
+		if err != nil {
+			return err
+		}
+
+		rows, err := tx.Query(ctx, `
+			SELECT 'q' || request_id::text, change_seq FROM requests
+			WHERE organization_id = $1 AND change_seq > $2 AND NOT (state = ANY($3))
+			UNION ALL
+			SELECT 'r' || runner_id::text, change_seq FROM runners
+			WHERE organization_id = $1 AND change_seq > $2 AND NOT (state = ANY($4))`,
+			orgID, max(cursor-watchWindow, 0), openRequestStates, openRunnerStates)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			var seq int64
+			if err := rows.Scan(&id, &seq); err != nil {
+				return err
+			}
+			sent[id] = max(sent[id], seq)
+		}
+		return rows.Err()
+	})
+	return snapshot, cursor, err
+}
+
 // watchRows reads the open rows (snapshot) or the rows changed after seq,
 // in change order.
-func (h *Handler) watchRows(ctx context.Context, orgID string, after int64, snapshot bool) ([]watchRow, error) {
-	s := h.e.svc
+func watchRows(ctx context.Context, q db.Querier, orgID string, after int64, snapshot bool) ([]watchRow, error) {
 	cond := "change_seq > $2"
 	args := []any{orgID, after}
 	if snapshot {
@@ -563,7 +608,7 @@ func (h *Handler) watchRows(ctx context.Context, orgID string, after int64, snap
 		reqArgs = []any{orgID, openRequestStates}
 	}
 	var out []watchRow
-	rows, err := s.DB.Pool.Query(ctx, "SELECT "+requestColumns+" FROM requests WHERE organization_id = $1 AND "+cond+" ORDER BY change_seq", reqArgs...)
+	rows, err := q.Query(ctx, "SELECT "+requestColumns+" FROM requests WHERE organization_id = $1 AND "+cond+" ORDER BY change_seq", reqArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -579,16 +624,11 @@ func (h *Handler) watchRows(ctx context.Context, orgID string, after int64, snap
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	var reqs []*tidev1.Request
-	for _, r := range out {
-		reqs = append(reqs, r.msg.GetRequest())
-	}
-	h.e.decorate(ctx, orgID, reqs...)
 	runArgs := args
 	if snapshot {
 		runArgs = []any{orgID, openRunnerStates}
 	}
-	rows, err = s.DB.Pool.Query(ctx, "SELECT "+runnerColumns+" FROM runners WHERE organization_id = $1 AND "+cond+" ORDER BY change_seq", runArgs...)
+	rows, err = q.Query(ctx, "SELECT "+runnerColumns+" FROM runners WHERE organization_id = $1 AND "+cond+" ORDER BY change_seq", runArgs...)
 	if err != nil {
 		return nil, err
 	}

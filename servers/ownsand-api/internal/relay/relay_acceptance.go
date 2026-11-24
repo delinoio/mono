@@ -31,12 +31,12 @@ func (c *Conn) recordStreamReceipt(f *ownsandv1.DataFrame, size int) *Stream {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := c.streams[f.GetStreamId()]
-	if s == nil {
+	if s == nil || s.isClosed() {
 		return nil
 	}
-	receivedAt := c.clk.mono()
+	receivedAt := c.clk.Elapsed()
 	if size >= LargeFrameBytes {
-		c.lastLarge.Store(c.clk.wall().UnixNano())
+		c.lastLarge.Store(c.clk.Now().UnixNano())
 		for _, stream := range c.streams {
 			stream.acceptance.extend(receivedAt)
 		}
@@ -61,5 +61,5 @@ func (s *Stream) AcceptanceExpired() bool {
 	c := s.conn
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return s.acceptance.expired(c.clk.mono())
+	return s.acceptance.expired(c.clk.Elapsed())
 }

@@ -31,7 +31,10 @@ describe("sign-in", () => {
     ).toBeHidden();
   });
 
-  test("signs in and lists the organizations", async ({ app, screen }) => {
+  test("signs in and lists the mock organizations in resolved development mode", async ({
+    app,
+    screen,
+  }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
 
@@ -51,6 +54,25 @@ describe("sign-in", () => {
 });
 
 describe("organizations", () => {
+  test("shows the full error when the organization cannot load", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${UNKNOWN_ORG}/api-keys`);
+
+    await expect(
+      screen.getByText("It was not found, or you no longer have access to it."),
+    ).toBeVisible();
+    await expect(screen.getByRole("button", "Try again")).toBeVisible();
+    await expect(screen.getByRole("navigation", "Organization")).toBeHidden();
+    await expect(
+      screen.getByText("The last refresh failed", { exact: false }),
+    ).toBeHidden();
+  });
+
   test("offers retry when the organization cannot be found", async ({
     app,
     screen,
@@ -167,6 +189,58 @@ describe("organization layout", () => {
   });
 });
 
+describe("organization member pagination", () => {
+  test("keeps loaded members visible and transfers ownership to a member from the next page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${ACME}/members`);
+    await expect(
+      screen.getByText("Some members are not shown yet."),
+    ).toBeVisible();
+    await expect(screen.getByText("Mina Kim", { exact: false })).toBeVisible();
+
+    await screen.getByRole("link", "Settings").tap();
+    await expect(
+      screen.getByText("Some members are not shown yet."),
+    ).toBeVisible();
+    await screen.getByRole("button", "Try again").tap();
+
+    const picker = screen.getByRole("combobox", "New owner");
+    await picker.tap();
+    await expect(screen.getByRole("option", "Mina Kim")).toBeHidden();
+    await screen.getByRole("option", "Nora Lee").tap();
+    await screen.getByRole("button", "Transfer").tap();
+    await expect(
+      screen.getByRole("alertdialog", "Make Nora Lee the owner?"),
+    ).toBeVisible();
+    await screen.getByRole("button", "Transfer ownership").tap();
+    await expect(
+      screen.getByRole("heading", "Transfer ownership"),
+    ).toBeHidden();
+
+    await screen.getByRole("link", "Members").tap();
+    await expect(browser).toHaveURL(`/orgs/${ACME}/members`);
+    await expect(screen.getByText("Nora Lee")).toBeVisible();
+    const role = await browser.evaluate(
+      () =>
+        Array.from(
+          document.querySelectorAll('[aria-label="Members"] .list-row'),
+        )
+          .find(
+            (row) =>
+              row.querySelector(".list-title")?.textContent === "Nora Lee",
+          )
+          ?.querySelector(".role")?.textContent ?? null,
+    );
+    expect(role).toBe("Owner");
+  });
+});
+
 describe("overview", () => {
   test("shows the live queue and the device pool", async ({
     app,
@@ -182,6 +256,10 @@ describe("overview", () => {
     ).toBeVisible();
     await expect(screen.getByRole("status", "Queue updates")).toContainText(
       "Live",
+    );
+    await expect(screen.getByText("Live")).toHaveAttribute(
+      "data-variant",
+      "accent",
     );
     await expect(screen.getByRole("table", "Waiting requests")).toContainText(
       "GitHub job",
@@ -221,7 +299,79 @@ describe("overview", () => {
   });
 });
 
+describe("audit", () => {
+  test("shows the newest event first", async ({ app, browser, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/audit`);
+
+    await expect(screen.getByRole("table", "Audit events")).toBeVisible();
+    const actions = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          'table[aria-label="Audit events"] tbody td:nth-child(2)',
+        ),
+        (cell) => cell.textContent,
+      ),
+    );
+    expect(actions).toEqual(["Dev session created", "OwnSand link set"]);
+  });
+});
+
+describe("requests", () => {
+  test("shows active requests in queue order before ended requests", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/requests`);
+
+    await screen.getByRole("checkbox", "Show ended requests").tap();
+    await expect(screen.getByRole("table", "Requests")).toContainText("deploy");
+    const sources = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          'table[aria-label="Requests"] tbody td:nth-child(4)',
+        ),
+        (cell) => cell.textContent,
+      ),
+    );
+    expect(sources).toEqual([
+      "acme-robotics/firmware · build (ubuntu)",
+      "acme-robotics/firmware · test (ubuntu)",
+      "sess_codex_4711",
+      "—",
+      "acme-robotics/site · deploy",
+    ]);
+  });
+});
+
 describe("integrations", () => {
+  test("opens management actions for an integration on the next page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+    const integration = screen
+      .getByRole("list", "Agent integrations")
+      .getByRole("listitem")
+      .filter({ hasText: "claude-team · Claude Code" });
+
+    await integration.getByRole("button", "Edit").tap();
+    await expect(screen.getByRole("dialog", "Edit claude-team")).toBeVisible();
+    await browser.keyboard.press("Escape");
+
+    await integration.getByRole("button", "Delete").tap();
+    await expect(
+      screen.getByRole("alertdialog", "Delete claude-team?"),
+    ).toBeVisible();
+  });
+
   test("keeps the integration edit dialog open after a duplicate rename", async ({
     app,
     screen,
@@ -452,7 +602,7 @@ describe("runner profiles", () => {
       .tap();
     await expect(renamedProfile).toBeHidden();
     await expect(
-      profiles.getByRole("listitem").filter({ hasText: "fixture-linux-198 ·" }),
+      profiles.getByRole("listitem").filter({ hasText: "fixture-linux-197 ·" }),
     ).toBeVisible();
 
     await screen.getByRole("button", "Create runner profile").tap();
@@ -492,6 +642,106 @@ describe("runner profiles", () => {
     await expect(profile.getByLabel("runs-on label of linux-build")).toHaveText(
       "tide-linux-build",
     );
+  });
+
+  test("shows field errors and saves after correcting the resource values", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+    await screen.getByRole("button", "Create runner profile").tap();
+
+    const dialog = screen.getByRole("dialog", "Create a runner profile");
+    await dialog.getByLabel("Name").tap();
+    await browser.keyboard.type("bounds-test");
+    const resources = [
+      [
+        "vCPUs",
+        "3000000000",
+        "1024",
+        "Enter a whole number of vCPUs from 1 to 1024.",
+      ],
+      [
+        "Memory (MiB)",
+        "10000000000000000000",
+        "16777216",
+        "Enter a whole number of MiB from 1 to 16777216.",
+      ],
+      [
+        "Disk (GiB)",
+        "1048577",
+        "1048576",
+        "Enter a whole number of GiB from 1 to 1048576.",
+      ],
+    ] as const;
+    for (const [label, invalid] of resources) {
+      await dialog.getByLabel(label).tap();
+      await browser.keyboard.press("ControlOrMeta+A");
+      await browser.keyboard.type(invalid);
+    }
+    await dialog.getByRole("button", "Create profile").tap();
+
+    for (const [label, , , message] of resources) {
+      await expect(dialog.getByLabel(label)).toHaveAttribute(
+        "aria-invalid",
+        "true",
+      );
+      await expect(dialog.getByText(message)).toBeVisible();
+    }
+    await expect(
+      dialog.getByText("Something went wrong. Try again."),
+    ).toBeHidden();
+    for (const [label, , valid] of resources) {
+      await dialog.getByLabel(label).tap();
+      await browser.keyboard.press("ControlOrMeta+A");
+      await browser.keyboard.type(valid);
+    }
+    await dialog.getByRole("button", "Create profile").tap();
+
+    await expect(dialog).toBeHidden();
+    const row = screen.getByRole("listitem").filter({ hasText: "bounds-test" });
+    await expect(row).toContainText("1024 vCPU · 16777216 MiB · 1048576 GiB");
+  });
+});
+
+describe("runner profiles", () => {
+  test("creates an agent-session profile with an integration on the next page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+    await expect(
+      screen.getByText("Integration: claude-team (Claude Code)"),
+    ).toBeVisible();
+    await screen.getByRole("button", "Create runner profile").tap();
+    await expect(screen.getByLabel("Name")).toBeFocused();
+    await browser.keyboard.type("claude-later");
+    await screen.getByRole("combobox", "Workload kind").tap();
+    await screen.getByRole("option", "Agent session").tap();
+    await screen.getByRole("combobox", "Agent integration").tap();
+    await screen.getByRole("option", "claude-team (Claude Code)").tap();
+
+    await screen.getByRole("combobox", "Guest OS").tap();
+    await screen.getByRole("option", "Windows").tap();
+    await screen.getByRole("button", "Create profile").tap();
+    await expect(
+      screen.getByText(
+        "The vendor of this integration does not run on this guest OS.",
+      ),
+    ).toBeVisible();
+
+    await screen.getByRole("combobox", "Guest OS").tap();
+    await screen.getByRole("option", "Linux").tap();
+    await screen.getByRole("button", "Create profile").tap();
+    await expect(
+      screen.getByRole("listitem").filter({ hasText: "claude-later" }),
+    ).toContainText("Integration: claude-team (Claude Code)");
   });
 });
 
@@ -596,6 +846,8 @@ describe("invitations", () => {
     await expect(screen.getByRole("combobox", "Organization")).toContainText(
       "Contoso",
     );
+    await screen.getByRole("combobox", "Organization").tap();
+    await expect(screen.getByRole("option", "Contoso")).toBeVisible();
   });
 });
 

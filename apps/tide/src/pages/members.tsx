@@ -4,7 +4,6 @@ import {
   callUnaryMethod,
   createQueryOptions,
   useMutation,
-  useQuery,
   useTransport,
 } from "@connectrpc/connect-query";
 import {
@@ -25,25 +24,22 @@ import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import { useState } from "react";
 import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
 import { useAuth } from "../auth.tsx";
+import { MemberListStatus } from "../components/member-list-status.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Empty,
-  ErrorNotice,
   FormDialog,
-  Loading,
   PageHeader,
+  QueryBoundary,
   SecretDialog,
   toastError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import { invitationLink } from "../invitation.ts";
+import { displayName, useMembers } from "../members.ts";
 import { can, canManageMember, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
-
-function displayName(m: Member): string {
-  return m.displayName !== "" ? m.displayName : m.userId;
-}
 
 /** Route `members`: members, roles, leaving and invitations. */
 export function MembersPage() {
@@ -53,10 +49,7 @@ export function MembersPage() {
   const queryClient = useQueryClient();
   const refresh = () =>
     invalidateServices(queryClient, MemberService, OrganizationService);
-  const members = useQuery(MemberService.method.listMembers, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const roster = useMembers(organizationId);
   const updateRole = useMutation(MemberService.method.updateMemberRole, {
     onSuccess: refresh,
   });
@@ -82,16 +75,9 @@ export function MembersPage() {
           ) : undefined
         }
       />
-      {members.isPending ? (
-        <Loading label="Loading members" />
-      ) : members.error ? (
-        <ErrorNotice
-          error={members.error}
-          onRetry={() => void members.refetch()}
-        />
-      ) : (
+      <MemberListStatus roster={roster}>
         <ul className="list" aria-label="Members">
-          {members.data.members.map((m) => {
+          {roster.members.map((m) => {
             const manageable = canManageMember(role, userId, m);
             return (
               <li key={m.userId} className="list-row">
@@ -145,7 +131,7 @@ export function MembersPage() {
             );
           })}
         </ul>
-      )}
+      </MemberListStatus>
       {can(role, Permission.ManageInvitations) ? <Invitations /> : null}
       <ConfirmDialog
         open={removing !== undefined}
@@ -214,9 +200,6 @@ function Invitations() {
   const [creating, setCreating] = useState(false);
   const [inviteRole, setInviteRole] = useState(String(Role.MEMBER));
   const [link, setLink] = useState<string>();
-  const pending =
-    list.data?.invitations.filter((i) => i.state === InvitationState.PENDING) ??
-    [];
 
   return (
     <section className="section" aria-labelledby="invitations-title">
@@ -229,46 +212,49 @@ function Invitations() {
           Invite someone
         </Button>
       </div>
-      {list.isPending ? (
-        <Loading label="Loading invitations" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : pending.length === 0 ? (
-        <Empty title="No pending invitations" />
-      ) : (
-        <ul className="list" aria-label="Pending invitations">
-          {pending.map((i) => (
-            <li key={i.invitationId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">
-                  {labels.role[i.role]} invitation{" "}
-                  <code>{i.secretPrefix}…</code>
-                </span>
-                <span className="muted">
-                  Expires {formatTime(i.expireTime)}
-                </span>
-              </div>
-              <Button
-                variant={ButtonVariant.Secondary}
-                size={ButtonSize.Small}
-                onClick={async () => {
-                  try {
-                    await revoke.mutateAsync({
-                      organizationId,
-                      invitationId: i.invitationId,
-                    });
-                    toast.success("The invitation is revoked.");
-                  } catch (error) {
-                    toastError(error);
-                  }
-                }}
-              >
-                Revoke
-              </Button>
-            </li>
-          ))}
-        </ul>
-      )}
+      <QueryBoundary query={list} loading="Loading invitations">
+        {(data) => {
+          const pending = data.invitations.filter(
+            (i) => i.state === InvitationState.PENDING,
+          );
+          return pending.length === 0 ? (
+            <Empty title="No pending invitations" />
+          ) : (
+            <ul className="list" aria-label="Pending invitations">
+              {pending.map((i) => (
+                <li key={i.invitationId} className="list-row">
+                  <div className="list-main">
+                    <span className="list-title">
+                      {labels.role[i.role]} invitation{" "}
+                      <code>{i.secretPrefix}…</code>
+                    </span>
+                    <span className="muted">
+                      Expires {formatTime(i.expireTime)}
+                    </span>
+                  </div>
+                  <Button
+                    variant={ButtonVariant.Secondary}
+                    size={ButtonSize.Small}
+                    onClick={async () => {
+                      try {
+                        await revoke.mutateAsync({
+                          organizationId,
+                          invitationId: i.invitationId,
+                        });
+                        toast.success("The invitation is revoked.");
+                      } catch (error) {
+                        toastError(error);
+                      }
+                    }}
+                  >
+                    Revoke
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          );
+        }}
+      </QueryBoundary>
       <FormDialog
         open={creating}
         onOpenChange={setCreating}

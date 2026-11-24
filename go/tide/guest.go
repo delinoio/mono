@@ -30,20 +30,25 @@ import (
 
 // Environment variable names of the guest commands.
 const (
-	guestEnvLock         = "TIDE_SYNC_LOCK"
-	guestEnvForce        = "TIDE_SYNC_FORCE"
-	guestEnvWorkspace    = "TIDE_SYNC_WORKSPACE"
-	guestEnvArchive      = "TIDE_SYNC_ARCHIVE"
-	guestEnvDeletes      = "TIDE_SYNC_DELETE_LIST"
-	guestEnvReplaceFiles = "TIDE_SYNC_REPLACE_FILE_LIST"
-	guestEnvPrunes       = "TIDE_SYNC_PRUNE_LIST"
-	guestEnvLinks        = "TIDE_SYNC_LINK_LIST"
-	guestEnvPath         = "TIDE_DOWNLOAD_PATH"
-	guestEnvDLArchive    = "TIDE_DOWNLOAD_ARCHIVE"
+	guestEnvLock          = "TIDE_SYNC_LOCK"
+	guestEnvForce         = "TIDE_SYNC_FORCE"
+	guestEnvWorkspace     = "TIDE_SYNC_WORKSPACE"
+	guestEnvStaleManifest = "TIDE_SYNC_STALE_MANIFEST"
+	guestEnvArchive       = "TIDE_SYNC_ARCHIVE"
+	guestEnvDeletes       = "TIDE_SYNC_DELETE_LIST"
+	guestEnvReplaceFiles  = "TIDE_SYNC_REPLACE_FILE_LIST"
+	guestEnvPrunes        = "TIDE_SYNC_PRUNE_LIST"
+	guestEnvAliasPrunes   = "TIDE_SYNC_PRUNE_ALIAS_LIST"
+	guestEnvLinks         = "TIDE_SYNC_LINK_LIST"
+	guestEnvPath          = "TIDE_DOWNLOAD_PATH"
+	guestEnvDLArchive     = "TIDE_DOWNLOAD_ARCHIVE"
 )
 
 // exitLocked is the exit code of the lock command when the lock exists.
 const exitLocked = 75
+
+// exitWorkspaceMissing means the lock was acquired but the workspace is missing.
+const exitWorkspaceMissing = 76
 
 // exitNotFound is the exit code of the download probe for a missing path.
 const exitNotFound = 66
@@ -55,10 +60,14 @@ const linkFailedPrefix = "TIDE-LINK-FAILED "
 // posixScripts are the sh scripts of Linux and macOS guests.
 var posixScripts = map[guestOp]string{
 	opLock: `if [ "$TIDE_SYNC_FORCE" = 1 ]; then rm -rf "$TIDE_SYNC_LOCK" || exit 1; fi
-if mkdir "$TIDE_SYNC_LOCK"; then exit 0; fi
+if mkdir "$TIDE_SYNC_LOCK"; then
+  if [ -d "$TIDE_SYNC_WORKSPACE" ]; then exit 0; fi
+  exit 76
+fi
 if [ -e "$TIDE_SYNC_LOCK" ]; then exit 75; fi
 exit 1`,
 	opApply: `set -e
+if [ -n "$TIDE_SYNC_STALE_MANIFEST" ]; then rm -f "$TIDE_SYNC_STALE_MANIFEST"; fi
 mkdir -p "$TIDE_SYNC_WORKSPACE"
 cd "$TIDE_SYNC_WORKSPACE"
 if [ -n "$TIDE_SYNC_DELETE_LIST" ]; then xargs -0 rm -f -- < "$TIDE_SYNC_DELETE_LIST"; fi
@@ -69,9 +78,18 @@ if [ -n "$TIDE_SYNC_REPLACE_FILE_LIST" ]; then
   done' tide < "$TIDE_SYNC_REPLACE_FILE_LIST"
 fi
 if [ -n "$TIDE_SYNC_PRUNE_LIST" ]; then xargs -0 sh -c 'for d do if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir -- "$d" || exit 1; fi; done' tide < "$TIDE_SYNC_PRUNE_LIST"; fi
+if [ -n "$TIDE_SYNC_PRUNE_ALIAS_LIST" ]; then
+  # With -0 and -x, Apple xargs passes one path per invocation even with -n 3.
+  xargs -0 -n 3 sh -c '
+    [ "$#" -eq 3 ] || exit 255
+    old=$1 incoming=$2 d=$3
+    if [ ! -L "$old" ] && [ ! -L "$incoming" ] && [ -d "$old" ] && [ "$old" -ef "$incoming" ]; then
+      if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir -- "$d" || exit 255; fi
+    fi' tide < "$TIDE_SYNC_PRUNE_ALIAS_LIST"
+fi
 if [ -n "$TIDE_SYNC_ARCHIVE" ]; then tar -x -m -o -f "$TIDE_SYNC_ARCHIVE"; fi`,
 	opCleanup: `status=0
-for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_REPLACE_FILE_LIST" "$TIDE_SYNC_PRUNE_LIST"; do
+for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_REPLACE_FILE_LIST" "$TIDE_SYNC_PRUNE_LIST" "$TIDE_SYNC_PRUNE_ALIAS_LIST"; do
   if [ -n "$f" ]; then rm -f "$f" || status=1; fi
 done
 if [ -n "$TIDE_SYNC_LOCK" ]; then rm -rf "$TIDE_SYNC_LOCK" || status=1; fi
@@ -93,17 +111,22 @@ var windowsScripts = map[guestOp]string{
 	// cmd.exe mkdir calls CreateDirectoryW, which fails when the directory
 	// exists, so the check and the creation are one step. The
 	// %TIDE_SYNC_LOCK% reference is expanded by cmd.exe inside quotes.
+	// Disable command extensions so mkdir cannot create missing parents.
 	opLock: `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $l = $env:TIDE_SYNC_LOCK
 if ($env:TIDE_SYNC_FORCE -eq '1' -and (Test-Path -LiteralPath $l)) { Remove-Item -LiteralPath $l -Recurse -Force }
-& cmd.exe /d /c 'mkdir "%TIDE_SYNC_LOCK%" 2>nul'
-if ($LASTEXITCODE -eq 0) { exit 0 }
+& cmd.exe /d /e:off /c 'mkdir "%TIDE_SYNC_LOCK%" 2>nul'
+if ($LASTEXITCODE -eq 0) {
+  if (Test-Path -LiteralPath $env:TIDE_SYNC_WORKSPACE -PathType Container) { exit 0 }
+  exit 76
+}
 if (Test-Path -LiteralPath $l) { exit 75 }
 exit 1`,
 	opApply: `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $ws = $env:TIDE_SYNC_WORKSPACE
+if ($env:TIDE_SYNC_STALE_MANIFEST) { [System.IO.File]::Delete($env:TIDE_SYNC_STALE_MANIFEST) }
 [System.IO.Directory]::CreateDirectory($ws) | Out-Null
 if ($env:TIDE_SYNC_DELETE_LIST) {
   foreach ($p in [System.IO.File]::ReadAllLines($env:TIDE_SYNC_DELETE_LIST, [System.Text.Encoding]::UTF8)) {
@@ -297,6 +320,20 @@ func (s *linkFailureScan) end() {
 	s.line, s.long = s.line[:0], false
 }
 
+// guestRoot returns a working directory that is independent of the workspace.
+func guestRoot(s *tidev1.DevSession) string {
+	switch s.GetGuestOs() {
+	case tidev1.GuestOs_GUEST_OS_LINUX, tidev1.GuestOs_GUEST_OS_MACOS:
+		return "/"
+	case tidev1.GuestOs_GUEST_OS_WINDOWS:
+		p := s.GetWorkspacePath()
+		if len(p) >= 3 && isASCIILetter(p[0]) && p[1:3] == `:\` {
+			return p[:3]
+		}
+	}
+	return ""
+}
+
 // runGuest runs one guest command through Exec and captures its output. A
 // command that cannot start, that a signal ends or whose sandbox ends is an
 // error.
@@ -312,10 +349,11 @@ func (c *Client) runGuest(ctx context.Context, s *tidev1.DevSession, op guestOp,
 	var out, errb bytes.Buffer
 	var scan linkFailureScan
 	res, err := c.Exec(ctx, ExecParams{
-		OrganizationID: s.GetOrganizationId(),
-		DevSessionID:   s.GetDevSessionId(),
-		Command:        cmd,
-		Env:            env,
+		OrganizationID:   s.GetOrganizationId(),
+		DevSessionID:     s.GetDevSessionId(),
+		Command:          cmd,
+		WorkingDirectory: guestRoot(s),
+		Env:              env,
 		OnEvent: func(ev ExecEvent) error {
 			switch ev.Kind {
 			case ExecEventStdout:

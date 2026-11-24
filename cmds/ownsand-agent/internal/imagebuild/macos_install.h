@@ -11,4 +11,4 @@ void *ownsandMacOSInstallStart(const char *disk, const char *aux, const char *re
     uintptr_t handle, char **errorMessage);
 void ownsandMacOSInstallCancel(void *installation);
 double ownsandMacOSInstallFractionCompleted(void *installation);
-void ownsandMacOSInstallClose(void *installation, bool stopVM);
+bool ownsandMacOSInstallClose(void *installation, bool stopVM, int64_t timeoutNanos, char **stopError);

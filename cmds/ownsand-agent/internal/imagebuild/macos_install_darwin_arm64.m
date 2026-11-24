@@ -140,26 +140,74 @@ double ownsandMacOSInstallFractionCompleted(void *value) {
     return 0;
 }
 
-void ownsandMacOSInstallClose(void *value, bool stopVM) {
+API_AVAILABLE(macos(12.0))
+static BOOL installVMTerminated(VZVirtualMachine *vm) {
+    VZVirtualMachineState state = vm.state;
+    return state == VZVirtualMachineStateStopped || state == VZVirtualMachineStateError;
+}
+
+bool ownsandMacOSInstallClose(void *value, bool stopVM, int64_t timeoutNanos, char **stopError) {
     if (@available(macOS 12.0, *)) {
-        // Keep the VM and installer alive through the optional stop callback.
         __attribute__((objc_precise_lifetime))
         OwnSandMacOSInstallation *installation = (__bridge_transfer OwnSandMacOSInstallation *)value;
-        dispatch_semaphore_t stopped = dispatch_semaphore_create(0);
-        __block BOOL stopping = NO;
-        // Fence the completion callback before releasing the installer.
-        dispatch_sync(installation.queue, ^{
+        if (!stopVM) {
+            // Fence the install completion callback before releasing the installer.
+            dispatch_sync(installation.queue, ^{});
+            return true;
+        }
+
+        dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, timeoutNanos);
+        dispatch_semaphore_t completed = dispatch_semaphore_create(0);
+        dispatch_source_t observer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, installation.queue);
+        __block NSError *failure = nil;
+        // The stop request, callback and state checks run on the install queue.
+        void (^finish)(NSError *) = ^(NSError *error) {
+            if (!dispatch_source_testcancel(observer)) {
+                failure = error;
+                dispatch_source_cancel(observer);
+                dispatch_semaphore_signal(completed);
+            }
+        };
+        dispatch_source_set_timer(observer, DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC, 0);
+        dispatch_source_set_event_handler(observer, ^{
+            if (installVMTerminated(installation.installer.virtualMachine)) {
+                finish(nil);
+            }
+        });
+        dispatch_activate(observer);
+        dispatch_async(installation.queue, ^{
+            // This runs after the install completion callback has returned.
+            if (dispatch_source_testcancel(observer)) {
+                return;
+            }
             VZVirtualMachine *vm = installation.installer.virtualMachine;
-            if (stopVM && installation.completed && vm.canStop) {
-                stopping = YES;
-                [vm stopWithCompletionHandler:^(NSError *unusedError) {
-                    dispatch_semaphore_signal(stopped);
+            if (installVMTerminated(vm)) {
+                finish(nil);
+                return;
+            }
+            if (vm.canStop && !dispatch_source_testcancel(observer)) {
+                [vm stopWithCompletionHandler:^(NSError *error) {
+                    // Keep the installer and VM alive through this callback,
+                    // including when the caller has already timed out.
+                    if (installVMTerminated(installation.installer.virtualMachine)) {
+                        finish(nil);
+                    } else if (error != nil) {
+                        finish(error);
+                    }
                 }];
             }
         });
-        if (stopping) {
-            dispatch_semaphore_wait(stopped, DISPATCH_TIME_FOREVER);
-            dispatch_sync(installation.queue, ^{});
+        if (dispatch_semaphore_wait(completed, deadline) != 0) {
+            dispatch_source_cancel(observer);
+            return false;
         }
+        if (failure != nil) {
+            @autoreleasepool {
+                *stopError = strdup(failure.description.UTF8String);
+            }
+            return false;
+        }
+        return true;
     }
+    return false;
 }

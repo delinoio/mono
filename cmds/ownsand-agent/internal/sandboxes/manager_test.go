@@ -2140,6 +2140,74 @@ func TestCreateStopsVMWhenRunningRecordCannotBePublished(t *testing.T) {
 	}
 }
 
+func TestCreateFailureEndRetry(t *testing.T) {
+	const (
+		deleting = ownsandv1.SandboxState_SANDBOX_STATE_DELETING
+		failed   = ownsandv1.SandboxState_SANDBOX_STATE_FAILED
+		reason   = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED
+	)
+	for _, retry := range []string{"restart", "deadline"} {
+		t.Run(retry, func(t *testing.T) {
+			e := newEnv(t)
+			e.m.runningBackoff = time.Millisecond
+			cmd := e.createCmd(1, time.Hour, 2*time.Hour)
+			id := cmd.GetSandboxId()
+			var restore func()
+			e.rt.onCreate = func(vmruntime.Spec) { restore = failRevisions(t, e.st) }
+			e.m.onRunningCommitFailed = func(_ int, willRetry bool) {
+				if !willRetry {
+					restore()
+					e.rt.mu.Lock()
+					e.rt.deleteFails = 1
+					e.rt.mu.Unlock()
+				}
+			}
+			entry, err := e.m.Create(context.Background(), cmd)
+			requireInternal(t, err)
+			if entry != nil {
+				t.Fatalf("create returned entry %v after cleanup failed", entry)
+			}
+			if got := persistedState(t, e.st, id); got != deleting {
+				t.Fatalf("saved state after failed cleanup = %v, want DELETING", got)
+			}
+			e.m.mu.Lock()
+			gotReason, ending := e.m.sandboxes[id].rec.EndReason, e.m.sandboxes[id].ending
+			e.m.mu.Unlock()
+			if gotReason != reason || ending {
+				t.Fatalf("failed cleanup left reason %v and ending %v, want CREATE_FAILED and false", gotReason, ending)
+			}
+
+			var reported *ownsandv1.SandboxStateEntry
+			if retry == "restart" {
+				e.restart()
+				report := e.m.StateReport(1, nil)
+				if len(report.GetSandboxes()) != 1 {
+					t.Fatalf("state report contains %d sandboxes, want 1", len(report.GetSandboxes()))
+				}
+				reported = report.GetSandboxes()[0]
+			} else {
+				e.tickAndWait()
+				if calls := e.rt.deleteCallCount(); calls != 1 {
+					t.Fatalf("runtime Delete called %d times before the deadline, want 1", calls)
+				}
+				e.clk.Advance(3 * time.Hour)
+				e.tickAndWait()
+				reported = e.out.lastEntry(id)
+				e.tickAndWait()
+				if calls := e.ex.endedCalls(id); calls != 1 || e.ex.ended[id] != reason {
+					t.Fatalf("exec tracker received %d notifications with reason %v, want one CREATE_FAILED", calls, e.ex.ended[id])
+				}
+			}
+			if reported.GetSandboxId() != id || reported.GetState() != failed || reported.GetEndReason() != reason {
+				t.Fatalf("reported sandbox after retry = %v, want FAILED / CREATE_FAILED", reported)
+			}
+			if got := persistedState(t, e.st, id); got != failed {
+				t.Fatalf("saved state after retry = %v, want FAILED", got)
+			}
+		})
+	}
+}
+
 // TestCreateKeepsSandboxTrackedWhenTheEndFails checks that, when neither the
 // RUNNING record nor the end of the sandbox can be recorded, the sandbox and
 // its VM stay tracked, and that a delete or a TTL tick ends them later.
