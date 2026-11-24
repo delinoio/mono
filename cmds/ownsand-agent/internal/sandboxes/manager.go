@@ -136,9 +136,8 @@ type Manager struct {
 	// waits for the running snapshot imports and wipes the local data, and
 	// nothing clears it, because the removal notice is final (a failed
 	// removal retries in the same process or after a restart that sets the
-	// fence again). While it is set, BeginSnapshotImport and
-	// AddImportedSnapshot refuse, so that no import creates snapshot
-	// metadata or directories after the wipe. imports counts the imports
+	// fence again). While it is set, fresh creates and snapshot imports
+	// cannot register or write new records. imports counts the imports
 	// that passed BeginSnapshotImport and did not end; importsDrained is
 	// closed (and cleared) when the count reaches zero while a RemoveAll
 	// waits for it.
@@ -629,6 +628,13 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	if entry, err, found := m.existingCreateLocked(id); found {
 		m.mu.Unlock()
 		return entry, err
+	}
+	// Removal sets the fence under m.mu before it takes the inventory.
+	// Hold the lock through registration so removal can find every create
+	// admitted before the fence.
+	if m.removing {
+		m.mu.Unlock()
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "device removal is in progress")
 	}
 	if err := m.checkLimitsLocked(cmd); err != nil {
 		m.mu.Unlock()

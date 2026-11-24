@@ -570,6 +570,47 @@ func TestCreateGateRecheckAfterConcurrentDelete(t *testing.T) {
 	}
 }
 
+func TestCreateGateRecheckAfterRemoval(t *testing.T) {
+	e := newEnv(t)
+	gate := newBlockingGate()
+	e.m.SetCreateGate(gate)
+	release := sync.OnceFunc(func() { close(gate.release) })
+	t.Cleanup(release)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.m.Create(t.Context(), cmd)
+		done <- err
+	}()
+	select {
+	case <-gate.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("create did not reach the gate")
+	}
+	if err := e.m.RemoveAll(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	select {
+	case err := <-done:
+		var ce *CommandError
+		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+			t.Errorf("create after removal: %v, want FAILED_PRECONDITION", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("create did not return")
+	}
+	if n := e.rt.startCount(); n != 0 {
+		t.Errorf("VM starts after removal = %d, want 0", n)
+	}
+	if entries := e.m.Entries(); len(entries) != 0 {
+		t.Errorf("sandboxes registered after removal: %v", entries)
+	}
+	if _, err := os.Stat(e.st.Path(store.SandboxesDir, cmd.GetSandboxId()+".json")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("sandbox record after removal: %v, want absent", err)
+	}
+}
+
 func TestCreateGateRecheckDuplicateCreateStartsOnce(t *testing.T) {
 	e := newEnv(t)
 	gate := newBlockingGate()
@@ -1250,6 +1291,71 @@ func TestRemoveAllRetriesFailedDeletion(t *testing.T) {
 	}
 	if e.rt.deleteCalls != 3 {
 		t.Fatalf("Delete calls after a complete clean-up = %d, want 3", e.rt.deleteCalls)
+	}
+}
+
+func TestRemoveAllCancelsCreateAndRetriesFailedDeletion(t *testing.T) {
+	e := newEnv(t)
+	e.rt.block = make(chan struct{})
+	e.rt.deleteFails = 1
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	created := make(chan error, 1)
+	go func() {
+		_, err := e.m.Create(t.Context(), cmd)
+		created <- err
+	}()
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_CREATING)
+
+	removed := make(chan error, 1)
+	go func() { removed <- e.m.RemoveAll(t.Context()) }()
+	select {
+	case err := <-created:
+		if err == nil {
+			t.Fatal("canceled create succeeded")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("removal did not cancel the create")
+	}
+	select {
+	case err := <-removed:
+		if err == nil {
+			t.Fatal("removal succeeded despite the delete failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("removal did not return")
+	}
+	if entries := e.m.Entries(); len(entries) != 1 || entries[0].GetSandboxId() != id {
+		t.Fatalf("sandboxes after the delete failure: %v, want %s", entries, id)
+	}
+	record := e.st.Path(store.SandboxesDir, id+".json")
+	if _, err := os.Stat(record); err != nil {
+		t.Fatalf("sandbox record after the delete failure: %v", err)
+	}
+
+	// A regression must return from Create even if it bypasses the fence.
+	close(e.rt.block)
+	requireCreateRefused := func() {
+		t.Helper()
+		_, err := e.m.Create(t.Context(), e.createCmd(1, time.Hour, time.Hour))
+		var ce *CommandError
+		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+			t.Fatalf("fresh create after removal: %v, want FAILED_PRECONDITION", err)
+		}
+	}
+	requireCreateRefused()
+	if err := e.m.RemoveAll(t.Context()); err != nil {
+		t.Fatalf("removal retry failed: %v", err)
+	}
+	requireCreateRefused()
+	if entries := e.m.Entries(); len(entries) != 0 {
+		t.Errorf("sandboxes after the retry: %v", entries)
+	}
+	if _, err := os.Stat(record); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("sandbox record after the retry: %v, want absent", err)
+	}
+	if calls := e.rt.deleteCallCount(); calls != 2 {
+		t.Errorf("runtime Delete calls = %d, want 2", calls)
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -42,6 +43,7 @@ import (
 	"github.com/delinoio/mono/go/uuidv7"
 	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
 
 var guestBinary string
@@ -432,6 +434,121 @@ func TestRemovalNoticeAtAuthenticate(t *testing.T) {
 		t.Fatal("removal not confirmed")
 	}
 	requireEmptyStateDir(t, st)
+}
+
+// createAdmissionGate holds a create before the manager can register it.
+type createAdmissionGate struct {
+	entered, resume, finished chan struct{}
+}
+
+func (g createAdmissionGate) BeginCreate() (func(), error) {
+	close(g.entered)
+	<-g.resume
+	return func() { close(g.finished) }, nil
+}
+
+// confirmRemovalGate holds the removal RPC before the control plane accepts it.
+type confirmRemovalGate struct {
+	ownsandv1connect.AgentServiceClient
+	entered, resume chan struct{}
+	once            sync.Once
+}
+
+func (g *confirmRemovalGate) ConfirmRemoval(ctx context.Context, req *connect.Request[ownsandv1.ConfirmRemovalRequest]) (*connect.Response[ownsandv1.ConfirmRemovalResponse], error) {
+	g.once.Do(func() { close(g.entered) })
+	select {
+	case <-g.resume:
+		return g.AgentServiceClient.ConfirmRemoval(ctx, req)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestDeviceRemovalFencesDispatchedCreate(t *testing.T) {
+	for _, name := range []string{"cleanup-command", "authenticate-notice"} {
+		t.Run(name, func(t *testing.T) {
+			cp := testcp.New(t)
+			st, id := enrollDevice(t, cp)
+			confirm := confirmRemovalGate{entered: make(chan struct{}), resume: make(chan struct{})}
+			h := startWith(t, cp, st, id, func(o *Options) {
+				confirm.AgentServiceClient = o.Control.Agent
+				o.Control.Agent = &confirm
+			})
+			h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+			admittedID, _ := uuidv7.NewString()
+			if res := h.command(createCommand(admittedID)); res.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+				t.Fatalf("create before removal: %v", res)
+			}
+
+			gate := createAdmissionGate{entered: make(chan struct{}), resume: make(chan struct{}), finished: make(chan struct{})}
+			h.agent.Sandboxes.SetCreateGate(gate)
+			resumeCreate := sync.OnceFunc(func() { close(gate.resume) })
+			t.Cleanup(resumeCreate)
+			lateID, _ := uuidv7.NewString()
+			cmd := createCommand(lateID)
+			cmd.CommandId, _ = uuidv7.NewString()
+			if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}) {
+				t.Fatal("could not send the late create")
+			}
+			select {
+			case <-gate.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("late create did not reach the gate")
+			}
+
+			cp.MarkRemoved(id.DeviceID)
+			if name == "cleanup-command" {
+				cmdID, _ := uuidv7.NewString()
+				cmd := &ownsandv1.AgentCommand{CommandId: cmdID, Command: &ownsandv1.AgentCommand_CleanUp{CleanUp: &ownsandv1.CleanUpCommand{}}}
+				if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}) {
+					t.Fatal("could not send the clean-up command")
+				}
+			} else {
+				cp.Current().Close()
+			}
+			select {
+			case <-confirm.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("agent did not reach removal confirmation")
+			}
+			if state, err := st.LoadAgent(); err != nil || !state.Removal.CleanupDone {
+				t.Fatalf("clean-up was not recorded before confirmation: %+v, %v", state, err)
+			}
+
+			resumeCreate()
+			select {
+			case <-gate.finished:
+			case <-time.After(10 * time.Second):
+				t.Fatal("late create did not finish")
+			}
+			if entries := h.agent.Sandboxes.Entries(); len(entries) != 0 {
+				t.Errorf("sandboxes at removal confirmation: %v, want none", entries)
+			}
+			if running, err := h.agent.rt.Running(t.Context()); err != nil || len(running) != 0 {
+				t.Errorf("running sandboxes at removal confirmation: %v, %v", running, err)
+			}
+			for _, sandboxID := range []string{admittedID, lateID} {
+				if _, err := os.Stat(st.Path(store.SandboxesDir, sandboxID+".json")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("sandbox %s record at removal confirmation: %v, want absent", sandboxID, err)
+				}
+			}
+
+			close(confirm.resume)
+			select {
+			case err := <-h.errc:
+				h.errc <- err
+				if !errors.Is(err, ErrRemoved) {
+					t.Fatalf("run returned %v, want ErrRemoved", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("agent did not finish removal")
+			}
+			if cp.Confirms() != 1 {
+				t.Fatal("removal was not confirmed")
+			}
+			requireEmptyStateDir(t, st)
+		})
+	}
 }
 
 // hostCleanerRuntime is a runtime with host resources outside the state
