@@ -438,6 +438,8 @@ describe("invitations", () => {
     await expect(screen.getByRole("navigation", "Organization")).toContainText(
       "Contoso",
     );
+    await screen.getByRole("combobox", "Organization").tap();
+    await expect(screen.getByRole("option", "Contoso")).toBeVisible();
   });
 });
 
