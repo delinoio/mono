@@ -44,9 +44,9 @@ type DownloadResult struct {
 	LocalPath string `json:"local_path"`
 	// Directory is true when the guest path is a directory.
 	Directory bool `json:"directory"`
-	// Files counts the regular files and symbolic links written.
+	// Files counts the regular files, symbolic links and hard links written.
 	Files int `json:"files"`
-	// Bytes counts the bytes of the regular files written.
+	// Bytes counts the regular-file bytes written, including hard-link fallback copies.
 	Bytes int64 `json:"bytes"`
 	// Warnings reports issues that did not prevent installation, including
 	// skipped archive entries and failures to remove the previous destination.
@@ -65,6 +65,10 @@ type DownloadResult struct {
 // written to a temporary location next to LocalPath and moved into place
 // only after the download succeeded.
 func (c *Client) Download(ctx context.Context, p DownloadParams) (*DownloadResult, error) {
+	return c.download(ctx, p, archiveExtractor{fileLimit: DownloadFileLimit, totalLimit: DownloadTotalLimit, link: (*os.Root).Link})
+}
+
+func (c *Client) download(ctx context.Context, p DownloadParams, extractor archiveExtractor) (*DownloadResult, error) {
 	report := func(tp TransferProgress) {
 		if p.Progress != nil {
 			p.Progress(tp)
@@ -156,7 +160,7 @@ func (c *Client) Download(ctx context.Context, p DownloadParams) (*DownloadResul
 			af.Close()
 			return nil, err
 		}
-		st, err := extractArchive(ctx, af, staged, DownloadFileLimit, DownloadTotalLimit)
+		st, err := extractor.extractArchive(ctx, af, staged)
 		af.Close()
 		if err != nil {
 			return nil, wrapLimit(err)

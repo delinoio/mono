@@ -1617,6 +1617,98 @@ func TestDownloadFileAndDirectory(t *testing.T) {
 	}
 }
 
+func TestDownloadHardLinkFallback(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	guest := filepath.Join(ds.GetWorkspacePath(), "out")
+	if err := os.Mkdir(guest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const content = "linked content"
+	const size = int64(len(content))
+	source := filepath.Join(guest, "source")
+	if err := os.WriteFile(source, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"source", "link1", "link2"}
+	for _, name := range names[1:] {
+		if err := os.Link(source, filepath.Join(guest, name)); err != nil {
+			t.Skipf("guest fixture needs hard links: %v", err)
+		}
+	}
+	unavailable := func(*os.Root, string, string) error { return errors.ErrUnsupported }
+	for _, tc := range []struct {
+		name       string
+		extractor  archiveExtractor
+		wantBytes  int64
+		wantLinked bool
+		wantTotal  int64
+	}{
+		{name: "hard link", wantBytes: size, wantLinked: true},
+		{name: "fallback at limit", extractor: archiveExtractor{fileLimit: size, totalLimit: 3 * size, link: unavailable}, wantBytes: 3 * size},
+		{name: "fallback over limit", extractor: archiveExtractor{fileLimit: size, totalLimit: 2 * size, link: unavailable}, wantTotal: 3 * size},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			dest := filepath.Join(parent, "result")
+			if err := os.Mkdir(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dest, "old"), []byte("previous"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			params := DownloadParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: "out", LocalPath: dest,
+			}
+			download := c.Download
+			if tc.extractor.link != nil {
+				download = func(ctx context.Context, p DownloadParams) (*DownloadResult, error) {
+					return c.download(ctx, p, tc.extractor)
+				}
+			}
+			res, err := download(ctx, params)
+			if entries, err := os.ReadDir(parent); err != nil || len(entries) != 1 || entries[0].Name() != "result" {
+				t.Fatalf("destination parent entries = %v, %v", entries, err)
+			}
+			if tc.wantTotal > 0 {
+				var limit *LimitError
+				if res != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition || !errors.As(err, &limit) || limit.Total != tc.wantTotal {
+					t.Fatalf("over-limit download = %+v, %v", res, err)
+				}
+				if entries, err := os.ReadDir(dest); err != nil || len(entries) != 1 || entries[0].Name() != "old" {
+					t.Fatalf("original destination entries = %v, %v", entries, err)
+				}
+				if b, err := os.ReadFile(filepath.Join(dest, "old")); err != nil || string(b) != "previous" {
+					t.Fatalf("original destination = %q, %v", b, err)
+				}
+				return
+			}
+			if err != nil || res == nil || !res.Directory || res.Files != len(names) || res.Bytes != tc.wantBytes {
+				t.Fatalf("directory download = %+v, %v", res, err)
+			}
+			infos := make([]fs.FileInfo, 0, len(names))
+			for _, name := range names {
+				p := filepath.Join(dest, name)
+				if b, err := os.ReadFile(p); err != nil || string(b) != content {
+					t.Fatalf("%s content = %q, %v", name, b, err)
+				}
+				info, err := os.Stat(p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, previous := range infos {
+					if os.SameFile(previous, info) != tc.wantLinked {
+						t.Errorf("same file (%s, %s) should be %t", previous.Name(), info.Name(), tc.wantLinked)
+					}
+				}
+				infos = append(infos, info)
+			}
+		})
+	}
+}
+
 func TestDownloadBackupCleanup(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
@@ -1933,6 +2025,7 @@ func tarOf(t *testing.T, entries ...*tar.Header) *bytes.Reader {
 
 func TestExtractRejectsPathTraversal(t *testing.T) {
 	ctx := context.Background()
+	extractor := archiveExtractor{fileLimit: 100, totalLimit: 1000, link: (*os.Root).Link}
 	cases := map[string][]*tar.Header{
 		"absolute":        {{Typeflag: tar.TypeReg, Name: "/etc/passwd", Size: 1, Mode: 0o644}},
 		"parent":          {{Typeflag: tar.TypeReg, Name: "../escape", Size: 1, Mode: 0o644}},
@@ -1947,7 +2040,7 @@ func TestExtractRejectsPathTraversal(t *testing.T) {
 		parent := t.TempDir()
 		dir := filepath.Join(parent, "dest")
 		_ = os.Mkdir(dir, 0o755)
-		if _, err := extractArchive(ctx, tarOf(t, entries...), dir, 100, 1000); err == nil {
+		if _, err := extractor.extractArchive(ctx, tarOf(t, entries...), dir); err == nil {
 			t.Errorf("%s: extraction accepted the archive", name)
 		}
 		if _, err := os.Stat(filepath.Join(parent, "escape")); err == nil {
@@ -1976,29 +2069,29 @@ func TestExtractRejectsPathTraversal(t *testing.T) {
 	} {
 		dir := filepath.Join(t.TempDir(), "dest")
 		_ = os.Mkdir(dir, 0o755)
-		if _, err := extractArchive(ctx, tarOf(t, entries...), dir, 100, 1000); err == nil || !strings.Contains(err.Error(), "resolves outside") {
+		if _, err := extractor.extractArchive(ctx, tarOf(t, entries...), dir); err == nil || !strings.Contains(err.Error(), "resolves outside") {
 			t.Errorf("%s: extraction = %v", name, err)
 		}
 	}
 	// Chained links that stay inside are kept.
 	inside := t.TempDir()
-	if _, err := extractArchive(ctx, tarOf(t,
+	if _, err := extractor.extractArchive(ctx, tarOf(t,
 		&tar.Header{Typeflag: tar.TypeReg, Name: "d/e/f", Size: 1, Mode: 0o644},
 		&tar.Header{Typeflag: tar.TypeSymlink, Name: "l1", Linkname: "d/e"},
 		&tar.Header{Typeflag: tar.TypeSymlink, Name: "l2", Linkname: "l1/../e/f"},
 		&tar.Header{Typeflag: tar.TypeSymlink, Name: "dangling", Linkname: "l1/missing/x"},
-	), inside, 100, 1000); err != nil {
+	), inside); err != nil {
 		t.Fatalf("links inside: %v", err)
 	}
 
 	dir := t.TempDir()
-	st, err := extractArchive(ctx, tarOf(t,
+	st, err := extractor.extractArchive(ctx, tarOf(t,
 		&tar.Header{Typeflag: tar.TypeDir, Name: "./", Mode: 0o755},
 		&tar.Header{Typeflag: tar.TypeReg, Name: "./a/f", Size: 3, Mode: 0o644},
 		&tar.Header{Typeflag: tar.TypeLink, Name: "./a/g", Linkname: "./a/f"},
 		&tar.Header{Typeflag: tar.TypeSymlink, Name: "./a/l", Linkname: "f"},
 		&tar.Header{Typeflag: tar.TypeFifo, Name: "./fifo"},
-	), dir, 100, 1000)
+	), dir)
 	if err != nil || st.files != 3 || len(st.warnings) != 1 {
 		t.Fatalf("valid archive: %+v %v", st, err)
 	}
@@ -2007,15 +2100,59 @@ func TestExtractRejectsPathTraversal(t *testing.T) {
 	}
 
 	// Entry limits are checked during extraction.
+	extractor.fileLimit, extractor.totalLimit = 10, 15
 	var le *LimitError
-	if _, err := extractArchive(ctx, tarOf(t, &tar.Header{Typeflag: tar.TypeReg, Name: "big", Size: 11, Mode: 0o644}), t.TempDir(), 10, 100); !errors.As(err, &le) {
+	if _, err := extractor.extractArchive(ctx, tarOf(t, &tar.Header{Typeflag: tar.TypeReg, Name: "big", Size: 11, Mode: 0o644}), t.TempDir()); !errors.As(err, &le) {
 		t.Fatalf("file limit: %v", err)
 	}
-	if _, err := extractArchive(ctx, tarOf(t,
+	if _, err := extractor.extractArchive(ctx, tarOf(t,
 		&tar.Header{Typeflag: tar.TypeReg, Name: "a", Size: 8, Mode: 0o644},
 		&tar.Header{Typeflag: tar.TypeReg, Name: "b", Size: 8, Mode: 0o644},
-	), t.TempDir(), 10, 15); !errors.As(err, &le) || le.Total != 16 {
+	), t.TempDir()); !errors.As(err, &le) || le.Total != 16 {
 		t.Fatalf("total limit: %v", err)
+	}
+}
+
+func TestExtractHardLinkLimits(t *testing.T) {
+	extractor := archiveExtractor{fileLimit: 8, totalLimit: 12}
+	st := &extractStats{bytes: 4}
+	called := false
+	write := func() error {
+		called = true
+		return nil
+	}
+	var limit *LimitError
+	err := extractor.writeFile(st, "copy", 9, write)
+	if !errors.As(err, &limit) || !slices.Equal(limit.Paths, []PathSize{{Path: "copy", Size: 9}}) || called || st.bytes != 4 {
+		t.Fatalf("per-file limit: error = %v, writer called = %t, bytes = %d", err, called, st.bytes)
+	}
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := root.WriteFile("source", []byte("too large"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err = extractor.copyFile(root, st, "source", "copy")
+	if !errors.As(err, &limit) || !slices.Equal(limit.Paths, []PathSize{{Path: "copy", Size: 9}}) || st.bytes != 4 {
+		t.Fatalf("fallback per-file limit: error = %v, bytes = %d", err, st.bytes)
+	}
+	if _, err := root.Stat("copy"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("rejected copy exists: stat error = %v", err)
+	}
+	err = extractor.writeFile(st, "copy", 8, func() error { return fs.ErrPermission })
+	if !errors.Is(err, fs.ErrPermission) || st.bytes != 4 {
+		t.Fatalf("write failure: error = %v, bytes = %d", err, st.bytes)
+	}
+	err = extractor.writeFile(st, "copy", 8, write)
+	if err != nil || !called || st.bytes != 12 {
+		t.Fatalf("exact limit: error = %v, writer called = %t, bytes = %d", err, called, st.bytes)
+	}
+	called = false
+	err = extractor.writeFile(st, "next-copy", 1, write)
+	if !errors.As(err, &limit) || limit.Total != 13 || called || st.bytes != 12 {
+		t.Fatalf("total limit: error = %v, writer called = %t, bytes = %d", err, called, st.bytes)
 	}
 }
 
