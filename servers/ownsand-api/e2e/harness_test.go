@@ -415,8 +415,7 @@ func launchProcess(logs *logSink, name string, env []string, bin string, args ..
 	return p, nil
 }
 
-// startProcess starts a child process that is stopped with SIGTERM when the
-// test ends.
+// startProcess starts a child process and stops it when the test ends.
 func startProcess(t *testing.T, logs *logSink, name string, env []string, bin string, args ...string) *proc {
 	t.Helper()
 	p, err := launchProcess(logs, name, env, bin, args...)
@@ -424,6 +423,11 @@ func startProcess(t *testing.T, logs *logSink, name string, env []string, bin st
 		t.Fatalf("start %s: %v", name, err)
 	}
 	t.Cleanup(func() {
+		// Go cannot deliver SIGTERM to a child on Windows.
+		if runtime.GOOS == "windows" {
+			killProcess(t, p)
+			return
+		}
 		_ = p.cmd.Process.Signal(syscall.SIGTERM)
 		select {
 		case <-p.done:
