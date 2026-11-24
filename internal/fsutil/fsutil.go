@@ -199,9 +199,18 @@ func makeDirsWritable(path string) {
 
 // TreeSize returns the total size of the regular files under dir.
 func TreeSize(dir string) (int64, error) {
+	return TreeSizeContext(context.Background(), dir)
+}
+
+// TreeSizeContext returns the size of the regular files under dir and checks
+// for cancellation before visiting each entry.
+func TreeSizeContext(ctx context.Context, dir string) (int64, error) {
 	var total int64
 	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if d.Type().IsRegular() {

@@ -7,12 +7,18 @@ import {
   render,
   screen,
 } from "@testing-library/react";
-import { Code, ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
+import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { pendingInvitation } from "./invitation.ts";
-import { MOCK_INVITATION_SECRET, MOCK_USER } from "./mock/mock-api.ts";
+import {
+  createMockTransport,
+  MOCK_IDS,
+  MOCK_INVITATION_SECRET,
+  MOCK_USER,
+} from "./mock/mock-api.ts";
 import {
   holdingTransport,
   renderConsole,
@@ -171,6 +177,99 @@ describe("a stale invitation acceptance", () => {
     expect(invalidations).toBe(2);
     expect(window.location.pathname).toBe("/invitations/accept");
   });
+});
+
+describe("opening another invitation while acceptance is pending", () => {
+  test.each([
+    ["succeeds", undefined],
+    ["fails", new ConnectError("down", Code.Unavailable)],
+  ] as const)(
+    "accepts the new link while the earlier request later %s",
+    async (_, error) => {
+      const firstSecret = "osi_earlier";
+      const mock = createMockTransport();
+      const earlierAcceptance = createRouterTransport((router) => {
+        router.rpc(MemberService.method.acceptInvitation, () => ({
+          organization: { organizationId: MOCK_IDS.acme },
+        }));
+      });
+      const held = holdingTransport(["AcceptInvitation"], undefined, {
+        ...mock,
+        unary(method, ...args) {
+          const input = args[3] as { invitationSecret?: string };
+          if (
+            method.name === "AcceptInvitation" &&
+            input.invitationSecret === firstSecret
+          ) {
+            return earlierAcceptance.unary(method, ...args);
+          }
+          return mock.unary(method, ...args);
+        },
+      });
+      renderConsole(`/invitations/accept#secret=${firstSecret}`, {
+        transport: held.transport,
+      });
+      const acceptButton = () =>
+        screen.getByRole("button", { name: "Accept invitation" });
+      const openCurrentLink = async () => {
+        await act(async () => {
+          window.history.replaceState(
+            null,
+            "",
+            `#secret=${MOCK_INVITATION_SECRET}`,
+          );
+          window.dispatchEvent(new HashChangeEvent("hashchange"));
+        });
+        expect(window.location.hash).toBe("");
+      };
+
+      await act(async () => {
+        fireEvent.click(acceptButton());
+      });
+      expect(acceptButton().hasAttribute("data-pending")).toBe(true);
+
+      await openCurrentLink();
+      expect(acceptButton().hasAttribute("data-pending")).toBe(false);
+      await act(async () => {
+        fireEvent.click(acceptButton());
+        fireEvent.click(acceptButton());
+      });
+      expect(acceptButton().hasAttribute("data-pending")).toBe(true);
+
+      pendingInvitation.save(MOCK_INVITATION_SECRET);
+      await openCurrentLink();
+      expect(acceptButton().hasAttribute("data-pending")).toBe(true);
+      await act(async () => {
+        fireEvent.click(acceptButton());
+      });
+
+      const calls = held.calls.AcceptInvitation;
+      expect(
+        calls.map(
+          ({ input }) =>
+            (input as { invitationSecret: string }).invitationSecret,
+        ),
+      ).toEqual([firstSecret, MOCK_INVITATION_SECRET]);
+
+      await act(async () => {
+        calls[0].settle(error);
+      });
+      await settle(60);
+      expect(window.location.pathname).toBe("/invitations/accept");
+      expect(screen.queryByText(/not available right now/)).toBeNull();
+      expect(acceptButton().hasAttribute("data-pending")).toBe(true);
+      expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
+
+      await act(async () => {
+        calls[1].settle();
+      });
+      await settle(60);
+      expect(window.location.pathname).toBe(
+        `/orgs/${MOCK_IDS.contoso}/sandboxes`,
+      );
+      expect(pendingInvitation.read()).toBeUndefined();
+    },
+  );
 });
 
 describe("the current invitation acceptance", () => {

@@ -376,8 +376,10 @@ sign_macos() {
       fi
       codesign "${args[@]}" "$target" < /dev/null
       codesign --verify --strict --verbose=2 "$target" < /dev/null
-      if [[ -n "$entitlements" ]] && ! codesign --display --entitlements - --xml "$target" < /dev/null 2> /dev/null | grep -q 'com.apple.security.virtualization'; then
-        echo "::error::$asset has no com.apple.security.virtualization entitlement after signing." >&2
+      if [[ -n "$entitlements" ]] && ! codesign --display --entitlements - --xml "$target" < /dev/null 2> /dev/null \
+        | plutil -convert json -o - -- - 2> /dev/null \
+        | jq -e 'objects | .["com.apple.security.virtualization"] == true' > /dev/null; then
+        echo "::error::Cannot confirm an enabled com.apple.security.virtualization entitlement for $asset after signing." >&2
         exit 1
       fi
       # notarytool accepts a zip, a disk image or a package, not a bare

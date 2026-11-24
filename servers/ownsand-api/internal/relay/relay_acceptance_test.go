@@ -27,7 +27,7 @@ func writeAcceptanceRequest(t *testing.T, s *Stream, send func(*ownsandv1.DataFr
 
 func TestAcceptanceDeadlineStartsAtSendCompletion(t *testing.T) {
 	clock := newStepClock()
-	s := openStream(t, newConnWithClock(context.Background(), "device", 1, testLimits, clock))
+	s := openStream(t, NewConnWithClock(context.Background(), "device", 1, testLimits, clock))
 	written := writeAcceptanceRequest(t, s, func(*ownsandv1.DataFrame) error {
 		clock.advance(time.Minute)
 		if s.AcceptanceExpired() {
@@ -69,11 +69,11 @@ func TestAcceptanceDeadlineUsesReceiptOrder(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			clock := newStepClock()
-			c := newConnWithClock(ctx, "device", 1, testLimits, clock)
+			c := NewConnWithClock(ctx, "device", 1, testLimits, clock)
 			s := openStream(t, c)
 			filler := openStream(t, c)
 			receive := func(at time.Duration, f *ownsandv1.DataFrame) {
-				clock.advance(at - clock.mono())
+				clock.advance(at - clock.Elapsed())
 				if err := c.dispatch(f); err != nil {
 					t.Fatal(err)
 				}

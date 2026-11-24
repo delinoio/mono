@@ -296,13 +296,15 @@ func (c *apiKeyOrganizationConn) Receive(msg any) error {
 	return checkAPIKeyOrganization(c.organization, msg)
 }
 
-// page returns one page of items with the protos contract rules: page
-// size 50 by default and at most 200, and an opaque token.
+// page rejects negative sizes and returns one page of items with an opaque token.
+// A size of zero defaults to 50. The maximum size is 200.
 func page[T any](items []T, size int32, token string) ([]T, string, error) {
-	if size <= 0 {
+	switch {
+	case size < 0:
+		return nil, "", connect.NewError(connect.CodeInvalidArgument, errors.New("invalid page_size: must not be negative"))
+	case size == 0:
 		size = 50
-	}
-	if size > 200 {
+	case size > 200:
 		size = 200
 	}
 	start := 0

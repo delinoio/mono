@@ -154,15 +154,20 @@ type Demand struct {
 // normal operation, not a failure.
 var ErrClaimTaken = errors.New("another worker holds the vendor request")
 
-// latestClaim returns the newest claim of a vendor request of the
-// organization with the state of its request, or nil.
-func (h *Hub) latestClaim(ctx context.Context, q db.Querier, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) (*Claim, *work.Request, error) {
+// latestVendorClaim returns the newest claim of a vendor request, or nil.
+func (h *Hub) latestVendorClaim(ctx context.Context, q db.Querier, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) (*Claim, error) {
 	c, err := scanClaim(q.QueryRow(ctx, `SELECT `+claimColumns+` FROM agent_claims c WHERE c.organization_id = $1 AND c.vendor = $2 AND c.vendor_request_id = $3
 		ORDER BY c.create_time DESC, c.request_id DESC LIMIT 1`, orgID, int16(vendor), vendorRequestID))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil, nil
+		return nil, nil
 	}
-	if err != nil {
+	return c, err
+}
+
+// latestClaim returns the newest claim of a vendor request with its request.
+func (h *Hub) latestClaim(ctx context.Context, q db.Querier, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) (*Claim, *work.Request, error) {
+	c, err := h.latestVendorClaim(ctx, q, orgID, vendor, vendorRequestID)
+	if err != nil || c == nil {
 		return nil, nil, err
 	}
 	req, err := h.engine.GetRequest(ctx, q, orgID, c.RequestID)
@@ -381,17 +386,38 @@ func canceledBeforeStart(req *work.Request) bool {
 	return req.StartTime == nil && req.EndReason == tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER
 }
 
-// lost marks a claim as no longer tide's and ends its request when no
-// runner started for it yet.
-func (h *Hub) lost(ctx context.Context, c *Claim, req *work.Request) error {
-	if err := h.setClaimState(ctx, h.svc.DB.Pool, c.RequestID, ClaimHeld, ClaimReleased); err != nil {
+// lost records that tide no longer holds the claim. Only a request that
+// is still queued under the dispatch lock ends with CANCELED_BY_SOURCE.
+func (h *Hub) lost(ctx context.Context, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) error {
+	unlock := h.lockVendorRequest(orgID, vendor, vendorRequestID)
+	defer unlock()
+
+	var canceled *work.Request
+	err := h.inTx(ctx, func(tx pgx.Tx) error {
+		c, err := h.latestVendorClaim(ctx, tx, orgID, vendor, vendorRequestID)
+		if err != nil || c == nil {
+			return err
+		}
+		req, err := h.engine.LockRequest(ctx, tx, c.RequestID)
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			// Retention can remove the request and claim after the lookup.
+			return nil
+		}
+		if err != nil || work.RequestTerminal(req.State) {
+			return err
+		}
+		if err := h.setClaimState(ctx, tx, req.ID, ClaimHeld, ClaimReleased); err != nil {
+			return err
+		}
+		if req.State != tidev1.RequestState_REQUEST_STATE_QUEUED {
+			return nil
+		}
+		canceled, err = h.engine.EndRequestTx(ctx, tx, req.ID, work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED,
+			Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE})
 		return err
+	})
+	if err == nil && canceled != nil {
+		h.engine.Kick(orgID)
 	}
-	if req.State != tidev1.RequestState_REQUEST_STATE_QUEUED {
-		// A runner starts or serves the request; its program exit ends it.
-		return nil
-	}
-	_, err := h.engine.EndRequest(ctx, c.OrganizationID, c.RequestID, work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED,
-		Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE})
 	return err
 }

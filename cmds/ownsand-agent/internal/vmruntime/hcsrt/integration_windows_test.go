@@ -130,6 +130,11 @@ func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExit
 	return out.String(), exited
 }
 
+func execSucceeded(exited *ownsandv1.ExecExited) bool {
+	code, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
+	return ok && code != nil && code.ExitCode == 0
+}
+
 // hostLANAddress returns an IPv4 address of a host interface that is not
 // loopback or link-local, which the OUTBOUND policy must block.
 func hostLANAddress() string {
@@ -210,6 +215,14 @@ func TestHyperVIntegration(t *testing.T) {
 		rt.Close()
 	})
 	e := &env{t: t, m: m, d: d}
+	checkDiskSize := func(sandboxID string) {
+		t.Helper()
+		out, ex := e.exec(sandboxID, "/bin/cat", "/sys/block/sda/size")
+		sectors, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+		if ex == nil || ex.GetExitCode() != 0 || err != nil || sectors != (2<<30)/512 {
+			t.Fatalf("sandbox %s disk sectors = %q, want %d", sandboxID, out, (2<<30)/512)
+		}
+	}
 
 	start := time.Now()
 	sb := e.create("", 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE)
@@ -217,9 +230,10 @@ func TestHyperVIntegration(t *testing.T) {
 	if sb.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_BASE_IMAGE {
 		t.Fatalf("sandbox %v", sb)
 	}
+	checkDiskSize(sb.GetSandboxId())
 	out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo hello; uname -sm; echo state > /root/marker; df -k / | tail -1; ls /sys/class/net")
-	if ex.GetExitCode() != 0 || !strings.Contains(out, "hello\nLinux x86_64\n") {
-		t.Fatalf("exec output %q exited %v", out, ex)
+	if !execSucceeded(ex) || !strings.Contains(out, "hello\nLinux x86_64\n") {
+		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	t.Logf("guest: %s", strings.TrimSpace(out))
 	// The runtime copies the COM1 output (the kernel console) of the VM to
@@ -271,6 +285,7 @@ func TestHyperVIntegration(t *testing.T) {
 	if cold.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
 		t.Fatalf("restore path %v", cold.GetRestorePath())
 	}
+	checkDiskSize(cold.GetSandboxId())
 	if out, _ := e.exec(cold.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" {
 		t.Fatalf("sandbox from snapshot %q", out)
 	}

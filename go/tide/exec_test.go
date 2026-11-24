@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -32,7 +33,7 @@ func needPOSIX(t *testing.T) {
 // workspace is a new local directory.
 func newSession(t *testing.T, c *Client, srv *tidetest.Server, org string, os tidev1.GuestOs) *tidev1.DevSession {
 	t.Helper()
-	ws := t.TempDir() + "/work"
+	ws := filepath.Join(t.TempDir(), "work")
 	if err := mkdir(ws); err != nil {
 		t.Fatal(err)
 	}
@@ -524,6 +525,92 @@ func TestExecErrors(t *testing.T) {
 	}
 	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure) - execCalls; n != 1 {
 		t.Fatalf("exec calls = %d, want 1", n)
+	}
+}
+
+func TestFakeExecCloseStopsGroup(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("the fake guest stops exec process groups on Linux and macOS")
+	}
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	// Redirect the child's descriptors so closing the exec stream cannot
+	// affect whether the child survives. Bound its lifetime on failure.
+	const command = `
+sh -c '
+	: > ready
+	i=0
+	while [ "$i" -lt 200 ]; do
+		if [ -e release ]; then
+			: > survived
+			exit
+		fi
+		i=$((i + 1))
+		sleep 0.025
+	done
+' </dev/null >/dev/null 2>&1 &
+wait
+`
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Exec(ctx, ExecParams{
+			OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+			Command: []string{"sh", "-c", command},
+		})
+		done <- err
+	}()
+	workspace := ds.GetWorkspacePath()
+	ready := filepath.Join(workspace, "ready")
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		_, err := os.Stat(ready)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("exec finished before the child was ready: %v", err)
+		case <-ctx.Done():
+			t.Fatal("child did not become ready")
+		case <-tick.C:
+		}
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("server did not close")
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("exec did not finish after Close: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("exec did not finish after Close")
+	}
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		t.Fatal("deadline expired while checking for the survival marker")
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "survived")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("survival marker after Close: stat returned %v, want not exist", err)
 	}
 }
 
