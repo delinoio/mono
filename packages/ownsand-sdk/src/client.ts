@@ -99,9 +99,10 @@ export type SandboxSourceInput =
 export interface CreateSandboxInput {
   source: SandboxSourceInput;
   /**
-   * Resources of the sandbox. `memoryMib` and `diskGib` are `int64` fields on
-   * the wire, so each accepts a `number` (a safe integer) or a `bigint` (up to
-   * the `int64` maximum); `vcpuCount` is an `int32` and stays a `number`.
+   * Sandbox resources. `memoryMib` and `diskGib` each accept a safe integer
+   * `number` or a `bigint`. `memoryMib` accepts up to the signed `int64`
+   * maximum, and `diskGib` accepts up to 8589934591 GiB. `vcpuCount` is an
+   * `int32` and takes a `number`.
    */
   resources: {
     vcpuCount: number;
