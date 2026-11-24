@@ -555,7 +555,7 @@ The server reads these environment variables without a service prefix. Empty val
 | `LOGTO_JWKS_URL`              | no       | `LOGTO_ISSUER` + `/jwks`        | Key set URL.                                                                                                   |
 | `LOGTO_JWKS_FILE`             | no       | empty                           | Local key set file instead of the URL, for end-to-end test issuers.                                            |
 | `LOGTO_AUDIENCE`              | no       | `https://tide.api.delino.io`    | Expected `aud`.                                                                                                |
-| `CORS_ORIGINS`                | no       | `https://tide.delino.io`        | Comma-separated browser origins.                                                                               |
+| `CORS_ORIGINS`                | no       | `https://tide.delino.io`        | Comma-separated HTTP or HTTPS origins. See [CORS origin format](#cors-origin-format).                          |
 | `TRUST_PROXY_CLIENT_ADDRESS`  | no       | `false`                         | Client address from the last `X-Forwarded-For` entry, as in OwnSand.                                           |
 | `ALLOW_DIRECT_CLIENT_ADDRESS` | no       | `false`                         | Client address from the TCP peer when the proxy setting is off. The development launcher sets `true`.          |
 | `TIDE_SECRET_KEYS`            | yes      |                                 | Service secret; see [Secrets](#secrets).                                                                       |
@@ -575,6 +575,12 @@ The server reads these environment variables without a service prefix. Empty val
 - When none of the six `GITHUB_APP_*` variables is set, the GitHub layer is off, so development setups without a GitHub App still start: the `GitHubService` RPCs fail with `failed_precondition` after authorization, `POST /webhooks/github` answers `503`, and no GitHub job is matched. Some but not all of the six variables stop the server at startup.
 - Later layers add the vendor settings to this table with their implementation. The Cursor, Devin, Claude Code and OpenAI Codex adapters add no variable. The Claude Code orchestrators put their run directories in `TMPDIR` (default `/tmp`); a Unix socket path must stay below 104 bytes, so `TMPDIR` must be short.
 - Member display names: `ListMembers` reads them through an optional display name source. The `delino-accounts` API has no display name RPC yet, as the [OwnSand contract](servers-ownsand-api-foundation.md#dependencies-and-integrations) records, so tide-api has no client or configuration for it and returns empty display names until that RPC exists.
+
+### CORS origin format
+
+The server stores each `CORS_ORIGINS` entry in the form that browsers use in the `Origin` header. It lowercases host names, writes IPv4 addresses in dotted decimal and writes IPv6 addresses in compressed form within brackets. It removes the default port for the scheme and keeps other ports. For example, `HTTPS://Tide.Delino.io:443` matches `https://tide.delino.io`, and `http://127.1:3000` matches `http://127.0.0.1:3000`. Use Punycode for internationalized host names.
+
+Each entry requires a host and permits an optional port. Startup fails if an entry includes user information, a path, a query or a fragment, including a bare `?` or `#`. Startup also fails for invalid hosts such as `1.2.3.4.5` or IPv6 addresses with a zone identifier.
 
 ## Security
 
