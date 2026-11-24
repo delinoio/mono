@@ -71,12 +71,14 @@ const status = (...releases) => ({
     name,
     type,
     newVersion,
+    changesets: [],
   })),
 });
 
 test("no pending changesets select nothing", () => {
   assert.deepEqual(plan({ changesets: [], releases: [] }, workspace), {
     changesets: [],
+    consumedChangesets: [],
     releases: [],
     servers: [],
     staticSites: [],
@@ -119,6 +121,7 @@ const devDependencyStatus = {
 test("none releases are deployed but not tagged", () => {
   const result = plan(devDependencyStatus, workspace);
   assert.deepEqual(result.changesets, ["fix"]);
+  assert.deepEqual(result.consumedChangesets, ["fix"]);
   assert.deepEqual(result.releases, [{ name: "ui", version: "0.0.1" }]);
   assert.deepEqual(
     result.staticSites.map((d) => [d.name, d.version]),
@@ -1876,6 +1879,7 @@ test("main writes GitHub outputs and a summary", () => {
     );
     assert.equal(outputs.has_changesets, "true");
     assert.deepEqual(JSON.parse(outputs.changesets), ["change"]);
+    assert.deepEqual(JSON.parse(outputs.consumed_changesets), ["change"]);
     assert.equal(outputs.has_servers, "true");
     assert.equal(outputs.has_static_sites, "false");
     assert.equal(outputs.has_binaries, "false");
