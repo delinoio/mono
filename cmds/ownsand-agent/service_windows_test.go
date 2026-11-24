@@ -7,15 +7,55 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/service"
 )
+
+func TestServiceMigrationPreservesRunArguments(t *testing.T) {
+	launcher := `C:\Program Files\OwnSand Agent\ownsand-service.exe`
+	old := `"D:\Agent Files\ownsand-agent.exe" run --state-dir "D:\Agent State" --no-color`
+	path, migrated, err := migratedWindowsServicePath(old, launcher)
+	if err != nil || migrated {
+		t.Fatalf("migrate %q = migrated %v, error %v", old, migrated, err)
+	}
+	result := windows.UTF16PtrToString(path)
+	args, err := windows.DecomposeCommandLine(result)
+	want := []string{launcher, "service", "launch", "run", "--state-dir", `D:\Agent State`, "--no-color"}
+	if err != nil || !reflect.DeepEqual(args, want) {
+		t.Fatalf("migrated command line = %q, %v, want %q", args, err, want)
+	}
+	if _, migrated, err := migratedWindowsServicePath(result, launcher); err != nil || !migrated {
+		t.Fatalf("repeat migration = migrated %v, error %v", migrated, err)
+	}
+}
+
+func TestServiceLauncherDirectorySecurity(t *testing.T) {
+	if !windows.GetCurrentProcessToken().IsElevated() {
+		t.Skip("creating the launcher directory needs an elevated administrator")
+	}
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "launcher")
+	for range 2 {
+		if err := createLauncherDirectory(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := filepath.Join(parent, "existing")
+	if err := os.Mkdir(other, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := createLauncherDirectory(other); err == nil {
+		t.Fatal("accepted an existing directory without the launcher DACL")
+	}
+}
 
 // executeHandler drives handler.Execute with a fake runner. When stop is
 // true, the test sends a stop request and the runner returns its outcome
@@ -130,7 +170,7 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 				events = append(events, message)
 				return tc.eventError
 			}
-			if code := runUnderServiceManager(config.Config{StateDir: dir}, cfgErr, dispatch, writeEvent); code != exitUsage {
+			if code := runUnderServiceManager(config.Config{StateDir: dir}, cfgErr, dispatch, writeEvent, nil); code != exitUsage {
 				t.Fatalf("runUnderServiceManager = %d, want %d", code, exitUsage)
 			}
 			if tc.wantEvent != "" {

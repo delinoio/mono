@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -26,7 +27,17 @@ func runService(cfg config.Config) int {
 	if err != nil || !isService {
 		return runInteractive(cfg)
 	}
-	return runUnderServiceManager(cfg, nil, svc.Run, writeStartupEvent)
+	return runUnderServiceManager(cfg, nil, svc.Run, writeStartupEvent, runUnmigratedService)
+}
+
+type unmigratedServiceInstaller struct{}
+
+func (unmigratedServiceInstaller) Install(string) error {
+	return errors.New("stop the service and run ownsand-agent service migrate before installing updates")
+}
+
+func runUnmigratedService(ctx context.Context, cfg config.Config, _ *os.File) (int, bool) {
+	return runAgentWithInstaller(ctx, cfg, unmigratedServiceInstaller{})
 }
 
 // runConfigError ends `run` when its configuration does not parse. Under the
@@ -43,7 +54,7 @@ func runConfigError(cfgErr error, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ownsand-agent:", cfgErr)
 		return exitUsage
 	}
-	return runUnderServiceManager(config.Config{StateDir: configErrorStateDir(os.LookupEnv)}, cfgErr, svc.Run, writeStartupEvent)
+	return runUnderServiceManager(config.Config{StateDir: configErrorStateDir(os.LookupEnv)}, cfgErr, svc.Run, writeStartupEvent, nil)
 }
 
 // configErrorStateDir returns the state directory for the log of a
@@ -58,7 +69,7 @@ func configErrorStateDir(lookup config.Lookup) string {
 	return config.DefaultStateDir()
 }
 
-func runUnderServiceManager(cfg config.Config, cfgErr error, dispatch func(string, svc.Handler) error, reportStartupError func(string) error) int {
+func runUnderServiceManager(cfg config.Config, cfgErr error, dispatch func(string, svc.Handler) error, reportStartupError func(string) error, runAgent func(context.Context, config.Config, *os.File) (int, bool)) int {
 	// A Windows service has no standard error; the agent writes its JSON
 	// log to agent.log in the state directory. The file is opened with
 	// delete sharing (see openServiceLog) so that a device removal can delete
@@ -86,7 +97,7 @@ func runUnderServiceManager(cfg config.Config, cfgErr error, dispatch func(strin
 		if cfgErr != nil {
 			return exitUsage, false
 		}
-		return runAgentOutcome(ctx, cfg)
+		return runAgent(ctx, cfg, logFile)
 	}
 	h := &handler{cfg: cfg, run: run}
 	if err := dispatch(service.Name, h); err != nil {
@@ -151,7 +162,11 @@ func (h *handler) finish(code int, updated, stopRequested bool) (bool, uint32) {
 }
 
 func serviceDefinition(exe, stateDir string) (string, error) {
-	return service.WindowsDefinition(exe, serviceEnv(stateDir)), nil
+	dir, err := windowsLauncherDirectory()
+	if err != nil {
+		return "", err
+	}
+	return service.WindowsDefinition(exe, launcherPath(dir), serviceEnv(stateDir)), nil
 }
 
 // setServiceEnvironment writes the REG_MULTI_SZ Environment value of the
@@ -178,7 +193,17 @@ func serviceInstall(stateDir string, stdout, stderr io.Writer) int {
 		return exitError
 	}
 	defer m.Disconnect()
-	s, err := m.CreateService(service.Name, exe, mgr.Config{DisplayName: "OwnSand device agent", StartType: mgr.StartAutomatic}, "run")
+	dir, unlock, err := lockWindowsLauncher()
+	if err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent: prepare the service launcher:", err)
+		return exitError
+	}
+	defer unlock()
+	if err := prepareNewWindowsService(m, dir, exe); err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent: prepare the service launcher:", err)
+		return exitError
+	}
+	s, err := m.CreateService(service.Name, launcherPath(dir), mgr.Config{DisplayName: "OwnSand device agent", StartType: mgr.StartAutomatic}, "service", "launch", "run")
 	if err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent: create service:", err)
 		return exitError
