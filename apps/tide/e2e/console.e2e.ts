@@ -12,7 +12,10 @@ const GLOBEX = "0193b000-0000-7000-8000-000000000004";
 const INVITATION_SECRET = "tdi_mock_contoso_invitation";
 
 describe("sign-in", () => {
-  test("signs in and lists the organizations", async ({ app, screen }) => {
+  test("signs in and lists the mock organizations in resolved development mode", async ({
+    app,
+    screen,
+  }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
 
