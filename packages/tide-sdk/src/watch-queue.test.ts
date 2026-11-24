@@ -24,8 +24,7 @@ import {
 
 const ORG = "0193a000-0000-7000-8000-000000000001";
 
-type Step =
-  "snapshot" | "change" | "keepalive" | "unavailable" | "denied" | "hang";
+type Step = "snapshot" | "change" | "keepalive" | "unavailable" | "hang";
 
 /** A WatchQueue server whose stream number `n` runs `scripts[n]`. */
 function watchServer(scripts: Step[][], options = {}) {
@@ -68,8 +67,6 @@ function watchServer(scripts: Step[][], options = {}) {
               break;
             case "unavailable":
               throw new ConnectError("restarting", Code.Unavailable);
-            case "denied":
-              throw new ConnectError("no access", Code.PermissionDenied);
             case "hang":
               await new Promise((_, reject) =>
                 ctx.signal.addEventListener("abort", () =>
@@ -208,20 +205,76 @@ describe("watchQueue", () => {
     ]);
   });
 
-  test("ends with the server's error for a status that is not retryable", async () => {
-    const server = watchServer([["denied"]]);
+  test("redacts an echoed normalized token from a terminal stream status", async () => {
+    const server = fakeServer((router) => {
+      router.service(WorkService, {
+        async *watchQueue(_req, ctx) {
+          yield { event: { case: "snapshotComplete", value: {} } };
+          const auth = ctx.requestHeader.get("authorization");
+          throw new ConnectError(
+            `no access with ${auth}`,
+            Code.PermissionDenied,
+            {
+              "x-tide-test": "rejected",
+            },
+          );
+        },
+      });
+    });
     const client = new TideClient({
       origin: FAKE_ORIGIN,
       fetch: server.fetch,
-      token: "test-token",
+      token: "secret-access-token\r\n",
       clock: new RecordingClock(),
     });
-    const error = await (async () => {
-      for await (const _ of client.watchQueue({ organizationId: ORG })) {
-        // No events.
-      }
-    })().catch((e: unknown) => e);
-    expect((error as ConnectError).code).toBe(Code.PermissionDenied);
+    const stream = client.watchQueue({ organizationId: ORG });
+    expect((await stream.next()).value).toEqual({
+      kind: WatchQueueEventKind.SnapshotComplete,
+    });
+    const error = (await stream
+      .next()
+      .catch((e: unknown) => e)) as ConnectError;
+    expect(server.calls[0]?.headers.get("authorization")).toBe(
+      "Bearer secret-access-token",
+    );
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error.code).toBe(Code.PermissionDenied);
+    expect(error.metadata.get("x-tide-test")).toBe("rejected");
+    expect(error.message).toBe(
+      "[permission_denied] no access with Bearer [redacted]",
+    );
+    expect(error.rawMessage).toBe("no access with Bearer [redacted]");
+  });
+
+  test("redacts the retained cause of a stream body read error", async () => {
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      token: () => "secret-access-token ",
+      fetch: async (_input, init) => {
+        const auth = new Headers(init?.headers).get("authorization");
+        const body = new ReadableStream({
+          start(controller) {
+            controller.error(new TypeError(`body read failed with ${auth}`));
+          },
+        });
+        return new Response(body, {
+          headers: { "content-type": "application/connect+proto" },
+        });
+      },
+    });
+    const stream = client.work
+      .watchQueue({ organizationId: ORG })
+      [Symbol.asyncIterator]();
+    const error = (await stream
+      .next()
+      .catch((e: unknown) => e)) as ConnectError;
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error.code).toBe(Code.Unknown);
+    const message = "body read failed with Bearer [redacted]";
+    expect(error.message).toBe(`[unknown] ${message}`);
+    expect(error.rawMessage).toBe(message);
+    expect(error.cause).toBeInstanceOf(TypeError);
+    expect((error.cause as TypeError).message).toBe(message);
   });
 
   test("ends with the configuration error of a token source that returns no token", async () => {
@@ -241,6 +294,69 @@ describe("watchQueue", () => {
     expect((error as ConnectError).cause).toBeInstanceOf(TideConfigError);
     expect(clock.sleeps).toEqual([]);
     expect(server.calls).toEqual([]);
+  });
+
+  test.each(["throws", "rejects"])(
+    "ends the first read when the token source %s",
+    async (failure) => {
+      const server = watchServer([["snapshot"]]);
+      const clock = new RecordingClock();
+      const providerError = new Error("fixture token failure");
+      let providerCalls = 0;
+      const client = new TideClient({
+        origin: FAKE_ORIGIN,
+        fetch: server.fetch,
+        clock,
+        token: () => {
+          providerCalls++;
+          if (failure === "throws") {
+            throw providerError;
+          }
+          return Promise.reject(providerError);
+        },
+      });
+      const stream = client.watchQueue({
+        organizationId: ORG,
+        signal: new AbortController().signal,
+      });
+      const error = (await stream
+        .next()
+        .catch((error: unknown) => error)) as ConnectError;
+      expect(error.cause).toBeInstanceOf(TideConfigError);
+      expect((error.cause as TideConfigError).cause).toBe(providerError);
+      expect(providerCalls).toBe(1);
+      expect(server.calls).toEqual([]);
+      expect(clock.sleeps).toEqual([]);
+    },
+  );
+
+  test("stops reconnecting when the token source fails after a clean stream end", async () => {
+    const server = watchServer([["change"]]);
+    const clock = new RecordingClock();
+    const providerError = new Error("fixture token failure");
+    let providerCalls = 0;
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: server.fetch,
+      clock,
+      token: () =>
+        ++providerCalls === 1 ? "test-token" : Promise.reject(providerError),
+    });
+    const stream = client.watchQueue({ organizationId: ORG });
+    expect((await stream.next()).value).toMatchObject({
+      kind: WatchQueueEventKind.Request,
+    });
+    expect((await stream.next()).value).toMatchObject({
+      kind: WatchQueueEventKind.Gap,
+    });
+    const error = (await stream
+      .next()
+      .catch((error: unknown) => error)) as ConnectError;
+    expect(error.cause).toBeInstanceOf(TideConfigError);
+    expect((error.cause as TideConfigError).cause).toBe(providerError);
+    expect(providerCalls).toBe(2);
+    expect(server.calls).toHaveLength(1);
+    expect(clock.sleeps).toEqual([1000]);
   });
 
   test("ends without an error when the signal aborts a pending token source", async () => {

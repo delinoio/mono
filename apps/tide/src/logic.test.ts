@@ -69,13 +69,72 @@ describe("configuration", () => {
     expect(REQUIRED_API_SCOPE).toBe("tide:use");
   });
 
-  test("rejects an origin with a path and the mock API in production", () => {
+  const pathError = "must be an origin without a path, query or fragment";
+
+  test.each([
+    ["https://api.test\\v1\\..", pathError],
+    ["https://api.test\\", pathError],
+    ["https:///api.test/v1/..", pathError],
+    ["https:api.test/v1/..", pathError],
+    ["https:/api.test/v1/..", pathError],
+    ["https:////api.test/v1/..", pathError],
+    ["https://api.test/v1/..", pathError],
+    ["https://api.test/v1", pathError],
+    ["https://api.test?x", pathError],
+    ["https://api.test?", pathError],
+    ["https://api.test#x", pathError],
+    ["https://api.test#", pathError],
+    ["https://u:p@api.test", "must not contain credentials"],
+    ["ftp://api.test", "must use http or https"],
+    ["nope", "is not a valid URL"],
+  ])("rejects %s for both configured origins", (value, error) => {
+    expect(() =>
+      readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production: false }),
+    ).toThrow(`PUBLIC_API_ORIGIN ${error}`);
     expect(() =>
       readConsoleConfig(
-        { PUBLIC_API_ORIGIN: "https://a.test/api" },
+        { PUBLIC_LOGTO_ENDPOINT: value, PUBLIC_LOGTO_APP_ID: "app" },
         { production: false },
       ),
-    ).toThrow();
+    ).toThrow(`PUBLIC_LOGTO_ENDPOINT ${error}`);
+  });
+
+  test.each([
+    ["https://api.test", "https://api.test"],
+    ["https://api.test/", "https://api.test"],
+    ["http://localhost:8080", "http://localhost:8080"],
+    ["HTTPS://api.test", "https://api.test"],
+    [" https://api.test/ ", "https://api.test"],
+  ])("normalizes %j to a bare origin", (value, origin) => {
+    const config = readConsoleConfig(
+      {
+        PUBLIC_API_ORIGIN: value,
+        PUBLIC_LOGTO_ENDPOINT: value,
+        PUBLIC_LOGTO_APP_ID: "app",
+      },
+      { production: false },
+    );
+    expect(config.apiOrigin).toBe(origin);
+    expect(config.logto?.endpoint).toBe(origin);
+  });
+
+  test.each(["", "   ", "\t\n"])(
+    "uses defaults for the blank value %j",
+    (value) => {
+      const config = readConsoleConfig(
+        {
+          PUBLIC_API_ORIGIN: value,
+          PUBLIC_LOGTO_ENDPOINT: value,
+          PUBLIC_LOGTO_APP_ID: "app",
+        },
+        { production: false },
+      );
+      expect(config.apiOrigin).toBe(DEFAULT_API_ORIGIN);
+      expect(config.logto).toBeUndefined();
+    },
+  );
+
+  test("enables the mock API only outside production", () => {
     expect(() =>
       readConsoleConfig({ PUBLIC_TIDE_MOCK_API: "true" }, { production: true }),
     ).toThrow();

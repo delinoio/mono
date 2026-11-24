@@ -8,7 +8,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"google.golang.org/protobuf/proto"
+
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // observations is a controllable view of the control plane for
@@ -129,5 +134,79 @@ func TestLogSinkStateReportMatching(t *testing.T) {
 	}
 	if logs.hasStateReport("agent", "dev-1") {
 		t.Error("a process name is matched exactly, not as a prefix")
+	}
+}
+
+func TestWaitForAgentConfigurationMatchesProcessAndLimits(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &logSink{}
+		agent := &proc{name: "agent0", done: make(chan struct{})}
+		limits := &ownsandv1.DeviceLimitsInput{VcpuCount: proto.Int32(8), MemoryMib: proto.Int64(16384), DiskGib: proto.Int64(100)}
+		const matching = `{"msg":"configuration received","vcpu_limit":8,"memory_mib_limit":16384,"disk_gib_limit":100}`
+		appendLines(logs,
+			`agent0: {"msg":"configuration received","vcpu_limit":0,"memory_mib_limit":0,"disk_gib_limit":0}`,
+			`agent0: {"msg":"configuration received","vcpu_limit":4,"memory_mib_limit":16384,"disk_gib_limit":100}`,
+			`agent0: {"msg":"configuration received","vcpu_limit":8,"memory_mib_limit":4096,"disk_gib_limit":100}`,
+			`agent0: {"msg":"configuration received","vcpu_limit":8,"memory_mib_limit":16384,"disk_gib_limit":20}`,
+			`agent0: {"msg":"another event","vcpu_limit":8,"memory_mib_limit":16384,"disk_gib_limit":100}`,
+			"agent0: invalid JSON "+matching,
+			"agent01: "+matching,
+		)
+
+		result := make(chan error, 1)
+		go func() { result <- logs.waitForAgentLimits(t.Context(), agent, "dev-1", limits) }()
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("wait returned before the target process logged the expected limits: %v", err)
+		default:
+		}
+
+		appendLines(logs, "agent0: "+matching)
+		if err := <-result; err != nil {
+			t.Fatalf("wait failed after the target process logged the expected limits: %v", err)
+		}
+	})
+}
+
+func TestWaitForAgentConfigurationFailsWithoutMatch(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		signal  func(context.CancelFunc, chan struct{})
+		cause   error
+		elapsed time.Duration
+	}{
+		{name: "process exit", signal: func(_ context.CancelFunc, done chan struct{}) { close(done) }, cause: errProcessExited},
+		{name: "startup canceled", signal: func(cancel context.CancelFunc, _ chan struct{}) { cancel() }, cause: context.Canceled},
+		{name: "device readiness deadline", cause: context.DeadlineExceeded, elapsed: deviceWaitTimeout},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				logs := &logSink{}
+				agent := &proc{name: "agent0", done: make(chan struct{})}
+				limits := &ownsandv1.DeviceLimitsInput{VcpuCount: proto.Int32(8), MemoryMib: proto.Int64(16384), DiskGib: proto.Int64(100)}
+				start := time.Now()
+				result := make(chan error, 1)
+				go func() { result <- logs.waitForAgentLimits(ctx, agent, "dev-1", limits) }()
+				synctest.Wait()
+				if tt.signal != nil {
+					tt.signal(cancel, agent.done)
+				}
+				err := <-result
+				if !errors.Is(err, tt.cause) {
+					t.Fatalf("wait returned %v, want %v", err, tt.cause)
+				}
+				if elapsed := time.Since(start); elapsed != tt.elapsed {
+					t.Errorf("wait failed after %v, want %v", elapsed, tt.elapsed)
+				}
+				for _, want := range []string{"dev-1", "agent0", "configuration received", "vcpu_limit=8", "memory_mib_limit=16384", "disk_gib_limit=100"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not contain %q", err, want)
+					}
+				}
+			})
+		})
 	}
 }

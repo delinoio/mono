@@ -16,6 +16,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   statSync,
   rmSync,
   symlinkSync,
@@ -25,6 +26,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { main as deployPlan } from "./deploy-plan.mjs";
 import { spawnProcessGroup } from "./fixture-process.mjs";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 
@@ -694,7 +696,7 @@ const changesetConfig = readFileSync(
 // A workspace with packages `a`, `b` and `delidev` (ignored by the
 // repository Changesets config), the repository Changesets config, a
 // pushed `main` and the repository `node_modules` for the Changesets CLI.
-function releaseFixture(t) {
+function releaseFixture(t, { tide = false } = {}) {
   const dir = scratch(t);
   const remote = join(dir, "remote.git");
   const work = join(dir, "work");
@@ -706,12 +708,22 @@ function releaseFixture(t) {
     join(work, "package.json"),
     JSON.stringify({ name: "fixture", private: true }),
   );
-  writeFileSync(join(work, "pnpm-workspace.yaml"), "packages:\n  - pkgs/*\n");
+  const packageRoot = tide ? "packages" : "pkgs";
+  const workspace = ["packages:", `  - ${packageRoot}/*`];
+  if (tide) {
+    workspace.push("  - cmds/tide");
+    mkdirSync(join(work, "cmds/tide"), { recursive: true });
+    writeFileSync(
+      join(work, "cmds/tide/package.json"),
+      readFileSync(join(root, "cmds/tide/package.json")),
+    );
+  }
+  writeFileSync(join(work, "pnpm-workspace.yaml"), workspace.join("\n") + "\n");
   writeFileSync(join(work, ".gitignore"), "node_modules\n");
   for (const name of ["a", "b", "delidev"]) {
-    mkdirSync(join(work, "pkgs", name), { recursive: true });
+    mkdirSync(join(work, packageRoot, name), { recursive: true });
     writeFileSync(
-      join(work, "pkgs", name, "package.json"),
+      join(work, packageRoot, name, "package.json"),
       `${JSON.stringify({ name, version: "0.0.0", private: true }, null, 2)}\n`,
     );
   }
@@ -763,6 +775,60 @@ function changesetBlobs(work, sha) {
     if (match && match[2] !== "README") blobs[match[2]] = match[1];
   }
   return blobs;
+}
+
+function readOutputs(file) {
+  return Object.fromEntries(
+    readFileSync(file, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => [
+        line.slice(0, line.indexOf("=")),
+        line.slice(line.indexOf("=") + 1),
+      ]),
+  );
+}
+
+// Run the planner on real Changesets status output and execute the workflow's
+// blob-recording step with the planner outputs.
+function planRelease(work) {
+  const status = join(work, "..", "status.json");
+  const planOutput = join(work, "..", "plan-output");
+  const blobsOutput = join(work, "..", "blobs-output");
+  execFileSync("pnpm", ["exec", "changeset", "status", "--output", status], {
+    cwd: work,
+    env: baseEnv,
+  });
+  deployPlan({
+    argv: [status],
+    env: { GITHUB_OUTPUT: planOutput },
+    repoRoot: work,
+  });
+  const outputs = readOutputs(planOutput);
+  const workflow = readFileSync(
+    join(root, ".github/workflows/deploy.yml"),
+    "utf8",
+  );
+  const script = workflow.match(
+    /^        id: blobs\n[\s\S]*?^        run: \|\n((?: {10}.*\n)+)/m,
+  )?.[1];
+  assert.ok(script, "workflow has a blob-recording step");
+  execFileSync("bash", ["-c", script], {
+    cwd: work,
+    env: {
+      ...baseEnv,
+      CHANGESETS: outputs.changesets,
+      CONSUMED_CHANGESETS: outputs.consumed_changesets,
+      GITHUB_OUTPUT: blobsOutput,
+    },
+  });
+  const maps = readOutputs(blobsOutput);
+  return {
+    releases: JSON.parse(outputs.releases),
+    hasBinaries: outputs.has_binaries,
+    blobs: JSON.parse(maps.changeset_blobs),
+    consumedBlobs: JSON.parse(maps.consumed_changeset_blobs),
+  };
 }
 
 function runRelease(work, sha, releases, extraEnv = {}) {
@@ -833,10 +899,16 @@ test(
   (t) => {
     const { remote, work } = releaseFixture(t);
     const sha = addChangeset(work, "native", { delidev: "patch" });
-    const result = runRelease(work, sha, []);
+    const plan = planRelease(work);
+    assert.deepEqual(plan.blobs, changesetBlobs(work, sha));
+    assert.deepEqual(plan.consumedBlobs, {});
+    const before = remoteRefs(remote);
+    const result = runRelease(work, sha, plan.releases, {
+      CHANGESET_BLOBS: JSON.stringify(plan.blobs),
+    });
     assert.equal(result.status, 0, result.stdout + result.stderr);
     assert.match(result.stdout, /changed nothing/);
-    assert.equal(remoteGit(remote, "rev-parse", "main"), sha);
+    assert.equal(remoteRefs(remote), before);
   },
 );
 
@@ -1033,23 +1105,33 @@ const recoveryRunId = "555";
 // the remote holds the version commit and the tags, and the rerun checks out
 // the planned revision again. `moved` moves `main` during the deployment, so
 // that the release pushes a cherry-picked copy of the tagged commit.
-function landedRelease(t, { moved = false, land = true } = {}) {
-  const fixture = releaseFixture(t);
+function landedRelease(t, { moved = false, land = true, mixed = false } = {}) {
+  const fixture = releaseFixture(t, { tide: mixed });
   const { dir, remote, work } = fixture;
-  const sha = addChangeset(work, "one", { a: "patch" });
-  const releases = [{ name: "a", version: "0.0.1" }];
+  const name = mixed ? "tide-cli" : "a";
+  if (mixed) {
+    addChangeset(work, "native", { delidev: "patch" });
+    addChangeset(work, "empty", {});
+    addChangeset(work, "none", { a: "none" });
+  }
+  const sha = addChangeset(work, "one", { [name]: "patch" });
   const blobs = changesetBlobs(work, sha);
+  const tag = `${name}@0.0.1`;
+  const plan = mixed
+    ? planRelease(work)
+    : { releases: [{ name, version: "0.0.1" }], blobs, consumedBlobs: blobs };
   if (moved) moveMain(dir, remote, "moved.txt", "moved\n");
   if (land) {
-    const result = runRelease(work, sha, releases, {
+    const result = runRelease(work, sha, plan.releases, {
+      CHANGESET_BLOBS: JSON.stringify(plan.blobs),
       GITHUB_RUN_ID: recoveryRunId,
     });
     assert.equal(result.status, 0, result.stdout + result.stderr);
     // The rerun starts from a fresh checkout of the planned revision.
     git(work, "reset", "--quiet", "--hard", sha);
-    git(work, "tag", "--delete", "a@0.0.1");
+    git(work, "tag", "--delete", tag);
   }
-  return { ...fixture, sha, releases, blobs };
+  return { ...fixture, ...plan, sha, tag };
 }
 
 // Every ref of the remote, to prove that a recovery writes nothing.
@@ -1075,7 +1157,7 @@ function runRecovery(t, state, { env = {}, responses } = {}) {
       ...baseEnv,
       PATH: `${bin}${delimiter}${baseEnv.PATH}`,
       RELEASES: JSON.stringify(state.releases),
-      CHANGESET_BLOBS: JSON.stringify(state.blobs),
+      CONSUMED_CHANGESET_BLOBS: JSON.stringify(state.consumedBlobs),
       SHA: state.sha,
       GITHUB_RUN_ID: recoveryRunId,
       GITHUB_RUN_ATTEMPT: "2",
@@ -1130,6 +1212,133 @@ test("recovery accepts a cherry-picked version commit", { skip }, (t) => {
   const result = runRecovery(t, state);
   assert.equal(result.recovered, "recovered=true");
   assert.ok(result.refsUnchanged);
+});
+
+for (const moved of [false, true]) {
+  const mode = moved ? "cherry-picked" : "direct";
+  test(
+    `recovery accepts a ${mode} Tide release with an ignored changeset`,
+    { skip },
+    (t) => {
+      const state = landedRelease(t, { mixed: true, moved });
+      const { remote, sha, tag, blobs, consumedBlobs } = state;
+      const planned = changesetBlobs(state.work, sha);
+      const { native, ...consumed } = planned;
+      assert.ok(native);
+      assert.deepEqual(Object.keys(consumed), ["empty", "none", "one"]);
+      assert.deepEqual(blobs, planned);
+      assert.deepEqual(consumedBlobs, consumed);
+      assert.equal(state.hasBinaries, "true");
+      assert.deepEqual(state.releases, [
+        { name: "tide-cli", version: "0.0.1" },
+      ]);
+      for (const id of Object.keys(consumed)) {
+        assert.equal(
+          remoteGit(remote, "ls-tree", "main", `.changeset/${id}.md`),
+          "",
+        );
+      }
+      assert.equal(
+        remoteGit(remote, "rev-parse", "main:.changeset/native.md"),
+        native,
+      );
+      assert.equal(remoteGit(remote, "cat-file", "-t", tag), "tag");
+      assert.equal(
+        remoteGit(remote, "rev-parse", `${tag}^{commit}`) ===
+          remoteGit(remote, "rev-parse", "main"),
+        !moved,
+      );
+
+      const result = runRecovery(t, state);
+      assert.equal(
+        result.recovered,
+        "recovered=true",
+        result.stdout + result.stderr,
+      );
+      assert.ok(result.refsUnchanged);
+    },
+  );
+}
+
+test(
+  "release rejects a changed ignored changeset when main moves",
+  { skip },
+  (t) => {
+    const { dir, remote, work, sha, releases, blobs } = landedRelease(t, {
+      mixed: true,
+      land: false,
+    });
+    moveMain(
+      dir,
+      remote,
+      ".changeset/native.md",
+      '---\n"delidev": patch\n---\n\nChanged.\n',
+    );
+    const before = remoteRefs(remote);
+    const result = runRelease(work, sha, releases, {
+      CHANGESET_BLOBS: JSON.stringify(blobs),
+    });
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(
+      result.stdout,
+      /\.changeset\/native\.md changed or was removed on main/,
+    );
+    assert.equal(remoteRefs(remote), before);
+  },
+);
+
+test(
+  "recovery rejects a release that leaves an expected changeset pending",
+  { skip },
+  (t) => {
+    const state = landedRelease(t, { mixed: true });
+    const { work, sha } = state;
+    git(work, "fetch", "--quiet", "origin", "main");
+    git(work, "checkout", "--quiet", "--detach", "FETCH_HEAD");
+    git(
+      work,
+      "restore",
+      "--source",
+      sha,
+      "--staged",
+      "--worktree",
+      ".changeset/one.md",
+    );
+    git(work, ...identity, "commit", "--quiet", "--amend", "--no-edit");
+    git(work, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    git(work, "checkout", "--quiet", "--detach", sha);
+
+    const result = runRecovery(t, state);
+    assert.equal(result.recovered, "recovered=false");
+    assert.match(
+      result.stdout,
+      /\.changeset\/one\.md is not consumed by the version commit/,
+    );
+    assert.ok(result.refsUnchanged);
+  },
+);
+
+test("recovery requires a nonempty, valid consumed blob map", { skip }, (t) => {
+  const state = landedRelease(t);
+  for (const map of [
+    "",
+    "{}",
+    '{"one":"short"}',
+    '{"../one":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
+  ]) {
+    const result = runRecovery(t, state, {
+      env: {
+        CONSUMED_CHANGESET_BLOBS: map,
+        CHANGESET_BLOBS: JSON.stringify(state.blobs),
+      },
+    });
+    assert.equal(result.recovered, "recovered=false");
+    assert.match(
+      result.stdout,
+      /CONSUMED_CHANGESET_BLOBS is not a nonempty map/,
+    );
+    assert.ok(result.refsUnchanged);
+  }
 });
 
 test("recovery proves nothing when the push never landed", { skip }, (t) => {
@@ -1204,20 +1413,24 @@ test("recovery rejects changesets that differ from the plan", { skip }, (t) => {
   const state = landedRelease(t);
   const result = runRecovery(t, {
     ...state,
-    blobs: { one: "e".repeat(40) },
+    consumedBlobs: { one: "e".repeat(40) },
   });
   assert.equal(result.recovered, "recovered=false");
   assert.match(result.stdout, /not consumed by the version commit/);
 });
 
 test("recovery rejects a changeset that exists again", { skip }, (t) => {
-  const state = landedRelease(t);
+  const state = landedRelease(t, { mixed: true });
   // The same file content returns to main, so its blob equals the plan.
   git(state.work, "fetch", "--quiet", "origin", "main");
   git(state.work, "checkout", "--quiet", "--detach", "FETCH_HEAD");
-  writeFileSync(
-    join(state.work, ".changeset/one.md"),
-    `---\n"a": patch\n---\n\nChange one.\n`,
+  git(
+    state.work,
+    "restore",
+    "--source",
+    state.sha,
+    "--worktree",
+    ".changeset/one.md",
   );
   commitAll(state.work, "restore changeset");
   git(state.work, "push", "--quiet", "origin", "HEAD:refs/heads/main");
@@ -1275,6 +1488,27 @@ test("deploy.yml tries the recovery before the stale-plan check", () => {
   assert.ok(recover < index("scripts/ci/check-pending-changesets.sh"));
   assert.match(steps[recover], /id: recover/);
   assert.match(steps[recover], /github\.run_attempt > 1/);
+  assert.ok(
+    steps[recover].includes(
+      "CONSUMED_CHANGESET_BLOBS: ${{ needs.plan.outputs.consumed_changeset_blobs }}",
+    ),
+  );
+  assert.ok(
+    steps[index("scripts/ci/check-pending-changesets.sh")].includes(
+      "CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}",
+    ),
+  );
+  assert.ok(
+    steps[index("scripts/ci/deploy-release.sh")].includes(
+      "CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}",
+    ),
+  );
+  const publish =
+    workflow.match(/^ {2}publish-binaries:\n(?:(?: {4}.*)?\n)+/m)?.[0] ?? "";
+  assert.match(
+    publish,
+    /needs\.release\.result == 'success' && needs\.plan\.outputs\.has_binaries == 'true'/,
+  );
   // Every step after the recovery is skipped when the release already landed.
   for (const step of steps.slice(recover + 1)) {
     assert.match(step, /steps\.recover\.outputs\.recovered != 'true'/);
@@ -1356,6 +1590,7 @@ function runProvider(t, args, { responses = {}, input, env = {} } = {}) {
       CLOUDFLARE_API_TOKEN: "token",
       CLOUDFLARE_ACCOUNT_ID: "account",
       DEPLOY_POLL_INTERVAL: "0",
+      DEPLOY_POLL_TIMEOUT: "30",
       ...env,
     },
   });
@@ -2126,6 +2361,16 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
 const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
 const dropletDeploymentUuid = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
 const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(64)}`;
+const httpArgs = [
+  "api",
+  dropletImage,
+  "8080",
+  "api.example.com",
+  "http1",
+  "none",
+];
+
+const accountsArgs = ["accounts-api", ...httpArgs.slice(1)];
 
 // Runs droplet-deploy.sh the way deploy-targets.sh does (`bash -s` with the
 // script on standard input) against stubbed `docker` and `curl`. `old` lists
@@ -2137,7 +2382,8 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_PS_EXIT exit code of `docker ps` (default 0).
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
 //   STUB_LOGS     exit code of `docker logs` (default 0).
-//   STUB_STOP_FAIL  space-separated container IDs that `docker stop` fails for.
+//   STUB_STOP_FAIL  space-separated container name or ID patterns that
+//                   `docker stop` fails for.
 //   STUB_RM_FAIL    space-separated container IDs that `docker rm` fails for
 //                 (`docker rm --force` of a replacement still succeeds).
 //   STUB_START_FAIL glob of the container names that `docker start` fails for.
@@ -2158,7 +2404,7 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 // `prepare(deployRoot)` changes the scratch state before the run.
 function setupDroplet(
   t,
-  args = ["api", dropletImage, "8080", "api.example.com", "http1", "none"],
+  args = httpArgs,
   {
     old = [],
     envFile = "LOG_LEVEL=info\n",
@@ -2187,13 +2433,16 @@ function setupDroplet(
     mkdirSync(join(deployRoot, "state"));
   }
   if (state !== undefined) {
-    writeFileSync(join(deployRoot, "state", "api.current"), state);
+    writeFileSync(join(deployRoot, "state", `${args[0]}.current`), state);
   }
   if (previous !== undefined) {
-    writeFileSync(join(deployRoot, "state", "api.previous"), previous);
+    writeFileSync(join(deployRoot, "state", `${args[0]}.previous`), previous);
   }
   if (route !== undefined) {
-    writeFileSync(join(deployRoot, "caddy", "sites", "api.caddy"), route);
+    writeFileSync(
+      join(deployRoot, "caddy", "sites", `${args[0]}.caddy`),
+      route,
+    );
   }
   shellStub(
     bin,
@@ -2226,7 +2475,10 @@ case "$1" in
     [[ "\$code" == 0 ]] || echo "docker: Error response from daemon: OCI runtime create failed" >&2
     exit "\$code" ;;
   exec) exit "\${STUB_RELOAD:-0}" ;;
-  stop) [[ " \${STUB_STOP_FAIL:-} " != *" \$4 "* ]] || exit 1 ;;
+  stop)
+    for pattern in \${STUB_STOP_FAIL:-}; do
+      [[ "$4" != $pattern ]] || exit 1
+    done ;;
   start) [[ -z "\${STUB_START_FAIL:-}" || "\$2" != \$STUB_START_FAIL ]] || exit 1 ;;
   image) [[ "\$2" != rm || " \${STUB_IMAGE_RM_FAIL:-} " != *" \$3 "* ]] || exit 1 ;;
   rm) [[ "\$2" == --force || " \${STUB_RM_FAIL:-} " != *" \$2 "* ]] || exit 1 ;;
@@ -2263,11 +2515,7 @@ esac`,
   return { dir, bin, deployRoot, read, calls, spawnEnv };
 }
 
-function runDroplet(
-  t,
-  args = ["api", dropletImage, "8080", "api.example.com", "http1", "none"],
-  { env = {}, ...options } = {},
-) {
+function runDroplet(t, args = httpArgs, { env = {}, ...options } = {}) {
   const setup = setupDroplet(t, args, options);
   const result = spawnSync("bash", ["-s", "--", ...args], {
     encoding: "utf8",
@@ -2391,6 +2639,138 @@ test(
           .includes(`reverse_proxy ${alias}:8080 {`),
       );
     }
+  },
+);
+
+test(
+  "droplet deploy applies the Accounts stop timeout to deployment and rollback",
+  { skip },
+  (t) => {
+    const first = runDroplet(t, accountsArgs, {
+      old: ["old1"],
+      state: `${olderImage}\n`,
+    });
+    assert.equal(first.status, 0, first.stderr);
+    assert.ok(first.calls.includes("docker stop --time 60 old1"));
+    assert.equal(first.read("state/accounts-api.previous"), `${olderImage}\n`);
+
+    const rollback = runDroplet(
+      t,
+      ["accounts-api", olderImage, ...httpArgs.slice(2)],
+      {
+        old: ["old1"],
+        state: first.read("state/accounts-api.current"),
+        previous: first.read("state/accounts-api.previous"),
+        env: { DROPLET_STOP_TIMEOUT: "00075" },
+      },
+    );
+    assert.equal(rollback.status, 0, rollback.stderr);
+    assert.ok(rollback.calls.includes("docker stop --time 75 old1"));
+    assert.equal(
+      rollback.read("state/accounts-api.current"),
+      `${olderImage}\n`,
+    );
+    assert.equal(
+      rollback.read("state/accounts-api.previous"),
+      `${dropletImage}\n`,
+    );
+  },
+);
+
+test(
+  "droplet deploy rejects invalid Accounts stop timeouts before any change",
+  { skip },
+  (t) => {
+    for (const timeout of [
+      "",
+      "30",
+      "59",
+      "-1",
+      "+60",
+      "60.0",
+      "60s",
+      " 60",
+      "9223372037",
+      "18446744073709551676",
+    ]) {
+      const result = runDroplet(t, accountsArgs, {
+        env: { DROPLET_STOP_TIMEOUT: timeout },
+      });
+      assert.equal(result.status, 1, JSON.stringify(timeout));
+      assert.match(result.stderr, /DROPLET_STOP_TIMEOUT for accounts-api/);
+      assert.deepEqual(result.calls, [""]);
+      assert.equal(result.read("state/accounts-api.lock"), undefined);
+      assert.equal(result.read("caddy/sites/accounts-api.caddy"), undefined);
+    }
+  },
+);
+
+test(
+  "droplet deploy stops failed Accounts replacements without changing the serving route",
+  { skip },
+  (t) => {
+    const route = "# old route\n";
+    for (const [env, timeout] of [
+      [{ STUB_HEALTHY: "0" }, 60],
+      [{ STUB_RELOAD: "1", DROPLET_STOP_TIMEOUT: "75" }, 75],
+    ]) {
+      const result = runDroplet(t, accountsArgs, {
+        route,
+        old: ["old1"],
+        state: `${olderImage}\n`,
+        previous: `${oldestImage}\n`,
+        env,
+      });
+      assert.equal(result.status, 1, result.stderr);
+      const stop = result.calls.find((call) => call.startsWith("docker stop"));
+      assert.match(
+        stop,
+        new RegExp(`^docker stop --time ${timeout} accounts-api-`),
+      );
+      const replacement = stop.split(" ").at(-1);
+      assert.ok(
+        result.calls.indexOf(stop) <
+          result.calls.indexOf(`docker rm ${replacement}`),
+      );
+      assert.equal(
+        result.calls.filter((call) => call.startsWith("docker stop")).length,
+        1,
+      );
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker rm --force")),
+      );
+      assert.equal(result.read("caddy/sites/accounts-api.caddy"), route);
+      assert.equal(
+        result.read("state/accounts-api.current"),
+        `${olderImage}\n`,
+      );
+      assert.equal(
+        result.read("state/accounts-api.previous"),
+        `${oldestImage}\n`,
+      );
+    }
+  },
+);
+
+test(
+  "droplet deploy leaves an Accounts replacement when its graceful stop fails",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, accountsArgs, {
+      env: { STUB_RELOAD: "1", STUB_STOP_FAIL: "accounts-api-*" },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /docker stop failed for the replacement accounts-api-.*; it was not removed/,
+    );
+    assert.match(result.stderr, /route of accounts-api was not switched/);
+    assert.ok(
+      result.calls.some((call) =>
+        call.startsWith("docker stop --time 60 accounts-api-"),
+      ),
+    );
+    assert.ok(!result.calls.some((call) => call.startsWith("docker rm ")));
   },
 );
 
@@ -2710,6 +3090,118 @@ test(
     assert.equal(setup.calls().at(-1), "docker start old1");
     assert.equal(setup.read("caddy/sites/api.caddy"), route);
     assert.equal(setup.read("state/api.current"), `${olderImage}\n`);
+  },
+);
+
+test(
+  "droplet deploy publishes the HTTP route and image state before honoring a signal",
+  { skip },
+  async (t) => {
+    const alias = `api-${dropletDeploymentUuid.replaceAll("-", "")}`;
+    for (const phase of ["reload", "state publication"]) {
+      for (const [signal, status] of [
+        ["SIGTERM", 143],
+        ["SIGINT", 130],
+        ["SIGHUP", 129],
+      ]) {
+        await t.test(`${signal} during ${phase}`, async (t) => {
+          const duringReload = phase === "reload";
+          const setup = setupDroplet(t, httpArgs, {
+            old: ["old1"],
+            route: "# old route\n",
+            state: `${olderImage}\n`,
+            previous: `${oldestImage}\n`,
+            stubs: duringReload
+              ? {}
+              : {
+                  mv: `if [[ "\${@: -1}" == *.current ]]; then
+  while [[ -d "$STUB_DIR" && ! -e "$STUB_DIR/release-state" ]]; do sleep 0.05; done
+fi
+exec /bin/mv "$@"`,
+                },
+          });
+          const run = startDroplet(t, setup, httpArgs, {
+            STUB_BLOCK_ON: duringReload ? "exec *" : "",
+          });
+          await waitFor(
+            () =>
+              setup
+                .calls()
+                .some((call) =>
+                  duringReload
+                    ? call.startsWith("docker exec")
+                    : call.startsWith("mv ") &&
+                      call.endsWith("/state/api.current"),
+                ),
+            phase,
+          );
+          assert.equal(setup.read("state/api.current"), `${olderImage}\n`);
+          run.child.kill(signal);
+          writeFileSync(
+            join(setup.dir, duringReload ? "release-docker" : "release-state"),
+            "",
+          );
+          const result = await run.done;
+          assert.equal(result.status, status, result.stderr);
+          assert.match(result.stderr, new RegExp(`received ${signal}`));
+          assert.match(
+            result.stderr,
+            /previous containers keep running.*cleanup was skipped/,
+          );
+          assert.ok(
+            setup
+              .read("caddy/sites/api.caddy")
+              .includes(`reverse_proxy ${alias}:8080`),
+          );
+          assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+          assert.equal(setup.read("state/api.previous"), `${olderImage}\n`);
+          assert.ok(
+            !setup
+              .calls()
+              .some((call) => /^docker (stop|start|rm|image) /.test(call)),
+          );
+        });
+      }
+    }
+  },
+);
+
+test(
+  "droplet deploy finishes HTTP route failure handling before honoring a signal",
+  { skip },
+  async (t) => {
+    for (const route of ["# old route\n", undefined]) {
+      await t.test(route ? "existing route" : "first deployment", async (t) => {
+        const state = route ? `${olderImage}\n` : undefined;
+        const previous = route ? `${oldestImage}\n` : undefined;
+        const setup = setupDroplet(t, httpArgs, {
+          old: route ? ["old1"] : [],
+          route,
+          state,
+          previous,
+        });
+        const run = startDroplet(t, setup, httpArgs, {
+          STUB_BLOCK_ON: "exec *",
+          STUB_RELOAD: "1",
+        });
+        await waitFor(
+          () => setup.calls().some((call) => call.startsWith("docker exec")),
+          "the proxy reload",
+        );
+        run.child.kill("SIGTERM");
+        writeFileSync(join(setup.dir, "release-docker"), "");
+        const result = await run.done;
+        assert.equal(result.status, 1, result.stderr);
+        assert.match(result.stderr, /the reverse proxy rejected the route/);
+        assert.equal(setup.read("caddy/sites/api.caddy"), route);
+        assert.equal(setup.read("state/api.current"), state);
+        assert.equal(setup.read("state/api.previous"), previous);
+        assert.match(setup.calls().at(-1), /^docker rm --force api-/);
+        assert.ok(
+          !setup.calls().some((call) => /^docker (stop|start) /.test(call)),
+        );
+      });
+    }
   },
 );
 
@@ -3614,6 +4106,9 @@ const caddyImage = `caddy:2.11.9@sha256:${"c".repeat(64)}`;
 //                 (default `running`); STUB_STATE_GONE makes that read fail.
 //   STUB_WGET_FAILS  the number of readiness probes that fail before one
 //                 succeeds, or `always`.
+//   STUB_STATE_DELAY stalls the state read.
+//   STUB_WGET_DELAY delays the admin probe.
+//   STUB_WGET_IGNORES_TERM makes the probe and its sleep ignore SIGTERM.
 // The readiness wait runs with a short deadline and interval.
 function runCaddy(
   t,
@@ -3625,7 +4120,7 @@ function runCaddy(
     state,
     gone,
     wgetFails,
-    simulateClock,
+    allowLateProbe,
     env: extra,
   } = {},
 ) {
@@ -3643,6 +4138,9 @@ fi
 case "$1" in
   inspect)
     if [[ "$3" == "{{.State.Status}}" ]]; then
+      # A child sleep can keep the captured output pipe open if Bash job
+      # control puts it in a separate process group.
+      if [[ -n "\${STUB_STATE_DELAY:-}" ]]; then exec sleep "$STUB_STATE_DELAY"; fi
       [[ -z "\${STUB_STATE_GONE:-}" ]] || { echo "Error: No such object: caddy" >&2; exit 1; }
       echo "\${STUB_STATE:-running}"
     else
@@ -3654,6 +4152,8 @@ case "$1" in
     ;;
   exec)
     if [[ "$*" == *wget* ]]; then
+      if [[ -n "\${STUB_WGET_IGNORES_TERM:-}" ]]; then trap '' TERM; fi
+      if [[ -n "\${STUB_WGET_DELAY:-}" ]]; then sleep "$STUB_WGET_DELAY"; fi
       count="$(cat "$STUB_DIR/wget.count" 2> /dev/null || echo 0)"
       echo $((count + 1)) > "$STUB_DIR/wget.count"
       if [[ "\${STUB_WGET_FAILS:-0}" == always ]] || (( count < \${STUB_WGET_FAILS:-0} )); then
@@ -3674,16 +4174,24 @@ esac`,
   if (wgetFails !== undefined) env.STUB_WGET_FAILS = String(wgetFails);
   env.START_CADDY_READY_TIMEOUT = "2";
   env.START_CADDY_READY_INTERVAL = "0.1";
-  if (simulateClock) {
-    // Replace Bash's wall clock with a counter advanced by each sleep.
-    env.BASH_ENV = join(dir, "clock.bash");
+  if (allowLateProbe) {
+    // Let the probe return success past the deadline to test the final check.
+    env.BASH_ENV = join(dir, "timeout.bash");
     writeFileSync(
       env.BASH_ENV,
-      "unset SECONDS\nSECONDS=0\nsleep() { SECONDS=$((SECONDS + $1)); }\n",
+      `timeout() {
+        if [[ "$3" == docker && "$4" == exec ]]; then
+          shift 2
+          "$@"
+        else
+          command timeout "$@"
+        fi
+      }
+`,
     );
-    env.START_CADDY_READY_INTERVAL = "1";
   }
   Object.assign(env, extra);
+  const startedAt = performance.now();
   const result = spawnSync(
     "bash",
     [startCaddy, ...(args ?? [caddyImage, "/srv/delino", "delino"])],
@@ -3691,6 +4199,7 @@ esac`,
   );
   return {
     ...result,
+    elapsedMs: performance.now() - startedAt,
     calls: readFileSync(join(dir, "calls.log"), "utf8")
       .trim()
       .split("\n")
@@ -3972,7 +4481,12 @@ test(
       "data-root": "/mnt/docker",
       "registry-mirrors": ["https://mirror.example.com"],
       "log-driver": "json-file",
-      "log-opts": { "max-size": "10m" },
+      "log-opts": {
+        "max-size": "10m",
+        labels: "NaN",
+        env: "Infinity",
+        tag: "-Infinity",
+      },
       "default-address-pools": [{ base: "10.10.0.0/16", size: 24 }],
     };
     const fixture = logsFixture(t, {
@@ -4021,7 +4535,8 @@ test(
   { skip },
   (t) => {
     // Unusual formatting, key order and an extra setting must all stay.
-    const content = '{"data-root":"/x",   "log-driver":"local"}\n\n';
+    const content =
+      '{"data-root":"/x",   "log-driver":"local", "log-opts":{"labels":"NaN","env":"Infinity","tag":"-Infinity"}}\n\n';
     const result = logsFixture(t, { content }).run();
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.read(), content);
@@ -4133,6 +4648,34 @@ test(
 );
 
 test(
+  "configure-docker-logs rejects unquoted non-finite literals",
+  { skip },
+  (t) => {
+    for (const driver of ["json-file", "local"]) {
+      for (const literal of ["NaN", "Infinity", "-Infinity"]) {
+        const content = `{"log-driver":"${driver}","default-address-pools":[{"base":"10.10.0.0/16","size":${literal}}]}\n`;
+        const result = logsFixture(t, { content, driver }).run();
+        const label = `${driver} with ${literal}`;
+        assert.notEqual(result.status, 0, label);
+        assert.ok(
+          result.stderr.includes(
+            `${realpathSync(result.config)} is not valid JSON`,
+          ),
+          label,
+        );
+        assert.ok(
+          result.stderr.includes(`(unexpected literal ${literal})`),
+          label,
+        );
+        assert.equal(result.read(), content, label);
+        assert.deepEqual(result.calls, [], label);
+        assert.deepEqual(result.leftovers(), [], label);
+      }
+    }
+  },
+);
+
+test(
   "configure-docker-logs keeps the file and Docker when the write fails",
   { skip },
   (t) => {
@@ -4215,36 +4758,91 @@ test("start-caddy fails when Caddy never answers", { skip }, (t) => {
   }
 });
 
-test("start-caddy uses decimal readiness deadlines", { skip }, (t) => {
-  for (const [timeout, seconds] of [
-    ["010", 10],
-    ["10", 10],
-    ["000", 0],
-    ["0", 0],
-    [undefined, 30],
-  ]) {
-    const label = timeout ?? "default";
+test(
+  "start-caddy skips readiness commands at a zero deadline",
+  { skip },
+  (t) => {
+    for (const timeout of ["0", "000"]) {
+      const result = runCaddy(t, {
+        inspect: `${caddyImage} false`,
+        env: { START_CADDY_READY_TIMEOUT: timeout },
+      });
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, new RegExp(`within ${timeout} seconds`));
+      assert.match(result.stderr, /container state is unavailable/);
+      assert.deepEqual(result.calls, [caddyInspect, "docker start caddy"]);
+    }
+  },
+);
+
+test("start-caddy accepts a probe before the deadline", { skip }, (t) => {
+  const result = runCaddy(t, {
+    inspect: `${caddyImage} false`,
+    env: { START_CADDY_READY_TIMEOUT: "1", STUB_WGET_DELAY: "0.2" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, [
+    caddyInspect,
+    "docker start caddy",
+    caddyState,
+    caddyProbe,
+  ]);
+});
+
+for (const { name, env, wgetFails, allowLateProbe, state, attempts } of [
+  {
+    name: "a stalled inspect",
+    env: { STUB_STATE_DELAY: "8" },
+    state: "unavailable",
+    attempts: [],
+  },
+  {
+    name: "a slow admin response",
+    env: { STUB_WGET_DELAY: "3" },
+    state: "running",
+    attempts: [caddyProbe],
+  },
+  {
+    name: "an admin probe that ignores SIGTERM",
+    env: { STUB_WGET_DELAY: "8", STUB_WGET_IGNORES_TERM: "1" },
+    state: "running",
+    attempts: [caddyProbe],
+  },
+  {
+    name: "a retry interval longer than the remaining budget",
+    env: { START_CADDY_READY_INTERVAL: "8" },
+    wgetFails: "always",
+    state: "running",
+    attempts: [caddyProbe],
+  },
+  {
+    name: "a successful probe that returns after the deadline",
+    env: { STUB_WGET_DELAY: "1.2" },
+    allowLateProbe: true,
+    state: "running",
+    attempts: [caddyProbe],
+  },
+]) {
+  test(`start-caddy enforces the deadline with ${name}`, { skip }, (t) => {
     const result = runCaddy(t, {
       inspect: `${caddyImage} false`,
-      wgetFails: "always",
-      simulateClock: true,
-      env: { START_CADDY_READY_TIMEOUT: timeout },
+      wgetFails,
+      allowLateProbe,
+      env: { START_CADDY_READY_TIMEOUT: "1", ...env },
     });
-    assert.equal(result.status, 1, label);
-    assert.match(result.stderr, /did not answer its admin API/, label);
-    assert.match(
-      result.stderr,
-      new RegExp(`within ${timeout ?? seconds} seconds`),
-      label,
-    );
-    // The initial probe runs at second 0, even with a zero-second budget.
-    assert.equal(
-      result.calls.filter((call) => call === caddyProbe).length,
-      seconds + 1,
-      label,
-    );
-  }
-});
+    assert.equal(result.status, 1, result.stderr);
+    assert.ok(result.elapsedMs < 3_000, `took ${result.elapsedMs} ms`);
+    assert.match(result.stderr, /within 1 seconds/);
+    assert.match(result.stderr, new RegExp(`container state is ${state}`));
+    assert.match(result.stderr, /docker logs caddy/);
+    assert.deepEqual(result.calls, [
+      caddyInspect,
+      "docker start caddy",
+      caddyState,
+      ...attempts,
+    ]);
+  });
+}
 
 test("start-caddy fails when the container disappears", { skip }, (t) => {
   const result = runCaddy(t, { gone: true });

@@ -240,8 +240,8 @@ func Evaluate(req Request, d Device, now time.Time) (Outcome, string) {
 // reserves on a device of the host OS. The Hyper-V runtime, the only runtime
 // on a Windows host, rounds the memory of a VM up to an even number of MiB
 // (see newComputeSystemDoc in the agent's hcsrt package), so an odd request
-// reserves one MiB more there. Other hosts reserve the requested size. The
-// sandbox record keeps the requested size; only the reservation changes.
+// reserves one MiB more there, up to math.MaxInt64. Other hosts reserve the
+// requested size. The sandbox record keeps the requested size.
 // Keep this rule in step with the memory allocation sums in the api package.
 func EffectiveMemoryMiB(hostOS ownsandv1.HostOs, requested int64) int64 {
 	if hostOS == ownsandv1.HostOs_HOST_OS_WINDOWS && requested%2 != 0 && requested < math.MaxInt64 {

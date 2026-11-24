@@ -3,10 +3,12 @@
 package guest
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -274,5 +276,133 @@ func TestReadBeginSettlesPendingRemovalFirst(t *testing.T) {
 	m.sweep(m.now())
 	if !f.exists(t) {
 		t.Fatal("a sweep removed the live snapshot of the new read")
+	}
+}
+
+func TestReadPreparationRetriesFailedRemoval(t *testing.T) {
+	for _, retry := range []string{"sweep", "already-absent", "same-ID admission"} {
+		t.Run(retry, func(t *testing.T) {
+			h := newHarness(t, nil)
+			m := h.srv.reads
+			logger, logs := newBufferLogger()
+			m.logger = logger
+			m.forceCopy = true
+			gate, started, releaseCopy := newReadPreparationGate(t)
+			m.copyHook = gate
+
+			path := filepath.Join(t.TempDir(), "private-source")
+			if err := os.WriteFile(path, []byte("before"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			req := readReq(t, path)
+			id := req.GetReadId()
+			snap := filepath.Join(m.dir, id)
+			remover := &flakyRemover{fail: true}
+			if runtime.GOOS != "windows" {
+				m.removeFile = remover.remove
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			s := h.open(ctx)
+			defer s.s.CloseRequest()
+			s.send(1, req)
+			waitStarted(t, started)
+			waiter, err := m.begin(id, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			unblockRemoval := func() { remover.fail = false }
+			if runtime.GOOS == "windows" {
+				// A Windows os.Open handle denies delete sharing.
+				locked, err := os.Open(snap)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer locked.Close()
+				unblockRemoval = func() {
+					if err := locked.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			const updated = "after, longer"
+			if err := os.WriteFile(path, []byte(updated), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			releaseCopy()
+
+			const abortMessage = "read: file changed during the snapshot copy"
+			if got := s.recv().GetError(); got.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ABORTED || got.GetMessage() != abortMessage {
+				t.Fatalf("read returned %v, want the original preparation error", got)
+			}
+			waitClosed(t, waiter.ready)
+			if got := detailOf(waiter.err); got.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ABORTED || got.GetMessage() != abortMessage {
+				t.Fatalf("waiting caller got %v, want the original preparation error", got)
+			}
+			m.end(id, waiter)
+			h.waitReadCallsEnded(id)
+			if m.hasEntry(id) {
+				t.Fatal("failed entry stayed after the last call ended")
+			}
+
+			m.sweep(h.clock.Now())
+			if _, err := os.Lstat(snap); err != nil || m.pending[id] != snap {
+				t.Fatalf("failed sweep lost the snapshot or pending removal: stat error %v, pending %v", err, m.pending)
+			}
+			if _, _, got := h.readAll(req); got.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+				t.Fatalf("retry while removal fails returned %v, want unavailable", got)
+			}
+			if got := logs.String(); strings.Count(got, "remove read snapshot failed") != 1 ||
+				strings.Contains(got, filepath.Base(m.dir)) || strings.Contains(got, filepath.Base(path)) ||
+				strings.Contains(got, updated) || strings.Contains(got, "before") {
+				t.Fatalf("want one warning and no paths or file contents in the logs, got %q", got)
+			}
+
+			m.copyHook = nil
+			unblockRemoval()
+			if retry == "already-absent" {
+				if err := os.Remove(snap); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if retry != "same-ID admission" {
+				m.sweep(h.clock.Now())
+				if _, err := os.Lstat(snap); !errors.Is(err, fs.ErrNotExist) || len(m.pending) != 0 {
+					t.Fatalf("sweep did not clear the snapshot and pending removal: stat error %v, pending %v", err, m.pending)
+				}
+			}
+			if data, size, got := h.readAll(req); got != nil || string(data) != updated || size != int64(len(updated)) {
+				t.Fatalf("retry after cleanup returned %q, size %d, error %v", data, size, got)
+			}
+			h.waitReadCallsEnded(id)
+			m.sweep(h.clock.Now())
+			if data, err := os.ReadFile(snap); err != nil || string(data) != updated || len(m.pending) != 0 {
+				t.Fatalf("new snapshot after sweep contains %q, error %v, pending %v", data, err, m.pending)
+			}
+		})
+	}
+}
+
+func TestReadPreparationPreservesExistingDestination(t *testing.T) {
+	h := newHarness(t, nil)
+	m := h.srv.reads
+	path := filepath.Join(t.TempDir(), "source")
+	if err := os.WriteFile(path, []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req := readReq(t, path)
+	id := req.GetReadId()
+	snap := filepath.Join(m.dir, id)
+	if err := os.WriteFile(snap, []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, got := h.readAll(req); got.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_INTERNAL {
+		t.Fatalf("exclusive creation returned %v, want the original filesystem error", got)
+	}
+	h.waitReadCallsEnded(id)
+	m.sweep(h.clock.Now())
+	if data, err := os.ReadFile(snap); err != nil || string(data) != "existing" || len(m.pending) != 0 {
+		t.Fatalf("preexisting destination contains %q, error %v, pending %v", data, err, m.pending)
 	}
 }

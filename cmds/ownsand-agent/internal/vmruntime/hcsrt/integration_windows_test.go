@@ -130,6 +130,11 @@ func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExit
 	return out.String(), exited
 }
 
+func execSucceeded(exited *ownsandv1.ExecExited) bool {
+	code, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
+	return ok && code != nil && code.ExitCode == 0
+}
+
 // hostLANAddress returns an IPv4 address of a host interface that is not
 // loopback or link-local, which the OUTBOUND policy must block.
 func hostLANAddress() string {
@@ -218,8 +223,8 @@ func TestHyperVIntegration(t *testing.T) {
 		t.Fatalf("sandbox %v", sb)
 	}
 	out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo hello; uname -sm; echo state > /root/marker; df -k / | tail -1; ls /sys/class/net")
-	if ex.GetExitCode() != 0 || !strings.Contains(out, "hello\nLinux x86_64\n") {
-		t.Fatalf("exec output %q exited %v", out, ex)
+	if !execSucceeded(ex) || !strings.Contains(out, "hello\nLinux x86_64\n") {
+		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	t.Logf("guest: %s", strings.TrimSpace(out))
 	// The runtime copies the COM1 output (the kernel console) of the VM to
