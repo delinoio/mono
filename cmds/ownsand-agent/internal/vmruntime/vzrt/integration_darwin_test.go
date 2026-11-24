@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +69,19 @@ type env struct {
 	t *testing.T
 	m *sandboxes.Manager
 	d *ops.Dispatcher
+}
+
+// invalidateMemoryState corrupts a disposable snapshot without clearing its
+// memory-state flag, so create attempts native restore before falling back.
+func (e *env) invalidateMemoryState(snapshotID string) {
+	e.t.Helper()
+	dir, err := e.m.ImportDir(snapshotID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "content", "vm.state"), []byte("invalid machine state"), 0o600); err != nil {
+		e.t.Fatal(err)
+	}
 }
 
 func (e *env) create(snapshotID string, memMiB int64, network ownsandv1.NetworkMode, memoryRestore bool) *ownsandv1.SandboxStateEntry {
@@ -307,7 +321,24 @@ func TestVirtualizationIntegration(t *testing.T) {
 	if out, _ := e.exec(cold.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" {
 		t.Fatalf("cold-booted sandbox %q", out)
 	}
-	ids := []string{sb.GetSandboxId(), restored.GetSandboxId(), cold.GetSandboxId()}
+	if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: restored.GetSandboxId()}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("delete restored sandbox %v %v", en, err)
+	}
+	ids := []string{sb.GetSandboxId(), cold.GetSandboxId()}
+
+	if snap.GetHasMemoryState() {
+		e.invalidateMemoryState(snapID)
+		fallback := e.create(snapID, 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE, true)
+		if fallback.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
+			t.Fatalf("restore path after invalid memory state %v", fallback.GetRestorePath())
+		}
+		if out, ex := e.exec(fallback.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
+			t.Fatalf("sandbox after invalid memory state %q %v", out, ex)
+		}
+		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: fallback.GetSandboxId()}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			t.Fatalf("delete fallback sandbox %v %v", en, err)
+		}
+	}
 
 	if os.Getenv(envOutbound) != "" {
 		ob := e.create("", 512, ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, false)
