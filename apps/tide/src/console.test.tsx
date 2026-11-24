@@ -34,6 +34,7 @@ import {
   RunnerState,
 } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
+import { MemberService } from "@delino/tide-protos/v1/member_pb";
 import {
   type ListMembersRequest,
   MemberService,
@@ -2188,6 +2189,26 @@ describe("confirmation dialog requests", () => {
 });
 
 describe("invitations", () => {
+  function holdInvitationAccept() {
+    const mock = createMockTransport();
+    let release = () => {};
+    const promise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const requested = rs.fn();
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (method.name === MemberService.method.acceptInvitation.name) {
+          requested();
+          await promise;
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    return { transport, release, requested };
+  }
+
   test("accepts the secret from the link fragment and removes it from the address", async () => {
     renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`);
     await settle(20);
@@ -2198,6 +2219,62 @@ describe("invitations", () => {
     await settle(80);
     expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.contoso}`);
     expect(storedText()).not.toContain(MOCK_INVITATION_SECRET);
+  });
+
+  test.each(["the tide link", "browser Back"])(
+    "refreshes organizations without navigating after the user leaves via %s",
+    async (departure) => {
+      const { transport, release, requested } = holdInvitationAccept();
+      renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`, {
+        transport,
+      });
+      await click(screen.getByRole("button", { name: "Join organization" }));
+      expect(requested).toHaveBeenCalledTimes(1);
+
+      if (departure === "the tide link") {
+        await click(screen.getByRole("link", { name: "tide" }));
+        await click(await screen.findByRole("link", { name: /Acme Robotics/ }));
+      } else {
+        await act(async () => {
+          window.history.replaceState(null, "", `/orgs/${MOCK_IDS.acme}`);
+          window.dispatchEvent(new PopStateEvent("popstate"));
+        });
+      }
+      const switcher = await screen.findByRole("combobox", {
+        name: "Organization",
+      });
+      await click(switcher);
+      expect(screen.queryByRole("option", { name: /Contoso/ })).toBeNull();
+
+      await act(async () => release());
+
+      expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}`);
+      expect(
+        await screen.findByRole("option", { name: /Contoso/ }),
+      ).toBeTruthy();
+    },
+  );
+
+  test("keeps the new invitation when an earlier accept succeeds", async () => {
+    const { transport, release, requested } = holdInvitationAccept();
+    renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`, {
+      transport,
+    });
+    const join = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Join organization",
+    });
+    await click(join);
+    expect(requested).toHaveBeenCalledTimes(1);
+
+    const input = screen.getByLabelText<HTMLInputElement>(
+      "Invitation link or secret",
+    );
+    await type(input, "tdi_follow_up_invitation");
+    await act(async () => release());
+    await waitFor(() => expect(join.disabled).toBe(false));
+
+    expect(window.location.pathname).toBe("/invitations/accept");
+    expect(input.value).toBe("tdi_follow_up_invitation");
   });
 
   test("asks a signed-out user to sign in and open the link again", async () => {
