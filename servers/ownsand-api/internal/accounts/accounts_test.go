@@ -226,6 +226,95 @@ func TestTokenSourceWaiterCancelDoesNotEndTheSharedRefresh(t *testing.T) {
 	}
 }
 
+// gatedDoneContext lets a test hold the waiter just before it selects
+// between cancellation and refresh completion.
+type gatedDoneContext struct {
+	context.Context
+	resume <-chan struct{}
+}
+
+func (ctx gatedDoneContext) Done() <-chan struct{} {
+	<-ctx.resume
+	return ctx.Context.Done()
+}
+
+func TestTokenSourceWaitersRejectCompletedRefreshAfterCancellation(t *testing.T) {
+	ts := &tokenServer{t: t, expires: 3600, block: make(chan struct{}), entered: make(chan struct{}, 4)}
+	src := newSource(t, ts, &clock{now: time.Now()})
+	active := tokenAsync(src, context.Background())
+	awaitEntry(t, ts.entered, active, "the active caller's request")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	// Go may choose either ready select case. Use several waiters to exercise both.
+	const waiterCount = 32
+	resume := make(chan struct{})
+	releaseWaiters := sync.OnceFunc(func() { close(resume) })
+	defer releaseWaiters()
+	waiterCtx := gatedDoneContext{Context: ctx, resume: resume}
+	waiters := make([]<-chan tokenResult, waiterCount)
+	for i := range waiters {
+		waiters[i] = tokenAsync(src, waiterCtx)
+	}
+	waitForFlightWaiters(t, src, waiterCount+1)
+
+	cancel()
+	ts.release()
+	if r := receive(t, active, "the active caller"); r.err != nil || r.token != "token-1" {
+		t.Fatalf("active caller = %+v", r)
+	}
+	// The active caller received the token, so both select cases are ready now.
+	releaseWaiters()
+	for _, waiter := range waiters {
+		if r := receive(t, waiter, "the canceled waiter"); r.token != "" || r.err != context.Canceled {
+			t.Errorf("canceled waiter = %+v", r)
+		}
+	}
+	if tok, err := src.Token(t.Context()); tok != "token-1" || err != nil || ts.calls.Load() != 1 {
+		t.Fatalf("cached token = %q, %v (calls %d)", tok, err, ts.calls.Load())
+	}
+}
+
+func TestTokenSourceWaiterDeadlineEndsWhileRefreshIsPending(t *testing.T) {
+	ts := &tokenServer{t: t, expires: 3600, block: make(chan struct{}), entered: make(chan struct{}, 4)}
+	src := newSource(t, ts, &clock{now: time.Now()})
+	active := tokenAsync(src, context.Background())
+	awaitEntry(t, ts.entered, active, "the active caller's request")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancel()
+	waiter := tokenAsync(src, ctx)
+	waitForFlightWaiters(t, src, 2)
+	if r := receive(t, waiter, "the waiter with a deadline"); r.token != "" || r.err != context.DeadlineExceeded {
+		t.Fatalf("expired waiter = %+v", r)
+	}
+
+	ts.release()
+	if r := receive(t, active, "the active caller"); r.err != nil || r.token != "token-1" {
+		t.Fatalf("active caller = %+v", r)
+	}
+}
+
+func TestTokenSourceRejectsCacheHitAfterCancellation(t *testing.T) {
+	c := &clock{now: time.Now()}
+	ts := &tokenServer{t: t, expires: 3600}
+	src := newSource(t, ts, c)
+	if tok, err := src.Token(t.Context()); tok != "token-1" || err != nil {
+		t.Fatalf("initial token = %q, %v", tok, err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	// End the context after Token begins to check the cached token.
+	src.cfg.Now = func() time.Time {
+		cancel()
+		return c.Now()
+	}
+	if tok, err := src.Token(ctx); tok != "" || err != context.Canceled || ts.calls.Load() != 1 {
+		t.Fatalf("canceled caller = %q, %v (calls %d)", tok, err, ts.calls.Load())
+	}
+}
+
 func TestTokenSourceCallersShareOneRefreshAndTheCache(t *testing.T) {
 	c := &clock{now: time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)}
 	ts := &tokenServer{t: t, expires: 3600, block: make(chan struct{}), entered: make(chan struct{}, 4)}

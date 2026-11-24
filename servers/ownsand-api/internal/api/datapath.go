@@ -55,17 +55,43 @@ const (
 // wait timed out after the offer was sent.
 const abandonRevocationTimeout = 2 * time.Second
 
-// revocation is a session revocation that waits for its acknowledgement.
+type revocationDelivery uint8
+
+const (
+	revocationSending revocationDelivery = iota
+	revocationDeferred
+	revocationQueued
+)
+
+// revocation tracks delivery and acknowledgement on the original channel.
 type revocation struct {
 	deviceID string
 	gen      uint64
 	target   revocationTarget
+	envelope *ownsandv1.AgentEnvelope
+	delivery revocationDelivery
 	// expireAt is when the revoked session reaches its absolute expiry or the
 	// revoked grant stops being revocable. The agent never needs the
 	// revocation after that, so the sweep deletes it even when no
 	// acknowledgement arrived.
 	expireAt time.Time
 }
+
+func (r revocation) logQueued(ctx context.Context, logger *slog.Logger) {
+	message := r.envelope.GetSessionRevocation()
+	logger.InfoContext(ctx, "session_revocation_sent", slog.String("device_id", r.deviceID),
+		slog.String("revocation_id", message.GetRevocationId()), slog.String("session_id", message.GetSessionId()),
+		slog.String("grant_id", message.GetRelayGrantId()))
+}
+
+func (r revocation) logExpired(ctx context.Context, logger *slog.Logger) {
+	logger.InfoContext(ctx, "session_revocation_expired",
+		slog.String("revocation_id", r.envelope.GetSessionRevocation().GetRevocationId()),
+		slog.String("device_id", r.deviceID), slog.String("target", string(r.target)), slog.Time("expire_time", r.expireAt))
+}
+
+// removedDeviceKey marks a channel that is waiting for device clean-up.
+type removedDeviceKey struct{}
 
 // DataPlane holds the in-memory data path state of the lease holder:
 // sessions, relay grants, pending revocations and agent relay connections.
@@ -229,7 +255,10 @@ func (p *DataPlane) HandleEnvelope(ctx context.Context, conn *hub.Conn, env *own
 		p.S.Logger.InfoContext(ctx, "relay_grant_released", slog.String("device_id", conn.DeviceID), slog.String("grant_id", m.RelayGrantRelease.GetGrantId()))
 	case *ownsandv1.AgentEnvelope_RevocationAck:
 		p.mu.Lock()
-		delete(p.revocations, m.RevocationAck.GetRevocationId())
+		id := m.RevocationAck.GetRevocationId()
+		if r, ok := p.revocations[id]; ok && r.deviceID == conn.DeviceID && r.gen == conn.Generation {
+			delete(p.revocations, id)
+		}
 		p.mu.Unlock()
 	default:
 		return false
@@ -257,10 +286,17 @@ func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event) {
 	revoked := p.Grants.RemoveMatching(func(g *grants.Grant) bool {
 		return matchPrincipal(g.OrgID, g.Principal) || matchSandbox(g.SandboxID, g.DeviceID)
 	})
-	for _, g := range revoked {
-		p.sendRevocation(ctx, g.DeviceID, g.ChannelGen, revocationTargetRelayGrant, g.RevocableUntil(), &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_RelayGrantId{RelayGrantId: g.ID}})
-	}
 	p.mu.Lock()
+	if e.Kind == events.KindDeviceRemoved {
+		if conn := p.S.Hub.Get(e.DeviceID); conn != nil {
+			conn.SetValue(removedDeviceKey{}, true)
+		}
+		for id, r := range p.revocations {
+			if r.deviceID == e.DeviceID {
+				delete(p.revocations, id)
+			}
+		}
+	}
 	var sessions []*session
 	for id, s := range p.sessions {
 		if matchPrincipal(s.orgID, s.principal) || matchSandbox(s.sandboxID, s.deviceID) {
@@ -269,37 +305,69 @@ func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event) {
 		}
 	}
 	p.mu.Unlock()
+	// Device clean-up ends the sessions and streams of the removed device.
+	if e.Kind == events.KindDeviceRemoved {
+		return
+	}
+	for _, g := range revoked {
+		p.sendRevocation(ctx, g.DeviceID, g.ChannelGen, revocationTargetRelayGrant, g.RevocableUntil(), &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_RelayGrantId{RelayGrantId: g.ID}})
+	}
 	for _, s := range sessions {
 		p.sendRevocation(ctx, s.deviceID, s.gen, revocationTargetSession, s.expireAt, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_SessionId{SessionId: s.id}})
 	}
 }
 
-// sendRevocation sends r to the agent and keeps it pending until the agent
-// acknowledges it, its send fails, its channel closes or expireAt passes.
-func (p *DataPlane) sendRevocation(ctx context.Context, deviceID string, gen uint64, target revocationTarget, expireAt time.Time, r *ownsandv1.SessionRevocation) {
-	p.sweepRevocations(ctx, p.S.now())
+// sendRevocation makes the initial bounded enqueue. The pending record owns
+// delivery after a failed enqueue on a channel that stays live.
+func (p *DataPlane) sendRevocation(ctx context.Context, deviceID string, gen uint64, target revocationTarget, expireAt time.Time, message *ownsandv1.SessionRevocation) {
+	p.sweepRevocations(ctx, p.S.now(), false)
+	p.mu.Lock()
 	conn := p.S.Hub.Get(deviceID)
-	if conn == nil || conn.Generation != gen {
-		// The channel that signaled the session or sent the grant is gone,
-		// so the agent already ended them.
+	if conn == nil || conn.Generation != gen || conn.Value(removedDeviceKey{}) != nil {
+		p.mu.Unlock()
 		return
 	}
-	r.RevocationId = newID()
-	// A target that already ended needs no pending record: the agent ended it
-	// on its own, and nothing would ever delete the record.
+	id := newID()
+	message.RevocationId = id
+	r := revocation{
+		deviceID: deviceID, gen: gen, target: target, expireAt: expireAt, delivery: revocationSending,
+		envelope: &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SessionRevocation{SessionRevocation: message}},
+	}
 	if p.S.now().Before(expireAt) {
-		p.mu.Lock()
-		p.revocations[r.RevocationId] = revocation{deviceID: deviceID, gen: gen, target: target, expireAt: expireAt}
-		p.mu.Unlock()
+		p.revocations[id] = r
 	}
-	if err := conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SessionRevocation{SessionRevocation: r}}); err != nil {
-		p.mu.Lock()
-		delete(p.revocations, r.RevocationId)
-		p.mu.Unlock()
-		return
+	p.mu.Unlock()
+
+	err := conn.Send(ctx, r.envelope)
+	p.mu.Lock()
+	_, pending := p.revocations[id]
+	deferred, expired := false, false
+	if pending {
+		switch {
+		case err == nil:
+			r.delivery = revocationQueued
+			p.revocations[id] = r
+		case p.S.Hub.Get(deviceID) != conn:
+			delete(p.revocations, id)
+		case !p.S.now().Before(expireAt):
+			delete(p.revocations, id)
+			expired = true
+		default:
+			r.delivery = revocationDeferred
+			p.revocations[id] = r
+			deferred = true
+		}
 	}
-	p.S.Logger.InfoContext(ctx, "session_revocation_sent", slog.String("device_id", deviceID), slog.String("revocation_id", r.RevocationId),
-		slog.String("session_id", r.GetSessionId()), slog.String("grant_id", r.GetRelayGrantId()))
+	p.mu.Unlock()
+
+	if err == nil {
+		r.logQueued(ctx, p.S.Logger)
+	} else if expired {
+		r.logExpired(ctx, p.S.Logger)
+	} else if deferred {
+		p.S.Logger.InfoContext(ctx, "session_revocation_enqueue_deferred", slog.String("device_id", deviceID),
+			slog.String("revocation_id", id), slog.String("target", string(target)))
+	}
 }
 
 // PendingRevocations returns the number of unacknowledged revocations.
@@ -309,33 +377,42 @@ func (p *DataPlane) PendingRevocations() int {
 	return len(p.revocations)
 }
 
-// SweepExpired deletes the pending revocations whose session or grant has
-// ended. It implements DataPathHooks and runs periodically, so an idle lease
-// holder with open agent channels stays bounded as well.
+// SweepExpired deletes expired revocations and retries deferred enqueues. It
+// implements DataPathHooks and runs periodically, including on idle channels.
 func (p *DataPlane) SweepExpired(ctx context.Context) {
-	p.sweepRevocations(ctx, p.S.now())
+	p.sweepRevocations(ctx, p.S.now(), true)
 }
 
-// sweepRevocations deletes the pending revocations whose end time passed
-// without an acknowledgement: the session reached its absolute expiry or the
-// grant stopped being revocable, so the agent ended it by itself.
-func (p *DataPlane) sweepRevocations(ctx context.Context, now time.Time) {
-	type expired struct {
-		id string
-		revocation
-	}
-	var gone []expired
+// RPC paths only need expiry. The periodic sweep also tries each deferred
+// enqueue while holding mu, so acknowledgement and terminal cleanup cannot
+// race the retry. TrySend does not wait for space in the queue.
+func (p *DataPlane) sweepRevocations(ctx context.Context, now time.Time, retry bool) {
+	var expired, queued []revocation
 	p.mu.Lock()
 	for id, r := range p.revocations {
 		if !now.Before(r.expireAt) {
-			gone = append(gone, expired{id: id, revocation: r})
+			expired = append(expired, r)
 			delete(p.revocations, id)
+			continue
+		}
+		if !retry || r.delivery != revocationDeferred {
+			continue
+		}
+		sent, err := p.S.Hub.TrySend(r.deviceID, r.gen, r.envelope)
+		if err != nil {
+			delete(p.revocations, id)
+		} else if sent {
+			r.delivery = revocationQueued
+			p.revocations[id] = r
+			queued = append(queued, r)
 		}
 	}
 	p.mu.Unlock()
-	for _, e := range gone {
-		p.S.Logger.InfoContext(ctx, "session_revocation_expired", slog.String("revocation_id", e.id), slog.String("device_id", e.deviceID),
-			slog.String("target", string(e.target)), slog.Time("expire_time", e.expireAt))
+	for _, r := range expired {
+		r.logExpired(ctx, p.S.Logger)
+	}
+	for _, r := range queued {
+		r.logQueued(ctx, p.S.Logger)
 	}
 }
 
@@ -415,7 +492,7 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 	}
 	now := h.S.now()
 	h.sweepSessions(now)
-	h.sweepRevocations(ctx, now)
+	h.sweepRevocations(ctx, now, false)
 	sess := &session{id: newID(), orgID: sb.OrgID, sandboxID: sb.ID, deviceID: sb.DeviceID, gen: conn.Generation, principal: pr, expireAt: now.Add(sessionLifetime)}
 	// Register the session as pending first, so a revocation processed
 	// before the answer ends it as well.

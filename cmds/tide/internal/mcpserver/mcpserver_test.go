@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +26,7 @@ import (
 	"github.com/delinoio/mono/go/tide"
 	"github.com/delinoio/mono/go/tide/tidetest"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
 
 type harness struct {
@@ -186,6 +189,46 @@ func TestWaitLimit(t *testing.T) {
 	}
 }
 
+func TestExecTimeoutRange(t *testing.T) {
+	needPOSIX(t)
+	h := newHarness(t, Config{})
+	args := map[string]any{"session_id": h.running(), "command": []string{"sh", "-c", "exit 0"}}
+
+	for _, seconds := range []int64{-1, 9223372037, 18446744074} {
+		args["timeout_seconds"] = seconds
+		if text, isErr := h.call("exec", args, nil); !isErr || !strings.HasPrefix(text, "invalid_argument:") {
+			t.Errorf("timeout_seconds %d = %q, isError = %v", seconds, text, isErr)
+		}
+		if got := len(h.srv.ExecRequests()); got != 0 {
+			t.Fatalf("timeout_seconds %d sent %d exec requests", seconds, got)
+		}
+	}
+
+	args["timeout_seconds"] = int64(9223372036)
+	if text, isErr := h.call("exec", args, nil); isErr {
+		t.Fatalf("maximum timeout: %s", text)
+	}
+	requests := h.srv.ExecRequests()
+	if len(requests) != 1 {
+		t.Fatalf("got %d exec requests, want 1", len(requests))
+	}
+	if got := requests[0].GetTimeout().AsDuration(); got != 9223372036*time.Second {
+		t.Fatalf("maximum timeout = %v, want 9223372036 seconds", got)
+	}
+
+	args["timeout_seconds"] = 0
+	if text, isErr := h.call("exec", args, nil); isErr {
+		t.Fatalf("zero timeout: %s", text)
+	}
+	requests = h.srv.ExecRequests()
+	if len(requests) != 2 {
+		t.Fatalf("got %d exec requests, want 2", len(requests))
+	}
+	if requests[1].GetTimeout() != nil {
+		t.Fatalf("zero timeout sent %v, want absent field", requests[1].GetTimeout())
+	}
+}
+
 func TestExecWithinAndBeyondWait(t *testing.T) {
 	needPOSIX(t)
 	h := newHarness(t, Config{})
@@ -227,6 +270,116 @@ func TestExecWithinAndBeyondWait(t *testing.T) {
 	// A timeout stops the command.
 	if _, isErr := h.call("exec", map[string]any{"session_id": id, "command": []string{"sleep", "10"}, "timeout_seconds": 1}, &r); isErr || !r.TimedOut {
 		t.Fatalf("timeout exec = %+v", r)
+	}
+}
+
+type attachExecFixture struct {
+	tidev1connect.UnimplementedDevSessionServiceHandler
+	attach func(context.Context, *tidev1.AttachDevSessionExecRequest, *connect.ServerStream[tidev1.AttachDevSessionExecResponse]) error
+}
+
+func (f attachExecFixture) AttachDevSessionExec(ctx context.Context, req *connect.Request[tidev1.AttachDevSessionExecRequest], stream *connect.ServerStream[tidev1.AttachDevSessionExecResponse]) error {
+	return f.attach(ctx, req.Msg, stream)
+}
+
+func TestExecOutputAttachConfirmation(t *testing.T) {
+	const (
+		execID       = "test-exec"
+		stdoutOffset = 12
+		stderrOffset = 34
+		maxWait      = time.Second + 200*time.Millisecond
+		deadline     = "deadline_exceeded: exec_output did not confirm exec test-exec before the wait expired. Retry with the same exec_id, stdout_offset 12, and stderr_offset 34."
+	)
+	keepalive := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Keepalive{Keepalive: &tidev1.DevSessionExecKeepalive{}}}
+	output := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Stdout{
+		Stdout: &tidev1.DevSessionExecOutput{Offset: stdoutOffset, Data: []byte("hi")},
+	}}
+	truncated := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_OutputTruncated{
+		OutputTruncated: &tidev1.DevSessionExecOutputTruncated{StdoutOffset: 16, StderrOffset: stderrOffset},
+	}}
+	exited := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Exited{
+		Exited: &tidev1.DevSessionExecExited{Status: &tidev1.DevSessionExecExited_ExitCode{ExitCode: 7}},
+	}}
+	exitCode := int64(7)
+	tests := []struct {
+		name       string
+		wait       int
+		events     []*tidev1.DevSessionExecEvent
+		code       connect.Code
+		wantErr    string
+		running    bool
+		stdout     string
+		stdoutNext int64
+		missing    *tide.ByteRange
+		exit       *int64
+	}{
+		{name: "silent wait", wait: 1, wantErr: deadline},
+		{name: "silent poll", wantErr: deadline},
+		{name: "keepalive wait", wait: 1, events: []*tidev1.DevSessionExecEvent{keepalive}, wantErr: deadline},
+		{name: "keepalive poll", events: []*tidev1.DevSessionExecEvent{keepalive}, wantErr: deadline},
+		{name: "missing", code: connect.CodeNotFound, wantErr: "not_found: attach rejected"},
+		{name: "denied", code: connect.CodePermissionDenied, wantErr: "permission_denied: attach rejected"},
+		{name: "running", events: []*tidev1.DevSessionExecEvent{output}, running: true, stdout: "hi", stdoutNext: 14},
+		{name: "truncated", events: []*tidev1.DevSessionExecEvent{truncated}, running: true, stdoutNext: 16, missing: &tide.ByteRange{From: 12, To: 16}},
+		{name: "exited silently", events: []*tidev1.DevSessionExecEvent{exited}, stdoutNext: stdoutOffset, exit: &exitCode},
+		{name: "exited with output", wait: 1, events: []*tidev1.DevSessionExecEvent{output, exited}, stdout: "hi", stdoutNext: 14, exit: &exitCode},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, handler := tidev1connect.NewDevSessionServiceHandler(attachExecFixture{attach: func(ctx context.Context, req *tidev1.AttachDevSessionExecRequest, stream *connect.ServerStream[tidev1.AttachDevSessionExecResponse]) error {
+				if req.GetExecId() != execID || req.GetStdoutOffset() != stdoutOffset || req.GetStderrOffset() != stderrOffset {
+					t.Errorf("attach request = %v", req)
+				}
+				if tc.code != 0 {
+					return connect.NewError(tc.code, errors.New("attach rejected"))
+				}
+				for _, event := range tc.events {
+					if err := stream.Send(&tidev1.AttachDevSessionExecResponse{Event: event}); err != nil {
+						return err
+					}
+				}
+				if tc.exit != nil {
+					return nil
+				}
+				<-ctx.Done()
+				return ctx.Err()
+			}})
+			upstream := httptest.NewUnstartedServer(handler)
+			upstream.Config.Protocols = new(http.Protocols)
+			upstream.Config.Protocols.SetUnencryptedHTTP2(true)
+			upstream.Start()
+			t.Cleanup(upstream.Close)
+			h := newHarness(t, Config{maxWait: maxWait, Client: func() (*tide.Client, error) {
+				return tide.New(tide.Options{BaseURL: upstream.URL, APIKey: "test-key"})
+			}})
+			var out execResult
+			start := time.Now()
+			message, isErr := h.call("exec_output", map[string]any{
+				"session_id": "test-session", "exec_id": execID, "stdout_offset": stdoutOffset,
+				"stderr_offset": stderrOffset, "wait_seconds": tc.wait,
+			}, &out)
+			if elapsed := time.Since(start); elapsed > maxWait+time.Second {
+				t.Errorf("attach took %v, cap is %v", elapsed, maxWait)
+			}
+			if tc.wantErr != "" {
+				if !isErr || message != tc.wantErr {
+					t.Fatalf("attach error = %v %q, want %q", isErr, message, tc.wantErr)
+				}
+				return
+			}
+			if isErr || out.ExecID != execID || out.Running != tc.running || !reflect.DeepEqual(out.ExitCode, tc.exit) {
+				t.Fatalf("attach result = %q %+v", message, out)
+			}
+			if out.Stdout != (Output{Text: tc.stdout, From: stdoutOffset, To: tc.stdoutNext}) ||
+				out.Stderr != (Output{From: stderrOffset, To: stderrOffset}) ||
+				out.NextStdoutOffset != tc.stdoutNext || out.NextStderrOffset != stderrOffset {
+				t.Fatalf("attach output and offsets = %+v", out)
+			}
+			if tc.missing != nil && !reflect.DeepEqual(out.OutputTruncated, []Truncated{{MissingStdout: tc.missing}}) {
+				t.Fatalf("attach truncation = %+v", out.OutputTruncated)
+			}
+		})
 	}
 }
 
@@ -273,6 +426,119 @@ func TestExecOutputWindowAndOffsets(t *testing.T) {
 	}
 	if m := out.OutputTruncated[0].MissingStdout; m == nil || m.From != 0 || m.To != 100000-100 {
 		t.Fatalf("missing = %+v", m)
+	}
+	if out.Stdout != (Output{Text: strings.Repeat("0", 96) + "999\n", To: 100000}) || out.NextStdoutOffset != 100000 {
+		t.Fatalf("short retained output = %+v, next = %d", out.Stdout, out.NextStdoutOffset)
+	}
+
+	for _, stream := range []string{"stdout", "stderr"} {
+		t.Run(stream+" truncated prefix", func(t *testing.T) {
+			h := newHarness(t, Config{})
+			h.srv.OutputKeepBytes = 65536
+			id := h.running()
+			script := `emit() { i=0; while [ "$i" -lt 1024 ]; do printf '%04d%0123d\n' "$i" 0; i=$((i+1)); done; }; `
+			if stream == "stderr" {
+				script += "printf short; emit >&2"
+			} else {
+				script += "printf short >&2; emit"
+			}
+			var run execResult
+			if msg, bad := h.call("exec", map[string]any{"session_id": id, "command": []string{"sh", "-c", script}}, &run); bad || run.ExitCode == nil || *run.ExitCode != 0 {
+				t.Fatalf("exec: %s", msg)
+			}
+			args := map[string]any{"session_id": id, "exec_id": run.ExecID, "stdout_offset": 0, "stderr_offset": 0}
+			var result execResult
+			if msg, bad := h.call("exec_output", args, &result); bad || result.ExitCode == nil {
+				t.Fatalf("exec_output: %s", msg)
+			}
+			preview, other := result.Stdout, result.Stderr
+			next, otherNext := result.NextStdoutOffset, result.NextStderrOffset
+			missing := &tide.ByteRange{From: 0, To: 65536}
+			wantTruncated := Truncated{MissingStdout: missing}
+			if stream == "stderr" {
+				preview, other = other, preview
+				next, otherNext = otherNext, next
+				wantTruncated = Truncated{MissingStderr: missing}
+			}
+			if !reflect.DeepEqual(result.OutputTruncated, []Truncated{wantTruncated}) {
+				t.Fatalf("truncated = %+v, want %+v", result.OutputTruncated, wantTruncated)
+			}
+			wantOmitted := tide.ByteRange{From: 73728, To: 106496}
+			if preview.From != 0 || preview.To != 131072 || next != 131072 || preview.Omitted == nil || *preview.Omitted != wantOmitted {
+				t.Fatalf("%s from = %d, to = %d, next = %d, omitted = %+v", stream, preview.From, preview.To, next, preview.Omitted)
+			}
+			if other != (Output{Text: "short", To: 5}) || otherNext != 5 {
+				t.Fatalf("other stream = %+v, next = %d", other, otherNext)
+			}
+			args[stream+"_offset"] = preview.Omitted.From
+			if msg, bad := h.call("exec_output", args, &result); bad || len(result.OutputTruncated) != 0 {
+				t.Fatalf("resume: %s, truncated = %+v", msg, result.OutputTruncated)
+			}
+			resumed := result.Stdout
+			if stream == "stderr" {
+				resumed = result.Stderr
+			}
+			if resumed.From != 73728 || !strings.HasPrefix(resumed.Text, "0576") {
+				t.Fatalf("resumed %s does not start at byte 73728", stream)
+			}
+		})
+	}
+}
+
+func TestExecOutputWindowAndOffsetsWithGaps(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		before   int
+		after    int
+		wantText string
+		wantOmit *tide.ByteRange
+	}{
+		{
+			name:     "gap in head",
+			before:   3000,
+			after:    40000,
+			wantText: strings.Repeat("a", 3000) + strings.Repeat("b", 5192) + "\n[... output omitted ...]\n" + strings.Repeat("b", 24576),
+			wantOmit: &tide.ByteRange{From: 55192, To: 65424},
+		},
+		{
+			name:     "gap in tail",
+			before:   28192,
+			after:    20000,
+			wantText: strings.Repeat("a", 8192) + "\n[... output omitted ...]\n" + strings.Repeat("b", 20000),
+			wantOmit: &tide.ByteRange{From: 8192, To: 50000},
+		},
+		{
+			name:     "all received bytes kept",
+			before:   3000,
+			after:    20000,
+			wantText: strings.Repeat("a", 3000) + strings.Repeat("b", 20000),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const afterOffset = 50000
+			c := newCollector(0, 7)
+			missing := tide.ByteRange{From: int64(tc.before), To: afterOffset}
+			for _, ev := range []tide.ExecEvent{
+				{Kind: tide.ExecEventStdout, Data: []byte(strings.Repeat("a", tc.before))},
+				{Kind: tide.ExecEventOutputTruncated, MissingStdout: missing},
+				{Kind: tide.ExecEventStdout, Offset: afterOffset, Data: []byte(strings.Repeat("b", tc.after))},
+			} {
+				if err := c.on(ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := c.result("exec", nil)
+			wantNext := int64(afterOffset + tc.after)
+			if r.Stdout.From != 0 || r.Stdout.To != wantNext || r.NextStdoutOffset != wantNext || !reflect.DeepEqual(r.Stdout.Omitted, tc.wantOmit) {
+				t.Fatalf("stdout from = %d, to = %d, next = %d, omitted = %+v, want omitted = %+v", r.Stdout.From, r.Stdout.To, r.NextStdoutOffset, r.Stdout.Omitted, tc.wantOmit)
+			}
+			if r.Stdout.Text != tc.wantText {
+				t.Fatal("stdout preview differs from the expected text")
+			}
+			if r.Stderr != (Output{From: 7, To: 7}) || r.NextStderrOffset != 7 || !reflect.DeepEqual(r.OutputTruncated, []Truncated{{MissingStdout: &missing}}) {
+				t.Fatalf("stderr = %+v, next = %d, truncated = %+v", r.Stderr, r.NextStderrOffset, r.OutputTruncated)
+			}
+		})
 	}
 }
 

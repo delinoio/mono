@@ -68,14 +68,12 @@ const (
 	DefaultSTUNRateBytesPerSecond = 1024
 	DefaultSTUNRateBurstBytes     = 4096
 	// MinSTUNRateBurstBytes is the smallest accepted STUN_RATE_LIMIT_BURST_BYTES.
-	// The limiter drops a response that is larger than the whole burst, so a
-	// smaller burst silently turns the server into one that never answers.
-	// A STUN message is a 20-byte header plus attributes. The 8-byte
-	// FINGERPRINT is always present; the largest success response adds the
-	// 24-byte IPv6 XOR-MAPPED-ADDRESS (52 bytes), and the smallest 420 error
-	// response (one unknown attribute) is 64 bytes. 64 bytes therefore admits
-	// every response that the server can build for a binding request.
-	MinSTUNRateBurstBytes = 64
+	// The limiter cannot send a response larger than the burst. The largest
+	// success response is 52 bytes. The largest 420 error response has a
+	// 20-byte header, a 28-byte ERROR-CODE, a 744-byte UNKNOWN-ATTRIBUTES
+	// attribute and an 8-byte FINGERPRINT. The 1500-byte maxDatagram limit
+	// in package stun allows up to 370 distinct unknown required attributes.
+	MinSTUNRateBurstBytes = 800
 	// DefaultAccountsAPIOrigin is the production origin of the delino-accounts
 	// API.
 	DefaultAccountsAPIOrigin = "https://accounts.api.delino.io"

@@ -32,6 +32,8 @@ type Record struct {
 	IdleTTL     time.Duration         `json:"idle_ttl"`
 	// IdleDeadline is not enforced while the sandbox is paused.
 	IdleDeadline time.Time `json:"idle_deadline"`
+	// PausedAtEnd keeps the idle deadline suspended when retrying a lost VM end.
+	PausedAtEnd bool `json:"paused_at_end,omitempty"`
 	// DeleteMarker: a delete arrived before the create, which the agent
 	// then rejects.
 	DeleteMarker bool `json:"delete_marker,omitempty"`
@@ -73,23 +75,25 @@ func (r *Record) Entry(epoch string) *ownsandv1.SandboxStateEntry {
 
 // ttlReason returns the end reason of the earlier passed deadline at now,
 // or UNSPECIFIED when no deadline passed. MAX_TTL_EXPIRED wins when both
-// deadlines are equal. A paused sandbox has no idle deadline.
+// deadlines are equal. The idle deadline is suspended while the sandbox is
+// paused and when retrying the lost VM end of a paused sandbox.
 //
 // A sandbox in DELETING whose failed end attempt recorded a TTL reason keeps
-// that reason. The state change to DELETING hides that the sandbox was
-// paused, so recomputing the reason would apply its stale idle deadline and
-// could replace MAX_TTL_EXPIRED with IDLE_TTL_EXPIRED on a retry.
+// that reason. For caller deletes, a passed idle deadline still makes a retry
+// due even when the sandbox was paused before the delete.
 func (r *Record) ttlReason(now time.Time) ownsandv1.SandboxEndReason {
+	idleSuspended := r.State == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED
 	if r.State == ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
 		switch r.EndReason {
 		case ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED,
 			ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED:
 			return r.EndReason
+		case ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE:
+			idleSuspended = r.PausedAtEnd
 		}
 	}
 	maxPassed := !r.MaxDeadline.IsZero() && !now.Before(r.MaxDeadline)
-	idleApplies := r.State != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED && !r.IdleDeadline.IsZero()
-	idlePassed := idleApplies && !now.Before(r.IdleDeadline)
+	idlePassed := !idleSuspended && !r.IdleDeadline.IsZero() && !now.Before(r.IdleDeadline)
 	switch {
 	case maxPassed && idlePassed:
 		if r.IdleDeadline.Before(r.MaxDeadline) {
@@ -112,9 +116,9 @@ func (r *Record) ttlReason(now time.Time) ownsandv1.SandboxEndReason {
 // stale idle deadline of a paused sandbox is the deadline that passed.
 //
 // LOST_ON_DEVICE is the other exception: a lost VM has no deadline of its own,
-// so a deadline that passed before the retry wins and the sandbox ends with the
-// TTL reason, as a live record of a lost VM does. A lost VM whose end failed
-// keeps LOST_ON_DEVICE without a passed deadline; Tick retries that end.
+// so an applicable deadline that passed before the retry sets the TTL end
+// reason, as it does for a live record of a lost VM. Without such a deadline,
+// Tick retries the end with LOST_ON_DEVICE.
 //
 // The deadlines still decide only whether an end is due, so the retry cadence
 // is the one of ttlReason: Tick retries a failed caller delete when a deadline

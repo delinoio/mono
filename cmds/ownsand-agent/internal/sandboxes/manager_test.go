@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -332,7 +334,11 @@ func (e *env) restart() {
 var limits = &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 4096, DiskGib: 20, VcpuOvercommitPercent: 100}
 
 func (e *env) createCmd(vcpu int32, idle, max time.Duration) *ownsandv1.CreateSandboxCommand {
-	id, _ := uuidv7.NewString()
+	e.t.Helper()
+	id, err := uuidv7.NewString()
+	if err != nil {
+		e.t.Fatalf("generate sandbox ID for create: %v", err)
+	}
 	return &ownsandv1.CreateSandboxCommand{
 		SandboxId:   id,
 		Source:      &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_LINUX},
@@ -394,6 +400,9 @@ func TestCreateDeleteLifecycle(t *testing.T) {
 	if err != nil || del.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || del.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
 		t.Fatalf("delete %v %v", del, err)
 	}
+	if stored := persistedRecord(t, e.st, id); !proto.Equal(stored.Entry(e.m.Epoch()), del) {
+		t.Fatalf("persisted record = %+v, want entry %v", stored, del)
+	}
 	want := []ownsandv1.SandboxState{
 		ownsandv1.SandboxState_SANDBOX_STATE_CREATING, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING,
 		ownsandv1.SandboxState_SANDBOX_STATE_DELETING, ownsandv1.SandboxState_SANDBOX_STATE_DELETED,
@@ -418,6 +427,105 @@ func TestCreateDeleteLifecycle(t *testing.T) {
 			t.Fatal("revision did not increase")
 		}
 		last = en.GetRevision().GetCounter()
+	}
+}
+
+func TestDeleteRetriesTerminalRecordSaveAfterRuntimeStops(t *testing.T) {
+	const timeout = 5 * time.Second
+	ctx := context.Background()
+	e := newEnv(t)
+	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	cmd := &ownsandv1.DeleteSandboxCommand{SandboxId: id}
+	started, block := make(chan struct{}), make(chan struct{})
+	e.rt.mu.Lock()
+	e.rt.deleteStarted, e.rt.deleteBlock = started, block
+	e.rt.mu.Unlock()
+	release := sync.OnceFunc(func() { close(block) })
+	var entry *ownsandv1.SandboxStateEntry
+	var deleteErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		entry, deleteErr = e.m.Delete(ctx, cmd)
+	}()
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			t.Error("delete did not finish during cleanup")
+		}
+	})
+	select {
+	case <-started:
+	case <-done:
+		t.Fatalf("delete finished before runtime cleanup: %v, %v", entry, deleteErr)
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for runtime cleanup")
+	}
+	deleting := persistedRecord(t, e.st, id)
+	if deleting.State != ownsandv1.SandboxState_SANDBOX_STATE_DELETING || deleting.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
+		t.Fatalf("record before runtime cleanup = %+v, want DELETING with caller reason", deleting)
+	}
+	restore := breakFile(t, e.st.Path(store.SandboxesDir, id+".json"))
+	release()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for delete")
+	}
+	// A second runtime Delete would now return normally and count as a call.
+	e.rt.mu.Lock()
+	e.rt.deleteBlock = nil
+	e.rt.mu.Unlock()
+
+	checkFailedDelete := func(seq uint64, entry *ownsandv1.SandboxStateEntry, err error) {
+		t.Helper()
+		if entry != nil || err == nil || !strings.Contains(err.Error(), "sandboxes: save record:") {
+			t.Fatalf("delete %d = %v, %v, want a record save error without an entry", seq, entry, err)
+		}
+		want := deleting.Entry(e.m.Epoch())
+		if report := e.m.StateReport(seq, nil); len(report.GetSandboxes()) != 1 || !proto.Equal(report.GetSandboxes()[0], want) {
+			t.Fatalf("state report after delete %d = %v, want only %v", seq, report.GetSandboxes(), want)
+		}
+		if got := e.out.lastEntry(id); !proto.Equal(got, want) {
+			t.Fatalf("update after delete %d = %v, want %v", seq, got, want)
+		}
+		n := e.out.count()
+		e.m.Tick(ctx, true)
+		if got := e.out.lastEntry(id); e.out.count() != n+1 || !proto.Equal(got, want) {
+			t.Fatalf("resend after delete %d = %v, want one resend of %v", seq, got, want)
+		}
+	}
+	checkFailedDelete(1, entry, deleteErr)
+	// Once the runtime stopped, even a delete with a different reason must
+	// complete the outcome already recorded in DELETING.
+	cmd.EndReason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED
+	entry, deleteErr = e.m.Delete(ctx, cmd)
+	checkFailedDelete(2, entry, deleteErr)
+	restore()
+	if stored := persistedRecord(t, e.st, id); stored.EndReason != deleting.EndReason || !proto.Equal(stored.Entry(e.m.Epoch()), deleting.Entry(e.m.Epoch())) {
+		t.Fatalf("record after failed saves = %+v, want %+v", stored, deleting)
+	}
+
+	entry, err := e.m.Delete(ctx, cmd)
+	if err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || entry.GetEndReason() != deleting.EndReason {
+		t.Fatalf("delete after recovery = %v, %v, want DELETED with %v", entry, err, deleting.EndReason)
+	}
+	if stored := persistedRecord(t, e.st, id); !proto.Equal(stored.Entry(e.m.Epoch()), entry) {
+		t.Fatalf("persisted record = %+v, want entry %v", stored, entry)
+	}
+	if update := e.out.lastEntry(id); !proto.Equal(update, entry) {
+		t.Fatalf("terminal update = %v, want %v", update, entry)
+	}
+	if again, err := e.m.Delete(ctx, cmd); err != nil || !proto.Equal(again, entry) {
+		t.Fatalf("idempotent delete = %v, %v, want %v", again, err, entry)
+	}
+	e.rt.mu.Lock()
+	calls := e.rt.deleteCalls
+	e.rt.mu.Unlock()
+	if ended := e.ex.endedCalls(id); calls != 1 || ended != 1 {
+		t.Fatalf("runtime delete calls = %d, exec end notifications = %d, want one each", calls, ended)
 	}
 }
 
@@ -517,44 +625,121 @@ func TestDeleteMarkerIsNotReportedUntilItIsSaved(t *testing.T) {
 	}
 }
 
-// blockingGate is a CreateGate whose BeginCreate waits until release is closed.
-// entered receives one value per BeginCreate call that started waiting.
-type blockingGate struct {
-	entered chan struct{}
-	release chan struct{}
+const createGateTimeout = 5 * time.Second
+
+type gateCreateResult struct {
+	entry *ownsandv1.SandboxStateEntry
+	err   error
 }
 
-func newBlockingGate() *blockingGate {
-	return &blockingGate{entered: make(chan struct{}, 8), release: make(chan struct{})}
+// blockingGate holds creates in BeginCreate until the test or cleanup releases it.
+// entered receives one value per BeginCreate call that started waiting.
+type blockingGate struct {
+	entered  chan struct{}
+	released chan struct{}
+	release  func()
+	results  chan gateCreateResult
+	workers  []<-chan struct{}
+}
+
+func newBlockingGate(t *testing.T, workerCount int) *blockingGate {
+	released := make(chan struct{})
+	g := &blockingGate{
+		entered:  make(chan struct{}, workerCount),
+		released: released,
+		release:  sync.OnceFunc(func() { close(released) }),
+		results:  make(chan gateCreateResult, workerCount),
+	}
+	// Tests construct the gate after newEnv so workers can finish before
+	// cleanup closes the manager and removes its store.
+	t.Cleanup(func() {
+		g.release()
+		timer := time.NewTimer(createGateTimeout)
+		defer timer.Stop()
+		for i, worker := range g.workers {
+			select {
+			case <-worker:
+			case <-timer.C:
+				t.Errorf("gate cleanup: create worker %d did not return within %s", i+1, createGateTimeout)
+				return
+			}
+		}
+	})
+	return g
 }
 
 func (g *blockingGate) BeginCreate() (func(), error) {
-	g.entered <- struct{}{}
-	<-g.release
+	select {
+	case g.entered <- struct{}{}:
+	case <-g.released:
+	}
+	<-g.released
 	return func() {}, nil
+}
+
+func (g *blockingGate) startCreate(ctx context.Context, m *Manager, cmd *ownsandv1.CreateSandboxCommand) {
+	stopped := make(chan struct{})
+	g.workers = append(g.workers, stopped)
+	go func() {
+		defer close(stopped)
+		entry, err := m.Create(ctx, cmd)
+		g.results <- gateCreateResult{entry, err}
+	}()
+}
+
+func (g *blockingGate) waitEntry(ctx context.Context, stage string) error {
+	var res gateCreateResult
+	select {
+	case <-g.entered:
+		return nil
+	case res = <-g.results:
+	case <-ctx.Done():
+		// Report the create result if it arrived by the time the wait expired.
+		select {
+		case res = <-g.results:
+		default:
+			return fmt.Errorf("%s: wait for gate entry: %w", stage, ctx.Err())
+		}
+	}
+	if res.err != nil {
+		return fmt.Errorf("%s: create returned before gate entry with entry %v: %w", stage, res.entry, res.err)
+	}
+	return fmt.Errorf("%s: create returned before gate entry with entry %v and no error", stage, res.entry)
+}
+
+func (g *blockingGate) requireEntry(t *testing.T, stage string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), createGateTimeout)
+	defer cancel()
+	if err := g.waitEntry(ctx, stage); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (g *blockingGate) waitResult(t *testing.T, stage string) gateCreateResult {
+	t.Helper()
+	select {
+	case res := <-g.results:
+		return res
+	case <-time.After(createGateTimeout):
+		t.Fatalf("%s: create did not return within %s", stage, createGateTimeout)
+		return gateCreateResult{}
+	}
 }
 
 func TestCreateGateRecheckAfterConcurrentDelete(t *testing.T) {
 	e := newEnv(t)
-	gate := newBlockingGate()
+	gate := newBlockingGate(t, 1)
 	e.m.SetCreateGate(gate)
 	cmd := e.createCmd(1, time.Hour, time.Hour)
-	type result struct {
-		entry *ownsandv1.SandboxStateEntry
-		err   error
-	}
-	done := make(chan result, 1)
-	go func() {
-		entry, err := e.m.Create(context.Background(), cmd)
-		done <- result{entry, err}
-	}()
-	<-gate.entered
-	del, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: cmd.GetSandboxId()})
+	gate.startCreate(t.Context(), e.m, cmd)
+	gate.requireEntry(t, "create before concurrent delete")
+	del, err := e.m.Delete(t.Context(), &ownsandv1.DeleteSandboxCommand{SandboxId: cmd.GetSandboxId()})
 	if err != nil || del.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
 		t.Fatalf("delete %v %v", del, err)
 	}
-	close(gate.release)
-	res := <-done
+	gate.release()
+	res := gate.waitResult(t, "create after concurrent delete")
 	var ce *CommandError
 	if !errors.As(res.err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
 		t.Fatalf("create after concurrent delete: %v", res.err)
@@ -562,35 +747,51 @@ func TestCreateGateRecheckAfterConcurrentDelete(t *testing.T) {
 	if n := e.rt.startCount(); n != 0 {
 		t.Fatalf("VM starts after delete = %d, want 0", n)
 	}
-	e.m.mu.Lock()
-	got := e.m.sandboxes[cmd.GetSandboxId()].rec.State
-	e.m.mu.Unlock()
-	if got != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+	if got, _ := e.m.State(cmd.GetSandboxId()); got != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
 		t.Fatalf("record state %v, want DELETED", got)
+	}
+}
+
+func TestCreateGateRecheckAfterRemoval(t *testing.T) {
+	e := newEnv(t)
+	gate := newBlockingGate(t, 1)
+	e.m.SetCreateGate(gate)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	gate.startCreate(t.Context(), e.m, cmd)
+	gate.requireEntry(t, "create before removal")
+	if err := e.m.RemoveAll(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	gate.release()
+	res := gate.waitResult(t, "create after removal")
+	var ce *CommandError
+	if !errors.As(res.err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Errorf("create after removal: %v, want FAILED_PRECONDITION", res.err)
+	}
+	if n := e.rt.startCount(); n != 0 {
+		t.Errorf("VM starts after removal = %d, want 0", n)
+	}
+	if entries := e.m.Entries(); len(entries) != 0 {
+		t.Errorf("sandboxes registered after removal: %v", entries)
+	}
+	if _, err := os.Stat(e.st.Path(store.SandboxesDir, cmd.GetSandboxId()+".json")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("sandbox record after removal: %v, want absent", err)
 	}
 }
 
 func TestCreateGateRecheckDuplicateCreateStartsOnce(t *testing.T) {
 	e := newEnv(t)
-	gate := newBlockingGate()
+	gate := newBlockingGate(t, 2)
 	e.m.SetCreateGate(gate)
 	cmd := e.createCmd(1, time.Hour, time.Hour)
-	type result struct {
-		entry *ownsandv1.SandboxStateEntry
-		err   error
-	}
-	done := make(chan result, 2)
 	for range 2 {
-		go func() {
-			entry, err := e.m.Create(context.Background(), cmd)
-			done <- result{entry, err}
-		}()
+		gate.startCreate(t.Context(), e.m, cmd)
 	}
-	<-gate.entered
-	<-gate.entered
-	close(gate.release)
-	for range 2 {
-		res := <-done
+	gate.requireEntry(t, "first duplicate create")
+	gate.requireEntry(t, "second duplicate create")
+	gate.release()
+	for i := range 2 {
+		res := gate.waitResult(t, fmt.Sprintf("duplicate create result %d", i+1))
 		if res.err != nil || res.entry.GetSandboxId() != cmd.GetSandboxId() {
 			t.Fatalf("create: %v %v", res.entry, res.err)
 		}
@@ -602,17 +803,73 @@ func TestCreateGateRecheckDuplicateCreateStartsOnce(t *testing.T) {
 
 func TestCreateGateControlStartsOnce(t *testing.T) {
 	e := newEnv(t)
-	gate := newBlockingGate()
-	close(gate.release)
+	gate := newBlockingGate(t, 1)
+	gate.release()
 	e.m.SetCreateGate(gate)
 	cmd := e.createCmd(1, time.Hour, time.Hour)
-	entry, err := e.m.Create(context.Background(), cmd)
-	if err != nil || entry.GetSandboxId() != cmd.GetSandboxId() {
-		t.Fatalf("create: %v %v", entry, err)
+	gate.startCreate(t.Context(), e.m, cmd)
+	res := gate.waitResult(t, "create through open gate")
+	if res.err != nil || res.entry.GetSandboxId() != cmd.GetSandboxId() {
+		t.Fatalf("create: %v %v", res.entry, res.err)
 	}
 	if n := e.rt.startCount(); n != 1 {
 		t.Fatalf("VM starts = %d, want 1", n)
 	}
+}
+
+func TestCreateGateControlEntryWait(t *testing.T) {
+	t.Run("early result", func(t *testing.T) {
+		e := newEnv(t)
+		gate := newBlockingGate(t, 1)
+		e.m.SetCreateGate(gate)
+		cmd := e.createCmd(1, time.Hour, time.Hour)
+		cmd.SandboxId = ""
+		gate.startCreate(t.Context(), e.m, cmd)
+		ctx, cancel := context.WithTimeout(t.Context(), createGateTimeout)
+		defer cancel()
+		err := gate.waitEntry(ctx, "invalid sandbox ID")
+		var ce *CommandError
+		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT ||
+			!strings.Contains(err.Error(), "invalid sandbox ID: create returned before gate entry") ||
+			!strings.Contains(err.Error(), "sandbox_id") {
+			t.Fatalf("gate entry wait = %v, want the sandbox ID validation error", err)
+		}
+	})
+	t.Run("missing entry and result", func(t *testing.T) {
+		gate := newBlockingGate(t, 1)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Millisecond)
+		defer cancel()
+		err := gate.waitEntry(ctx, "missing create")
+		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "missing create: wait for gate entry") {
+			t.Fatalf("gate entry wait = %v, want a gate entry deadline", err)
+		}
+	})
+}
+
+func TestCreateGateControlCleanupAfterDeleteFailure(t *testing.T) {
+	var gate *blockingGate
+	if !t.Run("failed delete", func(t *testing.T) {
+		e := newEnv(t)
+		gate = newBlockingGate(t, 1)
+		e.m.SetCreateGate(gate)
+		cmd := e.createCmd(1, time.Hour, time.Hour)
+		gate.startCreate(t.Context(), e.m, cmd)
+		gate.requireEntry(t, "create before failed delete")
+		id := cmd.GetSandboxId()
+		blockRecord(t, e.st, id)
+		_, err := e.m.Delete(t.Context(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+		requireInternal(t, err)
+		// Exit with the gate held, as the delete test does on failure.
+	}) {
+		return
+	}
+	select {
+	case <-gate.workers[0]:
+	default:
+		t.Fatal("gate cleanup did not join the create worker")
+	}
+	res := gate.waitResult(t, "create after failed delete cleanup")
+	requireInternal(t, res.err)
 }
 
 func TestDeleteCancelsRunningCreate(t *testing.T) {
@@ -800,8 +1057,8 @@ func TestTTLEndRetriesAfterStopFailure(t *testing.T) {
 
 // TestMaxTTLReasonSurvivesRetryOfPausedSandbox checks that a retry after a
 // failed stop keeps MAX_TTL_EXPIRED for a paused sandbox. The record in
-// DELETING no longer says paused, so recomputing the reason would apply the
-// idle deadline that the pause suspended.
+// DELETING keeps the selected TTL reason even if the idle deadline from
+// before the pause has also passed.
 func TestMaxTTLReasonSurvivesRetryOfPausedSandbox(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(10*time.Minute, time.Hour).GetSandboxId()
@@ -873,9 +1130,8 @@ func (e *env) failCallerDelete(id string, pause bool) {
 
 // TestCallerDeleteRetryKeepsReasonWhenIdleDeadlinePassed checks that a Tick
 // retry of a failed caller delete of a paused sandbox ends it as
-// DELETED_BY_CALLER. The pause suspended the idle deadline, but the record in
-// DELETING no longer says paused, so the stale idle deadline counts as passed
-// and used to replace the caller reason with IDLE_TTL_EXPIRED.
+// DELETED_BY_CALLER. The idle deadline from before the pause still makes the
+// retry due.
 func TestCallerDeleteRetryKeepsReasonWhenIdleDeadlinePassed(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(10*time.Minute, 24*time.Hour).GetSandboxId()
@@ -1254,6 +1510,71 @@ func TestRemoveAllRetriesFailedDeletion(t *testing.T) {
 	}
 }
 
+func TestRemoveAllCancelsCreateAndRetriesFailedDeletion(t *testing.T) {
+	e := newEnv(t)
+	e.rt.block = make(chan struct{})
+	e.rt.deleteFails = 1
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	created := make(chan error, 1)
+	go func() {
+		_, err := e.m.Create(t.Context(), cmd)
+		created <- err
+	}()
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_CREATING)
+
+	removed := make(chan error, 1)
+	go func() { removed <- e.m.RemoveAll(t.Context()) }()
+	select {
+	case err := <-created:
+		if err == nil {
+			t.Fatal("canceled create succeeded")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("removal did not cancel the create")
+	}
+	select {
+	case err := <-removed:
+		if err == nil {
+			t.Fatal("removal succeeded despite the delete failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("removal did not return")
+	}
+	if entries := e.m.Entries(); len(entries) != 1 || entries[0].GetSandboxId() != id {
+		t.Fatalf("sandboxes after the delete failure: %v, want %s", entries, id)
+	}
+	record := e.st.Path(store.SandboxesDir, id+".json")
+	if _, err := os.Stat(record); err != nil {
+		t.Fatalf("sandbox record after the delete failure: %v", err)
+	}
+
+	// A regression must return from Create even if it bypasses the fence.
+	close(e.rt.block)
+	requireCreateRefused := func() {
+		t.Helper()
+		_, err := e.m.Create(t.Context(), e.createCmd(1, time.Hour, time.Hour))
+		var ce *CommandError
+		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+			t.Fatalf("fresh create after removal: %v, want FAILED_PRECONDITION", err)
+		}
+	}
+	requireCreateRefused()
+	if err := e.m.RemoveAll(t.Context()); err != nil {
+		t.Fatalf("removal retry failed: %v", err)
+	}
+	requireCreateRefused()
+	if entries := e.m.Entries(); len(entries) != 0 {
+		t.Errorf("sandboxes after the retry: %v", entries)
+	}
+	if _, err := os.Stat(record); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("sandbox record after the retry: %v, want absent", err)
+	}
+	if calls := e.rt.deleteCallCount(); calls != 2 {
+		t.Errorf("runtime Delete calls = %d, want 2", calls)
+	}
+}
+
 // TestRestartPendingCleanupRejectsVMOperations checks that a live record kept
 // for a cleanup retry has no VM, so pause, resume and snapshot are rejected
 // instead of passing a nil VM to the runtime.
@@ -1406,6 +1727,80 @@ func TestFailedEndOfLostVMKeepsDeadlineWinning(t *testing.T) {
 		if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
 			t.Fatalf("restart=%v: end reason %v, want IDLE_TTL_EXPIRED", restart, r)
 		}
+	}
+}
+
+func TestFailedEndOfPausedLostVMIgnoresIdleDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		elapsed   time.Duration
+		wantState ownsandv1.SandboxState
+		wantEnd   ownsandv1.SandboxEndReason
+	}{
+		{"idle passed", 10 * time.Minute, ownsandv1.SandboxState_SANDBOX_STATE_FAILED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE},
+		{"max passed", 2 * time.Hour, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED},
+	} {
+		for _, retry := range []string{"tick", "restart"} {
+			t.Run(tc.name+"/"+retry, func(t *testing.T) {
+				ctx := context.Background()
+				e := newEnv(t)
+				id := e.create(5*time.Minute, time.Hour).GetSandboxId()
+				if entry, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+					t.Fatalf("pause: %v %v", entry, err)
+				}
+				e.loseVMWithFailedEnd(id)
+				if n := e.ex.endedCalls(id); n != 0 {
+					t.Fatalf("exec tracker notified %d times before cleanup succeeded", n)
+				}
+				e.clk.Advance(tc.elapsed)
+				if retry == "restart" {
+					e.restart()
+				} else {
+					e.m.Tick(ctx, false)
+				}
+				waitState(t, e.m, id, tc.wantState)
+				if reason := endReason(e.m, id); reason != tc.wantEnd {
+					t.Fatalf("end reason %v, want %v", reason, tc.wantEnd)
+				}
+				if retry == "tick" {
+					e.m.Tick(ctx, true)
+					e.ex.mu.Lock()
+					reason, calls := e.ex.ended[id], e.ex.calls[id]
+					e.ex.mu.Unlock()
+					if reason != tc.wantEnd || calls != 1 {
+						t.Fatalf("exec tracker notified %d times with %v, want 1 with %v", calls, reason, tc.wantEnd)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRestartLegacyFailedEndOfPausedLostVM(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	id := e.create(5*time.Minute, time.Hour).GetSandboxId()
+	if entry, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("pause: %v %v", entry, err)
+	}
+	e.loseVMWithFailedEnd(id)
+	data, err := os.ReadFile(e.st.Path(store.SandboxesDir, id+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record map[string]json.RawMessage
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatal(err)
+	}
+	delete(record, "paused_at_end")
+	if err := e.st.SaveSandbox(id, record); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(10 * time.Minute)
+	e.restart()
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if reason := endReason(e.m, id); reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
+		t.Fatalf("legacy end reason %v, want IDLE_TTL_EXPIRED", reason)
 	}
 }
 
@@ -1565,24 +1960,20 @@ func failRevisions(t *testing.T, st *store.Store) (restore func()) {
 // persistedState returns the state of the saved record of a sandbox.
 func persistedState(t *testing.T, st *store.Store, id string) ownsandv1.SandboxState {
 	t.Helper()
-	var state ownsandv1.SandboxState
-	found := false
-	if err := st.LoadSandboxes(func(data []byte) error {
-		var rec Record
-		if err := json.Unmarshal(data, &rec); err != nil {
-			return err
-		}
-		if rec.SandboxID == id {
-			state, found = rec.State, true
-		}
-		return nil
-	}); err != nil {
+	return persistedRecord(t, st, id).State
+}
+
+func persistedRecord(t *testing.T, st *store.Store, id string) Record {
+	t.Helper()
+	data, err := os.ReadFile(st.Path(store.SandboxesDir, id+".json"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !found {
-		t.Fatalf("no saved record of %s", id)
+	var rec Record
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatal(err)
 	}
-	return state
+	return rec
 }
 
 func requireStates(t *testing.T, got, want []ownsandv1.SandboxState) {
@@ -1940,6 +2331,8 @@ func TestResendTerminalUpdateAfterLostVM(t *testing.T) {
 // update for a sandbox whose VM stop has not returned, and starts no second
 // end for it.
 func TestResendSkipsSandboxWhoseEndIsRunning(t *testing.T) {
+	const waitTimeout = 5 * time.Second
+
 	e := newEnv(t)
 	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
 	e.rt.mu.Lock()
@@ -1947,12 +2340,31 @@ func TestResendSkipsSandboxWhoseEndIsRunning(t *testing.T) {
 	e.rt.deleteBlock = make(chan struct{})
 	started, block := e.rt.deleteStarted, e.rt.deleteBlock
 	e.rt.mu.Unlock()
-	done := make(chan error, 1)
+	release := sync.OnceFunc(func() { close(block) })
+	done := make(chan struct{})
+	// Release and join the delete worker before the manager and store clean up.
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-done:
+		case <-time.After(waitTimeout):
+			t.Error("timed out waiting for sandbox Delete during cleanup")
+		}
+	})
+
+	// Closing done publishes deleteErr and lets cleanup observe completion too.
+	var deleteErr error
 	go func() {
-		_, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
-		done <- err
+		_, deleteErr = e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+		close(done)
 	}()
-	<-started
+	select {
+	case <-started:
+	case <-done:
+		t.Fatalf("sandbox Delete returned before runtime entry: %v", deleteErr)
+	case <-time.After(waitTimeout):
+		t.Fatal("timed out waiting for sandbox Delete to enter the runtime")
+	}
 	n := e.out.count()
 	e.clk.Advance(11 * time.Minute)
 	e.m.Tick(context.Background(), true)
@@ -1968,9 +2380,14 @@ func TestResendSkipsSandboxWhoseEndIsRunning(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("%d runtime Delete calls while the end was running, want 1", calls)
 	}
-	close(block)
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	release()
+	select {
+	case <-done:
+		if deleteErr != nil {
+			t.Fatal(deleteErr)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("timed out waiting for sandbox Delete to finish after releasing the runtime")
 	}
 	requireTerminalResend(t, e, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER)
 }
@@ -2199,21 +2616,47 @@ func TestPauseDoesNotUndoWhenOnlyTheRecordSaveFails(t *testing.T) {
 }
 
 func TestDeleteSnapshotDuringCreate(t *testing.T) {
+	const waitTimeout = 5 * time.Second
+
 	e := newEnv(t)
 	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
-	snapID, _ := uuidv7.NewString()
+	snapID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatalf("generate snapshot ID: %v", err)
+	}
 	e.rt.snapStarted = make(chan struct{})
 	e.rt.snapBlock = make(chan struct{})
 	type result struct {
 		entry *ownsandv1.SnapshotStateEntry
 		err   error
 	}
-	done := make(chan result, 1)
+	results := make(chan result, 1)
+	workerDone := make(chan struct{})
+	release := sync.OnceFunc(func() { close(e.rt.snapBlock) })
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-workerDone:
+		case <-time.After(waitTimeout):
+			t.Errorf("snapshot create worker did not exit during cleanup within %s", waitTimeout)
+		}
+	})
 	go func() {
-		entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
-		done <- result{entry, err}
+		defer close(workerDone)
+		entry, err := e.m.CreateSnapshot(t.Context(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+		results <- result{entry, err}
 	}()
-	<-e.rt.snapStarted
+	var ce *CommandError
+	select {
+	case <-e.rt.snapStarted:
+	case res := <-results:
+		if errors.As(res.err, &ce) {
+			t.Fatalf("snapshot create returned before capture started with %s: %v (entry=%v)", ce.Code, res.err, res.entry)
+		}
+		t.Fatalf("snapshot create returned before capture started: entry=%v, error=%v", res.entry, res.err)
+	case <-time.After(waitTimeout):
+		t.Fatalf("snapshot capture did not start within %s", waitTimeout)
+	}
 	// While the capture runs, the snapshot is not recorded and not reported.
 	if e.m.HasSnapshot(snapID) {
 		t.Fatal("capturing snapshot is recorded")
@@ -2222,7 +2665,6 @@ func TestDeleteSnapshotDuringCreate(t *testing.T) {
 		t.Fatal("capturing snapshot is in the state report")
 	}
 	// A second create for the same snapshot does not touch the capture.
-	var ce *CommandError
 	other := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
 	if _, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: other}); !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
 		t.Fatalf("duplicate create during capture = %v", err)
@@ -2230,8 +2672,13 @@ func TestDeleteSnapshotDuringCreate(t *testing.T) {
 	if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}); err != nil {
 		t.Fatalf("delete during capture = %v", err)
 	}
-	close(e.rt.snapBlock)
-	res := <-done
+	release()
+	var res result
+	select {
+	case res = <-results:
+	case <-time.After(waitTimeout):
+		t.Fatalf("snapshot create did not finish after releasing capture within %s", waitTimeout)
+	}
 	if !errors.As(res.err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
 		t.Fatalf("create after a delete = %v, %v", res.entry, res.err)
 	}

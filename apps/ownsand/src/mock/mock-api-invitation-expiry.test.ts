@@ -89,38 +89,45 @@ describe("mock invitation expiry", () => {
     expect(res.member?.role).toBe(Role.MEMBER);
   });
 
-  test("the expiry check runs before the already-member check", async () => {
+  test("lists a pending invitation only before expiry and keeps the record", async () => {
     const { members } = start();
     const organizationId = MOCK_IDS.acme;
     const { invitation, invitationSecret } = await members.createInvitation({
       organizationId,
       role: Role.MEMBER,
     });
-    const memberCount = async () =>
-      (await members.listMembers({ organizationId })).members.length;
-    const before = await memberCount();
+    const listInvitations = async () =>
+      (await members.listInvitations({ organizationId })).invitations;
+    const before = await members.listMembers({ organizationId });
 
     // The caller owns the organization, so a valid invitation conflicts.
-    rs.setSystemTime(T0 + CREATED_TTL_MS - 1);
+    const expiry = T0 + CREATED_TTL_MS;
+    rs.setSystemTime(expiry - 1);
+    expect(await listInvitations()).toEqual([invitation]);
+    expect(invitation?.state).toBe(InvitationState.PENDING);
     expect(await codeOf(members.acceptInvitation({ invitationSecret }))).toBe(
       Code.AlreadyExists,
     );
-    rs.setSystemTime(T0 + CREATED_TTL_MS);
+
+    rs.setSystemTime(expiry);
+    expect(await listInvitations()).toEqual([]);
     expect(await codeOf(members.acceptInvitation({ invitationSecret }))).toBe(
       Code.NotFound,
     );
 
-    expect(await memberCount()).toBe(before);
-    const { invitations } = await members.listInvitations({ organizationId });
-    expect(
-      invitations.find((i) => i.invitationId === invitation!.invitationId)
-        ?.state,
-    ).toBe(InvitationState.PENDING);
+    rs.setSystemTime(expiry + 1);
+    expect(await listInvitations()).toEqual([]);
+    expect(await members.listMembers({ organizationId })).toEqual(before);
+
+    rs.setSystemTime(expiry - 1);
+    expect(await listInvitations()).toEqual([invitation]);
   });
 
-  test("a revoked invitation stays not found before its expiry", async () => {
+  test("omits a revoked invitation while another pending invitation is active", async () => {
     const { members } = start();
     const organizationId = MOCK_IDS.acme;
+    const before = await members.listInvitations({ organizationId });
+    expect(before.invitations).toHaveLength(1);
     const { invitation, invitationSecret } = await members.createInvitation({
       organizationId,
       role: Role.MEMBER,
@@ -129,8 +136,32 @@ describe("mock invitation expiry", () => {
       organizationId,
       invitationId: invitation!.invitationId,
     });
+    expect(await members.listInvitations({ organizationId })).toEqual(before);
     expect(await codeOf(members.acceptInvitation({ invitationSecret }))).toBe(
       Code.NotFound,
     );
+  });
+
+  test("requires organization membership and an owner or admin role to list invitations", async () => {
+    const { members } = start();
+    expect(
+      await codeOf(
+        members.listInvitations({ organizationId: MOCK_IDS.contoso }),
+      ),
+    ).toBe(Code.NotFound);
+    expect(
+      await codeOf(
+        members.listInvitations({ organizationId: MOCK_IDS.northwind }),
+      ),
+    ).toBe(Code.PermissionDenied);
+
+    const admin = createClient(
+      MemberService,
+      createMockTransport({ userId: "user-admin-jun" }),
+    );
+    const { invitations } = await admin.listInvitations({
+      organizationId: MOCK_IDS.acme,
+    });
+    expect(invitations).toHaveLength(1);
   });
 });

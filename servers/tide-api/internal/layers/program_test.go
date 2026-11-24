@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 
 	"github.com/delinoio/mono/go/ownsand"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/servers/tide-api/internal/agent"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/app"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
@@ -33,6 +35,9 @@ func (programAdapter) Kind() tidev1.WorkloadKind {
 }
 func (programAdapter) BindsAtDispatch() bool                      { return true }
 func (programAdapter) Prepare(context.Context, *work.Guest) error { return nil }
+func (programAdapter) ProgramExited(req *work.Request, res *ownsand.ExecResult) (work.RequestEnd, bool) {
+	return new(agent.Adapter).ProgramExited(req, res)
+}
 func (a programAdapter) Start(ctx context.Context, g *work.Guest) (work.StartResult, error) {
 	execID := api.NewID()
 	if _, err := g.Client.Exec(ctx, g.Runner.SandboxID, ownsand.ExecParams{ExecID: execID, Command: []string{"agent", "worker", "start"}}); err != nil {
@@ -42,10 +47,40 @@ func (a programAdapter) Start(ctx context.Context, g *work.Guest) (work.StartRes
 	return work.StartResult{ProgramExecID: execID}, nil
 }
 
-// TestRunnerProgramLifecycle: a program runner waits for work, becomes BUSY
-// when the source reports it, and its exit ends the request and deletes the
-// sandbox. The engine follows the program with AttachExec.
 func TestRunnerProgramLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		exitCode     int64
+		runnerReason tidev1.RunnerEndReason
+		requestEnd   work.RequestEnd
+		endRequest   bool
+		deleteRunner bool
+	}{
+		{
+			name: "successful exit", runnerReason: tidev1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE,
+			requestEnd: work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_ENDED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_COMPLETED},
+		},
+		{
+			name: "nonzero exit", exitCode: 7, runnerReason: tidev1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE,
+			requestEnd: work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_FAILED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_RUNNER_LOST},
+		},
+		{
+			name: "request ends during retry", endRequest: true, runnerReason: tidev1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE,
+			requestEnd: work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER},
+		},
+		{
+			name: "runner deletion during retry", deleteRunner: true, runnerReason: tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER,
+			requestEnd: work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_FAILED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_RUNNER_LOST},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testRunnerProgramExit(t, tc.exitCode, tc.runnerReason, tc.requestEnd, tc.endRequest, tc.deleteRunner)
+		})
+	}
+}
+
+func testRunnerProgramExit(t *testing.T, exitCode int64, runnerReason tidev1.RunnerEndReason, requestEnd work.RequestEnd, endRequest, deleteRunner bool) {
+	t.Helper()
 	fake := ownsandfake.New()
 	l := &layers.Layers{}
 	adapter := programAdapter{started: make(chan string, 1)}
@@ -63,8 +98,7 @@ func TestRunnerProgramLifecycle(t *testing.T) {
 	fake.SetExec(nil, func(ctx context.Context, sandboxID, execID string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
 		select {
 		case <-exit:
-			code := int64(0)
-			return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
+			return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &exitCode}, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -119,16 +153,46 @@ func TestRunnerProgramLifecycle(t *testing.T) {
 	if err := l.Engine.MarkBusy(ctx, w.org.ID, runnerID, ""); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := l.Engine.GetRequest(ctx, env.DB.Pool, w.org.ID, req.ID)
-	if got.State != tidev1.RequestState_REQUEST_STATE_RUNNING || got.StartTime == nil {
-		t.Fatalf("request %+v", got)
-	}
+	restore := env.FailProgramExitCommits()
 	close(exit)
+	eventually(t, "PostgreSQL rejecting the exit commit", func() bool {
+		return strings.Contains(env.Logs.String(), "injected program exit commit failure")
+	})
+	got, err := l.Engine.GetRequest(ctx, env.DB.Pool, w.org.ID, req.ID)
+	if err != nil || got.State != tidev1.RequestState_REQUEST_STATE_RUNNING || got.StartTime == nil ||
+		w.runner(t, runnerID).GetState() != tidev1.RunnerState_RUNNER_STATE_BUSY || fake.Active(w.osOrg) != 1 {
+		t.Fatalf("after failed commit: request %+v, error %v", got, err)
+	}
+	if endRequest {
+		if _, err := l.Engine.EndRequest(ctx, w.org.ID, req.ID, requestEnd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if deleteRunner {
+		// Keep the runner in DELETING while the follower retries the exit.
+		fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = errors.New("sandbox deletion temporarily unavailable") })
+		resp, err := env.User(w.org.Admin).Work.DeleteRunner(ctx, connect.NewRequest(&tidev1.DeleteRunnerRequest{
+			OrganizationId: w.org.ID, RunnerId: runnerID,
+		}))
+		if err != nil || resp.Msg.GetRunner().GetState() != tidev1.RunnerState_RUNNER_STATE_DELETING {
+			t.Fatalf("start concurrent deletion: %v, %v", resp, err)
+		}
+	}
+	restore()
+	if deleteRunner {
+		stays(t, "the user's deletion", func() bool {
+			r := w.runner(t, runnerID)
+			return r.GetState() == tidev1.RunnerState_RUNNER_STATE_DELETING && r.GetEndReason() == runnerReason
+		})
+		fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
+	}
 	eventually(t, "runner deleted", func() bool { return w.runner(t, runnerID).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED })
 	r := w.runner(t, runnerID)
-	got, _ = l.Engine.GetRequest(ctx, env.DB.Pool, w.org.ID, req.ID)
-	if r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE || got.State != tidev1.RequestState_REQUEST_STATE_ENDED ||
-		got.EndReason != tidev1.RequestEndReason_REQUEST_END_REASON_COMPLETED || fake.Active(w.osOrg) != 0 {
-		t.Fatalf("after exit: runner %v request %+v active %d", r, got, fake.Active(w.osOrg))
+	got, err = l.Engine.GetRequest(ctx, env.DB.Pool, w.org.ID, req.ID)
+	if err != nil || r.GetEndReason() != runnerReason || got.State != requestEnd.State || got.EndReason != requestEnd.Reason || fake.Active(w.osOrg) != 0 {
+		t.Fatalf("after exit: runner %v request %+v active %d error %v", r, got, fake.Active(w.osOrg), err)
+	}
+	if attach, exec := fake.Calls("AttachExec"), fake.Calls("Exec"); attach != 1 || exec != 1 {
+		t.Fatalf("program used %d attach calls and %d execs, want one each", attach, exec)
 	}
 }

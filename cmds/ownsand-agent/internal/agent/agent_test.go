@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -40,7 +42,9 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/processrt"
 	"github.com/delinoio/mono/go/uuidv7"
+	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
 
 var guestBinary string
@@ -350,6 +354,67 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	requireEmptyStateDir(t, st)
 }
 
+func TestFreeDiskCapabilityAndAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		free int64
+		fits bool
+	}{
+		{"saturated capacity", math.MaxInt64, true},
+		{"insufficient capacity", (1 << 30) - 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := testcp.New(t)
+			var downloadStarted atomic.Bool
+			b := bucketWithHook(t, func(r *http.Request) int {
+				if r.Method == http.MethodGet {
+					downloadStarted.Store(true)
+				}
+				return http.StatusNotFound
+			})
+			cp.SetSignedURLBase(b.URL)
+			st, id := enrollDevice(t, cp)
+			h := startWith(t, cp, st, id, func(opts *Options) {
+				opts.FreeDisk = func() (int64, error) { return tc.free, nil }
+			})
+			env, _ := h.wait(0, "capability report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil })
+			if got := env.GetCapabilityReport().GetCapabilities().GetFreeDiskBytes(); got != tc.free {
+				t.Fatalf("reported free disk = %d, want %d", got, tc.free)
+			}
+			h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+
+			sandboxID, _ := uuidv7.NewString()
+			create := h.command(createCommand(sandboxID))
+			if tc.fits {
+				if create.GetError() != nil || create.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+					t.Fatalf("create with %d free bytes = %v, want a running sandbox", tc.free, create)
+				}
+			} else if err := create.GetError(); err.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED ||
+				err.GetMessage() != "free disk of the state directory does not fit the sandbox disk" {
+				t.Fatalf("create with %d free bytes = %v, want insufficient disk", tc.free, create)
+			}
+
+			// The part metadata declares 1 GiB. The bucket returns 404 so
+			// the test can check admission without transferring 1 GiB.
+			snapshotID, _ := uuidv7.NewString()
+			res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ImportSnapshot{
+				ImportSnapshot: &ownsandv1.ImportSnapshotCommand{
+					Snapshot: &ownsandv1.SnapshotStateEntry{SnapshotId: snapshotID},
+					Parts:    []*ownsandv1.SnapshotPart{{PartNumber: 1, SizeBytes: 1 << 30, Sha256: make([]byte, sha256.Size)}},
+				},
+			}})
+			if tc.fits {
+				if res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS || !downloadStarted.Load() {
+					t.Fatalf("import with %d free bytes = %v, want a download attempt", tc.free, res)
+				}
+			} else if err := res.GetError(); err.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED ||
+				err.GetMessage() != "free disk does not fit the snapshot import" || downloadStarted.Load() {
+				t.Fatalf("import with %d free bytes = %v, want insufficient disk before download", tc.free, res)
+			}
+		})
+	}
+}
+
 // TestStatusRecordsCapabilities checks that the status file holds the
 // capabilities of the capability report that the agent sent, so that
 // `ownsand-agent status` can print the hypervisor checks.
@@ -431,6 +496,121 @@ func TestRemovalNoticeAtAuthenticate(t *testing.T) {
 		t.Fatal("removal not confirmed")
 	}
 	requireEmptyStateDir(t, st)
+}
+
+// createAdmissionGate holds a create before the manager can register it.
+type createAdmissionGate struct {
+	entered, resume, finished chan struct{}
+}
+
+func (g createAdmissionGate) BeginCreate() (func(), error) {
+	close(g.entered)
+	<-g.resume
+	return func() { close(g.finished) }, nil
+}
+
+// confirmRemovalGate holds the removal RPC before the control plane accepts it.
+type confirmRemovalGate struct {
+	ownsandv1connect.AgentServiceClient
+	entered, resume chan struct{}
+	once            sync.Once
+}
+
+func (g *confirmRemovalGate) ConfirmRemoval(ctx context.Context, req *connect.Request[ownsandv1.ConfirmRemovalRequest]) (*connect.Response[ownsandv1.ConfirmRemovalResponse], error) {
+	g.once.Do(func() { close(g.entered) })
+	select {
+	case <-g.resume:
+		return g.AgentServiceClient.ConfirmRemoval(ctx, req)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestDeviceRemovalFencesDispatchedCreate(t *testing.T) {
+	for _, name := range []string{"cleanup-command", "authenticate-notice"} {
+		t.Run(name, func(t *testing.T) {
+			cp := testcp.New(t)
+			st, id := enrollDevice(t, cp)
+			confirm := confirmRemovalGate{entered: make(chan struct{}), resume: make(chan struct{})}
+			h := startWith(t, cp, st, id, func(o *Options) {
+				confirm.AgentServiceClient = o.Control.Agent
+				o.Control.Agent = &confirm
+			})
+			h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+			admittedID, _ := uuidv7.NewString()
+			if res := h.command(createCommand(admittedID)); res.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+				t.Fatalf("create before removal: %v", res)
+			}
+
+			gate := createAdmissionGate{entered: make(chan struct{}), resume: make(chan struct{}), finished: make(chan struct{})}
+			h.agent.Sandboxes.SetCreateGate(gate)
+			resumeCreate := sync.OnceFunc(func() { close(gate.resume) })
+			t.Cleanup(resumeCreate)
+			lateID, _ := uuidv7.NewString()
+			cmd := createCommand(lateID)
+			cmd.CommandId, _ = uuidv7.NewString()
+			if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}) {
+				t.Fatal("could not send the late create")
+			}
+			select {
+			case <-gate.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("late create did not reach the gate")
+			}
+
+			cp.MarkRemoved(id.DeviceID)
+			if name == "cleanup-command" {
+				cmdID, _ := uuidv7.NewString()
+				cmd := &ownsandv1.AgentCommand{CommandId: cmdID, Command: &ownsandv1.AgentCommand_CleanUp{CleanUp: &ownsandv1.CleanUpCommand{}}}
+				if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}) {
+					t.Fatal("could not send the clean-up command")
+				}
+			} else {
+				cp.Current().Close()
+			}
+			select {
+			case <-confirm.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("agent did not reach removal confirmation")
+			}
+			if state, err := st.LoadAgent(); err != nil || !state.Removal.CleanupDone {
+				t.Fatalf("clean-up was not recorded before confirmation: %+v, %v", state, err)
+			}
+
+			resumeCreate()
+			select {
+			case <-gate.finished:
+			case <-time.After(10 * time.Second):
+				t.Fatal("late create did not finish")
+			}
+			if entries := h.agent.Sandboxes.Entries(); len(entries) != 0 {
+				t.Errorf("sandboxes at removal confirmation: %v, want none", entries)
+			}
+			if running, err := h.agent.rt.Running(t.Context()); err != nil || len(running) != 0 {
+				t.Errorf("running sandboxes at removal confirmation: %v, %v", running, err)
+			}
+			for _, sandboxID := range []string{admittedID, lateID} {
+				if _, err := os.Stat(st.Path(store.SandboxesDir, sandboxID+".json")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("sandbox %s record at removal confirmation: %v, want absent", sandboxID, err)
+				}
+			}
+
+			close(confirm.resume)
+			select {
+			case err := <-h.errc:
+				h.errc <- err
+				if !errors.Is(err, ErrRemoved) {
+					t.Fatalf("run returned %v, want ErrRemoved", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("agent did not finish removal")
+			}
+			if cp.Confirms() != 1 {
+				t.Fatal("removal was not confirmed")
+			}
+			requireEmptyStateDir(t, st)
+		})
+	}
 }
 
 // hostCleanerRuntime is a runtime with host resources outside the state
@@ -757,15 +937,30 @@ func newImportFixture(t *testing.T, hook func(r *http.Request) int) *importFixtu
 // newImportFixtureWith is newImportFixture with options that tweak the agent.
 func newImportFixtureWith(t *testing.T, hook func(r *http.Request) int, tweak func(*Options)) *importFixture {
 	t.Helper()
+	return newImportFixtureWithSource(t, hook, tweak, nil)
+}
+
+func newImportFixtureWithSource(t *testing.T, hook func(r *http.Request) int, tweak func(*Options), prepare func(root string)) *importFixture {
+	t.Helper()
 	cp := testcp.New(t)
 	b := bucketWithHook(t, hook)
 	cp.SetSignedURLBase(b.URL)
 	st, id := enrollDevice(t, cp)
+	if prepare != nil {
+		t.Cleanup(func() {
+			if err := fsutil.RemoveAll(st.Dir()); err != nil {
+				t.Errorf("remove fixture state: %v", err)
+			}
+		})
+	}
 	h := startWith(t, cp, st, id, tweak)
 	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
 	sandboxID, _ := uuidv7.NewString()
 	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
 		t.Fatal(res.GetError())
+	}
+	if prepare != nil {
+		prepare(st.Path(store.VMsDir, sandboxID, "root"))
 	}
 	snapID, _ := uuidv7.NewString()
 	res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}})
@@ -1050,6 +1245,82 @@ func TestImportCanceledBeforeSnapshotPublication(t *testing.T) {
 	f.requireRestorable(t, id)
 }
 
+func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
+	f := newImportFixtureWithSource(t, nil, nil, func(root string) {
+		dir := filepath.Join(root, "read-only")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "note"), []byte("snapshot fixture\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+	})
+	a := f.h.agent
+	for _, name := range []string{"ready record write fails", "channel context ends"} {
+		t.Run(name, func(t *testing.T) {
+			id, _ := uuidv7.NewString()
+			cmd := f.stage(t, id, false).GetImportSnapshot()
+			dir, err := f.h.st.SnapshotDir(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			a.beforeSnapshotPublishHook = func() {
+				ro := filepath.Join(dir, "content", "disk", "read-only")
+				info, err := os.Stat(ro)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := info.Mode().Perm(); got != 0o555 {
+					t.Errorf("renamed directory: mode %04o, want 0555", got)
+				}
+				if _, err := os.Stat(filepath.Join(ro, "note")); err != nil {
+					t.Fatal(err)
+				}
+				if name == "channel context ends" {
+					cancel()
+				} else if err := os.Mkdir(filepath.Join(dir, "record.json"), 0o700); err != nil {
+					// The ready record cannot replace a directory.
+					t.Fatal(err)
+				}
+			}
+			defer func() { a.beforeSnapshotPublishHook = nil }()
+			_, err = a.importSnapshot(ctx, cmd)
+			if name == "channel context ends" {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("import error = %v, want context.Canceled", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "save imported snapshot") {
+				t.Fatalf("import error = %v, want a ready record write failure", err)
+			}
+			if _, _, ok := a.Sandboxes.SnapshotContent(id); ok {
+				t.Error("an aborted import left a ready snapshot")
+			}
+			if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unpublished snapshot directory remains: %v", err)
+			}
+			a.beforeSnapshotPublishHook = nil
+			if entry, err := a.importSnapshot(context.Background(), cmd); err != nil || entry.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+				t.Fatalf("retry import = (%v, %v), want a ready snapshot", entry, err)
+			}
+			content, _, ok := a.Sandboxes.SnapshotContent(id)
+			if !ok {
+				t.Fatal("the retry did not publish the snapshot")
+			}
+			if _, err := os.Stat(filepath.Join(dir, "record.json")); err != nil {
+				t.Fatalf("ready snapshot record: %v", err)
+			}
+			if got, err := os.ReadFile(filepath.Join(content, "disk", "read-only", "note")); err != nil || string(got) != "snapshot fixture\n" {
+				t.Fatalf("retried snapshot content = %q, %v", got, err)
+			}
+		})
+	}
+}
+
 // TestImportWithCanceledContextAbortsEvenWithFreeLockAndReadyCopy checks that
 // an import whose channel context ended before the lock was free to take
 // returns ABORTED and not the ready entry, whether or not a ready copy of the
@@ -1175,6 +1446,19 @@ func TestEnrollRetriesAfterOriginWriteFailure(t *testing.T) {
 // TestWithdrawAgentUpdateCommand checks that the agent answers the withdrawal
 // command with success when no update is queued, and keeps reporting the
 // UP_TO_DATE update state.
+func TestNewRemovesAbandonedUpdateDownload(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	artifact := st.Path(store.UpdateDir, "ownsand-agent-1.1.0-1")
+	if err := os.WriteFile(artifact, []byte("abandoned update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newAgent(t, cp, st, id, nil)
+	if _, err := os.Lstat(artifact); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat abandoned download: %v, want not exist", err)
+	}
+}
+
 func TestWithdrawAgentUpdateCommand(t *testing.T) {
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
@@ -1199,19 +1483,23 @@ type updateEnv struct {
 	block    bool
 	keys     []ed25519.PublicKey
 	manifest string
+	install  func(string) error
 }
 
-func (e *updateEnv) Install(string) error {
+func (e *updateEnv) Install(path string) error {
 	if e.installs.Add(1) == 1 {
 		close(e.entered)
 	}
 	if e.block {
 		<-e.unblock
 	}
+	if e.install != nil {
+		return e.install(path)
+	}
 	return nil
 }
 
-func newUpdateEnv(t *testing.T, block bool) *updateEnv {
+func newUpdateEnv(t *testing.T, block bool, revokedVersions ...string) *updateEnv {
 	t.Helper()
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	e := &updateEnv{entered: make(chan struct{}), unblock: make(chan struct{}), block: block, keys: []ed25519.PublicKey{pub}}
@@ -1220,7 +1508,7 @@ func newUpdateEnv(t *testing.T, block bool) *updateEnv {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	sum := sha256.Sum256(artifact)
-	manifest, _ := json.Marshal(update.Manifest{Schema: 1, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
+	manifest, _ := json.Marshal(update.Manifest{Schema: 1, RevokedVersions: revokedVersions, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
 	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, manifest))
 	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, _ *http.Request) { w.Write(manifest) })
 	mux.HandleFunc("/manifest.json.sig", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(sig)) })
@@ -1809,16 +2097,27 @@ func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
 	})
 	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
 	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
-	sandboxID, _ := uuidv7.NewString()
+	sandboxID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatalf("generate sandbox ID: %v", err)
+	}
 	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
 		t.Fatalf("create %v", res)
 	}
-	snapID, _ := uuidv7.NewString()
+	snapID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatalf("generate snapshot ID: %v", err)
+	}
 	chanCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	h.agent.handleCommand(chanCtx, context.Background(), &ownsandv1.AgentCommand{CommandId: snapID, Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}}, 0)
-	if err := <-rt.ctxErr; err == nil {
-		t.Fatal("snapshot capture ran on a context that outlives its channel")
+	select {
+	case err := <-rt.ctxErr:
+		if err != context.Canceled {
+			t.Fatalf("snapshot runtime context error = %v, want %v", err, context.Canceled)
+		}
+	default:
+		t.Fatal("snapshot command returned without calling the runtime's Snapshot method")
 	}
 	// The runtime completed the capture although its channel ended. The
 	// snapshot must not become known or ready.

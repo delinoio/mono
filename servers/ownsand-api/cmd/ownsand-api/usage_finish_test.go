@@ -13,8 +13,9 @@ import (
 )
 
 type fakeUsage struct {
-	drain func(ctx context.Context) error
-	calls []string
+	drain    func(ctx context.Context) error
+	flushErr error
+	calls    []string
 }
 
 func (f *fakeUsage) DrainUsage(ctx context.Context) error {
@@ -24,7 +25,7 @@ func (f *fakeUsage) DrainUsage(ctx context.Context) error {
 
 func (f *fakeUsage) FlushUsageFinal(context.Context) error {
 	f.calls = append(f.calls, "flush")
-	return nil
+	return f.flushErr
 }
 
 // TestFinishUsageFlushesAfterDrain checks that the final flush runs after a
@@ -65,5 +66,51 @@ func TestFinishUsageBoundedWhenHandlerNeverExits(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "usage_drain_incomplete") {
 		t.Errorf("missing usage_drain_incomplete log: %s", logs.String())
+	}
+}
+
+func TestFinishUsageReturnsFinalFlushError(t *testing.T) {
+	drainErr := errors.New("requests still running")
+	flushErr := errors.New("failed to write usage counters")
+	tests := []struct {
+		name       string
+		drainErr   error
+		wantErrors []error
+		wantLogs   []string
+	}{
+		{
+			name:       "flush failure",
+			wantErrors: []error{flushErr},
+			wantLogs:   []string{"usage_final_flush_failed"},
+		},
+		{
+			name:       "drain and flush failures",
+			drainErr:   drainErr,
+			wantErrors: []error{errUsageDrainIncomplete, drainErr, flushErr},
+			wantLogs:   []string{"usage_drain_incomplete", "usage_final_flush_failed"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeUsage{
+				drain:    func(context.Context) error { return tt.drainErr },
+				flushErr: flushErr,
+			}
+			var logs bytes.Buffer
+			err := finishUsage(f, slog.New(slog.NewJSONHandler(&logs, nil)), time.Second, time.Second)
+			for _, want := range tt.wantErrors {
+				if !errors.Is(err, want) {
+					t.Errorf("finishUsage = %v, want it to wrap %v", err, want)
+				}
+			}
+			if got := strings.Join(f.calls, ","); got != "drain,flush" {
+				t.Errorf("calls = %s, want drain,flush", got)
+			}
+			for _, msg := range tt.wantLogs {
+				if !strings.Contains(logs.String(), msg) {
+					t.Errorf("missing %s log: %s", msg, logs.String())
+				}
+			}
+		})
 	}
 }

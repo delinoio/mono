@@ -187,8 +187,8 @@ func (o *orgService) UpdateOrganizationSettings(_ context.Context, req *connect.
 	if !slices.Contains(paths, "max_dev_sessions_per_user") {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("update_mask must name max_dev_sessions_per_user"))
 	}
-	if req.Msg.GetSettings().MaxDevSessionsPerUser != nil {
-		v := req.Msg.GetSettings().GetMaxDevSessionsPerUser()
+	if settings := req.Msg.GetSettings(); settings != nil && settings.MaxDevSessionsPerUser != nil {
+		v := settings.GetMaxDevSessionsPerUser()
 		if v <= 0 {
 			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("max_dev_sessions_per_user must be positive"))
 		}
@@ -656,7 +656,7 @@ func (a *apiKeyService) CreateApiKey(_ context.Context, req *connect.Request[tid
 		CreatedAt: timestamppb.Now(), ExpiresAt: req.Msg.GetExpiresAt(),
 	}
 	a.s.apiKeys = append(a.s.apiKeys, k)
-	return connect.NewResponse(&tidev1.CreateApiKeyResponse{ApiKey: proto.CloneOf(k), Secret: "tide_secret-" + k.GetApiKeyId()}), nil
+	return connect.NewResponse(&tidev1.CreateApiKeyResponse{ApiKey: proto.CloneOf(k), Secret: issuedAPIKeyPrefix + k.GetApiKeyId()}), nil
 }
 
 func (a *apiKeyService) ListApiKeys(_ context.Context, req *connect.Request[tidev1.ListApiKeysRequest]) (*connect.Response[tidev1.ListApiKeysResponse], error) {

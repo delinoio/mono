@@ -6,15 +6,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/snapxfer"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sysinfo"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/update"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/go/ownsand/validate"
+	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -55,16 +54,15 @@ func isUpdateCommand(cmd *ownsandv1.AgentCommand) bool {
 	return false
 }
 
-// updateCommandError maps the updater's refusals to error codes: a command
-// that arrives once the installation started or the running version is
-// revoked fails its precondition, and a superseded command is aborted.
+// updateCommandError maps admission refusals and interrupted update commands
+// to their protocol error codes.
 func updateCommandError(err error) error {
 	switch {
 	case err == nil:
 		return nil
-	case errors.Is(err, update.ErrInstalling), errors.Is(err, update.ErrRunningRevoked):
+	case errors.Is(err, update.ErrInstalling), errors.Is(err, update.ErrRunningRevoked), errors.Is(err, update.ErrRemoving):
 		return &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, Message: err.Error()}
-	case errors.Is(err, update.ErrSuperseded):
+	case errors.Is(err, update.ErrSuperseded), errors.Is(err, update.ErrRemovalAborted):
 		return &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_ABORTED, Message: err.Error()}
 	}
 	return err
@@ -167,10 +165,7 @@ func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *own
 	case *ownsandv1.AgentCommand_CleanUp:
 		logger.Info("clean-up command: removing the device")
 		a.send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: res}})
-		select {
-		case a.removal <- struct{}{}:
-		default:
-		}
+		a.requestRemoval()
 		return
 	case *ownsandv1.AgentCommand_UpdateAgent:
 		err = a.updater.HandleOrdered(chanCtx, c.UpdateAgent, order)
@@ -309,7 +304,7 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	for _, p := range cmd.GetParts() {
 		total += p.GetSizeBytes()
 	}
-	if free, err := sysinfo.FreeDiskBytes(a.st.Dir()); err == nil && free < 2*total {
+	if free, err := a.opts.FreeDisk(); err == nil && free < 2*total {
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, Message: "free disk does not fit the snapshot import"}
 	}
 	dir, err := a.Sandboxes.ImportDir(snapshotID)
@@ -323,12 +318,16 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	published := false
 	defer func() {
 		if !published {
-			os.RemoveAll(dir)
+			if err := fsutil.RemoveAll(dir); err != nil {
+				a.logger.Error("unpublished snapshot cleanup failed", "snapshot_id", snapshotID, "error", err)
+			}
 		}
 	}()
 	// Remove leftovers of an earlier attempt that a crash interrupted. No
 	// ready copy exists here: the check above ran under the lock.
-	os.RemoveAll(dir)
+	if err := fsutil.RemoveAll(dir); err != nil {
+		return nil, fmt.Errorf("remove stale snapshot import: %w", err)
+	}
 	if err := a.transfer.Import(ctx, snapshotID, cmd.GetParts(), filepath.Join(dir, "content")); err != nil {
 		a.logger.Error("snapshot import failed", "snapshot_id", snapshotID, "error", err)
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS, Message: "snapshot import failed its download or hash check"}
@@ -338,7 +337,7 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	}
 	e, err := a.Sandboxes.AddImportedSnapshot(ctx, entry)
 	if err != nil {
-		a.logger.Warn("snapshot import could not publish", "snapshot_id", snapshotID, "error", err)
+		a.logger.Warn("snapshot import stopped before publication", "snapshot_id", snapshotID, "error", err)
 		return nil, err
 	}
 	published = true

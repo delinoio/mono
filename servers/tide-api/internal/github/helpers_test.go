@@ -108,8 +108,11 @@ func (p *programs) exit(sandboxID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if ch := p.running[sandboxID]; ch != nil {
-		close(ch)
-		p.running[sandboxID] = make(chan struct{})
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
 	}
 }
 

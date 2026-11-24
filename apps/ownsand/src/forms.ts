@@ -49,17 +49,20 @@ export interface ResourceInput {
 }
 
 /**
- * The largest memory or disk value that the form sends. The form holds a
- * `number`, and a value above 2^53 - 1 would be rounded when it becomes the
- * `int64` of the request.
+ * The largest memory value that the form can hold exactly as a `number`
+ * before converting it to the request's `int64`.
  */
 export const MAX_RESOURCE_INT64 = Number.MAX_SAFE_INTEGER;
 
 /**
- * Returns field errors of the resource inputs, or an empty object. The vCPU
- * count is an `int32` and memory and disk are `int64` values in the request;
- * a value outside the range would fail in the protobuf serializer, or be
- * rounded, so the form reports it before the request.
+ * The control plane's disk limit keeps the size in bytes within an `int64`.
+ * See `go/ownsand/validate` and `docs/protos-ownsand-api-contract.md`.
+ */
+const MAX_DISK_GIB = 8589934591;
+
+/**
+ * Returns field errors before the form sends resources outside the supported
+ * ranges, or an empty object when all resources are valid.
  */
 export function resourceErrors(input: ResourceInput): {
   vcpu?: string;
@@ -82,8 +85,8 @@ export function resourceErrors(input: ResourceInput): {
   }
   if (input.disk === null || !(input.disk > 0)) {
     errors.disk = "Enter the disk size in GiB.";
-  } else if (!Number.isInteger(input.disk) || input.disk > MAX_RESOURCE_INT64) {
-    errors.disk = `Enter a whole number of GiB from 1 to ${MAX_RESOURCE_INT64}.`;
+  } else if (!Number.isInteger(input.disk) || input.disk > MAX_DISK_GIB) {
+    errors.disk = `Enter a whole number of GiB from 1 to ${MAX_DISK_GIB}.`;
   }
   return errors;
 }

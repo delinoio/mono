@@ -121,8 +121,9 @@ type Env struct {
 	// Objects is the in-memory object store of snapshot exports.
 	Objects *objectstore.Memory
 
-	opts app.Options
-	stop func()
+	opts                        app.Options
+	skipPeriodicRevocationSweep bool
+	stop                        func()
 }
 
 // Option changes the app options before New wires the app.
@@ -131,6 +132,23 @@ type Option func(*app.Options)
 // New starts a control plane on a fresh database. It skips the test when
 // no test database is configured.
 func New(t testing.TB, opts ...Option) *Env {
+	t.Helper()
+	return newEnv(t, false, opts...)
+}
+
+// NewWithoutPeriodicRevocationSweep starts a control plane whose background
+// worker leaves revocation expiry to RPCs and explicit sweeps. Deferred
+// enqueues retry only on explicit sweeps.
+func NewWithoutPeriodicRevocationSweep(t testing.TB, opts ...Option) *Env {
+	t.Helper()
+	return newEnv(t, true, opts...)
+}
+
+type withoutPeriodicRevocationSweep struct{ api.DataPathHooks }
+
+func (withoutPeriodicRevocationSweep) SweepExpired(context.Context) {}
+
+func newEnv(t testing.TB, skipPeriodicRevocationSweep bool, opts ...Option) *Env {
 	t.Helper()
 	database := dbtest.New(t)
 	clock := &Clock{now: time.Now().UTC().Truncate(time.Millisecond)}
@@ -172,7 +190,10 @@ func New(t testing.TB, opts ...Option) *Env {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	env := &Env{T: t, DB: database, Clock: clock, Logs: logs, Logger: logger, Objects: objects, opts: o}
+	env := &Env{
+		T: t, DB: database, Clock: clock, Logs: logs, Logger: logger, Objects: objects,
+		opts: o, skipPeriodicRevocationSweep: skipPeriodicRevocationSweep,
+	}
 	env.start()
 	return env
 }
@@ -184,6 +205,9 @@ func (e *Env) start() {
 	a, err := app.New(e.opts)
 	if err != nil {
 		e.T.Fatalf("wire app: %v", err)
+	}
+	if e.skipPeriodicRevocationSweep {
+		a.Service.DataPath = withoutPeriodicRevocationSweep{DataPathHooks: a.Service.DataPath}
 	}
 	srv := httptest.NewUnstartedServer(a.Handler())
 	srv.EnableHTTP2 = true
