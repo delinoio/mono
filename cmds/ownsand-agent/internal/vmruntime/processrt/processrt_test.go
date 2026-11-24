@@ -903,6 +903,9 @@ func TestExitedHelperReceivesNoSignal(t *testing.T) {
 	if _, err := os.Stat(h.dir); !os.IsNotExist(err) {
 		t.Errorf("sandbox directory after Delete: %v; want it removed", err)
 	}
+	if h.socketDir != "" {
+		mustNotExist(t, h.socketDir)
+	}
 	if _, err := rt.lookup(v.SandboxID()); err == nil {
 		t.Error("sandbox is still tracked after Delete")
 	}
@@ -1456,6 +1459,74 @@ func TestDeleteUntrackedRemovesRecordedSocketDirectory(t *testing.T) {
 	mustNotExist(t, socketDir)
 	mustNotExist(t, otherDir)
 	mustExist(t, unrelated)
+}
+
+func TestDeleteRetainsSocketDirectoryRecordOnRemovalFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("socket directory removal must run without root privileges")
+	}
+	ctx := context.Background()
+	vmsDir := t.TempDir()
+	rt := newRuntimeWithVMsDir(t, vmsDir)
+	closeRuntimeOnCleanup(t, rt)
+	id, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(vmsDir, id)
+	v, err := rt.Create(ctx, vmruntime.Spec{SandboxID: id, Dir: dir, GuestOS: hostGuestOS, BaseImage: hostBaseImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := killHelperAndWait(t, rt, v)
+	// Linux uses an abstract socket. Give that sandbox the same on-disk
+	// cleanup record that Create writes for the filesystem socket on macOS.
+	if h.socketDir == "" {
+		h.socketDir, err = os.MkdirTemp(t.TempDir(), socketDirPrefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := recordSocketDir(dir, h.socketDir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	socketDir := h.socketDir
+	// A nonempty read-only directory prevents RemoveAll from unlinking its
+	// entries. An empty directory could still be removed from its parent.
+	if err := os.WriteFile(filepath.Join(socketDir, "cleanup-test"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socketDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(socketDir, 0o700); err != nil && !os.IsNotExist(err) {
+			t.Errorf("restore socket directory permissions: %v", err)
+		}
+	})
+	if err := rt.Delete(ctx, id); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("Delete with a read-only socket directory = %v; want a permission error", err)
+	}
+	if got, err := rt.lookup(id); err != nil || got != h {
+		t.Fatalf("lookup after failed Delete = %p, %v; want the tracked sandbox %p", got, err, h)
+	}
+	record, err := os.ReadFile(filepath.Join(dir, socketDirFile))
+	if err != nil || string(record) != socketDir {
+		t.Fatalf("socket directory record after failed Delete = %q, %v; want %q", record, err, socketDir)
+	}
+
+	if err := os.Chmod(socketDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	restarted := newRuntimeWithVMsDir(t, vmsDir)
+	if err := restarted.Delete(ctx, id); err != nil {
+		t.Fatalf("Delete after restart: %v", err)
+	}
+	mustNotExist(t, socketDir)
+	mustNotExist(t, dir)
+	if err := restarted.Delete(ctx, id); err != nil {
+		t.Fatalf("second Delete after restart: %v", err)
+	}
 }
 
 // TestRecordSocketDirNoopWithoutSocketDirectory checks that a sandbox with an
