@@ -126,25 +126,26 @@ func TestDeleteOrganizationHooks(t *testing.T) {
 		for _, name := range []string{"requests", "credentials"} {
 			r.OnOrganizationDeletion(api.OrganizationDeletionHook{
 				Name: name,
-				Prepare: func(ctx context.Context, d api.OrganizationDeletion) error {
+				Prepare: func(ctx context.Context, d api.OrganizationDeletion) (api.OrganizationDeletionSteps, error) {
 					if failPrepare && name == "credentials" {
-						return connect.NewError(connect.CodeUnavailable, errors.New("ownsand down"))
+						return api.OrganizationDeletionSteps{}, connect.NewError(connect.CodeUnavailable, errors.New("ownsand down"))
 					}
 					rec.add("prepare:" + name)
-					return nil
+					return api.OrganizationDeletionSteps{
+						InTx: func(ctx context.Context, tx pgx.Tx) error {
+							var keys int
+							if err := tx.QueryRow(ctx, "SELECT count(*) FROM api_keys WHERE organization_id = $1 AND revoke_time IS NULL", d.OrganizationID).Scan(&keys); err != nil {
+								return err
+							}
+							if keys == 0 {
+								return errors.New("keys revoked before the hook")
+							}
+							rec.add("in_tx:" + name)
+							return nil
+						},
+						AfterCommit: func(context.Context) { rec.add("after:" + name) },
+					}, nil
 				},
-				InTx: func(ctx context.Context, tx pgx.Tx, d api.OrganizationDeletion) error {
-					var keys int
-					if err := tx.QueryRow(ctx, "SELECT count(*) FROM api_keys WHERE organization_id = $1 AND revoke_time IS NULL", d.OrganizationID).Scan(&keys); err != nil {
-						return err
-					}
-					if keys == 0 {
-						return errors.New("keys revoked before the hook")
-					}
-					rec.add("in_tx:" + name)
-					return nil
-				},
-				AfterCommit: func(ctx context.Context, d api.OrganizationDeletion) { rec.add("after:" + name) },
 			})
 		}
 		return nil

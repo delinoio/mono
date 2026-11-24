@@ -144,11 +144,13 @@ func Register(r *app.Registry, engine *work.Engine, integrations *integration.St
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "agent_watchers", RunFunc: h.runWatchers})
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "agent_claims", RunFunc: h.runPoller})
 	r.OnOrganizationDeletion(api.OrganizationDeletionHook{
-		Name:    "agent",
-		Prepare: h.prepareOrgDeletion,
-		Abort:   func(ctx context.Context, d api.OrganizationDeletion) { h.resumeOrg(d.OrganizationID) },
-		AfterCommit: func(ctx context.Context, d api.OrganizationDeletion) {
-			h.resumeOrg(d.OrganizationID)
+		Name: "agent",
+		Prepare: func(ctx context.Context, d api.OrganizationDeletion) (api.OrganizationDeletionSteps, error) {
+			if err := h.prepareOrgDeletion(ctx, d); err != nil {
+				return api.OrganizationDeletionSteps{}, err
+			}
+			resume := func(context.Context) { h.resumeOrg(d.OrganizationID) }
+			return api.OrganizationDeletionSteps{Abort: resume, AfterCommit: resume}, nil
 		},
 	})
 	return h
