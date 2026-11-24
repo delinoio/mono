@@ -26,7 +26,8 @@ var _ tidev1connect.MemberServiceHandler = MemberHandler{}
 const invitationColumns = `invitation_id::text, organization_id::text, role, secret_prefix, created_by_user_id,
 	create_time, expire_time, accept_time, revoke_time`
 
-func (s *Service) scanInvitation(row pgx.Row) (*tidev1.Invitation, error) {
+// Read the clock after scanning so revocation checks expiry after locking the row.
+func scanInvitation(row pgx.Row, now func() time.Time) (*tidev1.Invitation, error) {
 	var inv tidev1.Invitation
 	var role int16
 	var created, expires time.Time
@@ -42,7 +43,7 @@ func (s *Service) scanInvitation(row pgx.Row) (*tidev1.Invitation, error) {
 		inv.State = tidev1.InvitationState_INVITATION_STATE_ACCEPTED
 	case revoked != nil:
 		inv.State = tidev1.InvitationState_INVITATION_STATE_REVOKED
-	case !s.NowUTC().Before(expires):
+	case !now().Before(expires):
 		inv.State = tidev1.InvitationState_INVITATION_STATE_EXPIRED
 	default:
 		inv.State = tidev1.InvitationState_INVITATION_STATE_PENDING
@@ -70,9 +71,9 @@ func (h MemberHandler) CreateInvitation(ctx context.Context, req *connect.Reques
 		}
 		id := NewID()
 		now := h.NowUTC()
-		inv, err := h.scanInvitation(tx.QueryRow(ctx, `INSERT INTO invitations (invitation_id, organization_id, role, secret_sha256, secret_prefix, created_by_user_id, create_time, expire_time)
+		inv, err := scanInvitation(tx.QueryRow(ctx, `INSERT INTO invitations (invitation_id, organization_id, role, secret_sha256, secret_prefix, created_by_user_id, create_time, expire_time)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING `+invitationColumns,
-			id, c.OrganizationID, int16(role), secret.Hash, secret.DisplayPrefix, c.UserID, now, now.Add(InvitationLifetime)))
+			id, c.OrganizationID, int16(role), secret.Hash, secret.DisplayPrefix, c.UserID, now, now.Add(InvitationLifetime)), h.NowUTC)
 		if err != nil {
 			return err
 		}
@@ -100,16 +101,17 @@ func (h MemberHandler) ListInvitations(ctx context.Context, req *connect.Request
 	if err != nil {
 		return nil, err
 	}
+	cutoff := h.NowUTC()
 	rows, err := h.DB.Pool.Query(ctx, `SELECT `+invitationColumns+` FROM invitations
 		WHERE organization_id = $1 AND invitation_id > $2 AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $3
-		ORDER BY invitation_id LIMIT $4`, c.OrganizationID, AfterKey(after), h.NowUTC(), limit)
+		ORDER BY invitation_id LIMIT $4`, c.OrganizationID, AfterKey(after), cutoff, limit)
 	if err != nil {
 		return nil, h.Internal(ctx, "list invitations", err)
 	}
 	defer rows.Close()
 	resp := &tidev1.ListInvitationsResponse{}
 	for rows.Next() {
-		inv, err := h.scanInvitation(rows)
+		inv, err := scanInvitation(rows, func() time.Time { return cutoff })
 		if err != nil {
 			return nil, h.Internal(ctx, "list invitations", err)
 		}
@@ -140,7 +142,7 @@ func (h MemberHandler) RevokeInvitation(ctx context.Context, req *connect.Reques
 		if err := LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		inv, err := h.scanInvitation(tx.QueryRow(ctx, "SELECT "+invitationColumns+" FROM invitations WHERE organization_id = $1 AND invitation_id = $2 FOR UPDATE", c.OrganizationID, invID))
+		inv, err := scanInvitation(tx.QueryRow(ctx, "SELECT "+invitationColumns+" FROM invitations WHERE organization_id = $1 AND invitation_id = $2 FOR UPDATE", c.OrganizationID, invID), h.NowUTC)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound("invitation")
 		}
@@ -150,7 +152,7 @@ func (h MemberHandler) RevokeInvitation(ctx context.Context, req *connect.Reques
 		if inv.GetState() != tidev1.InvitationState_INVITATION_STATE_PENDING {
 			return ErrPrecondition("only a pending invitation can be revoked")
 		}
-		inv, err = h.scanInvitation(tx.QueryRow(ctx, "UPDATE invitations SET revoke_time = $3 WHERE organization_id = $1 AND invitation_id = $2 RETURNING "+invitationColumns, c.OrganizationID, invID, h.NowUTC()))
+		inv, err = scanInvitation(tx.QueryRow(ctx, "UPDATE invitations SET revoke_time = $3 WHERE organization_id = $1 AND invitation_id = $2 RETURNING "+invitationColumns, c.OrganizationID, invID, h.NowUTC()), h.NowUTC)
 		if err != nil {
 			return err
 		}
