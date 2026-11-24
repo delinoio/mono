@@ -13,6 +13,7 @@ import {
   ExecDevSessionResponseSchema,
 } from "@delino/tide-protos/v1/dev_session_pb";
 import { TideClient } from "./client.ts";
+import { TideConfigError } from "./errors.ts";
 import {
   type ExecCaller,
   type ExecEvent,
@@ -129,6 +130,78 @@ function describeEvent(event: ExecEvent): string {
 }
 
 describe("exec helper", () => {
+  test.each(["throws", "rejects"])(
+    "ends the first read when the token source %s",
+    async (failure) => {
+      const { server, execs, attachRequests } = execServer(
+        [started],
+        [[new ConnectError("unknown exec", Code.NotFound)]],
+      );
+      const clock = new RecordingClock();
+      const providerError = new Error("fixture token failure");
+      let providerCalls = 0;
+      const client = new TideClient({
+        origin: FAKE_ORIGIN,
+        fetch: server.fetch,
+        clock,
+        token: () => {
+          if (++providerCalls > 1) {
+            return "test-token";
+          }
+          if (failure === "throws") {
+            throw providerError;
+          }
+          return Promise.reject(providerError);
+        },
+      });
+      const stream = client.execDevSession({
+        ...execInput,
+        signal: new AbortController().signal,
+      });
+      const error = (await stream
+        .next()
+        .catch((error: unknown) => error)) as ConnectError;
+      expect(error.cause).toBeInstanceOf(TideConfigError);
+      expect((error.cause as TideConfigError).cause).toBe(providerError);
+      expect(providerCalls).toBe(1);
+      expect(server.calls).toEqual([]);
+      expect(execs).toEqual([]);
+      expect(attachRequests).toEqual([]);
+      expect(clock.sleeps).toEqual([]);
+    },
+  );
+
+  test("stops attaching when the token source fails after a clean stream end", async () => {
+    const { server, execs, attachRequests } = execServer([started], []);
+    const clock = new RecordingClock();
+    const providerError = new Error("fixture token failure");
+    let providerCalls = 0;
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: server.fetch,
+      clock,
+      token: () =>
+        ++providerCalls === 1 ? "test-token" : Promise.reject(providerError),
+    });
+    const stream = client.execDevSession(execInput);
+    expect((await stream.next()).value).toMatchObject({
+      kind: ExecEventKind.Started,
+    });
+    expect((await stream.next()).value).toMatchObject({
+      kind: ExecEventKind.Reattached,
+    });
+    const error = (await stream
+      .next()
+      .catch((error: unknown) => error)) as ConnectError;
+    expect(error.cause).toBeInstanceOf(TideConfigError);
+    expect((error.cause as TideConfigError).cause).toBe(providerError);
+    expect(providerCalls).toBe(2);
+    expect(server.calls).toHaveLength(1);
+    expect(execs).toHaveLength(1);
+    expect(attachRequests).toEqual([]);
+    expect(clock.sleeps).toEqual([]);
+  });
+
   test("continues with AttachDevSessionExec after each stream end and reports lost output", async () => {
     const { server, execs, attachRequests } = execServer(
       [started, out(0, "hel"), { case: "keepalive", value: {} }],
