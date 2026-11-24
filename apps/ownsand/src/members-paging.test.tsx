@@ -21,7 +21,7 @@ import {
 } from "@testing-library/react";
 import { toast } from "delino-ui/toast";
 import { MOCK_IDS, MOCK_USER, createMockTransport } from "./mock/mock-api.ts";
-import { renderConsole } from "./test-support.tsx";
+import { holdingTransport, renderConsole } from "./test-support.tsx";
 
 const OWNER = MOCK_USER;
 const ADMIN = "user-admin-jun";
@@ -195,6 +195,72 @@ describe("ownership transfer picker", () => {
     await screen.findByRole("option", { name: "Jun Park" }, WAIT);
     await flush();
     expect(state.tokens).toEqual([""]);
+  });
+
+  test("closes the transfer confirmation and hides cached choices after a terminal continuation error", async () => {
+    const paged = await pagedMembers([[OWNER, ADMIN], [MEMBER]]);
+    const { transport, calls, seen } = holdingTransport(
+      ["ListMembers"],
+      () => true,
+      paged.transport,
+    );
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
+    await waitFor(() => expect(calls.ListMembers).toHaveLength(1), WAIT);
+    await act(async () => calls.ListMembers![0]!.settle());
+    await openOwnerPicker();
+    const candidate = await screen.findByRole(
+      "option",
+      { name: "Jun Park" },
+      WAIT,
+    );
+    await act(async () => fireEvent.click(candidate));
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Transfer" })),
+    );
+    await screen.findByRole(
+      "alertdialog",
+      { name: "Make Jun Park the owner?" },
+      WAIT,
+    );
+
+    await act(async () =>
+      calls.ListMembers![1]!.settle(
+        new ConnectError("the page failed", Code.PermissionDenied),
+      ),
+    );
+    expect(
+      await screen.findByText(
+        "You do not have permission to do this.",
+        {},
+        WAIT,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "New owner" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Transfer" })).toBeNull();
+    expect(screen.queryByText("Some members are not shown yet.")).toBeNull();
+    expect(seen.TransferOwnership).toBeUndefined();
+    expect(
+      screen.getByRole("button", { name: "Delete organization" }),
+    ).toBeTruthy();
+
+    await act(async () =>
+      fireEvent.click(screen.getByRole("link", { name: "Members" })),
+    );
+    expect(
+      await screen.findByText(
+        "You do not have permission to do this.",
+        {},
+        WAIT,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("list", { name: "Members" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Remove Jun Park" }),
+    ).toBeNull();
+    expect(screen.queryByText("Some members are not shown yet.")).toBeNull();
+    expect(screen.getByRole("button", { name: "Invite someone" })).toBeTruthy();
+    expect(calls.ListMembers).toHaveLength(2);
   });
 
   test("says that members are missing when a later page fails and recovers on Try again", async () => {

@@ -104,15 +104,12 @@ func OwnSandGuestOS(g tidev1.GuestOs) ownsandv1.GuestOs { return ownsandv1.Guest
 
 // DeletionHook lets the work layer clean up when DeleteRunnerProfile runs:
 // Prepare may call OwnSand (delete the warm runners and the runners that wait
-// for work), and InTx runs in the deleting transaction (end the queued
-// requests with CANCELED and PROFILE_DELETED). Busy runners finish their
-// work.
+// for work). InTx runs with the profile locked and can return best-effort
+// work to run after commit. Busy runners finish their work.
 type DeletionHook struct {
 	Name    string
 	Prepare func(ctx context.Context, orgID, profileID string) error
-	InTx    func(ctx context.Context, tx pgx.Tx, orgID, profileID string) error
-	// AfterCommit runs after the profile is deleted (best effort).
-	AfterCommit func(ctx context.Context, orgID, profileID string)
+	InTx    func(ctx context.Context, tx pgx.Tx, orgID, profileID string) (afterCommit func(context.Context), err error)
 }
 
 // Profiles stores runner profiles.
@@ -168,8 +165,8 @@ func (ps *Profiles) Get(ctx context.Context, q db.Querier, orgID, id string) (*P
 
 // LockShare holds a shared profile row lock until the transaction ends.
 // The caller must lock the organization first, as DeleteRunnerProfile does.
-// Deletion either finds the committed request or removes the profile before
-// the caller can create a request.
+// Deletion either finds the committed work or removes the profile before
+// the caller can create it.
 func LockShare(ctx context.Context, tx pgx.Tx, orgID, id string) error {
 	var locked int
 	err := tx.QueryRow(ctx, "SELECT 1 FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR SHARE", orgID, id).Scan(&locked)
@@ -625,6 +622,7 @@ func (h *Handler) DeleteRunnerProfile(ctx context.Context, req *connect.Request[
 			return nil, s.Internal(ctx, "prepare runner profile deletion", err)
 		}
 	}
+	var afterCommit []func(context.Context)
 	err = s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
@@ -639,8 +637,12 @@ func (h *Handler) DeleteRunnerProfile(ctx context.Context, req *connect.Request[
 			if hook.InTx == nil {
 				continue
 			}
-			if err := hook.InTx(ctx, tx, c.OrganizationID, id); err != nil {
+			after, err := hook.InTx(ctx, tx, c.OrganizationID, id)
+			if err != nil {
 				return fmt.Errorf("runner profile deletion hook %s: %w", hook.Name, err)
+			}
+			if after != nil {
+				afterCommit = append(afterCommit, after)
 			}
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM runner_profiles WHERE runner_profile_id = $1", id); err != nil {
@@ -654,10 +656,8 @@ func (h *Handler) DeleteRunnerProfile(ctx context.Context, req *connect.Request[
 	if err != nil {
 		return nil, s.Internal(ctx, "delete runner profile", err)
 	}
-	for _, hook := range ps.hooks {
-		if hook.AfterCommit != nil {
-			hook.AfterCommit(context.WithoutCancel(ctx), c.OrganizationID, id)
-		}
+	for _, after := range afterCommit {
+		after(context.WithoutCancel(ctx))
 	}
 	ps.changed(ctx, c.OrganizationID)
 	return connect.NewResponse(&tidev1.DeleteRunnerProfileResponse{}), nil

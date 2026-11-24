@@ -59,6 +59,10 @@ export function MembersPage() {
   const [removing, setRemoving] = useState<Member>();
   const [leaving, setLeaving] = useState(false);
 
+  if (members.terminalLoadMoreError && removing !== undefined) {
+    setRemoving(undefined);
+  }
+
   return (
     <>
       <PageHeader

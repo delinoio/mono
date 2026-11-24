@@ -132,18 +132,26 @@ describe("organizations", () => {
     const list = await screen.findByRole("list", {
       name: "Your organizations",
     });
-    const rows = within(list).getAllByRole("listitem");
+    // Use the list structure for bulk checks so the full page fixture does
+    // not require computing hundreds of accessible names in happy-dom.
+    const rows = list.querySelectorAll("li");
     expect(rows).toHaveLength(201);
     expect(rows[0].textContent).toContain("Acme Robotics");
     expect(rows[199].textContent).toContain("Fixture organization 200");
     expect(rows[200].textContent).toContain("Globex");
-    expect(within(list).getAllByRole("link", { name: /Globex/ })).toHaveLength(
-      1,
-    );
+    expect(
+      list.querySelectorAll(`a[href="/orgs/${MOCK_IDS.globex}"]`),
+    ).toHaveLength(1);
 
-    await click(within(list).getByRole("link", { name: /Acme Robotics/ }));
-    await click(await screen.findByRole("combobox", { name: "Organization" }));
-    await click(await screen.findByRole("option", { name: "Globex" }));
+    fireEvent.click(
+      within(rows[0]).getByRole("link", { name: /Acme Robotics/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("combobox", { name: "Organization" }),
+    );
+    fireEvent.click(
+      await screen.findByText("Globex", { selector: '[role="option"] *' }),
+    );
 
     expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.globex}`);
     expect(

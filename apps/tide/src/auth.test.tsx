@@ -3,7 +3,12 @@ import { LogtoProvider } from "@logto/react";
 import { afterEach, describe, expect, test } from "@rstest/core";
 import { act, cleanup, render } from "@testing-library/react";
 import { useEffect } from "react";
-import { LogtoBridge, useAuth } from "./auth.tsx";
+import {
+  LogtoBridge,
+  logtoSignInSessionState,
+  SignInSessionState,
+  useAuth,
+} from "./auth.tsx";
 
 /** A Logto client that is signed in and returns a token after a delay. */
 class FakeLogtoClient {
@@ -65,5 +70,97 @@ describe("LogtoBridge", () => {
       });
     }
     expect(mounts).toBe(1);
+  });
+});
+
+describe("logtoSignInSessionState", () => {
+  const location = { origin: "https://console.test", pathname: "/callback" };
+  const currentKey = "logto:app:signInSession";
+  const legacyKey = "logto:app";
+  const sessionFor = (pathname: string) =>
+    JSON.stringify({
+      redirectUri: location.origin + pathname,
+      codeVerifier: "v",
+      state: "s",
+    });
+  const pending = sessionFor("/callback");
+
+  const cases: Array<{
+    name: string;
+    items: Record<string, string>;
+    expected: SignInSessionState;
+  }> = [
+    { name: "no entry", items: {}, expected: SignInSessionState.None },
+    {
+      name: "empty current key with an unreadable legacy entry",
+      items: { [currentKey]: "", [legacyKey]: "null" },
+      expected: SignInSessionState.None,
+    },
+    {
+      name: "entry for another application",
+      items: { "logto:other:signInSession": "null" },
+      expected: SignInSessionState.None,
+    },
+    {
+      name: "readable legacy entry for another path",
+      items: { [legacyKey]: sessionFor("/other") },
+      expected: SignInSessionState.None,
+    },
+    {
+      name: "readable current entry for this path",
+      items: { [currentKey]: pending, [legacyKey]: "null" },
+      expected: SignInSessionState.Pending,
+    },
+    {
+      name: "readable legacy entry for this path",
+      items: { [legacyKey]: pending },
+      expected: SignInSessionState.Pending,
+    },
+    {
+      name: "unreadable current entry with a pending legacy entry",
+      items: { [currentKey]: "null", [legacyKey]: pending },
+      expected: SignInSessionState.Invalid,
+    },
+    {
+      name: "legacy entry with invalid JSON",
+      items: { [legacyKey]: "{not json" },
+      expected: SignInSessionState.Invalid,
+    },
+    {
+      name: "empty object",
+      items: { [currentKey]: "{}" },
+      expected: SignInSessionState.Invalid,
+    },
+    {
+      name: "missing redirect URI",
+      items: { [currentKey]: '{"codeVerifier":"v","state":"s"}' },
+      expected: SignInSessionState.Invalid,
+    },
+    {
+      name: "numeric code verifier",
+      items: {
+        [currentKey]:
+          '{"redirectUri":"https://console.test/callback","codeVerifier":1,"state":"s"}',
+      },
+      expected: SignInSessionState.Invalid,
+    },
+  ];
+
+  test.each(cases)("classifies $name as $expected", ({ items, expected }) => {
+    expect(
+      logtoSignInSessionState("app", location, {
+        getItem: (key) => items[key] ?? null,
+      }),
+    ).toBe(expected);
+  });
+
+  test("treats inaccessible storage as no pending session", () => {
+    expect(
+      logtoSignInSessionState("app", location, {
+        getItem: () => {
+          throw new Error("Storage is inaccessible");
+        },
+      }),
+    ).toBe(SignInSessionState.None);
   });
 });

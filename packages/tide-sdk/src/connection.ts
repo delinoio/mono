@@ -104,7 +104,12 @@ async function currentToken(
  * token source that answers after the abort starts no request.
  */
 function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  signal.throwIfAborted();
+  if (signal.aborted) {
+    // A token source can abort synchronously before returning or throwing.
+    // Observe its rejection even though the call has already been canceled.
+    void promise.catch(() => {});
+    return Promise.reject(signal.reason);
+  }
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(signal.reason);
     signal.addEventListener("abort", onAbort, { once: true });

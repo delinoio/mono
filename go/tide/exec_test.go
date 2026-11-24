@@ -346,6 +346,69 @@ func TestExecReportsLostOutput(t *testing.T) {
 	}
 }
 
+func TestExecTimeoutValidation(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	params := ExecParams{
+		OrganizationID: org,
+		DevSessionID:   ds.GetDevSessionId(),
+		Command:        []string{"true"},
+	}
+
+	t.Run("negative", func(t *testing.T) {
+		p := params
+		p.Timeout = -time.Nanosecond
+		callbacks := 0
+		p.OnEvent = func(ExecEvent) error {
+			callbacks++
+			return nil
+		}
+		res, err := c.Exec(t.Context(), p)
+		if res != nil || connect.CodeOf(err) != connect.CodeInvalidArgument || connect.IsWireError(err) {
+			t.Errorf("Exec returned (%+v, %v), want a nil result and a local invalid_argument error", res, err)
+		}
+		if calls := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); calls != 0 {
+			t.Errorf("start calls = %d, want 0", calls)
+		}
+		if calls := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); calls != 0 {
+			t.Errorf("attach calls = %d, want 0", calls)
+		}
+		if callbacks != 0 {
+			t.Errorf("callback calls = %d, want 0", callbacks)
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{name: "zero", timeout: 0},
+		{name: "positive", timeout: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := params
+			p.Timeout = tc.timeout
+			before := len(srv.ExecRequests())
+			if _, err := c.Exec(t.Context(), p); err != nil {
+				t.Fatal(err)
+			}
+			requests := srv.ExecRequests()
+			if got := len(requests) - before; got != 1 {
+				t.Fatalf("start requests = %d, want 1", got)
+			}
+			timeout := requests[before].GetTimeout()
+			if tc.timeout == 0 {
+				if timeout != nil {
+					t.Fatalf("timeout = %v, want an absent field", timeout)
+				}
+			} else if timeout == nil || timeout.AsDuration() != tc.timeout {
+				t.Fatalf("timeout = %v, want %s", timeout, tc.timeout)
+			}
+		})
+	}
+}
+
 func TestExecErrors(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")

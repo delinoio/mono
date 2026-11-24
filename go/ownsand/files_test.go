@@ -1229,9 +1229,9 @@ func TestWriteFileRetryKeepsOperationIdentity(t *testing.T) {
 	}
 }
 
-// TestReadFileFromOffsetAcrossCalls checks a read that a relay serves in
-// several calls: each call starts at the offset that the previous one
-// reached, with the same read_id and salt, and reads the same snapshot.
+// TestReadFileFromOffsetAcrossCalls checks that a read keeps its snapshot
+// across calls with different spellings of the same read_id and across a
+// relay disconnect.
 func TestReadFileFromOffsetAcrossCalls(t *testing.T) {
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
@@ -1240,12 +1240,20 @@ func TestReadFileFromOffsetAcrossCalls(t *testing.T) {
 			cp.agent.setFile("/f", want)
 			s := cp.handle(t, cp.client(t, tr))
 			readID := mustID(t)
+			if tr == TransportRelay {
+				cp.relayScript = func(_ string, n int) relayAction {
+					if n == 2 {
+						return relayAction{abortAfter: 1}
+					}
+					return relayAction{}
+				}
+			}
 			salt := randomBytes(t, 32)
 			ctx := context.Background()
 			// The first call stops after the first chunk.
 			var first bytes.Buffer
 			stop := errors.New("client stream ended")
-			_, err := s.ReadFileFrom(ctx, FileReadParams{ReadID: readID, Path: "/f", BindingSalt: salt}, writerFunc(func(p []byte) (int, error) {
+			_, err := s.ReadFileFrom(ctx, FileReadParams{ReadID: strings.ToUpper(readID), Path: "/f", BindingSalt: salt}, writerFunc(func(p []byte) (int, error) {
 				n, _ := first.Write(p)
 				return n, stop
 			}))
@@ -1266,6 +1274,40 @@ func TestReadFileFromOffsetAcrossCalls(t *testing.T) {
 			if _, err := s.ReadFileFrom(ctx, FileReadParams{ReadID: readID, Path: "/f", BindingSalt: salt, Offset: -1}, &rest); !validate.IsValidationError(err) {
 				t.Fatalf("negative offset: %v", err)
 			}
+			reads := cp.agent.readRequests()
+			auths := cp.authRequests()
+			if _, err := s.ReadFileFrom(ctx, FileReadParams{ReadID: "bad", Path: "/f", BindingSalt: salt}, &rest); !validate.IsValidationError(err) {
+				t.Fatalf("bad read_id: %v", err)
+			}
+			if len(cp.agent.readRequests()) != len(reads) || len(cp.authRequests()) != len(auths) {
+				t.Fatal("invalid read_id started an operation")
+			}
+			wantRequests := 2
+			if tr == TransportRelay {
+				wantRequests = 3
+				if len(auths) < 2 {
+					t.Fatalf("got %d read grants across two calls, want at least 2", len(auths))
+				}
+			}
+			if len(reads) != wantRequests {
+				t.Fatalf("%d read requests, want %d", len(reads), wantRequests)
+			}
+			for _, req := range reads {
+				if got := req.GetReadId(); got != readID {
+					t.Fatalf("read request ID %q, want %q", got, readID)
+				}
+			}
+			if tr == TransportRelay && reads[2].GetOffset() != int64(first.Len()+datapath.MaxFileChunkSize) {
+				t.Fatalf("retry offset = %d", reads[2].GetOffset())
+			}
+			for _, auth := range auths {
+				if got := auth.GetOperationId(); got != readID {
+					t.Fatalf("read grant ID %q, want %q", got, readID)
+				}
+				if !bytes.Equal(auth.GetRequestDigest(), relaybinding.ReadFileDigest(reads[0])) {
+					t.Fatal("read grant digest differs from the forwarded request digest")
+				}
+			}
 		})
 	}
 }
@@ -1284,9 +1326,17 @@ func TestFileWriteChunksAcrossCalls(t *testing.T) {
 			s := cp.handle(t, cp.client(t, tr))
 			ctx := context.Background()
 			writeID := mustID(t)
+			if tr == TransportRelay {
+				cp.relayScript = func(_ string, n int) relayAction {
+					if n == 1 {
+						return relayAction{abortAfter: 1}
+					}
+					return relayAction{}
+				}
+			}
 			salt := randomBytes(t, 32)
 			data := randomBytes(t, 3000)
-			fw, err := s.OpenFileWrite(FileWriteParams{WriteID: writeID, Path: "/out", BindingSalt: salt})
+			fw, err := s.OpenFileWrite(FileWriteParams{WriteID: strings.ToUpper(writeID), Path: "/out", BindingSalt: salt})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1310,11 +1360,43 @@ func TestFileWriteChunksAcrossCalls(t *testing.T) {
 				t.Fatal("file content")
 			}
 			reqs := cp.agent.writeRequests()
-			if len(reqs) != 3 || reqs[0].GetPath() != "/out" || reqs[1].GetPath() != "" || reqs[2].GetPath() != "/out" || reqs[2].GetFinish().GetMode() != 0o755 {
-				t.Fatalf("requests %v", reqs)
-			}
+			auths := cp.authRequests()
 			if _, err := s.OpenFileWrite(FileWriteParams{WriteID: "bad", Path: "/out"}); !validate.IsValidationError(err) {
 				t.Fatalf("bad write_id: %v", err)
+			}
+			if len(cp.agent.writeRequests()) != len(reqs) || len(cp.authRequests()) != len(auths) {
+				t.Fatal("invalid write_id started an operation")
+			}
+			firstRequests := 1
+			if tr == TransportRelay {
+				firstRequests = 2
+				if len(auths) < 2 {
+					t.Fatalf("got %d write grants across two handles, want at least 2", len(auths))
+				}
+			}
+			if len(reqs) != firstRequests+2 {
+				t.Fatalf("%d write requests, want %d", len(reqs), firstRequests+2)
+			}
+			for _, req := range reqs {
+				if got := req.GetWriteId(); got != writeID {
+					t.Fatalf("write request ID %q, want %q", got, writeID)
+				}
+			}
+			for _, req := range reqs[:firstRequests] {
+				if req.GetPath() != "/out" || req.GetOffset() != 1000 || !bytes.Equal(req.GetData(), data[1000:2000]) {
+					t.Fatal("first write request did not keep its path, offset and data")
+				}
+			}
+			if chunk, finish := reqs[firstRequests], reqs[firstRequests+1]; chunk.GetPath() != "" || finish.GetPath() != "/out" || finish.GetFinish().GetMode() != 0o755 {
+				t.Fatal("write continuation did not use the expected paths and mode")
+			}
+			for _, auth := range auths {
+				if got := auth.GetOperationId(); got != writeID {
+					t.Fatalf("write grant ID %q, want %q", got, writeID)
+				}
+				if !bytes.Equal(auth.GetRequestDigest(), relaybinding.WriteFileDigest(reqs[0])) {
+					t.Fatal("write grant digest differs from the forwarded request digest")
+				}
 			}
 			big, _ := s.OpenFileWrite(FileWriteParams{WriteID: mustID(t), Path: "/big"})
 			if _, err := big.WriteChunk(ctx, 0, make([]byte, datapath.MaxFileChunkSize+1)); !validate.IsValidationError(err) {
