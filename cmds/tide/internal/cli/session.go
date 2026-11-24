@@ -86,12 +86,13 @@ func (a *app) sessionCreate(ctx context.Context, name string, args []string) err
 	if d == 0 {
 		return a.printMessage(s)
 	}
-	return a.waitAndPrint(ctx, c, org, s.GetDevSessionId(), d)
+	return a.waitAndPrint(ctx, c, org, s.GetDevSessionId(), d, s)
 }
 
-// waitAndPrint waits for a dev session, prints it and fails with status 1
-// when it is not RUNNING at the end of the wait.
-func (a *app) waitAndPrint(ctx context.Context, c *tide.Client, org, id string, d time.Duration) error {
+// waitAndPrint reports the outcome of a dev session wait. For create, it
+// prints the latest session even on failure and falls back to the created
+// session if polling did not read one.
+func (a *app) waitAndPrint(ctx context.Context, c *tide.Client, org, id string, d time.Duration, created *tidev1.DevSession) error {
 	wctx := ctx
 	if d > 0 {
 		var cancel context.CancelFunc
@@ -99,11 +100,21 @@ func (a *app) waitAndPrint(ctx context.Context, c *tide.Client, org, id string, 
 		defer cancel()
 	}
 	s, err := c.WaitDevSession(wctx, tide.WaitDevSessionParams{OrganizationID: org, DevSessionID: id})
-	if err != nil && !(errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && s != nil) {
+	if s == nil {
+		s = created
+	}
+	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && s != nil {
+		err = nil
+	}
+	if err != nil && created == nil {
 		return err
 	}
-	if perr := a.printMessage(s); perr != nil {
-		return perr
+	printErr := a.printMessage(s)
+	if err != nil {
+		return err
+	}
+	if printErr != nil {
+		return printErr
 	}
 	switch {
 	case s.GetState() == tidev1.RequestState_REQUEST_STATE_RUNNING:
@@ -129,7 +140,7 @@ func (a *app) sessionWait(ctx context.Context, name string, args []string) error
 	if err != nil {
 		return err
 	}
-	return a.waitAndPrint(ctx, c, org, rest[0], d)
+	return a.waitAndPrint(ctx, c, org, rest[0], d, nil)
 }
 
 func (a *app) sessionList(ctx context.Context, name string, args []string) error {
