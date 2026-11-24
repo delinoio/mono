@@ -82,7 +82,9 @@ func pollBilling(t *testing.T, env *testenv.Env) {
 
 func enforceBilling(t *testing.T, env *testenv.Env) {
 	t.Helper()
-	if err := env.App.Enforcer.Pass(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := env.App.Enforcer.Pass(ctx); err != nil {
 		t.Fatalf("billing enforcement pass: %v", err)
 	}
 }

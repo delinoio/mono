@@ -56,6 +56,12 @@ func Open(ctx context.Context, url string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
+	// A sandbox ordering lock holds one connection while its callback and
+	// agent result reconciliation use the pool.
+	const minimumPoolConns = 2
+	if cfg.MaxConns < minimumPoolConns {
+		return nil, fmt.Errorf("DATABASE_URL pool_max_conns must be at least %d", minimumPoolConns)
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
