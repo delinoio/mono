@@ -10,7 +10,6 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/snapxfer"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sysinfo"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/update"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/go/ownsand/validate"
@@ -309,7 +308,7 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	for _, p := range cmd.GetParts() {
 		total += p.GetSizeBytes()
 	}
-	if free, err := sysinfo.FreeDiskBytes(a.st.Dir()); err == nil && free < 2*total {
+	if free, err := a.opts.FreeDisk(); err == nil && free < 2*total {
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, Message: "free disk does not fit the snapshot import"}
 	}
 	dir, err := a.Sandboxes.ImportDir(snapshotID)

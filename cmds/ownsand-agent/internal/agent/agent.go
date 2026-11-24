@@ -21,6 +21,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/snapxfer"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sysinfo"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/update"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/internal/backoff"
@@ -51,6 +52,9 @@ type Options struct {
 	Control  *cpclient.Client
 	Runtime  vmruntime.Runtime
 	Logger   *slog.Logger
+	// FreeDisk returns the free bytes of the state directory. A nil value
+	// uses the native filesystem probe.
+	FreeDisk func() (int64, error)
 	// DataPath defaults to NoDataPath. NewDataPath, when set, builds it
 	// from the agent (the data path needs the dispatcher).
 	NewDataPath func(a *Agent) DataPath
@@ -106,6 +110,10 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.FreeDisk == nil {
+		dir := opts.Store.Dir()
+		opts.FreeDisk = func() (int64, error) { return sysinfo.FreeDiskBytes(dir) }
+	}
 	if opts.HeartbeatInterval <= 0 {
 		opts.HeartbeatInterval = DefaultHeartbeatInterval
 	}
@@ -128,7 +136,9 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 		restart:    make(chan struct{}, 1),
 		removal:    make(chan struct{}, 1),
 	}
-	a.Sandboxes, err = sandboxes.New(ctx, sandboxes.Options{Store: opts.Store, Runtime: opts.Runtime, Logger: opts.Logger})
+	a.Sandboxes, err = sandboxes.New(ctx, sandboxes.Options{
+		Store: opts.Store, Runtime: opts.Runtime, Logger: opts.Logger, FreeDisk: opts.FreeDisk,
+	})
 	if err != nil {
 		return nil, err
 	}
