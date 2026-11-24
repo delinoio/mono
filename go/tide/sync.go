@@ -81,7 +81,7 @@ type SyncResult struct {
 //     in LocalDir; submodules and nested repositories are skipped.
 //  2. The guest manifest <workspace_path>.tide-sync.json lists the synced
 //     paths with size, SHA-256 and mode; a missing or unreadable manifest
-//     counts as empty.
+//     counts as empty. An absent workspace also invalidates its manifest.
 //  3. New and changed files are uploaded. Manifest paths that are no longer
 //     listed are deleted. Guest files that are not in the manifest stay.
 //     With an older manifest that lacks UTF-8 validation, sync leaves an
@@ -102,7 +102,8 @@ type SyncResult struct {
 // path can change between a file and a directory; the directories that
 // held deleted files under the path of a new file are removed when they are
 // empty. A sync that stops before the new manifest is written leaves the
-// old manifest, so the next sync sends the same files again.
+// old manifest unless apply removed a stale one during workspace recovery.
+// In either case, the next sync sends the same files again.
 func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	report := func(tp TransferProgress) {
 		if p.Progress != nil {
@@ -173,12 +174,15 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	if p.Force {
 		force = "1"
 	}
-	lr, err := c.runGuest(ctx, s, opLock, map[string]string{guestEnvLock: lock, guestEnvForce: force})
+	lr, err := c.runGuest(ctx, s, opLock, map[string]string{
+		guestEnvLock: lock, guestEnvForce: force, guestEnvWorkspace: s.GetWorkspacePath(),
+	})
 	if err != nil {
 		return nil, err
 	}
+	workspaceMissing := lr.exitCode == exitWorkspaceMissing
 	switch lr.exitCode {
-	case 0:
+	case 0, exitWorkspaceMissing:
 	case exitLocked:
 		return nil, localError(connect.CodeFailedPrecondition, ErrSyncLocked)
 	default:
@@ -202,14 +206,19 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	// its lock before this sync takes it. The plan is therefore made again
 	// from the manifest that the lock now protects when that manifest
 	// differs from the first one.
-	if cur, err := c.readManifest(ctx, s); err != nil {
-		return nil, err
-	} else if cur.PathsValidated != old.PathsValidated || !maps.Equal(cur.Files, old.Files) {
-		c.logger.DebugContext(ctx, "tide sync manifest changed before the lock", "dev_session_id", s.GetDevSessionId())
+	var cur manifest
+	if !workspaceMissing {
+		cur, err = c.readManifest(ctx, s)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if workspaceMissing || cur.PathsValidated != old.PathsValidated || !maps.Equal(cur.Files, old.Files) {
+		c.logger.DebugContext(ctx, "tide sync replanning under the lock", "dev_session_id", s.GetDevSessionId(), "workspace_missing", workspaceMissing)
 		if plan, err = planSync(local, cur); err != nil {
 			return nil, err
 		}
-		if plan.empty() {
+		if plan.empty() && !workspaceMissing {
 			succeeded = true
 			res := plan.res
 			if r, err := c.runGuest(ctx, s, opCleanup, cleanupEnv); err != nil || r.exitCode != 0 {
@@ -227,7 +236,17 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 		return nil, err
 	}
 	windows := osys == tidev1.GuestOs_GUEST_OS_WINDOWS
-	applyEnv := map[string]string{guestEnvWorkspace: s.GetWorkspacePath(), guestEnvArchive: "", guestEnvDeletes: "", guestEnvPrunes: "", guestEnvLinks: ""}
+	applyEnv := map[string]string{
+		guestEnvWorkspace: s.GetWorkspacePath(), guestEnvStaleManifest: "",
+		guestEnvArchive: "", guestEnvDeletes: "", guestEnvPrunes: "", guestEnvLinks: "",
+	}
+
+	if workspaceMissing {
+		// Once apply recreates the workspace, a retry can no longer detect
+		// its absence. Remove the stale manifest before creating it so a
+		// partial restore cannot leave missing files marked as unchanged.
+		applyEnv[guestEnvStaleManifest] = guestSibling(s, manifestSuffix)
+	}
 
 	var links []localFile
 	var archived int
@@ -303,7 +322,7 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 
 	report(TransferProgress{Phase: TransferApplying, BytesDone: res.BytesSent, BytesTotal: res.BytesSent})
 	var failedLinks map[string]bool
-	if plan.hasFileChanges() {
+	if workspaceMissing || plan.hasFileChanges() {
 		ar, err := c.runGuest(ctx, s, opApply, applyEnv)
 		if err != nil {
 			return nil, err

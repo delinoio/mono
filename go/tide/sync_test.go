@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -65,7 +66,7 @@ func newRepo(t *testing.T, tracked, untracked map[string]string, gitignore strin
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)
@@ -93,6 +94,192 @@ func guestManifest(t *testing.T, ds *tidev1.DevSession) manifest {
 		t.Fatal(err)
 	}
 	return m
+}
+
+func TestTransferWithoutWorkspace(t *testing.T) {
+	guestOS := tidev1.GuestOs_GUEST_OS_LINUX
+	switch runtime.GOOS {
+	case "windows":
+		guestOS = tidev1.GuestOs_GUEST_OS_WINDOWS
+	case "darwin":
+		guestOS = tidev1.GuestOs_GUEST_OS_MACOS
+	}
+	for _, tc := range []struct {
+		name           string
+		force          bool
+		removeManifest bool
+		breakArchive   bool
+	}{
+		{name: "prior manifest"},
+		{name: "force", force: true},
+		{name: "manifest removed", removeManifest: true},
+		{name: "force and manifest removed", force: true, removeManifest: true},
+		{name: "retry after apply fails", breakArchive: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, guestOS)
+			ws := ds.GetWorkspacePath()
+			dir := newRepo(t, map[string]string{"a.txt": "unchanged"}, nil, "")
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(t.Context(), params); err != nil {
+				t.Fatal(err)
+			}
+			prior := guestManifest(t, ds)
+			if err := os.RemoveAll(ws); err != nil {
+				t.Fatal(err)
+			}
+			if tc.removeManifest {
+				if err := os.Remove(ws + manifestSuffix); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("added"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			params.Force = tc.force
+			if tc.breakArchive {
+				srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+					env := req.GetEnv()
+					if archive := env[guestEnvArchive]; archive != "" && env[guestEnvWorkspace] != "" {
+						if err := os.WriteFile(archive, []byte("invalid tar"), 0o644); err != nil {
+							t.Error(err)
+						}
+					}
+				}
+				_, err := c.Sync(t.Context(), params)
+				srv.BeforeExec = nil
+				if connect.CodeOf(err) != connect.CodeInternal {
+					t.Fatalf("sync with corrupt archive = %v, want apply failure", err)
+				}
+				if info, err := os.Stat(ws); err != nil || !info.IsDir() {
+					t.Fatalf("workspace should exist after failed apply: %v", err)
+				}
+				if _, err := os.Stat(ws + manifestSuffix); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("stale manifest survived failed apply: %v", err)
+				}
+			}
+			res, err := c.Sync(t.Context(), params)
+			if err != nil || res.Uploaded != 2 || res.Skipped != 0 {
+				t.Fatalf("restoring the workspace = %+v, %v", res, err)
+			}
+			if a, b := readGuest(t, ds, "a.txt"), readGuest(t, ds, "b.txt"); a != "unchanged" || b != "added" {
+				t.Fatalf("restored files = %q and %q", a, b)
+			}
+			m := guestManifest(t, ds)
+			bHash := sha256.Sum256([]byte("added"))
+			if len(m.Files) != 2 || m.Files["a.txt"] != prior.Files["a.txt"] ||
+				m.Files["b.txt"] != (manifestEntry{Size: 5, SHA256: hex.EncodeToString(bHash[:]), Mode: modeFile}) {
+				t.Fatalf("restored manifest = %+v", m)
+			}
+			requireTransferWorkingDirectories(t, ds, srv)
+		})
+	}
+
+	t.Run("download", func(t *testing.T) {
+		c, srv, org := newTestClient(t, "")
+		ds := newSession(t, c, srv, org, guestOS)
+		ws := ds.GetWorkspacePath()
+		if err := os.RemoveAll(ws); err != nil {
+			t.Fatal(err)
+		}
+		local := t.TempDir()
+		for _, p := range []string{"missing.txt", filepath.Join(ws, "missing.txt")} {
+			_, err := c.Download(t.Context(), DownloadParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: p,
+				LocalPath: filepath.Join(local, "missing.txt"),
+			})
+			if connect.CodeOf(err) != connect.CodeNotFound {
+				t.Fatalf("download of %q = %v, want not_found", p, err)
+			}
+		}
+
+		outside := t.TempDir()
+		file := filepath.Join(outside, "result.txt")
+		if err := os.WriteFile(file, []byte("built"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			guestPath string
+			dest      string
+			file      string
+		}{
+			{guestPath: file, dest: "file", file: "file"},
+			{guestPath: outside, dest: "directory", file: filepath.Join("directory", "result.txt")},
+		} {
+			_, err := c.Download(t.Context(), DownloadParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: tc.guestPath,
+				LocalPath: filepath.Join(local, tc.dest),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := os.ReadFile(filepath.Join(local, tc.file)); err != nil || string(got) != "built" {
+				t.Fatalf("downloaded file = %q, %v", got, err)
+			}
+		}
+		requireTransferWorkingDirectories(t, ds, srv)
+
+		// A user command with no working directory still receives the workspace.
+		if err := os.Mkdir(ws, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		command := []string{"pwd"}
+		if guestOS == tidev1.GuestOs_GUEST_OS_WINDOWS {
+			command = []string{"cmd.exe", "/d", "/c", "cd"}
+		}
+		var output collected
+		res, err := c.Exec(t.Context(), ExecParams{
+			OrganizationID: org, DevSessionID: ds.GetDevSessionId(), Command: command, OnEvent: output.on,
+		})
+		if err != nil || res.ExitCode == nil || *res.ExitCode != 0 {
+			t.Fatalf("user command = %+v, %v", res, err)
+		}
+		reqs := srv.ExecRequests()
+		if got := reqs[len(reqs)-1].GetWorkingDirectory(); got != "" {
+			t.Fatalf("user working directory in request = %q, want empty", got)
+		}
+		dir, err := os.Stat(strings.TrimSpace(output.stdout.String()))
+		want, wantErr := os.Stat(ws)
+		if err != nil || wantErr != nil || !os.SameFile(dir, want) {
+			t.Fatalf("user command ran in %q, want %q", output.stdout.String(), ws)
+		}
+	})
+
+	t.Run("missing workspace parent", func(t *testing.T) {
+		c, srv, org := newTestClient(t, "")
+		ds := newSession(t, c, srv, org, guestOS)
+		parent := filepath.Dir(ds.GetWorkspacePath())
+		if err := os.RemoveAll(parent); err != nil {
+			t.Fatal(err)
+		}
+		dir := newRepo(t, map[string]string{"a.txt": "a"}, nil, "")
+		_, err := c.Sync(t.Context(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
+		if connect.CodeOf(err) != connect.CodeInternal {
+			t.Fatalf("sync without workspace parent = %v, want lock failure", err)
+		}
+		if _, err := os.Stat(parent); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("sync recreated the workspace parent: %v", err)
+		}
+		requireTransferWorkingDirectories(t, ds, srv)
+	})
+}
+
+func requireTransferWorkingDirectories(t *testing.T, ds *tidev1.DevSession, srv *tidetest.Server) {
+	t.Helper()
+	want := "/"
+	if ds.GetGuestOs() == tidev1.GuestOs_GUEST_OS_WINDOWS {
+		want = filepath.VolumeName(ds.GetWorkspacePath()) + `\`
+	}
+	reqs := srv.ExecRequests()
+	if len(reqs) == 0 {
+		t.Fatal("transfer sent no guest exec requests")
+	}
+	for _, req := range reqs {
+		if got := req.GetWorkingDirectory(); got != want {
+			t.Fatalf("transfer working directory = %q, want %q", got, want)
+		}
+	}
 }
 
 func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
@@ -676,7 +863,7 @@ func TestSyncRetryFileToDirectory(t *testing.T) {
 			switch scenario {
 			case "manifest write failure":
 				srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
-					if req.GetEnv()[guestEnvWorkspace] != "" {
+					if req.GetEnv()[guestEnvWorkspace] != "" && req.GetEnv()[guestEnvLock] == "" {
 						srv.Fail(writeProc, connect.NewError(connect.CodePermissionDenied, errors.New("manifest write denied")))
 					}
 				}
@@ -1044,7 +1231,7 @@ func TestSyncCleanupWarnings(t *testing.T) {
 			c.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 			srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
 				env := req.GetEnv()
-				if env[guestEnvWorkspace] != "" && scenario == "manifest write fails" {
+				if env[guestEnvWorkspace] != "" && env[guestEnvLock] == "" && scenario == "manifest write fails" {
 					srv.Fail(writeProc, connect.NewError(connect.CodePermissionDenied, errors.New("manifest write denied")))
 				}
 				if archive := env[guestEnvArchive]; archive != "" && env[guestEnvLock] != "" && env[guestEnvForce] == "" && env[guestEnvWorkspace] == "" {
