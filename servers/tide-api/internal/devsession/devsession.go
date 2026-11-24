@@ -23,6 +23,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/delinoio/mono/go/ownsand/validate"
 	"github.com/delinoio/mono/go/uuidv7"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
@@ -627,6 +628,10 @@ func ownsandError(err error) error {
 	}
 	if errors.Is(err, context.Canceled) {
 		return connect.NewError(connect.CodeCanceled, errors.New("request canceled"))
+	}
+	var validationErr *validate.Error
+	if errors.As(err, &validationErr) {
+		return api.ErrInvalidf("%s", validationErr.Error())
 	}
 	return api.ErrUnavailable("the OwnSand data path failed; try again")
 }

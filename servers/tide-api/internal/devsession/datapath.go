@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -399,8 +400,12 @@ func (h *Handler) WriteDevSessionFile(ctx context.Context, req *connect.Request[
 	if m.GetOffset() < 0 {
 		return nil, api.ErrInvalidf("invalid offset: must not be negative")
 	}
-	if len(m.GetData()) > maxChunk {
+	chunkSize := len(m.GetData())
+	if chunkSize > maxChunk {
 		return nil, api.ErrInvalidf("invalid data: must be at most 1 MiB")
+	}
+	if m.GetOffset() > math.MaxInt64-int64(chunkSize) {
+		return nil, api.ErrInvalidf("invalid offset: the chunk end offset exceeds the maximum int64 value")
 	}
 	if m.GetMode() > 0o7777 {
 		return nil, api.ErrInvalidf("invalid mode: must be at most 07777")
@@ -419,16 +424,20 @@ func (h *Handler) WriteDevSessionFile(ctx context.Context, req *connect.Request[
 	sandboxID := sess.runner.SandboxID
 	key := sandboxID + "/" + writeID
 	entry, err := h.writes.get(key, path, func() (ownsandclient.FileWrite, error) {
-		return client.OpenFileWrite(sandboxID, ownsand.FileWriteParams{WriteID: writeID, Path: path, BindingSalt: h.bindingSalt(sandboxID, writeID)})
+		fw, err := client.OpenFileWrite(sandboxID, ownsand.FileWriteParams{WriteID: writeID, Path: path, BindingSalt: h.bindingSalt(sandboxID, writeID)})
+		if err != nil {
+			return nil, fileTransferError(err)
+		}
+		return fw, nil
 	})
 	if err != nil {
-		return nil, h.svc.Internal(ctx, "write dev session file", err)
+		return nil, err
 	}
 	start := time.Now()
 	entry.mu.Lock()
 	var res *tidev1.WriteDevSessionFileResponse
 	if m.GetFinal() {
-		r, werr := entry.fw.Finish(ctx, m.GetOffset(), m.GetData(), m.GetOffset()+int64(len(m.GetData())), m.GetMode())
+		r, werr := entry.fw.Finish(ctx, m.GetOffset(), m.GetData(), m.GetOffset()+int64(chunkSize), m.GetMode())
 		err = werr
 		if r != nil {
 			res = &tidev1.WriteDevSessionFileResponse{WriteId: writeID, Offset: r.GetOffset(), Length: r.GetLength(), Finished: r.GetFinished(), SizeBytes: r.GetSizeBytes()}
