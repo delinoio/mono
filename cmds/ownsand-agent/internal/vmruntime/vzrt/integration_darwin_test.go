@@ -141,6 +141,11 @@ func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExit
 	return out.String(), exited
 }
 
+func execSucceeded(exited *ownsandv1.ExecExited) bool {
+	code, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
+	return ok && code != nil && code.ExitCode == 0
+}
+
 // waitFor polls cond until it holds or 30 seconds passed.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
@@ -251,8 +256,8 @@ func TestVirtualizationIntegration(t *testing.T) {
 		t.Fatalf("sandbox %v", sb)
 	}
 	out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo hello; uname -sm; echo state > /root/marker; df -k / | tail -1; ls /sys/class/net")
-	if ex.GetExitCode() != 0 || !strings.Contains(out, "hello\nLinux aarch64\n") && !strings.Contains(out, "hello\nLinux x86_64\n") {
-		t.Fatalf("exec output %q exited %v", out, ex)
+	if !execSucceeded(ex) || !strings.Contains(out, "hello\nLinux aarch64\n") && !strings.Contains(out, "hello\nLinux x86_64\n") {
+		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	t.Logf("guest: %s", strings.TrimSpace(out))
 	// The root file system grew to the 2 GiB disk at boot.
@@ -280,22 +285,22 @@ func TestVirtualizationIntegration(t *testing.T) {
 	// answering exec requests.
 	consoleLog := st.Path(store.VMsDir, sb.GetSandboxId(), "console.log")
 	const marker = "OWNSAND-CONSOLE-MARKER"
-	if out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo "+marker+" > /dev/hvc0"); ex.GetExitCode() != 0 {
-		t.Fatalf("console write %q exited %v", out, ex)
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo "+marker+" > /dev/hvc0"); !execSucceeded(ex) {
+		t.Fatalf("console write %q exited %q", out, ex)
 	}
 	waitFor(t, "the marker in console.log", func() bool {
 		data, _ := os.ReadFile(consoleLog)
 		return strings.Contains(string(data), marker)
 	})
-	if out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "head -c 3145728 /dev/zero | tr '\\0' x > /dev/hvc0"); ex.GetExitCode() != 0 {
-		t.Fatalf("console flood %q exited %v", out, ex)
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "head -c 3145728 /dev/zero | tr '\\0' x > /dev/hvc0"); !execSucceeded(ex) {
+		t.Fatalf("console flood %q exited %q", out, ex)
 	}
 	waitFor(t, "console.log at the cap", func() bool {
 		fi, err := os.Stat(consoleLog)
 		return err == nil && fi.Size() == vmruntime.ConsoleLogLimit
 	})
-	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
-		t.Fatalf("exec after the console flood %q %v", out, ex)
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); !execSucceeded(ex) || out != "state\n" {
+		t.Fatalf("exec after the console flood %q exited %q", out, ex)
 	}
 	if fi, err := os.Stat(consoleLog); err != nil || fi.Size() != vmruntime.ConsoleLogLimit {
 		t.Fatalf("console.log %v %v, want exactly %d bytes", fi, err, vmruntime.ConsoleLogLimit)

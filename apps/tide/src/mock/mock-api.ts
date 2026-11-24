@@ -93,7 +93,12 @@ import {
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/tide-protos/v1/work_pb";
-import { TERMINAL_REQUEST_STATES, TERMINAL_RUNNER_STATES } from "../format.ts";
+import {
+  compareTimestamps,
+  TERMINAL_REQUEST_STATES,
+  TERMINAL_RUNNER_STATES,
+} from "../format.ts";
+import { compareQueueOrder } from "../queue.ts";
 import { uuidV7 } from "../uuid.ts";
 
 /**
@@ -244,6 +249,20 @@ function seed(
     member(MOCK_IDS.acme, userId, Role.OWNER, "Mina Kim"),
     member(MOCK_IDS.acme, OTHER_ADMIN, Role.ADMIN, "Ada Park"),
     member(MOCK_IDS.acme, OTHER_MEMBER, Role.MEMBER, ""),
+  );
+  // Fill the first page and give the console one more member to load.
+  for (let index = acme.members.length; index < 200; index++) {
+    acme.members.push(
+      member(
+        MOCK_IDS.acme,
+        `mock-user-roster-${index}`,
+        Role.MEMBER,
+        `Roster member ${index}`,
+      ),
+    );
+  }
+  acme.members.push(
+    member(MOCK_IDS.acme, "mock-user-nora", Role.MEMBER, "Nora Lee"),
   );
   acme.link = create(OwnSandLinkSchema, {
     organizationId: MOCK_IDS.acme,
@@ -719,6 +738,7 @@ export function createMockTransport(
 ): Transport {
   const userId = options.userId ?? MOCK_USER;
   const orgs = seed(userId, options.runnerProfileCount ?? 3);
+  let failAcmeContinuation = true;
   const watchers = new Map<string, Set<Watcher>>();
   const issuedStates = new Map<
     string,
@@ -1058,7 +1078,22 @@ export function createMockTransport(
       listMembers(req) {
         const { org } = membership(req.organizationId);
         const p = page(org.members, req);
-        return { members: p.items, nextPageToken: p.nextPageToken };
+        if (
+          req.organizationId === MOCK_IDS.acme &&
+          req.pageToken !== "" &&
+          failAcmeContinuation
+        ) {
+          // Let the browser fixture exercise the manual retry of a later page.
+          failAcmeContinuation = false;
+          throw new ConnectError("mock member page failure", Code.Internal);
+        }
+        // Like ListMembers on the server, a full page can be followed by an
+        // empty terminal page.
+        const nextPageToken =
+          p.items.length === (req.pageSize || 50)
+            ? String(Number(req.pageToken) + p.items.length)
+            : "";
+        return { members: p.items, nextPageToken };
       },
       updateMemberRole(req) {
         const { org, role } = membership(req.organizationId);
@@ -1631,13 +1666,19 @@ export function createMockTransport(
     router.service(WorkService, {
       listRequests(req) {
         const { org } = membership(req.organizationId);
-        const active = org.requests.filter(
-          (r) => !TERMINAL_REQUEST_STATES.has(r.state),
-        );
-        const ended = org.requests.filter((r) =>
-          TERMINAL_REQUEST_STATES.has(r.state),
-        );
-        const items = [...active, ...(req.includeEnded ? ended : [])].filter(
+        const active = org.requests
+          .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
+          .sort(compareQueueOrder);
+        const ended = req.includeEnded
+          ? org.requests
+              .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
+              .sort(
+                (a, b) =>
+                  compareTimestamps(b.endedAt, a.endedAt) ||
+                  a.requestId.localeCompare(b.requestId),
+              )
+          : [];
+        const items = [...active, ...ended].filter(
           (r) =>
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
@@ -1958,7 +1999,12 @@ export function createMockTransport(
     router.service(AuditService, {
       listAuditEvents(req) {
         const { org } = membership(req.organizationId);
-        const p = page(org.audit, req);
+        const events = org.audit.toSorted(
+          (a, b) =>
+            compareTimestamps(b.createTime, a.createTime) ||
+            b.auditEventId.localeCompare(a.auditEventId),
+        );
+        const p = page(events, req);
         return { events: p.items, nextPageToken: p.nextPageToken };
       },
     });

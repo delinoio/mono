@@ -27,6 +27,12 @@ const DefaultLogtoScope = "tide:use"
 // refreshMargin renews an access token this long before it expires.
 const refreshMargin = time.Minute
 
+const (
+	maxRefreshAttempts = 3
+	refreshAdoptWait   = 5 * time.Second
+	refreshAdoptPoll   = 50 * time.Millisecond
+)
+
 // errNoCredential tells the user how to get a credential.
 var errNoCredential = errors.New("not signed in: run 'tide login' or set " + EnvAPIKey)
 
@@ -131,9 +137,8 @@ func (a *app) logout(_ context.Context, name string, args []string) error {
 	return nil
 }
 
-// tokenSource returns the Logto access token of the stored credentials and
-// refreshes it shortly before it expires, storing the rotated refresh
-// token.
+// tokenSource returns the stored Logto access token. Before refreshing, it
+// reloads credentials to use any rotation that another process has published.
 func (a *app) tokenSource() (tide.TokenSource, error) {
 	st, err := a.store()
 	if err != nil {
@@ -159,40 +164,116 @@ func (a *app) tokenSource() (tide.TokenSource, error) {
 	}
 	var mu sync.Mutex
 	var staleErr error
+	fresh := func() bool {
+		return creds.AccessToken != "" && time.Until(creds.AccessTokenExpiry) > refreshMargin
+	}
+	// A removed or replaced session makes this source permanently stale.
+	adopt := func() (bool, error) {
+		stored, err := st.Load()
+		switch {
+		case errors.Is(err, credstore.ErrNotFound):
+			staleErr = errors.New("the stored credentials were removed (signed out); run 'tide login' to sign in again")
+			return false, staleErr
+		case err != nil:
+			return false, err
+		case stored.SessionID != creds.SessionID:
+			staleErr = errors.New("the stored credentials were replaced (signed in again); run the command again to load them")
+			return false, staleErr
+		}
+		rotated := stored.RefreshToken != creds.RefreshToken
+		creds = stored
+		return rotated, nil
+	}
 	return func(ctx context.Context) (string, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		if staleErr != nil {
 			return "", staleErr
 		}
-		if creds.AccessToken != "" && time.Until(creds.AccessTokenExpiry) > refreshMargin {
+		if fresh() {
 			return creds.AccessToken, nil
 		}
-		tok, err := cfg.Refresh(ctx, creds.RefreshToken)
-		if err != nil {
-			return "", fmt.Errorf("refresh the Logto token (run 'tide login' again if it was revoked): %w", err)
-		}
-		next := *creds
-		next.AccessToken = tok.AccessToken
-		next.AccessTokenExpiry = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
-		if tok.RefreshToken != "" {
-			next.RefreshToken = tok.RefreshToken
-		}
-		switch err := st.SaveIfSession(creds.SessionID, &next); {
-		case err == nil:
-		case errors.Is(err, credstore.ErrNotFound):
-			staleErr = errors.New("the stored credentials were removed while the Logto token refreshed (signed out); run 'tide login' to sign in again")
-			return "", staleErr
-		case errors.Is(err, credstore.ErrReplaced):
-			staleErr = errors.New("the stored credentials were replaced while the Logto token refreshed (signed in again); run the command again to load them")
-			return "", staleErr
-		default:
+		if _, err := adopt(); err != nil {
 			return "", err
 		}
-		*creds = next
-		a.logger.Debug("tide refreshed the Logto access token")
-		return creds.AccessToken, nil
+		for attempt := 1; ; attempt++ {
+			if fresh() {
+				a.logger.Debug("tide adopted the Logto access token that another process stored")
+				return creds.AccessToken, nil
+			}
+			if attempt > maxRefreshAttempts {
+				return "", errors.New("the Logto token was refreshed by another process too often while this command refreshed it; run the command again")
+			}
+			sent := creds.RefreshToken
+			tok, err := cfg.Refresh(ctx, sent)
+			if err != nil {
+				var oe *logto.Error
+				if attempt < maxRefreshAttempts && errors.As(err, &oe) && oe.Code == "invalid_grant" {
+					rotated, adoptErr := adopt()
+					if adoptErr != nil {
+						return "", adoptErr
+					}
+					if !rotated {
+						// The issuer may reject the spent token before the
+						// other process has published its replacement.
+						a.logger.Debug("tide waits for another process to publish the rotated Logto refresh token")
+						rotated, adoptErr = awaitRefreshRotation(ctx, adopt)
+						if adoptErr != nil {
+							return "", adoptErr
+						}
+					}
+					if rotated {
+						continue
+					}
+				}
+				return "", fmt.Errorf("refresh the Logto token (run 'tide login' again if it was revoked): %w", err)
+			}
+			next := *creds
+			next.AccessToken = tok.AccessToken
+			next.AccessTokenExpiry = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+			if tok.RefreshToken != "" {
+				next.RefreshToken = tok.RefreshToken
+			}
+			switch err := st.SaveIfCurrent(creds.SessionID, sent, &next); {
+			case err == nil:
+				creds = &next
+				a.logger.Debug("tide refreshed the Logto access token")
+				return creds.AccessToken, nil
+			case errors.Is(err, credstore.ErrNotFound):
+				staleErr = errors.New("the stored credentials were removed while the Logto token refreshed (signed out); run 'tide login' to sign in again")
+				return "", staleErr
+			case errors.Is(err, credstore.ErrReplaced):
+				staleErr = errors.New("the stored credentials were replaced while the Logto token refreshed (signed in again); run the command again to load them")
+				return "", staleErr
+			case errors.Is(err, credstore.ErrRotated):
+				a.logger.Debug("tide discarded a refreshed Logto token after another process stored a newer one")
+				if _, err := adopt(); err != nil {
+					return "", err
+				}
+			default:
+				return "", err
+			}
+		}
 	}, nil
+}
+
+func awaitRefreshRotation(ctx context.Context, adopt func() (bool, error)) (bool, error) {
+	deadline := time.NewTimer(refreshAdoptWait)
+	defer deadline.Stop()
+	tick := time.NewTicker(refreshAdoptPoll)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false, fmt.Errorf("wait for the rotated Logto refresh token: %w", ctx.Err())
+		case <-deadline.C:
+			return adopt()
+		case <-tick.C:
+			if rotated, err := adopt(); err != nil || rotated {
+				return rotated, err
+			}
+		}
+	}
 }
 
 // credentialMismatch reports the first configured Logto setting that

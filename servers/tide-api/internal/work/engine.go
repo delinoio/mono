@@ -190,7 +190,9 @@ func (e *Engine) GetRequest(ctx context.Context, q db.Querier, orgID, id string)
 	return r, err
 }
 
-func (e *Engine) lockRequest(ctx context.Context, tx pgx.Tx, id string) (*Request, error) {
+// LockRequest loads and locks a request by its ID in the caller's transaction.
+// When a transition needs both locks, take the runner lock first.
+func (e *Engine) LockRequest(ctx context.Context, tx pgx.Tx, id string) (*Request, error) {
 	r, err := scanRequest(tx.QueryRow(ctx, "SELECT "+requestColumns+" FROM requests WHERE request_id = $1 FOR UPDATE", id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, api.ErrNotFound("request")
@@ -308,7 +310,7 @@ func (e *Engine) CreateRequest(ctx context.Context, tx pgx.Tx, n NewRequest) (*R
 // log and clears the stored work order. Run ReleaseClaim with
 // releaseAfterCommit when the request ended before a runner took its work.
 func (e *Engine) endRequestTx(ctx context.Context, tx pgx.Tx, id string, end RequestEnd) (*Request, tidev1.RequestState, error) {
-	r, err := e.lockRequest(ctx, tx, id)
+	r, err := e.LockRequest(ctx, tx, id)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -509,7 +511,7 @@ func (e *Engine) DeleteIdleRunnerTx(ctx context.Context, tx pgx.Tx, orgID, runne
 
 // startRequestTx moves a request to STARTING or RUNNING with its runner.
 func (e *Engine) startRequestTx(ctx context.Context, tx pgx.Tx, requestID, runnerID string, from []tidev1.RequestState, to tidev1.RequestState) error {
-	req, err := e.lockRequest(ctx, tx, requestID)
+	req, err := e.LockRequest(ctx, tx, requestID)
 	if err != nil {
 		return err
 	}

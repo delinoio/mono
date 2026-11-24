@@ -20,6 +20,9 @@ var errStopTimeout = errors.New("vzrt: the VM did not reach a terminal state in 
 // keep them (for example the staged disk of an image build).
 var ErrVMMayRun = errors.New("vzrt: the VM may still run")
 
+// StopTimeout bounds the stop request and terminal-state observation.
+const StopTimeout = 10 * time.Second
+
 // stopPollInterval is how often stopMachine re-reads the machine state while
 // it waits, so a missing state-change notification cannot hide a stopped VM.
 const stopPollInterval = 10 * time.Millisecond

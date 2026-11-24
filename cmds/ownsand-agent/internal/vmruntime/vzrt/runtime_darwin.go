@@ -37,7 +37,6 @@ const (
 	// macOSReadyTimeout covers a macOS cold boot, which takes far longer
 	// than a Linux boot.
 	macOSReadyTimeout = 5 * time.Minute
-	stopTimeout       = 10 * time.Second
 	dialTimeout       = 10 * time.Second
 )
 
@@ -517,7 +516,6 @@ func (r *Runtime) attachNetwork(v *vm, mac net.HardwareAddr) (*vz.VirtioNetworkD
 	dev, err := networkDevice(vmFile, mac)
 	if err != nil {
 		stack.Close()
-		vmFile.Close()
 		conn.Close()
 		return nil, err
 	}
@@ -556,8 +554,10 @@ func datagramPair() (*os.File, net.Conn, error) {
 }
 
 // networkDevice returns a virtio network device with the MAC address mac on
-// a file-handle attachment of vmFile.
+// a file-handle attachment. It takes ownership of vmFile and closes it when
+// configuration ends. The attachment owns its duplicate descriptor.
 func networkDevice(vmFile *os.File, mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfiguration, error) {
+	defer vmFile.Close()
 	attachment, err := vz.NewFileHandleNetworkDeviceAttachment(vmFile)
 	if err != nil {
 		return nil, err
@@ -585,7 +585,6 @@ func NewIdleNetworkDevice(mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfigur
 	}
 	dev, err := networkDevice(vmFile, mac)
 	if err != nil {
-		vmFile.Close()
 		conn.Close()
 		return nil, nil, err
 	}
@@ -598,17 +597,7 @@ func NewIdleNetworkDevice(mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfigur
 			}
 		}
 	}()
-	return dev, closers{vmFile, conn}, nil
-}
-
-type closers []io.Closer
-
-func (c closers) Close() error {
-	var errs []error
-	for _, x := range c {
-		errs = append(errs, x.Close())
-	}
-	return errors.Join(errs...)
+	return dev, conn, nil
 }
 
 // newMachine creates the VM object of v and watches its state.
@@ -847,7 +836,7 @@ func (z vzMachine) Stop() error {
 // primary, if any, on success. If termination is unconfirmed, it joins the
 // stop failure and ErrVMMayRun with primary.
 func StopVMForCleanup(primary error, machine *vz.VirtualMachine, exited <-chan struct{}) error {
-	return stopForCleanup(primary, vzMachine{machine}, exited, stopTimeout)
+	return stopForCleanup(primary, vzMachine{machine}, exited, StopTimeout)
 }
 
 // stopVM stops the VM of v, if it runs, and then its network stack. It
@@ -863,7 +852,7 @@ func (r *Runtime) stopVM(v *vm) error {
 	machine, watcher := v.machine, v.watcher
 	v.mu.Unlock()
 	if machine != nil {
-		if err := watcher.stop(vzMachine{machine}, stopTimeout); err != nil {
+		if err := watcher.stop(vzMachine{machine}, StopTimeout); err != nil {
 			r.logger.Error("VM did not stop", "sandbox_id", v.id, "error", err)
 			return err
 		}

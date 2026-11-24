@@ -157,8 +157,8 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 		t.Fatalf("sandbox %v", sb)
 	}
 	out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "sw_vers -productName; uname -sm; id -u; echo state > /var/root/marker")
-	if ex.GetExitCode() != 0 || !strings.Contains(out, "macOS\nDarwin arm64\n0\n") {
-		t.Fatalf("exec output %q exited %v", out, ex)
+	if !execSucceeded(ex) || !strings.Contains(out, "macOS\nDarwin arm64\n0\n") {
+		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	// The guest helper grows the APFS container to the 72 GiB disk after
 	// the boot; the container size is in bytes.
