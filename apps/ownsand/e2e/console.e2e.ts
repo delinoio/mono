@@ -314,6 +314,33 @@ describe("roles", () => {
     await expect(screen.getByRole("link", "API keys")).toBeHidden();
     await expect(screen.getByRole("link", "Enrollment tokens")).toBeHidden();
   });
+
+  test("lets a member leave from the Members page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(
+      screen.getByRole("link", "Northwind Labs Member"),
+    ).toBeVisible();
+    await app.open(`/orgs/${NORTHWIND}/members`);
+
+    await screen.getByRole("button", "Leave organization").tap();
+    await screen
+      .getByRole("alertdialog", "Leave this organization?")
+      .getByRole("button", "Leave organization")
+      .tap();
+
+    await expect(browser).toHaveURL("/");
+    await expect(
+      screen.getByRole("heading", "Organizations", { level: 1 }),
+    ).toBeVisible();
+    await expect(
+      screen.getByRole("link", "Northwind Labs Member"),
+    ).toBeHidden();
+  });
 });
 
 describe("billing", () => {
