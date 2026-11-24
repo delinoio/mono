@@ -474,7 +474,7 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		return createFailed
 	}
 	sb, err := e.createSandbox(ctx, client, sreq)
-	res := e.applyCreate(ctx, r, sb, err)
+	res := e.applyCreate(ctx, r, req, sb, err)
 	if res == createFailed && ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || isCode(err, connect.CodeDeadlineExceeded)) {
 		return createStalled
 	}
@@ -498,7 +498,9 @@ func (e *Engine) storedCreateRequest(ctx context.Context, runnerID string) (*own
 var errSkip = errors.New("skip")
 
 // applyCreate applies a CreateSandbox result to a stored CREATING runner.
-func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandbox, err error) createResult {
+// dispatchRequest identifies the queued demand for the initial call, including
+// for pool runners that do not store a request ID.
+func (e *Engine) applyCreate(ctx context.Context, r *Runner, dispatchRequest *Request, sb *ownsandv1.Sandbox, err error) createResult {
 	switch {
 	case err == nil:
 		uerr := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
@@ -535,11 +537,11 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 	case rejected(err, connect.CodeUnavailable):
 		// No device has free capacity: the sandbox does not exist, so the
 		// runner is removed and its request returns to the queue.
-		e.dropRunner(ctx, r, false)
+		e.dropRunner(ctx, r, false, nil)
 		return createUnavailable
 	case rejected(err, connect.CodeFailedPrecondition):
 		// No device of the OwnSand organization can ever run the profile.
-		e.dropRunner(ctx, r, true)
+		e.dropRunner(ctx, r, true, dispatchRequest)
 		return createFailed
 	case rejected(err, connect.CodeInvalidArgument), rejected(err, connect.CodeNotFound), rejected(err, connect.CodePermissionDenied):
 		// OwnSand rejected the request (for example, an unknown template):
@@ -567,36 +569,41 @@ func rejected(err error, code connect.Code) bool {
 	return isCode(err, code) && connect.IsWireError(err)
 }
 
-// dropRunner removes a runner whose sandbox was never created. noDevice
-// ends the request with NO_ELIGIBLE_DEVICE; otherwise the request returns to
-// the queue without counting an attempt.
-func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool) {
+// dropRunner handles a runner whose sandbox was never created. For a
+// capacity rejection it removes the runner. For a no-device rejection it
+// records the failure and ends the request if it is still queued.
+func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool, dispatchRequest *Request) {
 	var ended *Request
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		cur, err := e.lockRunner(ctx, tx, r.ID)
 		if err != nil || cur.State != runCreating {
 			return err
 		}
-		if noDevice {
-			if _, err := e.setRunnerTx(ctx, tx, r.ID, []tidev1.RunnerState{runCreating}, runFailed, "end_reason = $4",
-				int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED)); err != nil {
-				return err
-			}
-		} else if _, err := tx.Exec(ctx, "DELETE FROM runners WHERE runner_id = $1", r.ID); err != nil {
+		if !noDevice {
+			_, err := tx.Exec(ctx, "DELETE FROM runners WHERE runner_id = $1", r.ID)
 			return err
 		}
-		if cur.RequestID == "" {
+		if _, err := e.setRunnerTx(ctx, tx, r.ID, []tidev1.RunnerState{runCreating}, runFailed, "end_reason = $4",
+			int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED)); err != nil {
+			return err
+		}
+		requestID := cur.RequestID
+		if dispatchRequest != nil {
+			requestID = dispatchRequest.ID
+		}
+		if requestID == "" {
 			return nil
 		}
-		if noDevice {
-			ended, _, err = e.endRequestTx(ctx, tx, cur.RequestID, RequestEnd{State: reqFailed, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE})
+		req, err := e.lockRequest(ctx, tx, requestID)
+		if err != nil || req.State != reqQueued {
 			return err
 		}
-		// The request stayed QUEUED.
-		return nil
+		ended, _, err = e.endRequestTx(ctx, tx, requestID, RequestEnd{State: reqFailed, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE})
+		return err
 	})
 	if err != nil {
 		e.svc.Logger.WarnContext(ctx, "dispatch_drop_runner_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		return
 	}
 	if ended != nil {
 		e.releaseClaim(ctx, ended)

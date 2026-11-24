@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -117,6 +118,127 @@ func TestJobLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(w.env.Logs.String(), `"github_job_id":9001`) || !strings.Contains(w.env.Logs.String(), `"delivery_id":"`+guid+`"`) {
 		t.Fatal("delivery logs lack the job or delivery ID")
+	}
+}
+
+func TestJobNoEligibleDevice(t *testing.T) {
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	w.link(t, 501, "acme")
+	w.createProfile(t, ghProfile("linux", 0))
+	w.os.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
+	})
+	jobs := []int64{9001, 9002}
+	for _, id := range jobs {
+		w.send(t, "workflow_job", job("queued", 501, id, tideLinux, ""))
+		if req := w.requestOfJob(t, id); req.GetState() != tidev1.RequestState_REQUEST_STATE_QUEUED {
+			t.Fatalf("job %d before dispatch: %v", id, req)
+		}
+	}
+
+	w.l.Engine.Pass(t.Context(), w.org.ID)
+	for _, id := range jobs {
+		if req := w.requestOfJob(t, id); req.GetState() != tidev1.RequestState_REQUEST_STATE_FAILED ||
+			req.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE || req.GetStartAttempts() != 0 {
+			t.Fatalf("job %d after dispatch: %v", id, req)
+		}
+	}
+	for _, r := range w.runners(t) {
+		if r.GetState() != tidev1.RunnerState_RUNNER_STATE_FAILED || r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED ||
+			r.GetRequestId() != "" || r.GetGithubInstallationId() != 501 {
+			t.Fatalf("failed pool runner: %v", r)
+		}
+	}
+
+	w.l.Engine.Pass(t.Context(), w.org.ID)
+	if calls, rows := w.os.Calls("CreateSandbox"), len(w.runners(t)); calls != len(jobs) || rows != len(jobs) {
+		t.Fatalf("got %d CreateSandbox calls and %d runner rows for %d jobs", calls, rows, len(jobs))
+	}
+}
+
+func TestJobSandboxCreateRejected(t *testing.T) {
+	for _, code := range []connect.Code{connect.CodeUnavailable, connect.CodeInvalidArgument, connect.CodeNotFound, connect.CodePermissionDenied} {
+		t.Run(code.String(), func(t *testing.T) {
+			w := newGHWorld(t, worldOpts{manualDispatch: true})
+			w.link(t, 501, "acme")
+			w.createProfile(t, ghProfile("linux", 0))
+			w.os.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.CreateError = connect.NewWireError(code, errors.New("sandbox rejected"))
+			})
+			w.send(t, "workflow_job", job("queued", 501, 9001, tideLinux, ""))
+			w.l.Engine.Pass(t.Context(), w.org.ID)
+			if req := w.requestOfJob(t, 9001); req.GetState() != tidev1.RequestState_REQUEST_STATE_QUEUED || req.GetStartAttempts() != 0 {
+				t.Fatalf("job after rejected create: %v", req)
+			}
+			runners := w.runners(t)
+			if code == connect.CodeUnavailable {
+				if len(runners) != 0 {
+					t.Fatalf("unavailable create left a runner: %v", runners)
+				}
+				w.os.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateError = nil })
+				w.l.Engine.Pass(t.Context(), w.org.ID)
+				runners = w.runners(t)
+				if len(runners) != 1 || runners[0].GetOwnsandSandboxId() == "" || w.os.Calls("CreateSandbox") != 2 {
+					t.Fatalf("retry did not create a sandbox: %v", runners)
+				}
+			} else if len(runners) != 1 || runners[0].GetState() != tidev1.RunnerState_RUNNER_STATE_FAILED ||
+				runners[0].GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+				t.Fatalf("rejected create did not record a start failure: %v", runners)
+			}
+		})
+	}
+}
+
+func TestJobCanceledDuringNoEligibleDeviceCreate(t *testing.T) {
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	w.link(t, 501, "acme")
+	// Keep the in-flight runner through the completion webhook's surplus check.
+	w.createProfile(t, ghProfile("linux", 1))
+	w.os.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
+	})
+	entered, release := make(chan struct{}), make(chan struct{})
+	w.os.SetCreateHook(func(ctx context.Context) error {
+		close(entered)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	w.send(t, "workflow_job", job("queued", 501, 9001, tideLinux, ""))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	passed := make(chan struct{})
+	go func() {
+		defer close(passed)
+		w.l.Engine.Pass(ctx, w.org.ID)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-passed
+	})
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("dispatcher did not call CreateSandbox")
+	}
+	w.send(t, "workflow_job", job("completed", 501, 9001, tideLinux, ""))
+	w.l.GitHub.Wait()
+	canceled := w.requestOfJob(t, 9001)
+	if canceled.GetState() != tidev1.RequestState_REQUEST_STATE_CANCELED ||
+		canceled.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE {
+		t.Fatalf("job after completion webhook: %v", canceled)
+	}
+	w.env.Clock.Advance(time.Minute)
+	close(release)
+	<-passed
+	if req := w.requestOfJob(t, 9001); req.GetState() != canceled.GetState() || req.GetEndReason() != canceled.GetEndReason() ||
+		!req.GetEndedAt().AsTime().Equal(canceled.GetEndedAt().AsTime()) {
+		t.Fatalf("rejected create changed a canceled job: %v", req)
+	}
+	if runners := w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_FAILED); len(runners) != 1 {
+		t.Fatalf("rejected create left %d failed runners, want 1", len(runners))
 	}
 }
 
