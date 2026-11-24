@@ -10,15 +10,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// These tests drive the write manager directly and replace the rename and the
-// reopen seams, so a failure is injected at one exact call and no test
-// depends on directory permissions, the user id, timers or a server.
+// These tests drive the write manager directly and inject failures at specific
+// file operations without depending on directory permissions, timers or a server.
 
 // reopenFixture is a write manager with one staged write that has all of its
 // five bytes and a finish request that is ready to send.
@@ -108,6 +108,78 @@ func wantOpError(t *testing.T, err error, code ownsandv1.ErrorCode, msg string) 
 	var op *opError
 	if !errors.As(err, &op) || op.code != code || op.msg != msg {
 		t.Fatalf("error %v, want %v %q", err, code, msg)
+	}
+}
+
+func (f *reopenFixture) stageAndFailClose(t *testing.T) {
+	t.Helper()
+	if _, err := f.m.apply(f.chunk); err != nil {
+		t.Fatalf("first chunk: %v", err)
+	}
+	closeFile := closeStagingFile
+	defer func() { closeStagingFile = closeFile }()
+	closeStagingFile = func(file *os.File) error {
+		if err := closeFile(file); err != nil {
+			t.Fatalf("close staging file before injecting EIO: %v", err)
+		}
+		return syscall.EIO
+	}
+
+	_, err := f.m.apply(f.finish)
+	wantOpError(t, err, ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "write: file system error")
+	if e := f.entry(t); e.file != nil || e.finished || e.gone {
+		t.Fatalf("entry after failed close: file set %v, finished %v, gone %v", e.file != nil, e.finished, e.gone)
+	}
+	if got, err := os.ReadFile(tempPath(f.target, f.id)); err != nil || string(got) != "hello" {
+		t.Fatalf("staging file after failed close: %q %v", got, err)
+	}
+	if _, err := os.Stat(f.target); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("target after failed close: %v", err)
+	}
+}
+
+func TestWriteFinishRetryReopensStagingFileAfterFailedClose(t *testing.T) {
+	f := newReopenFixture(t, 0)
+	f.stageAndFailClose(t)
+
+	if resp, err := f.m.apply(f.finish); err != nil || !resp.GetFinished() || resp.GetSizeBytes() != 5 {
+		t.Fatalf("repeated finish: %v %v", resp, err)
+	}
+	if got, err := os.ReadFile(f.target); err != nil || string(got) != "hello" {
+		t.Fatalf("target: %q %v", got, err)
+	}
+	if _, err := os.Stat(tempPath(f.target, f.id)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("staging file left: %v", err)
+	}
+}
+
+func TestWriteChunkReopensStagingFileAfterFailedClose(t *testing.T) {
+	f := newReopenFixture(t, 0o444)
+	f.stageAndFailClose(t)
+
+	tail := &ownsandv1.WriteFileRequest{WriteId: f.id, Path: f.target, Offset: 5, Data: []byte(" world")}
+	if _, err := f.m.apply(tail); err != nil {
+		t.Fatalf("chunk after failed close: %v", err)
+	}
+	e := f.entry(t)
+	if e.file == nil || len(e.ranges) != 1 || e.ranges[0] != (span{0, 11}) {
+		t.Fatalf("entry after chunk: file open %v, ranges %v", e.file != nil, e.ranges)
+	}
+	if runtime.GOOS != "windows" {
+		st, err := e.file.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := st.Mode().Perm(); mode != 0o600 {
+			t.Fatalf("reopened staging mode: %04o, want 0600", mode)
+		}
+	}
+	f.finish.Finish.SizeBytes = 11
+	if resp, err := f.m.apply(f.finish); err != nil || !resp.GetFinished() || resp.GetSizeBytes() != 11 {
+		t.Fatalf("finish after appended chunk: %v %v", resp, err)
+	}
+	if got, err := os.ReadFile(f.target); err != nil || string(got) != "hello world" {
+		t.Fatalf("target: %q %v", got, err)
 	}
 }
 
