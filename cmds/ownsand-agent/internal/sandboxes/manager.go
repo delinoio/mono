@@ -304,8 +304,8 @@ func (m *Manager) reconcile(ctx context.Context) error {
 		switch {
 		case reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED:
 		case sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_DELETING:
-			// A failed end attempt recorded its reason; the final state
-			// follows from it, so a lost VM stays FAILED/LOST_ON_DEVICE.
+			// A failed end attempt recorded the reason that determines
+			// the terminal state.
 			reason = sb.rec.EndReason
 		default:
 			reason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE
@@ -322,17 +322,17 @@ func (m *Manager) reconcile(ctx context.Context) error {
 	return nil
 }
 
-// finalStateFor returns the terminal state that ends a sandbox with reason:
-// FAILED for LOST_ON_DEVICE (the VM ended without a command) and DELETED for
-// every other reason (a delete or a TTL end). The record in DELETING keeps
-// its end reason across a failed end attempt, so an end that retries later,
-// also after an agent restart, derives the same state without a new record
-// field.
+// finalStateFor derives the terminal state from the end reason, including
+// when retrying after an agent restart. CREATE_FAILED and LOST_ON_DEVICE end
+// as FAILED. Caller deletes, TTL ends, and all other reasons end as DELETED.
 func finalStateFor(reason ownsandv1.SandboxEndReason) ownsandv1.SandboxState {
-	if reason == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+	switch reason {
+	case ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED,
+		ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE:
 		return ownsandv1.SandboxState_SANDBOX_STATE_FAILED
+	default:
+		return ownsandv1.SandboxState_SANDBOX_STATE_DELETED
 	}
-	return ownsandv1.SandboxState_SANDBOX_STATE_DELETED
 }
 
 // nextRevision persists and returns the next revision counter.
