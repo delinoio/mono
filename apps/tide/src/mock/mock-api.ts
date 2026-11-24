@@ -93,7 +93,11 @@ import {
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/tide-protos/v1/work_pb";
-import { TERMINAL_REQUEST_STATES, TERMINAL_RUNNER_STATES } from "../format.ts";
+import {
+  TERMINAL_REQUEST_STATES,
+  TERMINAL_RUNNER_STATES,
+  timestampMs,
+} from "../format.ts";
 import { uuidV7 } from "../uuid.ts";
 
 /**
@@ -169,18 +173,28 @@ interface OrgState {
   audit: AuditEvent[];
 }
 
+function isEligibleInvitation(invitation: Invitation, at: number): boolean {
+  const expiresAt = timestampMs(invitation.expireTime);
+  return (
+    invitation.state === InvitationState.PENDING &&
+    expiresAt !== undefined &&
+    expiresAt > at
+  );
+}
+
 function member(
   organizationId: string,
   userId: string,
   role: Role,
   displayName: string,
+  joinTime = ts(-30 * 86400),
 ): Member {
   return create(MemberSchema, {
     organizationId,
     userId,
     role,
     displayName,
-    joinTime: ts(-30 * 86400),
+    joinTime,
   });
 }
 
@@ -722,6 +736,7 @@ export function createMockTransport(
     targetKind: AuditTargetKind,
     targetId: string,
     subjectUserId = "",
+    createTime = ts(),
   ) => {
     org.audit.unshift(
       create(AuditEventSchema, {
@@ -732,7 +747,7 @@ export function createMockTransport(
         targetKind,
         targetId,
         subjectUserId,
-        createTime: ts(),
+        createTime,
       }),
     );
   };
@@ -966,7 +981,11 @@ export function createMockTransport(
       listInvitations(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
-        const p = page(org.invitations, req);
+        const at = now();
+        const eligible = org.invitations.filter((i) =>
+          isEligibleInvitation(i, at),
+        );
+        const p = page(eligible, req);
         return {
           invitations: p.items.map(({ secret: _s, ...rest }) => rest),
           nextPageToken: p.nextPageToken,
@@ -980,22 +999,30 @@ export function createMockTransport(
         );
         if (i === undefined)
           throw new ConnectError("invitation not found", Code.NotFound);
+        const at = now();
+        if (!isEligibleInvitation(i, at))
+          throw new ConnectError(
+            "only a pending invitation can be revoked",
+            Code.FailedPrecondition,
+          );
         i.state = InvitationState.REVOKED;
         audit(
           org,
           AuditAction.INVITATION_REVOKED,
           AuditTargetKind.INVITATION,
           i.invitationId,
+          undefined,
+          timestampFromMs(at),
         );
         const { secret: _s, ...rest } = i;
         return { invitation: rest };
       },
       acceptInvitation(req) {
+        const at = now();
         for (const org of orgs.values()) {
           const i = org.invitations.find(
             (x) =>
-              x.secret === req.invitationSecret &&
-              x.state === InvitationState.PENDING,
+              x.secret === req.invitationSecret && isEligibleInvitation(x, at),
           );
           if (i === undefined) continue;
           if (org.members.some((m) => m.userId === userId))
@@ -1004,13 +1031,14 @@ export function createMockTransport(
               Code.AlreadyExists,
             );
           i.state = InvitationState.ACCEPTED;
+          const joinTime = timestampFromMs(at);
           const m = member(
             org.organization.organizationId,
             userId,
             i.role,
             "Mina Kim",
+            joinTime,
           );
-          m.joinTime = ts();
           org.members.push(m);
           audit(
             org,
@@ -1018,6 +1046,7 @@ export function createMockTransport(
             AuditTargetKind.MEMBERSHIP,
             userId,
             userId,
+            joinTime,
           );
           return { organization: withRole(org, i.role), member: m };
         }
