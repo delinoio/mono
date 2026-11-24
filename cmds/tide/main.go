@@ -14,6 +14,12 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// Restore the default interrupt action after cancellation so a later
+	// interrupt can end a command blocked on credential input.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	code := cli.Run(ctx, cli.Env{Args: os.Args[1:]})
 	stop()
 	os.Exit(code)

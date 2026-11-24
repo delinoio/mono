@@ -128,7 +128,8 @@ type ExecParams struct {
 	// WorkingDirectory is an absolute guest path or a path relative to the
 	// workspace path. Empty means the workspace path.
 	WorkingDirectory string
-	// Timeout stops the command; zero means no timeout.
+	// Timeout specifies how long the command can run. Zero means no timeout.
+	// Exec rejects negative values.
 	Timeout time.Duration
 	// OnEvent receives the events in order. An error from it ends the
 	// stream (the command keeps running in the guest) and Exec returns that
@@ -186,11 +187,25 @@ func (e *ExecStreamError) Unwrap() error { return e.Err }
 // reported with an ExecEventOutputTruncated event and marks the result
 // incomplete.
 //
+// For stdout and stderr, a nil callback or a nil return from the callback
+// acknowledges the entire data range. If the callback returns an error, the
+// ExecStreamError offset for that stream points to the first byte offered
+// to the callback. AttachExec can replay that range while it is retained.
+// A sink that saves a prefix before returning an error can receive that
+// prefix again. To avoid duplicate writes, use atomic chunk writes or track
+// durable bytes by stream and offset.
+//
 // A server error of the ExecDevSession call itself (for example
 // failed_precondition for a dev session that is not RUNNING) is returned
 // unchanged: the command did not run. Failures after the request was sent
 // are returned as *ExecStreamError.
 func (c *Client) Exec(ctx context.Context, p ExecParams) (*ExecResult, error) {
+	if len(p.Command) == 0 {
+		return nil, localError(connect.CodeInvalidArgument, errors.New("tide: exec needs a command"))
+	}
+	if p.Timeout < 0 {
+		return nil, localError(connect.CodeInvalidArgument, errors.New("tide: exec timeout must be nonnegative"))
+	}
 	execID := p.ExecID
 	if execID == "" {
 		id, err := uuidv7.NewString()
@@ -198,9 +213,6 @@ func (c *Client) Exec(ctx context.Context, p ExecParams) (*ExecResult, error) {
 			return nil, err
 		}
 		execID = id
-	}
-	if len(p.Command) == 0 {
-		return nil, localError(connect.CodeInvalidArgument, errors.New("tide: exec needs a command"))
 	}
 	req := &tidev1.ExecDevSessionRequest{
 		OrganizationId:   p.OrganizationID,
@@ -218,12 +230,16 @@ func (c *Client) Exec(ctx context.Context, p ExecParams) (*ExecResult, error) {
 }
 
 // AttachExec continues the event stream of an exec from the given offsets,
-// with the same continuation rules as Exec. It does not report the started
-// event again.
+// with the same continuation rules as Exec. It suppresses the callback for
+// the started event.
+//
+// The callback acknowledges stdout and stderr chunks as described in
+// [Client.Exec]. A callback error returns an *ExecStreamError with the offset
+// of the first byte in the rejected range, which a later AttachExec can replay.
 func (c *Client) AttachExec(ctx context.Context, p AttachParams) (*ExecResult, error) {
 	op := &execOp{
 		c: c, org: p.OrganizationID, session: p.DevSessionID, execID: p.ExecID, onEvent: p.OnEvent,
-		stdout: p.StdoutOffset, stderr: p.StderrOffset, started: true,
+		stdout: p.StdoutOffset, stderr: p.StderrOffset, suppressStarted: true,
 	}
 	return op.run(ctx)
 }
@@ -236,6 +252,7 @@ type execOp struct {
 	start               *tidev1.ExecDevSessionRequest // nil after the first call
 	stdout, stderr      int64
 	started, incomplete bool
+	suppressStarted     bool
 }
 
 func (o *execOp) emit(ev ExecEvent) error {
@@ -381,6 +398,9 @@ func (o *execOp) handle(ev *tidev1.DevSessionExecEvent) (*ExecResult, error) {
 			return nil, nil
 		}
 		o.started = true
+		if o.suppressStarted {
+			return nil, nil
+		}
 		return nil, o.emit(ExecEvent{Kind: ExecEventStarted})
 	case ev.GetOutputTruncated() != nil:
 		t := ev.GetOutputTruncated()
@@ -435,9 +455,9 @@ func (o *execOp) lose(out, errRange ByteRange) error {
 	return o.emit(ExecEvent{Kind: ExecEventOutputTruncated, MissingStdout: out, MissingStderr: errRange})
 }
 
-// output reports one chunk. It drops bytes that the caller already
-// received (a continuation can repeat them) and reports skipped bytes as
-// lost output.
+// output reports one chunk. It drops previously acknowledged bytes,
+// reports skipped bytes as lost output, and advances past the chunk
+// when the callback accepts it.
 func (o *execOp) output(kind ExecEventKind, next *int64, ch *tidev1.DevSessionExecOutput) error {
 	off, data := ch.GetOffset(), ch.GetData()
 	if off > *next {
@@ -452,15 +472,19 @@ func (o *execOp) output(kind ExecEventKind, next *int64, ch *tidev1.DevSessionEx
 			return err
 		}
 	}
-	if end := off + int64(len(data)); end <= *next {
+	end := off + int64(len(data))
+	if end <= *next {
 		return nil
 	}
 	if off < *next {
 		data = data[*next-off:]
 		off = *next
 	}
-	*next = off + int64(len(data))
-	return o.emit(ExecEvent{Kind: kind, Offset: off, Data: data})
+	if err := o.emit(ExecEvent{Kind: kind, Offset: off, Data: data}); err != nil {
+		return err
+	}
+	*next = end
+	return nil
 }
 
 func (o *execOp) result(kind ExecResultKind) *ExecResult {

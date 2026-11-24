@@ -155,7 +155,7 @@ type vm struct {
 	machineID []byte
 	// hardwareModel is the hardware model of a macOS guest.
 	hardwareModel []byte
-	exited        <-chan struct{}
+	watcher       *machineWatcher
 	restore       ownsandv1.SandboxRestorePath
 	network       ownsandv1.NetworkMode
 	net           *netstack.Network
@@ -173,14 +173,21 @@ type vm struct {
 	// current VM configuration. It stays open and unused, so that the guest
 	// never reads an EOF from its console; stopVM closes it.
 	consoleIn *os.File
-	// stopMu serializes stopVM calls of one VM, so a retry of a failed stop
-	// never overlaps the attempt before it.
+	// stopMu serializes cleanup and the installation of each machine and its
+	// watcher, so cleanup always releases the pair it stopped.
 	stopMu sync.Mutex
 }
 
 func (v *vm) SandboxID() string                         { return v.id }
 func (v *vm) RestorePath() ownsandv1.SandboxRestorePath { return v.restore }
-func (v *vm) Exited() <-chan struct{}                   { return v.exited }
+func (v *vm) Exited() <-chan struct{} {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.watcher == nil {
+		return nil
+	}
+	return v.watcher.exited
+}
 
 // current returns the VM object, or an error after the VM was stopped.
 func (v *vm) current() (*vz.VirtualMachine, <-chan struct{}, error) {
@@ -189,7 +196,7 @@ func (v *vm) current() (*vz.VirtualMachine, <-chan struct{}, error) {
 	if v.machine == nil {
 		return nil, nil, fmt.Errorf("vzrt: sandbox %s has no running VM", v.id)
 	}
-	return v.machine, v.exited, nil
+	return v.machine, v.watcher.exited, nil
 }
 
 // Dial connects to the guest helper through the virtio socket device.
@@ -609,9 +616,11 @@ func (r *Runtime) newMachine(v *vm, cfg *vz.VirtualMachineConfiguration) error {
 	if err != nil {
 		return err
 	}
-	exited := WatchStopped(machine)
+	v.stopMu.Lock()
+	defer v.stopMu.Unlock()
 	v.mu.Lock()
-	v.machine, v.exited = machine, exited
+	v.machine = machine
+	v.watcher = watchMachine(machine.StateChangedNotify(), terminalState)
 	v.mu.Unlock()
 	return nil
 }
@@ -651,7 +660,7 @@ func (r *Runtime) waitGuest(ctx context.Context, v *vm) error {
 			return fmt.Errorf("vzrt: guest helper not ready: %w", err)
 		}
 		return nil
-	case <-v.exited:
+	case <-v.Exited():
 		return errors.New("vzrt: the VM stopped during boot")
 	}
 }
@@ -814,8 +823,7 @@ func (r *Runtime) restoreMemory(ctx context.Context, v *vm, spec vmruntime.Spec)
 type vzMachine struct{ m *vz.VirtualMachine }
 
 func (z vzMachine) Terminal() bool {
-	state := z.m.State()
-	return state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError
+	return terminalState(z.m.State())
 }
 func (z vzMachine) CanStop() bool { return z.m.CanStop() }
 func (z vzMachine) Stop() error   { return z.m.Stop() }
@@ -839,21 +847,17 @@ func (r *Runtime) stopVM(v *vm) error {
 	v.stopMu.Lock()
 	defer v.stopMu.Unlock()
 	v.mu.Lock()
-	machine, exited := v.machine, v.exited
+	machine, watcher := v.machine, v.watcher
 	v.mu.Unlock()
 	if machine != nil {
-		if err := stopMachine(vzMachine{machine}, exited, stopTimeout); err != nil {
+		if err := watcher.stop(vzMachine{machine}, stopTimeout); err != nil {
 			r.logger.Error("VM did not stop", "sandbox_id", v.id, "error", err)
 			return err
 		}
-		v.mu.Lock()
-		if v.machine == machine {
-			v.machine = nil
-		}
-		v.mu.Unlock()
 	}
 	// The VM is gone: nothing uses the network stack any more.
 	v.mu.Lock()
+	v.machine = nil
 	stack, conn := v.net, v.netConn
 	v.net, v.netConn = nil, nil
 	consoleIn := v.consoleIn
@@ -922,9 +926,7 @@ func (r *Runtime) Running(context.Context) ([]string, error) {
 	defer r.mu.Unlock()
 	ids := make([]string, 0, len(r.vms))
 	for id, v := range r.vms {
-		v.mu.Lock()
-		exited := v.exited
-		v.mu.Unlock()
+		exited := v.Exited()
 		if exited == nil {
 			continue
 		}

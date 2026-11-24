@@ -95,7 +95,8 @@ func newRotationHarness(t *testing.T, timing RelayTiming) *rotationHarness {
 	// 15.6 ms, so the allocation time and the first frame can read the same
 	// instant, the rotation check is false and the handler forwards the frame.
 	stream.Started = time.Now().Add(-time.Hour)
-	h.call = &relayCall{procedure: "/delino.ownsand.v1.RelayService/Exec", grant: &grants.Grant{ID: "grant-1"}, stream: stream, conn: conn, start: time.Now()}
+	h.call = &relayCall{procedure: "/delino.ownsand.v1.RelayService/Exec", grant: &grants.Grant{ID: "grant-1"}, stream: stream, start: time.Now()}
+	h.feed(&ownsandv1.RelayWindowUpdate{IncrementBytes: datapath.MinWindowSize})
 	return h
 }
 
@@ -108,6 +109,8 @@ func (h *rotationHarness) feed(payload any) {
 	case *ownsandv1.RequestAccepted:
 		f = datapath.MustNewFrame(h.call.stream.ID, "sandbox", p)
 	case *ownsandv1.ExecEvent:
+		f = datapath.MustNewFrame(h.call.stream.ID, "sandbox", p)
+	case *ownsandv1.RelayWindowUpdate:
 		f = datapath.MustNewFrame(h.call.stream.ID, "sandbox", p)
 	default:
 		h.t.Fatalf("unsupported payload %T", payload)

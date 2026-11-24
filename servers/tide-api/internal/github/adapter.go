@@ -9,8 +9,11 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -173,7 +176,7 @@ var errDeletedWhileStarting = errors.New("the runner was deleted while it starte
 // comes first: then the runner is no longer PREPARING, the registration is
 // removed here, and the start fails before the runner program starts.
 func (l *Layer) recordRegistration(ctx context.Context, inst *Installation, runnerID string, githubRunnerID int64) error {
-	starting := false
+	var starting, readyToCommit bool
 	err := l.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		var state int16
 		if err := tx.QueryRow(ctx, "SELECT state FROM runners WHERE runner_id = $1 FOR UPDATE", runnerID).Scan(&state); err != nil {
@@ -184,10 +187,24 @@ func (l *Layer) recordRegistration(ctx context.Context, inst *Installation, runn
 		}
 		s := tidev1.RunnerState(state)
 		starting = s == tidev1.RunnerState_RUNNER_STATE_PREPARING || s == tidev1.RunnerState_RUNNER_STATE_WARM
+		readyToCommit = true
 		return nil
 	})
-	if err != nil || starting {
+	if err != nil {
+		if !readyToCommit || registrationCommitRolledBack(err) {
+			// The normal sandbox cleanup cannot look up this GitHub ID.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			if cleanupErr := l.gh.DeleteRunner(cleanupCtx, inst.GitHubID, inst.Login, githubRunnerID); cleanupErr != nil {
+				l.svc.Logger.WarnContext(cleanupCtx, "github_runner_removal_failed",
+					slog.String("organization_id", inst.OrganizationID), slog.String("runner_id", runnerID),
+					slog.Int64("github_installation_id", inst.GitHubID), slog.Int64("github_runner_id", githubRunnerID), slog.Any("error", cleanupErr))
+			}
+		}
 		return err
+	}
+	if starting {
+		return nil
 	}
 	// The runner never connected, so GitHub accepts the removal. When it
 	// fails, the deletion of the runner (a DELETING runner) repeats it.
@@ -195,6 +212,17 @@ func (l *Layer) recordRegistration(ctx context.Context, inst *Installation, runn
 		l.svc.Logger.WarnContext(ctx, "github_runner_removal_failed", slog.String("organization_id", inst.OrganizationID), slog.String("runner_id", runnerID), slog.Any("error", err))
 	}
 	return errDeletedWhileStarting
+}
+
+func registrationCommitRolledBack(err error) bool {
+	if errors.Is(err, pgx.ErrTxCommitRollback) || pgconn.SafeToRetry(err) {
+		return true
+	}
+	// A PostgreSQL ERROR rejects COMMIT. Connection errors and an explicit
+	// statement_completion_unknown can leave the outcome uncertain.
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.SeverityUnlocalized == "ERROR" &&
+		!strings.HasPrefix(pgErr.Code, "08") && pgErr.Code != "40003"
 }
 
 // ProgramExited keeps the request: GitHub ends it with the completed event.

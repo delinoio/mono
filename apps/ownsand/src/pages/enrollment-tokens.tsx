@@ -68,6 +68,10 @@ export function EnrollmentTokensPage() {
   const [token, setToken] = useState<string>();
   const [revoking, setRevoking] = useState<EnrollmentToken>();
 
+  if (pages.terminalLoadMoreError && revoking !== undefined) {
+    setRevoking(undefined);
+  }
+
   return (
     <>
       <PageHeader
