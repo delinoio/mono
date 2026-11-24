@@ -121,6 +121,11 @@ describe("sandboxes", () => {
 
     await screen.getByRole("checkbox", "Show ended sandboxes").tap();
     await expect(screen.getByText("Deleted")).toBeVisible();
+
+    await screen.getByRole("checkbox", "Show ended sandboxes").tap();
+    await expect(screen.getByText("Deleted")).toBeHidden();
+    await expect(screen.getByText("Paused")).toBeVisible();
+    await expect(screen.getByRole("button", "Show more")).toBeHidden();
   });
 
   test("pauses and resumes a sandbox", async ({ app, screen }) => {
