@@ -181,7 +181,7 @@ func (h *Handler) CancelRequest(ctx context.Context, req *connect.Request[tidev1
 		// Check the state under the row lock that the end takes, so a
 		// dispatch or another cancellation that changes the request
 		// meanwhile is seen.
-		cur, err := e.lockRequest(ctx, tx, id)
+		cur, err := e.LockRequest(ctx, tx, id)
 		if err != nil {
 			return err
 		}

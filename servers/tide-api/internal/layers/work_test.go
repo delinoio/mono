@@ -23,6 +23,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/db"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/lease"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/profile"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
@@ -821,6 +822,106 @@ func TestDeleteAfterLostCreateResponse(t *testing.T) {
 	sandboxes := w.fake.Sandboxes(w.osOrg)
 	if len(sandboxes) != 1 || sandboxes[0].GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || w.runner(t, runnerID).GetOwnsandSandboxId() != sandboxes[0].GetSandboxId() {
 		t.Fatalf("sandboxes %v", sandboxes)
+	}
+}
+
+func TestDeleteSandboxNow(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		revokeKey   bool
+		deleteError error
+		activeAfter int
+	}{
+		{name: "revoked key", revokeKey: true, activeAfter: 1},
+		{name: "not found", deleteError: connect.NewWireError(connect.CodeNotFound, errors.New("sandbox not found")), activeAfter: 1},
+		{name: "success"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWorkWorld(t, devsession.Timing{})
+			ctx := t.Context()
+			member := w.env.User(w.org.Member)
+			profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+			session := w.createSession(t, member, profileID)
+			session = w.waitState(t, session.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+			if runner := w.runner(t, session.GetRunnerId()); runner.GetOwnsandSandboxId() == "" {
+				t.Fatal("running session has no stored sandbox ID")
+			}
+
+			// Give the lease to another instance so only the RPC can delete the sandbox.
+			w.env.App.Lease.Release()
+			other := lease.Lease{DB: w.env.DB, InstanceID: "other-instance"}
+			if held, err := other.TryAcquire(ctx); err != nil || !held {
+				t.Fatalf("could not hand off the lease: held=%v, err=%v", held, err)
+			}
+			if tc.revokeKey {
+				w.fake.RevokeKey(w.osOrg)
+			}
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = tc.deleteError })
+
+			_, err := member.DevSession.DeleteDevSession(ctx, connect.NewRequest(&tidev1.DeleteDevSessionRequest{
+				OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner := w.runner(t, session.GetRunnerId())
+			if runner.GetState() != tidev1.RunnerState_RUNNER_STATE_DELETED ||
+				runner.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER {
+				t.Fatalf("runner after synchronous deletion: %v", runner)
+			}
+			if calls, active := w.fake.Calls("DeleteSandbox"), w.fake.Active(w.osOrg); calls != 1 || active != tc.activeAfter {
+				t.Fatalf("DeleteSandbox calls=%d, active sandboxes=%d, want 1 and %d", calls, active, tc.activeAfter)
+			}
+		})
+	}
+}
+
+func TestDeleteSandboxRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		revokeKey   bool
+		activeAfter int
+	}{
+		{name: "key revoked before retry", revokeKey: true, activeAfter: 1},
+		{name: "OwnSand recovers"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWorkWorld(t, devsession.Timing{})
+			member := w.env.User(w.org.Member)
+			profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+			session := w.createSession(t, member, profileID)
+			session = w.waitState(t, session.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.DeleteError = connect.NewWireError(connect.CodeUnavailable, errors.New("device busy"))
+			})
+			_, err := member.DevSession.DeleteDevSession(t.Context(), connect.NewRequest(&tidev1.DeleteDevSessionRequest{
+				OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			eventually(t, "a deletion retry after the RPC", func() bool { return w.fake.Calls("DeleteSandbox") >= 2 })
+			before := w.runner(t, session.GetRunnerId())
+			if before.GetState() != tidev1.RunnerState_RUNNER_STATE_DELETING || before.GetOwnsandSandboxId() == "" ||
+				before.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER {
+				t.Fatalf("runner after unavailable error: %v", before)
+			}
+			if tc.revokeKey {
+				w.fake.RevokeKey(w.osOrg)
+			}
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
+
+			eventually(t, "runner deleted by the reconciler", func() bool {
+				return w.runner(t, session.GetRunnerId()).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED
+			})
+			after := w.runner(t, session.GetRunnerId())
+			if after.GetEndReason() != before.GetEndReason() || w.fake.Active(w.osOrg) != tc.activeAfter {
+				t.Fatalf("runner after retry: %v, active sandboxes=%d, want %d", after, w.fake.Active(w.osOrg), tc.activeAfter)
+			}
+			calls := w.fake.Calls("DeleteSandbox")
+			stays(t, "no more DeleteSandbox calls", func() bool { return w.fake.Calls("DeleteSandbox") == calls })
+		})
 	}
 }
 

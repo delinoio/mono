@@ -382,7 +382,7 @@ func (e *Engine) sandboxEnded(ctx context.Context, runnerID string, reason ownsa
 		a := e.adapters[r.Kind]
 		var req *Request
 		if r.RequestID != "" {
-			req, _ = e.lockRequest(ctx, tx, r.RequestID)
+			req, _ = e.LockRequest(ctx, tx, r.RequestID)
 		}
 		out := BaseAdapter{}.SandboxEnded(req, reason)
 		if a != nil {
@@ -452,7 +452,7 @@ func (e *Engine) programExited(ctx context.Context, runnerID string, res *ownsan
 		}
 		if r.RequestID != "" {
 			if a := e.adapters[r.Kind]; a != nil {
-				req, err := e.lockRequest(ctx, tx, r.RequestID)
+				req, err := e.LockRequest(ctx, tx, r.RequestID)
 				if err != nil {
 					return err
 				}
@@ -504,9 +504,18 @@ func (e *Engine) removeSandbox(ctx context.Context, client ownsandclient.Client,
 			return true
 		}
 	}
-	if _, err := client.DeleteSandbox(ctx, id); err != nil && !isCode(err, connect.CodeNotFound) {
-		e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
-		return false
+	if _, err := client.DeleteSandbox(ctx, id); err != nil {
+		switch code := connect.CodeOf(err); code {
+		case connect.CodeNotFound:
+			return true
+		case connect.CodeUnauthenticated:
+			e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_skipped", slog.String("runner_id", r.ID),
+				slog.String("organization_id", r.OrganizationID), slog.String("sandbox_id", id),
+				slog.String("code", code.String()), slog.String("cleanup", "idle_ttl"))
+		default:
+			e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+			return false
+		}
 	}
 	return true
 }
@@ -591,7 +600,7 @@ func (e *Engine) startFailed(ctx context.Context, runner *Runner, cause string) 
 			}
 			return err
 		}
-		req, err := e.lockRequest(ctx, tx, r.RequestID)
+		req, err := e.LockRequest(ctx, tx, r.RequestID)
 		if err != nil || req.State != reqStarting {
 			return err
 		}
@@ -713,7 +722,7 @@ func (e *Engine) deleteLockedRunnerTx(ctx context.Context, tx pgx.Tx, cur *Runne
 	if r.RequestID == "" || cause == 0 {
 		return r, nil, 0, nil
 	}
-	req, err := e.lockRequest(ctx, tx, r.RequestID)
+	req, err := e.LockRequest(ctx, tx, r.RequestID)
 	if err != nil {
 		return nil, nil, 0, err
 	}
