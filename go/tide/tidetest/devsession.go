@@ -520,7 +520,7 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 	if t := req.GetTimeout(); t != nil {
 		ctx, cancel = context.WithTimeout(ctx, t.AsDuration())
 	}
-	cmd := exec.CommandContext(ctx, req.GetCommand()[0], req.GetCommand()[1:]...)
+	cmd := newExecCommand(ctx, req.GetCommand())
 	cmd.Dir = dir
 	cmd.Env = os.Environ()
 	for k, v := range req.GetEnv() {
