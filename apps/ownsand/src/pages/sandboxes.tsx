@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
-  useInfiniteQuery,
+  createInfiniteQueryOptions,
   useMutation,
   useQuery,
+  useTransport,
 } from "@connectrpc/connect-query";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { useQueryClient } from "@tanstack/react-query";
+import {
+  hashKey,
+  useInfiniteQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { Badge } from "delino-ui/badge";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { Checkbox } from "delino-ui/checkbox";
@@ -25,7 +30,7 @@ import {
   SandboxService,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   invalidateServices,
   POLL_INTERVAL_MS,
@@ -74,7 +79,8 @@ export function SandboxesPage() {
       new Map((devices.data?.devices ?? []).map((d) => [d.deviceId, d.name])),
     [devices.data],
   );
-  const list = useInfiniteQuery(
+  const transport = useTransport();
+  const listOptions = createInfiniteQueryOptions(
     SandboxService.method.listSandboxes,
     {
       organizationId,
@@ -85,14 +91,34 @@ export function SandboxesPage() {
       includeEnded,
     },
     {
+      transport,
       pageParamKey: "pageToken",
       getNextPageParam: (last) => last.nextPageToken || undefined,
-      refetchInterval: (q) =>
-        q.state.data?.pages.some((p) => p.sandboxes.some(sandboxSettling))
-          ? POLL_INTERVAL_MS
-          : false,
     },
   );
+  const list = useInfiniteQuery({
+    ...listOptions,
+    refetchInterval: (q) =>
+      q.state.data?.pages.some((p) => p.sandboxes.some(sandboxSettling))
+        ? POLL_INTERVAL_MS
+        : false,
+  });
+  const listKey = hashKey(listOptions.queryKey);
+  const pendingNextPages = useRef(new Set<string>());
+
+  async function requestNextPage() {
+    const pending = pendingNextPages.current;
+    if (pending.has(listKey)) return;
+
+    // Supersede a background refresh. Guard the continuation before React
+    // can disable the button, and hold the guard for this query until it settles.
+    pending.add(listKey);
+    try {
+      await list.fetchNextPage({ cancelRefetch: true });
+    } finally {
+      pending.delete(listKey);
+    }
+  }
   const sandboxes = list.data?.pages.flatMap((p) => p.sandboxes) ?? [];
   // A failed "Show more" request is not a failed refresh of the list: the
   // loaded rows stay, and the error and its retry sit next to the button
@@ -188,18 +214,13 @@ export function SandboxesPage() {
         }
       </QueryBoundary>
       {nextPageFailed && !list.isFetchingNextPage ? (
-        <ErrorNotice
-          error={list.error}
-          // `cancelRefetch: false` joins a request that is already in flight
-          // instead of cancelling it and sending the same page twice.
-          onRetry={() => void list.fetchNextPage({ cancelRefetch: false })}
-        />
+        <ErrorNotice error={list.error} onRetry={requestNextPage} />
       ) : null}
       {list.hasNextPage ? (
         <Button
           variant={ButtonVariant.Secondary}
           disabled={list.isFetchingNextPage}
-          onClick={() => void list.fetchNextPage({ cancelRefetch: false })}
+          onClick={requestNextPage}
         >
           Show more
         </Button>
