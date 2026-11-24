@@ -51,7 +51,7 @@ func TestRemoveAllWaitsForRegisteredImportsAndRefusesLaterOnes(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	_, err = e.m.AddImportedSnapshot(&ownsandv1.SnapshotStateEntry{SnapshotId: snapID})
+	_, err = e.m.AddImportedSnapshot(context.Background(), &ownsandv1.SnapshotStateEntry{SnapshotId: snapID})
 	requireFailedPrecondition(t, err)
 	end()
 	end() // idempotent
@@ -103,7 +103,7 @@ func TestSnapshotImportRegistrationWithoutRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer end()
-	if _, err := e.m.AddImportedSnapshot(&ownsandv1.SnapshotStateEntry{SnapshotId: snapID}); err != nil {
+	if _, err := e.m.AddImportedSnapshot(context.Background(), &ownsandv1.SnapshotStateEntry{SnapshotId: snapID}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, ok := e.m.SnapshotContent(snapID); !ok {

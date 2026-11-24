@@ -83,9 +83,9 @@ fi
 log "Rotate container logs"
 # The `local` log driver keeps at most 100 MB per container by default.
 # configure-docker-logs.sh sets only the `log-driver` key and keeps the other
-# daemon settings; it restarts Docker only after it changed the file. The
-# helper is resolved from this script, so provisioning works from any current
-# directory.
+# daemon settings. It also recovers from an interrupted run by verifying the
+# active driver and restarting Docker if necessary. The helper is resolved
+# from this script, so provisioning works from any current directory.
 "$(dirname "${BASH_SOURCE[0]}")/configure-docker-logs.sh" /etc/docker/daemon.json
 systemctl enable --now docker
 

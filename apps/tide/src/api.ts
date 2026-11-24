@@ -18,13 +18,6 @@ import {
 import { QueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo } from "react";
 
-/**
- * The ListOrganizations request of the console. The control plane returns 50
- * organizations for an empty request, so every surface sends this one input
- * to read the first 200 and to share one React Query key.
- */
-export const LIST_ORGANIZATIONS_REQUEST = { pageSize: 200 } as const;
-
 /** Page size of the console's lists. */
 export const PAGE_SIZE = 50;
 

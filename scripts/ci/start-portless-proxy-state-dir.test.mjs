@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Covers which portless state directory the proxy preflight reads the proxy PID
-// from. portless uses `PORTLESS_STATE_DIR` as written, so a relative value
-// resolves against the working directory of the portless subprocesses (the app
-// directory), not against the directory where the preflight runs.
+// Covers state directory selection and propagation to the proxy and app tasks.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -16,12 +13,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
-const preflight = join(root, "scripts", "dev", "start-portless-proxy.mjs");
+const preflight = "start-portless-proxy.mjs";
+const launcher = "start-dev.mjs";
+const appNames = ["web", "web-sibling"];
 
 const pinnedVersion = "0.18.1";
 const outdatedVersion = "0.15.8";
@@ -29,35 +28,71 @@ const outdatedVersion = "0.15.8";
 // The version check reads the proxy command with `ps`, which Windows lacks.
 const psSkip = process.platform === "win32" ? "needs ps" : false;
 
-// A fake portless CLI that records its arguments and working directory.
+// A fake portless CLI that records its arguments, cwd and state override.
 const fakeCli = `
 import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
 appendFileSync(
   process.env.FAKE_PORTLESS_RECORD,
-  JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd() }) + "\\n",
+  JSON.stringify({
+    args,
+    cwd: process.cwd(),
+    stateDir: process.env.PORTLESS_STATE_DIR ?? null,
+  }) + "\\n",
 );
+if (args[0] === "proxy") process.exit(Number(process.env.FAKE_PORTLESS_STATUS));
+`;
+
+// A fake Turbo CLI that runs Portless from each task's working directory.
+const fakeTurbo = `
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
+assert.deepEqual(process.argv.slice(2), ["run", "dev"]);
+for (const name of ${JSON.stringify(appNames)}) {
+  const result = spawnSync(
+    process.execPath,
+    [join("node_modules", "portless", "dist", "cli.js"), "run"],
+    { cwd: join(process.cwd(), "apps", name), stdio: "inherit" },
+  );
+  assert.equal(result.status, 0);
+}
 `;
 
 // A fake proxy process that runs until the test kills it.
 const fakeProxyCli = `setInterval(() => {}, 1000);`;
 
-// Creates a repository fixture with one portless app and returns its paths.
+// Creates a repository fixture with two Portless apps and a Turbo CLI.
 function fixture(t) {
   // The real path keeps working directories comparable where the temporary
   // directory is a symbolic link, as on macOS.
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "portless-state-dir-")));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   mkdirSync(join(dir, "scripts", "dev"), { recursive: true });
-  copyFileSync(
-    preflight,
-    join(dir, "scripts", "dev", "start-portless-proxy.mjs"),
+  for (const script of [preflight, launcher]) {
+    copyFileSync(
+      join(root, "scripts", "dev", script),
+      join(dir, "scripts", "dev", script),
+    );
+  }
+  const turboDir = join(dir, "node_modules", "turbo");
+  mkdirSync(turboDir, { recursive: true });
+  writeFileSync(
+    join(turboDir, "package.json"),
+    JSON.stringify({ bin: { turbo: "./cli.mjs" } }),
   );
-  const appDir = join(dir, "apps", "web");
+  writeFileSync(join(turboDir, "cli.mjs"), fakeTurbo);
+  const [appDir, siblingDir] = appNames.map((name) => addFakeApp(dir, name));
+  return { dir, appDir, siblingDir };
+}
+
+function addFakeApp(dir, name) {
+  const appDir = join(dir, "apps", name);
   mkdirSync(appDir, { recursive: true });
   writeFileSync(
     join(appDir, "package.json"),
     JSON.stringify({
-      name: "web",
+      name,
       scripts: { dev: "portless run --prefix=" },
     }),
   );
@@ -73,7 +108,7 @@ function fixture(t) {
     }),
   );
   writeFileSync(join(portlessDir, "dist", "cli.js"), fakeCli);
-  return { dir, appDir };
+  return appDir;
 }
 
 // Starts a fake proxy of an older portless and records its PID in
@@ -98,10 +133,11 @@ function startOutdatedProxy(t, dir, stateDir) {
   return proxy.pid;
 }
 
-// Runs the preflight from the fixture root, as `pnpm dev` does. `stateDir` is
-// the value of PORTLESS_STATE_DIR, or undefined to leave it unset; `home` is
-// the home directory that the default state directory lives under.
-function run(dir, { stateDir, home }) {
+// Runs the requested entry point from the fixture root.
+function run(
+  dir,
+  { stateDir, home = dir, script = preflight, portless, proxyStatus = 0 },
+) {
   const record = join(dir, "record.jsonl");
   const {
     PORTLESS: _shellPortless,
@@ -113,11 +149,13 @@ function run(dir, { stateDir, home }) {
     HOME: home,
     USERPROFILE: home,
     FAKE_PORTLESS_RECORD: record,
+    FAKE_PORTLESS_STATUS: String(proxyStatus),
   };
+  if (portless !== undefined) env.PORTLESS = portless;
   if (stateDir !== undefined) env.PORTLESS_STATE_DIR = stateDir;
   const result = spawnSync(
     process.execPath,
-    [join(dir, "scripts", "dev", "start-portless-proxy.mjs")],
+    [join(dir, "scripts", "dev", script)],
     { encoding: "utf8", env, cwd: dir },
   );
   const calls = existsSync(record)
@@ -129,15 +167,15 @@ function run(dir, { stateDir, home }) {
   return { ...result, calls };
 }
 
-function stopThenStart(appDir) {
+function stopThenStart(appDir, stateDir = null) {
   return [
-    { args: ["proxy", "stop"], cwd: appDir },
-    { args: ["proxy", "start"], cwd: appDir },
+    { args: ["proxy", "stop"], cwd: appDir, stateDir },
+    ...startOnly(appDir, stateDir),
   ];
 }
 
-function startOnly(appDir) {
-  return [{ args: ["proxy", "start"], cwd: appDir }];
+function startOnly(appDir, stateDir = null) {
+  return [{ args: ["proxy", "start"], cwd: appDir, stateDir }];
 }
 
 test(
@@ -145,10 +183,11 @@ test(
   { skip: psSkip },
   (t) => {
     const { dir, appDir } = fixture(t);
-    startOutdatedProxy(t, dir, join(appDir, ".portless-probe"));
+    const stateDir = join(appDir, ".portless-probe");
+    startOutdatedProxy(t, dir, stateDir);
     const result = run(dir, { stateDir: ".portless-probe", home: dir });
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(result.calls, stopThenStart(appDir));
+    assert.deepEqual(result.calls, stopThenStart(appDir, stateDir));
     assert.match(result.stderr, /portless_proxy_outdated/);
   },
 );
@@ -162,7 +201,10 @@ test(
     startOutdatedProxy(t, dir, join(dir, ".portless-probe"));
     const result = run(dir, { stateDir: ".portless-probe", home: dir });
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(result.calls, startOnly(appDir));
+    assert.deepEqual(
+      result.calls,
+      startOnly(appDir, join(appDir, ".portless-probe")),
+    );
     assert.doesNotMatch(result.stderr, /portless_proxy_outdated/);
   },
 );
@@ -173,7 +215,7 @@ test("uses an absolute state directory as written", { skip: psSkip }, (t) => {
   startOutdatedProxy(t, dir, stateDir);
   const result = run(dir, { stateDir, home: dir });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(result.calls, stopThenStart(appDir));
+  assert.deepEqual(result.calls, stopThenStart(appDir, stateDir));
 });
 
 test(
@@ -188,3 +230,56 @@ test(
     assert.deepEqual(result.calls, stopThenStart(appDir));
   },
 );
+
+function appCalls(appDir, siblingDir, stateDir) {
+  return [appDir, siblingDir].map((cwd) => ({ args: ["run"], cwd, stateDir }));
+}
+
+test("root dev shares the preflight app's relative state directory", (t) => {
+  const { dir, appDir, siblingDir } = fixture(t);
+  const stateDir = join(appDir, ".portless-probe");
+  if (!psSkip) startOutdatedProxy(t, dir, stateDir);
+  const result = run(dir, { script: launcher, stateDir: ".portless-probe" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, [
+    ...(psSkip ? startOnly(appDir, stateDir) : stopThenStart(appDir, stateDir)),
+    ...appCalls(appDir, siblingDir, stateDir),
+  ]);
+});
+
+test("root dev passes the absolute override through as supplied", (t) => {
+  const { dir, appDir, siblingDir } = fixture(t);
+  const stateDir = join(dir, "absolute-state") + sep + ".";
+  const result = run(dir, { script: launcher, stateDir });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, [
+    ...startOnly(appDir, stateDir),
+    ...appCalls(appDir, siblingDir, stateDir),
+  ]);
+});
+
+test("root dev leaves the state directory unset by default", (t) => {
+  const { dir, appDir, siblingDir } = fixture(t);
+  const result = run(dir, { script: launcher });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, [
+    ...startOnly(appDir),
+    ...appCalls(appDir, siblingDir, null),
+  ]);
+});
+
+test("root dev exits before Turbo when the proxy preflight fails", (t) => {
+  const { dir, appDir } = fixture(t);
+  const result = run(dir, { script: launcher, proxyStatus: 3 });
+  assert.equal(result.status, 3, result.stderr);
+  assert.deepEqual(result.calls, startOnly(appDir));
+  assert.match(result.stderr, /portless_proxy_start_failed/);
+});
+
+test("root dev starts Turbo without a proxy when PORTLESS=0", (t) => {
+  const { dir, appDir, siblingDir } = fixture(t);
+  const result = run(dir, { script: launcher, portless: "0" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, appCalls(appDir, siblingDir, null));
+  assert.match(result.stderr, /portless_proxy_preflight_disabled/);
+});

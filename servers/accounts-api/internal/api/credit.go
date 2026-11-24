@@ -313,7 +313,8 @@ func (h *CreditHandler) UpdateAutoTopUpSettings(ctx context.Context, req *connec
 		if err != nil {
 			return err
 		}
-		mtd, err := billing.MonthToDate(ctx, tx, id, now)
+		// The lock wait can cross a UTC month boundary.
+		mtd, err := billing.MonthToDate(ctx, tx, id, h.timestamp())
 		if err != nil {
 			return err
 		}

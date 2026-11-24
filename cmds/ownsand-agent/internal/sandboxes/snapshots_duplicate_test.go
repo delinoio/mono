@@ -107,7 +107,7 @@ func TestDuplicateCreateSnapshotAfterSandboxLockDoesNotRaceDelete(t *testing.T) 
 		<-started
 		// Publish the snapshot as the first create does, then let the
 		// duplicate continue while a delete marks it.
-		if _, err := e.m.AddImportedSnapshot(&ownsandv1.SnapshotStateEntry{SnapshotId: snapID, GuestOs: ownsandv1.GuestOs_GUEST_OS_LINUX}); err != nil {
+		if _, err := e.m.AddImportedSnapshot(context.Background(), &ownsandv1.SnapshotStateEntry{SnapshotId: snapID, GuestOs: ownsandv1.GuestOs_GUEST_OS_LINUX}); err != nil {
 			sb.cmdMu.Unlock()
 			t.Fatal(err)
 		}

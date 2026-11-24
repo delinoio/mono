@@ -12,14 +12,24 @@ import (
 	"github.com/delinoio/mono/internal/backoff"
 )
 
+// requestRemoval fences the updater as soon as a channel or session receives
+// an authenticated removal notice. Run owns the durable clean-up.
+func (a *Agent) requestRemoval() {
+	a.removalOnce.Do(func() {
+		a.updater.FenceForRemoval()
+		close(a.removal)
+	})
+}
+
 // removeDevice runs the device removal: it records the authenticated
-// removal notice, deletes every local sandbox, snapshot and image, records
-// the finished clean-up, deletes the host network resources of the runtime
-// (see vmruntime.HostCleaner), confirms the removal with a signed nonce (an
-// unknown device means that an earlier confirmation succeeded) and only
-// then deletes the device key.
+// removal notice, drains the updater, deletes every local sandbox, snapshot
+// and image, records the finished clean-up, and deletes the runtime's host
+// network resources (see vmruntime.HostCleaner). It confirms removal with a
+// signed nonce before deleting the device key. An unknown device means an
+// earlier confirmation succeeded.
 func (a *Agent) removeDevice(ctx context.Context) (err error) {
-	// Fence the status file first: statusLoop is still running when the
+	installDone := a.updater.FenceForRemoval()
+	// Fence the status file before cleanup: statusLoop is still running when the
 	// removal notice arrives through Authenticate or the clean-up command,
 	// and a write after Reset would leave status.json behind. A removal
 	// that fails keeps the agent enrolled and retries, so it then lifts
@@ -38,6 +48,16 @@ func (a *Agent) removeDevice(ctx context.Context) (err error) {
 		return err
 	}
 	a.dataPath.Close()
+	if installDone != nil {
+		select {
+		case <-installDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !st.Removal.CleanupDone {
 		if err := a.Sandboxes.RemoveAll(ctx); err != nil {
 			a.logger.Error("removal clean-up failed", "error", err)
