@@ -277,7 +277,7 @@ When `Authenticate` reports that the device is unknown and the agent has no reco
 
 ## Dependencies and Integrations
 
-- Upstream: the [control plane](servers-ownsand-api-foundation.md) (API, agent channel, relay connections and STUN), Cloudflare R2 signed URLs, the release manifest host.
+- Upstream: the [control plane](servers-ownsand-api-foundation.md) (API, agent channel, relay connections and [STUN](servers-ownsand-api-foundation.md#stun)), Cloudflare R2 signed URLs, the release manifest host.
 - Platform: KVM and the microVM runtime, Virtualization.framework, Hyper-V Host Compute Service. Linux host tools of the Firecracker runtime: Firecracker `v1.17.0`, iproute2 (`ip`), nftables (`nft`) and e2fsprogs (`mkfs.ext4` 1.43 or later for the image build; the runtime itself runs no e2fsprogs tool on a sandbox disk image).
 - Protocol schemas: [protos contract](protos-ownsand-api-contract.md).
 - Go modules (root `go.mod`, owner-approved with the OwnSand implementation): `golang.org/x/sys` `v0.50.0` (released 2026-11-06) for vsock sockets, `FICLONE` reflinks, the guest clock and the Host Compute Service calls. Record the `govulncheck ./...` result of each dependency change in the pull request.
