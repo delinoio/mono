@@ -21,7 +21,14 @@ import {
   type Sandbox,
   SandboxState,
 } from "./index.ts";
-import { waitForSnapshotReady, withCleanup } from "./testing/e2e-support.ts";
+import {
+  BillingControlStatus,
+  CLEANUP_STEP_TIMEOUT_MS,
+  setBilling,
+  waitForSnapshotReady,
+  withBillingCleanup,
+  withCleanup,
+} from "./testing/e2e-support.ts";
 import { expectCleanExit } from "./testing/exec-assert.ts";
 import { MarkerOffsetFinder } from "./testing/marker-offset.ts";
 
@@ -40,7 +47,11 @@ const billingUrl = env.OWNSAND_E2E_BILLING_URL ?? "";
 // two network cleanup steps after 15 seconds, so a snapshot that never
 // becomes READY still leaves time for the cleanup inside both limits.
 const SNAPSHOT_READY_TIMEOUT_MS = 60_000;
-const CLEANUP_STEP_TIMEOUT_MS = 15_000;
+const cleanupOptions = {
+  stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS,
+  onCleanupError: (error: unknown) =>
+    process.stderr.write(`cleanup failed: ${String(error)}\n`),
+};
 
 const decoder = new TextDecoder();
 
@@ -59,27 +70,6 @@ function randomBytes(n: number): Uint8Array {
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
-}
-
-/**
- * Billing statuses that the billing control endpoint applies. The values
- * are the path segments of servers/ownsand-api/e2e/tssdk_test.go.
- */
-enum BillingControlStatus {
-  Suspended = "suspended",
-  Allowed = "allowed",
-}
-
-/** Applies a billing status to the organization at once. */
-async function setBilling(status: BillingControlStatus): Promise<void> {
-  const res = await fetch(`${billingUrl}/billing/${status}`, {
-    method: "POST",
-  });
-  if (!res.ok) {
-    throw new Error(
-      `billing control ${status}: ${res.status} ${await res.text()}`,
-    );
-  }
 }
 
 /** Polls the sandbox until it reaches the state, for at most a minute. */
@@ -275,11 +265,7 @@ async function expectSuspended(
             // Runs even when the delete failed, so the handle never leaks.
             () => sandbox.close(),
           ],
-          {
-            stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS,
-            onCleanupError: (error) =>
-              process.stderr.write(`cleanup failed: ${String(error)}\n`),
-          },
+          cleanupOptions,
         );
       },
       3 * 60_000,
@@ -305,40 +291,43 @@ async function expectSuspended(
           maxTtl: 2 * 60 * 60_000,
           network: NetworkMode.NONE,
         });
-        try {
-          expect((await sandbox.waitUntilStable({ pollMs: 200 })).state).toBe(
-            SandboxState.RUNNING,
-          );
-          const pwd = await sandbox.run({ command: ["/bin/pwd"] });
-          const root = decoder.decode(pwd.stdout).trim().replace(/\/$/, "");
-          const path = `${root}/billing.bin`;
-          const data = randomBytes(4096);
-          await sandbox.writeFile(path, data);
+        await withBillingCleanup(
+          async () => {
+            expect((await sandbox.waitUntilStable({ pollMs: 200 })).state).toBe(
+              SandboxState.RUNNING,
+            );
+            const pwd = await sandbox.run({ command: ["/bin/pwd"] });
+            const root = decoder.decode(pwd.stdout).trim().replace(/\/$/, "");
+            const path = `${root}/billing.bin`;
+            const data = randomBytes(4096);
+            await sandbox.writeFile(path, data);
 
-          // The suspension pauses the running sandbox and rejects the data
-          // path. Each relay operation ends with its first AuthorizeRelay.
-          await setBilling(BillingControlStatus.Suspended);
-          await waitForState(sandbox, SandboxState.PAUSED);
-          await expectSuspended(requests, () =>
-            sandbox.run({ command: ["/bin/echo", "suspended"] }),
-          );
-          await expectSuspended(requests, () => sandbox.readFileBytes(path));
+            // The suspension pauses the running sandbox and rejects the data
+            // path. Each relay operation ends with its first AuthorizeRelay.
+            await setBilling(billingUrl, BillingControlStatus.Suspended);
+            await waitForState(sandbox, SandboxState.PAUSED);
+            await expectSuspended(requests, () =>
+              sandbox.run({ command: ["/bin/echo", "suspended"] }),
+            );
+            await expectSuspended(requests, () => sandbox.readFileBytes(path));
 
-          // The recovery resumes the sandbox that billing paused, and the
-          // same operations work again.
-          await setBilling(BillingControlStatus.Allowed);
-          await waitForState(sandbox, SandboxState.RUNNING);
-          const run = await sandbox.run({
-            command: ["/bin/echo", "recovered"],
-          });
-          expect(decoder.decode(run.stdout)).toBe("recovered\n");
-          expectCleanExit(run.result);
-          expect(sameBytes(await sandbox.readFileBytes(path), data)).toBe(true);
-        } finally {
-          await setBilling(BillingControlStatus.Allowed);
-          await sandbox.delete();
-          sandbox.close();
-        }
+            // The recovery resumes the sandbox that billing paused, and the
+            // same operations work again.
+            await setBilling(billingUrl, BillingControlStatus.Allowed);
+            await waitForState(sandbox, SandboxState.RUNNING);
+            const run = await sandbox.run({
+              command: ["/bin/echo", "recovered"],
+            });
+            expect(decoder.decode(run.stdout)).toBe("recovered\n");
+            expectCleanExit(run.result);
+            expect(sameBytes(await sandbox.readFileBytes(path), data)).toBe(
+              true,
+            );
+          },
+          billingUrl,
+          sandbox,
+          cleanupOptions,
+        );
       },
       3 * 60_000,
     );

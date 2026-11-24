@@ -163,3 +163,45 @@ export async function withCleanup<T>(
   }
   return result as T;
 }
+
+export const CLEANUP_STEP_TIMEOUT_MS = 15_000;
+
+/** Billing statuses match the path segments of the Go harness endpoint. */
+export enum BillingControlStatus {
+  Suspended = "suspended",
+  Allowed = "allowed",
+}
+
+/** Applies a billing status to the organization at once. */
+export async function setBilling(
+  billingUrl: string,
+  status: BillingControlStatus,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${billingUrl}/billing/${status}`, {
+    method: "POST",
+    signal,
+  });
+  if (!res.ok) {
+    throw new Error(
+      `billing control ${status}: ${res.status} ${await res.text()}`,
+    );
+  }
+}
+
+export function withBillingCleanup<T>(
+  body: () => Promise<T>,
+  billingUrl: string,
+  sandbox: { delete(signal: AbortSignal): Promise<unknown>; close(): void },
+  options: WithCleanupOptions,
+): Promise<T> {
+  return withCleanup(
+    body,
+    [
+      (signal) => setBilling(billingUrl, BillingControlStatus.Allowed, signal),
+      (signal) => sandbox.delete(signal),
+      () => sandbox.close(),
+    ],
+    options,
+  );
+}
