@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"connectrpc.com/connect"
@@ -67,36 +66,33 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 		},
 		AfterCommit: func(ctx context.Context, orgID, profileID string) { e.releasePending(ctx, "profile/"+profileID) },
 	})
-	unmark := func(ctx context.Context, orgID string) {
-		if _, err := r.Service.DB.Pool.Exec(context.WithoutCancel(ctx), "UPDATE ownsand_links SET removing = false WHERE organization_id = $1", orgID); err != nil {
-			r.Service.Logger.WarnContext(ctx, "ownsand_link_unmark_failed", slog.String("organization_id", orgID), slog.Any("error", err))
-		}
-	}
 	r.OnOrganizationDeletion(api.OrganizationDeletionHook{
 		Name: "work",
-		Prepare: func(ctx context.Context, d api.OrganizationDeletion) error {
-			// Stop dispatch first, then delete every runner. The organization
-			// rows (and with them the requests, runners and the link) are
-			// deleted by the core in the same transaction as InTx.
-			if _, err := r.Service.DB.Pool.Exec(ctx, "UPDATE ownsand_links SET removing = true WHERE organization_id = $1", d.OrganizationID); err != nil {
-				return err
+		Prepare: func(ctx context.Context, d api.OrganizationDeletion) (api.OrganizationDeletionSteps, error) {
+			claim, err := links.ClaimRemoval(ctx, d.OrganizationID)
+			if err != nil {
+				return api.OrganizationDeletionSteps{}, err
 			}
-			if err := e.cleanUpRunners(ctx, d.OrganizationID, func(*Runner) bool { return true }); err != nil {
-				// The core runs Abort only for the hooks before the one that
-				// failed, so this hook clears its own mark: the organization
-				// stays and its dispatch continues.
-				unmark(ctx, d.OrganizationID)
-				return err
+			if claim.HasLink() {
+				if err := e.cleanUpRunners(ctx, d.OrganizationID, func(*Runner) bool { return true }); err != nil {
+					links.ReleaseRemoval(ctx, claim)
+					return api.OrganizationDeletionSteps{}, err
+				}
 			}
-			return nil
+			var ended []*Request
+			return api.OrganizationDeletionSteps{
+				Abort: func(ctx context.Context) { links.ReleaseRemoval(ctx, claim) },
+				InTx: func(ctx context.Context, tx pgx.Tx) error {
+					if err := links.CheckRemoval(ctx, tx, claim); err != nil {
+						return err
+					}
+					var err error
+					ended, err = e.endOpenTx(ctx, tx, d.OrganizationID, "", RequestEnd{State: reqCanceled, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER})
+					return err
+				},
+				AfterCommit: func(ctx context.Context) { e.releaseClaims(ctx, ended) },
+			}, nil
 		},
-		Abort: func(ctx context.Context, d api.OrganizationDeletion) { unmark(ctx, d.OrganizationID) },
-		InTx: func(ctx context.Context, tx pgx.Tx, d api.OrganizationDeletion) error {
-			ended, err := e.endOpenTx(ctx, tx, d.OrganizationID, "", RequestEnd{State: reqCanceled, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER})
-			e.pendingReleases.Store("org/"+d.OrganizationID, ended)
-			return err
-		},
-		AfterCommit: func(ctx context.Context, d api.OrganizationDeletion) { e.releasePending(ctx, "org/"+d.OrganizationID) },
 	})
 	return e
 }
@@ -108,7 +104,11 @@ func (e *Engine) releasePending(ctx context.Context, key string) {
 	if !ok {
 		return
 	}
-	for _, r := range v.([]*Request) {
+	e.releaseClaims(ctx, v.([]*Request))
+}
+
+func (e *Engine) releaseClaims(ctx context.Context, requests []*Request) {
+	for _, r := range requests {
 		if r.State == reqCanceled {
 			e.releaseClaim(ctx, r)
 		}

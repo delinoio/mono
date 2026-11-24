@@ -163,13 +163,28 @@ func GenerousLimits(now func() time.Time) api.Limits {
 func New(t testing.TB, opts ...Option) *Env {
 	t.Helper()
 	database := dbtest.New(t)
-	clock := &Clock{now: time.Now().UTC().Truncate(time.Millisecond)}
-	logs := &SafeBuffer{}
-	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	key, err := secrets.GenerateKey("test")
 	if err != nil {
 		t.Fatal(err)
 	}
+	return start(t, database, &Clock{now: time.Now().UTC().Truncate(time.Millisecond)}, key, opts)
+}
+
+// NewReplica starts another instance against this environment's database.
+func (e *Env) NewReplica(t testing.TB, opts ...Option) *Env {
+	t.Helper()
+	database, err := db.Open(context.Background(), e.DB.Pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(database.Close)
+	return start(t, database, e.Clock, e.SecretKey, opts)
+}
+
+func start(t testing.TB, database *db.DB, clock *Clock, key secrets.Key, opts []Option) *Env {
+	t.Helper()
+	logs := &SafeBuffer{}
+	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	keyring, err := secrets.NewKeyring(key)
 	if err != nil {
 		t.Fatal(err)
