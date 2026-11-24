@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,17 +44,28 @@ import (
 // the helper cannot continue it. A chunk or finish for its write_id fails
 // with not_found until the write expires, like a write whose state is lost.
 
-// writeRecordVersion is the format version of a write record.
-const writeRecordVersion = 1
+const (
+	writeRecordVersionUnixNano  = 1
+	writeRecordVersionSplitTime = 2
+)
+
+var (
+	minWriteRecordUnixNanoTime = time.Unix(0, math.MinInt64)
+	maxWriteRecordUnixNanoTime = time.Unix(0, math.MaxInt64)
+)
 
 // writeRecord is the JSON content of a record file. The file is sandbox
 // content (it holds a guest path), so the helper never logs it.
 type writeRecord struct {
-	Version  int          `json:"version"`
-	WriteID  string       `json:"write_id"`
-	TmpPath  string       `json:"tmp_path"`
-	Identity fileIdentity `json:"identity"`
-	LastNano int64        `json:"last_chunk_unix_nano"`
+	Version        int          `json:"version"`
+	WriteID        string       `json:"write_id"`
+	TmpPath        string       `json:"tmp_path"`
+	Identity       fileIdentity `json:"identity"`
+	LastNano       *int64       `json:"last_chunk_unix_nano,omitempty"`
+	LastSeconds    *int64       `json:"last_chunk_unix_seconds,omitempty"`
+	LastNanosecond *int         `json:"last_chunk_nanosecond,omitempty"`
+
+	lastChunk time.Time
 }
 
 // writeRecordSuffix and writeRecordTempSuffix name the record files. The
@@ -110,13 +122,18 @@ func (m *writeManager) saveRecord(e *writeEntry, durable bool) error {
 	if path == "" || e.identity == nil {
 		return nil
 	}
-	data, err := json.Marshal(writeRecord{
-		Version:  writeRecordVersion,
-		WriteID:  e.id,
-		TmpPath:  e.tmp,
-		Identity: *e.identity,
-		LastNano: e.lastChunk.UnixNano(),
-	})
+	rec := writeRecord{WriteID: e.id, TmpPath: e.tmp, Identity: *e.identity}
+	if e.lastChunk.Before(minWriteRecordUnixNanoTime) || e.lastChunk.After(maxWriteRecordUnixNanoTime) {
+		rec.Version = writeRecordVersionSplitTime
+		seconds, nanosecond := e.lastChunk.Unix(), e.lastChunk.Nanosecond()
+		rec.LastSeconds = &seconds
+		rec.LastNanosecond = &nanosecond
+	} else {
+		rec.Version = writeRecordVersionUnixNano
+		nano := e.lastChunk.UnixNano()
+		rec.LastNano = &nano
+	}
+	data, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
@@ -228,7 +245,7 @@ func (m *writeManager) loadRecords() error {
 			// record would orphan a staging file that still exists.
 			m.logger.Warn("write record: staging file lookup failed, keeping the record", "write_id", rec.WriteID, "error", sanitizedError(err))
 		}
-		last := time.Unix(0, rec.LastNano)
+		last := rec.lastChunk
 		if last.After(now) {
 			last = now
 		}
@@ -317,7 +334,23 @@ func readWriteRecord(path string) (writeRecord, error) {
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return rec, err
 	}
-	if rec.Version != writeRecordVersion {
+	switch rec.Version {
+	case writeRecordVersionUnixNano:
+		if rec.LastNano == nil || rec.LastSeconds != nil || rec.LastNanosecond != nil {
+			return rec, errors.New("invalid UnixNano timestamp in write record")
+		}
+		rec.lastChunk = time.Unix(0, *rec.LastNano)
+	case writeRecordVersionSplitTime:
+		if rec.LastNano != nil || rec.LastSeconds == nil || rec.LastNanosecond == nil ||
+			*rec.LastNanosecond < 0 || *rec.LastNanosecond >= int(time.Second) {
+			return rec, errors.New("invalid split timestamp in write record")
+		}
+		rec.lastChunk = time.Unix(*rec.LastSeconds, int64(*rec.LastNanosecond))
+		// A large positive Unix second can overflow the internal time.Time seconds.
+		if *rec.LastSeconds >= 0 && rec.lastChunk.Before(time.Time{}) {
+			return rec, errors.New("split timestamp out of range in write record")
+		}
+	default:
 		return rec, errors.New("unsupported record version")
 	}
 	return rec, nil
