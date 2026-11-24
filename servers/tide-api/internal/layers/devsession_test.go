@@ -14,6 +14,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -281,6 +282,89 @@ func collectExec(t *testing.T, stream interface {
 		out = append(out, msg())
 	}
 	return out, stream.Err()
+}
+
+func TestDevSessionExecGuestTimestamps(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	s, _ := w.runningSession(t)
+	start := time.Date(2024, time.January, 1, 0, 0, 0, 123456789, time.UTC)
+	end := time.Date(2024, time.January, 1, 0, 0, 2, 987654321, time.UTC)
+	epoch := time.Unix(0, 0).UTC()
+	for _, tc := range []struct {
+		name               string
+		start, end         *time.Time
+		wantStart, wantEnd *timestamppb.Timestamp
+	}{
+		{"nanoseconds", &start, &end, &timestamppb.Timestamp{Seconds: 1704067200, Nanos: 123456789}, &timestamppb.Timestamp{Seconds: 1704067202, Nanos: 987654321}},
+		{"epoch-without-end", &epoch, nil, &timestamppb.Timestamp{}, nil},
+		{"epoch-without-start", nil, &epoch, nil, &timestamppb.Timestamp{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			execID := api.NewID()
+			const stdout, stderr = "hello", "late"
+			started := ownsand.ExecEvent{Kind: ownsand.ExecEventStarted, ExecID: execID, StartTime: tc.start}
+			code := int64(3)
+			exited := ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &code, EndTime: tc.end, TimedOut: true}
+			w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+				for _, ev := range []ownsand.ExecEvent{
+					started,
+					{Kind: ownsand.ExecEventStdout, ExecID: execID, Data: []byte(stdout)},
+					{Kind: ownsand.ExecEventStderr, ExecID: execID, Data: []byte(stderr)},
+				} {
+					if err := p.OnEvent(ev); err != nil {
+						return nil, err
+					}
+				}
+				return &exited, nil
+			}, func(_ context.Context, _, id string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
+				if id != execID || p.StdoutOffset != int64(len(stdout)) || p.StderrOffset != int64(len(stderr)) {
+					return nil, errors.New("attach did not resume the completed exec at the consumed offsets")
+				}
+				if err := p.OnEvent(started); err != nil {
+					return nil, err
+				}
+				return &exited, nil
+			})
+			check := func(events []*tidev1.DevSessionExecEvent) {
+				t.Helper()
+				gotStart := events[0].GetStarted()
+				gotEnd := events[len(events)-1].GetExited()
+				if gotStart.GetExecId() != execID || !proto.Equal(gotStart.GetStartTime(), tc.wantStart) {
+					t.Errorf("started = %v, want exec %s and time %v", gotStart, execID, tc.wantStart)
+				}
+				if gotEnd.GetExitCode() != code || !gotEnd.GetTimedOut() || !proto.Equal(gotEnd.GetEndTime(), tc.wantEnd) {
+					t.Errorf("exited = %v, want exit code %d, timed_out and time %v", gotEnd, code, tc.wantEnd)
+				}
+			}
+
+			ctx := t.Context()
+			owner := w.env.User(w.org.Member)
+			stream, err := owner.DevSession.ExecDevSession(ctx, connect.NewRequest(&tidev1.ExecDevSessionRequest{
+				OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: execID, Command: []string{"make", "test"},
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			events, err := collectExec(t, stream, func() *tidev1.DevSessionExecEvent { return stream.Msg().GetEvent() })
+			if err != nil || len(events) != 4 || string(events[1].GetStdout().GetData()) != stdout || string(events[2].GetStderr().GetData()) != stderr {
+				t.Fatalf("exec events = %v, err = %v", events, err)
+			}
+			check(events)
+
+			attach, err := w.env.User(w.org.Member).DevSession.AttachDevSessionExec(ctx, connect.NewRequest(&tidev1.AttachDevSessionExecRequest{
+				OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: execID,
+				StdoutOffset: int64(len(events[1].GetStdout().GetData())), StderrOffset: int64(len(events[2].GetStderr().GetData())),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			events, err = collectExec(t, attach, func() *tidev1.DevSessionExecEvent { return attach.Msg().GetEvent() })
+			if err != nil || len(events) != 2 {
+				t.Fatalf("attach events = %v, err = %v", events, err)
+			}
+			check(events)
+		})
+	}
 }
 
 func TestDevSessionExec(t *testing.T) {
