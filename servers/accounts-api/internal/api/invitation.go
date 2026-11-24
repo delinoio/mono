@@ -282,8 +282,8 @@ func (h *BillingAccountHandler) revokeUndelivered(ctx context.Context, inv invit
 	h.flushAudit(ctx, audit)
 }
 
-// ListInvitations lists the pending invitations, newest first. Owner and
-// admin only.
+// ListInvitations lists pending invitations by creation time and then ID,
+// both descending. Owner and admin only.
 func (h *BillingAccountHandler) ListInvitations(ctx context.Context, req *connect.Request[accountsv1.ListInvitationsRequest]) (*connect.Response[accountsv1.ListInvitationsResponse], error) {
 	const rpc = "ListInvitations"
 	userID, err := callerUserID(ctx)
@@ -302,9 +302,8 @@ func (h *BillingAccountHandler) ListInvitations(ctx context.Context, req *connec
 	if err != nil {
 		return nil, err
 	}
-	before := "ffffffff-ffff-ffff-ffff-ffffffffffff"
 	if tok.After != "" {
-		if before, err = normalizeID("page_token", tok.After); err != nil {
+		if tok.After, err = normalizeID("page_token", tok.After); err != nil {
 			return nil, invalidArgument("page_token is not valid for this request")
 		}
 	}
@@ -316,11 +315,23 @@ func (h *BillingAccountHandler) ListInvitations(ctx context.Context, req *connec
 		return nil, err
 	}
 	now := h.timestamp()
-	rows, err := h.db.Pool.Query(ctx, `SELECT `+invitationColumns+` FROM billing_account_invitations
-		WHERE billing_account_id = $1 AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $2
-			AND invitation_id < $3
-		ORDER BY invitation_id DESC
-		LIMIT $4`, accountID, now, before, size+1)
+	const pending = `SELECT ` + invitationColumns + ` FROM billing_account_invitations
+		WHERE billing_account_id = $1 AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $2`
+	const timeOrder = ` ORDER BY create_time DESC, invitation_id DESC LIMIT $3`
+	legacy := tok.After != "" && tok.AfterTime == 0
+	var rows pgx.Rows
+	switch {
+	case tok.After == "":
+		rows, err = h.db.Pool.Query(ctx, pending+timeOrder, accountID, now, size+1)
+	case legacy:
+		// An ID-only token resumes the order used by the previous release.
+		rows, err = h.db.Pool.Query(ctx, pending+`
+			AND invitation_id < $4 ORDER BY invitation_id DESC LIMIT $3`, accountID, now, size+1, tok.After)
+	default:
+		rows, err = h.db.Pool.Query(ctx, pending+`
+			AND (create_time, invitation_id) < ($4, $5::uuid)`+timeOrder,
+			accountID, now, size+1, time.UnixMicro(tok.AfterTime).UTC(), tok.After)
+	}
 	if err != nil {
 		return nil, h.internal(ctx, "list_invitations", err)
 	}
@@ -331,7 +342,12 @@ func (h *BillingAccountHandler) ListInvitations(ctx context.Context, req *connec
 	resp := &accountsv1.ListInvitationsResponse{}
 	if len(invitations) > size {
 		invitations = invitations[:size]
-		resp.NextPageToken = encodePageToken(pageToken{RPC: rpc, Scope: accountID, After: invitations[size-1].ID})
+		last := invitations[size-1]
+		next := pageToken{RPC: rpc, Scope: accountID, After: last.ID}
+		if !legacy {
+			next.AfterTime = last.CreateTime.UnixMicro()
+		}
+		resp.NextPageToken = encodePageToken(next)
 	}
 	for _, i := range invitations {
 		resp.Invitations = append(resp.Invitations, i.proto(now))

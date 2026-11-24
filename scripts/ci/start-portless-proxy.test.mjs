@@ -125,12 +125,9 @@ function run(dir, env = {}) {
   return { ...result, calls };
 }
 
-test("root dev script starts the proxy before turbo", () => {
+test("root dev script uses the shared development launcher", () => {
   const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-  assert.equal(
-    manifest.scripts.dev,
-    "node scripts/dev/start-portless-proxy.mjs && turbo run dev",
-  );
+  assert.equal(manifest.scripts.dev, "node scripts/dev/start-dev.mjs");
 });
 
 test("starts the proxy once with the portless of a portless app", (t) => {
