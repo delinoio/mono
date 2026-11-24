@@ -325,9 +325,8 @@ func (m *Manager) reconcile(ctx context.Context) error {
 // finalStateFor returns the terminal state that ends a sandbox with reason:
 // FAILED for LOST_ON_DEVICE (the VM ended without a command) and DELETED for
 // every other reason (a delete or a TTL end). The record in DELETING keeps
-// its end reason across a failed end attempt, so an end that retries later,
-// also after an agent restart, derives the same state without a new record
-// field.
+// its end reason across a failed end attempt. A retry, including after restart,
+// derives the terminal state from the reason it resolves.
 func finalStateFor(reason ownsandv1.SandboxEndReason) ownsandv1.SandboxState {
 	if reason == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
 		return ownsandv1.SandboxState_SANDBOX_STATE_FAILED
@@ -883,6 +882,9 @@ func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.Sa
 		m.mu.Unlock()
 	}()
 	if _, err := m.update(sb, func(r *Record) {
+		if r.State == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+			r.PausedAtEnd = true
+		}
 		r.State = ownsandv1.SandboxState_SANDBOX_STATE_DELETING
 		r.EndReason = reason
 	}); err != nil {
