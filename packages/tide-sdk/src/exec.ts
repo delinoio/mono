@@ -120,15 +120,16 @@ export interface ExecHelperOptions {
  *   final event. After such an end, and after a retryable failure, the
  *   helper continues with `AttachDevSessionExec` from the next stdout and
  *   stderr offsets. A clean end continues at once; failures wait with
- *   exponential backoff from 1 second to 30 seconds.
+ *   exponential backoff from 1 second to 30 seconds. Keepalives do not
+ *   reset the backoff or yield events.
  * - It yields output in order and without duplicates, and reports output
  *   that it never received as `OutputLost`.
  * - Cancellation ends the iterator and stops following the command. The
  *   command keeps running in the guest.
  * - A status that is the server's answer ends the iteration with that
- *   `ConnectError`. When `ExecDevSession` failed before any event and
- *   `AttachDevSessionExec` then answers `not_found`, the command never
- *   started, and the iteration ends with the error of `ExecDevSession`.
+ *   `ConnectError`. If `ExecDevSession` fails and neither stream delivers
+ *   a command event before `AttachDevSessionExec` answers `not_found`,
+ *   the iteration ends with the error of `ExecDevSession`.
  */
 export async function* execDevSession(
   devSessions: ExecCaller,
@@ -221,7 +222,7 @@ export async function* execDevSession(
         yield { kind: ExecEventKind.SandboxEnded, reason: event.value.reason };
         return true;
       default:
-        // Keepalives and events of a newer schema carry no state.
+        // Events of a newer schema carry no state the helper can report.
         return false;
     }
   }
@@ -263,7 +264,10 @@ export async function* execDevSession(
         if (abortedBy(signal)) {
           return;
         }
-        if (message.event === undefined) {
+        if (
+          message.event === undefined ||
+          message.event.event.case === "keepalive"
+        ) {
           continue;
         }
         anyEvent = true;
