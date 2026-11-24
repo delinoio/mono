@@ -123,9 +123,9 @@ type Hub struct {
 
 	mu       sync.Mutex
 	watchers map[string]*watcher
-	// stopped holds the organizations whose deletion runs: no watcher runs
-	// for them until the deletion ends.
-	stopped map[string]bool
+	// stopped counts deletion attempts that are holding an organization's
+	// watchers stopped.
+	stopped map[string]int
 	syncNow chan struct{}
 }
 
@@ -138,7 +138,7 @@ func Register(r *app.Registry, engine *work.Engine, integrations *integration.St
 	}
 	h := &Hub{svc: r.Service, engine: engine, integrations: integrations, timing: timing, log: r.Service.Logger,
 		vendors: map[tidev1.AgentVendor]Vendor{}, bySource: map[work.Source]Vendor{},
-		claimLocks: map[string]*claimLock{}, watchers: map[string]*watcher{}, stopped: map[string]bool{}, syncNow: make(chan struct{}, 1)}
+		claimLocks: map[string]*claimLock{}, watchers: map[string]*watcher{}, stopped: map[string]int{}, syncNow: make(chan struct{}, 1)}
 	engine.RegisterAdapter(&Adapter{h: h})
 	integrations.OnDeletion(h.checkIntegrationDeletion)
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "agent_watchers", RunFunc: h.runWatchers})
@@ -384,10 +384,11 @@ func (h *Hub) releaseClaimLocked(ctx context.Context, c *Claim, req *work.Reques
 // released the claims of their requests. A release that the vendor does not
 // confirm fails the step, which stops the deletion and keeps the
 // credentials and the claim for a retry: after the deletion, no poller can
-// release it.
-func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion) error {
+// release it. This hook clears its own stop on error because the core calls
+// Abort only for hooks whose Prepare succeeded.
+func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion) (err error) {
 	h.mu.Lock()
-	h.stopped[d.OrganizationID] = true
+	h.stopped[d.OrganizationID]++
 	var stop []*watcher
 	for id, w := range h.watchers {
 		if w.in.OrganizationID == d.OrganizationID {
@@ -396,6 +397,11 @@ func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion
 		}
 	}
 	h.mu.Unlock()
+	defer func() {
+		if err != nil {
+			h.resumeOrg(d.OrganizationID)
+		}
+	}()
 	for _, w := range stop {
 		w.stop()
 	}
@@ -438,6 +444,11 @@ func (h *Hub) checkIntegrationDeletion(ctx context.Context, tx pgx.Tx, orgID, in
 
 func (h *Hub) resumeOrg(orgID string) {
 	h.mu.Lock()
+	if h.stopped[orgID] > 1 {
+		h.stopped[orgID]--
+		h.mu.Unlock()
+		return
+	}
 	delete(h.stopped, orgID)
 	h.mu.Unlock()
 	h.kickSync()

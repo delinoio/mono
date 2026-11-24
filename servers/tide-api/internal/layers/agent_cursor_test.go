@@ -360,7 +360,12 @@ func TestCursorOrganizationDeletion(t *testing.T) {
 	if _, ok := w.cursor.Claim("bc-org"); !ok {
 		t.Fatal("the vendor claim is gone")
 	}
+	eventually(t, "the Cursor watch resumes after the failed release", func() bool {
+		return w.cursor.Streams() == 1
+	})
 	w.cursor.FailClaimCalls(false)
+	w.cursor.AddRequest("bc-after", true)
+	w.requestBySource(t, "bc-after")
 	if _, err := w.env.User(w.org.Owner).Organization.DeleteOrganization(context.Background(), connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID})); err != nil {
 		t.Fatal(err)
 	}
@@ -368,4 +373,49 @@ func TestCursorOrganizationDeletion(t *testing.T) {
 		t.Fatalf("fail message %q %v", m, ok)
 	}
 	eventually(t, "the watch stops", func() bool { return w.cursor.Streams() == 0 })
+	stays(t, "the deleted organization's watch stays stopped", func() bool { return w.cursor.Streams() == 0 })
+}
+
+func TestCursorOrganizationDeletionDatabaseFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		setup     string
+		restore   string
+		wantError string
+	}{
+		{
+			name:      "claim query",
+			setup:     "ALTER TABLE agent_claims RENAME TO unavailable_claims",
+			restore:   "ALTER TABLE unavailable_claims RENAME TO agent_claims",
+			wantError: `"msg":"organization_deletion_prepare_failed","hook":"agent"`,
+		},
+		{
+			name: "deletion transaction",
+			setup: `CREATE TABLE deletion_blocker (organization_id uuid REFERENCES organizations);
+				INSERT INTO deletion_blocker SELECT organization_id FROM organizations`,
+			restore:   "DROP TABLE deletion_blocker",
+			wantError: `violates foreign key constraint`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			ctx := context.Background()
+			if _, err := w.env.DB.Pool.Exec(ctx, tc.setup); err != nil {
+				t.Fatal(err)
+			}
+			owner := w.env.User(w.org.Owner)
+			if _, err := owner.Organization.DeleteOrganization(ctx, connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID})); connect.CodeOf(err) != connect.CodeInternal {
+				t.Fatalf("DeleteOrganization error = %v, want internal", err)
+			}
+			if !strings.Contains(w.env.Logs.String(), tc.wantError) {
+				t.Fatalf("missing deletion error %q", tc.wantError)
+			}
+			if _, err := w.env.DB.Pool.Exec(ctx, tc.restore); err != nil {
+				t.Fatal(err)
+			}
+			eventually(t, "the Cursor watch resumes", func() bool { return w.cursor.Streams() == 1 })
+			w.cursor.AddRequest("bc-after-db-error", true)
+			w.requestBySource(t, "bc-after-db-error")
+		})
+	}
 }

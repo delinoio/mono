@@ -26,16 +26,17 @@ type Fake struct {
 	OutpostID   string
 	OutpostName string
 
-	mu        sync.Mutex
-	entries   map[string]*entry
-	order     []string
-	streams   map[int]chan string
-	nextID    int
-	lists     int
-	failWatch int
-	claims    map[string]int
-	releases  map[string]int
-	messages  map[string][]string
+	mu          sync.Mutex
+	entries     map[string]*entry
+	order       []string
+	streams     map[int]chan string
+	nextID      int
+	lists       int
+	failWatch   int
+	failRelease bool
+	claims      map[string]int
+	releases    map[string]int
+	messages    map[string][]string
 }
 
 type entry struct {
@@ -151,6 +152,10 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			obj["status"].(map[string]any)["claim_deadline"] = time.Now().Add(time.Minute).Unix()
 			writeJSON(w, http.StatusOK, obj)
 		case r.Method == http.MethodPost && action == "release":
+			if f.failRelease {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
+				return
+			}
 			if e.AcceptorID != body.AcceptorID {
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "not the acceptor"})
 				return
@@ -310,6 +315,13 @@ func (f *Fake) FailWatches(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failWatch = n
+}
+
+// FailReleases sets whether release calls fail with 503.
+func (f *Fake) FailReleases(fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failRelease = fail
 }
 
 // Streams returns the number of open watches.

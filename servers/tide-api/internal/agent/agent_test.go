@@ -3,6 +3,8 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,12 +14,48 @@ import (
 
 	"github.com/delinoio/mono/go/ownsand"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/servers/tide-api/internal/api"
+	"github.com/delinoio/mono/servers/tide-api/internal/db/dbtest"
 )
 
 const (
 	linux   = tidev1.GuestOs_GUEST_OS_LINUX
 	windows = tidev1.GuestOs_GUEST_OS_WINDOWS
 )
+
+func TestPrepareOrgDeletionKeepsOtherAttemptStopped(t *testing.T) {
+	h := &Hub{
+		svc:     &api.Service{DB: dbtest.New(t)},
+		stopped: map[string]int{},
+		syncNow: make(chan struct{}, 1),
+	}
+	d := api.OrganizationDeletion{OrganizationID: api.NewID()}
+	if err := h.prepareOrgDeletion(t.Context(), d); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := h.prepareOrgDeletion(ctx, d); !errors.Is(err, context.Canceled) {
+		t.Fatalf("prepare error = %v, want context canceled", err)
+	}
+	if count := h.stopped[d.OrganizationID]; count != 1 {
+		t.Fatalf("finished attempt affected the remaining stop, count = %d", count)
+	}
+	select {
+	case <-h.syncNow:
+		t.Fatal("watcher sync was scheduled while another attempt holds the stop")
+	default:
+	}
+	h.resumeOrg(d.OrganizationID)
+	if _, stopped := h.stopped[d.OrganizationID]; stopped {
+		t.Fatal("organization stays stopped after both attempts finished")
+	}
+	select {
+	case <-h.syncNow:
+	default:
+		t.Fatal("watcher sync is not scheduled")
+	}
+}
 
 func TestQuote(t *testing.T) {
 	if got := Quote(linux, "a'b $x"); got != `'a'\''b $x'` {
