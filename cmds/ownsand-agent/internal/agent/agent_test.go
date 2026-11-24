@@ -1204,6 +1204,47 @@ func TestImportStopsWithItsChannelContext(t *testing.T) {
 	f.requireRestorable(t, id)
 }
 
+// TestImportCanceledBeforeSnapshotPublication cancels the channel after
+// extraction and checks that a later import can publish and restore the copy.
+func TestImportCanceledBeforeSnapshotPublication(t *testing.T) {
+	f := newImportFixture(t, nil)
+	a := f.h.agent
+	id, _ := uuidv7.NewString()
+	cmd := f.stage(t, id, false).GetImportSnapshot()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.beforeSnapshotPublishHook = cancel
+	entry, err := a.importSnapshot(ctx, cmd)
+	a.beforeSnapshotPublishHook = nil
+	if entry != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("import at publication = (%v, %v), want (nil, context canceled)", entry, err)
+	}
+	if a.Sandboxes.HasSnapshot(id) {
+		t.Fatal("the canceled import left a snapshot record in memory")
+	}
+	dir, err := f.h.st.SnapshotDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot directory after cancellation: %v", err)
+	}
+	for _, snapshot := range a.Sandboxes.StateReport(0, nil).GetSnapshots() {
+		if snapshot.GetSnapshotId() == id {
+			t.Fatalf("state report contains canceled import %s", id)
+		}
+	}
+
+	retryCtx, cancelRetry := context.WithCancel(context.Background())
+	defer cancelRetry()
+	entry, err = a.importSnapshot(retryCtx, cmd)
+	cancelRetry()
+	if err != nil || entry.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("retry import = (%v, %v), want READY", entry, err)
+	}
+	f.requireRestorable(t, id)
+}
+
 func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
 	f := newImportFixtureWithSource(t, nil, nil, func(root string) {
 		dir := filepath.Join(root, "read-only")
