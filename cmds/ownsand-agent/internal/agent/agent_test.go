@@ -2080,7 +2080,7 @@ type snapshotCtxRuntime struct {
 
 func (r *snapshotCtxRuntime) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
 	r.ctxErr <- ctx.Err()
-	return r.Runtime.Snapshot(ctx, vm, dir)
+	return r.Runtime.Snapshot(context.WithoutCancel(ctx), vm, dir)
 }
 
 // TestSnapshotCaptureEndsWithItsChannel checks that a snapshot capture stays
@@ -2126,6 +2126,146 @@ func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
 	}
 	for _, s := range h.agent.Sandboxes.StateReport(2, nil).GetSnapshots() {
 		t.Fatalf("state report holds the snapshot %v after its channel ended", s)
+	}
+}
+
+// processSnapshotCopy waits for channel cancellation after the file copy
+// has written its first chunk.
+type processSnapshotCopy struct {
+	context.Context
+	path    string
+	started chan struct{}
+}
+
+func (c *processSnapshotCopy) Err() error {
+	if err := c.Context.Err(); err != nil {
+		return err
+	}
+	if st, err := os.Stat(c.path); err == nil && st.Size() > 0 {
+		close(c.started)
+		<-c.Done()
+	}
+	return c.Context.Err()
+}
+
+type processSnapshotGate struct {
+	vmruntime.Runtime
+	contentDir string
+	started    chan struct{}
+	copied     chan error
+	release    chan struct{}
+}
+
+func (r *processSnapshotGate) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+	if dir != r.contentDir {
+		return r.Runtime.Snapshot(ctx, vm, dir)
+	}
+	copyCtx := &processSnapshotCopy{Context: ctx, path: filepath.Join(dir, "disk", "note"), started: r.started}
+	info, err := r.Runtime.Snapshot(copyCtx, vm, dir)
+	r.copied <- err
+	<-r.release
+	return info, err
+}
+
+func TestProcessSnapshotCopyCanceledByChannelClose(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	snapID, _ := uuidv7.NewString()
+	snapDir, err := st.SnapshotDir(snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := &processSnapshotGate{
+		contentDir: filepath.Join(snapDir, "content"),
+		started:    make(chan struct{}),
+		copied:     make(chan error, 1),
+		release:    make(chan struct{}),
+	}
+	h := startWith(t, cp, st, id, func(o *Options) {
+		gate.Runtime = o.Runtime
+		o.Runtime = gate
+	})
+	release := sync.OnceFunc(func() { close(gate.release) })
+	defer release()
+	isStateReport := func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil }
+	h.wait(0, "initial state report", isStateReport)
+	sandboxID, _ := uuidv7.NewString()
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatalf("create: %v", res)
+	}
+	data := bytes.Repeat([]byte("snapshot data\n"), 1<<17)
+	if err := os.WriteFile(st.Path(store.VMsDir, sandboxID, "root", "note"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotCommand := func(id string) *ownsandv1.AgentCommand {
+		return &ownsandv1.AgentCommand{
+			CommandId: id,
+			Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{
+				SandboxId: sandboxID, SnapshotId: id,
+			}},
+		}
+	}
+	channel := cp.Current()
+	if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: snapshotCommand(snapID)}}) {
+		t.Fatal("no channel for the snapshot command")
+	}
+	select {
+	case <-gate.started:
+	case err := <-gate.copied:
+		t.Fatalf("capture completed without a cancellation checkpoint during the copy: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the snapshot did not start copying the disk")
+	}
+	from := cp.Received()
+	channel.Close()
+	select {
+	case err := <-gate.copied:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("process snapshot: %v, want context cancellation", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("closing the channel did not interrupt the disk copy")
+	}
+	path := filepath.Join(gate.contentDir, "disk", "note")
+	partial, err := os.Stat(path)
+	if err != nil || partial.Size() == 0 || partial.Size() >= int64(len(data)) {
+		t.Fatalf("expected a partial disk copy at cancellation, got %v, %v", partial, err)
+	}
+	reconnected, _ := h.wait(from, "state report after reconnect", isStateReport)
+	if snapshots := reconnected.GetStateReport().GetSnapshots(); len(snapshots) != 0 {
+		t.Fatalf("reconnect reported the in-flight snapshot: %v", snapshots)
+	}
+	release()
+	if res := cp.CommandResult(10*time.Second, snapID); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ABORTED || res.GetCreateSnapshot() != nil {
+		t.Fatalf("canceled capture result: %v", res)
+	}
+	if h.agent.Sandboxes.HasSnapshot(snapID) {
+		t.Fatal("canceled capture is known to the manager")
+	}
+	if _, err := os.Lstat(snapDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled capture directory: %v, want it removed", err)
+	}
+
+	readyID, _ := uuidv7.NewString()
+	res := h.command(snapshotCommand(readyID))
+	if res.GetError() != nil || res.GetCreateSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("uncanceled capture result: %v", res)
+	}
+	from = cp.Received()
+	cp.Current().Close()
+	report, _ := h.wait(from, "state report with the ready snapshot", isStateReport)
+	snapshots := report.GetStateReport().GetSnapshots()
+	if len(snapshots) != 1 || snapshots[0].GetSnapshotId() != readyID {
+		t.Fatalf("reported snapshots: %v, want only %s", snapshots, readyID)
+	}
+	readyContent, unlock, ok := h.agent.Sandboxes.AcquireSnapshot(readyID)
+	if !ok {
+		t.Fatal("could not acquire the ready snapshot")
+	}
+	defer unlock()
+	if got, err := os.ReadFile(filepath.Join(readyContent, "disk", "note")); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("ready snapshot file: %d bytes, %v", len(got), err)
 	}
 }
 

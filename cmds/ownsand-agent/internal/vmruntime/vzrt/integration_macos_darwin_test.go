@@ -130,7 +130,7 @@ func newMacOSEnv(t *testing.T, image string) (*env, vmruntime.Runtime) {
 		m.Close()
 		r.Close()
 	})
-	e := &env{t: t, m: m, d: d}
+	e := &env{t: t, m: m, d: d, st: st}
 	return e, r
 }
 
@@ -207,6 +207,13 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 	t.Logf("snapshot took %v, memory state %v", time.Since(start), snap.GetHasMemoryState())
 	if len(snap.GetMacosHardwareModel()) == 0 {
 		t.Fatal("macOS snapshot has no hardware model")
+	}
+	if snap.GetHasMemoryState() {
+		e.requireCanceledSnapshot(sb.GetSandboxId(), "vm.state", images.MacOSDisk)
+	}
+	e.requireCanceledSnapshot(sb.GetSandboxId(), images.MacOSDisk, images.MacOSAuxStorage)
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/var/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
+		t.Fatalf("source did not resume after cancellation: %q %v", out, ex)
 	}
 
 	// The source still runs with the snapshot's machine identifier, so a
