@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { Role } from "@delino/tide-protos/v1/common_pb";
@@ -37,6 +39,40 @@ describe("client configuration", () => {
     ]) {
       expect(() => resolveApiOrigin(bad)).toThrow(TideConfigError);
     }
+  });
+
+  test.each([
+    "https://api.example.test\\tenant\\..",
+    "https://api.example.test\\",
+    "https://api.example.test/tenant/..",
+    "https:///api.example.test/tenant/..",
+    "https:///api.example.test/tenant/../",
+    "https:api.example.test/tenant/..",
+    "https:/api.example.test/tenant/..",
+    "https:////api.example.test/tenant/..",
+    "https://api.example.test/./",
+  ])("rejects an origin with a hidden path (%s)", (origin) => {
+    const resolveOrigin = () => resolveApiOrigin(origin);
+    const createClient = () => new TideClient({ origin, token: "test-token" });
+    const expectedMessage = /^origin must not have a path, query or fragment$/;
+    expect(resolveOrigin).toThrow(TideConfigError);
+    expect(resolveOrigin).toThrow(expectedMessage);
+    expect(createClient).toThrow(TideConfigError);
+    expect(createClient).toThrow(expectedMessage);
+  });
+
+  test.each([
+    ["", DEFAULT_API_ORIGIN],
+    ["https://tide.api.delino.io", DEFAULT_API_ORIGIN],
+    ["HTTPS://API.EXAMPLE.TEST", "https://api.example.test"],
+    ["https://a.test/", "https://a.test"],
+    [" \t https://A.TEST/ \r\n", "https://a.test"],
+    ["http://[::1]:8080/", "http://[::1]:8080"],
+  ])("canonicalizes a valid explicit origin (%s)", (origin, expected) => {
+    expect(resolveApiOrigin(origin)).toBe(expected);
+    expect(new TideClient({ origin, token: "test-token" }).origin).toBe(
+      expected,
+    );
   });
 
   test("rejects an empty token", () => {
@@ -96,6 +132,61 @@ describe("credentials", () => {
     );
   });
 
+  test("cancellation leaves no unhandled token provider rejection", () => {
+    const fixture = fileURLToPath(
+      new URL("./testing/token-provider-cancellation.ts", import.meta.url),
+    );
+    execFileSync(
+      process.execPath,
+      [
+        "--unhandled-rejections=strict",
+        "--experimental-transform-types",
+        "--test",
+        fixture,
+      ],
+      { timeout: 10_000 },
+    );
+  });
+
+  test("an already aborted call skips the token source and fetch", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const server = fakeServer(() => {});
+    let providerCalls = 0;
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: server.fetch,
+      token: () => {
+        providerCalls++;
+        return "test-token";
+      },
+    });
+    await expect(
+      client.organizations.getOrganization(
+        { organizationId: ORG },
+        { signal: controller.signal },
+      ),
+    ).rejects.toMatchObject({ code: Code.Canceled });
+    expect(providerCalls).toBe(0);
+    expect(server.calls).toEqual([]);
+  });
+
+  test("a token source rejection reaches a live caller before any request", async () => {
+    const server = fakeServer(() => {});
+    const providerError = new Error("token source failed");
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: server.fetch,
+      token: () => Promise.reject(providerError),
+    });
+    const error = (await client.organizations
+      .getOrganization({ organizationId: ORG })
+      .catch((error: unknown) => error)) as ConnectError;
+    expect(error.cause).toBeInstanceOf(TideConfigError);
+    expect((error.cause as TideConfigError).cause).toBe(providerError);
+    expect(server.calls).toEqual([]);
+  });
+
   test("a token source that returns nothing fails before any request", async () => {
     const server = fakeServer(() => {});
     const client = new TideClient({
@@ -114,7 +205,9 @@ describe("credentials", () => {
   test("a token that is not a valid header value fails without the token in the error", async () => {
     const server = fakeServer(() => {});
     for (const token of [
+      "secret-access\rtoken",
       "secret-access\ntoken",
+      "secret-access\0token",
       () => "secret-access\u20actoken",
     ]) {
       const client = new TideClient({
@@ -217,47 +310,74 @@ describe("error mapping", () => {
     expect(connectCodeOf(error)).toBe(Code.PermissionDenied);
   });
 
-  test("redacts an echoed token and keeps the code", async () => {
+  test("redacts an echoed normalized token and keeps the status", async () => {
     const server = fakeServer((router) => {
       router.service(OrganizationService, {
         getOrganization: (_req, ctx) => {
           const token = ctx.requestHeader.get("authorization")!.slice(7);
-          throw new ConnectError(`bad token ${token}`, Code.Unauthenticated);
+          throw new ConnectError(`bad token ${token}`, Code.Unauthenticated, {
+            "x-tide-test": "rejected",
+          });
         },
       });
     });
     const client = new TideClient({
       origin: FAKE_ORIGIN,
       fetch: server.fetch,
-      token: () => "secret-access-token",
-    });
-    const error = (await client.organizations
-      .getOrganization({ organizationId: ORG })
-      .catch((e: unknown) => e)) as ConnectError;
-    expect(error.code).toBe(Code.Unauthenticated);
-    expect(error.message).not.toContain("secret-access-token");
-    expect(error.rawMessage).toBe("bad token [redacted]");
-  });
-
-  test("redacts the token from the retained cause of a fetch failure", async () => {
-    const client = new TideClient({
-      origin: FAKE_ORIGIN,
-      fetch: async (_input, init) => {
-        const auth = new Headers(init?.headers).get("authorization");
-        throw new TypeError(`fetch failed with ${auth}`);
-      },
-      token: () => "secret-access-token",
+      token: () => "secret-access-token\r\n",
     });
     const error = (await client.organizations
       .getOrganization({ organizationId: ORG })
       .catch((e: unknown) => e)) as ConnectError;
     expect(error).toBeInstanceOf(ConnectError);
-    expect(error.rawMessage).toBe("fetch failed with Bearer [redacted]");
-    const cause = error.cause as Error;
-    expect(cause).toBeInstanceOf(TypeError);
-    expect(cause.message).toBe("fetch failed with Bearer [redacted]");
-    expect(String(cause.stack)).not.toContain("secret-access-token");
+    expect(error.code).toBe(Code.Unauthenticated);
+    expect(error.metadata.get("x-tide-test")).toBe("rejected");
+    expect(error.message).not.toContain("secret-access-token");
+    expect(error.rawMessage).toBe("bad token [redacted]");
   });
+
+  test.each([
+    ["trailing space", "secret-access-token "],
+    ["trailing LF", "secret-access-token\n"],
+    ["trailing CRLF", "secret-access-token\r\n"],
+    ["surrounding tabs", "\tsecret-access-token\t"],
+    ["leading space", " secret-access-token"],
+  ])(
+    "normalizes a token with %s and redacts fetch errors",
+    async (_edge, raw) => {
+      for (const token of [raw, async () => raw]) {
+        let auth: string | null = null;
+        const client = new TideClient({
+          origin: FAKE_ORIGIN,
+          fetch: async (_input, init) => {
+            auth = new Headers(init?.headers).get("authorization");
+            throw new TypeError(`fetch failed with ${auth}`, {
+              cause: new Error(`original token: ${raw}`),
+            });
+          },
+          token,
+        });
+        const error = (await client.organizations
+          .getOrganization({ organizationId: ORG })
+          .catch((e: unknown) => e)) as ConnectError;
+        expect(auth).toBe("Bearer secret-access-token");
+        expect(error).toBeInstanceOf(ConnectError);
+        expect(error.code).toBe(Code.Unknown);
+        expect(error.rawMessage).toMatch(
+          /^fetch failed with Bearer ?\[redacted\]$/,
+        );
+        expect(error.message).toBe(`[unknown] ${error.rawMessage}`);
+        const cause = error.cause as Error;
+        expect(cause).toBeInstanceOf(TypeError);
+        expect(cause.message).toBe(error.rawMessage);
+        expect(String(cause.stack)).not.toContain("secret-access-token");
+        expect(cause.cause).toBeInstanceOf(Error);
+        expect((cause.cause as Error).message).toBe(
+          "original token: [redacted]",
+        );
+      }
+    },
+  );
 
   test("a network failure is a ConnectError that keeps the cause", async () => {
     const server = fakeServer(() => {}, { failFetch: () => true });

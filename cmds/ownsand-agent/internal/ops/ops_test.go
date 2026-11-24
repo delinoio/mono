@@ -46,6 +46,7 @@ func TestMain(m *testing.M) {
 	guestBinary = filepath.Join(dir, "ownsand-guest")
 	out, err := exec.Command("go", "build", "-o", guestBinary, "github.com/delinoio/mono/cmds/ownsand-guest").CombinedOutput()
 	if err != nil {
+		os.RemoveAll(dir)
 		panic(fmt.Sprintf("build guest helper: %v\n%s", err, out))
 	}
 	code := m.Run()

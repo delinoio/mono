@@ -163,12 +163,12 @@ export function MembersPage() {
         title="Leave this organization?"
         description="You lose access to this organization. tide revokes your personal API keys and ends your dev sessions. An admin can invite you again."
         confirmLabel="Leave organization"
-        onConfirm={async () => {
+        onConfirm={async (opening) => {
           await removeMember.mutateAsync({
             organizationId,
             userId: userId ?? "",
           });
-          navigate("/");
+          if (opening.isCurrent()) navigate("/");
         }}
       />
     </>

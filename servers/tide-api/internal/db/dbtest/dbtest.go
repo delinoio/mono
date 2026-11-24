@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/delinoio/mono/servers/tide-api/internal/db"
 )
@@ -67,14 +68,9 @@ func newURL(t testing.TB, maxVersion int64) string {
 	}
 	_ = conn.Close(ctx)
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		conn, err := pgx.Connect(ctx, admin)
-		if err != nil {
-			return
-		}
-		defer func() { _ = conn.Close(ctx) }()
-		_, _ = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+		dropDatabase(t, name, func(ctx context.Context) (adminConn, error) {
+			return pgx.Connect(ctx, admin)
+		})
 	})
 	child, err := childURL(admin, name)
 	if err != nil {
@@ -89,6 +85,34 @@ func newURL(t testing.TB, maxVersion int64) string {
 		t.Fatalf("migrate test database: %v", err)
 	}
 	return child
+}
+
+type cleanupReporter interface {
+	Helper()
+	Errorf(format string, args ...any)
+}
+
+type adminConn interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Close(ctx context.Context) error
+}
+
+func dropDatabase(t cleanupReporter, name string, connect func(context.Context) (adminConn, error)) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Driver errors can contain connection details.
+	conn, err := connect(ctx)
+	if err != nil {
+		t.Errorf("dbtest: connect to drop test database %s failed", name)
+		return
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	if _, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)"); err != nil {
+		t.Errorf("dbtest: drop test database %s failed", name)
+	}
 }
 
 // childURL returns the admin URL retargeted to the database name. It rewrites

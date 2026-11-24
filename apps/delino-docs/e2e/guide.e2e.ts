@@ -235,21 +235,29 @@ describe("brand colors", () => {
   const readHeroContrast = () =>
     function (glow: Rgba) {
       const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
-      const button = document.querySelector(".rp-button--brand");
+      const button = document.querySelector(
+        ".rp-home-hero__action.rp-button--brand",
+      );
       const wordmark = document.querySelector(".rp-home-hero__title-brand");
       if (!button || !wordmark) {
         throw new Error("The hero button or the hero wordmark is missing");
       }
-      const label = kit.parse(getComputedStyle(button).color);
+      const buttonStyle = getComputedStyle(button);
+      const label = kit.parse(buttonStyle.color);
       const background = kit.resolve("--rp-c-bg");
       const wordmarkStops = kit.stops(
         getComputedStyle(wordmark).backgroundImage,
       );
       return {
-        label: [label.r, label.g, label.b].join(","),
+        label: [label.r, label.g, label.b, label.a].join(","),
+        buttonOpacity: Number(buttonStyle.opacity),
+        buttonTransition: buttonStyle.transitionProperty,
+        buttonShadow: buttonStyle.boxShadow,
+        buttonHovered: button.matches(":hover"),
+        buttonAnimating: button.getAnimations().length > 0,
         buttonLabelLowest: Math.min(
           ...kit
-            .stops(getComputedStyle(button).backgroundImage)
+            .stops(buttonStyle.backgroundImage)
             .map((stop) => kit.ratio(label, stop)),
         ),
         wordmarkBackgroundLowest: Math.min(
@@ -406,6 +414,46 @@ describe("brand colors", () => {
     });
   }
 
+  test("keeps the light hero button opaque through hover", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate(installColorKit());
+    const readHero = () =>
+      browser.evaluate(readHeroContrast(), { r: 231, g: 232, b: 255, a: 1 });
+    const action = screen.getByRole("link", "Get started");
+    await expect(action).toBeVisible();
+    const rest = await readHero();
+
+    await action.hover();
+    const entering = await readHero();
+    expect(entering.buttonHovered).toBe(true);
+
+    await expect
+      .poll(async () => (await readHero()).buttonAnimating)
+      .toBe(false);
+    const hovered = await readHero();
+    expect(hovered.buttonHovered).toBe(true);
+
+    await screen.getByRole("image", "Delino logo").hover();
+    await expect
+      .poll(async () => (await readHero()).buttonAnimating)
+      .toBe(false);
+    const left = await readHero();
+    expect(left.buttonHovered).toBe(false);
+
+    for (const state of [hovered, rest, entering, left]) {
+      expect(state.label).toBe("255,255,255,1");
+      expect(state.buttonOpacity).toBe(1);
+      expect(state.buttonLabelLowest).toBeGreaterThanOrEqual(4.5);
+      expect(state.buttonTransition).toBe("box-shadow");
+    }
+    expect(hovered.buttonShadow).not.toBe(rest.buttonShadow);
+    expect(left.buttonShadow).toBe(rest.buttonShadow);
+  });
+
   // The glow is the darkest (dark) or lightest (light) color that the hero
   // background gradients paint behind the wordmark, sampled from the rendered
   // page: rgb(33, 25, 81) in dark mode and rgb(231, 232, 255) in light mode.
@@ -430,7 +478,7 @@ describe("brand colors", () => {
 
       const hero = await browser.evaluate(readHeroContrast(), glow);
 
-      expect(hero.label).toBe("255,255,255");
+      expect(hero.label).toBe("255,255,255,1");
       expect(hero.buttonLabelLowest).toBeGreaterThanOrEqual(4.5);
     });
 

@@ -4,14 +4,12 @@ import { useQuery, useTransport } from "@connectrpc/connect-query";
 import { BadgeVariant } from "delino-ui/badge";
 import { DeviceState, RunnerState } from "@delino/tide-protos/v1/common_pb";
 import { OwnSandLinkService } from "@delino/tide-protos/v1/ownsand_link_pb";
-import { RunnerProfileService } from "@delino/tide-protos/v1/runner_profile_pb";
 import {
   type DeviceCapacity,
   WorkService,
 } from "@delino/tide-protos/v1/work_pb";
 import { useEffect, useMemo, useReducer, useState } from "react";
 import { watchQueue } from "tide-sdk";
-import { MAX_PAGE_SIZE } from "../api.ts";
 import { SetupGuide } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
@@ -31,6 +29,7 @@ import {
   QueueViewActionKind,
   waitingInQueueOrder,
 } from "../queue.ts";
+import { useRunnerProfiles } from "../runner-profiles.ts";
 
 const RUNNER_ORDER = [
   RunnerState.CREATING,
@@ -91,15 +90,10 @@ export function OverviewPage() {
     return () => abort.abort();
   }, [transport, organizationId, attempt]);
 
-  const profiles = useQuery(RunnerProfileService.method.listRunnerProfiles, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const profiles = useRunnerProfiles(organizationId);
   const profileNames = useMemo(
     () =>
-      new Map(
-        (profiles.data?.profiles ?? []).map((p) => [p.runnerProfileId, p.name]),
-      ),
+      new Map((profiles.data ?? []).map((p) => [p.runnerProfileId, p.name])),
     [profiles.data],
   );
   const capacity = useQuery(WorkService.method.getCapacity, { organizationId });
@@ -146,6 +140,13 @@ export function OverviewPage() {
       ) : null}
       <section className="section" aria-labelledby="queue-title">
         <h2 id="queue-title">Waiting requests</h2>
+        {profiles.error ? (
+          <ErrorNotice
+            title="Could not load runner profiles."
+            error={profiles.error}
+            onRetry={() => void profiles.refetch()}
+          />
+        ) : null}
         {view.live === LiveState.Connecting ? (
           <Loading label="Loading the queue" />
         ) : waiting.length === 0 ? (

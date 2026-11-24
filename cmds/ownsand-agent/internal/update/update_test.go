@@ -564,10 +564,11 @@ func TestSupersedingCommandClearsQueuedArtifact(t *testing.T) {
 // earlier failure reports a diagnostic instead of hanging the test binary.
 const gateTimeout = 10 * time.Second
 
-// gateTransport holds the artifact download until open is called or the
-// request context ends, and signals started when that download begins.
+// gateTransport holds a download until open is called or the request
+// context ends, and signals started when that download begins.
 type gateTransport struct {
 	base    http.RoundTripper
+	path    string
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
@@ -577,7 +578,7 @@ type gateTransport struct {
 // fatal assertion cannot leave a download blocked.
 func newGateTransport(t *testing.T, base http.RoundTripper) *gateTransport {
 	t.Helper()
-	g := &gateTransport{base: base, started: make(chan struct{}, 1), release: make(chan struct{})}
+	g := &gateTransport{base: base, path: "/agent", started: make(chan struct{}, 1), release: make(chan struct{})}
 	t.Cleanup(g.open)
 	return g
 }
@@ -588,7 +589,7 @@ func (g *gateTransport) open() {
 }
 
 func (g *gateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Path == "/agent" {
+	if req.URL.Path == g.path {
 		select {
 		case g.started <- struct{}{}:
 		case <-req.Context().Done():
@@ -702,6 +703,34 @@ func TestWithdrawDuringDownloadNeverInstalls(t *testing.T) {
 	}
 	if ok, err := u.TryInstall(); ok || err != nil || inst.installed.Load() != 0 || restarts.Load() != 0 {
 		t.Fatalf("installed after a withdrawn download: %v %v", ok, err)
+	}
+}
+
+func TestRemovalPreventsLateDownloadFromWritingArtifact(t *testing.T) {
+	r := newRelease(t, nil)
+	u, inst, restarts := newUpdater(t, r, "1.0.0", &atomic.Bool{})
+	gate := newGateTransport(t, r.srv.Client().Transport)
+	u.opts.HTTP = &http.Client{Transport: gate}
+
+	done, _ := startUpdateWorker(t, u, &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}, u.NextOrder())
+	gate.awaitStartedOrEnd(t, done)
+	if installing := u.FenceForRemoval(); installing != nil {
+		t.Fatal("installation admitted before the artifact was downloaded")
+	}
+	if err := u.opts.Store.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	// The request stays live: the verified download must hit the fence even
+	// after the state directory has been emptied.
+	gate.open()
+	if err := awaitDone(t, done); !errors.Is(err, ErrRemovalAborted) {
+		t.Fatalf("download finished with %v, want ErrRemovalAborted", err)
+	}
+	if entries, err := os.ReadDir(u.opts.Store.Dir()); err != nil || len(entries) != 0 {
+		t.Fatalf("late download modified the state directory: %v, %v", entries, err)
+	}
+	if ok, err := u.TryInstall(); ok || err != nil || inst.installed.Load() != 0 || restarts.Load() != 0 {
+		t.Fatalf("installed after the download was fenced: %v, %v", ok, err)
 	}
 }
 
