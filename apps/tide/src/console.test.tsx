@@ -212,6 +212,7 @@ describe("organizations", () => {
   });
 });
 
+// The full roster renders 200 rows, and its first render can exceed the default timeout in CI.
 describe("organization member pagination", () => {
   const laterMemberId = "mock-user-nora";
   const waitForRoster = { timeout: 10_000 };
@@ -495,7 +496,7 @@ describe("organization member pagination", () => {
     ).toBeNull();
     expect(lists).toHaveLength(3);
   });
-});
+}, 20_000);
 
 describe("failed requests", () => {
   function failingTransport(methodName: string, code: Code): Transport {
