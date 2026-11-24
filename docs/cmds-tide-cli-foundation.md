@@ -61,6 +61,7 @@ This contract owns the tide command-line interface, component `tide-cli`, of [`t
 - Standard output carries only MCP messages. Logs go to standard error.
 - Dev sessions do not depend on the server process. When it exits, its dev sessions stay until they are deleted or their TTL ends; `list_sessions` finds them again.
 - Tool waits: a tool call waits at most 50 seconds and then returns the current state. OpenAI Codex stops an MCP tool call after 60 seconds by default (`tool_timeout_sec`), so 50 seconds leaves time for the response. The `wait_seconds` arguments accept 0 to 50, with a default of 50.
+- The `exec` tool accepts `timeout_seconds` as a whole number of seconds from 0 to 9223372036, inclusive. A positive value stops the command after that many seconds. A value of 0 or an omitted argument gives the command no timeout.
 
 | Tool              | Arguments                                                                                                                    | Result                                                                                                                                                                                                              |
 | ----------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
