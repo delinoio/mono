@@ -25,6 +25,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { main as deployPlan } from "./deploy-plan.mjs";
 import { spawnProcessGroup } from "./fixture-process.mjs";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 
@@ -694,7 +695,7 @@ const changesetConfig = readFileSync(
 // A workspace with packages `a`, `b` and `delidev` (ignored by the
 // repository Changesets config), the repository Changesets config, a
 // pushed `main` and the repository `node_modules` for the Changesets CLI.
-function releaseFixture(t) {
+function releaseFixture(t, { tide = false } = {}) {
   const dir = scratch(t);
   const remote = join(dir, "remote.git");
   const work = join(dir, "work");
@@ -706,12 +707,22 @@ function releaseFixture(t) {
     join(work, "package.json"),
     JSON.stringify({ name: "fixture", private: true }),
   );
-  writeFileSync(join(work, "pnpm-workspace.yaml"), "packages:\n  - pkgs/*\n");
+  const packageRoot = tide ? "packages" : "pkgs";
+  const workspace = ["packages:", `  - ${packageRoot}/*`];
+  if (tide) {
+    workspace.push("  - cmds/tide");
+    mkdirSync(join(work, "cmds/tide"), { recursive: true });
+    writeFileSync(
+      join(work, "cmds/tide/package.json"),
+      readFileSync(join(root, "cmds/tide/package.json")),
+    );
+  }
+  writeFileSync(join(work, "pnpm-workspace.yaml"), workspace.join("\n") + "\n");
   writeFileSync(join(work, ".gitignore"), "node_modules\n");
   for (const name of ["a", "b", "delidev"]) {
-    mkdirSync(join(work, "pkgs", name), { recursive: true });
+    mkdirSync(join(work, packageRoot, name), { recursive: true });
     writeFileSync(
-      join(work, "pkgs", name, "package.json"),
+      join(work, packageRoot, name, "package.json"),
       `${JSON.stringify({ name, version: "0.0.0", private: true }, null, 2)}\n`,
     );
   }
@@ -763,6 +774,60 @@ function changesetBlobs(work, sha) {
     if (match && match[2] !== "README") blobs[match[2]] = match[1];
   }
   return blobs;
+}
+
+function readOutputs(file) {
+  return Object.fromEntries(
+    readFileSync(file, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => [
+        line.slice(0, line.indexOf("=")),
+        line.slice(line.indexOf("=") + 1),
+      ]),
+  );
+}
+
+// Run the planner on real Changesets status output and execute the workflow's
+// blob-recording step with the planner outputs.
+function planRelease(work) {
+  const status = join(work, "..", "status.json");
+  const planOutput = join(work, "..", "plan-output");
+  const blobsOutput = join(work, "..", "blobs-output");
+  execFileSync("pnpm", ["exec", "changeset", "status", "--output", status], {
+    cwd: work,
+    env: baseEnv,
+  });
+  deployPlan({
+    argv: [status],
+    env: { GITHUB_OUTPUT: planOutput },
+    repoRoot: work,
+  });
+  const outputs = readOutputs(planOutput);
+  const workflow = readFileSync(
+    join(root, ".github/workflows/deploy.yml"),
+    "utf8",
+  );
+  const script = workflow.match(
+    /^        id: blobs\n[\s\S]*?^        run: \|\n((?: {10}.*\n)+)/m,
+  )?.[1];
+  assert.ok(script, "workflow has a blob-recording step");
+  execFileSync("bash", ["-c", script], {
+    cwd: work,
+    env: {
+      ...baseEnv,
+      CHANGESETS: outputs.changesets,
+      CONSUMED_CHANGESETS: outputs.consumed_changesets,
+      GITHUB_OUTPUT: blobsOutput,
+    },
+  });
+  const maps = readOutputs(blobsOutput);
+  return {
+    releases: JSON.parse(outputs.releases),
+    hasBinaries: outputs.has_binaries,
+    blobs: JSON.parse(maps.changeset_blobs),
+    consumedBlobs: JSON.parse(maps.consumed_changeset_blobs),
+  };
 }
 
 function runRelease(work, sha, releases, extraEnv = {}) {
@@ -833,10 +898,16 @@ test(
   (t) => {
     const { remote, work } = releaseFixture(t);
     const sha = addChangeset(work, "native", { delidev: "patch" });
-    const result = runRelease(work, sha, []);
+    const plan = planRelease(work);
+    assert.deepEqual(plan.blobs, changesetBlobs(work, sha));
+    assert.deepEqual(plan.consumedBlobs, {});
+    const before = remoteRefs(remote);
+    const result = runRelease(work, sha, plan.releases, {
+      CHANGESET_BLOBS: JSON.stringify(plan.blobs),
+    });
     assert.equal(result.status, 0, result.stdout + result.stderr);
     assert.match(result.stdout, /changed nothing/);
-    assert.equal(remoteGit(remote, "rev-parse", "main"), sha);
+    assert.equal(remoteRefs(remote), before);
   },
 );
 
@@ -1033,23 +1104,33 @@ const recoveryRunId = "555";
 // the remote holds the version commit and the tags, and the rerun checks out
 // the planned revision again. `moved` moves `main` during the deployment, so
 // that the release pushes a cherry-picked copy of the tagged commit.
-function landedRelease(t, { moved = false, land = true } = {}) {
-  const fixture = releaseFixture(t);
+function landedRelease(t, { moved = false, land = true, mixed = false } = {}) {
+  const fixture = releaseFixture(t, { tide: mixed });
   const { dir, remote, work } = fixture;
-  const sha = addChangeset(work, "one", { a: "patch" });
-  const releases = [{ name: "a", version: "0.0.1" }];
+  const name = mixed ? "tide-cli" : "a";
+  if (mixed) {
+    addChangeset(work, "native", { delidev: "patch" });
+    addChangeset(work, "empty", {});
+    addChangeset(work, "none", { a: "none" });
+  }
+  const sha = addChangeset(work, "one", { [name]: "patch" });
   const blobs = changesetBlobs(work, sha);
+  const tag = `${name}@0.0.1`;
+  const plan = mixed
+    ? planRelease(work)
+    : { releases: [{ name, version: "0.0.1" }], blobs, consumedBlobs: blobs };
   if (moved) moveMain(dir, remote, "moved.txt", "moved\n");
   if (land) {
-    const result = runRelease(work, sha, releases, {
+    const result = runRelease(work, sha, plan.releases, {
+      CHANGESET_BLOBS: JSON.stringify(plan.blobs),
       GITHUB_RUN_ID: recoveryRunId,
     });
     assert.equal(result.status, 0, result.stdout + result.stderr);
     // The rerun starts from a fresh checkout of the planned revision.
     git(work, "reset", "--quiet", "--hard", sha);
-    git(work, "tag", "--delete", "a@0.0.1");
+    git(work, "tag", "--delete", tag);
   }
-  return { ...fixture, sha, releases, blobs };
+  return { ...fixture, ...plan, sha, tag };
 }
 
 // Every ref of the remote, to prove that a recovery writes nothing.
@@ -1075,7 +1156,7 @@ function runRecovery(t, state, { env = {}, responses } = {}) {
       ...baseEnv,
       PATH: `${bin}${delimiter}${baseEnv.PATH}`,
       RELEASES: JSON.stringify(state.releases),
-      CHANGESET_BLOBS: JSON.stringify(state.blobs),
+      CONSUMED_CHANGESET_BLOBS: JSON.stringify(state.consumedBlobs),
       SHA: state.sha,
       GITHUB_RUN_ID: recoveryRunId,
       GITHUB_RUN_ATTEMPT: "2",
@@ -1130,6 +1211,133 @@ test("recovery accepts a cherry-picked version commit", { skip }, (t) => {
   const result = runRecovery(t, state);
   assert.equal(result.recovered, "recovered=true");
   assert.ok(result.refsUnchanged);
+});
+
+for (const moved of [false, true]) {
+  const mode = moved ? "cherry-picked" : "direct";
+  test(
+    `recovery accepts a ${mode} Tide release with an ignored changeset`,
+    { skip },
+    (t) => {
+      const state = landedRelease(t, { mixed: true, moved });
+      const { remote, sha, tag, blobs, consumedBlobs } = state;
+      const planned = changesetBlobs(state.work, sha);
+      const { native, ...consumed } = planned;
+      assert.ok(native);
+      assert.deepEqual(Object.keys(consumed), ["empty", "none", "one"]);
+      assert.deepEqual(blobs, planned);
+      assert.deepEqual(consumedBlobs, consumed);
+      assert.equal(state.hasBinaries, "true");
+      assert.deepEqual(state.releases, [
+        { name: "tide-cli", version: "0.0.1" },
+      ]);
+      for (const id of Object.keys(consumed)) {
+        assert.equal(
+          remoteGit(remote, "ls-tree", "main", `.changeset/${id}.md`),
+          "",
+        );
+      }
+      assert.equal(
+        remoteGit(remote, "rev-parse", "main:.changeset/native.md"),
+        native,
+      );
+      assert.equal(remoteGit(remote, "cat-file", "-t", tag), "tag");
+      assert.equal(
+        remoteGit(remote, "rev-parse", `${tag}^{commit}`) ===
+          remoteGit(remote, "rev-parse", "main"),
+        !moved,
+      );
+
+      const result = runRecovery(t, state);
+      assert.equal(
+        result.recovered,
+        "recovered=true",
+        result.stdout + result.stderr,
+      );
+      assert.ok(result.refsUnchanged);
+    },
+  );
+}
+
+test(
+  "release rejects a changed ignored changeset when main moves",
+  { skip },
+  (t) => {
+    const { dir, remote, work, sha, releases, blobs } = landedRelease(t, {
+      mixed: true,
+      land: false,
+    });
+    moveMain(
+      dir,
+      remote,
+      ".changeset/native.md",
+      '---\n"delidev": patch\n---\n\nChanged.\n',
+    );
+    const before = remoteRefs(remote);
+    const result = runRelease(work, sha, releases, {
+      CHANGESET_BLOBS: JSON.stringify(blobs),
+    });
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(
+      result.stdout,
+      /\.changeset\/native\.md changed or was removed on main/,
+    );
+    assert.equal(remoteRefs(remote), before);
+  },
+);
+
+test(
+  "recovery rejects a release that leaves an expected changeset pending",
+  { skip },
+  (t) => {
+    const state = landedRelease(t, { mixed: true });
+    const { work, sha } = state;
+    git(work, "fetch", "--quiet", "origin", "main");
+    git(work, "checkout", "--quiet", "--detach", "FETCH_HEAD");
+    git(
+      work,
+      "restore",
+      "--source",
+      sha,
+      "--staged",
+      "--worktree",
+      ".changeset/one.md",
+    );
+    git(work, ...identity, "commit", "--quiet", "--amend", "--no-edit");
+    git(work, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    git(work, "checkout", "--quiet", "--detach", sha);
+
+    const result = runRecovery(t, state);
+    assert.equal(result.recovered, "recovered=false");
+    assert.match(
+      result.stdout,
+      /\.changeset\/one\.md is not consumed by the version commit/,
+    );
+    assert.ok(result.refsUnchanged);
+  },
+);
+
+test("recovery requires a nonempty, valid consumed blob map", { skip }, (t) => {
+  const state = landedRelease(t);
+  for (const map of [
+    "",
+    "{}",
+    '{"one":"short"}',
+    '{"../one":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
+  ]) {
+    const result = runRecovery(t, state, {
+      env: {
+        CONSUMED_CHANGESET_BLOBS: map,
+        CHANGESET_BLOBS: JSON.stringify(state.blobs),
+      },
+    });
+    assert.equal(result.recovered, "recovered=false");
+    assert.match(
+      result.stdout,
+      /CONSUMED_CHANGESET_BLOBS is not a nonempty map/,
+    );
+    assert.ok(result.refsUnchanged);
+  }
 });
 
 test("recovery proves nothing when the push never landed", { skip }, (t) => {
@@ -1204,20 +1412,24 @@ test("recovery rejects changesets that differ from the plan", { skip }, (t) => {
   const state = landedRelease(t);
   const result = runRecovery(t, {
     ...state,
-    blobs: { one: "e".repeat(40) },
+    consumedBlobs: { one: "e".repeat(40) },
   });
   assert.equal(result.recovered, "recovered=false");
   assert.match(result.stdout, /not consumed by the version commit/);
 });
 
 test("recovery rejects a changeset that exists again", { skip }, (t) => {
-  const state = landedRelease(t);
+  const state = landedRelease(t, { mixed: true });
   // The same file content returns to main, so its blob equals the plan.
   git(state.work, "fetch", "--quiet", "origin", "main");
   git(state.work, "checkout", "--quiet", "--detach", "FETCH_HEAD");
-  writeFileSync(
-    join(state.work, ".changeset/one.md"),
-    `---\n"a": patch\n---\n\nChange one.\n`,
+  git(
+    state.work,
+    "restore",
+    "--source",
+    state.sha,
+    "--worktree",
+    ".changeset/one.md",
   );
   commitAll(state.work, "restore changeset");
   git(state.work, "push", "--quiet", "origin", "HEAD:refs/heads/main");
@@ -1275,6 +1487,27 @@ test("deploy.yml tries the recovery before the stale-plan check", () => {
   assert.ok(recover < index("scripts/ci/check-pending-changesets.sh"));
   assert.match(steps[recover], /id: recover/);
   assert.match(steps[recover], /github\.run_attempt > 1/);
+  assert.ok(
+    steps[recover].includes(
+      "CONSUMED_CHANGESET_BLOBS: ${{ needs.plan.outputs.consumed_changeset_blobs }}",
+    ),
+  );
+  assert.ok(
+    steps[index("scripts/ci/check-pending-changesets.sh")].includes(
+      "CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}",
+    ),
+  );
+  assert.ok(
+    steps[index("scripts/ci/deploy-release.sh")].includes(
+      "CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}",
+    ),
+  );
+  const publish =
+    workflow.match(/^ {2}publish-binaries:\n(?:(?: {4}.*)?\n)+/m)?.[0] ?? "";
+  assert.match(
+    publish,
+    /needs\.release\.result == 'success' && needs\.plan\.outputs\.has_binaries == 'true'/,
+  );
   // Every step after the recovery is skipped when the release already landed.
   for (const step of steps.slice(recover + 1)) {
     assert.match(step, /steps\.recover\.outputs\.recovered != 'true'/);
