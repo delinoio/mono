@@ -71,7 +71,8 @@ if [ -n "$TIDE_SYNC_REPLACE_FILE_LIST" ]; then
 fi
 if [ -n "$TIDE_SYNC_PRUNE_LIST" ]; then xargs -0 sh -c 'for d do if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir -- "$d" || exit 1; fi; done' tide < "$TIDE_SYNC_PRUNE_LIST"; fi
 if [ -n "$TIDE_SYNC_PRUNE_ALIAS_LIST" ]; then
-  xargs -0 -n 3 -x sh -c '
+  # With -0 and -x, Apple xargs passes one path per invocation even with -n 3.
+  xargs -0 -n 3 sh -c '
     [ "$#" -eq 3 ] || exit 255
     old=$1 incoming=$2 d=$3
     if [ ! -L "$old" ] && [ ! -L "$incoming" ] && [ -d "$old" ] && [ "$old" -ef "$incoming" ]; then

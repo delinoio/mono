@@ -932,6 +932,12 @@ func TestPruneDirsApplyAliasRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, line := range strings.Split(args[2], "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "xargs" && slices.Contains(fields, "-x") {
+			t.Fatalf("xargs -x splits NUL-separated alias records on macOS: %s", line)
+		}
+	}
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), guestEnvWorkspace + "=" + ws, guestEnvAliasPrunes + "=" + list}
 	if out, err := cmd.CombinedOutput(); err != nil {
