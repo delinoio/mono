@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -394,6 +395,9 @@ func TestCreateDeleteLifecycle(t *testing.T) {
 	if err != nil || del.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || del.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
 		t.Fatalf("delete %v %v", del, err)
 	}
+	if stored := persistedRecord(t, e.st, id); !proto.Equal(stored.Entry(e.m.Epoch()), del) {
+		t.Fatalf("persisted record = %+v, want entry %v", stored, del)
+	}
 	want := []ownsandv1.SandboxState{
 		ownsandv1.SandboxState_SANDBOX_STATE_CREATING, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING,
 		ownsandv1.SandboxState_SANDBOX_STATE_DELETING, ownsandv1.SandboxState_SANDBOX_STATE_DELETED,
@@ -418,6 +422,105 @@ func TestCreateDeleteLifecycle(t *testing.T) {
 			t.Fatal("revision did not increase")
 		}
 		last = en.GetRevision().GetCounter()
+	}
+}
+
+func TestDeleteRetriesTerminalRecordSaveAfterRuntimeStops(t *testing.T) {
+	const timeout = 5 * time.Second
+	ctx := context.Background()
+	e := newEnv(t)
+	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	cmd := &ownsandv1.DeleteSandboxCommand{SandboxId: id}
+	started, block := make(chan struct{}), make(chan struct{})
+	e.rt.mu.Lock()
+	e.rt.deleteStarted, e.rt.deleteBlock = started, block
+	e.rt.mu.Unlock()
+	release := sync.OnceFunc(func() { close(block) })
+	var entry *ownsandv1.SandboxStateEntry
+	var deleteErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		entry, deleteErr = e.m.Delete(ctx, cmd)
+	}()
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			t.Error("delete did not finish during cleanup")
+		}
+	})
+	select {
+	case <-started:
+	case <-done:
+		t.Fatalf("delete finished before runtime cleanup: %v, %v", entry, deleteErr)
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for runtime cleanup")
+	}
+	deleting := persistedRecord(t, e.st, id)
+	if deleting.State != ownsandv1.SandboxState_SANDBOX_STATE_DELETING || deleting.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
+		t.Fatalf("record before runtime cleanup = %+v, want DELETING with caller reason", deleting)
+	}
+	restore := breakFile(t, e.st.Path(store.SandboxesDir, id+".json"))
+	release()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for delete")
+	}
+	// A second runtime Delete would now return normally and count as a call.
+	e.rt.mu.Lock()
+	e.rt.deleteBlock = nil
+	e.rt.mu.Unlock()
+
+	checkFailedDelete := func(seq uint64, entry *ownsandv1.SandboxStateEntry, err error) {
+		t.Helper()
+		if entry != nil || err == nil || !strings.Contains(err.Error(), "sandboxes: save record:") {
+			t.Fatalf("delete %d = %v, %v, want a record save error without an entry", seq, entry, err)
+		}
+		want := deleting.Entry(e.m.Epoch())
+		if report := e.m.StateReport(seq, nil); len(report.GetSandboxes()) != 1 || !proto.Equal(report.GetSandboxes()[0], want) {
+			t.Fatalf("state report after delete %d = %v, want only %v", seq, report.GetSandboxes(), want)
+		}
+		if got := e.out.lastEntry(id); !proto.Equal(got, want) {
+			t.Fatalf("update after delete %d = %v, want %v", seq, got, want)
+		}
+		n := e.out.count()
+		e.m.Tick(ctx, true)
+		if got := e.out.lastEntry(id); e.out.count() != n+1 || !proto.Equal(got, want) {
+			t.Fatalf("resend after delete %d = %v, want one resend of %v", seq, got, want)
+		}
+	}
+	checkFailedDelete(1, entry, deleteErr)
+	// Once the runtime stopped, even a delete with a different reason must
+	// complete the outcome already recorded in DELETING.
+	cmd.EndReason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED
+	entry, deleteErr = e.m.Delete(ctx, cmd)
+	checkFailedDelete(2, entry, deleteErr)
+	restore()
+	if stored := persistedRecord(t, e.st, id); stored.EndReason != deleting.EndReason || !proto.Equal(stored.Entry(e.m.Epoch()), deleting.Entry(e.m.Epoch())) {
+		t.Fatalf("record after failed saves = %+v, want %+v", stored, deleting)
+	}
+
+	entry, err := e.m.Delete(ctx, cmd)
+	if err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || entry.GetEndReason() != deleting.EndReason {
+		t.Fatalf("delete after recovery = %v, %v, want DELETED with %v", entry, err, deleting.EndReason)
+	}
+	if stored := persistedRecord(t, e.st, id); !proto.Equal(stored.Entry(e.m.Epoch()), entry) {
+		t.Fatalf("persisted record = %+v, want entry %v", stored, entry)
+	}
+	if update := e.out.lastEntry(id); !proto.Equal(update, entry) {
+		t.Fatalf("terminal update = %v, want %v", update, entry)
+	}
+	if again, err := e.m.Delete(ctx, cmd); err != nil || !proto.Equal(again, entry) {
+		t.Fatalf("idempotent delete = %v, %v, want %v", again, err, entry)
+	}
+	e.rt.mu.Lock()
+	calls := e.rt.deleteCalls
+	e.rt.mu.Unlock()
+	if ended := e.ex.endedCalls(id); calls != 1 || ended != 1 {
+		t.Fatalf("runtime delete calls = %d, exec end notifications = %d, want one each", calls, ended)
 	}
 }
 
@@ -1744,24 +1847,20 @@ func failRevisions(t *testing.T, st *store.Store) (restore func()) {
 // persistedState returns the state of the saved record of a sandbox.
 func persistedState(t *testing.T, st *store.Store, id string) ownsandv1.SandboxState {
 	t.Helper()
-	var state ownsandv1.SandboxState
-	found := false
-	if err := st.LoadSandboxes(func(data []byte) error {
-		var rec Record
-		if err := json.Unmarshal(data, &rec); err != nil {
-			return err
-		}
-		if rec.SandboxID == id {
-			state, found = rec.State, true
-		}
-		return nil
-	}); err != nil {
+	return persistedRecord(t, st, id).State
+}
+
+func persistedRecord(t *testing.T, st *store.Store, id string) Record {
+	t.Helper()
+	data, err := os.ReadFile(st.Path(store.SandboxesDir, id+".json"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !found {
-		t.Fatalf("no saved record of %s", id)
+	var rec Record
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatal(err)
 	}
-	return state
+	return rec
 }
 
 func requireStates(t *testing.T, got, want []ownsandv1.SandboxState) {
