@@ -421,6 +421,32 @@ describe("personal API keys", () => {
   });
 });
 
+describe("API key revocation", () => {
+  test("Cancel keeps the key active", async ({ app, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    const revoke = screen.getByRole("button", "Revoke", { exact: true });
+    const dialog = screen.getByRole("alertdialog", "Revoke claude-on-laptop?");
+
+    await revoke.tap();
+    await dialog.getByRole("button", "Cancel").tap();
+    await expect(dialog).toBeHidden();
+    await expect(screen.getByText("claude-on-laptop · Active")).toBeVisible();
+  });
+
+  test("confirming revokes the key", async ({ app, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    await screen.getByRole("button", "Revoke", { exact: true }).tap();
+    const dialog = screen.getByRole("alertdialog", "Revoke claude-on-laptop?");
+    await dialog.getByRole("button", "Revoke key").tap();
+    await expect(dialog).toBeHidden();
+    await expect(screen.getByText("claude-on-laptop · Revoked")).toBeVisible();
+  });
+});
+
 describe("invitations", () => {
   test("accepts an invitation link and removes the secret from the address", async ({
     app,

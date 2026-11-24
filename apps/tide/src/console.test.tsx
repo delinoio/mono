@@ -891,6 +891,153 @@ describe("personal API key pages", () => {
   });
 });
 
+describe("confirmation dialog requests", () => {
+  function gatedTransport(methodName: string) {
+    const mock = createMockTransport();
+    const calls: {
+      input: unknown;
+      settle(error?: ConnectError): void;
+    }[] = [];
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (method.name === methodName) {
+          const error = await new Promise<ConnectError | undefined>(
+            (settle) => {
+              calls.push({ input: args[3], settle });
+            },
+          );
+          if (error) throw error;
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    return { transport, calls };
+  }
+
+  const seededKey = "claude-on-laptop";
+  const failure = new ConnectError(
+    "Revocation failed",
+    Code.FailedPrecondition,
+  );
+
+  async function openRevoke(name = seededKey) {
+    const row = (await screen.findByText(new RegExp(`^${name} ·`))).closest(
+      "li",
+    )!;
+    await click(within(row).getByRole("button", { name: "Revoke" }));
+    return screen.findByRole("alertdialog", { name: `Revoke ${name}?` });
+  }
+
+  function confirmButton(dialog: HTMLElement) {
+    return within(dialog).getByRole<HTMLButtonElement>("button", {
+      name: "Revoke key",
+    });
+  }
+
+  test("sends one request for two presses and disables confirmation until success", async () => {
+    const { transport, calls } = gatedTransport("RevokeApiKey");
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    const button = confirmButton(await openRevoke());
+    await act(async () => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(button.disabled).toBe(true);
+
+    await act(async () => calls[0].settle());
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(calls).toHaveLength(1);
+  });
+
+  test("shows a current failure and lets the user retry", async () => {
+    const { transport, calls } = gatedTransport("RevokeApiKey");
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    const dialog = await openRevoke();
+    const button = confirmButton(dialog);
+    await click(button);
+
+    await act(async () => calls[0].settle(failure));
+    expect(await within(dialog).findByText("Revocation failed")).toBeTruthy();
+    expect(button.disabled).toBe(false);
+
+    await click(button);
+    expect(calls).toHaveLength(2);
+    expect(button.disabled).toBe(true);
+    expect(within(dialog).queryByText("Revocation failed")).toBeNull();
+    await act(async () => calls[1].settle());
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  });
+
+  test("a late success refreshes the key list and leaves the next confirmation open", async () => {
+    const { transport, calls } = gatedTransport("RevokeApiKey");
+    const { apiKey } = await createClient(
+      ApiKeyService,
+      transport,
+    ).createApiKey({
+      organizationId: MOCK_IDS.acme,
+      name: "deploy-bot",
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    const first = await openRevoke();
+    await click(confirmButton(first));
+    await act(async () => fireEvent.keyDown(first, { key: "Escape" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    const second = await openRevoke("deploy-bot");
+
+    await act(async () => calls[0].settle());
+    expect(await screen.findByText(`${seededKey} · Revoked`)).toBeTruthy();
+    expect(
+      screen.getByRole("alertdialog", { name: "Revoke deploy-bot?" }),
+    ).toBe(second);
+    expect(confirmButton(second).disabled).toBe(false);
+    await click(confirmButton(second));
+    expect(calls.map(({ input }) => input)).toEqual([
+      expect.objectContaining({ apiKeyId: MOCK_IDS.apiKey }),
+      expect.objectContaining({ apiKeyId: apiKey!.apiKeyId }),
+    ]);
+    await act(async () => calls[1].settle());
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  });
+
+  test("a late failure stays hidden after Cancel and reopening the same target", async () => {
+    const { transport, calls } = gatedTransport("RevokeApiKey");
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    const first = await openRevoke();
+    await click(confirmButton(first));
+    await click(within(first).getByRole("button", { name: "Cancel" }));
+    const second = await openRevoke();
+
+    await act(async () => calls[0].settle(failure));
+    await settle();
+    expect(within(second).queryByText("Revocation failed")).toBeNull();
+    expect(confirmButton(second).disabled).toBe(false);
+  });
+
+  test.each([
+    [MOCK_IDS.northwind, "members", "Leave organization", "RemoveMember"],
+    [MOCK_IDS.acme, "settings", "Delete organization", "DeleteOrganization"],
+  ])(
+    "a dismissed %s/%s confirmation does not redirect when %s succeeds",
+    async (organizationId, section, label, method) => {
+      const { transport, calls } = gatedTransport(method);
+      renderConsole(`/orgs/${organizationId}/${section}`, { transport });
+      await click(await screen.findByRole("button", { name: label }));
+      const dialog = await screen.findByRole("alertdialog");
+      await click(within(dialog).getByRole("button", { name: label }));
+      await click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await click(screen.getByRole("link", { name: "Requests" }));
+      const path = `/orgs/${organizationId}/requests`;
+      expect(window.location.pathname).toBe(path);
+
+      await act(async () => calls[0].settle());
+      await settle();
+      expect(window.location.pathname).toBe(path);
+    },
+  );
+});
+
 describe("invitations", () => {
   test("accepts the secret from the link fragment and removes it from the address", async () => {
     renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`);
