@@ -77,7 +77,7 @@ func (f *exportVerifyFixture) wantLog(t *testing.T, parts ...string) {
 // wantFailed checks that the verification failed the export for reason: the
 // snapshot is EXPORT_FAILED, its manifest is gone and a clean-up job covers
 // the attempt prefix.
-func (f *exportVerifyFixture) wantFailed(t *testing.T, reason string) {
+func (f *exportVerifyFixture) wantFailed(t *testing.T, reason, key string) {
 	t.Helper()
 	if state, _, _ := f.verification(t); state != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED {
 		t.Fatalf("export state = %v, want EXPORT_FAILED", state)
@@ -88,7 +88,7 @@ func (f *exportVerifyFixture) wantFailed(t *testing.T, reason string) {
 	if _, ok := cleanupJobs(t, f.env)[f.prefix]; !ok {
 		t.Fatalf("no clean-up job for %s: %v", f.prefix, cleanupJobs(t, f.env))
 	}
-	f.wantLog(t, `"msg":"export_verification_failed"`, `"reason":"`+reason+`"`, `"snapshot_id":"`+f.snapID+`"`)
+	f.wantLog(t, `"msg":"export_verification_failed"`, `"reason":"`+reason+`"`, `"object_key":"`+key+`"`, `"snapshot_id":"`+f.snapID+`"`)
 }
 
 // TestExportVerificationPassesMatchingParts checks that the export becomes
@@ -133,18 +133,43 @@ func TestExportVerificationFailsMismatchingParts(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		reason string
+		part   string
 		tamper func(f *exportVerifyFixture)
 	}{
-		{"size difference", "size_mismatch", func(f *exportVerifyFixture) { f.env.Objects.PutSized(f.part2, 1<<20+1) }},
-		{"late replacement", "size_mismatch", func(f *exportVerifyFixture) { f.env.Objects.PutObject(f.part1, make([]byte, 7)) }},
-		{"unlisted object", "unlisted_object", func(f *exportVerifyFixture) { f.env.Objects.PutSized(f.prefix+"3", 1) }},
-		{"missing part", "missing_part", func(f *exportVerifyFixture) { f.env.Objects.RemoveObject(f.part2) }},
+		{"size difference", "size_mismatch", "2", func(f *exportVerifyFixture) { f.env.Objects.PutSized(f.part2, 1<<20+1) }},
+		{"late replacement", "size_mismatch", "1", func(f *exportVerifyFixture) { f.env.Objects.PutObject(f.part1, make([]byte, 7)) }},
+		{"unlisted object", "unlisted_object", "3", func(f *exportVerifyFixture) { f.env.Objects.PutSized(f.prefix+"3", 1) }},
+		{"missing part", "missing_part", "2", func(f *exportVerifyFixture) { f.env.Objects.RemoveObject(f.part2) }},
+		{"wrong size then missing part", "missing_part", "2", func(f *exportVerifyFixture) {
+			f.env.Objects.PutSized(f.part1, 7)
+			f.env.Objects.RemoveObject(f.part2)
+		}},
+		{"missing part then wrong size", "missing_part", "1", func(f *exportVerifyFixture) {
+			f.env.Objects.RemoveObject(f.part1)
+			f.env.Objects.PutSized(f.part2, 7)
+		}},
+		{"wrong size and unlisted object", "size_mismatch", "1", func(f *exportVerifyFixture) {
+			f.env.Objects.PutSized(f.part1, 7)
+			f.env.Objects.PutSized(f.prefix+"3", 1)
+		}},
+		{"missing part and unlisted object", "missing_part", "2", func(f *exportVerifyFixture) {
+			f.env.Objects.RemoveObject(f.part2)
+			f.env.Objects.PutSized(f.prefix+"3", 1)
+		}},
+		{"two missing parts", "missing_part", "1", func(f *exportVerifyFixture) {
+			f.env.Objects.RemoveObject(f.part1)
+			f.env.Objects.RemoveObject(f.part2)
+		}},
+		{"two size differences", "size_mismatch", "1", func(f *exportVerifyFixture) {
+			f.env.Objects.PutSized(f.part1, 7)
+			f.env.Objects.PutSized(f.part2, 7)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newExportVerifyFixture(t)
 			tc.tamper(f)
 			f.run(verifyDelay)
-			f.wantFailed(t, tc.reason)
+			f.wantFailed(t, tc.reason, f.prefix+tc.part)
 
 			// The clean-up job deletes the attempt prefix, and a new export
 			// starts a new verification.

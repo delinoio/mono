@@ -227,12 +227,14 @@ func compareExport(job exportVerifyJob, objects []objectstore.Object) (ExportVer
 	manifest := make(map[string]struct{}, len(numbers))
 	for _, n := range numbers {
 		key := partKey(job.orgID, job.snapshotID, job.commandID, n)
-		manifest[key] = struct{}{}
-		got, listed := sizes[key]
-		if !listed {
+		if _, listed := sizes[key]; !listed {
 			return ExportVerifyMissingPart, key
 		}
-		if got != job.parts[n] {
+		manifest[key] = struct{}{}
+	}
+	for _, n := range numbers {
+		key := partKey(job.orgID, job.snapshotID, job.commandID, n)
+		if sizes[key] != job.parts[n] {
 			return ExportVerifySizeMismatch, key
 		}
 	}
