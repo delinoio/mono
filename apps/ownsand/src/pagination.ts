@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ConnectError } from "@connectrpc/connect";
 import { useCallback, useEffect } from "react";
-import type { BoundaryQuery } from "./components/ui.tsx";
+import { type BoundaryQuery, isTerminalError } from "./components/ui.tsx";
 
 /** The part of a cached query that tells which request failed. */
 interface QueryRequestState {
@@ -64,18 +64,18 @@ export interface PagedQuery {
 /** The completeness of a list that the console reads page by page. */
 export interface FollowedPages {
   /**
-   * Whether the control plane still has pages that the console did not
-   * load. The list is then incomplete, and a surface must not present it as
-   * the whole list.
+   * Whether the console can show loaded rows while more pages remain.
    */
   isIncomplete: boolean;
   /** Whether the console is loading a later page now. */
   isLoadingMore: boolean;
-  /** The error of the last later-page request, until a retry starts. */
+  /** The transient error of the last later-page request. */
   loadMoreError: ConnectError | null;
   /** Loads the pages that are missing again after `loadMoreError`. */
   retryLoadMore: () => void;
-  /** The error of the first page or of a refetch; null when a later page failed. */
+  /** The terminal error of the last later-page request. */
+  terminalLoadMoreError: ConnectError | null;
+  /** The full-list error, excluding transient later-page errors. */
   error: ConnectError | null;
 }
 
@@ -85,11 +85,10 @@ export interface FollowedPages {
  * (the control plane lists in ascending ID order, so a new row is last) is
  * reachable.
  *
- * A failed later-page request stops the loop and surfaces as `loadMoreError`
- * with `isIncomplete`; `retryLoadMore` continues from the last loaded page.
- * While that failure stands, a window focus, a reconnect or a new observer
- * does not refetch the entry (see `FOLLOW_ALL_PAGES_OPTIONS`), so only
- * `retryLoadMore` or an invalidation requests a page again.
+ * A failed later-page request stops the loop. A transient error leaves the
+ * list incomplete and lets the user retry from the last loaded page. A
+ * terminal error replaces the list. Automatic refetch triggers leave the
+ * failed query in place (see `FOLLOW_ALL_PAGES_OPTIONS`).
  */
 export function useFollowAllPages(query: PagedQuery): FollowedPages {
   const { data, hasNextPage, isFetching, isFetchNextPageError, fetchNextPage } =
@@ -109,16 +108,25 @@ export function useFollowAllPages(query: PagedQuery): FollowedPages {
     }
   }, [data, hasNextPage, isFetching, isFetchNextPageError, fetchNextPage]);
 
+  const continuationError = isFetchNextPageError ? query.error : null;
+  const terminalLoadMoreError = isTerminalError(continuationError)
+    ? continuationError
+    : null;
+  const loadMoreError =
+    terminalLoadMoreError === null ? continuationError : null;
+
   const retryLoadMore = useCallback(() => {
-    void fetchNextPage({ cancelRefetch: false });
-  }, [fetchNextPage]);
+    if (loadMoreError !== null) void fetchNextPage({ cancelRefetch: false });
+  }, [fetchNextPage, loadMoreError]);
 
   return {
-    isIncomplete: data !== undefined && hasNextPage,
+    isIncomplete:
+      terminalLoadMoreError === null && data !== undefined && hasNextPage,
     isLoadingMore: query.isFetchingNextPage,
-    loadMoreError: isFetchNextPageError ? query.error : null,
+    loadMoreError,
+    terminalLoadMoreError,
     retryLoadMore,
-    error: isFetchNextPageError ? null : query.error,
+    error: loadMoreError === null ? query.error : null,
   };
 }
 
@@ -138,9 +146,8 @@ export function uniqueRows<T>(
 }
 
 /**
- * The query that `QueryBoundary` reads for a list that follows its pages: the
- * error of a later page is not the boundary's error, because the list shows
- * the loaded rows and `MorePagesNotice` offers the retry of that page.
+ * Uses the full-list error for `QueryBoundary`. A transient later-page error
+ * stays with the loaded rows and its retry in `MorePagesNotice`.
  */
 export function boundaryOf<TData>(
   query: {
