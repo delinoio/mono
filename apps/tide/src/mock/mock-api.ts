@@ -1537,6 +1537,17 @@ export function createMockTransport(
           }
         }
         validateProfile(next);
+        if (
+          org.profiles.some(
+            (other) =>
+              other.runnerProfileId !== p.runnerProfileId &&
+              other.name === next.name,
+          )
+        )
+          throw new ConnectError(
+            "a runner profile with this name exists",
+            Code.AlreadyExists,
+          );
         if (next.workloadKind === WorkloadKind.GITHUB_JOB)
           next.githubLabel = `tide-${next.name}`;
         next.updateTime = ts();

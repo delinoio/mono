@@ -25,7 +25,9 @@ import {
 } from "@connectrpc/connect";
 import { createQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
+import { AuditService } from "@delino/tide-protos/v1/audit_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
+import { RunnerProfileService } from "@delino/tide-protos/v1/runner_profile_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
@@ -563,6 +565,80 @@ describe("runner profiles", () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
     const label = await screen.findByLabelText("runs-on label of linux-build");
     expect(label.textContent).toBe("tide-linux-build");
+  });
+
+  test("rejects a duplicate rename without changing profiles or audit events", async () => {
+    const transport = createMockTransport();
+    const profiles = createClient(RunnerProfileService, transport);
+    const audit = createClient(AuditService, transport);
+    const organization = { organizationId: MOCK_IDS.acme };
+    const [profilesBefore, auditBefore] = await Promise.all([
+      profiles.listRunnerProfiles(organization),
+      audit.listAuditEvents(organization),
+    ]);
+
+    await expect(
+      profiles.updateRunnerProfile({
+        ...organization,
+        runnerProfileId: MOCK_IDS.linuxProfile,
+        profile: { name: "codex-linux" },
+        updateMask: { paths: ["name"] },
+      }),
+    ).rejects.toMatchObject({
+      code: Code.AlreadyExists,
+      rawMessage: "a runner profile with this name exists",
+    });
+
+    const [profilesAfter, auditAfter] = await Promise.all([
+      profiles.listRunnerProfiles(organization),
+      audit.listAuditEvents(organization),
+    ]);
+    expect(profilesAfter).toEqual(profilesBefore);
+    expect(auditAfter).toEqual(auditBefore);
+  });
+
+  test.each(["linux-build", "linux-build-new"])(
+    "accepts a name update to %s and returns the runs-on label",
+    async (name) => {
+      const profiles = createClient(
+        RunnerProfileService,
+        createMockTransport(),
+      );
+      const { profile } = await profiles.updateRunnerProfile({
+        organizationId: MOCK_IDS.acme,
+        runnerProfileId: MOCK_IDS.linuxProfile,
+        profile: { name },
+        updateMask: { paths: ["name"] },
+      });
+
+      expect(profile).toMatchObject({ name, githubLabel: `tide-${name}` });
+    },
+  );
+
+  test("keeps the edit dialog open and shows the duplicate-name error", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
+    const profiles = await screen.findByRole("list", {
+      name: "Runner profiles",
+    });
+    const row = within(profiles)
+      .getByText(/^linux-build ·/)
+      .closest("li")!;
+    await click(within(row).getByRole("button", { name: "Edit" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Edit linux-build",
+    });
+    await type(
+      within(dialog).getByRole("textbox", { name: "Name" }),
+      "codex-linux",
+    );
+    await click(within(dialog).getByRole("button", { name: "Save changes" }));
+
+    expect(
+      await within(dialog).findByText("a runner profile with this name exists"),
+    ).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Edit linux-build" })).toBe(
+      dialog,
+    );
   });
 
   test("a new profile can use the default priority of the workload kind", async () => {
