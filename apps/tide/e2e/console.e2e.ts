@@ -50,6 +50,83 @@ describe("organizations", () => {
   });
 });
 
+describe("organization layout", () => {
+  test("fits the document and scrolls the section list at narrow widths", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/members`);
+    await expect(
+      screen.getByRole("heading", "Members", { level: 1 }),
+    ).toBeVisible();
+
+    for (const width of [320, 390, 760]) {
+      await browser.setViewport({ width, height: 844 });
+      const layout = await browser.evaluate(() => {
+        const list = document.querySelector(".sidenav ul");
+        if (!list) throw new Error("Missing organization section list");
+        const root = document.documentElement;
+        return {
+          documentWidth: root.clientWidth,
+          documentScrollWidth: root.scrollWidth,
+          listWidth: list.clientWidth,
+          listScrollWidth: list.scrollWidth,
+          listOverflowX: getComputedStyle(list).overflowX,
+        };
+      });
+
+      expect(layout.documentScrollWidth, `${width}px document`).toBe(
+        layout.documentWidth,
+      );
+      expect(layout.listScrollWidth, `${width}px section list`).toBeGreaterThan(
+        layout.listWidth,
+      );
+      expect(layout.listOverflowX, `${width}px section list overflow`).toBe(
+        "auto",
+      );
+    }
+  });
+
+  test("keeps the 220 px vertical navigation column at desktop widths", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/members`);
+    await expect(
+      screen.getByRole("heading", "Members", { level: 1 }),
+    ).toBeVisible();
+
+    for (const width of [761, 1024]) {
+      await browser.setViewport({ width, height: 844 });
+      const layout = await browser.evaluate(() => {
+        const navigation = document.querySelector(".sidenav");
+        const first = navigation?.querySelector("li");
+        const second = first?.nextElementSibling;
+        if (!navigation || !first || !second) {
+          throw new Error("Missing organization section links");
+        }
+        return {
+          columnWidth: navigation.getBoundingClientRect().width,
+          firstBottom: first.getBoundingClientRect().bottom,
+          secondTop: second.getBoundingClientRect().top,
+        };
+      });
+
+      expect(layout.columnWidth, `${width}px navigation column`).toBe(220);
+      expect(
+        layout.secondTop,
+        `${width}px section list`,
+      ).toBeGreaterThanOrEqual(layout.firstBottom);
+    }
+  });
+});
+
 describe("overview", () => {
   test("shows the live queue and the device pool", async ({ app, screen }) => {
     await app.open("/");

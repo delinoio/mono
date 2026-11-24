@@ -69,6 +69,7 @@ Organization owners, admins and members who sign in with Logto.
 - The `api-keys` route shows a new secret once with a copy action and a notice that tide cannot show it again, and explains that the key works only for dev sessions. It lists the keys page by page with "Show more", so the console can show and revoke every key.
 - Organization deletion tells the owner to uninstall the GitHub App in GitHub, because tide cannot uninstall it.
 - The console hides actions that the user's role does not allow; the control plane still enforces every permission.
+- The organization layout supports viewports 320 px wide and wider. From 320 through 760 px, the section list scrolls horizontally above the page content. At 761 px and wider, the section list stacks vertically in a 220 px column.
 - UX follows the Toss Design Guidelines. Dialogs close with `Esc`. A form with a single critical input focuses it when it opens.
 
 ## Storage
