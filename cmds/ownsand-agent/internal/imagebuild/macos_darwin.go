@@ -47,6 +47,9 @@ const (
 // installs the guest helper as a launchd daemon, boots the guest once until
 // the helper answers and installs the image.
 func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	logger := opts.Logger.With("guest_os", "macos")
 	if os.Geteuid() != 0 {
 		// The guest helper files on the guest disk must be owned by root,
@@ -230,41 +233,11 @@ func (p *progressReader) Read(b []byte) (int, error) {
 
 // installMacOS runs the Virtualization.framework installer.
 func installMacOS(ctx context.Context, m vzrt.MacOSMachine, ipsw string, logger *slog.Logger) error {
-	cfg, _, err := vzrt.NewMacOSConfiguration(m)
-	if err != nil {
-		return err
-	}
-	machine, err := vz.NewVirtualMachine(cfg)
-	if err != nil {
-		return fmt.Errorf("imagebuild: create the install VM: %w", err)
-	}
-	installer, err := vz.NewMacOSInstaller(machine, ipsw)
-	if err != nil {
-		return fmt.Errorf("imagebuild: create the installer: %w", err)
-	}
-	start := time.Now()
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		t := time.NewTicker(30 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-				logger.Info("macOS installation", "fraction_completed", installer.FractionCompleted())
-			}
-		}
-	}()
-	logger.Info("installing macOS")
-	if err := installer.Install(ctx); err != nil {
+	if err := runMacOSInstall(ctx, func(ctx context.Context) (macOSInstallation, error) {
+		return startNativeMacOSInstall(ctx, m, ipsw)
+	}, logger); err != nil {
 		return fmt.Errorf("imagebuild: install macOS: %w", err)
 	}
-	if machine.CanStop() {
-		_ = machine.Stop()
-	}
-	logger.Info("macOS installed", "install_ms", time.Since(start).Milliseconds())
 	return nil
 }
 

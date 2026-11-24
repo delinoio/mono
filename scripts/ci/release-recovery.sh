@@ -8,7 +8,7 @@
 # `deploy-release.sh` pushes `main` and the tags in one atomic push. The push
 # can land while the job still fails (the connection dropped before the
 # response, or a later step failed). A rerun of the failed job then fails the
-# stale-plan check, because the planned changesets are gone from `main`, and
+# stale-plan check, because the consumed changesets are gone from `main`, and
 # `publish-binaries` never starts although the tags exist.
 #
 # This script proves that the release of this run already landed, without any
@@ -21,8 +21,8 @@
 # - exactly one commit on `main` after the deployed revision records
 #   `Deployed revision: <SHA>` and `Deployment run: <run ID>` (the run ID of
 #   all attempts is the same), has one parent and is the version commit;
-# - that commit deletes every planned changeset with exactly the planned blob,
-#   and no planned changeset exists on the tip of `main`;
+# - that commit deletes every changeset that the plan expects Changesets to
+#   consume, with exactly the planned blob, and none exists on the tip of `main`;
 # - every planned `<name>@<version>` is an annotated tag whose message is
 #   `<name>@<version> deployed from <SHA>` and that peels to one commit
 #   whose parent is the deployed revision and whose message is the message of
@@ -36,7 +36,9 @@
 #
 # Environment:
 #   RELEASES             JSON array of {name, version} planned tags.
-#   CHANGESET_BLOBS      JSON object of planned changeset id to blob SHA.
+#   CONSUMED_CHANGESET_BLOBS
+#                        JSON object of expected consumed changeset id to
+#                        planned blob SHA.
 #   SHA                  deployed revision; HEAD must be this commit.
 #   GITHUB_RUN_ID        run ID of this run (kept by reruns).
 #   GITHUB_RUN_ATTEMPT   attempt of this run; recovery needs more than 1.
@@ -77,9 +79,12 @@ if ! jq -es 'length == 1 and (.[0] | type == "array" and all(.[]; type == "objec
   <<< "${RELEASES:-}" > /dev/null 2>&1; then
   not_proven "RELEASES is not a JSON list of releases."
 fi
-if ! jq -es 'length == 1 and (.[0] | type == "object" and length > 0 and all(.[]; type == "string" and test("^[0-9a-f]{40}$")))' \
-  <<< "${CHANGESET_BLOBS:-}" > /dev/null 2>&1; then
-  not_proven "CHANGESET_BLOBS is not a nonempty map of changeset blob SHAs."
+if ! jq -es '
+  length == 1 and (.[0] | type == "object" and length > 0 and all(to_entries[];
+    (.key | test("\\A[A-Za-z0-9][A-Za-z0-9._-]*\\z"))
+    and (.value | type == "string" and test("\\A[0-9a-f]{40}\\z"))))
+' <<< "${CONSUMED_CHANGESET_BLOBS:-}" > /dev/null 2>&1; then
+  not_proven "CONSUMED_CHANGESET_BLOBS is not a nonempty map of changeset blob SHAs."
 fi
 if [[ "$(git rev-parse HEAD)" != "$SHA" ]]; then
   not_proven "HEAD is not the deployed revision $SHA."
@@ -87,7 +92,7 @@ fi
 
 mapfile -t tags < <(jq -r '.[] | "\(.name)@\(.version)"' <<< "$RELEASES")
 mapfile -t release_lines < <(jq -r '.[] | [.name, .version] | @tsv' <<< "$RELEASES")
-mapfile -t changeset_ids < <(jq -r 'keys[]' <<< "$CHANGESET_BLOBS")
+mapfile -t changeset_ids < <(jq -r 'keys[]' <<< "$CONSUMED_CHANGESET_BLOBS")
 
 # Read-only proof: only fetches into the local checkout. A failing fetch (for
 # example a tag that is not on the remote) proves nothing.
@@ -125,8 +130,8 @@ if ! git merge-base --is-ancestor "$SHA" "$main_parent"; then
   not_proven "the parent of the version commit $main_commit does not contain $SHA."
 fi
 
-# Every planned changeset is deleted by the version commit with exactly the
-# planned blob and is gone from the tip of `main`.
+# The version commit must delete each expected changeset with exactly the
+# planned blob. Each file must also be absent from the tip of `main`.
 declare -A deleted=()
 while IFS=$'\t' read -r meta path; do
   [[ -n "$meta" ]] || continue
@@ -136,7 +141,7 @@ while IFS=$'\t' read -r meta path; do
   fi
 done < <(git diff-tree -r --no-renames --no-commit-id --raw --no-abbrev "$main_parent" "$main_commit")
 for id in "${changeset_ids[@]}"; do
-  planned="$(jq -r --arg id "$id" '.[$id]' <<< "$CHANGESET_BLOBS")"
+  planned="$(jq -r --arg id "$id" '.[$id]' <<< "$CONSUMED_CHANGESET_BLOBS")"
   if [[ "${deleted[.changeset/$id.md]:-}" != "$planned" ]]; then
     not_proven ".changeset/$id.md is not consumed by the version commit $main_commit with the planned blob."
   fi
@@ -205,7 +210,8 @@ fi
 
 # A superseding deployment: a newer run may already have released other
 # changesets or deployed a newer revision.
-if ! runs_output="$(RUNS_ONLY=true bash "$script_dir/check-pending-changesets.sh" 2>&1)"; then
+if ! runs_output="$(RUNS_ONLY=true CHANGESET_BLOBS="$CONSUMED_CHANGESET_BLOBS" \
+  bash "$script_dir/check-pending-changesets.sh" 2>&1)"; then
   echo "$runs_output"
   not_proven "a newer deployment run exists or the runs could not be checked."
 fi

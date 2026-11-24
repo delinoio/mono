@@ -296,6 +296,69 @@ describe("watchQueue", () => {
     expect(server.calls).toEqual([]);
   });
 
+  test.each(["throws", "rejects"])(
+    "ends the first read when the token source %s",
+    async (failure) => {
+      const server = watchServer([["snapshot"]]);
+      const clock = new RecordingClock();
+      const providerError = new Error("fixture token failure");
+      let providerCalls = 0;
+      const client = new TideClient({
+        origin: FAKE_ORIGIN,
+        fetch: server.fetch,
+        clock,
+        token: () => {
+          providerCalls++;
+          if (failure === "throws") {
+            throw providerError;
+          }
+          return Promise.reject(providerError);
+        },
+      });
+      const stream = client.watchQueue({
+        organizationId: ORG,
+        signal: new AbortController().signal,
+      });
+      const error = (await stream
+        .next()
+        .catch((error: unknown) => error)) as ConnectError;
+      expect(error.cause).toBeInstanceOf(TideConfigError);
+      expect((error.cause as TideConfigError).cause).toBe(providerError);
+      expect(providerCalls).toBe(1);
+      expect(server.calls).toEqual([]);
+      expect(clock.sleeps).toEqual([]);
+    },
+  );
+
+  test("stops reconnecting when the token source fails after a clean stream end", async () => {
+    const server = watchServer([["change"]]);
+    const clock = new RecordingClock();
+    const providerError = new Error("fixture token failure");
+    let providerCalls = 0;
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: server.fetch,
+      clock,
+      token: () =>
+        ++providerCalls === 1 ? "test-token" : Promise.reject(providerError),
+    });
+    const stream = client.watchQueue({ organizationId: ORG });
+    expect((await stream.next()).value).toMatchObject({
+      kind: WatchQueueEventKind.Request,
+    });
+    expect((await stream.next()).value).toMatchObject({
+      kind: WatchQueueEventKind.Gap,
+    });
+    const error = (await stream
+      .next()
+      .catch((error: unknown) => error)) as ConnectError;
+    expect(error.cause).toBeInstanceOf(TideConfigError);
+    expect((error.cause as TideConfigError).cause).toBe(providerError);
+    expect(providerCalls).toBe(2);
+    expect(server.calls).toHaveLength(1);
+    expect(clock.sleeps).toEqual([1000]);
+  });
+
   test("ends without an error when the signal aborts a pending token source", async () => {
     const server = watchServer([["snapshot"]]);
     const abort = new AbortController();

@@ -156,8 +156,8 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 		t.Fatalf("sandbox %v", sb)
 	}
 	out, ex := e.exec(sb.GetSandboxId(), "cmd.exe", "/c", "echo hello")
-	if ex.GetExitCode() != 0 || out != "hello\r\n" {
-		t.Fatalf("exec output %q exited %v", out, ex)
+	if !execSucceeded(ex) || out != "hello\r\n" {
+		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	if _, ex := e.exec(sb.GetSandboxId(), "cmd.exe", "/c", "exit 7"); ex.GetExitCode() != 7 {
 		t.Fatalf("exit code %v", ex)
@@ -175,8 +175,8 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 	if out, _ := e.exec(sb.GetSandboxId(), "sc.exe", "qc", "ownsand-guest"); !strings.Contains(out, "AUTO_START") || !strings.Contains(out, "LocalSystem") {
 		t.Fatalf("service configuration %q", out)
 	}
-	if out, ex := e.exec(sb.GetSandboxId(), "cmd.exe", "/c", `echo state> C:\marker.txt`); ex.GetExitCode() != 0 {
-		t.Fatalf("write marker %q %v", out, ex)
+	if out, ex := e.exec(sb.GetSandboxId(), "cmd.exe", "/c", `echo state> C:\marker.txt`); !execSucceeded(ex) {
+		t.Fatalf("write marker %q exited %q", out, ex)
 	}
 	if out, _ := e.exec(sb.GetSandboxId(), "cmd.exe", "/c", `type C:\marker.txt`); out != "state\r\n" {
 		t.Fatalf("read marker %q", out)

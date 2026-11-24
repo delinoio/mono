@@ -164,6 +164,7 @@ test("every shared fixture input selects tests", async (t) => {
   for (const path of [
     ".changeset/config.json",
     ".changeset/brave-cats-run.md",
+    ".github/actionlint.yaml",
     ".github/workflows/CI.yml",
     ".github/workflows/deploy.yml",
     ".nvmrc",
@@ -174,6 +175,7 @@ test("every shared fixture input selects tests", async (t) => {
     "lefthook.yml",
     "scripts/install-git-hooks.sh",
     "scripts/droplet/start-caddy.sh",
+    "scripts/droplet/configure-docker-logs.sh",
     "scripts/protos.sh",
     "skills-lock.json",
     ".agents/skills/postgres/SKILL.md",
@@ -194,6 +196,28 @@ test("every shared fixture input selects tests", async (t) => {
       const result = plan(f.cwd, f.base, f.commit());
       assert.equal(result.quality, true);
       assert.equal(result.fixtures, true);
+    });
+  }
+});
+
+test("only the shared fixture input selects Droplet validation", async (t) => {
+  for (const [path, selected] of [
+    ["scripts/droplet/configure-docker-logs.sh", true],
+    ["scripts/droplet/provision.sh", false],
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      assert.deepEqual(plan(f.cwd, f.base, f.commit()), {
+        quality: selected,
+        format: false,
+        fixtures: selected,
+        go: false,
+        rust: false,
+        e2e: false,
+        workspace: false,
+        workflows: false,
+      });
     });
   }
 });
@@ -945,6 +969,28 @@ test("workflows and local actions select the workflow lint", async (t) => {
   f.write("scripts/ci/plan.mjs");
   f.write("workflows/example.yml");
   assert.equal(plan(f.cwd, f.base, f.commit()).workflows, false);
+});
+
+test("the actionlint config selects fixtures and workflow lint", async (t) => {
+  for (const [path, selected] of [
+    [".github/actionlint.yaml", true],
+    [".github/AGENTS.md", false],
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      assert.deepEqual(plan(f.cwd, f.base, f.commit()), {
+        quality: true,
+        format: true,
+        fixtures: selected,
+        go: false,
+        rust: false,
+        e2e: false,
+        workspace: false,
+        workflows: selected,
+      });
+    });
+  }
 });
 
 test("deleted workflows still select the workflow lint", (t) => {
