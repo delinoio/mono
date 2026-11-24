@@ -872,6 +872,11 @@ func TestRefreshKeepsRulesWhenRouteDumpFails(t *testing.T) {
 	m.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	// Stop the worker before useIPRouteDump restores the shared hook.
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 	go func() { m.Run(ctx); close(done) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for !strings.Contains(h.log(), "network policy refresh failed") {
@@ -880,8 +885,6 @@ func TestRefreshKeepsRulesWhenRouteDumpFails(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	cancel()
-	<-done
 }
 
 // fakeCleanupHost drives cleanupHost without root: taps lists the sandbox

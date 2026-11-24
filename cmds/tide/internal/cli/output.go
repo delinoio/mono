@@ -14,6 +14,8 @@ import (
 	"sync"
 	"text/tabwriter"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -39,6 +41,51 @@ func (a *app) paint(code, s string) string {
 }
 
 func (a *app) bold(s string) string { return a.paint(ansiBold, s) }
+
+// safeText escapes control characters, nonprintable Unicode and invalid UTF-8
+// bytes so a text field cannot change terminal state or add a line or column.
+func safeText(s string) string {
+	clean := utf8.ValidString(s)
+	for _, r := range s {
+		if !plainRune(r) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&b, "\\x%02x", s[i])
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || (r >= 0x7f && r <= 0x9f):
+			fmt.Fprintf(&b, "\\x%02x", r)
+		case !plainRune(r):
+			if r > 0xffff {
+				fmt.Fprintf(&b, "\\U%08x", r)
+			} else {
+				fmt.Fprintf(&b, "\\u%04x", r)
+			}
+		default:
+			b.WriteRune(r)
+		}
+		i += size
+	}
+	return b.String()
+}
+
+func plainRune(r rune) bool {
+	return unicode.IsPrint(r) || unicode.Is(unicode.Zs, r)
+}
 
 var jsonOpts = protojson.MarshalOptions{UseProtoNames: true}
 
@@ -92,7 +139,7 @@ func (a *app) printFields(w io.Writer, m proto.Message) error {
 	flatten("", v, &lines)
 	sort.SliceStable(lines, func(i, j int) bool { return lines[i][0] < lines[j][0] })
 	for _, l := range lines {
-		if _, err := fmt.Fprintf(w, "%s: %s\n", a.paint(ansiCyan, l[0]), l[1]); err != nil {
+		if _, err := fmt.Fprintf(w, "%s: %s\n", a.paint(ansiCyan, safeText(l[0])), safeText(l[1])); err != nil {
 			return err
 		}
 	}
@@ -200,9 +247,7 @@ func (a *app) printTable(w io.Writer, headers []string, rows [][]string) error {
 				return err
 			}
 		}
-		// Color codes would break the column widths, so the header uses
-		// bold only on the whole line below.
-		if _, err := fmt.Fprint(tw, h); err != nil {
+		if _, err := fmt.Fprint(tw, safeText(h)); err != nil {
 			return err
 		}
 	}
@@ -210,7 +255,12 @@ func (a *app) printTable(w io.Writer, headers []string, rows [][]string) error {
 		return err
 	}
 	for _, r := range rows {
-		if _, err := fmt.Fprintln(tw, strings.Join(r, "\t")); err != nil {
+		// Escape each cell before inserting the table delimiters.
+		cells := make([]string, len(r))
+		for i, c := range r {
+			cells[i] = safeText(c)
+		}
+		if _, err := fmt.Fprintln(tw, strings.Join(cells, "\t")); err != nil {
 			return err
 		}
 	}

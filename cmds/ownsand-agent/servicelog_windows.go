@@ -3,10 +3,72 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
+	"golang.org/x/sys/windows/svc/eventlog"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/service"
 )
+
+func setupServiceLog(stateDir string) (*os.File, string) {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return nil, serviceLogFailure("could not create the service state directory", err)
+	}
+	f, err := openServiceLog(filepath.Join(stateDir, "agent.log"))
+	if err != nil {
+		return nil, serviceLogFailure("could not open agent.log", err)
+	}
+	return f, ""
+}
+
+func serviceLogFailure(operation string, err error) string {
+	// PathError can contain the value of OWNSAND_AGENT_STATE_DIR. Only report
+	// the operating system error code and its system-supplied description.
+	var code windows.Errno
+	if errors.As(err, &code) {
+		return fmt.Sprintf("%s (Windows error %d: %v)", operation, code, code)
+	}
+	return operation
+}
+
+const startupDiagnosticEventID = 1
+
+func writeStartupEvent(message string) error {
+	// Provision the source on demand so upgraded services can use it too.
+	// Try to write even when provisioning fails, since the source may already
+	// be registered and the service account may lack registry write access.
+	_ = ensureStartupEventSource()
+	log, err := eventlog.Open(service.Name)
+	if err != nil {
+		return err
+	}
+	defer log.Close()
+	return log.Error(startupDiagnosticEventID, message)
+}
+
+func ensureStartupEventSource() error {
+	const sourceKey = `SYSTEM\CurrentControlSet\Services\EventLog\Application\` + service.Name
+	key, _, err := registry.CreateKey(registry.LOCAL_MACHINE, sourceKey, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer key.Close()
+	// Use the system message resource for insertion strings, as x/sys does
+	// in InstallAsEventCreate. Set the values even if the key exists so a
+	// subsequent start can repair a partially registered source.
+	if err := key.SetExpandStringValue("EventMessageFile", `%SystemRoot%\System32\EventCreate.exe`); err != nil {
+		return err
+	}
+	if err := key.SetDWordValue("CustomSource", 1); err != nil {
+		return err
+	}
+	return key.SetDWordValue("TypesSupported", eventlog.Error)
+}
 
 // openServiceLog opens (creating it when needed) the log file in append
 // mode with FILE_SHARE_DELETE, in addition to read and write sharing.

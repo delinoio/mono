@@ -163,9 +163,9 @@ func (s *Service) applyEvent(ctx context.Context, ev paddle.Event) (eventOutcome
 			return err
 		}
 		if out.BillingAccountID != "" {
-			// A credit, refund or subscription change can change the
-			// billing status of the linked organizations.
-			if err := s.syncStatuses(ctx, tx, out.BillingAccountID, now); err != nil {
+			// Read the clock again with the account lock held, since a
+			// suspension can become due while the webhook waits for it.
+			if err := s.SyncStatuses(ctx, tx, out.BillingAccountID); err != nil {
 				return err
 			}
 		}

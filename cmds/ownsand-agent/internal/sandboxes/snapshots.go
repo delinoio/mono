@@ -241,11 +241,16 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 	if err != nil {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
 	}
-	// Mark the capture before it starts, so that a second create does not
-	// touch it. The claim of this create already lets a delete that arrives
-	// meanwhile record its intent. An unregistered claim (invalid ID) cannot
-	// reach this point.
+	if m.beforeSnapshotCapture != nil {
+		m.beforeSnapshotCapture()
+	}
+	// Check for deletion under the same lock that marks the capture as
+	// started. A delete that wins this lock prevents any directory changes.
 	m.mu.Lock()
+	if claim.deleted {
+		m.mu.Unlock()
+		return nil, m.abortedSnapshotError(id)
+	}
 	pending := m.pending[id]
 	if pending == nil || pending.capturing {
 		m.mu.Unlock()
@@ -529,32 +534,30 @@ func (m *Manager) PrepareSnapshotImport(id string) error {
 // a create or an export reads the copy, the snapshot takes no new users and
 // the last of the current users deletes it; the command succeeds at once,
 // because the control plane sends it only once while the agent channel
-// stays connected. A delete that arrives after a create command of the
-// snapshot was received, whether the create waits for its sandbox or
-// captures, also succeeds at once; the create then aborts with ABORTED and
-// publishes nothing.
+// stays connected. The delete cancels every pending create claim for this
+// snapshot ID, even when a copy already exists. A canceled create that
+// still needs to capture the snapshot returns ABORTED without publishing.
+// A duplicate that finds the copy marked for deletion returns
+// FAILED_PRECONDITION.
 func (m *Manager) DeleteSnapshot(cmd *ownsandv1.DeleteSnapshotCommand) error {
 	id := cmd.GetSnapshotId()
 	if err := validate.UUIDv7("snapshot_id", id); err != nil {
 		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
 	}
 	m.mu.Lock()
+	creates := 0
+	if pending := m.pending[id]; pending != nil {
+		for claim := range pending.claims {
+			claim.deleted = true
+		}
+		creates = len(pending.claims)
+	}
 	snap, ok := m.snapshots[id]
 	if !ok {
-		if pending, creating := m.pending[id]; creating {
-			// A create was received and did not end: it waits for its
-			// sandbox, or it captures. Record the delete in every create
-			// command received so far; each discards its content instead of
-			// publishing it, or aborts before it captures.
-			for claim := range pending.claims {
-				claim.deleted = true
-			}
-			creates := len(pending.claims)
-			m.mu.Unlock()
-			m.logger.Info("snapshot delete recorded during its create", "snapshot_id", id, "creates", creates)
-			return nil
-		}
 		m.mu.Unlock()
+		if creates > 0 {
+			m.logger.Info("snapshot delete recorded during its create", "snapshot_id", id, "creates", creates)
+		}
 		return nil
 	}
 	if snap.users > 0 {
@@ -719,8 +722,9 @@ func (m *Manager) ImportDir(id string) (string, error) {
 // content was verified and extracted into ImportDir(id)/content. It refuses
 // once the device removal started: the check, the save and the insert run
 // under mu, so that no record is written after the removal fenced the
-// imports. The caller removes the content of a refused import.
-func (m *Manager) AddImportedSnapshot(entry *ownsandv1.SnapshotStateEntry) (*ownsandv1.SnapshotStateEntry, error) {
+// imports. It also checks the channel context before and after saving the
+// record. The caller removes the record and content of an unpublished import.
+func (m *Manager) AddImportedSnapshot(ctx context.Context, entry *ownsandv1.SnapshotStateEntry) (*ownsandv1.SnapshotStateEntry, error) {
 	dir, err := m.st.SnapshotDir(entry.GetSnapshotId())
 	if err != nil {
 		return nil, err
@@ -743,8 +747,14 @@ func (m *Manager) AddImportedSnapshot(entry *ownsandv1.SnapshotStateEntry) (*own
 	if m.removing {
 		return nil, errImportRefusedRemoving()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := m.st.SaveSnapshot(snap.rec.SnapshotID, snap.rec); err != nil {
 		return nil, fmt.Errorf("sandboxes: save imported snapshot: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	m.snapshots[snap.rec.SnapshotID] = snap
 	return snap.entry(), nil

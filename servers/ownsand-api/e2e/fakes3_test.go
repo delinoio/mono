@@ -3,10 +3,16 @@
 package e2e
 
 import (
+	"context"
 	"encoding/xml"
+	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -153,7 +159,7 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 			IsTruncated bool      `xml:"IsTruncated"`
 		}
 		sizes := f.sizes(q.Get("prefix"))
-		for _, k := range f.keys(q.Get("prefix")) {
+		for _, k := range slices.Sorted(maps.Keys(sizes)) {
 			res.Contents = append(res.Contents, content{Key: k, Size: sizes[k]})
 		}
 		w.Header().Set("Content-Type", "application/xml")
@@ -165,5 +171,110 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.Error(w, "unsupported", http.StatusMethodNotAllowed)
+	}
+}
+
+type fakeS3ListEntry struct {
+	Key  string `xml:"Key"`
+	Size string `xml:"Size"`
+}
+
+func putFakeS3Object(client *http.Client, f *fakeS3, key, body string) error {
+	req, err := http.NewRequest(http.MethodPut, f.url+"/"+fakeBucket+"/"+key+"?X-Amz-Signature=test", strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PUT %s: status %s", key, res.Status)
+	}
+	return nil
+}
+
+func listFakeS3Objects(t *testing.T, ctx context.Context, client *http.Client, f *fakeS3, prefix string) []fakeS3ListEntry {
+	t.Helper()
+	query := url.Values{"list-type": {"2"}, "prefix": {prefix}, "X-Amz-Signature": {"test"}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url+"/"+fakeBucket+"?"+query.Encode(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("list %q: status %s", prefix, res.Status)
+	}
+	if got := res.Header.Get("Content-Type"); got != "application/xml" {
+		t.Fatalf("list %q: Content-Type = %q, want application/xml", prefix, got)
+	}
+	var listing struct {
+		XMLName     xml.Name          `xml:"ListBucketResult"`
+		Contents    []fakeS3ListEntry `xml:"Contents"`
+		IsTruncated string            `xml:"IsTruncated"`
+	}
+	if err := xml.NewDecoder(res.Body).Decode(&listing); err != nil {
+		t.Fatalf("list %q: decode XML: %v", prefix, err)
+	}
+	if listing.IsTruncated != "false" {
+		t.Fatalf("list %q: IsTruncated = %q, want false", prefix, listing.IsTruncated)
+	}
+	return listing.Contents
+}
+
+func TestFakeS3ListObjectsV2(t *testing.T) {
+	f := newFakeS3(t)
+	client := &http.Client{Timeout: 10 * time.Second}
+	for _, object := range []struct{ key, body string }{
+		{"parts/2", ""},
+		{"parts/1", "abc"},
+		{"other/1", "x"},
+	} {
+		if err := putFakeS3Object(client, f, object.key, object.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := []fakeS3ListEntry{{Key: "parts/1", Size: "3"}, {Key: "parts/2", Size: "0"}}
+	if got := listFakeS3Objects(t, t.Context(), client, f, "parts/"); !slices.Equal(got, want) {
+		t.Fatalf("list parts/: entries = %v, want %v", got, want)
+	}
+}
+
+func TestFakeS3ListObjectsV2ConcurrentPut(t *testing.T) {
+	f := newFakeS3(t)
+	defer f.releasePuts()
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	for round := range 64 {
+		prefix := fmt.Sprintf("parts/%d/", round)
+		key := prefix + "1"
+		f.holdPuts()
+		putDone := make(chan error, 1)
+		go func() {
+			putDone <- putFakeS3Object(client, f, key, "abc")
+		}()
+		f.waitPutHeld(t)
+		// Release the pending PUT as the client sends the listing request.
+		ctx := httptrace.WithClientTrace(t.Context(), &httptrace.ClientTrace{
+			WroteRequest: func(httptrace.WroteRequestInfo) { f.releasePuts() },
+		})
+		got := listFakeS3Objects(t, ctx, client, f, prefix)
+		if err := <-putDone; err != nil {
+			t.Fatal(err)
+		}
+
+		want := []fakeS3ListEntry{{Key: key, Size: "3"}}
+		if len(got) != 0 && !slices.Equal(got, want) {
+			t.Fatalf("list %q during PUT: entries = %v, want none or %v", prefix, got, want)
+		}
+		if got := listFakeS3Objects(t, t.Context(), client, f, prefix); !slices.Equal(got, want) {
+			t.Fatalf("list %q after PUT: entries = %v, want %v", prefix, got, want)
+		}
 	}
 }

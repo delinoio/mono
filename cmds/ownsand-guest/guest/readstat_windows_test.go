@@ -156,8 +156,8 @@ func TestMakeSnapshotLongPath(t *testing.T) {
 	}
 	path := makeLongFile(t, "hello")
 	dst := filepath.Join(m.dir, "snap")
-	if _, n, err := m.makeSnapshot(path, dst); err != nil || n != 5 {
-		t.Fatalf("makeSnapshot of a long path: size %d, error %v", n, err)
+	if _, n, created, err := m.makeSnapshot(path, dst); err != nil || !created || n != 5 {
+		t.Fatalf("makeSnapshot of a long path: size %d, created %v, error %v", n, created, err)
 	}
 	if got, err := os.ReadFile(dst); err != nil || string(got) != "hello" {
 		t.Fatalf("snapshot content %q, error %v", got, err)

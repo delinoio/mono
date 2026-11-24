@@ -214,13 +214,8 @@ func MatchProfileName(labels []string) (string, bool) {
 	return name, name != ""
 }
 
-// matchProfile returns the GITHUB_JOB profile of an organization that the
-// job's labels name, or nil.
-func (l *Layer) matchProfile(ctx context.Context, tx pgx.Tx, orgID string, labels []string) (*profile.Profile, error) {
-	name, ok := MatchProfileName(labels)
-	if !ok {
-		return nil, nil
-	}
+// matchProfile returns the GITHUB_JOB profile with the given name, or nil.
+func (l *Layer) matchProfile(ctx context.Context, tx pgx.Tx, orgID, name string) (*profile.Profile, error) {
 	profiles, err := l.profiles.ListAll(ctx, tx, orgID)
 	if err != nil {
 		return nil, err
@@ -243,18 +238,28 @@ func (l *Layer) requestOfJob(ctx context.Context, tx pgx.Tx, orgID string, jobID
 }
 
 // createRequestTx creates the request of a matching job (or returns the
-// existing one).
+// existing one). workflowJob already holds the organization lock.
 func (l *Layer) createRequestTx(ctx context.Context, tx pgx.Tx, inst *Installation, ev *workflowJobEvent, o *outcome) (*work.Request, error) {
-	p, err := l.matchProfile(ctx, tx, inst.OrganizationID, ev.WorkflowJob.Labels)
+	name, ok := MatchProfileName(ev.WorkflowJob.Labels)
+	if !ok {
+		return nil, nil
+	}
+	p, err := l.matchProfile(ctx, tx, inst.OrganizationID, name)
 	if err != nil || p == nil {
 		return nil, err
 	}
-	if err := api.LockOrganizationShare(ctx, tx, inst.OrganizationID); err != nil {
+	if err := profile.LockShare(ctx, tx, inst.OrganizationID, p.ID); err != nil {
 		if connect.CodeOf(err) == connect.CodeNotFound {
-			// The organization is being deleted.
 			return nil, nil
 		}
 		return nil, err
+	}
+	p, err = l.profiles.Get(ctx, tx, inst.OrganizationID, p.ID)
+	if err != nil {
+		return nil, err
+	}
+	if p.Kind != tidev1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB || p.Name != name {
+		return nil, nil
 	}
 	req, created, err := l.engine.CreateRequest(ctx, tx, work.NewRequest{Profile: p, Source: work.SourceGitHub,
 		SourceKey: strconv.FormatInt(ev.WorkflowJob.ID, 10), PoolKey: inst.PoolKey()})

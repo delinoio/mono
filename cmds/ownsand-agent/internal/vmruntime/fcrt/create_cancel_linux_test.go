@@ -194,10 +194,31 @@ func (f *createFixture) events(t *testing.T) []string {
 func (f *createFixture) create(ctx context.Context) <-chan error {
 	done := make(chan error, 1)
 	go func() {
+		defer close(done)
 		_, err := f.r.Create(ctx, f.spec)
 		done <- err
 	}()
 	return done
+}
+
+func (f *createFixture) createWithSurvivingProcess(t *testing.T) (context.CancelFunc, <-chan error) {
+	t.Helper()
+	signalGroup, stopTimeout := f.r.signalGroup, f.r.stopTimeout
+	f.r.signalGroup = func(int) error { return nil }
+	// The fake stays alive. This only bounds how long Create waits for it to stop.
+	f.r.stopTimeout = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := f.create(ctx)
+	t.Cleanup(func() {
+		cancel()
+		// Drain any unread result and wait for the Create goroutine to
+		// close the channel before restoring the stop settings for Close.
+		for range done {
+		}
+		f.r.signalGroup = signalGroup
+		f.r.stopTimeout = stopTimeout
+	})
+	return cancel, done
 }
 
 // waitEvent blocks until the fake logged the event. The deadline only bounds
@@ -249,8 +270,7 @@ func (f *createFixture) registered() int {
 
 func requireProcessGone(t *testing.T, pid int) {
 	t.Helper()
-	// Create returned after the exit of the process was reaped, so the PID
-	// no longer exists.
+	// The runtime must reap the child before the PID disappears.
 	if err := syscall.Kill(pid, 0); err != syscall.ESRCH {
 		t.Fatalf("process %d of the first launch still exists: %v", pid, err)
 	}
@@ -336,23 +356,13 @@ func TestCreateContextEndedWhileStoppingFailedRestore(t *testing.T) {
 // Create still reports the context error.
 func TestCreateContextEndedKeepsVMWhenProcessSurvives(t *testing.T) {
 	f := newCreateFixture(t, loadBlock)
-	kill := f.r.signalGroup
-	f.r.signalGroup = func(int) error { return nil }
-	// The fake never exits, so the wait only bounds how long the test
-	// waits for the stop to give up; the outcome does not depend on it.
-	f.r.stopTimeout = 20 * time.Millisecond
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	done := f.create(ctx)
+	cancel, done := f.createWithSurvivingProcess(t)
 	f.waitEvent(t, "1 PUT /snapshot/load")
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("create error = %v, want a canceled context", err)
 	}
 	f.requireNoColdFallback(t)
-	// Let Close and the cleanup of the fixture really stop the process.
-	f.r.signalGroup = kill
-	f.r.stopTimeout = exitTimeout
 	if n := f.launches(t); n != 1 {
 		t.Fatalf("%d firecracker launches, want 1", n)
 	}
@@ -361,6 +371,58 @@ func TestCreateContextEndedKeepsVMWhenProcessSurvives(t *testing.T) {
 	}
 	if n := f.registered(); n != 1 {
 		t.Fatalf("%d VMs registered, want the 1 with the surviving process", n)
+	}
+}
+
+func TestCreateContextEndedReapsSurvivingProcessOnEarlyExit(t *testing.T) {
+	cases := []struct {
+		name          string
+		receiveResult bool
+	}{
+		{name: "after_result", receiveResult: true},
+		{name: "in_flight", receiveResult: false},
+	}
+	for _, tc := range cases {
+		var f *createFixture
+		var pid int
+		if t.Run(tc.name, func(t *testing.T) {
+			f = newCreateFixture(t, loadBlock)
+			var done <-chan error
+			// Observe the state after the Create cleanup and before Close.
+			t.Cleanup(func() {
+				select {
+				case _, ok := <-done:
+					if ok {
+						t.Error("create result still pending before runtime close")
+					}
+				default:
+					t.Error("create still running before runtime close")
+				}
+				if n := f.registered(); n != 1 {
+					t.Errorf("%d VMs registered before runtime close, want 1", n)
+				}
+			})
+			cancel, done := f.createWithSurvivingProcess(t)
+			f.waitEvent(t, "1 PUT /snapshot/load")
+			pid = f.firstPID(t)
+			select {
+			case err := <-done:
+				t.Fatalf("create returned before cancellation: %v", err)
+			default:
+			}
+			if tc.receiveResult {
+				cancel()
+				if err := <-done; !errors.Is(err, context.Canceled) {
+					t.Fatalf("create error = %v, want a canceled context", err)
+				}
+			}
+			// Run the same cleanup as a fatal assertion and let the parent
+			// check the child after this subtest returns.
+			t.SkipNow()
+		}) {
+			requireProcessGone(t, pid)
+			requireReleased(t, f)
+		}
 	}
 }
 
