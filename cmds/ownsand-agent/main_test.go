@@ -308,6 +308,55 @@ func TestStatusValidStatusFile(t *testing.T) {
 	}
 }
 
+func TestStatusControlPlaneURL(t *testing.T) {
+	const enrollmentURL = "https://enrollment.example.test"
+	const runtimeURL = "https://effective.example.test"
+	const runtimeSnapshot = `{"api_url":"https://effective.example.test","connected":true,"updated_at":"2026-01-01T00:00:00Z"}`
+	const connected = "connected (status of 2026-01-01 00:00:00)"
+	tests := []struct {
+		name          string
+		snapshot      string
+		enrollmentURL string
+		wantURL       string
+		wantConn      string
+	}{
+		{"runtime URL", runtimeSnapshot, enrollmentURL, runtimeURL, connected},
+		{"runtime URL without enrollment URL", runtimeSnapshot, "", runtimeURL, connected},
+		{"legacy snapshot", `{"connected":true,"updated_at":"2026-01-01T00:00:00Z"}`, enrollmentURL, enrollmentURL, connected},
+		{"absent snapshot", "", enrollmentURL, enrollmentURL, "unknown (the agent has not run)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := statusFixture(t)
+			t.Setenv("OWNSAND_AGENT_API_URL", "https://shell.example.test")
+			if tt.enrollmentURL != "" {
+				if _, err := st.UpdateAgent(func(a *store.AgentState) error {
+					a.APIURL = tt.enrollmentURL
+					a.Removal.NoticeReceived = true
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.snapshot != "" {
+				if err := os.WriteFile(st.Path(store.StatusFile), []byte(tt.snapshot), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var out, errb bytes.Buffer
+			if code := run([]string{"status", "--no-color"}, nil, &out, &errb); code != exitOK || errb.Len() != 0 {
+				t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+			}
+			if got := out.String(); strings.Count(got, "Control plane:") != 1 || !strings.Contains(got, "Control plane: "+tt.wantURL+"\n") || !strings.Contains(got, "Connection: "+tt.wantConn+"\n") {
+				t.Fatalf("stdout = %q, want control plane %q and connection %q", got, tt.wantURL, tt.wantConn)
+			}
+			if tt.enrollmentURL != "" && !strings.Contains(out.String(), "Removal: in progress\n") {
+				t.Fatalf("stdout = %q, want removal in progress", out.String())
+			}
+		})
+	}
+}
+
 // A status.json that cannot be decoded or read is an error: a diagnostic on
 // standard error, exit 1 and never the first-run line. The other sections
 // still print.

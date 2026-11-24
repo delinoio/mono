@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { Role } from "@delino/tide-protos/v1/common_pb";
@@ -37,6 +39,40 @@ describe("client configuration", () => {
     ]) {
       expect(() => resolveApiOrigin(bad)).toThrow(TideConfigError);
     }
+  });
+
+  test.each([
+    "https://api.example.test\\tenant\\..",
+    "https://api.example.test\\",
+    "https://api.example.test/tenant/..",
+    "https:///api.example.test/tenant/..",
+    "https:///api.example.test/tenant/../",
+    "https:api.example.test/tenant/..",
+    "https:/api.example.test/tenant/..",
+    "https:////api.example.test/tenant/..",
+    "https://api.example.test/./",
+  ])("rejects an origin with a hidden path (%s)", (origin) => {
+    const resolveOrigin = () => resolveApiOrigin(origin);
+    const createClient = () => new TideClient({ origin, token: "test-token" });
+    const expectedMessage = /^origin must not have a path, query or fragment$/;
+    expect(resolveOrigin).toThrow(TideConfigError);
+    expect(resolveOrigin).toThrow(expectedMessage);
+    expect(createClient).toThrow(TideConfigError);
+    expect(createClient).toThrow(expectedMessage);
+  });
+
+  test.each([
+    ["", DEFAULT_API_ORIGIN],
+    ["https://tide.api.delino.io", DEFAULT_API_ORIGIN],
+    ["HTTPS://API.EXAMPLE.TEST", "https://api.example.test"],
+    ["https://a.test/", "https://a.test"],
+    [" \t https://A.TEST/ \r\n", "https://a.test"],
+    ["http://[::1]:8080/", "http://[::1]:8080"],
+  ])("canonicalizes a valid explicit origin (%s)", (origin, expected) => {
+    expect(resolveApiOrigin(origin)).toBe(expected);
+    expect(new TideClient({ origin, token: "test-token" }).origin).toBe(
+      expected,
+    );
   });
 
   test("rejects an empty token", () => {
@@ -94,6 +130,61 @@ describe("credentials", () => {
     expect(server.calls.every((c) => c.url.startsWith(`${FAKE_ORIGIN}/`))).toBe(
       true,
     );
+  });
+
+  test("cancellation leaves no unhandled token provider rejection", () => {
+    const fixture = fileURLToPath(
+      new URL("./testing/token-provider-cancellation.ts", import.meta.url),
+    );
+    execFileSync(
+      process.execPath,
+      [
+        "--unhandled-rejections=strict",
+        "--experimental-transform-types",
+        "--test",
+        fixture,
+      ],
+      { timeout: 10_000 },
+    );
+  });
+
+  test("an already aborted call skips the token source and fetch", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const server = fakeServer(() => {});
+    let providerCalls = 0;
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: server.fetch,
+      token: () => {
+        providerCalls++;
+        return "test-token";
+      },
+    });
+    await expect(
+      client.organizations.getOrganization(
+        { organizationId: ORG },
+        { signal: controller.signal },
+      ),
+    ).rejects.toMatchObject({ code: Code.Canceled });
+    expect(providerCalls).toBe(0);
+    expect(server.calls).toEqual([]);
+  });
+
+  test("a token source rejection reaches a live caller before any request", async () => {
+    const server = fakeServer(() => {});
+    const providerError = new Error("token source failed");
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: server.fetch,
+      token: () => Promise.reject(providerError),
+    });
+    const error = (await client.organizations
+      .getOrganization({ organizationId: ORG })
+      .catch((error: unknown) => error)) as ConnectError;
+    expect(error.cause).toBeInstanceOf(TideConfigError);
+    expect((error.cause as TideConfigError).cause).toBe(providerError);
+    expect(server.calls).toEqual([]);
   });
 
   test("a token source that returns nothing fails before any request", async () => {

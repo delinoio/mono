@@ -108,6 +108,72 @@ test.each([0, 1])(
   },
 );
 
+test("an agent integration name conflict preserves the integration list and audit history", async () => {
+  const transport = createMockTransport();
+  const integrations = createClient(AgentIntegrationService, transport);
+  const audit = createClient(AuditService, transport);
+  const organizationId = MOCK_IDS.acme;
+  const id = { organizationId, agentIntegrationId: MOCK_IDS.claudeIntegration };
+  const listBefore = structuredClone(
+    await integrations.listAgentIntegrations({ organizationId }),
+  );
+  const integrationBefore = structuredClone(
+    await integrations.getAgentIntegration(id),
+  );
+  const auditBefore = structuredClone(
+    await audit.listAuditEvents({ organizationId }),
+  );
+  const conflict = {
+    code: Code.AlreadyExists,
+    rawMessage: "an agent integration with this name exists",
+  };
+
+  await expect(
+    integrations.updateAgentIntegration({
+      ...id,
+      name: " codex-prod ",
+      updateMask: { paths: ["name"] },
+    }),
+  ).rejects.toMatchObject(conflict);
+  await expect(
+    integrations.createAgentIntegration({
+      organizationId,
+      vendor: AgentVendor.CLAUDE_CODE,
+      name: "codex-prod",
+    }),
+  ).rejects.toMatchObject(conflict);
+
+  expect(await integrations.getAgentIntegration(id)).toEqual(integrationBefore);
+  expect(await integrations.listAgentIntegrations({ organizationId })).toEqual(
+    listBefore,
+  );
+  expect(await audit.listAuditEvents({ organizationId })).toEqual(auditBefore);
+});
+
+test.each(["claude-team", "claude-renamed"])(
+  "an integration can update its name to %s",
+  async (name) => {
+    const integrations = createClient(
+      AgentIntegrationService,
+      createMockTransport(),
+    );
+    const id = {
+      organizationId: MOCK_IDS.acme,
+      agentIntegrationId: MOCK_IDS.claudeIntegration,
+    };
+    const { integration } = await integrations.updateAgentIntegration({
+      ...id,
+      name,
+      updateMask: { paths: ["name"] },
+    });
+
+    expect(integration).toMatchObject({ name });
+    expect((await integrations.getAgentIntegration(id)).integration).toEqual(
+      integration,
+    );
+  },
+);
+
 test("a rejected combined update preserves the integration and its audit history", async () => {
   const createdAt = Date.UTC(2026, 0, 1);
   const updatedAt = Date.UTC(2026, 0, 2);

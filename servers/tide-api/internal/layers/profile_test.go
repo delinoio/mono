@@ -4,6 +4,8 @@ package layers_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,7 +17,173 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
+	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
+	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 )
+
+const templateKeyRejection = "OwnSand rejected the organization's OwnSand API key"
+
+func linuxDevProfile() *tidev1.RunnerProfile {
+	return &tidev1.RunnerProfile{
+		Name: "dev", WorkloadKind: tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, WorkspacePath: "/work",
+		GuestOs: tidev1.GuestOs_GUEST_OS_LINUX, Source: &tidev1.RunnerProfile_BaseImage{BaseImage: tidev1.GuestOs_GUEST_OS_LINUX},
+		Resources: &tidev1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 32}, NetworkMode: tidev1.NetworkMode_NETWORK_MODE_OUTBOUND,
+		IdleTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(8 * time.Hour), MaxQueueWait: durationpb.New(30 * time.Minute),
+	}
+}
+
+func wantTemplateError(t *testing.T, err error, code connect.Code, message string) {
+	t.Helper()
+	var got *connect.Error
+	if !errors.As(err, &got) || got.Code() != code || got.Message() != message {
+		t.Fatalf("template check: got %v, want %s: %s", err, code, message)
+	}
+}
+
+func wantProfileLinkState(t *testing.T, admin *testenv.Clients, orgID string, state tidev1.OwnSandLinkState) {
+	t.Helper()
+	got, err := admin.OwnSandLink.GetOwnSandLink(context.Background(), connect.NewRequest(&tidev1.GetOwnSandLinkRequest{OrganizationId: orgID}))
+	if err != nil || got.Msg.GetLink().GetState() != state {
+		t.Fatalf("OwnSand link: got %v (%v), want %s", got, err, state)
+	}
+}
+
+func TestRunnerProfileTemplateErrorsRevokedKey(t *testing.T) {
+	for _, action := range []string{"create", "source", "guest_os"} {
+		t.Run(action, func(t *testing.T) {
+			w := newWorld(t)
+			ctx := context.Background()
+			admin := w.env.User(w.org.Admin)
+			osOrg, templateID := api.NewID(), api.NewID()
+			source := &tidev1.RunnerProfile_OwnsandTemplateId{OwnsandTemplateId: templateID}
+			key := ownsandKey('a')
+			w.fake.AddOrg(osOrg, key)
+			w.fake.SetTemplate(osOrg, templateID, ownsandv1.GuestOs_GUEST_OS_LINUX)
+			if _, err := w.setLink(w.org.Admin, osOrg, key); err != nil {
+				t.Fatal(err)
+			}
+			wantProfileLinkState(t, admin, w.org.ID, tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE)
+
+			input := linuxDevProfile()
+			create := func() (*connect.Response[tidev1.CreateRunnerProfileResponse], error) {
+				return admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{OrganizationId: w.org.ID, Profile: input}))
+			}
+			if action == "create" {
+				w.fake.RevokeKey(osOrg)
+				input.Source = source
+				_, err := create()
+				wantTemplateError(t, err, connect.CodeFailedPrecondition, templateKeyRejection)
+				wantProfileLinkState(t, admin, w.org.ID, tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_INVALID)
+				list, err := admin.Profile.ListRunnerProfiles(ctx, connect.NewRequest(&tidev1.ListRunnerProfilesRequest{OrganizationId: w.org.ID}))
+				if err != nil || len(list.Msg.GetProfiles()) != 0 {
+					t.Fatalf("profiles after failed create: %v (%v)", list, err)
+				}
+				// An invalid link skips the check, even for an unknown template.
+				input.Source = &tidev1.RunnerProfile_OwnsandTemplateId{OwnsandTemplateId: api.NewID()}
+				if _, err := create(); err != nil {
+					t.Fatalf("template with invalid link: %v", err)
+				}
+				return
+			}
+
+			update := &tidev1.RunnerProfile{Source: source}
+			if action == "guest_os" {
+				// A guest_os-only update checks OwnSand when the stored source is a template.
+				input.Source = source
+				update = &tidev1.RunnerProfile{GuestOs: tidev1.GuestOs_GUEST_OS_MACOS}
+			}
+			created, err := create()
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := created.Msg.GetProfile()
+			id := before.GetRunnerProfileId()
+			w.fake.RevokeKey(osOrg)
+			_, err = admin.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+				OrganizationId: w.org.ID, RunnerProfileId: id, Profile: update, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{action}},
+			}))
+			wantTemplateError(t, err, connect.CodeFailedPrecondition, templateKeyRejection)
+			wantProfileLinkState(t, admin, w.org.ID, tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_INVALID)
+			got, err := admin.Profile.GetRunnerProfile(ctx, connect.NewRequest(&tidev1.GetRunnerProfileRequest{OrganizationId: w.org.ID, RunnerProfileId: id}))
+			if err != nil || !proto.Equal(got.Msg.GetProfile(), before) {
+				t.Fatalf("profile after failed update: %v (%v), want %v", got, err, before)
+			}
+		})
+	}
+}
+
+type templateErrorFactory struct {
+	ownsandclient.Factory
+	failures map[string]error
+}
+
+func (f templateErrorFactory) New(org, key string) (ownsandclient.Client, error) {
+	client, err := f.Factory.New(org, key)
+	if err != nil {
+		return nil, err
+	}
+	return templateErrorClient{Client: client, failures: f.failures}, nil
+}
+
+type templateErrorClient struct {
+	ownsandclient.Client
+	failures map[string]error
+}
+
+func (c templateErrorClient) TemplateGuestOS(ctx context.Context, id string) (ownsandv1.GuestOs, error) {
+	if err := c.failures[id]; err != nil {
+		return 0, err
+	}
+	return c.Client.TemplateGuestOS(ctx, id)
+}
+
+func TestRunnerProfileTemplateErrorsOwnSandCodes(t *testing.T) {
+	const detail = "scripted OwnSand detail"
+	cases := []struct {
+		upstream connect.Code
+		want     connect.Code
+		message  string
+	}{
+		{connect.CodePermissionDenied, connect.CodeFailedPrecondition, templateKeyRejection},
+		{connect.CodeResourceExhausted, connect.CodeResourceExhausted, "OwnSand: " + detail},
+		{connect.CodeInvalidArgument, connect.CodeInternal, "internal error"},
+		{connect.CodeFailedPrecondition, connect.CodeInternal, "internal error"},
+		{connect.CodeAborted, connect.CodeInternal, "internal error"},
+		{connect.CodeInternal, connect.CodeInternal, "internal error"},
+		{connect.CodeUnknown, connect.CodeInternal, "internal error"},
+		{connect.CodeNotFound, connect.CodeInvalidArgument, "invalid source.ownsand_template_id: the linked OwnSand organization has no such template"},
+		{connect.CodeUnavailable, connect.CodeUnavailable, "OwnSand is unavailable; try again"},
+		{connect.CodeDeadlineExceeded, connect.CodeUnavailable, "OwnSand is unavailable; try again"},
+	}
+	fake := ownsandfake.New()
+	factory := templateErrorFactory{Factory: fake, failures: make(map[string]error)}
+	ids := make(map[connect.Code]string)
+	for _, tc := range cases {
+		id := api.NewID()
+		ids[tc.upstream] = id
+		factory.failures[id] = connect.NewWireError(tc.upstream, errors.New(detail))
+	}
+	env := testenv.New(t, testenv.WithLayerOptions(layers.Options{OwnSand: factory}, &layers.Layers{}))
+	w := &world{env: env, org: env.NewOrg("alice")}
+	ctx := context.Background()
+	admin := env.User(w.org.Admin)
+	osOrg, key := api.NewID(), ownsandKey('a')
+	fake.AddOrg(osOrg, key)
+	if _, err := w.setLink(w.org.Admin, osOrg, key); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		t.Run(tc.upstream.String(), func(t *testing.T) {
+			input := linuxDevProfile()
+			input.Source = &tidev1.RunnerProfile_OwnsandTemplateId{OwnsandTemplateId: ids[tc.upstream]}
+			_, err := admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{OrganizationId: w.org.ID, Profile: input}))
+			wantTemplateError(t, err, tc.want, tc.message)
+			wantProfileLinkState(t, admin, w.org.ID, tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE)
+		})
+	}
+}
 
 func TestRunnerProfiles(t *testing.T) {
 	w := newWorld(t)
@@ -131,6 +299,70 @@ func TestRunnerProfiles(t *testing.T) {
 
 // Two updates of different masked fields of one profile that overlap both
 // stay applied.
+func TestRunnerProfileWindowsWorkspacePath(t *testing.T) {
+	w := newWorld(t)
+	ctx := t.Context()
+	admin := w.env.User(w.org.Admin).Profile
+	profile := linuxDevProfile()
+	profile.GuestOs = tidev1.GuestOs_GUEST_OS_WINDOWS
+	profile.Source = &tidev1.RunnerProfile_BaseImage{BaseImage: tidev1.GuestOs_GUEST_OS_WINDOWS}
+	profile.WorkspacePath = `C:\work\NUL`
+
+	_, err := admin.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{
+		OrganizationId: w.org.ID, Profile: profile,
+	}))
+	wantCode(t, "create with reserved device name", err, connect.CodeInvalidArgument)
+	if !strings.Contains(err.Error(), "workspace_path") {
+		t.Fatalf("create error does not name workspace_path: %v", err)
+	}
+
+	// Creating a profile with the same name confirms the rejected create did not save it.
+	profile.WorkspacePath = `C:\work`
+	created, err := admin.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{
+		OrganizationId: w.org.ID, Profile: profile,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created.Msg.GetProfile().GetRunnerProfileId()
+	update := func(path string) (*connect.Response[tidev1.UpdateRunnerProfileResponse], error) {
+		return admin.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: id,
+			Profile:    &tidev1.RunnerProfile{WorkspacePath: path},
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"workspace_path"}},
+		}))
+	}
+	assertStoredPath := func(want string) {
+		t.Helper()
+		got, err := admin.GetRunnerProfile(ctx, connect.NewRequest(&tidev1.GetRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: id,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if path := got.Msg.GetProfile().GetWorkspacePath(); path != want {
+			t.Fatalf("stored workspace path = %q, want %q", path, want)
+		}
+	}
+
+	_, err = update(`C:\work\LPT9.log`)
+	wantCode(t, "update with reserved device name", err, connect.CodeInvalidArgument)
+	if !strings.Contains(err.Error(), "workspace_path") {
+		t.Fatalf("update error does not name workspace_path: %v", err)
+	}
+	assertStoredPath(`C:\work`)
+
+	// Simulate a profile saved before reserved device names were rejected.
+	if _, err := w.env.DB.Pool.Exec(ctx, "UPDATE runner_profiles SET workspace_path = $2 WHERE runner_profile_id = $1", id, `C:\work\NUL`); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := update(`C:\work\project`)
+	if err != nil || repaired.Msg.GetProfile().GetWorkspacePath() != `C:\work\project` {
+		t.Fatalf("repair workspace path: %v (%v)", repaired, err)
+	}
+	assertStoredPath(`C:\work\project`)
+}
+
 func TestRunnerProfileConcurrentUpdates(t *testing.T) {
 	w := newWorld(t)
 	ctx := context.Background()
@@ -233,6 +465,67 @@ func TestRunnerProfileResourceUpdates(t *testing.T) {
 	_, err = update(&tidev1.Resources{}, "resources.memory_mib")
 	wantCode(t, "zero memory", err, connect.CodeInvalidArgument)
 	assertStored(replacement)
+}
+
+func TestRunnerProfileResourceLimitErrors(t *testing.T) {
+	w := newWorld(t)
+	ctx := t.Context()
+	admin := w.env.User(w.org.Admin)
+	create := func(name string, resources *tidev1.Resources) (*connect.Response[tidev1.CreateRunnerProfileResponse], error) {
+		return admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{
+			OrganizationId: w.org.ID,
+			Profile: &tidev1.RunnerProfile{
+				Name: name, WorkloadKind: tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, WorkspacePath: "/work",
+				GuestOs: tidev1.GuestOs_GUEST_OS_LINUX, Source: &tidev1.RunnerProfile_BaseImage{BaseImage: tidev1.GuestOs_GUEST_OS_LINUX},
+				Resources: resources, NetworkMode: tidev1.NetworkMode_NETWORK_MODE_OUTBOUND,
+				IdleTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(8 * time.Hour), MaxQueueWait: durationpb.New(30 * time.Minute),
+			},
+		}))
+	}
+	limits := &tidev1.Resources{VcpuCount: 1024, MemoryMib: 16777216, DiskGib: 1048576}
+	created, err := create("at-limits", limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := created.Msg.GetProfile().GetResources(); !proto.Equal(got, limits) {
+		t.Fatalf("created resources = %v, want %v", got, limits)
+	}
+	update := func(resources *tidev1.Resources) (*connect.Response[tidev1.UpdateRunnerProfileResponse], error) {
+		return admin.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: created.Msg.GetProfile().GetRunnerProfileId(),
+			Profile: &tidev1.RunnerProfile{Resources: resources}, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"resources"}},
+		}))
+	}
+	for _, tc := range []struct {
+		name      string
+		resources *tidev1.Resources
+		want      string
+	}{
+		{"zero-vcpu", &tidev1.Resources{VcpuCount: 0, MemoryMib: 4096, DiskGib: 32}, "invalid resources.vcpu_count: must be greater than zero"},
+		{"over-vcpu-limit", &tidev1.Resources{VcpuCount: 1025, MemoryMib: 4096, DiskGib: 32}, "invalid resources.vcpu_count: must be at most 1024"},
+		{"zero-memory", &tidev1.Resources{VcpuCount: 2, MemoryMib: 0, DiskGib: 32}, "invalid resources.memory_mib: must be greater than zero"},
+		{"over-memory-limit", &tidev1.Resources{VcpuCount: 2, MemoryMib: 16777217, DiskGib: 32}, "invalid resources.memory_mib: must be at most 16777216"},
+		{"zero-disk", &tidev1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 0}, "invalid resources.disk_gib: must be greater than zero"},
+		{"over-disk-limit", &tidev1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 1048577}, "invalid resources.disk_gib: must be at most 1048576"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, createErr := create(tc.name, tc.resources)
+			_, updateErr := update(tc.resources)
+			wantCode(t, "create", createErr, connect.CodeInvalidArgument)
+			wantCode(t, "update", updateErr, connect.CodeInvalidArgument)
+			want := "invalid_argument: " + tc.want
+			if createErr.Error() != want || updateErr.Error() != want {
+				t.Fatalf("create = %v, update = %v, want both to return %q", createErr, updateErr, want)
+			}
+		})
+	}
+	updated, err := update(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := updated.Msg.GetProfile().GetResources(); !proto.Equal(got, limits) {
+		t.Fatalf("updated resources = %v, want %v", got, limits)
+	}
 }
 
 // Durations are stored in milliseconds, so a value with a smaller part is

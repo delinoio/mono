@@ -38,6 +38,7 @@ jobs:
       static_sites: ${{ steps.plan.outputs.static_sites }}
       binaries: ${{ steps.plan.outputs.binaries }}
       changeset_blobs: ${{ steps.blobs.outputs.changeset_blobs }}
+      consumed_changeset_blobs: ${{ steps.blobs.outputs.consumed_changeset_blobs }}
       has_changesets: ${{ steps.plan.outputs.has_changesets }}
       has_servers: ${{ steps.plan.outputs.has_servers }}
       has_static_sites: ${{ steps.plan.outputs.has_static_sites }}
@@ -93,6 +94,7 @@ jobs:
         id: blobs
         env:
           CHANGESETS: ${{ steps.plan.outputs.changesets }}
+          CONSUMED_CHANGESETS: ${{ steps.plan.outputs.consumed_changesets }}
         shell: bash
         run: |
           set -euo pipefail
@@ -101,7 +103,13 @@ jobs:
             blob="$(git rev-parse "HEAD:.changeset/$id.md")"
             blobs="$(jq -c --arg id "$id" --arg blob "$blob" '. + {($id): $blob}' <<< "$blobs")"
           done < <(jq -r '.[]' <<< "$CHANGESETS")
+          consumed_blobs="$(jq -c --argjson ids "$CONSUMED_CHANGESETS" '
+            . as $planned
+            | reduce $ids[] as $id ({};
+                .[$id] = ($planned[$id] // error("No planned blob for changeset " + $id)))
+          ' <<< "$blobs")"
           echo "changeset_blobs=$blobs" >> "$GITHUB_OUTPUT"
+          echo "consumed_changeset_blobs=$consumed_blobs" >> "$GITHUB_OUTPUT"
 
   build-servers:
     name: Build ${{ matrix.server.name }}
@@ -454,7 +462,7 @@ jobs:
         if: ${{ github.run_attempt > 1 }}
         env:
           RELEASES: ${{ needs.plan.outputs.releases }}
-          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          CONSUMED_CHANGESET_BLOBS: ${{ needs.plan.outputs.consumed_changeset_blobs }}
           SHA: ${{ needs.plan.outputs.sha }}
           REPOSITORY: ${{ github.repository }}
           WORKFLOW: deploy.yml

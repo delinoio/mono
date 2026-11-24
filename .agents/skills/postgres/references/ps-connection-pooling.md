@@ -40,7 +40,7 @@ To connect to a dedicated PgBouncer, append `|pgbouncer-name` to the username (e
 
 PlanetScale PgBouncer uses **transaction pooling mode**. These features are unavailable:
 
-- Prepared statements that persist across transactions
+- SQL-level `PREPARE` across transactions. PgBouncer supports protocol-level named prepared statements across transactions only when `max_prepared_statements` is nonzero (PlanetScale defaults to `200`).
 - Temporary tables
 - `LISTEN`/`NOTIFY`
 - Session-level advisory locks

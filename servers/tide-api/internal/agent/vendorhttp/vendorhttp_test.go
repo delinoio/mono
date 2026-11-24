@@ -7,11 +7,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -37,6 +40,82 @@ func TestReadEvents(t *testing.T) {
 	stop := errors.New("stop")
 	if err := ReadEvents(strings.NewReader(body), func(Event) error { return stop }); !errors.Is(err, stop) {
 		t.Fatalf("callback error: %v", err)
+	}
+}
+
+func TestReadEventsLineEndingsAndBOM(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []Event
+	}{
+		{"LF", "data: ok\n\n", []Event{{Name: "message", Data: []byte("ok")}}},
+		{"CRLF", "data: ok\r\n\r\n", []Event{{Name: "message", Data: []byte("ok")}}},
+		{"CR", "data: ok\r\r", []Event{{Name: "message", Data: []byte("ok")}}},
+		{
+			"mixed with split CRLF",
+			"event: created\r\nid: c1\rdata: first\n: comment\rdata: second\r\n\r\ndata: after\n\n",
+			[]Event{
+				{ID: "c1", Name: "created", Data: []byte("first\nsecond")},
+				{ID: "c1", Name: "message", Data: []byte("after")},
+			},
+		},
+		{"BOM before data", "\uFEFFdata: ok\n\n", []Event{{Name: "message", Data: []byte("ok")}}},
+		{
+			"BOM before event and in data",
+			"\uFEFFevent: created\rdata: \uFEFFok\n\n",
+			[]Event{{Name: "created", Data: []byte("\uFEFFok")}},
+		},
+		{"second leading BOM", "\uFEFF\uFEFFdata: ignored\n\n", nil},
+		{"BOM at start of later line", ": comment\n\uFEFFdata: ignored\n\n", nil},
+		{"incomplete at EOF", "data: incomplete\r", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []Event
+			reader := iotest.OneByteReader(strings.NewReader(tc.body))
+			if err := ReadEvents(reader, func(e Event) error {
+				got = append(got, e)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("events = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReadEventsDispatchesCRBeforeReadingAgain(t *testing.T) {
+	stop := errors.New("stop after event")
+	readErr := errors.New("unexpected read")
+	reader := io.MultiReader(strings.NewReader("data: ok\r\r"), iotest.ErrReader(readErr))
+	err := ReadEvents(reader, func(e Event) error {
+		if e.Name != "message" || string(e.Data) != "ok" {
+			t.Fatalf("unexpected event: %+v", e)
+		}
+		return stop
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("ReadEvents returned %v, want %v", err, stop)
+	}
+}
+
+func TestReadEventsReaderErrorAndLineLimit(t *testing.T) {
+	readErr := errors.New("failed to read stream")
+	reader := io.MultiReader(strings.NewReader("data: incomplete\r"), iotest.ErrReader(readErr))
+	unexpectedEvent := func(e Event) error {
+		t.Fatalf("unexpected event: %+v", e)
+		return nil
+	}
+	if err := ReadEvents(reader, unexpectedEvent); !errors.Is(err, readErr) {
+		t.Fatalf("ReadEvents returned %v, want %v", err, readErr)
+	}
+	for _, ending := range []string{"\n", "\r\n", "\r"} {
+		line := "data:" + strings.Repeat("a", maxEventLine-len("data:"))
+		if err := ReadEvents(strings.NewReader(line+ending+ending), unexpectedEvent); err == nil {
+			t.Errorf("ReadEvents accepted an oversized line ending in %q", ending)
+		}
 	}
 }
 

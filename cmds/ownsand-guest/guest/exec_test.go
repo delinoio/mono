@@ -6,7 +6,6 @@ package guest
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -178,9 +177,8 @@ while :; do sleep 0.05; done`
 	evs := h.runExec(req)
 	childPid := readPidFile(t, pidFile)
 	t.Cleanup(func() { _ = syscall.Kill(childPid, syscall.SIGKILL) })
-	ex := evs[len(evs)-1].GetExited()
-	if !ex.GetTimedOut() || ex.GetExitCode() != 0 {
-		t.Fatalf("exited %v", ex)
+	if err := requireExplicitZeroExit(evs[len(evs)-1], true); err != nil {
+		t.Fatal(err)
 	}
 	// What the consumer sees of the child depends on its own scheduling, not
 	// on the order of the producer: a slow consumer can read the exited event
@@ -226,61 +224,6 @@ while :; do sleep 0.05; done`
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the pending SIGKILL outlived its empty process group")
-	}
-}
-
-// requireExplicitSuccess reports an error unless ev is an ExecExited event whose
-// status is an explicit exit code of 0 and that did not time out. The
-// scalar getters return zero values for a missing payload, so a failed event
-// or an unset status would otherwise pass a check on GetExitCode() and
-// GetTimedOut().
-func requireExplicitSuccess(ev *ownsandv1.ExecEvent) error {
-	exit, ok := ev.GetEvent().(*ownsandv1.ExecEvent_Exited)
-	if !ok || exit.Exited == nil {
-		return fmt.Errorf("terminal event is not an exit: %v", ev)
-	}
-	code, ok := exit.Exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
-	if !ok {
-		return fmt.Errorf("exit has no explicit exit code: %v", ev)
-	}
-	if code.ExitCode != 0 || exit.Exited.GetTimedOut() {
-		return fmt.Errorf("exit is not a clean zero exit: %v", ev)
-	}
-	return nil
-}
-
-func TestRequireExplicitSuccess(t *testing.T) {
-	exited := func(x *ownsandv1.ExecExited) *ownsandv1.ExecEvent {
-		return &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: x}}
-	}
-	code := func(c int64) *ownsandv1.ExecExited_ExitCode {
-		return &ownsandv1.ExecExited_ExitCode{ExitCode: c}
-	}
-	cases := []struct {
-		name string
-		ev   *ownsandv1.ExecEvent
-		ok   bool
-	}{
-		{"failed event", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Failed{
-			Failed: &ownsandv1.ExecFailed{Message: "boom"}}}, false},
-		{"nil exit payload", exited(nil), false},
-		{"empty exit", exited(&ownsandv1.ExecExited{}), false},
-		{"signal 15", exited(&ownsandv1.ExecExited{
-			Status: &ownsandv1.ExecExited_Signal{Signal: 15}}), false},
-		{"exit 7", exited(&ownsandv1.ExecExited{Status: code(7)}), false},
-		{"zero with timed_out", exited(&ownsandv1.ExecExited{Status: code(0), TimedOut: true}), false},
-		{"explicit zero", exited(&ownsandv1.ExecExited{Status: code(0)}), true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := requireExplicitSuccess(tc.ev)
-			if tc.ok && err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if !tc.ok && err == nil {
-				t.Fatal("expected an error")
-			}
-		})
 	}
 }
 
@@ -353,8 +296,11 @@ func TestExecRunsIndependentlyAndAttach(t *testing.T) {
 	s2.send(5, &ownsandv1.AttachExecRequest{SandboxId: testSandbox, ExecId: req.GetExecId(), StdoutOffset: 2})
 	evs := s2.collectExec()
 	stdout, _ := outputs(evs)
-	if stdout != "lloworld" || evs[len(evs)-1].GetExited().GetExitCode() != 0 {
+	if stdout != "lloworld" {
 		t.Fatalf("attach events %v", evs)
+	}
+	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+		t.Fatalf("attach events %v: %v", evs, err)
 	}
 	// A repeated exec request attaches from offset 0 and does not run the
 	// command again.
@@ -426,12 +372,12 @@ func TestExecKeepalive(t *testing.T) {
 			// The command is released: it must now exit successfully.
 			for {
 				ev := s.recv().GetExecEvent()
-				if ev.GetFailed() != nil {
+				switch ev.GetEvent().(type) {
+				case *ownsandv1.ExecEvent_Failed:
 					t.Fatalf("exec failed after release: %v", ev.GetFailed())
-				}
-				if ex := ev.GetExited(); ex != nil {
-					if ex.GetExitCode() != 0 || ex.GetTimedOut() {
-						t.Fatalf("exit code %d, timed out %t; want a clean exit", ex.GetExitCode(), ex.GetTimedOut())
+				case *ownsandv1.ExecEvent_Exited:
+					if err := requireExplicitSuccess(ev); err != nil {
+						t.Fatalf("exec after release: %v", err)
 					}
 					return
 				}
@@ -503,7 +449,10 @@ func TestServeOversizeFrameEndsStreamWhileExecRuns(t *testing.T) {
 	defer s2.s.CloseRequest()
 	s2.send(3, &ownsandv1.AttachExecRequest{SandboxId: testSandbox, ExecId: req.GetExecId()})
 	evs := s2.collectExec()
-	if stdout, _ := outputs(evs); stdout != "readydone" || evs[len(evs)-1].GetExited().GetExitCode() != 0 {
+	if stdout, _ := outputs(evs); stdout != "readydone" {
 		t.Fatalf("attach events %v", evs)
+	}
+	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+		t.Fatalf("attach events %v: %v", evs, err)
 	}
 }

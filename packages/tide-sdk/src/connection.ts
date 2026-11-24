@@ -26,8 +26,9 @@ export const API_RESOURCE = "https://tide.api.delino.io";
 export type TokenSource = string | (() => string | Promise<string>);
 
 /**
- * Validates an API origin and returns it in canonical form. It must be an
- * http or https origin without credentials, path, query or fragment.
+ * Validates an API origin and returns it in canonical form. Write an http or
+ * https origin as scheme://host[:port][/], without credentials, path, query,
+ * fragment or backslash.
  */
 export function resolveApiOrigin(value: string | undefined): string {
   const raw = value === undefined || value === "" ? DEFAULT_API_ORIGIN : value;
@@ -43,12 +44,14 @@ export function resolveApiOrigin(value: string | undefined): string {
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     throw new TideConfigError("origin must use http or https");
   }
+  // Check the written form because the URL parser can normalize a path to "/".
   if (
     url.pathname !== "/" ||
     url.search !== "" ||
     url.hash !== "" ||
     raw.includes("?") ||
-    raw.includes("#")
+    raw.includes("#") ||
+    !/^https?:\/\/[^/?#\\]+\/?$/i.test(raw.trim())
   ) {
     throw new TideConfigError("origin must not have a path, query or fragment");
   }
@@ -85,7 +88,7 @@ async function currentToken(
   if (typeof token === "string") {
     return token;
   }
-  const value = await untilAborted(
+  const value = await waitForToken(
     new Promise<string>((resolve) => resolve(token())),
     signal,
   );
@@ -96,13 +99,21 @@ async function currentToken(
 }
 
 /**
- * Waits for a promise, but rejects with the reason of the signal when the
- * signal aborts first. A late result of the promise is then ignored, so a
- * token source that answers after the abort starts no request.
+ * Waits for the token and reports provider failures as configuration errors.
+ * If the signal aborts first, it rejects with the signal's reason and ignores
+ * the provider's result.
  */
-function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  signal.throwIfAborted();
-  return new Promise<T>((resolve, reject) => {
+function waitForToken(
+  promise: Promise<string>,
+  signal: AbortSignal,
+): Promise<string> {
+  if (signal.aborted) {
+    // A token source can abort synchronously before returning or throwing.
+    // Observe its rejection even though the call has already been canceled.
+    void promise.catch(() => {});
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<string>((resolve, reject) => {
     const onAbort = () => reject(signal.reason);
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
@@ -110,9 +121,9 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
         signal.removeEventListener("abort", onAbort);
         resolve(value);
       },
-      (error: unknown) => {
+      (cause: unknown) => {
         signal.removeEventListener("abort", onAbort);
-        reject(error);
+        reject(new TideConfigError("the token source failed", { cause }));
       },
     );
   });

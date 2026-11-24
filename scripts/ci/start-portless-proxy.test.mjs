@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -43,10 +43,10 @@ const fakeProxyCli = `setInterval(() => {}, 1000);`;
 
 // Creates a repository fixture with a copy of the preflight script and the
 // given apps. Each app is { name, dev, installed }.
-function fixture(t, apps) {
+function fixture(t, apps, prefix = "portless-preflight-") {
   // The real path keeps working directories comparable where the temporary
   // directory is a symbolic link, as on macOS.
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "portless-preflight-")));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   mkdirSync(join(dir, "scripts", "dev"), { recursive: true });
   copyFileSync(
@@ -78,16 +78,20 @@ function fixture(t, apps) {
   return dir;
 }
 
+function proxyCliPath(dir) {
+  return join(dir, "global", "portless", "dist", "cli.js");
+}
+
 // Starts a fake proxy from a portless package of the given version and
 // records its PID in the fixture's portless state directory.
 function startProxy(t, dir, version) {
-  const portlessDir = join(dir, "global", "portless");
-  mkdirSync(join(portlessDir, "dist"), { recursive: true });
+  const cli = proxyCliPath(dir);
+  const dist = dirname(cli);
+  mkdirSync(dist, { recursive: true });
   writeFileSync(
-    join(portlessDir, "package.json"),
+    join(dist, "..", "package.json"),
     JSON.stringify({ name: "portless", version }),
   );
-  const cli = join(portlessDir, "dist", "cli.js");
   writeFileSync(cli, fakeProxyCli);
   const proxy = spawn(
     process.execPath,
@@ -220,10 +224,20 @@ test("exits with the status of a failed proxy start", (t) => {
 // The version check reads the proxy command with `ps`, which Windows lacks.
 const psSkip = process.platform === "win32" ? "needs ps" : false;
 
-test("stops a proxy that an older portless runs", { skip: psSkip }, (t) => {
+function versionedProxyFixture(t) {
   const dir = fixture(t, [
     { name: "web", dev: "portless run --prefix=", installed: true },
   ]);
+  if (/\s/.test(proxyCliPath(dir))) {
+    t.skip("whitespace in the proxy CLI path prevents version detection");
+    return null;
+  }
+  return dir;
+}
+
+test("stops a proxy that an older portless runs", { skip: psSkip }, (t) => {
+  const dir = versionedProxyFixture(t);
+  if (dir === null) return;
   const pid = startProxy(t, dir, "0.15.8");
   const result = run(dir);
   assert.equal(result.status, 0, result.stderr);
@@ -248,9 +262,8 @@ test("stops a proxy that an older portless runs", { skip: psSkip }, (t) => {
 
 for (const version of [pinnedVersion, "0.19.0"]) {
   test(`keeps a proxy that portless ${version} runs`, { skip: psSkip }, (t) => {
-    const dir = fixture(t, [
-      { name: "web", dev: "portless run --prefix=", installed: true },
-    ]);
+    const dir = versionedProxyFixture(t);
+    if (dir === null) return;
     startProxy(t, dir, version);
     const result = run(dir);
     assert.equal(result.status, 0, result.stderr);
@@ -260,6 +273,25 @@ for (const version of [pinnedVersion, "0.19.0"]) {
     assert.doesNotMatch(result.stderr, /portless_proxy_outdated/);
   });
 }
+
+test(
+  "keeps an older proxy with a space in its CLI path",
+  { skip: psSkip },
+  (t) => {
+    const dir = fixture(
+      t,
+      [{ name: "web", dev: "portless run --prefix=", installed: true }],
+      "portless preflight-",
+    );
+    startProxy(t, dir, "0.15.8");
+    const result = run(dir);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.calls, [
+      { args: ["proxy", "start"], cwd: join(dir, "apps", "web") },
+    ]);
+    assert.doesNotMatch(result.stderr, /portless_proxy_outdated/);
+  },
+);
 
 test("ignores a recorded PID of a process that is not portless", (t) => {
   const dir = fixture(t, [
@@ -280,9 +312,8 @@ test(
     skip: psSkip,
   },
   (t) => {
-    const dir = fixture(t, [
-      { name: "web", dev: "portless run --prefix=", installed: true },
-    ]);
+    const dir = versionedProxyFixture(t);
+    if (dir === null) return;
     startProxy(t, dir, "0.15.8");
     const result = run(dir, { FAKE_PORTLESS_STOP_STATUS: "4" });
     assert.equal(result.status, 4);

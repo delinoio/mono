@@ -108,6 +108,14 @@ The control plane serves every public service at `https://tide.api.delino.io`. E
 
 Use `resources` to replace all resource values. Use `resources.vcpu_count`, `resources.memory_mib` or `resources.disk_gib` to change individual values. The server keeps the current value of each omitted resource and validates the resulting profile.
 
+When the OwnSand link is `ACTIVE`, `CreateRunnerProfile` checks template sources. `UpdateRunnerProfile` checks a template source when the template ID changes or the mask includes `guest_os`. A missing or `INVALID` link skips this check. If the check fails, the RPC saves no profile changes.
+
+- OwnSand `not_found` or a guest OS mismatch returns `invalid_argument`.
+- OwnSand `unauthenticated` or `permission_denied` returns `failed_precondition` with `OwnSand rejected the organization's OwnSand API key`. Only `unauthenticated` marks the link `INVALID` if the rejected key is still the stored key.
+- OwnSand `resource_exhausted` returns `resource_exhausted` with the OwnSand message prefixed by `OwnSand: `.
+- OwnSand `unavailable` or `deadline_exceeded` returns `unavailable` with `OwnSand is unavailable; try again`.
+- Other OwnSand Connect errors return `internal` with `internal error`. Local request cancellation returns `canceled`.
+
 ### Agent integration messages
 
 `AgentIntegration` has `agent_integration_id`, `vendor`, `name`, a vendor settings `oneof` and the credential state: one `AgentCredentialState` (`AgentCredential`, `credential_set` and `credential_set_at`) for each credential of the vendor. Create and update requests carry the credentials in a vendor credentials `oneof`; `UpdateAgentIntegration` uses a field mask with the paths `name`, `settings` and `credentials`, and replaces only the non-empty credential fields. The settings and credentials per vendor:
@@ -126,8 +134,14 @@ Use `resources` to replace all resource values. Use `resources.vcpu_count`, `res
 - `ApiKey`: `api_key_id`, `name`, `display_prefix`, `state`, `created_at`, `expires_at` (absent when the key does not expire), `last_used_at` and `revoked_at`. `CreateApiKeyResponse` adds the `secret` field once.
 - `DevSession`: `dev_session_id` (the request ID), `runner_profile_id`, `owner_user_id`, `label`, `guest_os`, `workspace_path`, `state` (`RequestState`), `end_reason`, `queued_at`, `started_at`, `ended_at`, `runner_id` and `ownsand_device_id` when a runner serves it.
 - `ExecDevSessionRequest`: `organization_id`, `dev_session_id`, `exec_id`, `command` (argument array), `env` (string map), optional `working_directory` and optional `timeout`. `AttachDevSessionExecRequest`: `organization_id`, `dev_session_id`, `exec_id`, `stdout_offset` and `stderr_offset`.
-- `ExecDevSessionResponse` and `AttachDevSessionExecResponse` wrap one `DevSessionExecEvent`. `DevSessionExecEvent` is a `oneof` of `keepalive`, `started`, `output_truncated` (first available offsets), `stdout` and `stderr` (`offset` and `data`), `exited` (`oneof` of `exit_code` or `signal`, and `timed_out`), `failed` (`ExecFailureReason` and a message) and `sandbox_ended` (the OwnSand end reason as text). It copies the meaning of the OwnSand exec events and does not import OwnSand schemas.
-- `ReadDevSessionFileRequest`: `organization_id`, `dev_session_id`, `read_id`, `path` and `offset`; the stream carries chunks with `offset` and `data`, and a final message with `size_bytes`. `WriteDevSessionFileRequest`: `organization_id`, `dev_session_id`, `write_id`, `path`, `offset`, `data`, `mode` and `final`. Every chunk of a file uses the same `write_id`; the file appears at the path only after the `final` chunk, and the written chunks must then cover the whole file. The response returns the written range and, after the final chunk, `finished` and `size_bytes`.
+- `ExecDevSessionResponse` and `AttachDevSessionExecResponse` wrap one `DevSessionExecEvent`. `DevSessionExecEvent` is a `oneof` of `keepalive`, `started`, `output_truncated` (next offsets for both streams), `stdout` and `stderr` (`offset` and `data`), `exited` (`oneof` of `exit_code` or `signal`, and `timed_out`), `failed` (`ExecFailureReason` and a message) and `sandbox_ended` (the OwnSand end reason as text). It copies the meaning of the OwnSand exec events and does not import OwnSand schemas.
+- `ReadDevSessionFileRequest`: `organization_id`, `dev_session_id`, `read_id`, `path` and `offset`; the stream carries chunks with `offset` and `data`, and a final message with `size_bytes`. `WriteDevSessionFileRequest`: `organization_id`, `dev_session_id`, `write_id`, `path`, `offset`, `data`, `mode` and `final`. The RPC returns `invalid_argument` if `offset` is negative. Every chunk of a file uses the same `write_id`; the file appears at the path only after the `final` chunk, and the written chunks must then cover the whole file. The response returns the written range and, after the final chunk, `finished` and `size_bytes`.
+
+#### Dev session exec events
+
+The `started.start_time` and `exited.end_time` fields carry the guest's original timestamps with nanosecond precision. When `AttachDevSessionExec` replays a retained event, it returns the same timestamp, even after the command ends. If the guest timestamp is missing or invalid, the corresponding field is absent. The event still carries its other fields, including the exit status and timeout flag for `exited`. The Unix epoch is a valid timestamp and remains present.
+
+Each `output_truncated` event gives the next stdout and stderr offsets for resuming the exec. For each stream with missing bytes, the offset advances to the end of the missing range. The other stream keeps its current offset, based on the requested offset and any output already sent. `ExecDevSession` starts both offsets at zero. `AttachDevSessionExec` starts at the offsets in the request.
 
 ### Audit messages
 

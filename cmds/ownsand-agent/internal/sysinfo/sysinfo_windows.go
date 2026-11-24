@@ -42,5 +42,5 @@ func freeDiskBytes(dir string) (int64, error) {
 	if err := windows.GetDiskFreeSpaceEx(p, &free, &total, &totalFree); err != nil {
 		return 0, err
 	}
-	return int64(free), nil
+	return clampFreeBytes(free, 1), nil
 }

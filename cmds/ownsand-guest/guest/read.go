@@ -97,9 +97,8 @@ type readManager struct {
 	entries map[string]*readEntry
 	expired map[string]time.Time
 	// pending maps a read_id to the snapshot path whose removal failed. It is
-	// independent of expired: sweep retries the removal on every run until it
-	// succeeds or the file is already gone, also after the read_id left the
-	// expired memory. Guarded by mu.
+	// independent of expired. After the read entry is gone, each sweep retries
+	// the removal until it succeeds or the file is already gone. Guarded by mu.
 	pending   map[string]string
 	now       func() time.Time
 	retention time.Duration
@@ -224,10 +223,8 @@ func (m *readManager) begin(readID, path string) (*readEntry, error) {
 		e.open++
 		return e, nil
 	}
-	// A removal that failed for an earlier snapshot of this read_id is still
-	// pending once the expired memory ended. The new snapshot uses the same
-	// path, so settle the old removal first; otherwise a later retry would
-	// delete the live snapshot.
+	// The new snapshot uses the same path as an earlier failed or expired
+	// snapshot. Settle its pending removal before reusing the path.
 	if path, ok := m.pending[readID]; ok {
 		m.removeSnapshot(readID, path)
 		if _, ok := m.pending[readID]; ok {
@@ -306,31 +303,29 @@ func (m *readManager) end(readID string, e *readEntry) {
 }
 
 // prepare makes the snapshot and publishes the result. It publishes under
-// m.mu so that it is ordered against end(): a failure published after the
-// last call ended removes the entry here, and a failure published before it
-// is removed by end(). Either way a retry of the read_id snapshots again.
+// m.mu so that cleanup is recorded before the last call can forget the
+// failed entry. If the last call already ended, prepare forgets the entry.
 func (m *readManager) prepare(readID string, e *readEntry) {
 	defer m.wg.Done()
-	kind, size, err := m.makeSnapshot(e.path, e.snapshot)
-	if err != nil {
-		os.Remove(e.snapshot)
-	}
+	kind, size, created, err := m.makeSnapshot(e.path, e.snapshot)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	defer close(e.ready)
 	if err == nil && m.entries[readID] != e {
 		// Defense in depth: sweep skips an entry whose snapshot is still
 		// being prepared, so no path forgets the entry before this point.
-		// If one ever does, nothing tracks the file that makeSnapshot just
-		// created, and no later sweep could find it. Remove it here.
-		m.removeSnapshot(readID, e.snapshot)
+		// Treat a snapshot with no entry as a preparation failure.
 		err = errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "read expired")
 	}
 	if err != nil {
+		// makeSnapshot has closed its handles. Only remove a file that it
+		// created, and track a failed removal before publishing the error.
+		if created {
+			m.removeSnapshot(readID, e.snapshot)
+		}
 		e.err = err
 		// No call is left to receive the failure, and sweep keeps no
-		// failed entry: forget it so the next call for the read_id starts
-		// a new snapshot instead of returning this stale error.
+		// failed entry. Forget it so the next call can retry the read_id.
 		if e.open == 0 && m.entries[readID] == e {
 			delete(m.entries, readID)
 		}
@@ -348,52 +343,53 @@ func (m *readManager) prepare(readID string, e *readEntry) {
 	m.logger.Info("read snapshot ready", "read_id", readID, "kind", kind.String(), "size_bytes", size)
 }
 
-func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error) {
+// makeSnapshot reports whether it created dst, even if preparation failed.
+func (m *readManager) makeSnapshot(src, dst string) (kind SnapshotKind, size int64, created bool, err error) {
 	// statSource captures the identity of the file together with its size
 	// and modification time, so that the comparisons below detect a path
 	// that was swapped after this stat on every platform.
 	before, err := statSource(src)
 	if err != nil {
-		return 0, 0, fsError("read", err)
+		return 0, 0, false, fsError("read", err)
 	}
 	if !before.Mode().IsRegular() {
-		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "read: path is not a regular file")
+		return 0, 0, false, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "read: path is not a regular file")
 	}
 	if m.openHook != nil {
 		m.openHook()
 	}
 	in, err := openSource(src)
 	if err != nil {
-		return 0, 0, fsError("read", err)
+		return 0, 0, false, fsError("read", err)
 	}
 	defer in.Close()
 	// The pathname may have been swapped between the stat and the open, so
 	// the descriptor that is copied must itself be the validated file.
 	if inInfo, err := in.Stat(); err != nil || !inInfo.Mode().IsRegular() || !os.SameFile(before, inInfo) {
-		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
+		return 0, 0, false, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
 	// Check and create under mu, so that close cannot interleave: once close
 	// set the flag, no snapshot file is created.
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return 0, 0, errReadsClosed()
+		return 0, 0, false, errReadsClosed()
 	}
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	m.mu.Unlock()
 	if err != nil {
-		return 0, 0, fsError("read snapshot", err)
+		return 0, 0, false, fsError("read snapshot", err)
 	}
 	defer out.Close()
 	if !m.forceCopy && reflink(out, in) == nil {
 		st, err := out.Stat()
 		if err != nil {
-			return 0, 0, fsError("read snapshot", err)
+			return 0, 0, true, fsError("read snapshot", err)
 		}
 		if !sourceUnchanged(before, in, src) {
-			return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
+			return 0, 0, true, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 		}
-		return SnapshotKindReflink, st.Size(), nil
+		return SnapshotKindReflink, st.Size(), true, nil
 	}
 	// Copy in steps, so that close ends the copy and prepare removes the
 	// partial output before the lock of the state directory is released.
@@ -401,7 +397,7 @@ func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error)
 	for {
 		select {
 		case <-m.stop:
-			return 0, 0, errReadsClosed()
+			return 0, 0, true, errReadsClosed()
 		default:
 		}
 		c, err := io.CopyN(out, in, snapshotCopyChunk)
@@ -410,23 +406,23 @@ func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error)
 			break
 		}
 		if err != nil {
-			return 0, 0, fsError("read snapshot", err)
+			return 0, 0, true, fsError("read snapshot", err)
 		}
 	}
 	if m.copyHook != nil {
 		m.copyHook()
 	}
 	if !sourceUnchanged(before, in, src) {
-		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
+		return 0, 0, true, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
 	after := before
 	// The copied byte count must equal the stat size, except for a procfs
 	// file: it reports st_size 0 although a read returns bytes, so its
 	// snapshot size is the byte count of the copy.
 	if n != after.Size() && !(before.Size() == 0 && isProcfs(in)) {
-		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
+		return 0, 0, true, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
-	return SnapshotKindCopy, n, nil
+	return SnapshotKindCopy, n, true, nil
 }
 
 // sourceUnchanged reports whether both the open descriptor and the pathname
@@ -500,10 +496,8 @@ func (m *readManager) sweep(now time.Time) {
 		m.expired[id] = now
 		m.logger.Info("read expired", "read_id", id)
 	}
-	// Retry removals that failed earlier, whether or not the read_id is still
-	// in the expired memory. An id with a live entry cannot be pending (begin
-	// settles the removal first); skip it anyway, so that a retry can never
-	// delete the snapshot of an active or still prepared read.
+	// Retry removals that failed during expiry or preparation. Wait for the
+	// last caller of a failed read to release its entry before retrying.
 	for id, path := range m.pending {
 		if _, live := m.entries[id]; live {
 			continue

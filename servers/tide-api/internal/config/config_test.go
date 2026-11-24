@@ -99,6 +99,44 @@ func TestOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadCanonicalizesCORSOrigins(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		origins string
+		want    []string
+	}{
+		{
+			name:    "mixed origins",
+			origins: "HTTPS://Tide.Delino.io:443, http://Tide.Delino.io:80, https://tide.delino.io:8443, http://localhost:443, http://[0:0:0:0:0:0:0:1]:80, http://127.1:3000",
+			want: []string{
+				"https://tide.delino.io",
+				"http://tide.delino.io",
+				"https://tide.delino.io:8443",
+				"http://localhost:443",
+				"http://[::1]",
+				"http://127.0.0.1:3000",
+			},
+		},
+		{
+			name:    "alternate IP forms",
+			origins: "http://0x7f.1:3000, http://2130706433:3000, https://[0:0:0:0:0:0:0:1]:443",
+			want:    []string{"http://127.0.0.1:3000", "http://127.0.0.1:3000", "https://[::1]"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := baseEnv(t)
+			env[EnvCORSOrigins] = tc.origins
+			cfg, err := Load(lookup(env))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(cfg.CORSOrigins, tc.want) {
+				t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, tc.want)
+			}
+		})
+	}
+}
+
 func TestInvalid(t *testing.T) {
 	secretKey := testKey(t)
 	for _, tc := range []struct {
@@ -114,8 +152,14 @@ func TestInvalid(t *testing.T) {
 		{EnvRunMigrations, "maybe", EnvRunMigrations},
 		{EnvTrustProxyClientAddress, "yes please", EnvTrustProxyClientAddress},
 		{EnvAllowDirectClientAddress, "2", EnvAllowDirectClientAddress},
+		{EnvCORSOrigins, "https://u@tide.delino.io", EnvCORSOrigins},
+		{EnvCORSOrigins, "https://:443", EnvCORSOrigins},
+		{EnvCORSOrigins, "https://1.2.3.4.5", EnvCORSOrigins},
+		{EnvCORSOrigins, "https://tide.delino.io?", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://tide.delino.io/path", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://tide.delino.io#", EnvCORSOrigins},
+		{EnvCORSOrigins, "ftp://tide.delino.io", EnvCORSOrigins},
+		{EnvCORSOrigins, "http://[fe80::1%25eth0]", EnvCORSOrigins},
 		{EnvSecretKeys, "", EnvSecretKeys},
 		{EnvOwnSandAPIOrigin, "https://ownsand.example/api", EnvOwnSandAPIOrigin},
 		{EnvOwnSandAPIOrigin, "ftp://x", EnvOwnSandAPIOrigin},
@@ -134,6 +178,9 @@ func TestInvalid(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), secretKey) || (len(tc.value) > 20 && strings.Contains(err.Error(), secretKey[:20])) {
 			t.Errorf("%s=%q: error contains the key", tc.name, tc.value)
+		}
+		if tc.name == EnvCORSOrigins && strings.Contains(err.Error(), tc.value) {
+			t.Errorf("%s=%q: error contains the configured origin", tc.name, tc.value)
 		}
 	}
 }

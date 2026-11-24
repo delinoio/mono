@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
@@ -14,44 +14,31 @@ import {
   type Template,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { useState } from "react";
-import {
-  invalidateServices,
-  POLL_INTERVAL_MS,
-  snapshotSettling,
-} from "../api.ts";
+import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Empty,
+  ErrorNotice,
   FormDialog,
   PageHeader,
   QueryBoundary,
   ShortId,
+  isTerminalError,
   shortIdText,
   toastError,
 } from "../components/ui.tsx";
 import { formatBytes, formatTime, labels } from "../format.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
+import { useSnapshots, useTemplates } from "../snapshot-lists.ts";
 
 /** Route `snapshots`: snapshots, their export, and templates. */
 export function SnapshotsPage() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, SnapshotService);
-  const snapshots = useQuery(
-    SnapshotService.method.listSnapshots,
-    { organizationId, pageSize: 200 },
-    {
-      refetchInterval: (q) =>
-        q.state.data?.snapshots.some(snapshotSettling)
-          ? POLL_INTERVAL_MS
-          : false,
-    },
-  );
-  const templates = useQuery(SnapshotService.method.listTemplates, {
-    organizationId,
-    pageSize: 200,
-  });
+  const snapshots = useSnapshots(organizationId, "management");
+  const templates = useTemplates(organizationId, "management");
   const exportSnapshot = useMutation(SnapshotService.method.exportSnapshot, {
     onSuccess: refresh,
   });
@@ -69,21 +56,33 @@ export function SnapshotsPage() {
   const [deletingSnapshot, setDeletingSnapshot] = useState<Snapshot>();
   const [deletingTemplate, setDeletingTemplate] = useState<Template>();
 
+  // An open action belongs to its list. Discard it when access to that list ends.
+  if (isTerminalError(snapshots.boundary.error)) {
+    if (templateFrom) {
+      setTemplateFrom(undefined);
+      setTemplateName("");
+    }
+    if (deletingSnapshot) setDeletingSnapshot(undefined);
+  }
+  if (deletingTemplate && isTerminalError(templates.boundary.error)) {
+    setDeletingTemplate(undefined);
+  }
+
   return (
     <>
       <PageHeader
         title="Snapshots"
         description="Snapshots stay on their device. Export one to use it on other devices with the same OS and architecture."
       />
-      <QueryBoundary query={snapshots} loading="Loading snapshots">
-        {(data) =>
-          data.snapshots.length === 0 ? (
+      <QueryBoundary query={snapshots.boundary} loading="Loading snapshots">
+        {() =>
+          snapshots.rows.length === 0 ? (
             <Empty title="No snapshots">
               Take a snapshot from a running or paused sandbox.
             </Empty>
           ) : (
             <ul className="list" aria-label="Snapshots">
-              {data.snapshots.map((s) => {
+              {snapshots.rows.map((s) => {
                 const exportable =
                   s.state === SnapshotState.READY &&
                   (s.exportState === SnapshotExportState.NOT_EXPORTED ||
@@ -158,17 +157,18 @@ export function SnapshotsPage() {
           )
         }
       </QueryBoundary>
+      <ShowMore noun="snapshots" list={snapshots} />
       <section className="section" aria-labelledby="templates-title">
         <h2 id="templates-title">Templates</h2>
-        <QueryBoundary query={templates} loading="Loading templates">
-          {(data) =>
-            data.templates.length === 0 ? (
+        <QueryBoundary query={templates.boundary} loading="Loading templates">
+          {() =>
+            templates.rows.length === 0 ? (
               <Empty title="No templates">
                 A template gives a snapshot a name to create sandboxes from.
               </Empty>
             ) : (
               <ul className="list" aria-label="Templates">
-                {data.templates.map((t) => (
+                {templates.rows.map((t) => (
                   <li key={t.templateId} className="list-row">
                     <div className="list-main">
                       <span className="list-title">{t.name}</span>
@@ -191,6 +191,7 @@ export function SnapshotsPage() {
             )
           }
         </QueryBoundary>
+        <ShowMore noun="templates" list={templates} />
       </section>
       <FormDialog
         open={templateFrom !== undefined}
@@ -250,6 +251,36 @@ export function SnapshotsPage() {
           })
         }
       />
+    </>
+  );
+}
+
+function ShowMore({
+  noun,
+  list,
+}: {
+  noun: "snapshots" | "templates";
+  list: ReturnType<typeof useSnapshots> | ReturnType<typeof useTemplates>;
+}) {
+  const { boundary, pages, fetchNextPage } = list;
+  if (!pages.isIncomplete || isTerminalError(boundary.error)) return null;
+
+  return (
+    <>
+      {pages.loadMoreError && !pages.isLoadingMore ? (
+        <ErrorNotice
+          error={pages.loadMoreError}
+          onRetry={pages.retryLoadMore}
+        />
+      ) : null}
+      <Button
+        variant={ButtonVariant.Secondary}
+        aria-label={`Show more ${noun}`}
+        disabled={boundary.isFetching}
+        onClick={() => void fetchNextPage({ cancelRefetch: false })}
+      >
+        Show more
+      </Button>
     </>
   );
 }

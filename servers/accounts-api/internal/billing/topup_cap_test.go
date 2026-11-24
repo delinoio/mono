@@ -3,6 +3,7 @@
 package billing
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -41,7 +42,80 @@ func (f *fixture) monthToDate(acct string, at time.Time) int64 {
 	return mtd
 }
 
-func TestAutoTopUpClaimedInTheNextMonthCountsInTheClaimMonth(t *testing.T) {
+const (
+	lockCapAccount = `SELECT pg_backend_pid() FROM billing_accounts WHERE billing_account_id = $1 FOR UPDATE`
+	lockCapTopUp   = `SELECT pg_backend_pid() FROM top_ups WHERE billing_account_id = $1 AND status = 'pending' FOR UPDATE`
+)
+
+func (f *fixture) claimAfterMonthRollover(acct, lockQuery string) {
+	f.t.Helper()
+	ctx, cancel := context.WithTimeout(ctx(), 15*time.Second)
+	defer cancel()
+	tx, err := f.db.Pool.Begin(ctx)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	var holderPID int
+	if err := tx.QueryRow(ctx, lockQuery, acct).Scan(&holderPID); err != nil {
+		f.t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- f.s.ProcessAutoTopUps(ctx) }()
+
+	// Advance the clock only after Postgres confirms the claim is blocked.
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		var waiting bool
+		if err := f.db.Pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+				AND $1 = ANY(pg_blocking_pids(pid)))`, holderPID).Scan(&waiting); err != nil {
+			f.t.Fatalf("observe the claim lock wait: %v", err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-done:
+			f.t.Fatalf("claim finished before waiting on the row lock: %v", err)
+		case <-ctx.Done():
+			f.t.Fatal("claim did not wait on the row lock")
+		case <-poll.C:
+		}
+	}
+
+	f.clock.Set(afterMonthEnd)
+	if err := tx.Commit(ctx); err != nil {
+		f.t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			f.t.Fatal(err)
+		}
+	case <-ctx.Done():
+		f.t.Fatal("claim did not finish after releasing the row lock")
+	}
+}
+
+func TestAutoTopUpClaimUsesMonthAfterLocks(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{"billing account", lockCapAccount},
+		{"pending top-up", lockCapTopUp},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testAutoTopUpClaimUsesMonthAfterLock(t, tc.query)
+		})
+	}
+}
+
+func testAutoTopUpClaimUsesMonthAfterLock(t *testing.T, lockQuery string) {
+	t.Helper()
 	f, acct := capFixture(t)
 	if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
 		t.Fatal("no top-up queued")
@@ -51,9 +125,14 @@ func TestAutoTopUpClaimedInTheNextMonthCountsInTheClaimMonth(t *testing.T) {
 		t.Fatalf("December month to date after queueing = %d", got)
 	}
 
-	f.clock.Set(afterMonthEnd)
-	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+	f.claimAfterMonthRollover(acct, lockQuery)
+	var createTime, capTime time.Time
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT create_time, cap_time FROM top_ups WHERE billing_account_id = $1`, acct).
+		Scan(&createTime, &capTime); err != nil {
 		t.Fatal(err)
+	}
+	if !createTime.Equal(beforeMonthEnd) || !capTime.Equal(afterMonthEnd) {
+		t.Fatalf("create_time = %v, cap_time = %v, want %v and %v", createTime, capTime, beforeMonthEnd, afterMonthEnd)
 	}
 	charges := f.paddle.Charges()
 	if len(charges) != 1 || paddletest.ChargeAmountCents(charges[0]) != "2500" {
@@ -74,14 +153,6 @@ func TestAutoTopUpClaimedInTheNextMonthCountsInTheClaimMonth(t *testing.T) {
 	}
 	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "completed" {
 		t.Fatalf("top-ups = %v", got)
-	}
-	// The row keeps its queue time as history.
-	var createTime time.Time
-	if err := f.db.Pool.QueryRow(ctx(), `SELECT create_time FROM top_ups WHERE billing_account_id = $1`, acct).Scan(&createTime); err != nil {
-		t.Fatal(err)
-	}
-	if !createTime.Equal(beforeMonthEnd) {
-		t.Fatalf("create_time = %v, want the queue time %v", createTime, beforeMonthEnd)
 	}
 }
 
@@ -140,18 +211,31 @@ func TestPendingAutoTopUpFailsWhenTheClaimMonthCapIsUsed(t *testing.T) {
 		acct, 25*usd, claimedBefore); err != nil {
 		t.Fatal(err)
 	}
-	f.clock.Set(afterMonthEnd)
-	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+	if _, err := f.db.Pool.Exec(ctx(), `UPDATE credit_settings SET auto_top_up_consecutive_failures = 1 WHERE billing_account_id = $1`, acct); err != nil {
 		t.Fatal(err)
 	}
+	f.claimAfterMonthRollover(acct, lockCapAccount)
 	if charges := f.paddle.Charges(); len(charges) != 0 {
 		t.Fatalf("an obsolete top-up called Paddle: %+v", charges)
 	}
 	if got := f.topUpStatuses(acct); len(got) != 2 || got[0] != "failed:settings_changed" || got[1] != "completed" {
 		t.Fatalf("top-ups = %v", got)
 	}
-	if st, _ := loadSettings(ctx(), f.db.Pool, acct); !st.AutoEnabled || st.ConsecutiveFailures != 0 {
-		t.Fatalf("the obsolete top-up counted as a failure: %+v", st)
+	st, err := loadSettings(ctx(), f.db.Pool, acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.AutoEnabled || st.ConsecutiveFailures != 1 {
+		t.Fatalf("the obsolete top-up changed the failure count or disabled automatic top-ups: %+v", st)
+	}
+	var notifications int
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT count(*) FROM billing_notifications
+		WHERE billing_account_id = $1 AND kind IN ($2, $3)`, acct, NotifyPaymentFailed, NotifyAutoTopUpDisabled).
+		Scan(&notifications); err != nil {
+		t.Fatal(err)
+	}
+	if notifications != 0 {
+		t.Fatalf("the obsolete top-up queued %d failure notifications", notifications)
 	}
 	// Only the completed January top-up counts in January.
 	if got := f.monthToDate(acct, afterMonthEnd); got != 25*usd {
