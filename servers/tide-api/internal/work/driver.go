@@ -510,9 +510,18 @@ func (e *Engine) removeSandbox(ctx context.Context, client ownsandclient.Client,
 			return true
 		}
 	}
-	if _, err := client.DeleteSandbox(ctx, id); err != nil && !isCode(err, connect.CodeNotFound) {
-		e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
-		return false
+	if _, err := client.DeleteSandbox(ctx, id); err != nil {
+		switch code := connect.CodeOf(err); code {
+		case connect.CodeNotFound:
+			return true
+		case connect.CodeUnauthenticated:
+			e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_skipped", slog.String("runner_id", r.ID),
+				slog.String("organization_id", r.OrganizationID), slog.String("sandbox_id", id),
+				slog.String("code", code.String()), slog.String("cleanup", "idle_ttl"))
+		default:
+			e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+			return false
+		}
 	}
 	return true
 }

@@ -13,6 +13,20 @@ import (
 	"connectrpc.com/connect"
 )
 
+// CredentialError reports a terminal TokenSource failure or an empty token.
+// The SDK wraps it in a *connect.Error with the code unauthenticated.
+type CredentialError struct{ err error }
+
+func (e *CredentialError) Error() string {
+	if e.err == nil {
+		return "tide: token source returned an empty token"
+	}
+	return "tide: token source: " + e.err.Error()
+}
+
+// Unwrap returns the error from the token source, if any.
+func (e *CredentialError) Unwrap() error { return e.err }
+
 // PathSize is a local or guest path with its size in bytes.
 type PathSize struct {
 	Path string

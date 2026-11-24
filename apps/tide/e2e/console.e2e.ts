@@ -167,6 +167,58 @@ describe("organization layout", () => {
   });
 });
 
+describe("organization member pagination", () => {
+  test("keeps loaded members visible and transfers ownership to a member from the next page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${ACME}/members`);
+    await expect(
+      screen.getByText("Some members are not shown yet."),
+    ).toBeVisible();
+    await expect(screen.getByText("Mina Kim", { exact: false })).toBeVisible();
+
+    await screen.getByRole("link", "Settings").tap();
+    await expect(
+      screen.getByText("Some members are not shown yet."),
+    ).toBeVisible();
+    await screen.getByRole("button", "Try again").tap();
+
+    const picker = screen.getByRole("combobox", "New owner");
+    await picker.tap();
+    await expect(screen.getByRole("option", "Mina Kim")).toBeHidden();
+    await screen.getByRole("option", "Nora Lee").tap();
+    await screen.getByRole("button", "Transfer").tap();
+    await expect(
+      screen.getByRole("alertdialog", "Make Nora Lee the owner?"),
+    ).toBeVisible();
+    await screen.getByRole("button", "Transfer ownership").tap();
+    await expect(
+      screen.getByRole("heading", "Transfer ownership"),
+    ).toBeHidden();
+
+    await screen.getByRole("link", "Members").tap();
+    await expect(browser).toHaveURL(`/orgs/${ACME}/members`);
+    await expect(screen.getByText("Nora Lee")).toBeVisible();
+    const role = await browser.evaluate(
+      () =>
+        Array.from(
+          document.querySelectorAll('[aria-label="Members"] .list-row'),
+        )
+          .find(
+            (row) =>
+              row.querySelector(".list-title")?.textContent === "Nora Lee",
+          )
+          ?.querySelector(".role")?.textContent ?? null,
+    );
+    expect(role).toBe("Owner");
+  });
+});
+
 describe("overview", () => {
   test("shows the live queue and the device pool", async ({
     app,
@@ -218,6 +270,55 @@ describe("overview", () => {
     await expect(
       screen.getByRole("link", "Go to integrations"),
     ).toHaveAttribute("href", `/orgs/${NORTHWIND}/integrations`);
+  });
+});
+
+describe("audit", () => {
+  test("shows the newest event first", async ({ app, browser, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/audit`);
+
+    await expect(screen.getByRole("table", "Audit events")).toBeVisible();
+    const actions = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          'table[aria-label="Audit events"] tbody td:nth-child(2)',
+        ),
+        (cell) => cell.textContent,
+      ),
+    );
+    expect(actions).toEqual(["Dev session created", "OwnSand link set"]);
+  });
+});
+
+describe("requests", () => {
+  test("shows active requests in queue order before ended requests", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/requests`);
+
+    await screen.getByRole("checkbox", "Show ended requests").tap();
+    await expect(screen.getByRole("table", "Requests")).toContainText("deploy");
+    const sources = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          'table[aria-label="Requests"] tbody td:nth-child(4)',
+        ),
+        (cell) => cell.textContent,
+      ),
+    );
+    expect(sources).toEqual([
+      "acme-robotics/firmware · build (ubuntu)",
+      "acme-robotics/firmware · test (ubuntu)",
+      "sess_codex_4711",
+      "—",
+      "acme-robotics/site · deploy",
+    ]);
   });
 });
 
