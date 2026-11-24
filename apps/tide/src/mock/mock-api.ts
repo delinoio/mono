@@ -229,6 +229,28 @@ function profile(
   return p;
 }
 
+/** Give a seeded organization an installation beyond the first full page. */
+function seedMoreGitHubInstallations(
+  org: OrgState,
+  accountPrefix: string,
+  firstGitHubId: bigint,
+) {
+  for (let row = 2; row <= 201; row++) {
+    org.installations.push(
+      create(GitHubInstallationSchema, {
+        installationId: uuidV7(),
+        organizationId: org.organization.organizationId,
+        githubInstallationId: firstGitHubId + BigInt(row),
+        githubAccountLogin: `${accountPrefix}-${row}`,
+        state: GitHubInstallationState.ACTIVE,
+        githubRunnerGroupId: 1n,
+        runnerGroupName: "Default",
+        createTime: ts(-9 * 86400),
+      }),
+    );
+  }
+}
+
 function seed(userId: string): Map<string, OrgState> {
   const orgs = new Map<string, OrgState>();
 
@@ -263,6 +285,7 @@ function seed(userId: string): Map<string, OrgState> {
       createTime: ts(-9 * 86400),
     }),
   );
+  seedMoreGitHubInstallations(acme, "acme-robotics", 42_000_000n);
   acme.integrations.push(
     create(AgentIntegrationSchema, {
       agentIntegrationId: MOCK_IDS.codexIntegration,
@@ -615,6 +638,7 @@ function seed(userId: string): Map<string, OrgState> {
       createTime: ts(-40 * 86400),
     }),
   );
+  seedMoreGitHubInstallations(northwind, "northwind", 43_000_000n);
   orgs.set(MOCK_IDS.northwind, northwind);
 
   const contoso = emptyOrg(MOCK_IDS.contoso, "Contoso");

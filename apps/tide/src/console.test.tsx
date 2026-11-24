@@ -8,10 +8,17 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { createClient, type Transport } from "@connectrpc/connect";
+import {
+  Code,
+  ConnectError,
+  createClient,
+  createRouterTransport,
+  type Transport,
+} from "@connectrpc/connect";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
+import { GitHubService } from "@delino/tide-protos/v1/github_pb";
 import { QueryClient } from "@tanstack/react-query";
-import { PAGE_SIZE } from "./api.ts";
+import { MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode } from "./config.ts";
@@ -274,6 +281,89 @@ describe("integrations", () => {
       externalNavigation.assign = original;
     }
   });
+
+  for (const empty of [false, true]) {
+    test(`retries a failed GitHub continuation with ${empty ? "an empty" : "an overlapping"} final page`, async () => {
+      const mock = createMockTransport();
+      const gitHub = createClient(GitHubService, mock);
+      const input = {
+        organizationId: MOCK_IDS.acme,
+        pageSize: MAX_PAGE_SIZE,
+      };
+      const first = await gitHub.listGitHubInstallations(input);
+      const last = await gitHub.listGitHubInstallations({
+        ...input,
+        pageToken: first.nextPageToken,
+      });
+      const requests: { organizationId: string; pageToken: string }[] = [];
+      const nextPageToken = "github-installations-cursor";
+      const pages = createRouterTransport((router) => {
+        router.service(GitHubService, {
+          listGitHubInstallations(req) {
+            requests.push(req);
+            if (req.pageToken === "") return { ...first, nextPageToken };
+            if (requests.length === 2) {
+              throw new ConnectError(
+                "Cannot load installations",
+                Code.Internal,
+              );
+            }
+            return {
+              installations: empty
+                ? []
+                : [...first.installations.slice(-1), ...last.installations],
+            };
+          },
+        });
+      });
+      const transport: Transport = {
+        ...mock,
+        unary: (method, ...rest) =>
+          (method.name === "ListGitHubInstallations" ? pages : mock).unary(
+            method,
+            ...rest,
+          ),
+      };
+      renderConsole(`/orgs/${MOCK_IDS.globex}/integrations`, { transport });
+
+      const rows = () =>
+        within(
+          screen.getByRole("list", { name: "GitHub installations" }),
+        ).getAllByRole("listitem");
+      await click(await screen.findByRole("button", { name: "Show more" }));
+      expect(
+        await screen.findByText("Something went wrong. Try again."),
+      ).toBeTruthy();
+      expect(rows()).toHaveLength(200);
+
+      await click(screen.getByRole("button", { name: "Try again" }));
+      expect(screen.queryByText("Something went wrong. Try again.")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+      const loaded = rows();
+      expect(loaded).toHaveLength(empty ? 200 : 201);
+      expect(loaded[0]?.textContent).toContain("acme-robotics · Active");
+      expect(loaded[199]?.textContent).toContain("acme-robotics-200 · Active");
+      if (!empty) {
+        const later = within(loaded[200]!);
+        expect(later.getByText("acme-robotics-201 · Active")).toBeTruthy();
+        expect(later.getByRole("button", { name: "Unlink" })).toBeTruthy();
+        expect(
+          later.getByRole("button", { name: "Change runner group" }),
+        ).toBeTruthy();
+      }
+      expect(
+        requests.map(({ organizationId, pageToken }) => [
+          organizationId,
+          pageToken,
+        ]),
+      ).toEqual([
+        [MOCK_IDS.globex, ""],
+        [MOCK_IDS.globex, nextPageToken],
+        [MOCK_IDS.globex, nextPageToken],
+      ]);
+    });
+  }
 });
 
 describe("GitHub setup callback", () => {

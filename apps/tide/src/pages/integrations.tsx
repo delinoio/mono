@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "@bufbuild/protobuf";
 import { FieldMaskSchema } from "@bufbuild/protobuf/wkt";
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+} from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { BadgeVariant } from "delino-ui/badge";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
@@ -234,17 +238,26 @@ function GitHubSection({ admin }: { admin: boolean }) {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, GitHubService);
-  const list = useQuery(GitHubService.method.listGitHubInstallations, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const list = useInfiniteQuery(
+    GitHubService.method.listGitHubInstallations,
+    { organizationId, pageSize: MAX_PAGE_SIZE, pageToken: "" },
+    {
+      pageParamKey: "pageToken",
+      getNextPageParam: (page) => page.nextPageToken || undefined,
+    },
+  );
   const installUrl = useMutation(GitHubService.method.createGitHubInstallUrl);
   const unlink = useMutation(GitHubService.method.unlinkGitHubInstallation, {
     onSuccess: refresh,
   });
   const [unlinking, setUnlinking] = useState<GitHubInstallation>();
   const [grouping, setGrouping] = useState<GitHubInstallation>();
-  const installations = list.data?.installations ?? [];
+  const installations = new Map<string, GitHubInstallation>();
+  for (const page of list.data?.pages ?? []) {
+    for (const installation of page.installations) {
+      installations.set(installation.installationId, installation);
+    }
+  }
 
   const connect = async () => {
     try {
@@ -276,9 +289,9 @@ function GitHubSection({ admin }: { admin: boolean }) {
       </p>
       {list.isPending ? (
         <Loading label="Loading GitHub installations" />
-      ) : list.error ? (
+      ) : list.error && !list.isFetchNextPageError ? (
         <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : installations.length === 0 ? (
+      ) : installations.size === 0 ? (
         <Empty title="No GitHub organization is connected">
           {admin
             ? "Connect GitHub to run GitHub Actions jobs, or create an agent integration below."
@@ -286,7 +299,7 @@ function GitHubSection({ admin }: { admin: boolean }) {
         </Empty>
       ) : (
         <ul className="list" aria-label="GitHub installations">
-          {installations.map((i) => (
+          {Array.from(installations.values(), (i) => (
             <li key={i.installationId} className="list-row">
               <div className="list-main">
                 <span className="list-title">
@@ -322,6 +335,16 @@ function GitHubSection({ admin }: { admin: boolean }) {
           ))}
         </ul>
       )}
+      {list.isFetchNextPageError ? <ErrorNotice error={list.error} /> : null}
+      {list.hasNextPage ? (
+        <Button
+          variant={ButtonVariant.Secondary}
+          disabled={list.isFetching}
+          onClick={() => void list.fetchNextPage({ cancelRefetch: false })}
+        >
+          {list.isFetchNextPageError ? "Try again" : "Show more"}
+        </Button>
+      ) : null}
       {grouping !== undefined ? (
         <RunnerGroupDialog
           installation={grouping}
