@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -94,10 +95,10 @@ func TestLogCapture(t *testing.T) {
 	}
 }
 
-// TestBinaryWithProcessRuntime runs the built agent and guest helper
-// binaries with the process test runtime, configured only through
-// environment variables, against the fake control plane.
-func TestBinaryWithProcessRuntime(t *testing.T) {
+const binaryAgentTimeout = 20 * time.Second
+
+func buildProcessRuntimeBinaries(t *testing.T) string {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("builds binaries")
 	}
@@ -107,65 +108,154 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 			t.Fatalf("build %s: %v\n%s", pkg, err, out)
 		}
 	}
-	cp := testcp.New(t)
-	// Inherited OWNSAND_AGENT_* variables must not reach either subprocess:
-	// an invalid value would fail enroll and run in config.FromEnv, and a
-	// valid OWNSAND_AGENT_API_URL takes precedence over the stored URL.
-	env := append(withoutAgentEnv(os.Environ()),
-		"OWNSAND_AGENT_STATE_DIR="+t.TempDir(),
+	return bin
+}
+
+func processRuntimeEnv(stateDir, guestBinary string) []string {
+	// Inherited OWNSAND_AGENT_* variables could fail configuration
+	// validation or replace the enrolled control plane URL.
+	return append(withoutAgentEnv(os.Environ()),
+		"OWNSAND_AGENT_STATE_DIR="+stateDir,
 		"OWNSAND_AGENT_RUNTIME=process",
-		"OWNSAND_AGENT_GUEST_BINARY="+filepath.Join(bin, "ownsand-guest"),
+		"OWNSAND_AGENT_GUEST_BINARY="+guestBinary,
 		"NO_COLOR=1",
 	)
+}
+
+func enrollProcessRuntimeAgent(t *testing.T, bin string, cp *testcp.Server, env []string) {
+	t.Helper()
 	enroll := exec.Command(filepath.Join(bin, "ownsand-agent"), "enroll", "--api-url", cp.URL)
 	enroll.Env = env
 	enroll.Stdin = strings.NewReader(testcp.Token)
 	if out, err := enroll.CombinedOutput(); err != nil {
 		t.Fatalf("enroll: %v\n%s", err, out)
 	}
+}
+
+type processRuntimeAgent struct {
+	cmd    *exec.Cmd
+	logs   *logBuffer
+	exited chan struct{}
+	err    error // Set before exited is closed.
+}
+
+func startProcessRuntimeAgent(t *testing.T, bin string, env []string) *processRuntimeAgent {
+	t.Helper()
 	run := exec.Command(filepath.Join(bin, "ownsand-agent"), "run")
 	run.Env = env
-	logs := &logBuffer{}
-	run.Stderr = logs
+	agent := &processRuntimeAgent{cmd: run, logs: &logBuffer{}, exited: make(chan struct{})}
+	run.Stderr = agent.logs
 	if err := run.Start(); err != nil {
 		t.Fatal(err)
 	}
-	// One goroutine reaps the child as soon as it exits, so the child is
-	// reaped on every path: the normal SIGTERM shutdown below and any early
-	// t.Fatalf. exitErr is valid once exited is closed.
-	exited := make(chan struct{})
-	var exitErr error
 	go func() {
-		exitErr = run.Wait()
-		close(exited)
+		agent.err = run.Wait()
+		close(agent.exited)
 	}()
 	t.Cleanup(func() {
-		// Killing an already exited child is a harmless no-op.
 		_ = run.Process.Kill()
 		select {
-		case <-exited:
-		case <-time.After(20 * time.Second):
-			t.Error("agent child was not reaped after kill")
+		case <-agent.exited:
+		case <-time.After(binaryAgentTimeout):
+			t.Error("agent child wait did not finish after kill")
 		}
 	})
-	if env, _ := cp.WaitFor(20*time.Second, 0, func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil }); env == nil {
-		t.Fatalf("no state report\n%s", logs.String())
+	return agent
+}
+
+func (a *processRuntimeAgent) wait(t *testing.T, deadline time.Time) error {
+	t.Helper()
+	select {
+	case <-a.exited:
+		return a.err
+	case <-time.After(time.Until(deadline)):
+		t.Fatalf("agent wait with captured stderr did not finish\n%s", a.logs.String())
+		return nil
 	}
-	id, _ := uuidv7.NewString()
+}
+
+func stopBinaryAgent(t *testing.T, agent *processRuntimeAgent) {
+	t.Helper()
+	if err := agent.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.wait(t, time.Now().Add(binaryAgentTimeout)); err != nil {
+		t.Fatalf("agent exit after SIGTERM: %v\n%s", err, agent.logs.String())
+	}
+}
+
+func (a *processRuntimeAgent) waitForReport(t *testing.T, cp *testcp.Server, from int) *ownsandv1.StateReport {
+	t.Helper()
+	env, _ := cp.WaitFor(binaryAgentTimeout, from, func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	if env == nil {
+		t.Fatalf("no state report\n%s", a.logs.String())
+	}
+	return env.GetStateReport()
+}
+
+func sendProcessRuntimeCreate(t *testing.T, cp *testcp.Server, id string) string {
+	t.Helper()
 	cmdID, _ := uuidv7.NewString()
 	now := time.Now()
 	// The process runtime runs only guests of the host OS.
 	guestOS, baseImage := processrt.HostGuest()
-	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: &ownsandv1.AgentCommand{CommandId: cmdID, Command: &ownsandv1.AgentCommand_CreateSandbox{CreateSandbox: &ownsandv1.CreateSandboxCommand{
+	if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: &ownsandv1.AgentCommand{CommandId: cmdID, Command: &ownsandv1.AgentCommand_CreateSandbox{CreateSandbox: &ownsandv1.CreateSandboxCommand{
 		SandboxId: id, Source: &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: baseImage},
 		Resources: &ownsandv1.Resources{VcpuCount: 1, MemoryMib: 128, DiskGib: 1}, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE,
 		GuestOs: guestOS, IdleTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(time.Hour),
 		CreateTime: timestamppb.New(now), MaxDeadline: timestamppb.New(now.Add(time.Hour)),
 		Limits: &ownsandv1.DeviceLimits{VcpuCount: 2, MemoryMib: 1024, DiskGib: 2, VcpuOvercommitPercent: 100},
-	}}}}})
+	}}}}}) {
+		t.Fatal("send create command: agent channel is closed")
+	}
+	return cmdID
+}
+
+func processRuntimeSocketDir(t *testing.T, sandboxDir string) string {
+	t.Helper()
+	record, err := os.ReadFile(filepath.Join(sandboxDir, "socket-dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := string(record)
+	if !filepath.IsAbs(dir) || !strings.HasPrefix(filepath.Base(dir), "osb-") {
+		t.Fatalf("unexpected recorded socket directory %q", dir)
+	}
+	return dir
+}
+
+func requireProcessRuntimePathsRemoved(t *testing.T, paths ...string) {
+	t.Helper()
+	for _, path := range paths {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("%s: want removed, got stat error %v", path, err)
+		}
+	}
+}
+
+// TestBinaryWithProcessRuntime runs the built agent and guest helper
+// binaries with the process test runtime, configured only through
+// environment variables, against the fake control plane.
+func TestBinaryWithProcessRuntime(t *testing.T) {
+	bin := buildProcessRuntimeBinaries(t)
+	cp := testcp.New(t)
+	stateDir := t.TempDir()
+	env := processRuntimeEnv(stateDir, filepath.Join(bin, "ownsand-guest"))
+	enrollProcessRuntimeAgent(t, bin, cp, env)
+	agent := startProcessRuntimeAgent(t, bin, env)
+	agent.waitForReport(t, cp, 0)
+	logs := agent.logs
+
+	id, _ := uuidv7.NewString()
+	cmdID := sendProcessRuntimeCreate(t, cp, id)
 	res := cp.CommandResult(30*time.Second, cmdID)
 	if res.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		t.Fatalf("create result %v\n%s", res, logs.String())
+	}
+	sandboxDir := filepath.Join(stateDir, "vms", id)
+	paths := []string{sandboxDir}
+	if runtime.GOOS == "darwin" {
+		paths = append(paths, processRuntimeSocketDir(t, sandboxDir))
 	}
 	// The data path is wired: an offer gets an SDP answer, and a relay
 	// grant is acknowledged and opens a relay connection.
@@ -216,15 +306,8 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 		t.Fatalf("no relay connection\n%s", logs.String())
 	}
 
-	run.Process.Signal(syscall.SIGTERM)
-	select {
-	case <-exited:
-		if exitErr != nil {
-			t.Fatalf("agent exit: %v\n%s", exitErr, logs.String())
-		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("agent did not stop on SIGTERM")
-	}
+	stopBinaryAgent(t, agent)
+	requireProcessRuntimePathsRemoved(t, paths...)
 	for _, secret := range []string{testcp.Token, "osd_"} {
 		if strings.Contains(logs.String(), secret) {
 			t.Fatalf("logs contain a secret prefix %q", secret)

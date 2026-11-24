@@ -326,7 +326,9 @@ export type UpdateRunnerProfileRequest = Message<"delino.tide.v1.UpdateRunnerPro
   /**
    * Paths of RunnerProfile to change. `workload_kind` and
    * `agent_integration_id` are rejected with `invalid_argument`. `source`
-   * changes the source oneof.
+   * changes the source oneof. `resources` replaces all resource values.
+   * `resources.vcpu_count`, `resources.memory_mib` and `resources.disk_gib`
+   * each change only the named value.
    *
    * @generated from field: google.protobuf.FieldMask update_mask = 4;
    */

@@ -35,13 +35,14 @@
 # loopback admin endpoint in the container's network namespace, so no port is
 # published) and discards the body. Each attempt first reads the container
 # state; a container that is exited, dead or restarting fails the script at
-# once, and so does a container that does not answer within 30 seconds. The
-# failure message names the state and points to `docker logs caddy`. The
-# reload path does not wait: the running process already answered and
-# `caddy reload` validates the new configuration itself.
+# once. The state reads, probes and retry delays share one 30-second
+# deadline. On timeout the failure message reports the last known state
+# and points to `docker logs caddy`. The reload path does not wait.
+# The running process already answered, and `caddy reload` validates the
+# new configuration itself.
 #
 # Environment (optional, for tests and slow hosts):
-#   START_CADDY_READY_TIMEOUT   seconds to wait for the admin API; default 30.
+#   START_CADDY_READY_TIMEOUT   whole decimal seconds to wait for the admin API; default 30.
 #   START_CADDY_READY_INTERVAL  seconds between attempts; default 1.
 #
 # A failing `docker pull`, `docker run`, `docker start` or `docker exec` fails
@@ -67,28 +68,50 @@ if [[ ! "$ready_timeout" =~ ^[0-9]+$ ]] || [[ ! "$ready_interval" =~ ^[0-9]+(\.[
   exit 2
 fi
 
-# Waits until the Caddy process of the `caddy` container answers its admin
-# API. Returns non-zero with a diagnostic when the container is not running
-# (exited, dead, restarting and so on) or does not answer before the deadline.
+# Linux exposes elapsed time in hundredths of a second, independent of
+# wall-clock adjustments.
+readiness_clock() {
+  local uptime
+  IFS=' ' read -r uptime _ < /proc/uptime
+  printf '%d\n' "$((10#${uptime%.*} * 100 + 10#${uptime#*.}))"
+}
+
+readiness_budget() {
+  remaining=$((deadline - $(readiness_clock)))
+  (( remaining > 0 ))
+}
+
+run_with_readiness_limit() {
+  local duration
+  printf -v duration '%d.%02ds' "$(($1 / 100))" "$(($1 % 100))"
+  shift
+  # Kill the process group at the limit so a client that ignores TERM
+  # cannot keep provisioning blocked past the deadline.
+  LC_ALL=C timeout --signal=KILL "$duration" "$@"
+}
+
+# Waits until the Caddy process of the caddy container answers its admin API.
 wait_ready() {
-  local deadline=$((SECONDS + ready_timeout))
-  local state attempts=0
-  # `timeout` bounds one attempt when `docker exec` itself hangs; `wget -T`
-  # bounds the HTTP request. Without `timeout` only the latter applies.
-  local -a bound=()
-  if command -v timeout > /dev/null 2>&1; then
-    bound=(timeout 10)
-  fi
-  while :; do
-    if ! state="$(docker inspect --format '{{.State.Status}}' caddy 2>&1)"; then
+  local deadline=$(( $(readiness_clock) + 10#$ready_timeout * 100 ))
+  local remaining probe_budget state last_state=unavailable attempts=0
+  while readiness_budget; do
+    if state="$(run_with_readiness_limit "$remaining" docker inspect --format '{{.State.Status}}' caddy 2>&1)"; then
+      last_state="$state"
+    elif readiness_budget; then
       echo "error: cannot read the state of the caddy container: $state" >&2
       echo "Run \`docker logs caddy\` and \`docker ps --all\` for details." >&2
       return 1
+    else
+      break
     fi
+
+    readiness_budget || break
     case "$state" in
       running)
         attempts=$((attempts + 1))
-        if "${bound[@]}" docker exec caddy wget -q -T 2 -O /dev/null http://127.0.0.1:2019/config/ > /dev/null 2>&1; then
+        probe_budget=$((remaining < 1000 ? remaining : 1000))
+        if { run_with_readiness_limit "$probe_budget" docker exec caddy wget -q -T 2 -O /dev/null http://127.0.0.1:2019/config/; } > /dev/null 2>&1 &&
+          readiness_budget; then
           return 0
         fi
         ;;
@@ -99,13 +122,16 @@ wait_ready() {
         return 1
         ;;
     esac
-    if (( SECONDS >= deadline )); then
-      echo "error: Caddy did not answer its admin API (http://127.0.0.1:2019/config/) within ${ready_timeout} seconds; the container state is $state after $attempts probe attempts." >&2
-      echo "Run \`docker logs caddy\` to see why Caddy is not ready." >&2
-      return 1
+
+    readiness_budget || break
+    if ! { run_with_readiness_limit "$remaining" sleep "$ready_interval"; } 2> /dev/null; then
+      break
     fi
-    sleep "$ready_interval"
   done
+
+  echo "error: Caddy did not answer its admin API (http://127.0.0.1:2019/config/) within ${ready_timeout} seconds; the container state is $last_state after $attempts probe attempts." >&2
+  echo "Run \`docker logs caddy\` to see why Caddy is not ready." >&2
+  return 1
 }
 
 # A missing container makes `docker inspect` fail, which leaves both values

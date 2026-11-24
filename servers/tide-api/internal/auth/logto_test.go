@@ -8,10 +8,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -312,5 +314,250 @@ func TestLogtoValidatorCallerCancelDoesNotAbortFetch(t *testing.T) {
 	}
 	if got := o.fetches.Load(); got != 1 {
 		t.Fatalf("fetches = %d, want 1", got)
+	}
+}
+
+const jwksTestWait = 2 * time.Second
+
+// logtoRefreshFixture warms one key and parks all subsequent key set requests.
+type logtoRefreshFixture struct {
+	v        *LogtoValidator
+	cached   string
+	newKey   string
+	elapsed  atomic.Int64
+	requests atomic.Int32
+	started  chan struct{}
+	release  func()
+}
+
+func newLogtoRefreshFixture(t *testing.T, fetchTimeout time.Duration) *logtoRefreshFixture {
+	t.Helper()
+	now := time.Now()
+	firstKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := tokenFactory{key: firstKey, kid: "k1", issuer: "https://tenant.logto.app/oidc"}
+	second := tokenFactory{key: secondKey, kid: "k2", issuer: first.issuer}
+	ready := make(chan struct{})
+	f := &logtoRefreshFixture{
+		cached:  first.sign(t, "at+jwt", outageClaims(first, now)),
+		newKey:  second.sign(t, "at+jwt", outageClaims(second, now)),
+		started: make(chan struct{}, 4),
+		release: sync.OnceFunc(func() { close(ready) }),
+	}
+	outage := &jwksOutage{f: first}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if f.requests.Add(1) > 1 {
+			select {
+			case f.started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-ready:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		outage.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(f.release)
+
+	f.v = NewLogtoValidator(LogtoConfig{
+		Issuer:   first.issuer,
+		Audience: "https://tide.api.delino.io",
+		JWKSURL:  server.URL,
+		Now:      func() time.Time { return now.Add(time.Duration(f.elapsed.Load())) },
+	})
+	f.v.fetchTimeout = fetchTimeout
+	f.wantUser(t, f.cached)
+	outage.extra.Store(&second)
+	return f
+}
+
+func (f *logtoRefreshFixture) wantUser(t *testing.T, token string) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		sub, err := f.v.Validate(context.Background(), token)
+		if err == nil && sub != "user-1" {
+			err = errors.New("unexpected subject " + sub)
+		}
+		done <- err
+	}()
+	if err := waitForLogtoResult(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *logtoRefreshFixture) waitForFetch(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.started:
+	case <-time.After(jwksTestWait):
+		t.Fatal("refresh did not reach the key set server")
+	}
+}
+
+func waitForLogtoResult(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(jwksTestWait):
+		t.Fatal("key lookup did not return")
+		return nil
+	}
+}
+
+func TestLogtoValidatorCachedKeyDuringRefresh(t *testing.T) {
+	t.Run("stale cache", func(t *testing.T) {
+		f := newLogtoRefreshFixture(t, jwksFetchTimeout)
+		f.elapsed.Store(int64(jwksRefreshInterval + jwksMinRefresh))
+		f.wantUser(t, f.cached)
+		f.waitForFetch(t)
+		f.wantUser(t, f.cached)
+
+		f.release()
+		f.wantUser(t, f.newKey)
+		if got := f.requests.Load(); got != 2 {
+			t.Fatalf("fetches = %d, want 2", got)
+		}
+	})
+
+	t.Run("fresh cache", func(t *testing.T) {
+		f := newLogtoRefreshFixture(t, jwksFetchTimeout)
+		f.elapsed.Store(int64(jwksMinRefresh))
+		done := make(chan error, 1)
+		go func() {
+			_, err := f.v.Validate(context.Background(), f.newKey)
+			done <- err
+		}()
+		f.waitForFetch(t)
+		f.wantUser(t, f.cached)
+
+		f.release()
+		if err := waitForLogtoResult(t, done); err != nil {
+			t.Fatal(err)
+		}
+		f.wantUser(t, f.newKey)
+		if got := f.requests.Load(); got != 2 {
+			t.Fatalf("fetches = %d, want 2", got)
+		}
+	})
+}
+
+// observedLogtoContext signals when a lookup begins to select on Done.
+type observedLogtoContext struct {
+	context.Context
+	waiting chan struct{}
+}
+
+func (c observedLogtoContext) Done() <-chan struct{} {
+	close(c.waiting)
+	return c.Context.Done()
+}
+
+func TestLogtoValidatorCanceledWaiters(t *testing.T) {
+	f := newLogtoRefreshFixture(t, jwksFetchTimeout)
+	f.elapsed.Store(int64(jwksMinRefresh))
+	owner := make(chan error, 1)
+	go func() {
+		_, err := f.v.Validate(context.Background(), f.newKey)
+		owner <- err
+	}()
+	f.waitForFetch(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	waiting := make(chan struct{})
+	waiter := make(chan error, 1)
+	go func() {
+		_, err := f.v.key(observedLogtoContext{Context: ctx, waiting: waiting}, "k2")
+		waiter <- err
+	}()
+	select {
+	case <-waiting:
+	case <-time.After(jwksTestWait):
+		t.Fatal("second caller did not reach the wait")
+	}
+	cancel()
+	if err := waitForLogtoResult(t, waiter); err != context.Canceled {
+		t.Fatalf("waiter error = %v, want context.Canceled", err)
+	}
+
+	// Advance beyond the cooldown while the first fetch is still parked.
+	// An already canceled request must neither join it nor change its timestamp.
+	f.elapsed.Add(int64(jwksMinRefresh))
+	go func() {
+		_, err := f.v.Validate(ctx, f.newKey)
+		waiter <- err
+	}()
+	if err := waitForLogtoResult(t, waiter); err != ErrInvalidToken {
+		t.Fatalf("already canceled caller: %v", err)
+	}
+	f.v.mu.Lock()
+	attemptedAt := f.v.attemptedAt
+	f.v.mu.Unlock()
+	if want := f.v.cfg.Now().Add(-jwksMinRefresh); !attemptedAt.Equal(want) {
+		t.Fatalf("canceled caller moved last attempt to %v, want %v", attemptedAt, want)
+	}
+
+	f.release()
+	if err := waitForLogtoResult(t, owner); err != nil {
+		t.Fatal(err)
+	}
+	f.wantUser(t, f.newKey)
+	if got := f.requests.Load(); got != 2 {
+		t.Fatalf("fetches = %d, want 2", got)
+	}
+}
+
+func TestLogtoValidatorHungFetchRespectsTimeoutAndCooldown(t *testing.T) {
+	f := newLogtoRefreshFixture(t, 300*time.Millisecond)
+	f.elapsed.Store(int64(jwksMinRefresh))
+	done := make(chan error, 1)
+	start := func() {
+		go func() {
+			_, err := f.v.key(context.Background(), "k2")
+			done <- err
+		}()
+		f.waitForFetch(t)
+	}
+	wantTimeout := func() {
+		if err := waitForLogtoResult(t, done); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("hung fetch error = %v, want context.DeadlineExceeded", err)
+		}
+	}
+
+	start()
+	f.wantUser(t, f.cached)
+	select {
+	case err := <-done:
+		t.Fatalf("uncached key returned before cached key: %v", err)
+	default:
+	}
+	wantTimeout()
+
+	if _, err := f.v.key(context.Background(), "k2"); err != errUnknownKeyID {
+		t.Fatalf("key lookup during cooldown: %v", err)
+	}
+	if got := f.requests.Load(); got != 2 {
+		t.Fatalf("fetches during cooldown = %d, want 2", got)
+	}
+
+	f.elapsed.Add(int64(jwksMinRefresh))
+	start()
+	wantTimeout()
+	if _, err := f.v.key(context.Background(), "k2"); err != errUnknownKeyID {
+		t.Fatalf("key lookup during second cooldown: %v", err)
+	}
+	if got := f.requests.Load(); got != 3 {
+		t.Fatalf("fetches after cooldown = %d, want 3", got)
 	}
 }

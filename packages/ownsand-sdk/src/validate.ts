@@ -20,6 +20,12 @@ export const MAX_LABEL_VALUE_SIZE = 255;
 
 const utf8 = new TextEncoder();
 
+function validateUtf8(field: string, value: string): void {
+  if (!value.isWellFormed()) {
+    throw new OwnSandValidationError(field, "must be valid UTF-8");
+  }
+}
+
 /** Checks `idle_ttl` and `max_ttl` in milliseconds. Both are required. */
 export function validateTtl(
   idleTtlMs: number | undefined,
@@ -66,14 +72,16 @@ export function validateTtl(
 
 /** Largest `vcpu_count`: the `int32` range of the protobuf field. */
 const MAX_VCPU_COUNT = 2n ** 31n - 1n;
-/** Largest `memory_mib` and `disk_gib`: the `int64` range of the protobuf fields. */
+/** Largest `memory_mib`: the `int64` range of the protobuf field. */
 const MAX_INT64 = 2n ** 63n - 1n;
+/** Largest disk size in GiB whose byte count fits in an `int64`, as in Go's `validate.MaxDiskGiB`. */
+const MAX_DISK_GIB = MAX_INT64 >> 30n;
 /** Longest protobuf Duration in seconds (`google.protobuf.Duration` range). */
 const MAX_DURATION_SECONDS = 315_576_000_000n;
 
 /**
  * Checks one resource value. The value must be a positive integer within the
- * range of its protobuf field. A number must be a safe integer, so a fraction,
+ * specified range. A number must be a safe integer, so a fraction,
  * NaN, an infinity and a number that has lost integer precision are rejected;
  * a bigint is compared with the range directly. The check never relies on
  * `BigInt()` throwing, and the error names the rule, never the value.
@@ -101,9 +109,9 @@ function validateResource(
 }
 
 /**
- * Checks sandbox resources: all three are required, positive integers within
- * the range of their protobuf fields (`int32` for `vcpu_count`, `int64` for
- * `memory_mib` and `disk_gib`).
+ * Checks that all three sandbox resources are positive integers. The maximum
+ * values are the `int32` maximum for `vcpu_count`, the `int64` maximum for
+ * `memory_mib`, and 8589934591 for `disk_gib`.
  */
 export function validateResources(
   resources:
@@ -119,7 +127,7 @@ export function validateResources(
   }
   validateResource("resources.vcpu_count", resources.vcpuCount, MAX_VCPU_COUNT);
   validateResource("resources.memory_mib", resources.memoryMib, MAX_INT64);
-  validateResource("resources.disk_gib", resources.diskGib, MAX_INT64);
+  validateResource("resources.disk_gib", resources.diskGib, MAX_DISK_GIB);
 }
 
 /** Checks sandbox labels. */
@@ -134,6 +142,8 @@ export function validateLabels(
     if (key === "") {
       throw new OwnSandValidationError("labels", "keys must not be empty");
     }
+    validateUtf8("labels", key);
+    validateUtf8("labels", value);
     if (utf8.encode(key).length > MAX_LABEL_KEY_SIZE) {
       throw new OwnSandValidationError(
         "labels",
@@ -178,6 +188,14 @@ export function validateExec(input: {
       "needs a program as its first element",
     );
   }
+  for (const argument of input.command) {
+    validateUtf8("command", argument);
+  }
+  for (const [key, value] of Object.entries(input.env ?? {})) {
+    validateUtf8("env", key);
+    validateUtf8("env", value);
+  }
+  validateUtf8("working_directory", input.workingDirectory ?? "");
   const size = toBinary(
     ExecRequestSchema,
     create(ExecRequestSchema, {
@@ -247,9 +265,7 @@ export function validateGuestPath(field: string, path: string): void {
   if (path === "") {
     throw new OwnSandValidationError(field, "is required");
   }
-  if (!path.isWellFormed()) {
-    throw new OwnSandValidationError(field, "must be valid UTF-8");
-  }
+  validateUtf8(field, path);
   const absolute = isAbsoluteGuestPath(path);
   if (!absolute) {
     throw new OwnSandValidationError(field, "must be an absolute guest path");

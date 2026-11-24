@@ -237,17 +237,17 @@ export function assertInsideRepository(cwd, name) {
   );
 }
 
-// Regular file whose resolved location is inside the repository. Gone-path
-// errors, including the symlinked-parent one, propagate to the callers.
-function regularFileInside(cwd, name) {
-  if (!lstatSync(resolve(cwd, name)).isFile()) return false;
-  assertInsideRepository(cwd, name);
-  return true;
+// Read the entry type without following a leaf symlink. For regular files,
+// also check for symlinked parents before the caller can select the file.
+function worktreeEntry(cwd, name) {
+  const stats = lstatSync(resolve(cwd, name));
+  if (stats.isFile()) assertInsideRepository(cwd, name);
+  return stats;
 }
 
 function isRegularFile(cwd, name, skipGone = true) {
   try {
-    return regularFileInside(cwd, name);
+    return worktreeEntry(cwd, name).isFile();
   } catch (error) {
     if (skipGone && goneCodes.has(error.code)) return false;
     throw error;
@@ -319,7 +319,7 @@ const ExclusionProbe = "\n\n\n";
 // is the single owner of those exclusions and only evaluates them for paths it
 // is given, so ask it through `--stdin-filepath`, which applies the same
 // matching to a path that does not exist on disk. A probe that cannot run
-// reports "not excluded", which keeps the missing-file failure in force.
+// reports "not excluded", which keeps the path failure in force.
 function excludedByRstack(cwd, name) {
   try {
     const output = execFileSync(
@@ -370,8 +370,7 @@ function stagedRegularFile(cwd, name) {
   }
   let stats;
   try {
-    stats = lstatSync(resolve(cwd, name));
-    if (stats.isFile()) assertInsideRepository(cwd, name);
+    stats = worktreeEntry(cwd, name);
   } catch (error) {
     if (!goneCodes.has(error.code)) throw error;
     if (excludedByRstack(cwd, name)) return false;
@@ -432,31 +431,31 @@ export const NonUtf8Policy = Object.freeze({
   Defer: "defer",
 });
 
-// What an explicit comparison does with a formattable index path whose
-// working-tree entry is gone (see `GoneCode`). `Fail` is the formatter
-// behavior: a path that the shared Rstack exclusions skip is skipped, any other
-// path rethrows the original `lstat` error. `Defer` selects the path without
-// probing, for the CI planner, for the same reason as `NonUtf8Policy.Defer`:
-// the planner cannot evaluate the exclusions, and the probe's "cannot run"
-// fallback would wrongly fail an excluded path. The `quality` job's formatter
-// gives the verdict.
-export const MissingPathPolicy = Object.freeze({
+// An index path is unavailable when the working-tree entry is gone (see
+// `GoneCode`) or is non-regular. The formatter fails unless Rstack excludes
+// the path. The planner defers to the formatter and selects the path without
+// probing, as it does for `NonUtf8Policy.Defer`.
+export const UnavailablePathPolicy = Object.freeze({
   Fail: "fail",
   Defer: "defer",
 });
 
-// Explicit-comparison regular-file check. Unlike `stagedRegularFile` and the
-// local selector, which skip a gone path, the explicit comparison decides what
-// CI validates, so a gone path fails unless the shared exclusions skip it.
-function explicitRegularFile(cwd, name, missing) {
+function explicitRegularFile(cwd, name, unavailable) {
+  let stats;
+  let lookupError;
   try {
-    return regularFileInside(cwd, name);
+    stats = worktreeEntry(cwd, name);
+    if (stats.isFile()) return true;
   } catch (error) {
     if (!goneCodes.has(error.code)) throw error;
-    if (missing === MissingPathPolicy.Defer) return true;
-    if (excludedByRstack(cwd, name)) return false;
-    throw error;
+    lookupError = error;
   }
+  if (unavailable === UnavailablePathPolicy.Defer) return true;
+  if (excludedByRstack(cwd, name)) return false;
+  if (lookupError) throw lookupError;
+  throw new Error(
+    `Explicit comparison path ${name} cannot be formatted because its working-tree entry is a ${entryKind(stats)}`,
+  );
 }
 
 export function changedFormatFiles(
@@ -465,7 +464,7 @@ export function changedFormatFiles(
   head,
   local = false,
   nonUtf8 = NonUtf8Policy.Fail,
-  missing = MissingPathPolicy.Fail,
+  unavailable = UnavailablePathPolicy.Fail,
 ) {
   const cwd = repositoryRoot(start);
   revision(cwd, base);
@@ -534,7 +533,7 @@ export function changedFormatFiles(
       }
       return local
         ? isRegularFile(cwd, name, true)
-        : explicitRegularFile(cwd, name, missing);
+        : explicitRegularFile(cwd, name, unavailable);
     })
     .sort();
 }

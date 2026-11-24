@@ -3,19 +3,165 @@
 package claude
 
 import (
+	"bytes"
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/servers/tide-api/internal/agent"
 	"github.com/delinoio/mono/servers/tide-api/internal/profile"
 	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
+
+type acceptUnixFunc func() (*net.UnixConn, error)
+
+func (f acceptUnixFunc) AcceptUnix() (*net.UnixConn, error) { return f() }
+
+func TestClaudeHookAcceptRecovers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Claude orchestrators run on Linux and macOS")
+	}
+	// Keep the run directory short, as Watch does for the real socket.
+	dir, err := os.MkdirTemp("", "tc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, socketName)
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	w := &agent.Watch{Logger: slog.New(slog.NewJSONHandler(&logs, nil)).With("agent_integration_id", "test-integration")}
+	attempts := 0
+	listener := acceptUnixFunc(func() (*net.UnixConn, error) {
+		attempts++
+		if attempts == 1 || attempts == 3 {
+			return nil, os.NewSyscallError("accept", syscall.EMFILE)
+		}
+		return ln.AcceptUnix()
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&Vendor{}).serve(t.Context(), w, listener)
+	}()
+	for range 2 {
+		// A pre-warming request exercises the real hook exchange without a store.
+		reply, err := exchange(socket, hookRequest{OrderID: "order"})
+		if err != nil {
+			t.Error(err)
+			break
+		}
+		if reply.Result != HookReject {
+			t.Errorf("hook result = %q, want %q", reply.Result, HookReject)
+			break
+		}
+	}
+	_ = ln.Close()
+	<-done
+
+	var failures int
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if !strings.Contains(line, `"msg":"claude_hook_accept_failed"`) {
+			continue
+		}
+		failures++
+		for _, field := range []string{
+			`"level":"ERROR"`, `"agent_integration_id":"test-integration"`, syscall.EMFILE.Error(),
+			fmt.Sprintf(`"retry_in":%d`, hookAcceptBackoffMin.Nanoseconds()),
+		} {
+			if !strings.Contains(line, field) {
+				t.Errorf("accept log is missing %q: %s", field, line)
+			}
+		}
+	}
+	if failures != 2 {
+		t.Fatalf("logged %d accept failures, want 2", failures)
+	}
+}
+
+func TestClaudeHookAcceptClosed(t *testing.T) {
+	var logs bytes.Buffer
+	w := &agent.Watch{Logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+	attempts := 0
+	listener := acceptUnixFunc(func() (*net.UnixConn, error) {
+		attempts++
+		if attempts > 1 {
+			t.Fatal("serve retried a closed listener")
+		}
+		return nil, &net.OpError{Op: "accept", Net: "unix", Err: net.ErrClosed}
+	})
+	(&Vendor{}).serve(t.Context(), w, listener)
+	if attempts != 1 || logs.Len() != 0 {
+		t.Fatalf("closed listener: %d accepts and %q logs, want one accept and no logs", attempts, logs.String())
+	}
+}
+
+func TestClaudeHookAcceptBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		w := &agent.Watch{Logger: slog.New(slog.DiscardHandler)}
+		delays := []time.Duration{5, 10, 20, 40, 80, 160, 320, 640, 1000, 1000}
+		attempts := make(chan time.Time, len(delays)+2)
+		listener := acceptUnixFunc(func() (*net.UnixConn, error) {
+			select {
+			case attempts <- time.Now():
+			case <-ctx.Done():
+			}
+			return nil, syscall.EMFILE
+		})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			(&Vendor{}).serve(ctx, w, listener)
+		}()
+		synctest.Wait()
+		if len(attempts) != 1 {
+			t.Fatalf("got %d initial accept attempts, want one", len(attempts))
+		}
+		previous := <-attempts
+		for i, ms := range delays {
+			delay := ms * time.Millisecond
+			time.Sleep(delay - time.Nanosecond)
+			synctest.Wait()
+			if len(attempts) != 0 {
+				t.Fatalf("accept retried before the %s delay", delay)
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			if len(attempts) != 1 {
+				t.Fatalf("got %d accept attempts at retry %d, want one", len(attempts), i+1)
+			}
+			retry := <-attempts
+			if got := retry.Sub(previous); got != delay {
+				t.Fatalf("retry %d followed after %s, want %s", i+1, got, delay)
+			}
+			previous = retry
+		}
+		beforeCancel := time.Now()
+		cancel()
+		<-done
+		if !time.Now().Equal(beforeCancel) || len(attempts) != 0 {
+			t.Fatal("cancel did not stop the retry wait immediately")
+		}
+	})
+}
 
 func TestHookExitCodes(t *testing.T) {
 	for r, want := range map[HookResult]int{HookStored: 0, HookDuplicate: 0, HookRetry: 1, HookReject: 2, "unknown": 1} {
@@ -112,16 +258,37 @@ func TestInstallScript(t *testing.T) {
 
 func TestProgramRetireAt(t *testing.T) {
 	created := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
-	g := &work.Guest{Runner: &work.Runner{ID: "r1", CreateTime: created}, Profile: &profile.Profile{MaxTTL: 4 * time.Hour}}
-	p := Program("/tmp/tide-runner-r1", g, created.Add(time.Minute))
-	args := strings.Join(p.Args, " ")
-	want := "--retire-at " + strconv.FormatInt(created.Add(4*time.Hour-retireMargin).Unix(), 10)
-	if !strings.Contains(args, "--capacity 1") || !strings.Contains(args, want) || p.CredentialEnv != "SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET" {
-		t.Fatalf("program %q", args)
-	}
-	// A max_ttl that already passed adds no retirement.
-	p = Program("/tmp/tide-runner-r1", g, created.Add(5*time.Hour))
-	if strings.Contains(strings.Join(p.Args, " "), "--retire-at") {
-		t.Fatalf("retire-at in the past: %q", p.Args)
+	retireAt := strconv.FormatInt(created.Add(55*time.Minute).Unix(), 10)
+	for _, tc := range []struct {
+		name      string
+		profile   *profile.Profile
+		storedTTL time.Duration
+		elapsed   time.Duration
+		want      string
+	}{
+		{"raised profile TTL", &profile.Profile{MaxTTL: 8 * time.Hour}, time.Hour, time.Minute, retireAt},
+		{"lowered profile TTL", &profile.Profile{MaxTTL: 30 * time.Minute}, time.Hour, time.Minute, retireAt},
+		{"deleted profile", nil, time.Hour, time.Minute, retireAt},
+		{"over a minute away", nil, time.Hour, 54*time.Minute - time.Second, retireAt},
+		{"exactly a minute away", nil, time.Hour, 54 * time.Minute, ""},
+		{"under a minute away", nil, time.Hour, 54*time.Minute + time.Second, ""},
+		{"in the past", nil, time.Hour, 56 * time.Minute, ""},
+		{"unavailable sandbox TTL", &profile.Profile{MaxTTL: time.Hour}, 0, time.Minute, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := &work.Guest{Runner: &work.Runner{ID: "r1", CreateTime: created}, Profile: tc.profile, SandboxMaxTTL: tc.storedTTL}
+			p := Program("/tmp/tide-runner-r1", g, created.Add(tc.elapsed))
+			if !strings.Contains(strings.Join(p.Args, " "), "--capacity 1") || p.CredentialEnv != "SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET" {
+				t.Fatalf("unexpected program %q", p.Args)
+			}
+			index := slices.Index(p.Args, "--retire-at")
+			if tc.want == "" {
+				if index >= 0 {
+					t.Fatalf("unexpected --retire-at in %q", p.Args)
+				}
+			} else if index < 0 || index+1 == len(p.Args) || p.Args[index+1] != tc.want {
+				t.Fatalf("want --retire-at %s in %q", tc.want, p.Args)
+			}
+		})
 	}
 }

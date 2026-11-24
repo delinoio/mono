@@ -8,14 +8,19 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/go/tide/tidetest"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
 
 // newTestClient starts a fake server and returns a client with short
@@ -111,6 +116,100 @@ func TestAPIKeyOnlyOnDevSessionService(t *testing.T) {
 	}
 }
 
+func TestIssuedPersonalAPIKey(t *testing.T) {
+	admin, srv, org := newTestClient(t, "")
+	ctx := t.Context()
+	issue := func(expiresAt *timestamppb.Timestamp) (*Client, string) {
+		t.Helper()
+		res, err := admin.APIKeys().CreateApiKey(ctx, connect.NewRequest(&tidev1.CreateApiKeyRequest{
+			OrganizationId: org, Name: "dev session", ExpiresAt: expiresAt,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, err := New(Options{BaseURL: srv.URL, APIKey: res.Msg.GetSecret()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client, res.Msg.GetApiKey().GetApiKeyId()
+	}
+	list := func(client *Client, orgID string) error {
+		_, err := client.DevSessions().ListDevSessions(ctx, connect.NewRequest(&tidev1.ListDevSessionsRequest{OrganizationId: orgID}))
+		return err
+	}
+
+	key, keyID := issue(nil)
+	if err := list(key, org); err != nil {
+		t.Fatalf("list with issued key: %v", err)
+	}
+	if srv.LastCredential() != tidetest.CredentialAPIKey {
+		t.Fatal("the issued key was not recorded as an API key")
+	}
+	_, err := key.Organizations().GetOrganization(ctx, connect.NewRequest(&tidev1.GetOrganizationRequest{OrganizationId: org}))
+	if connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("get organization with issued key: %v, want permission_denied", err)
+	}
+	otherOrg := srv.AddOrganization("other").GetOrganizationId()
+	if err := list(key, otherOrg); connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("list with issued key from another organization: %v, want not_found", err)
+	}
+
+	t.Run("stream in another organization", func(t *testing.T) {
+		profile := srv.AddDevSessionProfile(otherOrg, "test", tidev1.GuestOs_GUEST_OS_LINUX, t.TempDir())
+		session, err := admin.DevSessions().CreateDevSession(ctx, connect.NewRequest(&tidev1.CreateDevSessionRequest{
+			OrganizationId: otherOrg, RunnerProfileId: profile.GetRunnerProfileId(),
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		read := func(client *Client) error {
+			stream, err := client.DevSessions().ReadDevSessionFile(ctx, connect.NewRequest(&tidev1.ReadDevSessionFileRequest{
+				OrganizationId: otherOrg, DevSessionId: session.Msg.GetDevSession().GetDevSessionId(),
+			}))
+			if err != nil {
+				return err
+			}
+			defer stream.Close()
+			stream.Receive()
+			return stream.Err()
+		}
+		if err := read(admin); connect.CodeOf(err) != connect.CodeInvalidArgument {
+			t.Fatalf("stream with access token and missing read ID: %v, want invalid_argument", err)
+		}
+		if err := read(key); connect.CodeOf(err) != connect.CodeNotFound {
+			t.Fatalf("stream with issued key from another organization: %v, want not_found", err)
+		}
+	})
+
+	_, err = admin.APIKeys().RevokeApiKey(ctx, connect.NewRequest(&tidev1.RevokeApiKeyRequest{
+		OrganizationId: org, ApiKeyId: keyID,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := list(key, org); connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("list with revoked key: %v, want unauthenticated", err)
+	}
+
+	now := time.Now()
+	unexpired, _ := issue(timestamppb.New(now.Add(time.Hour)))
+	if err := list(unexpired, org); err != nil {
+		t.Fatalf("list with unexpired key: %v", err)
+	}
+	expired, _ := issue(timestamppb.New(now.Add(-time.Hour)))
+	if err := list(expired, org); connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("list with expired key: %v, want unauthenticated", err)
+	}
+
+	unknown, err := New(Options{BaseURL: srv.URL, APIKey: "tide_secret-unknown"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := list(unknown, org); connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("list with unknown key: %v, want unauthenticated", err)
+	}
+}
+
 func TestPagination(t *testing.T) {
 	c, srv, _ := newTestClient(t, "")
 	for i := range 119 {
@@ -138,6 +237,92 @@ func TestPagination(t *testing.T) {
 	_, err = Collect(c.AllOrganizations(context.Background(), &tidev1.ListOrganizationsRequest{}))
 	if connect.CodeOf(err) != connect.CodeUnavailable {
 		t.Fatalf("pagination error = %v", err)
+	}
+}
+
+func TestPaginationRepeatedStartingToken(t *testing.T) {
+	const loopError = "tide: the server returned the page token of an earlier page again"
+	for _, tc := range []struct {
+		name       string
+		nextTokens map[string]string
+		wantTokens []string
+		wantIDs    []string
+		wantError  string
+	}{
+		{
+			name:       "starting token repeats immediately",
+			nextTokens: map[string]string{"resume": "resume"},
+			wantTokens: []string{"resume"},
+			wantIDs:    []string{"org-1"},
+			wantError:  loopError,
+		},
+		{
+			name:       "cycle returns to starting token",
+			nextTokens: map[string]string{"resume": "later", "later": "resume"},
+			wantTokens: []string{"resume", "later"},
+			wantIDs:    []string{"org-1", "org-2"},
+			wantError:  loopError,
+		},
+		{
+			name:       "distinct continuation ends with empty token",
+			nextTokens: map[string]string{"resume": "later", "later": ""},
+			wantTokens: []string{"resume", "later"},
+			wantIDs:    []string{"org-1", "org-2"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var tokens []string
+			ids := map[string]string{"resume": "org-1", "later": "org-2"}
+			handler := connect.NewUnaryHandler(tidev1connect.OrganizationServiceListOrganizationsProcedure,
+				func(_ context.Context, req *connect.Request[tidev1.ListOrganizationsRequest]) (*connect.Response[tidev1.ListOrganizationsResponse], error) {
+					token := req.Msg.GetPageToken()
+					mu.Lock()
+					tokens = append(tokens, token)
+					mu.Unlock()
+					next, ok := tc.nextTokens[token]
+					if !ok {
+						return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("unexpected page token %q", token))
+					}
+					return connect.NewResponse(&tidev1.ListOrganizationsResponse{
+						Organizations: []*tidev1.Organization{{OrganizationId: ids[token]}},
+						NextPageToken: next,
+					}), nil
+				})
+			srv := httptest.NewTLSServer(handler)
+			t.Cleanup(srv.Close)
+			client, err := New(Options{BaseURL: srv.URL, HTTPClient: srv.Client(), APIKey: tidetest.DefaultAccessToken})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req := &tidev1.ListOrganizationsRequest{PageToken: "resume"}
+			orgs, err := Collect(client.AllOrganizations(t.Context(), req))
+			var gotIDs []string
+			for _, org := range orgs {
+				gotIDs = append(gotIDs, org.GetOrganizationId())
+			}
+			mu.Lock()
+			gotTokens := slices.Clone(tokens)
+			mu.Unlock()
+			t.Logf("requested tokens = %q, collected organization IDs = %q, error = %v", gotTokens, gotIDs, err)
+			if !slices.Equal(gotTokens, tc.wantTokens) {
+				t.Errorf("requested tokens = %q, want %q", gotTokens, tc.wantTokens)
+			}
+			if !slices.Equal(gotIDs, tc.wantIDs) {
+				t.Errorf("collected organization IDs = %q, want %q", gotIDs, tc.wantIDs)
+			}
+			var gotError string
+			if err != nil {
+				gotError = err.Error()
+			}
+			if gotError != tc.wantError {
+				t.Errorf("Collect error = %q, want %q", gotError, tc.wantError)
+			}
+			if req.GetPageToken() != "resume" {
+				t.Errorf("caller request token = %q, want resume", req.GetPageToken())
+			}
+		})
 	}
 }
 

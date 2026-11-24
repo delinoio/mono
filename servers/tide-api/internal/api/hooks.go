@@ -73,35 +73,32 @@ type OrganizationDeletion struct {
 	Actor          auth.Principal
 }
 
-// OrganizationDeletionHook lets a layer clean up before the core revokes the
-// personal API keys and deletes the organization rows (memberships,
-// invitations, API keys and, through ON DELETE CASCADE, every row of a later
-// layer that references the organization). The contract's order is: end the
-// queued requests with CANCELED, delete the runners, stop the Claude Code
-// orchestrators and vendor watchers, remove the GitHub installation links,
-// then delete the stored credentials; register the hooks in that order.
+// OrganizationDeletionHook prepares a layer for one deletion attempt.
+// Prepare runs after the owner pre-check, before the deletion transaction.
+// It may call external services. On failure it must undo its own work.
 type OrganizationDeletionHook struct {
 	// Name is the stable hook name in log records.
 	Name string
-	// Prepare runs before the deletion transaction, after the caller passed
-	// the owner pre-check, and may call external services (for example
-	// OwnSand DeleteSandbox for the runners, with the stored OwnSand key). An
-	// error stops the deletion and is returned to the caller; the
-	// organization stays, so Prepare must be idempotent. Work that can start
-	// again until the transaction holds the organization lock (for example a
-	// dispatcher pass) must be stopped again in InTx.
-	Prepare func(ctx context.Context, d OrganizationDeletion) error
-	// InTx runs in the deletion transaction after the organization row lock
-	// and the authoritative owner check, before the core revokes the keys
-	// and deletes the rows.
-	InTx func(ctx context.Context, tx pgx.Tx, d OrganizationDeletion) error
-	// AfterCommit runs after the organization is deleted, for example to
-	// stop in-memory vendor watchers of the organization at once.
-	AfterCommit func(ctx context.Context, d OrganizationDeletion)
-	// Abort runs when the deletion fails after Prepare ran (for example,
-	// the owner transferred the ownership meanwhile), so a hook can undo
-	// what Prepare stopped. It runs for every hook whose Prepare succeeded.
-	Abort func(ctx context.Context, d OrganizationDeletion)
+	// Prepare is required.
+	Prepare func(ctx context.Context, d OrganizationDeletion) (OrganizationDeletionSteps, error)
+}
+
+// OrganizationDeletionSteps hold the callbacks for one deletion attempt.
+// They can capture state acquired during Prepare.
+type OrganizationDeletionSteps struct {
+	// InTx runs after the organization row lock and owner check, before
+	// the core revokes the keys and deletes the rows.
+	InTx func(ctx context.Context, tx pgx.Tx) error
+	// AfterCommit runs after the organization is deleted.
+	AfterCommit func(ctx context.Context)
+	// Abort undoes successful preparation if a later hook fails or the
+	// deletion transaction rolls back.
+	Abort func(ctx context.Context)
+}
+
+type preparedOrganizationDeletionHook struct {
+	name string
+	OrganizationDeletionSteps
 }
 
 // Hooks holds the registered extension hooks.
@@ -133,48 +130,47 @@ func (s *Service) membershipEndAfterCommit(ctx context.Context, e MembershipEnd)
 		slog.String("user_id", e.UserID), slog.Int("revoked_api_keys", len(e.RevokedAPIKeyIDs)))
 }
 
-func (s *Service) organizationDeletionPrepare(ctx context.Context, d OrganizationDeletion) error {
-	for i, h := range s.Hooks.OrganizationDeletion {
-		if h.Prepare == nil {
-			continue
-		}
-		if err := h.Prepare(ctx, d); err != nil {
+func (s *Service) organizationDeletionPrepare(ctx context.Context, d OrganizationDeletion) ([]preparedOrganizationDeletionHook, error) {
+	prepared := make([]preparedOrganizationDeletionHook, 0, len(s.Hooks.OrganizationDeletion))
+	for _, h := range s.Hooks.OrganizationDeletion {
+		steps, err := h.Prepare(ctx, d)
+		if err != nil {
 			s.Logger.WarnContext(ctx, "organization_deletion_prepare_failed", slog.String("hook", h.Name),
 				slog.String("organization_id", d.OrganizationID), slog.Any("error", err))
-			s.organizationDeletionAbort(ctx, d, i)
-			return err
+			organizationDeletionAbort(ctx, prepared)
+			return nil, err
 		}
+		prepared = append(prepared, preparedOrganizationDeletionHook{name: h.Name, OrganizationDeletionSteps: steps})
 	}
-	return nil
+	return prepared, nil
 }
 
-// organizationDeletionAbort runs the Abort hooks of the first n hooks.
-func (s *Service) organizationDeletionAbort(ctx context.Context, d OrganizationDeletion, n int) {
+func organizationDeletionAbort(ctx context.Context, prepared []preparedOrganizationDeletionHook) {
 	ctx = context.WithoutCancel(ctx)
-	for _, h := range s.Hooks.OrganizationDeletion[:n] {
+	for _, h := range prepared {
 		if h.Abort != nil {
-			h.Abort(ctx, d)
+			h.Abort(ctx)
 		}
 	}
 }
 
-func (s *Service) organizationDeletionInTx(ctx context.Context, tx pgx.Tx, d OrganizationDeletion) error {
-	for _, h := range s.Hooks.OrganizationDeletion {
+func organizationDeletionInTx(ctx context.Context, tx pgx.Tx, prepared []preparedOrganizationDeletionHook) error {
+	for _, h := range prepared {
 		if h.InTx == nil {
 			continue
 		}
-		if err := h.InTx(ctx, tx, d); err != nil {
-			return fmt.Errorf("organization deletion hook %s: %w", h.Name, err)
+		if err := h.InTx(ctx, tx); err != nil {
+			return fmt.Errorf("organization deletion hook %s: %w", h.name, err)
 		}
 	}
 	return nil
 }
 
-func (s *Service) organizationDeletionAfterCommit(ctx context.Context, d OrganizationDeletion) {
+func (s *Service) organizationDeletionAfterCommit(ctx context.Context, d OrganizationDeletion, prepared []preparedOrganizationDeletionHook) {
 	ctx = context.WithoutCancel(ctx)
-	for _, h := range s.Hooks.OrganizationDeletion {
+	for _, h := range prepared {
 		if h.AfterCommit != nil {
-			h.AfterCommit(ctx, d)
+			h.AfterCommit(ctx)
 		}
 	}
 	s.Logger.InfoContext(ctx, "organization_deleted", slog.String("organization_id", d.OrganizationID))

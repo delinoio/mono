@@ -43,7 +43,7 @@ func TestLinkAttemptRunning(t *testing.T) {
 	ctx := context.Background()
 	d := dbtest.New(t)
 	const orgID, attempt = "0190f3a4-0000-7000-8000-0000000000d1", "0190f3a4-0000-7000-8000-0000000000e1"
-	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 123456789, time.UTC)
 	running := func() bool {
 		t.Helper()
 		ok, err := billing.LinkAttemptRunning(ctx, d.Pool, orgID, attempt)
@@ -62,7 +62,7 @@ func TestLinkAttemptRunning(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if want := now.Add(billing.LinkCallTimeout + 15*time.Second); !deadline.Equal(want) {
+	if want := now.Add(billing.LinkCallTimeout + 15*time.Second).Truncate(time.Microsecond); !deadline.Equal(want) {
 		t.Fatalf("deadline = %v, want %v", deadline, want)
 	}
 	if !running() {

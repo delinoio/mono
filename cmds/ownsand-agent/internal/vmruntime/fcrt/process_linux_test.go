@@ -496,6 +496,11 @@ func (f *fixture) trackedVM(id string, pid int) (*vm, chan struct{}) {
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	f.t.Cleanup(func() {
+		if err := dirFile.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			f.t.Errorf("close directory for tracked VM %q: %v", id, err)
+		}
+	})
 	exited := make(chan struct{})
 	// The fixture has no reaper: the test closes exited, so the launch gate
 	// stays open and a stop signals the group.
@@ -505,6 +510,28 @@ func (f *fixture) trackedVM(id string, pid int) (*vm, chan struct{}) {
 	f.r.vms[id] = v
 	f.r.mu.Unlock()
 	return v, exited
+}
+
+func TestTrackedVMClosesDirectoryOnCleanup(t *testing.T) {
+	var dirFile *os.File
+	if !t.Run("stop without delete", func(t *testing.T) {
+		f := newFixture(t)
+		v, exited := f.trackedVM("sb1", 321)
+		dirFile = v.dirFile
+		f.r.signalGroup = func(int) error { return nil }
+		close(exited)
+		if err := f.r.stop(v); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dirFile.Stat(); err != nil {
+			t.Fatalf("directory handle after stop: %v", err)
+		}
+	}) {
+		return
+	}
+	if _, err := dirFile.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("directory handle after cleanup: got %v, want %v", err, os.ErrClosed)
+	}
 }
 
 func TestDeleteTrackedWaitsForExit(t *testing.T) {
@@ -541,6 +568,9 @@ func TestDeleteTrackedWaitsForExit(t *testing.T) {
 	close(exited)
 	if err := f.r.Delete(context.Background(), "sb1"); err != nil {
 		t.Fatalf("Delete after the exit: %v", err)
+	}
+	if _, err := v.dirFile.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("directory handle after Delete: got %v, want %v", err, os.ErrClosed)
 	}
 	if _, lerr := f.r.lookup("sb1"); lerr == nil {
 		t.Fatal("VM still registered")

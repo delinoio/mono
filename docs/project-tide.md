@@ -83,6 +83,7 @@ The project has one hosted server deployable (the control plane on the shared Di
 ### Protocol and API
 
 - The public API is tide's own Connect RPC API in the protobuf package `delino.tide.v1`. The [protos contract](protos-tide-api-contract.md) owns every service, message and enum.
+- List RPCs follow the [protos contract's enum filter rules](protos-tide-api-contract.md#general-rules).
 - Public RPCs are unary or server-streaming, like the [OwnSand transport rule](project-ownsand.md#protocol-and-api), so that browser clients can call them.
 - Dev session commands and file transfers go through `tide-api`: the caller calls tide RPCs, and `tide-api` calls the OwnSand data path with the organization's OwnSand API key. Callers of tide never get an OwnSand credential and never connect to OwnSand.
 - The `tide mcp` MCP server is a local stdio process of the [CLI](cmds-tide-cli-foundation.md#mcp-server). It is a client of the public RPCs and adds no server endpoint. tide has no remote (HTTP) MCP endpoint in this version.

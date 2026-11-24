@@ -16,28 +16,113 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 )
 
+// A 20-byte STUN header and four bytes per empty attribute fill maxDatagram.
+const maxUnknownRequiredAttributes = (maxDatagram - 20) / 4
+
+func bindingRequestWithUnknownRequired(count int) *pionstun.Message {
+	setters := []pionstun.Setter{pionstun.TransactionID, pionstun.BindingRequest}
+	for i := range count {
+		setters = append(setters, pionstun.RawAttribute{Type: 0x0100 + pionstun.AttrType(i)})
+	}
+	return pionstun.MustBuild(setters...)
+}
+
 // The smallest accepted burst must admit every response the server builds:
 // the limiter drops a response larger than the whole burst.
 func TestResponsesFitMinimumBurst(t *testing.T) {
 	plain := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest, pionstun.Fingerprint)
 	unknown := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest,
 		pionstun.RawAttribute{Type: 0x0030, Value: []byte{1, 2, 3, 4}}, pionstun.Fingerprint)
+	ipv4 := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 4000}
+	ipv6 := &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 4000}
+	largest := bindingRequestWithUnknownRequired(maxUnknownRequiredAttributes)
+	if len(largest.Raw) != maxDatagram {
+		t.Fatalf("largest request is %d bytes, want %d", len(largest.Raw), maxDatagram)
+	}
 	for name, tc := range map[string]struct {
-		req *pionstun.Message
-		src *net.UDPAddr
+		req      *pionstun.Message
+		src      *net.UDPAddr
+		wantSize int
 	}{
-		"ipv4 success": {plain, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 4000}},
-		"ipv6 success": {plain, &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 4000}},
-		"ipv4 420":     {unknown, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 4000}},
-		"ipv6 420":     {unknown, &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 4000}},
+		"ipv4 success":     {plain, ipv4, 40},
+		"ipv6 success":     {plain, ipv6, 52},
+		"ipv4 420":         {unknown, ipv4, 64},
+		"ipv6 420":         {unknown, ipv6, 64},
+		"420 with 2 types": {bindingRequestWithUnknownRequired(2), ipv4, 64},
+		"420 with 3 types": {bindingRequestWithUnknownRequired(3), ipv4, 68},
+		"largest 420":      {largest, ipv4, 800},
 	} {
 		resp, err := Respond(tc.req.Raw, tc.src)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
+		if len(resp) != tc.wantSize {
+			t.Errorf("%s: response is %d bytes, want %d", name, len(resp), tc.wantSize)
+		}
 		if len(resp) > config.MinSTUNRateBurstBytes {
 			t.Errorf("%s: response of %d bytes exceeds the %d-byte minimum burst", name, len(resp), config.MinSTUNRateBurstBytes)
 		}
+	}
+}
+
+func TestResponsesFitMinimumBurstOverUDP(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		count    int
+		wantSize int
+	}{
+		{"3 unknown types", 3, 68},
+		{"maximum unknown types", maxUnknownRequiredAttributes, 800},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := New(slog.New(slog.NewJSONHandler(io.Discard, nil)), config.DefaultSTUNRateBytesPerSecond, config.MinSTUNRateBurstBytes)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- s.Serve(ctx, pc) }()
+			defer func() {
+				cancel()
+				if err := <-done; err != nil {
+					t.Error(err)
+				}
+			}()
+
+			client, err := net.DialUDP("udp4", nil, pc.LocalAddr().(*net.UDPAddr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			req := bindingRequestWithUnknownRequired(tc.count)
+			if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Write(req.Raw); err != nil {
+				t.Fatal(err)
+			}
+			buf := make([]byte, maxDatagram)
+			n, err := client.Read(buf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n != tc.wantSize {
+				t.Fatalf("response is %d bytes, want %d", n, tc.wantSize)
+			}
+			resp := &pionstun.Message{Raw: buf[:n]}
+			if err := resp.Decode(); err != nil {
+				t.Fatal(err)
+			}
+			var code pionstun.ErrorCodeAttribute
+			if resp.Type != pionstun.BindingError || resp.TransactionID != req.TransactionID ||
+				code.GetFrom(resp) != nil || code.Code != pionstun.CodeUnknownAttribute {
+				t.Fatalf("response type %v, transaction %x, code %v", resp.Type, resp.TransactionID, code)
+			}
+			if reqs, resps, limited := waitForOutcomes(s.Stats, 1, 5*time.Second); reqs != 1 || resps != 1 || limited != 0 {
+				t.Fatalf("requests %d, responses %d, limited %d", reqs, resps, limited)
+			}
+		})
 	}
 }
 

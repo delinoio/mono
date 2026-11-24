@@ -95,6 +95,8 @@ type Engine struct {
 
 	mu      sync.Mutex
 	drivers map[string]chan struct{}
+	// initialCreates holds runner IDs while the dispatcher calls CreateSandbox.
+	initialCreates sync.Map
 	// runCtx and runWG belong to the running reconciler component.
 	runCtx context.Context
 	runWG  *sync.WaitGroup
@@ -205,6 +207,14 @@ func (e *Engine) GetRunner(ctx context.Context, q db.Querier, orgID, id string) 
 	return r, err
 }
 
+func (e *Engine) lockOrganizationRunner(ctx context.Context, tx pgx.Tx, orgID, id string) (*Runner, error) {
+	r, err := scanRunner(tx.QueryRow(ctx, "SELECT "+runnerColumns+" FROM runners WHERE organization_id = $1 AND runner_id = $2 FOR UPDATE", orgID, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, api.ErrNotFound("runner")
+	}
+	return r, err
+}
+
 func (e *Engine) lockRunner(ctx context.Context, tx pgx.Tx, id string) (*Runner, error) {
 	r, err := scanRunner(tx.QueryRow(ctx, "SELECT "+runnerColumns+" FROM runners WHERE runner_id = $1 FOR UPDATE", id))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -254,7 +264,8 @@ type NewRequest struct {
 // CreateRequest creates a QUEUED request in tx, or returns the existing
 // request of the same organization, source and source key (created is then
 // false), so a repeated event or claim never creates a second request. The
-// caller kicks the dispatcher after the commit (Service.WorkChanged).
+// caller holds the organization and profile share locks, in that order,
+// and kicks the dispatcher after the commit (Service.WorkChanged).
 func (e *Engine) CreateRequest(ctx context.Context, tx pgx.Tx, n NewRequest) (*Request, bool, error) {
 	p := n.Profile
 	id := n.RequestID
