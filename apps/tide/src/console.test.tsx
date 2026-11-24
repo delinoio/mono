@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { timestampMs } from "@bufbuild/protobuf/wkt";
 import {
   afterEach,
   beforeEach,
@@ -22,6 +23,7 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
+import { GitHubService } from "@delino/tide-protos/v1/github_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
@@ -372,6 +374,41 @@ describe("GitHub setup callback", () => {
       `/orgs/${MOCK_IDS.globex}/integrations`,
     );
     expect(await screen.findByText(/github-org-51000001/)).toBeTruthy();
+  });
+
+  test("an expired issued state keeps the callback on setup and shows restart guidance", async () => {
+    const transport = createMockTransport();
+    const github = createClient(GitHubService, transport);
+    const { url, expireTime } = await github.createGitHubInstallUrl({
+      organizationId: MOCK_IDS.globex,
+    });
+    const state = new URL(url).searchParams.get("state");
+    if (!state || !expireTime) throw new Error("Expected state and expiry");
+    const clock = rs
+      .spyOn(Date, "now")
+      .mockReturnValue(timestampMs(expireTime));
+    try {
+      const query = new URLSearchParams({
+        installation_id: "51000002",
+        code: "fixture-code",
+        state,
+      });
+      renderConsole(`/github/setup?${query}`, { transport });
+      await click(
+        await screen.findByRole("combobox", { name: "tide organization" }),
+      );
+      await click(await screen.findByRole("option", { name: /Globex/ }));
+      await click(screen.getByRole("button", { name: "Link installation" }));
+
+      expect(
+        await screen.findByText(
+          /Start the installation again from the integrations/,
+        ),
+      ).toBeTruthy();
+      expect(window.location.pathname).toBe("/github/setup");
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test("an address without the callback values explains what to do", async () => {
