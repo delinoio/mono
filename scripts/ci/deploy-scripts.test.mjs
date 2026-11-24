@@ -1589,6 +1589,7 @@ function runProvider(t, args, { responses = {}, input, env = {} } = {}) {
       CLOUDFLARE_API_TOKEN: "token",
       CLOUDFLARE_ACCOUNT_ID: "account",
       DEPLOY_POLL_INTERVAL: "0",
+      DEPLOY_POLL_TIMEOUT: "30",
       ...env,
     },
   });
