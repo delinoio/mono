@@ -22,6 +22,7 @@ import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
+import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { ExecResultKind } from "./operations/exec.ts";
 import { type LogRecord } from "./logger.ts";
 import { execBinding, requestDigest } from "./digest.ts";
@@ -126,6 +127,71 @@ describe("client construction", () => {
 });
 
 describe("organization", () => {
+  test("uses OWNSAND_ORG when the client option is empty", async () => {
+    const h = setup({ organizationId: "", env: { OWNSAND_ORG: ORG } });
+    h.api.unary(SnapshotService, "GetSnapshot", (req) => ({
+      snapshot: { snapshotId: req.snapshotId },
+    }));
+
+    expect(h.client.organizationId).toBe(ORG);
+    await h.client.getSnapshot("snapshot");
+    expect(h.api.callsOf("GetSnapshot")).toMatchObject([
+      { request: { organizationId: ORG } },
+    ]);
+  });
+
+  test("uses the client organization for empty helper overrides", async () => {
+    const h = setup();
+    h.api.unary(SandboxService, "CreateSandbox", () => ({
+      sandbox: { sandboxId: SANDBOX },
+    }));
+    h.api.unary(SnapshotService, "GetSnapshot", (req) => ({
+      snapshot: { snapshotId: req.snapshotId },
+    }));
+    h.api.unary(SnapshotService, "DeleteSnapshot", () => ({}));
+    h.api.unary(SnapshotService, "ExportSnapshot", (req) => ({
+      snapshot: { snapshotId: req.snapshotId },
+    }));
+    h.api.unary(SnapshotService, "CreateTemplate", () => ({
+      template: { templateId: "template" },
+    }));
+    h.api.unary(SnapshotService, "DeleteTemplate", () => ({}));
+
+    expect(
+      h.client.sandbox(SANDBOX, { organizationId: "" }).organizationId,
+    ).toBe(ORG);
+    const created = await h.clock.run(
+      h.client.createSandbox({ ...validCreate, organizationId: "" }),
+    );
+    expect(created.organizationId).toBe(ORG);
+    await h.client.getSnapshot("snapshot", "");
+    await h.client.deleteSnapshot("snapshot", "");
+    await h.client.exportSnapshot("snapshot", "");
+    await h.client.createTemplate("snapshot", "name", "");
+    await h.client.deleteTemplate("template", "");
+    await h.client.getSnapshot("snapshot", "other-org");
+
+    expect(h.api.calls).toMatchObject([
+      { method: "CreateSandbox", request: { organizationId: ORG } },
+      { method: "GetSnapshot", request: { organizationId: ORG } },
+      { method: "DeleteSnapshot", request: { organizationId: ORG } },
+      { method: "ExportSnapshot", request: { organizationId: ORG } },
+      { method: "CreateTemplate", request: { organizationId: ORG } },
+      { method: "DeleteTemplate", request: { organizationId: ORG } },
+      { method: "GetSnapshot", request: { organizationId: "other-org" } },
+    ]);
+  });
+
+  test("rejects a helper call locally when the option and OWNSAND_ORG are empty", async () => {
+    const h = setup({ organizationId: "", env: { OWNSAND_ORG: "" } });
+
+    expect(h.client.organizationId).toBeUndefined();
+    await expect(h.client.getSnapshot("snapshot", "")).rejects.toThrow(
+      OwnSandConfigError,
+    );
+    expect(h.api.calls).toHaveLength(0);
+  });
+
   test("fills the default organization and lets a call override it", async () => {
     const h = setup();
     h.api.unary(MemberService, "ListMembers", () => ({}));
