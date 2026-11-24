@@ -175,7 +175,7 @@ func (c *Client) Download(ctx context.Context, p DownloadParams) (*DownloadResul
 		}
 		res.Files, res.Bytes = 1, n
 	}
-	if err := replacePath(staged, dest); err != nil {
+	if err := replacePath(staged, dest, os.Rename); err != nil {
 		return nil, err
 	}
 	report(TransferProgress{Phase: TransferDone, BytesDone: size, BytesTotal: size})
@@ -192,21 +192,32 @@ func wrapLimit(err error) error {
 	return err
 }
 
-// replacePath moves staged to dest. An existing dest is moved aside first
-// and removed after the move, so dest is never half written.
-func replacePath(staged, dest string) error {
-	if _, err := os.Lstat(dest); err == nil {
-		aside := dest + ".tide-old-" + filepath.Base(filepath.Dir(staged))
-		if err := os.Rename(dest, aside); err != nil {
-			return fmt.Errorf("tide: move the existing destination aside: %w", err)
-		}
-		if err := os.Rename(staged, dest); err != nil {
-			_ = os.Rename(aside, dest)
-			return err
-		}
-		return os.RemoveAll(aside)
+// replacePath moves staged to dest. It keeps the previous destination in a
+// short, separate backup path so that staging cleanup cannot delete it.
+func replacePath(staged, dest string, rename func(string, string) error) error {
+	_, err := os.Lstat(dest)
+	if errors.Is(err, os.ErrNotExist) {
+		return rename(staged, dest)
 	}
-	return os.Rename(staged, dest)
+	if err != nil {
+		return err
+	}
+
+	backupDir, err := os.MkdirTemp(filepath.Dir(dest), ".tide-old-*")
+	if err != nil {
+		return fmt.Errorf("tide: create the destination backup directory: %w", err)
+	}
+	backup := filepath.Join(backupDir, "previous")
+	if err := rename(dest, backup); err != nil {
+		return errors.Join(fmt.Errorf("tide: move the existing destination aside: %w", err), os.Remove(backupDir))
+	}
+	if err := rename(staged, dest); err != nil {
+		if restoreErr := rename(backup, dest); restoreErr != nil {
+			return fmt.Errorf("tide: publish download: %w (restore failed, backup at %q: %w)", err, backup, restoreErr)
+		}
+		return errors.Join(err, os.Remove(backupDir))
+	}
+	return os.RemoveAll(backupDir)
 }
 
 func lastLine(s string) string {
