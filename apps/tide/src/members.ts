@@ -53,16 +53,7 @@ export function useMembers(organizationId: string) {
   return {
     members,
     hasData: data !== undefined,
-    hasNextPage,
-    isPending: query.isPending,
-    error: isFetching ? null : query.error,
-    retry: () => {
-      if (query.isFetchNextPageError) {
-        void fetchNextPage({ cancelRefetch: false });
-      } else {
-        void query.refetch();
-      }
-    },
+    query,
   };
 }
 

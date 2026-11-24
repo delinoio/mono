@@ -51,6 +51,25 @@ describe("sign-in", () => {
 });
 
 describe("organizations", () => {
+  test("shows the full error when the organization cannot load", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${UNKNOWN_ORG}/api-keys`);
+
+    await expect(
+      screen.getByText("It was not found, or you no longer have access to it."),
+    ).toBeVisible();
+    await expect(screen.getByRole("button", "Try again")).toBeVisible();
+    await expect(screen.getByRole("navigation", "Organization")).toBeHidden();
+    await expect(
+      screen.getByText("The last refresh failed", { exact: false }),
+    ).toBeHidden();
+  });
+
   test("offers retry when the organization cannot be found", async ({
     app,
     screen,

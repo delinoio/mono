@@ -1,26 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
+import type { ReactNode } from "react";
 import type { useMembers } from "../members.ts";
-import { ErrorNotice, Loading } from "./ui.tsx";
+import { ErrorNotice, QueryBoundary } from "./ui.tsx";
 
 export function MemberListStatus({
-  roster,
+  roster: { query },
+  children,
 }: {
   roster: ReturnType<typeof useMembers>;
+  children?: ReactNode;
 }) {
-  if (roster.isPending) return <Loading label="Loading members" />;
-  if (roster.error) {
-    return (
-      <>
-        {roster.hasNextPage ? (
-          <p className="muted">Some members are not shown yet.</p>
-        ) : null}
-        <ErrorNotice error={roster.error} onRetry={roster.retry} />
-      </>
-    );
-  }
-  return roster.hasNextPage ? (
-    <p className="muted" role="status">
-      Loading more members
-    </p>
-  ) : null;
+  return (
+    <QueryBoundary query={query} loading="Loading members">
+      {() => (
+        <>
+          {query.hasNextPage ? (
+            query.error && !query.isFetching ? (
+              <p className="muted">Some members are not shown yet.</p>
+            ) : (
+              <p className="muted" role="status">
+                Loading more members
+              </p>
+            )
+          ) : null}
+          {query.isFetchNextPageError && !query.isFetching ? (
+            <ErrorNotice
+              error={query.error}
+              onRetry={() => void query.fetchNextPage({ cancelRefetch: false })}
+            />
+          ) : null}
+          {children}
+        </>
+      )}
+    </QueryBoundary>
+  );
 }
