@@ -9,6 +9,7 @@ const ACME = "0193b000-0000-7000-8000-000000000001";
 const NORTHWIND = "0193b000-0000-7000-8000-000000000002";
 const CONTOSO = "0193b000-0000-7000-8000-000000000003";
 const GLOBEX = "0193b000-0000-7000-8000-000000000004";
+const UNKNOWN_ORG = "0193b000-0000-7000-8000-0000000000ff";
 const INVITATION_SECRET = "tdi_mock_contoso_invitation";
 
 describe("sign-in", () => {
@@ -32,6 +33,24 @@ describe("sign-in", () => {
 });
 
 describe("organizations", () => {
+  test("offers retry when the organization cannot be found", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${UNKNOWN_ORG}`);
+
+    await expect(
+      screen.getByText("It was not found, or you no longer have access to it."),
+    ).toBeVisible();
+    await expect(screen.getByRole("button", "Try again")).toBeVisible();
+    await expect(
+      screen.getByRole("button", "Sign in with Delino"),
+    ).toBeHidden();
+  });
+
   test("creates an organization from a dialog that focuses its only input", async ({
     app,
     screen,
