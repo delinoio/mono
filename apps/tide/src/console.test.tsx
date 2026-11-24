@@ -34,7 +34,6 @@ import {
   RunnerState,
 } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
-import { MemberService } from "@delino/tide-protos/v1/member_pb";
 import {
   type ListMembersRequest,
   MemberService,

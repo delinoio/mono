@@ -35,6 +35,8 @@ export default {
             rsbuildBin,
             "dev",
             "--no-env",
+            "--mode",
+            "development",
             "--host",
             "127.0.0.1",
             "--port",
@@ -45,11 +47,10 @@ export default {
           // in-browser fake API with a fake signed-in user, because it has no
           // control plane and no Logto tenant.
           //
-          // The value is deliberately padded with spaces. The build must
-          // trim it so the mock sign-in and the mock transport agree; if the
-          // trimming in rsbuild.config.ts is reverted, sign-in succeeds but
-          // the console calls the real API and the seeded data never loads.
-          env: { PUBLIC_TIDE_MOCK_API: " true " },
+          // The suite exercises the resolved development mode with an
+          // inherited production NODE_ENV. The mock sign-in and transport
+          // must both accept the padded flag.
+          env: { NODE_ENV: "production", PUBLIC_TIDE_MOCK_API: " true " },
           log: ".e2e/logs/app.log",
         },
       },

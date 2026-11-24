@@ -31,7 +31,10 @@ describe("sign-in", () => {
     ).toBeHidden();
   });
 
-  test("signs in and lists the organizations", async ({ app, screen }) => {
+  test("signs in and lists the mock organizations in resolved development mode", async ({
+    app,
+    screen,
+  }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
 

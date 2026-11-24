@@ -31,8 +31,8 @@ describe("e2e app command", () => {
     {
       directory: "tide",
       config: tideConfig,
-      configArgs: [],
-      env: { PUBLIC_TIDE_MOCK_API: " true " },
+      configArgs: ["--mode", "development"],
+      env: { NODE_ENV: "production", PUBLIC_TIDE_MOCK_API: " true " },
     },
   ]) {
     test(`starts ${directory} through Node on the selected loopback port`, () => {
