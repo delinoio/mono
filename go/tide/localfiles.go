@@ -150,10 +150,28 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 	return out, nil
 }
 
-// readLocalFile hashes one listed path. ok is false for a tracked path that
-// no longer exists locally (it then counts as deleted) or that is now a
-// directory.
+// readLocalFile hashes one listed path. Missing paths, paths below symbolic
+// links, and directories are absent from the local file list.
 func readLocalFile(dir, rel, indexMode string) (localFile, bool, error) {
+	// Lstat follows symbolic links in parent components, so check each
+	// parent from the root outwards before looking up the final component.
+	for i := range rel {
+		if rel[i] != '/' {
+			continue
+		}
+		parent := filepath.Join(dir, filepath.FromSlash(rel[:i]))
+		info, err := os.Lstat(parent)
+		if errors.Is(err, os.ErrNotExist) {
+			return localFile{}, false, nil
+		}
+		if err != nil {
+			return localFile{}, false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return localFile{}, false, nil
+		}
+	}
+
 	full := filepath.Join(dir, filepath.FromSlash(rel))
 	info, err := os.Lstat(full)
 	if errors.Is(err, os.ErrNotExist) {
