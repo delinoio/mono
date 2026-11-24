@@ -1873,16 +1873,27 @@ func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
 	})
 	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
 	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
-	sandboxID, _ := uuidv7.NewString()
+	sandboxID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatalf("generate sandbox ID: %v", err)
+	}
 	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
 		t.Fatalf("create %v", res)
 	}
-	snapID, _ := uuidv7.NewString()
+	snapID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatalf("generate snapshot ID: %v", err)
+	}
 	chanCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	h.agent.handleCommand(chanCtx, context.Background(), &ownsandv1.AgentCommand{CommandId: snapID, Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}}, 0)
-	if err := <-rt.ctxErr; err == nil {
-		t.Fatal("snapshot capture ran on a context that outlives its channel")
+	select {
+	case err := <-rt.ctxErr:
+		if err != context.Canceled {
+			t.Fatalf("snapshot runtime context error = %v, want %v", err, context.Canceled)
+		}
+	default:
+		t.Fatal("snapshot command returned without calling the runtime's Snapshot method")
 	}
 	// The runtime completed the capture although its channel ended. The
 	// snapshot must not become known or ready.
