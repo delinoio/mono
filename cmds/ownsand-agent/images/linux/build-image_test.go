@@ -37,10 +37,12 @@ const stubDocker = `#!/usr/bin/env bash
 printf '%s\n' "$@" >"$STUB_LOG_DIR/docker.args"
 stage=""
 out=""
+arch=""
 for arg in "$@"; do
   case "$arg" in
     *:/stage:ro) stage="${arg%:/stage:ro}" ;;
     *:/out) out="${arg%:/out}" ;;
+    linux/*) arch="${arg#linux/}" ;;
   esac
 done
 cp "$stage/ownsand-guest" "$STUB_LOG_DIR/staged.bin"
@@ -49,15 +51,18 @@ if [ "${STUB_DOCKER_STATUS:-0}" != 0 ]; then
   printf 'partial' >"$out/rootfs.ext4"
   exit "$STUB_DOCKER_STATUS"
 fi
-printf 'rootfs' >"$out/rootfs.ext4"
+printf 'rootfs-%s' "$arch" >"$out/rootfs.ext4"
 `
 
-// stubKernel replaces build-kernel.sh. It writes the kernel to its second
-// argument, or fails with $STUB_KERNEL_STATUS (default 0).
+// stubKernel replaces build-kernel.sh. It writes the kernel and its config,
+// or fails with $STUB_KERNEL_STATUS before writing the config.
 const stubKernel = `#!/usr/bin/env bash
 printf '%s\n' "$1" >"$STUB_LOG_DIR/kernel.arch"
-printf 'kernel' >"$2"
-exit "${STUB_KERNEL_STATUS:-0}"
+printf 'kernel-%s' "$1" >"$2"
+if [ "${STUB_KERNEL_STATUS:-0}" != 0 ]; then
+  exit "$STUB_KERNEL_STATUS"
+fi
+printf 'config-%s' "$1" >"$2.config"
 `
 
 // imageBuild is one prepared run of build-image.sh in a fake repository that
@@ -173,6 +178,44 @@ func (b *imageBuild) requireGuest(want []byte) {
 	}
 }
 
+func imageOutputs(arch string) map[string]string {
+	return map[string]string{
+		"vmlinux":        "kernel-" + arch,
+		"vmlinux.config": "config-" + arch,
+		"rootfs.ext4":    "rootfs-" + arch,
+	}
+}
+
+func (b *imageBuild) seedImage(arch string) {
+	b.t.Helper()
+	if err := os.MkdirAll(b.out, 0o755); err != nil {
+		b.t.Fatal(err)
+	}
+	for name, data := range imageOutputs(arch) {
+		if err := os.WriteFile(filepath.Join(b.out, name), []byte(data), 0o644); err != nil {
+			b.t.Fatal(err)
+		}
+	}
+}
+
+// An empty arch means that none of the final image paths should exist.
+func (b *imageBuild) requireImage(arch string) {
+	b.t.Helper()
+	for name, want := range imageOutputs(arch) {
+		path := filepath.Join(b.out, name)
+		if arch == "" {
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				b.t.Fatalf("%s: want an absent path, got stat error %v", name, err)
+			}
+			continue
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != want {
+			b.t.Fatalf("%s: got %q, want %q (read error: %v)", name, got, want, err)
+		}
+	}
+}
+
 // requireNoStage checks that no staging directory is left in the output
 // directory and that no scratch is left in TMPDIR.
 func (b *imageBuild) requireNoStage() {
@@ -183,7 +226,7 @@ func (b *imageBuild) requireNoStage() {
 			b.t.Fatal(err)
 		}
 		for _, e := range entries {
-			if strings.Contains(e.Name(), "stage") {
+			if strings.Contains(e.Name(), "stage") || e.Name() == ".ownsand-image-publish.lock" {
 				b.t.Fatalf("the build left %q in %s", e.Name(), filepath.Base(dir))
 			}
 		}
@@ -201,12 +244,7 @@ func TestSuccessfulBuildPreservesAnExistingGuestFile(t *testing.T) {
 			}
 			b.requireGuest(sentinel)
 			b.requireNoStage()
-			for name, want := range map[string]string{"vmlinux": "kernel", "rootfs.ext4": "rootfs"} {
-				got, err := os.ReadFile(filepath.Join(b.out, name))
-				if err != nil || string(got) != want {
-					t.Fatalf("%s: got %q (read error is nil: %t), want %q", name, got, err == nil, want)
-				}
-			}
+			b.requireImage(arch)
 			if got := strings.TrimSpace(b.readLog("go.goarch")); got != arch {
 				t.Fatalf("go built for %q, want %q", got, arch)
 			}
@@ -261,7 +299,7 @@ func TestBuildKeepsTheStageOfAnotherRun(t *testing.T) {
 	b := newImageBuild(t)
 	// A build that runs at once in the same output directory owns a stage
 	// directory of its own; this build must neither reuse nor remove it.
-	other := filepath.Join(b.out, ".ownsand-guest-stage.other")
+	other := filepath.Join(b.out, ".ownsand-image-stage.other")
 	if err := os.MkdirAll(other, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -278,27 +316,29 @@ func TestBuildKeepsTheStageOfAnotherRun(t *testing.T) {
 	if got := b.readLog("staged.bin"); got != "built" {
 		t.Fatalf("the container saw %q, want the freshly built guest helper", got)
 	}
-	if stagePath := strings.TrimSpace(b.readLog("stage.path")); stagePath == other {
+	if stagePath := strings.TrimSpace(b.readLog("stage.path")); filepath.Dir(stagePath) == other {
 		t.Fatal("the build reused the stage directory of another run")
 	}
 }
 
-func TestFailedStepsPreserveTheGuestFileAndRemoveTheStage(t *testing.T) {
+func TestFailedStepsPreserveThePreviousOutputs(t *testing.T) {
 	cases := []struct {
-		name   string
-		env    string
-		status int
+		name          string
+		env           string
+		status        int
+		kernelStarted bool
 	}{
-		{"go build", "STUB_GO_STATUS=7", 7},
-		{"root file system container", "STUB_DOCKER_STATUS=23", 23},
-		{"kernel build", "STUB_KERNEL_STATUS=9", 9},
+		{"go build", "STUB_GO_STATUS=7", 7, false},
+		{"root file system container", "STUB_DOCKER_STATUS=23", 23, false},
+		{"kernel build", "STUB_KERNEL_STATUS=9", 9, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			b := newImageBuild(t)
 			sentinel := []byte("pre-existing\x00bytes\n")
 			b.seedGuest(sentinel)
-			out, err := b.run("amd64", c.env)
+			b.seedImage("amd64")
+			out, err := b.run("arm64", c.env)
 			var exit *exec.ExitError
 			if !errors.As(err, &exit) {
 				t.Fatalf("the build did not fail with an exit status: %v\n%s", err, out)
@@ -306,13 +346,22 @@ func TestFailedStepsPreserveTheGuestFileAndRemoveTheStage(t *testing.T) {
 			if exit.ExitCode() != c.status {
 				t.Fatalf("exit status %d, want %d\n%s", exit.ExitCode(), c.status, out)
 			}
+			if strings.Contains(out, "wrote ") {
+				t.Fatalf("the failed build reported success:\n%s", out)
+			}
+			if !c.kernelStarted {
+				if _, err := os.Stat(filepath.Join(b.logs, "kernel.arch")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("want no kernel build record, got stat error %v", err)
+				}
+			}
 			b.requireGuest(sentinel)
+			b.requireImage("amd64")
 			b.requireNoStage()
 		})
 	}
 }
 
-func TestFailedStepsLeaveNoGuestFileWhenThereWasNone(t *testing.T) {
+func TestFailedFirstBuildLeavesNoOutputs(t *testing.T) {
 	for _, env := range []string{"STUB_GO_STATUS=7", "STUB_DOCKER_STATUS=23", "STUB_KERNEL_STATUS=9"} {
 		t.Run(env, func(t *testing.T) {
 			b := newImageBuild(t)
@@ -320,7 +369,99 @@ func TestFailedStepsLeaveNoGuestFileWhenThereWasNone(t *testing.T) {
 				t.Fatal("the build succeeded, want a failure")
 			}
 			b.requireGuest(nil)
+			b.requireImage("")
 			b.requireNoStage()
 		})
 	}
+}
+
+func TestPublicationFailureRollsBackAndAllowsRetry(t *testing.T) {
+	realMV, err := exec.LookPath("mv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name string
+		arch string
+	}{
+		{"first build", ""},
+		{"rebuild", "amd64"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b := newImageBuild(t)
+			sentinel := []byte("unrelated")
+			b.seedGuest(sentinel)
+			if c.arch != "" {
+				b.seedImage(c.arch)
+			}
+			stubPath := filepath.Join(b.dir, "bin", "mv")
+			const fault = `#!/usr/bin/env bash
+if [[ "$3" == */out/vmlinux.config ]]; then
+  # Confirm the first rename completed before failing the second.
+  if [ "$(cat "${4%/}/vmlinux")" != kernel-arm64 ]; then
+    exit 86
+  fi
+  exit 87
+fi
+exec "$STUB_REAL_MV" "$@"
+`
+			if err := os.WriteFile(stubPath, []byte(fault), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			out, err := b.run("arm64", "STUB_REAL_MV="+realMV)
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != 87 {
+				t.Fatalf("want the second rename to fail with exit 87, got %v\n%s", err, out)
+			}
+			b.requireImage(c.arch)
+			b.requireGuest(sentinel)
+			b.requireNoStage()
+
+			if err := os.Remove(stubPath); err != nil {
+				t.Fatal(err)
+			}
+			if out, err := b.run("arm64"); err != nil {
+				t.Fatalf("retry failed: %v\n%s", err, out)
+			}
+			b.requireImage("arm64")
+			b.requireGuest(sentinel)
+			b.requireNoStage()
+		})
+	}
+}
+
+func TestPublicationRejectsADirectoryAtAnOutputPath(t *testing.T) {
+	b := newImageBuild(t)
+	config := filepath.Join(b.out, "vmlinux.config")
+	if err := os.MkdirAll(config, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := b.run("arm64"); err == nil || !strings.Contains(out, "output path is a directory: "+config) {
+		t.Fatalf("want an output directory error, got %v\n%s", err, out)
+	}
+	entries, err := os.ReadDir(b.out)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "vmlinux.config" || !entries[0].IsDir() {
+		t.Fatalf("want only the existing directory, got %v (read error: %v)", entries, err)
+	}
+	entries, err = os.ReadDir(config)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("want the existing directory to stay empty, got %v (read error: %v)", entries, err)
+	}
+}
+
+func TestBuildDoesNotPublishWhileAnotherRunHoldsTheLock(t *testing.T) {
+	b := newImageBuild(t)
+	b.seedImage("amd64")
+	lock := filepath.Join(b.out, ".ownsand-image-publish.lock")
+	if err := os.Mkdir(lock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := b.run("arm64"); err == nil || !strings.Contains(out, "could not acquire image publication lock: "+lock) {
+		t.Fatalf("want a publication lock error, got %v\n%s", err, out)
+	}
+	b.requireImage("amd64")
+	if err := os.Remove(lock); err != nil {
+		t.Fatalf("the build did not preserve the other run's lock: %v", err)
+	}
+	b.requireNoStage()
 }

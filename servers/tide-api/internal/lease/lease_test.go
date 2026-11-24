@@ -17,7 +17,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/db/dbtest"
 )
 
-// testClock is a settable clock for the lease timestamps and deadline.
+// testClock is a settable clock for the local lease deadline.
 type testClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -185,10 +185,10 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 	clock := newTestClock()
 	var acquired, lost atomic.Int32
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	a := &Lease{DB: database, InstanceID: "a", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger,
+	a := &Lease{DB: database, InstanceID: "a", DeadlineNow: clock.Now, Logger: logger,
 		OnAcquire: func(context.Context) { acquired.Add(1) }, OnLose: func() { lost.Add(1) },
 		renewEvery: 20 * time.Millisecond, poll: 5 * time.Millisecond}
-	b := &Lease{DB: database, InstanceID: "b", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger}
+	b := &Lease{DB: database, InstanceID: "b", Logger: logger}
 
 	var calls atomic.Int32
 	blocked := make(chan struct{})
@@ -239,6 +239,11 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 		t.Fatal("the instance holds the lease at the confirmed expiry")
 	}
 	eventually(t, "the loss callback", func() bool { return lost.Load() == 1 })
+	// Expire the database row independently of the local ownership deadline.
+	tag, err := database.Pool.Exec(ctx, "UPDATE instance_leases SET expire_time = now() - interval '1 second' WHERE lease_name = $1", Name)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("expire lease row: updated %d rows, error %v", tag.RowsAffected(), err)
+	}
 	if held, err := b.TryAcquire(ctx); err != nil || !held {
 		t.Fatalf("the other instance could not take the expired lease: %v %v", held, err)
 	}
@@ -316,7 +321,7 @@ func TestLeaseRenewalExtendsOwnership(t *testing.T) {
 	database := dbtest.New(t)
 	clock := newTestClock()
 	var lost atomic.Int32
-	a := &Lease{DB: database, InstanceID: "a", Now: clock.Now, DeadlineNow: clock.Now,
+	a := &Lease{DB: database, InstanceID: "a", DeadlineNow: clock.Now,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), OnLose: func() { lost.Add(1) },
 		renewEvery: 20 * time.Millisecond, poll: 5 * time.Millisecond}
 	var calls atomic.Int32
@@ -350,12 +355,11 @@ func TestLeaseRenewalExtendsOwnership(t *testing.T) {
 // without waiting for the TTL.
 func TestLeaseReleaseDrain(t *testing.T) {
 	database := dbtest.New(t)
-	clock := newTestClock()
 	var lost atomic.Int32
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	a := &Lease{DB: database, InstanceID: "a", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger,
+	a := &Lease{DB: database, InstanceID: "a", Logger: logger,
 		OnLose: func() { lost.Add(1) }, renewEvery: 20 * time.Millisecond, poll: 5 * time.Millisecond}
-	b := &Lease{DB: database, InstanceID: "b", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger}
+	b := &Lease{DB: database, InstanceID: "b", Logger: logger}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); a.Run(ctx) }()
@@ -382,12 +386,11 @@ func TestLeaseReleaseDrain(t *testing.T) {
 // another holder takes the lease at once.
 func TestLeaseReleaseAfterUncertainAcquisition(t *testing.T) {
 	database := dbtest.New(t)
-	clock := newTestClock()
 	var lost atomic.Int32
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	a := &Lease{DB: database, InstanceID: "a", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger,
+	a := &Lease{DB: database, InstanceID: "a", Logger: logger,
 		OnLose: func() { lost.Add(1) }}
-	b := &Lease{DB: database, InstanceID: "b", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger}
+	b := &Lease{DB: database, InstanceID: "b", Logger: logger}
 	// The renewal commits the row and then reports an error, as a call does
 	// when the connection breaks after the commit.
 	a.renew = func(ctx context.Context) (bool, error) {
@@ -416,12 +419,11 @@ func TestLeaseReleaseAfterUncertainAcquisition(t *testing.T) {
 // does not own the lease leaves the row of the current holder.
 func TestLeaseReleaseKeepsOtherHolderRow(t *testing.T) {
 	database := dbtest.New(t)
-	clock := newTestClock()
 	var lost atomic.Int32
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	a := &Lease{DB: database, InstanceID: "a", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger,
+	a := &Lease{DB: database, InstanceID: "a", Logger: logger,
 		OnLose: func() { lost.Add(1) }}
-	b := &Lease{DB: database, InstanceID: "b", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger}
+	b := &Lease{DB: database, InstanceID: "b", Logger: logger}
 	if held, err := b.TryAcquire(context.Background()); err != nil || !held {
 		t.Fatalf("b could not acquire: %v %v", held, err)
 	}

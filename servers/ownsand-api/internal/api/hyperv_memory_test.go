@@ -4,6 +4,8 @@ package api_test
 
 import (
 	"context"
+	"math"
+	"strings"
 	"testing"
 
 	"connectrpc.com/connect"
@@ -103,5 +105,96 @@ func TestHyperVMemoryRounding(t *testing.T) {
 	}
 	if got := allocated(lin.ID); got != 1023 {
 		t.Fatalf("Linux allocation = %d, want 1023", got)
+	}
+}
+
+func TestHyperVMemoryMaxInt64(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	c := org.OwnerClient
+
+	for _, tc := range []struct {
+		name      string
+		hostOS    ownsandv1.HostOs
+		requested int64
+		want      int64
+	}{
+		{"Windows at MaxInt64", ownsandv1.HostOs_HOST_OS_WINDOWS, math.MaxInt64, math.MaxInt64},
+		{"Windows odd below MaxInt64", ownsandv1.HostOs_HOST_OS_WINDOWS, math.MaxInt64 - 2, math.MaxInt64 - 1},
+		{"Windows even below MaxInt64", ownsandv1.HostOs_HOST_OS_WINDOWS, math.MaxInt64 - 1, math.MaxInt64 - 1},
+		{"Linux odd below MaxInt64", ownsandv1.HostOs_HOST_OS_LINUX, math.MaxInt64 - 2, math.MaxInt64 - 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dev := env.EnrollDevice(org.ID, c, tc.hostOS, ownsandv1.Arch_ARCH_AMD64)
+			limits := &ownsandv1.UpdateDeviceLimitsRequest{
+				OrganizationId: org.ID, DeviceId: dev.ID,
+				Limits: &ownsandv1.DeviceLimits{VcpuCount: 64, MemoryMib: math.MaxInt64, DiskGib: 1000, VcpuOvercommitPercent: 100},
+			}
+			if _, err := c.Device.UpdateDeviceLimits(ctx, connect.NewRequest(limits)); err != nil {
+				t.Fatalf("set initial device limits: %v", err)
+			}
+			agent := env.NewFakeAgent(dev)
+			agent.HostOS = tc.hostOS
+			agent.Connect()
+
+			// Each case uses a separate device in the same organization, so later
+			// creates also read the saturated reservation during placement.
+			req := createReq(org.ID)
+			req.Placement = &ownsandv1.Placement{DeviceId: &dev.ID}
+			req.Resources.MemoryMib = tc.requested
+			if _, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(req)); err != nil {
+				t.Fatalf("CreateSandbox: %v", err)
+			}
+
+			getReq := &ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: dev.ID}
+			got, err := c.Device.GetDevice(ctx, connect.NewRequest(getReq))
+			if err != nil {
+				t.Fatalf("GetDevice: %v", err)
+			}
+			if memory := got.Msg.GetDevice().GetAllocation().GetMemoryMib(); memory != tc.want {
+				t.Errorf("GetDevice allocated memory = %d, want %d", memory, tc.want)
+			}
+
+			list, err := c.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID}))
+			if err != nil {
+				t.Fatalf("ListDevices: %v", err)
+			}
+			var listed *ownsandv1.Device
+			for _, d := range list.Msg.GetDevices() {
+				if d.GetDeviceId() == dev.ID {
+					listed = d
+					break
+				}
+			}
+			if listed == nil {
+				t.Fatal("ListDevices did not return the device")
+			}
+			if memory := listed.GetAllocation().GetMemoryMib(); memory != tc.want {
+				t.Errorf("ListDevices allocated memory = %d, want %d", memory, tc.want)
+			}
+
+			if tc.requested == math.MaxInt64 {
+				limits.Limits.MemoryMib = 8192
+				updated, err := c.Device.UpdateDeviceLimits(ctx, connect.NewRequest(limits))
+				if err != nil {
+					t.Fatalf("lower device memory limit: %v", err)
+				}
+				if memory := updated.Msg.GetDevice().GetAllocation().GetMemoryMib(); memory != tc.want {
+					t.Errorf("UpdateDeviceLimits allocated memory = %d, want %d", memory, tc.want)
+				}
+				got, err := c.Device.GetDevice(ctx, connect.NewRequest(getReq))
+				if err != nil {
+					t.Fatalf("GetDevice after lowering memory limit: %v", err)
+				}
+				if memory := got.Msg.GetDevice().GetLimits().GetMemoryMib(); memory != limits.Limits.MemoryMib {
+					t.Errorf("stored memory limit = %d, want %d", memory, limits.Limits.MemoryMib)
+				}
+			}
+		})
+	}
+
+	if strings.Contains(env.Logs.String(), "SQLSTATE 22003") {
+		t.Error("the control plane logged a PostgreSQL numeric overflow")
 	}
 }

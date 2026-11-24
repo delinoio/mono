@@ -44,51 +44,64 @@ function tokenSetup(accessToken: () => string | Promise<string>) {
 }
 
 /** Counts the calls of a callback that fails in the given way. */
-function failing(kind: "empty" | "throws" | "rejects") {
+function failing(result: () => string | Promise<string>) {
   const state = { calls: 0 };
   const callback = (): string | Promise<string> => {
     state.calls++;
-    switch (kind) {
-      case "empty":
-        return "";
-      case "throws":
-        throw new Error("token source unavailable");
-      case "rejects":
-        return Promise.reject(new Error("token source unavailable"));
-    }
+    return result();
   };
   return { state, callback };
 }
 
 describe("a failing access token callback (local credential failure)", () => {
   const operations: [string, (client: OwnSandClient) => Promise<unknown>][] = [
+    ["GetSandbox", (c) => c.sandbox(SANDBOX).get()],
     [
-      "exec",
+      "relay exec",
       (c) =>
         c
           .sandbox(SANDBOX)
           .exec({ command: ["true"] })
           .wait(),
     ],
-    ["readFileBytes", (c) => c.sandbox(SANDBOX).readFileBytes("/data")],
-    ["writeFile", (c) => c.sandbox(SANDBOX).writeFile("/f", "hello")],
+    ["relay readFileBytes", (c) => c.sandbox(SANDBOX).readFileBytes("/data")],
+    ["relay writeFile", (c) => c.sandbox(SANDBOX).writeFile("/f", "hello")],
   ];
 
-  describe.each([
-    ["an empty token", "empty", "accessToken returned no token"],
-    ["a throwing callback", "throws", "token source unavailable"],
-    ["a rejecting callback", "rejects", "token source unavailable"],
-  ] as const)("%s", (_name, kind, message) => {
+  const failures: [string, () => string | Promise<string>, string][] = [
+    ["an empty token", () => "", "accessToken returned no token"],
+    ["a token with only spaces", () => "   ", "accessToken returned no token"],
+    ["a token with only a tab", () => "\t", "accessToken returned no token"],
+    [
+      "a token with only a nonbreaking space",
+      () => "\u00a0",
+      "accessToken returned no token",
+    ],
+    [
+      "a throwing callback",
+      () => {
+        throw new Error("token source unavailable");
+      },
+      "token source unavailable",
+    ],
+    [
+      "a rejecting callback",
+      () => Promise.reject(new Error("token source unavailable")),
+      "token source unavailable",
+    ],
+  ];
+  describe.each(failures)("%s", (_name, result, message) => {
     test.each(operations)(
-      "ends relay %s at once with one callback call and no request",
+      "ends %s at once with one callback call and no request",
       async (_op, run) => {
-        const { state, callback } = failing(kind);
+        const { state, callback } = failing(result);
         const { h, client } = tokenSetup(callback);
         const started = h.clock.now();
         const error: any = await h.clock.run(run(client)).catch((e) => e);
         expect(error).toBeInstanceOf(ConnectError);
+        expect(error.code).toBe(Code.Unknown);
         expect(error.cause).toBeInstanceOf(OwnSandCredentialError);
-        expect(error.message).toContain(message);
+        expect(error.cause.message).toBe(message);
         expect(classifyFailure(error)).toBe(FailureClass.Terminal);
         expect(state.calls).toBe(1);
         expect(h.api.calls).toHaveLength(0);
@@ -97,7 +110,7 @@ describe("a failing access token callback (local credential failure)", () => {
     );
 
     test("ends createSandbox after one callback call and one attempt", async () => {
-      const { state, callback } = failing(kind);
+      const { state, callback } = failing(result);
       const { h, client } = tokenSetup(callback);
       h.api.unary(SandboxService, "CreateSandbox", () => ({
         sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
@@ -106,7 +119,11 @@ describe("a failing access token callback (local credential failure)", () => {
       const error = await h.clock
         .run(client.createSandbox(validCreate))
         .catch((e) => e);
-      expect(error.message).toContain(message);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(Code.Unknown);
+      expect(error.cause).toBeInstanceOf(OwnSandCredentialError);
+      expect(error.cause.message).toBe(message);
+      expect(classifyFailure(error)).toBe(FailureClass.Terminal);
       expect(state.calls).toBe(1);
       expect(h.api.calls).toHaveLength(0);
       expect(h.clock.now() - started).toBeLessThan(1000);
@@ -264,7 +281,7 @@ describe("an access token that is no header value", () => {
       const { h, client } = tokenSetup(() => token);
       h.api.unary(SandboxService, "GetSandbox", (_req, call) => {
         throw new ConnectError(
-          `rejected ${call.headers.get("authorization")}`,
+          `rejected   ${call.headers.get("authorization")}`,
           Code.Unauthenticated,
         );
       });
@@ -277,6 +294,7 @@ describe("an access token that is no header value", () => {
         "Bearer sentinel-edge",
       );
       expect(error.code).toBe(Code.Unauthenticated);
+      expect(error.rawMessage).toBe("rejected   Bearer [redacted]");
       expect(chainText(error)).not.toContain("sentinel-edge");
     },
   );

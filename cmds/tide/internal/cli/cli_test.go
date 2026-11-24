@@ -323,15 +323,18 @@ func TestCredentialPrecedenceAndErrors(t *testing.T) {
 
 func TestCredentialInput(t *testing.T) {
 	f := newFixture(t)
-	f.ok("ownsand-key-from-stdin\n", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org")
+	r := f.ok("ownsand-key-from-stdin\n", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org")
 	if _, key := f.srv.OwnSandLink(f.org); key != "ownsand-key-from-stdin" {
 		t.Fatalf("stdin key = %q", key)
+	}
+	if strings.Contains(r.stdout+r.stderr, "ownsand-key-from-stdin") {
+		t.Fatal("the credential from stdin was printed")
 	}
 	file := filepath.Join(t.TempDir(), "key")
 	if err := os.WriteFile(file, []byte("ownsand-key-from-file\r\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r := f.ok("", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org", "--api-key-file", file)
+	r = f.ok("", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org", "--api-key-file", file)
 	if _, key := f.srv.OwnSandLink(f.org); key != "ownsand-key-from-file" {
 		t.Fatalf("file key = %q", key)
 	}

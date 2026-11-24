@@ -33,7 +33,7 @@ type confirmResult struct {
 func sendConfirmedAsync(ctx context.Context, s *Stream, f *ownsandv1.DataFrame) <-chan confirmResult {
 	ch := make(chan confirmResult, 1)
 	go func() {
-		err := s.SendConfirmed(ctx, f, nil)
+		err := s.SendConfirmed(ctx, f, nil, 0)
 		ch <- confirmResult{err: err, at: time.Now()}
 	}()
 	return ch
