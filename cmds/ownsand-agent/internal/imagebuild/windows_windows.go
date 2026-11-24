@@ -16,6 +16,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestsync"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/hcsrt"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -31,8 +32,6 @@ const (
 	setupProgress       = time.Minute
 	provisionTimeout    = 5 * time.Minute
 	shutdownTimeout     = 10 * time.Minute
-	// buildVMID is the compute system ID of the build VM.
-	buildVMID = "ownsand-image-build-windows"
 )
 
 // provisionCommands run through the guest helper once setup finished.
@@ -51,6 +50,9 @@ var provisionCommands = [][]string{
 // shutdownCommand shuts the guest down at once; the build then waits for
 // the compute system to exit.
 var shutdownCommand = []string{`C:\Windows\System32\shutdown.exe`, "/s", "/t", "0", "/f"}
+
+// buildGuestFrameID labels provisioning requests on the VM-specific connection.
+const buildGuestFrameID = "ownsand-image-build-windows"
 
 // buildWindows builds the Windows base image from opts.ISO: it applies the
 // selected image of the ISO to a new VHDX offline (no Windows Setup boot
@@ -148,8 +150,12 @@ func buildWindows(ctx context.Context, dir string, opts Options) (err error) {
 	m.release(ctx, logger)
 	applied := time.Now()
 
+	id, err := uuidv7.NewString()
+	if err != nil {
+		return fmt.Errorf("imagebuild: generate the Windows build VM ID: %w", err)
+	}
 	logger.Info("booting the image once; Windows Setup finishes the specialize and OOBE passes")
-	vm, err := hcsrt.StartBuildVM(hcsrt.BuildVMOptions{ID: buildVMID, Disk: disk, Dir: build, VCPUs: cpus, MemoryMiB: memory, Logger: logger})
+	vm, err := hcsrt.StartBuildVM(hcsrt.BuildVMOptions{ID: "ownsand-image-build-windows-" + id, Disk: disk, Dir: build, VCPUs: cpus, MemoryMiB: memory, Logger: logger})
 	if err != nil {
 		return err
 	}
@@ -306,7 +312,7 @@ func runGuest(ctx context.Context, vm *hcsrt.BuildVM, command []string) error {
 func runGuestCode(ctx context.Context, vm *hcsrt.BuildVM, command []string) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, provisionTimeout)
 	defer cancel()
-	code, err := guestsync.Run(ctx, buildVMID, vm.Dial, command)
+	code, err := guestsync.Run(ctx, buildGuestFrameID, vm.Dial, command)
 	if err != nil && errors.Is(err, context.DeadlineExceeded) {
 		return 0, fmt.Errorf("no result within %v", provisionTimeout)
 	}
