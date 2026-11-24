@@ -111,8 +111,11 @@ function ForwardMessageDialog() {
 }
 
 function ForwardButton() {
-  const { actions } = use(Composer.Context)
-  return <Button onPress={actions.submit}>Forward</Button>
+  const context = use(Composer.Context)
+  if (context === null) {
+    throw new Error('ForwardButton must be rendered inside <Composer.Provider>')
+  }
+  return <Button onPress={context.actions.submit}>Forward</Button>
 }
 ```
 

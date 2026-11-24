@@ -47,7 +47,9 @@ type DownloadResult struct {
 	// Files counts the regular files and symbolic links written.
 	Files int `json:"files"`
 	// Bytes counts the bytes of the regular files written.
-	Bytes    int64    `json:"bytes"`
+	Bytes int64 `json:"bytes"`
+	// Warnings reports issues that did not prevent installation, including
+	// skipped archive entries and failures to remove the previous destination.
 	Warnings []string `json:"warnings,omitempty"`
 }
 
@@ -175,8 +177,12 @@ func (c *Client) Download(ctx context.Context, p DownloadParams) (*DownloadResul
 		}
 		res.Files, res.Bytes = 1, n
 	}
-	if err := replacePath(staged, dest); err != nil {
+	warning, err := replacePath(staged, dest, os.Rename)
+	if err != nil {
 		return nil, err
+	}
+	if warning != "" {
+		res.Warnings = append(res.Warnings, warning)
 	}
 	report(TransferProgress{Phase: TransferDone, BytesDone: size, BytesTotal: size})
 	return res, nil
@@ -192,21 +198,36 @@ func wrapLimit(err error) error {
 	return err
 }
 
-// replacePath moves staged to dest. An existing dest is moved aside first
-// and removed after the move, so dest is never half written.
-func replacePath(staged, dest string) error {
-	if _, err := os.Lstat(dest); err == nil {
-		aside := dest + ".tide-old-" + filepath.Base(filepath.Dir(staged))
-		if err := os.Rename(dest, aside); err != nil {
-			return fmt.Errorf("tide: move the existing destination aside: %w", err)
-		}
-		if err := os.Rename(staged, dest); err != nil {
-			_ = os.Rename(aside, dest)
-			return err
-		}
-		return os.RemoveAll(aside)
+// replacePath moves staged to dest. It keeps the previous destination in a
+// short, separate backup path so that staging cleanup cannot delete it.
+// After installation succeeds, a failure to remove the backup is a warning.
+func replacePath(staged, dest string, rename func(string, string) error) (string, error) {
+	_, err := os.Lstat(dest)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", rename(staged, dest)
 	}
-	return os.Rename(staged, dest)
+	if err != nil {
+		return "", err
+	}
+
+	backupDir, err := os.MkdirTemp(filepath.Dir(dest), ".tide-old-*")
+	if err != nil {
+		return "", fmt.Errorf("tide: create the destination backup directory: %w", err)
+	}
+	backup := filepath.Join(backupDir, "previous")
+	if err := rename(dest, backup); err != nil {
+		return "", errors.Join(fmt.Errorf("tide: move the existing destination aside: %w", err), os.Remove(backupDir))
+	}
+	if err := rename(staged, dest); err != nil {
+		if restoreErr := rename(backup, dest); restoreErr != nil {
+			return "", fmt.Errorf("tide: publish download: %w (restore failed, backup at %q: %w)", err, backup, restoreErr)
+		}
+		return "", errors.Join(err, os.Remove(backupDir))
+	}
+	if err := os.RemoveAll(backupDir); err != nil {
+		return fmt.Sprintf("tide: could not finish removing the download backup at %q: %v", backup, err), nil
+	}
+	return "", nil
 }
 
 func lastLine(s string) string {

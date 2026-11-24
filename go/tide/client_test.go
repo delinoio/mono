@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 
 	"github.com/delinoio/mono/go/tide/tidetest"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
 
 // newTestClient starts a fake server and returns a client with short
@@ -233,6 +237,92 @@ func TestPagination(t *testing.T) {
 	_, err = Collect(c.AllOrganizations(context.Background(), &tidev1.ListOrganizationsRequest{}))
 	if connect.CodeOf(err) != connect.CodeUnavailable {
 		t.Fatalf("pagination error = %v", err)
+	}
+}
+
+func TestPaginationRepeatedStartingToken(t *testing.T) {
+	const loopError = "tide: the server returned the page token of an earlier page again"
+	for _, tc := range []struct {
+		name       string
+		nextTokens map[string]string
+		wantTokens []string
+		wantIDs    []string
+		wantError  string
+	}{
+		{
+			name:       "starting token repeats immediately",
+			nextTokens: map[string]string{"resume": "resume"},
+			wantTokens: []string{"resume"},
+			wantIDs:    []string{"org-1"},
+			wantError:  loopError,
+		},
+		{
+			name:       "cycle returns to starting token",
+			nextTokens: map[string]string{"resume": "later", "later": "resume"},
+			wantTokens: []string{"resume", "later"},
+			wantIDs:    []string{"org-1", "org-2"},
+			wantError:  loopError,
+		},
+		{
+			name:       "distinct continuation ends with empty token",
+			nextTokens: map[string]string{"resume": "later", "later": ""},
+			wantTokens: []string{"resume", "later"},
+			wantIDs:    []string{"org-1", "org-2"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var tokens []string
+			ids := map[string]string{"resume": "org-1", "later": "org-2"}
+			handler := connect.NewUnaryHandler(tidev1connect.OrganizationServiceListOrganizationsProcedure,
+				func(_ context.Context, req *connect.Request[tidev1.ListOrganizationsRequest]) (*connect.Response[tidev1.ListOrganizationsResponse], error) {
+					token := req.Msg.GetPageToken()
+					mu.Lock()
+					tokens = append(tokens, token)
+					mu.Unlock()
+					next, ok := tc.nextTokens[token]
+					if !ok {
+						return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("unexpected page token %q", token))
+					}
+					return connect.NewResponse(&tidev1.ListOrganizationsResponse{
+						Organizations: []*tidev1.Organization{{OrganizationId: ids[token]}},
+						NextPageToken: next,
+					}), nil
+				})
+			srv := httptest.NewTLSServer(handler)
+			t.Cleanup(srv.Close)
+			client, err := New(Options{BaseURL: srv.URL, HTTPClient: srv.Client(), APIKey: tidetest.DefaultAccessToken})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req := &tidev1.ListOrganizationsRequest{PageToken: "resume"}
+			orgs, err := Collect(client.AllOrganizations(t.Context(), req))
+			var gotIDs []string
+			for _, org := range orgs {
+				gotIDs = append(gotIDs, org.GetOrganizationId())
+			}
+			mu.Lock()
+			gotTokens := slices.Clone(tokens)
+			mu.Unlock()
+			t.Logf("requested tokens = %q, collected organization IDs = %q, error = %v", gotTokens, gotIDs, err)
+			if !slices.Equal(gotTokens, tc.wantTokens) {
+				t.Errorf("requested tokens = %q, want %q", gotTokens, tc.wantTokens)
+			}
+			if !slices.Equal(gotIDs, tc.wantIDs) {
+				t.Errorf("collected organization IDs = %q, want %q", gotIDs, tc.wantIDs)
+			}
+			var gotError string
+			if err != nil {
+				gotError = err.Error()
+			}
+			if gotError != tc.wantError {
+				t.Errorf("Collect error = %q, want %q", gotError, tc.wantError)
+			}
+			if req.GetPageToken() != "resume" {
+				t.Errorf("caller request token = %q, want resume", req.GetPageToken())
+			}
+		})
 	}
 }
 

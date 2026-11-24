@@ -75,22 +75,35 @@ func TestPendingUnlinkBackoffAfterLockWait(t *testing.T) {
 	if _, err := holder.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", org1); err != nil {
 		t.Fatal(err)
 	}
+	holderPID := holder.Conn().PgConn().PID()
 	done := make(chan error, 1)
 	go func() { done <- f.statuses.UnlinkPending(ctx, org1) }()
-	// Wait until the attempt blocks on the organization row.
-	deadline := time.Now().Add(10 * time.Second)
+	// Wait on a separate connection until the attempt blocks on the holder.
+	const waitingForHolder = `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database()
+				AND wait_event_type = 'Lock'
+				AND query LIKE '%FOR NO KEY UPDATE%'
+				AND $1 = ANY(pg_blocking_pids(pid))
+		)`
+	waitCtx, cancelWait := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelWait()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
 	for {
-		var waiting int
-		if err := f.db.Pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%FOR NO KEY UPDATE%'").Scan(&waiting); err != nil {
-			t.Fatal(err)
+		var waiting bool
+		if err := f.db.Pool.QueryRow(waitCtx, waitingForHolder, holderPID).Scan(&waiting); err != nil {
+			t.Fatalf("observe the organization lock wait: %v", err)
 		}
-		if waiting > 0 {
+		if waiting {
 			break
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-waitCtx.Done():
 			t.Fatal("the attempt did not wait for the organization lock")
+		case <-poll.C:
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 	f.clock.Advance(10 * time.Second)
 	if err := holder.Commit(ctx); err != nil {

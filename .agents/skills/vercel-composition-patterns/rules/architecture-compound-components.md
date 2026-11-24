@@ -91,6 +91,7 @@ function ComposerSubmit() {
 // Export as compound component
 const Composer = {
   Provider: ComposerProvider,
+  Context: ComposerContext,
   Frame: ComposerFrame,
   Input: ComposerInput,
   Submit: ComposerSubmit,

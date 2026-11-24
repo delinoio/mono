@@ -64,6 +64,10 @@ export function ApiKeysPage() {
   const [secret, setSecret] = useState<string>();
   const [revoking, setRevoking] = useState<ApiKey>();
 
+  if (pages.terminalLoadMoreError && revoking !== undefined) {
+    setRevoking(undefined);
+  }
+
   return (
     <>
       <PageHeader

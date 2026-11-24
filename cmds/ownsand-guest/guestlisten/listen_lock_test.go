@@ -81,6 +81,7 @@ func TestListenUnixSecondStartWaitsForStaleSocketReplacement(t *testing.T) {
 
 	reached := make(chan struct{})
 	proceed := make(chan struct{})
+	release := sync.OnceFunc(func() { close(proceed) })
 	var once sync.Once
 	beforeUnixRemove = func() {
 		once.Do(func() {
@@ -88,36 +89,64 @@ func TestListenUnixSecondStartWaitsForStaleSocketReplacement(t *testing.T) {
 			<-proceed
 		})
 	}
-	// The wait of the second start is a signal and a yield, not a sleep. The
-	// budget is large enough that the polls of the wait never run it out.
-	unixLockBudget = 1000 * time.Hour
+	// Signal the first poll and keep the lock wait bounded if it never clears.
+	unixLockBudget = failureBound
 	polled := make(chan struct{})
 	var pollOnce sync.Once
-	unixLockSleep = func(time.Duration) {
+	unixLockSleep = func(d time.Duration) {
 		pollOnce.Do(func() { close(polled) })
-		runtime.Gosched()
+		time.Sleep(d)
 	}
 
-	first := listenAsync("unix://" + path)
+	type listenerStart struct {
+		done   chan struct{}
+		result listenResult
+	}
+	var started []*listenerStart
+	start := func() *listenerStart {
+		worker := &listenerStart{done: make(chan struct{})}
+		started = append(started, worker)
+		go func() {
+			l, err := Listen("unix://" + path)
+			worker.result = listenResult{l, err}
+			close(worker.done)
+		}()
+		return worker
+	}
+	// Join all starts before restoring the hooks or working directory. Keep
+	// the first listener open until the second start has finished its probe.
+	t.Cleanup(func() {
+		release()
+		for _, worker := range started {
+			<-worker.done
+		}
+		for _, worker := range started {
+			if l := worker.result.l; l != nil {
+				l.Close()
+			}
+		}
+	})
+
+	first := start()
 	receive(t, reached, "the first start to reach the removal")
-	second := listenAsync("unix://" + path)
+	second := start()
 	receive(t, polled, "the second start to wait for the lock")
 	select {
-	case r := <-second:
-		t.Fatalf("the second start finished while the first held the lock: %v", r.err)
+	case <-second.done:
+		t.Fatalf("the second start finished while the first held the lock: %v", second.result.err)
 	default:
 	}
-	close(proceed)
+	release()
 
-	f := receive(t, first, "the first start")
+	receive(t, first.done, "the first start")
+	f := first.result
 	if f.err != nil {
 		t.Fatalf("first start: %v", f.err)
 	}
-	defer f.l.Close()
 	go serveOnce(f.l)
-	s := receive(t, second, "the second start")
+	receive(t, second.done, "the second start")
+	s := second.result
 	if s.err == nil {
-		s.l.Close()
 		t.Fatal("the second start took the path of the first listener")
 	}
 	if !errors.Is(s.err, ErrAddressInUse) {
