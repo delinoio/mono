@@ -479,6 +479,7 @@ func TestDevSessionExec(t *testing.T) {
 	s, _ := w.runningSession(t)
 	var mu sync.Mutex
 	var got ownsand.ExecParams
+	rotatedID := api.NewID()
 	w.fake.SetExec(func(ctx context.Context, id string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
 		mu.Lock()
 		got = p
@@ -488,6 +489,14 @@ func TestDevSessionExec(t *testing.T) {
 			return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
 		}
 		if p.Command[0] == "sleep" {
+			for _, ev := range []ownsand.ExecEvent{
+				{Kind: ownsand.ExecEventStdout, Offset: 0, Data: []byte("hello")},
+				{Kind: ownsand.ExecEventStderr, Offset: 0, Data: []byte("ok")},
+			} {
+				if err := p.OnEvent(ev); err != nil {
+					return nil, err
+				}
+			}
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}
@@ -496,7 +505,12 @@ func TestDevSessionExec(t *testing.T) {
 		code := int64(3)
 		return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
 	}, func(ctx context.Context, id, execID string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
-		_ = p.OnEvent(ownsand.ExecEvent{Kind: ownsand.ExecEventStderr, ExecID: execID, Offset: p.StderrOffset, Data: []byte("late")})
+		if execID != rotatedID || p.StdoutOffset != 5 || p.StderrOffset != 2 {
+			return nil, fmt.Errorf("attach got exec %s at offsets (%d, %d), want exec %s at (5, 2)", execID, p.StdoutOffset, p.StderrOffset, rotatedID)
+		}
+		if err := p.OnEvent(ownsand.ExecEvent{Kind: ownsand.ExecEventStderr, ExecID: execID, Offset: p.StderrOffset, Data: []byte("late")}); err != nil {
+			return nil, err
+		}
 		sig := int32(9)
 		return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, Signal: &sig}, nil
 	})
@@ -527,15 +541,19 @@ func TestDevSessionExec(t *testing.T) {
 	// limit, with keepalives meanwhile.
 	start := time.Now()
 	stream, err = owner.DevSession.ExecDevSession(ctx, connect.NewRequest(&tidev1.ExecDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
-		ExecId: api.NewID(), Command: []string{"sleep", "100"}}))
+		ExecId: rotatedID, Command: []string{"sleep", "100"}}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	events, err = collectExec(t, stream, func() *tidev1.DevSessionExecEvent { return stream.Msg().GetEvent() })
-	if err != nil || time.Since(start) > 5*time.Second || len(events) < 2 {
+	if err != nil || time.Since(start) > 5*time.Second || len(events) < 3 {
 		t.Fatalf("rotated stream %v %v", events, err)
 	}
-	for _, ev := range events {
+	stdout, stderr := events[0].GetStdout(), events[1].GetStderr()
+	if string(stdout.GetData()) != "hello" || string(stderr.GetData()) != "ok" {
+		t.Fatalf("unexpected output before rotation: %v", events[:2])
+	}
+	for _, ev := range events[2:] {
 		if ev.GetKeepalive() == nil {
 			t.Fatalf("non-keepalive event %v", ev)
 		}
@@ -543,7 +561,9 @@ func TestDevSessionExec(t *testing.T) {
 
 	// Attach continues from offsets.
 	astream, err := owner.DevSession.AttachDevSessionExec(ctx, connect.NewRequest(&tidev1.AttachDevSessionExecRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
-		ExecId: execID, StdoutOffset: 5, StderrOffset: 2}))
+		ExecId:       rotatedID,
+		StdoutOffset: stdout.GetOffset() + int64(len(stdout.GetData())),
+		StderrOffset: stderr.GetOffset() + int64(len(stderr.GetData()))}))
 	if err != nil {
 		t.Fatal(err)
 	}

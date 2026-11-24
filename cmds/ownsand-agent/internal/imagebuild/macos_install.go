@@ -4,6 +4,7 @@ package imagebuild
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 )
@@ -12,12 +13,12 @@ type macOSInstallation interface {
 	completion() <-chan error
 	cancel()
 	fractionCompleted() float64
-	close(stopVM bool)
+	close(stopVM bool) error
 }
 
 // A successful start must register a completion callback. After that point,
 // the installer owns the staged files until the callback fires.
-func runMacOSInstall(ctx context.Context, start func(context.Context) (macOSInstallation, error), logger *slog.Logger) error {
+func runMacOSInstall(ctx context.Context, start func(context.Context) (macOSInstallation, error), logger *slog.Logger) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -27,7 +28,11 @@ func runMacOSInstall(ctx context.Context, start func(context.Context) (macOSInst
 		return err
 	}
 	stopVM := false
-	defer func() { installation.close(stopVM) }()
+	defer func() {
+		if closeErr := installation.close(stopVM); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	logger.Info("installing macOS")
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()

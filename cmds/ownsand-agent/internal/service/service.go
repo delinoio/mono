@@ -268,7 +268,7 @@ const windowsSeparators = "#~|@$*?;:!^&<>{}[]()'`"
 // WindowsCommand returns the sc.exe command that registers the Windows
 // service, for operators who do not use `service install`.
 func WindowsCommand(exe string) string {
-	return fmt.Sprintf(`sc.exe create %s binPath= "\"%s\" run" start= auto DisplayName= "OwnSand device agent"`, Name, exe)
+	return fmt.Sprintf(`sc.exe create %s binPath= "\"%s\" service launch run" start= auto DisplayName= "OwnSand device agent"`, Name, exe)
 }
 
 // WindowsRecoveryCommands returns the two sc.exe commands that set the
@@ -335,8 +335,8 @@ func windowsQuote(s string) string {
 // WindowsDefinition returns the printed Windows service definition: the
 // sc.exe create command, the two sc.exe failure-action commands and, when env
 // is not empty, the reg.exe command that sets the service environment.
-func WindowsDefinition(exe string, env []string) string {
-	out := WindowsCommand(exe) + "\n"
+func WindowsDefinition(source, launcher string, env []string) string {
+	out := fmt.Sprintf(`"%s" service prepare`+"\n", source) + WindowsCommand(launcher) + "\n"
 	for _, c := range WindowsRecoveryCommands() {
 		out += c + "\n"
 	}

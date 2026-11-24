@@ -15,6 +15,7 @@ import "C"
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"runtime/cgo"
 	"unsafe"
@@ -75,9 +76,17 @@ func (i *nativeMacOSInstallation) fractionCompleted() float64 {
 	return float64(C.ownsandMacOSInstallFractionCompleted(i.ptr))
 }
 
-func (i *nativeMacOSInstallation) close(stopVM bool) {
-	C.ownsandMacOSInstallClose(i.ptr, C.bool(stopVM))
-	i.handle.Delete()
+func (i *nativeMacOSInstallation) close(stopVM bool) error {
+	defer i.handle.Delete()
+	var nativeError *C.char
+	if C.ownsandMacOSInstallClose(i.ptr, C.bool(stopVM), C.int64_t(vzrt.StopTimeout.Nanoseconds()), &nativeError) {
+		return nil
+	}
+	if nativeError != nil {
+		defer C.free(unsafe.Pointer(nativeError))
+		return fmt.Errorf("stop the install VM: %w: %s", vzrt.ErrVMMayRun, C.GoString(nativeError))
+	}
+	return fmt.Errorf("stop the install VM: %w: the VM did not reach a terminal state in time", vzrt.ErrVMMayRun)
 }
 
 //export ownsandMacOSInstallCanStart

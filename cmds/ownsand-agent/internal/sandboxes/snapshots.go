@@ -274,11 +274,14 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 	m.logger.Info("snapshot creating", "snapshot_id", id, "sandbox_id", cmd.GetSandboxId())
 	info, err := m.rt.Snapshot(ctx, vm, filepath.Join(dir, contentDir))
 	if err != nil {
-		fsutil.RemoveAll(dir)
-		m.logger.Error("snapshot failed", "snapshot_id", id, "sandbox_id", cmd.GetSandboxId(), "error", err)
 		if state == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && info.SourceState == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 			m.recordSourcePausedAfterSnapshot(sb)
 		}
+		if ctx.Err() != nil {
+			return nil, m.abortCanceledSnapshotCreate(id, dir, err)
+		}
+		fsutil.RemoveAll(dir)
+		m.logger.Error("snapshot failed", "snapshot_id", id, "sandbox_id", cmd.GetSandboxId(), "error", err)
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot could not be taken")
 	}
 	// A runtime can return success after ctx ended, for example when it

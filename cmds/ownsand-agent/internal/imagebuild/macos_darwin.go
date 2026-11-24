@@ -68,10 +68,10 @@ func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
 			return
 		}
 		if errors.Is(err, vzrt.ErrVMMayRun) {
-			// The first-boot VM may still use the staged disk, so deleting
+			// The build VM may still use the staged disk, so deleting
 			// it could corrupt a running guest; keep it. The next build
 			// removes the directory at its start.
-			logger.Error("keeping the macOS build directory because the first-boot VM may still run", "build_dir", build)
+			logger.Error("keeping the macOS build directory because the build VM may still run", "build_dir", build)
 			return
 		}
 		os.RemoveAll(build)
@@ -154,29 +154,40 @@ func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
 	if err := provisionMacOSDisk(ctx, build, disk, opts.GuestBinary, logger); err != nil {
 		return err
 	}
-	helper, err := firstBootMacOS(ctx, machine, logger)
-	if err != nil {
-		return err
+	var downloadedIPSW string
+	if opts.IPSW == "" {
+		downloadedIPSW = ipsw
 	}
-	if err := images.WriteMetadata(build, images.Metadata{
+	metadata := images.Metadata{
 		GuestOS:          ownsandv1.GuestOs_GUEST_OS_MACOS,
 		Source:           source,
-		BuiltAt:          time.Now().UTC(),
 		DiskBytes:        diskGiB << 30,
 		MinimumCPUCount:  minCPUs,
 		MinimumMemoryMiB: minMemMiB,
-		GuestVersion:     helper,
+	}
+	if err := finishMacOSImage(dir, metadata, downloadedIPSW, func() (string, error) {
+		return firstBootMacOS(ctx, machine, logger)
 	}); err != nil {
-		return err
-	}
-	if opts.IPSW == "" {
-		os.Remove(ipsw)
-	}
-	if err := images.Install(dir); err != nil {
 		return err
 	}
 	logger.Info("macOS image installed", "source", source)
 	return nil
+}
+
+func finishMacOSImage(dir string, metadata images.Metadata, downloadedIPSW string, firstBoot func() (string, error)) error {
+	helper, err := firstBoot()
+	if err != nil {
+		return err
+	}
+	metadata.BuiltAt = time.Now().UTC()
+	metadata.GuestVersion = helper
+	if err := images.WriteMetadata(images.BuildDir(dir), metadata); err != nil {
+		return err
+	}
+	if downloadedIPSW != "" {
+		os.Remove(downloadedIPSW)
+	}
+	return images.Install(dir)
 }
 
 // downloadRestoreImage downloads the latest restore image that this Mac
@@ -264,20 +275,23 @@ func firstBootMacOS(ctx context.Context, m vzrt.MacOSMachine, logger *slog.Logge
 	if err != nil {
 		return "", fmt.Errorf("imagebuild: create the first-boot VM: %w", err)
 	}
-	exited := vzrt.WatchStopped(machine)
+	exit := vzrt.WatchVMExit(machine.StateChangedNotify())
 	start := time.Now()
 	if err := machine.Start(); err != nil {
 		return "", fmt.Errorf("imagebuild: start the first boot: %w", err)
 	}
-	stopped := false
 	defer func() {
-		if !stopped && err != nil {
-			err = vzrt.StopVMAfterFailure(err, machine, exited)
+		if err != nil {
+			err = vzrt.StopVMForCleanup(err, machine, exit.Done())
 		}
 	}()
 	dial := func(ctx context.Context) (net.Conn, error) {
-		return vzrt.DialGuest(ctx, machine, vzrt.GuestPort, exited)
+		return vzrt.DialGuest(ctx, machine, vzrt.GuestPort, exit.Done())
 	}
+	return provisionAndShutdownMacOS(ctx, dial, exit, logger, start, macOSShutdownTimeout)
+}
+
+func provisionAndShutdownMacOS(ctx context.Context, dial guestclient.Dialer, exit *vzrt.VMExit, logger *slog.Logger, start time.Time, shutdownTimeout time.Duration) (string, error) {
 	bootCtx, cancel := context.WithTimeout(ctx, macOSFirstBootTimeout)
 	defer cancel()
 	client := guestclient.New(dial)
@@ -296,7 +310,7 @@ func firstBootMacOS(ctx context.Context, m vzrt.MacOSMachine, logger *slog.Logge
 		if err != nil {
 			return "", fmt.Errorf("imagebuild: the guest helper did not answer after the first boot: %w", err)
 		}
-	case <-exited:
+	case <-exit.Done():
 		return "", errors.New("imagebuild: the guest stopped during its first boot")
 	}
 	logger.Info("macOS guest helper answered", "first_boot_ms", time.Since(start).Milliseconds(), "helper_version", helper)
@@ -309,15 +323,20 @@ func firstBootMacOS(ctx context.Context, m vzrt.MacOSMachine, logger *slog.Logge
 		}
 	}
 	logger.Info("macOS guest provisioned; shutting down")
-	// The helper does not answer after the shutdown starts, so the result
-	// of this command is not checked.
+	// The guest can disconnect before the helper replies. Use the VM state
+	// to confirm that shutdown succeeded.
 	sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
 	_, _ = guestsync.Run(sctx, buildSandboxID, dial, []string{"/sbin/shutdown", "-h", "now"})
 	scancel()
 	select {
-	case <-exited:
-		stopped = true
-	case <-time.After(macOSShutdownTimeout):
+	case <-exit.Done():
+		if state := exit.State(); state != vz.VirtualMachineStateStopped {
+			return "", fmt.Errorf("imagebuild: the first-boot VM failed during shutdown (%s)", state)
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+	case <-time.After(shutdownTimeout):
 		return "", errors.New("imagebuild: the guest did not shut down")
 	case <-ctx.Done():
 		return "", ctx.Err()
