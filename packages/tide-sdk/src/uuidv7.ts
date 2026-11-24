@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+const MAX_TIMESTAMP_MS = 2 ** 48 - 1;
+
 /**
  * UUID v7 generation for the identifiers that the client generates
  * (`exec_id`, `read_id` and `write_id`). The layout follows RFC 9562: a
@@ -17,21 +19,29 @@ export class UuidV7Generator {
     this.#nowMs = nowMs;
   }
 
+  /**
+   * Returns the next UUID v7. Throws RangeError if the floored clock reading
+   * or a counter carry exceeds the 48-bit timestamp limit. The generator
+   * keeps its last successful timestamp and counter on failure.
+   */
   next(): string {
     let ms = Math.floor(this.#nowMs());
+    let counter: number | undefined;
     if (ms <= this.#lastMs) {
       // Same millisecond, or a wall clock that went back: keep the last
       // timestamp and advance the counter so values stay increasing.
       ms = this.#lastMs;
-      this.#counter++;
-      if (this.#counter > 0xfff) {
+      if (this.#counter === 0xfff) {
         ms++;
-        this.#counter = randomCounter();
+      } else {
+        counter = this.#counter + 1;
       }
-    } else {
-      this.#counter = randomCounter();
     }
-    this.#lastMs = ms;
+    if (ms > MAX_TIMESTAMP_MS) {
+      throw new RangeError("UUID v7 timestamp exceeds the 48-bit limit");
+    }
+    counter ??= randomCounter();
+
     const bytes = new Uint8Array(16);
     globalThis.crypto.getRandomValues(bytes);
     let rest = ms;
@@ -39,13 +49,16 @@ export class UuidV7Generator {
       bytes[i] = rest % 256;
       rest = Math.floor(rest / 256);
     }
-    bytes[6] = 0x70 | ((this.#counter >> 8) & 0x0f);
-    bytes[7] = this.#counter & 0xff;
+    bytes[6] = 0x70 | ((counter >> 8) & 0x0f);
+    bytes[7] = counter & 0xff;
     bytes[8] = 0x80 | (bytes[8]! & 0x3f);
     const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(
       "",
     );
-    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    const uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    this.#lastMs = ms;
+    this.#counter = counter;
+    return uuid;
   }
 }
 
