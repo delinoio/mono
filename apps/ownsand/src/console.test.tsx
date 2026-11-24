@@ -1931,22 +1931,39 @@ describe("sandbox create form resources", () => {
     ).not.toBeNull();
   });
 
-  test("rejects memory and disk above 2^53 - 1 without a request", async () => {
+  test("rejects memory above 2^53 - 1 without a request", async () => {
     const { transport, created } = recordingTransport();
     const dialog = await openForm(transport);
     await commit(
       within(dialog).getByLabelText("Memory (MiB)"),
       "9007199254740993",
     );
-    await commit(
-      within(dialog).getByLabelText("Disk (GiB)"),
-      "10000000000000000000",
-    );
     await create(dialog);
     expect(dialog.textContent).toContain("MiB from 1 to 9007199254740991");
-    expect(dialog.textContent).toContain("GiB from 1 to 9007199254740991");
     expect(dialog.querySelector(".notice-error")).toBeNull();
     expect(created).toHaveLength(0);
+  });
+
+  test("rejects disk above the control-plane limit and sends the corrected value", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    const disk = within(dialog).getByLabelText("Disk (GiB)");
+    await commit(disk, "8589934592");
+    await create(dialog);
+    expect(disk.getAttribute("aria-invalid")).toBe("true");
+    expect(dialog.textContent).toContain(
+      "Enter a whole number of GiB from 1 to 8589934591.",
+    );
+    expect(dialog.querySelector(".notice-error")).toBeNull();
+    expect(created).toHaveLength(0);
+    expect(screen.getByRole("dialog", { name: "Create a sandbox" })).toBe(
+      dialog,
+    );
+
+    await commit(disk, "8589934591");
+    await create(dialog);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.diskGib).toBe(8589934591n);
   });
 
   test("creates with the largest vCPU count of the int32 range", async () => {
