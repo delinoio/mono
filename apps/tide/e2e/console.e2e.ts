@@ -24,6 +24,11 @@ describe("sign-in", () => {
     await expect(
       screen.getByRole("button", "Sign in with Delino"),
     ).toBeVisible();
+    await expect(
+      screen.getByText(
+        "Sign-in did not start. Check your connection and try again.",
+      ),
+    ).toBeHidden();
   });
 
   test("signs in and lists the organizations", async ({ app, screen }) => {
