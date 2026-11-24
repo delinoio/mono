@@ -5,7 +5,6 @@ package devsession
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/delinoio/mono/go/ownsand"
@@ -32,11 +31,8 @@ func (Adapter) BindsAtDispatch() bool { return true }
 // parents when they are missing.
 func MkdirCommand(guest tidev1.GuestOs, path string) []string {
 	if guest == tidev1.GuestOs_GUEST_OS_WINDOWS {
-		// PowerShell is part of every supported Windows guest; a single
-		// quoted string takes the path literally once its quotes double.
-		quoted := "'" + strings.ReplaceAll(path, "'", "''") + "'"
 		return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-			"New-Item -ItemType Directory -Force -Path " + quoted + " | Out-Null"}
+			"New-Item -ItemType Directory -Force -Path " + work.QuotePowerShell(path) + " | Out-Null"}
 	}
 	return []string{"mkdir", "-p", "--", path}
 }
