@@ -5,6 +5,7 @@ package work
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -127,7 +128,12 @@ func (e *Engine) drive(ctx context.Context, runnerID string, kick chan struct{})
 			continue
 		}
 		if RunnerTerminal(r.State) {
-			if e.cleanUpEnded(ctx, r) || !wait(e.timing.SandboxPoll) {
+			err := e.cleanUpEnded(ctx, r.ID, r.OrganizationID)
+			if err == nil {
+				return
+			}
+			e.svc.Logger.WarnContext(ctx, "runner_sandbox_cleanup_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+			if !wait(e.timing.SandboxPoll) {
 				return
 			}
 			continue
@@ -599,8 +605,11 @@ func (e *Engine) startFailed(ctx context.Context, runnerID, cause string) {
 	// The registration removal is not repeated for a FAILED runner: its
 	// failure is logged, and the sandbox goes anyway.
 	_ = e.removeRegistration(context.WithoutCancel(ctx), r)
-	if r.SandboxID != "" && !e.deleteEndedSandbox(context.WithoutCancel(ctx), r) {
-		e.ensureDriver(r.ID)
+	if r.SandboxID != "" {
+		if err := e.cleanUpEnded(context.WithoutCancel(ctx), r.ID, r.OrganizationID); err != nil {
+			e.svc.Logger.WarnContext(ctx, "runner_sandbox_cleanup_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+			e.ensureDriver(r.ID)
+		}
 	}
 	if ended != nil {
 		e.releaseClaim(ctx, ended)
@@ -610,36 +619,34 @@ func (e *Engine) startFailed(ctx context.Context, runnerID, cause string) {
 	}
 }
 
-// cleanUpEnded deletes the sandbox of an ended runner that is marked with
-// sandbox_cleanup. It reports whether no clean-up remains.
-func (e *Engine) cleanUpEnded(ctx context.Context, r *Runner) bool {
-	var pending bool
-	if err := e.svc.DB.Pool.QueryRow(ctx, "SELECT sandbox_cleanup FROM runners WHERE runner_id = $1", r.ID).Scan(&pending); err != nil {
-		return errors.Is(err, pgx.ErrNoRows)
+// cleanUpEnded deletes a pending sandbox without changing the runner's
+// terminal state. Read the sandbox ID with the mark because a late
+// CreateSandbox response can set both after the caller reads the runner.
+func (e *Engine) cleanUpEnded(ctx context.Context, runnerID, orgID string) error {
+	var sandboxID string
+	err := e.svc.DB.Pool.QueryRow(ctx, "SELECT COALESCE(ownsand_sandbox_id::text, '') FROM runners WHERE runner_id = $1 AND sandbox_cleanup", runnerID).Scan(&sandboxID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
 	}
-	return !pending || e.deleteEndedSandbox(ctx, r)
-}
+	if err != nil {
+		return fmt.Errorf("read pending sandbox: %w", err)
+	}
 
-// deleteEndedSandbox deletes the sandbox of an ended runner and clears its
-// sandbox_cleanup mark. It reports whether the mark is clear. A link that
-// is gone, or a key that OwnSand no longer accepts, cannot delete the
-// sandbox; its idle_ttl ends it.
-func (e *Engine) deleteEndedSandbox(ctx context.Context, r *Runner) bool {
-	client, _, err := e.links.ClientForRemoval(ctx, r.OrganizationID)
+	// If the link is gone or OwnSand rejects the key, the sandbox's
+	// idle_ttl ends it.
+	client, _, err := e.links.ClientForRemoval(ctx, orgID)
 	if err != nil && connect.CodeOf(err) != connect.CodeFailedPrecondition {
-		return false
+		return fmt.Errorf("load OwnSand client for cleanup: %w", err)
 	}
-	if err == nil && r.SandboxID != "" {
-		if _, err := client.DeleteSandbox(ctx, r.SandboxID); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
-			e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
-			return false
+	if err == nil && sandboxID != "" {
+		if _, err := client.DeleteSandbox(ctx, sandboxID); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
+			return fmt.Errorf("delete sandbox: %w", err)
 		}
 	}
-	if _, err := e.svc.DB.Pool.Exec(ctx, "UPDATE runners SET sandbox_cleanup = false WHERE runner_id = $1 AND sandbox_cleanup", r.ID); err != nil {
-		e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
-		return false
+	if _, err := e.svc.DB.Pool.Exec(ctx, "UPDATE runners SET sandbox_cleanup = false WHERE runner_id = $1 AND sandbox_cleanup", runnerID); err != nil {
+		return fmt.Errorf("clear sandbox cleanup mark: %w", err)
 	}
-	return true
+	return nil
 }
 
 // deleteRunner changes an open runner to DELETING with reason and ends its

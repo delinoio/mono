@@ -39,7 +39,7 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 	links.OnRemoval(link.RemovalHook{
 		Name: "work",
 		Prepare: func(ctx context.Context, orgID string) error {
-			return e.cleanUpRunners(ctx, orgID, func(*Runner) bool { return true })
+			return e.cleanUpOrganizationRunners(ctx, orgID)
 		},
 		InTx: func(ctx context.Context, tx pgx.Tx, orgID string) error {
 			ended, err := e.endOpenTx(ctx, tx, orgID, "", RequestEnd{State: reqCanceled, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_INTEGRATION_REMOVED})
@@ -81,7 +81,7 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 			if _, err := r.Service.DB.Pool.Exec(ctx, "UPDATE ownsand_links SET removing = true WHERE organization_id = $1", d.OrganizationID); err != nil {
 				return err
 			}
-			if err := e.cleanUpRunners(ctx, d.OrganizationID, func(*Runner) bool { return true }); err != nil {
+			if err := e.cleanUpOrganizationRunners(ctx, d.OrganizationID); err != nil {
 				// The core runs Abort only for the hooks before the one that
 				// failed, so this hook clears its own mark: the organization
 				// stays and its dispatch continues.
@@ -113,6 +113,31 @@ func (e *Engine) releasePending(ctx context.Context, key string) {
 			e.releaseClaim(ctx, r)
 		}
 	}
+}
+
+// cleanUpOrganizationRunners runs before the organization loses its OwnSand
+// key. List pending terminal work after cleaning open runners because an open
+// runner can fail to start during cleanup.
+func (e *Engine) cleanUpOrganizationRunners(ctx context.Context, orgID string) error {
+	if err := e.cleanUpRunners(ctx, orgID, func(*Runner) bool { return true }); err != nil {
+		return err
+	}
+	rows, err := e.svc.DB.Pool.Query(ctx, "SELECT runner_id::text FROM runners WHERE organization_id = $1 AND sandbox_cleanup AND state IN ($2, $3)",
+		orgID, int16(runDeleted), int16(runFailed))
+	if err != nil {
+		return err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, id := range ids {
+		if err := e.cleanUpEnded(ctx, id, orgID); err != nil {
+			errs = append(errs, fmt.Errorf("clean up sandbox of ended runner %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // cleanUpRunners deletes the open runners that match: each one is DELETING
