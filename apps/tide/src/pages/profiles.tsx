@@ -23,10 +23,9 @@ import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   CopyValue,
-  ErrorNotice,
   FormDialog,
-  Loading,
   PageHeader,
+  QueryBoundary,
 } from "../components/ui.tsx";
 import {
   emptyProfileForm,
@@ -77,7 +76,6 @@ export function ProfilesPage() {
   });
   const [editing, setEditing] = useState<RunnerProfile | "new">();
   const [deleting, setDeleting] = useState<RunnerProfile>();
-  const profiles = list.data?.profiles ?? [];
 
   return (
     <>
@@ -92,81 +90,85 @@ export function ProfilesPage() {
           ) : undefined
         }
       />
-      {list.isPending ? (
-        <Loading label="Loading runner profiles" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : profiles.length === 0 ? (
-        <SetupEmpty organizationId={organizationId} title="No runner profiles">
-          {admin
-            ? "Create a runner profile to start runners for your work."
-            : "Ask an admin to create a runner profile."}
-        </SetupEmpty>
-      ) : (
-        <ul className="list" aria-label="Runner profiles">
-          {profiles.map((p) => (
-            <li key={p.runnerProfileId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">
-                  {p.name} · {labels.workloadKind[p.workloadKind]} ·{" "}
-                  {labels.guestOs[p.guestOs]}
-                </span>
-                <span className="muted">
-                  {p.source.case === "ownsandTemplateId"
-                    ? `Template ${p.source.value}`
-                    : "Base image"}{" "}
-                  · {p.resources?.vcpuCount ?? 0} vCPU ·{" "}
-                  {String(p.resources?.memoryMib ?? 0n)} MiB ·{" "}
-                  {String(p.resources?.diskGib ?? 0n)} GiB · priority{" "}
-                  {labels.priority[p.priority].toLowerCase()} · warm{" "}
-                  {p.warmCount} · queue wait at most{" "}
-                  {formatDuration(p.maxQueueWait)}
-                </span>
-                {p.workloadKind === WorkloadKind.GITHUB_JOB &&
-                p.githubLabel !== "" ? (
-                  <span>
-                    runs-on:{" "}
-                    <CopyValue
-                      label={`runs-on label of ${p.name}`}
-                      value={p.githubLabel}
-                    />
-                  </span>
-                ) : null}
-                {p.workloadKind === WorkloadKind.AGENT_SESSION ? (
-                  <span className="muted">
-                    Integration:{" "}
-                    {integrationNames.get(p.agentIntegrationId) ??
-                      p.agentIntegrationId}
-                  </span>
-                ) : null}
-                {p.workloadKind === WorkloadKind.DEV_SESSION ? (
-                  <span className="muted">
-                    Workspace: <code>{p.workspacePath}</code>
-                  </span>
-                ) : null}
-              </div>
-              {admin ? (
-                <div className="list-actions">
-                  <Button
-                    variant={ButtonVariant.Secondary}
-                    size={ButtonSize.Small}
-                    onClick={() => setEditing(p)}
-                  >
-                    Edit
-                  </Button>
-                  <Button
-                    variant={ButtonVariant.Danger}
-                    size={ButtonSize.Small}
-                    onClick={() => setDeleting(p)}
-                  >
-                    Delete
-                  </Button>
-                </div>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      )}
+      <QueryBoundary query={list} loading="Loading runner profiles">
+        {(data) => {
+          const { profiles } = data;
+          return profiles.length === 0 ? (
+            <SetupEmpty
+              organizationId={organizationId}
+              title="No runner profiles"
+            >
+              {admin
+                ? "Create a runner profile to start runners for your work."
+                : "Ask an admin to create a runner profile."}
+            </SetupEmpty>
+          ) : (
+            <ul className="list" aria-label="Runner profiles">
+              {profiles.map((p) => (
+                <li key={p.runnerProfileId} className="list-row">
+                  <div className="list-main">
+                    <span className="list-title">
+                      {p.name} · {labels.workloadKind[p.workloadKind]} ·{" "}
+                      {labels.guestOs[p.guestOs]}
+                    </span>
+                    <span className="muted">
+                      {p.source.case === "ownsandTemplateId"
+                        ? `Template ${p.source.value}`
+                        : "Base image"}{" "}
+                      · {p.resources?.vcpuCount ?? 0} vCPU ·{" "}
+                      {String(p.resources?.memoryMib ?? 0n)} MiB ·{" "}
+                      {String(p.resources?.diskGib ?? 0n)} GiB · priority{" "}
+                      {labels.priority[p.priority].toLowerCase()} · warm{" "}
+                      {p.warmCount} · queue wait at most{" "}
+                      {formatDuration(p.maxQueueWait)}
+                    </span>
+                    {p.workloadKind === WorkloadKind.GITHUB_JOB &&
+                    p.githubLabel !== "" ? (
+                      <span>
+                        runs-on:{" "}
+                        <CopyValue
+                          label={`runs-on label of ${p.name}`}
+                          value={p.githubLabel}
+                        />
+                      </span>
+                    ) : null}
+                    {p.workloadKind === WorkloadKind.AGENT_SESSION ? (
+                      <span className="muted">
+                        Integration:{" "}
+                        {integrationNames.get(p.agentIntegrationId) ??
+                          p.agentIntegrationId}
+                      </span>
+                    ) : null}
+                    {p.workloadKind === WorkloadKind.DEV_SESSION ? (
+                      <span className="muted">
+                        Workspace: <code>{p.workspacePath}</code>
+                      </span>
+                    ) : null}
+                  </div>
+                  {admin ? (
+                    <div className="list-actions">
+                      <Button
+                        variant={ButtonVariant.Secondary}
+                        size={ButtonSize.Small}
+                        onClick={() => setEditing(p)}
+                      >
+                        Edit
+                      </Button>
+                      <Button
+                        variant={ButtonVariant.Danger}
+                        size={ButtonSize.Small}
+                        onClick={() => setDeleting(p)}
+                      >
+                        Delete
+                      </Button>
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          );
+        }}
+      </QueryBoundary>
       {editing !== undefined ? (
         <ProfileDialog
           profile={editing === "new" ? undefined : editing}

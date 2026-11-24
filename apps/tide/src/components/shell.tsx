@@ -21,7 +21,12 @@ import {
   RouteId,
   useRouter,
 } from "../router.tsx";
-import { ErrorNotice, Loading } from "./ui.tsx";
+import {
+  ErrorNotice,
+  Loading,
+  RefreshFailedNotice,
+  showsFullError,
+} from "./ui.tsx";
 
 interface OrgContextValue {
   organizationId: string;
@@ -210,14 +215,14 @@ export function OrgShell({
     organizationId,
   });
   let body: ReactNode;
-  if (org.isPending) {
-    body = <Loading label="Loading the organization" />;
-  } else if (org.error) {
+  if (showsFullError(org)) {
     body = (
       <main className="content">
         <ErrorNotice error={org.error} onRetry={() => void org.refetch()} />
       </main>
     );
+  } else if (org.data === undefined) {
+    body = <Loading label="Loading the organization" />;
   } else {
     const organization = org.data.organization!;
     const role = organization.callerRole;
@@ -251,6 +256,7 @@ export function OrgShell({
             </ul>
           </nav>
           <main className="content">
+            {org.error ? <RefreshFailedNotice query={org} /> : null}
             <InvalidLinkBanner organizationId={organizationId} />
             {canOpenSection(role, route.id) ? (
               children

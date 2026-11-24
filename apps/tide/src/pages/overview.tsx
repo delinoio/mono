@@ -19,6 +19,7 @@ import {
   ErrorNotice,
   Loading,
   PageHeader,
+  QueryBoundary,
   ShortId,
   StateBadge,
 } from "../components/ui.tsx";
@@ -228,40 +229,37 @@ export function OverviewPage() {
             </>
           ) : null}
         </p>
-        {capacity.isPending ? (
-          <Loading label="Loading the device pool" />
-        ) : capacity.error ? (
-          <ErrorNotice
-            error={capacity.error}
-            onRetry={() => void capacity.refetch()}
-          />
-        ) : capacity.data.devices.length === 0 ? (
-          <Empty title="No devices">
-            Link an OwnSand organization with devices, or enroll a device in the
-            OwnSand console.
-          </Empty>
-        ) : (
-          <div className="table-wrap">
-            <table className="table" aria-label="Devices">
-              <thead>
-                <tr>
-                  <th scope="col">Device</th>
-                  <th scope="col">State</th>
-                  <th scope="col">Platform</th>
-                  <th scope="col">vCPUs</th>
-                  <th scope="col">Memory</th>
-                  <th scope="col">Disk</th>
-                  <th scope="col">tide runners</th>
-                </tr>
-              </thead>
-              <tbody>
-                {capacity.data.devices.map((d) => (
-                  <DeviceRow key={d.ownsandDeviceId} device={d} />
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+        <QueryBoundary query={capacity} loading="Loading the device pool">
+          {(data) =>
+            data.devices.length === 0 ? (
+              <Empty title="No devices">
+                Link an OwnSand organization with devices, or enroll a device in
+                the OwnSand console.
+              </Empty>
+            ) : (
+              <div className="table-wrap">
+                <table className="table" aria-label="Devices">
+                  <thead>
+                    <tr>
+                      <th scope="col">Device</th>
+                      <th scope="col">State</th>
+                      <th scope="col">Platform</th>
+                      <th scope="col">vCPUs</th>
+                      <th scope="col">Memory</th>
+                      <th scope="col">Disk</th>
+                      <th scope="col">tide runners</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.devices.map((d) => (
+                      <DeviceRow key={d.ownsandDeviceId} device={d} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )
+          }
+        </QueryBoundary>
       </section>
     </>
   );

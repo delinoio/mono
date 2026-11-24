@@ -32,6 +32,24 @@ describe("sign-in", () => {
 });
 
 describe("organizations", () => {
+  test("shows the full error when the organization cannot load", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open("/orgs/0193b000-0000-7000-8000-000000000099/api-keys");
+
+    await expect(
+      screen.getByText("It was not found, or you no longer have access to it."),
+    ).toBeVisible();
+    await expect(screen.getByRole("button", "Try again")).toBeVisible();
+    await expect(screen.getByRole("navigation", "Organization")).toBeHidden();
+    await expect(
+      screen.getByText("The last refresh failed", { exact: false }),
+    ).toBeHidden();
+  });
+
   test("creates an organization from a dialog that focuses its only input", async ({
     app,
     screen,

@@ -9,10 +9,9 @@ import { type FormEvent, useState } from "react";
 import { TopBar } from "../components/shell.tsx";
 import {
   Empty,
-  ErrorNotice,
   FormDialog,
-  Loading,
   PageHeader,
+  QueryBoundary,
 } from "../components/ui.tsx";
 import { labels } from "../format.ts";
 import { secretFromInput, SECRET_PARAM } from "../invitation.ts";
@@ -57,30 +56,30 @@ export function OrganizationsPage() {
             </Button>
           }
         />
-        {orgs.isPending ? (
-          <Loading label="Loading organizations" />
-        ) : orgs.error ? (
-          <ErrorNotice error={orgs.error} onRetry={() => void orgs.refetch()} />
-        ) : orgs.data.organizations.length === 0 ? (
-          <Empty title="You are not in an organization yet">
-            Create one, or open an invitation link from an admin. Each tide
-            organization links to one OwnSand organization.
-          </Empty>
-        ) : (
-          <ul className="list" aria-label="Your organizations">
-            {orgs.data.organizations.map((org) => (
-              <li key={org.organizationId} className="list-row">
-                <Link
-                  className="list-link"
-                  to={orgPath(RouteId.Overview, org.organizationId)}
-                >
-                  <span className="list-title">{org.name}</span>
-                  <Badge>{labels.role[org.callerRole]}</Badge>
-                </Link>
-              </li>
-            ))}
-          </ul>
-        )}
+        <QueryBoundary query={orgs} loading="Loading organizations">
+          {(data) =>
+            data.organizations.length === 0 ? (
+              <Empty title="You are not in an organization yet">
+                Create one, or open an invitation link from an admin. Each tide
+                organization links to one OwnSand organization.
+              </Empty>
+            ) : (
+              <ul className="list" aria-label="Your organizations">
+                {data.organizations.map((org) => (
+                  <li key={org.organizationId} className="list-row">
+                    <Link
+                      className="list-link"
+                      to={orgPath(RouteId.Overview, org.organizationId)}
+                    >
+                      <span className="list-title">{org.name}</span>
+                      <Badge>{labels.role[org.callerRole]}</Badge>
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            )
+          }
+        </QueryBoundary>
         <section className="section" aria-labelledby="join-title">
           <h2 id="join-title">Join with an invitation</h2>
           <form className="inline-form" onSubmit={join}>

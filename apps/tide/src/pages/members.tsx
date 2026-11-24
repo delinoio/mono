@@ -14,10 +14,9 @@ import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Empty,
-  ErrorNotice,
   FormDialog,
-  Loading,
   PageHeader,
+  QueryBoundary,
   SecretDialog,
   toastError,
 } from "../components/ui.tsx";
@@ -67,70 +66,67 @@ export function MembersPage() {
           ) : undefined
         }
       />
-      {members.isPending ? (
-        <Loading label="Loading members" />
-      ) : members.error ? (
-        <ErrorNotice
-          error={members.error}
-          onRetry={() => void members.refetch()}
-        />
-      ) : (
-        <ul className="list" aria-label="Members">
-          {members.data.members.map((m) => {
-            const manageable = canManageMember(role, userId, m);
-            return (
-              <li key={m.userId} className="list-row">
-                <div className="list-main">
-                  <span className="list-title">
-                    {displayName(m)}
-                    {m.userId === userId ? (
-                      <span className="muted"> (you)</span>
-                    ) : null}
-                  </span>
-                  <span className="muted">Joined {formatTime(m.joinTime)}</span>
-                </div>
-                {manageable ? (
-                  <div className="list-actions">
-                    <Select
-                      label={`Role of ${displayName(m)}`}
-                      value={String(m.role)}
-                      onValueChange={async (v) => {
-                        if (v === null || Number(v) === m.role) return;
-                        try {
-                          await updateRole.mutateAsync({
-                            organizationId,
-                            userId: m.userId,
-                            role: Number(v) as Role,
-                          });
-                          toast.success("The role is changed.");
-                        } catch (error) {
-                          toastError(error);
-                        }
-                      }}
-                    >
-                      <SelectOption value={String(Role.ADMIN)}>
-                        Admin
-                      </SelectOption>
-                      <SelectOption value={String(Role.MEMBER)}>
-                        Member
-                      </SelectOption>
-                    </Select>
-                    <Button
-                      variant={ButtonVariant.Danger}
-                      size={ButtonSize.Small}
-                      onClick={() => setRemoving(m)}
-                    >
-                      Remove
-                    </Button>
+      <QueryBoundary query={members} loading="Loading members">
+        {(data) => (
+          <ul className="list" aria-label="Members">
+            {data.members.map((m) => {
+              const manageable = canManageMember(role, userId, m);
+              return (
+                <li key={m.userId} className="list-row">
+                  <div className="list-main">
+                    <span className="list-title">
+                      {displayName(m)}
+                      {m.userId === userId ? (
+                        <span className="muted"> (you)</span>
+                      ) : null}
+                    </span>
+                    <span className="muted">
+                      Joined {formatTime(m.joinTime)}
+                    </span>
                   </div>
-                ) : (
-                  <span className="role">{labels.role[m.role]}</span>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      )}
+                  {manageable ? (
+                    <div className="list-actions">
+                      <Select
+                        label={`Role of ${displayName(m)}`}
+                        value={String(m.role)}
+                        onValueChange={async (v) => {
+                          if (v === null || Number(v) === m.role) return;
+                          try {
+                            await updateRole.mutateAsync({
+                              organizationId,
+                              userId: m.userId,
+                              role: Number(v) as Role,
+                            });
+                            toast.success("The role is changed.");
+                          } catch (error) {
+                            toastError(error);
+                          }
+                        }}
+                      >
+                        <SelectOption value={String(Role.ADMIN)}>
+                          Admin
+                        </SelectOption>
+                        <SelectOption value={String(Role.MEMBER)}>
+                          Member
+                        </SelectOption>
+                      </Select>
+                      <Button
+                        variant={ButtonVariant.Danger}
+                        size={ButtonSize.Small}
+                        onClick={() => setRemoving(m)}
+                      >
+                        Remove
+                      </Button>
+                    </div>
+                  ) : (
+                    <span className="role">{labels.role[m.role]}</span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </QueryBoundary>
       {can(role, Permission.ManageInvitations) ? <Invitations /> : null}
       <ConfirmDialog
         open={removing !== undefined}
@@ -177,9 +173,6 @@ function Invitations() {
   const [creating, setCreating] = useState(false);
   const [inviteRole, setInviteRole] = useState(String(Role.MEMBER));
   const [link, setLink] = useState<string>();
-  const pending =
-    list.data?.invitations.filter((i) => i.state === InvitationState.PENDING) ??
-    [];
 
   return (
     <section className="section" aria-labelledby="invitations-title">
@@ -192,46 +185,49 @@ function Invitations() {
           Invite someone
         </Button>
       </div>
-      {list.isPending ? (
-        <Loading label="Loading invitations" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : pending.length === 0 ? (
-        <Empty title="No pending invitations" />
-      ) : (
-        <ul className="list" aria-label="Pending invitations">
-          {pending.map((i) => (
-            <li key={i.invitationId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">
-                  {labels.role[i.role]} invitation{" "}
-                  <code>{i.secretPrefix}…</code>
-                </span>
-                <span className="muted">
-                  Expires {formatTime(i.expireTime)}
-                </span>
-              </div>
-              <Button
-                variant={ButtonVariant.Secondary}
-                size={ButtonSize.Small}
-                onClick={async () => {
-                  try {
-                    await revoke.mutateAsync({
-                      organizationId,
-                      invitationId: i.invitationId,
-                    });
-                    toast.success("The invitation is revoked.");
-                  } catch (error) {
-                    toastError(error);
-                  }
-                }}
-              >
-                Revoke
-              </Button>
-            </li>
-          ))}
-        </ul>
-      )}
+      <QueryBoundary query={list} loading="Loading invitations">
+        {(data) => {
+          const pending = data.invitations.filter(
+            (i) => i.state === InvitationState.PENDING,
+          );
+          return pending.length === 0 ? (
+            <Empty title="No pending invitations" />
+          ) : (
+            <ul className="list" aria-label="Pending invitations">
+              {pending.map((i) => (
+                <li key={i.invitationId} className="list-row">
+                  <div className="list-main">
+                    <span className="list-title">
+                      {labels.role[i.role]} invitation{" "}
+                      <code>{i.secretPrefix}…</code>
+                    </span>
+                    <span className="muted">
+                      Expires {formatTime(i.expireTime)}
+                    </span>
+                  </div>
+                  <Button
+                    variant={ButtonVariant.Secondary}
+                    size={ButtonSize.Small}
+                    onClick={async () => {
+                      try {
+                        await revoke.mutateAsync({
+                          organizationId,
+                          invitationId: i.invitationId,
+                        });
+                        toast.success("The invitation is revoked.");
+                      } catch (error) {
+                        toastError(error);
+                      }
+                    }}
+                  >
+                    Revoke
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          );
+        }}
+      </QueryBoundary>
       <FormDialog
         open={creating}
         onOpenChange={setCreating}
