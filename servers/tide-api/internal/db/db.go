@@ -64,7 +64,8 @@ type DB struct {
 func Open(ctx context.Context, url string) (*DB, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
-		return nil, fmt.Errorf("parse database url: %w", err)
+		// The parser error can contain secrets from the connection string.
+		return nil, errors.New("parse database url: invalid connection string")
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

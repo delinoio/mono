@@ -497,33 +497,23 @@ func (h *UsageHandler) GetOrganizationBilling(ctx context.Context, req *connect.
 	if _, err := h.usageClient(ctx, req.Msg.GetService()); err != nil {
 		return nil, err
 	}
-	st, ok, err := h.billing.FreshStatus(ctx, service, orgID)
+	snapshot, ok, err := h.billing.ReadOrganizationBilling(ctx, service, orgID)
 	if err != nil {
 		return nil, h.internal(ctx, "get_organization_billing", err)
 	}
 	if !ok {
 		return nil, notFound("the organization has no link")
 	}
-	now := h.timestamp()
-	var name string
-	if err := h.db.Pool.QueryRow(ctx, `SELECT name FROM billing_accounts WHERE billing_account_id = $1`,
-		st.BillingAccountID).Scan(&name); err != nil {
-		return nil, h.internal(ctx, "get_organization_billing", err)
-	}
-	balance, _, err := billing.Balance(ctx, h.db.Pool, st.BillingAccountID, now)
-	if err != nil {
-		return nil, h.internal(ctx, "get_organization_billing", err)
-	}
-	monthStart := billing.MonthStart(now)
+	monthStart := billing.MonthStart(snapshot.Time)
 	usage, err := billing.OrganizationMonthUsage(ctx, h.db.Pool, service, orgID, monthStart, monthStart.AddDate(0, 1, 0))
 	if err != nil {
 		return nil, h.internal(ctx, "get_organization_billing", err)
 	}
 	resp := &accountsv1.GetOrganizationBillingResponse{
-		BillingAccountId:   st.BillingAccountID,
-		BillingAccountName: name,
-		BalanceUsdMicros:   balance,
-		Status:             st.Proto(),
+		BillingAccountId:   snapshot.Status.BillingAccountID,
+		BillingAccountName: snapshot.AccountName,
+		BalanceUsdMicros:   snapshot.Balance,
+		Status:             snapshot.Status.Proto(),
 		MonthStart:         timestamppb.New(monthStart),
 	}
 	for _, meter := range billing.ServiceMeters(req.Msg.GetService()) {

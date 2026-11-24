@@ -188,6 +188,14 @@ func TestCloseAccountPendingCheckoutAlreadyClosedAtPaddle(t *testing.T) {
 		acct := f.account()
 		txnID := f.checkout(acct)
 		f.paddle.SetTransactionStatus(txnID, paddle.TransactionStatusCanceled)
+		f.grant(acct, LedgerManualTopUp, 25*usd)
+		f.paddle.Fail("GET /transactions/", &paddletest.Failure{Status: http.StatusServiceUnavailable, Code: "unavailable"})
+
+		wantConnectCode(t, "close account", f.closeAccount(acct), connect.CodeUnavailable)
+		f.wantPendingCheckout(acct, txnID)
+		f.wantLedger(acct, wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd})
+
+		f.paddle.Fail("GET /transactions/", nil)
 		if err := f.closeAccount(acct); err != nil {
 			t.Fatal(err)
 		}
@@ -195,6 +203,10 @@ func TestCloseAccountPendingCheckoutAlreadyClosedAtPaddle(t *testing.T) {
 		if stored.Status != SubscriptionCanceled || stored.CheckoutTransactionID != "" {
 			t.Fatalf("stored subscription = %s with checkout %q", stored.Status, stored.CheckoutTransactionID)
 		}
+		f.wantLedger(acct,
+			wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd},
+			wantEntry{LedgerExpiry, -25 * usd, 0},
+		)
 	})
 }
 
@@ -310,13 +322,16 @@ func TestCloseAccountRetryAfterRollbackNeedsPaddleConfirmation(t *testing.T) {
 	}
 	t.Run("read fails", func(t *testing.T) {
 		f, acct, subID := setup(t)
-		_ = f.db.InTx(ctx(), func(tx pgx.Tx) error {
+		err := f.db.InTx(ctx(), func(tx pgx.Tx) error {
 			if err := f.s.CloseAccount(ctx(), tx, acct); err != nil {
 				return err
 			}
 			return errLaterWrite
 		})
-		f.paddle.Fail("GET /subscriptions/", &paddletest.Failure{Status: http.StatusServiceUnavailable, Code: "unavailable"})
+		if !errors.Is(err, errLaterWrite) {
+			t.Fatalf("first attempt = %v", err)
+		}
+		f.paddle.Fail("GET /subscriptions/", &paddletest.Failure{Status: http.StatusBadRequest, Code: "bad_request"})
 		wantConnectCode(t, "retry", f.closeAccount(acct), connect.CodeUnavailable)
 		stored, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
 		if stored.Status != SubscriptionActive || stored.PaddleSubscriptionID != subID {
@@ -328,6 +343,10 @@ func TestCloseAccountRetryAfterRollbackNeedsPaddleConfirmation(t *testing.T) {
 		if err := f.closeAccount(acct); err != nil {
 			t.Fatal(err)
 		}
+		f.wantLedger(acct,
+			wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd},
+			wantEntry{LedgerExpiry, -25 * usd, 0},
+		)
 	})
 	t.Run("rejected while active", func(t *testing.T) {
 		f, acct, subID := setup(t)

@@ -15,6 +15,7 @@ import (
 	"github.com/delinoio/mono/go/uuidv7"
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
+	"github.com/delinoio/mono/servers/accounts-api/internal/api"
 	"github.com/delinoio/mono/servers/accounts-api/internal/billing"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle/paddletest"
@@ -295,10 +296,52 @@ func TestDeleteBillingAccountCancelsPendingCheckout(t *testing.T) {
 	}
 
 	env.Paddle.Fail("PATCH /transactions/", nil)
-	wantCode(t, del(), 0)
+	injectMemberDeleteFailure(t, env)
+	wantCode(t, del(), connect.CodeInternal)
 	if txn, _ := env.Paddle.Transaction(txnID); txn.Status != paddle.TransactionStatusCanceled {
-		t.Fatalf("Paddle transaction after the deletion = %s", txn.Status)
+		t.Fatalf("Paddle transaction after the rollback = %s, want canceled", txn.Status)
 	}
+	if _, err := env.DB.Pool.Exec(ctx(), `DROP TRIGGER fail_member_delete ON billing_account_members`); err != nil {
+		t.Fatal(err)
+	}
+
+	env.Paddle.Fail("GET /transactions/", &paddletest.Failure{Status: http.StatusServiceUnavailable, Code: "unavailable"})
+	wantCode(t, del(), connect.CodeUnavailable)
+	wantCancellationLookupLog(t, env, "get_checkout_transaction", f.AccountID, "paddle_transaction_id", txnID)
+	if _, err := f.Owner.Client.GetBillingAccount(ctx(), connect.NewRequest(&accountsv1.GetBillingAccountRequest{BillingAccountId: f.AccountID})); err != nil {
+		t.Fatalf("billing account after the lookup failed: %v", err)
+	}
+	sub, err := billing.LoadSubscription(ctx(), env.DB.Pool, f.AccountID, false)
+	if err != nil || sub.Status != billing.SubscriptionPending || sub.CheckoutTransactionID != txnID {
+		t.Fatalf("local subscription = %+v, %v, want pending checkout %q", sub, err, txnID)
+	}
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM paddle_checkouts WHERE billing_account_id = $1 AND paddle_transaction_id = $2`,
+		f.AccountID, txnID).Scan(&checkouts); err != nil || checkouts != 1 {
+		t.Fatalf("checkout records after the lookup failed = %d, %v", checkouts, err)
+	}
+	if n := auditRowCount(t, env, f.AccountID, api.AuditBillingAccountDeleted); n != 0 {
+		t.Fatalf("deletion audits after the lookup failed = %d, want 0", n)
+	}
+
+	env.Paddle.Fail("GET /transactions/", nil)
+	wantCode(t, del(), 0)
+	if n := auditRowCount(t, env, f.AccountID, api.AuditBillingAccountDeleted); n != 1 {
+		t.Fatalf("deletion audits after the retry = %d, want 1", n)
+	}
+}
+
+func wantCancellationLookupLog(t *testing.T, env *testenv.Env, operation, accountID, paddleIDField, paddleID string) {
+	t.Helper()
+	want := fmt.Sprintf(`"msg":"billing_paddle_call_failed","operation":%q,"billing_account_id":%q,%q:%q`, operation, accountID, paddleIDField, paddleID)
+	for line := range strings.SplitSeq(env.Logs.String(), "\n") {
+		if strings.Contains(line, want) {
+			if strings.Contains(line, "fake failure") || strings.Contains(line, paddletest.APIKey) {
+				t.Fatal("lookup failure log includes Paddle response detail or credentials")
+			}
+			return
+		}
+	}
+	t.Fatalf("no Paddle failure log for %s", operation)
 }
 
 func injectMemberDeleteFailure(t *testing.T, env *testenv.Env) {
@@ -452,7 +495,25 @@ func TestDeleteBillingAccountRetryAfterRollback(t *testing.T) {
 	if _, err := env.DB.Pool.Exec(ctx(), `DROP TRIGGER fail_member_delete ON billing_account_members`); err != nil {
 		t.Fatal(err)
 	}
+	env.Paddle.Fail("GET /subscriptions/", &paddletest.Failure{Status: http.StatusBadRequest, Code: "bad_request"})
+	wantCode(t, del(), connect.CodeUnavailable)
+	wantCancellationLookupLog(t, env, "get_subscription", f.AccountID, "paddle_subscription_id", subID)
+	if got := balanceOf(t, env, f.Owner.ID, f.AccountID).GetBalanceUsdMicros(); got != 10*usd {
+		t.Fatalf("balance after the lookup failed = %d, want %d", got, 10*usd)
+	}
+	sub, err := billing.LoadSubscription(ctx(), env.DB.Pool, f.AccountID, false)
+	if err != nil || sub.Status != billing.SubscriptionActive || sub.PaddleSubscriptionID != subID {
+		t.Fatalf("local subscription = %+v, %v, want active subscription %q", sub, err, subID)
+	}
+	if n := auditRowCount(t, env, f.AccountID, api.AuditBillingAccountDeleted); n != 0 {
+		t.Fatalf("deletion audits after the lookup failed = %d, want 0", n)
+	}
+
+	env.Paddle.Fail("GET /subscriptions/", nil)
 	wantCode(t, del(), 0)
+	if n := auditRowCount(t, env, f.AccountID, api.AuditBillingAccountDeleted); n != 1 {
+		t.Fatalf("deletion audits after the retry = %d, want 1", n)
+	}
 	if err := env.DB.Pool.QueryRow(ctx(), `SELECT status FROM subscriptions WHERE billing_account_id = $1`, f.AccountID).Scan(&status); err != nil || status != "canceled" {
 		t.Fatalf("local subscription after the retry = %q, %v", status, err)
 	}

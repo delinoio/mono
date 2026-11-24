@@ -186,7 +186,7 @@ func New(opts Options) (*App, error) {
 	}
 	supervisor := &lease.Supervisor{Logger: opts.Logger}
 	l := &lease.Lease{
-		DB: opts.DB, InstanceID: opts.InstanceID, Now: opts.Now, Logger: opts.Logger, DeadlineNow: opts.LeaseDeadlineNow,
+		DB: opts.DB, InstanceID: opts.InstanceID, Logger: opts.Logger, DeadlineNow: opts.LeaseDeadlineNow,
 		OnAcquire: func(context.Context) { supervisor.Start() },
 		OnLose:    supervisor.Stop,
 	}

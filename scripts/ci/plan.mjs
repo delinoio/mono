@@ -3,9 +3,9 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import {
   changedFormatFiles,
-  MissingPathPolicy,
   NonUtf8Policy,
   repositoryRoot,
+  UnavailablePathPolicy,
 } from "./format-changed.mjs";
 import {
   declaredReleaseInputs,
@@ -22,6 +22,8 @@ const fixtureInputs = new Set([
   ".changeset/config.json",
   ".github/workflows/deploy.yml",
   ".github/workflows/CI.yml",
+  // The deploy fixtures check the single `queue` exception.
+  ".github/actionlint.yaml",
   ".nvmrc",
   "package.json",
   "pnpm-lock.yaml",
@@ -31,6 +33,8 @@ const fixtureInputs = new Set([
   "scripts/install-git-hooks.sh",
   // The Droplet fixtures run this helper against a stubbed `docker`.
   "scripts/droplet/start-caddy.sh",
+  // The Droplet fixtures run this helper against a stubbed `systemctl`.
+  "scripts/droplet/configure-docker-logs.sh",
   // `scripts/ci/protos-generate.test.mjs` runs this script against a fake `go`
   // in `test:tooling`. It is also a protobuf input (see `protoInputs`).
   "scripts/protos.sh",
@@ -305,9 +309,9 @@ function assertAncestorComparison(root, base, head) {
 export function plan(cwd, base, head) {
   // Reuse the formatter's revision validation and literal-path selection. The
   // planner runs without installed dependencies and cannot evaluate the Rstack
-  // exclusions, so a non-UTF-8 formattable name and a formattable path missing
-  // from the working tree are deferred: they select formatting and the
-  // `quality` job's formatter gives the verdict.
+  // exclusions. A formattable path with a non-UTF-8 name or a missing or
+  // non-regular working-tree entry selects formatting. The `quality`
+  // job's formatter checks the exclusions and gives the verdict.
   const format =
     changedFormatFiles(
       cwd,
@@ -315,7 +319,7 @@ export function plan(cwd, base, head) {
       head,
       false,
       NonUtf8Policy.Defer,
-      MissingPathPolicy.Defer,
+      UnavailablePathPolicy.Defer,
     ).length > 0;
   // The formatter selection above validated both revisions.
   assertAncestorComparison(repositoryRoot(cwd), base, head);

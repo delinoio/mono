@@ -175,6 +175,15 @@ export enum FailureClass {
   ResourceExhausted = "resource_exhausted",
 }
 
+/** Identifies a local credential error, including the cause Connect wraps. */
+export function isLocalCredentialError(error: unknown): boolean {
+  return (
+    error instanceof OwnSandCredentialError ||
+    (error instanceof ConnectError &&
+      error.cause instanceof OwnSandCredentialError)
+  );
+}
+
 /**
  * Classifies an error of an `AuthorizeRelay` or relay call under the relay
  * recovery rules of docs/packages-ownsand-sdk-foundation.md.
@@ -193,13 +202,7 @@ export function classifyFailure(error: unknown): FailureClass {
   if (error instanceof InvalidFrameError) {
     return FailureClass.Terminal;
   }
-  // A local credential failure is deterministic and is no transport
-  // interruption, also when Connect wrapped it (code unknown, cause set).
-  if (
-    error instanceof OwnSandCredentialError ||
-    (error instanceof ConnectError &&
-      error.cause instanceof OwnSandCredentialError)
-  ) {
+  if (isLocalCredentialError(error)) {
     return FailureClass.Terminal;
   }
   if (!(error instanceof ConnectError)) {

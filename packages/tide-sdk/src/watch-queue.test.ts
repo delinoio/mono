@@ -2,10 +2,10 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { RequestState, RunnerState } from "@delino/tide-protos/v1/common_pb";
-import type { MessageInitShape } from "@bufbuild/protobuf";
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import {
   WorkService,
-  type WatchQueueResponseSchema,
+  WatchQueueResponseSchema,
 } from "@delino/tide-protos/v1/work_pb";
 import { MAX_BACKOFF_MS } from "./backoff.ts";
 import { TideClient } from "./client.ts";
@@ -15,12 +15,16 @@ import {
   fakeServer,
   RecordingClock,
 } from "./testing/fake-server.ts";
-import { type WatchQueueEvent, WatchQueueEventKind } from "./watch-queue.ts";
+import {
+  watchQueue,
+  type WatchQueueCaller,
+  type WatchQueueEvent,
+  WatchQueueEventKind,
+} from "./watch-queue.ts";
 
 const ORG = "0193a000-0000-7000-8000-000000000001";
 
-type Step =
-  "snapshot" | "change" | "keepalive" | "unavailable" | "denied" | "hang";
+type Step = "snapshot" | "change" | "keepalive" | "unavailable" | "hang";
 
 /** A WatchQueue server whose stream number `n` runs `scripts[n]`. */
 function watchServer(scripts: Step[][], options = {}) {
@@ -63,8 +67,6 @@ function watchServer(scripts: Step[][], options = {}) {
               break;
             case "unavailable":
               throw new ConnectError("restarting", Code.Unavailable);
-            case "denied":
-              throw new ConnectError("no access", Code.PermissionDenied);
             case "hang":
               await new Promise((_, reject) =>
                 ctx.signal.addEventListener("abort", () =>
@@ -203,20 +205,76 @@ describe("watchQueue", () => {
     ]);
   });
 
-  test("ends with the server's error for a status that is not retryable", async () => {
-    const server = watchServer([["denied"]]);
+  test("redacts an echoed normalized token from a terminal stream status", async () => {
+    const server = fakeServer((router) => {
+      router.service(WorkService, {
+        async *watchQueue(_req, ctx) {
+          yield { event: { case: "snapshotComplete", value: {} } };
+          const auth = ctx.requestHeader.get("authorization");
+          throw new ConnectError(
+            `no access with ${auth}`,
+            Code.PermissionDenied,
+            {
+              "x-tide-test": "rejected",
+            },
+          );
+        },
+      });
+    });
     const client = new TideClient({
       origin: FAKE_ORIGIN,
       fetch: server.fetch,
-      token: "test-token",
+      token: "secret-access-token\r\n",
       clock: new RecordingClock(),
     });
-    const error = await (async () => {
-      for await (const _ of client.watchQueue({ organizationId: ORG })) {
-        // No events.
-      }
-    })().catch((e: unknown) => e);
-    expect((error as ConnectError).code).toBe(Code.PermissionDenied);
+    const stream = client.watchQueue({ organizationId: ORG });
+    expect((await stream.next()).value).toEqual({
+      kind: WatchQueueEventKind.SnapshotComplete,
+    });
+    const error = (await stream
+      .next()
+      .catch((e: unknown) => e)) as ConnectError;
+    expect(server.calls[0]?.headers.get("authorization")).toBe(
+      "Bearer secret-access-token",
+    );
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error.code).toBe(Code.PermissionDenied);
+    expect(error.metadata.get("x-tide-test")).toBe("rejected");
+    expect(error.message).toBe(
+      "[permission_denied] no access with Bearer [redacted]",
+    );
+    expect(error.rawMessage).toBe("no access with Bearer [redacted]");
+  });
+
+  test("redacts the retained cause of a stream body read error", async () => {
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      token: () => "secret-access-token ",
+      fetch: async (_input, init) => {
+        const auth = new Headers(init?.headers).get("authorization");
+        const body = new ReadableStream({
+          start(controller) {
+            controller.error(new TypeError(`body read failed with ${auth}`));
+          },
+        });
+        return new Response(body, {
+          headers: { "content-type": "application/connect+proto" },
+        });
+      },
+    });
+    const stream = client.work
+      .watchQueue({ organizationId: ORG })
+      [Symbol.asyncIterator]();
+    const error = (await stream
+      .next()
+      .catch((e: unknown) => e)) as ConnectError;
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error.code).toBe(Code.Unknown);
+    const message = "body read failed with Bearer [redacted]";
+    expect(error.message).toBe(`[unknown] ${message}`);
+    expect(error.rawMessage).toBe(message);
+    expect(error.cause).toBeInstanceOf(TypeError);
+    expect((error.cause as TypeError).message).toBe(message);
   });
 
   test("ends with the configuration error of a token source that returns no token", async () => {
@@ -236,6 +294,69 @@ describe("watchQueue", () => {
     expect((error as ConnectError).cause).toBeInstanceOf(TideConfigError);
     expect(clock.sleeps).toEqual([]);
     expect(server.calls).toEqual([]);
+  });
+
+  test.each(["throws", "rejects"])(
+    "ends the first read when the token source %s",
+    async (failure) => {
+      const server = watchServer([["snapshot"]]);
+      const clock = new RecordingClock();
+      const providerError = new Error("fixture token failure");
+      let providerCalls = 0;
+      const client = new TideClient({
+        origin: FAKE_ORIGIN,
+        fetch: server.fetch,
+        clock,
+        token: () => {
+          providerCalls++;
+          if (failure === "throws") {
+            throw providerError;
+          }
+          return Promise.reject(providerError);
+        },
+      });
+      const stream = client.watchQueue({
+        organizationId: ORG,
+        signal: new AbortController().signal,
+      });
+      const error = (await stream
+        .next()
+        .catch((error: unknown) => error)) as ConnectError;
+      expect(error.cause).toBeInstanceOf(TideConfigError);
+      expect((error.cause as TideConfigError).cause).toBe(providerError);
+      expect(providerCalls).toBe(1);
+      expect(server.calls).toEqual([]);
+      expect(clock.sleeps).toEqual([]);
+    },
+  );
+
+  test("stops reconnecting when the token source fails after a clean stream end", async () => {
+    const server = watchServer([["change"]]);
+    const clock = new RecordingClock();
+    const providerError = new Error("fixture token failure");
+    let providerCalls = 0;
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: server.fetch,
+      clock,
+      token: () =>
+        ++providerCalls === 1 ? "test-token" : Promise.reject(providerError),
+    });
+    const stream = client.watchQueue({ organizationId: ORG });
+    expect((await stream.next()).value).toMatchObject({
+      kind: WatchQueueEventKind.Request,
+    });
+    expect((await stream.next()).value).toMatchObject({
+      kind: WatchQueueEventKind.Gap,
+    });
+    const error = (await stream
+      .next()
+      .catch((error: unknown) => error)) as ConnectError;
+    expect(error.cause).toBeInstanceOf(TideConfigError);
+    expect((error.cause as TideConfigError).cause).toBe(providerError);
+    expect(providerCalls).toBe(2);
+    expect(server.calls).toHaveLength(1);
+    expect(clock.sleeps).toEqual([1000]);
   });
 
   test("ends without an error when the signal aborts a pending token source", async () => {
@@ -261,6 +382,113 @@ describe("watchQueue", () => {
     expect(events).toEqual([]);
     expect(asked).toBe(1);
     expect(server.calls).toEqual([]);
+  });
+
+  const firstRequest = create(WatchQueueResponseSchema, {
+    event: { case: "request", value: { requestId: "first" } },
+  });
+  const bufferedRequest = create(WatchQueueResponseSchema, {
+    event: { case: "request", value: { requestId: "buffered" } },
+  });
+  const bufferedSnapshot = create(WatchQueueResponseSchema, {
+    event: { case: "snapshotComplete", value: {} },
+  });
+
+  test.each([
+    ["request", bufferedRequest, "request buffered UNSPECIFIED"],
+    ["snapshot completion", bufferedSnapshot, "snapshot complete"],
+  ] as const)(
+    "closes the stream when a buffered %s arrives after abort",
+    async (_name, bufferedResponse, expected) => {
+      const clock = new RecordingClock();
+      let streams = 0;
+      let closed = 0;
+      const caller: WatchQueueCaller = {
+        async *watchQueue() {
+          streams++;
+          try {
+            yield firstRequest;
+            yield bufferedResponse;
+          } finally {
+            closed++;
+          }
+        },
+      };
+
+      const abort = new AbortController();
+      const events = watchQueue(caller, {
+        organizationId: ORG,
+        signal: abort.signal,
+        clock,
+      });
+      expect(summarize((await events.next()).value!)).toBe(
+        "request first UNSPECIFIED",
+      );
+      abort.abort(new Error("stop the watch"));
+      expect(await events.next()).toEqual({ done: true, value: undefined });
+      expect(closed).toBe(1);
+      expect(streams).toBe(1);
+      expect(clock.sleeps).toEqual([]);
+
+      const live = watchQueue(caller, {
+        organizationId: ORG,
+        signal: new AbortController().signal,
+        clock,
+      });
+      expect(summarize((await live.next()).value!)).toBe(
+        "request first UNSPECIFIED",
+      );
+      expect(summarize((await live.next()).value!)).toBe(expected);
+      await live.return();
+    },
+  );
+
+  test("ends without a gap if the signal aborts as the backoff ends", async () => {
+    const abort = new AbortController();
+    let streams = 0;
+    const events = watchQueue(
+      {
+        async *watchQueue() {
+          streams++;
+        },
+      },
+      {
+        organizationId: ORG,
+        signal: abort.signal,
+        clock: {
+          now: () => 0,
+          sleep: () => {
+            const wait = Promise.withResolvers<void>();
+            wait.resolve();
+            abort.abort();
+            return wait.promise;
+          },
+        },
+      },
+    );
+    expect(await events.next()).toEqual({ done: true, value: undefined });
+    expect(streams).toBe(1);
+  });
+
+  test("ends without reconnecting if the signal aborts after a gap", async () => {
+    const abort = new AbortController();
+    let streams = 0;
+    const events = watchQueue(
+      {
+        async *watchQueue() {
+          streams++;
+        },
+      },
+      {
+        organizationId: ORG,
+        signal: abort.signal,
+        clock: new RecordingClock(),
+      },
+    );
+    expect(summarize((await events.next()).value!)).toBe("gap 1 1000");
+    abort.abort();
+    expect(await events.next()).toEqual({ done: true, value: undefined });
+    expect(streams).toBe(1);
   });
 
   test("ends without an error when the signal aborts an open stream", async () => {

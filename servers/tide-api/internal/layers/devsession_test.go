@@ -5,6 +5,8 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -20,6 +23,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 )
@@ -126,6 +130,16 @@ func TestDevSessionQueueAndDeletion(t *testing.T) {
 		Owner: &tidev1.ListDevSessionsRequest_OwnedByCaller{OwnedByCaller: true}, IncludeEnded: true}))
 	if err != nil || len(list.Msg.GetDevSessions()) != 2 {
 		t.Fatalf("own sessions %v %v", list, err)
+	}
+	ended, err := memberByKey.DevSession.ListDevSessions(ctx, connect.NewRequest(&tidev1.ListDevSessionsRequest{OrganizationId: w.org.ID,
+		States: []tidev1.RequestState{tidev1.RequestState_REQUEST_STATE_ENDED}}))
+	if err != nil || len(ended.Msg.GetDevSessions()) < 2 {
+		t.Fatalf("ended sessions %v %v", ended, err)
+	}
+	unspecified, err := memberByKey.DevSession.ListDevSessions(ctx, connect.NewRequest(&tidev1.ListDevSessionsRequest{OrganizationId: w.org.ID,
+		States: []tidev1.RequestState{tidev1.RequestState_REQUEST_STATE_UNSPECIFIED}, IncludeEnded: true}))
+	if err != nil || len(unspecified.Msg.GetDevSessions()) != 0 {
+		t.Fatalf("sessions with unspecified state %v %v", unspecified, err)
 	}
 	open, _ := w.env.User(w.org.Member).DevSession.ListDevSessions(ctx, connect.NewRequest(&tidev1.ListDevSessionsRequest{OrganizationId: w.org.ID}))
 	if len(open.Msg.GetDevSessions()) != 0 {
@@ -271,6 +285,194 @@ func collectExec(t *testing.T, stream interface {
 	return out, stream.Err()
 }
 
+func TestDevSessionExecResumeOffsets(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	s, _ := w.runningSession(t)
+	ctx := t.Context()
+	client := w.env.User(w.org.Member).DevSession
+	execID := api.NewID()
+	code := int64(3)
+	emit := func(onEvent func(ownsand.ExecEvent) error, events ...ownsand.ExecEvent) (*ownsand.ExecResult, error) {
+		for _, ev := range events {
+			if err := onEvent(ev); err != nil {
+				return nil, err
+			}
+		}
+		return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
+	}
+	w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+		return emit(p.OnEvent,
+			ownsand.ExecEvent{Kind: ownsand.ExecEventStderr, Data: []byte("warn")},
+			ownsand.ExecEvent{Kind: ownsand.ExecEventOutputTruncated, MissingStdout: ownsand.ByteRange{To: 20}},
+		)
+	}, func(_ context.Context, _, id string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
+		if id != execID {
+			return nil, fmt.Errorf("attach exec ID = %s, want %s", id, execID)
+		}
+		switch {
+		case p.StdoutOffset == 10 && p.StderrOffset == 30:
+			return emit(p.OnEvent,
+				ownsand.ExecEvent{Kind: ownsand.ExecEventOutputTruncated, MissingStdout: ownsand.ByteRange{From: 10, To: 20}},
+				ownsand.ExecEvent{Kind: ownsand.ExecEventStdout, Offset: 20, Data: []byte("data")},
+				ownsand.ExecEvent{Kind: ownsand.ExecEventOutputTruncated, MissingStderr: ownsand.ByteRange{From: 30, To: 40}},
+			)
+		case p.StdoutOffset == 20 && p.StderrOffset == 30:
+			return emit(p.OnEvent, ownsand.ExecEvent{Kind: ownsand.ExecEventStderr, Offset: p.StderrOffset, Data: []byte("next")})
+		case p.StdoutOffset == 100 && p.StderrOffset == 300:
+			return emit(p.OnEvent, ownsand.ExecEvent{
+				Kind:          ownsand.ExecEventOutputTruncated,
+				MissingStdout: ownsand.ByteRange{From: 100, To: 200},
+				MissingStderr: ownsand.ByteRange{From: 300, To: 400},
+			})
+		default:
+			return nil, fmt.Errorf("unexpected attach offsets (%d, %d)", p.StdoutOffset, p.StderrOffset)
+		}
+	})
+
+	checkEvents := func(t *testing.T, events []*tidev1.DevSessionExecEvent, err error, count int) {
+		t.Helper()
+		if err != nil || len(events) != count || events[count-1].GetExited().GetExitCode() != code {
+			t.Fatalf("events = %v, err = %v, want %d events ending with exit code %d", events, err, count, code)
+		}
+	}
+	checkGap := func(t *testing.T, ev *tidev1.DevSessionExecEvent, stdout, stderr int64) *tidev1.DevSessionExecOutputTruncated {
+		t.Helper()
+		gap := ev.GetOutputTruncated()
+		if gap == nil || gap.GetStdoutOffset() != stdout || gap.GetStderrOffset() != stderr {
+			t.Errorf("truncation = %v, want offsets (%d, %d)", gap, stdout, stderr)
+		}
+		return gap
+	}
+	checkOutput := func(t *testing.T, output *tidev1.DevSessionExecOutput, offset int64, data string) {
+		t.Helper()
+		if output.GetOffset() != offset || string(output.GetData()) != data {
+			t.Errorf("output = %v, want %q at offset %d", output, data, offset)
+		}
+	}
+	attach := func(t *testing.T, stdout, stderr int64, count int) []*tidev1.DevSessionExecEvent {
+		t.Helper()
+		stream, err := client.AttachDevSessionExec(ctx, connect.NewRequest(&tidev1.AttachDevSessionExecRequest{
+			OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: execID,
+			StdoutOffset: stdout, StderrOffset: stderr,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		events, err := collectExec(t, stream, func() *tidev1.DevSessionExecEvent { return stream.Msg().GetEvent() })
+		checkEvents(t, events, err, count)
+		return events
+	}
+
+	t.Run("fresh exec", func(t *testing.T) {
+		stream, err := client.ExecDevSession(ctx, connect.NewRequest(&tidev1.ExecDevSessionRequest{
+			OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: execID, Command: []string{"make", "test"},
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		events, err := collectExec(t, stream, func() *tidev1.DevSessionExecEvent { return stream.Msg().GetEvent() })
+		checkEvents(t, events, err, 3)
+		checkOutput(t, events[0].GetStderr(), 0, "warn")
+		checkGap(t, events[1], 20, 4)
+	})
+	t.Run("attach and resume", func(t *testing.T) {
+		events := attach(t, 10, 30, 4)
+		firstGap := checkGap(t, events[0], 20, 30)
+		checkOutput(t, events[1].GetStdout(), 20, "data")
+		checkGap(t, events[2], 24, 40)
+
+		resumed := attach(t, firstGap.GetStdoutOffset(), firstGap.GetStderrOffset(), 2)
+		checkOutput(t, resumed[0].GetStderr(), 30, "next")
+	})
+	t.Run("both streams", func(t *testing.T) {
+		events := attach(t, 100, 300, 2)
+		checkGap(t, events[0], 200, 400)
+	})
+}
+
+func TestDevSessionExecGuestTimestamps(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	s, _ := w.runningSession(t)
+	start := time.Date(2024, time.January, 1, 0, 0, 0, 123456789, time.UTC)
+	end := time.Date(2024, time.January, 1, 0, 0, 2, 987654321, time.UTC)
+	epoch := time.Unix(0, 0).UTC()
+	for _, tc := range []struct {
+		name               string
+		start, end         *time.Time
+		wantStart, wantEnd *timestamppb.Timestamp
+	}{
+		{"nanoseconds", &start, &end, &timestamppb.Timestamp{Seconds: 1704067200, Nanos: 123456789}, &timestamppb.Timestamp{Seconds: 1704067202, Nanos: 987654321}},
+		{"epoch-without-end", &epoch, nil, &timestamppb.Timestamp{}, nil},
+		{"epoch-without-start", nil, &epoch, nil, &timestamppb.Timestamp{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			execID := api.NewID()
+			const stdout, stderr = "hello", "late"
+			started := ownsand.ExecEvent{Kind: ownsand.ExecEventStarted, ExecID: execID, StartTime: tc.start}
+			code := int64(3)
+			exited := ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &code, EndTime: tc.end, TimedOut: true}
+			w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+				for _, ev := range []ownsand.ExecEvent{
+					started,
+					{Kind: ownsand.ExecEventStdout, ExecID: execID, Data: []byte(stdout)},
+					{Kind: ownsand.ExecEventStderr, ExecID: execID, Data: []byte(stderr)},
+				} {
+					if err := p.OnEvent(ev); err != nil {
+						return nil, err
+					}
+				}
+				return &exited, nil
+			}, func(_ context.Context, _, id string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
+				if id != execID || p.StdoutOffset != int64(len(stdout)) || p.StderrOffset != int64(len(stderr)) {
+					return nil, errors.New("attach did not resume the completed exec at the consumed offsets")
+				}
+				if err := p.OnEvent(started); err != nil {
+					return nil, err
+				}
+				return &exited, nil
+			})
+			check := func(events []*tidev1.DevSessionExecEvent) {
+				t.Helper()
+				gotStart := events[0].GetStarted()
+				gotEnd := events[len(events)-1].GetExited()
+				if gotStart.GetExecId() != execID || !proto.Equal(gotStart.GetStartTime(), tc.wantStart) {
+					t.Errorf("started = %v, want exec %s and time %v", gotStart, execID, tc.wantStart)
+				}
+				if gotEnd.GetExitCode() != code || !gotEnd.GetTimedOut() || !proto.Equal(gotEnd.GetEndTime(), tc.wantEnd) {
+					t.Errorf("exited = %v, want exit code %d, timed_out and time %v", gotEnd, code, tc.wantEnd)
+				}
+			}
+
+			ctx := t.Context()
+			owner := w.env.User(w.org.Member)
+			stream, err := owner.DevSession.ExecDevSession(ctx, connect.NewRequest(&tidev1.ExecDevSessionRequest{
+				OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: execID, Command: []string{"make", "test"},
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			events, err := collectExec(t, stream, func() *tidev1.DevSessionExecEvent { return stream.Msg().GetEvent() })
+			if err != nil || len(events) != 4 || string(events[1].GetStdout().GetData()) != stdout || string(events[2].GetStderr().GetData()) != stderr {
+				t.Fatalf("exec events = %v, err = %v", events, err)
+			}
+			check(events)
+
+			attach, err := w.env.User(w.org.Member).DevSession.AttachDevSessionExec(ctx, connect.NewRequest(&tidev1.AttachDevSessionExecRequest{
+				OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: execID,
+				StdoutOffset: int64(len(events[1].GetStdout().GetData())), StderrOffset: int64(len(events[2].GetStderr().GetData())),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			events, err = collectExec(t, attach, func() *tidev1.DevSessionExecEvent { return attach.Msg().GetEvent() })
+			if err != nil || len(events) != 2 {
+				t.Fatalf("attach events = %v, err = %v", events, err)
+			}
+			check(events)
+		})
+	}
+}
+
 func TestDevSessionExec(t *testing.T) {
 	w := newWorkWorld(t, devsession.Timing{StreamLimit: 600 * time.Millisecond, KeepaliveInterval: 150 * time.Millisecond})
 	ctx := context.Background()
@@ -395,6 +597,11 @@ func TestDevSessionFiles(t *testing.T) {
 	if _, ok := w.fake.File(w.osOrg, sandboxID, "/home/dev/work/out/a.txt"); ok {
 		t.Fatal("the file appeared before the final chunk")
 	}
+	_, err := owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{
+		OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), WriteId: writeID,
+		Path: "out/other.txt", Data: data[:1000],
+	}))
+	wantCode(t, "changed path for the same write ID", err, connect.CodeInvalidArgument)
 	if _, err := write(0, data[:1000], false); err != nil {
 		t.Fatal(err)
 	}
@@ -408,6 +615,9 @@ func TestDevSessionFiles(t *testing.T) {
 	_, err = owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
 		WriteId: api.NewID(), Path: "/x", Data: make([]byte, 1<<20+1)}))
 	wantCode(t, "chunk above 1 MiB", err, connect.CodeInvalidArgument)
+	_, err = owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
+		WriteId: api.NewID(), Path: "/x", Offset: math.MaxInt64, Data: []byte("x"), Final: true}))
+	wantCode(t, "chunk end offset overflows", err, connect.CodeInvalidArgument)
 	_, err = w.env.User(w.org.Admin).DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
 		WriteId: api.NewID(), Path: "/x", Data: []byte("x"), Final: true}))
 	wantCode(t, "admin writes", err, connect.CodePermissionDenied)
@@ -451,6 +661,129 @@ func TestDevSessionFiles(t *testing.T) {
 	if !strings.Contains(w.env.Logs.String(), `"dev_session_file_read"`) || !strings.Contains(w.env.Logs.String(), `"dev_session_file_write"`) ||
 		strings.Contains(w.env.Logs.String(), "0123456789") {
 		t.Fatal("file transfer logs")
+	}
+}
+
+func TestDevSessionExecOwnSandValidation(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	s, _ := w.runningSession(t)
+	sdk, err := (ownsandclient.SDKFactory{BaseURL: "http://127.0.0.1:1"}).New(w.osOrg, ownsandKey('a'))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.fake.SetExec(sdk.Exec, nil)
+
+	owner := w.env.User(w.org.Member)
+	stream, err := owner.DevSession.ExecDevSession(t.Context(), connect.NewRequest(&tidev1.ExecDevSessionRequest{
+		OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: api.NewID(),
+		Command: []string{"id"}, Env: map[string]string{"BIG": strings.Repeat("x", 300<<10)},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stream.Receive() {
+		t.Fatal("oversized exec returned an event")
+	}
+	err = stream.Err()
+	wantCode(t, "oversized exec", err, connect.CodeInvalidArgument)
+	var ce *connect.Error
+	if !errors.As(err, &ce) || !strings.Contains(ce.Message(), "more than 262144") || strings.Contains(ce.Message(), "try again") {
+		t.Fatalf("oversized exec returned %v", err)
+	}
+}
+
+func TestDevSessionFilesOwnSandErrors(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	ctx := context.Background()
+	s, sandboxID := w.runningSession(t)
+	owner := w.env.User(w.org.Member)
+	upstream, err := w.fake.New(w.osOrg, ownsandKey('a'))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const path = "/home/dev/work/transfer.txt"
+	w.fake.SetFile(w.osOrg, sandboxID, path, []byte("hello"))
+	readID := api.NewID()
+	read := func(offset int64) (*connect.ServerStreamForClient[tidev1.ReadDevSessionFileResponse], error) {
+		return owner.DevSession.ReadDevSessionFile(ctx, connect.NewRequest(&tidev1.ReadDevSessionFileRequest{
+			OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ReadId: readID, Path: path, Offset: offset,
+		}))
+	}
+	stream, err := read(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for stream.Receive() {
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	const keyDiagnostic = "OwnSand rejected the organization's OwnSand API key"
+	for _, tc := range []struct {
+		name    string
+		code    connect.Code
+		message string
+		want    string
+	}{
+		{"operation mismatch", connect.CodePermissionDenied, "request does not match the recorded operation", "Restart the file transfer from the beginning with a new operation ID."},
+		{"other permission error", connect.CodePermissionDenied, "access denied", keyDiagnostic},
+		{"rejected API key", connect.CodeUnauthenticated, "invalid API key", keyDiagnostic},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Record both writes upstream so Tide's first call reopens each write.
+			writeIDs := []string{api.NewID(), api.NewID()}
+			for _, id := range writeIDs {
+				write, err := upstream.OpenFileWrite(sandboxID, ownsand.FileWriteParams{WriteID: id, Path: path})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := write.WriteChunk(ctx, 0, []byte("h")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.FileError = &ownsand.DataPathError{Err: connect.NewWireError(tc.code, errors.New(tc.message))}
+			})
+			t.Cleanup(func() { w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.FileError = nil }) })
+			wantError := func(operation string, err error) {
+				t.Helper()
+				wantCode(t, operation, err, connect.CodeFailedPrecondition)
+				var ce *connect.Error
+				if !errors.As(err, &ce) || ce.Message() != tc.want {
+					t.Fatalf("%s: got %v, want %q", operation, err, tc.want)
+				}
+			}
+			stream, err := read(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stream.Receive() {
+				t.Fatalf("continued read returned a result: %v", stream.Msg())
+			}
+			wantError("continued read", stream.Err())
+			for i, final := range []bool{false, true} {
+				// A credential rejection invalidates the link. Relink before
+				// checking the next RPC's handling of the upstream rejection.
+				if tc.code == connect.CodeUnauthenticated {
+					if _, err := w.setLink(w.org.Admin, w.osOrg, ownsandKey('a')); err != nil {
+						t.Fatal(err)
+					}
+				}
+				resp, err := owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{
+					OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), WriteId: writeIDs[i],
+					Path: path, Offset: 1, Data: []byte("ello"), Final: final,
+				}))
+				if resp != nil {
+					t.Fatalf("write final=%t returned a result: %v", final, resp.Msg)
+				}
+				operation := "reopened write chunk"
+				if final {
+					operation = "reopened write finalization"
+				}
+				wantError(operation, err)
+			}
+		})
 	}
 }
 

@@ -187,31 +187,34 @@ func (d *devSessionService) GetDevSession(_ context.Context, req *connect.Reques
 
 func (d *devSessionService) ListDevSessions(_ context.Context, req *connect.Request[tidev1.ListDevSessionsRequest]) (*connect.Response[tidev1.ListDevSessionsResponse], error) {
 	s := d.s
+	m := req.Msg
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.requireOrg(req.Msg.GetOrganizationId()); err != nil {
+	if _, err := s.requireOrg(m.GetOrganizationId()); err != nil {
 		return nil, err
 	}
+	profileID, err := normalizeListProfileID(m.GetRunnerProfileId())
+	if err != nil {
+		return nil, err
+	}
+	states := listStates(m.GetStates(), openRequestStates, m.GetIncludeEnded())
 	var mine []*tidev1.DevSession
 	for _, x := range s.sessions {
-		if x.GetOrganizationId() != req.Msg.GetOrganizationId() {
+		if x.GetOrganizationId() != m.GetOrganizationId() || (profileID != "" && x.GetRunnerProfileId() != profileID) {
 			continue
 		}
-		if !req.Msg.GetIncludeEnded() && terminalRequest(x.GetState()) {
+		if m.GetOwnedByCaller() && x.GetOwnerUserId() != s.UserID {
 			continue
 		}
-		if req.Msg.GetOwnedByCaller() && x.GetOwnerUserId() != s.UserID {
+		if o := m.GetOwnerUserId(); o != "" && x.GetOwnerUserId() != o {
 			continue
 		}
-		if o := req.Msg.GetOwnerUserId(); o != "" && x.GetOwnerUserId() != o {
-			continue
-		}
-		if len(req.Msg.GetStates()) > 0 && !slices.Contains(req.Msg.GetStates(), x.GetState()) {
+		if len(states) > 0 && !slices.Contains(states, x.GetState()) {
 			continue
 		}
 		mine = append(mine, x)
 	}
-	items, next, err := page(mine, req.Msg.GetPageSize(), req.Msg.GetPageToken())
+	items, next, err := page(mine, m.GetPageSize(), m.GetPageToken())
 	if err != nil {
 		return nil, err
 	}
@@ -355,6 +358,9 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 	if m.GetWriteId() == "" || len(m.GetData()) > 1<<20 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("write_id is required and a chunk holds at most 1 MiB"))
 	}
+	if m.GetOffset() < 0 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid offset: must not be negative"))
+	}
 	key := writeKey{
 		organizationID: ds.GetOrganizationId(),
 		devSessionID:   ds.GetDevSessionId(),
@@ -427,6 +433,7 @@ type guest struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	mu       sync.Mutex
+	closed   bool
 	execs    map[string]*proc
 	writes   map[writeKey]*pendingWrite
 	requests []*tidev1.ExecDevSessionRequest
@@ -443,6 +450,9 @@ func newGuest(s *Server) *guest {
 }
 
 func (g *guest) close() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
 	g.cancel()
 	g.wg.Wait()
 }
@@ -492,6 +502,10 @@ func (p *proc) finish(ev *tidev1.DevSessionExecEvent) {
 // start starts a local process for the exec request.
 func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) (*proc, error) {
 	g.mu.Lock()
+	if g.closed {
+		g.mu.Unlock()
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the fake guest is closed"))
+	}
 	if g.execs[req.GetExecId()] != nil {
 		g.mu.Unlock()
 		return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("the exec_id is in use"))
@@ -499,6 +513,8 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 	p := &proc{session: ds.GetDevSessionId(), execID: req.GetExecId(), changed: make(chan struct{}), start: time.Now(), keep: g.s.OutputKeepBytes}
 	g.execs[req.GetExecId()] = p
 	g.requests = append(g.requests, proto.CloneOf(req))
+	// Register the exec before close can stop admission and wait.
+	g.wg.Add(1)
 	g.mu.Unlock()
 
 	dir := ds.GetWorkspacePath()
@@ -507,6 +523,7 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 	}
 	failed := func(reason tidev1.ExecFailureReason, msg string) (*proc, error) {
 		p.finish(&tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Failed{Failed: &tidev1.DevSessionExecFailed{Reason: reason, Message: msg}}})
+		g.wg.Done()
 		return p, nil
 	}
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
@@ -517,7 +534,7 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 	if t := req.GetTimeout(); t != nil {
 		ctx, cancel = context.WithTimeout(ctx, t.AsDuration())
 	}
-	cmd := exec.CommandContext(ctx, req.GetCommand()[0], req.GetCommand()[1:]...)
+	cmd := newExecCommand(ctx, req.GetCommand())
 	cmd.Dir = dir
 	cmd.Env = os.Environ()
 	for k, v := range req.GetEnv() {
@@ -536,7 +553,6 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 		}
 		return failed(tidev1.ExecFailureReason_EXEC_FAILURE_REASON_OTHER, err.Error())
 	}
-	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
 		defer cancel()
@@ -563,7 +579,16 @@ const chunkLimit = 32 << 10
 // serve sends the events of p from the given offsets until the final
 // event, the end of ctx, or the stream event limit.
 func (g *guest) serve(ctx context.Context, p *proc, so, se int64, send func(*tidev1.DevSessionExecEvent) error) error {
-	if err := send(&tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Started{Started: &tidev1.DevSessionExecStarted{ExecId: p.execID, StartTime: timestamppb.New(p.start)}}}); err != nil {
+	limit := g.s.ExecStreamEventLimit
+	sent := 0
+	sendEvent := func(ev *tidev1.DevSessionExecEvent) (stop bool, err error) {
+		if err := send(ev); err != nil {
+			return true, err
+		}
+		sent++
+		return limit > 0 && sent >= limit, nil
+	}
+	if stop, err := sendEvent(&tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Started{Started: &tidev1.DevSessionExecStarted{ExecId: p.execID, StartTime: timestamppb.New(p.start)}}}); stop {
 		return err
 	}
 	offs := [2]int64{so, se}
@@ -572,14 +597,12 @@ func (g *guest) serve(ctx context.Context, p *proc, so, se int64, send func(*tid
 		offs[0] = max(offs[0], p.out[0].base)
 		offs[1] = max(offs[1], p.out[1].base)
 		p.mu.Unlock()
-		if err := send(&tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_OutputTruncated{OutputTruncated: &tidev1.DevSessionExecOutputTruncated{StdoutOffset: offs[0], StderrOffset: offs[1]}}}); err != nil {
+		if stop, err := sendEvent(&tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_OutputTruncated{OutputTruncated: &tidev1.DevSessionExecOutputTruncated{StdoutOffset: offs[0], StderrOffset: offs[1]}}}); stop {
 			return err
 		}
 	} else {
 		p.mu.Unlock()
 	}
-	limit := g.s.ExecStreamEventLimit
-	sent := 0
 	for {
 		p.mu.Lock()
 		var ev *tidev1.DevSessionExecEvent
@@ -612,7 +635,8 @@ func (g *guest) serve(ctx context.Context, p *proc, so, se int64, send func(*tid
 		switch {
 		case ev != nil:
 		case final != nil:
-			return send(final)
+			_, err := sendEvent(final)
+			return err
 		default:
 			select {
 			case <-ctx.Done():
@@ -621,12 +645,8 @@ func (g *guest) serve(ctx context.Context, p *proc, so, se int64, send func(*tid
 				continue
 			}
 		}
-		if err := send(ev); err != nil {
+		if stop, err := sendEvent(ev); stop {
 			return err
-		}
-		sent++
-		if limit > 0 && sent >= limit {
-			return nil
 		}
 	}
 }

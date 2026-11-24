@@ -118,10 +118,13 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 		}
 		if a.BindsAtDispatch() {
 			if warm := oldestWarm(runners, p.ID); warm != nil {
-				if err := e.assignWarm(ctx, req, warm); err != nil {
+				expired, err := e.assignWarm(ctx, req, warm)
+				if err != nil {
 					e.svc.Logger.WarnContext(ctx, "dispatch_assign_failed", slog.String("request_id", req.ID), slog.Any("error", err))
 				}
-				warm.RequestID = req.ID
+				if !expired {
+					warm.RequestID = req.ID
+				}
 				continue
 			}
 		}
@@ -230,10 +233,10 @@ func (e *Engine) expire(ctx context.Context, orgID string) error {
 		var ended *Request
 		err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 			r, err := e.lockRequest(ctx, tx, id)
-			if err != nil || r.State != reqQueued {
+			if err != nil {
 				return err
 			}
-			ended, _, err = e.endRequestTx(ctx, tx, id, RequestEnd{State: reqExpired, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_MAX_QUEUE_WAIT})
+			ended, err = e.expireQueuedTx(ctx, tx, r)
 			return err
 		})
 		if err != nil {
@@ -244,6 +247,16 @@ func (e *Engine) expire(ctx context.Context, orgID string) error {
 		}
 	}
 	return nil
+}
+
+// expireQueuedTx ends a locked request if it is still queued at its deadline.
+// The caller releases the returned request's claim after commit.
+func (e *Engine) expireQueuedTx(ctx context.Context, tx pgx.Tx, req *Request) (*Request, error) {
+	if req.State != reqQueued || e.svc.NowUTC().Before(req.QueueDeadline) {
+		return nil, nil
+	}
+	ended, _, err := e.endRequestTx(ctx, tx, req.ID, RequestEnd{State: reqExpired, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_MAX_QUEUE_WAIT})
+	return ended, err
 }
 
 // queue returns the QUEUED requests in queue order: priority (HIGH first),
@@ -345,33 +358,36 @@ func oldestWarm(runners []*Runner, profileID string) *Runner {
 	return nil
 }
 
-// assignWarm binds a warm runner to a request; the runner's driver then
-// starts the work.
-func (e *Engine) assignWarm(ctx context.Context, req *Request, warm *Runner) error {
+// assignWarm binds a warm runner to a request and wakes its driver.
+// It reports whether queue expiry left the runner available.
+func (e *Engine) assignWarm(ctx context.Context, req *Request, warm *Runner) (bool, error) {
+	var expired *Request
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if err := api.LockOrganizationShare(ctx, tx, req.OrganizationID); err != nil {
+			return err
+		}
+		if err := profile.LockShare(ctx, tx, req.OrganizationID, warm.ProfileID); err != nil {
+			if isCode(err, connect.CodeNotFound) {
+				return nil
+			}
 			return err
 		}
 		r, err := e.lockRunner(ctx, tx, warm.ID)
 		if err != nil || r.State != runWarm || r.RequestID != "" {
 			return err
 		}
-		cur, err := e.lockRequest(ctx, tx, req.ID)
-		if err != nil || cur.State != reqQueued {
-			return err
-		}
-		if _, err := tx.Exec(ctx, "UPDATE runners SET request_id = $2, update_time = $3 WHERE runner_id = $1", r.ID, req.ID, e.svc.NowUTC()); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, "UPDATE requests SET start_attempts = start_attempts + 1 WHERE request_id = $1", req.ID); err != nil {
-			return err
-		}
-		return e.startRequestTx(ctx, tx, req.ID, r.ID, []tidev1.RequestState{reqQueued}, reqStarting)
+		expired, err = e.bindStartTx(ctx, tx, r, req.ID)
+		return err
 	})
-	if err == nil {
-		e.kickRunner(warm.ID)
+	if err != nil {
+		return false, err
 	}
-	return err
+	if expired != nil {
+		e.releaseClaim(ctx, expired)
+		return true, nil
+	}
+	e.kickRunner(warm.ID)
+	return false, nil
 }
 
 type createResult int
@@ -427,20 +443,21 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		IdempotencyKey: api.NewID(), WorkspacePath: p.WorkspacePath, PoolKey: pool,
 	}
 	bind := req != nil && a.BindsAtDispatch()
-	stored := false
 	if req == nil {
 		r.warmProfileRevision = p.WarmRevision
 		r.warmLinkRevision = linkRevision
-		// The dispatcher owns the first CreateSandbox call. The driver
-		// can take over once that call and its database update finish.
-		e.initialWarmCreates.Store(r.ID, struct{}{})
-		defer func() {
-			e.initialWarmCreates.Delete(r.ID)
-			if stored {
-				e.ensureDriver(r.ID)
-			}
-		}()
 	}
+	// The dispatcher owns the first CreateSandbox call and applies its
+	// result before the driver can retry. A duplicate rejection can bind
+	// a queued request to the runner that already failed its start.
+	stored := false
+	e.initialCreates.Store(r.ID, struct{}{})
+	defer func() {
+		e.initialCreates.Delete(r.ID)
+		if stored {
+			e.ensureDriver(r.ID)
+		}
+	}()
 	// The request is stored with the runner, so every retry sends the same
 	// parameters with the key.
 	sreq := sandboxRequest(p, r)
@@ -470,6 +487,15 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 				return errWarmDeferred
 			}
 			if err := e.allowWarmCreate(ctx, tx, r); err != nil {
+				return err
+			}
+		} else if !bind {
+			// Pool runners remain unbound even when queued work prompts
+			// their creation. Deletion must see their reservations too.
+			if err := profile.LockShare(ctx, tx, p.OrganizationID, p.ID); err != nil {
+				if isCode(err, connect.CodeNotFound) {
+					return errSkip
+				}
 				return err
 			}
 		}
@@ -511,7 +537,7 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 	}
 	stored = true
 	sb, err := e.createSandbox(ctx, client, sreq)
-	res := e.applyCreate(ctx, r, sb, err)
+	res := e.applyCreate(ctx, r, req, sb, err)
 	if res == createFailed && ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || isCode(err, connect.CodeDeadlineExceeded)) {
 		return createStalled
 	}
@@ -535,7 +561,10 @@ func (e *Engine) storedCreateRequest(ctx context.Context, runnerID string) (*own
 var errSkip = errors.New("skip")
 
 // applyCreate applies a CreateSandbox result to a stored CREATING runner.
-func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandbox, err error) createResult {
+// dispatchRequest identifies the queued demand for the initial call, including
+// for pool runners that do not store a request ID.
+func (e *Engine) applyCreate(ctx context.Context, r *Runner, dispatchRequest *Request, sb *ownsandv1.Sandbox, err error) createResult {
+	var expired *Request
 	switch {
 	case err == nil:
 		uerr := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
@@ -559,12 +588,15 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 				// the sandbox, and starts nothing.
 				return nil
 			}
-			return e.bindStartTx(ctx, tx, cur)
+			expired, err = e.bindStartTx(ctx, tx, cur, cur.RequestID)
+			return err
 		})
 		if uerr != nil {
 			// The driver repeats CreateSandbox with the same key and gets
 			// the same sandbox.
 			e.svc.Logger.WarnContext(ctx, "runner_sandbox_store_failed", slog.String("runner_id", r.ID), slog.Any("error", uerr))
+		} else if expired != nil {
+			e.releaseClaim(ctx, expired)
 		}
 		e.ensureDriver(r.ID)
 		e.kickRunner(r.ID)
@@ -572,19 +604,26 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 	case rejected(err, connect.CodeUnavailable):
 		// No device has free capacity: the sandbox does not exist, so the
 		// runner is removed and its request returns to the queue.
-		e.dropRunner(ctx, r, false)
+		e.dropRunner(ctx, r, false, nil)
 		return createUnavailable
 	case rejected(err, connect.CodeFailedPrecondition):
 		// No device of the OwnSand organization can ever run the profile.
-		e.dropRunner(ctx, r, true)
+		e.dropRunner(ctx, r, true, dispatchRequest)
 		return createFailed
 	case rejected(err, connect.CodeInvalidArgument), rejected(err, connect.CodeNotFound), rejected(err, connect.CodePermissionDenied):
 		// OwnSand rejected the request (for example, an unknown template):
 		// a start failure that counts as an attempt.
-		if berr := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error { return e.bindStartTx(ctx, tx, r) }); berr != nil {
+		berr := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+			var err error
+			expired, err = e.bindStartTx(ctx, tx, r, r.RequestID)
+			return err
+		})
+		if berr != nil {
 			e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", berr))
+		} else if expired != nil {
+			e.releaseClaim(ctx, expired)
 		}
-		e.startFailed(ctx, r.ID, createSandboxRejected)
+		e.startFailed(ctx, r, createSandboxRejected)
 		return createFailed
 	default:
 		// The response may be lost: the runner stays CREATING with its key,
@@ -604,56 +643,71 @@ func rejected(err error, code connect.Code) bool {
 	return isCode(err, code) && connect.IsWireError(err)
 }
 
-// dropRunner removes a runner whose sandbox was never created. noDevice
-// ends the request with NO_ELIGIBLE_DEVICE; otherwise the request returns to
-// the queue without counting an attempt.
-func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool) {
+// dropRunner handles a runner whose sandbox was never created. For a
+// capacity rejection it removes the runner. For a no-device rejection it
+// records the failure and ends the request if it is still queued.
+func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool, dispatchRequest *Request) {
 	var ended *Request
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		cur, err := e.lockRunner(ctx, tx, r.ID)
 		if err != nil || cur.State != runCreating {
 			return err
 		}
-		if noDevice {
-			if _, err := e.setRunnerTx(ctx, tx, r.ID, []tidev1.RunnerState{runCreating}, runFailed, "end_reason = $4",
-				int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED)); err != nil {
-				return err
-			}
-		} else if _, err := tx.Exec(ctx, "DELETE FROM runners WHERE runner_id = $1", r.ID); err != nil {
+		if !noDevice {
+			_, err := tx.Exec(ctx, "DELETE FROM runners WHERE runner_id = $1", r.ID)
 			return err
 		}
-		if cur.RequestID == "" {
+		if _, err := e.setRunnerTx(ctx, tx, r.ID, []tidev1.RunnerState{runCreating}, runFailed, "end_reason = $4",
+			int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED)); err != nil {
+			return err
+		}
+		requestID := cur.RequestID
+		if dispatchRequest != nil {
+			requestID = dispatchRequest.ID
+		}
+		if requestID == "" {
 			return nil
 		}
-		if noDevice {
-			ended, _, err = e.endRequestTx(ctx, tx, cur.RequestID, RequestEnd{State: reqFailed, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE})
+		req, err := e.lockRequest(ctx, tx, requestID)
+		if err != nil || req.State != reqQueued {
 			return err
 		}
-		// The request stayed QUEUED.
-		return nil
+		ended, _, err = e.endRequestTx(ctx, tx, requestID, RequestEnd{State: reqFailed, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE})
+		return err
 	})
 	if err != nil {
 		e.svc.Logger.WarnContext(ctx, "dispatch_drop_runner_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		return
 	}
 	if ended != nil {
 		e.releaseClaim(ctx, ended)
 	}
 }
 
-// bindStartTx starts the request of a runner whose sandbox OwnSand created:
-// the request is STARTING with the runner and one more start attempt.
-func (e *Engine) bindStartTx(ctx context.Context, tx pgx.Tx, r *Runner) error {
-	if r.RequestID == "" {
-		return nil
+// bindStartTx checks the locked request's deadline before binding a runner
+// or counting a start attempt. The caller releases an expired request's
+// claim after commit.
+func (e *Engine) bindStartTx(ctx context.Context, tx pgx.Tx, r *Runner, requestID string) (*Request, error) {
+	if requestID == "" {
+		return nil, nil
 	}
-	req, err := e.lockRequest(ctx, tx, r.RequestID)
+	req, err := e.lockRequest(ctx, tx, requestID)
 	if err != nil || req.State != reqQueued {
-		return err
+		return nil, err
+	}
+	expired, err := e.expireQueuedTx(ctx, tx, req)
+	if err != nil || expired != nil {
+		return expired, err
+	}
+	if r.State == runWarm {
+		if _, err := tx.Exec(ctx, "UPDATE runners SET request_id = $2, update_time = $3 WHERE runner_id = $1", r.ID, req.ID, e.svc.NowUTC()); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := tx.Exec(ctx, "UPDATE requests SET start_attempts = start_attempts + 1 WHERE request_id = $1", req.ID); err != nil {
-		return err
+		return nil, err
 	}
-	return e.startRequestTx(ctx, tx, req.ID, r.ID, []tidev1.RequestState{reqQueued}, reqStarting)
+	return nil, e.startRequestTx(ctx, tx, req.ID, r.ID, []tidev1.RequestState{reqQueued}, reqStarting)
 }
 
 // requeueTx returns a STARTING request to QUEUED with its original queue

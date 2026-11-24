@@ -1,128 +1,503 @@
 // SPDX-License-Identifier: Apache-2.0
 
-package tidetest_test
+package tidetest
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"math"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 
-	"github.com/delinoio/mono/go/tide/tidetest"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
 
-func TestFakeWriteBinding(t *testing.T) {
-	server := tidetest.New()
-	t.Cleanup(server.Close)
-	client := tidev1connect.NewDevSessionServiceClient(http.DefaultClient, server.URL)
-	orgID := server.AddOrganization("test").GetOrganizationId()
-
-	newSession := func(t *testing.T) *tidev1.DevSession {
+func TestWriteDevSessionFileRejectsNegativeOffsets(t *testing.T) {
+	const writeID, fileName = "write-offset", "out.txt"
+	workspace := t.TempDir()
+	s := New()
+	t.Cleanup(s.Close)
+	org := s.AddOrganization("write test").GetOrganizationId()
+	profile := s.AddDevSessionProfile(org, "write", tidev1.GuestOs_GUEST_OS_LINUX, workspace)
+	client := tidev1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+	ctx := t.Context()
+	session, err := client.CreateDevSession(ctx, listTestRequest(&tidev1.CreateDevSessionRequest{
+		OrganizationId: org, RunnerProfileId: profile.GetRunnerProfileId(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := session.Msg.GetDevSession().GetDevSessionId()
+	write := func(offset int64, data string, final bool) (*connect.Response[tidev1.WriteDevSessionFileResponse], error) {
+		return client.WriteDevSessionFile(ctx, listTestRequest(&tidev1.WriteDevSessionFileRequest{
+			OrganizationId: org, DevSessionId: sessionID, WriteId: writeID, Path: fileName,
+			Offset: offset, Data: []byte(data), Final: final,
+		}))
+	}
+	requireInvalid := func(t *testing.T, offset int64, err error, want string) {
 		t.Helper()
-		profile := server.AddDevSessionProfile(orgID, "test", tidev1.GuestOs_GUEST_OS_LINUX, t.TempDir())
-		req := connect.NewRequest(&tidev1.CreateDevSessionRequest{
-			OrganizationId:  orgID,
-			RunnerProfileId: profile.GetRunnerProfileId(),
-		})
-		req.Header().Set("Authorization", "Bearer "+server.APIKey)
-		res, err := client.CreateDevSession(t.Context(), req)
+		var rpcErr *connect.Error
+		if !errors.As(err, &rpcErr) || rpcErr.Code() != connect.CodeInvalidArgument || rpcErr.Message() != want {
+			t.Errorf("offset %d: got %v, want InvalidArgument (%s)", offset, err, want)
+		}
+	}
+	checkNegativeOffsets := func(t *testing.T) {
+		for _, chunk := range []struct {
+			offset int64
+			data   string
+			final  bool
+		}{
+			{-1, "x", false},
+			{-3, "xyz", true},
+			{-5, "0123456789", false},
+			{math.MinInt64, "", true},
+		} {
+			_, err := write(chunk.offset, chunk.data, chunk.final)
+			requireInvalid(t, chunk.offset, err, "invalid offset: must not be negative")
+		}
+	}
+	requireWrite := func(offset int64, data string, final bool) {
+		t.Helper()
+		res, err := write(offset, data, final)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("write at offset %d: %v", offset, err)
 		}
-		return res.Msg.GetDevSession()
-	}
-	write := func(t *testing.T, session *tidev1.DevSession, writeID, path string, offset int64, data string, final bool) (*connect.Response[tidev1.WriteDevSessionFileResponse], error) {
-		t.Helper()
-		req := connect.NewRequest(&tidev1.WriteDevSessionFileRequest{
-			OrganizationId: orgID,
-			DevSessionId:   session.GetDevSessionId(),
-			WriteId:        writeID,
-			Path:           path,
-			Offset:         offset,
-			Data:           []byte(data),
-			Final:          final,
-		})
-		req.Header().Set("Authorization", "Bearer "+server.APIKey)
-		return client.WriteDevSessionFile(t.Context(), req)
-	}
-	checkChunk := func(t *testing.T, session *tidev1.DevSession, writeID, path string, offset int64, data string, final bool) {
-		t.Helper()
-		res, err := write(t, session, writeID, path, offset, data, final)
-		if err != nil {
-			t.Fatalf("write %s at offset %d: %v", path, offset, err)
-		}
-		wantSize := int64(0)
-		if final {
-			wantSize = offset + int64(len(data))
-		}
-		m := res.Msg
-		if m.GetWriteId() != writeID || m.GetOffset() != offset || m.GetLength() != int64(len(data)) ||
-			m.GetFinished() != final || m.GetSizeBytes() != wantSize {
-			t.Fatalf("write %s at offset %d returned %v, want length %d, finished %t, size %d",
-				path, offset, m, len(data), final, wantSize)
-		}
-	}
-	checkFile := func(t *testing.T, session *tidev1.DevSession, path, want string) {
-		t.Helper()
-		got, err := os.ReadFile(filepath.Join(session.GetWorkspacePath(), path))
-		if err != nil || string(got) != want {
-			t.Fatalf("read %s = %q, %v, want %q", path, got, err, want)
-		}
-	}
-	checkAbsent := func(t *testing.T, session *tidev1.DevSession, path string) {
-		t.Helper()
-		if _, err := os.Stat(filepath.Join(session.GetWorkspacePath(), path)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("stat %s: got %v, want file absent", path, err)
+		if res.Msg.GetFinished() != final || (final && res.Msg.GetSizeBytes() != offset+int64(len(data))) {
+			t.Fatalf("unexpected response to write at offset %d: %v", offset, res.Msg)
 		}
 	}
 
-	t.Run("completed write in another session", func(t *testing.T) {
-		first, second := newSession(t), newSession(t)
-		const id, path = "shared-completed", "fixture.txt"
-
-		checkChunk(t, first, id, path, 0, "a", true)
-		checkChunk(t, second, id, path, 0, "xyz", true)
-		checkFile(t, first, path, "a")
-		checkFile(t, second, path, "xyz")
+	t.Run("new write", func(t *testing.T) {
+		checkNegativeOffsets(t)
+		s.guest.mu.Lock()
+		_, exists := s.guest.writes[writeKey{organizationID: org, devSessionID: sessionID, writeID: writeID}]
+		s.guest.mu.Unlock()
+		if exists {
+			t.Error("a rejected request created a pending write")
+		}
 	})
+	requireWrite(0, "abc", false)
+	t.Run("pending write", checkNegativeOffsets)
+	_, err = write(4, "x", false)
+	requireInvalid(t, 4, err, "chunk at offset 4 does not continue the write at 3")
+	_, err = write(0, "xyz", false)
+	requireInvalid(t, 0, err, "chunk at offset 0 does not continue the write at 3")
+	requireWrite(3, "def", false)
+	requireWrite(0, "abc", false)
+	requireWrite(6, "ghi", true)
+	t.Run("finished write", checkNegativeOffsets)
 
-	t.Run("pending writes in both sessions", func(t *testing.T) {
-		first, second := newSession(t), newSession(t)
-		const id, path = "shared-pending", "fixture.txt"
+	data, err := os.ReadFile(filepath.Join(workspace, fileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "abcdefghi" {
+		t.Errorf("got file contents %q, want abcdefghi", data)
+	}
+}
 
-		checkChunk(t, first, id, path, 0, "a", false)
-		checkChunk(t, second, id, path, 0, "xy", false)
-		checkChunk(t, first, id, path, 1, "b", true)
-		checkChunk(t, second, id, path, 2, "z", true)
-		checkFile(t, first, path, "ab")
-		checkFile(t, second, path, "xyz")
-	})
-
-	t.Run("changed destination", func(t *testing.T) {
-		session := newSession(t)
-		const id, original, changed = "path-bound", "first.txt", "second.txt"
-		checkRejected := func() {
-			t.Helper()
-			if _, err := write(t, session, id, changed, 1, "x", true); connect.CodeOf(err) != connect.CodeInvalidArgument {
-				t.Fatalf("write to changed path returned %v, want invalid_argument", err)
+func TestListDevSessionsFilters(t *testing.T) {
+	const (
+		running    = tidev1.RequestState_REQUEST_STATE_RUNNING
+		ended      = tidev1.RequestState_REQUEST_STATE_ENDED
+		otherOwner = "user-2"
+	)
+	s := New()
+	t.Cleanup(s.Close)
+	org := s.AddOrganization("first").GetOrganizationId()
+	other := s.AddOrganization("second").GetOrganizationId()
+	s.mu.Lock()
+	s.sessions = []*tidev1.DevSession{
+		{DevSessionId: "other-org", OrganizationId: other, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID, State: ended},
+		{DevSessionId: "second-ended", OrganizationId: org, RunnerProfileId: secondListProfile, OwnerUserId: s.UserID, State: ended},
+		{DevSessionId: "other-owner", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: otherOwner, State: ended},
+		{DevSessionId: "first-running", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID, State: running},
+		{DevSessionId: "first-ended", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID, State: ended},
+		{DevSessionId: "unspecified", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID},
+	}
+	s.mu.Unlock()
+	client := tidev1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+	for _, tt := range []struct {
+		name string
+		req  *tidev1.ListDevSessionsRequest
+		want []string
+	}{
+		{"default open states", &tidev1.ListDevSessionsRequest{}, []string{"first-running"}},
+		{"profile", &tidev1.ListDevSessionsRequest{RunnerProfileId: strings.ToUpper(secondListProfile), IncludeEnded: true}, []string{"second-ended"}},
+		{"ended", &tidev1.ListDevSessionsRequest{States: []tidev1.RequestState{ended}}, []string{"second-ended", "other-owner", "first-ended"}},
+		{"ended with include_ended", &tidev1.ListDevSessionsRequest{States: []tidev1.RequestState{ended}, IncludeEnded: true}, []string{"second-ended", "other-owner", "first-ended"}},
+		{
+			"caller ownership intersection before pagination",
+			&tidev1.ListDevSessionsRequest{
+				RunnerProfileId: firstListProfile,
+				States:          []tidev1.RequestState{ended},
+				Owner:           &tidev1.ListDevSessionsRequest_OwnedByCaller{OwnedByCaller: true},
+				PageSize:        1,
+			},
+			[]string{"first-ended"},
+		},
+		{
+			"explicit owner intersection",
+			&tidev1.ListDevSessionsRequest{
+				RunnerProfileId: firstListProfile,
+				Owner:           &tidev1.ListDevSessionsRequest_OwnerUserId{OwnerUserId: otherOwner},
+				IncludeEnded:    true,
+			},
+			[]string{"other-owner"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.req.OrganizationId = org
+			res, err := client.ListDevSessions(t.Context(), listTestRequest(tt.req))
+			if err != nil {
+				t.Fatal(err)
 			}
+			var ids []string
+			for _, row := range res.Msg.GetDevSessions() {
+				ids = append(ids, row.GetDevSessionId())
+			}
+			if !slices.Equal(ids, tt.want) || res.Msg.GetNextPageToken() != "" {
+				t.Errorf("got IDs %v and next token %q, want IDs %v and no next token", ids, res.Msg.GetNextPageToken(), tt.want)
+			}
+		})
+	}
+	_, err := client.ListDevSessions(t.Context(), listTestRequest(&tidev1.ListDevSessionsRequest{OrganizationId: org, RunnerProfileId: " "}))
+	if connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Errorf("whitespace-only profile: got %v, want InvalidArgument", err)
+	}
+}
+
+const streamTestExecID = "018f0000-0000-7000-8000-00000000000a"
+
+func TestCloseDuringExecStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake guest runs POSIX sleep")
+	}
+	workspace := t.TempDir()
+	for round := range 300 {
+		testCloseDuringExecStart(t, workspace, round)
+	}
+}
+
+func testCloseDuringExecStart(t *testing.T, workspace string, round int) {
+	t.Helper()
+	const execs = 8
+	s := New()
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	var calls sync.WaitGroup
+	defer func() {
+		cancel()
+		calls.Wait()
+	}()
+	ready := make(chan struct{}, execs)
+	start := make(chan struct{})
+	s.BeforeExec = func(*tidev1.ExecDevSessionRequest) {
+		ready <- struct{}{}
+		select {
+		case <-start:
+		case <-ctx.Done():
 		}
+	}
+	client, ds := createExecTestSession(t, ctx, s, workspace)
+	for range execs {
+		calls.Go(func() {
+			stream, err := client.ExecDevSession(ctx, listTestRequest(&tidev1.ExecDevSessionRequest{
+				OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(),
+				ExecId: s.newID(), Command: []string{"sleep", "30"},
+			}))
+			if err == nil {
+				defer stream.Close()
+				for stream.Receive() {
+				}
+			}
+		})
+	}
+	for range execs {
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			t.Fatalf("round %d: execs did not reach the start gate: %v", round, ctx.Err())
+		}
+	}
+	close(start)
+	time.Sleep(time.Duration(rand.IntN(500)) * time.Microsecond)
+	s.Close()
 
-		checkChunk(t, session, id, original, 0, "a", false)
-		checkRejected()
-		checkAbsent(t, session, original)
-		checkAbsent(t, session, changed)
+	s.guest.mu.Lock()
+	defer s.guest.mu.Unlock()
+	for id, p := range s.guest.execs {
+		p.mu.Lock()
+		finished := p.final != nil
+		p.mu.Unlock()
+		if !finished {
+			t.Errorf("round %d: Close returned before exec %s finished", round, id)
+		}
+	}
+}
 
-		absolute := filepath.Join(session.GetWorkspacePath(), original)
-		checkChunk(t, session, id, absolute, 1, "b", true)
-		checkChunk(t, session, id, absolute, 1, "b", true)
-		checkRejected()
-		checkFile(t, session, original, "ab")
-		checkAbsent(t, session, changed)
+func TestCloseReapsRunningExec(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake guest runs POSIX sh commands")
+	}
+	s := New()
+	t.Cleanup(s.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	client, ds := createExecTestSession(t, ctx, s, t.TempDir())
+	stream, err := client.ExecDevSession(ctx, listTestRequest(&tidev1.ExecDevSessionRequest{
+		OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(),
+		ExecId: streamTestExecID, Command: []string{"sh", "-c", "echo $$; exec sleep 30"},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	var stdout strings.Builder
+	for stream.Receive() {
+		stdout.Write(stream.Msg().GetEvent().GetStdout().GetData())
+		if strings.HasSuffix(stdout.String(), "\n") {
+			break
+		}
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(stdout.String()))
+	if err != nil || pid <= 0 {
+		t.Fatalf("expected a process ID, got %q (stream error: %v)", stdout.String(), stream.Err())
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer process.Release()
+	if err := process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("exec was not running before Close: %v", err)
+	}
+
+	s.Close()
+	if err := process.Signal(syscall.Signal(0)); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("signal after Close returned %v, want os.ErrProcessDone", err)
+	}
+}
+
+func TestExecRejectedAfterClose(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake guest runs POSIX sh commands")
+	}
+	s := New()
+	workspace := t.TempDir()
+	s.Close()
+	ds := &tidev1.DevSession{WorkspacePath: workspace}
+	p, err := s.guest.start(ds, &tidev1.ExecDevSessionRequest{
+		ExecId: streamTestExecID, Command: []string{"sh", "-c", "touch started"},
 	})
+	if p != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition || len(s.ExecRequests()) != 0 {
+		t.Fatalf("start after Close returned (%v, %v), with %d admitted execs", p, err, len(s.ExecRequests()))
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "started")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat process marker after Close returned %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestCloseAfterExecStartFailure(t *testing.T) {
+	workspace := t.TempDir()
+	s := New()
+	t.Cleanup(s.srv.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	client, ds := createExecTestSession(t, ctx, s, workspace)
+	for _, tc := range []struct {
+		dir    string
+		reason tidev1.ExecFailureReason
+	}{
+		{dir: "missing", reason: tidev1.ExecFailureReason_EXEC_FAILURE_REASON_WORKING_DIRECTORY_INVALID},
+		{reason: tidev1.ExecFailureReason_EXEC_FAILURE_REASON_PROGRAM_NOT_FOUND},
+	} {
+		stream, err := client.ExecDevSession(ctx, listTestRequest(&tidev1.ExecDevSessionRequest{
+			OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(), ExecId: s.newID(),
+			Command: []string{filepath.Join(workspace, "missing-program")}, WorkingDirectory: tc.dir,
+		}))
+		events := receiveExecEvents(t, stream, err)
+		if len(events) != 2 || events[1].GetFailed().GetReason() != tc.reason {
+			t.Fatalf("exec in %q returned %v, want Started and Failed (%s)", tc.dir, events, tc.reason)
+		}
+	}
+	closed := make(chan struct{})
+	go func() {
+		s.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("Close did not return after exec start failures")
+	}
+}
+
+func TestExecStreamEventLimit(t *testing.T) {
+	const outputSize = 2*chunkLimit + 1
+	for _, limit := range []int{0, 1, 2} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			exec, attach := newExecStreams(t, limit, 0)
+			events := exec(fmt.Sprintf("printf '%%0%dd' 0; exit 3", outputSize))
+			requireStarted(t, events, limit)
+			if limit == 1 {
+				requireStarted(t, attach(0), limit)
+				return
+			}
+			if len(events) < 2 || events[1].GetStdout() == nil {
+				t.Fatal("the first event after Started must be stdout")
+			}
+
+			var output strings.Builder
+			for {
+				for i, ev := range events[1:] {
+					switch {
+					case ev.GetStdout() != nil:
+						chunk := ev.GetStdout()
+						if chunk.GetOffset() != int64(output.Len()) || len(chunk.GetData()) == 0 {
+							t.Fatalf("stdout chunk at offset %d has %d bytes, want nonempty data at %d",
+								chunk.GetOffset(), len(chunk.GetData()), output.Len())
+						}
+						output.Write(chunk.GetData())
+					case ev.GetExited() != nil:
+						if i != len(events)-2 || ev.GetExited().GetExitCode() != 3 {
+							t.Fatalf("expected exit code 3 as the last event, got %v", ev)
+						}
+						if output.String() != strings.Repeat("0", outputSize) {
+							t.Fatalf("incorrect stdout, got %d bytes and want %d zeros", output.Len(), outputSize)
+						}
+						return
+					default:
+						t.Fatalf("unexpected event %v", ev)
+					}
+				}
+				if limit == 0 {
+					t.Fatal("the unlimited stream ended before Exited")
+				}
+				events = attach(int64(output.Len()))
+				requireStarted(t, events, limit)
+			}
+		})
+	}
+}
+
+func TestExecStreamEventLimitCountsTruncation(t *testing.T) {
+	const limit = 2
+	exec, attach := newExecStreams(t, limit, 4)
+	requireStarted(t, exec("printf 0123456789"), limit)
+
+	// Wait for Exited at the end of stdout so the retained range is stable.
+	events := attach(10)
+	requireStarted(t, events, limit)
+	if events[1].GetExited() == nil {
+		t.Fatalf("expected Exited, got %v", events[1])
+	}
+
+	events = attach(0)
+	requireStarted(t, events, limit)
+	truncated := events[1].GetOutputTruncated()
+	if truncated == nil || truncated.GetStdoutOffset() != 6 || truncated.GetStderrOffset() != 0 {
+		t.Fatalf("expected OutputTruncated with offsets (6, 0), got %v", events[1])
+	}
+
+	events = attach(truncated.GetStdoutOffset())
+	requireStarted(t, events, limit)
+	chunk := events[1].GetStdout()
+	if chunk.GetOffset() != 6 || string(chunk.GetData()) != "6789" {
+		t.Fatalf("expected retained stdout at offset 6, got %v", events[1])
+	}
+	events = attach(chunk.GetOffset() + int64(len(chunk.GetData())))
+	requireStarted(t, events, limit)
+	if exited := events[1].GetExited(); exited == nil || exited.GetExitCode() != 0 {
+		t.Fatalf("expected exit code 0, got %v", events[1])
+	}
+}
+
+func requireStarted(t *testing.T, events []*tidev1.DevSessionExecEvent, limit int) {
+	t.Helper()
+	if limit > 0 && len(events) != limit {
+		t.Fatalf("received %d events, want %d", len(events), limit)
+	}
+	if len(events) == 0 || events[0].GetStarted().GetExecId() != streamTestExecID {
+		t.Fatal("expected Started with the exec ID as the first event")
+	}
+}
+
+func newExecStreams(t *testing.T, limit, keep int) (
+	func(string) []*tidev1.DevSessionExecEvent,
+	func(int64) []*tidev1.DevSessionExecEvent,
+) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake guest runs POSIX sh commands")
+	}
+	workspace := t.TempDir()
+	s := New()
+	t.Cleanup(s.Close)
+	s.ExecStreamEventLimit = limit
+	s.OutputKeepBytes = keep
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	client, ds := createExecTestSession(t, ctx, s, workspace)
+	return func(command string) []*tidev1.DevSessionExecEvent {
+			t.Helper()
+			stream, err := client.ExecDevSession(ctx, listTestRequest(&tidev1.ExecDevSessionRequest{
+				OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(), ExecId: streamTestExecID,
+				Command: []string{"sh", "-c", command},
+			}))
+			return receiveExecEvents(t, stream, err)
+		}, func(offset int64) []*tidev1.DevSessionExecEvent {
+			t.Helper()
+			stream, err := client.AttachDevSessionExec(ctx, listTestRequest(&tidev1.AttachDevSessionExecRequest{
+				OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(), ExecId: streamTestExecID, StdoutOffset: offset,
+			}))
+			return receiveExecEvents(t, stream, err)
+		}
+}
+
+func createExecTestSession(t *testing.T, ctx context.Context, s *Server, workspace string) (tidev1connect.DevSessionServiceClient, *tidev1.DevSession) {
+	t.Helper()
+	org := s.AddOrganization("exec test").GetOrganizationId()
+	profile := s.AddDevSessionProfile(org, "exec", tidev1.GuestOs_GUEST_OS_LINUX, workspace)
+	client := tidev1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+	session, err := client.CreateDevSession(ctx, listTestRequest(&tidev1.CreateDevSessionRequest{
+		OrganizationId: org, RunnerProfileId: profile.GetRunnerProfileId(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, session.Msg.GetDevSession()
+}
+
+func receiveExecEvents[T any, P interface {
+	*T
+	GetEvent() *tidev1.DevSessionExecEvent
+}](t *testing.T, stream *connect.ServerStreamForClient[T], err error) []*tidev1.DevSessionExecEvent {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	var events []*tidev1.DevSessionExecEvent
+	for stream.Receive() {
+		events = append(events, P(stream.Msg()).GetEvent())
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("stream failed: %v", err)
+	}
+	return events
 }

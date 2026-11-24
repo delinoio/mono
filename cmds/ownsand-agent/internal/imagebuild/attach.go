@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -17,12 +18,17 @@ import (
 	"time"
 )
 
-// This file holds the attach and detach logic of the macOS guest disk without
-// a build tag, so that unit tests exercise it on every host. Only the macOS
-// build (macos_provision_darwin.go) wires it to the real host tools.
+// This file holds the attachment and mount logic of the macOS guest disk
+// without a build tag, so that unit tests exercise it on every host. Only
+// the macOS build wires it to the real host tools.
 
 // hdiutilPath is the host tool that attaches and detaches the guest disk.
 const hdiutilPath = "/usr/bin/hdiutil"
+
+const diskutilPath = "/usr/sbin/diskutil"
+
+// unmountTimeout bounds Data volume cleanup before the whole disk detaches.
+const unmountTimeout = 30 * time.Second
 
 // detachTimeout bounds each detach attempt of the guest disk. The detach runs
 // on its own context, because the build context is often canceled already
@@ -158,6 +164,30 @@ func withAttachedDisk(ctx context.Context, run hostRunner, disk string, logger *
 		return errNoGUIDPartitionTable
 	}
 	return use(whole)
+}
+
+// withMountedDataVolume unmounts the volume after use, even if the build
+// context was canceled. The deadline lets whole-disk cleanup proceed if
+// diskutil stalls.
+func withMountedDataVolume(ctx context.Context, run hostRunner, data, mnt string, use func() error) (err error) {
+	if err := os.MkdirAll(mnt, 0o700); err != nil {
+		return err
+	}
+	if _, err := run(ctx, diskutilPath, "mount", "-mountPoint", mnt, data); err != nil {
+		return fmt.Errorf("imagebuild: mount the guest Data volume: %w", err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), unmountTimeout)
+		defer cancel()
+		if _, unmountErr := run(cleanupCtx, diskutilPath, "unmount", data); unmountErr != nil && err == nil {
+			if ctxErr := cleanupCtx.Err(); ctxErr != nil && !errors.Is(unmountErr, ctxErr) {
+				unmountErr = fmt.Errorf("%w: %w", ctxErr, unmountErr)
+			}
+			err = fmt.Errorf("imagebuild: unmount the guest Data volume: %w", unmountErr)
+		}
+		os.Remove(mnt)
+	}()
+	return use()
 }
 
 // detachDisk detaches the whole-disk device, and forces the detach when the

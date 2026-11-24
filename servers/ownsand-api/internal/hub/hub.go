@@ -118,10 +118,8 @@ func (c *Conn) Send(ctx context.Context, env *ownsandv1.AgentEnvelope) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	select {
-	case c.out <- env:
+	if c.trySend(env) {
 		return nil
-	default:
 	}
 	timer := time.NewTimer(c.queueFullWait)
 	defer timer.Stop()
@@ -136,6 +134,17 @@ func (c *Conn) Send(ctx context.Context, env *ownsandv1.AgentEnvelope) error {
 		// Close keeps the first cause, so an earlier close reason wins.
 		c.Close(ErrQueueFull)
 		return ErrQueueFull
+	}
+}
+
+// trySend queues env only when there is room. The caller checks whether
+// the channel is closed.
+func (c *Conn) trySend(env *ownsandv1.AgentEnvelope) bool {
+	select {
+	case c.out <- env:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -365,6 +374,19 @@ func (h *Hub) Get(deviceID string) *Conn {
 	default:
 		return c
 	}
+}
+
+// TrySend queues env immediately on the current channel of the given
+// generation. A full queue returns false without waiting or closing the
+// channel. A closed or superseded generation returns ErrChannelClosed.
+func (h *Hub) TrySend(deviceID string, generation uint64, env *ownsandv1.AgentEnvelope) (bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c := h.conns[deviceID]
+	if c == nil || c.Generation != generation || c.ctx.Err() != nil {
+		return false, ErrChannelClosed
+	}
+	return c.trySend(env), nil
 }
 
 // Live returns the current channel when the device's state report was

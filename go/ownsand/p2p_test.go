@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -343,6 +344,178 @@ func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
 				t.Fatalf("%d sessions opened, want 1", n)
 			}
 		})
+	}
+}
+
+func TestWriteAttemptDeadlineDuringPeerSend(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fragment int64
+	}{
+		{name: "send turn"},
+		{name: "before first fragment", fragment: 1},
+		{name: "after first fragment", fragment: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+			setupCtx, cancelSetup := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancelSetup()
+			sess, err := s.dp.route(setupCtx)
+			if err != nil || sess == nil {
+				t.Fatalf("route: %v, %v", sess, err)
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			s.c.timing.writeAttemptDeadline = 200 * time.Millisecond
+			var waiting <-chan struct{}
+			if tc.fragment == 0 {
+				sess.sendTurn <- struct{}{}
+			} else {
+				waiting = holdSendAt(sess, tc.fragment)
+			}
+			fw, err := s.OpenFileWrite(FileWriteParams{WriteID: mustID(t), Path: "/blocked"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := &ownsandv1.WriteFileRequest{
+				OrganizationId: s.org,
+				SandboxId:      s.id,
+				WriteId:        fw.op.id,
+				Path:           fw.path,
+				BindingSalt:    fw.salt,
+				Data:           bytes.Repeat([]byte("x"), 2*datapath.MaxDataChannelMessageSize),
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := fw.op.p2pAttempt(ctx, sess, req)
+				done <- err
+			}()
+			if waiting != nil {
+				requireReady(t, setupCtx, "the send waiting on a full buffer", closed(waiting), done)
+			}
+			err = requireWorker(t, setupCtx, "with the send still blocked", done)
+			if tc.fragment == 0 {
+				sess.releaseSendTurn()
+			}
+			if !errors.Is(err, errAttemptDeadline) || ctx.Err() != nil {
+				t.Fatalf("attempt: got %v with caller error %v, want errAttemptDeadline with a live caller", err, ctx.Err())
+			}
+			if kind, _ := classify(ctx, err); kind != failInterrupted {
+				t.Fatalf("classification = %v, want failInterrupted", kind)
+			}
+			if n := streamCount(sess); n != 0 {
+				t.Fatalf("%d streams left after the deadline", n)
+			}
+
+			wantSessions := 1
+			if tc.fragment == 2 {
+				var retired *errSessionRetired
+				if !sess.isDone() || !errors.As(sess.endErr, &retired) {
+					t.Fatal("the deadline did not retire the session with a partial frame")
+				}
+				wantSessions = 2
+			} else {
+				if sess.isDone() {
+					t.Fatal("the deadline ended the session before any fragment was sent")
+				}
+				if waiting != nil {
+					holdSendAt(sess, 1<<62)
+				}
+			}
+
+			s.c.timing.writeAttemptDeadline = testTiming().writeAttemptDeadline
+			want := []byte("after the deadline")
+			if err := s.WriteFileBytes(setupCtx, "/after", want, WriteOptions{}); err != nil {
+				t.Fatalf("write after the deadline: %v", err)
+			}
+			if got, _ := cp.agent.file("/after"); !bytes.Equal(got, want) {
+				t.Fatalf("file %q, want %q", got, want)
+			}
+			if writes := cp.agent.writeRequests(); len(writes) != 1 || writes[0].GetPath() != "/after" {
+				t.Fatalf("agent saw %d writes, want only the follow-up write", len(writes))
+			}
+			if n := cp.openSessionCount(); n != wantSessions {
+				t.Fatalf("%d sessions opened, want %d", n, wantSessions)
+			}
+		})
+	}
+}
+
+func TestWriteAttemptDeadlineIncludesPeerReplyWait(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agentGate = make(chan struct{})
+	defer close(cp.agentGate)
+	cp.agentHits = make(chan string, 1)
+	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	sess, err := s.dp.route(ctx)
+	if err != nil || sess == nil {
+		t.Fatalf("route: %v, %v", sess, err)
+	}
+	const budget = time.Second
+	s.c.timing.writeAttemptDeadline = budget
+	sess.sendTurn <- struct{}{}
+	release := sync.OnceFunc(sess.releaseSendTurn)
+	defer release()
+
+	op := &writeOp{s: s}
+	req := &ownsandv1.WriteFileRequest{WriteId: mustID(t), Path: "/wait", Data: []byte("x")}
+	done := make(chan error, 1)
+	go func() {
+		_, err := op.p2pAttempt(ctx, sess, req)
+		done <- err
+	}()
+	requireReady(t, ctx, "the write waiting for the send turn", func() bool { return streamCount(sess) == 1 }, done)
+	time.Sleep(budget / 2)
+	releasedAt := time.Now()
+	release()
+	select {
+	case kind := <-cp.agentHits:
+		if kind != "write" {
+			t.Fatalf("agent received %q, want write", kind)
+		}
+	case <-ctx.Done():
+		t.Fatalf("the agent did not receive the write: %v", ctx.Err())
+	}
+	if err := requireWorker(t, ctx, "with the reply still held", done); !errors.Is(err, errAttemptDeadline) {
+		t.Fatalf("attempt: got %v, want errAttemptDeadline", err)
+	}
+	if elapsed := time.Since(releasedAt); elapsed >= budget {
+		t.Fatalf("the reply wait used %s after the send was released, want less than a full attempt budget of %s", elapsed, budget)
+	}
+}
+
+func TestWriteChunkCallerCancellationWhileWaitingToSend(t *testing.T) {
+	cp := newFakeCP(t)
+	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+	setupCtx, cancelSetup := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancelSetup()
+	sess, err := s.dp.route(setupCtx)
+	if err != nil || sess == nil {
+		t.Fatalf("route: %v, %v", sess, err)
+	}
+	s.c.timing.writeAttemptDeadline = 10 * time.Second
+	sess.sendTurn <- struct{}{}
+	defer sess.releaseSendTurn()
+
+	fw, err := s.OpenFileWrite(FileWriteParams{WriteID: mustID(t), Path: "/canceled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(setupCtx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := fw.WriteChunk(ctx, 0, []byte("x"))
+		done <- err
+	}()
+	requireReady(t, setupCtx, "the chunk waiting for the send turn", func() bool { return streamCount(sess) == 1 }, done)
+	cancel()
+	if err := requireWorker(t, setupCtx, "after the caller canceled", done); err != context.Canceled {
+		t.Fatalf("WriteChunk: got %v, want context.Canceled", err)
 	}
 }
 
