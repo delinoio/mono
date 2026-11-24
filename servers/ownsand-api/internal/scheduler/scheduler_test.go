@@ -307,6 +307,21 @@ func TestFreeDisk(t *testing.T) {
 	}
 }
 
+func TestFreeDiskAtSignedLimit(t *testing.T) {
+	d := linuxDevice("d1")
+	req := linuxRequest()
+	req.DiskGiB = 1
+	d.Capabilities.FreeDiskBytes = math.MaxInt64
+	if dec, err := Place(req, []Device{d}, now); err != nil || dec.DeviceID != d.ID {
+		t.Fatalf("placement with saturated free disk = %+v, %v, want %s", dec, err, d.ID)
+	}
+
+	d.Capabilities.FreeDiskBytes = (1 << 30) - 1
+	if _, err := Place(req, []Device{d}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("placement with insufficient disk = %v, want unavailable", err)
+	}
+}
+
 func TestAllocatedVCPUBeyondInt32(t *testing.T) {
 	const total = 2 * int64(math.MaxInt32)
 	// The exact total decides capacity: the capped int32 field alone would

@@ -2,7 +2,11 @@
 import { Priority, RequestState } from "@delino/tide-protos/v1/common_pb";
 import type { Request, Runner } from "@delino/tide-protos/v1/work_pb";
 import { type WatchQueueEvent, WatchQueueEventKind } from "tide-sdk";
-import { TERMINAL_REQUEST_STATES, TERMINAL_RUNNER_STATES } from "./format.ts";
+import {
+  compareTimestamps,
+  TERMINAL_REQUEST_STATES,
+  TERMINAL_RUNNER_STATES,
+} from "./format.ts";
 
 /** The connection state of the live queue view. */
 export enum LiveState {
@@ -146,17 +150,20 @@ const PRIORITY_ORDER: Record<number, number> = {
 };
 
 /**
- * The waiting requests in queue order: priority (`HIGH` first), then the
+ * Queue order compares priority (`HIGH` first), then the
  * time the request was queued (oldest first), then the request ID.
  */
+export function compareQueueOrder(a: Request, b: Request): number {
+  return (
+    (PRIORITY_ORDER[a.priority] ?? 3) - (PRIORITY_ORDER[b.priority] ?? 3) ||
+    compareTimestamps(a.queuedAt, b.queuedAt) ||
+    (a.requestId < b.requestId ? -1 : a.requestId > b.requestId ? 1 : 0)
+  );
+}
+
+/** The waiting requests in queue order. */
 export function waitingInQueueOrder(requests: Iterable<Request>): Request[] {
   return [...requests]
     .filter((r) => r.state === RequestState.QUEUED)
-    .sort(
-      (a, b) =>
-        (PRIORITY_ORDER[a.priority] ?? 3) - (PRIORITY_ORDER[b.priority] ?? 3) ||
-        Number((a.queuedAt?.seconds ?? 0n) - (b.queuedAt?.seconds ?? 0n)) ||
-        (a.queuedAt?.nanos ?? 0) - (b.queuedAt?.nanos ?? 0) ||
-        (a.requestId < b.requestId ? -1 : a.requestId > b.requestId ? 1 : 0),
-    );
+    .sort(compareQueueOrder);
 }

@@ -195,10 +195,9 @@ func (e *ExecStreamError) Unwrap() error { return e.Err }
 // prefix again. To avoid duplicate writes, use atomic chunk writes or track
 // durable bytes by stream and offset.
 //
-// A server error of the ExecDevSession call itself (for example
-// failed_precondition for a dev session that is not RUNNING) is returned
-// unchanged: the command did not run. Failures after the request was sent
-// are returned as *ExecStreamError.
+// Exec returns an initial credential failure or a terminal server status
+// before the first event unchanged. Later stream failures return an
+// *ExecStreamError.
 func (c *Client) Exec(ctx context.Context, p ExecParams) (*ExecResult, error) {
 	if len(p.Command) == 0 {
 		return nil, localError(connect.CodeInvalidArgument, errors.New("tide: exec needs a command"))
@@ -348,11 +347,13 @@ func (o *execOp) run(ctx context.Context) (*ExecResult, error) {
 			return res, nil
 		}
 		if first {
-			// Only an explicit server status before any event proves that
-			// the command did not run. Any other failure continues with
-			// AttachDevSessionExec, so the command never runs twice.
-			if err != nil && !progressed && connect.IsWireError(err) && connect.CodeOf(err) != connect.CodeUnavailable {
-				return nil, err
+			// A terminal credential failure prevents the initial send.
+			// A terminal wire status before any event also ends the exec.
+			if err != nil && !progressed {
+				var credentialErr *CredentialError
+				if errors.As(err, &credentialErr) || (connect.IsWireError(err) && connect.CodeOf(err) != connect.CodeUnavailable) {
+					return nil, err
+				}
 			}
 			o.start = nil
 		}

@@ -301,14 +301,24 @@ func (ps *Profiles) checkTemplate(ctx context.Context, p *Profile) error {
 		return err
 	}
 	guest, err := client.TemplateGuestOS(ctx, p.TemplateID)
-	switch {
-	case err == nil:
-	case connect.CodeOf(err) == connect.CodeNotFound:
-		return api.ErrInvalidf("invalid source.ownsand_template_id: the linked OwnSand organization has no such template")
-	case connect.CodeOf(err) == connect.CodeUnavailable || connect.CodeOf(err) == connect.CodeDeadlineExceeded:
-		return api.ErrUnavailable("OwnSand is unavailable; try again")
-	default:
-		return fmt.Errorf("check template: %w", err)
+	if err != nil {
+		var ce *connect.Error
+		if errors.Is(err, context.Canceled) || !errors.As(err, &ce) {
+			return fmt.Errorf("check template: %w", err)
+		}
+		switch ce.Code() {
+		case connect.CodeNotFound:
+			return api.ErrInvalidf("invalid source.ownsand_template_id: the linked OwnSand organization has no such template")
+		case connect.CodeUnavailable, connect.CodeDeadlineExceeded:
+			return api.ErrUnavailable("OwnSand is unavailable; try again")
+		case connect.CodeUnauthenticated, connect.CodePermissionDenied:
+			return api.ErrPrecondition("OwnSand rejected the organization's OwnSand API key")
+		case connect.CodeResourceExhausted:
+			return connect.NewError(connect.CodeResourceExhausted, errors.New("OwnSand: "+ce.Message()))
+		default:
+			// Service.Internal passes through wrapped Connect errors.
+			return fmt.Errorf("check template: OwnSand answered %s: %s", ce.Code(), ce.Message())
+		}
 	}
 	if guest != OwnSandGuestOS(p.GuestOS) {
 		return api.ErrInvalidf("invalid source.ownsand_template_id: the template's guest OS is not guest_os")

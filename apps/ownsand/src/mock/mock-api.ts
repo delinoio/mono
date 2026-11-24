@@ -577,8 +577,14 @@ export interface MockTransportOptions {
    * row.
    */
   extraApiKeys?: number;
+  /** Pending invitations to add after the seeded Acme invitation. */
+  extraInvitations?: number;
   /** Online Linux devices to add after the two seeded Acme devices. */
   extraDevices?: number;
+  /** Ready snapshots to add after the seeded Acme snapshot. */
+  extraSnapshots?: number;
+  /** Templates to add after the seeded Acme template. */
+  extraTemplates?: number;
   /**
    * How many running sandboxes, labelled `extra=<index>`, to add to the Acme
    * organization after the seeded ones, on the seeded `build-box` device with
@@ -812,6 +818,29 @@ export function createMockTransport(
   }
   const acmeOrg = orgs.get(MOCK_IDS.acme);
   if (acmeOrg !== undefined) {
+    const seededSnapshot = acmeOrg.snapshots[0]!;
+    for (let i = 0; i < (options.extraSnapshots ?? 0); i++) {
+      const snapshot = clone(SnapshotSchema, seededSnapshot);
+      snapshot.snapshotId = newMockId();
+      acmeOrg.snapshots.push(snapshot);
+    }
+    const seededTemplate = acmeOrg.templates[0]!;
+    for (let i = 0; i < (options.extraTemplates ?? 0); i++) {
+      const template = clone(TemplateSchema, seededTemplate);
+      template.templateId = newMockId();
+      template.name = `Template ${String(i + 2).padStart(3, "0")}`;
+      acmeOrg.templates.push(template);
+    }
+    const seededInvitation = acmeOrg.invitations[0]!.invitation;
+    for (let i = 0; i < (options.extraInvitations ?? 0); i++) {
+      const invitation = clone(InvitationSchema, seededInvitation);
+      invitation.invitationId = newMockId();
+      invitation.secretPrefix = `osi_${String(i).padStart(4, "0")}`;
+      acmeOrg.invitations.push({
+        invitation,
+        secret: `${invitation.secretPrefix}_unused`,
+      });
+    }
     for (let i = 0; i < (options.extraEnrollmentTokens ?? 0); i++) {
       acmeOrg.tokens.push(
         create(EnrollmentTokenSchema, {
@@ -1163,7 +1192,12 @@ export function createMockTransport(
               expireTime !== undefined &&
               timestampMs(expireTime) > cutoff,
           );
-        return { invitations };
+        const { page, nextPageToken } = pageOf(
+          invitations,
+          req,
+          (invitation) => invitation.invitationId,
+        );
+        return { invitations: page, nextPageToken };
       },
       revokeInvitation(req) {
         const { org, role } = membership(req.organizationId);
@@ -1751,7 +1785,12 @@ export function createMockTransport(
       },
       listTemplates(req) {
         const { org } = membership(req.organizationId);
-        return { templates: org.templates };
+        const { page, nextPageToken } = pageOf(
+          org.templates,
+          req,
+          (t) => t.templateId,
+        );
+        return { templates: page, nextPageToken };
       },
       deleteTemplate(req) {
         const { org } = membership(req.organizationId);

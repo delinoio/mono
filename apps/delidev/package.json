@@ -8,7 +8,7 @@
     "build": "rsbuild build",
     "dev": "rsbuild dev",
     "preview": "rsbuild preview",
-    "tauri": "tauri",
+    "tauri": "node tauri.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
