@@ -343,45 +343,93 @@ type writes struct {
 }
 
 type writeEntry struct {
-	mu   sync.Mutex
-	fw   ownsandclient.FileWrite
-	path string
-	used time.Time
+	mu       sync.Mutex // Serializes chunks and protects the expiry state.
+	fw       ownsandclient.FileWrite
+	path     string
+	deadline time.Time
+	timer    *time.Timer
 }
 
 const writeIdle = 20 * time.Minute
 
 func newWrites() *writes { return &writes{entries: map[string]*writeEntry{}} }
 
-func (w *writes) get(key, path string, open func() (ownsandclient.FileWrite, error)) (*writeEntry, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	now := time.Now()
-	for k, e := range w.entries {
-		if now.Sub(e.used) > writeIdle {
-			delete(w.entries, k)
+// acquire returns the current entry with its mutex held until release.
+func (w *writes) acquire(key, path string, open func() (ownsandclient.FileWrite, error)) (*writeEntry, error) {
+	for {
+		e, err := w.getOrOpen(key, path, open)
+		if err != nil {
+			return nil, err
 		}
-	}
-	if e, ok := w.entries[key]; ok {
+		e.mu.Lock()
+		w.mu.Lock()
+		current := w.entries[key] == e
+		w.mu.Unlock()
+		if !current {
+			// Another chunk or the timer removed this entry while we waited.
+			e.mu.Unlock()
+			continue
+		}
+		if !time.Now().Before(e.deadline) {
+			w.drop(key, e)
+			e.mu.Unlock()
+			continue
+		}
 		if e.path != path {
+			e.mu.Unlock()
 			return nil, api.ErrInvalidf("invalid path: every chunk of a write_id must name the same path")
 		}
-		e.used = now
+		return e, nil
+	}
+}
+
+func (w *writes) getOrOpen(key, path string, open func() (ownsandclient.FileWrite, error)) (*writeEntry, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if e := w.entries[key]; e != nil {
 		return e, nil
 	}
 	fw, err := open()
 	if err != nil {
 		return nil, err
 	}
-	e := &writeEntry{fw: fw, path: path, used: now}
+	e := &writeEntry{fw: fw, path: path, deadline: time.Now().Add(writeIdle)}
 	w.entries[key] = e
+	e.timer = time.AfterFunc(time.Until(e.deadline), func() { w.expire(key, e) })
 	return e, nil
 }
 
-func (w *writes) drop(key string) {
+func (w *writes) expire(key string, e *writeEntry) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.entries[key] != e {
+		return
+	}
+	if remaining := time.Until(e.deadline); remaining > 0 {
+		// A successful chunk moved the deadline after this timer was set.
+		e.timer.Reset(remaining)
+		return
+	}
 	delete(w.entries, key)
-	w.mu.Unlock()
+}
+
+// drop removes the current entry while its mutex is held.
+func (w *writes) drop(key string, e *writeEntry) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	e.timer.Stop()
+	delete(w.entries, key)
+}
+
+func (w *writes) release(key string, e *writeEntry, finished bool, err error) {
+	defer e.mu.Unlock()
+	if finished || connect.CodeOf(err) == connect.CodeNotFound {
+		w.drop(key, e)
+	} else if err == nil {
+		e.deadline = time.Now().Add(writeIdle)
+	}
 }
 
 // WriteDevSessionFile writes one chunk of a guest file. Every chunk of a
@@ -423,7 +471,7 @@ func (h *Handler) WriteDevSessionFile(ctx context.Context, req *connect.Request[
 	}
 	sandboxID := sess.runner.SandboxID
 	key := sandboxID + "/" + writeID
-	entry, err := h.writes.get(key, path, func() (ownsandclient.FileWrite, error) {
+	entry, err := h.writes.acquire(key, path, func() (ownsandclient.FileWrite, error) {
 		fw, err := client.OpenFileWrite(sandboxID, ownsand.FileWriteParams{WriteID: writeID, Path: path, BindingSalt: h.bindingSalt(sandboxID, writeID)})
 		if err != nil {
 			return nil, fileTransferError(err)
@@ -434,7 +482,6 @@ func (h *Handler) WriteDevSessionFile(ctx context.Context, req *connect.Request[
 		return nil, err
 	}
 	start := time.Now()
-	entry.mu.Lock()
 	var res *tidev1.WriteDevSessionFileResponse
 	if m.GetFinal() {
 		r, werr := entry.fw.Finish(ctx, m.GetOffset(), m.GetData(), m.GetOffset()+int64(chunkSize), m.GetMode())
@@ -449,23 +496,16 @@ func (h *Handler) WriteDevSessionFile(ctx context.Context, req *connect.Request[
 			res = &tidev1.WriteDevSessionFileResponse{WriteId: writeID, Offset: r.GetOffset(), Length: r.GetLength()}
 		}
 	}
-	entry.mu.Unlock()
+	h.writes.release(key, entry, err == nil && res.GetFinished(), err)
 	log := h.svc.Logger.With(slog.String("organization_id", sess.req.OrganizationID), slog.String("request_id", sess.req.ID), slog.String("write_id", writeID))
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		log.WarnContext(ctx, "dev_session_write_failed", slog.String("code", ownsandclient.Code(err)), slog.Int("size", len(m.GetData())))
-		if connect.CodeOf(err) == connect.CodeNotFound {
-			// The write expired in the guest; a new write_id starts again.
-			h.writes.drop(key)
-		}
 		return nil, fileTransferError(err)
 	}
 	h.e.Metrics().TransferBytes("upload", strings.TrimPrefix(sess.guestOS.String(), "GUEST_OS_"), int64(len(m.GetData())))
 	log.InfoContext(ctx, "dev_session_file_write", slog.Int("size", len(m.GetData())), slog.Bool("final", m.GetFinal()), slog.Int64("duration_ms", time.Since(start).Milliseconds()))
-	if res.GetFinished() {
-		h.writes.drop(key)
-	}
 	return connect.NewResponse(res), nil
 }

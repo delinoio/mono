@@ -407,6 +407,11 @@ func TestDevSessionFiles(t *testing.T) {
 	if _, ok := w.fake.File(w.osOrg, sandboxID, "/home/dev/work/out/a.txt"); ok {
 		t.Fatal("the file appeared before the final chunk")
 	}
+	_, err := owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{
+		OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), WriteId: writeID,
+		Path: "out/other.txt", Data: data[:1000],
+	}))
+	wantCode(t, "changed path for the same write ID", err, connect.CodeInvalidArgument)
 	if _, err := write(0, data[:1000], false); err != nil {
 		t.Fatal(err)
 	}
