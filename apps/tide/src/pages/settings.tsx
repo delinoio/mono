@@ -14,7 +14,12 @@ import { type FormEvent, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { MemberListStatus } from "../components/member-list-status.tsx";
 import { useOrg } from "../components/shell.tsx";
-import { ConfirmDialog, ErrorNotice, PageHeader } from "../components/ui.tsx";
+import {
+  ConfirmDialog,
+  ErrorNotice,
+  PageHeader,
+  showsFullError,
+} from "../components/ui.tsx";
 import { devSessionLimitError } from "../forms.ts";
 import { displayName, useMembers } from "../members.ts";
 import { can, Permission } from "../roles.ts";
@@ -113,7 +118,10 @@ function OwnerActions() {
   const [target, setTarget] = useState<string | null>(null);
   const [confirmTransfer, setConfirmTransfer] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const candidates = roster.members.filter((m) => m.role !== Role.OWNER);
+  const hasRoster = roster.hasData && !showsFullError(roster.query);
+  const candidates = hasRoster
+    ? roster.members.filter((m) => m.role !== Role.OWNER)
+    : [];
   const candidate = candidates.find((m) => m.userId === target);
 
   return (
@@ -126,7 +134,7 @@ function OwnerActions() {
         <MemberListStatus roster={roster} />
         <div className="inline-form">
           <Select
-            disabled={!roster.hasData}
+            disabled={!hasRoster}
             label="New owner"
             placeholder="Choose a member"
             value={candidate?.userId ?? null}

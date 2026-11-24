@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -41,6 +42,8 @@ const (
 	// StreamLimit ends a forwarded exec or read stream before 14 minutes,
 	// with an OK status and no final event.
 	StreamLimit = 13*time.Minute + 30*time.Second
+	// writeGracePeriod gives Connect time to write its end-of-stream status.
+	writeGracePeriod = 15 * time.Second
 	// KeepaliveInterval is the longest time without an exec event; the
 	// contract requires at least one keepalive every 60 seconds.
 	KeepaliveInterval = 30 * time.Second
@@ -51,6 +54,7 @@ const (
 // Timing overrides the stream durations (tests).
 type Timing struct {
 	StreamLimit       time.Duration
+	WriteGracePeriod  time.Duration
 	KeepaliveInterval time.Duration
 }
 
@@ -70,12 +74,19 @@ func Register(r *app.Registry, e *work.Engine, timing Timing) *Handler {
 	if timing.StreamLimit <= 0 {
 		timing.StreamLimit = StreamLimit
 	}
+	if timing.WriteGracePeriod <= 0 {
+		timing.WriteGracePeriod = writeGracePeriod
+	}
 	if timing.KeepaliveInterval <= 0 {
 		timing.KeepaliveInterval = KeepaliveInterval
 	}
 	h := &Handler{svc: r.Service, e: e, timing: timing, writes: newWrites()}
 	e.RegisterAdapter(Adapter{})
-	r.Handle(tidev1connect.NewDevSessionServiceHandler(h, r.HandlerOptions()...))
+	path, handler := tidev1connect.NewDevSessionServiceHandler(h, r.HandlerOptions()...)
+	r.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ctx := context.WithValue(req.Context(), responseControllerKey{}, http.NewResponseController(w))
+		handler.ServeHTTP(w, req.WithContext(ctx))
+	}))
 	r.OnMembershipEnd(api.MembershipEndHook{Name: "dev_sessions", InTx: h.membershipEndTx, AfterCommit: h.membershipEndAfter})
 	return h
 }

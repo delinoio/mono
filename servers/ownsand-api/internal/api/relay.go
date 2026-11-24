@@ -47,7 +47,10 @@ const MaxRequestBytes = 2 << 20
 const _ = uint(MaxRequestBytes - datapath.MaxFrameSize - 1)
 
 // RelayAgentHandler serves RelayAgentService.
-type RelayAgentHandler struct{ *DataPlane }
+type RelayAgentHandler struct {
+	*DataPlane
+	Clock relay.Clock
+}
 
 var _ ownsandv1connect.RelayAgentServiceHandler = RelayAgentHandler{}
 
@@ -63,7 +66,7 @@ func (h RelayAgentHandler) Connect(ctx context.Context, stream *connect.BidiStre
 	if hc == nil {
 		return errUnavailable("the device has no agent channel on this instance")
 	}
-	conn := relay.NewConn(ctx, p.ID, hc.Generation, h.Limits)
+	conn := relay.NewConnWithClock(ctx, p.ID, hc.Generation, h.Limits, h.Clock)
 	log := h.S.Logger.With(slog.String("device_id", p.ID), slog.Uint64("generation", hc.Generation))
 	// The channel lookup above and the registration are separate steps; a
 	// reconnect can install a newer channel and its relay connection between

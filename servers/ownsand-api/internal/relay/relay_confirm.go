@@ -80,7 +80,7 @@ func (c *Conn) sendMeasured(of outFrame, send func(*ownsandv1.DataFrame) error) 
 		err := send(f)
 		if err == nil && w.acceptance > 0 {
 			c.mu.Lock()
-			completedAt := c.clk.mono()
+			completedAt := c.clk.Elapsed()
 			w.stream.acceptance.window = w.acceptance
 			w.stream.acceptance.deadline = completedAt + w.acceptance
 			c.mu.Unlock()

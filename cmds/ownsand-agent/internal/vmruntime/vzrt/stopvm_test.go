@@ -4,9 +4,12 @@ package vzrt
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -56,7 +59,7 @@ const testStopTimeout = 100 * time.Millisecond
 
 func TestStopMachineTerminalSkipsStop(t *testing.T) {
 	m := &fakeMachine{terminal: true, canStop: true}
-	if err := stopMachine(m, nil, testStopTimeout); err != nil {
+	if err := new(machineStopper).stopMachine(m, nil, testStopTimeout); err != nil {
 		t.Fatal(err)
 	}
 	if m.stops != 0 {
@@ -67,7 +70,7 @@ func TestStopMachineTerminalSkipsStop(t *testing.T) {
 func TestStopMachineRejectedStopIsAnError(t *testing.T) {
 	rejected := errors.New("framework rejected the stop")
 	m := &fakeMachine{canStop: true, stopErr: rejected}
-	err := stopMachine(m, make(chan struct{}), testStopTimeout)
+	err := new(machineStopper).stopMachine(m, make(chan struct{}), testStopTimeout)
 	if !errors.Is(err, rejected) {
 		t.Fatalf("error %v, want the rejection", err)
 	}
@@ -75,7 +78,7 @@ func TestStopMachineRejectedStopIsAnError(t *testing.T) {
 
 func TestStopMachineRejectedStopOfAnEndedMachineSucceeds(t *testing.T) {
 	m := &endsDuringStop{fakeMachine: fakeMachine{canStop: true, stopErr: errors.New("already stopped")}}
-	if err := stopMachine(m, make(chan struct{}), testStopTimeout); err != nil {
+	if err := new(machineStopper).stopMachine(m, make(chan struct{}), testStopTimeout); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -91,7 +94,7 @@ func (e *endsDuringStop) Stop() error {
 
 func TestStopMachineTimeoutWithoutTerminalState(t *testing.T) {
 	m := &fakeMachine{canStop: true}
-	err := stopMachine(m, make(chan struct{}), testStopTimeout)
+	err := new(machineStopper).stopMachine(m, make(chan struct{}), testStopTimeout)
 	if !errors.Is(err, errStopTimeout) {
 		t.Fatalf("error %v, want errStopTimeout", err)
 	}
@@ -104,7 +107,7 @@ func TestStopMachineWaitsWithoutCanStop(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 		close(exited)
 	}()
-	if err := stopMachine(m, exited, testStopTimeout); err != nil {
+	if err := new(machineStopper).stopMachine(m, exited, testStopTimeout); err != nil {
 		t.Fatal(err)
 	}
 	if m.stops != 0 {
@@ -116,7 +119,7 @@ func TestStopMachineNotificationClosed(t *testing.T) {
 	m := &fakeMachine{canStop: true}
 	exited := make(chan struct{})
 	close(exited)
-	if err := stopMachine(m, exited, testStopTimeout); err != nil {
+	if err := new(machineStopper).stopMachine(m, exited, testStopTimeout); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -124,7 +127,7 @@ func TestStopMachineNotificationClosed(t *testing.T) {
 func TestStopMachineMissingNotificationUsesTheState(t *testing.T) {
 	// The state-change notification never arrives, but the state read does.
 	m := &fakeMachine{canStop: true, stopEnds: true}
-	if err := stopMachine(m, make(chan struct{}), testStopTimeout); err != nil {
+	if err := new(machineStopper).stopMachine(m, make(chan struct{}), testStopTimeout); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -141,9 +144,10 @@ func TestReleaseAfterStopRetainsHandleUntilTheStopSucceeds(t *testing.T) {
 	tracked := map[string]*fakeVM{v.id: v, other.id: other}
 	m := &fakeMachine{canStop: true, stopErr: errors.New("stop rejected")}
 	var released atomic.Int32
+	var stopper machineStopper
 	run := func() error {
 		return releaseAfterStop(&mu, tracked, v.id, v,
-			func() error { return stopMachine(m, make(chan struct{}), testStopTimeout) },
+			func() error { return stopper.stopMachine(m, make(chan struct{}), testStopTimeout) },
 			func() error { released.Add(1); return nil })
 	}
 
@@ -247,4 +251,159 @@ func TestStopForCleanupAcceptedStopWithoutTerminalTimesOut(t *testing.T) {
 			t.Fatalf("error %v does not wrap %v", err, want)
 		}
 	}
+}
+
+// Hook the native calls before they take the fake's state lock so a stop
+// caller can still read the machine state while the request is blocked.
+type stopHooksMachine struct {
+	fakeMachine
+	canStopHook func()
+	stopHook    func()
+}
+
+func (m *stopHooksMachine) CanStop() bool {
+	if m.canStopHook != nil {
+		m.canStopHook()
+	}
+	return m.fakeMachine.CanStop()
+}
+
+func (m *stopHooksMachine) Stop() error {
+	if m.stopHook != nil {
+		m.stopHook()
+	}
+	return m.fakeMachine.Stop()
+}
+
+func TestStopMachineStalledRequestRetainsFilesAndHandle(t *testing.T) {
+	for _, phase := range []string{"eligibility", "completion"} {
+		t.Run(phase, func(t *testing.T) {
+			dir := t.TempDir()
+			disk := filepath.Join(dir, "disk.img")
+			if err := os.WriteFile(disk, []byte("staged disk"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Test(t, func(t *testing.T) {
+				unblock := make(chan struct{})
+				resume := sync.OnceFunc(func() { close(unblock) })
+				defer resume()
+				var calls atomic.Int32
+				stalled := func() {
+					calls.Add(1)
+					<-unblock
+				}
+				m := &stopHooksMachine{fakeMachine: fakeMachine{canStop: true, stopEnds: true}}
+				if phase == "eligibility" {
+					m.canStopHook = stalled
+				} else {
+					m.stopHook = stalled
+				}
+
+				w := watchMachine(make(chan watchTestState), watchTestTerminal)
+				defer w.cancel()
+				v := &fakeVM{id: "sb-1"}
+				var mu sync.Mutex
+				tracked := map[string]*fakeVM{v.id: v}
+				var released bool
+				clean := func() error {
+					return releaseAfterStop(&mu, tracked, v.id, v, func() error {
+						return w.stop(m, testStopTimeout)
+					}, func() error {
+						released = true
+						return os.Remove(disk)
+					})
+				}
+				for range 2 {
+					start := time.Now()
+					if err := clean(); !errors.Is(err, errStopTimeout) {
+						t.Fatalf("cleanup error = %v, want errStopTimeout", err)
+					}
+					if elapsed := time.Since(start); elapsed != testStopTimeout {
+						t.Fatalf("cleanup took %v, want %v", elapsed, testStopTimeout)
+					}
+					if tracked[v.id] != v || released {
+						t.Fatal("cleanup released the VM while its stop request was pending")
+					}
+					if _, err := os.Stat(disk); err != nil {
+						t.Fatalf("disk was not retained: %v", err)
+					}
+					select {
+					case <-w.done:
+						t.Fatal("the VM watcher was released before termination")
+					default:
+					}
+				}
+
+				// A later retry can finish after the original request ends.
+				resume()
+				synctest.Wait()
+				if calls.Load() != 1 || m.stops != 1 {
+					t.Fatalf("got %d stalled calls and %d Stop calls, want one each", calls.Load(), m.stops)
+				}
+				if err := clean(); err != nil {
+					t.Fatal(err)
+				}
+				if tracked[v.id] != nil || !released {
+					t.Fatal("the terminated VM was not released")
+				}
+				if _, err := os.Stat(disk); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("disk was not removed after termination: %v", err)
+				}
+			})
+		})
+	}
+}
+
+func TestStopMachineTerminalWhileCanStopIsBlocked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var stopper machineStopper
+		exited := make(chan struct{})
+		unblock := make(chan struct{})
+		resume := sync.OnceFunc(func() { close(unblock) })
+		defer resume()
+		m := &stopHooksMachine{
+			fakeMachine: fakeMachine{canStop: true},
+			canStopHook: func() { <-unblock },
+		}
+		results := make(chan error, 2)
+		for range 2 {
+			go func() { results <- stopper.stopMachine(m, exited, testStopTimeout) }()
+		}
+		synctest.Wait()
+		close(exited)
+		for range 2 {
+			if err := <-results; err != nil {
+				t.Fatalf("terminal notification did not unblock stop: %v", err)
+			}
+		}
+		resume()
+		synctest.Wait()
+		if m.stops != 0 {
+			t.Fatalf("Stop called %d times after the VM terminated", m.stops)
+		}
+	})
+}
+
+func TestStopForCleanupSharesDeadlineBetweenRequestAndTerminalWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		primary := errors.New("first boot failed")
+		for _, delay := range []time.Duration{testStopTimeout / 2, 2 * testStopTimeout} {
+			m := &stopHooksMachine{
+				fakeMachine: fakeMachine{canStop: true},
+				stopHook:    func() { time.Sleep(delay) },
+			}
+			start := time.Now()
+			err := stopForCleanup(primary, m, make(chan struct{}), testStopTimeout)
+			if elapsed := time.Since(start); elapsed != testStopTimeout {
+				t.Fatalf("cleanup took %v with a %v request, want %v", elapsed, delay, testStopTimeout)
+			}
+			for _, want := range []error{primary, ErrVMMayRun, errStopTimeout} {
+				if !errors.Is(err, want) {
+					t.Fatalf("error %v does not wrap %v", err, want)
+				}
+			}
+			// Let the fake callback return before the test exits its bubble.
+			time.Sleep(delay)
+		}
+	})
 }

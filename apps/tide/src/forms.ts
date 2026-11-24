@@ -32,6 +32,11 @@ export const MAX_QUEUE_WAIT_MS = 24 * HOUR_MS;
 export const OPENAI_MAX_QUEUE_WAIT_MS = 5 * MINUTE_MS;
 export const MAX_WARM_COUNT = 10;
 
+// Runner profile resource limits from servers/tide-api/internal/profile/validate.go.
+export const MAX_VCPU_COUNT = 1024;
+export const MAX_MEMORY_MIB = 16_777_216;
+export const MAX_DISK_GIB = 1_048_576;
+
 const PROFILE_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /** How a runner profile form names its source. */
@@ -152,17 +157,45 @@ export function profileErrors(
   ) {
     errors.templateId = "Enter the ID of an OwnSand template of this guest OS.";
   }
-  if (!positive(values.vcpuCount)) errors.vcpuCount = "Enter at least 1 vCPU.";
-  if (!positive(values.memoryMib))
+  if (values.vcpuCount === null || values.vcpuCount <= 0) {
+    errors.vcpuCount = "Enter at least 1 vCPU.";
+  } else if (
+    !Number.isInteger(values.vcpuCount) ||
+    values.vcpuCount > MAX_VCPU_COUNT
+  ) {
+    errors.vcpuCount = `Enter a whole number of vCPUs from 1 to ${MAX_VCPU_COUNT}.`;
+  }
+  if (values.memoryMib === null || values.memoryMib <= 0) {
     errors.memoryMib = "Enter the memory in MiB.";
-  if (!positive(values.diskGib)) errors.diskGib = "Enter the disk size in GiB.";
-  if (!positive(values.idleTtlMinutes)) {
+  } else if (
+    !Number.isInteger(values.memoryMib) ||
+    values.memoryMib > MAX_MEMORY_MIB
+  ) {
+    errors.memoryMib = `Enter a whole number of MiB from 1 to ${MAX_MEMORY_MIB}.`;
+  }
+  if (values.diskGib === null || values.diskGib <= 0) {
+    errors.diskGib = "Enter the disk size in GiB.";
+  } else if (
+    !Number.isInteger(values.diskGib) ||
+    values.diskGib > MAX_DISK_GIB
+  ) {
+    errors.diskGib = `Enter a whole number of GiB from 1 to ${MAX_DISK_GIB}.`;
+  }
+  const idleTtlMinutes = values.idleTtlMinutes ?? 0;
+  const maxTtlHours = values.maxTtlHours ?? 0;
+  if (!positive(idleTtlMinutes)) {
     errors.idleTtlMinutes = "Enter an idle TTL greater than zero.";
   }
-  if (!positive(values.maxTtlHours)) {
+  if (!positive(maxTtlHours)) {
     errors.maxTtlHours = "Enter a maximum TTL greater than zero.";
-  } else if (values.maxTtlHours! * HOUR_MS > MAX_TTL_MS) {
+  } else if (maxTtlHours * HOUR_MS > MAX_TTL_MS) {
     errors.maxTtlHours = "The maximum TTL is at most 7 days (168 hours).";
+  } else if (
+    positive(idleTtlMinutes) &&
+    idleTtlMinutes * MINUTE_MS > maxTtlHours * HOUR_MS
+  ) {
+    errors.idleTtlMinutes =
+      "The idle TTL must not be longer than the maximum TTL.";
   }
   const limit =
     vendor === AgentVendor.OPENAI_CODEX &&

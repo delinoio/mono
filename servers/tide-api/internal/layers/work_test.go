@@ -3,6 +3,7 @@
 package layers_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math"
@@ -950,6 +951,121 @@ func TestStartFailureCleanupRetry(t *testing.T) {
 		}
 		return pending == 0 && w.fake.Active(w.osOrg) == 0
 	})
+}
+
+func TestTerminalSandboxCleanupBeforeTeardown(t *testing.T) {
+	for _, teardown := range []struct {
+		name   string
+		delete bool
+	}{
+		{name: "unlink"},
+		{name: "delete organization", delete: true},
+	} {
+		for _, scenario := range []string{"retry", "already removed", "key rejected", "failed mark update"} {
+			t.Run(teardown.name+"/"+scenario, func(t *testing.T) {
+				w := newWorkWorld(t, devsession.Timing{})
+				ctx := context.Background()
+				remove := func() error {
+					if teardown.delete {
+						_, err := w.env.User(w.org.Owner).Organization.DeleteOrganization(ctx, connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID}))
+						return err
+					}
+					_, err := w.env.User(w.org.Admin).OwnSandLink.RemoveOwnSandLink(ctx, connect.NewRequest(&tidev1.RemoveOwnSandLinkRequest{OrganizationId: w.org.ID}))
+					return err
+				}
+				w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+					code := int64(1)
+					return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
+				}, nil)
+				setDeleteError := func(err error) { w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = err }) }
+				setDeleteError(connect.NewWireError(connect.CodeUnavailable, errors.New("device busy")))
+				// The fixture clock keeps warm fill in its backoff after one failed start.
+				w.createProfile(t, devProfileProto("warm", 1, 0))
+				pool := w.env.DB.Pool
+				var runnerID, sandboxID string
+				eventually(t, "a failed runner with pending sandbox cleanup", func() bool {
+					err := pool.QueryRow(ctx, "SELECT runner_id::text, ownsand_sandbox_id::text FROM runners WHERE organization_id = $1 AND state = $2 AND end_reason = $3 AND sandbox_cleanup",
+						w.org.ID, int16(tidev1.RunnerState_RUNNER_STATE_FAILED), int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED)).Scan(&runnerID, &sandboxID)
+					return err == nil && w.fake.Active(w.osOrg) == 1 && w.fake.Calls("DeleteSandbox") > 0
+				})
+
+				var key []byte
+				if err := pool.QueryRow(ctx, "SELECT api_key_ciphertext FROM ownsand_links WHERE organization_id = $1", w.org.ID).Scan(&key); err != nil {
+					t.Fatal(err)
+				}
+				assertRetained := func() {
+					t.Helper()
+					var pending, removing bool
+					var keptKey []byte
+					err := pool.QueryRow(ctx, `SELECT r.sandbox_cleanup, l.removing, l.api_key_ciphertext
+						FROM organizations o JOIN runners r USING (organization_id) JOIN ownsand_links l USING (organization_id)
+						WHERE o.organization_id = $1 AND r.runner_id = $2`,
+						w.org.ID, runnerID).Scan(&pending, &removing, &keptKey)
+					if err != nil || !pending || removing || !bytes.Equal(key, keptKey) {
+						t.Fatalf("teardown did not retain the organization, pending runner and key: pending=%v removing=%v same key=%v err=%v",
+							pending, removing, bytes.Equal(key, keptKey), err)
+					}
+				}
+				wantCode(t, "teardown while deletion is unavailable", remove(), connect.CodeUnavailable)
+				assertRetained()
+				if got := w.fake.Active(w.osOrg); got != 1 {
+					t.Fatalf("active sandboxes after failed teardown = %d, want 1", got)
+				}
+
+				wantActive := 0
+				switch scenario {
+				case "already removed":
+					w.fake.EndSandbox(w.osOrg, sandboxID, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+					setDeleteError(connect.NewWireError(connect.CodeNotFound, errors.New("sandbox already removed")))
+				case "key rejected":
+					setDeleteError(connect.NewWireError(connect.CodeUnauthenticated, errors.New("OwnSand key revoked")))
+					wantActive = 1 // The sandbox ends when its idle TTL expires.
+				case "failed mark update":
+					if _, err := pool.Exec(ctx, `CREATE FUNCTION refuse_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$
+						BEGIN RAISE EXCEPTION 'cannot clear cleanup mark'; END; $$;
+						CREATE TRIGGER refuse_cleanup BEFORE UPDATE OF sandbox_cleanup ON runners
+						FOR EACH ROW WHEN (OLD.sandbox_cleanup AND NOT NEW.sandbox_cleanup) EXECUTE FUNCTION refuse_cleanup();`); err != nil {
+						t.Fatal(err)
+					}
+					setDeleteError(nil)
+					wantCode(t, "teardown while the mark cannot be cleared", remove(), connect.CodeInternal)
+					assertRetained()
+					if got := w.fake.Active(w.osOrg); got != 0 {
+						t.Fatalf("active sandboxes after failed mark update = %d, want 0", got)
+					}
+					if _, err := pool.Exec(ctx, "DROP TRIGGER refuse_cleanup ON runners"); err != nil {
+						t.Fatal(err)
+					}
+				default:
+					setDeleteError(nil)
+				}
+				if err := remove(); err != nil {
+					t.Fatal(err)
+				}
+				if got := w.fake.Active(w.osOrg); got != wantActive {
+					t.Fatalf("active sandboxes after teardown = %d, want %d", got, wantActive)
+				}
+				var orgExists, linkExists, runnersExist bool
+				if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM organizations WHERE organization_id = $1),
+					EXISTS (SELECT FROM ownsand_links WHERE organization_id = $1),
+					EXISTS (SELECT FROM runners WHERE organization_id = $1)`, w.org.ID).Scan(&orgExists, &linkExists, &runnersExist); err != nil {
+					t.Fatal(err)
+				}
+				if linkExists || orgExists == teardown.delete || runnersExist == teardown.delete {
+					t.Fatalf("rows after teardown: organization=%v link=%v runners=%v", orgExists, linkExists, runnersExist)
+				}
+				if !teardown.delete {
+					r := w.runner(t, runnerID)
+					var pending bool
+					err := pool.QueryRow(ctx, "SELECT sandbox_cleanup FROM runners WHERE runner_id = $1", runnerID).Scan(&pending)
+					if err != nil || pending || r.GetState() != tidev1.RunnerState_RUNNER_STATE_FAILED ||
+						r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+						t.Fatalf("runner after unlink: state=%s reason=%s pending=%v err=%v", r.GetState(), r.GetEndReason(), pending, err)
+					}
+				}
+			})
+		}
+	}
 }
 
 // TestStalledCreateSandbox: a CreateSandbox call that OwnSand never

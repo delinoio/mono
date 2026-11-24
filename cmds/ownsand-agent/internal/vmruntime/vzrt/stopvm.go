@@ -20,6 +20,9 @@ var errStopTimeout = errors.New("vzrt: the VM did not reach a terminal state in 
 // keep them (for example the staged disk of an image build).
 var ErrVMMayRun = errors.New("vzrt: the VM may still run")
 
+// StopTimeout bounds the stop request and terminal-state observation.
+const StopTimeout = 10 * time.Second
+
 // stopPollInterval is how often stopMachine re-reads the machine state while
 // it waits, so a missing state-change notification cannot hide a stopped VM.
 const stopPollInterval = 10 * time.Millisecond
@@ -36,26 +39,60 @@ type stoppableMachine interface {
 	Stop() error
 }
 
-// stopMachine stops m and returns nil only when m is in a terminal state: the
-// state is terminal, exited is closed, or the state became terminal while it
-// waited. It returns an error when the framework rejects the stop or when the
-// VM does not reach a terminal state within timeout; the VM may still run
-// then, so the caller must keep its handle and may call stopMachine again.
-func stopMachine(m stoppableMachine, exited <-chan struct{}, timeout time.Duration) error {
-	if m.Terminal() {
-		return nil
+// machineStopper shares one pending framework request across stop attempts for
+// a single VM. The framework calls cannot be canceled when a caller times out.
+type machineStopper struct {
+	mu      sync.Mutex
+	pending *stopRequest
+}
+
+type stopRequest struct {
+	done chan struct{}
+	err  error
+}
+
+func (s *machineStopper) request(m stoppableMachine, exited <-chan struct{}) *stopRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending != nil {
+		return s.pending
 	}
-	if m.CanStop() {
-		if err := m.Stop(); err != nil {
-			if m.Terminal() {
-				// The VM ended on its own while the stop was rejected.
-				return nil
-			}
-			return fmt.Errorf("vzrt: stop VM: %w", err)
+	req := &stopRequest{done: make(chan struct{})}
+	s.pending = req
+	go func() {
+		// CanStop can block on the framework's dispatch queue. Check for
+		// termination again before issuing Stop if CanStop returns late.
+		if m.CanStop() && !machineTerminated(m, exited) {
+			req.err = m.Stop()
 		}
+		s.mu.Lock()
+		s.pending = nil
+		close(req.done)
+		s.mu.Unlock()
+	}()
+	return req
+}
+
+func machineTerminated(m stoppableMachine, exited <-chan struct{}) bool {
+	select {
+	case <-exited:
+		return true
+	default:
+		return m.Terminal()
 	}
+}
+
+// stopMachine uses one timeout for the framework request and the wait for
+// termination. A caller can retry after a timeout. It must keep the VM's
+// handle and resources until stopMachine confirms a terminal state.
+func (s *machineStopper) stopMachine(m stoppableMachine, exited <-chan struct{}, timeout time.Duration) error {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+	if machineTerminated(m, exited) {
+		return nil
+	}
+	req := s.request(m, exited)
+	done := req.done
 	poll := time.NewTicker(stopPollInterval)
 	defer poll.Stop()
 	for {
@@ -66,8 +103,16 @@ func stopMachine(m stoppableMachine, exited <-chan struct{}, timeout time.Durati
 			if m.Terminal() {
 				return nil
 			}
+		case <-done:
+			if machineTerminated(m, exited) {
+				return nil
+			}
+			if req.err != nil {
+				return fmt.Errorf("vzrt: stop VM: %w", req.err)
+			}
+			done = nil
 		case <-deadline.C:
-			if m.Terminal() {
+			if machineTerminated(m, exited) {
 				return nil
 			}
 			return errStopTimeout
@@ -80,10 +125,11 @@ func stopMachine(m stoppableMachine, exited <-chan struct{}, timeout time.Durati
 // is in a terminal state afterwards. Otherwise it joins primary with the stop
 // error, which wraps ErrVMMayRun, so the caller sees both the original cause
 // and the failed cleanup, and keeps the files that the VM may still use. It
-// waits at most timeout for the terminal state and never waits for a
-// notification without a deadline.
+// uses timeout for both the framework request and the wait for a terminal
+// state.
 func stopForCleanup(primary error, m stoppableMachine, exited <-chan struct{}, timeout time.Duration) error {
-	if err := stopMachine(m, exited, timeout); err != nil {
+	var stopper machineStopper
+	if err := stopper.stopMachine(m, exited, timeout); err != nil {
 		return errors.Join(primary, fmt.Errorf("%w: %w", ErrVMMayRun, err))
 	}
 	return primary

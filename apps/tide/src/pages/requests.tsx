@@ -14,8 +14,9 @@ import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   ErrorNotice,
-  Loading,
+  ListPagination,
   PageHeader,
+  QueryBoundary,
   ShortId,
   StateBadge,
 } from "../components/ui.tsx";
@@ -101,7 +102,6 @@ export function RequestsPage() {
   const cancel = useMutation(WorkService.method.cancelRequest, {
     onSuccess: () => invalidateServices(queryClient, WorkService),
   });
-  const requests = list.data?.pages.flatMap((p) => p.requests) ?? [];
   const admin = can(role, Permission.CancelRequests);
   const now = Date.now();
 
@@ -162,89 +162,87 @@ export function RequestsPage() {
           onRetry={() => void profiles.refetch()}
         />
       ) : null}
-      {list.isPending ? (
-        <Loading label="Loading requests" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : requests.length === 0 ? (
-        <SetupEmpty organizationId={organizationId} title="No requests match">
-          Requests appear when GitHub queues a job with a tide label, a vendor
-          asks for an agent session or a member creates a dev session.
-        </SetupEmpty>
-      ) : (
-        <div className="table-wrap">
-          <table className="table" aria-label="Requests">
-            <thead>
-              <tr>
-                <th scope="col">Request</th>
-                <th scope="col">Kind</th>
-                <th scope="col">Profile</th>
-                <th scope="col">Source</th>
-                <th scope="col">State</th>
-                <th scope="col">End reason</th>
-                <th scope="col">Priority</th>
-                <th scope="col">Queue wait</th>
-                <th scope="col">Queued</th>
-                {admin ? <th scope="col">Actions</th> : null}
-              </tr>
-            </thead>
-            <tbody>
-              {requests.map((r) => {
-                const wait = queueWaitMs(r, now);
-                return (
-                  <tr key={r.requestId}>
-                    <td>
-                      <ShortId id={r.requestId} />
-                    </td>
-                    <td>{labels.workloadKind[r.kind]}</td>
-                    <td>
-                      {profileNames.get(r.runnerProfileId) ?? (
-                        <ShortId id={r.runnerProfileId} />
-                      )}
-                    </td>
-                    <td className="wrap">{requestSource(r) || "—"}</td>
-                    <td>
-                      <StateBadge
-                        text={labels.requestState[r.state]}
-                        tone={requestStateTone(r.state)}
-                      />
-                    </td>
-                    <td>
-                      {TERMINAL_REQUEST_STATES.has(r.state)
-                        ? labels.requestEndReason[r.endReason]
-                        : "—"}
-                    </td>
-                    <td>{labels.priority[r.priority]}</td>
-                    <td>{wait === undefined ? "—" : formatSpan(wait)}</td>
-                    <td>{formatTime(r.queuedAt)}</td>
-                    {admin ? (
-                      <td>
-                        {r.state === RequestState.QUEUED ? (
-                          <Button
-                            variant={ButtonVariant.Danger}
-                            size={ButtonSize.Small}
-                            onClick={() => setCanceling(r)}
-                          >
-                            Cancel
-                          </Button>
-                        ) : null}
-                      </td>
-                    ) : null}
+      <QueryBoundary query={list} loading="Loading requests">
+        {(data) => {
+          const requests = data.pages.flatMap((p) => p.requests);
+          return requests.length === 0 ? (
+            <SetupEmpty
+              organizationId={organizationId}
+              title="No requests match"
+            >
+              Requests appear when GitHub queues a job with a tide label, a
+              vendor asks for an agent session or a member creates a dev
+              session.
+            </SetupEmpty>
+          ) : (
+            <div className="table-wrap">
+              <table className="table" aria-label="Requests">
+                <thead>
+                  <tr>
+                    <th scope="col">Request</th>
+                    <th scope="col">Kind</th>
+                    <th scope="col">Profile</th>
+                    <th scope="col">Source</th>
+                    <th scope="col">State</th>
+                    <th scope="col">End reason</th>
+                    <th scope="col">Priority</th>
+                    <th scope="col">Queue wait</th>
+                    <th scope="col">Queued</th>
+                    {admin ? <th scope="col">Actions</th> : null}
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-      {list.hasNextPage ? (
-        <Button
-          variant={ButtonVariant.Secondary}
-          onClick={() => void list.fetchNextPage()}
-        >
-          Show more
-        </Button>
-      ) : null}
+                </thead>
+                <tbody>
+                  {requests.map((r) => {
+                    const wait = queueWaitMs(r, now);
+                    return (
+                      <tr key={r.requestId}>
+                        <td>
+                          <ShortId id={r.requestId} />
+                        </td>
+                        <td>{labels.workloadKind[r.kind]}</td>
+                        <td>
+                          {profileNames.get(r.runnerProfileId) ?? (
+                            <ShortId id={r.runnerProfileId} />
+                          )}
+                        </td>
+                        <td className="wrap">{requestSource(r) || "—"}</td>
+                        <td>
+                          <StateBadge
+                            text={labels.requestState[r.state]}
+                            tone={requestStateTone(r.state)}
+                          />
+                        </td>
+                        <td>
+                          {TERMINAL_REQUEST_STATES.has(r.state)
+                            ? labels.requestEndReason[r.endReason]
+                            : "—"}
+                        </td>
+                        <td>{labels.priority[r.priority]}</td>
+                        <td>{wait === undefined ? "—" : formatSpan(wait)}</td>
+                        <td>{formatTime(r.queuedAt)}</td>
+                        {admin ? (
+                          <td>
+                            {r.state === RequestState.QUEUED ? (
+                              <Button
+                                variant={ButtonVariant.Danger}
+                                size={ButtonSize.Small}
+                                onClick={() => setCanceling(r)}
+                              >
+                                Cancel
+                              </Button>
+                            ) : null}
+                          </td>
+                        ) : null}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          );
+        }}
+      </QueryBoundary>
+      <ListPagination query={list} />
       <ConfirmDialog
         open={canceling !== undefined}
         onOpenChange={(open) => !open && setCanceling(undefined)}
