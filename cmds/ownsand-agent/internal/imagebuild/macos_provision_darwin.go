@@ -107,7 +107,7 @@ type apfsList struct {
 // on the whole disk device (for example disk8).
 func dataVolume(ctx context.Context, wholeDisk string) (string, error) {
 	var list apfsList
-	if err := plistJSON(ctx, &list, "/usr/sbin/diskutil", "apfs", "list", "-plist"); err != nil {
+	if err := plistJSON(ctx, &list, diskutilPath, "apfs", "list", "-plist"); err != nil {
 		return "", err
 	}
 	for _, c := range list.Containers {
@@ -136,33 +136,22 @@ func dataVolume(ctx context.Context, wholeDisk string) (string, error) {
 // so the guest boots without interaction.
 func provisionMacOSDisk(ctx context.Context, build, disk, guestBinary string, logger *slog.Logger) error {
 	return withAttachedDisk(ctx, runTool, disk, logger, func(whole string) error {
-		return installGuestHelper(ctx, build, whole, guestBinary, logger)
+		data, err := dataVolume(ctx, whole)
+		if err != nil {
+			return err
+		}
+		mnt := filepath.Join(build, "mnt")
+		return withMountedDataVolume(ctx, runTool, data, mnt, func() error {
+			return installGuestHelper(ctx, mnt, data, guestBinary, logger)
+		})
 	})
 }
 
-// installGuestHelper installs the guest helper on the Data volume of the
-// attached whole disk device (for example disk8).
-func installGuestHelper(ctx context.Context, build, whole, guestBinary string, logger *slog.Logger) (err error) {
-	data, err := dataVolume(ctx, whole)
-	if err != nil {
-		return err
-	}
-	mnt := filepath.Join(build, "mnt")
-	if err := os.MkdirAll(mnt, 0o700); err != nil {
-		return err
-	}
-	if _, err := runTool(ctx, "/usr/sbin/diskutil", "mount", "-mountPoint", mnt, data); err != nil {
-		return fmt.Errorf("imagebuild: mount the guest Data volume: %w", err)
-	}
-	defer func() {
-		if _, uerr := runTool(context.Background(), "/usr/sbin/diskutil", "unmount", data); uerr != nil && err == nil {
-			err = uerr
-		}
-		os.Remove(mnt)
-	}()
+// installGuestHelper installs the guest helper on the mounted Data volume.
+func installGuestHelper(ctx context.Context, mnt, data, guestBinary string, logger *slog.Logger) error {
 	// A mounted image ignores file ownership by default; the guest's launchd
 	// loads the daemon only when root owns it.
-	if _, err := runTool(ctx, "/usr/sbin/diskutil", "enableOwnership", data); err != nil {
+	if _, err := runTool(ctx, diskutilPath, "enableOwnership", data); err != nil {
 		return fmt.Errorf("imagebuild: enable ownership on the guest Data volume: %w", err)
 	}
 	if err := writeGuestFile(mnt, "/private/var/db/.AppleSetupDone", nil, 0o644); err != nil {

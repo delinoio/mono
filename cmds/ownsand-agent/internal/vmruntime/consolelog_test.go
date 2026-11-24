@@ -201,22 +201,27 @@ func TestCappedLogWriteFailureIsLoggedOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.f.Close() // every later file write fails
-	for i := 0; i < 3; i++ {
-		if n, err := w.Write([]byte("abc")); n != 3 || err != nil {
+	oversized := bytes.Repeat([]byte("x"), 100)
+	for i := 0; i < 2; i++ {
+		if n, err := w.Write(oversized); n != len(oversized) || err != nil {
 			t.Fatalf("write = %d, %v", n, err)
 		}
 	}
-	var failures int
-	for _, r := range rec.records(t) {
-		if strings.Contains(r["msg"].(string), "write failed") {
-			failures++
-			if r["sandbox_id"] != "sbx" || r["error"] == nil || r["error"] == "" {
-				t.Fatalf("failure record without sandbox_id and error: %v", r)
-			}
-		}
+	records := rec.records(t)
+	if len(records) != 1 {
+		t.Fatalf("got %d log records, want only the write failure", len(records))
 	}
-	if failures != 1 {
-		t.Fatalf("%d failure records, want 1", failures)
+	r := records[0]
+	if r["msg"] != "firecracker log write failed; discarding further output" ||
+		r["sandbox_id"] != "sbx" || r["error"] == nil || r["error"] == "" {
+		t.Fatalf("unexpected failure record: %v", r)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != 0 {
+		t.Fatalf("file size = %d, want 0", st.Size())
 	}
 }
 
@@ -271,7 +276,7 @@ func TestOpenCappedLogRejectsUnspecifiedKind(t *testing.T) {
 }
 
 // A write after Close (a producer that outlives the copy) is consumed
-// without an error and without a failure event.
+// without an error or a log event, even when it exceeds the free space.
 func TestCappedLogWriteAfterCloseIsConsumed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.log")
 	rec := &logRecords{}
@@ -279,20 +284,53 @@ func TestCappedLogWriteAfterCloseIsConsumed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.Write([]byte("ab"))
+	prefix := strings.Repeat("a", 60)
+	w.Write([]byte(prefix))
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("second Close = %v", err)
 	}
-	if n, err := w.Write([]byte("cdef")); n != 4 || err != nil {
+	if n, err := w.Write([]byte("0123456789")); n != 10 || err != nil {
 		t.Fatalf("write after Close = %d, %v", n, err)
 	}
-	if got, _ := os.ReadFile(path); string(got) != "ab" {
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != prefix {
 		t.Fatalf("file = %q", got)
 	}
 	if n := len(rec.records(t)); n != 0 {
 		t.Fatalf("%d log records for a write after Close", n)
+	}
+}
+
+func TestCappedLogOpenWriteBeyondLimitReportsCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.log")
+	rec := &logRecords{}
+	w, err := OpenCappedLog(path, 64, newTestLogger(rec), "sbx", ConsoleLogKindConsole)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	prefix := strings.Repeat("a", 60)
+	w.Write([]byte(prefix))
+	if n, err := w.Write([]byte("0123456789")); n != 10 || err != nil {
+		t.Fatalf("write = %d, %v", n, err)
+	}
+	records := rec.records(t)
+	if len(records) != 1 || records[0]["msg"] != "console log reached the cap; discarding further output" ||
+		records[0]["limit_bytes"] != float64(64) {
+		t.Fatalf("cap records = %v, want one cap record with limit_bytes 64", records)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != prefix+"0123" {
+		t.Fatalf("file = %q, want the first 64 bytes", got)
 	}
 }

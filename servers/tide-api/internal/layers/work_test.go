@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/delinoio/mono/go/ownsand"
@@ -382,6 +384,44 @@ func profileRunnerCount(t *testing.T, w *workWorld, profileID string, state tide
 		t.Fatal(err)
 	}
 	return n
+}
+
+func TestGetCapacityAllocatedVCPU(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	work := w.env.User(w.org.Member).Work
+	for _, tc := range []struct {
+		name       string
+		allocation *ownsandv1.DeviceAllocation
+		want       int64
+	}{
+		{"above int32", &ownsandv1.DeviceAllocation{VcpuCount: math.MaxInt32, VcpuTotalCount: proto.Int64(4294967294)}, 4294967294},
+		{"legacy count", &ownsandv1.DeviceAllocation{VcpuCount: 12}, 12},
+		{"explicit zero", &ownsandv1.DeviceAllocation{VcpuCount: 12, VcpuTotalCount: proto.Int64(0)}, 0},
+		{"missing allocation", nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const effectiveLimit int64 = 8589934588
+			w.fake.SetDevices(w.osOrg, &ownsandv1.Device{
+				DeviceId:                "device-0",
+				EffectiveVcpuLimitCount: effectiveLimit,
+				Allocation:              tc.allocation,
+			})
+			resp, err := work.GetCapacity(t.Context(), connect.NewRequest(&tidev1.GetCapacityRequest{OrganizationId: w.org.ID}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			devices := resp.Msg.GetDevices()
+			if len(devices) != 1 || devices[0].GetOwnsandDeviceId() != "device-0" {
+				t.Fatalf("devices = %v, want device-0", devices)
+			}
+			if got := devices[0].GetAllocation().GetVcpuCount(); got != tc.want {
+				t.Errorf("allocated vCPUs = %d, want %d", got, tc.want)
+			}
+			if got := devices[0].GetEffectiveVcpuLimit(); got != effectiveLimit {
+				t.Errorf("effective vCPU limit = %d, want %d", got, effectiveLimit)
+			}
+		})
+	}
 }
 
 func TestWorkService(t *testing.T) {

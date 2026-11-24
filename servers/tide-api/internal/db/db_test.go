@@ -4,6 +4,7 @@ package db_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -14,6 +15,22 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/db"
 	"github.com/delinoio/mono/servers/tide-api/internal/db/dbtest"
 )
+
+func TestOpenInvalidDatabaseURL(t *testing.T) {
+	database, err := db.Open(t.Context(), "postgres://[")
+	if database != nil {
+		database.Close()
+		t.Fatal("Open returned a database for an invalid URL")
+	}
+
+	const want = "parse database url: invalid connection string"
+	if err == nil || err.Error() != want {
+		t.Fatalf("Open error = %v, want %q", err, want)
+	}
+	if errors.Unwrap(err) != nil {
+		t.Fatal("Open error wraps the parser error")
+	}
+}
 
 // TestMigrationNames checks the naming convention of the embedded files.
 func TestMigrationNames(t *testing.T) {

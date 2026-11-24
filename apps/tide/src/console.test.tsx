@@ -25,7 +25,7 @@ import {
 } from "@connectrpc/connect";
 import { createQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
-import { AuditService } from "@delino/tide-protos/v1/audit_pb";
+import { AuditAction, AuditService } from "@delino/tide-protos/v1/audit_pb";
 import { Role } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
 import {
@@ -76,6 +76,7 @@ function renderConsole(
     isAuthenticated: signedIn,
     userId: signedIn ? MOCK_USER : undefined,
     signIn: options.signIn ?? (async () => {}),
+    signInFailed: false,
     signOut: async () => {},
     getAccessToken: async () => "token",
   };
@@ -1060,7 +1061,130 @@ describe("overview", () => {
   });
 });
 
+describe("audit", () => {
+  function auditActions(table: HTMLElement) {
+    return within(table)
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => within(row).getAllByRole("cell")[1]!.textContent);
+  }
+
+  test("shows the seeded audit events newest first", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/audit`);
+
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    expect(auditActions(table)).toEqual([
+      "Dev session created",
+      "OwnSand link set",
+    ]);
+  });
+
+  test("shows a request cancellation before the seeded audit events", async () => {
+    const transport = createMockTransport();
+    await createClient(WorkService, transport).cancelRequest({
+      organizationId: MOCK_IDS.acme,
+      requestId: MOCK_IDS.queuedJob,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/audit`, { transport });
+
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    expect(auditActions(table)).toEqual([
+      "Request canceled",
+      "Dev session created",
+      "OwnSand link set",
+    ]);
+  });
+
+  test("lists one audit event per page in newest-first order", async () => {
+    const client = createClient(AuditService, createMockTransport());
+    const organizationId = MOCK_IDS.acme;
+    const all = await client.listAuditEvents({ organizationId });
+    const first = await client.listAuditEvents({ organizationId, pageSize: 1 });
+    expect(first.nextPageToken).not.toBe("");
+    const second = await client.listAuditEvents({
+      organizationId,
+      pageSize: 1,
+      pageToken: first.nextPageToken,
+    });
+
+    expect(first.events.map((event) => event.action)).toEqual([
+      AuditAction.DEV_SESSION_CREATED,
+    ]);
+    expect(second.events.map((event) => event.action)).toEqual([
+      AuditAction.OWNSAND_LINK_SET,
+    ]);
+    expect([...first.events, ...second.events]).toEqual(all.events);
+    expect(second.nextPageToken).toBe("");
+  });
+});
+
 describe("work", () => {
+  test("shows active requests in queue order and can include ended requests", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/requests`);
+    const table = await screen.findByRole("table", { name: "Requests" });
+    const requestIds = (table: HTMLElement) =>
+      within(table)
+        .getAllByRole("row")
+        .slice(1)
+        .map((row) => row.querySelector("code")?.title);
+    const active = [
+      MOCK_IDS.runningJob,
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.queuedAgent,
+      MOCK_IDS.queuedDev,
+    ];
+    expect(requestIds(table)).toEqual(active);
+
+    await click(screen.getByRole("checkbox", { name: "Show ended requests" }));
+
+    const updatedTable = await screen.findByRole("table", {
+      name: "Requests",
+    });
+    expect(requestIds(updatedTable)).toEqual([...active, MOCK_IDS.endedJob]);
+  });
+
+  test("pages active requests before ended requests in descending end time", async () => {
+    const client = createClient(WorkService, createMockTransport());
+    const organizationId = MOCK_IDS.acme;
+    const time = Date.now();
+    const clock = rs.spyOn(Date, "now").mockReturnValue(time);
+    try {
+      await client.cancelRequest({
+        organizationId,
+        requestId: MOCK_IDS.queuedJob,
+      });
+      clock.mockReturnValue(time + 1);
+      await client.cancelRequest({
+        organizationId,
+        requestId: MOCK_IDS.queuedAgent,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+
+    const expected = [
+      MOCK_IDS.runningJob,
+      MOCK_IDS.queuedDev,
+      MOCK_IDS.queuedAgent,
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.endedJob,
+    ];
+    let pageToken = "";
+    for (const [index, requestId] of expected.entries()) {
+      const page = await client.listRequests({
+        organizationId,
+        includeEnded: true,
+        pageSize: 1,
+        pageToken,
+      });
+      expect(page.requests.map((request) => request.requestId)).toEqual([
+        requestId,
+      ]);
+      pageToken = page.nextPageToken;
+      expect(pageToken === "").toBe(index === expected.length - 1);
+    }
+  });
+
   test("canceling a request needs a confirmation", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/requests`);
     const table = await screen.findByRole("table", { name: "Requests" });

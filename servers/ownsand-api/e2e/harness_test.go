@@ -415,8 +415,7 @@ func launchProcess(logs *logSink, name string, env []string, bin string, args ..
 	return p, nil
 }
 
-// startProcess starts a child process that is stopped with SIGTERM when the
-// test ends.
+// startProcess starts a child process and stops it when the test ends.
 func startProcess(t *testing.T, logs *logSink, name string, env []string, bin string, args ...string) *proc {
 	t.Helper()
 	p, err := launchProcess(logs, name, env, bin, args...)
@@ -424,6 +423,11 @@ func startProcess(t *testing.T, logs *logSink, name string, env []string, bin st
 		t.Fatalf("start %s: %v", name, err)
 	}
 	t.Cleanup(func() {
+		// Go cannot deliver SIGTERM to a child on Windows.
+		if runtime.GOOS == "windows" {
+			killProcess(t, p)
+			return
+		}
 		_ = p.cmd.Process.Signal(syscall.SIGTERM)
 		select {
 		case <-p.done:
@@ -616,8 +620,8 @@ func (s *stack) linkBilling(ctx context.Context) *ownsandv1.OrganizationBilling 
 	return resp.Msg.GetBilling()
 }
 
-// startAgent enrolls agent i with a new enrollment token, runs it, waits
-// until its device is online and sets its limits.
+// startAgent enrolls agent i, starts it and waits for its device to reconcile.
+// It returns after the agent applies its initial limits.
 func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work string, i int, runtimeEnv []string) agentProc {
 	t := s.t
 	t.Helper()
@@ -644,9 +648,21 @@ func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work strin
 		known[a.deviceID] = true
 	}
 	deviceID := s.waitDeviceOnline(user, known)
-	if _, err := user.Devices().ReplaceLimits(ctx, &ownsandv1.ReplaceDeviceLimitsRequest{OrganizationId: s.orgID, DeviceId: deviceID,
-		Limits: &ownsandv1.DeviceLimitsInput{VcpuCount: proto.Int32(8), MemoryMib: proto.Int64(16384), DiskGib: proto.Int64(100), VcpuOvercommitPercent: proto.Int32(100)}}); err != nil {
+	limits := &ownsandv1.DeviceLimitsInput{
+		VcpuCount:             proto.Int32(8),
+		MemoryMib:             proto.Int64(16384),
+		DiskGib:               proto.Int64(100),
+		VcpuOvercommitPercent: proto.Int32(100),
+	}
+	if _, err := user.Devices().ReplaceLimits(ctx, &ownsandv1.ReplaceDeviceLimitsRequest{
+		OrganizationId: s.orgID,
+		DeviceId:       deviceID,
+		Limits:         limits,
+	}); err != nil {
 		t.Fatalf("ReplaceDeviceLimits: %v", err)
+	}
+	if err := s.logs.waitForAgentLimits(ctx, agent, deviceID, limits); err != nil {
+		t.Fatal(err)
 	}
 	return agentProc{deviceID: deviceID, stateDir: stateDir, env: agentEnv, proc: agent}
 }
@@ -921,9 +937,63 @@ func (s *stack) apiKeyClient(transport ownsand.Transport) *ownsand.Client {
 	return c
 }
 
-// deviceWaitTimeout bounds how long a started agent may take to come online
-// and to be reconciled by the control plane.
+// deviceWaitTimeout bounds each device readiness wait.
 const deviceWaitTimeout = time.Minute
+
+// waitForAgentLimits waits for the agent to log the limits it applied. The
+// ReplaceLimits response only confirms that the control plane stored them.
+func (l *logSink) waitForAgentLimits(ctx context.Context, agent *proc, deviceID string, limits *ownsandv1.DeviceLimitsInput) error {
+	ctx, cancel := context.WithTimeout(ctx, deviceWaitTimeout)
+	defer cancel()
+	ticker := time.NewTicker(logWaitInterval)
+	defer ticker.Stop()
+	notReady := func(err error) error {
+		return fmt.Errorf("device %s: waiting for process %s to log configuration received with vcpu_limit=%d, memory_mib_limit=%d, disk_gib_limit=%d: %w",
+			deviceID, agent.name, limits.GetVcpuCount(), limits.GetMemoryMib(), limits.GetDiskGib(), err)
+	}
+	for {
+		matched := l.hasAgentConfiguration(agent.name, limits)
+		select {
+		case <-agent.done:
+			return notReady(errProcessExited)
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			return notReady(err)
+		}
+		if matched {
+			return nil
+		}
+		select {
+		case <-agent.done:
+		case <-ctx.Done():
+		case <-ticker.C:
+		}
+	}
+}
+
+func (l *logSink) hasAgentConfiguration(name string, limits *ownsandv1.DeviceLimitsInput) bool {
+	prefix := name + ": "
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.lines {
+		text, ok := strings.CutPrefix(line, prefix)
+		if !ok {
+			continue
+		}
+		var event struct {
+			Msg       string `json:"msg"`
+			VcpuCount int32  `json:"vcpu_limit"`
+			MemoryMib int64  `json:"memory_mib_limit"`
+			DiskGib   int64  `json:"disk_gib_limit"`
+		}
+		if json.Unmarshal([]byte(text), &event) == nil && event.Msg == "configuration received" &&
+			event.VcpuCount == limits.GetVcpuCount() && event.MemoryMib == limits.GetMemoryMib() && event.DiskGib == limits.GetDiskGib() {
+			return true
+		}
+	}
+	return false
+}
 
 // waitDeviceOnline returns the ID of a device that is not in skip, is ONLINE
 // and has been reconciled by the current control plane process. ONLINE is
@@ -1004,8 +1074,8 @@ type cliResult struct {
 }
 
 // cli runs the ownsand CLI with the API key and the organization.
-func (s *stack) cli(transport ownsand.Transport, stdin io.Reader, args ...string) cliResult {
-	s.t.Helper()
+func (s *stack) cli(t *testing.T, transport ownsand.Transport, stdin io.Reader, args ...string) cliResult {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, filepath.Join(s.bins, "ownsand"), args...)
@@ -1014,7 +1084,7 @@ func (s *stack) cli(transport ownsand.Transport, stdin io.Reader, args ...string
 		"OWNSAND_API_KEY="+s.apiKey,
 		"OWNSAND_ORG="+s.orgID,
 		"OWNSAND_TRANSPORT="+transport.String(),
-		"OWNSAND_CONFIG_DIR="+s.t.TempDir(),
+		"OWNSAND_CONFIG_DIR="+t.TempDir(),
 		"NO_COLOR=1",
 	)
 	var stdout, stderr bytes.Buffer
@@ -1026,7 +1096,7 @@ func (s *stack) cli(transport ownsand.Transport, stdin io.Reader, args ...string
 	if err != nil {
 		ee, ok := err.(*exec.ExitError)
 		if !ok {
-			s.t.Fatalf("ownsand %v: %v", args, err)
+			t.Fatalf("ownsand %v: %v", args, err)
 		}
 		code = ee.ExitCode()
 	}

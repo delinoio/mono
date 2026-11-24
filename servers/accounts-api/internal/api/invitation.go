@@ -161,9 +161,7 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 	if err != nil {
 		return nil, h.internal(ctx, "create_invitation", err)
 	}
-	// The creation and expiry times are read inside the transaction, after the
-	// account lock, so a wait for the lock cannot leave them behind the clock
-	// of the pending check and the stored row.
+	key := emailKey(addr)
 	var now time.Time
 	inv := invitation{
 		ID: id, BillingAccountID: accountID, Email: addr, Role: role, InviterUserID: userID,
@@ -178,24 +176,28 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 		if err := require(account, PermissionManage); err != nil {
 			return err
 		}
+		if err := lockInvitationRate(ctx, tx, userID, key); err != nil {
+			return err
+		}
+		// Use one time after all locks for the pending check, quotas and writes.
 		now = h.timestamp()
 		inv.CreateTime, inv.ExpireTime = now, now.Add(InvitationLifetime)
 		var pending bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM billing_account_invitations
 			WHERE billing_account_id = $1 AND email_key = $2 AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $3)`,
-			accountID, emailKey(addr), now).Scan(&pending); err != nil {
+			accountID, key, now).Scan(&pending); err != nil {
 			return err
 		}
 		if pending {
 			return alreadyExists("a pending invitation for this email address exists")
 		}
-		if err := h.enforceInvitationRate(ctx, tx, accountID, userID, emailKey(addr), now); err != nil {
+		if err := h.enforceInvitationRate(ctx, tx, accountID, userID, key, now); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO billing_account_invitations
 			(invitation_id, billing_account_id, token_sha256, email, email_key, role, inviter_user_id, create_time, expire_time)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			id, accountID, hash, addr, emailKey(addr), string(role), userID, inv.CreateTime, inv.ExpireTime); err != nil {
+			id, accountID, hash, addr, key, string(role), userID, inv.CreateTime, inv.ExpireTime); err != nil {
 			return err
 		}
 		if err := h.recordAudit(ctx, tx, audit, now, auditEvent{

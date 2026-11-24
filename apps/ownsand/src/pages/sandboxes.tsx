@@ -2,7 +2,6 @@
 import {
   createInfiniteQueryOptions,
   useMutation,
-  useQuery,
   useTransport,
 } from "@connectrpc/connect-query";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -29,7 +28,6 @@ import {
   type Sandbox,
   SandboxService,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
-import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { useMemo, useRef, useState } from "react";
 import {
   invalidateServices,
@@ -61,6 +59,7 @@ import {
 } from "../format.ts";
 import { parseLabels, resourceErrors, ttlErrors } from "../forms.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
+import { useSnapshots, useTemplates } from "../snapshot-lists.ts";
 import { uuidV7 } from "../uuid.ts";
 
 const ALL = "all";
@@ -329,15 +328,11 @@ function CreateSandboxDialog({
   const { devices } = deviceList;
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
-  const templates = useQuery(
-    SnapshotService.method.listTemplates,
-    { organizationId, pageSize: 200 },
-    { enabled: open },
-  );
-  const snapshots = useQuery(
-    SnapshotService.method.listSnapshots,
-    { organizationId, pageSize: 200 },
-    { enabled: open },
+  const templates = useTemplates(organizationId, "picker", open);
+  const snapshots = useSnapshots(organizationId, "picker", open);
+  const readySnapshots = useMemo(
+    () => snapshots.rows.filter((s) => s.state === SnapshotState.READY),
+    [snapshots.rows],
   );
   const create = useMutation(SandboxService.method.createSandbox);
   // One idempotency key per logical create: a retry after a lost response
@@ -353,6 +348,14 @@ function CreateSandboxDialog({
   const [device, setDevice] = useState(ALL);
   const [labelText, setLabelText] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const sourceRequest = sourceOf(source);
+  const { case: sourceKind, value: sourceValue } = sourceRequest.source;
+  const sourceAvailable =
+    sourceKind === "baseImage" ||
+    (sourceKind === "templateId" &&
+      templates.rows.some((t) => t.templateId === sourceValue)) ||
+    (sourceKind === "snapshotId" &&
+      readySnapshots.some((s) => s.snapshotId === sourceValue));
 
   const reset = () => {
     setIdempotencyKey(uuidV7());
@@ -367,6 +370,7 @@ function CreateSandboxDialog({
       wide
       description="Choose the source, resources and time limits. There is no default TTL."
       submitLabel="Create"
+      submitDisabled={!sourceAvailable}
       onOpenChange={(next) => {
         onOpenChange(next);
         if (!next) reset();
@@ -386,7 +390,7 @@ function CreateSandboxDialog({
           res = await create.mutateAsync({
             organizationId,
             idempotencyKey,
-            source: sourceOf(source),
+            source: sourceRequest,
             resources: {
               vcpuCount: vcpu!,
               memoryMib: BigInt(memory!),
@@ -441,14 +445,15 @@ function CreateSandboxDialog({
         );
       }}
     >
-      {templates.isPending || snapshots.isPending ? (
+      {templates.boundary.isPending || snapshots.boundary.isPending ? (
         // Render the source picker once its options are known, so the
         // trigger shows the selected option's name from the start.
         <Loading label="Loading sources" />
       ) : (
         <Select
           label="Source"
-          value={source}
+          value={sourceAvailable ? source : null}
+          placeholder="Choose a source"
           onValueChange={(v) => v && setSource(v)}
         >
           {[BaseImage.LINUX, BaseImage.MACOS, BaseImage.WINDOWS].map((b) => (
@@ -456,22 +461,27 @@ function CreateSandboxDialog({
               {labels.baseImage[b]} base image
             </SelectOption>
           ))}
-          {(templates.data?.templates ?? []).map((t) => (
+          {templates.rows.map((t) => (
             <SelectOption key={t.templateId} value={`template:${t.templateId}`}>
               Template: {t.name}
             </SelectOption>
           ))}
-          {(snapshots.data?.snapshots ?? [])
-            .filter((s) => s.state === SnapshotState.READY)
-            .map((s) => (
-              <SelectOption
-                key={s.snapshotId}
-                value={`snapshot:${s.snapshotId}`}
-              >
-                {`Snapshot ${shortIdText(s.snapshotId)} · ${formatTime(s.createTime)}`}
-              </SelectOption>
-            ))}
+          {readySnapshots.map((s) => (
+            <SelectOption key={s.snapshotId} value={`snapshot:${s.snapshotId}`}>
+              {`Snapshot ${shortIdText(s.snapshotId)} · ${formatTime(s.createTime)}`}
+            </SelectOption>
+          ))}
         </Select>
+      )}
+      {templates.boundary.isPending ? null : (
+        <QueryBoundary query={templates.boundary} loading="Loading templates">
+          {() => <MorePagesNotice noun="templates" pages={templates.pages} />}
+        </QueryBoundary>
+      )}
+      {snapshots.boundary.isPending ? null : (
+        <QueryBoundary query={snapshots.boundary} loading="Loading snapshots">
+          {() => <MorePagesNotice noun="snapshots" pages={snapshots.pages} />}
+        </QueryBoundary>
       )}
       <div className="field-row">
         <NumberInput

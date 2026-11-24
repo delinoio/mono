@@ -275,27 +275,23 @@ func TestLoadR2EndpointPath(t *testing.T) {
 }
 
 func TestLoadSTUNRateBurst(t *testing.T) {
-	for _, value := range []string{"1", "63"} {
+	for _, value := range []string{"1", "799"} {
 		v := minimal()
 		v[EnvSTUNRateBurstBytes] = value
 		_, err := Load(env(v))
-		if err == nil {
-			t.Errorf("burst %s: accepted", value)
-			continue
-		}
-		if !strings.Contains(err.Error(), EnvSTUNRateBurstBytes) || !strings.Contains(err.Error(), "at least 64 bytes") || strings.Contains(err.Error(), value+" ") {
-			t.Errorf("burst %s: error %q", value, err)
+		if err == nil || err.Error() != EnvSTUNRateBurstBytes+" must be at least 800 bytes" {
+			t.Errorf("burst %s: error %v", value, err)
 		}
 	}
 	v := minimal()
 	cfg, err := Load(env(v))
-	if err != nil || cfg.STUNRateBurstBytes != DefaultSTUNRateBurstBytes {
-		t.Fatalf("default burst: %+v, %v", cfg, err)
+	if err != nil || cfg.STUNRateBurstBytes != 4096 || cfg.STUNRateBytesPerSecond != 1024 {
+		t.Fatalf("defaults: burst %d, rate %d, error %v", cfg.STUNRateBurstBytes, cfg.STUNRateBytesPerSecond, err)
 	}
-	v[EnvSTUNRateBurstBytes] = "64"
+	v[EnvSTUNRateBurstBytes] = "800"
 	cfg, err = Load(env(v))
-	if err != nil || cfg.STUNRateBurstBytes != MinSTUNRateBurstBytes {
-		t.Fatalf("minimum burst: %+v, %v", cfg, err)
+	if err != nil || cfg.STUNRateBurstBytes != 800 {
+		t.Fatalf("minimum burst: %d, error %v", cfg.STUNRateBurstBytes, err)
 	}
 	for _, value := range []string{"0", "-1", "abc"} {
 		v[EnvSTUNRateBurstBytes] = value

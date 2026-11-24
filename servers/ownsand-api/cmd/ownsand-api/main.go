@@ -76,7 +76,8 @@ type usageFinisher interface {
 // then writes the counts and closes the recorder within the flush timeout.
 // It returns errUsageDrainIncomplete when the drain ended before those
 // requests finished: their usage may be lost and a count that arrives after
-// the flush is logged by the recorder.
+// the flush is logged by the recorder. It also returns the final flush error
+// if the write fails.
 func finishUsage(a usageFinisher, logger *slog.Logger, flushTimeout, drainTimeout time.Duration) error {
 	flushCtx, cancel := context.WithTimeout(context.Background(), flushTimeout)
 	defer cancel()
@@ -89,6 +90,7 @@ func finishUsage(a usageFinisher, logger *slog.Logger, flushTimeout, drainTimeou
 	cancelDrain()
 	if ferr := a.FlushUsageFinal(flushCtx); ferr != nil {
 		logger.Error("usage_final_flush_failed", slog.Any("error", ferr))
+		return errors.Join(incomplete, ferr)
 	}
 	return incomplete
 }
