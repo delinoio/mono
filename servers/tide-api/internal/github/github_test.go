@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -402,6 +403,27 @@ func TestWarmRunnerPerPool(t *testing.T) {
 	w.l.GitHub.Wait()
 	eventually(t, "one surplus runner removed", func() bool { return len(w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)) == 1 })
 	stays(t, "the warm runner stays", func() bool { return len(w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)) == 1 })
+}
+
+func TestWarmPoolCooldownDoesNotDelayGitHubDemand(t *testing.T) {
+	w := newGHWorld(t, worldOpts{})
+	w.link(t, 501, "acme")
+	w.os.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeNotFound, errors.New("rejected"))
+	})
+	w.createProfile(t, ghProfile("linux", 1))
+	eventually(t, "one failed warm runner", func() bool {
+		return len(w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_FAILED)) == 1
+	})
+
+	w.os.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateError = nil })
+	w.send(t, "workflow_job", job("queued", 501, 1, tideLinux, ""))
+	eventually(t, "a runner for the job during the warm cooldown", func() bool {
+		return len(w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)) == 1
+	})
+	stays(t, "the demand runner does not clear the warm cooldown", func() bool {
+		return w.os.Calls("CreateSandbox") == 2
+	})
 }
 
 // TestWarmRunnerReclaim: when OwnSand has no capacity for a job, the

@@ -95,6 +95,8 @@ type Engine struct {
 
 	mu      sync.Mutex
 	drivers map[string]chan struct{}
+	// initialWarmCreates holds runner IDs while the dispatcher calls CreateSandbox.
+	initialWarmCreates sync.Map
 	// runCtx and runWG belong to the running reconciler component.
 	runCtx context.Context
 	runWG  *sync.WaitGroup
