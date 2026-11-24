@@ -147,7 +147,11 @@ describe("organization layout", () => {
 });
 
 describe("overview", () => {
-  test("shows the live queue and the device pool", async ({ app, screen }) => {
+  test("shows the live queue and the device pool", async ({
+    app,
+    browser,
+    screen,
+  }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${ACME}`);
@@ -161,6 +165,19 @@ describe("overview", () => {
     await expect(screen.getByRole("table", "Waiting requests")).toContainText(
       "GitHub job",
     );
+    const waitingKinds = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          'table[aria-label="Waiting requests"] tbody td:nth-child(3)',
+        ),
+        (cell) => cell.textContent,
+      ),
+    );
+    expect(waitingKinds).toEqual([
+      "GitHub job",
+      "Agent session",
+      "Dev session",
+    ]);
     await expect(screen.getByRole("table", "Devices")).toContainText(
       "build-box",
     );
