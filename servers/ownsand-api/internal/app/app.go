@@ -165,7 +165,7 @@ func New(opts Options) (*App, error) {
 	}
 	control := api.NewControl(svc)
 	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Logger: opts.Logger,
-		DeadlineNow: opts.LeaseDeadlineNow, OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
+		DeadlineNow: opts.LeaseDeadlineNow, OnLose: control.LeaseLost}
 	svc.Lease = l
 	statuses := billing.NewStatuses(billing.StatusOptions{
 		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Held: l.Held, Client: opts.UsageClient,
@@ -178,6 +178,10 @@ func New(opts Options) (*App, error) {
 		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Held: l.Held, Client: opts.UsageClient,
 		Statuses: statuses, Metrics: opts.Metrics, Timing: opts.BillingTiming,
 	})
+	l.OnAcquire = func(ctx context.Context) {
+		metering.WakeReporter()
+		control.LeaseAcquired(ctx)
+	}
 	svc.Usage = metering
 	relayLimits := relay.DefaultLimits()
 	if opts.RelayLimits != nil {
