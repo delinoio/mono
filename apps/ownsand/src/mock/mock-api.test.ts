@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { afterEach, describe, expect, rs, test } from "@rstest/core";
 import {
@@ -33,6 +34,11 @@ import {
 
 describe("mock device list", () => {
   const organizationId = MOCK_IDS.acme;
+  const removalTime = Date.UTC(2026, 0, 1);
+
+  afterEach(() => {
+    rs.useRealTimers();
+  });
 
   test("lists every seeded device before any removal", async () => {
     const client = createClient(DeviceService, createMockTransport());
@@ -72,7 +78,9 @@ describe("mock device list", () => {
   });
 
   test("still returns a removed device and ends its sandboxes", async () => {
-    const transport = createMockTransport();
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(removalTime);
+    const transport = createMockTransport({ userId: "user-admin-jun" });
     const devices = createClient(DeviceService, transport);
     const sandboxes = createClient(SandboxService, transport);
     const before = await sandboxes.listSandboxes({ organizationId });
@@ -80,7 +88,10 @@ describe("mock device list", () => {
       (s) =>
         s.deviceId === MOCK_IDS.buildBox && s.state !== SandboxState.DELETED,
     );
-    expect(onDevice.length).toBeGreaterThan(0);
+    expect(onDevice.length).toBeGreaterThan(1);
+    for (const sandbox of onDevice) {
+      expect(sandbox.endTime).toBeUndefined();
+    }
 
     await devices.removeDevice({ organizationId, deviceId: MOCK_IDS.buildBox });
 
@@ -96,7 +107,32 @@ describe("mock device list", () => {
       });
       expect(sandbox?.state).toBe(SandboxState.DELETED);
       expect(sandbox?.endReason).toBe(SandboxEndReason.DEVICE_REMOVED);
+      expect(sandbox?.endTime).toEqual(timestampFromMs(removalTime));
     }
+  });
+
+  test("preserves an already deleted sandbox and a sandbox on another device", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(removalTime - 1000);
+    const transport = createMockTransport({ userId: "user-admin-jun" });
+    const devices = createClient(DeviceService, transport);
+    const sandboxes = createClient(SandboxService, transport);
+    const deleted = { organizationId, sandboxId: MOCK_IDS.runningSandbox };
+    const other = { organizationId, sandboxId: MOCK_IDS.unreachableSandbox };
+    const { sandbox: alreadyDeleted } = await sandboxes.deleteSandbox(deleted);
+    expect(alreadyDeleted?.endTime).toEqual(
+      timestampFromMs(removalTime - 1000),
+    );
+    const unaffected = await sandboxes.getSandbox(other);
+
+    rs.setSystemTime(removalTime);
+    await devices.removeDevice({ organizationId, deviceId: MOCK_IDS.buildBox });
+
+    const { sandbox } = await sandboxes.getSandbox(deleted);
+    expect(sandbox?.state).toBe(SandboxState.DELETED);
+    expect(sandbox?.endReason).toBe(SandboxEndReason.DELETED_BY_CALLER);
+    expect(sandbox?.endTime).toEqual(timestampFromMs(removalTime - 1000));
+    expect(await sandboxes.getSandbox(other)).toEqual(unaffected);
   });
 });
 

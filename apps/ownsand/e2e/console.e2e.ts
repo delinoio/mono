@@ -257,6 +257,16 @@ describe("devices", () => {
     await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
     await expect(screen.getByText("studio-mac").first()).toBeVisible();
     await expect(screen.getByText("build-box-1")).toBeHidden();
+
+    await screen.getByRole("link", "Sandboxes", { exact: true }).tap();
+    const sandbox = screen.getByRole("link", "0193a000…00a1");
+    await expect(sandbox).toBeHidden();
+    await screen.getByRole("checkbox", "Show ended sandboxes").tap();
+    await sandbox.tap();
+    await expect(screen.getByText("Deleted", { exact: true })).toBeVisible();
+    await expect(
+      screen.getByText("Device removed", { exact: true }),
+    ).toBeVisible();
   });
 
   test("asks before it revokes a pending enrollment token", async ({
