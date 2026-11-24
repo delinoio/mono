@@ -70,8 +70,12 @@ if [ -n "$TIDE_SYNC_REPLACE_FILE_LIST" ]; then
 fi
 if [ -n "$TIDE_SYNC_PRUNE_LIST" ]; then xargs -0 sh -c 'for d do if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir -- "$d" || exit 1; fi; done' tide < "$TIDE_SYNC_PRUNE_LIST"; fi
 if [ -n "$TIDE_SYNC_ARCHIVE" ]; then tar -x -m -o -f "$TIDE_SYNC_ARCHIVE"; fi`,
-	opCleanup: `for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_REPLACE_FILE_LIST" "$TIDE_SYNC_PRUNE_LIST"; do if [ -n "$f" ]; then rm -f "$f"; fi; done
-if [ -n "$TIDE_SYNC_LOCK" ]; then rm -rf "$TIDE_SYNC_LOCK"; fi`,
+	opCleanup: `status=0
+for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_REPLACE_FILE_LIST" "$TIDE_SYNC_PRUNE_LIST"; do
+  if [ -n "$f" ]; then rm -f "$f" || status=1; fi
+done
+if [ -n "$TIDE_SYNC_LOCK" ]; then rm -rf "$TIDE_SYNC_LOCK" || status=1; fi
+exit "$status"`,
 	opProbe: `p="$TIDE_DOWNLOAD_PATH"
 if [ -d "$p" ]; then
   tar -c -f "$TIDE_DOWNLOAD_ARCHIVE" -C "$p" . || exit 1

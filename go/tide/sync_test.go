@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"maps"
 	"os"
 	"os/exec"
@@ -685,6 +686,149 @@ func TestSyncPlansAgainUnderTheLock(t *testing.T) {
 	}
 	if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("the sync kept its lock")
+	}
+}
+
+func TestPOSIXSyncCleanup(t *testing.T) {
+	needPOSIX(t)
+	for _, scenario := range []struct {
+		name        string
+		archiveDir  bool
+		lockDotPath bool
+	}{
+		{name: "archive removal fails", archiveDir: true},
+		{name: "missing and empty paths"},
+		{name: "lock removal fails", lockDotPath: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			dir := t.TempDir()
+			archive := filepath.Join(dir, "archive.tar")
+			lock := filepath.Join(dir, "lock")
+			if err := os.Mkdir(lock, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if scenario.archiveDir {
+				if err := os.Mkdir(archive, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(archive, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			lockArg := lock
+			if scenario.lockDotPath {
+				lockArg += "/."
+			}
+			args, err := guestCommand(tidev1.GuestOs_GUEST_OS_LINUX, opCleanup)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(args[0], args[1:]...)
+			cmd.Env = []string{
+				"PATH=" + os.Getenv("PATH"),
+				guestEnvArchive + "=" + archive,
+				guestEnvLock + "=" + lockArg,
+			}
+			for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes} {
+				path := filepath.Join(dir, key)
+				if scenario.archiveDir {
+					if err := os.WriteFile(path, nil, 0o644); err != nil {
+						t.Fatal(err)
+					}
+					cmd.Env = append(cmd.Env, key+"="+path)
+				} else if key == guestEnvDeletes {
+					cmd.Env = append(cmd.Env, key+"="+path)
+				} else if key == guestEnvReplaceFiles {
+					cmd.Env = append(cmd.Env, key+"=")
+				}
+			}
+			out, err := cmd.CombinedOutput()
+			var exitErr *exec.ExitError
+			if scenario.archiveDir || scenario.lockDotPath {
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+					t.Errorf("cleanup should exit 1, got %v: %s", err, out)
+				}
+			} else if err != nil {
+				t.Errorf("cleanup should succeed, got %v: %s", err, out)
+			}
+			var leftovers []string
+			if scenario.archiveDir {
+				leftovers = append(leftovers, filepath.Base(archive))
+			}
+			if scenario.lockDotPath {
+				leftovers = append(leftovers, filepath.Base(lock))
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var names []string
+			for _, entry := range entries {
+				names = append(names, entry.Name())
+			}
+			if !slices.Equal(names, leftovers) {
+				t.Errorf("remaining paths = %v, want %v", names, leftovers)
+			}
+		})
+	}
+}
+
+func TestSyncCleanupWarnings(t *testing.T) {
+	needPOSIX(t)
+	for _, scenario := range []string{"committed sync", "manifest write fails"} {
+		t.Run(scenario, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			dir := newRepo(t, map[string]string{"a.txt": "a"}, nil, "")
+			var logs bytes.Buffer
+			c.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+				env := req.GetEnv()
+				if env[guestEnvWorkspace] != "" && scenario == "manifest write fails" {
+					srv.Fail(writeProc, connect.NewError(connect.CodePermissionDenied, errors.New("manifest write denied")))
+				}
+				if archive := env[guestEnvArchive]; archive != "" && env[guestEnvLock] != "" && env[guestEnvForce] == "" && env[guestEnvWorkspace] == "" {
+					// rm -f fails on a directory even when the test runs as root.
+					if err := os.Remove(archive); err != nil {
+						t.Error(err)
+						return
+					}
+					if err := os.Mkdir(archive, 0o755); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			res, err := c.Sync(context.Background(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
+			ws := ds.GetWorkspacePath()
+			if scenario == "manifest write fails" {
+				var connectErr *connect.Error
+				if res != nil || !errors.As(err, &connectErr) || connectErr.Code() != connect.CodePermissionDenied || connectErr.Message() != "manifest write denied" {
+					t.Fatalf("sync = %+v, %v, want manifest write error", res, err)
+				}
+				if _, err := os.Stat(ws + manifestSuffix); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("manifest after failed write: %v", err)
+				}
+				if !strings.Contains(logs.String(), "tide sync clean-up failed") {
+					t.Error("missing deferred cleanup debug message")
+				}
+			} else {
+				if err != nil || res == nil || res.Uploaded != 1 {
+					t.Fatalf("sync = %+v, %v", res, err)
+				}
+				const warning = "the guest could not remove the sync archive or release the sync lock; the next sync may need force"
+				if !slices.Contains(res.Warnings, warning) {
+					t.Errorf("cleanup warning missing from %v", res.Warnings)
+				}
+				if m := guestManifest(t, ds); m.Version != manifestVersion || len(m.Files) != 1 || m.Files["a.txt"].Size != 1 {
+					t.Errorf("committed manifest = %+v", m)
+				}
+			}
+			if got := readGuest(t, ds, "a.txt"); got != "a" {
+				t.Errorf("applied file = %q", got)
+			}
+			if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("sync lock should be removed, got %v", err)
+			}
+		})
 	}
 }
 
