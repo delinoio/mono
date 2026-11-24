@@ -362,6 +362,9 @@ func (h *Handler) GetCapacity(ctx context.Context, req *connect.Request[tidev1.G
 		counts[device] = append(counts[device], &tidev1.RunnerStateCount{State: tidev1.RunnerState(state), Count: n})
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, s.Internal(ctx, "get capacity", err)
+	}
 	resp := &tidev1.GetCapacityResponse{}
 	for _, d := range devices {
 		l, a := d.GetLimits(), d.GetAllocation()
