@@ -337,6 +337,37 @@ describe("integrations", () => {
   });
 });
 
+describe("runner profiles", () => {
+  test("keeps the edit dialog open when a runner profile name already exists", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+
+    const profile = screen
+      .getByRole("listitem")
+      .filter({ hasText: "linux-build ·" });
+    await profile.getByRole("button", "Edit").tap();
+    const dialog = screen.getByRole("dialog", "Edit linux-build");
+    await dialog.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("codex-linux");
+    await dialog.getByRole("button", "Save changes").tap();
+
+    await expect(dialog).toBeVisible();
+    await expect(
+      dialog.getByText("a runner profile with this name exists"),
+    ).toBeVisible();
+    await dialog.getByRole("button", "Cancel").tap();
+    await expect(profile.getByLabel("runs-on label of linux-build")).toHaveText(
+      "tide-linux-build",
+    );
+  });
+});
+
 describe("personal API keys", () => {
   test("shows a new key once and closes the dialog with Escape", async ({
     app,
