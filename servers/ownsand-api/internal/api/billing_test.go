@@ -931,9 +931,9 @@ type linkAttemptFixture struct {
 	org  *testenv.Org
 }
 
-func newLinkAttemptFixture(t *testing.T, owner string) *linkAttemptFixture {
+func newLinkAttemptFixture(t *testing.T, owner string, opts ...testenv.Option) *linkAttemptFixture {
 	t.Helper()
-	env, fake := billingEnv(t)
+	env, fake := billingEnvWith(t, opts...)
 	fake.AddAccount(billingAccountA, "Account of "+owner, map[string]accountsv1.BillingAccountRole{owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
 	return &linkAttemptFixture{env: env, fake: fake, org: env.NewUnlinkedOrg(owner)}
 }

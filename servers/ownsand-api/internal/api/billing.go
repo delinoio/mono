@@ -418,19 +418,9 @@ func (h BillingHandler) finishLinkAttempt(ctx context.Context, orgID string, att
 		return billing.Status{}, billing.Change{}, "", err
 	}
 	detached := context.WithoutCancel(ctx)
-	// Dispatch admission: the persisted call deadline protects the call from
-	// the cleanup only while the call ends before it. The first transaction
-	// (the pending unlink that it sends first and its commit) can take long,
-	// and the cleanup worker removes the row once the deadline passed, so the
-	// call is started only for an attempt that still owns its row and bounded
-	// to the time that remains. No call is started otherwise, so no remote
-	// link exists that the row does not cover.
-	budget := billing.LinkCallBudget(attempt.deadline, h.now())
-	if budget <= 0 {
-		h.Logger.WarnContext(ctx, "billing_link_attempt_expired_before_dispatch", slog.String("organization_id", orgID), slog.String("billing_account_id", attempt.accountID),
-			slog.String("link_attempt_id", attempt.id), slog.Time("link_call_deadline", attempt.deadline))
-		h.abandonLinkAttempt(detached, orgID, attempt)
-		return billing.Status{}, billing.Change{}, "", errUnavailable("the billing link took too long to start; try again")
+	// The first transaction can use up the dispatch window before it commits.
+	if billing.LinkCallBudget(attempt.deadline, h.now()) <= 0 {
+		return billing.Status{}, billing.Change{}, "", h.expireLinkAttempt(detached, orgID, attempt)
 	}
 	running, err := billing.LinkAttemptRunning(detached, h.DB.Pool, orgID, attempt.id)
 	if err != nil {
@@ -442,7 +432,15 @@ func (h BillingHandler) finishLinkAttempt(ctx context.Context, orgID string, att
 			slog.String("link_attempt_id", attempt.id))
 		return billing.Status{}, billing.Change{}, "", connect.NewError(connect.CodeAborted, errors.New("the billing link was interrupted by another change of the organization; try again"))
 	}
-	callCtx, cancel := context.WithTimeout(detached, budget)
+	// The ownership read can also use up the window. Sample the context
+	// clock first so converting the service-clock budget cannot extend it.
+	admittedAt := time.Now()
+	budget := billing.LinkCallBudget(attempt.deadline, h.now())
+	callCtx, cancel := context.WithDeadline(detached, admittedAt.Add(budget))
+	if callCtx.Err() != nil {
+		cancel()
+		return billing.Status{}, billing.Change{}, "", h.expireLinkAttempt(detached, orgID, attempt)
+	}
 	resp, cerr := client.LinkOrganization(callCtx, connect.NewRequest(attempt.request))
 	cancel()
 	if cerr != nil {
@@ -490,9 +488,16 @@ func (h BillingHandler) finishLinkAttempt(ctx context.Context, orgID string, att
 // errLinkSuperseded marks a link attempt that another operation took over.
 var errLinkSuperseded = errors.New("billing: the link attempt was taken over")
 
-// abandonLinkAttempt deletes the record of an attempt that delino-accounts
-// rejected. A failure to delete leaves a record whose reconciliation sends a
-// harmless unlink after the call deadline.
+func (h BillingHandler) expireLinkAttempt(ctx context.Context, orgID string, attempt *linkAttempt) error {
+	h.Logger.WarnContext(ctx, "billing_link_attempt_expired_before_dispatch", slog.String("organization_id", orgID), slog.String("billing_account_id", attempt.accountID),
+		slog.String("link_attempt_id", attempt.id), slog.Time("link_call_deadline", attempt.deadline))
+	h.abandonLinkAttempt(ctx, orgID, attempt)
+	return errUnavailable("the billing link took too long to start; try again")
+}
+
+// abandonLinkAttempt deletes the record of an attempt that did not start or
+// that delino-accounts rejected. If deletion fails, reconciliation can send
+// a harmless unlink after the call deadline.
 func (h BillingHandler) abandonLinkAttempt(ctx context.Context, orgID string, attempt *linkAttempt) {
 	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if err := lockOrganizationNoKey(ctx, tx, orgID); err != nil {
