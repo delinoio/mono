@@ -12,8 +12,9 @@
 // processes read them, and the other apps exit before they register their
 // names. This script starts the proxy in the developer's terminal, before
 // Turbo starts, so every app finds a running proxy and only registers its
-// route. Remove this script and the root `dev` preflight when portless
-// serializes concurrent proxy starts from parallel `portless run` processes.
+// route. Remove the early proxy start when portless serializes concurrent
+// starts from parallel `portless run` processes. Keep the state directory
+// resolution while a relative override still depends on the app's cwd.
 //
 // The script does nothing when `PORTLESS` disables portless (the same values
 // that `portless run` accepts) or when no app runs its development server
@@ -160,16 +161,12 @@ function portlessVersionOf(path) {
 
 // Returns { pid, version } of the proxy that the portless state directory
 // records, or null when no proxy is recorded or its version is unknown.
-// The state directory matches `resolveStateDir` in portless 0.18.1, which uses
-// `PORTLESS_STATE_DIR` as written. A relative value therefore resolves against
-// the working directory of the portless process, and this script runs portless
-// from `appDir`, not from the directory where this script runs. An absolute
-// value and the default `~/.portless` do not depend on the working directory.
-function findRunningProxy(appDir) {
+// The launcher resolves relative overrides before this lookup. An empty or
+// unset override selects the default in portless 0.18.1.
+function findRunningProxy() {
   if (process.platform === "win32") return null;
-  const stateDir = process.env.PORTLESS_STATE_DIR
-    ? resolve(appDir, process.env.PORTLESS_STATE_DIR)
-    : join(homedir(), ".portless");
+  const stateDir =
+    process.env.PORTLESS_STATE_DIR || join(homedir(), ".portless");
   let pid;
   try {
     pid = Number.parseInt(
@@ -198,7 +195,7 @@ function findRunningProxy(appDir) {
 // Stops a running proxy that is older than the pinned portless. Returns 0 when
 // no such proxy runs or it stopped, otherwise the exit status for the script.
 function stopOutdatedProxy(found) {
-  const running = findRunningProxy(found.appDir);
+  const running = findRunningProxy();
   if (running === null || !isOlderVersion(running.version, found.version)) {
     return 0;
   }
@@ -225,7 +222,7 @@ function stopOutdatedProxy(found) {
   return result.status || 1;
 }
 
-function main() {
+export function startPortlessProxy() {
   const portlessSetting = process.env.PORTLESS;
   if (
     portlessSetting !== undefined &&
@@ -251,6 +248,13 @@ function main() {
       hint: "Run `pnpm install --frozen-lockfile` at the repository root.",
     });
     return 1;
+  }
+
+  // Keep the state directory the proxy previously used from this app's cwd.
+  // Set it on the launcher so the proxy and Turbo's package tasks inherit it.
+  const stateDir = process.env.PORTLESS_STATE_DIR;
+  if (stateDir && !isAbsolute(stateDir)) {
+    process.env.PORTLESS_STATE_DIR = resolve(found.appDir, stateDir);
   }
 
   const stopStatus = stopOutdatedProxy(found);
@@ -279,4 +283,6 @@ function main() {
   return result.status ?? 1;
 }
 
-process.exitCode = main();
+if (import.meta.main) {
+  process.exitCode = startPortlessProxy();
+}
