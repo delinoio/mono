@@ -43,7 +43,8 @@ var ErrLinkInProgress = errors.New("billing: a link attempt is in progress")
 // which it returns: LinkCallBudget admits the call only while it can end
 // before that deadline, so the cleanup cannot overtake it.
 func BeginLinkAttemptTx(ctx context.Context, tx pgx.Tx, orgID, attemptID, billingAccountID string, now time.Time) (time.Time, error) {
-	deadline := now.Add(LinkCallTimeout + linkCallGrace)
+	// Use the same precision as the persisted Postgres deadline.
+	deadline := now.Add(LinkCallTimeout + linkCallGrace).Truncate(time.Microsecond)
 	_, err := tx.Exec(ctx, `INSERT INTO billing_pending_unlinks (organization_id, billing_account_id, create_time, attempts, next_attempt_time, link_attempt_id, link_call_deadline)
 		VALUES ($1, $2, $3, 0, $4, $5, $4)`, orgID, billingAccountID, now, deadline, attemptID)
 	return deadline, err
@@ -95,9 +96,8 @@ func (s *Statuses) ReleaseLinkAttempt(ctx context.Context, orgID, attemptID stri
 	return err
 }
 
-// AbandonLinkAttempt deletes the link attempt after delino-accounts answered
-// that it created no link (a definitive failure). It changes nothing when
-// another operation took the attempt over.
+// AbandonLinkAttempt deletes the matching attempt if dispatch did not start
+// or delino-accounts definitively rejected the call.
 func (s *Statuses) AbandonLinkAttempt(ctx context.Context, q db.Querier, orgID, attemptID string) error {
 	_, err := q.Exec(ctx, "DELETE FROM billing_pending_unlinks WHERE organization_id = $1 AND link_attempt_id = $2", orgID, attemptID)
 	return err
