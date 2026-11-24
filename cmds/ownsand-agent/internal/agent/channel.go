@@ -176,7 +176,7 @@ func (a *Agent) heartbeats(ctx context.Context, c *conn, cancel context.CancelFu
 	t := time.NewTicker(a.opts.HeartbeatInterval)
 	defer t.Stop()
 	lastCap := time.Now()
-	lastFree, _ := sysinfo.FreeDiskBytes(a.st.Dir())
+	lastFree, _ := a.opts.FreeDisk()
 	var seq uint64
 	for {
 		select {
@@ -203,7 +203,7 @@ func (a *Agent) heartbeats(ctx context.Context, c *conn, cancel context.CancelFu
 		c.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Heartbeat{Heartbeat: &ownsandv1.Heartbeat{
 			Sequence: seq, UpdateState: state, UpdateTargetVersion: target,
 		}}})
-		free, _ := sysinfo.FreeDiskBytes(a.st.Dir())
+		free, _ := a.opts.FreeDisk()
 		if time.Since(lastCap) >= CapabilityInterval || abs(free-lastFree) > capabilityDiskDelta {
 			lastCap, lastFree = time.Now(), free
 			c.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CapabilityReport{CapabilityReport: a.capabilityReport(ctx)}})
@@ -221,7 +221,7 @@ func abs(v int64) int64 {
 func (a *Agent) capabilityReport(ctx context.Context) *ownsandv1.CapabilityReport {
 	caps := a.rt.Capabilities(ctx)
 	caps.MacOSHardwareModels = a.macOSHardwareModels(caps.MacOSHardwareModels)
-	free, _ := sysinfo.FreeDiskBytes(a.st.Dir())
+	free, _ := a.opts.FreeDisk()
 	report := &ownsandv1.CapabilityReport{
 		HostOs:       sysinfo.HostOS(),
 		Arch:         sysinfo.Arch(),

@@ -2,6 +2,8 @@
 
 package sysinfo
 
+import "math"
+
 // availBytes converts the statfs available block count of an unprivileged
 // user into bytes.
 //
@@ -17,5 +19,16 @@ func availBytes(bavail uint64, bsize, frsize int64) int64 {
 	if frsize > 0 {
 		unit = frsize
 	}
-	return int64(bavail) * unit
+	return clampFreeBytes(bavail, unit)
+}
+
+// clampFreeBytes converts an unsigned count to the signed byte capacity.
+func clampFreeBytes(count uint64, unit int64) int64 {
+	if unit <= 0 {
+		return 0
+	}
+	if count > uint64(math.MaxInt64/unit) {
+		return math.MaxInt64
+	}
+	return int64(count) * unit
 }

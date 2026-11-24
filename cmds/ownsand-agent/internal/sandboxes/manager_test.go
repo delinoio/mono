@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -100,6 +101,8 @@ type fakeRuntime struct {
 	resumeCalls int
 	// onCreate, when set, runs in Create after the VM started.
 	onCreate func(spec vmruntime.Spec)
+	// createStarted signals that Create reached the gate before VM startup.
+	createStarted chan struct{}
 	// files holds the sandbox IDs whose runtime files exist. Create adds an
 	// ID, a successful Delete removes it, and a test adds an ID to model the
 	// files that a lost VM leaves behind.
@@ -126,6 +129,9 @@ func (r *fakeRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntim
 	r.starts++
 	r.mu.Unlock()
 	if r.block != nil {
+		if r.createStarted != nil {
+			close(r.createStarted)
+		}
 		select {
 		case <-r.block:
 		case <-ctx.Done():
@@ -201,8 +207,11 @@ func (r *fakeRuntime) Delete(_ context.Context, id string) error {
 	r.deleteCalls++
 	if r.deleteBlock != nil {
 		started, block := r.deleteStarted, r.deleteBlock
+		r.deleteStarted = nil
 		r.mu.Unlock()
-		close(started)
+		if started != nil {
+			close(started)
+		}
 		<-block
 		r.mu.Lock()
 	}
@@ -991,6 +1000,37 @@ func TestTTLExpiry(t *testing.T) {
 	waitState(t, e.m, busy, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
 	if r := endReason(e.m, busy); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
 		t.Fatalf("busy reason %v", r)
+	}
+}
+
+func TestTTLExpiryCancelsRunningCreate(t *testing.T) {
+	e := newEnv(t)
+	e.rt.block = make(chan struct{})
+	e.rt.createStarted = make(chan struct{})
+	e.rt.onCreate = func(vmruntime.Spec) { t.Error("the runtime started a VM after TTL expiry") }
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.m.Create(ctx, cmd)
+		done <- err
+	}()
+	select {
+	case <-e.rt.createStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("create did not reach the runtime")
+	}
+	e.clk.Advance(2 * time.Hour)
+	e.m.Tick(ctx, false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	var ce *CommandError
+	if err := <-done; !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		t.Fatalf("create error %v, want ABORTED", err)
+	}
+	if reason := endReason(e.m, id); reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("end reason %v, want MAX_TTL_EXPIRED", reason)
 	}
 }
 
@@ -3211,6 +3251,169 @@ func TestFailedCreateRetriesStopUntilItSucceeds(t *testing.T) {
 	e.tickAndWait()
 	if calls := e.rt.deleteCallCount(); calls != 3 {
 		t.Fatalf("runtime Delete calls after a completed clean-up = %d, want 3", calls)
+	}
+}
+
+func retainedFailedCreate(t *testing.T, e *env, ack bool) string {
+	t.Helper()
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	e.rt.createErr = errors.New("injected create failure")
+	e.rt.retainFailedCreate(id)
+
+	entry, err := e.m.Create(t.Context(), cmd)
+	if err == nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED {
+		t.Fatalf("failed create: %v, %v", entry, err)
+	}
+	if ack {
+		e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: entry.GetRevision()})
+		if _, ok := e.m.State(id); ok {
+			t.Fatal("terminal acknowledgement kept the record")
+		}
+	}
+	if got := e.pendingCleanups(); got != 1 {
+		t.Fatalf("pending cleanups = %d, want 1", got)
+	}
+	if err := os.Mkdir(e.st.Path(store.VMsDir, id), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(e.st.Path(store.ImagesDir, "keep-until-wipe"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func checkFailedCreateFiles(t *testing.T, e *env, id string, present bool) {
+	t.Helper()
+	for _, path := range []string{e.st.Path(store.VMsDir, id), e.st.Path(store.ImagesDir, "keep-until-wipe")} {
+		_, err := os.Stat(path)
+		if (present && err != nil) || (!present && !errors.Is(err, os.ErrNotExist)) {
+			t.Errorf("stat %s: %v, want file presence %t", path, err, present)
+		}
+	}
+}
+
+func TestRemoveAllRetriesAcknowledgedFailedCreate(t *testing.T) {
+	e := newEnv(t)
+	id := retainedFailedCreate(t, e, true)
+	e.rt.deleteFails = 1
+
+	if err := e.m.RemoveAll(t.Context()); err == nil {
+		t.Fatal("RemoveAll succeeded despite the failed VM deletion")
+	}
+	if calls := e.rt.deleteCallCount(); calls != 1 {
+		t.Errorf("Delete calls after failure = %d, want 1", calls)
+	}
+	running, _ := e.rt.Running(t.Context())
+	if len(running) != 1 || running[0] != id || e.pendingCleanups() != 1 {
+		t.Errorf("running VMs = %v, pending cleanups = %d, want retained VM and cleanup", running, e.pendingCleanups())
+	}
+	checkFailedCreateFiles(t, e, id, true)
+
+	for range 2 {
+		if err := e.m.RemoveAll(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.tickAndWait()
+	if calls := e.rt.deleteCallCount(); calls != 2 || e.pendingCleanups() != 0 {
+		t.Errorf("Delete calls = %d, pending cleanups = %d, want 2 calls and no pending cleanups", calls, e.pendingCleanups())
+	}
+	if running, _ := e.rt.Running(t.Context()); len(running) != 0 {
+		t.Errorf("VMs still running after removal: %v", running)
+	}
+	checkFailedCreateFiles(t, e, id, false)
+}
+
+func TestRemoveAllWaitsForFailedCreateCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		acknowledged   bool
+		removalOwns    bool
+		cancelRemoval  bool
+		deleteFailures int
+	}{
+		{name: "background-acknowledged", acknowledged: true},
+		{name: "background-unacknowledged"},
+		{name: "background-fails", acknowledged: true, deleteFailures: 1},
+		{name: "background-cancel-wait", acknowledged: true, cancelRemoval: true},
+		{name: "removal-cancel-wait", acknowledged: true, removalOwns: true, cancelRemoval: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := newEnv(t)
+				id := retainedFailedCreate(t, e, tc.acknowledged)
+				started, block := make(chan struct{}), make(chan struct{})
+				e.rt.deleteStarted, e.rt.deleteBlock = started, block
+				e.rt.deleteFails = tc.deleteFailures
+				release := sync.OnceFunc(func() { close(block) })
+				defer release()
+
+				if !tc.removalOwns {
+					e.m.Tick(t.Context(), false)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				removed := make(chan error, 1)
+				go func() { removed <- e.m.RemoveAll(ctx) }()
+				synctest.Wait()
+				select {
+				case <-started:
+				default:
+					t.Fatal("runtime deletion did not start")
+				}
+				e.m.Tick(t.Context(), false)
+				synctest.Wait()
+
+				select {
+				case err := <-removed:
+					t.Fatalf("removal did not wait for the blocked deletion: %v", err)
+				default:
+				}
+				if calls := e.rt.deleteCallCount(); calls != 1 {
+					t.Errorf("Delete calls while cleanup is blocked = %d, want 1", calls)
+				}
+				checkFailedCreateFiles(t, e, id, true)
+
+				if tc.cancelRemoval {
+					cancel()
+					synctest.Wait()
+					select {
+					case err := <-removed:
+						if !errors.Is(err, context.Canceled) {
+							t.Errorf("removal error = %v, want canceled", err)
+						}
+					default:
+						t.Fatal("removal did not return when its context ended")
+					}
+					checkFailedCreateFiles(t, e, id, true)
+					if e.pendingCleanups() != 1 {
+						t.Error("canceled removal dropped pending cleanup")
+					}
+				}
+				release()
+				if !tc.cancelRemoval {
+					if err := <-removed; (err != nil) != (tc.deleteFailures != 0) {
+						t.Fatalf("removal returned %v, injected failures = %d", err, tc.deleteFailures)
+					}
+				}
+				e.m.bg.Wait()
+
+				if tc.deleteFailures != 0 {
+					checkFailedCreateFiles(t, e, id, true)
+					if e.pendingCleanups() != 1 {
+						t.Error("failed background Delete dropped pending cleanup")
+					}
+				}
+				if err := e.m.RemoveAll(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if calls := e.rt.deleteCallCount(); calls != 1+tc.deleteFailures {
+					t.Errorf("Delete calls after cleanup = %d, want %d", calls, 1+tc.deleteFailures)
+				}
+				checkFailedCreateFiles(t, e, id, false)
+			})
+		})
 	}
 }
 
