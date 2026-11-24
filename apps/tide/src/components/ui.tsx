@@ -81,9 +81,11 @@ function SignInButton() {
 
 /** A failed request with the recovery action for its error. */
 export function ErrorNotice({
+  title,
   error,
   onRetry,
 }: {
+  title?: string;
   error: unknown;
   onRetry?: () => void;
 }) {
@@ -91,7 +93,10 @@ export function ErrorNotice({
     error instanceof ConnectError && error.code === Code.Unauthenticated;
   return (
     <div className="notice notice-error" role="alert">
-      <p>{errorMessage(error)}</p>
+      <p>
+        {title && !sessionEnded ? `${title} ` : null}
+        {errorMessage(error, title === undefined ? undefined : "")}
+      </p>
       {sessionEnded ? (
         <SignInButton />
       ) : onRetry ? (
