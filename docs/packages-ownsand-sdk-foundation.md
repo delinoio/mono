@@ -69,6 +69,8 @@ The Go SDK client lives in the package root `ownsand`. Recorded decisions of the
 
 ### Operations
 
+In the TypeScript SDK, `createSandbox` rejects lone UTF-16 surrogates in label keys and values before sending a request. `exec` rejects them synchronously in command elements, environment keys and values, and the working directory before setting up either transport. The `OwnSandValidationError` message contains only the field (`labels`, `command`, `env` or `working_directory`) and the rule. Well-formed supplementary characters and literal U+FFFD keep their values during encoding.
+
 The SDKs expose the public services of the [protos contract](protos-ownsand-api-contract.md#public-services) with idiomatic names, and a sandbox handle with these operations:
 
 - `create`, `get`, `list`, `delete`, `pause`, `resume`.
