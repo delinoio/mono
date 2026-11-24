@@ -31,6 +31,8 @@ const fixtureInputs = new Set([
   "scripts/install-git-hooks.sh",
   // The Droplet fixtures run this helper against a stubbed `docker`.
   "scripts/droplet/start-caddy.sh",
+  // The Droplet fixtures run this helper against a stubbed `systemctl`.
+  "scripts/droplet/configure-docker-logs.sh",
   // `scripts/ci/protos-generate.test.mjs` runs this script against a fake `go`
   // in `test:tooling`. It is also a protobuf input (see `protoInputs`).
   "scripts/protos.sh",
