@@ -630,7 +630,7 @@ func (e *Engine) deleteRunner(ctx context.Context, orgID, runnerID string, reaso
 
 // deleteRunnerTx is deleteRunner in the caller's transaction.
 func (e *Engine) deleteRunnerTx(ctx context.Context, tx pgx.Tx, orgID, runnerID string, reason tidev1.RunnerEndReason, cause DeleteCause) (*Runner, *Request, tidev1.RequestState, error) {
-	cur, err := e.GetRunner(ctx, tx, orgID, runnerID)
+	cur, err := e.lockOrganizationRunner(ctx, tx, orgID, runnerID)
 	if err != nil {
 		return nil, nil, 0, err
 	}

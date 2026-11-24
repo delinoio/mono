@@ -211,6 +211,81 @@ func TestWorkService(t *testing.T) {
 	wantCode(t, "outsider", err, connect.CodeNotFound)
 }
 
+func TestDeleteRunnerUsesLockedState(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	admin := w.env.User(w.org.Admin)
+	member := w.env.User(w.org.Member)
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	session := w.createSession(t, member, profileID)
+	session = w.waitState(t, session.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+	runnerID := session.GetRunnerId()
+	deleteRequest := &tidev1.DeleteRunnerRequest{OrganizationId: w.org.ID, RunnerId: runnerID}
+	_, err := member.Work.DeleteRunner(ctx, connect.NewRequest(deleteRequest))
+	wantCode(t, "member deletes a runner", err, connect.CodePermissionDenied)
+	if got := w.fake.Active(w.osOrg); got != 1 {
+		t.Fatalf("active sandboxes before deletion: %d, want 1", got)
+	}
+
+	// Keep the runner DELETING long enough to retry the RPC in that state.
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.DeleteError = connect.NewWireError(connect.CodeUnavailable, errors.New("sandbox deletion unavailable"))
+	})
+	const updateState = "UPDATE runners SET state = $2 WHERE runner_id = $1"
+	if _, err := w.env.DB.Pool.Exec(ctx, updateState, runnerID, int16(tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)); err != nil {
+		t.Fatal(err)
+	}
+	commit := holdTx(t, w.env, updateState, runnerID, int16(tidev1.RunnerState_RUNNER_STATE_BUSY))
+	type deleteResult struct {
+		response *connect.Response[tidev1.DeleteRunnerResponse]
+		err      error
+	}
+	result := make(chan deleteResult, 1)
+	go func() {
+		response, err := admin.Work.DeleteRunner(ctx, connect.NewRequest(deleteRequest))
+		result <- deleteResult{response, err}
+	}()
+	waitForLockWaiter(t, w.env)
+	commit()
+	first := <-result
+	if first.err != nil || first.response.Msg.GetRunner().GetState() != tidev1.RunnerState_RUNNER_STATE_DELETING ||
+		first.response.Msg.GetRunner().GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER {
+		t.Fatalf("delete after concurrent transition: %v %v", first.response, first.err)
+	}
+	if s := w.session(t, session.GetDevSessionId()); s.GetState() != tidev1.RequestState_REQUEST_STATE_ENDED ||
+		s.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED {
+		t.Fatalf("session after runner deletion: %v", s)
+	}
+	action := tidev1.AuditAction_AUDIT_ACTION_RUNNER_DELETED
+	if got := countAudit(t, w.env, w.org.ID, action); got != 1 {
+		t.Fatalf("audit events after deletion: %d, want 1", got)
+	}
+	retry, err := admin.Work.DeleteRunner(ctx, connect.NewRequest(deleteRequest))
+	if err != nil || retry.Msg.GetRunner().GetState() != tidev1.RunnerState_RUNNER_STATE_DELETING {
+		t.Fatalf("delete a DELETING runner: %v %v", retry, err)
+	}
+	if got := countAudit(t, w.env, w.org.ID, action); got != 1 {
+		t.Fatalf("audit events after DELETING retry: %d, want 1", got)
+	}
+
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
+	eventually(t, "runner deleted", func() bool {
+		return w.runner(t, runnerID).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED
+	})
+	retry, err = admin.Work.DeleteRunner(ctx, connect.NewRequest(deleteRequest))
+	if err != nil || retry.Msg.GetRunner().GetState() != tidev1.RunnerState_RUNNER_STATE_DELETED ||
+		retry.Msg.GetRunner().GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER {
+		t.Fatalf("delete a DELETED runner: %v %v", retry, err)
+	}
+	if got := countAudit(t, w.env, w.org.ID, action); got != 1 {
+		t.Fatalf("audit events after DELETED retry: %d, want 1", got)
+	}
+	if got := w.fake.Active(w.osOrg); got != 0 {
+		t.Fatalf("active sandboxes after deletion: %d, want 0", got)
+	}
+}
+
 // TestCleanUps: deleting a profile cancels its queued sessions; removing
 // the OwnSand link deletes the runners and ends the sessions; deleting the
 // organization deletes the remaining sandboxes.
