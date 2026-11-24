@@ -187,8 +187,8 @@ func (o *orgService) UpdateOrganizationSettings(_ context.Context, req *connect.
 	if !slices.Contains(paths, "max_dev_sessions_per_user") {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("update_mask must name max_dev_sessions_per_user"))
 	}
-	if req.Msg.GetSettings().MaxDevSessionsPerUser != nil {
-		v := req.Msg.GetSettings().GetMaxDevSessionsPerUser()
+	if settings := req.Msg.GetSettings(); settings != nil && settings.MaxDevSessionsPerUser != nil {
+		v := settings.GetMaxDevSessionsPerUser()
 		if v <= 0 {
 			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("max_dev_sessions_per_user must be positive"))
 		}
