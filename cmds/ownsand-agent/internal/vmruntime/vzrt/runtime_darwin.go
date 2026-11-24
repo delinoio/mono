@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -38,7 +39,6 @@ const (
 	// macOSReadyTimeout covers a macOS cold boot, which takes far longer
 	// than a Linux boot.
 	macOSReadyTimeout = 5 * time.Minute
-	stopTimeout       = 10 * time.Second
 	dialTimeout       = 10 * time.Second
 )
 
@@ -808,7 +808,7 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 			}
 			// Wait for a pause that started so SnapshotWithPause can resume
 			// the VM even if the channel closes during the native transition.
-			pauseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopTimeout)
+			pauseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), StopTimeout)
 			defer cancel()
 			return r.pauseVM(pauseCtx, v)
 		},
@@ -900,16 +900,28 @@ type vzMachine struct{ m *vz.VirtualMachine }
 func (z vzMachine) Terminal() bool {
 	return terminalState(z.m.State())
 }
-func (z vzMachine) CanStop() bool { return z.m.CanStop() }
-func (z vzMachine) Stop() error   { return z.m.Stop() }
 
-// StopVMAfterFailure stops machine after the operation that owns it failed
-// with primary, waiting at most the runtime stop timeout for the terminal
-// state, and returns the error to report: primary when the VM is stopped, or
-// primary joined with the stop failure (which wraps ErrVMMayRun) when the VM
-// may still run.
-func StopVMAfterFailure(primary error, machine *vz.VirtualMachine, exited <-chan struct{}) error {
-	return stopForCleanup(primary, vzMachine{machine}, exited, stopTimeout)
+// A terminal notification can let cleanup discard the last tracked handle
+// while either native call is in progress. Keep the VM and its queue alive
+// until the call returns.
+func (z vzMachine) CanStop() bool {
+	ok := z.m.CanStop()
+	runtime.KeepAlive(z.m)
+	return ok
+}
+
+func (z vzMachine) Stop() error {
+	err := z.m.Stop()
+	runtime.KeepAlive(z.m)
+	return err
+}
+
+// StopVMForCleanup confirms that machine reached a terminal state. It uses
+// the runtime stop timeout for both the request and the wait. It returns
+// primary, if any, on success. If termination is unconfirmed, it joins the
+// stop failure and ErrVMMayRun with primary.
+func StopVMForCleanup(primary error, machine *vz.VirtualMachine, exited <-chan struct{}) error {
+	return stopForCleanup(primary, vzMachine{machine}, exited, StopTimeout)
 }
 
 // stopVM stops the VM of v, if it runs, and then its network stack. It
@@ -925,7 +937,7 @@ func (r *Runtime) stopVM(v *vm) error {
 	machine, watcher := v.machine, v.watcher
 	v.mu.Unlock()
 	if machine != nil {
-		if err := watcher.stop(vzMachine{machine}, stopTimeout); err != nil {
+		if err := watcher.stop(vzMachine{machine}, StopTimeout); err != nil {
 			r.logger.Error("VM did not stop", "sandbox_id", v.id, "error", err)
 			return err
 		}

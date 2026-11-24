@@ -68,10 +68,10 @@ func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
 			return
 		}
 		if errors.Is(err, vzrt.ErrVMMayRun) {
-			// The first-boot VM may still use the staged disk, so deleting
+			// The build VM may still use the staged disk, so deleting
 			// it could corrupt a running guest; keep it. The next build
 			// removes the directory at its start.
-			logger.Error("keeping the macOS build directory because the first-boot VM may still run", "build_dir", build)
+			logger.Error("keeping the macOS build directory because the build VM may still run", "build_dir", build)
 			return
 		}
 		os.RemoveAll(build)
@@ -282,7 +282,7 @@ func firstBootMacOS(ctx context.Context, m vzrt.MacOSMachine, logger *slog.Logge
 	}
 	defer func() {
 		if err != nil {
-			err = vzrt.StopVMAfterFailure(err, machine, exit.Done())
+			err = vzrt.StopVMForCleanup(err, machine, exit.Done())
 		}
 	}()
 	dial := func(ctx context.Context) (net.Conn, error) {

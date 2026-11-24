@@ -443,9 +443,16 @@ func TestVirtualizationIntegration(t *testing.T) {
 		}
 	}
 
+	// Delete a paused guest as well as the guests that are still running.
+	if _, err := m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: sb.GetSandboxId()}); err != nil {
+		t.Fatal(err)
+	}
 	for _, id := range ids {
 		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
 			t.Fatalf("delete %v %v", en, err)
+		}
+		if _, err := os.Stat(st.Path(store.VMsDir, id)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("VM directory after deleting %s: %v", id, err)
 		}
 	}
 	if ids, _ := rt.Running(context.Background()); len(ids) != 0 {

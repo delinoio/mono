@@ -15,6 +15,7 @@ type machineWatcher struct {
 	done     chan struct{}
 	cancel   context.CancelFunc
 	exitOnce sync.Once
+	stopper  machineStopper
 }
 
 func watchMachine[S any](notify <-chan S, terminal func(S) bool) *machineWatcher {
@@ -46,7 +47,7 @@ func (w *machineWatcher) signalExit() {
 
 // stop releases the watcher only after stopMachine confirms termination.
 func (w *machineWatcher) stop(m stoppableMachine, timeout time.Duration) error {
-	if err := stopMachine(m, w.exited, timeout); err != nil {
+	if err := w.stopper.stopMachine(m, w.exited, timeout); err != nil {
 		return err
 	}
 	// A state read can confirm termination before a notification arrives.
