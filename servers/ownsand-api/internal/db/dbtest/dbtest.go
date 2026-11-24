@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 )
@@ -54,9 +55,15 @@ func NewURLAtVersion(t testing.TB, maxVersion int64) string {
 func newURL(t testing.TB, maxVersion int64) string {
 	t.Helper()
 	admin := URL(t)
+	// Pool options configure the generated database's pool. They must not
+	// reach Postgres as session parameters on the admin connections.
+	adminConfig, err := pgxpool.ParseConfig(admin)
+	if err != nil {
+		t.Fatalf("parse %s: invalid database configuration", EnvTestDatabaseURL)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, admin)
+	conn, err := pgx.ConnectConfig(ctx, adminConfig.ConnConfig)
 	if err != nil {
 		t.Fatalf("connect to test database: %v", err)
 	}
@@ -70,7 +77,7 @@ func newURL(t testing.TB, maxVersion int64) string {
 	_ = conn.Close(ctx)
 	t.Cleanup(func() {
 		dropDatabase(t, name, func(ctx context.Context) (adminConn, error) {
-			return pgx.Connect(ctx, admin)
+			return pgx.ConnectConfig(ctx, adminConfig.ConnConfig)
 		})
 	})
 	child, err := childURL(admin, name)

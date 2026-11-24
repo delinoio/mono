@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
+	"google.golang.org/protobuf/proto"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
+	"github.com/delinoio/mono/servers/accounts-api/internal/api"
 	"github.com/delinoio/mono/servers/accounts-api/internal/testenv"
 )
 
@@ -33,6 +37,83 @@ func storedAutoTopUp(t *testing.T, env *testenv.Env, accountID string) (enabled 
 		t.Fatal(err)
 	}
 	return enabled, threshold, amount, cap, found
+}
+
+func TestUpdateAutoTopUpSettingsUsesMonthAfterAccountLock(t *testing.T) {
+	midnight := time.Date(2027, time.January, 1, 0, 0, 0, 0, time.UTC)
+	requestTime := midnight.Add(-100 * time.Millisecond)
+	for _, tc := range []struct {
+		name        string
+		releaseTime time.Time
+		wantTotal   int64
+	}{
+		{"next month", midnight.Add(100 * time.Millisecond), 40 * usd},
+		{"same month", midnight.Add(-50 * time.Millisecond), 25 * usd},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testenv.New(t)
+			owner := newPerson(env, "owner")
+			accountID := createAccount(t, owner, "Fixture").GetBillingAccountId()
+			credit := env.Credit(owner.ID)
+
+			// The January automatic top-up was queued in December. Place
+			// failed and manual top-ups in January to check both exclusions.
+			if _, err := env.DB.Pool.Exec(ctx(), `INSERT INTO top_ups
+				(top_up_id, billing_account_id, kind, status, amount_usd_micros, create_time, update_time, cap_time, idempotency_key)
+				VALUES
+				('01900000-0000-7000-8000-0000000000a1', $1, 'auto', 'completed', $2, $5, $5, $5, NULL),
+				('01900000-0000-7000-8000-0000000000a2', $1, 'auto', 'completed', $3, $5, $6, $6, NULL),
+				('01900000-0000-7000-8000-0000000000a3', $1, 'auto', 'failed',    $4, $6, $6, $6, NULL),
+				('01900000-0000-7000-8000-0000000000a4', $1, 'manual', 'completed', $4, $6, $6, NULL, '01900000-0000-7000-8000-0000000000b4')`,
+				accountID, 25*usd, 40*usd, 50*usd, requestTime, midnight); err != nil {
+				t.Fatal(err)
+			}
+
+			requested := &accountsv1.AutoTopUpSettings{
+				Enabled: true, ThresholdUsdMicros: 10 * usd, AmountUsdMicros: 25 * usd, MonthlyCapUsdMicros: 100 * usd,
+			}
+			// Clock.Now advances the test clock by one millisecond.
+			env.Clock.Advance(requestTime.Sub(env.Clock.Now()) - time.Millisecond)
+			var response *connect.Response[accountsv1.UpdateAutoTopUpSettingsResponse]
+			err := raceMembershipChange(t, env, accountID, func(pgx.Tx) {
+				env.Clock.Advance(tc.releaseTime.Sub(env.Clock.Now()) - time.Millisecond)
+			}, func() error {
+				var err error
+				response, err = credit.UpdateAutoTopUpSettings(ctx(), connect.NewRequest(&accountsv1.UpdateAutoTopUpSettingsRequest{
+					BillingAccountId: accountID,
+					Settings:         requested,
+				}))
+				return err
+			})
+			wantCode(t, err, 0)
+
+			want := proto.CloneOf(requested)
+			want.MonthToDateUsdMicros = tc.wantTotal
+			if got := response.Msg.GetSettings(); !proto.Equal(got, want) {
+				t.Fatalf("updated settings = %v, want %v", got, want)
+			}
+			read, err := credit.GetAutoTopUpSettings(ctx(), connect.NewRequest(&accountsv1.GetAutoTopUpSettingsRequest{
+				BillingAccountId: accountID,
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := read.Msg.GetSettings(); !proto.Equal(got, want) {
+				t.Fatalf("saved settings = %v, want %v", got, want)
+			}
+
+			var settingsTime, auditTime time.Time
+			if err := env.DB.Pool.QueryRow(ctx(), `SELECT s.update_time, a.create_time
+				FROM credit_settings s JOIN billing_audit_events a USING (billing_account_id)
+				WHERE s.billing_account_id = $1 AND a.kind = $2`,
+				accountID, api.AuditAutoTopUpSettingsUpdated).Scan(&settingsTime, &auditTime); err != nil {
+				t.Fatal(err)
+			}
+			if !settingsTime.Equal(requestTime) || !auditTime.Equal(requestTime) {
+				t.Fatalf("settings time = %s, audit time = %s, want request time %s for both", settingsTime, auditTime, requestTime)
+			}
+		})
+	}
 }
 
 // TestUpdateAutoTopUpSettingsReadFailureRollsBack makes the month-to-date

@@ -245,7 +245,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/transactions":
 		now := time.Now().UTC()
-		txn := paddle.Transaction{ID: s.NewID("txn"), Status: paddle.TransactionStatusDraft, CreatedAt: now, UpdatedAt: now}
+		mode, _ := body["collection_mode"].(string)
+		txn := paddle.Transaction{ID: s.NewID("txn"), Status: paddle.TransactionStatusDraft, CollectionMode: mode, CreatedAt: now, UpdatedAt: now}
 		if custom, ok := body["custom_data"].(map[string]any); ok {
 			txn.CustomData = custom
 		}
@@ -274,7 +275,7 @@ func (s *Server) serveTransaction(w http.ResponseWriter, r *http.Request, id str
 	defer s.mu.Unlock()
 	txn, ok := s.transactions[id]
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"type": "request_error", "code": "not_found"}})
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"type": "request_error", "code": paddle.CodeNotFound}})
 		return
 	}
 	if r.Method == http.MethodPatch && body["status"] == paddle.TransactionStatusCanceled {

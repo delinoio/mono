@@ -45,12 +45,12 @@ func wireToFileMode(wire uint32) fs.FileMode {
 	return mode
 }
 
-// renameFile and openStagingFile are the rename into place and the reopen of
-// a retained staging file; tests replace them to fail one call, because
-// directory permissions cannot fail the reopen of a file the owner can open.
+// Tests replace these operations to inject failures while finishing a write
+// or reopening a retained staging file.
 var (
-	renameFile      = os.Rename
-	openStagingFile = os.OpenFile
+	closeStagingFile = (*os.File).Close
+	renameFile       = os.Rename
+	openStagingFile  = os.OpenFile
 )
 
 // span is a written byte range [start, end).
@@ -334,11 +334,9 @@ func mergeSpan(ranges []span, s span) []span {
 	return out
 }
 
-// ensureOpen reopens the retained staging file of an unfinished write whose
-// file is closed. A finish whose rename failed closes the file; when the
-// reopen after that failure also fails, the write would otherwise stay
-// without a file until it expires. The written ranges are not touched: the
-// bytes are in the retained file.
+// ensureOpen reopens the retained staging file of an unfinished write. A
+// failed close or a failed reopen after a rename error leaves the staging
+// file closed. The retained file still holds the bytes for the written ranges.
 //
 // A staging file that does not exist any more (or that somebody replaced, so
 // it no longer has the identity of the file the helper created) cannot be
@@ -406,8 +404,11 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 	if err := e.file.Sync(); err != nil {
 		return fsError("write", err)
 	}
-	if err := e.file.Close(); err != nil {
-		return fsError("write", err)
+	closeErr := closeStagingFile(e.file)
+	// Close releases the handle even on error. The next call can reopen it.
+	e.file = nil
+	if closeErr != nil {
+		return fsError("write", closeErr)
 	}
 	if err := renameFile(e.tmp, e.target); err != nil {
 		// Reopen so a retry of the finish can try again. The mode of the
@@ -417,13 +418,11 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 		// applies the requested mode again before it renames. A failed reopen
 		// is not final: ensureOpen runs again at the start of every later
 		// chunk or finish of the write.
-		e.file = nil
 		// The reopen error is not reported: the caller gets the rename error,
 		// and the next call repeats the reopen and reports its own error.
 		_ = e.ensureOpen()
 		return fsError("write", err)
 	}
-	e.file = nil
 	return nil
 }
 

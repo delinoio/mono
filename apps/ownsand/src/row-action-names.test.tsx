@@ -77,8 +77,8 @@ describe("snapshot and template rows", () => {
     );
     const templates = namesOf(screen.getByRole("list", { name: "Templates" }));
     expect(templates).toEqual([
-      `Delete template node-24-toolchain from snapshot ${secondShort}`,
       `Delete template node-24-toolchain from snapshot ${firstShort}`,
+      `Delete template node-24-toolchain from snapshot ${secondShort}`,
     ]);
     // The accessible name starts with the visible text, and the visible text
     // is unchanged.

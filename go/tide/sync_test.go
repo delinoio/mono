@@ -11,12 +11,17 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 
@@ -196,6 +201,132 @@ func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
 	}
 }
 
+func TestSyncSkipsStaleSymlinkDescendants(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ctx := context.Background()
+	const (
+		replacement = "src/former"
+		descendant  = replacement + "/inner/file.txt"
+		target      = "../target"
+		targetFile  = "target/inner/file.txt"
+	)
+	for _, tc := range []struct {
+		name          string
+		targetContent string
+		ignored       bool
+	}{
+		{name: "matching target content", targetContent: "old"},
+		{name: "different target content", targetContent: "new"},
+		{name: "ignored link", targetContent: "old", ignored: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := newRepo(t, map[string]string{
+				descendant:     "old",
+				targetFile:     tc.targetContent,
+				"src/keep.txt": "keep",
+			}, nil, "")
+			if err := os.Symlink(targetFile, filepath.Join(dir, "standalone")); err != nil {
+				t.Fatal(err)
+			}
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(ctx, params); err != nil {
+				t.Fatal(err)
+			}
+			old := guestManifest(t, ds)
+			indexPath := filepath.Join(dir, ".git", "index")
+			indexBefore, err := os.ReadFile(indexPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.ignored {
+				exclude := filepath.Join(dir, ".git", "info", "exclude")
+				if err := os.WriteFile(exclude, []byte("/"+replacement+"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			link := filepath.Join(dir, replacement)
+			if err := os.RemoveAll(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+
+			local, err := listLocalFiles(ctx, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected := make(map[string]localFile, len(local.files))
+			for _, f := range local.files {
+				selected[f.rel] = f
+			}
+			if _, ok := selected[descendant]; ok {
+				t.Fatalf("selection includes stale path %q", descendant)
+			}
+			for _, rel := range []string{"src/keep.txt", targetFile, "standalone"} {
+				if f, ok := selected[rel]; !ok || f.entry != old.Files[rel] {
+					t.Fatalf("selection changed %q: %+v", rel, f)
+				}
+			}
+			f, hasLink := selected[replacement]
+			if tc.ignored && hasLink {
+				t.Fatalf("selection includes ignored link %q", replacement)
+			}
+			if !tc.ignored && (!hasLink || f.entry.Mode != modeSymlink || f.target != target) {
+				t.Fatalf("selection for %q = %+v", replacement, f)
+			}
+
+			plan, err := planSync(local, old)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(plan.deleted, []string{descendant}) {
+				t.Fatalf("planned deletions = %v, want [%s]", plan.deleted, descendant)
+			}
+			var wantChanges []localFile
+			if !tc.ignored {
+				wantChanges = []localFile{f}
+			}
+			if !slices.Equal(plan.changed, wantChanges) {
+				t.Fatalf("planned changes = %+v, want %+v", plan.changed, wantChanges)
+			}
+
+			res, err := c.Sync(ctx, params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Uploaded != len(wantChanges) || res.Deleted != 1 {
+				t.Fatalf("second sync = %+v", res)
+			}
+			m := guestManifest(t, ds)
+			if _, ok := m.Files[descendant]; ok {
+				t.Fatalf("guest manifest still includes %q", descendant)
+			}
+			if _, ok := m.Files[replacement]; ok != hasLink {
+				t.Fatalf("guest manifest link %q present = %t, want %t", replacement, ok, hasLink)
+			}
+			if hasLink {
+				if got, err := os.Readlink(filepath.Join(ds.GetWorkspacePath(), replacement)); err != nil || got != target {
+					t.Fatalf("guest symbolic link = %q, %v", got, err)
+				}
+			}
+			if got := readGuest(t, ds, targetFile); got != tc.targetContent {
+				t.Fatalf("guest target content = %q, want %q", got, tc.targetContent)
+			}
+			indexAfter, err := os.ReadFile(indexPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(indexBefore, indexAfter) {
+				t.Fatal("sync changed the Git index")
+			}
+		})
+	}
+}
+
 func TestSyncSkipsSubmodulesAndNeedsGit(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
@@ -211,6 +342,16 @@ func TestSyncSkipsSubmodulesAndNeedsGit(t *testing.T) {
 	}
 
 	plain := t.TempDir()
+	ceiling, err := filepath.Abs(filepath.Dir(plain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ceiling, err = filepath.EvalSymlinks(ceiling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stop Git from finding the enclosing checkout when TMPDIR is inside it.
+	t.Setenv("GIT_CEILING_DIRECTORIES", ceiling)
 	_, err = c.Sync(context.Background(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: plain})
 	if !errors.Is(err, ErrNotGitWorkTree) || connect.CodeOf(err) != connect.CodeFailedPrecondition {
 		t.Fatalf("not a work tree: %v", err)
@@ -270,6 +411,181 @@ func TestSyncCaseCollisionsAndWindowsNames(t *testing.T) {
 	}
 }
 
+func TestSyncInvalidUTF8(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	dir := newRepo(t, map[string]string{"ok.txt": "ok"}, nil, "")
+	const bad = "bad\xffname.txt"
+	badPath := filepath.Join(dir, bad)
+	if err := os.WriteFile(badPath, []byte("new"), 0o644); err != nil {
+		if errors.Is(err, fs.ErrInvalid) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.EILSEQ) {
+			t.Skipf("the local file system rejected a non-UTF-8 file name: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if got := PathRuleInvalidUTF8.String(); got != "invalid_utf8" {
+		t.Fatalf("rule identifier = %q", got)
+	}
+	linux := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	for _, guestOS := range []tidev1.GuestOs{
+		tidev1.GuestOs_GUEST_OS_LINUX, tidev1.GuestOs_GUEST_OS_MACOS, tidev1.GuestOs_GUEST_OS_WINDOWS,
+	} {
+		t.Run(guestOS.String(), func(t *testing.T) {
+			ds := linux
+			if guestOS != tidev1.GuestOs_GUEST_OS_LINUX {
+				ds = newSession(t, c, srv, org, guestOS)
+			}
+			reads, writes, execs := len(srv.ReadRequests()), srv.Calls(writeProc), srv.Calls(execProc)
+			_, err := c.Sync(context.Background(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir, Force: true})
+			var pe *PathRuleError
+			if connect.CodeOf(err) != connect.CodeFailedPrecondition || !errors.As(err, &pe) ||
+				pe.Rule != PathRuleInvalidUTF8 || len(pe.Paths) != 1 || !slices.Equal(pe.Paths[0], []string{bad}) {
+				t.Fatalf("invalid UTF-8 error = %v, path error = %+v", err, pe)
+			}
+			if msg := err.Error(); !utf8.ValidString(msg) || !strings.Contains(msg, strconv.Quote(bad)) {
+				t.Fatalf("error must quote the path and contain valid UTF-8: %q", msg)
+			}
+			if len(srv.ReadRequests()) != reads || srv.Calls(writeProc) != writes || srv.Calls(execProc) != execs {
+				t.Fatal("a rejected sync read or wrote files or ran guest commands")
+			}
+			if _, err := os.Stat(ds.GetWorkspacePath() + manifestSuffix); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("manifest must be absent after rejection: %v", err)
+			}
+		})
+	}
+
+	const valid = "ü.txt"
+	if err := os.Rename(badPath, filepath.Join(dir, valid)); err != nil {
+		t.Fatal(err)
+	}
+	params := SyncParams{OrganizationID: org, DevSessionID: linux.GetDevSessionId(), LocalDir: dir}
+	res, err := c.Sync(context.Background(), params)
+	if err != nil || res.Uploaded != 2 || res.Deleted != 0 || res.Skipped != 0 {
+		t.Fatalf("sync after rename = %+v, %v", res, err)
+	}
+	writes, execs := srv.Calls(writeProc), srv.Calls(execProc)
+	for range 2 {
+		res, err = c.Sync(context.Background(), params)
+		if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 2 || res.BytesSent != 0 {
+			t.Fatalf("unchanged sync = %+v, %v", res, err)
+		}
+	}
+	if srv.Calls(writeProc) != writes || srv.Calls(execProc) != execs {
+		t.Fatal("an unchanged sync wrote files or ran guest commands")
+	}
+	if m := guestManifest(t, linux); !m.PathsValidated || m.Files[valid].Mode != modeFile {
+		t.Fatalf("manifest did not record the valid path %q: %+v", valid, m)
+	}
+}
+
+func TestSyncLegacyAmbiguousUTF8Manifest(t *testing.T) {
+	needPOSIX(t)
+	for _, scenario := range []struct {
+		name              string
+		localHasPath      bool
+		clearMarkerOnLock bool
+	}{
+		{name: "drop stale entry without applying"},
+		{name: "replan when only the validation marker changes", clearMarkerOnLock: true},
+		{name: "reupload matching local file before managing it", localHasPath: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			ws := ds.GetWorkspacePath()
+			const raw = "entry-\xff.txt"
+			const replacement = "entry-\ufffd.txt"
+			tracked := map[string]string{"ok.txt": "ok"}
+			if scenario.localHasPath {
+				tracked[replacement] = "old local"
+			}
+			dir := newRepo(t, tracked, nil, "")
+			for name, contents := range map[string]string{"ok.txt": "ok", replacement: "guest created", raw: "old local"} {
+				if err := os.WriteFile(filepath.Join(ws, name), []byte(contents), 0o644); err != nil {
+					if name == raw && (errors.Is(err, fs.ErrInvalid) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.EILSEQ)) {
+						t.Skipf("the guest file system rejected a non-UTF-8 file name: %v", err)
+					}
+					t.Fatal(err)
+				}
+			}
+			okHash := sha256.Sum256([]byte("ok"))
+			oldHash := sha256.Sum256([]byte("old local"))
+			m := manifest{
+				Version: manifestVersion,
+				Files: map[string]manifestEntry{
+					"ok.txt":    {Size: 2, SHA256: hex.EncodeToString(okHash[:]), Mode: modeFile},
+					replacement: {Size: 9, SHA256: hex.EncodeToString(oldHash[:]), Mode: modeFile},
+				},
+				PathsValidated: scenario.clearMarkerOnLock,
+			}
+			writeManifest := func(m manifest) error {
+				body, err := json.Marshal(m)
+				if err != nil {
+					return err
+				}
+				return os.WriteFile(ws+manifestSuffix, body, 0o644)
+			}
+			if err := writeManifest(m); err != nil {
+				t.Fatal(err)
+			}
+			if scenario.clearMarkerOnLock {
+				srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+					if req.GetEnv()[guestEnvForce] != "" {
+						legacy := m
+						legacy.PathsValidated = false
+						if err := writeManifest(legacy); err != nil {
+							t.Error(err)
+						}
+					}
+				}
+			}
+			ctx := context.Background()
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			writes, execs := srv.Calls(writeProc), srv.Calls(execProc)
+			res, err := c.Sync(ctx, params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := guestManifest(t, ds)
+			if !next.PathsValidated || next.Version != manifestVersion || next.Files["ok.txt"].Mode != modeFile {
+				t.Fatalf("updated manifest = %+v", next)
+			}
+			if res.Deleted != 0 || res.Skipped != 1 || readGuest(t, ds, raw) != "old local" {
+				t.Fatalf("sync must preserve the raw-byte guest file and skip ok.txt: %+v", res)
+			}
+			if scenario.localHasPath {
+				if res.Uploaded != 1 || len(res.Warnings) != 0 || next.Files[replacement].Mode != modeFile ||
+					readGuest(t, ds, replacement) != "old local" {
+					t.Fatalf("sync must reupload the selected U+FFFD path: %+v, manifest %+v", res, next)
+				}
+				if err := os.Remove(filepath.Join(dir, replacement)); err != nil {
+					t.Fatal(err)
+				}
+				res, err = c.Sync(ctx, params)
+				if err != nil || res.Deleted != 1 || len(res.Warnings) != 0 {
+					t.Fatalf("deletion from a validated manifest = %+v, %v", res, err)
+				}
+				if _, err := os.Stat(filepath.Join(ws, replacement)); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("validated U+FFFD path must be deleted: %v", err)
+				}
+				return
+			}
+			if res.Uploaded != 0 || res.BytesSent != 0 || len(res.Warnings) != 1 ||
+				!strings.Contains(res.Warnings[0], strconv.Quote(replacement)) || len(next.Files) != 1 ||
+				readGuest(t, ds, replacement) != "guest created" {
+				t.Fatalf("sync must warn, preserve the guest file and drop the stale entry: %+v, manifest %+v", res, next)
+			}
+			if srv.Calls(writeProc)-writes != 1 || srv.Calls(execProc)-execs != 2 {
+				t.Fatal("a manifest-only update must write the manifest and only run lock and cleanup commands")
+			}
+			res, err = c.Sync(ctx, params)
+			if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 1 || len(res.Warnings) != 0 {
+				t.Fatalf("unchanged sync after dropping the stale entry = %+v, %v", res, err)
+			}
+		})
+	}
+}
+
 // caseSensitiveDir reports whether dir keeps two names that differ only in
 // case as two files.
 func caseSensitiveDir(t *testing.T, dir string) bool {
@@ -316,6 +632,142 @@ func TestInvalidWindowsPath(t *testing.T) {
 	}
 }
 
+func TestSyncRetryFileToDirectory(t *testing.T) {
+	needPOSIX(t)
+	for _, scenario := range []string{"first apply", "manifest write failure", "symlink", "ordinary deletion failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			ws := ds.GetWorkspacePath()
+			// Exercise a nested archive parent with a leading dash and a newline.
+			former := "-a with space\n"
+			child := former + "/nested/new.txt"
+			dir := newRepo(t, map[string]string{former: "old"}, nil, "")
+			p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			ctx := context.Background()
+			sync := func() (*SyncResult, error) { return c.Sync(ctx, p) }
+			checkCleanup := func() {
+				t.Helper()
+				if _, err := os.Lstat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("expected lock removal, stat returned %v", err)
+				}
+				if matches, err := filepath.Glob(ws + ".tide-sync-*"); err != nil || len(matches) != 0 {
+					t.Fatalf("temporary files left: %v, glob error: %v", matches, err)
+				}
+			}
+			if _, err := sync(); err != nil {
+				t.Fatal(err)
+			}
+			old := guestManifest(t, ds)
+			git(t, dir, "rm", "-q", "--", former)
+			if scenario == "ordinary deletion failure" {
+				child = "unrelated.txt"
+			}
+			writeChild := filepath.Join(dir, child)
+			if err := os.MkdirAll(filepath.Dir(writeChild), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(writeChild, []byte("new"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			git(t, dir, "add", "--", child)
+
+			var guestOnly, linkTarget string
+			switch scenario {
+			case "manifest write failure":
+				srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+					if req.GetEnv()[guestEnvWorkspace] != "" {
+						srv.Fail(writeProc, connect.NewError(connect.CodePermissionDenied, errors.New("manifest write denied")))
+					}
+				}
+				_, err := sync()
+				srv.BeforeExec = nil
+				if connect.CodeOf(err) != connect.CodePermissionDenied {
+					t.Fatalf("manifest write error = %v", err)
+				}
+				if got := readGuest(t, ds, child); got != "new" {
+					t.Fatalf("file after apply = %q", got)
+				}
+				if m := guestManifest(t, ds); m.Version != old.Version || !maps.Equal(m.Files, old.Files) {
+					t.Fatalf("manifest after failed write = %+v, want %+v", m, old)
+				}
+				checkCleanup()
+				guestOnly = former + "/guest.txt"
+				if err := os.WriteFile(filepath.Join(ws, child), []byte("guest edit"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink", "ordinary deletion failure":
+				if err := os.Remove(filepath.Join(ws, former)); err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "symlink" {
+					linkTarget = t.TempDir()
+					if err := os.WriteFile(filepath.Join(linkTarget, "keep.txt"), []byte("keep"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(linkTarget, filepath.Join(ws, former)); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if err := os.Mkdir(filepath.Join(ws, former), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					guestOnly = former + "/guest.txt"
+				}
+			}
+			if guestOnly != "" {
+				if err := os.WriteFile(filepath.Join(ws, guestOnly), []byte("keep"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			res, err := sync()
+			checkCleanup()
+			if guestOnly != "" && readGuest(t, ds, guestOnly) != "keep" {
+				t.Fatal("sync changed a guest-only file")
+			}
+			if scenario == "ordinary deletion failure" {
+				if err == nil {
+					t.Fatal("ordinary deletion of a directory succeeded")
+				}
+				if _, err := os.Lstat(filepath.Join(ws, child)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("archive extracted after a failed deletion, stat returned %v", err)
+				}
+				if m := guestManifest(t, ds); m.Version != old.Version || !maps.Equal(m.Files, old.Files) {
+					t.Fatalf("manifest after failed deletion = %+v, want %+v", m, old)
+				}
+				return
+			}
+			if err != nil || res.Uploaded != 1 || res.Deleted != 1 {
+				t.Fatalf("file-to-directory sync = %+v, %v", res, err)
+			}
+			if got := readGuest(t, ds, child); got != "new" {
+				t.Fatalf("file after sync = %q", got)
+			}
+			if linkTarget != "" {
+				if info, err := os.Lstat(filepath.Join(ws, former)); err != nil || !info.IsDir() {
+					t.Fatalf("sync did not replace the symlink with a directory: %v, %v", info, err)
+				}
+				if data, err := os.ReadFile(filepath.Join(linkTarget, "keep.txt")); err != nil || string(data) != "keep" {
+					t.Fatalf("symlink target changed: %q, %v", data, err)
+				}
+				if _, err := os.Lstat(filepath.Join(linkTarget, "nested")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("sync wrote through the symlink, stat returned %v", err)
+				}
+			}
+			m := guestManifest(t, ds)
+			if _, ok := m.Files[child]; !ok || len(m.Files) != 1 || m.Version != old.Version {
+				t.Fatalf("manifest after sync = %+v", m)
+			}
+			execs := srv.Calls(execProc)
+			res, err = sync()
+			if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 1 || srv.Calls(execProc) != execs {
+				t.Fatalf("unchanged sync = %+v, %v", res, err)
+			}
+		})
+	}
+}
+
 // TestSyncReplacesDirectoryWithFile checks that a synced directory that
 // became a file locally is replaced in the guest: the deletions leave empty
 // directories, which the apply command removes before the extraction, but
@@ -359,6 +811,80 @@ func TestSyncReplacesDirectoryWithFile(t *testing.T) {
 		if matches, _ := filepath.Glob(ds.GetWorkspacePath() + ".tide-sync-*"); len(matches) != 0 {
 			t.Fatalf("temporary files left: %v", matches)
 		}
+	}
+}
+
+func TestSyncUnstagedDirectoryToFile(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ctx := context.Background()
+	for _, scenario := range []struct {
+		name      string
+		guestFile bool
+	}{
+		{name: "empty after deletion"},
+		{name: "guest file blocks replacement", guestFile: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			dir := newRepo(t, map[string]string{"a/b/old": "old", "a/c": "c", "keep.txt": "k"}, nil, "")
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(ctx, params); err != nil {
+				t.Fatal(err)
+			}
+			before := guestManifest(t, ds)
+			if scenario.guestFile {
+				if err := os.WriteFile(filepath.Join(ds.GetWorkspacePath(), "a/b/guest.txt"), []byte("guest"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			replacement := filepath.Join(dir, "a")
+			if err := os.RemoveAll(replacement); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(replacement, []byte("now a file"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			listed := strings.Split(strings.TrimSpace(git(t, dir, "ls-files", "--cached", "--others", "--exclude-standard")), "\n")
+			for _, p := range []string{"a", "a/b/old", "a/c"} {
+				if !slices.Contains(listed, p) {
+					t.Fatalf("git omitted %q from %v", p, listed)
+				}
+			}
+
+			res, err := c.Sync(ctx, params)
+			git(t, dir, "diff", "--cached", "--quiet")
+			after := guestManifest(t, ds)
+			if scenario.guestFile {
+				if connect.CodeOf(err) != connect.CodeInternal || !strings.Contains(err.Error(), "guest apply command") {
+					t.Fatalf("sync = %+v, %v, want guest apply error", res, err)
+				}
+				if got := readGuest(t, ds, "a/b/guest.txt"); got != "guest" {
+					t.Fatalf("guest file content = %q", got)
+				}
+				if after.Version != before.Version || after.PathsValidated != before.PathsValidated || !maps.Equal(after.Files, before.Files) {
+					t.Fatalf("manifest after failed replacement = %+v, want %+v", after, before)
+				}
+				return
+			}
+			if err != nil || res.Uploaded != 1 || res.Deleted != 2 {
+				t.Fatalf("sync = %+v, %v", res, err)
+			}
+			if readGuest(t, ds, "a") != "now a file" || readGuest(t, ds, "keep.txt") != "k" {
+				t.Fatal("guest has unexpected file contents")
+			}
+			if len(after.Files) != 2 || after.Files["a"].Mode != modeFile || after.Files["keep.txt"] != before.Files["keep.txt"] {
+				t.Fatalf("manifest after replacement = %+v", after)
+			}
+		})
+	}
+}
+
+func TestReadLocalFileLookupError(t *testing.T) {
+	needPOSIX(t)
+	_, ok, err := readLocalFile(t.TempDir(), strings.Repeat("a", 4096), "")
+	if ok || !errors.Is(err, syscall.ENAMETOOLONG) {
+		t.Fatalf("readLocalFile = present %t, error %v, want ENAMETOOLONG", ok, err)
 	}
 }
 
@@ -421,6 +947,149 @@ func TestSyncPlansAgainUnderTheLock(t *testing.T) {
 	}
 	if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("the sync kept its lock")
+	}
+}
+
+func TestPOSIXSyncCleanup(t *testing.T) {
+	needPOSIX(t)
+	for _, scenario := range []struct {
+		name        string
+		archiveDir  bool
+		lockDotPath bool
+	}{
+		{name: "archive removal fails", archiveDir: true},
+		{name: "missing and empty paths"},
+		{name: "lock removal fails", lockDotPath: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			dir := t.TempDir()
+			archive := filepath.Join(dir, "archive.tar")
+			lock := filepath.Join(dir, "lock")
+			if err := os.Mkdir(lock, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if scenario.archiveDir {
+				if err := os.Mkdir(archive, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(archive, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			lockArg := lock
+			if scenario.lockDotPath {
+				lockArg += "/."
+			}
+			args, err := guestCommand(tidev1.GuestOs_GUEST_OS_LINUX, opCleanup)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(args[0], args[1:]...)
+			cmd.Env = []string{
+				"PATH=" + os.Getenv("PATH"),
+				guestEnvArchive + "=" + archive,
+				guestEnvLock + "=" + lockArg,
+			}
+			for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes} {
+				path := filepath.Join(dir, key)
+				if scenario.archiveDir {
+					if err := os.WriteFile(path, nil, 0o644); err != nil {
+						t.Fatal(err)
+					}
+					cmd.Env = append(cmd.Env, key+"="+path)
+				} else if key == guestEnvDeletes {
+					cmd.Env = append(cmd.Env, key+"="+path)
+				} else if key == guestEnvReplaceFiles {
+					cmd.Env = append(cmd.Env, key+"=")
+				}
+			}
+			out, err := cmd.CombinedOutput()
+			var exitErr *exec.ExitError
+			if scenario.archiveDir || scenario.lockDotPath {
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+					t.Errorf("cleanup should exit 1, got %v: %s", err, out)
+				}
+			} else if err != nil {
+				t.Errorf("cleanup should succeed, got %v: %s", err, out)
+			}
+			var leftovers []string
+			if scenario.archiveDir {
+				leftovers = append(leftovers, filepath.Base(archive))
+			}
+			if scenario.lockDotPath {
+				leftovers = append(leftovers, filepath.Base(lock))
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var names []string
+			for _, entry := range entries {
+				names = append(names, entry.Name())
+			}
+			if !slices.Equal(names, leftovers) {
+				t.Errorf("remaining paths = %v, want %v", names, leftovers)
+			}
+		})
+	}
+}
+
+func TestSyncCleanupWarnings(t *testing.T) {
+	needPOSIX(t)
+	for _, scenario := range []string{"committed sync", "manifest write fails"} {
+		t.Run(scenario, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			dir := newRepo(t, map[string]string{"a.txt": "a"}, nil, "")
+			var logs bytes.Buffer
+			c.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+				env := req.GetEnv()
+				if env[guestEnvWorkspace] != "" && scenario == "manifest write fails" {
+					srv.Fail(writeProc, connect.NewError(connect.CodePermissionDenied, errors.New("manifest write denied")))
+				}
+				if archive := env[guestEnvArchive]; archive != "" && env[guestEnvLock] != "" && env[guestEnvForce] == "" && env[guestEnvWorkspace] == "" {
+					// rm -f fails on a directory even when the test runs as root.
+					if err := os.Remove(archive); err != nil {
+						t.Error(err)
+						return
+					}
+					if err := os.Mkdir(archive, 0o755); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			res, err := c.Sync(context.Background(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
+			ws := ds.GetWorkspacePath()
+			if scenario == "manifest write fails" {
+				var connectErr *connect.Error
+				if res != nil || !errors.As(err, &connectErr) || connectErr.Code() != connect.CodePermissionDenied || connectErr.Message() != "manifest write denied" {
+					t.Fatalf("sync = %+v, %v, want manifest write error", res, err)
+				}
+				if _, err := os.Stat(ws + manifestSuffix); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("manifest after failed write: %v", err)
+				}
+				if !strings.Contains(logs.String(), "tide sync clean-up failed") {
+					t.Error("missing deferred cleanup debug message")
+				}
+			} else {
+				if err != nil || res == nil || res.Uploaded != 1 {
+					t.Fatalf("sync = %+v, %v", res, err)
+				}
+				const warning = "the guest could not remove the sync archive or release the sync lock; the next sync may need force"
+				if !slices.Contains(res.Warnings, warning) {
+					t.Errorf("cleanup warning missing from %v", res.Warnings)
+				}
+				if m := guestManifest(t, ds); m.Version != manifestVersion || len(m.Files) != 1 || m.Files["a.txt"].Size != 1 {
+					t.Errorf("committed manifest = %+v", m)
+				}
+			}
+			if got := readGuest(t, ds, "a.txt"); got != "a" {
+				t.Errorf("applied file = %q", got)
+			}
+			if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("sync lock should be removed, got %v", err)
+			}
+		})
 	}
 }
 
@@ -540,6 +1209,39 @@ func TestDownloadFileAndDirectory(t *testing.T) {
 		t.Fatal("file content differs")
 	}
 
+	t.Run("failed installation", func(t *testing.T) {
+		parent := t.TempDir()
+		dest := filepath.Join(parent, "result")
+		mustWrite(dest, "old", 0o644)
+		var staged string
+		var phases []TransferPhase
+		res, err := c.Download(t.Context(), DownloadParams{
+			OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: "out/report.txt", LocalPath: dest,
+			Progress: func(p TransferProgress) {
+				phases = append(phases, p.Phase)
+				if p.Phase == TransferDownloading && staged == "" {
+					// Remove the staged file after it receives data and before installation.
+					dirs, err := filepath.Glob(filepath.Join(parent, ".tide-download-*"))
+					if err != nil || len(dirs) != 1 {
+						t.Fatalf("staging directories = %v, %v", dirs, err)
+					}
+					staged = filepath.Join(dirs[0], "result")
+					if err := os.Remove(staged); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+		})
+		var renameErr *os.LinkError
+		if res != nil || !errors.Is(err, os.ErrNotExist) || !errors.As(err, &renameErr) ||
+			renameErr.Old != staged || renameErr.New != dest || slices.Contains(phases, TransferDone) {
+			t.Fatalf("failed installation = %+v, %v, phases %v", res, err, phases)
+		}
+		if contents, err := os.ReadFile(dest); err != nil || string(contents) != "old" {
+			t.Fatalf("restored destination = %q, %v", contents, err)
+		}
+	})
+
 	_, err = c.Download(ctx, DownloadParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: "missing", LocalPath: filepath.Join(local, "x")})
 	if connect.CodeOf(err) != connect.CodeNotFound {
 		t.Fatalf("missing guest path = %v", err)
@@ -561,6 +1263,227 @@ func TestDownloadFileAndDirectory(t *testing.T) {
 	}
 	if srv.Calls("/delino.tide.v1.DevSessionService/ReadDevSessionFile") != reads {
 		t.Fatal("a download over the limit read the file")
+	}
+}
+
+func TestDownloadBackupCleanup(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	guest := filepath.Join(ds.GetWorkspacePath(), "out")
+	if err := os.Mkdir(guest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(guest, "new.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A FIFO gives the archive an unsupported entry and an extraction warning.
+	if out, err := exec.Command("mkfifo", filepath.Join(guest, "pipe")).CombinedOutput(); err != nil {
+		t.Fatalf("mkfifo: %v: %s", err, out)
+	}
+	const extractionWarning = "pipe: skipped an archive entry of an unsupported type"
+
+	for _, tc := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{name: "cleanup succeeds", mode: 0o755},
+		{name: "cleanup denied", mode: 0o555},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanupDenied := tc.mode == 0o555
+			if cleanupDenied && os.Geteuid() == 0 {
+				t.Skip("the cleanup failure requires an unprivileged user")
+			}
+			parent := t.TempDir()
+			dest := filepath.Join(parent, "result")
+			const oldDir = "restricted"
+			if err := os.MkdirAll(filepath.Join(dest, oldDir), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dest, oldDir, "old.txt"), []byte("old"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var backups []string
+			t.Cleanup(func() {
+				for _, path := range append(backups, dest) {
+					err := os.Chmod(filepath.Join(path, oldDir), 0o755)
+					if err != nil && !errors.Is(err, os.ErrNotExist) {
+						t.Error(err)
+					}
+				}
+			})
+			if err := os.Chmod(filepath.Join(dest, oldDir), tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			var done int
+			res, err := c.Download(t.Context(), DownloadParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: "out", LocalPath: dest,
+				Progress: func(p TransferProgress) {
+					if p.Phase == TransferDone {
+						done++
+					}
+				},
+			})
+			backupDirs, globErr := filepath.Glob(filepath.Join(parent, ".tide-old-*"))
+			if globErr != nil {
+				t.Fatal(globErr)
+			}
+			for _, dir := range backupDirs {
+				backups = append(backups, filepath.Join(dir, "previous"))
+			}
+			if err != nil || res == nil || res.LocalPath != dest || !res.Directory ||
+				res.Files != 1 || res.Bytes != 3 || done != 1 {
+				t.Fatalf("download = %+v, %v, completion events %d", res, err, done)
+			}
+			if contents, err := os.ReadFile(filepath.Join(dest, "new.txt")); err != nil || string(contents) != "new" {
+				t.Fatalf("new content = %q, %v", contents, err)
+			}
+			if !cleanupDenied {
+				if len(backups) != 0 || !slices.Equal(res.Warnings, []string{extractionWarning}) {
+					t.Fatalf("backups = %v, warnings = %v", backups, res.Warnings)
+				}
+				return
+			}
+			if len(backups) != 1 || len(res.Warnings) != 2 || res.Warnings[0] != extractionWarning ||
+				!strings.Contains(res.Warnings[1], strconv.Quote(backups[0])) ||
+				!strings.Contains(res.Warnings[1], os.ErrPermission.Error()) {
+				t.Fatalf("backups = %v, warnings = %v", backups, res.Warnings)
+			}
+			if contents, err := os.ReadFile(filepath.Join(backups[0], oldDir, "old.txt")); err != nil || string(contents) != "old" {
+				t.Fatalf("old content = %q, %v", contents, err)
+			}
+		})
+	}
+}
+
+func TestDownloadAtFilenameLimit(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	ws := ds.GetWorkspacePath()
+	if err := os.Mkdir(filepath.Join(ws, "tree"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"file", "tree/new.txt"} {
+		if err := os.WriteFile(filepath.Join(ws, path), []byte("new"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Use the full 255-byte basename allowed by common POSIX filesystems.
+	name := strings.Repeat("a", 255)
+	for _, tc := range []struct {
+		name, guest, oldPath, newPath string
+		failRead                      bool
+	}{
+		{name: "replace file", guest: "file", oldPath: ".", newPath: "."},
+		{name: "replace directory", guest: "tree", oldPath: "old.txt", newPath: "new.txt"},
+		{name: "install file", guest: "file", newPath: "."},
+		{name: "failed transfer", guest: "file", oldPath: ".", failRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			dest := filepath.Join(parent, name)
+			if tc.oldPath != "" {
+				old := filepath.Join(dest, tc.oldPath)
+				if err := os.MkdirAll(filepath.Dir(old), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(old, []byte("old"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.failRead {
+				srv.Fail("/delino.tide.v1.DevSessionService/ReadDevSessionFile",
+					connect.NewError(connect.CodePermissionDenied, errors.New("transfer stopped")))
+			}
+			res, err := c.Download(t.Context(), DownloadParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: tc.guest, LocalPath: dest,
+			})
+			if tc.failRead {
+				if connect.CodeOf(err) != connect.CodePermissionDenied {
+					t.Fatalf("failed transfer = %v", err)
+				}
+				if contents, err := os.ReadFile(dest); err != nil || string(contents) != "old" {
+					t.Fatalf("destination after failed transfer = %q, %v", contents, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if res.LocalPath != dest || res.Directory != (tc.guest == "tree") {
+					t.Fatalf("download result = %+v", res)
+				}
+				if contents, err := os.ReadFile(filepath.Join(dest, tc.newPath)); err != nil || string(contents) != "new" {
+					t.Fatalf("downloaded content = %q, %v", contents, err)
+				}
+				if tc.oldPath == "old.txt" {
+					if _, err := os.Lstat(filepath.Join(dest, tc.oldPath)); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("old directory entry remains: %v", err)
+					}
+				}
+			}
+			entries, err := os.ReadDir(parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].Name() != name {
+				t.Fatalf("unexpected destination parent entries: %v", entries)
+			}
+		})
+	}
+}
+
+func TestReplacePathRollback(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		blockRestore bool
+	}{
+		{name: "restore destination"},
+		{name: "retain backup", blockRestore: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			dest := filepath.Join(parent, "result")
+			staged := filepath.Join(parent, "missing")
+			if err := os.WriteFile(dest, []byte("old"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var backup string
+			rename := func(from, to string) error {
+				if from == dest {
+					backup = to
+				}
+				if from == staged && tc.blockRestore {
+					// A directory appears after the old file moved aside.
+					if err := os.Mkdir(dest, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return os.Rename(from, to)
+			}
+			warning, err := replacePath(staged, dest, rename)
+			if warning != "" || !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("publication warning = %q, error = %v", warning, err)
+			}
+			if backup == "" {
+				t.Fatal("the destination was not backed up")
+			}
+			old := dest
+			if tc.blockRestore {
+				if !strings.Contains(err.Error(), strconv.Quote(backup)) {
+					t.Fatalf("error does not report the backup path %q: %v", backup, err)
+				}
+				old = backup
+			} else if _, err := os.Lstat(filepath.Dir(backup)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("backup directory remains: %v", err)
+			}
+			if contents, err := os.ReadFile(old); err != nil || string(contents) != "old" {
+				t.Fatalf("old content = %q, %v", contents, err)
+			}
+		})
 	}
 }
 
