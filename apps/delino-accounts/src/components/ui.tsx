@@ -22,7 +22,7 @@ import {
   type FormEvent,
   type ReactNode,
   useCallback,
-  useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -255,21 +255,9 @@ export function Empty({
   );
 }
 
-enum SubmissionResult {
-  /** Another submission of this opening is still running. */
-  Skipped = "skipped",
-  Succeeded = "succeeded",
-  Failed = "failed",
-  /** The dialog closed or opened again before the action settled. */
-  Stale = "stale",
-}
-
 /**
- * The submission state of a dialog. One submission runs at a time, and its
- * outcome belongs to the opening of the dialog that started it: a request
- * that settles after the dialog closed or opened again changes no state and
- * reports `Stale`, so an earlier failure never shows on a later opening and
- * never keeps its submit button disabled.
+ * Runs one submission at a time and applies its outcome only to the
+ * opening that started it.
  */
 function useDialogSubmission(open: boolean) {
   const [error, setError] = useState<unknown>();
@@ -285,39 +273,39 @@ function useDialogSubmission(open: boolean) {
       setPending(false);
     }
   }
-  // The opening counter changes on every open and close edge. The busy ref
-  // stops a second submission in the same tick, before the pending state
-  // renders, and starts again with every opening.
+  // End the opening during the commit so a promise that resumes after
+  // close or unmount sees that its opening is gone.
   const opening = useRef(0);
   const busy = useRef(false);
-  useEffect(() => {
-    opening.current += 1;
+  useLayoutEffect(() => {
     busy.current = false;
+    return () => {
+      opening.current += 1;
+    };
   }, [open]);
   const clearError = useCallback(() => setError(undefined), []);
   const submit = useCallback(
-    async (action: () => Promise<unknown>): Promise<SubmissionResult> => {
-      if (busy.current) return SubmissionResult.Skipped;
+    async <T,>(action: () => Promise<T>, onSucceeded: (result: T) => void) => {
+      // Block a second submission before the pending state renders.
+      if (busy.current) return;
       busy.current = true;
       const mine = opening.current;
       setPending(true);
       // A retry removes the notice of the previous failure.
       setError(undefined);
+      let result: T;
       try {
-        await action();
-        return mine === opening.current
-          ? SubmissionResult.Succeeded
-          : SubmissionResult.Stale;
+        result = await action();
       } catch (e) {
-        if (mine !== opening.current) return SubmissionResult.Stale;
-        setError(e);
-        return SubmissionResult.Failed;
+        if (mine === opening.current) setError(e);
+        return;
       } finally {
         if (mine === opening.current) {
           busy.current = false;
           setPending(false);
         }
       }
+      if (mine === opening.current) onSucceeded(result);
     },
     [],
   );
@@ -361,10 +349,7 @@ export function ConfirmDialog({
           <Button
             variant={ButtonVariant.Danger}
             disabled={pending}
-            onClick={async () => {
-              const result = await submit(onConfirm);
-              if (result === SubmissionResult.Succeeded) onOpenChange(false);
-            }}
+            onClick={() => submit(onConfirm, () => onOpenChange(false))}
           >
             {confirmLabel}
           </Button>
@@ -384,11 +369,9 @@ export enum FormSubmitOutcome {
 /**
  * What `FormDialog.onSubmit` resolves with. `onSucceeded` holds the effects
  * that belong to the opening that submitted the form (close, reset, navigate,
- * toast). The dialog runs it only when that opening is still the current one,
- * so a request that succeeds after the dialog closed or opened again cannot
- * close the new opening, clear its draft, navigate or notify. Work that must
- * happen for every success, such as refreshing cached data, stays in
- * `onSubmit` before it resolves.
+ * toast). The dialog runs it only while that opening is current. Work
+ * that must happen for every success, such as refreshing cached data, stays
+ * in `onSubmit` before it resolves.
  */
 export type FormSubmission =
   | { outcome: FormSubmitOutcome.Invalid }
@@ -425,21 +408,14 @@ export function FormDialog({
   onOpenChange: (open: boolean) => void;
   children: ReactNode;
 }) {
-  const { error, pending, clearError, submit: run } = useDialogSubmission(open);
-  const submit = async (event: FormEvent) => {
+  const { error, pending, clearError, submit } = useDialogSubmission(open);
+  const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
-    // The holder keeps the submission outside the action, because the action
-    // can settle after the opening that started it is gone.
-    const settled: { submission?: FormSubmission } = {};
-    const result = await run(async () => {
-      settled.submission = await onSubmit();
+    return submit(onSubmit, (submission) => {
+      if (submission.outcome === FormSubmitOutcome.Submitted) {
+        submission.onSucceeded?.();
+      }
     });
-    if (
-      result === SubmissionResult.Succeeded &&
-      settled.submission?.outcome === FormSubmitOutcome.Submitted
-    ) {
-      settled.submission.onSucceeded?.();
-    }
   };
   return (
     <Dialog
@@ -454,7 +430,7 @@ export function FormDialog({
         {description ? (
           <DialogDescription>{description}</DialogDescription>
         ) : null}
-        <form className="form" onSubmit={submit} noValidate>
+        <form className="form" onSubmit={handleSubmit} noValidate>
           {children}
           {error !== undefined ? <ErrorNotice error={error} /> : null}
           <DialogActions>

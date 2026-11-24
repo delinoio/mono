@@ -293,6 +293,20 @@ describe("FormDialog success effects", () => {
     expect(effects).toEqual(["done"]);
   });
 
+  test("skips the effects of a success after the form unmounts", async () => {
+    const pending = deferredSubmission();
+    const effects: string[] = [];
+    const { unmount } = render(
+      <FormHarness onSubmit={() => pending.promise} />,
+    );
+    openDialog();
+    fireEvent.click(submitButton());
+    unmount();
+    pending.resolve(formSubmitted(() => effects.push("done")));
+    await settle();
+    expect(effects).toEqual([]);
+  });
+
   test("skips the effects of a success that arrives while the dialog is closed", async () => {
     const pending = deferredSubmission();
     const effects: string[] = [];
