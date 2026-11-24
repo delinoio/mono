@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { LogtoProvider } from "@logto/react";
+import { LogtoProvider, useLogto } from "@logto/react";
 import {
   afterEach,
   beforeEach,
@@ -15,6 +15,8 @@ import { RouterProvider } from "./router.tsx";
 
 const LOGTO_CONFIG = { endpoint: "https://logto.test", appId: "app" };
 const SIGN_IN_SESSION_KEY = "logto:app:signInSession";
+const LEGACY_SESSION_KEY = "logto:app";
+const ID_TOKEN_KEY = "logto:app:idToken";
 const CALLBACK_WITH_QUERY = "/callback?code=x&state=y";
 
 function storeSignInSession(path = "/callback", key = SIGN_IN_SESSION_KEY) {
@@ -43,14 +45,14 @@ async function renderCallback({
   const complete = rstest.fn(async () => {
     await onCallback();
     window.sessionStorage.removeItem(SIGN_IN_SESSION_KEY);
-    window.sessionStorage.removeItem("logto:app");
+    window.sessionStorage.removeItem(LEGACY_SESSION_KEY);
   });
 
   class FakeLogtoClient {
     isAuthenticated = async () => signedIn;
     isSignInRedirected = async () =>
       window.sessionStorage.getItem(SIGN_IN_SESSION_KEY) !== null ||
-      window.sessionStorage.getItem("logto:app") !== null;
+      window.sessionStorage.getItem(LEGACY_SESSION_KEY) !== null;
     handleSignInCallback = complete;
   }
 
@@ -110,7 +112,7 @@ describe("Logto callback", () => {
     expect(complete).not.toHaveBeenCalled();
   });
 
-  test.each([SIGN_IN_SESSION_KEY, "logto:app"])(
+  test.each([SIGN_IN_SESSION_KEY, LEGACY_SESSION_KEY])(
     "waits for the callback to complete when a session is stored in %s",
     async (key) => {
       storeSignInSession("/callback", key);
@@ -151,4 +153,90 @@ describe("Logto callback", () => {
     expect(replace).not.toHaveBeenCalled();
     expect(push).not.toHaveBeenCalled();
   });
+});
+
+describe("Logto callback with unreadable session storage", () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  const session = {
+    redirectUri: "https://console.test/callback",
+    codeVerifier: "v",
+    state: "s",
+  };
+  const unreadableCases = [
+    { name: "invalid JSON", value: "{not json" },
+    { name: "an object without fields", value: "{}" },
+    { name: "null", value: "null" },
+    ...Object.keys(session).flatMap((key) => {
+      const fields: Record<string, unknown> = { ...session };
+      delete fields[key];
+      return [
+        { name: `missing ${key}`, value: JSON.stringify(fields) },
+        {
+          name: `non-string ${key}`,
+          value: JSON.stringify({ ...session, [key]: 1 }),
+        },
+      ];
+    }),
+  ];
+
+  function AuthStatus() {
+    const { isAuthenticated, isLoading } = useLogto();
+    if (isLoading) return null;
+    return <span>{isAuthenticated ? "signed in" : "signed out"}</span>;
+  }
+
+  beforeEach(() => {
+    unhandled.length = 0;
+    process.on("unhandledRejection", onUnhandled);
+  });
+
+  afterEach(() => {
+    process.off("unhandledRejection", onUnhandled);
+    window.localStorage.removeItem(ID_TOKEN_KEY);
+  });
+
+  for (const storageKey of [SIGN_IN_SESSION_KEY, LEGACY_SESSION_KEY]) {
+    for (const signedIn of [false, true]) {
+      test.each(unreadableCases)(
+        `shows one error notice for $name in ${storageKey} under StrictMode (signed in: ${signedIn})`,
+        async ({ value }) => {
+          window.sessionStorage.setItem(storageKey, value);
+          // The SDK uses the presence of an ID token to restore authentication.
+          if (signedIn) window.localStorage.setItem(ID_TOKEN_KEY, "fixture");
+          window.history.replaceState(null, "", CALLBACK_WITH_QUERY);
+          const replace = rstest.spyOn(window.history, "replaceState");
+          const push = rstest.spyOn(window.history, "pushState");
+
+          await act(async () => {
+            render(
+              <StrictMode>
+                <LogtoProvider config={LOGTO_CONFIG}>
+                  <AuthStatus />
+                  <RouterProvider>
+                    <LogtoCallbackPage appId={LOGTO_CONFIG.appId} />
+                  </RouterProvider>
+                </LogtoProvider>
+              </StrictMode>,
+            );
+          });
+          expect(
+            screen.getByText(signedIn ? "signed in" : "signed out"),
+          ).toBeDefined();
+          expect(screen.getByRole("alert").textContent).toBe(
+            "Something went wrong. Try again.",
+          );
+          expect(window.location.pathname + window.location.search).toBe(
+            CALLBACK_WITH_QUERY,
+          );
+          expect(replace).not.toHaveBeenCalled();
+          expect(push).not.toHaveBeenCalled();
+          expect(window.sessionStorage.getItem(storageKey)).toBe(value);
+          // Let an unhandled SDK rejection reach the process before checking.
+          await new Promise((resolve) => setImmediate(resolve));
+          expect(unhandled).toEqual([]);
+        },
+      );
+    }
+  }
 });

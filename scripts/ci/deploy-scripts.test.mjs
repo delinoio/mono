@@ -2360,6 +2360,14 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
 const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
 const dropletDeploymentUuid = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
 const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(64)}`;
+const httpArgs = [
+  "api",
+  dropletImage,
+  "8080",
+  "api.example.com",
+  "http1",
+  "none",
+];
 
 // Runs droplet-deploy.sh the way deploy-targets.sh does (`bash -s` with the
 // script on standard input) against stubbed `docker` and `curl`. `old` lists
@@ -2392,7 +2400,7 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 // `prepare(deployRoot)` changes the scratch state before the run.
 function setupDroplet(
   t,
-  args = ["api", dropletImage, "8080", "api.example.com", "http1", "none"],
+  args = httpArgs,
   {
     old = [],
     envFile = "LOG_LEVEL=info\n",
@@ -2497,11 +2505,7 @@ esac`,
   return { dir, bin, deployRoot, read, calls, spawnEnv };
 }
 
-function runDroplet(
-  t,
-  args = ["api", dropletImage, "8080", "api.example.com", "http1", "none"],
-  { env = {}, ...options } = {},
-) {
+function runDroplet(t, args = httpArgs, { env = {}, ...options } = {}) {
   const setup = setupDroplet(t, args, options);
   const result = spawnSync("bash", ["-s", "--", ...args], {
     encoding: "utf8",
@@ -2944,6 +2948,118 @@ test(
     assert.equal(setup.calls().at(-1), "docker start old1");
     assert.equal(setup.read("caddy/sites/api.caddy"), route);
     assert.equal(setup.read("state/api.current"), `${olderImage}\n`);
+  },
+);
+
+test(
+  "droplet deploy publishes the HTTP route and image state before honoring a signal",
+  { skip },
+  async (t) => {
+    const alias = `api-${dropletDeploymentUuid.replaceAll("-", "")}`;
+    for (const phase of ["reload", "state publication"]) {
+      for (const [signal, status] of [
+        ["SIGTERM", 143],
+        ["SIGINT", 130],
+        ["SIGHUP", 129],
+      ]) {
+        await t.test(`${signal} during ${phase}`, async (t) => {
+          const duringReload = phase === "reload";
+          const setup = setupDroplet(t, httpArgs, {
+            old: ["old1"],
+            route: "# old route\n",
+            state: `${olderImage}\n`,
+            previous: `${oldestImage}\n`,
+            stubs: duringReload
+              ? {}
+              : {
+                  mv: `if [[ "\${@: -1}" == *.current ]]; then
+  while [[ -d "$STUB_DIR" && ! -e "$STUB_DIR/release-state" ]]; do sleep 0.05; done
+fi
+exec /bin/mv "$@"`,
+                },
+          });
+          const run = startDroplet(t, setup, httpArgs, {
+            STUB_BLOCK_ON: duringReload ? "exec *" : "",
+          });
+          await waitFor(
+            () =>
+              setup
+                .calls()
+                .some((call) =>
+                  duringReload
+                    ? call.startsWith("docker exec")
+                    : call.startsWith("mv ") &&
+                      call.endsWith("/state/api.current"),
+                ),
+            phase,
+          );
+          assert.equal(setup.read("state/api.current"), `${olderImage}\n`);
+          run.child.kill(signal);
+          writeFileSync(
+            join(setup.dir, duringReload ? "release-docker" : "release-state"),
+            "",
+          );
+          const result = await run.done;
+          assert.equal(result.status, status, result.stderr);
+          assert.match(result.stderr, new RegExp(`received ${signal}`));
+          assert.match(
+            result.stderr,
+            /previous containers keep running.*cleanup was skipped/,
+          );
+          assert.ok(
+            setup
+              .read("caddy/sites/api.caddy")
+              .includes(`reverse_proxy ${alias}:8080`),
+          );
+          assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+          assert.equal(setup.read("state/api.previous"), `${olderImage}\n`);
+          assert.ok(
+            !setup
+              .calls()
+              .some((call) => /^docker (stop|start|rm|image) /.test(call)),
+          );
+        });
+      }
+    }
+  },
+);
+
+test(
+  "droplet deploy finishes HTTP route failure handling before honoring a signal",
+  { skip },
+  async (t) => {
+    for (const route of ["# old route\n", undefined]) {
+      await t.test(route ? "existing route" : "first deployment", async (t) => {
+        const state = route ? `${olderImage}\n` : undefined;
+        const previous = route ? `${oldestImage}\n` : undefined;
+        const setup = setupDroplet(t, httpArgs, {
+          old: route ? ["old1"] : [],
+          route,
+          state,
+          previous,
+        });
+        const run = startDroplet(t, setup, httpArgs, {
+          STUB_BLOCK_ON: "exec *",
+          STUB_RELOAD: "1",
+        });
+        await waitFor(
+          () => setup.calls().some((call) => call.startsWith("docker exec")),
+          "the proxy reload",
+        );
+        run.child.kill("SIGTERM");
+        writeFileSync(join(setup.dir, "release-docker"), "");
+        const result = await run.done;
+        assert.equal(result.status, 1, result.stderr);
+        assert.match(result.stderr, /the reverse proxy rejected the route/);
+        assert.equal(setup.read("caddy/sites/api.caddy"), route);
+        assert.equal(setup.read("state/api.current"), state);
+        assert.equal(setup.read("state/api.previous"), previous);
+        assert.match(setup.calls().at(-1), /^docker rm --force api-/);
+        assert.ok(
+          !setup.calls().some((call) => /^docker (stop|start) /.test(call)),
+        );
+      });
+    }
   },
 );
 

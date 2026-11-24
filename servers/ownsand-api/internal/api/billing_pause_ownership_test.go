@@ -4,16 +4,22 @@ package api_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
@@ -34,9 +40,10 @@ type lateFixture struct {
 	pauses []string
 }
 
-func newLateFixture(t *testing.T) *lateFixture {
+func newLateFixture(t *testing.T, extra ...testenv.Option) *lateFixture {
 	t.Helper()
-	f := &lateFixture{markerFixture: newMarkerFixtureWith(t, func(o *app.Options) { o.Timing = commandExpiryTiming() })}
+	opts := append([]testenv.Option{func(o *app.Options) { o.Timing = commandExpiryTiming() }}, extra...)
+	f := &lateFixture{markerFixture: newMarkerFixtureWith(t, opts...)}
 	f.agent.SetOnCommand(f.hook)
 	return f
 }
@@ -194,6 +201,175 @@ func TestLateBillingPauseUpdateAfterChannelReplacement(t *testing.T) {
 	// The old operation completes and the agent reports the newer PAUSED.
 	replacement.SendUpdate(replacement.SetSandbox(id, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED))
 	f.resumeLatePause(t, c, id, 1)
+}
+
+type callerPauseTrace struct{}
+type afterMarkClearKey struct{}
+type beforeMarkCommitKey struct{}
+
+func (callerPauseTrace) TraceQueryStart(ctx context.Context, _ *pgx.Conn, query pgx.TraceQueryStartData) context.Context {
+	switch {
+	case query.SQL == "commit":
+		if beforeCommit, ok := ctx.Value(beforeMarkCommitKey{}).(func()); ok {
+			beforeCommit()
+		}
+	case strings.HasPrefix(query.SQL, "UPDATE sandboxes SET paused_by_billing = false WHERE"):
+		return ctx
+	}
+	if ctx.Value(afterMarkClearKey{}) != nil {
+		return context.WithValue(ctx, afterMarkClearKey{}, false)
+	}
+	return ctx
+}
+
+func (callerPauseTrace) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, query pgx.TraceQueryEndData) {
+	if afterClear, ok := ctx.Value(afterMarkClearKey{}).(func()); ok && query.Err == nil && query.CommandTag.RowsAffected() == 1 {
+		afterClear()
+	}
+}
+
+func newTracedLateFixture(t *testing.T) *lateFixture {
+	t.Helper()
+	return newLateFixture(t, func(o *app.Options) {
+		cfg := o.DB.Pool.Config()
+		cfg.ConnConfig.Tracer = callerPauseTrace{}
+		pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		o.DB = &db.DB{Pool: pool}
+	})
+}
+
+// invokeCallerPause supplies the authenticated request context directly so the
+// test can cancel it at the database boundary and observe the handler error.
+func (f *lateFixture) invokeCallerPause(ctx context.Context, sandboxID string) error {
+	ctx = auth.WithPrincipal(ctx, auth.Principal{Kind: ownsandv1.PrincipalKind_PRINCIPAL_KIND_USER, ID: f.org.Owner})
+	h := api.SandboxHandler{Service: f.env.App.Service}
+	_, err := h.PauseSandbox(ctx, connect.NewRequest(&ownsandv1.PauseSandboxRequest{OrganizationId: f.org.ID, SandboxId: sandboxID}))
+	return err
+}
+
+func TestCallerPauseEnqueueFailureKeepsBillingOwnership(t *testing.T) {
+	for _, closeChannel := range []bool{true, false} {
+		name := "request canceled"
+		if closeChannel {
+			name = "channel closed"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newTracedLateFixture(t)
+			c := f.org.OwnerClient
+			id := f.create(t)
+			f.suspendedPass(t, id)
+			f.waitPauses(t, 1)
+			f.recoverWhileRunning(t, id)
+
+			svc := f.env.App.Service
+			conn := svc.Hub.Live(f.dev.ID)
+			if conn == nil {
+				t.Fatal("need a live channel for the caller pause")
+			}
+			beforePending := svc.PendingCommands()
+			beforeSent := countLogs(f.env, `"msg":"agent_command_sent"`)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			faultReached := false
+			ctx = context.WithValue(ctx, afterMarkClearKey{}, func() {
+				faultReached = true
+				if closeChannel {
+					conn.Close(errors.New("test: close before enqueue"))
+				} else {
+					cancel()
+				}
+			})
+			if err := f.invokeCallerPause(ctx, id); connect.CodeOf(err) != connect.CodeUnavailable || !faultReached {
+				t.Fatalf("PauseSandbox = %v, reached enqueue fault = %v", err, faultReached)
+			}
+			if !pausedByBilling(t, f.env, id) {
+				t.Fatal("failed enqueue cleared the billing mark")
+			}
+			if got := countLogs(f.env, `"msg":"agent_command_sent"`); got != beforeSent {
+				t.Fatalf("command enqueues = %d, want %d", got, beforeSent)
+			}
+			if got := svc.PendingCommands(); got != beforePending {
+				t.Fatalf("pending commands = %d, want %d", got, beforePending)
+			}
+
+			if closeChannel {
+				replacement := f.env.NewFakeAgent(f.dev)
+				replacement.SetSandbox(id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, 0)
+				replacement.Connect()
+				replacement.WaitFor("state report ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateAck().GetStateReport() != nil })
+				f.agent = replacement
+			}
+			f.agent.SendUpdate(f.agent.SetSandbox(id, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED, 0))
+			f.resumeLatePause(t, c, id, 1)
+		})
+	}
+}
+
+func TestCallerPauseCommitSurvivesRequestCancellation(t *testing.T) {
+	f := newTracedLateFixture(t)
+	id := f.create(t)
+	f.suspendedPass(t, id)
+	f.waitPauses(t, 1)
+	f.recoverWhileRunning(t, id)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ctx = context.WithValue(ctx, beforeMarkCommitKey{}, func() { cancel() })
+	if err := f.invokeCallerPause(ctx, id); !errors.Is(err, context.Canceled) {
+		t.Fatalf("PauseSandbox = %v, want canceled while waiting for the agent", err)
+	}
+	if pausedByBilling(t, f.env, id) {
+		t.Fatal("request cancellation prevented the ownership commit")
+	}
+
+	sendPauseResult(f.agent, f.waitPauses(t, 2)[1], id)
+	waitState(t, f.org.OwnerClient, f.org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
+	enforceBilling(t, f.env)
+	if got := resumeCommands(f.agent, id); got != 0 {
+		t.Fatalf("billing resumed a caller-owned pause %d times", got)
+	}
+}
+
+func TestCallerPauseCommitFailurePreservesResultReconciliation(t *testing.T) {
+	f := newLateFixture(t)
+	id := f.create(t)
+	f.suspendedPass(t, id)
+	f.waitPauses(t, 1)
+	f.recoverWhileRunning(t, id)
+
+	// The UPDATE succeeds. PostgreSQL runs the trigger only at commit.
+	for _, sql := range []string{
+		`CREATE FUNCTION reject_mark_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				RAISE EXCEPTION 'test: the billing mark commit failed';
+			END $$`,
+		`CREATE CONSTRAINT TRIGGER reject_mark_commit AFTER UPDATE ON sandboxes
+			DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+			WHEN (OLD.paused_by_billing AND NOT NEW.paused_by_billing)
+			EXECUTE FUNCTION reject_mark_commit()`,
+	} {
+		if _, err := f.env.DB.Pool.Exec(t.Context(), sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc := f.env.App.Service
+	beforePending := svc.PendingCommands()
+	if _, err := pauseRPC(f.org.OwnerClient, f.org.ID, id); connect.CodeOf(err) != connect.CodeInternal {
+		t.Fatalf("PauseSandbox = %v, want internal", err)
+	}
+	if got := svc.PendingCommands(); got != beforePending+1 {
+		t.Fatalf("pending commands = %d, want %d", got, beforePending+1)
+	}
+	if !pausedByBilling(t, f.env, id) {
+		t.Fatal("failed commit cleared the billing mark")
+	}
+
+	sendPauseResult(f.agent, f.waitPauses(t, 2)[1], id)
+	f.resumeLatePause(t, f.org.OwnerClient, id, 1)
 }
 
 // TestLateBillingPauseUpdateAfterControlPlaneReplacement recreates the

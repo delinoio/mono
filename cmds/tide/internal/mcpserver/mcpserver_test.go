@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +26,7 @@ import (
 	"github.com/delinoio/mono/go/tide"
 	"github.com/delinoio/mono/go/tide/tidetest"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
 
 type harness struct {
@@ -267,6 +270,116 @@ func TestExecWithinAndBeyondWait(t *testing.T) {
 	// A timeout stops the command.
 	if _, isErr := h.call("exec", map[string]any{"session_id": id, "command": []string{"sleep", "10"}, "timeout_seconds": 1}, &r); isErr || !r.TimedOut {
 		t.Fatalf("timeout exec = %+v", r)
+	}
+}
+
+type attachExecFixture struct {
+	tidev1connect.UnimplementedDevSessionServiceHandler
+	attach func(context.Context, *tidev1.AttachDevSessionExecRequest, *connect.ServerStream[tidev1.AttachDevSessionExecResponse]) error
+}
+
+func (f attachExecFixture) AttachDevSessionExec(ctx context.Context, req *connect.Request[tidev1.AttachDevSessionExecRequest], stream *connect.ServerStream[tidev1.AttachDevSessionExecResponse]) error {
+	return f.attach(ctx, req.Msg, stream)
+}
+
+func TestExecOutputAttachConfirmation(t *testing.T) {
+	const (
+		execID       = "test-exec"
+		stdoutOffset = 12
+		stderrOffset = 34
+		maxWait      = time.Second + 200*time.Millisecond
+		deadline     = "deadline_exceeded: exec_output did not confirm exec test-exec before the wait expired. Retry with the same exec_id, stdout_offset 12, and stderr_offset 34."
+	)
+	keepalive := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Keepalive{Keepalive: &tidev1.DevSessionExecKeepalive{}}}
+	output := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Stdout{
+		Stdout: &tidev1.DevSessionExecOutput{Offset: stdoutOffset, Data: []byte("hi")},
+	}}
+	truncated := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_OutputTruncated{
+		OutputTruncated: &tidev1.DevSessionExecOutputTruncated{StdoutOffset: 16, StderrOffset: stderrOffset},
+	}}
+	exited := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Exited{
+		Exited: &tidev1.DevSessionExecExited{Status: &tidev1.DevSessionExecExited_ExitCode{ExitCode: 7}},
+	}}
+	exitCode := int64(7)
+	tests := []struct {
+		name       string
+		wait       int
+		events     []*tidev1.DevSessionExecEvent
+		code       connect.Code
+		wantErr    string
+		running    bool
+		stdout     string
+		stdoutNext int64
+		missing    *tide.ByteRange
+		exit       *int64
+	}{
+		{name: "silent wait", wait: 1, wantErr: deadline},
+		{name: "silent poll", wantErr: deadline},
+		{name: "keepalive wait", wait: 1, events: []*tidev1.DevSessionExecEvent{keepalive}, wantErr: deadline},
+		{name: "keepalive poll", events: []*tidev1.DevSessionExecEvent{keepalive}, wantErr: deadline},
+		{name: "missing", code: connect.CodeNotFound, wantErr: "not_found: attach rejected"},
+		{name: "denied", code: connect.CodePermissionDenied, wantErr: "permission_denied: attach rejected"},
+		{name: "running", events: []*tidev1.DevSessionExecEvent{output}, running: true, stdout: "hi", stdoutNext: 14},
+		{name: "truncated", events: []*tidev1.DevSessionExecEvent{truncated}, running: true, stdoutNext: 16, missing: &tide.ByteRange{From: 12, To: 16}},
+		{name: "exited silently", events: []*tidev1.DevSessionExecEvent{exited}, stdoutNext: stdoutOffset, exit: &exitCode},
+		{name: "exited with output", wait: 1, events: []*tidev1.DevSessionExecEvent{output, exited}, stdout: "hi", stdoutNext: 14, exit: &exitCode},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, handler := tidev1connect.NewDevSessionServiceHandler(attachExecFixture{attach: func(ctx context.Context, req *tidev1.AttachDevSessionExecRequest, stream *connect.ServerStream[tidev1.AttachDevSessionExecResponse]) error {
+				if req.GetExecId() != execID || req.GetStdoutOffset() != stdoutOffset || req.GetStderrOffset() != stderrOffset {
+					t.Errorf("attach request = %v", req)
+				}
+				if tc.code != 0 {
+					return connect.NewError(tc.code, errors.New("attach rejected"))
+				}
+				for _, event := range tc.events {
+					if err := stream.Send(&tidev1.AttachDevSessionExecResponse{Event: event}); err != nil {
+						return err
+					}
+				}
+				if tc.exit != nil {
+					return nil
+				}
+				<-ctx.Done()
+				return ctx.Err()
+			}})
+			upstream := httptest.NewUnstartedServer(handler)
+			upstream.Config.Protocols = new(http.Protocols)
+			upstream.Config.Protocols.SetUnencryptedHTTP2(true)
+			upstream.Start()
+			t.Cleanup(upstream.Close)
+			h := newHarness(t, Config{maxWait: maxWait, Client: func() (*tide.Client, error) {
+				return tide.New(tide.Options{BaseURL: upstream.URL, APIKey: "test-key"})
+			}})
+			var out execResult
+			start := time.Now()
+			message, isErr := h.call("exec_output", map[string]any{
+				"session_id": "test-session", "exec_id": execID, "stdout_offset": stdoutOffset,
+				"stderr_offset": stderrOffset, "wait_seconds": tc.wait,
+			}, &out)
+			if elapsed := time.Since(start); elapsed > maxWait+time.Second {
+				t.Errorf("attach took %v, cap is %v", elapsed, maxWait)
+			}
+			if tc.wantErr != "" {
+				if !isErr || message != tc.wantErr {
+					t.Fatalf("attach error = %v %q, want %q", isErr, message, tc.wantErr)
+				}
+				return
+			}
+			if isErr || out.ExecID != execID || out.Running != tc.running || !reflect.DeepEqual(out.ExitCode, tc.exit) {
+				t.Fatalf("attach result = %q %+v", message, out)
+			}
+			if out.Stdout != (Output{Text: tc.stdout, From: stdoutOffset, To: tc.stdoutNext}) ||
+				out.Stderr != (Output{From: stderrOffset, To: stderrOffset}) ||
+				out.NextStdoutOffset != tc.stdoutNext || out.NextStderrOffset != stderrOffset {
+				t.Fatalf("attach output and offsets = %+v", out)
+			}
+			if tc.missing != nil && !reflect.DeepEqual(out.OutputTruncated, []Truncated{{MissingStdout: tc.missing}}) {
+				t.Fatalf("attach truncation = %+v", out.OutputTruncated)
+			}
+		})
 	}
 }
 

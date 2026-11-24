@@ -6,8 +6,8 @@
 // reconcilers and the daily jobs); RPCs and webhooks run on every instance.
 // The holder renews the lease every 10 seconds; it expires 30 seconds after
 // the last renewal, so a crashed holder loses it. A holder that cannot
-// confirm a renewal stops owning the lease at the expire_time of its last
-// successful renewal, whether or not the renewal call has returned. A
+// confirm a renewal stops owning the lease at its last confirmed local
+// deadline, whether or not the renewal call has returned. A
 // draining instance releases it at once. The lease runs the registered
 // components through a Supervisor. The owning contract is the Runtime and
 // Language section of docs/servers-tide-api-foundation.md.
@@ -46,13 +46,9 @@ const (
 type Lease struct {
 	DB         *db.DB
 	InstanceID string
-	// Now stamps the expire_time that the instance writes to the database.
-	Now    func() time.Time
-	Logger *slog.Logger
-	// DeadlineNow is the clock of the local ownership deadline; it defaults
-	// to time.Now. It is separate from Now so that a test can move the
-	// database timestamps (for example, to expire other rows) without
-	// expiring the local ownership, and the reverse.
+	Logger     *slog.Logger
+	// DeadlineNow is the clock of the local ownership deadline. Tests can
+	// set it independently of database time. It defaults to time.Now.
 	DeadlineNow func() time.Time
 	// OnAcquire runs when the instance gains the lease; OnLose runs when it
 	// loses or releases it. The context of OnAcquire ends at the confirmed
@@ -145,14 +141,16 @@ func (l *Lease) Wait(ctx context.Context) error {
 }
 
 // TryAcquire takes or renews the lease once and reports whether this
-// instance holds it. It does not change the local ownership state; Run does.
+// instance holds it. Run applies the result to local ownership state.
+// Both the stored expiry and the takeover check use the same PostgreSQL
+// transaction timestamp, so differences in instance wall clocks do not
+// affect acquisition or renewal.
 func (l *Lease) TryAcquire(ctx context.Context) (bool, error) {
-	now := l.Now()
 	var holder string
-	err := l.DB.Pool.QueryRow(ctx, `INSERT INTO instance_leases (lease_name, holder, expire_time) VALUES ($1, $2, $3)
+	err := l.DB.Pool.QueryRow(ctx, `INSERT INTO instance_leases (lease_name, holder, expire_time) VALUES ($1, $2, now() + make_interval(secs => $3))
 		ON CONFLICT (lease_name) DO UPDATE SET holder = EXCLUDED.holder, expire_time = EXCLUDED.expire_time
-		WHERE instance_leases.holder = EXCLUDED.holder OR instance_leases.expire_time <= $4
-		RETURNING holder`, Name, l.InstanceID, now.Add(TTL), now).Scan(&holder)
+		WHERE instance_leases.holder = EXCLUDED.holder OR instance_leases.expire_time <= now()
+		RETURNING holder`, Name, l.InstanceID, TTL.Seconds()).Scan(&holder)
 	if err != nil {
 		// No row: another instance holds a valid lease.
 		if errors.Is(err, pgx.ErrNoRows) {
