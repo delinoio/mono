@@ -804,6 +804,80 @@ func TestSyncReplacesDirectoryWithFile(t *testing.T) {
 	}
 }
 
+func TestSyncUnstagedDirectoryToFile(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ctx := context.Background()
+	for _, scenario := range []struct {
+		name      string
+		guestFile bool
+	}{
+		{name: "empty after deletion"},
+		{name: "guest file blocks replacement", guestFile: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			dir := newRepo(t, map[string]string{"a/b/old": "old", "a/c": "c", "keep.txt": "k"}, nil, "")
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(ctx, params); err != nil {
+				t.Fatal(err)
+			}
+			before := guestManifest(t, ds)
+			if scenario.guestFile {
+				if err := os.WriteFile(filepath.Join(ds.GetWorkspacePath(), "a/b/guest.txt"), []byte("guest"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			replacement := filepath.Join(dir, "a")
+			if err := os.RemoveAll(replacement); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(replacement, []byte("now a file"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			listed := strings.Split(strings.TrimSpace(git(t, dir, "ls-files", "--cached", "--others", "--exclude-standard")), "\n")
+			for _, p := range []string{"a", "a/b/old", "a/c"} {
+				if !slices.Contains(listed, p) {
+					t.Fatalf("git omitted %q from %v", p, listed)
+				}
+			}
+
+			res, err := c.Sync(ctx, params)
+			git(t, dir, "diff", "--cached", "--quiet")
+			after := guestManifest(t, ds)
+			if scenario.guestFile {
+				if connect.CodeOf(err) != connect.CodeInternal || !strings.Contains(err.Error(), "guest apply command") {
+					t.Fatalf("sync = %+v, %v, want guest apply error", res, err)
+				}
+				if got := readGuest(t, ds, "a/b/guest.txt"); got != "guest" {
+					t.Fatalf("guest file content = %q", got)
+				}
+				if after.Version != before.Version || after.PathsValidated != before.PathsValidated || !maps.Equal(after.Files, before.Files) {
+					t.Fatalf("manifest after failed replacement = %+v, want %+v", after, before)
+				}
+				return
+			}
+			if err != nil || res.Uploaded != 1 || res.Deleted != 2 {
+				t.Fatalf("sync = %+v, %v", res, err)
+			}
+			if readGuest(t, ds, "a") != "now a file" || readGuest(t, ds, "keep.txt") != "k" {
+				t.Fatal("guest has unexpected file contents")
+			}
+			if len(after.Files) != 2 || after.Files["a"].Mode != modeFile || after.Files["keep.txt"] != before.Files["keep.txt"] {
+				t.Fatalf("manifest after replacement = %+v", after)
+			}
+		})
+	}
+}
+
+func TestReadLocalFileLookupError(t *testing.T) {
+	needPOSIX(t)
+	_, ok, err := readLocalFile(t.TempDir(), strings.Repeat("a", 4096), "")
+	if ok || !errors.Is(err, syscall.ENAMETOOLONG) {
+		t.Fatalf("readLocalFile = present %t, error %v, want ENAMETOOLONG", ok, err)
+	}
+}
+
 func TestPruneDirs(t *testing.T) {
 	changed := []localFile{{rel: "a"}, {rel: "x/y"}}
 	got := pruneDirs([]string{"a/b/c/old", "a/d", "x/y/z", "other/dir/f", "a"}, changed)
