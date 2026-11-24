@@ -105,6 +105,8 @@ The control plane serves every public service at `https://tide.api.delino.io`. E
 
 `RunnerProfile` carries the fields of the [control plane runner profile table](servers-tide-api-foundation.md#runner-profiles). `source` is a `oneof` of `base_image` (`GuestOs`) and `ownsand_template_id`. `CreateRunnerProfile` sets every field. `UpdateRunnerProfile` uses a field mask and rejects a change of `workload_kind` or `agent_integration_id` with `invalid_argument`.
 
+Use `resources` to replace all resource values. Use `resources.vcpu_count`, `resources.memory_mib` or `resources.disk_gib` to change individual values. The server keeps the current value of each omitted resource and validates the resulting profile.
+
 ### Agent integration messages
 
 `AgentIntegration` has `agent_integration_id`, `vendor`, `name`, a vendor settings `oneof` and the credential state: one `AgentCredentialState` (`AgentCredential`, `credential_set` and `credential_set_at`) for each credential of the vendor. Create and update requests carry the credentials in a vendor credentials `oneof`; `UpdateAgentIntegration` uses a field mask with the paths `name`, `settings` and `credentials`, and replaces only the non-empty credential fields. The settings and credentials per vendor:

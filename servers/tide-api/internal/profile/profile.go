@@ -222,6 +222,12 @@ func applyField(p *Profile, in *tidev1.RunnerProfile, path string) error {
 	case "resources":
 		r := in.GetResources()
 		p.Resources = Resources{VCPUCount: r.GetVcpuCount(), MemoryMiB: r.GetMemoryMib(), DiskGiB: r.GetDiskGib()}
+	case "resources.vcpu_count":
+		p.Resources.VCPUCount = in.GetResources().GetVcpuCount()
+	case "resources.memory_mib":
+		p.Resources.MemoryMiB = in.GetResources().GetMemoryMib()
+	case "resources.disk_gib":
+		p.Resources.DiskGiB = in.GetResources().GetDiskGib()
 	case "network_mode":
 		p.NetworkMode = in.GetNetworkMode()
 	case "idle_ttl":

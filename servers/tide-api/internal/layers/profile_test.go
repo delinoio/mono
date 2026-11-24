@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
@@ -157,6 +158,76 @@ func TestRunnerProfileConcurrentUpdates(t *testing.T) {
 	if err != nil || got.Msg.GetProfile().GetName() != "renamed" || got.Msg.GetProfile().GetWarmCount() != 3 {
 		t.Fatalf("profile after both updates: %v %v", got, err)
 	}
+}
+
+func TestRunnerProfileResourceUpdates(t *testing.T) {
+	w := newWorld(t)
+	ctx := t.Context()
+	admin := w.env.User(w.org.Admin)
+	created, err := admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{OrganizationId: w.org.ID, Profile: &tidev1.RunnerProfile{
+		Name: "dev", WorkloadKind: tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, WorkspacePath: "/work",
+		GuestOs: tidev1.GuestOs_GUEST_OS_LINUX, Source: &tidev1.RunnerProfile_BaseImage{BaseImage: tidev1.GuestOs_GUEST_OS_LINUX},
+		Resources: &tidev1.Resources{VcpuCount: 4, MemoryMib: 8192, DiskGib: 64}, NetworkMode: tidev1.NetworkMode_NETWORK_MODE_OUTBOUND,
+		IdleTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(8 * time.Hour), MaxQueueWait: durationpb.New(30 * time.Minute),
+	}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created.Msg.GetProfile().GetRunnerProfileId()
+	update := func(resources *tidev1.Resources, paths ...string) (*connect.Response[tidev1.UpdateRunnerProfileResponse], error) {
+		return admin.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: id,
+			Profile: &tidev1.RunnerProfile{Resources: resources}, UpdateMask: &fieldmaskpb.FieldMask{Paths: paths},
+		}))
+	}
+	assertStored := func(want *tidev1.Resources) {
+		t.Helper()
+		got, err := admin.Profile.GetRunnerProfile(ctx, connect.NewRequest(&tidev1.GetRunnerProfileRequest{OrganizationId: w.org.ID, RunnerProfileId: id}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resources := got.Msg.GetProfile().GetResources(); !proto.Equal(resources, want) {
+			t.Fatalf("stored resources = %v, want %v", resources, want)
+		}
+	}
+
+	// Commit the memory change after the vCPU update tries to lock the row.
+	commit := holdTx(t, w.env, "UPDATE runner_profiles SET memory_mib = 16384 WHERE runner_profile_id = $1", id)
+	type result struct {
+		resp *connect.Response[tidev1.UpdateRunnerProfileResponse]
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := update(&tidev1.Resources{VcpuCount: 8}, "resources.vcpu_count")
+		done <- result{resp: resp, err: err}
+	}()
+	waitForLockWaiter(t, w.env)
+	commit()
+	concurrent := <-done
+	if concurrent.err != nil {
+		t.Fatal(concurrent.err)
+	}
+	want := &tidev1.Resources{VcpuCount: 8, MemoryMib: 16384, DiskGib: 64}
+	if got := concurrent.resp.Msg.GetProfile().GetResources(); !proto.Equal(got, want) {
+		t.Fatalf("resources after retry = %v, want %v", got, want)
+	}
+	assertStored(want)
+
+	if _, err := update(&tidev1.Resources{MemoryMib: 12288, DiskGib: 96}, "resources.memory_mib", "resources.disk_gib"); err != nil {
+		t.Fatal(err)
+	}
+	assertStored(&tidev1.Resources{VcpuCount: 8, MemoryMib: 12288, DiskGib: 96})
+
+	replacement := &tidev1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 32}
+	if _, err := update(replacement, "resources"); err != nil {
+		t.Fatal(err)
+	}
+	assertStored(replacement)
+
+	_, err = update(&tidev1.Resources{}, "resources.memory_mib")
+	wantCode(t, "zero memory", err, connect.CodeInvalidArgument)
+	assertStored(replacement)
 }
 
 // Durations are stored in milliseconds, so a value with a smaller part is
