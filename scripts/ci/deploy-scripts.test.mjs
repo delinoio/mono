@@ -5,7 +5,7 @@
 // `deploy-provider.sh` and `deploy-targets.sh` (against stubbed CLIs),
 // `droplet-deploy.sh` (against stubbed `docker` and `curl`),
 // `start-caddy.sh` (against a stubbed `docker`),
-// `configure-docker-logs.sh` (against a stubbed `systemctl`) and
+// `configure-docker-logs.sh` (against stubbed `docker` and `systemctl`) and
 // `deploy-release.sh` and `release-recovery.sh` (against a local bare remote).
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
@@ -3886,55 +3886,81 @@ test("start-caddy rejects bad usage before any change", { skip }, (t) => {
 
 const configureLogs = join(root, "scripts/droplet/configure-docker-logs.sh");
 
-// Runs configure-docker-logs.sh on `<scratch>/docker/daemon.json` against a
-// stubbed `systemctl`. `content` is the original file (absent when
-// undefined). `readOnlyDirectory` removes the write permission of the
-// directory during the run, which makes the write fail for an unprivileged
-// user.
-function runLogs(t, { content, readOnlyDirectory, noDirectory } = {}) {
+// The configuration and the stub daemon's driver persist across runs.
+function logsFixture(
+  t,
+  { content, readOnlyDirectory, noDirectory, driver = "local" } = {},
+) {
   const dir = scratch(t);
   const bin = join(dir, "bin");
   mkdirSync(bin);
-  writeFileSync(join(dir, "calls.log"), "");
-  shellStub(bin, "systemctl");
+  const calls = join(dir, "calls.log");
+  writeFileSync(join(dir, "driver"), driver);
+  shellStub(
+    bin,
+    "docker",
+    `[[ -z "$DOCKER_CONTEXT" && "$*" == "--host unix:///var/run/docker.sock info --format {{.LoggingDriver}}" ]] || exit 2
+driver="$(< "$STUB_DIR/driver")"
+[[ -n "$driver" ]] || exit 1
+printf '%s\\n' "$driver"`,
+  );
+  shellStub(
+    bin,
+    "systemctl",
+    `[[ "$*" == "restart docker" ]] || exit 2
+if [[ "$STUB_RESTART_STATUS" != 0 ]]; then
+  exit "$STUB_RESTART_STATUS"
+fi
+printf '%s' "$STUB_RESTARTED_DRIVER" > "$STUB_DIR/driver"`,
+  );
   const configDirectory = join(dir, "docker");
   if (!noDirectory) mkdirSync(configDirectory);
   const config = join(configDirectory, "daemon.json");
   if (content !== undefined) writeFileSync(config, content, { mode: 0o600 });
-  if (readOnlyDirectory) chmodSync(configDirectory, 0o555);
-  const env = {
-    ...baseEnv,
-    PATH: `${bin}${delimiter}${baseEnv.PATH}`,
-    STUB_DIR: dir,
-  };
-  const result = spawnSync("bash", [configureLogs, config], {
-    encoding: "utf8",
-    env,
-  });
-  // Restore the permission now, so the scratch directory can be removed.
-  if (readOnlyDirectory) chmodSync(configDirectory, 0o755);
+
   return {
-    ...result,
-    config,
-    read: () => readFileSync(config, "utf8"),
-    leftovers: () =>
-      existsSync(configDirectory)
-        ? readdirSync(configDirectory).filter((name) => name !== "daemon.json")
-        : [],
-    calls: readFileSync(join(dir, "calls.log"), "utf8")
-      .trim()
-      .split("\n")
-      .filter(Boolean),
+    run({ restartStatus = 0, restartedDriver = "local" } = {}) {
+      writeFileSync(calls, "");
+      if (readOnlyDirectory) chmodSync(configDirectory, 0o555);
+      const result = spawnSync("bash", [configureLogs, config], {
+        encoding: "utf8",
+        env: {
+          ...baseEnv,
+          PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+          DOCKER_CONTEXT: "remote-context",
+          DOCKER_HOST: "tcp://remote.example:2375",
+          STUB_DIR: dir,
+          STUB_RESTART_STATUS: String(restartStatus),
+          STUB_RESTARTED_DRIVER: restartedDriver,
+        },
+      });
+      // Restore the permission now, so the scratch directory can be removed.
+      if (readOnlyDirectory) chmodSync(configDirectory, 0o755);
+      return {
+        ...result,
+        config,
+        read: () => readFileSync(config, "utf8"),
+        leftovers: () =>
+          existsSync(configDirectory)
+            ? readdirSync(configDirectory).filter(
+                (name) => name !== "daemon.json",
+              )
+            : [],
+        calls: readFileSync(calls, "utf8").trim().split("\n").filter(Boolean),
+      };
+    },
   };
 }
 
 const restartDocker = "systemctl restart docker";
+const queryLogDriver =
+  "docker --host unix:///var/run/docker.sock info --format {{.LoggingDriver}}";
 
 test("configure-docker-logs creates a missing file", { skip }, (t) => {
-  const result = runLogs(t);
+  const result = logsFixture(t).run();
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.read()), { "log-driver": "local" });
-  assert.deepEqual(result.calls, [restartDocker]);
+  assert.deepEqual(result.calls, [restartDocker, queryLogDriver]);
   assert.deepEqual(result.leftovers(), []);
 });
 
@@ -3949,22 +3975,26 @@ test(
       "log-opts": { "max-size": "10m" },
       "default-address-pools": [{ base: "10.10.0.0/16", size: 24 }],
     };
-    const first = runLogs(t, { content: JSON.stringify(original) });
+    const fixture = logsFixture(t, {
+      content: JSON.stringify(original),
+      driver: "json-file",
+    });
+    const first = fixture.run();
     assert.equal(first.status, 0, first.stderr);
     assert.deepEqual(JSON.parse(first.read()), {
       ...original,
       "log-driver": "local",
     });
-    assert.deepEqual(first.calls, [restartDocker]);
+    assert.deepEqual(first.calls, [restartDocker, queryLogDriver]);
     assert.equal(statSync(first.config).mode & 0o777, 0o600);
     assert.deepEqual(first.leftovers(), []);
 
     // A second run on the written file changes nothing and restarts nothing.
     const written = first.read();
-    const second = runLogs(t, { content: written });
+    const second = fixture.run();
     assert.equal(second.status, 0, second.stderr);
     assert.equal(second.read(), written);
-    assert.deepEqual(second.calls, []);
+    assert.deepEqual(second.calls, [queryLogDriver]);
   },
 );
 
@@ -3974,13 +4004,15 @@ test(
     skip,
   },
   (t) => {
-    const result = runLogs(t, { content: '{"data-root": "/mnt/docker"}' });
+    const result = logsFixture(t, {
+      content: '{"data-root": "/mnt/docker"}',
+    }).run();
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.read()), {
       "data-root": "/mnt/docker",
       "log-driver": "local",
     });
-    assert.deepEqual(result.calls, [restartDocker]);
+    assert.deepEqual(result.calls, [restartDocker, queryLogDriver]);
   },
 );
 
@@ -3990,10 +4022,89 @@ test(
   (t) => {
     // Unusual formatting, key order and an extra setting must all stay.
     const content = '{"data-root":"/x",   "log-driver":"local"}\n\n';
-    const result = runLogs(t, { content });
+    const result = logsFixture(t, { content }).run();
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.read(), content);
-    assert.deepEqual(result.calls, []);
+    assert.deepEqual(result.calls, [queryLogDriver]);
+  },
+);
+
+test(
+  "configure-docker-logs applies an unchanged file after an interruption",
+  { skip },
+  (t) => {
+    const content = '{"data-root":"/x",   "log-driver":"local"}\n\n';
+    for (const driver of ["json-file", ""]) {
+      const fixture = logsFixture(t, { content, driver });
+      const first = fixture.run();
+      assert.equal(first.status, 0, first.stderr);
+      assert.equal(first.read(), content);
+      assert.deepEqual(first.calls, [
+        queryLogDriver,
+        restartDocker,
+        queryLogDriver,
+      ]);
+
+      const second = fixture.run();
+      assert.equal(second.status, 0, second.stderr);
+      assert.equal(second.read(), content);
+      assert.deepEqual(second.calls, [queryLogDriver]);
+    }
+  },
+);
+
+test(
+  "configure-docker-logs recovers on a rerun after a failed restart",
+  { skip },
+  (t) => {
+    const fixture = logsFixture(t, {
+      content: '{"log-driver":"json-file","data-root":"/srv/docker"}',
+      driver: "json-file",
+    });
+    const first = fixture.run({ restartStatus: 1 });
+    assert.notEqual(first.status, 0);
+    assert.match(first.stderr, /could not restart Docker/);
+    assert.deepEqual(first.calls, [restartDocker]);
+    const written = first.read();
+    assert.deepEqual(JSON.parse(written), {
+      "log-driver": "local",
+      "data-root": "/srv/docker",
+    });
+
+    const second = fixture.run();
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(second.read(), written);
+    assert.deepEqual(second.calls, [
+      queryLogDriver,
+      restartDocker,
+      queryLogDriver,
+    ]);
+  },
+);
+
+test(
+  "configure-docker-logs fails if a restart does not confirm local",
+  { skip },
+  (t) => {
+    const content = '{"log-driver":"local"}\n';
+    for (const [restartedDriver, diagnostic] of [
+      ["", /could not read Docker's active log driver .* after restart/],
+      [
+        "json-file",
+        /Docker reports log driver 'json-file' after restart; expected local/,
+      ],
+    ]) {
+      const fixture = logsFixture(t, { content, driver: "json-file" });
+      const result = fixture.run({ restartedDriver });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, diagnostic);
+      assert.equal(result.read(), content);
+      assert.deepEqual(result.calls, [
+        queryLogDriver,
+        restartDocker,
+        queryLogDriver,
+      ]);
+    }
   },
 );
 
@@ -4010,7 +4121,7 @@ test(
       "null",
       "42",
     ]) {
-      const result = runLogs(t, { content });
+      const result = logsFixture(t, { content }).run();
       const label = JSON.stringify(content);
       assert.notEqual(result.status, 0, label);
       assert.match(result.stderr, /error: .*daemon\.json/, label);
@@ -4027,7 +4138,7 @@ test(
   (t) => {
     // The directory of a missing configuration directory makes the write
     // fail for every user, root included.
-    const missing = runLogs(t, { noDirectory: true });
+    const missing = logsFixture(t, { noDirectory: true }).run();
     assert.notEqual(missing.status, 0);
     assert.match(missing.stderr, /cannot write .*daemon\.json/);
     assert.deepEqual(missing.calls, []);
@@ -4036,7 +4147,7 @@ test(
     // user; root ignores directory permissions.
     if (process.getuid?.() === 0) return;
     const content = '{"data-root": "/mnt/docker"}';
-    const result = runLogs(t, { content, readOnlyDirectory: true });
+    const result = logsFixture(t, { content, readOnlyDirectory: true }).run();
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /cannot write .*daemon\.json/);
     assert.match(result.stderr, /was not changed and Docker was not restarted/);

@@ -24,9 +24,10 @@
 #     Docker.
 # The new content goes to a temporary file in the same directory, which
 # replaces the configuration with one rename, so a failed write leaves the
-# original file intact. Docker restarts (`systemctl restart docker`) only
-# after a successful write; an unchanged file causes no restart. An existing
-# file keeps its permission bits and owner.
+# original file intact. An existing file keeps its permission bits and owner.
+# After a successful write, restart Docker and verify its active log driver.
+# For an unchanged file, check the active driver first. Restart if the check
+# fails or reports another driver, for example after an interrupted run.
 #
 # The JSON handling needs python3, which Ubuntu 24.04 images include; the
 # script adds no package.
@@ -137,16 +138,38 @@ except OSError:
 sys.exit(10)
 PY
 
+active_log_driver() {
+  # Query the system daemon even if the caller has selected another context.
+  DOCKER_CONTEXT= docker --host unix:///var/run/docker.sock info --format '{{.LoggingDriver}}'
+}
+
 case "$status" in
   0)
-    echo "Docker already uses the local log driver; $config is unchanged."
+    if driver="$(active_log_driver 2>/dev/null)" && [[ "$driver" == local ]]; then
+      echo "Docker already uses the local log driver; $config is unchanged."
+      exit 0
+    fi
+    echo "$config already sets the local log driver; restarting Docker to apply it."
     ;;
   10)
     echo "Set the local log driver in $config; restarting Docker."
-    systemctl restart docker
     ;;
   *)
     echo "error: $config was not changed and Docker was not restarted." >&2
     exit 1
     ;;
 esac
+
+if ! systemctl restart docker; then
+  echo "error: could not restart Docker to apply the local log driver from $config." >&2
+  exit 1
+fi
+if ! driver="$(active_log_driver)"; then
+  echo "error: could not read Docker's active log driver from the local socket after restart." >&2
+  exit 1
+fi
+if [[ "$driver" != local ]]; then
+  echo "error: Docker reports log driver ${driver@Q} after restart; expected local." >&2
+  exit 1
+fi
+echo "Docker uses the local log driver."
