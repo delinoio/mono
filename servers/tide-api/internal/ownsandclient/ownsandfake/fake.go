@@ -51,6 +51,7 @@ type Fake struct {
 	// (for example to stall a call until its context ends); its error is
 	// the call's error.
 	createHook func(context.Context, *ownsandv1.CreateSandboxRequest) error
+	deleteHook func(ctx context.Context) error
 }
 
 // Org is one fake OwnSand organization.
@@ -366,7 +367,23 @@ func (c *client) GetSandbox(ctx context.Context, sandboxID string) (*ownsandv1.S
 	return proto.Clone(s.sb).(*ownsandv1.Sandbox), nil
 }
 
+// SetDeleteHook sets the hook that runs before each DeleteSandbox call. The
+// hook runs without the fake lock. Passing nil removes it.
+func (f *Fake) SetDeleteHook(fn func(ctx context.Context) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteHook = fn
+}
+
 func (c *client) DeleteSandbox(ctx context.Context, sandboxID string) (*ownsandv1.Sandbox, error) {
+	c.f.mu.Lock()
+	hook := c.f.deleteHook
+	c.f.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx); err != nil {
+			return nil, err
+		}
+	}
 	o, s, err := c.sandbox("DeleteSandbox", sandboxID)
 	if err != nil {
 		return nil, err

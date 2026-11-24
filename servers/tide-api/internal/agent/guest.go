@@ -47,7 +47,7 @@ func Command(guest tidev1.GuestOs, script string) []string {
 // POSIX single-quoted string, or a PowerShell single-quoted string.
 func Quote(guest tidev1.GuestOs, s string) string {
 	if IsWindows(guest) {
-		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+		return work.QuotePowerShell(s)
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

@@ -25,10 +25,18 @@ import {
 } from "@connectrpc/connect";
 import { createQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
-import { AuditService } from "@delino/tide-protos/v1/audit_pb";
+import { AuditAction, AuditService } from "@delino/tide-protos/v1/audit_pb";
 import { Role } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
-import { RunnerProfileService } from "@delino/tide-protos/v1/runner_profile_pb";
+import {
+  type ListRunnerProfilesRequest,
+  RunnerProfileService,
+} from "@delino/tide-protos/v1/runner_profile_pb";
+import {
+  type ListRequestsRequest,
+  type ListRunnersRequest,
+  WorkService,
+} from "@delino/tide-protos/v1/work_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
@@ -68,6 +76,7 @@ function renderConsole(
     isAuthenticated: signedIn,
     userId: signedIn ? MOCK_USER : undefined,
     signIn: options.signIn ?? (async () => {}),
+    signInFailed: false,
     signOut: async () => {},
     getAccessToken: async () => "token",
   };
@@ -132,18 +141,26 @@ describe("organizations", () => {
     const list = await screen.findByRole("list", {
       name: "Your organizations",
     });
-    const rows = within(list).getAllByRole("listitem");
+    // Use the list structure for bulk checks so the full page fixture does
+    // not require computing hundreds of accessible names in happy-dom.
+    const rows = list.querySelectorAll("li");
     expect(rows).toHaveLength(201);
     expect(rows[0].textContent).toContain("Acme Robotics");
     expect(rows[199].textContent).toContain("Fixture organization 200");
     expect(rows[200].textContent).toContain("Globex");
-    expect(within(list).getAllByRole("link", { name: /Globex/ })).toHaveLength(
-      1,
-    );
+    expect(
+      list.querySelectorAll(`a[href="/orgs/${MOCK_IDS.globex}"]`),
+    ).toHaveLength(1);
 
-    await click(within(list).getByRole("link", { name: /Acme Robotics/ }));
-    await click(await screen.findByRole("combobox", { name: "Organization" }));
-    await click(await screen.findByRole("option", { name: "Globex" }));
+    fireEvent.click(
+      within(rows[0]).getByRole("link", { name: /Acme Robotics/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("combobox", { name: "Organization" }),
+    );
+    fireEvent.click(
+      await screen.findByText("Globex", { selector: '[role="option"] *' }),
+    );
 
     expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.globex}`);
     expect(
@@ -738,6 +755,113 @@ describe("GitHub setup callback", () => {
 });
 
 describe("runner profiles", () => {
+  test("follows the token after a full second page to an empty terminal page", async () => {
+    const mock = createMockTransport({ runnerProfileCount: 400 });
+    const pages: ListRunnerProfilesRequest[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...args) {
+        if (
+          method.name === RunnerProfileService.method.listRunnerProfiles.name
+        ) {
+          pages.push(args[3] as ListRunnerProfilesRequest);
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, { transport });
+
+    const list = await screen.findByRole("list", { name: "Runner profiles" });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(400);
+    expect(rows[0]?.textContent).toContain("codex-linux");
+    expect(rows[399]?.textContent).toContain("linux-build");
+    expect(
+      pages.map(({ organizationId, pageSize, pageToken }) => [
+        organizationId,
+        pageSize,
+        pageToken,
+      ]),
+    ).toEqual([
+      [MOCK_IDS.acme, 200, ""],
+      [MOCK_IDS.acme, 200, "200"],
+      [MOCK_IDS.acme, 200, "400"],
+    ]);
+  });
+
+  test("keeps work visible after a continuation fails and retries the full list", async () => {
+    const mock = createMockTransport({ runnerProfileCount: 201 });
+    const pages: string[] = [];
+    const selectedProfiles: string[] = [];
+    let fail = true;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (
+          method.name === RunnerProfileService.method.listRunnerProfiles.name
+        ) {
+          const { pageSize, pageToken } = args[3] as ListRunnerProfilesRequest;
+          if (pageSize === MAX_PAGE_SIZE) {
+            pages.push(pageToken);
+            if (pageToken !== "" && fail) {
+              fail = false;
+              throw new ConnectError("continuation failed", Code.Internal);
+            }
+          }
+        }
+        if (
+          method.name === WorkService.method.listRequests.name ||
+          method.name === WorkService.method.listRunners.name
+        ) {
+          const { runnerProfileId } = args[3] as
+            ListRequestsRequest | ListRunnersRequest;
+          if (runnerProfileId) selectedProfiles.push(runnerProfileId);
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}/requests`, {
+      transport,
+      staleTime: 10_000,
+    });
+
+    const error = (
+      await screen.findByText(/^Could not load runner profiles/)
+    ).closest<HTMLElement>('[role="alert"]')!;
+    const requests = await screen.findByRole("table", { name: "Requests" });
+    const waitingJob = within(requests).getByRole("row", {
+      name: /test \(ubuntu\)/,
+    });
+    expect(within(waitingJob).queryByText("linux-build")).toBeNull();
+    const filter = screen.getByRole<HTMLButtonElement>("combobox", {
+      name: "Runner profile",
+    });
+    expect(filter.disabled).toBe(true);
+
+    await click(within(error).getByRole("button", { name: "Try again" }));
+    expect(await within(waitingJob).findByText("linux-build")).toBeTruthy();
+    expect(filter.disabled).toBe(false);
+    await click(filter);
+    await click(await screen.findByRole("option", { name: "linux-build" }));
+
+    await click(screen.getByRole("link", { name: "Runners" }));
+    const runners = await screen.findByRole("table", { name: "Runners" });
+    expect(within(runners).getAllByText("linux-build")).toHaveLength(2);
+    await click(screen.getByRole("combobox", { name: "Runner profile" }));
+    await click(await screen.findByRole("option", { name: "linux-build" }));
+
+    await click(screen.getByRole("link", { name: "Overview" }));
+    const queue = await screen.findByRole("table", {
+      name: "Waiting requests",
+    });
+    expect(within(queue).getByText("linux-build")).toBeTruthy();
+    expect(pages).toEqual(["", "200", "", "200"]);
+    expect(selectedProfiles).toEqual([
+      MOCK_IDS.linuxProfile,
+      MOCK_IDS.linuxProfile,
+    ]);
+  });
+
   test("shows the runs-on label of GitHub job profiles", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
     const label = await screen.findByLabelText("runs-on label of linux-build");
@@ -937,7 +1061,130 @@ describe("overview", () => {
   });
 });
 
+describe("audit", () => {
+  function auditActions(table: HTMLElement) {
+    return within(table)
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => within(row).getAllByRole("cell")[1]!.textContent);
+  }
+
+  test("shows the seeded audit events newest first", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/audit`);
+
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    expect(auditActions(table)).toEqual([
+      "Dev session created",
+      "OwnSand link set",
+    ]);
+  });
+
+  test("shows a request cancellation before the seeded audit events", async () => {
+    const transport = createMockTransport();
+    await createClient(WorkService, transport).cancelRequest({
+      organizationId: MOCK_IDS.acme,
+      requestId: MOCK_IDS.queuedJob,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/audit`, { transport });
+
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    expect(auditActions(table)).toEqual([
+      "Request canceled",
+      "Dev session created",
+      "OwnSand link set",
+    ]);
+  });
+
+  test("lists one audit event per page in newest-first order", async () => {
+    const client = createClient(AuditService, createMockTransport());
+    const organizationId = MOCK_IDS.acme;
+    const all = await client.listAuditEvents({ organizationId });
+    const first = await client.listAuditEvents({ organizationId, pageSize: 1 });
+    expect(first.nextPageToken).not.toBe("");
+    const second = await client.listAuditEvents({
+      organizationId,
+      pageSize: 1,
+      pageToken: first.nextPageToken,
+    });
+
+    expect(first.events.map((event) => event.action)).toEqual([
+      AuditAction.DEV_SESSION_CREATED,
+    ]);
+    expect(second.events.map((event) => event.action)).toEqual([
+      AuditAction.OWNSAND_LINK_SET,
+    ]);
+    expect([...first.events, ...second.events]).toEqual(all.events);
+    expect(second.nextPageToken).toBe("");
+  });
+});
+
 describe("work", () => {
+  test("shows active requests in queue order and can include ended requests", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/requests`);
+    const table = await screen.findByRole("table", { name: "Requests" });
+    const requestIds = (table: HTMLElement) =>
+      within(table)
+        .getAllByRole("row")
+        .slice(1)
+        .map((row) => row.querySelector("code")?.title);
+    const active = [
+      MOCK_IDS.runningJob,
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.queuedAgent,
+      MOCK_IDS.queuedDev,
+    ];
+    expect(requestIds(table)).toEqual(active);
+
+    await click(screen.getByRole("checkbox", { name: "Show ended requests" }));
+
+    const updatedTable = await screen.findByRole("table", {
+      name: "Requests",
+    });
+    expect(requestIds(updatedTable)).toEqual([...active, MOCK_IDS.endedJob]);
+  });
+
+  test("pages active requests before ended requests in descending end time", async () => {
+    const client = createClient(WorkService, createMockTransport());
+    const organizationId = MOCK_IDS.acme;
+    const time = Date.now();
+    const clock = rs.spyOn(Date, "now").mockReturnValue(time);
+    try {
+      await client.cancelRequest({
+        organizationId,
+        requestId: MOCK_IDS.queuedJob,
+      });
+      clock.mockReturnValue(time + 1);
+      await client.cancelRequest({
+        organizationId,
+        requestId: MOCK_IDS.queuedAgent,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+
+    const expected = [
+      MOCK_IDS.runningJob,
+      MOCK_IDS.queuedDev,
+      MOCK_IDS.queuedAgent,
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.endedJob,
+    ];
+    let pageToken = "";
+    for (const [index, requestId] of expected.entries()) {
+      const page = await client.listRequests({
+        organizationId,
+        includeEnded: true,
+        pageSize: 1,
+        pageToken,
+      });
+      expect(page.requests.map((request) => request.requestId)).toEqual([
+        requestId,
+      ]);
+      pageToken = page.nextPageToken;
+      expect(pageToken === "").toBe(index === expected.length - 1);
+    }
+  });
+
   test("canceling a request needs a confirmation", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/requests`);
     const table = await screen.findByRole("table", { name: "Requests" });

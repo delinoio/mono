@@ -54,7 +54,7 @@ func MemoryMiB() int64 {
 }
 
 // FreeDiskBytes returns the free bytes of the file system of dir that the
-// agent can use.
+// agent can use. Counts above math.MaxInt64 are clamped to math.MaxInt64.
 func FreeDiskBytes(dir string) (int64, error) {
 	return freeDiskBytes(dir)
 }

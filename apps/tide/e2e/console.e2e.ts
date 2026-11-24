@@ -24,6 +24,11 @@ describe("sign-in", () => {
     await expect(
       screen.getByRole("button", "Sign in with Delino"),
     ).toBeVisible();
+    await expect(
+      screen.getByText(
+        "Sign-in did not start. Check your connection and try again.",
+      ),
+    ).toBeHidden();
   });
 
   test("signs in and lists the organizations", async ({ app, screen }) => {
@@ -216,6 +221,55 @@ describe("overview", () => {
   });
 });
 
+describe("audit", () => {
+  test("shows the newest event first", async ({ app, browser, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/audit`);
+
+    await expect(screen.getByRole("table", "Audit events")).toBeVisible();
+    const actions = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          'table[aria-label="Audit events"] tbody td:nth-child(2)',
+        ),
+        (cell) => cell.textContent,
+      ),
+    );
+    expect(actions).toEqual(["Dev session created", "OwnSand link set"]);
+  });
+});
+
+describe("requests", () => {
+  test("shows active requests in queue order before ended requests", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/requests`);
+
+    await screen.getByRole("checkbox", "Show ended requests").tap();
+    await expect(screen.getByRole("table", "Requests")).toContainText("deploy");
+    const sources = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          'table[aria-label="Requests"] tbody td:nth-child(4)',
+        ),
+        (cell) => cell.textContent,
+      ),
+    );
+    expect(sources).toEqual([
+      "acme-robotics/firmware · build (ubuntu)",
+      "acme-robotics/firmware · test (ubuntu)",
+      "sess_codex_4711",
+      "—",
+      "acme-robotics/site · deploy",
+    ]);
+  });
+});
+
 describe("integrations", () => {
   test("keeps the integration edit dialog open after a duplicate rename", async ({
     app,
@@ -380,6 +434,86 @@ describe("integrations", () => {
 });
 
 describe("runner profiles", () => {
+  test("uses a later profile across pages and refreshes after profile changes", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+
+    const profiles = screen.getByRole("list", "Runner profiles");
+    const laterProfile = profiles.getByRole("listitem").filter({
+      hasText: "linux-build ·",
+    });
+    await expect(laterProfile).toBeVisible();
+    await expect(laterProfile.getByRole("button", "Delete")).toBeVisible();
+    expect(
+      await browser.evaluate(
+        () =>
+          document.querySelectorAll('ul[aria-label="Runner profiles"] > li')
+            .length,
+      ),
+    ).toBe(201);
+
+    await laterProfile.getByRole("button", "Edit").tap();
+    const edit = screen.getByRole("dialog", "Edit linux-build");
+    await edit.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("linux-build-renamed");
+    await edit.getByRole("button", "Save changes").tap();
+    await expect(laterProfile).toBeHidden();
+
+    for (const page of ["Requests", "Runners"]) {
+      await screen.getByRole("link", page).tap();
+      await expect(screen.getByRole("table", page)).toContainText(
+        "linux-build-renamed",
+      );
+      const filter = screen.getByRole("combobox", "Runner profile");
+      await filter.tap();
+      await screen.getByRole("option", "linux-build-renamed").tap();
+      await expect(filter).toContainText("linux-build-renamed");
+      await expect(screen.getByRole("table", page)).toContainText(
+        "linux-build-renamed",
+      );
+    }
+    await screen.getByRole("link", "Overview").tap();
+    await expect(screen.getByRole("table", "Waiting requests")).toContainText(
+      "linux-build-renamed",
+    );
+
+    await screen.getByRole("link", "Runner profiles").tap();
+    await screen.getByRole("combobox", "Organization").tap();
+    await screen.getByRole("option", "Northwind Labs").tap();
+    await expect(profiles).toContainText("mac-build");
+    await expect(profiles).not.toContainText("linux-build-renamed");
+
+    await screen.getByRole("combobox", "Organization").tap();
+    await screen.getByRole("option", "Acme Robotics").tap();
+    const renamedProfile = profiles.getByRole("listitem").filter({
+      hasText: "linux-build-renamed ·",
+    });
+    await renamedProfile.getByRole("button", "Delete").tap();
+    await screen
+      .getByRole("alertdialog", "Delete linux-build-renamed?")
+      .getByRole("button", "Delete profile")
+      .tap();
+    await expect(renamedProfile).toBeHidden();
+    await expect(
+      profiles.getByRole("listitem").filter({ hasText: "fixture-linux-198 ·" }),
+    ).toBeVisible();
+
+    await screen.getByRole("button", "Create runner profile").tap();
+    const create = screen.getByRole("dialog", "Create a runner profile");
+    await create.getByLabel("Name").tap();
+    await browser.keyboard.type("new-linux");
+    await create.getByRole("button", "Create profile").tap();
+    await expect(
+      profiles.getByRole("listitem").filter({ hasText: "new-linux ·" }),
+    ).toBeVisible();
+  });
+
   test("keeps the edit dialog open when a runner profile name already exists", async ({
     app,
     screen,

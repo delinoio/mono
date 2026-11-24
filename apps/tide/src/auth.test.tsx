@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-import { LogtoProvider } from "@logto/react";
+import { LogtoProvider, useLogto } from "@logto/react";
 import { afterEach, describe, expect, test } from "@rstest/core";
-import { act, cleanup, render } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { useEffect } from "react";
 import {
   LogtoBridge,
@@ -35,6 +41,55 @@ afterEach(() => {
 });
 
 describe("LogtoBridge", () => {
+  test("ignores an existing provider error before and after a successful sign-in attempt", async () => {
+    const providerError = new Error("Earlier provider error");
+    class SignedOutClient extends FakeLogtoClient {
+      isAuthenticated = async () => false;
+      fetchUserInfo = async () => {
+        throw providerError;
+      };
+    }
+    function Page() {
+      const auth = useAuth();
+      const { error, fetchUserInfo } = useLogto();
+      if (auth.isLoading) return null;
+      return (
+        <>
+          <button type="button" onClick={() => void fetchUserInfo()}>
+            Seed provider error
+          </button>
+          <button type="button" onClick={() => void auth.signIn()}>
+            Start sign-in
+          </button>
+          <p>{error?.message}</p>
+          {auth.signInFailed ? <p role="alert">Sign-in failed</p> : null}
+        </>
+      );
+    }
+    render(
+      <LogtoProvider
+        config={{ endpoint: "https://logto.test", appId: "app" }}
+        LogtoClientClass={SignedOutClient as never}
+      >
+        <LogtoBridge>
+          <Page />
+        </LogtoBridge>
+      </LogtoProvider>,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Seed provider error" }),
+    );
+    await screen.findByText(providerError.message);
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Start sign-in" }));
+    });
+    expect(screen.getByText(providerError.message)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   test("a token request does not unmount the page that made it", async () => {
     let mounts = 0;
     // Like the console routes: nothing below renders while `isLoading`.

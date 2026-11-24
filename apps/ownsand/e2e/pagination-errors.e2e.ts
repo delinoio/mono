@@ -4,10 +4,11 @@ import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
 
 const ACME = "0193a000-0000-7000-8000-000000000001";
+const NORTHWIND = "0193a000-0000-7000-8000-000000000002";
 
 const paginationTest = test.extend<{
   pagedList: {
-    open(method: string, path: string): Promise<void>;
+    open(method: string, path: string, hold?: boolean): Promise<void>;
     release(code: Code): Promise<void>;
     allowRetry(): Promise<void>;
     tokens(): Promise<string[]>;
@@ -15,17 +16,20 @@ const paginationTest = test.extend<{
 }>({
   pagedList: async ({ app, browser, screen }, use) => {
     await use({
-      async open(method, path) {
+      async open(method, path, hold = true) {
         await app.open("/");
         await screen.getByRole("button", "Sign in with Delino").tap();
         await expect(
           screen.getByRole("link", "Acme Robotics Owner"),
         ).toBeVisible();
-        await browser.evaluate((name) => {
-          sessionStorage.setItem("ownsand-e2e-paged-list", name);
-          sessionStorage.setItem("ownsand-e2e-page-error", "hold");
-          return true;
-        }, method);
+        await browser.evaluate(
+          ({ name, hold }) => {
+            sessionStorage.setItem("ownsand-e2e-paged-list", name);
+            if (hold) sessionStorage.setItem("ownsand-e2e-page-error", "hold");
+            return true;
+          },
+          { name: method, hold },
+        );
         await app.open(path);
       },
       async release(code) {
@@ -196,6 +200,118 @@ describe("continuation errors", () => {
         failedTokens.at(-1),
       ]);
       await app.screenshot("recovered-organizations");
+    },
+  );
+});
+
+describe("device inventory pagination", () => {
+  paginationTest(
+    "opens, places on and filters by a device beyond the first page",
+    async ({ app, browser, pagedList, screen }) => {
+      await pagedList.open("ListDevices", `/orgs/${ACME}/devices`, false);
+      const device = screen.getByRole("link", "Device 201");
+      await expect(device).toHaveCount(1);
+      await expect(
+        screen.getByRole("region", "Device list").getByRole("link"),
+      ).toHaveCount(201);
+      const path = await browser.evaluate(() => {
+        const link = [...document.links].find(
+          (a) => a.textContent === "Device 201",
+        )!;
+        link.scrollIntoView({ block: "center" });
+        return link.pathname;
+      });
+      await app.screenshot("device-from-second-page");
+
+      await device.tap();
+      await expect(browser).toHaveURL(path);
+      await expect(screen.getByRole("heading", "Device 201")).toBeVisible();
+
+      await screen.getByRole("link", "Sandboxes", { exact: true }).tap();
+      await screen.getByRole("button", "Create sandbox").tap();
+      const dialog = screen.getByRole("dialog", "Create a sandbox");
+      const placement = dialog.getByRole("combobox", "Device");
+      await expect(placement).toHaveText("Any device that fits");
+      await placement.tap();
+      const option = screen.getByRole("option", "Device 201 (Online)");
+      await expect(option).toHaveCount(1);
+      await expect(screen.getByRole("option")).toHaveCount(202);
+      await option.tap();
+      await expect(placement).toHaveText("Device 201 (Online)");
+      await app.screenshot("placement-on-second-page-device");
+      await dialog.getByRole("button", "Create", { exact: true }).tap();
+      await expect(browser).toHaveURL(/\/sandboxes\/[0-9a-f-]+$/);
+
+      await screen.getByRole("link", "Sandboxes", { exact: true }).tap();
+      await expect(screen.getByRole("cell", "Device 201")).toBeVisible();
+      const filter = screen.getByRole("combobox", "Device");
+      await expect(filter).toHaveText("All devices");
+      await filter.tap();
+      await expect(screen.getByRole("option", "Device 201")).toHaveCount(1);
+      await expect(screen.getByRole("option")).toHaveCount(202);
+      await screen.getByRole("option", "Device 201").tap();
+      await expect(screen.getByRole("cell", "build-box-1")).toBeHidden();
+      await expect(screen.getByRole("cell", "Device 201")).toBeVisible();
+    },
+  );
+
+  paginationTest(
+    "keeps loaded device choices, retries the cursor once and scopes results by organization",
+    async ({ app, browser, pagedList, screen }) => {
+      await pagedList.open("ListDevices", `/orgs/${ACME}/sandboxes`);
+      await expect(screen.getByText("Loading more devices")).toBeVisible();
+      await pagedList.release(Code.Unavailable);
+      const notice = screen.getByText("Some devices are not shown yet.");
+      await expect(notice).toBeVisible();
+      const filter = screen.getByRole("combobox", "Device");
+      await filter.tap();
+      await expect(screen.getByRole("option", "build-box-1")).toBeVisible();
+      await expect(screen.getByRole("option", "Device 201")).toBeHidden();
+      await browser.keyboard.press("Escape");
+
+      const dialog = screen.getByRole("dialog", "Create a sandbox");
+      await screen.getByRole("button", "Create sandbox").tap();
+      const placement = dialog.getByRole("combobox", "Device");
+      await placement.tap();
+      await expect(
+        screen.getByRole("option", "build-box-1 (Online)"),
+      ).toBeVisible();
+      await browser.keyboard.press("Escape");
+      await app.screenshot("partial-device-picker");
+      const failedTokens = await pagedList.tokens();
+      const continuations = failedTokens.filter((token) => token !== "");
+      const token = continuations[0];
+      expect(token).toBeTruthy();
+      expect(continuations).toEqual([token, token, token]);
+
+      await pagedList.allowRetry();
+      await dialog.getByRole("button", "Try again").tap();
+      await expect(notice).toBeHidden();
+      await placement.tap();
+      const lastDevice = screen.getByRole("option", "Device 201 (Online)");
+      await expect(lastDevice).toHaveCount(1);
+      expect(await pagedList.tokens()).toEqual([...failedTokens, token]);
+      await lastDevice.tap();
+      await dialog.getByRole("button", "Cancel").tap();
+      await expect(screen.getByRole("button", "Create sandbox")).toBeFocused();
+
+      const northwindSandboxes = `/orgs/${NORTHWIND}/sandboxes`;
+      await browser.evaluate((path) => {
+        window.history.pushState(null, "", path);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+        return true;
+      }, northwindSandboxes);
+      await expect(browser).toHaveURL(northwindSandboxes);
+      await expect(screen.getByRole("heading", "Sandboxes")).toBeVisible();
+      await filter.tap();
+      await expect(screen.getByRole("option", "All devices")).toBeVisible();
+      await expect(screen.getByRole("option", "build-box-1")).toBeHidden();
+      await expect(screen.getByRole("option", "Device 201")).toBeHidden();
+      const organizationTokens = (await pagedList.tokens()).slice(
+        failedTokens.length + 1,
+      );
+      expect(organizationTokens.length).toBeGreaterThan(0);
+      expect(organizationTokens.every((token) => token === "")).toBe(true);
     },
   );
 });

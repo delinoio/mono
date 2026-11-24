@@ -93,9 +93,9 @@ func (c *Control) runExportVerifier(ctx context.Context) {
 // RunExportVerifyOnce makes one verifier pass over the EXPORTED snapshots that
 // are not verified yet. A row without export_verify_after (exported before
 // the migration or by a release that does not set it) gets it set to now plus
-// the upload URL lifetime and is not listed in this pass. An R2 failure, or a
-// control plane without R2, changes nothing: a failed export would otherwise
-// follow from an outage.
+// the upload URL lifetime and is not listed in this pass. A listing or apply
+// error leaves the export unverified so the worker can retry it on a later
+// pass.
 func (c *Control) RunExportVerifyOnce(ctx context.Context) {
 	s := c.S
 	if s.Objects == nil {
@@ -133,11 +133,11 @@ func (c *Control) RunExportVerifyOnce(ctx context.Context) {
 	}
 }
 
-// claimExportVerifyJobs sets the verification time of the rows that have none
-// and returns the rows whose time passed. It holds the rows with
-// FOR UPDATE SKIP LOCKED only while it reads them; the R2 listing runs
-// without a lock, and applyExportVerification locks the row again and checks
-// that it still names the same attempt.
+// claimExportVerifyJobs schedules the first check for rows without a deadline
+// and returns jobs whose deadline has passed. It advances the next claim time
+// before releasing the row locks so errors cannot keep other due jobs waiting.
+// The R2 listing runs outside the transaction. When applying a result, the
+// verifier locks the row again and checks that it still names the same attempt.
 func (s *Service) claimExportVerifyJobs(ctx context.Context) ([]exportVerifyJob, error) {
 	var jobs []exportVerifyJob
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
@@ -167,15 +167,17 @@ func (s *Service) claimExportVerifyJobs(ctx context.Context) ([]exportVerifyJob,
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		retryAfter := now.Add(s.exportVerifyPoll())
 		for _, r := range due {
+			after := retryAfter
 			if r.after == nil {
-				// First sight of a row that no verification time was set for:
-				// the signed URLs of its attempt may be valid for another
-				// lifetime, so wait for it before the first listing.
-				after := now.Add(s.exportVerifyDelay())
-				if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_verify_after = $2 WHERE snapshot_id = $1", r.snapshotID, after); err != nil {
-					return err
-				}
+				// Upload URLs can still be valid for a full lifetime.
+				after = now.Add(s.exportVerifyDelay())
+			}
+			if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_verify_after = $2 WHERE snapshot_id = $1", r.snapshotID, after); err != nil {
+				return err
+			}
+			if r.after == nil {
 				s.Logger.InfoContext(ctx, "export_verification_scheduled", slog.String("snapshot_id", r.snapshotID), slog.Time("verify_after", after))
 				continue
 			}

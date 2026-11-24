@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, describe, expect, rs, test } from "@rstest/core";
-import { SnapshotState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  SandboxState,
+  SnapshotState,
+} from "@delino/ownsand-protos/v1/common_pb";
 import {
   CLEANUP_STEP_TIMEOUT_MS,
   type CleanupStep,
   runCleanup,
   type SnapshotStatus,
+  waitForSandboxState,
   waitForSnapshotReady,
   withBillingCleanup,
   withCleanup,
@@ -13,6 +17,109 @@ import {
 import { VirtualClock } from "./virtual-clock.ts";
 
 const snap = (state: SnapshotState): SnapshotStatus => ({ state });
+
+describe("waitForSandboxState", () => {
+  test.each([
+    [SandboxState.RUNNING, SandboxState.PAUSED],
+    [SandboxState.PAUSED, SandboxState.RUNNING],
+  ])(
+    "returns when state changes from %s to %s within the deadline",
+    async (initial, target) => {
+      const clock = new VirtualClock();
+      const get = rs.fn(async () => ({ state: initial }));
+      get.mockResolvedValueOnce({ state: initial });
+      get.mockResolvedValueOnce({ state: target });
+
+      await clock.run(waitForSandboxState({ get }, target, { clock }));
+
+      expect(get).toHaveBeenCalledTimes(2);
+      expect(clock.now()).toBe(200);
+    },
+  );
+
+  test.each([SandboxState.PAUSED, SandboxState.RUNNING])(
+    "aborts a stalled first read for %s at the deadline and reaches cleanup",
+    async (target) => {
+      const clock = new VirtualClock();
+      const reply = Promise.withResolvers<{ state: SandboxState }>();
+      const get = rs.fn((_signal: AbortSignal) => reply.promise);
+      const cleanup = rs.fn();
+      const wait = waitForSandboxState({ get }, target, { clock }).finally(
+        cleanup,
+      );
+
+      await expect(clock.run(wait)).rejects.toThrow(
+        `did not reach ${SandboxState[target]} within 60000 ms: last state unknown`,
+      );
+      expect(clock.now()).toBe(60_000);
+      expect(get.mock.calls[0]?.[0].aborted).toBe(true);
+      expect(cleanup).toHaveBeenCalledOnce();
+
+      reply.resolve({ state: target });
+      await clock.advance(200);
+      expect(get).toHaveBeenCalledOnce();
+    },
+  );
+
+  test.each([60_000, 500])(
+    "stops polling at %s ms and reports the last state",
+    async (timeoutMs) => {
+      const clock = new VirtualClock();
+      const get = rs.fn(async () => ({ state: SandboxState.RUNNING }));
+      const wait = waitForSandboxState({ get }, SandboxState.PAUSED, {
+        clock,
+        timeoutMs,
+      });
+
+      await expect(clock.run(wait)).rejects.toThrow(
+        `did not reach PAUSED within ${timeoutMs} ms: last state RUNNING`,
+      );
+      expect(clock.now()).toBe(timeoutMs);
+      const expectedReads = Math.ceil(timeoutMs / 200);
+      expect(get).toHaveBeenCalledTimes(expectedReads);
+      await clock.advance(200);
+      expect(get).toHaveBeenCalledTimes(expectedReads);
+    },
+  );
+
+  test.each(["success", "error"])(
+    "rejects an RPC %s at the deadline before the timer callback runs",
+    async (outcome) => {
+      const clock = new VirtualClock();
+      const sleep = clock.sleep.bind(clock);
+      rs.spyOn(clock, "sleep").mockImplementation((ms, signal) =>
+        sleep(ms + 1, signal),
+      );
+      const get = rs.fn(async (signal: AbortSignal) => {
+        await sleep(60_000, signal);
+        if (outcome === "error") throw new Error("late RPC error");
+        return { state: SandboxState.PAUSED };
+      });
+
+      await expect(
+        clock.run(waitForSandboxState({ get }, SandboxState.PAUSED, { clock })),
+      ).rejects.toThrow(
+        "did not reach PAUSED within 60000 ms: last state unknown",
+      );
+      expect(clock.now()).toBe(60_000);
+      expect(get.mock.calls[0]?.[0].aborted).toBe(true);
+    },
+  );
+
+  test("preserves an RPC error that arrives before the deadline", async () => {
+    const clock = new VirtualClock();
+    const failure = new Error("GetSandbox failed");
+    const get = rs.fn(async () => {
+      throw failure;
+    });
+
+    await expect(
+      clock.run(waitForSandboxState({ get }, SandboxState.RUNNING, { clock })),
+    ).rejects.toBe(failure);
+    expect(get).toHaveBeenCalledOnce();
+    expect(clock.now()).toBe(0);
+  });
+});
 
 describe("waitForSnapshotReady", () => {
   test("returns once the snapshot is READY", async () => {
