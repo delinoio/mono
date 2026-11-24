@@ -653,8 +653,9 @@ export function createFakeApi(): FakeApi {
       },
       async getInvoiceUrl(req) {
         record("GetInvoiceUrl", req);
-        await api.gates.get("GetInvoiceUrl");
         load(req.billingAccountId, PAYMENT_ROLES);
+        // Hold the authorized response so access can change before delivery.
+        await api.gates.get("GetInvoiceUrl");
         return {
           invoiceUrl: `https://sandbox-invoice.paddle.test/${req.paddleTransactionId}.pdf`,
         };
