@@ -35,6 +35,8 @@ Layout, following the `accounts-api` server conventions:
 
 ## Interfaces and Contracts
 
+List handlers validate enum filters after authorization and before querying the list. See the [Connect RPC API contract](protos-tide-api-contract.md#general-rules).
+
 - Business APIs: the public services of the [protos contract](protos-tide-api-contract.md).
 - Webhook endpoints: see [Webhooks](#webhooks).
 - Operational endpoints: `GET /healthz` without authentication returns `200` with `{"status":"ok"}` while the process can serve HTTP requests. `GET /metrics` on `METRICS_ADDR` serves the metrics in the Prometheus format; see [Metrics](#metrics).

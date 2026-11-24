@@ -418,9 +418,13 @@ func (h *Handler) ListRunnerProfiles(ctx context.Context, req *connect.Request[t
 	if err != nil {
 		return nil, err
 	}
+	kind := req.Msg.GetWorkloadKind()
+	if err := api.DefinedEnum("workload_kind", "WorkloadKind", kind, tidev1.WorkloadKind_name); err != nil {
+		return nil, err
+	}
 	rows, err := s.DB.Pool.Query(ctx, "SELECT "+profileColumns+` FROM runner_profiles
 		WHERE organization_id = $1 AND runner_profile_id > $2 AND ($3 = 0 OR workload_kind = $3) ORDER BY runner_profile_id LIMIT $4`,
-		c.OrganizationID, api.AfterKey(after), int16(req.Msg.GetWorkloadKind()), limit)
+		c.OrganizationID, api.AfterKey(after), int16(kind), limit)
 	if err != nil {
 		return nil, s.Internal(ctx, "list runner profiles", err)
 	}

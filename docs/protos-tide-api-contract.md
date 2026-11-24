@@ -23,6 +23,7 @@ This contract owns the Connect RPC schemas of [`tide`](project-tide.md) in the p
 - Identifiers are UUID v7 values in canonical text form in `string` fields named `<entity>_id`. The tide link of a GitHub installation uses `installation_id`, because `github_installation_id` is the GitHub numeric installation ID. User ID fields (`user_id`) hold the Logto `sub` unchanged. OwnSand identifiers use the field names `ownsand_organization_id`, `ownsand_sandbox_id`, `ownsand_device_id` and `ownsand_template_id`. GitHub numeric identifiers use `int64` fields named `github_<entity>_id`.
 - Times use `google.protobuf.Timestamp`. Durations use `google.protobuf.Duration`. Sizes use `int64` fields with a unit suffix (`memory_mib`, `disk_gib`).
 - Every enum has a zero value `<ENUM>_UNSPECIFIED`. The server rejects `UNSPECIFIED` in a required enum field with `invalid_argument`.
+- If a list filter contains an undefined enum number, the server returns `invalid_argument` and names the field.
 - List RPCs use `page_size` (default 50, maximum 200) and an opaque `page_token`.
 - Every public RPC is unary or server-streaming. tide has no client-streaming or bidirectional RPC.
 - Errors use Connect error codes. Detail messages never contain credentials.
