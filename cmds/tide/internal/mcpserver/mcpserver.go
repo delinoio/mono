@@ -457,20 +457,23 @@ type execResult struct {
 	MissingEnv []string `json:"missing_env,omitempty"`
 }
 
-// window keeps the first headBytes and the last tailBytes of a stream.
+// window keeps the first headBytes and up to tailBytes after the last gap.
 type window struct {
-	from  int64
-	next  int64
-	head  []byte
-	tail  []byte
-	total int64
+	from    int64
+	next    int64
+	head    []byte
+	headEnd int64
+	tail    []byte
+	total   int64
 }
 
-func (w *window) add(data []byte) {
+func (w *window) add(offset int64, data []byte) {
+	w.next = offset + int64(len(data))
 	w.total += int64(len(data))
 	if room := headBytes - len(w.head); room > 0 {
 		n := min(room, len(data))
 		w.head = append(w.head, data[:n]...)
+		w.headEnd = offset + int64(n)
 		data = data[n:]
 	}
 	w.tail = append(w.tail, data...)
@@ -479,12 +482,20 @@ func (w *window) add(data []byte) {
 	}
 }
 
+func (w *window) skipTo(offset int64) {
+	if offset > w.next {
+		w.next = offset
+		// Keep the tail contiguous so its start is next minus its size.
+		w.tail = w.tail[:0]
+	}
+}
+
 func (w *window) output() Output {
 	o := Output{From: w.from, To: w.next}
 	kept := int64(len(w.head) + len(w.tail))
 	text := string(w.head) + string(w.tail)
 	if w.total > kept {
-		o.Omitted = &tide.ByteRange{From: w.from + int64(len(w.head)), To: w.next - int64(len(w.tail))}
+		o.Omitted = &tide.ByteRange{From: w.headEnd, To: w.next - int64(len(w.tail))}
 		text = string(w.head) + "\n[... output omitted ...]\n" + string(w.tail)
 	}
 	o.Text = strings.ToValidUTF8(text, "�")
@@ -523,22 +534,20 @@ func (c *collector) on(ev tide.ExecEvent) error {
 	c.once.Do(func() { close(c.confirmed) })
 	switch ev.Kind {
 	case tide.ExecEventStdout:
-		c.out.add(ev.Data)
-		c.out.next = ev.Offset + int64(len(ev.Data))
+		c.out.add(ev.Offset, ev.Data)
 	case tide.ExecEventStderr:
-		c.err.add(ev.Data)
-		c.err.next = ev.Offset + int64(len(ev.Data))
+		c.err.add(ev.Offset, ev.Data)
 	case tide.ExecEventOutputTruncated:
 		t := Truncated{}
 		if !ev.MissingStdout.Empty() {
 			r := ev.MissingStdout
 			t.MissingStdout = &r
-			c.out.next = max(c.out.next, r.To)
+			c.out.skipTo(r.To)
 		}
 		if !ev.MissingStderr.Empty() {
 			r := ev.MissingStderr
 			t.MissingStderr = &r
-			c.err.next = max(c.err.next, r.To)
+			c.err.skipTo(r.To)
 		}
 		c.truncated = append(c.truncated, t)
 	}
