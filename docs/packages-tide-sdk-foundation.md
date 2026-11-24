@@ -53,6 +53,7 @@ The SDKs give programs and the [CLI](cmds-tide-cli-foundation.md) typed access t
 - `WaitDevSession` polls `GetDevSession` every 2 seconds by default. When the caller context ends, it returns the last dev session that it read and the context error.
 - `Sync` returns `SyncResult` (uploaded, deleted and skipped counts, submodules, bytes sent, warnings). `Download` returns `DownloadResult` (local path, file count, bytes, warnings). Both report `TransferProgress`. SDK-side failures are `*connect.Error` values: `failed_precondition` wraps `*LimitError`, `*PathRuleError`, `ErrSyncLocked` and `ErrNotGitWorkTree`, `not_found` a missing guest path.
 - `go/tide/tidetest` is an in-memory fake of `tide-api` for tests. Its guest is the local machine: exec runs local processes and file RPCs read and write local paths, so a test uses a local directory as the workspace path. It is not a sandbox.
+  - The fake tracks each `write_id` separately for each dev session. The first chunk binds the ID to the resolved destination. Requests that change that destination return `invalid_argument`, even after the write completes. A retry of the original final request returns the completed size.
 
 ### Go SDK sync and download rules
 
