@@ -599,7 +599,7 @@ func (a *apiKeyService) CreateApiKey(_ context.Context, req *connect.Request[tid
 		CreatedAt: timestamppb.Now(), ExpiresAt: req.Msg.GetExpiresAt(),
 	}
 	a.s.apiKeys = append(a.s.apiKeys, k)
-	return connect.NewResponse(&tidev1.CreateApiKeyResponse{ApiKey: proto.CloneOf(k), Secret: "tide_secret-" + k.GetApiKeyId()}), nil
+	return connect.NewResponse(&tidev1.CreateApiKeyResponse{ApiKey: proto.CloneOf(k), Secret: issuedAPIKeyPrefix + k.GetApiKeyId()}), nil
 }
 
 func (a *apiKeyService) ListApiKeys(_ context.Context, req *connect.Request[tidev1.ListApiKeysRequest]) (*connect.Response[tidev1.ListApiKeysResponse], error) {
