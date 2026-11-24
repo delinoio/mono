@@ -221,6 +221,55 @@ describe("overview", () => {
   });
 });
 
+describe("audit", () => {
+  test("shows the newest event first", async ({ app, browser, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/audit`);
+
+    await expect(screen.getByRole("table", "Audit events")).toBeVisible();
+    const actions = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          'table[aria-label="Audit events"] tbody td:nth-child(2)',
+        ),
+        (cell) => cell.textContent,
+      ),
+    );
+    expect(actions).toEqual(["Dev session created", "OwnSand link set"]);
+  });
+});
+
+describe("requests", () => {
+  test("shows active requests in queue order before ended requests", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/requests`);
+
+    await screen.getByRole("checkbox", "Show ended requests").tap();
+    await expect(screen.getByRole("table", "Requests")).toContainText("deploy");
+    const sources = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          'table[aria-label="Requests"] tbody td:nth-child(4)',
+        ),
+        (cell) => cell.textContent,
+      ),
+    );
+    expect(sources).toEqual([
+      "acme-robotics/firmware · build (ubuntu)",
+      "acme-robotics/firmware · test (ubuntu)",
+      "sess_codex_4711",
+      "—",
+      "acme-robotics/site · deploy",
+    ]);
+  });
+});
+
 describe("integrations", () => {
   test("opens management actions for an integration on the next page", async ({
     app,
