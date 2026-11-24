@@ -103,10 +103,20 @@ func TestJobLifecycle(t *testing.T) {
 	}
 	// The JIT runner exits after its job: tide deletes the sandbox and keeps
 	// the request until the completed event.
+	restore := w.env.FailProgramExitCommits()
+	eventually(t, "one AttachExec call", func() bool { return w.os.Calls("AttachExec") == 1 })
 	w.progs.exit(r.GetOwnsandSandboxId())
+	eventually(t, "PostgreSQL rejecting the exit commit", func() bool {
+		return strings.Contains(w.env.Logs.String(), "injected program exit commit failure")
+	})
+	if w.runner(t, r.GetRunnerId()).GetState() != tidev1.RunnerState_RUNNER_STATE_BUSY ||
+		w.requestOfJob(t, 9001).GetState() != tidev1.RequestState_REQUEST_STATE_RUNNING || w.os.Active(w.osOrg) != 1 {
+		t.Fatal("the failed exit commit changed the runner or request")
+	}
+	restore()
 	eventually(t, "runner deleted", func() bool { return w.runner(t, r.GetRunnerId()).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED })
 	if got := w.runner(t, r.GetRunnerId()); got.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE ||
-		w.requestOfJob(t, 9001).GetState() != tidev1.RequestState_REQUEST_STATE_RUNNING {
+		w.requestOfJob(t, 9001).GetState() != tidev1.RequestState_REQUEST_STATE_RUNNING || w.os.Active(w.osOrg) != 0 || w.os.Calls("AttachExec") != 1 {
 		t.Fatalf("runner %v", got)
 	}
 	w.send(t, "workflow_job", job("completed", 501, 9001, tideLinux, "tide-"+r.GetRunnerId()))
