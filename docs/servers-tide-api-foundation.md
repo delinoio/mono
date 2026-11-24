@@ -393,6 +393,7 @@ The Go SDK implements download for the CLI and the MCP server. Download copies a
   4. When OwnSand returns `failed_precondition`, no device of the OwnSand organization can ever run the profile. The request ends with `FAILED` and the end reason `NO_ELIGIBLE_DEVICE`.
   5. The dispatcher continues with the next request. A request that does not fit does not block smaller requests behind it.
 - The dispatcher creates warm runners only when the queue of the organization has no uncovered request, so that warm runners never take capacity from waiting requests.
+- If a warm create fails, the dispatcher stops filling that profile, including its other runner pools, for the rest of the pass. It continues with later profiles while its context is active. A create deadline or dispatcher cancellation ends the pass.
 - tide never preempts a runner that serves a request.
 - Each `CreateSandbox` call uses an `idempotency_key` that tide generates and stores with the runner before the call, so a retry after a lost response does not create a second sandbox.
 - A request that is still `QUEUED` when its `max_queue_wait` ends expires with `EXPIRED` and `MAX_QUEUE_WAIT`. tide releases its vendor claim after expiry commits.
