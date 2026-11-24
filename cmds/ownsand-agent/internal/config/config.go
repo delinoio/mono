@@ -9,6 +9,7 @@ package config
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -161,6 +162,23 @@ func DefaultStateDir() string {
 // Lookup reads an environment variable.
 type Lookup func(string) (string, bool)
 
+type envError struct {
+	setting string
+	reason  string
+	err     error
+}
+
+func (e *envError) Error() string { return e.err.Error() }
+
+// RedactedError describes a FromEnv error without including environment values.
+func RedactedError(err error) string {
+	var invalid *envError
+	if errors.As(err, &invalid) {
+		return fmt.Sprintf("invalid %s: %s", invalid.setting, invalid.reason)
+	}
+	return "could not parse environment configuration"
+}
+
 // FromEnv builds the configuration from environment variables and
 // defaults.
 func FromEnv(lookup Lookup) (Config, error) {
@@ -187,20 +205,20 @@ func FromEnv(lookup Lookup) (Config, error) {
 	if v := get(EnvRuntime); v != "" {
 		kind, err := ParseRuntimeKind(v)
 		if err != nil {
-			return Config{}, err
+			return Config{}, &envError{EnvRuntime, "expected firecracker, virtualization, hyperv or process", err}
 		}
 		cfg.Runtime = kind
 	}
 	if v := get(EnvLogLevel); v != "" {
 		level, err := loglevel.Parse(v)
 		if err != nil {
-			return Config{}, fmt.Errorf("config: invalid %s %q", EnvLogLevel, v)
+			return Config{}, &envError{EnvLogLevel, "expected debug, info, warn or error", fmt.Errorf("config: invalid %s %q", EnvLogLevel, v)}
 		}
 		cfg.LogLevel = level
 	}
 	keys, err := ParsePublicKeys(get(EnvReleasePublicKeys))
 	if err != nil {
-		return Config{}, err
+		return Config{}, &envError{EnvReleasePublicKeys, "expected a comma-separated list of base64 Ed25519 public keys", err}
 	}
 	cfg.ReleasePublicKeys = keys
 	return cfg, nil

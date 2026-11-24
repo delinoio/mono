@@ -174,8 +174,8 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 		t.Fatalf("sandbox %v", sb)
 	}
 	out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "sw_vers -productName; uname -sm; id -u; echo state > /var/root/marker")
-	if ex.GetExitCode() != 0 || !strings.Contains(out, "macOS\nDarwin arm64\n0\n") {
-		t.Fatalf("exec output %q exited %v", out, ex)
+	if !execSucceeded(ex) || !strings.Contains(out, "macOS\nDarwin arm64\n0\n") {
+		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	// The guest helper grows the APFS container to the 72 GiB disk after
 	// the boot; the container size is in bytes.
@@ -238,8 +238,8 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 		if got := restored.GetRestorePath(); got != want {
 			t.Fatalf("restore path %v, want %v", got, want)
 		}
-		if out, _ := e.exec(restored.GetSandboxId(), "/bin/cat", "/var/root/marker"); out != "state\n" {
-			t.Fatalf("restored sandbox %q", out)
+		if out, ex := e.exec(restored.GetSandboxId(), "/bin/cat", "/var/root/marker"); out != "state\n" || !execSucceeded(ex) {
+			t.Fatalf("restored sandbox output %q, exit %v", out, ex)
 		}
 		deleteSandbox(restored.GetSandboxId())
 	}
@@ -315,6 +315,12 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 		t.Fatalf("snapshot create with invalid native configuration: %v", err)
 	}
 	t.Log("invalid snapshot VM configuration rejected by Virtualization.framework")
+
+	if snap.GetHasMemoryState() {
+		t.Log("restore after invalidating memory state")
+		e.invalidateMemoryState(snapID)
+		checkRestore(true, coldPath)
+	}
 
 	if ids, _ := r.Running(context.Background()); len(ids) != 0 {
 		t.Fatalf("VMs still run: %v", ids)
