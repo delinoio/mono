@@ -11,11 +11,26 @@ describe("MarkerOffsetFinder", () => {
     expect(finder.push(bytes("one\ntwo\n"))).toBe(4);
   });
 
-  test("finds the marker when a chunk split it", () => {
+  test("retains the byte offset of a marker split across chunks", () => {
     const finder = new MarkerOffsetFinder("one\n");
+    expect(finder.push(bytes("é"))).toBeUndefined();
     expect(finder.push(bytes("on"))).toBeUndefined();
     expect(finder.push(bytes("e"))).toBeUndefined();
-    expect(finder.push(bytes("\ntwo\n"))).toBe(4);
+    expect(finder.push(bytes("\ntwo\n"))).toBe(6);
+    expect(finder.push(bytes("one\n"))).toBe(6);
+  });
+
+  test("retains the first offset when later chunks lack or repeat the marker", () => {
+    const finder = new MarkerOffsetFinder("one\n");
+    expect(finder.push(bytes("one\n"))).toBe(4);
+    expect(finder.push(bytes("two\n"))).toBe(4);
+    expect(finder.push(bytes("one\n"))).toBe(4);
+  });
+
+  test("retains the first offset after an empty chunk", () => {
+    const finder = new MarkerOffsetFinder("one\n");
+    expect(finder.push(bytes("one\n"))).toBe(4);
+    expect(finder.push(new Uint8Array(0))).toBe(4);
   });
 
   test("counts bytes of earlier chunks, not characters", () => {

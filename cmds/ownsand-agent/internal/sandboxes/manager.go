@@ -170,6 +170,9 @@ type Manager struct {
 	// beforeIdleReports is a test hook that Tick calls after it collected the
 	// pending idle reports and released mu, before it publishes them.
 	beforeIdleReports func()
+	// beforeSnapshotCapture is a test hook called before the manager marks
+	// a capture as started, while the source sandbox command lock is held.
+	beforeSnapshotCapture func()
 	// removalHook is a test hook that removeSnapshot calls under hookMu
 	// before it deletes the stored copy; see SetSnapshotRemovalHookForTest.
 	hookMu      sync.Mutex

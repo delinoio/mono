@@ -800,16 +800,38 @@ var errNotOwned = errors.New("answered 200 before the process reported that it o
 // that holds the address does not count even before the probed process has
 // exited.
 //
-// The exit channel is consulted before a 200 is accepted, so a server that
-// answers while the probed process is already gone never wins the race with
-// the exit. The error of a timeout keeps the last observed status: the final
-// probe usually ends with the context deadline, and that error must not hide
-// it.
+// Process exit cancels any active probe. The poller checks for exit before
+// starting a probe, after it returns, and before accepting readiness or
+// reporting a timeout. A timeout keeps the last useful probe result.
 func pollReadyWhile(url string, budget time.Duration, exited <-chan struct{}, owned func() bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
+	if exited != nil {
+		go func() {
+			select {
+			case <-exited:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+
 	var lastErr error
+	processExit := func() error {
+		select {
+		case <-exited:
+			if lastErr == nil {
+				return fmt.Errorf("%w before it became healthy", errProcessExited)
+			}
+			return fmt.Errorf("%w before it became healthy (last probe: %v)", errProcessExited, lastErr)
+		default:
+			return nil
+		}
+	}
 	for {
+		if err := processExit(); err != nil {
+			return err
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return err
@@ -818,28 +840,25 @@ func pollReadyWhile(url string, budget time.Duration, exited <-chan struct{}, ow
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				select {
-				case <-exited:
-					return fmt.Errorf("%w before it became healthy (last probe: answered 200 from another listener)", errProcessExited)
-				default:
-				}
-				if owned == nil || owned() {
-					return nil
-				}
-				err = errNotOwned
+				lastErr = errNotOwned
 			} else {
-				err = fmt.Errorf("unexpected status %d", resp.StatusCode)
+				lastErr = fmt.Errorf("unexpected status %d", resp.StatusCode)
 			}
-		}
-		// A probe that ended because the budget expired carries no news about
-		// the process; keep the earlier error, such as the last status.
-		if ctx.Err() == nil || lastErr == nil {
+		} else if ctx.Err() == nil || lastErr == nil {
+			// Cancellation provides no new probe result. Keep any earlier result.
 			lastErr = err
 		}
+		if err := processExit(); err != nil {
+			return err
+		}
+		if err == nil && resp.StatusCode == http.StatusOK && (owned == nil || owned()) {
+			return processExit()
+		}
 		select {
-		case <-exited:
-			return fmt.Errorf("%w before it became healthy (last probe: %v)", errProcessExited, lastErr)
 		case <-ctx.Done():
+			if err := processExit(); err != nil {
+				return err
+			}
 			return fmt.Errorf("not healthy within %s: %w", budget, lastErr)
 		case <-time.After(healthPollInterval):
 		}

@@ -262,6 +262,56 @@ describe("integrations", () => {
       screen.getByText("github-org-51000001", { exact: false }),
     ).toBeVisible();
   });
+
+  test("an expired GitHub callback stays on setup and shows restart guidance", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}/integrations`);
+
+    await browser.evaluate(() => {
+      const issuedAt = Date.now();
+      Date.now = () => issuedAt;
+      // Simulate the GitHub redirect in the same document so the callback
+      // uses the in-memory transport that issued the state.
+      window.navigation.addEventListener(
+        "navigate",
+        (event) => {
+          const destination = new URL(event.destination.url);
+          if (destination.origin !== "https://github.com") return;
+          event.preventDefault();
+          const state = destination.searchParams.get("state");
+          if (!state) throw new Error("Expected an issued state");
+          const query = new URLSearchParams({
+            installation_id: "51000002",
+            code: "fixture-code",
+            state,
+          });
+          Date.now = () => issuedAt + 600_000;
+          setTimeout(() => {
+            window.history.pushState(null, "", `/github/setup?${query}`);
+            window.dispatchEvent(new PopStateEvent("popstate"));
+          }, 0);
+        },
+        { once: true },
+      );
+      return null;
+    });
+    await screen.getByRole("button", "Connect GitHub").tap();
+    await screen.getByRole("combobox", "tide organization").tap();
+    await screen.getByRole("option", "Globex (admin)").tap();
+    await screen.getByRole("button", "Link installation").tap();
+
+    await expect(
+      screen.getByText("Start the installation again from the integrations", {
+        exact: false,
+      }),
+    ).toBeVisible();
+    await expect(browser).toHaveURL("/github/setup");
+  });
 });
 
 describe("personal API keys", () => {

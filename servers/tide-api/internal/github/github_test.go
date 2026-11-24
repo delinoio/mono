@@ -7,8 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,9 +22,14 @@ import (
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
+	"github.com/delinoio/mono/servers/tide-api/internal/app"
 	"github.com/delinoio/mono/servers/tide-api/internal/github"
 	"github.com/delinoio/mono/servers/tide-api/internal/githubapi"
+	"github.com/delinoio/mono/servers/tide-api/internal/githubapi/githubfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/lease"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 	"github.com/delinoio/mono/servers/tide-api/internal/webhook"
 )
 
@@ -663,6 +672,92 @@ func TestLostDeliveries(t *testing.T) {
 		t.Fatalf("request %v", req)
 	}
 	w.l.GitHub.Wait()
+}
+
+func TestLostDeliveriesBeyondPage100(t *testing.T) {
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	w.link(t, 501, "acme")
+	w.createProfile(t, ghProfile("linux", 0))
+	ctx := t.Context()
+
+	w.env.Clock.Advance(-24 * time.Hour)
+	w.gh.SendLost("workflow_job", job("queued", 501, 7, tideLinux, ""))
+	w.env.Clock.Advance(24 * time.Hour)
+	now := w.env.Clock.Now()
+	recorded := make([]string, 0, 10_000)
+	for range 10_000 {
+		recorded = append(recorded, w.gh.SendLost("workflow_job", nil))
+	}
+	if _, err := w.env.DB.Pool.Exec(ctx, `INSERT INTO webhook_deliveries (sender, delivery_id, receive_time)
+		SELECT $1, guid, $2 FROM unnest($3::text[]) AS guid`, int16(webhook.SenderGitHub), now, recorded); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := w.l.GitHub.RedeliverOnce(ctx); n != 1 {
+		t.Fatalf("requested %d redeliveries, want 1", n)
+	}
+	if calls := w.gh.Calls("list_hook_deliveries"); calls != 101 {
+		t.Errorf("listed %d pages, want 101", calls)
+	}
+	if calls := w.gh.Calls("redeliver_hook_delivery"); calls != 1 {
+		t.Errorf("sent %d redelivery requests, want 1", calls)
+	}
+	eventually(t, "redelivered request", func() bool { return w.requestOfJob(t, 7) != nil })
+}
+
+func TestLostDeliveriesIncompleteListing(t *testing.T) {
+	f := githubfake.New(nil)
+	t.Cleanup(f.Server.Close)
+	for _, mode := range []string{"http error", "canceled"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var pages, attempts atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					attempts.Add(1)
+					w.WriteHeader(http.StatusAccepted)
+					return
+				}
+				if pages.Add(1) == 1 {
+					w.Header().Set("Link", fmt.Sprintf(`<http://%s/app/hook/deliveries?cursor=2>; rel="next"`, r.Host))
+					err := json.NewEncoder(w).Encode([]githubapi.Delivery{{ID: 1, GUID: "unseen", DeliveredAt: time.Now(), StatusCode: 500}})
+					if err != nil {
+						t.Errorf("encode deliveries: %v", err)
+					}
+					return
+				}
+				if mode == "canceled" {
+					cancel()
+					<-r.Context().Done()
+					return
+				}
+				http.Error(w, "listing failed", http.StatusBadGateway)
+			}))
+			t.Cleanup(upstream.Close)
+			cfg := f.Config()
+			cfg.APIOrigin = upstream.URL
+			opts := layers.Options{GitHub: github.Options{
+				Client:        githubapi.New(cfg, upstream.Client(), slog.New(slog.DiscardHandler), nil),
+				WebhookSecret: f.WebhookSecret,
+			}}
+			var l layers.Layers
+			env := testenv.New(t, testenv.WithLayerOptions(opts, &l), func(ao *app.Options) {
+				// Hold the lease elsewhere so only the explicit pass runs.
+				if _, err := ao.DB.Pool.Exec(t.Context(), "INSERT INTO instance_leases (lease_name, holder, expire_time) VALUES ($1, $2, $3)",
+					lease.Name, "manual-redelivery", ao.Now().Add(time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			})
+
+			if n := l.GitHub.RedeliverOnce(ctx); n != 0 || attempts.Load() != 0 || pages.Load() != 2 {
+				t.Errorf("requested %d redeliveries after %d page requests and %d attempts", n, pages.Load(), attempts.Load())
+			}
+			if mode == "http error" && !strings.Contains(env.Logs.String(), "github_redelivery_list_failed") {
+				t.Error("the later page failure did not take the listing-error path")
+			}
+		})
+	}
 }
 
 // TestCompletedBeforeQueued: a completed event of a job without a request

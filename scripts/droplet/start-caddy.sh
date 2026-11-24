@@ -41,7 +41,7 @@
 # `caddy reload` validates the new configuration itself.
 #
 # Environment (optional, for tests and slow hosts):
-#   START_CADDY_READY_TIMEOUT   seconds to wait for the admin API; default 30.
+#   START_CADDY_READY_TIMEOUT   whole decimal seconds to wait for the admin API; default 30.
 #   START_CADDY_READY_INTERVAL  seconds between attempts; default 1.
 #
 # A failing `docker pull`, `docker run`, `docker start` or `docker exec` fails
@@ -71,7 +71,7 @@ fi
 # API. Returns non-zero with a diagnostic when the container is not running
 # (exited, dead, restarting and so on) or does not answer before the deadline.
 wait_ready() {
-  local deadline=$((SECONDS + ready_timeout))
+  local deadline=$((SECONDS + 10#$ready_timeout))
   local state attempts=0
   # `timeout` bounds one attempt when `docker exec` itself hangs; `wget -T`
   # bounds the HTTP request. Without `timeout` only the latter applies.

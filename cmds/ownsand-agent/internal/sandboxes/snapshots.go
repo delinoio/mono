@@ -241,11 +241,16 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 	if err != nil {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
 	}
-	// Mark the capture before it starts, so that a second create does not
-	// touch it. The claim of this create already lets a delete that arrives
-	// meanwhile record its intent. An unregistered claim (invalid ID) cannot
-	// reach this point.
+	if m.beforeSnapshotCapture != nil {
+		m.beforeSnapshotCapture()
+	}
+	// Check for deletion under the same lock that marks the capture as
+	// started. A delete that wins this lock prevents any directory changes.
 	m.mu.Lock()
+	if claim.deleted {
+		m.mu.Unlock()
+		return nil, m.abortedSnapshotError(id)
+	}
 	pending := m.pending[id]
 	if pending == nil || pending.capturing {
 		m.mu.Unlock()

@@ -694,7 +694,10 @@ export function createMockTransport(
   const userId = options.userId ?? MOCK_USER;
   const orgs = seed(userId);
   const watchers = new Map<string, Set<Watcher>>();
-  const issuedStates = new Map<string, string>();
+  const issuedStates = new Map<
+    string,
+    { organizationId: string; expiresAtMs: number }
+  >();
 
   const membership = (orgId: string): { org: OrgState; role: Role } => {
     const org = orgs.get(orgId);
@@ -1170,10 +1173,14 @@ export function createMockTransport(
         const { role } = membership(req.organizationId);
         requireAdmin(role);
         const state = secret("state");
-        issuedStates.set(state, req.organizationId);
+        const expiresAtMs = now() + 600_000;
+        issuedStates.set(state, {
+          organizationId: req.organizationId,
+          expiresAtMs,
+        });
         return {
           url: `https://github.com/apps/tide/installations/new?state=${encodeURIComponent(state)}`,
-          expireTime: ts(600),
+          expireTime: timestampFromMs(expiresAtMs),
         };
       },
       linkGitHubInstallation(req) {
@@ -1184,11 +1191,14 @@ export function createMockTransport(
             "code and state are required",
             Code.InvalidArgument,
           );
-        // The mock accepts the state "mock-state" for the development server
-        // and the e2e suite, and every state that it issued for this
-        // organization. Each state is single-use.
+        // The development server and the e2e suite can use the fixed
+        // "mock-state" fixture. Issued states are single-use.
         const issued = issuedStates.get(req.state);
-        if (req.state !== "mock-state" && issued !== req.organizationId)
+        if (
+          req.state !== "mock-state" &&
+          (issued?.organizationId !== req.organizationId ||
+            now() >= issued.expiresAtMs)
+        )
           throw new ConnectError(
             "the installation state is not valid or has expired",
             Code.FailedPrecondition,

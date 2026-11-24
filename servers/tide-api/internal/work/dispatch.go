@@ -427,20 +427,21 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		IdempotencyKey: api.NewID(), WorkspacePath: p.WorkspacePath, PoolKey: pool,
 	}
 	bind := req != nil && a.BindsAtDispatch()
-	stored := false
 	if req == nil {
 		r.warmProfileRevision = p.WarmRevision
 		r.warmLinkRevision = linkRevision
-		// The dispatcher owns the first CreateSandbox call. The driver
-		// can take over once that call and its database update finish.
-		e.initialWarmCreates.Store(r.ID, struct{}{})
-		defer func() {
-			e.initialWarmCreates.Delete(r.ID)
-			if stored {
-				e.ensureDriver(r.ID)
-			}
-		}()
 	}
+	// The dispatcher owns the first CreateSandbox call and applies its
+	// result before the driver can retry. A duplicate rejection can bind
+	// a queued request to the runner that already failed its start.
+	stored := false
+	e.initialCreates.Store(r.ID, struct{}{})
+	defer func() {
+		e.initialCreates.Delete(r.ID)
+		if stored {
+			e.ensureDriver(r.ID)
+		}
+	}()
 	// The request is stored with the runner, so every retry sends the same
 	// parameters with the key.
 	sreq := sandboxRequest(p, r)
