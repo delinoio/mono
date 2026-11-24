@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { ExecFailureReason } from "@delino/tide-protos/v1/common_pb";
 import {
   type AttachDevSessionExecRequest,
+  AttachDevSessionExecResponseSchema,
   type DevSessionExecEvent,
+  type DevSessionExecEventSchema,
   DevSessionService,
   type ExecDevSessionRequest,
+  ExecDevSessionResponseSchema,
 } from "@delino/tide-protos/v1/dev_session_pb";
-import type { MessageInitShape } from "@bufbuild/protobuf";
-import type { DevSessionExecEventSchema } from "@delino/tide-protos/v1/dev_session_pb";
 import { TideClient } from "./client.ts";
-import { type ExecEvent, ExecEventKind, OutputStream } from "./exec.ts";
+import {
+  type ExecCaller,
+  type ExecEvent,
+  ExecEventKind,
+  execDevSession,
+  OutputStream,
+  runDevSessionExec,
+} from "./exec.ts";
 import {
   FAKE_ORIGIN,
   fakeServer,
@@ -39,6 +48,25 @@ const exited = (code: number): EventInit => ({
   case: "exited",
   value: { status: { case: "exitCode", value: BigInt(code) } },
 });
+
+const execInput = {
+  organizationId: ORG,
+  devSessionId: SESSION,
+  command: ["true"],
+};
+
+function response(event: EventInit) {
+  return create(ExecDevSessionResponseSchema, { event: { event } });
+}
+
+function execCaller(execDevSession: ExecCaller["execDevSession"]): ExecCaller {
+  return {
+    execDevSession,
+    attachDevSessionExec() {
+      throw new Error("unexpected attach");
+    },
+  };
+}
 
 /**
  * A dev session server: ExecDevSession runs `exec`, and the n-th
@@ -272,5 +300,192 @@ describe("exec helper", () => {
       ExecEventKind.Stdout,
     ]);
     expect(OutputStream.Stdout).toBe("stdout");
+  });
+
+  test.each(["initial", "attach"])(
+    "drops a buffered terminal event on the %s stream after cancellation",
+    async (source) => {
+      const abort = new AbortController();
+      let closes = 0;
+      let attaches = 0;
+      function* bufferedEvents() {
+        try {
+          yield started;
+          yield exited(0);
+        } finally {
+          closes++;
+        }
+      }
+      const caller: ExecCaller = {
+        async *execDevSession() {
+          if (source === "initial") {
+            for (const event of bufferedEvents()) {
+              yield response(event);
+            }
+          }
+        },
+        async *attachDevSessionExec() {
+          attaches++;
+          for (const event of bufferedEvents()) {
+            yield create(AttachDevSessionExecResponseSchema, {
+              event: { event },
+            });
+          }
+        },
+      };
+      const events = execDevSession(caller, {
+        ...execInput,
+        signal: abort.signal,
+      });
+      if (source === "attach") {
+        expect((await events.next()).value).toMatchObject({
+          kind: ExecEventKind.Reattached,
+        });
+      }
+      expect((await events.next()).value).toMatchObject({
+        kind: ExecEventKind.Started,
+      });
+      abort.abort();
+      expect(await events.next()).toEqual({ done: true, value: undefined });
+      expect(closes).toBe(1);
+      expect(attaches).toBe(source === "attach" ? 1 : 0);
+    },
+  );
+
+  test.each<{ name: string; event: EventInit }>([
+    { name: "a chunk", event: out(2, "x") },
+    {
+      name: "a second loss event",
+      event: {
+        case: "outputTruncated",
+        value: { stdoutOffset: 2n, stderrOffset: 3n },
+      },
+    },
+  ])(
+    "drops $name from the same response after cancellation",
+    async ({ event }) => {
+      const abort = new AbortController();
+      let closed = false;
+      const caller = execCaller(async function* () {
+        try {
+          yield response(event);
+        } finally {
+          closed = true;
+        }
+      });
+      const events = execDevSession(caller, {
+        ...execInput,
+        signal: abort.signal,
+      });
+      expect((await events.next()).value).toEqual({
+        kind: ExecEventKind.OutputLost,
+        range: { stream: OutputStream.Stdout, start: 0n, end: 2n },
+      });
+      abort.abort();
+      expect(await events.next()).toEqual({ done: true, value: undefined });
+      expect(closed).toBe(true);
+    },
+  );
+
+  test("rejects with the abort reason when a pending read returns a terminal event", async () => {
+    const abort = new AbortController();
+    const reason = new Error("exec canceled");
+    const reading = Promise.withResolvers<void>();
+    const terminal = Promise.withResolvers<void>();
+    let closed = false;
+    const caller = execCaller(async function* () {
+      try {
+        yield response(started);
+        reading.resolve();
+        await terminal.promise;
+        yield response(exited(0));
+      } finally {
+        closed = true;
+      }
+    });
+    const result = runDevSessionExec(caller, {
+      ...execInput,
+      signal: abort.signal,
+    });
+    await reading.promise;
+    abort.abort(reason);
+    terminal.resolve();
+    await expect(result).rejects.toBe(reason);
+    expect(closed).toBe(true);
+  });
+
+  test("keeps the terminal result when cancellation occurs during stream cleanup", async () => {
+    const abort = new AbortController();
+    const closing = Promise.withResolvers<void>();
+    const cleanup = Promise.withResolvers<void>();
+    const caller = execCaller(async function* () {
+      try {
+        yield response(exited(0));
+      } finally {
+        closing.resolve();
+        await cleanup.promise;
+      }
+    });
+    const result = runDevSessionExec(caller, {
+      ...execInput,
+      signal: abort.signal,
+    });
+    await closing.promise;
+    abort.abort();
+    cleanup.resolve();
+    expect((await result).outcome).toMatchObject({
+      kind: ExecEventKind.Exited,
+      exitCode: 0n,
+    });
+  });
+
+  test("starts no attach when the signal aborts after Reattached", async () => {
+    const abort = new AbortController();
+    let attaches = 0;
+    const caller: ExecCaller = {
+      async *execDevSession() {},
+      async *attachDevSessionExec() {
+        attaches++;
+        yield create(AttachDevSessionExecResponseSchema, {
+          event: { event: exited(0) },
+        });
+      },
+    };
+    const events = execDevSession(caller, {
+      ...execInput,
+      signal: abort.signal,
+    });
+    expect((await events.next()).value).toMatchObject({
+      kind: ExecEventKind.Reattached,
+    });
+    abort.abort();
+    expect(await events.next()).toEqual({ done: true, value: undefined });
+    expect(attaches).toBe(0);
+  });
+
+  test("does not emit Reattached when the signal aborts as backoff ends", async () => {
+    const abort = new AbortController();
+    const sleeping = Promise.withResolvers<void>();
+    const backoff = Promise.withResolvers<void>();
+    const caller = execCaller(async function* () {
+      throw new ConnectError("relay restarting", Code.Unavailable);
+    });
+    const clock = {
+      now: () => 0,
+      sleep() {
+        sleeping.resolve();
+        return backoff.promise;
+      },
+    };
+    const events = execDevSession(
+      caller,
+      { ...execInput, signal: abort.signal },
+      { clock },
+    );
+    const next = events.next();
+    await sleeping.promise;
+    backoff.resolve();
+    abort.abort();
+    expect(await next).toEqual({ done: true, value: undefined });
   });
 });

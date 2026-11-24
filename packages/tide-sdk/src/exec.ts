@@ -115,7 +115,7 @@ export interface ExecHelperOptions {
  * Runs a command in a running dev session and streams its events.
  *
  * - It generates the `exec_id` (UUID v7) unless the input has one, and
- *   calls `ExecDevSession` exactly once, so it never runs a command twice.
+ *   calls `ExecDevSession` at most once, so it never runs a command twice.
  * - The server ends each stream before 14 minutes with an OK status and no
  *   final event. After such an end, and after a retryable failure, the
  *   helper continues with `AttachDevSessionExec` from the next stdout and
@@ -123,6 +123,8 @@ export interface ExecHelperOptions {
  *   exponential backoff from 1 second to 30 seconds.
  * - It yields output in order and without duplicates, and reports output
  *   that it never received as `OutputLost`.
+ * - Cancellation ends the iterator and stops following the command. The
+ *   command keeps running in the guest.
  * - A status that is the server's answer ends the iteration with that
  *   `ConnectError`. When `ExecDevSession` failed before any event and
  *   `AttachDevSessionExec` then answers `not_found`, the command never
@@ -158,6 +160,9 @@ export async function* execDevSession(
         const first = event.value;
         if (first.stdoutOffset > stdoutOffset) {
           yield lost(OutputStream.Stdout, stdoutOffset, first.stdoutOffset);
+          if (abortedBy(signal)) {
+            return false;
+          }
           stdoutOffset = first.stdoutOffset;
         }
         if (first.stderrOffset > stderrOffset) {
@@ -180,6 +185,9 @@ export async function* execDevSession(
         }
         if (offset > expected) {
           yield lost(stream, expected, offset);
+          if (abortedBy(signal)) {
+            return false;
+          }
         }
         const from = offset < expected ? expected : offset;
         const chunk = data.subarray(Number(from - offset));
@@ -218,7 +226,7 @@ export async function* execDevSession(
     }
   }
 
-  for (let attempt = 0; ; attempt++) {
+  for (let attempt = 0; !abortedBy(signal); attempt++) {
     let cause: unknown;
     let progressed = false;
     try {
@@ -252,12 +260,15 @@ export async function* execDevSession(
               { signal },
             );
       for await (const message of stream) {
+        if (abortedBy(signal)) {
+          return;
+        }
         if (message.event === undefined) {
           continue;
         }
         anyEvent = true;
         progressed = true;
-        if (yield* handle(message.event.event)) {
+        if ((yield* handle(message.event.event)) || abortedBy(signal)) {
           return;
         }
       }
@@ -297,6 +308,9 @@ export async function* execDevSession(
         }
         throw error;
       }
+      if (abortedBy(signal)) {
+        return;
+      }
     }
     yield {
       kind: ExecEventKind.Reattached,
@@ -330,7 +344,7 @@ export interface ExecResult {
  * Runs a command with `execDevSession` and collects its output and outcome.
  * Output is kept in memory; use `execDevSession` for large output. It
  * fails with the `ConnectError` of the server, or with the abort reason
- * when the signal aborts before the command ends.
+ * when the signal aborts before the helper delivers a terminal event.
  */
 export async function runDevSessionExec(
   devSessions: ExecCaller,
