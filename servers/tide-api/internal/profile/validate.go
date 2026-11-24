@@ -205,8 +205,19 @@ func (rules Rules) Validate(p *Profile, vendor tidev1.AgentVendor) error {
 		return api.ErrInvalidf("invalid source: base_image or ownsand_template_id is required")
 	}
 	r := p.Resources
-	if r.VCPUCount <= 0 || r.VCPUCount > maxVCPUCount || r.MemoryMiB <= 0 || r.MemoryMiB > maxMemoryMiB || r.DiskGiB <= 0 || r.DiskGiB > maxDiskGiB {
-		return api.ErrInvalidf("invalid resources: vcpu_count, memory_mib and disk_gib must be greater than zero")
+	switch {
+	case r.VCPUCount <= 0:
+		return api.ErrInvalidf("invalid resources.vcpu_count: must be greater than zero")
+	case r.VCPUCount > maxVCPUCount:
+		return api.ErrInvalidf("invalid resources.vcpu_count: must be at most %d", maxVCPUCount)
+	case r.MemoryMiB <= 0:
+		return api.ErrInvalidf("invalid resources.memory_mib: must be greater than zero")
+	case r.MemoryMiB > maxMemoryMiB:
+		return api.ErrInvalidf("invalid resources.memory_mib: must be at most %d", maxMemoryMiB)
+	case r.DiskGiB <= 0:
+		return api.ErrInvalidf("invalid resources.disk_gib: must be greater than zero")
+	case r.DiskGiB > maxDiskGiB:
+		return api.ErrInvalidf("invalid resources.disk_gib: must be at most %d", maxDiskGiB)
 	}
 	if p.NetworkMode != tidev1.NetworkMode_NETWORK_MODE_OUTBOUND {
 		return api.ErrInvalidf("invalid network_mode: must be OUTBOUND")

@@ -230,6 +230,67 @@ func TestRunnerProfileResourceUpdates(t *testing.T) {
 	assertStored(replacement)
 }
 
+func TestRunnerProfileResourceLimitErrors(t *testing.T) {
+	w := newWorld(t)
+	ctx := t.Context()
+	admin := w.env.User(w.org.Admin)
+	create := func(name string, resources *tidev1.Resources) (*connect.Response[tidev1.CreateRunnerProfileResponse], error) {
+		return admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{
+			OrganizationId: w.org.ID,
+			Profile: &tidev1.RunnerProfile{
+				Name: name, WorkloadKind: tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, WorkspacePath: "/work",
+				GuestOs: tidev1.GuestOs_GUEST_OS_LINUX, Source: &tidev1.RunnerProfile_BaseImage{BaseImage: tidev1.GuestOs_GUEST_OS_LINUX},
+				Resources: resources, NetworkMode: tidev1.NetworkMode_NETWORK_MODE_OUTBOUND,
+				IdleTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(8 * time.Hour), MaxQueueWait: durationpb.New(30 * time.Minute),
+			},
+		}))
+	}
+	limits := &tidev1.Resources{VcpuCount: 1024, MemoryMib: 16777216, DiskGib: 1048576}
+	created, err := create("at-limits", limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := created.Msg.GetProfile().GetResources(); !proto.Equal(got, limits) {
+		t.Fatalf("created resources = %v, want %v", got, limits)
+	}
+	update := func(resources *tidev1.Resources) (*connect.Response[tidev1.UpdateRunnerProfileResponse], error) {
+		return admin.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: created.Msg.GetProfile().GetRunnerProfileId(),
+			Profile: &tidev1.RunnerProfile{Resources: resources}, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"resources"}},
+		}))
+	}
+	for _, tc := range []struct {
+		name      string
+		resources *tidev1.Resources
+		want      string
+	}{
+		{"zero-vcpu", &tidev1.Resources{VcpuCount: 0, MemoryMib: 4096, DiskGib: 32}, "invalid resources.vcpu_count: must be greater than zero"},
+		{"over-vcpu-limit", &tidev1.Resources{VcpuCount: 1025, MemoryMib: 4096, DiskGib: 32}, "invalid resources.vcpu_count: must be at most 1024"},
+		{"zero-memory", &tidev1.Resources{VcpuCount: 2, MemoryMib: 0, DiskGib: 32}, "invalid resources.memory_mib: must be greater than zero"},
+		{"over-memory-limit", &tidev1.Resources{VcpuCount: 2, MemoryMib: 16777217, DiskGib: 32}, "invalid resources.memory_mib: must be at most 16777216"},
+		{"zero-disk", &tidev1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 0}, "invalid resources.disk_gib: must be greater than zero"},
+		{"over-disk-limit", &tidev1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 1048577}, "invalid resources.disk_gib: must be at most 1048576"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, createErr := create(tc.name, tc.resources)
+			_, updateErr := update(tc.resources)
+			wantCode(t, "create", createErr, connect.CodeInvalidArgument)
+			wantCode(t, "update", updateErr, connect.CodeInvalidArgument)
+			want := "invalid_argument: " + tc.want
+			if createErr.Error() != want || updateErr.Error() != want {
+				t.Fatalf("create = %v, update = %v, want both to return %q", createErr, updateErr, want)
+			}
+		})
+	}
+	updated, err := update(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := updated.Msg.GetProfile().GetResources(); !proto.Equal(got, limits) {
+		t.Fatalf("updated resources = %v, want %v", got, limits)
+	}
+}
+
 // Durations are stored in milliseconds, so a value with a smaller part is
 // rejected instead of being truncated.
 func TestRunnerProfileSubMillisecondDurations(t *testing.T) {
