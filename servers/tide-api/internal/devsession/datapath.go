@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"math"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -120,14 +121,34 @@ func resultEvent(res *ownsand.ExecResult) (*tidev1.DevSessionExecEvent, string) 
 	return &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_SandboxEnded{SandboxEnded: &tidev1.DevSessionExecSandboxEnded{Reason: reason}}}, "sandbox_ended"
 }
 
-// relayExec forwards the events of one exec stream: it ends the stream
-// before StreamLimit with an OK status and no final event (the command keeps
-// running; the client continues with AttachDevSessionExec) and sends a
-// keepalive when no event went out for KeepaliveInterval.
+type responseControllerKey struct{}
+
+func (h *Handler) startRelay(ctx context.Context, start time.Time) (context.Context, context.CancelFunc, error) {
+	rotateAt := start.Add(h.timing.StreamLimit)
+	controller, ok := ctx.Value(responseControllerKey{}).(*http.ResponseController)
+	if !ok {
+		return nil, nil, h.svc.Internal(ctx, "set dev session response write deadline", http.ErrNotSupported)
+	}
+	// Keep the deadline active after the RPC method returns. Connect still
+	// has to write and flush the final status.
+	if err := controller.SetWriteDeadline(rotateAt.Add(h.timing.WriteGracePeriod)); err != nil {
+		return nil, nil, h.svc.Internal(ctx, "set dev session response write deadline", err)
+	}
+	streamCtx, cancel := context.WithDeadline(ctx, rotateAt)
+	return streamCtx, cancel, nil
+}
+
+// relayExec forwards exec events and sends a keepalive when the stream is
+// idle for KeepaliveInterval. At StreamLimit the OwnSand relay stops. A
+// client that keeps reading gets an OK status without a final event and
+// continues with AttachDevSessionExec.
 func (h *Handler) relayExec(ctx context.Context, sess *session, execID string, offsets execOffsets, send func(*tidev1.DevSessionExecEvent) error,
 	run func(ctx context.Context, onEvent func(ownsand.ExecEvent) error) (*ownsand.ExecResult, error)) error {
 	start := time.Now()
-	streamCtx, cancel := context.WithTimeout(ctx, h.timing.StreamLimit)
+	streamCtx, cancel, err := h.startRelay(ctx, start)
+	if err != nil {
+		return err
+	}
 	defer cancel()
 	sender := &execSender{send: send, last: time.Now()}
 	var sendErr error
@@ -293,9 +314,10 @@ func (w *chunkWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// ReadDevSessionFile streams a guest file from an offset. The stream ends
-// before StreamLimit without the end message when the file is not read to
-// its end; the client continues with the same read_id from its next offset.
+// ReadDevSessionFile streams a guest file from an offset. If the relay
+// reaches StreamLimit before reading the entire file, a client that keeps
+// reading gets an OK status without an end message. The client continues
+// with the same read_id from its next offset.
 func (h *Handler) ReadDevSessionFile(ctx context.Context, req *connect.Request[tidev1.ReadDevSessionFileRequest], stream *connect.ServerStream[tidev1.ReadDevSessionFileResponse]) error {
 	m := req.Msg
 	sess, _, err := h.operable(ctx, m.GetOrganizationId(), m.GetDevSessionId())
@@ -318,13 +340,19 @@ func (h *Handler) ReadDevSessionFile(ctx context.Context, req *connect.Request[t
 		return h.svc.Internal(ctx, "read dev session file", err)
 	}
 	start := time.Now()
-	streamCtx, cancel := context.WithTimeout(ctx, h.timing.StreamLimit)
+	streamCtx, cancel, err := h.startRelay(ctx, start)
+	if err != nil {
+		return err
+	}
 	defer cancel()
 	w := &chunkWriter{send: stream.Send, offset: m.GetOffset()}
 	size, err := client.ReadFile(streamCtx, sess.runner.SandboxID, ownsand.FileReadParams{
 		ReadID: readID, Path: path, BindingSalt: h.bindingSalt(sess.runner.SandboxID, readID), Offset: m.GetOffset()}, w)
 	h.e.Metrics().TransferBytes("download", strings.TrimPrefix(sess.guestOS.String(), "GUEST_OS_"), w.bytes)
 	log := h.svc.Logger.With(slog.String("organization_id", sess.req.OrganizationID), slog.String("request_id", sess.req.ID), slog.String("read_id", readID))
+	if w.sendErr != nil {
+		return w.sendErr
+	}
 	if err != nil {
 		if ctx.Err() == nil && errors.Is(streamCtx.Err(), context.DeadlineExceeded) {
 			log.InfoContext(ctx, "dev_session_read_stream_rotated", slog.Int64("bytes", w.bytes), slog.Int64("duration_ms", time.Since(start).Milliseconds()))
@@ -332,10 +360,6 @@ func (h *Handler) ReadDevSessionFile(ctx context.Context, req *connect.Request[t
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
-		}
-		if w.sendErr != nil {
-			// The client stream failed.
-			return w.sendErr
 		}
 		log.WarnContext(ctx, "dev_session_read_failed", slog.String("code", ownsandclient.Code(err)), slog.Int64("bytes", w.bytes))
 		return fileTransferError(err)
