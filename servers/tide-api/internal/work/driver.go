@@ -68,7 +68,7 @@ func (e *Engine) reconcile(ctx context.Context) {
 // ensureDriver starts the driver of a runner when the reconciler runs on
 // this instance (the lease holder) and no driver of the runner runs.
 func (e *Engine) ensureDriver(runnerID string) {
-	if _, creating := e.initialWarmCreates.Load(runnerID); creating {
+	if _, creating := e.initialCreates.Load(runnerID); creating {
 		return
 	}
 	e.mu.Lock()
