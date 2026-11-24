@@ -26,8 +26,9 @@ export const API_RESOURCE = "https://tide.api.delino.io";
 export type TokenSource = string | (() => string | Promise<string>);
 
 /**
- * Validates an API origin and returns it in canonical form. It must be an
- * http or https origin without credentials, path, query or fragment.
+ * Validates an API origin and returns it in canonical form. Write an http or
+ * https origin as scheme://host[:port][/], without credentials, path, query,
+ * fragment or backslash.
  */
 export function resolveApiOrigin(value: string | undefined): string {
   const raw = value === undefined || value === "" ? DEFAULT_API_ORIGIN : value;
@@ -43,12 +44,14 @@ export function resolveApiOrigin(value: string | undefined): string {
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     throw new TideConfigError("origin must use http or https");
   }
+  // Check the written form because the URL parser can normalize a path to "/".
   if (
     url.pathname !== "/" ||
     url.search !== "" ||
     url.hash !== "" ||
     raw.includes("?") ||
-    raw.includes("#")
+    raw.includes("#") ||
+    !/^https?:\/\/[^/?#\\]+\/?$/i.test(raw.trim())
   ) {
     throw new TideConfigError("origin must not have a path, query or fragment");
   }
