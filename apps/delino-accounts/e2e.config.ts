@@ -5,6 +5,11 @@ import { dirname, resolve } from "node:path";
 import type { E2EConfig } from "e2e";
 import { web } from "@e2e-dev/web";
 import { gateway } from "ai";
+import {
+  API_ORIGIN,
+  LOGTO_APP_ID,
+  LOGTO_ENDPOINT,
+} from "./e2e/fixture-session.ts";
 
 // The runner starts commands without a shell, so it needs the CLI file behind
 // pnpm's Windows command shim.
@@ -47,9 +52,9 @@ export default {
           // `e2e/home.e2e.ts` can observe that the build-time variable reaches
           // the client bundle. Keep it equal to `E2E_API_ORIGIN` in that file.
           env: {
-            PUBLIC_API_ORIGIN: "http://127.0.0.1:28100",
-            PUBLIC_LOGTO_ENDPOINT: "https://logto.test",
-            PUBLIC_LOGTO_APP_ID: "accounts-e2e",
+            PUBLIC_API_ORIGIN: API_ORIGIN,
+            PUBLIC_LOGTO_ENDPOINT: LOGTO_ENDPOINT,
+            PUBLIC_LOGTO_APP_ID: LOGTO_APP_ID,
           },
           log: ".e2e/logs/app.log",
         },

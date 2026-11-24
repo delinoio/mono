@@ -30,7 +30,7 @@ import {
   BillingAccountService,
 } from "@delino/accounts-protos/v1/billing_account_pb";
 import { can, canManageMember, Permission } from "../../roles.ts";
-import { RouteId, routePath, useRouter } from "../../router.tsx";
+import { parseRoute, RouteId, routePath, useRouter } from "../../router.tsx";
 
 function displayName(member: BillingAccountMember): string {
   return member.displayName !== "" ? member.displayName : member.userId;
@@ -209,9 +209,15 @@ export function MembersSection() {
             billingAccountId,
             userId: userId ?? "",
           });
-          // Leave the account first, so that the invalidation does not
-          // refetch its queries (they are now `not_found` for this user).
-          navigate(routePath({ id: RouteId.Billing }));
+          // Read the live route after the RPC. Move off this account before
+          // refreshing because the caller can no longer read it.
+          const route = parseRoute(window.location.pathname);
+          if (
+            route.id === RouteId.BillingAccount &&
+            route.billingAccountId === billingAccountId
+          ) {
+            navigate(routePath({ id: RouteId.Billing }));
+          }
           await refresh();
         }}
       />
