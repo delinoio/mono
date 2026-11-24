@@ -39,6 +39,40 @@ describe("client configuration", () => {
     }
   });
 
+  test.each([
+    "https://api.example.test\\tenant\\..",
+    "https://api.example.test\\",
+    "https://api.example.test/tenant/..",
+    "https:///api.example.test/tenant/..",
+    "https:///api.example.test/tenant/../",
+    "https:api.example.test/tenant/..",
+    "https:/api.example.test/tenant/..",
+    "https:////api.example.test/tenant/..",
+    "https://api.example.test/./",
+  ])("rejects an origin with a hidden path (%s)", (origin) => {
+    const resolveOrigin = () => resolveApiOrigin(origin);
+    const createClient = () => new TideClient({ origin, token: "test-token" });
+    const expectedMessage = /^origin must not have a path, query or fragment$/;
+    expect(resolveOrigin).toThrow(TideConfigError);
+    expect(resolveOrigin).toThrow(expectedMessage);
+    expect(createClient).toThrow(TideConfigError);
+    expect(createClient).toThrow(expectedMessage);
+  });
+
+  test.each([
+    ["", DEFAULT_API_ORIGIN],
+    ["https://tide.api.delino.io", DEFAULT_API_ORIGIN],
+    ["HTTPS://API.EXAMPLE.TEST", "https://api.example.test"],
+    ["https://a.test/", "https://a.test"],
+    [" \t https://A.TEST/ \r\n", "https://a.test"],
+    ["http://[::1]:8080/", "http://[::1]:8080"],
+  ])("canonicalizes a valid explicit origin (%s)", (origin, expected) => {
+    expect(resolveApiOrigin(origin)).toBe(expected);
+    expect(new TideClient({ origin, token: "test-token" }).origin).toBe(
+      expected,
+    );
+  });
+
   test("rejects an empty token", () => {
     expect(() => new TideClient({ token: "" })).toThrow(TideConfigError);
   });
