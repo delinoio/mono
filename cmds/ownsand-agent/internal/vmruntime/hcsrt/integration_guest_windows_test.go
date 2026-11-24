@@ -155,6 +155,15 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 	if sb.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_BASE_IMAGE {
 		t.Fatalf("sandbox %v", sb)
 	}
+	checkDiskSize := func(sandboxID string) {
+		t.Helper()
+		out, ex := e.exec(sandboxID, "powershell.exe", "-NoProfile", "-Command", "(Get-Disk -Number (Get-Partition -DriveLetter C).DiskNumber).Size")
+		size, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+		if ex == nil || ex.GetExitCode() != 0 || err != nil || size != windowsDiskGiB<<30 {
+			t.Fatalf("sandbox %s disk bytes = %q, want %d", sandboxID, out, windowsDiskGiB<<30)
+		}
+	}
+	checkDiskSize(sb.GetSandboxId())
 	out, ex := e.exec(sb.GetSandboxId(), "cmd.exe", "/c", "echo hello")
 	if ex.GetExitCode() != 0 || out != "hello\r\n" {
 		t.Fatalf("exec output %q exited %v", out, ex)
@@ -234,6 +243,7 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 	if cold.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
 		t.Fatalf("restore path %v", cold.GetRestorePath())
 	}
+	checkDiskSize(cold.GetSandboxId())
 	if out, _ := e.exec(cold.GetSandboxId(), "cmd.exe", "/c", `type C:\marker.txt`); out != "state\r\n" {
 		t.Fatalf("sandbox from snapshot %q", out)
 	}

@@ -100,6 +100,8 @@ type fakeRuntime struct {
 	resumeCalls int
 	// onCreate, when set, runs in Create after the VM started.
 	onCreate func(spec vmruntime.Spec)
+	// createStarted signals that Create reached the gate before VM startup.
+	createStarted chan struct{}
 	// files holds the sandbox IDs whose runtime files exist. Create adds an
 	// ID, a successful Delete removes it, and a test adds an ID to model the
 	// files that a lost VM leaves behind.
@@ -126,6 +128,9 @@ func (r *fakeRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntim
 	r.starts++
 	r.mu.Unlock()
 	if r.block != nil {
+		if r.createStarted != nil {
+			close(r.createStarted)
+		}
 		select {
 		case <-r.block:
 		case <-ctx.Done():
@@ -991,6 +996,37 @@ func TestTTLExpiry(t *testing.T) {
 	waitState(t, e.m, busy, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
 	if r := endReason(e.m, busy); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
 		t.Fatalf("busy reason %v", r)
+	}
+}
+
+func TestTTLExpiryCancelsRunningCreate(t *testing.T) {
+	e := newEnv(t)
+	e.rt.block = make(chan struct{})
+	e.rt.createStarted = make(chan struct{})
+	e.rt.onCreate = func(vmruntime.Spec) { t.Error("the runtime started a VM after TTL expiry") }
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.m.Create(ctx, cmd)
+		done <- err
+	}()
+	select {
+	case <-e.rt.createStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("create did not reach the runtime")
+	}
+	e.clk.Advance(2 * time.Hour)
+	e.m.Tick(ctx, false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	var ce *CommandError
+	if err := <-done; !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		t.Fatalf("create error %v, want ABORTED", err)
+	}
+	if reason := endReason(e.m, id); reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("end reason %v, want MAX_TTL_EXPIRED", reason)
 	}
 }
 
