@@ -51,6 +51,25 @@ describe("sign-in", () => {
 });
 
 describe("organizations", () => {
+  test("shows the full error when the organization cannot load", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${UNKNOWN_ORG}/api-keys`);
+
+    await expect(
+      screen.getByText("It was not found, or you no longer have access to it."),
+    ).toBeVisible();
+    await expect(screen.getByRole("button", "Try again")).toBeVisible();
+    await expect(screen.getByRole("navigation", "Organization")).toBeHidden();
+    await expect(
+      screen.getByText("The last refresh failed", { exact: false }),
+    ).toBeHidden();
+  });
+
   test("offers retry when the organization cannot be found", async ({
     app,
     screen,
@@ -598,6 +617,68 @@ describe("runner profiles", () => {
       "tide-linux-build",
     );
   });
+
+  test("shows field errors and saves after correcting the resource values", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+    await screen.getByRole("button", "Create runner profile").tap();
+
+    const dialog = screen.getByRole("dialog", "Create a runner profile");
+    await dialog.getByLabel("Name").tap();
+    await browser.keyboard.type("bounds-test");
+    const resources = [
+      [
+        "vCPUs",
+        "3000000000",
+        "1024",
+        "Enter a whole number of vCPUs from 1 to 1024.",
+      ],
+      [
+        "Memory (MiB)",
+        "10000000000000000000",
+        "16777216",
+        "Enter a whole number of MiB from 1 to 16777216.",
+      ],
+      [
+        "Disk (GiB)",
+        "1048577",
+        "1048576",
+        "Enter a whole number of GiB from 1 to 1048576.",
+      ],
+    ] as const;
+    for (const [label, invalid] of resources) {
+      await dialog.getByLabel(label).tap();
+      await browser.keyboard.press("ControlOrMeta+A");
+      await browser.keyboard.type(invalid);
+    }
+    await dialog.getByRole("button", "Create profile").tap();
+
+    for (const [label, , , message] of resources) {
+      await expect(dialog.getByLabel(label)).toHaveAttribute(
+        "aria-invalid",
+        "true",
+      );
+      await expect(dialog.getByText(message)).toBeVisible();
+    }
+    await expect(
+      dialog.getByText("Something went wrong. Try again."),
+    ).toBeHidden();
+    for (const [label, , valid] of resources) {
+      await dialog.getByLabel(label).tap();
+      await browser.keyboard.press("ControlOrMeta+A");
+      await browser.keyboard.type(valid);
+    }
+    await dialog.getByRole("button", "Create profile").tap();
+
+    await expect(dialog).toBeHidden();
+    const row = screen.getByRole("listitem").filter({ hasText: "bounds-test" });
+    await expect(row).toContainText("1024 vCPU · 16777216 MiB · 1048576 GiB");
+  });
 });
 
 describe("personal API keys", () => {
@@ -676,6 +757,8 @@ describe("invitations", () => {
     await expect(screen.getByRole("combobox", "Organization")).toContainText(
       "Contoso",
     );
+    await screen.getByRole("combobox", "Organization").tap();
+    await expect(screen.getByRole("option", "Contoso")).toBeVisible();
   });
 });
 

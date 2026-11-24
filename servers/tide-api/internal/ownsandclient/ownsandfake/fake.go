@@ -50,7 +50,7 @@ type Fake struct {
 	// createHook runs before each CreateSandbox call without the fake lock
 	// (for example to stall a call until its context ends); its error is
 	// the call's error.
-	createHook func(ctx context.Context) error
+	createHook func(context.Context, *ownsandv1.CreateSandboxRequest) error
 	deleteHook func(ctx context.Context) error
 }
 
@@ -276,6 +276,16 @@ func (c *client) TemplateGuestOS(ctx context.Context, templateID string) (ownsan
 // SetCreateHook sets the hook that runs before each CreateSandbox call; nil
 // removes it.
 func (f *Fake) SetCreateHook(fn func(ctx context.Context) error) {
+	if fn == nil {
+		f.SetCreateRequestHook(nil)
+		return
+	}
+	f.SetCreateRequestHook(func(ctx context.Context, _ *ownsandv1.CreateSandboxRequest) error { return fn(ctx) })
+}
+
+// SetCreateRequestHook sets a hook that can inspect each CreateSandbox request.
+// A nil hook removes it.
+func (f *Fake) SetCreateRequestHook(fn func(context.Context, *ownsandv1.CreateSandboxRequest) error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createHook = fn
@@ -286,7 +296,7 @@ func (c *client) CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandbox
 	hook := c.f.createHook
 	c.f.mu.Unlock()
 	if hook != nil {
-		if err := hook(ctx); err != nil {
+		if err := hook(ctx, req); err != nil {
 			return nil, err
 		}
 	}

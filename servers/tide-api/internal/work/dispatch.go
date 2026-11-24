@@ -144,12 +144,15 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 	}
 	// No uncovered request: fill the warm counts.
 	for _, p := range profiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		a := e.adapters[p.Kind]
 		if a == nil || p.WarmCount == 0 {
 			continue
 		}
 		if !a.BindsAtDispatch() {
-			if !e.fillPoolWarm(ctx, client, a, p, activeLink.CredentialRevision, queued, runners) {
+			if e.fillPoolWarm(ctx, client, a, p, activeLink.CredentialRevision, queued, runners) == createStalled {
 				return nil
 			}
 			continue
@@ -162,11 +165,11 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 		}
 		for ; idle < int(p.WarmCount); idle++ {
 			res := e.createRunner(ctx, client, p, nil, "", activeLink.CredentialRevision)
-			if res == createWarmDeferred {
-				break
+			if res == createStalled {
+				return nil
 			}
 			if res != createOK {
-				return nil
+				break
 			}
 		}
 	}
@@ -177,17 +180,17 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 // BindsAtDispatch in each runner pool that its WarmPooler lists. Every
 // request is covered when it runs, so a pool's runners in CREATING,
 // PREPARING or WAITING_FOR_WORK without a request beyond its QUEUED
-// requests are its warm runners. It reports false when a creation failed,
-// which ends the pass.
-func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, a Adapter, p *profile.Profile, linkRevision string, queued []*Request, runners []*Runner) bool {
+// requests are its warm runners. The first unsuccessful create ends fill
+// for this profile and returns its result to the dispatcher.
+func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, a Adapter, p *profile.Profile, linkRevision string, queued []*Request, runners []*Runner) createResult {
 	wp, ok := a.(WarmPooler)
 	if !ok {
-		return true
+		return createSkipped
 	}
 	pools, err := wp.WarmPools(ctx, p.OrganizationID)
 	if err != nil {
 		e.svc.Logger.WarnContext(ctx, "dispatch_warm_pools_failed", slog.String("organization_id", p.OrganizationID), slog.Any("error", err))
-		return true
+		return createSkipped
 	}
 	for _, pool := range pools {
 		idle := 0
@@ -203,15 +206,12 @@ func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, 
 		}
 		for ; idle < int(p.WarmCount); idle++ {
 			res := e.createRunner(ctx, client, p, nil, pool, linkRevision)
-			if res == createWarmDeferred {
-				return true
-			}
 			if res != createOK {
-				return false
+				return res
 			}
 		}
 	}
-	return true
+	return createOK
 }
 
 // expire ends the QUEUED requests whose maximum queue wait ended.

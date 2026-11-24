@@ -100,11 +100,124 @@ export function ErrorNotice({
       {sessionEnded ? (
         <SignInButton />
       ) : onRetry ? (
-        <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
+        <Button
+          type="button"
+          variant={ButtonVariant.Secondary}
+          onClick={onRetry}
+        >
           Try again
         </Button>
       ) : null}
     </div>
+  );
+}
+
+function isTerminalError(error: unknown): boolean {
+  return (
+    error instanceof ConnectError &&
+    (error.code === Code.NotFound ||
+      error.code === Code.PermissionDenied ||
+      error.code === Code.Unauthenticated)
+  );
+}
+
+interface BoundaryQuery<T> {
+  data: T | undefined;
+  error: unknown;
+  isPending: boolean;
+  isFetching: boolean;
+  isFetchNextPageError?: boolean;
+  refetch: () => unknown;
+}
+
+export function showsFullError(query: BoundaryQuery<unknown>): boolean {
+  return (
+    query.error != null &&
+    (query.data === undefined || isTerminalError(query.error))
+  );
+}
+
+export function RefreshFailedNotice({
+  query,
+}: {
+  query: BoundaryQuery<unknown>;
+}) {
+  return (
+    <div className="notice notice-error" role="alert">
+      <p>
+        The last refresh failed, so this page may be out of date.{" "}
+        {errorMessage(query.error)}
+      </p>
+      <Button
+        type="button"
+        variant={ButtonVariant.Secondary}
+        disabled={query.isFetching}
+        onClick={() => void query.refetch()}
+      >
+        Try again
+      </Button>
+    </div>
+  );
+}
+
+/** Keeps loaded content mounted during a transient refresh failure. */
+export function QueryBoundary<T>({
+  query,
+  loading,
+  errorTitle,
+  children,
+}: {
+  query: BoundaryQuery<T>;
+  loading: string;
+  errorTitle?: string;
+  children: (data: T) => ReactNode;
+}) {
+  if (showsFullError(query)) {
+    return (
+      <ErrorNotice
+        title={errorTitle}
+        error={query.error}
+        onRetry={() => void query.refetch()}
+      />
+    );
+  }
+  if (query.isPending || query.data === undefined) {
+    return <Loading label={loading} />;
+  }
+  return (
+    <>
+      {query.error != null && !query.isFetchNextPageError ? (
+        <RefreshFailedNotice query={query} />
+      ) : null}
+      {children(query.data)}
+    </>
+  );
+}
+
+/** Retries the continuation separately from a refresh of the loaded pages. */
+export function ListPagination({
+  query,
+}: {
+  query: BoundaryQuery<unknown> & {
+    hasNextPage: boolean;
+    isFetchNextPageError: boolean;
+    fetchNextPage: (options: { cancelRefetch: boolean }) => unknown;
+  };
+}) {
+  if (!query.hasNextPage || showsFullError(query)) return null;
+
+  const loadMore = () => void query.fetchNextPage({ cancelRefetch: false });
+  if (query.isFetchNextPageError && !query.isFetching) {
+    return <ErrorNotice error={query.error} onRetry={loadMore} />;
+  }
+  return (
+    <Button
+      variant={ButtonVariant.Secondary}
+      disabled={query.isFetching}
+      onClick={loadMore}
+    >
+      Show more
+    </Button>
   );
 }
 

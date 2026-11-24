@@ -33,7 +33,7 @@ func needPOSIX(t *testing.T) {
 // workspace is a new local directory.
 func newSession(t *testing.T, c *Client, srv *tidetest.Server, org string, os tidev1.GuestOs) *tidev1.DevSession {
 	t.Helper()
-	ws := t.TempDir() + "/work"
+	ws := filepath.Join(t.TempDir(), "work")
 	if err := mkdir(ws); err != nil {
 		t.Fatal(err)
 	}

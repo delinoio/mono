@@ -5,6 +5,7 @@
 package vzrt
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -29,7 +30,7 @@ func TestVirtualizationFailedRestoreWatcher(t *testing.T) {
 	spec := vmruntime.Spec{Resources: &ownsandv1.Resources{VcpuCount: 2, MemoryMib: 512}}
 	for attempt := range 3 {
 		dir := t.TempDir()
-		if err := copyFile(rootfs, filepath.Join(dir, diskFile)); err != nil {
+		if err := copyFile(context.Background(), rootfs, filepath.Join(dir, diskFile)); err != nil {
 			t.Fatal(err)
 		}
 		console, err := vmruntime.OpenCappedLog(filepath.Join(dir, consoleFile), vmruntime.ConsoleLogLimit,

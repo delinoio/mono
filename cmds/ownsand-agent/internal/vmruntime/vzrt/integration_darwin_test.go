@@ -67,9 +67,66 @@ func (s *sink) Send(_ context.Context, f *ownsandv1.DataFrame) error {
 }
 
 type env struct {
-	t *testing.T
-	m *sandboxes.Manager
-	d *ops.Dispatcher
+	t  *testing.T
+	m  *sandboxes.Manager
+	d  *ops.Dispatcher
+	st *store.Store
+}
+
+// cancelAtSnapshotFile cancels at the first capture checkpoint that can see
+// the watched file. next must still be absent when a capture has more work.
+type cancelAtSnapshotFile struct {
+	context.Context
+	cancel  context.CancelFunc
+	watch   string
+	next    string
+	reached bool
+	nextErr error
+}
+
+func (c *cancelAtSnapshotFile) Err() error {
+	if c.Context.Err() == nil {
+		if _, err := os.Stat(c.watch); err == nil {
+			c.reached = true
+			if c.next != "" {
+				_, c.nextErr = os.Stat(c.next)
+			}
+			c.cancel()
+		}
+	}
+	return c.Context.Err()
+}
+
+func (e *env) requireCanceledSnapshot(sandboxID, watch, next string) {
+	e.t.Helper()
+	id, _ := uuidv7.NewString()
+	dir, err := e.st.SnapshotDir(id)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelAtSnapshotFile{Context: base, cancel: cancel, watch: filepath.Join(dir, "content", watch)}
+	if next != "" {
+		ctx.next = filepath.Join(dir, "content", next)
+	}
+	snap, err := e.m.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: id, SandboxId: sandboxID})
+	var commandErr *sandboxes.CommandError
+	if !ctx.reached || snap != nil || !errors.As(err, &commandErr) || commandErr.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		e.t.Fatalf("cancel at %s: reached = %v, snapshot = %v, error = %v", watch, ctx.reached, snap, err)
+	}
+	if next != "" && !errors.Is(ctx.nextErr, os.ErrNotExist) {
+		e.t.Fatalf("%s was not absent when capture stopped at %s: %v", next, watch, ctx.nextErr)
+	}
+	for _, snap := range e.m.StateReport(0, nil).GetSnapshots() {
+		if snap.GetSnapshotId() == id {
+			e.t.Fatalf("state report contains the canceled snapshot: %v", snap)
+		}
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		e.t.Fatalf("canceled snapshot directory: %v, want it removed", err)
+	}
+	e.t.Logf("canceled capture at %s and removed its staging directory", watch)
 }
 
 // invalidateMemoryState corrupts a disposable snapshot without clearing its
@@ -247,7 +304,7 @@ func TestVirtualizationIntegration(t *testing.T) {
 		m.Close()
 		rt.Close()
 	})
-	e := &env{t: t, m: m, d: d}
+	e := &env{t: t, m: m, d: d, st: st}
 
 	start := time.Now()
 	sb := e.create("", 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE, false)
@@ -311,6 +368,13 @@ func TestVirtualizationIntegration(t *testing.T) {
 		t.Fatalf("snapshot %v %v", snap, err)
 	}
 	t.Logf("snapshot has memory state: %v", snap.GetHasMemoryState())
+	if snap.GetHasMemoryState() {
+		e.requireCanceledSnapshot(sb.GetSandboxId(), "vm.state", "disk.img")
+	}
+	e.requireCanceledSnapshot(sb.GetSandboxId(), "disk.img", "")
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
+		t.Fatalf("source did not resume after cancellation: %q %v", out, ex)
+	}
 	start = time.Now()
 	restored := e.create(snapID, 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE, true)
 	t.Logf("restore from snapshot took %v (%v)", time.Since(start), restored.GetRestorePath())
