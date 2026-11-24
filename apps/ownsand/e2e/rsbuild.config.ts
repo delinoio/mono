@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { mergeRsbuildConfig } from "@rsbuild/core";
 import consoleConfig from "../rsbuild.config.ts";
 
-// The browser suite serves RPC fixtures and can select a synthetic continuation failure.
+// Only the browser suite serves RPC fixtures and can select synthetic list request failures.
 export default mergeRsbuildConfig(consoleConfig, {
   source: {
     entry: {

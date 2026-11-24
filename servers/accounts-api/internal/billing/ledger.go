@@ -224,6 +224,9 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	if in.Amount <= 0 {
 		return "", false, fmt.Errorf("credit grant amount %d is not positive", in.Amount)
 	}
+	// The caller holds both locks. Use the current time for pending adjustments
+	// so they account for credit that expired while the webhook waited.
+	adjustmentTime := s.timestamp()
 	var grantAccountID string
 	err = tx.QueryRow(ctx, `SELECT credit_grant_id::text, billing_account_id::text FROM credit_grants
 		WHERE paddle_transaction_id = $1`, in.PaddleTransactionID).Scan(&grantID, &grantAccountID)
@@ -231,7 +234,7 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 		// The pending rows are applied under the lock of the account of the
 		// grant, which is acct for every grant that a webhook resolves.
 		if grantAccountID == acct.ID {
-			if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, now); err != nil {
+			if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, adjustmentTime); err != nil {
 				return "", false, err
 			}
 		}
@@ -281,7 +284,7 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 		slog.Int64("balance_after_usd_micros", acct.Balance))
 	// Approved refunds and chargebacks of this purchase that arrived before
 	// its payment now reduce the new grant, as if they had arrived after it.
-	if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, now); err != nil {
+	if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, adjustmentTime); err != nil {
 		return "", false, err
 	}
 	return grantID, true, nil

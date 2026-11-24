@@ -382,6 +382,70 @@ func (h *Handler) GetOwnSandLink(ctx context.Context, req *connect.Request[tidev
 	return connect.NewResponse(resp), nil
 }
 
+// RemovalClaim identifies the link that one teardown attempt may remove.
+// An attempt that found no link has an empty link ID.
+type RemovalClaim struct {
+	orgID  string
+	linkID string
+}
+
+// HasLink reports whether the attempt claimed an existing link.
+func (c RemovalClaim) HasLink() bool { return c.linkID != "" }
+
+// ClaimRemoval stops dispatch before an attempt can start runner cleanup.
+// An absent link returns an empty claim. A competing attempt fails.
+func (l *Links) ClaimRemoval(ctx context.Context, orgID string) (RemovalClaim, error) {
+	if err := ctx.Err(); err != nil {
+		return RemovalClaim{}, err
+	}
+	// Let the short database step report its result even if the caller
+	// cancels. The caller must know whether to release the committed claim.
+	claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	claim := RemovalClaim{orgID: orgID}
+	var exists bool
+	// Check for absence in the same snapshot so a deletion or relink
+	// cannot change the interpretation of a failed update.
+	err := l.svc.DB.Pool.QueryRow(claimCtx, `WITH claimed AS (
+		UPDATE ownsand_links SET removing = true WHERE organization_id = $1 AND NOT removing
+		RETURNING ownsand_link_id
+	)
+	SELECT COALESCE((SELECT ownsand_link_id::text FROM claimed), ''),
+		EXISTS (SELECT 1 FROM ownsand_links WHERE organization_id = $1)`, orgID).Scan(&claim.linkID, &exists)
+	if err != nil {
+		return RemovalClaim{}, err
+	}
+	if exists && !claim.HasLink() {
+		return RemovalClaim{}, api.ErrPrecondition("the OwnSand link is being removed")
+	}
+	return claim, nil
+}
+
+// CheckRemoval verifies the prepared link under the organization row lock.
+// Deletion that prepared without a link must retry if one now exists.
+func (l *Links) CheckRemoval(ctx context.Context, tx pgx.Tx, claim RemovalClaim) error {
+	lk, exists, err := l.Get(ctx, tx, claim.orgID)
+	if err != nil {
+		return err
+	}
+	if exists != claim.HasLink() || (exists && (lk.LinkID != claim.linkID || !lk.Removing)) {
+		return api.ErrPrecondition("the OwnSand link changed meanwhile; try again")
+	}
+	return nil
+}
+
+// ReleaseRemoval clears only the link claimed by the failed attempt.
+func (l *Links) ReleaseRemoval(ctx context.Context, claim RemovalClaim) {
+	if !claim.HasLink() {
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if _, err := l.svc.DB.Pool.Exec(releaseCtx, "UPDATE ownsand_links SET removing = false WHERE ownsand_link_id = $1 AND removing", claim.linkID); err != nil {
+		l.svc.Logger.WarnContext(ctx, "ownsand_link_removal_unmark_failed", slog.String("organization_id", claim.orgID), slog.Any("error", err))
+	}
+}
+
 // RemoveOwnSandLink marks the link as being removed (dispatch stops), runs
 // the Prepare hooks (the work layer deletes the runners), then deletes the
 // link and its key in a transaction that also runs the InTx hooks (the work
@@ -394,11 +458,11 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 	if err != nil {
 		return nil, err
 	}
-	tag, err := s.DB.Pool.Exec(ctx, "UPDATE ownsand_links SET removing = true WHERE organization_id = $1", c.OrganizationID)
+	claim, err := l.ClaimRemoval(ctx, c.OrganizationID)
 	if err != nil {
-		return nil, s.Internal(ctx, "mark ownsand link removal", err)
+		return nil, s.Internal(ctx, "claim ownsand link removal", err)
 	}
-	if tag.RowsAffected() == 0 {
+	if !claim.HasLink() {
 		return nil, api.ErrNotFound("OwnSand link")
 	}
 	for _, hook := range l.hooks {
@@ -407,7 +471,7 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 		}
 		if err := hook.Prepare(ctx, c.OrganizationID); err != nil {
 			s.Logger.WarnContext(ctx, "ownsand_link_removal_prepare_failed", slog.String("hook", hook.Name), slog.String("organization_id", c.OrganizationID), slog.Any("error", err))
-			l.unmarkRemoval(ctx, c.OrganizationID)
+			l.ReleaseRemoval(ctx, claim)
 			return nil, s.Internal(ctx, "prepare ownsand link removal", err)
 		}
 	}
@@ -415,12 +479,8 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 		if err := api.LockOrganization(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		lk, ok, err := l.Get(ctx, tx, c.OrganizationID)
-		if err != nil {
+		if err := l.CheckRemoval(ctx, tx, claim); err != nil {
 			return err
-		}
-		if !ok {
-			return api.ErrNotFound("OwnSand link")
 		}
 		for _, hook := range l.hooks {
 			if hook.InTx == nil {
@@ -430,12 +490,12 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 				return fmt.Errorf("ownsand link removal hook %s: %w", hook.Name, err)
 			}
 		}
-		if _, err := tx.Exec(ctx, "DELETE FROM ownsand_links WHERE organization_id = $1", c.OrganizationID); err != nil {
+		if _, err := tx.Exec(ctx, "DELETE FROM ownsand_links WHERE ownsand_link_id = $1", claim.linkID); err != nil {
 			return err
 		}
 		return s.WriteAudit(ctx, tx, api.AuditEvent{
 			OrganizationID: c.OrganizationID, Action: tidev1.AuditAction_AUDIT_ACTION_OWNSAND_LINK_REMOVED, Actor: c.Principal,
-			TargetKind: tidev1.AuditTargetKind_AUDIT_TARGET_KIND_OWNSAND_LINK, TargetID: lk.LinkID,
+			TargetKind: tidev1.AuditTargetKind_AUDIT_TARGET_KIND_OWNSAND_LINK, TargetID: claim.linkID,
 		})
 	})
 	if err != nil {
@@ -443,7 +503,7 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 		// while it waited for the organization lock), so the link stays and
 		// must not stay marked.
 		s.Logger.WarnContext(ctx, "ownsand_link_removal_failed", slog.String("organization_id", c.OrganizationID), slog.Any("error", err))
-		l.unmarkRemoval(ctx, c.OrganizationID)
+		l.ReleaseRemoval(ctx, claim)
 		return nil, s.Internal(ctx, "remove ownsand link", err)
 	}
 	l.forget(c.OrganizationID)
@@ -454,16 +514,4 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 	}
 	s.Logger.InfoContext(ctx, "ownsand_link_removed", slog.String("organization_id", c.OrganizationID))
 	return connect.NewResponse(&tidev1.RemoveOwnSandLinkResponse{}), nil
-}
-
-// unmarkRemoval clears the removal mark of a removal that failed, so the
-// kept link is dispatchable again and accepts a new key. It does not use the
-// cancellation of ctx, because a canceled request is one cause of the
-// failure, and it has its own time limit.
-func (l *Links) unmarkRemoval(ctx context.Context, orgID string) {
-	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	if _, err := l.svc.DB.Pool.Exec(uctx, "UPDATE ownsand_links SET removing = false WHERE organization_id = $1", orgID); err != nil {
-		l.svc.Logger.WarnContext(ctx, "ownsand_link_removal_unmark_failed", slog.String("organization_id", orgID), slog.Any("error", err))
-	}
 }

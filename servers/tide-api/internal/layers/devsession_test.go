@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -283,6 +285,194 @@ func collectExec(t *testing.T, stream interface {
 	return out, stream.Err()
 }
 
+func TestDevSessionExecResumeOffsets(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	s, _ := w.runningSession(t)
+	ctx := t.Context()
+	client := w.env.User(w.org.Member).DevSession
+	execID := api.NewID()
+	code := int64(3)
+	emit := func(onEvent func(ownsand.ExecEvent) error, events ...ownsand.ExecEvent) (*ownsand.ExecResult, error) {
+		for _, ev := range events {
+			if err := onEvent(ev); err != nil {
+				return nil, err
+			}
+		}
+		return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
+	}
+	w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+		return emit(p.OnEvent,
+			ownsand.ExecEvent{Kind: ownsand.ExecEventStderr, Data: []byte("warn")},
+			ownsand.ExecEvent{Kind: ownsand.ExecEventOutputTruncated, MissingStdout: ownsand.ByteRange{To: 20}},
+		)
+	}, func(_ context.Context, _, id string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
+		if id != execID {
+			return nil, fmt.Errorf("attach exec ID = %s, want %s", id, execID)
+		}
+		switch {
+		case p.StdoutOffset == 10 && p.StderrOffset == 30:
+			return emit(p.OnEvent,
+				ownsand.ExecEvent{Kind: ownsand.ExecEventOutputTruncated, MissingStdout: ownsand.ByteRange{From: 10, To: 20}},
+				ownsand.ExecEvent{Kind: ownsand.ExecEventStdout, Offset: 20, Data: []byte("data")},
+				ownsand.ExecEvent{Kind: ownsand.ExecEventOutputTruncated, MissingStderr: ownsand.ByteRange{From: 30, To: 40}},
+			)
+		case p.StdoutOffset == 20 && p.StderrOffset == 30:
+			return emit(p.OnEvent, ownsand.ExecEvent{Kind: ownsand.ExecEventStderr, Offset: p.StderrOffset, Data: []byte("next")})
+		case p.StdoutOffset == 100 && p.StderrOffset == 300:
+			return emit(p.OnEvent, ownsand.ExecEvent{
+				Kind:          ownsand.ExecEventOutputTruncated,
+				MissingStdout: ownsand.ByteRange{From: 100, To: 200},
+				MissingStderr: ownsand.ByteRange{From: 300, To: 400},
+			})
+		default:
+			return nil, fmt.Errorf("unexpected attach offsets (%d, %d)", p.StdoutOffset, p.StderrOffset)
+		}
+	})
+
+	checkEvents := func(t *testing.T, events []*tidev1.DevSessionExecEvent, err error, count int) {
+		t.Helper()
+		if err != nil || len(events) != count || events[count-1].GetExited().GetExitCode() != code {
+			t.Fatalf("events = %v, err = %v, want %d events ending with exit code %d", events, err, count, code)
+		}
+	}
+	checkGap := func(t *testing.T, ev *tidev1.DevSessionExecEvent, stdout, stderr int64) *tidev1.DevSessionExecOutputTruncated {
+		t.Helper()
+		gap := ev.GetOutputTruncated()
+		if gap == nil || gap.GetStdoutOffset() != stdout || gap.GetStderrOffset() != stderr {
+			t.Errorf("truncation = %v, want offsets (%d, %d)", gap, stdout, stderr)
+		}
+		return gap
+	}
+	checkOutput := func(t *testing.T, output *tidev1.DevSessionExecOutput, offset int64, data string) {
+		t.Helper()
+		if output.GetOffset() != offset || string(output.GetData()) != data {
+			t.Errorf("output = %v, want %q at offset %d", output, data, offset)
+		}
+	}
+	attach := func(t *testing.T, stdout, stderr int64, count int) []*tidev1.DevSessionExecEvent {
+		t.Helper()
+		stream, err := client.AttachDevSessionExec(ctx, connect.NewRequest(&tidev1.AttachDevSessionExecRequest{
+			OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: execID,
+			StdoutOffset: stdout, StderrOffset: stderr,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		events, err := collectExec(t, stream, func() *tidev1.DevSessionExecEvent { return stream.Msg().GetEvent() })
+		checkEvents(t, events, err, count)
+		return events
+	}
+
+	t.Run("fresh exec", func(t *testing.T) {
+		stream, err := client.ExecDevSession(ctx, connect.NewRequest(&tidev1.ExecDevSessionRequest{
+			OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: execID, Command: []string{"make", "test"},
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		events, err := collectExec(t, stream, func() *tidev1.DevSessionExecEvent { return stream.Msg().GetEvent() })
+		checkEvents(t, events, err, 3)
+		checkOutput(t, events[0].GetStderr(), 0, "warn")
+		checkGap(t, events[1], 20, 4)
+	})
+	t.Run("attach and resume", func(t *testing.T) {
+		events := attach(t, 10, 30, 4)
+		firstGap := checkGap(t, events[0], 20, 30)
+		checkOutput(t, events[1].GetStdout(), 20, "data")
+		checkGap(t, events[2], 24, 40)
+
+		resumed := attach(t, firstGap.GetStdoutOffset(), firstGap.GetStderrOffset(), 2)
+		checkOutput(t, resumed[0].GetStderr(), 30, "next")
+	})
+	t.Run("both streams", func(t *testing.T) {
+		events := attach(t, 100, 300, 2)
+		checkGap(t, events[0], 200, 400)
+	})
+}
+
+func TestDevSessionExecGuestTimestamps(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	s, _ := w.runningSession(t)
+	start := time.Date(2024, time.January, 1, 0, 0, 0, 123456789, time.UTC)
+	end := time.Date(2024, time.January, 1, 0, 0, 2, 987654321, time.UTC)
+	epoch := time.Unix(0, 0).UTC()
+	for _, tc := range []struct {
+		name               string
+		start, end         *time.Time
+		wantStart, wantEnd *timestamppb.Timestamp
+	}{
+		{"nanoseconds", &start, &end, &timestamppb.Timestamp{Seconds: 1704067200, Nanos: 123456789}, &timestamppb.Timestamp{Seconds: 1704067202, Nanos: 987654321}},
+		{"epoch-without-end", &epoch, nil, &timestamppb.Timestamp{}, nil},
+		{"epoch-without-start", nil, &epoch, nil, &timestamppb.Timestamp{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			execID := api.NewID()
+			const stdout, stderr = "hello", "late"
+			started := ownsand.ExecEvent{Kind: ownsand.ExecEventStarted, ExecID: execID, StartTime: tc.start}
+			code := int64(3)
+			exited := ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &code, EndTime: tc.end, TimedOut: true}
+			w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+				for _, ev := range []ownsand.ExecEvent{
+					started,
+					{Kind: ownsand.ExecEventStdout, ExecID: execID, Data: []byte(stdout)},
+					{Kind: ownsand.ExecEventStderr, ExecID: execID, Data: []byte(stderr)},
+				} {
+					if err := p.OnEvent(ev); err != nil {
+						return nil, err
+					}
+				}
+				return &exited, nil
+			}, func(_ context.Context, _, id string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
+				if id != execID || p.StdoutOffset != int64(len(stdout)) || p.StderrOffset != int64(len(stderr)) {
+					return nil, errors.New("attach did not resume the completed exec at the consumed offsets")
+				}
+				if err := p.OnEvent(started); err != nil {
+					return nil, err
+				}
+				return &exited, nil
+			})
+			check := func(events []*tidev1.DevSessionExecEvent) {
+				t.Helper()
+				gotStart := events[0].GetStarted()
+				gotEnd := events[len(events)-1].GetExited()
+				if gotStart.GetExecId() != execID || !proto.Equal(gotStart.GetStartTime(), tc.wantStart) {
+					t.Errorf("started = %v, want exec %s and time %v", gotStart, execID, tc.wantStart)
+				}
+				if gotEnd.GetExitCode() != code || !gotEnd.GetTimedOut() || !proto.Equal(gotEnd.GetEndTime(), tc.wantEnd) {
+					t.Errorf("exited = %v, want exit code %d, timed_out and time %v", gotEnd, code, tc.wantEnd)
+				}
+			}
+
+			ctx := t.Context()
+			owner := w.env.User(w.org.Member)
+			stream, err := owner.DevSession.ExecDevSession(ctx, connect.NewRequest(&tidev1.ExecDevSessionRequest{
+				OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: execID, Command: []string{"make", "test"},
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			events, err := collectExec(t, stream, func() *tidev1.DevSessionExecEvent { return stream.Msg().GetEvent() })
+			if err != nil || len(events) != 4 || string(events[1].GetStdout().GetData()) != stdout || string(events[2].GetStderr().GetData()) != stderr {
+				t.Fatalf("exec events = %v, err = %v", events, err)
+			}
+			check(events)
+
+			attach, err := w.env.User(w.org.Member).DevSession.AttachDevSessionExec(ctx, connect.NewRequest(&tidev1.AttachDevSessionExecRequest{
+				OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: execID,
+				StdoutOffset: int64(len(events[1].GetStdout().GetData())), StderrOffset: int64(len(events[2].GetStderr().GetData())),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			events, err = collectExec(t, attach, func() *tidev1.DevSessionExecEvent { return attach.Msg().GetEvent() })
+			if err != nil || len(events) != 2 {
+				t.Fatalf("attach events = %v, err = %v", events, err)
+			}
+			check(events)
+		})
+	}
+}
+
 func TestDevSessionExec(t *testing.T) {
 	w := newWorkWorld(t, devsession.Timing{StreamLimit: 600 * time.Millisecond, KeepaliveInterval: 150 * time.Millisecond})
 	ctx := context.Background()
@@ -407,6 +597,11 @@ func TestDevSessionFiles(t *testing.T) {
 	if _, ok := w.fake.File(w.osOrg, sandboxID, "/home/dev/work/out/a.txt"); ok {
 		t.Fatal("the file appeared before the final chunk")
 	}
+	_, err := owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{
+		OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), WriteId: writeID,
+		Path: "out/other.txt", Data: data[:1000],
+	}))
+	wantCode(t, "changed path for the same write ID", err, connect.CodeInvalidArgument)
 	if _, err := write(0, data[:1000], false); err != nil {
 		t.Fatal(err)
 	}

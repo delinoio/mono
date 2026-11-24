@@ -177,13 +177,16 @@ func ErrRateLimited(retry time.Duration) error {
 	return connect.NewError(connect.CodeResourceExhausted, fmt.Errorf("rate limit exceeded; retry in %d s", max(seconds, 1)))
 }
 
-// Internal wraps an unexpected error. The detail goes to the log, not to the
-// caller. A Connect error passes through unchanged.
+// Internal passes through Connect errors and maps context errors to their
+// Connect codes. It logs unexpected errors and returns a generic message.
 func (s *Service) Internal(ctx context.Context, op string, err error) error {
 	if ce := new(connect.Error); errors.As(err, &ce) {
 		return err
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("request deadline exceeded"))
+	}
+	if errors.Is(err, context.Canceled) {
 		return connect.NewError(connect.CodeCanceled, errors.New("request canceled"))
 	}
 	s.Logger.ErrorContext(ctx, "internal_error", slog.String("op", op), slog.Any("error", err))

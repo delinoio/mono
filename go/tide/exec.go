@@ -230,8 +230,8 @@ func (c *Client) Exec(ctx context.Context, p ExecParams) (*ExecResult, error) {
 }
 
 // AttachExec continues the event stream of an exec from the given offsets,
-// with the same continuation rules as Exec. It does not report the started
-// event again.
+// with the same continuation rules as Exec. It suppresses the callback for
+// the started event.
 //
 // The callback acknowledges stdout and stderr chunks as described in
 // [Client.Exec]. A callback error returns an *ExecStreamError with the offset
@@ -239,7 +239,7 @@ func (c *Client) Exec(ctx context.Context, p ExecParams) (*ExecResult, error) {
 func (c *Client) AttachExec(ctx context.Context, p AttachParams) (*ExecResult, error) {
 	op := &execOp{
 		c: c, org: p.OrganizationID, session: p.DevSessionID, execID: p.ExecID, onEvent: p.OnEvent,
-		stdout: p.StdoutOffset, stderr: p.StderrOffset, started: true,
+		stdout: p.StdoutOffset, stderr: p.StderrOffset, suppressStarted: true,
 	}
 	return op.run(ctx)
 }
@@ -252,6 +252,7 @@ type execOp struct {
 	start               *tidev1.ExecDevSessionRequest // nil after the first call
 	stdout, stderr      int64
 	started, incomplete bool
+	suppressStarted     bool
 }
 
 func (o *execOp) emit(ev ExecEvent) error {
@@ -397,6 +398,9 @@ func (o *execOp) handle(ev *tidev1.DevSessionExecEvent) (*ExecResult, error) {
 			return nil, nil
 		}
 		o.started = true
+		if o.suppressStarted {
+			return nil, nil
+		}
 		return nil, o.emit(ExecEvent{Kind: ExecEventStarted})
 	case ev.GetOutputTruncated() != nil:
 		t := ev.GetOutputTruncated()
