@@ -282,6 +282,35 @@ describe("overview", () => {
     );
   });
 
+  test("opens a fresh live queue after leaving Overview", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("link", "Acme Robotics Owner").tap();
+    const status = screen.getByRole("status", "Queue updates");
+    const queue = screen.getByRole("table", "Waiting requests");
+    await expect(status).toContainText("Live");
+    await expect(queue).toContainText("GitHub job");
+
+    await screen.getByRole("link", "Requests").tap();
+    const job = screen
+      .getByRole("table", "Requests")
+      .getByRole("row")
+      .filter({ hasText: "acme-robotics/firmware · test (ubuntu)" });
+    await job.getByRole("button", "Cancel").tap();
+    const dialog = screen.getByRole("alertdialog", "Cancel this request?");
+    await dialog.getByRole("button", "Cancel request").tap();
+    await expect(dialog).toBeHidden();
+    await expect(job).toBeHidden();
+
+    await screen.getByRole("link", "Overview").tap();
+    await expect(status).toContainText("Live");
+    await expect(queue).toContainText("Agent session");
+    await expect(queue).not.toContainText("GitHub job");
+  });
+
   test("an invalid OwnSand link shows the dispatch banner", async ({
     app,
     screen,
