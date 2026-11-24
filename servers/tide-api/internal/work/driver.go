@@ -68,7 +68,7 @@ func (e *Engine) reconcile(ctx context.Context) {
 // ensureDriver starts the driver of a runner when the reconciler runs on
 // this instance (the lease holder) and no driver of the runner runs.
 func (e *Engine) ensureDriver(runnerID string) {
-	if _, creating := e.initialWarmCreates.Load(runnerID); creating {
+	if _, creating := e.initialCreates.Load(runnerID); creating {
 		return
 	}
 	e.mu.Lock()
@@ -208,7 +208,7 @@ func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, 
 			return e.timing.SandboxPoll
 		}
 		sb, err := e.createSandbox(ctx, client, req)
-		switch e.applyCreate(ctx, r, sb, err) {
+		switch e.applyCreate(ctx, r, nil, sb, err) {
 		case createOK:
 			return 0
 		default:
@@ -286,7 +286,19 @@ func (e *Engine) stepPreparing(ctx context.Context, client ownsandclient.Client,
 // stepStart runs Adapter.Start (lifecycle step 3).
 func (e *Engine) stepStart(ctx context.Context, client ownsandclient.Client, r *Runner) {
 	a := e.adapters[r.Kind]
-	res, err := a.Start(ctx, e.guest(ctx, client, r))
+	g := e.guest(ctx, client, r)
+	if r.Kind == tidev1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION {
+		req, err := e.storedCreateRequest(ctx, r.ID)
+		if err == nil {
+			err = req.GetMaxTtl().CheckValid()
+		}
+		if err != nil {
+			e.svc.Logger.WarnContext(ctx, "runner_create_request_load_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		} else {
+			g.SandboxMaxTTL = req.GetMaxTtl().AsDuration()
+		}
+	}
+	res, err := a.Start(ctx, g)
 	if err != nil {
 		if ctx.Err() == nil {
 			e.svc.Logger.WarnContext(ctx, "runner_start_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
@@ -658,7 +670,7 @@ func (e *Engine) deleteRunner(ctx context.Context, orgID, runnerID string, reaso
 
 // deleteRunnerTx is deleteRunner in the caller's transaction.
 func (e *Engine) deleteRunnerTx(ctx context.Context, tx pgx.Tx, orgID, runnerID string, reason tidev1.RunnerEndReason, cause DeleteCause) (*Runner, *Request, tidev1.RequestState, error) {
-	cur, err := e.GetRunner(ctx, tx, orgID, runnerID)
+	cur, err := e.lockOrganizationRunner(ctx, tx, orgID, runnerID)
 	if err != nil {
 		return nil, nil, 0, err
 	}

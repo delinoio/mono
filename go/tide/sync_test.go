@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -426,6 +427,142 @@ func TestInvalidWindowsPath(t *testing.T) {
 		if got := invalidWindowsPath(p); got != want {
 			t.Errorf("invalidWindowsPath(%q) = %v, want %v", p, got, want)
 		}
+	}
+}
+
+func TestSyncRetryFileToDirectory(t *testing.T) {
+	needPOSIX(t)
+	for _, scenario := range []string{"first apply", "manifest write failure", "symlink", "ordinary deletion failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			ws := ds.GetWorkspacePath()
+			// Exercise a nested archive parent with a leading dash and a newline.
+			former := "-a with space\n"
+			child := former + "/nested/new.txt"
+			dir := newRepo(t, map[string]string{former: "old"}, nil, "")
+			p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			ctx := context.Background()
+			sync := func() (*SyncResult, error) { return c.Sync(ctx, p) }
+			checkCleanup := func() {
+				t.Helper()
+				if _, err := os.Lstat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("expected lock removal, stat returned %v", err)
+				}
+				if matches, err := filepath.Glob(ws + ".tide-sync-*"); err != nil || len(matches) != 0 {
+					t.Fatalf("temporary files left: %v, glob error: %v", matches, err)
+				}
+			}
+			if _, err := sync(); err != nil {
+				t.Fatal(err)
+			}
+			old := guestManifest(t, ds)
+			git(t, dir, "rm", "-q", "--", former)
+			if scenario == "ordinary deletion failure" {
+				child = "unrelated.txt"
+			}
+			writeChild := filepath.Join(dir, child)
+			if err := os.MkdirAll(filepath.Dir(writeChild), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(writeChild, []byte("new"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			git(t, dir, "add", "--", child)
+
+			var guestOnly, linkTarget string
+			switch scenario {
+			case "manifest write failure":
+				srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+					if req.GetEnv()[guestEnvWorkspace] != "" {
+						srv.Fail(writeProc, connect.NewError(connect.CodePermissionDenied, errors.New("manifest write denied")))
+					}
+				}
+				_, err := sync()
+				srv.BeforeExec = nil
+				if connect.CodeOf(err) != connect.CodePermissionDenied {
+					t.Fatalf("manifest write error = %v", err)
+				}
+				if got := readGuest(t, ds, child); got != "new" {
+					t.Fatalf("file after apply = %q", got)
+				}
+				if m := guestManifest(t, ds); m.Version != old.Version || !maps.Equal(m.Files, old.Files) {
+					t.Fatalf("manifest after failed write = %+v, want %+v", m, old)
+				}
+				checkCleanup()
+				guestOnly = former + "/guest.txt"
+				if err := os.WriteFile(filepath.Join(ws, child), []byte("guest edit"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink", "ordinary deletion failure":
+				if err := os.Remove(filepath.Join(ws, former)); err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "symlink" {
+					linkTarget = t.TempDir()
+					if err := os.WriteFile(filepath.Join(linkTarget, "keep.txt"), []byte("keep"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(linkTarget, filepath.Join(ws, former)); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if err := os.Mkdir(filepath.Join(ws, former), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					guestOnly = former + "/guest.txt"
+				}
+			}
+			if guestOnly != "" {
+				if err := os.WriteFile(filepath.Join(ws, guestOnly), []byte("keep"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			res, err := sync()
+			checkCleanup()
+			if guestOnly != "" && readGuest(t, ds, guestOnly) != "keep" {
+				t.Fatal("sync changed a guest-only file")
+			}
+			if scenario == "ordinary deletion failure" {
+				if err == nil {
+					t.Fatal("ordinary deletion of a directory succeeded")
+				}
+				if _, err := os.Lstat(filepath.Join(ws, child)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("archive extracted after a failed deletion, stat returned %v", err)
+				}
+				if m := guestManifest(t, ds); m.Version != old.Version || !maps.Equal(m.Files, old.Files) {
+					t.Fatalf("manifest after failed deletion = %+v, want %+v", m, old)
+				}
+				return
+			}
+			if err != nil || res.Uploaded != 1 || res.Deleted != 1 {
+				t.Fatalf("file-to-directory sync = %+v, %v", res, err)
+			}
+			if got := readGuest(t, ds, child); got != "new" {
+				t.Fatalf("file after sync = %q", got)
+			}
+			if linkTarget != "" {
+				if info, err := os.Lstat(filepath.Join(ws, former)); err != nil || !info.IsDir() {
+					t.Fatalf("sync did not replace the symlink with a directory: %v, %v", info, err)
+				}
+				if data, err := os.ReadFile(filepath.Join(linkTarget, "keep.txt")); err != nil || string(data) != "keep" {
+					t.Fatalf("symlink target changed: %q, %v", data, err)
+				}
+				if _, err := os.Lstat(filepath.Join(linkTarget, "nested")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("sync wrote through the symlink, stat returned %v", err)
+				}
+			}
+			m := guestManifest(t, ds)
+			if _, ok := m.Files[child]; !ok || len(m.Files) != 1 || m.Version != old.Version {
+				t.Fatalf("manifest after sync = %+v", m)
+			}
+			execs := srv.Calls(execProc)
+			res, err = sync()
+			if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 1 || srv.Calls(execProc) != execs {
+				t.Fatalf("unchanged sync = %+v, %v", res, err)
+			}
+		})
 	}
 }
 

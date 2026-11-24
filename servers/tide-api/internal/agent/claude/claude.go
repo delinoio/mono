@@ -81,6 +81,11 @@ const (
 // default /workspace needs a writable root directory.
 const runnerBaseDir = "/claude-runner"
 
+const (
+	hookAcceptBackoffMin = 5 * time.Millisecond
+	hookAcceptBackoffMax = time.Second
+)
+
 // Process is a started child process.
 type Process interface {
 	Wait() error
@@ -225,7 +230,7 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 	if len(socket) >= 104 {
 		return fmt.Errorf("the hook socket path %q is too long; set a shorter TMPDIR", socket)
 	}
-	ln, err := net.Listen("unix", socket)
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
 	if err != nil {
 		return fmt.Errorf("listen on the hook socket: %w", err)
 	}
@@ -233,13 +238,17 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 		_ = ln.Close()
 		return fmt.Errorf("restrict the hook socket: %w", err)
 	}
+	// Keep accepting during the orchestrator drain. When the drain ends,
+	// cancel any retry wait and close the listener to unblock AcceptUnix.
+	serveCtx, stopServing := context.WithCancel(context.WithoutCancel(ctx))
 	var serving sync.WaitGroup
 	serving.Add(1)
 	go func() {
 		defer serving.Done()
-		v.serve(ctx, w, ln.(*net.UnixListener))
+		v.serve(serveCtx, w, ln)
 	}()
 	defer func() {
+		stopServing()
 		_ = ln.Close()
 		serving.Wait()
 	}()
@@ -286,17 +295,35 @@ func (v *Vendor) Restarted(ctx context.Context, log *slog.Logger, backoff time.D
 	log.WarnContext(ctx, "claude_orchestrator_restart", slog.Duration("backoff", backoff), slog.Any("error", err))
 }
 
+type hookListener interface {
+	AcceptUnix() (*net.UnixConn, error)
+}
+
 // serve answers hook connections until the listener closes. A hook that
 // connects while the orchestrator drains is still served, with a context
 // that outlives the watch.
-func (v *Vendor) serve(ctx context.Context, w *agent.Watch, ln *net.UnixListener) {
+func (v *Vendor) serve(ctx context.Context, w *agent.Watch, ln hookListener) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
-	for {
+	backoff := hookAcceptBackoffMin
+	for ctx.Err() == nil {
 		conn, err := ln.AcceptUnix()
 		if err != nil {
-			return
+			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+				return
+			}
+			w.Logger.ErrorContext(ctx, "claude_hook_accept_failed", slog.Any("error", err), slog.Duration("retry_in", backoff))
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			}
+			backoff = min(2*backoff, hookAcceptBackoffMax)
+			continue
 		}
+		backoff = hookAcceptBackoffMin
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -535,13 +562,13 @@ func (v *Vendor) Start(ctx context.Context, g *work.Guest, in integration.Integr
 // Program returns the runner program: one session (--capacity 1) with the
 // work order in SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET, the base directory
 // in the guest home, no health listener, an idle release after IdleRelease
-// minutes (the runner then exits 0) and, when the profile has a max_ttl, a
-// retirement retireMargin before the sandbox's max_ttl.
+// minutes (the runner then exits 0), and retirement retireMargin before the
+// deadline from the stored sandbox TTL when that retirement is still possible.
 func Program(dir string, g *work.Guest, now time.Time) agent.Program {
 	args := []string{"claude", "self-hosted-runner", "--capacity", "1", "--base-dir", agent.HomeArg + runnerBaseDir, "--health-port", "0",
 		"--release-idle-session-min", strconv.Itoa(IdleRelease)}
-	if g.Profile != nil && g.Profile.MaxTTL > 0 {
-		if retire := g.Runner.CreateTime.Add(g.Profile.MaxTTL - retireMargin); retire.After(now.Add(time.Minute)) {
+	if g.SandboxMaxTTL > 0 {
+		if retire := g.Runner.CreateTime.Add(g.SandboxMaxTTL - retireMargin); retire.After(now.Add(time.Minute)) {
 			args = append(args, "--retire-at", strconv.FormatInt(retire.Unix(), 10))
 		}
 	}

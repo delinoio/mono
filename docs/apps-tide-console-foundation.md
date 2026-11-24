@@ -20,6 +20,7 @@ Organization owners, admins and members who sign in with Logto.
 
 - The console calls the control plane only through its absolute origin. It reads the origin from `PUBLIC_API_ORIGIN` and uses `https://tide.api.delino.io` when the value is not set. It must not import source from `servers/`.
 - Authentication: the console is a Logto single-page application (`@logto/react`) that requests access tokens for the API resource `https://tide.api.delino.io`. The Logto SDK keeps its session in the browser. The console reports loading to its pages only until the SDK has restored the session for the first time, so a token request never unmounts the page that made it.
+- When a request fails with `Unauthenticated`, the error notice shows "Your session ended. Sign in again." and offers "Sign in with Delino" as its only recovery action. The button starts the Logto sign-in redirect. Other errors keep their retry action where the page offers one.
 - Logto application registration (recorded with placeholders until the tenant registration exists):
 
   | Item                       | Value                                                                                                          |
@@ -69,6 +70,7 @@ Organization owners, admins and members who sign in with Logto.
 - The `api-keys` route shows a new secret once with a copy action and a notice that tide cannot show it again, and explains that the key works only for dev sessions. It lists the keys page by page with "Show more", so the console can show and revoke every key.
 - Organization deletion tells the owner to uninstall the GitHub App in GitHub, because tide cannot uninstall it.
 - The console hides actions that the user's role does not allow; the control plane still enforces every permission.
+- The organization layout supports viewports 320 px wide and wider. From 320 through 760 px, the section list scrolls horizontally above the page content. At 761 px and wider, the section list stacks vertically in a 220 px column.
 - UX follows the Toss Design Guidelines. Dialogs close with `Esc`. A form with a single critical input focuses it when it opens.
 
 ## Storage
@@ -89,6 +91,7 @@ The console sends no logs to a service in this version. Browser console messages
 
 - Package scripts: `dev` (portless, started as `node node_modules/portless/dist/cli.js run --prefix=` through the shared `scripts/dev/with-infisical.mjs` with the Infisical folder `/apps/tide`, according to the [environment contract](repository-environment-contract.md#local-development-injection)), `dev:app` (`rsbuild dev`, which portless starts), `build` (`rsbuild build` into the ignored `dist/`), `preview`, `lint` and `typecheck` (`tsc --noEmit`), `test` (`rstest run` with `happy-dom`) and `test:e2e` (`e2e run`). They run through root Turborepo tasks.
 - Unit tests cover the configuration rules, the router, the role matrix and the dev session delete rule, the runner profile form rules (`workspace_path` for `DEV_SESSION`, guest OS path syntax, the OpenAI Codex queue wait, the update mask, the default priority only on create), the queue view across a gap and a manual retry, the queue order, the setup steps, the GitHub callback parsing and address removal, the invitation link handling and the Logto auth bridge, and render the console against the mock API: role-based navigation and actions, the `INVALID` banner, credential forms with password fields that show only "Set at", the OpenAI Codex webhook URL, the `runs-on` label, the GitHub callback, a reconnect of the live overview, the setup guidance, confirmations of destructive actions, and a one-time API key secret that never reaches browser storage and closes with `Esc`.
+- Unit tests cover sign-in after an `Unauthenticated` response on the organizations page and in the organization shell, and retry actions for other failures.
 - End-to-end suite: `apps/tide/e2e/` according to the [e2e contract](repository-e2e-contract.md), against the development server with `PUBLIC_TIDE_MOCK_API=true`; the app command runs `rsbuild dev --no-env`, so local `.env` files do not affect it. It does not reach a control plane, GitHub or Logto; acceptance against them is not covered.
 
 ## Dependencies and Integrations

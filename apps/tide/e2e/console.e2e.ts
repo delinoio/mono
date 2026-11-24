@@ -9,6 +9,7 @@ const ACME = "0193b000-0000-7000-8000-000000000001";
 const NORTHWIND = "0193b000-0000-7000-8000-000000000002";
 const CONTOSO = "0193b000-0000-7000-8000-000000000003";
 const GLOBEX = "0193b000-0000-7000-8000-000000000004";
+const UNKNOWN_ORG = "0193b000-0000-7000-8000-0000000000ff";
 const INVITATION_SECRET = "tdi_mock_contoso_invitation";
 
 describe("sign-in", () => {
@@ -32,6 +33,24 @@ describe("sign-in", () => {
 });
 
 describe("organizations", () => {
+  test("offers retry when the organization cannot be found", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${UNKNOWN_ORG}`);
+
+    await expect(
+      screen.getByText("It was not found, or you no longer have access to it."),
+    ).toBeVisible();
+    await expect(screen.getByRole("button", "Try again")).toBeVisible();
+    await expect(
+      screen.getByRole("button", "Sign in with Delino"),
+    ).toBeHidden();
+  });
+
   test("creates an organization from a dialog that focuses its only input", async ({
     app,
     screen,
@@ -47,6 +66,83 @@ describe("organizations", () => {
 
     await expect(browser).toHaveURL(/\/orgs\/[0-9a-f-]+$/);
     await expect(screen.getByText("Set up tide")).toBeVisible();
+  });
+});
+
+describe("organization layout", () => {
+  test("fits the document and scrolls the section list at narrow widths", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/members`);
+    await expect(
+      screen.getByRole("heading", "Members", { level: 1 }),
+    ).toBeVisible();
+
+    for (const width of [320, 390, 760]) {
+      await browser.setViewport({ width, height: 844 });
+      const layout = await browser.evaluate(() => {
+        const list = document.querySelector(".sidenav ul");
+        if (!list) throw new Error("Missing organization section list");
+        const root = document.documentElement;
+        return {
+          documentWidth: root.clientWidth,
+          documentScrollWidth: root.scrollWidth,
+          listWidth: list.clientWidth,
+          listScrollWidth: list.scrollWidth,
+          listOverflowX: getComputedStyle(list).overflowX,
+        };
+      });
+
+      expect(layout.documentScrollWidth, `${width}px document`).toBe(
+        layout.documentWidth,
+      );
+      expect(layout.listScrollWidth, `${width}px section list`).toBeGreaterThan(
+        layout.listWidth,
+      );
+      expect(layout.listOverflowX, `${width}px section list overflow`).toBe(
+        "auto",
+      );
+    }
+  });
+
+  test("keeps the 220 px vertical navigation column at desktop widths", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/members`);
+    await expect(
+      screen.getByRole("heading", "Members", { level: 1 }),
+    ).toBeVisible();
+
+    for (const width of [761, 1024]) {
+      await browser.setViewport({ width, height: 844 });
+      const layout = await browser.evaluate(() => {
+        const navigation = document.querySelector(".sidenav");
+        const first = navigation?.querySelector("li");
+        const second = first?.nextElementSibling;
+        if (!navigation || !first || !second) {
+          throw new Error("Missing organization section links");
+        }
+        return {
+          columnWidth: navigation.getBoundingClientRect().width,
+          firstBottom: first.getBoundingClientRect().bottom,
+          secondTop: second.getBoundingClientRect().top,
+        };
+      });
+
+      expect(layout.columnWidth, `${width}px navigation column`).toBe(220);
+      expect(
+        layout.secondTop,
+        `${width}px section list`,
+      ).toBeGreaterThanOrEqual(layout.firstBottom);
+    }
   });
 });
 
@@ -88,6 +184,43 @@ describe("overview", () => {
 });
 
 describe("integrations", () => {
+  test("saves a Cursor integration name, pool, and credential together", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}/integrations`);
+    await screen.getByRole("button", "Create agent integration").tap();
+    await screen.getByRole("combobox", "Vendor").tap();
+    await screen.getByRole("option", "Cursor").tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.type("cursor-before");
+    await screen.getByLabel("Cursor self-hosted pool name").tap();
+    await browser.keyboard.type("pool-before");
+    await screen.getByLabel("Service account API key").tap();
+    await browser.keyboard.type("synthetic-cursor-before");
+    await screen.getByRole("button", "Create integration").tap();
+
+    await screen.getByRole("button", "Edit").tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("cursor-after");
+    await screen.getByLabel("Cursor self-hosted pool name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("pool-after");
+    await screen.getByLabel("Service account API key").tap();
+    await browser.keyboard.type("synthetic-cursor-after");
+    await screen.getByRole("button", "Save changes").tap();
+
+    const row = screen
+      .getByRole("listitem")
+      .filter({ hasText: "cursor-after" });
+    await expect(row).toContainText("Cursor self-hosted pool name: pool-after");
+    await expect(row).toContainText("Service account API key: Set at");
+  });
+
   test("links OwnSand and shows only when the key was set", async ({
     app,
     screen,

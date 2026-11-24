@@ -261,21 +261,28 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 			return nil, err
 		}
 	}
-	if len(deleted) > 0 {
-		list := guestSibling(s, ".tide-sync-"+syncID+".delete")
-		applyEnv[guestEnvDeletes] = list
-		cleanupEnv[guestEnvDeletes] = list
-		n, err := c.writeGuestFile(ctx, s, list, 0o644, bytes.NewReader(pathList(deleted, windows)), nil)
-		res.BytesSent += n
-		if err != nil {
-			return nil, err
-		}
+	strictDeletes := deleted
+	var replacedFiles []string
+	if !windows {
+		applyEnv[guestEnvReplaceFiles] = ""
+		strictDeletes, replacedFiles = splitSyncDeletions(deleted, changed)
 	}
-	if prunes := pruneDirs(deleted, changed); len(prunes) > 0 {
-		list := guestSibling(s, ".tide-sync-"+syncID+".prune")
-		applyEnv[guestEnvPrunes] = list
-		cleanupEnv[guestEnvPrunes] = list
-		n, err := c.writeGuestFile(ctx, s, list, 0o644, bytes.NewReader(pathList(prunes, windows)), nil)
+	for _, list := range []struct {
+		suffix string
+		env    string
+		paths  []string
+	}{
+		{".delete", guestEnvDeletes, strictDeletes},
+		{".replace", guestEnvReplaceFiles, replacedFiles},
+		{".prune", guestEnvPrunes, pruneDirs(deleted, changed)},
+	} {
+		if len(list.paths) == 0 {
+			continue
+		}
+		listPath := guestSibling(s, ".tide-sync-"+syncID+list.suffix)
+		applyEnv[list.env] = listPath
+		cleanupEnv[list.env] = listPath
+		n, err := c.writeGuestFile(ctx, s, listPath, 0o644, bytes.NewReader(pathList(list.paths, windows)), nil)
 		res.BytesSent += n
 		if err != nil {
 			return nil, err
@@ -465,6 +472,29 @@ func pathList(paths []string, windows bool) []byte {
 		}
 	}
 	return b.Bytes()
+}
+
+// splitSyncDeletions separates former files that the POSIX archive needs
+// as directories. If the manifest write failed after apply, those paths may
+// already be directories and must stay in place when the SDK retries.
+func splitSyncDeletions(deleted []string, changed []localFile) (strict, replacedFiles []string) {
+	if len(deleted) == 0 || len(changed) == 0 {
+		return deleted, nil
+	}
+	parents := map[string]bool{}
+	for _, f := range changed {
+		for dir := path.Dir(f.rel); dir != "." && !parents[dir]; dir = path.Dir(dir) {
+			parents[dir] = true
+		}
+	}
+	for _, rel := range deleted {
+		if parents[rel] {
+			replacedFiles = append(replacedFiles, rel)
+		} else {
+			strict = append(strict, rel)
+		}
+	}
+	return strict, replacedFiles
 }
 
 // pruneDirs returns the guest directories that the apply command removes
