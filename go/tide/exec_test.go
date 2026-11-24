@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http/httptest"
 	"os"
 	"runtime"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/delinoio/mono/go/tide/tidetest"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
 
 // needPOSIX skips tests whose fake guest runs sh and tar locally.
@@ -60,6 +62,214 @@ func (c *collected) on(ev ExecEvent) error {
 		c.truncated = append(c.truncated, ev)
 	}
 	return nil
+}
+
+func TestExecCallbackResume(t *testing.T) {
+	needPOSIX(t)
+	rejected := errors.New("output rejected")
+	for _, tc := range []struct {
+		kind           ExecEventKind
+		command        string
+		stdout, stderr string
+	}{
+		{ExecEventStdout, "printf lost", "lost", ""},
+		{ExecEventStderr, "printf lost >&2", "", "lost"},
+	} {
+		t.Run(tc.kind.String(), func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			ctx := context.Background()
+			_, err := c.Exec(ctx, ExecParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+				Command: []string{"sh", "-c", tc.command},
+				OnEvent: func(ev ExecEvent) error {
+					if ev.Kind == tc.kind {
+						return rejected
+					}
+					return nil
+				},
+			})
+			se := requireExecCallbackError(t, err, rejected, 0, 0)
+
+			var got collected
+			res, err := c.AttachExec(ctx, AttachParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(), ExecID: se.ExecID,
+				StdoutOffset: se.StdoutOffset, StderrOffset: se.StderrOffset, OnEvent: got.on,
+			})
+			if err != nil || res.Kind != ExecResultExited || res.ExitCode == nil || *res.ExitCode != 0 || res.Incomplete {
+				t.Fatalf("attach result = %+v, error = %v", res, err)
+			}
+			if got.stdout.String() != tc.stdout || got.stderr.String() != tc.stderr {
+				t.Fatalf("replayed stdout = %q, stderr = %q", got.stdout.String(), got.stderr.String())
+			}
+			if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); n != 1 {
+				t.Fatalf("exec calls = %d, want 1", n)
+			}
+		})
+	}
+}
+
+type execAttachScript struct {
+	tidev1connect.UnimplementedDevSessionServiceHandler
+	events func(*tidev1.AttachDevSessionExecRequest) []*tidev1.DevSessionExecEvent
+}
+
+func (s execAttachScript) AttachDevSessionExec(_ context.Context, req *connect.Request[tidev1.AttachDevSessionExecRequest], stream *connect.ServerStream[tidev1.AttachDevSessionExecResponse]) error {
+	for _, ev := range s.events(req.Msg) {
+		if err := stream.Send(&tidev1.AttachDevSessionExecResponse{Event: ev}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestExecCallbackResumeAttach(t *testing.T) {
+	rejected := errors.New("output rejected")
+	stdout := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Stdout{
+		Stdout: &tidev1.DevSessionExecOutput{Offset: 1, Data: []byte("bcdef")},
+	}}
+	gap := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Stdout{
+		Stdout: &tidev1.DevSessionExecOutput{Offset: 5, Data: []byte("f")},
+	}}
+	stderr := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Stderr{
+		Stderr: &tidev1.DevSessionExecOutput{Offset: 5, Data: []byte("f")},
+	}}
+	truncated := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_OutputTruncated{
+		OutputTruncated: &tidev1.DevSessionExecOutputTruncated{StdoutOffset: 3, StderrOffset: 5},
+	}}
+	exited := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Exited{
+		Exited: &tidev1.DevSessionExecExited{Status: &tidev1.DevSessionExecExited_ExitCode{}},
+	}}
+
+	t.Run("rejected output", func(t *testing.T) {
+		for _, tc := range []struct {
+			name                     string
+			events                   []*tidev1.DevSessionExecEvent
+			kind                     ExecEventKind
+			data                     string
+			stdout, stderr           int64
+			finalStdout, finalStderr int64
+			missingOut, missingErr   ByteRange
+		}{
+			{
+				name: "trimmed stdout", events: []*tidev1.DevSessionExecEvent{stdout, exited},
+				kind: ExecEventStdout, data: "def", stdout: 3, stderr: 2, finalStdout: 6, finalStderr: 2,
+			},
+			{
+				name: "stdout after gap", events: []*tidev1.DevSessionExecEvent{gap, exited},
+				kind: ExecEventStdout, data: "f", stdout: 5, stderr: 2, finalStdout: 6, finalStderr: 2,
+				missingOut: ByteRange{From: 3, To: 5},
+			},
+			{
+				name: "stderr after truncation", events: []*tidev1.DevSessionExecEvent{truncated, stderr, exited},
+				kind: ExecEventStderr, data: "f", stdout: 3, stderr: 5, finalStdout: 3, finalStderr: 6,
+				missingErr: ByteRange{From: 2, To: 5},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				c := newExecAttachClient(t, func(*tidev1.AttachDevSessionExecRequest) []*tidev1.DevSessionExecEvent {
+					return tc.events
+				})
+				var got collected
+				var offered ExecEvent
+				params := AttachParams{ExecID: "exec", StdoutOffset: 3, StderrOffset: 2, OnEvent: func(ev ExecEvent) error {
+					if ev.Kind == tc.kind {
+						offered = ev
+						return rejected
+					}
+					return got.on(ev)
+				}}
+				_, err := c.AttachExec(context.Background(), params)
+				se := requireExecCallbackError(t, err, rejected, tc.stdout, tc.stderr)
+				offset := tc.stdout
+				if tc.kind == ExecEventStderr {
+					offset = tc.stderr
+				}
+				if offered.ExecID != params.ExecID || offered.Offset != offset || string(offered.Data) != tc.data {
+					t.Fatalf("rejected event = %+v, data = %q", offered, offered.Data)
+				}
+				if tc.missingOut.Empty() && tc.missingErr.Empty() {
+					if len(got.truncated) != 0 {
+						t.Fatalf("unexpected truncation: %+v", got.truncated)
+					}
+				} else if len(got.truncated) != 1 || got.truncated[0].MissingStdout != tc.missingOut || got.truncated[0].MissingStderr != tc.missingErr {
+					t.Fatalf("truncation = %+v, want stdout %+v and stderr %+v", got.truncated, tc.missingOut, tc.missingErr)
+				}
+
+				got = collected{}
+				res, err := c.AttachExec(context.Background(), AttachParams{
+					ExecID: se.ExecID, StdoutOffset: se.StdoutOffset, StderrOffset: se.StderrOffset, OnEvent: got.on,
+				})
+				if err != nil || res.StdoutOffset != tc.finalStdout || res.StderrOffset != tc.finalStderr || res.Incomplete {
+					t.Fatalf("reattach result = %+v, error = %v", res, err)
+				}
+				out := got.stdout.String()
+				if tc.kind == ExecEventStderr {
+					out = got.stderr.String()
+				}
+				if out != tc.data || len(got.truncated) != 0 {
+					t.Fatalf("replayed output = %q, truncation = %+v", out, got.truncated)
+				}
+			})
+		}
+	})
+
+	t.Run("accepted output", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			callback bool
+			want     string
+		}{
+			{"callback", true, "def"},
+			{"nil callback", false, ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var got collected
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				c := newExecAttachClient(t, func(req *tidev1.AttachDevSessionExecRequest) []*tidev1.DevSessionExecEvent {
+					if req.GetStdoutOffset() == 6 {
+						return []*tidev1.DevSessionExecEvent{stdout, exited}
+					}
+					// Rotate the first stream before sending the final result.
+					return []*tidev1.DevSessionExecEvent{stdout}
+				})
+				params := AttachParams{ExecID: "exec", StdoutOffset: 3, StderrOffset: 2}
+				if tc.callback {
+					params.OnEvent = got.on
+				}
+				res, err := c.AttachExec(ctx, params)
+				if err != nil || res.StdoutOffset != 6 || res.StderrOffset != 2 || got.stdout.String() != tc.want {
+					t.Fatalf("attach result = %+v, error = %v, stdout = %q", res, err, got.stdout.String())
+				}
+			})
+		}
+	})
+}
+
+func newExecAttachClient(t *testing.T, events func(*tidev1.AttachDevSessionExecRequest) []*tidev1.DevSessionExecEvent) *Client {
+	t.Helper()
+	_, handler := tidev1connect.NewDevSessionServiceHandler(execAttachScript{events: events})
+	srv := httptest.NewTLSServer(handler)
+	t.Cleanup(srv.Close)
+	c, err := New(Options{BaseURL: srv.URL, HTTPClient: srv.Client(), APIKey: tidetest.DefaultAPIKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func requireExecCallbackError(t *testing.T, err, rejected error, stdout, stderr int64) *ExecStreamError {
+	t.Helper()
+	var se *ExecStreamError
+	if !errors.As(err, &se) || !errors.Is(err, rejected) {
+		t.Fatalf("error = %v, want ExecStreamError wrapping %v", err, rejected)
+	}
+	if se.ExecID == "" || se.StdoutOffset != stdout || se.StderrOffset != stderr {
+		t.Fatalf("stream error has exec ID %q and offsets (%d, %d), want exec ID and offsets (%d, %d)",
+			se.ExecID, se.StdoutOffset, se.StderrOffset, stdout, stderr)
+	}
+	return se
 }
 
 func TestExecAttachAfterStreamRotation(t *testing.T) {
