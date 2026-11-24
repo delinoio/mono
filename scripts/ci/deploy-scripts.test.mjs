@@ -2370,6 +2370,8 @@ const httpArgs = [
   "none",
 ];
 
+const accountsArgs = ["accounts-api", ...httpArgs.slice(1)];
+
 // Runs droplet-deploy.sh the way deploy-targets.sh does (`bash -s` with the
 // script on standard input) against stubbed `docker` and `curl`. `old` lists
 // the IDs of running containers of the service. Stub behavior:
@@ -2380,7 +2382,8 @@ const httpArgs = [
 //   STUB_PS_EXIT exit code of `docker ps` (default 0).
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
 //   STUB_LOGS     exit code of `docker logs` (default 0).
-//   STUB_STOP_FAIL  space-separated container IDs that `docker stop` fails for.
+//   STUB_STOP_FAIL  space-separated container name or ID patterns that
+//                   `docker stop` fails for.
 //   STUB_RM_FAIL    space-separated container IDs that `docker rm` fails for
 //                 (`docker rm --force` of a replacement still succeeds).
 //   STUB_START_FAIL glob of the container names that `docker start` fails for.
@@ -2430,13 +2433,16 @@ function setupDroplet(
     mkdirSync(join(deployRoot, "state"));
   }
   if (state !== undefined) {
-    writeFileSync(join(deployRoot, "state", "api.current"), state);
+    writeFileSync(join(deployRoot, "state", `${args[0]}.current`), state);
   }
   if (previous !== undefined) {
-    writeFileSync(join(deployRoot, "state", "api.previous"), previous);
+    writeFileSync(join(deployRoot, "state", `${args[0]}.previous`), previous);
   }
   if (route !== undefined) {
-    writeFileSync(join(deployRoot, "caddy", "sites", "api.caddy"), route);
+    writeFileSync(
+      join(deployRoot, "caddy", "sites", `${args[0]}.caddy`),
+      route,
+    );
   }
   shellStub(
     bin,
@@ -2469,7 +2475,10 @@ case "$1" in
     [[ "\$code" == 0 ]] || echo "docker: Error response from daemon: OCI runtime create failed" >&2
     exit "\$code" ;;
   exec) exit "\${STUB_RELOAD:-0}" ;;
-  stop) [[ " \${STUB_STOP_FAIL:-} " != *" \$4 "* ]] || exit 1 ;;
+  stop)
+    for pattern in \${STUB_STOP_FAIL:-}; do
+      [[ "$4" != $pattern ]] || exit 1
+    done ;;
   start) [[ -z "\${STUB_START_FAIL:-}" || "\$2" != \$STUB_START_FAIL ]] || exit 1 ;;
   image) [[ "\$2" != rm || " \${STUB_IMAGE_RM_FAIL:-} " != *" \$3 "* ]] || exit 1 ;;
   rm) [[ "\$2" == --force || " \${STUB_RM_FAIL:-} " != *" \$2 "* ]] || exit 1 ;;
@@ -2630,6 +2639,138 @@ test(
           .includes(`reverse_proxy ${alias}:8080 {`),
       );
     }
+  },
+);
+
+test(
+  "droplet deploy applies the Accounts stop timeout to deployment and rollback",
+  { skip },
+  (t) => {
+    const first = runDroplet(t, accountsArgs, {
+      old: ["old1"],
+      state: `${olderImage}\n`,
+    });
+    assert.equal(first.status, 0, first.stderr);
+    assert.ok(first.calls.includes("docker stop --time 60 old1"));
+    assert.equal(first.read("state/accounts-api.previous"), `${olderImage}\n`);
+
+    const rollback = runDroplet(
+      t,
+      ["accounts-api", olderImage, ...httpArgs.slice(2)],
+      {
+        old: ["old1"],
+        state: first.read("state/accounts-api.current"),
+        previous: first.read("state/accounts-api.previous"),
+        env: { DROPLET_STOP_TIMEOUT: "00075" },
+      },
+    );
+    assert.equal(rollback.status, 0, rollback.stderr);
+    assert.ok(rollback.calls.includes("docker stop --time 75 old1"));
+    assert.equal(
+      rollback.read("state/accounts-api.current"),
+      `${olderImage}\n`,
+    );
+    assert.equal(
+      rollback.read("state/accounts-api.previous"),
+      `${dropletImage}\n`,
+    );
+  },
+);
+
+test(
+  "droplet deploy rejects invalid Accounts stop timeouts before any change",
+  { skip },
+  (t) => {
+    for (const timeout of [
+      "",
+      "30",
+      "59",
+      "-1",
+      "+60",
+      "60.0",
+      "60s",
+      " 60",
+      "9223372037",
+      "18446744073709551676",
+    ]) {
+      const result = runDroplet(t, accountsArgs, {
+        env: { DROPLET_STOP_TIMEOUT: timeout },
+      });
+      assert.equal(result.status, 1, JSON.stringify(timeout));
+      assert.match(result.stderr, /DROPLET_STOP_TIMEOUT for accounts-api/);
+      assert.deepEqual(result.calls, [""]);
+      assert.equal(result.read("state/accounts-api.lock"), undefined);
+      assert.equal(result.read("caddy/sites/accounts-api.caddy"), undefined);
+    }
+  },
+);
+
+test(
+  "droplet deploy stops failed Accounts replacements without changing the serving route",
+  { skip },
+  (t) => {
+    const route = "# old route\n";
+    for (const [env, timeout] of [
+      [{ STUB_HEALTHY: "0" }, 60],
+      [{ STUB_RELOAD: "1", DROPLET_STOP_TIMEOUT: "75" }, 75],
+    ]) {
+      const result = runDroplet(t, accountsArgs, {
+        route,
+        old: ["old1"],
+        state: `${olderImage}\n`,
+        previous: `${oldestImage}\n`,
+        env,
+      });
+      assert.equal(result.status, 1, result.stderr);
+      const stop = result.calls.find((call) => call.startsWith("docker stop"));
+      assert.match(
+        stop,
+        new RegExp(`^docker stop --time ${timeout} accounts-api-`),
+      );
+      const replacement = stop.split(" ").at(-1);
+      assert.ok(
+        result.calls.indexOf(stop) <
+          result.calls.indexOf(`docker rm ${replacement}`),
+      );
+      assert.equal(
+        result.calls.filter((call) => call.startsWith("docker stop")).length,
+        1,
+      );
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker rm --force")),
+      );
+      assert.equal(result.read("caddy/sites/accounts-api.caddy"), route);
+      assert.equal(
+        result.read("state/accounts-api.current"),
+        `${olderImage}\n`,
+      );
+      assert.equal(
+        result.read("state/accounts-api.previous"),
+        `${oldestImage}\n`,
+      );
+    }
+  },
+);
+
+test(
+  "droplet deploy leaves an Accounts replacement when its graceful stop fails",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, accountsArgs, {
+      env: { STUB_RELOAD: "1", STUB_STOP_FAIL: "accounts-api-*" },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /docker stop failed for the replacement accounts-api-.*; it was not removed/,
+    );
+    assert.match(result.stderr, /route of accounts-api was not switched/);
+    assert.ok(
+      result.calls.some((call) =>
+        call.startsWith("docker stop --time 60 accounts-api-"),
+      ),
+    );
+    assert.ok(!result.calls.some((call) => call.startsWith("docker rm ")));
   },
 );
 
