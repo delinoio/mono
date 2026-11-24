@@ -13,6 +13,19 @@ const UNKNOWN_ORG = "0193b000-0000-7000-8000-0000000000ff";
 const INVITATION_SECRET = "tdi_mock_contoso_invitation";
 
 describe("sign-in", () => {
+  test("returns to sign-in from a direct mock callback visit", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/callback");
+
+    await expect(browser).toHaveURL(/\/$/);
+    await expect(
+      screen.getByRole("button", "Sign in with Delino"),
+    ).toBeVisible();
+  });
+
   test("signs in and lists the organizations", async ({ app, screen }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
