@@ -77,3 +77,16 @@ describe("billing", () => {
     ).toBeVisible();
   });
 });
+
+describe("sign-in callback", () => {
+  test("shows the configuration notice without a Logto registration", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/callback");
+
+    await expect(
+      screen.getByText("Sign-in is not configured for this build."),
+    ).toBeVisible();
+  });
+});
