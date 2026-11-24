@@ -382,6 +382,36 @@ describe("billing", () => {
   });
 });
 
+describe("agent version policy", () => {
+  test("leaves the saved version in place when the admin leaves an unsaved edit", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/settings`);
+
+    const pin = screen.getByRole("radio", "Pin a version");
+    const version = screen.getByRole("textbox", "Pinned version");
+    await pin.tap();
+    await version.tap();
+    await browser.keyboard.type("1.4.2");
+    await screen.getByRole("button", "Save policy").tap();
+    await expect(screen.getByRole("region", "Notifications")).toContainText(
+      "The agent version policy is saved.",
+    );
+
+    await screen.getByRole("radio", "Hold updates").tap();
+    await expect(version).toBeHidden();
+    await screen.getByRole("link", "Devices", { exact: true }).tap();
+    await screen.getByRole("link", "Settings", { exact: true }).tap();
+
+    await expect(pin).toHaveAttribute("aria-checked", "true");
+    await expect(version).toHaveValue("1.4.2");
+  });
+});
+
 describe("invitations", () => {
   test("accepts an invitation link through sign-in and removes the secret from the address", async ({
     app,
