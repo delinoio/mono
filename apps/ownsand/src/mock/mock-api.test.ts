@@ -138,6 +138,8 @@ describe("mock device list", () => {
 
 describe("mock idempotent createSandbox", () => {
   const organizationId = MOCK_IDS.acme;
+  const createTime = Date.UTC(2026, 0, 1);
+  const dayMs = 24 * 60 * 60 * 1000;
   const request = (idempotencyKey: string) => ({
     organizationId,
     idempotencyKey,
@@ -148,6 +150,10 @@ describe("mock idempotent createSandbox", () => {
     idleTtl: { seconds: 600n },
     maxTtl: { seconds: 3600n },
     labels: { team: "ci" },
+  });
+
+  afterEach(() => {
+    rs.useRealTimers();
   });
 
   test("a retry returns the same sandbox and the request labels", async () => {
@@ -219,6 +225,72 @@ describe("mock idempotent createSandbox", () => {
     await expect(
       client.createSandbox({ ...request(key), labels: { team: "other" } }),
     ).rejects.toMatchObject({ code: Code.AlreadyExists });
+  });
+
+  test("replays until the 24-hour boundary without extending the reservation", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(createTime);
+    const client = createClient(SandboxService, createMockTransport());
+    const params = request(uuidV7());
+    const first = await client.createSandbox(params);
+
+    rs.setSystemTime(createTime + dayMs - 1);
+    expect(await client.createSandbox(params)).toEqual(first);
+    await expect(
+      client.createSandbox({ ...params, labels: { team: "other" } }),
+    ).rejects.toMatchObject({ code: Code.AlreadyExists });
+
+    rs.setSystemTime(createTime + dayMs);
+    const second = await client.createSandbox(params);
+    expect(second.sandbox?.sandboxId).not.toBe(first.sandbox?.sandboxId);
+    expect(
+      await client.getSandbox({
+        organizationId,
+        sandboxId: first.sandbox!.sandboxId,
+      }),
+    ).toMatchObject({ sandbox: first.sandbox });
+  });
+
+  test("reserves a reused key for 24 hours with the new parameters", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(createTime);
+    const client = createClient(SandboxService, createMockTransport());
+    const params = request(uuidV7());
+    const first = await client.createSandbox(params);
+    const changed = { ...params, labels: { team: "other" } };
+    const reuseTime = createTime + dayMs + 1;
+
+    rs.setSystemTime(reuseTime);
+    const second = await client.createSandbox(changed);
+    expect(second.sandbox?.sandboxId).not.toBe(first.sandbox?.sandboxId);
+    expect(second.sandbox?.labels).toEqual(changed.labels);
+    expect(await client.createSandbox(changed)).toEqual(second);
+
+    rs.setSystemTime(reuseTime + dayMs - 1);
+    expect(await client.createSandbox(changed)).toEqual(second);
+    rs.setSystemTime(reuseTime + dayMs);
+    const third = await client.createSandbox(changed);
+    expect(third.sandbox?.sandboxId).not.toBe(second.sandbox?.sandboxId);
+  });
+
+  test("leaves an expired key available after failed placement", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(createTime);
+    const client = createClient(SandboxService, createMockTransport());
+    const params = request(uuidV7());
+    const first = await client.createSandbox(params);
+
+    rs.setSystemTime(createTime + dayMs);
+    await expect(
+      client.createSandbox({
+        ...params,
+        placement: { deviceId: uuidV7() },
+      }),
+    ).rejects.toMatchObject({ code: Code.NotFound });
+
+    const second = await client.createSandbox(params);
+    expect(second.sandbox?.sandboxId).not.toBe(first.sandbox?.sandboxId);
+    expect(await client.createSandbox(params)).toEqual(second);
   });
 
   test("label order does not change the idempotency result", async () => {
