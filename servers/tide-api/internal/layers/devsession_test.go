@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 )
@@ -408,6 +410,9 @@ func TestDevSessionFiles(t *testing.T) {
 	_, err = owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
 		WriteId: api.NewID(), Path: "/x", Data: make([]byte, 1<<20+1)}))
 	wantCode(t, "chunk above 1 MiB", err, connect.CodeInvalidArgument)
+	_, err = owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
+		WriteId: api.NewID(), Path: "/x", Offset: math.MaxInt64, Data: []byte("x"), Final: true}))
+	wantCode(t, "chunk end offset overflows", err, connect.CodeInvalidArgument)
 	_, err = w.env.User(w.org.Admin).DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
 		WriteId: api.NewID(), Path: "/x", Data: []byte("x"), Final: true}))
 	wantCode(t, "admin writes", err, connect.CodePermissionDenied)
@@ -451,6 +456,34 @@ func TestDevSessionFiles(t *testing.T) {
 	if !strings.Contains(w.env.Logs.String(), `"dev_session_file_read"`) || !strings.Contains(w.env.Logs.String(), `"dev_session_file_write"`) ||
 		strings.Contains(w.env.Logs.String(), "0123456789") {
 		t.Fatal("file transfer logs")
+	}
+}
+
+func TestDevSessionExecOwnSandValidation(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	s, _ := w.runningSession(t)
+	sdk, err := (ownsandclient.SDKFactory{BaseURL: "http://127.0.0.1:1"}).New(w.osOrg, ownsandKey('a'))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.fake.SetExec(sdk.Exec, nil)
+
+	owner := w.env.User(w.org.Member)
+	stream, err := owner.DevSession.ExecDevSession(t.Context(), connect.NewRequest(&tidev1.ExecDevSessionRequest{
+		OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ExecId: api.NewID(),
+		Command: []string{"id"}, Env: map[string]string{"BIG": strings.Repeat("x", 300<<10)},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stream.Receive() {
+		t.Fatal("oversized exec returned an event")
+	}
+	err = stream.Err()
+	wantCode(t, "oversized exec", err, connect.CodeInvalidArgument)
+	var ce *connect.Error
+	if !errors.As(err, &ce) || !strings.Contains(ce.Message(), "more than 262144") || strings.Contains(ce.Message(), "try again") {
+		t.Fatalf("oversized exec returned %v", err)
 	}
 }
 
