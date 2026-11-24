@@ -2,6 +2,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "@rstest/core";
 import * as React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import {
   act,
   cleanup,
@@ -1246,16 +1247,64 @@ describe("Select", () => {
       expect(trigger.textContent).toContain("Template: node-24-toolchain");
     });
 
-    test("prefers an explicit label over the children", () => {
+    test.each([
+      { name: "standalone bigint", children: 12n, text: "12" },
+      { name: "mixed bigint", children: [12n, " GiB"], text: "12 GiB" },
+      {
+        name: "nested bigint beyond the safe integer range",
+        children: <span>{9007199254740993n}</span>,
+        text: "9007199254740993",
+      },
+      { name: "number", children: 12, text: "12" },
+    ])("shows the selected text for $name", ({ children, text }) => {
+      const select = (
+        <Select label="Quantity" defaultValue="option-id">
+          <>
+            <SelectOption value="option-id">{children}</SelectOption>
+            <SelectOption value="other-option">Other option</SelectOption>
+          </>
+        </Select>
+      );
+      const markup = document.createElement("div");
+      markup.innerHTML = renderToStaticMarkup(select);
+      expect(markup.querySelector(".dui-select-value")?.textContent).toBe(text);
+
+      render(select);
+      expect(
+        screen.getByRole("combobox", { name: "Quantity" }).textContent,
+      ).toBe(text);
+    });
+
+    test("shows a mixed bigint option and reports its string value on selection", async () => {
+      const values: (string | null)[] = [];
       render(
-        <Select label="Role" defaultValue="editor">
-          <SelectOption value="editor" label="Editor label">
-            Editor {"children"}
+        <Select label="Quantity" onValueChange={(value) => values.push(value)}>
+          <SelectOption value="option-id">{12n} GiB</SelectOption>
+        </Select>,
+      );
+
+      const trigger = screen.getByRole("combobox", { name: "Quantity" });
+      await act(async () => {
+        fireEvent.click(trigger);
+      });
+      const option = screen.getByRole("option", { name: "12 GiB" });
+      await act(async () => {
+        fireEvent.click(option);
+      });
+      expect(trigger.textContent).toBe("12 GiB");
+      expect(values).toEqual(["option-id"]);
+    });
+
+    test("prefers an explicit label over bigint children", () => {
+      render(
+        <Select label="Quantity" defaultValue="option-id">
+          <SelectOption value="option-id" label="Twelve">
+            {12n}
           </SelectOption>
         </Select>,
       );
-      const trigger = screen.getByRole("combobox", { name: "Role" });
-      expect(trigger.textContent).toContain("Editor label");
+      const trigger = screen.getByRole("combobox", { name: "Quantity" });
+      expect(trigger.textContent).toBe("Twelve");
     });
 
     test("reads the text of nested elements and numbers", () => {
