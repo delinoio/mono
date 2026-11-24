@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -333,7 +334,11 @@ func (e *env) restart() {
 var limits = &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 4096, DiskGib: 20, VcpuOvercommitPercent: 100}
 
 func (e *env) createCmd(vcpu int32, idle, max time.Duration) *ownsandv1.CreateSandboxCommand {
-	id, _ := uuidv7.NewString()
+	e.t.Helper()
+	id, err := uuidv7.NewString()
+	if err != nil {
+		e.t.Fatalf("generate sandbox ID for create: %v", err)
+	}
 	return &ownsandv1.CreateSandboxCommand{
 		SandboxId:   id,
 		Source:      &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_LINUX},
@@ -620,44 +625,121 @@ func TestDeleteMarkerIsNotReportedUntilItIsSaved(t *testing.T) {
 	}
 }
 
-// blockingGate is a CreateGate whose BeginCreate waits until release is closed.
-// entered receives one value per BeginCreate call that started waiting.
-type blockingGate struct {
-	entered chan struct{}
-	release chan struct{}
+const createGateTimeout = 5 * time.Second
+
+type gateCreateResult struct {
+	entry *ownsandv1.SandboxStateEntry
+	err   error
 }
 
-func newBlockingGate() *blockingGate {
-	return &blockingGate{entered: make(chan struct{}, 8), release: make(chan struct{})}
+// blockingGate holds creates in BeginCreate until the test or cleanup releases it.
+// entered receives one value per BeginCreate call that started waiting.
+type blockingGate struct {
+	entered  chan struct{}
+	released chan struct{}
+	release  func()
+	results  chan gateCreateResult
+	workers  []<-chan struct{}
+}
+
+func newBlockingGate(t *testing.T, workerCount int) *blockingGate {
+	released := make(chan struct{})
+	g := &blockingGate{
+		entered:  make(chan struct{}, workerCount),
+		released: released,
+		release:  sync.OnceFunc(func() { close(released) }),
+		results:  make(chan gateCreateResult, workerCount),
+	}
+	// Tests construct the gate after newEnv so workers can finish before
+	// cleanup closes the manager and removes its store.
+	t.Cleanup(func() {
+		g.release()
+		timer := time.NewTimer(createGateTimeout)
+		defer timer.Stop()
+		for i, worker := range g.workers {
+			select {
+			case <-worker:
+			case <-timer.C:
+				t.Errorf("gate cleanup: create worker %d did not return within %s", i+1, createGateTimeout)
+				return
+			}
+		}
+	})
+	return g
 }
 
 func (g *blockingGate) BeginCreate() (func(), error) {
-	g.entered <- struct{}{}
-	<-g.release
+	select {
+	case g.entered <- struct{}{}:
+	case <-g.released:
+	}
+	<-g.released
 	return func() {}, nil
+}
+
+func (g *blockingGate) startCreate(ctx context.Context, m *Manager, cmd *ownsandv1.CreateSandboxCommand) {
+	stopped := make(chan struct{})
+	g.workers = append(g.workers, stopped)
+	go func() {
+		defer close(stopped)
+		entry, err := m.Create(ctx, cmd)
+		g.results <- gateCreateResult{entry, err}
+	}()
+}
+
+func (g *blockingGate) waitEntry(ctx context.Context, stage string) error {
+	var res gateCreateResult
+	select {
+	case <-g.entered:
+		return nil
+	case res = <-g.results:
+	case <-ctx.Done():
+		// Report the create result if it arrived by the time the wait expired.
+		select {
+		case res = <-g.results:
+		default:
+			return fmt.Errorf("%s: wait for gate entry: %w", stage, ctx.Err())
+		}
+	}
+	if res.err != nil {
+		return fmt.Errorf("%s: create returned before gate entry with entry %v: %w", stage, res.entry, res.err)
+	}
+	return fmt.Errorf("%s: create returned before gate entry with entry %v and no error", stage, res.entry)
+}
+
+func (g *blockingGate) requireEntry(t *testing.T, stage string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), createGateTimeout)
+	defer cancel()
+	if err := g.waitEntry(ctx, stage); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (g *blockingGate) waitResult(t *testing.T, stage string) gateCreateResult {
+	t.Helper()
+	select {
+	case res := <-g.results:
+		return res
+	case <-time.After(createGateTimeout):
+		t.Fatalf("%s: create did not return within %s", stage, createGateTimeout)
+		return gateCreateResult{}
+	}
 }
 
 func TestCreateGateRecheckAfterConcurrentDelete(t *testing.T) {
 	e := newEnv(t)
-	gate := newBlockingGate()
+	gate := newBlockingGate(t, 1)
 	e.m.SetCreateGate(gate)
 	cmd := e.createCmd(1, time.Hour, time.Hour)
-	type result struct {
-		entry *ownsandv1.SandboxStateEntry
-		err   error
-	}
-	done := make(chan result, 1)
-	go func() {
-		entry, err := e.m.Create(context.Background(), cmd)
-		done <- result{entry, err}
-	}()
-	<-gate.entered
-	del, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: cmd.GetSandboxId()})
+	gate.startCreate(t.Context(), e.m, cmd)
+	gate.requireEntry(t, "create before concurrent delete")
+	del, err := e.m.Delete(t.Context(), &ownsandv1.DeleteSandboxCommand{SandboxId: cmd.GetSandboxId()})
 	if err != nil || del.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
 		t.Fatalf("delete %v %v", del, err)
 	}
-	close(gate.release)
-	res := <-done
+	gate.release()
+	res := gate.waitResult(t, "create after concurrent delete")
 	var ce *CommandError
 	if !errors.As(res.err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
 		t.Fatalf("create after concurrent delete: %v", res.err)
@@ -665,43 +747,26 @@ func TestCreateGateRecheckAfterConcurrentDelete(t *testing.T) {
 	if n := e.rt.startCount(); n != 0 {
 		t.Fatalf("VM starts after delete = %d, want 0", n)
 	}
-	e.m.mu.Lock()
-	got := e.m.sandboxes[cmd.GetSandboxId()].rec.State
-	e.m.mu.Unlock()
-	if got != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+	if got, _ := e.m.State(cmd.GetSandboxId()); got != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
 		t.Fatalf("record state %v, want DELETED", got)
 	}
 }
 
 func TestCreateGateRecheckAfterRemoval(t *testing.T) {
 	e := newEnv(t)
-	gate := newBlockingGate()
+	gate := newBlockingGate(t, 1)
 	e.m.SetCreateGate(gate)
-	release := sync.OnceFunc(func() { close(gate.release) })
-	t.Cleanup(release)
 	cmd := e.createCmd(1, time.Hour, time.Hour)
-	done := make(chan error, 1)
-	go func() {
-		_, err := e.m.Create(t.Context(), cmd)
-		done <- err
-	}()
-	select {
-	case <-gate.entered:
-	case <-time.After(10 * time.Second):
-		t.Fatal("create did not reach the gate")
-	}
+	gate.startCreate(t.Context(), e.m, cmd)
+	gate.requireEntry(t, "create before removal")
 	if err := e.m.RemoveAll(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	release()
-	select {
-	case err := <-done:
-		var ce *CommandError
-		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
-			t.Errorf("create after removal: %v, want FAILED_PRECONDITION", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("create did not return")
+	gate.release()
+	res := gate.waitResult(t, "create after removal")
+	var ce *CommandError
+	if !errors.As(res.err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Errorf("create after removal: %v, want FAILED_PRECONDITION", res.err)
 	}
 	if n := e.rt.startCount(); n != 0 {
 		t.Errorf("VM starts after removal = %d, want 0", n)
@@ -716,25 +781,17 @@ func TestCreateGateRecheckAfterRemoval(t *testing.T) {
 
 func TestCreateGateRecheckDuplicateCreateStartsOnce(t *testing.T) {
 	e := newEnv(t)
-	gate := newBlockingGate()
+	gate := newBlockingGate(t, 2)
 	e.m.SetCreateGate(gate)
 	cmd := e.createCmd(1, time.Hour, time.Hour)
-	type result struct {
-		entry *ownsandv1.SandboxStateEntry
-		err   error
-	}
-	done := make(chan result, 2)
 	for range 2 {
-		go func() {
-			entry, err := e.m.Create(context.Background(), cmd)
-			done <- result{entry, err}
-		}()
+		gate.startCreate(t.Context(), e.m, cmd)
 	}
-	<-gate.entered
-	<-gate.entered
-	close(gate.release)
-	for range 2 {
-		res := <-done
+	gate.requireEntry(t, "first duplicate create")
+	gate.requireEntry(t, "second duplicate create")
+	gate.release()
+	for i := range 2 {
+		res := gate.waitResult(t, fmt.Sprintf("duplicate create result %d", i+1))
 		if res.err != nil || res.entry.GetSandboxId() != cmd.GetSandboxId() {
 			t.Fatalf("create: %v %v", res.entry, res.err)
 		}
@@ -746,17 +803,73 @@ func TestCreateGateRecheckDuplicateCreateStartsOnce(t *testing.T) {
 
 func TestCreateGateControlStartsOnce(t *testing.T) {
 	e := newEnv(t)
-	gate := newBlockingGate()
-	close(gate.release)
+	gate := newBlockingGate(t, 1)
+	gate.release()
 	e.m.SetCreateGate(gate)
 	cmd := e.createCmd(1, time.Hour, time.Hour)
-	entry, err := e.m.Create(context.Background(), cmd)
-	if err != nil || entry.GetSandboxId() != cmd.GetSandboxId() {
-		t.Fatalf("create: %v %v", entry, err)
+	gate.startCreate(t.Context(), e.m, cmd)
+	res := gate.waitResult(t, "create through open gate")
+	if res.err != nil || res.entry.GetSandboxId() != cmd.GetSandboxId() {
+		t.Fatalf("create: %v %v", res.entry, res.err)
 	}
 	if n := e.rt.startCount(); n != 1 {
 		t.Fatalf("VM starts = %d, want 1", n)
 	}
+}
+
+func TestCreateGateControlEntryWait(t *testing.T) {
+	t.Run("early result", func(t *testing.T) {
+		e := newEnv(t)
+		gate := newBlockingGate(t, 1)
+		e.m.SetCreateGate(gate)
+		cmd := e.createCmd(1, time.Hour, time.Hour)
+		cmd.SandboxId = ""
+		gate.startCreate(t.Context(), e.m, cmd)
+		ctx, cancel := context.WithTimeout(t.Context(), createGateTimeout)
+		defer cancel()
+		err := gate.waitEntry(ctx, "invalid sandbox ID")
+		var ce *CommandError
+		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT ||
+			!strings.Contains(err.Error(), "invalid sandbox ID: create returned before gate entry") ||
+			!strings.Contains(err.Error(), "sandbox_id") {
+			t.Fatalf("gate entry wait = %v, want the sandbox ID validation error", err)
+		}
+	})
+	t.Run("missing entry and result", func(t *testing.T) {
+		gate := newBlockingGate(t, 1)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Millisecond)
+		defer cancel()
+		err := gate.waitEntry(ctx, "missing create")
+		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "missing create: wait for gate entry") {
+			t.Fatalf("gate entry wait = %v, want a gate entry deadline", err)
+		}
+	})
+}
+
+func TestCreateGateControlCleanupAfterDeleteFailure(t *testing.T) {
+	var gate *blockingGate
+	if !t.Run("failed delete", func(t *testing.T) {
+		e := newEnv(t)
+		gate = newBlockingGate(t, 1)
+		e.m.SetCreateGate(gate)
+		cmd := e.createCmd(1, time.Hour, time.Hour)
+		gate.startCreate(t.Context(), e.m, cmd)
+		gate.requireEntry(t, "create before failed delete")
+		id := cmd.GetSandboxId()
+		blockRecord(t, e.st, id)
+		_, err := e.m.Delete(t.Context(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+		requireInternal(t, err)
+		// Exit with the gate held, as the delete test does on failure.
+	}) {
+		return
+	}
+	select {
+	case <-gate.workers[0]:
+	default:
+		t.Fatal("gate cleanup did not join the create worker")
+	}
+	res := gate.waitResult(t, "create after failed delete cleanup")
+	requireInternal(t, res.err)
 }
 
 func TestDeleteCancelsRunningCreate(t *testing.T) {
