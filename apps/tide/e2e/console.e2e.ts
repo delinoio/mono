@@ -799,6 +799,31 @@ describe("API key revocation", () => {
 });
 
 describe("invitations", () => {
+  test("creates and revokes an invitation as an admin and hides the controls from members", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}/members`);
+    await expect(screen.getByText("No pending invitations")).toBeVisible();
+
+    await screen.getByRole("button", "Invite someone").tap();
+    await screen.getByRole("button", "Create link").tap();
+    const link = screen.getByRole("dialog", "Your invitation link");
+    await expect(link).toContainText("/invitations/accept#secret=");
+    await screen.getByRole("button", "Done").tap();
+    await expect(link).toBeHidden();
+    await screen.getByRole("button", "Revoke").tap();
+    await expect(screen.getByText("No pending invitations")).toBeVisible();
+
+    await app.open(`/orgs/${NORTHWIND}/members`);
+    await expect(
+      screen.getByRole("heading", "Members", { level: 1 }),
+    ).toBeVisible();
+    await expect(screen.getByRole("button", "Invite someone")).toBeHidden();
+  });
+
   test("accepts an invitation link and removes the secret from the address", async ({
     app,
     screen,

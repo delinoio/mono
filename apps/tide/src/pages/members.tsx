@@ -1,11 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
-import { useQueryClient } from "@tanstack/react-query";
+import { create } from "@bufbuild/protobuf";
+import {
+  callUnaryMethod,
+  createQueryOptions,
+  useMutation,
+  useTransport,
+} from "@connectrpc/connect-query";
+import {
+  useQuery as useReactQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { toast } from "delino-ui/toast";
 import { InvitationState, Role } from "@delino/tide-protos/v1/common_pb";
-import { type Member, MemberService } from "@delino/tide-protos/v1/member_pb";
+import {
+  type Invitation,
+  ListInvitationsResponseSchema,
+  type Member,
+  MemberService,
+} from "@delino/tide-protos/v1/member_pb";
 import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import { useState } from "react";
 import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
@@ -149,13 +163,35 @@ export function MembersPage() {
 
 function Invitations() {
   const { organizationId } = useOrg();
+  const transport = useTransport();
   const queryClient = useQueryClient();
-  const refresh = () => invalidateServices(queryClient, MemberService);
-  const list = useQuery(MemberService.method.listInvitations, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
+  const method = MemberService.method.listInvitations;
+  const input = { organizationId, pageSize: MAX_PAGE_SIZE };
+  const query = createQueryOptions(method, input, { transport });
+  const list = useReactQuery({
+    ...query,
+    queryFn: async ({ signal }) => {
+      const invitations: Invitation[] = [];
+      let pageToken = "";
+      do {
+        const page = await callUnaryMethod(
+          transport,
+          method,
+          { ...input, pageToken },
+          { signal },
+        );
+        invitations.push(...page.invitations);
+        pageToken = page.nextPageToken;
+      } while (pageToken !== "");
+      return create(ListInvitationsResponseSchema, { invitations });
+    },
   });
-  const create = useMutation(MemberService.method.createInvitation, {
+  const refresh = async () => {
+    // A write can finish while the first load is still paging.
+    await queryClient.cancelQueries({ queryKey: query.queryKey, exact: true });
+    await invalidateServices(queryClient, MemberService);
+  };
+  const createInvitation = useMutation(MemberService.method.createInvitation, {
     onSuccess: refresh,
   });
   const revoke = useMutation(MemberService.method.revokeInvitation, {
@@ -226,7 +262,7 @@ function Invitations() {
         description="You get a one-time link that works for 7 days. Send it to the person you invite."
         submitLabel="Create link"
         onSubmit={async () => {
-          const res = await create.mutateAsync({
+          const res = await createInvitation.mutateAsync({
             organizationId,
             role: Number(inviteRole) as Role,
           });

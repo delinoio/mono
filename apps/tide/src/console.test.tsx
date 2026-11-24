@@ -41,8 +41,10 @@ import {
 } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
 import {
+  type ListInvitationsRequest,
   type ListMembersRequest,
   MemberService,
+  type RevokeInvitationRequest,
 } from "@delino/tide-protos/v1/member_pb";
 import {
   GetOrganizationResponseSchema,
@@ -2396,6 +2398,135 @@ describe("confirmation dialog requests", () => {
 });
 
 describe("invitations", () => {
+  function invitationFixture({ failContinuation = false } = {}) {
+    const mock = createMockTransport();
+    const client = createClient(MemberService, mock);
+    const listRequests: ListInvitationsRequest[] = [];
+    const revokeRequests: RevokeInvitationRequest[] = [];
+    const fixture = createRouterTransport((router) => {
+      router.service(MemberService, {
+        async listInvitations(req, { signal }) {
+          listRequests.push(req);
+          if (failContinuation && req.pageToken !== "") {
+            failContinuation = false;
+            throw new ConnectError("Continuation failed", Code.Internal);
+          }
+          const page = await client.listInvitations(req, { signal });
+          // The control plane returns a token at the end of every full page.
+          if (page.invitations.length === req.pageSize && !page.nextPageToken) {
+            page.nextPageToken = String(Number(req.pageToken) + req.pageSize);
+          }
+          return page;
+        },
+        revokeInvitation(req, { signal }) {
+          revokeRequests.push(req);
+          return client.revokeInvitation(req, { signal });
+        },
+      });
+    });
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...args) {
+        const handler =
+          method.name === "ListInvitations" ||
+          method.name === "RevokeInvitation"
+            ? fixture
+            : mock;
+        return handler.unary(method, ...args);
+      },
+    };
+    return { client, listRequests, revokeRequests, transport };
+  }
+
+  test("lists and revokes a later-page invitation and refreshes after writes", async () => {
+    const { client, listRequests, revokeRequests, transport } =
+      invitationFixture();
+    const organizationId = MOCK_IDS.globex;
+    const invite = { organizationId, role: Role.MEMBER };
+    const seeded = [];
+    for (let i = 0; i <= MAX_PAGE_SIZE; i++) {
+      seeded.push(await client.createInvitation(invite));
+    }
+    renderConsole(`/orgs/${organizationId}/members`, { transport });
+    const list = await screen.findByRole("list", {
+      name: "Pending invitations",
+    });
+    expect(within(list).getAllByRole("listitem").length).toBe(201);
+    expect(
+      [...list.querySelectorAll("code")].map((code) => code.textContent),
+    ).toEqual(seeded.map(({ invitation }) => `${invitation!.secretPrefix}…`));
+
+    const revoke = within(list).getAllByRole("button", { name: "Revoke" });
+    await click(revoke.at(-1)!);
+    expect(revokeRequests).toEqual([
+      expect.objectContaining({
+        organizationId,
+        invitationId: seeded.at(-1)!.invitation!.invitationId,
+      }),
+    ]);
+    await waitFor(() =>
+      expect(
+        within(
+          screen.getByRole("list", { name: "Pending invitations" }),
+        ).getAllByRole("listitem"),
+      ).toHaveLength(200),
+    );
+
+    await click(screen.getByRole("button", { name: "Invite someone" }));
+    await click(screen.getByRole("button", { name: "Create link" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Your invitation link",
+    });
+    expect(dialog.querySelector("code")?.textContent).toContain(
+      "/invitations/accept#secret=tdi_",
+    );
+    await click(within(dialog).getByRole("button", { name: "Done" }));
+    expect(
+      screen.queryByRole("dialog", { name: "Your invitation link" }),
+    ).toBeNull();
+    expect(within(list).getAllByRole("listitem").length).toBe(201);
+    expect(
+      listRequests.map(({ organizationId, pageToken, pageSize }) => ({
+        organizationId,
+        pageToken,
+        pageSize,
+      })),
+    ).toEqual(
+      ["", "200", "", "200", "", "200"].map((pageToken) => ({
+        organizationId,
+        pageToken,
+        pageSize: MAX_PAGE_SIZE,
+      })),
+    );
+  });
+
+  test("retries the complete list after a continuation error and stops at an empty terminal page", async () => {
+    const { client, listRequests, transport } = invitationFixture({
+      failContinuation: true,
+    });
+    const organizationId = MOCK_IDS.acme;
+    for (let i = 0; i < MAX_PAGE_SIZE; i++) {
+      await client.createInvitation({ organizationId, role: Role.MEMBER });
+    }
+    renderConsole(`/orgs/${organizationId}/members`, { transport });
+    const retry = await screen.findByRole("button", { name: "Try again" });
+    expect(screen.queryByText("No pending invitations")).toBeNull();
+    expect(
+      screen.queryByRole("list", { name: "Pending invitations" }),
+    ).toBeNull();
+    await click(retry);
+    const list = await screen.findByRole("list", {
+      name: "Pending invitations",
+    });
+    expect(within(list).getAllByRole("listitem").length).toBe(200);
+    expect(listRequests.map(({ pageToken }) => pageToken)).toEqual([
+      "",
+      "200",
+      "",
+      "200",
+    ]);
+  });
+
   function holdInvitationAccept() {
     const mock = createMockTransport();
     let release = () => {};
