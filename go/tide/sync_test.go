@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -824,6 +825,136 @@ func TestDownloadFileAndDirectory(t *testing.T) {
 	}
 	if srv.Calls("/delino.tide.v1.DevSessionService/ReadDevSessionFile") != reads {
 		t.Fatal("a download over the limit read the file")
+	}
+}
+
+func TestDownloadAtFilenameLimit(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	ws := ds.GetWorkspacePath()
+	if err := os.Mkdir(filepath.Join(ws, "tree"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"file", "tree/new.txt"} {
+		if err := os.WriteFile(filepath.Join(ws, path), []byte("new"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Use the full 255-byte basename allowed by common POSIX filesystems.
+	name := strings.Repeat("a", 255)
+	for _, tc := range []struct {
+		name, guest, oldPath, newPath string
+		failRead                      bool
+	}{
+		{name: "replace file", guest: "file", oldPath: ".", newPath: "."},
+		{name: "replace directory", guest: "tree", oldPath: "old.txt", newPath: "new.txt"},
+		{name: "install file", guest: "file", newPath: "."},
+		{name: "failed transfer", guest: "file", oldPath: ".", failRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			dest := filepath.Join(parent, name)
+			if tc.oldPath != "" {
+				old := filepath.Join(dest, tc.oldPath)
+				if err := os.MkdirAll(filepath.Dir(old), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(old, []byte("old"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.failRead {
+				srv.Fail("/delino.tide.v1.DevSessionService/ReadDevSessionFile",
+					connect.NewError(connect.CodePermissionDenied, errors.New("transfer stopped")))
+			}
+			res, err := c.Download(t.Context(), DownloadParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: tc.guest, LocalPath: dest,
+			})
+			if tc.failRead {
+				if connect.CodeOf(err) != connect.CodePermissionDenied {
+					t.Fatalf("failed transfer = %v", err)
+				}
+				if contents, err := os.ReadFile(dest); err != nil || string(contents) != "old" {
+					t.Fatalf("destination after failed transfer = %q, %v", contents, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if res.LocalPath != dest || res.Directory != (tc.guest == "tree") {
+					t.Fatalf("download result = %+v", res)
+				}
+				if contents, err := os.ReadFile(filepath.Join(dest, tc.newPath)); err != nil || string(contents) != "new" {
+					t.Fatalf("downloaded content = %q, %v", contents, err)
+				}
+				if tc.oldPath == "old.txt" {
+					if _, err := os.Lstat(filepath.Join(dest, tc.oldPath)); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("old directory entry remains: %v", err)
+					}
+				}
+			}
+			entries, err := os.ReadDir(parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].Name() != name {
+				t.Fatalf("unexpected destination parent entries: %v", entries)
+			}
+		})
+	}
+}
+
+func TestReplacePathRollback(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		blockRestore bool
+	}{
+		{name: "restore destination"},
+		{name: "retain backup", blockRestore: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			dest := filepath.Join(parent, "result")
+			staged := filepath.Join(parent, "missing")
+			if err := os.WriteFile(dest, []byte("old"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var backup string
+			rename := func(from, to string) error {
+				if from == dest {
+					backup = to
+				}
+				if from == staged && tc.blockRestore {
+					// A directory appears after the old file moved aside.
+					if err := os.Mkdir(dest, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return os.Rename(from, to)
+			}
+			err := replacePath(staged, dest, rename)
+			if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("publication error = %v", err)
+			}
+			if backup == "" {
+				t.Fatal("the destination was not backed up")
+			}
+			old := dest
+			if tc.blockRestore {
+				if !strings.Contains(err.Error(), strconv.Quote(backup)) {
+					t.Fatalf("error does not report the backup path %q: %v", backup, err)
+				}
+				old = backup
+			} else if _, err := os.Lstat(filepath.Dir(backup)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("backup directory remains: %v", err)
+			}
+			if contents, err := os.ReadFile(old); err != nil || string(contents) != "old" {
+				t.Fatalf("old content = %q, %v", contents, err)
+			}
+		})
 	}
 }
 
