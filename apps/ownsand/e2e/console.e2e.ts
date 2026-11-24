@@ -185,6 +185,30 @@ describe("devices", () => {
     await expect(screen.getByRole("button", "Remove device")).toBeVisible();
   });
 
+  test("shows saved device limits when returning to the device page", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/devices/${BUILD_BOX}`);
+
+    const disk = screen.getByLabel("Disk limit (GiB)");
+    await expect(disk).toHaveValue("500");
+    await disk.fill("600");
+    await screen.getByRole("button", "Save limits").tap();
+    await expect(
+      screen
+        .getByRole("region", "Notifications")
+        .getByText("The device limits are saved."),
+    ).toBeVisible();
+
+    await screen.getByRole("link", "Devices", { exact: true }).tap();
+    await expect(screen.getByText("80 of 600 GiB")).toBeVisible();
+    await screen.getByRole("link", "build-box-1").tap();
+    await expect(disk).toHaveValue("600");
+  });
+
   test("removes a device and drops it from the device list", async ({
     app,
     screen,

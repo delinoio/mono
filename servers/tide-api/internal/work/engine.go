@@ -95,6 +95,8 @@ type Engine struct {
 
 	mu      sync.Mutex
 	drivers map[string]chan struct{}
+	// initialCreates holds runner IDs while the dispatcher calls CreateSandbox.
+	initialCreates sync.Map
 	// runCtx and runWG belong to the running reconciler component.
 	runCtx context.Context
 	runWG  *sync.WaitGroup
@@ -199,6 +201,14 @@ func (e *Engine) lockRequest(ctx context.Context, tx pgx.Tx, id string) (*Reques
 // GetRunner loads a runner of the organization (not_found otherwise).
 func (e *Engine) GetRunner(ctx context.Context, q db.Querier, orgID, id string) (*Runner, error) {
 	r, err := scanRunner(q.QueryRow(ctx, "SELECT "+runnerColumns+" FROM runners WHERE organization_id = $1 AND runner_id = $2", orgID, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, api.ErrNotFound("runner")
+	}
+	return r, err
+}
+
+func (e *Engine) lockOrganizationRunner(ctx context.Context, tx pgx.Tx, orgID, id string) (*Runner, error) {
+	r, err := scanRunner(tx.QueryRow(ctx, "SELECT "+runnerColumns+" FROM runners WHERE organization_id = $1 AND runner_id = $2 FOR UPDATE", orgID, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, api.ErrNotFound("runner")
 	}

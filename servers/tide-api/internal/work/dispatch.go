@@ -83,7 +83,7 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 	if err != nil || !ok || !lk.Dispatchable() {
 		return err
 	}
-	client, _, err := e.links.Client(ctx, orgID)
+	client, activeLink, err := e.links.Client(ctx, orgID)
 	if err != nil {
 		return err
 	}
@@ -125,7 +125,7 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 				continue
 			}
 		}
-		res := e.createRunner(ctx, client, p, req, req.PoolKey)
+		res := e.createRunner(ctx, client, p, req, req.PoolKey, "")
 		if res == createUnavailable && !reclaimed {
 			reclaimed = e.reclaimWarm(ctx, queued, runners, p.ID)
 		}
@@ -146,7 +146,7 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 			continue
 		}
 		if !a.BindsAtDispatch() {
-			if !e.fillPoolWarm(ctx, client, a, p, queued, runners) {
+			if !e.fillPoolWarm(ctx, client, a, p, activeLink.CredentialRevision, queued, runners) {
 				return nil
 			}
 			continue
@@ -158,7 +158,11 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 			}
 		}
 		for ; idle < int(p.WarmCount); idle++ {
-			if e.createRunner(ctx, client, p, nil, "") != createOK {
+			res := e.createRunner(ctx, client, p, nil, "", activeLink.CredentialRevision)
+			if res == createWarmDeferred {
+				break
+			}
+			if res != createOK {
 				return nil
 			}
 		}
@@ -172,7 +176,7 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 // PREPARING or WAITING_FOR_WORK without a request beyond its QUEUED
 // requests are its warm runners. It reports false when a creation failed,
 // which ends the pass.
-func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, a Adapter, p *profile.Profile, queued []*Request, runners []*Runner) bool {
+func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, a Adapter, p *profile.Profile, linkRevision string, queued []*Request, runners []*Runner) bool {
 	wp, ok := a.(WarmPooler)
 	if !ok {
 		return true
@@ -195,7 +199,11 @@ func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, 
 			}
 		}
 		for ; idle < int(p.WarmCount); idle++ {
-			if e.createRunner(ctx, client, p, nil, pool) != createOK {
+			res := e.createRunner(ctx, client, p, nil, pool, linkRevision)
+			if res == createWarmDeferred {
+				return true
+			}
+			if res != createOK {
 				return false
 			}
 		}
@@ -373,6 +381,7 @@ const (
 	createUnavailable
 	createFailed
 	createSkipped
+	createWarmDeferred
 	// createStalled: the call reached CreateTimeout (an uncertain result).
 	createStalled
 )
@@ -411,13 +420,28 @@ func sandboxRequest(p *profile.Profile, r *Runner) *ownsandv1.CreateSandboxReque
 // createRunner stores a new runner with its idempotency key, binds the
 // request for binding kinds, and calls CreateSandbox. req is nil for a warm
 // runner; pool is the runner pool of a kind without BindsAtDispatch.
-func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, p *profile.Profile, req *Request, pool string) createResult {
+func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, p *profile.Profile, req *Request, pool, linkRevision string) createResult {
 	a := e.adapters[p.Kind]
 	r := &Runner{
 		ID: api.NewID(), OrganizationID: p.OrganizationID, ProfileID: p.ID, Kind: p.Kind, GuestOS: p.GuestOS,
 		IdempotencyKey: api.NewID(), WorkspacePath: p.WorkspacePath, PoolKey: pool,
 	}
 	bind := req != nil && a.BindsAtDispatch()
+	if req == nil {
+		r.warmProfileRevision = p.WarmRevision
+		r.warmLinkRevision = linkRevision
+	}
+	// The dispatcher owns the first CreateSandbox call and applies its
+	// result before the driver can retry. A duplicate rejection can bind
+	// a queued request to the runner that already failed its start.
+	stored := false
+	e.initialCreates.Store(r.ID, struct{}{})
+	defer func() {
+		e.initialCreates.Delete(r.ID)
+		if stored {
+			e.ensureDriver(r.ID)
+		}
+	}()
 	// The request is stored with the runner, so every retry sends the same
 	// parameters with the key.
 	sreq := sandboxRequest(p, r)
@@ -435,11 +459,20 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		// before they delete runners.
 		var removing bool
 		var state int16
-		if err := tx.QueryRow(ctx, "SELECT removing, state FROM ownsand_links WHERE organization_id = $1 FOR SHARE", p.OrganizationID).Scan(&removing, &state); err != nil {
+		var currentLinkRevision string
+		if err := tx.QueryRow(ctx, "SELECT removing, state, credential_revision::text FROM ownsand_links WHERE organization_id = $1 FOR SHARE", p.OrganizationID).Scan(&removing, &state, &currentLinkRevision); err != nil {
 			return err
 		}
 		if removing || tidev1.OwnSandLinkState(state) != tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE {
 			return errSkip
+		}
+		if req == nil {
+			if currentLinkRevision != linkRevision {
+				return errWarmDeferred
+			}
+			if err := e.allowWarmCreate(ctx, tx, r); err != nil {
+				return err
+			}
 		}
 		if bind {
 			// The request stays QUEUED until OwnSand created the sandbox, so
@@ -456,9 +489,10 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		}
 		now := e.svc.NowUTC()
 		created, err := scanRunner(tx.QueryRow(ctx, `INSERT INTO runners (runner_id, organization_id, runner_profile_id, kind, guest_os, state, request_id, pool_key,
-			idempotency_key, create_request, workspace_path, create_time, update_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12) RETURNING `+runnerColumns,
+			idempotency_key, create_request, workspace_path, create_time, update_time, warm_profile_revision, warm_link_revision)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14) RETURNING `+runnerColumns,
 			r.ID, r.OrganizationID, r.ProfileID, int16(r.Kind), int16(r.GuestOS), int16(runCreating), nullable(r.RequestID), nullable(r.PoolKey),
-			r.IdempotencyKey, createReq, r.WorkspacePath, now))
+			r.IdempotencyKey, createReq, r.WorkspacePath, now, nullable(r.warmProfileRevision), nullable(r.warmLinkRevision)))
 		if err != nil {
 			return err
 		}
@@ -469,12 +503,16 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 	if errors.Is(err, errSkip) {
 		return createSkipped
 	}
+	if errors.Is(err, errWarmDeferred) {
+		return createWarmDeferred
+	}
 	if err != nil {
 		e.svc.Logger.WarnContext(ctx, "dispatch_create_runner_failed", slog.String("organization_id", p.OrganizationID), slog.Any("error", err))
 		return createFailed
 	}
+	stored = true
 	sb, err := e.createSandbox(ctx, client, sreq)
-	res := e.applyCreate(ctx, r, sb, err)
+	res := e.applyCreate(ctx, r, req, sb, err)
 	if res == createFailed && ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || isCode(err, connect.CodeDeadlineExceeded)) {
 		return createStalled
 	}
@@ -498,7 +536,9 @@ func (e *Engine) storedCreateRequest(ctx context.Context, runnerID string) (*own
 var errSkip = errors.New("skip")
 
 // applyCreate applies a CreateSandbox result to a stored CREATING runner.
-func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandbox, err error) createResult {
+// dispatchRequest identifies the queued demand for the initial call, including
+// for pool runners that do not store a request ID.
+func (e *Engine) applyCreate(ctx context.Context, r *Runner, dispatchRequest *Request, sb *ownsandv1.Sandbox, err error) createResult {
 	switch {
 	case err == nil:
 		uerr := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
@@ -535,11 +575,11 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 	case rejected(err, connect.CodeUnavailable):
 		// No device has free capacity: the sandbox does not exist, so the
 		// runner is removed and its request returns to the queue.
-		e.dropRunner(ctx, r, false)
+		e.dropRunner(ctx, r, false, nil)
 		return createUnavailable
 	case rejected(err, connect.CodeFailedPrecondition):
 		// No device of the OwnSand organization can ever run the profile.
-		e.dropRunner(ctx, r, true)
+		e.dropRunner(ctx, r, true, dispatchRequest)
 		return createFailed
 	case rejected(err, connect.CodeInvalidArgument), rejected(err, connect.CodeNotFound), rejected(err, connect.CodePermissionDenied):
 		// OwnSand rejected the request (for example, an unknown template):
@@ -547,7 +587,7 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 		if berr := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error { return e.bindStartTx(ctx, tx, r) }); berr != nil {
 			e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", berr))
 		}
-		e.startFailed(ctx, r.ID, "create_sandbox_rejected")
+		e.startFailed(ctx, r.ID, createSandboxRejected)
 		return createFailed
 	default:
 		// The response may be lost: the runner stays CREATING with its key,
@@ -567,36 +607,41 @@ func rejected(err error, code connect.Code) bool {
 	return isCode(err, code) && connect.IsWireError(err)
 }
 
-// dropRunner removes a runner whose sandbox was never created. noDevice
-// ends the request with NO_ELIGIBLE_DEVICE; otherwise the request returns to
-// the queue without counting an attempt.
-func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool) {
+// dropRunner handles a runner whose sandbox was never created. For a
+// capacity rejection it removes the runner. For a no-device rejection it
+// records the failure and ends the request if it is still queued.
+func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool, dispatchRequest *Request) {
 	var ended *Request
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		cur, err := e.lockRunner(ctx, tx, r.ID)
 		if err != nil || cur.State != runCreating {
 			return err
 		}
-		if noDevice {
-			if _, err := e.setRunnerTx(ctx, tx, r.ID, []tidev1.RunnerState{runCreating}, runFailed, "end_reason = $4",
-				int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED)); err != nil {
-				return err
-			}
-		} else if _, err := tx.Exec(ctx, "DELETE FROM runners WHERE runner_id = $1", r.ID); err != nil {
+		if !noDevice {
+			_, err := tx.Exec(ctx, "DELETE FROM runners WHERE runner_id = $1", r.ID)
 			return err
 		}
-		if cur.RequestID == "" {
+		if _, err := e.setRunnerTx(ctx, tx, r.ID, []tidev1.RunnerState{runCreating}, runFailed, "end_reason = $4",
+			int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED)); err != nil {
+			return err
+		}
+		requestID := cur.RequestID
+		if dispatchRequest != nil {
+			requestID = dispatchRequest.ID
+		}
+		if requestID == "" {
 			return nil
 		}
-		if noDevice {
-			ended, _, err = e.endRequestTx(ctx, tx, cur.RequestID, RequestEnd{State: reqFailed, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE})
+		req, err := e.lockRequest(ctx, tx, requestID)
+		if err != nil || req.State != reqQueued {
 			return err
 		}
-		// The request stayed QUEUED.
-		return nil
+		ended, _, err = e.endRequestTx(ctx, tx, requestID, RequestEnd{State: reqFailed, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE})
+		return err
 	})
 	if err != nil {
 		e.svc.Logger.WarnContext(ctx, "dispatch_drop_runner_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		return
 	}
 	if ended != nil {
 		e.releaseClaim(ctx, ended)

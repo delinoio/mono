@@ -68,6 +68,9 @@ func (e *Engine) reconcile(ctx context.Context) {
 // ensureDriver starts the driver of a runner when the reconciler runs on
 // this instance (the lease holder) and no driver of the runner runs.
 func (e *Engine) ensureDriver(runnerID string) {
+	if _, creating := e.initialCreates.Load(runnerID); creating {
+		return
+	}
 	e.mu.Lock()
 	ctx, wg := e.runCtx, e.runWG
 	if ctx == nil || ctx.Err() != nil {
@@ -80,8 +83,8 @@ func (e *Engine) ensureDriver(runnerID string) {
 	}
 	kick := make(chan struct{}, 1)
 	e.drivers[runnerID] = kick
-	e.mu.Unlock()
 	wg.Add(1)
+	e.mu.Unlock()
 	go func() {
 		defer wg.Done()
 		defer func() {
@@ -205,7 +208,7 @@ func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, 
 			return e.timing.SandboxPoll
 		}
 		sb, err := e.createSandbox(ctx, client, req)
-		switch e.applyCreate(ctx, r, sb, err) {
+		switch e.applyCreate(ctx, r, nil, sb, err) {
 		case createOK:
 			return 0
 		default:
@@ -268,8 +271,11 @@ func (e *Engine) stepPreparing(ctx context.Context, client ownsandclient.Client,
 		return
 	}
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
-		_, err := e.setRunnerTx(ctx, tx, r.ID, []tidev1.RunnerState{runPrep}, runWarm, "")
-		return err
+		n, err := e.setRunnerTx(ctx, tx, r.ID, []tidev1.RunnerState{runPrep}, runWarm, "")
+		if err != nil || n == nil {
+			return err
+		}
+		return resetWarmRetry(ctx, tx, n)
 	})
 	if err != nil {
 		e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
@@ -280,7 +286,19 @@ func (e *Engine) stepPreparing(ctx context.Context, client ownsandclient.Client,
 // stepStart runs Adapter.Start (lifecycle step 3).
 func (e *Engine) stepStart(ctx context.Context, client ownsandclient.Client, r *Runner) {
 	a := e.adapters[r.Kind]
-	res, err := a.Start(ctx, e.guest(ctx, client, r))
+	g := e.guest(ctx, client, r)
+	if r.Kind == tidev1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION {
+		req, err := e.storedCreateRequest(ctx, r.ID)
+		if err == nil {
+			err = req.GetMaxTtl().CheckValid()
+		}
+		if err != nil {
+			e.svc.Logger.WarnContext(ctx, "runner_create_request_load_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		} else {
+			g.SandboxMaxTTL = req.GetMaxTtl().AsDuration()
+		}
+	}
+	res, err := a.Start(ctx, g)
 	if err != nil {
 		if ctx.Err() == nil {
 			e.svc.Logger.WarnContext(ctx, "runner_start_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
@@ -298,16 +316,25 @@ func (e *Engine) stepStart(ctx context.Context, client ownsandclient.Client, r *
 			return e.startRequestTx(ctx, tx, n.RequestID, n.ID, []tidev1.RequestState{reqStarting}, reqRunning)
 		}
 		n, err := e.setRunnerTx(ctx, tx, r.ID, from, runWaiting, "program_exec_id = $4", nullable(res.ProgramExecID))
-		if err != nil || n != nil || res.ProgramExecID == "" {
+		if err != nil {
 			return err
+		}
+		if n != nil {
+			return resetWarmRetry(ctx, tx, n)
+		}
+		if res.ProgramExecID == "" {
+			return nil
 		}
 		// A source that binds work later (GITHUB_JOB: an early in_progress
 		// webhook, MarkBusy) can mark the runner BUSY before Start returns.
 		// The runner keeps the exec ID, so its driver follows the program
 		// and deletes the sandbox when the program exits.
-		_, err = tx.Exec(ctx, "UPDATE runners SET program_exec_id = $2, update_time = $3 WHERE runner_id = $1 AND state = $4 AND program_exec_id IS NULL",
+		tag, err := tx.Exec(ctx, "UPDATE runners SET program_exec_id = $2, update_time = $3 WHERE runner_id = $1 AND state = $4 AND program_exec_id IS NULL",
 			r.ID, res.ProgramExecID, e.svc.NowUTC(), int16(runBusy))
-		return err
+		if err != nil || tag.RowsAffected() == 0 {
+			return err
+		}
+		return resetWarmRetry(ctx, tx, r)
 	})
 	if err != nil {
 		e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
@@ -529,6 +556,7 @@ func (e *Engine) finishDelete(ctx context.Context, runnerID string) {
 func (e *Engine) startFailed(ctx context.Context, runnerID, cause string) {
 	var r *Runner
 	var ended *Request
+	var warmStopped bool
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		cur, err := e.lockRunner(ctx, tx, runnerID)
 		if err != nil || (cur.State != runCreating && cur.State != runPrep && cur.State != runWarm) {
@@ -538,7 +566,13 @@ func (e *Engine) startFailed(ctx context.Context, runnerID, cause string) {
 		// reconciler retries it when it fails.
 		r, err = e.setRunnerTx(ctx, tx, runnerID, []tidev1.RunnerState{cur.State}, runFailed, "end_reason = $4, sandbox_cleanup = $5",
 			int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED), cur.SandboxID != "")
-		if err != nil || r == nil || r.RequestID == "" {
+		if err != nil || r == nil {
+			return err
+		}
+		if r.RequestID == "" {
+			if r.warmProfileRevision != "" {
+				warmStopped, err = e.recordWarmFailure(ctx, tx, r, cause == createSandboxRejected)
+			}
 			return err
 		}
 		req, err := e.lockRequest(ctx, tx, r.RequestID)
@@ -558,6 +592,10 @@ func (e *Engine) startFailed(ctx context.Context, runnerID, cause string) {
 		return
 	}
 	e.svc.Logger.WarnContext(ctx, "runner_start_failure", slog.String("runner_id", runnerID), slog.String("organization_id", r.OrganizationID), slog.String("cause", cause))
+	if warmStopped {
+		e.svc.Logger.WarnContext(ctx, "warm_runner_fill_stopped", slog.String("organization_id", r.OrganizationID),
+			slog.String("runner_profile_id", r.ProfileID), slog.String("cause", cause))
+	}
 	// The registration removal is not repeated for a FAILED runner: its
 	// failure is logged, and the sandbox goes anyway.
 	_ = e.removeRegistration(context.WithoutCancel(ctx), r)
@@ -567,7 +605,9 @@ func (e *Engine) startFailed(ctx context.Context, runnerID, cause string) {
 	if ended != nil {
 		e.releaseClaim(ctx, ended)
 	}
-	e.Kick(r.OrganizationID)
+	if r.RequestID != "" || r.warmProfileRevision == "" {
+		e.Kick(r.OrganizationID)
+	}
 }
 
 // cleanUpEnded deletes the sandbox of an ended runner that is marked with
@@ -630,7 +670,7 @@ func (e *Engine) deleteRunner(ctx context.Context, orgID, runnerID string, reaso
 
 // deleteRunnerTx is deleteRunner in the caller's transaction.
 func (e *Engine) deleteRunnerTx(ctx context.Context, tx pgx.Tx, orgID, runnerID string, reason tidev1.RunnerEndReason, cause DeleteCause) (*Runner, *Request, tidev1.RequestState, error) {
-	cur, err := e.GetRunner(ctx, tx, orgID, runnerID)
+	cur, err := e.lockOrganizationRunner(ctx, tx, orgID, runnerID)
 	if err != nil {
 		return nil, nil, 0, err
 	}

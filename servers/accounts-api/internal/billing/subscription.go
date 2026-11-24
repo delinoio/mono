@@ -242,6 +242,17 @@ func (s *Service) activateFromPayment(ctx context.Context, tx pgx.Tx, acct *acco
 		// state.
 		return nil
 	}
+	if current.Status == SubscriptionCanceled && current.PaddleSubscriptionID != "" {
+		// StartSubscription records a pending checkout before a new
+		// subscription can complete. Keep the canceled row here and
+		// retain the credit grant and mapping for this payment.
+		s.logger.InfoContext(ctx, "billing_subscription_payment_ignored",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("paddle_subscription_id", txn.SubscriptionID),
+			slog.String("paddle_transaction_id", txn.ID),
+			slog.String("reason", "different_canceled_subscription"))
+		return nil
+	}
 	if current.PaddleSubscriptionID == txn.SubscriptionID && current.Status == SubscriptionPastDue &&
 		txn.BillingPeriod != nil && current.CurrentPeriodEnd != nil &&
 		txn.BillingPeriod.EndsAt.Before(*current.CurrentPeriodEnd) {

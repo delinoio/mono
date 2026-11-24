@@ -265,6 +265,26 @@ func TestCursorClaimEndsBeforeRunner(t *testing.T) {
 	eventually(t, "the watch stops without a profile", func() bool { return w.cursor.Streams() == 0 })
 }
 
+func TestCursorClaimRejectedWithoutEligibleDevice(t *testing.T) {
+	w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
+	})
+	w.cursor.AddRequest("bc-no-device", true)
+	req := w.requestBySource(t, "bc-no-device")
+	r := w.waitRequest(t, req.GetRequestId(), tidev1.RequestState_REQUEST_STATE_FAILED)
+	if r.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE {
+		t.Fatalf("request %v", r)
+	}
+	eventually(t, "vendor claim released for no eligible device", func() bool {
+		claim, err := w.l.Agents.Claim(t.Context(), req.GetRequestId())
+		return err == nil && claim.State == agent.ClaimReleased
+	})
+	if message, ok := w.cursor.Failed("bc-no-device"); !ok || !strings.Contains(message, "can run the runner profile") {
+		t.Fatalf("Cursor failure: %q (reported: %t)", message, ok)
+	}
+}
+
 // TestCursorIntegrationDeletionKeepsHeldClaims: when the release of a
 // queued request's claim fails at the profile deletion, the integration
 // cannot be deleted until the claim poller released the claim.
