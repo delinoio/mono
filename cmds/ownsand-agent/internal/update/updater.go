@@ -293,6 +293,11 @@ func (u *Updater) setStateFor(order uint64, s ownsandv1.AgentUpdateState, target
 		u.mu.Unlock()
 		return false
 	}
+	// A retry keeps the last verified revocation while it fetches and
+	// verifies a new manifest.
+	if s == ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING && u.revokedRunning {
+		s = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
+	}
 	u.state, u.target = s, target
 	u.mu.Unlock()
 	u.opts.Logger.Info("agent update state", "update_state", s.String(), "target_version", target)
@@ -310,27 +315,24 @@ func (u *Updater) clearPendingLocked() {
 	u.artifact = ""
 }
 
-// recordRunningRevocation stores whether a verified manifest revokes the
-// running version, on behalf of the command with the given order. A command
-// that a newer one superseded leaves the value to the newer command. A
-// revoked running version also moves the reported state to
-// REVOKED_PENDING_IDLE with the target at once, so the heartbeat tells the
-// control plane to stop placing sandboxes while the artifact still downloads
-// and not only after it finished.
-func (u *Updater) recordRunningRevocation(order uint64, revoked bool, target string) {
+// recordRunningRevocation applies a verified manifest to the create gate
+// and the heartbeat state before the artifact download begins. It returns
+// false if a newer command superseded this command.
+func (u *Updater) recordRunningRevocation(order uint64, revoked bool, target string) bool {
 	u.mu.Lock()
 	if u.applied != order {
 		u.mu.Unlock()
-		return
+		return false
 	}
 	u.revokedRunning = revoked
-	if !revoked {
-		u.mu.Unlock()
-		return
+	state := ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING
+	if revoked {
+		state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
 	}
-	u.state, u.target = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE, target
+	u.state, u.target = state, target
 	u.mu.Unlock()
-	u.opts.Logger.Info("agent update state", "update_state", ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE.String(), "target_version", target)
+	u.opts.Logger.Info("agent update state", "update_state", state.String(), "target_version", target)
+	return true
 }
 
 func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, error) {
@@ -399,11 +401,10 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	if !u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING, target) {
 		return ErrSuperseded
 	}
-	m, artifactPath, err := u.download(ctx, target, order)
+	artifactPath, err := u.download(ctx, target, order)
 	if err != nil {
-		// A verified manifest that revokes the running version keeps the
-		// device in the revoked state after an artifact failure, so the
-		// heartbeat tells the control plane to stop placing sandboxes.
+		// Keep the last verified revocation after any download or
+		// verification failure.
 		failedState := ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
 		u.mu.Lock()
 		if u.revokedRunning {
@@ -432,7 +433,6 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 		u.opts.Logger.Info("agent update download discarded", "target_version", target, "order", order)
 		return ErrSuperseded
 	}
-	u.revokedRunning = m.Revoked(u.opts.Running)
 	u.artifact = artifactPath
 	u.target = target
 	if u.revokedRunning {
@@ -491,51 +491,49 @@ func (u *Updater) WithdrawOrdered(order uint64) error {
 	return nil
 }
 
-func (u *Updater) download(ctx context.Context, target string, order uint64) (*Manifest, string, error) {
+func (u *Updater) download(ctx context.Context, target string, order uint64) (string, error) {
 	manifest, err := u.fetch(ctx, u.opts.ManifestURL, maxManifestBytes)
 	if err != nil {
-		return nil, "", fmt.Errorf("update: download manifest: %w", err)
+		return "", fmt.Errorf("update: download manifest: %w", err)
 	}
 	sigText, err := u.fetch(ctx, u.opts.ManifestURL+".sig", 4096)
 	if err != nil {
-		return nil, "", fmt.Errorf("update: download manifest signature: %w", err)
+		return "", fmt.Errorf("update: download manifest signature: %w", err)
 	}
 	sig, err := DecodeSignature(sigText)
 	if err != nil {
-		return nil, "", err
+		return "", err
 	}
 	keys := append(append([]ed25519.PublicKey{}, BuiltinKeys...), u.opts.Keys...)
 	m, err := Verify(manifest, sig, keys)
 	if err != nil {
-		return nil, "", err
+		return "", err
 	}
-	// The signed manifest is the evidence that the running version is revoked,
-	// so record it now and not when the artifact is published: a withdrawal
-	// that arrives during the artifact download must already see it and leave
-	// the revocation recovery alone.
-	u.recordRunningRevocation(order, m.Revoked(u.opts.Running), target)
+	if !u.recordRunningRevocation(order, m.Revoked(u.opts.Running), target) {
+		return "", ErrSuperseded
+	}
 	if m.Revoked(target) {
-		return nil, "", ErrRevoked
+		return "", ErrRevoked
 	}
 	art, err := m.Artifact(target, u.opts.Platform)
 	if err != nil {
-		return nil, "", err
+		return "", err
 	}
 	data, err := u.fetch(ctx, art.URL, maxArtifactBytes)
 	if err != nil {
-		return nil, "", fmt.Errorf("update: download artifact: %w", err)
+		return "", fmt.Errorf("update: download artifact: %w", err)
 	}
 	sum := sha256.Sum256(data)
 	if hex.EncodeToString(sum[:]) != art.SHA256 {
-		return nil, "", ErrHashMismatch
+		return "", ErrHashMismatch
 	}
 	// The order makes the file name unique to the command, so a superseded
 	// download never removes or replaces the artifact of a newer command.
 	path := u.opts.Store.Path(store.UpdateDir, fmt.Sprintf("ownsand-agent-%s-%d", target, order))
 	if err := store.WriteFileAtomic(path, data, 0o700); err != nil {
-		return nil, "", err
+		return "", err
 	}
-	return m, path, nil
+	return path, nil
 }
 
 // TryInstall installs a verified update when the device is idle and no
