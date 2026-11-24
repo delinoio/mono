@@ -220,7 +220,7 @@ function AutoTopUpForm({
     <SettingsForm
       title="Automatic top-up"
       id="auto-top-up-title"
-      description="Buy credit automatically when a usage charge makes the balance fall below the threshold. The monthly cap limits automatic top-ups in one UTC calendar month. After 2 failed top-ups in a row, automatic top-up turns off."
+      description="Buy credit automatically when a usage charge makes the balance fall below the threshold. The monthly cap limits automatic top-ups in one UTC calendar month. Automatic top-ups in progress count toward the cap. After 2 failed top-ups in a row, automatic top-up turns off."
       editable={editable}
       onSubmit={async () => {
         const checked = checkAutoTopUp({
@@ -287,7 +287,7 @@ function AutoTopUpForm({
         autoComplete="off"
       />
       <dl className="details">
-        <Detail term="Charged this month">
+        <Detail term="Monthly cap usage">
           {formatUsd(settings?.monthToDateUsdMicros ?? 0n)}
         </Detail>
         <Detail term="Failed top-ups in a row">

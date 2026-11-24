@@ -1638,6 +1638,25 @@ describe("invitation acceptance", () => {
 });
 
 describe("settings", () => {
+  test("shows a queued automatic top-up as monthly cap usage", async () => {
+    const api = createFakeApi();
+    const account = api.accounts.get(ACCOUNT_ID)!;
+    account.autoTopUp = {
+      ...account.autoTopUp,
+      monthToDateUsdMicros: 25_000_000n,
+    };
+    await renderAccount(ADMIN, { api });
+    await openTab("Settings");
+
+    expect(
+      (await screen.findByText("Monthly cap usage")).nextSibling?.textContent,
+    ).toBe("$25.00");
+    expect(
+      screen.getByText(/Automatic top-ups in progress count toward the cap\./),
+    ).toBeTruthy();
+    expect(screen.queryByText("Charged this month")).toBeNull();
+  });
+
   test("checks the automatic top-up minimums and the required cap before saving", async () => {
     const { api } = await renderAccount(ADMIN);
     await openTab("Settings");
@@ -1685,9 +1704,9 @@ describe("settings", () => {
       name: "Top-up amount (USD)",
     });
     await type(amount, "75");
-    expect(
-      screen.getByText("Charged this month").nextSibling?.textContent,
-    ).toBe("$0.00");
+    expect(screen.getByText("Monthly cap usage").nextSibling?.textContent).toBe(
+      "$0.00",
+    );
     const fake = api.accounts.get(ACCOUNT_ID)!;
     fake.autoTopUp = {
       ...fake.autoTopUp,
@@ -1700,9 +1719,9 @@ describe("settings", () => {
     });
     await settle(60);
     expect(calls(api, "GetAutoTopUpSettings").length).toBeGreaterThan(before);
-    expect(
-      screen.getByText("Charged this month").nextSibling?.textContent,
-    ).toBe("$30.00");
+    expect(screen.getByText("Monthly cap usage").nextSibling?.textContent).toBe(
+      "$30.00",
+    );
     expect(
       screen.getByText("Failed top-ups in a row").nextSibling?.textContent,
     ).toBe("1");
