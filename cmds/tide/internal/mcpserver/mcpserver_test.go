@@ -427,6 +427,119 @@ func TestExecOutputWindowAndOffsets(t *testing.T) {
 	if m := out.OutputTruncated[0].MissingStdout; m == nil || m.From != 0 || m.To != 100000-100 {
 		t.Fatalf("missing = %+v", m)
 	}
+	if out.Stdout != (Output{Text: strings.Repeat("0", 96) + "999\n", To: 100000}) || out.NextStdoutOffset != 100000 {
+		t.Fatalf("short retained output = %+v, next = %d", out.Stdout, out.NextStdoutOffset)
+	}
+
+	for _, stream := range []string{"stdout", "stderr"} {
+		t.Run(stream+" truncated prefix", func(t *testing.T) {
+			h := newHarness(t, Config{})
+			h.srv.OutputKeepBytes = 65536
+			id := h.running()
+			script := `emit() { i=0; while [ "$i" -lt 1024 ]; do printf '%04d%0123d\n' "$i" 0; i=$((i+1)); done; }; `
+			if stream == "stderr" {
+				script += "printf short; emit >&2"
+			} else {
+				script += "printf short >&2; emit"
+			}
+			var run execResult
+			if msg, bad := h.call("exec", map[string]any{"session_id": id, "command": []string{"sh", "-c", script}}, &run); bad || run.ExitCode == nil || *run.ExitCode != 0 {
+				t.Fatalf("exec: %s", msg)
+			}
+			args := map[string]any{"session_id": id, "exec_id": run.ExecID, "stdout_offset": 0, "stderr_offset": 0}
+			var result execResult
+			if msg, bad := h.call("exec_output", args, &result); bad || result.ExitCode == nil {
+				t.Fatalf("exec_output: %s", msg)
+			}
+			preview, other := result.Stdout, result.Stderr
+			next, otherNext := result.NextStdoutOffset, result.NextStderrOffset
+			missing := &tide.ByteRange{From: 0, To: 65536}
+			wantTruncated := Truncated{MissingStdout: missing}
+			if stream == "stderr" {
+				preview, other = other, preview
+				next, otherNext = otherNext, next
+				wantTruncated = Truncated{MissingStderr: missing}
+			}
+			if !reflect.DeepEqual(result.OutputTruncated, []Truncated{wantTruncated}) {
+				t.Fatalf("truncated = %+v, want %+v", result.OutputTruncated, wantTruncated)
+			}
+			wantOmitted := tide.ByteRange{From: 73728, To: 106496}
+			if preview.From != 0 || preview.To != 131072 || next != 131072 || preview.Omitted == nil || *preview.Omitted != wantOmitted {
+				t.Fatalf("%s from = %d, to = %d, next = %d, omitted = %+v", stream, preview.From, preview.To, next, preview.Omitted)
+			}
+			if other != (Output{Text: "short", To: 5}) || otherNext != 5 {
+				t.Fatalf("other stream = %+v, next = %d", other, otherNext)
+			}
+			args[stream+"_offset"] = preview.Omitted.From
+			if msg, bad := h.call("exec_output", args, &result); bad || len(result.OutputTruncated) != 0 {
+				t.Fatalf("resume: %s, truncated = %+v", msg, result.OutputTruncated)
+			}
+			resumed := result.Stdout
+			if stream == "stderr" {
+				resumed = result.Stderr
+			}
+			if resumed.From != 73728 || !strings.HasPrefix(resumed.Text, "0576") {
+				t.Fatalf("resumed %s does not start at byte 73728", stream)
+			}
+		})
+	}
+}
+
+func TestExecOutputWindowAndOffsetsWithGaps(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		before   int
+		after    int
+		wantText string
+		wantOmit *tide.ByteRange
+	}{
+		{
+			name:     "gap in head",
+			before:   3000,
+			after:    40000,
+			wantText: strings.Repeat("a", 3000) + strings.Repeat("b", 5192) + "\n[... output omitted ...]\n" + strings.Repeat("b", 24576),
+			wantOmit: &tide.ByteRange{From: 55192, To: 65424},
+		},
+		{
+			name:     "gap in tail",
+			before:   28192,
+			after:    20000,
+			wantText: strings.Repeat("a", 8192) + "\n[... output omitted ...]\n" + strings.Repeat("b", 20000),
+			wantOmit: &tide.ByteRange{From: 8192, To: 50000},
+		},
+		{
+			name:     "all received bytes kept",
+			before:   3000,
+			after:    20000,
+			wantText: strings.Repeat("a", 3000) + strings.Repeat("b", 20000),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const afterOffset = 50000
+			c := newCollector(0, 7)
+			missing := tide.ByteRange{From: int64(tc.before), To: afterOffset}
+			for _, ev := range []tide.ExecEvent{
+				{Kind: tide.ExecEventStdout, Data: []byte(strings.Repeat("a", tc.before))},
+				{Kind: tide.ExecEventOutputTruncated, MissingStdout: missing},
+				{Kind: tide.ExecEventStdout, Offset: afterOffset, Data: []byte(strings.Repeat("b", tc.after))},
+			} {
+				if err := c.on(ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := c.result("exec", nil)
+			wantNext := int64(afterOffset + tc.after)
+			if r.Stdout.From != 0 || r.Stdout.To != wantNext || r.NextStdoutOffset != wantNext || !reflect.DeepEqual(r.Stdout.Omitted, tc.wantOmit) {
+				t.Fatalf("stdout from = %d, to = %d, next = %d, omitted = %+v, want omitted = %+v", r.Stdout.From, r.Stdout.To, r.NextStdoutOffset, r.Stdout.Omitted, tc.wantOmit)
+			}
+			if r.Stdout.Text != tc.wantText {
+				t.Fatal("stdout preview differs from the expected text")
+			}
+			if r.Stderr != (Output{From: 7, To: 7}) || r.NextStderrOffset != 7 || !reflect.DeepEqual(r.OutputTruncated, []Truncated{{MissingStdout: &missing}}) {
+				t.Fatalf("stderr = %+v, next = %d, truncated = %+v", r.Stderr, r.NextStderrOffset, r.OutputTruncated)
+			}
+		})
+	}
 }
 
 func TestPassEnvValuesNeverInResults(t *testing.T) {

@@ -360,7 +360,7 @@ func TestAcceptanceExtensionsAreMonotonic(t *testing.T) {
 		}
 	}
 
-	waiting.startAcceptance(30 * time.Second)
+	writeAcceptanceRequest(t, waiting, func(*ownsandv1.DataFrame) error { return nil })
 	clock.advance(10 * time.Second)
 	clock.stepWall(time.Hour)
 	receiveLarge() // Deadline moves from elapsed second 30 to 40.

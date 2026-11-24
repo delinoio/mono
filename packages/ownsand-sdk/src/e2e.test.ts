@@ -18,13 +18,13 @@ import {
   isBillingError,
   NetworkMode,
   OwnSandClient,
-  type Sandbox,
   SandboxState,
 } from "./index.ts";
 import {
   BillingControlStatus,
   CLEANUP_STEP_TIMEOUT_MS,
   setBilling,
+  waitForSandboxState,
   waitForSnapshotReady,
   withBillingCleanup,
   withCleanup,
@@ -70,24 +70,6 @@ function randomBytes(n: number): Uint8Array {
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
-}
-
-/** Polls the sandbox until it reaches the state, for at most a minute. */
-async function waitForState(
-  sandbox: Sandbox,
-  want: SandboxState,
-): Promise<void> {
-  const deadline = Date.now() + 60_000;
-  for (;;) {
-    const { state } = await sandbox.get();
-    if (state === want) return;
-    if (Date.now() > deadline) {
-      throw new Error(
-        `sandbox did not reach ${SandboxState[want]}: last ${SandboxState[state]}`,
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
 }
 
 const AUTHORIZE_RELAY_PATH = `/${DataPathService.typeName}/${DataPathService.method.authorizeRelay.name}`;
@@ -305,7 +287,7 @@ async function expectSuspended(
             // The suspension pauses the running sandbox and rejects the data
             // path. Each relay operation ends with its first AuthorizeRelay.
             await setBilling(billingUrl, BillingControlStatus.Suspended);
-            await waitForState(sandbox, SandboxState.PAUSED);
+            await waitForSandboxState(sandbox, SandboxState.PAUSED);
             await expectSuspended(requests, () =>
               sandbox.run({ command: ["/bin/echo", "suspended"] }),
             );
@@ -314,7 +296,7 @@ async function expectSuspended(
             // The recovery resumes the sandbox that billing paused, and the
             // same operations work again.
             await setBilling(billingUrl, BillingControlStatus.Allowed);
-            await waitForState(sandbox, SandboxState.RUNNING);
+            await waitForSandboxState(sandbox, SandboxState.RUNNING);
             const run = await sandbox.run({
               command: ["/bin/echo", "recovered"],
             });

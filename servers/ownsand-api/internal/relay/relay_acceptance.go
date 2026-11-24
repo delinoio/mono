@@ -2,54 +2,64 @@
 
 package relay
 
-import "time"
+import (
+	"time"
 
-// acceptanceWait is protected by the connection mutex. A window starts when
-// the writer confirms a request and can extend only while it is active.
-type acceptanceWait struct {
-	timeout  time.Duration
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+)
+
+// streamAcceptance tracks admission on the connection's monotonic clock.
+// The writer starts the window, and the reader updates it in receive order
+// so a later large frame cannot change the decision for an earlier notice.
+type streamAcceptance struct {
+	window   time.Duration
 	deadline time.Duration
-	accepted bool
+	resolved bool
 }
 
-// startAcceptance runs on the connection writer after a successful send.
-func (s *Stream) startAcceptance(timeout time.Duration) {
-	c := s.conn
+func (a streamAcceptance) expired(now time.Duration) bool {
+	return a.window > 0 && !a.resolved && now >= a.deadline
+}
+
+func (a *streamAcceptance) extend(receivedAt time.Duration) {
+	if a.window > 0 && !a.resolved && receivedAt < a.deadline {
+		a.deadline = receivedAt + a.window
+	}
+}
+
+func (c *Conn) recordStreamReceipt(f *ownsandv1.DataFrame, size int) *Stream {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !s.acceptance.accepted {
-		s.acceptance = acceptanceWait{timeout: timeout, deadline: c.clk.Elapsed() + timeout}
+	s := c.streams[f.GetStreamId()]
+	if s == nil || s.isClosed() {
+		return nil
 	}
-}
-
-// recordLargeReceive runs with the connection mutex held. The receive loop
-// processes receipts in order, so each qualifying frame can extend an
-// active window even when the RPC handler has not checked it yet.
-func (c *Conn) recordLargeReceive() {
-	now := c.clk.Elapsed()
-	c.lastLarge.Store(c.clk.Now().UnixNano())
-	for _, s := range c.streams {
-		wait := &s.acceptance
-		if wait.timeout > 0 && now < wait.deadline {
-			wait.deadline = now + wait.timeout
+	receivedAt := c.clk.Elapsed()
+	if size >= LargeFrameBytes {
+		c.lastLarge.Store(c.clk.Now().UnixNano())
+		for _, stream := range c.streams {
+			stream.acceptance.extend(receivedAt)
 		}
 	}
+	if !s.acceptance.expired(receivedAt) {
+		switch f.GetKind() {
+		case ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED,
+			ownsandv1.DataFrameKind_DATA_FRAME_KIND_SESSION_END,
+			ownsandv1.DataFrameKind_DATA_FRAME_KIND_ERROR:
+			// An agent can end the stream as soon as it sees the open
+			// frame, or reply before the writer returns from the send.
+			s.acceptance.resolved = true
+		}
+	}
+	return s
 }
 
-// AcceptanceExpired reports whether the active acceptance window reached
-// its cutoff on the connection's monotonic clock.
+// AcceptanceExpired reports whether a forwarded request ran out of time
+// before the connection received an acceptance or terminal frame. Once a
+// timely reply arrives, caller response backpressure cannot change the result.
 func (s *Stream) AcceptanceExpired() bool {
 	c := s.conn
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	wait := s.acceptance
-	return wait.timeout > 0 && c.clk.Elapsed() >= wait.deadline
-}
-
-// MarkAccepted stops the acceptance window.
-func (s *Stream) MarkAccepted() {
-	c := s.conn
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	s.acceptance = acceptanceWait{accepted: true}
+	return s.acceptance.expired(c.clk.Elapsed())
 }

@@ -71,6 +71,10 @@ def fail(message):
     sys.exit(1)
 
 
+def reject_constant(literal):
+    raise ValueError(f"unexpected literal {literal}")
+
+
 try:
     with open(path, "rb") as handle:
         raw = handle.read()
@@ -85,7 +89,7 @@ if raw is None:
     config = {}
 else:
     try:
-        config = json.loads(raw.decode("utf-8"))
+        config = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
     except (UnicodeDecodeError, ValueError) as error:
         fail(f"{path} is not valid JSON ({error}); fix or remove it, then run again")
     if not isinstance(config, dict):

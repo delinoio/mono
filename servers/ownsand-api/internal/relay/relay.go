@@ -157,9 +157,10 @@ type Conn struct {
 	perGrant  map[string]int
 	peerKinds map[ownsandv1.DataFrameKind]bool
 
-	// writeWaiters registers frames whose send the caller needs the writer
-	// to confirm.
-	writeWaiters sync.Map // *ownsandv1.DataFrame -> writeWaiter
+	// writeWaiters maps a frame that SendConfirmed queued to the channel on
+	// which the writer reports the result of its send (see sendMeasured).
+	// The queue and the outFrame stay unchanged for every other sender.
+	writeWaiters sync.Map // *ownsandv1.DataFrame -> *confirmedWrite
 }
 
 // outFrame is a frame in the outbound queue. final marks a stream's final
@@ -218,15 +219,6 @@ func (c *Conn) SetWireBytes(written func() int64) { c.wireBytes = written }
 // envelopePrefix is the size of the Connect and gRPC message envelope
 // prefix (one flag byte and a 4-byte length).
 const envelopePrefix = 5
-
-// sendMeasured sends of.frame with send, reports its bytes to of.onWritten
-// (see sendCounted) and tells a SendConfirmed caller that waits for the frame
-// that the send returned.
-func (c *Conn) sendMeasured(of outFrame, send func(*ownsandv1.DataFrame) error) error {
-	err := c.sendCounted(of, send)
-	c.writeConfirmed(of.frame, err)
-	return err
-}
 
 // sendCounted sends of.frame with send and reports its bytes to
 // of.onWritten: the bytes that the send wrote, also when it failed after a
@@ -492,12 +484,7 @@ func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
 		// Unknown kinds on stream 0 are ignored.
 		return nil
 	}
-	c.mu.Lock()
-	s := c.streams[f.GetStreamId()]
-	if s != nil && size >= LargeFrameBytes && !s.isClosed() {
-		c.recordLargeReceive()
-	}
-	c.mu.Unlock()
+	s := c.recordStreamReceipt(f, size)
 	if s == nil {
 		// A late frame of a closed stream is dropped.
 		return nil
@@ -542,10 +529,9 @@ type Stream struct {
 	recv      *datapath.ReceiveWindow
 	send      *datapath.SendWindow
 
-	acceptance acceptanceWait // protected by conn.mu
-
-	mu    sync.Mutex
-	queue []*ownsandv1.DataFrame
+	acceptance streamAcceptance // guarded by conn.mu
+	mu         sync.Mutex
+	queue      []*ownsandv1.DataFrame
 	// controlFrames and controlBytes count the queued frames that carry no
 	// credit. The receive credit window bounds every other queued frame.
 	controlFrames int

@@ -92,6 +92,7 @@ const NOT_CONFIGURED: Auth = {
   isAuthenticated: false,
   userId: undefined,
   signIn: async () => {},
+  signInFailed: false,
   signOut: async () => {},
   getAccessToken: async () => undefined,
 };
@@ -224,7 +225,14 @@ function SignIn({
       </p>
       {notice !== undefined && configured ? <p>{notice}</p> : null}
       {configured ? (
-        <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
+        <>
+          <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
+          {auth.signInFailed ? (
+            <p role="alert">
+              Sign-in did not start. Check your connection and try again.
+            </p>
+          ) : null}
+        </>
       ) : (
         <p role="alert">{SIGN_IN_NOT_CONFIGURED}</p>
       )}

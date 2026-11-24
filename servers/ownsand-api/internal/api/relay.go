@@ -443,16 +443,17 @@ type streamEvents struct {
 // request deadline, which the request gate counted from the stream_id
 // allocation, so the upload of the request body already used part of it.
 // onWritten, when set, receives the bytes of the frame on the agent
-// connection once the relay wrote it. When acceptance is positive, the writer
-// starts the acceptance window after sending the frame and sendRequest waits
-// for that confirmation. Otherwise sendRequest returns when the frame is
-// queued.
+// connection once the relay wrote it. A positive acceptance window makes
+// sendRequest wait for the connection writer. The request deadline then
+// covers the wait behind a blocked writer, and the writer starts the
+// acceptance window after it sends the frame. With no acceptance window,
+// sendRequest returns when the frame is queued.
 func (p *DataPlane) sendRequest(ctx context.Context, c *relayCall, f *ownsandv1.DataFrame, deadline time.Time, onWritten func(int64), acceptance time.Duration) error {
 	rctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	var err error
 	if acceptance > 0 {
-		err = c.stream.SendForAcceptance(rctx, f, acceptance)
+		err = c.stream.SendConfirmed(rctx, f, onWritten, acceptance)
 	} else {
 		err = c.stream.SendMetered(rctx, f, onWritten)
 	}
@@ -502,22 +503,23 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 	// the acceptance timeout below never runs while the frame still waits
 	// behind a blocked writer; that wait stays under the request deadline.
 	uploadDone := make(chan error, 1)
-	go func() { uploadDone <- p.sendRequest(ctx, c, request, deadline, nil, p.Timing.Acceptance) }()
+	go func(done chan<- error) {
+		done <- p.sendRequest(ctx, c, request, deadline, nil, p.Timing.Acceptance)
+	}(uploadDone)
 	tick := min(p.Timing.Keepalive, p.Timing.Acceptance) / 4
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	lastEmit := time.Now()
 	accepted := false
-	forwarded := false
 	rotateAt := c.stream.Started.Add(p.Timing.Rotation)
 	for {
-		if !forwarded {
+		if uploadDone != nil {
 			select {
 			case err := <-uploadDone:
 				if err != nil {
 					return err
 				}
-				forwarded = true
+				uploadDone = nil
 			default:
 			}
 		}
@@ -552,10 +554,10 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 			}
 			return nil // rotation: OK status without a final event
 		}
+		if !accepted && c.stream.AcceptanceExpired() {
+			return errUnavailable("the agent did not accept the request")
+		}
 		if f == nil {
-			if !accepted && c.stream.AcceptanceExpired() {
-				return errUnavailable("the agent did not accept the request")
-			}
 			if now.Sub(lastEmit) >= p.Timing.Keepalive {
 				if err := ev.keepalive(); err != nil {
 					return err
@@ -570,8 +572,15 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 		}
 		if f.GetKind() == ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED {
 			if !accepted {
+				// The agent can reply before the writer reports the send.
+				// Publish acceptance only after forwarding succeeded.
+				if uploadDone != nil {
+					if err := <-uploadDone; err != nil {
+						return err
+					}
+					uploadDone = nil
+				}
 				accepted = true
-				c.stream.MarkAccepted()
 				if err := ev.accepted(); err != nil {
 					return err
 				}
