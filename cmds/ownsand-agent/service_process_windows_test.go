@@ -21,6 +21,10 @@ func TestLauncherStopsPayloadProcess(t *testing.T) {
 
 	switch os.Getenv(role) {
 	case "payload":
+		// Console-launched programs can inherit a setting that ignores Ctrl+C.
+		if ok, _, err := setConsoleCtrlHandler.Call(0, 1); ok == 0 {
+			t.Fatalf("ignore Ctrl+C in the payload: %v", err)
+		}
 		ctx, stop := signal.NotifyContext(t.Context(), os.Interrupt)
 		defer stop()
 		if err := os.WriteFile(os.Getenv(readyPath), nil, 0o600); err != nil {
@@ -60,7 +64,7 @@ func TestLauncherStopsPayloadProcess(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 		defer cancel()
 		child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestLauncherStopsPayloadProcess$")
-		child.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+		child.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.DETACHED_PROCESS}
 		if output, err := child.CombinedOutput(); err != nil {
 			t.Fatalf("launch and stop a payload: %v\n%s", err, output)
 		}

@@ -25,6 +25,13 @@ var (
 	attachPayloadConsole  = kernel32.NewProc("AttachConsole")
 	freePayloadConsole    = kernel32.NewProc("FreeConsole")
 	setConsoleCtrlHandler = kernel32.NewProc("SetConsoleCtrlHandler")
+
+	ignorePayloadConsoleBreak = windows.NewCallback(func(event uint32) uintptr {
+		if event == windows.CTRL_BREAK_EVENT {
+			return 1
+		}
+		return 0
+	})
 )
 
 func runPayloadProcess(ctx context.Context, exe string, args []string, stderr *os.File) (int, error) {
@@ -62,6 +69,8 @@ func runPayloadProcess(ctx context.Context, exe string, args []string, stderr *o
 		return int(res.code), res.err
 	case <-ctx.Done():
 	}
+	// Keep the launcher attached and its event handler registered until the payload exits.
+	defer freePayloadConsole.Call()
 	if err := stopPayloadConsole(child.ProcessId); err != nil {
 		// The process can exit before AttachConsole. Terminate the job if
 		// the payload has already lost its console and is still running.
@@ -149,9 +158,11 @@ func stopPayloadConsole(pid uint32) error {
 	if ok, _, err := attachPayloadConsole.Call(uintptr(pid)); ok == 0 {
 		return err
 	}
-	defer freePayloadConsole.Call()
-	if ok, _, err := setConsoleCtrlHandler.Call(0, 1); ok == 0 {
+	// Windows propagates the setting that ignores Ctrl+C to child processes.
+	// Ctrl+Break still reaches the payload's interrupt handler. The event also
+	// reaches the launcher while it is attached, so consume it here.
+	if ok, _, err := setConsoleCtrlHandler.Call(ignorePayloadConsoleBreak, 1); ok == 0 {
 		return err
 	}
-	return windows.GenerateConsoleCtrlEvent(windows.CTRL_C_EVENT, 0)
+	return windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, 0)
 }
