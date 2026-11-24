@@ -2,10 +2,10 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { RequestState, RunnerState } from "@delino/tide-protos/v1/common_pb";
-import type { MessageInitShape } from "@bufbuild/protobuf";
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import {
   WorkService,
-  type WatchQueueResponseSchema,
+  WatchQueueResponseSchema,
 } from "@delino/tide-protos/v1/work_pb";
 import { MAX_BACKOFF_MS } from "./backoff.ts";
 import { TideClient } from "./client.ts";
@@ -15,7 +15,12 @@ import {
   fakeServer,
   RecordingClock,
 } from "./testing/fake-server.ts";
-import { type WatchQueueEvent, WatchQueueEventKind } from "./watch-queue.ts";
+import {
+  watchQueue,
+  type WatchQueueCaller,
+  type WatchQueueEvent,
+  WatchQueueEventKind,
+} from "./watch-queue.ts";
 
 const ORG = "0193a000-0000-7000-8000-000000000001";
 
@@ -261,6 +266,113 @@ describe("watchQueue", () => {
     expect(events).toEqual([]);
     expect(asked).toBe(1);
     expect(server.calls).toEqual([]);
+  });
+
+  const firstRequest = create(WatchQueueResponseSchema, {
+    event: { case: "request", value: { requestId: "first" } },
+  });
+  const bufferedRequest = create(WatchQueueResponseSchema, {
+    event: { case: "request", value: { requestId: "buffered" } },
+  });
+  const bufferedSnapshot = create(WatchQueueResponseSchema, {
+    event: { case: "snapshotComplete", value: {} },
+  });
+
+  test.each([
+    ["request", bufferedRequest, "request buffered UNSPECIFIED"],
+    ["snapshot completion", bufferedSnapshot, "snapshot complete"],
+  ] as const)(
+    "closes the stream when a buffered %s arrives after abort",
+    async (_name, bufferedResponse, expected) => {
+      const clock = new RecordingClock();
+      let streams = 0;
+      let closed = 0;
+      const caller: WatchQueueCaller = {
+        async *watchQueue() {
+          streams++;
+          try {
+            yield firstRequest;
+            yield bufferedResponse;
+          } finally {
+            closed++;
+          }
+        },
+      };
+
+      const abort = new AbortController();
+      const events = watchQueue(caller, {
+        organizationId: ORG,
+        signal: abort.signal,
+        clock,
+      });
+      expect(summarize((await events.next()).value!)).toBe(
+        "request first UNSPECIFIED",
+      );
+      abort.abort(new Error("stop the watch"));
+      expect(await events.next()).toEqual({ done: true, value: undefined });
+      expect(closed).toBe(1);
+      expect(streams).toBe(1);
+      expect(clock.sleeps).toEqual([]);
+
+      const live = watchQueue(caller, {
+        organizationId: ORG,
+        signal: new AbortController().signal,
+        clock,
+      });
+      expect(summarize((await live.next()).value!)).toBe(
+        "request first UNSPECIFIED",
+      );
+      expect(summarize((await live.next()).value!)).toBe(expected);
+      await live.return();
+    },
+  );
+
+  test("ends without a gap if the signal aborts as the backoff ends", async () => {
+    const abort = new AbortController();
+    let streams = 0;
+    const events = watchQueue(
+      {
+        async *watchQueue() {
+          streams++;
+        },
+      },
+      {
+        organizationId: ORG,
+        signal: abort.signal,
+        clock: {
+          now: () => 0,
+          sleep: () => {
+            const wait = Promise.withResolvers<void>();
+            wait.resolve();
+            abort.abort();
+            return wait.promise;
+          },
+        },
+      },
+    );
+    expect(await events.next()).toEqual({ done: true, value: undefined });
+    expect(streams).toBe(1);
+  });
+
+  test("ends without reconnecting if the signal aborts after a gap", async () => {
+    const abort = new AbortController();
+    let streams = 0;
+    const events = watchQueue(
+      {
+        async *watchQueue() {
+          streams++;
+        },
+      },
+      {
+        organizationId: ORG,
+        signal: abort.signal,
+        clock: new RecordingClock(),
+      },
+    );
+    expect(summarize((await events.next()).value!)).toBe("gap 1 1000");
+    abort.abort();
+    expect(await events.next()).toEqual({ done: true, value: undefined });
+    expect(streams).toBe(1);
   });
 
   test("ends without an error when the signal aborts an open stream", async () => {
