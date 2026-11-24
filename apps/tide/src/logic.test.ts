@@ -341,6 +341,39 @@ describe("queue view", () => {
     expect(order).toEqual(["h-new", "n-old", "n-a", "n-b", "low"]);
   });
 
+  test("orders waiting requests within the same millisecond by queue time", () => {
+    const later = create(RequestSchema, {
+      requestId: "n-a",
+      state: RequestState.QUEUED,
+      priority: Priority.NORMAL,
+      queuedAt: { seconds: 1_700_000_000n, nanos: 123_900_000 },
+    });
+    const earlier = create(RequestSchema, {
+      requestId: "n-b",
+      state: RequestState.QUEUED,
+      priority: Priority.NORMAL,
+      queuedAt: { seconds: 1_700_000_000n, nanos: 123_100_000 },
+    });
+
+    expect(
+      waitingInQueueOrder([later, earlier]).map((r) => r.requestId),
+    ).toEqual(["n-b", "n-a"]);
+  });
+
+  test("treats a missing queue timestamp as the Unix epoch", () => {
+    const missing = create(RequestSchema, {
+      requestId: "a-missing",
+      state: RequestState.QUEUED,
+      priority: Priority.NORMAL,
+    });
+    const order = waitingInQueueOrder([
+      request("b-epoch", RequestState.QUEUED),
+      missing,
+      request("c-before-epoch", RequestState.QUEUED, Priority.NORMAL, -1),
+    ]).map((r) => r.requestId);
+    expect(order).toEqual(["c-before-epoch", "a-missing", "b-epoch"]);
+  });
+
   test("measures the queue wait until start, end or now", () => {
     expect(queueWaitMs({ queuedAt: timestampFromMs(1000) }, 61_000)).toBe(
       60_000,
