@@ -16,6 +16,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   statSync,
   rmSync,
   symlinkSync,
@@ -4339,7 +4340,12 @@ test(
       "data-root": "/mnt/docker",
       "registry-mirrors": ["https://mirror.example.com"],
       "log-driver": "json-file",
-      "log-opts": { "max-size": "10m" },
+      "log-opts": {
+        "max-size": "10m",
+        labels: "NaN",
+        env: "Infinity",
+        tag: "-Infinity",
+      },
       "default-address-pools": [{ base: "10.10.0.0/16", size: 24 }],
     };
     const fixture = logsFixture(t, {
@@ -4388,7 +4394,8 @@ test(
   { skip },
   (t) => {
     // Unusual formatting, key order and an extra setting must all stay.
-    const content = '{"data-root":"/x",   "log-driver":"local"}\n\n';
+    const content =
+      '{"data-root":"/x",   "log-driver":"local", "log-opts":{"labels":"NaN","env":"Infinity","tag":"-Infinity"}}\n\n';
     const result = logsFixture(t, { content }).run();
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.read(), content);
@@ -4495,6 +4502,34 @@ test(
       assert.equal(result.read(), content, label);
       assert.deepEqual(result.calls, [], label);
       assert.deepEqual(result.leftovers(), [], label);
+    }
+  },
+);
+
+test(
+  "configure-docker-logs rejects unquoted non-finite literals",
+  { skip },
+  (t) => {
+    for (const driver of ["json-file", "local"]) {
+      for (const literal of ["NaN", "Infinity", "-Infinity"]) {
+        const content = `{"log-driver":"${driver}","default-address-pools":[{"base":"10.10.0.0/16","size":${literal}}]}\n`;
+        const result = logsFixture(t, { content, driver }).run();
+        const label = `${driver} with ${literal}`;
+        assert.notEqual(result.status, 0, label);
+        assert.ok(
+          result.stderr.includes(
+            `${realpathSync(result.config)} is not valid JSON`,
+          ),
+          label,
+        );
+        assert.ok(
+          result.stderr.includes(`(unexpected literal ${literal})`),
+          label,
+        );
+        assert.equal(result.read(), content, label);
+        assert.deepEqual(result.calls, [], label);
+        assert.deepEqual(result.leftovers(), [], label);
+      }
     }
   },
 );
