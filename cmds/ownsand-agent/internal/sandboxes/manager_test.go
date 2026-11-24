@@ -800,8 +800,8 @@ func TestTTLEndRetriesAfterStopFailure(t *testing.T) {
 
 // TestMaxTTLReasonSurvivesRetryOfPausedSandbox checks that a retry after a
 // failed stop keeps MAX_TTL_EXPIRED for a paused sandbox. The record in
-// DELETING no longer says paused, so recomputing the reason would apply the
-// idle deadline that the pause suspended.
+// DELETING keeps the selected TTL reason even if the idle deadline from
+// before the pause has also passed.
 func TestMaxTTLReasonSurvivesRetryOfPausedSandbox(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(10*time.Minute, time.Hour).GetSandboxId()
@@ -873,9 +873,8 @@ func (e *env) failCallerDelete(id string, pause bool) {
 
 // TestCallerDeleteRetryKeepsReasonWhenIdleDeadlinePassed checks that a Tick
 // retry of a failed caller delete of a paused sandbox ends it as
-// DELETED_BY_CALLER. The pause suspended the idle deadline, but the record in
-// DELETING no longer says paused, so the stale idle deadline counts as passed
-// and used to replace the caller reason with IDLE_TTL_EXPIRED.
+// DELETED_BY_CALLER. The idle deadline from before the pause still makes the
+// retry due.
 func TestCallerDeleteRetryKeepsReasonWhenIdleDeadlinePassed(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(10*time.Minute, 24*time.Hour).GetSandboxId()
@@ -1406,6 +1405,80 @@ func TestFailedEndOfLostVMKeepsDeadlineWinning(t *testing.T) {
 		if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
 			t.Fatalf("restart=%v: end reason %v, want IDLE_TTL_EXPIRED", restart, r)
 		}
+	}
+}
+
+func TestFailedEndOfPausedLostVMIgnoresIdleDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		elapsed   time.Duration
+		wantState ownsandv1.SandboxState
+		wantEnd   ownsandv1.SandboxEndReason
+	}{
+		{"idle passed", 10 * time.Minute, ownsandv1.SandboxState_SANDBOX_STATE_FAILED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE},
+		{"max passed", 2 * time.Hour, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED},
+	} {
+		for _, retry := range []string{"tick", "restart"} {
+			t.Run(tc.name+"/"+retry, func(t *testing.T) {
+				ctx := context.Background()
+				e := newEnv(t)
+				id := e.create(5*time.Minute, time.Hour).GetSandboxId()
+				if entry, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+					t.Fatalf("pause: %v %v", entry, err)
+				}
+				e.loseVMWithFailedEnd(id)
+				if n := e.ex.endedCalls(id); n != 0 {
+					t.Fatalf("exec tracker notified %d times before cleanup succeeded", n)
+				}
+				e.clk.Advance(tc.elapsed)
+				if retry == "restart" {
+					e.restart()
+				} else {
+					e.m.Tick(ctx, false)
+				}
+				waitState(t, e.m, id, tc.wantState)
+				if reason := endReason(e.m, id); reason != tc.wantEnd {
+					t.Fatalf("end reason %v, want %v", reason, tc.wantEnd)
+				}
+				if retry == "tick" {
+					e.m.Tick(ctx, true)
+					e.ex.mu.Lock()
+					reason, calls := e.ex.ended[id], e.ex.calls[id]
+					e.ex.mu.Unlock()
+					if reason != tc.wantEnd || calls != 1 {
+						t.Fatalf("exec tracker notified %d times with %v, want 1 with %v", calls, reason, tc.wantEnd)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRestartLegacyFailedEndOfPausedLostVM(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	id := e.create(5*time.Minute, time.Hour).GetSandboxId()
+	if entry, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("pause: %v %v", entry, err)
+	}
+	e.loseVMWithFailedEnd(id)
+	data, err := os.ReadFile(e.st.Path(store.SandboxesDir, id+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record map[string]json.RawMessage
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatal(err)
+	}
+	delete(record, "paused_at_end")
+	if err := e.st.SaveSandbox(id, record); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(10 * time.Minute)
+	e.restart()
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if reason := endReason(e.m, id); reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
+		t.Fatalf("legacy end reason %v, want IDLE_TTL_EXPIRED", reason)
 	}
 }
 
