@@ -311,6 +311,34 @@ func TestExecAttachAfterStreamRotation(t *testing.T) {
 	}
 }
 
+func TestExecNotFoundAfterStreamRotation(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	// End the first stream immediately after Started, then reject the attach.
+	srv.ExecStreamEventLimit = 1
+	srv.Fail(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure, connect.NewError(connect.CodeNotFound, errors.New("exec not found")))
+
+	var got collected
+	_, err := c.Exec(t.Context(), ExecParams{
+		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+		Command: []string{"true"}, OnEvent: got.on,
+	})
+	var se *ExecStreamError
+	if !errors.As(err, &se) || connect.CodeOf(se.Err) != connect.CodeNotFound {
+		t.Fatalf("exec error = %v, want ExecStreamError wrapping not_found", err)
+	}
+	if !se.Started || se.OutcomeUnknown || got.started != 1 {
+		t.Fatalf("stream error = %+v, started = %t, outcome unknown = %t, start callbacks = %d", se, se.Started, se.OutcomeUnknown, got.started)
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); n != 1 {
+		t.Fatalf("exec calls = %d, want 1", n)
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); n != 1 {
+		t.Fatalf("attach calls = %d, want 1", n)
+	}
+}
+
 func TestExecReportsLostOutput(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
@@ -434,14 +462,23 @@ func TestExecErrors(t *testing.T) {
 	srv.SetSessionState(ds.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
 
 	// An unknown exec on attach reports an unknown outcome.
-	_, err = c.AttachExec(ctx, AttachParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), ExecID: "missing"})
-	if !errors.As(err, &se) || connect.CodeOf(err) != connect.CodeNotFound {
-		t.Fatalf("attach missing: %v", err)
+	var got collected
+	_, err = c.AttachExec(ctx, AttachParams{
+		OrganizationID: org, DevSessionID: ds.GetDevSessionId(), ExecID: "missing",
+		StdoutOffset: 10, StderrOffset: 30, OnEvent: got.on,
+	})
+	if !errors.As(err, &se) || connect.CodeOf(se.Err) != connect.CodeNotFound {
+		t.Fatalf("attach error = %v, want ExecStreamError wrapping not_found", err)
+	}
+	if se.ExecID != "missing" || se.StdoutOffset != 10 || se.StderrOffset != 30 {
+		t.Fatalf("attach error = %+v, want exec ID missing and offsets (10, 30)", se)
+	}
+	if se.Started || !se.OutcomeUnknown || got.started != 0 {
+		t.Fatalf("started = %t, outcome unknown = %t, start callbacks = %d", se.Started, se.OutcomeUnknown, got.started)
 	}
 
 	// A cancelled caller gets the offsets to continue with.
 	cctx, cancel := context.WithCancel(ctx)
-	var got collected
 	_, err = c.Exec(cctx, ExecParams{
 		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
 		Command: []string{"sh", "-c", "echo hello; sleep 0.5; echo world"},
