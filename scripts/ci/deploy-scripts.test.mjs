@@ -3617,7 +3617,17 @@ const caddyImage = `caddy:2.11.9@sha256:${"c".repeat(64)}`;
 // The readiness wait runs with a short deadline and interval.
 function runCaddy(
   t,
-  { inspect, fail, noImage, args, state, gone, wgetFails, env: extra } = {},
+  {
+    inspect,
+    fail,
+    noImage,
+    args,
+    state,
+    gone,
+    wgetFails,
+    simulateClock,
+    env: extra,
+  } = {},
 ) {
   const dir = scratch(t);
   const bin = join(dir, "bin");
@@ -3664,6 +3674,15 @@ esac`,
   if (wgetFails !== undefined) env.STUB_WGET_FAILS = String(wgetFails);
   env.START_CADDY_READY_TIMEOUT = "2";
   env.START_CADDY_READY_INTERVAL = "0.1";
+  if (simulateClock) {
+    // Replace Bash's wall clock with a counter advanced by each sleep.
+    env.BASH_ENV = join(dir, "clock.bash");
+    writeFileSync(
+      env.BASH_ENV,
+      "unset SECONDS\nSECONDS=0\nsleep() { SECONDS=$((SECONDS + $1)); }\n",
+    );
+    env.START_CADDY_READY_INTERVAL = "1";
+  }
   Object.assign(env, extra);
   const result = spawnSync(
     "bash",
@@ -3719,6 +3738,37 @@ test("start-caddy starts a stopped container", { skip }, (t) => {
     caddyProbe,
   ]);
 });
+
+test(
+  "start-caddy probes after create and start with padded timeouts",
+  { skip },
+  (t) => {
+    const createCalls = [
+      caddyImageInspect,
+      "docker rm --force caddy",
+      caddyRun,
+    ];
+    const startCalls = ["docker start caddy"];
+    for (const timeout of ["08", "8", "09", "9"]) {
+      for (const [inspect, operationCalls] of [
+        [undefined, createCalls],
+        [`${caddyImage} false`, startCalls],
+      ]) {
+        const result = runCaddy(t, {
+          inspect,
+          env: { START_CADDY_READY_TIMEOUT: timeout },
+        });
+        const label = `${inspect ?? "missing"} with timeout ${timeout}`;
+        assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+        assert.deepEqual(
+          result.calls,
+          [caddyInspect, ...operationCalls, caddyState, caddyProbe],
+          label,
+        );
+      }
+    }
+  },
+);
 
 test("start-caddy recreates a container with another image", { skip }, (t) => {
   for (const running of ["true", "false"]) {
@@ -4051,6 +4101,37 @@ test("start-caddy fails when Caddy never answers", { skip }, (t) => {
     // The deadline bounds the attempts: at least two, far below an
     // unbounded loop.
     assert.ok(probes >= 2 && probes <= 60, `${label}: ${probes} probes`);
+  }
+});
+
+test("start-caddy uses decimal readiness deadlines", { skip }, (t) => {
+  for (const [timeout, seconds] of [
+    ["010", 10],
+    ["10", 10],
+    ["000", 0],
+    ["0", 0],
+    [undefined, 30],
+  ]) {
+    const label = timeout ?? "default";
+    const result = runCaddy(t, {
+      inspect: `${caddyImage} false`,
+      wgetFails: "always",
+      simulateClock: true,
+      env: { START_CADDY_READY_TIMEOUT: timeout },
+    });
+    assert.equal(result.status, 1, label);
+    assert.match(result.stderr, /did not answer its admin API/, label);
+    assert.match(
+      result.stderr,
+      new RegExp(`within ${timeout ?? seconds} seconds`),
+      label,
+    );
+    // The initial probe runs at second 0, even with a zero-second budget.
+    assert.equal(
+      result.calls.filter((call) => call === caddyProbe).length,
+      seconds + 1,
+      label,
+    );
   }
 });
 
