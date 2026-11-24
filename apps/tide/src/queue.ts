@@ -2,11 +2,7 @@
 import { Priority, RequestState } from "@delino/tide-protos/v1/common_pb";
 import type { Request, Runner } from "@delino/tide-protos/v1/work_pb";
 import { type WatchQueueEvent, WatchQueueEventKind } from "tide-sdk";
-import {
-  TERMINAL_REQUEST_STATES,
-  TERMINAL_RUNNER_STATES,
-  timestampMs,
-} from "./format.ts";
+import { TERMINAL_REQUEST_STATES, TERMINAL_RUNNER_STATES } from "./format.ts";
 
 /** The connection state of the live queue view. */
 export enum LiveState {
@@ -159,7 +155,8 @@ export function waitingInQueueOrder(requests: Iterable<Request>): Request[] {
     .sort(
       (a, b) =>
         (PRIORITY_ORDER[a.priority] ?? 3) - (PRIORITY_ORDER[b.priority] ?? 3) ||
-        (timestampMs(a.queuedAt) ?? 0) - (timestampMs(b.queuedAt) ?? 0) ||
+        Number((a.queuedAt?.seconds ?? 0n) - (b.queuedAt?.seconds ?? 0n)) ||
+        (a.queuedAt?.nanos ?? 0) - (b.queuedAt?.nanos ?? 0) ||
         (a.requestId < b.requestId ? -1 : a.requestId > b.requestId ? 1 : 0),
     );
 }

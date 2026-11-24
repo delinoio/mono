@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { timestampMs } from "@bufbuild/protobuf/wkt";
 import {
   afterEach,
   beforeEach,
@@ -23,15 +24,27 @@ import {
   createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
+import { createQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
+import { AuditService } from "@delino/tide-protos/v1/audit_pb";
 import { Role } from "@delino/tide-protos/v1/common_pb";
+import { GitHubService } from "@delino/tide-protos/v1/github_pb";
 import {
   type ListMembersRequest,
   MemberService,
 } from "@delino/tide-protos/v1/member_pb";
 import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
+import {
+  type ListRunnerProfilesRequest,
+  RunnerProfileService,
+} from "@delino/tide-protos/v1/runner_profile_pb";
+import {
+  type ListRequestsRequest,
+  type ListRunnersRequest,
+  WorkService,
+} from "@delino/tide-protos/v1/work_pb";
 import { QueryClient } from "@tanstack/react-query";
-import { PAGE_SIZE } from "./api.ts";
+import { MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { ErrorNotice } from "./components/ui.tsx";
@@ -43,6 +56,7 @@ import {
   MOCK_USER,
   type MockTransportOptions,
 } from "./mock/mock-api.ts";
+import { organizationPages } from "./mock/organization-pages.ts";
 import { externalNavigation } from "./navigation.ts";
 
 const config = {
@@ -58,6 +72,7 @@ function renderConsole(
     signIn?: Auth["signIn"];
     transport?: Transport;
     mock?: MockTransportOptions;
+    staleTime?: number;
   } = {},
 ) {
   window.history.replaceState(null, "", path);
@@ -67,11 +82,15 @@ function renderConsole(
     isAuthenticated: signedIn,
     userId: signedIn ? MOCK_USER : undefined,
     signIn: options.signIn ?? (async () => {}),
+    signInFailed: false,
     signOut: async () => {},
     getAccessToken: async () => "token",
   };
   const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    defaultOptions: {
+      queries: { retry: false, staleTime: options.staleTime },
+      mutations: { retry: false },
+    },
   });
   render(
     <AuthContextProvider value={auth}>
@@ -82,6 +101,7 @@ function renderConsole(
       />
     </AuthContextProvider>,
   );
+  return queryClient;
 }
 
 async function settle(ms = 40) {
@@ -118,6 +138,45 @@ afterEach(() => {
 });
 
 describe("organizations", () => {
+  test("shares all pages in server order between home and the switcher", async () => {
+    const { transport, listRequests } = await organizationPages({
+      lastRole: Role.ADMIN,
+    });
+    renderConsole("/", { transport, staleTime: 10_000 });
+
+    const list = await screen.findByRole("list", {
+      name: "Your organizations",
+    });
+    // Use the list structure for bulk checks so the full page fixture does
+    // not require computing hundreds of accessible names in happy-dom.
+    const rows = list.querySelectorAll("li");
+    expect(rows).toHaveLength(201);
+    expect(rows[0].textContent).toContain("Acme Robotics");
+    expect(rows[199].textContent).toContain("Fixture organization 200");
+    expect(rows[200].textContent).toContain("Globex");
+    expect(
+      list.querySelectorAll(`a[href="/orgs/${MOCK_IDS.globex}"]`),
+    ).toHaveLength(1);
+
+    fireEvent.click(
+      within(rows[0]).getByRole("link", { name: /Acme Robotics/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("combobox", { name: "Organization" }),
+    );
+    fireEvent.click(
+      await screen.findByText("Globex", { selector: '[role="option"] *' }),
+    );
+
+    expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.globex}`);
+    expect(
+      listRequests.map(({ pageSize, pageToken }) => [pageSize, pageToken]),
+    ).toEqual([
+      [200, ""],
+      [200, "after-200"],
+    ]);
+  });
+
   test("lists the caller's organizations and creates one from a focused dialog", async () => {
     renderConsole("/");
     expect(
@@ -584,6 +643,54 @@ describe("OwnSand link", () => {
 });
 
 describe("integrations", () => {
+  async function editClaudeIntegration() {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`);
+    const list = within(
+      await screen.findByRole("list", { name: "Agent integrations" }),
+    );
+    const row = list.getByText("claude-team · Claude Code").closest("li")!;
+    await click(within(row).getByRole("button", { name: "Edit" }));
+    const dialog = screen.getByRole("dialog", { name: "Edit claude-team" });
+    const form = within(dialog);
+    const name = form.getByRole("textbox", { name: "Name" });
+    const save = () =>
+      click(form.getByRole("button", { name: "Save changes" }));
+    return { list, dialog, form, name, save };
+  }
+
+  test("keeps the edit dialog open when the name already exists", async () => {
+    const { list, dialog, form, name, save } = await editClaudeIntegration();
+    await type(name, "codex-prod");
+    await save();
+
+    expect(
+      await form.findByText("an agent integration with this name exists"),
+    ).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Edit claude-team" })).toBe(
+      dialog,
+    );
+    expect(list.getAllByText(/^codex-prod · /)).toHaveLength(1);
+    expect(list.getAllByText(/^claude-team · /)).toHaveLength(1);
+  });
+
+  test("renames an integration to an unused name", async () => {
+    const { list, name, save } = await editClaudeIntegration();
+    await type(name, "claude-renamed");
+    await save();
+
+    expect(await list.findByText("claude-renamed · Claude Code")).toBeTruthy();
+    expect(list.queryByText("claude-team · Claude Code")).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("closes the edit dialog when the integration name is unchanged", async () => {
+    const { list, save } = await editClaudeIntegration();
+    await save();
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(list.getByText("claude-team · Claude Code")).toBeTruthy();
+  });
+
   test("shows the OpenAI webhook URL and the credential state without values", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`);
     const url = await screen.findByLabelText("webhook URL of codex-prod");
@@ -644,27 +751,290 @@ describe("integrations", () => {
 });
 
 describe("GitHub setup callback", () => {
-  test("strips code and state, links the installation and continues to integrations", async () => {
-    renderConsole(
-      "/github/setup?installation_id=51000001&code=gh_code&state=mock-state&setup_action=install",
-    );
-    await settle(20);
-    expect(window.location.search).toBe("");
-    expect(window.location.href).not.toContain("gh_code");
-    // The user is an admin of Acme and Globex, so the page asks which one.
-    const form = await screen.findByRole("button", {
-      name: "Link installation",
+  const callbackPath =
+    "/github/setup?installation_id=51000001&code=gh_code&state=mock-state&setup_action=install";
+  const integrationsPath = `/orgs/${MOCK_IDS.globex}/integrations`;
+  const installationName = /github-org-51000001/;
+
+  function holdLinkRequest() {
+    const mock = createMockTransport();
+    let completeLink!: (error?: ConnectError) => void;
+    const response = new Promise<ConnectError | undefined>((resolve) => {
+      completeLink = resolve;
     });
-    expect(form).toBeTruthy();
-    const trigger = screen.getByRole("combobox", { name: "tide organization" });
-    await click(trigger);
+    const linkRequest = rs.fn();
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (method.name === GitHubService.method.linkGitHubInstallation.name) {
+          linkRequest();
+          const error = await response;
+          if (error !== undefined) throw error;
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    return { transport, completeLink, linkRequest };
+  }
+
+  async function submitToGlobex() {
+    await click(
+      await screen.findByRole("combobox", { name: "tide organization" }),
+    );
     await click(await screen.findByRole("option", { name: /Globex/ }));
     await click(screen.getByRole("button", { name: "Link installation" }));
-    await settle(80);
-    expect(window.location.pathname).toBe(
-      `/orgs/${MOCK_IDS.globex}/integrations`,
+  }
+
+  test("waits for the last page before offering every eligible organization", async () => {
+    let releaseLastPage!: () => void;
+    const lastPage = new Promise<void>((resolve) => {
+      releaseLastPage = resolve;
+    });
+    const { transport, listRequests, linkRequests } = await organizationPages({
+      firstRole: Role.OWNER,
+      lastRole: Role.ADMIN,
+      beforeLastPage: () => lastPage,
+    });
+    renderConsole(callbackPath, { transport });
+
+    await waitFor(() => expect(listRequests).toHaveLength(2));
+    expect(
+      screen.getByRole("status", { name: "Loading your organizations" }),
+    ).toBeTruthy();
+    expect(linkRequests).toHaveLength(0);
+    expect(window.location.search).toBe("");
+
+    releaseLastPage();
+    await click(
+      await screen.findByRole("combobox", { name: "tide organization" }),
     );
-    expect(await screen.findByText(/github-org-51000001/)).toBeTruthy();
+    expect(
+      screen.getAllByRole("option").map((option) => option.textContent),
+    ).toEqual(["Acme Robotics (owner)", "Globex (admin)"]);
+    await click(screen.getByRole("option", { name: "Globex (admin)" }));
+    await click(screen.getByRole("button", { name: "Link installation" }));
+
+    expect(await screen.findByText(installationName)).toBeTruthy();
+    expect(window.location.pathname).toBe(integrationsPath);
+    expect(linkRequests.map((request) => request.organizationId)).toEqual([
+      MOCK_IDS.globex,
+    ]);
+  });
+
+  test("retries a failed later page before linking to the sole eligible organization", async () => {
+    let attempts = 0;
+    const { transport, listRequests, linkRequests } = await organizationPages({
+      lastRole: Role.ADMIN,
+      beforeLastPage: async () => {
+        if (++attempts === 1)
+          throw new ConnectError("Page failed", Code.Internal);
+      },
+    });
+    renderConsole(callbackPath, { transport });
+
+    const retry = await screen.findByRole("button", { name: "Try again" });
+    expect(within(screen.getByRole("main")).getByRole("alert")).toBeTruthy();
+    expect(window.location.search).toBe("");
+    expect(linkRequests).toHaveLength(0);
+    await click(retry);
+
+    expect(await screen.findByText(installationName)).toBeTruthy();
+    expect(window.location.pathname).toBe(integrationsPath);
+    expect(linkRequests).toMatchObject([
+      {
+        organizationId: MOCK_IDS.globex,
+        githubInstallationId: 51000001n,
+        code: "gh_code",
+        state: "mock-state",
+      },
+    ]);
+    expect(listRequests.slice(0, 4).map(({ pageToken }) => pageToken)).toEqual([
+      "",
+      "after-200",
+      "",
+      "after-200",
+    ]);
+  });
+
+  test("keeps a full first page when the terminal page is empty", async () => {
+    const { transport, listRequests, linkRequests } = await organizationPages(
+      {},
+    );
+    renderConsole(callbackPath, { transport, staleTime: 10_000 });
+
+    expect(await screen.findByText(/Only an owner or admin/)).toBeTruthy();
+    expect(listRequests.map(({ pageToken }) => pageToken)).toEqual([
+      "",
+      "after-200",
+    ]);
+    expect(linkRequests).toHaveLength(0);
+
+    await click(screen.getByRole("link", { name: "Go to your organizations" }));
+    const list = await screen.findByRole("list", {
+      name: "Your organizations",
+    });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(200);
+    expect(listRequests).toHaveLength(2);
+  });
+
+  test("strips callback values and replaces the setup entry on success", async () => {
+    const { transport, completeLink, linkRequest } = holdLinkRequest();
+    renderConsole(callbackPath, { transport });
+    await submitToGlobex();
+    expect(window.location.search).toBe("");
+    expect(linkRequest).toHaveBeenCalledTimes(1);
+    const historyLength = window.history.length;
+
+    completeLink();
+
+    expect(await screen.findByText(installationName)).toBeTruthy();
+    expect(window.location.pathname).toBe(integrationsPath);
+    expect(window.history.length).toBe(historyLength);
+    expect(linkRequest).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["Tide link", "Back", "return to setup"] as const)(
+    "preserves the current entry after leaving with %s and refreshes Integrations",
+    async (navigation) => {
+      const { transport, completeLink, linkRequest } = holdLinkRequest();
+      window.history.replaceState({ entry: "organizations" }, "", "/");
+      window.history.pushState(null, "", callbackPath);
+      const queryClient = renderConsole(callbackPath, { transport });
+      const installations = createQueryOptions(
+        GitHubService.method.listGitHubInstallations,
+        { organizationId: MOCK_IDS.globex, pageSize: MAX_PAGE_SIZE },
+        { transport },
+      );
+      queryClient.setQueryDefaults(installations.queryKey, {
+        staleTime: Infinity,
+      });
+      const before = await queryClient.fetchQuery(installations);
+      expect(before.installations).toHaveLength(0);
+      await submitToGlobex();
+      expect(linkRequest).toHaveBeenCalledTimes(1);
+
+      if (navigation === "Back") {
+        await act(async () => window.history.back());
+      } else {
+        await click(screen.getByRole("link", { name: "tide" }));
+      }
+      expect(
+        await screen.findByRole("heading", { name: "Organizations" }),
+      ).toBeTruthy();
+      if (navigation === "return to setup") {
+        await act(async () => window.history.back());
+        expect(
+          await screen.findByText(/has no GitHub installation details/),
+        ).toBeTruthy();
+      }
+      const currentPath =
+        navigation === "return to setup" ? "/github/setup" : "/";
+      const currentEntry = { entry: navigation };
+      window.history.replaceState(currentEntry, "", currentPath);
+      const historyLength = window.history.length;
+
+      completeLink();
+      await waitFor(() => {
+        expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+          "success",
+        );
+      });
+
+      expect(window.location.pathname).toBe(currentPath);
+      expect(window.history.state).toEqual(currentEntry);
+      expect(window.history.length).toBe(historyLength);
+      expect(
+        queryClient.getQueryState(installations.queryKey)?.isInvalidated,
+      ).toBe(true);
+      if (navigation === "return to setup") {
+        await click(
+          screen.getByRole("link", { name: "Go to your organizations" }),
+        );
+      }
+      await click(await screen.findByRole("link", { name: /Globex/ }));
+      await click(await screen.findByRole("link", { name: "Integrations" }));
+      expect(await screen.findByText(installationName)).toBeTruthy();
+      expect(linkRequest).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test("checks the address before the router renders a navigation", async () => {
+    const { transport, completeLink, linkRequest } = holdLinkRequest();
+    const queryClient = renderConsole(callbackPath, { transport });
+    await submitToGlobex();
+    expect(linkRequest).toHaveBeenCalledTimes(1);
+    // Change the browser entry before the router receives its popstate event.
+    window.history.pushState({ entry: "organizations" }, "", "/");
+    completeLink();
+    await waitFor(() => {
+      expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+        "success",
+      );
+    });
+
+    expect(window.location.pathname).toBe("/");
+    expect(window.history.state).toEqual({ entry: "organizations" });
+  });
+
+  test("keeps setup open and shows restart instructions after a failure", async () => {
+    const { transport, completeLink, linkRequest } = holdLinkRequest();
+    renderConsole(callbackPath, { transport });
+    await submitToGlobex();
+    expect(linkRequest).toHaveBeenCalledTimes(1);
+    const historyLength = window.history.length;
+
+    completeLink(
+      new ConnectError(
+        "The installation state expired",
+        Code.FailedPrecondition,
+      ),
+    );
+
+    const message = await screen.findByText("The installation state expired");
+    expect(message.closest('[role="alert"]')).toBeTruthy();
+    expect(
+      screen.getByText(
+        /The installation link is single-use. Start the installation again/,
+      ),
+    ).toBeTruthy();
+    expect(window.location.pathname).toBe("/github/setup");
+    expect(window.history.length).toBe(historyLength);
+    expect(linkRequest).toHaveBeenCalledTimes(1);
+  });
+
+  test("an expired issued state keeps the callback on setup and shows restart guidance", async () => {
+    const transport = createMockTransport();
+    const github = createClient(GitHubService, transport);
+    const { url, expireTime } = await github.createGitHubInstallUrl({
+      organizationId: MOCK_IDS.globex,
+    });
+    const state = new URL(url).searchParams.get("state");
+    if (!state || !expireTime) throw new Error("Expected state and expiry");
+    const clock = rs
+      .spyOn(Date, "now")
+      .mockReturnValue(timestampMs(expireTime));
+    try {
+      const query = new URLSearchParams({
+        installation_id: "51000002",
+        code: "fixture-code",
+        state,
+      });
+      renderConsole(`/github/setup?${query}`, { transport });
+      await click(
+        await screen.findByRole("combobox", { name: "tide organization" }),
+      );
+      await click(await screen.findByRole("option", { name: /Globex/ }));
+      await click(screen.getByRole("button", { name: "Link installation" }));
+
+      expect(
+        await screen.findByText(
+          /Start the installation again from the integrations/,
+        ),
+      ).toBeTruthy();
+      expect(window.location.pathname).toBe("/github/setup");
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test("an address without the callback values explains what to do", async () => {
@@ -676,10 +1046,191 @@ describe("GitHub setup callback", () => {
 });
 
 describe("runner profiles", () => {
+  test("follows the token after a full second page to an empty terminal page", async () => {
+    const mock = createMockTransport({ runnerProfileCount: 400 });
+    const pages: ListRunnerProfilesRequest[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...args) {
+        if (
+          method.name === RunnerProfileService.method.listRunnerProfiles.name
+        ) {
+          pages.push(args[3] as ListRunnerProfilesRequest);
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, { transport });
+
+    const list = await screen.findByRole("list", { name: "Runner profiles" });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(400);
+    expect(rows[0]?.textContent).toContain("codex-linux");
+    expect(rows[399]?.textContent).toContain("linux-build");
+    expect(
+      pages.map(({ organizationId, pageSize, pageToken }) => [
+        organizationId,
+        pageSize,
+        pageToken,
+      ]),
+    ).toEqual([
+      [MOCK_IDS.acme, 200, ""],
+      [MOCK_IDS.acme, 200, "200"],
+      [MOCK_IDS.acme, 200, "400"],
+    ]);
+  });
+
+  test("keeps work visible after a continuation fails and retries the full list", async () => {
+    const mock = createMockTransport({ runnerProfileCount: 201 });
+    const pages: string[] = [];
+    const selectedProfiles: string[] = [];
+    let fail = true;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (
+          method.name === RunnerProfileService.method.listRunnerProfiles.name
+        ) {
+          const { pageSize, pageToken } = args[3] as ListRunnerProfilesRequest;
+          if (pageSize === MAX_PAGE_SIZE) {
+            pages.push(pageToken);
+            if (pageToken !== "" && fail) {
+              fail = false;
+              throw new ConnectError("continuation failed", Code.Internal);
+            }
+          }
+        }
+        if (
+          method.name === WorkService.method.listRequests.name ||
+          method.name === WorkService.method.listRunners.name
+        ) {
+          const { runnerProfileId } = args[3] as
+            ListRequestsRequest | ListRunnersRequest;
+          if (runnerProfileId) selectedProfiles.push(runnerProfileId);
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}/requests`, {
+      transport,
+      staleTime: 10_000,
+    });
+
+    const error = (
+      await screen.findByText(/^Could not load runner profiles/)
+    ).closest<HTMLElement>('[role="alert"]')!;
+    const requests = await screen.findByRole("table", { name: "Requests" });
+    const waitingJob = within(requests).getByRole("row", {
+      name: /test \(ubuntu\)/,
+    });
+    expect(within(waitingJob).queryByText("linux-build")).toBeNull();
+    const filter = screen.getByRole<HTMLButtonElement>("combobox", {
+      name: "Runner profile",
+    });
+    expect(filter.disabled).toBe(true);
+
+    await click(within(error).getByRole("button", { name: "Try again" }));
+    expect(await within(waitingJob).findByText("linux-build")).toBeTruthy();
+    expect(filter.disabled).toBe(false);
+    await click(filter);
+    await click(await screen.findByRole("option", { name: "linux-build" }));
+
+    await click(screen.getByRole("link", { name: "Runners" }));
+    const runners = await screen.findByRole("table", { name: "Runners" });
+    expect(within(runners).getAllByText("linux-build")).toHaveLength(2);
+    await click(screen.getByRole("combobox", { name: "Runner profile" }));
+    await click(await screen.findByRole("option", { name: "linux-build" }));
+
+    await click(screen.getByRole("link", { name: "Overview" }));
+    const queue = await screen.findByRole("table", {
+      name: "Waiting requests",
+    });
+    expect(within(queue).getByText("linux-build")).toBeTruthy();
+    expect(pages).toEqual(["", "200", "", "200"]);
+    expect(selectedProfiles).toEqual([
+      MOCK_IDS.linuxProfile,
+      MOCK_IDS.linuxProfile,
+    ]);
+  });
+
   test("shows the runs-on label of GitHub job profiles", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
     const label = await screen.findByLabelText("runs-on label of linux-build");
     expect(label.textContent).toBe("tide-linux-build");
+  });
+
+  test("rejects a duplicate rename without changing profiles or audit events", async () => {
+    const transport = createMockTransport();
+    const profiles = createClient(RunnerProfileService, transport);
+    const audit = createClient(AuditService, transport);
+    const organization = { organizationId: MOCK_IDS.acme };
+    const [profilesBefore, auditBefore] = await Promise.all([
+      profiles.listRunnerProfiles(organization),
+      audit.listAuditEvents(organization),
+    ]);
+
+    await expect(
+      profiles.updateRunnerProfile({
+        ...organization,
+        runnerProfileId: MOCK_IDS.linuxProfile,
+        profile: { name: "codex-linux" },
+        updateMask: { paths: ["name"] },
+      }),
+    ).rejects.toMatchObject({
+      code: Code.AlreadyExists,
+      rawMessage: "a runner profile with this name exists",
+    });
+
+    const [profilesAfter, auditAfter] = await Promise.all([
+      profiles.listRunnerProfiles(organization),
+      audit.listAuditEvents(organization),
+    ]);
+    expect(profilesAfter).toEqual(profilesBefore);
+    expect(auditAfter).toEqual(auditBefore);
+  });
+
+  test.each(["linux-build", "linux-build-new"])(
+    "accepts a name update to %s and returns the runs-on label",
+    async (name) => {
+      const profiles = createClient(
+        RunnerProfileService,
+        createMockTransport(),
+      );
+      const { profile } = await profiles.updateRunnerProfile({
+        organizationId: MOCK_IDS.acme,
+        runnerProfileId: MOCK_IDS.linuxProfile,
+        profile: { name },
+        updateMask: { paths: ["name"] },
+      });
+
+      expect(profile).toMatchObject({ name, githubLabel: `tide-${name}` });
+    },
+  );
+
+  test("keeps the edit dialog open and shows the duplicate-name error", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
+    const profiles = await screen.findByRole("list", {
+      name: "Runner profiles",
+    });
+    const row = within(profiles)
+      .getByText(/^linux-build ·/)
+      .closest("li")!;
+    await click(within(row).getByRole("button", { name: "Edit" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Edit linux-build",
+    });
+    await type(
+      within(dialog).getByRole("textbox", { name: "Name" }),
+      "codex-linux",
+    );
+    await click(within(dialog).getByRole("button", { name: "Save changes" }));
+
+    expect(
+      await within(dialog).findByText("a runner profile with this name exists"),
+    ).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Edit linux-build" })).toBe(
+      dialog,
+    );
   });
 
   test("a new profile can use the default priority of the workload kind", async () => {
@@ -882,6 +1433,153 @@ describe("personal API key pages", () => {
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
   });
+});
+
+describe("confirmation dialog requests", () => {
+  function gatedTransport(methodName: string) {
+    const mock = createMockTransport();
+    const calls: {
+      input: unknown;
+      settle(error?: ConnectError): void;
+    }[] = [];
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (method.name === methodName) {
+          const error = await new Promise<ConnectError | undefined>(
+            (settle) => {
+              calls.push({ input: args[3], settle });
+            },
+          );
+          if (error) throw error;
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    return { transport, calls };
+  }
+
+  const seededKey = "claude-on-laptop";
+  const failure = new ConnectError(
+    "Revocation failed",
+    Code.FailedPrecondition,
+  );
+
+  async function openRevoke(name = seededKey) {
+    const row = (await screen.findByText(new RegExp(`^${name} ·`))).closest(
+      "li",
+    )!;
+    await click(within(row).getByRole("button", { name: "Revoke" }));
+    return screen.findByRole("alertdialog", { name: `Revoke ${name}?` });
+  }
+
+  function confirmButton(dialog: HTMLElement) {
+    return within(dialog).getByRole<HTMLButtonElement>("button", {
+      name: "Revoke key",
+    });
+  }
+
+  test("sends one request for two presses and disables confirmation until success", async () => {
+    const { transport, calls } = gatedTransport("RevokeApiKey");
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    const button = confirmButton(await openRevoke());
+    await act(async () => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(button.disabled).toBe(true);
+
+    await act(async () => calls[0].settle());
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(calls).toHaveLength(1);
+  });
+
+  test("shows a current failure and lets the user retry", async () => {
+    const { transport, calls } = gatedTransport("RevokeApiKey");
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    const dialog = await openRevoke();
+    const button = confirmButton(dialog);
+    await click(button);
+
+    await act(async () => calls[0].settle(failure));
+    expect(await within(dialog).findByText("Revocation failed")).toBeTruthy();
+    expect(button.disabled).toBe(false);
+
+    await click(button);
+    expect(calls).toHaveLength(2);
+    expect(button.disabled).toBe(true);
+    expect(within(dialog).queryByText("Revocation failed")).toBeNull();
+    await act(async () => calls[1].settle());
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  });
+
+  test("a late success refreshes the key list and leaves the next confirmation open", async () => {
+    const { transport, calls } = gatedTransport("RevokeApiKey");
+    const { apiKey } = await createClient(
+      ApiKeyService,
+      transport,
+    ).createApiKey({
+      organizationId: MOCK_IDS.acme,
+      name: "deploy-bot",
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    const first = await openRevoke();
+    await click(confirmButton(first));
+    await act(async () => fireEvent.keyDown(first, { key: "Escape" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    const second = await openRevoke("deploy-bot");
+
+    await act(async () => calls[0].settle());
+    expect(await screen.findByText(`${seededKey} · Revoked`)).toBeTruthy();
+    expect(
+      screen.getByRole("alertdialog", { name: "Revoke deploy-bot?" }),
+    ).toBe(second);
+    expect(confirmButton(second).disabled).toBe(false);
+    await click(confirmButton(second));
+    expect(calls.map(({ input }) => input)).toEqual([
+      expect.objectContaining({ apiKeyId: MOCK_IDS.apiKey }),
+      expect.objectContaining({ apiKeyId: apiKey!.apiKeyId }),
+    ]);
+    await act(async () => calls[1].settle());
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  });
+
+  test("a late failure stays hidden after Cancel and reopening the same target", async () => {
+    const { transport, calls } = gatedTransport("RevokeApiKey");
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    const first = await openRevoke();
+    await click(confirmButton(first));
+    await click(within(first).getByRole("button", { name: "Cancel" }));
+    const second = await openRevoke();
+
+    await act(async () => calls[0].settle(failure));
+    await settle();
+    expect(within(second).queryByText("Revocation failed")).toBeNull();
+    expect(confirmButton(second).disabled).toBe(false);
+  });
+
+  test.each([
+    [MOCK_IDS.northwind, "members", "Leave organization", "RemoveMember"],
+    [MOCK_IDS.acme, "settings", "Delete organization", "DeleteOrganization"],
+  ])(
+    "a dismissed %s/%s confirmation does not redirect when %s succeeds",
+    async (organizationId, section, label, method) => {
+      const { transport, calls } = gatedTransport(method);
+      renderConsole(`/orgs/${organizationId}/${section}`, { transport });
+      await click(await screen.findByRole("button", { name: label }));
+      const dialog = await screen.findByRole("alertdialog");
+      await click(within(dialog).getByRole("button", { name: label }));
+      await click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await click(screen.getByRole("link", { name: "Requests" }));
+      const path = `/orgs/${organizationId}/requests`;
+      expect(window.location.pathname).toBe(path);
+
+      await act(async () => calls[0].settle());
+      await settle();
+      expect(window.location.pathname).toBe(path);
+    },
+  );
 });
 
 describe("invitations", () => {

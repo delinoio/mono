@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/delinoio/mono/servers/internal/listenaddr"
+	"github.com/delinoio/mono/servers/internal/weborigin"
 	"github.com/delinoio/mono/servers/tide-api/internal/secrets"
 )
 
@@ -256,12 +257,17 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.CORSOrigins = nil
 		for _, origin := range splitList(v) {
 			u, err := url.Parse(origin)
-			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "" || u.RawQuery != "" ||
-				// A bare "#" leaves u.Fragment empty, so check the raw value too. Browsers never send a fragment in Origin.
-				u.Fragment != "" || strings.Contains(origin, "#") {
+			// ForceQuery detects a bare "?". Check the raw origin for a bare "#".
+			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil ||
+				u.Path != "" || u.RawQuery != "" || u.ForceQuery || strings.Contains(origin, "#") {
 				return Config{}, fmt.Errorf("%s must list origins such as https://tide.delino.io", EnvCORSOrigins)
 			}
-			cfg.CORSOrigins = append(cfg.CORSOrigins, origin)
+			// The CORS middleware matches the browser's Origin header exactly.
+			canonical, ok := weborigin.Canonical(u)
+			if !ok {
+				return Config{}, fmt.Errorf("%s must list origins such as https://tide.delino.io", EnvCORSOrigins)
+			}
+			cfg.CORSOrigins = append(cfg.CORSOrigins, canonical)
 		}
 	}
 	if cfg.TrustProxyClientAddress, err = parseBool(EnvTrustProxyClientAddress, get(EnvTrustProxyClientAddress), false); err != nil {

@@ -48,29 +48,33 @@ func readBusinessState(t *testing.T, env *testenv.Env, accountID string) busines
 // membership change and acquires the account lock after it.
 func raceMembershipChange(t *testing.T, env *testenv.Env, accountID string, change func(tx pgx.Tx), call func() error) error {
 	t.Helper()
+	return raceLockWait(t, env, "billing account lock", func(tx pgx.Tx) {
+		var locked int
+		if err := tx.QueryRow(ctx(), `SELECT 1 FROM billing_accounts WHERE billing_account_id = $1 FOR UPDATE`, accountID).Scan(&locked); err != nil {
+			t.Fatal(err)
+		}
+	}, change, call)
+}
+
+// raceLockWait runs an RPC while a separate transaction holds a lock.
+// It runs change only after Postgres confirms the RPC is waiting on the holder.
+func raceLockWait(t *testing.T, env *testenv.Env, lockName string, lock, change func(pgx.Tx), call func() error) error {
+	t.Helper()
 	tx, err := env.DB.Pool.Begin(ctx())
 	if err != nil {
 		t.Fatal(err)
 	}
-	finished := false
-	t.Cleanup(func() {
-		if !finished {
-			_ = tx.Rollback(ctx())
-		}
-	})
+	defer func() { _ = tx.Rollback(ctx()) }()
 	var holderPID int
 	if err := tx.QueryRow(ctx(), `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
 		t.Fatal(err)
 	}
-	var locked int
-	if err := tx.QueryRow(ctx(), `SELECT 1 FROM billing_accounts WHERE billing_account_id = $1 FOR UPDATE`, accountID).Scan(&locked); err != nil {
-		t.Fatal(err)
-	}
+	lock(tx)
 
 	done := make(chan error, 1)
 	go func() { done <- call() }()
 
-	// Confirm that the RPC waits for a row lock held by the holder.
+	// Confirm that the RPC waits for the holder's lock.
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		var waiting int
@@ -84,11 +88,11 @@ func raceMembershipChange(t *testing.T, env *testenv.Env, accountID string, chan
 		}
 		select {
 		case err := <-done:
-			t.Fatalf("the RPC returned (%v) before it waited for the billing account lock", err)
+			t.Fatalf("the RPC returned (%v) before it waited for the %s", err, lockName)
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the RPC did not wait for the billing account lock")
+			t.Fatalf("the RPC did not wait for the %s", lockName)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -97,7 +101,6 @@ func raceMembershipChange(t *testing.T, env *testenv.Env, accountID string, chan
 	if err := tx.Commit(ctx()); err != nil {
 		t.Fatal(err)
 	}
-	finished = true
 
 	select {
 	case err := <-done:

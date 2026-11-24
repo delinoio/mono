@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { Role } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
-import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import { useEffect, useRef, useState } from "react";
-import { invalidateServices, LIST_ORGANIZATIONS_REQUEST } from "../api.ts";
+import { invalidateServices } from "../api.ts";
 import { TopBar } from "../components/shell.tsx";
 import { ErrorNotice, Loading, PageHeader } from "../components/ui.tsx";
 import {
@@ -15,8 +14,9 @@ import {
   parseGitHubCallback,
   stripCallbackFromAddress,
 } from "../github-callback.ts";
+import { useOrganizations } from "../organizations.ts";
 import { can, Permission } from "../roles.ts";
-import { Link, orgPath, RouteId, useRouter } from "../router.tsx";
+import { Link, orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
 
 /**
  * Route `github-setup`: the callback of the GitHub App installation. It
@@ -34,13 +34,14 @@ export function GitHubSetupPage() {
   useEffect(() => {
     stripCallbackFromAddress(window.location, window.history);
   }, []);
-  const orgs = useQuery(
-    OrganizationService.method.listOrganizations,
-    LIST_ORGANIZATIONS_REQUEST,
-  );
-  const adminOrgs = (orgs.data?.organizations ?? []).filter((o) =>
-    can(o.callerRole, Permission.ManageIntegrations),
-  );
+  const orgs = useOrganizations(callback !== undefined);
+  const loadingOrgs = orgs.isPending || orgs.fetchStatus !== "idle";
+  const adminOrgs =
+    orgs.isSuccess && !loadingOrgs
+      ? orgs.data.filter((o) =>
+          can(o.callerRole, Permission.ManageIntegrations),
+        )
+      : [];
   const link = useMutation(GitHubService.method.linkGitHubInstallation, {
     onSuccess: () => invalidateServices(queryClient, GitHubService),
   });
@@ -48,28 +49,33 @@ export function GitHubSetupPage() {
   // React strict mode runs effects twice; the code and state are single-use.
   const sent = useRef(false);
 
-  const linkTo = async (organizationId: string) => {
+  const linkTo = (organizationId: string) => {
     if (callback === undefined || sent.current) return;
     sent.current = true;
-    try {
-      await link.mutateAsync({
+    link.mutate(
+      {
         organizationId,
         githubInstallationId: callback.githubInstallationId,
         code: callback.code,
         state: callback.state,
-      });
-      navigate(orgPath(RouteId.Integrations, organizationId), {
-        replace: true,
-      });
-    } catch {
-      // The notice below shows the error. The state is single-use, so the
-      // admin starts the installation again from integrations.
-    }
+      },
+      {
+        // This callback belongs to the visit that submitted the request.
+        // Check the address in case the router has yet to render a navigation.
+        onSuccess: () => {
+          if (parseRoute(window.location.pathname).id === RouteId.GitHubSetup) {
+            navigate(orgPath(RouteId.Integrations, organizationId), {
+              replace: true,
+            });
+          }
+        },
+      },
+    );
   };
 
   const onlyOrg = adminOrgs.length === 1 ? adminOrgs[0] : undefined;
   useEffect(() => {
-    if (onlyOrg !== undefined) void linkTo(onlyOrg.organizationId);
+    if (onlyOrg !== undefined) linkTo(onlyOrg.organizationId);
     // Runs once per organization list; linkTo sends the single-use code at
     // most once.
   }, [onlyOrg?.organizationId]);
@@ -85,7 +91,7 @@ export function GitHubSetupPage() {
         <Link to="/">Go to your organizations</Link>
       </div>
     );
-  } else if (orgs.isPending) {
+  } else if (loadingOrgs) {
     body = <Loading label="Loading your organizations" />;
   } else if (orgs.error) {
     body = (
@@ -120,7 +126,7 @@ export function GitHubSetupPage() {
         className="form"
         onSubmit={(event) => {
           event.preventDefault();
-          if (selected !== undefined) void linkTo(selected);
+          if (selected !== undefined) linkTo(selected);
         }}
       >
         <Select

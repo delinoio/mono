@@ -122,7 +122,7 @@ func (c *CappedLog) Write(p []byte) (int, error) {
 			c.logger.Warn(c.subject+" write failed; discarding further output", "sandbox_id", c.sandboxID, "error", err)
 		}
 	}
-	if int64(len(p)) > keep && !c.capped {
+	if !c.failed && !c.closed && int64(len(p)) > keep && !c.capped {
 		c.capped = true
 		c.logger.Warn(c.subject+" reached the cap; discarding further output", "sandbox_id", c.sandboxID, "limit_bytes", c.limit)
 	}

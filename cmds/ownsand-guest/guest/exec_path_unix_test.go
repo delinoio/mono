@@ -175,8 +175,11 @@ func TestExecBareNameUsesRequestPath(t *testing.T) {
 	req := execReq(t, "mytool")
 	req.Env = map[string]string{"PATH": tool}
 	evs := h.runExec(req)
-	if stdout, _ := outputs(evs); stdout != "from-request-path" || evs[len(evs)-1].GetExited().GetExitCode() != 0 {
+	if stdout, _ := outputs(evs); stdout != "from-request-path" {
 		t.Fatalf("events %v", evs)
+	}
+	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+		t.Fatalf("events %v: %v", evs, err)
 	}
 
 	// Without a PATH in the request the helper PATH decides.
@@ -206,8 +209,11 @@ func TestExecBareNameUsesRequestPath(t *testing.T) {
 		req.Env = map[string]string{"PATH": helperPath}
 		req.WorkingDirectory = tool
 		evs = h.runExec(req)
-		if stdout, _ := outputs(evs); stdout != "from-request-path" || evs[len(evs)-1].GetExited().GetExitCode() != 0 {
+		if stdout, _ := outputs(evs); stdout != "from-request-path" {
 			t.Fatalf("%q: events %v", name, evs)
+		}
+		if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+			t.Fatalf("%q: events %v: %v", name, evs, err)
 		}
 	}
 	if os.Getenv("PATH") != helperPath {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,6 +152,86 @@ func TestWriteRecoveryExpiresStagingFileAfterRestart(t *testing.T) {
 	}
 }
 
+func TestWriteRecoveryTimestampRange(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		last   time.Time
+		legacy bool
+	}{
+		{"before legacy range", time.Date(1600, 1, 1, 0, 0, 0, 123456789, time.UTC), false},
+		{"below minimum", time.Unix(0, math.MinInt64).Add(-time.Nanosecond), false},
+		{"minimum", time.Unix(0, math.MinInt64), true},
+		{"epoch", time.Unix(0, 0), true},
+		{"legacy range", time.Date(2026, 1, 1, 0, 0, 0, 123456789, time.UTC), true},
+		{"maximum", time.Unix(0, math.MaxInt64), true},
+		{"above maximum", time.Unix(0, math.MaxInt64).Add(time.Nanosecond), false},
+		{"after legacy range", time.Date(2300, 1, 1, 0, 0, 0, 123456789, time.UTC), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := &fakeClock{now: tc.last.Add(-3 * time.Second)}
+			h := newHarness(t, func(c *Config) { c.Now = clock.Now })
+			h.clock = clock
+			target, req := startPartialWrite(t, h)
+			id := req.GetWriteId()
+			staging := tempPath(target, id)
+			record := h.srv.writes.recordPath(id)
+			clock.Advance(3 * time.Second)
+			more := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: id, Offset: 7, Data: []byte("more")}
+			if _, errd := h.write(more); errd != nil {
+				t.Fatal(errd)
+			}
+
+			data, err := os.ReadFile(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(data, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if tc.legacy {
+				if len(fields) != 5 || string(fields["version"]) != "1" || fields["last_chunk_unix_nano"] == nil {
+					t.Fatalf("expected the version-1 record shape, got %s", data)
+				}
+			} else if len(fields) != 6 || string(fields["version"]) != "2" ||
+				fields["last_chunk_unix_seconds"] == nil || fields["last_chunk_nanosecond"] == nil {
+				t.Fatalf("expected the version-2 record shape, got %s", data)
+			}
+
+			clock.Advance(30 * time.Second)
+			recovered := restart(t, h, nil)
+			if _, errd := recovered.write(req); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND || !strings.Contains(errd.GetMessage(), "helper restart") {
+				t.Fatalf("chunk of a recovered write: %v", errd)
+			}
+			finish := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: id, Finish: &ownsandv1.WriteFileFinish{SizeBytes: 11}}
+			if _, errd := recovered.write(finish); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
+				t.Fatalf("finish of a recovered write: %v", errd)
+			}
+			last := recovered.srv.writes.entries[id].lastChunk
+			if !last.Equal(tc.last) {
+				t.Errorf("recovered last chunk: got %s, want %s", last, tc.last)
+			}
+			recovered.srv.Sweep()
+			if !exists(staging) || !exists(record) {
+				t.Fatal("staging file or record missing 30 seconds after the last chunk")
+			}
+			clock.Advance(OperationRetention - 30*time.Second - time.Nanosecond)
+			recovered.srv.Sweep()
+			if !exists(staging) || !exists(record) {
+				t.Fatal("staging file or record missing 1 nanosecond before expiry")
+			}
+			clock.Advance(time.Nanosecond)
+			recovered.srv.Sweep()
+			if exists(staging) || exists(record) {
+				t.Error("staging file or record still present at expiry")
+			}
+			if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
+				t.Fatalf("target %q %v", got, err)
+			}
+		})
+	}
+}
+
 func TestWriteRecoveryUsesTimeOfLastChunk(t *testing.T) {
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
@@ -249,12 +330,17 @@ func TestWriteAcceptedChunkRefreshesExpiryBeforeFinish(t *testing.T) {
 }
 
 func TestWriteRecoveryClampsFutureLastChunk(t *testing.T) {
-	h := newHarness(t, nil)
+	clock := &fakeClock{now: time.Date(2300, 1, 1, 0, 0, 0, 123456789, time.UTC)}
+	h := newHarness(t, func(c *Config) { c.Now = clock.Now })
+	h.clock = clock
 	target, req := startPartialWrite(t, h)
 	tmp := tempPath(target, req.GetWriteId())
 	// The guest clock went back by an hour (a clock set) before the restart.
-	h.clock.Advance(-time.Hour)
+	clock.Advance(-time.Hour)
 	h2 := restart(t, h, nil)
+	if got := h2.srv.writes.entries[req.GetWriteId()].lastChunk; !got.Equal(clock.Now()) {
+		t.Fatalf("recovered last chunk: got %s, want restart time %s", got, clock.Now())
+	}
 	h2.clock.Advance(14 * time.Minute)
 	h2.srv.Sweep()
 	if !exists(tmp) {
@@ -268,7 +354,9 @@ func TestWriteRecoveryClampsFutureLastChunk(t *testing.T) {
 }
 
 func TestWriteRecoveryKeepsReplacedFile(t *testing.T) {
-	h := newHarness(t, nil)
+	clock := &fakeClock{now: time.Date(1600, 1, 1, 0, 0, 0, 123456789, time.UTC)}
+	h := newHarness(t, func(c *Config) { c.Now = clock.Now })
+	h.clock = clock
 	target, req := startPartialWrite(t, h)
 	tmp := tempPath(target, req.GetWriteId())
 	releaseWriteFiles(h)
@@ -313,7 +401,9 @@ func demoteRecordToTemp(t *testing.T, h *harness, req *ownsandv1.WriteFileReques
 }
 
 func TestWriteRecoveryPromotesFirstTempRecord(t *testing.T) {
-	h := newHarness(t, nil)
+	clock := &fakeClock{now: time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC)}
+	h := newHarness(t, func(c *Config) { c.Now = clock.Now })
+	h.clock = clock
 	target, req := startPartialWrite(t, h)
 	tmp := tempPath(target, req.GetWriteId())
 	canonical, temp := demoteRecordToTemp(t, h, req)
@@ -476,6 +566,31 @@ func TestWriteRecoveryRemovesInvalidTempRecords(t *testing.T) {
 	// The staging file of the discarded valid record is not tracked and stays.
 	if !exists(tmp) {
 		t.Fatal("staging file removed without a record")
+	}
+}
+
+func TestWriteRecoveryRejectsInvalidSplitTimestamp(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fields string
+	}{
+		{"missing seconds", `"last_chunk_nanosecond":0`},
+		{"missing nanosecond", `"last_chunk_unix_seconds":10413792000`},
+		{"negative nanosecond", `"last_chunk_unix_seconds":10413792000,"last_chunk_nanosecond":-1`},
+		{"nanosecond overflow", `"last_chunk_unix_seconds":10413792000,"last_chunk_nanosecond":1000000000`},
+		{"seconds overflow", `"last_chunk_unix_seconds":9223372036854775807,"last_chunk_nanosecond":0`},
+		{"mixed versions", `"last_chunk_unix_nano":0,"last_chunk_unix_seconds":10413792000,"last_chunk_nanosecond":0`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "write.json")
+			data := []byte(`{"version":2,` + tc.fields + `}`)
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readWriteRecord(path); err == nil {
+				t.Fatalf("accepted invalid timestamp: %s", data)
+			}
+		})
 	}
 }
 

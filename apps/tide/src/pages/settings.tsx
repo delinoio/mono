@@ -179,9 +179,9 @@ function OwnerActions() {
         title={`Delete ${name}?`}
         description="Every runner is deleted and every queued request is canceled. Uninstall the tide GitHub App in GitHub yourself, because tide cannot uninstall it. This cannot be undone."
         confirmLabel="Delete organization"
-        onConfirm={async () => {
+        onConfirm={async (opening) => {
           await remove.mutateAsync({ organizationId });
-          navigate("/");
+          if (opening.isCurrent()) navigate("/");
         }}
       />
     </>
