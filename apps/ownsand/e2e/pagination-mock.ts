@@ -11,12 +11,33 @@ const lists = {
 
 const CONTINUATION = "e2e-next-page";
 
+async function failOrganizationListIfConfigured() {
+  if (
+    sessionStorage.getItem("ownsand-e2e-organization-list-error") === "hold"
+  ) {
+    await new Promise<void>((resolve) => {
+      window.addEventListener(
+        "ownsand-e2e-release-organization-list",
+        () => resolve(),
+        { once: true },
+      );
+    });
+  }
+  const code = sessionStorage.getItem("ownsand-e2e-organization-list-error");
+  if (code !== null) {
+    throw new ConnectError(
+      "Synthetic organization list failure",
+      Number(code) as Code,
+    );
+  }
+}
+
 export function createMockTransport(): Transport {
   const methodName = sessionStorage.getItem("ownsand-e2e-paged-list");
-  if (methodName === null || !Object.hasOwn(lists, methodName)) {
-    return createBaseMock();
-  }
-  const { field, firstPageSize } = lists[methodName as keyof typeof lists];
+  const pagination =
+    methodName !== null && Object.hasOwn(lists, methodName)
+      ? lists[methodName as keyof typeof lists]
+      : undefined;
   // Seed enough rows to split the selected list across two pages.
   const base = createBaseMock({
     extraApiKeys: Number(methodName === "ListApiKeys"),
@@ -25,7 +46,10 @@ export function createMockTransport(): Transport {
   return {
     ...base,
     async unary(method, signal, timeout, header, input, contextValues) {
-      if (method.name !== methodName) {
+      if (method.name === "ListOrganizations") {
+        await failOrganizationListIfConfigured();
+      }
+      if (method.name !== methodName || pagination === undefined) {
         return base.unary(
           method,
           signal,
@@ -35,6 +59,7 @@ export function createMockTransport(): Transport {
           contextValues,
         );
       }
+      const { field, firstPageSize } = pagination;
       const request = input as typeof input & { pageToken?: string };
       const token = request.pageToken ?? "";
       const tokens = JSON.parse(

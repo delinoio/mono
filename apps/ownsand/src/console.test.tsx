@@ -429,6 +429,7 @@ describe("organizations", () => {
     expect(
       await screen.findByText("Some organizations are not shown yet."),
     ).toBeTruthy();
+    expect(screen.queryByText(/The last refresh failed/)).toBeNull();
     expect(screen.getByRole("link", { name: /Acme Robotics/ })).toBeTruthy();
     expect(screen.queryByRole("link", { name: /Northwind Labs/ })).toBeNull();
     state.failPage = undefined;
@@ -3424,6 +3425,107 @@ describe("a failed refetch of loaded data", () => {
     });
     await settle(60);
   };
+
+  test.each([
+    new ConnectError("the request failed", Code.Unavailable),
+    new TypeError("Failed to fetch"),
+  ])(
+    "keeps loaded organizations and retries a transient refresh error: %s",
+    async (error) => {
+      const { transport, calls } = holdPagedTransport(["ListOrganizations"]);
+      const queryClient = newQueryClient();
+      renderConsole("/", { transport, queryClient });
+      await waitFor(() => expect(calls.ListOrganizations).toHaveLength(1));
+      await act(async () => calls.ListOrganizations![0]!.settle());
+      const list = await screen.findByRole("list", {
+        name: "Your organizations",
+      });
+
+      const refetch = queryClient.refetchQueries();
+      await waitFor(() => expect(calls.ListOrganizations).toHaveLength(2));
+      await act(async () => {
+        calls.ListOrganizations![1]!.settle(error);
+        await refetch;
+      });
+
+      const notice = await screen.findByText(REFRESH_NOTICE);
+      expect(
+        notice.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        within(list).getByRole("link", { name: /Acme Robotics/ }),
+      ).toBeTruthy();
+      expect(
+        within(list).getByRole("link", { name: /Northwind Labs/ }),
+      ).toBeTruthy();
+
+      const retry = screen.getByRole<HTMLButtonElement>("button", {
+        name: "Try again",
+      });
+      expect(retry.disabled).toBe(false);
+      await act(async () => fireEvent.click(retry));
+      await waitFor(() => expect(retry.disabled).toBe(true));
+      expect(calls.ListOrganizations).toHaveLength(3);
+      expect(screen.getByRole("list", { name: "Your organizations" })).toBe(
+        list,
+      );
+
+      await act(async () => calls.ListOrganizations![2]!.settle());
+      await waitFor(() =>
+        expect(screen.queryByText(REFRESH_NOTICE)).toBeNull(),
+      );
+      expect(screen.getByRole("list", { name: "Your organizations" })).toBe(
+        list,
+      );
+    },
+  );
+
+  test.each([
+    [Code.NotFound, "It was not found, or you no longer have access to it."],
+    [Code.PermissionDenied, "You do not have permission to do this."],
+    [Code.Unauthenticated, "Your session ended. Sign in again."],
+  ] as const)(
+    "replaces the loaded organization list on terminal error %s",
+    async (code, message) => {
+      const { transport, state } = switchable();
+      const queryClient = newQueryClient();
+      renderConsole("/", { transport, queryClient });
+      await screen.findByRole("list", { name: "Your organizations" });
+
+      state.code = code;
+      state.methods = ["ListOrganizations"];
+      await refetchAll(queryClient);
+
+      expect(await screen.findByText(message)).toBeTruthy();
+      expect(
+        screen.queryByRole("list", { name: "Your organizations" }),
+      ).toBeNull();
+      expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+      if (code === Code.Unauthenticated) {
+        expect(
+          screen.getByRole("button", { name: "Sign in with Delino" }),
+        ).toBeTruthy();
+      }
+    },
+  );
+
+  test("shows a full error when the first organization request fails", async () => {
+    const { transport, state } = switchable();
+    state.code = Code.Unavailable;
+    state.methods = ["ListOrganizations"];
+    renderConsole("/", { transport });
+
+    expect(
+      await screen.findByText(
+        "OwnSand is not available right now. Try again in a moment.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+    expect(
+      screen.queryByRole("list", { name: "Your organizations" }),
+    ).toBeNull();
+    expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+  });
 
   test("keeps the page, the navigation and an open dialog with its typed value, and clears the notice on the next success", async () => {
     const { transport, state } = switchable();

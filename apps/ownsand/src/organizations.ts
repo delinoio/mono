@@ -15,10 +15,14 @@ import {
 export interface OrganizationsResult extends FollowedPages {
   /** Every organization that the loaded pages hold, in the server's order. */
   organizations: Organization[];
+  /** The loaded organizations, or undefined until the first page loads. */
+  data: Organization[] | undefined;
   /** Whether the first page is still loading. */
   isPending: boolean;
   /** Whether at least the first page is loaded, also after a failed refetch. */
   isLoaded: boolean;
+  /** Whether a request for this list is in progress. */
+  isFetching: boolean;
   /** Reads every page again from the first one. */
   refetch: () => Promise<unknown>;
 }
@@ -60,9 +64,11 @@ export function useOrganizations(): OrganizationsResult {
 
   return {
     organizations,
+    data: data === undefined ? undefined : organizations,
     isPending: query.isPending,
+    isFetching: query.isFetching,
     isLoaded: data !== undefined,
     ...pages,
-    refetch: () => query.refetch(),
+    refetch: query.refetch,
   };
 }
