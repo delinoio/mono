@@ -16,7 +16,7 @@ import {
   stripCallbackFromAddress,
 } from "../github-callback.ts";
 import { can, Permission } from "../roles.ts";
-import { Link, orgPath, RouteId, useRouter } from "../router.tsx";
+import { Link, orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
 
 /**
  * Route `github-setup`: the callback of the GitHub App installation. It
@@ -48,28 +48,33 @@ export function GitHubSetupPage() {
   // React strict mode runs effects twice; the code and state are single-use.
   const sent = useRef(false);
 
-  const linkTo = async (organizationId: string) => {
+  const linkTo = (organizationId: string) => {
     if (callback === undefined || sent.current) return;
     sent.current = true;
-    try {
-      await link.mutateAsync({
+    link.mutate(
+      {
         organizationId,
         githubInstallationId: callback.githubInstallationId,
         code: callback.code,
         state: callback.state,
-      });
-      navigate(orgPath(RouteId.Integrations, organizationId), {
-        replace: true,
-      });
-    } catch {
-      // The notice below shows the error. The state is single-use, so the
-      // admin starts the installation again from integrations.
-    }
+      },
+      {
+        // This callback belongs to the visit that submitted the request.
+        // Check the address in case the router has yet to render a navigation.
+        onSuccess: () => {
+          if (parseRoute(window.location.pathname).id === RouteId.GitHubSetup) {
+            navigate(orgPath(RouteId.Integrations, organizationId), {
+              replace: true,
+            });
+          }
+        },
+      },
+    );
   };
 
   const onlyOrg = adminOrgs.length === 1 ? adminOrgs[0] : undefined;
   useEffect(() => {
-    if (onlyOrg !== undefined) void linkTo(onlyOrg.organizationId);
+    if (onlyOrg !== undefined) linkTo(onlyOrg.organizationId);
     // Runs once per organization list; linkTo sends the single-use code at
     // most once.
   }, [onlyOrg?.organizationId]);
@@ -120,7 +125,7 @@ export function GitHubSetupPage() {
         className="form"
         onSubmit={(event) => {
           event.preventDefault();
-          if (selected !== undefined) void linkTo(selected);
+          if (selected !== undefined) linkTo(selected);
         }}
       >
         <Select

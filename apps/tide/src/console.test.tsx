@@ -13,6 +13,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import {
@@ -21,9 +22,11 @@ import {
   createClient,
   type Transport,
 } from "@connectrpc/connect";
+import { createQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
+import { GitHubService } from "@delino/tide-protos/v1/github_pb";
 import { QueryClient } from "@tanstack/react-query";
-import { PAGE_SIZE } from "./api.ts";
+import { MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { ErrorNotice } from "./components/ui.tsx";
@@ -74,6 +77,7 @@ function renderConsole(
       />
     </AuthContextProvider>,
   );
+  return queryClient;
 }
 
 async function settle(ms = 40) {
@@ -351,27 +355,163 @@ describe("integrations", () => {
 });
 
 describe("GitHub setup callback", () => {
-  test("strips code and state, links the installation and continues to integrations", async () => {
-    renderConsole(
-      "/github/setup?installation_id=51000001&code=gh_code&state=mock-state&setup_action=install",
-    );
-    await settle(20);
-    expect(window.location.search).toBe("");
-    expect(window.location.href).not.toContain("gh_code");
-    // The user is an admin of Acme and Globex, so the page asks which one.
-    const form = await screen.findByRole("button", {
-      name: "Link installation",
+  const callbackPath =
+    "/github/setup?installation_id=51000001&code=gh_code&state=mock-state&setup_action=install";
+  const integrationsPath = `/orgs/${MOCK_IDS.globex}/integrations`;
+  const installationName = /github-org-51000001/;
+
+  function holdLinkRequest() {
+    const mock = createMockTransport();
+    let completeLink!: (error?: ConnectError) => void;
+    const response = new Promise<ConnectError | undefined>((resolve) => {
+      completeLink = resolve;
     });
-    expect(form).toBeTruthy();
-    const trigger = screen.getByRole("combobox", { name: "tide organization" });
-    await click(trigger);
+    const linkRequest = rs.fn();
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (method.name === GitHubService.method.linkGitHubInstallation.name) {
+          linkRequest();
+          const error = await response;
+          if (error !== undefined) throw error;
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    return { transport, completeLink, linkRequest };
+  }
+
+  async function submitToGlobex() {
+    await click(
+      await screen.findByRole("combobox", { name: "tide organization" }),
+    );
     await click(await screen.findByRole("option", { name: /Globex/ }));
     await click(screen.getByRole("button", { name: "Link installation" }));
-    await settle(80);
-    expect(window.location.pathname).toBe(
-      `/orgs/${MOCK_IDS.globex}/integrations`,
+  }
+
+  test("strips callback values and replaces the setup entry on success", async () => {
+    const { transport, completeLink, linkRequest } = holdLinkRequest();
+    renderConsole(callbackPath, { transport });
+    await submitToGlobex();
+    expect(window.location.search).toBe("");
+    expect(linkRequest).toHaveBeenCalledTimes(1);
+    const historyLength = window.history.length;
+
+    completeLink();
+
+    expect(await screen.findByText(installationName)).toBeTruthy();
+    expect(window.location.pathname).toBe(integrationsPath);
+    expect(window.history.length).toBe(historyLength);
+    expect(linkRequest).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["Tide link", "Back", "return to setup"] as const)(
+    "preserves the current entry after leaving with %s and refreshes Integrations",
+    async (navigation) => {
+      const { transport, completeLink, linkRequest } = holdLinkRequest();
+      window.history.replaceState({ entry: "organizations" }, "", "/");
+      window.history.pushState(null, "", callbackPath);
+      const queryClient = renderConsole(callbackPath, { transport });
+      const installations = createQueryOptions(
+        GitHubService.method.listGitHubInstallations,
+        { organizationId: MOCK_IDS.globex, pageSize: MAX_PAGE_SIZE },
+        { transport },
+      );
+      queryClient.setQueryDefaults(installations.queryKey, {
+        staleTime: Infinity,
+      });
+      const before = await queryClient.fetchQuery(installations);
+      expect(before.installations).toHaveLength(0);
+      await submitToGlobex();
+      expect(linkRequest).toHaveBeenCalledTimes(1);
+
+      if (navigation === "Back") {
+        await act(async () => window.history.back());
+      } else {
+        await click(screen.getByRole("link", { name: "tide" }));
+      }
+      expect(
+        await screen.findByRole("heading", { name: "Organizations" }),
+      ).toBeTruthy();
+      if (navigation === "return to setup") {
+        await act(async () => window.history.back());
+        expect(
+          await screen.findByText(/has no GitHub installation details/),
+        ).toBeTruthy();
+      }
+      const currentPath =
+        navigation === "return to setup" ? "/github/setup" : "/";
+      const currentEntry = { entry: navigation };
+      window.history.replaceState(currentEntry, "", currentPath);
+      const historyLength = window.history.length;
+
+      completeLink();
+      await waitFor(() => {
+        expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+          "success",
+        );
+      });
+
+      expect(window.location.pathname).toBe(currentPath);
+      expect(window.history.state).toEqual(currentEntry);
+      expect(window.history.length).toBe(historyLength);
+      expect(
+        queryClient.getQueryState(installations.queryKey)?.isInvalidated,
+      ).toBe(true);
+      if (navigation === "return to setup") {
+        await click(
+          screen.getByRole("link", { name: "Go to your organizations" }),
+        );
+      }
+      await click(await screen.findByRole("link", { name: /Globex/ }));
+      await click(await screen.findByRole("link", { name: "Integrations" }));
+      expect(await screen.findByText(installationName)).toBeTruthy();
+      expect(linkRequest).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test("checks the address before the router renders a navigation", async () => {
+    const { transport, completeLink, linkRequest } = holdLinkRequest();
+    const queryClient = renderConsole(callbackPath, { transport });
+    await submitToGlobex();
+    expect(linkRequest).toHaveBeenCalledTimes(1);
+    // Change the browser entry before the router receives its popstate event.
+    window.history.pushState({ entry: "organizations" }, "", "/");
+    completeLink();
+    await waitFor(() => {
+      expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+        "success",
+      );
+    });
+
+    expect(window.location.pathname).toBe("/");
+    expect(window.history.state).toEqual({ entry: "organizations" });
+  });
+
+  test("keeps setup open and shows restart instructions after a failure", async () => {
+    const { transport, completeLink, linkRequest } = holdLinkRequest();
+    renderConsole(callbackPath, { transport });
+    await submitToGlobex();
+    expect(linkRequest).toHaveBeenCalledTimes(1);
+    const historyLength = window.history.length;
+
+    completeLink(
+      new ConnectError(
+        "The installation state expired",
+        Code.FailedPrecondition,
+      ),
     );
-    expect(await screen.findByText(/github-org-51000001/)).toBeTruthy();
+
+    const message = await screen.findByText("The installation state expired");
+    expect(message.closest('[role="alert"]')).toBeTruthy();
+    expect(
+      screen.getByText(
+        /The installation link is single-use. Start the installation again/,
+      ),
+    ).toBeTruthy();
+    expect(window.location.pathname).toBe("/github/setup");
+    expect(window.history.length).toBe(historyLength);
+    expect(linkRequest).toHaveBeenCalledTimes(1);
   });
 
   test("an address without the callback values explains what to do", async () => {

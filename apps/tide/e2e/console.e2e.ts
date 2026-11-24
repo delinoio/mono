@@ -253,11 +253,17 @@ describe("integrations", () => {
     );
 
     await expect(browser).toHaveURL("/github/setup");
+    const setupHistoryLength = await browser.evaluate(
+      () => window.history.length,
+    );
     await screen.getByRole("combobox", "tide organization").tap();
     await screen.getByRole("option", "Globex (admin)").tap();
     await screen.getByRole("button", "Link installation").tap();
 
     await expect(browser).toHaveURL(`/orgs/${GLOBEX}/integrations`);
+    expect(await browser.evaluate(() => window.history.length)).toBe(
+      setupHistoryLength,
+    );
     await expect(
       screen.getByText("github-org-51000001", { exact: false }),
     ).toBeVisible();
