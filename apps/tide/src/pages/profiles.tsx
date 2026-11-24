@@ -17,7 +17,7 @@ import {
   RunnerProfileService,
 } from "@delino/tide-protos/v1/runner_profile_pb";
 import { useMemo, useState } from "react";
-import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
+import { MAX_PAGE_SIZE } from "../api.ts";
 import { SetupEmpty } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
@@ -39,6 +39,10 @@ import {
 } from "../forms.ts";
 import { formatDuration, labels } from "../format.ts";
 import { can, Permission } from "../roles.ts";
+import {
+  refreshRunnerProfiles,
+  useRunnerProfiles,
+} from "../runner-profiles.ts";
 
 const KINDS = [
   WorkloadKind.GITHUB_JOB,
@@ -53,10 +57,7 @@ export function ProfilesPage() {
   const { organizationId, role } = useOrg();
   const queryClient = useQueryClient();
   const admin = can(role, Permission.ManageRunnerProfiles);
-  const list = useQuery(RunnerProfileService.method.listRunnerProfiles, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const list = useRunnerProfiles(organizationId);
   const integrations = useQuery(
     AgentIntegrationService.method.listAgentIntegrations,
     { organizationId, pageSize: MAX_PAGE_SIZE },
@@ -72,7 +73,7 @@ export function ProfilesPage() {
     [integrations.data],
   );
   const remove = useMutation(RunnerProfileService.method.deleteRunnerProfile, {
-    onSuccess: () => invalidateServices(queryClient, RunnerProfileService),
+    onSuccess: () => refreshRunnerProfiles(queryClient),
   });
   const [editing, setEditing] = useState<RunnerProfile | "new">();
   const [deleting, setDeleting] = useState<RunnerProfile>();
@@ -90,9 +91,12 @@ export function ProfilesPage() {
           ) : undefined
         }
       />
-      <QueryBoundary query={list} loading="Loading runner profiles">
-        {(data) => {
-          const { profiles } = data;
+      <QueryBoundary
+        query={list}
+        loading="Loading runner profiles"
+        errorTitle="Could not load runner profiles."
+      >
+        {(profiles) => {
           return profiles.length === 0 ? (
             <SetupEmpty
               organizationId={organizationId}
@@ -213,7 +217,7 @@ function ProfileDialog({
     AgentIntegrationService.method.listAgentIntegrations,
     { organizationId, pageSize: MAX_PAGE_SIZE },
   );
-  const refresh = () => invalidateServices(queryClient, RunnerProfileService);
+  const refresh = () => refreshRunnerProfiles(queryClient);
   const createProfile = useMutation(
     RunnerProfileService.method.createRunnerProfile,
     { onSuccess: refresh },

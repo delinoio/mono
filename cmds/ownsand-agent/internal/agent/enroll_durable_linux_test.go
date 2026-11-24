@@ -5,8 +5,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/cpclient"
@@ -14,49 +18,77 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 )
 
-// TestEnrollStopsBeforeCallWhenPendingKeyIsNotDurable checks that a state
-// directory that cannot be flushed ends the enrollment before the RPC, so the
-// one-time token is not spent, and that a retry with the same token enrolls
-// once the directory works again.
 func TestEnrollStopsBeforeCallWhenPendingKeyIsNotDurable(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root opens a directory without the read permission")
 	}
-	cp := testcp.New(t)
-	cp.ConsumeEnrollToken()
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	client, err := cpclient.New(cp.URL, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Without the read permission a directory still accepts the identity
-	// file (write and search permission), but it cannot be opened to flush
-	// its entries.
-	if err := os.Chmod(st.Dir(), 0o300); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.Chmod(st.Dir(), 0o700) })
-	if _, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger()); err == nil {
-		t.Fatal("enroll succeeded although the state directory could not be flushed")
-	}
-	if keys := cp.EnrollPublicKeys(); len(keys) != 0 {
-		t.Fatalf("%d Enroll calls reached the control plane before the key was durable", len(keys))
-	}
-	if err := os.Chmod(st.Dir(), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	id, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger())
-	if err != nil {
-		t.Fatalf("retry: %v", err)
-	}
-	if id.DeviceID == "" {
-		t.Fatalf("retry identity: %+v", id)
-	}
-	if keys := cp.EnrollPublicKeys(); len(keys) != 1 {
-		t.Fatalf("%d Enroll calls reached the control plane, want 1", len(keys))
+	for _, tc := range []struct {
+		name   string
+		failed string
+		reopen bool
+	}{
+		{name: "state directory", failed: "parent/child/state"},
+		{name: "previously created ancestor", failed: "parent", reopen: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := testcp.New(t)
+			cp.ConsumeEnrollToken()
+			client, err := cpclient.New(cp.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			dir := filepath.Join(root, "parent", "child", "state")
+			st, err := store.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			blocked := filepath.Join(root, tc.failed)
+			// Write and search access allow the identity write. Flushing
+			// the directory entries also requires read access.
+			if err := os.Chmod(blocked, 0o300); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.Chmod(blocked, 0o700) })
+			enroll := func() (*store.Identity, error) {
+				return Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger())
+			}
+			requireSyncFailure := func() {
+				t.Helper()
+				_, err := enroll()
+				var pathErr *fs.PathError
+				if !errors.As(err, &pathErr) || !errors.Is(err, fs.ErrPermission) || pathErr.Op != "open" || pathErr.Path != blocked {
+					t.Errorf("Enroll error = %v, want permission failure opening %s", err, blocked)
+				}
+				if calls := len(cp.EnrollPublicKeys()); calls != 0 {
+					t.Fatalf("%d Enroll calls reached the control plane while %s could not be flushed", calls, blocked)
+				}
+			}
+			requireSyncFailure()
+			pendingKey := requirePendingKey(t, st)
+			if tc.reopen {
+				// A later enrollment process has no record of which
+				// directories the first Store created.
+				st, err = store.Open(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			requireSyncFailure()
+			if err := os.Chmod(blocked, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			id, err := enroll()
+			if err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			if id.DeviceID == "" {
+				t.Fatal("retry returned no device ID")
+			}
+			if keys := cp.EnrollPublicKeys(); len(keys) != 1 || !bytes.Equal(keys[0], pendingKey) {
+				t.Fatal("want one Enroll call with the original pending public key")
+			}
+		})
 	}
 }
 

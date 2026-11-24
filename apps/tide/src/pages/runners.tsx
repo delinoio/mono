@@ -10,14 +10,14 @@ import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Checkbox } from "delino-ui/checkbox";
 import { Select, SelectOption } from "delino-ui/select";
 import { RunnerState } from "@delino/tide-protos/v1/common_pb";
-import { RunnerProfileService } from "@delino/tide-protos/v1/runner_profile_pb";
 import { type Runner, WorkService } from "@delino/tide-protos/v1/work_pb";
 import { useMemo, useState } from "react";
-import { invalidateServices, MAX_PAGE_SIZE, PAGE_SIZE } from "../api.ts";
+import { invalidateServices, PAGE_SIZE } from "../api.ts";
 import { SetupEmpty } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
+  ErrorNotice,
   ListPagination,
   PageHeader,
   QueryBoundary,
@@ -26,6 +26,7 @@ import {
 } from "../components/ui.tsx";
 import { formatTime, labels, TERMINAL_RUNNER_STATES } from "../format.ts";
 import { can, Permission } from "../roles.ts";
+import { useRunnerProfiles } from "../runner-profiles.ts";
 
 const ALL = "all";
 
@@ -54,15 +55,10 @@ export function RunnersPage() {
   const [profileId, setProfileId] = useState<string>(ALL);
   const [includeEnded, setIncludeEnded] = useState(false);
   const [deleting, setDeleting] = useState<Runner>();
-  const profiles = useQuery(RunnerProfileService.method.listRunnerProfiles, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const profiles = useRunnerProfiles(organizationId);
   const profileNames = useMemo(
     () =>
-      new Map(
-        (profiles.data?.profiles ?? []).map((p) => [p.runnerProfileId, p.name]),
-      ),
+      new Map((profiles.data ?? []).map((p) => [p.runnerProfileId, p.name])),
     [profiles.data],
   );
   const devices = useQuery(WorkService.method.getCapacity, { organizationId });
@@ -116,11 +112,12 @@ export function RunnersPage() {
         </Select>
         <Select
           label="Runner profile"
+          disabled={!profiles.isSuccess}
           value={profileId}
           onValueChange={(v) => setProfileId(v ?? ALL)}
         >
           <SelectOption value={ALL}>All profiles</SelectOption>
-          {(profiles.data?.profiles ?? []).map((p) => (
+          {(profiles.data ?? []).map((p) => (
             <SelectOption key={p.runnerProfileId} value={p.runnerProfileId}>
               {p.name}
             </SelectOption>
@@ -132,6 +129,13 @@ export function RunnersPage() {
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
+      {profiles.error ? (
+        <ErrorNotice
+          title="Could not load runner profiles."
+          error={profiles.error}
+          onRetry={() => void profiles.refetch()}
+        />
+      ) : null}
       <QueryBoundary query={list} loading="Loading runners">
         {(data) => {
           const runners = data.pages.flatMap((p) => p.runners);

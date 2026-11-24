@@ -48,6 +48,7 @@ type Link struct {
 	State                 tidev1.OwnSandLinkState
 	Removing              bool
 	CredentialSetTime     time.Time
+	CredentialRevision    string
 	CreateTime            time.Time
 }
 
@@ -90,8 +91,8 @@ type Links struct {
 }
 
 type cachedClient struct {
-	setTime time.Time
-	client  ownsandclient.Client
+	revision string
+	client   ownsandclient.Client
 }
 
 // Register mounts OwnSandLinkService and its daily re-encryption job and
@@ -110,8 +111,8 @@ func (l *Links) OnRemoval(h RemovalHook) { l.hooks = append(l.hooks, h) }
 func (l *Links) Get(ctx context.Context, q db.Querier, orgID string) (Link, bool, error) {
 	var lk Link
 	var state int16
-	err := q.QueryRow(ctx, `SELECT ownsand_link_id::text, organization_id::text, ownsand_organization_id::text, state, removing, credential_set_time, create_time
-		FROM ownsand_links WHERE organization_id = $1`, orgID).Scan(&lk.LinkID, &lk.OrganizationID, &lk.OwnSandOrganizationID, &state, &lk.Removing, &lk.CredentialSetTime, &lk.CreateTime)
+	err := q.QueryRow(ctx, `SELECT ownsand_link_id::text, organization_id::text, ownsand_organization_id::text, state, removing, credential_set_time, create_time, credential_revision::text
+		FROM ownsand_links WHERE organization_id = $1`, orgID).Scan(&lk.LinkID, &lk.OrganizationID, &lk.OwnSandOrganizationID, &state, &lk.Removing, &lk.CredentialSetTime, &lk.CreateTime, &lk.CredentialRevision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Link{}, false, nil
 	}
@@ -143,8 +144,8 @@ func (l *Links) client(ctx context.Context, orgID string, any bool) (ownsandclie
 	var state int16
 	var keyID string
 	var ciphertext []byte
-	err := s.DB.Pool.QueryRow(ctx, `SELECT ownsand_organization_id::text, state, removing, credential_set_time, create_time, api_key_key_id, api_key_ciphertext
-		FROM ownsand_links WHERE organization_id = $1`, orgID).Scan(&lk.OwnSandOrganizationID, &state, &lk.Removing, &lk.CredentialSetTime, &lk.CreateTime, &keyID, &ciphertext)
+	err := s.DB.Pool.QueryRow(ctx, `SELECT ownsand_organization_id::text, state, removing, credential_set_time, create_time, credential_revision::text, api_key_key_id, api_key_ciphertext
+		FROM ownsand_links WHERE organization_id = $1`, orgID).Scan(&lk.OwnSandOrganizationID, &state, &lk.Removing, &lk.CredentialSetTime, &lk.CreateTime, &lk.CredentialRevision, &keyID, &ciphertext)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, Link{}, api.ErrPrecondition("the organization has no OwnSand link")
 	}
@@ -159,7 +160,7 @@ func (l *Links) client(ctx context.Context, orgID string, any bool) (ownsandclie
 	l.mu.Lock()
 	cached, ok := l.clients[orgID]
 	l.mu.Unlock()
-	if ok && cached.setTime.Equal(lk.CredentialSetTime) {
+	if ok && cached.revision == lk.CredentialRevision {
 		return cached.client, lk, nil
 	}
 	key, err := s.Secrets.Open(secrets.Sealed{KeyID: keyID, Ciphertext: ciphertext}, associatedData(orgID))
@@ -171,10 +172,10 @@ func (l *Links) client(ctx context.Context, orgID string, any bool) (ownsandclie
 	if err != nil {
 		return nil, lk, err
 	}
-	setTime := lk.CredentialSetTime
-	c := l.instrument(orgID, inner, func() { l.markInvalid(orgID, setTime) })
+	revision := lk.CredentialRevision
+	c := l.instrument(orgID, inner, func() { l.markInvalid(orgID, revision) })
 	l.mu.Lock()
-	l.clients[orgID] = cachedClient{setTime: setTime, client: c}
+	l.clients[orgID] = cachedClient{revision: revision, client: c}
 	l.mu.Unlock()
 	return c, lk, nil
 }
@@ -185,11 +186,11 @@ func (l *Links) instrument(orgID string, inner ownsandclient.Client, onUnauthent
 
 // markInvalid marks the link INVALID when the key that failed is still the
 // stored key, so a key that an admin set meanwhile stays ACTIVE.
-func (l *Links) markInvalid(orgID string, setTime time.Time) {
+func (l *Links) markInvalid(orgID, revision string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	tag, err := l.svc.DB.Pool.Exec(ctx, `UPDATE ownsand_links SET state = $3 WHERE organization_id = $1 AND credential_set_time = $2 AND state = $4`,
-		orgID, setTime, int16(tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_INVALID), int16(tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE))
+	tag, err := l.svc.DB.Pool.Exec(ctx, `UPDATE ownsand_links SET state = $3 WHERE organization_id = $1 AND credential_revision = $2 AND state = $4`,
+		orgID, revision, int16(tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_INVALID), int16(tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE))
 	if err != nil {
 		l.svc.Logger.Warn("ownsand_link_invalidate_failed", slog.String("organization_id", orgID), slog.Any("error", err))
 		return
@@ -322,21 +323,20 @@ func (h *Handler) SetOwnSandLink(ctx context.Context, req *connect.Request[tidev
 	if err != nil {
 		return nil, s.Internal(ctx, "encrypt ownsand api key", err)
 	}
-	// PostgreSQL stores timestamptz with microsecond precision. The
-	// transaction compares the stored credential_set_time with now, so now
-	// has the same precision.
-	now := s.NowUTC().Truncate(time.Microsecond)
+	now := s.NowUTC()
+	revision := api.NewID()
 	var out Link
 	err = s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO ownsand_links (ownsand_link_id, organization_id, ownsand_organization_id, state, api_key_key_id, api_key_ciphertext, credential_set_time, create_time)
-			VALUES ($7, $1, $2, $3, $4, $5, $6, $6)
+		_, err := tx.Exec(ctx, `INSERT INTO ownsand_links (ownsand_link_id, organization_id, ownsand_organization_id, state, api_key_key_id, api_key_ciphertext, credential_set_time, create_time, credential_revision)
+			VALUES ($7, $1, $2, $3, $4, $5, $6, $6, $8)
 			ON CONFLICT (organization_id) DO UPDATE SET state = EXCLUDED.state, api_key_key_id = EXCLUDED.api_key_key_id,
-				api_key_ciphertext = EXCLUDED.api_key_ciphertext, credential_set_time = EXCLUDED.credential_set_time
+				api_key_ciphertext = EXCLUDED.api_key_ciphertext, credential_set_time = EXCLUDED.credential_set_time,
+				credential_revision = EXCLUDED.credential_revision
 			WHERE ownsand_links.ownsand_organization_id = EXCLUDED.ownsand_organization_id AND NOT ownsand_links.removing`,
-			c.OrganizationID, ownsandOrg, int16(tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE), sealed.KeyID, sealed.Ciphertext, now, api.NewID())
+			c.OrganizationID, ownsandOrg, int16(tidev1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE), sealed.KeyID, sealed.Ciphertext, now, api.NewID(), revision)
 		if db.IsUniqueViolation(err) {
 			return api.ErrAlreadyExists("another tide organization links this OwnSand organization")
 		}
@@ -347,7 +347,7 @@ func (h *Handler) SetOwnSandLink(ctx context.Context, req *connect.Request[tidev
 		if err != nil {
 			return err
 		}
-		if !ok || lk.OwnSandOrganizationID != ownsandOrg || !lk.CredentialSetTime.Equal(now) {
+		if !ok || lk.OwnSandOrganizationID != ownsandOrg || lk.CredentialRevision != revision {
 			return api.ErrPrecondition("the OwnSand link changed meanwhile; try again")
 		}
 		out = lk
@@ -382,6 +382,70 @@ func (h *Handler) GetOwnSandLink(ctx context.Context, req *connect.Request[tidev
 	return connect.NewResponse(resp), nil
 }
 
+// RemovalClaim identifies the link that one teardown attempt may remove.
+// An attempt that found no link has an empty link ID.
+type RemovalClaim struct {
+	orgID  string
+	linkID string
+}
+
+// HasLink reports whether the attempt claimed an existing link.
+func (c RemovalClaim) HasLink() bool { return c.linkID != "" }
+
+// ClaimRemoval stops dispatch before an attempt can start runner cleanup.
+// An absent link returns an empty claim. A competing attempt fails.
+func (l *Links) ClaimRemoval(ctx context.Context, orgID string) (RemovalClaim, error) {
+	if err := ctx.Err(); err != nil {
+		return RemovalClaim{}, err
+	}
+	// Let the short database step report its result even if the caller
+	// cancels. The caller must know whether to release the committed claim.
+	claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	claim := RemovalClaim{orgID: orgID}
+	var exists bool
+	// Check for absence in the same snapshot so a deletion or relink
+	// cannot change the interpretation of a failed update.
+	err := l.svc.DB.Pool.QueryRow(claimCtx, `WITH claimed AS (
+		UPDATE ownsand_links SET removing = true WHERE organization_id = $1 AND NOT removing
+		RETURNING ownsand_link_id
+	)
+	SELECT COALESCE((SELECT ownsand_link_id::text FROM claimed), ''),
+		EXISTS (SELECT 1 FROM ownsand_links WHERE organization_id = $1)`, orgID).Scan(&claim.linkID, &exists)
+	if err != nil {
+		return RemovalClaim{}, err
+	}
+	if exists && !claim.HasLink() {
+		return RemovalClaim{}, api.ErrPrecondition("the OwnSand link is being removed")
+	}
+	return claim, nil
+}
+
+// CheckRemoval verifies the prepared link under the organization row lock.
+// Deletion that prepared without a link must retry if one now exists.
+func (l *Links) CheckRemoval(ctx context.Context, tx pgx.Tx, claim RemovalClaim) error {
+	lk, exists, err := l.Get(ctx, tx, claim.orgID)
+	if err != nil {
+		return err
+	}
+	if exists != claim.HasLink() || (exists && (lk.LinkID != claim.linkID || !lk.Removing)) {
+		return api.ErrPrecondition("the OwnSand link changed meanwhile; try again")
+	}
+	return nil
+}
+
+// ReleaseRemoval clears only the link claimed by the failed attempt.
+func (l *Links) ReleaseRemoval(ctx context.Context, claim RemovalClaim) {
+	if !claim.HasLink() {
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if _, err := l.svc.DB.Pool.Exec(releaseCtx, "UPDATE ownsand_links SET removing = false WHERE ownsand_link_id = $1 AND removing", claim.linkID); err != nil {
+		l.svc.Logger.WarnContext(ctx, "ownsand_link_removal_unmark_failed", slog.String("organization_id", claim.orgID), slog.Any("error", err))
+	}
+}
+
 // RemoveOwnSandLink marks the link as being removed (dispatch stops), runs
 // the Prepare hooks (the work layer deletes the runners), then deletes the
 // link and its key in a transaction that also runs the InTx hooks (the work
@@ -394,11 +458,11 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 	if err != nil {
 		return nil, err
 	}
-	tag, err := s.DB.Pool.Exec(ctx, "UPDATE ownsand_links SET removing = true WHERE organization_id = $1", c.OrganizationID)
+	claim, err := l.ClaimRemoval(ctx, c.OrganizationID)
 	if err != nil {
-		return nil, s.Internal(ctx, "mark ownsand link removal", err)
+		return nil, s.Internal(ctx, "claim ownsand link removal", err)
 	}
-	if tag.RowsAffected() == 0 {
+	if !claim.HasLink() {
 		return nil, api.ErrNotFound("OwnSand link")
 	}
 	for _, hook := range l.hooks {
@@ -407,7 +471,7 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 		}
 		if err := hook.Prepare(ctx, c.OrganizationID); err != nil {
 			s.Logger.WarnContext(ctx, "ownsand_link_removal_prepare_failed", slog.String("hook", hook.Name), slog.String("organization_id", c.OrganizationID), slog.Any("error", err))
-			l.unmarkRemoval(ctx, c.OrganizationID)
+			l.ReleaseRemoval(ctx, claim)
 			return nil, s.Internal(ctx, "prepare ownsand link removal", err)
 		}
 	}
@@ -415,12 +479,8 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 		if err := api.LockOrganization(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		lk, ok, err := l.Get(ctx, tx, c.OrganizationID)
-		if err != nil {
+		if err := l.CheckRemoval(ctx, tx, claim); err != nil {
 			return err
-		}
-		if !ok {
-			return api.ErrNotFound("OwnSand link")
 		}
 		for _, hook := range l.hooks {
 			if hook.InTx == nil {
@@ -430,12 +490,12 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 				return fmt.Errorf("ownsand link removal hook %s: %w", hook.Name, err)
 			}
 		}
-		if _, err := tx.Exec(ctx, "DELETE FROM ownsand_links WHERE organization_id = $1", c.OrganizationID); err != nil {
+		if _, err := tx.Exec(ctx, "DELETE FROM ownsand_links WHERE ownsand_link_id = $1", claim.linkID); err != nil {
 			return err
 		}
 		return s.WriteAudit(ctx, tx, api.AuditEvent{
 			OrganizationID: c.OrganizationID, Action: tidev1.AuditAction_AUDIT_ACTION_OWNSAND_LINK_REMOVED, Actor: c.Principal,
-			TargetKind: tidev1.AuditTargetKind_AUDIT_TARGET_KIND_OWNSAND_LINK, TargetID: lk.LinkID,
+			TargetKind: tidev1.AuditTargetKind_AUDIT_TARGET_KIND_OWNSAND_LINK, TargetID: claim.linkID,
 		})
 	})
 	if err != nil {
@@ -443,7 +503,7 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 		// while it waited for the organization lock), so the link stays and
 		// must not stay marked.
 		s.Logger.WarnContext(ctx, "ownsand_link_removal_failed", slog.String("organization_id", c.OrganizationID), slog.Any("error", err))
-		l.unmarkRemoval(ctx, c.OrganizationID)
+		l.ReleaseRemoval(ctx, claim)
 		return nil, s.Internal(ctx, "remove ownsand link", err)
 	}
 	l.forget(c.OrganizationID)
@@ -454,16 +514,4 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 	}
 	s.Logger.InfoContext(ctx, "ownsand_link_removed", slog.String("organization_id", c.OrganizationID))
 	return connect.NewResponse(&tidev1.RemoveOwnSandLinkResponse{}), nil
-}
-
-// unmarkRemoval clears the removal mark of a removal that failed, so the
-// kept link is dispatchable again and accepts a new key. It does not use the
-// cancellation of ctx, because a canceled request is one cause of the
-// failure, and it has its own time limit.
-func (l *Links) unmarkRemoval(ctx context.Context, orgID string) {
-	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	if _, err := l.svc.DB.Pool.Exec(uctx, "UPDATE ownsand_links SET removing = false WHERE organization_id = $1", orgID); err != nil {
-		l.svc.Logger.WarnContext(ctx, "ownsand_link_removal_unmark_failed", slog.String("organization_id", orgID), slog.Any("error", err))
-	}
 }

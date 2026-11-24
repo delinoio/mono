@@ -5,7 +5,9 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -17,5 +19,35 @@ func TestSyncDirectory(t *testing.T) {
 	}
 	if err := syncDirectory(filepath.Join(dir, "missing")); err == nil {
 		t.Fatal("syncDirectory(missing) succeeded")
+	}
+}
+
+func TestSyncPendingIdentityDirectoriesFollowsResolvedPath(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	if err := os.Mkdir("target", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target", "alias"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open("alias/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := recordSyncDir(t, nil)
+	if err := st.SyncPendingIdentityDirectories(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Join(root, "target", "state"), filepath.Join(root, "target")}
+	for dir := root; dir != "/"; dir = filepath.Dir(dir) {
+		want = append(want, dir)
+	}
+	want = append(want, "/")
+	if !slices.Equal(*calls, want) {
+		t.Fatalf("synced directories = %v, want %v", *calls, want)
 	}
 }

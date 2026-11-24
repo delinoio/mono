@@ -9,10 +9,10 @@ import {
 } from "@delino/tide-protos/v1/organization_pb";
 import { OwnSandLinkService } from "@delino/tide-protos/v1/ownsand_link_pb";
 import { createContext, type ReactNode, useContext } from "react";
-import { LIST_ORGANIZATIONS_REQUEST } from "../api.ts";
 import { useAuth } from "../auth.tsx";
 import { ACCOUNTS_URL, OWNSAND_CONSOLE_URL } from "../config.ts";
 import { labels } from "../format.ts";
+import { useOrganizations } from "../organizations.ts";
 import { can, Permission } from "../roles.ts";
 import {
   Link,
@@ -123,10 +123,7 @@ export function canOpenSection(role: Role | undefined, id: RouteId): boolean {
 export function TopBar({ organizationId }: { organizationId?: string }) {
   const auth = useAuth();
   const { route, navigate } = useRouter();
-  const orgs = useQuery(
-    OrganizationService.method.listOrganizations,
-    LIST_ORGANIZATIONS_REQUEST,
-  );
+  const orgs = useOrganizations(organizationId !== undefined);
   const section: OrgRouteId =
     "organizationId" in route ? route.id : RouteId.Overview;
   return (
@@ -144,7 +141,7 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
               navigate(orgPath(section, value));
             }}
           >
-            {orgs.data.organizations.map((org) => (
+            {orgs.data.map((org) => (
               <SelectOption key={org.organizationId} value={org.organizationId}>
                 {org.name}
               </SelectOption>

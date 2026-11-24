@@ -12,6 +12,7 @@ import {
   connectErrorFromDetail,
   InvalidFrameError,
   isBillingError,
+  isLocalCredentialError,
   OwnSandError,
   PeerStreamOverrunError,
 } from "../errors.ts";
@@ -174,9 +175,8 @@ export class PeerSession {
   }
 
   /**
-   * Opens a session: `GetIceServers` (a failure other than an abort, an
-   * authorization error or a billing error moves the handle to the relay), a
-   * non-trickle offer with all candidates (10 seconds at most),
+   * Opens a session: `GetIceServers`, a non-trickle offer with all candidates
+   * (10 seconds at most),
    * `OpenSession`, and the data channel open within 10 seconds after the
    * answer is applied. `OpenSession` has no limit of its own here, so a slow
    * signaling call does not use up the time that the channel needs to open.
@@ -195,12 +195,11 @@ export class PeerSession {
     } catch (error) {
       if (
         signal?.aborted ||
+        isLocalCredentialError(error) ||
         (error instanceof ConnectError &&
           (AUTHORIZATION_CODES.has(error.code) || isBillingError(error)))
       ) {
-        // An abort, an authorization error and a billing rejection end the
-        // operation, as they do for OpenSession (a billing rejection also
-        // rejects the relay).
+        // These failures end the operation and keep the handle on peer-to-peer.
         throw error;
       }
       // Any other GetIceServers failure means the peer path is not usable:
@@ -266,11 +265,11 @@ export class PeerSession {
           throw error;
         }
         if (
-          error instanceof ConnectError &&
-          (AUTHORIZATION_CODES.has(error.code) || isBillingError(error))
+          isLocalCredentialError(error) ||
+          (error instanceof ConnectError &&
+            (AUTHORIZATION_CODES.has(error.code) || isBillingError(error)))
         ) {
-          // A billing rejection also rejects the relay, so it ends the
-          // operation instead of a fall back to the relay.
+          // These failures end the operation and keep the handle on peer-to-peer.
           throw error;
         }
         if (
@@ -296,10 +295,11 @@ export class PeerSession {
     } catch (error) {
       pc.close();
       if (
+        signal?.aborted ||
+        isLocalCredentialError(error) ||
         error instanceof ConnectError ||
         error instanceof PeerUnavailableError ||
-        error instanceof SessionNotOpenError ||
-        signal?.aborted
+        error instanceof SessionNotOpenError
       ) {
         throw error;
       }

@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,13 @@ type devinWorld struct {
 func newDevinWorld(t *testing.T, guest tidev1.GuestOs) *devinWorld {
 	t.Helper()
 	fake := devinfake.New(t, devinAPIToken, "tide-outpost")
+	w := createDevinWorld(t, guest, fake)
+	eventually(t, "the Devin watch", func() bool { return fake.Streams() == 1 })
+	return w
+}
+
+func createDevinWorld(t *testing.T, guest tidev1.GuestOs, fake *devinfake.Fake) *devinWorld {
+	t.Helper()
 	w := newAgentWorld(t, layers.Options{Devin: devin.Options{BaseURL: fake.Server.URL, ReleaseGrace: time.Minute}})
 	dw := &devinWorld{agentWorld: w, devin: fake}
 	id := w.createIntegration(t, &tidev1.CreateAgentIntegrationRequest{
@@ -44,7 +52,6 @@ func newDevinWorld(t *testing.T, guest tidev1.GuestOs) *devinWorld {
 			ApiToken: devinAPIToken, OutpostToken: devinOutpostToken}},
 	})
 	dw.profileID = w.createProfile(t, agentProfileProto("devin-agents", id, guest, time.Hour))
-	eventually(t, "the Devin watch", func() bool { return fake.Streams() == 1 })
 	return dw
 }
 
@@ -273,6 +280,85 @@ func TestDevinWatchReconnect(t *testing.T) {
 	stays(t, "one request", func() bool { return len(w.requests(t)) == 1 && w.devin.Claims("ses-missed") == 1 })
 	if w.request(t, req.GetRequestId()).GetState() != tidev1.RequestState_REQUEST_STATE_QUEUED {
 		t.Fatal("the request left the queue")
+	}
+}
+
+func TestDevinWatchPagination(t *testing.T) {
+	tests := []struct {
+		name        string
+		pages       map[string]devinfake.QueuePage
+		sessions    []string
+		watchCursor string
+		stalled     bool
+	}{
+		{
+			name: "empty cursor",
+			pages: map[string]devinfake.QueuePage{
+				"": {SessionIDs: []string{"ses-1", "ses-1", "ses-2"}, HasNextPage: true},
+			},
+			sessions: []string{"ses-1", "ses-2"},
+			stalled:  true,
+		},
+		{
+			name: "empty cursor after an advancing page",
+			pages: map[string]devinfake.QueuePage{
+				"":       {SessionIDs: []string{"ses-1"}, Cursor: "page-1", HasNextPage: true},
+				"page-1": {SessionIDs: []string{"ses-1", "ses-2"}, HasNextPage: true},
+			},
+			sessions:    []string{"ses-1", "ses-2"},
+			watchCursor: "page-1",
+			stalled:     true,
+		},
+		{
+			name: "unchanged cursor",
+			pages: map[string]devinfake.QueuePage{
+				"":       {SessionIDs: []string{"ses-1"}, Cursor: "page-1", HasNextPage: true},
+				"page-1": {SessionIDs: []string{"ses-1", "ses-2"}, Cursor: "page-1", HasNextPage: true},
+			},
+			sessions:    []string{"ses-1", "ses-2"},
+			watchCursor: "page-1",
+			stalled:     true,
+		},
+		{
+			name: "advancing cursors",
+			pages: map[string]devinfake.QueuePage{
+				"":       {SessionIDs: []string{"ses-1"}, Cursor: "page-1", HasNextPage: true},
+				"page-1": {SessionIDs: []string{"ses-2"}, Cursor: "page-2", HasNextPage: true},
+				"page-2": {SessionIDs: []string{"ses-3"}, Cursor: "page-3", HasNextPage: true},
+				"page-3": {SessionIDs: []string{"ses-4"}, Cursor: "page-4", HasNextPage: true},
+				"page-4": {SessionIDs: []string{"ses-5"}, Cursor: "page-5"},
+			},
+			sessions:    []string{"ses-1", "ses-2", "ses-3", "ses-4", "ses-5"},
+			watchCursor: "page-5",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := devinfake.New(t, devinAPIToken, "tide-outpost")
+			for _, sid := range tc.sessions {
+				fake.AddSession(sid, false)
+			}
+			fake.SetQueuePages(t, tc.pages)
+			w := createDevinWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, fake)
+			eventually(t, "the Devin watch after the listed pages", func() bool {
+				return fake.Streams() == 1 || fake.Lists() > len(tc.pages)
+			})
+			if got := fake.Lists(); got != len(tc.pages) {
+				t.Fatalf("list requests = %d, want %d", got, len(tc.pages))
+			}
+			if got := fake.WatchCursors(); !slices.Equal(got, []string{tc.watchCursor}) {
+				t.Fatalf("watch cursors = %q, want [%q]", got, tc.watchCursor)
+			}
+			if got := fake.ClaimAttempts(); !slices.Equal(got, tc.sessions) {
+				t.Fatalf("claim attempts = %q, want %q", got, tc.sessions)
+			}
+			for _, sid := range tc.sessions {
+				w.requestBySource(t, sid)
+			}
+			if warned := strings.Contains(w.env.Logs.String(), `"level":"WARN","msg":"devin_queue_pagination_stalled"`); warned != tc.stalled {
+				t.Fatalf("pagination warning present = %t, want %t", warned, tc.stalled)
+			}
+		})
 	}
 }
 

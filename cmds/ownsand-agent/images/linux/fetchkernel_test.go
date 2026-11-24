@@ -24,7 +24,9 @@ var fetchKernelBody = []byte("the pinned guest kernel")
 // the overlap does not depend on timing), then writes $STUB_BODY to the -o
 // file. With STUB_PARTIAL set it writes only the first bytes and fails with
 // the curl exit status 18 (partial file), like an interrupted download.
+// STUB_DESTINATION_DIRECTORY makes the destination a directory during the download.
 const fetchKernelStubCurl = `#!/usr/bin/env bash
+set -e
 out=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -47,6 +49,10 @@ fi
 if [ -n "${STUB_PARTIAL:-}" ]; then
   head -c 3 "$STUB_BODY" > "$out"
   exit 18
+fi
+if [ -n "${STUB_DESTINATION_DIRECTORY:-}" ]; then
+  mkdir "$STUB_DESTINATION_DIRECTORY"
+  cp "$STUB_BODY" "$STUB_DESTINATION_DIRECTORY/sentinel"
 fi
 cp "$STUB_BODY" "$out"
 `
@@ -170,7 +176,7 @@ func (k *kernelFetch) downloads() []string {
 	if err != nil {
 		k.t.Fatal(err)
 	}
-	return strings.Fields(string(data))
+	return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
 }
 
 // requireKernel checks that the published kernel holds exactly want, is
@@ -230,6 +236,62 @@ func TestFetchKernelReplacesAnOlderKernelOnSuccess(t *testing.T) {
 	k.requireKernel(fetchKernelBody)
 }
 
+func TestFetchKernelRejectsDirectoryDestination(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		wantDownloads int
+	}{
+		{name: "before download", wantDownloads: 0},
+		{name: "during download", wantDownloads: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			k := newKernelFetch(t)
+			body := k.body("good", fetchKernelBody)
+			sentinel := filepath.Join(k.kernel(), "sentinel")
+			var extra []string
+			if test.wantDownloads == 0 {
+				if err := os.Mkdir(k.kernel(), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(sentinel, fetchKernelBody, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				extra = append(extra, "STUB_DESTINATION_DIRECTORY="+k.kernel())
+			}
+			out, err := k.run(body, extra...)
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				t.Fatalf("fetch with a directory destination: err = %v, want nonzero exit\n%s", err, out)
+			}
+			if !strings.Contains(out, k.kernel()) || !strings.Contains(out, "is a directory") {
+				t.Errorf("output does not identify the destination as a directory:\n%s", out)
+			}
+			if strings.Contains(out, "wrote "+k.kernel()) {
+				t.Errorf("fetch reported success:\n%s", out)
+			}
+			if got := k.downloads(); len(got) != test.wantDownloads {
+				t.Errorf("downloads = %v, want %d", got, test.wantDownloads)
+			}
+			got, err := os.ReadFile(sentinel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != string(fetchKernelBody) {
+				t.Errorf("sentinel contents = %q, want %q", got, fetchKernelBody)
+			}
+			entries, err := os.ReadDir(k.kernel())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].Name() != "sentinel" {
+				t.Errorf("destination entries = %v, want only sentinel", entries)
+			}
+			k.requireNoLeftovers()
+		})
+	}
+}
+
 func TestFetchKernelOverlappingFetchesUseOwnStagingFiles(t *testing.T) {
 	k := newKernelFetch(t)
 	body := k.body("good", fetchKernelBody)
@@ -259,8 +321,9 @@ func TestFetchKernelOverlappingFetchesUseOwnStagingFiles(t *testing.T) {
 		t.Fatalf("both fetches downloaded into the same file %q", staging[0])
 	}
 	for _, path := range staging {
-		if filepath.Dir(path) != k.outDir || !strings.HasPrefix(filepath.Base(path), "vmlinux.download.") {
-			t.Fatalf("staging file %q is not a temporary file next to the output", path)
+		dir := filepath.Dir(path)
+		if filepath.Dir(dir) != k.outDir || !strings.HasPrefix(filepath.Base(dir), "vmlinux.download.") || filepath.Base(path) != "vmlinux" {
+			t.Fatalf("staging file %q is not named vmlinux in a temporary directory next to the output", path)
 		}
 	}
 }

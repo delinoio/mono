@@ -101,13 +101,13 @@ export function resolveCredential(
   env: Env,
 ): Credential {
   if (credential !== undefined) {
-    if ("apiKey" in credential && credential.apiKey === "") {
+    if ("apiKey" in credential && credential.apiKey.trim() === "") {
       throw new OwnSandConfigError("apiKey must not be empty");
     }
     return credential;
   }
   const apiKey = env[EnvVar.ApiKey];
-  if (apiKey !== undefined && apiKey !== "") {
+  if (apiKey !== undefined && apiKey.trim() !== "") {
     return { apiKey };
   }
   throw new OwnSandConfigError(
@@ -194,7 +194,7 @@ async function currentSecret(
     }),
     signal,
   );
-  if (typeof token !== "string" || token === "") {
+  if (typeof token !== "string" || token.trim() === "") {
     throw new OwnSandCredentialError("accessToken returned no token");
   }
   return token;

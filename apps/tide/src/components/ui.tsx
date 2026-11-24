@@ -20,7 +20,14 @@ import {
 } from "delino-ui/dialog";
 import { Skeleton } from "delino-ui/skeleton";
 import { toast } from "delino-ui/toast";
-import { type FormEvent, type ReactNode, useState } from "react";
+import {
+  type FormEvent,
+  type ReactNode,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { useAuth } from "../auth.tsx";
 import { errorMessage } from "../format.ts";
 
 export function PageHeader({
@@ -59,18 +66,40 @@ export function Loading({ label = "Loading" }: { label?: string }) {
   );
 }
 
-/** A failed request, with a retry button. */
+function SignInButton() {
+  const auth = useAuth();
+  return (
+    <Button
+      type="button"
+      variant={ButtonVariant.Secondary}
+      onClick={() => auth.signIn()}
+    >
+      Sign in with Delino
+    </Button>
+  );
+}
+
+/** A failed request with the recovery action for its error. */
 export function ErrorNotice({
+  title,
   error,
   onRetry,
 }: {
+  title?: string;
   error: unknown;
   onRetry?: () => void;
 }) {
+  const sessionEnded =
+    error instanceof ConnectError && error.code === Code.Unauthenticated;
   return (
     <div className="notice notice-error" role="alert">
-      <p>{errorMessage(error)}</p>
-      {onRetry ? (
+      <p>
+        {title && !sessionEnded ? `${title} ` : null}
+        {errorMessage(error, title === undefined ? undefined : "")}
+      </p>
+      {sessionEnded ? (
+        <SignInButton />
+      ) : onRetry ? (
         <Button
           type="button"
           variant={ButtonVariant.Secondary}
@@ -135,15 +164,21 @@ export function RefreshFailedNotice({
 export function QueryBoundary<T>({
   query,
   loading,
+  errorTitle,
   children,
 }: {
   query: BoundaryQuery<T>;
   loading: string;
+  errorTitle?: string;
   children: (data: T) => ReactNode;
 }) {
   if (showsFullError(query)) {
     return (
-      <ErrorNotice error={query.error} onRetry={() => void query.refetch()} />
+      <ErrorNotice
+        title={errorTitle}
+        error={query.error}
+        onRetry={() => void query.refetch()}
+      />
     );
   }
   if (query.isPending || query.data === undefined) {
@@ -270,6 +305,8 @@ export function SecretDialog({
 /**
  * An explicit confirmation step for a destructive action. The cancel
  * button comes first and gets the focus; Escape closes the dialog.
+ * Check the opening before redirecting after a successful request. Cache
+ * invalidation belongs to the request and runs even after dismissal.
  */
 export function ConfirmDialog({
   open,
@@ -283,23 +320,50 @@ export function ConfirmDialog({
   title: string;
   description: ReactNode;
   confirmLabel: string;
-  onConfirm: () => Promise<unknown>;
+  onConfirm: (opening: { isCurrent(): boolean }) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
 }) {
   const [error, setError] = useState<unknown>();
+  const [pending, setPending] = useState(false);
   const [wasOpen, setWasOpen] = useState(open);
   if (open !== wasOpen) {
-    // Adjust state while rendering: every time the dialog opens again it
-    // starts without the notice of an earlier failure, including a failure
-    // that arrived after the dialog was already closed.
     setWasOpen(open);
-    if (open) setError(undefined);
+    setPending(false);
+    setError(undefined);
   }
+
+  const opening = useRef(0);
+  useLayoutEffect(() => {
+    // Invalidate the opening during a controlled close or unmount.
+    return () => {
+      opening.current += 1;
+    };
+  }, [open]);
+
+  const confirm = async () => {
+    if (pending) return;
+    const startedIn = opening.current;
+    const isCurrent = () => opening.current === startedIn;
+    setPending(true);
+    setError(undefined);
+    try {
+      await onConfirm({ isCurrent });
+      if (isCurrent()) onOpenChange(false);
+    } catch (e) {
+      if (isCurrent()) setError(e);
+    } finally {
+      if (isCurrent()) setPending(false);
+    }
+  };
   return (
     <AlertDialog
       open={open}
       onOpenChange={(next) => {
-        if (!next) setError(undefined);
+        if (!next) {
+          opening.current += 1;
+          setPending(false);
+          setError(undefined);
+        }
         onOpenChange(next);
       }}
     >
@@ -311,16 +375,8 @@ export function ConfirmDialog({
           <AlertDialogClose>Cancel</AlertDialogClose>
           <Button
             variant={ButtonVariant.Danger}
-            onClick={async () => {
-              // A retry removes the notice of the previous failure.
-              setError(undefined);
-              try {
-                await onConfirm();
-                onOpenChange(false);
-              } catch (e) {
-                setError(e);
-              }
-            }}
+            disabled={pending}
+            onClick={confirm}
           >
             {confirmLabel}
           </Button>

@@ -449,20 +449,70 @@ func (s *Service) dueAccounts(statuses []OrganizationStatus) []string {
 	return out
 }
 
-// FreshStatus returns the current status of the organization after it
-// recorded a due suspension.
-func (s *Service) FreshStatus(ctx context.Context, service, organizationID string) (OrganizationStatus, bool, error) {
-	o, ok, err := CurrentStatus(ctx, s.db.Pool, service, organizationID)
-	if err != nil || !ok {
-		return o, ok, err
-	}
-	if due := s.dueAccounts([]OrganizationStatus{o}); len(due) > 0 {
-		if err := s.SyncAccount(ctx, o.BillingAccountID); err != nil {
-			return OrganizationStatus{}, false, err
+// OrganizationBillingSnapshot holds the account name, usable balance and
+// persisted link status at the billing decision time.
+type OrganizationBillingSnapshot struct {
+	AccountName string
+	Balance     int64
+	Status      OrganizationStatus
+	Time        time.Time
+}
+
+// ReadOrganizationBilling reads the current link and its billing account
+// under the account lock. It records a block caused by expired credit or a
+// due suspension before returning the status.
+func (s *Service) ReadOrganizationBilling(ctx context.Context, service, organizationID string) (OrganizationBillingSnapshot, bool, error) {
+	for {
+		var snapshot OrganizationBillingSnapshot
+		var found, retry bool
+		err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+			candidate, ok, err := CurrentStatus(ctx, tx, service, organizationID)
+			if err != nil || !ok {
+				return err
+			}
+			account, err := lockAccount(ctx, tx, candidate.BillingAccountID)
+			if err != nil {
+				return err
+			}
+
+			// Link changes lock the account first. Recheck after the wait and
+			// release the old account lock before trying a different account.
+			status, ok, err := CurrentStatus(ctx, tx, service, organizationID)
+			if err != nil || !ok {
+				return err
+			}
+			if status.BillingAccountID != account.ID {
+				retry = true
+				return nil
+			}
+
+			now := s.timestamp()
+			balance, _, err := Balance(ctx, tx, account.ID, now)
+			if err != nil {
+				return err
+			}
+			blockDue := status.Status == StatusAllowed && balance <= 0
+			suspendDue := status.Status == StatusBlocked && status.SuspendTime != nil && !now.Before(*status.SuspendTime)
+			if blockDue || suspendDue {
+				if err := s.syncStatuses(ctx, tx, account.ID, now); err != nil {
+					return err
+				}
+				status, ok, err = CurrentStatus(ctx, tx, service, organizationID)
+				if err != nil || !ok {
+					return err
+				}
+			}
+			snapshot = OrganizationBillingSnapshot{AccountName: account.Name, Balance: balance, Status: status, Time: now}
+			found = true
+			return nil
+		})
+		if err != nil {
+			return OrganizationBillingSnapshot{}, false, err
 		}
-		return CurrentStatus(ctx, s.db.Pool, service, organizationID)
+		if !retry {
+			return snapshot, found, nil
+		}
 	}
-	return o, true, nil
 }
 
 // ListStatusChanges returns up to limit current statuses of the service with

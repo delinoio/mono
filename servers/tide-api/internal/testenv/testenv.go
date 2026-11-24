@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -163,13 +164,28 @@ func GenerousLimits(now func() time.Time) api.Limits {
 func New(t testing.TB, opts ...Option) *Env {
 	t.Helper()
 	database := dbtest.New(t)
-	clock := &Clock{now: time.Now().UTC().Truncate(time.Millisecond)}
-	logs := &SafeBuffer{}
-	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	key, err := secrets.GenerateKey("test")
 	if err != nil {
 		t.Fatal(err)
 	}
+	return start(t, database, &Clock{now: time.Now().UTC().Truncate(time.Millisecond)}, key, opts)
+}
+
+// NewReplica starts another instance against this environment's database.
+func (e *Env) NewReplica(t testing.TB, opts ...Option) *Env {
+	t.Helper()
+	database, err := db.Open(context.Background(), e.DB.Pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(database.Close)
+	return start(t, database, e.Clock, e.SecretKey, opts)
+}
+
+func start(t testing.TB, database *db.DB, clock *Clock, key secrets.Key, opts []Option) *Env {
+	t.Helper()
+	logs := &SafeBuffer{}
+	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	keyring, err := secrets.NewKeyring(key)
 	if err != nil {
 		t.Fatal(err)
@@ -207,6 +223,32 @@ func New(t testing.TB, opts ...Option) *Env {
 		srv.Close()
 	})
 	return &Env{T: t, DB: database, App: a, Server: srv, Clock: clock, Logs: logs, SecretKey: key}
+}
+
+// FailProgramExitCommits makes PostgreSQL abort transactions that move a
+// runner to DELETING for WORK_DONE. The returned function restores commits.
+func (e *Env) FailProgramExitCommits() func() {
+	e.T.Helper()
+	ctx := e.T.Context()
+	if _, err := e.DB.Pool.Exec(ctx, fmt.Sprintf(`
+		CREATE FUNCTION fail_program_exit() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'injected program exit commit failure' USING ERRCODE = '40001';
+		END;
+		$$;
+		CREATE CONSTRAINT TRIGGER fail_program_exit
+			AFTER UPDATE ON runners DEFERRABLE INITIALLY DEFERRED
+			FOR EACH ROW WHEN (NEW.state = %d AND NEW.end_reason = %d)
+			EXECUTE FUNCTION fail_program_exit();`,
+		tidev1.RunnerState_RUNNER_STATE_DELETING, tidev1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE)); err != nil {
+		e.T.Fatal(err)
+	}
+	return func() {
+		e.T.Helper()
+		if _, err := e.DB.Pool.Exec(ctx, "DROP TRIGGER fail_program_exit ON runners"); err != nil {
+			e.T.Fatal(err)
+		}
+	}
 }
 
 // Clients are the Connect clients of one credential.

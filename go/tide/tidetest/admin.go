@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/delinoio/mono/go/uuidv7"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
@@ -186,8 +187,8 @@ func (o *orgService) UpdateOrganizationSettings(_ context.Context, req *connect.
 	if !slices.Contains(paths, "max_dev_sessions_per_user") {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("update_mask must name max_dev_sessions_per_user"))
 	}
-	if req.Msg.GetSettings().MaxDevSessionsPerUser != nil {
-		v := req.Msg.GetSettings().GetMaxDevSessionsPerUser()
+	if settings := req.Msg.GetSettings(); settings != nil && settings.MaxDevSessionsPerUser != nil {
+		v := settings.GetMaxDevSessionsPerUser()
 		if v <= 0 {
 			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("max_dev_sessions_per_user must be positive"))
 		}
@@ -431,23 +432,70 @@ func terminalRequest(st tidev1.RequestState) bool {
 	return false
 }
 
+var openRequestStates = []tidev1.RequestState{
+	tidev1.RequestState_REQUEST_STATE_QUEUED,
+	tidev1.RequestState_REQUEST_STATE_STARTING,
+	tidev1.RequestState_REQUEST_STATE_RUNNING,
+}
+
+var openRunnerStates = []tidev1.RunnerState{
+	tidev1.RunnerState_RUNNER_STATE_CREATING,
+	tidev1.RunnerState_RUNNER_STATE_PREPARING,
+	tidev1.RunnerState_RUNNER_STATE_WARM,
+	tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK,
+	tidev1.RunnerState_RUNNER_STATE_BUSY,
+	tidev1.RunnerState_RUNNER_STATE_DELETING,
+}
+
+// listStates returns the states to match. An empty result allows every state.
+func listStates[T ~int32](states, open []T, includeEnded bool) []T {
+	if len(states) > 0 {
+		return states
+	}
+	if includeEnded {
+		return nil
+	}
+	return open
+}
+
+func normalizeListProfileID(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	id, err := uuidv7.Parse(value)
+	if err != nil {
+		return "", connect.NewError(connect.CodeInvalidArgument, errors.New("invalid runner_profile_id: must be a UUID v7"))
+	}
+	return id.String(), nil
+}
+
 func (w *workService) ListRequests(_ context.Context, req *connect.Request[tidev1.ListRequestsRequest]) (*connect.Response[tidev1.ListRequestsResponse], error) {
+	m := req.Msg
 	w.s.mu.Lock()
 	defer w.s.mu.Unlock()
-	if _, err := w.s.requireOrg(req.Msg.GetOrganizationId()); err != nil {
+	if _, err := w.s.requireOrg(m.GetOrganizationId()); err != nil {
 		return nil, err
 	}
+	profileID, err := normalizeListProfileID(m.GetRunnerProfileId())
+	if err != nil {
+		return nil, err
+	}
+	kind := m.GetKind()
+	states := listStates(m.GetStates(), openRequestStates, m.GetIncludeEnded())
 	var mine []*tidev1.Request
 	for _, r := range w.s.requests {
-		if r.GetOrganizationId() != req.Msg.GetOrganizationId() || (!req.Msg.GetIncludeEnded() && terminalRequest(r.GetState())) {
+		if r.GetOrganizationId() != m.GetOrganizationId() || (profileID != "" && r.GetRunnerProfileId() != profileID) {
 			continue
 		}
-		if len(req.Msg.GetStates()) > 0 && !slices.Contains(req.Msg.GetStates(), r.GetState()) {
+		if kind != tidev1.WorkloadKind_WORKLOAD_KIND_UNSPECIFIED && r.GetKind() != kind {
+			continue
+		}
+		if len(states) > 0 && !slices.Contains(states, r.GetState()) {
 			continue
 		}
 		mine = append(mine, r)
 	}
-	items, next, err := page(mine, req.Msg.GetPageSize(), req.Msg.GetPageToken())
+	items, next, err := page(mine, m.GetPageSize(), m.GetPageToken())
 	if err != nil {
 		return nil, err
 	}
@@ -487,19 +535,28 @@ func (w *workService) CancelRequest(_ context.Context, req *connect.Request[tide
 }
 
 func (w *workService) ListRunners(_ context.Context, req *connect.Request[tidev1.ListRunnersRequest]) (*connect.Response[tidev1.ListRunnersResponse], error) {
+	m := req.Msg
 	w.s.mu.Lock()
 	defer w.s.mu.Unlock()
-	if _, err := w.s.requireOrg(req.Msg.GetOrganizationId()); err != nil {
+	if _, err := w.s.requireOrg(m.GetOrganizationId()); err != nil {
 		return nil, err
 	}
+	profileID, err := normalizeListProfileID(m.GetRunnerProfileId())
+	if err != nil {
+		return nil, err
+	}
+	states := listStates(m.GetStates(), openRunnerStates, m.GetIncludeEnded())
 	var mine []*tidev1.Runner
 	for _, r := range w.s.runners {
-		if r.GetOrganizationId() != req.Msg.GetOrganizationId() || (!req.Msg.GetIncludeEnded() && terminalRunner(r.GetState())) {
+		if r.GetOrganizationId() != m.GetOrganizationId() || (profileID != "" && r.GetRunnerProfileId() != profileID) {
+			continue
+		}
+		if len(states) > 0 && !slices.Contains(states, r.GetState()) {
 			continue
 		}
 		mine = append(mine, r)
 	}
-	items, next, err := page(mine, req.Msg.GetPageSize(), req.Msg.GetPageToken())
+	items, next, err := page(mine, m.GetPageSize(), m.GetPageToken())
 	if err != nil {
 		return nil, err
 	}
@@ -599,7 +656,7 @@ func (a *apiKeyService) CreateApiKey(_ context.Context, req *connect.Request[tid
 		CreatedAt: timestamppb.Now(), ExpiresAt: req.Msg.GetExpiresAt(),
 	}
 	a.s.apiKeys = append(a.s.apiKeys, k)
-	return connect.NewResponse(&tidev1.CreateApiKeyResponse{ApiKey: proto.CloneOf(k), Secret: "tide_secret-" + k.GetApiKeyId()}), nil
+	return connect.NewResponse(&tidev1.CreateApiKeyResponse{ApiKey: proto.CloneOf(k), Secret: issuedAPIKeyPrefix + k.GetApiKeyId()}), nil
 }
 
 func (a *apiKeyService) ListApiKeys(_ context.Context, req *connect.Request[tidev1.ListApiKeysRequest]) (*connect.Response[tidev1.ListApiKeysResponse], error) {

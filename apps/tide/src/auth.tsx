@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { LogtoProvider, useLogto } from "@logto/react";
+import { LogtoProvider, PersistKey, useLogto } from "@logto/react";
 import {
   createContext,
   type ReactNode,
@@ -7,6 +7,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { API_RESOURCE, type LogtoSettings } from "./config.ts";
@@ -18,6 +19,8 @@ export interface Auth {
   /** The Logto user ID (`sub`) of the signed-in user. */
   userId: string | undefined;
   signIn(): Promise<void>;
+  /** The latest sign-in attempt failed before navigation. */
+  signInFailed: boolean;
   signOut(): Promise<void>;
   /** A current access token for the control plane API resource. */
   getAccessToken(): Promise<string | undefined>;
@@ -49,6 +52,74 @@ export const SIGN_IN_NOT_CONFIGURED =
 
 /** Path of the sign-in callback route. */
 export const CALLBACK_PATH = "/callback";
+
+/** What the SDK's stored sign-in session says about this address. */
+export enum SignInSessionState {
+  /** No redirect is pending: there is no stored session, or it is for another address. */
+  None = "none",
+  /** A readable session names this address, so the SDK completes a redirect. */
+  Pending = "pending",
+  /** The stored session cannot be read, so the SDK hook would reject. */
+  Invalid = "invalid",
+}
+
+/**
+ * The Logto callback hook is idle both before a redirect starts and when
+ * there is no redirect to complete. Read the SDK's pending session using
+ * the same keys, field checks and URI check as the client. The hook also
+ * checks the session outside its error handler and rejects if it is unreadable.
+ * Replace this reader when `@logto/react` exposes enough callback state to
+ * distinguish idle, pending and unreadable sessions. Remove the unreadable
+ * session guard when the hook handles that error itself.
+ */
+export function logtoSignInSessionState(
+  appId: string,
+  location: Pick<Location, "origin" | "pathname">,
+  storage: Pick<Storage, "getItem"> | undefined = browserSessionStorage(),
+): SignInSessionState {
+  let stored: string | null;
+  try {
+    const key = `logto:${appId}`;
+    stored =
+      storage?.getItem(`${key}:${PersistKey.SignInSession}`) ??
+      storage?.getItem(key) ??
+      null;
+  } catch {
+    return SignInSessionState.None;
+  }
+  if (stored === null || stored === "") return SignInSessionState.None;
+  let session: unknown;
+  try {
+    session = JSON.parse(stored);
+  } catch {
+    return SignInSessionState.Invalid;
+  }
+  if (typeof session !== "object" || session === null) {
+    return SignInSessionState.Invalid;
+  }
+  const { redirectUri, codeVerifier, state } = session as Record<
+    string,
+    unknown
+  >;
+  if (
+    typeof redirectUri !== "string" ||
+    typeof codeVerifier !== "string" ||
+    typeof state !== "string"
+  ) {
+    return SignInSessionState.Invalid;
+  }
+  return redirectUri === `${location.origin}${location.pathname}`
+    ? SignInSessionState.Pending
+    : SignInSessionState.None;
+}
+
+function browserSessionStorage(): Storage | undefined {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Logto single-page application sign-in. The SDK requests access tokens for
@@ -85,14 +156,39 @@ export function LogtoBridge({ children }: { children: ReactNode }) {
   const logto = useLogto();
   const [userId, setUserId] = useState<string | undefined>();
   const [initialized, setInitialized] = useState(false);
+  const [signInFailed, setSignInFailed] = useState(false);
+  const [settledSignIn, setSettledSignIn] = useState<{
+    previousError: Error | undefined;
+  }>();
+  const signingIn = useRef(false);
   const {
     isAuthenticated,
     isLoading: sdkLoading,
     getIdTokenClaims,
     getAccessToken,
+    error: sdkError,
     signIn,
     signOut,
   } = logto;
+  // The SDK records a sign-in failure in its provider before resolving the
+  // promise. Compare the error after React applies the provider update. Use
+  // the promise directly once the SDK reports the failure through it.
+  useEffect(() => {
+    if (settledSignIn === undefined) return;
+    setSignInFailed(
+      sdkError !== undefined && sdkError !== settledSignIn.previousError,
+    );
+    setSettledSignIn(undefined);
+    signingIn.current = false;
+  }, [sdkError, settledSignIn]);
+  const startSignIn = useCallback(async () => {
+    // The SDK shares one error field. Keep attempts from overlapping.
+    if (signingIn.current) return;
+    signingIn.current = true;
+    setSignInFailed(false);
+    await signIn(window.location.origin + CALLBACK_PATH);
+    setSettledSignIn({ previousError: sdkError });
+  }, [sdkError, signIn]);
   // The SDK sets `isLoading` for every token request, not only while it
   // restores the session. The console unmounts its pages while `isLoading`
   // is true, so each page that requested a token unmounted itself, mounted
@@ -115,7 +211,8 @@ export function LogtoBridge({ children }: { children: ReactNode }) {
       isLoading: sdkLoading && !initialized,
       isAuthenticated,
       userId,
-      signIn: () => signIn(window.location.origin + CALLBACK_PATH),
+      signIn: startSignIn,
+      signInFailed,
       signOut: async () => {
         await signOut(window.location.origin);
       },
@@ -127,7 +224,8 @@ export function LogtoBridge({ children }: { children: ReactNode }) {
       initialized,
       isAuthenticated,
       userId,
-      signIn,
+      startSignIn,
+      signInFailed,
       signOut,
       getAccessToken,
     ],
@@ -177,6 +275,7 @@ export function MockAuthProvider({ children }: { children: ReactNode }) {
       isAuthenticated: signedIn,
       userId: signedIn ? MOCK_USER_ID : undefined,
       signIn,
+      signInFailed: false,
       signOut,
       getAccessToken: async () => (signedIn ? "mock-access-token" : undefined),
     }),
