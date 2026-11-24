@@ -116,9 +116,8 @@ func (r *Record) ttlReason(now time.Time) ownsandv1.SandboxEndReason {
 // TTL reason, as a live record of a lost VM does. A lost VM whose end failed
 // keeps LOST_ON_DEVICE without a passed deadline; Tick retries that end.
 //
-// The deadlines still decide only whether an end is due, so the retry cadence
-// is the one of ttlReason: Tick retries a failed caller delete when a deadline
-// passed, and otherwise the control plane resend or the next agent start does.
+// The deadlines decide when a TTL retry is due. Tick can also retry a failed
+// caller delete before a deadline if the retained VM has signaled its exit.
 func (r *Record) endReasonAt(now time.Time) ownsandv1.SandboxEndReason {
 	reason := r.ttlReason(now)
 	if reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED &&

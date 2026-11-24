@@ -909,9 +909,8 @@ func TestCallerDeleteRetryKeepsReasonWhenMaxDeadlinePassed(t *testing.T) {
 	}
 }
 
-// TestCallerDeleteRetryWaitsForDeadline checks that the retry cadence stays
-// as it was: Tick does not retry a failed caller delete while no deadline
-// passed, so a stuck delete is not retried every second.
+// TestCallerDeleteRetryWaitsForDeadline checks that Tick waits for a TTL
+// deadline to retry a failed caller delete while its VM is still running.
 func TestCallerDeleteRetryWaitsForDeadline(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(time.Hour, 24*time.Hour).GetSandboxId()
