@@ -890,10 +890,55 @@ func TestReadLocalFileLookupError(t *testing.T) {
 
 func TestPruneDirs(t *testing.T) {
 	changed := []localFile{{rel: "a"}, {rel: "x/y"}}
-	got := pruneDirs([]string{"a/b/c/old", "a/d", "x/y/z", "other/dir/f", "a"}, changed)
+	got, aliases := pruneDirs([]string{"a/b/c/old", "a/d", "x/y/z", "other/dir/f", "a"}, changed, false)
 	want := []string{"a/b/c", "a/b", "x/y", "a"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("pruneDirs = %v, want %v", got, want)
+	if !slices.Equal(got, want) || len(aliases) != 0 {
+		t.Fatalf("pruneDirs = %q, %q; want %q and no aliases", got, aliases, want)
+	}
+}
+
+func TestPruneDirsCaseOnlyReplacement(t *testing.T) {
+	deleted := []string{"Assets/nested/old.txt", "Assets/nested/another.txt", "Exact/sub/old.txt"}
+	changed := []localFile{{rel: "assets"}, {rel: "Exact"}}
+	wantExact := []string{"Exact/sub", "Exact"}
+	for _, matchAliases := range []bool{false, true} {
+		var wantAliases []string
+		if matchAliases {
+			wantAliases = []string{"Assets", "assets", "Assets/nested", "Assets", "assets", "Assets"}
+		}
+		exact, aliases := pruneDirs(deleted, changed, matchAliases)
+		if !slices.Equal(exact, wantExact) || !slices.Equal(aliases, wantAliases) {
+			t.Fatalf("pruneDirs(matchAliases=%t) = %q, %q; want %q, %q", matchAliases, exact, aliases, wantExact, wantAliases)
+		}
+	}
+}
+
+func TestPruneDirsApplyAliasRecords(t *testing.T) {
+	needPOSIX(t)
+	dir := t.TempDir()
+	ws := filepath.Join(dir, "work")
+	old := "-Assets\n'"
+	nested := old + "/nested\n'"
+	if err := os.MkdirAll(filepath.Join(ws, nested), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A second spelling with ./ refers to the same directory on any volume.
+	incoming := "./" + old
+	list := filepath.Join(dir, "alias-prune-list")
+	if err := os.WriteFile(list, pathList([]string{old, incoming, nested, old, incoming, old}, false), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args, err := guestCommand(tidev1.GuestOs_GUEST_OS_MACOS, opApply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), guestEnvWorkspace + "=" + ws, guestEnvAliasPrunes + "=" + list}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("prune alias directories: %v: %s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(ws, old)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old directory was not removed: %v", err)
 	}
 }
 
@@ -989,7 +1034,7 @@ func TestPOSIXSyncCleanup(t *testing.T) {
 				guestEnvArchive + "=" + archive,
 				guestEnvLock + "=" + lockArg,
 			}
-			for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes} {
+			for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvAliasPrunes} {
 				path := filepath.Join(dir, key)
 				if scenario.archiveDir {
 					if err := os.WriteFile(path, nil, 0o644); err != nil {
