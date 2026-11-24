@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, expect, rs, test } from "@rstest/core";
+import { afterEach, describe, expect, rs, test } from "@rstest/core";
 import { SnapshotState } from "@delino/ownsand-protos/v1/common_pb";
 import {
+  CLEANUP_STEP_TIMEOUT_MS,
   type CleanupStep,
   runCleanup,
   type SnapshotStatus,
   waitForSnapshotReady,
+  withBillingCleanup,
   withCleanup,
 } from "./e2e-support.ts";
 import { VirtualClock } from "./virtual-clock.ts";
@@ -245,4 +247,143 @@ describe("withCleanup", () => {
     );
     await expect(clock.run(wait)).rejects.toBeInstanceOf(AggregateError);
   });
+});
+
+describe("withBillingCleanup", () => {
+  const billingUrl = "http://billing.test";
+
+  afterEach(() => {
+    rs.restoreAllMocks();
+  });
+
+  function fixture(
+    restore: () => Promise<Response>,
+    remove: (signal: AbortSignal, clock: VirtualClock) => Promise<void>,
+  ) {
+    const clock = new VirtualClock();
+    const steps: string[] = [];
+    const reported: unknown[] = [];
+    const restoreFetch = rs
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(() => {
+        steps.push("restore");
+        return restore();
+      });
+    const sandbox = {
+      delete: rs.fn((signal: AbortSignal) => {
+        steps.push("delete");
+        return remove(signal, clock);
+      }),
+      close: () => {
+        steps.push("close");
+      },
+    };
+    return {
+      clock,
+      steps,
+      reported,
+      restoreFetch,
+      sandbox,
+      run: (body: () => Promise<void>) =>
+        clock.run(
+          withBillingCleanup(body, billingUrl, sandbox, {
+            stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS,
+            clock,
+            onCleanupError: (error) => reported.push(error),
+          }),
+        ),
+    };
+  }
+
+  test("attempts each step once in order when the body passes", async () => {
+    const cleanup = fixture(
+      async () => new Response(),
+      async () => {},
+    );
+    await cleanup.run(async () => {});
+    expect(cleanup.steps).toEqual(["restore", "delete", "close"]);
+    expect(cleanup.restoreFetch).toHaveBeenCalledWith(
+      `${billingUrl}/billing/allowed`,
+      { method: "POST", signal: expect.any(AbortSignal) },
+    );
+  });
+
+  test("keeps a failed body's error and reports both cleanup failures in order", async () => {
+    const bodyError = new Error("billing body failed");
+    const deleteError = new Error("delete failed");
+    const cleanup = fixture(
+      async () => new Response("restore failed", { status: 500 }),
+      async () => {
+        throw deleteError;
+      },
+    );
+    await expect(
+      cleanup.run(async () => {
+        throw bodyError;
+      }),
+    ).rejects.toBe(bodyError);
+    expect(cleanup.steps).toEqual(["restore", "delete", "close"]);
+    expect(cleanup.reported).toEqual([
+      new Error("billing control allowed: 500 restore failed"),
+      deleteError,
+    ]);
+    expect(cleanup.reported[1]).toBe(deleteError);
+  });
+
+  test("aggregates cleanup failures of a passing body in step order", async () => {
+    const restoreError = new Error("restore fetch failed");
+    const deleteError = new Error("delete failed");
+    const cleanup = fixture(
+      async () => {
+        throw restoreError;
+      },
+      async () => {
+        throw deleteError;
+      },
+    );
+    await expect(cleanup.run(async () => {})).rejects.toMatchObject({
+      name: "AggregateError",
+      errors: [restoreError, deleteError],
+    });
+    expect(cleanup.steps).toEqual(["restore", "delete", "close"]);
+    expect(cleanup.reported).toEqual([]);
+  });
+
+  test.each(["restore", "delete"])(
+    "continues cleanup after the %s step times out",
+    async (pendingStep) => {
+      let deleteStart: { time: number; aborted: boolean } | undefined;
+      const cleanup = fixture(
+        () =>
+          pendingStep === "restore"
+            ? new Promise<Response>(() => {})
+            : Promise.resolve(new Response()),
+        (signal, clock) => {
+          deleteStart = { time: clock.now(), aborted: signal.aborted };
+          return pendingStep === "delete"
+            ? new Promise<void>(() => {})
+            : Promise.resolve();
+        },
+      );
+
+      const outcome = cleanup.run(async () => {});
+      await expect(outcome).rejects.toThrow(
+        "cleanup step timed out after 15000 ms",
+      );
+      expect(cleanup.clock.now()).toBe(15_000);
+      expect(cleanup.steps).toEqual(["restore", "delete", "close"]);
+      const restoreSignal = cleanup.restoreFetch.mock.calls[0]?.[1]?.signal;
+      const deleteSignal = cleanup.sandbox.delete.mock.calls[0]?.[0];
+      expect(restoreSignal).toBeInstanceOf(AbortSignal);
+      expect(deleteSignal).toBeInstanceOf(AbortSignal);
+      expect(deleteSignal).not.toBe(restoreSignal);
+      expect(deleteStart).toEqual({
+        time: pendingStep === "restore" ? 15_000 : 0,
+        aborted: false,
+      });
+      expect(
+        (pendingStep === "restore" ? restoreSignal : deleteSignal)?.reason,
+      ).toMatchObject({ message: "cleanup step timed out after 15000 ms" });
+    },
+  );
 });
