@@ -7,6 +7,12 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
+import { SnapshotState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  type ListSnapshotsResponse,
+  SnapshotService,
+} from "@delino/ownsand-protos/v1/snapshot_pb";
+import { QueryClient } from "@tanstack/react-query";
 import {
   act,
   cleanup,
@@ -16,6 +22,7 @@ import {
   within,
 } from "@testing-library/react";
 import { toast } from "delino-ui/toast";
+import { invalidateServices } from "./api.ts";
 import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
 import { holdingTransport, renderConsole, settle } from "./test-support.tsx";
 
@@ -82,6 +89,148 @@ async function waitForRows(name: string, count: number) {
   await waitFor(() => expect(itemsOf(name)).toHaveLength(count), WAIT);
   return itemsOf(name);
 }
+
+describe("snapshot source lists", () => {
+  // The mock returns a token after every full page, including the last full
+  // page. Use one row per response here to exercise that rule with two rows.
+  function sourcePages() {
+    const mock = createMockTransport({ extraSnapshots: 1 });
+    const state = {
+      laterSnapshotError: undefined as Code | undefined,
+      laterSnapshotState: SnapshotState.READY,
+      tokens: [] as string[],
+    };
+    const transport: Transport = {
+      ...mock,
+      async unary(method, signal, timeout, header, input, contextValues) {
+        if (method.name !== "ListSnapshots") {
+          return mock.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+        }
+        const request = input as typeof input & { pageToken: string };
+        state.tokens.push(request.pageToken);
+        if (request.pageToken && state.laterSnapshotError !== undefined) {
+          throw new ConnectError(
+            "Could not load snapshots",
+            state.laterSnapshotError,
+          );
+        }
+        const response = await mock.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          { ...request, pageSize: 1 },
+          contextValues,
+        );
+        const message = response.message as unknown as ListSnapshotsResponse;
+        if (!request.pageToken || message.snapshots.length === 0) {
+          return response;
+        }
+        const duplicate = {
+          ...message.snapshots[0]!,
+          state: state.laterSnapshotState,
+        };
+        return {
+          ...response,
+          message: { ...response.message, snapshots: [duplicate, duplicate] },
+        };
+      },
+    };
+    return { transport, state };
+  }
+
+  const showMore = () =>
+    screen.getByRole("button", { name: "Show more snapshots" });
+
+  test("retries the same token, shows an ID once and stops after an empty last page", async () => {
+    const { transport, state } = sourcePages();
+    state.laterSnapshotError = Code.Unavailable;
+    renderConsole(`/orgs/${MOCK_IDS.acme}/snapshots`, { transport });
+    await waitForRows("Snapshots", 1);
+    fireEvent.click(showMore());
+
+    const retry = await screen.findByRole("button", { name: "Try again" });
+    expect(itemsOf("Snapshots")).toHaveLength(1);
+    state.laterSnapshotError = undefined;
+    fireEvent.click(retry);
+    await waitForRows("Snapshots", 2);
+    expect(state.tokens).toEqual(["", state.tokens[1], state.tokens[1]]);
+    expect(state.tokens[1]).not.toBe("");
+
+    fireEvent.click(showMore());
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Show more snapshots" }),
+      ).toBeNull(),
+    );
+    expect(itemsOf("Snapshots")).toHaveLength(2);
+    expect(state.tokens[3]).not.toBe(state.tokens[1]);
+  });
+
+  test.each([
+    [Code.NotFound, "It was not found, or you no longer have access to it."],
+    [Code.PermissionDenied, "You do not have permission to do this."],
+    [Code.Unauthenticated, "Your session ended. Sign in again."],
+  ] as const)(
+    "removes management rows and their continuation after terminal status %s",
+    async (code, notice) => {
+      const { transport, state } = sourcePages();
+      state.laterSnapshotError = code;
+      renderConsole(`/orgs/${MOCK_IDS.acme}/snapshots`, { transport });
+      await waitForRows("Snapshots", 1);
+      await waitForRows("Templates", 1);
+      fireEvent.click(showMore());
+
+      await waitFor(() => {
+        expect(screen.queryByRole("list", { name: "Snapshots" })).toBeNull();
+        expect(
+          screen.queryByRole("button", { name: "Show more snapshots" }),
+        ).toBeNull();
+      });
+      expect(screen.getByText(notice)).toBeTruthy();
+      expect(itemsOf("Templates")).toHaveLength(1);
+    },
+  );
+
+  test("offers a later snapshot once it becomes ready after invalidation", async () => {
+    const { transport, state } = sourcePages();
+    state.laterSnapshotState = SnapshotState.CREATING;
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+      transport,
+      queryClient,
+    });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Create sandbox" }),
+    );
+    await waitFor(() => expect(state.tokens).toHaveLength(3));
+    const source = await screen.findByRole("combobox", { name: "Source" });
+    fireEvent.click(source);
+    expect(
+      await screen.findAllByRole("option", { name: /^Snapshot / }),
+    ).toHaveLength(1);
+
+    state.laterSnapshotState = SnapshotState.READY;
+    await act(async () => {
+      await invalidateServices(queryClient, SnapshotService);
+    });
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("option", { name: /^Snapshot / }),
+      ).toHaveLength(2),
+    );
+    expect(state.tokens).toHaveLength(6);
+  });
+});
 
 describe("enrollment tokens list", () => {
   /** A mock whose acme organization holds the seeded token and `EXTRA_ROWS` unused ones. */

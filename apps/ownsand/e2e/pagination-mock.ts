@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
+import { SnapshotExportState } from "@delino/ownsand-protos/v1/common_pb";
+import type { CreateSandboxRequest } from "@delino/ownsand-protos/v1/sandbox_pb";
+import type {
+  ListSnapshotsResponse,
+  ListTemplatesResponse,
+} from "@delino/ownsand-protos/v1/snapshot_pb";
 import { createMockTransport as createBaseMock } from "../src/mock/mock-api.ts";
 
 const lists = {
@@ -32,6 +38,28 @@ async function failOrganizationListIfConfigured() {
   }
 }
 
+async function failContinuationIfConfigured() {
+  if (sessionStorage.getItem("ownsand-e2e-page-error") === "hold") {
+    await new Promise<void>((resolve) => {
+      window.addEventListener("ownsand-e2e-release-page", () => resolve(), {
+        once: true,
+      });
+    });
+  }
+  const code = sessionStorage.getItem("ownsand-e2e-page-error");
+  if (code !== null) {
+    throw new ConnectError(
+      "Synthetic continuation failure",
+      Number(code) as Code,
+    );
+  }
+}
+
+function recordToken(key: string, token: string) {
+  const tokens = JSON.parse(sessionStorage.getItem(key) ?? "[]") as string[];
+  sessionStorage.setItem(key, JSON.stringify([...tokens, token]));
+}
+
 export function createMockTransport(): Transport {
   const methodName = sessionStorage.getItem("ownsand-e2e-paged-list");
   const pagination =
@@ -40,17 +68,83 @@ export function createMockTransport(): Transport {
       : undefined;
   // Devices use the base mock's control-plane page size and cursor.
   const pageDevices = methodName === "ListDevices";
+  const pageSources = methodName === "SnapshotSources";
   // Seed enough rows to split the selected list across two pages.
   const base = createBaseMock({
     extraApiKeys: Number(methodName === "ListApiKeys"),
     extraDevices: pageDevices ? 199 : 0,
     extraEnrollmentTokens: Number(methodName === "ListEnrollmentTokens"),
+    extraSnapshots: pageSources ? 200 : 0,
+    extraTemplates: pageSources ? 200 : 0,
   });
   return {
     ...base,
     async unary(method, signal, timeout, header, input, contextValues) {
       if (method.name === "ListOrganizations") {
         await failOrganizationListIfConfigured();
+      }
+      if (pageSources && method.name === "CreateSandbox") {
+        const { source } = input as unknown as CreateSandboxRequest;
+        sessionStorage.setItem(
+          "ownsand-e2e-created-source",
+          JSON.stringify(source?.source),
+        );
+      }
+      if (
+        pageSources &&
+        (method.name === "ListSnapshots" || method.name === "ListTemplates")
+      ) {
+        const { pageToken = "" } = input as { pageToken?: string };
+        recordToken(`ownsand-e2e-${method.name}-tokens`, pageToken);
+        if (
+          pageToken !== "" &&
+          sessionStorage.getItem("ownsand-e2e-source-fault") === method.name
+        ) {
+          await failContinuationIfConfigured();
+        }
+        const response = await base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+        if (pageToken === "") return response;
+        if (method.name === "ListTemplates") {
+          const { templates } =
+            response.message as unknown as ListTemplatesResponse;
+          const template = templates[0];
+          if (template)
+            sessionStorage.setItem(
+              "ownsand-e2e-later-template",
+              template.templateId,
+            );
+          return response;
+        }
+        const { snapshots } =
+          response.message as unknown as ListSnapshotsResponse;
+        const snapshot = snapshots[0];
+        if (!snapshot) return response;
+        sessionStorage.setItem(
+          "ownsand-e2e-later-snapshot",
+          snapshot.snapshotId,
+        );
+        if (
+          sessionStorage.getItem("ownsand-e2e-snapshot-exporting") !== "true"
+        ) {
+          return response;
+        }
+        return {
+          ...response,
+          message: {
+            ...response.message,
+            snapshots: [
+              { ...snapshot, exportState: SnapshotExportState.EXPORTING },
+              ...snapshots.slice(1),
+            ],
+          },
+        };
       }
       if (
         method.name !== methodName ||
@@ -67,13 +161,7 @@ export function createMockTransport(): Transport {
       }
       const request = input as typeof input & { pageToken?: string };
       const token = request.pageToken ?? "";
-      const tokens = JSON.parse(
-        sessionStorage.getItem("ownsand-e2e-page-tokens") ?? "[]",
-      ) as string[];
-      sessionStorage.setItem(
-        "ownsand-e2e-page-tokens",
-        JSON.stringify([...tokens, token]),
-      );
+      recordToken("ownsand-e2e-page-tokens", token);
       if (token !== "") {
         if (!pageDevices && token !== CONTINUATION) {
           throw new ConnectError(
@@ -81,22 +169,7 @@ export function createMockTransport(): Transport {
             Code.InvalidArgument,
           );
         }
-        if (sessionStorage.getItem("ownsand-e2e-page-error") === "hold") {
-          await new Promise<void>((resolve) => {
-            window.addEventListener(
-              "ownsand-e2e-release-page",
-              () => resolve(),
-              { once: true },
-            );
-          });
-        }
-        const code = sessionStorage.getItem("ownsand-e2e-page-error");
-        if (code !== null) {
-          throw new ConnectError(
-            "Synthetic continuation failure",
-            Number(code) as Code,
-          );
-        }
+        await failContinuationIfConfigured();
       }
 
       if (pagination === undefined) {
