@@ -115,8 +115,8 @@ func TestExecBareNameUsesRequestPathWindows(t *testing.T) {
 	// finds its libraries as the original does.
 	req.Env["pAtH"] = dir + string(os.PathListSeparator) + helperPath
 	evs := h.runExec(req)
-	if got := evs[len(evs)-1].GetExited(); got == nil || got.GetExitCode() != 0 {
-		t.Fatalf("events %v", evs)
+	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+		t.Fatalf("events %v: %v", evs, err)
 	}
 	if os.Getenv("PATH") != helperPath {
 		t.Fatalf("helper PATH changed to %q", os.Getenv("PATH"))
