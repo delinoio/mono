@@ -498,6 +498,8 @@ GitHub Actions runner (recorded implementation, `servers/tide-api/internal/githu
 
 `GetCapacity` returns, for each device of the linked OwnSand organization, the data that OwnSand `ListDevices` returns about state, limits, the effective vCPU limit and allocation, together with the number of tide runners on the device by state. The console uses it to show how the device pool is used.
 
+For allocated vCPUs, `GetCapacity` uses the [exact OwnSand total](protos-ownsand-api-contract.md#device-limits) when present, including zero. If OwnSand omits the exact total, tide widens the legacy count to `int64`. If there is no allocation, tide reports zero allocated vCPUs.
+
 ### Metrics
 
 The server records its metrics with the OpenTelemetry SDK through the shared `servers/internal/telemetry` package, like `accounts-api` ([accounts-api metrics](servers-accounts-api-foundation.md#metrics)). `GET /metrics` on `METRICS_ADDR` serves them in the Prometheus format through the OpenTelemetry Prometheus exporter. Caddy does not route `METRICS_ADDR`, so the endpoint is not public. Metric labels never contain organization IDs, user IDs, repository names or other user data.
