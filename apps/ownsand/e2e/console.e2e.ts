@@ -128,6 +128,27 @@ describe("sandboxes", () => {
     await expect(screen.getByRole("button", "Show more")).toBeHidden();
   });
 
+  test("shows a field error when the sandbox disk exceeds 8589934591 GiB", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/sandboxes`);
+    await screen.getByRole("button", "Create sandbox").tap();
+
+    const dialog = screen.getByRole("dialog", "Create a sandbox");
+    const disk = dialog.getByLabel("Disk (GiB)");
+    await disk.fill("8589934592");
+    await dialog.getByRole("button", "Create").tap();
+
+    await expect(dialog).toBeVisible();
+    await expect(disk).toHaveAttribute("aria-invalid", "true");
+    await expect(
+      dialog.getByText("Enter a whole number of GiB from 1 to 8589934591."),
+    ).toBeVisible();
+  });
+
   test("pauses and resumes a sandbox", async ({ app, screen }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
