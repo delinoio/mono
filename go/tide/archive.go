@@ -102,6 +102,12 @@ type extractStats struct {
 	warnings []string
 }
 
+type archiveExtractor struct {
+	fileLimit  int64
+	totalLimit int64
+	link       func(*os.Root, string, string) error
+}
+
 // extractArchive extracts the tar archive r into the directory dir, which
 // must exist and be empty. It rejects entries with absolute paths, entries
 // that resolve outside dir, symbolic links whose targets point outside dir
@@ -111,7 +117,7 @@ type extractStats struct {
 // most fileLimit bytes and all files together at most totalLimit bytes.
 // Entry types other than directories, regular files, symbolic links and
 // hard links are skipped with a warning.
-func extractArchive(ctx context.Context, r io.Reader, dir string, fileLimit, totalLimit int64) (*extractStats, error) {
+func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir string) (*extractStats, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
@@ -145,18 +151,13 @@ func extractArchive(ctx context.Context, r io.Reader, dir string, fileLimit, tot
 				return st, err
 			}
 		case tar.TypeReg:
-			if hdr.Size > fileLimit {
-				return st, &LimitError{Operation: "download", FileLimit: fileLimit, TotalLimit: totalLimit, Paths: []PathSize{{Path: filepath.ToSlash(name), Size: hdr.Size}}}
-			}
-			if st.bytes+hdr.Size > totalLimit {
-				return st, &LimitError{Operation: "download", FileLimit: fileLimit, TotalLimit: totalLimit, Total: st.bytes + hdr.Size}
-			}
-			if err := writeEntry(root, name, mode, tr, hdr.Size); err != nil {
+			if err := e.writeFile(st, name, hdr.Size, func() error {
+				return writeEntry(root, name, mode, tr, hdr.Size)
+			}); err != nil {
 				return st, err
 			}
 			regular[name] = true
 			st.files++
-			st.bytes += hdr.Size
 		case tar.TypeSymlink:
 			if !confinedLinkTarget(name, hdr.Linkname) {
 				return st, fmt.Errorf("tide: the archive entry %s is a symbolic link that points outside the destination", filepath.ToSlash(name))
@@ -181,8 +182,8 @@ func extractArchive(ctx context.Context, r io.Reader, dir string, fileLimit, tot
 				return st, err
 			}
 			_ = root.Remove(name)
-			if err := root.Link(target, name); err != nil {
-				if err := copyInRoot(root, target, name); err != nil {
+			if err := e.link(root, target, name); err != nil {
+				if err := e.copyFile(root, st, target, name); err != nil {
 					return st, err
 				}
 			}
@@ -233,7 +234,21 @@ func writeEntry(root *os.Root, name string, mode fs.FileMode, r io.Reader, size 
 	return err
 }
 
-func copyInRoot(root *os.Root, from, to string) error {
+func (e archiveExtractor) writeFile(st *extractStats, name string, size int64, write func() error) error {
+	if size > e.fileLimit {
+		return &LimitError{Operation: "download", FileLimit: e.fileLimit, TotalLimit: e.totalLimit, Paths: []PathSize{{Path: filepath.ToSlash(name), Size: size}}}
+	}
+	if st.bytes+size > e.totalLimit {
+		return &LimitError{Operation: "download", FileLimit: e.fileLimit, TotalLimit: e.totalLimit, Total: st.bytes + size}
+	}
+	if err := write(); err != nil {
+		return err
+	}
+	st.bytes += size
+	return nil
+}
+
+func (e archiveExtractor) copyFile(root *os.Root, st *extractStats, from, to string) error {
 	src, err := root.Open(from)
 	if err != nil {
 		return err
@@ -243,7 +258,9 @@ func copyInRoot(root *os.Root, from, to string) error {
 	if err != nil {
 		return err
 	}
-	return writeEntry(root, to, info.Mode().Perm(), src, info.Size())
+	return e.writeFile(st, to, info.Size(), func() error {
+		return writeEntry(root, to, info.Mode().Perm(), src, info.Size())
+	})
 }
 
 // confinedLinkTarget reports whether the symbolic link target linkname of

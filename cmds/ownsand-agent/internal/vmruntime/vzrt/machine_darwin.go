@@ -33,6 +33,35 @@ func terminalState(state vz.VirtualMachineState) bool {
 	return state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError
 }
 
+// VMExit records the first terminal state reported by a VM.
+type VMExit struct {
+	done  <-chan struct{}
+	state vz.VirtualMachineState
+}
+
+// Done returns a channel that closes when the VM stops or fails.
+func (e *VMExit) Done() <-chan struct{} { return e.done }
+
+// State waits for Done and returns the terminal state.
+func (e *VMExit) State() vz.VirtualMachineState {
+	<-e.done
+	return e.state
+}
+
+// WatchVMExit consumes a VM's state notifications until it sees Stopped or Error.
+func WatchVMExit(notify <-chan vz.VirtualMachineState) *VMExit {
+	exit := &VMExit{}
+	watcher := watchMachine(notify, func(state vz.VirtualMachineState) bool {
+		if !terminalState(state) {
+			return false
+		}
+		exit.state = state
+		return true
+	})
+	exit.done = watcher.exited
+	return exit
+}
+
 // WatchStopped returns a channel that is closed when machine stops or fails.
 func WatchStopped(machine *vz.VirtualMachine) <-chan struct{} {
 	return watchMachine(machine.StateChangedNotify(), terminalState).exited

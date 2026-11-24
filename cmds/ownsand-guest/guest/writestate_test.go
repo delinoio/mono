@@ -354,6 +354,16 @@ func TestWriteRecoveryClampsFutureLastChunk(t *testing.T) {
 }
 
 func TestWriteRecoveryKeepsReplacedFile(t *testing.T) {
+	t.Run("canonical", func(t *testing.T) {
+		testWriteRecoveryKeepsReplacedFile(t, false)
+	})
+	t.Run("failed promotion", func(t *testing.T) {
+		testWriteRecoveryKeepsReplacedFile(t, true)
+	})
+}
+
+func testWriteRecoveryKeepsReplacedFile(t *testing.T, failPromotion bool) {
+	t.Helper()
 	clock := &fakeClock{now: time.Date(1600, 1, 1, 0, 0, 0, 123456789, time.UTC)}
 	h := newHarness(t, func(c *Config) { c.Now = clock.Now })
 	h.clock = clock
@@ -373,7 +383,14 @@ func TestWriteRecoveryKeepsReplacedFile(t *testing.T) {
 	if err := os.Remove(held); err != nil {
 		t.Fatal(err)
 	}
-	h2 := restart(t, h, nil)
+	var h2 *harness
+	if failPromotion {
+		canonical, temp := demoteRecordToTemp(t, h, req)
+		h2 = restartWithFailedRecordPromotion(t, h, canonical, temp)
+	} else {
+		h2 = restart(t, h, nil)
+	}
+	assertWriteLostAfterRestart(t, h2, req)
 	h2.clock.Advance(16 * time.Minute)
 	h2.srv.Sweep()
 	if got, err := os.ReadFile(tmp); err != nil || string(got) != "somebody else" {
@@ -431,6 +448,141 @@ func TestWriteRecoveryPromotesFirstTempRecord(t *testing.T) {
 	}
 	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
 		t.Fatalf("target %q %v", got, err)
+	}
+}
+
+// restartWithFailedRecordPromotion fails only the expected startup rename.
+func restartWithFailedRecordPromotion(t *testing.T, h *harness, canonical, temp string) *harness {
+	t.Helper()
+	original := promoteWriteRecord
+	defer func() { promoteWriteRecord = original }()
+	attempts := 0
+	promoteWriteRecord = func(from, to string) error {
+		if from != temp || to != canonical {
+			t.Fatalf("unexpected promotion from %q to %q", from, to)
+		}
+		attempts++
+		return &os.LinkError{Op: "rename", Old: from, New: to, Err: fs.ErrPermission}
+	}
+	var logs syncBuffer
+	h2 := restart(t, h, func(c *Config) {
+		c.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	})
+	if attempts != 1 {
+		t.Fatalf("promotion attempts = %d, want 1", attempts)
+	}
+	var warning struct {
+		Message string `json:"msg"`
+		Error   string `json:"error"`
+	}
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if err := json.Unmarshal([]byte(line), &warning); err != nil {
+			t.Fatal(err)
+		}
+		if warning.Message == "promote write record temporary file failed" {
+			if warning.Error != fs.ErrPermission.Error() {
+				t.Fatalf("promotion error = %q, want %q", warning.Error, fs.ErrPermission)
+			}
+			return h2
+		}
+	}
+	t.Fatal("missing warning for failed record promotion")
+	return nil
+}
+
+func assertWriteLostAfterRestart(t *testing.T, h *harness, chunk *ownsandv1.WriteFileRequest) {
+	t.Helper()
+	finish := &ownsandv1.WriteFileRequest{
+		SandboxId: testSandbox,
+		WriteId:   chunk.GetWriteId(),
+		Finish:    &ownsandv1.WriteFileFinish{SizeBytes: int64(len(chunk.GetData()))},
+	}
+	for _, req := range []*ownsandv1.WriteFileRequest{chunk, finish} {
+		_, errd := h.write(req)
+		if errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND ||
+			errd.GetMessage() != "write was lost in a helper restart" {
+			t.Fatalf("recovered write response: %v", errd)
+		}
+	}
+}
+
+func TestWriteRecoveryFailedPromotionExpiresStagingFile(t *testing.T) {
+	h := newHarness(t, nil)
+	target, req := startPartialWrite(t, h)
+	staging := tempPath(target, req.GetWriteId())
+	canonical, temp := demoteRecordToTemp(t, h, req)
+	record, err := os.ReadFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h2 := restartWithFailedRecordPromotion(t, h, canonical, temp)
+	checkRecord := func() {
+		t.Helper()
+		if got := recordFiles(t, h2); len(got) != 1 || got[0] != filepath.Base(temp) {
+			t.Fatalf("records after failed promotion: %v", got)
+		}
+		if got, err := os.ReadFile(temp); err != nil || !bytes.Equal(got, record) {
+			t.Fatalf("temporary record changed after failed promotion: %v", err)
+		}
+	}
+	checkRecord()
+	assertWriteLostAfterRestart(t, h2, req)
+
+	h2.clock.Advance(15*time.Minute - time.Second)
+	h2.srv.Sweep()
+	if got, err := os.ReadFile(staging); err != nil || string(got) != "partial" {
+		t.Fatalf("staging file before expiry: %q, %v", got, err)
+	}
+	checkRecord()
+
+	h2.srv.writes.removeFile = func(path string) error {
+		if path != staging {
+			t.Fatalf("unexpected removal of %q", path)
+		}
+		return &fs.PathError{Op: "remove", Path: path, Err: fs.ErrPermission}
+	}
+	h2.clock.Advance(time.Second)
+	h2.srv.Sweep()
+	if !exists(staging) {
+		t.Fatal("staging file disappeared after failed cleanup")
+	}
+	checkRecord()
+	assertWriteLostAfterRestart(t, h2, req)
+
+	h2.srv.writes.removeFile = func(path string) error {
+		checkRecord()
+		return os.Remove(path)
+	}
+	h2.srv.Sweep()
+	if exists(staging) || len(recordFiles(t, h2)) != 0 {
+		t.Fatal("staging file or record survived successful cleanup retry")
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
+		t.Fatalf("target after expiry: %q, %v", got, err)
+	}
+	if _, errd := h2.write(req); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND ||
+		errd.GetMessage() != "write expired" {
+		t.Fatalf("write after expiry: %v", errd)
+	}
+}
+
+func TestWriteRecoveryFailedPromotionRetriesOnRestart(t *testing.T) {
+	h := newHarness(t, nil)
+	target, req := startPartialWrite(t, h)
+	canonical, temp := demoteRecordToTemp(t, h, req)
+
+	h2 := restartWithFailedRecordPromotion(t, h, canonical, temp)
+	h2.clock.Advance(5 * time.Minute)
+	h3 := restart(t, h2, nil)
+	if got := recordFiles(t, h3); len(got) != 1 || got[0] != filepath.Base(canonical) {
+		t.Fatalf("records after restart with working promotion: %v", got)
+	}
+	assertWriteLostAfterRestart(t, h3, req)
+	h3.clock.Advance(10 * time.Minute)
+	h3.srv.Sweep()
+	if exists(tempPath(target, req.GetWriteId())) || len(recordFiles(t, h3)) != 0 {
+		t.Fatal("staging file or promoted record survived expiry")
 	}
 }
 
@@ -595,14 +747,29 @@ func TestWriteRecoveryRejectsInvalidSplitTimestamp(t *testing.T) {
 }
 
 func TestWriteRecoveryDropsTempRecordWithoutStagingFile(t *testing.T) {
+	t.Run("promoted", func(t *testing.T) {
+		testWriteRecoveryDropsTempRecordWithoutStagingFile(t, false)
+	})
+	t.Run("failed promotion", func(t *testing.T) {
+		testWriteRecoveryDropsTempRecordWithoutStagingFile(t, true)
+	})
+}
+
+func testWriteRecoveryDropsTempRecordWithoutStagingFile(t *testing.T, failPromotion bool) {
+	t.Helper()
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	releaseWriteFiles(h)
 	if err := os.Remove(tempPath(target, req.GetWriteId())); err != nil {
 		t.Fatal(err)
 	}
-	demoteRecordToTemp(t, h, req)
-	h2 := restart(t, h, nil)
+	canonical, temp := demoteRecordToTemp(t, h, req)
+	var h2 *harness
+	if failPromotion {
+		h2 = restartWithFailedRecordPromotion(t, h, canonical, temp)
+	} else {
+		h2 = restart(t, h, nil)
+	}
 	if got := recordFiles(t, h2); len(got) != 0 {
 		t.Fatalf("records after restart: %v", got)
 	}

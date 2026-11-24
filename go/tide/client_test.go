@@ -240,6 +240,58 @@ func TestPagination(t *testing.T) {
 	}
 }
 
+func TestFakePageSizeValidation(t *testing.T) {
+	c, srv, _ := newTestClient(t, "")
+	for i := range 200 {
+		srv.AddOrganization(fmt.Sprintf("org-%d", i))
+	}
+	ctx := t.Context()
+	list := c.Organizations().ListOrganizations
+
+	if _, err := list(ctx, connect.NewRequest(&tidev1.ListOrganizationsRequest{PageSize: -1})); connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Errorf("negative page size: got %v, want invalid_argument", err)
+	}
+	if _, err := list(ctx, connect.NewRequest(&tidev1.ListOrganizationsRequest{PageSize: 1, PageToken: "malformed"})); connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Errorf("malformed page token: got %v, want invalid_argument", err)
+	}
+
+	first, err := list(ctx, connect.NewRequest(&tidev1.ListOrganizationsRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(first.Msg.GetOrganizations()); got != 50 {
+		t.Fatalf("default page size: got %d, want 50", got)
+	}
+	token := first.Msg.GetNextPageToken()
+	if token == "" {
+		t.Fatal("default page is missing a continuation token")
+	}
+	next, err := list(ctx, connect.NewRequest(&tidev1.ListOrganizationsRequest{PageToken: token}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(next.Msg.GetOrganizations()); got != 50 {
+		t.Fatalf("next page size: got %d, want 50", got)
+	}
+	firstIDs := make(map[string]bool, 50)
+	for _, org := range first.Msg.GetOrganizations() {
+		firstIDs[org.GetOrganizationId()] = true
+	}
+	for _, org := range next.Msg.GetOrganizations() {
+		if firstIDs[org.GetOrganizationId()] {
+			t.Fatalf("next page repeated organization %q", org.GetOrganizationId())
+		}
+	}
+
+	capped, err := list(ctx, connect.NewRequest(&tidev1.ListOrganizationsRequest{PageSize: 201}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(capped.Msg.GetOrganizations()); got != 200 {
+		t.Fatalf("capped page size: got %d, want 200", got)
+	}
+}
+
 func TestPaginationRepeatedStartingToken(t *testing.T) {
 	const loopError = "tide: the server returned the page token of an earlier page again"
 	for _, tc := range []struct {

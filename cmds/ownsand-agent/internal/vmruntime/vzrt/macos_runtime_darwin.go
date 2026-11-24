@@ -91,8 +91,15 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 	src := r.opts.MacOSImage
 	if spec.Snapshot != nil {
 		src = spec.Snapshot.Dir
-	} else if model, detail := r.macOSImage(); model == nil {
-		return nil, fmt.Errorf("%w: %s", vmruntime.ErrUnsupported, detail)
+	} else {
+		if model, detail := r.macOSImage(); model == nil {
+			return nil, fmt.Errorf("%w: %s", vmruntime.ErrUnsupported, detail)
+		}
+		if meta, err := images.Resolve(src); err == nil {
+			if spec.Resources.GetVcpuCount() < meta.MinimumCPUCount || spec.Resources.GetMemoryMib() < meta.MinimumMemoryMiB {
+				return nil, fmt.Errorf("%w: macOS guests need at least %d vCPUs and %d MiB of memory", vmruntime.ErrUnsupported, meta.MinimumCPUCount, meta.MinimumMemoryMiB)
+			}
+		}
 	}
 	model, err := os.ReadFile(filepath.Join(src, images.MacOSHardwareModel))
 	if err != nil {
@@ -100,11 +107,6 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 	}
 	if !macOSHardwareModelSupported(model) {
 		return nil, fmt.Errorf("%w: this Mac does not support the hardware model of the macOS guest", vmruntime.ErrUnsupported)
-	}
-	if meta, err := images.Resolve(r.opts.MacOSImage); err == nil {
-		if spec.Resources.GetVcpuCount() < meta.MinimumCPUCount || spec.Resources.GetMemoryMib() < meta.MinimumMemoryMiB {
-			return nil, fmt.Errorf("%w: macOS guests need at least %d vCPUs and %d MiB of memory", vmruntime.ErrUnsupported, meta.MinimumCPUCount, meta.MinimumMemoryMiB)
-		}
 	}
 	start := time.Now()
 	if err := os.RemoveAll(spec.Dir); err != nil {
@@ -117,10 +119,10 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 		hardwareModel: model, vcpu: spec.Resources.GetVcpuCount(), memMiB: spec.Resources.GetMemoryMib()}
 	cleanup := func() { r.discard(v) }
 	prepare := func() error {
-		if err := copyFile(filepath.Join(src, images.MacOSDisk), filepath.Join(spec.Dir, diskFile)); err != nil {
+		if err := copyFile(context.Background(), filepath.Join(src, images.MacOSDisk), filepath.Join(spec.Dir, diskFile)); err != nil {
 			return fmt.Errorf("vzrt: prepare disk: %w", err)
 		}
-		if err := copyFile(filepath.Join(src, images.MacOSAuxStorage), filepath.Join(spec.Dir, auxFile)); err != nil {
+		if err := copyFile(context.Background(), filepath.Join(src, images.MacOSAuxStorage), filepath.Join(spec.Dir, auxFile)); err != nil {
 			return fmt.Errorf("vzrt: prepare auxiliary storage: %w", err)
 		}
 		return nil
@@ -248,19 +250,14 @@ func (r *Runtime) restoreMacOS(ctx context.Context, v *vm, spec vmruntime.Spec) 
 // snapshotMacOS writes the snapshot of a paused macOS guest: APFS clones of
 // the disk and the auxiliary storage, the hardware model and, for NONE
 // sandboxes, the machine state with the machine identifier.
-func (r *Runtime) snapshotMacOS(v *vm, dir string) (vmruntime.SnapshotInfo, error) {
+func (r *Runtime) snapshotMacOS(ctx context.Context, v *vm, dir string) (vmruntime.SnapshotInfo, error) {
 	info := vmruntime.SnapshotInfo{MacOSHardwareModel: v.hardwareModel}
 	if memoryStateSupported && v.network == ownsandv1.NetworkMode_NETWORK_MODE_NONE {
-		machine, _, err := v.current()
+		saved, err := r.saveSnapshotMemory(ctx, v, filepath.Join(dir, snapState))
 		if err != nil {
 			return vmruntime.SnapshotInfo{}, err
 		}
-		if err := saveMemory(machine, filepath.Join(dir, snapState)); err != nil {
-			r.logger.Warn("saving the macOS machine state failed; taking a disk-only snapshot", "sandbox_id", v.id, "error", err)
-			os.Remove(filepath.Join(dir, snapState))
-		} else {
-			info.HasMemoryState = true
-		}
+		info.HasMemoryState = saved
 	}
 	// The machine identifier is kept with every macOS snapshot; a cold boot
 	// does not use it.
@@ -270,10 +267,10 @@ func (r *Runtime) snapshotMacOS(v *vm, dir string) (vmruntime.SnapshotInfo, erro
 	if err := os.WriteFile(filepath.Join(dir, images.MacOSHardwareModel), v.hardwareModel, 0o600); err != nil {
 		return vmruntime.SnapshotInfo{}, err
 	}
-	if err := copyFile(filepath.Join(v.dir, diskFile), filepath.Join(dir, images.MacOSDisk)); err != nil {
+	if err := copyFile(ctx, filepath.Join(v.dir, diskFile), filepath.Join(dir, images.MacOSDisk)); err != nil {
 		return vmruntime.SnapshotInfo{}, err
 	}
-	if err := copyFile(filepath.Join(v.dir, auxFile), filepath.Join(dir, images.MacOSAuxStorage)); err != nil {
+	if err := copyFile(ctx, filepath.Join(v.dir, auxFile), filepath.Join(dir, images.MacOSAuxStorage)); err != nil {
 		return vmruntime.SnapshotInfo{}, err
 	}
 	for _, name := range []string{snapState, images.MacOSDisk, images.MacOSAuxStorage, images.MacOSHardwareModel, images.MacOSMachineID} {
@@ -281,5 +278,5 @@ func (r *Runtime) snapshotMacOS(v *vm, dir string) (vmruntime.SnapshotInfo, erro
 			info.SizeBytes += st.Size()
 		}
 	}
-	return info, nil
+	return info, ctx.Err()
 }

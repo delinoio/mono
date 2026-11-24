@@ -40,6 +40,7 @@ out=""
 arch=""
 for arg in "$@"; do
   case "$arg" in
+    OUT_NAME=*) exec "$STUB_LOG_DIR/kernel-docker" "$@" ;;
     *:/stage:ro) stage="${arg%:/stage:ro}" ;;
     *:/out) out="${arg%:/out}" ;;
     linux/*) arch="${arg#linux/}" ;;
@@ -359,6 +360,30 @@ func TestFailedStepsPreserveThePreviousOutputs(t *testing.T) {
 			b.requireNoStage()
 		})
 	}
+}
+
+func TestFailedStepsRejectKernelChecksumFailure(t *testing.T) {
+	b := newImageBuild(t)
+	b.seedImage("amd64")
+	kernel, err := os.ReadFile("build-kernel.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string][]byte{
+		filepath.Join(filepath.Dir(b.script), "build-kernel.sh"): kernel,
+		filepath.Join(b.logs, "kernel-docker"):                   []byte(stubKernelDocker),
+		filepath.Join(b.dir, "bin", "shasum"):                    []byte(stubFailedShasum),
+	} {
+		if err := os.WriteFile(path, contents, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := b.run("arm64", "OWNSAND_KERNEL_CACHE="+filepath.Join(b.tmp, "cache"))
+	if err == nil || !strings.Contains(out, "could not compute SHA-256") || strings.Contains(out, "wrote ") {
+		t.Fatalf("want a checksum failure with no success message, got %v\n%s", err, out)
+	}
+	b.requireImage("amd64")
+	b.requireNoStage()
 }
 
 func TestFailedFirstBuildLeavesNoOutputs(t *testing.T) {

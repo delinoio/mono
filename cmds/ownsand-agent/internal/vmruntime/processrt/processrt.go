@@ -587,19 +587,19 @@ func (r *Runtime) signalGroups(v *vm, groups []int, sig syscall.Signal) error {
 
 // Snapshot copies the sandbox root directory as its disk. The process
 // runtime has no memory state.
-func (r *Runtime) Snapshot(_ context.Context, m vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
 	v, err := r.lookup(m.SandboxID())
 	if err != nil {
 		return vmruntime.SnapshotInfo{}, err
 	}
-	if err := fsutil.CopyTree(filepath.Join(v.dir, rootDir), filepath.Join(dir, diskDir)); err != nil {
+	if err := fsutil.CopyTreeContext(ctx, filepath.Join(v.dir, rootDir), filepath.Join(dir, diskDir)); err != nil {
 		return vmruntime.SnapshotInfo{}, fmt.Errorf("processrt: snapshot disk: %w", err)
 	}
-	size, err := fsutil.TreeSize(dir)
+	size, err := fsutil.TreeSizeContext(ctx, dir)
 	if err != nil {
 		return vmruntime.SnapshotInfo{}, err
 	}
-	return vmruntime.SnapshotInfo{SizeBytes: size}, nil
+	return vmruntime.SnapshotInfo{SizeBytes: size}, ctx.Err()
 }
 
 // Delete kills the helper's process group and the process groups of the
