@@ -179,9 +179,11 @@ describe("credentials", () => {
       fetch: server.fetch,
       token: () => Promise.reject(providerError),
     });
-    await expect(
-      client.organizations.getOrganization({ organizationId: ORG }),
-    ).rejects.toMatchObject({ cause: providerError });
+    const error = (await client.organizations
+      .getOrganization({ organizationId: ORG })
+      .catch((error: unknown) => error)) as ConnectError;
+    expect(error.cause).toBeInstanceOf(TideConfigError);
+    expect((error.cause as TideConfigError).cause).toBe(providerError);
     expect(server.calls).toEqual([]);
   });
 
