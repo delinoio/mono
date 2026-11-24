@@ -46,7 +46,11 @@ export default {
           // to the app command. Pass a nondefault API origin explicitly so
           // `e2e/home.e2e.ts` can observe that the build-time variable reaches
           // the client bundle. Keep it equal to `E2E_API_ORIGIN` in that file.
-          env: { PUBLIC_API_ORIGIN: "http://127.0.0.1:28100" },
+          env: {
+            PUBLIC_API_ORIGIN: "http://127.0.0.1:28100",
+            PUBLIC_LOGTO_ENDPOINT: "https://logto.test",
+            PUBLIC_LOGTO_APP_ID: "accounts-e2e",
+          },
           log: ".e2e/logs/app.log",
         },
       },
