@@ -63,13 +63,13 @@ type QueueEvent struct {
 }
 
 // WatchQueue streams the request and runner changes of an organization to
-// handle until ctx ends, handle returns an error, or the server rejects the
-// watch with a status that a reconnect cannot fix (for example
-// unauthenticated, permission_denied, not_found or invalid_argument). After
-// each stream end it reconnects with exponential backoff from 1 second to
-// 30 seconds and reports a QueueEventGap first; the backoff starts again
-// from 1 second after a stream that delivered its snapshot. It returns
-// ctx.Err() when ctx ends and the handler's error unchanged.
+// handle until ctx ends, handle returns an error, or the watch gets a
+// terminal error such as a [CredentialError] or permission_denied. It
+// reconnects after transient errors and normal stream ends. It reports a
+// QueueEventGap before each reconnect and uses exponential backoff from
+// 1 second to 30 seconds. The backoff resets after a stream delivers its
+// snapshot. WatchQueue returns ctx.Err() when ctx ends and the handler's
+// error unchanged.
 func (c *Client) WatchQueue(ctx context.Context, organizationID string, handle func(QueueEvent) error) error {
 	bo := backoff{min: c.timing.backoffMin, max: c.timing.backoffMax}
 	for attempt := 0; ; attempt++ {
