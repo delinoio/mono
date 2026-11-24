@@ -137,10 +137,11 @@ func New(t testing.TB, opts ...Option) *Env {
 }
 
 // NewWithoutPeriodicRevocationSweep starts a control plane whose background
-// worker leaves revocation expiry to RPCs and explicit sweeps.
-func NewWithoutPeriodicRevocationSweep(t testing.TB) *Env {
+// worker leaves revocation expiry to RPCs and explicit sweeps. Deferred
+// enqueues retry only on explicit sweeps.
+func NewWithoutPeriodicRevocationSweep(t testing.TB, opts ...Option) *Env {
 	t.Helper()
-	return newEnv(t, true)
+	return newEnv(t, true, opts...)
 }
 
 type withoutPeriodicRevocationSweep struct{ api.DataPathHooks }
