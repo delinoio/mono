@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 )
 
 // TestMembershipEndWithSessionsAndKeys: removing a member revokes the keys,
@@ -98,6 +100,162 @@ func TestWarmRunnersAndReclaim(t *testing.T) {
 	// Warm runners wait while a request is uncovered: no warm runner comes
 	// back while the pool is full.
 	stays(t, "no warm runner while full", func() bool { return w.fake.Active(w.osOrg) <= 2 })
+}
+
+func TestWarmCreateRejectionDoesNotSpin(t *testing.T) {
+	for _, code := range []connect.Code{connect.CodeInvalidArgument, connect.CodeNotFound, connect.CodePermissionDenied} {
+		t.Run(code.String(), func(t *testing.T) {
+			t.Parallel()
+			w := newWorkWorld(t, devsession.Timing{})
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.CreateError = connect.NewWireError(code, errors.New("rejected"))
+			})
+			profileID := w.createProfile(t, devProfileProto("warm", 1, 0))
+			attempts := func(want int) bool {
+				return w.fake.Calls("CreateSandbox") == want &&
+					profileRunnerCount(t, w, profileID, tidev1.RunnerState_RUNNER_STATE_FAILED) == want
+			}
+
+			cooldown := testenv.FastWorkTiming().PassInterval
+			for want := 1; want <= 3; want++ {
+				eventually(t, "one failed runner for the next attempt", func() bool { return attempts(want) })
+				if want < 3 {
+					w.env.Clock.Advance(cooldown - time.Millisecond)
+					w.l.Engine.Kick(w.org.ID)
+					stays(t, "no retry during the cooldown", func() bool { return attempts(want) })
+					w.env.Clock.Advance(time.Millisecond)
+					w.l.Engine.Kick(w.org.ID)
+					cooldown *= 2
+				}
+			}
+
+			if code == connect.CodeInvalidArgument {
+				// Demand bypasses the stopped warm fill on the same profile.
+				ctx := context.Background()
+				session := w.createSession(t, w.env.User(w.org.Member), profileID)
+				session = w.waitState(t, session.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_FAILED)
+				req, err := w.env.User(w.org.Member).Work.GetRequest(ctx, connect.NewRequest(&tidev1.GetRequestRequest{
+					OrganizationId: w.org.ID, RequestId: session.GetDevSessionId(),
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if session.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED ||
+					req.Msg.GetRequest().GetStartAttempts() != 3 || !attempts(6) {
+					t.Fatalf("session %v, request %v, CreateSandbox calls %d", session, req.Msg.GetRequest(), w.fake.Calls("CreateSandbox"))
+				}
+			}
+
+			before := w.fake.Calls("CreateSandbox")
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateError = nil })
+			w.env.Clock.Advance(time.Hour)
+			w.l.Engine.Kick(w.org.ID)
+			stays(t, "no retries after the hard stop", func() bool { return attempts(before) })
+			if n := strings.Count(w.env.Logs.String(), `"msg":"warm_runner_fill_stopped"`); n != 1 {
+				t.Fatalf("warm fill stop logs = %d, want 1", n)
+			}
+
+			if code == connect.CodePermissionDenied {
+				if _, err := w.setLink(w.org.Admin, w.osOrg, ownsandKey('a')); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				renameWarmProfile(t, w, profileID)
+			}
+			eventually(t, "the warm runner after a configuration change", func() bool {
+				return profileRunnerCount(t, w, profileID, tidev1.RunnerState_RUNNER_STATE_WARM) == 1
+			})
+			if got := w.fake.Calls("CreateSandbox"); got != before+1 {
+				t.Fatalf("CreateSandbox calls = %d after recovery, want %d", got, before+1)
+			}
+		})
+	}
+}
+
+func TestWarmPreparationFailureBacksOffAndReadyRunnerClearsRetry(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+		exitCode := int64(1)
+		return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &exitCode}, nil
+	}, nil)
+	profileID := w.createProfile(t, devProfileProto("warm", 1, 0))
+	eventually(t, "a failed preparation and sandbox deletion", func() bool {
+		return profileRunnerCount(t, w, profileID, tidev1.RunnerState_RUNNER_STATE_FAILED) == 1 && w.fake.Active(w.osOrg) == 0
+	})
+	w.fake.SetExec(nil, nil)
+	w.l.Engine.Kick(w.org.ID)
+	stays(t, "no retry during preparation cooldown", func() bool { return w.fake.Calls("CreateSandbox") == 1 })
+	w.env.Clock.Advance(testenv.FastWorkTiming().PassInterval)
+	eventually(t, "a warm runner after preparation recovers", func() bool {
+		return profileRunnerCount(t, w, profileID, tidev1.RunnerState_RUNNER_STATE_WARM) == 1
+	})
+	var failures int
+	if err := w.env.DB.Pool.QueryRow(context.Background(), "SELECT warm_failures FROM runner_profiles WHERE runner_profile_id = $1", profileID).Scan(&failures); err != nil || failures != 0 {
+		t.Fatalf("warm failures = %d, want 0 (%v)", failures, err)
+	}
+}
+
+func TestWarmInFlightRejectionDoesNotBackOffNewProfileRevision(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	started, release, duplicate := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
+	var first sync.Once
+	w.fake.SetCreateHook(func(ctx context.Context) error {
+		initial := false
+		first.Do(func() { initial = true })
+		if !initial {
+			select {
+			case duplicate <- struct{}{}:
+			default:
+			}
+			return nil
+		}
+		close(started)
+		select {
+		case <-release:
+			return connect.NewWireError(connect.CodeNotFound, errors.New("old profile rejected"))
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	profileID := w.createProfile(t, devProfileProto("warm", 1, 0))
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm create did not start")
+	}
+	renameWarmProfile(t, w, profileID)
+	// Let the reconciler see the open row while the dispatcher still owns it.
+	select {
+	case <-duplicate:
+		t.Fatal("reconciler duplicated the in-flight CreateSandbox call")
+	case <-time.After(3 * testenv.FastWorkTiming().ReconcileInterval):
+	}
+	close(release)
+	eventually(t, "warm runner under the new profile revision without advancing the clock", func() bool {
+		return profileRunnerCount(t, w, profileID, tidev1.RunnerState_RUNNER_STATE_WARM) == 1
+	})
+}
+
+func renameWarmProfile(t *testing.T, w *workWorld, profileID string) {
+	t.Helper()
+	_, err := w.env.User(w.org.Admin).Profile.UpdateRunnerProfile(context.Background(), connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+		OrganizationId:  w.org.ID,
+		RunnerProfileId: profileID,
+		Profile:         &tidev1.RunnerProfile{Name: "warm-updated"},
+		UpdateMask:      &fieldmaskpb.FieldMask{Paths: []string{"name"}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func profileRunnerCount(t *testing.T, w *workWorld, profileID string, state tidev1.RunnerState) int {
+	t.Helper()
+	var n int
+	if err := w.env.DB.Pool.QueryRow(context.Background(), "SELECT count(*) FROM runners WHERE runner_profile_id = $1 AND state = $2", profileID, int16(state)).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func TestWorkService(t *testing.T) {

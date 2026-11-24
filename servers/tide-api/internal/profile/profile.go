@@ -57,6 +57,7 @@ type Profile struct {
 	WarmCount    int32
 	CreateTime   time.Time
 	UpdateTime   time.Time
+	WarmRevision string // Changes with every profile update.
 }
 
 // GitHubLabel is the `runs-on` label of a GITHUB_JOB profile.
@@ -135,7 +136,7 @@ func (ps *Profiles) OnDeletion(h DeletionHook) { ps.hooks = append(ps.hooks, h) 
 
 const profileColumns = `runner_profile_id::text, organization_id::text, name, workload_kind, COALESCE(agent_integration_id::text, ''), workspace_path,
 	guest_os, COALESCE(base_image, 0), COALESCE(ownsand_template_id::text, ''), vcpu_count, memory_mib, disk_gib, network_mode,
-	idle_ttl_ms, max_ttl_ms, priority, max_queue_wait_ms, warm_count, create_time, update_time`
+	idle_ttl_ms, max_ttl_ms, priority, max_queue_wait_ms, warm_count, create_time, update_time, warm_revision::text`
 
 // Scan reads a row of profileColumns.
 func Scan(row pgx.Row) (*Profile, error) {
@@ -144,7 +145,7 @@ func Scan(row pgx.Row) (*Profile, error) {
 	var idle, maxTTL, wait int64
 	if err := row.Scan(&p.ID, &p.OrganizationID, &p.Name, &kind, &p.AgentIntegrationID, &p.WorkspacePath, &guest, &base, &p.TemplateID,
 		&p.Resources.VCPUCount, &p.Resources.MemoryMiB, &p.Resources.DiskGiB, &network, &idle, &maxTTL, &priority, &wait, &p.WarmCount,
-		&p.CreateTime, &p.UpdateTime); err != nil {
+		&p.CreateTime, &p.UpdateTime, &p.WarmRevision); err != nil {
 		return nil, err
 	}
 	p.Kind, p.GuestOS, p.BaseImage = tidev1.WorkloadKind(kind), tidev1.GuestOs(guest), tidev1.GuestOs(base)
@@ -544,7 +545,9 @@ func (ps *Profiles) applyUpdate(ctx context.Context, c api.Caller, id string, in
 		}
 		_, err = tx.Exec(ctx, `UPDATE runner_profiles SET name = $3, workspace_path = $4, guest_os = $5, base_image = $6, ownsand_template_id = $7,
 			vcpu_count = $8, memory_mib = $9, disk_gib = $10, network_mode = $11, idle_ttl_ms = $12, max_ttl_ms = $13, priority = $14,
-			max_queue_wait_ms = $15, warm_count = $16, update_time = $17 WHERE organization_id = $1 AND runner_profile_id = $2`,
+			max_queue_wait_ms = $15, warm_count = $16, update_time = $17, warm_revision = gen_random_uuid(),
+			warm_retry_link_revision = NULL, warm_failures = 0, warm_create_rejections = 0, warm_retry_after = NULL
+			WHERE organization_id = $1 AND runner_profile_id = $2`,
 			c.OrganizationID, id, p.Name, p.WorkspacePath, int16(p.GuestOS), nullable(int16(p.BaseImage)), nullable(p.TemplateID),
 			p.Resources.VCPUCount, p.Resources.MemoryMiB, p.Resources.DiskGiB, int16(p.NetworkMode), p.IdleTTL.Milliseconds(), p.MaxTTL.Milliseconds(),
 			int16(p.Priority), p.MaxQueueWait.Milliseconds(), p.WarmCount, p.UpdateTime)
