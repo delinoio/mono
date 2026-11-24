@@ -187,31 +187,34 @@ func (d *devSessionService) GetDevSession(_ context.Context, req *connect.Reques
 
 func (d *devSessionService) ListDevSessions(_ context.Context, req *connect.Request[tidev1.ListDevSessionsRequest]) (*connect.Response[tidev1.ListDevSessionsResponse], error) {
 	s := d.s
+	m := req.Msg
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.requireOrg(req.Msg.GetOrganizationId()); err != nil {
+	if _, err := s.requireOrg(m.GetOrganizationId()); err != nil {
 		return nil, err
 	}
+	profileID, err := normalizeListProfileID(m.GetRunnerProfileId())
+	if err != nil {
+		return nil, err
+	}
+	states := listStates(m.GetStates(), openRequestStates, m.GetIncludeEnded())
 	var mine []*tidev1.DevSession
 	for _, x := range s.sessions {
-		if x.GetOrganizationId() != req.Msg.GetOrganizationId() {
+		if x.GetOrganizationId() != m.GetOrganizationId() || (profileID != "" && x.GetRunnerProfileId() != profileID) {
 			continue
 		}
-		if !req.Msg.GetIncludeEnded() && terminalRequest(x.GetState()) {
+		if m.GetOwnedByCaller() && x.GetOwnerUserId() != s.UserID {
 			continue
 		}
-		if req.Msg.GetOwnedByCaller() && x.GetOwnerUserId() != s.UserID {
+		if o := m.GetOwnerUserId(); o != "" && x.GetOwnerUserId() != o {
 			continue
 		}
-		if o := req.Msg.GetOwnerUserId(); o != "" && x.GetOwnerUserId() != o {
-			continue
-		}
-		if len(req.Msg.GetStates()) > 0 && !slices.Contains(req.Msg.GetStates(), x.GetState()) {
+		if len(states) > 0 && !slices.Contains(states, x.GetState()) {
 			continue
 		}
 		mine = append(mine, x)
 	}
-	items, next, err := page(mine, req.Msg.GetPageSize(), req.Msg.GetPageToken())
+	items, next, err := page(mine, m.GetPageSize(), m.GetPageToken())
 	if err != nil {
 		return nil, err
 	}
