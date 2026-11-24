@@ -2405,7 +2405,7 @@ func TestMacOSSnapshotHardwareModels(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(dir, contentDir), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		entry, err := e.m.AddImportedSnapshot(&ownsandv1.SnapshotStateEntry{
+		entry, err := e.m.AddImportedSnapshot(context.Background(), &ownsandv1.SnapshotStateEntry{
 			SnapshotId: id, GuestOs: guest, Resources: &ownsandv1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 64},
 			MacosHardwareModel: []byte(model),
 		})
