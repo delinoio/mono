@@ -298,32 +298,9 @@ func (d *devSessionService) ReadDevSessionFile(ctx context.Context, req *connect
 	if req.Msg.GetReadId() == "" {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("read_id is required"))
 	}
-	// Like the OwnSand guest helper, the first call of a read_id takes a
-	// private snapshot of the file, and every later call of that read_id
-	// reads the snapshot.
-	g := d.s.guest
-	g.mu.Lock()
-	g.reads = append(g.reads, proto.CloneOf(req.Msg))
-	data, ok := g.snapshots[req.Msg.GetReadId()]
-	g.mu.Unlock()
-	if !ok {
-		p := guestPath(ds, req.Msg.GetPath())
-		info, err := os.Stat(p)
-		if errors.Is(err, fs.ErrNotExist) {
-			return notFound("file")
-		}
-		if err != nil {
-			return connect.NewError(connect.CodeFailedPrecondition, err)
-		}
-		if info.IsDir() {
-			return connect.NewError(connect.CodeFailedPrecondition, errors.New("not a regular file"))
-		}
-		if data, err = os.ReadFile(p); err != nil {
-			return connect.NewError(connect.CodeFailedPrecondition, err)
-		}
-		g.mu.Lock()
-		g.snapshots[req.Msg.GetReadId()] = data
-		g.mu.Unlock()
+	data, err := d.s.guest.readSnapshot(ds, req.Msg)
+	if err != nil {
+		return err
 	}
 	off := req.Msg.GetOffset()
 	if off < 0 || off > int64(len(data)) {
@@ -347,6 +324,54 @@ func (d *devSessionService) ReadDevSessionFile(ctx context.Context, req *connect
 		}
 	}
 	return stream.Send(&tidev1.ReadDevSessionFileResponse{Event: &tidev1.ReadDevSessionFileResponse_End{End: &tidev1.DevSessionFileEnd{SizeBytes: off}}})
+}
+
+func (g *guest) readSnapshot(ds *tidev1.DevSession, req *tidev1.ReadDevSessionFileRequest) ([]byte, error) {
+	id, path := req.GetReadId(), guestPath(ds, req.GetPath())
+	orgID, sessionID := ds.GetOrganizationId(), ds.GetDevSessionId()
+	g.mu.Lock()
+	g.reads = append(g.reads, proto.CloneOf(req))
+	snapshot, ok := g.snapshots[id]
+	g.mu.Unlock()
+	if !ok {
+		data, err := readSnapshotFile(path)
+
+		// Another request may have bound this ID during the file read.
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		snapshot, ok = g.snapshots[id]
+		if !ok {
+			if err == nil {
+				g.snapshots[id] = readSnapshot{organizationID: orgID, devSessionID: sessionID, path: path, data: data}
+			}
+			return data, err
+		}
+	}
+	if snapshot.organizationID != orgID || snapshot.devSessionID != sessionID {
+		return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("read_id is already bound to another dev session"))
+	}
+	if snapshot.path != path {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("read_id is already bound to a different path"))
+	}
+	return snapshot.data, nil
+}
+
+func readSnapshotFile(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, notFound("file")
+	}
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
+	}
+	if info.IsDir() {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("not a regular file"))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
+	}
+	return data, nil
 }
 
 func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.Request[tidev1.WriteDevSessionFileRequest]) (*connect.Response[tidev1.WriteDevSessionFileResponse], error) {
@@ -428,6 +453,13 @@ type pendingWrite struct {
 	done bool
 }
 
+type readSnapshot struct {
+	organizationID string
+	devSessionID   string
+	path           string
+	data           []byte
+}
+
 type guest struct {
 	s        *Server
 	ctx      context.Context
@@ -437,16 +469,15 @@ type guest struct {
 	execs    map[string]*proc
 	writes   map[writeKey]*pendingWrite
 	requests []*tidev1.ExecDevSessionRequest
-	// snapshots holds the file snapshot of each read_id, reads the read
-	// requests in order.
-	snapshots map[string][]byte
+	// snapshots holds the first snapshot bound to each read_id.
+	snapshots map[string]readSnapshot
 	reads     []*tidev1.ReadDevSessionFileRequest
 	wg        sync.WaitGroup
 }
 
 func newGuest(s *Server) *guest {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &guest{s: s, ctx: ctx, cancel: cancel, execs: map[string]*proc{}, writes: map[writeKey]*pendingWrite{}, snapshots: map[string][]byte{}}
+	return &guest{s: s, ctx: ctx, cancel: cancel, execs: map[string]*proc{}, writes: map[writeKey]*pendingWrite{}, snapshots: map[string]readSnapshot{}}
 }
 
 func (g *guest) close() {
