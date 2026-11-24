@@ -510,3 +510,32 @@ describe.each([
     LONG_LIST_TEST_TIMEOUT_MS,
   );
 });
+
+describe("device inventory", () => {
+  test(
+    "keeps exactly 200 unique rows when the final page is empty",
+    async () => {
+      const { transport, state } = pagedTransport(
+        "ListDevices",
+        createMockTransport({ extraDevices: 198 }),
+      );
+      renderConsole(`/orgs/${MOCK_IDS.acme}/devices`, { transport });
+      const table = await screen.findByRole("table", {}, WAIT);
+      await waitFor(() => {
+        expect(within(table).getAllByRole("link")).toHaveLength(200);
+        expect(state.tokens).toHaveLength(2);
+        expect(screen.queryByText("Loading more devices")).toBeNull();
+      }, WAIT);
+      expect(
+        new Set(
+          within(table)
+            .getAllByRole("link")
+            .map((link) => link.getAttribute("href")),
+        ).size,
+      ).toBe(200);
+      expect(state.tokens[0]).toBe("");
+      expect(state.tokens[1]).not.toBe("");
+    },
+    LONG_LIST_TEST_TIMEOUT_MS,
+  );
+});

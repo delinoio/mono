@@ -577,6 +577,8 @@ export interface MockTransportOptions {
    * row.
    */
   extraApiKeys?: number;
+  /** Online Linux devices to add after the two seeded Acme devices. */
+  extraDevices?: number;
   /**
    * How many running sandboxes, labelled `extra=<index>`, to add to the Acme
    * organization after the seeded ones, on the seeded `build-box` device with
@@ -835,6 +837,20 @@ export function createMockTransport(
       extra.sandboxId = newMockId();
       extra.labels = { extra: String(i) };
       acmeOrg.sandboxes.push(extra);
+    }
+    const buildBox = acmeOrg.devices.find(
+      (d) => d.deviceId === MOCK_IDS.buildBox,
+    );
+    for (
+      let i = 0;
+      buildBox !== undefined && i < (options.extraDevices ?? 0);
+      i++
+    ) {
+      const device = clone(DeviceSchema, buildBox);
+      device.deviceId = newMockId();
+      device.name = `Device ${String(i + 3).padStart(3, "0")}`;
+      device.allocation = undefined;
+      acmeOrg.devices.push(device);
     }
     for (let i = 0; i < (options.extraApiKeys ?? 0); i++) {
       acmeOrg.apiKeys.push(
@@ -1339,13 +1355,13 @@ export function createMockTransport(
             Code.InvalidArgument,
           );
         }
-        return {
-          devices: org.devices.filter((d) =>
-            req.state === undefined
-              ? d.state !== DeviceState.REMOVED
-              : d.state === req.state,
-          ),
-        };
+        const devices = org.devices.filter((d) =>
+          req.state === undefined
+            ? d.state !== DeviceState.REMOVED
+            : d.state === req.state,
+        );
+        const { page, nextPageToken } = pageOf(devices, req, (d) => d.deviceId);
+        return { devices: page, nextPageToken };
       },
       getDevice(req) {
         const { org } = membership(req.organizationId);
