@@ -214,7 +214,7 @@ type userResponse struct {
 	Name         *string `json:"name"`
 }
 
-// User implements Directory. A rejected token is renewed once.
+// User implements Directory. It evicts rejected tokens and retries once.
 func (l *Logto) User(ctx context.Context, userID string) (User, error) {
 	if userID == "" {
 		return User{}, ErrUserNotFound
@@ -225,9 +225,11 @@ func (l *Logto) User(ctx context.Context, userID string) (User, error) {
 			return User{}, err
 		}
 		user, status, err := l.getUser(ctx, token, userID)
-		if status == http.StatusUnauthorized && attempt == 0 {
+		if status == http.StatusUnauthorized {
 			l.invalidate(token)
-			continue
+			if attempt == 0 {
+				continue
+			}
 		}
 		return user, err
 	}

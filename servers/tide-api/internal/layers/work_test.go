@@ -669,11 +669,13 @@ func TestStartFailureCleanupRetry(t *testing.T) {
 		t.Fatalf("session %v with %d active sandboxes", s, w.fake.Active(w.osOrg))
 	}
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
-	eventually(t, "the failed starts' sandboxes deleted", func() bool { return w.fake.Active(w.osOrg) == 0 })
-	var pending int
-	if err := w.env.DB.Pool.QueryRow(context.Background(), "SELECT count(*) FROM runners WHERE organization_id = $1 AND sandbox_cleanup", w.org.ID).Scan(&pending); err != nil || pending != 0 {
-		t.Fatalf("%d runners still marked (%v)", pending, err)
-	}
+	eventually(t, "the failed starts' sandboxes deleted and cleanup marks cleared", func() bool {
+		var pending int
+		if err := w.env.DB.Pool.QueryRow(context.Background(), "SELECT count(*) FROM runners WHERE organization_id = $1 AND sandbox_cleanup", w.org.ID).Scan(&pending); err != nil {
+			t.Fatal(err)
+		}
+		return pending == 0 && w.fake.Active(w.osOrg) == 0
+	})
 }
 
 // TestStalledCreateSandbox: a CreateSandbox call that OwnSand never
