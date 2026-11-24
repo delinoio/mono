@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -94,6 +95,26 @@ func TestFromEnv(t *testing.T) {
 	cfg, _ = FromEnv(env(map[string]string{EnvReleaseManifestURL: " https://example.test/manifest.json "}))
 	if cfg.ReleaseManifestURL != "https://example.test/manifest.json" {
 		t.Fatalf("manifest URL override %q", cfg.ReleaseManifestURL)
+	}
+}
+
+func TestRedactedErrorNamesInvalidSettings(t *testing.T) {
+	const raw = "private-fixture-value"
+	for setting, reason := range map[string]string{
+		EnvRuntime:           "expected firecracker, virtualization, hyperv or process",
+		EnvLogLevel:          "expected debug, info, warn or error",
+		EnvReleasePublicKeys: "expected a comma-separated list of base64 Ed25519 public keys",
+	} {
+		_, err := FromEnv(env(map[string]string{setting: raw}))
+		if err == nil {
+			t.Fatalf("%s accepted an invalid value", setting)
+		}
+		if got, want := RedactedError(err), "invalid "+setting+": "+reason; got != want {
+			t.Errorf("RedactedError = %q, want %q", got, want)
+		}
+	}
+	if got := RedactedError(fmt.Errorf("unexpected error: %s", raw)); strings.Contains(got, raw) {
+		t.Errorf("RedactedError exposed an unexpected error: %q", got)
 	}
 }
 
