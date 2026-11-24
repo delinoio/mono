@@ -128,18 +128,20 @@ function credentialInterceptor(options: ConnectionOptions): Interceptor {
     }
     req.signal.throwIfAborted();
     const secret = await currentToken(options.token, req.signal);
+    const token = secret.trim();
     try {
-      req.header.set("Authorization", `Bearer ${secret}`);
+      req.header.set("Authorization", `Bearer ${token}`);
     } catch {
       // The TypeError of Headers.set contains the whole header value, so it
       // is not kept as the cause.
       throw new TideConfigError("the token is not a valid header value");
     }
+    const secrets = [secret, token];
     let res;
     try {
       res = await next(req);
     } catch (error) {
-      throw redactError(error, [secret]);
+      throw redactError(error, secrets);
     }
     if (!res.stream) {
       return res;
@@ -151,7 +153,7 @@ function credentialInterceptor(options: ConnectionOptions): Interceptor {
         try {
           yield* inner;
         } catch (error) {
-          throw redactError(error, [secret]);
+          throw redactError(error, secrets);
         }
       })(),
     };
