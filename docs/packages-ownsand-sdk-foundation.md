@@ -134,7 +134,7 @@ The SDKs log nothing by default. An optional logger receives RPC names, sandbox 
 
 ## Dependencies and Integrations
 
-- Upstream: the [control plane](servers-ownsand-api-foundation.md) (API, relay and STUN) and the [protos contract](protos-ownsand-api-contract.md).
+- Upstream: the [control plane](servers-ownsand-api-foundation.md) (API, relay and [STUN](servers-ownsand-api-foundation.md#stun)) and the [protos contract](protos-ownsand-api-contract.md).
 - Peers: the [device agent](cmds-ownsand-agent-foundation.md#data-path).
 - Downstream: the [CLI](cmds-ownsand-cli-foundation.md) uses the Go SDK.
 - Publication: the workspace package is named `ownsand-sdk` and is `private`, so neither pnpm nor Changesets publishes it. Its binding dependency `@delino/ownsand-protos` is also `private`, so a publication of the SDK also needs a publication of that package. The npm package name and publication workflow of the TypeScript SDK stay an [open decision](project-ownsand.md#open-decisions); the repository publishes no packages to a registry today. The Go SDK needs no publication, because it is part of the root Go module.
