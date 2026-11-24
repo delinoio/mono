@@ -174,6 +174,7 @@ test("every shared fixture input selects tests", async (t) => {
     "lefthook.yml",
     "scripts/install-git-hooks.sh",
     "scripts/droplet/start-caddy.sh",
+    "scripts/droplet/configure-docker-logs.sh",
     "scripts/protos.sh",
     "skills-lock.json",
     ".agents/skills/postgres/SKILL.md",
@@ -194,6 +195,28 @@ test("every shared fixture input selects tests", async (t) => {
       const result = plan(f.cwd, f.base, f.commit());
       assert.equal(result.quality, true);
       assert.equal(result.fixtures, true);
+    });
+  }
+});
+
+test("only the shared fixture input selects Droplet validation", async (t) => {
+  for (const [path, selected] of [
+    ["scripts/droplet/configure-docker-logs.sh", true],
+    ["scripts/droplet/provision.sh", false],
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      assert.deepEqual(plan(f.cwd, f.base, f.commit()), {
+        quality: selected,
+        format: false,
+        fixtures: selected,
+        go: false,
+        rust: false,
+        e2e: false,
+        workspace: false,
+        workflows: false,
+      });
     });
   }
 });
