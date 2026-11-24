@@ -232,7 +232,7 @@ func (e *Engine) expire(ctx context.Context, orgID string) error {
 	for _, id := range ids {
 		var ended *Request
 		err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
-			r, err := e.lockRequest(ctx, tx, id)
+			r, err := e.LockRequest(ctx, tx, id)
 			if err != nil {
 				return err
 			}
@@ -503,7 +503,7 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 			// The request stays QUEUED until OwnSand created the sandbox, so
 			// a request that finds no capacity does not change state; the
 			// bound runner keeps the next pass from dispatching it again.
-			cur, err := e.lockRequest(ctx, tx, req.ID)
+			cur, err := e.LockRequest(ctx, tx, req.ID)
 			if err != nil {
 				return err
 			}
@@ -668,7 +668,7 @@ func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool, dispa
 		if requestID == "" {
 			return nil
 		}
-		req, err := e.lockRequest(ctx, tx, requestID)
+		req, err := e.LockRequest(ctx, tx, requestID)
 		if err != nil || req.State != reqQueued {
 			return err
 		}
@@ -691,7 +691,7 @@ func (e *Engine) bindStartTx(ctx context.Context, tx pgx.Tx, r *Runner, requestI
 	if requestID == "" {
 		return nil, nil
 	}
-	req, err := e.lockRequest(ctx, tx, requestID)
+	req, err := e.LockRequest(ctx, tx, requestID)
 	if err != nil || req.State != reqQueued {
 		return nil, err
 	}
@@ -713,7 +713,7 @@ func (e *Engine) bindStartTx(ctx context.Context, tx pgx.Tx, r *Runner, requestI
 // requeueTx returns a STARTING request to QUEUED with its original queue
 // time after a start failure.
 func (e *Engine) requeueTx(ctx context.Context, tx pgx.Tx, requestID string) error {
-	req, err := e.lockRequest(ctx, tx, requestID)
+	req, err := e.LockRequest(ctx, tx, requestID)
 	if err != nil || req.State != reqStarting {
 		return err
 	}

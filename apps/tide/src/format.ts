@@ -113,6 +113,17 @@ export const TERMINAL_RUNNER_STATES: ReadonlySet<RunnerState> = new Set([
   RunnerState.FAILED,
 ]);
 
+/** Compares timestamps at nanosecond precision, treating a missing time as the epoch. */
+export function compareTimestamps(
+  a: Timestamp | undefined,
+  b: Timestamp | undefined,
+): number {
+  return (
+    Number((a?.seconds ?? 0n) - (b?.seconds ?? 0n)) ||
+    (a?.nanos ?? 0) - (b?.nanos ?? 0)
+  );
+}
+
 export function timestampMs(ts: Timestamp | undefined): number | undefined {
   if (ts === undefined) return undefined;
   return Number(ts.seconds) * 1000 + Math.floor(ts.nanos / 1e6);

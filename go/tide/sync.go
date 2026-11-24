@@ -37,8 +37,8 @@ const (
 	lockSuffix     = ".tide-sync.lock"
 )
 
-// manifestReadLimit bounds the manifest that sync reads.
-const manifestReadLimit int64 = 256 << 20
+// syncManifestLimit bounds the encoded manifest that sync reads and writes.
+const syncManifestLimit int64 = 256 << 20
 
 // cleanupTimeout bounds the guest clean-up after a failed sync or download.
 const cleanupTimeout = 30 * time.Second
@@ -81,13 +81,14 @@ type SyncResult struct {
 //     in LocalDir; submodules and nested repositories are skipped.
 //  2. The guest manifest <workspace_path>.tide-sync.json lists the synced
 //     paths with size, SHA-256 and mode; a missing or unreadable manifest
-//     counts as empty.
+//     counts as empty unless it exceeds the manifest size limit.
 //  3. New and changed files are uploaded. Manifest paths that are no longer
 //     listed are deleted. Guest files that are not in the manifest stay.
 //     With an older manifest that lacks UTF-8 validation, sync leaves an
 //     absent path with U+FFFD on the guest and drops its entry with a warning.
 //  4. A changed file above 100 MiB or changed files above 2 GiB in total
-//     fail the sync before any upload (*LimitError).
+//     fail the sync before any upload (*LimitError). A guest or candidate
+//     manifest above 256 MiB fails with failed_precondition.
 //  5. Paths that are not valid UTF-8 (all guests), paths that differ only
 //     in case (Windows and macOS guests), and paths that are not valid on
 //     Windows (Windows guests) fail before the lock and any upload
@@ -104,6 +105,10 @@ type SyncResult struct {
 // empty. A sync that stops before the new manifest is written leaves the
 // old manifest, so the next sync sends the same files again.
 func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
+	return c.sync(ctx, p, syncManifestLimit)
+}
+
+func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*SyncResult, error) {
 	report := func(tp TransferProgress) {
 		if p.Progress != nil {
 			p.Progress(tp)
@@ -136,7 +141,7 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 		return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleInvalidUTF8, Paths: invalidUTF8})
 	}
 
-	old, err := c.readManifest(ctx, s)
+	old, err := c.readManifest(ctx, s, manifestLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -165,6 +170,20 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	if plan.empty() {
 		report(TransferProgress{Phase: TransferDone})
 		return plan.res, nil
+	}
+
+	// Check the encoded manifest before taking the lock or uploading anything.
+	// Apply can only make it smaller by leaving out failed Windows links.
+	next := manifest{Version: manifestVersion, Files: make(map[string]manifestEntry, len(local.files)), PathsValidated: true}
+	for _, f := range local.files {
+		next.Files[f.rel] = f.entry
+	}
+	body, err := json.Marshal(next)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > manifestLimit {
+		return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sync candidate manifest exceeds the size limit of %d bytes (encoded size %d bytes)", manifestLimit, len(body)))
 	}
 
 	// Step 6: the lock.
@@ -202,7 +221,7 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	// its lock before this sync takes it. The plan is therefore made again
 	// from the manifest that the lock now protects when that manifest
 	// differs from the first one.
-	if cur, err := c.readManifest(ctx, s); err != nil {
+	if cur, err := c.readManifest(ctx, s, manifestLimit); err != nil {
 		return nil, err
 	} else if cur.PathsValidated != old.PathsValidated || !maps.Equal(cur.Files, old.Files) {
 		c.logger.DebugContext(ctx, "tide sync manifest changed before the lock", "dev_session_id", s.GetDevSessionId())
@@ -260,8 +279,10 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	var replacedFiles []string
 	if !windows {
 		applyEnv[guestEnvReplaceFiles] = ""
+		applyEnv[guestEnvAliasPrunes] = ""
 		strictDeletes, replacedFiles = splitSyncDeletions(deleted, changed)
 	}
+	prunes, aliasPrunes := pruneDirs(deleted, changed, osys == tidev1.GuestOs_GUEST_OS_MACOS)
 	for _, list := range []struct {
 		suffix string
 		env    string
@@ -269,7 +290,8 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	}{
 		{".delete", guestEnvDeletes, strictDeletes},
 		{".replace", guestEnvReplaceFiles, replacedFiles},
-		{".prune", guestEnvPrunes, pruneDirs(deleted, changed)},
+		{".prune", guestEnvPrunes, prunes},
+		{".prune-alias", guestEnvAliasPrunes, aliasPrunes},
 	} {
 		if len(list.paths) == 0 {
 			continue
@@ -319,17 +341,15 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 		}
 	}
 
-	next := manifest{Version: manifestVersion, Files: map[string]manifestEntry{}, PathsValidated: true}
-	for _, f := range local.files {
-		if failedLinks[f.rel] {
-			// Left out, so the next sync tries the link again.
-			continue
+	if len(failedLinks) > 0 {
+		// Leave out failed links so the next sync tries them again.
+		for rel := range failedLinks {
+			delete(next.Files, rel)
 		}
-		next.Files[f.rel] = f.entry
-	}
-	body, err := json.Marshal(next)
-	if err != nil {
-		return nil, err
+		body, err = json.Marshal(next)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if _, err := c.writeGuestFile(ctx, s, guestSibling(s, manifestSuffix), 0o644, bytes.NewReader(body), nil); err != nil {
 		return nil, err
@@ -350,15 +370,18 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 }
 
 // readManifest reads the guest manifest. A missing or unreadable manifest
-// counts as empty; only a cancelled caller and errors that also stop every
-// later step of the sync (credential, permission and session state errors)
-// end the sync.
-func (c *Client) readManifest(ctx context.Context, s *tidev1.DevSession) (manifest, error) {
+// counts as empty. An oversized manifest, cancellation, and credential,
+// permission or session state errors end the sync.
+func (c *Client) readManifest(ctx context.Context, s *tidev1.DevSession, manifestLimit int64) (manifest, error) {
 	var b bytes.Buffer
-	_, err := c.readGuestFile(ctx, s, guestSibling(s, manifestSuffix), manifestReadLimit, &b, nil)
+	_, err := c.readGuestFile(ctx, s, guestSibling(s, manifestSuffix), manifestLimit, &b, nil)
 	if err != nil {
 		if ctx.Err() != nil {
 			return manifest{}, ctx.Err()
+		}
+		var limitError *LimitError
+		if errors.As(err, &limitError) {
+			return manifest{}, localError(connect.CodeFailedPrecondition, fmt.Errorf("sync guest manifest exceeds the size limit of %d bytes", manifestLimit))
 		}
 		switch connect.CodeOf(err) {
 		case connect.CodeUnauthenticated, connect.CodePermissionDenied, connect.CodeFailedPrecondition:
@@ -515,27 +538,38 @@ func splitSyncDeletions(deleted []string, changed []localFile) (strict, replaced
 	return strict, replacedFiles
 }
 
-// pruneDirs returns the guest directories that the apply command removes
-// after the deletions and before the extraction. The deletions remove only
-// files, so a deleted entry a/b/old leaves the directories a/b and a, and
-// the guest tar cannot then extract a new file or link at a. For each
-// deleted path below the path of a changed file or link, the result holds
-// the directories from the parent of the deleted path up to that path.
-// The guest removes only empty directories, so files that the guest created
-// there stay and make the apply fail. Deeper directories come first.
-func pruneDirs(deleted []string, changed []localFile) []string {
-	incoming := map[string]bool{}
-	for _, f := range changed {
-		incoming[f.rel] = true
+// pruneDirs lists the directories to remove after the deletions and before
+// extraction, deeper directories first. An alias candidate adds three paths
+// to the alias list: the old ancestor, the incoming spelling, and the
+// directory to remove. The guest checks that both spellings name the same
+// directory before it prunes an alias candidate.
+func pruneDirs(deleted []string, changed []localFile, matchAliases bool) (exact, aliases []string) {
+	if len(deleted) == 0 || len(changed) == 0 {
+		return nil, nil
 	}
-	dirs := map[string]bool{}
+	key := func(p string) string {
+		if matchAliases {
+			return foldCase(p)
+		}
+		return p
+	}
+	incoming := map[string]string{}
+	for _, f := range changed {
+		incoming[key(f.rel)] = f.rel
+	}
+	type alias struct{ old, incoming string }
+	dirs := map[string]alias{}
 	for _, d := range deleted {
 		var chain []string
 		for dir := path.Dir(d); dir != "."; dir = path.Dir(dir) {
 			chain = append(chain, dir)
-			if incoming[dir] {
+			if replacement, ok := incoming[key(dir)]; ok {
+				var names alias
+				if replacement != dir {
+					names = alias{old: dir, incoming: replacement}
+				}
 				for _, c := range chain {
-					dirs[c] = true
+					dirs[c] = names
 				}
 				break
 			}
@@ -552,7 +586,14 @@ func pruneDirs(deleted []string, changed []localFile) []string {
 		}
 		return out[i] < out[j]
 	})
-	return out
+	for _, d := range out {
+		if names := dirs[d]; names.old != "" {
+			aliases = append(aliases, names.old, names.incoming, d)
+		} else {
+			exact = append(exact, d)
+		}
+	}
+	return exact, aliases
 }
 
 // largest returns the n largest regular files of files.

@@ -26,19 +26,20 @@ type Fake struct {
 	OutpostID   string
 	OutpostName string
 
-	mu            sync.Mutex
-	entries       map[string]*entry
-	order         []string
-	streams       map[int]chan string
-	nextID        int
-	lists         int
-	failWatch     int
-	queuePages    map[string]map[string]any
-	claimAttempts []string
-	watchCursors  []string
-	claims        map[string]int
-	releases      map[string]int
-	messages      map[string][]string
+	mu              sync.Mutex
+	entries         map[string]*entry
+	order           []string
+	streams         map[int]chan string
+	nextID          int
+	lists           int
+	failWatch       int
+	queuePages      map[string]map[string]any
+	claimAttempts   []string
+	watchCursors    []string
+	claims          map[string]int
+	releaseAttempts map[string]int
+	releases        map[string]int
+	messages        map[string][]string
 }
 
 type entry struct {
@@ -61,7 +62,7 @@ func (e *entry) object(outpost string) map[string]any {
 // New starts a fake with one outpost and one API token.
 func New(t testing.TB, token, outpostName string) *Fake {
 	f := &Fake{Token: token, OutpostID: "outpost_env-0001", OutpostName: outpostName, entries: map[string]*entry{}, streams: map[int]chan string{},
-		claims: map[string]int{}, releases: map[string]int{}, messages: map[string][]string{}}
+		claims: map[string]int{}, releaseAttempts: map[string]int{}, releases: map[string]int{}, messages: map[string][]string{}}
 	f.Server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(func() {
 		f.EndStreams()
@@ -136,6 +137,9 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		sid, action, _ := strings.Cut(rest, "/")
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if r.Method == http.MethodPost && action == "release" {
+			f.releaseAttempts[sid]++
+		}
 		e, ok := f.entries[sid]
 		if !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
@@ -291,6 +295,15 @@ func (f *Fake) Forget(sid string) {
 	delete(f.entries, sid)
 }
 
+// DeleteSession removes a session and sends a DELETED event. A repeated
+// call delivers the deletion again.
+func (f *Fake) DeleteSession(sid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.entries, sid)
+	f.broadcastLocked("DELETED", &entry{SessionID: sid})
+}
+
 // ClaimElsewhere lets another acceptor take a pending session.
 func (f *Fake) ClaimElsewhere(sid string) {
 	f.mu.Lock()
@@ -398,6 +411,13 @@ func (f *Fake) Claims(sid string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.claims[sid]
+}
+
+// ReleaseAttempts returns the number of release calls, including rejected calls.
+func (f *Fake) ReleaseAttempts(sid string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.releaseAttempts[sid]
 }
 
 // Releases returns how often a session's claim was released.

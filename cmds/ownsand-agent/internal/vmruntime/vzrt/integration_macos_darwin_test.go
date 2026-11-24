@@ -158,8 +158,8 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 		t.Fatalf("sandbox %v", sb)
 	}
 	out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "sw_vers -productName; uname -sm; id -u; echo state > /var/root/marker")
-	if ex.GetExitCode() != 0 || !strings.Contains(out, "macOS\nDarwin arm64\n0\n") {
-		t.Fatalf("exec output %q exited %v", out, ex)
+	if !execSucceeded(ex) || !strings.Contains(out, "macOS\nDarwin arm64\n0\n") {
+		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	// The guest helper grows the APFS container to the 72 GiB disk after
 	// the boot; the container size is in bytes.
@@ -227,11 +227,20 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 	if out, _ := e.exec(restored.GetSandboxId(), "/bin/cat", "/var/root/marker"); out != "state\n" {
 		t.Fatalf("restored sandbox %q", out)
 	}
-	ids := []string{restored.GetSandboxId()}
-
-	for _, id := range ids {
-		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
-			t.Fatalf("delete %v %v", en, err)
+	if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: restored.GetSandboxId()}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("delete restored sandbox %v %v", en, err)
+	}
+	if snap.GetHasMemoryState() {
+		e.invalidateMemoryState(snapID)
+		fallback := e.mustCreateMacOS(snapID, ownsandv1.NetworkMode_NETWORK_MODE_NONE, true)
+		if fallback.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
+			t.Fatalf("restore path after invalid memory state %v", fallback.GetRestorePath())
+		}
+		if out, ex := e.exec(fallback.GetSandboxId(), "/bin/cat", "/var/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
+			t.Fatalf("sandbox after invalid memory state %q %v", out, ex)
+		}
+		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: fallback.GetSandboxId()}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			t.Fatalf("delete fallback sandbox %v %v", en, err)
 		}
 	}
 	if ids, _ := r.Running(context.Background()); len(ids) != 0 {

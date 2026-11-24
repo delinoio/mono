@@ -361,13 +361,21 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 	if m.GetOffset() < 0 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid offset: must not be negative"))
 	}
+	key := writeKey{
+		organizationID: ds.GetOrganizationId(),
+		devSessionID:   ds.GetDevSessionId(),
+		writeID:        m.GetWriteId(),
+	}
+	path := guestPath(ds, m.GetPath())
 	g := d.s.guest
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	w := g.writes[m.GetWriteId()]
+	w := g.writes[key]
 	if w == nil {
-		w = &pendingWrite{path: guestPath(ds, m.GetPath())}
-		g.writes[m.GetWriteId()] = w
+		w = &pendingWrite{path: path}
+		g.writes[key] = w
+	} else if w.path != path {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("every chunk of a write_id must name the same path"))
 	}
 	if w.done {
 		return connect.NewResponse(&tidev1.WriteDevSessionFileResponse{WriteId: m.GetWriteId(), Offset: m.GetOffset(), Length: int64(len(m.GetData())), Finished: true, SizeBytes: int64(len(w.data))}), nil
@@ -408,6 +416,12 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 
 // The fake guest.
 
+type writeKey struct {
+	organizationID string
+	devSessionID   string
+	writeID        string
+}
+
 type pendingWrite struct {
 	path string
 	data []byte
@@ -421,7 +435,7 @@ type guest struct {
 	mu       sync.Mutex
 	closed   bool
 	execs    map[string]*proc
-	writes   map[string]*pendingWrite
+	writes   map[writeKey]*pendingWrite
 	requests []*tidev1.ExecDevSessionRequest
 	// snapshots holds the file snapshot of each read_id, reads the read
 	// requests in order.
@@ -432,7 +446,7 @@ type guest struct {
 
 func newGuest(s *Server) *guest {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &guest{s: s, ctx: ctx, cancel: cancel, execs: map[string]*proc{}, writes: map[string]*pendingWrite{}, snapshots: map[string][]byte{}}
+	return &guest{s: s, ctx: ctx, cancel: cancel, execs: map[string]*proc{}, writes: map[writeKey]*pendingWrite{}, snapshots: map[string][]byte{}}
 }
 
 func (g *guest) close() {
@@ -520,7 +534,7 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 	if t := req.GetTimeout(); t != nil {
 		ctx, cancel = context.WithTimeout(ctx, t.AsDuration())
 	}
-	cmd := exec.CommandContext(ctx, req.GetCommand()[0], req.GetCommand()[1:]...)
+	cmd := newExecCommand(ctx, req.GetCommand())
 	cmd.Dir = dir
 	cmd.Env = os.Environ()
 	for k, v := range req.GetEnv() {

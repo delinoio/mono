@@ -2264,6 +2264,116 @@ func (r *retainedCreateRuntime) calls() int {
 	return r.deleteCalls
 }
 
+func TestRemovalRetriesRetainedFailedCreate(t *testing.T) {
+	testRemovalRetriesRetainedFailedCreate(t, func(_ *store.Store, o *Options) vmruntime.Runtime {
+		return o.Runtime
+	}, nil)
+}
+
+func testRemovalRetriesRetainedFailedCreate(t *testing.T, runtimeForStore func(*store.Store, *Options) vmruntime.Runtime, configureCreate func(*ownsandv1.CreateSandboxCommand)) {
+	t.Helper()
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	confirm := confirmRemovalGate{entered: make(chan struct{}), resume: make(chan struct{})}
+	var rt *retainedCreateRuntime
+	a := newAgent(t, cp, st, id, func(o *Options) {
+		rt = &retainedCreateRuntime{Runtime: runtimeForStore(st, o), failDeletes: 1}
+		o.Runtime = rt
+		confirm.AgentServiceClient = o.Control.Agent
+		o.Control.Agent = &confirm
+	})
+	t.Cleanup(a.shutdown)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+
+	sandboxID, _ := uuidv7.NewString()
+	cmd := createCommand(sandboxID).GetCreateSandbox()
+	if configureCreate != nil {
+		configureCreate(cmd)
+	}
+	a.Sandboxes.SetLimits(limits)
+	entry, err := a.Sandboxes.Create(ctx, cmd)
+	if err == nil || entry.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+		t.Fatalf("create result %v, %v, want a failed create", entry, err)
+	}
+	a.Sandboxes.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: sandboxID, Revision: entry.GetRevision()})
+	if _, ok := a.Sandboxes.State(sandboxID); ok {
+		t.Fatal("terminal acknowledgement kept the sandbox record")
+	}
+
+	vmDir := st.Path(store.VMsDir, sandboxID)
+	localImage := st.Path(store.ImagesDir, "keep-until-wipe")
+	if err := os.WriteFile(localImage, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cp.MarkRemoved(id.DeviceID)
+	remove := func() <-chan error {
+		done := make(chan error, 1)
+		go func() {
+			defer close(done)
+			done <- a.removeDevice(ctx)
+		}()
+		t.Cleanup(func() { <-done })
+		return done
+	}
+	select {
+	case err := <-remove():
+		if err == nil || errors.Is(err, ErrRemoved) || rt.calls() != 1 {
+			t.Fatalf("first removal = %v, Delete calls = %d, want an injected stop failure", err, rt.calls())
+		}
+	case <-confirm.entered:
+		t.Fatal("removal attempted confirmation with the retained VM still running")
+	case <-ctx.Done():
+		t.Fatal("first removal did not return")
+	}
+	if state, err := st.LoadAgent(); err != nil || !state.Removal.NoticeReceived || state.Removal.CleanupDone {
+		t.Fatalf("state after the failed stop: %+v, %v", state, err)
+	}
+	if running, err := rt.Running(ctx); err != nil || len(running) != 1 || running[0] != sandboxID {
+		t.Fatalf("VMs after the failed stop = %v, %v, want the retained VM", running, err)
+	}
+	for _, path := range []string{vmDir, localImage} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("local data after the failed stop: %v", err)
+		}
+	}
+	t.Log("Failed deletion left the acknowledged VM running and preserved local data. Removal did not attempt confirmation.")
+
+	retried := remove()
+	select {
+	case <-confirm.entered:
+	case err := <-retried:
+		t.Fatalf("removal retry failed before confirmation: %v", err)
+	case <-ctx.Done():
+		t.Fatal("removal retry did not reach confirmation")
+	}
+	if state, err := st.LoadAgent(); err != nil || !state.Removal.CleanupDone {
+		t.Fatalf("state at confirmation: %+v, %v", state, err)
+	}
+	if running, err := rt.Running(ctx); err != nil || len(running) != 0 || rt.calls() != 2 {
+		t.Fatalf("VMs at confirmation = %v, %v, Delete calls = %d", running, err, rt.calls())
+	}
+	for _, path := range []string{vmDir, localImage} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat at confirmation: %v, want %s absent", err, path)
+		}
+	}
+	close(confirm.resume)
+	select {
+	case err := <-retried:
+		if !errors.Is(err, ErrRemoved) {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("removal retry did not finish")
+	}
+	if cp.Confirms() != 1 {
+		t.Fatalf("removal confirmations = %d, want 1", cp.Confirms())
+	}
+	requireEmptyStateDir(t, st)
+	t.Log("The retry stopped the retained VM and wiped local data before the control plane accepted confirmation.")
+}
+
 // TestFailedCreateRetainedVMIsStoppedByRunningAgent checks that a running
 // agent stops the VM that a failed create kept after a failed stop, without
 // a restart: the VM and its directory stay while the stop fails, and the

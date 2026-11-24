@@ -84,7 +84,7 @@ func TestWriteDevSessionFileRejectsNegativeOffsets(t *testing.T) {
 	t.Run("new write", func(t *testing.T) {
 		checkNegativeOffsets(t)
 		s.guest.mu.Lock()
-		_, exists := s.guest.writes[writeID]
+		_, exists := s.guest.writes[writeKey{organizationID: org, devSessionID: sessionID, writeID: writeID}]
 		s.guest.mu.Unlock()
 		if exists {
 			t.Error("a rejected request created a pending write")

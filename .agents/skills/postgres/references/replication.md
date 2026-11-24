@@ -8,11 +8,15 @@ tags: postgres, replication, streaming, slots, synchronous, failover, standby, o
 
 ## Streaming Replication for followers
 
-Use physical (byte-for-byte) replication via WAL stream from primary to standbys. Standbys are read-only (hot standby); same major PG version and architecture required (same minor recommended). Without replication slots, the primary may recycle WAL before the standby receives it → standby needs full resync via `pg_basebackup`. Use replication slots to guarantee WAL retention for specific standbys.
+Use physical (byte-for-byte) replication via WAL stream from primary to standbys. Standbys are read-only (hot standby) and require the same PostgreSQL major version and architecture as the primary. Use the same minor version when possible.
+
+If the primary recycles WAL before the standby receives it, the standby can catch up through a working `restore_command` when an accessible WAL archive contains the complete sequence needed to bridge the gap. The standby can resume streaming once the primary can supply the next WAL. Reinitialize the standby from a new base backup (for example, with `pg_basebackup`) only if a required WAL segment cannot be recovered from any available source. [PostgreSQL standby operation](https://www.postgresql.org/docs/18/warm-standby.html#STANDBY-SERVER-OPERATION)
 
 ## Replication Slots
 
-Postgres supports Physical slots (streaming) and logical slots (logical replication). Slots prevent WAL deletion even if standby is offline — can exhaust `pg_wal/` disk. Use `max_slot_wal_keep_size` to cap retained WAL per slot. Use `idle_replication_slot_timeout` (PG 18+) to auto-invalidate idle slots. `wal_keep_size` is a simpler alternative to slots for WAL retention. Drop inactive slots immediately to prevent disk exhaustion.
+Postgres supports physical slots (streaming) and logical slots (logical replication). Slots can retain WAL in `pg_wal/` while a standby is offline. By default, `max_slot_wal_keep_size` is `-1`, which imposes no limit on WAL retention by slots and can lead to disk exhaustion. With a finite limit, PostgreSQL may remove required WAL at a checkpoint if a slot's `restart_lsn` is behind the current WAL position by more than that limit. [PostgreSQL replication settings](https://www.postgresql.org/docs/18/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE)
+
+Use `idle_replication_slot_timeout` (PG 18+) to auto-invalidate idle slots. `wal_keep_size` is a simpler alternative to slots for WAL retention. Drop inactive slots immediately to prevent disk exhaustion.
 
 Slot lag (MB behind): `SELECT slot_name, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)/1024/1024 AS mb_behind FROM pg_replication_slots;`
 

@@ -385,6 +385,119 @@ func TestSyncLimits(t *testing.T) {
 	}
 }
 
+func TestSyncManifestLimitCandidate(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	dir := newRepo(t, map[string]string{"old.txt": "old"}, nil, "")
+	ctx := context.Background()
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	ws := ds.GetWorkspacePath()
+	previous, err := os.ReadFile(ws + manifestSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	git(t, dir, "rm", "-q", "old.txt")
+	// The JSON key for a&b.txt contains a Unicode escape. Count encoded bytes.
+	entries := make(map[string]manifestEntry)
+	for name, contents := range map[string]string{"a&b.txt": "a", "new.txt": "new"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256([]byte(contents))
+		entries[name] = manifestEntry{Size: int64(len(contents)), SHA256: hex.EncodeToString(sum[:]), Mode: modeFile}
+	}
+	want, err := json.Marshal(manifest{Version: manifestVersion, Files: entries, PathsValidated: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writesBefore, execsBefore := srv.Calls(writeProc), srv.Calls(execProc)
+	_, err = c.sync(ctx, params, int64(len(want)-1))
+	if connect.CodeOf(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "candidate manifest exceeds the size limit") {
+		t.Fatalf("oversized candidate manifest: %v", err)
+	}
+	if srv.Calls(writeProc) != writesBefore || srv.Calls(execProc) != execsBefore {
+		t.Fatal("oversized candidate manifest caused an upload or a guest command")
+	}
+	if got, err := os.ReadFile(ws + manifestSuffix); err != nil || !bytes.Equal(got, previous) {
+		t.Fatalf("previous manifest changed: %q, %v", got, err)
+	}
+	if got := readGuest(t, ds, "old.txt"); got != "old" {
+		t.Fatalf("previous guest file changed: %q", got)
+	}
+
+	res, err := c.sync(ctx, params, int64(len(want)))
+	if err != nil || res.Uploaded != 2 || res.Deleted != 1 {
+		t.Fatalf("sync at the limit = %+v, %v", res, err)
+	}
+	if got, err := os.ReadFile(ws + manifestSuffix); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("manifest at the limit = %q, %v", got, err)
+	}
+	res, err = c.sync(ctx, params, int64(len(want)))
+	if err != nil || res.Uploaded != 0 || res.Skipped != 2 {
+		t.Fatalf("incremental sync at the limit = %+v, %v", res, err)
+	}
+}
+
+func TestSyncManifestLimitGuest(t *testing.T) {
+	needPOSIX(t)
+	for _, name := range []string{"initial read", "read under the lock"} {
+		t.Run(name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			dir := newRepo(t, map[string]string{"a.txt": "local"}, nil, "")
+			ctx := context.Background()
+			ws := ds.GetWorkspacePath()
+			guestFile := filepath.Join(ws, "a.txt")
+			if err := os.WriteFile(guestFile, []byte("guest"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			const limit = 200
+			body := []byte(`{"version":1,"files":{}}`)
+			atLimit := append(bytes.Clone(body), bytes.Repeat([]byte(" "), limit-len(body))...)
+			oversized := append(bytes.Clone(atLimit), ' ')
+			start := oversized
+			wantExecs := 0
+			if name == "read under the lock" {
+				start = atLimit
+				wantExecs = 2 // lock and cleanup
+				srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+					if req.GetEnv()[guestEnvForce] != "" {
+						// Another sync replaces the manifest before this sync takes the lock.
+						if err := os.WriteFile(ws+manifestSuffix, oversized, 0o644); err != nil {
+							t.Error(err)
+						}
+					}
+				}
+			}
+			if err := os.WriteFile(ws+manifestSuffix, start, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res, err := c.sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}, limit)
+			if res != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "guest manifest exceeds the size limit") {
+				t.Fatalf("oversized guest manifest = %+v, %v", res, err)
+			}
+			if writes, execs := srv.Calls(writeProc), srv.Calls(execProc); writes != 0 || execs != wantExecs {
+				t.Fatalf("got %d uploads and %d execs, want 0 uploads and %d execs", writes, execs, wantExecs)
+			}
+			if got, err := os.ReadFile(ws + manifestSuffix); err != nil || !bytes.Equal(got, oversized) {
+				t.Fatalf("oversized manifest changed: %q, %v", got, err)
+			}
+			if got := readGuest(t, ds, "a.txt"); got != "guest" {
+				t.Fatalf("guest file changed: %q", got)
+			}
+			if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("sync lock after failure: %v", err)
+			}
+		})
+	}
+}
+
 func TestSyncCaseCollisionsAndWindowsNames(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
@@ -890,10 +1003,61 @@ func TestReadLocalFileLookupError(t *testing.T) {
 
 func TestPruneDirs(t *testing.T) {
 	changed := []localFile{{rel: "a"}, {rel: "x/y"}}
-	got := pruneDirs([]string{"a/b/c/old", "a/d", "x/y/z", "other/dir/f", "a"}, changed)
+	got, aliases := pruneDirs([]string{"a/b/c/old", "a/d", "x/y/z", "other/dir/f", "a"}, changed, false)
 	want := []string{"a/b/c", "a/b", "x/y", "a"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("pruneDirs = %v, want %v", got, want)
+	if !slices.Equal(got, want) || len(aliases) != 0 {
+		t.Fatalf("pruneDirs = %q, %q; want %q and no aliases", got, aliases, want)
+	}
+}
+
+func TestPruneDirsCaseOnlyReplacement(t *testing.T) {
+	deleted := []string{"Assets/nested/old.txt", "Assets/nested/another.txt", "Exact/sub/old.txt"}
+	changed := []localFile{{rel: "assets"}, {rel: "Exact"}}
+	wantExact := []string{"Exact/sub", "Exact"}
+	for _, matchAliases := range []bool{false, true} {
+		var wantAliases []string
+		if matchAliases {
+			wantAliases = []string{"Assets", "assets", "Assets/nested", "Assets", "assets", "Assets"}
+		}
+		exact, aliases := pruneDirs(deleted, changed, matchAliases)
+		if !slices.Equal(exact, wantExact) || !slices.Equal(aliases, wantAliases) {
+			t.Fatalf("pruneDirs(matchAliases=%t) = %q, %q; want %q, %q", matchAliases, exact, aliases, wantExact, wantAliases)
+		}
+	}
+}
+
+func TestPruneDirsApplyAliasRecords(t *testing.T) {
+	needPOSIX(t)
+	dir := t.TempDir()
+	ws := filepath.Join(dir, "work")
+	old := "-Assets\n'"
+	nested := old + "/nested\n'"
+	if err := os.MkdirAll(filepath.Join(ws, nested), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A second spelling with ./ refers to the same directory on any volume.
+	incoming := "./" + old
+	list := filepath.Join(dir, "alias-prune-list")
+	if err := os.WriteFile(list, pathList([]string{old, incoming, nested, old, incoming, old}, false), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args, err := guestCommand(tidev1.GuestOs_GUEST_OS_MACOS, opApply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(args[2], "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "xargs" && slices.Contains(fields, "-x") {
+			t.Fatalf("xargs -x splits NUL-separated alias records on macOS: %s", line)
+		}
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), guestEnvWorkspace + "=" + ws, guestEnvAliasPrunes + "=" + list}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("prune alias directories: %v: %s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(ws, old)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old directory was not removed: %v", err)
 	}
 }
 
@@ -989,7 +1153,7 @@ func TestPOSIXSyncCleanup(t *testing.T) {
 				guestEnvArchive + "=" + archive,
 				guestEnvLock + "=" + lockArg,
 			}
-			for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes} {
+			for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvAliasPrunes} {
 				path := filepath.Join(dir, key)
 				if scenario.archiveDir {
 					if err := os.WriteFile(path, nil, 0o644); err != nil {
@@ -1714,6 +1878,43 @@ func TestLinkOutcome(t *testing.T) {
 	failed, warnings = linkOutcome(links, &guestResult{linkFailures: []string{"l2"}, outputLost: true})
 	if len(failed) != 3 || len(warnings) != 3 {
 		t.Fatalf("incomplete output: failed %v warnings %q", failed, warnings)
+	}
+}
+
+func TestLinkOutcomeInSyncManifest(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_WINDOWS)
+	dir := newRepo(t, nil, nil, "")
+	if err := os.Symlink("target", filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Emulate the Windows command results on the fake POSIX guest.
+	bin := t.TempDir()
+	script := `#!/bin/sh
+set -eu
+if [ -n "${TIDE_SYNC_FORCE-}" ]; then
+    mkdir "$TIDE_SYNC_LOCK"
+elif [ -n "${TIDE_SYNC_WORKSPACE-}" ]; then
+    test -s "$TIDE_SYNC_LINK_LIST"
+    echo 'TIDE-LINK-FAILED link'
+else
+    rm -f "$TIDE_SYNC_LINK_LIST"
+    rmdir "$TIDE_SYNC_LOCK"
+fi
+`
+	if err := os.WriteFile(filepath.Join(bin, "powershell.exe"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	res, err := c.Sync(context.Background(), params)
+	if err != nil || res.Uploaded != 0 || !slices.Equal(res.Warnings, []string{"link: the guest could not create the symbolic link"}) {
+		t.Fatalf("sync with a failed Windows link = %+v, %v", res, err)
+	}
+	if m := guestManifest(t, ds); len(m.Files) != 0 {
+		t.Fatalf("manifest contains the failed link: %+v", m)
 	}
 }
 
