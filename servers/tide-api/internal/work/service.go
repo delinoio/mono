@@ -572,6 +572,9 @@ func (h *Handler) watchRows(ctx context.Context, orgID string, after int64, snap
 		out = append(out, watchRow{id: "q" + r.ID, seq: r.ChangeSeq, msg: &tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Request{Request: r.Proto()}}})
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	var reqs []*tidev1.Request
 	for _, r := range out {
 		reqs = append(reqs, r.msg.GetRequest())
