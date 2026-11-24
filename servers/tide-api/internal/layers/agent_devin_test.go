@@ -250,10 +250,17 @@ func TestDevinClaimLossAfterDispatchWins(t *testing.T) {
 	waitForLockWaiter(t, w.env)
 	// Keep the claim change uncommitted until the fake guest starts.
 	commitClaim := holdTx(t, w.env, "SELECT 1 FROM agent_claims WHERE request_id = $1 FOR UPDATE", id)
+	// Use a separate connection to observe the locks. The two fixture
+	// transactions, dispatch and claim loss can fill the default pool.
+	observer, err := pgx.ConnectConfig(ctx, w.env.DB.Pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close(ctx)
 	w.devin.ClaimElsewhere(sid)
 	eventually(t, "the loss event waits after looking up the claim", func() bool {
 		var waiting bool
-		err := w.env.DB.Pool.QueryRow(ctx, `SELECT EXISTS (
+		err := observer.QueryRow(ctx, `SELECT EXISTS (
 			SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'
 			AND (query LIKE '%FROM requests WHERE request_id = $1 FOR UPDATE%' OR query LIKE 'UPDATE agent_claims SET state%'))`).Scan(&waiting)
 		if err != nil {
