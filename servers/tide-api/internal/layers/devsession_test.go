@@ -454,6 +454,101 @@ func TestDevSessionFiles(t *testing.T) {
 	}
 }
 
+func TestDevSessionFilesOwnSandErrors(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	ctx := context.Background()
+	s, sandboxID := w.runningSession(t)
+	owner := w.env.User(w.org.Member)
+	upstream, err := w.fake.New(w.osOrg, ownsandKey('a'))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const path = "/home/dev/work/transfer.txt"
+	w.fake.SetFile(w.osOrg, sandboxID, path, []byte("hello"))
+	readID := api.NewID()
+	read := func(offset int64) (*connect.ServerStreamForClient[tidev1.ReadDevSessionFileResponse], error) {
+		return owner.DevSession.ReadDevSessionFile(ctx, connect.NewRequest(&tidev1.ReadDevSessionFileRequest{
+			OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), ReadId: readID, Path: path, Offset: offset,
+		}))
+	}
+	stream, err := read(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for stream.Receive() {
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	const keyDiagnostic = "OwnSand rejected the organization's OwnSand API key"
+	for _, tc := range []struct {
+		name    string
+		code    connect.Code
+		message string
+		want    string
+	}{
+		{"operation mismatch", connect.CodePermissionDenied, "request does not match the recorded operation", "Restart the file transfer from the beginning with a new operation ID."},
+		{"other permission error", connect.CodePermissionDenied, "access denied", keyDiagnostic},
+		{"rejected API key", connect.CodeUnauthenticated, "invalid API key", keyDiagnostic},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Record both writes upstream so Tide's first call reopens each write.
+			writeIDs := []string{api.NewID(), api.NewID()}
+			for _, id := range writeIDs {
+				write, err := upstream.OpenFileWrite(sandboxID, ownsand.FileWriteParams{WriteID: id, Path: path})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := write.WriteChunk(ctx, 0, []byte("h")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.FileError = &ownsand.DataPathError{Err: connect.NewWireError(tc.code, errors.New(tc.message))}
+			})
+			t.Cleanup(func() { w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.FileError = nil }) })
+			wantError := func(operation string, err error) {
+				t.Helper()
+				wantCode(t, operation, err, connect.CodeFailedPrecondition)
+				var ce *connect.Error
+				if !errors.As(err, &ce) || ce.Message() != tc.want {
+					t.Fatalf("%s: got %v, want %q", operation, err, tc.want)
+				}
+			}
+			stream, err := read(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stream.Receive() {
+				t.Fatalf("continued read returned a result: %v", stream.Msg())
+			}
+			wantError("continued read", stream.Err())
+			for i, final := range []bool{false, true} {
+				// A credential rejection invalidates the link. Relink before
+				// checking the next RPC's handling of the upstream rejection.
+				if tc.code == connect.CodeUnauthenticated {
+					if _, err := w.setLink(w.org.Admin, w.osOrg, ownsandKey('a')); err != nil {
+						t.Fatal(err)
+					}
+				}
+				resp, err := owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{
+					OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(), WriteId: writeIDs[i],
+					Path: path, Offset: 1, Data: []byte("ello"), Final: final,
+				}))
+				if resp != nil {
+					t.Fatalf("write final=%t returned a result: %v", final, resp.Msg)
+				}
+				operation := "reopened write chunk"
+				if final {
+					operation = "reopened write finalization"
+				}
+				wantError(operation, err)
+			}
+		})
+	}
+}
+
 func newWorkWorld(t *testing.T, ds devsession.Timing) *workWorld {
 	t.Helper()
 	w := &world{fake: ownsandfake.New(), l: &layers.Layers{}}

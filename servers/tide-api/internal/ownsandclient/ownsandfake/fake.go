@@ -73,6 +73,8 @@ type Org struct {
 	// DeleteError, when set, is the error of the next DeleteSandbox calls
 	// (for example a transient OwnSand failure).
 	DeleteError error
+	// FileError, when set, is returned for reads, write chunks and finalization.
+	FileError error
 	// StartRunning makes new sandboxes RUNNING at once (the default);
 	// false keeps them CREATING until the test calls SetRunning.
 	StartRunning bool
@@ -428,7 +430,12 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 		return 0, err
 	}
 	c.f.mu.Lock()
-	s := c.f.orgs[c.org].sandboxes[sandboxID]
+	org := c.f.orgs[c.org]
+	if err := org.FileError; err != nil {
+		c.f.mu.Unlock()
+		return 0, err
+	}
+	s := org.sandboxes[sandboxID]
 	snap, ok := s.reads[p.ReadID]
 	if !ok {
 		src, exists := s.files[p.Path]
@@ -477,7 +484,11 @@ func (w *fileWrite) send(offset int64, data []byte, size *int64) (*ownsandv1.Wri
 	}
 	w.c.f.mu.Lock()
 	defer w.c.f.mu.Unlock()
-	s := w.c.f.orgs[w.c.org].sandboxes[w.sandboxID]
+	org := w.c.f.orgs[w.c.org]
+	if err := org.FileError; err != nil {
+		return nil, err
+	}
+	s := org.sandboxes[w.sandboxID]
 	fw := s.writes[w.p.WriteID]
 	if fw == nil {
 		fw = &fakeWrite{path: w.p.Path, ranges: map[int64][]byte{}}
