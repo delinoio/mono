@@ -7,6 +7,7 @@ package vzrt
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -87,24 +88,47 @@ func fileExists(p string) bool {
 	return err == nil && st.Mode().IsRegular()
 }
 
-// hasEntitlement reports whether the agent executable is signed with the
-// com.apple.security.virtualization entitlement, which every
-// Virtualization.framework VM needs.
+// hasEntitlement reports whether the signed agent enables the
+// com.apple.security.virtualization entitlement.
 func hasEntitlement(ctx context.Context) (bool, string) {
 	exe, err := os.Executable()
 	if err != nil {
 		return false, "cannot find the agent executable"
 	}
+	return inspectVirtualizationEntitlement(ctx, exe)
+}
+
+func inspectVirtualizationEntitlement(ctx context.Context, exe string) (bool, string) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "/usr/bin/codesign", "-d", "--entitlements", "-", "--xml", exe).Output()
 	if err != nil {
-		return false, "the agent executable is not code-signed"
+		return false, "cannot inspect the signed entitlements of the agent executable"
 	}
-	if !bytes.Contains(out, []byte("com.apple.security.virtualization")) {
-		return false, "the agent executable lacks the com.apple.security.virtualization entitlement"
+	enabled, err := virtualizationEntitlementEnabled(ctx, out)
+	if err != nil {
+		return false, "cannot read the signed entitlement plist of the agent executable"
 	}
-	return true, "the agent executable has the com.apple.security.virtualization entitlement"
+	if !enabled {
+		return false, "the agent executable lacks an enabled com.apple.security.virtualization entitlement"
+	}
+	return true, "the agent executable has an enabled com.apple.security.virtualization entitlement"
+}
+
+func virtualizationEntitlementEnabled(ctx context.Context, plist []byte) (bool, error) {
+	// Read the converted dictionary so dots in the key stay literal.
+	cmd := exec.CommandContext(ctx, "/usr/bin/plutil", "-convert", "json", "-o", "-", "--", "-")
+	cmd.Stdin = bytes.NewReader(plist)
+	out, err := cmd.Output()
+	if err != nil {
+		return false, err
+	}
+	var entitlements map[string]any
+	if err := json.Unmarshal(out, &entitlements); err != nil {
+		return false, err
+	}
+	enabled, _ := entitlements["com.apple.security.virtualization"].(bool)
+	return enabled, nil
 }
 
 // Capabilities runs the hypervisor checks.
