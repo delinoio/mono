@@ -158,6 +158,10 @@ describe("overview", () => {
     await expect(screen.getByRole("status", "Queue updates")).toContainText(
       "Live",
     );
+    await expect(screen.getByText("Live")).toHaveAttribute(
+      "data-variant",
+      "accent",
+    );
     await expect(screen.getByRole("table", "Waiting requests")).toContainText(
       "GitHub job",
     );

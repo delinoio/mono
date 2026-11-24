@@ -19,9 +19,16 @@ import {
   Code,
   ConnectError,
   createClient,
+  createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
+import type { MessageInitShape } from "@bufbuild/protobuf";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
+import { RequestState, RunnerState } from "@delino/tide-protos/v1/common_pb";
+import {
+  type WatchQueueResponseSchema,
+  WorkService,
+} from "@delino/tide-protos/v1/work_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
@@ -491,6 +498,99 @@ describe("overview", () => {
       screen.getByRole("table", { name: "Waiting requests" }),
     ).toBeTruthy();
   });
+
+  test.each([false, true])(
+    "keeps the last snapshot after a terminal stream error (after an automatic reconnect: %s)",
+    async (afterReconnect) => {
+      let failStream!: () => void;
+      const streamFailure = new Promise<void>((resolve) => {
+        failStream = resolve;
+      });
+      let completeSnapshot!: () => void;
+      const replacementSnapshot = new Promise<void>((resolve) => {
+        completeSnapshot = resolve;
+      });
+      let streams = 0;
+      const queue = createRouterTransport((router) => {
+        router.service(WorkService, {
+          async *watchQueue(): AsyncGenerator<
+            MessageInitShape<typeof WatchQueueResponseSchema>
+          > {
+            const stream = ++streams;
+            if (stream === 1) {
+              yield {
+                event: {
+                  case: "request",
+                  value: { requestId: "queued", state: RequestState.QUEUED },
+                },
+              };
+              yield {
+                event: {
+                  case: "runner",
+                  value: { runnerId: "warm", state: RunnerState.WARM },
+                },
+              };
+              yield { event: { case: "snapshotComplete", value: {} } };
+              await streamFailure;
+              if (afterReconnect) {
+                throw new ConnectError("retryable error", Code.Unavailable);
+              }
+            }
+            if (stream === (afterReconnect ? 2 : 1)) {
+              throw new ConnectError("internal error", Code.Internal);
+            }
+            await replacementSnapshot;
+            yield { event: { case: "snapshotComplete", value: {} } };
+          },
+        });
+      });
+      const mock = createMockTransport();
+      const transport: Transport = {
+        ...mock,
+        stream: (method, ...rest) =>
+          (method.name === "WatchQueue" ? queue : mock).stream(method, ...rest),
+      };
+      renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
+
+      const status = within(
+        await screen.findByRole("status", { name: "Queue updates" }),
+      );
+      const warmCount = () =>
+        screen.getByText("Warm", { selector: "dt" }).nextElementSibling
+          ?.textContent;
+      const live = await status.findByText("Live");
+      expect(live.getAttribute("data-variant")).toBe("accent");
+      expect(screen.getByText("queued")).toBeTruthy();
+      expect(warmCount()).toBe("1");
+
+      await act(async () => failStream());
+      const disconnected = await status.findByText(
+        "Disconnected",
+        {},
+        { timeout: 3000 },
+      );
+      expect(disconnected.getAttribute("data-variant")).toBe("neutral");
+      expect(screen.getByText("Something went wrong. Try again.")).toBeTruthy();
+      const retry = screen.getByRole("button", { name: "Try again" });
+      expect(screen.getByText("queued")).toBeTruthy();
+      expect(warmCount()).toBe("1");
+      expect(streams).toBe(afterReconnect ? 2 : 1);
+
+      await click(retry);
+      expect(status.getByText("Reconnecting")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+      expect(screen.getByText("queued")).toBeTruthy();
+      expect(warmCount()).toBe("1");
+      expect(streams).toBe(afterReconnect ? 3 : 2);
+
+      await act(async () => completeSnapshot());
+      expect(status.getByText("Live").getAttribute("data-variant")).toBe(
+        "accent",
+      );
+      expect(screen.getByText("No request is waiting")).toBeTruthy();
+      expect(warmCount()).toBe("0");
+    },
+  );
 
   test("guides the first setup of a new organization", async () => {
     renderConsole(`/orgs/${MOCK_IDS.globex}`);
