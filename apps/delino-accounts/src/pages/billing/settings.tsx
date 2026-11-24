@@ -17,6 +17,8 @@ import {
 } from "../../components/ui.tsx";
 import {
   type AutoTopUpErrors,
+  type AutoTopUpInput,
+  type AutoTopUpValues,
   checkAccountName,
   checkAlertThreshold,
   checkAutoTopUp,
@@ -171,20 +173,13 @@ function AutoTopUpSection() {
         error={settings.isRefetchError ? settings.error : undefined}
         onRetry={() => void settings.refetch()}
       />
-      <AutoTopUpForm
-        // Start again from the server values after each save. Only the four
-        // editable values identify the form: the read-only counters change
-        // without any user action, and a refetch that changes only them must
-        // not discard the draft in the inputs.
-        key={autoTopUpFormKey(settings.data.settings)}
-        settings={settings.data.settings}
-      />
+      <AutoTopUpForm settings={settings.data.settings} />
     </>
   );
 }
 
-/** The identity of the saved editable values of the automatic top-up form. */
-function autoTopUpFormKey(settings: AutoTopUpSettings | undefined): string {
+/** Compares saved settings without the read-only counters. */
+function autoTopUpSettingsKey(settings: AutoTopUpValues | undefined): string {
   return [
     settings?.enabled ?? false,
     settings?.thresholdUsdMicros ?? 0n,
@@ -198,6 +193,21 @@ function amountText(micros: bigint | undefined): string {
   return micros === undefined || micros === 0n ? "" : toAmountInput(micros);
 }
 
+function autoTopUpDraft(settings: AutoTopUpValues | undefined): AutoTopUpInput {
+  return {
+    enabled: settings?.enabled ?? false,
+    threshold: amountText(settings?.thresholdUsdMicros),
+    amount: amountText(settings?.amountUsdMicros),
+    monthlyCap: amountText(settings?.monthlyCapUsdMicros),
+  };
+}
+
+interface AutoTopUpFormState {
+  settingsKey: string;
+  confirmationKey?: string;
+  draft: AutoTopUpInput;
+}
+
 function AutoTopUpForm({
   settings,
 }: {
@@ -207,15 +217,29 @@ function AutoTopUpForm({
   const queryClient = useQueryClient();
   const update = useMutation(CreditService.method.updateAutoTopUpSettings);
   const editable = can(role, Permission.ManagePayments);
-  const [enabled, setEnabled] = useState(settings?.enabled ?? false);
-  const [threshold, setThreshold] = useState(
-    amountText(settings?.thresholdUsdMicros),
-  );
-  const [amount, setAmount] = useState(amountText(settings?.amountUsdMicros));
-  const [monthlyCap, setMonthlyCap] = useState(
-    amountText(settings?.monthlyCapUsdMicros),
-  );
+  const settingsKey = autoTopUpSettingsKey(settings);
+  const [form, setForm] = useState<AutoTopUpFormState>(() => ({
+    settingsKey,
+    draft: autoTopUpDraft(settings),
+  }));
   const [errors, setErrors] = useState<AutoTopUpErrors>({});
+  if (form.settingsKey !== settingsKey) {
+    // A read that confirms this form's save keeps the current draft.
+    if (settingsKey === form.confirmationKey) {
+      setForm({ settingsKey, draft: form.draft });
+    } else {
+      setForm({ settingsKey, draft: autoTopUpDraft(settings) });
+      setErrors({});
+    }
+  }
+  const { draft } = form;
+  const editDraft = (edit: Partial<AutoTopUpInput>) => {
+    setForm((current) => ({
+      ...current,
+      draft: { ...current.draft, ...edit },
+    }));
+  };
+
   return (
     <SettingsForm
       title="Automatic top-up"
@@ -223,12 +247,7 @@ function AutoTopUpForm({
       description="Buy credit automatically when a usage charge makes the balance fall below the threshold. The monthly cap limits automatic top-ups in one UTC calendar month. After 2 failed top-ups in a row, automatic top-up turns off."
       editable={editable}
       onSubmit={async () => {
-        const checked = checkAutoTopUp({
-          enabled,
-          threshold,
-          amount,
-          monthlyCap,
-        });
+        const checked = checkAutoTopUp(draft);
         if (!checked.ok) {
           setErrors(checked.errors);
           return;
@@ -238,29 +257,33 @@ function AutoTopUpForm({
           billingAccountId,
           settings: checked.value,
         });
-        // An equivalent save (for example "50" for a saved $50.00) leaves the
-        // form key unchanged, so the key reset does not run and the typed text
-        // would stay. Show the saved values instead. A rejected save throws
-        // above, so its draft and error stay.
-        setEnabled(saved.settings?.enabled ?? checked.value.enabled);
-        setThreshold(amountText(saved.settings?.thresholdUsdMicros));
-        setAmount(amountText(saved.settings?.amountUsdMicros));
-        setMonthlyCap(amountText(saved.settings?.monthlyCapUsdMicros));
+        const savedSettings = saved.settings ?? checked.value;
+        const savedKey = autoTopUpSettingsKey(savedSettings);
+        setForm((current) => ({
+          ...current,
+          confirmationKey:
+            savedKey === current.settingsKey ? undefined : savedKey,
+          // Each edit creates a new draft, even if it restores an earlier value.
+          draft:
+            current.draft === draft
+              ? autoTopUpDraft(savedSettings)
+              : current.draft,
+        }));
         await invalidateServices(queryClient, CreditService);
         toast.success("Automatic top-up is saved.");
       }}
     >
       <Switch
         label="Automatic top-up"
-        checked={enabled}
-        onCheckedChange={setEnabled}
+        checked={draft.enabled}
+        onCheckedChange={(enabled) => editDraft({ enabled })}
         disabled={!editable}
       />
       <TextField
         label="Threshold (USD)"
         description="At least $10.00."
-        value={threshold}
-        onChange={(event) => setThreshold(event.target.value)}
+        value={draft.threshold}
+        onChange={(event) => editDraft({ threshold: event.target.value })}
         error={errors.threshold}
         disabled={!editable}
         inputMode="decimal"
@@ -269,8 +292,8 @@ function AutoTopUpForm({
       <TextField
         label="Top-up amount (USD)"
         description="At least $25.00. Tax is added on top."
-        value={amount}
-        onChange={(event) => setAmount(event.target.value)}
+        value={draft.amount}
+        onChange={(event) => editDraft({ amount: event.target.value })}
         error={errors.amount}
         disabled={!editable}
         inputMode="decimal"
@@ -279,8 +302,8 @@ function AutoTopUpForm({
       <TextField
         label="Monthly cap (USD)"
         description="Required. At least the top-up amount."
-        value={monthlyCap}
-        onChange={(event) => setMonthlyCap(event.target.value)}
+        value={draft.monthlyCap}
+        onChange={(event) => editDraft({ monthlyCap: event.target.value })}
         error={errors.monthlyCap}
         disabled={!editable}
         inputMode="decimal"

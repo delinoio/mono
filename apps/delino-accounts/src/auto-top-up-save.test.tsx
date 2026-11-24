@@ -12,6 +12,7 @@ import {
   cleanup,
   fireEvent,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -22,12 +23,8 @@ import {
   createFakeApi,
   type FakeApi,
 } from "./testing/fake-api.ts";
+import { deferNextCall } from "./testing/form-submit-deferral.ts";
 import { renderApp, settle } from "./testing/render.tsx";
-
-/**
- * The automatic top-up form shows the saved values after a successful save,
- * also when they are equivalent to the typed text ("50" and "50.00").
- */
 
 async function click(element: Element) {
   await act(async () => {
@@ -66,7 +63,7 @@ async function renderSettings(api: FakeApi) {
   })) as HTMLInputElement;
   const save = within(amount.closest("form")!).getByRole("button", {
     name: "Save",
-  });
+  }) as HTMLButtonElement;
   return { amount, save };
 }
 
@@ -117,21 +114,131 @@ describe("automatic top-up save", () => {
     expect(amountValue()).toBe("50.00");
   });
 
-  test("a rejected save keeps the draft and shows the error", async () => {
+  test("keeps edits made during the save and its confirming read", async () => {
     const api = savedApi();
     const { amount, save } = await renderSettings(api);
+    const toggle = screen.getByRole("switch", { name: "Automatic top-up" });
+    const threshold = screen.getByRole("textbox", {
+      name: "Threshold (USD)",
+    }) as HTMLInputElement;
+    const cap = screen.getByRole("textbox", {
+      name: "Monthly cap (USD)",
+    }) as HTMLInputElement;
+    const mutation = deferNextCall(api, "UpdateAutoTopUpSettings");
+    const confirmation = deferNextCall(api, "GetAutoTopUpSettings");
+    const readsBeforeSave = api.calls.filter(
+      (call) => call.method === "GetAutoTopUpSettings",
+    ).length;
+
     await type(amount, "60");
-    api.failNext.set(
-      "UpdateAutoTopUpSettings",
-      new ConnectError("down", Code.Unavailable),
-    );
     await click(save);
-    await settle(60);
+    expect(updates(api)).toEqual([
+      expect.objectContaining({
+        settings: expect.objectContaining({
+          enabled: true,
+          thresholdUsdMicros: 10_000_000n,
+          amountUsdMicros: 60_000_000n,
+          monthlyCapUsdMicros: 200_000_000n,
+        }),
+      }),
+    ]);
+    expect(save.disabled).toBe(true);
+    await type(threshold, "15");
+    await type(amount, "75");
+    await type(cap, "250");
+    await click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    await click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    await act(async () => mutation.release());
+    await waitFor(() =>
+      expect(
+        api.calls.filter((call) => call.method === "GetAutoTopUpSettings"),
+      ).toHaveLength(readsBeforeSave + 1),
+    );
+    expect([threshold.value, amount.value, cap.value]).toEqual([
+      "15",
+      "75",
+      "250",
+    ]);
+    expect(save.disabled).toBe(true);
+    expect(successToasts).not.toHaveBeenCalled();
+    await type(amount, "80");
+
+    await act(async () => confirmation.release());
+    await waitFor(() => expect(save.disabled).toBe(false));
+    expect(amount.isConnected).toBe(true);
+    expect([threshold.value, amount.value, cap.value]).toEqual([
+      "15",
+      "80",
+      "250",
+    ]);
     expect(updates(api)).toHaveLength(1);
+    await click(save);
+    expect(updates(api)).toHaveLength(2);
+    expect(updates(api)[1]).toEqual(
+      expect.objectContaining({
+        settings: expect.objectContaining({
+          enabled: true,
+          thresholdUsdMicros: 15_000_000n,
+          amountUsdMicros: 80_000_000n,
+          monthlyCapUsdMicros: 250_000_000n,
+        }),
+      }),
+    );
+    await waitFor(() => expect(amountValue()).toBe("80.00"));
+  });
+
+  test("an equivalent save preserves a newer switch edit and draft text", async () => {
+    const api = savedApi();
+    const { amount, save } = await renderSettings(api);
+    const toggle = screen.getByRole("switch", { name: "Automatic top-up" });
+    const mutation = deferNextCall(api, "UpdateAutoTopUpSettings");
+    await type(amount, "50");
+    await click(save);
+    await click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+
+    await act(async () => mutation.release());
+    await waitFor(() => expect(save.disabled).toBe(false));
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(amountValue()).toBe("50");
+    await click(save);
+    expect(updates(api)).toHaveLength(2);
+    expect(updates(api)[1]).toEqual(
+      expect.objectContaining({
+        settings: expect.objectContaining({ enabled: false }),
+      }),
+    );
+  });
+
+  test("a rejected save keeps the newer draft available for retry", async () => {
+    const api = savedApi();
+    const { amount, save } = await renderSettings(api);
+    const mutation = deferNextCall(api, "UpdateAutoTopUpSettings");
+    await type(amount, "60");
+    await click(save);
+    await type(amount, "75");
+    await act(async () =>
+      mutation.fail(new ConnectError("down", Code.Unavailable)),
+    );
+    expect(updates(api)).toEqual([
+      expect.objectContaining({
+        settings: expect.objectContaining({ amountUsdMicros: 60_000_000n }),
+      }),
+    ]);
     expect(
       await screen.findByText(/Delino Accounts is not available/),
     ).toBeTruthy();
-    expect(amountValue()).toBe("60");
+    expect(amountValue()).toBe("75");
     expect(successToasts).not.toHaveBeenCalled();
+    await click(save);
+    expect(updates(api)).toHaveLength(2);
+    expect(updates(api)[1]).toEqual(
+      expect.objectContaining({
+        settings: expect.objectContaining({ amountUsdMicros: 75_000_000n }),
+      }),
+    );
   });
 });

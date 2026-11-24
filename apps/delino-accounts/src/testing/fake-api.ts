@@ -608,12 +608,14 @@ export function createFakeApi(): FakeApi {
         load(req.billingAccountId, PAYMENT_ROLES);
         return {};
       },
-      getAutoTopUpSettings(req) {
+      async getAutoTopUpSettings(req) {
         record("GetAutoTopUpSettings", req);
+        await awaitDeferredCall(api, "GetAutoTopUpSettings");
         return { settings: load(req.billingAccountId).account.autoTopUp };
       },
-      updateAutoTopUpSettings(req) {
+      async updateAutoTopUpSettings(req) {
         record("UpdateAutoTopUpSettings", req);
+        await awaitDeferredCall(api, "UpdateAutoTopUpSettings");
         const { account } = load(req.billingAccountId, PAYMENT_ROLES);
         const s = req.settings!;
         account.autoTopUp = {
