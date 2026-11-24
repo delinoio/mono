@@ -1320,7 +1320,7 @@ export function createMockTransport(
           );
         if (org.integrations.some((i) => i.name === name))
           throw new ConnectError(
-            "an integration with this name exists",
+            "an agent integration with this name exists",
             Code.AlreadyExists,
           );
         if (req.vendor === AgentVendor.UNSPECIFIED)
@@ -1369,6 +1369,13 @@ export function createMockTransport(
             throw new ConnectError(
               "name must have 1 to 64 characters",
               Code.InvalidArgument,
+            );
+          if (
+            org.integrations.some((other) => other !== i && other.name === name)
+          )
+            throw new ConnectError(
+              "an agent integration with this name exists",
+              Code.AlreadyExists,
             );
         }
         const settings = hasPath(req.updateMask, "settings")

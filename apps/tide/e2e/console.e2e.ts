@@ -201,6 +201,32 @@ describe("overview", () => {
 });
 
 describe("integrations", () => {
+  test("keeps the integration edit dialog open after a duplicate rename", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+    await screen
+      .getByRole("listitem")
+      .filter({ hasText: "claude-team" })
+      .getByRole("button", "Edit")
+      .tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("codex-prod");
+    await screen.getByRole("button", "Save changes").tap();
+
+    await expect(screen.getByRole("dialog", "Edit claude-team")).toBeVisible();
+    await expect(
+      screen.getByText("an agent integration with this name exists"),
+    ).toBeVisible();
+    await expect(screen.getByText("codex-prod · OpenAI Codex")).toBeVisible();
+    await expect(screen.getByText("claude-team · Claude Code")).toBeVisible();
+  });
+
   test("saves a Cursor integration name, pool, and credential together", async ({
     app,
     screen,

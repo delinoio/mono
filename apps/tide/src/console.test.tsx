@@ -298,6 +298,54 @@ describe("OwnSand link", () => {
 });
 
 describe("integrations", () => {
+  async function editClaudeIntegration() {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`);
+    const list = within(
+      await screen.findByRole("list", { name: "Agent integrations" }),
+    );
+    const row = list.getByText("claude-team · Claude Code").closest("li")!;
+    await click(within(row).getByRole("button", { name: "Edit" }));
+    const dialog = screen.getByRole("dialog", { name: "Edit claude-team" });
+    const form = within(dialog);
+    const name = form.getByRole("textbox", { name: "Name" });
+    const save = () =>
+      click(form.getByRole("button", { name: "Save changes" }));
+    return { list, dialog, form, name, save };
+  }
+
+  test("keeps the edit dialog open when the name already exists", async () => {
+    const { list, dialog, form, name, save } = await editClaudeIntegration();
+    await type(name, "codex-prod");
+    await save();
+
+    expect(
+      await form.findByText("an agent integration with this name exists"),
+    ).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Edit claude-team" })).toBe(
+      dialog,
+    );
+    expect(list.getAllByText(/^codex-prod · /)).toHaveLength(1);
+    expect(list.getAllByText(/^claude-team · /)).toHaveLength(1);
+  });
+
+  test("renames an integration to an unused name", async () => {
+    const { list, name, save } = await editClaudeIntegration();
+    await type(name, "claude-renamed");
+    await save();
+
+    expect(await list.findByText("claude-renamed · Claude Code")).toBeTruthy();
+    expect(list.queryByText("claude-team · Claude Code")).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("closes the edit dialog when the integration name is unchanged", async () => {
+    const { list, save } = await editClaudeIntegration();
+    await save();
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(list.getByText("claude-team · Claude Code")).toBeTruthy();
+  });
+
   test("shows the OpenAI webhook URL and the credential state without values", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`);
     const url = await screen.findByLabelText("webhook URL of codex-prod");
