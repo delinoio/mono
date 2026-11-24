@@ -17,7 +17,7 @@ import {
 } from "@testing-library/react";
 import { toast } from "delino-ui/toast";
 import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
-import { renderConsole, settle } from "./test-support.tsx";
+import { holdingTransport, renderConsole, settle } from "./test-support.tsx";
 
 /**
  * The longest wait for one condition. The console renders a list of more than
@@ -208,11 +208,14 @@ describe("enrollment tokens list", () => {
         ),
       ).toBeTruthy();
       expect(itemsOf("Enrollment tokens")).toHaveLength(FIRST_PAGE_ROWS);
+      const [, failedToken] = state.tokens;
+      expect(failedToken).toBeTruthy();
       state.failLaterPages = false;
       await act(async () => {
         fireEvent.click(screen.getByRole("button", { name: "Try again" }));
       });
       await waitForRows("Enrollment tokens", ALL_ROWS);
+      expect(state.tokens).toEqual(["", failedToken, failedToken]);
       await waitFor(
         () =>
           expect(
@@ -384,11 +387,14 @@ describe("API keys list", () => {
         await screen.findByText("Some API keys are not shown yet.", {}, WAIT),
       ).toBeTruthy();
       expect(itemsOf("API keys")).toHaveLength(FIRST_PAGE_ROWS);
+      const [, failedToken] = state.tokens;
+      expect(failedToken).toBeTruthy();
       state.failLaterPages = false;
       await act(async () => {
         fireEvent.click(screen.getByRole("button", { name: "Try again" }));
       });
       await waitForRows("API keys", ALL_ROWS);
+      expect(state.tokens).toEqual(["", failedToken, failedToken]);
       await waitFor(
         () =>
           expect(
@@ -430,6 +436,76 @@ describe("API keys list", () => {
       expect(await screen.findByText("No API keys", {}, WAIT)).toBeTruthy();
       expect(screen.queryByRole("list", { name: "API keys" })).toBeNull();
       expect(screen.queryByText(/key-0/)).toBeNull();
+    },
+    LONG_LIST_TEST_TIMEOUT_MS,
+  );
+});
+
+describe.each([
+  {
+    path: "api-keys",
+    method: "ListApiKeys",
+    list: "API keys",
+    noun: "API keys",
+    create: "Create API key",
+    options: { extraApiKeys: EXTRA_ROWS },
+  },
+  {
+    path: "enrollment-tokens",
+    method: "ListEnrollmentTokens",
+    list: "Enrollment tokens",
+    noun: "enrollment tokens",
+    create: "Create token",
+    options: { extraEnrollmentTokens: EXTRA_ROWS },
+  },
+])("$list terminal continuation errors", (fixture) => {
+  test.each([
+    [Code.Unauthenticated, "Your session ended. Sign in again."],
+    [Code.NotFound, "It was not found, or you no longer have access to it."],
+    [Code.PermissionDenied, "You do not have permission to do this."],
+  ])(
+    "replaces loaded rows and actions with the full notice for %s",
+    async (code, message) => {
+      const paged = pagedTransport(
+        fixture.method,
+        createMockTransport(fixture.options),
+      );
+      const { transport, calls } = holdingTransport(
+        [fixture.method],
+        () => true,
+        paged.transport,
+      );
+      renderConsole(`/orgs/${MOCK_IDS.acme}/${fixture.path}`, { transport });
+      await waitFor(() => expect(calls[fixture.method]).toHaveLength(1), WAIT);
+      await act(async () => calls[fixture.method]![0]!.settle());
+      await waitFor(() => expect(calls[fixture.method]).toHaveLength(2), WAIT);
+
+      const list = screen.getByRole("list", { name: fixture.list });
+      await act(async () =>
+        fireEvent.click(
+          within(list).getAllByRole("button", { name: /^Revoke/ })[0]!,
+        ),
+      );
+      await screen.findByRole("alertdialog", {}, WAIT);
+      await act(async () =>
+        calls[fixture.method]![1]!.settle(
+          new ConnectError("the page failed", code),
+        ),
+      );
+
+      expect(await screen.findByText(message, {}, WAIT)).toBeTruthy();
+      expect(screen.queryByRole("list", { name: fixture.list })).toBeNull();
+      expect(screen.queryByRole("button", { name: /^Revoke/ })).toBeNull();
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(
+        screen.queryByText(`Some ${fixture.noun} are not shown yet.`),
+      ).toBeNull();
+      expect(screen.getByRole("button", { name: fixture.create })).toBeTruthy();
+      if (code === Code.Unauthenticated) {
+        expect(
+          screen.getByRole("button", { name: "Sign in with Delino" }),
+        ).toBeTruthy();
+      }
     },
     LONG_LIST_TEST_TIMEOUT_MS,
   );

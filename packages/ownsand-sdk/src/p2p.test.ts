@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import assert from "node:assert/strict";
 import { runInNewContext } from "node:vm";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -128,6 +129,43 @@ function execEvent(
 }
 
 describe("peer-to-peer data path", () => {
+  describe.each([DataPathTransport.RELAY, DataPathTransport.PEER_TO_PEER])(
+    "exec validation with transport %s",
+    (transport) => {
+      test.each([
+        ["program", { command: ["program\ud800"] }, "command"],
+        ["argument", { command: ["echo", "argument\udfff"] }, "command"],
+        [
+          "environment key",
+          { env: { "\ud800": "first", "\ufffd": "second" } },
+          "env",
+        ],
+        ["environment value", { env: { example: "value\udfff" } }, "env"],
+        [
+          "working directory",
+          { workingDirectory: "/tmp/\ud800" },
+          "working_directory",
+        ],
+      ] as const)(
+        "rejects a lone surrogate in the %s before transport setup",
+        (_name, override, field) => {
+          const { h, rtc } = p2pSetup(() => {}, { transport });
+          const sandbox = h.client.sandbox(SANDBOX);
+          assert.throws(
+            () => sandbox.exec({ command: ["echo"], ...override }),
+            {
+              name: "OwnSandValidationError",
+              field,
+              message: `${field} must be valid UTF-8`,
+            },
+          );
+          expect(h.api.calls).toHaveLength(0);
+          expect(rtc.connections).toHaveLength(0);
+        },
+      );
+    },
+  );
+
   test("runs an exec over one data channel without a relay grant", async () => {
     const { h, rtc } = p2pSetup((frame, peer) => {
       if (frame.kind === DataFrameKind.EXEC_REQUEST) {
@@ -137,7 +175,12 @@ describe("peer-to-peer data path", () => {
       }
     });
     const sandbox = h.client.sandbox(SANDBOX);
-    const run = await h.clock.run(sandbox.run({ command: ["echo", "p2p"] }));
+    const input = {
+      command: ["echo", "p2p 😀\ufffd"],
+      env: { "key😀": "\ufffd", "key\ufffd": "😀" },
+      workingDirectory: "/tmp/😀\ufffd",
+    };
+    const run = await h.clock.run(sandbox.run(input));
     expect(text(run.stdout)).toBe("p2p");
     expect(run.result.kind).toBe(ExecResultKind.Exited);
     expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
@@ -157,6 +200,10 @@ describe("peer-to-peer data path", () => {
     expect(request!.kind).toBe(DataFrameKind.EXEC_REQUEST);
     expect(request!.streamId).toBe(1n);
     expect(request!.sandboxId).toBe(SANDBOX);
+    expect(request!.payload).toMatchObject({
+      case: "execRequest",
+      value: input,
+    });
     // A second operation uses the same session with a new stream ID.
     await h.clock.run(sandbox.run({ command: ["true"] }));
     expect(h.api.callsOf("OpenSession")).toHaveLength(1);

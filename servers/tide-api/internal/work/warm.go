@@ -24,7 +24,7 @@ type warmRetry struct {
 	retryAfter *time.Time
 }
 
-// lockWarmRetry serializes warm admission and outcomes for the profile.
+// lockWarmRetry serializes warm admission and outcomes with profile deletion.
 // A new link revision starts with an empty retry state.
 func lockWarmRetry(ctx context.Context, tx pgx.Tx, r *Runner) (warmRetry, error) {
 	var retry warmRetry
@@ -35,6 +35,19 @@ func lockWarmRetry(ctx context.Context, tx pgx.Tx, r *Runner) (warmRetry, error)
 		FROM runner_profiles WHERE runner_profile_id = $1 AND warm_revision = $2 FOR NO KEY UPDATE`,
 		r.ProfileID, r.warmProfileRevision, r.warmLinkRevision).Scan(&retry.failures, &retry.rejections, &retry.retryAfter)
 	return retry, err
+}
+
+// lockWarmOutcomeProfile takes the profile lock before the runner lock,
+// in the same order as profile deletion. An older revision needs no update.
+func lockWarmOutcomeProfile(ctx context.Context, tx pgx.Tx, r *Runner) error {
+	if r.warmProfileRevision == "" || r.RequestID != "" {
+		return nil
+	}
+	_, err := lockWarmRetry(ctx, tx, r)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	return err
 }
 
 func (e *Engine) allowWarmCreate(ctx context.Context, tx pgx.Tx, r *Runner) error {

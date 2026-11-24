@@ -22,6 +22,15 @@ import (
 // errReadGap reports a chunk that starts after the next undelivered offset.
 var errReadGap = errors.New("ownsand: file chunk skipped bytes")
 
+// canonicalFileID matches the control plane's spelling before the SDK binds
+// the ID to a relay grant. Request validation still handles invalid IDs.
+func canonicalFileID(id string) string {
+	if u, err := uuidv7.Parse(id); err == nil {
+		return u.String()
+	}
+	return id
+}
+
 // ReadFile streams the guest file at path to w and returns its size. It
 // generates one read_id and continues an interrupted read with the same
 // read_id, path and salt from the next undelivered offset, so the caller
@@ -65,7 +74,7 @@ func (s *Sandbox) ReadFileBytes(ctx context.Context, path string) ([]byte, error
 // the file (see the file transfer contract).
 type FileReadParams struct {
 	// ReadID is the read_id, a UUID v7 that the caller generated right
-	// before the first call of the read.
+	// before the first call of the read. The SDK uses its lowercase form.
 	ReadID string
 	// Path is the absolute guest path. Every call of one ReadID uses the
 	// same path.
@@ -84,6 +93,7 @@ type FileReadParams struct {
 // next undelivered offset. Like ReadFile, it continues an interrupted
 // stream with the same read_id and salt, so w never receives a byte twice.
 func (s *Sandbox) ReadFileFrom(ctx context.Context, p FileReadParams, w io.Writer) (int64, error) {
+	id := canonicalFileID(p.ReadID)
 	salt := p.BindingSalt
 	if len(salt) == 0 {
 		var err error
@@ -91,7 +101,7 @@ func (s *Sandbox) ReadFileFrom(ctx context.Context, p FileReadParams, w io.Write
 			return 0, err
 		}
 	}
-	base := &ownsandv1.ReadFileRequest{OrganizationId: s.org, SandboxId: s.id, ReadId: p.ReadID, Path: p.Path, BindingSalt: salt}
+	base := &ownsandv1.ReadFileRequest{OrganizationId: s.org, SandboxId: s.id, ReadId: id, Path: p.Path, BindingSalt: salt}
 	check := proto.Clone(base).(*ownsandv1.ReadFileRequest)
 	check.Offset = p.Offset
 	if err := validate.ReadFileRequest(check); err != nil {
@@ -103,7 +113,7 @@ func (s *Sandbox) ReadFileFrom(ctx context.Context, p FileReadParams, w io.Write
 		w:     w,
 		next:  p.Offset,
 		rec:   newRecovery(s.c.timing.recoveryWindow),
-		grant: newRelayGrant(s, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_READ_FILE, p.ReadID, relaybinding.ReadFileDigest(base)),
+		grant: newRelayGrant(s, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_READ_FILE, id, relaybinding.ReadFileDigest(base)),
 	}
 	return op.run(ctx)
 }
@@ -504,7 +514,7 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 // example a server that relays the chunks of its own clients).
 type FileWriteParams struct {
 	// WriteID is the write_id, a UUID v7 that the caller generated right
-	// before the first chunk of the file.
+	// before the first chunk of the file. The SDK uses its lowercase form.
 	WriteID string
 	// Path is the absolute guest target path.
 	Path string
@@ -534,6 +544,7 @@ type FileWrite struct {
 // OpenFileWrite returns a FileWrite. It sends nothing; the first chunk
 // starts the write in the guest.
 func (s *Sandbox) OpenFileWrite(p FileWriteParams) (*FileWrite, error) {
+	id := canonicalFileID(p.WriteID)
 	salt := p.BindingSalt
 	if len(salt) == 0 {
 		var err error
@@ -541,7 +552,7 @@ func (s *Sandbox) OpenFileWrite(p FileWriteParams) (*FileWrite, error) {
 			return nil, err
 		}
 	}
-	first := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: p.WriteID, Path: p.Path, BindingSalt: salt}
+	first := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: id, Path: p.Path, BindingSalt: salt}
 	if err := validate.WriteFileRequest(first, true); err != nil {
 		return nil, err
 	}
@@ -552,8 +563,8 @@ func (s *Sandbox) OpenFileWrite(p FileWriteParams) (*FileWrite, error) {
 		first: true,
 		op: &writeOp{
 			s:     s,
-			id:    p.WriteID,
-			grant: newRelayGrant(s, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE, p.WriteID, relaybinding.WriteFileDigest(first)),
+			id:    id,
+			grant: newRelayGrant(s, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE, id, relaybinding.WriteFileDigest(first)),
 		},
 	}, nil
 }
@@ -713,20 +724,27 @@ func (op *writeOp) send(ctx context.Context, req *ownsandv1.WriteFileRequest) (*
 }
 
 func (op *writeOp) p2pAttempt(ctx context.Context, sess *p2pSession, req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteFileResponse, error) {
-	st, err := sess.openStream(ctx, proto.Clone(req))
-	if err != nil {
-		return nil, err
-	}
-	defer st.close()
 	actx, cancel := context.WithTimeoutCause(ctx, op.s.c.timing.writeAttemptDeadline, errAttemptDeadline)
 	defer cancel()
+	attemptErr := func(err error) error {
+		if callerErr := ctx.Err(); callerErr != nil {
+			return callerErr
+		}
+		if context.Cause(actx) == errAttemptDeadline {
+			return errAttemptDeadline
+		}
+		return err
+	}
+
+	st, err := sess.openStream(actx, proto.Clone(req))
+	if err != nil {
+		return nil, attemptErr(err)
+	}
+	defer st.close()
 	for {
 		f, err := st.recv(actx)
 		if err != nil {
-			if errors.Is(context.Cause(actx), errAttemptDeadline) && ctx.Err() == nil {
-				return nil, errAttemptDeadline
-			}
-			return nil, err
+			return nil, attemptErr(err)
 		}
 		switch f.GetKind() {
 		case ownsandv1.DataFrameKind_DATA_FRAME_KIND_FILE_WRITE_RESULT:

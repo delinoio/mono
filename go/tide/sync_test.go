@@ -342,6 +342,16 @@ func TestSyncSkipsSubmodulesAndNeedsGit(t *testing.T) {
 	}
 
 	plain := t.TempDir()
+	ceiling, err := filepath.Abs(filepath.Dir(plain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ceiling, err = filepath.EvalSymlinks(ceiling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stop Git from finding the enclosing checkout when TMPDIR is inside it.
+	t.Setenv("GIT_CEILING_DIRECTORIES", ceiling)
 	_, err = c.Sync(context.Background(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: plain})
 	if !errors.Is(err, ErrNotGitWorkTree) || connect.CodeOf(err) != connect.CodeFailedPrecondition {
 		t.Fatalf("not a work tree: %v", err)

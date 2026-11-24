@@ -34,10 +34,8 @@ import (
 const testAPIKey = "osk_test-secret-key-value"
 
 // canonicalFakeID returns the lowercase text form of a valid UUID v7 and any
-// other value unchanged. The real control plane rewrites validated sandbox
-// identifiers this way before it forwards a request to an agent or compares a
-// request with a relay grant; the fakes do the same, so a test that opens a
-// handle with an uppercase spelling reproduces that behavior.
+// other value unchanged. The real control plane canonicalizes sandbox and
+// file operation IDs before it forwards requests and relay grants to an agent.
 func canonicalFakeID(s string) string {
 	if u, err := uuidv7.Parse(s); err == nil {
 		return u.String()
@@ -704,7 +702,7 @@ func (f *fakeDataPath) AuthorizeRelay(ctx context.Context, req *connect.Request[
 	id, ok := cp.byAuthID[req.Msg.GetAuthorizationId()]
 	if !ok {
 		id = mustID(cp.t)
-		g := &fakeGrant{id: id, kind: req.Msg.GetOperationKind(), opID: req.Msg.GetOperationId(), digest: req.Msg.GetRequestDigest()}
+		g := &fakeGrant{id: id, kind: req.Msg.GetOperationKind(), opID: canonicalFakeID(req.Msg.GetOperationId()), digest: req.Msg.GetRequestDigest()}
 		if r := req.Msg.ReplacesGrantId; r != nil {
 			if old := cp.grants[*r]; old != nil && old.opID == g.opID {
 				old.replaced = true
@@ -937,6 +935,7 @@ func (f *fakeRelay) AttachExec(ctx context.Context, req *connect.Request[ownsand
 
 func (f *fakeRelay) ReadFile(ctx context.Context, req *connect.Request[ownsandv1.ReadFileRequest], stream *connect.ServerStream[ownsandv1.ReadFileResponse]) error {
 	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
+	req.Msg.ReadId = canonicalFakeID(req.Msg.GetReadId())
 	g, act, err := f.begin("ReadFile", req.Header(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_READ_FILE)
 	if err != nil {
 		return err
@@ -992,6 +991,7 @@ func (f *fakeRelay) ReadFile(ctx context.Context, req *connect.Request[ownsandv1
 
 func (f *fakeRelay) WriteFile(_ context.Context, req *connect.Request[ownsandv1.WriteFileRequest]) (*connect.Response[ownsandv1.WriteFileResponse], error) {
 	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
+	req.Msg.WriteId = canonicalFakeID(req.Msg.GetWriteId())
 	g, act, err := f.begin("WriteFile", req.Header(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE)
 	if err != nil {
 		return nil, err

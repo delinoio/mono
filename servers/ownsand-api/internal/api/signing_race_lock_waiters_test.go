@@ -18,12 +18,18 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
+// The holder, waiter and activity observer each need their own connection.
+const signingLockMinPoolConns = 3
+
 // holdAndBlockForShare creates a row in pool's database, holds its row lock
 // with FOR UPDATE and starts a FOR SHARE statement that blocks behind that
 // lock. It returns once pool's database shows the blocked statement. Cleanup
 // releases the lock and waits for the blocked statement.
 func holdAndBlockForShare(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
+	if maxConns := pool.Config().MaxConns; maxConns < signingLockMinPoolConns {
+		t.Fatalf("signing lock fixture pool_max_conns = %d, requires at least %d", maxConns, signingLockMinPoolConns)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	if _, err := pool.Exec(ctx, "CREATE TABLE lock_probe (id int PRIMARY KEY)"); err != nil {
@@ -61,10 +67,13 @@ func holdAndBlockForShare(t *testing.T, pool *pgxpool.Pool) {
 		// The statement blocks until the holder ends; its result is irrelevant.
 		_, _ = waiter.Exec(ctx, "SELECT 1 FROM lock_probe WHERE id = 1 FOR SHARE")
 	}()
+	// Bound the entire observation without canceling the blocked statement.
+	observerCtx, cancelObserver := context.WithTimeout(context.Background(), forShareLockWaitersTimeout)
+	defer cancelObserver()
 	testenv.Eventually(t, "the FOR SHARE statement waits for the row lock", func() bool {
-		n, err := queryForShareLockWaiters(ctx, pool)
+		n, err := queryForShareLockWaiters(observerCtx, pool)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("count FOR SHARE lock waiters: %v", err)
 		}
 		return n == 1
 	})
@@ -112,9 +121,9 @@ const (
 	signingLockPoolClosed = "signing lock fixture pool closed"
 )
 
-func TestForShareLockWaitersCleanUpAfterSetupError(t *testing.T) {
+func TestForShareLockWaitersCleanUpAfterFailure(t *testing.T) {
 	if failure := os.Getenv(signingLockFailureEnv); failure != "" {
-		failSigningLockFixtureSetup(t, failure)
+		failSigningLockFixture(t, failure)
 		return
 	}
 
@@ -123,21 +132,29 @@ func TestForShareLockWaitersCleanUpAfterSetupError(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tt := range []struct {
-		name      string
-		wantError string
+		name            string
+		wantError       string
+		wantNoCheckouts bool
 	}{
 		{name: "holder_statement", wantError: "SQLSTATE 25006"},
 		{name: "waiter_begin", wantError: waiterBeginError},
+		{name: "max_conns_1", wantError: "pool_max_conns = 1, requires at least 3", wantNoCheckouts: true},
+		{name: "max_conns_2", wantError: "pool_max_conns = 2, requires at least 3", wantNoCheckouts: true},
+		{name: "observer_checkout", wantError: "count FOR SHARE lock waiters: context deadline exceeded"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			// Own the database in the parent so it can be dropped if the child hangs.
 			databaseURL := dbtest.NewURL(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, executable,
-				"-test.run=^TestForShareLockWaitersCleanUpAfterSetupError$", "-test.v", "-test.timeout=30s")
+				"-test.run=^TestForShareLockWaitersCleanUpAfterFailure$", "-test.v", "-test.timeout=30s")
 			cmd.Env = append(cmd.Environ(), signingLockFailureEnv+"="+tt.name, dbtest.EnvTestDatabaseURL+"="+databaseURL)
 			output, err := cmd.CombinedOutput()
+			report := string(output)
+			if strings.Contains(report, databaseURL) {
+				t.Fatal("fixture subprocess printed the database URL")
+			}
 			if ctx.Err() != nil {
 				t.Fatalf("fixture subprocess timed out: %s", output)
 			}
@@ -146,21 +163,30 @@ func TestForShareLockWaitersCleanUpAfterSetupError(t *testing.T) {
 				t.Fatalf("fixture subprocess should fail with exit code 1, got %v: %s", err, output)
 			}
 			for _, want := range []string{tt.wantError, signingLockPoolClosed} {
-				if !strings.Contains(string(output), want) {
+				if !strings.Contains(report, want) {
 					t.Fatalf("fixture subprocess output is missing %q: %s", want, output)
 				}
+			}
+			if tt.wantNoCheckouts && !strings.Contains(report, "signing lock fixture checkouts = 0") {
+				t.Fatalf("undersized pool attempted a checkout: %s", output)
 			}
 		})
 	}
 }
 
-func failSigningLockFixtureSetup(t *testing.T, failure string) {
+func failSigningLockFixture(t *testing.T, failure string) {
 	t.Helper()
 	config, err := pgxpool.ParseConfig(dbtest.URL(t))
 	if err != nil {
 		t.Fatal("parse signing lock fixture database configuration")
 	}
 	config.MaxConns = 3
+	switch failure {
+	case "max_conns_1":
+		config.MaxConns = 1
+	case "max_conns_2":
+		config.MaxConns = 2
+	}
 	config.MinConns = 0
 	config.MinIdleConns = 0
 	var checkouts int
@@ -182,8 +208,16 @@ func failSigningLockFixtureSetup(t *testing.T, failure string) {
 	}
 	t.Cleanup(func() {
 		pool.Close()
-		t.Log(signingLockPoolClosed)
+		t.Logf("%s; signing lock fixture checkouts = %d", signingLockPoolClosed, checkouts)
 	})
+	if failure == "observer_checkout" {
+		// Reserve one slot so the holder and waiter leave none for the observer.
+		conn, err := pool.Acquire(t.Context())
+		if err != nil {
+			t.Fatalf("reserve a signing lock fixture connection: %v", err)
+		}
+		t.Cleanup(conn.Release)
+	}
 
 	holdAndBlockForShare(t, pool)
 }

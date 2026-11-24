@@ -73,7 +73,7 @@ export interface OwnSandClientOptions {
   apiKey?: string;
   /** A function that returns a current Logto access token. */
   accessToken?: () => string | Promise<string>;
-  /** Default organization; `OWNSAND_ORG` when absent. */
+  /** Default organization. Uses `OWNSAND_ORG` when omitted or empty. */
   organizationId?: string;
   /** Forces a data path transport, for example for tests. */
   transport?: DataPathTransport;
@@ -160,7 +160,7 @@ export class OwnSandClient {
           : undefined;
     const credential = resolveCredential(explicit, env);
     this.origin = resolveApiOrigin(options.origin);
-    const org = options.organizationId ?? env[EnvVar.Organization];
+    const org = options.organizationId || env[EnvVar.Organization];
     this.organizationId = org === "" ? undefined : org;
     this.#clock = options.clock ?? systemClock;
     this.#ids = new UuidV7Generator(() => this.#clock.wallNow());
@@ -191,7 +191,7 @@ export class OwnSandClient {
   }
 
   #org(override: string | undefined): string {
-    const org = override ?? this.organizationId;
+    const org = override || this.organizationId;
     if (org === undefined || org === "") {
       throw new OwnSandConfigError(
         `no organization: set organizationId or ${EnvVar.Organization}`,

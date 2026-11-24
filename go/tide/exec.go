@@ -128,7 +128,8 @@ type ExecParams struct {
 	// WorkingDirectory is an absolute guest path or a path relative to the
 	// workspace path. Empty means the workspace path.
 	WorkingDirectory string
-	// Timeout stops the command; zero means no timeout.
+	// Timeout specifies how long the command can run. Zero means no timeout.
+	// Exec rejects negative values.
 	Timeout time.Duration
 	// OnEvent receives the events in order. An error from it ends the
 	// stream (the command keeps running in the guest) and Exec returns that
@@ -199,6 +200,12 @@ func (e *ExecStreamError) Unwrap() error { return e.Err }
 // unchanged: the command did not run. Failures after the request was sent
 // are returned as *ExecStreamError.
 func (c *Client) Exec(ctx context.Context, p ExecParams) (*ExecResult, error) {
+	if len(p.Command) == 0 {
+		return nil, localError(connect.CodeInvalidArgument, errors.New("tide: exec needs a command"))
+	}
+	if p.Timeout < 0 {
+		return nil, localError(connect.CodeInvalidArgument, errors.New("tide: exec timeout must be nonnegative"))
+	}
 	execID := p.ExecID
 	if execID == "" {
 		id, err := uuidv7.NewString()
@@ -206,9 +213,6 @@ func (c *Client) Exec(ctx context.Context, p ExecParams) (*ExecResult, error) {
 			return nil, err
 		}
 		execID = id
-	}
-	if len(p.Command) == 0 {
-		return nil, localError(connect.CodeInvalidArgument, errors.New("tide: exec needs a command"))
 	}
 	req := &tidev1.ExecDevSessionRequest{
 		OrganizationId:   p.OrganizationID,
