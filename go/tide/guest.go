@@ -30,15 +30,16 @@ import (
 
 // Environment variable names of the guest commands.
 const (
-	guestEnvLock      = "TIDE_SYNC_LOCK"
-	guestEnvForce     = "TIDE_SYNC_FORCE"
-	guestEnvWorkspace = "TIDE_SYNC_WORKSPACE"
-	guestEnvArchive   = "TIDE_SYNC_ARCHIVE"
-	guestEnvDeletes   = "TIDE_SYNC_DELETE_LIST"
-	guestEnvPrunes    = "TIDE_SYNC_PRUNE_LIST"
-	guestEnvLinks     = "TIDE_SYNC_LINK_LIST"
-	guestEnvPath      = "TIDE_DOWNLOAD_PATH"
-	guestEnvDLArchive = "TIDE_DOWNLOAD_ARCHIVE"
+	guestEnvLock         = "TIDE_SYNC_LOCK"
+	guestEnvForce        = "TIDE_SYNC_FORCE"
+	guestEnvWorkspace    = "TIDE_SYNC_WORKSPACE"
+	guestEnvArchive      = "TIDE_SYNC_ARCHIVE"
+	guestEnvDeletes      = "TIDE_SYNC_DELETE_LIST"
+	guestEnvReplaceFiles = "TIDE_SYNC_REPLACE_FILE_LIST"
+	guestEnvPrunes       = "TIDE_SYNC_PRUNE_LIST"
+	guestEnvLinks        = "TIDE_SYNC_LINK_LIST"
+	guestEnvPath         = "TIDE_DOWNLOAD_PATH"
+	guestEnvDLArchive    = "TIDE_DOWNLOAD_ARCHIVE"
 )
 
 // exitLocked is the exit code of the lock command when the lock exists.
@@ -61,9 +62,15 @@ exit 1`,
 mkdir -p "$TIDE_SYNC_WORKSPACE"
 cd "$TIDE_SYNC_WORKSPACE"
 if [ -n "$TIDE_SYNC_DELETE_LIST" ]; then xargs -0 rm -f -- < "$TIDE_SYNC_DELETE_LIST"; fi
+if [ -n "$TIDE_SYNC_REPLACE_FILE_LIST" ]; then
+  xargs -0 sh -c 'for p do
+    if [ ! -L "$p" ] && [ -d "$p" ]; then continue; fi
+    rm -f -- "$p" || exit 1
+  done' tide < "$TIDE_SYNC_REPLACE_FILE_LIST"
+fi
 if [ -n "$TIDE_SYNC_PRUNE_LIST" ]; then xargs -0 sh -c 'for d do if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir -- "$d" || exit 1; fi; done' tide < "$TIDE_SYNC_PRUNE_LIST"; fi
 if [ -n "$TIDE_SYNC_ARCHIVE" ]; then tar -x -m -o -f "$TIDE_SYNC_ARCHIVE"; fi`,
-	opCleanup: `for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_PRUNE_LIST"; do if [ -n "$f" ]; then rm -f "$f"; fi; done
+	opCleanup: `for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_REPLACE_FILE_LIST" "$TIDE_SYNC_PRUNE_LIST"; do if [ -n "$f" ]; then rm -f "$f"; fi; done
 if [ -n "$TIDE_SYNC_LOCK" ]; then rm -rf "$TIDE_SYNC_LOCK"; fi`,
 	opProbe: `p="$TIDE_DOWNLOAD_PATH"
 if [ -d "$p" ]; then

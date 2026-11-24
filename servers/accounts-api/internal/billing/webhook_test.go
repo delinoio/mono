@@ -802,6 +802,76 @@ func TestCustomDataPaymentOnlyAddsCredit(t *testing.T) {
 	}
 }
 
+func TestLatePaymentOfEarlierSubscriptionKeepsCanceledReplacement(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	org := f.link(acct, "Organization")
+	cancelTime := f.clock.Now()
+	oldSub, _, before := f.canceledReplacement(acct, cancelTime)
+	if before.PaddleUpdateTime == nil || !before.PaddleUpdateTime.Equal(cancelTime) {
+		t.Fatalf("canceled replacement update time = %v, want %v", before.PaddleUpdateTime, cancelTime)
+	}
+	f.wantStatus(org, StatusBlocked, ReasonNoActiveSubscription)
+	logs := f.captureLogs()
+	eventsBefore := f.eventCount()
+
+	lateTxnID := f.paddle.NewID("txn")
+	data := paddletest.Transaction(paddletest.TransactionData{
+		ID: lateTxnID, SubscriptionID: oldSub, Origin: paddle.OriginSubscriptionRecurring,
+		PriceID: priceID, SubtotalCents: 1000, PeriodEnd: f.clock.Now().AddDate(0, 1, 0),
+	})
+	body := paddletest.Event("evt_late_renewal", paddle.EventTransactionCompleted, f.clock.Now(), data)
+	sig := paddle.SignatureHeaderValue(whSecret, f.clock.Now(), body)
+	for range 2 {
+		if code := f.deliver(body, sig); code != http.StatusOK {
+			t.Fatalf("late payment webhook status = %d, want %d", code, http.StatusOK)
+		}
+		f.wantLedger(acct, wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd})
+		after, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+		if err != nil || !reflect.DeepEqual(after, before) {
+			t.Fatalf("subscription after the late payment = %+v, %v, want %+v", after, err, before)
+		}
+		f.wantStatus(org, StatusBlocked, ReasonNoActiveSubscription)
+	}
+	if got := f.eventCount(); got != eventsBefore+1 {
+		t.Fatalf("recorded events = %d, want %d", got, eventsBefore+1)
+	}
+	if got := f.count(`SELECT count(*) FROM paddle_subscriptions
+		WHERE paddle_subscription_id = $1 AND billing_account_id = $2`, oldSub, acct); got != 1 {
+		t.Fatalf("mapped subscriptions for the renewal = %d, want 1", got)
+	}
+	var ignoredLogs []string
+	for line := range strings.Lines(logs.String()) {
+		if strings.Contains(line, `"msg":"billing_subscription_payment_ignored"`) {
+			ignoredLogs = append(ignoredLogs, line)
+		}
+	}
+	if len(ignoredLogs) != 1 ||
+		!strings.Contains(ignoredLogs[0], `"billing_account_id":"`+acct+`"`) ||
+		!strings.Contains(ignoredLogs[0], `"paddle_subscription_id":"`+oldSub+`"`) ||
+		!strings.Contains(ignoredLogs[0], `"paddle_transaction_id":"`+lateTxnID+`"`) ||
+		!strings.Contains(ignoredLogs[0], `"reason":"different_canceled_subscription"`) {
+		t.Fatalf("ignored activation logs = %q, want one with the account, subscription, transaction, and reason fields", ignoredLogs)
+	}
+
+	txnID := f.checkout(acct)
+	pending, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if err != nil || txnID == "" || pending.Status != SubscriptionPending || pending.CheckoutTransactionID != txnID {
+		t.Fatalf("subscription after StartSubscription = %+v, %v (transaction %q)", pending, err, txnID)
+	}
+	newSub := f.paddle.NewID("sub")
+	if code := f.webhook(paddle.EventTransactionCompleted, paddletest.Transaction(paddletest.TransactionData{
+		ID: txnID, SubscriptionID: newSub, Origin: paddle.OriginWeb, PriceID: priceID, SubtotalCents: 1000,
+	})); code != http.StatusOK {
+		t.Fatalf("checkout payment webhook status = %d, want %d", code, http.StatusOK)
+	}
+	active, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if err != nil || active.Status != SubscriptionActive || active.PaddleSubscriptionID != newSub || active.CheckoutTransactionID != "" {
+		t.Fatalf("subscription after the checkout payment = %+v, %v, want active subscription %q", active, err, newSub)
+	}
+	f.wantStatus(org, StatusAllowed, ReasonNone)
+}
+
 // TestLatePaymentOfEarlierSubscriptionKeepsNewCheckout checks that the
 // verified payment of a canceled earlier subscription neither activates nor
 // alters the pending row of a new checkout, that the credit is still granted

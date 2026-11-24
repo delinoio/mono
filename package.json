@@ -7,7 +7,7 @@
   "scripts": {
     "prepare": "./scripts/install-git-hooks.sh",
     "build": "turbo run build",
-    "dev": "node scripts/dev/start-portless-proxy.mjs && turbo run dev",
+    "dev": "node scripts/dev/start-dev.mjs",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test test:tooling",

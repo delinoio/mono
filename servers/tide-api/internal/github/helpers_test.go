@@ -25,6 +25,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/githubapi"
 	"github.com/delinoio/mono/servers/tide-api/internal/githubapi/githubfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/lease"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 )
@@ -131,8 +132,9 @@ type ghWorld struct {
 }
 
 type worldOpts struct {
-	unconfigured bool
-	warm         int32
+	unconfigured   bool
+	manualDispatch bool
+	warm           int32
 }
 
 func newGHWorld(t *testing.T, o worldOpts) *ghWorld {
@@ -160,7 +162,16 @@ func newGHWorld(t *testing.T, o worldOpts) *ghWorld {
 		}
 	}
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(w.reader))
-	w.env = testenv.New(t, testenv.WithLayerOptions(opts, w.l), func(ao *app.Options) { ao.Metrics = provider })
+	w.env = testenv.New(t, testenv.WithLayerOptions(opts, w.l), func(ao *app.Options) {
+		ao.Metrics = provider
+		if o.manualDispatch {
+			// Hold the lease elsewhere so only explicit passes run in the test.
+			if _, err := ao.DB.Pool.Exec(t.Context(), "INSERT INTO instance_leases (lease_name, holder, expire_time) VALUES ($1, $2, $3)",
+				lease.Name, "manual-dispatch", ao.Now().Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
 	clock.Store(w.env.Clock)
 	t.Cleanup(func() {
 		if t.Failed() {

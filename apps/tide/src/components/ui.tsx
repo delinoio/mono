@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError } from "@connectrpc/connect";
 import { Badge, BadgeVariant } from "delino-ui/badge";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import {
@@ -20,6 +21,7 @@ import {
 import { Skeleton } from "delino-ui/skeleton";
 import { toast } from "delino-ui/toast";
 import { type FormEvent, type ReactNode, useState } from "react";
+import { useAuth } from "../auth.tsx";
 import { errorMessage } from "../format.ts";
 
 export function PageHeader({
@@ -58,7 +60,20 @@ export function Loading({ label = "Loading" }: { label?: string }) {
   );
 }
 
-/** A failed request, with a retry button. */
+function SignInButton() {
+  const auth = useAuth();
+  return (
+    <Button
+      type="button"
+      variant={ButtonVariant.Secondary}
+      onClick={() => auth.signIn()}
+    >
+      Sign in with Delino
+    </Button>
+  );
+}
+
+/** A failed request with the recovery action for its error. */
 export function ErrorNotice({
   error,
   onRetry,
@@ -66,10 +81,14 @@ export function ErrorNotice({
   error: unknown;
   onRetry?: () => void;
 }) {
+  const sessionEnded =
+    error instanceof ConnectError && error.code === Code.Unauthenticated;
   return (
     <div className="notice notice-error" role="alert">
       <p>{errorMessage(error)}</p>
-      {onRetry ? (
+      {sessionEnded ? (
+        <SignInButton />
+      ) : onRetry ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
           Try again
         </Button>
