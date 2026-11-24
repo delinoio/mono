@@ -4,12 +4,15 @@ package e2e
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/delinoio/mono/go/ownsand"
@@ -86,30 +89,132 @@ func waitSandboxState(ctx context.Context, t *testing.T, sb *ownsand.Sandbox, wh
 	}
 }
 
-// hcsSystems returns the output of hcsdiag list, which names every compute
-// system of the host.
-func hcsSystems(t *testing.T) string {
-	t.Helper()
-	out, err := exec.Command("hcsdiag", "list").CombinedOutput()
-	if err != nil {
-		t.Fatalf("hcsdiag list: %v\n%s", err, out)
-	}
-	return string(out)
+func hcsListOutput(ctx context.Context, executable string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, executable, args...)
+	// Bound output collection if an inherited pipe stays open after the command exits.
+	cmd.WaitDelay = 100 * time.Millisecond
+	return cmd.CombinedOutput()
 }
 
-// requireNoComputeSystem fails when a compute system of the sandbox exists.
+// requireNoComputeSystem checks that hcsdiag no longer lists the sandbox.
 func requireNoComputeSystem(t *testing.T, sandboxID string) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		out := hcsSystems(t)
-		if !strings.Contains(strings.ToLower(out), strings.ToLower(sandboxID)) {
-			return
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := waitForNoComputeSystem(ctx, sandboxID, func(ctx context.Context) ([]byte, error) {
+		return hcsListOutput(ctx, "hcsdiag", "list")
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForNoComputeSystem(ctx context.Context, sandboxID string, list func(context.Context) ([]byte, error)) error {
+	matchID := strings.ToLower(sandboxID)
+	var lastOutput []byte
+	for ctx.Err() == nil {
+		out, err := list(ctx)
+		if len(out) > 0 {
+			lastOutput = out
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("a compute system of sandbox %s is left:\n%s", sandboxID, out)
+		if ctx.Err() != nil {
+			break
 		}
-		time.Sleep(time.Second)
+		if err != nil {
+			return fmt.Errorf("hcsdiag list for sandbox %s: %w\n%s", sandboxID, err, out)
+		}
+		if !strings.Contains(strings.ToLower(string(out)), matchID) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+		}
+	}
+	return fmt.Errorf("wait for hcsdiag list to omit sandbox %s: %w\n%s", sandboxID, ctx.Err(), lastOutput)
+}
+
+func TestRequireNoComputeSystemCancelsCommand(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	t.Setenv(envHelperMode, string(helperBlock))
+	bin, args := helperArgs()
+	done := make(chan error, 1)
+	go func() {
+		done <- waitForNoComputeSystem(ctx, "sandbox-id", func(ctx context.Context) ([]byte, error) {
+			return hcsListOutput(ctx, bin, args...)
+		})
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) ||
+			!strings.Contains(err.Error(), "sandbox-id") ||
+			!strings.Contains(err.Error(), "out-final") ||
+			!strings.Contains(err.Error(), "err-final") {
+			t.Fatalf("waitForNoComputeSystem = %v, want deadline, sandbox ID, and both output streams", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the blocked helper process did not return after the deadline")
+	}
+}
+
+func TestRequireNoComputeSystemStopsPollingAtDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const budget = 1500 * time.Millisecond
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(t.Context(), budget)
+		defer cancel()
+		const output = "running SANDBOX-ID"
+		polls := 0
+		err := waitForNoComputeSystem(ctx, "sandbox-id", func(ctx context.Context) ([]byte, error) {
+			polls++
+			if ctx.Err() != nil {
+				t.Error("poll started after the deadline")
+			}
+			return []byte(output), nil
+		})
+		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), output) {
+			t.Fatalf("waitForNoComputeSystem = %v, want deadline and %q", err, output)
+		}
+		if elapsed := time.Since(start); elapsed != budget || polls != 2 {
+			t.Errorf("polls = %d, elapsed = %s, want 2 polls in %s", polls, elapsed, budget)
+		}
+	})
+}
+
+func TestRequireNoComputeSystemReturnsWhenAbsent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, outputs := range [][]string{{"other compute system"}, {"running SANDBOX-ID", "other compute system"}} {
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			polls := 0
+			err := waitForNoComputeSystem(ctx, "sandbox-id", func(context.Context) ([]byte, error) {
+				if polls == len(outputs) {
+					t.Fatal("poll continued after the sandbox ID disappeared")
+				}
+				output := outputs[polls]
+				polls++
+				return []byte(output), nil
+			})
+			cancel()
+			if err != nil || polls != len(outputs) {
+				t.Errorf("output sequence %q: got %d polls, error %v", outputs, polls, err)
+			}
+		}
+	})
+}
+
+func TestRequireNoComputeSystemReportsCommandFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	t.Setenv(envHelperMode, string(helperFail))
+	bin, args := helperArgs()
+	err := waitForNoComputeSystem(ctx, "sandbox-id", func(ctx context.Context) ([]byte, error) {
+		return hcsListOutput(ctx, bin, args...)
+	})
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 ||
+		!strings.Contains(err.Error(), "out-final") ||
+		!strings.Contains(err.Error(), "err-final") {
+		t.Fatalf("waitForNoComputeSystem = %v, want exit code 1 and both output streams", err)
 	}
 }
 

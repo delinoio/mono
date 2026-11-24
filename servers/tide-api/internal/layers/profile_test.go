@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -298,6 +299,70 @@ func TestRunnerProfiles(t *testing.T) {
 
 // Two updates of different masked fields of one profile that overlap both
 // stay applied.
+func TestRunnerProfileWindowsWorkspacePath(t *testing.T) {
+	w := newWorld(t)
+	ctx := t.Context()
+	admin := w.env.User(w.org.Admin).Profile
+	profile := linuxDevProfile()
+	profile.GuestOs = tidev1.GuestOs_GUEST_OS_WINDOWS
+	profile.Source = &tidev1.RunnerProfile_BaseImage{BaseImage: tidev1.GuestOs_GUEST_OS_WINDOWS}
+	profile.WorkspacePath = `C:\work\NUL`
+
+	_, err := admin.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{
+		OrganizationId: w.org.ID, Profile: profile,
+	}))
+	wantCode(t, "create with reserved device name", err, connect.CodeInvalidArgument)
+	if !strings.Contains(err.Error(), "workspace_path") {
+		t.Fatalf("create error does not name workspace_path: %v", err)
+	}
+
+	// Creating a profile with the same name confirms the rejected create did not save it.
+	profile.WorkspacePath = `C:\work`
+	created, err := admin.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{
+		OrganizationId: w.org.ID, Profile: profile,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created.Msg.GetProfile().GetRunnerProfileId()
+	update := func(path string) (*connect.Response[tidev1.UpdateRunnerProfileResponse], error) {
+		return admin.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: id,
+			Profile:    &tidev1.RunnerProfile{WorkspacePath: path},
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"workspace_path"}},
+		}))
+	}
+	assertStoredPath := func(want string) {
+		t.Helper()
+		got, err := admin.GetRunnerProfile(ctx, connect.NewRequest(&tidev1.GetRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: id,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if path := got.Msg.GetProfile().GetWorkspacePath(); path != want {
+			t.Fatalf("stored workspace path = %q, want %q", path, want)
+		}
+	}
+
+	_, err = update(`C:\work\LPT9.log`)
+	wantCode(t, "update with reserved device name", err, connect.CodeInvalidArgument)
+	if !strings.Contains(err.Error(), "workspace_path") {
+		t.Fatalf("update error does not name workspace_path: %v", err)
+	}
+	assertStoredPath(`C:\work`)
+
+	// Simulate a profile saved before reserved device names were rejected.
+	if _, err := w.env.DB.Pool.Exec(ctx, "UPDATE runner_profiles SET workspace_path = $2 WHERE runner_profile_id = $1", id, `C:\work\NUL`); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := update(`C:\work\project`)
+	if err != nil || repaired.Msg.GetProfile().GetWorkspacePath() != `C:\work\project` {
+		t.Fatalf("repair workspace path: %v (%v)", repaired, err)
+	}
+	assertStoredPath(`C:\work\project`)
+}
+
 func TestRunnerProfileConcurrentUpdates(t *testing.T) {
 	w := newWorld(t)
 	ctx := context.Background()

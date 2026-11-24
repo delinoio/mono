@@ -9,6 +9,11 @@ import {
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { SnapshotState } from "@delino/ownsand-protos/v1/common_pb";
 import {
+  type Invitation,
+  type ListInvitationsRequest,
+  type ListInvitationsResponse,
+} from "@delino/ownsand-protos/v1/member_pb";
+import {
   type ListSnapshotsResponse,
   SnapshotService,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
@@ -230,6 +235,127 @@ describe("snapshot source lists", () => {
     );
     expect(state.tokens).toHaveLength(6);
   });
+});
+
+describe("pending invitations list", () => {
+  const name = "Pending invitations";
+  const path = `/orgs/${MOCK_IDS.acme}/members`;
+
+  function invitationPages() {
+    const userId = "user-admin-jun";
+    const mock = createMockTransport({ extraInvitations: 1, userId });
+    const state = {
+      requests: [] as ListInvitationsRequest[],
+      continuationError: undefined as Code | undefined,
+    };
+    let firstInvitation: Invitation | undefined;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, signal, timeout, header, input, contextValues) {
+        if (method.name !== "ListInvitations") {
+          return mock.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+        }
+        const request = input as typeof input & ListInvitationsRequest;
+        state.requests.push(request);
+        if (request.pageToken && state.continuationError !== undefined) {
+          throw new ConnectError(
+            "Could not load invitations",
+            state.continuationError,
+          );
+        }
+        const response = await mock.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          { ...request, pageSize: 1 },
+          contextValues,
+        );
+        const { invitations } =
+          response.message as unknown as ListInvitationsResponse;
+        if (!request.pageToken) {
+          firstInvitation = invitations[0];
+        } else if (firstInvitation && invitations.length > 0) {
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              invitations: [firstInvitation, ...invitations],
+            },
+          };
+        }
+        return response;
+      },
+    };
+    return { transport, state, userId };
+  }
+
+  test("shows each invitation once and starts a new organization without a cursor", async () => {
+    const { transport, state, userId } = invitationPages();
+    const { organization } = await createClient(
+      OrganizationService,
+      transport,
+    ).createOrganization({ name: "Initech" });
+    renderConsole(path, { transport, userId });
+
+    await waitForRows(name, 2);
+    await waitFor(() => expect(state.requests).toHaveLength(3));
+    expect(state.requests.map((request) => request.pageSize)).toEqual([
+      200, 200, 200,
+    ]);
+    expect(state.requests[0]!.pageToken).toBe("");
+    expect(state.requests[1]!.pageToken).not.toBe("");
+    expect(state.requests[2]!.pageToken).not.toBe("");
+    expect(state.requests[2]!.pageToken).not.toBe(state.requests[1]!.pageToken);
+    expect(
+      screen.getByRole("button", { name: "Revoke Member invitation osi_0000" }),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Organization" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Initech" }));
+
+    expect(await screen.findByText("No pending invitations")).toBeTruthy();
+    expect(screen.queryByRole("list", { name })).toBeNull();
+    expect(state.requests).toHaveLength(4);
+    expect(state.requests[3]).toMatchObject({
+      organizationId: organization!.organizationId,
+      pageToken: "",
+    });
+  });
+
+  test.each([
+    [Code.NotFound, "It was not found, or you no longer have access to it."],
+    [Code.PermissionDenied, "You do not have permission to do this."],
+    [Code.Unauthenticated, "Your session ended. Sign in again."],
+  ] as const)(
+    "hides rows and revoke actions on terminal continuation status %s",
+    async (code, message) => {
+      const { transport, state, userId } = invitationPages();
+      state.continuationError = code;
+      renderConsole(path, { transport, userId });
+
+      const region = within(
+        await screen.findByRole("region", { name: "Invitations" }),
+      );
+      expect(await region.findByText(message)).toBeTruthy();
+      expect(region.queryByRole("list", { name })).toBeNull();
+      expect(region.queryByRole("button", { name: /^Revoke/ })).toBeNull();
+      expect(region.queryByText(/Some pending invitations/)).toBeNull();
+      if (code === Code.Unauthenticated) {
+        expect(
+          region.getByRole("button", { name: "Sign in with Delino" }),
+        ).toBeTruthy();
+      }
+      expect(state.requests[1]?.pageToken).toBeTruthy();
+    },
+  );
 });
 
 describe("enrollment tokens list", () => {

@@ -62,18 +62,36 @@ func (s *execSender) idle() time.Duration {
 	return time.Since(s.last)
 }
 
-// convertEvent copies an OwnSand exec event into the tide schema.
-func convertEvent(ev ownsand.ExecEvent) *tidev1.DevSessionExecEvent {
+// execOffsets tracks the next byte of each output stream in one relay.
+type execOffsets struct {
+	stdout int64
+	stderr int64
+}
+
+// convertEvent copies an OwnSand exec event into the tide schema and advances the offsets.
+func (o *execOffsets) convertEvent(ev ownsand.ExecEvent) *tidev1.DevSessionExecEvent {
 	switch ev.Kind {
 	case ownsand.ExecEventStarted:
-		return &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Started{Started: &tidev1.DevSessionExecStarted{ExecId: ev.ExecID, StartTime: timestamppb.Now()}}}
+		started := &tidev1.DevSessionExecStarted{ExecId: ev.ExecID}
+		if ev.StartTime != nil {
+			started.StartTime = timestamppb.New(*ev.StartTime)
+		}
+		return &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Started{Started: started}}
 	case ownsand.ExecEventStdout:
+		o.stdout = max(o.stdout, ev.Offset+int64(len(ev.Data)))
 		return &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Stdout{Stdout: &tidev1.DevSessionExecOutput{Offset: ev.Offset, Data: ev.Data}}}
 	case ownsand.ExecEventStderr:
+		o.stderr = max(o.stderr, ev.Offset+int64(len(ev.Data)))
 		return &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Stderr{Stderr: &tidev1.DevSessionExecOutput{Offset: ev.Offset, Data: ev.Data}}}
 	case ownsand.ExecEventOutputTruncated:
+		if !ev.MissingStdout.Empty() {
+			o.stdout = max(o.stdout, ev.MissingStdout.To)
+		}
+		if !ev.MissingStderr.Empty() {
+			o.stderr = max(o.stderr, ev.MissingStderr.To)
+		}
 		return &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_OutputTruncated{OutputTruncated: &tidev1.DevSessionExecOutputTruncated{
-			StdoutOffset: ev.MissingStdout.To, StderrOffset: ev.MissingStderr.To}}}
+			StdoutOffset: o.stdout, StderrOffset: o.stderr}}}
 	}
 	return nil
 }
@@ -83,7 +101,10 @@ func convertEvent(ev ownsand.ExecEvent) *tidev1.DevSessionExecEvent {
 func resultEvent(res *ownsand.ExecResult) (*tidev1.DevSessionExecEvent, string) {
 	switch res.Kind {
 	case ownsand.ExecResultExited:
-		ex := &tidev1.DevSessionExecExited{TimedOut: res.TimedOut, EndTime: timestamppb.Now()}
+		ex := &tidev1.DevSessionExecExited{TimedOut: res.TimedOut}
+		if res.EndTime != nil {
+			ex.EndTime = timestamppb.New(*res.EndTime)
+		}
 		switch {
 		case res.ExitCode != nil:
 			ex.Status = &tidev1.DevSessionExecExited_ExitCode{ExitCode: *res.ExitCode}
@@ -103,7 +124,7 @@ func resultEvent(res *ownsand.ExecResult) (*tidev1.DevSessionExecEvent, string) 
 // before StreamLimit with an OK status and no final event (the command keeps
 // running; the client continues with AttachDevSessionExec) and sends a
 // keepalive when no event went out for KeepaliveInterval.
-func (h *Handler) relayExec(ctx context.Context, sess *session, execID string, send func(*tidev1.DevSessionExecEvent) error,
+func (h *Handler) relayExec(ctx context.Context, sess *session, execID string, offsets execOffsets, send func(*tidev1.DevSessionExecEvent) error,
 	run func(ctx context.Context, onEvent func(ownsand.ExecEvent) error) (*ownsand.ExecResult, error)) error {
 	start := time.Now()
 	streamCtx, cancel := context.WithTimeout(ctx, h.timing.StreamLimit)
@@ -139,7 +160,7 @@ func (h *Handler) relayExec(ctx context.Context, sess *session, execID string, s
 		}
 	}()
 	res, err := run(streamCtx, func(ev ownsand.ExecEvent) error {
-		if out := convertEvent(ev); out != nil {
+		if out := offsets.convertEvent(ev); out != nil {
 			if err := sender.Send(out); err != nil {
 				fail(err)
 				return err
@@ -212,7 +233,7 @@ func (h *Handler) ExecDevSession(ctx context.Context, req *connect.Request[tidev
 	if err != nil {
 		return h.svc.Internal(ctx, "exec dev session", err)
 	}
-	return h.relayExec(ctx, sess, execID, func(ev *tidev1.DevSessionExecEvent) error {
+	return h.relayExec(ctx, sess, execID, execOffsets{}, func(ev *tidev1.DevSessionExecEvent) error {
 		return stream.Send(&tidev1.ExecDevSessionResponse{Event: ev})
 	}, func(ctx context.Context, onEvent func(ownsand.ExecEvent) error) (*ownsand.ExecResult, error) {
 		return client.Exec(ctx, sess.runner.SandboxID, ownsand.ExecParams{
@@ -232,17 +253,18 @@ func (h *Handler) AttachDevSessionExec(ctx context.Context, req *connect.Request
 	if err != nil {
 		return err
 	}
-	if m.GetStdoutOffset() < 0 || m.GetStderrOffset() < 0 {
+	offsets := execOffsets{stdout: m.GetStdoutOffset(), stderr: m.GetStderrOffset()}
+	if offsets.stdout < 0 || offsets.stderr < 0 {
 		return api.ErrInvalidf("invalid offsets: must not be negative")
 	}
 	client, _, err := h.e.Links().Client(ctx, sess.req.OrganizationID)
 	if err != nil {
 		return h.svc.Internal(ctx, "attach dev session exec", err)
 	}
-	return h.relayExec(ctx, sess, execID, func(ev *tidev1.DevSessionExecEvent) error {
+	return h.relayExec(ctx, sess, execID, offsets, func(ev *tidev1.DevSessionExecEvent) error {
 		return stream.Send(&tidev1.AttachDevSessionExecResponse{Event: ev})
 	}, func(ctx context.Context, onEvent func(ownsand.ExecEvent) error) (*ownsand.ExecResult, error) {
-		return client.AttachExec(ctx, sess.runner.SandboxID, execID, ownsand.AttachParams{StdoutOffset: m.GetStdoutOffset(), StderrOffset: m.GetStderrOffset(), OnEvent: onEvent})
+		return client.AttachExec(ctx, sess.runner.SandboxID, execID, ownsand.AttachParams{StdoutOffset: offsets.stdout, StderrOffset: offsets.stderr, OnEvent: onEvent})
 	})
 }
 

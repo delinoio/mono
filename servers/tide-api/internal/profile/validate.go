@@ -101,7 +101,8 @@ func DefaultPriority(kind tidev1.WorkloadKind) tidev1.Priority {
 // syntax of guest: `/...` for Linux and macOS, `X:\...` for Windows. The
 // path has no `.` or `..` segment, no empty segment and no trailing
 // separator, because sync keeps its manifest and lock next to the workspace
-// (`<workspace_path>.tide-sync.json`).
+// (`<workspace_path>.tide-sync.json`). Windows path segments also exclude
+// reserved device names.
 func ValidWorkspacePath(guest tidev1.GuestOs, path string) bool {
 	if path == "" || len(path) > maxWorkspacePath || !utf8.ValidString(path) {
 		return false
@@ -137,11 +138,24 @@ func ValidWorkspacePath(guest tidev1.GuestOs, path string) bool {
 		if seg == "" || seg == "." || seg == ".." {
 			return false
 		}
-		if guest == tidev1.GuestOs_GUEST_OS_WINDOWS && (strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, " ")) {
+		if guest == tidev1.GuestOs_GUEST_OS_WINDOWS && (strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, " ") || isWindowsDeviceName(seg)) {
 			return false
 		}
 	}
 	return true
+}
+
+// isWindowsDeviceName applies the same basename rule as the Tide Go SDK's
+// file sync validation. Windows reserves these names even with an extension.
+func isWindowsDeviceName(segment string) bool {
+	base, _, _ := strings.Cut(segment, ".")
+	switch strings.ToUpper(strings.TrimRight(base, " ")) {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³":
+		return true
+	}
+	return false
 }
 
 func isLetter(c byte) bool { return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' }
@@ -185,6 +199,9 @@ func (rules Rules) Validate(p *Profile, vendor tidev1.AgentVendor) error {
 	}
 	if p.Kind == tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION {
 		if !ValidWorkspacePath(p.GuestOS, p.WorkspacePath) {
+			if p.GuestOS == tidev1.GuestOs_GUEST_OS_WINDOWS {
+				return api.ErrInvalidf("invalid workspace_path: must be an absolute Windows path without reserved device names or a trailing separator")
+			}
 			return api.ErrInvalidf("invalid workspace_path: must be an absolute %s path without a trailing separator", p.GuestOS)
 		}
 	} else if p.WorkspacePath != "" {

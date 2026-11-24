@@ -15,6 +15,7 @@ import (
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
@@ -112,6 +113,74 @@ func checkLines(t *testing.T, res *ExecResult, r *recorder, n int) {
 	}
 	if r.count(ExecEventStarted) != 1 {
 		t.Fatalf("%d started events", r.count(ExecEventStarted))
+	}
+}
+
+func TestExecGuestTimestamps(t *testing.T) {
+	start := time.Date(2024, time.January, 1, 0, 0, 0, 123456789, time.UTC)
+	end := time.Date(2024, time.January, 1, 0, 0, 2, 987654321, time.UTC)
+	epoch := time.Unix(0, 0).UTC()
+	invalid := &timestamppb.Timestamp{Nanos: 1_000_000_000}
+	for _, path := range []struct {
+		name string
+		mode Transport
+		want ownsandv1.DataPathTransport
+	}{
+		{"peer-to-peer", TransportAuto, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER},
+		{"relay", TransportRelay, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY},
+	} {
+		for _, tc := range []struct {
+			name               string
+			start, end         *timestamppb.Timestamp
+			wantStart, wantEnd *time.Time
+		}{
+			{"nanoseconds", timestamppb.New(start), timestamppb.New(end), &start, &end},
+			{"epoch", &timestamppb.Timestamp{}, &timestamppb.Timestamp{}, &epoch, &epoch},
+			{"missing-start-invalid-end", nil, invalid, nil, nil},
+			{"invalid-start-missing-end", invalid, nil, nil, nil},
+		} {
+			t.Run(path.name+"/"+tc.name, func(t *testing.T) {
+				cp := newFakeCP(t)
+				cp.agent.startTime = tc.start
+				cp.agent.run = func(_ []string, e *fakeExec) {
+					final := exitedEvent(3)
+					final.GetExited().EndTime = tc.end
+					final.GetExited().TimedOut = true
+					e.finish(final)
+				}
+				checkTime := func(label string, got, want *time.Time) {
+					t.Helper()
+					if (got == nil) != (want == nil) || (got != nil && !got.Equal(*want)) {
+						t.Errorf("%s time = %v, want %v", label, got, want)
+					}
+				}
+				check := func(label string, res *ExecResult, r *recorder) {
+					t.Helper()
+					if len(r.events) != 1 || r.events[0].Kind != ExecEventStarted || r.events[0].ExecID != res.ExecID {
+						t.Fatalf("%s events: %+v", label, r.events)
+					}
+					if res.Kind != ExecResultExited || res.ExitCode == nil || *res.ExitCode != 3 || !res.TimedOut || res.Transport != path.want {
+						t.Fatalf("%s result: %+v", label, res)
+					}
+					checkTime(label+" start", r.events[0].StartTime, tc.wantStart)
+					checkTime(label+" end", res.EndTime, tc.wantEnd)
+				}
+
+				res, r := runExec(t, cp.handle(t, cp.client(t, path.mode)))
+				check("exec", res, r)
+
+				reattach := cp.handle(t, cp.client(t, path.mode))
+				replay := &recorder{}
+				result, err := reattach.AttachExec(t.Context(), res.ExecID, AttachParams{OnEvent: replay.on})
+				if err != nil {
+					t.Fatal(err)
+				}
+				check("attach", result, replay)
+				if cp.agent.totalRuns() != 1 {
+					t.Fatalf("command ran %d times", cp.agent.totalRuns())
+				}
+			})
+		}
 	}
 }
 

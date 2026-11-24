@@ -1374,9 +1374,9 @@ func TestReadSnapshotAbortsWhenPathSwappedBeforeOpen(t *testing.T) {
 			}
 		}
 		dst := filepath.Join(m.dir, "snap")
-		_, _, err := m.makeSnapshot(path, dst)
-		if err == nil || !strings.Contains(err.Error(), "file changed during the snapshot copy") {
-			t.Fatalf("forceCopy=%v: expected abort, got %v", forceCopy, err)
+		_, _, created, err := m.makeSnapshot(path, dst)
+		if created || err == nil || !strings.Contains(err.Error(), "file changed during the snapshot copy") {
+			t.Fatalf("forceCopy=%v: expected abort before creation, got created=%v, err=%v", forceCopy, created, err)
 		}
 		// The abort must leave no snapshot file behind.
 		if _, err := os.Lstat(dst); !errors.Is(err, fs.ErrNotExist) {
@@ -1388,7 +1388,7 @@ func TestReadSnapshotAbortsWhenPathSwappedBeforeOpen(t *testing.T) {
 	}
 	// A stable file still reads.
 	m.openHook = nil
-	if kind, n, err := m.makeSnapshot(path, filepath.Join(m.dir, "ok")); err != nil || n != 4 {
-		t.Fatalf("stable read: kind %v n %d err %v", kind, n, err)
+	if kind, n, created, err := m.makeSnapshot(path, filepath.Join(m.dir, "ok")); err != nil || !created || n != 4 {
+		t.Fatalf("stable read: kind %v n %d created %v err %v", kind, n, created, err)
 	}
 }
