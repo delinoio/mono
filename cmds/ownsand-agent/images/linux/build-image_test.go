@@ -323,13 +323,14 @@ func TestBuildKeepsTheStageOfAnotherRun(t *testing.T) {
 
 func TestFailedStepsPreserveThePreviousOutputs(t *testing.T) {
 	cases := []struct {
-		name   string
-		env    string
-		status int
+		name          string
+		env           string
+		status        int
+		kernelStarted bool
 	}{
-		{"go build", "STUB_GO_STATUS=7", 7},
-		{"root file system container", "STUB_DOCKER_STATUS=23", 23},
-		{"kernel build", "STUB_KERNEL_STATUS=9", 9},
+		{"go build", "STUB_GO_STATUS=7", 7, false},
+		{"root file system container", "STUB_DOCKER_STATUS=23", 23, false},
+		{"kernel build", "STUB_KERNEL_STATUS=9", 9, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -344,6 +345,14 @@ func TestFailedStepsPreserveThePreviousOutputs(t *testing.T) {
 			}
 			if exit.ExitCode() != c.status {
 				t.Fatalf("exit status %d, want %d\n%s", exit.ExitCode(), c.status, out)
+			}
+			if strings.Contains(out, "wrote ") {
+				t.Fatalf("the failed build reported success:\n%s", out)
+			}
+			if !c.kernelStarted {
+				if _, err := os.Stat(filepath.Join(b.logs, "kernel.arch")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("want no kernel build record, got stat error %v", err)
+				}
 			}
 			b.requireGuest(sentinel)
 			b.requireImage("amd64")
