@@ -853,6 +853,41 @@ describe("invitations", () => {
     await expect(screen.getByRole("button", "Invite someone")).toBeHidden();
   });
 
+  test("accepts the replacement invitation after a fragment-only navigation", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    const path = "/invitations/accept?source=fixture";
+    const firstSecret = "tdi_fixture_a";
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`${path}#secret=${firstSecret}`);
+
+    const join = screen.getByRole("button", "Join organization");
+    const invalid = screen.getByText(
+      "It was not found, or you no longer have access to it.",
+    );
+    await expect(browser).toHaveURL(path);
+    await join.tap();
+    await expect(invalid).toBeVisible();
+
+    await browser.evaluate((secret) => {
+      window.location.hash = `secret=${secret}`;
+      return null;
+    }, INVITATION_SECRET);
+
+    await expect(browser).toHaveURL(path);
+    await expect(invalid).toBeHidden();
+    await join.tap();
+
+    await expect(browser).toHaveURL(`/orgs/${CONTOSO}`);
+    await expect(screen.getByRole("combobox", "Organization")).toContainText(
+      "Contoso",
+    );
+  });
+
   test("accepts an invitation link and removes the secret from the address", async ({
     app,
     screen,
