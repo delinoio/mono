@@ -466,6 +466,37 @@ describe("agent version policy", () => {
 });
 
 describe("invitations", () => {
+  test("hides the seeded pending invitation from Members at expiry", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    const start = Date.UTC(2026, 0, 1, 12);
+    const expiry = start + 6 * 24 * 60 * 60 * 1000;
+    await browser.addInitScript((ms) => {
+      Date.now = () => ms;
+    }, start);
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/members`);
+
+    const invitations = screen.getByRole("region", "Invitations");
+    const revoke = invitations.getByRole("button", /^Revoke/);
+    await expect(revoke).toBeVisible();
+    await app.screenshot("invitation-before-expiry");
+
+    await screen.getByRole("link", "Devices", { exact: true }).tap();
+    await browser.evaluate((ms) => {
+      Date.now = () => ms;
+      return null;
+    }, expiry);
+    await screen.getByRole("link", "Members", { exact: true }).tap();
+
+    await expect(invitations.getByText("No pending invitations")).toBeVisible();
+    await expect(revoke).toBeHidden();
+    await app.screenshot("invitation-at-expiry");
+  });
+
   test("accepts an invitation link through sign-in and removes the secret from the address", async ({
     app,
     screen,
