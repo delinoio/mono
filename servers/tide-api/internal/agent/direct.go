@@ -90,12 +90,16 @@ func (h *Hub) CreateDirectTx(ctx context.Context, tx pgx.Tx, v Vendor, in integr
 	if c != nil && (!d.Repeat || !work.RequestTerminal(req.State)) {
 		return req, false, nil
 	}
-	p, err := h.profileFor(ctx, tx, in)
+	profileID, err := demandProfileID(ctx, tx, in)
 	if err != nil {
 		return nil, false, err
 	}
-	if p == nil {
+	if profileID == "" {
 		return nil, false, ErrNoProfile
+	}
+	p, err := h.lockDemandProfile(ctx, tx, in, profileID)
+	if err != nil {
+		return nil, false, err
 	}
 	base := d.SourceKey
 	if base == "" {

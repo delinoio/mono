@@ -380,8 +380,12 @@ const forShareLockWaitersQuery = `
 SELECT count(*) FROM pg_stat_activity
 WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FOR SHARE%'`
 
-// queryForShareLockWaiters runs forShareLockWaitersQuery on pool.
+const forShareLockWaitersTimeout = 10 * time.Second
+
+// queryForShareLockWaiters bounds both the pool checkout and the activity query.
 func queryForShareLockWaiters(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, forShareLockWaitersTimeout)
+	defer cancel()
 	var n int
 	if err := pool.QueryRow(ctx, forShareLockWaitersQuery).Scan(&n); err != nil {
 		return 0, err

@@ -5,9 +5,14 @@ package githubapi_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,5 +162,136 @@ func TestFailedDeliveries(t *testing.T) {
 	}
 	if err := c.Redeliver(context.Background(), 1); githubapi.StatusOf(err) != 404 {
 		t.Fatalf("unknown delivery: %v", err)
+	}
+}
+
+func TestFailedDeliveriesBeyondPage100(t *testing.T) {
+	since := time.Date(2026, time.November, 24, 0, 0, 0, 0, time.UTC)
+	now := since
+	f := githubfake.New(func() time.Time { return now })
+	t.Cleanup(f.Server.Close)
+	c := githubapi.New(f.Config(), nil, slog.New(slog.DiscardHandler), func() time.Time { return now })
+
+	atCutoff := f.SendLost("workflow_job", nil)
+	f.Update(func() { now = since.Add(time.Hour) })
+	for range 10_000 {
+		f.SendLost("workflow_job", nil)
+	}
+
+	list, err := c.FailedDeliveries(t.Context(), since)
+	if err != nil || len(list) != 10_001 || f.Calls("list_hook_deliveries") != 101 {
+		t.Fatalf("list = %d deliveries, %v, %d page requests", len(list), err, f.Calls("list_hook_deliveries"))
+	}
+	if last := list[len(list)-1]; last.GUID != atCutoff || !last.DeliveredAt.Equal(since) {
+		t.Fatalf("last delivery = %+v, want %s at %s", last, atCutoff, since)
+	}
+}
+
+func TestFailedDeliveriesPagination(t *testing.T) {
+	since := time.Date(2026, time.November, 24, 0, 0, 0, 0, time.UTC)
+	f := githubfake.New(nil)
+	t.Cleanup(f.Server.Close)
+	var foreignCalls atomic.Int32
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreignCalls.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	t.Cleanup(foreign.Close)
+
+	for _, tt := range []struct {
+		name      string
+		wantPages int32
+		wantID    int64
+	}{
+		{name: "end", wantPages: 1, wantID: 1},
+		{name: "cutoff", wantPages: 1, wantID: 1},
+		{name: "foreign origin", wantPages: 1, wantID: 1},
+		{name: "empty page with cursor", wantPages: 2, wantID: 2},
+		{name: "cycle", wantPages: 2},
+		{name: "http error", wantPages: 2},
+		{name: "canceled", wantPages: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				page := calls.Add(1)
+				if page > tt.wantPages {
+					t.Error("requested an extra page")
+					http.Error(w, "unexpected request", http.StatusInternalServerError)
+					return
+				}
+				items := []githubapi.Delivery{{ID: int64(page), DeliveredAt: since, StatusCode: 500}}
+				origin := "http://" + r.Host
+				var next string
+				if page == 1 {
+					switch tt.name {
+					case "cutoff":
+						items = append(items, githubapi.Delivery{ID: 2, DeliveredAt: since.Add(-time.Second), StatusCode: 500})
+						next = "cursor=2"
+					case "foreign origin":
+						origin = foreign.URL
+						next = "cursor=2"
+					case "empty page with cursor":
+						items = []githubapi.Delivery{}
+						next = "cursor=2"
+					case "cycle", "http error", "canceled":
+						next = "cursor=2"
+					}
+				} else {
+					switch tt.name {
+					case "cycle":
+						next = "per_page=100&status=failure"
+					case "http error":
+						http.Error(w, "listing failed", http.StatusBadGateway)
+						return
+					case "canceled":
+						cancel()
+						<-r.Context().Done()
+						return
+					}
+				}
+				if next != "" {
+					w.Header().Set("Link", fmt.Sprintf(`<%s/app/hook/deliveries?%s>; rel="next"`, origin, next))
+				}
+				if err := json.NewEncoder(w).Encode(items); err != nil {
+					t.Errorf("encode deliveries: %v", err)
+				}
+			}))
+			t.Cleanup(upstream.Close)
+			cfg := f.Config()
+			cfg.APIOrigin = upstream.URL
+			c := githubapi.New(cfg, upstream.Client(), slog.New(slog.DiscardHandler), nil)
+			list, err := c.FailedDeliveries(ctx, since)
+
+			switch tt.name {
+			case "cycle":
+				if err == nil || !strings.Contains(err.Error(), "pagination cycle") {
+					t.Errorf("cycle error = %v", err)
+				}
+			case "http error":
+				if githubapi.StatusOf(err) != http.StatusBadGateway {
+					t.Errorf("later page error = %v", err)
+				}
+			case "canceled":
+				if !errors.Is(err, context.Canceled) {
+					t.Errorf("cancellation error = %v", err)
+				}
+			default:
+				if err != nil {
+					t.Errorf("list error = %v", err)
+				}
+			}
+			if tt.wantID == 0 && len(list) != 0 || tt.wantID != 0 && (len(list) != 1 || list[0].ID != tt.wantID) {
+				t.Errorf("got %v, want only delivery %d (0 means none)", list, tt.wantID)
+			}
+			if pages := calls.Load(); pages != tt.wantPages {
+				t.Errorf("listed %d pages, want %d", pages, tt.wantPages)
+			}
+		})
+	}
+	if calls := foreignCalls.Load(); calls != 0 {
+		t.Errorf("foreign origin received %d requests", calls)
 	}
 }

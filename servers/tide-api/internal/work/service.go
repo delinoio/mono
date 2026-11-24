@@ -63,18 +63,26 @@ func parseOffsetToken(size int32, token string) (int32, int, error) {
 	return limit, n, nil
 }
 
-func stateList[T ~int32](states []T, open []int16, includeEnded bool) []int16 {
+// RequestStateFilter returns the SQL state filter for requests and dev sessions.
+func RequestStateFilter(states []tidev1.RequestState, includeEnded bool) ([]int16, error) {
+	return stateList(states, "RequestState", tidev1.RequestState_name, openRequestStates, includeEnded)
+}
+
+func stateList[T ~int32](states []T, enum string, names map[int32]string, open []int16, includeEnded bool) ([]int16, error) {
 	if len(states) > 0 {
 		out := make([]int16, len(states))
 		for i, s := range states {
+			if err := api.DefinedEnum("states", enum, s, names); err != nil {
+				return nil, err
+			}
 			out[i] = int16(s)
 		}
-		return out
+		return out, nil
 	}
 	if includeEnded {
-		return nil
+		return nil, nil
 	}
-	return open
+	return open, nil
 }
 
 // ListRequests lists requests: the open ones in queue order first, then the
@@ -96,13 +104,20 @@ func (h *Handler) ListRequests(ctx context.Context, req *connect.Request[tidev1.
 			return nil, err
 		}
 	}
-	states := stateList(m.GetStates(), openRequestStates, m.GetIncludeEnded())
+	kind := m.GetKind()
+	if err := api.DefinedEnum("kind", "WorkloadKind", kind, tidev1.WorkloadKind_name); err != nil {
+		return nil, err
+	}
+	states, err := RequestStateFilter(m.GetStates(), m.GetIncludeEnded())
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.DB.Pool.Query(ctx, "SELECT "+requestColumns+` FROM requests
 		WHERE organization_id = $1 AND ($2 = '' OR runner_profile_id::text = $2) AND ($3 = 0 OR kind = $3) AND ($4::smallint[] IS NULL OR state = ANY($4))
 		ORDER BY (state IN (4, 5, 6, 7)),
 			CASE WHEN state IN (1, 2, 3) THEN priority END, CASE WHEN state IN (1, 2, 3) THEN queue_time END,
 			CASE WHEN state IN (4, 5, 6, 7) THEN end_time END DESC, request_id
-		LIMIT $5 OFFSET $6`, c.OrganizationID, profileID, int16(m.GetKind()), states, limit, offset)
+		LIMIT $5 OFFSET $6`, c.OrganizationID, profileID, int16(kind), states, limit, offset)
 	if err != nil {
 		return nil, s.Internal(ctx, "list requests", err)
 	}
@@ -209,7 +224,10 @@ func (h *Handler) ListRunners(ctx context.Context, req *connect.Request[tidev1.L
 			return nil, err
 		}
 	}
-	states := stateList(m.GetStates(), openRunnerStates, m.GetIncludeEnded())
+	states, err := stateList(m.GetStates(), "RunnerState", tidev1.RunnerState_name, openRunnerStates, m.GetIncludeEnded())
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.DB.Pool.Query(ctx, "SELECT "+runnerColumns+` FROM runners
 		WHERE organization_id = $1 AND runner_id > $2 AND ($3 = '' OR runner_profile_id::text = $3) AND ($4::smallint[] IS NULL OR state = ANY($4))
 		ORDER BY runner_id LIMIT $5`, c.OrganizationID, api.AfterKey(after), profileID, states, limit)
@@ -346,15 +364,22 @@ func (h *Handler) GetCapacity(ctx context.Context, req *connect.Request[tidev1.G
 		counts[device] = append(counts[device], &tidev1.RunnerStateCount{State: tidev1.RunnerState(state), Count: n})
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, s.Internal(ctx, "get capacity", err)
+	}
 	resp := &tidev1.GetCapacityResponse{}
 	for _, d := range devices {
 		l, a := d.GetLimits(), d.GetAllocation()
+		allocatedVCPU := int64(a.GetVcpuCount())
+		if a != nil && a.VcpuTotalCount != nil {
+			allocatedVCPU = a.GetVcpuTotalCount()
+		}
 		resp.Devices = append(resp.Devices, &tidev1.DeviceCapacity{
 			OwnsandDeviceId: d.GetDeviceId(), Name: d.GetName(), State: deviceState(d.GetState()),
 			HostOs: label(d.GetHostOs(), "HOST_OS_"), Arch: label(d.GetArch(), "ARCH_"),
 			Limits:             &tidev1.DeviceLimits{VcpuCount: l.GetVcpuCount(), MemoryMib: l.GetMemoryMib(), DiskGib: l.GetDiskGib(), VcpuOvercommitPercent: l.GetVcpuOvercommitPercent()},
 			EffectiveVcpuLimit: d.GetEffectiveVcpuLimitCount(),
-			Allocation:         &tidev1.DeviceAllocation{VcpuCount: int64(a.GetVcpuCount()), MemoryMib: a.GetMemoryMib(), DiskGib: a.GetDiskGib(), MacosGuestCount: a.GetMacosGuestCount()},
+			Allocation:         &tidev1.DeviceAllocation{VcpuCount: allocatedVCPU, MemoryMib: a.GetMemoryMib(), DiskGib: a.GetDiskGib(), MacosGuestCount: a.GetMacosGuestCount()},
 			Runners:            counts[d.GetDeviceId()],
 		})
 	}
@@ -596,6 +621,9 @@ func watchRows(ctx context.Context, q db.Querier, orgID string, after int64, sna
 		out = append(out, watchRow{id: "q" + r.ID, seq: r.ChangeSeq, msg: &tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Request{Request: r.Proto()}}})
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	runArgs := args
 	if snapshot {
 		runArgs = []any{orgID, openRunnerStates}

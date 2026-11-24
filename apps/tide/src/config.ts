@@ -59,7 +59,7 @@ export interface ConsoleConfig {
   logto: LogtoSettings | undefined;
 }
 
-/** Validates an http or https origin without path, query, fragment or credentials. */
+/** Validates the written form of an HTTP or HTTPS origin and returns its normalized origin. */
 export function resolveOrigin(
   name: string,
   value: string | undefined,
@@ -79,12 +79,9 @@ export function resolveOrigin(
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     throw new Error(`${name} must use http or https`);
   }
-  if (
-    url.pathname !== "/" ||
-    raw.includes("?") ||
-    raw.includes("#") ||
-    /^[a-z]+:\/\/[^/]+\/./i.test(raw.trim())
-  ) {
+  // URL parsing can remove dot segments and treat backslashes as slashes.
+  // Check the written form so a value that hides a path still fails.
+  if (url.pathname !== "/" || !/^https?:\/\/[^/?#\\]+\/?$/i.test(raw.trim())) {
     throw new Error(
       `${name} must be an origin without a path, query or fragment`,
     );

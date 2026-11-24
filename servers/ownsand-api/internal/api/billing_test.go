@@ -82,7 +82,9 @@ func pollBilling(t *testing.T, env *testenv.Env) {
 
 func enforceBilling(t *testing.T, env *testenv.Env) {
 	t.Helper()
-	if err := env.App.Enforcer.Pass(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := env.App.Enforcer.Pass(ctx); err != nil {
 		t.Fatalf("billing enforcement pass: %v", err)
 	}
 }
@@ -931,9 +933,9 @@ type linkAttemptFixture struct {
 	org  *testenv.Org
 }
 
-func newLinkAttemptFixture(t *testing.T, owner string) *linkAttemptFixture {
+func newLinkAttemptFixture(t *testing.T, owner string, opts ...testenv.Option) *linkAttemptFixture {
 	t.Helper()
-	env, fake := billingEnv(t)
+	env, fake := billingEnvWith(t, opts...)
 	fake.AddAccount(billingAccountA, "Account of "+owner, map[string]accountsv1.BillingAccountRole{owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
 	return &linkAttemptFixture{env: env, fake: fake, org: env.NewUnlinkedOrg(owner)}
 }

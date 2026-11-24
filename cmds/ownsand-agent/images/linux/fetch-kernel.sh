@@ -8,13 +8,11 @@
 # kernel was first downloaded. A kernel built and signed by the OwnSand
 # release process replaces it before the first release.
 #
-# The download goes to a unique temporary file next to <output-vmlinux> and is
-# verified before it is published, so fetches that run at the same time (two
-# builds, a retry beside a slow run) never share a staging file. The rename
-# that publishes it is atomic because both paths are on one file system. A
-# download that fails or does not match the checksum leaves an existing
-# <output-vmlinux> untouched, and the temporary file is removed whatever way
-# the script ends.
+# Each fetch stages its download in a unique directory next to <output-vmlinux>.
+# It verifies the download before publishing it with an atomic rename on the
+# same file system. A failed download or checksum mismatch leaves an existing
+# kernel untouched. A directory at the output path stays untouched even if it
+# appears during the fetch. The script removes its staging directory on exit.
 #
 # Usage: fetch-kernel.sh <output-vmlinux>
 set -euo pipefail
@@ -29,14 +27,41 @@ if [ "$(uname -m)" != "x86_64" ]; then
   echo "only the x86_64 kernel is pinned" >&2
   exit 1
 fi
-tmp="$(mktemp "$1.download.XXXXXX")"
-# Remove the temporary file whatever way the script ends, also on a signal.
-trap 'rm -f "$tmp"' EXIT
+
+out="$1"
+reject_directory() {
+  if [ -d "$out" ]; then
+    echo "kernel output path is a directory: $out" >&2
+    exit 1
+  fi
+}
+reject_directory
+
+out_name="${out##*/}"
+if [ -z "$out_name" ]; then
+  echo "kernel output path must name a file: $out" >&2
+  exit 1
+fi
+out_dir=./
+case "$out" in
+  /*) out_dir="${out%/*}/" ;;
+  */*) out_dir="./${out%/*}/" ;;
+esac
+
+stage="$(mktemp -d "${out_dir}${out_name}.download.XXXXXX")"
+trap 'rm -rf -- "$stage"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+tmp="$stage/$out_name"
 curl -fsSL -o "$tmp" "$url"
 echo "$sha256  $tmp" | sha256sum -c --quiet -
-# mktemp creates the file with mode 0600; a published kernel is readable.
 chmod 0644 "$tmp"
-mv -f "$tmp" "$1"
-echo "wrote $1"
+
+# Let mv append the basename to the parent directory. The rename then fails
+# if the final filename has become a directory.
+if ! mv -f -- "$tmp" "$out_dir"; then
+  reject_directory
+  echo "could not publish the kernel at $out" >&2
+  exit 1
+fi
+echo "wrote $out"

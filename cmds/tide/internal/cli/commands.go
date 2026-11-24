@@ -577,6 +577,16 @@ func addIntegrationFlags(fs *flag.FlagSet, create bool) *integrationFlags {
 	return f
 }
 
+func (f *integrationFlags) validateVendorSettings(v tidev1.AgentVendor) error {
+	if f.poolName.set && v != tidev1.AgentVendor_AGENT_VENDOR_CURSOR {
+		return usageErr("--pool-name applies only to cursor")
+	}
+	if f.outpostName.set && v != tidev1.AgentVendor_AGENT_VENDOR_DEVIN {
+		return usageErr("--outpost-name applies only to devin")
+	}
+	return nil
+}
+
 // integrationSettings returns the settings oneof value for the vendor.
 func integrationSettings(v tidev1.AgentVendor, f *integrationFlags) any {
 	switch v {
@@ -641,6 +651,9 @@ func (a *app) integrationCreate(ctx context.Context, name string, args []string)
 	}
 	vendor, err := parseEnum("vendor", f.vendor.v, vendorValues)
 	if err != nil {
+		return err
+	}
+	if err := f.validateVendorSettings(vendor); err != nil {
 		return err
 	}
 	if f.name.v == "" {
@@ -744,6 +757,9 @@ func (a *app) integrationUpdate(ctx context.Context, name string, args []string)
 		return err
 	}
 	vendor := cur.Msg.GetIntegration().GetVendor()
+	if err := f.validateVendorSettings(vendor); err != nil {
+		return err
+	}
 	req := &tidev1.UpdateAgentIntegrationRequest{OrganizationId: org, AgentIntegrationId: rest[0], UpdateMask: &fieldmaskpb.FieldMask{}}
 	if f.name.set {
 		req.Name = f.name.v
@@ -865,23 +881,28 @@ func (f *profileFlags) apply(p *tidev1.RunnerProfile) ([]string, error) {
 		p.Source = &tidev1.RunnerProfile_OwnsandTemplateId{OwnsandTemplateId: f.template.v}
 		paths = append(paths, "source")
 	}
-	// The update mask has only the whole "resources" path, so the
-	// message must carry every resource value. profileUpdate fills the
-	// values without a flag from the current profile first.
 	if f.setsResources() {
 		if p.Resources == nil {
 			p.Resources = &tidev1.Resources{}
 		}
+		var resourcePaths []string
 		if f.vcpu.set {
 			p.Resources.VcpuCount = f.vcpu.v
+			resourcePaths = append(resourcePaths, "resources.vcpu_count")
 		}
 		if f.memory.set {
 			p.Resources.MemoryMib = f.memory.v
+			resourcePaths = append(resourcePaths, "resources.memory_mib")
 		}
 		if f.disk.set {
 			p.Resources.DiskGib = f.disk.v
+			resourcePaths = append(resourcePaths, "resources.disk_gib")
 		}
-		paths = append(paths, "resources")
+		if len(resourcePaths) == 3 {
+			paths = append(paths, "resources")
+		} else {
+			paths = append(paths, resourcePaths...)
+		}
 	}
 	for _, d := range []struct {
 		f     *stringFlag
@@ -1006,27 +1027,15 @@ func (a *app) profileUpdate(ctx context.Context, name string, args []string) err
 	if err != nil {
 		return err
 	}
-	// The first apply checks the flags before any request is sent.
-	if paths, err := f.apply(&tidev1.RunnerProfile{}); err != nil {
-		return err
-	} else if len(paths) == 0 {
-		return usageErr("nothing to update: pass at least one profile flag")
-	}
-	org, c, err := a.orgSetup()
+	p := &tidev1.RunnerProfile{}
+	paths, err := f.apply(p)
 	if err != nil {
 		return err
 	}
-	p := &tidev1.RunnerProfile{}
-	if f.setsResources() && !(f.vcpu.set && f.memory.set && f.disk.set) {
-		// The "resources" path replaces all resource values, so keep the
-		// current values of the resources without a flag.
-		cur, err := c.RunnerProfiles().GetRunnerProfile(ctx, connect.NewRequest(&tidev1.GetRunnerProfileRequest{OrganizationId: org, RunnerProfileId: rest[0]}))
-		if err != nil {
-			return err
-		}
-		p.Resources = proto.CloneOf(cur.Msg.GetProfile().GetResources())
+	if len(paths) == 0 {
+		return usageErr("nothing to update: pass at least one profile flag")
 	}
-	paths, err := f.apply(p)
+	org, c, err := a.orgSetup()
 	if err != nil {
 		return err
 	}

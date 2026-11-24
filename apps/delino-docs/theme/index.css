@@ -19,6 +19,22 @@
 }
 
 /*
+ * Workaround: Rspress 2.1.3 fades the entire light hero brand button on hover,
+ * which puts the white label below 4.5:1 over the gradient. Transition only
+ * the shadow so the label and gradient stay opaque. Remove this override when
+ * Rspress provides a hover treatment that preserves the contrast.
+ */
+html:not(.rp-dark) .rp-home-hero__action.rp-button--brand {
+  transition: box-shadow 0.3s;
+}
+
+html:not(.rp-dark) .rp-home-hero__action.rp-button--brand:hover {
+  opacity: 1;
+  box-shadow: 0 4px 12px
+    color-mix(in srgb, var(--rp-c-brand-darker) 35%, transparent);
+}
+
+/*
  * Dark-mode brand ramp. Rspress paints text directly with --rp-c-brand (active
  * navbar item, heading anchors, search panel, hovered feature cards), and the
  * light-mode brand reaches only 2.23:1 to 4.10:1 on the dark surfaces

@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { create } from "@bufbuild/protobuf";
+import {
+  createConnectQueryKey,
+  useMutation,
+  useQuery,
+  useTransport,
+} from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { NumberInput } from "delino-ui/number-input";
@@ -10,6 +16,7 @@ import { DeviceState } from "@delino/ownsand-protos/v1/common_pb";
 import {
   type Device,
   DeviceService,
+  GetDeviceResponseSchema,
 } from "@delino/ownsand-protos/v1/device_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
@@ -23,6 +30,7 @@ import {
   Empty,
   ErrorNotice,
   Loading,
+  MorePagesNotice,
   PageHeader,
   QueryBoundary,
   RefreshFailedNotice,
@@ -30,6 +38,7 @@ import {
   showsFullError,
   toastError,
 } from "../components/ui.tsx";
+import { useDevices } from "../devices.ts";
 import {
   deviceAllocatedVcpu,
   effectiveVcpuLimit,
@@ -53,10 +62,7 @@ function vcpuSummary(d: Device): string {
 /** Route `devices`: devices with state, limits, allocation and agent version. */
 export function DevicesPage() {
   const { organizationId, role } = useOrg();
-  const list = useQuery(DeviceService.method.listDevices, {
-    organizationId,
-    pageSize: 200,
-  });
+  const { devices, boundary, pages } = useDevices(organizationId);
   return (
     <>
       <PageHeader
@@ -73,9 +79,12 @@ export function DevicesPage() {
           ) : undefined
         }
       />
-      <QueryBoundary query={list} loading="Loading devices">
-        {(data) =>
-          data.devices.length === 0 ? (
+      {showsFullError(boundary) ? null : (
+        <MorePagesNotice noun="devices" pages={pages} />
+      )}
+      <QueryBoundary query={boundary} loading="Loading devices">
+        {() =>
+          devices.length === 0 ? (
             <Empty title="No devices yet">
               An admin creates an enrollment token and installs the agent on a
               device.
@@ -95,7 +104,7 @@ export function DevicesPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {data.devices.map((d) => (
+                  {devices.map((d) => (
                     <tr key={d.deviceId}>
                       <td>
                         <Link
@@ -157,12 +166,27 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   const { organizationId, role } = useOrg();
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
+  const transport = useTransport();
   const query = useQuery(DeviceService.method.getDevice, {
     organizationId,
     deviceId,
   });
   const update = useMutation(DeviceService.method.replaceDeviceLimits, {
-    onSuccess: () => invalidateServices(queryClient, DeviceService),
+    onSuccess: ({ device }, { organizationId, deviceId }) => {
+      if (device !== undefined) {
+        // Use the confirmed device if the readback fails.
+        queryClient.setQueryData(
+          createConnectQueryKey({
+            schema: DeviceService.method.getDevice,
+            input: { organizationId, deviceId },
+            transport,
+            cardinality: "finite",
+          }),
+          create(GetDeviceResponseSchema, { device }),
+        );
+      }
+      return invalidateServices(queryClient, DeviceService);
+    },
   });
   const remove = useMutation(DeviceService.method.removeDevice, {
     onSuccess: () => {
@@ -175,7 +199,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
     },
   });
   // The fields the user has edited and not saved yet. A field that is absent
-  // (`undefined`) is untouched and shows the fetched limit, so a refresh
+  // (`undefined`) is untouched and shows the cached limit, so a refresh
   // that changes the limits updates it and never replaces an edit.
   const [draft, setDraft] = useState<DeviceLimitsDraft>({});
   const [fieldError, setFieldError] = useState<{
@@ -201,7 +225,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   const d = device!;
   const admin =
     can(role, Permission.ManageDevices) && d.state !== DeviceState.REMOVED;
-  // The shown value of each field is its edit, else the fetched limit.
+  // The shown value of each field is its edit, else the cached limit.
   // Memory and disk are the digits of the stored int64 limits: a number
   // cannot hold a value above 2^53 exactly, so saving another limit would
   // otherwise round them.
@@ -249,8 +273,8 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
         deviceId,
         limits: input.limits,
       });
-      // The saved values are now the fetched limits: drop the edits that
-      // they came from. An edit that differs from what was submitted stays.
+      // The cache holds the confirmed or refreshed limits. Drop the submitted
+      // edits. An edit that differs from what was submitted stays.
       setDraft((current) => ({
         vcpu:
           current.vcpu === input.limits.vcpuCount ? undefined : current.vcpu,

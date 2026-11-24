@@ -28,9 +28,9 @@ import {
   NonUtf8Policy,
   NonUtf8RootError,
   isThrowawayIndex,
-  MissingPathPolicy,
   runFormatter,
   stagedFormatFiles,
+  UnavailablePathPolicy,
 } from "./format-changed.mjs";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 
@@ -1052,6 +1052,47 @@ test("explicit comparison still fails for a non-excluded path that is missing fr
   }
 });
 
+for (const kind of ["directory", "symbolic link"]) {
+  test(
+    `explicit comparison rejects a tracked file replaced by a ${kind} unless Rstack excludes it`,
+    { skip: kind === "symbolic link" && process.platform === "win32" },
+    (t) => {
+      const f = fixture(t);
+      const names = ["probe.ts", "vendor/probe.ts"];
+      const source = "const value = 2;\n";
+      for (const name of names) f.write(name, "const value = 1;\n");
+      const base = f.commit();
+      for (const name of names) f.write(name, source);
+      const head = f.commit();
+      const outside = outsideDirectory(t);
+      for (const name of names) {
+        assert.equal(indexMode(f, name), "100644");
+        const path = join(f.cwd, name);
+        rmSync(path);
+        if (kind === "directory") mkdirSync(path);
+        else symlinkSync(join(outside, "b.ts"), path);
+      }
+      for (const result of runExplicitCli(f, base, head)) {
+        assert.equal(result.status, 2, result.stdout + result.stderr);
+        assert.equal(result.stdout, "", "no formatter batches were started");
+        const error = JSON.parse(result.stderr);
+        assert.equal(error.event, "ci_format_error");
+        assert.match(error.message, /probe\.ts/u);
+        assert.ok(error.message.includes(kind), error.message);
+      }
+      assert.equal(readFileSync(join(outside, "b.ts"), "utf8"), outsideSource);
+
+      rmSync(join(f.cwd, "probe.ts"), { recursive: true });
+      f.write("probe.ts", source);
+      assert.deepEqual(changedFormatFiles(f.cwd, base, head), ["probe.ts"]);
+      for (const result of runExplicitCli(f, base, head)) {
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        assert.match(result.stdout, /"candidates":1/u);
+      }
+    },
+  );
+}
+
 for (const { name, skip, breakParent } of [
   {
     name: "ENOTDIR",
@@ -1110,7 +1151,7 @@ test("explicit comparison keeps a range-deleted path skipped beside a missing ex
   ]);
 });
 
-test("explicit comparison with the Defer missing-path policy selects a missing path without probing", (t) => {
+test("explicit comparison with the Defer policy selects a missing path without probing", (t) => {
   const { f, base, head } = missingRangeFixture(t);
   f.git("update-index", "--skip-worktree", "pnpm-lock.yaml", "vendor/lib.ts");
   rmSync(join(f.cwd, "pnpm-lock.yaml"));
@@ -1123,7 +1164,7 @@ test("explicit comparison with the Defer missing-path policy selects a missing p
       head,
       false,
       NonUtf8Policy.Fail,
-      MissingPathPolicy.Defer,
+      UnavailablePathPolicy.Defer,
     ),
     ["c.ts", "kept.ts", "pnpm-lock.yaml", "vendor/lib.ts"],
   );

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 
@@ -246,32 +247,51 @@ func (a *app) sessionAttach(ctx context.Context, name string, args []string) err
 	if err != nil {
 		return err
 	}
-	w := &execWriter{a: a, execID: rest[1]}
+	w := &execWriter{a: a}
 	res, err := c.AttachExec(ctx, tide.AttachParams{OrganizationID: org, DevSessionID: rest[0], ExecID: rest[1], StdoutOffset: *so, StderrOffset: *se, OnEvent: w.event})
 	return a.finishExec(ctx, rest[0], w, res, err)
 }
 
-// execWriter writes exec events: raw output in text mode, one JSON object
-// per event with --output json.
+// execWriter writes raw output in text mode and decodes each stream in JSON mode.
 type execWriter struct {
-	a      *app
-	execID string
+	a              *app
+	stdout, stderr utf8Stream
 }
 
 func (w *execWriter) event(ev tide.ExecEvent) error {
-	w.execID = ev.ExecID
 	a := w.a
 	if a.fmt == FormatJSON {
-		obj := map[string]any{"event": ev.Kind.String(), "exec_id": ev.ExecID}
 		switch ev.Kind {
 		case tide.ExecEventStdout, tide.ExecEventStderr:
-			obj["offset"] = ev.Offset
-			obj["data"] = strings.ToValidUTF8(string(ev.Data), "�")
+			stream := w.stream(ev.Kind)
+			if ev.Offset != stream.next {
+				if err := w.flush(ev.Kind, ev.ExecID); err != nil {
+					return err
+				}
+			}
+			offset, data := stream.decode(ev.Offset, ev.Data)
+			if data == "" {
+				return nil
+			}
+			return w.writeOutput(ev.Kind, ev.ExecID, offset, data)
 		case tide.ExecEventOutputTruncated:
-			obj["missing_stdout"] = ev.MissingStdout
-			obj["missing_stderr"] = ev.MissingStderr
+			if !ev.MissingStdout.Empty() {
+				if err := w.flush(tide.ExecEventStdout, ev.ExecID); err != nil {
+					return err
+				}
+			}
+			if !ev.MissingStderr.Empty() {
+				if err := w.flush(tide.ExecEventStderr, ev.ExecID); err != nil {
+					return err
+				}
+			}
+			return writeJSON(a.env.Stdout, map[string]any{
+				"event": ev.Kind.String(), "exec_id": ev.ExecID,
+				"missing_stdout": ev.MissingStdout, "missing_stderr": ev.MissingStderr,
+			})
+		default:
+			return writeJSON(a.env.Stdout, map[string]any{"event": ev.Kind.String(), "exec_id": ev.ExecID})
 		}
-		return writeJSON(a.env.Stdout, obj)
 	}
 	switch ev.Kind {
 	case tide.ExecEventStdout:
@@ -293,6 +313,76 @@ func (w *execWriter) event(ev tide.ExecEvent) error {
 	return nil
 }
 
+func (w *execWriter) stream(kind tide.ExecEventKind) *utf8Stream {
+	if kind == tide.ExecEventStderr {
+		return &w.stderr
+	}
+	return &w.stdout
+}
+
+func (w *execWriter) writeOutput(kind tide.ExecEventKind, execID string, offset int64, data string) error {
+	return writeJSON(w.a.env.Stdout, map[string]any{
+		"event": kind.String(), "exec_id": execID, "offset": offset, "data": data,
+	})
+}
+
+func (w *execWriter) flush(kind tide.ExecEventKind, execID string) error {
+	stream := w.stream(kind)
+	if len(stream.pending) == 0 {
+		return nil
+	}
+	offset := stream.resumeOffset(stream.next)
+	stream.pending = stream.pending[:0]
+	return w.writeOutput(kind, execID, offset, string(utf8.RuneError))
+}
+
+func (w *execWriter) flushAll(execID string) error {
+	if err := w.flush(tide.ExecEventStdout, execID); err != nil {
+		return err
+	}
+	return w.flush(tide.ExecEventStderr, execID)
+}
+
+// utf8Stream holds up to three bytes of an incomplete UTF-8 character
+// until the next contiguous chunk arrives.
+type utf8Stream struct {
+	pending []byte
+	next    int64 // Offset after the last byte received.
+}
+
+func (u *utf8Stream) decode(offset int64, data []byte) (int64, string) {
+	start := offset - int64(len(u.pending))
+	u.next = offset + int64(len(data))
+	if len(u.pending) != 0 {
+		data = append(u.pending, data...)
+	}
+	cut := incompleteRuneStart(data)
+	text := strings.ToValidUTF8(string(data[:cut]), string(utf8.RuneError))
+	u.pending = append(u.pending[:0], data[cut:]...)
+	return start, text
+}
+
+func (u *utf8Stream) resumeOffset(receivedOffset int64) int64 {
+	if len(u.pending) != 0 {
+		return u.next - int64(len(u.pending))
+	}
+	return receivedOffset
+}
+
+// incompleteRuneStart returns the start of a valid but incomplete UTF-8
+// sequence at the end of data, or len(data) if there is no such sequence.
+func incompleteRuneStart(data []byte) int {
+	for i := len(data) - 1; i >= 0 && i >= len(data)-utf8.UTFMax+1; i-- {
+		if utf8.RuneStart(data[i]) {
+			if !utf8.FullRune(data[i:]) {
+				return i
+			}
+			break
+		}
+	}
+	return len(data)
+}
+
 // finishExec maps an exec result to the exit status of the ownsand sandbox
 // exec rules.
 func (a *app) finishExec(ctx context.Context, session string, w *execWriter, res *tide.ExecResult, err error) error {
@@ -304,9 +394,17 @@ func (a *app) finishExec(ctx context.Context, session string, w *execWriter, res
 			return err
 		}
 		if ctx.Err() != nil {
-			return &exitError{code: ExitInterrupted, msg: fmt.Sprintf("interrupted; the command keeps running. Continue with: tide session attach %s %s --stdout-offset %d --stderr-offset %d", session, se.ExecID, se.StdoutOffset, se.StderrOffset)}
+			stdoutOffset, stderrOffset := se.StdoutOffset, se.StderrOffset
+			if jsonMode {
+				stdoutOffset = w.stdout.resumeOffset(stdoutOffset)
+				stderrOffset = w.stderr.resumeOffset(stderrOffset)
+			}
+			return &exitError{code: ExitInterrupted, msg: fmt.Sprintf("interrupted; the command keeps running. Continue with: tide session attach %s %s --stdout-offset %d --stderr-offset %d", session, se.ExecID, stdoutOffset, stderrOffset)}
 		}
 		if jsonMode {
+			if err := w.flushAll(se.ExecID); err != nil {
+				return err
+			}
 			obj := map[string]any{"event": "stream_error", "exec_id": se.ExecID, "message": describeError(se.Err), "stdout_offset": se.StdoutOffset, "stderr_offset": se.StderrOffset, "outcome_unknown": se.OutcomeUnknown}
 			if werr := writeJSON(a.env.Stdout, obj); werr != nil {
 				return werr
@@ -317,6 +415,9 @@ func (a *app) finishExec(ctx context.Context, session string, w *execWriter, res
 	}
 	a.logger.Debug("tide exec ended", "exec_id", res.ExecID, "result", res.Kind.String())
 	if jsonMode {
+		if err := w.flushAll(res.ExecID); err != nil {
+			return err
+		}
 		obj := map[string]any{"event": res.Kind.String(), "exec_id": res.ExecID, "incomplete": res.Incomplete,
 			"stdout_offset": res.StdoutOffset, "stderr_offset": res.StderrOffset}
 		switch res.Kind {
