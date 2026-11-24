@@ -227,7 +227,7 @@ func closeRuntimeOnCleanup(t *testing.T, rt *Runtime) {
 				continue
 			}
 			t.Errorf("helper of sandbox %s outlived Close; killing it", v.id)
-			_ = signalGroup(v.cmd, sigKill)
+			_ = v.helper.signal(sigKill)
 			select {
 			case <-v.exited:
 			case <-time.After(10 * time.Second):
@@ -320,7 +320,7 @@ func TestLifecycleSignalsReachExecWorkers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	aHelper := helper.cmd.Process.Pid
+	aHelper := helper.helper.pid
 	for _, pid := range []int{aShell, aSleep} {
 		pgid, err := syscall.Getpgid(pid)
 		if err != nil || pgid == aHelper {
@@ -408,7 +408,7 @@ func TestDeleteNeverContinuesHelperBeforeKill(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			helperPID := h.cmd.Process.Pid
+			helperPID := h.helper.pid
 			if paused {
 				if err := rt.Pause(context.Background(), m); err != nil {
 					t.Fatal(err)
@@ -448,7 +448,7 @@ func TestPauseFailureContinuesHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	helperPID := helper.cmd.Process.Pid
+	helperPID := helper.helper.pid
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -488,7 +488,7 @@ func TestResumeFailureKeepsSandboxStopped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	helperPID := helper.cmd.Process.Pid
+	helperPID := helper.helper.pid
 
 	if err := rt.Pause(context.Background(), v); err != nil {
 		t.Fatal(err)
@@ -561,7 +561,7 @@ func TestHelperStoppedObservesRealHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pid := h.cmd.Process.Pid
+	pid := h.helper.pid
 	readers := map[string]func() (bool, error){
 		"ps": func() (bool, error) { return psStopped(context.Background(), pid) },
 	}
@@ -654,7 +654,7 @@ func TestPauseEnumeratesOnlyAfterHelperIsObservedStopped(t *testing.T) {
 	if got := calls(); got != 4 {
 		t.Errorf("observations of the helper = %d; want 4 (three not stopped, one stopped)", got)
 	}
-	for _, pid := range []int{h.cmd.Process.Pid, shell, sleeper} {
+	for _, pid := range []int{h.helper.pid, shell, sleeper} {
 		waitState(t, "process after Pause", pid, "T")
 	}
 	useStopSeams(t, h, nil, 0)
@@ -675,7 +675,7 @@ func TestPauseRollsBackWhenHelperDoesNotStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	helperPID := h.cmd.Process.Pid
+	helperPID := h.helper.pid
 	var signals []syscall.Signal
 	h.onSignal = func(sig syscall.Signal) { signals = append(signals, sig) }
 	useStopSeams(t, h, func(context.Context, int) (bool, error) { return false, nil }, 100*time.Millisecond)
@@ -714,7 +714,7 @@ func TestDeleteFailsWhenHelperDoesNotStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	helperPID := h.cmd.Process.Pid
+	helperPID := h.helper.pid
 	var signals []syscall.Signal
 	h.onSignal = func(sig syscall.Signal) { signals = append(signals, sig) }
 	useStopSeams(t, h, func(context.Context, int) (bool, error) { return false, nil }, 100*time.Millisecond)
@@ -787,7 +787,7 @@ func TestWaitHelperStoppedEndsWhenHelperExitsDuringWait(t *testing.T) {
 	// reaped before it was killed, so the process ID is still its own.
 	var kill sync.Once
 	useStopSeams(t, h, func(context.Context, int) (bool, error) {
-		kill.Do(func() { go func() { _ = syscall.Kill(h.cmd.Process.Pid, syscall.SIGKILL) }() })
+		kill.Do(func() { go func() { _ = syscall.Kill(h.helper.pid, syscall.SIGKILL) }() })
 		return false, nil
 	}, 10*time.Second)
 	if err := h.waitHelperStopped(context.Background()); err != nil {
@@ -835,7 +835,7 @@ func killHelperAndWait(t *testing.T, rt *Runtime, v vmruntime.VM) *vm {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Kill(h.cmd.Process.Pid, syscall.SIGKILL); err != nil {
+	if err := syscall.Kill(h.helper.pid, syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -862,7 +862,10 @@ func bystanderAsReusedGroup(t *testing.T, h *vm) int {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	})
-	h.cmd = &exec.Cmd{Process: cmd.Process}
+	h.helper = helperProcess{
+		pid:    cmd.Process.Pid,
+		signal: func(sig syscall.Signal) error { return syscall.Kill(-cmd.Process.Pid, sig) },
+	}
 	waitState(t, "bystander", cmd.Process.Pid, "S", "R")
 	return cmd.Process.Pid
 }
@@ -920,7 +923,7 @@ func TestDeleteWithCanceledContextKillsWorkers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	helperPID := h.cmd.Process.Pid
+	helperPID := h.helper.pid
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -947,7 +950,7 @@ func TestDeleteRetryAfterListingFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	helperPID := h.cmd.Process.Pid
+	helperPID := h.helper.pid
 
 	// An empty PATH makes the `ps` command of the process listing fail. The
 	// observation of the stopped helper also runs `ps` on macOS, so it gets the
@@ -1036,7 +1039,7 @@ func TestFailedStartCleanupDoesNotNeedProcessListing(t *testing.T) {
 	}
 	if v, err := rt.lookup(id); err == nil {
 		if !v.hasExited() {
-			_ = signalGroup(v.cmd, sigKill)
+			_ = v.helper.signal(sigKill)
 		}
 		t.Fatal("sandbox is still tracked after the failed Create; the caller cannot retry the cleanup")
 	}
@@ -1226,7 +1229,7 @@ func TestRelativeSandboxDirectoryKeepsHelperRecordsOutsideRoot(t *testing.T) {
 		t.Fatalf("sandbox directory of the runtime = %q; want the absolute %q", h.dir, absDir)
 	}
 	root := filepath.Join(absDir, rootDir)
-	if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", h.cmd.Process.Pid)); err == nil && cwd != root {
+	if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", h.helper.pid)); err == nil && cwd != root {
 		t.Errorf("helper working directory = %q; want the sandbox root %q", cwd, root)
 	}
 	// The helper keeps its records beside the root, and nothing named like

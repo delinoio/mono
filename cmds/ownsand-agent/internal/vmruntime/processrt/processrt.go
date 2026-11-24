@@ -28,10 +28,8 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/launcher"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/internal/fsutil"
-	"github.com/delinoio/mono/internal/procgroup"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -176,6 +174,13 @@ func (r *Runtime) Capabilities(context.Context) vmruntime.Capabilities {
 	}
 }
 
+// helperProcess keeps the identity and signal path of the guest helper. On
+// macOS the agent waits on a separate supervisor, which owns the helper.
+type helperProcess struct {
+	pid    int
+	signal func(syscall.Signal) error
+}
+
 type vm struct {
 	id  string
 	dir string
@@ -184,7 +189,7 @@ type vm struct {
 	// directory (see newSocket).
 	socket    string
 	socketDir string
-	cmd       *exec.Cmd
+	helper    helperProcess
 	exited    chan struct{}
 	restore   ownsandv1.SandboxRestorePath
 	// onSignal is a test seam: it is nil in production and records each
@@ -218,13 +223,8 @@ func (v *vm) hasExited() bool {
 	}
 }
 
-// signalHelper sends sig to the helper's process group. It returns
-// errHelperExited without a syscall when the helper was reaped: Cmd.Wait does
-// not clear cmd.Process, so the negative process ID of a reaped helper can
-// address an unrelated process group that reused the ID. A helper that is
-// reaped between the check and the signal is a remaining, very short window
-// that the runtime cannot close, because it does not control when Cmd.Wait
-// reaps the helper.
+// signalHelper sends sig to the helper's process group. A process ID may
+// be reused after reaping, so a known exited helper receives no signal.
 func (v *vm) signalHelper(sig syscall.Signal) error {
 	if v.hasExited() {
 		return errHelperExited
@@ -232,7 +232,10 @@ func (v *vm) signalHelper(sig syscall.Signal) error {
 	if v.onSignal != nil {
 		v.onSignal(sig)
 	}
-	return signalGroup(v.cmd, sig)
+	if v.helper.signal == nil {
+		return nil
+	}
+	return v.helper.signal(sig)
 }
 
 // waitHelperStopped waits until the helper has been observed stopped, or has
@@ -252,7 +255,7 @@ func (v *vm) signalHelper(sig syscall.Signal) error {
 // The last observation error is part of that error, so that a missing `ps`
 // is not reported as a helper that ignored the signal.
 func (v *vm) waitHelperStopped(ctx context.Context) error {
-	if v.cmd == nil || v.cmd.Process == nil {
+	if v.helper.pid == 0 {
 		return nil
 	}
 	timeout := helperStopTimeout
@@ -263,7 +266,7 @@ func (v *vm) waitHelperStopped(ctx context.Context) error {
 	if v.observeStopped != nil {
 		observe = v.observeStopped
 	}
-	pid := v.cmd.Process.Pid
+	pid := v.helper.pid
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(helperStopPoll)
@@ -373,15 +376,15 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	cmd.Env = append(os.Environ(), "HOME="+root)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
-	procgroup.Set(cmd)
-	if err := launcher.Start(cmd); err != nil {
+	helper, wait, err := startHelper(cmd)
+	if err != nil {
 		fsutil.RemoveAll(dir)
 		removeSocketDir(v)
 		return nil, fmt.Errorf("processrt: start guest helper: %w", err)
 	}
-	v.cmd = cmd
+	v.helper = helper
 	go func() {
-		_ = cmd.Wait()
+		wait()
 		close(v.exited)
 	}()
 	r.mu.Lock()
@@ -407,7 +410,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		r.deleteAfterFailedStart(v)
 		return nil, errors.New("processrt: guest helper exited during start")
 	}
-	r.logger.Info("process sandbox started", "sandbox_id", spec.SandboxID, "pid", cmd.Process.Pid)
+	r.logger.Info("process sandbox started", "sandbox_id", spec.SandboxID, "pid", helper.pid)
 	return v, nil
 }
 
@@ -554,7 +557,7 @@ func (r *Runtime) signalDescendants(ctx context.Context, v *vm, sig syscall.Sign
 // fork that the init process adopted) is not found; see the process runtime
 // entry in docs/cmds-ownsand-agent-foundation.md.
 func (r *Runtime) execGroups(ctx context.Context, v *vm) ([]int, error) {
-	if v.cmd == nil || v.cmd.Process == nil {
+	if v.helper.pid == 0 {
 		return nil, nil
 	}
 	if v.hasExited() {
@@ -562,7 +565,7 @@ func (r *Runtime) execGroups(ctx context.Context, v *vm) ([]int, error) {
 		// process now.
 		return nil, nil
 	}
-	groups, err := descendantGroups(ctx, v.cmd.Process.Pid)
+	groups, err := descendantGroups(ctx, v.helper.pid)
 	if err != nil {
 		return nil, fmt.Errorf("processrt: list exec process groups of sandbox %s: %w", v.id, err)
 	}
@@ -786,13 +789,4 @@ func (r *Runtime) Close() error {
 		errs = append(errs, r.Delete(context.Background(), id))
 	}
 	return errors.Join(errs...)
-}
-
-// signalGroup signals the process group of cmd that procgroup.Set created.
-// A command that has not started is a no-op.
-func signalGroup(cmd *exec.Cmd, sig syscall.Signal) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-	return procgroup.Signal(cmd.Process, sig)
 }
