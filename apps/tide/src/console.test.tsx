@@ -26,6 +26,7 @@ import {
 import { createQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
 import { AuditService } from "@delino/tide-protos/v1/audit_pb";
+import { Role } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
 import { RunnerProfileService } from "@delino/tide-protos/v1/runner_profile_pb";
 import { QueryClient } from "@tanstack/react-query";
@@ -41,6 +42,7 @@ import {
   MOCK_USER,
   type MockTransportOptions,
 } from "./mock/mock-api.ts";
+import { organizationPages } from "./mock/organization-pages.ts";
 import { externalNavigation } from "./navigation.ts";
 
 const config = {
@@ -56,6 +58,7 @@ function renderConsole(
     signIn?: Auth["signIn"];
     transport?: Transport;
     mock?: MockTransportOptions;
+    staleTime?: number;
   } = {},
 ) {
   window.history.replaceState(null, "", path);
@@ -69,7 +72,10 @@ function renderConsole(
     getAccessToken: async () => "token",
   };
   const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    defaultOptions: {
+      queries: { retry: false, staleTime: options.staleTime },
+      mutations: { retry: false },
+    },
   });
   render(
     <AuthContextProvider value={auth}>
@@ -117,6 +123,37 @@ afterEach(() => {
 });
 
 describe("organizations", () => {
+  test("shares all pages in server order between home and the switcher", async () => {
+    const { transport, listRequests } = await organizationPages({
+      lastRole: Role.ADMIN,
+    });
+    renderConsole("/", { transport, staleTime: 10_000 });
+
+    const list = await screen.findByRole("list", {
+      name: "Your organizations",
+    });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(201);
+    expect(rows[0].textContent).toContain("Acme Robotics");
+    expect(rows[199].textContent).toContain("Fixture organization 200");
+    expect(rows[200].textContent).toContain("Globex");
+    expect(within(list).getAllByRole("link", { name: /Globex/ })).toHaveLength(
+      1,
+    );
+
+    await click(within(list).getByRole("link", { name: /Acme Robotics/ }));
+    await click(await screen.findByRole("combobox", { name: "Organization" }));
+    await click(await screen.findByRole("option", { name: "Globex" }));
+
+    expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.globex}`);
+    expect(
+      listRequests.map(({ pageSize, pageToken }) => [pageSize, pageToken]),
+    ).toEqual([
+      [200, ""],
+      [200, "after-200"],
+    ]);
+  });
+
   test("lists the caller's organizations and creates one from a focused dialog", async () => {
     renderConsole("/");
     expect(
@@ -439,6 +476,98 @@ describe("GitHub setup callback", () => {
     await click(await screen.findByRole("option", { name: /Globex/ }));
     await click(screen.getByRole("button", { name: "Link installation" }));
   }
+
+  test("waits for the last page before offering every eligible organization", async () => {
+    let releaseLastPage!: () => void;
+    const lastPage = new Promise<void>((resolve) => {
+      releaseLastPage = resolve;
+    });
+    const { transport, listRequests, linkRequests } = await organizationPages({
+      firstRole: Role.OWNER,
+      lastRole: Role.ADMIN,
+      beforeLastPage: () => lastPage,
+    });
+    renderConsole(callbackPath, { transport });
+
+    await waitFor(() => expect(listRequests).toHaveLength(2));
+    expect(
+      screen.getByRole("status", { name: "Loading your organizations" }),
+    ).toBeTruthy();
+    expect(linkRequests).toHaveLength(0);
+    expect(window.location.search).toBe("");
+
+    releaseLastPage();
+    await click(
+      await screen.findByRole("combobox", { name: "tide organization" }),
+    );
+    expect(
+      screen.getAllByRole("option").map((option) => option.textContent),
+    ).toEqual(["Acme Robotics (owner)", "Globex (admin)"]);
+    await click(screen.getByRole("option", { name: "Globex (admin)" }));
+    await click(screen.getByRole("button", { name: "Link installation" }));
+
+    expect(await screen.findByText(installationName)).toBeTruthy();
+    expect(window.location.pathname).toBe(integrationsPath);
+    expect(linkRequests.map((request) => request.organizationId)).toEqual([
+      MOCK_IDS.globex,
+    ]);
+  });
+
+  test("retries a failed later page before linking to the sole eligible organization", async () => {
+    let attempts = 0;
+    const { transport, listRequests, linkRequests } = await organizationPages({
+      lastRole: Role.ADMIN,
+      beforeLastPage: async () => {
+        if (++attempts === 1)
+          throw new ConnectError("Page failed", Code.Internal);
+      },
+    });
+    renderConsole(callbackPath, { transport });
+
+    const retry = await screen.findByRole("button", { name: "Try again" });
+    expect(within(screen.getByRole("main")).getByRole("alert")).toBeTruthy();
+    expect(window.location.search).toBe("");
+    expect(linkRequests).toHaveLength(0);
+    await click(retry);
+
+    expect(await screen.findByText(installationName)).toBeTruthy();
+    expect(window.location.pathname).toBe(integrationsPath);
+    expect(linkRequests).toMatchObject([
+      {
+        organizationId: MOCK_IDS.globex,
+        githubInstallationId: 51000001n,
+        code: "gh_code",
+        state: "mock-state",
+      },
+    ]);
+    expect(listRequests.slice(0, 4).map(({ pageToken }) => pageToken)).toEqual([
+      "",
+      "after-200",
+      "",
+      "after-200",
+    ]);
+  });
+
+  test("keeps a full first page when the terminal page is empty", async () => {
+    const { transport, listRequests, linkRequests } = await organizationPages(
+      {},
+    );
+    renderConsole(callbackPath, { transport, staleTime: 10_000 });
+
+    expect(await screen.findByText(/Only an owner or admin/)).toBeTruthy();
+    expect(listRequests.map(({ pageToken }) => pageToken)).toEqual([
+      "",
+      "after-200",
+    ]);
+    expect(linkRequests).toHaveLength(0);
+
+    await click(screen.getByRole("link", { name: "Go to your organizations" }));
+    const list = await screen.findByRole("list", {
+      name: "Your organizations",
+    });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(200);
+    expect(listRequests).toHaveLength(2);
+  });
 
   test("strips callback values and replaces the setup entry on success", async () => {
     const { transport, completeLink, linkRequest } = holdLinkRequest();

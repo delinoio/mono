@@ -66,6 +66,9 @@ describe("organizations", () => {
 
     await expect(browser).toHaveURL(/\/orgs\/[0-9a-f-]+$/);
     await expect(screen.getByText("Set up tide")).toBeVisible();
+    await expect(screen.getByRole("combobox", "Organization")).toContainText(
+      "Fabrikam",
+    );
   });
 });
 
@@ -429,13 +432,19 @@ describe("invitations", () => {
   }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
-    await app.open(`/invitations/accept#secret=${INVITATION_SECRET}`);
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await screen.getByLabel("Invitation link or secret").tap();
+    await browser.keyboard.type(INVITATION_SECRET);
+    await screen.getByRole("button", "Continue").tap();
 
     await expect(browser).toHaveURL("/invitations/accept");
     await screen.getByRole("button", "Join organization").tap();
 
     await expect(browser).toHaveURL(`/orgs/${CONTOSO}`);
     await expect(screen.getByRole("navigation", "Organization")).toContainText(
+      "Contoso",
+    );
+    await expect(screen.getByRole("combobox", "Organization")).toContainText(
       "Contoso",
     );
   });
