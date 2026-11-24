@@ -6,9 +6,17 @@ import {
   type Interceptor,
   type Transport,
 } from "@connectrpc/connect";
-import { createConnectQueryKey } from "@connectrpc/connect-query";
+import {
+  createConnectQueryKey,
+  useInfiniteQuery,
+} from "@connectrpc/connect-query";
 import { createConnectTransport } from "@connectrpc/connect-web";
+import {
+  type AgentIntegration,
+  AgentIntegrationService,
+} from "@delino/tide-protos/v1/agent_integration_pb";
 import { QueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo } from "react";
 
 /**
  * The ListOrganizations request of the console. The control plane returns 50
@@ -22,6 +30,66 @@ export const PAGE_SIZE = 50;
 
 /** The largest page that the control plane returns. */
 export const MAX_PAGE_SIZE = 200;
+
+const EMPTY_INTEGRATIONS: readonly AgentIntegration[] = [];
+
+// A refetch starts from the first page. Keep the continuation error until
+// the user retries its cursor or a mutation invalidates the query.
+function refetchUnlessContinuationFailed(query: {
+  state: {
+    status: string;
+    fetchMeta: { fetchMore?: { direction: string } } | null;
+  };
+}): boolean {
+  const { status, fetchMeta } = query.state;
+  return status !== "error" || fetchMeta?.fetchMore?.direction !== "forward";
+}
+
+/** Loads all integration pages into one query per organization. */
+export function useAgentIntegrations(organizationId: string) {
+  const {
+    data,
+    error,
+    fetchNextPage,
+    hasNextPage,
+    isFetching,
+    isFetchNextPageError,
+    isPending,
+    refetch,
+  } = useInfiniteQuery(
+    AgentIntegrationService.method.listAgentIntegrations,
+    { organizationId, pageSize: MAX_PAGE_SIZE, pageToken: "" },
+    {
+      pageParamKey: "pageToken",
+      getNextPageParam: (last) => last.nextPageToken || undefined,
+      refetchOnMount: refetchUnlessContinuationFailed,
+      refetchOnReconnect: refetchUnlessContinuationFailed,
+      refetchOnWindowFocus: refetchUnlessContinuationFailed,
+    },
+  );
+  useEffect(() => {
+    if (hasNextPage && !isFetching && !error) {
+      void fetchNextPage({ cancelRefetch: false });
+    }
+  }, [data, error, fetchNextPage, hasNextPage, isFetching]);
+
+  return {
+    integrations: useMemo(
+      () =>
+        data?.pages.flatMap((page) => page.integrations) ?? EMPTY_INTEGRATIONS,
+      [data],
+    ),
+    isLoading: isPending || (hasNextPage && !error),
+    error,
+    retry: () => {
+      if (isFetchNextPageError) {
+        void fetchNextPage({ cancelRefetch: false });
+      } else {
+        void refetch({ cancelRefetch: false });
+      }
+    },
+  };
+}
 
 /**
  * The Connect transport of the console: binary Connect protocol to the

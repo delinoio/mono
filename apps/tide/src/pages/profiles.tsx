@@ -5,7 +5,6 @@ import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { NumberInput } from "delino-ui/number-input";
 import { Select, SelectOption } from "delino-ui/select";
 import { TextField } from "delino-ui/text-field";
-import { AgentIntegrationService } from "@delino/tide-protos/v1/agent_integration_pb";
 import {
   GuestOs,
   NetworkMode,
@@ -17,7 +16,11 @@ import {
   RunnerProfileService,
 } from "@delino/tide-protos/v1/runner_profile_pb";
 import { useMemo, useState } from "react";
-import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
+import {
+  invalidateServices,
+  MAX_PAGE_SIZE,
+  useAgentIntegrations,
+} from "../api.ts";
 import { SetupEmpty } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
@@ -58,19 +61,17 @@ export function ProfilesPage() {
     organizationId,
     pageSize: MAX_PAGE_SIZE,
   });
-  const integrations = useQuery(
-    AgentIntegrationService.method.listAgentIntegrations,
-    { organizationId, pageSize: MAX_PAGE_SIZE },
-  );
+  const agentIntegrations = useAgentIntegrations(organizationId);
+  const { integrations } = agentIntegrations;
   const integrationNames = useMemo(
     () =>
       new Map(
-        (integrations.data?.integrations ?? []).map((i) => [
+        integrations.map((i) => [
           i.agentIntegrationId,
           `${i.name} (${labels.vendor[i.vendor]})`,
         ]),
       ),
-    [integrations.data],
+    [integrations],
   );
   const remove = useMutation(RunnerProfileService.method.deleteRunnerProfile, {
     onSuccess: () => invalidateServices(queryClient, RunnerProfileService),
@@ -92,6 +93,12 @@ export function ProfilesPage() {
           ) : undefined
         }
       />
+      {agentIntegrations.error ? (
+        <ErrorNotice
+          error={agentIntegrations.error}
+          onRetry={agentIntegrations.retry}
+        />
+      ) : null}
       {list.isPending ? (
         <Loading label="Loading runner profiles" />
       ) : list.error ? (
@@ -170,6 +177,7 @@ export function ProfilesPage() {
       {editing !== undefined ? (
         <ProfileDialog
           profile={editing === "new" ? undefined : editing}
+          agentIntegrations={agentIntegrations}
           onClose={() => setEditing(undefined)}
         />
       ) : null}
@@ -193,9 +201,11 @@ export function ProfilesPage() {
 /** The create and edit dialog of a runner profile. */
 function ProfileDialog({
   profile,
+  agentIntegrations,
   onClose,
 }: {
   profile: RunnerProfile | undefined;
+  agentIntegrations: ReturnType<typeof useAgentIntegrations>;
   onClose: () => void;
 }) {
   const { organizationId } = useOrg();
@@ -207,10 +217,7 @@ function ProfileDialog({
   );
   const [values, setValues] = useState<ProfileFormValues>(initial);
   const [errors, setErrors] = useState<ProfileErrors>({});
-  const integrations = useQuery(
-    AgentIntegrationService.method.listAgentIntegrations,
-    { organizationId, pageSize: MAX_PAGE_SIZE },
-  );
+  const { integrations, error, isLoading, retry } = agentIntegrations;
   const refresh = () => invalidateServices(queryClient, RunnerProfileService);
   const createProfile = useMutation(
     RunnerProfileService.method.createRunnerProfile,
@@ -227,7 +234,7 @@ function ProfileDialog({
     setValues((v) => ({ ...v, [key]: value }));
     setErrors((e) => ({ ...e, [key]: undefined }));
   };
-  const vendor = integrations.data?.integrations.find(
+  const vendor = integrations.find(
     (i) => i.agentIntegrationId === values.agentIntegrationId,
   )?.vendor;
   const creating = profile === undefined;
@@ -308,24 +315,30 @@ function ProfileDialog({
         </Select>
       </div>
       {values.workloadKind === WorkloadKind.AGENT_SESSION ? (
-        <Select
-          label="Agent integration"
-          value={
-            values.agentIntegrationId === "" ? null : values.agentIntegrationId
-          }
-          onValueChange={(v) => v && set("agentIntegrationId", v)}
-          error={errors.agentIntegrationId}
-          disabled={!creating}
-        >
-          {(integrations.data?.integrations ?? []).map((i) => (
-            <SelectOption
-              key={i.agentIntegrationId}
-              value={i.agentIntegrationId}
-            >
-              {`${i.name} (${labels.vendor[i.vendor]})`}
-            </SelectOption>
-          ))}
-        </Select>
+        <>
+          {error ? <ErrorNotice error={error} onRetry={retry} /> : null}
+          {isLoading ? <Loading label="Loading agent integrations" /> : null}
+          <Select
+            label="Agent integration"
+            value={
+              values.agentIntegrationId === ""
+                ? null
+                : values.agentIntegrationId
+            }
+            onValueChange={(v) => v && set("agentIntegrationId", v)}
+            error={errors.agentIntegrationId}
+            disabled={!creating}
+          >
+            {integrations.map((i) => (
+              <SelectOption
+                key={i.agentIntegrationId}
+                value={i.agentIntegrationId}
+              >
+                {`${i.name} (${labels.vendor[i.vendor]})`}
+              </SelectOption>
+            ))}
+          </Select>
+        </>
       ) : null}
       {values.workloadKind === WorkloadKind.DEV_SESSION ? (
         <TextField

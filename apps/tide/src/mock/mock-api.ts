@@ -125,8 +125,9 @@ export const MOCK_IDS = {
   linuxProfile: "0193b000-0000-7000-8000-0000000000b1",
   codexProfile: "0193b000-0000-7000-8000-0000000000b2",
   devProfile: "0193b000-0000-7000-8000-0000000000b3",
+  claudeProfile: "0193b000-0000-7000-8000-0000000000b4",
   codexIntegration: "0193b000-0000-7000-8000-0000000000c1",
-  claudeIntegration: "0193b000-0000-7000-8000-0000000000c2",
+  claudeIntegration: "0193b002-0000-7000-8000-0000000000c2",
   installation: "0193b000-0000-7000-8000-0000000000d1",
   queuedJob: "0193b000-0000-7000-8000-0000000000e1",
   queuedAgent: "0193b000-0000-7000-8000-0000000000e2",
@@ -229,7 +230,10 @@ function profile(
   return p;
 }
 
-function seed(userId: string): Map<string, OrgState> {
+function seed(
+  userId: string,
+  agentIntegrationPageSize: number | undefined,
+): Map<string, OrgState> {
   const orgs = new Map<string, OrgState>();
 
   const acme = emptyOrg(MOCK_IDS.acme, "Acme Robotics");
@@ -291,6 +295,21 @@ function seed(userId: string): Map<string, OrgState> {
       createTime: ts(-8 * 86400),
       updateTime: ts(-8 * 86400),
     }),
+  );
+  // Put claude-team on the second page of the console's integration list.
+  const firstIntegrationPageSize = agentIntegrationPageSize ?? 1;
+  for (let index = 2; index <= firstIntegrationPageSize; index += 1) {
+    acme.integrations.push(
+      create(AgentIntegrationSchema, {
+        agentIntegrationId: `0193b001-0000-7000-8000-${index.toString(16).padStart(12, "0")}`,
+        organizationId: MOCK_IDS.acme,
+        vendor: AgentVendor.CURSOR,
+        name: `cursor-pool-${index}`,
+        settings: { case: "cursor", value: { poolName: `pool-${index}` } },
+      }),
+    );
+  }
+  acme.integrations.push(
     create(AgentIntegrationSchema, {
       agentIntegrationId: MOCK_IDS.claudeIntegration,
       organizationId: MOCK_IDS.acme,
@@ -341,6 +360,19 @@ function seed(userId: string): Map<string, OrgState> {
       priority: Priority.NORMAL,
     }),
   );
+  if (agentIntegrationPageSize !== undefined) {
+    acme.profiles.push(
+      profile(MOCK_IDS.acme, {
+        runnerProfileId: MOCK_IDS.claudeProfile,
+        name: "claude-linux",
+        workloadKind: WorkloadKind.AGENT_SESSION,
+        agentIntegrationId: MOCK_IDS.claudeIntegration,
+        guestOs: GuestOs.LINUX,
+        source: { case: "baseImage", value: GuestOs.LINUX },
+        priority: Priority.NORMAL,
+      }),
+    );
+  }
   acme.requests.push(
     create(RequestSchema, {
       requestId: MOCK_IDS.queuedJob,
@@ -615,6 +647,15 @@ function seed(userId: string): Map<string, OrgState> {
       createTime: ts(-40 * 86400),
     }),
   );
+  northwind.integrations.push(
+    create(AgentIntegrationSchema, {
+      agentIntegrationId: "0193b000-0000-7000-8000-0000000000c3",
+      organizationId: MOCK_IDS.northwind,
+      vendor: AgentVendor.CLAUDE_CODE,
+      name: "northwind-claude",
+      settings: { case: "claudeCode", value: {} },
+    }),
+  );
   orgs.set(MOCK_IDS.northwind, northwind);
 
   const contoso = emptyOrg(MOCK_IDS.contoso, "Contoso");
@@ -675,6 +716,8 @@ function hasPath(mask: FieldMask | undefined, path: string): boolean {
 export interface MockTransportOptions {
   /** The signed-in user. Default: `MOCK_USER`. */
   userId?: string;
+  /** Caps integration pages and seeds a profile that uses the second page. */
+  agentIntegrationPageSize?: number;
   /**
    * Ends each WatchQueue stream after its snapshot and this many
    * milliseconds, like the control plane before 14 minutes. Default: the
@@ -692,7 +735,7 @@ export function createMockTransport(
   options: MockTransportOptions = {},
 ): Transport {
   const userId = options.userId ?? MOCK_USER;
-  const orgs = seed(userId);
+  const orgs = seed(userId, options.agentIntegrationPageSize);
   const watchers = new Map<string, Set<Watcher>>();
   const issuedStates = new Map<string, string>();
 
@@ -1345,7 +1388,13 @@ export function createMockTransport(
       },
       listAgentIntegrations(req) {
         const { org } = membership(req.organizationId);
-        const p = page(org.integrations, req);
+        const p = page(org.integrations, {
+          pageToken: req.pageToken,
+          pageSize:
+            req.pageSize === 200
+              ? (options.agentIntegrationPageSize ?? req.pageSize)
+              : req.pageSize,
+        });
         return { integrations: p.items, nextPageToken: p.nextPageToken };
       },
       updateAgentIntegration(req) {

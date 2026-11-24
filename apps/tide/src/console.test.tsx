@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { create, isMessage } from "@bufbuild/protobuf";
 import {
   afterEach,
   beforeEach,
@@ -22,8 +23,16 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
+import {
+  DeleteAgentIntegrationRequestSchema,
+  ListAgentIntegrationsRequestSchema,
+  UpdateAgentIntegrationRequestSchema,
+} from "@delino/tide-protos/v1/agent_integration_pb";
+import { Role } from "@delino/tide-protos/v1/common_pb";
+import { GetOrganizationResponseSchema } from "@delino/tide-protos/v1/organization_pb";
+import { CreateRunnerProfileRequestSchema } from "@delino/tide-protos/v1/runner_profile_pb";
 import { QueryClient } from "@tanstack/react-query";
-import { PAGE_SIZE } from "./api.ts";
+import { MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { ErrorNotice } from "./components/ui.tsx";
@@ -291,6 +300,139 @@ describe("OwnSand link", () => {
 });
 
 describe("integrations", () => {
+  test("retries the failed cursor and scopes loaded integrations to the active organization", async () => {
+    const mock = createMockTransport({ agentIntegrationPageSize: 1 });
+    const requests: Array<[string, number, string]> = [];
+    let failContinuation = true;
+    renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`, {
+      transport: {
+        ...mock,
+        async unary(method, signal, timeout, header, input, context) {
+          const request = create(method.input, input);
+          if (isMessage(request, ListAgentIntegrationsRequestSchema)) {
+            requests.push([
+              request.organizationId,
+              request.pageSize,
+              request.pageToken,
+            ]);
+            if (request.pageToken !== "" && failContinuation) {
+              failContinuation = false;
+              throw new ConnectError("Continuation failed", Code.Internal);
+            }
+          }
+          return mock.unary(method, signal, timeout, header, input, context);
+        },
+      },
+    });
+
+    const retry = await screen.findByRole("button", { name: "Try again" });
+    const list = screen.getByRole("list", { name: "Agent integrations" });
+    expect(list.children).toHaveLength(1);
+    expect(screen.queryByText("claude-team · Claude Code")).toBeNull();
+    await click(retry);
+    expect(await screen.findByText("claude-team · Claude Code")).toBeTruthy();
+    expect(list.children).toHaveLength(2);
+    expect(within(list).getAllByText("codex-prod · OpenAI Codex")).toHaveLength(
+      1,
+    );
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+
+    await click(screen.getByRole("combobox", { name: "Organization" }));
+    await click(await screen.findByRole("option", { name: /Northwind Labs/ }));
+    expect(
+      await screen.findByText("northwind-claude · Claude Code"),
+    ).toBeTruthy();
+    expect(screen.queryByText("claude-team · Claude Code")).toBeNull();
+    expect(requests).toEqual([
+      [MOCK_IDS.acme, MAX_PAGE_SIZE, ""],
+      [MOCK_IDS.acme, MAX_PAGE_SIZE, "1"],
+      [MOCK_IDS.acme, MAX_PAGE_SIZE, "1"],
+      [MOCK_IDS.northwind, MAX_PAGE_SIZE, ""],
+    ]);
+  }, 20_000);
+
+  test.each([Role.ADMIN, Role.MEMBER])(
+    "applies the caller role %s to actions for a later-page integration",
+    async (role) => {
+      const mock = createMockTransport({ agentIntegrationPageSize: 1 });
+      const update = rs.fn();
+      const remove = rs.fn();
+      renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`, {
+        transport: {
+          ...mock,
+          async unary(method, signal, timeout, header, input, context) {
+            const request = create(method.input, input);
+            if (isMessage(request, UpdateAgentIntegrationRequestSchema)) {
+              update(request.organizationId, request.agentIntegrationId);
+            }
+            if (isMessage(request, DeleteAgentIntegrationRequestSchema)) {
+              remove(request.organizationId, request.agentIntegrationId);
+            }
+            const result = await mock.unary(
+              method,
+              signal,
+              timeout,
+              header,
+              input,
+              context,
+            );
+            if (
+              isMessage(result.message, GetOrganizationResponseSchema) &&
+              result.message.organization
+            ) {
+              result.message.organization.callerRole = role;
+            }
+            return result;
+          },
+        },
+      });
+      const label = await screen.findByText("claude-team · Claude Code");
+      const row = within(label.closest("li")!);
+      if (role === Role.MEMBER) {
+        expect(row.queryByRole("button", { name: "Edit" })).toBeNull();
+        expect(row.queryByRole("button", { name: "Delete" })).toBeNull();
+        expect(
+          screen.queryByRole("button", { name: "Create agent integration" }),
+        ).toBeNull();
+        return;
+      }
+
+      await click(row.getByRole("button", { name: "Edit" }));
+      const edit = within(
+        await screen.findByRole("dialog", { name: "Edit claude-team" }),
+      );
+      await type(
+        edit.getByRole("textbox", { name: "Name" }),
+        "claude-team-renamed",
+      );
+      await click(edit.getByRole("button", { name: "Save changes" }));
+      const renamed = await screen.findByText(
+        "claude-team-renamed · Claude Code",
+      );
+      expect(update).toHaveBeenCalledExactlyOnceWith(
+        MOCK_IDS.acme,
+        MOCK_IDS.claudeIntegration,
+      );
+
+      await click(
+        within(renamed.closest("li")!).getByRole("button", { name: "Delete" }),
+      );
+      const confirmation = within(
+        await screen.findByRole("alertdialog", {
+          name: "Delete claude-team-renamed?",
+        }),
+      );
+      await click(
+        confirmation.getByRole("button", { name: "Delete integration" }),
+      );
+      expect(remove).toHaveBeenCalledExactlyOnceWith(
+        MOCK_IDS.acme,
+        MOCK_IDS.claudeIntegration,
+      );
+    },
+    20_000,
+  );
+
   test("shows the OpenAI webhook URL and the credential state without values", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`);
     const url = await screen.findByLabelText("webhook URL of codex-prod");
@@ -383,6 +525,71 @@ describe("GitHub setup callback", () => {
 });
 
 describe("runner profiles", () => {
+  test("resolves a later-page integration's name, vendor and ID", async () => {
+    const mock = createMockTransport({ agentIntegrationPageSize: 1 });
+    const createProfile = rs.fn();
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+      transport: {
+        ...mock,
+        async unary(method, signal, timeout, header, input, context) {
+          const request = create(method.input, input);
+          if (isMessage(request, CreateRunnerProfileRequestSchema)) {
+            createProfile(
+              request.organizationId,
+              request.profile?.agentIntegrationId,
+            );
+          }
+          return mock.unary(method, signal, timeout, header, input, context);
+        },
+      },
+    });
+    expect(
+      await screen.findByText("Integration: claude-team (Claude Code)"),
+    ).toBeTruthy();
+    await click(screen.getByRole("button", { name: "Create runner profile" }));
+    const form = within(
+      await screen.findByRole("dialog", { name: "Create a runner profile" }),
+    );
+    await type(form.getByRole("textbox", { name: "Name" }), "claude-later");
+    await click(form.getByRole("combobox", { name: "Workload kind" }));
+    await click(await screen.findByRole("option", { name: "Agent session" }));
+    await click(form.getByRole("combobox", { name: "Agent integration" }));
+    await click(
+      await screen.findByRole("option", { name: "claude-team (Claude Code)" }),
+    );
+    await click(form.getByRole("combobox", { name: "Guest OS" }));
+    await click(await screen.findByRole("option", { name: "Windows" }));
+    await click(form.getByRole("button", { name: "Create profile" }));
+    expect(
+      await form.findByText(
+        "The vendor of this integration does not run on this guest OS.",
+      ),
+    ).toBeTruthy();
+    expect(createProfile).not.toHaveBeenCalled();
+
+    await click(form.getByRole("combobox", { name: "Guest OS" }));
+    await click(await screen.findByRole("option", { name: "Linux" }));
+    await click(form.getByRole("button", { name: "Create profile" }));
+    expect(
+      await screen.findByText("claude-later · Agent session · Linux"),
+    ).toBeTruthy();
+    expect(createProfile).toHaveBeenCalledExactlyOnceWith(
+      MOCK_IDS.acme,
+      MOCK_IDS.claudeIntegration,
+    );
+
+    const profile = screen
+      .getByText("claude-later · Agent session · Linux")
+      .closest("li")!;
+    await click(within(profile).getByRole("button", { name: "Edit" }));
+    const edit = within(
+      await screen.findByRole("dialog", { name: "Edit claude-later" }),
+    );
+    expect(
+      edit.getByRole("combobox", { name: "Agent integration" }),
+    ).toHaveProperty("disabled", true);
+  }, 20_000);
+
   test("shows the runs-on label of GitHub job profiles", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
     const label = await screen.findByLabelText("runs-on label of linux-build");

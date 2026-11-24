@@ -66,6 +66,7 @@ Organization owners, admins and members who sign in with Logto.
 - When the OwnSand link is `INVALID`, every organization route shows a banner that explains that dispatch has stopped and links to `integrations`.
 - Credential forms accept a value once and never show it again. After a save, the form shows only that the credential is set and when.
 - For an `OPENAI_CODEX` integration, the console shows the webhook URL to register in OpenAI.
+- The `integrations` and `profiles` routes load all pages of agent integrations for the active organization. If a later page fails, the console keeps the integrations it has loaded and offers to retry that page.
 - The `profiles` route requires `workspace_path` for `DEV_SESSION` profiles. It offers the default priority of the workload kind only when it creates a profile, because an update requires `HIGH`, `NORMAL` or `LOW`. The `dev-sessions` route shows no command, output or file content, and it does not run commands; commands and file transfers are available only through the CLI, the MCP server and the SDKs.
 - The `api-keys` route shows a new secret once with a copy action and a notice that tide cannot show it again, and explains that the key works only for dev sessions. It lists the keys page by page with "Show more", so the console can show and revoke every key.
 - Organization deletion tells the owner to uninstall the GitHub App in GitHub, because tide cannot uninstall it.

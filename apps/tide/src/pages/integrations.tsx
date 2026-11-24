@@ -27,7 +27,11 @@ import {
 import { OwnSandLinkService } from "@delino/tide-protos/v1/ownsand_link_pb";
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import { useState } from "react";
-import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
+import {
+  invalidateServices,
+  MAX_PAGE_SIZE,
+  useAgentIntegrations,
+} from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
@@ -554,10 +558,8 @@ function settingValue(i: AgentIntegration): string {
 function AgentIntegrationsSection({ admin }: { admin: boolean }) {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
-  const list = useQuery(AgentIntegrationService.method.listAgentIntegrations, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const { integrations, isLoading, error, retry } =
+    useAgentIntegrations(organizationId);
   const remove = useMutation(
     AgentIntegrationService.method.deleteAgentIntegration,
     {
@@ -566,7 +568,6 @@ function AgentIntegrationsSection({ admin }: { admin: boolean }) {
   );
   const [editing, setEditing] = useState<AgentIntegration | "new">();
   const [deleting, setDeleting] = useState<AgentIntegration>();
-  const integrations = list.data?.integrations ?? [];
 
   return (
     <section className="section" aria-labelledby="agents-title">
@@ -585,17 +586,16 @@ function AgentIntegrationsSection({ admin }: { admin: boolean }) {
         An agent integration holds the account or pool of one coding-agent
         vendor. Agent session runner profiles name one integration.
       </p>
-      {list.isPending ? (
-        <Loading label="Loading agent integrations" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : integrations.length === 0 ? (
+      {error ? <ErrorNotice error={error} onRetry={retry} /> : null}
+      {isLoading ? <Loading label="Loading agent integrations" /> : null}
+      {integrations.length === 0 && !isLoading && !error ? (
         <Empty title="No agent integrations">
           {admin
             ? "Create an integration for Claude Code, Cursor, OpenAI Codex or Devin to run their sessions, or connect GitHub above."
             : "Ask an admin to create an agent integration."}
         </Empty>
-      ) : (
+      ) : null}
+      {integrations.length > 0 ? (
         <ul className="list" aria-label="Agent integrations">
           {integrations.map((i) => (
             <li key={i.agentIntegrationId} className="list-row">
@@ -646,7 +646,7 @@ function AgentIntegrationsSection({ admin }: { admin: boolean }) {
             </li>
           ))}
         </ul>
-      )}
+      ) : null}
       {editing !== undefined ? (
         <IntegrationDialog
           integration={editing === "new" ? undefined : editing}

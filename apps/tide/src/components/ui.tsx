@@ -89,7 +89,11 @@ export function ErrorNotice({
       {sessionEnded ? (
         <SignInButton />
       ) : onRetry ? (
-        <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
+        <Button
+          type="button"
+          variant={ButtonVariant.Secondary}
+          onClick={onRetry}
+        >
           Try again
         </Button>
       ) : null}
