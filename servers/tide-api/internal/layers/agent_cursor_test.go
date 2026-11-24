@@ -51,6 +51,23 @@ func newCursorWorldTiming(t *testing.T, guest tidev1.GuestOs, timing agent.Timin
 	return cw
 }
 
+func TestCursorClaimDuringProfileDeletion(t *testing.T) {
+	w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	const id = "bc-deleted-profile"
+	commit := holdTx(t, w.env, "DELETE FROM runner_profiles WHERE runner_profile_id = $1", w.profileID)
+	w.cursor.AddRequest(id, true)
+	waitForLockWaiter(t, w.env)
+	if n := w.cursor.ClaimCount(id); n != 1 {
+		t.Fatalf("%d claims while admission waits for the profile, want 1", n)
+	}
+	commit()
+	eventually(t, "release of the unused vendor claim", func() bool { return w.cursor.Released(id) == 1 })
+	if _, held := w.cursor.Claim(id); held {
+		t.Error("the vendor claim is still active")
+	}
+	w.assertNoRequestsOrClaims(t)
+}
+
 // TestCursorRequestLifecycle: a pending request is claimed with a tide
 // worker ID and becomes a request; the runner installs nothing new, gets
 // the key only in its credential file, starts `agent worker ... start` with
