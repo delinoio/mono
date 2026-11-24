@@ -150,6 +150,50 @@ describe("exec handle after a terminal failure", () => {
     expect(await second).toBe(failure);
   });
 
+  test("records the abort reason before closing the generator at its cached event", async () => {
+    const cleanup = openGate();
+    let closing = false;
+    let advanced = false;
+    async function* stream(): AsyncGenerator<ExecStreamEvent, ExecResult> {
+      try {
+        yield { type: ExecEventType.Started, execId: "e" };
+        advanced = true;
+        throw new Error("unexpected stream read");
+      } finally {
+        closing = true;
+        await cleanup.gate;
+      }
+    }
+
+    const caller = new AbortController();
+    const handle = new ExecHandle(
+      "e",
+      stream(),
+      {} as DataPathSelector,
+      undefined,
+      true,
+      caller.signal,
+    );
+    await settle();
+    caller.abort(null);
+    const first = expect(handle[Symbol.asyncIterator]().next()).rejects.toBe(
+      null,
+    );
+    let overlapping: unknown = undefined;
+    const waited = handle.wait().catch((error: unknown) => {
+      overlapping = error;
+    });
+    try {
+      await settle();
+      expect(closing).toBe(true);
+      expect(advanced).toBe(false);
+      expect(overlapping).toBe(null);
+    } finally {
+      cleanup.open();
+      await Promise.all([first, waited]);
+    }
+  });
+
   test("a rejection that is not an Error, including undefined, is reported as it is", async () => {
     for (const reason of ["aborted by the caller", undefined, 0, null]) {
       const { gate, open } = openGate();
@@ -232,6 +276,66 @@ describe("exec handle after a terminal failure", () => {
 });
 
 describe("exec over the relay", () => {
+  for (const firstReader of ["iterator", "wait"] as const) {
+    test(`rejects the first ${firstReader} read after cancellation with a cached event`, async () => {
+      const h = setup();
+      const seen: { signal?: AbortSignal } = {};
+      h.api.stream(RelayService, "Exec", function* (req, call) {
+        seen.signal = call.signal;
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.started(req.execId));
+        yield new Hang();
+      });
+      const caller = new AbortController();
+      const reason = new Error("caller canceled after Started");
+      const handle = h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"], signal: caller.signal });
+      await h.clock.settle();
+      expect(h.api.callsOf("Exec")).toHaveLength(1);
+      expect(seen.signal?.aborted).toBe(false);
+
+      caller.abort(reason);
+      const first =
+        firstReader === "iterator"
+          ? handle[Symbol.asyncIterator]().next()
+          : handle.wait();
+      await h.clock.run(
+        Promise.all([
+          expect(first).rejects.toBe(reason),
+          expect(handle.wait()).rejects.toBe(reason),
+        ]),
+      );
+      await expect(handle.wait()).rejects.toBe(reason);
+      expect(seen.signal?.aborted).toBe(true);
+      expect(h.api.callsOf("Exec")).toHaveLength(1);
+      expect(h.api.callsOf("AttachExec")).toHaveLength(0);
+    });
+  }
+
+  test("delivers the cached Started once to a delayed active reader", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* (req) {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started(req.execId));
+      yield execMsg(ev.exited(0));
+    });
+    const handle = h.client
+      .sandbox(SANDBOX)
+      .exec({ command: ["x"], signal: new AbortController().signal });
+    await h.clock.settle();
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+    expect(await h.clock.run(collect(handle))).toEqual([
+      { type: ExecEventType.Started, execId: handle.execId },
+    ]);
+    expect(await handle.wait()).toMatchObject({
+      kind: ExecResultKind.Exited,
+      exitCode: 0n,
+    });
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+    expect(h.api.callsOf("AttachExec")).toHaveLength(0);
+  });
+
   test("runs a command relay-only without OpenSession and binds the grant to the request digest", async () => {
     const h = setup();
     h.api.stream(RelayService, "Exec", function* (req) {
