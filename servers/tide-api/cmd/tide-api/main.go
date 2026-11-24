@@ -36,9 +36,8 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 )
 
-// shutdownTimeout bounds the drain after a termination signal. Server
-// streams (dev session exec, WatchQueue) end with the drain; clients resume
-// them.
+// shutdownTimeout bounds the public HTTP drain. Server streams (dev session
+// exec, WatchQueue) end with the drain. Clients resume them.
 const shutdownTimeout = 10 * time.Second
 
 // HTTP server timeouts. Server streams run for up to 14 minutes, so the
@@ -57,7 +56,9 @@ func main() {
 		os.Exit(claude.RunHook(os.Getenv, os.Args[0], os.Stderr))
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-	if err := run(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, stop); err != nil {
 		slog.Error("server_exited", slog.Any("error", err))
 		os.Exit(1)
 	}
@@ -68,7 +69,7 @@ func hookMode(args []string) bool {
 	return len(args) > 0 && (filepath.Base(args[0]) == claude.HookName || len(args) > 1 && args[1] == claude.HookName)
 }
 
-func run() error {
+func run(ctx context.Context, stop context.CancelFunc) error {
 	cfg, err := config.Load(os.LookupEnv)
 	if err != nil {
 		return err
@@ -88,9 +89,6 @@ func run() error {
 	}()
 	logger := tel.Logger
 	slog.SetDefault(logger)
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	database, err := db.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -169,22 +167,49 @@ func run() error {
 	if metricsListener != nil {
 		metricsSrv = newMetricsServer(tel, logger)
 		metricsAddr = metricsListener.Addr().String()
-		go func() {
-			if err := metricsSrv.Serve(metricsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("metrics_server_failed", slog.Any("error", err))
-			}
-		}()
 	}
 
 	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)),
 		slog.String("client_address_mode", string(cfg.ClientAddressMode)), slog.String("metrics_addr", metricsAddr),
 		slog.String("secret_primary_key_id", cfg.SecretKeys.PrimaryKeyID()), slog.Bool("github_app", cfg.GitHub != nil),
 		slog.Bool("otlp_metrics_export", tel.MetricsExport), slog.Bool("otlp_logs_export", tel.LogsExport))
-	err = serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait)
-	if metricsSrv != nil {
-		_ = metricsSrv.Close()
+	return runServers(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait, metricsSrv, metricsListener)
+}
+
+// runServers shuts down public HTTP when the configured metrics listener
+// fails. It waits for the metrics Serve result even if a signal starts the
+// shutdown, so an overlapping metrics failure is returned to main.
+func runServers(ctx context.Context, stop func(), srv *http.Server, listener net.Listener, logger *slog.Logger,
+	timeout time.Duration, beforeDrain func(), metricsSrv *http.Server, metricsListener net.Listener) error {
+	if metricsSrv == nil {
+		return serve(ctx, stop, srv, listener, logger, timeout, beforeDrain)
 	}
-	return err
+
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	metricsDone := make(chan error, 1)
+	go func() {
+		err := metricsSrv.Serve(metricsListener)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		if err != nil {
+			logger.Error("metrics_server_failed", slog.Any("error", err))
+			cancel()
+		}
+		metricsDone <- err
+	}()
+
+	stopSignal := func() {
+		// Keep the handler installed after a metrics failure so a concurrent
+		// first signal cannot interrupt the drain or the exit log.
+		if ctx.Err() != nil {
+			stop()
+		}
+	}
+	err := serve(serveCtx, stopSignal, srv, listener, logger, timeout, beforeDrain)
+	_ = metricsSrv.Close()
+	return errors.Join(err, <-metricsDone)
 }
 
 // newMetricsServer returns the internal Prometheus listener. It serves only

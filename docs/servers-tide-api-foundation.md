@@ -477,6 +477,8 @@ GitHub Actions runner (recorded implementation, `servers/tide-api/internal/githu
 
 The server records its metrics with the OpenTelemetry SDK through the shared `servers/internal/telemetry` package, like `accounts-api` ([accounts-api metrics](servers-accounts-api-foundation.md#metrics)). `GET /metrics` on `METRICS_ADDR` serves them in the Prometheus format through the OpenTelemetry Prometheus exporter. Caddy does not route `METRICS_ADDR`, so the endpoint is not public. Metric labels never contain organization IDs, user IDs, repository names or other user data.
 
+If `METRICS_ADDR` is empty, Tide starts without a metrics listener. If the configured address cannot bind, startup fails before the lease workers start. If the listener fails permanently after binding, Tide logs the cause, stops the lease workers and releases the lease, and then drains public HTTP within the shutdown timeout. The process exits with a nonzero status and logs the original listener error, even if a termination signal arrives during the same shutdown. A clean signal shutdown exits successfully.
+
 | Metric                                    | Type      | Labels                        |
 | ----------------------------------------- | --------- | ----------------------------- |
 | `tide_requests`                           | gauge     | `kind`, `priority`, `state`   |
