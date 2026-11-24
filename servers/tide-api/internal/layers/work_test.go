@@ -11,15 +11,18 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
+	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/profile"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
+	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
 // TestMembershipEndWithSessionsAndKeys: removing a member revokes the keys,
@@ -869,8 +872,234 @@ func TestWatchQueueRemovedRunner(t *testing.T) {
 	close(release)
 	for watch.Receive() {
 		if r := watch.Msg().GetRunner(); r != nil && r.GetRunnerId() == runnerID && r.GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED {
+			if r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP {
+				t.Fatalf("removed runner end reason = %v, want CLEAN_UP", r.GetEndReason())
+			}
 			return
 		}
 	}
 	t.Fatalf("the removed runner was not sent as DELETED: %v", watch.Err())
+}
+
+const (
+	watchRequestOpen = tidev1.RequestState_REQUEST_STATE_RUNNING
+	watchRequestEnd  = tidev1.RequestState_REQUEST_STATE_CANCELED
+	watchRunnerOpen  = tidev1.RunnerState_RUNNER_STATE_BUSY
+	watchRunnerEnd   = tidev1.RunnerState_RUNNER_STATE_DELETED
+)
+
+func TestWatchQueueCommitOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		runner   bool
+		rollBack bool
+	}{
+		{name: "late request"},
+		{name: "late runner", runner: true},
+		{name: "rolled back request", rollBack: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := testenv.New(t, testenv.WithLayers(ownsandfake.New(), &layers.Layers{}))
+			org, otherOrg := env.NewOrg("alice"), env.NewOrg("bob")
+			target := seedQueueWatchRow(t, env, org.ID, tc.runner)
+			later := seedQueueWatchRow(t, env, org.ID, false)
+			foreign := seedQueueWatchRow(t, env, otherOrg.ID, tc.runner)
+
+			ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
+			defer cancel()
+			watch := openQueueWatch(t, ctx, env, org)
+			expectQueueWatchState(t, nextQueueWatchEvent(t, watch), target, watchRequestOpen, watchRunnerOpen)
+			expectQueueWatchState(t, nextQueueWatchEvent(t, watch), later, watchRequestOpen, watchRunnerOpen)
+			if msg := nextQueueWatchEvent(t, watch); msg.GetSnapshotComplete() == nil {
+				t.Fatalf("expected snapshot_complete, got %v", msg)
+			}
+
+			tx, err := env.DB.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(t.Context())
+			// The trigger must record the top-level ID even inside a savepoint.
+			savepoint, err := tx.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			earlySeq := endQueueWatchRow(t, ctx, savepoint, target, tc.runner)
+			if err := savepoint.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			other, err := env.DB.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer other.Rollback(t.Context())
+			if _, err := other.Exec(ctx, "SELECT nextval('work_change_seq') FROM generate_series(1, 1500)"); err != nil {
+				t.Fatal(err)
+			}
+			laterSeq := endQueueWatchRow(t, ctx, other, later, false)
+			endQueueWatchRow(t, ctx, other, foreign, tc.runner)
+			if err := other.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if laterSeq-earlySeq < 1000 {
+				t.Fatalf("sequence gap = %d, want at least 1000", laterSeq-earlySeq)
+			}
+			expectQueueWatchState(t, nextQueueWatchEvent(t, watch), later, watchRequestEnd, watchRunnerEnd)
+
+			if tc.rollBack {
+				if err := tx.Rollback(ctx); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				expectQueueWatchState(t, nextQueueWatchEvent(t, watch), target, watchRequestEnd, watchRunnerEnd)
+			}
+			// A new commit must still arrive after the late commit or rollback.
+			next := seedQueueWatchRow(t, env, org.ID, true)
+			expectQueueWatchState(t, nextQueueWatchEvent(t, watch), next, watchRequestOpen, watchRunnerOpen)
+
+			received := make(chan bool, 1)
+			go func() { received <- watch.Receive() }()
+			select {
+			case hasEvent := <-received:
+				if hasEvent {
+					t.Fatalf("idle watch emitted an unexpected event: %v", watch.Msg())
+				}
+				t.Fatalf("watch ended during idle polls: %v", watch.Err())
+			case <-time.After(2200 * time.Millisecond):
+				cancel()
+				if <-received {
+					t.Fatalf("idle watch emitted an unexpected event: %v", watch.Msg())
+				}
+			}
+		})
+	}
+}
+
+func TestWatchQueueSnapshotAcrossTables(t *testing.T) {
+	env := testenv.New(t, testenv.WithLayers(ownsandfake.New(), &layers.Layers{}))
+	org := env.NewOrg("alice")
+	requestID := seedQueueWatchRow(t, env, org.ID, false)
+	runnerID := seedQueueWatchRow(t, env, org.ID, true)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	writer, err := env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Rollback(t.Context())
+	if _, err := writer.Exec(ctx, "LOCK TABLE runners IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	type watchResult struct {
+		stream *connect.ServerStreamForClient[tidev1.WatchQueueResponse]
+		err    error
+	}
+	started := make(chan watchResult, 1)
+	go func() {
+		stream, err := env.User(org.Member).Work.WatchQueue(ctx, connect.NewRequest(&tidev1.WatchQueueRequest{OrganizationId: org.ID}))
+		started <- watchResult{stream, err}
+	}()
+
+	// Commit only after the watch read requests and is blocked reading runners.
+	eventually(t, "watch reading the runner snapshot", func() bool {
+		var waiting bool
+		err := env.DB.Pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+				AND query LIKE '% FROM runners WHERE organization_id = $1 AND state = ANY($2)%'
+		)`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return waiting
+	})
+	endQueueWatchRow(t, ctx, writer, requestID, false)
+	endQueueWatchRow(t, ctx, writer, runnerID, true)
+	if err := writer.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	watch := <-started
+	if watch.err != nil {
+		t.Fatal(watch.err)
+	}
+	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), requestID, watchRequestOpen, watchRunnerOpen)
+	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), runnerID, watchRequestOpen, watchRunnerOpen)
+	if msg := nextQueueWatchEvent(t, watch.stream); msg.GetSnapshotComplete() == nil {
+		t.Fatalf("expected snapshot_complete, got %v", msg)
+	}
+	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), requestID, watchRequestEnd, watchRunnerEnd)
+	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), runnerID, watchRequestEnd, watchRunnerEnd)
+}
+
+func seedQueueWatchRow(t *testing.T, env *testenv.Env, orgID string, runner bool) string {
+	t.Helper()
+	kind := int16(tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION)
+	var row pgx.Row
+	if runner {
+		row = env.DB.Pool.QueryRow(t.Context(), `INSERT INTO runners (runner_id, organization_id, runner_profile_id,
+			kind, guest_os, state, idempotency_key, create_request, ownsand_sandbox_id, create_time, update_time)
+			VALUES (gen_random_uuid(), $1, gen_random_uuid(), $2, $3, $4,
+				gen_random_uuid(), ''::bytea, gen_random_uuid(), now(), now()) RETURNING runner_id::text`,
+			orgID, kind, int16(tidev1.GuestOs_GUEST_OS_LINUX), int16(watchRunnerOpen))
+	} else {
+		row = env.DB.Pool.QueryRow(t.Context(), `INSERT INTO requests (request_id, organization_id, runner_profile_id,
+			kind, source, source_key, state, priority, queue_time, queue_deadline, create_time, update_time)
+			VALUES (gen_random_uuid(), $1, gen_random_uuid(), $2, $3, gen_random_uuid()::text,
+				$4, $5, now(), now() + interval '1 hour', now(), now()) RETURNING request_id::text`,
+			orgID, kind, int16(work.SourceDevSession), int16(watchRequestOpen), int16(tidev1.Priority_PRIORITY_NORMAL))
+	}
+	var id string
+	if err := row.Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func endQueueWatchRow(t *testing.T, ctx context.Context, tx pgx.Tx, id string, runner bool) int64 {
+	t.Helper()
+	sql := "UPDATE requests SET state = $2, end_time = now() WHERE request_id = $1 RETURNING change_seq"
+	state := int16(watchRequestEnd)
+	if runner {
+		sql = "UPDATE runners SET state = $2, end_time = now() WHERE runner_id = $1 RETURNING change_seq"
+		state = int16(watchRunnerEnd)
+	}
+	var seq int64
+	if err := tx.QueryRow(ctx, sql, id, state).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+func openQueueWatch(t *testing.T, ctx context.Context, env *testenv.Env, org testenv.Org) *connect.ServerStreamForClient[tidev1.WatchQueueResponse] {
+	t.Helper()
+	watch, err := env.User(org.Member).Work.WatchQueue(ctx, connect.NewRequest(&tidev1.WatchQueueRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return watch
+}
+
+func nextQueueWatchEvent(t *testing.T, watch *connect.ServerStreamForClient[tidev1.WatchQueueResponse]) *tidev1.WatchQueueResponse {
+	t.Helper()
+	if !watch.Receive() {
+		t.Fatalf("watch ended before the expected event: %v", watch.Err())
+	}
+	return watch.Msg()
+}
+
+func expectQueueWatchState(t *testing.T, event *tidev1.WatchQueueResponse, id string, requestState tidev1.RequestState, runnerState tidev1.RunnerState) {
+	t.Helper()
+	if r := event.GetRequest(); r != nil && r.GetRequestId() == id && r.GetState() == requestState {
+		return
+	}
+	if r := event.GetRunner(); r != nil && r.GetRunnerId() == id && r.GetState() == runnerState {
+		return
+	}
+	t.Fatalf("expected state %v or %v for %s, got %v", requestState, runnerState, id, event)
 }

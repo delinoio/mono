@@ -3,12 +3,13 @@
 package work
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -377,15 +378,10 @@ func (h *Handler) GetCapacity(ctx context.Context, req *connect.Request[tidev1.G
 	return connect.NewResponse(resp), nil
 }
 
-// WatchQueue streams every open request and runner, then
-// snapshot_complete, then each change (also the change to a terminal
-// state). Changes are read by change_seq, which a trigger assigns on every
-// write, so the stream works on every instance. A sequence value can commit
-// after a higher one; the stream therefore reads a window behind its cursor
-// again and sends each row version once.
+// WatchQueue streams every open request and runner, then snapshot_complete,
+// then changes to either table, including transitions to terminal states.
 func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.WatchQueueRequest], stream *connect.ServerStream[tidev1.WatchQueueResponse]) error {
-	e := h.e
-	s := e.svc
+	s := h.e.svc
 	c, err := s.Authorize(ctx, s.DB.Pool, req.Msg.GetOrganizationId(), authz.ActionRead)
 	if err != nil {
 		return err
@@ -396,97 +392,45 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.Wa
 	}
 	ctx, cancel := context.WithTimeout(ctx, lifetime)
 	defer cancel()
-	var mu sync.Mutex
-	send := func(m *tidev1.WatchQueueResponse) error {
-		mu.Lock()
-		defer mu.Unlock()
-		return stream.Send(m)
-	}
-	sent := map[string]int64{}
-	// removable holds the sent runners that the dispatcher may still remove
-	// without a terminal state: a CREATING runner without a sandbox, whose
-	// CreateSandbox OwnSand rejected for capacity (dropRunner).
+	// Only a CREATING runner without a sandbox can disappear without a
+	// terminal state when OwnSand rejects CreateSandbox for capacity.
 	removable := map[string]*tidev1.Runner{}
-	var cursor, removed int64
-	emit := func(rows []watchRow) error {
-		for _, r := range rows {
-			if sent[r.id] >= r.seq {
-				continue
-			}
-			sent[r.id] = r.seq
-			cursor = max(cursor, r.seq)
-			if run := r.msg.GetRunner(); run != nil {
+	emit := func(batch watchBatch) error {
+		for _, row := range batch.rows {
+			if run := row.msg.GetRunner(); run != nil {
 				if run.GetState() == runCreating && run.GetOwnsandSandboxId() == "" {
 					removable[run.GetRunnerId()] = run
 				} else {
 					delete(removable, run.GetRunnerId())
 				}
 			}
-			if err := send(r.msg); err != nil {
+			if err := stream.Send(row.msg); err != nil {
 				return err
 			}
 		}
-		return nil
-	}
-	// emitRemoved sends a sent runner whose row is gone once more as
-	// DELETED with CLEAN_UP, so a client drops it: the stream has no
-	// removal event.
-	emitRemoved := func() error {
-		if len(removable) == 0 {
-			return nil
-		}
-		ids := make([]string, 0, len(removable))
-		for id := range removable {
-			ids = append(ids, id)
-		}
-		rows, err := s.DB.Pool.Query(ctx, "SELECT runner_id::text FROM runners WHERE runner_id = ANY($1::uuid[])", ids)
-		if err != nil {
-			return err
-		}
-		exists := map[string]bool{}
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return err
-			}
-			exists[id] = true
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		for _, id := range ids {
-			if exists[id] {
-				continue
-			}
+		// The stream has no removal event. Send a removed runner once more
+		// as DELETED with CLEAN_UP so the client drops it.
+		for _, id := range batch.removed {
 			gone := proto.Clone(removable[id]).(*tidev1.Runner)
 			gone.State, gone.EndReason, gone.EndedAt = runDeleted, tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP, api.Timestamp(s.NowUTC())
 			delete(removable, id)
-			removed++
-			if err := send(&tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Runner{Runner: gone}}); err != nil {
+			if err := stream.Send(&tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Runner{Runner: gone}}); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	snapshot, err := h.watchRows(ctx, c.OrganizationID, 0, true)
+	batch, err := h.readWatchBatch(ctx, c.OrganizationID, "", removable)
 	if err != nil {
 		return s.Internal(ctx, "watch queue", err)
 	}
-	if err := emit(snapshot); err != nil {
+	if err := emit(batch); err != nil {
 		return err
 	}
-	if cursor == 0 {
-		if err := s.DB.Pool.QueryRow(ctx, "SELECT COALESCE(GREATEST((SELECT max(change_seq) FROM requests WHERE organization_id = $1), (SELECT max(change_seq) FROM runners WHERE organization_id = $1)), 0)",
-			c.OrganizationID).Scan(&cursor); err != nil {
-			return s.Internal(ctx, "watch queue", err)
-		}
-	}
-	if err := send(&tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_SnapshotComplete{SnapshotComplete: &tidev1.WatchQueueSnapshotComplete{}}}); err != nil {
+	if err := stream.Send(&tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_SnapshotComplete{SnapshotComplete: &tidev1.WatchQueueSnapshotComplete{}}}); err != nil {
 		return err
 	}
-	const window = 1000
+	checkpoint := batch.snapshot
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	lastSend := time.Now()
@@ -501,34 +445,22 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.Wa
 			return ctx.Err()
 		case <-ticker.C:
 		}
-		rows, err := h.watchRows(ctx, c.OrganizationID, max(cursor-window, 0), false)
+		batch, err := h.readWatchBatch(ctx, c.OrganizationID, checkpoint, removable)
 		if err != nil {
 			if ctx.Err() != nil {
 				continue
 			}
 			return s.Internal(ctx, "watch queue", err)
 		}
-		before, beforeRemoved := len(sent), removed
-		prevCursor := cursor
-		if err := emit(rows); err != nil {
+		if err := emit(batch); err != nil {
 			return err
 		}
-		if err := emitRemoved(); err != nil {
-			if ctx.Err() != nil {
-				continue
-			}
-			return s.Internal(ctx, "watch queue", err)
-		}
-		if cursor != prevCursor || len(sent) != before || removed != beforeRemoved {
+		checkpoint = batch.snapshot
+		if len(batch.rows) > 0 || len(batch.removed) > 0 {
 			lastSend = time.Now()
 		}
-		for id, seq := range sent {
-			if seq < cursor-window {
-				delete(sent, id)
-			}
-		}
 		if time.Since(lastSend) >= keepalive {
-			if err := send(&tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Keepalive{Keepalive: &tidev1.WatchQueueKeepalive{}}}); err != nil {
+			if err := stream.Send(&tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Keepalive{Keepalive: &tidev1.WatchQueueKeepalive{}}}); err != nil {
 				return err
 			}
 			lastSend = time.Now()
@@ -537,70 +469,95 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.Wa
 }
 
 type watchRow struct {
-	id  string
 	seq int64
 	msg *tidev1.WatchQueueResponse
 }
 
-// watchRows reads the open rows (snapshot) or the rows changed after seq,
-// in change order.
-func (h *Handler) watchRows(ctx context.Context, orgID string, after int64, snapshot bool) ([]watchRow, error) {
+type watchBatch struct {
+	snapshot string
+	rows     []watchRow
+	removed  []string
+}
+
+// The current read only returns visible row versions. A version is new to the
+// stream if its writer was in progress or its transaction ID was at or above
+// the previous snapshot's upper bound. Both predicates can use the same index.
+const watchChangedCondition = `watch_xact_id IS NOT NULL AND (
+	watch_xact_id >= pg_snapshot_xmax($2::text::pg_snapshot)
+	OR watch_xact_id = ANY(ARRAY(SELECT pg_snapshot_xip($2::text::pg_snapshot)))
+)`
+
+func (h *Handler) readWatchBatch(ctx context.Context, orgID, checkpoint string, removable map[string]*tidev1.Runner) (watchBatch, error) {
 	s := h.e.svc
-	cond := "change_seq > $2"
-	args := []any{orgID, after}
-	if snapshot {
-		cond = "state = ANY($2)"
-	}
-	reqArgs := args
-	if snapshot {
-		reqArgs = []any{orgID, openRequestStates}
-	}
-	var out []watchRow
-	rows, err := s.DB.Pool.Query(ctx, "SELECT "+requestColumns+" FROM requests WHERE organization_id = $1 AND "+cond+" ORDER BY change_seq", reqArgs...)
+	tx, err := s.DB.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return nil, err
+		return watchBatch{}, err
 	}
+	defer tx.Rollback(ctx)
+
+	var batch watchBatch
+	if err := tx.QueryRow(ctx, "SELECT pg_current_snapshot()::text").Scan(&batch.snapshot); err != nil {
+		return watchBatch{}, err
+	}
+	cond := watchChangedCondition
+	reqArgs, runArgs := []any{orgID, checkpoint}, []any{orgID, checkpoint}
+	if checkpoint == "" {
+		cond = "state = ANY($2)"
+		reqArgs, runArgs = []any{orgID, openRequestStates}, []any{orgID, openRunnerStates}
+	}
+	rows, err := tx.Query(ctx, "SELECT "+requestColumns+" FROM requests WHERE organization_id = $1 AND "+cond, reqArgs...)
+	if err != nil {
+		return watchBatch{}, err
+	}
+	var reqs []*tidev1.Request
 	for rows.Next() {
 		r, err := scanRequest(rows)
 		if err != nil {
 			rows.Close()
-			return nil, err
+			return watchBatch{}, err
 		}
-		out = append(out, watchRow{id: "q" + r.ID, seq: r.ChangeSeq, msg: &tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Request{Request: r.Proto()}}})
+		request := r.Proto()
+		reqs = append(reqs, request)
+		batch.rows = append(batch.rows, watchRow{seq: r.ChangeSeq, msg: &tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Request{Request: request}}})
 	}
-	rows.Close()
-	var reqs []*tidev1.Request
-	for _, r := range out {
-		reqs = append(reqs, r.msg.GetRequest())
+	if err := rows.Err(); err != nil {
+		return watchBatch{}, err
 	}
-	h.e.decorate(ctx, orgID, reqs...)
-	runArgs := args
-	if snapshot {
-		runArgs = []any{orgID, openRunnerStates}
-	}
-	rows, err = s.DB.Pool.Query(ctx, "SELECT "+runnerColumns+" FROM runners WHERE organization_id = $1 AND "+cond+" ORDER BY change_seq", runArgs...)
+	rows, err = tx.Query(ctx, "SELECT "+runnerColumns+" FROM runners WHERE organization_id = $1 AND "+cond, runArgs...)
 	if err != nil {
-		return nil, err
+		return watchBatch{}, err
 	}
-	defer rows.Close()
 	for rows.Next() {
 		r, err := scanRunner(rows)
 		if err != nil {
-			return nil, err
+			rows.Close()
+			return watchBatch{}, err
 		}
-		out = append(out, watchRow{id: "r" + r.ID, seq: r.ChangeSeq, msg: &tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Runner{Runner: r.Proto()}}})
+		batch.rows = append(batch.rows, watchRow{seq: r.ChangeSeq, msg: &tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Runner{Runner: r.Proto()}}})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return watchBatch{}, err
 	}
-	sortRows(out)
-	return out, nil
-}
 
-func sortRows(rows []watchRow) {
-	for i := 1; i < len(rows); i++ {
-		for j := i; j > 0 && rows[j].seq < rows[j-1].seq; j-- {
-			rows[j], rows[j-1] = rows[j-1], rows[j]
+	if len(removable) > 0 {
+		ids := make([]string, 0, len(removable))
+		for id := range removable {
+			ids = append(ids, id)
+		}
+		rows, err := tx.Query(ctx, `SELECT id::text FROM unnest($2::uuid[]) AS candidate(id)
+			WHERE NOT EXISTS (SELECT 1 FROM runners WHERE organization_id = $1 AND runner_id = candidate.id)`, orgID, ids)
+		if err != nil {
+			return watchBatch{}, err
+		}
+		batch.removed, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return watchBatch{}, err
 		}
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return watchBatch{}, err
+	}
+	h.e.decorate(ctx, orgID, reqs...)
+	slices.SortFunc(batch.rows, func(a, b watchRow) int { return cmp.Compare(a.seq, b.seq) })
+	return batch, nil
 }
