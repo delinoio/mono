@@ -129,6 +129,16 @@ func TestDevSessionQueueAndDeletion(t *testing.T) {
 	if err != nil || len(list.Msg.GetDevSessions()) != 2 {
 		t.Fatalf("own sessions %v %v", list, err)
 	}
+	ended, err := memberByKey.DevSession.ListDevSessions(ctx, connect.NewRequest(&tidev1.ListDevSessionsRequest{OrganizationId: w.org.ID,
+		States: []tidev1.RequestState{tidev1.RequestState_REQUEST_STATE_ENDED}}))
+	if err != nil || len(ended.Msg.GetDevSessions()) < 2 {
+		t.Fatalf("ended sessions %v %v", ended, err)
+	}
+	unspecified, err := memberByKey.DevSession.ListDevSessions(ctx, connect.NewRequest(&tidev1.ListDevSessionsRequest{OrganizationId: w.org.ID,
+		States: []tidev1.RequestState{tidev1.RequestState_REQUEST_STATE_UNSPECIFIED}, IncludeEnded: true}))
+	if err != nil || len(unspecified.Msg.GetDevSessions()) != 0 {
+		t.Fatalf("sessions with unspecified state %v %v", unspecified, err)
+	}
 	open, _ := w.env.User(w.org.Member).DevSession.ListDevSessions(ctx, connect.NewRequest(&tidev1.ListDevSessionsRequest{OrganizationId: w.org.ID}))
 	if len(open.Msg.GetDevSessions()) != 0 {
 		t.Fatalf("open sessions %v", open)

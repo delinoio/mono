@@ -54,8 +54,13 @@ func TestRunnerProfiles(t *testing.T) {
 
 	// List with a kind filter; members read.
 	list, err := w.env.User(w.org.Member).Profile.ListRunnerProfiles(ctx, connect.NewRequest(&tidev1.ListRunnerProfilesRequest{OrganizationId: w.org.ID, WorkloadKind: tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION}))
-	if err != nil || len(list.Msg.GetProfiles()) != 1 {
+	if err != nil || len(list.Msg.GetProfiles()) != 1 || list.Msg.GetProfiles()[0].GetRunnerProfileId() != p.GetRunnerProfileId() {
 		t.Fatalf("list %v %v", list, err)
+	}
+	all, err := w.env.User(w.org.Member).Profile.ListRunnerProfiles(ctx, connect.NewRequest(&tidev1.ListRunnerProfilesRequest{OrganizationId: w.org.ID,
+		WorkloadKind: tidev1.WorkloadKind_WORKLOAD_KIND_UNSPECIFIED}))
+	if err != nil || len(all.Msg.GetProfiles()) != 2 {
+		t.Fatalf("unfiltered profiles %v %v", all, err)
 	}
 
 	// Update: kind and integration cannot change.

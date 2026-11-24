@@ -302,9 +302,14 @@ func TestWorkService(t *testing.T) {
 
 	// Queue order: HIGH first, then by queue time; open requests first.
 	list, err := w.env.User(w.org.Member).Work.ListRequests(ctx, connect.NewRequest(&tidev1.ListRequestsRequest{OrganizationId: w.org.ID,
-		States: []tidev1.RequestState{tidev1.RequestState_REQUEST_STATE_QUEUED}}))
+		Kind: tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, States: []tidev1.RequestState{tidev1.RequestState_REQUEST_STATE_QUEUED}}))
 	if err != nil || len(list.Msg.GetRequests()) != 2 || list.Msg.GetRequests()[0].GetRequestId() != high.GetDevSessionId() {
 		t.Fatalf("queue %v %v", list, err)
+	}
+	runners, err := owner.Work.ListRunners(ctx, connect.NewRequest(&tidev1.ListRunnersRequest{OrganizationId: w.org.ID,
+		States: []tidev1.RunnerState{tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK, tidev1.RunnerState_RUNNER_STATE_BUSY}}))
+	if err != nil || len(runners.Msg.GetRunners()) != 1 || runners.Msg.GetRunners()[0].GetRunnerId() != running.GetRunnerId() {
+		t.Fatalf("active runners %v %v", runners, err)
 	}
 	// Cancel: admins only, QUEUED only.
 	_, err = w.env.User(w.org.Member).Work.CancelRequest(ctx, connect.NewRequest(&tidev1.CancelRequestRequest{OrganizationId: w.org.ID, RequestId: low.GetDevSessionId()}))

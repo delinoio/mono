@@ -360,12 +360,9 @@ func (h *Handler) ListDevSessions(ctx context.Context, req *connect.Request[tide
 			return nil, err
 		}
 	}
-	var states []int16
-	for _, st := range m.GetStates() {
-		states = append(states, int16(st))
-	}
-	if len(states) == 0 && !m.GetIncludeEnded() {
-		states = work.OpenRequestStates()
+	states, err := work.RequestStateFilter(m.GetStates(), m.GetIncludeEnded())
+	if err != nil {
+		return nil, err
 	}
 	rows, err := s.DB.Pool.Query(ctx, "SELECT "+work.RequestColumns+` FROM requests
 		WHERE organization_id = $1 AND kind = $2 AND request_id > $3 AND ($4 = '' OR owner_user_id = $4) AND ($5 = '' OR runner_profile_id::text = $5)
