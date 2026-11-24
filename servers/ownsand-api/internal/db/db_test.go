@@ -5,6 +5,7 @@ package db_test
 import (
 	"context"
 	"io/fs"
+	"net"
 	"reflect"
 	"slices"
 	"strconv"
@@ -19,6 +20,30 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
+
+func TestOpenRejectsSingleConnectionPool(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	databaseURL := "postgres://test:dummy-password@" + address + "/test?sslmode=disable&pool_max_conns=1"
+	database, err := db.Open(ctx, databaseURL)
+	if database != nil {
+		database.Close()
+		t.Fatal("Open returned a single-connection pool")
+	}
+	const want = "DATABASE_URL pool_max_conns must be at least 2"
+	if err == nil || err.Error() != want {
+		t.Fatalf("Open error = %v, want %q", err, want)
+	}
+}
 
 const insertInventoryDevice = `INSERT INTO devices (device_id, organization_id, public_key, name, host_os, arch, agent_version,
 	update_state, update_target_version, pending_idle_since, capabilities, limit_vcpu_count, limit_memory_mib, limit_disk_gib,

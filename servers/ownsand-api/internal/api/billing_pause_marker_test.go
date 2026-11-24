@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
@@ -107,7 +109,29 @@ func (f *markerFixture) suspendAll(t *testing.T, ids ...string) {
 // command, removes the billing mark, and a later recovery resumes only the
 // sandbox that no caller paused.
 func TestCallerPauseAdoptsBillingPause(t *testing.T) {
+	t.Run("fixture_pool", func(t *testing.T) {
+		testCallerPauseAdoptsBillingPause(t, 0)
+	})
+	t.Run("two_connections", func(t *testing.T) {
+		databaseURL, err := url.Parse(dbtest.URL(t))
+		if err != nil {
+			t.Fatal("invalid test database URL")
+		}
+		if databaseURL.RawQuery != "" {
+			databaseURL.RawQuery += "&"
+		}
+		databaseURL.RawQuery += "pool_max_conns=2"
+		t.Setenv(dbtest.EnvTestDatabaseURL, databaseURL.String())
+		testCallerPauseAdoptsBillingPause(t, 2)
+	})
+}
+
+func testCallerPauseAdoptsBillingPause(t *testing.T, poolMaxConns int32) {
+	t.Helper()
 	f := newMarkerFixture(t)
+	if got := f.env.DB.Pool.Config().MaxConns; poolMaxConns != 0 && got != poolMaxConns {
+		t.Fatalf("pool maximum = %d, want %d", got, poolMaxConns)
+	}
 	adopted, control := f.create(t), f.create(t)
 	f.suspendAll(t, adopted, control)
 	pauses := pauseCommands(f.agent, adopted)
@@ -119,10 +143,16 @@ func TestCallerPauseAdoptsBillingPause(t *testing.T) {
 	// answers PAUSED, clears the mark and sends no command, also when it is
 	// repeated.
 	for i := 0; i < 2; i++ {
-		sb, err := pauseRPC(f.org.OwnerClient, f.org.ID, adopted)
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		resp, err := f.org.OwnerClient.Sandbox.PauseSandbox(ctx, connect.NewRequest(&ownsandv1.PauseSandboxRequest{
+			OrganizationId: f.org.ID,
+			SandboxId:      adopted,
+		}))
+		cancel()
 		if err != nil {
 			t.Fatalf("PauseSandbox %d: %v", i, err)
 		}
+		sb := resp.Msg.GetSandbox()
 		if sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 			t.Fatalf("PauseSandbox %d state = %v", i, sb.GetState())
 		}
