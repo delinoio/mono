@@ -58,6 +58,38 @@ func TestValidateAcceptsValidProfiles(t *testing.T) {
 	}
 }
 
+func TestValidateResourceLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Resources)
+		want   string
+	}{
+		{"zero vCPU", func(r *Resources) { r.VCPUCount = 0 }, "invalid resources.vcpu_count: must be greater than zero"},
+		{"negative vCPU", func(r *Resources) { r.VCPUCount = -1 }, "invalid resources.vcpu_count: must be greater than zero"},
+		{"over vCPU limit", func(r *Resources) { r.VCPUCount = 1025 }, "invalid resources.vcpu_count: must be at most 1024"},
+		{"zero memory", func(r *Resources) { r.MemoryMiB = 0 }, "invalid resources.memory_mib: must be greater than zero"},
+		{"negative memory", func(r *Resources) { r.MemoryMiB = -1 }, "invalid resources.memory_mib: must be greater than zero"},
+		{"over memory limit", func(r *Resources) { r.MemoryMiB = 16777217 }, "invalid resources.memory_mib: must be at most 16777216"},
+		{"zero disk", func(r *Resources) { r.DiskGiB = 0 }, "invalid resources.disk_gib: must be greater than zero"},
+		{"negative disk", func(r *Resources) { r.DiskGiB = -1 }, "invalid resources.disk_gib: must be greater than zero"},
+		{"over disk limit", func(r *Resources) { r.DiskGiB = 1048577 }, "invalid resources.disk_gib: must be at most 1048576"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := devProfile()
+			tc.mutate(&p.Resources)
+			if err := Validate(p, 0); connect.CodeOf(err) != connect.CodeInvalidArgument || err.Error() != "invalid_argument: "+tc.want {
+				t.Fatalf("Validate() = %v, want invalid_argument: %s", err, tc.want)
+			}
+		})
+	}
+
+	p := devProfile()
+	p.Resources = Resources{VCPUCount: 1024, MemoryMiB: 16777216, DiskGiB: 1048576}
+	if err := Validate(p, 0); err != nil {
+		t.Fatalf("Validate() at the resource limits: %v", err)
+	}
+}
+
 func TestValidateRejects(t *testing.T) {
 	for name, mutate := range map[string]func(p *Profile){
 		"empty name":            func(p *Profile) { p.Name = "" },
@@ -79,9 +111,6 @@ func TestValidateRejects(t *testing.T) {
 		"no source":             func(p *Profile) { p.BaseImage = 0 },
 		"other base image":      func(p *Profile) { p.BaseImage = macos },
 		"bad template id":       func(p *Profile) { p.BaseImage, p.TemplateID = 0, "x" },
-		"no vcpu":               func(p *Profile) { p.Resources.VCPUCount = 0 },
-		"no memory":             func(p *Profile) { p.Resources.MemoryMiB = 0 },
-		"no disk":               func(p *Profile) { p.Resources.DiskGiB = -1 },
 		"no network mode":       func(p *Profile) { p.NetworkMode = 0 },
 		"no idle ttl":           func(p *Profile) { p.IdleTTL = 0 },
 		"max ttl over 7 days":   func(p *Profile) { p.MaxTTL = 7*24*time.Hour + time.Second },
