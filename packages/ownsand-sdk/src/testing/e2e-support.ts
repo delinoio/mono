@@ -34,14 +34,11 @@ export async function waitForSnapshotReady(
   getSnapshot: (signal: AbortSignal) => Promise<SnapshotStatus>,
   options: WaitForSnapshotReadyOptions,
 ): Promise<void> {
+  options.signal?.throwIfAborted();
   const clock = options.clock ?? systemClock;
   const stop = new AbortController();
   const onCallerAbort = () => stop.abort(options.signal?.reason);
-  if (options.signal?.aborted) {
-    onCallerAbort();
-  } else {
-    options.signal?.addEventListener("abort", onCallerAbort, { once: true });
-  }
+  options.signal?.addEventListener("abort", onCallerAbort, { once: true });
   let lastState: SnapshotState | undefined;
   // The deadline timer ends with the wait: `stop.abort()` below rejects its
   // sleep, which the catch ignores.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, expect, test } from "@rstest/core";
+import { describe, expect, rs, test } from "@rstest/core";
 import { SnapshotState } from "@delino/ownsand-protos/v1/common_pb";
 import {
   type CleanupStep,
@@ -83,6 +83,26 @@ describe("waitForSnapshotReady", () => {
       clock,
     });
     await expect(clock.run(wait)).rejects.toThrow("FAILED");
+  });
+
+  test("rejects an already-aborted signal before polling or sleeping", async () => {
+    const clock = new VirtualClock();
+    const sleep = rs.spyOn(clock, "sleep");
+    const caller = new AbortController();
+    const reason = new Error("caller gave up");
+    caller.abort(reason);
+    const getSnapshot = rs.fn(() => Promise.resolve(snap(SnapshotState.READY)));
+
+    await expect(
+      waitForSnapshotReady(getSnapshot, {
+        timeoutMs: 1_000,
+        pollMs: 200,
+        clock,
+        signal: caller.signal,
+      }),
+    ).rejects.toBe(reason);
+    expect(getSnapshot).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   test("stops when the caller aborts", async () => {
