@@ -3614,7 +3614,8 @@ const caddyImage = `caddy:2.11.9@sha256:${"c".repeat(64)}`;
 //                 (default `running`); STUB_STATE_GONE makes that read fail.
 //   STUB_WGET_FAILS  the number of readiness probes that fail before one
 //                 succeeds, or `always`.
-//   STUB_STATE_DELAY and STUB_WGET_DELAY delay the state read and admin probe.
+//   STUB_STATE_DELAY stalls the state read.
+//   STUB_WGET_DELAY delays the admin probe.
 //   STUB_WGET_IGNORES_TERM makes the probe and its sleep ignore SIGTERM.
 // The readiness wait runs with a short deadline and interval.
 function runCaddy(
@@ -3645,7 +3646,9 @@ fi
 case "$1" in
   inspect)
     if [[ "$3" == "{{.State.Status}}" ]]; then
-      if [[ -n "\${STUB_STATE_DELAY:-}" ]]; then sleep "$STUB_STATE_DELAY"; fi
+      # A child sleep can keep the captured output pipe open if Bash job
+      # control puts it in a separate process group.
+      if [[ -n "\${STUB_STATE_DELAY:-}" ]]; then exec sleep "$STUB_STATE_DELAY"; fi
       [[ -z "\${STUB_STATE_GONE:-}" ]] || { echo "Error: No such object: caddy" >&2; exit 1; }
       echo "\${STUB_STATE:-running}"
     else
