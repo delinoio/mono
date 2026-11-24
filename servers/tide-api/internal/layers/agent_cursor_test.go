@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -39,6 +40,13 @@ func newCursorWorld(t *testing.T, guest tidev1.GuestOs) *cursorWorld {
 func newCursorWorldTiming(t *testing.T, guest tidev1.GuestOs, timing agent.Timing) *cursorWorld {
 	t.Helper()
 	fake := cursorfake.New(t, cursorKey, "tide-pool")
+	w := startCursorWorld(t, guest, timing, fake)
+	eventually(t, "the Cursor stream", func() bool { return fake.Streams() == 1 })
+	return w
+}
+
+func startCursorWorld(t *testing.T, guest tidev1.GuestOs, timing agent.Timing, fake *cursorfake.Fake) *cursorWorld {
+	t.Helper()
 	w := newAgentWorld(t, layers.Options{Cursor: cursor.Options{BaseURL: fake.Server.URL, RelistInterval: time.Hour}, AgentTiming: timing})
 	cw := &cursorWorld{agentWorld: w, cursor: fake}
 	cw.integrationID = w.createIntegration(t, &tidev1.CreateAgentIntegrationRequest{
@@ -47,7 +55,6 @@ func newCursorWorldTiming(t *testing.T, guest tidev1.GuestOs, timing agent.Timin
 		Credentials: &tidev1.CreateAgentIntegrationRequest_CursorCredentials{CursorCredentials: &tidev1.CursorCredentials{ServiceAccountApiKey: cursorKey}},
 	})
 	cw.profileID = w.createProfile(t, agentProfileProto("cursor-agents", cw.integrationID, guest, time.Hour))
-	eventually(t, "the Cursor stream", func() bool { return fake.Streams() == 1 })
 	return cw
 }
 
@@ -398,6 +405,86 @@ func TestCursorIntegrationDeletionKeepsHeldClaims(t *testing.T) {
 	if err := del(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCursorWatchPaginationRepeats(t *testing.T) {
+	const (
+		firstToken  = "page-token-A"
+		secondToken = "page-token-B"
+		backoff     = 100 * time.Millisecond
+	)
+	for _, tc := range []struct {
+		name  string
+		extra []cursorfake.Page
+		want  []string
+	}{
+		{name: "same token", want: []string{"", firstToken, "", firstToken}},
+		{name: "cycle", extra: []cursorfake.Page{{NextPageToken: secondToken}}, want: []string{"", firstToken, secondToken, "", firstToken}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := cursorfake.New(t, cursorKey, "tide-pool")
+			for _, id := range []string{"earlier", "offending", "recovered"} {
+				fake.AddRequest(id, false)
+			}
+			pages := []cursorfake.Page{{Requests: []cursorfake.Request{{ID: "earlier"}}, NextPageToken: firstToken}}
+			pages = append(pages, tc.extra...)
+			pages = append(pages,
+				cursorfake.Page{Requests: []cursorfake.Request{{ID: "offending"}}, NextPageToken: firstToken, StreamCursor: "invalid-cursor"},
+				cursorfake.Page{NextPageToken: firstToken},
+				cursorfake.Page{Requests: []cursorfake.Request{{ID: "recovered"}}, StreamCursor: "recovered-cursor"},
+			)
+			fake.ScriptPages(pages...)
+			timing := fastAgentTiming()
+			timing.BackoffMin = backoff
+			w := startCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, timing, fake)
+			eventually(t, "the Cursor recovery stream", func() bool { return fake.Streams() == 1 })
+
+			lists, claims, streams := fake.WatchCalls()
+			var tokens []string
+			for _, call := range lists {
+				tokens = append(tokens, call.PageToken)
+			}
+			if !slices.Equal(tokens, tc.want) {
+				t.Fatalf("list tokens = %q, want %q", tokens, tc.want)
+			}
+			if !slices.Equal(claims, []string{"earlier", "recovered"}) || !slices.Equal(streams, []string{"recovered-cursor"}) {
+				t.Fatalf("claim calls = %q, stream cursors = %q", claims, streams)
+			}
+			offending := 1 + len(tc.extra)
+			if elapsed := lists[offending+1].At.Sub(lists[offending].At); elapsed < backoff {
+				t.Errorf("fresh list started after %v, want at least %v", elapsed, backoff)
+			}
+			logs := w.env.Logs.String()
+			if !strings.Contains(logs, `"msg":"vendor_watch_reconnect"`) || !strings.Contains(logs, `"cause":"error"`) {
+				t.Error("the error reconnect was not logged")
+			}
+			if strings.Contains(logs, firstToken) || strings.Contains(logs, secondToken) {
+				t.Error("a page token appeared in the logs")
+			}
+		})
+	}
+}
+
+func TestCursorWatchPaginationUsesFinalCursor(t *testing.T) {
+	fake := cursorfake.New(t, cursorKey, "tide-pool")
+	fake.AddRequest("first", false)
+	fake.AddRequest("second", false)
+	fake.ScriptPages(
+		cursorfake.Page{Requests: []cursorfake.Request{{ID: "first"}}, NextPageToken: "next", StreamCursor: "first-cursor"},
+		cursorfake.Page{Requests: []cursorfake.Request{{ID: "second"}}, StreamCursor: "final-cursor"},
+	)
+	w := startCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, agent.Timing{}, fake)
+	eventually(t, "the Cursor stream", func() bool { return fake.Streams() == 1 })
+
+	lists, claims, streams := fake.WatchCalls()
+	if len(lists) != 2 || lists[0].PageToken != "" || lists[1].PageToken != "next" {
+		t.Errorf("list calls = %v, want the initial page then next", lists)
+	}
+	if !slices.Equal(claims, []string{"first", "second"}) || !slices.Equal(streams, []string{"final-cursor"}) {
+		t.Fatalf("claim calls = %q, stream cursors = %q", claims, streams)
+	}
+	w.requestBySource(t, "first")
+	w.requestBySource(t, "second")
 }
 
 // TestCursorWatchReconnect: after the stream drops, tide reconnects with
