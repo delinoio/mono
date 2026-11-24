@@ -1225,13 +1225,22 @@ export function createMockTransport(
           }
         } else {
           requireAdmin(role);
-          const target = org.members.find((m) => m.userId === req.userId);
-          if (target?.role === Role.OWNER) {
-            throw new ConnectError(
-              "the owner cannot be removed",
-              Code.PermissionDenied,
-            );
-          }
+        }
+        if (req.userId === "") {
+          throw new ConnectError(
+            "invalid user_id: is required",
+            Code.InvalidArgument,
+          );
+        }
+        const target = org.members.find((m) => m.userId === req.userId);
+        if (target === undefined) {
+          throw new ConnectError("member not found", Code.NotFound);
+        }
+        if (target.role === Role.OWNER) {
+          throw new ConnectError(
+            "the owner cannot be removed",
+            Code.PermissionDenied,
+          );
         }
         org.members = org.members.filter((m) => m.userId !== req.userId);
         return {};

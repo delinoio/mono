@@ -848,6 +848,96 @@ describe("mock updateMemberRole", () => {
   });
 });
 
+describe("mock removeMember", () => {
+  const organizationId = MOCK_IDS.acme;
+  const admin = "user-admin-jun";
+  const member = "user-member-ada";
+  const unknown = "user-unknown";
+
+  const memberClient = (userId: string) =>
+    createClient(MemberService, createMockTransport({ userId }));
+
+  for (const [role, caller] of [
+    ["owner", MOCK_USER],
+    ["admin", admin],
+  ] as const) {
+    test(`rejects an unknown target for an ${role} without changing members`, async () => {
+      const client = memberClient(caller);
+      const before = await client.listMembers({ organizationId });
+
+      await expect(
+        client.removeMember({ organizationId, userId: unknown }),
+      ).rejects.toMatchObject({
+        code: Code.NotFound,
+        rawMessage: "member not found",
+      });
+      expect(await client.listMembers({ organizationId })).toEqual(before);
+    });
+
+    test(`rejects an empty target for an ${role} without changing members`, async () => {
+      const client = memberClient(caller);
+      const before = await client.listMembers({ organizationId });
+
+      await expect(
+        client.removeMember({ organizationId, userId: "" }),
+      ).rejects.toMatchObject({
+        code: Code.InvalidArgument,
+        rawMessage: "invalid user_id: is required",
+      });
+      expect(await client.listMembers({ organizationId })).toEqual(before);
+    });
+  }
+
+  test("checks member permissions before validating or looking up the target", async () => {
+    const client = memberClient(member);
+    for (const userId of [unknown, ""]) {
+      await expect(
+        client.removeMember({ organizationId, userId }),
+      ).rejects.toMatchObject({ code: Code.PermissionDenied });
+    }
+  });
+
+  test("removes an existing member", async () => {
+    const client = memberClient(MOCK_USER);
+    const { members } = await client.listMembers({ organizationId });
+    expect(members.map((entry) => entry.userId)).toContain(member);
+
+    await client.removeMember({ organizationId, userId: member });
+
+    expect((await client.listMembers({ organizationId })).members).toEqual(
+      members.filter((entry) => entry.userId !== member),
+    );
+  });
+
+  test("allows a member to leave the organization", async () => {
+    const client = memberClient(member);
+
+    await client.removeMember({ organizationId, userId: member });
+
+    await expect(client.listMembers({ organizationId })).rejects.toMatchObject({
+      code: Code.NotFound,
+    });
+  });
+
+  test("blocks the owner from leaving", async () => {
+    await expect(
+      memberClient(MOCK_USER).removeMember({
+        organizationId,
+        userId: MOCK_USER,
+      }),
+    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+  });
+
+  test("blocks an admin from removing the owner", async () => {
+    await expect(
+      memberClient(admin).removeMember({ organizationId, userId: MOCK_USER }),
+    ).rejects.toMatchObject({
+      code: Code.PermissionDenied,
+      rawMessage: "the owner cannot be removed",
+    });
+  });
+});
+
 describe("mock enrollment token expiry", () => {
   const organizationId = MOCK_IDS.acme;
   const T0 = Date.UTC(2026, 0, 1, 12, 0, 0);
