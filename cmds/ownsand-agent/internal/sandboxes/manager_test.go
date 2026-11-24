@@ -2013,6 +2013,8 @@ func TestResendTerminalUpdateAfterLostVM(t *testing.T) {
 // update for a sandbox whose VM stop has not returned, and starts no second
 // end for it.
 func TestResendSkipsSandboxWhoseEndIsRunning(t *testing.T) {
+	const waitTimeout = 5 * time.Second
+
 	e := newEnv(t)
 	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
 	e.rt.mu.Lock()
@@ -2020,12 +2022,31 @@ func TestResendSkipsSandboxWhoseEndIsRunning(t *testing.T) {
 	e.rt.deleteBlock = make(chan struct{})
 	started, block := e.rt.deleteStarted, e.rt.deleteBlock
 	e.rt.mu.Unlock()
-	done := make(chan error, 1)
+	release := sync.OnceFunc(func() { close(block) })
+	done := make(chan struct{})
+	// Release and join the delete worker before the manager and store clean up.
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-done:
+		case <-time.After(waitTimeout):
+			t.Error("timed out waiting for sandbox Delete during cleanup")
+		}
+	})
+
+	// Closing done publishes deleteErr and lets cleanup observe completion too.
+	var deleteErr error
 	go func() {
-		_, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
-		done <- err
+		_, deleteErr = e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+		close(done)
 	}()
-	<-started
+	select {
+	case <-started:
+	case <-done:
+		t.Fatalf("sandbox Delete returned before runtime entry: %v", deleteErr)
+	case <-time.After(waitTimeout):
+		t.Fatal("timed out waiting for sandbox Delete to enter the runtime")
+	}
 	n := e.out.count()
 	e.clk.Advance(11 * time.Minute)
 	e.m.Tick(context.Background(), true)
@@ -2041,9 +2062,14 @@ func TestResendSkipsSandboxWhoseEndIsRunning(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("%d runtime Delete calls while the end was running, want 1", calls)
 	}
-	close(block)
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	release()
+	select {
+	case <-done:
+		if deleteErr != nil {
+			t.Fatal(deleteErr)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("timed out waiting for sandbox Delete to finish after releasing the runtime")
 	}
 	requireTerminalResend(t, e, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER)
 }
