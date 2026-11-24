@@ -1085,14 +1085,16 @@ func must(b []byte, _ bool) []byte { return b }
 // reports the end of input, so the lookahead of WriteFile delays the first
 // send by that long.
 type lateEOFReader struct {
-	data  []byte
-	off   int
-	delay time.Duration
+	data            []byte
+	off             int
+	delay           time.Duration
+	readCompletedAt time.Time
 }
 
 func (r *lateEOFReader) Read(p []byte) (int, error) {
 	if r.off >= len(r.data) {
 		time.Sleep(r.delay)
+		r.readCompletedAt = time.Now()
 		return 0, io.EOF
 	}
 	n := copy(p, r.data[r.off:])
@@ -1102,16 +1104,16 @@ func (r *lateEOFReader) Read(p []byte) (int, error) {
 
 // firstByteDelayReader waits before it returns its first byte.
 type firstByteDelayReader struct {
-	data  []byte
-	off   int
-	delay time.Duration
-	slept bool
+	data            []byte
+	off             int
+	delay           time.Duration
+	readCompletedAt time.Time
 }
 
 func (r *firstByteDelayReader) Read(p []byte) (int, error) {
-	if !r.slept {
-		r.slept = true
+	if r.readCompletedAt.IsZero() {
 		time.Sleep(r.delay)
+		r.readCompletedAt = time.Now()
 	}
 	if r.off >= len(r.data) {
 		return 0, io.EOF
@@ -1126,13 +1128,14 @@ func (r *firstByteDelayReader) Read(p []byte) (int, error) {
 // source does not age the UUID v7 timestamp before the first send.
 func TestWriteFileGeneratesWriteIDWhenFirstRequestIsReady(t *testing.T) {
 	const delay = 1500 * time.Millisecond
-	const maxAge = 500 * time.Millisecond
-	cases := map[string]func() io.Reader{
-		"slow first byte": func() io.Reader {
-			return &firstByteDelayReader{data: []byte("hello"), delay: delay}
+	cases := map[string]func() (io.Reader, *time.Time){
+		"slow first byte": func() (io.Reader, *time.Time) {
+			r := &firstByteDelayReader{data: []byte("hello"), delay: delay}
+			return r, &r.readCompletedAt
 		},
-		"full chunk then late end of input": func() io.Reader {
-			return &lateEOFReader{data: make([]byte, datapath.MaxFileChunkSize), delay: delay}
+		"full chunk then late end of input": func() (io.Reader, *time.Time) {
+			r := &lateEOFReader{data: make([]byte, datapath.MaxFileChunkSize), delay: delay}
+			return r, &r.readCompletedAt
 		},
 	}
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
@@ -1140,23 +1143,26 @@ func TestWriteFileGeneratesWriteIDWhenFirstRequestIsReady(t *testing.T) {
 			t.Run(tr.String()+"/"+name, func(t *testing.T) {
 				cp := newFakeCP(t)
 				s := cp.handle(t, cp.client(t, tr))
-				if _, err := s.WriteFile(context.Background(), "/slow", newReader(), WriteOptions{}); err != nil {
+				r, readCompletedAt := newReader()
+				if _, err := s.WriteFile(context.Background(), "/slow", r, WriteOptions{}); err != nil {
 					t.Fatal(err)
 				}
 				reqs := cp.agent.writeRequests()
 				if len(reqs) == 0 {
 					t.Fatal("no write request reached the agent")
 				}
-				sentAt := time.Now()
 				id := reqs[0].GetWriteId()
 				created, err := uuidv7.TimeOf(id)
 				if err != nil {
 					t.Fatal(err)
 				}
-				// The agent saw the first request after the delay; its write_id
-				// must be newer than the delay, not from before the read.
-				if age := sentAt.Sub(created); age > maxAge {
-					t.Fatalf("write_id %s is %v old after the upload; the delayed read must not age it (limit %v)", id, age, maxAge)
+				if readCompletedAt.IsZero() {
+					t.Fatal("the delayed source read did not complete")
+				}
+				createdMillis := created.UnixMilli()
+				readCompletedMillis := readCompletedAt.UnixMilli()
+				if createdMillis < readCompletedMillis {
+					t.Fatalf("write_id %s timestamp %d ms precedes delayed source read completion %d ms", id, createdMillis, readCompletedMillis)
 				}
 				for _, r := range reqs {
 					if r.GetWriteId() != id {
