@@ -29,19 +29,13 @@ type MacOSMachine struct {
 	Network *vz.VirtioNetworkDeviceConfiguration
 }
 
+func terminalState(state vz.VirtualMachineState) bool {
+	return state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError
+}
+
 // WatchStopped returns a channel that is closed when machine stops or fails.
 func WatchStopped(machine *vz.VirtualMachine) <-chan struct{} {
-	exited := make(chan struct{})
-	notify := machine.StateChangedNotify()
-	go func() {
-		for state := range notify {
-			if state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError {
-				close(exited)
-				return
-			}
-		}
-	}()
-	return exited
+	return watchMachine(machine.StateChangedNotify(), terminalState).exited
 }
 
 // DialGuest connects to a vsock port of the guest through the virtio socket

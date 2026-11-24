@@ -20,6 +20,12 @@ export const MAX_LABEL_VALUE_SIZE = 255;
 
 const utf8 = new TextEncoder();
 
+function validateUtf8(field: string, value: string): void {
+  if (!value.isWellFormed()) {
+    throw new OwnSandValidationError(field, "must be valid UTF-8");
+  }
+}
+
 /** Checks `idle_ttl` and `max_ttl` in milliseconds. Both are required. */
 export function validateTtl(
   idleTtlMs: number | undefined,
@@ -136,6 +142,8 @@ export function validateLabels(
     if (key === "") {
       throw new OwnSandValidationError("labels", "keys must not be empty");
     }
+    validateUtf8("labels", key);
+    validateUtf8("labels", value);
     if (utf8.encode(key).length > MAX_LABEL_KEY_SIZE) {
       throw new OwnSandValidationError(
         "labels",
@@ -180,6 +188,14 @@ export function validateExec(input: {
       "needs a program as its first element",
     );
   }
+  for (const argument of input.command) {
+    validateUtf8("command", argument);
+  }
+  for (const [key, value] of Object.entries(input.env ?? {})) {
+    validateUtf8("env", key);
+    validateUtf8("env", value);
+  }
+  validateUtf8("working_directory", input.workingDirectory ?? "");
   const size = toBinary(
     ExecRequestSchema,
     create(ExecRequestSchema, {
@@ -249,9 +265,7 @@ export function validateGuestPath(field: string, path: string): void {
   if (path === "") {
     throw new OwnSandValidationError(field, "is required");
   }
-  if (!path.isWellFormed()) {
-    throw new OwnSandValidationError(field, "must be valid UTF-8");
-  }
+  validateUtf8(field, path);
   const absolute = isAbsoluteGuestPath(path);
   if (!absolute) {
     throw new OwnSandValidationError(field, "must be an absolute guest path");

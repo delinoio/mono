@@ -21,6 +21,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/codex/codexfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/webhook"
 )
 
 const (
@@ -106,7 +107,9 @@ func TestCreateDirectDuringProfileChange(t *testing.T) {
 // and no secret or body reaches the log.
 func TestCodexSessionLifecycle(t *testing.T) {
 	w := newCodexWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	const remoteURL = "https://Relay.openai.test:443/v1/agents/%61pi?mode=connect"
 	w.openai.AddSession("sess_1", "ccarenv_1")
+	w.openai.Update("sess_1", func(s *codexfake.Session) { s.RemoteURL = remoteURL })
 	body := codexfake.ActionRequired("sess_1")
 	if code := w.deliver(t, "wh_1", body); code != http.StatusOK {
 		t.Fatalf("delivery %d", code)
@@ -142,7 +145,7 @@ func TestCodexSessionLifecycle(t *testing.T) {
 	script := w.guest.startScript(sandboxID)
 	for _, want := range []string{
 		"CODEX_API_KEY=$(cat '" + dir + "/credential')",
-		"exec 'codex' 'exec-server' '--remote' 'https://api.openai.test/v1/agents/api' '--environment-id' 'ccarenv_1' >>'" + dir + "/runner.log' 2>&1",
+		"exec 'codex' 'exec-server' '--remote' '" + remoteURL + "' '--environment-id' 'ccarenv_1' >>'" + dir + "/runner.log' 2>&1",
 		`export PATH="$HOME/.local/bin:$PATH"`,
 		`export PATH="$HOME/.local/share/tide/node-v` + codex.NodeVersion + `/bin:$PATH"`,
 	} {
@@ -195,6 +198,43 @@ func TestCodexSessionLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(logs, `"msg":"openai_webhook_delivery"`) || !strings.Contains(logs, `"result":"duplicate"`) {
 		t.Fatal("deliveries are not logged")
+	}
+}
+
+func TestCodexIgnoresInvalidRemote(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+	}{
+		{"hostless", "https:///executor"},
+		{"malformed host", "https://[::1/executor"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newCodexWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			w.openai.AddSession("sess_invalid_remote", "ccarenv_invalid_remote")
+			w.openai.Update("sess_invalid_remote", func(s *codexfake.Session) { s.RemoteURL = tc.url })
+
+			const deliveryID = "wh_invalid_remote"
+			if code := w.deliver(t, deliveryID, codexfake.ActionRequired("sess_invalid_remote")); code != http.StatusOK {
+				t.Fatalf("delivery status %d, want 200", code)
+			}
+			seen, err := webhook.Seen(t.Context(), w.env.DB.Pool, webhook.SenderOpenAI, deliveryID)
+			if err != nil || !seen {
+				t.Fatalf("delivery recorded = %t, error = %v", seen, err)
+			}
+			w.assertNoRequestsOrClaims(t)
+			var runners int
+			if err := w.env.DB.Pool.QueryRow(t.Context(), "SELECT count(*) FROM runners WHERE organization_id = $1", w.org.ID).Scan(&runners); err != nil {
+				t.Fatal(err)
+			}
+			if runners != 0 {
+				t.Fatalf("%d runners, want none", runners)
+			}
+			logs := w.env.Logs.String()
+			if !strings.Contains(logs, `"result":"ignored"`) || !strings.Contains(logs, `"detail":"invalid environment"`) {
+				t.Fatal("delivery was not logged as ignored due to an invalid environment")
+			}
+		})
 	}
 }
 

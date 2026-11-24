@@ -18,8 +18,8 @@ A dirty page is modified in shared_buffers but not yet written to data files. A 
 
 - `checkpoint_timeout` (default 5 min) and `max_wal_size` (default 1GB) — checkpoint on whichever triggers first.
 - `checkpoint_completion_target=0.9` spreads I/O over 90% of the interval; avoid spikes.
-- "Checkpoints are occurring too frequently" in logs → increase `max_wal_size`.
-- **Target: >90% of checkpoints should be time-based** (`num_timed` in `pg_stat_checkpointer`), not size-based (`num_requested`). If num_requested/(num_timed+num_requested) > 10%, tune `max_wal_size` up.
+- In `pg_stat_checkpointer`, `num_timed` counts scheduled checkpoints. `num_requested` counts requested checkpoints, including WAL-size triggers and manual SQL `CHECKPOINT` commands.
+- Consider increasing `max_wal_size` only when you have evidence of frequent WAL-triggered checkpoints, such as the PostgreSQL log message "checkpoints are occurring too frequently". Use the logs to identify the cause when `num_requested` rises.
 
 ## WAL Disk Management
 

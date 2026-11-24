@@ -131,8 +131,8 @@ func (e *TokenError) Error() string {
 }
 
 // Token returns a cached token or requests a new one. A caller that finds a
-// request in progress waits for it and returns early with its own context
-// error when ctx ends first.
+// request in progress stops waiting when ctx ends. The caller's context
+// error takes precedence when a token and a context error are both ready.
 //
 // The request does not use the context of the caller that started it: it
 // runs detached from every caller context (context.WithoutCancel) with a
@@ -148,6 +148,9 @@ func (s *TokenSource) Token(ctx context.Context) (string, error) {
 	if s.token != "" && s.cfg.Now().Before(s.refreshAt) {
 		token := s.token
 		s.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		return token, nil
 	}
 	f := s.flight
@@ -160,6 +163,10 @@ func (s *TokenSource) Token(ctx context.Context) (string, error) {
 	s.mu.Unlock()
 	select {
 	case <-f.done:
+		// Either select case can win if both channels are ready.
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		return f.token, f.err
 	case <-ctx.Done():
 		return "", ctx.Err()

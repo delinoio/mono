@@ -347,7 +347,12 @@ describe("exec over the relay", () => {
       yield execMsg(ev.exited(0));
     });
     const sandbox = h.client.sandbox(SANDBOX);
-    const handle = sandbox.exec({ command: ["/bin/echo", "hello world"] });
+    const input = {
+      command: ["/bin/echo", "hello 😀\ufffd"],
+      env: { "key😀": "\ufffd", "key\ufffd": "😀" },
+      workingDirectory: "/tmp/😀\ufffd",
+    };
+    const handle = sandbox.exec(input);
     const events = await h.clock.run(collect(handle));
     const result = await handle.wait();
 
@@ -373,6 +378,7 @@ describe("exec over the relay", () => {
     const [exec] = h.api.callsOf("Exec");
     const authReq = auth!.request as any;
     const execReq = exec!.request as any;
+    expect(execReq).toMatchObject(input);
     expect(authReq.operationKind).toBe(RelayOperationKind.EXEC);
     expect(authReq.operationId).toBe(execReq.execId);
     expect(authReq.replacesGrantId).toBeUndefined();

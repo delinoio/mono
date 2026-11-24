@@ -302,17 +302,23 @@ func (c *Client) Stream(ctx context.Context, op, path string, query url.Values, 
 }
 
 // ReadEvents parses a text/event-stream body and calls fn for each event,
-// following the WHATWG event stream rules: comment lines start with `:`,
-// a blank line dispatches the event, several `data:` lines join with `\n`,
-// and an event without data is not dispatched.
+// following the WHATWG event stream rules. It skips one leading UTF-8 BOM
+// and accepts LF, CRLF, and CR line endings. Comment lines start with `:`.
+// A blank line dispatches an event with data, joining its `data:` lines with `\n`.
 func ReadEvents(r io.Reader, fn func(Event) error) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), maxEventLine)
+	sc.Split(splitEventLines())
 	var ev Event
 	var data [][]byte
 	hasData := false
+	firstLine := true
 	for sc.Scan() {
 		line := sc.Bytes()
+		if firstLine {
+			line = bytes.TrimPrefix(line, []byte("\uFEFF"))
+			firstLine = false
+		}
 		if len(line) == 0 {
 			if hasData {
 				ev.Data = bytes.Join(data, []byte("\n"))
@@ -344,4 +350,28 @@ func ReadEvents(r io.Reader, fn func(Event) error) error {
 		}
 	}
 	return sc.Err()
+}
+
+func splitEventLines() bufio.SplitFunc {
+	skipLF := false
+	return func(data []byte, atEOF bool) (int, []byte, error) {
+		start := 0
+		if skipLF && len(data) > 0 {
+			skipLF = false
+			if data[0] == '\n' {
+				start = 1
+			}
+		}
+		line := data[start:]
+		if end := bytes.IndexAny(line, "\r\n"); end >= 0 {
+			// Emit the line at CR so a blank line can dispatch before the next read.
+			// Consume a following LF on the next split, even across reads.
+			skipLF = line[end] == '\r'
+			return start + end + 1, line[:end], nil
+		}
+		if atEOF && len(line) > 0 {
+			return len(data), line, nil
+		}
+		return start, nil, nil
+	}
 }

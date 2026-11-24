@@ -10,11 +10,14 @@ import (
 	"time"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
 // verifyDelay is the wait between an export and its first R2 listing.
 const verifyDelay = 15 * time.Minute
+const verifyPoll = 30 * time.Second
 
 // exportVerifyFixture is an exported snapshot of the fake agent: two parts of
 // 1 MiB under the prefix of its attempt.
@@ -30,7 +33,9 @@ type exportVerifyFixture struct {
 
 func newExportVerifyFixture(t *testing.T) *exportVerifyFixture {
 	t.Helper()
-	env := testenv.New(t)
+	env := testenv.New(t, func(opts *app.Options) {
+		opts.Timing.ExportVerifyPoll = verifyPoll
+	})
 	org := env.NewOrg("alice")
 	setupAgent(t, env, org, nil)
 	exportedAt := env.Clock.Now()
@@ -189,7 +194,7 @@ func TestExportVerificationFailsMismatchingParts(t *testing.T) {
 }
 
 // TestExportVerificationRetriesAfterR2Failure checks that an R2 listing error
-// changes nothing and that a later pass verifies the export.
+// preserves the export and that a later pass verifies it.
 func TestExportVerificationRetriesAfterR2Failure(t *testing.T) {
 	f := newExportVerifyFixture(t)
 	f.env.Objects.SetListFail(errors.New("r2 is down"))
@@ -204,7 +209,12 @@ func TestExportVerificationRetriesAfterR2Failure(t *testing.T) {
 	f.wantLog(t, `"msg":"export_verification_retry"`, `"reason":"r2_list_failed"`)
 
 	f.env.Objects.SetListFail(nil)
-	f.run(time.Minute)
+	f.run(verifyPoll - time.Second)
+	f.wantExported(t, false)
+	if got := f.env.Objects.ListCalls(); got != 1 {
+		t.Fatalf("list calls before retry = %d, want 1", got)
+	}
+	f.run(time.Second)
 	f.wantExported(t, true)
 }
 
@@ -245,5 +255,199 @@ func TestExportVerificationSchedulesRowsWithoutTime(t *testing.T) {
 	f.wantExported(t, true)
 	if got := f.env.Objects.ListCalls(); got != 1 {
 		t.Fatalf("list calls = %d, want 1", got)
+	}
+}
+
+type exportVerifyStore struct {
+	objectstore.Store
+	list func(context.Context, string) ([]objectstore.Object, error)
+}
+
+func (s exportVerifyStore) ListPrefix(ctx context.Context, prefix string) ([]objectstore.Object, error) {
+	return s.list(ctx, prefix)
+}
+
+// seedOlderExportVerifications adds due exports ahead of f's export. Each
+// has a distinct attempt and a one-part manifest that matches the store.
+func (f *exportVerifyFixture) seedOlderExportVerifications(t *testing.T) []*exportVerifyFixture {
+	t.Helper()
+	rows, err := f.env.DB.Pool.Query(context.Background(), `
+		WITH older AS (
+			INSERT INTO snapshots (
+				snapshot_id, organization_id, source_sandbox_id, state, export_state, guest_os,
+				host_os, arch, vcpu_count, memory_mib, disk_gib, network_mode, created_by_kind,
+				created_by_id, create_time, export_command_id, export_verify_after
+			)
+			SELECT gen_random_uuid(), organization_id, source_sandbox_id, state, export_state,
+				guest_os, host_os, arch, vcpu_count, memory_mib, disk_gib, network_mode,
+				created_by_kind, 'verification-fault', create_time, gen_random_uuid(),
+				export_verify_after - n * interval '1 second'
+			FROM snapshots CROSS JOIN generate_series(1, 50) AS n
+			WHERE snapshot_id = $1
+			RETURNING snapshot_id, export_command_id
+		), parts AS (
+			INSERT INTO snapshot_parts (snapshot_id, part_number, size_bytes, sha256)
+			SELECT snapshot_id, 1, 1, decode(repeat('00', 32), 'hex') FROM older
+			RETURNING snapshot_id
+		)
+		SELECT snapshot_id::text, export_command_id::text FROM older JOIN parts USING (snapshot_id)`, f.snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var older []*exportVerifyFixture
+	for rows.Next() {
+		var id, command string
+		if err := rows.Scan(&id, &command); err != nil {
+			t.Fatal(err)
+		}
+		prefix := attemptPrefixOf(f.org.ID, id, command)
+		f.env.Objects.PutSized(prefix+"1", 1)
+		older = append(older, &exportVerifyFixture{env: f.env, snapID: id})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(older) != 50 {
+		t.Fatalf("seeded %d older exports, want 50", len(older))
+	}
+	return older
+}
+
+func TestExportVerificationRotatesRetries(t *testing.T) {
+	for _, reason := range []string{"r2_list_failed", "database_error"} {
+		t.Run(reason, func(t *testing.T) {
+			ctx := context.Background()
+			f := newExportVerifyFixture(t)
+			older := f.seedOlderExportVerifications(t)
+			faults := true
+			var listed []string
+			f.env.App.Service.Objects = exportVerifyStore{Store: f.env.Objects, list: func(ctx context.Context, prefix string) ([]objectstore.Object, error) {
+				listed = append(listed, prefix)
+				if reason == "r2_list_failed" && faults && prefix != f.prefix {
+					return nil, errors.New("injected listing error")
+				}
+				return f.env.Objects.ListPrefix(ctx, prefix)
+			}}
+			if reason == "database_error" {
+				// Reject the verification write for older rows after the
+				// claim has committed and listing has succeeded.
+				_, err := f.env.DB.Pool.Exec(ctx, `
+					CREATE FUNCTION reject_export_verification() RETURNS trigger LANGUAGE plpgsql AS $$
+					BEGIN
+						RAISE EXCEPTION 'injected apply error';
+					END;
+					$$;
+					CREATE TRIGGER reject_export_verification
+					BEFORE UPDATE OF export_verified ON snapshots FOR EACH ROW
+					WHEN (NEW.export_verified AND OLD.created_by_id = 'verification-fault')
+					EXECUTE FUNCTION reject_export_verification()`)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			f.run(verifyDelay)
+			if len(listed) != 50 {
+				t.Fatalf("first pass listed %d prefixes, want 50", len(listed))
+			}
+			f.wantExported(t, false)
+			firstRetry := f.env.Clock.Now().Add(verifyPoll)
+			for _, job := range older {
+				_, _, after := job.verification(t)
+				if after == nil || !after.Equal(firstRetry) {
+					t.Fatalf("first retry for %s = %v, want %v", job.snapID, after, firstRetry)
+				}
+			}
+
+			listed = nil
+			f.run(verifyPoll)
+			if len(listed) != 50 || listed[0] != f.prefix {
+				t.Fatalf("second pass listed %d prefixes, want 50 starting with %s", len(listed), f.prefix)
+			}
+			f.wantExported(t, true)
+			for _, job := range older {
+				job.wantExported(t, false)
+				if got := len(manifestHashes(t, f.env, job.snapID)); got != 1 {
+					t.Fatalf("manifest for %s has %d parts after failure, want 1", job.snapID, got)
+				}
+			}
+			if got := len(cleanupJobs(t, f.env)); got != 0 {
+				t.Fatalf("%d clean-up jobs after failures, want none", got)
+			}
+			f.wantLog(t, `"msg":"export_verification_retry"`, `"reason":"`+reason+`"`)
+
+			faults = false
+			if reason == "database_error" {
+				if _, err := f.env.DB.Pool.Exec(ctx, "DROP TRIGGER reject_export_verification ON snapshots"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.run(verifyPoll)
+			for _, job := range older {
+				job.wantExported(t, true)
+			}
+		})
+	}
+}
+
+func TestExportVerificationIgnoresStaleWork(t *testing.T) {
+	for _, action := range []string{"replace after listing error", "replace before apply", "verify before apply", "delete before apply"} {
+		t.Run(action, func(t *testing.T) {
+			f := newExportVerifyFixture(t)
+			replacementDeadline := f.exportedAt.Add(2 * verifyDelay)
+			var calls int
+			f.env.App.Service.Objects = exportVerifyStore{Store: f.env.Objects, list: func(ctx context.Context, prefix string) ([]objectstore.Object, error) {
+				calls++
+				if prefix != f.prefix {
+					t.Fatalf("listed %s, want %s", prefix, f.prefix)
+				}
+				pool := f.env.DB.Pool
+				var err error
+				switch action {
+				case "replace after listing error", "replace before apply":
+					_, err = pool.Exec(ctx, "UPDATE snapshots SET export_command_id = gen_random_uuid(), export_verify_after = $2 WHERE snapshot_id = $1", f.snapID, replacementDeadline)
+				case "verify before apply":
+					_, err = pool.Exec(ctx, "UPDATE snapshots SET export_verified = true WHERE snapshot_id = $1", f.snapID)
+				case "delete before apply":
+					_, err = pool.Exec(ctx, "DELETE FROM snapshots WHERE snapshot_id = $1", f.snapID)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if action == "replace after listing error" {
+					return nil, errors.New("injected listing error")
+				}
+				// A missing part would fail the export if the result applied.
+				return nil, nil
+			}}
+
+			f.run(verifyDelay)
+			if calls != 1 {
+				t.Fatalf("list calls = %d, want 1", calls)
+			}
+			switch action {
+			case "replace after listing error", "replace before apply":
+				f.wantExported(t, false)
+				_, _, after := f.verification(t)
+				if after == nil || !after.Equal(replacementDeadline) {
+					t.Fatalf("replacement deadline = %v, want %v", after, replacementDeadline)
+				}
+				f.run(verifyDelay - time.Second)
+				if calls != 1 {
+					t.Fatalf("list calls before the replacement deadline = %d, want 1", calls)
+				}
+			case "verify before apply":
+				f.wantExported(t, true)
+			case "delete before apply":
+				var exists bool
+				if err := f.env.DB.Pool.QueryRow(context.Background(), "SELECT EXISTS (SELECT 1 FROM snapshots WHERE snapshot_id = $1)", f.snapID).Scan(&exists); err != nil || exists {
+					t.Fatalf("snapshot exists = %v after deletion, query error = %v", exists, err)
+				}
+			}
+			if got := len(cleanupJobs(t, f.env)); got != 0 {
+				t.Fatalf("stale work created %d clean-up jobs, want none", got)
+			}
+		})
 	}
 }
