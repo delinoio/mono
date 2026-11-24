@@ -187,10 +187,13 @@ var (
 func (u *Updater) removeAbandonedArtifacts() {
 	dir := u.opts.Store.Path(store.UpdateDir)
 	entries, err := os.ReadDir(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		return
-	}
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// On Windows, ReadDir also returns ErrNotExist for a regular file.
+			if _, statErr := os.Lstat(dir); errors.Is(statErr, fs.ErrNotExist) {
+				return
+			}
+		}
 		u.opts.Logger.Warn("update directory listing failed", "error", err)
 		return
 	}

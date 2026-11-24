@@ -89,7 +89,7 @@ func TestNewRemovesAbandonedUpdateFiles(t *testing.T) {
 	}
 }
 
-func TestNewSurvivesUnreadableUpdateDir(t *testing.T) {
+func TestNewSurvivesUpdateDirListingError(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
