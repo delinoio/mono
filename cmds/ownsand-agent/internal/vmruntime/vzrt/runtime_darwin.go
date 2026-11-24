@@ -516,7 +516,6 @@ func (r *Runtime) attachNetwork(v *vm, mac net.HardwareAddr) (*vz.VirtioNetworkD
 	dev, err := networkDevice(vmFile, mac)
 	if err != nil {
 		stack.Close()
-		vmFile.Close()
 		conn.Close()
 		return nil, err
 	}
@@ -555,8 +554,10 @@ func datagramPair() (*os.File, net.Conn, error) {
 }
 
 // networkDevice returns a virtio network device with the MAC address mac on
-// a file-handle attachment of vmFile.
+// a file-handle attachment. It takes ownership of vmFile and closes it when
+// configuration ends. The attachment owns its duplicate descriptor.
 func networkDevice(vmFile *os.File, mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfiguration, error) {
+	defer vmFile.Close()
 	attachment, err := vz.NewFileHandleNetworkDeviceAttachment(vmFile)
 	if err != nil {
 		return nil, err
@@ -584,7 +585,6 @@ func NewIdleNetworkDevice(mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfigur
 	}
 	dev, err := networkDevice(vmFile, mac)
 	if err != nil {
-		vmFile.Close()
 		conn.Close()
 		return nil, nil, err
 	}
@@ -597,17 +597,7 @@ func NewIdleNetworkDevice(mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfigur
 			}
 		}
 	}()
-	return dev, closers{vmFile, conn}, nil
-}
-
-type closers []io.Closer
-
-func (c closers) Close() error {
-	var errs []error
-	for _, x := range c {
-		errs = append(errs, x.Close())
-	}
-	return errors.Join(errs...)
+	return dev, conn, nil
 }
 
 // newMachine creates the VM object of v and watches its state.

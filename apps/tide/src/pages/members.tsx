@@ -10,6 +10,7 @@ import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import { useState } from "react";
 import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
 import { useAuth } from "../auth.tsx";
+import { MemberListStatus } from "../components/member-list-status.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
@@ -22,12 +23,9 @@ import {
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import { invitationLink } from "../invitation.ts";
+import { displayName, useMembers } from "../members.ts";
 import { can, canManageMember, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
-
-function displayName(m: Member): string {
-  return m.displayName !== "" ? m.displayName : m.userId;
-}
 
 /** Route `members`: members, roles, leaving and invitations. */
 export function MembersPage() {
@@ -37,10 +35,7 @@ export function MembersPage() {
   const queryClient = useQueryClient();
   const refresh = () =>
     invalidateServices(queryClient, MemberService, OrganizationService);
-  const members = useQuery(MemberService.method.listMembers, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const roster = useMembers(organizationId);
   const updateRole = useMutation(MemberService.method.updateMemberRole, {
     onSuccess: refresh,
   });
@@ -66,67 +61,63 @@ export function MembersPage() {
           ) : undefined
         }
       />
-      <QueryBoundary query={members} loading="Loading members">
-        {(data) => (
-          <ul className="list" aria-label="Members">
-            {data.members.map((m) => {
-              const manageable = canManageMember(role, userId, m);
-              return (
-                <li key={m.userId} className="list-row">
-                  <div className="list-main">
-                    <span className="list-title">
-                      {displayName(m)}
-                      {m.userId === userId ? (
-                        <span className="muted"> (you)</span>
-                      ) : null}
-                    </span>
-                    <span className="muted">
-                      Joined {formatTime(m.joinTime)}
-                    </span>
+      <MemberListStatus roster={roster}>
+        <ul className="list" aria-label="Members">
+          {roster.members.map((m) => {
+            const manageable = canManageMember(role, userId, m);
+            return (
+              <li key={m.userId} className="list-row">
+                <div className="list-main">
+                  <span className="list-title">
+                    {displayName(m)}
+                    {m.userId === userId ? (
+                      <span className="muted"> (you)</span>
+                    ) : null}
+                  </span>
+                  <span className="muted">Joined {formatTime(m.joinTime)}</span>
+                </div>
+                {manageable ? (
+                  <div className="list-actions">
+                    <Select
+                      label={`Role of ${displayName(m)}`}
+                      value={String(m.role)}
+                      onValueChange={async (v) => {
+                        if (v === null || Number(v) === m.role) return;
+                        try {
+                          await updateRole.mutateAsync({
+                            organizationId,
+                            userId: m.userId,
+                            role: Number(v) as Role,
+                          });
+                          toast.success("The role is changed.");
+                        } catch (error) {
+                          toastError(error);
+                        }
+                      }}
+                    >
+                      <SelectOption value={String(Role.ADMIN)}>
+                        Admin
+                      </SelectOption>
+                      <SelectOption value={String(Role.MEMBER)}>
+                        Member
+                      </SelectOption>
+                    </Select>
+                    <Button
+                      variant={ButtonVariant.Danger}
+                      size={ButtonSize.Small}
+                      onClick={() => setRemoving(m)}
+                    >
+                      Remove
+                    </Button>
                   </div>
-                  {manageable ? (
-                    <div className="list-actions">
-                      <Select
-                        label={`Role of ${displayName(m)}`}
-                        value={String(m.role)}
-                        onValueChange={async (v) => {
-                          if (v === null || Number(v) === m.role) return;
-                          try {
-                            await updateRole.mutateAsync({
-                              organizationId,
-                              userId: m.userId,
-                              role: Number(v) as Role,
-                            });
-                            toast.success("The role is changed.");
-                          } catch (error) {
-                            toastError(error);
-                          }
-                        }}
-                      >
-                        <SelectOption value={String(Role.ADMIN)}>
-                          Admin
-                        </SelectOption>
-                        <SelectOption value={String(Role.MEMBER)}>
-                          Member
-                        </SelectOption>
-                      </Select>
-                      <Button
-                        variant={ButtonVariant.Danger}
-                        size={ButtonSize.Small}
-                        onClick={() => setRemoving(m)}
-                      >
-                        Remove
-                      </Button>
-                    </div>
-                  ) : (
-                    <span className="role">{labels.role[m.role]}</span>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </QueryBoundary>
+                ) : (
+                  <span className="role">{labels.role[m.role]}</span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      </MemberListStatus>
       {can(role, Permission.ManageInvitations) ? <Invitations /> : null}
       <ConfirmDialog
         open={removing !== undefined}

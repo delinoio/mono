@@ -21,13 +21,19 @@ import {
   Code,
   ConnectError,
   createClient,
+  createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
 import { createQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
-import { AuditService } from "@delino/tide-protos/v1/audit_pb";
+import { AuditAction, AuditService } from "@delino/tide-protos/v1/audit_pb";
 import { Role } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
+import {
+  type ListMembersRequest,
+  MemberService,
+} from "@delino/tide-protos/v1/member_pb";
+import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import {
   type ListRunnerProfilesRequest,
   RunnerProfileService,
@@ -205,6 +211,292 @@ describe("organizations", () => {
     ).toBe("https://ownsand.delino.io");
   });
 });
+
+// The full roster renders 200 rows, and its first render can exceed the default timeout in CI.
+describe("organization member pagination", () => {
+  const laterMemberId = "mock-user-nora";
+  const waitForRoster = { timeout: 10_000 };
+
+  async function rosterFixture({
+    failToken,
+    emptyLastPage = false,
+    beforeContinuation,
+  }: {
+    failToken?: string;
+    emptyLastPage?: boolean;
+    beforeContinuation?: Promise<void>;
+  } = {}) {
+    const mock = createMockTransport();
+    const memberApi = createClient(MemberService, mock);
+    const organizationApi = createClient(OrganizationService, mock);
+    const { members } = await memberApi.listMembers({
+      organizationId: MOCK_IDS.acme,
+      pageSize: 200,
+    });
+    const laterMember = {
+      organizationId: MOCK_IDS.acme,
+      userId: laterMemberId,
+      role: Role.MEMBER,
+    };
+    if (!emptyLastPage)
+      members.push({ ...members[0]!, ...laterMember, displayName: "" });
+
+    const lists: ListMembersRequest[] = [];
+    const updateRole = rs.fn(memberApi.updateMemberRole);
+    const remove = rs.fn(memberApi.removeMember);
+    const transfer = rs.fn(organizationApi.transferOwnership);
+    const roster = createRouterTransport((router) => {
+      router.service(MemberService, {
+        async listMembers(req) {
+          lists.push(req);
+          if (req.organizationId !== MOCK_IDS.acme) {
+            return memberApi.listMembers(req);
+          }
+          if (req.pageToken === "p2") await beforeContinuation;
+          if (req.pageToken === failToken) {
+            failToken = undefined;
+            throw new ConnectError("ListMembers failed", Code.Internal);
+          }
+          return req.pageToken === ""
+            ? { members: members.slice(0, 200), nextPageToken: "p2" }
+            : {
+                // A member may repeat across pages. The first occurrence
+                // determines where the row appears.
+                members: members.length > 200 ? members.slice(199) : [],
+              };
+        },
+        async updateMemberRole(req) {
+          const result = await updateRole(req);
+          const member = members.find((member) => member.userId === req.userId);
+          if (member) member.role = req.role;
+          return result;
+        },
+        async removeMember(req) {
+          const result = await remove(req);
+          const index = members.findIndex(
+            (member) => member.userId === req.userId,
+          );
+          if (index !== -1) members.splice(index, 1);
+          return result;
+        },
+      });
+      router.service(OrganizationService, {
+        transferOwnership: (req) => transfer(req),
+      });
+    });
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...args) {
+        return [
+          "ListMembers",
+          "UpdateMemberRole",
+          "RemoveMember",
+          "TransferOwnership",
+        ].includes(method.name)
+          ? roster.unary(method, ...args)
+          : mock.unary(method, ...args);
+      },
+    };
+    return { transport, lists, updateRole, remove, transfer };
+  }
+
+  function memberRows() {
+    return within(screen.getByRole("list", { name: "Members" })).getAllByRole(
+      "listitem",
+    );
+  }
+
+  function tokens(lists: ListMembersRequest[]) {
+    return lists.map(({ pageToken }) => pageToken);
+  }
+
+  async function openOwnerPicker() {
+    await click(await screen.findByRole("combobox", { name: "New owner" }));
+  }
+
+  test.each(["role change", "removal"])(
+    "loads a 201st member once and refreshes after %s",
+    async (mutation) => {
+      const { transport, lists, updateRole, remove } = await rosterFixture();
+      renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
+      const row = (
+        await screen.findByText(laterMemberId, {}, waitForRoster)
+      ).closest("li")!;
+      expect(memberRows()).toHaveLength(201);
+      expect(memberRows()[199]?.textContent).toContain("Roster member 199");
+      expect(memberRows()[200]).toBe(row);
+      expect(tokens(lists)).toEqual(["", "p2"]);
+      expect(lists.every(({ pageSize }) => pageSize === 200)).toBe(true);
+
+      const target = { organizationId: MOCK_IDS.acme, userId: laterMemberId };
+      if (mutation === "role change") {
+        await click(
+          within(row).getByRole("combobox", {
+            name: `Role of ${laterMemberId}`,
+          }),
+        );
+        await click(await screen.findByRole("option", { name: "Admin" }));
+        await waitFor(() => {
+          expect(within(row).getByRole("combobox").textContent).toContain(
+            "Admin",
+          );
+        });
+        expect(updateRole).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({ ...target, role: Role.ADMIN }),
+        );
+      } else {
+        await click(within(row).getByRole("button", { name: "Remove" }));
+        const dialog = await screen.findByRole("alertdialog", {
+          name: `Remove ${laterMemberId}?`,
+        });
+        await click(
+          within(dialog).getByRole("button", { name: "Remove member" }),
+        );
+        await waitFor(() =>
+          expect(screen.queryByText(laterMemberId)).toBeNull(),
+        );
+        expect(remove).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining(target),
+        );
+        expect(memberRows()).toHaveLength(200);
+      }
+      expect(tokens(lists)).toEqual(["", "p2", "", "p2"]);
+    },
+  );
+
+  test("transfers to a later member and refreshes the former owner's permissions", async () => {
+    const { transport, transfer, lists } = await rosterFixture();
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
+    await waitFor(() => expect(tokens(lists)).toEqual(["", "p2"]));
+    await openOwnerPicker();
+    expect(screen.queryByRole("option", { name: "Mina Kim" })).toBeNull();
+    await click(await screen.findByRole("option", { name: laterMemberId }));
+    await click(screen.getByRole("button", { name: "Transfer" }));
+    const dialog = await screen.findByRole("alertdialog", {
+      name: `Make ${laterMemberId} the owner?`,
+    });
+    await click(
+      within(dialog).getByRole("button", { name: "Transfer ownership" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("heading", { name: "Transfer ownership" }),
+      ).toBeNull(),
+    );
+    expect(transfer).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        organizationId: MOCK_IDS.acme,
+        userId: laterMemberId,
+      }),
+    );
+    expect(tokens(lists)).toEqual(["", "p2", "", "p2"]);
+  });
+
+  test("shares loaded pages and retries a failed continuation from either view", async () => {
+    let releaseContinuation!: () => void;
+    const beforeContinuation = new Promise<void>((resolve) => {
+      releaseContinuation = resolve;
+    });
+    const { transport, lists } = await rosterFixture({
+      failToken: "p2",
+      beforeContinuation,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
+    expect(
+      await screen.findByText("Loading more members", {}, waitForRoster),
+    ).toBeTruthy();
+    expect(memberRows()).toHaveLength(200);
+    releaseContinuation();
+
+    expect(
+      await screen.findByText(
+        "Some members are not shown yet.",
+        {},
+        waitForRoster,
+      ),
+    ).toBeTruthy();
+    expect(memberRows()).toHaveLength(200);
+    await click(screen.getByRole("link", { name: "Settings" }));
+    expect(
+      await screen.findByText(
+        "Some members are not shown yet.",
+        {},
+        waitForRoster,
+      ),
+    ).toBeTruthy();
+    await openOwnerPicker();
+    expect(
+      await screen.findByRole("option", { name: "Ada Park" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("option", { name: laterMemberId })).toBeNull();
+    await act(async () => {
+      fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+    });
+
+    await click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() =>
+      expect(screen.queryByText("Some members are not shown yet.")).toBeNull(),
+    );
+    await openOwnerPicker();
+    expect(
+      await screen.findAllByRole("option", { name: laterMemberId }),
+    ).toHaveLength(1);
+    expect(tokens(lists)).toEqual(["", "p2", "p2"]);
+  });
+
+  test.each(["members", "settings"])(
+    "retries a first-page error in %s",
+    async (section) => {
+      const { transport, lists } = await rosterFixture({
+        failToken: "",
+        emptyLastPage: true,
+      });
+      renderConsole(`/orgs/${MOCK_IDS.acme}/${section}`, { transport });
+      await click(await screen.findByRole("button", { name: "Try again" }));
+      await waitFor(() => expect(tokens(lists)).toEqual(["", "", "p2"]));
+      await waitFor(() =>
+        expect(screen.queryByText("Loading more members")).toBeNull(),
+      );
+      if (section === "members") {
+        expect(memberRows()).toHaveLength(200);
+      } else {
+        await openOwnerPicker();
+        expect(
+          await screen.findByRole("option", { name: "Roster member 199" }),
+        ).toBeTruthy();
+      }
+    },
+  );
+
+  test("isolates the roster and transfer permissions when switching organizations", async () => {
+    const { transport, lists } = await rosterFixture({ emptyLastPage: true });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
+    await screen.findByText("Roster member 199", {}, waitForRoster);
+    await waitFor(() =>
+      expect(screen.queryByText("Loading more members")).toBeNull(),
+    );
+    await click(screen.getByRole("combobox", { name: "Organization" }));
+    await click(await screen.findByRole("option", { name: "Globex" }));
+    await waitFor(() => expect(memberRows()).toHaveLength(2));
+    expect(screen.queryByText("Roster member 199")).toBeNull();
+    expect(
+      lists.map(({ organizationId, pageToken }) => [organizationId, pageToken]),
+    ).toEqual([
+      [MOCK_IDS.acme, ""],
+      [MOCK_IDS.acme, "p2"],
+      [MOCK_IDS.globex, ""],
+    ]);
+    await click(screen.getByRole("link", { name: "Settings" }));
+    expect(
+      screen.getByRole("heading", { name: "Dev sessions per user" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", { name: "Transfer ownership" }),
+    ).toBeNull();
+    expect(lists).toHaveLength(3);
+  });
+}, 20_000);
 
 describe("failed requests", () => {
   function failingTransport(methodName: string, code: Code): Transport {
@@ -1061,7 +1353,130 @@ describe("overview", () => {
   });
 });
 
+describe("audit", () => {
+  function auditActions(table: HTMLElement) {
+    return within(table)
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => within(row).getAllByRole("cell")[1]!.textContent);
+  }
+
+  test("shows the seeded audit events newest first", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/audit`);
+
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    expect(auditActions(table)).toEqual([
+      "Dev session created",
+      "OwnSand link set",
+    ]);
+  });
+
+  test("shows a request cancellation before the seeded audit events", async () => {
+    const transport = createMockTransport();
+    await createClient(WorkService, transport).cancelRequest({
+      organizationId: MOCK_IDS.acme,
+      requestId: MOCK_IDS.queuedJob,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/audit`, { transport });
+
+    const table = await screen.findByRole("table", { name: "Audit events" });
+    expect(auditActions(table)).toEqual([
+      "Request canceled",
+      "Dev session created",
+      "OwnSand link set",
+    ]);
+  });
+
+  test("lists one audit event per page in newest-first order", async () => {
+    const client = createClient(AuditService, createMockTransport());
+    const organizationId = MOCK_IDS.acme;
+    const all = await client.listAuditEvents({ organizationId });
+    const first = await client.listAuditEvents({ organizationId, pageSize: 1 });
+    expect(first.nextPageToken).not.toBe("");
+    const second = await client.listAuditEvents({
+      organizationId,
+      pageSize: 1,
+      pageToken: first.nextPageToken,
+    });
+
+    expect(first.events.map((event) => event.action)).toEqual([
+      AuditAction.DEV_SESSION_CREATED,
+    ]);
+    expect(second.events.map((event) => event.action)).toEqual([
+      AuditAction.OWNSAND_LINK_SET,
+    ]);
+    expect([...first.events, ...second.events]).toEqual(all.events);
+    expect(second.nextPageToken).toBe("");
+  });
+});
+
 describe("work", () => {
+  test("shows active requests in queue order and can include ended requests", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/requests`);
+    const table = await screen.findByRole("table", { name: "Requests" });
+    const requestIds = (table: HTMLElement) =>
+      within(table)
+        .getAllByRole("row")
+        .slice(1)
+        .map((row) => row.querySelector("code")?.title);
+    const active = [
+      MOCK_IDS.runningJob,
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.queuedAgent,
+      MOCK_IDS.queuedDev,
+    ];
+    expect(requestIds(table)).toEqual(active);
+
+    await click(screen.getByRole("checkbox", { name: "Show ended requests" }));
+
+    const updatedTable = await screen.findByRole("table", {
+      name: "Requests",
+    });
+    expect(requestIds(updatedTable)).toEqual([...active, MOCK_IDS.endedJob]);
+  });
+
+  test("pages active requests before ended requests in descending end time", async () => {
+    const client = createClient(WorkService, createMockTransport());
+    const organizationId = MOCK_IDS.acme;
+    const time = Date.now();
+    const clock = rs.spyOn(Date, "now").mockReturnValue(time);
+    try {
+      await client.cancelRequest({
+        organizationId,
+        requestId: MOCK_IDS.queuedJob,
+      });
+      clock.mockReturnValue(time + 1);
+      await client.cancelRequest({
+        organizationId,
+        requestId: MOCK_IDS.queuedAgent,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+
+    const expected = [
+      MOCK_IDS.runningJob,
+      MOCK_IDS.queuedDev,
+      MOCK_IDS.queuedAgent,
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.endedJob,
+    ];
+    let pageToken = "";
+    for (const [index, requestId] of expected.entries()) {
+      const page = await client.listRequests({
+        organizationId,
+        includeEnded: true,
+        pageSize: 1,
+        pageToken,
+      });
+      expect(page.requests.map((request) => request.requestId)).toEqual([
+        requestId,
+      ]);
+      pageToken = page.nextPageToken;
+      expect(pageToken === "").toBe(index === expected.length - 1);
+    }
+  });
+
   test("canceling a request needs a confirmation", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/requests`);
     const table = await screen.findByRole("table", { name: "Requests" });
