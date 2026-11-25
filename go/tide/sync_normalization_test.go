@@ -115,8 +115,17 @@ func TestSyncNormalizationKeepsOriginalPaths(t *testing.T) {
 				needDistinctUnicodeNames(t)
 				files[first] = "first"
 			}
+			dir := newRepo(t, files, nil, "")
+			if guestOS == tidev1.GuestOs_GUEST_OS_MACOS {
+				// Git on macOS can precompose names before storing them in the index.
+				path := strings.TrimSuffix(git(t, dir, "ls-files", "-z", "--cached"), "\x00")
+				if path != first && path != second {
+					t.Fatalf("expected one tracked Unicode path, got %+q", path)
+				}
+				files = map[string]string{path: "second"}
+			}
 			ds := newSession(t, c, srv, org, guestOS)
-			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: newRepo(t, files, nil, "")}
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
 			if guestOS == tidev1.GuestOs_GUEST_OS_WINDOWS {
 				// The fake runs on POSIX, so intercept the lock before it runs PowerShell.
 				const lock = "intercepted Windows lock"
@@ -137,7 +146,7 @@ func TestSyncNormalizationKeepsOriginalPaths(t *testing.T) {
 			}
 			for path, expected := range files {
 				if m.Files[path].Mode != modeFile || readGuest(t, ds, path) != expected {
-					t.Fatalf("sync did not preserve %q and its contents", path)
+					t.Fatalf("sync did not preserve %+q and its contents", path)
 				}
 			}
 		})
