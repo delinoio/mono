@@ -525,7 +525,7 @@ func TestCreateSnapshotSendFailCompensation(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := testenv.New(t, createFailTiming(tc.budget, 20*time.Millisecond))
-			env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
+			env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 			ctx := context.Background()
 			org := env.NewOrg("alice")
 			c := org.OwnerClient
@@ -541,17 +541,7 @@ func TestCreateSnapshotSendFailCompensation(t *testing.T) {
 			fault.on(tc.code, tc.max)
 
 			saturate(t, env, agent)
-			rpcCtx, cancel := context.WithTimeout(ctx, enqueueFailureDeadline)
-			defer cancel()
-			_, err = c.Snapshot.CreateSnapshot(rpcCtx, connect.NewRequest(&ownsandv1.CreateSnapshotRequest{OrganizationId: org.ID, SandboxId: sandboxID}))
-			if err == nil {
-				t.Fatal("CreateSnapshot on a saturated channel succeeded")
-			}
-			list, err := c.Snapshot.ListSnapshots(ctx, connect.NewRequest(&ownsandv1.ListSnapshotsRequest{OrganizationId: org.ID}))
-			if err != nil || len(list.Msg.GetSnapshots()) != 1 {
-				t.Fatalf("snapshots = %v, %v", list, err)
-			}
-			snapID := list.Msg.GetSnapshots()[0].GetSnapshotId()
+			snapID := snapshotCreateFailsAfterCommit(t, c, org.ID, sandboxID)
 
 			if tc.resolve {
 				testenv.Eventually(t, "snapshot FAILED", func() bool {

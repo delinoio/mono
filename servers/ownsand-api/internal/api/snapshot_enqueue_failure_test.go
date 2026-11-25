@@ -30,6 +30,28 @@ func snapshotStateOf(t *testing.T, c *testenv.Clients, orgID, snapshotID string)
 	return s.Msg.GetSnapshot().GetState()
 }
 
+// snapshotCreateFailsAfterCommit cancels the request only after the new
+// snapshot is visible. The caller has already saturated the agent channel,
+// so the cancellation fails the command send and starts compensation.
+func snapshotCreateFailsAfterCommit(t *testing.T, c *testenv.Clients, orgID, sandboxID string) string {
+	t.Helper()
+	var snapID string
+	failRPCAfterCommit(t, "CreateSnapshot",
+		func(ctx context.Context) error {
+			_, err := c.Snapshot.CreateSnapshot(ctx, connect.NewRequest(&ownsandv1.CreateSnapshotRequest{OrganizationId: orgID, SandboxId: sandboxID}))
+			return err
+		},
+		func() bool {
+			list, err := c.Snapshot.ListSnapshots(t.Context(), connect.NewRequest(&ownsandv1.ListSnapshotsRequest{OrganizationId: orgID}))
+			if err != nil || len(list.Msg.GetSnapshots()) != 1 || list.Msg.GetSnapshots()[0].GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING {
+				return false
+			}
+			snapID = list.Msg.GetSnapshots()[0].GetSnapshotId()
+			return true
+		})
+	return snapID
+}
+
 // TestCreateSnapshotEnqueueFailureLeavesNoCreatingRow checks that a
 // CreateSnapshot whose request ends before the command is queued does not
 // leave the committed CREATING record behind: the record becomes FAILED
@@ -51,20 +73,7 @@ func TestCreateSnapshotEnqueueFailureLeavesNoCreatingRow(t *testing.T) {
 	waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 
 	saturate(t, env, agent)
-	var snapID string
-	failRPCAfterCommit(t, "CreateSnapshot",
-		func(ctx context.Context) error {
-			_, err := c.Snapshot.CreateSnapshot(ctx, connect.NewRequest(&ownsandv1.CreateSnapshotRequest{OrganizationId: org.ID, SandboxId: sandboxID}))
-			return err
-		},
-		func() bool {
-			list, err := c.Snapshot.ListSnapshots(ctx, connect.NewRequest(&ownsandv1.ListSnapshotsRequest{OrganizationId: org.ID}))
-			if err != nil || len(list.Msg.GetSnapshots()) != 1 || list.Msg.GetSnapshots()[0].GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING {
-				return false
-			}
-			snapID = list.Msg.GetSnapshots()[0].GetSnapshotId()
-			return true
-		})
+	snapID := snapshotCreateFailsAfterCommit(t, c, org.ID, sandboxID)
 
 	testenv.Eventually(t, "the same snapshot is the only record", func() bool {
 		list, err := c.Snapshot.ListSnapshots(ctx, connect.NewRequest(&ownsandv1.ListSnapshotsRequest{OrganizationId: org.ID}))
