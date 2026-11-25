@@ -17,16 +17,20 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/delinoio/mono/servers/accounts-api/internal/metrics"
 )
 
 // The tests in this file cover the signal wiring of the real process. Signal
 // registration is process-global, so they re-execute the test binary as a helper
-// process that runs the production shutdownContext, newServer and serve, and
+// process that runs the production shutdownContext, newServer and runServers, and
 // signal that process from the parent.
 
 const (
 	// signalHelperEnv switches the test binary into helper-process mode.
-	signalHelperEnv = "ACCOUNTS_API_SIGNAL_HELPER"
+	signalHelperEnv            = "ACCOUNTS_API_SIGNAL_HELPER"
+	signalHelperHealthy        = "healthy"
+	signalHelperMetricsFailure = "metrics-failure"
 	// helperDrainTimeout is the drain timeout of the helper. It is far above
 	// every limit the parent test waits for, so an exit that waits for the drain
 	// to time out is distinguishable from a prompt one.
@@ -37,13 +41,36 @@ const (
 // binary into it. It serves /ping, /slow?ms=<n> (a handler that blocks for n
 // milliseconds) and /hold (a handler that blocks until the parent releases it
 // over the helper's stdin), prints "listening <addr>", "slow_started" and
-// "hold_started" lines, and exits with serve's result.
+// "hold_started" lines, and exits with runServers' result. In the metrics
+// failure mode, the first byte fails Accept and the third lets the worker finish.
 func TestSignalHelperProcess(t *testing.T) {
-	if os.Getenv(signalHelperEnv) != "1" {
+	mode := os.Getenv(signalHelperEnv)
+	if mode != signalHelperHealthy && mode != signalHelperMetricsFailure {
 		t.Skip("helper process for the signal tests")
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	listener := newTestListener(t)
+	metricsListener := newTestListener(t)
+	releaseRequest := make(chan struct{})
+	worker := func(ctx context.Context) { <-ctx.Done() }
+	timeout := helperDrainTimeout
+	if mode == signalHelperMetricsFailure {
+		failMetrics := make(chan struct{})
+		finishWorker := make(chan struct{})
+		metricsListener = gatedMetricsListener{Listener: metricsListener, fail: failMetrics}
+		timeout = shutdownTimeout
+		worker = func(ctx context.Context) {
+			<-ctx.Done()
+			logger.Info("worker_draining")
+			<-finishWorker
+			logger.Info("worker_finished")
+		}
+		go releaseOnControlInput(failMetrics, releaseRequest, finishWorker)
+	} else {
+		go releaseOnControlInput(releaseRequest)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {})
 	mux.HandleFunc("GET /slow", func(w http.ResponseWriter, r *http.Request) {
@@ -53,26 +80,41 @@ func TestSignalHelperProcess(t *testing.T) {
 	})
 	mux.HandleFunc("GET /hold", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("hold_started")
-		// The handler returns only when the parent writes the release byte, or
-		// closes the control pipe (which is what the test cleanup does). It is
-		// never time based, so the request is still in flight whenever the parent
-		// has not released it, however long the parent is stalled.
-		_, _ = io.ReadFull(os.Stdin, make([]byte, 1))
+		<-releaseRequest
 	})
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
+	serveMetrics := func(ctx context.Context) error {
+		return metrics.Serve(ctx, metricsListener, http.NotFoundHandler(), logger)
 	}
 	ctx, stop := shutdownContext()
-	defer stop()
 	fmt.Println("listening", listener.Addr().String())
-	if err := serve(ctx, stop, newServer(mux, logger), listener, logger, helperDrainTimeout); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	err := runServers(ctx, stop, newServer(mux, logger), listener, logger, timeout, worker, serveMetrics)
+	stop()
+	if err != nil {
+		logger.Error("server_exited", slog.Any("error", err))
 		os.Exit(1)
 	}
 	os.Exit(0)
+}
+
+// releaseOnControlInput opens each gate after a byte from the parent. Closing
+// the pipe during cleanup opens any remaining gates.
+func releaseOnControlInput(gates ...chan struct{}) {
+	var control [1]byte
+	for _, gate := range gates {
+		_, _ = io.ReadFull(os.Stdin, control[:])
+		close(gate)
+	}
+}
+
+type gatedMetricsListener struct {
+	net.Listener
+	fail <-chan struct{}
+}
+
+func (l gatedMetricsListener) Accept() (net.Conn, error) {
+	<-l.fail
+	return nil, errMetricsAccept
 }
 
 // helperProcess is a running helper process and the output it printed.
@@ -82,19 +124,18 @@ type helperProcess struct {
 	addr   string
 	exited chan struct{}
 	out    *syncBuffer
-	// control is the write end of the helper's stdin. The /hold handler blocks
-	// until it receives a byte on it.
+	// control is the write end of the helper's stdin. Each byte opens one gate.
 	control io.WriteCloser
 }
 
-func startHelperProcess(t *testing.T) *helperProcess {
+func startHelperProcess(t *testing.T, mode string) *helperProcess {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("the helper process is signalled with POSIX signals")
 	}
 	out := &syncBuffer{}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestSignalHelperProcess$")
-	cmd.Env = append(os.Environ(), signalHelperEnv+"=1")
+	cmd.Env = append(os.Environ(), signalHelperEnv+"="+mode)
 	cmd.Stdout = out
 	cmd.Stderr = out
 	control, err := cmd.StdinPipe()
@@ -171,7 +212,7 @@ func (h *helperProcess) wait(limit time.Duration) syscall.WaitStatus {
 	return h.cmd.ProcessState.Sys().(syscall.WaitStatus)
 }
 
-// release lets the /hold handler of the helper return.
+// release opens the next gate in the helper.
 func (h *helperProcess) release() {
 	h.t.Helper()
 	if _, err := h.control.Write([]byte{1}); err != nil {
@@ -186,6 +227,24 @@ func (h *helperProcess) finished() bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func (h *helperProcess) waitForListenerClosure() {
+	h.t.Helper()
+	// server_shutdown_started is logged just before the server closes its
+	// listeners. A failed dial proves that the public listener is closed.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", h.addr, time.Second)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		if time.Now().After(deadline) {
+			h.t.Fatalf("helper listener still accepts connections after shutdown started; output:\n%s", h.out.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -217,7 +276,7 @@ func getAsyncContext(ctx context.Context, url string) <-chan int {
 func TestSecondTerminationSignalTerminatesProcessDuringDrain(t *testing.T) {
 	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT} {
 		t.Run(sig.String(), func(t *testing.T) {
-			h := startHelperProcess(t)
+			h := startHelperProcess(t, signalHelperHealthy)
 			// The request outlives the whole test, so only the second signal can
 			// end the process before helperDrainTimeout.
 			getAsync("http://" + h.addr + "/slow?ms=60000")
@@ -239,7 +298,7 @@ func TestSecondTerminationSignalTerminatesProcessDuringDrain(t *testing.T) {
 }
 
 func TestSingleTerminationSignalDrainsInFlightRequestAndExitsZero(t *testing.T) {
-	h := startHelperProcess(t)
+	h := startHelperProcess(t, signalHelperHealthy)
 	// The /hold handler returns only when the test releases it, so the request
 	// is guaranteed to be in flight while the signal and the shutdown happen.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -259,24 +318,9 @@ func TestSingleTerminationSignalDrainsInFlightRequestAndExitsZero(t *testing.T) 
 	}
 	requireHeld("before the signal")
 
-	h.signal(syscall.SIGINT)
+	h.signal(syscall.SIGTERM)
 	h.waitForLine("server_shutdown_started")
-
-	// server_shutdown_started is logged just before the server closes its
-	// listeners, so the listener only stops accepting a moment later. A fresh
-	// dial that fails proves that the shutdown has reached the listener.
-	dialDeadline := time.Now().Add(5 * time.Second)
-	for {
-		conn, err := net.DialTimeout("tcp", h.addr, time.Second)
-		if err != nil {
-			break
-		}
-		_ = conn.Close()
-		if time.Now().After(dialDeadline) {
-			t.Fatalf("helper listener still accepts connections after the shutdown started; output:\n%s", h.out.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	h.waitForListenerClosure()
 	requireHeld("while the shutdown waits for the held request")
 	if strings.Contains(h.out.String(), "server_shutdown_completed") {
 		t.Fatalf("shutdown completed while the request was still held; output:\n%s", h.out.String())
@@ -299,7 +343,7 @@ func TestSingleTerminationSignalDrainsInFlightRequestAndExitsZero(t *testing.T) 
 }
 
 func TestSingleTerminationSignalWithoutTrafficExitsZero(t *testing.T) {
-	h := startHelperProcess(t)
+	h := startHelperProcess(t, signalHelperHealthy)
 
 	resp, err := http.Get("http://" + h.addr + "/ping")
 	if err != nil {
@@ -315,6 +359,45 @@ func TestSingleTerminationSignalWithoutTrafficExitsZero(t *testing.T) {
 	ws := h.wait(5 * time.Second)
 	if !ws.Exited() || ws.ExitStatus() != 0 {
 		t.Errorf("wait status = %v, want exit status 0", ws)
+	}
+}
+
+func TestFirstTerminationSignalPreservesMetricsFailureDrain(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT} {
+		t.Run(sig.String(), func(t *testing.T) {
+			h := startHelperProcess(t, signalHelperMetricsFailure)
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			status := getAsyncContext(ctx, "http://"+h.addr+"/hold")
+			h.waitForLine("hold_started")
+
+			h.release() // Fail the bound metrics listener's Accept call.
+			h.waitForLine("server_shutdown_started")
+			h.waitForListenerClosure()
+
+			h.signal(sig)
+			h.release() // Let the request finish.
+			select {
+			case got := <-status:
+				if got != http.StatusOK {
+					t.Errorf("in-flight request status = %d, want %d; output:\n%s", got, http.StatusOK, h.out.String())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("held request did not finish after release; output:\n%s", h.out.String())
+			}
+
+			h.waitForLine(`"msg":"worker_draining"`)
+			h.release() // Let the worker finish.
+			ws := h.wait(5 * time.Second)
+			if !ws.Exited() || ws.ExitStatus() != 1 {
+				t.Fatalf("wait status = %v, want exit status 1; output:\n%s", ws, h.out.String())
+			}
+			h.waitForLine(`"msg":"worker_finished"`)
+			exitLog := h.waitForLine(`"msg":"server_exited"`)
+			if !strings.Contains(exitLog, errMetricsAccept.Error()) {
+				t.Fatalf("exit log lacks the original metrics error: %s", exitLog)
+			}
+		})
 	}
 }
 

@@ -149,18 +149,17 @@ func run() error {
 //
 // The metrics listener is not optional infrastructure once it is bound: when
 // serveMetrics fails by itself (for example a permanent Accept error), runServers
-// logs the error and starts the bounded shutdown of srv as if a signal had
-// arrived, so the process does not keep serving without its metrics. The
-// original error is joined into the result, also when a shutdown signal races
-// the failure, so the process exits non-zero with the error in its exit log.
+// logs the error and starts the bounded shutdown of srv. If no signal has
+// arrived at drain entry, the signal registration stays active so the first
+// signal cannot interrupt the drain. The original metrics error is joined into
+// the result even if a signal races with the failure.
 //
 // worker and serveMetrics receive a context that is cancelled only after srv
 // has drained. runServers takes them as functions so tests can inject failures
 // without OS signals.
 func runServers(ctx context.Context, stop func(), srv *http.Server, listener net.Listener, logger *slog.Logger, timeout time.Duration,
 	worker func(context.Context), serveMetrics func(context.Context) error) error {
-	// serveCtx ends when the shutdown trigger fires or when the metrics
-	// listener fails; only the first of them reaches serve through ctx.
+	// Only the original context tells us that a signal arrived.
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 
@@ -184,7 +183,12 @@ func runServers(ctx context.Context, stop func(), srv *http.Server, listener net
 		}))
 	}
 
-	serveErr := serve(serveCtx, stop, srv, listener, logger, timeout)
+	stopSignal := func() {
+		if ctx.Err() != nil {
+			stop()
+		}
+	}
+	serveErr := serve(serveCtx, stopSignal, srv, listener, logger, timeout)
 	stopBackground()
 	errs := []error{serveErr}
 	for _, errc := range backgroundErrs {
@@ -249,10 +253,9 @@ func newHandler(cfg config.Config, database *db.DB, logger *slog.Logger, appMetr
 // shutdownContext returns a context that is cancelled by the first SIGINT or
 // SIGTERM, and the stop function that releases the signal registration.
 //
-// The registration stays installed until stop runs. While it is installed a
-// repeated signal is swallowed, so serve calls stop as soon as it observes the
-// first signal; a second signal during the drain then reaches the default
-// disposition and terminates the process instead of waiting for the drain.
+// The registration stays installed until stop runs. At drain entry, runServers
+// releases the registration if it has observed a signal. A second signal then
+// reaches the default disposition and terminates the process.
 func shutdownContext() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
@@ -303,11 +306,10 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 // server down within timeout. It takes the shutdown trigger as a context so
 // tests can drive it without OS signals.
 //
-// stop releases the signal registration behind ctx. serve calls it, before it
-// logs server_shutdown_started and starts the drain, when ctx is done first, so
-// a second termination signal during the drain terminates the process. It is
-// not called when Serve fails first: the caller's deferred stop covers that
-// path. stop must be safe to call more than once.
+// stop is the callback that can release the signal registration. When ctx is
+// done first, serve calls it before logging server_shutdown_started and starting
+// the drain. When Serve fails first, the caller's deferred stop handles cleanup.
+// stop must be safe to call more than once.
 //
 // Request contexts derive from a server-lifetime context that is deliberately
 // not ctx: cancelling ctx only starts the drain, so in-flight handlers that
