@@ -71,6 +71,11 @@ func (e *errLocalCredential) Error() string { return e.cause.Error() }
 // source returned.
 func (e *errLocalCredential) Unwrap() error { return e.cause }
 
+func isLocalCredentialError(err error) bool {
+	var localErr *errLocalCredential
+	return errors.As(err, &localErr)
+}
+
 func (t tokenCredential) bearer(ctx context.Context) (string, error) {
 	tok, err := t(ctx)
 	if err != nil {

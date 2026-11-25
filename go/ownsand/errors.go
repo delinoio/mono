@@ -165,15 +165,14 @@ func classify(ctx context.Context, err error) (failureKind, time.Duration) {
 	if ctx.Err() != nil {
 		return failTerminal, 0
 	}
+	if isLocalCredentialError(err) {
+		// Credential acquisition failed before the RPC reached the transport.
+		return failTerminal, 0
+	}
 	if errors.Is(err, errStall) || errors.Is(err, errAttemptDeadline) || errors.Is(err, errStreamOverrun) || errors.Is(err, errAuthorizeDeadline) || errors.Is(err, errNotAccepted) || errors.Is(err, errRecoveryDeadline) {
 		// A relay stream that closed cleanly before the agent accepted it
 		// carries no terminal status, so it is a transport interruption.
 		return failInterrupted, 0
-	}
-	if errors.Is(err, errInvalidCredential) {
-		// The credential cannot be sent as a header on any attempt, so a
-		// retry, a recovery or the relay cannot succeed.
-		return failTerminal, 0
 	}
 	var fe *frameError
 	explicit := errors.As(err, &fe) || connect.IsWireError(err)

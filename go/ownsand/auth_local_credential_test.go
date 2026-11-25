@@ -5,8 +5,10 @@ package ownsand
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 )
@@ -208,5 +210,91 @@ func TestLocalCredentialFailureAfterCallerCancellationReturnsContextError(t *tes
 	}
 	if n := len(cp.authRequests()); n != 0 {
 		t.Fatalf("%d AuthorizeRelay calls", n)
+	}
+}
+
+func TestLocalTokenDeadlineEndsRelayAuthorization(t *testing.T) {
+	callbackErr := fmt.Errorf("credential store: %w", context.DeadlineExceeded)
+	for _, tc := range []struct {
+		name      string
+		failCall  int
+		wireCalls int
+	}{
+		{name: "initial grant", failCall: 1, wireCalls: 0},
+		{name: "replacement grant after transport interruption", failCall: 3, wireCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.setFile("/f", []byte("contents"))
+			cp.relayScript = func(_ string, n int) relayAction {
+				if tc.wireCalls > 0 && n == 1 {
+					return relayAction{abortAfter: 1}
+				}
+				return relayAction{}
+			}
+			ts := &localCredTokenSource{failFrom: tc.failCall, failTo: tc.failCall, onFail: func() error { return callbackErr }}
+			c := localCredClient(t, cp, TransportRelay, ts)
+			s := cp.handle(t, c)
+
+			// Exercise the caller-deadline skew while the caller is still live.
+			c.timing.callerDeadlineSkew = safetyTimeout
+			ctx, cancel := context.WithTimeout(context.Background(), safetyTimeout)
+			defer cancel()
+			_, err := s.ReadFileBytes(ctx, "/f")
+			if !errors.Is(err, callbackErr) || !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+				t.Fatalf("read error = %v, caller context = %v, want local token deadline with a live caller", err, ctx.Err())
+			}
+			if calls, auths, reads := ts.callCount(), len(cp.authRequests()), cp.relayCount("ReadFile"); calls != tc.failCall || auths != tc.wireCalls || reads != tc.wireCalls {
+				t.Fatalf("token calls = %d, wire authorizations = %d, wire reads = %d, want %d, %d, %d", calls, auths, reads, tc.failCall, tc.wireCalls, tc.wireCalls)
+			}
+
+			got, err := s.ReadFileBytes(ctx, "/f")
+			if err != nil || string(got) != "contents" {
+				t.Fatalf("read after token source recovery = %q, %v", got, err)
+			}
+			if n := len(cp.authRequests()); n != tc.wireCalls+1 {
+				t.Fatalf("%d wire authorizations after token source recovery, want %d", n, tc.wireCalls+1)
+			}
+		})
+	}
+}
+
+func TestLocalTokenDeadlineDuringRelayAuthorizationCancellation(t *testing.T) {
+	callbackErr := fmt.Errorf("credential store: %w", context.DeadlineExceeded)
+	for _, tc := range []struct {
+		name         string
+		cancelCaller bool
+		wantErr      error
+	}{
+		{name: "caller canceled", cancelCaller: true, wantErr: context.Canceled},
+		{name: "authorization window expired", wantErr: callbackErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			calls := 0
+			source := func(attempt context.Context) (string, error) {
+				calls++
+				if tc.cancelCaller {
+					cancel()
+				}
+				<-attempt.Done()
+				return "", callbackErr
+			}
+			c, err := New(Options{BaseURL: cp.srv.URL, TokenSource: source, OrganizationID: cp.orgID, Transport: TransportRelay})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.timing = testTiming()
+			c.timing.recoveryWindow = 20 * time.Millisecond
+			_, err = cp.handle(t, c).ReadFileBytes(ctx, "/f")
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("read error = %v, want %v", err, tc.wantErr)
+			}
+			if auths := len(cp.authRequests()); calls != 1 || auths != 0 {
+				t.Fatalf("token calls = %d, wire authorizations = %d, want 1, 0", calls, auths)
+			}
+		})
 	}
 }
