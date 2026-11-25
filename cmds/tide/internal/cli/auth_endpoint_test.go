@@ -26,26 +26,38 @@ func (tr *loginEndpointTransport) RoundTrip(req *http.Request) (*http.Response, 
 }
 
 func TestLoginValidatesLogtoEndpoint(t *testing.T) {
+	const tenantEndpoint = "http://auth.example:8080/tenant"
+	const queryOrFragmentError = "logto: the tenant endpoint must not contain a query or fragment"
 	for _, tc := range []struct {
 		name         string
-		suffix       string
+		endpoint     string
 		wantRequests []string
 		wantError    string
 	}{
-		{name: "query", suffix: "?mode=test"},
-		{name: "fragment", suffix: "#login"},
-		{name: "empty query", suffix: "?"},
-		{name: "empty fragment", suffix: "#"},
+		{name: "query", endpoint: tenantEndpoint + "?mode=test", wantError: queryOrFragmentError},
+		{name: "fragment", endpoint: tenantEndpoint + "#login", wantError: queryOrFragmentError},
+		{name: "empty query", endpoint: tenantEndpoint + "?", wantError: queryOrFragmentError},
+		{name: "empty fragment", endpoint: tenantEndpoint + "#", wantError: queryOrFragmentError},
+		{
+			name:      "port without hostname",
+			endpoint:  "https://:443",
+			wantError: "logto: the tenant endpoint must be an http or https URL",
+		},
+		{
+			name:         "HTTPS with explicit port",
+			endpoint:     "https://auth.example:8443",
+			wantRequests: []string{"POST /oidc/device/auth"},
+			wantError:    "logto: stop_after_device_request",
+		},
 		{
 			name:         "path prefix with trailing slash",
-			suffix:       "/",
+			endpoint:     tenantEndpoint + "/",
 			wantRequests: []string{"POST /tenant/oidc/device/auth"},
 			wantError:    "logto: stop_after_device_request",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			endpoint := "http://auth.example:8080/tenant" + tc.suffix
-			values := map[string]string{EnvLogtoEndpoint: endpoint, EnvLogtoAppID: "app", EnvNoColor: "1"}
+			values := map[string]string{EnvLogtoEndpoint: tc.endpoint, EnvLogtoAppID: "app", EnvNoColor: "1"}
 			tr := &loginEndpointTransport{}
 			var stderr bytes.Buffer
 			code := Run(context.Background(), Env{
@@ -55,12 +67,8 @@ func TestLoginValidatesLogtoEndpoint(t *testing.T) {
 				LookupEnv:  func(key string) (string, bool) { value, ok := values[key]; return value, ok },
 				HTTPClient: &http.Client{Transport: tr},
 			})
-			wantError := tc.wantError
-			if wantError == "" {
-				wantError = "logto: the tenant endpoint must not contain a query or fragment"
-			}
-			if got := stderr.String(); code != ExitError || !strings.Contains(got, wantError) || strings.Contains(got, endpoint) {
-				t.Errorf("login exit = %d, stderr = %q, want exit %d with %q", code, got, ExitError, wantError)
+			if got := stderr.String(); code != ExitError || !strings.Contains(got, tc.wantError) || strings.Contains(got, tc.endpoint) {
+				t.Errorf("login exit = %d, stderr = %q, want exit %d with %q", code, got, ExitError, tc.wantError)
 			}
 			if !slices.Equal(tr.requests, tc.wantRequests) {
 				t.Errorf("requests = %v, want %v", tr.requests, tc.wantRequests)

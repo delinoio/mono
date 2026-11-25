@@ -175,7 +175,7 @@ func (c Config) Validate() error {
 		return ErrMissingConfig
 	}
 	u, err := url.Parse(c.Endpoint)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
 		return errors.New("logto: the tenant endpoint must be an http or https URL")
 	}
 	// Check for delimiters in the original URL because url.Parse drops an empty fragment.
