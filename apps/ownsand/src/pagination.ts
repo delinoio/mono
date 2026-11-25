@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import type { QueryClient, QueryKey } from "@tanstack/react-query";
 import { useCallback, useEffect } from "react";
 import { type BoundaryQuery, isTerminalError } from "./components/ui.tsx";
 
@@ -50,6 +51,22 @@ export const FOLLOW_ALL_PAGES_OPTIONS = {
   refetchOnReconnect: refetchUnlessLaterPageFailed,
   refetchOnMount: refetchUnlessLaterPageFailed,
 } as const;
+
+/**
+ * Cancel an uncached list fetch before invalidating after a successful write.
+ * Invalidation can reuse a pending fetch when it has no cached data.
+ */
+export function cancelUncachedList(
+  queryClient: QueryClient,
+  queryKey: QueryKey,
+): Promise<void> {
+  return queryClient.cancelQueries({
+    queryKey,
+    exact: true,
+    fetchStatus: "fetching",
+    predicate: (query) => query.state.data === undefined,
+  });
+}
 
 /** The part of an infinite query result that `useFollowAllPages` reads. */
 export interface PagedQuery {
