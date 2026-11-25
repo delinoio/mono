@@ -24,6 +24,7 @@ import {
   createClient,
   type Transport,
 } from "@connectrpc/connect";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
 import {
   BaseImage,
   type DeviceLimitsInput,
@@ -31,6 +32,10 @@ import {
   SandboxState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
+import {
+  BillingService,
+  type LinkBillingAccountRequest,
+} from "@delino/ownsand-protos/v1/billing_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { type Sandbox } from "@delino/ownsand-protos/v1/sandbox_pb";
 import {
@@ -50,6 +55,7 @@ import { pendingInvitation } from "./invitation.ts";
 import { RouteId, RouterProvider, useRouter } from "./router.tsx";
 import {
   createMockTransport,
+  MOCK_BILLING_ACCOUNTS,
   MOCK_IDS,
   MOCK_INVITATION_SECRET,
   MOCK_USER,
@@ -2962,6 +2968,206 @@ describe("billing settings", () => {
     await settle(60);
     return screen.findByRole("dialog", { name: "Link a billing account" });
   }
+
+  function renderBillingLink() {
+    const queryClient = createQueryClient();
+    const options = {
+      billing: { [MOCK_IDS.acme]: MockBillingState.BlockedUnlinked },
+    };
+    const mock = createMockTransport(options);
+    const withoutAcme = createMockTransport({
+      ...options,
+      linkableBillingAccounts: MOCK_BILLING_ACCOUNTS.slice(1),
+    });
+    const listMethod = BillingService.method.listLinkableBillingAccounts.name;
+    const links: string[] = [];
+    let hideAcme = false;
+    const { transport, calls } = holdPagedTransport([listMethod], undefined, {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === BillingService.method.linkBillingAccount.name) {
+          links.push(
+            (rest[3] as unknown as LinkBillingAccountRequest).billingAccountId,
+          );
+        }
+        const source =
+          method.name === listMethod && hideAcme ? withoutAcme : mock;
+        return source.unary(method, ...rest);
+      },
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      queryClient,
+      transport,
+    });
+    return {
+      links,
+      removeAcme: () => {
+        hideAcme = true;
+      },
+      refetch: () => {
+        void queryClient.refetchQueries({
+          type: "active",
+          queryKey: createConnectQueryKey({
+            schema: BillingService.method.listLinkableBillingAccounts,
+            cardinality: undefined,
+          }),
+        });
+      },
+      async finishListRequest(index: number, error?: Error) {
+        await waitFor(() => expect(calls[listMethod]?.[index]).toBeDefined());
+        await act(async () => calls[listMethod]![index]!.settle(error));
+      },
+    };
+  }
+
+  async function submitLinkForm(dialog: HTMLElement) {
+    const button = within(dialog).getByRole<HTMLButtonElement>("button", {
+      name: "Link",
+    });
+    await act(async () => {
+      fireEvent.click(button);
+      fireEvent.submit(button.form!);
+    });
+  }
+
+  test.each([
+    [
+      Code.PermissionDenied,
+      "You do not have permission to do this.",
+      "Try again",
+    ],
+    [
+      Code.NotFound,
+      "It was not found, or you no longer have access to it.",
+      null,
+    ],
+    [
+      Code.Unauthenticated,
+      "Your session ended. Sign in again.",
+      "Sign in with Delino",
+    ],
+  ] as const)(
+    "blocks a billing link after terminal error %s",
+    async (code, message, action) => {
+      const fixture = renderBillingLink();
+      const dialog = await openLinkDialog();
+      const body = within(dialog);
+      await fixture.finishListRequest(0);
+      const account = await body.findByRole("radio", {
+        name: /Acme Robotics billing/,
+      });
+      await act(async () => fireEvent.click(account));
+      expect(account.getAttribute("aria-checked")).toBe("true");
+
+      fixture.refetch();
+      await fixture.finishListRequest(
+        1,
+        new ConnectError("List refresh failed", code),
+      );
+      expect((await body.findByRole("alert")).textContent).toContain(message);
+      expect(body.queryAllByRole("radio")).toHaveLength(0);
+      expect(
+        body.getByRole<HTMLButtonElement>("button", { name: "Link" }).disabled,
+      ).toBe(true);
+      if (action === null) {
+        expect(body.queryByRole("button", { name: "Try again" })).toBeNull();
+      } else {
+        expect(body.getByRole("button", { name: action })).toBeTruthy();
+      }
+      await submitLinkForm(dialog);
+      expect(fixture.links).toEqual([]);
+    },
+  );
+
+  test.each([true, false])(
+    "recovers from a billing list error (original account available: %s)",
+    async (keepAcme) => {
+      const fixture = renderBillingLink();
+      const dialog = await openLinkDialog();
+      const body = within(dialog);
+      await fixture.finishListRequest(0);
+      const account = await body.findByRole("radio", {
+        name: /Acme Robotics billing/,
+      });
+      await act(async () => fireEvent.click(account));
+      fixture.refetch();
+      await fixture.finishListRequest(
+        1,
+        new ConnectError("List refresh failed", Code.PermissionDenied),
+      );
+      const retry = await body.findByRole("button", { name: "Try again" });
+
+      if (!keepAcme) fixture.removeAcme();
+      await act(async () => fireEvent.click(retry));
+      await fixture.finishListRequest(2);
+      const lab = await body.findByRole("radio", {
+        name: /Research lab credits/,
+      });
+      expect(body.queryByRole("alert")).toBeNull();
+      const acme = body.queryByRole("radio", { name: /Acme Robotics billing/ });
+      if (keepAcme) {
+        expect(acme?.getAttribute("aria-checked")).toBe("true");
+      } else {
+        expect(acme).toBeNull();
+        expect(lab.getAttribute("aria-checked")).toBe("false");
+        await act(async () => fireEvent.submit(lab.closest("form")!));
+        expect(await body.findByText("Choose a billing account.")).toBeTruthy();
+        expect(fixture.links).toEqual([]);
+        await act(async () => fireEvent.click(lab));
+      }
+      await act(async () =>
+        fireEvent.click(body.getByRole("button", { name: "Link" })),
+      );
+      expect(fixture.links).toEqual([
+        keepAcme ? MOCK_IDS.acmeBillingAccount : MOCK_IDS.labBillingAccount,
+      ]);
+    },
+  );
+
+  test("links the visible selection after a transient billing list error", async () => {
+    const fixture = renderBillingLink();
+    const body = within(await openLinkDialog());
+    await fixture.finishListRequest(0);
+    const account = await body.findByRole("radio", {
+      name: /Acme Robotics billing/,
+    });
+    await act(async () => fireEvent.click(account));
+    fixture.refetch();
+    await fixture.finishListRequest(
+      1,
+      new ConnectError("List refresh failed", Code.Internal),
+    );
+
+    expect((await body.findByRole("alert")).textContent).toContain(
+      "The last refresh failed",
+    );
+    expect(account.getAttribute("aria-checked")).toBe("true");
+    await act(async () =>
+      fireEvent.click(body.getByRole("button", { name: "Link" })),
+    );
+    expect(fixture.links).toEqual([MOCK_IDS.acmeBillingAccount]);
+  });
+
+  test("blocks a billing link during loading and on the first list failure", async () => {
+    const fixture = renderBillingLink();
+    const dialog = await openLinkDialog();
+    const body = within(dialog);
+    expect(
+      body.getByRole<HTMLButtonElement>("button", { name: "Link" }).disabled,
+    ).toBe(true);
+    await submitLinkForm(dialog);
+
+    await fixture.finishListRequest(
+      0,
+      new ConnectError("List failed", Code.Internal),
+    );
+    await body.findByRole("alert");
+    expect(
+      body.getByRole<HTMLButtonElement>("button", { name: "Link" }).disabled,
+    ).toBe(true);
+    await submitLinkForm(dialog);
+    expect(fixture.links).toEqual([]);
+  });
 
   test("the owner links a billing account and the block ends", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {

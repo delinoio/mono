@@ -15,6 +15,21 @@ const INVITATION_SECRET = "osi_mock_contoso_invitation";
 // accepting it fails and leaves the invitation unused.
 const ACME_INVITATION_SECRET = "osi_7f3a_unused";
 
+async function failOnWindowFocus({ key, code }: { key: string; code: Code }) {
+  sessionStorage.setItem(key, String(code));
+  const now = Date.now;
+  // Treat the queries as stale when React Query handles the visibility event.
+  Date.now = () => now() + 11_000;
+  try {
+    window.dispatchEvent(new Event("visibilitychange"));
+    // React Query checks staleness after resuming paused mutations.
+    await Promise.resolve();
+  } finally {
+    Date.now = now;
+  }
+  return true;
+}
+
 describe("sign-in", () => {
   test("signs in and lists the organizations", async ({ app, screen }) => {
     await app.open("/");
@@ -109,21 +124,6 @@ describe("organization list errors", () => {
   const refreshNotice = /The last refresh failed/;
   const listName = "Your organizations";
 
-  async function failOnWindowFocus(code: Code) {
-    sessionStorage.setItem("ownsand-e2e-organization-list-error", String(code));
-    const now = Date.now;
-    // Treat the list as stale when React Query handles the visibility event.
-    Date.now = () => now() + 11_000;
-    try {
-      window.dispatchEvent(new Event("visibilitychange"));
-      // React Query checks staleness after resuming paused mutations.
-      await Promise.resolve();
-    } finally {
-      Date.now = now;
-    }
-    return true;
-  }
-
   test("keeps loaded rows while retrying a failed refresh", async ({
     app,
     browser,
@@ -135,7 +135,10 @@ describe("organization list errors", () => {
     const northwind = screen.getByRole("link", "Northwind Labs Member");
     await expect(northwind).toBeVisible();
 
-    await browser.evaluate(failOnWindowFocus, Code.Unavailable);
+    await browser.evaluate(failOnWindowFocus, {
+      key: "ownsand-e2e-organization-list-error",
+      code: Code.Unavailable,
+    });
 
     const notice = screen.getByText(refreshNotice);
     await expect(notice).toBeVisible();
@@ -175,7 +178,10 @@ describe("organization list errors", () => {
     const list = screen.getByRole("list", listName);
     await expect(list).toBeVisible();
 
-    await browser.evaluate(failOnWindowFocus, Code.Unauthenticated);
+    await browser.evaluate(failOnWindowFocus, {
+      key: "ownsand-e2e-organization-list-error",
+      code: Code.Unauthenticated,
+    });
 
     await expect(
       screen.getByText("Your session ended. Sign in again."),
@@ -491,6 +497,32 @@ describe("roles", () => {
 });
 
 describe("billing", () => {
+  const billingListErrorKey = "ownsand-e2e-billing-list-error";
+  const acmeBillingId = "0193a000-0000-7000-8000-0000000000e1";
+  const labBillingId = "0193a000-0000-7000-8000-0000000000e2";
+
+  function billingLinkRequests() {
+    return JSON.parse(
+      sessionStorage.getItem("ownsand-e2e-billing-link-requests") ?? "[]",
+    ) as string[];
+  }
+
+  function submitBillingForm() {
+    document
+      .querySelector<HTMLFormElement>('[role="dialog"] form')!
+      .requestSubmit();
+    return true;
+  }
+
+  async function openBillingLinkDialog(screen: Screen) {
+    await screen.getByRole("button", "Unlink billing account").tap();
+    const confirm = screen.getByRole("alertdialog");
+    await confirm.getByRole("button", "Unlink billing account").tap();
+    await expect(confirm).toBeHidden();
+    await screen.getByRole("button", "Link a billing account").tap();
+    return screen.getByRole("dialog", "Link a billing account");
+  }
+
   test("shows the suspension banner to a member", async ({ app, screen }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
@@ -553,6 +585,105 @@ describe("billing", () => {
     await expect(
       screen.getByRole("region", "This organization is blocked"),
     ).toBeHidden();
+  });
+
+  for (const keepAccount of [true, false]) {
+    test(`recovers from a terminal billing refresh with the chosen account ${keepAccount ? "present" : "removed"}`, async ({
+      app,
+      screen,
+      browser,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(`/orgs/${ACME}/settings`);
+      const dialog = await openBillingLinkDialog(screen);
+      const link = dialog.getByRole("button", "Link");
+      const acme = dialog.getByRole("radio", "Acme Robotics billing · Owner");
+      const lab = dialog.getByRole("radio", "Research lab credits · Admin");
+      await acme.tap();
+      await expect(acme).toHaveAttribute("aria-checked", "true");
+
+      await browser.evaluate(failOnWindowFocus, {
+        key: billingListErrorKey,
+        code: Code.PermissionDenied,
+      });
+      await expect(dialog.getByRole("alert")).toContainText(
+        "You do not have permission to do this.",
+      );
+      await expect(acme).toBeHidden();
+      await expect(lab).toBeHidden();
+      await expect(link).toHaveAttribute("disabled", "");
+      await browser.evaluate(submitBillingForm);
+      expect(await browser.evaluate(billingLinkRequests)).toEqual([]);
+      await app.screenshot(
+        `billing-terminal-refresh-${keepAccount ? "keep" : "remove"}`,
+      );
+
+      await browser.evaluate(
+        ({ key, keepAccount }) => {
+          sessionStorage.removeItem(key);
+          if (!keepAccount) {
+            sessionStorage.setItem(
+              "ownsand-e2e-billing-list-remove-first",
+              "true",
+            );
+          }
+          return true;
+        },
+        { key: billingListErrorKey, keepAccount },
+      );
+      await dialog.getByRole("button", "Try again").tap();
+      await expect(lab).toBeVisible();
+      await expect(dialog.getByRole("alert")).toBeHidden();
+      if (keepAccount) {
+        await expect(acme).toHaveAttribute("aria-checked", "true");
+      } else {
+        await expect(acme).toBeHidden();
+        await expect(lab).toHaveAttribute("aria-checked", "false");
+        await browser.evaluate(submitBillingForm);
+        await expect(
+          dialog.getByText("Choose a billing account."),
+        ).toBeVisible();
+        expect(await browser.evaluate(billingLinkRequests)).toEqual([]);
+      }
+      await app.screenshot(
+        `billing-refresh-recovered-${keepAccount ? "keep" : "remove"}`,
+      );
+      if (!keepAccount) await lab.tap();
+      await link.tap();
+      await expect(dialog).toBeHidden();
+      expect(await browser.evaluate(billingLinkRequests)).toEqual([
+        keepAccount ? acmeBillingId : labBillingId,
+      ]);
+    });
+  }
+
+  test("links the visible choice after a transient billing refresh error", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/settings`);
+    const dialog = await openBillingLinkDialog(screen);
+    const acme = dialog.getByRole("radio", "Acme Robotics billing · Owner");
+    await acme.tap();
+
+    await browser.evaluate(failOnWindowFocus, {
+      key: billingListErrorKey,
+      code: Code.Internal,
+    });
+    await expect(dialog.getByRole("alert")).toContainText(
+      "The last refresh failed",
+    );
+    await expect(acme).toHaveAttribute("aria-checked", "true");
+    await app.screenshot("billing-transient-refresh");
+    await dialog.getByRole("button", "Link").tap();
+    await expect(dialog).toBeHidden();
+    expect(await browser.evaluate(billingLinkRequests)).toEqual([
+      acmeBillingId,
+    ]);
   });
 });
 
