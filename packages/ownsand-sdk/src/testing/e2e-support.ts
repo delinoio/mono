@@ -5,7 +5,68 @@
 // unit tests can cover them without a control plane (the end-to-end test is
 // skipped unless the OwnSand end-to-end suite starts it).
 import { type Clock, systemClock } from "../clock.ts";
-import { SnapshotState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  SandboxState,
+  SnapshotState,
+} from "@delino/ownsand-protos/v1/common_pb";
+
+/** Waits for one billing transition, including time spent in RPCs and delays. */
+export async function waitForSandboxState(
+  sandbox: { get(signal: AbortSignal): Promise<{ state: SandboxState }> },
+  target: SandboxState,
+  {
+    timeoutMs = 60_000,
+    clock = systemClock,
+  }: {
+    timeoutMs?: number;
+    clock?: Clock;
+  } = {},
+): Promise<void> {
+  const deadline = clock.now() + timeoutMs;
+  const stop = new AbortController();
+  let lastState: SandboxState | undefined;
+  const expire = () =>
+    stop.abort(
+      new Error(
+        `sandbox did not reach ${SandboxState[target]} within ${timeoutMs} ms: last state ${
+          lastState === undefined ? "unknown" : SandboxState[lastState]
+        }`,
+      ),
+    );
+  const checkDeadline = () => {
+    // The timer callback can run after a poll delay or RPC has settled.
+    if (clock.now() >= deadline && !stop.signal.aborted) expire();
+    stop.signal.throwIfAborted();
+  };
+  const poll = async () => {
+    try {
+      for (;;) {
+        checkDeadline();
+        const { state } = await sandbox.get(stop.signal);
+        checkDeadline();
+        lastState = state;
+        if (state === target) return;
+        await clock.sleep(200, stop.signal);
+      }
+    } catch (error) {
+      checkDeadline();
+      throw error;
+    }
+  };
+
+  const aborted = new Promise<never>((_, reject) => {
+    stop.signal.addEventListener("abort", () => reject(stop.signal.reason), {
+      once: true,
+    });
+  });
+  clock.sleep(timeoutMs, stop.signal).then(expire, () => {});
+  try {
+    // Race the whole poll so that an RPC that ignores abort cannot block cleanup.
+    await Promise.race([aborted, poll()]);
+  } finally {
+    stop.abort();
+  }
+}
 
 /** The part of a snapshot message that the poll reads. */
 export interface SnapshotStatus {
@@ -34,14 +95,11 @@ export async function waitForSnapshotReady(
   getSnapshot: (signal: AbortSignal) => Promise<SnapshotStatus>,
   options: WaitForSnapshotReadyOptions,
 ): Promise<void> {
+  options.signal?.throwIfAborted();
   const clock = options.clock ?? systemClock;
   const stop = new AbortController();
   const onCallerAbort = () => stop.abort(options.signal?.reason);
-  if (options.signal?.aborted) {
-    onCallerAbort();
-  } else {
-    options.signal?.addEventListener("abort", onCallerAbort, { once: true });
-  }
+  options.signal?.addEventListener("abort", onCallerAbort, { once: true });
   let lastState: SnapshotState | undefined;
   // The deadline timer ends with the wait: `stop.abort()` below rejects its
   // sleep, which the catch ignores.
@@ -165,4 +223,46 @@ export async function withCleanup<T>(
     throw new AggregateError(errors, "several cleanup steps failed");
   }
   return result as T;
+}
+
+export const CLEANUP_STEP_TIMEOUT_MS = 15_000;
+
+/** Billing statuses match the path segments of the Go harness endpoint. */
+export enum BillingControlStatus {
+  Suspended = "suspended",
+  Allowed = "allowed",
+}
+
+/** Applies a billing status to the organization at once. */
+export async function setBilling(
+  billingUrl: string,
+  status: BillingControlStatus,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${billingUrl}/billing/${status}`, {
+    method: "POST",
+    signal,
+  });
+  if (!res.ok) {
+    throw new Error(
+      `billing control ${status}: ${res.status} ${await res.text()}`,
+    );
+  }
+}
+
+export function withBillingCleanup<T>(
+  body: () => Promise<T>,
+  billingUrl: string,
+  sandbox: { delete(signal: AbortSignal): Promise<unknown>; close(): void },
+  options: WithCleanupOptions,
+): Promise<T> {
+  return withCleanup(
+    body,
+    [
+      (signal) => setBilling(billingUrl, BillingControlStatus.Allowed, signal),
+      (signal) => sandbox.delete(signal),
+      () => sandbox.close(),
+    ],
+    options,
+  );
 }

@@ -27,6 +27,29 @@ func TestExecTextStdoutWriteErrorExitsWithError(t *testing.T) {
 	}
 }
 
+func TestExecTextStderrWriteErrorReportsDiagnostic(t *testing.T) {
+	r := newRunner(t)
+	var stdout bytes.Buffer
+	stderr := &firstWriteFails{err: errDiskFull}
+	code := r.runWriters(&stdout, stderr, "--no-color", "sandbox", "exec", r.f.sb, "--", "echo", "hello")
+	if code != ExitError || stdout.String() != "hello\n" {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.buf.String())
+	}
+	if want := "error: " + errDiskFull.Error() + "\n"; stderr.buf.String() != want {
+		t.Fatalf("stderr %q, want %q", stderr.buf.String(), want)
+	}
+}
+
+func TestExecTextStderrWriteErrorExitsWithoutDiagnostic(t *testing.T) {
+	r := newRunner(t)
+	var stdout bytes.Buffer
+	stderr := &failingWriter{failAfter: 0, err: errDiskFull}
+	code := r.runWriters(&stdout, stderr, "sandbox", "exec", r.f.sb, "--", "echo", "hello")
+	if code != ExitError || stdout.String() != "hello\n" {
+		t.Fatalf("exit %d, stdout %q", code, stdout.String())
+	}
+}
+
 // TestExecTextDataPathFailureStillExits255 checks that a genuine data path
 // failure keeps exit 255 and its diagnostic, and that a successful exec still
 // streams the guest output and returns the guest exit status.
@@ -37,7 +60,7 @@ func TestExecTextDataPathFailureStillExits255(t *testing.T) {
 		t.Fatalf("denied: exit %d stderr %q", res.code, res.stderr)
 	}
 	res = r.run("sandbox", "exec", r.f.sb, "--", "echo", "hello")
-	if res.code != 0 || res.stdout != "hello\n" {
+	if res.code != 0 || res.stdout != "hello\n" || res.stderr != "err\xff\n" {
 		t.Fatalf("echo: %+v", res)
 	}
 	res = r.run("sandbox", "exec", r.f.sb, "--", "exit3")

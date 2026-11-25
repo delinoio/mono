@@ -5,12 +5,16 @@
 package fsutil
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 )
@@ -48,10 +52,11 @@ func buildModeTree(t *testing.T) string {
 		}
 	}
 	files := map[string]fs.FileMode{
-		"top":        0o660,
-		"ro/f":       0o770,
-		"ro/deep/g":  0o444,
-		"rw/private": 0o600,
+		"top":            0o660,
+		"ro/f":           0o770,
+		"ro/deep/g":      0o444,
+		"ro/deep/shared": 0o664,
+		"rw/private":     0o600,
 	}
 	for name, mode := range files {
 		path := filepath.Join(src, name)
@@ -80,17 +85,18 @@ func buildModeTree(t *testing.T) string {
 	return src
 }
 
-func requireModeTree(t *testing.T, dst string) {
+func requireModeTree(t *testing.T, dst string, rootMode fs.FileMode) {
 	t.Helper()
 	for name, mode := range map[string]fs.FileMode{
-		".":          0o775,
-		"rw":         0o775,
-		"ro":         0o555,
-		"ro/deep":    0o555,
-		"top":        0o660,
-		"ro/f":       0o770,
-		"ro/deep/g":  0o444,
-		"rw/private": 0o600,
+		".":              rootMode,
+		"rw":             0o775,
+		"ro":             0o555,
+		"ro/deep":        0o555,
+		"top":            0o660,
+		"ro/f":           0o770,
+		"ro/deep/g":      0o444,
+		"ro/deep/shared": 0o664,
+		"rw/private":     0o600,
 	} {
 		requireMode(t, filepath.Join(dst, name), mode)
 	}
@@ -118,7 +124,7 @@ func TestCopyTreePreservesModesUnderUmask(t *testing.T) {
 					if err := CopyTree(src, dst); err != nil {
 						t.Fatalf("CopyTree: %v", err)
 					}
-					requireModeTree(t, dst)
+					requireModeTree(t, dst, 0o775)
 					requireMode(t, base, 0o711)
 					if test.dir != base {
 						parentMode := 0o775&^fs.FileMode(mask) | 0o700
@@ -137,6 +143,71 @@ func TestCopyTreePreservesModesUnderUmask(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestReadTarPreservesModesUnderUmask(t *testing.T) {
+	const env = "FSUTIL_TEST_TAR_UMASK"
+	if value := os.Getenv(env); value != "" {
+		mask, err := strconv.ParseUint(value, 8, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		setUmask(t, int(mask))
+		src := buildModeTree(t)
+		var archive bytes.Buffer
+		if err := WriteTar(&archive, src); err != nil {
+			t.Fatal(err)
+		}
+		dst := t.TempDir()
+		if err := os.Chmod(dst, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { makeDirsWritable(dst) })
+		if err := ReadTar(&archive, dst); err != nil {
+			t.Fatal(err)
+		}
+		requireModeTree(t, dst, 0o700)
+		for name, want := range map[string]string{"ro/deep/shared": "ro/deep/shared", "ro/link": "top"} {
+			if b, err := os.ReadFile(filepath.Join(dst, name)); err != nil || string(b) != want {
+				t.Errorf("read %s: %q, %v; want %q", name, b, err, want)
+			}
+		}
+		return
+	}
+	for _, mask := range []string{"0022", "0077"} {
+		t.Run("umask"+mask, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestReadTarPreservesModesUnderUmask$")
+			cmd.Env = append(os.Environ(), env+"="+mask)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("tar round trip: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+func TestReadTarAppliesExplicitDirectoryModesAfterExtraction(t *testing.T) {
+	dst := t.TempDir()
+	t.Cleanup(func() { makeDirsWritable(dst) })
+	archive := buildTar(t, []tarEntry{
+		{hdr: tar.Header{Name: "parent", Typeflag: tar.TypeDir, Mode: 0}},
+		{hdr: tar.Header{Name: "parent/deep", Typeflag: tar.TypeDir, Mode: 0o550}},
+		{hdr: tar.Header{Name: "parent/implicit/file", Typeflag: tar.TypeReg, Mode: 0o600}, data: "contents"},
+		{hdr: tar.Header{Name: "parent/", Typeflag: tar.TypeDir, Mode: 0o400}},
+	})
+	if err := ReadTar(archive, dst); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(dst, "parent")
+	requireMode(t, parent, 0o400)
+	// Reopen the parent to check what extraction wrote below it.
+	if err := os.Chmod(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	requireMode(t, filepath.Join(parent, "deep"), 0o550)
+	requireMode(t, filepath.Join(parent, "implicit"), 0o700)
+	if got, err := os.ReadFile(filepath.Join(parent, "implicit", "file")); err != nil || string(got) != "contents" {
+		t.Fatalf("extracted file = %q, %v", got, err)
 	}
 }
 

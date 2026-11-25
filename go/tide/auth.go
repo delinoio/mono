@@ -28,10 +28,14 @@ type tokenCredential TokenSource
 func (t tokenCredential) bearer(ctx context.Context) (string, error) {
 	tok, err := t(ctx)
 	if err != nil {
-		return "", errorf("token source: %w", err)
+		var networkError interface{ Timeout() bool }
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) {
+			return "", errorf("token source: %w", err)
+		}
+		return "", localError(connect.CodeUnauthenticated, &CredentialError{err: err})
 	}
 	if tok == "" {
-		return "", errors.New("tide: token source returned an empty token")
+		return "", localError(connect.CodeUnauthenticated, &CredentialError{})
 	}
 	return tok, nil
 }
@@ -79,9 +83,12 @@ type failedConn struct {
 	err error
 }
 
-func (f *failedConn) Send(any) error             { return f.err }
-func (f *failedConn) Receive(any) error          { return f.err }
-func (f *failedConn) CloseRequest() error        { return nil }
+func (f *failedConn) Send(any) error    { return f.err }
+func (f *failedConn) Receive(any) error { return f.err }
+
+// Connect treats EOF on send and receive as a stream boundary. Return the
+// error on close too so a token source error that wraps EOF reaches callers.
+func (f *failedConn) CloseRequest() error        { return f.err }
 func (f *failedConn) CloseResponse() error       { return nil }
 func (f *failedConn) RequestHeader() http.Header { return http.Header{} }
 

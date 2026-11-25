@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
@@ -20,6 +21,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/codex/codexfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/webhook"
 )
 
 const (
@@ -61,6 +63,41 @@ func (w *codexWorld) deliver(t *testing.T, id string, body []byte) int {
 	return w.sender.Send(t, codexfake.Delivery{ID: id, Body: body})
 }
 
+func TestCreateDirectDuringProfileChange(t *testing.T) {
+	for _, tc := range []struct {
+		name, change string
+		args         []any
+	}{
+		{"deleted", "DELETE FROM runner_profiles WHERE runner_profile_id = $1", nil},
+		{"integration changed", "UPDATE runner_profiles SET agent_integration_id = NULL WHERE runner_profile_id = $1", nil},
+		{"kind changed", "UPDATE runner_profiles SET workload_kind = $2 WHERE runner_profile_id = $1", []any{int16(tidev1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newCodexWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			ctx := t.Context()
+			in, err := w.l.Integrations.Get(ctx, w.env.DB.Pool, w.org.ID, w.integrationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			args := append([]any{w.profileID}, tc.args...)
+			commit := holdTx(t, w.env, tc.change, args...)
+			done := make(chan error, 1)
+			go func() {
+				done <- w.env.DB.InTx(ctx, func(tx pgx.Tx) error {
+					_, _, err := w.l.Agents.CreateDirectTx(ctx, tx, w.l.Codex, in, agent.DirectDemand{VendorRequestID: "sess_profile_changed"})
+					return err
+				})
+			}()
+			waitForLockWaiter(t, w.env)
+			commit()
+			if err := <-done; !errors.Is(err, agent.ErrNoProfile) {
+				t.Fatalf("create direct: %v, want ErrNoProfile", err)
+			}
+			w.assertNoRequestsOrClaims(t)
+		})
+	}
+}
+
 // TestCodexSessionLifecycle: an environment_connection webhook makes tide
 // read the session with the API key and queue a request keyed by the
 // session and environment IDs; the runner gets only the environment key,
@@ -70,7 +107,9 @@ func (w *codexWorld) deliver(t *testing.T, id string, body []byte) int {
 // and no secret or body reaches the log.
 func TestCodexSessionLifecycle(t *testing.T) {
 	w := newCodexWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	const remoteURL = "https://Relay.openai.test:443/v1/agents/%61pi?mode=connect"
 	w.openai.AddSession("sess_1", "ccarenv_1")
+	w.openai.Update("sess_1", func(s *codexfake.Session) { s.RemoteURL = remoteURL })
 	body := codexfake.ActionRequired("sess_1")
 	if code := w.deliver(t, "wh_1", body); code != http.StatusOK {
 		t.Fatalf("delivery %d", code)
@@ -106,7 +145,7 @@ func TestCodexSessionLifecycle(t *testing.T) {
 	script := w.guest.startScript(sandboxID)
 	for _, want := range []string{
 		"CODEX_API_KEY=$(cat '" + dir + "/credential')",
-		"exec 'codex' 'exec-server' '--remote' 'https://api.openai.test/v1/agents/api' '--environment-id' 'ccarenv_1' >>'" + dir + "/runner.log' 2>&1",
+		"exec 'codex' 'exec-server' '--remote' '" + remoteURL + "' '--environment-id' 'ccarenv_1' >>'" + dir + "/runner.log' 2>&1",
 		`export PATH="$HOME/.local/bin:$PATH"`,
 		`export PATH="$HOME/.local/share/tide/node-v` + codex.NodeVersion + `/bin:$PATH"`,
 	} {
@@ -159,6 +198,43 @@ func TestCodexSessionLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(logs, `"msg":"openai_webhook_delivery"`) || !strings.Contains(logs, `"result":"duplicate"`) {
 		t.Fatal("deliveries are not logged")
+	}
+}
+
+func TestCodexIgnoresInvalidRemote(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+	}{
+		{"hostless", "https:///executor"},
+		{"malformed host", "https://[::1/executor"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newCodexWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			w.openai.AddSession("sess_invalid_remote", "ccarenv_invalid_remote")
+			w.openai.Update("sess_invalid_remote", func(s *codexfake.Session) { s.RemoteURL = tc.url })
+
+			const deliveryID = "wh_invalid_remote"
+			if code := w.deliver(t, deliveryID, codexfake.ActionRequired("sess_invalid_remote")); code != http.StatusOK {
+				t.Fatalf("delivery status %d, want 200", code)
+			}
+			seen, err := webhook.Seen(t.Context(), w.env.DB.Pool, webhook.SenderOpenAI, deliveryID)
+			if err != nil || !seen {
+				t.Fatalf("delivery recorded = %t, error = %v", seen, err)
+			}
+			w.assertNoRequestsOrClaims(t)
+			var runners int
+			if err := w.env.DB.Pool.QueryRow(t.Context(), "SELECT count(*) FROM runners WHERE organization_id = $1", w.org.ID).Scan(&runners); err != nil {
+				t.Fatal(err)
+			}
+			if runners != 0 {
+				t.Fatalf("%d runners, want none", runners)
+			}
+			logs := w.env.Logs.String()
+			if !strings.Contains(logs, `"result":"ignored"`) || !strings.Contains(logs, `"detail":"invalid environment"`) {
+				t.Fatal("delivery was not logged as ignored due to an invalid environment")
+			}
+		})
 	}
 }
 

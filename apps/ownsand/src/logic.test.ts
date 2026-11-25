@@ -485,7 +485,6 @@ describe("formatting and form rules", () => {
       memory: "Enter the memory in MiB.",
       disk: "Enter the disk size in GiB.",
     });
-    // The vCPU count is an int32; memory and disk stay exact below 2^53.
     expect(resourceErrors({ vcpu: 2147483648, memory: 1, disk: 1 }).vcpu).toBe(
       "Enter a whole number of vCPUs from 1 to 2147483647.",
     );
@@ -495,13 +494,18 @@ describe("formatting and form rules", () => {
     expect(
       resourceErrors({ vcpu: 1, memory: 9007199254740992, disk: 1 }).memory,
     ).toContain("1 to 9007199254740991");
-    expect(resourceErrors({ vcpu: 1, memory: 1, disk: 1e19 }).disk).toContain(
-      "1 to 9007199254740991",
+    expect(resourceErrors({ vcpu: 1, memory: 1, disk: 8589934591 })).toEqual(
+      {},
     );
+    for (const disk of [8589934592, 9007199254740991, 1e19]) {
+      expect(resourceErrors({ vcpu: 1, memory: 1, disk }).disk).toBe(
+        "Enter a whole number of GiB from 1 to 8589934591.",
+      );
+    }
     expect(resourceErrors({ vcpu: 1.5, memory: 1.5, disk: 1.5 })).toEqual({
       vcpu: "Enter a whole number of vCPUs from 1 to 2147483647.",
       memory: "Enter a whole number of MiB from 1 to 9007199254740991.",
-      disk: "Enter a whole number of GiB from 1 to 9007199254740991.",
+      disk: "Enter a whole number of GiB from 1 to 8589934591.",
     });
   });
 

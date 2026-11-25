@@ -48,11 +48,12 @@
 # number. Bash runs a trap only after the foreground command (`docker` or
 # `curl`) returns, so the handler waits for that command, which the stop
 # timeout and the 5-second `curl` limit bound. `SIGKILL` cannot be caught and
-# still leaves the containers stopped. A signal during the route switch waits
-# until the route switch has finished: when the route switched, the script
-# records the state and exits without a restart, because the route names the
-# replacement; when it did not, the script restores the stopped containers as
-# above.
+# still leaves the containers stopped. For both HTTP-only and UDP deployments,
+# the script defers these signals during the route switch and image-state
+# publication. When the reload succeeds, the script records the state and
+# exits with the signal status before cleanup. When the reload fails, the
+# script restores the route file and removes the replacement, then restarts
+# any containers that it stopped for UDP and reports the route failure.
 #
 # Every deployment reads a fresh identifier under the service lock, before it
 # runs any `docker` command: a UUID that the kernel generates for each read
@@ -95,8 +96,10 @@
 #   DROPLET_ID_SOURCE       file that yields a fresh UUID on every read (default
 #                           /proc/sys/kernel/random/uuid). Tests replace it.
 #   DROPLET_HEALTH_TIMEOUT  seconds to wait for the health check (default 120).
-#   DROPLET_STOP_TIMEOUT    seconds between SIGTERM and SIGKILL when the old
-#                           container stops (default 30).
+#   DROPLET_STOP_TIMEOUT    seconds between SIGTERM and SIGKILL. Accounts API
+#                           defaults to 60 and requires at least 60 for old
+#                           containers and failed replacements. Other
+#                           services default to 30 for old containers.
 #   DROPLET_LOCK_TIMEOUT    seconds to wait for a running deployment of the
 #                           same service to finish before the script gives up
 #                           without a change (default 600).
@@ -171,6 +174,18 @@ main() {
   local proxy="${DROPLET_PROXY:-caddy}"
   local health_timeout="${DROPLET_HEALTH_TIMEOUT:-120}"
   local stop_timeout="${DROPLET_STOP_TIMEOUT:-30}"
+  local replacement_stop_timeout=""
+  if [[ "$service" == accounts-api ]]; then
+    stop_timeout="${DROPLET_STOP_TIMEOUT-60}"
+    # Capture decimal digits without leading zeros for Bash and Docker. The
+    # upper bound keeps Docker's conversion to a nanosecond duration in range.
+    if [[ ! "$stop_timeout" =~ ^0*([1-9][0-9]{0,9})$ ]] ||
+      (( BASH_REMATCH[1] < 60 || BASH_REMATCH[1] > 9223372036 )); then
+      fail "DROPLET_STOP_TIMEOUT for accounts-api must be a whole number of seconds from 60 to 9223372036."
+    fi
+    stop_timeout="${BASH_REMATCH[1]}"
+    replacement_stop_timeout="$stop_timeout"
+  fi
   local lock_timeout="${DROPLET_LOCK_TIMEOUT:-600}"
   local proxy_lock_timeout="${DROPLET_PROXY_LOCK_TIMEOUT:-$lock_timeout}"
   local id_source="${DROPLET_ID_SOURCE:-/proc/sys/kernel/random/uuid}"
@@ -269,11 +284,11 @@ main() {
     # (for example an OCI runtime or entrypoint error). `set -e` would end the
     # script before any cleanup, so the call is an `if` operand.
     if ! docker run --detach "${create[@]}" > /dev/null; then
-      discard_replacement "$new"
+      discard_replacement "$new" "$replacement_stop_timeout"
       fail "$new did not start; the previous container keeps serving."
     fi
     if ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
-      discard_replacement "$new"
+      discard_replacement "$new" "$replacement_stop_timeout"
       fail "$new did not pass the health check; the previous container keeps serving."
     fi
   else
@@ -289,16 +304,16 @@ main() {
     echo "Create $new as $upstream with the UDP ports $udp_ports"
     # No container is stopped yet, so the previous containers keep serving.
     if ! docker create "${create[@]}" > /dev/null; then
-      discard_replacement "$new"
+      discard_replacement "$new" "$replacement_stop_timeout"
       fail "$new was not created; the previous containers keep serving."
     fi
     # From the first stop until the route switch, a signal restores the
     # previous containers (see `interrupted`). Bash expands the quoted trap
     # text when the signal arrives, in the frame of the running command, so
     # `$new` and `stopped` are the values of this deployment.
-    trap 'interrupted TERM "$new" "${stopped[@]}"' TERM
-    trap 'interrupted INT "$new" "${stopped[@]}"' INT
-    trap 'interrupted HUP "$new" "${stopped[@]}"' HUP
+    trap 'interrupted TERM "$new" "$replacement_stop_timeout" "${stopped[@]}"' TERM
+    trap 'interrupted INT "$new" "$replacement_stop_timeout" "${stopped[@]}"' INT
+    trap 'interrupted HUP "$new" "$replacement_stop_timeout" "${stopped[@]}"' HUP
     for running_id in "${stopped[@]}"; do
       echo "Stop the previous container $running_id to free the UDP ports"
       if ! docker stop --time "$stop_timeout" "$running_id" > /dev/null; then
@@ -309,7 +324,7 @@ main() {
     done
     echo "Start $new"
     if ! docker start "$new" > /dev/null || ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
-      discard_replacement "$new"
+      discard_replacement "$new" "$replacement_stop_timeout"
       restart_previous "${stopped[@]}"
       fail "$new did not start or did not pass the health check; the previous containers were started again."
     fi
@@ -328,15 +343,11 @@ main() {
   local pending_signal=""
   local proxy_lock_fd="" route_switched=""
   if acquire_proxy_lock "$root/state/.proxy.lock" "$proxy_lock_timeout" "$service" proxy_lock_fd; then
-    # A signal during the route switch is only recorded: the route file and
-    # the proxy reload run as one step, and restoring the previous containers
-    # after a switch that succeeded would remove the replacement that the
-    # route names.
-    if (( ${#publish[@]} > 0 )); then
-      trap 'pending_signal=TERM' TERM
-      trap 'pending_signal=INT' INT
-      trap 'pending_signal=HUP' HUP
-    fi
+    # Defer signals until a rejected route is restored and its replacement
+    # removed, or until a successful switch is recorded in the state files.
+    trap 'pending_signal=TERM' TERM
+    trap 'pending_signal=INT' INT
+    trap 'pending_signal=HUP' HUP
     if write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol"; then
       route_switched=1
     fi
@@ -344,7 +355,7 @@ main() {
     exec {proxy_lock_fd}>&-
   fi
   if [[ -z "$route_switched" ]]; then
-    discard_replacement "$new"
+    discard_replacement "$new" "$replacement_stop_timeout"
     if (( ${#stopped[@]} > 0 )); then
       restart_previous "${stopped[@]}"
       fail "the route of $service was not switched; the previous containers were started again."
@@ -355,12 +366,14 @@ main() {
   # The proxy routes to the replacement now, so it is the deployed image.
   # Record it before the cleanup: a failed cleanup must not leave the state
   # files naming the image that the route no longer serves.
-  # The route switched, so the replacement is the deployed image and a signal
-  # no longer restores the previous containers.
-  trap - TERM INT HUP
   record_state "$state" "$image" || fail "the route of $service now serves $image, but the state files $state.current and $state.previous were not updated."
+  trap - TERM INT HUP
   if [[ -n "$pending_signal" ]]; then
-    echo "::error::received SIG$pending_signal during the route switch; the route of $service serves $new, so the previous containers stay stopped and their cleanup was skipped. Deploy the same image again to finish the cleanup." >&2
+    local previous_status="any running previous containers keep running"
+    if (( ${#publish[@]} > 0 )); then
+      previous_status="the previous containers stay stopped"
+    fi
+    echo "::error::received SIG$pending_signal during the route switch or image-state publication. The route of $service serves $new, $previous_status, and cleanup was skipped. Deploy the same image again to finish the cleanup." >&2
     exit $((128 + $(signal_number "$pending_signal")))
   fi
 
@@ -452,20 +465,21 @@ signal_number() {
 }
 
 # The trap handler of a service with UDP ports from the first stop until the
-# route switch. Arguments: the signal name, the replacement container and the
-# containers that were running. It removes the replacement and starts the
-# previous containers again (the route still names them), reports the signal
-# and exits with 128 plus the signal number. A container that does not start
+# route switch. Arguments: the signal name, the replacement container, its
+# stop timeout and the containers that were running. It removes the
+# replacement and starts the previous containers again (the route still
+# names them). It reports the signal and exits with 128 plus the signal number.
+# A container that does not start
 # is named by `restart_previous`. The handler ignores further signals so that
 # the restart finishes; starting a container that already runs is a no-op, so
 # a signal during the stop loop restores the containers that were not stopped
 # yet too.
 interrupted() {
-  local name="$1" replacement="$2"
-  shift 2
+  local name="$1" replacement="$2" stop_timeout="$3"
+  shift 3
   trap '' TERM INT HUP
   echo "::error::received SIG$name before the route of the service switched; the replacement $replacement is removed and the previous containers are started again." >&2
-  discard_replacement "$replacement"
+  discard_replacement "$replacement" "$stop_timeout"
   restart_previous "$@"
   exit $((128 + $(signal_number "$name")))
 }
@@ -512,9 +526,22 @@ upstream_alias() {
 # log read or removal must not hide the deployment failure that the caller
 # reports.
 discard_replacement() {
-  echo "Last log lines of $1:"
-  docker logs --tail 200 "$1" 2>&1 || true
-  docker rm --force "$1" > /dev/null || true
+  local replacement="$1" stop_timeout="$2"
+  echo "Last log lines of $replacement:"
+  docker logs --tail 200 "$replacement" 2>&1 || true
+  if [[ -z "$stop_timeout" ]]; then
+    docker rm --force "$replacement" > /dev/null || true
+    return
+  fi
+  # A running Accounts replacement can start a charge before it serves
+  # traffic. If graceful stop fails, leave the container for cleanup.
+  if ! docker stop --time "$stop_timeout" "$replacement" > /dev/null; then
+    echo "::error::docker stop failed for the replacement $replacement; it was not removed." >&2
+    return
+  fi
+  if ! docker rm "$replacement" > /dev/null; then
+    echo "::error::docker rm failed for the replacement $replacement." >&2
+  fi
 }
 
 # Waits until the container answers `GET /healthz` with a 2xx status. Redirects

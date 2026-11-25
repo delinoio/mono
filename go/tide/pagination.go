@@ -30,8 +30,12 @@ func paginate[Req, Res any, PReq interface {
 			req = PReq(new(Req))
 		}
 		page := proto.Clone(req).(PReq)
-		tokenField := page.ProtoReflect().Descriptor().Fields().ByName("page_token")
+		pageMessage := page.ProtoReflect()
+		tokenField := pageMessage.Descriptor().Fields().ByName("page_token")
 		seen := map[string]bool{}
+		if start := pageMessage.Get(tokenField).String(); start != "" {
+			seen[start] = true
+		}
 		for {
 			res, err := call(ctx, connect.NewRequest((*Req)(page)))
 			if err != nil {
@@ -53,7 +57,7 @@ func paginate[Req, Res any, PReq interface {
 				return
 			}
 			seen[next] = true
-			page.ProtoReflect().Set(tokenField, protoreflect.ValueOfString(next))
+			pageMessage.Set(tokenField, protoreflect.ValueOfString(next))
 		}
 	}
 }

@@ -5,10 +5,13 @@ package fcrt_test
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +25,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/fcrt"
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/uuidv7"
@@ -65,6 +69,14 @@ func (e *env) create(snapshotID string, memMiB int64, memoryRestore bool) *ownsa
 
 func (e *env) createSized(snapshotID string, memMiB, diskGiB int64, memoryRestore bool) *ownsandv1.SandboxStateEntry {
 	e.t.Helper()
+	entry, err := e.m.Create(context.Background(), createCommand(snapshotID, memMiB, diskGiB, memoryRestore))
+	if err != nil {
+		e.t.Fatalf("create: %v", err)
+	}
+	return entry
+}
+
+func createCommand(snapshotID string, memMiB, diskGiB int64, memoryRestore bool) *ownsandv1.CreateSandboxCommand {
 	id, _ := uuidv7.NewString()
 	now := time.Now()
 	cmd := &ownsandv1.CreateSandboxCommand{
@@ -83,11 +95,7 @@ func (e *env) createSized(snapshotID string, memMiB, diskGiB int64, memoryRestor
 	if snapshotID != "" {
 		cmd.Source = &ownsandv1.CreateSandboxCommand_SnapshotId{SnapshotId: snapshotID}
 	}
-	entry, err := e.m.Create(context.Background(), cmd)
-	if err != nil {
-		e.t.Fatalf("create: %v", err)
-	}
-	return entry
+	return cmd
 }
 
 func fieldOr(fields []string, i int) string {
@@ -125,6 +133,21 @@ func collectExec(frames []*ownsandv1.DataFrame) (string, *ownsandv1.ExecExited, 
 		return out.String(), nil, fmt.Errorf("exec stream of %d frames ended without an exited event", len(frames))
 	}
 	return out.String(), exited, nil
+}
+
+func execSucceeded(exited *ownsandv1.ExecExited) bool {
+	code, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
+	return ok && code != nil && code.ExitCode == 0
+}
+
+func hasRestoredMarker(out string, exited *ownsandv1.ExecExited) bool {
+	return execSucceeded(exited) && out == "state\n"
+}
+
+func hasLargerRootFilesystem(out string, exited *ownsandv1.ExecExited) bool {
+	// df reports 1 KiB blocks in the second field.
+	blocks, err := strconv.ParseInt(fieldOr(strings.Fields(out), 1), 10, 64)
+	return execSucceeded(exited) && err == nil && blocks >= 3<<19
 }
 
 // exec runs cmd in the sandbox and returns its output and its exited event,
@@ -198,7 +221,63 @@ func TestCollectExec(t *testing.T) {
 	})
 }
 
+func TestRequireExplicitExecSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		exited *ownsandv1.ExecExited
+		want   bool
+	}{
+		{name: "missing event"},
+		{name: "unset status", exited: &ownsandv1.ExecExited{}},
+		{name: "signal", exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_Signal{Signal: 15}}},
+		{name: "exit 7", exited: exitedEvent(7).GetExited()},
+		{name: "exit 0", exited: exitedEvent(0).GetExited(), want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, probe := range []struct {
+				name  string
+				out   string
+				check func(string, *ownsandv1.ExecExited) bool
+			}{
+				{name: "marker", out: "state\n", check: hasRestoredMarker},
+				{name: "capacity", out: "/dev/vda 2000000 200000 1800000 10% /\n", check: hasLargerRootFilesystem},
+			} {
+				t.Run(probe.name, func(t *testing.T) {
+					frames := []*ownsandv1.DataFrame{execFrame(stdoutEvent(probe.out))}
+					if tc.exited != nil {
+						frames = append(frames, execFrame(&ownsandv1.ExecEvent{
+							Event: &ownsandv1.ExecEvent_Exited{Exited: tc.exited},
+						}))
+					}
+					out, exited, err := collectExec(frames)
+					if tc.exited == nil {
+						if err == nil {
+							t.Fatal("stream without an exited event passed")
+						}
+					} else if err != nil {
+						t.Fatalf("collect exec: %v", err)
+					}
+					if out != probe.out {
+						t.Fatalf("output %q, want %q", out, probe.out)
+					}
+					if got := probe.check(out, exited); got != tc.want {
+						t.Fatalf("success = %t, want %t (output %q, exited %q)", got, tc.want, out, exited)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestFirecrackerIntegration(t *testing.T) {
+	testFirecrackerIntegration(t, false)
+}
+
+func TestFirecrackerLinuxBaseDiskSizing(t *testing.T) {
+	testFirecrackerIntegration(t, true)
+}
+
+func testFirecrackerIntegration(t *testing.T, diskSizing bool) {
 	binary, kernel, rootfs := os.Getenv(envBinary), os.Getenv(envKernel), os.Getenv(envRootfs)
 	if binary == "" || kernel == "" || rootfs == "" {
 		t.Skipf("set %s, %s and %s to boot real microVMs", envBinary, envKernel, envRootfs)
@@ -234,6 +313,10 @@ func TestFirecrackerIntegration(t *testing.T) {
 		rt.Close()
 	})
 	e := &env{t: t, m: m, d: d}
+	if diskSizing {
+		e.checkBaseDiskSizing(rt, rootfs, st.Path(store.VMsDir))
+		return
+	}
 
 	start := time.Now()
 	sb := e.create("", 256, false)
@@ -242,8 +325,8 @@ func TestFirecrackerIntegration(t *testing.T) {
 		t.Fatalf("sandbox %v", sb)
 	}
 	out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo hello; uname -s; echo state > /root/marker; df -k / | tail -1")
-	if ex == nil || ex.GetExitCode() != 0 || !strings.Contains(out, "hello\nLinux\n") {
-		t.Fatalf("exec output %q exited %v", out, ex)
+	if !execSucceeded(ex) || !strings.Contains(out, "hello\nLinux\n") {
+		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	t.Logf("guest df: %s", strings.TrimSpace(out))
 	if _, err := m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: sb.GetSandboxId()}); err != nil {
@@ -252,8 +335,8 @@ func TestFirecrackerIntegration(t *testing.T) {
 	if _, err := m.Resume(context.Background(), &ownsandv1.ResumeSandboxCommand{SandboxId: sb.GetSandboxId()}); err != nil {
 		t.Fatal(err)
 	}
-	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); ex == nil || ex.GetExitCode() != 0 || out != "state\n" {
-		t.Fatalf("after resume %q", out)
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); !hasRestoredMarker(out, ex) {
+		t.Fatalf("after resume %q exited %q", out, ex)
 	}
 	snapID, _ := uuidv7.NewString()
 	snap, err := m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sb.GetSandboxId()})
@@ -266,15 +349,15 @@ func TestFirecrackerIntegration(t *testing.T) {
 	if restored.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE {
 		t.Fatalf("restore path %v", restored.GetRestorePath())
 	}
-	if out, ex := e.exec(restored.GetSandboxId(), "/bin/cat", "/root/marker"); ex == nil || ex.GetExitCode() != 0 || out != "state\n" {
-		t.Fatalf("restored sandbox %q", out)
+	if out, ex := e.exec(restored.GetSandboxId(), "/bin/cat", "/root/marker"); !hasRestoredMarker(out, ex) {
+		t.Fatalf("restored sandbox %q exited %q", out, ex)
 	}
 	cold := e.create(snapID, 512, true)
 	if cold.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
 		t.Fatalf("cold restore path %v", cold.GetRestorePath())
 	}
-	if out, ex := e.exec(cold.GetSandboxId(), "/bin/cat", "/root/marker"); ex == nil || ex.GetExitCode() != 0 || out != "state\n" {
-		t.Fatalf("cold-booted sandbox %q", out)
+	if out, ex := e.exec(cold.GetSandboxId(), "/bin/cat", "/root/marker"); !hasRestoredMarker(out, ex) {
+		t.Fatalf("cold-booted sandbox %q exited %q", out, ex)
 	}
 	// A larger disk never restores the memory state: the sandbox boots the
 	// snapshot disk cold and the guest sees the requested capacity.
@@ -282,15 +365,13 @@ func TestFirecrackerIntegration(t *testing.T) {
 	if grown.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
 		t.Fatalf("larger-disk restore path %v", grown.GetRestorePath())
 	}
-	if out, _ := e.exec(grown.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" {
-		t.Fatalf("larger-disk sandbox %q", out)
+	if out, ex := e.exec(grown.GetSandboxId(), "/bin/cat", "/root/marker"); !hasRestoredMarker(out, ex) {
+		t.Fatalf("larger-disk sandbox %q exited %q", out, ex)
 	}
 	// The root file system of the 2 GiB disk is larger than the 1 GiB snapshot
-	// disk could hold (df reports 1 KiB blocks in the second field).
-	dfOut, _ := e.exec(grown.GetSandboxId(), "/bin/sh", "-c", "df -k / | tail -1")
-	fields := strings.Fields(dfOut)
-	if blocks, err := strconv.ParseInt(fieldOr(fields, 1), 10, 64); err != nil || blocks < 3<<19 {
-		t.Fatalf("larger-disk root file system %q", dfOut)
+	// disk could hold.
+	if out, ex := e.exec(grown.GetSandboxId(), "/bin/sh", "-c", "df -k / | tail -1"); !hasLargerRootFilesystem(out, ex) {
+		t.Fatalf("larger-disk root file system %q exited %q", out, ex)
 	}
 	// A base-image create with a larger disk grows the image file on the host
 	// only; the guest helper grows the root file system online at boot.
@@ -314,5 +395,67 @@ func TestFirecrackerIntegration(t *testing.T) {
 	}
 	if len(ids) != 0 {
 		t.Fatalf("microVMs still run: %v", ids)
+	}
+}
+
+func (e *env) checkBaseDiskSizing(rt vmruntime.Runtime, rootfs, vmsDir string) {
+	e.t.Helper()
+	digest := func() [sha256.Size]byte {
+		file, err := os.Open(rootfs)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		defer file.Close()
+		hash := sha256.New()
+		n, err := io.Copy(hash, file)
+		if err != nil || n != 2<<30 {
+			e.t.Fatalf("read base image: %d bytes, want 2 GiB, error %v", n, err)
+		}
+		return [sha256.Size]byte(hash.Sum(nil))
+	}
+	original := digest()
+	ctx := e.t.Context()
+	cmd := createCommand("", 256, 1, false)
+	cmd.Limits.DiskGib = 1
+	entry, err := e.m.Create(ctx, cmd)
+	var commandErr *sandboxes.CommandError
+	if !errors.As(err, &commandErr) || commandErr.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION ||
+		entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED ||
+		entry.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+		e.t.Fatalf("undersized create: entry %v, error %v", entry, err)
+	}
+	if e.m.Busy() {
+		e.t.Fatal("undersized create left an active sandbox")
+	}
+	if ids, err := rt.Running(ctx); err != nil || len(ids) != 0 {
+		e.t.Fatalf("running VMs after undersized create: %v, error %v", ids, err)
+	}
+	if _, err := os.Stat(filepath.Join(vmsDir, cmd.GetSandboxId())); !errors.Is(err, os.ErrNotExist) {
+		e.t.Fatalf("undersized create left a VM directory: %v", err)
+	}
+	for _, diskGiB := range []int64{2, 3} {
+		cmd := createCommand("", 256, diskGiB, false)
+		cmd.Limits.DiskGib = diskGiB
+		entry, err := e.m.Create(ctx, cmd)
+		if err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			e.t.Fatalf("create with %d GiB: entry %v, error %v", diskGiB, entry, err)
+		}
+		id := cmd.GetSandboxId()
+		info, err := os.Stat(filepath.Join(vmsDir, id, "rootfs.ext4"))
+		if err != nil || info.Size() != diskGiB<<30 {
+			e.t.Fatalf("disk file for %d GiB request: %v, error %v", diskGiB, info, err)
+		}
+		out, ex := e.exec(id, "/bin/cat", "/sys/block/vda/size")
+		want := strconv.FormatInt((diskGiB<<30)/512, 10)
+		if !execSucceeded(ex) || strings.TrimSpace(out) != want {
+			e.t.Fatalf("guest disk sectors = %q, want %s, exit %v", out, want, ex)
+		}
+		if entry, err := e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil ||
+			entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			e.t.Fatalf("delete: entry %v, error %v", entry, err)
+		}
+	}
+	if digest() != original {
+		e.t.Fatal("the base image changed")
 	}
 }

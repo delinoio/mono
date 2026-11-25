@@ -40,16 +40,17 @@ const APIKeyPrefix = "tide_"
 // TokenSource returns the current credential: a Logto access token for the
 // API resource https://tide.api.delino.io, or a personal API key. The SDK
 // calls it before every RPC, so it should cache a token until shortly
-// before it expires.
+// before it expires. An empty token or a failure other than a network or
+// context error produces a [CredentialError].
 type TokenSource func(ctx context.Context) (string, error)
 
 // Options configures a Client.
 type Options struct {
 	// BaseURL is the API origin, for example https://tide.api.delino.io or
-	// http://127.0.0.1:18400 for a local control plane. An http:// origin
-	// uses HTTP/2 without TLS (h2c with prior knowledge) or HTTP/1.1. It
-	// must not have a path, query, fragment or user info. Empty means
-	// DefaultBaseURL.
+	// http://127.0.0.1:18400 for a local control plane. The origin must
+	// have a hostname. An http:// origin uses HTTP/2 without TLS (h2c
+	// with prior knowledge) or HTTP/1.1. It must not have a path, query,
+	// fragment or user info. Empty means DefaultBaseURL.
 	BaseURL string
 	// APIKey is a personal API key (tide_...). Set exactly one of APIKey and
 	// TokenSource.
@@ -115,7 +116,8 @@ func New(opts Options) (*Client, error) {
 	}
 	base = strings.TrimRight(base, "/")
 	origin, err := url.Parse(base)
-	if err != nil || origin.Host == "" || (origin.Scheme != "https" && origin.Scheme != "http") {
+	// Host can contain a port even when Hostname is empty.
+	if err != nil || origin.Hostname() == "" || (origin.Scheme != "https" && origin.Scheme != "http") {
 		return nil, errors.New("tide: invalid base URL: want an http or https origin")
 	}
 	// url.Parse drops an empty fragment and records a bare "?" only as

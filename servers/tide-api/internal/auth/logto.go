@@ -45,11 +45,14 @@ const clockLeeway = 30 * time.Second
 const (
 	jwksRefreshInterval = 10 * time.Minute
 	jwksMinRefresh      = time.Minute
+	jwksFetchTimeout    = 10 * time.Second
 )
 
 // ErrInvalidToken is returned for every token that fails validation. The
 // caller turns it into unauthenticated without the detail.
 var ErrInvalidToken = errors.New("invalid access token")
+
+var errUnknownKeyID = errors.New("unknown key id")
 
 // LogtoConfig configures the Logto access token validator.
 type LogtoConfig struct {
@@ -70,20 +73,23 @@ type LogtoConfig struct {
 type LogtoValidator struct {
 	cfg LogtoConfig
 
+	// mu guards cache and refresh state. The fetch and file read run without it.
 	mu        sync.Mutex
 	keys      jose.JSONWebKeySet
 	fetchedAt time.Time
-	// attemptedAt is the start time of the last refresh attempt, successful
-	// or not. It gates both refresh paths so that a failing key set endpoint
-	// is not fetched again within jwksMinRefresh while it holds the mutex.
+	// attemptedAt starts the cooldown for both successful and failed fetches.
 	attemptedAt time.Time
+	inflight    *jwksFetch
+
+	// fetchTimeout bounds one HTTP fetch. Tests can shorten it.
+	fetchTimeout time.Duration
 }
 
 // NewLogtoValidator returns a validator. It does not fetch keys until the
 // first token arrives.
 func NewLogtoValidator(cfg LogtoConfig) *LogtoValidator {
 	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: 10 * time.Second}
+		cfg.Client = &http.Client{Timeout: jwksFetchTimeout}
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -91,7 +97,7 @@ func NewLogtoValidator(cfg LogtoConfig) *LogtoValidator {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &LogtoValidator{cfg: cfg}
+	return &LogtoValidator{cfg: cfg, fetchTimeout: jwksFetchTimeout}
 }
 
 type logtoClaims struct {
@@ -144,33 +150,78 @@ func (v *LogtoValidator) Validate(ctx context.Context, raw string) (string, erro
 	return claims.Subject, nil
 }
 
+// key returns cached keys immediately. A caller that needs an uncached key
+// waits for the shared fetch or for its own context to end.
 func (v *LogtoValidator) key(ctx context.Context, kid string) (*jose.JSONWebKey, error) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	now := v.cfg.Now()
-	cooling := func() bool {
-		return !v.attemptedAt.IsZero() && now.Sub(v.attemptedAt) < jwksMinRefresh
-	}
-	if (v.fetchedAt.IsZero() || now.Sub(v.fetchedAt) > jwksRefreshInterval) && !cooling() {
-		if err := v.refreshLocked(ctx); err != nil && v.fetchedAt.IsZero() {
-			return nil, err
-		}
-	}
-	if k := v.findLocked(kid); k != nil {
-		return k, nil
-	}
-	// An unknown key ID refreshes the key set at most once per
-	// jwksMinRefresh, counted from the last attempt even when it failed.
-	if cooling() {
-		return nil, errors.New("unknown key id")
-	}
-	if err := v.refreshLocked(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
+		v.mu.Unlock()
 		return nil, err
 	}
-	if k := v.findLocked(kid); k != nil {
+
+	now := v.cfg.Now()
+	k := v.findLocked(kid)
+	cooling := !v.attemptedAt.IsZero() && now.Sub(v.attemptedAt) < jwksMinRefresh
+	stale := v.fetchedAt.IsZero() || now.Sub(v.fetchedAt) > jwksRefreshInterval
+	call := v.inflight
+	if call == nil && !cooling && (k == nil || stale) {
+		call = v.startFetchLocked(context.WithoutCancel(ctx), now)
+	}
+	v.mu.Unlock()
+
+	if k != nil {
 		return k, nil
 	}
-	return nil, errors.New("unknown key id")
+	if call == nil {
+		return nil, errUnknownKeyID
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-call.done:
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if call.err != nil {
+		return nil, call.err
+	}
+
+	v.mu.Lock()
+	k = v.findLocked(kid)
+	v.mu.Unlock()
+	if k == nil {
+		return nil, errUnknownKeyID
+	}
+	return k, nil
+}
+
+// jwksFetch is one shared load. The fetch sets err before closing done.
+type jwksFetch struct {
+	done chan struct{}
+	err  error
+}
+
+// startFetchLocked records the attempt while v.mu is held. The goroutine
+// loads the key set outside the lock and publishes the result when it finishes.
+func (v *LogtoValidator) startFetchLocked(ctx context.Context, now time.Time) *jwksFetch {
+	call := &jwksFetch{done: make(chan struct{})}
+	v.inflight = call
+	v.attemptedAt = now
+	go func() {
+		set, err := v.load(ctx)
+		v.mu.Lock()
+		if err == nil {
+			v.keys = set
+			v.fetchedAt = v.cfg.Now()
+		}
+		call.err = err
+		v.inflight = nil
+		close(call.done)
+		v.mu.Unlock()
+	}()
+	return call
 }
 
 func (v *LogtoValidator) findLocked(kid string) *jose.JSONWebKey {
@@ -183,13 +234,8 @@ func (v *LogtoValidator) findLocked(kid string) *jose.JSONWebKey {
 	return nil
 }
 
-func (v *LogtoValidator) refreshLocked(ctx context.Context) error {
-	// A caller that is already gone must not arm the process-wide cooldown
-	// for later live callers.
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	v.attemptedAt = v.cfg.Now()
+func (v *LogtoValidator) load(ctx context.Context) (jose.JSONWebKeySet, error) {
+	var set jose.JSONWebKeySet
 	var body []byte
 	var err error
 	if v.cfg.JWKSFile != "" {
@@ -199,23 +245,18 @@ func (v *LogtoValidator) refreshLocked(ctx context.Context) error {
 	}
 	if err != nil {
 		v.cfg.Logger.Warn("logto_jwks_fetch_failed", slog.Any("error", err))
-		return err
+		return set, err
 	}
-	var set jose.JSONWebKeySet
 	if err := json.Unmarshal(body, &set); err != nil {
 		v.cfg.Logger.Warn("logto_jwks_parse_failed", slog.Any("error", err))
-		return err
+		return jose.JSONWebKeySet{}, err
 	}
-	v.keys = set
-	v.fetchedAt = v.cfg.Now()
 	v.cfg.Logger.Info("logto_jwks_loaded", slog.Int("keys", len(set.Keys)))
-	return nil
+	return set, nil
 }
 
 func (v *LogtoValidator) fetch(ctx context.Context) ([]byte, error) {
-	// The fetch serves every caller and arms a shared cooldown, so one
-	// caller's cancellation must not abort it; only the timeout bounds it.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, v.fetchTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, v.cfg.JWKSURL, nil)
 	if err != nil {
