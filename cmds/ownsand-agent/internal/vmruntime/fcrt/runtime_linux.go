@@ -438,12 +438,16 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			cleanup()
 			return nil, fmt.Errorf("fcrt: restore memory state: %w", cerr)
 		}
-		// The hypervisor could not read the saved state: boot the snapshot
-		// disk cold.
 		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
 		if err := r.stop(v); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("fcrt: stop the failed restore process: %w", err)
+		}
+		// The guest may have written to the working disk before the load
+		// response failed. Restore the captured bytes after the process exits.
+		if err := copyDisk(ctx, src, disk); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("fcrt: prepare fallback disk: %w", err)
 		}
 		if err := growDisk(ctx, disk, diskGiB<<30); err != nil {
 			cleanup()

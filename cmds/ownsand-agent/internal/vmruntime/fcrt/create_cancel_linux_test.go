@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -42,8 +43,10 @@ const (
 
 // Answers of the fake to PUT /snapshot/load.
 const (
-	loadBlock = "block" // never answers, until the process is killed
-	loadFail  = "fail"  // HTTP 400, as a state file that Firecracker cannot read
+	loadBlock         = "block"           // never answers, until the process is killed
+	loadFail          = "fail"            // HTTP 400, as a state file that Firecracker cannot read
+	loadResumeAndDrop = "resume-and-drop" // the guest writes to disk before the response is lost
+	capturedDisk      = "captured snapshot"
 )
 
 // The helper runs from init, which precedes TestMain, so TestMain stays
@@ -72,6 +75,13 @@ func init() {
 	prior, _ := os.ReadFile(logPath)
 	launch := strings.Count(string(prior), "launch ") + 1
 	note(fmt.Sprintf("launch %d pid %d", launch, os.Getpid()))
+	if loadMode == loadResumeAndDrop && launch > 1 {
+		disk, err := os.ReadFile(diskFile)
+		if err != nil {
+			os.Exit(4)
+		}
+		note("fallback disk: " + string(disk))
+	}
 	l, err := net.Listen("unix", sock)
 	if err != nil {
 		os.Exit(2)
@@ -88,6 +98,22 @@ func init() {
 		switch {
 		case req.Method == http.MethodPut && req.URL.Path == "/snapshot/load" && loadMode == loadBlock:
 			<-req.Context().Done()
+		case req.Method == http.MethodPut && req.URL.Path == "/snapshot/load" && loadMode == loadResumeAndDrop:
+			var load snapshotLoad
+			if err := json.NewDecoder(req.Body).Decode(&load); err != nil || !load.ResumeVM {
+				fault(w, "expected a snapshot load with resume")
+				return
+			}
+			if err := os.WriteFile(diskFile, []byte("changed by resumed guest"), 0o600); err != nil {
+				fault(w, err.Error())
+				return
+			}
+			note("restore changed the working disk")
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				os.Exit(5)
+			}
+			conn.Close()
 		case req.Method == http.MethodPut && req.URL.Path == "/snapshot/load":
 			fault(w, "cannot load the snapshot")
 		case req.Method == http.MethodPut && req.URL.Path == "/vsock" && launch > 1:
@@ -161,7 +187,7 @@ func newCreateFixture(t *testing.T, loadMode string) *createFixture {
 	// The snapshot and the spec both request a disk of 0 GiB, so the sizes
 	// match (a memory-state restore needs equal sizes) and the cold boot has
 	// nothing to grow. A larger sparse disk would only slow the copy.
-	if err := os.WriteFile(filepath.Join(snap, snapDisk), []byte("disk"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(snap, snapDisk), []byte(capturedDisk), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	res := &ownsandv1.Resources{VcpuCount: 1, MemoryMib: 128}
@@ -429,7 +455,7 @@ func TestCreateContextEndedReapsSurvivingProcessOnEarlyExit(t *testing.T) {
 // A snapshot-load error with a live context still stops the process of the
 // attempt and boots the snapshot disk cold with a new process.
 func TestCreateLoadErrorWithLiveContextBootsCold(t *testing.T) {
-	f := newCreateFixture(t, loadFail)
+	f := newCreateFixture(t, loadResumeAndDrop)
 	_, err := f.r.Create(context.Background(), f.spec)
 	if err == nil {
 		t.Fatal("create succeeded although the fake cold boot ends in an error")
@@ -444,12 +470,37 @@ func TestCreateLoadErrorWithLiveContextBootsCold(t *testing.T) {
 		t.Fatal("the create did not log the cold-boot fallback")
 	}
 	events := f.events(t)
-	var sawDrive bool
-	for _, e := range events {
-		sawDrive = sawDrive || e == "2 PUT /drives/rootfs"
+	for _, want := range []string{"restore changed the working disk", "fallback disk: " + capturedDisk, "2 PUT /drives/rootfs"} {
+		if !slices.Contains(events, want) {
+			t.Fatalf("missing event %q: %q", want, events)
+		}
 	}
-	if !sawDrive {
-		t.Fatalf("the cold boot never attached the snapshot disk: %q", events)
+	saved, err := os.ReadFile(filepath.Join(f.spec.Snapshot.Dir, snapDisk))
+	if err != nil || string(saved) != capturedDisk {
+		t.Fatalf("saved snapshot disk = %q, err = %v", saved, err)
+	}
+	requireProcessGone(t, f.firstPID(t))
+	requireReleased(t, f)
+}
+
+func TestCreateFallbackCopyFailureReleasesVM(t *testing.T) {
+	f := newCreateFixture(t, loadFail)
+	kill := f.r.signalGroup
+	removeSnapshot := sync.OnceFunc(func() {
+		if err := os.Remove(filepath.Join(f.spec.Snapshot.Dir, snapDisk)); err != nil {
+			t.Errorf("remove snapshot before fallback: %v", err)
+		}
+	})
+	f.r.signalGroup = func(pid int) error {
+		removeSnapshot()
+		return kill(pid)
+	}
+	_, err := f.r.Create(context.Background(), f.spec)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("create error = %v, want missing snapshot disk", err)
+	}
+	if n := f.launches(t); n != 1 {
+		t.Fatalf("%d firecracker launches, want 1", n)
 	}
 	requireProcessGone(t, f.firstPID(t))
 	requireReleased(t, f)
