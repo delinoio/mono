@@ -2,7 +2,10 @@
 
 package dataplane
 
-import "time"
+import (
+	"container/list"
+	"time"
+)
 
 // Revocation tombstones. The control plane may revoke a session that the
 // agent has not registered yet: the offer is answered on its own goroutine,
@@ -24,7 +27,6 @@ const (
 type tombstone struct {
 	id       string
 	expireAt time.Time
-	seq      uint64
 }
 
 // tombstones is the bounded set of session IDs that were revoked before the
@@ -32,11 +34,10 @@ type tombstone struct {
 // Every tombstone has the same lifetime, so the insertion order is also the
 // expiry order and an expiry sweep or a size trim pops the head of the queue.
 type tombstones struct {
-	// live maps a session ID to the sequence number of its queue entry; a
-	// queue entry whose sequence number differs was consumed or replaced.
-	live  map[string]uint64
-	queue []tombstone
-	seq   uint64
+	// Map each session ID to its queue entry so consuming a tombstone
+	// removes it from both collections immediately.
+	live  map[string]*list.Element
+	queue list.List
 }
 
 // add records a tombstone for id. A repeated revocation keeps the first one.
@@ -46,14 +47,12 @@ func (t *tombstones) add(id string, now time.Time) {
 		return
 	}
 	if t.live == nil {
-		t.live = map[string]uint64{}
+		t.live = make(map[string]*list.Element)
 	}
-	t.seq++
-	t.live[id] = t.seq
-	t.queue = append(t.queue, tombstone{id: id, expireAt: now.Add(tombstoneTTL), seq: t.seq})
-	for len(t.live) > maxTombstones {
-		t.popHead()
+	if t.queue.Len() == maxTombstones {
+		t.remove(t.queue.Front())
 	}
+	t.live[id] = t.queue.PushBack(tombstone{id: id, expireAt: now.Add(tombstoneTTL)})
 }
 
 // has reports whether id has a live tombstone.
@@ -65,32 +64,28 @@ func (t *tombstones) has(id string, now time.Time) bool {
 
 // take reports whether id has a live tombstone and consumes it.
 func (t *tombstones) take(id string, now time.Time) bool {
-	if !t.has(id, now) {
+	t.sweep(now)
+	entry, ok := t.live[id]
+	if !ok {
 		return false
 	}
-	delete(t.live, id)
+	t.remove(entry)
 	return true
 }
 
-// sweep drops the tombstones that expired and the queue entries of consumed
-// ones at the head.
+// sweep drops expired tombstones from the head.
 func (t *tombstones) sweep(now time.Time) {
-	for len(t.queue) > 0 {
-		h := t.queue[0]
-		if t.live[h.id] == h.seq && now.Before(h.expireAt) {
+	for entry := t.queue.Front(); entry != nil; entry = t.queue.Front() {
+		if now.Before(entry.Value.(tombstone).expireAt) {
 			return
 		}
-		t.popHead()
+		t.remove(entry)
 	}
 }
 
-func (t *tombstones) popHead() {
-	h := t.queue[0]
-	t.queue[0] = tombstone{}
-	t.queue = t.queue[1:]
-	if t.live[h.id] == h.seq {
-		delete(t.live, h.id)
-	}
+func (t *tombstones) remove(entry *list.Element) {
+	record := t.queue.Remove(entry).(tombstone)
+	delete(t.live, record.id)
 }
 
 func (t *tombstones) len() int { return len(t.live) }

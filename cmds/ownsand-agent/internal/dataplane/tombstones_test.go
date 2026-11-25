@@ -13,7 +13,6 @@ func TestTombstoneTakeConsumes(t *testing.T) {
 	var ts tombstones
 	now := time.Unix(1000, 0)
 	ts.add("a", now)
-	ts.add("a", now.Add(time.Minute)) // a repeated revocation keeps the first tombstone
 	if !ts.has("a", now) || ts.has("b", now) {
 		t.Fatal("has: want a only")
 	}
@@ -30,6 +29,7 @@ func TestTombstoneExpiresAfterSessionLifetime(t *testing.T) {
 	now := time.Unix(1000, 0)
 	ts.add("a", now)
 	ts.add("b", now.Add(30*time.Minute))
+	ts.add("a", now.Add(45*time.Minute)) // A repeated revocation keeps the first expiry.
 	if !ts.has("a", now.Add(tombstoneTTL-time.Nanosecond)) {
 		t.Fatal("tombstone expired before the session lifetime")
 	}
@@ -63,16 +63,44 @@ func TestTombstoneCapDropsOldest(t *testing.T) {
 	}
 }
 
-// A consumed tombstone leaves a stale queue entry; a new tombstone for the
-// same ID must not be deleted by the stale entry reaching the head.
+func TestTombstoneTakeRemovesQueueEntryOutOfOrder(t *testing.T) {
+	var ts tombstones
+	now := time.Unix(1000, 0)
+	for i := 0; i < maxTombstones; i++ {
+		ts.add(fmt.Sprintf("s%d", i), now)
+	}
+	for i := 1; i <= 3; i++ {
+		id := fmt.Sprintf("s%d", i)
+		if !ts.take(id, now) {
+			t.Fatalf("take did not find %s", id)
+		}
+		if got := ts.queue.Len(); got != maxTombstones-1 {
+			t.Fatalf("queue length after take = %d, want %d", got, maxTombstones-1)
+		}
+		ts.add(id, now)
+		if got := ts.queue.Len(); got != maxTombstones {
+			t.Fatalf("queue length after re-add = %d, want %d", got, maxTombstones)
+		}
+	}
+	ts.add("new", now)
+	if ts.has("s0", now) || !ts.has("s4", now) {
+		t.Fatal("capacity eviction did not drop the oldest live record")
+	}
+}
+
 func TestTombstoneReaddAfterTake(t *testing.T) {
 	var ts tombstones
 	now := time.Unix(1000, 0)
+	ts.add("head", now)
 	ts.add("a", now)
-	ts.take("a", now)
+	if !ts.take("a", now) {
+		t.Fatal("take did not find a")
+	}
 	ts.add("a", now.Add(time.Minute))
-	ts.add("b", now.Add(time.Minute))
-	if !ts.has("a", now.Add(time.Minute)) || ts.len() != 2 {
-		t.Fatalf("re-added tombstone lost, len = %d", ts.len())
+	if !ts.has("a", now.Add(tombstoneTTL)) || ts.len() != 1 {
+		t.Fatalf("re-added tombstone did not survive the original expiry, len = %d", ts.len())
+	}
+	if ts.has("a", now.Add(tombstoneTTL+time.Minute)) {
+		t.Fatal("re-added tombstone outlived its own expiry")
 	}
 }
