@@ -251,9 +251,10 @@ func TestControlCursorReacquireWithEqualCursor(t *testing.T) {
 	}
 }
 
-func TestControlCursorUnsetCursorAcquiresWithoutWriteBack(t *testing.T) {
+func TestControlCursorRetryEstablishesBaselineWithoutDeliveringEvents(t *testing.T) {
 	h := newCursorHarness(t, 2)
-	h.latest = 2
+	h.acquire(0, errors.New("database unavailable"))
+	h.latest, h.latestErr = 2, nil
 	h.c.processEvents(context.Background())
 	if len(h.delivered) != 0 {
 		t.Fatalf("delivered = %v, want none", h.delivered)
@@ -265,6 +266,7 @@ func TestControlCursorUnsetCursorAcquiresWithoutWriteBack(t *testing.T) {
 
 func TestControlCursorInitSupersededByLeaseLost(t *testing.T) {
 	h := newCursorHarness(t, 10)
+	h.acquire(0, errors.New("database unavailable"))
 	h.interceptFirstLatestID(func() (int64, error) {
 		h.c.LeaseLost()
 		return 5, nil
@@ -276,10 +278,16 @@ func TestControlCursorInitSupersededByLeaseLost(t *testing.T) {
 	if len(h.delivered) != 0 {
 		t.Fatalf("delivered = %v, want none", h.delivered)
 	}
+	h.latest, h.latestErr = 10, nil
+	h.c.processEvents(context.Background())
+	if got := h.cursor(); got != -1 {
+		t.Fatalf("cursor = %d, want -1 after polling without retry permission", got)
+	}
 }
 
 func TestControlCursorInitSupersededByReacquire(t *testing.T) {
 	h := newCursorHarness(t, 10)
+	h.acquire(0, errors.New("database unavailable"))
 	h.interceptFirstLatestID(func() (int64, error) {
 		h.c.LeaseLost()
 		h.acquire(8, nil)
@@ -298,38 +306,37 @@ func TestControlCursorInitSupersededByReacquire(t *testing.T) {
 	}
 }
 
-func TestControlCursorInitSupersededByAcquireDuringInit(t *testing.T) {
-	// OnAcquire runs while the event processor already sees the lease as
-	// held: its LeaseAcquired finishes first, with and without a failure of
-	// the processor's own LatestID read.
-	cases := []struct {
-		name  string
-		first func() (int64, error)
-	}{
-		{"stale id", func() (int64, error) { return 2, nil }},
-		{"failed read", func() (int64, error) { return 0, errors.New("db error") }},
+func TestControlCursorRetryCannotSeedNewPeriod(t *testing.T) {
+	h := newCursorHarness(t, 10)
+	h.c.S.Lease = &ownershipLease{held: true}
+	h.c.S.BaselineReady = h.c.baselineReady
+	readErr := errors.New("database unavailable")
+	h.acquire(0, readErr)
+	h.interceptFirstLatestID(func() (int64, error) {
+		h.c.LeaseLost()
+		h.acquire(0, readErr)
+		return 2, nil
+	})
+	h.c.processEvents(context.Background())
+	if got := h.cursor(); got != -1 {
+		t.Fatalf("new lease period got the old retry's cursor %d", got)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newCursorHarness(t, 10)
-			h.interceptFirstLatestID(func() (int64, error) {
-				h.acquire(7, nil)
-				return tc.first()
-			})
-			h.c.processEvents(context.Background())
-			if got := h.cursor(); got != 7 {
-				t.Fatalf("cursor = %d, want 7", got)
-			}
-			if len(h.delivered) != 0 {
-				t.Fatalf("delivered = %v, want none", h.delivered)
-			}
-		})
+	if ok, n := admit(h.c.S); ok || n != 0 {
+		t.Fatalf("admitted = %v, registered = %d before the new baseline; want refused", ok, n)
+	}
+	h.latest, h.latestErr = 7, nil
+	h.c.processEvents(context.Background())
+	if got := h.cursor(); got != 7 {
+		t.Fatalf("cursor = %d, want the new lease period's baseline 7", got)
+	}
+	if ok, n := admit(h.c.S); !ok || n != 1 {
+		t.Fatalf("admitted = %v, registered = %d with the new baseline; want admitted once", ok, n)
 	}
 }
 
 func TestControlCursorInitFailedReadLeavesStateUnchanged(t *testing.T) {
 	h := newCursorHarness(t, 2)
-	h.latestErr = errors.New("database unavailable")
+	h.acquire(0, errors.New("database unavailable"))
 	h.c.processEvents(context.Background())
 	if got := h.cursor(); got != -1 {
 		t.Fatalf("cursor = %d, want -1 after a failed LatestID read", got)
@@ -337,8 +344,8 @@ func TestControlCursorInitFailedReadLeavesStateUnchanged(t *testing.T) {
 	h.c.mu.Lock()
 	gen := h.c.cursorGen
 	h.c.mu.Unlock()
-	if gen != 0 {
-		t.Fatalf("cursorGen = %d, want 0 (an initialization is not a lease transition)", gen)
+	if gen != 1 {
+		t.Fatalf("cursorGen = %d, want 1 after the failed retry", gen)
 	}
 	// The next poll repeats the read.
 	h.latest, h.latestErr = 2, nil
@@ -350,13 +357,15 @@ func TestControlCursorInitFailedReadLeavesStateUnchanged(t *testing.T) {
 
 func TestControlCursorInitKeepsGeneration(t *testing.T) {
 	h := newCursorHarness(t, 2)
-	h.latest = 2
+	h.acquire(0, errors.New("database unavailable"))
+	h.latest, h.latestErr = 2, nil
 	h.c.processEvents(context.Background())
 	h.c.mu.Lock()
 	gen := h.c.cursorGen
+	retry := h.c.retryBaseline
 	h.c.mu.Unlock()
-	if gen != 0 {
-		t.Fatalf("cursorGen = %d, want 0 (an initialization is not a lease transition)", gen)
+	if gen != 1 || retry {
+		t.Fatalf("cursorGen = %d, retry allowed = %t; want 1, false after a successful retry", gen, retry)
 	}
 }
 
