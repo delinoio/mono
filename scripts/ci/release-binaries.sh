@@ -693,9 +693,17 @@ r2_get() {
 }
 
 r2_put() {
-  local key="$1" file="$2" type="$3"
-  curl --config <(r2_config) -fsS --retry 3 -X PUT -H "Content-Type: $type" \
-    -H "Cache-Control: no-cache" --data-binary "@$file" "$(r2_url "$key")" -o /dev/null < /dev/null
+  local key="$1" file="$2" type="$3" code
+  code="$(curl --config <(r2_config) -sS --retry 3 -o /dev/null -w '%{http_code}' \
+    -X PUT -H "Content-Type: $type" -H "Cache-Control: no-cache" \
+    --data-binary "@$file" "$(r2_url "$key")" < /dev/null)" || {
+    echo "::error::Could not upload $key to the releases bucket (curl exit $?, HTTP ${code:-unknown})." >&2
+    return 1
+  }
+  if [[ "$code" != 2[0-9][0-9] ]]; then
+    echo "::error::Uploading $key to the releases bucket returned HTTP $code." >&2
+    return 1
+  fi
 }
 
 require_r2() {
@@ -774,8 +782,8 @@ upload_manifests() {
     done
     # The manifest first, then its signature: an agent that reads between
     # the two uploads fails verification and retries with a later update.
-    r2_put "$key" "$dir/$name/manifest.json" application/json
-    r2_put "$key.sig" "$dir/$name/manifest.json.sig" text/plain
+    r2_put "$key" "$dir/$name/manifest.json" application/json || return 1
+    r2_put "$key.sig" "$dir/$name/manifest.json.sig" text/plain || return 1
     # The public URL is the custom domain of the bucket. A mismatch is a
     # warning only: the objects are already published, and a CDN cache can
     # serve the previous object for a short time.
