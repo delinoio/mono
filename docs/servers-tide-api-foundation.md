@@ -611,6 +611,8 @@ The server reads these environment variables without a service prefix. It remove
 | `GITHUB_API_ORIGIN`           | no       | `https://api.github.com`        | Origin of the GitHub REST API. Only tests change it (a fake GitHub API).                                       |
 | `GITHUB_WEB_ORIGIN`           | no       | `https://github.com`            | Origin of the installation page and of `POST /login/oauth/access_token`. Only tests change it.                 |
 
+The Logto endpoint URLs and the OwnSand, public and GitHub origins require a hostname. If a hostname is missing, the startup error names the variable and omits its value.
+
 - When none of the six `GITHUB_APP_*` variables is set, the GitHub layer is off, so development setups without a GitHub App still start: the `GitHubService` RPCs fail with `failed_precondition` after authorization, `POST /webhooks/github` answers `503`, and no GitHub job is matched. Some but not all of the six variables stop the server at startup.
 - Later layers add the vendor settings to this table with their implementation. The Cursor, Devin, Claude Code and OpenAI Codex adapters add no variable. The Claude Code orchestrators put their run directories in `TMPDIR` (default `/tmp`); a Unix socket path must stay below 104 bytes, so `TMPDIR` must be short.
 - Member display names: `ListMembers` reads them through an optional display name source. The `delino-accounts` API has no display name RPC yet, as the [OwnSand contract](servers-ownsand-api-foundation.md#dependencies-and-integrations) records, so tide-api has no client or configuration for it and returns empty display names until that RPC exists.

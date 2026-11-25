@@ -424,7 +424,7 @@ func validSlug(v string) bool {
 // is removed), query, fragment or user info.
 func parseOrigin(name, value, example string) (string, error) {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
 		u.ForceQuery || u.Fragment != "" || u.User != nil || strings.Contains(value, "#") {
 		return "", fmt.Errorf("%s must be an origin such as %s", name, example)
 	}
@@ -469,7 +469,7 @@ func splitList(v string) []string {
 
 func validateURL(name, value string) error {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
 		return fmt.Errorf("%s must be an http or https URL", name)
 	}
 	return nil

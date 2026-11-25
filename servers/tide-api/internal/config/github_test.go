@@ -79,7 +79,9 @@ func TestGitHubAppInvalid(t *testing.T) {
 		{EnvGitHubAppPrivateKey, "not a key", EnvGitHubAppPrivateKey},
 		{EnvGitHubAppPrivateKey, "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\n", EnvGitHubAppPrivateKey},
 		{EnvGitHubAPIOrigin, "https://api.github.com/v3", EnvGitHubAPIOrigin},
+		{EnvGitHubAPIOrigin, "https://:443", EnvGitHubAPIOrigin},
 		{EnvGitHubWebOrigin, "ftp://github.com", EnvGitHubWebOrigin},
+		{EnvGitHubWebOrigin, "https://:443", EnvGitHubWebOrigin},
 	} {
 		env := gitHubEnv(t, keyPEM)
 		env[tc.name] = tc.value
@@ -87,6 +89,9 @@ func TestGitHubAppInvalid(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s=%q: err = %v, want an error that names %s", tc.name, tc.value, err, tc.want)
 			continue
+		}
+		if strings.Contains(tc.value, "://") && strings.Contains(err.Error(), tc.value) {
+			t.Errorf("%s=%q: error contains the configured URL", tc.name, tc.value)
 		}
 		for _, secret := range []string{"client-secret-value", "webhook-secret-value", "MII"} {
 			if strings.Contains(err.Error(), secret) {

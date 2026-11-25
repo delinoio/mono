@@ -73,7 +73,7 @@ func TestOverrides(t *testing.T) {
 	env[EnvMetricsAddr] = "0.0.0.0:9400"
 	env[EnvSecretKeys] = "new:" + testKey(t) + ",old:" + testKey(t)
 	env[EnvOwnSandAPIOrigin] = "http://127.0.0.1:18300/"
-	env[EnvPublicOrigin] = "https://tide.example"
+	env[EnvPublicOrigin] = "http://[::1]:18400/"
 	cfg, err := Load(lookup(env))
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestOverrides(t *testing.T) {
 	if cfg.LogtoAudience != "https://tide.example" || len(cfg.CORSOrigins) != 2 || cfg.MetricsAddr != "0.0.0.0:9400" {
 		t.Fatalf("cfg = %+v", cfg)
 	}
-	if cfg.OwnSandAPIOrigin != "http://127.0.0.1:18300" || cfg.PublicOrigin != "https://tide.example" {
+	if cfg.OwnSandAPIOrigin != "http://127.0.0.1:18300" || cfg.PublicOrigin != "http://[::1]:18400" {
 		t.Fatalf("origins = %q %q", cfg.OwnSandAPIOrigin, cfg.PublicOrigin)
 	}
 	if cfg.ClientAddressMode != ClientAddressVerifiedProxy {
@@ -145,7 +145,9 @@ func TestInvalid(t *testing.T) {
 		{EnvDatabaseURL, "", EnvDatabaseURL},
 		{EnvLogtoIssuer, "", EnvLogtoIssuer},
 		{EnvLogtoIssuer, "ftp://x", EnvLogtoIssuer},
+		{EnvLogtoIssuer, "https://:443/oidc", EnvLogtoIssuer},
 		{EnvLogtoJWKSURL, "nope", EnvLogtoJWKSURL},
+		{EnvLogtoJWKSURL, "https://:443/oidc/jwks", EnvLogtoJWKSURL},
 		{EnvAddr, "nope", EnvAddr},
 		{EnvMetricsAddr, "127.0.0.1:99999", EnvMetricsAddr},
 		{EnvLogLevel, "İNFO", EnvLogLevel},
@@ -163,8 +165,10 @@ func TestInvalid(t *testing.T) {
 		{EnvSecretKeys, "", EnvSecretKeys},
 		{EnvOwnSandAPIOrigin, "https://ownsand.example/api", EnvOwnSandAPIOrigin},
 		{EnvOwnSandAPIOrigin, "ftp://x", EnvOwnSandAPIOrigin},
+		{EnvOwnSandAPIOrigin, "http://:18300", EnvOwnSandAPIOrigin},
 		{EnvPublicOrigin, "https://tide.example?", EnvPublicOrigin},
 		{EnvPublicOrigin, "https://u@tide.example", EnvPublicOrigin},
+		{EnvPublicOrigin, "http://:18400/", EnvPublicOrigin},
 		{EnvSecretKeys, "k1", EnvSecretKeys},
 		{EnvSecretKeys, "k1:" + secretKey[:20], EnvSecretKeys},
 		{EnvSecretKeys, "k1:" + secretKey + ",k1:" + secretKey, EnvSecretKeys},
@@ -179,8 +183,8 @@ func TestInvalid(t *testing.T) {
 		if strings.Contains(err.Error(), secretKey) || (len(tc.value) > 20 && strings.Contains(err.Error(), secretKey[:20])) {
 			t.Errorf("%s=%q: error contains the key", tc.name, tc.value)
 		}
-		if tc.name == EnvCORSOrigins && strings.Contains(err.Error(), tc.value) {
-			t.Errorf("%s=%q: error contains the configured origin", tc.name, tc.value)
+		if strings.Contains(tc.value, "://") && strings.Contains(err.Error(), tc.value) {
+			t.Errorf("%s=%q: error contains the configured URL", tc.name, tc.value)
 		}
 	}
 }
