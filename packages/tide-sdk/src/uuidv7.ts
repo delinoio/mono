@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const MAX_TIMESTAMP_MS = 2 ** 48 - 1;
+const TIMESTAMP_OVERFLOW_MESSAGE = "UUID v7 timestamp exceeds the 48-bit limit";
 
 /**
  * UUID v7 generation for the identifiers that the client generates
@@ -20,12 +21,21 @@ export class UuidV7Generator {
   }
 
   /**
-   * Returns the next UUID v7. Throws RangeError if the floored clock reading
-   * or a counter carry exceeds the 48-bit timestamp limit. The generator
-   * keeps its last successful timestamp and counter on failure.
+   * Returns the next UUID v7. Treats finite readings before the Unix epoch as
+   * zero. Throws RangeError for non-finite readings or if the floored reading
+   * or a counter carry exceeds the 48-bit timestamp limit. The generator keeps
+   * its last successful timestamp and counter on failure.
    */
   next(): string {
-    let ms = Math.floor(this.#nowMs());
+    const now = this.#nowMs();
+    if (!Number.isFinite(now)) {
+      throw new RangeError(
+        now === Infinity
+          ? TIMESTAMP_OVERFLOW_MESSAGE
+          : "UUID v7 clock reading must be finite",
+      );
+    }
+    let ms = Math.max(0, Math.floor(now));
     let counter: number | undefined;
     if (ms <= this.#lastMs) {
       // Same millisecond, or a wall clock that went back: keep the last
@@ -38,7 +48,7 @@ export class UuidV7Generator {
       }
     }
     if (ms > MAX_TIMESTAMP_MS) {
-      throw new RangeError("UUID v7 timestamp exceeds the 48-bit limit");
+      throw new RangeError(TIMESTAMP_OVERFLOW_MESSAGE);
     }
     counter ??= randomCounter();
 

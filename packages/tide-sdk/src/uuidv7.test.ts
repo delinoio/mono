@@ -4,6 +4,69 @@ import { isUuidV7, UuidV7Generator } from "./index.ts";
 
 const MAX_TIMESTAMP_MS = 2 ** 48 - 1;
 
+test.each([NaN, -Infinity, Infinity])(
+  "rejects clock reading %s and recovers at zero",
+  (reading) => {
+    let now = reading;
+    const generator = new UuidV7Generator(() => now);
+    expect(() => generator.next()).toThrow(RangeError);
+
+    now = 0;
+    const uuid = generator.next();
+    expect(isUuidV7(uuid)).toBe(true);
+    expect(uuid.slice(0, 13)).toBe("00000000-0000");
+  },
+);
+
+test.each([NaN, -Infinity, Infinity])(
+  "keeps the timestamp and counter after clock reading %s",
+  (reading) => {
+    let now = 1000;
+    const generator = new UuidV7Generator(() => now);
+    const before = generator.next();
+
+    now = reading;
+    expect(() => generator.next()).toThrow(RangeError);
+
+    now = 999;
+    const recovered = generator.next();
+    expect(isUuidV7(recovered)).toBe(true);
+    expect(recovered.slice(0, 13)).toBe("00000000-03e8");
+    expect(counterOf(recovered)).toBe(counterOf(before) + 1);
+    expect(recovered > before).toBe(true);
+  },
+);
+
+test("keeps the upper-bound diagnostic for positive infinity", () => {
+  const generator = new UuidV7Generator(() => Infinity);
+  expect(() => generator.next()).toThrow(
+    "UUID v7 timestamp exceeds the 48-bit limit",
+  );
+});
+
+test("increases UUIDs across pre-epoch, epoch, and positive clock readings", () => {
+  let now = -1;
+  const generator = new UuidV7Generator(() => now);
+  let previous = generator.next();
+  expect(isUuidV7(previous)).toBe(true);
+  expect(previous.slice(0, 13)).toBe("00000000-0000");
+
+  for (const [reading, prefix] of [
+    [-1000, "00000000-0000"],
+    [-0.5, "00000000-0000"],
+    [0, "00000000-0000"],
+    [0.5, "00000000-0000"],
+    [1.5, "00000000-0001"],
+  ] as const) {
+    now = reading;
+    const next = generator.next();
+    expect(isUuidV7(next)).toBe(true);
+    expect(next.slice(0, 13)).toBe(prefix);
+    expect(next > previous).toBe(true);
+    previous = next;
+  }
+});
+
 test("rejects a first clock reading above the limit and recovers at zero", () => {
   let now = MAX_TIMESTAMP_MS + 1;
   const generator = new UuidV7Generator(() => now);
