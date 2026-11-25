@@ -26,7 +26,10 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import type { MessageInitShape } from "@bufbuild/protobuf";
-import { createQueryOptions } from "@connectrpc/connect-query";
+import {
+  createConnectQueryKey,
+  createQueryOptions,
+} from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
 import {
   DeleteAgentIntegrationRequestSchema,
@@ -160,7 +163,7 @@ function gatedTransport(methodName: string) {
       return mock.unary(method, ...args);
     },
   };
-  return { transport, calls };
+  return { transport, calls, mock };
 }
 
 /** Every value that the console keeps in browser storage. */
@@ -3089,6 +3092,61 @@ describe("invitations", () => {
 });
 
 describe("settings", () => {
+  const limitPath = "max_dev_sessions_per_user";
+
+  async function openLimitForm(initial: number | null) {
+    const organizationId = MOCK_IDS.globex;
+    const { transport, calls, mock } = gatedTransport(
+      "UpdateOrganizationSettings",
+    );
+    const client = createClient(OrganizationService, mock);
+    const setStoredLimit = async (value: number | null) => {
+      await client.updateOrganizationSettings({
+        organizationId,
+        settings: value === null ? {} : { maxDevSessionsPerUser: value },
+        updateMask: { paths: [limitPath] },
+      });
+    };
+    await setStoredLimit(initial);
+    const queryClient = renderConsole(`/orgs/${organizationId}/settings`, {
+      transport,
+    });
+    const input = await screen.findByRole<HTMLInputElement>("textbox", {
+      name: "Limit per user",
+    });
+    const save = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Save limit",
+    });
+    const queryKey = createConnectQueryKey({
+      schema: OrganizationService.method.getOrganization,
+      input: { organizationId },
+      transport,
+      cardinality: "finite",
+    });
+
+    return {
+      input,
+      save,
+      calls,
+      async settleSave(error?: ConnectError) {
+        await act(async () => calls.at(-1)!.settle(error));
+        await waitFor(() => expect(queryClient.isMutating()).toBe(0));
+      },
+      async refetch(value: number | null) {
+        await setStoredLimit(value);
+        await act(async () => {
+          await queryClient.refetchQueries({ queryKey, type: "active" });
+        });
+        await waitFor(() =>
+          expect(
+            queryClient.getQueryData(queryKey)?.organization?.settings
+              ?.maxDevSessionsPerUser ?? null,
+          ).toBe(value),
+        );
+      },
+    };
+  }
+
   test("organization deletion tells the owner to uninstall the GitHub App", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/settings`);
     await click(
@@ -3110,5 +3168,89 @@ describe("settings", () => {
     await click(screen.getByRole("button", { name: "Save limit" }));
     await settle(60);
     expect(document.body.textContent).not.toContain("Enter a whole number");
+  });
+
+  test.each([
+    [5, 3],
+    [null, 3],
+    [5, null],
+  ])(
+    "refreshes an untouched limit from %s to %s without writing",
+    async (before, after) => {
+      const { input, save, calls, refetch } = await openLimitForm(before);
+      expect(input.value).toBe(before === null ? "" : String(before));
+      await refetch(after);
+      await waitFor(() =>
+        expect(input.value).toBe(after === null ? "" : String(after)),
+      );
+      expect(save.disabled).toBe(true);
+      await click(save);
+      await act(async () => fireEvent.submit(input.form!));
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  test("skips a draft equal to the latest stored limit", async () => {
+    const { input, save, calls, refetch } = await openLimitForm(5);
+    await type(input, "4");
+    expect(save.disabled).toBe(false);
+    await refetch(4);
+    await waitFor(() => expect(save.disabled).toBe(true));
+    await act(async () => fireEvent.submit(input.form!));
+    expect(calls).toHaveLength(0);
+  });
+
+  test("saves a draft after a refresh and follows later confirmed limits", async () => {
+    const { input, save, calls, refetch, settleSave } = await openLimitForm(5);
+    await type(input, "4");
+    await refetch(3);
+    expect(input.value).toBe("4");
+    await click(save);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].input).toMatchObject({
+      settings: { maxDevSessionsPerUser: 4 },
+      updateMask: { paths: [limitPath] },
+    });
+    await settleSave();
+    expect(input.value).toBe("4");
+    await refetch(2);
+    await waitFor(() => expect(input.value).toBe("2"));
+  });
+
+  test("keeps an explicit clear after a refresh and retries a failed save", async () => {
+    const { input, save, calls, refetch, settleSave } = await openLimitForm(5);
+    await type(input, "");
+    await refetch(3);
+    expect(input.value).toBe("");
+    await click(save);
+    expect(calls).toHaveLength(1);
+    await settleSave(new ConnectError("write failed", Code.Internal));
+    await waitFor(() => expect(save.disabled).toBe(false));
+    expect(input.value).toBe("");
+    await click(save);
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.input).toMatchObject({ updateMask: { paths: [limitPath] } });
+      expect((call.input as { settings: object }).settings).toEqual({});
+    }
+    await settleSave();
+    await waitFor(() => expect(save.disabled).toBe(true));
+    expect(input.value).toBe("");
+  });
+
+  test("keeps a newer draft after saving an earlier edit with the same value", async () => {
+    const { input, save, calls, refetch, settleSave } = await openLimitForm(5);
+    await type(input, "4");
+    await click(save);
+    expect(calls).toHaveLength(1);
+    expect(save.disabled).toBe(true);
+    await type(input, "7");
+    await act(async () => fireEvent.submit(input.form!));
+    expect(calls).toHaveLength(1);
+    await type(input, "4");
+    await settleSave();
+    await refetch(2);
+    await waitFor(() => expect(save.disabled).toBe(false));
+    expect(input.value).toBe("4");
   });
 });
