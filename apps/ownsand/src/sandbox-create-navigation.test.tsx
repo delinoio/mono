@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  rs,
+  test,
+} from "@rstest/core";
 import {
   act,
   cleanup,
@@ -8,6 +15,7 @@ import {
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
+import type { CreateSandboxResponse } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { MOCK_IDS } from "./mock/mock-api.ts";
 import { holdingTransport, renderConsole, settle } from "./test-support.tsx";
 
@@ -104,5 +112,64 @@ describe("create sandbox navigation", () => {
     expect(keys).toHaveLength(2);
     expect(keys[1]).toBe(keys[0]);
     expect(window.location.pathname).toMatch(/\/sandboxes\/[0-9a-f-]{36}$/);
+  });
+
+  test("rejects a malformed ID and blocks replay at the reservation deadline", async () => {
+    const start = Date.now();
+    const now = rs.spyOn(Date, "now").mockReturnValue(start);
+    try {
+      const { transport, seen } = holdingTransport([]);
+      renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+        transport: {
+          ...transport,
+          async unary(method, ...args) {
+            const response = await transport.unary(method, ...args);
+            if (method.name !== "CreateSandbox") return response;
+            const { sandbox } =
+              response.message as unknown as CreateSandboxResponse;
+            return {
+              ...response,
+              message: {
+                ...response.message,
+                sandbox: { ...sandbox, sandboxId: "../devices" },
+              },
+            };
+          },
+        },
+      });
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Create sandbox" }),
+        );
+      });
+      const dialog = await screen.findByRole("dialog", {
+        name: "Create a sandbox",
+      });
+      await act(async () => {
+        fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+      });
+      expect(
+        await within(dialog).findByText(/The sandbox may have been created/),
+      ).toBeTruthy();
+      expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}/sandboxes`);
+
+      const retry = within(dialog).getByRole<HTMLButtonElement>("button", {
+        name: "Retry original request",
+      });
+      expect(retry.disabled).toBe(false);
+      // The click must check the deadline even if the browser has not run
+      // the timer that disables the button yet.
+      now.mockReturnValue(start + 24 * 60 * 60 * 1000);
+      await act(async () => {
+        fireEvent.click(retry);
+      });
+      expect(retry.disabled).toBe(true);
+      expect(
+        within(dialog).getByText(/The retry window has ended/),
+      ).toBeTruthy();
+      expect(seen.CreateSandbox).toBe(1);
+    } finally {
+      now.mockRestore();
+    }
   });
 });

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { create, toJsonString } from "@bufbuild/protobuf";
 import {
   Code,
   ConnectError,
@@ -12,7 +13,11 @@ import {
   type RevokeInvitationRequest,
 } from "@delino/ownsand-protos/v1/member_pb";
 import { SnapshotExportState } from "@delino/ownsand-protos/v1/common_pb";
-import type { CreateSandboxRequest } from "@delino/ownsand-protos/v1/sandbox_pb";
+import {
+  CreateSandboxRequestSchema,
+  type CreateSandboxRequest,
+  type CreateSandboxResponse,
+} from "@delino/ownsand-protos/v1/sandbox_pb";
 import type {
   ListSnapshotsResponse,
   ListTemplatesResponse,
@@ -112,6 +117,8 @@ export function createMockTransport(): Transport {
   const credentialField =
     credentialList === "ListApiKeys" ? "apiKeys" : "tokens";
   let credentialCreated = false;
+  const createResponse = sessionStorage.getItem("ownsand-e2e-create-response");
+  const creates: { request: string; sandboxId: string }[] = [];
   // Seed enough rows to split the selected list across two pages.
   const base = createBaseMock({
     extraApiKeys: Number(methodName === "ListApiKeys"),
@@ -316,6 +323,50 @@ export function createMockTransport(): Transport {
           "ownsand-e2e-created-source",
           JSON.stringify(source?.source),
         );
+      }
+      if (createResponse !== null && method.name === "CreateSandbox") {
+        const response = await base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+        const { sandbox } =
+          response.message as unknown as CreateSandboxResponse;
+        if (!sandbox) throw new Error("The mock create returned no sandbox");
+        creates.push({
+          request: toJsonString(
+            CreateSandboxRequestSchema,
+            create(
+              CreateSandboxRequestSchema,
+              input as unknown as CreateSandboxRequest,
+            ),
+          ),
+          sandboxId: sandbox.sandboxId,
+        });
+        sessionStorage.setItem("ownsand-e2e-creates", JSON.stringify(creates));
+        if (creates.length > 1 || createResponse === "valid") return response;
+        if (createResponse === "held") {
+          await new Promise<void>((resolve) => {
+            window.addEventListener(
+              "ownsand-e2e-release-create",
+              () => resolve(),
+              { once: true },
+            );
+          });
+        }
+        return {
+          ...response,
+          message: {
+            ...response.message,
+            sandbox:
+              createResponse === "empty-id"
+                ? { ...sandbox, sandboxId: "" }
+                : undefined,
+          },
+        };
       }
       if (
         pageSources &&
