@@ -64,6 +64,29 @@ func (w *devinWorld) full() {
 	})
 }
 
+func TestDevinOrganizationDeletionRecovery(t *testing.T) {
+	w := newDevinWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	w.full()
+	w.devin.AddSession("ses-org", true)
+	req := w.requestBySource(t, "ses-org")
+	w.devin.FailReleases(true)
+	ctx := context.Background()
+	owner := w.env.User(w.org.Owner)
+	if _, err := owner.Organization.DeleteOrganization(ctx, connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID})); connect.CodeOf(err) != connect.CodeInternal {
+		t.Fatalf("DeleteOrganization error = %v, want internal", err)
+	}
+	if c, err := w.l.Agents.Claim(ctx, req.GetRequestId()); err != nil || c.State != agent.ClaimHeld {
+		t.Fatalf("claim %+v %v", c, err)
+	}
+	if phase, acceptor := w.devin.State("ses-org"); phase != "claimed" || acceptor != "tide-"+req.GetRequestId() {
+		t.Fatalf("queue entry %s %s", phase, acceptor)
+	}
+	eventually(t, "the Devin watch resumes after the failed release", func() bool { return w.devin.Streams() == 1 })
+	w.devin.FailReleases(false)
+	w.devin.AddSession("ses-after", true)
+	w.requestBySource(t, "ses-after")
+}
+
 // TestDevinSessionLifecycle: a pending session is claimed with a tide
 // acceptor ID; the runner gets only the outpost token (in its credential
 // file), starts `devin worker start --session ... --acceptor-id ...`,
