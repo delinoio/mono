@@ -197,6 +197,18 @@ func TestTextListKeepsNextPageHint(t *testing.T) {
 	}
 }
 
+func TestTextListNextPageHintWriteErrorExitsWithError(t *testing.T) {
+	r := newRunner(t)
+	var stdout bytes.Buffer
+	stderr := &failingWriter{err: errDiskFull}
+	if code := r.runWriters(&stdout, stderr, "api-key", "list", "--no-color"); code != ExitError {
+		t.Errorf("exit %d, want %d", code, ExitError)
+	}
+	if table := stdout.String(); !strings.HasPrefix(table, "ID") || !strings.Contains(table, "ci") {
+		t.Errorf("stdout misses the API key table: %q", table)
+	}
+}
+
 // TestPrintTableReturnsEveryWriteError checks that the error of any write of
 // the table reaches the caller: a row write that flushes early as well as the
 // final flush.
