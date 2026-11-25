@@ -76,6 +76,9 @@ type Org struct {
 	DeleteError error
 	// FileError, when set, is returned for reads, write chunks and finalization.
 	FileError error
+	// OnFileRead observes the context and parameters before any chunks are
+	// written. It runs without the fake lock.
+	OnFileRead func(context.Context, ownsand.FileReadParams)
 	// StartRunning makes new sandboxes RUNNING at once (the default);
 	// false keeps them CREATING until the test calls SetRunning.
 	StartRunning bool
@@ -473,7 +476,11 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 		snap = append([]byte(nil), src...)
 		s.reads[p.ReadID] = snap
 	}
+	onRead := org.OnFileRead
 	c.f.mu.Unlock()
+	if onRead != nil {
+		onRead(ctx, p)
+	}
 	for off := p.Offset; off < int64(len(snap)); {
 		if err := ctx.Err(); err != nil {
 			return off, err
