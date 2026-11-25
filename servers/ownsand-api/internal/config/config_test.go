@@ -94,6 +94,7 @@ func TestLoadCORSOrigins(t *testing.T) {
 		{"loopback with port", "http://127.0.0.1:13100", true},
 		{"hostless with port", "https://:443", false},
 		{"hostless after valid", "https://a.example, https://:443", false},
+		{"percent in host", "https://exa%25mple.test", false},
 		{"bare query", "https://console.example.org?", false},
 		{"user info", "https://user@console.example.org", false},
 		{"user and password", "https://user:pw@console.example.org", false},

@@ -636,7 +636,7 @@ The Logto endpoint URLs and the OwnSand, public and GitHub origins require a hos
 
 The server stores each `CORS_ORIGINS` entry in the form that browsers use in the `Origin` header. It lowercases host names, writes IPv4 addresses in dotted decimal and writes IPv6 addresses in compressed form within brackets. It removes the default port for the scheme and keeps other ports. For example, `HTTPS://Tide.Delino.io:443` matches `https://tide.delino.io`, and `http://127.1:3000` matches `http://127.0.0.1:3000`. Use Punycode for internationalized host names.
 
-Each entry requires a host and permits an optional port. Startup fails if an entry includes user information, a path, a query or a fragment, including a bare `?` or `#`. Startup also fails for invalid hosts such as `1.2.3.4.5` or IPv6 addresses with a zone identifier.
+Each entry requires a host and permits an optional port. Startup fails if an entry includes user information, a path, a query or a fragment, including a bare `?` or `#`. Startup also fails for invalid hosts such as `1.2.3.4.5`, IPv6 addresses with a zone identifier or decoded hostnames that contain a percent sign.
 
 ## Security
 

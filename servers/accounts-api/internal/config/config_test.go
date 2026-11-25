@@ -415,7 +415,7 @@ func TestLoadRejectsInvalidBillingValues(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsHostlessURLsAndOrigins(t *testing.T) {
+func TestLoadRejectsInvalidURLAndOriginHosts(t *testing.T) {
 	for name, tc := range map[string]struct{ env, value string }{
 		"issuer https port only":       {EnvLogtoIssuer, "https://:443/oidc"},
 		"issuer http port only":        {EnvLogtoIssuer, "http://:80"},
@@ -425,6 +425,8 @@ func TestLoadRejectsHostlessURLsAndOrigins(t *testing.T) {
 		"web origin port only":         {EnvWebOrigin, "https://:443"},
 		"web origin http port only":    {EnvWebOrigin, "http://:80"},
 		"cors empty bracketed address": {EnvCORSOrigins, "http://[]:80"},
+		"cors percent in host":         {EnvCORSOrigins, "https://exa%25mple.test"},
+		"web origin percent in host":   {EnvWebOrigin, "https://exa%25mple.test"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(lookupFrom(map[string]string{tc.env: tc.value}))

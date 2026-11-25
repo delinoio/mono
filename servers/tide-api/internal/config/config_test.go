@@ -157,6 +157,7 @@ func TestInvalid(t *testing.T) {
 		{EnvAllowDirectClientAddress, "2", EnvAllowDirectClientAddress},
 		{EnvCORSOrigins, "https://u@tide.delino.io", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://:443", EnvCORSOrigins},
+		{EnvCORSOrigins, "https://exa%25mple.test", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://1.2.3.4.5", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://tide.delino.io?", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://tide.delino.io/path", EnvCORSOrigins},

@@ -29,8 +29,9 @@ import (
 // IPv4 spelling such as 127.1, 0x7f.1, 2130706433 or 0177.0.0.1 is stored as
 // 127.0.0.1, as a browser sends it. Such a host that is not an IPv4 address (for
 // example 1.2.3.4.5, 256.1.1.1 or example.1) is rejected, as browsers reject it.
-// A non-ASCII host name is only lower-cased: a browser sends it in its
-// punycode form, so an operator must configure that form.
+// A percent sign in the decoded domain is rejected. A non-ASCII host name
+// is only lower-cased: a browser sends it in its punycode form, so an
+// operator must configure that form.
 func Canonical(u *url.URL) (string, bool) {
 	if u == nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
 		return "", false
@@ -43,6 +44,8 @@ func Canonical(u *url.URL) (string, bool) {
 			return "", false
 		}
 		host = "[" + addr + "]"
+	} else if strings.Contains(host, "%") {
+		return "", false
 	} else if endsInNumber(host) {
 		addr, ok := parseIPv4(host)
 		if !ok {
