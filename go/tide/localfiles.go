@@ -31,7 +31,12 @@ const (
 	modeExecutable uint32 = 0o100755
 	modeSymlink    uint32 = 0o120000
 	modeGitlink           = "160000"
+	indexSymlink          = "120000"
 )
+
+// Bound reads of placeholder files while allowing targets as long as the
+// extended Windows path limit, even when encoded as UTF-8.
+const maxSymlinkPlaceholderBytes = 128 << 10
 
 // manifestVersion is the version of the guest manifest format.
 const manifestVersion = 1
@@ -82,6 +87,15 @@ type localList struct {
 	skipped []string
 }
 
+type gitIndexEntry struct {
+	mode      string
+	stageZero bool
+}
+
+func (e gitIndexEntry) isSymlink() bool {
+	return e.stageZero && e.mode == indexSymlink
+}
+
 // listLocalFiles selects the local files of a sync: the output of
 // `git ls-files --cached --others --exclude-standard` in dir (tracked
 // files and untracked files that are not ignored), without submodules.
@@ -109,9 +123,10 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The index modes: gitlinks (submodules) and the executable bit, which
-	// a Windows file system does not keep.
-	indexMode := map[string]string{}
+	// Read Git's file types and the executable bit, which Windows does not
+	// keep. Only a stage-zero link entry can identify a text placeholder.
+	index := map[string]gitIndexEntry{}
+	hasIndexedSymlink := false
 	for _, rec := range splitNUL(staged) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -120,9 +135,22 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 		if !ok {
 			continue
 		}
-		if f := strings.Fields(meta); len(f) > 0 {
-			indexMode[p] = f[0]
+		if fields := strings.Fields(meta); len(fields) == 3 {
+			entry := gitIndexEntry{mode: fields[0], stageZero: fields[2] == "0"}
+			index[p] = entry
+			hasIndexedSymlink = hasIndexedSymlink || entry.isSymlink()
 		}
+	}
+	symlinkPlaceholders := false
+	if hasIndexedSymlink {
+		value, err := runGit(ctx, dir, "config", "--type=bool", "--default", "true", "--get", "core.symlinks")
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err != nil {
+			return nil, err
+		}
+		symlinkPlaceholders = strings.TrimSpace(string(value)) == "false"
 	}
 	out := &localList{}
 	seen := map[string]bool{}
@@ -140,14 +168,15 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 			out.skipped = append(out.skipped, strings.TrimSuffix(p, "/"))
 			continue
 		}
-		if indexMode[p] == modeGitlink {
+		entry := index[p]
+		if entry.mode == modeGitlink {
 			out.skipped = append(out.skipped, p)
 			continue
 		}
 		if !validRelPath(p) {
 			return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("tide: git listed a path that is not a local relative path: %q", p))
 		}
-		f, ok, err := readLocalFile(ctx, dir, p, indexMode[p])
+		f, ok, err := readLocalFile(ctx, dir, p, entry.mode, symlinkPlaceholders && entry.isSymlink())
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +191,7 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 
 // readLocalFile hashes one listed path. Missing paths, directories, and paths
 // below a file or symbolic link are absent from the local file list.
-func readLocalFile(ctx context.Context, dir, rel, indexMode string) (localFile, bool, error) {
+func readLocalFile(ctx context.Context, dir, rel, indexMode string, symlinkPlaceholder bool) (localFile, bool, error) {
 	// Lstat follows symbolic links in parent components, so check each
 	// parent from the root outwards before looking up the final component.
 	for i := range rel {
@@ -197,17 +226,28 @@ func readLocalFile(ctx context.Context, dir, rel, indexMode string) (localFile, 
 		if err != nil {
 			return localFile{}, false, err
 		}
-		target = filepath.ToSlash(target)
-		sum := sha256.Sum256([]byte(target))
-		f.target = target
-		f.entry = manifestEntry{Size: int64(len(target)), SHA256: hex.EncodeToString(sum[:]), Mode: modeSymlink}
+		return localSymlink(rel, filepath.ToSlash(target)), true, nil
 	case info.Mode().IsRegular():
 		file, err := os.Open(full)
 		if err != nil {
 			return localFile{}, false, err
 		}
+		defer file.Close()
+		if symlinkPlaceholder {
+			target, err := io.ReadAll(io.LimitReader(localContextReader{ctx: ctx, src: file}, maxSymlinkPlaceholderBytes+1))
+			if err := ctx.Err(); err != nil {
+				return localFile{}, false, err
+			}
+			if err != nil {
+				return localFile{}, false, err
+			}
+			if len(target) == 0 || len(target) > maxSymlinkPlaceholderBytes || bytes.IndexByte(target, 0) >= 0 {
+				return localFile{}, false, localError(connect.CodeFailedPrecondition, fmt.Errorf("tide: invalid Git symlink placeholder target for %q (must be 1 to %d bytes without NUL)", rel, maxSymlinkPlaceholderBytes))
+			}
+			// Git wrote the target bytes. Keep literal backslashes and whitespace.
+			return localSymlink(rel, string(target)), true, nil
+		}
 		size, digest, err := hashLocalFile(ctx, file)
-		file.Close()
 		if err != nil {
 			return localFile{}, false, err
 		}
@@ -227,14 +267,23 @@ func readLocalFile(ctx context.Context, dir, rel, indexMode string) (localFile, 
 	return f, true, nil
 }
 
-// localHashReader checks the context before each read. It exposes only Read
+func localSymlink(rel, target string) localFile {
+	sum := sha256.Sum256([]byte(target))
+	return localFile{
+		rel:    rel,
+		target: target,
+		entry:  manifestEntry{Size: int64(len(target)), SHA256: hex.EncodeToString(sum[:]), Mode: modeSymlink},
+	}
+}
+
+// localContextReader checks the context before each read. It exposes only Read
 // so io.Copy cannot call the underlying file's WriterTo method.
-type localHashReader struct {
+type localContextReader struct {
 	ctx context.Context
 	src io.Reader
 }
 
-func (r localHashReader) Read(p []byte) (int, error) {
+func (r localContextReader) Read(p []byte) (int, error) {
 	if err := r.ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -243,7 +292,7 @@ func (r localHashReader) Read(p []byte) (int, error) {
 
 func hashLocalFile(ctx context.Context, src io.Reader) (int64, string, error) {
 	h := sha256.New()
-	size, err := io.Copy(h, localHashReader{ctx: ctx, src: src})
+	size, err := io.Copy(h, localContextReader{ctx: ctx, src: src})
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return 0, "", ctxErr
 	}

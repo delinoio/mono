@@ -401,6 +401,115 @@ func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
 	}
 }
 
+func TestSyncGitSymlinkPlaceholder(t *testing.T) {
+	needPOSIX(t)
+	const target = "targets/literal\\backslash and spaces "
+	const replacement = "regular replacement\n"
+	type checkoutCase int
+	const (
+		placeholder checkoutCase = iota
+		stagedFile
+		unstagedFile
+		unmergedFile
+	)
+	for _, tc := range []struct {
+		name   string
+		config string
+		kind   checkoutCase
+		mode   uint32
+	}{
+		{"disabled", "off", placeholder, modeSymlink},
+		{"staged regular file", "false", stagedFile, modeFile},
+		{"unstaged regular file", "true", unstagedFile, modeFile},
+		{"unmerged index", "false", unmergedFile, modeFile},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			dir := newRepo(t, nil, nil, "")
+			link := filepath.Join(dir, "link")
+			git(t, dir, "config", "core.symlinks", "true")
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			git(t, dir, "add", "--", "link")
+			git(t, dir, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "link")
+			git(t, dir, "config", "core.symlinks", tc.config)
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			wantContent := replacement
+			if tc.kind == placeholder {
+				git(t, dir, "checkout-index", "--", "link")
+				wantContent = target
+				info, err := os.Lstat(link)
+				if err != nil || !info.Mode().IsRegular() {
+					t.Fatalf("expected a local regular file: %v, %v", info, err)
+				}
+			} else {
+				if err := os.WriteFile(link, []byte(replacement), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch tc.kind {
+			case stagedFile:
+				// Git preserves the indexed link mode when adding a text
+				// placeholder. Remove its index entry before staging a file.
+				git(t, dir, "rm", "--cached", "--", "link")
+				git(t, dir, "add", "--", "link")
+			case unmergedFile:
+				oid := strings.TrimSpace(git(t, dir, "rev-parse", ":link"))
+				git(t, dir, "rm", "--cached", "--", "link")
+				cmd := exec.Command("git", "-C", dir, "update-index", "--index-info")
+				cmd.Stdin = strings.NewReader("120000 " + oid + " 3\tlink\n")
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("create unmerged index entry: %v: %s", err, out)
+				}
+			}
+
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(t.Context(), params); err != nil {
+				t.Fatal(err)
+			}
+			guestLink := filepath.Join(ds.GetWorkspacePath(), "link")
+			if tc.mode == modeSymlink {
+				if got, err := os.Readlink(guestLink); err != nil || got != target {
+					t.Fatalf("guest link target = %q, %v", got, err)
+				}
+			} else {
+				if info, err := os.Lstat(guestLink); err != nil || !info.Mode().IsRegular() {
+					t.Fatalf("expected a guest regular file: %v, %v", info, err)
+				}
+				if got := readGuest(t, ds, "link"); got != replacement {
+					t.Fatalf("guest file content = %q", got)
+				}
+			}
+			sum := sha256.Sum256([]byte(wantContent))
+			want := manifestEntry{Size: int64(len(wantContent)), SHA256: hex.EncodeToString(sum[:]), Mode: tc.mode}
+			if got := guestManifest(t, ds).Files["link"]; got != want {
+				t.Fatalf("guest manifest entry = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestSyncRejectsGitSymlinkPlaceholderLineBreakOnWindows(t *testing.T) {
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_WINDOWS)
+	dir := newRepo(t, map[string]string{"link": "target\nsecond line"}, nil, "")
+	oid := strings.TrimSpace(git(t, dir, "rev-parse", ":link"))
+	git(t, dir, "update-index", "--cacheinfo", "120000,"+oid+",link")
+	git(t, dir, "config", "core.symlinks", "false")
+
+	_, err := c.Sync(t.Context(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
+	if connect.CodeOf(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "line break") {
+		t.Fatalf("sync error = %v, want failed precondition for a link target with a line break", err)
+	}
+	if srv.Calls(execProc) != 0 || srv.Calls(writeProc) != 0 {
+		t.Fatal("sync started a guest command or upload for the rejected link")
+	}
+}
+
 func TestSyncSkipsStaleSymlinkDescendants(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
@@ -1251,7 +1360,7 @@ func TestReadLocalFileHashWithLiveContext(t *testing.T) {
 
 func TestReadLocalFileLookupError(t *testing.T) {
 	needPOSIX(t)
-	_, ok, err := readLocalFile(t.Context(), t.TempDir(), strings.Repeat("a", 4096), "")
+	_, ok, err := readLocalFile(t.Context(), t.TempDir(), strings.Repeat("a", 4096), "", false)
 	if ok || !errors.Is(err, syscall.ENAMETOOLONG) {
 		t.Fatalf("readLocalFile = present %t, error %v, want ENAMETOOLONG", ok, err)
 	}
