@@ -1013,14 +1013,20 @@ func TestBillingLinkLostResponseIsReconciled(t *testing.T) {
 	ctx := context.Background()
 	f.loseLinkResponse(t)
 
-	// The restarted instance reconciles the attempt: not before the first
-	// back-off, then by removing the remote link.
+	// The restarted instance waits until the recovery deadline, even after
+	// the ordinary first back-off.
 	restarted := f.restart()
 	if err := restarted.RetryPendingUnlinks(ctx); err != nil {
 		t.Fatal(err)
 	}
 	f.wantRemoteLink(t, true)
 	f.env.Clock.Advance(2 * time.Second)
+	if err := restarted.RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRows(t, 1, 1)
+	f.wantRemoteLink(t, true)
+	f.env.Clock.Advance(time.Minute)
 	if err := restarted.RetryPendingUnlinks(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1041,10 +1047,15 @@ func TestBillingLinkLostResponseIsReconciled(t *testing.T) {
 }
 
 // TestBillingLinkLostResponseRetryRecovers checks that an authorized retry
-// of the same account recovers the link at once, without the lease holder.
+// of the same account recovers the link after the deadline.
 func TestBillingLinkLostResponseRetryRecovers(t *testing.T) {
 	f := newLinkAttemptFixture(t, "jack")
 	f.loseLinkResponse(t)
+	if err := f.link(f.org.OwnerClient, billingAccountA); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("retry during recovery grace: %v, want unavailable", err)
+	}
+	f.wantRows(t, 1, 1)
+	f.env.Clock.Advance(time.Minute)
 	if err := f.link(f.org.OwnerClient, billingAccountA); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
@@ -1069,6 +1080,7 @@ func TestBillingLinkLostResponseRetryRecovers(t *testing.T) {
 func TestBillingLinkLostResponseThenRejectedRetry(t *testing.T) {
 	f := newLinkAttemptFixture(t, "kim")
 	f.loseLinkResponse(t)
+	f.env.Clock.Advance(time.Minute)
 	// The owner is only a viewer of the billing account now.
 	f.fake.AddAccount(billingAccountA, "Account of kim", map[string]accountsv1.BillingAccountRole{f.org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_VIEWER})
 	if err := f.link(f.org.OwnerClient, billingAccountA); testenv.Code(err) != connect.CodePermissionDenied && testenv.Code(err) != connect.CodeNotFound {
@@ -1086,6 +1098,7 @@ func TestBillingLinkLostResponseThenRejectedRetry(t *testing.T) {
 func TestBillingUnlinkRemovesUnconfirmedLink(t *testing.T) {
 	f := newLinkAttemptFixture(t, "lena")
 	f.loseLinkResponse(t)
+	f.env.Clock.Advance(time.Minute)
 	before := f.fake.Calls(accountstest.MethodUnlinkOrganization)
 	if err := f.unlink(f.org.OwnerClient); err != nil {
 		t.Fatal(err)
@@ -1108,6 +1121,7 @@ func TestBillingUnlinkRemovesUnconfirmedLink(t *testing.T) {
 	// While delino-accounts is down, the unlink fails and the record stays.
 	f2 := newLinkAttemptFixture(t, "lena2")
 	f2.loseLinkResponse(t)
+	f2.env.Clock.Advance(time.Minute)
 	f2.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
 	if err := f2.unlink(f2.org.OwnerClient); testenv.Code(err) != connect.CodeUnavailable {
 		t.Fatalf("unlink while delino-accounts is down: %v", err)
@@ -1126,12 +1140,24 @@ func TestBillingTransferAndDeletionRemoveUnconfirmedLink(t *testing.T) {
 	if _, err := f.org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: f.org.ID, UserId: f.org.Admin})); err != nil {
 		t.Fatal(err)
 	}
+	f.wantRemoteLink(t, true)
+	f.wantRows(t, 0, 1)
+	f.env.Clock.Advance(time.Minute)
+	if err := f.restart().RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
 	f.wantRemoteLink(t, false)
 	f.wantRows(t, 0, 0)
 
 	g := newLinkAttemptFixture(t, "nora")
 	g.loseLinkResponse(t)
 	if _, err := g.org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: g.org.ID})); err != nil {
+		t.Fatal(err)
+	}
+	g.wantRemoteLink(t, true)
+	g.wantRows(t, 0, 1)
+	g.env.Clock.Advance(time.Minute)
+	if err := g.restart().RetryPendingUnlinks(ctx); err != nil {
 		t.Fatal(err)
 	}
 	g.wantRemoteLink(t, false)
@@ -1141,6 +1167,7 @@ func TestBillingTransferAndDeletionRemoveUnconfirmedLink(t *testing.T) {
 	// lease holder works off later; the organization row is gone.
 	h := newLinkAttemptFixture(t, "olga")
 	h.loseLinkResponse(t)
+	h.env.Clock.Advance(time.Minute)
 	h.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
 	if _, err := h.org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: h.org.ID})); err != nil {
 		t.Fatal(err)
@@ -1379,6 +1406,7 @@ func (f *linkAttemptFixture) holdPendingUnlinkOfNewOwner(t *testing.T) (*account
 	t.Helper()
 	ctx := context.Background()
 	f.loseLinkResponse(t)
+	f.env.Clock.Advance(time.Minute)
 	f.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
 	if _, err := f.org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: f.org.ID, UserId: f.org.Admin})); err != nil {
 		t.Fatal(err)
@@ -1432,37 +1460,76 @@ func TestBillingLinkExpiredBeforeDispatchStartsNoCall(t *testing.T) {
 	f.wantRows(t, 0, 0)
 }
 
-// TestBillingLinkBoundsCallToRemainingWindow checks that a link that starts
-// late but inside its window bounds the call to the time that remains, so
-// the call ends before the cleanup can remove the attempt row: the stalled
-// call fails fast, the row stays for the reconciliation and no cleanup
-// removes it while the call could still run.
+// TestBillingLinkBoundsCallToRemainingWindow holds the Accounts link before
+// it takes effect. The OwnSand call times out within the remaining dispatch
+// window, and cleanup waits for the persisted deadline to protect the late link.
 func TestBillingLinkBoundsCallToRemainingWindow(t *testing.T) {
 	f := newLinkAttemptFixture(t, "vera")
-	ctx := context.Background()
+	ctx := t.Context()
 	gate, done := f.holdPendingUnlinkOfNewOwner(t)
-	// 100 ms of the 15-second call window remain at the dispatch.
-	f.env.Clock.Advance(billing.LinkCallTimeout - 100*time.Millisecond)
+	start := f.env.Clock.Now()
+	// Only one second of the 15-second dispatch window remains.
+	f.env.Clock.Advance(billing.LinkCallTimeout - time.Second)
 	linkGate := f.fake.Hold(accountstest.MethodLinkOrganization)
 	t.Cleanup(linkGate.Release)
 	gate.Release()
+	select {
+	case <-linkGate.Entered:
+	case err := <-done:
+		t.Fatalf("link returned before reaching Accounts: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Accounts did not receive the link")
+	}
 	select {
 	case err := <-done:
 		if testenv.Code(err) != connect.CodeUnavailable {
 			t.Fatalf("link with a stalled call: %v, want unavailable", err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("the stalled call was not bounded to the remaining window")
 	}
-	// The call was cut short, so the row stays and the lease holder removes
-	// whatever the call may still create, after the first back-off.
-	f.wantRows(t, 1, 1)
-	linkGate.Release()
-	f.env.Clock.Advance(time.Minute)
-	if err := f.env.App.Billing.RetryPendingUnlinks(ctx); err != nil {
+
+	// Move past the ordinary first retry delay while Accounts still holds
+	// the link. A restarted worker and the new owner must both leave the
+	// recovery row in place and send no unlink.
+	restarted := f.restart()
+	unlinkCalls := f.fake.Calls(accountstest.MethodUnlinkOrganization)
+	f.env.Clock.Advance(2 * time.Second)
+	if err := restarted.RetryPendingUnlinks(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err := f.unlink(f.env.User(f.org.Admin)); testenv.Code(err) != connect.CodeUnavailable {
+		t.Errorf("owner unlink during recovery grace: %v, want unavailable", err)
+	}
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != unlinkCalls {
+		t.Errorf("UnlinkOrganization calls during recovery grace = %d, want %d", n, unlinkCalls)
+	}
+	f.wantRows(t, 1, 1)
+	f.wantRemoteLink(t, false)
+
+	linkGate.Release()
+	testenv.Eventually(t, "late Accounts link", func() bool {
+		account, _, ok := f.fake.Link(f.org.ID)
+		return ok && account == billingAccountB
+	})
+	// Even a visible remote link remains protected until the deadline.
+	cutoff := start.Add(billing.LinkCallTimeout + 15*time.Second).Truncate(time.Microsecond)
+	f.env.Clock.Advance(cutoff.Sub(f.env.Clock.Now()) - time.Microsecond)
+	if err := restarted.RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, true)
+	f.wantRows(t, 1, 1)
+
+	f.env.Clock.Advance(time.Microsecond)
+	if err := restarted.RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, false)
 	f.wantRows(t, 0, 0)
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != unlinkCalls+1 {
+		t.Fatalf("UnlinkOrganization calls after recovery grace = %d, want %d", n, unlinkCalls+1)
+	}
 }
 
 // linkUpstreamOnly links the organization to billingAccountA on

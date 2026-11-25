@@ -448,7 +448,9 @@ func (h BillingHandler) finishLinkAttempt(ctx context.Context, orgID string, att
 			h.abandonLinkAttempt(detached, orgID, attempt)
 			return billing.Status{}, billing.Change{}, "", h.accountsError(ctx, "LinkOrganization", cerr, connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeAlreadyExists, connect.CodeInvalidArgument)
 		}
-		h.releaseLinkAttempt(detached, orgID, attempt)
+		// Accounts may still commit the link after the client gives up.
+		// Keep the persisted deadline and worker schedule so cleanup waits.
+		h.logUnconfirmedLinkAttempt(ctx, orgID, attempt)
 		return billing.Status{}, billing.Change{}, "", h.accountsError(ctx, "LinkOrganization", cerr)
 	}
 	var st billing.Status
@@ -510,13 +512,17 @@ func (h BillingHandler) abandonLinkAttempt(ctx context.Context, orgID string, at
 	}
 }
 
-// releaseLinkAttempt records that the call of an attempt without a confirmed
-// local link has returned, so that the reconciliation can start.
+// releaseLinkAttempt allows early reconciliation when dispatch did not start
+// or Accounts confirmed the link but the local write failed.
 func (h BillingHandler) releaseLinkAttempt(ctx context.Context, orgID string, attempt *linkAttempt) {
 	if err := h.Billing.ReleaseLinkAttempt(ctx, orgID, attempt.id); err != nil {
 		h.Logger.WarnContext(ctx, "billing_link_attempt_release_failed", slog.String("organization_id", orgID), slog.String("link_attempt_id", attempt.id), slog.Any("error", err))
 		return
 	}
+	h.logUnconfirmedLinkAttempt(ctx, orgID, attempt)
+}
+
+func (h BillingHandler) logUnconfirmedLinkAttempt(ctx context.Context, orgID string, attempt *linkAttempt) {
 	h.Logger.WarnContext(ctx, "billing_link_attempt_unconfirmed", slog.String("organization_id", orgID), slog.String("billing_account_id", attempt.accountID),
 		slog.String("link_attempt_id", attempt.id))
 }
