@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -49,7 +50,7 @@ func TestMountedISOFailedExplicitDismountIsRetriedByDeferred(t *testing.T) {
 	if !strings.Contains(buf.String(), "dismount the ISO failed") {
 		t.Errorf("the failure was not logged: %q", buf.String())
 	}
-	m.release(context.Background(), logger) // the deferred dismount
+	m.finish(logger) // the deferred dismount
 	if len(rec.ctxErrs) != 2 {
 		t.Fatalf("the runner ran %d times, want 2", len(rec.ctxErrs))
 	}
@@ -74,7 +75,7 @@ func TestMountedISOSuccessfulExplicitDismountLeavesDeferredIdle(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 	m.release(context.Background(), logger)
-	m.release(context.Background(), logger) // deferred
+	m.finish(logger) // deferred
 	if len(rec.ctxErrs) != 1 {
 		t.Errorf("the runner ran %d times, want 1", len(rec.ctxErrs))
 	}
@@ -210,7 +211,7 @@ func (f *fakeISOHost) count(step string) int {
 
 func TestMountISOAttachesAndDismountsOnce(t *testing.T) {
 	f := &fakeISOHost{}
-	m, err := mountISOWith(context.Background(), `C:\iso\a.iso`, f.run)
+	m, err := mountTestISO(context.Background(), `C:\iso\a.iso`, f.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +231,7 @@ func TestMountISOAttachesAndDismountsOnce(t *testing.T) {
 
 func TestMountISOKeepsAnISOAttachedBeforeTheBuild(t *testing.T) {
 	f := &fakeISOHost{attached: true}
-	m, err := mountISOWith(context.Background(), `C:\iso\b.iso`, f.run)
+	m, err := mountTestISO(context.Background(), `C:\iso\b.iso`, f.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +246,7 @@ func TestMountISOKeepsAnISOAttachedBeforeTheBuild(t *testing.T) {
 
 func TestMountISOPreAttachedStaysAttachedAfterFailedDiscovery(t *testing.T) {
 	f := &fakeISOHost{attached: true, volumeErr: errors.New("Get-Volume failed")}
-	_, err := mountISOWith(context.Background(), `C:\iso\c.iso`, f.run)
+	_, err := mountTestISO(context.Background(), `C:\iso\c.iso`, f.run)
 	if err == nil || !strings.Contains(err.Error(), "Get-Volume failed") {
 		t.Fatalf("err = %v", err)
 	}
@@ -268,7 +269,7 @@ func TestMountISODiscoveryFailuresDismount(t *testing.T) {
 		{"long drive letter", &fakeISOHost{volumeOut: `{"letter":"EF"}`}, "no drive letter"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m, err := mountISOWith(context.Background(), `C:\iso\d.iso`, tc.host.run)
+			m, err := mountTestISO(context.Background(), `C:\iso\d.iso`, tc.host.run)
 			if m != nil || err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("m = %v, err = %v", m, err)
 			}
@@ -282,7 +283,7 @@ func TestMountISODiscoveryFailuresDismount(t *testing.T) {
 func TestMountISOCanceledDiscoveryDismountsOnAFreshContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &fakeISOHost{volumeErr: context.Canceled, onVolume: cancel}
-	_, err := mountISOWith(ctx, `C:\iso\e.iso`, f.run)
+	_, err := mountTestISO(ctx, `C:\iso\e.iso`, f.run)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
@@ -298,7 +299,7 @@ func TestMountISOCleanupFailureIsJoinedWithThePrimaryError(t *testing.T) {
 	primary := errors.New("Get-Volume failed")
 	cleanup := errors.New("detach failed")
 	f := &fakeISOHost{volumeErr: primary, dismountErr: cleanup}
-	_, err := mountISOWith(context.Background(), `C:\iso\f.iso`, f.run)
+	_, err := mountTestISO(context.Background(), `C:\iso\f.iso`, f.run)
 	if !errors.Is(err, primary) || !errors.Is(err, cleanup) {
 		t.Fatalf("err = %v, want both the primary and the cleanup error", err)
 	}
@@ -306,11 +307,15 @@ func TestMountISOCleanupFailureIsJoinedWithThePrimaryError(t *testing.T) {
 
 func TestMountISOMountRunsDetachedFromCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 	f := &fakeISOHost{}
-	// The query step sees the canceled context but the fake ignores it; the
-	// mount step must not.
-	m, err := mountISOWith(ctx, `C:\iso\g.iso`, f.run)
+	run := func(c context.Context, script string, env ...string) ([]byte, error) {
+		if script == isoQueryScript {
+			cancel()
+		}
+		return f.run(c, script, env...)
+	}
+	m, err := mountTestISO(ctx, `C:\iso\g.iso`, run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +331,7 @@ func TestMountISOAmbiguousMountFailureIsReconciled(t *testing.T) {
 		f := &fakeISOHost{mountErr: mountErr, mountAttachesOnError: true}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		_, err := mountISOWith(ctx, `C:\iso\h.iso`, f.run)
+		_, err := mountTestISO(ctx, `C:\iso\h.iso`, f.run)
 		if !errors.Is(err, mountErr) {
 			t.Fatalf("err = %v", err)
 		}
@@ -336,7 +341,7 @@ func TestMountISOAmbiguousMountFailureIsReconciled(t *testing.T) {
 	})
 	t.Run("still detached", func(t *testing.T) {
 		f := &fakeISOHost{mountErr: mountErr}
-		_, err := mountISOWith(context.Background(), `C:\iso\i.iso`, f.run)
+		_, err := mountTestISO(context.Background(), `C:\iso\i.iso`, f.run)
 		if !errors.Is(err, mountErr) {
 			t.Fatalf("err = %v", err)
 		}
@@ -346,7 +351,7 @@ func TestMountISOAmbiguousMountFailureIsReconciled(t *testing.T) {
 	})
 	t.Run("state unknown", func(t *testing.T) {
 		f := &fakeISOHost{mountErr: mountErr, mountAttachesOnError: true, queryErrAfterMount: errors.New("query failed")}
-		_, err := mountISOWith(context.Background(), `C:\iso\j.iso`, f.run)
+		_, err := mountTestISO(context.Background(), `C:\iso\j.iso`, f.run)
 		if !errors.Is(err, mountErr) {
 			t.Fatalf("err = %v", err)
 		}
@@ -364,7 +369,7 @@ func TestMountISOAmbiguousMountFailureIsReconciled(t *testing.T) {
 			}
 			return f2(c, script, env...)
 		}
-		_, err := mountISOWith(ctx, `C:\iso\k.iso`, wrapped)
+		_, err := mountTestISO(ctx, `C:\iso\k.iso`, wrapped)
 		if !errors.Is(err, mountErr) {
 			t.Fatalf("err = %v", err)
 		}
@@ -379,13 +384,13 @@ func TestMountISOAmbiguousMountFailureIsReconciled(t *testing.T) {
 
 func TestMountISOQueryFailureAttachesNothing(t *testing.T) {
 	f := &fakeISOHost{queryErr: errors.New("Get-DiskImage failed")}
-	_, err := mountISOWith(context.Background(), `C:\iso\l.iso`, f.run)
+	_, err := mountTestISO(context.Background(), `C:\iso\l.iso`, f.run)
 	if err == nil || f.count("mount") != 0 || f.count("dismount") != 0 {
 		t.Fatalf("err = %v, steps = %v", err, f.steps)
 	}
 	// The path lock was released.
 	f2 := &fakeISOHost{}
-	m, err := mountISOWith(context.Background(), `C:\iso\l.iso`, f2.run)
+	m, err := mountTestISO(context.Background(), `C:\iso\l.iso`, f2.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,14 +399,14 @@ func TestMountISOQueryFailureAttachesNothing(t *testing.T) {
 
 func TestMountISOSerializesBuildsOfOneISOPath(t *testing.T) {
 	f := &fakeISOHost{}
-	first, err := mountISOWith(context.Background(), `C:\iso\m.iso`, f.run)
+	first, err := mountTestISO(context.Background(), `C:\iso\m.iso`, f.run)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// A canceled wait returns without touching the attachment.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := mountISOWith(ctx, `C:\ISO\M.iso`, f.run); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := mountTestISO(ctx, `C:\ISO\M.iso`, f.run); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("overlapping mount = %v, want a deadline error", err)
 	}
 	if f.count("query") != 1 {
@@ -409,7 +414,7 @@ func TestMountISOSerializesBuildsOfOneISOPath(t *testing.T) {
 	}
 	// A different path does not wait.
 	other := &fakeISOHost{}
-	o, err := mountISOWith(context.Background(), `C:\iso\n.iso`, other.run)
+	o, err := mountTestISO(context.Background(), `C:\iso\n.iso`, other.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +427,7 @@ func TestMountISOSerializesBuildsOfOneISOPath(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		m, err := mountISOWith(context.Background(), `C:\iso\m.iso`, f.run)
+		m, err := mountTestISO(context.Background(), `C:\iso\m.iso`, f.run)
 		done <- result{m, err}
 	}()
 	select {
@@ -450,7 +455,7 @@ func TestMountISOSerializesBuildsOfOneISOPath(t *testing.T) {
 
 func TestMountISOFailedDismountKeepsTheLockUntilItSucceeds(t *testing.T) {
 	f := &fakeISOHost{}
-	m, err := mountISOWith(context.Background(), `C:\iso\o.iso`, f.run)
+	m, err := mountTestISO(context.Background(), `C:\iso\o.iso`, f.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,14 +464,94 @@ func TestMountISOFailedDismountKeepsTheLockUntilItSucceeds(t *testing.T) {
 	m.release(context.Background(), logger)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := mountISOWith(ctx, `C:\iso\o.iso`, f.run); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := mountTestISO(ctx, `C:\iso\o.iso`, f.run); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("mount while the ISO stays attached = %v", err)
 	}
 	f.dismountErr = nil
 	m.release(context.Background(), logger)
-	m2, err := mountISOWith(context.Background(), `C:\iso\o.iso`, f.run)
+	m2, err := mountTestISO(context.Background(), `C:\iso\o.iso`, f.run)
 	if err != nil {
 		t.Fatal(err)
 	}
 	m2.release(context.Background(), logger)
+}
+
+func mountTestISO(ctx context.Context, path string, run isoRunner) (*mountedISO, error) {
+	return mountISOWith(ctx, path, run, lockTestISO)
+}
+
+// isoLocks lets portable fixtures exercise the ISO lifetime with a
+// process-local lock. Windows builds use lockWindowsISO.
+var isoLocks = struct {
+	sync.Mutex
+	m map[string]*isoLockEntry
+}{m: map[string]*isoLockEntry{}}
+
+type isoLockEntry struct {
+	token chan struct{} // holds one value while the path is free
+	refs  int
+}
+
+// lockTestISO waits until no other build holds path, or ctx ends, and returns the
+// function that releases the path.
+func lockTestISO(ctx context.Context, path string) (func(), error) {
+	key := isoLockKey(path)
+	isoLocks.Lock()
+	e := isoLocks.m[key]
+	if e == nil {
+		e = &isoLockEntry{token: make(chan struct{}, 1)}
+		e.token <- struct{}{}
+		isoLocks.m[key] = e
+	}
+	e.refs++
+	isoLocks.Unlock()
+
+	forget := func() {
+		isoLocks.Lock()
+		if e.refs--; e.refs == 0 {
+			delete(isoLocks.m, key)
+		}
+		isoLocks.Unlock()
+	}
+	release := func() {
+		e.token <- struct{}{}
+		forget()
+	}
+	// Take a free path even when ctx is done, so that the outcome does not
+	// depend on the random choice of select; a done ctx fails the next step.
+	select {
+	case <-e.token:
+		return release, nil
+	default:
+	}
+	select {
+	case <-e.token:
+		return release, nil
+	case <-ctx.Done():
+		forget()
+		return nil, ctx.Err()
+	}
+}
+
+func TestMountedISOFinalFailedDismountReleasesTheLock(t *testing.T) {
+	host := &fakeISOHost{dismountErr: errors.New("detach failed")}
+	ctx := context.Background()
+	path := `C:\iso\final-failed-dismount.iso`
+	m, err := mountTestISO(ctx, path, host.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	m.finish(slog.New(slog.NewTextHandler(&log, nil)))
+	if !host.attached || host.count("dismount") != 1 || !strings.Contains(log.String(), "detach failed") {
+		t.Fatalf("unexpected final detach result: attached=%v steps=%v log=%q", host.attached, host.steps, &log)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	replacement, err := mountTestISO(ctx, path, host.run)
+	if err != nil {
+		t.Fatalf("the final detach attempt kept the lock: %v", err)
+	}
+	replacement.finish(slog.New(slog.NewTextHandler(&log, nil)))
 }

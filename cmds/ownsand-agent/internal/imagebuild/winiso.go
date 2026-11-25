@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -50,6 +49,8 @@ const (
 // isoRunner runs a PowerShell script with env added to the environment and
 // returns its standard output. Production uses powershell; tests replace it.
 type isoRunner func(ctx context.Context, script string, env ...string) ([]byte, error)
+
+type isoLocker func(ctx context.Context, path string) (func(), error)
 
 // tail returns the last n bytes of s without surrounding space.
 func tail(s string, n int) string {
@@ -130,10 +131,14 @@ func (m *mountedISO) driveLetter(ctx context.Context) (string, error) {
 // joins the primary error with the error of the detach, if any. The caller
 // receives the attachment, and the duty to release it, only after the drive
 // letter is known.
-func mountISOWith(ctx context.Context, path string, run isoRunner) (*mountedISO, error) {
-	unlock, err := lockISO(ctx, path)
+func mountISOWith(ctx context.Context, path string, run isoRunner, lock isoLocker) (*mountedISO, error) {
+	unlock, err := lock(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("imagebuild: wait for another build of the ISO: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		unlock()
+		return nil, err
 	}
 	m := &mountedISO{path: path, run: run, unlock: unlock}
 
@@ -212,16 +217,10 @@ func (m *mountedISO) release(ctx context.Context, logger *slog.Logger) {
 	}
 }
 
-// isoLocks serializes builds by ISO path. An entry exists while a build holds
-// or waits for the path.
-var isoLocks = struct {
-	sync.Mutex
-	m map[string]*isoLockEntry
-}{m: map[string]*isoLockEntry{}}
-
-type isoLockEntry struct {
-	token chan struct{} // holds one value while the path is free
-	refs  int
+// finish makes the final detach attempt and releases the lock even if it fails.
+func (m *mountedISO) finish(logger *slog.Logger) {
+	defer m.releaseLock()
+	m.release(context.Background(), logger)
 }
 
 // isoLockKey normalizes path: Windows file names are case-insensitive.
@@ -230,45 +229,4 @@ func isoLockKey(path string) string {
 		path = abs
 	}
 	return strings.ToLower(filepath.Clean(path))
-}
-
-// lockISO waits until no other build holds path, or ctx ends, and returns the
-// function that releases the path.
-func lockISO(ctx context.Context, path string) (func(), error) {
-	key := isoLockKey(path)
-	isoLocks.Lock()
-	e := isoLocks.m[key]
-	if e == nil {
-		e = &isoLockEntry{token: make(chan struct{}, 1)}
-		e.token <- struct{}{}
-		isoLocks.m[key] = e
-	}
-	e.refs++
-	isoLocks.Unlock()
-
-	forget := func() {
-		isoLocks.Lock()
-		if e.refs--; e.refs == 0 {
-			delete(isoLocks.m, key)
-		}
-		isoLocks.Unlock()
-	}
-	release := func() {
-		e.token <- struct{}{}
-		forget()
-	}
-	// Take a free path even when ctx is done, so that the outcome does not
-	// depend on the random choice of select; a done ctx fails the next step.
-	select {
-	case <-e.token:
-		return release, nil
-	default:
-	}
-	select {
-	case <-e.token:
-		return release, nil
-	case <-ctx.Done():
-		forget()
-		return nil, ctx.Err()
-	}
 }
