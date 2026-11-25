@@ -168,11 +168,16 @@ describe("agent version policy during a refresh", () => {
 
   test("keeps a mode edit and updates the untouched version and its validation", async () => {
     const { render, refresh, serverChange, state } = controlPlane();
+    const invalidVersionInput = () =>
+      screen.queryByRole("textbox", {
+        name: "Pinned version",
+        description: (description) => description.includes(VERSION_ERROR),
+      });
     render();
     await screen.findByRole("radio", { name: DEFAULT }, WAIT);
     await selectMode(PIN);
     await save();
-    expect(screen.getByText(VERSION_ERROR)).toBeTruthy();
+    expect(invalidVersionInput()).toBe(input());
     expect(state.saves).toHaveLength(0);
 
     await serverChange(AgentVersionPolicyMode.HOLD);
@@ -180,19 +185,19 @@ describe("agent version policy during a refresh", () => {
     await screen.findByText(/^Last changed /, {}, WAIT);
     expect(selected(PIN)).toBe("true");
     expect(input().value).toBe("");
-    expect(screen.getByText(VERSION_ERROR)).toBeTruthy();
+    expect(invalidVersionInput()).toBe(input());
 
     await serverChange(AgentVersionPolicyMode.PIN, "2.0.0");
     await refresh();
     await waitFor(() => expect(input().value).toBe("2.0.0"), WAIT);
-    expect(screen.queryByText(VERSION_ERROR)).toBeNull();
+    expect(invalidVersionInput()).toBeNull();
 
     await editVersion("");
-    expect(screen.queryByText(VERSION_ERROR)).toBeNull();
+    expect(invalidVersionInput()).toBeNull();
     await save();
-    expect(screen.getByText(VERSION_ERROR)).toBeTruthy();
+    expect(invalidVersionInput()).toBe(input());
     await editVersion("1.4.2");
-    expect(screen.queryByText(VERSION_ERROR)).toBeNull();
+    expect(invalidVersionInput()).toBeNull();
   });
 
   test("follows an untouched mode and keeps an edited version when pinning returns", async () => {

@@ -1992,16 +1992,34 @@ describe("settings", () => {
     await type(threshold, "9.99");
     await type(amount, "24.99");
     await click(save);
-    expect(screen.getByText("Enter at least $10.00.")).toBeTruthy();
-    expect(screen.getByText("Enter at least $25.00.")).toBeTruthy();
-    expect(screen.getByText("Enter an amount.")).toBeTruthy();
+    expect(
+      within(form).getByRole("textbox", {
+        name: "Threshold (USD)",
+        description: /Enter at least \$10\.00\./,
+      }),
+    ).toBe(threshold);
+    expect(
+      within(form).getByRole("textbox", {
+        name: "Top-up amount (USD)",
+        description: /Enter at least \$25\.00\./,
+      }),
+    ).toBe(amount);
+    expect(
+      within(form).getByRole("textbox", {
+        name: "Monthly cap (USD)",
+        description: /Enter an amount\./,
+      }),
+    ).toBe(cap);
     await type(threshold, "10");
     await type(amount, "50");
     await type(cap, "40");
     await click(save);
     expect(
-      screen.getByText("Enter at least the top-up amount ($50.00)."),
-    ).toBeTruthy();
+      within(form).getByRole("textbox", {
+        name: "Monthly cap (USD)",
+        description: /Enter at least the top-up amount \(\$50\.00\)\./,
+      }),
+    ).toBe(cap);
     expect(calls(api, "UpdateAutoTopUpSettings")).toHaveLength(0);
     await type(cap, "200.00");
     await click(save);
