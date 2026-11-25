@@ -537,6 +537,26 @@ describe("integrations", () => {
     ).toBeVisible();
   });
 
+  test("the GitHub callback rejects an installation ID above the signed int64 limit", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(
+      "/github/setup?installation_id=9223372036854775808&code=e2e_code&state=mock-state",
+    );
+
+    await expect(screen.getByRole("main").getByRole("alert")).toContainText(
+      "The address has no GitHub installation details.",
+    );
+    await expect(browser).toHaveURL("/github/setup");
+    await expect(
+      screen.getByRole("combobox", "tide organization"),
+    ).toBeHidden();
+  });
+
   test("an owner can change the runner group and unlink an installation on the next page", async ({
     app,
     screen,

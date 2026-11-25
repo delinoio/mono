@@ -599,6 +599,23 @@ describe("GitHub callback", () => {
     ).toBeUndefined();
   });
 
+  test("accepts installation IDs through the signed int64 limit", () => {
+    expect(
+      parseGitHubCallback(
+        "?installation_id=9223372036854775807&code=c&state=s",
+      ),
+    ).toEqual({
+      githubInstallationId: 9_223_372_036_854_775_807n,
+      code: "c",
+      state: "s",
+    });
+    expect(
+      parseGitHubCallback(
+        "?installation_id=9223372036854775808&code=c&state=s",
+      ),
+    ).toBeUndefined();
+  });
+
   test("removes the query from the address bar", () => {
     const calls: string[] = [];
     stripCallbackFromAddress(

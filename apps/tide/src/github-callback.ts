@@ -21,6 +21,8 @@ export interface GitHubCallback {
   state: string;
 }
 
+const MAX_INT64 = 2n ** 63n - 1n;
+
 /** Parses the callback query; undefined when a value is missing or invalid. */
 export function parseGitHubCallback(
   search: string,
@@ -32,7 +34,11 @@ export function parseGitHubCallback(
   if (!/^[1-9][0-9]{0,18}$/.test(id) || code === "" || state === "") {
     return undefined;
   }
-  return { githubInstallationId: BigInt(id), code, state };
+  const githubInstallationId = BigInt(id);
+  if (githubInstallationId > MAX_INT64) {
+    return undefined;
+  }
+  return { githubInstallationId, code, state };
 }
 
 /**
