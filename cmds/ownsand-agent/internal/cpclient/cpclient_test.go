@@ -60,6 +60,50 @@ func TestHTTPClientRedirectPolicy(t *testing.T) {
 	}
 }
 
+func TestNewHTTPClientRejectsInvalidOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		origin string
+		reason string
+	}{
+		{"HTTPS without authority", "https:///control", "requires a hostname"},
+		{"HTTP without authority", "http:///control", "requires a hostname"},
+		{"HTTPS with port only", "https://:443", "requires a hostname"},
+		{"HTTP with port only", "http://:18300", "requires a hostname"},
+		{"malformed URL", "https://example.test:bad-port/control", "invalid control plane origin URL"},
+		{"unsupported scheme", "ftp://example.test", "must use https or http"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := NewHTTPClient(tc.origin, nil)
+			if client != nil || err == nil || !strings.Contains(err.Error(), tc.reason) || strings.Contains(err.Error(), tc.origin) {
+				t.Fatalf("NewHTTPClient() = %v, %v; want error containing %q without the URL", client, err, tc.reason)
+			}
+		})
+	}
+}
+
+func TestNewHTTPClientSelectsHTTP2Transport(t *testing.T) {
+	for _, tc := range []struct {
+		origin string
+		useTLS bool
+	}{
+		{"https://example.test", true},
+		{"http://127.0.0.1:18300", false},
+		{"http://[::1]:18300", false},
+	} {
+		t.Run(tc.origin, func(t *testing.T) {
+			client, err := NewHTTPClient(tc.origin, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			protocols := client.Transport.(*http.Transport).Protocols
+			if protocols.HTTP1() || protocols.HTTP2() != tc.useTLS || protocols.UnencryptedHTTP2() == tc.useTLS {
+				t.Fatalf("protocols = %v; want only HTTP/2 with TLS enabled = %t", protocols, tc.useTLS)
+			}
+		})
+	}
+}
+
 // authTestTimeout is the shortened attempt deadline of these tests. The
 // production default is DefaultAuthTimeout.
 const authTestTimeout = 300 * time.Millisecond

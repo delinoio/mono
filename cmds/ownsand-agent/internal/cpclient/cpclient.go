@@ -80,7 +80,8 @@ func (c *Client) EnrollContext(ctx context.Context) (context.Context, context.Ca
 func NewHTTPClient(apiURL string, tlsConfig *tls.Config) (*http.Client, error) {
 	u, err := url.Parse(apiURL)
 	if err != nil {
-		return nil, fmt.Errorf("cpclient: invalid control plane origin: %w", err)
+		// The parse error includes the input URL, which may contain credentials.
+		return nil, errors.New("cpclient: invalid control plane origin URL")
 	}
 	var protocols http.Protocols
 	switch u.Scheme {
@@ -89,7 +90,10 @@ func NewHTTPClient(apiURL string, tlsConfig *tls.Config) (*http.Client, error) {
 	case "http":
 		protocols.SetUnencryptedHTTP2(true)
 	default:
-		return nil, fmt.Errorf("cpclient: control plane origin must use https or http, not %q", u.Scheme)
+		return nil, errors.New("cpclient: control plane origin must use https or http")
+	}
+	if u.Hostname() == "" {
+		return nil, errors.New("cpclient: control plane origin requires a hostname")
 	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{

@@ -132,6 +132,26 @@ func TestCLIEnrollRejectsMissingDeviceIDAndRetries(t *testing.T) {
 	}
 }
 
+func TestCLIEnrollRejectsHostlessFlagBeforeCreatingIdentity(t *testing.T) {
+	clearAgentEnv(t)
+	cp := testcp.New(t)
+	dir := t.TempDir()
+	t.Setenv(config.EnvAPIURL, cp.URL)
+	const hostlessURL = "https://:443"
+	var out, errb bytes.Buffer
+	code := run([]string{"enroll", "--state-dir", dir, "--api-url", hostlessURL},
+		strings.NewReader(testcp.Token+"\n"), &out, &errb)
+	if code != exitError || !strings.Contains(errb.String(), "requires a hostname") {
+		t.Fatalf("enroll exit code = %d, stderr = %q; want exit code %d and a hostname error", code, errb.String(), exitError)
+	}
+	if _, err := os.Stat(filepath.Join(dir, store.IdentityFile)); !os.IsNotExist(err) {
+		t.Fatalf("identity file stat error = %v; want file to be absent", err)
+	}
+	if got := len(cp.EnrollPublicKeys()); got != 0 {
+		t.Fatalf("control plane got %d enrollment requests; want zero", got)
+	}
+}
+
 func TestCLIMisc(t *testing.T) {
 	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
 	clearAgentEnv(t)
