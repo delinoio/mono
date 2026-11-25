@@ -54,7 +54,12 @@ func newCursorWorldTiming(t *testing.T, guest tidev1.GuestOs, timing agent.Timin
 
 func startCursorWorld(t *testing.T, guest tidev1.GuestOs, timing agent.Timing, fake *cursorfake.Fake, opts ...testenv.Option) *cursorWorld {
 	t.Helper()
-	w := newAgentWorld(t, layers.Options{Cursor: cursor.Options{BaseURL: fake.Server.URL, RelistInterval: time.Hour}, AgentTiming: timing}, opts...)
+	return startCursorWorldRelisting(t, guest, timing, fake, time.Hour, opts...)
+}
+
+func startCursorWorldRelisting(t *testing.T, guest tidev1.GuestOs, timing agent.Timing, fake *cursorfake.Fake, relist time.Duration, opts ...testenv.Option) *cursorWorld {
+	t.Helper()
+	w := newAgentWorld(t, layers.Options{Cursor: cursor.Options{BaseURL: fake.Server.URL, RelistInterval: relist}, AgentTiming: timing}, opts...)
 	cw := &cursorWorld{agentWorld: w, cursor: fake}
 	cw.integrationID = w.createIntegration(t, &tidev1.CreateAgentIntegrationRequest{
 		Vendor: tidev1.AgentVendor_AGENT_VENDOR_CURSOR, Name: "cursor",
@@ -445,6 +450,7 @@ func TestCursorWatchPaginationRepeats(t *testing.T) {
 			timing.BackoffMin = backoff
 			w := startCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, timing, fake)
 			eventually(t, "the Cursor recovery stream", func() bool { return fake.Streams() == 1 })
+			w.requestBySource(t, "recovered")
 
 			lists, claims, streams := fake.WatchCalls()
 			var tokens []string
@@ -482,6 +488,8 @@ func TestCursorWatchPaginationUsesFinalCursor(t *testing.T) {
 	)
 	w := startCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, agent.Timing{}, fake)
 	eventually(t, "the Cursor stream", func() bool { return fake.Streams() == 1 })
+	w.requestBySource(t, "first")
+	w.requestBySource(t, "second")
 
 	lists, claims, streams := fake.WatchCalls()
 	if len(lists) != 2 || lists[0].PageToken != "" || lists[1].PageToken != "next" {
@@ -490,8 +498,151 @@ func TestCursorWatchPaginationUsesFinalCursor(t *testing.T) {
 	if !slices.Equal(claims, []string{"first", "second"}) || !slices.Equal(streams, []string{"final-cursor"}) {
 		t.Fatalf("claim calls = %q, stream cursors = %q", claims, streams)
 	}
-	w.requestBySource(t, "first")
-	w.requestBySource(t, "second")
+}
+
+func TestCursorWatchRelistsWhileClaimIsBlocked(t *testing.T) {
+	for _, source := range []string{"list", "stream"} {
+		t.Run(source, func(t *testing.T) {
+			fake := cursorfake.New(t, cursorKey, "tide-pool")
+			first := fake.AddRequest("blocked", false)
+			missed := fake.AddRequest("missed", false)
+			resume := make(chan struct{})
+			fake.HoldClaim(first.ID, resume)
+			initial := cursorfake.Page{StreamCursor: "initial"}
+			if source == "list" {
+				initial.Requests = []cursorfake.Request{first}
+			}
+			fake.ScriptPages(initial,
+				cursorfake.Page{Requests: []cursorfake.Request{first}, NextPageToken: "later"},
+				cursorfake.Page{Requests: []cursorfake.Request{missed}}, // Empty cursor returns 410.
+				cursorfake.Page{Requests: []cursorfake.Request{first, missed}, StreamCursor: "recovered"},
+			)
+			timing := fastAgentTiming()
+			timing.BackoffMin, timing.BackoffMax = time.Hour, time.Hour
+			w := startCursorWorldRelisting(t, tidev1.GuestOs_GUEST_OS_LINUX, timing, fake, 500*time.Millisecond)
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
+			})
+			eventually(t, "the initial Cursor stream", func() bool { return fake.Streams() == 1 })
+			if source == "stream" {
+				fake.Announce(first.ID, first.CreatedAtMs)
+			}
+			eventually(t, "the blocked Cursor claim", func() bool {
+				_, attempts, _ := fake.WatchCalls()
+				return len(attempts) > 0
+			})
+			eventually(t, "the stream after the scheduled and 410 relists", func() bool {
+				_, _, cursors := fake.WatchCalls()
+				return slices.Contains(cursors, "recovered")
+			})
+			lists, attempts, cursors := fake.WatchCalls()
+			if len(lists) < 4 || lists[2].PageToken != "later" || len(cursors) < 3 || !slices.Equal(cursors[:3], []string{"initial", "", "recovered"}) {
+				t.Fatalf("lists = %v, stream cursors = %q", lists, cursors)
+			}
+			if !slices.Equal(attempts, []string{first.ID}) {
+				t.Fatalf("claim attempts while blocked = %q", attempts)
+			}
+			logs := w.env.Logs.String()
+			if strings.Count(logs, `"cause":"scheduled"`) < 2 || strings.Contains(logs, `"cause":"error"`) {
+				t.Fatal("expected two scheduled reconnects and no error backoff")
+			}
+			w.assertNoRequestsOrClaims(t)
+			t.Logf("Cursor listed page %q and opened streams %q while the only claim attempt %q was still blocked", lists[2].PageToken, cursors[:3], first.ID)
+
+			close(resume)
+			for _, id := range []string{first.ID, missed.ID} {
+				req := w.requestBySource(t, id)
+				w.waitRequest(t, req.GetRequestId(), tidev1.RequestState_REQUEST_STATE_QUEUED)
+				claim, err := w.l.Agents.Claim(t.Context(), req.GetRequestId())
+				if err != nil || claim.VendorRequestID != id || claim.State != agent.ClaimHeld {
+					t.Fatalf("stored claim for %q = %+v, error = %v", id, claim, err)
+				}
+			}
+			_, attempts, _ = fake.WatchCalls()
+			if !slices.Equal(attempts, []string{first.ID, missed.ID}) || len(w.requests(t)) != 2 {
+				t.Fatalf("claim attempts after release = %q, want one for each Tide request", attempts)
+			}
+			t.Logf("Tide listed two queued requests over Connect and stored one held claim for each; Cursor attempts = %q", attempts)
+		})
+	}
+}
+
+func TestCursorWatchResumesAfterAdmissionOverflow(t *testing.T) {
+	w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	resume := make(chan struct{})
+	w.cursor.HoldClaim("blocked", resume)
+	w.cursor.AddRequest("blocked", true)
+	eventually(t, "the blocked Cursor claim", func() bool {
+		_, attempts, _ := w.cursor.WatchCalls()
+		return len(attempts) > 0
+	})
+	missed := w.cursor.AddRequest("missed", false)
+
+	// Fill the whole queue with entries that stay visible in the scripted
+	// list but return 404 from the claim endpoint.
+	prefix := make([]cursorfake.Request, 100)
+	want := []string{"blocked"}
+	for i := range prefix {
+		prefix[i].ID = "stale-" + strconv.Itoa(i)
+		want = append(want, prefix[i].ID)
+	}
+	w.cursor.ScriptPages(
+		cursorfake.Page{Requests: prefix, NextPageToken: "later"},
+		cursorfake.Page{Requests: []cursorfake.Request{missed}, StreamCursor: "overflow"},
+		cursorfake.Page{Requests: prefix, NextPageToken: "later"},
+		cursorfake.Page{Requests: []cursorfake.Request{missed}, StreamCursor: "retried"},
+	)
+	w.cursor.DropStreams()
+	eventually(t, "the stream after the full queue", func() bool {
+		_, _, cursors := w.cursor.WatchCalls()
+		return slices.Contains(cursors, "overflow") && w.cursor.Streams() == 1
+	})
+	if !strings.Contains(w.env.Logs.String(), `"cause":"admission_queue_full"`) {
+		t.Fatal("the later page did not overflow the admission queue")
+	}
+	close(resume)
+	eventually(t, "the first batch of claim attempts", func() bool {
+		_, attempts, _ := w.cursor.WatchCalls()
+		return len(attempts) >= len(want)
+	})
+	w.cursor.DropStreams()
+	w.requestBySource(t, missed.ID)
+	_, attempts, _ := w.cursor.WatchCalls()
+	want = append(want, missed.ID)
+	if !slices.Equal(attempts, want) {
+		t.Fatalf("claim attempts = %q, want one pass through the prefix before %q", attempts, missed.ID)
+	}
+	t.Logf("The watcher kept %d queued admissions, then claimed %q from a later page without retrying the unchanged prefix", len(prefix), missed.ID)
+}
+
+func TestCursorWatchStopCancelsAdmission(t *testing.T) {
+	fake := cursorfake.New(t, cursorKey, "tide-pool")
+	canceled := fake.HoldClaim("blocked", make(chan struct{}))
+	fake.AddRequest("blocked", false)
+	fake.AddRequest("queued", false)
+	w := startCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, agent.Timing{}, fake)
+	eventually(t, "the Cursor stream and blocked claim", func() bool {
+		_, attempts, _ := fake.WatchCalls()
+		return fake.Streams() == 1 && len(attempts) > 0
+	})
+	owner := w.env.User(w.org.Owner)
+	if _, err := owner.Organization.DeleteOrganization(t.Context(), connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID})); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "cancellation of the claim and stream", func() bool {
+		select {
+		case <-canceled:
+			return w.cursor.Streams() == 0
+		default:
+			return false
+		}
+	})
+	_, attempts, _ := w.cursor.WatchCalls()
+	if !slices.Equal(attempts, []string{"blocked"}) {
+		t.Fatalf("claim attempts = %q; queued work survived watcher stop", attempts)
+	}
+	w.assertNoRequestsOrClaims(t)
+	t.Log("DeleteOrganization completed, the fake observed cancellation of the claim and stream, and no queued claim started")
 }
 
 // TestCursorWatchReconnect: after the stream drops, tide reconnects with

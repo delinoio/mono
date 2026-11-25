@@ -40,6 +40,12 @@ type ListCall struct {
 	At        time.Time
 }
 
+type blockedClaim struct {
+	id       string
+	resume   <-chan struct{}
+	canceled chan struct{}
+}
+
 // Fake is the fake Cursor API.
 type Fake struct {
 	Server *httptest.Server
@@ -63,6 +69,7 @@ type Fake struct {
 	pages         []Page
 	listCalls     []ListCall
 	claimCalls    []string
+	blockedClaim  *blockedClaim
 	streamCursors []string
 	auth          []string
 	// failClaimCalls makes release and fail answer 503.
@@ -129,8 +136,20 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
-		defer f.mu.Unlock()
 		f.claimCalls = append(f.claimCalls, body.ID)
+		block := f.blockedClaim
+		if block != nil && block.id == body.ID {
+			f.blockedClaim = nil
+			f.mu.Unlock()
+			select {
+			case <-block.resume:
+			case <-r.Context().Done():
+				close(block.canceled)
+				return
+			}
+			f.mu.Lock()
+		}
+		defer f.mu.Unlock()
 		if _, ok := f.claims[body.ID]; ok {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "already claimed"})
 			return
@@ -270,7 +289,7 @@ func (f *Fake) broadcastLocked(event string, v any) {
 
 // AddRequest queues a pending request. With announce, open streams get a
 // `created` event; without, only a list shows it (a dropped event).
-func (f *Fake) AddRequest(id string, announce bool) {
+func (f *Fake) AddRequest(id string, announce bool) Request {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r := Request{ID: id, CreatedAtMs: time.Now().UnixMilli()}
@@ -278,6 +297,17 @@ func (f *Fake) AddRequest(id string, announce bool) {
 	if announce {
 		f.broadcastLocked("created", r)
 	}
+	return r
+}
+
+// HoldClaim blocks the next claim of id until resume closes or the caller
+// cancels the HTTP request. The returned channel closes on cancellation.
+func (f *Fake) HoldClaim(id string, resume <-chan struct{}) <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	canceled := make(chan struct{})
+	f.blockedClaim = &blockedClaim{id: id, resume: resume, canceled: canceled}
+	return canceled
 }
 
 // Announce sends a `created` event for a request again (a duplicate).
