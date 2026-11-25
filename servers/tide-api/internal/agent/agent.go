@@ -380,7 +380,7 @@ func (h *Hub) releaseClaimLocked(ctx context.Context, c *Claim, req *work.Reques
 	}
 	done, err := v.Release(ctx, in, cur, req)
 	if done {
-		if err := h.setClaimState(ctx, h.svc.DB.Pool, cur.RequestID, ClaimHeld, ClaimReleased); err != nil {
+		if err := h.setClaimState(ctx, api.OrganizationDeletionQuerier(ctx, h.svc.DB.Pool), cur.RequestID, ClaimHeld, ClaimReleased); err != nil {
 			return false, err
 		}
 		h.log.InfoContext(ctx, "agent_claim_released", slog.String("organization_id", cur.OrganizationID), slog.String("request_id", cur.RequestID),

@@ -142,35 +142,60 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 	if err != nil {
 		return nil, err
 	}
-	d := OrganizationDeletion{OrganizationID: pre.OrganizationID, Actor: pre.Principal}
-	prepared, err := h.organizationDeletionPrepare(ctx, d)
+	// Cleanup needs a stable Postgres session and also uses the ordinary
+	// pool. Give the advisory lock its own connection.
+	conn, err := pgx.ConnectConfig(ctx, h.DB.Pool.Config().ConnConfig)
+	if err != nil {
+		return nil, h.Internal(ctx, "open organization deletion session", err)
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = conn.Close(closeCtx)
+	}()
+	d, err := h.beginOrganizationDeletion(ctx, conn, pre.OrganizationID)
+	if err != nil {
+		return nil, h.Internal(ctx, "authorize organization deletion", err)
+	}
+	attempt := &organizationDeletionAttempt{OrganizationDeletion: d, conn: conn, request: ctx}
+	committed := false
+	defer func() {
+		if !committed {
+			h.releaseOrganizationDeletion(ctx, d)
+		}
+	}()
+	cleanupCtx := context.WithValue(ctx, organizationDeletionContextKey{}, attempt)
+	prepared, err := h.organizationDeletionPrepare(cleanupCtx, d)
 	if err != nil {
 		return nil, h.Internal(ctx, "prepare organization deletion", err)
 	}
-	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
-		c, err := h.authorizeOwnerLocked(ctx, tx, d.OrganizationID)
-		if err != nil {
+	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		if err := LockOrganization(ctx, tx, d.OrganizationID); err != nil {
+			return err
+		}
+		if err := attempt.verify(ctx, tx); err != nil {
 			return err
 		}
 		if err := organizationDeletionInTx(ctx, tx, prepared); err != nil {
 			return err
 		}
-		if _, err := h.revokeAPIKeysTx(ctx, tx, c.OrganizationID, "", c.Principal); err != nil {
+		if _, err := h.revokeAPIKeysTx(ctx, tx, d.OrganizationID, "", d.Actor); err != nil {
 			return err
 		}
 		if err := h.WriteAudit(ctx, tx, AuditEvent{
-			OrganizationID: c.OrganizationID, Action: tidev1.AuditAction_AUDIT_ACTION_ORGANIZATION_DELETED, Actor: c.Principal,
-			TargetKind: tidev1.AuditTargetKind_AUDIT_TARGET_KIND_ORGANIZATION, TargetID: c.OrganizationID,
+			OrganizationID: d.OrganizationID, Action: tidev1.AuditAction_AUDIT_ACTION_ORGANIZATION_DELETED, Actor: d.Actor,
+			TargetKind: tidev1.AuditTargetKind_AUDIT_TARGET_KIND_ORGANIZATION, TargetID: d.OrganizationID,
 		}); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", c.OrganizationID)
+		_, err := tx.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", d.OrganizationID)
 		return err
 	})
 	if err != nil {
-		organizationDeletionAbort(ctx, prepared)
+		organizationDeletionAbort(cleanupCtx, prepared)
 		return nil, h.Internal(ctx, "delete organization", err)
 	}
+	committed = true
 	h.organizationDeletionAfterCommit(ctx, d, prepared)
 	return connect.NewResponse(&tidev1.DeleteOrganizationResponse{}), nil
 }
@@ -218,6 +243,13 @@ func (h OrganizationHandler) TransferOwnership(ctx context.Context, req *connect
 		c, err := h.authorizeOwnerLocked(ctx, tx, req.Msg.GetOrganizationId())
 		if err != nil {
 			return err
+		}
+		var deleting bool
+		if err := tx.QueryRow(ctx, "SELECT deletion_attempt_id IS NOT NULL FROM organizations WHERE organization_id = $1", c.OrganizationID).Scan(&deleting); err != nil {
+			return err
+		}
+		if deleting {
+			return ErrPrecondition("organization deletion is in progress; try again")
 		}
 		if target == "" {
 			return ErrInvalidf("invalid user_id: is required")

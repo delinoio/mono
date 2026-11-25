@@ -71,11 +71,12 @@ type MembershipEndHook struct {
 type OrganizationDeletion struct {
 	OrganizationID string
 	Actor          auth.Principal
+	AttemptID      string
 }
 
 // OrganizationDeletionHook prepares a layer for one deletion attempt.
-// Prepare runs after the owner pre-check, before the deletion transaction.
-// It may call external services. On failure it must undo its own work.
+// Prepare runs after the core authorizes and records the deletion intent.
+// It can call external services. The step must support retries.
 type OrganizationDeletionHook struct {
 	// Name is the stable hook name in log records.
 	Name string
@@ -86,7 +87,7 @@ type OrganizationDeletionHook struct {
 // OrganizationDeletionSteps hold the callbacks for one deletion attempt.
 // They can capture state acquired during Prepare.
 type OrganizationDeletionSteps struct {
-	// InTx runs after the organization row lock and owner check, before
+	// InTx runs after the core locks the organization and verifies the intent, before
 	// the core revokes the keys and deletes the rows.
 	InTx func(ctx context.Context, tx pgx.Tx) error
 	// AfterCommit runs after the organization is deleted.
@@ -133,6 +134,10 @@ func (s *Service) membershipEndAfterCommit(ctx context.Context, e MembershipEnd)
 func (s *Service) organizationDeletionPrepare(ctx context.Context, d OrganizationDeletion) ([]preparedOrganizationDeletionHook, error) {
 	prepared := make([]preparedOrganizationDeletionHook, 0, len(s.Hooks.OrganizationDeletion))
 	for _, h := range s.Hooks.OrganizationDeletion {
+		if err := CheckOrganizationDeletion(ctx); err != nil {
+			organizationDeletionAbort(ctx, prepared)
+			return nil, err
+		}
 		steps, err := h.Prepare(ctx, d)
 		if err != nil {
 			s.Logger.WarnContext(ctx, "organization_deletion_prepare_failed", slog.String("hook", h.Name),

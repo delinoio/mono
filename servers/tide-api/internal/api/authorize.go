@@ -113,10 +113,16 @@ func (s *Service) Authorize(ctx context.Context, q db.Querier, orgID string, act
 // lock, so a transfer that committed first is visible to a deletion and the
 // other way round.
 func (s *Service) authorizeOwnerLocked(ctx context.Context, tx pgx.Tx, orgID string) (Caller, error) {
-	if _, err := s.Authorize(ctx, tx, orgID, authz.ActionOwnerOnly); err != nil {
+	pre, err := s.Authorize(ctx, tx, orgID, authz.ActionOwnerOnly)
+	if err != nil {
 		return Caller{}, err
 	}
-	orgID, _ = NormalizeID("organization_id", orgID)
+	return s.authorizeOwnerAfterLock(ctx, tx, pre.OrganizationID)
+}
+
+// authorizeOwnerAfterLock is for callers that already ran the owner
+// pre-check and have the canonical organization ID.
+func (s *Service) authorizeOwnerAfterLock(ctx context.Context, tx pgx.Tx, orgID string) (Caller, error) {
 	if err := LockOrganization(ctx, tx, orgID); err != nil {
 		return Caller{}, err
 	}
