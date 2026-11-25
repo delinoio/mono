@@ -49,7 +49,12 @@ export function AuditPage() {
           return events.length === 0 ? (
             <Empty title="No audit events" />
           ) : (
-            <div className="table-wrap">
+            <div
+              className="table-wrap"
+              role="region"
+              aria-label="Audit events table"
+              tabIndex={0}
+            >
               <table className="table" aria-label="Audit events">
                 <thead>
                   <tr>

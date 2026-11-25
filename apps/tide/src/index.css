@@ -263,6 +263,11 @@ h2 {
   background: var(--dui-color-surface);
 }
 
+.table-wrap[tabindex="0"]:focus-visible {
+  outline: 2px solid var(--dui-color-focus-ring);
+  outline-offset: 2px;
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;
