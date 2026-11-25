@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 )
@@ -37,7 +36,7 @@ var ErrEnrollmentBusy = errors.New("store: another enrollment is running for thi
 // locked file cannot be removed, so a Reset that runs while an enrollment
 // holds the lock reports an error for the lock file.
 func (s *Store) LockEnrollment(ctx context.Context) (unlock func(), err error) {
-	f, err := os.OpenFile(s.Path(EnrollmentLockFile), os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := openEnrollmentLock(s.dir)
 	if err != nil {
 		return nil, fmt.Errorf("store: open enrollment lock: %w", err)
 	}

@@ -7,9 +7,14 @@ package store
 import (
 	"errors"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/windows"
 )
+
+func openEnrollmentLock(dir string) (*os.File, error) {
+	return os.OpenFile(filepath.Join(dir, EnrollmentLockFile), os.O_RDWR|os.O_CREATE, 0o600)
+}
 
 // tryLockFile takes an exclusive LockFileEx lock on the first byte without
 // waiting. It reports false when another handle holds the lock.
