@@ -34,7 +34,7 @@ func TestInstallAndStartCommands(t *testing.T) {
 			[]string{runnerSHA256["linux-x64"], runnerSHA256["linux-arm64"]}, "./run.sh --jitconfig"},
 		{tidev1.GuestOs_GUEST_OS_MACOS, "/bin/sh", []string{"actions-runner-osx-$arch-2.338.2.tar.gz", "/opt/actions-runner"},
 			[]string{runnerSHA256["osx-x64"], runnerSHA256["osx-arm64"]}, "./run.sh --jitconfig"},
-		{tidev1.GuestOs_GUEST_OS_WINDOWS, "powershell.exe", []string{"actions-runner-win-$a-2.338.2.zip", `C:\actions-runner`, "Get-FileHash", "icacls.exe"},
+		{tidev1.GuestOs_GUEST_OS_WINDOWS, "powershell.exe", []string{"actions-runner-win-$a-2.338.2.zip", `C:\actions-runner`, "Get-FileHash", "Set-Acl"},
 			[]string{runnerSHA256["win-x64"], runnerSHA256["win-arm64"]}, "run.cmd --jitconfig"},
 	} {
 		install := InstallCommand(tc.guest)
