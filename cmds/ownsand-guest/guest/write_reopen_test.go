@@ -79,6 +79,7 @@ func newReopenFixture(t *testing.T, mode uint32) *reopenFixture {
 			if e.file != nil {
 				e.file.Close()
 			}
+			e.closeModeFile()
 		}
 	})
 	id := newID(t)
@@ -337,28 +338,113 @@ func TestWriteDoesNotReopenReplacedStagingFile(t *testing.T) {
 	if f.entry(t).identity == nil {
 		t.Skip("the platform keeps no staging file identity")
 	}
+	replaceStagingFile(t, f)
+
+	f.checkRejectedReplacement(t)
+}
+
+func TestWriteDoesNotReopenReplacedStagingFileDuringModeRestore(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not restore staging permissions")
+	}
+	f := newReopenFixture(t, 0)
+	f.stageAndFailFinish(t)
+
+	chmod := chmodStagingFile
+	t.Cleanup(func() { chmodStagingFile = chmod })
+	chmodStagingFile = func(file *os.File, mode os.FileMode) error {
+		// ensureOpen has verified the path. Change it before the mode
+		// operation and let the writable reopen see the new file.
+		replaceStagingFile(t, f)
+		return chmod(file, mode)
+	}
+
+	f.checkRejectedReplacement(t)
+}
+
+func replaceStagingFile(t *testing.T, f *reopenFixture) {
+	t.Helper()
 	tmp := tempPath(f.target, f.id)
-	// Keep the original file alive through a second name, so the replacement
-	// cannot reuse its inode or file index.
-	keep := tmp + ".keep"
-	if err := os.Link(tmp, keep); err != nil {
+	// Keep the original inode or file index from being reused.
+	if err := os.Link(tmp, tmp+".keep"); err != nil {
 		t.Skipf("hard links are not available: %v", err)
 	}
 	if err := os.Remove(tmp); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(tmp, []byte("foreign"), 0o600); err != nil {
+	if err := os.WriteFile(tmp, []byte("foreign"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(tmp, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkReplacement(t, tmp)
+}
 
-	_, err := f.m.apply(f.finish)
-	wantOpError(t, err, ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write staging file is gone")
-	f.m.sweep(f.clock.Now())
-	// The sweep keeps a file that the helper did not create.
-	if got, err := os.ReadFile(tmp); err != nil || string(got) != "foreign" {
+func checkReplacement(t *testing.T, path string) {
+	t.Helper()
+	if got, err := os.ReadFile(path); err != nil || string(got) != "foreign" {
 		t.Fatalf("replaced file %q %v", got, err)
 	}
+	if runtime.GOOS != "windows" {
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := st.Mode().Perm(); mode != 0o644 {
+			t.Fatalf("replacement mode %04o, want 0644", mode)
+		}
+	}
+}
+
+func (f *reopenFixture) checkRejectedReplacement(t *testing.T) {
+	t.Helper()
+	tmp := tempPath(f.target, f.id)
+	_, err := f.m.apply(f.finish)
+	wantOpError(t, err, ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write staging file is gone")
+	checkReplacement(t, tmp)
+	_, err = f.m.apply(f.finish)
+	wantOpError(t, err, ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write expired")
+
+	record := f.m.recordPath(f.id)
+	if !exists(record) {
+		t.Fatal("write record is gone before the sweep")
+	}
+	f.m.sweep(f.clock.Now())
+	checkReplacement(t, tmp)
+	if exists(record) {
+		t.Fatal("write record left after the sweep")
+	}
+	_, err = f.m.apply(f.finish)
+	wantOpError(t, err, ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write expired")
 	if _, err := os.Stat(f.target); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("target after a replaced staging file: %v", err)
+	}
+}
+
+func TestWriteFinishRetryWithoutOwnerReadOrWriteMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ignores the finish mode")
+	}
+	f := newReopenFixture(t, 0o100)
+	f.stageAndFailFinish(t)
+
+	if resp, err := f.m.apply(f.finish); err != nil || !resp.GetFinished() {
+		t.Fatalf("repeated finish: %v %v", resp, err)
+	}
+	st, err := os.Stat(f.target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := st.Mode().Perm(); mode != 0o100 {
+		t.Fatalf("target mode %04o, want 0100", mode)
+	}
+	if err := os.Chmod(f.target, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(f.target); err != nil || string(got) != "hello" {
+		t.Fatalf("target: %q %v", got, err)
 	}
 }

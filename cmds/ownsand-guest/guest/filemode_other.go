@@ -18,13 +18,3 @@ func applyFileMode(f *os.File, wire uint32) error {
 	}
 	return nil
 }
-
-// restoreStagingMode makes the staging file readable and writable for its
-// owner again after a failed rename, so the file can be reopened. A file
-// system without modes keeps the file as it is.
-func restoreStagingMode(path string) error {
-	if err := os.Chmod(path, 0o600); err != nil && !errors.Is(err, errors.ErrUnsupported) {
-		return err
-	}
-	return nil
-}
