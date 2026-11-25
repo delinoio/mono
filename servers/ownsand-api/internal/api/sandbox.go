@@ -697,44 +697,50 @@ func (h SandboxHandler) ListSandboxes(ctx context.Context, req *connect.Request[
 	return connect.NewResponse(resp), nil
 }
 
-// waitSandbox waits up to the command wait for done to report true on the
-// sandbox, and returns the current sandbox either way.
-func (s *Service) waitSandbox(ctx context.Context, orgID, sandboxID string, done func(*sandboxRow) bool) (*sandboxRow, error) {
-	deadline := time.NewTimer(s.Timing.CommandWait)
-	defer deadline.Stop()
+// waitSandbox uses one command wait budget for reads and notifications after
+// the delete commits. Between reads it can return the last observed state.
+func (s *Service) waitSandbox(ctx context.Context, orgID, sandboxID string) (*sandboxRow, error) {
+	deadline := time.Now().Add(s.Timing.CommandWait)
+	waitCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	// Other instances change sandboxes too, so poll as a fallback to the
 	// in-process notification.
 	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
+
+	var last *sandboxRow
 	for {
-		sb, err, finished := s.waitSandboxOnce(ctx, orgID, sandboxID, done, poll.C, deadline.C)
-		if finished {
+		// Subscribe before reading so a change between the read and wait is
+		// not lost. A poll or notification can be ready at the deadline.
+		changed, unregister := s.watch.watch(sandboxID)
+		if waitCtx.Err() != nil || !time.Now().Before(deadline) {
+			unregister()
+			break
+		}
+
+		sb, err := loadSandbox(waitCtx, s.DB.Pool, orgID, sandboxID, false)
+		if waitErr := waitCtx.Err(); waitErr != nil {
+			err = waitErr
+		}
+		if err != nil || isTerminal(sb.AgentState) {
+			unregister()
 			return sb, err
 		}
+		last = sb
+		select {
+		case <-changed:
+		case <-poll.C:
+		case <-waitCtx.Done():
+		}
+		unregister()
 	}
-}
-
-// waitSandboxOnce is one iteration of waitSandbox. It subscribes before it
-// reads, so a change between the read and the wait is not lost, and it
-// unregisters the subscription on every exit.
-func (s *Service) waitSandboxOnce(ctx context.Context, orgID, sandboxID string, done func(*sandboxRow) bool, poll, deadline <-chan time.Time) (sb *sandboxRow, err error, finished bool) {
-	changed, unregister := s.watch.watch(sandboxID)
-	defer unregister()
-	sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
-	if err != nil || done(sb) {
-		return sb, err, true
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	select {
-	case <-changed:
-		return nil, nil, false
-	case <-poll:
-		return nil, nil, false
-	case <-deadline:
-		sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
-		return sb, err, true
-	case <-ctx.Done():
-		return nil, ctx.Err(), true
+	if last == nil {
+		return nil, context.DeadlineExceeded
 	}
+	return last, nil
 }
 
 func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[ownsandv1.DeleteSandboxRequest]) (*connect.Response[ownsandv1.DeleteSandboxResponse], error) {
@@ -773,7 +779,7 @@ func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[
 		return connect.NewResponse(&ownsandv1.DeleteSandboxResponse{Sandbox: sb.proto()}), nil
 	}
 	h.notify()
-	sb, err = h.waitSandbox(ctx, orgID, sandboxID, func(r *sandboxRow) bool { return isTerminal(r.AgentState) })
+	sb, err = h.waitSandbox(ctx, orgID, sandboxID)
 	if err != nil {
 		return nil, h.internal(ctx, "delete sandbox", err)
 	}
