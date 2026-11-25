@@ -41,6 +41,11 @@ if (( EUID != 0 )); then
   exit 1
 fi
 
+if ! command -v flock > /dev/null; then
+  echo "error: provision.sh needs flock (util-linux) for the proxy lock." >&2
+  exit 2
+fi
+
 public_key_file="$1"
 acme_email="$2"
 root="/srv/delino"
@@ -105,9 +110,27 @@ chown "$deploy_user:$deploy_user" "$home/.ssh/authorized_keys"
 chmod 0600 "$home/.ssh/authorized_keys"
 
 log "Create $root"
-install -d -m 0755 -o "$deploy_user" -g "$deploy_user" "$root" "$root/caddy" "$root/caddy/sites" "$root/state"
+install -d -m 0755 -o "$deploy_user" -g "$deploy_user" "$root" "$root/state"
 # Server env files hold secrets.
 install -d -m 0700 -o "$deploy_user" -g "$deploy_user" "$root/env"
+proxy_lock="$root/state/.proxy.lock"
+proxy_lock_timeout="${DROPLET_PROXY_LOCK_TIMEOUT:-${DROPLET_LOCK_TIMEOUT:-600}}"
+log "Acquire the Caddy proxy lock"
+# Create the lock as the deploy user so its first open works even when root
+# provisions with a restrictive umask. Preserve the inode on every rerun.
+if ! runuser -u "$deploy_user" -- touch -- "$proxy_lock" ||
+  ! { exec {proxy_lock_fd}>> "$proxy_lock"; } 2> /dev/null; then
+  echo "error: could not open the proxy lock file $proxy_lock." >&2
+  exit 1
+fi
+if ! flock --wait "$proxy_lock_timeout" "$proxy_lock_fd"; then
+  echo "error: could not acquire the proxy lock $proxy_lock (wait limit: $proxy_lock_timeout seconds)." >&2
+  exit 1
+fi
+
+# Deployments and rollbacks use the same lock. Keep it through the Caddy
+# helper, which can read every service route while reloading or starting.
+install -d -m 0755 -o "$deploy_user" -g "$deploy_user" "$root/caddy" "$root/caddy/sites"
 caddyfile="{
 	email $acme_email
 }
@@ -133,5 +156,6 @@ log "Start the Caddy reverse proxy"
 # The helper is resolved from this script, so provisioning works from any
 # current directory.
 "$(dirname "${BASH_SOURCE[0]}")/start-caddy.sh" "$caddy_image" "$root" "$network"
+exec {proxy_lock_fd}>&-
 
 log "Done. Next: log in to the registry as $deploy_user, create the server env files and configure the Cloud Firewall."
