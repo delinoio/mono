@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,6 +72,78 @@ type env struct {
 	m  *sandboxes.Manager
 	d  *ops.Dispatcher
 	st *store.Store
+}
+
+// cancelAtGuestReadiness ends the create when waitGuest derives its timeout.
+// Create has already resumed the restored VM when it reaches this point.
+type cancelAtGuestReadiness struct {
+	context.Context
+	cancel context.CancelFunc
+	waits  int
+}
+
+func (c *cancelAtGuestReadiness) Deadline() (time.Time, bool) {
+	c.waits++
+	c.cancel()
+	return c.Context.Deadline()
+}
+
+func (e *env) requireCanceledRestore(t *testing.T, snapshotID string, guestOS ownsandv1.GuestOs) {
+	t.Helper()
+	snapshotDir, snapshot, ok := e.m.SnapshotContent(snapshotID)
+	if !ok {
+		t.Fatal("snapshot content missing")
+	}
+	if !snapshot.GetHasMemoryState() {
+		t.Skip("snapshot has no memory state")
+	}
+	var fallback atomic.Bool
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{
+		ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
+			if attr.Key == slog.MessageKey && strings.Contains(attr.Value.String(), "booting the snapshot disk cold") {
+				fallback.Store(true)
+			}
+			return attr
+		},
+	}))
+	vmsDir := t.TempDir()
+	rt, err := vzrt.New(vzrt.Options{Kernel: os.Getenv(envKernel), VMsDir: vmsDir, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := rt.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	id, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := snapshot.GetResources()
+	spec := vmruntime.Spec{
+		SandboxID: id, Dir: filepath.Join(vmsDir, id), Resources: resources, GuestOS: guestOS,
+		NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE, MemoryRestoreAllowed: true,
+		Snapshot: &vmruntime.SnapshotSource{SnapshotID: snapshotID, Dir: snapshotDir, HasMemoryState: true, Resources: resources},
+	}
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelAtGuestReadiness{Context: base, cancel: cancel}
+	vm, err := rt.Create(ctx, spec)
+	if fallback.Load() || ctx.waits != 1 {
+		t.Fatalf("readiness waits = %d, disk fallback = %t, create error = %v", ctx.waits, fallback.Load(), err)
+	}
+	if vm != nil || err != context.Canceled {
+		t.Fatalf("create = %v, %v, want the create context error after a confirmed stop", vm, err)
+	}
+	if ids, err := rt.Running(context.Background()); err != nil || len(ids) != 0 {
+		t.Fatalf("VMs after failed create = %v, %v", ids, err)
+	}
+	if _, err := os.Lstat(spec.Dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled VM directory: %v, want it removed", err)
+	}
+	t.Log("restored VM stopped with no cold boot")
 }
 
 // cancelAtSnapshotFile cancels at the first capture checkpoint that can see
@@ -396,6 +469,9 @@ func TestVirtualizationIntegration(t *testing.T) {
 	}
 	ids := []string{sb.GetSandboxId(), cold.GetSandboxId()}
 
+	t.Run("cancel-during-restored-readiness", func(t *testing.T) {
+		e.requireCanceledRestore(t, snapID, ownsandv1.GuestOs_GUEST_OS_LINUX)
+	})
 	if snap.GetHasMemoryState() {
 		e.invalidateMemoryState(snapID)
 		fallback := e.create(snapID, 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE, true)

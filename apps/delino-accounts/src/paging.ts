@@ -111,6 +111,7 @@ export function useAllPages<I extends DescMessage, O extends DescMessage, Item>(
     },
   );
   const {
+    data,
     hasNextPage,
     isFetching,
     isFetchNextPageError,
@@ -121,6 +122,7 @@ export function useAllPages<I extends DescMessage, O extends DescMessage, Item>(
   // Read the next page as soon as the previous one has loaded. A failed page
   // stops the loop until the user retries it, so a failing server is not
   // called in a tight loop. A failed refresh stops it too until the retry.
+  // A fast response can update the data without a render in the fetching state.
   useEffect(() => {
     if (
       hasNextPage &&
@@ -131,6 +133,7 @@ export function useAllPages<I extends DescMessage, O extends DescMessage, Item>(
       void fetchNextPage();
     }
   }, [
+    data,
     hasNextPage,
     isFetching,
     isFetchNextPageError,
@@ -140,7 +143,7 @@ export function useAllPages<I extends DescMessage, O extends DescMessage, Item>(
 
   const seen = new Set<string>();
   const items: Item[] = [];
-  for (const page of query.data?.pages ?? []) {
+  for (const page of data?.pages ?? []) {
     for (const item of read(page).items) {
       const id = itemKey(item);
       if (!seen.has(id)) {

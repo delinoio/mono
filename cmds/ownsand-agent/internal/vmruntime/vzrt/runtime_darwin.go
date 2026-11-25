@@ -288,6 +288,13 @@ func growFile(path string, size int64) error {
 	return os.Truncate(path, size)
 }
 
+func checkBaseDiskCapacity(sourceBytes, requestedBytes int64) error {
+	if sourceBytes > requestedBytes {
+		return fmt.Errorf("%w: the base disk requires %d bytes, but the request allocates %d bytes", vmruntime.ErrUnsupported, sourceBytes, requestedBytes)
+	}
+	return nil
+}
+
 // Create boots a VM for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
 	switch spec.GuestOS {
@@ -300,8 +307,15 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if !fileExists(r.opts.Kernel) {
 		return nil, fmt.Errorf("%w: the Linux kernel is missing", vmruntime.ErrUnsupported)
 	}
-	if spec.Snapshot == nil && !fileExists(r.opts.Rootfs) {
-		return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+	diskBytes := spec.Resources.GetDiskGib() << 30
+	if spec.Snapshot == nil {
+		baseDisk, err := os.Stat(r.opts.Rootfs)
+		if err != nil || !baseDisk.Mode().IsRegular() {
+			return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+		}
+		if err := checkBaseDiskCapacity(baseDisk.Size(), diskBytes); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.RemoveAll(spec.Dir); err != nil {
 		return nil, err
@@ -338,7 +352,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 
 	if memoryRestore {
 		err := r.restoreMemory(ctx, v, spec)
-		if err == nil {
+		if err == nil && ctx.Err() == nil {
 			v.restore = ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE
 			clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			if err := guestclient.New(v.Dial).SetClock(clockCtx, time.Now()); err != nil {
@@ -348,21 +362,16 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			r.logger.Info("VM restored from memory state", "sandbox_id", v.id)
 			return v, nil
 		}
-		// Virtualization.framework could not restore the saved state: boot
-		// the snapshot disk cold.
-		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
-		// Never boot the snapshot disk cold while the failed attempt's VM may
-		// still run on the same disk.
-		if stopErr := r.stopVM(v); stopErr != nil {
-			cleanup()
-			return nil, fmt.Errorf("vzrt: stop the VM of the failed memory-state restore: %w", stopErr)
+		if err := finishFailedRestore(ctx, func() error { return r.stopVM(v) }, cleanup); err != nil {
+			return nil, err
 		}
-		if err := copyFile(context.Background(), src, disk); err != nil {
+		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
+		if err := copyFile(ctx, src, disk); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
 		}
 	}
-	if err := growFile(disk, spec.Resources.GetDiskGib()<<30); err != nil {
+	if err := growFile(disk, diskBytes); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vzrt: resize disk: %w", err)
 	}
@@ -666,6 +675,9 @@ func (r *Runtime) coldBoot(ctx context.Context, v *vm, spec vmruntime.Spec) erro
 	if err := r.newMachine(v, cfg); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := v.machine.Start(); err != nil {
 		return fmt.Errorf("vzrt: start VM: %w", err)
 	}
@@ -687,15 +699,7 @@ func (r *Runtime) waitGuest(ctx context.Context, v *vm) error {
 		_, err := client.WaitReady(rctx, 100*time.Millisecond)
 		done <- err
 	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("vzrt: guest helper not ready: %w", err)
-		}
-		return nil
-	case <-v.Exited():
-		return errors.New("vzrt: the VM stopped during boot")
-	}
+	return waitGuestResult(done, v.Exited())
 }
 
 func (r *Runtime) lookup(id string) (*vm, error) {

@@ -3,21 +3,22 @@ import type { Browser } from "@e2e-dev/web";
 import { API_RESOURCE } from "../src/config.ts";
 
 export const API_ORIGIN = "http://127.0.0.1:28100";
-const LOGTO_ENDPOINT = "https://logto.test";
-const LOGTO_APP_ID = "accounts-e2e";
+export const LOGTO_ENDPOINT = "https://logto.test";
+export const LOGTO_APP_ID = "accounts-e2e";
+const FIXTURE_USER_ID = "fixture-user";
 
 export async function seedFixtureSession(browser: Browser, appOrigin: string) {
   // Let the real SDK read a fixture session. Its tokens are only usable with
   // the browser's intercepted responses.
   await browser.addInitScript(
-    ({ appId, appOrigin, endpoint, resource }) => {
+    ({ appId, appOrigin, endpoint, resource, userId }) => {
       if (location.origin !== appOrigin) return;
       const prefix = `logto:${appId}`;
       const header = btoa(JSON.stringify({ alg: "ES384", typ: "JWT" }));
       const now = Math.floor(Date.now() / 1000);
       const claims = btoa(
         JSON.stringify({
-          sub: "fixture-user",
+          sub: userId,
           iss: `${endpoint}/oidc`,
           aud: appId,
           iat: now,
@@ -41,6 +42,7 @@ export async function seedFixtureSession(browser: Browser, appOrigin: string) {
       appOrigin,
       endpoint: LOGTO_ENDPOINT,
       resource: API_RESOURCE,
+      userId: FIXTURE_USER_ID,
     },
   );
 }

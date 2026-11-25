@@ -53,16 +53,16 @@ func (a *app) mcp(ctx context.Context, name string, args []string) error {
 	logger := slog.New(newLogHandler(a.env.Stderr, a.color, level))
 	// The SDK client logs through the same handler.
 	a.logger = logger
-	// A missing credential is not fatal: every tool reports it, so that
-	// the agent can tell the user to run tide login or set TIDE_API_KEY.
-	var once sync.Once
-	var client *tide.Client
-	var clientErr error
+	// Serialize SDK initialization across tool calls. If it fails, the next
+	// call tries again and can load credentials saved by tide login.
+	var clientMu sync.Mutex
 	srv := mcpserver.New(mcpserver.Config{
 		Client: func() (*tide.Client, error) {
-			once.Do(func() { client, clientErr = a.sdk() })
-			if clientErr != nil {
-				return nil, describeCredentialError(clientErr)
+			clientMu.Lock()
+			defer clientMu.Unlock()
+			client, err := a.sdk()
+			if err != nil {
+				return nil, describeCredentialError(err)
 			}
 			return client, nil
 		},

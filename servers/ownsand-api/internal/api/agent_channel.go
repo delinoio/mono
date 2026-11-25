@@ -572,6 +572,11 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	var err error
 	switch info.kind {
 	case cmdCreateSandbox:
+		if res.GetError().GetCode() == ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+			// A competing end owns teardown. Apply its state through the
+			// sandbox updates or the next state report.
+			break
+		}
 		if res.GetError() != nil {
 			// A transient database error is retried inside
 			// Timing.CreateFailTimeout; a failure that remains closes this

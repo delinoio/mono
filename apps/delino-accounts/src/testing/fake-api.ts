@@ -35,6 +35,7 @@ import {
   ServiceId,
   type UsageSummaryRow,
 } from "@delino/accounts-protos/v1/usage_pb";
+import { type UtcMonth, utcMonthOf } from "../format.ts";
 import { awaitDeferredCall } from "./form-submit-deferral.ts";
 
 type Init<T> = Omit<T, "$typeName" | "$unknown">;
@@ -259,7 +260,12 @@ const PAYMENT_ROLES = new Set([
   BillingAccountRole.ADMIN,
 ]);
 
-export function createFakeApi(): FakeApi {
+/** Assigns seeded usage to the given UTC month or the current month of each request. */
+export function createFakeApi({
+  usageMonth,
+}: { usageMonth?: UtcMonth } = {}): FakeApi {
+  const fixedUsageMonth =
+    usageMonth === undefined ? undefined : { ...usageMonth };
   const api = {
     userId: OWNER,
     accounts: new Map([[ACCOUNT_ID, seedAccount()]]),
@@ -546,6 +552,12 @@ export function createFakeApi(): FakeApi {
           req.billingAccountId,
           new Set([BillingAccountRole.OWNER]),
         );
+        if (req.userId === self.userId) {
+          throw new ConnectError(
+            "user_id must name another member",
+            Code.InvalidArgument,
+          );
+        }
         const target = account.members.find((m) => m.userId === req.userId);
         if (target === undefined) {
           throw new ConnectError("member not found", Code.NotFound);
@@ -676,13 +688,9 @@ export function createFakeApi(): FakeApi {
         record("ListUsageSummary", req);
         await api.gates.get("ListUsageSummary");
         const { account } = load(req.billingAccountId);
-        // The seeded usage belongs to the current UTC month.
-        const now = new Date();
+        const { year, month } = fixedUsageMonth ?? utcMonthOf(new Date());
         const rows =
-          req.year === now.getUTCFullYear() &&
-          req.month === now.getUTCMonth() + 1
-            ? account.usage
-            : [];
+          req.year === year && req.month === month ? account.usage : [];
         // The server reports the total of the whole month on every page,
         // so sum all rows before paging them.
         const totalAmountUsdMicros = rows.reduce(

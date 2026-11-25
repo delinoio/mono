@@ -267,7 +267,7 @@ function ProfileDialog({
         values.workloadKind === WorkloadKind.AGENT_SESSION &&
         (query.isPending || integrationsUnavailable)
       }
-      onSubmit={async () => {
+      onSubmit={async (opening) => {
         const found = profileErrors(values, vendor);
         if (Object.keys(found).length > 0) {
           setErrors(found);
@@ -289,7 +289,7 @@ function ProfileDialog({
             });
           }
         }
-        onClose();
+        if (opening.isCurrent()) onClose();
       }}
     >
       <TextField
