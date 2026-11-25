@@ -411,6 +411,54 @@ func TestOutputFormats(t *testing.T) {
 	}
 }
 
+func TestGitHubInstallURLOutput(t *testing.T) {
+	f := newFixture(t)
+	const url = "https://github.com/apps/tide/installations/new?state=test-state"
+	text := f.ok("", "github", "install-url", "--org", f.org)
+	if text.stdout != url+"\n" {
+		t.Errorf("text stdout = %q, want the URL and a newline", text.stdout)
+	}
+	if !strings.HasPrefix(text.stderr, "Open the URL in a browser before ") ||
+		!strings.HasSuffix(text.stderr, "; the tide console completes the link.\n") {
+		t.Errorf("text stderr = %q, want the browser instruction", text.stderr)
+	}
+
+	jsonOutput := f.ok("", "github", "install-url", "--org", f.org, "--output", "json")
+	var response map[string]string
+	if err := json.Unmarshal([]byte(jsonOutput.stdout), &response); err != nil {
+		t.Fatalf("decode install URL JSON: %v", err)
+	}
+	if len(response) != 2 || response["url"] != url || response["expire_time"] == "" || jsonOutput.stderr != "" {
+		t.Errorf("JSON stdout = %q, stderr = %q, want the URL and expiry on stdout only", jsonOutput.stdout, jsonOutput.stderr)
+	}
+}
+
+type installURLFailingWriter struct{ err error }
+
+func (w installURLFailingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestGitHubInstallURLWriteError(t *testing.T) {
+	f := newFixture(t)
+	writeErr := errors.New("stdout write failed")
+	for _, format := range []string{"text", "json"} {
+		t.Run(format, func(t *testing.T) {
+			var stderr bytes.Buffer
+			code := Run(context.Background(), Env{
+				Args:   []string{"github", "install-url", "--org", f.org, "--output", format},
+				Stdout: installURLFailingWriter{err: writeErr},
+				Stderr: &stderr,
+				LookupEnv: func(key string) (string, bool) {
+					value, ok := f.env[key]
+					return value, ok
+				},
+			})
+			if code != ExitError || stderr.String() != "error: "+writeErr.Error()+"\n" {
+				t.Fatalf("exit = %d, stderr = %q, want exit %d and only the write error", code, stderr.String(), ExitError)
+			}
+		})
+	}
+}
+
 func TestOrgUseAndSettings(t *testing.T) {
 	f := newFixture(t)
 	other := f.srv.AddOrganization("other").GetOrganizationId()
