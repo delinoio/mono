@@ -815,8 +815,19 @@ func newWorkWorld(t *testing.T, ds devsession.Timing) *workWorld {
 
 func newWorkWorldWithTiming(t *testing.T, ds devsession.Timing, timing *work.Timing) *workWorld {
 	t.Helper()
-	w := &world{fake: ownsandfake.New(), l: &layers.Layers{}}
-	w.env = testenv.New(t, testenv.WithLayerOptions(layers.Options{OwnSand: w.fake, WorkTiming: timing, DevSessionTiming: ds}, w.l))
+	fake := ownsandfake.New()
+	return newWorkWorldWithOptions(t, ds, timing, fake, fake)
+}
+
+func newWorkWorldWithProvider(t *testing.T, ds devsession.Timing, fake *ownsandfake.Fake, provider ownsandclient.Factory) *workWorld {
+	t.Helper()
+	return newWorkWorldWithOptions(t, ds, nil, fake, provider)
+}
+
+func newWorkWorldWithOptions(t *testing.T, ds devsession.Timing, timing *work.Timing, fake *ownsandfake.Fake, provider ownsandclient.Factory) *workWorld {
+	t.Helper()
+	w := &world{fake: fake, l: &layers.Layers{}}
+	w.env = testenv.New(t, testenv.WithLayerOptions(layers.Options{OwnSand: provider, WorkTiming: timing, DevSessionTiming: ds}, w.l))
 	w.org = w.env.NewOrg("alice")
 	ww := &workWorld{world: w, osOrg: api.NewID()}
 	w.fake.AddOrg(ww.osOrg, ownsandKey('a'))
