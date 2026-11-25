@@ -695,13 +695,20 @@ func TestExecAdmissionRacesSandboxEnd(t *testing.T) {
 // and the start of its forwarding goroutine.
 type admittedSandboxes struct {
 	*sandboxes.Manager
-	once     sync.Once
-	admitted chan struct{}
-	release  chan struct{}
+	once        sync.Once
+	admitted    chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
 }
 
 func newAdmittedSandboxes(m *sandboxes.Manager) *admittedSandboxes {
 	return &admittedSandboxes{Manager: m, admitted: make(chan struct{}), release: make(chan struct{})}
+}
+
+// Release lets the paused WithRunning call return. It is safe to call again
+// during cleanup after the test has already released the gate.
+func (a *admittedSandboxes) Release() {
+	a.releaseOnce.Do(func() { close(a.release) })
 }
 
 func (a *admittedSandboxes) WithRunning(id string, fn func()) bool {
@@ -725,6 +732,9 @@ func TestCloseWaitsForAdmittedExec(t *testing.T) {
 		gate = newAdmittedSandboxes(m)
 		return gate
 	}})
+	// Cleanup runs in reverse order, so release the gate before dispatcher Close
+	// waits for the admitted worker to finish.
+	t.Cleanup(gate.Release)
 	req := e.execReq("/bin/sh", "-c", "sleep 60")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -756,7 +766,7 @@ func TestCloseWaitsForAdmittedExec(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 
-	close(gate.release)
+	gate.Release()
 	select {
 	case <-closed:
 	case <-time.After(waitBound):
