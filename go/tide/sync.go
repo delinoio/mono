@@ -260,7 +260,8 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	windows := osys == tidev1.GuestOs_GUEST_OS_WINDOWS
 	applyEnv := map[string]string{
 		guestEnvWorkspace: s.GetWorkspacePath(), guestEnvStaleManifest: "",
-		guestEnvArchive: "", guestEnvDeletes: "", guestEnvPrunes: "", guestEnvLinks: "",
+		guestEnvArchive: "", guestEnvDeletes: "", guestEnvReplaceFiles: "",
+		guestEnvPrunes: "", guestEnvLinks: "",
 	}
 
 	if workspaceMissing {
@@ -297,12 +298,9 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 			return nil, err
 		}
 	}
-	strictDeletes := deleted
-	var replacedFiles []string
+	strictDeletes, replacedFiles := splitSyncDeletions(deleted, changed)
 	if !windows {
-		applyEnv[guestEnvReplaceFiles] = ""
 		applyEnv[guestEnvAliasPrunes] = ""
-		strictDeletes, replacedFiles = splitSyncDeletions(deleted, changed)
 	}
 	prunes, aliasPrunes := pruneDirs(deleted, changed, osys == tidev1.GuestOs_GUEST_OS_MACOS)
 	for _, list := range []struct {
@@ -560,7 +558,7 @@ func pathList(paths []string, windows bool) []byte {
 	return b.Bytes()
 }
 
-// splitSyncDeletions separates former files that the POSIX archive needs
+// splitSyncDeletions separates former files that incoming paths need
 // as directories. If the manifest write failed after apply, those paths may
 // already be directories and must stay in place when the SDK retries.
 func splitSyncDeletions(deleted []string, changed []localFile) (strict, replacedFiles []string) {
