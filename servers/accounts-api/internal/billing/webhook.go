@@ -693,8 +693,7 @@ func (s *Service) applyPendingAdjustments(ctx context.Context, tx pgx.Tx, acct *
 	return nil
 }
 
-// reconcilePendingBatch bounds the purchases that one run of
-// ReconcilePendingAdjustments reconciles; the next run takes the rest.
+// reconcilePendingBatch bounds the purchases attempted in one run.
 const reconcilePendingBatch = 100
 
 // ReconcilePendingAdjustments applies and deletes the pending adjustments
@@ -702,36 +701,78 @@ const reconcilePendingBatch = 100
 // the pending rows of its purchase, but a grant that another release created
 // does not (for example, the previous release during a rollout or rollback,
 // which has no pending adjustment table), and a repeated delivery of the
-// payment event is a no-op by the event record. This task finds those rows by
-// their purchase, so no pending row stays behind a grant. Each purchase runs
-// in its own transaction that takes the purchase lock before the lock of the
+// payment event is a no-op by the event record. The worker retries eligible
+// purchases in order, rotating past failed attempts between runs. Each
+// purchase runs in its own transaction that takes the purchase lock before the lock of the
 // billing account, like the webhook paths. applyAdjustment records every
 // adjustment ID in credit_refunds, so a row that was applied before is only
 // deleted, and the credit of an adjustment is never removed twice. A row of a
 // purchase without a grant, and a row of a deleted billing account, stay
 // stored.
 func (s *Service) ReconcilePendingAdjustments(ctx context.Context) error {
-	rows, err := s.db.Pool.Query(ctx, `SELECT DISTINCT p.paddle_transaction_id FROM pending_credit_adjustments p
-		JOIN credit_grants g ON g.paddle_transaction_id = p.paddle_transaction_id
-		JOIN billing_accounts a ON a.billing_account_id = g.billing_account_id
-		WHERE a.delete_time IS NULL
-		ORDER BY p.paddle_transaction_id LIMIT $1`, reconcilePendingBatch)
+	select {
+	case s.pendingReconcileRun <- struct{}{}:
+		defer func() { <-s.pendingReconcileRun }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	cursor := s.pendingReconcileCursor
+	transactions, err := s.pendingAdjustmentPurchases(ctx, cursor, false, reconcilePendingBatch)
 	if err != nil {
 		return err
 	}
-	transactions, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return err
+	// Wrap only through the starting cursor so a purchase is selected at
+	// most once per run, even if it fails and stays pending.
+	if remaining := reconcilePendingBatch - len(transactions); cursor != nil && remaining > 0 {
+		wrapped, err := s.pendingAdjustmentPurchases(ctx, cursor, true, remaining)
+		if err != nil {
+			return err
+		}
+		transactions = append(transactions, wrapped...)
 	}
+
+	var firstErr error
+	failed := 0
 	for _, transactionID := range transactions {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		s.pendingReconcileCursor = &transactionID
 		if err := s.reconcilePurchase(ctx, transactionID); err != nil {
-			return fmt.Errorf("reconcile pending adjustments of purchase %s: %w", transactionID, err)
+			failed++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("reconcile pending adjustments of purchase %s: %w", transactionID, err)
+			}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if firstErr != nil {
+		return fmt.Errorf("%d pending adjustment purchases failed: %w", failed, firstErr)
+	}
 	return nil
+}
+
+func (s *Service) pendingAdjustmentPurchases(ctx context.Context, cursor *string, wrap bool, limit int) ([]string, error) {
+	query := `SELECT DISTINCT p.paddle_transaction_id FROM pending_credit_adjustments p
+		JOIN credit_grants g ON g.paddle_transaction_id = p.paddle_transaction_id
+		JOIN billing_accounts a ON a.billing_account_id = g.billing_account_id
+		WHERE a.delete_time IS NULL`
+	args := []any{limit}
+	if cursor != nil {
+		if wrap {
+			query += " AND p.paddle_transaction_id <= $2"
+		} else {
+			query += " AND p.paddle_transaction_id > $2"
+		}
+		args = append(args, *cursor)
+	}
+	rows, err := s.db.Pool.Query(ctx, query+" ORDER BY p.paddle_transaction_id LIMIT $1", args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 // reconcilePurchase applies the pending adjustments of one purchase that has
