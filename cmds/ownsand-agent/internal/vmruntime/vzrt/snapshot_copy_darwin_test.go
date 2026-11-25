@@ -15,13 +15,17 @@ import (
 
 type cancelStreamedCopy struct {
 	context.Context
-	cancel context.CancelFunc
-	path   string
+	cancel      context.CancelFunc
+	path        string
+	bytesCopied int64
 }
 
-func (c cancelStreamedCopy) Err() error {
-	if st, err := os.Stat(c.path); err == nil && st.Size() > 0 {
-		c.cancel()
+func (c *cancelStreamedCopy) Err() error {
+	if c.path != "" && c.bytesCopied == 0 {
+		if st, err := os.Stat(c.path); err == nil && st.Size() > 0 {
+			c.bytesCopied = st.Size()
+			c.cancel()
+		}
 	}
 	return c.Context.Err()
 }
@@ -35,7 +39,7 @@ func TestVirtualizationStreamedCopyStopsWhenCanceled(t *testing.T) {
 	}
 	base, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctx := cancelStreamedCopy{Context: base, cancel: cancel, path: dst}
+	ctx := &cancelStreamedCopy{Context: base, cancel: cancel, path: dst}
 	if err := copyFileStream(ctx, src, dst); !errors.Is(err, context.Canceled) {
 		t.Fatalf("streamed copy: %v, want context cancellation", err)
 	}
