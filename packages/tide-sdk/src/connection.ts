@@ -70,7 +70,7 @@ export interface ConnectionOptions {
  * token from errors.
  */
 export function createApiTransport(options: ConnectionOptions): Transport {
-  if (typeof options.token === "string" && options.token === "") {
+  if (typeof options.token === "string" && options.token.trim() === "") {
     throw new TideConfigError("token must not be empty");
   }
   return createConnectTransport({
@@ -92,7 +92,7 @@ async function currentToken(
     new Promise<string>((resolve) => resolve(token())),
     signal,
   );
-  if (typeof value !== "string" || value === "") {
+  if (typeof value !== "string" || value.trim() === "") {
     throw new TideConfigError("the token source returned no token");
   }
   return value;
