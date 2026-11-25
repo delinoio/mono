@@ -99,6 +99,12 @@ import {
   TERMINAL_RUNNER_STATES,
   timestampMs,
 } from "../format.ts";
+import {
+  AGENT_INTEGRATION_NAME_LIMIT,
+  API_KEY_NAME_LIMIT,
+  isNameLengthValid,
+  ORGANIZATION_NAME_LIMIT,
+} from "../name.ts";
 import { compareQueueOrder } from "../queue.ts";
 import { uuidV7 } from "../uuid.ts";
 
@@ -998,7 +1004,7 @@ export function createMockTransport(
     router.service(OrganizationService, {
       createOrganization(req) {
         const name = req.name.trim();
-        if (name === "" || name.length > 100)
+        if (!isNameLengthValid(name, ORGANIZATION_NAME_LIMIT))
           throw new ConnectError(
             "name must have 1 to 100 characters",
             Code.InvalidArgument,
@@ -1484,7 +1490,7 @@ export function createMockTransport(
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
         const name = req.name.trim();
-        if (name === "" || name.length > 64)
+        if (!isNameLengthValid(name, AGENT_INTEGRATION_NAME_LIMIT))
           throw new ConnectError(
             "name must have 1 to 64 characters",
             Code.InvalidArgument,
@@ -1542,7 +1548,7 @@ export function createMockTransport(
         let name = i.name;
         if (hasPath(req.updateMask, "name")) {
           name = req.name.trim();
-          if (name === "" || name.length > 64)
+          if (!isNameLengthValid(name, AGENT_INTEGRATION_NAME_LIMIT))
             throw new ConnectError(
               "name must have 1 to 64 characters",
               Code.InvalidArgument,
@@ -1940,7 +1946,7 @@ export function createMockTransport(
       createApiKey(req) {
         const { org } = membership(req.organizationId);
         const name = req.name.trim();
-        if (name === "" || name.length > 64)
+        if (!isNameLengthValid(name, API_KEY_NAME_LIMIT))
           throw new ConnectError(
             "name must have 1 to 64 characters",
             Code.InvalidArgument,

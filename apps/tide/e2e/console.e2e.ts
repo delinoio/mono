@@ -96,7 +96,7 @@ describe("organizations", () => {
     ).toBeHidden();
   });
 
-  test("creates an organization from a dialog that focuses its only input", async ({
+  test("creates an organization with a full Unicode name from the focused dialog", async ({
     app,
     screen,
     browser,
@@ -106,13 +106,14 @@ describe("organizations", () => {
     await screen.getByRole("button", "Create organization").tap();
 
     await expect(screen.getByLabel("Organization name")).toBeFocused();
-    await browser.keyboard.type("Fabrikam");
+    const name = "🧪".repeat(100);
+    await browser.keyboard.type(` ${name} `);
     await screen.getByRole("button", "Create").tap();
 
     await expect(browser).toHaveURL(/\/orgs\/[0-9a-f-]+$/);
     await expect(screen.getByText("Set up tide")).toBeVisible();
     await expect(screen.getByRole("combobox", "Organization")).toContainText(
-      "Fabrikam",
+      name,
     );
 
     const organizationPath = await browser.evaluate(() => location.pathname);
@@ -680,7 +681,7 @@ describe("integrations", () => {
     ).toContainText("Environment key: Set at");
   });
 
-  test("saves a Cursor integration name, pool, and credential together", async ({
+  test("creates and updates a Cursor integration with a full Unicode name, pool, and credential", async ({
     app,
     screen,
     browser,
@@ -692,17 +693,22 @@ describe("integrations", () => {
     await screen.getByRole("combobox", "Vendor").tap();
     await screen.getByRole("option", "Cursor").tap();
     await screen.getByLabel("Name").tap();
-    await browser.keyboard.type("cursor-before");
+    const initialName = "🧪".repeat(64);
+    await browser.keyboard.type(` ${initialName} `);
     await screen.getByLabel("Cursor self-hosted pool name").tap();
     await browser.keyboard.type("pool-before");
     await screen.getByLabel("Service account API key").tap();
     await browser.keyboard.type("synthetic-cursor-before");
     await screen.getByRole("button", "Create integration").tap();
 
-    await screen.getByRole("button", "Edit").tap();
+    const initialRow = screen
+      .getByRole("listitem")
+      .filter({ hasText: initialName });
+    await initialRow.getByRole("button", "Edit").tap();
     await screen.getByLabel("Name").tap();
     await browser.keyboard.press("ControlOrMeta+A");
-    await browser.keyboard.type("cursor-after");
+    const updatedName = "🧫".repeat(64);
+    await browser.keyboard.type(` ${updatedName} `);
     await screen.getByLabel("Cursor self-hosted pool name").tap();
     await browser.keyboard.press("ControlOrMeta+A");
     await browser.keyboard.type("pool-after");
@@ -710,9 +716,7 @@ describe("integrations", () => {
     await browser.keyboard.type("synthetic-cursor-after");
     await screen.getByRole("button", "Save changes").tap();
 
-    const row = screen
-      .getByRole("listitem")
-      .filter({ hasText: "cursor-after" });
+    const row = screen.getByRole("listitem").filter({ hasText: updatedName });
     await expect(row).toContainText("Cursor self-hosted pool name: pool-after");
     await expect(row).toContainText("Service account API key: Set at");
   });
@@ -1237,7 +1241,8 @@ describe("personal API keys", () => {
     await app.open(`/orgs/${ACME}/api-keys`);
     await screen.getByRole("button", "Create API key").tap();
     await expect(screen.getByLabel("Name")).toBeFocused();
-    await browser.keyboard.type("codex-agent");
+    const name = "🧪".repeat(64);
+    await browser.keyboard.type(` ${name} `);
     await screen.getByRole("button", "Create key").tap();
 
     const dialog = screen.getByRole("dialog", "Your new personal API key");
@@ -1247,9 +1252,7 @@ describe("personal API keys", () => {
 
     await browser.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
-    await expect(
-      screen.getByText("codex-agent", { exact: false }),
-    ).toBeVisible();
+    await expect(screen.getByText(name, { exact: false })).toBeVisible();
   });
 });
 

@@ -53,6 +53,7 @@ import {
 } from "../components/ui.tsx";
 import { ownsandDevicesUrl } from "../config.ts";
 import { formatTime, labels } from "../format.ts";
+import { AGENT_INTEGRATION_NAME_LIMIT, isNameLengthValid } from "../name.ts";
 import { externalNavigation } from "../navigation.ts";
 import { can, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
@@ -788,8 +789,9 @@ function IntegrationDialog({
       submitLabel={creating ? "Create integration" : "Save changes"}
       onSubmit={async (opening) => {
         const found: Record<string, string> = {};
-        if (name.trim() === "" || name.trim().length > 64) {
-          found.name = "Enter a name of 1 to 64 characters.";
+        const trimmedName = name.trim();
+        if (!isNameLengthValid(trimmedName, AGENT_INTEGRATION_NAME_LIMIT)) {
+          found.name = `Enter a name of 1 to ${AGENT_INTEGRATION_NAME_LIMIT} characters.`;
         }
         if (label !== undefined && setting.trim() === "") {
           found.setting = `Enter the ${label.toLowerCase()}.`;
@@ -813,13 +815,13 @@ function IntegrationDialog({
           await createIntegration.mutateAsync({
             organizationId,
             vendor,
-            name: name.trim(),
+            name: trimmedName,
             settings: vendorSettings(vendor, setting.trim()),
             credentials: vendorCredentials(vendor, values),
           });
         } else {
           const paths: string[] = [];
-          if (name.trim() !== integration.name) paths.push("name");
+          if (trimmedName !== integration.name) paths.push("name");
           if (label !== undefined && setting.trim() !== initialSetting) {
             paths.push("settings");
           }
@@ -831,7 +833,7 @@ function IntegrationDialog({
             > = {
               organizationId,
               agentIntegrationId: integration.agentIntegrationId,
-              name: name.trim(),
+              name: trimmedName,
               settings: vendorSettings(vendor, setting.trim()),
               credentials: replaced
                 ? vendorCredentials(vendor, values)
@@ -873,7 +875,6 @@ function IntegrationDialog({
         }}
         error={errors.name}
         autoFocus
-        maxLength={64}
         autoComplete="off"
       />
       {label !== undefined ? (
