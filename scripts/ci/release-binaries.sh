@@ -139,33 +139,50 @@ sha256_line() {
 # Writes GO-LICENSE (the Go toolchain license; every binary statically links
 # the Go standard library and runtime) and THIRD-PARTY-LICENSES.txt with the
 # license files of every module that one of the platform builds links.
-write_notices() {
+write_notices() (
   local name="$1" dir="$2" out="$3"
-  local platform cgo modules module version module_dir found file
-  local goroot
+  local platform cgo module version module_dir file goroot work
+  # A retry must not leave an earlier notice available for assembly if it fails.
+  rm -f -- "$out/THIRD-PARTY-LICENSES.txt"
+  work="$(mktemp -d "$out/.notices.XXXXXXXX")"
+  trap 'rm -rf -- "$work"' EXIT
+
   goroot="$(go env GOROOT < /dev/null)"
   if [[ ! -f "$goroot/LICENSE" ]]; then
     echo "::error::The Go toolchain at $goroot has no LICENSE file to ship as GO-LICENSE." >&2
     exit 1
   fi
   cp "$goroot/LICENSE" "$out/GO-LICENSE"
-  modules="$(mktemp)"
   # Scan each platform with the cgo setting that its build uses. Bind the
   # platform to `$p` first: inside `$cgo | index(...)` a bare `.` is `$cgo`.
+  jq -r --arg name "$name" '.[] | select(.name == $name) | .cgoPlatforms as $cgo | .platforms[] | . as $p | [$p, (if ($cgo | index($p)) != null then "1" else "0" end)] | @tsv' \
+    <<< "$BINARIES" > "$work/platforms"
   while IFS=$'\t' read -r -u 3 platform cgo; do
     GOOS="${platform%-*}" GOARCH="${platform#*-}" CGO_ENABLED="$cgo" \
-      go list -deps -buildvcs=false -f '{{with .Module}}{{if not .Main}}{{.Path}}{{"\t"}}{{.Version}}{{"\t"}}{{.Dir}}{{end}}{{end}}' "./$dir" < /dev/null >> "$modules"
-  done 3< <(jq -r --arg name "$name" '.[] | select(.name == $name) | .cgoPlatforms as $cgo | .platforms[] | . as $p | [$p, (if ($cgo | index($p)) != null then "1" else "0" end)] | @tsv' <<< "$BINARIES")
+      go list -deps -buildvcs=false -f '{{with .Module}}{{if not .Main}}{{.Path}}{{"\t"}}{{.Version}}{{"\t"}}{{.Dir}}{{end}}{{end}}' "./$dir" < /dev/null
+  done 3< "$work/platforms" > "$work/modules"
+  if ! sort -u "$work/modules" > "$work/sorted-modules"; then
+    echo "::error::Could not sort the linked modules for $name." >&2
+    exit 1
+  fi
+
   {
     echo "Third-party licenses of $name"
     echo
     echo "This file holds the license files of every Go module that a release executable of $name links."
-  } > "$out/THIRD-PARTY-LICENSES.txt"
+  } > "$work/THIRD-PARTY-LICENSES.txt"
   while IFS=$'\t' read -r -u 3 module version module_dir; do
     [[ -n "$module" ]] || continue
-    found=0
+    if ! find "$module_dir" -maxdepth 2 -type f \( -ipath "$module_dir/licen[cs]e*" -o -ipath "$module_dir/copying*" -o -ipath "$module_dir/notice*" -o -ipath "$module_dir/patents*" -o -ipath "$module_dir/licenses/*" \) -print0 |
+      sort -z > "$work/license-paths"; then
+      echo "::error::Could not enumerate license files for module $module $version that $name links." >&2
+      exit 1
+    fi
+    if [[ ! -s "$work/license-paths" ]]; then
+      echo "::error::Module $module $version that $name links has no license file in $module_dir." >&2
+      exit 1
+    fi
     while IFS= read -r -d '' file; do
-      found=1
       {
         echo
         echo "================================================================"
@@ -173,15 +190,11 @@ write_notices() {
         echo "================================================================"
         echo
         cat -- "$file"
-      } >> "$out/THIRD-PARTY-LICENSES.txt"
-    done < <(find "$module_dir" -maxdepth 2 -type f \( -ipath "$module_dir/licen[cs]e*" -o -ipath "$module_dir/copying*" -o -ipath "$module_dir/notice*" -o -ipath "$module_dir/patents*" -o -ipath "$module_dir/licenses/*" \) -print0 | sort -z)
-    if (( found == 0 )); then
-      echo "::error::Module $module $version that $name links has no license file in $module_dir." >&2
-      exit 1
-    fi
-  done 3< <(sort -u "$modules")
-  rm -f "$modules"
-}
+      } >> "$work/THIRD-PARTY-LICENSES.txt"
+    done < "$work/license-paths"
+  done 3< "$work/sorted-modules"
+  mv -- "$work/THIRD-PARTY-LICENSES.txt" "$out/THIRD-PARTY-LICENSES.txt"
+)
 
 build() {
   local mode="$1" out="$2"
