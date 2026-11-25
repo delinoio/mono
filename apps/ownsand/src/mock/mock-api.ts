@@ -8,6 +8,7 @@ import {
 import {
   type Duration,
   type Timestamp,
+  TimestampSchema,
   timestampFromMs,
   timestampMs,
 } from "@bufbuild/protobuf/wkt";
@@ -97,6 +98,7 @@ import {
 } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { ACCOUNTS_URL } from "../config.ts";
 import { effectiveVcpuLimit, MAX_INT32 } from "../format.ts";
+import { MAX_TTL_SECONDS } from "../forms.ts";
 import { uuidV7 } from "../uuid.ts";
 
 /**
@@ -198,6 +200,8 @@ const DEFAULT_BILLING: Readonly<Record<string, MockBillingState>> = {
 };
 
 const HOUR = 3600;
+const NANOS_PER_SECOND = 1_000_000_000n;
+const MAX_TTL_NANOS = BigInt(MAX_TTL_SECONDS) * NANOS_PER_SECOND;
 const DAY_MS = 24 * HOUR * 1000;
 /** A non-paying organization becomes suspended 3 days after its block. */
 const SUSPEND_AFTER_MS = 3 * DAY_MS;
@@ -206,6 +210,37 @@ const ts = (offsetSeconds = 0): Timestamp =>
   timestampFromMs(now() + offsetSeconds * 1000);
 const dur = (seconds: number): Duration =>
   ({ seconds: BigInt(seconds), nanos: 0 }) as Duration;
+
+function ttlNanos(
+  ttl: Duration | undefined,
+  field: "idle_ttl" | "max_ttl",
+): bigint {
+  if (ttl === undefined) {
+    throw new ConnectError(`${field} is required`, Code.InvalidArgument);
+  }
+  const { seconds, nanos } = ttl;
+  if (
+    seconds < 0n ||
+    !Number.isInteger(nanos) ||
+    nanos < 0 ||
+    nanos >= Number(NANOS_PER_SECOND) ||
+    (seconds === 0n && nanos === 0)
+  ) {
+    throw new ConnectError(
+      `${field} must be a valid duration greater than zero`,
+      Code.InvalidArgument,
+    );
+  }
+  return seconds * NANOS_PER_SECOND + BigInt(nanos);
+}
+
+function addTtl(timestamp: Timestamp, durationNanos: bigint): Timestamp {
+  const nanos = BigInt(timestamp.nanos) + durationNanos;
+  return create(TimestampSchema, {
+    seconds: timestamp.seconds + nanos / NANOS_PER_SECOND,
+    nanos: Number(nanos % NANOS_PER_SECOND),
+  });
+}
 
 interface OrgState {
   organization: Organization;
@@ -1561,6 +1596,20 @@ export function createMockTransport(
         const req = canonicalizeCreateSandbox(rawReq);
         const { org } = membership(req.organizationId);
         requireBillingAllowed(org);
+        const idleTtlNanos = ttlNanos(req.idleTtl, "idle_ttl");
+        const maxTtlNanos = ttlNanos(req.maxTtl, "max_ttl");
+        if (maxTtlNanos > MAX_TTL_NANOS) {
+          throw new ConnectError(
+            "max_ttl must be at most 7 days",
+            Code.InvalidArgument,
+          );
+        }
+        if (idleTtlNanos > maxTtlNanos) {
+          throw new ConnectError(
+            "idle_ttl must not be greater than max_ttl",
+            Code.InvalidArgument,
+          );
+        }
         // Map entries serialize in insertion order, so sort labels first to make
         // the comparison independent of label order (the real API hashes a
         // deterministic encoding).
@@ -1599,6 +1648,7 @@ export function createMockTransport(
             Code.FailedPrecondition,
           );
         }
+        const createTime = timestampFromMs(nowMs);
         const sandbox = create(SandboxSchema, {
           sandboxId: newMockId(),
           organizationId: req.organizationId,
@@ -1613,10 +1663,10 @@ export function createMockTransport(
           labels: { ...req.labels },
           idleTtl: req.idleTtl,
           maxTtl: req.maxTtl,
-          idleDeadline: ts(Number(req.idleTtl?.seconds ?? 0n)),
-          maxDeadline: ts(Number(req.maxTtl?.seconds ?? 0n)),
+          idleDeadline: addTtl(createTime, idleTtlNanos),
+          maxDeadline: addTtl(createTime, maxTtlNanos),
           createdBy: { kind: PrincipalKind.USER, id: userId },
-          createTime: ts(),
+          createTime,
         });
         org.sandboxes.unshift(sandbox);
         org.createKeys.set(req.idempotencyKey, {
