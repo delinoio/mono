@@ -439,8 +439,12 @@ func TestValidate(t *testing.T) {
 			t.Errorf("Validate() = %v, want ErrMissingConfig", err)
 		}
 	}
-	if err := (Config{Endpoint: "ftp://x", AppID: "a"}).Validate(); err == nil {
-		t.Error("Validate() accepted an unsupported scheme")
+	const invalidURL = "logto: the tenant endpoint must be an http or https URL"
+	for _, endpoint := range []string{"ftp://x", "https://:443"} {
+		err := (Config{Endpoint: endpoint, AppID: "a"}).Validate()
+		if err == nil || err.Error() != invalidURL {
+			t.Errorf("Validate(%q) = %v, want %q", endpoint, err, invalidURL)
+		}
 	}
 
 	for _, endpoint := range []string{
