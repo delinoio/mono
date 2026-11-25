@@ -118,6 +118,8 @@ When the OwnSand link is `ACTIVE`, `CreateRunnerProfile` checks template sources
 
 ### Agent integration messages
 
+Each `GetAgentIntegration` response and each `ListAgentIntegrations` page use one committed view of the integration settings and credential state. Each page has its own view.
+
 `AgentIntegration` has `agent_integration_id`, `vendor`, `name`, a vendor settings `oneof` and the credential state: one `AgentCredentialState` (`AgentCredential`, `credential_set` and `credential_set_at`) for each credential of the vendor. Create and update requests carry the credentials in a vendor credentials `oneof`; `UpdateAgentIntegration` uses a field mask with the paths `name`, `settings` and `credentials`, and replaces only the non-empty credential fields. The settings and credentials per vendor:
 
 | Vendor         | Settings       | Credentials                                    |

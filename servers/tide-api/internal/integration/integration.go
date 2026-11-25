@@ -439,68 +439,76 @@ func (h *Handler) CreateAgentIntegration(ctx context.Context, req *connect.Reque
 	return connect.NewResponse(resp), nil
 }
 
+// readSnapshot keeps authorization, integration rows, and credential state
+// in the same committed view for the entire response.
+func (h *Handler) readSnapshot(ctx context.Context, fn func(pgx.Tx) error) error {
+	return pgx.BeginTxFunc(ctx, h.st.svc.DB.Pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, fn)
+}
+
 func (h *Handler) GetAgentIntegration(ctx context.Context, req *connect.Request[tidev1.GetAgentIntegrationRequest]) (*connect.Response[tidev1.GetAgentIntegrationResponse], error) {
 	s := h.st.svc
-	c, err := s.Authorize(ctx, s.DB.Pool, req.Msg.GetOrganizationId(), authz.ActionRead)
-	if err != nil {
-		return nil, err
-	}
-	id, err := api.NormalizeID("agent_integration_id", req.Msg.GetAgentIntegrationId())
-	if err != nil {
-		return nil, err
-	}
-	in, err := h.st.Get(ctx, s.DB.Pool, c.OrganizationID, id)
+	var integration *tidev1.AgentIntegration
+	err := h.readSnapshot(ctx, func(tx pgx.Tx) error {
+		c, err := s.Authorize(ctx, tx, req.Msg.GetOrganizationId(), authz.ActionRead)
+		if err != nil {
+			return err
+		}
+		id, err := api.NormalizeID("agent_integration_id", req.Msg.GetAgentIntegrationId())
+		if err != nil {
+			return err
+		}
+		in, err := h.st.Get(ctx, tx, c.OrganizationID, id)
+		if err != nil {
+			return err
+		}
+		integration, err = h.st.proto(ctx, tx, in)
+		return err
+	})
 	if err != nil {
 		return nil, s.Internal(ctx, "get agent integration", err)
 	}
-	p, err := h.st.proto(ctx, s.DB.Pool, in)
-	if err != nil {
-		return nil, s.Internal(ctx, "get agent integration", err)
-	}
-	return connect.NewResponse(&tidev1.GetAgentIntegrationResponse{Integration: p}), nil
+	return connect.NewResponse(&tidev1.GetAgentIntegrationResponse{Integration: integration}), nil
 }
 
 func (h *Handler) ListAgentIntegrations(ctx context.Context, req *connect.Request[tidev1.ListAgentIntegrationsRequest]) (*connect.Response[tidev1.ListAgentIntegrationsResponse], error) {
 	s := h.st.svc
-	c, err := s.Authorize(ctx, s.DB.Pool, req.Msg.GetOrganizationId(), authz.ActionRead)
-	if err != nil {
-		return nil, err
-	}
-	limit, after, err := api.PageArgs(req.Msg.GetPageSize(), req.Msg.GetPageToken())
-	if err != nil {
-		return nil, err
-	}
-	rows, err := s.DB.Pool.Query(ctx, "SELECT "+integrationColumns+" FROM agent_integrations WHERE organization_id = $1 AND agent_integration_id > $2 ORDER BY agent_integration_id LIMIT $3",
-		c.OrganizationID, api.AfterKey(after), limit)
-	if err != nil {
-		return nil, s.Internal(ctx, "list agent integrations", err)
-	}
-	var list []Integration
-	for rows.Next() {
-		in, err := scanIntegration(rows)
-		if err != nil {
-			rows.Close()
-			return nil, s.Internal(ctx, "list agent integrations", err)
-		}
-		list = append(list, in)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, s.Internal(ctx, "list agent integrations", err)
-	}
 	resp := &tidev1.ListAgentIntegrationsResponse{}
-	for _, in := range list {
-		p, err := h.st.proto(ctx, s.DB.Pool, in)
+	err := h.readSnapshot(ctx, func(tx pgx.Tx) error {
+		c, err := s.Authorize(ctx, tx, req.Msg.GetOrganizationId(), authz.ActionRead)
 		if err != nil {
-			return nil, s.Internal(ctx, "list agent integrations", err)
+			return err
 		}
-		resp.Integrations = append(resp.Integrations, p)
+		limit, after, err := api.PageArgs(req.Msg.GetPageSize(), req.Msg.GetPageToken())
+		if err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, "SELECT "+integrationColumns+" FROM agent_integrations WHERE organization_id = $1 AND agent_integration_id > $2 ORDER BY agent_integration_id LIMIT $3",
+			c.OrganizationID, api.AfterKey(after), limit)
+		if err != nil {
+			return err
+		}
+		list, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Integration, error) {
+			return scanIntegration(row)
+		})
+		if err != nil {
+			return err
+		}
+
+		last := ""
+		for _, in := range list {
+			p, err := h.st.proto(ctx, tx, in)
+			if err != nil {
+				return err
+			}
+			resp.Integrations = append(resp.Integrations, p)
+			last = in.ID
+		}
+		resp.NextPageToken = api.NextPageToken(len(list), limit, last)
+		return nil
+	})
+	if err != nil {
+		return nil, s.Internal(ctx, "list agent integrations", err)
 	}
-	last := ""
-	if n := len(list); n > 0 {
-		last = list[n-1].ID
-	}
-	resp.NextPageToken = api.NextPageToken(len(list), limit, last)
 	return connect.NewResponse(resp), nil
 }
 

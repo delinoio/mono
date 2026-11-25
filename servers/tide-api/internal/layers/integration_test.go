@@ -5,12 +5,16 @@ package layers_test
 import (
 	"bytes"
 	"context"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
@@ -67,10 +71,46 @@ func TestAgentIntegrations(t *testing.T) {
 		t.Fatalf("integration %v / %v", devin, cursor)
 	}
 	// Reads never return credentials, and the database holds them encrypted.
-	list, err := w.env.User(w.org.Member).Integration.ListAgentIntegrations(ctx, connect.NewRequest(&tidev1.ListAgentIntegrationsRequest{OrganizationId: w.org.ID}))
-	if err != nil || len(list.Msg.GetIntegrations()) != 4 {
+	member := w.env.User(w.org.Member).Integration
+	expected := []*tidev1.AgentIntegration{claude, cursor, codex, devin}
+	slices.SortFunc(expected, func(a, b *tidev1.AgentIntegration) int {
+		return strings.Compare(a.GetAgentIntegrationId(), b.GetAgentIntegrationId())
+	})
+	list, err := member.ListAgentIntegrations(ctx, connect.NewRequest(&tidev1.ListAgentIntegrationsRequest{OrganizationId: w.org.ID}))
+	if err != nil || !slices.EqualFunc(list.Msg.GetIntegrations(), expected, equalIntegration) {
 		t.Fatalf("list %v %v", list, err)
 	}
+	pageToken := ""
+	for _, want := range expected {
+		id := want.GetAgentIntegrationId()
+		page, err := member.ListAgentIntegrations(ctx, connect.NewRequest(&tidev1.ListAgentIntegrationsRequest{
+			OrganizationId: w.org.ID, PageSize: 1, PageToken: pageToken,
+		}))
+		if err != nil || !slices.EqualFunc(page.Msg.GetIntegrations(), []*tidev1.AgentIntegration{want}, equalIntegration) ||
+			page.Msg.GetNextPageToken() != api.NextPageToken(1, 1, id) {
+			t.Fatalf("page for %s: %v, %v", id, page, err)
+		}
+		pageToken = page.Msg.GetNextPageToken()
+		get, err := member.GetAgentIntegration(ctx, connect.NewRequest(&tidev1.GetAgentIntegrationRequest{
+			OrganizationId: w.org.ID, AgentIntegrationId: id,
+		}))
+		if err != nil || !proto.Equal(get.Msg.GetIntegration(), want) {
+			t.Fatalf("get %s: %v, %v", id, get, err)
+		}
+	}
+	last, err := member.ListAgentIntegrations(ctx, connect.NewRequest(&tidev1.ListAgentIntegrationsRequest{
+		OrganizationId: w.org.ID, PageSize: 1, PageToken: pageToken,
+	}))
+	if err != nil || len(last.Msg.GetIntegrations()) != 0 || last.Msg.GetNextPageToken() != "" {
+		t.Fatalf("last page: %v, %v", last, err)
+	}
+	outsider := w.env.User("outsider").Integration
+	_, err = outsider.GetAgentIntegration(ctx, connect.NewRequest(&tidev1.GetAgentIntegrationRequest{
+		OrganizationId: w.org.ID, AgentIntegrationId: devin.GetAgentIntegrationId(),
+	}))
+	wantCode(t, "outsider gets", err, connect.CodeNotFound)
+	_, err = outsider.ListAgentIntegrations(ctx, connect.NewRequest(&tidev1.ListAgentIntegrationsRequest{OrganizationId: w.org.ID}))
+	wantCode(t, "outsider lists", err, connect.CodeNotFound)
 	rows, _ := w.env.DB.Pool.Query(ctx, "SELECT ciphertext FROM agent_integration_credentials")
 	n := 0
 	for rows.Next() {
@@ -174,6 +214,128 @@ func TestAgentIntegrations(t *testing.T) {
 		t.Fatalf("second run %d %v", again, err)
 	}
 
+}
+
+func equalIntegration(a, b *tidev1.AgentIntegration) bool {
+	return proto.Equal(a, b)
+}
+
+func TestAgentIntegrationReadSnapshot(t *testing.T) {
+	for _, mutation := range []string{"update", "delete"} {
+		t.Run(mutation, func(t *testing.T) {
+			w := newWorld(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			admin := w.env.User(w.org.Admin).Integration
+			created, err := admin.CreateAgentIntegration(ctx, connect.NewRequest(&tidev1.CreateAgentIntegrationRequest{
+				OrganizationId: w.org.ID, Vendor: tidev1.AgentVendor_AGENT_VENDOR_DEVIN, Name: "devin",
+				Settings: &tidev1.CreateAgentIntegrationRequest_Devin{Devin: &tidev1.DevinSettings{OutpostName: "original"}},
+				Credentials: &tidev1.CreateAgentIntegrationRequest_DevinCredentials{DevinCredentials: &tidev1.DevinCredentials{
+					ApiToken: "test-api-token", OutpostToken: "test-outpost-token",
+				}},
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := created.Msg.GetIntegration()
+			id := before.GetAgentIntegrationId()
+
+			tx, err := w.env.DB.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			// Pause each RPC after it reads the integration row and before it reads credential state.
+			if _, err := tx.Exec(ctx, "LOCK TABLE agent_integration_credentials IN ACCESS EXCLUSIVE MODE"); err != nil {
+				t.Fatal(err)
+			}
+			updateTime := before.GetUpdateTime().AsTime().Add(time.Second)
+			if mutation == "update" {
+				if _, err := tx.Exec(ctx, "UPDATE agent_integrations SET outpost_name = 'updated', update_time = $2 WHERE agent_integration_id = $1", id, updateTime); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tx.Exec(ctx, "UPDATE agent_integration_credentials SET set_time = $2 WHERE agent_integration_id = $1", id, updateTime); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := tx.Exec(ctx, "DELETE FROM agent_integrations WHERE agent_integration_id = $1", id); err != nil {
+				t.Fatal(err)
+			}
+
+			member := w.env.User(w.org.Member).Integration
+			get := func() (*tidev1.AgentIntegration, error) {
+				res, err := member.GetAgentIntegration(ctx, connect.NewRequest(&tidev1.GetAgentIntegrationRequest{
+					OrganizationId: w.org.ID, AgentIntegrationId: id,
+				}))
+				if err != nil {
+					return nil, err
+				}
+				return res.Msg.GetIntegration(), nil
+			}
+			list := func() ([]*tidev1.AgentIntegration, error) {
+				res, err := member.ListAgentIntegrations(ctx, connect.NewRequest(&tidev1.ListAgentIntegrationsRequest{
+					OrganizationId: w.org.ID, PageSize: 1,
+				}))
+				if err != nil {
+					return nil, err
+				}
+				return res.Msg.GetIntegrations(), nil
+			}
+			var (
+				gotIntegration  *tidev1.AgentIntegration
+				gotPage         []*tidev1.AgentIntegration
+				getErr, listErr error
+				reads           sync.WaitGroup
+			)
+			reads.Go(func() { gotIntegration, getErr = get() })
+			reads.Go(func() { gotPage, listErr = list() })
+
+			for {
+				var waiting int
+				err := w.env.DB.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks AS l JOIN pg_stat_activity AS a USING (pid)
+					WHERE a.datname = current_database() AND a.query LIKE 'SELECT credential, set_time FROM agent_integration_credentials%'
+					  AND l.relation = 'agent_integration_credentials'::regclass AND l.mode = 'AccessShareLock' AND NOT l.granted`).Scan(&waiting)
+				if err != nil {
+					t.Fatalf("wait for both credential reads: %v", err)
+				}
+				if waiting == 2 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			reads.Wait()
+			if getErr != nil || !proto.Equal(gotIntegration, before) {
+				t.Errorf("Get in flight: got %v, %v; want %v", gotIntegration, getErr, before)
+			}
+			if listErr != nil || !slices.EqualFunc(gotPage, []*tidev1.AgentIntegration{before}, equalIntegration) {
+				t.Errorf("List in flight: got %v, %v; want [%v]", gotPage, listErr, before)
+			}
+
+			after, err := get()
+			afterList, listErr := list()
+			if mutation == "delete" {
+				wantCode(t, "Get after delete", err, connect.CodeNotFound)
+				if listErr != nil || len(afterList) != 0 {
+					t.Errorf("List after delete: got %v, %v; want an empty page", afterList, listErr)
+				}
+				return
+			}
+			expected := proto.CloneOf(before)
+			expected.GetDevin().OutpostName = "updated"
+			expected.UpdateTime = timestamppb.New(updateTime)
+			for _, state := range expected.GetCredentials() {
+				state.CredentialSetAt = expected.UpdateTime
+			}
+			if err != nil || !proto.Equal(after, expected) {
+				t.Errorf("Get after update: got %v, %v; want %v", after, err, expected)
+			}
+			if listErr != nil || !slices.EqualFunc(afterList, []*tidev1.AgentIntegration{expected}, equalIntegration) {
+				t.Errorf("List after update: got %v, %v; want [%v]", afterList, listErr, expected)
+			}
+		})
+	}
 }
 
 // keyOf returns the test environment's key, so the rotation ring can still
