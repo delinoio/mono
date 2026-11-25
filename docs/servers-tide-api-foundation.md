@@ -392,7 +392,7 @@ The Go SDK implements download for the CLI and the MCP server. Download copies a
 
 - A directory is packed in the guest with `tar` into a temporary archive next to the workspace, downloaded with `ReadDevSessionFile` and extracted locally. The client removes the guest archive after the download.
 - The client rejects the download when one file is larger than 500 MiB or the transfer is larger than 2 GiB in total. It checks the size of a single file or of the archive before it reads it, and checks each archive entry during extraction.
-- Local extraction rejects entries with absolute paths, entries that resolve outside the local destination and symbolic links that point outside it. It writes to a temporary location and moves the result into place only after the download succeeds.
+- Local extraction rejects entries with absolute paths, entries that resolve outside the local destination and symbolic links that point outside it. The client extracts to a temporary location. If two regular archive paths differ only in case and resolve to the same local directory entry, the client returns `failed_precondition` with both paths. It installs the result only after the download succeeds.
 - Download never changes the local working tree unless the caller names a destination in it.
 
 ### Queue and dispatch

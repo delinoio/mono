@@ -125,6 +125,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 	defer root.Close()
 	st := &extractStats{}
 	regular := map[string]bool{}
+	fileNames := map[string][]archiveFileName{}
 	tr := tar.NewReader(r)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -151,11 +152,17 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 				return st, err
 			}
 		case tar.TypeReg:
+			key := foldCase(name)
+			names := fileNames[key]
 			if err := e.writeFile(st, name, hdr.Size, func() error {
+				if err := checkArchiveCaseCollision(root, name, hdr.Name, names); err != nil {
+					return err
+				}
 				return writeEntry(root, name, mode, tr, hdr.Size)
 			}); err != nil {
 				return st, err
 			}
+			fileNames[key] = rememberArchiveFileName(names, name, hdr.Name)
 			regular[name] = true
 			st.files++
 		case tar.TypeSymlink:
@@ -193,6 +200,113 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			st.warnings = append(st.warnings, fmt.Sprintf("%s: skipped an archive entry of an unsupported type", filepath.ToSlash(name)))
 		}
 	}
+}
+
+type archiveFileName struct {
+	local   string
+	archive string
+}
+
+func rememberArchiveFileName(names []archiveFileName, local, archive string) []archiveFileName {
+	for i, name := range names {
+		if name.local == local {
+			names[i].archive = archive
+			return names
+		}
+	}
+	return append(names, archiveFileName{local: local, archive: archive})
+}
+
+// A case-folded match is only a candidate. The two archive paths must
+// resolve to the same entry on the staging filesystem.
+func checkArchiveCaseCollision(root *os.Root, name, archivePath string, names []archiveFileName) error {
+	if len(names) == 0 {
+		return nil
+	}
+	for _, previous := range names {
+		if previous.local == name {
+			return nil // Repeated entries with the same name may replace one another.
+		}
+	}
+
+	info, err := root.Lstat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+
+	for _, previous := range names {
+		other, err := root.Lstat(previous.local)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(info, other) {
+			continue
+		}
+		alias, err := sameArchiveDirectoryEntry(root, name, previous.local)
+		if err != nil {
+			return err
+		}
+		if alias {
+			return &archiveCaseCollision{earlier: previous.archive, later: archivePath}
+		}
+	}
+	return nil
+}
+
+// A hard link can share the file identity of a different directory entry.
+func sameArchiveDirectoryEntry(root *os.Root, a, b string) (bool, error) {
+	dir := filepath.Dir(a)
+	if otherDir := filepath.Dir(b); dir != otherDir {
+		parent, err := root.Stat(dir)
+		if err != nil {
+			return false, err
+		}
+		otherParent, err := root.Stat(otherDir)
+		if err != nil {
+			return false, err
+		}
+		if !os.SameFile(parent, otherParent) {
+			return false, nil
+		}
+	}
+
+	first, second := filepath.Base(a), filepath.Base(b)
+	if first == second {
+		return true, nil
+	}
+	directory, err := root.Open(dir)
+	if err != nil {
+		return false, err
+	}
+	defer directory.Close()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		return false, err
+	}
+	var firstExists, secondExists bool
+	for _, entry := range entries {
+		firstExists = firstExists || entry.Name() == first
+		secondExists = secondExists || entry.Name() == second
+	}
+	return !firstExists || !secondExists, nil
+}
+
+type archiveCaseCollision struct {
+	earlier string
+	later   string
+}
+
+func (e *archiveCaseCollision) Error() string {
+	return fmt.Sprintf("tide: the archive entries %q and %q conflict on the destination filesystem", e.earlier, e.later)
 }
 
 // entryName returns the local form of a tar entry name. ok is false for the
