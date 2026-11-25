@@ -411,7 +411,7 @@ func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion
 		}
 	}()
 	stopWatchers(stop)
-	claims, err := h.heldClaims(ctx, "c.organization_id = $1 AND r.state = ANY($2)", d.OrganizationID, work.OpenRequestStates())
+	claims, err := h.heldClaims(ctx, strictClaimLookup, "c.organization_id = $1 AND r.state = ANY($2)", d.OrganizationID, work.OpenRequestStates())
 	if err != nil {
 		return err
 	}
