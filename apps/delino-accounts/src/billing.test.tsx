@@ -1654,8 +1654,8 @@ describe("invitation acceptance", () => {
     expect(pendingInvitation.read()).toBeUndefined();
   });
 
-  test("an ended session offers sign-in and keeps the token for the redirect", async () => {
-    pendingInvitation.save(INVITATION_TOKEN);
+  test("a replacement invitation survives the sign-in redirect after an ended session", async () => {
+    pendingInvitation.save(EARLIER_INVITATION_TOKEN);
     const api = createFakeApi();
     api.userId = OUTSIDER;
     api.failNext.set(
@@ -1672,7 +1672,29 @@ describe("invitation acceptance", () => {
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
     await click(screen.getByRole("button", { name: "Sign in with Delino" }));
     expect(signIns).toHaveLength(1);
+    expect(pendingInvitation.read()).toBe(EARLIER_INVITATION_TOKEN);
+
+    await act(async () => {
+      window.location.hash = `token=${INVITATION_TOKEN}`;
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    expect(window.location.hash).toBe("");
     expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
+    expect(afterSignInPath()).toBe("/billing/invitations/accept");
+    expect(calls(api, "AcceptInvitation")).toEqual([
+      expect.objectContaining({ invitationToken: EARLIER_INVITATION_TOKEN }),
+    ]);
+    cleanup();
+    renderApp("/billing/invitations/accept", { api });
+    await click(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    );
+    await settle(60);
+    expect(calls(api, "AcceptInvitation")).toEqual([
+      expect.objectContaining({ invitationToken: EARLIER_INVITATION_TOKEN }),
+      expect.objectContaining({ invitationToken: INVITATION_TOKEN }),
+    ]);
+    expect(pendingInvitation.read()).toBeUndefined();
   });
 
   test("an ended session shows a sign-in failure and keeps the token for a retry", async () => {

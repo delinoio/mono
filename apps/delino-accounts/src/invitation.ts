@@ -53,9 +53,8 @@ function store(): SessionStore | undefined {
  * Reads the token of a newly opened invitation link from the address and
  * drops any token that an earlier link left in `sessionStorage`, so that a
  * later load with an empty fragment cannot accept the earlier invitation.
- * The new token stays in memory; only the Sign in button saves it for the
- * redirect. An address without a token leaves the stored token alone,
- * because the sign-in return reads it.
+ * The caller saves the new token if sign-in is in progress. An address
+ * without a token leaves the stored token alone for the sign-in return.
  */
 export function openInvitationFromAddress(
   location: Pick<Location, "hash" | "pathname" | "search">,
