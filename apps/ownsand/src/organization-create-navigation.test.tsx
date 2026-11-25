@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
-import { Code, ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError, type Transport } from "@connectrpc/connect";
+import type { CreateOrganizationResponse } from "@delino/ownsand-protos/v1/organization_pb";
 import {
   act,
   cleanup,
@@ -8,6 +9,7 @@ import {
   screen,
   within,
 } from "@testing-library/react";
+import { createMockTransport } from "./mock/mock-api.ts";
 import { holdingTransport, renderConsole, settle } from "./test-support.tsx";
 
 beforeEach(() => {
@@ -82,6 +84,58 @@ describe("create organization navigation", () => {
         .textContent?.includes("Initech"),
     ).toBe(true);
   });
+
+  test.each([
+    { reply: "no organization", id: undefined },
+    { reply: "an empty ID", id: "" },
+    { reply: "a malformed ID", id: "not-an-organization-id" },
+    { reply: "a UUID v4 ID", id: "0193a000-0000-4000-8000-000000000011" },
+  ])(
+    "keeps the name and route when the response has $reply",
+    async ({ id }) => {
+      const mock = createMockTransport();
+      const incompleteCreate: Transport = {
+        ...mock,
+        async unary(method, ...args) {
+          const response = await mock.unary(method, ...args);
+          if (method.name !== "CreateOrganization") return response;
+          const { organization } =
+            response.message as unknown as CreateOrganizationResponse;
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              organization:
+                id !== undefined && organization
+                  ? { ...organization, organizationId: id }
+                  : undefined,
+            },
+          };
+        },
+      };
+      const { transport, seen } = holdingTransport(
+        [],
+        undefined,
+        incompleteCreate,
+      );
+      const dialog = await openAndName(transport, "Initech");
+      await submit(dialog);
+      expect(window.location.pathname).toBe("/");
+      expect(within(dialog).getByRole("alert").textContent).toContain(
+        "The organization may have been created. Close this dialog and check the organization list before trying again.",
+      );
+      expect(
+        (
+          within(dialog).getByRole("textbox", {
+            name: "Organization name",
+          }) as HTMLInputElement
+        ).value,
+      ).toBe("Initech");
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await screen.findByRole("link", { name: /Initech/ });
+      expect(seen.CreateOrganization).toBe(1);
+    },
+  );
 
   test("a failed creation keeps the dialog with its error and a retry works", async () => {
     const { transport, calls, seen } = holdingTransport(["CreateOrganization"]);

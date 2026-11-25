@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError } from "@connectrpc/connect";
 import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Badge } from "delino-ui/badge";
@@ -18,6 +19,9 @@ import { labels } from "../format.ts";
 import { secretFromInput, SECRET_PARAM } from "../invitation.ts";
 import { refreshOrganizations, useOrganizations } from "../organizations.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
+
+const organizationIdPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /** Route `organizations`: the organization list, creation and invitations. */
 export function OrganizationsPage() {
@@ -122,12 +126,19 @@ export function OrganizationsPage() {
           // A request of a dismissed opening neither closes the form of a
           // later opening nor moves the user away from the page they went to.
           if (!opening.isCurrent()) return;
+          const organizationId = res.organization?.organizationId;
+          if (!organizationId || !organizationIdPattern.test(organizationId)) {
+            throw new ConnectError(
+              "The organization may have been created. Close this dialog and check the organization list before trying again.",
+              Code.FailedPrecondition,
+            );
+          }
           setCreating(false);
           setName("");
           navigate(
             routePath({
               id: RouteId.Sandboxes,
-              organizationId: res.organization!.organizationId,
+              organizationId,
             }),
           );
         }}

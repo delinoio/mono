@@ -17,6 +17,7 @@ import {
   type RevokeInvitationRequest,
 } from "@delino/ownsand-protos/v1/member_pb";
 import { SnapshotExportState } from "@delino/ownsand-protos/v1/common_pb";
+import type { CreateOrganizationResponse } from "@delino/ownsand-protos/v1/organization_pb";
 import {
   CreateSandboxRequestSchema,
   type CreateSandboxRequest,
@@ -274,6 +275,49 @@ export function createMockTransport(): Transport {
         method.name === "AcceptInvitation"
       ) {
         await holdOrganizationRefreshStep("mutation");
+      }
+      if (method.name === "CreateOrganization") {
+        const reply = sessionStorage.getItem(
+          "ownsand-e2e-organization-create-reply",
+        );
+        if (reply !== null) {
+          const countKey = "ownsand-e2e-organization-create-count";
+          sessionStorage.setItem(
+            countKey,
+            String(Number(sessionStorage.getItem(countKey)) + 1),
+          );
+          if (reply === "late-missing-organization") {
+            await new Promise<void>((resolve) => {
+              window.addEventListener(
+                "ownsand-e2e-release-organization-create",
+                () => resolve(),
+                {
+                  once: true,
+                },
+              );
+            });
+          }
+          const response = await base.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+          const { organization } =
+            response.message as unknown as CreateOrganizationResponse;
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              organization:
+                reply === "empty-id" && organization
+                  ? { ...organization, organizationId: "" }
+                  : undefined,
+            },
+          };
+        }
       }
       if (
         method.name === "AcceptInvitation" &&
