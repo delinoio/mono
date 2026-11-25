@@ -33,10 +33,10 @@ if [ -z "$busybox" ]; then
   echo "busybox is required" >&2
   exit 1
 fi
-# -L follows a symlink, because file describes the link and not its target
-# otherwise, and a dangling link prints no linkage so it is still rejected.
+# -b omits the input path so its text cannot match the linkage check.
+# -L describes the symlink target. A dangling link has no linkage description.
 # file prints "static-pie linked" for a static position-independent executable.
-if ! file -L -- "$busybox" | grep -Eq 'statically linked|static-pie linked'; then
+if ! file -b -L -- "$busybox" | grep -Eq 'statically linked|static-pie linked'; then
   echo "busybox must be statically linked: $busybox" >&2
   exit 1
 fi
