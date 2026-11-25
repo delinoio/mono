@@ -543,12 +543,15 @@ func (e *Engine) resolveCreate(ctx context.Context, client ownsandclient.Client,
 		e.svc.Logger.WarnContext(ctx, "runner_create_request_load_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
 		return "", false
 	}
-	if err := api.CheckOrganizationDeletion(ctx); err != nil {
+	if err := api.CheckTeardown(ctx); err != nil {
 		return "", false
 	}
 	sb, err := e.createSandbox(ctx, client, req)
 	switch {
 	case err == nil:
+		if err := api.CheckTeardown(ctx); err != nil {
+			return "", false
+		}
 		if _, err := api.OrganizationDeletionQuerier(ctx, e.svc.DB.Pool).Exec(ctx, "UPDATE runners SET ownsand_sandbox_id = $2, ownsand_device_id = $3, update_time = $4 WHERE runner_id = $1 AND ownsand_sandbox_id IS NULL",
 			r.ID, sb.GetSandboxId(), sb.GetDeviceId(), e.svc.NowUTC()); err != nil {
 			e.svc.Logger.WarnContext(ctx, "runner_sandbox_store_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
@@ -674,12 +677,15 @@ func (e *Engine) cleanUpEnded(ctx context.Context, runnerID, orgID string) error
 		return fmt.Errorf("load OwnSand client for cleanup: %w", err)
 	}
 	if err == nil && r.SandboxID != "" {
-		if err := api.CheckOrganizationDeletion(ctx); err != nil {
+		if err := api.CheckTeardown(ctx); err != nil {
 			return err
 		}
 		if _, err := client.DeleteSandbox(ctx, r.SandboxID); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
 			return fmt.Errorf("delete sandbox: %w", err)
 		}
+	}
+	if err := api.CheckTeardown(ctx); err != nil {
+		return err
 	}
 	if _, err := api.OrganizationDeletionQuerier(ctx, e.svc.DB.Pool).Exec(ctx, "UPDATE runners SET sandbox_cleanup = false WHERE runner_id = $1 AND sandbox_cleanup", runnerID); err != nil {
 		return fmt.Errorf("clear sandbox cleanup mark: %w", err)

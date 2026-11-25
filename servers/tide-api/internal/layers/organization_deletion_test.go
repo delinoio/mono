@@ -70,7 +70,7 @@ func TestOrganizationDeletionRecoversInterruptedLinkClaim(t *testing.T) {
 		var credentialsPresent bool
 		err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM ownsand_links l JOIN organizations o USING (organization_id)
 			WHERE l.organization_id = $1 AND length(l.api_key_ciphertext) > 0
-			AND l.removing AND l.organization_deletion_attempt_id = o.deletion_attempt_id)`, org.ID).Scan(&credentialsPresent)
+			AND l.removing AND l.removal_token = o.deletion_attempt_id)`, org.ID).Scan(&credentialsPresent)
 		if err != nil {
 			return err
 		}
@@ -142,6 +142,11 @@ func TestOrganizationDeletionRecoversInterruptedLinkClaim(t *testing.T) {
 	wantCode(t, "admin attempts to resume deletion", remove(second, org.Admin), connect.CodePermissionDenied)
 	wantCode(t, "transfer before the interrupted deletion is retried", transfer(), connect.CodeFailedPrecondition)
 
+	// Advance the persisted lease past its deadline without waiting for the
+	// production lease duration. The old provider call is still in flight.
+	if _, err := pool.Exec(ctx, "UPDATE ownsand_links SET removal_expires_at = clock_timestamp() WHERE organization_id = $1", org.ID); err != nil {
+		t.Fatal(err)
+	}
 	retry := make(chan error, 1)
 	go func() { retry <- remove(second, org.Owner) }()
 	waitCall(2)
@@ -153,7 +158,7 @@ func TestOrganizationDeletionRecoversInterruptedLinkClaim(t *testing.T) {
 		t.Fatalf("the stale attempt reached another provider call: %d calls", n)
 	}
 	var newID, linkID string
-	if err := pool.QueryRow(ctx, `SELECT o.deletion_attempt_id::text, l.organization_deletion_attempt_id::text
+	if err := pool.QueryRow(ctx, `SELECT o.deletion_attempt_id::text, l.removal_token::text
 		FROM organizations o JOIN ownsand_links l USING (organization_id) WHERE o.organization_id = $1`, org.ID).Scan(&newID, &linkID); err != nil {
 		t.Fatal(err)
 	}

@@ -24,21 +24,22 @@ import (
 // Environment variable names read by the server. The OpenTelemetry SDK
 // reads the OTEL_* variables itself.
 const (
-	EnvAddr                     = "ADDR"
-	EnvLogLevel                 = "LOG_LEVEL"
-	EnvDatabaseURL              = "DATABASE_URL"
-	EnvRunMigrations            = "RUN_MIGRATIONS"
-	EnvLogtoIssuer              = "LOGTO_ISSUER"
-	EnvLogtoJWKSURL             = "LOGTO_JWKS_URL"
-	EnvLogtoJWKSFile            = "LOGTO_JWKS_FILE"
-	EnvLogtoAudience            = "LOGTO_AUDIENCE"
-	EnvCORSOrigins              = "CORS_ORIGINS"
-	EnvTrustProxyClientAddress  = "TRUST_PROXY_CLIENT_ADDRESS"
-	EnvAllowDirectClientAddress = "ALLOW_DIRECT_CLIENT_ADDRESS"
-	EnvSecretKeys               = "TIDE_SECRET_KEYS"
-	EnvMetricsAddr              = "METRICS_ADDR"
-	EnvOwnSandAPIOrigin         = "OWNSAND_API_ORIGIN"
-	EnvPublicOrigin             = "PUBLIC_ORIGIN"
+	EnvAddr                         = "ADDR"
+	EnvLogLevel                     = "LOG_LEVEL"
+	EnvDatabaseURL                  = "DATABASE_URL"
+	EnvRunMigrations                = "RUN_MIGRATIONS"
+	EnvReclaimLegacyOwnSandRemovals = "RECLAIM_LEGACY_OWNSAND_REMOVALS"
+	EnvLogtoIssuer                  = "LOGTO_ISSUER"
+	EnvLogtoJWKSURL                 = "LOGTO_JWKS_URL"
+	EnvLogtoJWKSFile                = "LOGTO_JWKS_FILE"
+	EnvLogtoAudience                = "LOGTO_AUDIENCE"
+	EnvCORSOrigins                  = "CORS_ORIGINS"
+	EnvTrustProxyClientAddress      = "TRUST_PROXY_CLIENT_ADDRESS"
+	EnvAllowDirectClientAddress     = "ALLOW_DIRECT_CLIENT_ADDRESS"
+	EnvSecretKeys                   = "TIDE_SECRET_KEYS"
+	EnvMetricsAddr                  = "METRICS_ADDR"
+	EnvOwnSandAPIOrigin             = "OWNSAND_API_ORIGIN"
+	EnvPublicOrigin                 = "PUBLIC_ORIGIN"
 
 	// The tide GitHub App. Set all six or none: without them the GitHub
 	// layer is off (see GitHubApp).
@@ -140,6 +141,8 @@ type Config struct {
 	DatabaseURL string
 	// RunMigrations applies the embedded migrations at startup.
 	RunMigrations bool
+	// ReclaimLegacyOwnSandRemovals is safe to enable after old servers drain.
+	ReclaimLegacyOwnSandRemovals bool
 
 	LogtoIssuer   string
 	LogtoJWKSURL  string
@@ -229,6 +232,10 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	var err error
 	if cfg.RunMigrations, err = parseBool(EnvRunMigrations, get(EnvRunMigrations), true); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.ReclaimLegacyOwnSandRemovals, err = parseBool(EnvReclaimLegacyOwnSandRemovals, get(EnvReclaimLegacyOwnSandRemovals), false); err != nil {
 		return Config{}, err
 	}
 

@@ -165,11 +165,18 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 		}
 	}()
 	cleanupCtx := context.WithValue(ctx, organizationDeletionContextKey{}, attempt)
-	prepared, err := h.organizationDeletionPrepare(cleanupCtx, d)
+	cleanupCtx, prepared, err := h.organizationDeletionPrepare(cleanupCtx, d)
 	if err != nil {
 		return nil, h.Internal(ctx, "prepare organization deletion", err)
 	}
-	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+	// Check cancellation and the lease before the transaction. The work hook
+	// rechecks the claim under row locks before writing any final state.
+	if err := CheckTeardown(cleanupCtx); err != nil {
+		organizationDeletionAbort(cleanupCtx, prepared)
+		return nil, h.Internal(ctx, "check organization deletion", err)
+	}
+	err = pgx.BeginFunc(cleanupCtx, conn, func(tx pgx.Tx) error {
+		ctx := cleanupCtx
 		if err := LockOrganization(ctx, tx, d.OrganizationID); err != nil {
 			return err
 		}

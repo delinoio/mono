@@ -84,6 +84,7 @@ type Links struct {
 	svc     *api.Service
 	factory ownsandclient.Factory
 	metrics *metrics.Metrics
+	removal RemovalOptions
 	hooks   []RemovalHook
 
 	mu      sync.Mutex
@@ -97,8 +98,11 @@ type cachedClient struct {
 
 // Register mounts OwnSandLinkService and its daily re-encryption job and
 // returns the Links of the other layers.
-func Register(r *app.Registry, factory ownsandclient.Factory, m *metrics.Metrics) *Links {
-	l := &Links{svc: r.Service, factory: factory, metrics: m, clients: map[string]cachedClient{}}
+func Register(r *app.Registry, factory ownsandclient.Factory, m *metrics.Metrics, removal RemovalOptions) *Links {
+	if removal.LeaseDuration <= 0 {
+		removal.LeaseDuration = time.Minute
+	}
+	l := &Links{svc: r.Service, factory: factory, metrics: m, removal: removal, clients: map[string]cachedClient{}}
 	r.Handle(tidev1connect.NewOwnSandLinkServiceHandler(&Handler{links: l}, r.HandlerOptions()...))
 	r.AddDailyJob(jobs.Job{Name: "reencrypt_ownsand_links", Run: func(ctx context.Context, _ time.Time) (int64, error) { return l.Reencrypt(ctx, l.svc.Secrets) }})
 	return l
@@ -382,101 +386,11 @@ func (h *Handler) GetOwnSandLink(ctx context.Context, req *connect.Request[tidev
 	return connect.NewResponse(resp), nil
 }
 
-// RemovalClaim identifies the link that one teardown attempt may remove.
-// An attempt that found no link has an empty link ID.
-type RemovalClaim struct {
-	orgID             string
-	linkID            string
-	deletionAttemptID *string
-}
-
-// HasLink reports whether the attempt claimed an existing link.
-func (c RemovalClaim) HasLink() bool { return c.linkID != "" }
-
-// ClaimRemoval stops dispatch before an attempt can start runner cleanup.
-// An absent link returns an empty claim. A competing attempt fails.
-func (l *Links) ClaimRemoval(ctx context.Context, orgID string) (RemovalClaim, error) {
-	return l.claimRemoval(ctx, orgID, nil)
-}
-
-// ClaimOrganizationRemoval lets an authorized deletion resume a link claim
-// left by an interrupted organization deletion.
-func (l *Links) ClaimOrganizationRemoval(ctx context.Context, d api.OrganizationDeletion) (RemovalClaim, error) {
-	return l.claimRemoval(ctx, d.OrganizationID, &d.AttemptID)
-}
-
-func (l *Links) claimRemoval(ctx context.Context, orgID string, attemptID *string) (RemovalClaim, error) {
-	if err := ctx.Err(); err != nil {
-		return RemovalClaim{}, err
-	}
-	// Let the short database step report its result even if the caller
-	// cancels. The caller must know whether to release the committed claim.
-	claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	claim := RemovalClaim{orgID: orgID, deletionAttemptID: attemptID}
-	var exists bool
-	// Check for absence in the same snapshot so a deletion or relink
-	// cannot change the interpretation of a failed update.
-	q := api.OrganizationDeletionQuerier(ctx, l.svc.DB.Pool)
-	err := q.QueryRow(claimCtx, `WITH claimed AS (
-		UPDATE ownsand_links SET removing = true, organization_deletion_attempt_id = $2
-		WHERE organization_id = $1 AND (NOT removing OR ($2::uuid IS NOT NULL AND organization_deletion_attempt_id IS NOT NULL))
-		RETURNING ownsand_link_id
-	)
-	SELECT COALESCE((SELECT ownsand_link_id::text FROM claimed), ''),
-		EXISTS (SELECT 1 FROM ownsand_links WHERE organization_id = $1)`, orgID, attemptID).Scan(&claim.linkID, &exists)
-	if err != nil {
-		return RemovalClaim{}, err
-	}
-	if exists && !claim.HasLink() {
-		return RemovalClaim{}, api.ErrPrecondition("the OwnSand link is being removed")
-	}
-	return claim, nil
-}
-
-// CheckRemoval verifies the prepared link under the organization row lock.
-// Deletion that prepared without a link must retry if one now exists.
-func (l *Links) CheckRemoval(ctx context.Context, tx pgx.Tx, claim RemovalClaim) error {
-	var linkID string
-	var removing, sameAttempt bool
-	err := tx.QueryRow(ctx, `SELECT ownsand_link_id::text, removing, organization_deletion_attempt_id IS NOT DISTINCT FROM $2::uuid
-		FROM ownsand_links WHERE organization_id = $1`, claim.orgID, claim.deletionAttemptID).Scan(&linkID, &removing, &sameAttempt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		if !claim.HasLink() {
-			return nil
-		}
-	} else if err != nil {
-		return err
-	} else if linkID == claim.linkID && removing && sameAttempt {
-		return nil
-	}
-	return api.ErrPrecondition("the OwnSand link changed meanwhile; try again")
-}
-
-// ReleaseRemoval clears only the link claimed by the failed attempt.
-func (l *Links) ReleaseRemoval(ctx context.Context, claim RemovalClaim) {
-	if !claim.HasLink() {
-		return
-	}
-	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	// Use the pool even if cancellation ended the deletion session. Lock its
-	// intent first so a takeover cannot race the release of the old link mark.
-	if _, err := l.svc.DB.Pool.Exec(releaseCtx, `WITH owned_intent AS (
-		SELECT 1 FROM organizations WHERE organization_id = $3 AND deletion_attempt_id = $2 FOR UPDATE
-	)
-	UPDATE ownsand_links SET removing = false, organization_deletion_attempt_id = NULL
-	WHERE ownsand_link_id = $1 AND removing AND organization_deletion_attempt_id IS NOT DISTINCT FROM $2::uuid
-		AND ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM owned_intent))`, claim.linkID, claim.deletionAttemptID, claim.orgID); err != nil {
-		l.svc.Logger.WarnContext(ctx, "ownsand_link_removal_unmark_failed", slog.String("organization_id", claim.orgID), slog.Any("error", err))
-	}
-}
-
 // RemoveOwnSandLink marks the link as being removed (dispatch stops), runs
 // the Prepare hooks (the work layer deletes the runners), then deletes the
 // link and its key in a transaction that also runs the InTx hooks (the work
-// layer ends the queued requests with CANCELED). A failed Prepare or a failed
-// deletion transaction clears the mark and keeps the link.
+// layer ends the queued requests with CANCELED). On failure the handler
+// keeps the link and tries to release its claim.
 func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[tidev1.RemoveOwnSandLinkRequest]) (*connect.Response[tidev1.RemoveOwnSandLinkResponse], error) {
 	l := h.links
 	s := l.svc
@@ -491,17 +405,29 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 	if !claim.HasLink() {
 		return nil, api.ErrNotFound("OwnSand link")
 	}
+
+	committed := false
+	cleanupCtx, stop := l.WatchRemoval(ctx, claim)
+	defer func() {
+		if !committed {
+			stop()
+			l.ReleaseRemoval(ctx, claim)
+		}
+	}()
 	for _, hook := range l.hooks {
 		if hook.Prepare == nil {
 			continue
 		}
-		if err := hook.Prepare(ctx, c.OrganizationID); err != nil {
+		if err := api.CheckTeardown(cleanupCtx); err != nil {
+			return nil, s.Internal(ctx, "check ownsand link removal", err)
+		}
+		if err := hook.Prepare(cleanupCtx, c.OrganizationID); err != nil {
 			s.Logger.WarnContext(ctx, "ownsand_link_removal_prepare_failed", slog.String("hook", hook.Name), slog.String("organization_id", c.OrganizationID), slog.Any("error", err))
-			l.ReleaseRemoval(ctx, claim)
 			return nil, s.Internal(ctx, "prepare ownsand link removal", err)
 		}
 	}
-	err = s.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = s.DB.InTx(cleanupCtx, func(tx pgx.Tx) error {
+		ctx := cleanupCtx
 		if err := api.LockOrganization(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
@@ -525,13 +451,11 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 		})
 	})
 	if err != nil {
-		// The deletion rolled back (for example, the request was canceled
-		// while it waited for the organization lock), so the link stays and
-		// must not stay marked.
 		s.Logger.WarnContext(ctx, "ownsand_link_removal_failed", slog.String("organization_id", c.OrganizationID), slog.Any("error", err))
-		l.ReleaseRemoval(ctx, claim)
 		return nil, s.Internal(ctx, "remove ownsand link", err)
 	}
+	committed = true
+	stop()
 	l.forget(c.OrganizationID)
 	for _, hook := range l.hooks {
 		if hook.AfterCommit != nil {

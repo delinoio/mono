@@ -87,6 +87,9 @@ type OrganizationDeletionHook struct {
 // OrganizationDeletionSteps hold the callbacks for one deletion attempt.
 // They can capture state acquired during Prepare.
 type OrganizationDeletionSteps struct {
+	// PrepareContext, when set, is derived from the caller's context and used
+	// for the remaining preparation hooks and final transaction.
+	PrepareContext context.Context
 	// InTx runs after the core locks the organization and verifies the intent, before
 	// the core revokes the keys and deletes the rows.
 	InTx func(ctx context.Context, tx pgx.Tx) error
@@ -131,23 +134,26 @@ func (s *Service) membershipEndAfterCommit(ctx context.Context, e MembershipEnd)
 		slog.String("user_id", e.UserID), slog.Int("revoked_api_keys", len(e.RevokedAPIKeyIDs)))
 }
 
-func (s *Service) organizationDeletionPrepare(ctx context.Context, d OrganizationDeletion) ([]preparedOrganizationDeletionHook, error) {
+func (s *Service) organizationDeletionPrepare(ctx context.Context, d OrganizationDeletion) (context.Context, []preparedOrganizationDeletionHook, error) {
 	prepared := make([]preparedOrganizationDeletionHook, 0, len(s.Hooks.OrganizationDeletion))
 	for _, h := range s.Hooks.OrganizationDeletion {
-		if err := CheckOrganizationDeletion(ctx); err != nil {
+		if err := CheckTeardown(ctx); err != nil {
 			organizationDeletionAbort(ctx, prepared)
-			return nil, err
+			return ctx, nil, err
 		}
 		steps, err := h.Prepare(ctx, d)
 		if err != nil {
 			s.Logger.WarnContext(ctx, "organization_deletion_prepare_failed", slog.String("hook", h.Name),
 				slog.String("organization_id", d.OrganizationID), slog.Any("error", err))
 			organizationDeletionAbort(ctx, prepared)
-			return nil, err
+			return ctx, nil, err
 		}
 		prepared = append(prepared, preparedOrganizationDeletionHook{name: h.Name, OrganizationDeletionSteps: steps})
+		if steps.PrepareContext != nil {
+			ctx = steps.PrepareContext
+		}
 	}
-	return prepared, nil
+	return ctx, prepared, nil
 }
 
 func organizationDeletionAbort(ctx context.Context, prepared []preparedOrganizationDeletionHook) {
