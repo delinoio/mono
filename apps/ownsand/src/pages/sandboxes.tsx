@@ -178,52 +178,54 @@ export function SandboxesPage() {
       </div>
       {creating ? null : <DeviceListNotice list={deviceList} />}
       <QueryBoundary query={boundaryQuery} loading="Loading sandboxes">
-        {() =>
-          sandboxes.length === 0 ? (
-            <Empty title="No sandboxes match">
-              Create a sandbox, or change the filters.
-            </Empty>
-          ) : (
-            <TableRegion label="Sandbox list">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th scope="col">Sandbox</th>
-                    <th scope="col">State</th>
-                    <th scope="col">Device</th>
-                    <th scope="col">Resources</th>
-                    <th scope="col">Idle deadline</th>
-                    <th scope="col">Max deadline</th>
-                    <th scope="col">Labels</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sandboxes.map((s) => (
-                    <SandboxRow
-                      key={s.sandboxId}
-                      sandbox={s}
-                      organizationId={organizationId}
-                      deviceName={deviceNames.get(s.deviceId)}
-                    />
-                  ))}
-                </tbody>
-              </table>
-            </TableRegion>
-          )
-        }
+        {() => (
+          <>
+            {sandboxes.length === 0 ? (
+              <Empty title="No sandboxes match">
+                Create a sandbox, or change the filters.
+              </Empty>
+            ) : (
+              <TableRegion label="Sandbox list">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Sandbox</th>
+                      <th scope="col">State</th>
+                      <th scope="col">Device</th>
+                      <th scope="col">Resources</th>
+                      <th scope="col">Idle deadline</th>
+                      <th scope="col">Max deadline</th>
+                      <th scope="col">Labels</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sandboxes.map((s) => (
+                      <SandboxRow
+                        key={s.sandboxId}
+                        sandbox={s}
+                        organizationId={organizationId}
+                        deviceName={deviceNames.get(s.deviceId)}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </TableRegion>
+            )}
+            {nextPageFailed && !list.isFetchingNextPage ? (
+              <ErrorNotice error={list.error} onRetry={requestNextPage} />
+            ) : null}
+            {list.hasNextPage ? (
+              <Button
+                variant={ButtonVariant.Secondary}
+                disabled={list.isFetchingNextPage}
+                onClick={requestNextPage}
+              >
+                Show more
+              </Button>
+            ) : null}
+          </>
+        )}
       </QueryBoundary>
-      {nextPageFailed && !list.isFetchingNextPage ? (
-        <ErrorNotice error={list.error} onRetry={requestNextPage} />
-      ) : null}
-      {list.hasNextPage ? (
-        <Button
-          variant={ButtonVariant.Secondary}
-          disabled={list.isFetchingNextPage}
-          onClick={requestNextPage}
-        >
-          Show more
-        </Button>
-      ) : null}
       <CreateSandboxDialog
         open={creating}
         onOpenChange={setCreating}
