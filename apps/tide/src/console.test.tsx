@@ -2148,6 +2148,7 @@ describe("overview", () => {
       await screen.findByRole("region", { name: "Device pool" }),
     );
     expect(await pool.findByText("No devices")).toBeTruthy();
+    expect(pool.queryByRole("region", { name: "Devices table" })).toBeNull();
   });
 
   test("offers to retry a failed capacity request for an active link", async () => {
@@ -2639,6 +2640,68 @@ describe("member names in Audit and Dev Sessions", () => {
       ]);
     },
   );
+});
+
+describe("table scroll regions without data", () => {
+  test.each([
+    ["", "GetCapacity", "Loading the device pool", "Devices table"],
+    ["/audit", "ListAuditEvents", "Loading audit events", "Audit events table"],
+  ])(
+    "omits the region while %s loads or fails",
+    async (path, method, loading, name) => {
+      const { transport, calls } = gatedTransport(method);
+      renderConsole(`/orgs/${MOCK_IDS.acme}${path}`, { transport });
+
+      await waitFor(() => expect(calls).toHaveLength(1));
+      expect(screen.getByRole("status", { name: loading })).toBeTruthy();
+      expect(screen.queryByRole("region", { name })).toBeNull();
+
+      await act(async () =>
+        calls[0]!.settle(new ConnectError("Unavailable", Code.Unavailable)),
+      );
+      expect(
+        await screen.findByRole("button", { name: "Try again" }),
+      ).toBeTruthy();
+      expect(screen.queryByRole("region", { name })).toBeNull();
+    },
+  );
+
+  test("omits the waiting requests region when the first queue snapshot fails", async () => {
+    let failStream!: () => void;
+    const streamFailure = new Promise<void>((resolve) => {
+      failStream = resolve;
+    });
+    const queue = createRouterTransport((router) => {
+      router.service(WorkService, {
+        async *watchQueue() {
+          await streamFailure;
+          throw new ConnectError("Queue failed", Code.Internal);
+        },
+      });
+    });
+    const mock = createMockTransport();
+    const transport: Transport = {
+      ...mock,
+      stream: (method, ...args) =>
+        (method.name === "WatchQueue" ? queue : mock).stream(method, ...args),
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
+
+    const name = "Waiting requests table";
+    expect(
+      await screen.findByRole("status", { name: "Loading the queue" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("region", { name })).toBeNull();
+
+    await act(async () => failStream());
+    expect(
+      await screen.findByRole("button", { name: "Try again" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("status", { name: "Loading the queue" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("region", { name })).toBeNull();
+  });
 });
 
 describe("audit", () => {
