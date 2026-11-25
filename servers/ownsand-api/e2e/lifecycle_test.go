@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package e2e runs the real OwnSand control plane, the real device agent
-// with the process runtime, the Go SDK and the CLI binary together. It is
-// enabled with OWNSAND_E2E=1 and OWNSAND_TEST_DATABASE_URL; see
-// docs/project-ownsand.md#end-to-end-test.
+// with the process or Virtualization.framework runtime, the Go SDK and the
+// CLI binary together. Set OWNSAND_E2E=1 and OWNSAND_TEST_DATABASE_URL
+// to enable it. See docs/project-ownsand.md#end-to-end-test.
 package e2e
 
 import (
@@ -137,11 +137,51 @@ func (s *stack) waitLocalSnapshotGone(t *testing.T, a agentProc, snapshotID stri
 // each forced transport.
 func TestLifecycleSDK(t *testing.T) {
 	s := newStack(t)
+	wantRestore := defaultSDKRestorePaths(s.processRuntime)
 	for _, tr := range transports {
-		// The process runtime has no memory state: a snapshot restore always
-		// copies the snapshot files and starts a new process.
 		t.Run(tr.String(), func(t *testing.T) {
-			sdkLifecycle(t, s, tr, ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT)
+			sdkLifecycle(t, s, tr, wantRestore...)
+		})
+	}
+}
+
+func defaultSDKRestorePaths(processRuntime bool) []ownsandv1.SandboxRestorePath {
+	coldBoot := ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT
+	if processRuntime {
+		// The process runtime copies the snapshot files and starts a new process.
+		return []ownsandv1.SandboxRestorePath{coldBoot}
+	}
+	// Virtualization.framework can restore saved memory or boot the snapshot disk.
+	return []ownsandv1.SandboxRestorePath{
+		ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE,
+		coldBoot,
+	}
+}
+
+func TestDefaultSDKRestorePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		processRuntime bool
+		acceptsMemory  bool
+	}{
+		{name: "process", processRuntime: true},
+		{name: "virtualization", acceptsMemory: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := defaultSDKRestorePaths(tc.processRuntime)
+			for _, check := range []struct {
+				path   ownsandv1.SandboxRestorePath
+				accept bool
+			}{
+				{ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT, true},
+				{ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE, tc.acceptsMemory},
+				{ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_BASE_IMAGE, false},
+				{ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_UNSPECIFIED, false},
+			} {
+				if got := slices.Contains(paths, check.path); got != check.accept {
+					t.Errorf("accepts %v = %v, want %v", check.path, got, check.accept)
+				}
+			}
 		})
 	}
 }
@@ -229,9 +269,11 @@ func sdkLifecycle(t *testing.T, s *stack, tr ownsand.Transport, wantRestore ...o
 	if err != nil || restoredInfo.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		t.Fatalf("restored WaitStable = (%v, %v)", restoredInfo.GetState(), err)
 	}
-	if !slices.Contains(wantRestore, restoredInfo.GetRestorePath()) {
-		t.Fatalf("restored sandbox restore path %v, want one of %v", restoredInfo.GetRestorePath(), wantRestore)
+	restorePath := restoredInfo.GetRestorePath()
+	if !slices.Contains(wantRestore, restorePath) {
+		t.Fatalf("restored sandbox restore path %v, want one of %v", restorePath, wantRestore)
 	}
+	t.Logf("restored sandbox restore path: %v", restorePath)
 	// The restored sandbox has its own root; the file came with the
 	// snapshot.
 	got, err = restored.ReadFileBytes(ctx, workDir(ctx, t, restored)+"/e2e.bin")
