@@ -72,7 +72,7 @@ func powershellUTF8JSON(ctx context.Context, pipeline string, env ...string) ([]
 // mountISO attaches the ISO read-only, or uses it where it is attached
 // already; see mountISOWith.
 func mountISO(ctx context.Context, path string) (*mountedISO, error) {
-	return mountISOWith(ctx, path, powershell)
+	return mountISOWith(ctx, path, powershell, lockWindowsISO)
 }
 
 // installImage returns sources\install.wim or sources\install.esd of the
