@@ -288,6 +288,13 @@ func growFile(path string, size int64) error {
 	return os.Truncate(path, size)
 }
 
+func checkBaseDiskCapacity(sourceBytes, requestedBytes int64) error {
+	if sourceBytes > requestedBytes {
+		return fmt.Errorf("%w: the base disk requires %d bytes, but the request allocates %d bytes", vmruntime.ErrUnsupported, sourceBytes, requestedBytes)
+	}
+	return nil
+}
+
 // Create boots a VM for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
 	switch spec.GuestOS {
@@ -300,8 +307,15 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if !fileExists(r.opts.Kernel) {
 		return nil, fmt.Errorf("%w: the Linux kernel is missing", vmruntime.ErrUnsupported)
 	}
-	if spec.Snapshot == nil && !fileExists(r.opts.Rootfs) {
-		return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+	diskBytes := spec.Resources.GetDiskGib() << 30
+	if spec.Snapshot == nil {
+		baseDisk, err := os.Stat(r.opts.Rootfs)
+		if err != nil || !baseDisk.Mode().IsRegular() {
+			return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+		}
+		if err := checkBaseDiskCapacity(baseDisk.Size(), diskBytes); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.RemoveAll(spec.Dir); err != nil {
 		return nil, err
@@ -362,7 +376,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
 		}
 	}
-	if err := growFile(disk, spec.Resources.GetDiskGib()<<30); err != nil {
+	if err := growFile(disk, diskBytes); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vzrt: resize disk: %w", err)
 	}
