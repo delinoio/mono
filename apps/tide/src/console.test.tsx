@@ -44,6 +44,7 @@ import {
   Role,
   RunnerState,
 } from "@delino/tide-protos/v1/common_pb";
+import { DevSessionService } from "@delino/tide-protos/v1/dev_session_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
 import {
   type ListInvitationsRequest,
@@ -2278,6 +2279,204 @@ describe("setup guidance", () => {
   });
 });
 
+describe("member names in Audit and Dev Sessions", () => {
+  const laterMemberId = "member-201";
+  const ownerIds = [laterMemberId, MOCK_USER, "unnamed", "departed"];
+  const tables = [
+    { section: "audit", name: "Audit events", column: 2 },
+    { section: "dev-sessions", name: "Dev sessions", column: 1 },
+  ];
+
+  function nameFixture({ failContinuation = false } = {}) {
+    let continueRoster!: () => void;
+    const continuation = new Promise<void>((resolve) => {
+      continueRoster = resolve;
+    });
+    const lists: ListMembersRequest[] = [];
+    const mock = createMockTransport();
+    const fixture = createRouterTransport((router) => {
+      router.service(MemberService, {
+        async listMembers(req) {
+          lists.push(req);
+          if (req.organizationId === MOCK_IDS.northwind) {
+            return {
+              members: [
+                { userId: laterMemberId, displayName: "Northwind Name" },
+              ],
+            };
+          }
+          if (req.pageToken === "p2") {
+            await continuation;
+            if (failContinuation) {
+              throw new ConnectError(
+                "Roster continuation failed",
+                Code.Internal,
+              );
+            }
+            return {
+              members: [{ userId: laterMemberId, displayName: "Later Member" }],
+            };
+          }
+          return {
+            members: [
+              { userId: MOCK_USER, displayName: "First Member" },
+              { userId: "unnamed" },
+              ...Array.from({ length: 198 }, (_, i) => ({
+                userId: `filler-${i}`,
+              })),
+            ],
+            nextPageToken: "p2",
+          };
+        },
+      });
+      router.service(AuditService, {
+        listAuditEvents: () => ({
+          events: [...ownerIds, ""].map((userId, i) => ({
+            auditEventId: `event-${i}`,
+            actorUserId: userId,
+            subjectUserId: userId,
+            actorApiKeyId: i === 0 ? MOCK_IDS.apiKey : "",
+          })),
+        }),
+      });
+      router.service(DevSessionService, {
+        listDevSessions: () => ({
+          devSessions: ownerIds.map((ownerUserId, i) => ({
+            devSessionId: `session-${i}`,
+            ownerUserId,
+          })),
+        }),
+      });
+    });
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...args) {
+        return ["ListMembers", "ListAuditEvents", "ListDevSessions"].includes(
+          method.name,
+        )
+          ? fixture.unary(method, ...args)
+          : mock.unary(method, ...args);
+      },
+    };
+    return { transport, lists, continueRoster };
+  }
+
+  function columnText(table: HTMLElement, column: number) {
+    return within(table)
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => within(row).getAllByRole("cell")[column]!.textContent);
+  }
+
+  test.each(tables)(
+    "updates names as roster pages arrive in $name",
+    async ({ section, name, column }) => {
+      const { transport, lists, continueRoster } = nameFixture();
+      renderConsole(`/orgs/${MOCK_IDS.acme}/${section}`, { transport });
+
+      const table = await screen.findByRole("table", { name });
+      await waitFor(() => {
+        expect(lists.map(({ pageToken }) => pageToken)).toEqual(["", "p2"]);
+        expect(columnText(table, column)[0]).toContain(laterMemberId);
+        expect(columnText(table, column)[1]).toContain("First Member");
+      });
+      expect(
+        lists.map(({ organizationId, pageSize }) => [organizationId, pageSize]),
+      ).toEqual([
+        [MOCK_IDS.acme, MAX_PAGE_SIZE],
+        [MOCK_IDS.acme, MAX_PAGE_SIZE],
+      ]);
+
+      continueRoster();
+      await waitFor(() =>
+        expect(columnText(table, column)[0]).toContain("Later Member"),
+      );
+      if (section === "audit") {
+        expect(columnText(table, column)).toEqual([
+          expect.stringContaining("Later Member with API key "),
+          "First Member",
+          "unnamed",
+          "departed",
+          "tide",
+        ]);
+        expect(columnText(table, 4)).toEqual([
+          "Later Member",
+          "First Member",
+          "unnamed",
+          "departed",
+          "—",
+        ]);
+      } else {
+        expect(columnText(table, column)).toEqual([
+          "Later Member",
+          "First Member (you)",
+          "unnamed",
+          "departed",
+        ]);
+      }
+      expect(lists.map(({ pageToken }) => pageToken)).toEqual(["", "p2"]);
+    },
+  );
+
+  test.each(tables)(
+    "keeps rows and scopes names after a failed continuation in $name",
+    async ({ section, name, column }) => {
+      const { transport, lists, continueRoster } = nameFixture({
+        failContinuation: true,
+      });
+      const client = renderConsole(`/orgs/${MOCK_IDS.acme}/${section}`, {
+        transport,
+      });
+      const table = await screen.findByRole("table", { name });
+      await waitFor(() =>
+        expect(lists.map(({ pageToken }) => pageToken)).toEqual(["", "p2"]),
+      );
+      continueRoster();
+      await waitFor(() =>
+        expect(
+          client
+            .getQueryCache()
+            .getAll()
+            .some(
+              (query) =>
+                query.state.error instanceof ConnectError &&
+                query.state.error.rawMessage === "Roster continuation failed",
+            ),
+        ).toBe(true),
+      );
+
+      expect(columnText(table, column).slice(0, 4)).toEqual([
+        expect.stringContaining(laterMemberId),
+        expect.stringContaining("First Member"),
+        "unnamed",
+        "departed",
+      ]);
+
+      await click(screen.getByRole("combobox", { name: "Organization" }));
+      await click(
+        await screen.findByRole("option", { name: /Northwind Labs/ }),
+      );
+      const northwindTable = await screen.findByRole("table", { name });
+      await waitFor(() => {
+        expect(columnText(northwindTable, column)[0]).toContain(
+          "Northwind Name",
+        );
+      });
+      expect(northwindTable.textContent).not.toContain("First Member");
+      expect(
+        lists.map(({ organizationId, pageToken }) => [
+          organizationId,
+          pageToken,
+        ]),
+      ).toEqual([
+        [MOCK_IDS.acme, ""],
+        [MOCK_IDS.acme, "p2"],
+        [MOCK_IDS.northwind, ""],
+      ]);
+    },
+  );
+});
+
 describe("audit", () => {
   function auditActions(table: HTMLElement) {
     return within(table)
@@ -2291,6 +2490,7 @@ describe("audit", () => {
 
     const table = await screen.findByRole("table", { name: "Audit events" });
     expect(auditActions(table)).toEqual([
+      "Dev session created",
       "Dev session created",
       "OwnSand link set",
     ]);
@@ -2307,6 +2507,7 @@ describe("audit", () => {
     const table = await screen.findByRole("table", { name: "Audit events" });
     expect(auditActions(table)).toEqual([
       "Request canceled",
+      "Dev session created",
       "Dev session created",
       "OwnSand link set",
     ]);
@@ -2328,10 +2529,20 @@ describe("audit", () => {
       AuditAction.DEV_SESSION_CREATED,
     ]);
     expect(second.events.map((event) => event.action)).toEqual([
+      AuditAction.DEV_SESSION_CREATED,
+    ]);
+    const third = await client.listAuditEvents({
+      organizationId,
+      pageSize: 1,
+      pageToken: second.nextPageToken,
+    });
+    expect(third.events.map((event) => event.action)).toEqual([
       AuditAction.OWNSAND_LINK_SET,
     ]);
-    expect([...first.events, ...second.events]).toEqual(all.events);
-    expect(second.nextPageToken).toBe("");
+    expect([...first.events, ...second.events, ...third.events]).toEqual(
+      all.events,
+    );
+    expect(third.nextPageToken).toBe("");
   });
 });
 
