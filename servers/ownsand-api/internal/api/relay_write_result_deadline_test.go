@@ -45,13 +45,20 @@ type writeResultCall struct {
 // deadline and waits until the agent holds the write chunk.
 func startWriteResultCall(t *testing.T, deadline time.Duration) *writeResultCall {
 	t.Helper()
+	c := startWriteCall(t, deadline, 8<<20)
+	c.relay.WaitFrame("write chunk", func(f *ownsandv1.DataFrame) bool { return f.GetStreamId() == c.stream && f.GetFileWriteChunk() != nil })
+	return c
+}
+
+func startWriteCall(t *testing.T, deadline time.Duration, initialCredit int64) *writeResultCall {
+	t.Helper()
 	env := testenv.New(t, func(o *app.Options) {
 		o.RelayTiming = &api.RelayTiming{Rotation: 3 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: time.Second,
 			RequestDeadline: deadline, GrantAck: time.Second, Signaling: 2 * time.Second}
 	})
 	org, agent, sandboxID := runningSandbox(t, env)
 	c := &writeResultCall{deadline: deadline, sandboxID: sandboxID, env: env, release: make(chan struct{}), done: make(chan error, 1), resp: make(chan *ownsandv1.WriteFileResponse, 1)}
-	c.relay = agent.ConnectRelay(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
+	c.relay = agent.ConnectRelayWithWindow(initialCredit, func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
 		w := f.GetFileWriteChunk()
 		if w == nil {
 			return
@@ -78,7 +85,6 @@ func startWriteResultCall(t *testing.T, deadline time.Duration) *writeResultCall
 		c.done <- err
 	}()
 	c.stream = streamOf(c.relay, c.grant)
-	c.relay.WaitFrame("write chunk", func(f *ownsandv1.DataFrame) bool { return f.GetStreamId() == c.stream && f.GetFileWriteChunk() != nil })
 	return c
 }
 

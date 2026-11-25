@@ -539,6 +539,8 @@ type Stream struct {
 	notify        chan struct{}
 	err           error
 	closed        bool
+	agentEnded    bool
+	cancelWrite   context.CancelFunc
 	// Started is when the stream_id was allocated.
 	Started time.Time
 }
@@ -627,6 +629,32 @@ func (s *Stream) SendMetered(ctx context.Context, f *ownsandv1.DataFrame, onWrit
 	return s.enqueueFrame(ctx, outFrame{frame: f, onWritten: onWritten})
 }
 
+// SendWriteRequest waits for the relay to queue the unary write request or
+// receive an agent error or session-end frame. The caller reads the terminal
+// frame with Next after this returns. The stream has one write request.
+func (s *Stream) SendWriteRequest(ctx context.Context, f *ownsandv1.DataFrame, onWritten func(int64)) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	s.mu.Lock()
+	if s.agentEnded {
+		s.mu.Unlock()
+		return nil
+	}
+	s.cancelWrite = cancel
+	s.mu.Unlock()
+
+	err := s.SendMetered(ctx, f, onWritten)
+	s.mu.Lock()
+	s.cancelWrite = nil
+	ended := s.agentEnded
+	s.mu.Unlock()
+	if ended {
+		return nil
+	}
+	return err
+}
+
 // enqueueFrame queues an ordinary frame of this stream. It waits for one of
 // the connection's outboundQueue tokens like Conn.enqueueFrame, and then
 // inserts the frame only while the stream is open: the check and the insert
@@ -652,6 +680,13 @@ func (s *Stream) enqueueFrame(ctx context.Context, of outFrame) error {
 		s.mu.Unlock()
 		<-c.slots
 		return ErrStreamClosed
+	}
+	// A terminal frame can cancel the write while credit or a queue slot
+	// becomes available. Check again while holding the same lock as push.
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		<-c.slots
+		return err
 	}
 	// The token guarantees room, see Conn.enqueueFrame.
 	c.out <- of
@@ -687,6 +722,13 @@ func (s *Stream) push(f *ownsandv1.DataFrame) error {
 		s.controlBytes += size
 	}
 	s.queue = append(s.queue, f)
+	switch f.GetKind() {
+	case ownsandv1.DataFrameKind_DATA_FRAME_KIND_ERROR, ownsandv1.DataFrameKind_DATA_FRAME_KIND_SESSION_END:
+		s.agentEnded = true
+		if s.cancelWrite != nil {
+			s.cancelWrite()
+		}
+	}
 	ch := s.notify
 	s.notify = make(chan struct{})
 	s.mu.Unlock()
