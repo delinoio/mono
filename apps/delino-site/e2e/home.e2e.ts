@@ -486,6 +486,10 @@ describe("brand colors", () => {
       browser,
     }) => {
       await app.open("/");
+      await expect(
+        browser.locator(".rp-home-hero__action.rp-button--brand"),
+      ).toBeVisible();
+      await expect(browser.locator(".rp-home-hero__title-brand")).toBeVisible();
       await browser.evaluate(installColorKit());
       if (mode === "dark") {
         await browser.evaluate(() => {
@@ -505,6 +509,10 @@ describe("brand colors", () => {
       browser,
     }) => {
       await app.open("/");
+      await expect(
+        browser.locator(".rp-home-hero__action.rp-button--brand"),
+      ).toBeVisible();
+      await expect(browser.locator(".rp-home-hero__title-brand")).toBeVisible();
       await browser.evaluate(installColorKit());
       if (mode === "dark") {
         await browser.evaluate(() => {
