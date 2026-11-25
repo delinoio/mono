@@ -90,8 +90,10 @@ type FileReadParams struct {
 
 // ReadFileFrom streams the guest file of p to w from p.Offset and returns
 // the file size when the read reaches the end. On an error it returns the
-// next undelivered offset. Like ReadFile, it continues an interrupted
-// stream with the same read_id and salt, so w never receives a byte twice.
+// next undelivered offset. If request validation fails, it returns p.Offset
+// for a nonnegative offset, or zero for a negative offset. Like ReadFile,
+// it continues an interrupted stream with the same read_id and salt, so w
+// never receives a byte twice.
 func (s *Sandbox) ReadFileFrom(ctx context.Context, p FileReadParams, w io.Writer) (int64, error) {
 	id := canonicalFileID(p.ReadID)
 	salt := p.BindingSalt
@@ -105,7 +107,7 @@ func (s *Sandbox) ReadFileFrom(ctx context.Context, p FileReadParams, w io.Write
 	check := proto.Clone(base).(*ownsandv1.ReadFileRequest)
 	check.Offset = p.Offset
 	if err := validate.ReadFileRequest(check); err != nil {
-		return 0, err
+		return max(p.Offset, 0), err
 	}
 	op := &readOp{
 		s:     s,
