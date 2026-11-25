@@ -242,6 +242,31 @@ describe("organization member pagination", () => {
 });
 
 describe("overview", () => {
+  test("guides an unlinked organization to integrations from the device pool", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}`);
+
+    const pool = screen.getByRole("region", "Device pool");
+    const integrations = pool.getByRole("link", "Go to integrations");
+    await expect(pool).toContainText(
+      "An admin must link an OwnSand organization",
+    );
+    await expect(pool.getByRole("alert")).toBeHidden();
+    await expect(pool.getByRole("button", "Try again")).toBeHidden();
+    await expect(integrations).toHaveAttribute(
+      "href",
+      `/orgs/${GLOBEX}/integrations`,
+    );
+    await integrations.tap();
+    await expect(
+      screen.getByRole("heading", "Integrations", { level: 1 }),
+    ).toBeVisible();
+  });
+
   test("shows the live queue and the device pool", async ({
     app,
     browser,

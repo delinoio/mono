@@ -12,6 +12,7 @@ import {
 } from "@delino/tide-protos/v1/audit_pb";
 import { AgentVendor } from "@delino/tide-protos/v1/common_pb";
 import { GitHubService } from "@delino/tide-protos/v1/github_pb";
+import { WorkService } from "@delino/tide-protos/v1/work_pb";
 import { expect, rs, test } from "@rstest/core";
 import { createMockTransport, MOCK_IDS } from "./mock-api.ts";
 
@@ -19,6 +20,23 @@ const invalidInstallationState = {
   code: Code.FailedPrecondition,
   rawMessage: "the installation state is not valid or has expired",
 };
+
+test.each([
+  [MOCK_IDS.globex, "the organization has no OwnSand link"],
+  [
+    MOCK_IDS.northwind,
+    "the OwnSand link is invalid; an admin must set a new OwnSand API key",
+  ],
+])(
+  "capacity rejects an inactive OwnSand link in %s",
+  async (organizationId, rawMessage) => {
+    const work = createClient(WorkService, createMockTransport());
+    await expect(work.getCapacity({ organizationId })).rejects.toMatchObject({
+      code: Code.FailedPrecondition,
+      rawMessage,
+    });
+  },
+);
 
 test("GitHub installation state is scoped to its organization and can be used once before expiry", async () => {
   const issuedAt = Date.UTC(2026, 0, 1) + 123;

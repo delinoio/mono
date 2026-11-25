@@ -50,6 +50,7 @@ import {
   GetOrganizationResponseSchema,
   OrganizationService,
 } from "@delino/tide-protos/v1/organization_pb";
+import { OwnSandLinkService } from "@delino/tide-protos/v1/ownsand_link_pb";
 import {
   CreateRunnerProfileRequestSchema,
   type ListRunnerProfilesRequest,
@@ -1611,6 +1612,80 @@ describe("runner profiles", () => {
 });
 
 describe("overview", () => {
+  test.each([
+    [MOCK_IDS.globex, "link an OwnSand organization", false],
+    [MOCK_IDS.northwind, "replace the OwnSand API key", true],
+  ])(
+    "guides organization %s to integrations when the OwnSand link is inactive",
+    async (organizationId, nextStep, hasInvalidLink) => {
+      const mock = createMockTransport();
+      const getCapacity = rs.fn();
+      const transport: Transport = {
+        ...mock,
+        unary: (method, ...rest) => {
+          if (method.name === "GetCapacity") getCapacity();
+          return mock.unary(method, ...rest);
+        },
+      };
+      renderConsole(`/orgs/${organizationId}`, { transport });
+      const pool = within(
+        await screen.findByRole("region", { name: "Device pool" }),
+      );
+      const integrations = await pool.findByRole("link", {
+        name: "Go to integrations",
+      });
+      expect(integrations.getAttribute("href")).toBe(
+        `/orgs/${organizationId}/integrations`,
+      );
+      expect(pool.getByText(new RegExp(nextStep))).toBeTruthy();
+      expect(pool.queryByRole("alert")).toBeNull();
+      expect(pool.queryByRole("button", { name: "Try again" })).toBeNull();
+      expect(getCapacity).not.toHaveBeenCalled();
+      if (hasInvalidLink) {
+        const banner = screen.getByRole("alert", { name: "OwnSand link" });
+        expect(within(banner).getByText("Dispatch has stopped")).toBeTruthy();
+      }
+    },
+  );
+
+  test("shows no devices when the active OwnSand link has an empty pool", async () => {
+    const transport = createMockTransport();
+    await createClient(OwnSandLinkService, transport).setOwnSandLink({
+      organizationId: MOCK_IDS.globex,
+      ownsandOrganizationId: "ownsand-globex-fixture",
+      ownsandApiKey: "osk_fixture",
+    });
+    renderConsole(`/orgs/${MOCK_IDS.globex}`, { transport });
+    const pool = within(
+      await screen.findByRole("region", { name: "Device pool" }),
+    );
+    expect(await pool.findByText("No devices")).toBeTruthy();
+  });
+
+  test("offers to retry a failed capacity request for an active link", async () => {
+    const mock = createMockTransport();
+    let failCapacity = true;
+    const transport: Transport = {
+      ...mock,
+      unary: async (method, ...rest) => {
+        if (method.name === "GetCapacity" && failCapacity) {
+          throw new ConnectError("Capacity unavailable", Code.Unavailable);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
+    const pool = within(
+      await screen.findByRole("region", { name: "Device pool" }),
+    );
+    const alert = await pool.findByRole("alert");
+    expect(alert.textContent).toContain("tide is not available right now");
+    failCapacity = false;
+    await click(within(alert).getByRole("button", { name: "Try again" }));
+    expect(await pool.findByText("build-box")).toBeTruthy();
+    expect(pool.queryByRole("alert")).toBeNull();
+  });
+
   test("shows waiting requests in queue order and the device pool", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}`);
     const table = await screen.findByRole("table", {

@@ -1835,7 +1835,17 @@ export function createMockTransport(
       },
       getCapacity(req) {
         const { org } = membership(req.organizationId);
-        return { devices: org.link === undefined ? [] : org.devices };
+        if (org.link === undefined)
+          throw new ConnectError(
+            "the organization has no OwnSand link",
+            Code.FailedPrecondition,
+          );
+        if (org.link.state !== OwnSandLinkState.ACTIVE)
+          throw new ConnectError(
+            "the OwnSand link is invalid; an admin must set a new OwnSand API key",
+            Code.FailedPrecondition,
+          );
+        return { devices: org.devices };
       },
       async *watchQueue(req, ctx: HandlerContext) {
         const { org } = membership(req.organizationId);
