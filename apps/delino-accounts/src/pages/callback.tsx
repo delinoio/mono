@@ -7,11 +7,7 @@ import {
   readLogtoSignInRedirect,
   useAuth,
 } from "../auth.tsx";
-import {
-  ErrorNotice,
-  Loading,
-  SignInFailureNotice,
-} from "../components/ui.tsx";
+import { Loading, SignInFailureNotice } from "../components/ui.tsx";
 import { pendingInvitation } from "../invitation.ts";
 import { RouteId, routePath, useRouter } from "../router.tsx";
 
@@ -26,8 +22,8 @@ export function afterSignInPath(): string {
  * Route `callback`: completes the Logto sign-in redirect. A visit with no
  * sign-in redirect in progress (a typed address, a bookmark or a reload after
  * the SDK finished the sign-in) leaves the route for the same target. A stored
- * sign-in session that cannot be read shows a failure with a way to sign in
- * again and deletes the pending invitation token.
+ * sign-in session that cannot be read or a failed callback clears the
+ * pending invitation token and offers a way to sign in again.
  */
 export function LogtoCallbackPage({ appId }: { appId: string }) {
   // Decide once on mount, before the hook completes a redirect and the SDK
@@ -46,12 +42,16 @@ export function LogtoCallbackPage({ appId }: { appId: string }) {
 
 /** The failure for a stored sign-in session that the SDK cannot read. */
 function UnreadableSignInSession() {
-  const auth = useAuth();
   // The failed return ends the redirect, so the pending invitation token has
   // no reason to stay.
   useEffect(() => {
     pendingInvitation.clear();
   }, []);
+  return <SignInRecovery />;
+}
+
+function SignInRecovery() {
+  const auth = useAuth();
   return (
     <main className="content content-narrow">
       <div className="notice notice-error" role="alert">
@@ -90,11 +90,7 @@ function CompleteSignIn({ pending }: { pending: boolean }) {
     }
   }, [error]);
   if (error) {
-    return (
-      <main className="content content-narrow">
-        <ErrorNotice error={error} />
-      </main>
-    );
+    return <SignInRecovery />;
   }
   return isLoading ? <Loading label="Signing in" /> : null;
 }

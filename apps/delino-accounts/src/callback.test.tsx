@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
 import { QueryClient } from "@tanstack/react-query";
 import { act, cleanup, render, screen, within } from "@testing-library/react";
 import { StrictMode } from "react";
-import { Accounts } from "./App.tsx";
+import { Accounts, App } from "./App.tsx";
 import {
   type Auth,
   AuthContextProvider,
@@ -17,6 +17,19 @@ import { TEST_CONFIG } from "./testing/render.tsx";
 const APP_ID = "app";
 const SIGN_IN_SESSION_KEY = `logto:${APP_ID}:signInSession`;
 const TOKEN = "bai_TESTTOKEN";
+
+const SIGN_IN_FAILURE_MESSAGE =
+  "Sign-in did not start. Check your connection and try again.";
+const RECOVERY_MESSAGE = "The sign-in could not be completed. Sign in again.";
+
+/** Finds the callback recovery notice among the app alerts. */
+function recoveryNotice(): HTMLElement {
+  const notice = screen.getByText(RECOVERY_MESSAGE).closest("[role=alert]");
+  if (!(notice instanceof HTMLElement)) {
+    throw new Error("the failure message is not inside an alert");
+  }
+  return notice;
+}
 
 /** Stores the sign-in session that the Logto SDK keeps while a redirect is out. */
 function storeSignInSession(
@@ -117,6 +130,16 @@ afterEach(() => {
   cleanup();
 });
 
+test("the sign-in callback shows the configuration notice without Logto", () => {
+  window.history.replaceState(null, "", "/callback");
+  render(<App config={{ ...TEST_CONFIG, logto: undefined }} />);
+
+  expect(
+    screen.getByText("Sign-in is not configured for this build."),
+  ).toBeTruthy();
+  expect(window.location.pathname).toBe("/callback");
+});
+
 describe("sign-in callback without a redirect in progress", () => {
   test.each([false, true])(
     "leaves for billing (StrictMode %s)",
@@ -181,20 +204,52 @@ describe("sign-in callback with a redirect in progress", () => {
   });
 
   test.each([false, true])(
-    "a failed callback shows the notice, stays and deletes the token (StrictMode %s)",
+    "a failed callback offers sign-in again, stays and deletes the token (StrictMode %s)",
     async (strict) => {
       storeSignInSession();
       pendingInvitation.save(TOKEN);
       handleSignInCallback = async () => {
         throw new Error("callback failed");
       };
-      renderCallback({ strict });
+      renderCallback({ strict, url: "/callback?error=access_denied&state=s" });
       await settle();
-      expect(screen.getByText("Something went wrong. Try again.")).toBeTruthy();
+
+      const button = within(recoveryNotice()).getByRole<HTMLButtonElement>(
+        "button",
+        { name: "Sign in with Delino" },
+      );
+      expect(button.disabled).toBe(false);
+      expect(screen.queryByText("callback failed")).toBeNull();
+      expect(screen.queryByText(SIGN_IN_FAILURE_MESSAGE)).toBeNull();
       expect(window.location.pathname).toBe("/callback");
       expect(pendingInvitation.read()).toBeUndefined();
+
+      await act(async () => {
+        button.click();
+      });
+      expect(signIns).toBe(1);
     },
   );
+
+  test("a retry that fails before redirect shows the alert and can be retried", async () => {
+    storeSignInSession();
+    handleSignInCallback = async () => {
+      throw new Error("callback failed");
+    };
+    renderCallback({ auth: { signInFailed: true } });
+    await settle();
+
+    expect(screen.getByText(SIGN_IN_FAILURE_MESSAGE)).toBeTruthy();
+    const button = within(recoveryNotice()).getByRole<HTMLButtonElement>(
+      "button",
+      { name: "Sign in with Delino" },
+    );
+    expect(button.disabled).toBe(false);
+    await act(async () => {
+      button.click();
+    });
+    expect(signIns).toBe(1);
+  });
 
   test("a callback in progress keeps the stored token", async () => {
     storeSignInSession();
@@ -206,19 +261,6 @@ describe("sign-in callback with a redirect in progress", () => {
     expect(pendingInvitation.read()).toBe(TOKEN);
   });
 });
-
-const SIGN_IN_FAILURE_MESSAGE =
-  "Sign-in did not start. Check your connection and try again.";
-const UNREADABLE_MESSAGE = "The sign-in could not be completed. Sign in again.";
-
-/** The notice for an unreadable session, without the other alerts of the app. */
-function failureNotice(): HTMLElement {
-  const notice = screen.getByText(UNREADABLE_MESSAGE).closest("[role=alert]");
-  if (!(notice instanceof HTMLElement)) {
-    throw new Error("the failure message is not inside an alert");
-  }
-  return notice;
-}
 
 describe("sign-in callback with an unreadable stored session", () => {
   let rejections: unknown[] = [];
@@ -266,7 +308,7 @@ describe("sign-in callback with an unreadable stored session", () => {
     pendingInvitation.save(TOKEN);
     renderCallback({ strict: true });
     await settle();
-    expect(failureNotice()).toBeTruthy();
+    expect(recoveryNotice()).toBeTruthy();
     expect(pendingInvitation.read()).toBeUndefined();
   });
 
@@ -275,7 +317,7 @@ describe("sign-in callback with an unreadable stored session", () => {
     renderCallback();
     await settle();
     await act(async () => {
-      within(failureNotice())
+      within(recoveryNotice())
         .getByRole("button", { name: "Sign in with Delino" })
         .click();
     });
@@ -291,7 +333,7 @@ describe("sign-in callback with an unreadable stored session", () => {
     renderCallback({ auth: { signInFailed: true } });
     await settle();
     expect(screen.getByText(SIGN_IN_FAILURE_MESSAGE)).toBeTruthy();
-    expect(failureNotice()).toBeTruthy();
+    expect(recoveryNotice()).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "Sign in with Delino" }),
     ).toBeTruthy();
