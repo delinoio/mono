@@ -207,9 +207,14 @@ if [[ "$url" == https://*.r2.cloudflarestorage.com/* ]]; then
   path="$STUB_DIR/r2/\${url#https://*.r2.cloudflarestorage.com/}"
   if [[ -f "$STUB_DIR/r2-status" ]]; then printf '%s' "$(cat "$STUB_DIR/r2-status")"; exit 0; fi
   if [[ "$method" == PUT ]]; then
+    if [[ "\${path#"$STUB_DIR/r2/"*/}" == "\${STUB_R2_REDIRECT_KEY:-}" ]]; then
+      [[ -z "$write" ]] || printf 307
+      exit 0
+    fi
     mkdir -p "$(dirname "$path")"; cp "$data" "$path"
     mkdir -p "$(dirname "$STUB_DIR/public/\${path#"$STUB_DIR/r2/"*/}")"
     [[ -f "$STUB_DIR/public-stale" ]] || cp "$data" "$STUB_DIR/public/\${path#"$STUB_DIR/r2/"*/}"
+    [[ -z "$write" ]] || printf 200
     exit 0
   fi
   if [[ -f "$path" ]]; then cp "$path" "$out"; printf 200; else echo NoSuchKey > "$out"; printf 404; fi
@@ -1745,14 +1750,49 @@ test(
       assert.equal(puts.length, 2);
       assert.match(
         puts[0],
-        /Content-Type: application\/json -H Cache-Control: no-cache .*\/ownsand-agent\/manifest\.json -o \/dev\/null$/,
+        /Content-Type: application\/json -H Cache-Control: no-cache .*\/ownsand-agent\/manifest\.json$/,
       );
       assert.match(
         puts[1],
-        /Content-Type: text\/plain .*\/ownsand-agent\/manifest\.json\.sig -o \/dev\/null$/,
+        /Content-Type: text\/plain .*\/ownsand-agent\/manifest\.json\.sig$/,
       );
       assert.match(result.summary, /serves the new manifest/);
     });
+    for (const file of ["manifest.json", "manifest.json.sig"]) {
+      await t.test(`redirected ${file} PUT`, (t) => {
+        const f = fixture(t);
+        const dir = join(f.dir, "manifests");
+        const key = `ownsand-agent/${file}`;
+        const manifest = '{"new":true}\n';
+        write(join(dir, "ownsand-agent/manifest.json"), manifest);
+        write(join(dir, "ownsand-agent/manifest.json.sig"), "sig\n");
+
+        const result = f.run(["upload-manifests", dir], {
+          ...r2Env,
+          STUB_R2_REDIRECT_KEY: key,
+        });
+        assert.equal(result.status, 1, result.stderr);
+        assert.ok(
+          result.stderr.includes(
+            `Uploading ${key} to the releases bucket returned HTTP 307`,
+          ),
+        );
+        const requests = result.log.trim().split("\n");
+        assert.equal(requests.length, file === "manifest.json" ? 1 : 2);
+        assert.ok(requests.every((request) => request.includes("-X PUT")));
+        assert.ok(requests.at(-1).endsWith(`/${key}`));
+        if (file === "manifest.json.sig") {
+          assert.equal(
+            readFileSync(
+              join(f.dir, "public/ownsand-agent/manifest.json"),
+              "utf8",
+            ),
+            manifest,
+          );
+        }
+        assert.doesNotMatch(result.stdout, /::warning::/);
+      });
+    }
     await t.test("stale public URL", (t) => {
       const f = fixture(t);
       writeFileSync(join(f.dir, "public-stale"), "");
