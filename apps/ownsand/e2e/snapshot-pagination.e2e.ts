@@ -102,6 +102,7 @@ describe("snapshot and template pagination", () => {
       await screen.getByRole("button", "Delete template").tap();
       await expect(laterTemplate).toBeHidden();
       await expect(templates).toHaveCount(200);
+      await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
 
       await snapshots
         .last()
