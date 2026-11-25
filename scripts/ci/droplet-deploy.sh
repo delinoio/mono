@@ -41,14 +41,14 @@
 # fails, the script removes it and starts the stopped containers again; the
 # route still names them.
 #
-# The same recovery runs when a `SIGTERM`, `SIGINT` or `SIGHUP` (for example a
-# dropped SSH connection or a cancelled workflow run) ends the script between
-# the first stop and the route switch: the handler removes the replacement,
-# starts the stopped containers again and exits with 128 plus the signal
-# number. Bash runs a trap only after the foreground command (`docker` or
-# `curl`) returns, so the handler waits for that command, which the stop
-# timeout and the 5-second `curl` limit bound. `SIGKILL` cannot be caught and
-# still leaves the containers stopped. For both HTTP-only and UDP deployments,
+# On `SIGTERM`, `SIGINT` or `SIGHUP`, the script cleans up an HTTP-only
+# replacement from launch through proxy-lock acquisition. For UDP, the same
+# handler runs from the first stop through proxy-lock acquisition and also
+# restarts the stopped containers. The handler holds the service lock and
+# exits with 128 plus the signal number. Bash runs the trap after the
+# foreground command returns. A Docker stop, `curl` or `flock` can wait
+# up to its configured timeout. `SIGKILL` cannot be caught and can leave
+# the UDP containers stopped. For both HTTP-only and UDP deployments,
 # the script defers these signals during the route switch and image-state
 # publication. When the reload succeeds, the script records the state and
 # exits with the signal status before cleanup. When the reload fails, the
@@ -291,6 +291,11 @@ main() {
   # replacement fails.
   local -a stopped=()
   if (( ${#publish[@]} == 0 )); then
+    # The name check above passed. Clean up this replacement if a signal
+    # arrives during launch, the health check or the proxy lock wait.
+    trap 'interrupted TERM "$new" "$replacement_stop_timeout"' TERM
+    trap 'interrupted INT "$new" "$replacement_stop_timeout"' INT
+    trap 'interrupted HUP "$new" "$replacement_stop_timeout"' HUP
     echo "Start $new as $upstream"
     # A failed `docker run` can leave a created container that did not start
     # (for example an OCI runtime or entrypoint error). `set -e` would end the
@@ -350,8 +355,7 @@ main() {
   # and before the first route file is touched, and it stays held until the
   # reload succeeded or the route file is restored. A run that cannot take it
   # changes no route file and takes the same failure path as a rejected
-  # route. It waits before the signal traps below are set, so that a signal
-  # ends the wait like it ends any other step before the route switch.
+  # route. The pre-switch traps stay active through the lock wait.
   local pending_signal=""
   local proxy_lock_fd="" route_switched=""
   if acquire_proxy_lock "$root/state/.proxy.lock" "$proxy_lock_timeout" "$service" proxy_lock_fd; then
@@ -476,21 +480,18 @@ signal_number() {
   esac
 }
 
-# The trap handler of a service with UDP ports from the first stop until the
-# route switch. Arguments: the signal name, the replacement container, its
-# stop timeout and the containers that were running. It removes the
-# replacement and starts the previous containers again (the route still
-# names them). It reports the signal and exits with 128 plus the signal number.
-# A container that does not start
-# is named by `restart_previous`. The handler ignores further signals so that
-# the restart finishes; starting a container that already runs is a no-op, so
-# a signal during the stop loop restores the containers that were not stopped
-# yet too.
+# Handles signals before the route switch. The arguments are the signal name,
+# the replacement, its stop timeout and, for UDP, the containers that were
+# running. The handler ignores further signals while it discards the
+# replacement and restarts any previous containers passed by the caller.
+# Starting a container that already runs is a no-op, so recovery also works
+# partway through the UDP stop loop. The handler exits with 128 plus the
+# signal number.
 interrupted() {
   local name="$1" replacement="$2" stop_timeout="$3"
   shift 3
   trap '' TERM INT HUP
-  echo "::error::received SIG$name before the route of the service switched; the replacement $replacement is removed and the previous containers are started again." >&2
+  echo "::error::received SIG$name before the route of the service switched; cleaning up the replacement $replacement." >&2
   discard_replacement "$replacement" "$stop_timeout"
   restart_previous "$@"
   exit $((128 + $(signal_number "$name")))
@@ -536,20 +537,21 @@ upstream_alias() {
 
 # Prints the log tail of a replacement that failed, then removes it. A failed
 # log read or removal must not hide the deployment failure that the caller
-# reports.
+# reports. Return zero explicitly on early returns because a trap can call
+# this function after a negated command and inherit its nonzero status.
 discard_replacement() {
   local replacement="$1" stop_timeout="$2"
   echo "Last log lines of $replacement:"
   docker logs --tail 200 "$replacement" 2>&1 || true
   if [[ -z "$stop_timeout" ]]; then
     docker rm --force "$replacement" > /dev/null || true
-    return
+    return 0
   fi
   # A running Accounts replacement can start a charge before it serves
   # traffic. If graceful stop fails, leave the container for cleanup.
   if ! docker stop --time "$stop_timeout" "$replacement" > /dev/null; then
     echo "::error::docker stop failed for the replacement $replacement; it was not removed." >&2
-    return
+    return 0
   fi
   if ! docker rm "$replacement" > /dev/null; then
     echo "::error::docker rm failed for the replacement $replacement." >&2
