@@ -389,6 +389,7 @@ export function createFakeApi({
       },
       async getBillingAccount(req) {
         record("GetBillingAccount", req);
+        await awaitDeferredCall(api, "GetBillingAccount");
         await api.gates.get("GetBillingAccount");
         return { billingAccount: view(load(req.billingAccountId).account) };
       },
@@ -403,8 +404,9 @@ export function createFakeApi({
         );
         return { billingAccounts: page, nextPageToken };
       },
-      updateBillingAccount(req) {
+      async updateBillingAccount(req) {
         record("UpdateBillingAccount", req);
+        await awaitDeferredCall(api, "UpdateBillingAccount");
         const { account } = load(req.billingAccountId, PAYMENT_ROLES);
         account.name = req.name;
         return { billingAccount: view(account) };

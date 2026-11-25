@@ -26,9 +26,9 @@ async function installInvoiceFixture(
 ) {
   await seedFixtureSession(browser, appOrigin);
   if (popupBlocked) {
-    await browser.addInitScript(() => {
-      window.open = () => null;
-    });
+    await browser.addInitScript((origin) => {
+      if (location.origin === origin) window.open = () => null;
+    }, appOrigin);
   }
 
   let markStarted!: () => void;

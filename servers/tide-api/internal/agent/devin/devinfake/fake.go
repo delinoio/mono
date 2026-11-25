@@ -33,6 +33,7 @@ type Fake struct {
 	nextID          int
 	lists           int
 	failWatch       int
+	failRelease     bool
 	queuePages      map[string]map[string]any
 	claimAttempts   []string
 	watchCursors    []string
@@ -169,6 +170,10 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			obj["status"].(map[string]any)["claim_deadline"] = time.Now().Add(time.Minute).Unix()
 			writeJSON(w, http.StatusOK, obj)
 		case r.Method == http.MethodPost && action == "release":
+			if f.failRelease {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
+				return
+			}
 			if e.AcceptorID != body.AcceptorID {
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "not the acceptor"})
 				return
@@ -338,6 +343,13 @@ func (f *Fake) FailWatches(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failWatch = n
+}
+
+// FailReleases sets whether release calls fail with 503.
+func (f *Fake) FailReleases(fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failRelease = fail
 }
 
 // Streams returns the number of open watches.
