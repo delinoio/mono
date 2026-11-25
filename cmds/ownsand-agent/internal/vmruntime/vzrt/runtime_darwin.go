@@ -38,9 +38,12 @@ const (
 	readyTimeout = 60 * time.Second
 	// macOSReadyTimeout covers a macOS cold boot, which takes far longer
 	// than a Linux boot.
-	macOSReadyTimeout = 5 * time.Minute
-	dialTimeout       = 10 * time.Second
+	macOSReadyTimeout     = 5 * time.Minute
+	dialTimeout           = 10 * time.Second
+	snapshotResumeTimeout = 10 * time.Second
 )
+
+var errVMTerminalState = errors.New("VM reached a terminal state")
 
 // guestLink is the link of every OUTBOUND sandbox: each sandbox has its own
 // network stack, so every sandbox uses the same addresses.
@@ -716,18 +719,26 @@ func (r *Runtime) lookup(id string) (*vm, error) {
 	return v, nil
 }
 
-// waitState waits until the VM reaches want.
-func waitState(ctx context.Context, machine *vz.VirtualMachine, want vz.VirtualMachineState) error {
+// waitState waits until the VM reaches want, exits, or the context ends.
+func waitState(ctx context.Context, state func() vz.VirtualMachineState, want vz.VirtualMachineState) error {
 	t := time.NewTicker(10 * time.Millisecond)
 	defer t.Stop()
-	for machine.State() != want {
+	for {
+		current := state()
+		if current == want {
+			return nil
+		}
+		if terminalState(current) {
+			return fmt.Errorf("vzrt: VM state %v, want %v: %w", current, want, errVMTerminalState)
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("vzrt: VM state %v, want %v: %w", current, want, err)
+		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("vzrt: VM state %v, want %v: %w", machine.State(), want, ctx.Err())
 		case <-t.C:
 		}
 	}
-	return nil
 }
 
 // Pause flushes the guest page cache and then stops the vCPUs and keeps the
@@ -756,7 +767,7 @@ func (r *Runtime) pauseVM(ctx context.Context, v *vm) error {
 	if err := machine.Pause(); err != nil {
 		return fmt.Errorf("vzrt: pause: %w", err)
 	}
-	if err := waitState(ctx, machine, vz.VirtualMachineStatePaused); err != nil {
+	if err := waitState(ctx, machine.State, vz.VirtualMachineStatePaused); err != nil {
 		return err
 	}
 	v.mu.Lock()
@@ -778,7 +789,7 @@ func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 	if err := machine.Resume(); err != nil {
 		return fmt.Errorf("vzrt: resume: %w", err)
 	}
-	if err := waitState(ctx, machine, vz.VirtualMachineStateRunning); err != nil {
+	if err := waitState(ctx, machine.State, vz.VirtualMachineStateRunning); err != nil {
 		return err
 	}
 	v.mu.Lock()
@@ -805,10 +816,8 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 	v.mu.Lock()
 	wasPaused := v.paused
 	v.mu.Unlock()
-	// A paused VM was flushed by its Pause; Pause flushes a running one. A
-	// failed resume after a completed capture fails the snapshot, so no READY
-	// record is saved for a VM that stays paused.
-	return vmruntime.SnapshotWithPause(r.logger, v.id, wasPaused,
+	// A paused VM was flushed by its Pause; flush a running one before capture.
+	info, err := vmruntime.SnapshotWithPause(r.logger, v.id, wasPaused,
 		func() error {
 			r.flushForPause(ctx, v)
 			if err := ctx.Err(); err != nil {
@@ -820,8 +829,20 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 			defer cancel()
 			return r.pauseVM(pauseCtx, v)
 		},
-		func() error { return r.Resume(context.Background(), m) },
+		func() error {
+			// Recover the source even when the snapshot context has ended.
+			// The deadline bounds the state poll after the native Resume call.
+			resumeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotResumeTimeout)
+			defer cancel()
+			return r.Resume(resumeCtx, m)
+		},
 		func() (vmruntime.SnapshotInfo, error) { return r.capture(ctx, v, dir) })
+	if errors.Is(err, errVMTerminalState) {
+		// The VM exit watcher reconciles a terminal source after Snapshot
+		// returns and the command lock is released.
+		info.SourceState = ownsandv1.SandboxState_SANDBOX_STATE_UNSPECIFIED
+	}
+	return info, err
 }
 
 // capture writes the snapshot content of the paused VM v into dir.
