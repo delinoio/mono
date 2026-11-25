@@ -19,24 +19,24 @@ const EnrollmentLockFile = "enrollment.lock"
 // with its context on every platform.
 const enrollmentLockPoll = 25 * time.Millisecond
 
-// ErrEnrollmentBusy reports that another enrollment holds the enrollment
-// lock of the state directory and did not release it before the wait ended.
-var ErrEnrollmentBusy = errors.New("store: another enrollment is running for this state directory")
+// ErrEnrollmentBusy reports that another operation held the enrollment lock
+// of the state directory until the wait ended.
+var ErrEnrollmentBusy = errors.New("store: the enrollment lock is busy for this state directory")
 
 // LockEnrollment takes the exclusive enrollment lock of the state directory
 // and returns the function that releases it. The lock is an advisory file
 // lock (flock, or LockFileEx on Windows), so it excludes other Store values
 // and other processes that use the same directory, and the operating system
 // releases it when the holder exits or crashes. It waits until another
-// holder releases the lock or ctx ends; then it returns ErrEnrollmentBusy
-// together with the error of ctx. Different state directories use different
-// locks and never wait for each other.
-//
-// Reset removes the lock file with every other entry. On Windows an open
-// locked file cannot be removed, so a Reset that runs while an enrollment
-// holds the lock reports an error for the lock file.
+// holder releases the lock or ctx ends. If ctx ends while waiting, it
+// returns ErrEnrollmentBusy together with the error of ctx. Different
+// state directories use different locks and never wait for each other.
 func (s *Store) LockEnrollment(ctx context.Context) (unlock func(), err error) {
-	f, err := openEnrollmentLock(s.dir)
+	return acquireEnrollmentLock(ctx, s.dir)
+}
+
+func acquireEnrollmentLock(ctx context.Context, dir string) (unlock func(), err error) {
+	f, err := openEnrollmentLock(dir)
 	if err != nil {
 		return nil, fmt.Errorf("store: open enrollment lock: %w", err)
 	}

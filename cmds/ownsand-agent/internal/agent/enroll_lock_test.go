@@ -275,3 +275,47 @@ func TestEnrollStateDirectoriesAreIndependent(t *testing.T) {
 		t.Fatalf("first enrollment: %v", r.err)
 	}
 }
+
+func TestResetWaitsForEnrollment(t *testing.T) {
+	cp, st, client := newEnrollFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	hold := cp.HoldNextEnroll()
+	enrollment := enrollAsync(t, ctx, st, client)
+	select {
+	case <-hold.Arrived():
+	case r := <-enrollment:
+		t.Fatalf("enrollment ended before reaching the control plane: %v", r.err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	key := requirePendingKey(t, st)
+
+	reset := make(chan error, 1)
+	go func() { reset <- store.ResetDir(st.Dir()) }()
+	select {
+	case err := <-reset:
+		t.Fatalf("reset returned while enrollment held the lock: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if got := requirePendingKey(t, st); !bytes.Equal(got, key) {
+		t.Fatal("reset changed the pending key")
+	}
+	if err := store.ResetDir(t.TempDir()); err != nil {
+		t.Fatalf("reset in a different directory: %v", err)
+	}
+
+	hold.Release()
+	if r := <-enrollment; r.err != nil || r.id.DeviceID == "" {
+		t.Fatalf("enrollment failed: %v", r.err)
+	}
+	select {
+	case err := <-reset:
+		if err != nil {
+			t.Fatalf("reset after enrollment: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	requireEmptyStateDir(t, st)
+}

@@ -283,17 +283,16 @@ func TestChannelLifecycleCommandsAndRemoval(t *testing.T) {
 	requireEmptyStateDir(t, st)
 }
 
-// requireEmptyStateDir fails when a finished removal left any entry in the
-// state directory, for example a status.json that a status write created
-// after the delete.
+// requireEmptyStateDir checks that cleanup removed all state. The empty
+// enrollment lock file stays so later operations use the same lock.
 func requireEmptyStateDir(t *testing.T, st *store.Store) {
 	t.Helper()
 	entries, err := os.ReadDir(st.Path())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range entries {
-		t.Errorf("state directory keeps %q after the removal", e.Name())
+	if len(entries) != 1 || entries[0].Name() != store.EnrollmentLockFile {
+		t.Errorf("state directory holds %v after cleanup, want only %s", entries, store.EnrollmentLockFile)
 	}
 }
 

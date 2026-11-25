@@ -3,10 +3,13 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // ResetDir needs no healthy layout: it deletes an identity and a regular
@@ -25,11 +28,93 @@ func TestResetDirDeletesDamagedLayout(t *testing.T) {
 		t.Fatalf("ResetDir: %v", err)
 	}
 	entries, err := os.ReadDir(dir)
-	if err != nil || len(entries) != 0 {
+	if err != nil || len(entries) != 1 || entries[0].Name() != EnrollmentLockFile {
 		t.Fatalf("entries %v, error %v", entries, err)
 	}
 	if err := ResetDir(dir); err != nil {
-		t.Fatalf("second ResetDir on an empty directory: %v", err)
+		t.Fatalf("second ResetDir: %v", err)
+	}
+}
+
+func TestResetDirKeepsHeldLockAndStateUntilRetry(t *testing.T) {
+	dir := t.TempDir()
+	unlock := lockEnrollment(t, openStore(t, dir))
+	defer unlock()
+	lockPath := filepath.Join(dir, EnrollmentLockFile)
+	before, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{IdentityFile, AgentFile} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("state"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if err := resetDir(ctx, dir); !errors.Is(err, ErrEnrollmentBusy) {
+		t.Fatalf("reset while enrollment holds the lock: %v, want ErrEnrollmentBusy", err)
+	}
+	for _, name := range []string{IdentityFile, AgentFile} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("busy reset changed %s: %v", name, err)
+		}
+	}
+	unlock()
+	if err := ResetDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(lockPath)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("reset changed the enrollment lock: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != EnrollmentLockFile {
+		t.Fatalf("entries %v, error %v", entries, err)
+	}
+}
+
+func TestResetDirHandlesEnrollmentLockCasing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, strings.ToUpper(EnrollmentLockFile))
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := os.Stat(filepath.Join(dir, EnrollmentLockFile))
+	caseSensitive := errors.Is(err, os.ErrNotExist)
+	if err != nil && !caseSensitive {
+		t.Fatal(err)
+	}
+	if err := ResetDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("entries %v, error %v", entries, err)
+	}
+	wantName := filepath.Base(path)
+	if caseSensitive {
+		wantName = EnrollmentLockFile
+	}
+	if got := entries[0].Name(); got != wantName {
+		t.Fatalf("retained lock %q, want %q", got, wantName)
+	}
+}
+
+func TestResetDirRejectsMalformedEnrollmentLock(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, EnrollmentLockFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	identity := filepath.Join(dir, IdentityFile)
+	if err := os.WriteFile(identity, []byte("identity"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ResetDir(dir); err == nil {
+		t.Fatal("reset accepted a directory as the enrollment lock")
+	}
+	if _, err := os.Stat(identity); err != nil {
+		t.Fatalf("reset changed the identity: %v", err)
 	}
 }
 

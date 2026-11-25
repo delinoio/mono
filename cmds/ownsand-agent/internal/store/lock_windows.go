@@ -13,7 +13,15 @@ import (
 )
 
 func openEnrollmentLock(dir string) (*os.File, error) {
-	return os.OpenFile(filepath.Join(dir, EnrollmentLockFile), os.O_RDWR|os.O_CREATE, 0o600)
+	path := filepath.Join(dir, EnrollmentLockFile)
+	info, err := os.Lstat(path)
+	if err == nil && !info.Mode().IsRegular() {
+		return nil, errors.New("enrollment lock must be a regular file")
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 }
 
 // tryLockFile takes an exclusive LockFileEx lock on the first byte without
