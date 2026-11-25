@@ -131,8 +131,7 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 		c.logger.DebugContext(ctx, "ownsand data path session opened", "sandbox_id", d.s.id, "session_id", sess.sessionID, "transport", "peer-to-peer", "duration", time.Since(start))
 		return sess, nil
 	}
-	var localCredErr *errLocalCredential
-	if ctx.Err() == nil && errors.As(err, &localCredErr) {
+	if ctx.Err() == nil && isLocalCredentialError(err) {
 		// The token source failed on this machine, before any request left
 		// the process. The relay needs the same credential, so the error ends
 		// the operation: no AuthorizeRelay call and no change of the handle's
@@ -216,6 +215,10 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 func callerDeadlineEnded(ctx context.Context, err error, skew time.Duration) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	if isLocalCredentialError(err) {
+		// Only a request sent to the control plane can carry the caller's deadline.
+		return nil
 	}
 	switch connect.CodeOf(err) {
 	case connect.CodeDeadlineExceeded, connect.CodeCanceled, connect.CodeUnavailable, connect.CodeUnknown:
@@ -483,7 +486,8 @@ func (g *relayGrant) authorize(ctx context.Context, rec *recovery) error {
 		timer := time.AfterFunc(left, func() { cancel(errAuthorizeDeadline) })
 		res, err := c.dataPath.AuthorizeRelay(actx, connect.NewRequest(proto.Clone(req).(*ownsandv1.AuthorizeRelayRequest)))
 		timer.Stop()
-		if err != nil && ctx.Err() == nil && errors.Is(context.Cause(actx), errAuthorizeDeadline) {
+		// Keep the credential error if the token source returns after the timer fires.
+		if err != nil && ctx.Err() == nil && errors.Is(context.Cause(actx), errAuthorizeDeadline) && !isLocalCredentialError(err) {
 			err = errAuthorizeDeadline
 		}
 		cancel(context.Canceled)
