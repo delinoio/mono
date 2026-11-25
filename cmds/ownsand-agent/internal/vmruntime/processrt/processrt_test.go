@@ -549,11 +549,61 @@ func TestStateIsStopped(t *testing.T) {
 	}
 }
 
+func TestPSStopped(t *testing.T) {
+	tests := []struct {
+		name    string
+		script  string
+		stopped bool
+		wantErr bool
+	}{
+		{name: "absent", script: "exit 1", stopped: true},
+		{name: "stopped", script: "printf ' T+\n'", stopped: true},
+		{name: "dead", script: "printf 'Z\n'", stopped: true},
+		{name: "running", script: "printf 'R\n'"},
+		{name: "exit 2", script: "exit 2", wantErr: true},
+		{name: "terminated", script: "kill -KILL $$", wantErr: true},
+		{name: "diagnostic", script: "printf 'cannot read process state\n' >&2; exit 1", wantErr: true},
+		{name: "exit 1 with state", script: "printf 'T\n'; exit 1", wantErr: true},
+		{name: "empty success", script: "exit 0", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			installPSFixture(t, tt.script)
+			stopped, err := psStopped(context.Background(), os.Getpid())
+			if stopped != tt.stopped || (err != nil) != tt.wantErr {
+				t.Fatalf("psStopped = %v, %v; want stopped=%v, error=%v", stopped, err, tt.stopped, tt.wantErr)
+			}
+		})
+	}
+	t.Run("missing executable", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		if stopped, err := psStopped(context.Background(), os.Getpid()); stopped || !errors.Is(err, exec.ErrNotFound) {
+			t.Fatalf("psStopped = %v, %v; want false, exec.ErrNotFound", stopped, err)
+		}
+	})
+	t.Run("canceled context", func(t *testing.T) {
+		installPSFixture(t, "exit 1")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if stopped, err := psStopped(ctx, os.Getpid()); stopped || !errors.Is(err, context.Canceled) {
+			t.Fatalf("psStopped = %v, %v; want false, context.Canceled", stopped, err)
+		}
+	})
+}
+
+func installPSFixture(t *testing.T, script string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 // TestHelperStoppedObservesRealHelper checks the observation of a real helper
 // process through both the /proc reader and the `ps` reader: a running helper
 // is not stopped, a SIGSTOP stops it, a SIGCONT runs it again, and a reaped
-// process counts as stopped. On macOS only the `ps` reader runs; the format of
-// its state column there is verified by a cross-compiling vet only.
+// process counts as stopped. On macOS only the `ps` reader runs.
 func TestHelperStoppedObservesRealHelper(t *testing.T) {
 	rt := newRuntime(t)
 	m := createSandbox(t, rt)
@@ -750,6 +800,105 @@ func TestDeleteFailsWhenHelperDoesNotStop(t *testing.T) {
 	}
 	if _, err := rt.lookup(m.SandboxID()); err == nil {
 		t.Error("sandbox is still tracked after the retried Delete")
+	}
+}
+
+// TestLifecycleEnumeratesOnlyAfterHelperPSStopped uses the real helper and
+// exec workers. The observer runs psStopped on Linux as well as on macOS.
+func TestLifecycleEnumeratesOnlyAfterHelperPSStopped(t *testing.T) {
+	operations := []struct {
+		name string
+		run  func(*Runtime, vmruntime.VM) error
+	}{
+		{name: "Pause", run: func(rt *Runtime, m vmruntime.VM) error { return rt.Pause(context.Background(), m) }},
+		{name: "Delete", run: func(rt *Runtime, m vmruntime.VM) error { return rt.Delete(context.Background(), m.SandboxID()) }},
+	}
+	for _, op := range operations {
+		for _, failure := range []string{"persistent", "transient"} {
+			t.Run(op.name+"/"+failure, func(t *testing.T) {
+				rt := newRuntime(t)
+				m := createSandbox(t, rt)
+				shell, sleeper := startWorker(t, m)
+				h, err := rt.lookup(m.SandboxID())
+				if err != nil {
+					t.Fatal(err)
+				}
+				realPS, err := exec.LookPath("ps")
+				if err != nil {
+					t.Fatal(err)
+				}
+				oldPath := os.Getenv("PATH")
+				listed := filepath.Join(t.TempDir(), "listed")
+				t.Setenv("PROCESSRT_TEST_PS", realPS)
+				t.Setenv("PROCESSRT_TEST_PS_LISTED", listed)
+				t.Setenv("PROCESSRT_TEST_PS_FAILURE", failure)
+				t.Setenv("PROCESSRT_TEST_PS_FAILED", filepath.Join(t.TempDir(), "failed"))
+				installPSFixture(t, `
+if [ "$1" = "-A" ]; then
+    touch "$PROCESSRT_TEST_PS_LISTED" || exit 3
+elif [ "$PROCESSRT_TEST_PS_FAILURE" = "persistent" ] || [ ! -e "$PROCESSRT_TEST_PS_FAILED" ]; then
+    touch "$PROCESSRT_TEST_PS_FAILED" || exit 3
+    exit 2
+fi
+exec "$PROCESSRT_TEST_PS" "$@"
+`)
+				observations := 0
+				observedStopped := false
+				wait := 100 * time.Millisecond
+				if failure == "transient" {
+					wait = 0 // Use the real timeout while waiting for the stop signal to take effect.
+				}
+				useStopSeams(t, h, func(ctx context.Context, pid int) (bool, error) {
+					mustNotExist(t, listed)
+					stopped, err := psStopped(ctx, pid)
+					observations++
+					if observations == 1 {
+						var exitErr *exec.ExitError
+						if stopped || !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+							t.Errorf("first observation = %v, %v; want false and ps exit 2", stopped, err)
+						}
+					}
+					observedStopped = stopped && err == nil
+					return stopped, err
+				}, wait)
+
+				err = op.run(rt, m)
+				t.Setenv("PATH", oldPath)
+				if failure == "persistent" {
+					var exitErr *exec.ExitError
+					if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+						t.Fatalf("%s = %v; want an error from the failed ps probe", op.name, err)
+					}
+					mustNotExist(t, listed)
+					if _, err := rt.lookup(m.SandboxID()); err != nil {
+						t.Fatalf("sandbox after failed %s: %v", op.name, err)
+					}
+					mustExist(t, h.dir)
+					if h.hasExited() {
+						t.Fatal("the helper exited while the stop probe was failing")
+					}
+					if op.name == "Pause" {
+						waitState(t, "helper after failed Pause", h.helper.pid, "S", "R")
+					}
+					for _, pid := range []int{shell, sleeper} {
+						waitState(t, "worker after failed "+op.name, pid, "S", "R")
+					}
+					useStopSeams(t, h, nil, 0)
+					if err := op.run(rt, m); err != nil {
+						t.Fatalf("retried %s: %v", op.name, err)
+					}
+					return
+				}
+
+				if err != nil {
+					t.Fatal(err)
+				}
+				if observations < 2 || !observedStopped {
+					t.Fatalf("%s listed workers without a valid stop after the failed probe", op.name)
+				}
+				mustExist(t, listed)
+			})
+		}
 	}
 }
 
