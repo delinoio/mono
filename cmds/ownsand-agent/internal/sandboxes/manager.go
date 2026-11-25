@@ -885,8 +885,8 @@ func (m *Manager) watchVM(sb *sandbox, vm vmruntime.VM) {
 }
 
 // endLocked stops the VM and records the end. The caller holds sb.cmdMu.
-// When the attempt fails, it clears sb.ending so that a later Tick (TTL) or
-// Delete retries the end; the record may stay in DELETING until then. The
+// When the attempt fails, it clears sb.ending so that a later Tick or
+// Delete can retry the end. The record may stay in DELETING until then. The
 // retry runs under sb.cmdMu, so ends still cannot overlap. A retry does not
 // repeat the exec tracker notification.
 func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.SandboxState, reason ownsandv1.SandboxEndReason) (entry *ownsandv1.SandboxStateEntry, err error) {
@@ -1118,15 +1118,37 @@ func (m *Manager) undoRuntimeMove(sb *sandbox, id string, from ownsandv1.Sandbox
 	return updateErr
 }
 
-// Tick enforces the TTLs, reports moved idle deadlines at most once per
-// minute and resends unacknowledged updates when resend is true.
+// retryEndBeforeDeadline reports whether Tick can retry a failed end before
+// a TTL deadline. The caller holds m.mu.
+func (sb *sandbox) retryEndBeforeDeadline() bool {
+	if sb.rec.State != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		return false
+	}
+	switch sb.rec.EndReason {
+	case ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE:
+		return true
+	case ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER:
+		if sb.vm != nil {
+			// The watcher may have seen the VM exit while Delete still owned the end.
+			select {
+			case <-sb.vm.Exited():
+				return true
+			default:
+			}
+		}
+	}
+	return false
+}
+
+// Tick enforces the TTLs, retries cleanup of exited VMs, reports moved idle
+// deadlines at most once per minute and resends unacknowledged updates when
+// resend is true.
 func (m *Manager) Tick(ctx context.Context, resend bool) {
 	now := m.now()
 	type expiry struct {
 		sb     *sandbox
 		reason ownsandv1.SandboxEndReason
-		// retry is true for the retry of a failed end of a lost VM, which no
-		// deadline caused.
+		// retry marks cleanup that is due without a passed deadline.
 		retry bool
 	}
 	var expired []expiry
@@ -1170,10 +1192,7 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 				expired = append(expired, expiry{sb: sb, reason: reason})
 				continue
 			}
-			// The end of a lost VM failed at its first attempt and left the
-			// record in DELETING with LOST_ON_DEVICE. No deadline passed, so
-			// nothing else retries it before the next agent start.
-			if sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_DELETING && sb.rec.EndReason == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+			if sb.retryEndBeforeDeadline() {
 				sb.ending = true
 				expired = append(expired, expiry{sb: sb, reason: sb.rec.EndReason, retry: true})
 				continue
@@ -1206,7 +1225,7 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 	m.mu.Unlock()
 	for _, e := range expired {
 		if e.retry {
-			m.logger.Info("retrying the end of a lost sandbox", "sandbox_id", e.sb.rec.SandboxID, "end_reason", e.reason.String())
+			m.logger.Info("retrying sandbox cleanup", "sandbox_id", e.sb.rec.SandboxID, "end_reason", e.reason.String())
 		} else {
 			m.logger.Info("sandbox TTL expired", "sandbox_id", e.sb.rec.SandboxID, "end_reason", e.reason.String())
 		}
@@ -1215,7 +1234,7 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			e.sb.cmdMu.Lock()
 			defer e.sb.cmdMu.Unlock()
 			if _, err := m.endLocked(ctx, e.sb, finalStateFor(e.reason), e.reason); err != nil {
-				m.logger.Error("end expired sandbox failed", "sandbox_id", e.sb.rec.SandboxID, "error", err)
+				m.logger.Error("end sandbox failed", "sandbox_id", e.sb.rec.SandboxID, "error", err)
 			}
 		}(e)
 	}
