@@ -31,6 +31,19 @@ type failingListener struct {
 
 func (l failingListener) Accept() (net.Conn, error) { return nil, l.err }
 
+type acceptErrorOnCloseListener struct {
+	net.Listener
+	err error
+}
+
+func (l acceptErrorOnCloseListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if errors.Is(err, net.ErrClosed) {
+		return nil, l.err
+	}
+	return conn, err
+}
+
 // noStop stands in for the signal-registration stop function in tests that
 // drive serve with a plain context.
 func noStop() {}
@@ -91,6 +104,52 @@ func TestServeReturnsServeErrorBeforeShutdown(t *testing.T) {
 	err := serve(context.Background(), noStop, &http.Server{}, failingListener{Listener: newTestListener(t), err: acceptErr}, newTestLogger(), time.Second)
 	if !errors.Is(err, acceptErr) {
 		t.Fatalf("serve error = %v, want %v", err, acceptErr)
+	}
+}
+
+func TestServePublicListenerFailureCancelsRequestAtDrainDeadline(t *testing.T) {
+	const timeout = 200 * time.Millisecond
+	acceptErr := errors.New("public accept failed permanently")
+	listener := newTestListener(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	cancelledAt := make(chan time.Time, 1)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+			cancelledAt <- time.Now()
+		case <-release:
+		}
+	})}
+	done := runAsync(func() error {
+		return serve(context.Background(), noStop, srv, acceptErrorOnCloseListener{listener, acceptErr}, newTestLogger(), timeout)
+	})
+	_, requestErr := getWithEarlyError(listener.Addr().String())
+	if err := awaitHandlerStarted(started, requestErr, done, handlerStartTimeout); err != nil {
+		t.Fatal(err)
+	}
+	failedAt := time.Now()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("fail public listener: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, acceptErr) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("serve error = %v, want both %v and %v", err, acceptErr, context.DeadlineExceeded)
+		}
+	case <-time.After(handlerStartTimeout):
+		t.Fatal("serve did not return after the drain deadline")
+	}
+	select {
+	case at := <-cancelledAt:
+		if elapsed := at.Sub(failedAt); elapsed < timeout {
+			t.Fatalf("request context cancelled %v after public listener failure, want at least %v", elapsed, timeout)
+		}
+	case <-time.After(handlerStartTimeout):
+		t.Fatal("request context was not cancelled after the drain deadline")
 	}
 }
 
