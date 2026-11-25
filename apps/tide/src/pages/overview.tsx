@@ -164,7 +164,12 @@ export function OverviewPage() {
             queue order.
           </Empty>
         ) : (
-          <div className="table-wrap">
+          <div
+            className="table-wrap"
+            role="region"
+            aria-label="Waiting requests table"
+            tabIndex={0}
+          >
             <table className="table" aria-label="Waiting requests">
               <thead>
                 <tr>
@@ -274,7 +279,12 @@ function DeviceCapacityTable({ organizationId }: { organizationId: string }) {
             OwnSand console.
           </Empty>
         ) : (
-          <div className="table-wrap">
+          <div
+            className="table-wrap"
+            role="region"
+            aria-label="Devices table"
+            tabIndex={0}
+          >
             <table className="table" aria-label="Devices">
               <thead>
                 <tr>

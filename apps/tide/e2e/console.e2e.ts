@@ -598,6 +598,96 @@ describe("member names in Audit and Dev Sessions", () => {
   });
 });
 
+describe("keyboard scrolling in tables", () => {
+  for (const { path, tableName, lastColumn } of [
+    { path: "", tableName: "Waiting requests", lastColumn: "Waiting" },
+    { path: "", tableName: "Devices", lastColumn: "tide runners" },
+    { path: "/audit", tableName: "Audit events", lastColumn: "Subject" },
+  ]) {
+    test(`scrolls the ${tableName} table with the arrow keys at 320 px`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await browser.setViewport({ width: 320, height: 844 });
+      await app.open(`/orgs/${ACME}${path}`);
+
+      const regionName = `${tableName} table`;
+      const region = screen.getByRole("region", regionName, { exact: true });
+      await expect(region).toHaveAttribute("tabindex", "0");
+      await expect(
+        region
+          .getByRole("table", tableName)
+          .getByRole("columnheader", lastColumn),
+      ).toBeVisible();
+
+      const focusedLabel = () =>
+        browser.evaluate(
+          () => document.activeElement?.getAttribute("aria-label") ?? null,
+        );
+      // Tab from the page to the region without focusing it programmatically.
+      for (let stop = 0; stop < 40; stop += 1) {
+        await browser.keyboard.press("Tab");
+        if ((await focusedLabel()) === regionName) break;
+      }
+      await expect(region).toBeFocused();
+
+      const metrics = await browser.evaluate(() => {
+        const region = document.activeElement!;
+        const style = getComputedStyle(region);
+        return {
+          overflow: region.scrollWidth - region.clientWidth,
+          ring: `${style.outlineStyle} ${style.outlineWidth}`,
+          scrollLeft: region.scrollLeft,
+        };
+      });
+      expect(metrics.overflow).toBeGreaterThan(0);
+      expect(metrics.ring).toBe("solid 2px");
+      expect(metrics.scrollLeft).toBe(0);
+
+      const scrollLeft = () =>
+        browser.evaluate(() => document.activeElement?.scrollLeft ?? 0);
+      await browser.keyboard.press("ArrowRight");
+      await expect.poll(scrollLeft).toBeGreaterThan(10);
+      const scrolledRight = await scrollLeft();
+      await browser.keyboard.press("ArrowLeft");
+      await expect.poll(scrollLeft).toBeLessThan(scrolledRight);
+      await expect(region).toBeFocused();
+
+      await browser.keyboard.press("Tab");
+      expect(await focusedLabel()).not.toBe(regionName);
+      await browser.keyboard.press("Shift+Tab");
+      await expect(region).toBeFocused();
+      await browser.keyboard.press("Shift+Tab");
+      expect(await focusedLabel()).not.toBe(regionName);
+    });
+  }
+
+  test("omits the table regions on empty overview and audit pages", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}`);
+
+    await expect(screen.getByText("No request is waiting")).toBeVisible();
+    await expect(
+      screen.getByText("OwnSand link required", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      screen.getByRole("region", "Waiting requests table"),
+    ).toBeHidden();
+    await expect(screen.getByRole("region", "Devices table")).toBeHidden();
+
+    await app.open(`/orgs/${GLOBEX}/audit`);
+    await expect(screen.getByText("No audit events")).toBeVisible();
+    await expect(screen.getByRole("region", "Audit events table")).toBeHidden();
+  });
+});
+
 describe("requests", () => {
   test("shows active requests in queue order before ended requests", async ({
     app,

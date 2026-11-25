@@ -93,6 +93,7 @@ Organization owners, admins and members who sign in with Logto.
 - The console hides actions that the user's role does not allow; the control plane still enforces every permission.
 - At widths of 320 px and wider, the home organization list wraps names as needed so the full name and role badge fit inside each row.
 - The organization layout supports viewports 320 px wide and wider. From 320 through 760 px, the section list scrolls horizontally above the page content. At 761 px and wider, the section list stacks vertically in a 220 px column.
+- On Overview and Audit, Tab reaches the populated Waiting requests, Devices and Audit events tables. Each table shows a focus ring. When columns extend past the visible area, the left and right arrow keys scroll the table horizontally. Tab and Shift+Tab move focus past the table in either direction.
 - UX follows the Toss Design Guidelines. Dialogs close with `Esc`. A form with a single critical input focuses it when it opens.
 - Each form dialog opening starts without a pending request or a submission error. Only the opening that sent a request can show its error, finish its pending state, or act on its success by closing the form, navigating, or showing a one-time secret or link. A failure in the current opening allows a retry. Successful requests refresh the affected data even after dismissal. A key or invitation created after dismissal appears in its list, and the console cannot show its secret or link again.
 
