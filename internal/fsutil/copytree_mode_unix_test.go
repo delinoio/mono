@@ -153,21 +153,21 @@ func TestReadTarPreservesModesUnderUmask(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		setUmask(t, int(mask))
 		src := buildModeTree(t)
 		var archive bytes.Buffer
 		if err := WriteTar(&archive, src); err != nil {
 			t.Fatal(err)
 		}
 		dst := t.TempDir()
-		if err := os.Chmod(dst, 0o700); err != nil {
+		if err := os.Chmod(dst, 0o711); err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { makeDirsWritable(dst) })
+		setUmask(t, int(mask))
 		if err := ReadTar(&archive, dst); err != nil {
 			t.Fatal(err)
 		}
-		requireModeTree(t, dst, 0o700)
+		requireModeTree(t, dst, 0o711)
 		for name, want := range map[string]string{"ro/deep/shared": "ro/deep/shared", "ro/link": "top"} {
 			if b, err := os.ReadFile(filepath.Join(dst, name)); err != nil || string(b) != want {
 				t.Errorf("read %s: %q, %v; want %q", name, b, err, want)
@@ -175,7 +175,7 @@ func TestReadTarPreservesModesUnderUmask(t *testing.T) {
 		}
 		return
 	}
-	for _, mask := range []string{"0022", "0077"} {
+	for _, mask := range []string{"0022", "0077", "0200", "0277", "0177"} {
 		t.Run("umask"+mask, func(t *testing.T) {
 			cmd := exec.Command(os.Args[0], "-test.run=^TestReadTarPreservesModesUnderUmask$")
 			cmd.Env = append(os.Environ(), env+"="+mask)
@@ -194,7 +194,9 @@ func TestReadTarAppliesExplicitDirectoryModesAfterExtraction(t *testing.T) {
 		{hdr: tar.Header{Name: "parent/deep", Typeflag: tar.TypeDir, Mode: 0o550}},
 		{hdr: tar.Header{Name: "parent/implicit/file", Typeflag: tar.TypeReg, Mode: 0o600}, data: "contents"},
 		{hdr: tar.Header{Name: "parent/", Typeflag: tar.TypeDir, Mode: 0o400}},
+		{hdr: tar.Header{Name: "implicit-parent/nested/", Typeflag: tar.TypeDir, Mode: 0o755}},
 	})
+	setUmask(t, 0o222)
 	if err := ReadTar(archive, dst); err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +208,28 @@ func TestReadTarAppliesExplicitDirectoryModesAfterExtraction(t *testing.T) {
 	}
 	requireMode(t, filepath.Join(parent, "deep"), 0o550)
 	requireMode(t, filepath.Join(parent, "implicit"), 0o700)
+	requireMode(t, filepath.Join(dst, "implicit-parent"), 0o700)
+	requireMode(t, filepath.Join(dst, "implicit-parent", "nested"), 0o755)
 	if got, err := os.ReadFile(filepath.Join(parent, "implicit", "file")); err != nil || string(got) != "contents" {
+		t.Fatalf("extracted file = %q, %v", got, err)
+	}
+}
+
+func TestReadTarPopulatesThroughConfinedDirectoryLinkUnderUmask(t *testing.T) {
+	requireSymlinks(t)
+	dst := t.TempDir()
+	archive := buildTar(t, []tarEntry{
+		{hdr: tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "missing/target"}},
+		{hdr: tar.Header{Name: "link/child/file", Typeflag: tar.TypeReg, Mode: 0o640}, data: "contents"},
+	})
+	setUmask(t, 0o277)
+	if err := ReadTar(archive, dst); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"missing", "missing/target", "missing/target/child"} {
+		requireMode(t, filepath.Join(dst, name), 0o700)
+	}
+	if got, err := os.ReadFile(filepath.Join(dst, "missing", "target", "child", "file")); err != nil || string(got) != "contents" {
 		t.Fatalf("extracted file = %q, %v", got, err)
 	}
 }
