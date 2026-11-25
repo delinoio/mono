@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -673,4 +674,117 @@ while :; do sleep 0.05; done
 		t.Fatal(err)
 	}
 	checkHook("drain", "order-drain")
+}
+
+func TestClaudeInheritedOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix processes and signals")
+	}
+	for _, mode := range []string{"graceful", "forced", "unexpected"} {
+		t.Run(mode, func(t *testing.T) {
+			scratch := t.TempDir()
+			script := filepath.Join(scratch, "claude")
+			if err := os.WriteFile(script, []byte(`#!/bin/sh
+cd "${0%/*}" || exit 1
+mode=`+mode+`
+trap 'touch terminated; exit 0' TERM
+if [ -f ready ]; then
+  printf '%s\n' "$TIDE_SPAWN_SOCKET" > restarted
+else
+  # This helper inherits stdout and stderr and outlives the watcher.
+  sleep 120 &
+  if [ "$mode" = forced ]; then trap '' TERM; fi
+  printf '%s\n' "$TIDE_SPAWN_SOCKET" "$$" "$!" > starting
+  mv starting ready
+  if [ "$mode" = unexpected ]; then
+    while [ ! -f crash ]; do sleep 0.05; done
+    exit 17
+  fi
+fi
+while :; do sleep 0.05; done
+`), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			stopTimeout := 5 * time.Second
+			if mode == "forced" {
+				stopTimeout = 500 * time.Millisecond
+			}
+			w := newAgentWorld(t, layers.Options{Claude: claude.Options{ClaudePath: script, Start: claude.ExecStart, StopTimeout: stopTimeout}})
+			id := w.createIntegration(t, &tidev1.CreateAgentIntegrationRequest{
+				Vendor: tidev1.AgentVendor_AGENT_VENDOR_CLAUDE_CODE, Name: "claude",
+				Settings:    &tidev1.CreateAgentIntegrationRequest_ClaudeCode{ClaudeCode: &tidev1.ClaudeCodeSettings{}},
+				Credentials: &tidev1.CreateAgentIntegrationRequest_ClaudeCodeCredentials{ClaudeCodeCredentials: &tidev1.ClaudeCodeCredentials{EnvironmentKey: claudeEnvKey}},
+			})
+			profileID := w.createProfile(t, agentProfileProto("claude-agents", id, tidev1.GuestOs_GUEST_OS_LINUX, time.Hour))
+			var first []string
+			eventually(t, "the orchestrator and its output helper", func() bool {
+				b, err := os.ReadFile(filepath.Join(scratch, "ready"))
+				first = strings.Split(strings.TrimSpace(string(b)), "\n")
+				return err == nil && len(first) == 3
+			})
+			helperPID, err := strconv.Atoi(first[2])
+			if err != nil {
+				t.Fatal(err)
+			}
+			helper, err := os.FindProcess(helperPID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = helper.Kill()
+				_ = helper.Release()
+			})
+			leaderPID, err := strconv.Atoi(first[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			leader, err := os.FindProcess(leaderPID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer leader.Release()
+
+			began := time.Now()
+			if mode == "unexpected" {
+				if err := os.WriteFile(filepath.Join(scratch, "crash"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				eventually(t, "a replacement orchestrator with a new socket", func() bool {
+					b, err := os.ReadFile(filepath.Join(scratch, "restarted"))
+					socket := strings.TrimSpace(string(b))
+					if err != nil || socket == first[0] {
+						return false
+					}
+					info, err := os.Stat(socket)
+					return err == nil && info.Mode()&os.ModeSocket != 0
+				})
+				if !strings.Contains(w.env.Logs.String(), "exit status 17") {
+					t.Fatal("the restart did not report the orchestrator exit status")
+				}
+			} else {
+				if _, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(t.Context(), connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+					OrganizationId: w.org.ID, RunnerProfileId: profileID,
+				})); err != nil {
+					t.Fatal(err)
+				}
+				eventually(t, "the stopped watcher", func() bool {
+					return strings.Contains(w.env.Logs.String(), `"msg":"vendor_watch_stopped"`)
+				})
+				_, err := os.Stat(filepath.Join(scratch, "terminated"))
+				if mode == "graceful" && err != nil {
+					t.Fatalf("the leader should finish its SIGTERM handler: %v", err)
+				}
+			}
+			if _, err := os.Stat(filepath.Dir(first[0])); !os.IsNotExist(err) {
+				t.Fatalf("the old run directory should be removed: %v", err)
+			}
+			if err := leader.Signal(syscall.Signal(0)); err == nil {
+				t.Fatal("the orchestrator leader remains alive")
+			}
+			if err := helper.Signal(syscall.Signal(0)); err != nil {
+				t.Fatalf("the output helper should still be alive: %v", err)
+			}
+			t.Logf("watcher finished after %s with its output helper still alive", time.Since(began).Round(time.Millisecond))
+		})
+	}
 }

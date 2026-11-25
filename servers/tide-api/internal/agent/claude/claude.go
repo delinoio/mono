@@ -585,6 +585,9 @@ func ExecStart(spec ProcessSpec) (Process, error) {
 	cmd := exec.Command(spec.Path, spec.Args...)
 	cmd.Env = spec.Env
 	cmd.Stdout, cmd.Stderr = spec.Stdout, spec.Stderr
+	// A descendant can hold the output pipes open after the orchestrator
+	// exits. Bound this wait separately from the SIGTERM grace period.
+	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
