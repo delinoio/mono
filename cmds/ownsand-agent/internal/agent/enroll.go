@@ -115,6 +115,11 @@ func Enroll(ctx context.Context, st *store.Store, cp *cpclient.Client, token, na
 		logger.Error("enrollment failed", "code", connect.CodeOf(err).String())
 		return nil, fmt.Errorf("agent: enroll: %w", err)
 	}
+	deviceID := resp.Msg.GetDeviceId()
+	if deviceID == "" {
+		logger.Error("enrollment response missing device ID")
+		return nil, errors.New("agent: enroll: control plane response is missing device ID")
+	}
 	// The identity with a device ID is the "enrolled" marker, so persist the
 	// origin that run needs first. A failure at either write leaves the
 	// pending-key identity, and a retry enrolls again with the same key.
@@ -125,7 +130,7 @@ func Enroll(ctx context.Context, st *store.Store, cp *cpclient.Client, token, na
 	}); err != nil {
 		return nil, err
 	}
-	id.DeviceID = resp.Msg.GetDeviceId()
+	id.DeviceID = deviceID
 	id.OrganizationID = resp.Msg.GetOrganizationId()
 	if err := st.SaveIdentity(id); err != nil {
 		return nil, err
