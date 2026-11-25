@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -560,7 +561,7 @@ func TestSupersedingCommandClearsQueuedArtifact(t *testing.T) {
 	}
 }
 
-// gateTimeout bounds every wait on a gated download, so a regression or an
+// gateTimeout bounds waits on gated downloads and installs, so a regression or an
 // earlier failure reports a diagnostic instead of hanging the test binary.
 const gateTimeout = 10 * time.Second
 
@@ -1054,17 +1055,109 @@ func TestTransferReservationAfterFailedInstall(t *testing.T) {
 	end()
 }
 
-// blockingInstaller holds Install until release is closed, so a test can
-// observe the updater while an installation is in progress.
-type blockingInstaller struct {
+// gatedInstall holds Install so the test can observe an in-progress update.
+// Closing done publishes the TryInstall result to the test and its cleanup.
+type gatedInstall struct {
 	started chan struct{}
 	release chan struct{}
+	done    chan struct{}
+	once    sync.Once
+
+	installErr error
+	installed  bool
+	err        error
 }
 
-func (b *blockingInstaller) Install(string) error {
-	close(b.started)
-	<-b.release
-	return nil
+func startGatedInstall(t *testing.T, u *Updater, installErr error) *gatedInstall {
+	t.Helper()
+	g := &gatedInstall{
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+		done:       make(chan struct{}),
+		installErr: installErr,
+	}
+	u.opts.Installer = g
+	t.Cleanup(func() {
+		g.open()
+		g.awaitResult(t)
+	})
+	go func() {
+		g.installed, g.err = u.TryInstall()
+		close(g.done)
+	}()
+	return g
+}
+
+func (g *gatedInstall) Install(string) error {
+	close(g.started)
+	<-g.release
+	return g.installErr
+}
+
+func (g *gatedInstall) open() {
+	g.once.Do(func() { close(g.release) })
+}
+
+func (g *gatedInstall) awaitStarted() error {
+	select {
+	case <-g.started:
+		return nil
+	case <-g.done:
+		if g.err != nil {
+			return fmt.Errorf("TryInstall returned before installer started (installed=%t): %w", g.installed, g.err)
+		}
+		return fmt.Errorf("TryInstall returned before installer started (installed=%t, err=nil)", g.installed)
+	case <-time.After(gateTimeout):
+		return fmt.Errorf("installer did not start within %v", gateTimeout)
+	}
+}
+
+func (g *gatedInstall) awaitResult(t *testing.T) (bool, error) {
+	t.Helper()
+	select {
+	case <-g.done:
+		return g.installed, g.err
+	case <-time.After(gateTimeout):
+		t.Fatalf("TryInstall did not finish within %v", gateTimeout)
+		return false, nil
+	}
+}
+
+func TestGatedInstallReportsEarlyStoreError(t *testing.T) {
+	r := newRelease(t, nil)
+	u, _, _ := newUpdater(t, r, "1.0.0", &atomic.Bool{})
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(u.opts.Store.Path(store.AgentFile), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g := startGatedInstall(t, u, nil)
+	err := g.awaitStarted()
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || !strings.Contains(err.Error(), "TryInstall returned before installer started (installed=false)") {
+		t.Fatalf("want the early result with the store decode error, got %v", err)
+	}
+}
+
+func TestGatedInstallReleasesOnCleanup(t *testing.T) {
+	var g *gatedInstall
+	if !t.Run("start installer", func(t *testing.T) {
+		r := newRelease(t, nil)
+		u, _, _ := newUpdater(t, r, "1.0.0", &atomic.Bool{})
+		if err := update(u, "1.1.0", false); err != nil {
+			t.Fatal(err)
+		}
+		g = startGatedInstall(t, u, nil)
+		if err := g.awaitStarted(); err != nil {
+			t.Fatal(err)
+		}
+	}) {
+		return
+	}
+	if installed, err := g.awaitResult(t); !installed || err != nil {
+		t.Fatalf("TryInstall after cleanup: installed=%t, err=%v", installed, err)
+	}
 }
 
 // TestWithdrawDuringInstallLogsTheObservedTarget covers the late withdrawal:
@@ -1074,37 +1167,23 @@ func TestWithdrawDuringInstallLogsTheObservedTarget(t *testing.T) {
 	u, _, _ := newUpdater(t, r, "1.0.0", &atomic.Bool{})
 	var logs strings.Builder
 	u.opts.Logger = slog.New(slog.NewTextHandler(&logs, nil))
-	inst := &blockingInstaller{started: make(chan struct{}), release: make(chan struct{})}
-	u.opts.Installer = inst
 	if err := update(u, "1.1.0", false); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { _, err := u.TryInstall(); done <- err }()
-	<-inst.started
+	inst := startGatedInstall(t, u, nil)
+	if err := inst.awaitStarted(); err != nil {
+		t.Fatal(err)
+	}
 	if err := u.Withdraw(); !errors.Is(err, ErrInstalling) {
 		t.Fatalf("withdrawal during installation: %v", err)
 	}
-	close(inst.release)
-	if err := awaitDone(t, done); err != nil {
-		t.Fatal(err)
+	inst.open()
+	if installed, err := inst.awaitResult(t); !installed || err != nil {
+		t.Fatalf("TryInstall: installed=%t, err=%v", installed, err)
 	}
 	if !strings.Contains(logs.String(), "agent update withdrawal too late") || !strings.Contains(logs.String(), "target_version=1.1.0") {
 		t.Fatalf("late withdrawal log does not carry the target:\n%s", logs.String())
 	}
-}
-
-// failingInstaller signals that Install started, waits for release and then
-// fails, so the failure path writes the target while withdrawals run.
-type failingInstaller struct {
-	started chan struct{}
-	release chan struct{}
-}
-
-func (f *failingInstaller) Install(string) error {
-	close(f.started)
-	<-f.release
-	return errors.New("boom")
 }
 
 // TestWithdrawRacesWithInstallFailure runs late withdrawals while a failing
@@ -1114,31 +1193,46 @@ func TestWithdrawRacesWithInstallFailure(t *testing.T) {
 	r := newRelease(t, nil)
 	u, _, _ := newUpdater(t, r, "1.0.0", &atomic.Bool{})
 	u.opts.Logger = slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
-	for i := 0; i < 50; i++ {
-		inst := &failingInstaller{started: make(chan struct{}), release: make(chan struct{})}
-		u.opts.Installer = inst
-		u.mu.Lock()
-		u.artifact = filepath.Join(t.TempDir(), "agent")
-		u.target = "1.1.0"
-		u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_PENDING_IDLE
-		u.mu.Unlock()
-		done := make(chan struct{})
-		go func() { u.TryInstall(); close(done) }()
-		<-inst.started
-		// The installation is in progress, so every withdrawal that runs
-		// before the failure returns ErrInstalling and logs the target.
-		var wg sync.WaitGroup
-		for w := 0; w < 4; w++ {
-			wg.Add(1)
+	installErr := errors.New("boom")
+	for i := range 50 {
+		if !t.Run(fmt.Sprint(i), func(t *testing.T) {
+			u.mu.Lock()
+			u.artifact = filepath.Join(t.TempDir(), "agent")
+			u.target = "1.1.0"
+			u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_PENDING_IDLE
+			u.mu.Unlock()
+			inst := startGatedInstall(t, u, installErr)
+			if err := inst.awaitStarted(); err != nil {
+				t.Fatal(err)
+			}
+			// Withdrawals that run before the failure return ErrInstalling
+			// and log the target.
+			var wg sync.WaitGroup
+			for range 4 {
+				wg.Go(func() {
+					for range 20 {
+						u.WithdrawOrdered(u.NextOrder())
+					}
+				})
+			}
+			withdrawalsDone := make(chan struct{})
 			go func() {
-				defer wg.Done()
-				for j := 0; j < 20; j++ {
-					u.WithdrawOrdered(u.NextOrder())
-				}
+				wg.Wait()
+				close(withdrawalsDone)
 			}()
+			t.Cleanup(func() {
+				select {
+				case <-withdrawalsDone:
+				case <-time.After(gateTimeout):
+					t.Fatalf("withdrawals did not finish within %v", gateTimeout)
+				}
+			})
+			inst.open()
+			if installed, err := inst.awaitResult(t); installed || !errors.Is(err, installErr) {
+				t.Fatalf("TryInstall: installed=%t, err=%v", installed, err)
+			}
+		}) {
+			return
 		}
-		close(inst.release)
-		<-done
-		wg.Wait()
 	}
 }
