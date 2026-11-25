@@ -27,7 +27,7 @@ const BuildOwner = "ownsand-agent-image-build"
 
 // BuildVMOptions configure the VM that boots a new Windows image once.
 type BuildVMOptions struct {
-	// ID is the compute system ID.
+	// ID is a fresh compute system ID for this build attempt.
 	ID string
 	// Disk is the VHDX of the new image.
 	Disk string
@@ -70,16 +70,6 @@ func StartBuildVM(opts BuildVMOptions) (*BuildVM, error) {
 	if err := CheckHost(); err != nil {
 		return nil, err
 	}
-	// A compute system left by an interrupted build holds the disk.
-	if old, err := openSystem(opts.ID); err == nil {
-		opts.Logger.Warn("stopping a compute system of an earlier image build", "id", opts.ID)
-		_ = old.terminate()
-		select {
-		case <-old.exited:
-		case <-time.After(stopTimeout):
-		}
-		old.close()
-	}
 	if err := grantVMGroup(opts.Dir, accessReadWrite, true); err != nil {
 		return nil, err
 	}
@@ -91,7 +81,7 @@ func StartBuildVM(opts BuildVMOptions) (*BuildVM, error) {
 		ConsolePipe: pipe, VCPUs: opts.VCPUs, MemoryMiB: opts.MemoryMiB})
 	sys, err := createSystem(opts.ID, doc)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("hcsrt: create image build VM %q: %w", opts.ID, err)
 	}
 	b := &BuildVM{sys: sys, logger: opts.Logger, stop: make(chan struct{}), console: make(chan struct{})}
 	props, err := sys.properties()
@@ -107,6 +97,7 @@ func StartBuildVM(opts BuildVMOptions) (*BuildVM, error) {
 		return nil, err
 	}
 	go b.copyConsole(pipe, filepath.Join(opts.Dir, consoleFile))
+	opts.Logger.Info("started the Windows image build VM", "hcs_id", opts.ID, "com1_pipe", pipe)
 	return b, nil
 }
 
