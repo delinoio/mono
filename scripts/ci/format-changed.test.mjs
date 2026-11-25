@@ -33,6 +33,7 @@ import {
   UnavailablePathPolicy,
 } from "./format-changed.mjs";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
+import { killProcessGroup } from "./fixture-process.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const require = createRequire(import.meta.url);
@@ -47,11 +48,18 @@ function fixture(
   initialCommit = true,
   parentEnv = process.env,
   directoryName = null,
+  beforeRemove,
 ) {
   const parent = mkdtempSync(join(tmpdir(), "rstack-format-"));
   // Clean up the unique parent, not `cwd`: `cwd` is rebound to the child
   // directory below, and removing only the child would leak the parent.
-  t.after(() => rmSync(parent, { recursive: true, force: true }));
+  t.after(async () => {
+    try {
+      await beforeRemove?.();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
   let cwd = parent;
   if (directoryName !== null) {
     // Place the repository in a child directory with a chosen name; removing
@@ -2323,7 +2331,8 @@ setTimeout(() => {
 // An isolated repository with its own copy of the script and a stand-in
 // node_modules/rstack; the standard fixture symlinks the real node_modules.
 function standInFixture(t, fileCount) {
-  const f = fixture(t, false);
+  let reap;
+  const f = fixture(t, false, process.env, null, () => reap?.());
   rmSync(join(f.cwd, "node_modules"), { recursive: true });
   f.write(
     "node_modules/rstack/package.json",
@@ -2348,7 +2357,7 @@ function standInFixture(t, fileCount) {
       return [];
     }
   };
-  return { f, state, lines };
+  return { f, state, lines, registerReaper: (cleanup) => (reap = cleanup) };
 }
 
 // Upper bounds for waits on a process the test started. A passing run never
@@ -2394,8 +2403,9 @@ function isAlive(pid) {
     return (
       stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) !== "Z"
     );
-  } catch {
-    return true;
+  } catch (error) {
+    // The process can disappear between kill(pid, 0) and the /proc read.
+    return process.platform !== "linux" || error.code !== "ENOENT";
   }
 }
 
@@ -2413,11 +2423,11 @@ function standInEnv(f, state, mode, extra = {}) {
 // kills the formatter and every stand-in pid recorded in batches.log, then
 // waits (bounded) until all of them are gone; `reap()` runs the same cleanup on
 // demand and is idempotent.
-function startFormatter(t, { f, state, lines, args, env }) {
+function startFormatter({ f, lines, registerReaper, args, env }) {
   const parent = spawn(
     process.execPath,
     [join(f.cwd, "scripts/ci/format-changed.mjs"), ...args],
-    { cwd: f.cwd, env, stdio: ["ignore", "pipe", "pipe"] },
+    { cwd: f.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
   );
   let stderr = "";
   parent.stdout.resume();
@@ -2428,30 +2438,21 @@ function startFormatter(t, { f, state, lines, args, env }) {
   let reaped = null;
   const reap = () =>
     (reaped ??= (async () => {
-      if (parent.exitCode === null && parent.signalCode === null)
-        parent.kill("SIGKILL");
-      const children = lines("batches.log").map(Number);
-      for (const pid of children) {
-        if (!isAlive(pid)) continue;
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch (error) {
-          if (error.code !== "ESRCH") throw error;
-        }
-      }
+      // Stop the group even if a stand-in did not finish writing its PID.
+      killProcessGroup(parent);
       await within(
         closed,
         StandInDeadlineMs.Reap,
         "the formatter to be reaped",
       );
-      for (const pid of children)
+      for (const pid of lines("batches.log").map(Number))
         await waitFor(
           () => !isAlive(pid),
           `stand-in ${pid} to exit`,
           StandInDeadlineMs.Reap,
         );
     })());
-  t.after(reap);
+  registerReaper(reap);
   return { parent, closed, reap, stderr: () => stderr };
 }
 
@@ -2459,7 +2460,8 @@ function startFormatter(t, { f, state, lines, args, env }) {
 // the first stand-in pid. `extra` adds stand-in variables to the environment.
 async function startReadyRun(t, kind, extra = {}) {
   // 120 tracked files plus the fixture files are more than two 50-path batches.
-  const { f, state, lines } = standInFixture(t, 120);
+  const standInRun = standInFixture(t, 120);
+  const { f, state, lines } = standInRun;
   let args = ["--all"];
   let env = standInEnv(f, state, StandInMode.Signal, extra);
   if (kind === RunKind.PathspecStaged) {
@@ -2476,7 +2478,7 @@ async function startReadyRun(t, kind, extra = {}) {
       GIT_INDEX_FILE: throwaway,
     });
   }
-  const run = startFormatter(t, { f, state, lines, args, env });
+  const run = startFormatter({ ...standInRun, args, env });
   await waitFor(() => lines("batches.log").length > 0, "the first batch");
   return { run, lines, child: Number(lines("batches.log")[0]) };
 }
@@ -2582,11 +2584,10 @@ test(
   "a child that ignores the forwarded signal fails the bounded wait and is reaped",
   { skip: process.platform === "win32" },
   async (t) => {
-    const { f, state, lines } = standInFixture(t, 120);
-    const run = startFormatter(t, {
-      f,
-      state,
-      lines,
+    const standInRun = standInFixture(t, 120);
+    const { f, state, lines } = standInRun;
+    const run = startFormatter({
+      ...standInRun,
       args: ["--all"],
       env: standInEnv(f, state, StandInMode.Signal, {
         STANDIN_IGNORE_SIGNALS: "1",
