@@ -773,6 +773,72 @@ describe("exec over the relay", () => {
     expect(result.complete).toBe(false);
   });
 
+  for (const stream of ["stdout", "stderr"] as const) {
+    const gap = {
+      type: ExecEventType.OutputTruncated,
+      stdout: stream === "stdout" ? { start: 0n, end: 2n } : undefined,
+      stderr: stream === "stderr" ? { start: 0n, end: 2n } : undefined,
+    };
+
+    test(`rejects a read canceled after reporting a ${stream} gap`, async () => {
+      const h = setup();
+      h.api.stream(RelayService, "Exec", function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.started());
+        yield execMsg(ev[stream](2, "x"));
+        yield new Hang();
+      });
+      const caller = new AbortController();
+      const handle = h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"], signal: caller.signal });
+      const iterator = handle[Symbol.asyncIterator]();
+      expect(await h.clock.run(iterator.next())).toMatchObject({
+        done: false,
+        value: { type: ExecEventType.Started },
+      });
+      expect(await h.clock.run(iterator.next())).toEqual({
+        done: false,
+        value: gap,
+      });
+
+      const reason = new Error("caller canceled after the truncation event");
+      caller.abort(reason);
+      await h.clock.run(expect(iterator.next()).rejects.toBe(reason));
+      await expect(handle.wait()).rejects.toBe(reason);
+      expect(h.api.callsOf("AttachExec")).toHaveLength(0);
+    });
+
+    test(`delivers the retained ${stream} chunk once after reporting its gap`, async () => {
+      const h = setup();
+      h.api.stream(RelayService, "Exec", function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.started());
+        yield execMsg(ev[stream](2, "x"));
+        yield execMsg(ev.exited(0));
+      });
+      const handle = h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"], signal: new AbortController().signal });
+      const events = await h.clock.run(collect(handle));
+      expect(events).toEqual([
+        { type: ExecEventType.Started, execId: handle.execId },
+        gap,
+        {
+          type:
+            stream === "stdout" ? ExecEventType.Stdout : ExecEventType.Stderr,
+          offset: 2n,
+          data: new TextEncoder().encode("x"),
+        },
+      ]);
+      expect(await handle.wait()).toMatchObject({
+        kind: ExecResultKind.Exited,
+        exitCode: 0n,
+        complete: false,
+      });
+    });
+  }
+
   test("a stream that ends without accepted is a failure, not a rotation", async () => {
     const h = setup();
     h.api.stream(RelayService, "Exec", async function* () {
