@@ -30,6 +30,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/ratelimit"
 )
@@ -162,12 +163,12 @@ type Service struct {
 type LeaseHolder interface {
 	Held() bool
 	// WhileHeld runs fn only while the instance holds the lease, with the
-	// ownership lock held, and reports whether it ran. The transition that
-	// clears ownership takes the same lock before it closes the agent
-	// channels, so a channel registered in fn is either closed by that
-	// transition or never registered. fn must do no I/O and must not call
-	// the lease.
-	WhileHeld(fn func()) bool
+	// ownership lock held. It passes the current lease period and reports
+	// whether fn ran. The transition that clears ownership takes the same
+	// lock before it closes the agent channels. It closes channels that
+	// fn already registered and prevents later admissions. fn must do no
+	// I/O and must not call the lease.
+	WhileHeld(fn func(*lease.Period)) bool
 }
 
 // DataPathHooks receives the data path parts of the agent channel.

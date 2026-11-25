@@ -11,6 +11,7 @@ import (
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 )
 
 // cursorHarness drives Control.processEvents without a database. readEvents
@@ -405,18 +406,18 @@ type ownershipLease struct{ held bool }
 
 func (l *ownershipLease) Held() bool { return l.held }
 
-func (l *ownershipLease) WhileHeld(fn func()) bool {
+func (l *ownershipLease) WhileHeld(fn func(*lease.Period)) bool {
 	if !l.held {
 		return false
 	}
-	fn()
+	fn(nil)
 	return true
 }
 
 // admit runs the channel admission step of Service.admitChannel with a
 // registration that counts its runs.
 func admit(s *Service) (admitted bool, registered int) {
-	admitted = s.admitChannel(func() { registered++ })
+	admitted = s.admitChannel(func(*lease.Period) { registered++ })
 	return admitted, registered
 }
 

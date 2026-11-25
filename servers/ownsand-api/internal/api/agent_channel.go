@@ -12,13 +12,13 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/delinoio/mono/go/uuidv7"
 	"github.com/delinoio/mono/internal/semver"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 )
 
 // commandKind identifies the command behind a command ID.
@@ -154,13 +154,13 @@ func (s *Service) sendDeleteSnapshot(ctx context.Context, conn *hub.Conn, orgID,
 // admitChannel runs register only while the instance holds the lease and the
 // control event baseline of the lease period is established, as one step
 // under the ownership lock of the lease. It reports whether register ran.
-func (s *Service) admitChannel(register func()) bool {
+func (s *Service) admitChannel(register func(*lease.Period)) bool {
 	admitted := false
-	s.Lease.WhileHeld(func() {
+	s.Lease.WhileHeld(func(period *lease.Period) {
 		if s.BaselineReady != nil && !s.BaselineReady() {
 			return
 		}
-		register()
+		register(period)
 		admitted = true
 	})
 	return admitted
@@ -193,7 +193,13 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 	// committed between that observation and the baseline, because the
 	// event processor only dispatches events after the baseline. The agent
 	// reconnects through its backoff until the baseline exists.
-	conn := h.Hub.RegisterAdmitted(ctx, p.ID, p.OrganizationID, h.admitChannel)
+	var period *lease.Period
+	conn := h.Hub.RegisterAdmitted(ctx, p.ID, p.OrganizationID, func(register func()) bool {
+		return h.admitChannel(func(current *lease.Period) {
+			period = current
+			register()
+		})
+	})
 	if conn == nil {
 		return errUnavailable("this instance does not accept agent channels now")
 	}
@@ -267,8 +273,8 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 		}
 		if stalled {
 			// Abort the blocked transport write before the device state
-			// changes: markOffline waits on the device row lock without a
-			// bound, and a blocked writer must not stay until it returns.
+			// changes: markOffline can wait on the device row lock, and a
+			// blocked writer must not stay until it returns.
 			// The send returns an error once the stream is reset. When the
 			// abort is not possible, the wait for the writer below lasts
 			// until the transport ends the stream (the agent disconnects).
@@ -282,7 +288,7 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 		log.InfoContext(context.WithoutCancel(ctx), "agent_channel_disconnected", slog.Bool("current", current), slog.String("cause", fmt.Sprint(cause)),
 			slog.Int("commands_marked_for_expiry", expiring))
 		if current {
-			h.markOffline(context.WithoutCancel(ctx), conn.DeviceID)
+			h.markOffline(context.WithoutCancel(ctx), conn.DeviceID, period)
 		}
 		if stalled {
 			// The handler cannot return while the send is active: returning
@@ -344,32 +350,65 @@ func channelReadLimitError(cause error) error {
 // holds the device row lock until then. The replacement's state report
 // then sets the device ONLINE after the write.
 //
-// Lock order: the device row lock is taken first (as the state report
-// transaction does), and the fence second.
-func (s *Service) markOffline(ctx context.Context, deviceID string) {
+// Lock the device row before taking the hub fence or the shared lease row
+// lock. Release and takeover can then proceed while this write waits on the
+// device. Once the shared lease row is locked, hold it through commit so a
+// successor cannot acquire the lease between the check and the update.
+func (s *Service) markOffline(parent context.Context, deviceID string, period *lease.Period) {
+	const leaseEnded = "the channel's lease period is no longer current"
 	log := s.Logger.With(slog.String("device_id", deviceID))
-	var offline, ran bool
+	ctx, cancel := period.Context(parent)
+	defer cancel()
+	if ctx.Err() != nil {
+		log.InfoContext(parent, "device_offline_skipped", slog.String("reason", leaseEnded))
+		return
+	}
+	var offline bool
+	var skipReason string
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
-		offline, ran = false, false
 		if _, err := tx.Exec(ctx, "SELECT 1 FROM devices WHERE device_id = $1 FOR UPDATE", deviceID); err != nil {
 			return err
 		}
-		var execErr error
-		ran = s.Hub.IfNoChannel(deviceID, func() {
-			var tag pgconn.CommandTag
-			tag, execErr = tx.Exec(ctx, "UPDATE devices SET state = $2 WHERE device_id = $1 AND state = $3",
-				deviceID, int16(ownsandv1.DeviceState_DEVICE_STATE_OFFLINE), int16(ownsandv1.DeviceState_DEVICE_STATE_ONLINE))
-			offline = execErr == nil && tag.RowsAffected() > 0
-		})
-		return execErr
+		var writeErr error
+		if !s.Hub.IfNoChannel(deviceID, func() {
+			expiry, err := period.LockRow(ctx, tx)
+			if err != nil {
+				writeErr = err
+				return
+			}
+			if expiry.IsZero() {
+				skipReason = leaseEnded
+				return
+			}
+			// Evaluate expiry after both row locks, with the database
+			// clock at the update instead of the transaction start time.
+			var held bool
+			writeErr = tx.QueryRow(ctx, `WITH validity AS MATERIALIZED (SELECT clock_timestamp() < $4::timestamptz AS held),
+				updated AS (
+					UPDATE devices SET state = $2 WHERE device_id = $1 AND state = $3 AND (SELECT held FROM validity)
+					RETURNING 1
+				)
+				SELECT held, EXISTS (SELECT 1 FROM updated) FROM validity`,
+				deviceID, int16(ownsandv1.DeviceState_DEVICE_STATE_OFFLINE), int16(ownsandv1.DeviceState_DEVICE_STATE_ONLINE), expiry).Scan(&held, &offline)
+			if writeErr == nil && !held {
+				skipReason = leaseEnded
+			}
+		}) {
+			skipReason = "a newer agent channel is registered"
+		}
+		return writeErr
 	})
+	if err != nil && errors.Is(err, ctx.Err()) {
+		err = nil
+		skipReason = leaseEnded
+	}
 	switch {
 	case err != nil:
-		log.WarnContext(ctx, "device_offline_update_failed", slog.Any("error", err))
-	case !ran:
-		log.InfoContext(ctx, "device_offline_skipped", slog.String("reason", "a newer agent channel is registered"))
+		log.WarnContext(parent, "device_offline_update_failed", slog.Any("error", err))
+	case skipReason != "":
+		log.InfoContext(parent, "device_offline_skipped", slog.String("reason", skipReason))
 	case offline:
-		log.InfoContext(ctx, "device_offline")
+		log.InfoContext(parent, "device_offline")
 	}
 }
 
