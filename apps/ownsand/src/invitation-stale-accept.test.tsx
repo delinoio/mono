@@ -190,11 +190,13 @@ describe("a stale invitation acceptance", () => {
 
 const EARLIER_SECRET = "osi_earlier";
 
-function holdBothAcceptances() {
+function holdBothAcceptances(
+  organization: { organizationId: string } | undefined,
+) {
   const mock = createMockTransport();
   const earlierAcceptance = createRouterTransport((router) => {
     router.rpc(MemberService.method.acceptInvitation, () => ({
-      organization: { organizationId: MOCK_IDS.acme },
+      organization,
     }));
   });
   return holdingTransport(["AcceptInvitation"], undefined, {
@@ -214,12 +216,13 @@ function holdBothAcceptances() {
 
 describe("opening another invitation while acceptance is pending", () => {
   test.each([
-    ["succeeds", undefined],
-    ["fails", new ConnectError("down", Code.Unavailable)],
+    ["succeeds", { organizationId: MOCK_IDS.acme }, undefined],
+    ["succeeds without an organization", undefined, undefined],
+    ["fails", undefined, new ConnectError("down", Code.Unavailable)],
   ] as const)(
     "accepts the new link while the earlier request later %s",
-    async (_, error) => {
-      const held = holdBothAcceptances();
+    async (_, organization, error) => {
+      const held = holdBothAcceptances(organization);
       renderConsole(`/invitations/accept#secret=${EARLIER_SECRET}`, {
         transport: held.transport,
       });
@@ -271,6 +274,7 @@ describe("opening another invitation while acceptance is pending", () => {
       await settle(60);
       expect(window.location.pathname).toBe("/invitations/accept");
       expect(screen.queryByText(/not available right now/)).toBeNull();
+      expect(screen.queryByText(/you may have joined/i)).toBeNull();
       expect(acceptButton().hasAttribute("data-pending")).toBe(true);
       expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
 
@@ -287,7 +291,7 @@ describe("opening another invitation while acceptance is pending", () => {
 });
 
 test("keeps a newer fragment until hashchange can consume it", async () => {
-  const held = holdBothAcceptances();
+  const held = holdBothAcceptances({ organizationId: MOCK_IDS.acme });
   const queryClient = new QueryClient();
   const invalidate = rs.spyOn(queryClient, "invalidateQueries");
   renderConsole(`/invitations/accept#secret=${EARLIER_SECRET}`, {
@@ -372,6 +376,42 @@ describe("the current invitation acceptance", () => {
     );
     expect(window.location.hash).toBe("");
     expect(pendingInvitation.read()).toBeUndefined();
+  });
+
+  test("invalidates both services on an incomplete success", async () => {
+    const client = new QueryClient();
+    const invalidate = rs.spyOn(client, "invalidateQueries");
+    const transport = createRouterTransport((router) => {
+      router.rpc(MemberService.method.acceptInvitation, () => ({
+        organization: { organizationId: " " },
+      }));
+    });
+    pendingInvitation.save(SECRET_A);
+    renderConsole("/invitations/accept", { transport, queryClient: client });
+
+    fireEvent.click(screen.getByRole("button", { name: "Accept invitation" }));
+
+    expect(
+      await screen.findByText("You may have joined the organization."),
+    ).toBeTruthy();
+    for (const schema of [MemberService, OrganizationService]) {
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: createConnectQueryKey({ schema, cardinality: undefined }),
+      });
+    }
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(window.location.pathname).toBe("/invitations/accept");
+
+    await act(async () => {
+      window.history.replaceState(null, "", `#secret=${SECRET_B}`);
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    expect(
+      screen.queryByText("You may have joined the organization."),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
   });
 
   test("deletes its stored secret when the request fails", async () => {

@@ -761,6 +761,96 @@ describe("invitations", () => {
     );
   });
 
+  for (const response of ["missing-organization", "empty-id"]) {
+    test(`offers Organizations after accepting an invitation with ${response}`, async ({
+      app,
+      screen,
+      browser,
+    }) => {
+      await app.open(`/invitations/accept#secret=${INVITATION_SECRET}`);
+      await screen.getByRole("button", "Sign in to accept").tap();
+      await browser.evaluate((mode) => {
+        sessionStorage.setItem("ownsand-e2e-accept-response", mode);
+        return null;
+      }, response);
+      expect(
+        await browser.evaluate(() =>
+          sessionStorage.getItem("ownsand.pending-invitation"),
+        ),
+      ).toEqual(INVITATION_SECRET);
+
+      const accept = screen.getByRole("button", "Accept invitation");
+      await accept.tap();
+
+      await expect(
+        screen.getByText("You may have joined the organization."),
+      ).toBeVisible();
+      await expect(accept).toBeHidden();
+      await expect(browser).toHaveURL("/invitations/accept");
+      expect(
+        await browser.evaluate(() =>
+          sessionStorage.getItem("ownsand.pending-invitation"),
+        ),
+      ).toBeNull();
+      await app.screenshot(`invitation-recovery-${response}`);
+
+      await screen.getByRole("link", "Go to your organizations").tap();
+      await expect(browser).toHaveURL("/");
+      await expect(screen.getByRole("link", /Contoso Research/)).toBeVisible();
+      expect(
+        await browser.evaluate(() =>
+          sessionStorage.getItem("ownsand-e2e-accept-count"),
+        ),
+      ).toEqual("1");
+    });
+  }
+
+  test("leaves a newer invitation available after an earlier incomplete success", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open(`/invitations/accept#secret=${INVITATION_SECRET}`);
+    await screen.getByRole("button", "Sign in to accept").tap();
+    await browser.evaluate(() => {
+      sessionStorage.setItem("ownsand-e2e-accept-response", "hold");
+      return null;
+    });
+    const accept = screen.getByRole("button", "Accept invitation");
+    await accept.tap();
+    await expect(accept).toBeDisabled();
+    expect(
+      await browser.evaluate(() =>
+        sessionStorage.getItem("ownsand-e2e-accept-held"),
+      ),
+    ).toEqual("true");
+
+    await browser.evaluate((secret) => {
+      window.location.hash = `secret=${secret}`;
+      return null;
+    }, ACME_INVITATION_SECRET);
+    await expect(accept).toBeEnabled();
+    await browser.evaluate(async (secret) => {
+      sessionStorage.setItem("ownsand.pending-invitation", secret);
+      window.dispatchEvent(new Event("ownsand-e2e-release-accept"));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      return null;
+    }, ACME_INVITATION_SECRET);
+
+    await expect(accept).toBeEnabled();
+    await expect(
+      screen.getByText("You may have joined the organization."),
+    ).toBeHidden();
+    expect(
+      await browser.evaluate(() =>
+        sessionStorage.getItem("ownsand.pending-invitation"),
+      ),
+    ).toEqual(ACME_INVITATION_SECRET);
+    await app.screenshot("invitation-newer-after-incomplete-success");
+    await accept.tap();
+    await expect(screen.getByText("you are already a member")).toBeVisible();
+  });
+
   test("accepts a different link opened on the same page after an invitation error", async ({
     app,
     screen,
