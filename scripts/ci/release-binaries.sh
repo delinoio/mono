@@ -63,12 +63,6 @@
 #   OWNSAND_AGENT_RELEASE_SIGNING_KEY  PKCS#8 PEM Ed25519 release key.
 set -euo pipefail
 
-# Empty arrays under `set -u` and `mapfile` need Bash 4.4 or newer.
-if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
-  echo "::error::$0 needs Bash 4.4 or newer, not $BASH_VERSION." >&2
-  exit 2
-fi
-
 here="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$here/../.." && pwd)"
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
@@ -290,11 +284,13 @@ run_manifest_tool() {
 keychain=""
 signing_work=""
 # The user keychain search list before sign_macos added its keychain.
+# Bash 3.2 treats an empty array as unset under `set -u`. Expand the list
+# only when it has entries, and keep each path as a separate argument.
 keychain_search_list=()
 keychain_search_list_saved=""
 cleanup_signing() {
   if [[ -n "$keychain_search_list_saved" ]]; then
-    security list-keychains -d user -s "${keychain_search_list[@]}" > /dev/null 2>&1 || true
+    security list-keychains -d user -s ${keychain_search_list[@]+"${keychain_search_list[@]}"} > /dev/null 2>&1 || true
   fi
   if [[ -n "$keychain" ]]; then
     security delete-keychain "$keychain" > /dev/null 2>&1 || true
@@ -343,7 +339,7 @@ sign_macos() {
     [[ -n "$entry" ]] && keychain_search_list+=("$entry")
   done < <(security list-keychains -d user)
   keychain_search_list_saved=1
-  security list-keychains -d user -s "$keychain" "${keychain_search_list[@]}"
+  security list-keychains -d user -s "$keychain" ${keychain_search_list[@]+"${keychain_search_list[@]}"}
   rm -f "$work/certificate.p12"
   local identities identity
   identities="$(security find-identity -v -p codesigning "$keychain" | grep -c '"Developer ID Application: ' || true)"
@@ -784,6 +780,15 @@ case "$command" in
   has-manifests) (( $# == 1 )) || usage ;;
   *) usage ;;
 esac
+
+# The macOS runner provides Bash 3.2 for `build cgo` and `sign-macos`.
+# Keep the Bash 4.4 minimum for the Linux jobs, which use newer array
+# features and `mapfile` in their release helpers.
+if [[ "$command" != sign-macos && ( "$command" != build || "$2" != cgo ) ]] &&
+  (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "::error::$0 needs Bash 4.4 or newer, not $BASH_VERSION." >&2
+  exit 2
+fi
 
 case "$command" in
   build) build "$2" "$3" ;;
