@@ -9,7 +9,10 @@ import {
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
+import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import { createFakeApi, type FakeApi } from "./testing/fake-api.ts";
+import { deferNextCall } from "./testing/form-submit-deferral.ts";
 import { renderApp, settle } from "./testing/render.tsx";
 
 /**
@@ -36,8 +39,7 @@ function calls(api: FakeApi, method: string) {
 }
 
 /** Opens the create dialog of the billing list and returns its name field. */
-async function openDialog(api: FakeApi) {
-  renderApp("/billing", { api });
+async function openDialog() {
   await screen.findByRole("link", { name: /Acme Robotics/ });
   await click(screen.getByRole("button", { name: "Create billing account" }));
   await settle(60);
@@ -54,9 +56,65 @@ afterEach(() => {
 });
 
 describe("billing account creation", () => {
+  test("keeps the route selected through Back when an abandoned create succeeds", async () => {
+    const api = createFakeApi();
+    const { queryClient } = renderApp("/", { api, strict: true });
+    await click(screen.getByRole("link", { name: "Manage billing" }));
+    const input = await openDialog();
+
+    const listQuery = queryClient.getQueryCache().find({
+      queryKey: createConnectQueryKey({
+        schema: BillingAccountService.method.listBillingAccounts,
+        cardinality: undefined,
+      }),
+      exact: false,
+    });
+    expect(listQuery?.state.isInvalidated).toBe(false);
+
+    const held = deferNextCall(api, "CreateBillingAccount");
+    try {
+      await type(input, "Northwind");
+      await click(
+        within(screen.getByRole("dialog")).getByRole("button", {
+          name: "Create",
+        }),
+      );
+      expect(calls(api, "CreateBillingAccount")).toEqual([
+        expect.objectContaining({ name: "Northwind" }),
+      ]);
+
+      await act(async () => {
+        window.history.replaceState(null, "", "/");
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+      const historyLength = window.history.length;
+      expect(
+        screen.getByRole("heading", { name: "Delino Accounts" }),
+      ).toBeTruthy();
+      expect(screen.queryByRole("dialog")).toBeNull();
+
+      held.release();
+      await waitFor(() => expect(listQuery?.state.isInvalidated).toBe(true));
+      expect(window.location.pathname).toBe("/");
+      expect(window.history.length).toBe(historyLength);
+      expect(
+        screen.getByRole("heading", { name: "Delino Accounts" }),
+      ).toBeTruthy();
+
+      await click(screen.getByRole("link", { name: "Manage billing" }));
+      expect(
+        await screen.findByRole("link", { name: /Northwind/ }),
+      ).toBeTruthy();
+      expect(calls(api, "CreateBillingAccount")).toHaveLength(1);
+    } finally {
+      held.release();
+    }
+  });
+
   test("opens the new account while the refresh of the list is still pending", async () => {
     const api = createFakeApi();
-    const input = await openDialog(api);
+    renderApp("/billing", { api });
+    const input = await openDialog();
     // Hold every later read of the list until the test releases it.
     let release!: () => void;
     api.gates.set(
@@ -94,7 +152,8 @@ describe("billing account creation", () => {
 
   test("a failed create keeps the dialog and the name, and a retry succeeds", async () => {
     const api = createFakeApi();
-    const input = await openDialog(api);
+    renderApp("/billing", { api });
+    const input = await openDialog();
     api.failNext.set(
       "CreateBillingAccount",
       new ConnectError("busy", Code.Unavailable),
