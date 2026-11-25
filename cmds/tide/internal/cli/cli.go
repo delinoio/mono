@@ -181,9 +181,10 @@ func (a *app) errorf(format string, args ...any) {
 	fmt.Fprintf(a.env.Stderr, "%s %s\n", a.paint(ansiRed, "error:"), msg)
 }
 
-func (a *app) warnf(format string, args ...any) {
+func (a *app) warnf(format string, args ...any) error {
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(a.env.Stderr, "%s %s\n", a.paint(ansiYellow, "warning:"), msg)
+	_, err := fmt.Fprintf(a.env.Stderr, "%s %s\n", a.paint(ansiYellow, "warning:"), msg)
+	return err
 }
 
 func (a *app) registerGlobals(fs *flag.FlagSet) {

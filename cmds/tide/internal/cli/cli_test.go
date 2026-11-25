@@ -168,6 +168,82 @@ func TestExecJSONFlushesUTF8BeforeResult(t *testing.T) {
 	}
 }
 
+type failingExecOutput struct {
+	bytes.Buffer
+	err    error
+	failAt int
+	writes int
+}
+
+func (w *failingExecOutput) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == w.failAt {
+		return 0, w.err
+	}
+	return w.Buffer.Write(p)
+}
+
+func TestSessionExecAndAttachOutputWriteFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake guest runs POSIX sh commands")
+	}
+	f := newFixture(t)
+	f.srv.AddDevSessionProfile(f.org, "linux", tidev1.GuestOs_GUEST_OS_LINUX, f.wd)
+	f.env[EnvAPIKey] = f.srv.APIKey
+	f.env[EnvOrganization] = f.org
+	var session struct {
+		ID string `json:"dev_session_id"`
+	}
+	if err := json.Unmarshal([]byte(f.ok("", "--output", "json", "session", "create", "linux").stdout), &session); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, command := range []string{"exec", "attach"} {
+		for _, tc := range []struct {
+			name, format string
+			failStderr   bool
+		}{
+			{name: "stdout", format: "text"},
+			{name: "stderr", format: "text", failStderr: true},
+			{name: "json", format: "json"},
+		} {
+			t.Run(command+"/"+tc.name, func(t *testing.T) {
+				execArgs := []string{"session", "exec", session.ID, "--", "sh", "-c", "printf out; printf err >&2"}
+				args := execArgs
+				if command == "attach" {
+					f.ok("", execArgs...)
+					requests := f.srv.ExecRequests()
+					args = []string{"session", "attach", session.ID, requests[len(requests)-1].GetExecId()}
+				}
+
+				var stdout, stderr failingExecOutput
+				failed := &stdout
+				failAt := 1
+				if tc.failStderr {
+					failed = &stderr
+				}
+				if tc.format == "json" && command == "exec" {
+					failAt = 2 // The first line reports the start event.
+				}
+				failed.failAt = failAt
+				failed.err = errors.New("local output write failed")
+				code := Run(t.Context(), Env{
+					Args:      append([]string{"--output", tc.format}, args...),
+					Stdout:    &stdout,
+					Stderr:    &stderr,
+					LookupEnv: func(k string) (string, bool) { v, ok := f.env[k]; return v, ok },
+				})
+				if code != ExitError || !strings.HasSuffix(stderr.String(), "error: local output write failed\n") {
+					t.Errorf("exit = %d, stderr = %q, want exit 1 and the write error", code, stderr.String())
+				}
+				if failed.writes < failAt || strings.Contains(stdout.String(), `"event":"stream_error"`) {
+					t.Errorf("writes to failing output = %d, stdout = %q", failed.writes, stdout.String())
+				}
+			})
+		}
+	}
+}
+
 type interruptExecOutput struct {
 	bytes.Buffer
 	cancel context.CancelFunc

@@ -267,9 +267,16 @@ func (a *app) sessionAttach(ctx context.Context, name string, args []string) err
 type execWriter struct {
 	a              *app
 	stdout, stderr utf8Stream
+	writeErr       error
 }
 
 func (w *execWriter) event(ev tide.ExecEvent) error {
+	// The SDK wraps a callback error in ExecStreamError to retain replay offsets.
+	w.writeErr = w.writeEvent(ev)
+	return w.writeErr
+}
+
+func (w *execWriter) writeEvent(ev tide.ExecEvent) error {
 	a := w.a
 	if a.fmt == FormatJSON {
 		switch ev.Kind {
@@ -319,7 +326,7 @@ func (w *execWriter) event(ev tide.ExecEvent) error {
 		if !ev.MissingStderr.Empty() {
 			parts = append(parts, fmt.Sprintf("stderr bytes %d to %d", ev.MissingStderr.From, ev.MissingStderr.To))
 		}
-		a.warnf("output was lost: %s", strings.Join(parts, " and "))
+		return a.warnf("output was lost: %s", strings.Join(parts, " and "))
 	}
 	return nil
 }
@@ -397,6 +404,9 @@ func incompleteRuneStart(data []byte) int {
 // finishExec maps an exec result to the exit status of the ownsand sandbox
 // exec rules.
 func (a *app) finishExec(ctx context.Context, session string, w *execWriter, res *tide.ExecResult, err error) error {
+	if w.writeErr != nil {
+		return &exitError{code: ExitError, msg: w.writeErr.Error()}
+	}
 	jsonMode := a.fmt == FormatJSON
 	if err != nil {
 		var se *tide.ExecStreamError
