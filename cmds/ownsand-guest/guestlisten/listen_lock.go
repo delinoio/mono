@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -61,14 +62,23 @@ func lockUnixAddress(address string) (func(), error) {
 	if runtime.GOOS == "linux" && strings.HasPrefix(address, "@") {
 		return noop, nil
 	}
-	f, err := os.OpenFile(address+unixLockSuffix, os.O_RDWR|os.O_CREATE, 0o600)
+	var waited time.Duration
+	wait := func() bool {
+		if waited >= unixLockBudget {
+			return false
+		}
+		unixLockSleep(unixLockPollInterval)
+		waited += unixLockPollInterval
+		return true
+	}
+	f, err := openUnixLockFile(address+unixLockSuffix, wait)
 	if errors.Is(err, os.ErrNotExist) {
 		return noop, nil
 	}
 	if err != nil {
 		return nil, pathFreeError(ErrLockFailed, err)
 	}
-	for waited := time.Duration(0); ; waited += unixLockPollInterval {
+	for {
 		locked, err := tryLockFile(f)
 		if err != nil {
 			_ = f.Close()
@@ -80,10 +90,42 @@ func lockUnixAddress(address string) (func(), error) {
 				_ = f.Close()
 			}, nil
 		}
-		if waited >= unixLockBudget {
+		if !wait() {
 			_ = f.Close()
 			return nil, ErrLockTimeout
 		}
-		unixLockSleep(unixLockPollInterval)
 	}
+}
+
+func openUnixLockFile(path string, wait func() bool) (*os.File, error) {
+	const mode = 0o600
+	if runtime.GOOS != "linux" {
+		return os.OpenFile(path, os.O_RDWR|os.O_CREATE, mode)
+	}
+
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
+	if errors.Is(err, os.ErrExist) {
+		for {
+			existing, openErr := os.OpenFile(path, os.O_RDWR, 0)
+			if errors.Is(openErr, os.ErrNotExist) {
+				// A missing target, such as a dangling symlink, must not
+				// let the listener proceed without a lock.
+				return nil, err
+			}
+			// The creator may still be restoring permissions. Use the
+			// same budget as flock and keep the open error on expiry.
+			if !errors.Is(openErr, syscall.EACCES) || !wait() {
+				return existing, openErr
+			}
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Only the creator changes the mode, on the same inode it will lock.
+	if err := f.Chmod(mode); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
 }
