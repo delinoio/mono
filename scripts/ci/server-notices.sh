@@ -10,8 +10,8 @@
 #   service      the server name, used in the file header.
 #   package      the Go package of the production command, relative to the
 #                current directory, for example ./servers/accounts-api/cmd/accounts-api.
-#   output-file  the path of the bundle. It is written only when every linked
-#                third-party module has a license file.
+#   output-file  the path of the bundle. It is written only after discovery
+#                succeeds and every linked third-party module has a license file.
 #
 # The module and license discovery follows `write_notices` in
 # `scripts/ci/release-binaries.sh`. Keep the license file expression below in
@@ -34,12 +34,20 @@ export GOOS=linux GOARCH=amd64 CGO_ENABLED=0
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
 modules="$work/modules"
+sorted_modules="$work/sorted-modules"
+license_paths="$work/license-paths"
+sorted_license_paths="$work/sorted-license-paths"
 bundle="$work/THIRD-PARTY-LICENSES.txt"
 
 if ! go list -mod=readonly -deps -buildvcs=false \
   -f '{{with .Module}}{{if not .Main}}{{.Path}}{{"\t"}}{{.Version}}{{"\t"}}{{.Dir}}{{end}}{{end}}' \
   "$package" < /dev/null > "$modules"; then
   echo "::error::Cannot list the Go modules that $service links (go list $package failed)." >&2
+  exit 1
+fi
+
+if ! sort -u "$modules" > "$sorted_modules"; then
+  echo "::error::Cannot sort the Go modules that $service links." >&2
   exit 1
 fi
 
@@ -56,6 +64,14 @@ while IFS=$'\t' read -r -u 3 module version module_dir; do
     echo "::error::Module $module $version that $service links has no source directory; download the modules before you generate the notices." >&2
     exit 1
   fi
+  if ! find "$module_dir" -maxdepth 2 -type f \( -ipath "$module_dir/licen[cs]e*" -o -ipath "$module_dir/copying*" -o -ipath "$module_dir/notice*" -o -ipath "$module_dir/patents*" -o -ipath "$module_dir/licenses/*" \) -print0 > "$license_paths"; then
+    echo "::error::Cannot find license files for $module $version that $service links." >&2
+    exit 1
+  fi
+  if ! sort -z "$license_paths" > "$sorted_license_paths"; then
+    echo "::error::Cannot sort license paths for $module $version that $service links." >&2
+    exit 1
+  fi
   found=0
   while IFS= read -r -d '' file; do
     found=1
@@ -67,13 +83,13 @@ while IFS=$'\t' read -r -u 3 module version module_dir; do
       echo
       cat -- "$file"
     } >> "$bundle"
-  done < <(find "$module_dir" -maxdepth 2 -type f \( -ipath "$module_dir/licen[cs]e*" -o -ipath "$module_dir/copying*" -o -ipath "$module_dir/notice*" -o -ipath "$module_dir/patents*" -o -ipath "$module_dir/licenses/*" \) -print0 | sort -z)
+  done < "$sorted_license_paths"
   if (( found == 0 )); then
     echo "::error::Module $module $version that $service links has no license file in $module_dir." >&2
     exit 1
   fi
   count=$((count + 1))
-done 3< <(sort -u "$modules")
+done 3< "$sorted_modules"
 
 if (( count == 0 )); then
   # Every server links at least one third-party module; an empty list means
