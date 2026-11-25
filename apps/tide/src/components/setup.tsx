@@ -15,21 +15,30 @@ export enum SetupStep {
   Done = "done",
 }
 
-export interface SetupState {
-  linked: boolean;
-  hasGitHubInstallation: boolean;
-  hasAgentIntegration: boolean;
-  hasRunnerProfile: boolean;
+interface SetupState {
+  linked: boolean | undefined;
+  hasGitHubInstallation: boolean | undefined;
+  hasAgentIntegration: boolean | undefined;
+  hasRunnerProfile: boolean | undefined;
 }
 
-/** The first step that is not done yet. */
-export function nextSetupStep(state: SetupState): SetupStep {
+/** Returns the next step when its prerequisites are known. */
+export function nextSetupStep(state: SetupState): SetupStep | undefined {
+  if (state.linked === undefined) return undefined;
   if (!state.linked) return SetupStep.LinkOwnSand;
-  if (!state.hasGitHubInstallation && !state.hasAgentIntegration) {
+  if (
+    state.hasGitHubInstallation === false &&
+    state.hasAgentIntegration === false
+  ) {
     return SetupStep.ConnectWorkSource;
   }
-  if (!state.hasRunnerProfile) return SetupStep.CreateRunnerProfile;
-  return SetupStep.Done;
+  if (state.hasGitHubInstallation || state.hasAgentIntegration) {
+    if (state.hasRunnerProfile === undefined) return undefined;
+    return state.hasRunnerProfile
+      ? SetupStep.Done
+      : SetupStep.CreateRunnerProfile;
+  }
+  return undefined;
 }
 
 const STEP_TEXT: Record<
@@ -66,8 +75,7 @@ const ORDER = [
   SetupStep.CreateRunnerProfile,
 ] as const;
 
-/** Reads the setup state of an organization; undefined while it loads. */
-export function useSetupState(organizationId: string): SetupState | undefined {
+function useNextSetupStep(organizationId: string): SetupStep | undefined {
   const link = useQuery(OwnSandLinkService.method.getOwnSandLink, {
     organizationId,
   });
@@ -83,28 +91,20 @@ export function useSetupState(organizationId: string): SetupState | undefined {
     organizationId,
     pageSize: 1,
   });
-  if (
-    link.data === undefined ||
-    installations.data === undefined ||
-    integrations.data === undefined ||
-    profiles.data === undefined
-  ) {
-    return undefined;
-  }
-  return {
-    linked: link.data.link !== undefined,
-    hasGitHubInstallation: installations.data.installations.length > 0,
-    hasAgentIntegration: integrations.data.integrations.length > 0,
-    hasRunnerProfile: profiles.data.profiles.length > 0,
-  };
+  return nextSetupStep({
+    linked: link.data && link.data.link !== undefined,
+    hasGitHubInstallation:
+      installations.data && installations.data.installations.length > 0,
+    hasAgentIntegration:
+      integrations.data && integrations.data.integrations.length > 0,
+    hasRunnerProfile: profiles.data && profiles.data.profiles.length > 0,
+  });
 }
 
 /** The setup checklist of the overview, while a step is not done. */
 export function SetupGuide({ organizationId }: { organizationId: string }) {
-  const state = useSetupState(organizationId);
-  if (state === undefined) return null;
-  const next = nextSetupStep(state);
-  if (next === SetupStep.Done) return null;
+  const next = useNextSetupStep(organizationId);
+  if (next === undefined || next === SetupStep.Done) return null;
   const nextIndex = ORDER.indexOf(next);
   return (
     <section className="section" aria-labelledby="setup-title">
@@ -138,8 +138,7 @@ export function SetupGuide({ organizationId }: { organizationId: string }) {
 }
 
 /**
- * The empty state of a list: names the next setup step while the setup is
- * not done, or the given text afterwards.
+ * Shows the next setup step when known, or the given empty-state text.
  */
 export function SetupEmpty({
   organizationId,
@@ -150,9 +149,8 @@ export function SetupEmpty({
   title: string;
   children?: React.ReactNode;
 }) {
-  const state = useSetupState(organizationId);
-  const next = state === undefined ? SetupStep.Done : nextSetupStep(state);
-  if (next === SetupStep.Done) {
+  const next = useNextSetupStep(organizationId);
+  if (next === undefined || next === SetupStep.Done) {
     return <Empty title={title}>{children}</Empty>;
   }
   const text = STEP_TEXT[next];

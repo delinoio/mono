@@ -114,6 +114,17 @@ describe("organizations", () => {
     await expect(screen.getByRole("combobox", "Organization")).toContainText(
       "Fabrikam",
     );
+
+    const organizationPath = await browser.evaluate(() => location.pathname);
+    const setup = screen.getByRole("region", "Set up tide");
+    await setup.getByRole("link", "Link OwnSand").tap();
+
+    await expect(
+      screen.getByRole("heading", "Integrations", { level: 1 }),
+    ).toBeVisible();
+    expect(await browser.evaluate(() => location.pathname)).toBe(
+      `${organizationPath}/integrations`,
+    );
   });
 
   test("fits organization names and role badges in their home list rows", async ({
