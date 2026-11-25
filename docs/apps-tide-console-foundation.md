@@ -101,6 +101,7 @@ The console stores nothing except the Logto SDK session state in the browser (in
 - Credential inputs use password-type fields and are cleared after submission.
 - Destructive actions (OwnSand link removal, GitHub installation unlink, integration deletion, profile deletion, runner deletion, dev session deletion, API key revocation, organization deletion, ownership transfer) need an explicit confirmation step.
 - The result of a request belongs to the opening that sent it. A confirmation button is disabled while its request runs.
+- After a successful leave or deletion, the console opens the organization list before it refreshes affected queries if the confirmation is still open. If the user dismisses the confirmation or moves to another page, the console refreshes the data and preserves their current URL and history. Removing another member refreshes the roster on Members.
 - The console shows no runner output and no dev session output. It never stores an API key secret.
 
 ## Logging

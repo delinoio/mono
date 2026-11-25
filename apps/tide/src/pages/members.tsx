@@ -53,9 +53,7 @@ export function MembersPage() {
   const updateRole = useMutation(MemberService.method.updateMemberRole, {
     onSuccess: refresh,
   });
-  const removeMember = useMutation(MemberService.method.removeMember, {
-    onSuccess: refresh,
-  });
+  const removeMember = useMutation(MemberService.method.removeMember);
   const [removing, setRemoving] = useState<Member>();
   const [leaving, setLeaving] = useState(false);
 
@@ -139,9 +137,13 @@ export function MembersPage() {
         title={`Remove ${removing ? displayName(removing) : ""}?`}
         description="They lose access to this organization. tide revokes their personal API keys and ends their dev sessions."
         confirmLabel="Remove member"
-        onConfirm={() =>
-          removeMember.mutateAsync({ organizationId, userId: removing!.userId })
-        }
+        onConfirm={async () => {
+          await removeMember.mutateAsync({
+            organizationId,
+            userId: removing!.userId,
+          });
+          await refresh();
+        }}
       />
       <ConfirmDialog
         open={leaving}
@@ -154,7 +156,9 @@ export function MembersPage() {
             organizationId,
             userId: userId ?? "",
           });
+          // Refreshing the old route can unmount the confirmation.
           if (opening.isCurrent()) navigate("/");
+          await refresh();
         }}
       />
     </>

@@ -191,6 +191,45 @@ describe("organizations", () => {
     await created.tap();
     await expect(browser).toHaveURL(createdPath);
   });
+
+  for (const { section, action, title, removed, remaining } of [
+    {
+      section: `/orgs/${NORTHWIND}/members`,
+      action: "Leave organization",
+      title: "Leave this organization?",
+      removed: "Northwind Labs Member",
+      remaining: "Acme Robotics Owner",
+    },
+    {
+      section: `/orgs/${ACME}/settings`,
+      action: "Delete organization",
+      title: "Delete Acme Robotics?",
+      removed: "Acme Robotics Owner",
+      remaining: "Northwind Labs Member",
+    },
+  ]) {
+    test(`returns home after confirming ${action.toLowerCase()}`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await expect(screen.getByRole("link", removed)).toBeVisible();
+      await app.open(section);
+      await screen.getByRole("button", action).tap();
+      const confirmation = screen.getByRole("alertdialog", title);
+      await expect(confirmation).toBeVisible();
+      await confirmation.getByRole("button", action).tap();
+
+      await expect(browser).toHaveURL("/");
+      await expect(
+        screen.getByRole("heading", "Organizations", { level: 1 }),
+      ).toBeVisible();
+      await expect(screen.getByRole("link", remaining)).toBeVisible();
+      await expect(screen.getByRole("link", removed)).toBeHidden();
+    });
+  }
 });
 
 describe("organization layout", () => {
