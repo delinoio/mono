@@ -18,7 +18,7 @@ function refetchUnlessLaterPageFailed(query: {
   );
 }
 
-/** The shared roster for Members and ownership transfer in one organization. */
+/** The shared roster for one organization. */
 export function useMembers(organizationId: string) {
   const query = useInfiniteQuery(
     MemberService.method.listMembers,

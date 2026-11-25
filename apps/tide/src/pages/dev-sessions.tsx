@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import {
-  useInfiniteQuery,
-  useMutation,
-  useQuery,
-} from "@connectrpc/connect-query";
+import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Checkbox } from "delino-ui/checkbox";
@@ -12,10 +8,9 @@ import {
   type DevSession,
   DevSessionService,
 } from "@delino/tide-protos/v1/dev_session_pb";
-import { MemberService } from "@delino/tide-protos/v1/member_pb";
 import { WorkService } from "@delino/tide-protos/v1/work_pb";
 import { useMemo, useState } from "react";
-import { invalidateServices, MAX_PAGE_SIZE, PAGE_SIZE } from "../api.ts";
+import { invalidateServices, PAGE_SIZE } from "../api.ts";
 import { SetupEmpty } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
@@ -32,6 +27,7 @@ import {
   memberName,
   TERMINAL_REQUEST_STATES,
 } from "../format.ts";
+import { useMembers } from "../members.ts";
 import { canDeleteDevSession } from "../roles.ts";
 import { Link, orgPath, RouteId } from "../router.tsx";
 import { requestStateTone } from "./requests.tsx";
@@ -54,16 +50,10 @@ export function DevSessionsPage() {
   const [owner, setOwner] = useState<OwnerFilter>(OwnerFilter.Everyone);
   const [includeEnded, setIncludeEnded] = useState(false);
   const [deleting, setDeleting] = useState<DevSession>();
-  const members = useQuery(MemberService.method.listMembers, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const { members } = useMembers(organizationId);
   const names = useMemo(
-    () =>
-      new Map(
-        (members.data?.members ?? []).map((m) => [m.userId, m.displayName]),
-      ),
-    [members.data],
+    () => new Map(members.map((member) => [member.userId, member.displayName])),
+    [members],
   );
   const list = useInfiniteQuery(
     DevSessionService.method.listDevSessions,

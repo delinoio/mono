@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useInfiniteQuery, useQuery } from "@connectrpc/connect-query";
+import { useInfiniteQuery } from "@connectrpc/connect-query";
 import { AuditService } from "@delino/tide-protos/v1/audit_pb";
-import { MemberService } from "@delino/tide-protos/v1/member_pb";
 import { useMemo } from "react";
-import { MAX_PAGE_SIZE, PAGE_SIZE } from "../api.ts";
+import { PAGE_SIZE } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   Empty,
@@ -13,20 +12,15 @@ import {
   ShortId,
 } from "../components/ui.tsx";
 import { formatTime, labels, memberName } from "../format.ts";
+import { useMembers } from "../members.ts";
 
 /** Route `audit`: audit events of the organization, newest first. */
 export function AuditPage() {
   const { organizationId } = useOrg();
-  const members = useQuery(MemberService.method.listMembers, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const { members } = useMembers(organizationId);
   const names = useMemo(
-    () =>
-      new Map(
-        (members.data?.members ?? []).map((m) => [m.userId, m.displayName]),
-      ),
-    [members.data],
+    () => new Map(members.map((member) => [member.userId, member.displayName])),
+    [members],
   );
   const list = useInfiniteQuery(
     AuditService.method.listAuditEvents,

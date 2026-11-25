@@ -481,7 +481,44 @@ describe("audit", () => {
         (cell) => cell.textContent,
       ),
     );
-    expect(actions).toEqual(["Dev session created", "OwnSand link set"]);
+    expect(actions).toEqual([
+      "Dev session created",
+      "Dev session created",
+      "OwnSand link set",
+    ]);
+  });
+});
+
+describe("member names in Audit and Dev Sessions", () => {
+  test("keeps fallback labels on a roster error and uses names from the recovered roster", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/audit`);
+
+    const audit = screen.getByRole("table", "Audit events");
+    await expect(audit).toContainText("Mina Kim");
+    await expect(audit).toContainText("mock-user-nora");
+
+    await screen.getByRole("link", "Members").tap();
+    await expect(
+      screen.getByText("Some members are not shown yet."),
+    ).toBeVisible();
+    await screen.getByRole("button", "Try again").tap();
+    await expect(screen.getByText("Nora Lee")).toBeVisible();
+
+    await screen.getByRole("link", "Audit events").tap();
+    await expect(audit).toContainText("Nora Lee");
+    await expect(screen.getByText("mock-user-nora")).toBeHidden();
+
+    await screen.getByRole("link", "Dev sessions").tap();
+    await screen.getByRole("checkbox", "Show ended dev sessions").tap();
+    await expect(screen.getByRole("table", "Dev sessions")).toContainText(
+      "Mina Kim (you)",
+    );
+    await expect(screen.getByRole("cell", "Nora Lee")).toBeVisible();
   });
 });
 

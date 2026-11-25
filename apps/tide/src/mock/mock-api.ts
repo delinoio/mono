@@ -153,6 +153,7 @@ export const MOCK_IDS = {
 
 const OTHER_ADMIN = "mock-user-ada";
 const OTHER_MEMBER = "mock-user-lin";
+const LATER_MEMBER = "mock-user-nora";
 
 const now = () => Date.now();
 const ts = (offsetSeconds = 0): Timestamp =>
@@ -297,7 +298,7 @@ function seed(
     );
   }
   acme.members.push(
-    member(MOCK_IDS.acme, "mock-user-nora", Role.MEMBER, "Nora Lee"),
+    member(MOCK_IDS.acme, LATER_MEMBER, Role.MEMBER, "Nora Lee"),
   );
   acme.link = create(OwnSandLinkSchema, {
     organizationId: MOCK_IDS.acme,
@@ -636,8 +637,8 @@ function seed(
       organizationId: MOCK_IDS.acme,
       runnerProfileId: MOCK_IDS.devProfile,
       runnerProfileName: "windows-dev",
-      ownerUserId: OTHER_MEMBER,
-      label: "",
+      ownerUserId: LATER_MEMBER,
+      label: "compiler check",
       guestOs: GuestOs.WINDOWS,
       workspacePath: "C:\\work",
       state: RequestState.ENDED,
@@ -682,6 +683,16 @@ function seed(
       targetId: MOCK_IDS.queuedDev,
       subjectUserId: userId,
       createTime: ts(-60),
+    }),
+    create(AuditEventSchema, {
+      auditEventId: uuidV7(),
+      organizationId: MOCK_IDS.acme,
+      action: AuditAction.DEV_SESSION_CREATED,
+      actorUserId: LATER_MEMBER,
+      targetKind: AuditTargetKind.DEV_SESSION,
+      targetId: MOCK_IDS.devSessionOther,
+      subjectUserId: LATER_MEMBER,
+      createTime: ts(-86400),
     }),
   );
   orgs.set(MOCK_IDS.acme, acme);
