@@ -102,38 +102,40 @@ mv "$dir.partial" "$dir"
 `
 }
 
-// windowsInstallScript is the PowerShell form of unixInstallScript for
-// C:\actions-runner: Invoke-WebRequest, Get-FileHash and
-// System.IO.Compression.ZipFile, as the release notes show. It removes the
-// inherited permissions of the runner directory, so only SYSTEM and the
-// Administrators can read the JIT configuration file in it.
+// windowsInstallScript installs the runner if it is missing and restricts
+// access to the runner directory before Tide can write the JIT configuration.
 func windowsInstallScript() string {
 	return `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $dir = '` + windowsRunnerDir + `'
-if ((Test-Path -LiteralPath "$dir\run.cmd") -and (Test-Path -LiteralPath "$dir\bin\Runner.Listener.exe")) { exit 0 }
-$arch = $env:PROCESSOR_ARCHITEW6432
-if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
-switch ($arch) {
-  'AMD64' { $a = 'x64'; $sum = '` + runnerSHA256["win-x64"] + `' }
-  'ARM64' { $a = 'arm64'; $sum = '` + runnerSHA256["win-arm64"] + `' }
-  default { throw "unsupported architecture: $arch" }
+$installed = (Test-Path -LiteralPath "$dir\run.cmd") -and (Test-Path -LiteralPath "$dir\bin\Runner.Listener.exe")
+if (-not $installed) {
+  $arch = $env:PROCESSOR_ARCHITEW6432
+  if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+  switch ($arch) {
+    'AMD64' { $a = 'x64'; $sum = '` + runnerSHA256["win-x64"] + `' }
+    'ARM64' { $a = 'arm64'; $sum = '` + runnerSHA256["win-arm64"] + `' }
+    default { throw "unsupported architecture: $arch" }
+  }
+  $asset = "actions-runner-win-$a-` + RunnerVersion + `.zip"
+  $zip = Join-Path $env:TEMP $asset
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/actions/runner/releases/download/v` + RunnerVersion + `/$asset" -OutFile $zip
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant() -ne $sum) { Remove-Item -LiteralPath $zip -Force; throw "checksum mismatch for $asset" }
+  $partial = "$dir.partial"
+  if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Recurse -Force }
+  New-Item -ItemType Directory -Force -Path $partial | Out-Null
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $partial)
+  Remove-Item -LiteralPath $zip -Force
+  if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+  Move-Item -LiteralPath $partial -Destination $dir
 }
-$asset = "actions-runner-win-$a-` + RunnerVersion + `.zip"
-$zip = Join-Path $env:TEMP $asset
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/actions/runner/releases/download/v` + RunnerVersion + `/$asset" -OutFile $zip
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant() -ne $sum) { Remove-Item -LiteralPath $zip -Force; throw "checksum mismatch for $asset" }
-$partial = "$dir.partial"
-if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $partial | Out-Null
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $partial)
-Remove-Item -LiteralPath $zip -Force
-if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
-Move-Item -LiteralPath $partial -Destination $dir
-& icacls.exe $dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "icacls failed" }
+# Replace the entire DACL, including explicit grants from a template.
+# Set a trusted owner so the previous owner cannot restore those grants.
+$acl = Get-Acl -LiteralPath $dir
+$acl.SetSecurityDescriptorSddlForm('O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)', [System.Security.AccessControl.AccessControlSections]'Owner, Access')
+Set-Acl -LiteralPath $dir -AclObject $acl
 `
 }
 

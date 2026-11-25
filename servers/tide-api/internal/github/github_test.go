@@ -19,6 +19,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
+	"github.com/delinoio/mono/go/ownsand"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
@@ -138,6 +139,37 @@ func TestJobLifecycle(t *testing.T) {
 	if !strings.Contains(w.env.Logs.String(), `"github_job_id":9001`) || !strings.Contains(w.env.Logs.String(), `"delivery_id":"`+guid+`"`) {
 		t.Fatal("delivery logs lack the job or delivery ID")
 	}
+}
+
+func TestJITRegistrationSkipsStartWhenWindowsACLPreparationFails(t *testing.T) {
+	w := newGHWorld(t, worldOpts{})
+	guest := tidev1.GuestOs_GUEST_OS_WINDOWS
+	w.os.SetExec(func(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+		if !strings.Contains(strings.Join(p.Command, " "), "Set-Acl ") {
+			return w.progs.exec(ctx, sandboxID, p)
+		}
+		code := int64(1)
+		return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
+	}, w.progs.attach)
+	w.link(t, 501, "acme")
+	profile := ghProfile("windows", 0)
+	profile.GuestOs = guest
+	profile.Source = &tidev1.RunnerProfile_BaseImage{BaseImage: guest}
+	profileID := w.createProfile(t, profile)
+	w.send(t, "workflow_job", job("queued", 501, 9001, []string{"self-hosted", "tide-windows"}, ""))
+	if req := w.requestOfJob(t, 9001); req.GetRunnerProfileId() != profileID {
+		t.Fatalf("queued request did not match the Windows profile: %v", req)
+	}
+
+	failed := tidev1.RunnerState_RUNNER_STATE_FAILED
+	eventually(t, "Windows runner preparation failure", func() bool { return len(w.runnersIn(t, failed)) > 0 })
+	if r := w.runnersIn(t, failed)[0]; r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+		t.Fatalf("runner end reason = %v", r.GetEndReason())
+	}
+	if jit, writes, execs := w.gh.Calls("generate_jitconfig"), w.os.Calls("WriteFile"), w.os.Calls("Exec"); jit != 0 || writes != 0 || execs == 0 || len(w.progs.all()) != 0 {
+		t.Fatalf("JIT configurations = %d, file writes = %d, execs = %d; want no JIT request, file write, or exec other than Windows preparation", jit, writes, execs)
+	}
+	t.Log("Tide reported a prep failure through the runner RPC after the Windows preparation exec, with no JIT request, file write, or start exec")
 }
 
 func TestJobNoEligibleDevice(t *testing.T) {
