@@ -196,39 +196,54 @@ func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Reques
 	return connect.NewResponse(&ownsandv1.CreateSnapshotResponse{Snapshot: snap.pb}), nil
 }
 
-// applySnapshotResult applies the result of a create-snapshot command with
-// applyResultWithRetry. The server removed the command record before it
-// applied the result and the agent sends the result once, so a result that
-// a transient database error loses would leave the snapshot CREATING for as
-// long as the channel lives. Both writes act only on a CREATING row, so a
-// retry after a commit whose outcome is unknown, after the deletion of the
-// snapshot or after another writer settled it changes nothing more. When
-// the application ends without success while conn is still the current
-// channel of its device, the channel is closed: the state report of the
-// replacement channel then applies the agent's report of the snapshot, or
-// fails a snapshot that it does not list.
+// applySnapshotResult retries database errors because the agent sends the
+// result once and the server already removed the command record. Both writes
+// act only on a CREATING row. A successful result for a missing row triggers
+// local copy deletion after the transaction commits. If the result stays
+// unapplied, the server closes the current channel so the replacement
+// channel's state report can reconcile the snapshot.
 func (s *Service) applySnapshotResult(ctx context.Context, conn *hub.Conn, info commandInfo, res *ownsandv1.AgentCommandResult) error {
-	return s.applyResultWithRetry(ctx, conn, resultApplyEvents{
+	var missing bool
+	err := s.applyResultWithRetry(ctx, conn, resultApplyEvents{
 		retry:     "snapshot_result_apply_retry",
 		recovered: "snapshot_result_apply_recovered",
 		abandoned: "snapshot_result_apply_abandoned",
 	}, errSnapshotResultNotApplied, []any{slog.String("snapshot_id", info.snapshotID), slog.String("command_id", res.GetCommandId())},
-		func(ctx context.Context) error { return s.applySnapshotResultOnce(ctx, info, res) })
+		func(dbCtx context.Context) error {
+			var err error
+			missing, err = s.applySnapshotResultOnce(dbCtx, info, res)
+			return err
+		})
+	if err == nil && missing {
+		s.Logger.InfoContext(ctx, "snapshot_create_result_late", slog.String("snapshot_id", info.snapshotID),
+			slog.String("device_id", conn.DeviceID), slog.String("channel_id", conn.ID), slog.String("command_id", res.GetCommandId()))
+		s.sendDeleteSnapshot(ctx, conn, info.orgID, info.snapshotID)
+	}
+	return err
 }
 
 // errSnapshotResultNotApplied is the cause that closes a channel whose
 // create-snapshot result could not be applied.
 var errSnapshotResultNotApplied = errors.New("the create-snapshot result could not be applied")
 
-func (s *Service) applySnapshotResultOnce(ctx context.Context, info commandInfo, res *ownsandv1.AgentCommandResult) error {
-	if res.GetError() != nil || res.GetCreateSnapshot().GetSnapshot() == nil {
+// applySnapshotResultOnce reports whether a successful create has no snapshot row.
+func (s *Service) applySnapshotResultOnce(ctx context.Context, info commandInfo, res *ownsandv1.AgentCommandResult) (bool, error) {
+	entry := res.GetCreateSnapshot().GetSnapshot()
+	if res.GetError() != nil || entry == nil {
 		_, err := s.DB.Pool.Exec(ctx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1 AND state = $3", info.snapshotID,
 			int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
-		return err
+		return false, err
 	}
-	return s.DB.InTx(ctx, func(tx pgx.Tx) error {
-		return applySnapshotEntryTx(ctx, tx, info.snapshotID, res.GetCreateSnapshot().GetSnapshot())
+	var missing bool
+	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		applied, err := applySnapshotEntryTx(ctx, tx, info.snapshotID, entry)
+		if err != nil || applied {
+			return err
+		}
+		// The guarded update also skips rows that another writer settled.
+		return tx.QueryRow(ctx, "SELECT NOT EXISTS (SELECT 1 FROM snapshots WHERE snapshot_id = $1)", info.snapshotID).Scan(&missing)
 	})
+	return missing, err
 }
 
 // applyExportResult applies the result of an export command. Only the result
