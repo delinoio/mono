@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
@@ -1774,7 +1774,10 @@ test("check rejects a missing license or entitlements file", (t) => {
 
 // Writes a `tool` package with a license file and optional entitlements under
 // a temporary repository root, and returns the root.
-function releaseFixture(t, { entitlements = "entitlements.plist" } = {}) {
+function releaseFixture(
+  t,
+  { entitlements = "entitlements.plist", licenseFiles = ["LICENSE"] } = {},
+) {
   const dir = mkdtempSync(join(tmpdir(), "deploy-plan-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   mkdirSync(join(dir, "cmds/ownsand"), { recursive: true });
@@ -1783,13 +1786,56 @@ function releaseFixture(t, { entitlements = "entitlements.plist" } = {}) {
     JSON.stringify({
       name: "tool",
       deploy: githubRelease("tool", {
-        licenseFiles: ["LICENSE"],
+        licenseFiles,
         ...(entitlements ? { entitlements } : {}),
       }),
     }),
   );
   return dir;
 }
+
+test("plan and --check reject # in a binary license basename", async (t) => {
+  const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
+  for (const file of [
+    "NOTICE",
+    "licenses#upstream/NOTICE",
+    "NOTICE#upstream.txt",
+  ]) {
+    await t.test(file, (t) => {
+      const dir = releaseFixture(t, {
+        entitlements: null,
+        licenseFiles: [file],
+      });
+      const path = join(dir, file);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "license\n");
+      const makePlan = () =>
+        plan(status(["tool", "1.2.3"]), readWorkspacePackages(dir));
+      const run = spawnSync(process.execPath, [cli, "--check", dir], {
+        encoding: "utf8",
+      });
+
+      if (file === "NOTICE#upstream.txt") {
+        const message =
+          'tool: deploy.licenseFiles path "NOTICE#upstream.txt" has # in its basename';
+        assert.throws(makePlan, (error) => {
+          assert.ok(error instanceof DeployPlanError);
+          assert.equal(error.message, message);
+          return true;
+        });
+        assert.equal(run.status, 2, run.stderr);
+        assert.deepEqual(JSON.parse(run.stderr.trim()), {
+          event: "deploy_plan_error",
+          message,
+        });
+      } else {
+        assert.deepEqual(makePlan().binaries[0].licenseFiles, [file]);
+        assert.equal(run.status, 0, run.stderr);
+        assert.equal(JSON.parse(run.stdout.trim()).event, "deploy_plan_check");
+      }
+    });
+  }
+});
 
 test("check rejects a directory at a license or entitlements path", (t) => {
   const dir = releaseFixture(t);
