@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,6 +24,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/delinoio/mono/go/ownsand/validate"
 	"github.com/delinoio/mono/go/uuidv7"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
@@ -30,6 +32,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/app"
 	"github.com/delinoio/mono/servers/tide-api/internal/authz"
 	"github.com/delinoio/mono/servers/tide-api/internal/db"
+	"github.com/delinoio/mono/servers/tide-api/internal/profile"
 	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
@@ -39,6 +42,8 @@ const (
 	// StreamLimit ends a forwarded exec or read stream before 14 minutes,
 	// with an OK status and no final event.
 	StreamLimit = 13*time.Minute + 30*time.Second
+	// writeGracePeriod gives Connect time to write its end-of-stream status.
+	writeGracePeriod = 15 * time.Second
 	// KeepaliveInterval is the longest time without an exec event; the
 	// contract requires at least one keepalive every 60 seconds.
 	KeepaliveInterval = 30 * time.Second
@@ -49,6 +54,7 @@ const (
 // Timing overrides the stream durations (tests).
 type Timing struct {
 	StreamLimit       time.Duration
+	WriteGracePeriod  time.Duration
 	KeepaliveInterval time.Duration
 }
 
@@ -68,12 +74,19 @@ func Register(r *app.Registry, e *work.Engine, timing Timing) *Handler {
 	if timing.StreamLimit <= 0 {
 		timing.StreamLimit = StreamLimit
 	}
+	if timing.WriteGracePeriod <= 0 {
+		timing.WriteGracePeriod = writeGracePeriod
+	}
 	if timing.KeepaliveInterval <= 0 {
 		timing.KeepaliveInterval = KeepaliveInterval
 	}
 	h := &Handler{svc: r.Service, e: e, timing: timing, writes: newWrites()}
 	e.RegisterAdapter(Adapter{})
-	r.Handle(tidev1connect.NewDevSessionServiceHandler(h, r.HandlerOptions()...))
+	path, handler := tidev1connect.NewDevSessionServiceHandler(h, r.HandlerOptions()...)
+	r.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ctx := context.WithValue(req.Context(), responseControllerKey{}, http.NewResponseController(w))
+		handler.ServeHTTP(w, req.WithContext(ctx))
+	}))
 	r.OnMembershipEnd(api.MembershipEndHook{Name: "dev_sessions", InTx: h.membershipEndTx, AfterCommit: h.membershipEndAfter})
 	return h
 }
@@ -134,6 +147,9 @@ func (h *Handler) complete(ctx context.Context, q db.Querier, reqs []*work.Reque
 			runners[r.ID] = r
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
 	}
 	type prof struct {
 		name, workspace string
@@ -154,6 +170,9 @@ func (h *Handler) complete(ctx context.Context, q db.Querier, reqs []*work.Reque
 		profiles[id] = p
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	for _, s := range out {
 		if p, ok := profiles[s.req.ProfileID]; ok {
 			s.profileName, s.workspace, s.guestOS = p.name, p.workspace, tidev1.GuestOs(p.guest)
@@ -257,17 +276,7 @@ func (h *Handler) CreateDevSession(ctx context.Context, req *connect.Request[tid
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		// A shared lock of the profile row until the commit: a concurrent
-		// DeleteRunnerProfile, which locks the row FOR UPDATE before its
-		// hook cancels the queued requests, either waits and cancels this
-		// request too, or deletes the row first and this call fails with
-		// not_found.
-		var locked int
-		if err := tx.QueryRow(ctx, "SELECT 1 FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR SHARE",
-			c.OrganizationID, profileID).Scan(&locked); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return api.ErrNotFound("runner profile")
-			}
+		if err := profile.LockShare(ctx, tx, c.OrganizationID, profileID); err != nil {
 			return err
 		}
 		p, err := h.e.Profiles().Get(ctx, tx, c.OrganizationID, profileID)
@@ -277,13 +286,14 @@ func (h *Handler) CreateDevSession(ctx context.Context, req *connect.Request[tid
 		if p.Kind != tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION {
 			return api.ErrInvalidf("invalid runner_profile_id: the profile is not a DEV_SESSION profile")
 		}
-		var limit *int32
+		var locked int
 		if err := tx.QueryRow(ctx, "SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE", c.OrganizationID, c.UserID).Scan(&locked); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return api.ErrNotFound("organization")
 			}
 			return err
 		}
+		var limit *int32
 		if err := tx.QueryRow(ctx, "SELECT max_dev_sessions_per_user FROM organizations WHERE organization_id = $1", c.OrganizationID).Scan(&limit); err != nil {
 			return err
 		}
@@ -359,30 +369,14 @@ func (h *Handler) ListDevSessions(ctx context.Context, req *connect.Request[tide
 			return nil, err
 		}
 	}
-	var states []int16
-	for _, st := range m.GetStates() {
-		states = append(states, int16(st))
+	states, err := work.RequestStateFilter(m.GetStates(), m.GetIncludeEnded())
+	if err != nil {
+		return nil, err
 	}
-	if len(states) == 0 && !m.GetIncludeEnded() {
-		states = work.OpenRequestStates()
-	}
-	rows, err := s.DB.Pool.Query(ctx, "SELECT "+work.RequestColumns+` FROM requests
-		WHERE organization_id = $1 AND kind = $2 AND request_id > $3 AND ($4 = '' OR owner_user_id = $4) AND ($5 = '' OR runner_profile_id::text = $5)
-		AND ($6::smallint[] IS NULL OR state = ANY($6)) ORDER BY request_id LIMIT $7`,
-		c.OrganizationID, int16(tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION), api.AfterKey(after), owner, profileID, states, limit)
+	reqs, err := listRequests(ctx, s.DB.Pool, c.OrganizationID, api.AfterKey(after), owner, profileID, states, limit)
 	if err != nil {
 		return nil, s.Internal(ctx, "list dev sessions", err)
 	}
-	var reqs []*work.Request
-	for rows.Next() {
-		r, err := work.ScanRequest(rows)
-		if err != nil {
-			rows.Close()
-			return nil, s.Internal(ctx, "list dev sessions", err)
-		}
-		reqs = append(reqs, r)
-	}
-	rows.Close()
 	all, err := h.complete(ctx, s.DB.Pool, reqs)
 	if err != nil {
 		return nil, s.Internal(ctx, "list dev sessions", err)
@@ -395,6 +389,29 @@ func (h *Handler) ListDevSessions(ctx context.Context, req *connect.Request[tide
 	}
 	resp.NextPageToken = api.NextPageToken(len(all), limit, last)
 	return connect.NewResponse(resp), nil
+}
+
+func listRequests(ctx context.Context, q db.Querier, orgID, after, owner, profileID string, states []int16, limit int32) ([]*work.Request, error) {
+	rows, err := q.Query(ctx, "SELECT "+work.RequestColumns+` FROM requests
+		WHERE organization_id = $1 AND kind = $2 AND request_id > $3 AND ($4 = '' OR owner_user_id = $4) AND ($5 = '' OR runner_profile_id::text = $5)
+		AND ($6::smallint[] IS NULL OR state = ANY($6)) ORDER BY request_id LIMIT $7`,
+		orgID, int16(tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION), after, owner, profileID, states, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var reqs []*work.Request
+	for rows.Next() {
+		r, err := work.ScanRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		reqs = append(reqs, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return reqs, nil
 }
 
 // errRebound restarts a DeleteDevSession transaction whose session got a
@@ -530,6 +547,9 @@ func (h *Handler) membershipEndTx(ctx context.Context, tx pgx.Tx, m api.Membersh
 		list = append(list, o)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	for _, o := range list {
 		if o.runner != "" && tidev1.RequestState(o.state) != tidev1.RequestState_REQUEST_STATE_QUEUED {
 			if _, err := h.e.DeleteRunnerTx(ctx, tx, m.OrganizationID, o.runner, tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER, work.DeleteMemberRemoved); err != nil {
@@ -546,25 +566,33 @@ func (h *Handler) membershipEndTx(ctx context.Context, tx pgx.Tx, m api.Membersh
 // membershipEndAfter deletes the sandboxes of the runners that
 // membershipEndTx marked.
 func (h *Handler) membershipEndAfter(ctx context.Context, m api.MembershipEnd) {
-	rows, err := h.svc.DB.Pool.Query(ctx, `SELECT n.runner_id::text FROM runners n JOIN requests r ON r.request_id = n.request_id
-		WHERE n.organization_id = $1 AND n.state = $2 AND r.owner_user_id = $3 AND r.end_reason = $4`,
-		m.OrganizationID, int16(tidev1.RunnerState_RUNNER_STATE_DELETING), m.UserID, int16(tidev1.RequestEndReason_REQUEST_END_REASON_MEMBER_REMOVED))
+	ids, err := memberCleanupRunnerIDs(ctx, h.svc.DB.Pool, m)
 	if err != nil {
 		h.svc.Logger.WarnContext(ctx, "dev_session_member_cleanup_failed", slog.String("organization_id", m.OrganizationID), slog.Any("error", err))
-		return
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if rows.Scan(&id) == nil {
-			ids = append(ids, id)
-		}
-	}
-	rows.Close()
 	for _, id := range ids {
 		h.e.DeleteSandboxOf(ctx, m.OrganizationID, id)
 	}
 	h.e.Kick(m.OrganizationID)
+}
+
+func memberCleanupRunnerIDs(ctx context.Context, q db.Querier, m api.MembershipEnd) ([]string, error) {
+	rows, err := q.Query(ctx, `SELECT n.runner_id::text FROM runners n JOIN requests r ON r.request_id = n.request_id
+		WHERE n.organization_id = $1 AND n.state = $2 AND r.owner_user_id = $3 AND r.end_reason = $4`,
+		m.OrganizationID, int16(tidev1.RunnerState_RUNNER_STATE_DELETING), m.UserID, int16(tidev1.RequestEndReason_REQUEST_END_REASON_MEMBER_REMOVED))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // resolvePath returns an absolute guest path: an absolute path of the guest
@@ -627,6 +655,10 @@ func ownsandError(err error) error {
 	}
 	if errors.Is(err, context.Canceled) {
 		return connect.NewError(connect.CodeCanceled, errors.New("request canceled"))
+	}
+	var validationErr *validate.Error
+	if errors.As(err, &validationErr) {
+		return api.ErrInvalidf("%s", validationErr.Error())
 	}
 	return api.ErrUnavailable("the OwnSand data path failed; try again")
 }

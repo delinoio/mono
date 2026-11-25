@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -32,7 +33,7 @@ func needPOSIX(t *testing.T) {
 // workspace is a new local directory.
 func newSession(t *testing.T, c *Client, srv *tidetest.Server, org string, os tidev1.GuestOs) *tidev1.DevSession {
 	t.Helper()
-	ws := t.TempDir() + "/work"
+	ws := filepath.Join(t.TempDir(), "work")
 	if err := mkdir(ws); err != nil {
 		t.Fatal(err)
 	}
@@ -276,9 +277,11 @@ func TestExecAttachAfterStreamRotation(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
 	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
-	srv.ExecStreamEventLimit = 1
+	srv.ExecStreamEventLimit = 2
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	var got collected
-	res, err := c.Exec(context.Background(), ExecParams{
+	res, err := c.Exec(ctx, ExecParams{
 		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
 		Command: []string{"sh", "-c", `for i in 1 2 3 4 5 6; do echo "out $i"; echo "err $i" >&2; sleep 0.01; done; exit 3`},
 		OnEvent: got.on,
@@ -290,16 +293,17 @@ func TestExecAttachAfterStreamRotation(t *testing.T) {
 		t.Fatalf("result = %+v", res)
 	}
 	wantOut := "out 1\nout 2\nout 3\nout 4\nout 5\nout 6\n"
-	if got.stdout.String() != wantOut || !strings.Contains(got.stderr.String(), "err 6") || got.started != 1 {
+	wantErr := "err 1\nerr 2\nerr 3\nerr 4\nerr 5\nerr 6\n"
+	if got.stdout.String() != wantOut || got.stderr.String() != wantErr || got.started != 1 {
 		t.Fatalf("stdout %q stderr %q started %d", got.stdout.String(), got.stderr.String(), got.started)
 	}
-	if res.StdoutOffset != int64(len(wantOut)) {
-		t.Fatalf("stdout offset %d", res.StdoutOffset)
+	if res.StdoutOffset != int64(len(wantOut)) || res.StderrOffset != int64(len(wantErr)) {
+		t.Fatalf("stdout offset %d, stderr offset %d", res.StdoutOffset, res.StderrOffset)
 	}
-	if n := srv.Calls("/delino.tide.v1.DevSessionService/AttachDevSessionExec"); n < 2 {
+	if n := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); n < 2 {
 		t.Fatalf("attach calls = %d, want several", n)
 	}
-	if n := srv.Calls("/delino.tide.v1.DevSessionService/ExecDevSession"); n != 1 {
+	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); n != 1 {
 		t.Fatalf("exec calls = %d, want 1", n)
 	}
 	reqs := srv.ExecRequests()
@@ -308,14 +312,44 @@ func TestExecAttachAfterStreamRotation(t *testing.T) {
 	}
 }
 
+func TestExecNotFoundAfterStreamRotation(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	// End the first stream immediately after Started, then reject the attach.
+	srv.ExecStreamEventLimit = 1
+	srv.Fail(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure, connect.NewError(connect.CodeNotFound, errors.New("exec not found")))
+
+	var got collected
+	_, err := c.Exec(t.Context(), ExecParams{
+		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+		Command: []string{"true"}, OnEvent: got.on,
+	})
+	var se *ExecStreamError
+	if !errors.As(err, &se) || connect.CodeOf(se.Err) != connect.CodeNotFound {
+		t.Fatalf("exec error = %v, want ExecStreamError wrapping not_found", err)
+	}
+	if !se.Started || se.OutcomeUnknown || got.started != 1 {
+		t.Fatalf("stream error = %+v, started = %t, outcome unknown = %t, start callbacks = %d", se, se.Started, se.OutcomeUnknown, got.started)
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); n != 1 {
+		t.Fatalf("exec calls = %d, want 1", n)
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); n != 1 {
+		t.Fatalf("attach calls = %d, want 1", n)
+	}
+}
+
 func TestExecReportsLostOutput(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
 	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
-	srv.ExecStreamEventLimit = 1
+	srv.ExecStreamEventLimit = 2
 	srv.OutputKeepBytes = 8
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	var got collected
-	res, err := c.Exec(context.Background(), ExecParams{
+	res, err := c.Exec(ctx, ExecParams{
 		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
 		Command: []string{"sh", "-c", `echo first; sleep 0.2; echo 0123456789abcdefghij; sleep 0.2; echo end`},
 		OnEvent: got.on,
@@ -323,8 +357,8 @@ func TestExecReportsLostOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Incomplete || len(got.truncated) == 0 {
-		t.Fatalf("result incomplete=%v truncated=%v", res.Incomplete, got.truncated)
+	if res.Kind != ExecResultExited || res.ExitCode == nil || *res.ExitCode != 0 || !res.Incomplete || len(got.truncated) == 0 {
+		t.Fatalf("result = %+v, truncation = %v", res, got.truncated)
 	}
 	tr := got.truncated[0].MissingStdout
 	if tr.Empty() || tr.From < int64(len("first\n")) {
@@ -332,6 +366,75 @@ func TestExecReportsLostOutput(t *testing.T) {
 	}
 	if !strings.HasSuffix(got.stdout.String(), "end\n") {
 		t.Fatalf("stdout %q", got.stdout.String())
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); n == 0 {
+		t.Fatal("expected an attach after rotation")
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); n != 1 {
+		t.Fatalf("exec calls = %d, want 1", n)
+	}
+}
+
+func TestExecTimeoutValidation(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	params := ExecParams{
+		OrganizationID: org,
+		DevSessionID:   ds.GetDevSessionId(),
+		Command:        []string{"true"},
+	}
+
+	t.Run("negative", func(t *testing.T) {
+		p := params
+		p.Timeout = -time.Nanosecond
+		callbacks := 0
+		p.OnEvent = func(ExecEvent) error {
+			callbacks++
+			return nil
+		}
+		res, err := c.Exec(t.Context(), p)
+		if res != nil || connect.CodeOf(err) != connect.CodeInvalidArgument || connect.IsWireError(err) {
+			t.Errorf("Exec returned (%+v, %v), want a nil result and a local invalid_argument error", res, err)
+		}
+		if calls := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure); calls != 0 {
+			t.Errorf("start calls = %d, want 0", calls)
+		}
+		if calls := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); calls != 0 {
+			t.Errorf("attach calls = %d, want 0", calls)
+		}
+		if callbacks != 0 {
+			t.Errorf("callback calls = %d, want 0", callbacks)
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{name: "zero", timeout: 0},
+		{name: "positive", timeout: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := params
+			p.Timeout = tc.timeout
+			before := len(srv.ExecRequests())
+			if _, err := c.Exec(t.Context(), p); err != nil {
+				t.Fatal(err)
+			}
+			requests := srv.ExecRequests()
+			if got := len(requests) - before; got != 1 {
+				t.Fatalf("start requests = %d, want 1", got)
+			}
+			timeout := requests[before].GetTimeout()
+			if tc.timeout == 0 {
+				if timeout != nil {
+					t.Fatalf("timeout = %v, want an absent field", timeout)
+				}
+			} else if timeout == nil || timeout.AsDuration() != tc.timeout {
+				t.Fatalf("timeout = %v, want %s", timeout, tc.timeout)
+			}
+		})
 	}
 }
 
@@ -360,14 +463,23 @@ func TestExecErrors(t *testing.T) {
 	srv.SetSessionState(ds.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
 
 	// An unknown exec on attach reports an unknown outcome.
-	_, err = c.AttachExec(ctx, AttachParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), ExecID: "missing"})
-	if !errors.As(err, &se) || connect.CodeOf(err) != connect.CodeNotFound {
-		t.Fatalf("attach missing: %v", err)
+	var got collected
+	_, err = c.AttachExec(ctx, AttachParams{
+		OrganizationID: org, DevSessionID: ds.GetDevSessionId(), ExecID: "missing",
+		StdoutOffset: 10, StderrOffset: 30, OnEvent: got.on,
+	})
+	if !errors.As(err, &se) || connect.CodeOf(se.Err) != connect.CodeNotFound {
+		t.Fatalf("attach error = %v, want ExecStreamError wrapping not_found", err)
+	}
+	if se.ExecID != "missing" || se.StdoutOffset != 10 || se.StderrOffset != 30 {
+		t.Fatalf("attach error = %+v, want exec ID missing and offsets (10, 30)", se)
+	}
+	if se.Started || !se.OutcomeUnknown || got.started != 0 {
+		t.Fatalf("started = %t, outcome unknown = %t, start callbacks = %d", se.Started, se.OutcomeUnknown, got.started)
 	}
 
 	// A cancelled caller gets the offsets to continue with.
 	cctx, cancel := context.WithCancel(ctx)
-	var got collected
 	_, err = c.Exec(cctx, ExecParams{
 		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
 		Command: []string{"sh", "-c", "echo hello; sleep 0.5; echo world"},
@@ -388,16 +500,118 @@ func TestExecErrors(t *testing.T) {
 		t.Fatalf("attach after cancel: %q %+v %v", got.stdout.String(), res, err)
 	}
 
-	// A transient failure of the first stream continues with attach, and
-	// the command runs once.
-	srv.Fail("/delino.tide.v1.DevSessionService/AttachDevSessionExec", connect.NewError(connect.CodeUnavailable, errors.New("restart")))
-	srv.ExecStreamEventLimit = 1
+	// After rotation, a transient failure of the first attach is retried
+	// without running the command again.
+	execCalls := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure)
+	attachCalls := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure)
+	srv.Fail(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure, connect.NewError(connect.CodeUnavailable, errors.New("restart")))
+	srv.ExecStreamEventLimit = 2
+	retryCtx, cancelRetry := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelRetry()
 	got = collected{}
-	res, err = c.Exec(ctx, ExecParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), Command: []string{"sh", "-c", "echo a; echo b"}, OnEvent: got.on})
-	if err != nil || got.stdout.String() != "a\nb\n" {
-		t.Fatalf("retry: %q %v", got.stdout.String(), err)
+	res, err = c.Exec(retryCtx, ExecParams{
+		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+		Command: []string{"sh", "-c", "echo a; echo b; echo retry >&2"},
+		OnEvent: got.on,
+	})
+	if err != nil || res.Kind != ExecResultExited || res.ExitCode == nil || *res.ExitCode != 0 || res.Incomplete {
+		t.Fatalf("retry result = %+v, error = %v", res, err)
 	}
-	_ = res
+	if got.stdout.String() != "a\nb\n" || got.stderr.String() != "retry\n" {
+		t.Fatalf("retry stdout = %q, stderr = %q", got.stdout.String(), got.stderr.String())
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure) - attachCalls; n < 2 {
+		t.Fatalf("attach calls = %d, want at least 2", n)
+	}
+	if n := srv.Calls(tidev1connect.DevSessionServiceExecDevSessionProcedure) - execCalls; n != 1 {
+		t.Fatalf("exec calls = %d, want 1", n)
+	}
+}
+
+func TestFakeExecCloseStopsGroup(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("the fake guest stops exec process groups on Linux and macOS")
+	}
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	// Redirect the child's descriptors so closing the exec stream cannot
+	// affect whether the child survives. Bound its lifetime on failure.
+	const command = `
+sh -c '
+	: > ready
+	i=0
+	while [ "$i" -lt 200 ]; do
+		if [ -e release ]; then
+			: > survived
+			exit
+		fi
+		i=$((i + 1))
+		sleep 0.025
+	done
+' </dev/null >/dev/null 2>&1 &
+wait
+`
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Exec(ctx, ExecParams{
+			OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+			Command: []string{"sh", "-c", command},
+		})
+		done <- err
+	}()
+	workspace := ds.GetWorkspacePath()
+	ready := filepath.Join(workspace, "ready")
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		_, err := os.Stat(ready)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("exec finished before the child was ready: %v", err)
+		case <-ctx.Done():
+			t.Fatal("child did not become ready")
+		case <-tick.C:
+		}
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("server did not close")
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("exec did not finish after Close: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("exec did not finish after Close")
+	}
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		t.Fatal("deadline expired while checking for the survival marker")
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "survived")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("survival marker after Close: stat returned %v, want not exist", err)
+	}
 }
 
 func mkdir(p string) error { return os.MkdirAll(p, 0o755) }

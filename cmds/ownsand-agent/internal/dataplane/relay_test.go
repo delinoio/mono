@@ -754,8 +754,13 @@ func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
 		t.Fatal("watchdog timed out a connection with recent inbound bytes")
 	}
 	<-c.out
-	if f := <-c.out; f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE || f.GetRelayKeepalive().GetEchoRequested() {
-		t.Fatalf("queued frame %v, want a plain keepalive", f)
+	select {
+	case f := <-c.out:
+		if f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE || f.GetRelayKeepalive().GetEchoRequested() {
+			t.Fatalf("queued frame %v, want a plain keepalive", f)
+		}
+	default:
+		t.Fatal("watchdog did not queue a due keepalive")
 	}
 	// A keepalive that is not due is not sent.
 	c.markSent()

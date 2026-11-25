@@ -431,10 +431,35 @@ func TestErrorsNeverContainTokens(t *testing.T) {
 }
 
 func TestValidate(t *testing.T) {
-	if (Config{}).Validate() == nil || (Config{Endpoint: "ftp://x", AppID: "a"}).Validate() == nil {
-		t.Fatal("invalid configuration accepted")
+	for _, cfg := range []Config{
+		{AppID: "a"},
+		{Endpoint: "https://auth.example"},
+	} {
+		if err := cfg.Validate(); !errors.Is(err, ErrMissingConfig) {
+			t.Errorf("Validate() = %v, want ErrMissingConfig", err)
+		}
 	}
-	if err := (Config{Endpoint: "https://auth.example", AppID: "a"}).Validate(); err != nil {
-		t.Fatal(err)
+	if err := (Config{Endpoint: "ftp://x", AppID: "a"}).Validate(); err == nil {
+		t.Error("Validate() accepted an unsupported scheme")
+	}
+
+	for _, endpoint := range []string{
+		"https://auth.example",
+		"https://auth.example/tenant/",
+		"http://auth.example:8080/tenant/",
+		"https://auth.example/tenant%3F%23/",
+	} {
+		if err := (Config{Endpoint: endpoint, AppID: "a"}).Validate(); err != nil {
+			t.Errorf("Validate(%q) = %v", endpoint, err)
+		}
+	}
+
+	const wantError = "logto: the tenant endpoint must not contain a query or fragment"
+	for _, suffix := range []string{"?mode=test", "#login", "?", "#"} {
+		endpoint := "https://auth.example/tenant" + suffix
+		err := (Config{Endpoint: endpoint, AppID: "a"}).Validate()
+		if err == nil || err.Error() != wantError {
+			t.Errorf("Validate(%q) = %v, want %q", endpoint, err, wantError)
+		}
 	}
 }

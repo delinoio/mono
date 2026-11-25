@@ -13,6 +13,20 @@ import (
 	"connectrpc.com/connect"
 )
 
+// CredentialError reports a terminal TokenSource failure or an empty token.
+// The SDK wraps it in a *connect.Error with the code unauthenticated.
+type CredentialError struct{ err error }
+
+func (e *CredentialError) Error() string {
+	if e.err == nil {
+		return "tide: token source returned an empty token"
+	}
+	return "tide: token source: " + e.err.Error()
+}
+
+// Unwrap returns the error from the token source, if any.
+func (e *CredentialError) Unwrap() error { return e.err }
+
 // PathSize is a local or guest path with its size in bytes.
 type PathSize struct {
 	Path string
@@ -62,6 +76,8 @@ const (
 	// PathRuleInvalidWindowsName: the path is not valid on a Windows guest
 	// (a reserved name, a reserved character, or a trailing space or dot).
 	PathRuleInvalidWindowsName
+	// PathRuleInvalidUTF8: a local path contains invalid UTF-8.
+	PathRuleInvalidUTF8
 )
 
 // String returns the stable identifier of r.
@@ -71,23 +87,31 @@ func (r PathRule) String() string {
 		return "case_collision"
 	case PathRuleInvalidWindowsName:
 		return "invalid_windows_name"
+	case PathRuleInvalidUTF8:
+		return "invalid_utf8"
 	}
 	return fmt.Sprintf("PathRule(%d)", int(r))
 }
 
 // PathRuleError reports local paths that break a path rule of sync. The SDK
-// returns it before any upload, wrapped in a *connect.Error with the code
-// failed_precondition.
+// returns it before it takes the sync lock or uploads anything, wrapped in a
+// *connect.Error with the code failed_precondition.
 type PathRuleError struct {
 	Rule PathRule
 	// Paths lists the paths. For a case collision, each group lists the
-	// paths that differ only in case.
+	// paths that differ only in case. For other rules, each group has one path.
 	Paths [][]string
 }
 
 func (e *PathRuleError) Error() string {
 	parts := make([]string, 0, len(e.Paths))
 	for _, g := range e.Paths {
+		if e.Rule == PathRuleInvalidUTF8 {
+			for _, path := range g {
+				parts = append(parts, fmt.Sprintf("%q", path))
+			}
+			continue
+		}
 		parts = append(parts, strings.Join(g, " and "))
 	}
 	switch e.Rule {
@@ -95,6 +119,8 @@ func (e *PathRuleError) Error() string {
 		return "paths differ only in case, and the guest file system ignores case: " + strings.Join(parts, "; ")
 	case PathRuleInvalidWindowsName:
 		return "paths are not valid on a Windows guest: " + strings.Join(parts, ", ")
+	case PathRuleInvalidUTF8:
+		return "paths are not valid UTF-8: " + strings.Join(parts, ", ")
 	}
 	return "paths break a sync rule: " + strings.Join(parts, "; ")
 }

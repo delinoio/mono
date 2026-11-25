@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"connectrpc.com/connect"
@@ -39,7 +38,7 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 	links.OnRemoval(link.RemovalHook{
 		Name: "work",
 		Prepare: func(ctx context.Context, orgID string) error {
-			return e.cleanUpRunners(ctx, orgID, func(*Runner) bool { return true })
+			return e.cleanUpOrganizationRunners(ctx, orgID)
 		},
 		InTx: func(ctx context.Context, tx pgx.Tx, orgID string) error {
 			ended, err := e.endOpenTx(ctx, tx, orgID, "", RequestEnd{State: reqCanceled, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_INTEGRATION_REMOVED})
@@ -51,54 +50,78 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 	profiles.OnDeletion(profile.DeletionHook{
 		Name: "work",
 		Prepare: func(ctx context.Context, orgID, profileID string) error {
-			// Warm runners and runners that wait for work go; busy runners
-			// and runners that start for a request finish their work.
 			return e.cleanUpRunners(ctx, orgID, func(r *Runner) bool {
-				if r.ProfileID != profileID || r.State == runBusy {
-					return false
-				}
-				return r.RequestID == "" || r.State == runWaiting
+				return r.ProfileID == profileID && r.State != runBusy && (r.RequestID == "" || r.State == runWaiting)
 			})
 		},
-		InTx: func(ctx context.Context, tx pgx.Tx, orgID, profileID string) error {
-			ended, err := e.endQueuedTx(ctx, tx, orgID, profileID, RequestEnd{State: reqCanceled, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_PROFILE_DELETED})
-			e.pendingReleases.Store("profile/"+profileID, ended)
-			return err
-		},
-		AfterCommit: func(ctx context.Context, orgID, profileID string) { e.releasePending(ctx, "profile/"+profileID) },
+		InTx: e.deleteProfileWorkTx,
 	})
-	unmark := func(ctx context.Context, orgID string) {
-		if _, err := r.Service.DB.Pool.Exec(context.WithoutCancel(ctx), "UPDATE ownsand_links SET removing = false WHERE organization_id = $1", orgID); err != nil {
-			r.Service.Logger.WarnContext(ctx, "ownsand_link_unmark_failed", slog.String("organization_id", orgID), slog.Any("error", err))
-		}
-	}
 	r.OnOrganizationDeletion(api.OrganizationDeletionHook{
 		Name: "work",
-		Prepare: func(ctx context.Context, d api.OrganizationDeletion) error {
-			// Stop dispatch first, then delete every runner. The organization
-			// rows (and with them the requests, runners and the link) are
-			// deleted by the core in the same transaction as InTx.
-			if _, err := r.Service.DB.Pool.Exec(ctx, "UPDATE ownsand_links SET removing = true WHERE organization_id = $1", d.OrganizationID); err != nil {
-				return err
+		Prepare: func(ctx context.Context, d api.OrganizationDeletion) (api.OrganizationDeletionSteps, error) {
+			claim, err := links.ClaimRemoval(ctx, d.OrganizationID)
+			if err != nil {
+				return api.OrganizationDeletionSteps{}, err
 			}
-			if err := e.cleanUpRunners(ctx, d.OrganizationID, func(*Runner) bool { return true }); err != nil {
-				// The core runs Abort only for the hooks before the one that
-				// failed, so this hook clears its own mark: the organization
-				// stays and its dispatch continues.
-				unmark(ctx, d.OrganizationID)
-				return err
+			if claim.HasLink() {
+				if err := e.cleanUpOrganizationRunners(ctx, d.OrganizationID); err != nil {
+					links.ReleaseRemoval(ctx, claim)
+					return api.OrganizationDeletionSteps{}, err
+				}
 			}
-			return nil
+			var ended []*Request
+			return api.OrganizationDeletionSteps{
+				Abort: func(ctx context.Context) { links.ReleaseRemoval(ctx, claim) },
+				InTx: func(ctx context.Context, tx pgx.Tx) error {
+					if err := links.CheckRemoval(ctx, tx, claim); err != nil {
+						return err
+					}
+					var err error
+					ended, err = e.endOpenTx(ctx, tx, d.OrganizationID, "", RequestEnd{State: reqCanceled, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER})
+					return err
+				},
+				AfterCommit: func(ctx context.Context) { e.releaseClaims(ctx, ended) },
+			}, nil
 		},
-		Abort: func(ctx context.Context, d api.OrganizationDeletion) { unmark(ctx, d.OrganizationID) },
-		InTx: func(ctx context.Context, tx pgx.Tx, d api.OrganizationDeletion) error {
-			ended, err := e.endOpenTx(ctx, tx, d.OrganizationID, "", RequestEnd{State: reqCanceled, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER})
-			e.pendingReleases.Store("org/"+d.OrganizationID, ended)
-			return err
-		},
-		AfterCommit: func(ctx context.Context, d api.OrganizationDeletion) { e.releasePending(ctx, "org/"+d.OrganizationID) },
 	})
 	return e
+}
+
+func (e *Engine) deleteProfileWorkTx(ctx context.Context, tx pgx.Tx, orgID, profileID string) (func(context.Context), error) {
+	// GitHub can bind a waiting runner while holding its request lock.
+	// Lock queued requests before runners to use the same order.
+	ended, err := e.endQueuedTx(ctx, tx, orgID, profileID, RequestEnd{State: reqCanceled, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_PROFILE_DELETED})
+	if err != nil {
+		return nil, err
+	}
+	// The profile lock excludes new reservations. Mark the runners that
+	// arrived after Prepare, and check their eligibility under their locks.
+	rows, err := tx.Query(ctx, `SELECT runner_id::text FROM runners WHERE organization_id = $1 AND runner_profile_id = $2
+		AND ((request_id IS NULL AND state IN ($3, $4, $5)) OR state = $6) ORDER BY runner_id FOR UPDATE`,
+		orgID, profileID, int16(runCreating), int16(runPrep), int16(runWarm), int16(runWaiting))
+	if err != nil {
+		return nil, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, err
+	}
+	var deletions []*Deletion
+	for _, id := range ids {
+		d, err := e.DeleteRunnerTx(ctx, tx, orgID, id, tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP, DeleteCleanUp)
+		if err != nil {
+			return nil, err
+		}
+		deletions = append(deletions, d)
+	}
+	return func(ctx context.Context) {
+		for _, r := range ended {
+			e.releaseClaim(ctx, r)
+		}
+		for _, d := range deletions {
+			e.FinishDeletion(ctx, d)
+		}
+	}, nil
 }
 
 // releasePending releases the vendor claims of the requests that a clean-up
@@ -108,11 +131,40 @@ func (e *Engine) releasePending(ctx context.Context, key string) {
 	if !ok {
 		return
 	}
-	for _, r := range v.([]*Request) {
+	e.releaseClaims(ctx, v.([]*Request))
+}
+
+func (e *Engine) releaseClaims(ctx context.Context, requests []*Request) {
+	for _, r := range requests {
 		if r.State == reqCanceled {
 			e.releaseClaim(ctx, r)
 		}
 	}
+}
+
+// cleanUpOrganizationRunners runs before the organization loses its OwnSand
+// key. List pending terminal work after cleaning open runners because an open
+// runner can fail to start during cleanup.
+func (e *Engine) cleanUpOrganizationRunners(ctx context.Context, orgID string) error {
+	if err := e.cleanUpRunners(ctx, orgID, func(*Runner) bool { return true }); err != nil {
+		return err
+	}
+	rows, err := e.svc.DB.Pool.Query(ctx, "SELECT runner_id::text FROM runners WHERE organization_id = $1 AND sandbox_cleanup AND state IN ($2, $3)",
+		orgID, int16(runDeleted), int16(runFailed))
+	if err != nil {
+		return err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, id := range ids {
+		if err := e.cleanUpEnded(ctx, id, orgID); err != nil {
+			errs = append(errs, fmt.Errorf("clean up sandbox of ended runner %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // cleanUpRunners deletes the open runners that match: each one is DELETING
@@ -129,16 +181,18 @@ func (e *Engine) cleanUpRunners(ctx context.Context, orgID string, match func(*R
 		if !match(r) {
 			continue
 		}
-		if r.State != runDeleting {
-			if _, err := e.deleteRunner(ctx, orgID, r.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP, DeleteCleanUp); err != nil {
-				if isCode(err, connect.CodeNotFound) {
-					// The dispatcher removed a runner whose sandbox
-					// OwnSand never created (no capacity) after the list.
-					continue
-				}
-				errs = append(errs, err)
+		r, err := e.deleteRunnerMatching(ctx, orgID, r.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP, DeleteCleanUp, match)
+		if err != nil {
+			if isCode(err, connect.CodeNotFound) {
+				// OwnSand rejected the creation and the dispatcher removed
+				// the reservation after the list.
 				continue
 			}
+			errs = append(errs, err)
+			continue
+		}
+		if r == nil {
+			continue
 		}
 		if err := e.removeRegistration(ctx, r); err != nil {
 			errs = append(errs, fmt.Errorf("remove the registration of runner %s: %w", r.ID, err))
@@ -197,21 +251,15 @@ func (e *Engine) endOpenTx(ctx context.Context, tx pgx.Tx, orgID, profileID stri
 }
 
 func (e *Engine) endWhereTx(ctx context.Context, tx pgx.Tx, orgID, profileID string, states []int16, end RequestEnd) ([]*Request, error) {
-	rows, err := tx.Query(ctx, "SELECT request_id::text FROM requests WHERE organization_id = $1 AND ($2 = '' OR runner_profile_id::text = $2) AND state = ANY($3)",
+	rows, err := tx.Query(ctx, "SELECT request_id::text FROM requests WHERE organization_id = $1 AND ($2 = '' OR runner_profile_id::text = $2) AND state = ANY($3) ORDER BY request_id FOR UPDATE",
 		orgID, profileID, states)
 	if err != nil {
 		return nil, err
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		ids = append(ids, id)
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, err
 	}
-	rows.Close()
 	var out []*Request
 	for _, id := range ids {
 		r, _, err := e.endRequestTx(ctx, tx, id, end)

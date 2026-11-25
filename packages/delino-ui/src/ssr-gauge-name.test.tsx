@@ -1,32 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, expect, test } from "@rstest/core";
+import { afterEach, describe, expect, test } from "@rstest/core";
+import { cleanup, render, within } from "@testing-library/react";
 import type * as React from "react";
-import { renderToStaticMarkup } from "react-dom/server";
+import { renderToStaticMarkup, renderToString } from "react-dom/server";
 import { Meter } from "./meter.tsx";
 import { Progress } from "./progress.tsx";
 
 type GaugeCase = {
   name: string;
   slot: string;
+  role: string;
   label: string;
   /** Renders the gauge with the given extra props. */
   gauge: (props: {
     value: number | null;
     showValue?: boolean;
+    "aria-label"?: string;
     "aria-labelledby"?: string;
   }) => React.ReactElement;
 };
+
+afterEach(cleanup);
 
 const GAUGE_CASES: GaugeCase[] = [
   {
     name: "Progress",
     slot: "progress",
+    role: "progressbar",
     label: "Uploading",
     gauge: (props) => <Progress label="Uploading" {...props} />,
   },
   {
     name: "Meter",
     slot: "meter",
+    role: "meter",
     label: "Storage used",
     // The `Meter` value type excludes `null`, so the `null` case uses 0.
     gauge: ({ value, ...props }) => (
@@ -61,7 +68,7 @@ function escapeRegExp(text: string): string {
 }
 
 describe.each(GAUGE_CASES)("$name static markup name", (gaugeCase) => {
-  const { slot, label, gauge } = gaugeCase;
+  const { slot, role, label, gauge } = gaugeCase;
 
   for (const showValue of [false, true]) {
     for (const value of [40, null]) {
@@ -95,6 +102,67 @@ describe.each(GAUGE_CASES)("$name static markup name", (gaugeCase) => {
     expect(root).toContain('aria-labelledby="external"');
     expect(root.match(/aria-labelledby=/g)).toHaveLength(1);
   });
+
+  test("keeps an explicit aria-label without a label reference in static markup", () => {
+    const markup = renderToStaticMarkup(
+      gauge({ value: 40, "aria-label": "Custom name", "aria-labelledby": " " }),
+    );
+    const root = rootTag(markup, slot);
+
+    expect(root).toContain('aria-label="Custom name"');
+    expect(root).not.toMatch(/aria-labelledby="[^"]+"/);
+    expect(markup).toContain(`>${label}<`);
+  });
+
+  test.each([
+    { scenario: "no caller name", expected: label },
+    { scenario: "blank aria-label", ariaLabel: " ", expected: label },
+    {
+      scenario: "blank caller names",
+      ariaLabel: " ",
+      ariaLabelledBy: " ",
+      expected: label,
+    },
+    {
+      scenario: "explicit aria-label",
+      ariaLabel: "Custom name",
+      expected: "Custom name",
+    },
+    {
+      scenario: "both caller names",
+      ariaLabel: "Custom name",
+      ariaLabelledBy: "external",
+      expected: "External name",
+    },
+  ])(
+    "names the gauge before and after hydration with $scenario",
+    ({ ariaLabel, ariaLabelledBy, expected }) => {
+      const fixture = (
+        <>
+          <span id="external">External name</span>
+          {gauge({
+            value: 40,
+            "aria-label": ariaLabel,
+            "aria-labelledby": ariaLabelledBy,
+          })}
+        </>
+      );
+      const container = document.createElement("div");
+      container.innerHTML = renderToString(fixture);
+      document.body.append(container);
+      const serverGauge = within(container).queryByRole(role, {
+        name: expected,
+      });
+
+      render(fixture, { container, hydrate: true });
+
+      expect(serverGauge).toBeTruthy();
+      expect(within(container).getByRole(role, { name: expected })).toBe(
+        serverGauge,
+      );
+      expect(within(container).getByText(label)).toBeTruthy();
+    },
+  );
 });
 
 describe("gauge name ids", () => {

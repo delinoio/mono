@@ -289,14 +289,18 @@ func consolePipe(sandboxID string) string { return `\\.\pipe\ownsand-` + sandbox
 
 // Create boots a VM for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
-	windowsGuest := spec.GuestOS == ownsandv1.GuestOs_GUEST_OS_WINDOWS
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	switch spec.GuestOS {
 	case ownsandv1.GuestOs_GUEST_OS_LINUX:
 		if !fileExists(r.opts.Kernel) {
 			return nil, fmt.Errorf("%w: the Linux kernel is missing", vmruntime.ErrUnsupported)
 		}
-		if spec.Snapshot == nil && !fileExists(r.opts.Rootfs) {
-			return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+		if spec.Snapshot == nil {
+			if err := vmruntime.CheckLinuxBaseDiskSize(r.opts.Rootfs, spec.Resources.GetDiskGib()); err != nil {
+				return nil, err
+			}
 		}
 	case ownsandv1.GuestOs_GUEST_OS_WINDOWS:
 		if err := r.checkWindowsSpec(spec); err != nil {
@@ -308,6 +312,25 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if err := hcsLoad(); err != nil {
 		return nil, fmt.Errorf("%w: the Host Compute Service is not available: %v", vmruntime.ErrUnsupported, err)
 	}
+	return r.createVM(ctx, spec, vmCreateOps{
+		copyFile:     copyFile,
+		makeFixedVHD: makeFixedVHD,
+		growVHDX:     growVHDX,
+		createSystem: createSystem,
+	})
+}
+
+// vmCreateOps lets tests control disk preparation and detect attempts to
+// create a compute system without booting a VM.
+type vmCreateOps struct {
+	copyFile     func(context.Context, string, string) error
+	makeFixedVHD func(string, int64, bool) (int64, error)
+	growVHDX     func(string, int64) (int64, error)
+	createSystem func(string, any) (*system, error)
+}
+
+func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreateOps) (vmruntime.VM, error) {
+	windowsGuest := spec.GuestOS == ownsandv1.GuestOs_GUEST_OS_WINDOWS
 	start := time.Now()
 	if err := r.resetVMDir(spec.SandboxID, spec.Dir); err != nil {
 		return nil, err
@@ -343,9 +366,9 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		err  error
 	)
 	if windowsGuest {
-		vs, size, err = r.prepareWindowsDisk(spec)
+		vs, size, err = r.prepareWindowsDisk(ctx, spec, ops)
 	} else {
-		vs, size, err = r.prepareLinuxDisk(spec)
+		vs, size, err = r.prepareLinuxDisk(ctx, spec, ops)
 	}
 	if err != nil {
 		cleanup()
@@ -355,10 +378,19 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	vs.VCPUs, vs.MemoryMiB = spec.Resources.GetVcpuCount(), spec.Resources.GetMemoryMib()
 	diskReady := time.Now()
 	r.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		r.mu.Unlock()
+		cleanup()
+		return nil, err
+	}
 	r.vms[spec.SandboxID] = v
 	r.mu.Unlock()
 
-	sys, err := createSystem(systemID(v.id), newComputeSystemDoc(vs))
+	if err := ctx.Err(); err != nil {
+		cleanup()
+		return nil, err
+	}
+	sys, err := ops.createSystem(systemID(v.id), newComputeSystemDoc(vs))
 	if err != nil {
 		cleanup()
 		return nil, err
@@ -370,6 +402,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		<-sys.exited
 		v.markExited()
 	}()
+	if err := ctx.Err(); err != nil {
+		cleanup()
+		return nil, err
+	}
 	props, err := sys.properties()
 	if err == nil {
 		v.runtimeID, err = guid.FromString(props.RuntimeID)
@@ -377,6 +413,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if err != nil {
 		cleanup()
 		return nil, fmt.Errorf("hcsrt: read the VM runtime ID: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		cleanup()
+		return nil, err
 	}
 	if err := sys.start(); err != nil {
 		cleanup()
@@ -419,7 +459,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 
 // prepareLinuxDisk makes the fixed VHD of a Linux guest from the root file
 // system or a snapshot disk.
-func (r *Runtime) prepareLinuxDisk(spec vmruntime.Spec) (vmSpec, int64, error) {
+func (r *Runtime) prepareLinuxDisk(ctx context.Context, spec vmruntime.Spec, ops vmCreateOps) (vmSpec, int64, error) {
 	if err := grantVMGroup(r.opts.Kernel, accessRead, false); err != nil {
 		return vmSpec{}, 0, err
 	}
@@ -428,12 +468,23 @@ func (r *Runtime) prepareLinuxDisk(spec vmruntime.Spec) (vmSpec, int64, error) {
 		src, hasFooter = filepath.Join(spec.Snapshot.Dir, snapDisk), true
 	}
 	disk := filepath.Join(spec.Dir, diskFile)
-	// A create is bound to the agent lifetime, not to a channel, so its copy
-	// is not interrupted.
-	if err := copyFile(context.Background(), src, disk); err != nil {
+	if err := ops.copyFile(ctx, src, disk); err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
 	}
-	size, err := makeFixedVHD(disk, spec.Resources.GetDiskGib()<<30, hasFooter)
+	if err := ctx.Err(); err != nil {
+		return vmSpec{}, 0, err
+	}
+	diskGiB := spec.Resources.GetDiskGib()
+	// The local image builder can replace the source between the check and the copy.
+	if !hasFooter {
+		if err := vmruntime.CheckLinuxBaseDiskSize(disk, diskGiB); err != nil {
+			return vmSpec{}, 0, fmt.Errorf("hcsrt: check copied disk: %w", err)
+		}
+	}
+	size, err := ops.makeFixedVHD(disk, diskGiB<<30, hasFooter)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return vmSpec{}, 0, ctxErr
+	}
 	if err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
 	}

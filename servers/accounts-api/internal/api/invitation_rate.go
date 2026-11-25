@@ -53,25 +53,21 @@ func resourceExhausted(msg string) error {
 	return connect.NewError(connect.CodeResourceExhausted, errors.New(msg))
 }
 
-// enforceInvitationRate fails with resource_exhausted when one more invitation
-// from userID to the address with emailKey would exceed a limit at now. It
-// must run in the CreateInvitation transaction after the billing account lock
-// and before the insert.
-//
-// Two transaction-scoped advisory locks serialize the count and the insert for
-// one inviter and for one address, so concurrent calls cannot pass the same
-// count and exceed a limit. The lock order is the billing account (taken by
-// the caller), the inviter, then the address. The advisory locks release at
-// the end of the transaction, after the new row is committed or rolled back.
-// No other code path takes an advisory lock of these kinds, and no path takes
-// them before the account lock, so the order cannot deadlock.
-func (h *BillingAccountHandler) enforceInvitationRate(ctx context.Context, tx pgx.Tx, accountID, userID, emailKey string, now time.Time) error {
+// lockInvitationRate takes transaction-scoped locks for the inviter and
+// recipient, in that order, after the caller has locked the billing account.
+// Hold all three locks through commit so concurrent calls cannot pass the
+// same count and exceed either limit.
+func lockInvitationRate(ctx context.Context, tx pgx.Tx, userID, emailKey string) error {
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('invitation_rate_inviter:' || $1::text, 0))`, userID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('invitation_rate_email:' || $1::text, 0))`, emailKey); err != nil {
-		return err
-	}
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('invitation_rate_email:' || $1::text, 0))`, emailKey)
+	return err
+}
+
+// enforceInvitationRate checks both limits at now while the transaction
+// holds the invitation rate locks.
+func (h *BillingAccountHandler) enforceInvitationRate(ctx context.Context, tx pgx.Tx, accountID, userID, emailKey string, now time.Time) error {
 	since := now.Add(-invitationRateWindow)
 	checks := []struct {
 		kind  invitationLimitKind

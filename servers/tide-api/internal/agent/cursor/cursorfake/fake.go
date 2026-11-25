@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,19 @@ import (
 type Request struct {
 	ID          string `json:"id"`
 	CreatedAtMs int64  `json:"createdAtMs"`
+}
+
+// Page is one scripted pending-list response.
+type Page struct {
+	Requests      []Request `json:"requests"`
+	NextPageToken string    `json:"nextPageToken,omitempty"`
+	StreamCursor  string    `json:"streamCursor"`
+}
+
+// ListCall records the token and arrival time of a pending-list call.
+type ListCall struct {
+	PageToken string
+	At        time.Time
 }
 
 // Fake is the fake Cursor API.
@@ -40,13 +54,17 @@ type Fake struct {
 	// connected are the worker IDs whose worker is connected.
 	connected map[string]bool
 	// Failed and Released record the fail messages and releases by request.
-	failed   map[string]string
-	released map[string]int
-	claimsN  map[string]int
-	streams  map[int]chan string
-	nextID   int
-	lists    int
-	auth     []string
+	failed        map[string]string
+	failAttempts  map[string]int
+	released      map[string]int
+	claimsN       map[string]int
+	streams       map[int]chan string
+	nextID        int
+	pages         []Page
+	listCalls     []ListCall
+	claimCalls    []string
+	streamCursors []string
+	auth          []string
 	// failClaimCalls makes release and fail answer 503.
 	failClaimCalls bool
 }
@@ -54,7 +72,7 @@ type Fake struct {
 // New starts a fake for a pool with one service account key.
 func New(t testing.TB, key, pool string) *Fake {
 	f := &Fake{Key: key, Pool: pool, claims: map[string]string{}, connected: map[string]bool{}, failed: map[string]string{},
-		released: map[string]int{}, claimsN: map[string]int{}, streams: map[int]chan string{}}
+		failAttempts: map[string]int{}, released: map[string]int{}, claimsN: map[string]int{}, streams: map[int]chan string{}}
 	f.Server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(func() {
 		f.DropStreams()
@@ -90,10 +108,15 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
-		f.lists++
-		list := append([]Request{}, f.pending...)
+		f.listCalls = append(f.listCalls, ListCall{PageToken: r.URL.Query().Get("pageToken"), At: time.Now()})
+		var page Page
+		if len(f.pages) > 0 {
+			page, f.pages = f.pages[0], f.pages[1:]
+		} else {
+			page = Page{Requests: append([]Request{}, f.pending...), StreamCursor: fmt.Sprintf("cursor-%d", time.Now().UnixNano())}
+		}
 		f.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"requests": list, "streamCursor": fmt.Sprintf("cursor-%d", time.Now().UnixNano())})
+		writeJSON(w, http.StatusOK, page)
 	case r.Method == http.MethodGet && path == "/v0/private-workers/pending-requests/stream":
 		f.stream(w, r)
 	case r.Method == http.MethodPost && path == "/v0/private-workers/claim":
@@ -107,6 +130,7 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		f.claimCalls = append(f.claimCalls, body.ID)
 		if _, ok := f.claims[body.ID]; ok {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "already claimed"})
 			return
@@ -131,6 +155,9 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		id, action, _ := strings.Cut(rest, "/")
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if action == "fail" {
+			f.failAttempts[id]++
+		}
 		if f.failClaimCalls {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
 			return
@@ -183,7 +210,11 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *Fake) stream(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("cursor") == "" || r.URL.Query().Get("pool") != f.Pool {
+	cursor := r.URL.Query().Get("cursor")
+	f.mu.Lock()
+	f.streamCursors = append(f.streamCursors, cursor)
+	f.mu.Unlock()
+	if cursor == "" || r.URL.Query().Get("pool") != f.Pool {
 		writeJSON(w, http.StatusGone, map[string]string{"code": "cursor_expired"})
 		return
 	}
@@ -277,7 +308,23 @@ func (f *Fake) Streams() int {
 func (f *Fake) Lists() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.lists
+	return len(f.listCalls)
+}
+
+// ScriptPages serves the given pages in order before returning to the
+// normal pending list.
+func (f *Fake) ScriptPages(pages ...Page) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pages = slices.Clone(pages)
+}
+
+// WatchCalls returns pending-list calls, attempted claim IDs and stream
+// cursors in the order they arrived at each endpoint.
+func (f *Fake) WatchCalls() (lists []ListCall, claims, streams []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.listCalls), slices.Clone(f.claimCalls), slices.Clone(f.streamCursors)
 }
 
 // Claim returns the worker ID of the live claim of a request.
@@ -301,6 +348,13 @@ func (f *Fake) Failed(id string) (string, bool) {
 	defer f.mu.Unlock()
 	m, ok := f.failed[id]
 	return m, ok
+}
+
+// FailAttempts returns how often the fail endpoint was called for a request.
+func (f *Fake) FailAttempts(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.failAttempts[id]
 }
 
 // Released returns how often the claim of a request was released.

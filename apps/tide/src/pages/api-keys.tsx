@@ -13,10 +13,10 @@ import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Empty,
-  ErrorNotice,
   FormDialog,
-  Loading,
+  ListPagination,
   PageHeader,
+  QueryBoundary,
   SecretDialog,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
@@ -53,7 +53,6 @@ export function ApiKeysPage() {
   const [nameError, setNameError] = useState<string>();
   const [secret, setSecret] = useState<string>();
   const [revoking, setRevoking] = useState<ApiKey>();
-  const keys = list.data?.pages.flatMap((p) => p.apiKeys) ?? [];
 
   return (
     <>
@@ -64,55 +63,49 @@ export function ApiKeysPage() {
           <Button onClick={() => setCreating(true)}>Create API key</Button>
         }
       />
-      {list.isPending ? (
-        <Loading label="Loading API keys" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : keys.length === 0 ? (
-        <Empty title="No personal API keys">
-          Create a key for a coding agent that uses dev sessions.
-        </Empty>
-      ) : (
-        <ul className="list" aria-label="Personal API keys">
-          {keys.map((k) => (
-            <li key={k.apiKeyId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">
-                  {k.name} · {labels.apiKeyState[k.state]}
-                </span>
-                <span className="muted">
-                  <code>{k.displayPrefix}…</code> · created{" "}
-                  {formatTime(k.createdAt)} ·{" "}
-                  {k.expiresAt === undefined
-                    ? "does not expire"
-                    : `expires ${formatTime(k.expiresAt)}`}{" "}
-                  · last used{" "}
-                  {k.lastUsedAt === undefined
-                    ? "never"
-                    : formatTime(k.lastUsedAt)}
-                </span>
-              </div>
-              {k.state === ApiKeyState.ACTIVE ? (
-                <Button
-                  variant={ButtonVariant.Danger}
-                  size={ButtonSize.Small}
-                  onClick={() => setRevoking(k)}
-                >
-                  Revoke
-                </Button>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      )}
-      {list.hasNextPage ? (
-        <Button
-          variant={ButtonVariant.Secondary}
-          onClick={() => void list.fetchNextPage()}
-        >
-          Show more
-        </Button>
-      ) : null}
+      <QueryBoundary query={list} loading="Loading API keys">
+        {(data) => {
+          const keys = data.pages.flatMap((p) => p.apiKeys);
+          return keys.length === 0 ? (
+            <Empty title="No personal API keys">
+              Create a key for a coding agent that uses dev sessions.
+            </Empty>
+          ) : (
+            <ul className="list" aria-label="Personal API keys">
+              {keys.map((k) => (
+                <li key={k.apiKeyId} className="list-row">
+                  <div className="list-main">
+                    <span className="list-title">
+                      {k.name} · {labels.apiKeyState[k.state]}
+                    </span>
+                    <span className="muted">
+                      <code>{k.displayPrefix}…</code> · created{" "}
+                      {formatTime(k.createdAt)} ·{" "}
+                      {k.expiresAt === undefined
+                        ? "does not expire"
+                        : `expires ${formatTime(k.expiresAt)}`}{" "}
+                      · last used{" "}
+                      {k.lastUsedAt === undefined
+                        ? "never"
+                        : formatTime(k.lastUsedAt)}
+                    </span>
+                  </div>
+                  {k.state === ApiKeyState.ACTIVE ? (
+                    <Button
+                      variant={ButtonVariant.Danger}
+                      size={ButtonSize.Small}
+                      onClick={() => setRevoking(k)}
+                    >
+                      Revoke
+                    </Button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          );
+        }}
+      </QueryBoundary>
+      <ListPagination query={list} />
       <FormDialog
         open={creating}
         onOpenChange={(open) => {
@@ -125,7 +118,7 @@ export function ApiKeysPage() {
         title="Create a personal API key"
         description="The key authenticates as you, but only on dev session calls."
         submitLabel="Create key"
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           const trimmed = name.trim();
           if (trimmed === "" || trimmed.length > 64) {
             setNameError(
@@ -142,6 +135,7 @@ export function ApiKeysPage() {
                 ? undefined
                 : timestampFromMs(Date.now() + days * DAY_MS),
           });
+          if (!opening.isCurrent()) return;
           setCreating(false);
           setName("");
           setSecret(res.secret);
