@@ -1181,6 +1181,42 @@ func TestReadCopyZeroSizeProcfs(t *testing.T) {
 	}
 }
 
+func TestReadCopySysfsSizeMismatch(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("sysfs exists only on Linux")
+	}
+	const path = "/sys/devices/system/cpu/online"
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Skipf("stat %s: %v", path, err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("read %s: %v", path, err)
+	}
+	if len(content) <= 2 || info.Size() == int64(len(content)) {
+		t.Skipf("%s does not provide a mismatched size and a readable suffix at offset 2", path)
+	}
+
+	h := newHarness(t, nil)
+	req := readReq(t, path)
+	data, size, errd := h.readAll(req)
+	if errd != nil || size != int64(len(content)) || !bytes.Equal(data, content) {
+		t.Fatalf("sysfs read: %d bytes, final size %d, error %v; want %d bytes", len(data), size, errd, len(content))
+	}
+
+	req.Offset = 2
+	suffix, resumedSize, errd := h.readAll(req)
+	if errd != nil || resumedSize != size || !bytes.Equal(suffix, content[2:]) {
+		t.Fatalf("resumed sysfs read: %d bytes, final size %d, error %v", len(suffix), resumedSize, errd)
+	}
+
+	req.Offset = size + 1
+	if _, _, errd := h.readAll(req); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_OUT_OF_RANGE {
+		t.Fatalf("sysfs read beyond the snapshot size: %v", errd)
+	}
+}
+
 func TestReadCopyEmptyFileAndSizeChange(t *testing.T) {
 	h := newHarness(t, nil)
 	h.srv.reads.forceCopy = true

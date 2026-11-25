@@ -6,7 +6,6 @@ package guest
 
 import "os"
 
-// isProcfs is always false: procfs exists only on Linux guests.
-func isProcfs(f *os.File) bool {
+func allowsSnapshotSizeMismatch(*os.File, int64) bool {
 	return false
 }

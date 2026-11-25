@@ -415,11 +415,7 @@ func (m *readManager) makeSnapshot(src, dst string) (kind SnapshotKind, size int
 	if !sourceUnchanged(before, in, src) {
 		return 0, 0, true, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
-	after := before
-	// The copied byte count must equal the stat size, except for a procfs
-	// file: it reports st_size 0 although a read returns bytes, so its
-	// snapshot size is the byte count of the copy.
-	if n != after.Size() && !(before.Size() == 0 && isProcfs(in)) {
+	if n != before.Size() && !allowsSnapshotSizeMismatch(in, before.Size()) {
 		return 0, 0, true, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
 	return SnapshotKindCopy, n, true, nil
