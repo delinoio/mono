@@ -49,6 +49,7 @@ func wireToFileMode(wire uint32) fs.FileMode {
 // or reopening a retained staging file.
 var (
 	closeStagingFile = (*os.File).Close
+	chmodStagingFile = (*os.File).Chmod
 	renameFile       = os.Rename
 	openStagingFile  = os.OpenFile
 )
@@ -65,12 +66,15 @@ type finishFields struct {
 }
 
 type writeEntry struct {
-	mu         sync.Mutex
-	id         string // write_id
-	path       string // exact path string of the binding
-	target     string // path that the finish renames to
-	tmp        string
-	file       *os.File
+	mu     sync.Mutex
+	id     string // write_id
+	path   string // exact path string of the binding
+	target string // path that the finish renames to
+	tmp    string
+	file   *os.File
+	// modeFile keeps the original Unix object accessible after a failed
+	// finish, even if its mode denies read and write access.
+	modeFile   *os.File
 	ranges     []span
 	lastChunk  time.Time
 	finished   bool
@@ -357,16 +361,36 @@ func (e *writeEntry) ensureOpen() error {
 	if e.file != nil || e.finished {
 		return nil
 	}
-	if err := restoreStagingMode(e.tmp); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return e.retire()
+	if e.modeFile != nil {
+		if e.identity == nil {
+			// The first identity lookup can fail. The retained descriptor
+			// still refers to the original staging file.
+			identity, err := identityOfFile(e.modeFile)
+			if err != nil {
+				return fsError("write", err)
+			}
+			e.identity = &identity
 		}
-		return fsError("write", err)
+		if err := e.checkStagingPath(); err != nil {
+			return err
+		}
+		// The name can change after the check. Only the original object
+		// can receive the permission change.
+		if err := chmodStagingFile(e.modeFile, 0o600); err != nil && !errors.Is(err, errors.ErrUnsupported) {
+			return fsError("write", err)
+		}
 	}
-	f, err := openStagingFile(e.tmp, os.O_RDWR, 0)
+	f, err := openStagingFile(e.tmp, stagingReopenFlags, 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return e.retire()
+		}
+		if e.modeFile != nil {
+			// A replacement may also cause open to fail (for example, if
+			// the replacement is read-only).
+			if err := e.checkStagingPath(); err != nil {
+				return err
+			}
 		}
 		return fsError("write", err)
 	}
@@ -382,7 +406,29 @@ func (e *writeEntry) ensureOpen() error {
 		}
 	}
 	e.file = f
+	e.closeModeFile()
 	return nil
+}
+
+func (e *writeEntry) checkStagingPath() error {
+	current, err := identityOfPath(e.tmp)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return e.retire()
+	case err != nil:
+		return fsError("write", err)
+	case current != *e.identity:
+		return e.retire()
+	default:
+		return nil
+	}
+}
+
+func (e *writeEntry) closeModeFile() {
+	if e.modeFile != nil {
+		e.modeFile.Close()
+		e.modeFile = nil
+	}
 }
 
 // retire marks the write gone and returns the not_found outcome. The sweep
@@ -414,9 +460,17 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 	if err := e.file.Sync(); err != nil {
 		return fsError("write", err)
 	}
+	// Keep access to the file before closing it. If duplication fails, the
+	// original handle stays open and the finish can retry.
+	modeFile, err := duplicateStagingFile(e.file)
+	if err != nil {
+		return fsError("write", err)
+	}
 	closeErr := closeStagingFile(e.file)
-	// Close releases the handle even on error. The next call can reopen it.
+	// Close releases the handle even on error. Keep the duplicate until
+	// it is no longer needed for retry or cleanup.
 	e.file = nil
+	e.modeFile = modeFile
 	if closeErr != nil {
 		return fsError("write", closeErr)
 	}
@@ -433,6 +487,7 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 		_ = e.ensureOpen()
 		return fsError("write", err)
 	}
+	e.closeModeFile()
 	return nil
 }
 
@@ -458,6 +513,7 @@ func (m *writeManager) sweep(now time.Time) {
 			if err := m.cleanup(e); err != nil {
 				m.logger.Warn("clean up write failed", "write_id", id, "error", sanitizedError(err))
 			} else {
+				e.closeModeFile()
 				delete(m.entries, id)
 				m.expired[id] = now
 				m.logger.Info("write expired", "write_id", id, "finished", e.finished, "recovered", e.recovered)
