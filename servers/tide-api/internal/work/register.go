@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
@@ -271,67 +270,4 @@ func (e *Engine) endWhereTx(ctx context.Context, tx pgx.Tx, orgID, profileID str
 		}
 	}
 	return out, nil
-}
-
-// RunGauges is the lease component that records tide_requests and
-// tide_runners.
-func (e *Engine) RunGauges(ctx context.Context) error {
-	seenReq, seenRun := map[[3]string]bool{}, map[[3]string]bool{}
-	t := time.NewTicker(e.timing.GaugeInterval)
-	defer t.Stop()
-	for {
-		e.recordGauges(ctx, seenReq, seenRun)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.C:
-		}
-	}
-}
-
-func (e *Engine) recordGauges(ctx context.Context, seenReq, seenRun map[[3]string]bool) {
-	now := map[[3]string]int64{}
-	rows, err := e.svc.DB.Pool.Query(ctx, "SELECT kind, priority, state, count(*) FROM requests WHERE state = ANY($1) GROUP BY kind, priority, state", openRequestStates)
-	if err != nil {
-		return
-	}
-	for rows.Next() {
-		var kind, prio, state int16
-		var n int64
-		if rows.Scan(&kind, &prio, &state, &n) == nil {
-			now[[3]string{kindLabel(tidev1.WorkloadKind(kind)), priorityLabel(tidev1.Priority(prio)), reqStateLabel(tidev1.RequestState(state))}] = n
-		}
-	}
-	rows.Close()
-	for k := range seenReq {
-		if _, ok := now[k]; !ok {
-			now[k] = 0
-		}
-	}
-	for k, n := range now {
-		seenReq[k] = true
-		e.m.Requests(k[0], k[1], k[2], n)
-	}
-	now = map[[3]string]int64{}
-	rows, err = e.svc.DB.Pool.Query(ctx, "SELECT kind, guest_os, state, count(*) FROM runners WHERE state = ANY($1) GROUP BY kind, guest_os, state", openRunnerStates)
-	if err != nil {
-		return
-	}
-	for rows.Next() {
-		var kind, guest, state int16
-		var n int64
-		if rows.Scan(&kind, &guest, &state, &n) == nil {
-			now[[3]string{kindLabel(tidev1.WorkloadKind(kind)), guestLabel(tidev1.GuestOs(guest)), runStateLabel(tidev1.RunnerState(state))}] = n
-		}
-	}
-	rows.Close()
-	for k := range seenRun {
-		if _, ok := now[k]; !ok {
-			now[k] = 0
-		}
-	}
-	for k, n := range now {
-		seenRun[k] = true
-		e.m.Runners(k[0], k[1], k[2], n)
-	}
 }

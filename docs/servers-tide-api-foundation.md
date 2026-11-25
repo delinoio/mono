@@ -530,6 +530,7 @@ If `METRICS_ADDR` is empty, Tide starts without a metrics listener. If the confi
 | `tide_dev_session_transfer_bytes_total`   | counter   | `direction`, `guest_os`       |
 
 - Implementation status: `tide_ownsand_calls_total`, `tide_requests`, `tide_request_queue_wait_seconds` (recorded when a request leaves `QUEUED`), `tide_requests_ended_total`, `tide_runners`, `tide_runner_start_seconds` (creation until `WARM`, `WAITING_FOR_WORK` or `BUSY`), `tide_dev_session_execs_total`, `tide_dev_session_transfer_bytes_total` `tide_webhook_deliveries_total` (GitHub and OpenAI), `tide_vendor_watch_reconnects_total` (`vendor` `CURSOR` or `DEVIN`) and `tide_claude_orchestrator_restarts_total` (an orchestrator that exited or did not start) are recorded; the lease holder records the two gauges every 15 seconds.
+- Each gauge keeps its last complete sample if its grouped query fails. An error in one query does not prevent the other gauge from updating. A complete sample reports zero for groups seen earlier in the lease period that are now absent.
 - The `kind` label includes `DEV_SESSION`. `tide_dev_session_execs_total` counts ended dev session execs by `result` (`exited`, `failed`, `sandbox_ended`). `tide_dev_session_transfer_bytes_total` counts the file bytes that `tide-api` relays, with `direction` `upload` or `download`, so that operators can see the Droplet bandwidth that dev sessions use.
 
 - A webhook delivery that the server rejects for a missing or invalid signature counts with `result` `invalid_signature`.
