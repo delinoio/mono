@@ -356,7 +356,10 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 	jw := &execJSONWriter{a: a, binary: *binary}
 	onEvent := func(ev ownsand.ExecEvent) error {
 		if jsonMode {
-			return jw.event(ev)
+			if err := jw.event(ev); err != nil {
+				return &localWriteError{err: err}
+			}
+			return nil
 		}
 		switch ev.Kind {
 		case ownsand.ExecEventStdout:
@@ -389,8 +392,7 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 		}
 		var lw *localWriteError
 		if errors.As(err, &lw) {
-			// The CLI received the guest output. A local write failure uses
-			// the ordinary CLI error status.
+			// A local write failure uses the ordinary CLI error status.
 			return lw.err
 		}
 		var dp *ownsand.DataPathError
@@ -893,7 +895,7 @@ func (a *app) fileWrite(ctx context.Context, name string, args []string) error {
 	return nil
 }
 
-// localWriteError identifies a failed local write of guest stdout or stderr.
+// localWriteError identifies a failed local write of an exec event or guest output.
 type localWriteError struct{ err error }
 
 func (e *localWriteError) Error() string { return e.err.Error() }
