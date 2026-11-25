@@ -261,32 +261,51 @@ func TestCursorClaimEndsBeforeRunner(t *testing.T) {
 		return ok && strings.Contains(m, "maximum queue wait")
 	})
 
-	w.cursor.AddRequest("bc-cancel", true)
-	canceled := w.requestBySource(t, "bc-cancel")
+	canceledDemand := w.cursor.AddRequest("bc-cancel", true)
+	canceled := w.requestBySource(t, canceledDemand.ID)
 	w.cancel(t, canceled.GetRequestId())
 	eventually(t, "fail at cancel", func() bool {
-		m, ok := w.cursor.Failed("bc-cancel")
+		m, ok := w.cursor.Failed(canceledDemand.ID)
 		return ok && strings.Contains(m, "canceled")
 	})
 	c, err := w.l.Agents.Claim(context.Background(), canceled.GetRequestId())
 	if err != nil || c.State != agent.ClaimReleased {
 		t.Fatalf("claim %+v %v", c, err)
 	}
-	// The same entry again: declined, so no second request.
-	createdAt, _ := strconv.ParseInt(c.DemandMarker, 10, 64)
-	w.cursor.Announce("bc-cancel", createdAt)
-	stays(t, "no second request", func() bool {
-		for _, r := range w.requests(t) {
-			if r.GetSourceKey() == "bc-cancel#2" {
-				return false
-			}
-		}
-		return true
-	})
-
-	// Deleting the profile ends the queued request and fails its turn.
+	// The admission worker handles stream events in order. Wait for the next
+	// request so the original admission has finished before replaying it.
 	w.cursor.AddRequest("bc-profile", true)
 	queued := w.requestBySource(t, "bc-profile")
+	const replayBarrier = "bc-after-replay"
+	w.cursor.Announce(canceledDemand.ID, canceledDemand.CreatedAtMs)
+	w.cursor.Announce(replayBarrier, canceledDemand.CreatedAtMs)
+	// The worker can attempt the barrier claim only after it handles the replay.
+	// Announce adds neither ID to the pending list. WatchCalls includes 404s.
+	eventually(t, "claim attempt after the replay", func() bool {
+		_, attempts, _ := w.cursor.WatchCalls()
+		return slices.Contains(attempts, replayBarrier)
+	})
+	_, attempts, _ := w.cursor.WatchCalls()
+	count := 0
+	for _, id := range attempts {
+		if id == canceledDemand.ID {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("claim attempts for %q after replay = %d, want 1", canceledDemand.ID, count)
+	}
+	if r := w.request(t, canceled.GetRequestId()); r.GetState() != tidev1.RequestState_REQUEST_STATE_CANCELED ||
+		r.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER {
+		t.Fatalf("original request after replay = %v, want canceled by user", r)
+	}
+	for _, r := range w.requests(t) {
+		if r.GetSourceKey() == canceledDemand.ID+"#2" {
+			t.Fatalf("replayed demand created a second request: %v", r)
+		}
+	}
+
+	// Deleting the profile ends the queued request and fails its turn.
 	if _, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(context.Background(), connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
 		OrganizationId: w.org.ID, RunnerProfileId: w.profileID})); err != nil {
 		t.Fatal(err)
