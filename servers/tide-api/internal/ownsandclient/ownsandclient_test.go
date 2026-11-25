@@ -6,13 +6,17 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/tide-api/internal/metrics"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
@@ -68,5 +72,47 @@ func TestInstrumentedCountsLogsAndReportsUnauthenticated(t *testing.T) {
 	}
 	if ownsandclient.Code(nil) != "ok" || ownsandclient.Code(context.Canceled) != "canceled" {
 		t.Fatal("code strings")
+	}
+}
+
+func TestSDKDeleteSandboxDeadline(t *testing.T) {
+	requests := make(chan string, 1)
+	canceled := make(chan struct{})
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.Path
+		select {
+		case <-r.Context().Done():
+			close(canceled)
+		case <-t.Context().Done():
+		}
+	}))
+	server.Config.Protocols = new(http.Protocols)
+	server.Config.Protocols.SetUnencryptedHTTP2(true)
+	server.Start()
+	t.Cleanup(server.Close)
+
+	factory := ownsandclient.SDKFactory{BaseURL: server.URL}
+	client, err := factory.New("org-1", "osk_"+strings.Repeat("a", 43))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	if _, err := client.DeleteSandbox(ctx, "sandbox-1"); connect.CodeOf(err) != connect.CodeDeadlineExceeded {
+		t.Fatalf("DeleteSandbox error = %v, want deadline_exceeded", err)
+	}
+	select {
+	case path := <-requests:
+		if path != ownsandv1connect.SandboxServiceDeleteSandboxProcedure {
+			t.Fatalf("request path = %q, want DeleteSandbox", path)
+		}
+	default:
+		t.Fatal("the server never received the DeleteSandbox attempt")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server did not observe request cancellation")
 	}
 }

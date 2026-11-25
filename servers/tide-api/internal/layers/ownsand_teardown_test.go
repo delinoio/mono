@@ -15,6 +15,7 @@ import (
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/app"
+	"github.com/delinoio/mono/servers/tide-api/internal/auth"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
@@ -220,9 +221,9 @@ func pauseTeardown(t *testing.T, w *workWorld) (wait func(context.Context), rele
 	t.Cleanup(release)
 	calls = &atomic.Int32{}
 	w.fake.SetDeleteHook(func(ctx context.Context) error {
-		// Teardown RPCs have a deadline in this test. Reconciler calls
+		// Count calls from authenticated teardown RPCs. Reconciler calls
 		// also wait, so they cannot delete the sandbox during the check.
-		if _, rpc := ctx.Deadline(); rpc && calls.Add(1) == 1 {
+		if _, rpc := auth.PrincipalFrom(ctx); rpc && calls.Add(1) == 1 {
 			close(started)
 		}
 		select {
