@@ -323,6 +323,7 @@ Gaps in the OpenAI documentation (NOT DOCUMENTED; tide implements them defensive
 ### Personal API keys
 
 - Every member can create personal API keys for themselves in an organization with `ApiKeyService.CreateApiKey`, with a name (1 to 64 characters) and an optional expiry time. A key without an expiry stays valid until it is revoked. Each user lists and revokes only their own keys.
+- After it locks the organization and caller membership rows, `CreateApiKey` checks the expiry again. If the expiry is at or before the time of that check, the RPC returns `invalid_argument` without creating a key or an audit event. A successful creation uses the post-lock time for `created_at`.
 - Secret format: `tide_` followed by 32 random bytes from a cryptographically secure source in unpadded base64url, like the [OwnSand API keys](servers-ownsand-api-foundation.md#authentication). `CreateApiKey` returns the secret once.
 - The server stores only the SHA-256 hash of the secret and a short non-secret prefix for display. A lookup hashes the presented value, loads the row by that hash and compares the stored hash in constant time. A value with the `tide_` prefix but a wrong shape gets `unauthenticated`.
 - A revoked or expired key gets `unauthenticated`. The server records the last use time of each key with at most one write per key per minute. Only an accepted use counts: a valid key that an RPC other than `DevSessionService` rejects does not change the last use time.
