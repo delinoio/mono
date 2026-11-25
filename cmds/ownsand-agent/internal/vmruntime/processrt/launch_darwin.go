@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
@@ -54,7 +55,7 @@ func init() {
 	os.Exit(0)
 }
 
-func startHelper(cmd *exec.Cmd) (helperProcess, func(), error) {
+func startHelper(cmd *exec.Cmd, _ *slog.Logger) (helperProcess, func(), error) {
 	self, err := os.Executable()
 	if err != nil {
 		return helperProcess{}, nil, err

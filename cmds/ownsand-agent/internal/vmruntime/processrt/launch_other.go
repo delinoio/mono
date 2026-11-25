@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 
-//go:build !darwin
+//go:build !darwin && !linux
 
 package processrt
 
 import (
+	"log/slog"
 	"os/exec"
 	"syscall"
 
@@ -12,7 +13,7 @@ import (
 	"github.com/delinoio/mono/internal/procgroup"
 )
 
-func startHelper(cmd *exec.Cmd) (helperProcess, func(), error) {
+func startHelper(cmd *exec.Cmd, _ *slog.Logger) (helperProcess, func(), error) {
 	procgroup.Set(cmd)
 	if err := launcher.Start(cmd); err != nil {
 		return helperProcess{}, nil, err
