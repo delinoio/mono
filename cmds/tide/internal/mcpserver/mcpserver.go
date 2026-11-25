@@ -337,19 +337,22 @@ func (s *Server) waitSession(ctx context.Context, _ *mcp.CallToolRequest, in wai
 	if err != nil {
 		return nil, sessionResult{}, err
 	}
+	singleLookup := wait == 0
+	if singleLookup {
+		wait = s.cfg.maxWait
+	}
 	wctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
-	d, err := c.WaitDevSession(wctx, tide.WaitDevSessionParams{OrganizationID: s.cfg.OrganizationID, DevSessionID: in.SessionID})
-	if err != nil && !(errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil) {
-		return nil, sessionResult{}, toolError(err)
-	}
-	if d == nil {
-		// The wait ended before the first read (wait_seconds 0).
-		res, gerr := c.DevSessions().GetDevSession(ctx, connect.NewRequest(&tidev1.GetDevSessionRequest{OrganizationId: s.cfg.OrganizationID, DevSessionId: in.SessionID}))
-		if gerr != nil {
-			return nil, sessionResult{}, toolError(gerr)
+	if singleLookup {
+		res, err := c.DevSessions().GetDevSession(wctx, connect.NewRequest(&tidev1.GetDevSessionRequest{OrganizationId: s.cfg.OrganizationID, DevSessionId: in.SessionID}))
+		if err != nil {
+			return nil, sessionResult{}, toolError(err)
 		}
-		d = res.Msg.GetDevSession()
+		return nil, sessionResult{Session: sessionOf(res.Msg.GetDevSession())}, nil
+	}
+	d, err := c.WaitDevSession(wctx, tide.WaitDevSessionParams{OrganizationID: s.cfg.OrganizationID, DevSessionID: in.SessionID})
+	if err != nil && (d == nil || ctx.Err() != nil || wctx.Err() != context.DeadlineExceeded || !errors.Is(err, context.DeadlineExceeded)) {
+		return nil, sessionResult{}, toolError(err)
 	}
 	return nil, sessionResult{Session: sessionOf(d)}, nil
 }

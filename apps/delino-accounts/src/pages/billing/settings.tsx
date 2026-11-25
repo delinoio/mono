@@ -32,7 +32,7 @@ import {
 import { BillingUsageService } from "@delino/accounts-protos/v1/usage_pb";
 import { formatUsd, toAmountInput } from "../../money.ts";
 import { can, Permission } from "../../roles.ts";
-import { RouteId, routePath, useRouter } from "../../router.tsx";
+import { parseRoute, RouteId, routePath, useRouter } from "../../router.tsx";
 
 const READ_ONLY_NOTE = "Only owners and admins can change these settings.";
 
@@ -404,9 +404,15 @@ function DeleteSection() {
         confirmLabel="Delete billing account"
         onConfirm={async () => {
           await remove.mutateAsync({ billingAccountId });
-          // Leave the deleted account first, so that the invalidation does
-          // not refetch its queries (they are now `not_found`).
-          navigate(routePath({ id: RouteId.Billing }));
+          // Read the live route after the RPC. Move off this account before
+          // refreshing because the caller can no longer read it.
+          const route = parseRoute(window.location.pathname);
+          if (
+            route.id === RouteId.BillingAccount &&
+            route.billingAccountId === billingAccountId
+          ) {
+            navigate(routePath({ id: RouteId.Billing }));
+          }
           await invalidateServices(
             queryClient,
             BillingAccountService,

@@ -369,14 +369,21 @@ func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
 		t.Fatalf("writes of the second sync = %d, want 3", n)
 	}
 
-	// Nothing changed: no lock and no upload.
+	// An unchanged sync takes and releases the lock without writing files.
 	execsBefore := srv.Calls(execProc)
+	writesBefore = srv.Calls(writeProc)
 	res, err = c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
-	if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 6 {
+	if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 6 || res.BytesSent != 0 || len(res.Warnings) != 0 {
 		t.Fatalf("unchanged sync = %+v %v", res, err)
 	}
-	if srv.Calls(execProc) != execsBefore {
-		t.Fatal("an unchanged sync ran guest commands")
+	if n := srv.Calls(execProc) - execsBefore; n != 2 {
+		t.Fatalf("guest commands of unchanged sync = %d, want lock and cleanup", n)
+	}
+	if srv.Calls(writeProc) != writesBefore {
+		t.Fatal("unchanged sync wrote to the guest")
+	}
+	if _, err := os.Stat(ds.GetWorkspacePath() + lockSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lock after unchanged sync: %v", err)
 	}
 
 	// A subdirectory of the working tree syncs only its own files.
@@ -770,8 +777,8 @@ func TestSyncInvalidUTF8(t *testing.T) {
 			t.Fatalf("unchanged sync = %+v, %v", res, err)
 		}
 	}
-	if srv.Calls(writeProc) != writes || srv.Calls(execProc) != execs {
-		t.Fatal("an unchanged sync wrote files or ran guest commands")
+	if srv.Calls(writeProc) != writes || srv.Calls(execProc)-execs != 4 {
+		t.Fatal("each unchanged sync must only run lock and cleanup commands without writing files")
 	}
 	if m := guestManifest(t, linux); !m.PathsValidated || m.Files[valid].Mode != modeFile {
 		t.Fatalf("manifest did not record the valid path %q: %+v", valid, m)
@@ -829,8 +836,10 @@ func TestSyncLegacyAmbiguousUTF8Manifest(t *testing.T) {
 				t.Fatal(err)
 			}
 			if scenario.clearMarkerOnLock {
+				cleared := false
 				srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
-					if req.GetEnv()[guestEnvForce] != "" {
+					if req.GetEnv()[guestEnvForce] != "" && !cleared {
+						cleared = true
 						legacy := m
 						legacy.PathsValidated = false
 						if err := writeManifest(legacy); err != nil {
@@ -1059,10 +1068,13 @@ func TestSyncRetryFileToDirectory(t *testing.T) {
 			if _, ok := m.Files[child]; !ok || len(m.Files) != 1 || m.Version != old.Version {
 				t.Fatalf("manifest after sync = %+v", m)
 			}
-			execs := srv.Calls(execProc)
+			writes, execs := srv.Calls(writeProc), srv.Calls(execProc)
 			res, err = sync()
-			if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 1 || srv.Calls(execProc) != execs {
+			if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 1 {
 				t.Fatalf("unchanged sync = %+v, %v", res, err)
+			}
+			if srv.Calls(writeProc) != writes || srv.Calls(execProc)-execs != 2 {
+				t.Fatal("unchanged sync must only run lock and cleanup commands without writing files")
 			}
 		})
 	}
@@ -1248,10 +1260,8 @@ func TestPruneDirsApplyAliasRecords(t *testing.T) {
 	}
 }
 
-// TestSyncPlansAgainUnderTheLock checks that a sync whose manifest changed
-// between its first read and its lock makes its plan again from the new
-// manifest: another sync that wrote a.txt and released its lock in that
-// time must not make this sync skip a.txt.
+// TestSyncPlansAgainUnderTheLock starts with a matching manifest. Another
+// sync replaces a.txt and the manifest before this sync takes the lock.
 func TestSyncPlansAgainUnderTheLock(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
@@ -1262,9 +1272,7 @@ func TestSyncPlansAgainUnderTheLock(t *testing.T) {
 	if _, err := c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	want := guestManifest(t, ds)
 	other := false
 	srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
 		if other || req.GetEnv()[guestEnvLock] == "" || req.GetEnv()[guestEnvForce] == "" {
@@ -1290,14 +1298,114 @@ func TestSyncPlansAgainUnderTheLock(t *testing.T) {
 	if !other {
 		t.Fatal("the sync took no lock")
 	}
-	if res.Uploaded != 2 || readGuest(t, ds, "a.txt") != "v1" || readGuest(t, ds, "b.txt") != "b" {
+	if res.Uploaded != 1 || readGuest(t, ds, "a.txt") != "v1" {
 		t.Fatalf("sync = %+v, a.txt = %q", res, readGuest(t, ds, "a.txt"))
 	}
-	if m := guestManifest(t, ds); len(m.Files) != 2 {
-		t.Fatalf("manifest %+v", m)
+	if m := guestManifest(t, ds); !maps.Equal(m.Files, want.Files) {
+		t.Fatalf("manifest = %+v, want %+v", m, want)
 	}
 	if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("the sync kept its lock")
+	}
+}
+
+func TestSyncUnchangedTakesLock(t *testing.T) {
+	needPOSIX(t)
+	const warning = "the guest could not release the sync lock; the next sync may need force"
+	for _, tc := range []struct {
+		name        string
+		existing    bool
+		force       bool
+		failCleanup bool
+	}{
+		{name: "held lock", existing: true},
+		{name: "force stale lock", existing: true, force: true},
+		{name: "cleanup failure", failCleanup: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			dir := newRepo(t, map[string]string{"a.txt": "v1"}, nil, "")
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(ctx, params); err != nil {
+				t.Fatal(err)
+			}
+			ws := ds.GetWorkspacePath()
+			lock := ws + lockSuffix
+			marker := filepath.Join(lock, "existing")
+			if tc.existing {
+				if err := os.Mkdir(lock, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(marker, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			readsBefore := len(srv.ReadRequests())
+			execsBefore := srv.Calls(execProc)
+			writesBefore := srv.Calls(writeProc)
+			srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+				env := req.GetEnv()
+				switch {
+				case env[guestEnvLock] == lock && env[guestEnvForce] != "":
+					if n := len(srv.ReadRequests()) - readsBefore; n != 1 {
+						t.Errorf("manifest reads before lock = %d, want 1", n)
+					}
+					if (env[guestEnvForce] == "1") != tc.force {
+						t.Errorf("force lock value = %q, force = %t", env[guestEnvForce], tc.force)
+					}
+					if tc.failCleanup {
+						srv.Fail(execProc, connect.NewError(connect.CodePermissionDenied, errors.New("cleanup denied")))
+					}
+				case env[guestEnvLock] == lock && env[guestEnvWorkspace] == "":
+					if reads := srv.ReadRequests()[readsBefore:]; len(reads) != 2 || reads[1].GetPath() != ws+manifestSuffix {
+						t.Errorf("expected a second manifest read before cleanup, got %v", reads)
+					}
+					if _, err := os.Stat(lock); err != nil {
+						t.Errorf("lock before cleanup: %v", err)
+					}
+					if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+						t.Errorf("stale lock marker before cleanup: %v", err)
+					}
+				default:
+					t.Error("unchanged sync ran an unexpected guest command")
+				}
+			}
+			var phases []TransferPhase
+			params.Force = tc.force
+			params.Progress = func(p TransferProgress) { phases = append(phases, p.Phase) }
+			res, err := c.Sync(ctx, params)
+			if srv.Calls(writeProc) != writesBefore {
+				t.Fatal("unchanged sync wrote to the guest")
+			}
+			if tc.existing && !tc.force {
+				if res != nil || !errors.Is(err, ErrSyncLocked) || connect.CodeOf(err) != connect.CodeFailedPrecondition {
+					t.Fatalf("locked sync = %+v, %v", res, err)
+				}
+				if _, err := os.Stat(marker); err != nil {
+					t.Fatalf("existing lock marker: %v", err)
+				}
+				return
+			}
+			if err != nil || res.Uploaded != 0 || res.Deleted != 0 || res.Skipped != 1 || res.BytesSent != 0 {
+				t.Fatalf("unchanged sync = %+v, %v", res, err)
+			}
+			if n := srv.Calls(execProc) - execsBefore; n != 2 {
+				t.Fatalf("guest commands = %d, want lock and cleanup", n)
+			}
+			if !slices.Equal(phases, []TransferPhase{TransferPreparing, TransferDone}) {
+				t.Fatalf("unchanged sync phases = %v", phases)
+			}
+			_, statErr := os.Stat(lock)
+			if tc.failCleanup {
+				if !slices.Equal(res.Warnings, []string{warning}) || statErr != nil {
+					t.Fatalf("cleanup failure warnings = %v, lock stat = %v", res.Warnings, statErr)
+				}
+			} else if len(res.Warnings) != 0 || !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("cleanup warnings = %v, lock stat = %v", res.Warnings, statErr)
+			}
+		})
 	}
 }
 

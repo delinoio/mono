@@ -1813,6 +1813,7 @@ export function createMockTransport(
       },
       async *watchQueue(req, ctx: HandlerContext) {
         const { org } = membership(req.organizationId);
+        const { signal } = ctx;
         const queue: MessageInitShape<typeof WatchQueueResponseSchema>[] = [];
         let wake: (() => void) | undefined;
         const watcher: Watcher = (event) => {
@@ -1839,19 +1840,19 @@ export function createMockTransport(
           for (;;) {
             while (queue.length > 0) yield queue.shift()!;
             const remaining = endAt === undefined ? 10_000 : endAt - now();
-            if (remaining <= 0) return;
+            if (remaining <= 0 || signal.aborted) return;
             await new Promise<void>((resolve) => {
-              const timer = setTimeout(resolve, Math.min(remaining, 10_000));
-              wake = () => {
+              const finish = () => {
                 clearTimeout(timer);
+                signal.removeEventListener("abort", finish);
+                wake = undefined;
                 resolve();
               };
-              ctx.signal.addEventListener("abort", () => wake?.(), {
-                once: true,
-              });
+              const timer = setTimeout(finish, Math.min(remaining, 10_000));
+              wake = finish;
+              signal.addEventListener("abort", finish);
             });
-            wake = undefined;
-            if (ctx.signal.aborted) return;
+            if (signal.aborted) return;
             if (queue.length === 0 && (endAt === undefined || now() < endAt)) {
               yield { event: { case: "keepalive", value: {} } };
             }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, expect, test } from "@rstest/core";
+import { afterEach, describe, expect, rs, test } from "@rstest/core";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { CreditService } from "@delino/accounts-protos/v1/credit_pb";
 import { BillingUsageService } from "@delino/accounts-protos/v1/usage_pb";
@@ -10,12 +10,17 @@ import {
   addUsageRows,
   ADMIN,
   createFakeApi,
+  OUTSIDER,
   VIEWER,
 } from "./testing/fake-api.ts";
 
+const DECEMBER = { year: 2026, month: 12 };
+const JANUARY = { year: 2027, month: 1 };
+const UTC_ROLLOVER = Date.parse("2027-01-01T00:00:00.000Z");
+
 /** Seeds 201 rows per list, so that the first page of 200 leaves one row. */
 function seeded() {
-  const api = createFakeApi();
+  const api = createFakeApi({ usageMonth: DECEMBER });
   const account = api.accounts.get(ACCOUNT_ID)!;
   account.ledger = [];
   account.invoices = [];
@@ -30,9 +35,6 @@ function seeded() {
   };
 }
 
-const NOW = new Date();
-const MONTH = { year: NOW.getUTCFullYear(), month: NOW.getUTCMonth() + 1 };
-
 const rejection = async (promise: Promise<unknown>) => {
   try {
     await promise;
@@ -43,6 +45,10 @@ const rejection = async (promise: Promise<unknown>) => {
 };
 
 describe("fake billing history pagination", () => {
+  afterEach(() => {
+    rs.useRealTimers();
+  });
+
   test("ListLedgerEntries pages by the page size and ends with an empty token", async () => {
     const { credit } = seeded();
     const first = await credit.listLedgerEntries({
@@ -81,27 +87,57 @@ describe("fake billing history pagination", () => {
     expect(last.nextPageToken).toBe("");
   });
 
-  test("ListUsageSummary pages the rows and reports the month total on every page", async () => {
+  test("ListUsageSummary keeps the configured month's rows and total across UTC rollover", async () => {
+    rs.useFakeTimers({ now: UTC_ROLLOVER - 1, toFake: ["Date"] });
     const { usage } = seeded();
-    const first = await usage.listUsageSummary({
+    const request = {
       billingAccountId: ACCOUNT_ID,
-      ...MONTH,
+      ...DECEMBER,
       pageSize: 200,
-    });
+    };
+    const first = await usage.listUsageSummary(request);
     expect(first.rows).toHaveLength(200);
     expect(first.nextPageToken).not.toBe("");
+    expect(first.totalAmountUsdMicros).toBe(201n);
+
+    rs.setSystemTime(UTC_ROLLOVER);
     const last = await usage.listUsageSummary({
-      billingAccountId: ACCOUNT_ID,
-      ...MONTH,
-      pageSize: 200,
+      ...request,
       pageToken: first.nextPageToken,
     });
     expect(last.rows.map((row) => row.organizationId)).toEqual([
       "usage-org-0201",
     ]);
     expect(last.nextPageToken).toBe("");
-    expect(first.totalAmountUsdMicros).toBe(201n);
     expect(last.totalAmountUsdMicros).toBe(201n);
+
+    const fresh = await usage.listUsageSummary(request);
+    expect(fresh).toEqual(first);
+  });
+
+  test("ListUsageSummary uses the current UTC month on each request by default", async () => {
+    rs.useFakeTimers({ now: UTC_ROLLOVER - 1, toFake: ["Date"] });
+    const { transport } = createFakeApi();
+    const usage = createClient(BillingUsageService, transport);
+    const before = await usage.listUsageSummary({
+      billingAccountId: ACCOUNT_ID,
+      ...DECEMBER,
+    });
+    expect(before.rows.length).toBeGreaterThan(0);
+
+    rs.setSystemTime(UTC_ROLLOVER);
+    const previous = await usage.listUsageSummary({
+      billingAccountId: ACCOUNT_ID,
+      ...DECEMBER,
+    });
+    expect(previous.rows).toEqual([]);
+    expect(previous.totalAmountUsdMicros).toBe(0n);
+    expect(previous.nextPageToken).toBe("");
+    const current = await usage.listUsageSummary({
+      billingAccountId: ACCOUNT_ID,
+      ...JANUARY,
+    });
+    expect(current).toEqual(before);
   });
 
   test("an omitted page size is 50 and a larger one is capped at 200", async () => {
@@ -130,18 +166,13 @@ describe("fake billing history pagination", () => {
   });
 
   test("an invalid page token is rejected with InvalidArgument", async () => {
-    const { credit, usage } = seeded();
+    const { credit } = seeded();
     const calls = [
       credit.listLedgerEntries({
         billingAccountId: ACCOUNT_ID,
         pageToken: "bogus",
       }),
       credit.listInvoices({ billingAccountId: ACCOUNT_ID, pageToken: "bogus" }),
-      usage.listUsageSummary({
-        billingAccountId: ACCOUNT_ID,
-        ...MONTH,
-        pageToken: "bogus",
-      }),
     ];
     for (const call of calls) {
       expect((await rejection(call)).code).toBe(Code.InvalidArgument);
@@ -149,7 +180,7 @@ describe("fake billing history pagination", () => {
   });
 
   test("the role checks still apply to every page", async () => {
-    const { api, credit, usage } = seeded();
+    const { api, credit } = seeded();
     api.userId = ADMIN;
     expect(
       (await credit.listInvoices({ billingAccountId: ACCOUNT_ID })).invoices,
@@ -165,14 +196,41 @@ describe("fake billing history pagination", () => {
         )
       ).code,
     ).toBe(Code.PermissionDenied);
-    // Every member reads the ledger and the usage summary.
     expect(
       (await credit.listLedgerEntries({ billingAccountId: ACCOUNT_ID }))
         .ledgerEntries,
     ).toHaveLength(50);
+  });
+
+  test("ListUsageSummary keeps member access and token validation after rollover", async () => {
+    rs.useFakeTimers({ now: UTC_ROLLOVER, toFake: ["Date"] });
+    const { api, usage } = seeded();
+    api.userId = VIEWER;
+    const request = { billingAccountId: ACCOUNT_ID, ...DECEMBER };
+    const first = await usage.listUsageSummary(request);
+    expect(first.rows).toHaveLength(50);
+    expect(first.nextPageToken).not.toBe("");
+
+    const otherMonth = await usage.listUsageSummary({
+      billingAccountId: ACCOUNT_ID,
+      ...JANUARY,
+    });
+    expect(otherMonth.rows).toEqual([]);
+    expect(otherMonth.totalAmountUsdMicros).toBe(0n);
+    expect(otherMonth.nextPageToken).toBe("");
+
     expect(
-      (await usage.listUsageSummary({ billingAccountId: ACCOUNT_ID, ...MONTH }))
-        .rows,
-    ).toHaveLength(50);
+      (
+        await rejection(
+          usage.listUsageSummary({ ...request, pageToken: "bogus" }),
+        )
+      ).code,
+    ).toBe(Code.InvalidArgument);
+
+    api.userId = OUTSIDER;
+    const denied = await rejection(
+      usage.listUsageSummary({ ...request, pageToken: first.nextPageToken }),
+    );
+    expect(denied.code).toBe(Code.NotFound);
   });
 });

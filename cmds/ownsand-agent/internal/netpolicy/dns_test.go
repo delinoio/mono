@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -349,29 +350,179 @@ func startTCPUpstream(t *testing.T, handle func(c net.Conn)) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var mu sync.Mutex
+	t.Cleanup(serveTCPUpstream(l, handle))
+	return l.Addr().String()
+}
+
+func serveTCPUpstream(l net.Listener, handle func(net.Conn)) func() {
 	var conns []net.Conn
-	t.Cleanup(func() {
-		l.Close()
-		mu.Lock()
-		defer mu.Unlock()
-		for _, c := range conns {
-			c.Close()
-		}
-	})
+	acceptDone := make(chan struct{})
 	go func() {
+		defer close(acceptDone)
 		for {
 			c, err := l.Accept()
 			if err != nil {
 				return
 			}
-			mu.Lock()
 			conns = append(conns, c)
-			mu.Unlock()
 			go handle(c)
 		}
 	}()
-	return l.Addr().String()
+	return func() {
+		l.Close()
+		// An in-flight Accept can still return a connection during Close.
+		<-acceptDone
+		for _, c := range conns {
+			c.Close()
+		}
+	}
+}
+
+type tcpUpstreamTestListener struct {
+	accept func() (net.Conn, error)
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (l *tcpUpstreamTestListener) Accept() (net.Conn, error) { return l.accept() }
+func (l *tcpUpstreamTestListener) Addr() net.Addr            { return &net.TCPAddr{} }
+func (l *tcpUpstreamTestListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func TestTCPUpstreamCleanupClosesLateConnection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		server, peer := net.Pipe()
+		defer server.Close()
+		defer peer.Close()
+
+		accepting := make(chan struct{})
+		returnConn := make(chan struct{})
+		returnClosed := make(chan struct{})
+		releaseConn := sync.OnceFunc(func() { close(returnConn) })
+		releaseClosed := sync.OnceFunc(func() { close(returnClosed) })
+		defer releaseConn()
+		defer releaseClosed()
+
+		pending := server
+		l := &tcpUpstreamTestListener{
+			closed: make(chan struct{}),
+			accept: func() (net.Conn, error) {
+				if pending == nil {
+					<-returnClosed
+					return nil, net.ErrClosed
+				}
+				c := pending
+				pending = nil
+				close(accepting)
+				<-returnConn
+				return c, nil
+			},
+		}
+
+		handlerStarted := make(chan struct{})
+		handlerRead := make(chan error, 1)
+		cleanup := serveTCPUpstream(l, func(c net.Conn) {
+			close(handlerStarted)
+			_, err := c.Read(make([]byte, 1))
+			handlerRead <- err
+		})
+		<-accepting
+		cleanupDone := make(chan struct{})
+		go func() {
+			cleanup()
+			close(cleanupDone)
+		}()
+		synctest.Wait()
+		select {
+		case <-l.closed:
+		default:
+			t.Fatal("cleanup did not close the listener")
+		}
+		select {
+		case <-cleanupDone:
+			t.Fatal("cleanup returned while Accept still held a connection")
+		default:
+		}
+
+		// Hold the next Accept so the handler blocks in Read before cleanup
+		// can close its connection.
+		releaseConn()
+		synctest.Wait()
+		select {
+		case <-handlerStarted:
+		default:
+			t.Fatal("the accepted connection did not reach its handler")
+		}
+		select {
+		case err := <-handlerRead:
+			t.Fatalf("handler read returned before cleanup closed the connection: %v", err)
+		default:
+		}
+
+		releaseClosed()
+		synctest.Wait()
+		select {
+		case <-cleanupDone:
+		default:
+			t.Fatal("cleanup did not return after Accept reported closure")
+		}
+		select {
+		case err := <-handlerRead:
+			if err != io.ErrClosedPipe {
+				t.Errorf("handler read error = %v, want %v", err, io.ErrClosedPipe)
+			}
+		default:
+			t.Error("handler read stayed blocked after cleanup")
+		}
+		peerRead := make(chan error, 1)
+		go func() {
+			_, err := peer.Read(make([]byte, 1))
+			peerRead <- err
+		}()
+		synctest.Wait()
+		select {
+		case err := <-peerRead:
+			if err != io.EOF {
+				t.Errorf("peer read error = %v, want EOF", err)
+			}
+		default:
+			t.Error("peer read stayed blocked after cleanup")
+		}
+	})
+}
+
+func TestTCPUpstreamCleanupWithNoConnections(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		accepting := make(chan struct{})
+		closed := make(chan struct{})
+		l := &tcpUpstreamTestListener{
+			closed: closed,
+			accept: func() (net.Conn, error) {
+				close(accepting)
+				<-closed
+				return nil, net.ErrClosed
+			},
+		}
+		defer l.Close()
+
+		cleanup := serveTCPUpstream(l, func(net.Conn) {
+			t.Error("handler received a connection")
+		})
+		<-accepting
+		cleanupDone := make(chan struct{})
+		go func() {
+			cleanup()
+			close(cleanupDone)
+		}()
+		synctest.Wait()
+		select {
+		case <-cleanupDone:
+		default:
+			t.Fatal("cleanup did not return with no connections")
+		}
+	})
 }
 
 // readDNSFrame reads one length-prefixed message and returns its payload.

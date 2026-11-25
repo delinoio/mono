@@ -282,6 +282,35 @@ describe("overview", () => {
     );
   });
 
+  test("opens a fresh live queue after leaving Overview", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("link", "Acme Robotics Owner").tap();
+    const status = screen.getByRole("status", "Queue updates");
+    const queue = screen.getByRole("table", "Waiting requests");
+    await expect(status).toContainText("Live");
+    await expect(queue).toContainText("GitHub job");
+
+    await screen.getByRole("link", "Requests").tap();
+    const job = screen
+      .getByRole("table", "Requests")
+      .getByRole("row")
+      .filter({ hasText: "acme-robotics/firmware · test (ubuntu)" });
+    await job.getByRole("button", "Cancel").tap();
+    const dialog = screen.getByRole("alertdialog", "Cancel this request?");
+    await dialog.getByRole("button", "Cancel request").tap();
+    await expect(dialog).toBeHidden();
+    await expect(job).toBeHidden();
+
+    await screen.getByRole("link", "Overview").tap();
+    await expect(status).toContainText("Live");
+    await expect(queue).toContainText("Agent session");
+    await expect(queue).not.toContainText("GitHub job");
+  });
+
   test("an invalid OwnSand link shows the dispatch banner", async ({
     app,
     screen,
@@ -615,7 +644,7 @@ describe("runner profiles", () => {
     ).toBeVisible();
   });
 
-  test("keeps the edit dialog open when a runner profile name already exists", async ({
+  test("lets the user retry an edit when a runner profile name already exists", async ({
     app,
     screen,
     browser,
@@ -638,10 +667,17 @@ describe("runner profiles", () => {
     await expect(
       dialog.getByText("a runner profile with this name exists"),
     ).toBeVisible();
-    await dialog.getByRole("button", "Cancel").tap();
     await expect(profile.getByLabel("runs-on label of linux-build")).toHaveText(
       "tide-linux-build",
     );
+    await dialog.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("linux-build-retry");
+    await dialog.getByRole("button", "Save changes").tap();
+    await expect(dialog).toBeHidden();
+    await expect(
+      screen.getByLabel("runs-on label of linux-build-retry"),
+    ).toHaveText("tide-linux-build-retry");
   });
 
   test("shows field errors and saves after correcting the resource values", async ({
@@ -822,6 +858,41 @@ describe("invitations", () => {
       screen.getByRole("heading", "Members", { level: 1 }),
     ).toBeVisible();
     await expect(screen.getByRole("button", "Invite someone")).toBeHidden();
+  });
+
+  test("accepts the replacement invitation after a fragment-only navigation", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    const path = "/invitations/accept?source=fixture";
+    const firstSecret = "tdi_fixture_a";
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`${path}#secret=${firstSecret}`);
+
+    const join = screen.getByRole("button", "Join organization");
+    const invalid = screen.getByText(
+      "It was not found, or you no longer have access to it.",
+    );
+    await expect(browser).toHaveURL(path);
+    await join.tap();
+    await expect(invalid).toBeVisible();
+
+    await browser.evaluate((secret) => {
+      window.location.hash = `secret=${secret}`;
+      return null;
+    }, INVITATION_SECRET);
+
+    await expect(browser).toHaveURL(path);
+    await expect(invalid).toBeHidden();
+    await join.tap();
+
+    await expect(browser).toHaveURL(`/orgs/${CONTOSO}`);
+    await expect(screen.getByRole("combobox", "Organization")).toContainText(
+      "Contoso",
+    );
   });
 
   test("accepts an invitation link and removes the secret from the address", async ({
