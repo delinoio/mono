@@ -4,6 +4,8 @@ package hcsrt
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -90,10 +92,52 @@ func TestCopyConsoleEndsCloserWhenPipeEnds(t *testing.T) {
 // its logger.
 func newTestBuildVM() *BuildVM {
 	return &BuildVM{
-		sys:     &system{exited: make(chan struct{})},
+		sys:     newSystem("fake-build", 0),
 		logger:  slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		stop:    make(chan struct{}),
 		console: make(chan struct{}),
+	}
+}
+
+func TestBuildVMRequiresConfirmedExit(t *testing.T) {
+	shortStopTimeout(t)
+	b := newTestBuildVM()
+	registerFakeCallback(t, b.sys)
+	b.sys.terminateFn = func() error { return nil }
+	b.sys.verifyExitFn = func(string, time.Time) (bool, error) { return false, errors.New("status unavailable") }
+	notifySystem(b.sys, hcsEventServiceDisconnect)
+	if err := b.WaitExit(t.Context(), 50*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitExit = %v, want unconfirmed shutdown", err)
+	}
+	requireOpenSignal(t, b.Exited(), "build VM exit")
+	go func() {
+		<-b.stop
+		close(b.console)
+	}()
+	b.Close()
+	b.Close()
+	waitForSignal(t, b.sys.closed, "handle closed")
+	waitForSignal(t, b.console, "build console stopped")
+	requireOpenSignal(t, b.Exited(), "build VM exit")
+	if err := b.WaitExit(t.Context(), time.Second); !errors.Is(err, errSystemHandleClosed) {
+		t.Fatalf("WaitExit after Close = %v, want handle closed error", err)
+	}
+}
+
+func TestBuildVMWaitExitAcceptsConfirmation(t *testing.T) {
+	for _, statusCheck := range []bool{false, true} {
+		b := newTestBuildVM()
+		registerFakeCallback(t, b.sys)
+		if statusCheck {
+			b.sys.verifyExitFn = func(string, time.Time) (bool, error) { return true, nil }
+			notifySystem(b.sys, hcsEventServiceDisconnect)
+		} else {
+			notifySystem(b.sys, hcsEventSystemExited)
+		}
+		if err := b.WaitExit(t.Context(), time.Second); err != nil {
+			t.Fatal(err)
+		}
+		waitForSignal(t, b.Exited(), "build VM exit")
 	}
 }
 
