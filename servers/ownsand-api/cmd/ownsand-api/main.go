@@ -27,7 +27,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/stun"
 )
 
-// shutdownTimeout bounds the drain after a termination signal. Long-lived
+// shutdownTimeout bounds the drain after a signal or listener failure. Long-lived
 // streams (the agent channel and relay connections) end with the drain.
 const shutdownTimeout = 10 * time.Second
 
@@ -225,22 +225,52 @@ func run() error {
 	if metricsListener != nil {
 		metricsSrv = newMetricsServer(tel, logger)
 		metricsAddr = metricsListener.Addr().String()
-		go func() {
-			if err := metricsSrv.Serve(metricsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("metrics_server_failed", slog.Any("error", err))
-			}
-		}()
 	}
 
 	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("stun_addr", udp.LocalAddr().String()), slog.String("log_level", string(cfg.LogLevel)),
 		slog.String("client_address_mode", string(cfg.ClientAddressMode)), slog.String("metrics_addr", metricsAddr), slog.Bool("usage_reporting", cfg.Accounts.Enabled),
 		slog.Bool("otlp_metrics_export", tel.MetricsExport), slog.Bool("otlp_logs_export", tel.LogsExport))
-	err = serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait)
-	usageErr := finishUsage(a, logger, usageFlushTimeout, usageDrainTimeout)
+	return runServers(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait, a, metricsSrv, metricsListener)
+}
+
+// runServers drains public HTTP and finishes usage before closing metrics.
+// A metrics failure starts the same shutdown as a termination signal.
+func runServers(ctx context.Context, stopSignal func(), srv *http.Server, listener net.Listener, logger *slog.Logger,
+	timeout time.Duration, beforeDrain func(), usage usageFinisher, metricsSrv *http.Server, metricsListener net.Listener) error {
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var metricsDone chan error
 	if metricsSrv != nil {
-		_ = metricsSrv.Close()
+		metricsDone = make(chan error, 1)
+		go func() {
+			err := metricsSrv.Serve(metricsListener)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			if err != nil {
+				logger.Error("metrics_server_failed", slog.Any("error", err))
+				err = fmt.Errorf("serve metrics: %w", err)
+				cancel()
+			}
+			metricsDone <- err
+		}()
 	}
-	return errors.Join(err, usageErr)
+
+	stop := func() {
+		// A listener failure can start the drain before any signal arrives.
+		// Keep the handler installed so the first signal can be handled.
+		if ctx.Err() != nil {
+			stopSignal()
+		}
+	}
+	err := serve(serveCtx, stop, srv, listener, logger, timeout, beforeDrain)
+	usageErr := finishUsage(usage, logger, usageFlushTimeout, usageDrainTimeout)
+	if metricsDone == nil {
+		return errors.Join(err, usageErr)
+	}
+	closeErr := metricsSrv.Close()
+	return errors.Join(err, usageErr, <-metricsDone, closeErr)
 }
 
 // newMetricsServer returns the internal Prometheus listener. It serves only
@@ -275,32 +305,32 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 // timeout. beforeDrain runs first, so the background workers release the
 // instance lease and close agent connections before the drain.
 func serve(ctx context.Context, stop func(), srv *http.Server, listener net.Listener, logger *slog.Logger, timeout time.Duration, beforeDrain func()) error {
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(listener) }()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(listener) }()
+	var serveErr error
 	select {
-	case err := <-serveErr:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
+	case serveErr = <-serveDone:
+		serveDone = nil
 	case <-ctx.Done():
+		stop()
 	}
-	stop()
 	logger.Info("server_shutdown_started")
 	beforeDrain()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	err := srv.Shutdown(shutdownCtx)
-	if errors.Is(err, context.DeadlineExceeded) {
+	drainErr := srv.Shutdown(shutdownCtx)
+	if errors.Is(drainErr, context.DeadlineExceeded) {
 		// Long-lived streams that did not end within the drain are closed.
-		err = srv.Close()
+		drainErr = srv.Close()
 	}
-	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	if serveDone != nil {
+		serveErr = <-serveDone
 	}
-	if err != nil {
-		return err
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		serveErr = nil
 	}
-	logger.Info("server_shutdown_completed")
-	return nil
+	if drainErr == nil {
+		logger.Info("server_shutdown_completed")
+	}
+	return errors.Join(serveErr, drainErr)
 }
