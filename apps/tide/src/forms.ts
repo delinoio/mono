@@ -109,6 +109,16 @@ function positive(value: number | null): boolean {
   return value !== null && Number.isFinite(value) && value > 0;
 }
 
+function normalizedDurationMs(value: number, unitMs: number): number {
+  const ms = value * unitMs;
+  const nearest = Math.round(ms);
+  // Allow roundoff from displaying milliseconds in minutes or hours and
+  // multiplying them back. Leave genuine fractions for field validation.
+  return Math.abs(ms - nearest) <= Math.abs(ms) * Number.EPSILON ? nearest : ms;
+}
+
+const WHOLE_MILLISECONDS = "Enter a duration in whole milliseconds.";
+
 /**
  * Returns the field errors of a runner profile form, or an empty object.
  * `vendor` is the vendor of the selected agent integration.
@@ -181,19 +191,24 @@ export function profileErrors(
   ) {
     errors.diskGib = `Enter a whole number of GiB from 1 to ${MAX_DISK_GIB}.`;
   }
-  const idleTtlMinutes = values.idleTtlMinutes ?? 0;
-  const maxTtlHours = values.maxTtlHours ?? 0;
-  if (!positive(idleTtlMinutes)) {
+  const idleTtlMs = normalizedDurationMs(values.idleTtlMinutes ?? 0, MINUTE_MS);
+  const maxTtlMs = normalizedDurationMs(values.maxTtlHours ?? 0, HOUR_MS);
+  const maxQueueWaitMs = normalizedDurationMs(
+    values.maxQueueWaitMinutes ?? 0,
+    MINUTE_MS,
+  );
+  if (!positive(values.idleTtlMinutes)) {
     errors.idleTtlMinutes = "Enter an idle TTL greater than zero.";
+  } else if (Number.isFinite(idleTtlMs) && !Number.isInteger(idleTtlMs)) {
+    errors.idleTtlMinutes = WHOLE_MILLISECONDS;
   }
-  if (!positive(maxTtlHours)) {
+  if (!positive(values.maxTtlHours)) {
     errors.maxTtlHours = "Enter a maximum TTL greater than zero.";
-  } else if (maxTtlHours * HOUR_MS > MAX_TTL_MS) {
+  } else if (maxTtlMs > MAX_TTL_MS) {
     errors.maxTtlHours = "The maximum TTL is at most 7 days (168 hours).";
-  } else if (
-    positive(idleTtlMinutes) &&
-    idleTtlMinutes * MINUTE_MS > maxTtlHours * HOUR_MS
-  ) {
+  } else if (!Number.isInteger(maxTtlMs)) {
+    errors.maxTtlHours = WHOLE_MILLISECONDS;
+  } else if (errors.idleTtlMinutes === undefined && idleTtlMs > maxTtlMs) {
     errors.idleTtlMinutes =
       "The idle TTL must not be longer than the maximum TTL.";
   }
@@ -205,11 +220,13 @@ export function profileErrors(
   if (!positive(values.maxQueueWaitMinutes)) {
     errors.maxQueueWaitMinutes =
       "Enter a maximum queue wait greater than zero.";
-  } else if (values.maxQueueWaitMinutes! * MINUTE_MS > limit) {
+  } else if (maxQueueWaitMs > limit) {
     errors.maxQueueWaitMinutes =
       limit === OPENAI_MAX_QUEUE_WAIT_MS
         ? "OpenAI waits at most 5 minutes for an executor."
         : "The maximum queue wait is at most 24 hours (1440 minutes).";
+  } else if (!Number.isInteger(maxQueueWaitMs)) {
+    errors.maxQueueWaitMinutes = WHOLE_MILLISECONDS;
   }
   if (
     values.warmCount === null ||
@@ -246,9 +263,13 @@ export function profileFromForm(values: ProfileFormValues): RunnerProfile {
       diskGib: BigInt(values.diskGib!),
     },
     networkMode: NetworkMode.OUTBOUND,
-    idleTtl: durationFromMs(values.idleTtlMinutes! * MINUTE_MS),
-    maxTtl: durationFromMs(values.maxTtlHours! * HOUR_MS),
-    maxQueueWait: durationFromMs(values.maxQueueWaitMinutes! * MINUTE_MS),
+    idleTtl: durationFromMs(
+      normalizedDurationMs(values.idleTtlMinutes!, MINUTE_MS),
+    ),
+    maxTtl: durationFromMs(normalizedDurationMs(values.maxTtlHours!, HOUR_MS)),
+    maxQueueWait: durationFromMs(
+      normalizedDurationMs(values.maxQueueWaitMinutes!, MINUTE_MS),
+    ),
     priority: values.priority,
     warmCount: values.warmCount!,
   });

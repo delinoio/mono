@@ -1044,6 +1044,50 @@ describe("runner profiles", () => {
     ).toHaveText("tide-linux-build-retry");
   });
 
+  test("validates whole milliseconds on click and Enter", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+    await screen.getByRole("button", "Create runner profile").tap();
+
+    const dialog = screen.getByRole("dialog", "Create a runner profile");
+    const setDuration = async (label: string, value: string) => {
+      await dialog.getByLabel(label).tap();
+      await browser.keyboard.press("ControlOrMeta+A");
+      await browser.keyboard.type(value);
+    };
+    await dialog.getByLabel("Name").tap();
+    await browser.keyboard.type("precise-linux");
+    const message = dialog.getByText("Enter a duration in whole milliseconds.");
+    await setDuration("Idle TTL (minutes)", "1.000001");
+    await dialog.getByRole("button", "Create profile").tap();
+    await expect(message).toBeVisible();
+    await expect(dialog.getByLabel("Idle TTL (minutes)")).toHaveAttribute(
+      "aria-invalid",
+      "true",
+    );
+
+    await setDuration("Idle TTL (minutes)", "1.001");
+    await setDuration("Maximum TTL (hours)", "1.001");
+    await setDuration("Maximum queue wait (minutes)", "1.000001");
+    await browser.keyboard.press("Enter");
+    await expect(message).toBeVisible();
+    await expect(
+      dialog.getByLabel("Maximum queue wait (minutes)"),
+    ).toHaveAttribute("aria-invalid", "true");
+
+    await setDuration("Maximum queue wait (minutes)", "1.001");
+    await browser.keyboard.press("Enter");
+    await expect(dialog).toBeHidden();
+    await expect(
+      screen.getByLabel("runs-on label of precise-linux"),
+    ).toHaveText("tide-precise-linux");
+  });
+
   test("shows field errors and saves after correcting the resource values", async ({
     app,
     screen,

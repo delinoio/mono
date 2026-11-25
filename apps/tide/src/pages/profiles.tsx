@@ -52,6 +52,11 @@ const KINDS = [
 ];
 const GUEST_OSES = [GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS];
 const PRIORITIES = [Priority.HIGH, Priority.NORMAL, Priority.LOW];
+const DURATION_FIELDS = [
+  ["idleTtlMinutes", "Idle TTL (minutes)"],
+  ["maxTtlHours", "Maximum TTL (hours)"],
+  ["maxQueueWaitMinutes", "Maximum queue wait (minutes)"],
+] as const;
 
 /** Route `profiles`: runner profiles; create, change and delete for `admin`. */
 export function ProfilesPage() {
@@ -422,28 +427,21 @@ function ProfileDialog({
         />
       </div>
       <div className="field-row">
-        <NumberInput
-          label="Idle TTL (minutes)"
-          value={values.idleTtlMinutes}
-          onValueChange={(v) => set("idleTtlMinutes", v)}
-          min={1}
-          error={errors.idleTtlMinutes}
-        />
-        <NumberInput
-          label="Maximum TTL (hours)"
-          value={values.maxTtlHours}
-          onValueChange={(v) => set("maxTtlHours", v)}
-          min={1}
-          max={168}
-          error={errors.maxTtlHours}
-        />
-        <NumberInput
-          label="Maximum queue wait (minutes)"
-          value={values.maxQueueWaitMinutes}
-          onValueChange={(v) => set("maxQueueWaitMinutes", v)}
-          min={1}
-          error={errors.maxQueueWaitMinutes}
-        />
+        {DURATION_FIELDS.map(([field, label]) => (
+          <TextField
+            key={field}
+            label={label}
+            type="number"
+            inputMode="decimal"
+            step="any"
+            defaultValue={String(initial[field] ?? "")}
+            onChange={(event) => {
+              const value = event.currentTarget.valueAsNumber;
+              set(field, Number.isNaN(value) ? null : value);
+            }}
+            error={errors[field]}
+          />
+        ))}
       </div>
       <div className="field-row">
         <Select
