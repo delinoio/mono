@@ -2922,8 +2922,7 @@ describe("continuation of the billing history lists", () => {
     entry.seed(accountOf(api));
     await renderAccount(OWNER, { api });
     await openTab(entry.tab);
-    await screen.findByRole("button", { name: entry.more });
-    await settle(60);
+    await waitFor(() => expect(moreButton(entry).disabled).toBe(false));
     expect(rowCount(entry.list)).toBe(entry.firstPage);
     expect(pageTokens(api, entry.method)).toEqual([""]);
     return api;
@@ -2938,9 +2937,8 @@ describe("continuation of the billing history lists", () => {
         const api = await openList(entry);
         expect(moreButton(entry).disabled).toBe(false);
         await click(moreButton(entry));
-        await settle(60);
+        await waitFor(() => expect(rowCount(entry.list)).toBe(entry.total));
         expect(pageTokens(api, entry.method)).toEqual(["", nonemptyPageToken]);
-        expect(rowCount(entry.list)).toBe(entry.total);
         expect(screen.queryByRole("button", { name: entry.more })).toBeNull();
       });
 
@@ -2953,34 +2951,37 @@ describe("continuation of the billing history lists", () => {
             release = resolve;
           }),
         );
-        await refocus();
-        // The refresh holds the first page.
-        expect(pageTokens(api, entry.method)).toEqual(["", ""]);
-        expect(moreButton(entry).disabled).toBe(true);
-        await click(moreButton(entry));
-        expect(pageTokens(api, entry.method)).toEqual(["", ""]);
-        release();
-        api.gates.delete(entry.method);
-        await settle(60);
+        try {
+          await refocus();
+          // The refresh holds the first page.
+          await waitFor(() => {
+            expect(pageTokens(api, entry.method)).toEqual(["", ""]);
+            expect(moreButton(entry).disabled).toBe(true);
+          });
+          await click(moreButton(entry));
+          expect(pageTokens(api, entry.method)).toEqual(["", ""]);
+        } finally {
+          api.gates.delete(entry.method);
+          release();
+        }
         // The refresh finished and no request used the cached token.
+        await waitFor(() => expect(moreButton(entry).disabled).toBe(false));
         expect(pageTokens(api, entry.method)).toEqual(["", ""]);
         expect(rowCount(entry.list)).toBe(entry.firstPage);
-        expect(moreButton(entry).disabled).toBe(false);
         await click(moreButton(entry));
-        await settle(60);
+        await waitFor(() => expect(rowCount(entry.list)).toBe(entry.total));
         expect(pageTokens(api, entry.method)).toEqual([
           "",
           "",
           nonemptyPageToken,
         ]);
-        expect(rowCount(entry.list)).toBe(entry.total);
       });
 
       test("after a failed refresh the rows and the retry stay and the continuation waits for the retry", async () => {
         const api = await openList(entry);
         api.failNext.set(entry.method, BACKGROUND_FAILURE);
         await refocus();
-        expect(screen.getByText(BUSY)).toBeTruthy();
+        expect(await screen.findByText(BUSY)).toBeTruthy();
         expect(rowCount(entry.list)).toBe(entry.firstPage);
         expect(moreButton(entry).disabled).toBe(true);
         await click(moreButton(entry));
@@ -2988,31 +2989,31 @@ describe("continuation of the billing history lists", () => {
 
         // A successful retry supplies the token again.
         await click(screen.getByRole("button", { name: "Try again" }));
-        await settle(60);
+        await waitFor(() => expect(moreButton(entry).disabled).toBe(false));
         expect(screen.queryByText(BUSY)).toBeNull();
         expect(pageTokens(api, entry.method)).toEqual(["", "", ""]);
-        expect(moreButton(entry).disabled).toBe(false);
         await click(moreButton(entry));
-        await settle(60);
+        await waitFor(() => expect(rowCount(entry.list)).toBe(entry.total));
         expect(pageTokens(api, entry.method)).toEqual([
           "",
           "",
           "",
           nonemptyPageToken,
         ]);
-        expect(rowCount(entry.list)).toBe(entry.total);
       });
 
       test("a retry that returns an empty token removes the continuation", async () => {
         const api = await openList(entry);
         api.failNext.set(entry.method, BACKGROUND_FAILURE);
         await refocus();
+        const retry = await screen.findByRole("button", { name: "Try again" });
         expect(moreButton(entry).disabled).toBe(true);
         // The list shrank to one page while the refresh failed.
         entry.shrink(accountOf(api));
-        await click(screen.getByRole("button", { name: "Try again" }));
-        await settle(60);
-        expect(screen.queryByRole("button", { name: entry.more })).toBeNull();
+        await click(retry);
+        await waitFor(() =>
+          expect(screen.queryByRole("button", { name: entry.more })).toBeNull(),
+        );
         expect(pageTokens(api, entry.method)).toEqual(["", "", ""]);
       });
     });
