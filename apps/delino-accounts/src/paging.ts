@@ -62,6 +62,8 @@ type PageTokenInfiniteQuery = <I extends DescMessage, O extends DescMessage>(
   options: {
     pageParamKey: "pageToken";
     getNextPageParam: (last: MessageShape<O>) => string | undefined;
+    refetchOnMount: (query: Query) => boolean;
+    refetchOnReconnect: (query: Query) => boolean;
     refetchOnWindowFocus: (query: Query) => boolean;
   },
 ) => UseInfiniteQueryResult<
@@ -70,15 +72,12 @@ type PageTokenInfiniteQuery = <I extends DescMessage, O extends DescMessage>(
 >;
 
 /**
- * Whether a focus of the tab may refetch the list. A failed request for a
- * later page leaves the list waiting for the user to retry it. A refetch on
- * focus would read the cached pages again from the first page, clear the
- * failure and let the continuation effect request the failed token without
- * the user's retry, so the list refetches on focus only when no continuation
- * request has failed. TanStack Query marks the failed request with the
- * `forward` direction of `fetchMore`, as it does for `isFetchNextPageError`.
+ * An automatic refetch starts at page one and can clear a continuation error.
+ * Keep waiting for the user's retry while the cached query has a failed later
+ * page. TanStack Query marks that failure with the `forward` direction of
+ * `fetchMore`, as it does for `isFetchNextPageError`.
  */
-function refetchListOnFocus(query: Query): boolean {
+function canRefetchListOnLifecycle(query: Query): boolean {
   return !(
     query.state.status === "error" &&
     query.state.fetchMeta?.fetchMore?.direction === "forward"
@@ -107,7 +106,9 @@ export function useAllPages<I extends DescMessage, O extends DescMessage, Item>(
     {
       pageParamKey: "pageToken",
       getNextPageParam: (last) => read(last).nextPageToken || undefined,
-      refetchOnWindowFocus: refetchListOnFocus,
+      refetchOnMount: canRefetchListOnLifecycle,
+      refetchOnReconnect: canRefetchListOnLifecycle,
+      refetchOnWindowFocus: canRefetchListOnLifecycle,
     },
   );
   const {

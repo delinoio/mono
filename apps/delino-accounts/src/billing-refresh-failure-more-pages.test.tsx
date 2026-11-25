@@ -9,6 +9,8 @@ import {
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
+import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import { addBillingAccounts, createFakeApi } from "./testing/fake-api.ts";
 import { listRows } from "./testing/list-rows.ts";
 import { renderApp } from "./testing/render.tsx";
@@ -78,22 +80,25 @@ test("a failed refresh of a partially loaded list pauses the continuation until 
     "ListBillingAccounts",
     new ConnectError("unavailable", Code.Unavailable),
   );
-  renderApp("/billing", { api });
+  const { queryClient } = renderApp("/billing", { api });
   await screen.findByText(/Some items did not load/);
   expect(rows()).toHaveLength(200);
   const initialTokens = pageTokens(api);
   expect(initialTokens).toEqual(["", expect.stringMatching(/./)]);
 
-  // A reconnect refresh now fails on page one. A focus of the tab does not
-  // refresh a list that waits for the retry of a failed later page (see
-  // billing-focus-after-continuation-failure.test.tsx), but a reconnect does.
+  // Explicitly refresh the active list from page one and fail that request.
   api.failNext.set(
     "ListBillingAccounts",
     new ConnectError("busy", Code.ResourceExhausted),
   );
   await act(async () => {
-    window.dispatchEvent(new Event("offline"));
-    window.dispatchEvent(new Event("online"));
+    await queryClient.refetchQueries({
+      type: "active",
+      queryKey: createConnectQueryKey({
+        schema: BillingAccountService.method.listBillingAccounts,
+        cardinality: undefined,
+      }),
+    });
   });
   const notice = (await screen.findByText(REFRESH_NOTICE)).closest(
     '[role="alert"]',
