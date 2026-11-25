@@ -218,24 +218,26 @@ func listServer(t *testing.T, prefix string, pages map[string]string) (*R2, func
 	}
 }
 
-// TestListPrefixFollowsContinuationTokens lists two pages and checks that
+// TestListPrefixFollowsContinuationTokens lists three pages and checks that
 // every key and its size is returned in order.
 func TestListPrefixFollowsContinuationTokens(t *testing.T) {
 	const prefix = "organizations/o/snapshots/s/attempts/a/"
 	r, tokens := listServer(t, prefix, map[string]string{
 		"": `<ListBucketResult><Contents><Key>` + prefix + `1</Key><Size>5242880</Size></Contents>` +
 			`<IsTruncated>true</IsTruncated><NextContinuationToken>page-2</NextContinuationToken></ListBucketResult>`,
-		"page-2": `<ListBucketResult><Contents><Key>` + prefix + `2</Key><Size>17</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>`,
+		"page-2": `<ListBucketResult><Contents><Key>` + prefix + `2</Key><Size>17</Size></Contents>` +
+			`<IsTruncated>true</IsTruncated><NextContinuationToken>page-3</NextContinuationToken></ListBucketResult>`,
+		"page-3": `<ListBucketResult><Contents><Key>` + prefix + `3</Key><Size>3</Size></Contents></ListBucketResult>`,
 	})
 	got, err := r.ListPrefix(context.Background(), prefix)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Object{{Key: prefix + "1", Size: 5 << 20}, {Key: prefix + "2", Size: 17}}
+	want := []Object{{Key: prefix + "1", Size: 5 << 20}, {Key: prefix + "2", Size: 17}, {Key: prefix + "3", Size: 3}}
 	if !slices.Equal(got, want) {
 		t.Fatalf("objects = %v, want %v", got, want)
 	}
-	if got := tokens(); !slices.Equal(got, []string{"", "page-2"}) {
+	if got := tokens(); !slices.Equal(got, []string{"", "page-2", "page-3"}) {
 		t.Fatalf("continuation tokens = %q", got)
 	}
 }
@@ -271,19 +273,27 @@ func TestListPrefixAndDeletePrefixRejectInvalidPages(t *testing.T) {
 	}{
 		{
 			name: "omitted token", pages: map[string]string{"": truncatedPage + "</ListBucketResult>"},
-			wantTokens: []string{""}, wantError: "truncated list without a continuation token",
+			wantTokens: []string{""}, wantError: "objectstore: truncated list without a continuation token",
 		},
 		{
 			name: "empty token", pages: map[string]string{"": pageWithToken("")},
-			wantTokens: []string{""}, wantError: "truncated list without a continuation token",
+			wantTokens: []string{""}, wantError: "objectstore: truncated list without a continuation token",
 		},
 		{
 			name: "wrong root on first page", pages: map[string]string{"": wrongRoot},
-			wantTokens: []string{""}, wantError: "expected element type <ListBucketResult>",
+			wantTokens: []string{""}, wantError: "expected element type <ListBucketResult> but have <Error>",
 		},
 		{
 			name: "wrong root on later page", pages: map[string]string{"": pageWithToken("next"), "next": wrongRoot},
-			wantTokens: []string{"", "next"}, wantError: "expected element type <ListBucketResult>",
+			wantTokens: []string{"", "next"}, wantError: "expected element type <ListBucketResult> but have <Error>",
+		},
+		{
+			name: "immediate repeat", pages: map[string]string{"": pageWithToken("page-2"), "page-2": pageWithToken("page-2")},
+			wantTokens: []string{"", "page-2"}, wantError: "objectstore: repeated list continuation token",
+		},
+		{
+			name: "cycle", pages: map[string]string{"": pageWithToken("page-2"), "page-2": pageWithToken("page-3"), "page-3": pageWithToken("page-2")},
+			wantTokens: []string{"", "page-2", "page-3"}, wantError: "objectstore: repeated list continuation token",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -291,8 +301,8 @@ func TestListPrefixAndDeletePrefixRejectInvalidPages(t *testing.T) {
 			t.Run("ListPrefix", func(t *testing.T) {
 				r, tokens := listServer(t, prefix, tc.pages)
 				got, err := r.ListPrefix(ctx, prefix)
-				if got != nil || err == nil || !strings.Contains(err.Error(), tc.wantError) {
-					t.Fatalf("ListPrefix = (%v, %v), want nil objects and error containing %q", got, err, tc.wantError)
+				if got != nil || err == nil || err.Error() != tc.wantError {
+					t.Fatalf("ListPrefix = (%v, %v), want nil objects and error %q", got, err, tc.wantError)
 				}
 				if got := tokens(); !slices.Equal(got, tc.wantTokens) {
 					t.Fatalf("request tokens = %q, want %q", got, tc.wantTokens)
@@ -300,8 +310,8 @@ func TestListPrefixAndDeletePrefixRejectInvalidPages(t *testing.T) {
 			})
 			t.Run("DeletePrefix", func(t *testing.T) {
 				r, tokens := listServer(t, prefix, tc.pages)
-				if err := r.DeletePrefix(ctx, prefix); err == nil || !strings.Contains(err.Error(), tc.wantError) {
-					t.Fatalf("DeletePrefix error = %v, want error containing %q", err, tc.wantError)
+				if err := r.DeletePrefix(ctx, prefix); err == nil || err.Error() != tc.wantError {
+					t.Fatalf("DeletePrefix error = %v, want %q", err, tc.wantError)
 				}
 				if got := tokens(); !slices.Equal(got, tc.wantTokens) {
 					t.Fatalf("request tokens = %q, want %q", got, tc.wantTokens)

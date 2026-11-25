@@ -234,6 +234,7 @@ type listResult struct {
 // listing.
 func (r *R2) ListPrefix(ctx context.Context, prefix string) ([]Object, error) {
 	var objects []Object
+	seenTokens := make(map[string]struct{})
 	token := ""
 	for {
 		u, err := url.Parse(strings.TrimSuffix(r.Endpoint, "/") + "/" + r.Bucket)
@@ -270,6 +271,10 @@ func (r *R2) ListPrefix(ctx context.Context, prefix string) ([]Object, error) {
 		if list.NextContinuationToken == "" {
 			return nil, errors.New("objectstore: truncated list without a continuation token")
 		}
+		if _, seen := seenTokens[list.NextContinuationToken]; seen {
+			return nil, errors.New("objectstore: repeated list continuation token")
+		}
+		seenTokens[list.NextContinuationToken] = struct{}{}
 		token = list.NextContinuationToken
 	}
 }
