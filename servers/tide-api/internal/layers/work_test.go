@@ -877,6 +877,97 @@ func TestDeleteSandboxNow(t *testing.T) {
 	}
 }
 
+func TestDeleteSandboxAttemptTimeout(t *testing.T) {
+	timing := testenv.FastWorkTiming()
+	timing.DeleteTimeout = 150 * time.Millisecond
+	w := newWorkWorldWithTiming(t, devsession.Timing{}, &timing)
+	admin := w.env.User(w.org.Admin)
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	session := w.createSession(t, w.env.User(w.org.Member), profileID)
+	session = w.waitState(t, session.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+	runnerID := session.GetRunnerId()
+	sandboxID := w.runner(t, runnerID).GetOwnsandSandboxId()
+	if sandboxID == "" {
+		t.Fatal("running session has no stored sandbox ID")
+	}
+
+	// Park the lease to isolate the inline attempt from reconciliation.
+	w.env.App.Lease.Release()
+	other := lease.Lease{DB: w.env.DB, InstanceID: "other-instance"}
+	if held, err := other.TryAcquire(t.Context()); err != nil || !held {
+		t.Fatalf("could not park the lease: held=%v, err=%v", held, err)
+	}
+
+	attempts := make(chan error, 1)
+	w.fake.SetDeleteHook(func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			select {
+			case attempts <- ctx.Err():
+			default:
+			}
+			return ctx.Err()
+		case <-t.Context().Done():
+			return t.Context().Err()
+		}
+	})
+	assertAttemptTimedOut := func() {
+		t.Helper()
+		select {
+		case err := <-attempts:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("delete attempt ended with %v, want deadline exceeded", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("OwnSand delete attempt did not time out")
+		}
+	}
+	assertRunner := func(r *tidev1.Runner, state tidev1.RunnerState) {
+		t.Helper()
+		if r.GetState() != state || r.GetOwnsandSandboxId() != sandboxID ||
+			r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER {
+			t.Fatalf("runner = %v, want %s with the original sandbox ID and deletion reason", r, state)
+		}
+	}
+
+	deleteRunner := func() *tidev1.Runner {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		resp, err := admin.Work.DeleteRunner(ctx, connect.NewRequest(&tidev1.DeleteRunnerRequest{
+			OrganizationId: w.org.ID, RunnerId: runnerID,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.Msg.GetRunner()
+	}
+	assertRunner(deleteRunner(), tidev1.RunnerState_RUNNER_STATE_DELETING)
+	assertAttemptTimedOut()
+	if s := w.session(t, session.GetDevSessionId()); s.GetState() != tidev1.RequestState_REQUEST_STATE_ENDED ||
+		s.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED {
+		t.Fatalf("session after runner deletion: %v", s)
+	}
+
+	assertRunner(deleteRunner(), tidev1.RunnerState_RUNNER_STATE_DELETING)
+	action := tidev1.AuditAction_AUDIT_ACTION_RUNNER_DELETED
+	if got := countAudit(t, w.env, w.org.ID, action); got != 1 {
+		t.Fatalf("audit events after repeated DeleteRunner: %d, want 1", got)
+	}
+
+	other.Release()
+	w.env.NewReplica(t, testenv.WithLayerOptions(layers.Options{OwnSand: w.fake, WorkTiming: &timing}, &layers.Layers{}))
+	assertAttemptTimedOut()
+	assertRunner(w.runner(t, runnerID), tidev1.RunnerState_RUNNER_STATE_DELETING)
+
+	w.fake.SetDeleteHook(nil)
+	eventually(t, "the reconciler deletes the original sandbox", func() bool {
+		return w.runner(t, runnerID).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED &&
+			w.fake.Active(w.osOrg) == 0
+	})
+	assertRunner(w.runner(t, runnerID), tidev1.RunnerState_RUNNER_STATE_DELETED)
+}
+
 func TestDeleteSandboxRetry(t *testing.T) {
 	for _, tc := range []struct {
 		name        string

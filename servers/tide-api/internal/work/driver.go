@@ -510,7 +510,9 @@ func (e *Engine) removeSandbox(ctx context.Context, client ownsandclient.Client,
 			return true
 		}
 	}
-	if _, err := client.DeleteSandbox(ctx, id); err != nil {
+	deleteCtx, cancel := context.WithTimeout(ctx, e.timing.deleteTimeout())
+	defer cancel()
+	if _, err := client.DeleteSandbox(deleteCtx, id); err != nil {
 		switch code := connect.CodeOf(err); code {
 		case connect.CodeNotFound:
 			return true
