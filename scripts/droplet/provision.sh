@@ -146,10 +146,9 @@ if ! docker network inspect "$network" > /dev/null 2>&1; then
 fi
 
 log "Start the Caddy reverse proxy"
-# start-caddy.sh creates a missing container, recreates one that runs another
-# image, starts a stopped one that has the pinned image and reloads a running
-# one that has it. The container is recreated only when its image changed, so
-# the certificates in the `caddy-data` volume and the open connections stay.
+# start-caddy.sh creates a missing container or recreates one with another
+# image or log driver. When the pinned image and the local log driver match,
+# the helper starts a stopped container or reloads a running one.
 # After a create or a start the helper waits until Caddy answers its local
 # admin API and fails when Caddy exited or does not answer within 30 seconds;
 # `set -e` then ends this script before the `Done` message.
