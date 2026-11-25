@@ -5,6 +5,9 @@ import consoleConfig from "../rsbuild.config.ts";
 
 // Only the browser suite serves RPC fixtures and can select synthetic list request failures.
 export default mergeRsbuildConfig(consoleConfig, {
+  // Compile the console and the RPC fixture together before concurrent tests
+  // navigate to either entry.
+  dev: { lazyCompilation: false },
   source: {
     entry: {
       index: "./src/index.tsx",
