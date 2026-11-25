@@ -2359,6 +2359,15 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
 // --- droplet-deploy.sh -----------------------------------------------------
 
 const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
+const skipDroplet =
+  skip ||
+  (process.platform !== "linux" &&
+    "the Droplet deadline needs Linux /proc/uptime") ||
+  (spawnSync("timeout", ["--version"], { encoding: "utf8" }).stdout?.includes(
+    "GNU coreutils",
+  )
+    ? false
+    : "the Droplet deadline needs GNU coreutils timeout");
 const dropletDeploymentUuid = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
 const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(64)}`;
 const httpArgs = [
@@ -2400,6 +2409,8 @@ const accountsArgs = ["accounts-api", ...httpArgs.slice(1)];
 //   STUB_BLOCK_ON  glob that a `docker` call (its arguments joined by spaces)
 //                 must match to block until `<scratch>/release-docker` exists,
 //                 so that a test can send a signal while the call runs.
+//   STUB_BLOCK_IGNORES_TERM makes the blocked command ignore TERM for four seconds.
+//   STUB_STATUS_DELAY delays the replacement's status inspection.
 // `stubs` adds stub commands (name -> shell body) that shadow system tools, and
 // `prepare(deployRoot)` changes the scratch state before the run.
 function setupDroplet(
@@ -2448,9 +2459,13 @@ function setupDroplet(
     bin,
     "docker",
     `if [[ -n "\${STUB_BLOCK_ON:-}" && "$*" == \$STUB_BLOCK_ON ]]; then
-  # The loop also ends when the scratch directory is gone, so that a stub
-  # of a test that failed does not outlive it.
-  while [[ -d "$STUB_DIR" && ! -e "$STUB_DIR/release-docker" ]]; do sleep 0.05; done
+  if [[ "\${STUB_BLOCK_IGNORES_TERM:-}" == 1 ]]; then
+    trap '' TERM
+    sleep 4
+  else
+    # A blocked stub also ends when the scratch directory is removed.
+    while [[ -d "$STUB_DIR" && ! -e "$STUB_DIR/release-docker" ]]; do sleep 0.05; done
+  fi
 fi
 case "$1" in
   ps)
@@ -2460,7 +2475,9 @@ case "$1" in
     printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
   inspect)
     case "$3" in
-      *State.Status*) echo "\${STUB_STATUS:-running}" ;;
+      *State.Status*)
+        if [[ -n "\${STUB_STATUS_DELAY:-}" ]]; then sleep "$STUB_STATUS_DELAY"; fi
+        echo "\${STUB_STATUS:-running}" ;;
       *Config.Image*)
         [[ " \${STUB_INSPECT_IMAGE_FAIL:-} " != *" \$4 "* ]] || exit 1
         for pair in \${STUB_OLD_IMAGES:-}; do
@@ -2515,15 +2532,23 @@ esac`,
   return { dir, bin, deployRoot, read, calls, spawnEnv };
 }
 
-function runDroplet(t, args = httpArgs, { env = {}, ...options } = {}) {
+function runDroplet(
+  t,
+  args = httpArgs,
+  { env = {}, watchdog, ...options } = {},
+) {
   const setup = setupDroplet(t, args, options);
+  const start = performance.now();
   const result = spawnSync("bash", ["-s", "--", ...args], {
     encoding: "utf8",
     input: readFileSync(dropletDeploy, "utf8"),
     env: setup.spawnEnv(env),
+    timeout: watchdog,
+    killSignal: "SIGKILL",
   });
   return {
     ...result,
+    elapsedMs: performance.now() - start,
     read: setup.read,
     calls: setup.calls(),
     deployRoot: setup.deployRoot,
@@ -2535,7 +2560,7 @@ const commands = (calls) =>
 
 test(
   "droplet deploy starts, checks, routes and then stops the old container",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const result = runDroplet(t, undefined, { old: ["old1"] });
     assert.equal(result.status, 0, result.stdout + result.stderr);
@@ -2592,7 +2617,7 @@ test(
 
 test(
   "droplet deploy switches the route to the new alias on every deployment",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const first = runDroplet(t);
     assert.equal(first.status, 0, first.stderr);
@@ -2608,7 +2633,7 @@ test(
 
 test(
   "droplet deploy keeps the alias of a long service name a valid DNS label",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     // The service name may have 63 characters, and cutting the name can leave a
     // trailing hyphen.
@@ -2644,7 +2669,7 @@ test(
 
 test(
   "droplet deploy applies the Accounts stop timeout to deployment and rollback",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const first = runDroplet(t, accountsArgs, {
       old: ["old1"],
@@ -2679,7 +2704,7 @@ test(
 
 test(
   "droplet deploy rejects invalid Accounts stop timeouts before any change",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     for (const timeout of [
       "",
@@ -2707,7 +2732,7 @@ test(
 
 test(
   "droplet deploy stops failed Accounts replacements without changing the serving route",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const route = "# old route\n";
     for (const [env, timeout] of [
@@ -2754,7 +2779,7 @@ test(
 
 test(
   "droplet deploy leaves an Accounts replacement when its graceful stop fails",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const result = runDroplet(t, accountsArgs, {
       env: { STUB_RELOAD: "1", STUB_STOP_FAIL: "accounts-api-*" },
@@ -2776,7 +2801,7 @@ test(
 
 test(
   "droplet deploy keeps the previous image for a rollback",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const result = runDroplet(t, undefined, {
       state: `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}\n`,
@@ -2792,7 +2817,7 @@ test(
 
 test(
   "droplet deploy proxies h2c to a server with the h2c upstream protocol",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const http1 = runDroplet(t);
     assert.equal(http1.status, 0, http1.stderr);
@@ -2837,7 +2862,7 @@ const udpArgs = [
 
 test(
   "droplet deploy stops the old container before it starts a replacement with UDP ports",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const result = runDroplet(t, udpArgs, { old: ["old1"] });
     assert.equal(result.status, 0, result.stdout + result.stderr);
@@ -2890,7 +2915,7 @@ test(
 
 test(
   "droplet deploy starts the old container again when a replacement with UDP ports fails",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const route = "# old route\n";
     for (const [label, env, message] of [
@@ -2962,7 +2987,7 @@ test(
 // foreground command returns, so the test releases the check after the signal.
 test(
   "droplet deploy starts the old container again when a signal ends a replacement with UDP ports before the route switch",
-  { skip },
+  { skip: skipDroplet },
   async (t) => {
     const route = "# old route\n";
     for (const [signal, status] of [
@@ -3006,7 +3031,7 @@ test(
 
 test(
   "droplet deploy names a previous container that does not start again after a signal",
-  { skip },
+  { skip: skipDroplet },
   async (t) => {
     const setup = setupDroplet(t, udpArgs, {
       old: ["old1"],
@@ -3033,7 +3058,7 @@ test(
 
 test(
   "droplet deploy keeps the replacement when a signal arrives during the route switch",
-  { skip },
+  { skip: skipDroplet },
   async (t) => {
     const route = "# old route\n";
     const setup = setupDroplet(t, udpArgs, {
@@ -3066,7 +3091,7 @@ test(
 
 test(
   "droplet deploy restores the previous containers when a signal arrives during a failed route switch",
-  { skip },
+  { skip: skipDroplet },
   async (t) => {
     const route = "# old route\n";
     const setup = setupDroplet(t, udpArgs, {
@@ -3095,7 +3120,7 @@ test(
 
 test(
   "droplet deploy publishes the HTTP route and image state before honoring a signal",
-  { skip },
+  { skip: skipDroplet },
   async (t) => {
     const alias = `api-${dropletDeploymentUuid.replaceAll("-", "")}`;
     for (const phase of ["reload", "state publication"]) {
@@ -3168,7 +3193,7 @@ exec /bin/mv "$@"`,
 
 test(
   "droplet deploy finishes HTTP route failure handling before honoring a signal",
-  { skip },
+  { skip: skipDroplet },
   async (t) => {
     for (const route of ["# old route\n", undefined]) {
       await t.test(route ? "existing route" : "first deployment", async (t) => {
@@ -3207,7 +3232,7 @@ test(
 
 test(
   "droplet deploy does not start the old container again when a signal arrives after the route switch",
-  { skip },
+  { skip: skipDroplet },
   async (t) => {
     const setup = setupDroplet(t, udpArgs, {
       old: ["old1"],
@@ -3240,7 +3265,7 @@ const oldestImage = `registry.digitalocean.com/delino/api@sha256:${"1".repeat(64
 
 test(
   "droplet deploy records the image and fails when the cleanup of an old container fails",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const cases = [
       {
@@ -3301,7 +3326,7 @@ const imageCalls = (calls) =>
 
 test(
   "droplet deploy removes the image of a removed old container after the removal",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const result = runDroplet(t, undefined, { old: ["old1"] });
     assert.equal(result.status, 0, result.stdout + result.stderr);
@@ -3319,7 +3344,7 @@ test(
 
 test(
   "droplet deploy removes no image when the old container ran the new image",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     // A retry of the same image after a failed cleanup.
     const result = runDroplet(t, undefined, {
@@ -3331,31 +3356,35 @@ test(
   },
 );
 
-test("droplet deploy removes each distinct old image once", { skip }, (t) => {
-  const result = runDroplet(t, undefined, {
-    old: ["old1", "old2", "old3"],
-    env: {
-      STUB_OLD_IMAGES: `old1=${olderImage} old2=${oldestImage} old3=${olderImage}`,
-    },
-  });
-  assert.equal(result.status, 0, result.stdout + result.stderr);
-  // old3 shares the image of old1, so the image goes after the last
-  // container that used it, and only once.
-  assert.deepEqual(imageCalls(result.calls), [
-    `docker image rm ${olderImage}`,
-    `docker image rm ${oldestImage}`,
-    "docker image prune --force",
-  ]);
-  const lastRm = result.calls.lastIndexOf("docker rm old3");
-  assert.ok(
-    lastRm > 0 &&
-      lastRm < result.calls.indexOf(`docker image rm ${olderImage}`),
-  );
-});
+test(
+  "droplet deploy removes each distinct old image once",
+  { skip: skipDroplet },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      old: ["old1", "old2", "old3"],
+      env: {
+        STUB_OLD_IMAGES: `old1=${olderImage} old2=${oldestImage} old3=${olderImage}`,
+      },
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    // old3 shares the image of old1, so the image goes after the last
+    // container that used it, and only once.
+    assert.deepEqual(imageCalls(result.calls), [
+      `docker image rm ${olderImage}`,
+      `docker image rm ${oldestImage}`,
+      "docker image prune --force",
+    ]);
+    const lastRm = result.calls.lastIndexOf("docker rm old3");
+    assert.ok(
+      lastRm > 0 &&
+        lastRm < result.calls.indexOf(`docker image rm ${olderImage}`),
+    );
+  },
+);
 
 test(
   "droplet deploy still succeeds and prunes when the removal of an old image fails",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const result = runDroplet(t, undefined, {
       old: ["old1"],
@@ -3381,7 +3410,7 @@ test(
 
 test(
   "droplet deploy keeps the image of an old container that it could not remove or inspect",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     // old1 stays (its removal fails), so its image stays; old2 shares that
     // image. old3 has an unreadable image and old4 has its own image.
@@ -3412,7 +3441,7 @@ test(
 
 test(
   "droplet deploy removes the old image of a service with UDP ports",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     // The previous containers are already stopped when the cleanup starts.
     const result = runDroplet(t, udpArgs, { old: ["old1"] });
@@ -3430,7 +3459,7 @@ test(
 
 test(
   "droplet deploy keeps the previous image after an interrupted state write",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     // An interrupted earlier attempt left `current` empty or missing while
     // `previous` still names the image that served before it. Recording the
@@ -3460,7 +3489,7 @@ test(
 
 test(
   "droplet deploy keeps the previous image when a retry finishes a failed cleanup",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     // The first attempt switched the route and recorded the image, but could
     // not stop the old container. The retry deploys the same image again.
@@ -3487,7 +3516,7 @@ test(
 
 test(
   "droplet deploy keeps both state files when the health check or the proxy reload fails",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     for (const env of [{ STUB_HEALTHY: "0" }, { STUB_RELOAD: "1" }]) {
       const result = runDroplet(t, undefined, {
@@ -3511,7 +3540,7 @@ test(
 
 test(
   "droplet deploy fails before it starts a container when the container list cannot be read",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const result = runDroplet(t, undefined, {
       old: ["old1"],
@@ -3528,7 +3557,7 @@ test(
 
 test(
   "droplet deploy removes an unhealthy container and keeps the old one",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     for (const env of [{ STUB_HEALTHY: "0" }, { STUB_STATUS: "exited" }]) {
       const result = runDroplet(t, undefined, { old: ["old1"], env });
@@ -3558,7 +3587,7 @@ test(
 
 test(
   "droplet deploy removes the replacement and keeps everything else when docker run fails",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const route = "# old route\n";
     const options = {
@@ -3610,7 +3639,7 @@ test(
 
 test(
   "droplet deploy removes the replacement and stops nothing when docker create fails",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const route = "# old route\n";
     const result = runDroplet(t, udpArgs, {
@@ -3639,38 +3668,251 @@ test(
   },
 );
 
-test("droplet deploy accepts only a 2xx health status", { skip }, (t) => {
-  for (const code of ["200", "204"]) {
-    const result = runDroplet(t, undefined, {
+test(
+  "droplet deploy validates the decimal health timeout before the UDP handoff",
+  { skip: skipDroplet },
+  (t) => {
+    const options = {
       old: ["old1"],
-      env: { STUB_HTTP_CODE: code },
+      route: "# old route\n",
+      state: `${olderImage}\n`,
+      previous: `${oldestImage}\n`,
+    };
+    for (const timeout of [
+      "-1",
+      "+8",
+      "8.5",
+      " 8",
+      "1+2",
+      "9223372037",
+      "999999999999999999999999",
+    ]) {
+      const result = runDroplet(t, udpArgs, {
+        ...options,
+        env: { DROPLET_HEALTH_TIMEOUT: timeout },
+      });
+      assert.equal(result.status, 1, timeout);
+      assert.match(
+        result.stderr,
+        /DROPLET_HEALTH_TIMEOUT must be a whole number of seconds/,
+        timeout,
+      );
+      assert.deepEqual(result.calls, [""], timeout);
+      assert.equal(
+        result.read("caddy/sites/api.caddy"),
+        options.route,
+        timeout,
+      );
+      assert.equal(result.read("state/api.current"), options.state, timeout);
+      assert.equal(
+        result.read("state/api.previous"),
+        options.previous,
+        timeout,
+      );
+    }
+
+    const zero = runDroplet(t, udpArgs, {
+      ...options,
+      env: { DROPLET_HEALTH_TIMEOUT: "000" },
     });
-    assert.equal(result.status, 0, code + result.stdout + result.stderr);
-    assert.ok(result.calls.some((call) => call.startsWith("docker stop")));
-  }
-  for (const code of ["302", "307", "404", "500", "000"]) {
+    assert.equal(zero.status, 1);
+    assert.match(zero.stderr, /did not pass the health check within 0 seconds/);
+    assert.ok(!zero.calls.some((call) => call.startsWith("docker inspect")));
+    assert.match(zero.calls.at(-2), /^docker rm --force api-/);
+    assert.equal(zero.calls.at(-1), "docker start old1");
+
+    for (const [timeout, seconds] of [
+      ["08", 8],
+      ["09", 9],
+      ["010", 10],
+      [undefined, 120],
+      ["", 120],
+    ]) {
+      const result = runDroplet(t, udpArgs, {
+        ...options,
+        env: { DROPLET_HEALTH_TIMEOUT: timeout, STUB_STATUS: "exited" },
+        stubs: { timeout: 'shift 2; exec "$@"' },
+      });
+      assert.equal(result.status, 1, timeout);
+      assert.match(result.stderr, /is exited, not running/, timeout);
+      const limit = result.calls.find((call) => call.startsWith("timeout "));
+      const budget = Number(
+        limit.match(/^timeout --signal=KILL ([0-9.]+)s /)[1],
+      );
+      assert.ok(budget > seconds - 0.5 && budget <= seconds, limit);
+      assert.ok(!result.calls.some((call) => call.startsWith("curl")));
+      assert.match(result.calls.at(-2), /^docker rm --force api-/, timeout);
+      assert.equal(result.calls.at(-1), "docker start old1", timeout);
+    }
+  },
+);
+
+test(
+  "droplet deploy preserves the serving route and image state when a probe outlives the deadline",
+  { skip: skipDroplet },
+  (t) => {
+    for (const args of [httpArgs, udpArgs]) {
+      const route = "# old route\n";
+      const current = `${olderImage}\n`;
+      const previous = `${oldestImage}\n`;
+      const result = runDroplet(t, args, {
+        old: ["old1"],
+        route,
+        state: current,
+        previous,
+        env: { DROPLET_HEALTH_TIMEOUT: "1" },
+        stubs: { curl: "trap '' TERM; sleep 2; printf 200" },
+        watchdog: 3000,
+      });
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(
+        result.stderr,
+        /did not pass the health check within 1 seconds/,
+      );
+      assert.ok(result.calls.some((call) => call.startsWith("curl")));
+      assert.ok(result.elapsedMs < 1800, `took ${result.elapsedMs} ms`);
+      assert.ok(!result.calls.some((call) => call.startsWith("docker exec")));
+      assert.equal(result.read("caddy/sites/api.caddy"), route);
+      assert.equal(result.read("state/api.current"), current);
+      assert.equal(result.read("state/api.previous"), previous);
+      if (args === udpArgs) {
+        assert.ok(result.calls.includes("docker stop --time 30 old1"));
+        assert.match(result.calls.at(-2), /^docker rm --force api-/);
+        assert.equal(result.calls.at(-1), "docker start old1");
+      } else {
+        assert.match(result.calls.at(-1), /^docker rm --force api-/);
+        assert.ok(!result.calls.some((call) => call.startsWith("docker stop")));
+      }
+    }
+  },
+);
+
+test(
+  "droplet deploy bounds both inspections and the retry pause by the remaining health budget",
+  { skip: skipDroplet },
+  (t) => {
+    for (const env of [
+      { STUB_BLOCK_ON: "inspect*State.Status*" },
+      { STUB_BLOCK_ON: "inspect*NetworkSettings*" },
+      { STUB_HTTP_CODE: "503" },
+    ]) {
+      const result = runDroplet(t, undefined, {
+        env: {
+          DROPLET_HEALTH_TIMEOUT: "1",
+          STUB_BLOCK_IGNORES_TERM: "1",
+          ...env,
+        },
+        watchdog: 2600,
+      });
+      const label = JSON.stringify(env);
+      assert.equal(
+        result.status,
+        1,
+        `${label} ${result.error ?? result.stderr}`,
+      );
+      assert.match(
+        result.stderr,
+        /did not pass the health check within 1 seconds/,
+        label,
+      );
+      assert.ok(
+        result.elapsedMs < 2000,
+        `${label} took ${result.elapsedMs} ms`,
+      );
+      assert.equal(
+        result.calls.filter((call) => call.startsWith("curl")).length,
+        env.STUB_BLOCK_ON ? 0 : 1,
+        label,
+      );
+    }
+  },
+);
+
+test(
+  "droplet deploy shares the deadline across a slow inspection and probe",
+  { skip: skipDroplet },
+  (t) => {
     const result = runDroplet(t, undefined, {
-      old: ["old1"],
-      env: { STUB_HTTP_CODE: code },
+      env: { DROPLET_HEALTH_TIMEOUT: "1", STUB_STATUS_DELAY: "0.6" },
+      stubs: { curl: "sleep 0.6; printf 204" },
+      watchdog: 2600,
     });
-    assert.equal(result.status, 1, code);
-    assert.match(result.stderr, /did not pass the health check/, code);
-    assert.ok(
-      result.calls.some((call) => call.startsWith("docker rm --force api-")),
-      code,
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /did not pass the health check within 1 seconds/,
     );
-    assert.ok(
-      !result.calls.some((call) => call.startsWith("docker stop")),
-      code,
+    assert.ok(result.calls.some((call) => call.startsWith("curl")));
+    assert.ok(!result.calls.some((call) => call.startsWith("docker exec")));
+  },
+);
+
+test(
+  "droplet deploy rejects a 2xx response observed after the deadline",
+  { skip: skipDroplet },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      env: { DROPLET_HEALTH_TIMEOUT: "1" },
+      stubs: {
+        // Simulate the command returning before its timer is handled.
+        timeout: 'shift 2; exec "$@"',
+        curl: "sleep 1.2; printf 200",
+      },
+      watchdog: 2600,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /did not pass the health check within 1 seconds/,
     );
-    assert.equal(result.read("caddy/sites/api.caddy"), undefined, code);
-    assert.equal(result.read("state/api.current"), undefined, code);
-  }
-});
+    assert.ok(!result.calls.some((call) => call.startsWith("docker exec")));
+  },
+);
+
+test(
+  "droplet deploy accepts only a 2xx health status",
+  { skip: skipDroplet },
+  (t) => {
+    for (const code of ["200", "204"]) {
+      const result = runDroplet(t, undefined, {
+        old: ["old1"],
+        env: { STUB_HTTP_CODE: code, DROPLET_HEALTH_TIMEOUT: "7" },
+        stubs: {
+          timeout: 'exec "$(PATH="${PATH#*:}" command -v timeout)" "$@"',
+        },
+      });
+      assert.equal(result.status, 0, code + result.stdout + result.stderr);
+      assert.ok(result.calls.some((call) => call.startsWith("docker stop")));
+      assert.ok(
+        result.calls.some((call) =>
+          call.startsWith("timeout --signal=KILL 5.00s curl "),
+        ),
+      );
+    }
+    for (const code of ["302", "307", "404", "500", "000"]) {
+      const result = runDroplet(t, undefined, {
+        old: ["old1"],
+        env: { STUB_HTTP_CODE: code },
+      });
+      assert.equal(result.status, 1, code);
+      assert.match(result.stderr, /did not pass the health check/, code);
+      assert.ok(
+        result.calls.some((call) => call.startsWith("docker rm --force api-")),
+        code,
+      );
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker stop")),
+        code,
+      );
+      assert.equal(result.read("caddy/sites/api.caddy"), undefined, code);
+      assert.equal(result.read("state/api.current"), undefined, code);
+    }
+  },
+);
 
 test(
   "droplet deploy restores the route when the proxy rejects it",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const previous = "# old route\nold.example.com {\n}\n";
     const result = runDroplet(t, undefined, {
@@ -3696,7 +3938,7 @@ test(
 
 test(
   "droplet deploy fails and keeps the route when a route step fails",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const previous = "# old route\nold.example.com {\n}\n";
     const current = `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}\n`;
@@ -3761,7 +4003,7 @@ test(
 
 test(
   "droplet deploy prints the replacement logs before it removes it when the route fails",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     // A failing `docker logs` must neither stop the cleanup nor change the
     // verdict.
@@ -3820,7 +4062,7 @@ const concurrentImage = `registry.digitalocean.com/delino/api@sha256:${"f".repea
 
 test(
   "droplet deploy serializes concurrent deployments of one service",
-  { skip },
+  { skip: skipDroplet },
   async (t) => {
     const setup = setupDroplet(t, undefined, {
       old: ["old1"],
@@ -3888,7 +4130,7 @@ test(
 
 test(
   "droplet deploy gives up without a change when the lock stays held",
-  { skip },
+  { skip: skipDroplet },
   async (t) => {
     const setup = setupDroplet(t, undefined, {
       old: ["old1"],
@@ -3925,7 +4167,7 @@ test(
 
 test(
   "droplet deploy does not make deployments of different services wait",
-  { skip },
+  { skip: skipDroplet },
   async (t) => {
     const setup = setupDroplet(t, undefined, {
       old: ["old1"],
@@ -3963,7 +4205,7 @@ test(
 
 test(
   "droplet deploy fails before any change when the lock file cannot be opened",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const result = runDroplet(t, undefined, {
       // A directory in the place of the lock file.
@@ -3979,7 +4221,7 @@ test(
 
 test(
   "droplet deploy rejects bad arguments and configuration before any change",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const image = dropletImage;
     for (const [args, options, message] of [
@@ -4883,7 +5125,7 @@ test("start-caddy rejects a bad readiness setting", { skip }, (t) => {
 // `release-docker` file) and start the deployment of another service.
 const hasPgrep = spawnSync("sh", ["-c", "command -v pgrep"]).status === 0;
 const skipProxyLock =
-  skip || (!hasPgrep && "pgrep is not installed (procps is missing)");
+  skipDroplet || (!hasPgrep && "pgrep is not installed (procps is missing)");
 const workerArgs = [
   "worker",
   concurrentImage,
