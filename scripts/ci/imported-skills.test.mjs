@@ -172,6 +172,15 @@ test("a missing skill directory is reported", (t) => {
   assert.deepEqual(kinds(f.root), [ProblemKind.SkillDirectoryMissing]);
 });
 
+test("a regular file at the skill root is reported as a missing directory", (t) => {
+  const f = fixture(t);
+  const path = `${SkillsDirectory}/licensed`;
+  rmSync(join(f.root, path), { recursive: true });
+  f.write(path, "regular file\n");
+  assert.deepEqual(kinds(f.root), [ProblemKind.SkillDirectoryMissing]);
+  assert.throws(() => buildManifest(f.root), /licensed does not exist/u);
+});
+
 test("a missing SKILL.md is reported", (t) => {
   const f = fixture(t);
   f.remove(`${SkillsDirectory}/licensed/SKILL.md`);
@@ -292,6 +301,48 @@ test("the repository copy test reads the checked-in tree unchanged", (t) => {
 // Creating a symbolic link needs a privilege or developer mode on Windows, so
 // the link fixtures run on other platforms only.
 const symlinkTest = process.platform === "win32" ? test.skip : test;
+
+for (const targetExists of [true, false]) {
+  symlinkTest(
+    `a ${targetExists ? "directory" : "dangling"} link at a skill root is rejected`,
+    (t) => {
+      const f = fixture(t);
+      const path = `${SkillsDirectory}/demo`;
+      const target = join(f.root, "target");
+      rmSync(join(f.root, path), { recursive: true });
+      if (targetExists) {
+        mkdirSync(target);
+      }
+      symlinkSync(target, join(f.root, path), "dir");
+      f.write(`${SkillsDirectory}/licensed/SKILL.md`, "# Changed\n");
+
+      const [rootProblem, laterProblem, ...extra] = verifyImportedSkills(
+        f.root,
+      );
+      assert.equal(rootProblem.kind, ProblemKind.SymlinkUnsupported);
+      assert.equal(rootProblem.skill, "demo");
+      assert.equal(rootProblem.path, path);
+      assert.ok(rootProblem.message.startsWith(`${path} is a symbolic link`));
+      assert.equal(laterProblem.kind, ProblemKind.FileChanged);
+      assert.equal(laterProblem.skill, "licensed");
+      assert.deepEqual(extra, []);
+
+      const manifest = readFileSync(join(f.root, ManifestFile));
+      const result = spawnSync(
+        process.execPath,
+        [script, "--root", f.root, "--write-manifest"],
+        { encoding: "utf8" },
+      );
+      assert.equal(result.status, 2);
+      assert.ok(
+        result.stderr.startsWith(
+          `imported_skills_error ${path} is a symbolic link`,
+        ),
+      );
+      assert.deepEqual(readFileSync(join(f.root, ManifestFile)), manifest);
+    },
+  );
+}
 
 symlinkTest(
   "a relative in-tree symbolic link is reported with its path",
