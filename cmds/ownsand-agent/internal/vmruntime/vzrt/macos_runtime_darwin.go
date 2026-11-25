@@ -88,57 +88,15 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 	if !macOSGuestsSupported {
 		return nil, fmt.Errorf("%w: macOS guests need an Apple silicon Mac", vmruntime.ErrUnsupported)
 	}
-	src := r.opts.MacOSImage
 	diskBytes := spec.Resources.GetDiskGib() << 30
-	if spec.Snapshot != nil {
-		src = spec.Snapshot.Dir
-	} else {
-		if model, detail := r.macOSImage(); model == nil {
-			return nil, fmt.Errorf("%w: %s", vmruntime.ErrUnsupported, detail)
-		}
-		if meta, err := images.Resolve(src); err == nil {
-			if spec.Resources.GetVcpuCount() < meta.MinimumCPUCount || spec.Resources.GetMemoryMib() < meta.MinimumMemoryMiB {
-				return nil, fmt.Errorf("%w: macOS guests need at least %d vCPUs and %d MiB of memory", vmruntime.ErrUnsupported, meta.MinimumCPUCount, meta.MinimumMemoryMiB)
-			}
-		}
-		baseDisk, err := os.Stat(filepath.Join(src, images.MacOSDisk))
-		if err != nil {
-			return nil, fmt.Errorf("vzrt: inspect the macOS base disk: %w", err)
-		}
-		if err := checkBaseDiskCapacity(baseDisk.Size(), diskBytes); err != nil {
-			return nil, err
-		}
-	}
-	model, err := os.ReadFile(filepath.Join(src, images.MacOSHardwareModel))
-	if err != nil {
-		return nil, fmt.Errorf("vzrt: read the macOS hardware model: %w", err)
-	}
-	if !macOSHardwareModelSupported(model) {
-		return nil, fmt.Errorf("%w: this Mac does not support the hardware model of the macOS guest", vmruntime.ErrUnsupported)
-	}
 	start := time.Now()
-	if err := os.RemoveAll(spec.Dir); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(spec.Dir, 0o700); err != nil {
+	model, err := prepareMacOSSource(ctx, spec, r.opts.MacOSImage, macOSHardwareModelSupported, copyFile)
+	if err != nil {
 		return nil, err
 	}
 	v := &vm{id: spec.SandboxID, dir: spec.Dir, network: spec.NetworkMode, guestOS: spec.GuestOS,
 		hardwareModel: model, vcpu: spec.Resources.GetVcpuCount(), memMiB: spec.Resources.GetMemoryMib()}
 	cleanup := func() { r.discard(v) }
-	prepare := func(ctx context.Context) error {
-		if err := copyFile(ctx, filepath.Join(src, images.MacOSDisk), filepath.Join(spec.Dir, diskFile)); err != nil {
-			return fmt.Errorf("vzrt: prepare disk: %w", err)
-		}
-		if err := copyFile(ctx, filepath.Join(src, images.MacOSAuxStorage), filepath.Join(spec.Dir, auxFile)); err != nil {
-			return fmt.Errorf("vzrt: prepare auxiliary storage: %w", err)
-		}
-		return nil
-	}
-	if err := prepare(context.Background()); err != nil {
-		cleanup()
-		return nil, err
-	}
 	r.mu.Lock()
 	r.vms[spec.SandboxID] = v
 	r.mu.Unlock()
@@ -163,7 +121,7 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 		r.mu.Lock()
 		v.machineID = nil
 		r.mu.Unlock()
-		if err := prepare(ctx); err != nil {
+		if err := copyMacOSSource(ctx, spec.Snapshot.Dir, spec.Dir, copyFile); err != nil {
 			cleanup()
 			return nil, err
 		}

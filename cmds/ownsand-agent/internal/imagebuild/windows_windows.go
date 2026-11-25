@@ -196,7 +196,7 @@ func buildWindows(ctx context.Context, dir string, opts Options) (err error) {
 	if err := images.WriteMetadata(build, meta); err != nil {
 		return err
 	}
-	if err := images.Install(dir); err != nil {
+	if err := images.Install(ctx, dir); err != nil {
 		return fmt.Errorf("imagebuild: install the image: %w", err)
 	}
 	logger.Info("Windows image installed", "source", meta.Source, "disk_bytes", size, "file_bytes", fileBytes,
