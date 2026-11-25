@@ -50,12 +50,9 @@ const bashVersion = spawnSync(
   .map(Number) ?? [0, 0];
 // The scripts and the stubs call jq, which the Ubuntu runners provide.
 const hasJq = spawnSync("sh", ["-c", "command -v jq"]).status === 0;
-// droplet-deploy.sh serializes deployments with util-linux `flock`.
-const hasFlock = spawnSync("sh", ["-c", "command -v flock"]).status === 0;
 function skipReason() {
   if (process.platform === "win32") return "the deploy scripts run on Linux";
   if (!hasJq) return "jq is not installed";
-  if (!hasFlock) return "flock is not installed";
   if (bashVersion[0] < 4 || (bashVersion[0] === 4 && bashVersion[1] < 4)) {
     return `the deploy scripts need Bash 4.4 or newer, found ${bashVersion.join(".")}`;
   }
@@ -2358,9 +2355,13 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
 
 // --- droplet-deploy.sh -----------------------------------------------------
 
+// droplet-deploy.sh serializes deployments with util-linux `flock`.
+const hasFlock = spawnSync("sh", ["-c", "command -v flock"]).status === 0;
+
 const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
 const skipDroplet =
   skip ||
+  (!hasFlock && "flock is not installed") ||
   (process.platform !== "linux" &&
     "the Droplet deadline needs Linux /proc/uptime") ||
   (spawnSync("timeout", ["--version"], { encoding: "utf8" }).stdout?.includes(
@@ -5347,7 +5348,7 @@ test(
 
 test(
   "droplet deploy changes no route when the proxy lock file cannot be opened",
-  { skip },
+  { skip: skipDroplet },
   (t) => {
     const route = "# previous api route\n";
     const result = runDroplet(t, undefined, {
