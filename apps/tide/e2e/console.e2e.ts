@@ -189,6 +189,38 @@ describe("organization layout", () => {
   });
 });
 
+describe("organization settings", () => {
+  test("enables saving only when the admin edits the limit", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Globex Admin")).toBeVisible();
+    await app.open(`/orgs/${GLOBEX}/settings`);
+
+    const input = screen.getByLabel("Limit per user");
+    const save = screen.getByRole("button", "Save limit");
+    await expect(input).toBeFocused();
+    await expect(save).toBeDisabled();
+    await browser.keyboard.press("Enter");
+    await expect(save).toBeDisabled();
+
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("4");
+    await expect(save).toBeEnabled();
+    await save.tap();
+    await expect(
+      screen
+        .getByRole("region", "Notifications")
+        .getByText("The dev session limit is saved."),
+    ).toBeVisible();
+    await expect(input).toHaveValue("4");
+    await expect(save).toBeDisabled();
+  });
+});
+
 describe("organization member pagination", () => {
   test("keeps loaded members visible and transfers ownership to a member from the next page", async ({
     app,

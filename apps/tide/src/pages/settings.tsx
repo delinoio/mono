@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "@bufbuild/protobuf";
 import { FieldMaskSchema } from "@bufbuild/protobuf/wkt";
-import { useMutation } from "@connectrpc/connect-query";
+import {
+  createConnectQueryKey,
+  useMutation,
+  useTransport,
+} from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { Button, ButtonVariant } from "delino-ui/button";
@@ -43,15 +47,44 @@ export function SettingsPage() {
 function DevSessionLimit() {
   const { organizationId, organization } = useOrg();
   const queryClient = useQueryClient();
-  const stored = organization.settings?.maxDevSessionsPerUser;
-  const [value, setValue] = useState<number | null>(stored ?? null);
+  const transport = useTransport();
+  const stored = organization.settings?.maxDevSessionsPerUser ?? null;
+  const [draft, setDraft] = useState<{ value: number | null }>();
+  const value = draft ? draft.value : stored;
+  const hasChanges = draft !== undefined && draft.value !== stored;
   const [error, setError] = useState<string>();
   const update = useMutation(
     OrganizationService.method.updateOrganizationSettings,
-    { onSuccess: () => invalidateServices(queryClient, OrganizationService) },
+    {
+      onSuccess: (saved) => {
+        const confirmed = saved.organization;
+        if (confirmed) {
+          const queryKey = createConnectQueryKey({
+            schema: OrganizationService.method.getOrganization,
+            input: { organizationId },
+            transport,
+            cardinality: "finite",
+          });
+          // Keep the confirmed settings available if the follow-up read fails.
+          queryClient.setQueryData(queryKey, (current) =>
+            current?.organization
+              ? {
+                  ...current,
+                  organization: {
+                    ...current.organization,
+                    settings: confirmed.settings,
+                  },
+                }
+              : current,
+          );
+        }
+        return invalidateServices(queryClient, OrganizationService);
+      },
+    },
   );
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (!hasChanges || update.isPending) return;
     const found = devSessionLimitError(value);
     if (found !== undefined) {
       setError(found);
@@ -65,6 +98,8 @@ function DevSessionLimit() {
           paths: ["max_dev_sessions_per_user"],
         }),
       });
+      // Each edit creates a new draft, even if it returns to the submitted value.
+      setDraft((current) => (current === draft ? undefined : current));
       toast.success(
         value === null
           ? "Dev sessions have no per-user limit."
@@ -87,14 +122,14 @@ function DevSessionLimit() {
           label="Limit per user"
           value={value}
           onValueChange={(v) => {
-            setValue(v);
+            setDraft({ value: v });
             setError(undefined);
           }}
           min={1}
           error={error}
           autoFocus
         />
-        <Button type="submit" disabled={update.isPending}>
+        <Button type="submit" disabled={!hasChanges || update.isPending}>
           Save limit
         </Button>
       </form>
