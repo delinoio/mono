@@ -78,6 +78,9 @@ const (
 	PathRuleInvalidWindowsName
 	// PathRuleInvalidUTF8: a local path contains invalid UTF-8.
 	PathRuleInvalidUTF8
+	// PathRuleNormalizationCollision reports paths that collide after Unicode
+	// canonical normalization and case mapping on a macOS guest.
+	PathRuleNormalizationCollision
 )
 
 // String returns the stable identifier of r.
@@ -89,6 +92,8 @@ func (r PathRule) String() string {
 		return "invalid_windows_name"
 	case PathRuleInvalidUTF8:
 		return "invalid_utf8"
+	case PathRuleNormalizationCollision:
+		return "normalization_collision"
 	}
 	return fmt.Sprintf("PathRule(%d)", int(r))
 }
@@ -98,21 +103,28 @@ func (r PathRule) String() string {
 // *connect.Error with the code failed_precondition.
 type PathRuleError struct {
 	Rule PathRule
-	// Paths lists the paths. For a case collision, each group lists the
-	// paths that differ only in case. For other rules, each group has one path.
+	// Paths lists the original paths. For a collision, each group lists the
+	// paths that collide. For other rules, each group has one path.
 	Paths [][]string
 }
 
 func (e *PathRuleError) Error() string {
 	parts := make([]string, 0, len(e.Paths))
 	for _, g := range e.Paths {
-		if e.Rule == PathRuleInvalidUTF8 {
+		switch e.Rule {
+		case PathRuleInvalidUTF8:
 			for _, path := range g {
 				parts = append(parts, fmt.Sprintf("%q", path))
 			}
-			continue
+		case PathRuleNormalizationCollision:
+			quoted := make([]string, 0, len(g))
+			for _, path := range g {
+				quoted = append(quoted, fmt.Sprintf("%+q", path))
+			}
+			parts = append(parts, strings.Join(quoted, " and "))
+		default:
+			parts = append(parts, strings.Join(g, " and "))
 		}
-		parts = append(parts, strings.Join(g, " and "))
 	}
 	switch e.Rule {
 	case PathRuleCaseCollision:
@@ -121,6 +133,8 @@ func (e *PathRuleError) Error() string {
 		return "paths are not valid on a Windows guest: " + strings.Join(parts, ", ")
 	case PathRuleInvalidUTF8:
 		return "paths are not valid UTF-8: " + strings.Join(parts, ", ")
+	case PathRuleNormalizationCollision:
+		return "paths collide after Unicode normalization on macOS: " + strings.Join(parts, "; ") + ". Rename or remove one path in each group before retrying."
 	}
 	return "paths break a sync rule: " + strings.Join(parts, "; ")
 }
