@@ -4,7 +4,7 @@
 // (Cursor, Devin, and later Claude Code and OpenAI Codex) share: JSON
 // requests and responses, Server-Sent Event streams, a base URL per vendor
 // (the production origin, or an httptest server in tests) and typed status
-// errors. It uses only net/http.
+// errors.
 //
 // Logging (docs/servers-tide-api-foundation.md, Logging): every vendor API
 // answer that is not 2xx is logged as vendor_api_error with the vendor, the
@@ -29,6 +29,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/delinoio/mono/servers/tide-api/internal/api"
 )
 
 // Limits of the client.
@@ -218,6 +220,9 @@ func (c *Client) Do(ctx context.Context, op, method, path string, query url.Valu
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	if err := api.CheckOrganizationDeletion(ctx); err != nil {
+		return err
+	}
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", c.Vendor, op, redact(err))

@@ -58,7 +58,7 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 	r.OnOrganizationDeletion(api.OrganizationDeletionHook{
 		Name: "work",
 		Prepare: func(ctx context.Context, d api.OrganizationDeletion) (api.OrganizationDeletionSteps, error) {
-			claim, err := links.ClaimRemoval(ctx, d.OrganizationID)
+			claim, err := links.ClaimOrganizationRemoval(ctx, d)
 			if err != nil {
 				return api.OrganizationDeletionSteps{}, err
 			}
@@ -211,6 +211,9 @@ func (e *Engine) cleanUpRunners(ctx context.Context, orgID string, match func(*R
 			}
 		}
 		if id != "" {
+			if err := api.CheckOrganizationDeletion(ctx); err != nil {
+				return err
+			}
 			if _, err := client.DeleteSandbox(ctx, id); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
 				// A key that OwnSand no longer accepts cannot delete the
 				// sandbox; its idle_ttl ends it.

@@ -120,3 +120,39 @@ func TestWatchQueueTransactionMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestOrganizationDeletionIntentMigration verifies that existing link
+// removal claims keep their original owner after the forward migration.
+func TestOrganizationDeletionIntentMigration(t *testing.T) {
+	ctx := t.Context()
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, 11))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	const orgID = "00000000-0000-0000-0000-000000000001"
+	if _, err := d.Pool.Exec(ctx, `
+		INSERT INTO organizations (organization_id, name, create_time)
+		VALUES ('00000000-0000-0000-0000-000000000001', 'legacy', now());
+		INSERT INTO ownsand_links (organization_id, ownsand_link_id, ownsand_organization_id,
+			state, removing, api_key_key_id, api_key_ciphertext, credential_set_time, create_time)
+		VALUES ('00000000-0000-0000-0000-000000000001', gen_random_uuid(), gen_random_uuid(),
+			1, true, 'fixture', '', now(), now());`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, slog.New(slog.NewJSONHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+	var removing bool
+	var orgAttempt, linkAttempt *string
+	if err := d.Pool.QueryRow(ctx, `
+		SELECT l.removing, o.deletion_attempt_id::text, l.organization_deletion_attempt_id::text
+		FROM organizations o JOIN ownsand_links l USING (organization_id) WHERE o.organization_id = $1`,
+		orgID).Scan(&removing, &orgAttempt, &linkAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if !removing || orgAttempt != nil || linkAttempt != nil {
+		t.Fatalf("migration changed a standalone link claim: removing = %v, organization attempt = %v, link attempt = %v", removing, orgAttempt, linkAttempt)
+	}
+	t.Log("Forward migration preserved the existing standalone link removal claim and left both attempt IDs unset.")
+}
