@@ -22,6 +22,7 @@ import (
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
+	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 )
 
@@ -256,6 +257,14 @@ func TestDevSessionFileReadRotation(t *testing.T) {
 	data := make([]byte, 1500)
 	rand.Read(data)
 	w.fake.SetFile(w.osOrg, sandboxID, "/home/dev/work/"+path, data)
+	expired := make(chan error, 1)
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.OnFileRead = func(ctx context.Context, p ownsand.FileReadParams) {
+			if p.Offset == 0 {
+				context.AfterFunc(ctx, func() { expired <- ctx.Err() })
+			}
+		}
+	})
 	readID := api.NewID()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -277,7 +286,14 @@ func TestDevSessionFileReadRotation(t *testing.T) {
 	// Wait for the first chunk to start filling the receive window. Keep it
 	// blocked through relay rotation, then drain it during the write grace.
 	_ = stream.ResponseHeader()
-	time.Sleep(relayLimit)
+	select {
+	case err := <-expired:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("upstream context = %v, want relay deadline", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the blocked read did not reach its relay deadline")
+	}
 	if !stream.Receive() {
 		t.Fatalf("missing first chunk: %v", stream.Err())
 	}
