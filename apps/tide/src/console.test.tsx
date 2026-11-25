@@ -141,6 +141,27 @@ async function type(element: HTMLElement, value: string) {
   });
 }
 
+function gatedTransport(methodName: string) {
+  const mock = createMockTransport();
+  const calls: {
+    input: unknown;
+    settle(error?: ConnectError): void;
+  }[] = [];
+  const transport: Transport = {
+    ...mock,
+    async unary(method, ...args) {
+      if (method.name === methodName) {
+        const error = await new Promise<ConnectError | undefined>((settle) => {
+          calls.push({ input: args[3], settle });
+        });
+        if (error) throw error;
+      }
+      return mock.unary(method, ...args);
+    },
+  };
+  return { transport, calls };
+}
+
 /** Every value that the console keeps in browser storage. */
 function storedText(): string {
   return JSON.stringify({ ...window.sessionStorage, ...window.localStorage });
@@ -1925,6 +1946,165 @@ describe("personal API keys", () => {
   });
 });
 
+describe("form dialog openings", () => {
+  const apiKeysPath = `/orgs/${MOCK_IDS.acme}/api-keys`;
+  const secretTitle = "Your new personal API key";
+
+  function createKeyButton(dialog: HTMLElement) {
+    return within(dialog).getByRole<HTMLButtonElement>("button", {
+      name: "Create key",
+    });
+  }
+
+  async function openCreateKey(name: string) {
+    await click(await screen.findByRole("button", { name: "Create API key" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Create a personal API key",
+    });
+    await type(within(dialog).getByRole("textbox", { name: "Name" }), name);
+    return dialog;
+  }
+
+  async function dismiss(dialog: HTMLElement) {
+    await act(async () => fireEvent.keyDown(dialog, { key: "Escape" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  }
+
+  test("submits a reopened form while the first request is still pending", async () => {
+    const { transport, calls } = gatedTransport("CreateApiKey");
+    renderConsole(apiKeysPath, { transport });
+    const first = await openCreateKey("first-key");
+    await click(createKeyButton(first));
+    expect(createKeyButton(first).disabled).toBe(true);
+    await dismiss(first);
+
+    const second = await openCreateKey("second-key");
+    const submit = createKeyButton(second);
+    expect(submit.disabled).toBe(false);
+    await click(submit);
+    expect(calls.map(({ input }) => input)).toEqual([
+      expect.objectContaining({ name: "first-key" }),
+      expect.objectContaining({ name: "second-key" }),
+    ]);
+
+    await act(async () =>
+      calls[0].settle(
+        new ConnectError("First request failed", Code.FailedPrecondition),
+      ),
+    );
+    await settle();
+    expect(within(second).queryByRole("alert")).toBeNull();
+    expect(submit.disabled).toBe(true);
+
+    await act(async () => calls[1].settle());
+    expect(
+      await screen.findByRole("dialog", { name: secretTitle }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("dialog", { name: "Create a personal API key" }),
+    ).toBeNull();
+  });
+
+  test("shows a current failure and allows a retry", async () => {
+    const { transport, calls } = gatedTransport("CreateApiKey");
+    renderConsole(apiKeysPath, { transport });
+    const dialog = await openCreateKey("retry-key");
+    const submit = createKeyButton(dialog);
+    await click(submit);
+    await act(async () =>
+      calls[0].settle(
+        new ConnectError("Key creation failed", Code.FailedPrecondition),
+      ),
+    );
+    expect(await within(dialog).findByRole("alert")).toHaveProperty(
+      "textContent",
+      "Key creation failed",
+    );
+    expect(submit.disabled).toBe(false);
+
+    await click(submit);
+    expect(calls).toHaveLength(2);
+    expect(within(dialog).queryByRole("alert")).toBeNull();
+    await act(async () => calls[1].settle());
+    const secret = await screen.findByRole("dialog", { name: secretTitle });
+    expect(within(secret).getByLabelText("API key").textContent).toMatch(
+      /^tide_/,
+    );
+    await dismiss(secret);
+    expect(await screen.findByText("retry-key · Active")).toBeTruthy();
+  });
+
+  test.each([true, false])(
+    "refreshes the key list after a dismissed success with a reopened form: %s",
+    async (reopen) => {
+      const { transport, calls } = gatedTransport("CreateApiKey");
+      renderConsole(apiKeysPath, { transport });
+      const first = await openCreateKey("created-key");
+      await click(createKeyButton(first));
+      await dismiss(first);
+      const second = reopen ? await openCreateKey("draft-key") : undefined;
+
+      await act(async () => calls[0].settle());
+      expect(await screen.findByText("created-key · Active")).toBeTruthy();
+      expect(screen.queryByRole("dialog", { name: secretTitle })).toBeNull();
+      if (second !== undefined) {
+        expect(
+          screen.getByRole("dialog", { name: "Create a personal API key" }),
+        ).toBe(second);
+        expect(
+          within(second).getByRole("textbox", { name: "Name" }),
+        ).toHaveProperty("value", "draft-key");
+      }
+    },
+  );
+
+  test("refreshes the invitation list without replacing the reopened form with a link", async () => {
+    const { transport, calls } = gatedTransport("CreateInvitation");
+    renderConsole(`/orgs/${MOCK_IDS.globex}/members`, { transport });
+    const invite = await screen.findByRole("button", {
+      name: "Invite someone",
+    });
+    await click(invite);
+    const first = await screen.findByRole("dialog", { name: "Invite someone" });
+    await click(within(first).getByRole("button", { name: "Create link" }));
+    await dismiss(first);
+    await click(invite);
+    const second = await screen.findByRole("dialog", {
+      name: "Invite someone",
+    });
+
+    await act(async () => calls[0].settle());
+    expect(await screen.findByText(/Member invitation/)).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Invite someone" })).toBe(second);
+    expect(
+      screen.queryByRole("dialog", { name: "Your invitation link" }),
+    ).toBeNull();
+  });
+
+  test("refreshes the organization list without navigating after dismissal", async () => {
+    const { transport, calls } = gatedTransport("CreateOrganization");
+    renderConsole("/", { transport });
+    await click(
+      await screen.findByRole("button", { name: "Create organization" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Create an organization",
+    });
+    await type(
+      within(dialog).getByRole("textbox", { name: "Organization name" }),
+      "New testing org",
+    );
+    await click(within(dialog).getByRole("button", { name: "Create" }));
+    await dismiss(dialog);
+
+    await act(async () => calls[0].settle());
+    expect(
+      await screen.findByRole("link", { name: /New testing org/ }),
+    ).toBeTruthy();
+    expect(window.location.pathname).toBe("/");
+  });
+});
+
 describe("personal API key pages", () => {
   test("shows the keys after the first page", async () => {
     const transport = createMockTransport();
@@ -2251,29 +2431,6 @@ describe("failed query refreshes", () => {
 });
 
 describe("confirmation dialog requests", () => {
-  function gatedTransport(methodName: string) {
-    const mock = createMockTransport();
-    const calls: {
-      input: unknown;
-      settle(error?: ConnectError): void;
-    }[] = [];
-    const transport: Transport = {
-      ...mock,
-      async unary(method, ...args) {
-        if (method.name === methodName) {
-          const error = await new Promise<ConnectError | undefined>(
-            (settle) => {
-              calls.push({ input: args[3], settle });
-            },
-          );
-          if (error) throw error;
-        }
-        return mock.unary(method, ...args);
-      },
-    };
-    return { transport, calls };
-  }
-
   const seededKey = "claude-on-laptop";
   const failure = new ConnectError(
     "Revocation failed",

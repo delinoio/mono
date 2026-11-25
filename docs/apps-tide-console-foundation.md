@@ -84,6 +84,7 @@ Organization owners, admins and members who sign in with Logto.
 - The console hides actions that the user's role does not allow; the control plane still enforces every permission.
 - The organization layout supports viewports 320 px wide and wider. From 320 through 760 px, the section list scrolls horizontally above the page content. At 761 px and wider, the section list stacks vertically in a 220 px column.
 - UX follows the Toss Design Guidelines. Dialogs close with `Esc`. A form with a single critical input focuses it when it opens.
+- Each form dialog opening starts without a pending request or a submission error. Only the opening that sent a request can show its error, finish its pending state, or act on its success by closing the form, navigating, or showing a one-time secret or link. A failure in the current opening allows a retry. Successful requests refresh the affected data even after dismissal. A key or invitation created after dismissal appears in its list, and the console cannot show its secret or link again.
 
 ## Storage
 
