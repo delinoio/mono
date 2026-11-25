@@ -12,21 +12,13 @@
 #   root    provisioning root; `<root>/caddy` is mounted as /etc/caddy.
 #   network Docker network that the container joins.
 #
-# The script handles the state of the `caddy` container in one of three ways,
-# so the certificates in the `caddy-data` volume and the open connections stay
-# whenever the image did not change:
-#   - The container is missing, or it uses another image: obtain the pinned
-#     image first (a `docker pull`, only when the image is not already
-#     local), then remove the old container (if present) and create it with
-#     the pinned image. A failing pull fails the script before the old
-#     container is touched, so the proxy keeps serving; a local image needs no
-#     registry connection.
-#   - The container uses the pinned image and is not running (for example
-#     after `docker stop`, which `--restart unless-stopped` does not undo):
-#     start it. `docker exec` cannot reload a stopped container, and the
-#     started container reads the Caddyfile that `provision.sh` just wrote.
-#   - The container uses the pinned image and is running: reload the
-#     configuration without recreating it.
+# Create Caddy with the pinned image and the `local` log driver. Recreate
+# an existing container if its image or log driver differs. Recreation
+# preserves the certificates in the `caddy-data` volume and can interrupt
+# open connections. Obtain the image before removing the old container.
+# Keep the old container if its settings cannot be read or the pull fails.
+# When both settings match, start a stopped container or reload a running
+# one. A container reads the current Caddyfile when it starts.
 # After the create and start paths the script waits until the new Caddy
 # process answers its admin API, because a successful `docker run` or
 # `docker start` only means that Docker accepted the start: Caddy can still
@@ -134,25 +126,38 @@ wait_ready() {
   return 1
 }
 
-# A missing container makes `docker inspect` fail, which leaves both values
-# empty and selects the create path below.
+# List by exact name to distinguish an absent container from an inspect
+# failure. Keep the ID so removal targets only the container we inspected.
+current_id="$(docker container ls --all --no-trunc --filter 'name=^/caddy$' --format '{{.ID}}')"
 current_image=""
 running=""
-read -r current_image running < <(
-  docker inspect --format '{{.Config.Image}} {{.State.Running}}' caddy 2> /dev/null || true
-) || true
+current_log_driver=""
+if [[ -n "$current_id" ]]; then
+  if ! settings="$(docker container inspect --format '{{.Config.Image}} {{.State.Running}} {{.HostConfig.LogConfig.Type}}' "$current_id")"; then
+    echo "error: cannot inspect the settings of the caddy container." >&2
+    exit 1
+  fi
+  read -r current_image running current_log_driver <<< "$settings"
+  if [[ -z "$current_log_driver" || "$current_log_driver" == '<no value>' ]]; then
+    echo "error: cannot determine the log driver of the caddy container." >&2
+    exit 1
+  fi
+fi
 
-if [[ "$current_image" != "$caddy_image" ]]; then
+if [[ "$current_image" != "$caddy_image" || "$current_log_driver" != "local" ]]; then
   # Obtain the pinned image before the old container goes away. `docker run`
   # would pull it implicitly, but only after the removal, so an unreachable
   # registry would leave the Droplet without a proxy. When the pull fails,
   # `set -e` ends the script here with the pull diagnostic and the old
   # container keeps running.
   docker image inspect "$caddy_image" > /dev/null 2>&1 || docker pull "$caddy_image"
-  docker rm --force caddy > /dev/null 2>&1 || true
+  if [[ -n "$current_id" ]]; then
+    docker rm --force "$current_id" > /dev/null
+  fi
   docker run --detach --name caddy \
     --network "$network" \
     --restart unless-stopped \
+    --log-driver local \
     --publish 80:80 --publish 443:443 --publish 443:443/udp \
     --volume "$root/caddy:/etc/caddy:ro" \
     --volume caddy-data:/data \
