@@ -89,6 +89,11 @@ describe("organizations", () => {
     await expect(
       screen.getByRole("button", "Sign in with Delino"),
     ).toBeHidden();
+    await expect(
+      screen.getByText(
+        "Sign-in did not start. Check your connection and try again.",
+      ),
+    ).toBeHidden();
   });
 
   test("creates an organization from a dialog that focuses its only input", async ({

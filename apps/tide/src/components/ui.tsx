@@ -66,16 +66,19 @@ export function Loading({ label = "Loading" }: { label?: string }) {
   );
 }
 
-function SignInButton() {
+export function SignInAction({ variant }: { variant?: ButtonVariant }) {
   const auth = useAuth();
   return (
-    <Button
-      type="button"
-      variant={ButtonVariant.Secondary}
-      onClick={() => auth.signIn()}
-    >
-      Sign in with Delino
-    </Button>
+    <>
+      <Button type="button" variant={variant} onClick={() => auth.signIn()}>
+        Sign in with Delino
+      </Button>
+      {auth.signInFailed ? (
+        <p className="sign-in-failure" role="alert">
+          Sign-in did not start. Check your connection and try again.
+        </p>
+      ) : null}
+    </>
   );
 }
 
@@ -89,17 +92,21 @@ export function ErrorNotice({
   error: unknown;
   onRetry?: () => void;
 }) {
-  const sessionEnded =
-    error instanceof ConnectError && error.code === Code.Unauthenticated;
+  if (error instanceof ConnectError && error.code === Code.Unauthenticated) {
+    return (
+      <div className="notice notice-error">
+        <p role="alert">{errorMessage(error)}</p>
+        <SignInAction variant={ButtonVariant.Secondary} />
+      </div>
+    );
+  }
   return (
     <div className="notice notice-error" role="alert">
       <p>
-        {title && !sessionEnded ? `${title} ` : null}
+        {title ? `${title} ` : null}
         {errorMessage(error, title === undefined ? undefined : "")}
       </p>
-      {sessionEnded ? (
-        <SignInButton />
-      ) : onRetry ? (
+      {onRetry ? (
         <Button
           type="button"
           variant={ButtonVariant.Secondary}

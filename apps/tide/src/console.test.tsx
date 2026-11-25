@@ -589,6 +589,11 @@ describe("failed requests", () => {
     expect(
       screen.queryByRole("button", { name: "Sign in with Delino" }),
     ).toBeNull();
+    expect(
+      screen.queryByText(
+        "Sign-in did not start. Check your connection and try again.",
+      ),
+    ).toBeNull();
   });
 
   test("renders a generic notice without an auth provider", () => {
