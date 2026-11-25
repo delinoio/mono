@@ -100,7 +100,7 @@ type Env struct {
 	DB        *db.DB
 	URL       string
 	Issuer    *authtest.Issuer
-	Directory *directory.Fake
+	Directory *directory.Fake // Available when New starts the server.
 	Email     *email.Fake
 	Paddle    *paddletest.Server
 	Billing   *billing.Service
@@ -111,23 +111,32 @@ type Env struct {
 // New starts accounts-api on a fresh database.
 func New(t testing.TB) *Env {
 	t.Helper()
+	fake := directory.NewFake()
+	env := NewWithDirectory(t, fake)
+	env.Directory = fake
+	return env
+}
+
+// NewWithDirectory starts accounts-api with the supplied directory.
+// Use Client and Issuer to authenticate users from that directory.
+func NewWithDirectory(t testing.TB, lookup directory.Directory) *Env {
+	t.Helper()
 	database := dbtest.New(t)
 	logs := &SafeBuffer{}
 	logger := slog.New(slog.NewJSONHandler(io.MultiWriter(logs), &slog.HandlerOptions{Level: slog.LevelDebug}))
 	env := &Env{
-		t:         t,
-		DB:        database,
-		Issuer:    authtest.NewIssuer(t),
-		Directory: directory.NewFake(),
-		Email:     email.NewFake(),
-		Paddle:    paddletest.New(t),
-		Clock:     &Clock{now: time.Now().UTC().Truncate(time.Microsecond)},
-		Logs:      logs,
+		t:      t,
+		DB:     database,
+		Issuer: authtest.NewIssuer(t),
+		Email:  email.NewFake(),
+		Paddle: paddletest.New(t),
+		Clock:  &Clock{now: time.Now().UTC().Truncate(time.Microsecond)},
+		Logs:   logs,
 	}
 	env.Billing = billing.New(billing.Config{
 		DB:                  database,
 		Paddle:              paddle.New(paddle.Config{BaseURL: env.Paddle.URL, APIKey: paddletest.APIKey}),
-		Directory:           env.Directory,
+		Directory:           lookup,
 		Email:               env.Email,
 		Logger:              logger,
 		Now:                 env.Clock.Now,
@@ -142,7 +151,7 @@ func New(t testing.TB) *Env {
 		Validator: auth.NewLogtoValidator(auth.LogtoConfig{
 			Issuer: env.Issuer.URL, Audience: authtest.Audience, Logger: logger,
 		}),
-		Directory:   env.Directory,
+		Directory:   lookup,
 		Email:       env.Email,
 		Logger:      logger,
 		Now:         env.Clock.Now,

@@ -254,8 +254,8 @@ func (l *Logto) getUser(ctx context.Context, token, userID string) (User, int, e
 	default:
 		return User{}, resp.StatusCode, fmt.Errorf("logto user status %d", resp.StatusCode)
 	}
-	var body userResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&body); err != nil {
+	var body *userResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&body); err != nil || body == nil {
 		return User{}, resp.StatusCode, errors.New("logto user response is not valid")
 	}
 	var user User
