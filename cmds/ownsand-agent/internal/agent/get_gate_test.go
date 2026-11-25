@@ -6,27 +6,28 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/delinoio/mono/go/uuidv7"
 )
 
-// gatedBucket serves a bucket whose hook runs the gate and closes done once
-// the hook returned for the first request of the gate's snapshot.
-func gatedBucket(t *testing.T, gate *getGate) (url string, done <-chan struct{}) {
+// gatedBucket closes done when the gate hook returns for the GET at firstPath.
+func gatedBucket(t *testing.T, gate *getGate, firstPath string) (url string, done <-chan struct{}) {
 	t.Helper()
 	finished := make(chan struct{})
 	var once sync.Once
 	b := bucketWithHook(t, func(r *http.Request) int {
 		status := gate.hook(r)
-		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/"+gate.id+"/") {
+		if r.Method == http.MethodGet && r.URL.Path == firstPath {
 			once.Do(func() { close(finished) })
 		}
 		return status
 	})
+	t.Cleanup(gate.Release)
 	return b.URL, finished
 }
 
@@ -39,6 +40,11 @@ func getWithContext(ctx context.Context, url string) error {
 	if err != nil {
 		return err
 	}
+	// A GET that reaches the empty bucket receives a 404.
+	if resp.StatusCode != http.StatusNotFound {
+		resp.Body.Close()
+		return fmt.Errorf("GET status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
 	return resp.Body.Close()
 }
 
@@ -47,11 +53,12 @@ func getWithContext(ctx context.Context, url string) error {
 func TestGetGateEndsWhenTheRequestIsCanceled(t *testing.T) {
 	id, _ := uuidv7.NewString()
 	gate := newGetGate(id)
-	url, done := gatedBucket(t, gate)
-	ctx, cancel := context.WithCancel(context.Background())
+	firstPath := "/" + id + "/1"
+	url, done := gatedBucket(t, gate, firstPath)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	errc := make(chan error, 1)
-	go func() { errc <- getWithContext(ctx, url+"/"+id+"/1") }()
+	go func() { errc <- getWithContext(ctx, url+firstPath) }()
 	waitClosed(t, gate.started, "the gated download")
 	select {
 	case <-done:
@@ -75,28 +82,35 @@ func TestGetGateWaitsForReleaseAndPassesOtherRequests(t *testing.T) {
 	id, _ := uuidv7.NewString()
 	other, _ := uuidv7.NewString()
 	gate := newGetGate(id)
-	url, done := gatedBucket(t, gate)
-	t.Cleanup(gate.Release)
-	errc := make(chan error, 1)
-	go func() { errc <- getWithContext(context.Background(), url+"/"+id+"/1") }()
+	firstPath := "/" + id + "/1"
+	url, firstHookDone := gatedBucket(t, gate, firstPath)
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- getWithContext(t.Context(), url+firstPath) }()
 	waitClosed(t, gate.started, "the gated download")
-	// Requests that are not the first matching GET pass while it waits.
-	if err := getWithContext(context.Background(), url+"/"+other+"/1"); err != nil {
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := getWithContext(ctx, url+"/"+other+"/1"); err != nil {
 		t.Fatalf("request for another snapshot: %v", err)
 	}
+	if err := getWithContext(ctx, url+"/"+id+"/2"); err != nil {
+		t.Fatalf("later matching download before release: %v", err)
+	}
 	select {
-	case <-done:
+	case <-firstHookDone:
 		t.Fatal("the first download did not wait for the release")
 	default:
 	}
 	gate.Release()
 	gate.Release()
-	waitClosed(t, done, "the download after the release")
-	if err := <-errc; err != nil {
-		t.Fatalf("gated download: %v", err)
-	}
-	if err := getWithContext(context.Background(), url+"/"+id+"/2"); err != nil {
-		t.Fatalf("later download: %v", err)
+	waitClosed(t, firstHookDone, "the first download after release")
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatalf("gated download: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the first GET response after release")
 	}
 	if got := gate.count(); got != 2 {
 		t.Fatalf("gets = %d, want 2", got)
