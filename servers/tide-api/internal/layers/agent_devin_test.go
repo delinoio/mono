@@ -499,11 +499,13 @@ func TestDevinStartCheckPartialFailure(t *testing.T) {
 	w.devin.AddSession("ses-ok", true)
 	ok := waiting("ses-ok")
 	w.devin.Forget("ses-gone")
+	// A poll might already have read ses-gone before it disappeared.
+	// Let that poll finish before making the other session ready.
+	eventually(t, "the failed session check to be logged", func() bool {
+		return strings.Contains(w.env.Logs.String(), "agent_session_check_failed")
+	})
 	w.devin.SetSessionStatusSilently("ses-ok", "running")
 	w.waitRunner(t, ok.GetRunnerId(), tidev1.RunnerState_RUNNER_STATE_BUSY)
-	if !strings.Contains(w.env.Logs.String(), "agent_session_check_failed") {
-		t.Fatal("the failed check was not logged")
-	}
 }
 
 // TestDevinWatchReconnect: a stream end (scheduled, at most 5 minutes) and
