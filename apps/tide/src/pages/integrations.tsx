@@ -30,7 +30,7 @@ import {
 } from "@delino/tide-protos/v1/github_pb";
 import { OwnSandLinkService } from "@delino/tide-protos/v1/ownsand_link_pb";
 import type { MessageInitShape } from "@bufbuild/protobuf";
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import {
   invalidateServices,
   MAX_PAGE_SIZE,
@@ -55,6 +55,7 @@ import { ownsandDevicesUrl } from "../config.ts";
 import { formatTime, labels } from "../format.ts";
 import { externalNavigation } from "../navigation.ts";
 import { can, Permission } from "../roles.ts";
+import { useRouter } from "../router.tsx";
 
 /** Route `integrations`: the OwnSand link, GitHub and agent integrations. */
 export function IntegrationsPage() {
@@ -245,6 +246,14 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
 
 function GitHubSection({ admin }: { admin: boolean }) {
   const { organizationId } = useOrg();
+  const { isCurrentVisit } = useRouter();
+  const mounted = useRef(false);
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, GitHubService);
   const list = useInfiniteQuery(
@@ -265,7 +274,9 @@ function GitHubSection({ admin }: { admin: boolean }) {
   const connect = async () => {
     try {
       const res = await installUrl.mutateAsync({ organizationId });
-      externalNavigation.assign(res.url);
+      if (mounted.current && isCurrentVisit()) {
+        externalNavigation.assign(res.url);
+      }
     } catch (error) {
       toastError(error);
     }

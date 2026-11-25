@@ -630,6 +630,51 @@ describe("integrations", () => {
     await expect(screen.getByRole("button", "Show more")).toBeVisible();
   });
 
+  test("a GitHub install response cannot redirect a later Integrations visit", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+    await expect(screen.getByRole("button", "Connect GitHub")).toBeVisible();
+
+    const redirects = await browser.evaluate(async () => {
+      const button = document.querySelector<HTMLButtonElement>(
+        "#github-title + button",
+      )!;
+      const nav = document.querySelector('nav[aria-label="Organization"]')!;
+      const members = nav.querySelector<HTMLAnchorElement>(
+        'a[href$="/members"]',
+      )!;
+      const integrations = nav.querySelector<HTMLAnchorElement>(
+        'a[href$="/integrations"]',
+      )!;
+      let redirects = 0;
+      const recordRedirect = (event: NavigateEvent) => {
+        if (new URL(event.destination.url).origin === "https://github.com") {
+          event.preventDefault();
+          redirects += 1;
+        }
+      };
+      window.navigation.addEventListener("navigate", recordRedirect);
+      try {
+        // Both links run before the in-memory API response can resolve.
+        button.click();
+        members.click();
+        integrations.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        return redirects;
+      } finally {
+        window.navigation.removeEventListener("navigate", recordRedirect);
+      }
+    });
+
+    expect(redirects).toBe(0);
+    await expect(browser).toHaveURL(`/orgs/${ACME}/integrations`);
+  });
+
   test("an expired GitHub callback stays on setup and shows restart guidance", async ({
     app,
     screen,

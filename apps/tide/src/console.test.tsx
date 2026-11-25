@@ -912,11 +912,14 @@ describe("integrations", () => {
     const original = externalNavigation.assign;
     externalNavigation.assign = (url) => assigned.push(url);
     try {
-      renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`);
+      const { transport, calls } = gatedTransport("CreateGitHubInstallUrl");
+      renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`, { transport });
       await click(
         await screen.findByRole("button", { name: "Connect GitHub" }),
       );
-      await settle(60);
+      expect(calls).toHaveLength(1);
+      expect(assigned).toHaveLength(0);
+      await act(async () => calls[0].settle());
       expect(assigned.length).toBe(1);
       expect(assigned[0]).toMatch(
         /^https:\/\/github\.com\/apps\/tide\/installations\/new\?state=/,
@@ -925,6 +928,75 @@ describe("integrations", () => {
       externalNavigation.assign = original;
     }
   });
+
+  test.each([
+    ["leaving Integrations", `/orgs/${MOCK_IDS.acme}/members`],
+    ["switching organizations", `/orgs/${MOCK_IDS.globex}/integrations`],
+    ["leaving and returning", `/orgs/${MOCK_IDS.acme}/integrations`],
+    [
+      "leaving and returning in one render",
+      `/orgs/${MOCK_IDS.acme}/integrations`,
+    ],
+    ["a location change before popstate", `/orgs/${MOCK_IDS.acme}/members`],
+  ])(
+    "Connect GitHub discards the installation URL after %s",
+    async (scenario, path) => {
+      const assigned: string[] = [];
+      const original = externalNavigation.assign;
+      externalNavigation.assign = (url) => assigned.push(url);
+      try {
+        const { transport, calls } = gatedTransport("CreateGitHubInstallUrl");
+        const queryClient = renderConsole(
+          `/orgs/${MOCK_IDS.acme}/integrations`,
+          {
+            transport,
+          },
+        );
+        await click(
+          await screen.findByRole("button", { name: "Connect GitHub" }),
+        );
+        expect(calls).toHaveLength(1);
+        expect(calls[0].input).toMatchObject({ organizationId: MOCK_IDS.acme });
+        const members = screen.getByRole("link", { name: "Members" });
+        const integrations = screen.getByRole("link", { name: "Integrations" });
+        switch (scenario) {
+          case "leaving Integrations":
+            await click(members);
+            break;
+          case "switching organizations":
+            await click(
+              await screen.findByRole("combobox", { name: "Organization" }),
+            );
+            await click(await screen.findByRole("option", { name: "Globex" }));
+            break;
+          case "leaving and returning":
+            await click(members);
+            await click(screen.getByRole("link", { name: "Integrations" }));
+            break;
+          case "leaving and returning in one render":
+            act(() => {
+              fireEvent.click(members);
+              fireEvent.click(integrations);
+            });
+            break;
+          case "a location change before popstate":
+            window.history.pushState(null, "", path);
+            break;
+        }
+        expect(window.location.pathname).toBe(path);
+
+        await act(async () => calls[0].settle());
+
+        expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+          "success",
+        );
+        expect(assigned).toHaveLength(0);
+        expect(window.location.pathname).toBe(path);
+      } finally {
+        externalNavigation.assign = original;
+      }
+    },
+  );
 
   for (const empty of [false, true]) {
     test(`retries a failed GitHub continuation with ${empty ? "an empty" : "an overlapping"} final page`, async () => {
