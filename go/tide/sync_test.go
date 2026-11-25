@@ -20,14 +20,17 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"connectrpc.com/connect"
 
 	"github.com/delinoio/mono/go/tide/tidetest"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
 
 const writeProc = "/delino.tide.v1.DevSessionService/WriteDevSessionFile"
@@ -1606,6 +1609,204 @@ func TestSyncLockAndRestartAfterStoppedSync(t *testing.T) {
 	srv.SetSessionState(ds.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_STARTING)
 	if _, err := c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}); connect.CodeOf(err) != connect.CodeFailedPrecondition {
 		t.Fatalf("sync of a starting session = %v", err)
+	}
+}
+
+func TestSyncApplyStreamLoss(t *testing.T) {
+	needPOSIX(t)
+	for _, tc := range []struct {
+		name    string
+		unknown bool
+	}{
+		{name: "terminal"},
+		{name: "unknown", unknown: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, stop := context.WithTimeout(t.Context(), 15*time.Second)
+			defer stop()
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			params := func(content string) SyncParams {
+				return SyncParams{
+					OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+					LocalDir: newRepo(t, map[string]string{"a.txt": content}, nil, ""),
+				}
+			}
+			initial, first, second := params("initial"), params("first"), params("second")
+			if err := os.WriteFile(filepath.Join(initial.LocalDir, "obsolete.txt"), []byte("obsolete"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			lock := ds.GetWorkspacePath() + lockSuffix
+			var manifestAtCleanup atomic.Pointer[manifest]
+			srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+				env := req.GetEnv()
+				if env[guestEnvLock] != lock || env[guestEnvArchive] == "" {
+					return
+				}
+				body, err := os.ReadFile(ds.GetWorkspacePath() + manifestSuffix)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				var published manifest
+				if err := json.Unmarshal(body, &published); err != nil {
+					t.Error(err)
+					return
+				}
+				manifestAtCleanup.Store(&published)
+			}
+			if _, err := c.Sync(ctx, initial); err != nil {
+				t.Fatal(err)
+			}
+			old := guestManifest(t, ds)
+			requireOldManifest := func() {
+				t.Helper()
+				if got := guestManifest(t, ds); !maps.Equal(got.Files, old.Files) {
+					t.Fatalf("manifest entries changed before a successful sync: %+v", got.Files)
+				}
+			}
+
+			// Run the actual apply script and hold tar just before extraction.
+			// Its process remains alive when the client cancels the stream.
+			tarBin, err := exec.LookPath("tar")
+			if err != nil {
+				t.Fatal(err)
+			}
+			gate := t.TempDir()
+			script := `#!/bin/sh
+set -eu
+: > "$TIDE_TEST_GATE/started"
+while [ ! -f "$TIDE_TEST_GATE/release" ]; do sleep 0.02; done
+exec "$TIDE_TEST_REAL_TAR" "$@"
+`
+			if err := os.WriteFile(filepath.Join(gate, "tar"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TIDE_TEST_GATE", gate)
+			t.Setenv("TIDE_TEST_REAL_TAR", tarBin)
+			t.Setenv("PATH", gate+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			syncErr := make(chan error, 1)
+			applyCtx, cancelApply := context.WithCancel(ctx)
+			defer cancelApply()
+			go func() {
+				_, err := c.Sync(applyCtx, first)
+				syncErr <- err
+			}()
+			waitFor := func(description string, ready func() bool) {
+				t.Helper()
+				ticker := time.NewTicker(5 * time.Millisecond)
+				defer ticker.Stop()
+				for !ready() {
+					select {
+					case err := <-syncErr:
+						t.Fatalf("sync returned before %s: %v", description, err)
+					case <-ctx.Done():
+						t.Fatalf("waiting for %s: %v", description, ctx.Err())
+					case <-ticker.C:
+					}
+				}
+			}
+			waitFor("apply to reach tar", func() bool {
+				_, err := os.Stat(filepath.Join(gate, "started"))
+				return err == nil
+			})
+			requests := srv.ExecRequests()
+			apply := requests[len(requests)-1]
+			archive, deletes := apply.GetEnv()[guestEnvArchive], apply.GetEnv()[guestEnvDeletes]
+			if archive == "" || deletes == "" {
+				t.Fatal("the apply request needs an archive and deletion list")
+			}
+			retainedPaths := []string{lock, archive, deletes}
+			attachProc := tidev1connect.DevSessionServiceAttachDevSessionExecProcedure
+			attachments := srv.Calls(attachProc)
+			if tc.unknown {
+				srv.Fail(attachProc, connect.NewError(connect.CodeNotFound, errors.New("exec unknown")))
+			}
+			cancelApply()
+			requireCanceled := func() {
+				t.Helper()
+				select {
+				case err := <-syncErr:
+					var streamErr *ExecStreamError
+					if !errors.As(err, &streamErr) || !errors.Is(err, context.Canceled) || streamErr.ExecID != apply.GetExecId() {
+						t.Fatalf("sync returned %v, want original cancellation for apply %s", err, apply.GetExecId())
+					}
+				case <-ctx.Done():
+					t.Fatalf("canceled sync did not return: %v", ctx.Err())
+				}
+			}
+			if tc.unknown {
+				requireCanceled()
+			} else {
+				waitFor("SDK to attach to apply", func() bool { return srv.Calls(attachProc) > attachments })
+			}
+
+			for _, path := range retainedPaths {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("apply still needs %s: %v", path, err)
+				}
+			}
+			writes := srv.Calls(writeProc)
+			if _, err := c.Sync(ctx, second); !errors.Is(err, ErrSyncLocked) {
+				t.Fatalf("concurrent sync returned %v, want ErrSyncLocked", err)
+			}
+			if got := srv.Calls(writeProc); got != writes {
+				t.Errorf("concurrent sync issued %d write calls", got-writes)
+			}
+			requireOldManifest()
+			if err := os.WriteFile(filepath.Join(gate, "release"), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.unknown {
+				// The test observes apply directly so it can verify that a
+				// command with an unknown outcome could still write.
+				result, err := c.AttachExec(ctx, AttachParams{
+					OrganizationID: org, DevSessionID: ds.GetDevSessionId(), ExecID: apply.GetExecId(),
+				})
+				if err != nil || result.Kind != ExecResultExited {
+					t.Fatalf("observe original apply = %+v, %v", result, err)
+				}
+			} else {
+				requireCanceled()
+			}
+			if got := readGuest(t, ds, "a.txt"); got != "first" {
+				t.Fatalf("original apply wrote %q, want first", got)
+			}
+			requireOldManifest()
+			applyCount := 0
+			for _, req := range srv.ExecRequests() {
+				if req.GetEnv()[guestEnvArchive] != "" && req.GetEnv()[guestEnvWorkspace] != "" {
+					applyCount++
+				}
+			}
+			if applyCount != 2 { // Initial sync and the canceled sync each applied once.
+				t.Errorf("got %d apply commands, want 2", applyCount)
+			}
+			for _, path := range retainedPaths {
+				_, err := os.Stat(path)
+				if tc.unknown && err != nil || !tc.unknown && !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("stat %s after %s outcome: %v", path, tc.name, err)
+				}
+			}
+			if tc.unknown {
+				return
+			}
+			if res, err := c.Sync(ctx, second); err != nil || res.Uploaded != 1 {
+				t.Fatalf("retry sync = %+v, %v", res, err)
+			}
+			if got := readGuest(t, ds, "a.txt"); got != "second" {
+				t.Errorf("retry wrote %q, want second", got)
+			}
+			if _, err := os.Stat(lock); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("lock after successful retry: %v", err)
+			}
+			hash := sha256.Sum256([]byte("second"))
+			if m := manifestAtCleanup.Load(); m == nil || m.Files["a.txt"].SHA256 != hex.EncodeToString(hash[:]) {
+				t.Errorf("manifest at lock release = %+v, want second file hash", m)
+			}
+		})
 	}
 }
 
