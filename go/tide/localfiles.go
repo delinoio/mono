@@ -112,6 +112,9 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 	// a Windows file system does not keep.
 	indexMode := map[string]string{}
 	for _, rec := range splitNUL(staged) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		meta, p, ok := strings.Cut(rec, "\t")
 		if !ok {
 			continue
@@ -123,6 +126,9 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 	out := &localList{}
 	seen := map[string]bool{}
 	for _, p := range splitNUL(listed) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if seen[p] {
 			continue // a conflicted path is listed once per stage
 		}
@@ -140,7 +146,7 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 		if !validRelPath(p) {
 			return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("tide: git listed a path that is not a local relative path: %q", p))
 		}
-		f, ok, err := readLocalFile(dir, p, indexMode[p])
+		f, ok, err := readLocalFile(ctx, dir, p, indexMode[p])
 		if err != nil {
 			return nil, err
 		}
@@ -155,7 +161,7 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 
 // readLocalFile hashes one listed path. Missing paths, directories, and paths
 // below a file or symbolic link are absent from the local file list.
-func readLocalFile(dir, rel, indexMode string) (localFile, bool, error) {
+func readLocalFile(ctx context.Context, dir, rel, indexMode string) (localFile, bool, error) {
 	// Lstat follows symbolic links in parent components, so check each
 	// parent from the root outwards before looking up the final component.
 	for i := range rel {
@@ -195,12 +201,11 @@ func readLocalFile(dir, rel, indexMode string) (localFile, bool, error) {
 		f.target = target
 		f.entry = manifestEntry{Size: int64(len(target)), SHA256: hex.EncodeToString(sum[:]), Mode: modeSymlink}
 	case info.Mode().IsRegular():
-		h := sha256.New()
 		file, err := os.Open(full)
 		if err != nil {
 			return localFile{}, false, err
 		}
-		n, err := io.Copy(h, file)
+		size, digest, err := hashLocalFile(ctx, file)
 		file.Close()
 		if err != nil {
 			return localFile{}, false, err
@@ -214,11 +219,37 @@ func readLocalFile(dir, rel, indexMode string) (localFile, bool, error) {
 		if executable {
 			mode = modeExecutable
 		}
-		f.entry = manifestEntry{Size: n, SHA256: hex.EncodeToString(h.Sum(nil)), Mode: mode}
+		f.entry = manifestEntry{Size: size, SHA256: digest, Mode: mode}
 	default:
 		return localFile{}, false, nil
 	}
 	return f, true, nil
+}
+
+// localHashReader checks the context before each read. It exposes only Read
+// so io.Copy cannot call the underlying file's WriterTo method.
+type localHashReader struct {
+	ctx context.Context
+	src io.Reader
+}
+
+func (r localHashReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.src.Read(p)
+}
+
+func hashLocalFile(ctx context.Context, src io.Reader) (int64, string, error) {
+	h := sha256.New()
+	size, err := io.Copy(h, localHashReader{ctx: ctx, src: src})
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return 0, "", ctxErr
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	return size, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
