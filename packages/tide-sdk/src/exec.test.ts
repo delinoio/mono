@@ -393,8 +393,80 @@ describe("exec helper", () => {
     expect(attachRequests).toHaveLength(1);
   });
 
+  test("backs off to the cap after replayed starts", async () => {
+    const unavailable = new ConnectError("relay restarting", Code.Unavailable);
+    const startThenFail = [started, unavailable];
+    const { server, execs, attachRequests } = execServer(startThenFail, [
+      ...Array.from({ length: 6 }, () => startThenFail),
+      [exited(0)],
+    ]);
+    const clock = new RecordingClock();
+    const events: string[] = [];
+    for await (const event of client(server.fetch, clock).execDevSession(
+      execInput,
+    )) {
+      events.push(describeEvent(event));
+    }
+
+    expect(clock.sleeps).toEqual([
+      1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000,
+    ]);
+    expect(events).toEqual([
+      "started",
+      ...Array.from({ length: 7 }, () => "reattach 0 0"),
+      "exited 0",
+    ]);
+    expect(execs).toHaveLength(1);
+    expect(attachRequests).toHaveLength(7);
+    for (const request of attachRequests) {
+      expect(request).toMatchObject({
+        execId: execs[0]!.execId,
+        stdoutOffset: 0n,
+        stderrOffset: 0n,
+      });
+    }
+  });
+
+  test("resets backoff when an attach replays Started and delivers new output", async () => {
+    const unavailable = new ConnectError("relay restarting", Code.Unavailable);
+    const { server, execs, attachRequests } = execServer(
+      [started, unavailable],
+      [
+        [started, unavailable],
+        [started, out(0, "hello"), err(0, "!"), unavailable],
+        [exited(0)],
+      ],
+    );
+    const clock = new RecordingClock();
+    const events: string[] = [];
+    for await (const event of client(server.fetch, clock).execDevSession(
+      execInput,
+    )) {
+      events.push(describeEvent(event));
+    }
+
+    expect(clock.sleeps).toEqual([1_000, 2_000, 1_000]);
+    expect(events).toEqual([
+      "started",
+      "reattach 0 0",
+      "reattach 0 0",
+      "stdout 0 hello",
+      "stderr 0 !",
+      "reattach 5 1",
+      "exited 0",
+    ]);
+    expect(execs).toHaveLength(1);
+    expect(
+      attachRequests.map((r) => [r.execId, r.stdoutOffset, r.stderrOffset]),
+    ).toEqual([
+      [execs[0]!.execId, 0n, 0n],
+      [execs[0]!.execId, 0n, 0n],
+      [execs[0]!.execId, 5n, 1n],
+    ]);
+  });
+
   test.each([
-    [3, [1_000, 2_000, 4_000, 1_000]],
+    [2, [1_000, 2_000, 1_000]],
     [7, [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 1_000]],
   ])(
     "backs off after %i keepalive-only failures and resets after Started",

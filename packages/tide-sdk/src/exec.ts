@@ -119,9 +119,10 @@ export interface ExecHelperOptions {
  * - The server ends each stream before 14 minutes with an OK status and no
  *   final event. After such an end, and after a retryable failure, the
  *   helper continues with `AttachDevSessionExec` from the next stdout and
- *   stderr offsets. A clean end continues at once; failures wait with
- *   exponential backoff from 1 second to 30 seconds. Keepalives do not
- *   reset the backoff or yield events.
+ *   stderr offsets. A clean end continues at once. Failures wait with
+ *   exponential backoff from 1 second to 30 seconds. The first start event
+ *   resets the backoff and yields Started. Replayed starts and keepalives
+ *   do neither.
  * - It yields output in order and without duplicates, and reports output
  *   that it never received as `OutputLost`.
  * - Cancellation ends the iterator and stops following the command. The
@@ -270,9 +271,12 @@ export async function* execDevSession(
         ) {
           continue;
         }
+        const event = message.event.event;
         anyEvent = true;
-        progressed = true;
-        if ((yield* handle(message.event.event)) || abortedBy(signal)) {
+        if (event.case !== "started" || !started) {
+          progressed = true;
+        }
+        if ((yield* handle(event)) || abortedBy(signal)) {
           return;
         }
       }
