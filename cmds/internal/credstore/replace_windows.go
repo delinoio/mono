@@ -19,6 +19,22 @@ const replaceRetryTimeout = 2 * time.Second
 // replaceRetryInterval is the pause between two replace attempts.
 const replaceRetryInterval = 10 * time.Millisecond
 
+var readRetrySleep = time.Sleep
+
+// A load runs without the writer lock. Windows can deny the open while a
+// replacement or another program holds an incompatible handle. Retry only
+// sharing violations, for the same bounded interval as replacements.
+func readFile(path string) ([]byte, error) {
+	deadline := time.Now().Add(replaceRetryTimeout)
+	for {
+		data, err := os.ReadFile(path)
+		if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) || time.Now().After(deadline) {
+			return data, err
+		}
+		readRetrySleep(replaceRetryInterval)
+	}
+}
+
 // replaceFile renames src over dst and retries for up to
 // replaceRetryTimeout while the rename fails with access denied or a
 // sharing violation.

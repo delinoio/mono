@@ -17,12 +17,17 @@ import (
 // violation, as an antivirus scanner does. The handle closes once.
 func holdWithoutDeleteShare(t *testing.T, path string) (release func()) {
 	t.Helper()
+	return holdCredentialFile(t, path, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE)
+}
+
+func holdCredentialFile(t *testing.T, path string, shareMode uint32) (release func()) {
+	t.Helper()
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	h, err := windows.CreateFile(p, windows.GENERIC_READ,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil,
+		shareMode, nil,
 		windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
 		t.Fatalf("hold the credential file: %v", err)
@@ -36,6 +41,25 @@ func holdWithoutDeleteShare(t *testing.T, path string) (release func()) {
 	}
 	t.Cleanup(release)
 	return release
+}
+
+func TestLoadRetriesUntilHandleIsReleased(t *testing.T) {
+	s := savedStore(t)
+	release := holdCredentialFile(t, s.Path(), 0)
+	oldSleep := readRetrySleep
+	t.Cleanup(func() { readRetrySleep = oldSleep })
+	sleeps := 0
+	readRetrySleep = func(time.Duration) {
+		sleeps++
+		release()
+	}
+	got, err := s.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got.RefreshToken != "r" || sleeps != 1 {
+		t.Fatalf("want the saved credential after one retry pause, got %d pauses", sleeps)
+	}
 }
 
 // stubRemoveRetry replaces the retry seams for one test. sleep runs instead of

@@ -6,6 +6,10 @@ package credstore
 
 import "os"
 
+func readFile(path string) ([]byte, error) {
+	return os.ReadFile(path)
+}
+
 // replaceFile renames src over dst. On Linux and macOS a rename replaces an
 // open destination atomically, so no retry is needed.
 func replaceFile(src, dst string) error {
