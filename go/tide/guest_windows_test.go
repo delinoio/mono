@@ -42,8 +42,24 @@ func requireRemoved(t *testing.T, path string) {
 	}
 }
 
+func TestWindowsGuestSyncRetryFileToDirectory(t *testing.T) {
+	testSyncRetryFileToDirectory(t, tidev1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", func(t *testing.T, link, target string) {
+		t.Helper()
+		// A junction is a directory reparse point and needs no symlink privilege.
+		const script = `$ErrorActionPreference = 'Stop'
+$parent = [System.IO.Path]::GetDirectoryName($env:TIDE_TEST_LINK)
+$name = [System.IO.Path]::GetFileName($env:TIDE_TEST_LINK)
+New-Item -ItemType Junction -Path $parent -Name $name -Value $env:TIDE_TEST_TARGET | Out-Null`
+		cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(script))
+		cmd.Env = append(os.Environ(), "TIDE_TEST_LINK="+link, "TIDE_TEST_TARGET="+target)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("create junction: %v: %s", err, out)
+		}
+	})
+}
+
 func TestWindowsGuestCleanup(t *testing.T) {
-	for _, name := range []string{guestEnvArchive, guestEnvDeletes, guestEnvPrunes, guestEnvLinks, guestEnvLock, guestEnvDLArchive} {
+	for _, name := range []string{guestEnvArchive, guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvLinks, guestEnvLock, guestEnvDLArchive} {
 		t.Setenv(name, "")
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatal(err)
@@ -75,7 +91,7 @@ func TestWindowsGuestCleanup(t *testing.T) {
 				op = opRemoveArchive
 				env[guestEnvDLArchive] = filepath.Join(root, "download [archive].tar")
 			} else {
-				for _, key := range []string{guestEnvArchive, guestEnvDeletes, guestEnvPrunes, guestEnvLinks} {
+				for _, key := range []string{guestEnvArchive, guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvLinks} {
 					env[key] = filepath.Join(root, key)
 				}
 				env[guestEnvLock] = filepath.Join(root, "lock")

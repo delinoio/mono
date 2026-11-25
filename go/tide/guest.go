@@ -135,6 +135,26 @@ if ($env:TIDE_SYNC_DELETE_LIST) {
     if (Test-Path -LiteralPath $t) { Remove-Item -LiteralPath $t -Force }
   }
 }
+if ($env:TIDE_SYNC_REPLACE_FILE_LIST) {
+  foreach ($p in [System.IO.File]::ReadAllLines($env:TIDE_SYNC_REPLACE_FILE_LIST, [System.Text.Encoding]::UTF8)) {
+    if ($p -eq '') { continue }
+    $t = Join-Path $ws $p
+    try {
+      $item = Get-Item -LiteralPath $t -Force
+    } catch [System.Management.Automation.ItemNotFoundException] {
+      continue
+    }
+    if ($item.Attributes -band [System.IO.FileAttributes]::Directory) {
+      # Keep a directory from an earlier apply. Unlink directory reparse points
+      # without recursing into their targets.
+      if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        [System.IO.Directory]::Delete($t)
+      }
+    } else {
+      Remove-Item -LiteralPath $t -Force
+    }
+  }
+}
 if ($env:TIDE_SYNC_PRUNE_LIST) {
   foreach ($p in [System.IO.File]::ReadAllLines($env:TIDE_SYNC_PRUNE_LIST, [System.Text.Encoding]::UTF8)) {
     if ($p -eq '') { continue }
@@ -163,7 +183,7 @@ if ($env:TIDE_SYNC_LINK_LIST) {
 exit 0`,
 	opCleanup: `$ProgressPreference = 'SilentlyContinue'
 $status = 0
-foreach ($f in @($env:TIDE_SYNC_ARCHIVE, $env:TIDE_SYNC_DELETE_LIST, $env:TIDE_SYNC_PRUNE_LIST, $env:TIDE_SYNC_LINK_LIST)) {
+foreach ($f in @($env:TIDE_SYNC_ARCHIVE, $env:TIDE_SYNC_DELETE_LIST, $env:TIDE_SYNC_REPLACE_FILE_LIST, $env:TIDE_SYNC_PRUNE_LIST, $env:TIDE_SYNC_LINK_LIST)) {
   try {
     if ($f -and (Test-Path -LiteralPath $f -ErrorAction Stop)) {
       Remove-Item -LiteralPath $f -Force -ErrorAction Stop

@@ -1058,13 +1058,22 @@ func TestInvalidWindowsPath(t *testing.T) {
 
 func TestSyncRetryFileToDirectory(t *testing.T) {
 	needPOSIX(t)
-	for _, scenario := range []string{"first apply", "manifest write failure", "symlink", "ordinary deletion failure"} {
+	// Exercise a nested archive parent with a leading dash and a newline.
+	testSyncRetryFileToDirectory(t, tidev1.GuestOs_GUEST_OS_LINUX, "-a with space\n", func(t *testing.T, link, target string) {
+		t.Helper()
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func testSyncRetryFileToDirectory(t *testing.T, guestOS tidev1.GuestOs, former string, makeDirectoryLink func(*testing.T, string, string)) {
+	t.Helper()
+	for _, scenario := range []string{"first apply", "manifest write failure", "directory link", "ordinary deletion failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			c, srv, org := newTestClient(t, "")
-			ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+			ds := newSession(t, c, srv, org, guestOS)
 			ws := ds.GetWorkspacePath()
-			// Exercise a nested archive parent with a leading dash and a newline.
-			former := "-a with space\n"
 			child := former + "/nested/new.txt"
 			dir := newRepo(t, map[string]string{former: "old"}, nil, "")
 			p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
@@ -1120,18 +1129,16 @@ func TestSyncRetryFileToDirectory(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(ws, child), []byte("guest edit"), 0o644); err != nil {
 					t.Fatal(err)
 				}
-			case "symlink", "ordinary deletion failure":
+			case "directory link", "ordinary deletion failure":
 				if err := os.Remove(filepath.Join(ws, former)); err != nil {
 					t.Fatal(err)
 				}
-				if scenario == "symlink" {
+				if scenario == "directory link" {
 					linkTarget = t.TempDir()
 					if err := os.WriteFile(filepath.Join(linkTarget, "keep.txt"), []byte("keep"), 0o644); err != nil {
 						t.Fatal(err)
 					}
-					if err := os.Symlink(linkTarget, filepath.Join(ws, former)); err != nil {
-						t.Fatal(err)
-					}
+					makeDirectoryLink(t, filepath.Join(ws, former), linkTarget)
 				} else {
 					if err := os.Mkdir(filepath.Join(ws, former), 0o755); err != nil {
 						t.Fatal(err)
@@ -1151,8 +1158,8 @@ func TestSyncRetryFileToDirectory(t *testing.T) {
 				t.Fatal("sync changed a guest-only file")
 			}
 			if scenario == "ordinary deletion failure" {
-				if err == nil {
-					t.Fatal("ordinary deletion of a directory succeeded")
+				if connect.CodeOf(err) != connect.CodeInternal || !strings.Contains(err.Error(), "the guest apply command exited") {
+					t.Fatalf("ordinary deletion should fail in guest apply, got %v", err)
 				}
 				if _, err := os.Lstat(filepath.Join(ws, child)); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("archive extracted after a failed deletion, stat returned %v", err)
