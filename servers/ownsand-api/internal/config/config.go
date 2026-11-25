@@ -342,7 +342,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	cfg.ClientAddressMode = ResolveClientAddressMode(cfg.TrustProxyClientAddress, cfg.AllowDirectClientAddress)
 
-	if v := get(EnvSTUNURLs); v != "" {
+	if v, ok := lookup(EnvSTUNURLs); ok {
 		cfg.STUNURLs = nil
 		for _, u := range splitList(v) {
 			if !validSTUNURL(u) {
@@ -350,8 +350,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			}
 			cfg.STUNURLs = append(cfg.STUNURLs, u)
 		}
-		// splitList drops blank items, so a delimiter-only value such as ","
-		// leaves no URL. Reject it instead of publishing an empty STUN list.
+		// An explicit list must contain at least one URL after trimming and splitting.
 		if len(cfg.STUNURLs) == 0 {
 			return Config{}, fmt.Errorf("%s must list stun: URLs with a host", EnvSTUNURLs)
 		}

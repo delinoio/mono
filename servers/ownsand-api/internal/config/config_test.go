@@ -311,6 +311,8 @@ func TestLoadSTUNURLs(t *testing.T) {
 		{"hostname default port", "stun:example.com", true},
 		{"bracketed IPv6", "stun:[::1]:3478", true},
 		{"list", "stun:a:3478, stun:[::1]:3478", true},
+		{"empty", "", false},
+		{"whitespace only", " \t\n\v\f\r", false},
 		{"delimiter only", ",", false},
 		{"blank items only", " , ", false},
 		{"hostless", "stun:", false},
@@ -338,6 +340,19 @@ func TestLoadSTUNURLs(t *testing.T) {
 				t.Fatalf("error = %q, want %q (no URL echo)", err, want)
 			}
 		})
+	}
+}
+
+func TestLoadSTUNURLsOverride(t *testing.T) {
+	v := minimal()
+	v[EnvSTUNURLs] = " stun:127.0.0.1:13478, stun:[::1]:3478 "
+	cfg, err := Load(env(v))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"stun:127.0.0.1:13478", "stun:[::1]:3478"}
+	if !slices.Equal(cfg.STUNURLs, want) {
+		t.Fatalf("STUNURLs = %v, want %v", cfg.STUNURLs, want)
 	}
 }
 
