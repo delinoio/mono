@@ -21,7 +21,8 @@ const creditsName = "CREDITS.html";
 async function resolveDistribution() {
   const lock = await readFile(cargoLock, "utf8");
   const [, version] =
-    /^\[\[package\]\]\nname = "cef"\nversion = "([^"]+)"/m.exec(lock) ?? [];
+    /^\[\[package\]\]\r?\nname = "cef"\r?\nversion = "([^"]+)"/m.exec(lock) ??
+    [];
   if (!version) throw new Error("Cargo.lock does not contain the CEF version");
 
   // Match the pinned Tauri CLI resolver. It interprets a relative CEF_PATH
