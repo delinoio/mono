@@ -3,8 +3,11 @@
 package billing
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -85,6 +88,122 @@ func (f *fixture) grantExpireTime(transactionID string) time.Time {
 		f.t.Fatal(err)
 	}
 	return expire
+}
+
+func TestPaymentWebhookExpiresCreditBeforePurchase(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		kind          LedgerKind
+		releaseOffset time.Duration
+	}{
+		{name: "manual top-up at expiry", kind: LedgerManualTopUp},
+		{name: "subscription payment at expiry", kind: LedgerSubscriptionCredit},
+		{name: "purchase before expiry", kind: LedgerManualTopUp, releaseOffset: -time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			const seedID, txnID, eventID = "txn_seed", "txn_purchase", "evt_purchase"
+			if code := f.webhook(paddle.EventTransactionCompleted, purchase(seedID, acct, LedgerManualTopUp, 400)); code != http.StatusOK {
+				t.Fatalf("seed payment status %d", code)
+			}
+			if _, err := f.db.Pool.Exec(ctx(), `INSERT INTO credit_settings (billing_account_id,
+				low_balance_threshold_usd_micros, low_balance_alerted, update_time) VALUES ($1, $2, true, $3)`,
+				acct, 12*usd, f.clock.Now()); err != nil {
+				t.Fatal(err)
+			}
+
+			accountingTime := f.grantExpireTime(seedID).Add(tc.releaseOffset)
+			eventTime := accountingTime.Add(-time.Minute)
+			f.clock.Set(eventTime)
+			data := purchase(txnID, acct, tc.kind, 1000)
+			server := httptest.NewServer(f.s.WebhookHandler())
+			t.Cleanup(server.Close)
+			client := server.Client()
+			client.Timeout = 30 * time.Second
+			deliver := func(id string, signatureTime time.Time) error {
+				body := paddletest.Event(id, paddle.EventTransactionCompleted, eventTime, data)
+				req, err := http.NewRequest(http.MethodPost, server.URL+"/webhooks/paddle", bytes.NewReader(body))
+				if err != nil {
+					return err
+				}
+				req.Header.Set(paddle.SignatureHeader, paddle.SignatureHeaderValue(whSecret, signatureTime, body))
+				resp, err := client.Do(req)
+				if err != nil {
+					return err
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					return fmt.Errorf("payment %s status %d, want %d", id, resp.StatusCode, http.StatusOK)
+				}
+				return nil
+			}
+
+			release := f.holdAccountLock(acct)
+			result := make(chan error, 1)
+			go func() { result <- deliver(eventID, eventTime) }()
+			f.waitForAccountLockWait()
+			f.clock.Set(accountingTime)
+			release()
+			if err := <-result; err != nil {
+				t.Fatal(err)
+			}
+
+			wantExpired := tc.releaseOffset == 0
+			wantSeedRemaining := 4 * usd
+			want := []wantEntry{{LedgerManualTopUp, 4 * usd, 4 * usd}}
+			if wantExpired {
+				want = append(want, wantEntry{LedgerExpiry, -4 * usd, 0})
+				wantSeedRemaining = 0
+			}
+			want = append(want, wantEntry{tc.kind, 10 * usd, 10*usd + wantSeedRemaining})
+			f.wantLedger(acct, want...)
+			f.wantLowBalance(acct, 0, wantExpired)
+			if got := f.remaining(f.grantIDOf(seedID)); got != wantSeedRemaining {
+				t.Errorf("seed grant remaining %d, want %d", got, wantSeedRemaining)
+			}
+			entries, err := ListLedgerByTime(ctx(), f.db.Pool, acct, time.Time{}, "", len(want))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != len(want) || entries[0].Kind != tc.kind || deref(entries[0].PaddleTransactionID) != txnID ||
+				!entries[0].CreateTime.Equal(accountingTime) {
+				t.Fatalf("newest ledger entry must be the purchase at %s, got %+v", accountingTime, entries)
+			}
+			if wantExpired && (entries[1].Kind != LedgerExpiry || !entries[1].CreateTime.Equal(accountingTime)) {
+				t.Fatalf("second newest ledger entry must be the expiry at %s, got %+v", accountingTime, entries[1])
+			}
+
+			var createdAt, expiresAt, processedAt time.Time
+			var remaining int64
+			if err := f.db.Pool.QueryRow(ctx(), `SELECT create_time, expire_time, remaining_usd_micros
+				FROM credit_grants WHERE paddle_transaction_id = $1`, txnID).Scan(&createdAt, &expiresAt, &remaining); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.db.Pool.QueryRow(ctx(), `SELECT process_time FROM paddle_events WHERE paddle_event_id = $1`, eventID).
+				Scan(&processedAt); err != nil {
+				t.Fatal(err)
+			}
+			if !createdAt.Equal(eventTime) || !expiresAt.Equal(GrantExpireTime(eventTime)) ||
+				!processedAt.Equal(eventTime) || remaining != 10*usd {
+				t.Errorf("grant created at %s, expires at %s, has %d remaining and event processed at %s, want %s, %s, %d and %s",
+					createdAt, expiresAt, remaining, processedAt, eventTime, GrantExpireTime(eventTime), 10*usd, eventTime)
+			}
+
+			for _, id := range []string{eventID, "evt_purchase_redelivery"} {
+				if err := deliver(id, accountingTime); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.wantLedger(acct, want...)
+			f.wantLowBalance(acct, 0, wantExpired)
+			if got := f.count(`SELECT count(*) FROM credit_grants WHERE paddle_transaction_id = $1`, txnID); got != 1 {
+				t.Fatalf("after replays: grants %d, want 1", got)
+			}
+			t.Logf("observed account lock wait, purchase balance %d, prior grant remaining %d, alert flagged %v, no duplicate credit",
+				entries[0].BalanceAfter, f.remaining(f.grantIDOf(seedID)), wantExpired)
+		})
+	}
 }
 
 // refundWhileGrantExpires sends an approved refund webhook that waits for the
