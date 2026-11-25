@@ -177,6 +177,75 @@ func TestDevSessionStalledResponse(t *testing.T) {
 	}
 }
 
+func TestDevSessionFileReadPath(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	session, sandboxID := w.runningSession(t)
+	client := w.env.User(w.org.Member).DevSession
+	read := func(t *testing.T, path string) *connect.ServerStreamForClient[tidev1.ReadDevSessionFileResponse] {
+		t.Helper()
+		stream, err := client.ReadDevSessionFile(t.Context(), connect.NewRequest(&tidev1.ReadDevSessionFileRequest{
+			OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(), ReadId: api.NewID(), Path: path,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = stream.Close() })
+		return stream
+	}
+
+	for _, tc := range []struct {
+		name, path, message string
+	}{
+		{"NUL", "a\x00b", "invalid path: must be valid UTF-8 without NUL"},
+		{"empty", "", "invalid path: is required"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := read(t, tc.path)
+			if stream.Receive() {
+				t.Fatal("invalid path returned a file event")
+			}
+			calls := w.fake.Calls("ReadFile")
+			if calls != 0 {
+				t.Fatalf("OwnSand file reads = %d, want zero", calls)
+			}
+			var err *connect.Error
+			if !errors.As(stream.Err(), &err) || err.Code() != connect.CodeInvalidArgument || err.Message() != tc.message {
+				t.Fatalf("read error = %v, want invalid_argument: %s", stream.Err(), tc.message)
+			}
+			t.Logf("Connect returned %v with %d OwnSand file reads", err, calls)
+		})
+	}
+
+	t.Run("relative", func(t *testing.T) {
+		const path = "download.txt"
+		data := []byte("test file")
+		w.fake.SetFile(w.osOrg, sandboxID, "/home/dev/work/"+path, data)
+		stream := read(t, path)
+		if !stream.Receive() {
+			t.Fatalf("missing file chunk: %v", stream.Err())
+		}
+		chunk := stream.Msg().GetChunk()
+		if chunk == nil || chunk.GetOffset() != 0 || !bytes.Equal(chunk.GetData(), data) {
+			t.Fatalf("unexpected file chunk: %v", chunk)
+		}
+		if !stream.Receive() {
+			t.Fatalf("missing final file size: %v", stream.Err())
+		}
+		end := stream.Msg().GetEnd()
+		if end == nil || end.GetSizeBytes() != int64(len(data)) {
+			t.Fatalf("unexpected file end: %v", end)
+		}
+		if stream.Receive() || stream.Err() != nil {
+			t.Fatalf("expected a completed file stream, got %v", stream.Err())
+		}
+		calls := w.fake.Calls("ReadFile")
+		if calls != 1 {
+			t.Fatalf("OwnSand file reads = %d, want one", calls)
+		}
+		t.Logf("Connect streamed %d bytes and final size %d with %d OwnSand file read", len(chunk.GetData()), end.GetSizeBytes(), calls)
+	})
+}
+
 func TestDevSessionFileReadRotation(t *testing.T) {
 	const relayLimit = 200 * time.Millisecond
 	w := newWorkWorld(t, devsession.Timing{StreamLimit: relayLimit, WriteGracePeriod: 2 * time.Second})

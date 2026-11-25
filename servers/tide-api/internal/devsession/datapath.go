@@ -331,9 +331,12 @@ func (h *Handler) ReadDevSessionFile(ctx context.Context, req *connect.Request[t
 	if m.GetOffset() < 0 {
 		return api.ErrInvalidf("invalid offset: must not be negative")
 	}
-	path, err := resolvePath(sess.guestOS, sess.workspace, m.GetPath())
-	if err != nil || m.GetPath() == "" {
+	if m.GetPath() == "" {
 		return api.ErrInvalidf("invalid path: is required")
+	}
+	path, err := resolvePath(sess.guestOS, sess.workspace, m.GetPath())
+	if err != nil {
+		return err
 	}
 	client, _, err := h.e.Links().Client(ctx, sess.req.OrganizationID)
 	if err != nil {
