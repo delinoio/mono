@@ -358,22 +358,65 @@ func TestCursorClaimExpiresAtRunnerBinding(t *testing.T) {
 }
 
 func TestCursorClaimRejectedWithoutEligibleDevice(t *testing.T) {
-	w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
-	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
-		o.CreateError = connect.NewWireError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
-	})
-	w.cursor.AddRequest("bc-no-device", true)
-	req := w.requestBySource(t, "bc-no-device")
-	r := w.waitRequest(t, req.GetRequestId(), tidev1.RequestState_REQUEST_STATE_FAILED)
-	if r.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE {
-		t.Fatalf("request %v", r)
-	}
-	eventually(t, "vendor claim released for no eligible device", func() bool {
-		claim, err := w.l.Agents.Claim(t.Context(), req.GetRequestId())
-		return err == nil && claim.State == agent.ClaimReleased
-	})
-	if message, ok := w.cursor.Failed("bc-no-device"); !ok || !strings.Contains(message, "can run the runner profile") {
-		t.Fatalf("Cursor failure: %q (reported: %t)", message, ok)
+	for _, tc := range []struct {
+		name    string
+		advance time.Duration
+		state   tidev1.RequestState
+		reason  tidev1.RequestEndReason
+		message string
+	}{
+		{"before_deadline", time.Hour - time.Millisecond, tidev1.RequestState_REQUEST_STATE_FAILED,
+			tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE, "can run the runner profile"},
+		{"at_deadline", time.Hour, tidev1.RequestState_REQUEST_STATE_EXPIRED,
+			tidev1.RequestEndReason_REQUEST_END_REASON_MAX_QUEUE_WAIT, "maximum queue wait"},
+		{"after_deadline", time.Hour + time.Millisecond, tidev1.RequestState_REQUEST_STATE_EXPIRED,
+			tidev1.RequestEndReason_REQUEST_END_REASON_MAX_QUEUE_WAIT, "maximum queue wait"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.CreateError = connect.NewWireError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
+			})
+			wait, resume := holdCreateSandbox(t, w.fake, 1)
+			const key = "bc-no-device"
+			w.cursor.AddRequest(key, true)
+			wait()
+			req := w.requestBySource(t, key)
+			commit := holdTx(t, w.env, "SELECT 1 FROM requests WHERE request_id = $1 FOR UPDATE", req.GetRequestId())
+			resume()
+			waitForLockWaiter(t, w.env)
+			w.env.Clock.Advance(tc.advance)
+
+			if _, held := w.cursor.Claim(key); !held || w.cursor.FailAttempts(key) != 0 {
+				t.Fatal("Cursor claim changed before the terminal transaction could commit")
+			}
+			commit()
+
+			r := w.waitRequest(t, req.GetRequestId(), tc.state)
+			if r.GetEndReason() != tc.reason || r.GetStartAttempts() != 0 || r.GetRunnerId() != "" {
+				t.Fatalf("request after cold rejection: %v", r)
+			}
+			resp, err := w.env.User(w.org.Owner).Work.ListRunners(t.Context(), connect.NewRequest(&tidev1.ListRunnersRequest{
+				OrganizationId: w.org.ID, IncludeEnded: true,
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			runners := resp.Msg.GetRunners()
+			if len(runners) != 1 || runners[0].GetState() != tidev1.RunnerState_RUNNER_STATE_FAILED ||
+				runners[0].GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED ||
+				runners[0].GetOwnsandSandboxId() != "" || len(w.fake.Sandboxes(w.osOrg)) != 0 {
+				t.Fatalf("cold rejection should fail only the runner start and leave no sandbox: %v", runners)
+			}
+			eventually(t, "vendor claim released with the request outcome", func() bool {
+				claim, err := w.l.Agents.Claim(t.Context(), req.GetRequestId())
+				message, ok := w.cursor.Failed(key)
+				return err == nil && claim.State == agent.ClaimReleased && ok && strings.Contains(message, tc.message)
+			})
+			if got := w.cursor.FailAttempts(key); got != 1 {
+				t.Fatalf("vendor failure notifications: %d, want 1", got)
+			}
+		})
 	}
 }
 

@@ -214,7 +214,7 @@ func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, 
 			return e.timing.SandboxPoll
 		}
 		sb, err := e.createSandbox(ctx, client, req)
-		switch e.applyCreate(ctx, r, nil, sb, err) {
+		switch e.applyCreate(ctx, r, sb, err) {
 		case createOK:
 			return 0
 		default:

@@ -158,11 +158,7 @@ func newGHWorld(t *testing.T, o worldOpts) *ghWorld {
 	w.os.SetExec(w.progs.exec, w.progs.attach)
 	opts := layers.Options{OwnSand: w.os}
 	if !o.unconfigured {
-		opts.GitHub = github.Options{
-			Client:        githubapi.New(w.gh.Config(), nil, slog.New(slog.NewJSONHandler(w.ghLogs, nil)), now),
-			WebhookSecret: w.gh.WebhookSecret,
-			Timing:        github.Timing{RedeliveryInterval: time.Hour, RedeliveryWindow: 24 * time.Hour, PrepareTimeout: time.Minute, RegistrationGiveUp: time.Minute},
-		}
+		opts.GitHub = w.githubOptions(now)
 	}
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(w.reader))
 	w.env = testenv.New(t, testenv.WithLayerOptions(opts, w.l), func(ao *app.Options) {
@@ -196,6 +192,14 @@ func newGHWorld(t *testing.T, o worldOpts) *ghWorld {
 		t.Fatal(err)
 	}
 	return w
+}
+
+func (w *ghWorld) githubOptions(now func() time.Time) github.Options {
+	return github.Options{
+		Client:        githubapi.New(w.gh.Config(), nil, slog.New(slog.NewJSONHandler(w.ghLogs, nil)), now),
+		WebhookSecret: w.gh.WebhookSecret,
+		Timing:        github.Timing{RedeliveryInterval: time.Hour, RedeliveryWindow: 24 * time.Hour, PrepareTimeout: time.Minute, RegistrationGiveUp: time.Minute},
+	}
 }
 
 func wantCode(t *testing.T, what string, err error, want connect.Code) {

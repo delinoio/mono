@@ -71,6 +71,8 @@ type Runner struct {
 	EndTime          *time.Time
 	UpdateTime       time.Time
 	ChangeSeq        int64
+	// A pool runner can have a queued sponsor before GitHub assigns work.
+	sponsorRequestID string
 	// The revisions are set only for runners created by warm fill.
 	warmProfileRevision string
 	warmLinkRevision    string
@@ -150,14 +152,14 @@ func scanRequest(row scanner) (*Request, error) {
 const runnerColumns = `runner_id::text, organization_id::text, runner_profile_id::text, kind, guest_os, state, end_reason, COALESCE(request_id::text, ''),
 	COALESCE(pool_key, ''), idempotency_key::text, COALESCE(ownsand_sandbox_id::text, ''), ownsand_device_id, ownsand_end_reason, workspace_path,
 	COALESCE(program_exec_id::text, ''), create_time, ready_time, end_time, update_time, change_seq,
-	COALESCE(warm_profile_revision::text, ''), COALESCE(warm_link_revision::text, '')`
+	COALESCE(warm_profile_revision::text, ''), COALESCE(warm_link_revision::text, ''), COALESCE(sponsor_request_id::text, '')`
 
 func scanRunner(row scanner) (*Runner, error) {
 	var r Runner
 	var kind, guest, state, reason int16
 	if err := row.Scan(&r.ID, &r.OrganizationID, &r.ProfileID, &kind, &guest, &state, &reason, &r.RequestID, &r.PoolKey, &r.IdempotencyKey,
 		&r.SandboxID, &r.DeviceID, &r.OwnSandEndReason, &r.WorkspacePath, &r.ProgramExecID, &r.CreateTime, &r.ReadyTime, &r.EndTime,
-		&r.UpdateTime, &r.ChangeSeq, &r.warmProfileRevision, &r.warmLinkRevision); err != nil {
+		&r.UpdateTime, &r.ChangeSeq, &r.warmProfileRevision, &r.warmLinkRevision, &r.sponsorRequestID); err != nil {
 		return nil, err
 	}
 	r.Kind, r.GuestOS, r.State, r.EndReason = tidev1.WorkloadKind(kind), tidev1.GuestOs(guest), tidev1.RunnerState(state), tidev1.RunnerEndReason(reason)
