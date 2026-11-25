@@ -120,6 +120,19 @@ func TestMakeFixedVHD(t *testing.T) {
 	if bytes.Equal(first[68:84], second[68:84]) {
 		t.Fatal("the regrown disk kept its unique ID")
 	}
+	disk, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldFooter, zeros [vhdFooterSize]byte
+	_, err = disk.ReadAt(oldFooter[:], int64(len(raw)))
+	disk.Close()
+	if err != nil {
+		t.Fatalf("read old footer range: %v", err)
+	}
+	if oldFooter != zeros {
+		t.Fatal("the old footer range is not zero")
+	}
 	// A raw image without a footer is rejected where a VHD is expected.
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
