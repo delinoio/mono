@@ -8,70 +8,96 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// TestRemovalFencesInFlightSnapshotImport pauses an import after it wrote the
-// snapshot content and before it publishes the ready entry, runs the device
-// removal to the point where it can finish, and releases the import. The
-// import must not create snapshot metadata or directories after the clean-up
-// boundary, so the state directory is empty when both ended.
+// TestRemovalFencesInFlightSnapshotImport verifies that canceled removal
+// preserves snapshot storage while an admitted import is still active.
 func TestRemovalFencesInFlightSnapshotImport(t *testing.T) {
-	f := newImportFixture(t, nil)
-	a := f.h.agent
+	source := newImportFixture(t, nil)
 	id, _ := uuidv7.NewString()
-	staged := f.stage(t, id, false)
+	staged := source.stage(t, id, false)
+
+	// Import onto a fresh device so sandbox deletion cannot delay the wipe.
+	cp := testcp.New(t)
+	cp.SetSignedURLBase(source.b.URL)
+	st, identity := enrollDevice(t, cp)
+	h := start(t, cp, st, identity)
+	a := h.agent
+	sentinel := st.Path(store.SnapshotsDir, "removal-sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep until the import exits"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	entered := make(chan struct{})
-	release := make(chan struct{})
+	hookRelease := make(chan struct{})
+	release := sync.OnceFunc(func() { close(hookRelease) })
 	a.beforeSnapshotPublishHook = func() {
 		close(entered)
-		<-release
+		<-hookRelease
 	}
-	// A failed assertion must not leave the import blocked: the agent
-	// cleanup waits for its commands.
-	t.Cleanup(func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	})
-	cmdID := f.h.sendCommand(staged)
+	t.Cleanup(release)
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	cmdID := h.sendCommand(staged)
 	waitClosed(t, entered, "the import before its publication")
 
-	f.h.cp.MarkRemoved(f.h.id.DeviceID)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	removed := make(chan error, 1)
-	go func() { removed <- a.removeDevice(context.Background()) }()
-	// Without the fence the removal finishes here and wipes the state
-	// directory while the import still holds its content.
-	settle()
-	close(release)
+	go func() { removed <- a.removeDevice(ctx) }()
 
-	res := f.h.result(cmdID)
-	if res.GetError() == nil && res.GetImportSnapshot().GetSnapshot() == nil {
-		t.Fatalf("import result has neither an entry nor an error: %v", res)
+	// Wait for the admission fence before canceling. Any probe admitted
+	// before the fence releases its reservation without writing data.
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(10 * time.Second)
+	for {
+		endImport, err := a.Sandboxes.BeginSnapshotImport()
+		if err != nil {
+			var refusal *sandboxes.CommandError
+			if !errors.As(err, &refusal) || refusal.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+				t.Fatalf("snapshot import admission returned %v, want FAILED_PRECONDITION", err)
+			}
+			break
+		}
+		endImport()
+		select {
+		case err := <-removed:
+			t.Fatalf("removal returned %v before it fenced import admission", err)
+		case <-deadline:
+			t.Fatal("removal did not fence import admission")
+		case <-ticker.C:
+		}
 	}
+
+	cancel()
 	select {
 	case err := <-removed:
-		if !errors.Is(err, ErrRemoved) {
-			t.Fatalf("removal returned %v", err)
+		if _, statErr := os.Stat(sentinel); statErr != nil {
+			t.Fatalf("snapshot sentinel while the import is held: %v", statErr)
 		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("removal did not finish")
-	}
-	// Whether the import was refused or published before the boundary, the
-	// removal leaves nothing behind.
-	requireEmptyStateDir(t, f.h.st)
-	if dir, err := f.h.st.SnapshotDir(id); err == nil {
-		if _, err := os.Stat(dir); err == nil {
-			t.Errorf("snapshot directory %q exists after the removal", dir)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("removal returned %v while the import is held, want context.Canceled", err)
 		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("removal did not return after cancellation while the import is held")
 	}
+
+	release()
+	if res := h.result(cmdID); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("import after the fence = %v, want FAILED_PRECONDITION", res)
+	}
+	h.requestDeviceRemoval(false)
+	h.requireRunResult(ErrRemoved)
+	requireEmptyStateDir(t, st)
 	if a.Sandboxes.HasSnapshot(id) {
 		t.Error("snapshot record exists after the removal")
 	}
