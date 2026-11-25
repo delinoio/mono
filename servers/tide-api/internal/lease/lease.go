@@ -126,17 +126,33 @@ func (l *Lease) WhileHeld(fn func()) bool {
 	return true
 }
 
-// Wait blocks until the instance holds the lease or ctx ends.
+// Wait blocks until the instance holds a lease whose confirmed deadline is
+// still in the future or ctx ends.
 func (l *Lease) Wait(ctx context.Context) error {
 	l.init()
-	l.mu.Lock()
-	ch := l.acquired
-	l.mu.Unlock()
-	select {
-	case <-ch:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	for {
+		l.mu.Lock()
+		if l.heldLocked() {
+			l.mu.Unlock()
+			return nil
+		}
+		if l.held {
+			// The lease expired before the watcher recorded the loss.
+			l.mu.Unlock()
+			l.expireIfDue()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			continue
+		}
+		ch := l.acquired
+		l.mu.Unlock()
+		select {
+		case <-ch:
+			// Recheck ownership. The signaled period may already be over.
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
