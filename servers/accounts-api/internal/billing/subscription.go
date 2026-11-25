@@ -391,15 +391,11 @@ func (s *Service) StartSubscription(ctx context.Context, tx pgx.Tx, accountID st
 	return txn.ID, sub, true, nil
 }
 
-// changeSubscription runs a Paddle call that returns the subscription entity
-// and stores the result. tx holds the billing account lock.
-func (s *Service) changeSubscription(ctx context.Context, tx pgx.Tx, accountID, operation string, call func(id string) (paddle.Subscription, error)) (Subscription, error) {
+// changeSubscription stores the confirmed result of a Paddle schedule change
+// for the current subscription. tx holds the billing account and subscription locks.
+func (s *Service) changeSubscription(ctx context.Context, tx pgx.Tx, accountID, operation string, sub Subscription, call func(id string) (paddle.Subscription, error)) (Subscription, error) {
 	now := s.timestamp()
 	acct, err := lockAccount(ctx, tx, accountID)
-	if err != nil {
-		return Subscription{}, err
-	}
-	sub, err := LoadSubscription(ctx, tx, accountID, true)
 	if err != nil {
 		return Subscription{}, err
 	}
@@ -413,8 +409,21 @@ func (s *Service) changeSubscription(ctx context.Context, tx pgx.Tx, accountID, 
 			slog.Any("error", err))
 		return Subscription{}, paddleError(err, "subscription change")
 	}
-	if _, err := s.applyPaddleSubscription(ctx, tx, acct, entity, now); err != nil {
+	status, _ := mapPaddleStatus(entity.Status)
+	if entity.ID != sub.PaddleSubscriptionID || entity.UpdatedAt.IsZero() ||
+		(status != SubscriptionActive && status != SubscriptionPastDue) {
+		s.logger.WarnContext(ctx, "billing_subscription_change_unconfirmed",
+			slog.String("operation", operation),
+			slog.String("billing_account_id", accountID),
+			slog.String("paddle_subscription_id", sub.PaddleSubscriptionID))
+		return Subscription{}, unavailable("the payment provider did not confirm the subscription change; try again later")
+	}
+	applied, err := s.applyPaddleSubscription(ctx, tx, acct, entity, now)
+	if err != nil {
 		return Subscription{}, err
+	}
+	if !applied {
+		return Subscription{}, unavailable("the payment provider did not confirm the subscription change; try again later")
 	}
 	if err := s.syncStatuses(ctx, tx, accountID, now); err != nil {
 		return Subscription{}, err
@@ -436,7 +445,7 @@ func (s *Service) CancelSubscription(ctx context.Context, tx pgx.Tx, accountID s
 	if sub.CancelAtPeriodEnd {
 		return sub, false, nil
 	}
-	sub, err = s.changeSubscription(ctx, tx, accountID, "cancel_subscription", func(id string) (paddle.Subscription, error) {
+	sub, err = s.changeSubscription(ctx, tx, accountID, "cancel_subscription", sub, func(id string) (paddle.Subscription, error) {
 		return s.paddle.CancelSubscription(ctx, id, paddle.EffectiveNextBillingPeriod)
 	})
 	return sub, err == nil, err
@@ -455,7 +464,7 @@ func (s *Service) ResumeSubscription(ctx context.Context, tx pgx.Tx, accountID s
 	if !sub.CancelAtPeriodEnd {
 		return sub, false, nil
 	}
-	sub, err = s.changeSubscription(ctx, tx, accountID, "resume_subscription", func(id string) (paddle.Subscription, error) {
+	sub, err = s.changeSubscription(ctx, tx, accountID, "resume_subscription", sub, func(id string) (paddle.Subscription, error) {
 		return s.paddle.RemoveScheduledChange(ctx, id)
 	})
 	return sub, err == nil, err

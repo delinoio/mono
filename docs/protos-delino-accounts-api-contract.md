@@ -108,6 +108,10 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 
 - While the subscription is `PENDING`, `StartSubscription` reuses a verified payable checkout or returns a replacement if Paddle confirms that the original is canceled or missing. An inconclusive lookup or a payment awaiting its verified webhook returns retryable `unavailable` and preserves the pending checkout.
 
+### Subscription cancellation and resumption
+
+- `CancelSubscription` and `ResumeSubscription` return retryable `unavailable` if Paddle does not confirm the requested schedule for the current subscription. The stored schedule and audit log stay unchanged. Repeating a change that the local schedule already reflects succeeds without contacting Paddle.
+
 ### Top-ups
 
 - `CreateTopUp` charges `amount_usd_micros` with Paddle `POST /subscriptions/{id}/charge` (`effective_from: immediately`). The amount is at least $25 and at most $10,000, in whole cents; other values fail with `invalid_argument`. The call fails with `failed_precondition` unless the subscription is `ACTIVE`, and with `failed_precondition` (a message without payment data) when Paddle rejects the charge; Paddle unavailability fails with `unavailable`.
