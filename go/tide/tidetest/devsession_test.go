@@ -26,7 +26,7 @@ import (
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
 
-func TestWriteDevSessionFileRejectsNegativeOffsets(t *testing.T) {
+func TestWriteDevSessionFileRejectsInvalidOffsets(t *testing.T) {
 	const writeID, fileName = "write-offset", "out.txt"
 	workspace := t.TempDir()
 	s := New()
@@ -55,19 +55,25 @@ func TestWriteDevSessionFileRejectsNegativeOffsets(t *testing.T) {
 			t.Errorf("offset %d: got %v, want InvalidArgument (%s)", offset, err, want)
 		}
 	}
-	checkNegativeOffsets := func(t *testing.T) {
+	checkInvalidOffsets := func(t *testing.T) {
+		t.Helper()
+		const negative = "invalid offset: must not be negative"
+		const overflow = "invalid offset: the chunk end offset exceeds the maximum int64 value"
 		for _, chunk := range []struct {
 			offset int64
 			data   string
 			final  bool
+			want   string
 		}{
-			{-1, "x", false},
-			{-3, "xyz", true},
-			{-5, "0123456789", false},
-			{math.MinInt64, "", true},
+			{-1, "x", false, negative},
+			{-3, "xyz", true, negative},
+			{-5, "0123456789", false, negative},
+			{math.MinInt64, "", true, negative},
+			{math.MaxInt64, "x", false, overflow},
+			{math.MaxInt64 - 1, "xy", true, overflow},
 		} {
 			_, err := write(chunk.offset, chunk.data, chunk.final)
-			requireInvalid(t, chunk.offset, err, "invalid offset: must not be negative")
+			requireInvalid(t, chunk.offset, err, chunk.want)
 		}
 	}
 	requireWrite := func(offset int64, data string, final bool) {
@@ -82,7 +88,7 @@ func TestWriteDevSessionFileRejectsNegativeOffsets(t *testing.T) {
 	}
 
 	t.Run("new write", func(t *testing.T) {
-		checkNegativeOffsets(t)
+		checkInvalidOffsets(t)
 		s.guest.mu.Lock()
 		_, exists := s.guest.writes[writeKey{organizationID: org, devSessionID: sessionID, writeID: writeID}]
 		s.guest.mu.Unlock()
@@ -91,7 +97,9 @@ func TestWriteDevSessionFileRejectsNegativeOffsets(t *testing.T) {
 		}
 	})
 	requireWrite(0, "abc", false)
-	t.Run("pending write", checkNegativeOffsets)
+	t.Run("pending write", checkInvalidOffsets)
+	_, err = write(math.MaxInt64-1, "x", false)
+	requireInvalid(t, math.MaxInt64-1, err, fmt.Sprintf("chunk at offset %d does not continue the write at 3", math.MaxInt64-1))
 	_, err = write(4, "x", false)
 	requireInvalid(t, 4, err, "chunk at offset 4 does not continue the write at 3")
 	_, err = write(0, "xyz", false)
@@ -99,7 +107,8 @@ func TestWriteDevSessionFileRejectsNegativeOffsets(t *testing.T) {
 	requireWrite(3, "def", false)
 	requireWrite(0, "abc", false)
 	requireWrite(6, "ghi", true)
-	t.Run("finished write", checkNegativeOffsets)
+	t.Run("finished write", checkInvalidOffsets)
+	requireWrite(6, "ghi", true)
 
 	data, err := os.ReadFile(filepath.Join(workspace, fileName))
 	if err != nil {
