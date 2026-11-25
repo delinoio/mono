@@ -307,12 +307,33 @@ func TestSessionExecJSONResumesBufferedUTF8(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(f.wd, "resume"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	args := append([]string{"--output", "json"}, strings.Fields(hint)...)
-	attached := f.ok("", args...)
+	attached := f.ok("", strings.Fields(hint)...)
 	checkExecJSONLines(t, attached.stdout,
 		execJSONLine{Event: "stdout", Offset: 1, Data: "€"},
 		execJSONLine{Event: "exited"},
 	)
+}
+
+func TestExecAttachCommandQuotesArguments(t *testing.T) {
+	const value = "--api-url=http://[::1]:8080"
+	for _, tc := range []struct {
+		label   string
+		windows bool
+		input   string
+		want    string
+	}{
+		{"empty flag value", false, "--output=", "--output="},
+		{"IPv6 POSIX", false, value, "'" + value + "'"},
+		{"IPv6 PowerShell", true, value, "'" + value + "'"},
+		{"quotes POSIX", false, "--org=a'b $c", `'--org=a'"'"'b $c'`},
+		{"quotes PowerShell", true, "--org=a'b‘’‚‛ $c", `'--org=a''b‘‘’’‚‚‛‛ $c'`},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			if got := quoteAttachArg(tc.input, tc.windows); got != tc.want {
+				t.Fatalf("quoted arg = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 func (f *fixture) run(stdin string, args ...string) result {

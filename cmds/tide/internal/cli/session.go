@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -420,7 +421,8 @@ func (a *app) finishExec(ctx context.Context, session string, w *execWriter, res
 				stdoutOffset = w.stdout.resumeOffset(stdoutOffset)
 				stderrOffset = w.stderr.resumeOffset(stderrOffset)
 			}
-			return &exitError{code: ExitInterrupted, msg: fmt.Sprintf("interrupted; the command keeps running. Continue with: tide session attach %s %s --stdout-offset %d --stderr-offset %d", session, se.ExecID, stdoutOffset, stderrOffset)}
+			hint := a.attachCommand(session, se.ExecID, stdoutOffset, stderrOffset)
+			return &exitError{code: ExitInterrupted, msg: "interrupted; the command keeps running. Continue with: " + hint}
 		}
 		if jsonMode {
 			if err := w.flushAll(se.ExecID); err != nil {
@@ -478,6 +480,42 @@ func (a *app) finishExec(ctx context.Context, session string, w *execWriter, res
 		a.warnf("the output is incomplete")
 	}
 	return &exitError{code: execExitStatus(res)}
+}
+
+func (a *app) attachCommand(sessionID, execID string, stdoutOffset, stderrOffset int64) string {
+	windows := runtime.GOOS == "windows"
+	args := []string{"tide", "session", "attach", quoteAttachArg(sessionID, windows), quoteAttachArg(execID, windows)}
+	for _, option := range []struct {
+		name  string
+		value string
+		set   bool
+	}{
+		{"org", a.g.org, a.g.orgSet},
+		{"api-url", a.g.apiURL, a.g.apiURLSet},
+		{"output", a.g.output, a.g.outputSet},
+	} {
+		if option.set {
+			args = append(args, quoteAttachArg("--"+option.name+"="+option.value, windows))
+		}
+	}
+	return strings.Join(args, " ") + fmt.Sprintf(" --stdout-offset %d --stderr-offset %d", stdoutOffset, stderrOffset)
+}
+
+// quoteAttachArg quotes one argument for a POSIX shell or, on Windows, PowerShell.
+func quoteAttachArg(arg string, windows bool) string {
+	if arg != "" && strings.IndexFunc(arg, func(c rune) bool {
+		return !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+			strings.ContainsRune("-._:/=", c))
+	}) == -1 {
+		return arg
+	}
+	if windows {
+		// PowerShell also treats the four typographic single quotes as delimiters.
+		arg = strings.NewReplacer("'", "''", "‘", "‘‘", "’", "’’", "‚", "‚‚", "‛", "‛‛").Replace(arg)
+	} else {
+		arg = strings.ReplaceAll(arg, "'", "'\"'\"'")
+	}
+	return "'" + arg + "'"
 }
 
 // execExitStatus applies the first matching rule: lost output 255, sandbox
