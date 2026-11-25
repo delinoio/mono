@@ -111,7 +111,7 @@ func TestMacOSImageFirstBootShutdown(t *testing.T) {
 				return d.DialContext(ctx, "tcp", srv.Listener.Addr().String())
 			}
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			err := finishMacOSImage(dir, images.Metadata{GuestOS: guestOS}, "", func() (string, error) {
+			err := finishMacOSImage(t.Context(), dir, images.Metadata{GuestOS: guestOS}, "", func() (string, error) {
 				return provisionAndShutdownMacOS(ctx, dial, exit, logger, time.Now(), 100*time.Millisecond)
 			})
 			for _, command := range append(slices.Clone(macOSProvisionCommands), shutdownCommand) {

@@ -10,11 +10,14 @@ import (
 	"syscall"
 )
 
-// tryLockFile takes an exclusive flock without blocking. It reports false
-// when another open file description holds the lock.
-func tryLockFile(f *os.File) (bool, error) {
+// tryLockFile reports false if a conflicting flock is already held.
+func tryLockFile(f *os.File, mode lockMode) (bool, error) {
+	flags := syscall.LOCK_EX | syscall.LOCK_NB
+	if mode == sharedLock {
+		flags = syscall.LOCK_SH | syscall.LOCK_NB
+	}
 	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := syscall.Flock(int(f.Fd()), flags)
 		switch {
 		case err == nil:
 			return true, nil

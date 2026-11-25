@@ -11,12 +11,15 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// tryLockFile takes an exclusive LockFileEx lock on the first byte without
-// waiting. It reports false when another handle holds the lock.
-func tryLockFile(f *os.File) (bool, error) {
+// tryLockFile reports false if another handle holds a conflicting byte lock.
+func tryLockFile(f *os.File, mode lockMode) (bool, error) {
+	flags := uint32(windows.LOCKFILE_FAIL_IMMEDIATELY)
+	if mode == exclusiveLock {
+		flags |= windows.LOCKFILE_EXCLUSIVE_LOCK
+	}
 	ol := new(windows.Overlapped)
 	err := windows.LockFileEx(windows.Handle(f.Fd()),
-		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, ol)
+		flags, 0, 1, 0, ol)
 	switch {
 	case err == nil:
 		return true, nil

@@ -291,13 +291,6 @@ func growFile(path string, size int64) error {
 	return os.Truncate(path, size)
 }
 
-func checkBaseDiskCapacity(sourceBytes, requestedBytes int64) error {
-	if sourceBytes > requestedBytes {
-		return fmt.Errorf("%w: the base disk requires %d bytes, but the request allocates %d bytes", vmruntime.ErrUnsupported, sourceBytes, requestedBytes)
-	}
-	return nil
-}
-
 // Create boots a VM for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
 	switch spec.GuestOS {
