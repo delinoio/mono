@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import type { MessageInitShape } from "@bufbuild/protobuf";
 import {
   createInfiniteQueryOptions,
   useMutation,
@@ -25,10 +26,11 @@ import {
 } from "@delino/ownsand-protos/v1/common_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import {
+  CreateSandboxRequestSchema,
   type Sandbox,
   SandboxService,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   invalidateServices,
   POLL_INTERVAL_MS,
@@ -63,6 +65,17 @@ import { useSnapshots, useTemplates } from "../snapshot-lists.ts";
 import { uuidV7 } from "../uuid.ts";
 
 const ALL = "all";
+const CREATE_RESERVATION_MS = 24 * 60 * 60 * 1000;
+const SANDBOX_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+interface CreateAttempt {
+  request: MessageInitShape<typeof CreateSandboxRequestSchema>;
+  expiresAt: number;
+  status: "pending" | "unconfirmed" | "expired";
+  sourceLabel: string;
+  deviceLabel: string | undefined;
+}
 
 /** Route `sandboxes`: the sandbox list with filters and creation. */
 export function SandboxesPage() {
@@ -338,6 +351,8 @@ function CreateSandboxDialog({
   // One idempotency key per logical create: a retry after a lost response
   // reuses it, so the control plane returns the original sandbox.
   const [idempotencyKey, setIdempotencyKey] = useState(uuidV7);
+  const firstSubmittedAt = useRef<number>(undefined);
+  const [attempt, setAttempt] = useState<CreateAttempt>();
   const [source, setSource] = useState(`base:${BaseImage.LINUX}`);
   const [vcpu, setVcpu] = useState<number | null>(2);
   const [memory, setMemory] = useState<number | null>(4096);
@@ -349,15 +364,49 @@ function CreateSandboxDialog({
   const [labelText, setLabelText] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
   const sourceRequest = sourceOf(source);
-  const { case: sourceKind, value: sourceValue } = sourceRequest.source;
-  const sourceAvailable =
-    sourceKind === "baseImage" ||
-    (sourceKind === "templateId" &&
-      templates.rows.some((t) => t.templateId === sourceValue)) ||
-    (sourceKind === "snapshotId" &&
-      readySnapshots.some((s) => s.snapshotId === sourceValue));
+  const sourceOptions = [
+    ...[BaseImage.LINUX, BaseImage.MACOS, BaseImage.WINDOWS].map((image) => ({
+      value: `base:${image}`,
+      label: `${labels.baseImage[image]} base image`,
+    })),
+    ...templates.rows.map((template) => ({
+      value: `template:${template.templateId}`,
+      label: `Template: ${template.name}`,
+    })),
+    ...readySnapshots.map((snapshot) => ({
+      value: `snapshot:${snapshot.snapshotId}`,
+      label: `Snapshot ${shortIdText(snapshot.snapshotId)} · ${formatTime(snapshot.createTime)}`,
+    })),
+  ];
+  const selectedSource = sourceOptions.find(
+    (option) => option.value === source,
+  );
+  const selectedDevice = devices.find((item) => item.deviceId === device);
+  const retryDeadline =
+    attempt?.status === "unconfirmed" ? attempt.expiresAt : undefined;
+  const expired = attempt?.status === "expired";
+  const recovering = retryDeadline !== undefined || expired;
+  const fieldsLocked = attempt !== undefined;
+
+  useEffect(() => {
+    if (retryDeadline === undefined) return;
+    const timer = window.setTimeout(
+      () => {
+        setAttempt((current) =>
+          current?.status === "unconfirmed" &&
+          current.expiresAt === retryDeadline
+            ? { ...current, status: "expired" }
+            : current,
+        );
+      },
+      Math.max(0, retryDeadline - Date.now()),
+    );
+    return () => window.clearTimeout(timer);
+  }, [retryDeadline]);
 
   const reset = () => {
+    firstSubmittedAt.current = undefined;
+    setAttempt(undefined);
     setIdempotencyKey(uuidV7());
     setErrors({});
     setLabelText("");
@@ -369,54 +418,81 @@ function CreateSandboxDialog({
       title="Create a sandbox"
       wide
       description="Choose the source, resources and time limits. There is no default TTL."
-      submitLabel="Create"
-      submitDisabled={!sourceAvailable}
+      submitLabel={recovering ? "Retry original request" : "Create"}
+      submitDisabled={
+        attempt?.status === "pending" ||
+        expired ||
+        (attempt === undefined && !selectedSource)
+      }
       onOpenChange={(next) => {
         onOpenChange(next);
         if (!next) reset();
       }}
       onSubmit={async (opening) => {
-        const next: Record<string, string> = {};
-        const ttl = ttlErrors({ idleMinutes, maxHours });
-        if (ttl.idle) next.idle = ttl.idle;
-        if (ttl.max) next.max = ttl.max;
-        Object.assign(next, resourceErrors({ vcpu, memory, disk }));
-        const parsed = parseLabels(labelText);
-        if ("error" in parsed) next.labels = parsed.error;
-        setErrors(next);
-        if (Object.keys(next).length > 0 || "error" in parsed) return;
+        let submission = attempt;
+        if (submission) {
+          if (submission.status !== "unconfirmed") return;
+          if (Date.now() >= submission.expiresAt) {
+            setAttempt({ ...submission, status: "expired" });
+            return;
+          }
+        } else {
+          if (!selectedSource) return;
+          const next: Record<string, string> = {};
+          const ttl = ttlErrors({ idleMinutes, maxHours });
+          if (ttl.idle) next.idle = ttl.idle;
+          if (ttl.max) next.max = ttl.max;
+          Object.assign(next, resourceErrors({ vcpu, memory, disk }));
+          const parsed = parseLabels(labelText);
+          if ("error" in parsed) next.labels = parsed.error;
+          setErrors(next);
+          if (Object.keys(next).length > 0 || "error" in parsed) return;
+
+          // A response can be lost after the server reserves the key. Start
+          // the retry window with the first request that used this key.
+          firstSubmittedAt.current ??= Date.now();
+          submission = {
+            status: "pending",
+            expiresAt: firstSubmittedAt.current + CREATE_RESERVATION_MS,
+            sourceLabel: selectedSource.label,
+            deviceLabel: selectedDevice
+              ? deviceOptionLabel(selectedDevice.name, selectedDevice.state)
+              : undefined,
+            request: {
+              organizationId,
+              idempotencyKey,
+              source: sourceRequest,
+              resources: {
+                vcpuCount: vcpu!,
+                memoryMib: BigInt(memory!),
+                diskGib: BigInt(disk!),
+              },
+              idleTtl: { seconds: BigInt(Math.round(idleMinutes! * 60)) },
+              maxTtl: { seconds: BigInt(Math.round(maxHours! * 3600)) },
+              placement: device === ALL ? undefined : { deviceId: device },
+              network: { mode: Number(network) as NetworkMode },
+              labels: parsed.labels,
+            },
+          };
+          setAttempt(submission);
+        }
         let res;
         try {
-          res = await create.mutateAsync({
-            organizationId,
-            idempotencyKey,
-            source: sourceRequest,
-            resources: {
-              vcpuCount: vcpu!,
-              memoryMib: BigInt(memory!),
-              diskGib: BigInt(disk!),
-            },
-            idleTtl: { seconds: BigInt(Math.round(idleMinutes! * 60)) },
-            maxTtl: { seconds: BigInt(Math.round(maxHours! * 3600)) },
-            placement: device === ALL ? undefined : { deviceId: device },
-            network: { mode: Number(network) as NetworkMode },
-            labels: parsed.labels,
-          });
+          res = await create.mutateAsync(submission.request);
         } catch (error) {
+          if (submission.status === "pending" && opening.isCurrent()) {
+            setAttempt(undefined);
+          }
           // The control plane answers `Unavailable` without a reason. When
           // the selected device is offline in the loaded device list, name
           // it, so the notice does not read as an outage of OwnSand.
-          const selected =
-            device === ALL
-              ? undefined
-              : devices.find((d) => d.deviceId === device);
           if (
             error instanceof ConnectError &&
             error.code === Code.Unavailable &&
-            selected?.state === DeviceState.OFFLINE
+            selectedDevice?.state === DeviceState.OFFLINE
           ) {
             throw new ConnectError(
-              offlineDeviceMessage(selected.name),
+              offlineDeviceMessage(selectedDevice.name),
               Code.FailedPrecondition,
               undefined,
               undefined,
@@ -427,50 +503,54 @@ function CreateSandboxDialog({
         }
         // A new sandbox changes the allocation of its device. The device
         // and sandbox queries are marked stale and refetched in the
-        // background; the dialog closes and the detail page opens from the
-        // created sandbox without waiting for the list refetch.
+        // background. Navigation can use the response without waiting for
+        // either list to refetch.
         void invalidateServices(queryClient, DeviceService);
         void invalidateServices(queryClient, SandboxService);
         // A request of a dismissed opening neither closes the form of a
         // later opening nor moves the user away from the page they went to.
         if (!opening.isCurrent()) return;
+        const sandboxId = res.sandbox?.sandboxId;
+        if (!sandboxId || !SANDBOX_ID.test(sandboxId)) {
+          setAttempt({
+            ...submission,
+            status:
+              Date.now() >= submission.expiresAt ? "expired" : "unconfirmed",
+          });
+          return;
+        }
         onOpenChange(false);
         reset();
         navigate(
           routePath({
             id: RouteId.Sandbox,
             organizationId,
-            sandboxId: res.sandbox!.sandboxId,
+            sandboxId,
           }),
         );
       }}
     >
-      {templates.boundary.isPending || snapshots.boundary.isPending ? (
+      {!fieldsLocked &&
+      (templates.boundary.isPending || snapshots.boundary.isPending) ? (
         // Render the source picker once its options are known, so the
         // trigger shows the selected option's name from the start.
         <Loading label="Loading sources" />
       ) : (
         <Select
           label="Source"
-          value={sourceAvailable ? source : null}
+          value={selectedSource || fieldsLocked ? source : null}
           placeholder="Choose a source"
+          disabled={fieldsLocked}
           onValueChange={(v) => v && setSource(v)}
         >
-          {[BaseImage.LINUX, BaseImage.MACOS, BaseImage.WINDOWS].map((b) => (
-            <SelectOption key={b} value={`base:${b}`}>
-              {labels.baseImage[b]} base image
+          {sourceOptions.map(({ value, label }) => (
+            <SelectOption key={value} value={value}>
+              {label}
             </SelectOption>
           ))}
-          {templates.rows.map((t) => (
-            <SelectOption key={t.templateId} value={`template:${t.templateId}`}>
-              Template: {t.name}
-            </SelectOption>
-          ))}
-          {readySnapshots.map((s) => (
-            <SelectOption key={s.snapshotId} value={`snapshot:${s.snapshotId}`}>
-              {`Snapshot ${shortIdText(s.snapshotId)} · ${formatTime(s.createTime)}`}
-            </SelectOption>
-          ))}
+          {!selectedSource && attempt ? (
+            <SelectOption value={source}>{attempt.sourceLabel}</SelectOption>
+          ) : null}
         </Select>
       )}
       {templates.boundary.isPending ? null : (
@@ -487,6 +567,7 @@ function CreateSandboxDialog({
         <NumberInput
           label="vCPUs"
           value={vcpu}
+          disabled={fieldsLocked}
           onValueChange={setVcpu}
           min={1}
           error={errors.vcpu}
@@ -494,6 +575,7 @@ function CreateSandboxDialog({
         <NumberInput
           label="Memory (MiB)"
           value={memory}
+          disabled={fieldsLocked}
           onValueChange={setMemory}
           min={256}
           // `step` is also the grid that Enter and blur snap the typed value
@@ -506,6 +588,7 @@ function CreateSandboxDialog({
         <NumberInput
           label="Disk (GiB)"
           value={disk}
+          disabled={fieldsLocked}
           onValueChange={setDisk}
           min={1}
           error={errors.disk}
@@ -516,6 +599,7 @@ function CreateSandboxDialog({
           label="Idle TTL (minutes)"
           description="Ends the sandbox after this long without activity."
           value={idleMinutes}
+          disabled={fieldsLocked}
           onValueChange={setIdleMinutes}
           min={1}
           error={errors.idle}
@@ -524,6 +608,7 @@ function CreateSandboxDialog({
           label="Maximum TTL (hours)"
           description="At most 168 hours (7 days)."
           value={maxHours}
+          disabled={fieldsLocked}
           onValueChange={setMaxHours}
           min={1}
           max={168}
@@ -534,6 +619,7 @@ function CreateSandboxDialog({
         <Select
           label="Network"
           value={network}
+          disabled={fieldsLocked}
           onValueChange={(v) => v && setNetwork(v)}
         >
           <SelectOption value={String(NetworkMode.OUTBOUND)}>
@@ -546,6 +632,7 @@ function CreateSandboxDialog({
         <Select
           label="Device"
           value={device}
+          disabled={fieldsLocked}
           onValueChange={(v) => setDevice(v ?? ALL)}
         >
           <SelectOption value={ALL}>Any device that fits</SelectOption>
@@ -554,6 +641,9 @@ function CreateSandboxDialog({
               {deviceOptionLabel(d.name, d.state)}
             </SelectOption>
           ))}
+          {!selectedDevice && attempt?.deviceLabel ? (
+            <SelectOption value={device}>{attempt.deviceLabel}</SelectOption>
+          ) : null}
         </Select>
       </div>
       {open ? <DeviceListNotice list={deviceList} /> : null}
@@ -561,10 +651,21 @@ function CreateSandboxDialog({
         label="Labels"
         description="One key=value per line. Every member and API key can read labels, so never put secrets in them."
         value={labelText}
+        disabled={fieldsLocked}
         onValueChange={setLabelText}
         rows={3}
         error={errors.labels}
       />
+      {recovering ? (
+        <div className="notice notice-error" role="alert">
+          <p>
+            The sandbox may have been created.{" "}
+            {expired
+              ? "The retry window has ended. Check the sandbox list before creating another sandbox."
+              : "Retry the original request to recover the sandbox."}
+          </p>
+        </div>
+      ) : null}
     </FormDialog>
   );
 }
