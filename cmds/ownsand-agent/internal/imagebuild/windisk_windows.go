@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"github.com/Microsoft/go-winio/vhd"
 	"golang.org/x/sys/windows"
@@ -25,6 +27,9 @@ import (
 const (
 	efiPartitionMiB = 260
 	msrPartitionMiB = 16
+
+	driveLetterMutexName   = `Global\Delino.OwnSand.ImageBuild.DriveLetters`
+	driveLetterMutexWaitMS = 50
 )
 
 // attachedDisk is the new image VHDX attached to the host with two drive
@@ -84,12 +89,61 @@ func (d *attachedDisk) detach() error {
 	return err
 }
 
-// freeDriveLetters returns n unused drive letters, from Z downwards.
-func freeDriveLetters(n int) ([]string, error) {
-	mask, err := windows.GetLogicalDrives()
-	if err != nil {
-		return nil, err
+// withDriveLetterMutex serializes drive-letter selection and assignment
+// across builder processes, including those in different Windows sessions.
+func withDriveLetterMutex(ctx context.Context, name string, partition func() error) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	mutexName, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return err
+	}
+	// Grant SYNCHRONIZE and MUTEX_MODIFY_STATE to SYSTEM, administrators,
+	// and the object owner so elevated builders can share the mutex.
+	descriptor, err := windows.SecurityDescriptorFromString("D:(A;;0x00100001;;;SY)(A;;0x00100001;;;BA)(A;;0x00100001;;;OW)")
+	if err != nil {
+		return fmt.Errorf("imagebuild: create the drive-letter mutex security descriptor: %w", err)
+	}
+	attrs := windows.SecurityAttributes{SecurityDescriptor: descriptor}
+	attrs.Length = uint32(unsafe.Sizeof(attrs))
+	mutex, err := windows.CreateMutexEx(&attrs, mutexName, 0, windows.SYNCHRONIZE|windows.MUTEX_MODIFY_STATE)
+	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		return fmt.Errorf("imagebuild: open the drive-letter mutex: %w", err)
+	}
+	defer windows.CloseHandle(mutex)
+
+	// Windows assigns mutex ownership to the thread that waited on it.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	for ctx.Err() == nil {
+		result, waitErr := windows.WaitForSingleObject(mutex, driveLetterMutexWaitMS)
+		if waitErr != nil {
+			return fmt.Errorf("imagebuild: wait for the drive-letter mutex: %w", waitErr)
+		}
+		switch result {
+		case windows.WAIT_OBJECT_0, windows.WAIT_ABANDONED:
+			// Partitioning reads a fresh mask even if the previous owner exited.
+			defer func() {
+				if releaseErr := windows.ReleaseMutex(mutex); releaseErr != nil {
+					err = errors.Join(err, fmt.Errorf("imagebuild: release the drive-letter mutex: %w", releaseErr))
+				}
+			}()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return partition()
+		case uint32(windows.WAIT_TIMEOUT):
+			continue
+		default:
+			return fmt.Errorf("imagebuild: unexpected drive-letter mutex wait result %#x", result)
+		}
+	}
+	return ctx.Err()
+}
+
+// freeDriveLetters returns n unused drive letters, from Z downwards.
+func freeDriveLetters(mask uint32, n int) ([]string, error) {
 	var out []string
 	for c := 'Z'; c >= 'D' && len(out) < n; c-- {
 		if mask&(1<<(c-'A')) == 0 {
@@ -122,20 +176,30 @@ func diskpartScript(number int, system, win string) string {
 
 // partition partitions the attached disk and mounts its two volumes.
 func (d *attachedDisk) partition(ctx context.Context, scratch string) error {
-	letters, err := freeDriveLetters(2)
-	if err != nil {
-		return err
-	}
-	d.System, d.Windows = letters[0], letters[1]
-	script := filepath.Join(scratch, "diskpart.txt")
-	if err := os.WriteFile(script, []byte(diskpartScript(d.number, d.System[:1], d.Windows[:1])), 0o600); err != nil {
-		return err
-	}
-	defer os.Remove(script)
-	if out, err := runTool(ctx, "diskpart.exe", "/s", script); err != nil {
-		return fmt.Errorf("imagebuild: partition the image disk: %w: %s", err, out)
-	}
-	return nil
+	return d.partitionWith(ctx, scratch, driveLetterMutexName, windows.GetLogicalDrives, runTool)
+}
+
+func (d *attachedDisk) partitionWith(ctx context.Context, scratch, mutexName string, readMask func() (uint32, error), run func(context.Context, string, ...string) (string, error)) error {
+	return withDriveLetterMutex(ctx, mutexName, func() error {
+		mask, err := readMask()
+		if err != nil {
+			return err
+		}
+		letters, err := freeDriveLetters(mask, 2)
+		if err != nil {
+			return err
+		}
+		d.System, d.Windows = letters[0], letters[1]
+		script := filepath.Join(scratch, "diskpart.txt")
+		if err := os.WriteFile(script, []byte(diskpartScript(d.number, d.System[:1], d.Windows[:1])), 0o600); err != nil {
+			return err
+		}
+		defer os.Remove(script)
+		if out, err := run(ctx, "diskpart.exe", "/s", script); err != nil {
+			return fmt.Errorf("imagebuild: partition the image disk: %w: %s", err, out)
+		}
+		return nil
+	})
 }
 
 // runTool runs a Windows tool and returns the end of its output.
