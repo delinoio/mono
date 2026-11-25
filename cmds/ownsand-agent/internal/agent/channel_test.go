@@ -150,7 +150,9 @@ func TestChannelAckTimeoutStillReconnects(t *testing.T) {
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
 	cp.SetAck(false, true)
-	h := start(t, cp, st, id)
+	h := startWith(t, cp, st, id, func(o *Options) {
+		o.AckTimeout = 500 * time.Millisecond
+	})
 	h.wait(0, "capability report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil })
 	deadline := time.Now().Add(10 * time.Second)
 	for cp.Channels() < 2 {

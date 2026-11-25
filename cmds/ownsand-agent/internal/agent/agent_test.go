@@ -138,8 +138,11 @@ func newAgent(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Identi
 	client, _ := cpclient.New(cp.URL, nil)
 	opts := Options{
 		Store: st, Identity: id, Control: client, Runtime: rt, Logger: logger,
-		HeartbeatInterval: 50 * time.Millisecond, AckTimeout: 500 * time.Millisecond,
-		BackoffMin: 20 * time.Millisecond, BackoffMax: 100 * time.Millisecond,
+		// Keep the regular acknowledgement deadline for command fixtures.
+		// A short interval gives tests prompt heartbeats without ending a
+		// channel when the runner briefly stalls the receiver.
+		HeartbeatInterval: 50 * time.Millisecond,
+		BackoffMin:        20 * time.Millisecond, BackoffMax: 100 * time.Millisecond,
 		Update: update.Options{Platform: "linux-amd64", Running: "1.0.0", Installer: update.ExecutableInstaller{Path: filepath.Join(t.TempDir(), "exe")}},
 	}
 	if tweak != nil {
@@ -169,7 +172,7 @@ func (h *harness) command(cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandRe
 	}
 	res := h.cp.CommandResult(30*time.Second, cmd.GetCommandId())
 	if res == nil {
-		h.t.Fatal("no command result")
+		h.t.Fatalf("no command result for %T after %d control channels", cmd.GetCommand(), h.cp.Channels())
 	}
 	return res
 }
@@ -237,22 +240,19 @@ func TestChannelLifecycleCommandsAndRemoval(t *testing.T) {
 	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SessionRevocation{SessionRevocation: &ownsandv1.SessionRevocation{RevocationId: "r1", Target: &ownsandv1.SessionRevocation_SessionId{SessionId: "s"}}}})
 	h.wait(0, "revocation ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetRevocationAck().GetRevocationId() == "r1" })
 
-	// Without heartbeat acknowledgements the agent reconnects and sends a
-	// new state report. The agent sends a state report only when a channel
-	// opens, so every report at or after this cursor belongs to the
-	// reconnect. Sample the cursor before the trigger: sampling it after the
-	// reconnect can skip past the new report when a heartbeat follows it.
+	// Close the channel and wait for a report from its replacement before
+	// sending more commands. The heartbeat-deadline test exercises the
+	// timer separately.
 	channels := cp.Channels()
 	cursor := cp.Received()
-	cp.SetAck(false, true)
+	cp.Current().Close()
 	deadline := time.Now().Add(10 * time.Second)
 	for cp.Channels() == channels {
 		if time.Now().After(deadline) {
-			t.Fatal("agent did not reconnect without heartbeat acknowledgements")
+			t.Fatal("agent did not reconnect after the control plane closed the channel")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	cp.SetAck(true, true)
 	h.wait(cursor, "state report after reconnect", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
 
 	res = h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSandbox{DeleteSandbox: &ownsandv1.DeleteSandboxCommand{SandboxId: sandboxID}}})
