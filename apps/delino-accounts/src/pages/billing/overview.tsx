@@ -264,6 +264,8 @@ function SubscriptionCard() {
   const [canceling, setCanceling] = useState(false);
   const [startError, setStartError] = useState<unknown>();
   const canPay = can(role, Permission.ManagePayments);
+  const cancelOpen = canPay && canceling;
+  if (canceling && !cancelOpen) setCanceling(false);
 
   // One controller per mounted view of this billing account. Leaving the
   // view aborts it, so a subscription start whose response arrives later does
@@ -405,7 +407,7 @@ function SubscriptionCard() {
         </div>
       ) : null}
       <ConfirmDialog
-        open={canceling}
+        open={cancelOpen}
         onOpenChange={setCanceling}
         title="Cancel the subscription?"
         description={
@@ -414,7 +416,10 @@ function SubscriptionCard() {
             : "It stays active until the end of the paid period. After that, linked organizations cannot use paid features."
         }
         confirmLabel="Cancel subscription"
-        onConfirm={() => cancel.mutateAsync({ billingAccountId })}
+        onConfirm={async () => {
+          if (!cancelOpen) return;
+          await cancel.mutateAsync({ billingAccountId });
+        }}
       />
     </section>
   );
