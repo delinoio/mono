@@ -204,6 +204,152 @@ describe("continuation errors", () => {
   );
 });
 
+const refreshTest = test.extend<{
+  refresh: {
+    open(path: string, method: string, mutation: string): Promise<void>;
+    fail(): Promise<void>;
+    recover(): Promise<void>;
+  };
+}>({
+  refresh: async ({ app, browser, screen }, use) => {
+    await use({
+      async open(path, method, mutation) {
+        await app.open("/");
+        await screen.getByRole("button", "Sign in with Delino").tap();
+        await expect(
+          screen.getByRole("link", "Acme Robotics Owner"),
+        ).toBeVisible();
+        await browser.evaluate(
+          ({ method, mutation }) => {
+            sessionStorage.setItem("ownsand-e2e-refresh-list", method);
+            sessionStorage.setItem("ownsand-e2e-tracked-mutation", mutation);
+            return true;
+          },
+          { method, mutation },
+        );
+        await app.open(`/orgs/${ACME}/${path}`);
+      },
+      async fail() {
+        await browser.evaluate(async (code) => {
+          sessionStorage.setItem("ownsand-e2e-refresh-error", String(code));
+          // Treat the list as stale when React Query handles the visibility event.
+          const now = Date.now;
+          Date.now = () => now() + 11_000;
+          try {
+            window.dispatchEvent(new Event("visibilitychange"));
+            // React Query checks staleness after resuming paused mutations.
+            await Promise.resolve();
+          } finally {
+            Date.now = now;
+          }
+          return true;
+        }, Code.PermissionDenied);
+      },
+      async recover() {
+        expect(
+          await browser.evaluate(() => {
+            sessionStorage.removeItem("ownsand-e2e-refresh-error");
+            return JSON.parse(
+              sessionStorage.getItem("ownsand-e2e-mutation-calls") ?? "[]",
+            );
+          }),
+        ).toEqual([]);
+        await screen.getByRole("button", "Try again").tap();
+      },
+    });
+  },
+});
+
+describe("terminal full refresh errors", () => {
+  const error = "You do not have permission to do this.";
+
+  for (const fixture of [
+    {
+      path: "api-keys",
+      list: "API keys",
+      method: "ListApiKeys",
+      mutation: "RevokeApiKey",
+      action: /^Revoke API key/,
+    },
+    {
+      path: "enrollment-tokens",
+      list: "Enrollment tokens",
+      method: "ListEnrollmentTokens",
+      mutation: "RevokeEnrollmentToken",
+      action: /^Revoke enrollment token/,
+    },
+    {
+      path: "members",
+      list: "Pending invitations",
+      method: "ListInvitations",
+      mutation: "RevokeInvitation",
+      action: /^Revoke Member invitation/,
+    },
+    {
+      path: "members",
+      list: "Members",
+      method: "ListMembers",
+      mutation: "RemoveMember",
+      action: "Remove Jun Park",
+    },
+  ]) {
+    refreshTest(
+      `dismisses the ${fixture.list} confirmation`,
+      async ({ app, refresh, screen }) => {
+        await refresh.open(fixture.path, fixture.method, fixture.mutation);
+        const list = screen.getByRole("list", fixture.list);
+        const dialog = screen.getByRole("alertdialog");
+        await list.getByRole("button", fixture.action).tap();
+        await expect(dialog).toBeVisible();
+
+        await refresh.fail();
+        await expect(dialog).toBeHidden();
+        await expect(screen.getByText(error)).toBeVisible();
+        await expect(list).toBeHidden();
+        await app.screenshot(`terminal-refresh-${fixture.method}`);
+
+        await refresh.recover();
+        await expect(list).toBeVisible();
+        await expect(dialog).toBeHidden();
+      },
+    );
+  }
+
+  refreshTest(
+    "clears the chosen owner and leaves deletion available",
+    async ({ app, refresh, screen }) => {
+      await refresh.open("settings", "ListMembers", "TransferOwnership");
+      const picker = screen.getByRole("combobox", "New owner");
+      const transfer = screen.getByRole("button", "Transfer", { exact: true });
+      const dialog = screen.getByRole(
+        "alertdialog",
+        "Make Jun Park the owner?",
+      );
+      await picker.tap();
+      await screen.getByRole("option", "Jun Park").tap();
+      await transfer.tap();
+      await expect(dialog).toBeVisible();
+
+      await refresh.fail();
+      await expect(dialog).toBeHidden();
+      await expect(screen.getByText(error)).toBeVisible();
+      await expect(picker).toBeHidden();
+      await expect(transfer).toBeHidden();
+      await expect(
+        screen.getByRole("button", "Delete organization"),
+      ).toBeVisible();
+      await app.screenshot("terminal-refresh-owner-picker");
+
+      await refresh.recover();
+      await expect(picker).toHaveText("Choose a member");
+      await expect(transfer).toBeDisabled();
+      await expect(dialog).toBeHidden();
+      await picker.tap();
+      await expect(screen.getByRole("option", "Jun Park")).toBeVisible();
+    },
+  );
+});
+
 describe("device inventory pagination", () => {
   paginationTest(
     "opens, places on and filters by a device beyond the first page",

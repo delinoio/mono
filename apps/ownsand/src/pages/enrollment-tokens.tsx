@@ -21,6 +21,7 @@ import {
   QueryBoundary,
   SecretDialog,
   ShortId,
+  isTerminalError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import {
@@ -68,7 +69,7 @@ export function EnrollmentTokensPage() {
   const [token, setToken] = useState<string>();
   const [revoking, setRevoking] = useState<EnrollmentToken>();
 
-  if (pages.terminalLoadMoreError && revoking !== undefined) {
+  if (isTerminalError(pages.error) && revoking !== undefined) {
     setRevoking(undefined);
   }
 
@@ -134,9 +135,10 @@ export function EnrollmentTokensPage() {
         description="The token stops working at once. It cannot be restored; create a new token instead."
         confirmLabel="Revoke token"
         onConfirm={async () => {
+          if (!revoking) return;
           await revoke.mutateAsync({
             organizationId,
-            enrollmentTokenId: revoking!.enrollmentTokenId,
+            enrollmentTokenId: revoking.enrollmentTokenId,
           });
           toast.success("The token is revoked.");
         }}

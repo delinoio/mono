@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Shared helpers for the console tests that live outside `console.test.tsx`.
 import { act, render } from "@testing-library/react";
-import { type Transport } from "@connectrpc/connect";
+import type { DescMethodUnary } from "@bufbuild/protobuf";
+import { Code, ConnectError, type Transport } from "@connectrpc/connect";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
+import { createQueryClient } from "./api.ts";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { createMockTransport, MOCK_USER } from "./mock/mock-api.ts";
@@ -98,4 +101,40 @@ export function holdingTransport(
     },
   };
   return { transport, calls, seen };
+}
+
+/** Refetches one list from the first page with the console's retry policy. */
+export function fullListRefresh(
+  method: DescMethodUnary,
+  mock: Transport = createMockTransport(),
+) {
+  let failure: Code | undefined;
+  const failedTokens: string[] = [];
+  const seen: Record<string, number> = {};
+  const transport: Transport = {
+    ...mock,
+    async unary(rpc, ...rest) {
+      seen[rpc.name] = (seen[rpc.name] ?? 0) + 1;
+      if (rpc.name === method.name && failure !== undefined) {
+        failedTokens.push((rest[3] as { pageToken: string }).pageToken);
+        throw new ConnectError("the refresh failed", failure);
+      }
+      return mock.unary(rpc, ...rest);
+    },
+  };
+  const queryClient = createQueryClient();
+  const defaults = queryClient.getDefaultOptions();
+  queryClient.setDefaultOptions({
+    ...defaults,
+    queries: { ...defaults.queries, retryDelay: 0 },
+  });
+  const queryKey = createConnectQueryKey({
+    schema: method,
+    cardinality: "infinite",
+  });
+  const refetch = async (code?: Code) => {
+    failure = code;
+    await act(() => queryClient.refetchQueries({ queryKey }));
+  };
+  return { transport, queryClient, refetch, failedTokens, seen };
 }
