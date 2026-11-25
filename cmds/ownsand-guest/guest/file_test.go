@@ -122,7 +122,11 @@ func TestReadFileErrors(t *testing.T) {
 	if _, _, errd := h.readAll(req); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
 		t.Fatalf("missing: %v", errd)
 	}
-	os.WriteFile(req.GetPath(), []byte("now"), 0o644)
+	// The error frame can arrive before the server forgets the failed entry.
+	h.waitReadCallsEnded(req.GetReadId())
+	if err := os.WriteFile(req.GetPath(), []byte("now"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if data, _, errd := h.readAll(req); errd != nil || string(data) != "now" {
 		t.Fatalf("retry: %q %v", data, errd)
 	}
