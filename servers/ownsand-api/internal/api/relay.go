@@ -312,8 +312,12 @@ func (p *DataPlane) open(ctx context.Context, procedure string, header http.Head
 	}
 	// The organization of the request is not known yet; begin compares it
 	// with the grant's after Connect decoded the request.
-	if _, _, err := p.S.authorize(ctx, p.S.DB.Pool, g.OrgID, authz.ActionUseSandboxes); err != nil {
+	_, membership, err := p.S.authorizeDataPath(ctx, p.S.DB.Pool, g.OrgID)
+	if err != nil {
 		return nil, err
+	}
+	if membership.ID != g.Membership.ID {
+		return nil, p.rejectGrant(pr, errGrantInvalid())
 	}
 	// Exec, AttachExec, ReadFile and WriteFile are rejected while the
 	// grant's organization is suspended; a stream that is already open is

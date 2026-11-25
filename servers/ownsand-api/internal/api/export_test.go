@@ -8,7 +8,6 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
-	"github.com/delinoio/mono/servers/ownsand-api/internal/authz"
 )
 
 // ReconcileStateReportForTest applies a full state report of the device
@@ -59,9 +58,8 @@ func (p *DataPlane) SessionCount() int {
 // AuthorizeRelay repeat after they register a pending session or grant, with
 // the data path action. A test uses it where the registered call cannot reach
 // that step, for example after the organization and its sandboxes are gone.
-func (s *Service) ReauthorizeForTest(ctx context.Context, orgID string) error {
-	_, _, err := s.reauthorize(ctx, s.DB.Pool, orgID, authz.ActionUseSandboxes)
-	return err
+func (s *Service) ReauthorizeForTest(ctx context.Context, orgID, membershipID string) error {
+	return s.reauthorizeDataPath(ctx, s.DB.Pool, orgID, membershipID)
 }
 
 // SetLatestIDForTest replaces the read of the newest control event ID that

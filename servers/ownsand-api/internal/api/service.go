@@ -465,6 +465,16 @@ func principal(ctx context.Context) (auth.Principal, error) {
 // organization get not_found; a matrix rejection gets permission_denied.
 // It returns the principal and, for users, the role.
 func (s *Service) authorize(ctx context.Context, q db.Querier, orgID string, action authz.Action) (auth.Principal, ownsandv1.Role, error) {
+	return s.authorizeOrganization(ctx, q, orgID, action, nil)
+}
+
+func (s *Service) authorizeDataPath(ctx context.Context, q db.Querier, orgID string) (auth.Principal, auth.MembershipSnapshot, error) {
+	var membership auth.MembershipSnapshot
+	p, _, err := s.authorizeOrganization(ctx, q, orgID, authz.ActionUseSandboxes, &membership)
+	return p, membership, err
+}
+
+func (s *Service) authorizeOrganization(ctx context.Context, q db.Querier, orgID string, action authz.Action, membership *auth.MembershipSnapshot) (auth.Principal, ownsandv1.Role, error) {
 	p, err := principal(ctx)
 	if err != nil {
 		return p, 0, err
@@ -477,7 +487,15 @@ func (s *Service) authorize(ctx context.Context, q db.Querier, orgID string, act
 	switch p.Kind {
 	case ownsandv1.PrincipalKind_PRINCIPAL_KIND_USER:
 		var role int16
-		err := q.QueryRow(ctx, "SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2", orgID, p.ID).Scan(&role)
+		if membership == nil {
+			err = q.QueryRow(ctx, "SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2", orgID, p.ID).Scan(&role)
+		} else {
+			// The membership and commit-ordered event ID must come from one
+			// statement snapshot. A replacement membership is visible only
+			// after the event that ended the predecessor has committed.
+			err = q.QueryRow(ctx, `SELECT membership_id::text, role, (SELECT COALESCE(max(delivery_id), 0) FROM control_events)
+				FROM memberships WHERE organization_id = $1 AND user_id = $2`, orgID, p.ID).Scan(&membership.ID, &role, &membership.DeliveryID)
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			return p, 0, errNotFound("organization")
 		}
@@ -501,29 +519,30 @@ func (s *Service) authorize(ctx context.Context, q db.Querier, orgID string, act
 	return p, 0, errPermission("this credential is not accepted here")
 }
 
-// reauthorize repeats authorize for a caller that a data path RPC already
-// registered as a pending session or grant. authorize reads the database only
-// for a user; an API key principal comes from the interceptor, which checked
-// the key before the handler registered the call. A revocation event that the
-// lease holder handled between that check and the registration found nothing
-// to end, so for an API key reauthorize reads the key and its organization
-// again and returns unauthenticated when the key is revoked or the
-// organization is gone. A user is checked as in authorize.
-func (s *Service) reauthorize(ctx context.Context, q db.Querier, orgID string, action authz.Action) (auth.Principal, ownsandv1.Role, error) {
-	p, role, err := s.authorize(ctx, q, orgID, action)
-	if err != nil || !p.IsAPIKey() {
-		return p, role, err
+// reauthorizeDataPath checks the original membership or API key again after
+// the session or grant is registered. A revocation processed before
+// registration could have missed that work.
+func (s *Service) reauthorizeDataPath(ctx context.Context, q db.Querier, orgID, membershipID string) error {
+	p, membership, err := s.authorizeDataPath(ctx, q, orgID)
+	if err != nil {
+		return err
+	}
+	if p.IsUser() && membership.ID != membershipID {
+		return errNotFound("organization")
+	}
+	if !p.IsAPIKey() {
+		return nil
 	}
 	var live bool
 	err = q.QueryRow(ctx, `SELECT true FROM api_keys k JOIN organizations o ON o.organization_id = k.organization_id
 		WHERE k.api_key_id = $1 AND k.organization_id = $2 AND k.revoke_time IS NULL`, p.ID, p.OrganizationID).Scan(&live)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return p, 0, errUnauthenticated("invalid API key")
+		return errUnauthenticated("invalid API key")
 	}
 	if err != nil {
-		return p, 0, s.internal(ctx, "reload api key", err)
+		return s.internal(ctx, "reload api key", err)
 	}
-	return p, role, nil
+	return nil
 }
 
 // requireUser returns the principal of an RPC without organization_id,

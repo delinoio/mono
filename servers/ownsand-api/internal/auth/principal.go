@@ -19,6 +19,13 @@ type Principal struct {
 	OrganizationID string
 }
 
+// MembershipSnapshot is the membership and last control event visible when
+// a user was authorized for data path work. It is empty for API keys.
+type MembershipSnapshot struct {
+	ID         string
+	DeliveryID int64
+}
+
 // Proto returns the protobuf form of the principal.
 func (p Principal) Proto() *ownsandv1.Principal {
 	return &ownsandv1.Principal{Kind: p.Kind, Id: p.ID}

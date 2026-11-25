@@ -67,6 +67,7 @@ type Request struct {
 	DeviceID        string
 	ChannelGen      uint64
 	Principal       auth.Principal
+	Membership      auth.MembershipSnapshot
 	Kind            ownsandv1.RelayOperationKind
 	OperationID     string
 	Digest          []byte
@@ -78,8 +79,8 @@ type Request struct {
 }
 
 func (r Request) sameOperation(g *Grant) bool {
-	return g.Principal == r.Principal && g.SandboxID == r.SandboxID && g.OrgID == r.OrgID && g.Kind == r.Kind &&
-		g.OperationID == r.OperationID && bytes.Equal(g.Digest, r.Digest)
+	return g.Principal == r.Principal && g.Membership.ID == r.Membership.ID && g.SandboxID == r.SandboxID &&
+		g.OrgID == r.OrgID && g.Kind == r.Kind && g.OperationID == r.OperationID && bytes.Equal(g.Digest, r.Digest)
 }
 
 // sameRequest reports whether r repeats the request that created g: the same
@@ -228,16 +229,19 @@ func (r *Registry) Reserve(req Request, newID func() string) (g *Grant, existing
 	defer r.mu.Unlock()
 	now := r.Now()
 	r.sweepLocked(now)
-	if old := r.byAuth[req.AuthorizationID]; old != nil && old.State == Installed && !admittable(old, now) {
-		// The grant of this authorization ID is no longer admittable: a retry
-		// gets a new grant.
-		delete(r.byAuth, req.AuthorizationID)
-	}
 	if old := r.byAuth[req.AuthorizationID]; old != nil {
-		if !req.sameRequest(old) {
+		if old.Membership.ID != req.Membership.ID {
 			return nil, false, ErrReuse
 		}
-		return old, true, nil
+		if old.State != Installed || admittable(old, now) {
+			if !req.sameRequest(old) {
+				return nil, false, ErrReuse
+			}
+			return old, true, nil
+		}
+		// The grant of this authorization ID is no longer admittable: a retry
+		// by the same membership gets a new grant.
+		delete(r.byAuth, req.AuthorizationID)
 	}
 	var predecessor *Grant
 	if req.ReplacesID != "" {

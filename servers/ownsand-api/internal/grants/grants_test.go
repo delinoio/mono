@@ -451,3 +451,41 @@ func TestRevocableUntil(t *testing.T) {
 		t.Fatalf("RemoveMatching before the end returned %v", cp)
 	}
 }
+
+func TestGrantRetryKeepsMembershipSnapshot(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	request := req("authorization", "user", "operation")
+	request.Membership = auth.MembershipSnapshot{ID: "membership", DeliveryID: 10}
+	original, _, err := r.Reserve(request, newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Ack(original.ID, accepted, "")
+
+	retry := request
+	retry.Membership.DeliveryID++
+	g, existing, err := r.Reserve(retry, newID)
+	if err != nil || !existing || g != original {
+		t.Fatalf("retry = %v, existing = %t, error = %v", g, existing, err)
+	}
+	if g.Membership != request.Membership {
+		t.Fatalf("stored membership = %+v, want %+v", g.Membership, request.Membership)
+	}
+
+	rejoined := retry
+	rejoined.Membership.ID = "replacement"
+	if _, _, err := r.Reserve(rejoined, newID); !errors.Is(err, ErrReuse) {
+		t.Fatalf("retry from replacement membership: %v", err)
+	}
+	// Streams can still be live after admission expires. Keep the conflict
+	// while the original grant is tracked, even when it cannot admit streams.
+	c.t = c.t.Add(Lifetime + AdmissionTolerance)
+	if _, _, err := r.Reserve(rejoined, newID); !errors.Is(err, ErrReuse) {
+		t.Fatalf("retry from replacement membership after admission expiry: %v", err)
+	}
+	g, existing, err = r.Reserve(retry, newID)
+	if err != nil || existing || g.ID == original.ID {
+		t.Fatalf("same-membership retry after admission expiry = %v, existing = %t, error = %v", g, existing, err)
+	}
+}
