@@ -15,6 +15,7 @@ import {
 } from "../components/ui.tsx";
 import { labels } from "../format.ts";
 import { secretFromInput, SECRET_PARAM } from "../invitation.ts";
+import { isNameLengthValid, ORGANIZATION_NAME_LIMIT } from "../name.ts";
 import { refreshOrganizations, useOrganizations } from "../organizations.ts";
 import { Link, orgPath, RouteId, routePath, useRouter } from "../router.tsx";
 
@@ -26,6 +27,7 @@ export function OrganizationsPage() {
   const create = useMutation(OrganizationService.method.createOrganization);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
+  const [nameError, setNameError] = useState<string>();
   const [link, setLink] = useState("");
   const [linkError, setLinkError] = useState<string>();
 
@@ -105,10 +107,20 @@ export function OrganizationsPage() {
         submitLabel="Create"
         onOpenChange={(open) => {
           setCreating(open);
-          if (!open) setName("");
+          if (!open) {
+            setName("");
+            setNameError(undefined);
+          }
         }}
         onSubmit={async (opening) => {
-          const res = await create.mutateAsync({ name: name.trim() });
+          const trimmed = name.trim();
+          if (!isNameLengthValid(trimmed, ORGANIZATION_NAME_LIMIT)) {
+            setNameError(
+              `Enter an organization name of 1 to ${ORGANIZATION_NAME_LIMIT} characters.`,
+            );
+            return;
+          }
+          const res = await create.mutateAsync({ name: trimmed });
           await refreshOrganizations(queryClient);
           if (!opening.isCurrent()) return;
           setCreating(false);
@@ -119,10 +131,13 @@ export function OrganizationsPage() {
         <TextField
           label="Organization name"
           value={name}
-          onValueChange={setName}
+          onValueChange={(value) => {
+            setName(value);
+            setNameError(undefined);
+          }}
+          error={nameError}
           required
           autoFocus
-          maxLength={100}
         />
       </FormDialog>
     </>

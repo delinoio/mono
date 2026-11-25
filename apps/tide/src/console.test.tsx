@@ -39,6 +39,7 @@ import {
 } from "@delino/tide-protos/v1/agent_integration_pb";
 import { AuditAction, AuditService } from "@delino/tide-protos/v1/audit_pb";
 import {
+  AgentVendor,
   OwnSandLinkState,
   RequestState,
   Role,
@@ -2671,6 +2672,158 @@ describe("personal API keys", () => {
     expect(screen.queryByText(value)).toBeNull();
     expect(await screen.findByText(/codex-agent/)).toBeTruthy();
   });
+});
+
+describe("display name limits", () => {
+  const creates = [
+    {
+      path: `/orgs/${MOCK_IDS.acme}/api-keys`,
+      button: "Create API key",
+      submit: "Create key",
+      label: "Name",
+      method: "CreateApiKey",
+      limit: 64,
+    },
+    {
+      path: `/orgs/${MOCK_IDS.globex}/integrations`,
+      button: "Create agent integration",
+      submit: "Create integration",
+      label: "Name",
+      method: "CreateAgentIntegration",
+      limit: 64,
+    },
+    {
+      path: "/",
+      button: "Create organization",
+      submit: "Create",
+      label: "Organization name",
+      method: "CreateOrganization",
+      limit: 100,
+    },
+  ];
+
+  for (const fixture of creates) {
+    test.each(["a", "🧪"])(
+      `${fixture.method} applies the trimmed name limit to %s`,
+      async (character) => {
+        const { transport, calls } = gatedTransport(fixture.method);
+        renderConsole(fixture.path, { transport });
+        await click(
+          await screen.findByRole("button", { name: fixture.button }),
+        );
+        const dialog = await screen.findByRole("dialog");
+        const form = within(dialog);
+        const input = form.getByRole<HTMLInputElement>("textbox", {
+          name: fixture.label,
+        });
+        const submit = form.getByRole("button", { name: fixture.submit });
+        if (fixture.method === "CreateAgentIntegration") {
+          await type(
+            dialog.querySelector<HTMLInputElement>('input[type="password"]')!,
+            "synthetic-agent-key",
+          );
+        }
+
+        const tooLong = ` ${character.repeat(fixture.limit + 1)} `;
+        await type(input, tooLong);
+        await click(submit);
+        expect(input.value).toBe(tooLong);
+        expect(input.getAttribute("aria-invalid")).toBe("true");
+        expect(
+          form.getByText(new RegExp(`1 to ${fixture.limit} characters`)),
+        ).toBeTruthy();
+        expect(calls).toHaveLength(0);
+
+        const name = character.repeat(fixture.limit);
+        await type(input, ` ${name} `);
+        await click(submit);
+        expect(calls.map(({ input }) => input)).toEqual([
+          expect.objectContaining({ name }),
+        ]);
+        await act(async () => calls[0].settle());
+        await waitFor(() => expect(dialog.isConnected).toBe(false));
+      },
+    );
+  }
+
+  test.each(["a", "🧪"])(
+    "integration edits apply the trimmed name limit to %s",
+    async (character) => {
+      const { transport, calls } = gatedTransport("UpdateAgentIntegration");
+      const organizationId = MOCK_IDS.globex;
+      await createClient(
+        AgentIntegrationService,
+        transport,
+      ).createAgentIntegration({
+        organizationId,
+        vendor: AgentVendor.CURSOR,
+        name: "before",
+        settings: { case: "cursor", value: { poolName: "before-pool" } },
+        credentials: {
+          case: "cursorCredentials",
+          value: { serviceAccountApiKey: "synthetic-cursor-key" },
+        },
+      });
+      renderConsole(`/orgs/${organizationId}/integrations`, { transport });
+      await click(await screen.findByRole("button", { name: "Edit" }));
+      const dialog = within(
+        await screen.findByRole("dialog", { name: "Edit before" }),
+      );
+      const input = dialog.getByRole<HTMLInputElement>("textbox", {
+        name: "Name",
+      });
+      const submit = dialog.getByRole("button", { name: "Save changes" });
+
+      const tooLong = ` ${character.repeat(65)} `;
+      await type(input, tooLong);
+      await click(submit);
+      expect(input.value).toBe(tooLong);
+      expect(input.getAttribute("aria-invalid")).toBe("true");
+      expect(
+        dialog.getByText("Enter a name of 1 to 64 characters."),
+      ).toBeTruthy();
+      expect(calls).toHaveLength(0);
+
+      const name = character.repeat(64);
+      await type(input, ` ${name} `);
+      await click(submit);
+      expect(calls.map(({ input }) => input)).toEqual([
+        expect.objectContaining({
+          name,
+          updateMask: expect.objectContaining({ paths: ["name"] }),
+        }),
+      ]);
+      await act(async () => calls[0].settle());
+
+      const renamed = await screen.findByText(`${name} · Cursor`);
+      await click(
+        within(renamed.closest("li")!).getByRole("button", { name: "Edit" }),
+      );
+      const prefilled = within(
+        await screen.findByRole("dialog", { name: `Edit ${name}` }),
+      );
+      expect(
+        prefilled.getByRole<HTMLInputElement>("textbox", { name: "Name" })
+          .value,
+      ).toBe(name);
+      await type(
+        prefilled.getByRole("textbox", {
+          name: "Cursor self-hosted pool name",
+        }),
+        "after-pool",
+      );
+      await click(prefilled.getByRole("button", { name: "Save changes" }));
+      expect(calls[1]?.input).toEqual(
+        expect.objectContaining({
+          updateMask: expect.objectContaining({ paths: ["settings"] }),
+        }),
+      );
+      await act(async () => calls[1].settle());
+      expect(
+        await screen.findByText("Cursor self-hosted pool name: after-pool"),
+      ).toBeTruthy();
+    },
+  );
 });
 
 describe("form dialog openings", () => {

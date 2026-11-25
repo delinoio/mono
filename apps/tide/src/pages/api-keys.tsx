@@ -20,6 +20,7 @@ import {
   SecretDialog,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
+import { API_KEY_NAME_LIMIT, isNameLengthValid } from "../name.ts";
 
 /** Expiry choices of a new key, in days; 0 means no expiry. */
 export const EXPIRY_DAYS = [30, 90, 365, 0] as const;
@@ -120,9 +121,9 @@ export function ApiKeysPage() {
         submitLabel="Create key"
         onSubmit={async (opening) => {
           const trimmed = name.trim();
-          if (trimmed === "" || trimmed.length > 64) {
+          if (!isNameLengthValid(trimmed, API_KEY_NAME_LIMIT)) {
             setNameError(
-              "Enter a name of 1 to 64 characters, for example the agent that uses the key.",
+              `Enter a name of 1 to ${API_KEY_NAME_LIMIT} characters, for example the agent that uses the key.`,
             );
             return;
           }
@@ -151,7 +152,6 @@ export function ApiKeysPage() {
           }}
           error={nameError}
           autoFocus
-          maxLength={64}
           autoComplete="off"
         />
         <Select
