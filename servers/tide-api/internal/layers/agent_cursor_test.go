@@ -8,17 +8,24 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/cursor"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/cursor/cursorfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/app"
+	"github.com/delinoio/mono/servers/tide-api/internal/db"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
+	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
 const cursorKey = "crsr_service_account_key_0123456789"
@@ -45,9 +52,9 @@ func newCursorWorldTiming(t *testing.T, guest tidev1.GuestOs, timing agent.Timin
 	return w
 }
 
-func startCursorWorld(t *testing.T, guest tidev1.GuestOs, timing agent.Timing, fake *cursorfake.Fake) *cursorWorld {
+func startCursorWorld(t *testing.T, guest tidev1.GuestOs, timing agent.Timing, fake *cursorfake.Fake, opts ...testenv.Option) *cursorWorld {
 	t.Helper()
-	w := newAgentWorld(t, layers.Options{Cursor: cursor.Options{BaseURL: fake.Server.URL, RelistInterval: time.Hour}, AgentTiming: timing})
+	w := newAgentWorld(t, layers.Options{Cursor: cursor.Options{BaseURL: fake.Server.URL, RelistInterval: time.Hour}, AgentTiming: timing}, opts...)
 	cw := &cursorWorld{agentWorld: w, cursor: fake}
 	cw.integrationID = w.createIntegration(t, &tidev1.CreateAgentIntegrationRequest{
 		Vendor: tidev1.AgentVendor_AGENT_VENDOR_CURSOR, Name: "cursor",
@@ -559,6 +566,200 @@ func TestCursorOrganizationDeletion(t *testing.T) {
 	}
 	eventually(t, "the watch stops", func() bool { return w.cursor.Streams() == 0 })
 	stays(t, "the deleted organization's watch stays stopped", func() bool { return w.cursor.Streams() == 0 })
+}
+
+func TestCursorOrganizationDeletionKeepsTerminalHeldClaims(t *testing.T) {
+	timing := fastAgentTiming()
+	timing.PollInterval = time.Hour // Keep the poller from releasing the claims during the test.
+	w := newCursorWorldTiming(t, tidev1.GuestOs_GUEST_OS_LINUX, timing)
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
+	})
+	ctx := t.Context()
+	type request struct {
+		vendorID string
+		id       string
+		attempts int
+	}
+	claims := []request{{vendorID: "bc-ended-first"}, {vendorID: "bc-ended-second"}}
+	for i := range claims {
+		w.cursor.AddRequest(claims[i].vendorID, true)
+		claims[i].id = w.requestBySource(t, claims[i].vendorID).GetRequestId()
+	}
+
+	w.cursor.FailClaimCalls(true)
+	if _, err := w.env.User(w.org.Owner).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+		OrganizationId: w.org.ID, RunnerProfileId: w.profileID,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	for i := range claims {
+		w.waitRequest(t, claims[i].id, tidev1.RequestState_REQUEST_STATE_CANCELED)
+		claims[i].attempts = w.cursor.FailAttempts(claims[i].vendorID)
+	}
+
+	if err := w.deleteOrganization(ctx); connect.CodeOf(err) != connect.CodeInternal {
+		t.Fatalf("DeleteOrganization while Cursor returns 503 = %v, want internal", err)
+	}
+	for _, c := range claims {
+		w.assertOrganizationRetainedClaim(t, c.id, c.vendorID)
+		if got := w.cursor.FailAttempts(c.vendorID); got != c.attempts+1 {
+			t.Fatalf("Cursor fail attempts for %s = %d, want %d", c.vendorID, got, c.attempts+1)
+		}
+	}
+	t.Log("Cursor returned 503 for both ended claims. Tide kept both claims, the organization and the credential.")
+
+	w.cursor.FailClaimCalls(false)
+	if err := w.deleteOrganization(ctx); err != nil {
+		t.Fatalf("DeleteOrganization after Cursor recovered: %v", err)
+	}
+	for _, c := range claims {
+		if _, held := w.cursor.Claim(c.vendorID); held || w.cursor.FailAttempts(c.vendorID) != c.attempts+2 {
+			t.Fatalf("Cursor did not clear the retained claim for %s on the successful deletion retry", c.vendorID)
+		}
+	}
+	if err := w.getOrganization(ctx); connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("GetOrganization after successful deletion = %v, want not found", err)
+	}
+	t.Log("The next deletion call cleared both vendor claims and removed the organization.")
+}
+
+func TestCursorOrganizationDeletionReleasesBusyRunnerClaim(t *testing.T) {
+	timing := fastAgentTiming()
+	timing.PollInterval = time.Hour // Prevent a background release after the work hook ends the request.
+	w := newCursorWorldTiming(t, tidev1.GuestOs_GUEST_OS_LINUX, timing)
+	const id = "bc-busy"
+	w.cursor.AddRequest(id, true)
+	req := w.requestBySource(t, id)
+	workerID, held := w.cursor.Claim(id)
+	if !held {
+		t.Fatal("Cursor has no claim for the request")
+	}
+	eventually(t, "runner waits for work", func() bool {
+		runnerID := w.request(t, req.GetRequestId()).GetRunnerId()
+		return runnerID != "" && w.runner(t, runnerID).GetState() == tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+	})
+	w.cursor.Connect(workerID)
+	w.l.Agents.Poll(t.Context())
+	running := w.waitRequest(t, req.GetRequestId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+	w.waitRunner(t, running.GetRunnerId(), tidev1.RunnerState_RUNNER_STATE_BUSY)
+
+	if err := w.deleteOrganization(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, held := w.cursor.Claim(id); held {
+		t.Fatal("Cursor still holds the busy runner's claim after deletion")
+	}
+	if released := w.cursor.Released(id); released != 1 {
+		t.Fatalf("Cursor release count = %d, want 1", released)
+	}
+	if err := w.getOrganization(t.Context()); connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("GetOrganization after successful deletion = %v, want not found", err)
+	}
+	t.Log("Deletion ended the busy runner and cleared its vendor claim once before removing the organization.")
+}
+
+// cursorRequestReadFault cancels one GetRequest query for the selected
+// request. It leaves the joined claim query and the RPC context usable.
+type cursorRequestReadFault struct {
+	requestID atomic.Pointer[string]
+}
+
+func (f *cursorRequestReadFault) TraceQueryStart(ctx context.Context, _ *pgx.Conn, q pgx.TraceQueryStartData) context.Context {
+	const getRequest = "SELECT " + work.RequestColumns + " FROM requests WHERE organization_id = $1 AND request_id = $2"
+	if q.SQL == getRequest {
+		if id := f.requestID.Load(); id != nil && q.Args[1] == *id && f.requestID.CompareAndSwap(id, nil) {
+			queryCtx, cancel := context.WithCancel(ctx)
+			cancel()
+			return queryCtx
+		}
+	}
+	return ctx
+}
+
+func (*cursorRequestReadFault) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// TestCursorOrganizationDeletionRequestReadFailure faults the follow-up
+// request read after the agent hook has found a held claim.
+func TestCursorOrganizationDeletionRequestReadFailure(t *testing.T) {
+	ctx := t.Context()
+	fake := cursorfake.New(t, cursorKey, "tide-pool")
+	fault := &cursorRequestReadFault{}
+	timing := fastAgentTiming()
+	timing.PollInterval = time.Hour
+	w := startCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, timing, fake, func(o *app.Options) {
+		cfg := o.DB.Pool.Config()
+		cfg.ConnConfig.Tracer = fault
+		pool, err := pgxpool.NewWithConfig(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		o.DB = &db.DB{Pool: pool}
+	})
+	eventually(t, "the Cursor stream", func() bool { return fake.Streams() == 1 })
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
+	})
+	const id = "bc-request-read-failed"
+	fake.AddRequest(id, true)
+	requestID := w.requestBySource(t, id).GetRequestId()
+	w.waitRequest(t, requestID, tidev1.RequestState_REQUEST_STATE_QUEUED)
+	fault.requestID.Store(&requestID)
+	err := w.deleteOrganization(ctx)
+	if fault.requestID.Load() != nil {
+		t.Fatal("the follow-up request read did not receive the fault")
+	}
+	if connect.CodeOf(err) != connect.CodeCanceled {
+		t.Fatalf("DeleteOrganization with a canceled request read = %v, want canceled", err)
+	}
+	if !strings.Contains(w.env.Logs.String(), "load request "+requestID+" for held vendor claim") {
+		t.Fatal("the agent hook did not report the failed follow-up request read")
+	}
+	w.assertOrganizationRetainedClaim(t, requestID, id)
+	if attempts := fake.FailAttempts(id); attempts != 0 {
+		t.Fatalf("Cursor fail attempts after a failed request read = %d, want 0", attempts)
+	}
+	t.Log("The request read was canceled. The RPC returned canceled and retained the organization, credential and claim without a vendor call.")
+
+	if err := w.deleteOrganization(ctx); err != nil {
+		t.Fatalf("DeleteOrganization after the request read recovered: %v", err)
+	}
+	if _, held := fake.Claim(id); held || fake.FailAttempts(id) != 1 {
+		t.Fatal("Cursor did not clear the queued claim on the successful deletion retry")
+	}
+	if err := w.getOrganization(ctx); connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("GetOrganization after successful deletion = %v, want not found", err)
+	}
+	t.Log("The next deletion call cleared the vendor claim and removed the organization.")
+}
+
+func (w *cursorWorld) deleteOrganization(ctx context.Context) error {
+	_, err := w.env.User(w.org.Owner).Organization.DeleteOrganization(ctx, connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID}))
+	return err
+}
+
+func (w *cursorWorld) getOrganization(ctx context.Context) error {
+	_, err := w.env.User(w.org.Owner).Organization.GetOrganization(ctx, connect.NewRequest(&tidev1.GetOrganizationRequest{OrganizationId: w.org.ID}))
+	return err
+}
+
+func (w *cursorWorld) assertOrganizationRetainedClaim(t *testing.T, requestID, vendorRequestID string) {
+	t.Helper()
+	ctx := t.Context()
+	if err := w.getOrganization(ctx); err != nil {
+		t.Fatalf("GetOrganization after failed deletion: %v", err)
+	}
+	key, err := w.l.Integrations.Credential(ctx, w.org.ID, w.integrationID, tidev1.AgentCredential_AGENT_CREDENTIAL_SERVICE_ACCOUNT_API_KEY)
+	if err != nil || key != cursorKey {
+		t.Fatalf("Cursor credential did not survive the failed deletion: %v", err)
+	}
+	if claim, err := w.l.Agents.Claim(ctx, requestID); err != nil || claim.State != agent.ClaimHeld {
+		t.Fatalf("claim after failed deletion = %+v, %v, want held", claim, err)
+	}
+	if _, held := w.cursor.Claim(vendorRequestID); !held {
+		t.Fatal("Cursor no longer holds the claim after failed deletion")
+	}
 }
 
 func TestCursorOrganizationDeletionDatabaseFailure(t *testing.T) {

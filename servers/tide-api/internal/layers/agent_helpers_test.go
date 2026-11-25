@@ -117,14 +117,14 @@ type agentWorld struct {
 	guest *guestRecorder
 }
 
-func newAgentWorld(t *testing.T, opts layers.Options) *agentWorld {
+func newAgentWorld(t *testing.T, opts layers.Options, testOpts ...testenv.Option) *agentWorld {
 	t.Helper()
 	w := &world{fake: ownsandfake.New(), l: &layers.Layers{}}
 	opts.OwnSand = w.fake
 	if opts.AgentTiming == (agent.Timing{}) {
 		opts.AgentTiming = fastAgentTiming()
 	}
-	w.env = testenv.New(t, testenv.WithLayerOptions(opts, w.l))
+	w.env = testenv.New(t, append([]testenv.Option{testenv.WithLayerOptions(opts, w.l)}, testOpts...)...)
 	w.org = w.env.NewOrg("alice")
 	ww := &workWorld{world: w, osOrg: api.NewID()}
 	w.fake.AddOrg(ww.osOrg, ownsandKey('a'))

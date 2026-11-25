@@ -296,7 +296,7 @@ func (h *Hub) runPoller(ctx context.Context) error {
 func (h *Hub) Poll(ctx context.Context) { h.poll(ctx) }
 
 func (h *Hub) poll(ctx context.Context) {
-	ended, err := h.heldClaims(ctx, "NOT (r.state = ANY($1))", work.OpenRequestStates())
+	ended, err := h.heldClaims(ctx, bestEffortClaimLookup, "NOT (r.state = ANY($1))", work.OpenRequestStates())
 	if err != nil {
 		if ctx.Err() == nil {
 			h.log.WarnContext(ctx, "agent_claims_poll_failed", slog.Any("error", err))
@@ -309,7 +309,7 @@ func (h *Hub) poll(ctx context.Context) {
 				slog.Any("error", err))
 		}
 	}
-	starting, err := h.heldClaims(ctx, `r.state = $1 AND EXISTS (SELECT 1 FROM runners n WHERE n.request_id = r.request_id AND n.state = $2)`,
+	starting, err := h.heldClaims(ctx, bestEffortClaimLookup, `r.state = $1 AND EXISTS (SELECT 1 FROM runners n WHERE n.request_id = r.request_id AND n.state = $2)`,
 		int16(tidev1.RequestState_REQUEST_STATE_STARTING), int16(tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK))
 	if err != nil {
 		return

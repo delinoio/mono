@@ -99,9 +99,17 @@ type heldClaim struct {
 	req   *work.Request
 }
 
+type heldClaimLookupMode uint8
+
+const (
+	bestEffortClaimLookup heldClaimLookupMode = iota
+	strictClaimLookup
+)
+
 // heldClaims returns the held claims of registered vendors whose request
 // matches where (c is agent_claims, r is requests), with their requests.
-func (h *Hub) heldClaims(ctx context.Context, where string, args ...any) ([]heldClaim, error) {
+// Strict lookup fails if any selected request cannot be loaded.
+func (h *Hub) heldClaims(ctx context.Context, mode heldClaimLookupMode, where string, args ...any) ([]heldClaim, error) {
 	vendors := make([]int16, 0, len(h.vendors))
 	for v := range h.vendors {
 		vendors = append(vendors, int16(v))
@@ -129,6 +137,9 @@ func (h *Hub) heldClaims(ctx context.Context, where string, args ...any) ([]held
 	for _, c := range claims {
 		req, err := h.engine.GetRequest(ctx, h.svc.DB.Pool, c.OrganizationID, c.RequestID)
 		if err != nil {
+			if mode == strictClaimLookup {
+				return nil, fmt.Errorf("load request %s for held vendor claim: %w", c.RequestID, err)
+			}
 			continue
 		}
 		out = append(out, heldClaim{claim: c, req: req})

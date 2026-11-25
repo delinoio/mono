@@ -384,14 +384,12 @@ func (h *Hub) releaseClaimLocked(ctx context.Context, c *Claim, req *work.Reques
 	return done, err
 }
 
-// prepareOrgDeletion stops the watchers of the organization and releases
-// the claims of its queued requests while the credentials still exist. The
-// work layer's hook (registered earlier) already deleted the runners, which
-// released the claims of their requests. A release that the vendor does not
-// confirm fails the step, which stops the deletion and keeps the
-// credentials and the claim for a retry: after the deletion, no poller can
-// release it. This hook clears its own stop on error because the core calls
-// Abort only for hooks whose Prepare succeeded.
+// prepareOrgDeletion stops the organization's watchers and releases its
+// held claims while the credentials still exist. This includes claims of
+// requests the work layer already ended, because its release is best effort.
+// A lookup error or an unconfirmed release keeps the organization and its
+// credentials for a retry. The hook resumes its own watchers on error
+// because the core calls Abort only for hooks whose Prepare succeeded.
 func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion) (err error) {
 	h.mu.Lock()
 	h.stopped[d.OrganizationID]++
@@ -411,7 +409,7 @@ func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion
 		}
 	}()
 	stopWatchers(stop)
-	claims, err := h.heldClaims(ctx, "c.organization_id = $1 AND r.state = ANY($2)", d.OrganizationID, work.OpenRequestStates())
+	claims, err := h.heldClaims(ctx, strictClaimLookup, "c.organization_id = $1", d.OrganizationID)
 	if err != nil {
 		return err
 	}
