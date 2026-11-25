@@ -352,7 +352,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 
 	if memoryRestore {
 		err := r.restoreMemory(ctx, v, spec)
-		if err == nil {
+		if err == nil && ctx.Err() == nil {
 			v.restore = ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE
 			clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			if err := guestclient.New(v.Dial).SetClock(clockCtx, time.Now()); err != nil {
@@ -362,16 +362,11 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			r.logger.Info("VM restored from memory state", "sandbox_id", v.id)
 			return v, nil
 		}
-		// Virtualization.framework could not restore the saved state: boot
-		// the snapshot disk cold.
-		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
-		// Never boot the snapshot disk cold while the failed attempt's VM may
-		// still run on the same disk.
-		if stopErr := r.stopVM(v); stopErr != nil {
-			cleanup()
-			return nil, fmt.Errorf("vzrt: stop the VM of the failed memory-state restore: %w", stopErr)
+		if err := finishFailedRestore(ctx, func() error { return r.stopVM(v) }, cleanup); err != nil {
+			return nil, err
 		}
-		if err := copyFile(context.Background(), src, disk); err != nil {
+		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
+		if err := copyFile(ctx, src, disk); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
 		}
@@ -680,6 +675,9 @@ func (r *Runtime) coldBoot(ctx context.Context, v *vm, spec vmruntime.Spec) erro
 	if err := r.newMachine(v, cfg); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := v.machine.Start(); err != nil {
 		return fmt.Errorf("vzrt: start VM: %w", err)
 	}
@@ -701,15 +699,7 @@ func (r *Runtime) waitGuest(ctx context.Context, v *vm) error {
 		_, err := client.WaitReady(rctx, 100*time.Millisecond)
 		done <- err
 	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("vzrt: guest helper not ready: %w", err)
-		}
-		return nil
-	case <-v.Exited():
-		return errors.New("vzrt: the VM stopped during boot")
-	}
+	return waitGuestResult(done, v.Exited())
 }
 
 func (r *Runtime) lookup(id string) (*vm, error) {
