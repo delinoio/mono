@@ -3,9 +3,11 @@
 package hcsrt
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -125,6 +127,10 @@ func hcsLoad() error {
 // hcsRun runs one asynchronous HCS call: call starts it on a new operation
 // and hcsRun waits for its result document.
 func hcsRun(name string, call func(op uintptr) uintptr) (string, error) {
+	return hcsRunWithin(name, time.Time{}, call)
+}
+
+func hcsRunWithin(name string, deadline time.Time, call func(op uintptr) uintptr) (string, error) {
 	op, _, e := procHcsCreateOperation.Call(0, 0)
 	if op == 0 {
 		return "", fmt.Errorf("hcsrt: HcsCreateOperation: %w", e)
@@ -134,7 +140,14 @@ func hcsRun(name string, call func(op uintptr) uintptr) (string, error) {
 		return "", &hcsError{op: name, hr: uint32(hr)}
 	}
 	var result *uint16
-	hr, _, _ := procHcsWaitForOperationResult.Call(op, uintptr(hcsOperationTimeout/time.Millisecond), uintptr(unsafe.Pointer(&result)))
+	timeout := hcsOperationTimeout
+	if !deadline.IsZero() {
+		timeout = min(timeout, time.Until(deadline))
+		if timeout <= 0 {
+			return "", context.DeadlineExceeded
+		}
+	}
+	hr, _, _ := procHcsWaitForOperationResult.Call(op, uintptr(timeout/time.Millisecond), uintptr(unsafe.Pointer(&result)))
 	doc := takeString(result)
 	if failed(hr) {
 		return "", &hcsError{op: name, hr: uint32(hr), result: doc}
@@ -146,15 +159,18 @@ func hcsRun(name string, call func(op uintptr) uintptr) (string, error) {
 type system struct {
 	id     string
 	handle uintptr
-	// exited is closed when the HCS reports that the system exited or
-	// that the HCS service disconnected.
-	exited   chan struct{}
-	exitOnce sync.Once
-	cbKey    uintptr
-	// terminateFn replaces the HCS terminate call when it is not nil. It is
-	// a seam for tests that fake a compute system without a Hyper-V host;
-	// remove it when the HCS calls sit behind an interface.
-	terminateFn func() error
+	// Only confirmed exit closes exited. A disconnect calls for a status
+	// check, and closed signals completion of handle and callback cleanup.
+	exited         chan struct{}
+	disconnected   chan struct{}
+	closed         chan struct{}
+	exitOnce       sync.Once
+	disconnectOnce sync.Once
+	closeOnce      sync.Once
+	cbKey          uintptr
+	// These functions replace HCS calls in tests without a Hyper-V host.
+	terminateFn  func() error
+	verifyExitFn func(string, time.Time) (bool, error)
 }
 
 // Exit callbacks. windows.NewCallback never releases a callback, so one
@@ -182,17 +198,85 @@ func systemCallback(event *hcsEvent, key uintptr) uintptr {
 		return 0
 	}
 	callbackMu.Lock()
+	defer callbackMu.Unlock()
 	s := callbackSys[key]
-	callbackMu.Unlock()
 	if s != nil {
-		s.markExited()
+		switch event.Type {
+		case hcsEventSystemExited:
+			s.markExited()
+		case hcsEventServiceDisconnect:
+			s.disconnectOnce.Do(func() { close(s.disconnected) })
+		}
 	}
 	return 0
 }
 
 func (s *system) markExited() { s.exitOnce.Do(func() { close(s.exited) }) }
 
-// watch registers the exit callback of s.
+func (s *system) exitConfirmed() bool {
+	select {
+	case <-s.exited:
+		return true
+	default:
+		return false
+	}
+}
+
+var errSystemHandleClosed = errors.New("hcsrt: the compute system handle closed before exit was confirmed")
+
+// waitExit waits for a confirmed exit. A disconnect starts one independent
+// status query per wait. An inconclusive result leaves the exit event armed.
+func (s *system) waitExit(ctx context.Context) error {
+	type exitResult struct {
+		confirmed bool
+		err       error
+	}
+	disconnected := s.disconnected
+	var result <-chan exitResult
+	var statusErr error
+	for !s.exitConfirmed() {
+		select {
+		case <-s.exited:
+			return nil
+		case <-s.closed:
+			// Closing the handle can deliver a final exit callback.
+			if s.exitConfirmed() {
+				return nil
+			}
+			return errSystemHandleClosed
+		case <-ctx.Done():
+			if s.exitConfirmed() {
+				return nil
+			}
+			return errors.Join(ctx.Err(), statusErr)
+		case <-disconnected:
+			disconnected = nil
+			id, verify := s.id, s.verifyExitFn
+			deadline := time.Now().Add(stopTimeout)
+			if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
+				deadline = end
+			}
+			// The HCS call can finish after this waiter. It holds no
+			// reference to the VM or its original handle.
+			done := make(chan exitResult, 1)
+			result = done
+			go func() {
+				confirmed, err := verify(id, deadline)
+				done <- exitResult{confirmed, err}
+			}()
+		case status := <-result:
+			result = nil
+			if status.confirmed {
+				s.markExited()
+				return nil
+			}
+			statusErr = status.err
+		}
+	}
+	return nil
+}
+
+// watch registers the system callback.
 func (s *system) watch() error {
 	callbackOnce.Do(func() { callbackPtr = windows.NewCallback(systemCallback) })
 	callbackMu.Lock()
@@ -212,7 +296,10 @@ func (s *system) watch() error {
 }
 
 func newSystem(id string, handle uintptr) *system {
-	return &system{id: id, handle: handle, exited: make(chan struct{})}
+	return &system{
+		id: id, handle: handle, exited: make(chan struct{}), disconnected: make(chan struct{}),
+		closed: make(chan struct{}), verifyExitFn: verifySystemExit,
+	}
 }
 
 // createSystem creates (but does not start) a compute system from doc.
@@ -302,6 +389,7 @@ func (s *system) terminate() error {
 		_, err = s.call("HcsTerminateComputeSystem", procHcsTerminateComputeSystem, "")
 	}
 	if err != nil && isNotFoundOrStopped(err) {
+		s.markExited()
 		return nil
 	}
 	return err
@@ -314,6 +402,7 @@ type systemProperties struct {
 	Owner     string `json:"Owner"`
 	RuntimeID string `json:"RuntimeId"`
 	State     string `json:"State"`
+	Stopped   bool   `json:"Stopped"`
 }
 
 func (s *system) properties() (systemProperties, error) {
@@ -331,18 +420,50 @@ func (s *system) properties() (systemProperties, error) {
 // close closes the handle of s. With ShouldTerminateOnLastHandleClosed the
 // HCS terminates the system when this is its last handle.
 func (s *system) close() {
-	if s.handle != 0 {
-		procHcsCloseComputeSystem.Call(s.handle)
-		s.handle = 0
+	s.closeOnce.Do(func() {
+		if s.handle != 0 {
+			procHcsCloseComputeSystem.Call(s.handle)
+		}
+		callbackMu.Lock()
+		delete(callbackSys, s.cbKey)
+		callbackMu.Unlock()
+		close(s.closed)
+	})
+}
+
+// verifySystemExit queries HCS by ID without using the disconnected handle.
+func verifySystemExit(id string, deadline time.Time) (bool, error) {
+	list, err := querySystems(map[string][]string{"Ids": {id}}, deadline)
+	if isNotFoundOrStopped(err) {
+		return true, nil
 	}
-	callbackMu.Lock()
-	delete(callbackSys, s.cbKey)
-	callbackMu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	return confirmedSystemExit(id, list)
+}
+
+func confirmedSystemExit(id string, list []systemProperties) (bool, error) {
+	switch {
+	case list == nil:
+		return false, errors.New("hcsrt: status query returned no compute system list")
+	case len(list) == 0:
+		return true, nil
+	case len(list) == 1 && strings.EqualFold(list[0].ID, id):
+		const stoppedState = "Stopped"
+		return list[0].State == stoppedState || (list[0].State == "" && list[0].Stopped), nil
+	default:
+		return false, errors.New("hcsrt: status query returned unexpected compute system IDs")
+	}
 }
 
 // enumerateSystems lists the compute systems of owner.
 func enumerateSystems(owner string) ([]systemProperties, error) {
-	q, err := json.Marshal(map[string][]string{"Owners": {owner}})
+	return querySystems(map[string][]string{"Owners": {owner}}, time.Time{})
+}
+
+func querySystems(query map[string][]string, deadline time.Time) ([]systemProperties, error) {
+	q, err := json.Marshal(query)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +471,7 @@ func enumerateSystems(owner string) ([]systemProperties, error) {
 	if err != nil {
 		return nil, err
 	}
-	doc, err := hcsRun("HcsEnumerateComputeSystems", func(op uintptr) uintptr {
+	doc, err := hcsRunWithin("HcsEnumerateComputeSystems", deadline, func(op uintptr) uintptr {
 		hr, _, _ := procHcsEnumerateComputeSystems.Call(uintptr(unsafe.Pointer(qp)), op)
 		return hr
 	})

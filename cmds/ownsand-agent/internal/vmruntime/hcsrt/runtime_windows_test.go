@@ -103,9 +103,39 @@ func TestDeleteRemovesVMDirWhenSystemAbsent(t *testing.T) {
 // in place of the HCS terminate call and can mark the system as exited, like
 // the exit callback of the HCS does.
 func fakeSystem(terminate func(s *system) error) *system {
-	s := &system{id: "fake", exited: make(chan struct{})}
+	s := newSystem("fake", 0)
 	s.terminateFn = func() error { return terminate(s) }
 	return s
+}
+
+func registerFakeCallback(t *testing.T, s *system) {
+	t.Helper()
+	callbackMu.Lock()
+	callbackNext++
+	s.cbKey = callbackNext
+	callbackSys[s.cbKey] = s
+	callbackMu.Unlock()
+	t.Cleanup(s.close)
+}
+
+func notifySystem(s *system, event uint32) { systemCallback(&hcsEvent{Type: event}, s.cbKey) }
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s signal stayed open", name)
+	}
+}
+
+func requireOpenSignal(t *testing.T, signal <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-signal:
+		t.Fatalf("%s signal closed unexpectedly", name)
+	default:
+	}
 }
 
 // shortStopTimeout shortens the wait for an exit event for the test.
@@ -132,20 +162,34 @@ func neverExits(*system) error { return nil }
 func TestStopSystemNeedsConfirmedExit(t *testing.T) {
 	shortStopTimeout(t)
 	termErr := errors.New("terminate failed")
+	statusErr := errors.New("status unavailable")
+	disconnectDuringTerminate := func(s *system) error {
+		notifySystem(s, hcsEventServiceDisconnect)
+		return termErr
+	}
 	for _, tc := range []struct {
 		name      string
 		terminate func(s *system) error
+		verify    func() (bool, error)
 		wantErr   error
 		wantTerm  bool
 	}{
-		{"terminate and exit event", exitsOnTerminate, nil, false},
-		{"terminate error but exit event", func(s *system) error { s.markExited(); return termErr }, nil, false},
-		{"terminate without exit event", neverExits, errStopUnconfirmed, false},
-		{"terminate error without exit event", func(*system) error { return termErr }, errStopUnconfirmed, true},
+		{"terminate and exit event", exitsOnTerminate, nil, nil, false},
+		{"terminate error but exit event", func(s *system) error { notifySystem(s, hcsEventSystemExited); return termErr }, nil, nil, false},
+		{"terminate without exit event", neverExits, nil, errStopUnconfirmed, false},
+		{"terminate error without exit event", func(*system) error { return termErr }, nil, errStopUnconfirmed, true},
+		{"terminate reports already stopped", func(*system) error { return &hcsError{hr: hrSystemAlreadyStopped} }, nil, nil, false},
+		{"disconnect with unknown status", disconnectDuringTerminate, func() (bool, error) { return false, statusErr }, errStopUnconfirmed, true},
+		{"disconnect with running VM", disconnectDuringTerminate, func() (bool, error) { return false, nil }, errStopUnconfirmed, true},
+		{"disconnect with confirmed exit", disconnectDuringTerminate, func() (bool, error) { return true, nil }, nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &Runtime{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 			sys := fakeSystem(tc.terminate)
+			registerFakeCallback(t, sys)
+			if tc.verify != nil {
+				sys.verifyExitFn = func(string, time.Time) (bool, error) { return tc.verify() }
+			}
 			err := r.stopSystem("sb", sys)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("stopSystem = %v, want %v", err, tc.wantErr)
@@ -153,6 +197,7 @@ func TestStopSystemNeedsConfirmedExit(t *testing.T) {
 			if tc.wantTerm && !errors.Is(err, termErr) {
 				t.Errorf("stopSystem = %v, want it to wrap the terminate error", err)
 			}
+			waitForSignal(t, sys.closed, "handle closed")
 			select {
 			case <-sys.exited:
 				if tc.wantErr != nil {
@@ -198,10 +243,30 @@ func TestDeleteKeepsVMDirWhenOrphanExitUnconfirmed(t *testing.T) {
 }
 
 func TestDeleteKeepsTrackedVMWhenExitUnconfirmed(t *testing.T) {
+	for _, disconnect := range []bool{false, true} {
+		name := "no exit event"
+		if disconnect {
+			name = "disconnect and VM still running"
+		}
+		t.Run(name, func(t *testing.T) { testDeleteKeepsTrackedVM(t, disconnect) })
+	}
+}
+
+func testDeleteKeepsTrackedVM(t *testing.T, disconnect bool) {
+	t.Helper()
 	shortStopTimeout(t)
 	r, dir := newDeleteTestRuntime(t, "sb")
-	v := &vm{id: "sb", dir: dir, exited: make(chan struct{}), stopping: make(chan struct{}),
-		sys: fakeSystem(neverExits)}
+	sys := fakeSystem(func(s *system) error {
+		if disconnect {
+			notifySystem(s, hcsEventServiceDisconnect)
+		}
+		return nil
+	})
+	registerFakeCallback(t, sys)
+	sys.verifyExitFn = func(string, time.Time) (bool, error) { return false, nil }
+	v := &vm{id: "sb", dir: dir, exited: make(chan struct{}), stopping: make(chan struct{})}
+	v.attachSystem(sys)
+	watchDone := v.watchDone
 	r.vms["sb"] = v
 	if err := r.Delete(t.Context(), "sb"); !errors.Is(err, errStopUnconfirmed) {
 		t.Fatalf("Delete = %v, want errStopUnconfirmed", err)
@@ -209,6 +274,8 @@ func TestDeleteKeepsTrackedVMWhenExitUnconfirmed(t *testing.T) {
 	if r.vms["sb"] != v {
 		t.Error("Delete dropped the registration of a VM whose exit is not confirmed")
 	}
+	waitForSignal(t, watchDone, "exit watcher")
+	waitForSignal(t, sys.closed, "handle closed")
 	select {
 	case <-v.exited:
 		t.Error("the VM counts as exited without a confirmed exit")
@@ -233,6 +300,95 @@ func TestDeleteKeepsTrackedVMWhenExitUnconfirmed(t *testing.T) {
 	}
 	if _, serr := os.Stat(dir); !os.IsNotExist(serr) {
 		t.Errorf("the VM directory still exists after the confirmed stop: %v", serr)
+	}
+	if err := r.Delete(t.Context(), "sb"); err != nil {
+		t.Fatalf("repeated Delete = %v", err)
+	}
+}
+
+func TestVMWatcherForwardsConfirmedExit(t *testing.T) {
+	for _, tc := range []string{"active handle", "closing handle", "disconnect and running status"} {
+		t.Run(tc, func(t *testing.T) {
+			sys := fakeSystem(neverExits)
+			registerFakeCallback(t, sys)
+			v := &vm{exited: make(chan struct{})}
+			switch tc {
+			case "active handle":
+				v.attachSystem(sys)
+			case "closing handle":
+				notifySystem(sys, hcsEventSystemExited)
+				sys.close()
+				v.attachSystem(sys)
+			case "disconnect and running status":
+				queried := make(chan struct{})
+				sys.verifyExitFn = func(string, time.Time) (bool, error) {
+					close(queried)
+					return false, nil
+				}
+				v.attachSystem(sys)
+				notifySystem(sys, hcsEventServiceDisconnect)
+				notifySystem(sys, hcsEventServiceDisconnect)
+				waitForSignal(t, queried, "status query")
+				requireOpenSignal(t, v.Exited(), "VM exit")
+				requireOpenSignal(t, v.watchDone, "exit watcher")
+			}
+			notifySystem(sys, hcsEventSystemExited)
+			waitForSignal(t, v.Exited(), "VM exit")
+			waitForSignal(t, v.watchDone, "exit watcher")
+			sys.close()
+			sys.close()
+		})
+	}
+}
+
+func TestFailedCreateReleasesWatcherAndKeepsUnconfirmedVM(t *testing.T) {
+	shortStopTimeout(t)
+	const id = "failed-create"
+	r, dir := newDeleteTestRuntime(t, id)
+	r.opts.Kernel = filepath.Join(r.opts.VMsDir, "kernel")
+	if err := os.WriteFile(r.opts.Kernel, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	failOpenSystem(t, &hcsError{op: "HcsOpenComputeSystem", hr: hrSystemNotFound})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	sys := fakeSystem(neverExits)
+	registerFakeCallback(t, sys)
+	spec := vmruntime.Spec{
+		SandboxID: id,
+		GuestOS:   ownsandv1.GuestOs_GUEST_OS_LINUX,
+		Dir:       dir,
+		Resources: &ownsandv1.Resources{DiskGib: 1},
+	}
+	ops := vmCreateOps{
+		copyFile: func(_ context.Context, _, dst string) error {
+			return os.WriteFile(dst, []byte("disk"), 0o600)
+		},
+		makeFixedVHD: func(_ string, size int64, _ bool) (int64, error) { return size, nil },
+		createSystem: func(string, any) (*system, error) {
+			cancel()
+			return sys, nil
+		},
+	}
+	if v, err := r.createVM(ctx, spec, ops); v != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("createVM = %v, %v, want nil, context.Canceled", v, err)
+	}
+	v := r.vms[id]
+	if v == nil {
+		t.Fatal("failed-create cleanup dropped the VM registration")
+	}
+	waitForSignal(t, v.watchDone, "exit watcher")
+	waitForSignal(t, sys.closed, "handle closed")
+	requireOpenSignal(t, v.Exited(), "VM exit")
+	if _, err := os.Stat(filepath.Join(dir, diskFile)); err != nil {
+		t.Fatalf("failed-create cleanup removed the VM disk: %v", err)
+	}
+	if err := r.Delete(t.Context(), id); err != nil {
+		t.Fatalf("retry Delete = %v", err)
+	}
+	waitForSignal(t, v.Exited(), "VM exit")
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) || r.vms[id] != nil {
+		t.Fatalf("the VM registration or directory remains after retry: %v", err)
 	}
 }
 

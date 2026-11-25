@@ -150,9 +150,11 @@ type vm struct {
 	// console copy and the tunnel.
 	stopping    chan struct{}
 	stopOnce    sync.Once
+	stopMu      sync.Mutex
 	consoleDone chan struct{}
 	mu          sync.Mutex
 	sys         *system
+	watchDone   <-chan struct{}
 	net         *netstack.Network
 	netDone     chan struct{}
 	paused      bool
@@ -163,6 +165,19 @@ type vm struct {
 }
 
 func (v *vm) markExited() { v.exitOnce.Do(func() { close(v.exited) }) }
+
+func (v *vm) attachSystem(sys *system) {
+	done := make(chan struct{})
+	v.mu.Lock()
+	v.sys, v.watchDone = sys, done
+	v.mu.Unlock()
+	go func() {
+		defer close(done)
+		if sys.waitExit(context.Background()) == nil {
+			v.markExited()
+		}
+	}()
+}
 
 func (v *vm) SandboxID() string                         { return v.id }
 func (v *vm) RestorePath() ownsandv1.SandboxRestorePath { return v.restore }
@@ -398,13 +413,7 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 		cleanup()
 		return nil, err
 	}
-	v.mu.Lock()
-	v.sys = sys
-	v.mu.Unlock()
-	go func() {
-		<-sys.exited
-		v.markExited()
-	}()
+	v.attachSystem(sys)
 	if err := ctx.Err(); err != nil {
 		cleanup()
 		return nil, err
@@ -742,39 +751,32 @@ func (r *Runtime) captureDisk(ctx context.Context, v *vm, dir string) (vmruntime
 // unknown and a caller keeps the state and the files and retries the stop.
 var errStopUnconfirmed = errors.New("hcsrt: the exit of the compute system is not confirmed")
 
-// stopSystemTimeout is how long stopSystem waits for the exit event after it
+// stopSystemTimeout is how long stopSystem waits for confirmation after it
 // asked the HCS to terminate the system. It is a variable only so that tests
 // can shorten the wait; it equals stopTimeout otherwise.
 var stopSystemTimeout = stopTimeout
 
-// stopSystem terminates sys, waits until it exited and closes its handle. It
-// returns nil only when the exit event arrived, whether or not the terminate
-// call itself failed; the exit event is the confirmation. Without it, closing
-// the last handle is no proof that the system ended, because another handle
-// owner may keep it alive, so stopSystem returns an error that wraps
-// errStopUnconfirmed (and the terminate error, if any) and leaves sys unmarked
-// as exited. The handle is closed either way; a retry reopens the system by
-// its ID.
+// stopSystem requests termination and closes the handle after waiting for
+// exit confirmation. Another owner can hold a handle and keep the VM alive
+// after closure. An unconfirmed stop returns errStopUnconfirmed so a retry
+// can reopen the system by ID.
 func (r *Runtime) stopSystem(sandboxID string, sys *system) error {
 	termErr := sys.terminate()
 	if termErr != nil {
 		r.logger.Warn("terminate VM failed", "sandbox_id", sandboxID, "error", termErr)
 	}
-	exited := false
-	select {
-	case <-sys.exited:
-		exited = true
-	case <-time.After(stopSystemTimeout):
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), stopSystemTimeout)
+	defer cancel()
+	waitErr := sys.waitExit(ctx)
 	sys.close()
-	if exited {
+	if sys.exitConfirmed() {
 		return nil
 	}
-	r.logger.Error("VM did not stop", "sandbox_id", sandboxID)
+	r.logger.Error("VM exit is unconfirmed", "sandbox_id", sandboxID, "error", waitErr)
 	if termErr != nil {
-		return fmt.Errorf("%w: sandbox %s: terminate: %w", errStopUnconfirmed, sandboxID, termErr)
+		return fmt.Errorf("%w: sandbox %s: terminate: %w; wait for exit: %w", errStopUnconfirmed, sandboxID, termErr, waitErr)
 	}
-	return fmt.Errorf("%w: sandbox %s", errStopUnconfirmed, sandboxID)
+	return fmt.Errorf("%w: sandbox %s: %w", errStopUnconfirmed, sandboxID, waitErr)
 }
 
 // stopVM stops the VM of v, if it runs, and its network stack. It returns an
@@ -782,9 +784,13 @@ func (r *Runtime) stopSystem(sandboxID string, sys *system) error {
 // exit of the compute system is not confirmed. v then stays not exited and a
 // later call stops the system again by its ID.
 func (r *Runtime) stopVM(v *vm) error {
+	// A concurrent stop must see the first stop's result before it decides
+	// whether to reopen the system.
+	v.stopMu.Lock()
+	defer v.stopMu.Unlock()
 	v.stopOnce.Do(func() { close(v.stopping) })
 	v.mu.Lock()
-	sys := v.sys
+	sys, watchDone := v.sys, v.watchDone
 	v.sys = nil
 	unconfirmed := v.stopUnconfirmed
 	stack, netDone := v.net, v.netDone
@@ -795,6 +801,13 @@ func (r *Runtime) stopVM(v *vm) error {
 	switch {
 	case sys != nil:
 		stopErr = r.stopSystem(v.id, sys)
+		if watchDone != nil {
+			<-watchDone
+			// The watcher may confirm exit while the handle is closing.
+			if sys.exitConfirmed() {
+				stopErr = nil
+			}
+		}
 	case unconfirmed:
 		// An earlier stop closed the handle without a confirmed exit.
 		stopErr = r.stopOrphan(v.id)
