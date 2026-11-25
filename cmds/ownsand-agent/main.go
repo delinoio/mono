@@ -281,6 +281,9 @@ func runAgentWithInstaller(ctx context.Context, cfg config.Config, installer upd
 	}
 	cp, err := cpclient.New(apiURL, nil)
 	if err != nil {
+		if cfg.APIURLOverride != "" {
+			logger = logger.With("setting", config.EnvAPIURL)
+		}
 		logger.Error("control plane client failed", "error", err)
 		return exitError, false
 	}
