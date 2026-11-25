@@ -838,7 +838,7 @@ func TestBlockedDestinationsTakeNoSlot(t *testing.T) {
 
 // A failed host dial releases its slot, and after Close no slot is in use.
 func TestFlowSlotReleasedOnEveryPath(t *testing.T) {
-	srv, _ := silentTCPServer(t)
+	srv, accepted := silentTCPServer(t)
 	sink := udpEchoSink(t)
 	rd := &routeDial{tcpAddr: srv.Addr().String(), udpAddr: sink.LocalAddr().String()}
 	rd.failTCP.Store(1)
@@ -847,16 +847,44 @@ func TestFlowSlotReleasedOnEveryPath(t *testing.T) {
 	defer cancel()
 	warmUp(t, g)
 
-	// The first host dial fails and the guest gets a reset.
+	// The first host dial fails and releases its slot before sending the reset.
 	if c, err := g.dial(ctx, "203.0.113.10:80"); err == nil {
 		c.Close()
 		t.Fatal("the guest connected although the host dial failed")
 	}
-	waitFor(t, "the slot of the failed dial", func() bool { return n.limiter.inUse(TransportTCP) == 0 })
+	if got := rd.tcp.Load(); got != 1 {
+		t.Fatalf("host TCP dials after the reset = %d, want 1", got)
+	}
+	if got := n.limiter.inUse(TransportTCP); got != 0 {
+		t.Fatalf("TCP slots after a failed dial = %d, want 0", got)
+	}
 	// With the limit at 1, a leaked slot would reject this connection.
-	if _, err := g.dial(ctx, "203.0.113.10:80"); err != nil {
+	tcpConn, err := g.dial(ctx, "203.0.113.10:80")
+	if err != nil {
 		t.Fatalf("connection after a failed dial: %v", err)
 	}
+	defer tcpConn.Close()
+
+	// The guest handshake can finish before the TCP relay registers with the
+	// network. Wait for a byte to cross the relay before testing Close.
+	var hostConn net.Conn
+	select {
+	case hostConn = <-accepted:
+		defer hostConn.Close()
+	case <-ctx.Done():
+		t.Fatalf("host did not accept the TCP connection: %v", ctx.Err())
+	}
+	deadline, _ := ctx.Deadline()
+	_ = tcpConn.SetWriteDeadline(deadline)
+	_ = hostConn.SetReadDeadline(deadline)
+	if _, err := tcpConn.Write([]byte("x")); err != nil {
+		t.Fatalf("write to TCP relay: %v", err)
+	}
+	var buf [1]byte
+	if _, err := io.ReadFull(hostConn, buf[:]); err != nil || buf[0] != 'x' {
+		t.Fatalf("read from TCP relay = %q, %v, want x", buf[:], err)
+	}
+
 	if !echoed(t, g.dialUDP(t, "203.0.113.10:9000"), 2*time.Second) {
 		t.Fatal("UDP flow was not relayed")
 	}

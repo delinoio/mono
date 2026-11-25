@@ -509,6 +509,16 @@ func (st *p2pStream) recv(ctx context.Context) (*ownsandv1.DataFrame, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	f, err := st.recvNext(ctx)
+	// A frame or transport error can win the select when the context ends.
+	// Check again before handing the selected result to the caller.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return f, err
+}
+
+func (st *p2pStream) recvNext(ctx context.Context) (*ownsandv1.DataFrame, error) {
 	select {
 	case f := <-st.ch:
 		return f, nil

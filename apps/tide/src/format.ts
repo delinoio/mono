@@ -113,6 +113,17 @@ export const TERMINAL_RUNNER_STATES: ReadonlySet<RunnerState> = new Set([
   RunnerState.FAILED,
 ]);
 
+/** Compares timestamps at nanosecond precision, treating a missing time as the epoch. */
+export function compareTimestamps(
+  a: Timestamp | undefined,
+  b: Timestamp | undefined,
+): number {
+  return (
+    Number((a?.seconds ?? 0n) - (b?.seconds ?? 0n)) ||
+    (a?.nanos ?? 0) - (b?.nanos ?? 0)
+  );
+}
+
 export function timestampMs(ts: Timestamp | undefined): number | undefined {
   if (ts === undefined) return undefined;
   return Number(ts.seconds) * 1000 + Math.floor(ts.nanos / 1e6);
@@ -170,9 +181,12 @@ export function queueWaitMs(
   return Math.max(0, until - queued);
 }
 
-export function errorMessage(error: unknown): string {
+export function errorMessage(
+  error: unknown,
+  fallback = "Something went wrong. Try again.",
+): string {
   if (!(error instanceof ConnectError)) {
-    return "Something went wrong. Try again.";
+    return fallback;
   }
   switch (error.code) {
     case Code.Unauthenticated:
@@ -191,7 +205,7 @@ export function errorMessage(error: unknown): string {
     case Code.FailedPrecondition:
       return error.rawMessage || "The request is not valid.";
     default:
-      return "Something went wrong. Try again.";
+      return fallback;
   }
 }
 

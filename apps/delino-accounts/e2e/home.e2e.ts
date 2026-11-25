@@ -61,9 +61,7 @@ describe("home", () => {
 });
 
 describe("billing", () => {
-  // The e2e app command sets no Logto registration, so the billing routes
-  // load through the single-page-application fallback and show the notice.
-  test("asks for sign-in configuration on a direct billing route", async ({
+  test("offers sign-in to a signed-out user on a direct billing route", async ({
     app,
     screen,
   }) => {
@@ -73,7 +71,7 @@ describe("billing", () => {
       screen.getByRole("heading", "Sign in to manage billing", { level: 1 }),
     ).toBeVisible();
     await expect(
-      screen.getByText("Sign-in is not configured for this build."),
+      screen.getByRole("button", "Sign in with Delino"),
     ).toBeVisible();
   });
 });

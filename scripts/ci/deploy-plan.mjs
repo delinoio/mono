@@ -786,14 +786,13 @@ export function plan(status, packages) {
       )
       .map((pkg) => [pkg.manifest.name, pkg]),
   );
-  const allReleases = (status.releases ?? []).map(
-    ({ name, type, newVersion }) => {
-      if (!packagesByName.has(name)) {
-        throw new DeployPlanError(`release ${name} is not a workspace package`);
-      }
-      return { name, type, version: newVersion };
-    },
-  );
+  const statusReleases = status.releases ?? [];
+  const allReleases = statusReleases.map(({ name, type, newVersion }) => {
+    if (!packagesByName.has(name)) {
+      throw new DeployPlanError(`release ${name} is not a workspace package`);
+    }
+    return { name, type, version: newVersion };
+  });
   // A `none` release keeps its current version, whose tag may already exist.
   const releases = allReleases
     .filter((r) => r.type !== ReleaseType.None)
@@ -837,11 +836,24 @@ export function plan(status, packages) {
       byName.get(name),
     );
   });
+  const changesets = status.changesets ?? [];
+  // Changesets CLI 3.0.3 records the source IDs of every non-skipped release,
+  // including `none` releases, after applying its config and package rules.
+  // It also consumes empty changesets, which contribute to no release.
+  const contributingChangesetIds = new Set(
+    statusReleases.flatMap(({ changesets: ids }) => ids.map(checkChangesetId)),
+  );
   return {
     // The deploy jobs check that these changeset files are still pending on
     // `main` before they upload, so a rerun of an old run cannot deploy a
     // superseded revision.
-    changesets: (status.changesets ?? []).map(({ id }) => checkChangesetId(id)),
+    changesets: changesets.map(({ id }) => checkChangesetId(id)),
+    consumedChangesets: changesets
+      .filter(
+        ({ id, releases }) =>
+          releases.length === 0 || contributingChangesetIds.has(id),
+      )
+      .map(({ id }) => id),
     releases: releases.sort((a, b) => a.name.localeCompare(b.name)),
     servers: deployables.filter((d) => d.kind === DeployKind.Server),
     staticSites: deployables.filter((d) => d.kind === DeployKind.StaticSite),
@@ -873,6 +885,7 @@ export function main({
     JSON.stringify({
       event: "deploy_plan",
       changesets: result.changesets,
+      consumedChangesets: result.consumedChangesets,
       releases: result.releases,
       servers: result.servers.map((d) => d.name),
       staticSites: result.staticSites.map((d) => d.name),
@@ -887,9 +900,10 @@ export function main({
         `servers=${JSON.stringify(result.servers)}`,
         `static_sites=${JSON.stringify(result.staticSites)}`,
         `binaries=${JSON.stringify(result.binaries)}`,
-        // Any pending changeset, including one with only `none` releases,
-        // needs the release job to consume it.
+        // Run the release job for any pending changeset, including one with
+        // only `none` releases.
         `changesets=${JSON.stringify(result.changesets)}`,
+        `consumed_changesets=${JSON.stringify(result.consumedChangesets)}`,
         `has_changesets=${result.changesets.length > 0}`,
         `has_servers=${result.servers.length > 0}`,
         `has_static_sites=${result.staticSites.length > 0}`,

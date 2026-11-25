@@ -5,6 +5,7 @@
 This contract owns both components of [`delidev`](project-delidev.md):
 
 - `apps/delidev/package.json`: workspace package `delidev` with the frontend scripts and the `tauri` CLI script.
+- `apps/delidev/tauri.mjs` and `apps/delidev/cef-deb-notices.mjs`: the Tauri CLI entry point and Debian notice staging hook.
 - `apps/delidev/rsbuild.config.ts`, `apps/delidev/index.html`, `apps/delidev/src/` and `apps/delidev/public/`: the `delidev-frontend` web frontend.
 - `apps/delidev/turbo.json`: package-local Turbo task configuration.
 - `apps/delidev/src-tauri/`: the `delidev-shell` Rust crate:
@@ -88,6 +89,7 @@ Run from the repository root:
 - `pnpm --filter delidev dev`: frontend development server at `http://127.0.0.1:13200` without the native shell. The server fails when the port is in use.
 - `pnpm --filter delidev tauri dev`: desktop app on CEF. The Tauri CLI starts `pnpm dev` and loads `http://127.0.0.1:13200`. On macOS the CLI runs the app from an `.app` bundle.
 - `pnpm --filter delidev tauri build`: desktop bundles. The CLI ships `libcef`, its resources and the `en-US` locale with the app.
+- `pnpm --filter delidev tauri build --bundles deb`: Linux Debian bundle. It installs the original CEF `LICENSE.txt` and `CREDITS.html` under `/usr/share/doc/delidev/cef/`. If the selected CEF distribution has no unpacked `LICENSE.txt`, the bundling hook uses `tar` to read it from the distribution's cached archive. Debian bundling fails if either notice is unavailable.
 - `pnpm exec turbo run typecheck build --filter=delidev`: frontend type check and production build into `apps/delidev/dist/`.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test`: Rust checks of the root workspace on the host desktop target.
 - `pnpm --filter delidev tauri android init` and `pnpm --filter delidev tauri ios init`: generate the Android and iOS host projects under `src-tauri/gen/`. Then use `tauri android dev`, `tauri android build`, `tauri ios dev` and `tauri ios build`.

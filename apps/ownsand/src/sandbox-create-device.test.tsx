@@ -7,9 +7,11 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { Code, ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import type { Transport } from "@connectrpc/connect";
 import { DeviceState } from "@delino/ownsand-protos/v1/common_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import type { CreateSandboxRequest } from "@delino/ownsand-protos/v1/sandbox_pb";
 import {
   deviceOptionLabel,
   errorMessage,
@@ -71,10 +73,11 @@ describe("create sandbox device select", () => {
     await act(async () => {
       fireEvent.click(within(dialog).getByRole("combobox", { name: "Device" }));
     });
-    const option = (await screen.findAllByRole("option")).find(
-      (o) => o.textContent === name,
-    )!;
-    expect(option).toBeTruthy();
+    const option = await screen.findByRole(
+      "option",
+      { name },
+      { timeout: 10_000 },
+    );
     await act(async () => {
       fireEvent.click(option);
     });
@@ -109,6 +112,36 @@ describe("create sandbox device select", () => {
       );
     });
     expect(trigger.textContent).toContain("studio-mac (Offline)");
+  });
+
+  test("sends the ID of a device from the second page for explicit placement", async () => {
+    const organizationId = MOCK_IDS.acme;
+    const mock = createMockTransport({ extraDevices: 199 });
+    const client = createClient(DeviceService, mock);
+    const first = await client.listDevices({ organizationId, pageSize: 200 });
+    const { devices } = await client.listDevices({
+      organizationId,
+      pageSize: 200,
+      pageToken: first.nextPageToken,
+    });
+    const requests: CreateSandboxRequest[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          requests.push(rest[3] as CreateSandboxRequest);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+
+    const dialog = await openForm(transport);
+    await chooseDevice(dialog, "Device 201 (Online)");
+    await create(dialog);
+
+    expect(requests.map((request) => request.placement?.deviceId)).toEqual([
+      devices[0]!.deviceId,
+    ]);
   });
 
   test("names the offline device when the create is Unavailable and keeps the dialog and key", async () => {

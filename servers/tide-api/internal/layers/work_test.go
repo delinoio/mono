@@ -3,22 +3,32 @@
 package layers_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"math"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/servers/tide-api/internal/db"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
+	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/lease"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/profile"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
+	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
 // TestMembershipEndWithSessionsAndKeys: removing a member revokes the keys,
@@ -100,6 +110,128 @@ func TestWarmRunnersAndReclaim(t *testing.T) {
 	// Warm runners wait while a request is uncovered: no warm runner comes
 	// back while the pool is full.
 	stays(t, "no warm runner while full", func() bool { return w.fake.Active(w.osOrg) <= 2 })
+}
+
+func TestWarmReservationDuringProfileDeletion(t *testing.T) {
+	t.Run("stale dispatch cannot reserve", func(t *testing.T) {
+		w := newWorkWorld(t, devsession.Timing{})
+		ctx := context.Background()
+		liveID := w.createProfile(t, devProfileProto("live", 0, 0))
+		deletedID := w.createProfile(t, devProfileProto("to-delete", 0, 0))
+		// The dispatch order is by profile ID. Block its first sandbox call
+		// so the pass retains the deleted profile in its snapshot.
+		if liveID > deletedID {
+			liveID, deletedID = deletedID, liveID
+		}
+		creating, release := make(chan struct{}, 1), make(chan struct{}, 1)
+		defer close(release)
+		w.fake.SetCreateHook(func(ctx context.Context) error {
+			select {
+			case creating <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		enableWarmProfiles(t, w, liveID, deletedID)
+		select {
+		case <-creating:
+		case <-time.After(5 * time.Second):
+			t.Fatal("dispatch did not reach the first profile")
+		}
+		if _, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: deletedID,
+		})); err != nil {
+			t.Fatal(err)
+		}
+		w.fake.SetCreateHook(nil)
+		// Let the captured call proceed and observe the surviving profile.
+		release <- struct{}{}
+		eventually(t, "surviving profile warms", func() bool {
+			return profileRunnerCount(t, w, liveID, tidev1.RunnerState_RUNNER_STATE_WARM) == 1
+		})
+		stays(t, "stale profile creates no runner or sandbox", func() bool {
+			var n int
+			if err := w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM runners WHERE runner_profile_id = $1", deletedID).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n == 0 && w.fake.Calls("CreateSandbox") == 1
+		})
+	})
+
+	t.Run("deletion catches late reservation", func(t *testing.T) {
+		w := newWorkWorld(t, devsession.Timing{})
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		prepared, continueDelete := make(chan struct{}), make(chan struct{})
+		w.l.Profiles.OnDeletion(profile.DeletionHook{
+			Name: "test gate after work cleanup",
+			Prepare: func(ctx context.Context, _, _ string) error {
+				close(prepared)
+				select {
+				case <-continueDelete:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		})
+		profileID := w.createProfile(t, devProfileProto("to-delete", 0, 0))
+		done := make(chan error, 1)
+		go func() {
+			_, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+				OrganizationId: w.org.ID, RunnerProfileId: profileID,
+			}))
+			done <- err
+		}()
+		select {
+		case <-prepared:
+		case <-ctx.Done():
+			t.Fatal("deletion did not complete the initial cleanup")
+		}
+		// OwnSand commits the sandbox but Tide has no sandbox ID until it
+		// can recover the result by replaying the stored idempotency key.
+		w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+			o.CreateResponseError = connect.NewError(connect.CodeDeadlineExceeded, context.DeadlineExceeded)
+		})
+		enableWarmProfiles(t, w, profileID)
+		eventually(t, "late reservation holds a sandbox", func() bool {
+			return w.fake.Active(w.osOrg) == 1
+		})
+		var runnerID string
+		if err := w.env.DB.Pool.QueryRow(ctx, `SELECT runner_id::text FROM runners
+			WHERE runner_profile_id = $1 AND request_id IS NULL AND ownsand_sandbox_id IS NULL`, profileID).Scan(&runnerID); err != nil {
+			t.Fatal(err)
+		}
+		close(continueDelete)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if r := w.runner(t, runnerID); r.GetState() != tidev1.RunnerState_RUNNER_STATE_DELETING ||
+			r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP {
+			t.Fatalf("late reservation after profile deletion: %v", r)
+		}
+		w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateResponseError = nil })
+		eventually(t, "late runner and its sandbox are deleted", func() bool {
+			return w.runner(t, runnerID).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED && w.fake.Active(w.osOrg) == 0
+		})
+		if n := len(w.fake.Sandboxes(w.osOrg)); n != 1 {
+			t.Fatalf("got %d sandboxes, want one by idempotency key", n)
+		}
+	})
+}
+
+func enableWarmProfiles(t *testing.T, w *workWorld, ids ...string) {
+	t.Helper()
+	// Make all profiles eligible in the same dispatch snapshot.
+	if _, err := w.env.DB.Pool.Exec(context.Background(), "UPDATE runner_profiles SET warm_count = 1 WHERE runner_profile_id::text = ANY($1)", ids); err != nil {
+		t.Fatal(err)
+	}
+	w.l.Engine.Kick(w.org.ID)
 }
 
 func TestWarmCreateRejectionDoesNotSpin(t *testing.T) {
@@ -258,6 +390,44 @@ func profileRunnerCount(t *testing.T, w *workWorld, profileID string, state tide
 	return n
 }
 
+func TestGetCapacityAllocatedVCPU(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	work := w.env.User(w.org.Member).Work
+	for _, tc := range []struct {
+		name       string
+		allocation *ownsandv1.DeviceAllocation
+		want       int64
+	}{
+		{"above int32", &ownsandv1.DeviceAllocation{VcpuCount: math.MaxInt32, VcpuTotalCount: proto.Int64(4294967294)}, 4294967294},
+		{"legacy count", &ownsandv1.DeviceAllocation{VcpuCount: 12}, 12},
+		{"explicit zero", &ownsandv1.DeviceAllocation{VcpuCount: 12, VcpuTotalCount: proto.Int64(0)}, 0},
+		{"missing allocation", nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const effectiveLimit int64 = 8589934588
+			w.fake.SetDevices(w.osOrg, &ownsandv1.Device{
+				DeviceId:                "device-0",
+				EffectiveVcpuLimitCount: effectiveLimit,
+				Allocation:              tc.allocation,
+			})
+			resp, err := work.GetCapacity(t.Context(), connect.NewRequest(&tidev1.GetCapacityRequest{OrganizationId: w.org.ID}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			devices := resp.Msg.GetDevices()
+			if len(devices) != 1 || devices[0].GetOwnsandDeviceId() != "device-0" {
+				t.Fatalf("devices = %v, want device-0", devices)
+			}
+			if got := devices[0].GetAllocation().GetVcpuCount(); got != tc.want {
+				t.Errorf("allocated vCPUs = %d, want %d", got, tc.want)
+			}
+			if got := devices[0].GetEffectiveVcpuLimit(); got != effectiveLimit {
+				t.Errorf("effective vCPU limit = %d, want %d", got, effectiveLimit)
+			}
+		})
+	}
+}
+
 func TestWorkService(t *testing.T) {
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
@@ -302,9 +472,14 @@ func TestWorkService(t *testing.T) {
 
 	// Queue order: HIGH first, then by queue time; open requests first.
 	list, err := w.env.User(w.org.Member).Work.ListRequests(ctx, connect.NewRequest(&tidev1.ListRequestsRequest{OrganizationId: w.org.ID,
-		States: []tidev1.RequestState{tidev1.RequestState_REQUEST_STATE_QUEUED}}))
+		Kind: tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, States: []tidev1.RequestState{tidev1.RequestState_REQUEST_STATE_QUEUED}}))
 	if err != nil || len(list.Msg.GetRequests()) != 2 || list.Msg.GetRequests()[0].GetRequestId() != high.GetDevSessionId() {
 		t.Fatalf("queue %v %v", list, err)
+	}
+	runners, err := owner.Work.ListRunners(ctx, connect.NewRequest(&tidev1.ListRunnersRequest{OrganizationId: w.org.ID,
+		States: []tidev1.RunnerState{tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK, tidev1.RunnerState_RUNNER_STATE_BUSY}}))
+	if err != nil || len(runners.Msg.GetRunners()) != 1 || runners.Msg.GetRunners()[0].GetRunnerId() != running.GetRunnerId() {
+		t.Fatalf("active runners %v %v", runners, err)
 	}
 	// Cancel: admins only, QUEUED only.
 	_, err = w.env.User(w.org.Member).Work.CancelRequest(ctx, connect.NewRequest(&tidev1.CancelRequestRequest{OrganizationId: w.org.ID, RequestId: low.GetDevSessionId()}))
@@ -651,6 +826,106 @@ func TestDeleteAfterLostCreateResponse(t *testing.T) {
 	}
 }
 
+func TestDeleteSandboxNow(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		revokeKey   bool
+		deleteError error
+		activeAfter int
+	}{
+		{name: "revoked key", revokeKey: true, activeAfter: 1},
+		{name: "not found", deleteError: connect.NewWireError(connect.CodeNotFound, errors.New("sandbox not found")), activeAfter: 1},
+		{name: "success"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWorkWorld(t, devsession.Timing{})
+			ctx := t.Context()
+			member := w.env.User(w.org.Member)
+			profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+			session := w.createSession(t, member, profileID)
+			session = w.waitState(t, session.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+			if runner := w.runner(t, session.GetRunnerId()); runner.GetOwnsandSandboxId() == "" {
+				t.Fatal("running session has no stored sandbox ID")
+			}
+
+			// Give the lease to another instance so only the RPC can delete the sandbox.
+			w.env.App.Lease.Release()
+			other := lease.Lease{DB: w.env.DB, InstanceID: "other-instance"}
+			if held, err := other.TryAcquire(ctx); err != nil || !held {
+				t.Fatalf("could not hand off the lease: held=%v, err=%v", held, err)
+			}
+			if tc.revokeKey {
+				w.fake.RevokeKey(w.osOrg)
+			}
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = tc.deleteError })
+
+			_, err := member.DevSession.DeleteDevSession(ctx, connect.NewRequest(&tidev1.DeleteDevSessionRequest{
+				OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner := w.runner(t, session.GetRunnerId())
+			if runner.GetState() != tidev1.RunnerState_RUNNER_STATE_DELETED ||
+				runner.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER {
+				t.Fatalf("runner after synchronous deletion: %v", runner)
+			}
+			if calls, active := w.fake.Calls("DeleteSandbox"), w.fake.Active(w.osOrg); calls != 1 || active != tc.activeAfter {
+				t.Fatalf("DeleteSandbox calls=%d, active sandboxes=%d, want 1 and %d", calls, active, tc.activeAfter)
+			}
+		})
+	}
+}
+
+func TestDeleteSandboxRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		revokeKey   bool
+		activeAfter int
+	}{
+		{name: "key revoked before retry", revokeKey: true, activeAfter: 1},
+		{name: "OwnSand recovers"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWorkWorld(t, devsession.Timing{})
+			member := w.env.User(w.org.Member)
+			profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+			session := w.createSession(t, member, profileID)
+			session = w.waitState(t, session.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.DeleteError = connect.NewWireError(connect.CodeUnavailable, errors.New("device busy"))
+			})
+			_, err := member.DevSession.DeleteDevSession(t.Context(), connect.NewRequest(&tidev1.DeleteDevSessionRequest{
+				OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			eventually(t, "a deletion retry after the RPC", func() bool { return w.fake.Calls("DeleteSandbox") >= 2 })
+			before := w.runner(t, session.GetRunnerId())
+			if before.GetState() != tidev1.RunnerState_RUNNER_STATE_DELETING || before.GetOwnsandSandboxId() == "" ||
+				before.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER {
+				t.Fatalf("runner after unavailable error: %v", before)
+			}
+			if tc.revokeKey {
+				w.fake.RevokeKey(w.osOrg)
+			}
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
+
+			eventually(t, "runner deleted by the reconciler", func() bool {
+				return w.runner(t, session.GetRunnerId()).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED
+			})
+			after := w.runner(t, session.GetRunnerId())
+			if after.GetEndReason() != before.GetEndReason() || w.fake.Active(w.osOrg) != tc.activeAfter {
+				t.Fatalf("runner after retry: %v, active sandboxes=%d, want %d", after, w.fake.Active(w.osOrg), tc.activeAfter)
+			}
+			calls := w.fake.Calls("DeleteSandbox")
+			stays(t, "no more DeleteSandbox calls", func() bool { return w.fake.Calls("DeleteSandbox") == calls })
+		})
+	}
+}
+
 // TestStartFailureCleanupRetry: when the sandbox deletion after a start
 // failure fails, tide retries it until OwnSand deletes the sandbox.
 func TestStartFailureCleanupRetry(t *testing.T) {
@@ -669,10 +944,127 @@ func TestStartFailureCleanupRetry(t *testing.T) {
 		t.Fatalf("session %v with %d active sandboxes", s, w.fake.Active(w.osOrg))
 	}
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
-	eventually(t, "the failed starts' sandboxes deleted", func() bool { return w.fake.Active(w.osOrg) == 0 })
-	var pending int
-	if err := w.env.DB.Pool.QueryRow(context.Background(), "SELECT count(*) FROM runners WHERE organization_id = $1 AND sandbox_cleanup", w.org.ID).Scan(&pending); err != nil || pending != 0 {
-		t.Fatalf("%d runners still marked (%v)", pending, err)
+	eventually(t, "the failed starts' sandboxes deleted and cleanup marks cleared", func() bool {
+		var pending int
+		if err := w.env.DB.Pool.QueryRow(context.Background(), "SELECT count(*) FROM runners WHERE organization_id = $1 AND sandbox_cleanup", w.org.ID).Scan(&pending); err != nil {
+			t.Fatal(err)
+		}
+		return pending == 0 && w.fake.Active(w.osOrg) == 0
+	})
+}
+
+func TestTerminalSandboxCleanupBeforeTeardown(t *testing.T) {
+	for _, teardown := range []struct {
+		name   string
+		delete bool
+	}{
+		{name: "unlink"},
+		{name: "delete organization", delete: true},
+	} {
+		for _, scenario := range []string{"retry", "already removed", "key rejected", "failed mark update"} {
+			t.Run(teardown.name+"/"+scenario, func(t *testing.T) {
+				w := newWorkWorld(t, devsession.Timing{})
+				ctx := context.Background()
+				remove := func() error {
+					if teardown.delete {
+						_, err := w.env.User(w.org.Owner).Organization.DeleteOrganization(ctx, connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID}))
+						return err
+					}
+					_, err := w.env.User(w.org.Admin).OwnSandLink.RemoveOwnSandLink(ctx, connect.NewRequest(&tidev1.RemoveOwnSandLinkRequest{OrganizationId: w.org.ID}))
+					return err
+				}
+				w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+					code := int64(1)
+					return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
+				}, nil)
+				setDeleteError := func(err error) { w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = err }) }
+				setDeleteError(connect.NewWireError(connect.CodeUnavailable, errors.New("device busy")))
+				// The fixture clock keeps warm fill in its backoff after one failed start.
+				w.createProfile(t, devProfileProto("warm", 1, 0))
+				pool := w.env.DB.Pool
+				var runnerID, sandboxID string
+				eventually(t, "a failed runner with pending sandbox cleanup", func() bool {
+					err := pool.QueryRow(ctx, "SELECT runner_id::text, ownsand_sandbox_id::text FROM runners WHERE organization_id = $1 AND state = $2 AND end_reason = $3 AND sandbox_cleanup",
+						w.org.ID, int16(tidev1.RunnerState_RUNNER_STATE_FAILED), int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED)).Scan(&runnerID, &sandboxID)
+					return err == nil && w.fake.Active(w.osOrg) == 1 && w.fake.Calls("DeleteSandbox") > 0
+				})
+
+				var key []byte
+				if err := pool.QueryRow(ctx, "SELECT api_key_ciphertext FROM ownsand_links WHERE organization_id = $1", w.org.ID).Scan(&key); err != nil {
+					t.Fatal(err)
+				}
+				assertRetained := func() {
+					t.Helper()
+					var pending, removing bool
+					var keptKey []byte
+					err := pool.QueryRow(ctx, `SELECT r.sandbox_cleanup, l.removing, l.api_key_ciphertext
+						FROM organizations o JOIN runners r USING (organization_id) JOIN ownsand_links l USING (organization_id)
+						WHERE o.organization_id = $1 AND r.runner_id = $2`,
+						w.org.ID, runnerID).Scan(&pending, &removing, &keptKey)
+					if err != nil || !pending || removing || !bytes.Equal(key, keptKey) {
+						t.Fatalf("teardown did not retain the organization, pending runner and key: pending=%v removing=%v same key=%v err=%v",
+							pending, removing, bytes.Equal(key, keptKey), err)
+					}
+				}
+				wantCode(t, "teardown while deletion is unavailable", remove(), connect.CodeUnavailable)
+				assertRetained()
+				if got := w.fake.Active(w.osOrg); got != 1 {
+					t.Fatalf("active sandboxes after failed teardown = %d, want 1", got)
+				}
+
+				wantActive := 0
+				switch scenario {
+				case "already removed":
+					w.fake.EndSandbox(w.osOrg, sandboxID, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+					setDeleteError(connect.NewWireError(connect.CodeNotFound, errors.New("sandbox already removed")))
+				case "key rejected":
+					setDeleteError(connect.NewWireError(connect.CodeUnauthenticated, errors.New("OwnSand key revoked")))
+					wantActive = 1 // The sandbox ends when its idle TTL expires.
+				case "failed mark update":
+					if _, err := pool.Exec(ctx, `CREATE FUNCTION refuse_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$
+						BEGIN RAISE EXCEPTION 'cannot clear cleanup mark'; END; $$;
+						CREATE TRIGGER refuse_cleanup BEFORE UPDATE OF sandbox_cleanup ON runners
+						FOR EACH ROW WHEN (OLD.sandbox_cleanup AND NOT NEW.sandbox_cleanup) EXECUTE FUNCTION refuse_cleanup();`); err != nil {
+						t.Fatal(err)
+					}
+					setDeleteError(nil)
+					wantCode(t, "teardown while the mark cannot be cleared", remove(), connect.CodeInternal)
+					assertRetained()
+					if got := w.fake.Active(w.osOrg); got != 0 {
+						t.Fatalf("active sandboxes after failed mark update = %d, want 0", got)
+					}
+					if _, err := pool.Exec(ctx, "DROP TRIGGER refuse_cleanup ON runners"); err != nil {
+						t.Fatal(err)
+					}
+				default:
+					setDeleteError(nil)
+				}
+				if err := remove(); err != nil {
+					t.Fatal(err)
+				}
+				if got := w.fake.Active(w.osOrg); got != wantActive {
+					t.Fatalf("active sandboxes after teardown = %d, want %d", got, wantActive)
+				}
+				var orgExists, linkExists, runnersExist bool
+				if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM organizations WHERE organization_id = $1),
+					EXISTS (SELECT FROM ownsand_links WHERE organization_id = $1),
+					EXISTS (SELECT FROM runners WHERE organization_id = $1)`, w.org.ID).Scan(&orgExists, &linkExists, &runnersExist); err != nil {
+					t.Fatal(err)
+				}
+				if linkExists || orgExists == teardown.delete || runnersExist == teardown.delete {
+					t.Fatalf("rows after teardown: organization=%v link=%v runners=%v", orgExists, linkExists, runnersExist)
+				}
+				if !teardown.delete {
+					r := w.runner(t, runnerID)
+					var pending bool
+					err := pool.QueryRow(ctx, "SELECT sandbox_cleanup FROM runners WHERE runner_id = $1", runnerID).Scan(&pending)
+					if err != nil || pending || r.GetState() != tidev1.RunnerState_RUNNER_STATE_FAILED ||
+						r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+						t.Fatalf("runner after unlink: state=%s reason=%s pending=%v err=%v", r.GetState(), r.GetEndReason(), pending, err)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -700,6 +1092,183 @@ func TestStalledCreateSandbox(t *testing.T) {
 	if n := len(w.fake.Sandboxes(w.osOrg)); n != 2 {
 		t.Fatalf("%d sandboxes", n)
 	}
+}
+
+func TestWatchQueueSnapshotReplay(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		openFirst bool
+		openLast  bool
+		endedRows int
+	}{
+		{name: "open oldest", openFirst: true, endedRows: 300},
+		{name: "open newest", openLast: true, endedRows: 300},
+		{name: "no open rows", endedRows: 300},
+		{name: "open oldest with large history", openFirst: true, endedRows: 1500},
+		{name: "open newest with large history", openLast: true, endedRows: 1500},
+		{name: "no open rows with large history", endedRows: 1500},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w := newWorkWorld(t, devsession.Timing{})
+			q := w.env.DB.Pool
+			other := w.env.NewOrg("other")
+			seedWatchRequests(t, q, other.ID, "other", tidev1.RequestState_REQUEST_STATE_RUNNING, 1)
+
+			if test.openFirst {
+				seedWatchRequests(t, q, w.org.ID, "open", tidev1.RequestState_REQUEST_STATE_RUNNING, 1)
+			}
+			seedWatchRequests(t, q, w.org.ID, "historical", tidev1.RequestState_REQUEST_STATE_ENDED, test.endedRows)
+			if _, err := q.Exec(t.Context(), `INSERT INTO runners
+				(runner_id, organization_id, runner_profile_id, kind, guest_os, state, idempotency_key,
+				 create_request, create_time, update_time, end_time)
+				SELECT gen_random_uuid(), $1, gen_random_uuid(), $2, $3, $4, gen_random_uuid(), '',
+				 now(), now(), now() FROM generate_series(1, 3)`,
+				w.org.ID, int16(tidev1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION),
+				int16(tidev1.GuestOs_GUEST_OS_LINUX), int16(tidev1.RunnerState_RUNNER_STATE_DELETED)); err != nil {
+				t.Fatal(err)
+			}
+			if test.openLast {
+				seedWatchRequests(t, q, w.org.ID, "open", tidev1.RequestState_REQUEST_STATE_RUNNING, 1)
+			}
+
+			var keys []string
+			if test.openFirst || test.openLast {
+				keys = []string{"open-1"}
+			}
+			watch, cancel := openQueueWatch(t, w, keys...)
+			assertQueueWatchIdle(t, watch, cancel)
+		})
+	}
+}
+
+func TestWatchQueueSnapshotReplayChanges(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	q := w.env.DB.Pool
+	seedWatchRequests(t, q, w.org.ID, "open", tidev1.RequestState_REQUEST_STATE_RUNNING, 2)
+	watch, cancel := openQueueWatch(t, w, "open-1", "open-2")
+
+	endWatchRequest(t, q, w.org.ID, "open-1")
+	expectWatchEnd(t, watch, "open-1")
+	seedWatchRequests(t, q, w.org.ID, "new-terminal", tidev1.RequestState_REQUEST_STATE_ENDED, 1)
+	expectWatchEnd(t, watch, "new-terminal-1")
+
+	// Advance the change sequence by more than the previous replay window.
+	if _, err := q.Exec(t.Context(), "SELECT nextval('work_change_seq') FROM generate_series(1, 1100)"); err != nil {
+		t.Fatal(err)
+	}
+	seedWatchRequests(t, q, w.org.ID, "advance", tidev1.RequestState_REQUEST_STATE_ENDED, 1)
+	expectWatchEnd(t, watch, "advance-1")
+	endWatchRequest(t, q, w.org.ID, "open-2")
+	expectWatchEnd(t, watch, "open-2")
+	assertQueueWatchIdle(t, watch, cancel)
+}
+
+func TestWatchQueueLateCommit(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		beforeSnapshot bool
+	}{
+		{name: "in flight at snapshot", beforeSnapshot: true},
+		{name: "in flight during poll"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w := newWorkWorld(t, devsession.Timing{})
+			q := w.env.DB.Pool
+			seedWatchRequests(t, q, w.org.ID, "open", tidev1.RequestState_REQUEST_STATE_RUNNING, 1)
+			ctx := t.Context()
+			tx, err := q.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if test.beforeSnapshot {
+				endWatchRequest(t, tx, w.org.ID, "open-1")
+				seedWatchRequests(t, q, w.org.ID, "historical", tidev1.RequestState_REQUEST_STATE_ENDED, 1)
+			}
+			watch, cancel := openQueueWatch(t, w, "open-1")
+			if !test.beforeSnapshot {
+				endWatchRequest(t, tx, w.org.ID, "open-1")
+				seedWatchRequests(t, q, w.org.ID, "advance", tidev1.RequestState_REQUEST_STATE_ENDED, 1)
+				expectWatchEnd(t, watch, "advance-1")
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			expectWatchEnd(t, watch, "open-1")
+			assertQueueWatchIdle(t, watch, cancel)
+		})
+	}
+}
+
+// Running requests with no runner stay open until the test changes them.
+func seedWatchRequests(t *testing.T, q db.Querier, orgID, prefix string, state tidev1.RequestState, count int) {
+	t.Helper()
+	if _, err := q.Exec(t.Context(), `INSERT INTO requests
+		(request_id, organization_id, runner_profile_id, kind, source, source_key, state, priority,
+		 queue_time, queue_deadline, create_time, update_time, end_time)
+		SELECT gen_random_uuid(), $1, gen_random_uuid(), $2, 99, $3 || '-' || n, $4, $5,
+		 now(), now() + interval '1 hour', now(), now(), CASE WHEN $4::smallint = $6 THEN now() END
+		FROM generate_series(1, $7) AS n`, orgID, int16(tidev1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION),
+		prefix, int16(state), int16(tidev1.Priority_PRIORITY_NORMAL), int16(tidev1.RequestState_REQUEST_STATE_ENDED), count); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func endWatchRequest(t *testing.T, q db.Querier, orgID, key string) {
+	t.Helper()
+	if tag, err := q.Exec(t.Context(), `UPDATE requests SET state = $3, end_time = now()
+		WHERE organization_id = $1 AND source_key = $2`, orgID, key, int16(tidev1.RequestState_REQUEST_STATE_ENDED)); err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("end request %s: %v, %v", key, tag, err)
+	}
+}
+
+func openQueueWatch(t *testing.T, w *workWorld, requestKeys ...string) (*connect.ServerStreamForClient[tidev1.WatchQueueResponse], context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	t.Cleanup(cancel)
+	watch, err := w.env.User(w.org.Member).Work.WatchQueue(ctx, connect.NewRequest(&tidev1.WatchQueueRequest{OrganizationId: w.org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for watch.Receive() {
+		msg := watch.Msg()
+		if msg.GetSnapshotComplete() != nil {
+			if !slices.Equal(keys, requestKeys) {
+				t.Fatalf("snapshot keys %v, want %v", keys, requestKeys)
+			}
+			return watch, cancel
+		}
+		req := msg.GetRequest()
+		if req == nil || req.GetState() != tidev1.RequestState_REQUEST_STATE_RUNNING {
+			t.Fatalf("unexpected snapshot event: %v", msg)
+		}
+		keys = append(keys, req.GetSourceKey())
+	}
+	t.Fatalf("snapshot did not complete: %v", watch.Err())
+	return nil, nil
+}
+
+func expectWatchEnd(t *testing.T, watch *connect.ServerStreamForClient[tidev1.WatchQueueResponse], key string) {
+	t.Helper()
+	if !watch.Receive() {
+		t.Fatalf("no terminal event for %s: %v", key, watch.Err())
+	}
+	got := watch.Msg().GetRequest()
+	if got.GetSourceKey() != key || got.GetState() != tidev1.RequestState_REQUEST_STATE_ENDED {
+		t.Fatalf("want terminal event for %s, got %v", key, watch.Msg())
+	}
+}
+
+func assertQueueWatchIdle(t *testing.T, watch *connect.ServerStreamForClient[tidev1.WatchQueueResponse], cancel context.CancelFunc) {
+	t.Helper()
+	// Read across three default poll intervals to catch delayed replays.
+	timer := time.AfterFunc(3200*time.Millisecond, cancel)
+	defer timer.Stop()
+	if watch.Receive() {
+		t.Fatalf("unexpected event after snapshot_complete: %v", watch.Msg())
+	}
+	wantCode(t, "idle watch at cancellation", watch.Err(), connect.CodeCanceled)
 }
 
 // TestWatchQueueRemovedRunner: a CREATING runner that the dispatcher removes
@@ -739,8 +1308,234 @@ func TestWatchQueueRemovedRunner(t *testing.T) {
 	close(release)
 	for watch.Receive() {
 		if r := watch.Msg().GetRunner(); r != nil && r.GetRunnerId() == runnerID && r.GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED {
+			if r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP {
+				t.Fatalf("removed runner end reason = %v, want CLEAN_UP", r.GetEndReason())
+			}
 			return
 		}
 	}
 	t.Fatalf("the removed runner was not sent as DELETED: %v", watch.Err())
+}
+
+const (
+	watchRequestOpen = tidev1.RequestState_REQUEST_STATE_RUNNING
+	watchRequestEnd  = tidev1.RequestState_REQUEST_STATE_CANCELED
+	watchRunnerOpen  = tidev1.RunnerState_RUNNER_STATE_BUSY
+	watchRunnerEnd   = tidev1.RunnerState_RUNNER_STATE_DELETED
+)
+
+func TestWatchQueueCommitOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		runner   bool
+		rollBack bool
+	}{
+		{name: "late request"},
+		{name: "late runner", runner: true},
+		{name: "rolled back request", rollBack: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := testenv.New(t, testenv.WithLayers(ownsandfake.New(), &layers.Layers{}))
+			org, otherOrg := env.NewOrg("alice"), env.NewOrg("bob")
+			target := seedQueueWatchRow(t, env, org.ID, tc.runner)
+			later := seedQueueWatchRow(t, env, org.ID, false)
+			foreign := seedQueueWatchRow(t, env, otherOrg.ID, tc.runner)
+
+			ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
+			defer cancel()
+			watch := startQueueWatch(t, ctx, env, org)
+			expectQueueWatchState(t, nextQueueWatchEvent(t, watch), target, watchRequestOpen, watchRunnerOpen)
+			expectQueueWatchState(t, nextQueueWatchEvent(t, watch), later, watchRequestOpen, watchRunnerOpen)
+			if msg := nextQueueWatchEvent(t, watch); msg.GetSnapshotComplete() == nil {
+				t.Fatalf("expected snapshot_complete, got %v", msg)
+			}
+
+			tx, err := env.DB.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(t.Context())
+			// The trigger must record the top-level ID even inside a savepoint.
+			savepoint, err := tx.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			earlySeq := endQueueWatchRow(t, ctx, savepoint, target, tc.runner)
+			if err := savepoint.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			other, err := env.DB.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer other.Rollback(t.Context())
+			if _, err := other.Exec(ctx, "SELECT nextval('work_change_seq') FROM generate_series(1, 1500)"); err != nil {
+				t.Fatal(err)
+			}
+			laterSeq := endQueueWatchRow(t, ctx, other, later, false)
+			endQueueWatchRow(t, ctx, other, foreign, tc.runner)
+			if err := other.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if laterSeq-earlySeq < 1000 {
+				t.Fatalf("sequence gap = %d, want at least 1000", laterSeq-earlySeq)
+			}
+			expectQueueWatchState(t, nextQueueWatchEvent(t, watch), later, watchRequestEnd, watchRunnerEnd)
+
+			if tc.rollBack {
+				if err := tx.Rollback(ctx); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				expectQueueWatchState(t, nextQueueWatchEvent(t, watch), target, watchRequestEnd, watchRunnerEnd)
+			}
+			// A new commit must still arrive after the late commit or rollback.
+			next := seedQueueWatchRow(t, env, org.ID, true)
+			expectQueueWatchState(t, nextQueueWatchEvent(t, watch), next, watchRequestOpen, watchRunnerOpen)
+
+			received := make(chan bool, 1)
+			go func() { received <- watch.Receive() }()
+			select {
+			case hasEvent := <-received:
+				if hasEvent {
+					t.Fatalf("idle watch emitted an unexpected event: %v", watch.Msg())
+				}
+				t.Fatalf("watch ended during idle polls: %v", watch.Err())
+			case <-time.After(2200 * time.Millisecond):
+				cancel()
+				if <-received {
+					t.Fatalf("idle watch emitted an unexpected event: %v", watch.Msg())
+				}
+			}
+		})
+	}
+}
+
+func TestWatchQueueSnapshotAcrossTables(t *testing.T) {
+	env := testenv.New(t, testenv.WithLayers(ownsandfake.New(), &layers.Layers{}))
+	org := env.NewOrg("alice")
+	requestID := seedQueueWatchRow(t, env, org.ID, false)
+	runnerID := seedQueueWatchRow(t, env, org.ID, true)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	writer, err := env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Rollback(t.Context())
+	if _, err := writer.Exec(ctx, "LOCK TABLE runners IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	type watchResult struct {
+		stream *connect.ServerStreamForClient[tidev1.WatchQueueResponse]
+		err    error
+	}
+	started := make(chan watchResult, 1)
+	go func() {
+		stream, err := env.User(org.Member).Work.WatchQueue(ctx, connect.NewRequest(&tidev1.WatchQueueRequest{OrganizationId: org.ID}))
+		started <- watchResult{stream, err}
+	}()
+
+	// Commit only after the watch read requests and is blocked reading runners.
+	eventually(t, "watch reading the runner snapshot", func() bool {
+		var waiting bool
+		err := env.DB.Pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+				AND query LIKE '% FROM runners WHERE organization_id = $1 AND state = ANY($2)%'
+		)`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return waiting
+	})
+	endQueueWatchRow(t, ctx, writer, requestID, false)
+	endQueueWatchRow(t, ctx, writer, runnerID, true)
+	if err := writer.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	watch := <-started
+	if watch.err != nil {
+		t.Fatal(watch.err)
+	}
+	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), requestID, watchRequestOpen, watchRunnerOpen)
+	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), runnerID, watchRequestOpen, watchRunnerOpen)
+	if msg := nextQueueWatchEvent(t, watch.stream); msg.GetSnapshotComplete() == nil {
+		t.Fatalf("expected snapshot_complete, got %v", msg)
+	}
+	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), requestID, watchRequestEnd, watchRunnerEnd)
+	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), runnerID, watchRequestEnd, watchRunnerEnd)
+}
+
+func seedQueueWatchRow(t *testing.T, env *testenv.Env, orgID string, runner bool) string {
+	t.Helper()
+	kind := int16(tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION)
+	var row pgx.Row
+	if runner {
+		row = env.DB.Pool.QueryRow(t.Context(), `INSERT INTO runners (runner_id, organization_id, runner_profile_id,
+			kind, guest_os, state, idempotency_key, create_request, ownsand_sandbox_id, create_time, update_time)
+			VALUES (gen_random_uuid(), $1, gen_random_uuid(), $2, $3, $4,
+				gen_random_uuid(), ''::bytea, gen_random_uuid(), now(), now()) RETURNING runner_id::text`,
+			orgID, kind, int16(tidev1.GuestOs_GUEST_OS_LINUX), int16(watchRunnerOpen))
+	} else {
+		row = env.DB.Pool.QueryRow(t.Context(), `INSERT INTO requests (request_id, organization_id, runner_profile_id,
+			kind, source, source_key, state, priority, queue_time, queue_deadline, create_time, update_time)
+			VALUES (gen_random_uuid(), $1, gen_random_uuid(), $2, $3, gen_random_uuid()::text,
+				$4, $5, now(), now() + interval '1 hour', now(), now()) RETURNING request_id::text`,
+			orgID, kind, int16(work.SourceDevSession), int16(watchRequestOpen), int16(tidev1.Priority_PRIORITY_NORMAL))
+	}
+	var id string
+	if err := row.Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func endQueueWatchRow(t *testing.T, ctx context.Context, tx pgx.Tx, id string, runner bool) int64 {
+	t.Helper()
+	sql := "UPDATE requests SET state = $2, end_time = now() WHERE request_id = $1 RETURNING change_seq"
+	state := int16(watchRequestEnd)
+	if runner {
+		sql = "UPDATE runners SET state = $2, end_time = now() WHERE runner_id = $1 RETURNING change_seq"
+		state = int16(watchRunnerEnd)
+	}
+	var seq int64
+	if err := tx.QueryRow(ctx, sql, id, state).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+func startQueueWatch(t *testing.T, ctx context.Context, env *testenv.Env, org testenv.Org) *connect.ServerStreamForClient[tidev1.WatchQueueResponse] {
+	t.Helper()
+	watch, err := env.User(org.Member).Work.WatchQueue(ctx, connect.NewRequest(&tidev1.WatchQueueRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return watch
+}
+
+func nextQueueWatchEvent(t *testing.T, watch *connect.ServerStreamForClient[tidev1.WatchQueueResponse]) *tidev1.WatchQueueResponse {
+	t.Helper()
+	if !watch.Receive() {
+		t.Fatalf("watch ended before the expected event: %v", watch.Err())
+	}
+	return watch.Msg()
+}
+
+func expectQueueWatchState(t *testing.T, event *tidev1.WatchQueueResponse, id string, requestState tidev1.RequestState, runnerState tidev1.RunnerState) {
+	t.Helper()
+	if r := event.GetRequest(); r != nil && r.GetRequestId() == id && r.GetState() == requestState {
+		return
+	}
+	if r := event.GetRunner(); r != nil && r.GetRunnerId() == id && r.GetState() == runnerState {
+		return
+	}
+	t.Fatalf("expected state %v or %v for %s, got %v", requestState, runnerState, id, event)
 }

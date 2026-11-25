@@ -256,9 +256,11 @@ func TestWindowsExitStatus(t *testing.T) {
 }
 
 func TestWindowsDefinitionWithoutEnvironmentPrintsTheRecoveryCommands(t *testing.T) {
-	exe := `C:\Program Files\ownsand-agent.exe`
-	lines := strings.Split(strings.TrimSuffix(WindowsDefinition(exe, nil), "\n"), "\n")
+	source := `C:\Downloads\ownsand-agent.exe`
+	exe := `C:\Program Files\OwnSand Agent\ownsand-service.exe`
+	lines := strings.Split(strings.TrimSuffix(WindowsDefinition(source, exe, nil), "\n"), "\n")
 	want := []string{
+		`"C:\Downloads\ownsand-agent.exe" service prepare`,
 		WindowsCommand(exe),
 		"sc.exe failure ownsand-agent reset= 86400 actions= restart/5000",
 		"sc.exe failureflag ownsand-agent 1",
@@ -266,23 +268,23 @@ func TestWindowsDefinitionWithoutEnvironmentPrintsTheRecoveryCommands(t *testing
 	if !reflect.DeepEqual(lines, want) {
 		t.Fatalf("WindowsDefinition() lines = %q, want %q", lines, want)
 	}
-	if strings.Contains(WindowsDefinition(exe, []string{}), "reg.exe") {
+	if strings.Contains(WindowsDefinition(source, exe, []string{}), "reg.exe") {
 		t.Fatal("an empty environment must not print a reg.exe command")
 	}
 }
 
 func TestWindowsDefinitionPrintsTheEnvironmentCommand(t *testing.T) {
 	env := []string{"OWNSAND_AGENT_LOG_LEVEL=debug", `OWNSAND_AGENT_STATE_DIR=D:\ownsand test\`}
-	lines := strings.Split(strings.TrimSuffix(WindowsDefinition(`C:\a.exe`, env), "\n"), "\n")
-	if len(lines) != 4 || !strings.HasPrefix(lines[0], "sc.exe create ownsand-agent") ||
-		!strings.HasPrefix(lines[1], "sc.exe failure ownsand-agent") || !strings.HasPrefix(lines[2], "sc.exe failureflag ownsand-agent") {
+	lines := strings.Split(strings.TrimSuffix(WindowsDefinition(`C:\a.exe`, `C:\launcher.exe`, env), "\n"), "\n")
+	if len(lines) != 5 || !strings.HasPrefix(lines[1], "sc.exe create ownsand-agent") ||
+		!strings.HasPrefix(lines[2], "sc.exe failure ownsand-agent") || !strings.HasPrefix(lines[3], "sc.exe failureflag ownsand-agent") {
 		t.Fatalf("definition lines = %q", lines)
 	}
 	// The trailing backslash in front of the closing quote is doubled, and
 	// `#` is the first separator that no entry contains.
 	want := `reg.exe add "HKLM\SYSTEM\CurrentControlSet\Services\ownsand-agent" /v Environment /t REG_MULTI_SZ /s "#" /d "OWNSAND_AGENT_LOG_LEVEL=debug#OWNSAND_AGENT_STATE_DIR=D:\ownsand test\\" /f`
-	if lines[3] != want {
-		t.Fatalf("reg command:\n got %s\nwant %s", lines[3], want)
+	if lines[4] != want {
+		t.Fatalf("reg command:\n got %s\nwant %s", lines[4], want)
 	}
 }
 
@@ -309,7 +311,7 @@ func TestWindowsEnvironmentCommandErrorsWithoutAFreeSeparator(t *testing.T) {
 	if _, err := WindowsEnvironmentCommand([]string{all}); err == nil {
 		t.Fatal("expected an error when every separator occurs in a value")
 	}
-	if out := WindowsDefinition(`C:\a.exe`, []string{all}); !strings.Contains(out, "REM no reg.exe separator") || strings.Contains(out, "reg.exe add") {
+	if out := WindowsDefinition(`C:\a.exe`, `C:\launcher.exe`, []string{all}); !strings.Contains(out, "REM no reg.exe separator") || strings.Contains(out, "reg.exe add") {
 		t.Fatalf("definition must fall back to a REM line: %q", out)
 	}
 }

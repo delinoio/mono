@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -153,4 +155,32 @@ func TestDirectoryAtTheOutputPathFailsTheBuild(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("the build wrote %d entries into the directory", len(entries))
 	}
+}
+
+func TestDirectoryCreatedDuringFormattingFailsTheBuild(t *testing.T) {
+	b := newRootfsBuild(t)
+	const mkfs = `#!/usr/bin/env bash
+set -eu
+mkdir -- "$STUB_OUTPUT"
+printf 'keep this file\n' > "$STUB_OUTPUT/sentinel"
+`
+	if err := os.WriteFile(filepath.Join(b.dir, "bin", "mkfs.ext4"), []byte(mkfs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := b.run(stubApplets, "STUB_OUTPUT="+b.out)
+	requireFailure(t, out, err)
+	if !strings.Contains(out, b.out) || strings.Contains(out, "wrote ") {
+		t.Fatalf("want a diagnostic naming %s and no success message:\n%s", b.out, out)
+	}
+	entries, err := os.ReadDir(b.out)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "sentinel" {
+		t.Fatalf("want only the sentinel in %s, got %v (read error: %v)", b.out, entries, err)
+	}
+	data, err := os.ReadFile(filepath.Join(b.out, "sentinel"))
+	if err != nil || string(data) != "keep this file\n" {
+		t.Fatalf("sentinel = %q (read error: %v)", data, err)
+	}
+	b.requireOutputDirEntries("rootfs.ext4")
+	b.requireNoScratch()
 }

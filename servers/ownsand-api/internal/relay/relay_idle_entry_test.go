@@ -57,7 +57,7 @@ func awaitIdleSendEntry(t *testing.T, entered <-chan struct{}, done <-chan error
 func newIdleTestConn(t *testing.T) (*Conn, *stepClock) {
 	t.Helper()
 	clk := newStepClock()
-	c := newConnWithClock(context.Background(), "device", 1, testLimits, clk)
+	c := NewConnWithClock(context.Background(), "device", 1, testLimits, clk)
 	t.Cleanup(func() { c.Close(errors.New("test done")) })
 	return c, clk
 }

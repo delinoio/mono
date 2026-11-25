@@ -36,11 +36,7 @@ func (w *Watch) Admit(ctx context.Context, d Demand) error { return w.h.admit(ct
 // the vendor queue: a QUEUED tide request of it ends with CANCELED and
 // CANCELED_BY_SOURCE.
 func (w *Watch) Lost(ctx context.Context, vendorRequestID string) error {
-	c, req, err := w.h.latestClaim(ctx, w.h.svc.DB.Pool, w.In.OrganizationID, w.In.Vendor, vendorRequestID)
-	if err != nil || c == nil || work.RequestTerminal(req.State) {
-		return err
-	}
-	return w.h.lost(ctx, c, req)
+	return w.h.lost(ctx, w.In.OrganizationID, w.In.Vendor, vendorRequestID)
 }
 
 // Claim returns the newest claim of a vendor request and its request, or
@@ -167,14 +163,14 @@ func (h *Hub) syncWatchers(ctx context.Context) {
 	var stop []*watcher
 	for id, w := range h.watchers {
 		d, ok := want[id]
-		if !ok || d.version != w.version || h.stopped[w.in.OrganizationID] {
+		if !ok || d.version != w.version || h.stopped[w.in.OrganizationID] > 0 {
 			stop = append(stop, w)
 			delete(h.watchers, id)
 		}
 	}
 	var start []desired
 	for id, d := range want {
-		if _, ok := h.watchers[id]; !ok && !h.stopped[d.in.OrganizationID] {
+		if _, ok := h.watchers[id]; !ok && h.stopped[d.in.OrganizationID] == 0 {
 			start = append(start, d)
 		}
 	}
@@ -189,7 +185,7 @@ func (h *Hub) syncWatchers(ctx context.Context) {
 		wctx, cancel := context.WithCancel(ctx)
 		w := &watcher{in: d.in, version: d.version, cancel: cancel, done: make(chan struct{})}
 		h.mu.Lock()
-		if h.stopped[d.in.OrganizationID] {
+		if h.stopped[d.in.OrganizationID] > 0 {
 			h.mu.Unlock()
 			cancel()
 			continue

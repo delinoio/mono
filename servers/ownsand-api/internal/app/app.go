@@ -79,6 +79,8 @@ type Options struct {
 	// (tests).
 	RelayLimits *relay.Limits
 	RelayTiming *api.RelayTiming
+	// RelayClock overrides the clock of agent relay connections (tests).
+	RelayClock relay.Clock
 
 	// UsageClient is the delino-accounts UsageService client: it reports
 	// metered usage, polls billing statuses and changes billing links. When
@@ -165,7 +167,7 @@ func New(opts Options) (*App, error) {
 	}
 	control := api.NewControl(svc)
 	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Logger: opts.Logger,
-		DeadlineNow: opts.LeaseDeadlineNow, OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
+		DeadlineNow: opts.LeaseDeadlineNow, OnLose: control.LeaseLost}
 	svc.Lease = l
 	statuses := billing.NewStatuses(billing.StatusOptions{
 		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Held: l.Held, Client: opts.UsageClient,
@@ -178,6 +180,10 @@ func New(opts Options) (*App, error) {
 		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Held: l.Held, Client: opts.UsageClient,
 		Statuses: statuses, Metrics: opts.Metrics, Timing: opts.BillingTiming,
 	})
+	l.OnAcquire = func(ctx context.Context) {
+		metering.WakeReporter()
+		control.LeaseAcquired(ctx)
+	}
 	svc.Usage = metering
 	relayLimits := relay.DefaultLimits()
 	if opts.RelayLimits != nil {
@@ -224,7 +230,7 @@ func New(opts Options) (*App, error) {
 	relayOpts := append(slices.Clone(handlerOpts), connect.WithRequestGate(plane.RelayGate(authn, opts.ClientAddressMode)))
 	relayPath, relayHandler := ownsandv1connect.NewRelayServiceHandler(api.RelayHandler{DataPlane: plane}, relayOpts...)
 	add(relayPath, api.RelayReadDeadlines(plane.MeterRelayEgress(relayHandler)))
-	relayAgentPath, relayAgentHandler := ownsandv1connect.NewRelayAgentServiceHandler(api.RelayAgentHandler{DataPlane: plane}, handlerOpts...)
+	relayAgentPath, relayAgentHandler := ownsandv1connect.NewRelayAgentServiceHandler(api.RelayAgentHandler{DataPlane: plane, Clock: opts.RelayClock}, handlerOpts...)
 	add(relayAgentPath, api.RelayAgentWriteInterrupt(relayAgentHandler))
 
 	return &App{

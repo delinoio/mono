@@ -3,9 +3,9 @@ import { Priority, RequestState } from "@delino/tide-protos/v1/common_pb";
 import type { Request, Runner } from "@delino/tide-protos/v1/work_pb";
 import { type WatchQueueEvent, WatchQueueEventKind } from "tide-sdk";
 import {
+  compareTimestamps,
   TERMINAL_REQUEST_STATES,
   TERMINAL_RUNNER_STATES,
-  timestampMs,
 } from "./format.ts";
 
 /** The connection state of the live queue view. */
@@ -19,6 +19,8 @@ export enum LiveState {
    * last state until the new snapshot is complete.
    */
   Reconnecting = "reconnecting",
+  /** The stream stopped with an error. The view keeps the last state. */
+  Disconnected = "disconnected",
 }
 
 /** The live queue view: non-terminal requests and runners by ID. */
@@ -41,11 +43,13 @@ export enum QueueViewActionKind {
    * manual retry. The new stream starts with a snapshot and without a `Gap`.
    */
   Restart = "restart",
+  StreamFailed = "stream_failed",
 }
 
 /** An action of the queue view reducer. */
 export type QueueViewAction =
-  WatchQueueEvent | { kind: QueueViewActionKind.Restart };
+  | WatchQueueEvent
+  | { kind: QueueViewActionKind.Restart | QueueViewActionKind.StreamFailed };
 
 /** A new view before the first snapshot. */
 export function initialQueueView(): QueueView {
@@ -85,6 +89,10 @@ export function applyQueueEvent(
   event: QueueViewAction,
 ): QueueView {
   switch (event.kind) {
+    case QueueViewActionKind.StreamFailed:
+      return view.live === LiveState.Connecting
+        ? view
+        : { ...view, live: LiveState.Disconnected, pending: undefined };
     case QueueViewActionKind.Restart:
       return {
         ...view,
@@ -150,16 +158,20 @@ const PRIORITY_ORDER: Record<number, number> = {
 };
 
 /**
- * The waiting requests in queue order: priority (`HIGH` first), then the
+ * Queue order compares priority (`HIGH` first), then the
  * time the request was queued (oldest first), then the request ID.
  */
+export function compareQueueOrder(a: Request, b: Request): number {
+  return (
+    (PRIORITY_ORDER[a.priority] ?? 3) - (PRIORITY_ORDER[b.priority] ?? 3) ||
+    compareTimestamps(a.queuedAt, b.queuedAt) ||
+    (a.requestId < b.requestId ? -1 : a.requestId > b.requestId ? 1 : 0)
+  );
+}
+
+/** The waiting requests in queue order. */
 export function waitingInQueueOrder(requests: Iterable<Request>): Request[] {
   return [...requests]
     .filter((r) => r.state === RequestState.QUEUED)
-    .sort(
-      (a, b) =>
-        (PRIORITY_ORDER[a.priority] ?? 3) - (PRIORITY_ORDER[b.priority] ?? 3) ||
-        (timestampMs(a.queuedAt) ?? 0) - (timestampMs(b.queuedAt) ?? 0) ||
-        (a.requestId < b.requestId ? -1 : a.requestId > b.requestId ? 1 : 0),
-    );
+    .sort(compareQueueOrder);
 }

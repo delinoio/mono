@@ -808,6 +808,9 @@ func TestListManageableBillingAccounts(t *testing.T) {
 
 func TestGetOrganizationBillingAndUsageViews(t *testing.T) {
 	env := testenv.New(t)
+	// Keep both completed usage windows in the fixture clock's UTC month.
+	midMonth := time.Date(2026, time.November, 15, 12, 0, 0, 0, time.UTC)
+	env.Clock.Advance(midMonth.Sub(env.Clock.Now()) - time.Millisecond)
 	f := newFixture(t, env)
 	subscribe(t, env, f)
 	org1, org2 := newOrg(t), newOrg(t)
@@ -828,21 +831,17 @@ func TestGetOrganizationBillingAndUsageViews(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	monthStart := billing.MonthStart(env.Clock.Now())
 	m := resp.Msg
 	if m.GetBillingAccountId() != f.AccountID || m.GetBillingAccountName() != "Fixture" || m.GetBalanceUsdMicros() != 10*usd-15_030-90 ||
-		m.GetStatus().GetStatus() != allowed || !m.GetMonthStart().AsTime().Equal(billing.MonthStart(time.Now())) {
+		m.GetStatus().GetStatus() != allowed || !m.GetMonthStart().AsTime().Equal(monthStart) {
 		t.Fatalf("GetOrganizationBilling = %v", m)
 	}
 	var meters []string
 	for _, mu := range m.GetMeterUsages() {
 		meters = append(meters, fmt.Sprintf("%s=%d/%d", mu.GetMeter(), mu.GetQuantity(), mu.GetAmountUsdMicros()))
 	}
-	sameMonth := !w.Add(-billing.WindowLength).Before(billing.MonthStart(w))
-	wantEgress := "METER_OWNSAND_RELAY_EGRESS=150/15000"
-	if !sameMonth {
-		wantEgress = "METER_OWNSAND_RELAY_EGRESS=100/10000"
-	}
-	if got := strings.Join(meters, " "); got != wantEgress+" METER_OWNSAND_R2_STORAGE=0/0 METER_OWNSAND_CLASS_A_RPC=0/0 METER_OWNSAND_CLASS_B_RPC=3/30" {
+	if got := strings.Join(meters, " "); got != "METER_OWNSAND_RELAY_EGRESS=150/15000 METER_OWNSAND_R2_STORAGE=0/0 METER_OWNSAND_CLASS_A_RPC=0/0 METER_OWNSAND_CLASS_B_RPC=3/30" {
 		t.Fatalf("meter usages = %s", got)
 	}
 
@@ -868,7 +867,7 @@ func TestGetOrganizationBillingAndUsageViews(t *testing.T) {
 
 	// The monthly summary by service, organization and meter, with the
 	// total of every page.
-	year, month := int32(w.Year()), int32(w.Month())
+	year, month := int32(monthStart.Year()), int32(monthStart.Month())
 	summary := func(p person, token string, size int32) (*accountsv1.ListUsageSummaryResponse, error) {
 		resp, err := env.BillingUsage(p.ID).ListUsageSummary(ctx(), connect.NewRequest(&accountsv1.ListUsageSummaryRequest{
 			BillingAccountId: f.AccountID, Year: year, Month: month, PageSize: size, PageToken: token}))
@@ -894,9 +893,6 @@ func TestGetOrganizationBillingAndUsageViews(t *testing.T) {
 		}
 	}
 	wantTotal := int64(15_000 + 30 + 90)
-	if !sameMonth {
-		wantTotal -= 5_000
-	}
 	if len(rows) != 3 || total != wantTotal {
 		t.Fatalf("summary rows = %v with total %d, want 3 rows with %d", rows, total, wantTotal)
 	}

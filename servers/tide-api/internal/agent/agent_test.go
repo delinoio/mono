@@ -3,6 +3,8 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,8 @@ import (
 
 	"github.com/delinoio/mono/go/ownsand"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/servers/tide-api/internal/api"
+	"github.com/delinoio/mono/servers/tide-api/internal/db/dbtest"
 )
 
 const (
@@ -19,12 +23,73 @@ const (
 	windows = tidev1.GuestOs_GUEST_OS_WINDOWS
 )
 
+func TestPrepareOrgDeletionKeepsOtherAttemptStopped(t *testing.T) {
+	h := &Hub{
+		svc:     &api.Service{DB: dbtest.New(t)},
+		stopped: map[string]int{},
+		syncNow: make(chan struct{}, 1),
+	}
+	d := api.OrganizationDeletion{OrganizationID: api.NewID()}
+	if err := h.prepareOrgDeletion(t.Context(), d); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := h.prepareOrgDeletion(ctx, d); !errors.Is(err, context.Canceled) {
+		t.Fatalf("prepare error = %v, want context canceled", err)
+	}
+	if count := h.stopped[d.OrganizationID]; count != 1 {
+		t.Fatalf("finished attempt affected the remaining stop, count = %d", count)
+	}
+	select {
+	case <-h.syncNow:
+		t.Fatal("watcher sync was scheduled while another attempt holds the stop")
+	default:
+	}
+	h.resumeOrg(d.OrganizationID)
+	if _, stopped := h.stopped[d.OrganizationID]; stopped {
+		t.Fatal("organization stays stopped after both attempts finished")
+	}
+	select {
+	case <-h.syncNow:
+	default:
+		t.Fatal("watcher sync is not scheduled")
+	}
+}
+
 func TestQuote(t *testing.T) {
 	if got := Quote(linux, "a'b $x"); got != `'a'\''b $x'` {
 		t.Fatalf("posix %s", got)
 	}
-	if got := Quote(windows, "a'b $x"); got != `'a''b $x'` {
-		t.Fatalf("powershell %s", got)
+	if got := Quote(linux, "a’b"); got != "'a’b'" {
+		t.Fatalf("POSIX quote = %q, want %q", got, "'a’b'")
+	}
+	for _, tt := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"ascii", "a'b $x", "'a''b $x'"},
+		{"left", "a‘b", "'a‘‘b'"},
+		{"right", "a’b", "'a’’b'"},
+		{"low", "a‚b", "'a‚‚b'"},
+		{"reversed", "a‛b", "'a‛‛b'"},
+		{"mixed", "O'Neil’s ‘workspace’", "'O''Neil’’s ‘‘workspace’’'"},
+		{"path", `C:\Users\O’Brien\ws`, `'C:\Users\O’’Brien\ws'`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Quote(windows, tt.value); got != tt.want {
+				t.Fatalf("PowerShell quote = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQuoteInMakeDirScript(t *testing.T) {
+	script := makeDirScript(windows, `C:\Users\O’Brien\runner`)
+	want := `$d = 'C:\Users\O’’Brien\runner'` + "\n"
+	if !strings.Contains(script, want) {
+		t.Fatalf("script lacks %q:\n%s", want, script)
 	}
 }
 
@@ -71,13 +136,18 @@ func TestStartScriptPOSIX(t *testing.T) {
 }
 
 func TestStartScriptWindows(t *testing.T) {
-	s := StartScript(windows, Program{Dir: `C:\ProgramData\tide\runners\r1`, CredentialEnv: "CURSOR_API_KEY", Env: [][2]string{{"CURSOR_AGENT_WORKER_ID", "tide-1"}},
-		Args: []string{"agent", "worker", "--pool", "it's", "--worker-dir", HomeArg, "--base", HomeArg + `\w`, "start"}})
+	s := StartScript(windows, Program{
+		Dir:           `C:\ProgramData\tide\runners\r1`,
+		CredentialEnv: "CURSOR_API_KEY",
+		Env:           [][2]string{{"CURSOR_AGENT_WORKER_ID", "tide-1"}, {"TIDE_TEST_LABEL", "O’Brien"}},
+		Args:          []string{"agent", "worker", "--pool", "it's", "--worker-dir", HomeArg, "--base", HomeArg + `\w`, "Bob’s pool", "start"},
+	})
 	for _, want := range []string{
 		`$env:CURSOR_API_KEY = [IO.File]::ReadAllText('C:\ProgramData\tide\runners\r1\credential')`,
 		`Remove-Item -Force -LiteralPath 'C:\ProgramData\tide\runners\r1\credential'`,
 		`$env:CURSOR_AGENT_WORKER_ID = 'tide-1'`,
-		`& 'agent' 'worker' '--pool' 'it''s' '--worker-dir' $env:USERPROFILE '--base' ($env:USERPROFILE + '\w') 'start' *>> 'C:\ProgramData\tide\runners\r1\runner.log'`,
+		`$env:TIDE_TEST_LABEL = 'O’’Brien'`,
+		`& 'agent' 'worker' '--pool' 'it''s' '--worker-dir' $env:USERPROFILE '--base' ($env:USERPROFILE + '\w') 'Bob’’s pool' 'start' *>> 'C:\ProgramData\tide\runners\r1\runner.log'`,
 		"exit $LASTEXITCODE",
 	} {
 		if !strings.Contains(s, want) {

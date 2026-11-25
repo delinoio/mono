@@ -94,10 +94,11 @@ describe("sandboxes page when a Show more request fails", () => {
     expect(failedToken).not.toBe("");
     expect(state.tokens).toEqual(["", failedToken]);
 
-    // The retry sends the failed token and does not read the first page again.
+    // Retry and Show more share the same pending continuation.
     state.failLater = false;
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      fireEvent.click(screen.getByRole("button", { name: "Show more" }));
     });
     await waitFor(() => expect(rows()).toHaveLength(51), WAIT);
     await waitFor(() => expect(notices()).toHaveLength(0), WAIT);

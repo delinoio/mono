@@ -7,14 +7,17 @@ package vzrt_test
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -65,9 +68,151 @@ func (s *sink) Send(_ context.Context, f *ownsandv1.DataFrame) error {
 }
 
 type env struct {
-	t *testing.T
-	m *sandboxes.Manager
-	d *ops.Dispatcher
+	t  *testing.T
+	m  *sandboxes.Manager
+	d  *ops.Dispatcher
+	st *store.Store
+}
+
+// cancelAtGuestReadiness ends the create when waitGuest derives its timeout.
+// Create has already resumed the restored VM when it reaches this point.
+type cancelAtGuestReadiness struct {
+	context.Context
+	cancel context.CancelFunc
+	waits  int
+}
+
+func (c *cancelAtGuestReadiness) Deadline() (time.Time, bool) {
+	c.waits++
+	c.cancel()
+	return c.Context.Deadline()
+}
+
+func (e *env) requireCanceledRestore(t *testing.T, snapshotID string, guestOS ownsandv1.GuestOs) {
+	t.Helper()
+	snapshotDir, snapshot, ok := e.m.SnapshotContent(snapshotID)
+	if !ok {
+		t.Fatal("snapshot content missing")
+	}
+	if !snapshot.GetHasMemoryState() {
+		t.Skip("snapshot has no memory state")
+	}
+	var fallback atomic.Bool
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{
+		ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
+			if attr.Key == slog.MessageKey && strings.Contains(attr.Value.String(), "booting the snapshot disk cold") {
+				fallback.Store(true)
+			}
+			return attr
+		},
+	}))
+	vmsDir := t.TempDir()
+	rt, err := vzrt.New(vzrt.Options{Kernel: os.Getenv(envKernel), VMsDir: vmsDir, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := rt.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	id, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := snapshot.GetResources()
+	spec := vmruntime.Spec{
+		SandboxID: id, Dir: filepath.Join(vmsDir, id), Resources: resources, GuestOS: guestOS,
+		NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE, MemoryRestoreAllowed: true,
+		Snapshot: &vmruntime.SnapshotSource{SnapshotID: snapshotID, Dir: snapshotDir, HasMemoryState: true, Resources: resources},
+	}
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelAtGuestReadiness{Context: base, cancel: cancel}
+	vm, err := rt.Create(ctx, spec)
+	if fallback.Load() || ctx.waits != 1 {
+		t.Fatalf("readiness waits = %d, disk fallback = %t, create error = %v", ctx.waits, fallback.Load(), err)
+	}
+	if vm != nil || err != context.Canceled {
+		t.Fatalf("create = %v, %v, want the create context error after a confirmed stop", vm, err)
+	}
+	if ids, err := rt.Running(context.Background()); err != nil || len(ids) != 0 {
+		t.Fatalf("VMs after failed create = %v, %v", ids, err)
+	}
+	if _, err := os.Lstat(spec.Dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled VM directory: %v, want it removed", err)
+	}
+	t.Log("restored VM stopped with no cold boot")
+}
+
+// cancelAtSnapshotFile cancels at the first capture checkpoint that can see
+// the watched file. next must still be absent when a capture has more work.
+type cancelAtSnapshotFile struct {
+	context.Context
+	cancel  context.CancelFunc
+	watch   string
+	next    string
+	reached bool
+	nextErr error
+}
+
+func (c *cancelAtSnapshotFile) Err() error {
+	if c.Context.Err() == nil {
+		if _, err := os.Stat(c.watch); err == nil {
+			c.reached = true
+			if c.next != "" {
+				_, c.nextErr = os.Stat(c.next)
+			}
+			c.cancel()
+		}
+	}
+	return c.Context.Err()
+}
+
+func (e *env) requireCanceledSnapshot(sandboxID, watch, next string) {
+	e.t.Helper()
+	id, _ := uuidv7.NewString()
+	dir, err := e.st.SnapshotDir(id)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelAtSnapshotFile{Context: base, cancel: cancel, watch: filepath.Join(dir, "content", watch)}
+	if next != "" {
+		ctx.next = filepath.Join(dir, "content", next)
+	}
+	snap, err := e.m.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: id, SandboxId: sandboxID})
+	var commandErr *sandboxes.CommandError
+	if !ctx.reached || snap != nil || !errors.As(err, &commandErr) || commandErr.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		e.t.Fatalf("cancel at %s: reached = %v, snapshot = %v, error = %v", watch, ctx.reached, snap, err)
+	}
+	if next != "" && !errors.Is(ctx.nextErr, os.ErrNotExist) {
+		e.t.Fatalf("%s was not absent when capture stopped at %s: %v", next, watch, ctx.nextErr)
+	}
+	for _, snap := range e.m.StateReport(0, nil).GetSnapshots() {
+		if snap.GetSnapshotId() == id {
+			e.t.Fatalf("state report contains the canceled snapshot: %v", snap)
+		}
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		e.t.Fatalf("canceled snapshot directory: %v, want it removed", err)
+	}
+	e.t.Logf("canceled capture at %s and removed its staging directory", watch)
+}
+
+// invalidateMemoryState corrupts a disposable snapshot without clearing its
+// memory-state flag, so create attempts native restore before falling back.
+func (e *env) invalidateMemoryState(snapshotID string) {
+	e.t.Helper()
+	dir, err := e.m.ImportDir(snapshotID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "content", "vm.state"), []byte("invalid machine state"), 0o600); err != nil {
+		e.t.Fatal(err)
+	}
 }
 
 func (e *env) create(snapshotID string, memMiB int64, network ownsandv1.NetworkMode, memoryRestore bool) *ownsandv1.SandboxStateEntry {
@@ -124,6 +269,11 @@ func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExit
 		}
 	}
 	return out.String(), exited
+}
+
+func execSucceeded(exited *ownsandv1.ExecExited) bool {
+	code, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
+	return ok && code != nil && code.ExitCode == 0
 }
 
 // waitFor polls cond until it holds or 30 seconds passed.
@@ -227,7 +377,7 @@ func TestVirtualizationIntegration(t *testing.T) {
 		m.Close()
 		rt.Close()
 	})
-	e := &env{t: t, m: m, d: d}
+	e := &env{t: t, m: m, d: d, st: st}
 
 	start := time.Now()
 	sb := e.create("", 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE, false)
@@ -236,8 +386,8 @@ func TestVirtualizationIntegration(t *testing.T) {
 		t.Fatalf("sandbox %v", sb)
 	}
 	out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo hello; uname -sm; echo state > /root/marker; df -k / | tail -1; ls /sys/class/net")
-	if ex.GetExitCode() != 0 || !strings.Contains(out, "hello\nLinux aarch64\n") && !strings.Contains(out, "hello\nLinux x86_64\n") {
-		t.Fatalf("exec output %q exited %v", out, ex)
+	if !execSucceeded(ex) || !strings.Contains(out, "hello\nLinux aarch64\n") && !strings.Contains(out, "hello\nLinux x86_64\n") {
+		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	t.Logf("guest: %s", strings.TrimSpace(out))
 	// The root file system grew to the 2 GiB disk at boot.
@@ -265,22 +415,22 @@ func TestVirtualizationIntegration(t *testing.T) {
 	// answering exec requests.
 	consoleLog := st.Path(store.VMsDir, sb.GetSandboxId(), "console.log")
 	const marker = "OWNSAND-CONSOLE-MARKER"
-	if out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo "+marker+" > /dev/hvc0"); ex.GetExitCode() != 0 {
-		t.Fatalf("console write %q exited %v", out, ex)
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo "+marker+" > /dev/hvc0"); !execSucceeded(ex) {
+		t.Fatalf("console write %q exited %q", out, ex)
 	}
 	waitFor(t, "the marker in console.log", func() bool {
 		data, _ := os.ReadFile(consoleLog)
 		return strings.Contains(string(data), marker)
 	})
-	if out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "head -c 3145728 /dev/zero | tr '\\0' x > /dev/hvc0"); ex.GetExitCode() != 0 {
-		t.Fatalf("console flood %q exited %v", out, ex)
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "head -c 3145728 /dev/zero | tr '\\0' x > /dev/hvc0"); !execSucceeded(ex) {
+		t.Fatalf("console flood %q exited %q", out, ex)
 	}
 	waitFor(t, "console.log at the cap", func() bool {
 		fi, err := os.Stat(consoleLog)
 		return err == nil && fi.Size() == vmruntime.ConsoleLogLimit
 	})
-	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
-		t.Fatalf("exec after the console flood %q %v", out, ex)
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); !execSucceeded(ex) || out != "state\n" {
+		t.Fatalf("exec after the console flood %q exited %q", out, ex)
 	}
 	if fi, err := os.Stat(consoleLog); err != nil || fi.Size() != vmruntime.ConsoleLogLimit {
 		t.Fatalf("console.log %v %v, want exactly %d bytes", fi, err, vmruntime.ConsoleLogLimit)
@@ -291,6 +441,13 @@ func TestVirtualizationIntegration(t *testing.T) {
 		t.Fatalf("snapshot %v %v", snap, err)
 	}
 	t.Logf("snapshot has memory state: %v", snap.GetHasMemoryState())
+	if snap.GetHasMemoryState() {
+		e.requireCanceledSnapshot(sb.GetSandboxId(), "vm.state", "disk.img")
+	}
+	e.requireCanceledSnapshot(sb.GetSandboxId(), "disk.img", "")
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
+		t.Fatalf("source did not resume after cancellation: %q %v", out, ex)
+	}
 	start = time.Now()
 	restored := e.create(snapID, 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE, true)
 	t.Logf("restore from snapshot took %v (%v)", time.Since(start), restored.GetRestorePath())
@@ -307,7 +464,27 @@ func TestVirtualizationIntegration(t *testing.T) {
 	if out, _ := e.exec(cold.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" {
 		t.Fatalf("cold-booted sandbox %q", out)
 	}
-	ids := []string{sb.GetSandboxId(), restored.GetSandboxId(), cold.GetSandboxId()}
+	if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: restored.GetSandboxId()}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("delete restored sandbox %v %v", en, err)
+	}
+	ids := []string{sb.GetSandboxId(), cold.GetSandboxId()}
+
+	t.Run("cancel-during-restored-readiness", func(t *testing.T) {
+		e.requireCanceledRestore(t, snapID, ownsandv1.GuestOs_GUEST_OS_LINUX)
+	})
+	if snap.GetHasMemoryState() {
+		e.invalidateMemoryState(snapID)
+		fallback := e.create(snapID, 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE, true)
+		if fallback.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
+			t.Fatalf("restore path after invalid memory state %v", fallback.GetRestorePath())
+		}
+		if out, ex := e.exec(fallback.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
+			t.Fatalf("sandbox after invalid memory state %q %v", out, ex)
+		}
+		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: fallback.GetSandboxId()}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			t.Fatalf("delete fallback sandbox %v %v", en, err)
+		}
+	}
 
 	if os.Getenv(envOutbound) != "" {
 		ob := e.create("", 512, ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, false)
@@ -342,9 +519,16 @@ func TestVirtualizationIntegration(t *testing.T) {
 		}
 	}
 
+	// Delete a paused guest as well as the guests that are still running.
+	if _, err := m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: sb.GetSandboxId()}); err != nil {
+		t.Fatal(err)
+	}
 	for _, id := range ids {
 		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
 			t.Fatalf("delete %v %v", en, err)
+		}
+		if _, err := os.Stat(st.Path(store.VMsDir, id)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("VM directory after deleting %s: %v", id, err)
 		}
 	}
 	if ids, _ := rt.Running(context.Background()); len(ids) != 0 {

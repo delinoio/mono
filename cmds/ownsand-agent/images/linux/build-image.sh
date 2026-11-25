@@ -8,8 +8,7 @@
 # macOS hosts; a container of the other architecture needs emulation (Docker
 # Desktop provides it).
 #
-# The output directory gets `vmlinux` and `rootfs.ext4`, the layout of
-# images/linux in the agent state directory.
+# The output directory gets `vmlinux`, `vmlinux.config`, and `rootfs.ext4`.
 #
 # Usage: build-image.sh <amd64|arm64> <output-dir> [rootfs-size-mib]
 set -euo pipefail
@@ -34,23 +33,54 @@ image="debian:trixie-20261104"
 mkdir -p "$out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
 
-# The guest helper goes to a unique staging directory that the root file system
-# container mounts read-only, so a file that already exists at
-# "$out_dir/ownsand-guest" stays untouched on success and on failure. The
-# directory is inside the output directory, which Docker already has to share
-# with the container (Docker Desktop on macOS shares only some host paths), and
-# the trap removes it on success, on a failed step and on a signal.
-stage="$(mktemp -d "$out_dir/.ownsand-guest-stage.XXXXXX")"
-trap 'rm -rf "$stage"' EXIT
+# Keep staging on the destination file system so publication uses renames.
+# Docker Desktop already needs access to the output directory.
+stage="$(mktemp -d "$out_dir/.ownsand-image-stage.XXXXXX")"
+outputs=(vmlinux vmlinux.config rootfs.ext4)
+publish_lock="$out_dir/.ownsand-image-publish.lock"
+lock_held=false
+publishing=false
+
+cleanup() {
+  local status=$? name keep_stage=false
+  trap '' INT TERM
+  if "$publishing"; then
+    for name in "${outputs[@]}"; do
+      # Each staged file disappears only when its rename completes.
+      if [ -e "$stage/out/$name" ]; then
+        continue
+      fi
+      if [ -e "$stage/previous/$name" ] || [ -L "$stage/previous/$name" ]; then
+        if ! mv -f -- "$stage/previous/$name" "$out_dir/"; then
+          echo "could not restore $out_dir/$name" >&2
+          keep_stage=true
+        fi
+      elif ! rm -f -- "$out_dir/$name"; then
+        keep_stage=true
+      fi
+    done
+  fi
+  if "$lock_held" && ! rmdir -- "$publish_lock" && [ "$status" -eq 0 ]; then
+    status=1
+  fi
+  if "$keep_stage"; then
+    echo "image rollback incomplete; recovery files are in $stage" >&2
+  elif ! rm -rf -- "$stage" && [ "$status" -eq 0 ]; then
+    status=1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-(cd "$repo" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false -o "$stage/ownsand-guest" ./cmds/ownsand-guest)
+mkdir -- "$stage/guest" "$stage/out" "$stage/previous"
+(cd "$repo" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false -o "$stage/guest/ownsand-guest" ./cmds/ownsand-guest)
 
 docker run --rm --platform "linux/$arch" \
   -v "$repo/cmds/ownsand-agent/images/linux:/scripts:ro" \
-  -v "$stage:/stage:ro" \
-  -v "$out_dir:/out" \
+  -v "$stage/guest:/stage:ro" \
+  -v "$stage/out:/out" \
   -e "SIZE_MIB=$size_mib" \
   "$image" bash -euo pipefail -c '
     apt-get update -qq >/dev/null
@@ -60,7 +90,48 @@ docker run --rm --platform "linux/$arch" \
     GUEST_BINARY=/stage/ownsand-guest BUSYBOX=/bin/busybox \
       /work/cmds/ownsand-agent/images/linux/build-rootfs.sh /out/rootfs.ext4 "$SIZE_MIB"
   '
-rm -rf "$stage"
+"$here/build-kernel.sh" "$arch" "$stage/out/vmlinux"
+for name in "${outputs[@]}"; do
+  if [ ! -f "$stage/out/$name" ] || [ -L "$stage/out/$name" ]; then
+    echo "build did not produce a regular file: $name" >&2
+    exit 1
+  fi
+done
 
-"$here/build-kernel.sh" "$arch" "$out_dir/vmlinux"
-echo "wrote $out_dir/vmlinux and $out_dir/rootfs.ext4"
+# Defer signal exits until the shell knows whether it owns the lock.
+interrupted=0
+trap 'interrupted=130' INT
+trap 'interrupted=143' TERM
+if mkdir -- "$publish_lock"; then
+  lock_held=true
+else
+  echo "could not acquire image publication lock: $publish_lock" >&2
+  exit 1
+fi
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [ "$interrupted" -ne 0 ]; then
+  exit "$interrupted"
+fi
+
+for name in "${outputs[@]}"; do
+  dest="$out_dir/$name"
+  if [ -d "$dest" ]; then
+    echo "output path is a directory: $dest" >&2
+    exit 1
+  fi
+  if [ -L "$dest" ] || [ -f "$dest" ]; then
+    cp -pP -- "$dest" "$stage/previous/$name"
+  elif [ -e "$dest" ]; then
+    echo "output path is not a regular file or symbolic link: $dest" >&2
+    exit 1
+  fi
+done
+
+publishing=true
+for name in "${outputs[@]}"; do
+  # Let mv append the basename, so a directory at the final filename fails.
+  mv -f -- "$stage/out/$name" "$out_dir/"
+done
+publishing=false
+echo "wrote $out_dir/vmlinux, $out_dir/vmlinux.config and $out_dir/rootfs.ext4"

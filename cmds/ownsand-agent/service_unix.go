@@ -19,6 +19,16 @@ func runService(cfg config.Config) int {
 	return runInteractive(cfg)
 }
 
+func runServiceLauncher(_ config.Config, _ []string, stderr io.Writer) int {
+	fmt.Fprintln(stderr, "ownsand-agent: the service launcher is available on Windows")
+	return exitUsage
+}
+
+func serviceLauncherSetup(_ bool, _, stderr io.Writer) int {
+	fmt.Fprintln(stderr, "ownsand-agent: service launcher setup is available on Windows")
+	return exitUsage
+}
+
 // runConfigError ends `run` when its configuration does not parse. systemd
 // and launchd read the standard error of the agent, so it only prints the
 // error and returns the usage exit code.

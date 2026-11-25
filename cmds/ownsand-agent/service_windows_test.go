@@ -3,19 +3,59 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"io"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/service"
 )
+
+func TestServiceMigrationPreservesRunArguments(t *testing.T) {
+	launcher := `C:\Program Files\OwnSand Agent\ownsand-service.exe`
+	old := `"D:\Agent Files\ownsand-agent.exe" run --state-dir "D:\Agent State" --no-color`
+	path, migrated, err := migratedWindowsServicePath(old, launcher)
+	if err != nil || migrated {
+		t.Fatalf("migrate %q = migrated %v, error %v", old, migrated, err)
+	}
+	result := windows.UTF16PtrToString(path)
+	args, err := windows.DecomposeCommandLine(result)
+	want := []string{launcher, "service", "launch", "run", "--state-dir", `D:\Agent State`, "--no-color"}
+	if err != nil || !reflect.DeepEqual(args, want) {
+		t.Fatalf("migrated command line = %q, %v, want %q", args, err, want)
+	}
+	if _, migrated, err := migratedWindowsServicePath(result, launcher); err != nil || !migrated {
+		t.Fatalf("repeat migration = migrated %v, error %v", migrated, err)
+	}
+}
+
+func TestServiceLauncherDirectorySecurity(t *testing.T) {
+	if !windows.GetCurrentProcessToken().IsElevated() {
+		t.Skip("creating the launcher directory needs an elevated administrator")
+	}
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "launcher")
+	for range 2 {
+		if err := createLauncherDirectory(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := filepath.Join(parent, "existing")
+	if err := os.Mkdir(other, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := createLauncherDirectory(other); err == nil {
+		t.Fatal("accepted an existing directory without the launcher DACL")
+	}
+}
 
 // executeHandler drives handler.Execute with a fake runner. When stop is
 // true, the test sends a stop request and the runner returns its outcome
@@ -76,21 +116,84 @@ func TestHandlerReportsTheRestartStatus(t *testing.T) {
 	}
 }
 
-// A service whose configuration does not parse still runs the service
-// handler: it reports the usage exit code as a service-specific error, so
-// the Event Log names the code and the failure actions apply, and it logs
-// the error.
-func TestHandlerReportsAConfigurationError(t *testing.T) {
-	logs := captureStderr(t)
-	h := &handler{run: configErrorRun(errors.New("config: invalid OWNSAND_AGENT_LOG_LEVEL \"bogus\""))}
-	status := make(chan svc.Status, 8)
-	specific, exit := h.Execute(nil, make(chan svc.ChangeRequest), status)
-	if !specific || exit != exitUsage || h.code != exitUsage {
-		t.Fatalf("Execute = (%v, %d), code %d; want (true, %d), code %d", specific, exit, h.code, exitUsage, exitUsage)
+func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
+	const rawLevel = "private-fixture-level"
+	const rawPath = "private-fixture-state"
+	wantSetting := "invalid OWNSAND_AGENT_LOG_LEVEL: expected debug, info, warn or error"
+	_, cfgErr := config.FromEnv(func(name string) (string, bool) {
+		if name == config.EnvLogLevel {
+			return rawLevel, true
+		}
+		return "", false
+	})
+	if cfgErr == nil {
+		t.Fatal("invalid log level accepted")
 	}
-	got := logs()
-	if !strings.Contains(got, `"msg":"invalid configuration"`) || !strings.Contains(got, "invalid OWNSAND_AGENT_LOG_LEVEL") {
-		t.Fatalf("log = %q", got)
+	for _, tc := range []struct {
+		name       string
+		blockMkdir bool
+		blockOpen  bool
+		eventError error
+		wantEvent  string
+	}{
+		{name: "directory creation fails", blockMkdir: true, wantEvent: "could not create the service state directory"},
+		{name: "file open fails", blockOpen: true, wantEvent: "could not open agent.log"},
+		{name: "Event Log write fails", blockOpen: true, eventError: errors.New("write failed"), wantEvent: "could not open agent.log"},
+		{name: "file log works"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), rawPath)
+			path := filepath.Join(dir, "agent.log")
+			if tc.blockMkdir {
+				if err := os.WriteFile(dir, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.blockOpen {
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dispatch := func(name string, h svc.Handler) error {
+				if name != service.Name {
+					t.Fatalf("dispatched service %q, want %q", name, service.Name)
+				}
+				status := make(chan svc.Status, 8)
+				specific, exit := h.Execute(nil, make(chan svc.ChangeRequest), status)
+				if !specific || exit != exitUsage {
+					t.Fatalf("Execute = (%v, %d), want (true, %d)", specific, exit, exitUsage)
+				}
+				return nil
+			}
+			var events []string
+			writeEvent := func(message string) error {
+				events = append(events, message)
+				return tc.eventError
+			}
+			if code := runUnderServiceManager(config.Config{StateDir: dir}, cfgErr, dispatch, writeEvent, nil); code != exitUsage {
+				t.Fatalf("runUnderServiceManager = %d, want %d", code, exitUsage)
+			}
+			if tc.wantEvent != "" {
+				if len(events) != 1 || !strings.HasPrefix(events[0], tc.wantEvent) || !strings.Contains(events[0], wantSetting) {
+					t.Fatalf("events = %q, want one event with %q and %q", events, tc.wantEvent, wantSetting)
+				}
+				if strings.Contains(events[0], rawPath) || strings.Contains(events[0], rawLevel) {
+					t.Fatalf("event exposes an environment value: %q", events[0])
+				}
+				return
+			}
+			if len(events) != 0 {
+				t.Fatalf("events = %q with a working log file", events)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log := string(data)
+			if strings.Count(log, `"msg":"invalid configuration"`) != 1 || !strings.Contains(log, wantSetting) || strings.Contains(log, rawLevel) {
+				t.Fatalf("unexpected log contents: %s", log)
+			}
+		})
 	}
 }
 
@@ -108,38 +211,5 @@ func TestConfigErrorStateDir(t *testing.T) {
 		if got := configErrorStateDir(lookup); got != tc.want {
 			t.Errorf("%s: configErrorStateDir = %q, want %q", tc.name, got, tc.want)
 		}
-	}
-}
-
-// captureStderr replaces os.Stderr with a pipe until the test ends and
-// returns a function that returns what was written so far.
-func captureStderr(t *testing.T) func() string {
-	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	prev := os.Stderr
-	os.Stderr = w
-	var buf bytes.Buffer
-	done := make(chan struct{})
-	go func() {
-		io.Copy(&buf, r)
-		close(done)
-	}()
-	restored := false
-	restore := func() {
-		if !restored {
-			restored = true
-			os.Stderr = prev
-			w.Close()
-			<-done
-			r.Close()
-		}
-	}
-	t.Cleanup(restore)
-	return func() string {
-		restore()
-		return buf.String()
 	}
 }

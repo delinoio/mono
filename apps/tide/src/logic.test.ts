@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create } from "@bufbuild/protobuf";
+import { create, toBinary } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { describe, expect, test } from "@rstest/core";
 import {
@@ -11,6 +11,10 @@ import {
   RunnerState,
   WorkloadKind,
 } from "@delino/tide-protos/v1/common_pb";
+import {
+  CreateRunnerProfileRequestSchema,
+  UpdateRunnerProfileRequestSchema,
+} from "@delino/tide-protos/v1/runner_profile_pb";
 import { RequestSchema, RunnerSchema } from "@delino/tide-protos/v1/work_pb";
 import { WatchQueueEventKind } from "tide-sdk";
 import { nextSetupStep, SetupStep } from "./components/setup.tsx";
@@ -69,13 +73,72 @@ describe("configuration", () => {
     expect(REQUIRED_API_SCOPE).toBe("tide:use");
   });
 
-  test("rejects an origin with a path and the mock API in production", () => {
+  const pathError = "must be an origin without a path, query or fragment";
+
+  test.each([
+    ["https://api.test\\v1\\..", pathError],
+    ["https://api.test\\", pathError],
+    ["https:///api.test/v1/..", pathError],
+    ["https:api.test/v1/..", pathError],
+    ["https:/api.test/v1/..", pathError],
+    ["https:////api.test/v1/..", pathError],
+    ["https://api.test/v1/..", pathError],
+    ["https://api.test/v1", pathError],
+    ["https://api.test?x", pathError],
+    ["https://api.test?", pathError],
+    ["https://api.test#x", pathError],
+    ["https://api.test#", pathError],
+    ["https://u:p@api.test", "must not contain credentials"],
+    ["ftp://api.test", "must use http or https"],
+    ["nope", "is not a valid URL"],
+  ])("rejects %s for both configured origins", (value, error) => {
+    expect(() =>
+      readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production: false }),
+    ).toThrow(`PUBLIC_API_ORIGIN ${error}`);
     expect(() =>
       readConsoleConfig(
-        { PUBLIC_API_ORIGIN: "https://a.test/api" },
+        { PUBLIC_LOGTO_ENDPOINT: value, PUBLIC_LOGTO_APP_ID: "app" },
         { production: false },
       ),
-    ).toThrow();
+    ).toThrow(`PUBLIC_LOGTO_ENDPOINT ${error}`);
+  });
+
+  test.each([
+    ["https://api.test", "https://api.test"],
+    ["https://api.test/", "https://api.test"],
+    ["http://localhost:8080", "http://localhost:8080"],
+    ["HTTPS://api.test", "https://api.test"],
+    [" https://api.test/ ", "https://api.test"],
+  ])("normalizes %j to a bare origin", (value, origin) => {
+    const config = readConsoleConfig(
+      {
+        PUBLIC_API_ORIGIN: value,
+        PUBLIC_LOGTO_ENDPOINT: value,
+        PUBLIC_LOGTO_APP_ID: "app",
+      },
+      { production: false },
+    );
+    expect(config.apiOrigin).toBe(origin);
+    expect(config.logto?.endpoint).toBe(origin);
+  });
+
+  test.each(["", "   ", "\t\n"])(
+    "uses defaults for the blank value %j",
+    (value) => {
+      const config = readConsoleConfig(
+        {
+          PUBLIC_API_ORIGIN: value,
+          PUBLIC_LOGTO_ENDPOINT: value,
+          PUBLIC_LOGTO_APP_ID: "app",
+        },
+        { production: false },
+      );
+      expect(config.apiOrigin).toBe(DEFAULT_API_ORIGIN);
+      expect(config.logto).toBeUndefined();
+    },
+  );
+
+  test("enables the mock API only outside production", () => {
     expect(() =>
       readConsoleConfig({ PUBLIC_TIDE_MOCK_API: "true" }, { production: true }),
     ).toThrow();
@@ -158,6 +221,108 @@ describe("roles", () => {
 });
 
 describe("runner profile form", () => {
+  test.each([
+    {
+      field: "vcpuCount",
+      max: 1024,
+      oversized: 3_000_000_000,
+      requiredMessage: "Enter at least 1 vCPU.",
+      rangeMessage: "Enter a whole number of vCPUs from 1 to 1024.",
+    },
+    {
+      field: "memoryMib",
+      max: 16_777_216,
+      oversized: 1e19,
+      requiredMessage: "Enter the memory in MiB.",
+      rangeMessage: "Enter a whole number of MiB from 1 to 16777216.",
+    },
+    {
+      field: "diskGib",
+      max: 1_048_576,
+      oversized: 1e19,
+      requiredMessage: "Enter the disk size in GiB.",
+      rangeMessage: "Enter a whole number of GiB from 1 to 1048576.",
+    },
+  ] as const)(
+    "validates whole numbers and limits for $field",
+    ({ field, max, oversized, requiredMessage, rangeMessage }) => {
+      const form = { ...emptyProfileForm(), name: "linux-build" };
+      for (const value of [null, 0, -1]) {
+        expect(profileErrors({ ...form, [field]: value }, undefined)).toEqual({
+          [field]: requiredMessage,
+        });
+      }
+      for (const value of [1.5, max + 1, oversized]) {
+        expect(profileErrors({ ...form, [field]: value }, undefined)).toEqual({
+          [field]: rangeMessage,
+        });
+      }
+      for (const value of [1, max]) {
+        expect(profileErrors({ ...form, [field]: value }, undefined)).toEqual(
+          {},
+        );
+      }
+    },
+  );
+
+  test("compares the idle TTL only when both TTLs are valid", () => {
+    const form = { ...emptyProfileForm(), name: "linux-build", maxTtlHours: 1 };
+    expect(profileErrors({ ...form, idleTtlMinutes: 61 }, undefined)).toEqual({
+      idleTtlMinutes: "The idle TTL must not be longer than the maximum TTL.",
+    });
+    for (const idleTtlMinutes of [59.5, 60]) {
+      expect(profileErrors({ ...form, idleTtlMinutes }, undefined)).toEqual({});
+    }
+    for (const maxTtlHours of [null, 0, -1, 200]) {
+      expect(
+        profileErrors(
+          { ...form, maxTtlHours, idleTtlMinutes: 1_000_000 },
+          undefined,
+        ),
+      ).toEqual({
+        maxTtlHours: expect.any(String),
+      });
+    }
+    expect(profileErrors({ ...form, idleTtlMinutes: null }, undefined)).toEqual(
+      {
+        idleTtlMinutes: "Enter an idle TTL greater than zero.",
+      },
+    );
+  });
+
+  test.each([
+    { vcpuCount: 1, memoryMib: 1, diskGib: 1 },
+    { vcpuCount: 1024, memoryMib: 16_777_216, diskGib: 1_048_576 },
+  ])(
+    "serializes create and update at resource limits ($vcpuCount vCPUs)",
+    (resources) => {
+      const form = {
+        ...emptyProfileForm(),
+        name: "linux-build",
+        idleTtlMinutes: 59.5,
+        maxQueueWaitMinutes: 1.5,
+        ...resources,
+      };
+      expect(profileErrors(form, undefined)).toEqual({});
+      const profile = profileFromForm(form);
+      expect(() =>
+        toBinary(
+          CreateRunnerProfileRequestSchema,
+          create(CreateRunnerProfileRequestSchema, { profile }),
+        ),
+      ).not.toThrow();
+      expect(() =>
+        toBinary(
+          UpdateRunnerProfileRequestSchema,
+          create(UpdateRunnerProfileRequestSchema, {
+            profile,
+            updateMask: profileUpdateMask(emptyProfileForm(), form),
+          }),
+        ),
+      ).not.toThrow();
+    },
+  );
+
   test("requires workspace_path for DEV_SESSION profiles in the guest OS syntax", () => {
     const values = {
       ...emptyProfileForm(),
@@ -274,6 +439,13 @@ describe("queue view", () => {
     expect(view.requests.size).toBe(0);
   });
 
+  test("keeps the loading state when the stream fails before the first snapshot", () => {
+    const view = initialQueueView();
+    expect(
+      applyQueueEvent(view, { kind: QueueViewActionKind.StreamFailed }),
+    ).toBe(view);
+  });
+
   test("keeps the last state across a gap and replaces it with the new snapshot", () => {
     let view = initialQueueView();
     view = applyQueueEvent(view, {
@@ -339,6 +511,39 @@ describe("queue view", () => {
       request("low", RequestState.QUEUED, Priority.LOW, 0),
     ]).map((r) => r.requestId);
     expect(order).toEqual(["h-new", "n-old", "n-a", "n-b", "low"]);
+  });
+
+  test("orders waiting requests within the same millisecond by queue time", () => {
+    const later = create(RequestSchema, {
+      requestId: "n-a",
+      state: RequestState.QUEUED,
+      priority: Priority.NORMAL,
+      queuedAt: { seconds: 1_700_000_000n, nanos: 123_900_000 },
+    });
+    const earlier = create(RequestSchema, {
+      requestId: "n-b",
+      state: RequestState.QUEUED,
+      priority: Priority.NORMAL,
+      queuedAt: { seconds: 1_700_000_000n, nanos: 123_100_000 },
+    });
+
+    expect(
+      waitingInQueueOrder([later, earlier]).map((r) => r.requestId),
+    ).toEqual(["n-b", "n-a"]);
+  });
+
+  test("treats a missing queue timestamp as the Unix epoch", () => {
+    const missing = create(RequestSchema, {
+      requestId: "a-missing",
+      state: RequestState.QUEUED,
+      priority: Priority.NORMAL,
+    });
+    const order = waitingInQueueOrder([
+      request("b-epoch", RequestState.QUEUED),
+      missing,
+      request("c-before-epoch", RequestState.QUEUED, Priority.NORMAL, -1),
+    ]).map((r) => r.requestId);
+    expect(order).toEqual(["c-before-epoch", "a-missing", "b-epoch"]);
   });
 
   test("measures the queue wait until start, end or now", () => {

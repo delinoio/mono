@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
-import { BaseImage, SandboxState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  BaseImage,
+  DeviceState,
+  SandboxState,
+} from "@delino/ownsand-protos/v1/common_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { uuidV7 } from "../uuid.ts";
@@ -271,5 +276,40 @@ describe("mock snapshot list filters and paging", () => {
         }),
       ),
     ).toBe(Code.NotFound);
+  });
+});
+
+describe("mock device list paging", () => {
+  test("pages devices in ID order and applies the state filter before the page boundary", async () => {
+    const client = createClient(
+      DeviceService,
+      createMockTransport({ extraDevices: 199 }),
+    );
+    const first = await client.listDevices({ organizationId, pageSize: 200 });
+    const firstIds = first.devices.map((d) => d.deviceId);
+    expect(firstIds).toHaveLength(200);
+    expect(firstIds).toEqual([...firstIds].sort());
+    expect(first.nextPageToken).toBe(tokenOf(firstIds.at(-1)!));
+    const last = await client.listDevices({
+      organizationId,
+      pageSize: 200,
+      pageToken: first.nextPageToken,
+    });
+    expect(last.devices.map((d) => d.name)).toEqual(["Device 201"]);
+    expect(last.nextPageToken).toBe("");
+
+    const online = { organizationId, pageSize: 200, state: DeviceState.ONLINE };
+    const full = await client.listDevices(online);
+    expect(full.devices).toHaveLength(200);
+    expect(full.devices.every((d) => d.state === DeviceState.ONLINE)).toBe(
+      true,
+    );
+    expect(full.nextPageToken).toBe(tokenOf(last.devices[0]!.deviceId));
+    const empty = await client.listDevices({
+      ...online,
+      pageToken: full.nextPageToken,
+    });
+    expect(empty.devices).toHaveLength(0);
+    expect(empty.nextPageToken).toBe("");
   });
 });

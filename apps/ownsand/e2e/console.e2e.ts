@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code } from "@connectrpc/connect";
 import { describe, test } from "@e2e-dev/web";
 import { expect, type Screen } from "e2e";
 
@@ -104,6 +105,116 @@ describe("organizations", () => {
   });
 });
 
+describe("organization list errors", () => {
+  const refreshNotice = /The last refresh failed/;
+  const listName = "Your organizations";
+
+  async function failOnWindowFocus(code: Code) {
+    sessionStorage.setItem("ownsand-e2e-organization-list-error", String(code));
+    const now = Date.now;
+    // Treat the list as stale when React Query handles the visibility event.
+    Date.now = () => now() + 11_000;
+    try {
+      window.dispatchEvent(new Event("visibilitychange"));
+      // React Query checks staleness after resuming paused mutations.
+      await Promise.resolve();
+    } finally {
+      Date.now = now;
+    }
+    return true;
+  }
+
+  test("keeps loaded rows while retrying a failed refresh", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    const acme = screen.getByRole("link", "Acme Robotics Owner");
+    const northwind = screen.getByRole("link", "Northwind Labs Member");
+    await expect(northwind).toBeVisible();
+
+    await browser.evaluate(failOnWindowFocus, Code.Unavailable);
+
+    const notice = screen.getByText(refreshNotice);
+    await expect(notice).toBeVisible();
+    await expect(acme).toBeVisible();
+    await expect(northwind).toBeVisible();
+    await app.screenshot("organization-refresh-failed");
+
+    await browser.evaluate(() => {
+      sessionStorage.setItem("ownsand-e2e-organization-list-error", "hold");
+      return true;
+    });
+    const retry = screen.getByRole("button", "Try again");
+    await retry.tap();
+    await expect(retry).toHaveAttribute("disabled", "");
+    await expect(acme).toBeVisible();
+    await expect(northwind).toBeVisible();
+    await app.screenshot("organization-refresh-retrying");
+
+    await browser.evaluate(() => {
+      sessionStorage.removeItem("ownsand-e2e-organization-list-error");
+      window.dispatchEvent(new Event("ownsand-e2e-release-organization-list"));
+      return true;
+    });
+    await expect(notice).toBeHidden();
+    await expect(acme).toBeVisible();
+    await expect(northwind).toBeVisible();
+    await app.screenshot("organization-refresh-recovered");
+  });
+
+  test("replaces the list when the session ends during a refresh", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    const list = screen.getByRole("list", listName);
+    await expect(list).toBeVisible();
+
+    await browser.evaluate(failOnWindowFocus, Code.Unauthenticated);
+
+    await expect(
+      screen.getByText("Your session ended. Sign in again."),
+    ).toBeVisible();
+    await expect(
+      screen.getByRole("button", "Sign in with Delino"),
+    ).toBeVisible();
+    await expect(list).toBeHidden();
+    await expect(screen.getByText(refreshNotice)).toBeHidden();
+    await app.screenshot("organization-refresh-ended-session");
+  });
+
+  test("shows a full error when the first organization request fails", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate((code) => {
+      sessionStorage.setItem(
+        "ownsand-e2e-organization-list-error",
+        String(code),
+      );
+      return true;
+    }, Code.Unavailable);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+
+    await expect(
+      screen.getByText(
+        "OwnSand is not available right now. Try again in a moment.",
+      ),
+    ).toBeVisible();
+    await expect(screen.getByRole("button", "Try again")).toBeVisible();
+    await expect(screen.getByRole("list", listName)).toBeHidden();
+    await expect(screen.getByText(refreshNotice)).toBeHidden();
+    await app.screenshot("organization-first-load-failed");
+  });
+});
+
 describe("sandboxes", () => {
   test("lists active sandboxes and shows ended ones on request", async ({
     app,
@@ -121,6 +232,32 @@ describe("sandboxes", () => {
 
     await screen.getByRole("checkbox", "Show ended sandboxes").tap();
     await expect(screen.getByText("Deleted")).toBeVisible();
+
+    await screen.getByRole("checkbox", "Show ended sandboxes").tap();
+    await expect(screen.getByText("Deleted")).toBeHidden();
+    await expect(screen.getByText("Paused")).toBeVisible();
+    await expect(screen.getByRole("button", "Show more")).toBeHidden();
+  });
+
+  test("shows a field error when the sandbox disk exceeds 8589934591 GiB", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/sandboxes`);
+    await screen.getByRole("button", "Create sandbox").tap();
+
+    const dialog = screen.getByRole("dialog", "Create a sandbox");
+    const disk = dialog.getByLabel("Disk (GiB)");
+    await disk.fill("8589934592");
+    await dialog.getByRole("button", "Create").tap();
+
+    await expect(dialog).toBeVisible();
+    await expect(disk).toHaveAttribute("aria-invalid", "true");
+    await expect(
+      dialog.getByText("Enter a whole number of GiB from 1 to 8589934591."),
+    ).toBeVisible();
   });
 
   test("pauses and resumes a sandbox", async ({ app, screen }) => {
@@ -231,6 +368,16 @@ describe("devices", () => {
     await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
     await expect(screen.getByText("studio-mac").first()).toBeVisible();
     await expect(screen.getByText("build-box-1")).toBeHidden();
+
+    await screen.getByRole("link", "Sandboxes", { exact: true }).tap();
+    const sandbox = screen.getByRole("link", "0193a000…00a1");
+    await expect(sandbox).toBeHidden();
+    await screen.getByRole("checkbox", "Show ended sandboxes").tap();
+    await sandbox.tap();
+    await expect(screen.getByText("Deleted", { exact: true })).toBeVisible();
+    await expect(
+      screen.getByText("Device removed", { exact: true }),
+    ).toBeVisible();
   });
 
   test("asks before it revokes a pending enrollment token", async ({
@@ -314,6 +461,33 @@ describe("roles", () => {
     await expect(screen.getByRole("link", "API keys")).toBeHidden();
     await expect(screen.getByRole("link", "Enrollment tokens")).toBeHidden();
   });
+
+  test("lets a member leave from the Members page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(
+      screen.getByRole("link", "Northwind Labs Member"),
+    ).toBeVisible();
+    await app.open(`/orgs/${NORTHWIND}/members`);
+
+    await screen.getByRole("button", "Leave organization").tap();
+    await screen
+      .getByRole("alertdialog", "Leave this organization?")
+      .getByRole("button", "Leave organization")
+      .tap();
+
+    await expect(browser).toHaveURL("/");
+    await expect(
+      screen.getByRole("heading", "Organizations", { level: 1 }),
+    ).toBeVisible();
+    await expect(
+      screen.getByRole("link", "Northwind Labs Member"),
+    ).toBeHidden();
+  });
 });
 
 describe("billing", () => {
@@ -382,7 +556,68 @@ describe("billing", () => {
   });
 });
 
+describe("agent version policy", () => {
+  test("leaves the saved version in place when the admin leaves an unsaved edit", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/settings`);
+
+    const pin = screen.getByRole("radio", "Pin a version");
+    const version = screen.getByRole("textbox", "Pinned version");
+    await pin.tap();
+    await version.tap();
+    await browser.keyboard.type("1.4.2");
+    await screen.getByRole("button", "Save policy").tap();
+    await expect(screen.getByRole("region", "Notifications")).toContainText(
+      "The agent version policy is saved.",
+    );
+
+    await screen.getByRole("radio", "Hold updates").tap();
+    await expect(version).toBeHidden();
+    await screen.getByRole("link", "Devices", { exact: true }).tap();
+    await screen.getByRole("link", "Settings", { exact: true }).tap();
+
+    await expect(pin).toHaveAttribute("aria-checked", "true");
+    await expect(version).toHaveValue("1.4.2");
+  });
+});
+
 describe("invitations", () => {
+  test("hides the seeded pending invitation from Members at expiry", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    const start = Date.UTC(2026, 0, 1, 12);
+    const expiry = start + 6 * 24 * 60 * 60 * 1000;
+    await browser.addInitScript((ms) => {
+      Date.now = () => ms;
+    }, start);
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/members`);
+
+    const invitations = screen.getByRole("region", "Invitations");
+    const revoke = invitations.getByRole("button", /^Revoke/);
+    await expect(revoke).toBeVisible();
+    await app.screenshot("invitation-before-expiry");
+
+    await screen.getByRole("link", "Devices", { exact: true }).tap();
+    await browser.evaluate((ms) => {
+      Date.now = () => ms;
+      return null;
+    }, expiry);
+    await screen.getByRole("link", "Members", { exact: true }).tap();
+
+    await expect(invitations.getByText("No pending invitations")).toBeVisible();
+    await expect(revoke).toBeHidden();
+    await app.screenshot("invitation-at-expiry");
+  });
+
   test("accepts an invitation link through sign-in and removes the secret from the address", async ({
     app,
     screen,
@@ -400,7 +635,7 @@ describe("invitations", () => {
     );
   });
 
-  test("shows the error of a failed acceptance and keeps the accept button", async ({
+  test("accepts a different link opened on the same page after an invitation error", async ({
     app,
     screen,
     browser,
@@ -412,6 +647,16 @@ describe("invitations", () => {
     await expect(screen.getByText("you are already a member")).toBeVisible();
     await expect(screen.getByRole("button", "Accept invitation")).toBeVisible();
     await expect(browser).toHaveURL("/invitations/accept");
+
+    await browser.evaluate((secret) => {
+      window.location.hash = `secret=${secret}`;
+      return true;
+    }, INVITATION_SECRET);
+    await expect(screen.getByText("you are already a member")).toBeHidden();
+    await expect(browser).toHaveURL("/invitations/accept");
+    await screen.getByRole("button", "Accept invitation").tap();
+
+    await expect(browser).toHaveURL(`/orgs/${CONTOSO}/sandboxes`);
   });
 });
 
@@ -647,6 +892,53 @@ describe("narrow screens", () => {
   });
 });
 
+describe("organization switcher popup width", () => {
+  for (const width of [390, 240]) {
+    test(`fits a ${width}px trigger within the popup width limit`, async ({
+      app,
+      screen,
+      browser,
+    }) => {
+      const viewportWidth = 390;
+      const popupWidthLimit = viewportWidth - 16;
+      await browser.setViewport({ width: viewportWidth, height: 844 });
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(`/orgs/${ACME}/sandboxes`);
+
+      const trigger = screen.getByRole("combobox", "Organization");
+      await expect(trigger).toBeVisible();
+      const triggerWidth = await browser.evaluate((width) => {
+        const element = document.querySelector<HTMLElement>(
+          '.org-switcher [role="combobox"]',
+        );
+        if (!element) throw new Error("Organization trigger is missing");
+        element.style.width = `${width}px`;
+        element.style.minWidth = `${width}px`;
+        return element.offsetWidth;
+      }, width);
+      expect(triggerWidth).toBe(width);
+
+      await trigger.tap();
+      await expect(screen.getByRole("listbox")).toBeVisible();
+      await expect(screen.getByRole("option", "Northwind Labs")).toBeVisible();
+      const popupWidth = await browser.evaluate(() => {
+        const popup = document.querySelector<HTMLElement>(
+          ".dui-select-content",
+        );
+        if (!popup) throw new Error("Organization popup is missing");
+        // offsetWidth measures the border box during the opening animation.
+        return popup.offsetWidth;
+      });
+      await app.screenshot(`organization-popup-trigger-${width}`);
+      expect(popupWidth).toBeLessThanOrEqual(popupWidthLimit);
+      expect(popupWidth).toBeGreaterThanOrEqual(
+        Math.min(triggerWidth, popupWidthLimit),
+      );
+    });
+  }
+});
+
 // A name that is one 100-character word, the longest the console accepts. It
 // has no space to break at, so it must wrap inside its container.
 const LONG_NAME_PREFIX = "LONGNAME_";
@@ -753,6 +1045,7 @@ describe("long names", () => {
       expect(m.right).toBeLessThanOrEqual(m.viewportWidth);
       // The whole name stays readable: it wraps instead of being cut off.
       await expect(screen.getByRole("option", LONG_NAME)).toBeVisible();
+      await app.screenshot(`organization-popup-long-option-${width}`);
       await browser.keyboard.press("Escape");
     }
   });

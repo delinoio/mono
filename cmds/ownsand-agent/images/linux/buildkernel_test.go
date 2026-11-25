@@ -14,9 +14,10 @@ import (
 
 // stubKernelDocker replaces docker for build-kernel.sh. It records its
 // arguments, one per line, in $STUB_LOG_DIR/docker.args and writes the kernel
-// into the /out mount like the container would, so the script runs to its
-// end without Docker.
+// and config using the production copy commands against the host output
+// directory, so the script runs without Docker.
 const stubKernelDocker = `#!/usr/bin/env bash
+set -euo pipefail
 printf '%s\n' "$@" >"$STUB_LOG_DIR/docker.args"
 out_dir=""
 out_name=""
@@ -32,13 +33,45 @@ for arg in "$@"; do
   fi
   prev="$arg"
 done
-printf 'kernel' >"$out_dir/$out_name"
+built=vmlinux
+OUT_NAME="$out_name"
+cd "$STUB_LOG_DIR"
+printf 'kernel' >"$built"
+printf 'config' >.config
+if [ "${STUB_KERNEL_LATE_DIRECTORY:-}" = yes ]; then
+  mkdir "$out_dir/$out_name"
+  printf 'keep' >"$out_dir/$out_name/sentinel"
+fi
+cp() {
+  # Model the container's GNU cp -T on both Linux and macOS hosts.
+  if [ "$1" = -T ]; then
+    shift 2
+    if [ -d "$out_dir/${2#/out/}" ]; then
+      echo "output path is a directory: $2" >&2
+      return 1
+    fi
+  fi
+  command cp "$1" "$out_dir/${2#/out/}"
+}
+copies="$(printf '%s\n' "${!#}" | sed -n '/^    cp /p')"
+[ -n "$copies" ]
+eval "$copies"
 `
 
 // stubShasum replaces shasum, which a Linux host may not have; the script
 // only prints the checksum of the kernel it built.
 const stubShasum = `#!/usr/bin/env bash
-echo "0000000000000000000000000000000000000000000000000000000000000000  $3"
+echo "0000000000000000000000000000000000000000000000000000000000000000  ${3:--}"
+`
+
+const stubFailedShasum = "#!/usr/bin/env bash\nexit 3\n"
+
+const fixtureKernelSHA256 = "6923dd1bc0460082c5d55a831908c24a282860b7f1cd6c2b79cf1bc8857c639c"
+
+const stubSha256sum = `#!/usr/bin/env bash
+IFS= read -r input || :
+[ "$#" -eq 0 ] && [ "$input" = kernel ] || exit 4
+printf '%s  -\n' '` + fixtureKernelSHA256 + `'
 `
 
 type kernelBuild struct {
@@ -81,13 +114,22 @@ func newKernelBuild(t *testing.T) *kernelBuild {
 			t.Fatal(err)
 		}
 	}
+	for _, name := range []string{"bash", "basename", "cp", "cut", "dirname", "mkdir", "sed"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(path, filepath.Join(b.stub, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return b
 }
 
 // run runs build-kernel.sh from the working directory with the given
 // OWNSAND_KERNEL_CACHE (unset when cache is nil) and returns its combined
 // output and exit error.
-func (b *kernelBuild) run(cache *string) (string, error) {
+func (b *kernelBuild) run(cache *string, extra ...string) (string, error) {
 	b.t.Helper()
 	cmd := exec.Command("bash", b.script, "amd64", "./vmlinux")
 	cmd.Dir = b.work
@@ -99,12 +141,13 @@ func (b *kernelBuild) run(cache *string) (string, error) {
 	}
 	cmd.Env = append(cmd.Env,
 		"HOME="+b.home,
-		"PATH="+b.stub+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"PATH="+b.stub,
 		"STUB_LOG_DIR="+b.logs,
 	)
 	if cache != nil {
 		cmd.Env = append(cmd.Env, "OWNSAND_KERNEL_CACHE="+*cache)
 	}
+	cmd.Env = append(cmd.Env, extra...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -233,5 +276,83 @@ func TestBuildKernelCachePathThatIsAFileFailsBeforeDocker(t *testing.T) {
 		if args := b.dockerArgs(); args != nil {
 			t.Fatalf("docker ran with cache %q: %q", cache, args)
 		}
+	}
+}
+
+func TestBuildKernelRejectsDirectoryAtOutput(t *testing.T) {
+	for _, when := range []string{"existing", "during build"} {
+		t.Run(when, func(t *testing.T) {
+			b := newKernelBuild(t)
+			path := filepath.Join(b.work, "vmlinux")
+			var env []string
+			if when == "existing" {
+				if err := os.Mkdir(path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "sentinel"), []byte("keep"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				env = append(env, "STUB_KERNEL_LATE_DIRECTORY=yes")
+			}
+			out, err := b.run(nil, env...)
+			if err == nil || !strings.Contains(out, "./vmlinux") || strings.Contains(out, "wrote ") {
+				t.Fatalf("want a failed build naming ./vmlinux, got %v\n%s", err, out)
+			}
+			if ran := b.dockerArgs() != nil; ran != (when == "during build") {
+				t.Fatalf("docker ran = %t with %s directory", ran, when)
+			}
+			entries, err := os.ReadDir(path)
+			if err != nil || len(entries) != 1 || entries[0].Name() != "sentinel" {
+				t.Fatalf("output directory contents changed: %v, %v", entries, err)
+			}
+			data, err := os.ReadFile(filepath.Join(path, "sentinel"))
+			if err != nil || string(data) != "keep" {
+				t.Fatalf("sentinel = %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestBuildKernelChecksumTools(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		shasum   string
+		fallback bool
+		want     string
+	}{
+		{"preferred tool fails", stubFailedShasum, true, "could not compute SHA-256 for ./vmlinux"},
+		{"both tools absent", "", false, "install shasum or sha256sum"},
+		{"fallback succeeds", "", true, "wrote ./vmlinux (" + fixtureKernelSHA256 + ")"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newKernelBuild(t)
+			path := filepath.Join(b.stub, "shasum")
+			if tc.shasum == "" {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(path, []byte(tc.shasum), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.fallback {
+				if err := os.WriteFile(filepath.Join(b.stub, "sha256sum"), []byte(stubSha256sum), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := b.run(nil)
+			wantSuccess := tc.shasum == "" && tc.fallback
+			if (err == nil) != wantSuccess || strings.Contains(out, "wrote ") != wantSuccess || !strings.Contains(out, tc.want) {
+				t.Fatalf("want %q (success = %t), got %v\n%s", tc.want, wantSuccess, err, out)
+			}
+			if tc.fallback {
+				for name, want := range map[string]string{"vmlinux": "kernel", "vmlinux.config": "config"} {
+					got, err := os.ReadFile(filepath.Join(b.work, name))
+					if err != nil || string(got) != want {
+						t.Fatalf("%s = %q, %v, want %q", name, got, err, want)
+					}
+				}
+			}
+		})
 	}
 }

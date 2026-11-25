@@ -5,12 +5,16 @@ import { PasswordInput } from "delino-ui/password-input";
 import { Button } from "delino-ui/button";
 import { MemberService } from "@delino/tide-protos/v1/member_pb";
 import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { TopBar } from "../components/shell.tsx";
 import { ErrorNotice, PageHeader } from "../components/ui.tsx";
-import { secretFromInput, takeSecretFromAddress } from "../invitation.ts";
-import { orgPath, RouteId, useRouter } from "../router.tsx";
+import {
+  secretFromFragment,
+  secretFromInput,
+  takeSecretFromAddress,
+} from "../invitation.ts";
+import { orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
 
 /**
  * Route `invitation`: accept an invitation secret as the signed-in user. The
@@ -20,14 +24,35 @@ import { orgPath, RouteId, useRouter } from "../router.tsx";
 export function InvitationPage() {
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
-  const [value, setValue] = useState(
-    () => secretFromInput(window.location.hash) ?? "",
-  );
+  const [value, setValue] = useState("");
   const [inputError, setInputError] = useState<string>();
-  const accept = useMutation(MemberService.method.acceptInvitation);
+  const currentAttempt = useRef(0);
+  const accept = useMutation(MemberService.method.acceptInvitation, {
+    // Joining changes the organization list even if the user has moved on.
+    onSuccess: () => invalidateServices(queryClient, OrganizationService),
+  });
+  const resetAccept = accept.reset;
   useEffect(() => {
-    takeSecretFromAddress(window.location, window.history);
-  }, []);
+    const consumeInvitation = () => {
+      if (parseRoute(window.location.pathname).id !== RouteId.Invitation) {
+        return;
+      }
+      const secret = takeSecretFromAddress(window.location, window.history);
+      if (secret === undefined) {
+        return;
+      }
+      currentAttempt.current += 1;
+      setValue(secret);
+      setInputError(undefined);
+      resetAccept();
+    };
+    window.addEventListener("hashchange", consumeInvitation);
+    consumeInvitation();
+    return () => {
+      window.removeEventListener("hashchange", consumeInvitation);
+      currentAttempt.current += 1;
+    };
+  }, [resetAccept]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -36,10 +61,18 @@ export function InvitationPage() {
       setInputError("Paste the invitation link or the secret.");
       return;
     }
+    const attempt = ++currentAttempt.current;
     try {
       const res = await accept.mutateAsync({ invitationSecret: secret });
+      // The address can change before React unmounts or hashchange runs.
+      if (
+        attempt !== currentAttempt.current ||
+        parseRoute(window.location.pathname).id !== RouteId.Invitation ||
+        secretFromFragment(window.location.hash) !== undefined
+      ) {
+        return;
+      }
       setValue("");
-      await invalidateServices(queryClient, OrganizationService);
       navigate(orgPath(RouteId.Overview, res.organization!.organizationId), {
         replace: true,
       });
@@ -62,6 +95,7 @@ export function InvitationPage() {
             toggleLabel="Show invitation"
             value={value}
             onValueChange={(v: string) => {
+              currentAttempt.current += 1;
               setValue(v);
               setInputError(undefined);
             }}

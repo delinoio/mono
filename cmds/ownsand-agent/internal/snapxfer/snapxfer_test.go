@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -70,7 +71,9 @@ func TestExportImportRoundTrip(t *testing.T) {
 	b := newBucket(t)
 	tr := &Transfer{HTTP: b.srv.Client(), URLs: b, Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)), TempDir: t.TempDir()}
 	src := t.TempDir()
-	os.WriteFile(filepath.Join(src, "disk"), []byte(strings.Repeat("snapshot-", 5000)), 0o600)
+	const file = "disk/read-only/data"
+	data := strings.Repeat("snapshot-", 5000)
+	makeProcessSnapshot(t, src, data)
 	parts, size, err := tr.Export(context.Background(), "snap", src, 4096)
 	if err != nil {
 		t.Fatal(err)
@@ -79,17 +82,78 @@ func TestExportImportRoundTrip(t *testing.T) {
 		t.Fatalf("parts %d size %d url requests %d", len(parts), size, b.requests)
 	}
 	dst := filepath.Join(t.TempDir(), "content")
+	t.Cleanup(func() { removeTestTree(t, dst) })
 	if err := tr.Import(context.Background(), "snap", parts, dst); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := os.ReadFile(filepath.Join(dst, "disk"))
-	if string(got) != strings.Repeat("snapshot-", 5000) {
-		t.Fatal("imported content differs")
+	if got, err := os.ReadFile(filepath.Join(dst, file)); err != nil || string(got) != data {
+		t.Fatalf("imported content = (%d bytes, %v), want the original bytes", len(got), err)
+	}
+	// The process runtime restores a snapshot by copying its disk directory.
+	restored := filepath.Join(t.TempDir(), "restored")
+	direct := filepath.Join(t.TempDir(), "direct")
+	t.Cleanup(func() {
+		removeTestTree(t, restored)
+		removeTestTree(t, direct)
+	})
+	if err := fsutil.CopyTree(filepath.Join(dst, "disk"), restored); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsutil.CopyTree(filepath.Join(src, "disk"), direct); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(restored, "read-only", "data")); err != nil || string(got) != data {
+		t.Fatalf("restored content = (%d bytes, %v), want the original bytes", len(got), err)
+	}
+	if runtime.GOOS != "windows" {
+		for name, want := range map[string]os.FileMode{"read-only": 0o555, "read-only/data": 0o664} {
+			requireMode(t, filepath.Join(restored, name), want)
+			requireMode(t, filepath.Join(direct, name), want)
+		}
 	}
 	// A part whose hash differs from the command is rejected.
 	parts[2].Sha256[0] ^= 1
 	if err := tr.Import(context.Background(), "snap", parts, filepath.Join(t.TempDir(), "c2")); err == nil {
 		t.Fatal("tampered hash accepted")
+	}
+}
+
+func makeProcessSnapshot(t *testing.T, root, data string) {
+	t.Helper()
+	t.Cleanup(func() { removeTestTree(t, root) })
+	dir := filepath.Join(root, "disk", "read-only")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "data")
+	if err := os.WriteFile(file, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(file, 0o664); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func removeTestTree(t *testing.T, root string) {
+	t.Helper()
+	if err := fsutil.RemoveAll(root); err != nil {
+		t.Errorf("remove test tree: %v", err)
+	}
+}
+
+func requireMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Errorf("%s: mode %04o, want %04o", path, got, want)
 	}
 }
 
@@ -683,7 +747,14 @@ func (c *cancelOnEOF) Read(p []byte) (int, error) {
 }
 
 func TestImportStopsWhenTheContextIsDone(t *testing.T) {
-	b, parts := storeSnapshot(t, strings.Repeat("snapshot-", 5000), 4096)
+	b := newBucket(t)
+	src := t.TempDir()
+	makeProcessSnapshot(t, src, strings.Repeat("snapshot-", 5000))
+	export := &Transfer{HTTP: b.srv.Client(), URLs: b, Logger: quietLogger(), TempDir: t.TempDir()}
+	parts, _, err := export.Export(context.Background(), "snap", src, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name string
 		run  func(cancel context.CancelFunc) *Transfer
@@ -707,6 +778,7 @@ func TestImportStopsWhenTheContextIsDone(t *testing.T) {
 			tr := tc.run(cancel)
 			tr.TempDir = t.TempDir()
 			base := t.TempDir()
+			t.Cleanup(func() { removeTestTree(t, base) })
 			err := tr.Import(ctx, "snap", parts, filepath.Join(base, "content"))
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("err = %v, want context.Canceled", err)
