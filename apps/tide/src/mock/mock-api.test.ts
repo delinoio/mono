@@ -168,6 +168,34 @@ test("an agent integration name conflict preserves the integration list and audi
   expect(await audit.listAuditEvents({ organizationId })).toEqual(auditBefore);
 });
 
+test("creating an integration without credentials preserves the integration list and audit history", async () => {
+  const transport = createMockTransport();
+  const integrations = createClient(AgentIntegrationService, transport);
+  const audit = createClient(AuditService, transport);
+  const organizationId = MOCK_IDS.acme;
+  const listBefore = structuredClone(
+    await integrations.listAgentIntegrations({ organizationId }),
+  );
+  const auditBefore = structuredClone(
+    await audit.listAuditEvents({ organizationId }),
+  );
+
+  await expect(
+    integrations.createAgentIntegration({
+      organizationId,
+      vendor: AgentVendor.CLAUDE_CODE,
+      name: "claude-without-credentials",
+    }),
+  ).rejects.toMatchObject({
+    code: Code.InvalidArgument,
+    rawMessage: "credentials are required",
+  });
+  expect(await integrations.listAgentIntegrations({ organizationId })).toEqual(
+    listBefore,
+  );
+  expect(await audit.listAuditEvents({ organizationId })).toEqual(auditBefore);
+});
+
 test.each(["claude-team", "claude-renamed"])(
   "an integration can update its name to %s",
   async (name) => {
@@ -179,13 +207,17 @@ test.each(["claude-team", "claude-renamed"])(
       organizationId: MOCK_IDS.acme,
       agentIntegrationId: MOCK_IDS.claudeIntegration,
     };
+    const before = structuredClone(await integrations.getAgentIntegration(id));
     const { integration } = await integrations.updateAgentIntegration({
       ...id,
       name,
       updateMask: { paths: ["name"] },
     });
 
-    expect(integration).toMatchObject({ name });
+    expect(integration).toMatchObject({
+      name,
+      credentials: before.integration?.credentials,
+    });
     expect((await integrations.getAgentIntegration(id)).integration).toEqual(
       integration,
     );
@@ -228,6 +260,17 @@ test("a rejected combined update preserves the integration and its audit history
     };
 
     clock.mockReturnValue(updatedAt);
+    await expect(
+      integrations.updateAgentIntegration(update),
+    ).rejects.toMatchObject({
+      code: Code.InvalidArgument,
+      rawMessage: "credentials are required",
+    });
+    expect(await integrations.getAgentIntegration(id)).toEqual(before);
+    expect(await audit.listAuditEvents({ organizationId })).toEqual(
+      auditBefore,
+    );
+
     await expect(
       integrations.updateAgentIntegration({
         ...update,
