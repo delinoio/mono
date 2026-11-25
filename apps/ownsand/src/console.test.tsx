@@ -62,6 +62,10 @@ import {
   MockBillingState,
 } from "./mock/mock-api.ts";
 import { holdingTransport as holdPagedTransport } from "./test-support.tsx";
+import {
+  mockSandboxTransition,
+  SandboxTransitionOutcome,
+} from "../e2e/sandbox-transition-mock.ts";
 
 /** The seeded Acme invitation, which the mock user cannot accept: already a member. */
 const MOCK_ACME_INVITATION_SECRET = "osi_7f3a_unused";
@@ -1488,6 +1492,127 @@ describe("cached lists after a mutation that changes another service", () => {
       });
     }
   });
+});
+
+describe("sandbox transition notices", () => {
+  function expectToast(type: "info" | "success" | "error", message: string) {
+    return waitFor(() => {
+      expect(
+        document.querySelector(`.dui-toast[data-type="${type}"]`)?.textContent,
+      ).toContain(message);
+    });
+  }
+
+  for (const {
+    action,
+    nextAction,
+    sandboxId,
+    initialState,
+    finalState,
+    completion,
+  } of [
+    {
+      action: "Pause",
+      nextAction: "Resume",
+      sandboxId: MOCK_IDS.runningSandbox,
+      initialState: "Running",
+      finalState: "Paused",
+      completion: "The sandbox is paused.",
+    },
+    {
+      action: "Resume",
+      nextAction: "Pause",
+      sandboxId: MOCK_IDS.pausedSandbox,
+      initialState: "Paused",
+      finalState: "Running",
+      completion: "The sandbox is running.",
+    },
+  ]) {
+    const path = `/orgs/${MOCK_IDS.acme}/sandboxes/${sandboxId}`;
+    const method = `${action}Sandbox`;
+    const requested = `${action} requested. Check the sandbox status.`;
+
+    test(`reports ${action} completion when the mutation confirms the transition`, async () => {
+      renderConsole(path);
+      fireEvent.click(await screen.findByRole("button", { name: action }));
+      await expectToast("success", completion);
+      expect(screen.queryByText(requested)).toBeNull();
+      expect(screen.getByText(finalState)).toBeTruthy();
+      expect(screen.getByRole("button", { name: nextAction })).toBeTruthy();
+    });
+
+    for (const outcome of [
+      SandboxTransitionOutcome.Pending,
+      SandboxTransitionOutcome.Missing,
+    ]) {
+      test(`reports ${action} as requested with a ${outcome} transition response`, async () => {
+        const mock = mockSandboxTransition(createMockTransport(), outcome);
+        const { transport, calls } = countingTransport(mock);
+        renderConsole(path, { transport });
+
+        fireEvent.click(await screen.findByRole("button", { name: action }));
+
+        await expectToast("info", requested);
+        expect(screen.queryByText(completion)).toBeNull();
+        expect(calls.GetSandbox).toBe(2);
+        expect(screen.getByText(initialState)).toBeTruthy();
+        expect(screen.getByRole("button", { name: action })).toBeTruthy();
+      });
+    }
+
+    test(`keeps the existing error when ${action} is rejected`, async () => {
+      const mock = mockSandboxTransition(
+        createMockTransport(),
+        SandboxTransitionOutcome.Rejected,
+      );
+      const { transport, calls } = countingTransport(mock);
+      renderConsole(path, { transport });
+
+      const button = await screen.findByRole("button", { name: action });
+      fireEvent.click(button);
+
+      await expectToast(
+        "error",
+        "OwnSand is not available right now. Try again in a moment.",
+      );
+      expect(screen.queryByText(completion)).toBeNull();
+      expect(screen.queryByText(requested)).toBeNull();
+      expect(calls.GetSandbox).toBe(1);
+      expect(button.hasAttribute("data-pending")).toBe(false);
+    });
+
+    test(`sends one ${action} through the mutation and refresh`, async () => {
+      const mock = mockSandboxTransition(
+        createMockTransport(),
+        SandboxTransitionOutcome.Pending,
+      );
+      let holdRefresh = false;
+      const { transport, calls, seen } = holdPagedTransport(
+        [method, "GetSandbox"],
+        (name) => name === method || holdRefresh,
+        mock,
+      );
+      renderConsole(path, { transport });
+      const button = await screen.findByRole("button", { name: action });
+
+      fireEvent.click(button);
+      fireEvent.click(button);
+      await waitFor(() => expect(calls[method]).toHaveLength(1));
+      expect(button.getAttribute("aria-busy")).toBe("true");
+
+      holdRefresh = true;
+      await act(async () => calls[method]![0]!.settle());
+      await waitFor(() => expect(calls.GetSandbox).toHaveLength(1));
+      expect(button.getAttribute("aria-busy")).toBe("true");
+      expect(screen.queryByText(requested)).toBeNull();
+      fireEvent.click(button);
+
+      await act(async () => calls.GetSandbox![0]!.settle());
+      await expectToast("info", requested);
+      expect(button.hasAttribute("data-pending")).toBe(false);
+      expect(seen[method]).toBe(1);
+    });
+  }
 });
 
 /**
