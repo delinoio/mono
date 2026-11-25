@@ -6,7 +6,6 @@ import { Button, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { type FormEvent, useState } from "react";
-import { invalidateServices } from "../api.ts";
 import { TopBar } from "../components/shell.tsx";
 import {
   Empty,
@@ -17,7 +16,7 @@ import {
 } from "../components/ui.tsx";
 import { labels } from "../format.ts";
 import { secretFromInput, SECRET_PARAM } from "../invitation.ts";
-import { useOrganizations } from "../organizations.ts";
+import { refreshOrganizations, useOrganizations } from "../organizations.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
 /** Route `organizations`: the organization list, creation and invitations. */
@@ -119,7 +118,7 @@ export function OrganizationsPage() {
           // The list and the switcher refresh in the background. The console
           // opens the new organization from the `CreateOrganization`
           // response instead of waiting for the list refetch.
-          void invalidateServices(queryClient, OrganizationService);
+          void refreshOrganizations(queryClient);
           // A request of a dismissed opening neither closes the form of a
           // later opening nor moves the user away from the page they went to.
           if (!opening.isCurrent()) return;

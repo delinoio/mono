@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useInfiniteQuery } from "@connectrpc/connect-query";
+import {
+  createConnectQueryKey,
+  useInfiniteQuery,
+} from "@connectrpc/connect-query";
 import type { Organization } from "@delino/ownsand-protos/v1/organization_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
+import type { QueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
-import { LIST_ORGANIZATIONS_REQUEST } from "./api.ts";
+import { invalidateServices, LIST_ORGANIZATIONS_REQUEST } from "./api.ts";
 import {
   type FollowedPages,
   FOLLOW_ALL_PAGES_OPTIONS,
   uniqueRows,
   useFollowAllPages,
 } from "./pagination.ts";
+
+/** Refreshes the shared organization list after the caller gains membership. */
+export async function refreshOrganizations(queryClient: QueryClient) {
+  // Invalidation reuses an in-flight request when the query has no data.
+  // Cancel that request so it cannot supply the pre-mutation membership.
+  await queryClient.cancelQueries({
+    queryKey: createConnectQueryKey({
+      schema: OrganizationService.method.listOrganizations,
+      cardinality: "infinite",
+    }),
+    predicate: (query) => query.state.data === undefined,
+  });
+  await invalidateServices(queryClient, OrganizationService);
+}
 
 /** The organizations of the caller, as the organization list and the switcher show them. */
 export interface OrganizationsResult extends FollowedPages {

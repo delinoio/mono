@@ -84,8 +84,9 @@ describe("create organization navigation", () => {
   });
 
   test("a failed creation keeps the dialog with its error and a retry works", async () => {
-    const { transport, calls } = holdingTransport(["CreateOrganization"]);
+    const { transport, calls, seen } = holdingTransport(["CreateOrganization"]);
     const dialog = await openAndName(transport, "Initech");
+    const listRequests = seen.ListOrganizations;
     await submit(dialog);
     await act(async () => {
       calls.CreateOrganization?.[0]?.settle(
@@ -95,6 +96,7 @@ describe("create organization navigation", () => {
     await settle(60);
     expect(window.location.pathname).toBe("/");
     expect(dialog.querySelector(".notice-error")).not.toBeNull();
+    expect(seen.ListOrganizations).toBe(listRequests);
     expect(
       (
         within(dialog).getByRole("button", {

@@ -73,6 +73,16 @@ function holdCredentialRequest(name: "create" | "list") {
   });
 }
 
+async function holdOrganizationRefreshStep(step: "list" | "mutation") {
+  const key = `ownsand-e2e-organization-refresh-${step}`;
+  if (sessionStorage.getItem(key) !== "hold") return;
+  await new Promise<void>((resolve) => {
+    window.addEventListener(`${key}-release`, () => resolve(), { once: true });
+    sessionStorage.setItem(key, "held");
+  });
+  sessionStorage.setItem(key, "released");
+}
+
 export function createMockTransport(): Transport {
   const methodName = sessionStorage.getItem("ownsand-e2e-paged-list");
   const refreshList = sessionStorage.getItem("ownsand-e2e-refresh-list");
@@ -173,6 +183,31 @@ export function createMockTransport(): Transport {
       }
       if (method.name === "ListOrganizations") {
         await failOrganizationListIfConfigured();
+        if (
+          sessionStorage.getItem("ownsand-e2e-organization-refresh") === "true"
+        ) {
+          const { pageToken = "" } = input as { pageToken?: string };
+          // Capture the rows before holding delivery. Ignore cancellation of
+          // the held response to show that its late arrival cannot win.
+          const response = await base.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+          signal?.throwIfAborted();
+          recordToken("ownsand-e2e-organization-refresh-tokens", pageToken);
+          await holdOrganizationRefreshStep("list");
+          return response;
+        }
+      }
+      if (
+        method.name === "CreateOrganization" ||
+        method.name === "AcceptInvitation"
+      ) {
+        await holdOrganizationRefreshStep("mutation");
       }
       if (
         pageInvitations &&
