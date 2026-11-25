@@ -96,9 +96,8 @@ func (*Vendor) Source() work.Source        { return work.SourceOpenAICodex }
 func (*Vendor) PushesDemand() {}
 
 // Watch is never called for a Pusher; it waits for ctx.
-func (*Vendor) Watch(ctx context.Context, _ *agent.Watch) error {
+func (*Vendor) Watch(ctx context.Context, _ *agent.Watch) {
 	<-ctx.Done()
-	return ctx.Err()
 }
 
 // api returns a client with the integration's OpenAI API key. The key

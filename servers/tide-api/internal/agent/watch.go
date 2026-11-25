@@ -235,35 +235,37 @@ func (h *Hub) syncWatchers(ctx context.Context) {
 	}
 }
 
-// watch runs the watch sessions of one integration until ctx ends. After a
-// session that failed or ended unexpectedly, it waits with exponential
-// backoff (BackoffMin to BackoffMax) and counts a reconnect; after a
-// scheduled end, it lists again at once. A session that ran longer than
-// BackoffMax resets the backoff.
 func (h *Hub) watch(ctx context.Context, v Vendor, in integration.Integration) {
 	log := h.log.With(slog.String("organization_id", in.OrganizationID), slog.String("agent_integration_id", in.ID), slog.String("vendor", VendorLabel(in.Vendor)))
 	log.InfoContext(ctx, "vendor_watch_started")
-	w := &Watch{h: h, v: v, In: in, Logger: log}
-	backoff := h.timing.BackoffMin
+	v.Watch(ctx, &Watch{h: h, v: v, In: in, Logger: log})
+}
+
+// Run reconnects an integration's watch sessions until ctx ends. A nil
+// result means a scheduled end and starts the next session immediately.
+// An error counts as a reconnect and applies exponential backoff.
+func (w *Watch) Run(ctx context.Context, session func() error) {
+	timing := w.h.timing
+	backoff := timing.BackoffMin
 	for ctx.Err() == nil {
 		began := time.Now()
-		err := v.Watch(ctx, w)
+		err := session()
 		if ctx.Err() != nil {
 			return
 		}
-		if time.Since(began) > h.timing.BackoffMax {
-			backoff = h.timing.BackoffMin
+		if time.Since(began) > timing.BackoffMax {
+			backoff = timing.BackoffMin
 		}
 		if err == nil {
-			log.InfoContext(ctx, "vendor_watch_reconnect", slog.String("cause", "scheduled"))
-			backoff = h.timing.BackoffMin
+			w.Logger.InfoContext(ctx, "vendor_watch_reconnect", slog.String("cause", "scheduled"))
+			backoff = timing.BackoffMin
 			continue
 		}
-		if rs, ok := v.(Restarter); ok {
-			rs.Restarted(ctx, log, backoff, err)
+		if rs, ok := w.v.(Restarter); ok {
+			rs.Restarted(ctx, w.Logger, backoff, err)
 		} else {
-			h.engine.Metrics().VendorWatchReconnect(VendorLabel(in.Vendor))
-			log.WarnContext(ctx, "vendor_watch_reconnect", slog.String("cause", "error"), slog.Duration("backoff", backoff), slog.Any("error", err))
+			w.h.engine.Metrics().VendorWatchReconnect(VendorLabel(w.In.Vendor))
+			w.Logger.WarnContext(ctx, "vendor_watch_reconnect", slog.String("cause", "error"), slog.Duration("backoff", backoff), slog.Any("error", err))
 		}
 		t := time.NewTimer(backoff)
 		select {
@@ -272,7 +274,7 @@ func (h *Hub) watch(ctx context.Context, v Vendor, in integration.Integration) {
 			return
 		case <-t.C:
 		}
-		backoff = min(2*backoff, h.timing.BackoffMax)
+		backoff = min(2*backoff, timing.BackoffMax)
 	}
 }
 

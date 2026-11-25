@@ -199,11 +199,15 @@ func orchestratorEnv(key, socket string) []string {
 	return append(env, "SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET="+key, SocketEnv+"="+socket, "DISABLE_AUTOUPDATER=1")
 }
 
-// Watch runs one orchestrator of the integration until ctx ends (it then
+func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) {
+	w.Run(ctx, func() error { return v.watchSession(ctx, w) })
+}
+
+// watchSession runs one orchestrator of the integration until ctx ends (it then
 // stops the orchestrator with SIGTERM, waits for its drain and returns
 // ctx.Err()) or until the orchestrator exits (an error: the Hub restarts
 // it with backoff and calls Restarted).
-func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
+func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch) error {
 	key, err := w.Credential(ctx, tidev1.AgentCredential_AGENT_CREDENTIAL_ENVIRONMENT_KEY)
 	if err != nil {
 		return fmt.Errorf("read the environment key: %w", err)

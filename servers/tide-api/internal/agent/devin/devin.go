@@ -168,10 +168,14 @@ func (v *Vendor) outpostID(ctx context.Context, c *vendorhttp.Client, name strin
 	}
 }
 
-// Watch resolves the outpost, lists its pending sessions, admits each one,
+func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) {
+	w.Run(ctx, func() error { return v.watchSession(ctx, w) })
+}
+
+// watchSession resolves the outpost, lists its pending sessions, admits each one,
 // and follows the watch stream from the list's cursor. Devin ends a watch
 // stream after at most 5 minutes; that end is scheduled.
-func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
+func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch) error {
 	c, err := v.api(ctx, w.In)
 	if err != nil {
 		return err

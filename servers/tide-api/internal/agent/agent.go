@@ -63,13 +63,9 @@ type Vendor interface {
 	// Vendor is the agent vendor; Source is the work.Source of its requests.
 	Vendor() tidev1.AgentVendor
 	Source() work.Source
-	// Watch runs one watch session of an integration: it lists the pending
-	// vendor requests, admits each one with w.Admit, then follows the
-	// vendor's stream until ctx ends or the stream ends. It returns nil for
-	// a scheduled end (the Hub lists again at once and counts no reconnect)
-	// and an error for a failure or an unexpected end (the Hub waits with
-	// backoff and counts a reconnect).
-	Watch(ctx context.Context, w *Watch) error
+	// Watch watches one integration until ctx ends. It uses w.Run to
+	// reconnect and waits for any work it started before returning.
+	Watch(ctx context.Context, w *Watch)
 	// CheckStarted returns the request IDs of claims whose runner program
 	// took its session, among claims of one integration whose request is
 	// STARTING with a runner that waits for work. When the vendor cannot

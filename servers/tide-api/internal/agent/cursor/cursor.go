@@ -57,6 +57,8 @@ const (
 	DefaultIdleReleaseTimeout = 600
 	// workerBatch is the largest workerIds list of one status call.
 	workerBatch = 100
+	// admissionQueueSize holds one page of pending requests.
+	admissionQueueSize = 100
 )
 
 // Options configures the vendor.
@@ -126,11 +128,24 @@ type pendingPage struct {
 	StreamCursor  string           `json:"streamCursor"`
 }
 
-// Watch lists the pool's pending requests, admits each unclaimed one, and
-// follows the stream from the list's cursor until the relist time
-// (scheduled end), a `410 Gone` (cursor expired: scheduled end, list again
-// at once) or another end (an error).
-func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
+// Watch keeps one admission worker for the lifetime of the integration's
+// watcher. It uses the watcher's context across list and stream sessions.
+func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) {
+	admissions := newAdmissionQueue(admissionQueueSize)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		admissions.run(ctx, func(a pendingAdmission) { v.admit(ctx, w, a.client, a.request) })
+	}()
+
+	var listStart int
+	w.Run(ctx, func() error { return v.watchSession(ctx, w, admissions, &listStart) })
+	<-done
+}
+
+// watchSession lists pending requests and follows the final page's cursor.
+// A relist timeout or an expired cursor ends the session on schedule.
+func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch, admissions *admissionQueue, listStart *int) error {
 	c, err := v.api(ctx, w.In)
 	if err != nil {
 		return err
@@ -139,6 +154,8 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 	cursor := ""
 	token := ""
 	usedTokens := make(map[string]struct{})
+	position, nextStart := 0, -1
+	var listedAt time.Time
 	for {
 		q := url.Values{"pool": {pool}, "limit": {"100"}}
 		if token != "" {
@@ -152,19 +169,38 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 		if _, used := usedTokens[page.NextPageToken]; used {
 			return errors.New("the Cursor pending request list repeated a page token")
 		}
+		token = page.NextPageToken
+		if token == "" {
+			listedAt = time.Now()
+		}
+		// Continue listing even when the queue is full. On the next
+		// complete list, resume offering entries at the first omitted
+		// position so a persistent prefix cannot starve later pages.
 		for _, r := range page.Requests {
-			v.admit(ctx, w, c, r)
+			if r.ClaimedWorkerID != "" {
+				continue
+			}
+			if position >= *listStart && nextStart < 0 && !admissions.offer(c, r) {
+				nextStart = position
+			}
+			position++
 		}
 		cursor = page.StreamCursor
-		if token = page.NextPageToken; token == "" {
+		if token == "" {
 			break
 		}
+	}
+	if nextStart >= 0 {
+		w.Logger.DebugContext(ctx, "agent_demand_deferred", slog.String("cause", "admission_queue_full"))
+		*listStart = nextStart
+	} else {
+		*listStart = 0
 	}
 	relist := v.opts.RelistInterval
 	if relist == 0 {
 		relist = DefaultRelistInterval + rand.N(relistJitter)
 	}
-	sctx, cancel := context.WithTimeout(ctx, relist)
+	sctx, cancel := context.WithDeadline(ctx, listedAt.Add(relist))
 	defer cancel()
 	q := url.Values{"pool": {pool}}
 	if cursor != "" {
@@ -178,7 +214,9 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 				w.Logger.WarnContext(ctx, "vendor_event_invalid", slog.String("event", e.Name))
 				return nil
 			}
-			v.admit(ctx, w, c, r)
+			if r.ClaimedWorkerID == "" && !admissions.offer(c, r) {
+				w.Logger.DebugContext(ctx, "agent_demand_deferred", slog.String("cause", "admission_queue_full"))
+			}
 		case "claimed", "claimed_offline", "expired", "heartbeat":
 			// claimed: tide's own claims and those of other controllers.
 			// claimed_offline: a claim whose worker is offline; tide does not
@@ -200,12 +238,8 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 	return err
 }
 
-// admit claims one pending request. Entries with a claimed worker
-// (claimed_offline) are not claimable.
+// admit claims one pending request.
 func (v *Vendor) admit(ctx context.Context, w *agent.Watch, c *vendorhttp.Client, r PendingRequest) {
-	if r.ClaimedWorkerID != "" {
-		return
-	}
 	err := w.Admit(ctx, agent.Demand{
 		VendorRequestID: r.ID, Marker: strconv.FormatInt(r.CreatedAtMs, 10), Scope: w.In.PoolName,
 		Claim: func(ctx context.Context, workerID string) error {
