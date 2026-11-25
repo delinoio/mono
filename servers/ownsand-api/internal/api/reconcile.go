@@ -389,7 +389,7 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID,
 		e, ok := listed[sn.id]
 		if ok {
 			if ownsandv1.SnapshotState(sn.state) == ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING && e.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING {
-				if err := applySnapshotEntryTx(ctx, tx, sn.id, e); err != nil {
+				if _, err := applySnapshotEntryTx(ctx, tx, sn.id, e); err != nil {
 					return 0, err
 				}
 			}
@@ -483,19 +483,16 @@ func unknownSnapshotsTx(ctx context.Context, tx pgx.Tx, entries []*ownsandv1.Sna
 }
 
 // applySnapshotEntryTx stores the agent's report of a snapshot. It acts only
-// while the record is CREATING, which both callers (the create-snapshot
-// result and the state report) require: a repeat of the write after a commit
-// whose outcome is unknown, or a late result for a record that another writer
-// settled or that is being deleted, changes nothing.
-func applySnapshotEntryTx(ctx context.Context, tx pgx.Tx, snapshotID string, e *ownsandv1.SnapshotStateEntry) error {
+// while the record is CREATING and reports whether it updated the row.
+func applySnapshotEntryTx(ctx context.Context, tx pgx.Tx, snapshotID string, e *ownsandv1.SnapshotStateEntry) (bool, error) {
 	state := e.GetState()
 	if state == ownsandv1.SnapshotState_SNAPSHOT_STATE_UNSPECIFIED {
 		state = ownsandv1.SnapshotState_SNAPSHOT_STATE_READY
 	}
-	_, err := tx.Exec(ctx, `UPDATE snapshots SET state = $2, has_memory_state = $3, size_bytes = $4,
+	tag, err := tx.Exec(ctx, `UPDATE snapshots SET state = $2, has_memory_state = $3, size_bytes = $4,
 		macos_hardware_model = COALESCE($5, macos_hardware_model) WHERE snapshot_id = $1 AND state = $6`,
 		snapshotID, int16(state), e.GetHasMemoryState(), e.GetSizeBytes(), nilIfEmpty(e.GetMacosHardwareModel()), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
-	return err
+	return tag.RowsAffected() > 0, err
 }
 
 func nilIfEmpty(b []byte) any {
