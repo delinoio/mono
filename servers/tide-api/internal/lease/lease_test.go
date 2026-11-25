@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/delinoio/mono/servers/tide-api/internal/db/dbtest"
@@ -260,6 +261,73 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 	if got := acquired.Load(); got != 1 {
 		t.Fatalf("OnAcquire ran %d times, want 1", got)
 	}
+}
+
+func TestWaitIgnoresExpiredAcquisition(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clock := newTestClock()
+		l, lost := newTestLease()
+		l.DeadlineNow = clock.Now
+		acquireFor(t, l, clock.Now().Add(TTL))
+		if err := l.Wait(t.Context()); err != nil {
+			t.Fatalf("Wait with a current lease: %v", err)
+		}
+
+		// Advance to the deadline before the watcher records the loss.
+		clock.Advance(TTL)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := l.Wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Wait with an expired lease: got %v, want %v", err, context.DeadlineExceeded)
+		}
+		if got := lost.Load(); got != 1 {
+			t.Fatalf("OnLose ran %d times, want 1", got)
+		}
+
+		done := make(chan error, 1)
+		go func() { done <- l.Wait(t.Context()) }()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("Wait without a lease returned %v", err)
+		default:
+		}
+		acquireFor(t, l, clock.Now().Add(TTL))
+		if err := <-done; err != nil {
+			t.Fatalf("Wait after reacquisition: %v", err)
+		}
+	})
+}
+
+func TestWaitRechecksOwnershipAfterWake(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		l, _ := newTestLease()
+		l.init()
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- l.Wait(ctx) }()
+		synctest.Wait()
+
+		// A waiter can observe the signal from an ownership period after
+		// the loss transition has already installed the next channel.
+		l.mu.Lock()
+		previous := l.acquired
+		l.acquired = make(chan struct{})
+		close(previous)
+		l.mu.Unlock()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("Wait after a stale wake returned %v", err)
+		default:
+		}
+
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("Wait after cancellation: got %v, want %v", err, context.Canceled)
+		}
+	})
 }
 
 // TestLeaseAcquireCallbackBoundedByExpiry checks that the work that runs on
