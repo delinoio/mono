@@ -414,8 +414,7 @@ func listRequests(ctx context.Context, q db.Querier, orgID, after, owner, profil
 	return reqs, nil
 }
 
-// errRebound restarts a DeleteDevSession transaction whose session got a
-// runner after the runner lock.
+// errRebound signals that a session acquired a runner after the runner lookup.
 var errRebound = errors.New("the dev session got a runner")
 
 // deleteAttempts bounds the restarts of DeleteDevSession after errRebound.
@@ -448,54 +447,22 @@ func (h *Handler) DeleteDevSession(ctx context.Context, req *connect.Request[tid
 			if !authz.CanDeleteDevSession(c.Role, c.UserID, sess.req.OwnerUserID) {
 				return api.ErrPermission("a member can delete only their own dev sessions")
 			}
-			// Decide on the locked state, so a dispatch that starts the
-			// session meanwhile is seen: lock the open runner of the session,
-			// then the request, in the engine's lock order (runner first).
-			var runnerID string
-			err = tx.QueryRow(ctx, "SELECT runner_id::text FROM runners WHERE request_id = $1 AND state <> ALL($2) FOR UPDATE",
-				sessionID, []int16{int16(tidev1.RunnerState_RUNNER_STATE_DELETED), int16(tidev1.RunnerState_RUNNER_STATE_FAILED)}).Scan(&runnerID)
-			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			cur, runnerLocked, err := h.lockSessionForEnd(ctx, tx, c.OrganizationID, sessionID)
+			if err != nil || work.RequestTerminal(cur.State) {
 				return err
 			}
-			cur, err := work.ScanRequest(tx.QueryRow(ctx, "SELECT "+work.RequestColumns+" FROM requests WHERE request_id = $1 FOR UPDATE", sessionID))
-			if err != nil {
-				return err
-			}
-			if work.RequestTerminal(cur.State) {
-				return nil
-			}
-			queued := cur.State == tidev1.RequestState_REQUEST_STATE_QUEUED
-			ended := false
-			if !queued && cur.RunnerID != "" {
-				if cur.RunnerID != runnerID {
-					r, err := h.e.GetRunner(ctx, tx, c.OrganizationID, cur.RunnerID)
-					if err != nil {
-						return err
-					}
-					if !work.RunnerTerminal(r.State) {
-						// The runner was bound after the runner lock; locking
-						// it now would invert the lock order.
-						return errRebound
-					}
-				}
+			if runnerLocked {
 				d, err = h.e.DeleteRunnerTx(ctx, tx, c.OrganizationID, cur.RunnerID, tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER, work.DeleteByUser)
 				if err != nil {
 					return err
 				}
-				after, err := h.e.GetRequest(ctx, tx, c.OrganizationID, sessionID)
-				if err != nil {
-					return err
-				}
-				ended = work.RequestTerminal(after.State)
 			}
-			if !ended {
-				end := work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER}
-				if !queued {
-					end = work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_ENDED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED}
-				}
-				if _, err := h.e.EndRequestTx(ctx, tx, sessionID, end); err != nil {
-					return err
-				}
+			end := work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_ENDED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED}
+			if cur.State == tidev1.RequestState_REQUEST_STATE_QUEUED {
+				end = work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER}
+			}
+			if _, err := h.e.EndRequestTx(ctx, tx, sessionID, end); err != nil {
+				return err
 			}
 			return s.WriteAudit(ctx, tx, api.AuditEvent{
 				OrganizationID: c.OrganizationID, Action: tidev1.AuditAction_AUDIT_ACTION_DEV_SESSION_DELETED, Actor: c.Principal,
@@ -522,41 +489,70 @@ func (h *Handler) DeleteDevSession(ctx context.Context, req *connect.Request[tid
 	return connect.NewResponse(&tidev1.DeleteDevSessionResponse{DevSession: sess.proto()}), nil
 }
 
-// membershipEndTx ends the removed member's dev sessions of the
-// organization: queued ones with CANCELED and MEMBER_REMOVED, the others
-// with ENDED and MEMBER_REMOVED; their runners are DELETING, and
-// membershipEndAfter deletes the sandboxes (the lease holder's drivers
-// retry).
+// lockSessionForEnd follows the engine's runner-before-request lock order.
+// It reports whether the caller holds the lock on a started session's runner.
+func (h *Handler) lockSessionForEnd(ctx context.Context, tx pgx.Tx, orgID, sessionID string) (*work.Request, bool, error) {
+	var runnerID string
+	err := tx.QueryRow(ctx, "SELECT runner_id::text FROM runners WHERE request_id = $1 AND state <> ALL($2) FOR UPDATE",
+		sessionID, []int16{int16(tidev1.RunnerState_RUNNER_STATE_DELETED), int16(tidev1.RunnerState_RUNNER_STATE_FAILED)}).Scan(&runnerID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, err
+	}
+	cur, err := h.e.LockRequest(ctx, tx, sessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	if work.RequestTerminal(cur.State) || cur.State == tidev1.RequestState_REQUEST_STATE_QUEUED || cur.RunnerID == "" {
+		return cur, false, nil
+	}
+	if cur.RunnerID == runnerID {
+		return cur, true, nil
+	}
+	r, err := h.e.GetRunner(ctx, tx, orgID, cur.RunnerID)
+	if err != nil {
+		return nil, false, err
+	}
+	if work.RunnerTerminal(r.State) {
+		return cur, false, nil
+	}
+	// The session got a live runner after the lookup. Retry in a new
+	// transaction to take its lock before the request lock.
+	return nil, false, errRebound
+}
+
+// membershipEndTx cancels queued sessions and ends started sessions with
+// MEMBER_REMOVED. The runner deletion is recorded in the same transaction.
 func (h *Handler) membershipEndTx(ctx context.Context, tx pgx.Tx, m api.MembershipEnd) error {
-	rows, err := tx.Query(ctx, "SELECT request_id::text, state, COALESCE(runner_id::text, '') FROM requests WHERE organization_id = $1 AND kind = $2 AND owner_user_id = $3 AND state = ANY($4)",
+	rows, err := tx.Query(ctx, "SELECT request_id::text FROM requests WHERE organization_id = $1 AND kind = $2 AND owner_user_id = $3 AND state = ANY($4) ORDER BY request_id",
 		m.OrganizationID, int16(tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION), m.UserID, work.OpenRequestStates())
 	if err != nil {
 		return err
 	}
-	type open struct {
-		id, runner string
-		state      int16
-	}
-	var list []open
-	for rows.Next() {
-		var o open
-		if err := rows.Scan(&o.id, &o.state, &o.runner); err != nil {
-			rows.Close()
-			return err
-		}
-		list = append(list, o)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
 		return err
 	}
-	for _, o := range list {
-		if o.runner != "" && tidev1.RequestState(o.state) != tidev1.RequestState_REQUEST_STATE_QUEUED {
-			if _, err := h.e.DeleteRunnerTx(ctx, tx, m.OrganizationID, o.runner, tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER, work.DeleteMemberRemoved); err != nil {
+	for _, id := range ids {
+		cur, runnerLocked, err := h.lockSessionForEnd(ctx, tx, m.OrganizationID, id)
+		if errors.Is(err, errRebound) {
+			return api.ErrRetryMembershipEnd
+		}
+		if err != nil {
+			return err
+		}
+		if work.RequestTerminal(cur.State) {
+			continue
+		}
+		if runnerLocked {
+			if _, err := h.e.DeleteRunnerTx(ctx, tx, m.OrganizationID, cur.RunnerID, tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER, work.DeleteMemberRemoved); err != nil {
 				return err
 			}
 		}
-		if _, err := h.e.EndRequestTx(ctx, tx, o.id, work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_MEMBER_REMOVED}); err != nil {
+		state := tidev1.RequestState_REQUEST_STATE_ENDED
+		if cur.State == tidev1.RequestState_REQUEST_STATE_QUEUED {
+			state = tidev1.RequestState_REQUEST_STATE_CANCELED
+		}
+		if _, err := h.e.EndRequestTx(ctx, tx, id, work.RequestEnd{State: state, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_MEMBER_REMOVED}); err != nil {
 			return err
 		}
 	}
