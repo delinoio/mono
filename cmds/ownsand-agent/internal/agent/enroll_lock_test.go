@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -48,6 +49,20 @@ func enrollAsync(t *testing.T, ctx context.Context, st *store.Store, client *cpc
 	return out
 }
 
+func waitForEnrollArrival(hold *testcp.EnrollHold, result <-chan enrollResult) error {
+	select {
+	case <-hold.Arrived():
+		return nil
+	case r := <-result:
+		if r.err != nil {
+			return fmt.Errorf("enrollment returned before the held RPC was observed: %w", r.err)
+		}
+		return errors.New("enrollment succeeded before the held RPC was observed")
+	case <-time.After(10 * time.Second):
+		return errors.New("timed out waiting for enrollment to reach the control plane")
+	}
+}
+
 func newEnrollFixture(t *testing.T) (*testcp.Server, *store.Store, *cpclient.Client) {
 	t.Helper()
 	cp := testcp.New(t)
@@ -62,6 +77,22 @@ func newEnrollFixture(t *testing.T) (*testcp.Server, *store.Store, *cpclient.Cli
 	return cp, st, client
 }
 
+func TestEnrollArrivalReportsEarlyError(t *testing.T) {
+	cp, st, client := newEnrollFixture(t)
+	ctx := t.Context()
+	if _, err := Enroll(ctx, st, client, testcp.Token, "host", quietLogger()); err != nil {
+		t.Fatalf("enroll fixture: %v", err)
+	}
+	hold := cp.HoldNextEnroll()
+	result := enrollAsync(t, ctx, st, client)
+	if err := waitForEnrollArrival(hold, result); !errors.Is(err, ErrAlreadyEnrolled) {
+		t.Fatalf("wait for enrollment: got %v, want ErrAlreadyEnrolled", err)
+	}
+	if calls := len(cp.EnrollPublicKeys()); calls != 1 {
+		t.Fatalf("the repeated attempt reached the control plane: got %d calls, want 1", calls)
+	}
+}
+
 // TestEnrollWaitingAttemptKeepsCompletedIdentity starts a second enrollment
 // on one state directory while the first is in its Enroll call. The second
 // waits for the lock, then finds the completed identity, ends with
@@ -71,7 +102,9 @@ func TestEnrollWaitingAttemptKeepsCompletedIdentity(t *testing.T) {
 	cp, st, client := newEnrollFixture(t)
 	hold := cp.HoldNextEnroll()
 	first := enrollAsync(t, context.Background(), st, client)
-	<-hold.Arrived()
+	if err := waitForEnrollArrival(hold, first); err != nil {
+		t.Fatal(err)
+	}
 	pubKey := requirePendingKey(t, st)
 
 	st2, client2 := openSecond(t, st, cp)
@@ -116,7 +149,9 @@ func TestEnrollWaitingAttemptReusesPendingKey(t *testing.T) {
 	cp.DropNextEnrollResponse()
 	hold := cp.HoldNextEnroll()
 	first := enrollAsync(t, context.Background(), st, client)
-	<-hold.Arrived()
+	if err := waitForEnrollArrival(hold, first); err != nil {
+		t.Fatal(err)
+	}
 	pubKey := requirePendingKey(t, st)
 
 	st2, client2 := openSecond(t, st, cp)
@@ -183,7 +218,9 @@ func TestEnrollGivesUpWhileAnotherEnrollmentRuns(t *testing.T) {
 	cp, st, client := newEnrollFixture(t)
 	hold := cp.HoldNextEnroll()
 	first := enrollAsync(t, context.Background(), st, client)
-	<-hold.Arrived()
+	if err := waitForEnrollArrival(hold, first); err != nil {
+		t.Fatal(err)
+	}
 	pubKey := requirePendingKey(t, st)
 
 	st2, client2 := openSecond(t, st, cp)
@@ -212,7 +249,9 @@ func TestEnrollStateDirectoriesAreIndependent(t *testing.T) {
 	cp, st, client := newEnrollFixture(t)
 	hold := cp.HoldNextEnroll()
 	first := enrollAsync(t, context.Background(), st, client)
-	<-hold.Arrived()
+	if err := waitForEnrollArrival(hold, first); err != nil {
+		t.Fatal(err)
+	}
 
 	otherStore, err := store.Open(t.TempDir())
 	if err != nil {

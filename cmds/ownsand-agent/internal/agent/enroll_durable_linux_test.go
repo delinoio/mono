@@ -109,15 +109,13 @@ func TestEnrollKeyIsOnDiskWhenCallArrives(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	errc := make(chan error, 1)
-	go func() {
-		_, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger())
-		errc <- err
-	}()
-	<-hold.Arrived()
+	first := enrollAsync(t, context.Background(), st, client)
+	if err := waitForEnrollArrival(hold, first); err != nil {
+		t.Fatal(err)
+	}
 	onDisk := requirePendingKey(t, st)
 	hold.Release()
-	if err := <-errc; err == nil {
+	if r := <-first; r.err == nil {
 		t.Fatal("enroll succeeded although the response was dropped")
 	}
 	if _, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger()); err != nil {
