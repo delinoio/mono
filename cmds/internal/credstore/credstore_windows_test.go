@@ -17,17 +17,12 @@ import (
 // violation, as an antivirus scanner does. The handle closes once.
 func holdWithoutDeleteShare(t *testing.T, path string) (release func()) {
 	t.Helper()
-	return holdCredentialFile(t, path, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE)
-}
-
-func holdCredentialFile(t *testing.T, path string, shareMode uint32) (release func()) {
-	t.Helper()
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	h, err := windows.CreateFile(p, windows.GENERIC_READ,
-		shareMode, nil,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil,
 		windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
 		t.Fatalf("hold the credential file: %v", err)
@@ -43,22 +38,25 @@ func holdCredentialFile(t *testing.T, path string, shareMode uint32) (release fu
 	return release
 }
 
-func TestLoadRetriesUntilHandleIsReleased(t *testing.T) {
+func TestReadFileRetriesSharingViolation(t *testing.T) {
 	s := savedStore(t)
-	release := holdCredentialFile(t, s.Path(), 0)
-	oldSleep := readRetrySleep
-	t.Cleanup(func() { readRetrySleep = oldSleep })
-	sleeps := 0
-	readRetrySleep = func(time.Duration) {
-		sleeps++
-		release()
-	}
-	got, err := s.Load()
+	attempts := 0
+	got, err := readFileWithRetry(s.Path(), func(path string) ([]byte, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, &os.PathError{Op: "open", Path: path, Err: windows.ERROR_SHARING_VIOLATION}
+		}
+		return os.ReadFile(path)
+	})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if got.RefreshToken != "r" || sleeps != 1 {
-		t.Fatalf("want the saved credential after one retry pause, got %d pauses", sleeps)
+	want, err := os.ReadFile(s.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) || attempts != 2 {
+		t.Fatalf("want the saved credentials after two reads, got %d reads", attempts)
 	}
 }
 
