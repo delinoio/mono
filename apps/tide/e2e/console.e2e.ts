@@ -110,6 +110,82 @@ describe("organizations", () => {
       "Fabrikam",
     );
   });
+
+  test("fits organization names and role badges in their home list rows", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const longName = "W".repeat(100);
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("button", "Create organization").tap();
+    await browser.keyboard.type(longName);
+    await screen.getByRole("button", "Create").tap();
+    await expect(browser).toHaveURL(/\/orgs\/[0-9a-f-]+$/);
+    const createdPath = await browser.evaluate(() => location.pathname);
+    await screen.getByRole("link", "tide").tap();
+
+    const list = screen.getByRole("list", "Your organizations");
+    const acme = list.getByRole("link", "Acme Robotics Owner");
+    const created = list.getByRole("link", `${longName} Owner`);
+    const measureRow = (name: string) =>
+      browser.evaluate((name) => {
+        const list = document.querySelector(
+          'ul[aria-label="Your organizations"]',
+        );
+        const title = Array.from(
+          list?.querySelectorAll(".list-title") ?? [],
+        ).find((title) => title.textContent === name);
+        const row = title?.closest("li");
+        const badge = row?.querySelector(".dui-badge");
+        if (!list || !title || !row || !badge) {
+          throw new Error(`Missing organization row for ${name}`);
+        }
+
+        const rowBounds = row.getBoundingClientRect();
+        const listBounds = list.getBoundingClientRect();
+        const fits = (rect: DOMRect) =>
+          [rowBounds, listBounds].every(
+            (bounds) =>
+              rect.width > 0 &&
+              rect.height > 0 &&
+              rect.left >= bounds.left &&
+              rect.right <= bounds.right &&
+              rect.top >= bounds.top &&
+              rect.bottom <= bounds.bottom,
+          );
+        const range = document.createRange();
+        range.selectNodeContents(title);
+        const fragments = Array.from(range.getClientRects());
+        const root = document.documentElement;
+        return {
+          lines: fragments.length,
+          titleFits: fragments.every(fits),
+          badgeFits: fits(badge.getBoundingClientRect()),
+          documentFits: root.scrollWidth === root.clientWidth,
+        };
+      }, name);
+
+    for (const width of [1024, 320]) {
+      await browser.setViewport({ width, height: 844 });
+      await expect(acme.getByText("Owner")).toBeVisible();
+      await expect(acme).toHaveAttribute("href", `/orgs/${ACME}`);
+      const layout = await measureRow("Acme Robotics");
+      expect(layout.lines, `${width}px Acme title`).toBe(1);
+      expect(layout.titleFits, `${width}px Acme title fits`).toBe(true);
+      expect(layout.badgeFits, `${width}px Acme role fits`).toBe(true);
+    }
+
+    await expect(created.getByText("Owner")).toBeVisible();
+    const layout = await measureRow(longName);
+    expect(layout.lines, "320px long title wraps").toBeGreaterThan(1);
+    expect(layout.titleFits, "320px long title fits").toBe(true);
+    expect(layout.badgeFits, "320px long title role fits").toBe(true);
+    expect(layout.documentFits, "320px document fits").toBe(true);
+    await created.tap();
+    await expect(browser).toHaveURL(createdPath);
+  });
 });
 
 describe("organization layout", () => {

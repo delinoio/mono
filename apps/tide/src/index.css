@@ -239,6 +239,10 @@ h2 {
   font-weight: 600;
 }
 
+.list-link > .list-title {
+  overflow-wrap: anywhere;
+}
+
 .list-actions {
   display: flex;
   align-items: center;
