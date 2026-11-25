@@ -5,6 +5,7 @@ package work
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -26,27 +27,36 @@ type workGaugeSnapshot struct {
 
 type gaugeQuery func(context.Context, string, ...any) (pgx.Rows, error)
 
-// RunGauges is the lease component that records tide_requests and
-// tide_runners.
+// RunGauges samples tide_requests and tide_runners while the lease is held.
 func (e *Engine) RunGauges(ctx context.Context) error {
-	var snapshot workGaugeSnapshot
+	var published atomic.Pointer[workGaugeSnapshot]
+	var current workGaugeSnapshot
+	stopObserving := e.m.ObserveWorkGauges(ctx, func() (requests, runners map[[3]string]int64) {
+		snapshot := published.Load()
+		if snapshot == nil {
+			return nil, nil
+		}
+		return snapshot.requests, snapshot.runners
+	})
+	defer stopObserving()
+
 	t := time.NewTicker(e.timing.GaugeInterval)
 	defer t.Stop()
-	for {
-		sample := sampleWorkGauges(ctx, e.svc.DB.Pool.Query, e.svc.Logger, snapshot)
-		for labels, count := range sample.requests {
-			e.m.Requests(labels[0], labels[1], labels[2], count)
+	for ctx.Err() == nil {
+		sample := sampleWorkGauges(ctx, e.svc.DB.Pool.Query, e.svc.Logger, current)
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		for labels, count := range sample.runners {
-			e.m.Runners(labels[0], labels[1], labels[2], count)
-		}
-		snapshot = snapshot.withSample(sample)
+		next := current.withSample(sample)
+		published.Store(&next)
+		current = next
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
 		}
 	}
+	return ctx.Err()
 }
 
 // withSample keeps the last complete counts for any failed query.
