@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
 import { QueryClient } from "@tanstack/react-query";
 import { act, cleanup, render, screen, within } from "@testing-library/react";
 import { StrictMode } from "react";
-import { Accounts } from "./App.tsx";
+import { Accounts, App } from "./App.tsx";
 import {
   type Auth,
   AuthContextProvider,
@@ -128,6 +128,16 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+});
+
+test("the sign-in callback shows the configuration notice without Logto", () => {
+  window.history.replaceState(null, "", "/callback");
+  render(<App config={{ ...TEST_CONFIG, logto: undefined }} />);
+
+  expect(
+    screen.getByText("Sign-in is not configured for this build."),
+  ).toBeTruthy();
+  expect(window.location.pathname).toBe("/callback");
 });
 
 describe("sign-in callback without a redirect in progress", () => {
