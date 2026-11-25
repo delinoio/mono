@@ -5,17 +5,21 @@ package agent
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/delinoio/mono/go/ownsand"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/db/dbtest"
+	"github.com/delinoio/mono/servers/tide-api/internal/integration"
 )
 
 const (
@@ -54,6 +58,64 @@ func TestPrepareOrgDeletionKeepsOtherAttemptStopped(t *testing.T) {
 	case <-h.syncNow:
 	default:
 		t.Fatal("watcher sync is not scheduled")
+	}
+}
+
+func TestPrepareOrgDeletionJoinsLeaseDrain(t *testing.T) {
+	orgID := api.NewID()
+	watchCtx, cancelWatch := context.WithCancel(t.Context())
+	defer cancelWatch()
+	w := &watcher{
+		in:     integration.Integration{ID: api.NewID(), OrganizationID: orgID},
+		cancel: cancelWatch,
+		done:   make(chan struct{}),
+	}
+	h := &Hub{
+		svc:      &api.Service{DB: dbtest.New(t)},
+		log:      slog.Default(),
+		timing:   DefaultTiming(),
+		watchers: map[string]*watcher{w.in.ID: w},
+		draining: map[string]map[*watcher]struct{}{},
+		stopped:  map[string]int{},
+	}
+	release := sync.OnceFunc(func() { h.finishWatcher(w) })
+	defer release()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	leaseCtx, cancelLease := context.WithCancel(ctx)
+	cancelLease()
+	leaseDone := make(chan error, 1)
+	go func() { leaseDone <- h.runWatchers(leaseCtx) }()
+	select {
+	case <-watchCtx.Done():
+	case <-ctx.Done():
+		t.Fatal("lease shutdown did not cancel the watcher")
+	}
+
+	prepared := make(chan error, 1)
+	go func() { prepared <- h.prepareOrgDeletion(ctx, api.OrganizationDeletion{OrganizationID: orgID}) }()
+	select {
+	case err := <-prepared:
+		t.Fatalf("deletion preparation returned while the lease watcher was draining: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	select {
+	case err := <-prepared:
+		if err != nil {
+			t.Fatalf("deletion preparation: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("deletion preparation did not finish after the watcher exited")
+	}
+	select {
+	case err := <-leaseDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("lease watcher loop: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the lease watcher loop did not stop")
 	}
 }
 

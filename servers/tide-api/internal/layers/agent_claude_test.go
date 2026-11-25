@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/agent"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/claude"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/claude/claudefake"
+	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 )
@@ -442,6 +444,163 @@ func TestClaudeOrganizationDeletion(t *testing.T) {
 		t.Fatal("the orchestrator runs after the organization deletion")
 	}
 	stays(t, "no orchestrator", func() bool { return len(w.orch.Running()) == 0 })
+}
+
+func TestClaudeOrganizationDeletionWaitsForDrainingWatcher(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "claude")
+	if err := os.WriteFile(script, []byte(`#!/bin/sh
+trap '
+  : > "$TIDE_SPAWN_SOCKET.term"
+  while [ ! -f "$TIDE_SPAWN_SOCKET.release" ]; do sleep 0.02; done
+  exit 0
+' TERM
+: > "$TIDE_SPAWN_SOCKET.ready"
+while :; do sleep 0.02; done
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan string, 4)
+	w := newAgentWorld(t, layers.Options{Claude: claude.Options{
+		ClaudePath: script, HookPath: claudeHookPath, StopTimeout: 30 * time.Second,
+		Start: func(spec claude.ProcessSpec) (claude.Process, error) {
+			p, err := claude.ExecStart(spec)
+			if err == nil {
+				for _, entry := range spec.Env {
+					if socket, ok := strings.CutPrefix(entry, "TIDE_SPAWN_SOCKET="); ok {
+						started <- socket
+						break
+					}
+				}
+			}
+			return p, err
+		},
+	}})
+	otherWorld := &world{env: w.env, fake: w.fake, l: w.l, org: w.env.NewOrg("bob")}
+	other := &agentWorld{workWorld: &workWorld{world: otherWorld, osOrg: api.NewID()}}
+	w.fake.AddOrg(other.osOrg, ownsandKey('b'))
+	if _, err := other.setLink(other.org.Admin, other.osOrg, ownsandKey('b')); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	waitFile := func(path string) {
+		t.Helper()
+		eventually(t, filepath.Base(path), func() bool {
+			_, err := os.Stat(path)
+			return err == nil
+		})
+	}
+	start := func(w *agentWorld) (string, string, string) {
+		t.Helper()
+		integrationID := w.createIntegration(t, &tidev1.CreateAgentIntegrationRequest{
+			Vendor: tidev1.AgentVendor_AGENT_VENDOR_CLAUDE_CODE, Name: "claude",
+			Settings:    &tidev1.CreateAgentIntegrationRequest_ClaudeCode{ClaudeCode: &tidev1.ClaudeCodeSettings{}},
+			Credentials: &tidev1.CreateAgentIntegrationRequest_ClaudeCodeCredentials{ClaudeCodeCredentials: &tidev1.ClaudeCodeCredentials{EnvironmentKey: claudeEnvKey}},
+		})
+		profileID := w.createProfile(t, agentProfileProto("claude-agents", integrationID, tidev1.GuestOs_GUEST_OS_LINUX, time.Hour))
+		var socket string
+		select {
+		case socket = <-started:
+		case <-ctx.Done():
+			t.Fatal("orchestrator did not start")
+		}
+		t.Cleanup(func() { _ = os.WriteFile(socket+".release", nil, 0o600) })
+		waitFile(socket + ".ready")
+		return integrationID, profileID, socket
+	}
+	socketOpen := func(socket string) bool {
+		conn, err := net.DialTimeout("unix", socket, time.Second)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}
+	deleteOrg := func(w *agentWorld) <-chan error {
+		result := make(chan error, 1)
+		go func() {
+			_, err := w.env.User(w.org.Owner).Organization.DeleteOrganization(ctx,
+				connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID}))
+			result <- err
+		}()
+		return result
+	}
+	assertPending := func(result <-chan error) {
+		t.Helper()
+		select {
+		case err := <-result:
+			t.Fatalf("DeleteOrganization returned during the orchestrator drain: %v", err)
+		default:
+		}
+	}
+	rowsExist := func(w *agentWorld, integrationID string) (bool, bool) {
+		t.Helper()
+		var org, credential bool
+		err := w.env.DB.Pool.QueryRow(ctx, `SELECT
+			EXISTS (SELECT 1 FROM organizations WHERE organization_id = $1),
+			EXISTS (SELECT 1 FROM agent_integration_credentials WHERE agent_integration_id = $2)`,
+			w.org.ID, integrationID).Scan(&org, &credential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return org, credential
+	}
+	releaseAndVerify := func(w *agentWorld, integrationID, socket string, result <-chan error) {
+		t.Helper()
+		if err := os.WriteFile(socket+".release", nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("DeleteOrganization did not finish after release")
+		}
+		if socketOpen(socket) {
+			t.Fatal("the hook socket is open after DeleteOrganization returned")
+		}
+		if org, credential := rowsExist(w, integrationID); org || credential {
+			t.Fatalf("after deletion: organization=%t, credentials=%t", org, credential)
+		}
+	}
+
+	id, profile, socket := start(w)
+	otherID, _, otherSocket := start(other)
+	if _, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+		OrganizationId: w.org.ID, RunnerProfileId: profile,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	waitFile(socket + ".term")
+	result := deleteOrg(w)
+	eventually(t, "the link is marked removing", func() bool {
+		var removing bool
+		err := w.env.DB.Pool.QueryRow(ctx, "SELECT removing FROM ownsand_links WHERE organization_id = $1", w.org.ID).Scan(&removing)
+		assertPending(result)
+		return err == nil && removing
+	})
+	stays(t, "the organization and credentials during the drain", func() bool {
+		assertPending(result)
+		org, credential := rowsExist(w, id)
+		return org && credential && socketOpen(socket)
+	})
+	t.Log("the owner RPC stayed pending while the link was marked removing, the organization and credential rows existed, and the hook socket accepted connections")
+
+	otherResult := deleteOrg(other)
+	waitFile(otherSocket + ".term")
+	assertPending(otherResult)
+	releaseAndVerify(other, otherID, otherSocket, otherResult)
+	assertPending(result)
+	if !socketOpen(socket) {
+		t.Fatal("the first organization's hook socket closed before its orchestrator was released")
+	}
+	t.Log("deletion stopped the second organization's active watcher and completed while the first watcher was still draining")
+
+	releaseAndVerify(w, id, socket, result)
+	t.Log("after process release both owner RPCs succeeded, their hook sockets were closed, and their organization and credential rows were gone")
 }
 
 // TestClaudeRealProcesses runs the production path with real processes: a
