@@ -33,8 +33,7 @@ type FakeRelay struct {
 	stream *connect.BidiStreamForClient[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]
 	cancel context.CancelFunc
 	sendMu sync.Mutex
-	// Window is the credit the fake agent grants per stream toward itself.
-	Window int64
+	window int64
 	// OnRequest serves the first request frame of a stream.
 	OnRequest func(s *RelayStream, f *ownsandv1.DataFrame)
 
@@ -51,9 +50,16 @@ type FakeRelay struct {
 // credential.
 func (a *FakeAgent) ConnectRelay(onRequest func(s *RelayStream, f *ownsandv1.DataFrame)) *FakeRelay {
 	a.T.Helper()
+	return a.ConnectRelayWithWindow(8<<20, onRequest)
+}
+
+// ConnectRelayWithWindow sets the initial credit that the fake agent grants
+// per stream. With zero credit, the test controls when to send window updates.
+func (a *FakeAgent) ConnectRelayWithWindow(window int64, onRequest func(s *RelayStream, f *ownsandv1.DataFrame)) *FakeRelay {
+	a.T.Helper()
 	cred := a.Env.SessionCredential(a.Device)
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &FakeRelay{agent: a, cancel: cancel, Window: 8 << 20, OnRequest: onRequest, changed: make(chan struct{}), closed: make(chan struct{}),
+	r := &FakeRelay{agent: a, cancel: cancel, window: window, OnRequest: onRequest, changed: make(chan struct{}), closed: make(chan struct{}),
 		streams: map[uint64]*RelayStream{}, received: map[uint64]bool{}}
 	r.stream = a.Env.Clients(cred).RelayAgent.Connect(ctx)
 	r.SendFrame(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{}))
@@ -171,8 +177,8 @@ func (r *FakeRelay) read() {
 		s, opened, first, ch := r.observe(f)
 		close(ch)
 		switch {
-		case opened:
-			r.SendFrame(datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RelayWindowUpdate{IncrementBytes: r.Window}))
+		case opened && r.window > 0:
+			r.SendFrame(datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RelayWindowUpdate{IncrementBytes: r.window}))
 		case first:
 			r.mu.Lock()
 			hook := r.OnRequest

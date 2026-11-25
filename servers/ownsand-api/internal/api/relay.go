@@ -446,8 +446,9 @@ type streamEvents struct {
 // connection once the relay wrote it. A positive acceptance window makes
 // sendRequest wait for the connection writer. The request deadline then
 // covers the wait behind a blocked writer, and the writer starts the
-// acceptance window after it sends the frame. With no acceptance window,
-// sendRequest returns when the frame is queued.
+// acceptance window after it sends the frame. For a unary write, which has no
+// acceptance window, sendRequest also returns when the agent ends the stream
+// so the handler can read the terminal frame.
 func (p *DataPlane) sendRequest(ctx context.Context, c *relayCall, f *ownsandv1.DataFrame, deadline time.Time, onWritten func(int64), acceptance time.Duration) error {
 	rctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -455,7 +456,7 @@ func (p *DataPlane) sendRequest(ctx context.Context, c *relayCall, f *ownsandv1.
 	if acceptance > 0 {
 		err = c.stream.SendConfirmed(rctx, f, onWritten, acceptance)
 	} else {
-		err = c.stream.SendMetered(rctx, f, onWritten)
+		err = c.stream.SendWriteRequest(rctx, f, onWritten)
 	}
 	if err != nil {
 		if errors.Is(err, relay.ErrConnClosed) {
@@ -747,10 +748,7 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 		}
 		agentErr, ended := endFromAgent(f)
 		result := f.GetFileWriteResult()
-		if !ended && result == nil {
-			continue
-		}
-		if hook := h.afterWriteResponseDequeued.Load(); hook != nil {
+		if hook := h.afterWriteResponseDequeued.Load(); hook != nil && (ended || result != nil) {
 			(*hook)(cctx)
 		}
 		// Next can return a queued frame after the call context ends.
@@ -761,6 +759,9 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 		if ended {
 			sendClose = false
 			return nil, agentErr
+		}
+		if result == nil {
+			continue
 		}
 		c.frames++
 		c.bytes += datapath.FrameCost(f)
