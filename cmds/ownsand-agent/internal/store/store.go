@@ -447,11 +447,8 @@ func (s *Store) WipeLocalData() error {
 	return nil
 }
 
-// Reset deletes the whole content of the state directory, including the
-// identity. A failure to delete one entry does not stop the deletion of the
-// others: an entry that stays (for example, a log file that another process
-// holds open) must not keep the identity on disk. Reset returns every
-// failure joined into one error.
+// Reset deletes local state, including the identity, under the enrollment
+// lock. See ResetDir for the cleanup and error rules.
 func (s *Store) Reset() error {
 	return ResetDir(s.dir)
 }

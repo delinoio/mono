@@ -473,6 +473,9 @@ func reset(cfg config.Config, yes bool, stdout, stderr io.Writer) int {
 	// Open would fail on it before it deleted anything.
 	if err := store.ResetDir(cfg.StateDir); err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
+		if errors.Is(err, store.ErrEnrollmentBusy) {
+			fmt.Fprintln(stderr, "ownsand-agent: run reset again after enrollment or the other reset ends")
+		}
 		return exitError
 	}
 	fmt.Fprintln(stdout, "Local agent data deleted from", filepath.Clean(cfg.StateDir))

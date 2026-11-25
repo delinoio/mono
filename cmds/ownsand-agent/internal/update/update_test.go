@@ -721,12 +721,12 @@ func TestRemovalPreventsLateDownloadFromWritingArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The request stays live: the verified download must hit the fence even
-	// after the state directory has been emptied.
+	// after reset has cleared the state.
 	gate.open()
 	if err := awaitDone(t, done); !errors.Is(err, ErrRemovalAborted) {
 		t.Fatalf("download finished with %v, want ErrRemovalAborted", err)
 	}
-	if entries, err := os.ReadDir(u.opts.Store.Dir()); err != nil || len(entries) != 0 {
+	if entries, err := os.ReadDir(u.opts.Store.Dir()); err != nil || len(entries) != 1 || entries[0].Name() != store.EnrollmentLockFile {
 		t.Fatalf("late download modified the state directory: %v, %v", entries, err)
 	}
 	if ok, err := u.TryInstall(); ok || err != nil || inst.installed.Load() != 0 || restarts.Load() != 0 {

@@ -3,26 +3,31 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
 
-// ResetDir deletes the whole content of the state directory dir, including the
-// identity, without opening a Store: unlike Open it creates no runtime
-// subdirectory and needs no healthy layout, so a reset also works when an
-// entry has the wrong type (for example a regular file at images) or the
-// layout is incomplete. The directory itself stays.
+const resetEnrollmentLockWait = 45 * time.Second
+
+// ResetDir deletes the state directory contents, including the identity,
+// while holding the enrollment lock. The directory and lock file stay.
+// ResetDir needs no Store and works when the runtime layout is damaged.
 //
-// An absent directory counts as empty and is not an error. A path that is not
-// a directory, an unreadable directory and an empty dir are errors. A failure
-// to delete one entry does not stop the deletion of the others: an entry that
-// stays (for example, a log file that another process holds open) must not
-// keep the identity on disk. ResetDir returns every failure joined into one
-// error. Deletion goes through removeAll, so a read-only directory of a copied
-// tree does not stop it.
+// An absent directory counts as empty. If the lock cannot be acquired, no
+// entries are removed. Once the lock is held, ResetDir attempts every
+// deletion and returns all failures together.
 func ResetDir(dir string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), resetEnrollmentLockWait)
+	defer cancel()
+	return resetDir(ctx, dir)
+}
+
+func resetDir(ctx context.Context, dir string) error {
 	if dir == "" {
 		return errors.New("store: state directory is required")
 	}
@@ -39,13 +44,37 @@ func ResetDir(dir string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("store: state directory %q is not a directory", dir)
 	}
+	unlock, err := acquireEnrollmentLock(ctx, dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("store: read state directory: %w", err)
 	}
 	var errs []error
 	for _, e := range entries {
-		if err := removeAll(filepath.Join(dir, e.Name())); err != nil {
+		path := filepath.Join(dir, e.Name())
+		// A process waiting on the open file must still share this lock
+		// with processes that open it after reset.
+		if e.Name() == EnrollmentLockFile {
+			continue
+		}
+		if strings.EqualFold(e.Name(), EnrollmentLockFile) {
+			// The lock can have different casing on a case-insensitive volume.
+			lock, lockErr := os.Lstat(filepath.Join(dir, EnrollmentLockFile))
+			entry, entryErr := e.Info()
+			if err := errors.Join(lockErr, entryErr); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if os.SameFile(lock, entry) {
+				continue
+			}
+		}
+		if err := removeAll(path); err != nil {
 			errs = append(errs, err)
 		}
 	}
