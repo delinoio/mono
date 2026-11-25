@@ -30,6 +30,7 @@ export function InvitationPage({ configured }: { configured: boolean }) {
   });
   const accept = useMutation(BillingAccountService.method.acceptInvitation);
   const resetAccept = accept.reset;
+  const signingIn = useRef(false);
   // Identifies the invitation attempt that the page shows. A new link or the
   // unmount of the page replaces it, so the late success of an earlier
   // request does not navigate away from what the user sees.
@@ -47,10 +48,19 @@ export function InvitationPage({ configured }: { configured: boolean }) {
   }, []);
 
   useEffect(() => {
+    if (auth.signInFailed) {
+      signingIn.current = false;
+    }
+  }, [auth.signInFailed]);
+
+  useEffect(() => {
     // A new link opened while the page is shown.
     const onHash = () => {
       const next = openInvitationFromAddress(window.location, window.history);
       if (next !== undefined) {
+        if (signingIn.current) {
+          pendingInvitation.save(next);
+        }
         currentAttempt.current += 1;
         resetAccept();
         setAttempt((n) => n + 1);
@@ -75,6 +85,14 @@ export function InvitationPage({ configured }: { configured: boolean }) {
     );
   }
 
+  function signIn(invitationToken: string) {
+    // The fragment does not survive the redirect. Keep the handoff active
+    // until the page leaves or sign-in reports a failure.
+    signingIn.current = true;
+    pendingInvitation.save(invitationToken);
+    return auth.signIn();
+  }
+
   if (!auth.isAuthenticated) {
     return (
       <Page narrow>
@@ -84,16 +102,7 @@ export function InvitationPage({ configured }: { configured: boolean }) {
         />
         {configured ? (
           <>
-            <Button
-              onClick={async () => {
-                // The fragment does not survive the sign-in redirect, so the
-                // token waits in sessionStorage until AcceptInvitation returns.
-                pendingInvitation.save(token);
-                await auth.signIn();
-              }}
-            >
-              Sign in to accept
-            </Button>
+            <Button onClick={() => signIn(token)}>Sign in to accept</Button>
             <SignInFailureNotice />
           </>
         ) : (
@@ -110,15 +119,7 @@ export function InvitationPage({ configured }: { configured: boolean }) {
         description="You join as the signed-in user. The invitation works only once and only for the invited email address."
       />
       {accept.error ? (
-        <ErrorNotice
-          error={accept.error}
-          onSignIn={async () => {
-            // The accept handler deleted the token after the failure, and the
-            // fragment does not survive the sign-in redirect, so save it again.
-            pendingInvitation.save(token);
-            await auth.signIn();
-          }}
-        />
+        <ErrorNotice error={accept.error} onSignIn={() => signIn(token)} />
       ) : null}
       <div className="actions">
         <Button
