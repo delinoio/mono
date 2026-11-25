@@ -95,7 +95,8 @@
 #   DROPLET_PROXY           reverse proxy container name (default caddy).
 #   DROPLET_ID_SOURCE       file that yields a fresh UUID on every read (default
 #                           /proc/sys/kernel/random/uuid). Tests replace it.
-#   DROPLET_HEALTH_TIMEOUT  seconds to wait for the health check (default 120).
+#   DROPLET_HEALTH_TIMEOUT  whole decimal seconds to wait for the health check,
+#                           from 0 to 9223372036 (unset or empty: 120).
 #   DROPLET_STOP_TIMEOUT    seconds between SIGTERM and SIGKILL. Accounts API
 #                           defaults to 60 and requires at least 60 for old
 #                           containers and failed replacements. Other
@@ -173,6 +174,13 @@ main() {
   local network="${DROPLET_NETWORK:-delino}"
   local proxy="${DROPLET_PROXY:-caddy}"
   local health_timeout="${DROPLET_HEALTH_TIMEOUT:-120}"
+  # Limit the capture before arithmetic and discard leading zeros so Bash
+  # always reads the timeout as decimal.
+  if [[ ! "$health_timeout" =~ ^0*([1-9][0-9]{0,9}|0)$ ]] ||
+    (( BASH_REMATCH[1] > 9223372036 )); then
+    fail "DROPLET_HEALTH_TIMEOUT must be a whole number of seconds from 0 to 9223372036."
+  fi
+  health_timeout="${BASH_REMATCH[1]}"
   local stop_timeout="${DROPLET_STOP_TIMEOUT:-30}"
   local replacement_stop_timeout=""
   if [[ "$service" == accounts-api ]]; then

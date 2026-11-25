@@ -3639,6 +3639,72 @@ test(
   },
 );
 
+test(
+  "droplet deploy validates the decimal health timeout before the UDP handoff",
+  { skip },
+  (t) => {
+    const options = {
+      old: ["old1"],
+      route: "# old route\n",
+      state: `${olderImage}\n`,
+      previous: `${oldestImage}\n`,
+    };
+    for (const timeout of [
+      "-1",
+      "+8",
+      "8.5",
+      " 8",
+      "1+2",
+      "9223372037",
+      "999999999999999999999999",
+    ]) {
+      const result = runDroplet(t, udpArgs, {
+        ...options,
+        env: { DROPLET_HEALTH_TIMEOUT: timeout },
+      });
+      assert.equal(result.status, 1, timeout);
+      assert.match(
+        result.stderr,
+        /DROPLET_HEALTH_TIMEOUT must be a whole number of seconds/,
+        timeout,
+      );
+      assert.deepEqual(result.calls, [""], timeout);
+      assert.equal(
+        result.read("caddy/sites/api.caddy"),
+        options.route,
+        timeout,
+      );
+      assert.equal(result.read("state/api.current"), options.state, timeout);
+      assert.equal(
+        result.read("state/api.previous"),
+        options.previous,
+        timeout,
+      );
+    }
+
+    const zero = runDroplet(t, udpArgs, {
+      ...options,
+      env: { DROPLET_HEALTH_TIMEOUT: "000" },
+    });
+    assert.equal(zero.status, 1);
+    assert.match(zero.stderr, /did not pass the health check within 0 seconds/);
+    assert.ok(!zero.calls.some((call) => call.startsWith("docker inspect")));
+    assert.match(zero.calls.at(-2), /^docker rm --force api-/);
+    assert.equal(zero.calls.at(-1), "docker start old1");
+
+    for (const timeout of ["08", "09", "010", undefined, ""]) {
+      const result = runDroplet(t, udpArgs, {
+        ...options,
+        env: { DROPLET_HEALTH_TIMEOUT: timeout, STUB_STATUS: "exited" },
+      });
+      assert.equal(result.status, 1, timeout);
+      assert.match(result.stderr, /is exited, not running/, timeout);
+      assert.match(result.calls.at(-2), /^docker rm --force api-/, timeout);
+      assert.equal(result.calls.at(-1), "docker start old1", timeout);
+    }
+  },
+);
+
 test("droplet deploy accepts only a 2xx health status", { skip }, (t) => {
   for (const code of ["200", "204"]) {
     const result = runDroplet(t, undefined, {
