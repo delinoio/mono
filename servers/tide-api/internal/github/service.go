@@ -327,13 +327,10 @@ func (h *Handler) UpdateGitHubInstallation(ctx context.Context, req *connect.Req
 	return connect.NewResponse(&tidev1.UpdateGitHubInstallationResponse{Installation: out.proto()}), nil
 }
 
-// UnlinkGitHubInstallation removes a link. It first removes the GitHub
-// registrations of the installation's runners that wait for a job (while
-// the app can still reach the installation), then, in one transaction,
-// deletes the link, cancels the QUEUED requests, ends the started ones and
-// deletes the waiting runners. A runner whose removal GitHub refused took a
-// job and finishes it. It also works without a GitHub App configuration;
-// there is then no registration to remove.
+// UnlinkGitHubInstallation removes the GitHub registrations of idle runners
+// while holding the installation lock. It then deletes the link, ends open
+// requests and schedules sandbox deletion in the same transaction. A runner
+// whose removal GitHub refused stays so it can finish its job.
 func (h *Handler) UnlinkGitHubInstallation(ctx context.Context, req *connect.Request[tidev1.UnlinkGitHubInstallationRequest]) (*connect.Response[tidev1.UnlinkGitHubInstallationResponse], error) {
 	l := h.l
 	s := l.svc
@@ -349,20 +346,6 @@ func (h *Handler) UnlinkGitHubInstallation(ctx context.Context, req *connect.Req
 	if err != nil {
 		return nil, s.Internal(ctx, "get github installation", err)
 	}
-	skip := map[string]bool{}
-	if l.Configured() && inst.Active() {
-		idle, err := l.idleRunners(ctx, s.DB.Pool, c.OrganizationID, inst.PoolKey())
-		if err != nil {
-			return nil, s.Internal(ctx, "list runners", err)
-		}
-		for _, r := range idle {
-			refused, err := l.removeRegistration(ctx, inst, r.ID)
-			if err != nil {
-				return nil, l.gitHubUnavailable(ctx, "remove runner registration", err)
-			}
-			skip[r.ID] = refused
-		}
-	}
 	var deleted []string
 	err = s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
@@ -374,6 +357,25 @@ func (h *Handler) UnlinkGitHubInstallation(ctx context.Context, req *connect.Req
 		}
 		if cur == nil || cur.ID != inst.ID {
 			return api.ErrNotFound("GitHub installation")
+		}
+		skip := map[string]bool{}
+		if l.Configured() && cur.Active() {
+			idle, err := l.idleRunners(ctx, tx, cur.OrganizationID, cur.PoolKey())
+			if err != nil {
+				return err
+			}
+			for _, r := range idle {
+				refused, err := l.removeRegistration(ctx, tx, cur, r.ID)
+				if err != nil {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					return api.ErrUnavailable("GitHub runner registration could not be removed; try again")
+				}
+				if refused {
+					skip[r.ID] = true
+				}
+			}
 		}
 		if deleted, err = l.deactivateTx(ctx, tx, cur, skip); err != nil {
 			return err

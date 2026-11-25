@@ -615,7 +615,7 @@ func (l *Layer) removeIdleRunner(ctx context.Context, inst *Installation, orgID,
 		if !l.Configured() || inst == nil || !inst.Active() {
 			return false, nil
 		}
-		refused, err := l.removeRegistration(ctx, inst, runnerID)
+		refused, err := l.removeRegistration(ctx, l.svc.DB.Pool, inst, runnerID)
 		if err != nil || refused {
 			return false, err
 		}

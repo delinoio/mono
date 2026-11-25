@@ -88,54 +88,10 @@ func (a *Adapter) Start(ctx context.Context, g *work.Guest) (work.StartResult, e
 	if g.Profile == nil {
 		return work.StartResult{}, errors.New("the runner profile was deleted")
 	}
-	inst, err := l.poolInstallation(ctx, l.svc.DB.Pool, r.OrganizationID, r.PoolKey)
+	jit, err := l.startRegistration(ctx, r, g.Profile.GitHubLabel())
 	if err != nil {
 		return work.StartResult{}, err
 	}
-	if inst == nil || !inst.Active() {
-		return work.StartResult{}, errors.New("the GitHub installation of the runner pool is not linked or not active")
-	}
-	// A previous start of the same runner (for example before a lease
-	// handover) may have registered it; remove that registration first.
-	if prev, err := l.registration(ctx, l.svc.DB.Pool, r.ID); err != nil {
-		return work.StartResult{}, err
-	} else if prev != nil && !prev.removed && prev.githubRunnerID != 0 {
-		if err := l.gh.DeleteRunner(ctx, inst.GitHubID, inst.Login, prev.githubRunnerID); err != nil {
-			return work.StartResult{}, fmt.Errorf("remove the previous registration: %w", err)
-		}
-	}
-	label := g.Profile.GitHubLabel()
-	if _, err := l.svc.DB.Pool.Exec(ctx, `INSERT INTO github_runners (runner_id, organization_id, github_installation_id, github_label) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (runner_id) DO UPDATE SET github_runner_id = NULL, registration_removed = false, github_label = EXCLUDED.github_label`,
-		r.ID, r.OrganizationID, inst.GitHubID, label); err != nil {
-		return work.StartResult{}, err
-	}
-	name := RunnerNamePrefix + r.ID
-	labels := []string{label}
-	jit, err := l.gh.GenerateJITConfig(ctx, inst.GitHubID, inst.Login, name, inst.RunnerGroupID, labels)
-	if errors.Is(err, githubapi.ErrRunnerNameTaken) {
-		// GitHub does not document the cause of 409; a registration with the
-		// name from an earlier attempt is the likely one. Remove it and try
-		// once more.
-		found, ferr := l.gh.FindRunner(ctx, inst.GitHubID, inst.Login, name)
-		if ferr != nil {
-			return work.StartResult{}, ferr
-		}
-		if found != nil {
-			if derr := l.gh.DeleteRunner(ctx, inst.GitHubID, inst.Login, found.ID); derr != nil {
-				return work.StartResult{}, derr
-			}
-		}
-		jit, err = l.gh.GenerateJITConfig(ctx, inst.GitHubID, inst.Login, name, inst.RunnerGroupID, labels)
-	}
-	if err != nil {
-		return work.StartResult{}, err
-	}
-	if err := l.recordRegistration(ctx, inst, r.ID, jit.Runner.ID); err != nil {
-		return work.StartResult{}, err
-	}
-	l.svc.Logger.InfoContext(ctx, "github_runner_registered", slog.String("organization_id", r.OrganizationID), slog.String("runner_id", r.ID),
-		slog.Int64("github_installation_id", inst.GitHubID), slog.Int64("github_runner_id", jit.Runner.ID), slog.Int64("github_runner_group_id", inst.RunnerGroupID))
 	cfg := []byte(jit.EncodedJITConfig)
 	jit.EncodedJITConfig = ""
 	fw, err := g.Client.OpenFileWrite(r.SandboxID, ownsand.FileWriteParams{WriteID: api.NewID(), Path: JITFilePath(r.GuestOS)})
@@ -170,48 +126,134 @@ func (a *Adapter) Start(ctx context.Context, g *work.Guest) (work.StartResult, e
 // example as a surplus runner) before its registration was recorded.
 var errDeletedWhileStarting = errors.New("the runner was deleted while it started")
 
-// recordRegistration stores the GitHub runner ID of a new registration. It
-// locks the runner row, like removeIdleRunner, so a deletion of a waiting
-// runner either sees the registration (and removes it at GitHub first) or
-// comes first: then the runner is no longer PREPARING, the registration is
-// removed here, and the start fails before the runner program starts.
-func (l *Layer) recordRegistration(ctx context.Context, inst *Installation, runnerID string, githubRunnerID int64) error {
-	var starting, readyToCommit bool
-	err := l.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
-		var state int16
-		if err := tx.QueryRow(ctx, "SELECT state FROM runners WHERE runner_id = $1 FOR UPDATE", runnerID).Scan(&state); err != nil {
+// startRegistration holds a share lock on the installation until it publishes
+// the runner ID. Unlink holds the exclusive lock before reading runner IDs.
+func (l *Layer) startRegistration(ctx context.Context, r *work.Runner, label string) (*githubapi.JITConfig, error) {
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	inst, err := l.poolInstallation(ctx, l.svc.DB.Pool, r.OrganizationID, r.PoolKey)
+	if err != nil {
+		return nil, err
+	}
+	unavailable := errors.New("the GitHub installation of the runner pool is not linked or not active")
+	if inst == nil || !inst.Active() {
+		return nil, unavailable
+	}
+	// Keep the placeholder's foreign-key locks out of the JIT transaction.
+	// A retry must keep the previous ID visible until its replacement commits.
+	if _, err := l.svc.DB.Pool.Exec(ctx, `INSERT INTO github_runners (runner_id, organization_id, github_installation_id, github_label) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (runner_id) DO NOTHING`, r.ID, r.OrganizationID, inst.GitHubID, label); err != nil {
+		return nil, err
+	}
+
+	var jit *githubapi.JITConfig
+	var starting bool
+	err = l.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+		cur, err := l.byGitHubID(ctx, tx, inst.GitHubID, lockShare)
+		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, "UPDATE github_runners SET github_runner_id = $2 WHERE runner_id = $1", runnerID, githubRunnerID); err != nil {
+		if cur == nil || cur.ID != inst.ID || !cur.Active() {
+			return unavailable
+		}
+		inst = cur
+
+		// A previous start may have registered this runner before a lease handover.
+		prev, err := l.registration(ctx, tx, r.ID)
+		if err != nil {
 			return err
 		}
-		s := tidev1.RunnerState(state)
-		starting = s == tidev1.RunnerState_RUNNER_STATE_PREPARING || s == tidev1.RunnerState_RUNNER_STATE_WARM
-		readyToCommit = true
+		if prev != nil && !prev.removed && prev.githubRunnerID != 0 {
+			if err := l.gh.DeleteRunner(ctx, inst.GitHubID, inst.Login, prev.githubRunnerID); err != nil {
+				return fmt.Errorf("remove the previous registration: %w", err)
+			}
+		}
+		jit, err = l.generateJITConfig(ctx, inst, r.ID, label)
+		if err != nil {
+			return err
+		}
+
+		// A savepoint lets us undo a failed write and remove the GitHub
+		// registration before releasing the installation lock.
+		err = pgx.BeginFunc(ctx, tx, func(tx pgx.Tx) error {
+			var writeErr error
+			starting, writeErr = recordRegistration(ctx, tx, r.ID, label, jit.Runner.ID)
+			return writeErr
+		})
+		if err != nil {
+			l.rollbackRegistration(ctx, inst, r.ID, jit.Runner.ID)
+			jit = nil
+			return err
+		}
+		if !starting {
+			// A surplus removal can delete the runner before its ID is stored.
+			// Preserve the ID so a later cleanup can retry a failed GitHub call.
+			if _, err := l.removeRegistration(ctx, tx, inst, r.ID); err != nil {
+				l.svc.Logger.WarnContext(ctx, "github_runner_removal_failed", slog.String("organization_id", inst.OrganizationID), slog.String("runner_id", r.ID), slog.Any("error", err))
+			}
+		}
 		return nil
 	})
 	if err != nil {
-		if !readyToCommit || registrationCommitRolledBack(err) {
-			// The normal sandbox cleanup cannot look up this GitHub ID.
-			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			defer cancel()
-			if cleanupErr := l.gh.DeleteRunner(cleanupCtx, inst.GitHubID, inst.Login, githubRunnerID); cleanupErr != nil {
-				l.svc.Logger.WarnContext(cleanupCtx, "github_runner_removal_failed",
-					slog.String("organization_id", inst.OrganizationID), slog.String("runner_id", runnerID),
-					slog.Int64("github_installation_id", inst.GitHubID), slog.Int64("github_runner_id", githubRunnerID), slog.Any("error", cleanupErr))
-			}
+		if jit != nil && registrationCommitRolledBack(err) {
+			l.rollbackRegistration(ctx, inst, r.ID, jit.Runner.ID)
 		}
-		return err
+		return nil, err
 	}
-	if starting {
-		return nil
+	if !starting {
+		return nil, errDeletedWhileStarting
 	}
-	// The runner never connected, so GitHub accepts the removal. When it
-	// fails, the deletion of the runner (a DELETING runner) repeats it.
-	if _, err := l.removeRegistration(context.WithoutCancel(ctx), inst, runnerID); err != nil {
-		l.svc.Logger.WarnContext(ctx, "github_runner_removal_failed", slog.String("organization_id", inst.OrganizationID), slog.String("runner_id", runnerID), slog.Any("error", err))
+	l.svc.Logger.InfoContext(ctx, "github_runner_registered", slog.String("organization_id", r.OrganizationID), slog.String("runner_id", r.ID),
+		slog.Int64("github_installation_id", inst.GitHubID), slog.Int64("github_runner_id", jit.Runner.ID), slog.Int64("github_runner_group_id", inst.RunnerGroupID))
+	return jit, nil
+}
+
+func (l *Layer) generateJITConfig(ctx context.Context, inst *Installation, runnerID, label string) (*githubapi.JITConfig, error) {
+	name := RunnerNamePrefix + runnerID
+	labels := []string{label}
+	jit, err := l.gh.GenerateJITConfig(ctx, inst.GitHubID, inst.Login, name, inst.RunnerGroupID, labels)
+	if !errors.Is(err, githubapi.ErrRunnerNameTaken) {
+		return jit, err
 	}
-	return errDeletedWhileStarting
+	// GitHub does not document why it returns 409. A previous registration
+	// with the same name can cause it. Remove that registration and retry once.
+	found, err := l.gh.FindRunner(ctx, inst.GitHubID, inst.Login, name)
+	if err != nil {
+		return nil, err
+	}
+	if found != nil {
+		if err := l.gh.DeleteRunner(ctx, inst.GitHubID, inst.Login, found.ID); err != nil {
+			return nil, err
+		}
+	}
+	return l.gh.GenerateJITConfig(ctx, inst.GitHubID, inst.Login, name, inst.RunnerGroupID, labels)
+}
+
+// recordRegistration locks the runner row in the same order as surplus
+// removal. If deletion has already started, the caller removes the late
+// registration and skips starting the runner program.
+func recordRegistration(ctx context.Context, tx pgx.Tx, runnerID, label string, githubRunnerID int64) (bool, error) {
+	var state int16
+	if err := tx.QueryRow(ctx, "SELECT state FROM runners WHERE runner_id = $1 FOR UPDATE", runnerID).Scan(&state); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, "UPDATE github_runners SET github_runner_id = $2, github_label = $3, registration_removed = false WHERE runner_id = $1",
+		runnerID, githubRunnerID, label); err != nil {
+		return false, err
+	}
+	s := tidev1.RunnerState(state)
+	return s == tidev1.RunnerState_RUNNER_STATE_PREPARING || s == tidev1.RunnerState_RUNNER_STATE_WARM, nil
+}
+
+func (l *Layer) rollbackRegistration(ctx context.Context, inst *Installation, runnerID string, githubRunnerID int64) {
+	// Normal sandbox cleanup cannot look up a runner ID that did not commit.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if err := l.gh.DeleteRunner(cleanupCtx, inst.GitHubID, inst.Login, githubRunnerID); err != nil {
+		l.svc.Logger.WarnContext(cleanupCtx, "github_runner_removal_failed",
+			slog.String("organization_id", inst.OrganizationID), slog.String("runner_id", runnerID),
+			slog.Int64("github_installation_id", inst.GitHubID), slog.Int64("github_runner_id", githubRunnerID), slog.Any("error", err))
+	}
 }
 
 func registrationCommitRolledBack(err error) bool {
@@ -261,7 +303,7 @@ func (a *Adapter) RemoveRegistration(ctx context.Context, r *work.Runner) error 
 	if inst == nil || !inst.Active() {
 		return nil
 	}
-	_, err = l.removeRegistration(ctx, inst, r.ID)
+	_, err = l.removeRegistration(ctx, l.svc.DB.Pool, inst, r.ID)
 	if err == nil {
 		return nil
 	}
