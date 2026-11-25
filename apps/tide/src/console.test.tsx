@@ -398,6 +398,7 @@ describe("organization member pagination", () => {
         await waitFor(() =>
           expect(screen.queryByText(laterMemberId)).toBeNull(),
         );
+        expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}/members`);
         expect(remove).toHaveBeenCalledExactlyOnceWith(
           expect.objectContaining(target),
         );
@@ -2799,24 +2800,135 @@ describe("confirmation dialog requests", () => {
     expect(confirmButton(second).disabled).toBe(false);
   });
 
-  test.each([
-    [MOCK_IDS.northwind, "members", "Leave organization", "RemoveMember"],
-    [MOCK_IDS.acme, "settings", "Delete organization", "DeleteOrganization"],
-  ])(
-    "a dismissed %s/%s confirmation does not redirect when %s succeeds",
-    async (organizationId, section, label, method) => {
+  const organizationActions = [
+    {
+      organizationId: MOCK_IDS.northwind,
+      path: `/orgs/${MOCK_IDS.northwind}/members`,
+      label: "Leave organization",
+      method: "RemoveMember",
+      name: "Northwind Labs",
+    },
+    {
+      organizationId: MOCK_IDS.acme,
+      path: `/orgs/${MOCK_IDS.acme}/settings`,
+      label: "Delete organization",
+      method: "DeleteOrganization",
+      name: "Acme Robotics",
+    },
+  ];
+
+  async function submitOrganizationAction(label: string) {
+    await click(await screen.findByRole("button", { name: label }));
+    const dialog = await screen.findByRole("alertdialog");
+    await click(within(dialog).getByRole("button", { name: label }));
+    return dialog;
+  }
+
+  test.each(organizationActions)(
+    "goes home before the list refresh finishes after $label",
+    async ({ path, label, method, name }) => {
       const { transport, calls } = gatedTransport(method);
-      renderConsole(`/orgs/${organizationId}/${section}`, { transport });
-      await click(await screen.findByRole("button", { name: label }));
-      const dialog = await screen.findByRole("alertdialog");
-      await click(within(dialog).getByRole("button", { name: label }));
+      let releaseList!: () => void;
+      const listRefresh = new Promise<void>((resolve) => {
+        releaseList = resolve;
+      });
+      const onListRefresh = rs.fn();
+      let holdList = false;
+      const heldTransport: Transport = {
+        ...transport,
+        async unary(method, ...args) {
+          if (method.name === "ListOrganizations" && holdList) {
+            onListRefresh();
+            await listRefresh;
+          }
+          return transport.unary(method, ...args);
+        },
+      };
+      renderConsole(path, {
+        transport: heldTransport,
+        staleTime: Infinity,
+      });
+      await screen.findByRole("combobox", { name: "Organization" });
+      await submitOrganizationAction(label);
+
+      try {
+        holdList = true;
+        await act(async () => calls[0].settle());
+        await waitFor(() => expect(onListRefresh).toHaveBeenCalled());
+        expect(window.location.pathname).toBe("/");
+      } finally {
+        await act(async () => releaseList());
+      }
+
+      const list = await screen.findByRole("list", {
+        name: "Your organizations",
+      });
+      await waitFor(() =>
+        expect(
+          within(list).queryByRole("link", { name: new RegExp(name) }),
+        ).toBeNull(),
+      );
+      expect(
+        screen.queryByText(
+          "It was not found, or you no longer have access to it.",
+        ),
+      ).toBeNull();
+    },
+  );
+
+  test.each(organizationActions)(
+    "a dismissed $label confirmation refreshes the data without taking the user home",
+    async ({ organizationId, path, label, method }) => {
+      const { transport, calls } = gatedTransport(method);
+      const listReads = rs.fn();
+      const observedTransport: Transport = {
+        ...transport,
+        unary(method, ...args) {
+          if (method.name === "ListOrganizations") listReads();
+          return transport.unary(method, ...args);
+        },
+      };
+      renderConsole(path, {
+        transport: observedTransport,
+        staleTime: Infinity,
+      });
+      await screen.findByRole("combobox", { name: "Organization" });
+      const dialog = await submitOrganizationAction(label);
       await click(within(dialog).getByRole("button", { name: "Cancel" }));
       await click(screen.getByRole("link", { name: "Requests" }));
-      const path = `/orgs/${organizationId}/requests`;
-      expect(window.location.pathname).toBe(path);
+      const requestsPath = `/orgs/${organizationId}/requests`;
+      const historyLength = window.history.length;
+      expect(window.location.pathname).toBe(requestsPath);
+      expect(listReads).toHaveBeenCalledTimes(1);
 
       await act(async () => calls[0].settle());
-      await settle();
+      await screen.findByText(
+        "It was not found, or you no longer have access to it.",
+      );
+      expect(listReads).toHaveBeenCalledTimes(2);
+      expect(window.location.pathname).toBe(requestsPath);
+      expect(window.history.length).toBe(historyLength);
+    },
+  );
+
+  test.each(organizationActions)(
+    "keeps the current route and shows the $label error in the dialog",
+    async ({ path, label, method }) => {
+      const { transport, calls } = gatedTransport(method);
+      renderConsole(path, { transport });
+      const dialog = await submitOrganizationAction(label);
+
+      await act(async () =>
+        calls[0].settle(
+          new ConnectError(
+            "Organization action failed",
+            Code.FailedPrecondition,
+          ),
+        ),
+      );
+      expect(
+        await within(dialog).findByText("Organization action failed"),
+      ).toBeTruthy();
       expect(window.location.pathname).toBe(path);
     },
   );

@@ -147,9 +147,7 @@ function OwnerActions() {
     onSuccess: () =>
       invalidateServices(queryClient, OrganizationService, MemberService),
   });
-  const remove = useMutation(OrganizationService.method.deleteOrganization, {
-    onSuccess: () => invalidateServices(queryClient, OrganizationService),
-  });
+  const remove = useMutation(OrganizationService.method.deleteOrganization);
   const [target, setTarget] = useState<string | null>(null);
   const [confirmTransfer, setConfirmTransfer] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -224,7 +222,9 @@ function OwnerActions() {
         confirmLabel="Delete organization"
         onConfirm={async (opening) => {
           await remove.mutateAsync({ organizationId });
+          // Refreshing the old route can unmount the confirmation.
           if (opening.isCurrent()) navigate("/");
+          await invalidateServices(queryClient, OrganizationService);
         }}
       />
     </>
