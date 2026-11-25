@@ -112,6 +112,8 @@ func (b *BuildVM) Dial(ctx context.Context) (net.Conn, error) {
 		select {
 		case <-b.sys.exited:
 			cancel()
+		case <-b.stop:
+			cancel()
 		case <-ctx.Done():
 		}
 	}()
@@ -146,22 +148,22 @@ func (b *BuildVM) WaitReady(ctx context.Context, timeout, progress time.Duration
 			return r.version, nil
 		case <-b.sys.exited:
 			return "", errors.New("hcsrt: the build VM stopped before its guest helper answered")
+		case <-b.stop:
+			return "", errSystemHandleClosed
 		case <-tick.C:
 			b.logger.Info("waiting for Windows setup to finish", "elapsed", time.Since(start).Round(time.Second).String())
 		}
 	}
 }
 
-// WaitExit waits until the guest shut down, at most timeout.
+// WaitExit waits at most timeout for confirmation that the guest shut down.
 func (b *BuildVM) WaitExit(ctx context.Context, timeout time.Duration) error {
-	select {
-	case <-b.sys.exited:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(timeout):
-		return fmt.Errorf("hcsrt: the build VM did not shut down within %v", timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := b.sys.waitExit(ctx); err != nil {
+		return fmt.Errorf("hcsrt: could not confirm build VM shutdown: %w", err)
 	}
+	return nil
 }
 
 // Close terminates the VM, if it still runs, and releases it. It is
@@ -169,18 +171,14 @@ func (b *BuildVM) WaitExit(ctx context.Context, timeout time.Duration) error {
 func (b *BuildVM) Close() { b.closeOnce.Do(b.close) }
 
 func (b *BuildVM) close() {
-	select {
-	case <-b.sys.exited:
-	default:
-		_ = b.sys.terminate()
-		select {
-		case <-b.sys.exited:
-		case <-time.After(stopTimeout):
-		}
-	}
 	close(b.stop)
+	if !b.sys.exitConfirmed() {
+		_ = b.sys.terminate()
+		ctx, cancel := context.WithTimeout(context.Background(), stopSystemTimeout)
+		_ = b.sys.waitExit(ctx)
+		cancel()
+	}
 	b.sys.close()
-	b.sys.markExited()
 	select {
 	case <-b.console:
 	case <-time.After(stopTimeout):
