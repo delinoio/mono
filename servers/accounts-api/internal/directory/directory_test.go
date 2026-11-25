@@ -63,6 +63,10 @@ func TestLogtoUser(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "u1", "primaryEmail": "A@Example.com", "name": "Ann", "username": nil})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/users/u2":
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "u2", "primaryEmail": nil, "name": nil})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/users/u3":
+			_, _ = io.WriteString(w, `{"id":"u3"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/users/null":
+			_, _ = io.WriteString(w, "null")
 		case r.Method == http.MethodGet && r.URL.Path == "/api/users/broken":
 			w.WriteHeader(http.StatusInternalServerError)
 		default:
@@ -95,9 +99,14 @@ func TestLogtoUser(t *testing.T) {
 	if gotRetry != "Bearer tok2" {
 		t.Fatalf("retry Authorization = %q, want the replacement token %q", gotRetry, "Bearer tok2")
 	}
-	user, err = l.User(ctx, "u2")
-	if err != nil || user != (directory.User{}) {
-		t.Fatalf("User(u2) = %+v, %v", user, err)
+	for _, id := range []string{"u2", "u3"} {
+		user, err = l.User(ctx, id)
+		if err != nil || user != (directory.User{}) {
+			t.Fatalf("User(%s) = %+v, %v", id, user, err)
+		}
+	}
+	if _, err := l.User(ctx, "null"); err == nil || err.Error() != "logto user response is not valid" {
+		t.Fatalf("User(null) error = %v, want an invalid-response error", err)
 	}
 	if tokens.Load() != 2 {
 		t.Fatalf("the cached token was not reused: %d requests", tokens.Load())
