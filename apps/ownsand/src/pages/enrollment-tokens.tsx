@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
-import { useQueryClient } from "@tanstack/react-query";
+import {
+  createInfiniteQueryOptions,
+  useMutation,
+  useTransport,
+} from "@connectrpc/connect-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { toast } from "delino-ui/toast";
@@ -27,6 +31,7 @@ import { formatTime, labels } from "../format.ts";
 import {
   FOLLOW_ALL_PAGES_OPTIONS,
   boundaryOf,
+  cancelUncachedList,
   uniqueRows,
   useFollowAllPages,
 } from "../pagination.ts";
@@ -38,17 +43,24 @@ const TTL_HOURS = [1, 6, 12, 24] as const;
 export function EnrollmentTokensPage() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
+  const transport = useTransport();
   const refresh = () => invalidateServices(queryClient, DeviceService);
   // The control plane lists tokens in ascending ID order, so a new token is on
   // the last page. Read every page, or it could not be revoked from here.
-  const list = useInfiniteQuery(
-    DeviceService.method.listEnrollmentTokens,
-    { organizationId, pageSize: 200, pageToken: "" },
-    {
-      ...FOLLOW_ALL_PAGES_OPTIONS,
-      getNextPageParam: (last) => last.nextPageToken || undefined,
-    },
-  );
+  const listOptions = (listOrganizationId: string) =>
+    createInfiniteQueryOptions(
+      DeviceService.method.listEnrollmentTokens,
+      { organizationId: listOrganizationId, pageSize: 200, pageToken: "" },
+      {
+        transport,
+        pageParamKey: FOLLOW_ALL_PAGES_OPTIONS.pageParamKey,
+        getNextPageParam: (last) => last.nextPageToken || undefined,
+      },
+    );
+  const list = useInfiniteQuery({
+    ...listOptions(organizationId),
+    ...FOLLOW_ALL_PAGES_OPTIONS,
+  });
   const pages = useFollowAllPages(list);
   const tokens = useMemo(
     () =>
@@ -59,7 +71,15 @@ export function EnrollmentTokensPage() {
     [list.data],
   );
   const create = useMutation(DeviceService.method.createEnrollmentToken, {
-    onSuccess: refresh,
+    onSuccess: async (_, { organizationId: submittedOrganizationId }) => {
+      if (submittedOrganizationId !== undefined) {
+        await cancelUncachedList(
+          queryClient,
+          listOptions(submittedOrganizationId).queryKey,
+        );
+      }
+      return refresh();
+    },
   });
   const revoke = useMutation(DeviceService.method.revokeEnrollmentToken, {
     onSuccess: refresh,

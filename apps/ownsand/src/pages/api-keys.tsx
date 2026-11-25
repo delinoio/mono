@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
-import { useQueryClient } from "@tanstack/react-query";
+import {
+  createInfiniteQueryOptions,
+  useMutation,
+  useTransport,
+} from "@connectrpc/connect-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
 import { ApiKeyState } from "@delino/ownsand-protos/v1/common_pb";
@@ -25,6 +29,7 @@ import { formatTime, labels } from "../format.ts";
 import {
   FOLLOW_ALL_PAGES_OPTIONS,
   boundaryOf,
+  cancelUncachedList,
   uniqueRows,
   useFollowAllPages,
 } from "../pagination.ts";
@@ -33,17 +38,24 @@ import {
 export function ApiKeysPage() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
+  const transport = useTransport();
   const refresh = () => invalidateServices(queryClient, ApiKeyService);
   // The control plane lists keys in ascending ID order, so a new key is on the
   // last page. Read every page, or it could not be revoked from here.
-  const list = useInfiniteQuery(
-    ApiKeyService.method.listApiKeys,
-    { organizationId, pageSize: 200, pageToken: "" },
-    {
-      ...FOLLOW_ALL_PAGES_OPTIONS,
-      getNextPageParam: (last) => last.nextPageToken || undefined,
-    },
-  );
+  const listOptions = (listOrganizationId: string) =>
+    createInfiniteQueryOptions(
+      ApiKeyService.method.listApiKeys,
+      { organizationId: listOrganizationId, pageSize: 200, pageToken: "" },
+      {
+        transport,
+        pageParamKey: FOLLOW_ALL_PAGES_OPTIONS.pageParamKey,
+        getNextPageParam: (last) => last.nextPageToken || undefined,
+      },
+    );
+  const list = useInfiniteQuery({
+    ...listOptions(organizationId),
+    ...FOLLOW_ALL_PAGES_OPTIONS,
+  });
   const pages = useFollowAllPages(list);
   const apiKeys = useMemo(
     () =>
@@ -54,7 +66,15 @@ export function ApiKeysPage() {
     [list.data],
   );
   const create = useMutation(ApiKeyService.method.createApiKey, {
-    onSuccess: refresh,
+    onSuccess: async (_, { organizationId: submittedOrganizationId }) => {
+      if (submittedOrganizationId !== undefined) {
+        await cancelUncachedList(
+          queryClient,
+          listOptions(submittedOrganizationId).queryKey,
+        );
+      }
+      return refresh();
+    },
   });
   const revoke = useMutation(ApiKeyService.method.revokeApiKey, {
     onSuccess: refresh,

@@ -64,6 +64,15 @@ function recordToken(key: string, token: string) {
   sessionStorage.setItem(key, JSON.stringify([...tokens, token]));
 }
 
+function holdCredentialRequest(name: "create" | "list") {
+  const key = `ownsand-e2e-credential-${name}`;
+  if (sessionStorage.getItem(key) === "release") return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    window.addEventListener(`${key}-release`, () => resolve(), { once: true });
+    sessionStorage.setItem(key, "held");
+  });
+}
+
 export function createMockTransport(): Transport {
   const methodName = sessionStorage.getItem("ownsand-e2e-paged-list");
   const refreshList = sessionStorage.getItem("ownsand-e2e-refresh-list");
@@ -75,6 +84,14 @@ export function createMockTransport(): Transport {
   const pageDevices = methodName === "ListDevices";
   const pageInvitations = methodName === "ListInvitations";
   const pageSources = methodName === "SnapshotSources";
+  const credentialList = sessionStorage.getItem(
+    "ownsand-e2e-credential-method",
+  );
+  const credentialCreate =
+    credentialList === "ListApiKeys" ? "CreateApiKey" : "CreateEnrollmentToken";
+  const credentialField =
+    credentialList === "ListApiKeys" ? "apiKeys" : "tokens";
+  let credentialCreated = false;
   // Seed enough rows to split the selected list across two pages.
   const base = createBaseMock({
     extraApiKeys: Number(methodName === "ListApiKeys"),
@@ -106,6 +123,53 @@ export function createMockTransport(): Transport {
             Number(code) as Code,
           );
         }
+      }
+      if (credentialList !== null && method.name === credentialCreate) {
+        await holdCredentialRequest("create");
+        if (sessionStorage.getItem("ownsand-e2e-credential-create-fails")) {
+          throw new ConnectError(
+            "Synthetic create failure",
+            Code.InvalidArgument,
+          );
+        }
+        const response = await base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+        credentialCreated = true;
+        return response;
+      }
+      if (method.name === credentialList) {
+        const hold = !credentialCreated;
+        const response = await base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+        // Ignore the request React Strict Mode aborts on its test mount.
+        if (signal?.aborted) return response;
+        const token = (input as typeof input & { pageToken: string }).pageToken;
+        recordToken("ownsand-e2e-credential-tokens", token);
+        if (!hold) return response;
+
+        // Deliver the empty pre-create page even if the client cancels it.
+        await holdCredentialRequest("list");
+        sessionStorage.setItem("ownsand-e2e-credential-list", "delivered");
+        return {
+          ...response,
+          message: {
+            ...response.message,
+            [credentialField]: [],
+            nextPageToken: "",
+          },
+        };
       }
       if (method.name === "ListOrganizations") {
         await failOrganizationListIfConfigured();
