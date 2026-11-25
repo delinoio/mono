@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/delinoio/mono/cmds/internal/credstore"
@@ -164,7 +163,7 @@ func (a *app) tokenSource() (tide.TokenSource, error) {
 	if creds.Resource != "" {
 		cfg.Resource = creds.Resource
 	}
-	var mu sync.Mutex
+	refreshLock := make(chan struct{}, 1)
 	var staleErr error
 	fresh := func() bool {
 		return creds.AccessToken != "" && time.Until(creds.AccessTokenExpiry) > refreshMargin
@@ -187,8 +186,15 @@ func (a *app) tokenSource() (tide.TokenSource, error) {
 		return rotated, nil
 	}
 	return func(ctx context.Context) (string, error) {
-		mu.Lock()
-		defer mu.Unlock()
+		select {
+		case refreshLock <- struct{}{}:
+			defer func() { <-refreshLock }()
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if staleErr != nil {
 			return "", staleErr
 		}

@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"regexp"
-	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -55,16 +54,20 @@ func (a *app) mcp(ctx context.Context, name string, args []string) error {
 	a.logger = logger
 	// Serialize SDK initialization across tool calls. If it fails, the next
 	// call tries again and can load credentials saved by tide login.
-	var clientMu sync.Mutex
+	clientLock := make(chan struct{}, 1)
 	srv := mcpserver.New(mcpserver.Config{
-		Client: func() (*tide.Client, error) {
-			clientMu.Lock()
-			defer clientMu.Unlock()
-			client, err := a.sdk()
-			if err != nil {
-				return nil, describeCredentialError(err)
+		Client: func(ctx context.Context) (*tide.Client, error) {
+			select {
+			case clientLock <- struct{}{}:
+				defer func() { <-clientLock }()
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			}
-			return client, nil
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			client, err := a.sdk()
+			return client, describeCredentialError(err)
 		},
 		OrganizationID: org,
 		PassEnv:        passEnv,
