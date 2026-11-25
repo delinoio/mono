@@ -3,6 +3,8 @@
 package accountstest
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -86,4 +88,164 @@ func TestGetOrganizationBillingCountsOnlyTheCurrentMonth(t *testing.T) {
 	if q, a, _ := usage(); q != 3 || a != 30 {
 		t.Fatalf("April usage after duplicate = %d, %d; want 3, 30", q, a)
 	}
+}
+
+func TestUnlinkGateBypassesNotificationAfterRelease(t *testing.T) {
+	f := New(t, nil)
+	gate := holdUnlinkGate(t, f)
+	gate.Release()
+
+	client := f.Client()
+	const org = "synthetic-organization"
+	wantCalls := cap(gate.Entered) + 1
+	for call := 1; call <= wantCalls; call++ {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		_, err := client.UnlinkOrganization(ctx, connect.NewRequest(&accountsv1.UnlinkOrganizationRequest{OrganizationId: org}))
+		cancel()
+		if err != nil {
+			t.Fatalf("unlink call %d after release: %v", call, err)
+		}
+	}
+	if got := f.Calls(MethodUnlinkOrganization); got != wantCalls {
+		t.Fatalf("unlink calls = %d, want %d", got, wantCalls)
+	}
+	if got := len(gate.Entered); got != 0 {
+		t.Fatalf("notifications after release = %d, want 0", got)
+	}
+}
+
+func TestUnlinkGateReleaseUnblocksFullNotificationBuffer(t *testing.T) {
+	f := New(t, nil)
+	gate := holdUnlinkGate(t, f)
+	client := f.Client()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	wantCalls := cap(gate.Entered) + 1
+	results := make(chan error, wantCalls)
+	unlink := func() {
+		_, err := client.UnlinkOrganization(ctx, connect.NewRequest(&accountsv1.UnlinkOrganizationRequest{OrganizationId: "synthetic-organization"}))
+		results <- err
+	}
+
+	go unlink()
+	awaitHeldUnlink(t, ctx, gate, results)
+	gate.Entered <- struct{}{}
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for range cap(gate.Entered) - 1 {
+		go unlink()
+	}
+	for len(gate.Entered) < cap(gate.Entered) {
+		select {
+		case <-ticker.C:
+		case err := <-results:
+			t.Fatalf("unlink completed before release: %v", err)
+		case <-ctx.Done():
+			t.Fatal("timed out filling the gate notification buffer")
+		}
+	}
+
+	go unlink()
+	for f.Calls(MethodUnlinkOrganization) < wantCalls {
+		select {
+		case <-ticker.C:
+		case err := <-results:
+			t.Fatalf("unlink completed before release: %v", err)
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for the extra unlink call to reach the gate")
+		}
+	}
+	gate.Release()
+	gate.Release()
+
+	for call := 1; call <= wantCalls; call++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatalf("unlink result %d after release: %v", call, err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for unlink result %d after release", call)
+		}
+	}
+	if got := len(gate.Entered); got != cap(gate.Entered) {
+		t.Fatalf("buffered notifications after release = %d, want %d", got, cap(gate.Entered))
+	}
+	if got := f.Calls(MethodUnlinkOrganization); got != wantCalls {
+		t.Fatalf("unlink calls = %d, want %d", got, wantCalls)
+	}
+}
+
+func TestUnlinkGateReturnsConfiguredFailureAfterRelease(t *testing.T) {
+	f := New(t, nil)
+	gate := holdUnlinkGate(t, f)
+	const message = "synthetic unlink failure"
+	f.Fail(MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New(message)))
+
+	client := f.Client()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	results := make(chan error, 1)
+	go func() {
+		_, err := client.UnlinkOrganization(ctx, connect.NewRequest(&accountsv1.UnlinkOrganizationRequest{OrganizationId: "synthetic-organization"}))
+		results <- err
+	}()
+	awaitHeldUnlink(t, ctx, gate, results)
+	gate.Release()
+
+	select {
+	case err := <-results:
+		var rpcErr *connect.Error
+		if !errors.As(err, &rpcErr) || rpcErr.Code() != connect.CodeUnavailable || rpcErr.Message() != message {
+			t.Fatalf("unlink result = %v, want unavailable with message %q", err, message)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the configured failure after release")
+	}
+	if got := f.Calls(MethodUnlinkOrganization); got != 1 {
+		t.Fatalf("unlink calls = %d, want 1", got)
+	}
+}
+
+func awaitHeldUnlink(t *testing.T, ctx context.Context, gate *Gate, results <-chan error) {
+	t.Helper()
+	select {
+	case <-gate.Entered:
+	case err := <-results:
+		t.Fatalf("unlink completed before notifying the test: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the unlink notification")
+	}
+	select {
+	case err := <-results:
+		t.Fatalf("unlink completed before release: %v", err)
+	default:
+	}
+}
+
+func holdUnlinkGate(t *testing.T, f *Server) *Gate {
+	t.Helper()
+	gate := f.Hold(MethodUnlinkOrganization)
+	t.Cleanup(func() {
+		gate.Release()
+		if !t.Failed() {
+			return
+		}
+
+		// Keep draining until the server closes so a blocked send cannot hang cleanup.
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			for {
+				select {
+				case <-gate.Entered:
+				case <-done:
+					return
+				}
+			}
+		}()
+		f.srv.Close()
+	})
+	return gate
 }
