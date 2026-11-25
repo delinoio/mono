@@ -68,7 +68,7 @@ func CopyTreeContext(ctx context.Context, src, dst string) error {
 		}
 		switch {
 		case d.IsDir():
-			if err := mkdirCopyDir(target, info.Mode().Perm()); err != nil {
+			if err := MkdirAllWithOwnerAccess(target, info.Mode().Perm()); err != nil {
 				return err
 			}
 			dirs = append(dirs, dirMode{path: target, perm: info.Mode().Perm()})
@@ -101,9 +101,11 @@ func CopyTreeContext(ctx context.Context, src, dst string) error {
 	return nil
 }
 
-// mkdirCopyDir creates missing components in order so that a restrictive
-// umask cannot prevent creation of the next component.
-func mkdirCopyDir(path string, perm fs.FileMode) error {
+// MkdirAllWithOwnerAccess creates missing directories along a trusted path.
+// On Unix, it restores owner read, write, and search access before using each
+// new directory. The umask still controls group and other permission bits.
+// Existing directories keep their mode.
+func MkdirAllWithOwnerAccess(path string, perm fs.FileMode) error {
 	const ownerAccess = 0o700
 	if runtime.GOOS == "windows" {
 		return os.MkdirAll(path, perm|ownerAccess)
@@ -115,7 +117,7 @@ func mkdirCopyDir(path string, perm fs.FileMode) error {
 		return &fs.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
 	}
 	if parent := filepath.Dir(path); parent != path {
-		if err := mkdirCopyDir(parent, perm); err != nil {
+		if err := MkdirAllWithOwnerAccess(parent, perm); err != nil {
 			return err
 		}
 	}
@@ -361,7 +363,8 @@ func WriteTarContext(ctx context.Context, w io.Writer, dir string) error {
 //
 // On Unix, regular files and explicitly archived directories receive the
 // ordinary permission bits from their headers, regardless of the umask.
-// Directory modes are applied after extraction and link validation.
+// Directory modes are applied after extraction and link validation. An
+// implicit directory without its own header keeps mode 0700.
 func ReadTar(r io.Reader, dir string) error {
 	return ReadTarContext(context.Background(), r, dir)
 }
@@ -399,7 +402,7 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 		mode := fs.FileMode(hdr.Mode).Perm()
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := root.MkdirAll(name, mode|0o700); err != nil {
+			if err := mkdirTarDirs(root, name, mode); err != nil {
 				return err
 			}
 			if runtime.GOOS != "windows" {
@@ -407,7 +410,7 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 				dirs[strings.TrimRight(name, string(filepath.Separator))] = mode
 			}
 		case tar.TypeReg:
-			if err := root.MkdirAll(filepath.Dir(name), 0o700); err != nil {
+			if err := mkdirTarDirs(root, filepath.Dir(name), 0); err != nil {
 				return err
 			}
 			f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
@@ -463,6 +466,55 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 		}
 	}
 	return ctx.Err()
+}
+
+func mkdirTarDirs(root *os.Root, name string, mode fs.FileMode) error {
+	if runtime.GOOS == "windows" {
+		return root.MkdirAll(name, mode|0o700)
+	}
+	return mkdirTarDir(root, name, false, 8)
+}
+
+func mkdirTarDir(root *os.Root, name string, intermediate bool, linksLeft int) error {
+	const ownerAccess = 0o700
+	// Keep the original path components so os.Root can resolve ".." after
+	// any symbolic links. filepath.Dir would clean the path lexically.
+	name = strings.TrimRight(name, string(filepath.Separator))
+	sep := strings.LastIndexByte(name, filepath.Separator)
+	err := root.Mkdir(name, ownerAccess)
+	if errors.Is(err, fs.ErrNotExist) && sep >= 0 {
+		if err := mkdirTarDir(root, name[:sep], true, linksLeft); err != nil {
+			return err
+		}
+		err = root.Mkdir(name, ownerAccess)
+	}
+	if errors.Is(err, fs.ErrExist) {
+		info, statErr := root.Stat(name)
+		if statErr == nil && info.IsDir() {
+			return nil
+		}
+		// Like Root.MkdirAll, populate through a dangling directory link
+		// only when it is an intermediate path component.
+		if intermediate && linksLeft > 0 && errors.Is(statErr, fs.ErrNotExist) {
+			if target, linkErr := root.Readlink(name); linkErr == nil && confinedLinkTarget(name, target) {
+				return mkdirTarDir(root, name[:sep+1]+target, true, linksLeft-1)
+			}
+		}
+	}
+	if err != nil {
+		return err
+	}
+	info, err := root.Lstat(name)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return &fs.PathError{Op: "mkdir", Path: name, Err: syscall.ENOTDIR}
+	}
+	if info.Mode()&ownerAccess == ownerAccess {
+		return nil
+	}
+	return chmodNewTarDir(root, name, ownerAccess)
 }
 
 func tarDirectoryDepth(name string) int {
