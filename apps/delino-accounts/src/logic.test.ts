@@ -148,13 +148,52 @@ describe("forms", () => {
   });
 
   test("checks invitation email addresses", () => {
-    expect(checkEmail(" a@example.com ")).toEqual({
+    expect(checkEmail(" \tA@example.com\u0085")).toEqual({
       ok: true,
-      value: "a@example.com",
+      value: "A@example.com",
     });
-    expect(checkEmail("a@b@c").ok).toBe(false);
-    expect(checkEmail("nobody").ok).toBe(false);
-    expect(checkEmail(`${"a".repeat(250)}@b.co`).ok).toBe(false);
+    for (const email of [
+      "first.last+tag@example.co.uk",
+      "a@b",
+      "o'neil@host_name",
+      "用户@例子.测试",
+      "a@[192.0.2.1]",
+      "a@[2001:db8::1]",
+      "a@[::ffff:c000:201]",
+      `${"é".repeat(126)}@b`,
+    ]) {
+      expect(checkEmail(email)).toEqual({ ok: true, value: email });
+    }
+
+    for (const email of [
+      "nobody",
+      "a@",
+      "@b",
+      "a@b@c",
+      "a b@c",
+      "a..b@example.test",
+      ".a@b",
+      "a.@b",
+      "a@b..c",
+      "a@.b",
+      "a@b.",
+      "<a@b>",
+      "‹a@b›",
+      "Someone <a@b>",
+      '"a"@b',
+      "a@[01.2.3.4]",
+      "a@[256.2.3.4]",
+      "a@[2001:db8::x]",
+      "a@[IPv6:2001:db8::1]",
+      "a@[fe80::1%eth0]",
+      `${"a".repeat(250)}@b.co`,
+      `${"é".repeat(126)}@bb`,
+    ]) {
+      expect(checkEmail(email)).toEqual({
+        ok: false,
+        error: "Enter an email address like name@example.com.",
+      });
+    }
   });
 
   test("checks the manual top-up limits with bigint micro-USD", () => {
