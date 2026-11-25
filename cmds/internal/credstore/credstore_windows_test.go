@@ -38,6 +38,28 @@ func holdWithoutDeleteShare(t *testing.T, path string) (release func()) {
 	return release
 }
 
+func TestReadFileRetriesSharingViolation(t *testing.T) {
+	s := savedStore(t)
+	attempts := 0
+	got, err := readFileWithRetry(s.Path(), func(path string) ([]byte, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, &os.PathError{Op: "open", Path: path, Err: windows.ERROR_SHARING_VIOLATION}
+		}
+		return os.ReadFile(path)
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	want, err := os.ReadFile(s.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) || attempts != 2 {
+		t.Fatalf("want the saved credentials after two reads, got %d reads", attempts)
+	}
+}
+
 // stubRemoveRetry replaces the retry seams for one test. sleep runs instead of
 // a real pause, so the tests do not depend on timer granularity.
 func stubRemoveRetry(t *testing.T, timeout time.Duration, sleep func(time.Duration)) {

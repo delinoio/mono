@@ -84,7 +84,7 @@ func (s Store) Path() string { return filepath.Join(s.Dir, FileName) }
 
 // Load reads the stored credentials.
 func (s Store) Load() (*Credentials, error) {
-	b, err := os.ReadFile(s.Path())
+	b, err := readFile(s.Path())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound
 	}
