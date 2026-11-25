@@ -17,6 +17,11 @@ import { connectCodeOf, TideConfigError, TideError } from "./errors.ts";
 import { FAKE_ORIGIN, fakeServer } from "./testing/fake-server.ts";
 
 const ORG = "0193a000-0000-7000-8000-000000000001";
+const BLANK_TOKENS = [
+  ["empty string", ""],
+  ["ASCII whitespace", " \t\r\n"],
+  ["Unicode whitespace", "\u00a0\u2003"],
+] as const;
 
 describe("client configuration", () => {
   test("uses the production origin by default", () => {
@@ -75,8 +80,12 @@ describe("client configuration", () => {
     );
   });
 
-  test("rejects an empty token", () => {
-    expect(() => new TideClient({ token: "" })).toThrow(TideConfigError);
+  test.each(BLANK_TOKENS)("rejects a static token with %s", (_kind, token) => {
+    const server = fakeServer(() => {});
+    expect(
+      () => new TideClient({ origin: FAKE_ORIGIN, fetch: server.fetch, token }),
+    ).toThrow(TideConfigError);
+    expect(server.calls).toEqual([]);
   });
 
   test("creates a client for every public service", () => {
@@ -187,20 +196,29 @@ describe("credentials", () => {
     expect(server.calls).toEqual([]);
   });
 
-  test("a token source that returns nothing fails before any request", async () => {
-    const server = fakeServer(() => {});
-    const client = new TideClient({
-      origin: FAKE_ORIGIN,
-      fetch: server.fetch,
-      token: async () => "",
-    });
-    const error = await client.organizations
-      .getOrganization({ organizationId: ORG })
-      .catch((e: unknown) => e);
-    // Connect wraps an interceptor failure and keeps it as the cause.
-    expect((error as ConnectError).cause).toBeInstanceOf(TideConfigError);
-    expect(server.calls).toEqual([]);
-  });
+  test.each(BLANK_TOKENS)(
+    "rejects a provider token with %s before any request",
+    async (_kind, token) => {
+      const server = fakeServer(() => {});
+      let providerCalls = 0;
+      const client = new TideClient({
+        origin: FAKE_ORIGIN,
+        fetch: server.fetch,
+        token: async () => {
+          providerCalls++;
+          return token;
+        },
+      });
+      expect(providerCalls).toBe(0);
+      const error = await client.organizations
+        .getOrganization({ organizationId: ORG })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect((error as ConnectError).cause).toBeInstanceOf(TideConfigError);
+      expect(providerCalls).toBe(1);
+      expect(server.calls).toEqual([]);
+    },
+  );
 
   test("a token that is not a valid header value fails without the token in the error", async () => {
     const server = fakeServer(() => {});
@@ -342,15 +360,17 @@ describe("error mapping", () => {
     ["trailing CRLF", "secret-access-token\r\n"],
     ["surrounding tabs", "\tsecret-access-token\t"],
     ["leading space", " secret-access-token"],
+    ["mixed whitespace", " \tsecret-access-token\r\n"],
   ])(
     "normalizes a token with %s and redacts fetch errors",
     async (_edge, raw) => {
       for (const token of [raw, async () => raw]) {
-        let auth: string | null = null;
+        const headers: (string | null)[] = [];
         const client = new TideClient({
           origin: FAKE_ORIGIN,
           fetch: async (_input, init) => {
-            auth = new Headers(init?.headers).get("authorization");
+            const auth = new Headers(init?.headers).get("authorization");
+            headers.push(auth);
             throw new TypeError(`fetch failed with ${auth}`, {
               cause: new Error(`original token: ${raw}`),
             });
@@ -360,7 +380,7 @@ describe("error mapping", () => {
         const error = (await client.organizations
           .getOrganization({ organizationId: ORG })
           .catch((e: unknown) => e)) as ConnectError;
-        expect(auth).toBe("Bearer secret-access-token");
+        expect(headers).toEqual(["Bearer secret-access-token"]);
         expect(error).toBeInstanceOf(ConnectError);
         expect(error.code).toBe(Code.Unknown);
         expect(error.rawMessage).toMatch(
