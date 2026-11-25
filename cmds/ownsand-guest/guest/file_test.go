@@ -335,21 +335,30 @@ func TestReadCancelWhileChunkPending(t *testing.T) {
 	if err := os.WriteFile(path, randomBytes(t, 2<<20+100), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	s := h.open(ctx)
+	defer s.s.CloseRequest()
+	defer s.s.CloseResponse()
 	req := readReq(t, path)
 	s.send(1, req)
+	// Establish the response stream before canceling it. The keepalive
+	// ticker can send before the snapshot produces its first chunk.
+	for {
+		ev := s.recv().GetFileReadEvent()
+		if ev.GetChunk() != nil {
+			break
+		}
+		if ev.GetKeepalive() == nil {
+			t.Fatalf("unexpected event before first chunk: %v", ev)
+		}
+	}
 	waitStarted(t, g.started)
 	cancel()
-	// The call ends while the gate is closed.
-	deadline := time.Now().Add(10 * time.Second)
-	for h.srv.reads.readEntryOpen(req.GetReadId()) != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the call did not end while the chunk read was stalled")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	// Close the client body so the HTTP/2 stream is reset even if the
+	// transport has buffered response data and the client has stopped reading.
+	_ = s.s.CloseResponse()
+	h.waitReadCallsEnded(req.GetReadId())
 	select {
 	case <-g.closed:
 		t.Fatal("snapshot closed while its read is still stalled")
