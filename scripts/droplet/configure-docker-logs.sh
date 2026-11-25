@@ -17,8 +17,8 @@
 #   - The file is a JSON object whose top-level `log-driver` is already
 #     `local`: leave it byte for byte as it is.
 #   - The file is a JSON object with another `log-driver` value or none: set
-#     the key and keep every other key (`data-root`, `registry-mirrors` and so
-#     on). The file is rewritten as indented JSON.
+#     the key and keep every other setting. If a retained logging option
+#     key is unsupported by `local`, exit before writing or restarting.
 #   - The file is not valid JSON, or valid JSON that is not an object: print
 #     a diagnostic and exit non-zero before it writes a file or restarts
 #     Docker.
@@ -97,6 +97,30 @@ else:
 
 if config.get("log-driver") == "local":
     sys.exit(0)
+
+options = config.get("log-opts")
+if options is not None:
+    if not isinstance(options, dict):
+        fail(f"{path} must hold a JSON object or null for log-opts")
+    # Match Moby's local.LogOptKeys and the built-in keys that
+    # logger.ValidateLogOpts filters out, including the dual-logging cache
+    # keys registered by logger/loggerutils/cache.
+    local_keys = {
+        "max-file", "max-size", "compress",
+        "labels", "labels-regex", "env", "env-regex", "tag",
+    }
+    supported_keys = (
+        local_keys
+        | {"mode", "max-buffer-size", "cache-disabled"}
+        | {f"cache-{key}" for key in local_keys}
+    )
+    unsupported = options.keys() - supported_keys
+    if unsupported:
+        keys = ", ".join(repr(key) for key in sorted(unsupported))
+        fail(
+            f"{path} has log-opts keys unsupported by the local log driver ({keys}). "
+            "Review log-opts before rerunning provisioning."
+        )
 
 config["log-driver"] = "local"
 content = (json.dumps(config, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
