@@ -3,9 +3,11 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +24,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/delinoio/mono/go/tide"
@@ -50,7 +53,9 @@ func newHarness(t *testing.T, cfg Config) *harness {
 	}
 	srv.AddDevSessionProfile(org, "linux", tidev1.GuestOs_GUEST_OS_LINUX, ws)
 	if cfg.Client == nil {
-		cfg.Client = func() (*tide.Client, error) { return tide.New(tide.Options{BaseURL: srv.URL, APIKey: srv.APIKey}) }
+		cfg.Client = func(context.Context) (*tide.Client, error) {
+			return tide.New(tide.Options{BaseURL: srv.URL, APIKey: srv.APIKey})
+		}
 	}
 	cfg.OrganizationID = org
 	if cfg.LookupEnv == nil {
@@ -190,6 +195,148 @@ func TestWaitLimit(t *testing.T) {
 	}
 }
 
+type toolDeadlineTransport func(*http.Request) (*http.Response, error)
+
+func (f toolDeadlineTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestSessionToolDeadlines(t *testing.T) {
+	const budget = 500 * time.Millisecond
+	const profiles = tidev1connect.DevSessionServiceListDevSessionProfilesProcedure
+	const sessions = tidev1connect.DevSessionServiceListDevSessionsProcedure
+
+	type call struct {
+		path string
+		body proto.Message // A nil body stalls the RPC until its context ends.
+	}
+	for _, tc := range []struct {
+		name  string
+		args  map[string]any
+		calls []call
+	}{
+		{name: "list_profiles", calls: []call{{path: profiles}}},
+		{name: "create_session", args: map[string]any{"profile": "linux"}, calls: []call{{path: profiles}}},
+		{name: "list_sessions", calls: []call{{path: sessions}}},
+		{name: "get_session", args: map[string]any{"session_id": "test"}, calls: []call{{path: tidev1connect.DevSessionServiceGetDevSessionProcedure}}},
+		{name: "delete_session", args: map[string]any{"session_id": "test"}, calls: []call{{path: tidev1connect.DevSessionServiceDeleteDevSessionProcedure}}},
+		{name: "list_profiles", calls: []call{{profiles, &tidev1.ListDevSessionProfilesResponse{NextPageToken: "next"}}, {path: profiles}}},
+		{name: "list_sessions", calls: []call{{sessions, &tidev1.ListDevSessionsResponse{NextPageToken: "next"}}, {path: sessions}}},
+		{name: "create_session", args: map[string]any{"profile": "linux"}, calls: []call{
+			{profiles, &tidev1.ListDevSessionProfilesResponse{NextPageToken: "next"}},
+			{profiles, &tidev1.ListDevSessionProfilesResponse{Profiles: []*tidev1.DevSessionProfile{{Name: "linux", RunnerProfileId: "test-profile"}}}},
+			{path: tidev1connect.DevSessionServiceCreateDevSessionProcedure},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var seen atomic.Int32
+			var toolDeadline time.Time
+			httpClient := &http.Client{Transport: toolDeadlineTransport(func(r *http.Request) (*http.Response, error) {
+				i := int(seen.Add(1)) - 1
+				if i >= len(tc.calls) {
+					return nil, errors.New("unexpected RPC")
+				}
+				want := tc.calls[i]
+				if r.URL.Path != want.path {
+					t.Errorf("RPC %d path = %q, want %q", i, r.URL.Path, want.path)
+				}
+				deadline, ok := r.Context().Deadline()
+				if !ok || time.Until(deadline) > budget {
+					t.Errorf("RPC %d deadline = %v, want a deadline within %v", i, deadline, budget)
+				}
+				if i == 0 {
+					toolDeadline = deadline
+				} else if !deadline.Equal(toolDeadline) {
+					t.Errorf("RPC %d deadline = %v, want the first RPC's deadline %v", i, deadline, toolDeadline)
+				}
+				if want.body == nil {
+					<-r.Context().Done()
+					return nil, r.Context().Err()
+				}
+				body, err := proto.Marshal(want.body)
+				if err != nil {
+					return nil, err
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"application/proto"}},
+					Body:       io.NopCloser(bytes.NewReader(body)),
+				}, nil
+			})}
+			client := func(context.Context) (*tide.Client, error) {
+				return tide.New(tide.Options{BaseURL: "http://tide.test", APIKey: "test-key", HTTPClient: httpClient})
+			}
+			h := newHarness(t, Config{maxWait: budget, Client: client})
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			result, err := h.session.CallTool(ctx, &mcp.CallToolParams{Name: tc.name, Arguments: tc.args})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.IsError || len(result.Content) != 1 {
+				t.Fatalf("tool result = %+v, want one error message", result)
+			}
+			if message, ok := result.Content[0].(*mcp.TextContent); !ok || !strings.HasPrefix(message.Text, "deadline_exceeded:") {
+				t.Errorf("tool error = %v, want deadline_exceeded", result.Content[0])
+			}
+			if got := int(seen.Load()); got != len(tc.calls) {
+				t.Errorf("RPCs = %d, want %d", got, len(tc.calls))
+			}
+		})
+	}
+}
+
+func TestSessionToolDeadlineDuringClientSetup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(*testing.T, context.Context, <-chan struct{}) (context.Context, context.CancelFunc)
+		code string
+	}{
+		{
+			name: "earlier caller deadline",
+			end: func(_ *testing.T, parent context.Context, _ <-chan struct{}) (context.Context, context.CancelFunc) {
+				return context.WithTimeout(parent, 100*time.Millisecond)
+			},
+			code: "deadline_exceeded:",
+		},
+		{
+			name: "caller cancellation",
+			end: func(t *testing.T, parent context.Context, entered <-chan struct{}) (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(parent)
+				go func() {
+					select {
+					case <-entered:
+						cancel()
+					case <-t.Context().Done():
+					}
+				}()
+				return ctx, cancel
+			},
+			code: "canceled:",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			s := New(Config{maxWait: 3 * time.Second, Client: func(ctx context.Context) (*tide.Client, error) {
+				defer close(finished)
+				close(entered)
+				<-release // Simulate a local file read that ignores cancellation.
+				return nil, ctx.Err()
+			}})
+			t.Cleanup(s.Close)
+			ctx, cancel := tc.end(t, t.Context(), entered)
+			defer cancel()
+			_, _, err := withToolDeadline(s.cfg.maxWait, s.getSession)(ctx, nil, sessionArgs{SessionID: "test"})
+			close(release)
+			<-finished
+			if err == nil || !strings.HasPrefix(err.Error(), tc.code) || ctx.Err() == nil {
+				t.Errorf("get_session = %v, caller context = %v, want %s", err, ctx.Err(), tc.code)
+			}
+		})
+	}
+}
+
 func TestWaitSessionDeadline(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -228,7 +375,7 @@ func TestWaitSessionDeadline(t *testing.T) {
 			upstream.Config.Protocols.SetUnencryptedHTTP2(true)
 			upstream.Start()
 			t.Cleanup(upstream.Close)
-			h := newHarness(t, Config{maxWait: 500 * time.Millisecond, Client: func() (*tide.Client, error) {
+			h := newHarness(t, Config{maxWait: 500 * time.Millisecond, Client: func(context.Context) (*tide.Client, error) {
 				return tide.New(tide.Options{BaseURL: upstream.URL, APIKey: "test-key"})
 			}})
 			if tc.callerTimeout > 0 {
@@ -430,7 +577,7 @@ func TestExecOutputAttachConfirmation(t *testing.T) {
 			upstream.Config.Protocols.SetUnencryptedHTTP2(true)
 			upstream.Start()
 			t.Cleanup(upstream.Close)
-			h := newHarness(t, Config{maxWait: maxWait, Client: func() (*tide.Client, error) {
+			h := newHarness(t, Config{maxWait: maxWait, Client: func(context.Context) (*tide.Client, error) {
 				return tide.New(tide.Options{BaseURL: upstream.URL, APIKey: "test-key"})
 			}})
 			var out execResult
@@ -773,7 +920,7 @@ func TestErrorMapping(t *testing.T) {
 	}
 
 	// Without a credential, every tool tells the user what to do.
-	noCred := newHarness(t, Config{Client: func() (*tide.Client, error) {
+	noCred := newHarness(t, Config{Client: func(context.Context) (*tide.Client, error) {
 		return nil, errors.New("not signed in: run 'tide login' or set TIDE_API_KEY")
 	}})
 	for _, tool := range []string{"list_profiles", "list_sessions"} {
@@ -796,7 +943,7 @@ func fieldMask(paths ...string) *fieldmaskpb.FieldMask { return &fieldmaskpb.Fie
 func TestExecStartUnconfirmed(t *testing.T) {
 	var block atomic.Bool
 	var srv *tidetest.Server
-	h := newHarness(t, Config{maxWait: time.Second, Client: func() (*tide.Client, error) {
+	h := newHarness(t, Config{maxWait: time.Second, Client: func(context.Context) (*tide.Client, error) {
 		return tide.New(tide.Options{BaseURL: srv.URL, TokenSource: func(ctx context.Context) (string, error) {
 			if block.Load() {
 				<-ctx.Done()

@@ -49,8 +49,8 @@ const confirmationGrace = 10 * time.Second
 // Config configures a Server.
 type Config struct {
 	// Client returns the SDK client. It returns an error when no credential
-	// is usable; every tool then returns that error.
-	Client func() (*tide.Client, error)
+	// is usable. Use the context when waiting to initialize a shared client.
+	Client func(context.Context) (*tide.Client, error)
 	// OrganizationID is the organization of every tool.
 	OrganizationID string
 	// PassEnv names local environment variables that every exec receives.
@@ -125,10 +125,14 @@ func toolError(err error) error {
 	if errors.As(err, &ce) {
 		return fmt.Errorf("%s: %s", ce.Code(), ce.Message())
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
 		return fmt.Errorf("%s: %s", connect.CodeDeadlineExceeded, err)
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%s: %s", connect.CodeCanceled, err)
+	default:
+		return fmt.Errorf("%s: %s", connect.CodeUnknown, err)
 	}
-	return fmt.Errorf("%s: %s", connect.CodeUnknown, err)
 }
 
 func invalid(format string, args ...any) error {
@@ -146,8 +150,11 @@ func (s *Server) waitDuration(v *int) (time.Duration, error) {
 	return min(time.Duration(*v)*time.Second, s.cfg.maxWait), nil
 }
 
-func (s *Server) client() (*tide.Client, error) {
-	c, err := s.cfg.Client()
+func (s *Server) client(ctx context.Context) (*tide.Client, error) {
+	c, err := s.cfg.Client(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, toolError(err)
+	}
 	if err != nil {
 		return nil, toolError(connect.NewError(connect.CodeUnauthenticated, err))
 	}
@@ -260,12 +267,12 @@ type listSessionsResult struct {
 }
 
 func (s *Server) register() {
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "list_profiles", Description: "List the dev session profiles: name, guest OS, resources, workspace path, TTLs and maximum queue wait."}, s.listProfiles)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "create_session", Description: "Create a dev session of a profile. Returns at once with the session ID and state; a session without free capacity is QUEUED. Call wait_session until it is RUNNING."}, s.createSession)
+	mcp.AddTool(s.mcp, &mcp.Tool{Name: "list_profiles", Description: "List the dev session profiles: name, guest OS, resources, workspace path, TTLs and maximum queue wait."}, withToolDeadline(s.cfg.maxWait, s.listProfiles))
+	mcp.AddTool(s.mcp, &mcp.Tool{Name: "create_session", Description: "Create a dev session of a profile. Returns at once with the session ID and state; a session without free capacity is QUEUED. Call wait_session until it is RUNNING."}, withToolDeadline(s.cfg.maxWait, s.createSession))
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "wait_session", Description: "Wait until a dev session is RUNNING or ended, or the wait passes, and return its state. Call it again while the state is QUEUED or STARTING."}, s.waitSession)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "list_sessions", Description: "List your own dev sessions with ID, profile, guest OS, state, label and times."}, s.listSessions)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "get_session", Description: "Read one dev session."}, s.getSession)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "delete_session", Description: "Delete a dev session (cancel it when queued) and return its final state."}, s.deleteSession)
+	mcp.AddTool(s.mcp, &mcp.Tool{Name: "list_sessions", Description: "List your own dev sessions with ID, profile, guest OS, state, label and times."}, withToolDeadline(s.cfg.maxWait, s.listSessions))
+	mcp.AddTool(s.mcp, &mcp.Tool{Name: "get_session", Description: "Read one dev session."}, withToolDeadline(s.cfg.maxWait, s.getSession))
+	mcp.AddTool(s.mcp, &mcp.Tool{Name: "delete_session", Description: "Delete a dev session (cancel it when queued) and return its final state."}, withToolDeadline(s.cfg.maxWait, s.deleteSession))
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "exec", Description: "Run a command (an argument array, no shell unless you call one) in a running dev session. " +
 		"When it ends within the wait: the exit code or signal, timed_out and the output. Otherwise: the exec_id, running true, the output so far and the next offsets for exec_output; the command keeps running. " +
 		"Each stream returns at most the first 8 KiB and the last 24 KiB of new output, with the omitted byte range. Standard input is not supported."}, s.exec)
@@ -277,8 +284,37 @@ func (s *Server) register() {
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "transfer_status", Description: "Return the progress or the result of a sync or download that this server process runs. A transfer stops when the server process exits; a later sync sends the same files again."}, s.transferStatus)
 }
 
+// withToolDeadline passes one deadline through every RPC and lets the tool
+// return on time even if a local credential read or write is still blocked.
+func withToolDeadline[In, Out any](wait time.Duration, handler mcp.ToolHandlerFor[In, Out]) mcp.ToolHandlerFor[In, Out] {
+	type outcome struct {
+		result *mcp.CallToolResult
+		output Out
+		err    error
+	}
+	return func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
+		ctx, cancel := context.WithTimeout(ctx, wait)
+		defer cancel()
+		done := make(chan outcome, 1)
+		go func() {
+			result, output, err := handler(ctx, req, in)
+			done <- outcome{result: result, output: output, err: err}
+		}()
+		var result outcome
+		select {
+		case result = <-done:
+		case <-ctx.Done():
+		}
+		if err := ctx.Err(); err != nil {
+			var zero Out
+			return nil, zero, toolError(err)
+		}
+		return result.result, result.output, result.err
+	}
+}
+
 func (s *Server) listProfiles(ctx context.Context, _ *mcp.CallToolRequest, _ noArgs) (*mcp.CallToolResult, listProfilesResult, error) {
-	c, err := s.client()
+	c, err := s.client(ctx)
 	if err != nil {
 		return nil, listProfilesResult{}, err
 	}
@@ -303,7 +339,7 @@ func (s *Server) createSession(ctx context.Context, _ *mcp.CallToolRequest, in c
 	if in.Profile == "" {
 		return nil, sessionResult{}, invalid("profile is required")
 	}
-	c, err := s.client()
+	c, err := s.client(ctx)
 	if err != nil {
 		return nil, sessionResult{}, err
 	}
@@ -333,7 +369,7 @@ func (s *Server) waitSession(ctx context.Context, _ *mcp.CallToolRequest, in wai
 	if err != nil {
 		return nil, sessionResult{}, err
 	}
-	c, err := s.client()
+	c, err := s.client(ctx)
 	if err != nil {
 		return nil, sessionResult{}, err
 	}
@@ -358,7 +394,7 @@ func (s *Server) waitSession(ctx context.Context, _ *mcp.CallToolRequest, in wai
 }
 
 func (s *Server) listSessions(ctx context.Context, _ *mcp.CallToolRequest, in listSessionsArgs) (*mcp.CallToolResult, listSessionsResult, error) {
-	c, err := s.client()
+	c, err := s.client(ctx)
 	if err != nil {
 		return nil, listSessionsResult{}, err
 	}
@@ -377,7 +413,7 @@ func (s *Server) listSessions(ctx context.Context, _ *mcp.CallToolRequest, in li
 }
 
 func (s *Server) getSession(ctx context.Context, _ *mcp.CallToolRequest, in sessionArgs) (*mcp.CallToolResult, sessionResult, error) {
-	c, err := s.client()
+	c, err := s.client(ctx)
 	if err != nil {
 		return nil, sessionResult{}, err
 	}
@@ -389,7 +425,7 @@ func (s *Server) getSession(ctx context.Context, _ *mcp.CallToolRequest, in sess
 }
 
 func (s *Server) deleteSession(ctx context.Context, _ *mcp.CallToolRequest, in sessionArgs) (*mcp.CallToolResult, sessionResult, error) {
-	c, err := s.client()
+	c, err := s.client(ctx)
 	if err != nil {
 		return nil, sessionResult{}, err
 	}
@@ -645,7 +681,7 @@ func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) 
 	if in.TimeoutSeconds > maxExecTimeoutSeconds {
 		return nil, execResult{}, invalid("timeout_seconds must be between 0 and %d", maxExecTimeoutSeconds)
 	}
-	c, err := s.client()
+	c, err := s.client(ctx)
 	if err != nil {
 		return nil, execResult{}, err
 	}
@@ -700,7 +736,7 @@ func (s *Server) execOutput(ctx context.Context, _ *mcp.CallToolRequest, in exec
 	if in.ExecID == "" || in.StdoutOffset < 0 || in.StderrOffset < 0 {
 		return nil, execResult{}, invalid("exec_id is required and the offsets must not be negative")
 	}
-	c, err := s.client()
+	c, err := s.client(ctx)
 	if err != nil {
 		return nil, execResult{}, err
 	}
@@ -828,7 +864,7 @@ func (s *Server) sync(ctx context.Context, _ *mcp.CallToolRequest, in syncArgs) 
 	if err != nil {
 		return nil, transferResult{}, err
 	}
-	c, err := s.client()
+	c, err := s.client(ctx)
 	if err != nil {
 		return nil, transferResult{}, err
 	}
@@ -855,7 +891,7 @@ func (s *Server) download(ctx context.Context, _ *mcp.CallToolRequest, in downlo
 	if in.GuestPath == "" || in.LocalPath == "" {
 		return nil, transferResult{}, invalid("guest_path and local_path are required")
 	}
-	c, err := s.client()
+	c, err := s.client(ctx)
 	if err != nil {
 		return nil, transferResult{}, err
 	}
