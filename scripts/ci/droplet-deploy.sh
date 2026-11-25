@@ -97,6 +97,7 @@
 #                           /proc/sys/kernel/random/uuid). Tests replace it.
 #   DROPLET_HEALTH_TIMEOUT  whole decimal seconds to wait for the health check,
 #                           from 0 to 9223372036 (unset or empty: 120).
+#                           Inspections, probes and retries share this deadline.
 #   DROPLET_STOP_TIMEOUT    seconds between SIGTERM and SIGKILL. Accounts API
 #                           defaults to 60 and requires at least 60 for old
 #                           containers and failed replacements. Other
@@ -193,6 +194,9 @@ main() {
     fi
     stop_timeout="${BASH_REMATCH[1]}"
     replacement_stop_timeout="$stop_timeout"
+  fi
+  if ! command -v timeout > /dev/null || [[ ! -r /proc/uptime ]]; then
+    fail "droplet-deploy.sh needs GNU coreutils timeout and /proc/uptime for the health-check deadline."
   fi
   local lock_timeout="${DROPLET_LOCK_TIMEOUT:-600}"
   local proxy_lock_timeout="${DROPLET_PROXY_LOCK_TIMEOUT:-$lock_timeout}"
@@ -552,29 +556,61 @@ discard_replacement() {
   fi
 }
 
-# Waits until the container answers `GET /healthz` with a 2xx status. Redirects
-# are not followed, so a 3xx answer is not healthy. A transport failure (no
-# status) is retried until the deadline. Fails at once when the container stops.
+# Linux reports uptime in hundredths of a second, independent of wall-clock
+# changes. Read the same clock for the deadline and every remaining budget.
+health_clock() {
+  local uptime
+  IFS=' ' read -r uptime _ < /proc/uptime || return 1
+  printf '%d\n' "$((10#${uptime%.*} * 100 + 10#${uptime#*.}))"
+}
+
+# Updates the remaining time in the caller's wait_healthy frame.
+health_budget() {
+  local now
+  now="$(health_clock)" || return 1
+  remaining=$((deadline - now))
+  (( remaining > 0 ))
+}
+
+run_with_health_limit() {
+  local duration
+  printf -v duration '%d.%02ds' "$(($1 / 100))" "$(($1 % 100))"
+  shift
+  # Kill the command's process group at the deadline, even if it ignores TERM.
+  LC_ALL=C timeout --signal=KILL "$duration" "$@"
+}
+
+# Waits for a 2xx response to GET /healthz before one shared deadline.
+# Inspections and retry pauses also use the remaining time. Redirects,
+# other non-2xx responses and transport failures are retried. A container
+# that is no longer running fails immediately.
 wait_healthy() {
   local container="$1" network="$2" port="$3" timeout="$4"
-  local deadline=$((SECONDS + timeout)) status address code
-  while (( SECONDS < deadline )); do
-    status="$(docker inspect --format '{{.State.Status}}' "$container")"
+  local deadline remaining status address code probe_budget
+  deadline="$(health_clock)" || return 1
+  deadline=$((deadline + timeout * 100))
+  while health_budget; do
+    status="$(run_with_health_limit "$remaining" docker inspect --format '{{.State.Status}}' "$container")" ||
+      status="unavailable"
+    health_budget || break
     if [[ "$status" != running ]]; then
       echo "::error::$container is $status, not running." >&2
       return 1
     fi
-    address="$(docker inspect --format "{{with index .NetworkSettings.Networks \"$network\"}}{{.IPAddress}}{{end}}" "$container")"
+    address="$(run_with_health_limit "$remaining" docker inspect --format "{{with index .NetworkSettings.Networks \"$network\"}}{{.IPAddress}}{{end}}" "$container")" ||
+      address=""
+    health_budget || break
     if [[ -n "$address" ]]; then
-      code="$(curl --silent --show-error --output /dev/null \
-        --write-out '%{http_code}' --max-time 5 \
-        "http://$address:$port/healthz" 2> /dev/null)" || code=""
-      if [[ "$code" =~ ^2[0-9]{2}$ ]]; then
+      probe_budget=$((remaining < 500 ? remaining : 500))
+      if code="$(run_with_health_limit "$probe_budget" curl --silent --show-error --output /dev/null \
+        --write-out '%{http_code}' --max-time 5 "http://$address:$port/healthz" 2> /dev/null)" &&
+        health_budget && [[ "$code" =~ ^2[0-9]{2}$ ]]; then
         echo "$container passed the health check."
         return 0
       fi
     fi
-    sleep 2
+    health_budget || break
+    run_with_health_limit "$remaining" sleep 2 2> /dev/null || break
   done
   echo "::error::$container did not pass the health check within $timeout seconds." >&2
   return 1
