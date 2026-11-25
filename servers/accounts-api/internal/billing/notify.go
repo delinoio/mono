@@ -149,6 +149,18 @@ func (s *Service) settle(ctx context.Context, fn func(ctx context.Context) error
 // deliver sends the leased notification n to every owner and admin that did
 // not get it yet and records the result.
 func (s *Service) deliver(ctx context.Context, n notification) error {
+	var expiry time.Time
+	if n.Kind == NotifyCreditExpiry {
+		var err error
+		expiry, err = time.Parse(time.RFC3339Nano, n.Details[notifyDetailExpireTime])
+		if err != nil {
+			return s.abandonCreditExpiryNotice(ctx, n, "invalid_credit_expiry_time")
+		}
+		if !expiry.After(s.timestamp()) {
+			return s.abandonCreditExpiryNotice(ctx, n, "credit_expired")
+		}
+	}
+
 	var name string
 	var deleted bool
 	if err := s.db.Pool.QueryRow(ctx, `SELECT name, delete_time IS NOT NULL FROM billing_accounts WHERE billing_account_id = $1`,
@@ -206,6 +218,10 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 			return s.deferNotification(ctx, n)
 		}
 		user, err := s.directory.User(ctx, userID)
+		// A profile lookup can cross the expiry even if it returns no email.
+		if n.Kind == NotifyCreditExpiry && !expiry.After(s.timestamp()) {
+			return s.abandonCreditExpiryNotice(ctx, n, "credit_expired")
+		}
 		if err != nil && !errors.Is(err, directory.ErrUserNotFound) {
 			if ctx.Err() != nil {
 				return s.deferNotification(ctx, n)
@@ -228,6 +244,9 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 			})
 			if err != nil {
 				return err
+			}
+			if n.Kind == NotifyCreditExpiry && !expiry.After(s.timestamp()) {
+				return s.abandonCreditExpiryNotice(ctx, n, "credit_expired")
 			}
 			if err := s.email.Send(ctx, msg); err != nil {
 				if ctx.Err() != nil {
@@ -258,6 +277,22 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 	}
 	return s.settle(ctx, func(ctx context.Context) error {
 		return s.finish(ctx, n, failed, failedRecipients)
+	})
+}
+
+// abandonCreditExpiryNotice retires the notice and keeps prior recipient records.
+func (s *Service) abandonCreditExpiryNotice(ctx context.Context, n notification, reason string) error {
+	return s.settle(ctx, func(ctx context.Context) error {
+		if _, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET abandon_time = $2 WHERE notification_id = $1`,
+			n.ID, s.timestamp()); err != nil {
+			return err
+		}
+		s.logger.InfoContext(ctx, "billing_notification_suppressed",
+			slog.String("billing_account_id", n.BillingAccountID),
+			slog.String("kind", string(n.Kind)),
+			slog.String("notification_id", n.ID),
+			slog.String("reason", reason))
+		return nil
 	})
 }
 
