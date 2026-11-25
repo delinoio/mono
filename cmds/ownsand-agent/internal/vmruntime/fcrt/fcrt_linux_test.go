@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -347,10 +348,13 @@ func TestAPIClientErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got []string
+	var requestsMu sync.Mutex
+	var requests []string
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		got = append(got, r.Method+" "+r.URL.Path+" "+string(body))
+		requestsMu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path+" "+string(body))
+		requestsMu.Unlock()
 		if r.URL.Path == "/fail" {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(apiFault{FaultMessage: "bad request"})
@@ -373,7 +377,10 @@ func TestAPIClientErrors(t *testing.T) {
 	if err := c.call(context.Background(), http.MethodPut, "/fail", nil); err == nil || !strings.Contains(err.Error(), "bad request") {
 		t.Fatalf("fault: %v", err)
 	}
-	if got[len(got)-2] != `PATCH /vm {"state":"Paused"}` {
+	requestsMu.Lock()
+	got := slices.Clone(requests)
+	requestsMu.Unlock()
+	if len(got) < 2 || got[len(got)-2] != `PATCH /vm {"state":"Paused"}` {
 		t.Fatalf("requests %v", got)
 	}
 }
