@@ -101,7 +101,7 @@ func buildWindows(ctx context.Context, dir string, opts Options) (err error) {
 	}
 	// The deferred dismount is the retry of a failed explicit dismount below:
 	// dismount keeps m.ours set until the detach succeeded.
-	defer m.release(context.Background(), logger)
+	defer m.finish(logger)
 	wim, err := m.installImage()
 	if err != nil {
 		return err
