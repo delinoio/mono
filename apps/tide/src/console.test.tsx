@@ -38,6 +38,7 @@ import {
 } from "@delino/tide-protos/v1/agent_integration_pb";
 import { AuditAction, AuditService } from "@delino/tide-protos/v1/audit_pb";
 import {
+  OwnSandLinkState,
   RequestState,
   Role,
   RunnerState,
@@ -53,7 +54,10 @@ import {
   GetOrganizationResponseSchema,
   OrganizationService,
 } from "@delino/tide-protos/v1/organization_pb";
-import { OwnSandLinkService } from "@delino/tide-protos/v1/ownsand_link_pb";
+import {
+  OwnSandLinkService,
+  type SetOwnSandLinkRequest,
+} from "@delino/tide-protos/v1/ownsand_link_pb";
 import {
   CreateRunnerProfileRequestSchema,
   type ListRunnerProfilesRequest,
@@ -66,7 +70,7 @@ import {
   WorkService,
 } from "@delino/tide-protos/v1/work_pb";
 import { QueryClient } from "@tanstack/react-query";
-import { MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
+import { invalidateServices, MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { ErrorNotice } from "./components/ui.tsx";
@@ -679,6 +683,132 @@ describe("OwnSand link", () => {
     });
     await settle(60);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  function renderLinkReplacement() {
+    const mock = createMockTransport();
+    let target: string | undefined = MOCK_IDS.ownsandAcme;
+    const readLink = rs.fn(() => {
+      if (target === undefined) return {};
+      return {
+        link: {
+          organizationId: MOCK_IDS.acme,
+          ownsandOrganizationId: target,
+          state: OwnSandLinkState.ACTIVE,
+          credentialSet: true,
+        },
+      };
+    });
+    const writes: SetOwnSandLinkRequest[] = [];
+    const linkTransport = createRouterTransport((router) => {
+      router.service(OwnSandLinkService, {
+        getOwnSandLink: readLink,
+        setOwnSandLink(request) {
+          writes.push(request);
+          return {};
+        },
+      });
+    });
+    const queryClient = renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`, {
+      transport: {
+        ...mock,
+        unary(method, ...args) {
+          return method.parent === OwnSandLinkService
+            ? linkTransport.unary(method, ...args)
+            : mock.unary(method, ...args);
+        },
+      },
+    });
+    return {
+      writes,
+      readLink,
+      async refresh(next: string | undefined) {
+        target = next;
+        await act(() => invalidateServices(queryClient, OwnSandLinkService));
+      },
+    };
+  }
+
+  async function openReplacement(key: string) {
+    await click(await screen.findByRole("button", { name: "Replace API key" }));
+    const dialog = screen.getByRole("dialog", { name: "Replace the API key" });
+    const input =
+      within(dialog).getByLabelText<HTMLInputElement>("OwnSand API key");
+    await type(input, key);
+    return {
+      dialog,
+      input,
+      submit: within(dialog).getByRole<HTMLButtonElement>("button", {
+        name: "Replace key",
+      }),
+    };
+  }
+
+  test.each([
+    ["removed", undefined],
+    ["changed", MOCK_IDS.ownsandNorthwind],
+  ] as const)(
+    "disables a replacement opening when the link is %s",
+    async (_, next) => {
+      const { writes, refresh } = renderLinkReplacement();
+      const { dialog, input, submit } = await openReplacement("osk_stale");
+
+      await refresh(next);
+
+      const notice = await within(dialog).findByRole("alert");
+      expect(notice.textContent).toContain("Close this dialog and start again");
+      expect(input.value).toBe("");
+      expect(input.disabled).toBe(true);
+      expect(submit.disabled).toBe(true);
+
+      await refresh(MOCK_IDS.ownsandAcme);
+      expect(within(dialog).getByRole("alert")).toBeTruthy();
+      expect(submit.disabled).toBe(true);
+      await refresh(next);
+
+      await click(submit);
+      // Simulate the form submission that Enter can trigger.
+      await act(async () => fireEvent.submit(submit.form!));
+      expect(writes).toHaveLength(0);
+
+      await act(async () => fireEvent.keyDown(dialog, { key: "Escape" }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+      if (next === undefined) {
+        expect(
+          screen.getByRole("button", { name: "Link OwnSand" }),
+        ).toBeTruthy();
+      } else {
+        const replacement = await openReplacement("osk_fresh");
+        await click(replacement.submit);
+        expect(writes).toMatchObject([
+          { ownsandOrganizationId: next, ownsandApiKey: "osk_fresh" },
+        ]);
+        await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      }
+    },
+  );
+
+  test("replaces the key for the original organization after an unchanged refresh", async () => {
+    const { writes, readLink, refresh } = renderLinkReplacement();
+    const { input, submit } = await openReplacement("osk_replacement");
+
+    await refresh(MOCK_IDS.ownsandAcme);
+    expect(input.value).toBe("osk_replacement");
+    expect(submit.disabled).toBe(false);
+    const readsBeforeSubmit = readLink.mock.calls.length;
+
+    await click(submit);
+
+    expect(writes).toMatchObject([
+      {
+        organizationId: MOCK_IDS.acme,
+        ownsandOrganizationId: MOCK_IDS.ownsandAcme,
+        ownsandApiKey: "osk_replacement",
+      },
+    ]);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(readLink.mock.calls.length).toBeGreaterThan(readsBeforeSubmit);
   });
 
   test("removing the link needs a confirmation", async () => {
