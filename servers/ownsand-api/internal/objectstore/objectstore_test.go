@@ -191,54 +191,9 @@ func TestDeletePrefix(t *testing.T) {
 	}
 }
 
-// TestDeletePrefixRejectsIncompleteListing checks that DeletePrefix returns
-// an error and deletes nothing when a successful (HTTP 200) listing is
-// truncated and has an omitted or empty continuation token. Returning nil
-// there would let the caller finish a cleanup job while objects under the
-// prefix remain. The fixture holds two keys under the prefix but serves only
-// the first one.
-func TestDeletePrefixRejectsIncompleteListing(t *testing.T) {
-	const prefix = "organizations/o/"
-	for _, tc := range []struct {
-		name  string
-		token string
-	}{
-		{name: "omitted token", token: ""},
-		{name: "empty token", token: "<NextContinuationToken></NextContinuationToken>"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var mu sync.Mutex
-			var lists, deletes int
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				mu.Lock()
-				defer mu.Unlock()
-				switch req.Method {
-				case http.MethodGet:
-					lists++
-					_, _ = w.Write([]byte("<ListBucketResult><Contents><Key>" + prefix + "1</Key></Contents>" +
-						"<IsTruncated>true</IsTruncated>" + tc.token + "</ListBucketResult>"))
-				case http.MethodDelete:
-					deletes++
-					w.WriteHeader(http.StatusNoContent)
-				}
-			}))
-			defer srv.Close()
-			r := &R2{Endpoint: srv.URL, Bucket: "bucket", AccessKeyID: "k", SecretAccessKey: "s"}
-			if err := r.DeletePrefix(context.Background(), prefix); err == nil {
-				t.Fatal("DeletePrefix = nil, want an error for a truncated page without a continuation token")
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			if lists != 1 || deletes != 0 {
-				t.Fatalf("list requests = %d, delete requests = %d, want 1 and 0", lists, deletes)
-			}
-		})
-	}
-}
-
 // listServer serves the ListObjectsV2 pages that pages maps by continuation
 // token ("" is the first page) and records every request token.
-func listServer(t *testing.T, prefix string, pages map[string]string) (*R2, *[]string) {
+func listServer(t *testing.T, prefix string, pages map[string]string) (*R2, func() []string) {
 	t.Helper()
 	var mu sync.Mutex
 	var tokens []string
@@ -256,7 +211,11 @@ func listServer(t *testing.T, prefix string, pages map[string]string) (*R2, *[]s
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
-	return &R2{Endpoint: srv.URL, Bucket: "bucket", AccessKeyID: "k", SecretAccessKey: "s"}, &tokens
+	return &R2{Endpoint: srv.URL, Bucket: "bucket", AccessKeyID: "k", SecretAccessKey: "s"}, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(tokens)
+	}
 }
 
 // TestListPrefixFollowsContinuationTokens lists two pages and checks that
@@ -276,8 +235,8 @@ func TestListPrefixFollowsContinuationTokens(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("objects = %v, want %v", got, want)
 	}
-	if !slices.Equal(*tokens, []string{"", "page-2"}) {
-		t.Fatalf("continuation tokens = %q", *tokens)
+	if got := tokens(); !slices.Equal(got, []string{"", "page-2"}) {
+		t.Fatalf("continuation tokens = %q", got)
 	}
 }
 
@@ -294,6 +253,71 @@ func TestListPrefixRejectsIncompleteListing(t *testing.T) {
 	}
 	if got, err := r.ListPrefix(context.Background(), "other/"); err == nil {
 		t.Fatalf("ListPrefix of an unexpected prefix = %v, want the status error", got)
+	}
+}
+
+func TestListPrefixAndDeletePrefixRejectInvalidPages(t *testing.T) {
+	const prefix = "p/"
+	const wrongRoot = `<Error><Code>InternalError</Code></Error>`
+	const truncatedPage = `<ListBucketResult><Contents><Key>p/1</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated>`
+	pageWithToken := func(token string) string {
+		return truncatedPage + "<NextContinuationToken>" + token + "</NextContinuationToken></ListBucketResult>"
+	}
+	for _, tc := range []struct {
+		name       string
+		pages      map[string]string
+		wantTokens []string
+		wantError  string
+	}{
+		{
+			name: "omitted token", pages: map[string]string{"": truncatedPage + "</ListBucketResult>"},
+			wantTokens: []string{""}, wantError: "truncated list without a continuation token",
+		},
+		{
+			name: "empty token", pages: map[string]string{"": pageWithToken("")},
+			wantTokens: []string{""}, wantError: "truncated list without a continuation token",
+		},
+		{
+			name: "wrong root on first page", pages: map[string]string{"": wrongRoot},
+			wantTokens: []string{""}, wantError: "expected element type <ListBucketResult>",
+		},
+		{
+			name: "wrong root on later page", pages: map[string]string{"": pageWithToken("next"), "next": wrongRoot},
+			wantTokens: []string{"", "next"}, wantError: "expected element type <ListBucketResult>",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			t.Run("ListPrefix", func(t *testing.T) {
+				r, tokens := listServer(t, prefix, tc.pages)
+				got, err := r.ListPrefix(ctx, prefix)
+				if got != nil || err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("ListPrefix = (%v, %v), want nil objects and error containing %q", got, err, tc.wantError)
+				}
+				if got := tokens(); !slices.Equal(got, tc.wantTokens) {
+					t.Fatalf("request tokens = %q, want %q", got, tc.wantTokens)
+				}
+			})
+			t.Run("DeletePrefix", func(t *testing.T) {
+				r, tokens := listServer(t, prefix, tc.pages)
+				if err := r.DeletePrefix(ctx, prefix); err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("DeletePrefix error = %v, want error containing %q", err, tc.wantError)
+				}
+				if got := tokens(); !slices.Equal(got, tc.wantTokens) {
+					t.Fatalf("request tokens = %q, want %q", got, tc.wantTokens)
+				}
+			})
+		})
+	}
+}
+
+func TestListPrefixAcceptsNamespacedEmptyListing(t *testing.T) {
+	const prefix = "p/"
+	r, _ := listServer(t, prefix, map[string]string{
+		"": `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListBucketResult>`,
+	})
+	if got, err := r.ListPrefix(context.Background(), prefix); err != nil || len(got) != 0 {
+		t.Fatalf("ListPrefix = (%v, %v), want an empty listing", got, err)
 	}
 }
 
