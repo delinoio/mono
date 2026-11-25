@@ -153,7 +153,7 @@ type request struct {
 	// ok lists the statuses that succeed; out receives their JSON body.
 	ok  []int
 	out any
-	// installationID, when set, drops the cached token on 401.
+	// installationID identifies the cache entry to check on a 401.
 	installationID int64
 }
 
@@ -215,7 +215,7 @@ func (c *Client) do(ctx context.Context, r request) (http.Header, error) {
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
 	if resp.StatusCode == http.StatusUnauthorized && r.installationID != 0 {
-		c.dropToken(r.installationID)
+		c.dropToken(r.installationID, r.auth)
 	}
 	c.logger.WarnContext(ctx, "github_api_error", slog.String("op", r.op), slog.Int("status", resp.StatusCode))
 	return nil, &Error{Op: r.op, Status: resp.StatusCode}
@@ -259,9 +259,11 @@ func (c *Client) InstallationToken(ctx context.Context, installationID int64) (s
 	return out.Token, nil
 }
 
-func (c *Client) dropToken(installationID int64) {
+func (c *Client) dropToken(installationID int64, rejectedToken string) {
 	c.mu.Lock()
-	delete(c.tokens, installationID)
+	if cached, ok := c.tokens[installationID]; ok && cached.token == rejectedToken {
+		delete(c.tokens, installationID)
+	}
 	c.mu.Unlock()
 }
 

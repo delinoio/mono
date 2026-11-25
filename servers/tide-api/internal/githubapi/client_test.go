@@ -70,6 +70,104 @@ func TestInstallationTokenCache(t *testing.T) {
 	}
 }
 
+func TestDelayedUnauthorizedPreservesReplacementInstallationToken(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var mints, requests atomic.Int32
+	token := func(number int32) string { return fmt.Sprintf("test-installation-token-%d", number) }
+	delayedStarted := make(chan struct{})
+	releaseDelayed := make(chan struct{})
+	steps := []struct {
+		tokenNumber int32
+		status      int
+	}{
+		{1, http.StatusUnauthorized}, // Delayed until after token 2 succeeds.
+		{1, http.StatusUnauthorized},
+		{2, http.StatusOK},
+		{2, http.StatusOK},
+		{2, http.StatusUnauthorized},
+		{3, http.StatusOK},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /app/installations/1/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(map[string]string{"token": token(mints.Add(1))}); err != nil {
+			t.Errorf("encode token response: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /orgs/acme/actions/runner-groups", func(w http.ResponseWriter, r *http.Request) {
+		call := int(requests.Add(1))
+		if call > len(steps) {
+			t.Errorf("unexpected runner group request %d", call)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		step := steps[call-1]
+		if r.Header.Get("Authorization") != "Bearer "+token(step.tokenNumber) {
+			t.Errorf("runner group request %d used the wrong bearer", call)
+		}
+		if call == 1 {
+			close(delayedStarted)
+			select {
+			case <-releaseDelayed:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		w.WriteHeader(step.status)
+		if step.status == http.StatusOK {
+			_, _ = fmt.Fprint(w, `{"total_count":0,"runner_groups":[]}`)
+		}
+	})
+	upstream := httptest.NewServer(mux)
+	t.Cleanup(upstream.Close)
+	f := githubfake.New(nil)
+	t.Cleanup(f.Server.Close)
+	cfg := f.Config()
+	cfg.APIOrigin = upstream.URL
+	c := githubapi.New(cfg, upstream.Client(), slog.New(slog.DiscardHandler), nil)
+
+	list := func() error {
+		_, err := c.RunnerGroups(ctx, 1, "acme")
+		return err
+	}
+	requireUnauthorized := func(label string, err error) {
+		t.Helper()
+		var apiErr *githubapi.Error
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized || apiErr.Op != "list_runner_groups" {
+			t.Fatalf("%s: got %v, want the runner group HTTP 401", label, err)
+		}
+	}
+	requireSuccess := func(label string, wantMints int32) {
+		t.Helper()
+		if err := list(); err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		if got := mints.Load(); got != wantMints {
+			t.Fatalf("%s: got %d token mints, want %d", label, got, wantMints)
+		}
+	}
+
+	delayedResult := make(chan error, 1)
+	go func() { delayedResult <- list() }()
+	select {
+	case <-delayedStarted:
+	case err := <-delayedResult:
+		t.Fatalf("request returned before reaching the delayed handler: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the delayed request")
+	}
+	requireUnauthorized("reject the initial token", list())
+	requireSuccess("mint and use the replacement token", 2)
+	close(releaseDelayed)
+	requireUnauthorized("return the delayed 401", <-delayedResult)
+	requireSuccess("reuse the replacement after the delayed 401", 2)
+	requireUnauthorized("reject the replacement token", list())
+	requireSuccess("refresh after the current token is rejected", 3)
+}
+
 func TestRunners(t *testing.T) {
 	c, f, logs := newClient(t)
 	f.AddInstallation(1, "acme", "Organization")
