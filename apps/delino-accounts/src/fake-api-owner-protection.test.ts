@@ -29,7 +29,13 @@ function setup(caller: string) {
   const members = () => api.accounts.get(ACCOUNT_ID)!.members;
   const roleOf = (userId: string) =>
     members().find((m) => m.userId === userId)?.role;
-  return { api, client, members, roleOf };
+  const listMemberRoles = async () => {
+    const { members } = await client.listMembers({
+      billingAccountId: ACCOUNT_ID,
+    });
+    return members.map(({ userId, role }) => ({ userId, role }));
+  };
+  return { api, client, members, roleOf, listMemberRoles };
 }
 
 describe("fake owner protection", () => {
@@ -68,6 +74,50 @@ describe("fake owner protection", () => {
 
     expect(error.code).toBe(Code.FailedPrecondition);
     expect(roleOf(OWNER)).toBe(BillingAccountRole.OWNER);
+  });
+
+  test("rejects a transfer to the current owner and preserves membership", async () => {
+    const { client, listMemberRoles } = setup(OWNER);
+    const before = await listMemberRoles();
+
+    const error = await rejection(
+      client.transferOwnership({ billingAccountId: ACCOUNT_ID, userId: OWNER }),
+    );
+
+    expect(error.code).toBe(Code.InvalidArgument);
+    expect(error.rawMessage).toBe("user_id must name another member");
+    const after = await listMemberRoles();
+    expect(after).toEqual(before);
+    expect(
+      after.filter(({ role }) => role === BillingAccountRole.OWNER),
+    ).toEqual([{ userId: OWNER, role: BillingAccountRole.OWNER }]);
+  });
+
+  test("checks ownership before checking the transfer target", async () => {
+    const { client, listMemberRoles } = setup(ADMIN);
+    const before = await listMemberRoles();
+
+    const error = await rejection(
+      client.transferOwnership({ billingAccountId: ACCOUNT_ID, userId: ADMIN }),
+    );
+
+    expect(error.code).toBe(Code.PermissionDenied);
+    expect(await listMemberRoles()).toEqual(before);
+  });
+
+  test("rejects a transfer to an unknown member and preserves membership", async () => {
+    const { client, listMemberRoles } = setup(OWNER);
+    const before = await listMemberRoles();
+
+    const error = await rejection(
+      client.transferOwnership({
+        billingAccountId: ACCOUNT_ID,
+        userId: "user-missing",
+      }),
+    );
+
+    expect(error.code).toBe(Code.NotFound);
+    expect(await listMemberRoles()).toEqual(before);
   });
 
   test("protects the new owner after a transfer and releases the former one", async () => {

@@ -8,10 +8,7 @@ import {
 } from "@delino/accounts-protos/v1/billing_account_pb";
 import { type Browser, describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import {
-  BILLING_API_ORIGIN,
-  installBillingSession,
-} from "./billing-session.ts";
+import { API_ORIGIN, seedFixtureSession } from "./fixture-session.ts";
 
 const existingAccount = {
   billingAccountId: "0193a1b2-0000-7000-8000-000000000001",
@@ -44,7 +41,7 @@ async function deferBillingCreate(browser: Browser, holdListRefresh: boolean) {
   let creates = 0;
   let reads = 0;
   let created = false;
-  await browser.route(BILLING_API_ORIGIN + "/**", async (route) => {
+  await browser.route(API_ORIGIN + "/**", async (route) => {
     const headers = {
       "access-control-allow-origin": "*",
       "access-control-allow-methods": "POST",
@@ -114,7 +111,7 @@ describe("billing account creation", () => {
         ? "preserves browser Back and refreshes billing after a late create"
         : "opens the created account while the list refresh is held",
       async ({ app, browser, screen }) => {
-        await installBillingSession(browser, app.baseUrl);
+        await seedFixtureSession(browser, app.baseUrl);
         const billing = await deferBillingCreate(browser, !leave);
         try {
           await app.open("/");

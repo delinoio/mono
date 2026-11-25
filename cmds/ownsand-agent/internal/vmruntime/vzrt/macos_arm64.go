@@ -21,6 +21,10 @@ const macOSGuestsSupported = true
 // entropy device, a graphics device without a window and, for OUTBOUND
 // guests, the network device.
 func NewMacOSConfiguration(m MacOSMachine) (*vz.VirtualMachineConfiguration, []byte, error) {
+	memoryBytes, err := memoryMiBToBytes(m.MemoryMiB)
+	if err != nil {
+		return nil, nil, err
+	}
 	model, err := vz.NewMacHardwareModelWithData(m.HardwareModel)
 	if err != nil {
 		return nil, nil, fmt.Errorf("vzrt: hardware model: %w", err)
@@ -50,7 +54,7 @@ func NewMacOSConfiguration(m MacOSMachine) (*vz.VirtualMachineConfiguration, []b
 	if err != nil {
 		return nil, nil, err
 	}
-	cfg, err := vz.NewVirtualMachineConfiguration(boot, uint(m.CPUs), uint64(m.MemoryMiB)<<20)
+	cfg, err := vz.NewVirtualMachineConfiguration(boot, uint(m.CPUs), memoryBytes)
 	if err != nil {
 		return nil, nil, err
 	}

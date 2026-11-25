@@ -32,7 +32,7 @@ import {
 import { BillingUsageService } from "@delino/accounts-protos/v1/usage_pb";
 import { formatUsd, toAmountInput } from "../../money.ts";
 import { can, Permission } from "../../roles.ts";
-import { RouteId, routePath, useRouter } from "../../router.tsx";
+import { parseRoute, RouteId, routePath, useRouter } from "../../router.tsx";
 
 const READ_ONLY_NOTE = "Only owners and admins can change these settings.";
 
@@ -105,15 +105,19 @@ function NameSettings() {
   const { billingAccountId, name, role } = useBillingAccount();
   const queryClient = useQueryClient();
   const update = useMutation(BillingAccountService.method.updateBillingAccount);
-  // Only the user's unsaved edit is local state. A pristine field (no draft)
-  // shows the fetched name, so it follows refetches, also when read-only.
-  const [draft, setDraft] = useState<string>();
+  const [draft, setDraft] = useState<{ value: string }>();
+  const [savedName, setSavedName] = useState<string>();
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
   const editable = can(role, Permission.ManageMembers);
-  // The draft ends once the fetched name equals it: either the user typed the
-  // current name back, or the refetch after a save delivered the saved name.
-  if (draft !== undefined && draft === name) setDraft(undefined);
-  const value = draft ?? name;
+  const awaitingSavedName = savedName !== undefined && savedName !== name;
+  if (savedName === name) setSavedName(undefined);
+  // While saving or waiting for the saved name to arrive, the fetched name
+  // can be stale. A draft that matches it may still be an unsaved edit.
+  if (!saving && !awaitingSavedName && draft?.value === name) {
+    setDraft(undefined);
+  }
+  const value = draft?.value ?? savedName ?? name;
   return (
     <SettingsForm
       title="Name"
@@ -126,18 +130,23 @@ function NameSettings() {
           return;
         }
         setError(undefined);
-        await update.mutateAsync({ billingAccountId, name: checked.value });
-        // Show the saved (trimmed) name until the refetch delivers it, so the
-        // field neither flashes the old name nor reverts if the refetch fails.
-        setDraft(checked.value);
-        await invalidateServices(queryClient, BillingAccountService);
-        toast.success("The name is saved.");
+        setSaving(true);
+        try {
+          await update.mutateAsync({ billingAccountId, name: checked.value });
+          setSavedName(checked.value);
+          // Each edit creates a new draft, even if the user types the same text.
+          setDraft((latest) => (latest === draft ? undefined : latest));
+          await invalidateServices(queryClient, BillingAccountService);
+          toast.success("The name is saved.");
+        } finally {
+          setSaving(false);
+        }
       }}
     >
       <TextField
         label="Billing account name"
         value={value}
-        onChange={(event) => setDraft(event.target.value)}
+        onChange={(event) => setDraft({ value: event.target.value })}
         error={error}
         disabled={!editable}
         autoComplete="off"
@@ -404,9 +413,15 @@ function DeleteSection() {
         confirmLabel="Delete billing account"
         onConfirm={async () => {
           await remove.mutateAsync({ billingAccountId });
-          // Leave the deleted account first, so that the invalidation does
-          // not refetch its queries (they are now `not_found`).
-          navigate(routePath({ id: RouteId.Billing }));
+          // Read the live route after the RPC. Move off this account before
+          // refreshing because the caller can no longer read it.
+          const route = parseRoute(window.location.pathname);
+          if (
+            route.id === RouteId.BillingAccount &&
+            route.billingAccountId === billingAccountId
+          ) {
+            navigate(routePath({ id: RouteId.Billing }));
+          }
           await invalidateServices(
             queryClient,
             BillingAccountService,

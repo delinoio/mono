@@ -103,22 +103,44 @@ func requireModeTree(t *testing.T, dst string, rootMode fs.FileMode) {
 }
 
 func TestCopyTreePreservesModesUnderUmask(t *testing.T) {
-	for _, mask := range []int{0o022, 0o077} {
+	for _, mask := range []int{0o022, 0o077, 0o277, 0o177} {
 		t.Run(fmt.Sprintf("umask%04o", mask), func(t *testing.T) {
-			setUmask(t, mask)
 			src := buildModeTree(t)
-			dst := filepath.Join(t.TempDir(), "dst")
-			t.Cleanup(func() { makeDirsWritable(dst) })
-			if err := CopyTree(src, dst); err != nil {
-				t.Fatalf("CopyTree: %v", err)
+			base := t.TempDir()
+			if err := os.Chmod(base, 0o711); err != nil {
+				t.Fatal(err)
 			}
-			requireModeTree(t, dst, 0o775)
-			if b, err := os.ReadFile(filepath.Join(dst, "ro", "deep", "g")); err != nil || string(b) != "ro/deep/g" {
-				t.Fatalf("content of a file in a read-only directory = %q, %v", b, err)
-			}
-			link, err := os.Readlink(filepath.Join(dst, "ro", "link"))
-			if err != nil || link != "../top" {
-				t.Fatalf("symbolic link = %q, %v", link, err)
+			for _, test := range []struct {
+				name string
+				dir  string
+			}{
+				{name: "existing-parent", dir: base},
+				{name: "missing-parents", dir: filepath.Join(base, "parent", "nested")},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					dst := filepath.Join(test.dir, "dst")
+					t.Cleanup(func() { makeDirsWritable(dst) })
+					setUmask(t, mask)
+					if err := CopyTree(src, dst); err != nil {
+						t.Fatalf("CopyTree: %v", err)
+					}
+					requireModeTree(t, dst, 0o775)
+					requireMode(t, base, 0o711)
+					if test.dir != base {
+						parentMode := 0o775&^fs.FileMode(mask) | 0o700
+						requireMode(t, filepath.Dir(test.dir), parentMode)
+						requireMode(t, test.dir, parentMode)
+					}
+					for _, name := range []string{"top", "ro/deep/g"} {
+						if b, err := os.ReadFile(filepath.Join(dst, name)); err != nil || string(b) != name {
+							t.Fatalf("content of %s = %q, %v", name, b, err)
+						}
+					}
+					link, err := os.Readlink(filepath.Join(dst, "ro", "link"))
+					if err != nil || link != "../top" {
+						t.Fatalf("symbolic link = %q, %v", link, err)
+					}
+				})
 			}
 		})
 	}
@@ -249,16 +271,22 @@ func TestCopyTreeErrorIsReportedAndLeavesPartialCopyRemovable(t *testing.T) {
 }
 
 func TestCopyTreeContextCanceledLeavesPartialCopyRemovable(t *testing.T) {
-	setUmask(t, 0o022)
-	src := buildModeTree(t)
-	dst := filepath.Join(t.TempDir(), "dst")
-	t.Cleanup(func() { makeDirsWritable(dst) })
-	// The context ends at the fourth entry, after ro and ro/deep were created.
-	ctx := &errAfterContext{Context: context.Background(), left: 3}
-	if err := CopyTreeContext(ctx, src, dst); !errors.Is(err, context.Canceled) {
-		t.Fatalf("CopyTreeContext error = %v, want context.Canceled", err)
-	}
-	if err := os.RemoveAll(dst); err != nil {
-		t.Fatalf("os.RemoveAll of the partial copy: %v", err)
+	for _, mask := range []int{0o022, 0o277, 0o177} {
+		t.Run(fmt.Sprintf("umask%04o", mask), func(t *testing.T) {
+			src := buildModeTree(t)
+			parent := filepath.Join(t.TempDir(), "parent")
+			dst := filepath.Join(parent, "dst")
+			t.Cleanup(func() { makeDirsWritable(parent) })
+			setUmask(t, mask)
+			// The context ends at the fourth entry, after ro and ro/deep were created.
+			ctx := &errAfterContext{Context: context.Background(), left: 3}
+			if err := CopyTreeContext(ctx, src, dst); !errors.Is(err, context.Canceled) {
+				t.Fatalf("CopyTreeContext error = %v, want context.Canceled", err)
+			}
+			requireMode(t, filepath.Join(dst, "ro", "deep"), 0o755&^fs.FileMode(mask)|0o700)
+			if err := os.RemoveAll(parent); err != nil {
+				t.Fatalf("os.RemoveAll of the partial copy: %v", err)
+			}
+		})
 	}
 }

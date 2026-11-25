@@ -344,6 +344,55 @@ func TestAgentRejectedCreateRetriesTransientError(t *testing.T) {
 	connStaysOpen(t, conn)
 }
 
+func TestCreateAbortedByTTLAwaitsAgentUpdate(t *testing.T) {
+	const (
+		creating = ownsandv1.SandboxState_SANDBOX_STATE_CREATING
+		deleted  = ownsandv1.SandboxState_SANDBOX_STATE_DELETED
+		reason   = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED
+	)
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	_, agent := setupAgent(t, env, org, nil)
+	withholdAll(agent)
+
+	c := org.OwnerClient
+	created, err := c.Sandbox.CreateSandbox(t.Context(), connect.NewRequest(createReq(org.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created.Msg.GetSandbox().GetSandboxId()
+	cmd := agent.WaitFor("create command", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCommand().GetCreateSandbox().GetSandboxId() == id
+	}).GetCommand()
+	entry := agent.SetSandbox(id, creating, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED)
+	agent.SendUpdate(entry)
+	agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: &ownsandv1.AgentCommandResult{
+		CommandId: cmd.GetCommandId(),
+		Error:     &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_ABORTED},
+		Result:    &ownsandv1.AgentCommandResult_CreateSandbox{CreateSandbox: &ownsandv1.CreateSandboxResult{Sandbox: entry}},
+	}}})
+	// The server processes the result before it can acknowledge this heartbeat.
+	const sequence = 37
+	agent.Heartbeat(sequence)
+	agent.WaitFor("heartbeat after aborted create", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetHeartbeatAck().GetSequence() == sequence
+	})
+	if got := getSandbox(t, c, org.ID, id); got.GetState() != creating {
+		t.Errorf("state before the TTL update = %v, want %v", got.GetState(), creating)
+	}
+
+	terminal := agent.SetSandbox(id, deleted, reason)
+	agent.SendUpdate(terminal)
+	agent.WaitFor("terminal update ack", func(e *ownsandv1.AgentEnvelope) bool {
+		ack := e.GetStateAck().GetSandboxUpdate()
+		return ack.GetSandboxId() == id && ack.GetRevision().GetCounter() == terminal.GetRevision().GetCounter()
+	})
+	got := getSandbox(t, c, org.ID, id)
+	if got.GetState() != deleted || got.GetEndReason() != reason {
+		t.Fatalf("state after the TTL update = %v / %v, want %v / %v", got.GetState(), got.GetEndReason(), deleted, reason)
+	}
+}
+
 // TestAgentRejectedCreateUnresolvedClosesChannel checks that a rejected
 // create whose transition stays unresolved closes the channel and that the
 // replacement channel ends the sandbox as LOST_ON_DEVICE.

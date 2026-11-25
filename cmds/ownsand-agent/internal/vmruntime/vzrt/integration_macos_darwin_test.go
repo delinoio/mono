@@ -232,6 +232,9 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 	for _, id := range []string{sb.GetSandboxId(), cold.GetSandboxId()} {
 		deleteSandbox(id)
 	}
+	t.Run("cancel-during-restored-readiness", func(t *testing.T) {
+		e.requireCanceledRestore(t, snapID, ownsandv1.GuestOs_GUEST_OS_MACOS)
+	})
 	// With the source gone, the memory state restores with the snapshot's
 	// identifier.
 	coldPath := ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT

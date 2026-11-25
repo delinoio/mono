@@ -12,6 +12,7 @@ import {
   cleanup,
   fireEvent,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -36,6 +37,7 @@ import {
   OWNER,
   VIEWER,
 } from "./testing/fake-api.ts";
+import { deferNextCall } from "./testing/form-submit-deferral.ts";
 import { listItems } from "./testing/list-rows.ts";
 import { fakeCheckout, renderApp, settle } from "./testing/render.tsx";
 
@@ -290,6 +292,12 @@ describe("billing accounts", () => {
     }) as HTMLInputElement;
   }
 
+  function saveNameButton() {
+    return within(nameField().closest("form")!).getByRole("button", {
+      name: "Save",
+    }) as HTMLButtonElement;
+  }
+
   test("an unedited name field and the header follow a refetched account name", async () => {
     const { api } = await renderAccount(ADMIN);
     await openTab("Settings");
@@ -348,33 +356,74 @@ describe("billing accounts", () => {
     ]);
   });
 
-  test("a failed name save keeps the edit for a retry, then the field follows the saved name", async () => {
+  for (const [draft, nextName] of [
+    ["  Beta  ", "Beta"],
+    ["Acme Robotics", "Acme Robotics"],
+  ]) {
+    test(`keeps the newer name draft "${draft}" through a successful save and refetch`, async () => {
+      const { api } = await renderAccount(ADMIN);
+      await openTab("Settings");
+      const pending = deferNextCall(api, "UpdateBillingAccount");
+      await type(nameField(), "  Alpha  ");
+      await click(saveNameButton());
+      expect(calls(api, "UpdateBillingAccount")).toEqual([
+        expect.objectContaining({ name: "Alpha" }),
+      ]);
+      expect(saveNameButton().disabled).toBe(true);
+      expect(nameField().disabled).toBe(false);
+      await type(nameField(), draft);
+
+      pending.release();
+      await screen.findByRole("heading", { name: "Alpha", level: 1 });
+      expect(nameField().value).toBe(draft);
+      await waitFor(() => expect(saveNameButton().disabled).toBe(false));
+      await click(saveNameButton());
+      await screen.findByRole("heading", { name: nextName, level: 1 });
+      expect(calls(api, "UpdateBillingAccount")).toEqual([
+        expect.objectContaining({ name: "Alpha" }),
+        expect.objectContaining({ name: nextName }),
+      ]);
+    });
+  }
+
+  test("a failed name save keeps the latest edit for a retry", async () => {
     const { api } = await renderAccount(ADMIN);
     await openTab("Settings");
+    const pending = deferNextCall(api, "UpdateBillingAccount");
+    await type(nameField(), "Alpha");
+    await click(saveNameButton());
     await type(nameField(), "  Gamma  ");
-    const save = () =>
-      click(
-        within(nameField().closest("form")!).getByRole("button", {
-          name: "Save",
-        }),
-      );
-    api.failNext.set("UpdateBillingAccount", BACKGROUND_FAILURE);
-    await save();
-    await settle(60);
-    expect(screen.getByText(BUSY)).toBeTruthy();
+    pending.fail(BACKGROUND_FAILURE);
+    await screen.findByText(BUSY);
     expect(nameField().value).toBe("  Gamma  ");
 
-    await save();
-    await settle(60);
+    await click(saveNameButton());
+    await screen.findByRole("heading", { name: "Gamma", level: 1 });
     expect(calls(api, "UpdateBillingAccount")).toEqual([
-      expect.objectContaining({ name: "Gamma" }),
+      expect.objectContaining({ name: "Alpha" }),
       expect.objectContaining({ name: "Gamma" }),
     ]);
+    expect(nameField().value).toBe("Gamma");
+  });
+
+  test("shows the normalized saved name during and after a failed refetch", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    const refetch = deferNextCall(api, "GetBillingAccount");
+    await type(nameField(), "  Gamma  ");
+    await click(saveNameButton());
+    await waitFor(() => expect(nameField().value).toBe("Gamma"));
     expect(
-      await screen.findByRole("heading", { name: "Gamma", level: 1 }),
+      screen.getByRole("heading", { name: "Acme Robotics", level: 1 }),
     ).toBeTruthy();
+    expect(saveNameButton().disabled).toBe(true);
+
+    refetch.fail(BACKGROUND_FAILURE);
+    await screen.findByText(BUSY);
     expect(nameField().value).toBe("Gamma");
 
+    await click(screen.getByRole("button", { name: "Try again" }));
+    await screen.findByRole("heading", { name: "Gamma", level: 1 });
     renameElsewhere(api, "Beta");
     await refocus();
     expect(nameField().value).toBe("Beta");
@@ -818,7 +867,7 @@ describe("invoices", () => {
     await settle();
   }
 
-  test("demotion to viewer while Invoices is open selects Overview", async () => {
+  test("Overview stays selected after invoice access returns", async () => {
     const api = createFakeApi();
     await renderAccount(ADMIN, { api });
     await openTab("Invoices");
@@ -831,11 +880,26 @@ describe("invoices", () => {
     await changeRoleAndRefetch(api, ADMIN, BillingAccountRole.VIEWER);
 
     expect(screen.queryByRole("tab", { name: "Invoices" })).toBeNull();
-    const selected = screen
-      .getAllByRole("tab")
-      .filter((t) => t.getAttribute("aria-selected") === "true");
-    expect(selected.map((t) => t.textContent)).toEqual(["Overview"]);
-    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+    expect(screen.queryByRole("tabpanel", { name: "Invoices" })).toBeNull();
+    expect(screen.getAllByRole("tab", { selected: true })).toEqual([
+      screen.getByRole("tab", { name: "Overview" }),
+    ]);
+
+    await changeRoleAndRefetch(api, ADMIN, BillingAccountRole.ADMIN);
+
+    expect(
+      screen.getByRole("tab", { name: "Invoices", selected: false }),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("tab", { selected: true })).toEqual([
+      screen.getByRole("tab", { name: "Overview" }),
+    ]);
+    expect(screen.getByRole("tabpanel", { name: "Overview" })).toBeTruthy();
+
+    await openTab("Invoices");
+
+    expect(
+      screen.getByRole("tab", { name: "Invoices", selected: true }),
+    ).toBeTruthy();
   });
 
   test("a role change that keeps access keeps the Invoices tab selected", async () => {
