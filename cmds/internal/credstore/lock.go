@@ -5,7 +5,6 @@ package credstore
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 )
@@ -31,7 +30,7 @@ var ErrLockTimeout = errors.New("credstore: timed out waiting for the credential
 // can still be replaced atomically while the lock is held, and the OS
 // releases the lock when the process exits.
 func (s Store) lock() (func(), error) {
-	f, err := os.OpenFile(filepath.Join(s.Dir, LockFileName), os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := openLockFile(filepath.Join(s.Dir, LockFileName))
 	if err != nil {
 		return nil, fmt.Errorf("credstore: open lock file: %w", err)
 	}
