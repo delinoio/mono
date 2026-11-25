@@ -81,6 +81,34 @@ function calls(api: ReturnType<typeof createFakeApi>, method: string) {
   return api.calls.filter((c) => c.method === method).map((c) => c.request);
 }
 
+function setMemberRole(
+  api: ReturnType<typeof createFakeApi>,
+  userId: string,
+  role: BillingAccountRole,
+) {
+  const member = api.accounts
+    .get(ACCOUNT_ID)
+    ?.members.find((m) => m.userId === userId);
+  if (member === undefined) throw new Error("member missing");
+  member.role = role;
+}
+
+async function refetchOnVisibilityChange() {
+  await act(async () => {
+    window.dispatchEvent(new Event("visibilitychange"));
+  });
+  await settle();
+}
+
+async function changeRoleAndRefetch(
+  api: ReturnType<typeof createFakeApi>,
+  userId: string,
+  role: BillingAccountRole,
+) {
+  setMemberRole(api, userId, role);
+  await refetchOnVisibilityChange();
+}
+
 beforeEach(() => {
   window.sessionStorage.clear();
   window.localStorage.clear();
@@ -451,6 +479,114 @@ describe("overview", () => {
     await renderAccount(undefined, { api });
     expect(await balanceText()).toBe("-$1.50");
     expect(screen.getByText(/The balance is negative/)).toBeTruthy();
+  });
+});
+
+describe("billing confirmations after a role refresh", () => {
+  test.each([
+    {
+      tab: "Overview",
+      launch: "Cancel subscription",
+      rpc: "CancelSubscription",
+    },
+    { tab: "Members", launch: "Remove", rpc: "RemoveMember" },
+  ])(
+    "dismisses $rpc on demotion and requires a new opening after restoration",
+    async ({ tab, launch, rpc }) => {
+      const { api } = await renderAccount(ADMIN);
+      await openTab(tab);
+      await click((await screen.findAllByRole("button", { name: launch }))[0]);
+      await screen.findByRole("alertdialog");
+
+      await changeRoleAndRefetch(api, ADMIN, BillingAccountRole.VIEWER);
+
+      expect(screen.getByText("Your role: Viewer")).toBeTruthy();
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(screen.queryByRole("button", { name: launch })).toBeNull();
+      expect(calls(api, rpc)).toEqual([]);
+
+      await changeRoleAndRefetch(api, ADMIN, BillingAccountRole.ADMIN);
+
+      expect(screen.getByText("Your role: Admin")).toBeTruthy();
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      await click((await screen.findAllByRole("button", { name: launch }))[0]);
+      const dialog = await screen.findByRole("alertdialog");
+      await click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(calls(api, rpc)).toEqual([]);
+    },
+  );
+
+  test("dismisses an ownership transfer when the caller becomes an admin", async () => {
+    const { api } = await renderAccount(OWNER);
+    await openTab("Members");
+    await click(
+      (await screen.findAllByRole("button", { name: "Make owner" })).at(-1)!,
+    );
+    await screen.findByRole("alertdialog", {
+      name: "Make Vera Viewer the owner?",
+    });
+
+    setMemberRole(api, ADMIN, BillingAccountRole.OWNER);
+    await changeRoleAndRefetch(api, OWNER, BillingAccountRole.ADMIN);
+
+    expect(screen.getByText("Your role: Admin")).toBeTruthy();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Make owner" })).toBeNull();
+    expect(calls(api, "TransferOwnership")).toEqual([]);
+
+    setMemberRole(api, ADMIN, BillingAccountRole.ADMIN);
+    await changeRoleAndRefetch(api, OWNER, BillingAccountRole.OWNER);
+    expect(screen.getAllByRole("button", { name: "Make owner" })).toHaveLength(
+      2,
+    );
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
+  test("dismisses removal when the selected member becomes the owner", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Members");
+    await click(await screen.findByRole("button", { name: "Remove" }));
+    await screen.findByRole("alertdialog", { name: "Remove Vera Viewer?" });
+
+    setMemberRole(api, OWNER, BillingAccountRole.ADMIN);
+    await changeRoleAndRefetch(api, VIEWER, BillingAccountRole.OWNER);
+
+    expect(screen.getByText("Your role: Admin")).toBeTruthy();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(calls(api, "RemoveMember")).toEqual([]);
+  });
+
+  test("keeps cancellation open across a transient error and a role change that still permits it", async () => {
+    const { api } = await renderAccount(OWNER);
+    await click(
+      await screen.findByRole("button", { name: "Cancel subscription" }),
+    );
+    await screen.findByRole("alertdialog");
+
+    api.failNext.set(
+      "GetBillingAccount",
+      new ConnectError("down", Code.Unavailable),
+    );
+    await refetchOnVisibilityChange();
+
+    expect(screen.getByText("Your role: Owner")).toBeTruthy();
+    expect(screen.getByText(/Delino Accounts is not available/)).toBeTruthy();
+    expect(screen.getByRole("alertdialog")).toBeTruthy();
+
+    setMemberRole(api, ADMIN, BillingAccountRole.OWNER);
+    await changeRoleAndRefetch(api, OWNER, BillingAccountRole.ADMIN);
+
+    expect(screen.getByText("Your role: Admin")).toBeTruthy();
+    await click(
+      within(screen.getByRole("alertdialog")).getByRole("button", {
+        name: "Cancel subscription",
+      }),
+    );
+    expect(calls(api, "CancelSubscription")).toEqual([
+      expect.objectContaining({ billingAccountId: ACCOUNT_ID }),
+    ]);
+    expect(await screen.findByText(/Ends on Dec 1, 2026/)).toBeTruthy();
   });
 });
 
@@ -849,23 +985,6 @@ describe("invoices", () => {
         .getAttribute("aria-selected"),
     ).toBe("true");
   });
-
-  /** Changes the caller's role in the fake API and refetches the account. */
-  async function changeRoleAndRefetch(
-    api: ReturnType<typeof createFakeApi>,
-    userId: string,
-    role: BillingAccountRole,
-  ) {
-    const member = api.accounts
-      .get(ACCOUNT_ID)
-      ?.members.find((m) => m.userId === userId);
-    if (member === undefined) throw new Error("member missing");
-    member.role = role;
-    await act(async () => {
-      window.dispatchEvent(new Event("visibilitychange"));
-    });
-    await settle();
-  }
 
   test("Overview stays selected after invoice access returns", async () => {
     const api = createFakeApi();

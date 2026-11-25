@@ -70,9 +70,28 @@ export function MembersSection() {
   const transfer = useMutation(BillingAccountService.method.transferOwnership, {
     onSuccess: refresh,
   });
-  const [removing, setRemoving] = useState<BillingAccountMember>();
-  const [transferring, setTransferring] = useState<BillingAccountMember>();
+  const [removingId, setRemovingId] = useState<string>();
+  const [transferringId, setTransferringId] = useState<string>();
   const [leaving, setLeaving] = useState(false);
+  const canTransfer = can(role, Permission.TransferOwnership);
+  const manageable = (member: BillingAccountMember) =>
+    member.userId !== userId && canManageMember(role, member.role);
+  const removing = members.items.find(
+    (member) => member.userId === removingId && manageable(member),
+  );
+  const transferring = canTransfer
+    ? members.items.find(
+        (member) => member.userId === transferringId && manageable(member),
+      )
+    : undefined;
+
+  // Clear invalid selections before the dialog can render again.
+  if (removingId !== undefined && removing === undefined) {
+    setRemovingId(undefined);
+  }
+  if (transferringId !== undefined && transferring === undefined) {
+    setTransferringId(undefined);
+  }
 
   return (
     <div className="stack">
@@ -99,7 +118,6 @@ export function MembersSection() {
             <ul className="list" aria-label="Members">
               {members.items.map((m) => {
                 const self = m.userId === userId;
-                const manageable = !self && canManageMember(role, m.role);
                 return (
                   <li key={m.userId} className="list-row">
                     <div className="list-main">
@@ -111,7 +129,7 @@ export function MembersSection() {
                         Joined {formatDate(m.createTime)}
                       </span>
                     </div>
-                    {manageable ? (
+                    {manageable(m) ? (
                       <div className="list-actions">
                         <Select
                           label={`Role of ${displayName(m)}`}
@@ -142,11 +160,11 @@ export function MembersSection() {
                             Viewer
                           </SelectOption>
                         </Select>
-                        {can(role, Permission.TransferOwnership) ? (
+                        {canTransfer ? (
                           <Button
                             variant={ButtonVariant.Secondary}
                             size={ButtonSize.Small}
-                            onClick={() => setTransferring(m)}
+                            onClick={() => setTransferringId(m.userId)}
                           >
                             Make owner
                           </Button>
@@ -154,7 +172,7 @@ export function MembersSection() {
                         <Button
                           variant={ButtonVariant.Danger}
                           size={ButtonSize.Small}
-                          onClick={() => setRemoving(m)}
+                          onClick={() => setRemovingId(m.userId)}
                         >
                           Remove
                         </Button>
@@ -173,27 +191,29 @@ export function MembersSection() {
       {can(role, Permission.ManageMembers) ? <Invitations /> : null}
       <ConfirmDialog
         open={removing !== undefined}
-        onOpenChange={(open) => !open && setRemoving(undefined)}
+        onOpenChange={(open) => !open && setRemovingId(undefined)}
         title={`Remove ${removing ? displayName(removing) : ""}?`}
         description="They lose access to this billing account. Linked organizations stay linked."
         confirmLabel="Remove member"
-        onConfirm={() =>
-          removeMember.mutateAsync({
+        onConfirm={async () => {
+          if (removing === undefined) return;
+          await removeMember.mutateAsync({
             billingAccountId,
-            userId: removing!.userId,
-          })
-        }
+            userId: removing.userId,
+          });
+        }}
       />
       <ConfirmDialog
         open={transferring !== undefined}
-        onOpenChange={(open) => !open && setTransferring(undefined)}
+        onOpenChange={(open) => !open && setTransferringId(undefined)}
         title={`Make ${transferring ? displayName(transferring) : ""} the owner?`}
         description="There is only one owner. You become an admin and can no longer delete the billing account or transfer ownership."
         confirmLabel="Transfer ownership"
         onConfirm={async () => {
+          if (transferring === undefined) return;
           await transfer.mutateAsync({
             billingAccountId,
-            userId: transferring!.userId,
+            userId: transferring.userId,
           });
           toast.success("Ownership is transferred.");
         }}
