@@ -2982,6 +2982,101 @@ test(
   },
 );
 
+test(
+  "droplet deploy cleans up an HTTP replacement on a pre-switch signal",
+  {
+    skip: skipDroplet,
+  },
+  async (t) => {
+    for (const {
+      name,
+      signal = "SIGTERM",
+      status = 143,
+      args = httpArgs,
+      launching = false,
+      first = false,
+      stopFails = false,
+    } of [
+      { name: "TERM during health" },
+      { name: "INT during health", signal: "SIGINT", status: 130 },
+      { name: "HUP during health", signal: "SIGHUP", status: 129 },
+      { name: "TERM during launch", launching: true },
+      { name: "first deployment", first: true },
+      { name: "Accounts graceful stop", args: accountsArgs },
+      { name: "Accounts rejected stop", args: accountsArgs, stopFails: true },
+    ]) {
+      await t.test(name, async (t) => {
+        const service = args[0];
+        const route = first ? undefined : "# old route\n";
+        const state = first ? undefined : `${olderImage}\n`;
+        const previous = first ? undefined : `${oldestImage}\n`;
+        const setup = setupDroplet(t, args, {
+          old: first ? [] : ["old1"],
+          route,
+          state,
+          previous,
+          stubs: { curl: blockingCurl },
+        });
+        const run = startDroplet(t, setup, args, {
+          DROPLET_STOP_TIMEOUT: "75",
+          STUB_BLOCK: launching ? "" : "1",
+          STUB_BLOCK_ON: launching ? "run *" : "",
+          STUB_STOP_FAIL: stopFails ? "accounts-api-*" : "",
+        });
+        await waitFor(
+          () =>
+            setup
+              .calls()
+              .some((call) =>
+                call.startsWith(launching ? "docker run " : "curl "),
+              ),
+          launching ? "replacement launch" : "the replacement health check",
+        );
+        run.child.kill(signal);
+        writeFileSync(
+          join(setup.dir, launching ? "release-docker" : "release"),
+          "",
+        );
+
+        const result = await run.done;
+        assert.equal(result.status, status, result.stderr);
+        assert.match(
+          result.stderr,
+          new RegExp(`received ${signal} before the route`),
+        );
+        const calls = setup.calls();
+        const replacement = calls
+          .find((call) => call.startsWith("docker run "))
+          .split(" ")[4];
+        assert.ok(
+          result.stderr.includes(`cleaning up the replacement ${replacement}`),
+        );
+        const changes = calls.filter((call) =>
+          /^docker (exec|start|stop|rm) /.test(call),
+        );
+        if (service === "accounts-api") {
+          const stop = `docker stop --time 75 ${replacement}`;
+          if (stopFails) {
+            assert.deepEqual(changes, [stop]);
+            assert.ok(
+              result.stderr.includes(
+                `docker stop failed for the replacement ${replacement}`,
+              ),
+            );
+          } else {
+            assert.deepEqual(changes, [stop, `docker rm ${replacement}`]);
+          }
+        } else {
+          assert.deepEqual(changes, [`docker rm --force ${replacement}`]);
+        }
+        assert.equal(setup.read(`caddy/sites/${service}.caddy`), route);
+        assert.equal(setup.read(`state/${service}.current`), state);
+        assert.equal(setup.read(`state/${service}.previous`), previous);
+      });
+    }
+  },
+);
+
 // A signal that ends a deployment with UDP ports between the first stop and
 // the route switch must leave the service as it was before the deployment.
 // The `curl` stub blocks the health check (STUB_BLOCK) so that the signal
@@ -5460,6 +5555,54 @@ async function waitForLockWait(run, what) {
     what,
   );
 }
+
+test(
+  "droplet deploy cleans up an HTTP replacement on a signal while waiting for the proxy lock",
+  { skip: skipProxyLock },
+  async (t) => {
+    const route = "# old route\n";
+    const state = `${olderImage}\n`;
+    const previous = `${oldestImage}\n`;
+    const setup = setupDroplet(t, httpArgs, {
+      old: ["old1"],
+      route,
+      state,
+      previous,
+    });
+    const ready = join(setup.dir, "proxy-locked");
+    const lock = spawnProcessGroup(t, "bash", [
+      "-c",
+      'exec 9>"$1"; flock 9 && touch "$2" && read -r _',
+      "bash",
+      join(setup.deployRoot, "state/.proxy.lock"),
+      ready,
+    ]);
+    await waitFor(() => existsSync(ready), "the proxy lock to be held");
+    const run = startDroplet(t, setup, httpArgs);
+    await waitForLockWait(
+      run,
+      "the HTTP deployment to wait for the proxy lock",
+    );
+    run.child.kill("SIGTERM");
+    lock.child.stdin.end("release\n");
+    assert.equal((await lock.done).status, 0);
+
+    const result = await run.done;
+    assert.equal(result.status, 143, result.stderr);
+    assert.match(result.stderr, /received SIGTERM before the route/);
+    const calls = setup.calls();
+    const replacement = calls
+      .find((call) => call.startsWith("docker run "))
+      .split(" ")[4];
+    assert.deepEqual(
+      calls.filter((call) => /^docker (exec|start|stop|rm) /.test(call)),
+      [`docker rm --force ${replacement}`],
+    );
+    assert.equal(setup.read("caddy/sites/api.caddy"), route);
+    assert.equal(setup.read("state/api.current"), state);
+    assert.equal(setup.read("state/api.previous"), previous);
+  },
+);
 
 test(
   "droplet deploy serializes the route changes and proxy reloads of different services",
