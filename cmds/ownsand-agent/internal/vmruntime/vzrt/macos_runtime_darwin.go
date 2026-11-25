@@ -89,6 +89,7 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 		return nil, fmt.Errorf("%w: macOS guests need an Apple silicon Mac", vmruntime.ErrUnsupported)
 	}
 	src := r.opts.MacOSImage
+	diskBytes := spec.Resources.GetDiskGib() << 30
 	if spec.Snapshot != nil {
 		src = spec.Snapshot.Dir
 	} else {
@@ -99,6 +100,13 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 			if spec.Resources.GetVcpuCount() < meta.MinimumCPUCount || spec.Resources.GetMemoryMib() < meta.MinimumMemoryMiB {
 				return nil, fmt.Errorf("%w: macOS guests need at least %d vCPUs and %d MiB of memory", vmruntime.ErrUnsupported, meta.MinimumCPUCount, meta.MinimumMemoryMiB)
 			}
+		}
+		baseDisk, err := os.Stat(filepath.Join(src, images.MacOSDisk))
+		if err != nil {
+			return nil, fmt.Errorf("vzrt: inspect the macOS base disk: %w", err)
+		}
+		if err := checkBaseDiskCapacity(baseDisk.Size(), diskBytes); err != nil {
+			return nil, err
 		}
 	}
 	model, err := os.ReadFile(filepath.Join(src, images.MacOSHardwareModel))
@@ -164,7 +172,7 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 		}
 	}
 	disk := filepath.Join(spec.Dir, diskFile)
-	if err := growFile(disk, spec.Resources.GetDiskGib()<<30); err != nil {
+	if err := growFile(disk, diskBytes); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vzrt: resize disk: %w", err)
 	}
