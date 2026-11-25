@@ -157,23 +157,27 @@ func stateIsStopped(state byte) bool {
 }
 
 // psStopped reports whether `ps -o stat= -p pid` shows a stopped or dead
-// process. `ps` exits with status 1 and prints nothing for a process that does
-// not exist; that process counts as stopped. A `ps` that cannot run is an
-// error.
+// process. Exit status 1 with blank stdout and stderr indicates that the
+// process no longer exists, which counts as stopped. Other failures and
+// successful probes without a state return an error.
 func psStopped(ctx context.Context, pid int) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, psTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, fmt.Errorf("ps: %w", ctxErr)
+	}
+	stat := bytes.TrimSpace(out)
 	if err != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && len(bytes.TrimSpace(out)) == 0 && ctx.Err() == nil {
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 &&
+			len(stat) == 0 && len(bytes.TrimSpace(exitErr.Stderr)) == 0 {
 			return true, nil
 		}
 		return false, fmt.Errorf("ps: %w", err)
 	}
-	stat := bytes.TrimSpace(out)
 	if len(stat) == 0 {
-		return true, nil
+		return false, errors.New("ps: missing process state")
 	}
 	return stateIsStopped(stat[0]), nil
 }
