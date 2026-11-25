@@ -135,6 +135,16 @@ func sendInFlight() bool {
 	}
 }
 
+type relayInterruptClock struct {
+	elapsed atomic.Int64
+}
+
+func (*relayInterruptClock) Now() time.Time { return time.Now() }
+
+func (c *relayInterruptClock) Elapsed() time.Duration {
+	return time.Duration(c.elapsed.Load())
+}
+
 // TestRelayAgentConnectEndsBlockedSendBeforeReturning runs the production
 // Connect serving path (RelayAgentWriteInterrupt and serveRelayConn) over a
 // real HTTP/2 connection. The agent sends nothing after its first frame, so
@@ -157,6 +167,7 @@ func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			limits := relay.Limits{StreamBuffer: datapath.MinWindowSize, MaxStreamsPerConn: 4, MaxStreamsPerGrant: 4,
 				Keepalive: 150 * time.Millisecond, IdleTimeout: 600 * time.Millisecond}
+			clock := &relayInterruptClock{}
 			type result struct {
 				err     error
 				elapsed time.Duration
@@ -174,7 +185,7 @@ func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
 			handler := connect.NewBidiStreamHandler(ownsandv1connect.RelayAgentServiceConnectProcedure,
 				func(ctx context.Context, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
 					start := time.Now()
-					conn := relay.NewConn(ctx, "device", 1, limits)
+					conn := relay.NewConnWithClock(ctx, "device", 1, limits, clock)
 					s, err := conn.Open(ctx, "grant", "sandbox")
 					if err != nil {
 						return err
@@ -215,7 +226,7 @@ func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
 							case <-ticker.C:
 							}
 							completed := sendsCompleted.Load()
-							if sendsStarted.Load() <= completed {
+							if completed == 0 || sendsStarted.Load() <= completed {
 								lastCompleted = -1
 								continue
 							}
@@ -225,6 +236,9 @@ func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
 							}
 							if time.Since(since) >= sendBlockedWindow {
 								observed <- true
+								// Start the idle close once the fixture has
+								// established HTTP/2 backpressure.
+								clock.elapsed.Store(int64(limits.IdleTimeout + time.Millisecond))
 								return
 							}
 						}
