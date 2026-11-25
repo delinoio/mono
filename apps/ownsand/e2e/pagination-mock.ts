@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-import { Code, ConnectError, type Transport } from "@connectrpc/connect";
-import type {
-  ListInvitationsResponse,
-  RevokeInvitationRequest,
+import {
+  Code,
+  ConnectError,
+  createRouterTransport,
+  type Transport,
+} from "@connectrpc/connect";
+import {
+  MemberService,
+  type ListInvitationsResponse,
+  type RevokeInvitationRequest,
 } from "@delino/ownsand-protos/v1/member_pb";
 import { SnapshotExportState } from "@delino/ownsand-protos/v1/common_pb";
 import type { CreateSandboxRequest } from "@delino/ownsand-protos/v1/sandbox_pb";
@@ -10,7 +16,10 @@ import type {
   ListSnapshotsResponse,
   ListTemplatesResponse,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
-import { createMockTransport as createBaseMock } from "../src/mock/mock-api.ts";
+import {
+  createMockTransport as createBaseMock,
+  MOCK_IDS,
+} from "../src/mock/mock-api.ts";
 
 const lists = {
   ListApiKeys: { field: "apiKeys", firstPageSize: 1 },
@@ -116,6 +125,11 @@ export function createMockTransport(): Transport {
     extraSnapshots: pageSources ? 200 : 0,
     extraTemplates: pageSources ? 200 : 0,
   });
+  const earlierAcceptance = createRouterTransport((router) => {
+    router.rpc(MemberService.method.acceptInvitation, () => ({
+      organization: { organizationId: MOCK_IDS.acme },
+    }));
+  });
   return {
     ...base,
     async unary(method, signal, timeout, header, input, contextValues) {
@@ -208,6 +222,29 @@ export function createMockTransport(): Transport {
         method.name === "AcceptInvitation"
       ) {
         await holdOrganizationRefreshStep("mutation");
+      }
+      if (
+        method.name === "AcceptInvitation" &&
+        sessionStorage.getItem("ownsand-e2e-acceptance") === "hold"
+      ) {
+        await new Promise<void>((resolve) => {
+          window.addEventListener(
+            "ownsand-e2e-release-acceptance",
+            () => resolve(),
+            {
+              once: true,
+            },
+          );
+          sessionStorage.setItem("ownsand-e2e-acceptance", "held");
+        });
+        return earlierAcceptance.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
       }
       if (
         pageInvitations &&

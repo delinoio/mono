@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  rs,
+  test,
+} from "@rstest/core";
 import {
   act,
   cleanup,
@@ -8,7 +15,9 @@ import {
   screen,
 } from "@testing-library/react";
 import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
+import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
@@ -179,6 +188,30 @@ describe("a stale invitation acceptance", () => {
   });
 });
 
+const EARLIER_SECRET = "osi_earlier";
+
+function holdBothAcceptances() {
+  const mock = createMockTransport();
+  const earlierAcceptance = createRouterTransport((router) => {
+    router.rpc(MemberService.method.acceptInvitation, () => ({
+      organization: { organizationId: MOCK_IDS.acme },
+    }));
+  });
+  return holdingTransport(["AcceptInvitation"], undefined, {
+    ...mock,
+    unary(method, ...args) {
+      const input = args[3] as { invitationSecret?: string };
+      if (
+        method.name === "AcceptInvitation" &&
+        input.invitationSecret === EARLIER_SECRET
+      ) {
+        return earlierAcceptance.unary(method, ...args);
+      }
+      return mock.unary(method, ...args);
+    },
+  });
+}
+
 describe("opening another invitation while acceptance is pending", () => {
   test.each([
     ["succeeds", undefined],
@@ -186,27 +219,8 @@ describe("opening another invitation while acceptance is pending", () => {
   ] as const)(
     "accepts the new link while the earlier request later %s",
     async (_, error) => {
-      const firstSecret = "osi_earlier";
-      const mock = createMockTransport();
-      const earlierAcceptance = createRouterTransport((router) => {
-        router.rpc(MemberService.method.acceptInvitation, () => ({
-          organization: { organizationId: MOCK_IDS.acme },
-        }));
-      });
-      const held = holdingTransport(["AcceptInvitation"], undefined, {
-        ...mock,
-        unary(method, ...args) {
-          const input = args[3] as { invitationSecret?: string };
-          if (
-            method.name === "AcceptInvitation" &&
-            input.invitationSecret === firstSecret
-          ) {
-            return earlierAcceptance.unary(method, ...args);
-          }
-          return mock.unary(method, ...args);
-        },
-      });
-      renderConsole(`/invitations/accept#secret=${firstSecret}`, {
+      const held = holdBothAcceptances();
+      renderConsole(`/invitations/accept#secret=${EARLIER_SECRET}`, {
         transport: held.transport,
       });
       const acceptButton = () =>
@@ -249,7 +263,7 @@ describe("opening another invitation while acceptance is pending", () => {
           ({ input }) =>
             (input as { invitationSecret: string }).invitationSecret,
         ),
-      ).toEqual([firstSecret, MOCK_INVITATION_SECRET]);
+      ).toEqual([EARLIER_SECRET, MOCK_INVITATION_SECRET]);
 
       await act(async () => {
         calls[0].settle(error);
@@ -272,7 +286,94 @@ describe("opening another invitation while acceptance is pending", () => {
   );
 });
 
+test("keeps a newer fragment until hashchange can consume it", async () => {
+  const held = holdBothAcceptances();
+  const queryClient = new QueryClient();
+  const invalidate = rs.spyOn(queryClient, "invalidateQueries");
+  renderConsole(`/invitations/accept#secret=${EARLIER_SECRET}`, {
+    transport: held.transport,
+    queryClient,
+  });
+  const acceptButton = () =>
+    screen.getByRole("button", { name: "Accept invitation" });
+
+  await act(async () => {
+    fireEvent.click(acceptButton());
+  });
+  const calls = held.calls.AcceptInvitation;
+  expect(calls.map(({ input }) => input)).toMatchObject([
+    { invitationSecret: EARLIER_SECRET },
+  ]);
+
+  const newerHash = `#secret=${MOCK_INVITATION_SECRET}`;
+  // Happy DOM queues hashchange for replaceState. Deliver it manually
+  // after checking the response in the interval before the event.
+  const deferHashChange = (event: Event) => event.stopImmediatePropagation();
+  window.addEventListener("hashchange", deferHashChange, true);
+  try {
+    window.history.replaceState(null, "", newerHash);
+    pendingInvitation.save(EARLIER_SECRET);
+    await act(async () => {
+      calls[0].settle();
+    });
+  } finally {
+    window.removeEventListener("hashchange", deferHashChange, true);
+  }
+
+  expect(window.location.pathname).toBe("/invitations/accept");
+  expect(window.location.hash).toBe(newerHash);
+  expect(pendingInvitation.read()).toBe(EARLIER_SECRET);
+  expect(invalidate).toHaveBeenCalledTimes(2);
+  for (const schema of [MemberService, OrganizationService]) {
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: createConnectQueryKey({ schema, cardinality: undefined }),
+    });
+  }
+
+  await act(async () => {
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+  });
+  expect(window.location.hash).toBe("");
+  expect(pendingInvitation.read()).toBeUndefined();
+  await act(async () => {
+    fireEvent.click(acceptButton());
+  });
+  expect(calls.map(({ input }) => input)).toMatchObject([
+    { invitationSecret: EARLIER_SECRET },
+    { invitationSecret: MOCK_INVITATION_SECRET },
+  ]);
+  await act(async () => {
+    calls[1].settle();
+  });
+  expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.contoso}/sandboxes`);
+});
+
 describe("the current invitation acceptance", () => {
+  test("navigates when the unconsumed fragment has the submitted secret", async () => {
+    const held = holdingTransport(["AcceptInvitation"]);
+    renderConsole(`/invitations/accept#secret=${SECRET_A}`, {
+      transport: held.transport,
+    });
+    pendingInvitation.save(SECRET_A);
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Accept invitation" }),
+      );
+    });
+
+    // An alternate encoding still identifies the invitation being accepted.
+    window.history.replaceState(null, "", `#secret=%20${SECRET_A}%20`);
+    await act(async () => {
+      held.calls.AcceptInvitation[0].settle();
+    });
+    expect(held.calls.AcceptInvitation).toHaveLength(1);
+    expect(window.location.pathname).toBe(
+      `/orgs/${MOCK_IDS.contoso}/sandboxes`,
+    );
+    expect(window.location.hash).toBe("");
+    expect(pendingInvitation.read()).toBeUndefined();
+  });
+
   test("deletes its stored secret when the request fails", async () => {
     const held = holdingTransport(["AcceptInvitation"]);
     pendingInvitation.save(SECRET_A);
