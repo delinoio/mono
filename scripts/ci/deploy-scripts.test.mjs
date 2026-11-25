@@ -4,6 +4,7 @@
 // `check-pending-changesets.sh` (against a stubbed `gh`),
 // `deploy-provider.sh` and `deploy-targets.sh` (against stubbed CLIs),
 // `droplet-deploy.sh` (against stubbed `docker` and `curl`),
+// `provision.sh` (against stubbed host commands),
 // `start-caddy.sh` (against a stubbed `docker`),
 // `configure-docker-logs.sh` (against stubbed `docker` and `systemctl`) and
 // `deploy-release.sh` and `release-recovery.sh` (against a local bare remote).
@@ -23,7 +24,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { main as deployPlan } from "./deploy-plan.mjs";
@@ -4329,6 +4330,115 @@ test(
       {},
     );
     assert.doesNotMatch(valid.stderr, /host name/);
+  },
+);
+
+// --- provision.sh ----------------------------------------------------------
+
+const skipProvision = skip || (!hasFlock && "flock is not installed");
+
+function provisionFixture(t) {
+  const dir = scratch(t);
+  const provision = join(dir, "provision.sh");
+  const source = readFileSync(
+    join(root, "scripts/droplet/provision.sh"),
+    "utf8",
+  );
+  // Redirect the provisioning root and bypass the root check for the fixture.
+  writeFileSync(
+    provision,
+    source
+      .replace('root="/srv/delino"', 'root="$PROVISION_FIXTURE_ROOT"')
+      .replace("if (( EUID != 0 )); then", "if false; then"),
+  );
+  writeFileSync(join(dir, "key.pub"), "ssh-ed25519 AAAA fixture\n");
+  for (const [name, body] of Object.entries({
+    docker: "exit 0",
+    systemctl: "exit 0",
+    usermod: "exit 0",
+    id: "exit 0",
+    getent:
+      'printf "deploy:x:1:1::%s/home:/bin/bash\\n" "$PROVISION_FIXTURE_ROOT"',
+    install: 'mkdir -p "${@:8}"',
+    chown: "exit 0",
+    runuser: '[[ "$1 $2 $3" == "-u deploy --" ]] && exec "${@:4}"',
+    "configure-docker-logs.sh": "exit 0",
+    "start-caddy.sh": `
+lock="$2/state/.proxy.lock"
+[[ -f "$2/caddy/Caddyfile" && -f "$lock" ]] || exit 1
+flock --nonblock --conflict-exit-code 13 "$lock" true
+[[ "$?" == 13 ]] && touch "$2/caddy-started"
+`,
+  })) {
+    writeFileSync(join(dir, name), `#!/usr/bin/env bash\n${body}\n`, {
+      mode: 0o755,
+    });
+  }
+  return {
+    caddyfile: join(dir, "caddy", "Caddyfile"),
+    lock: join(dir, "state", ".proxy.lock"),
+    helperRan: () => existsSync(join(dir, "caddy-started")),
+    run: (prefix = []) => {
+      const [command, ...args] = [
+        ...prefix,
+        "bash",
+        provision,
+        join(dir, "key.pub"),
+        "test@example.com",
+      ];
+      return spawnSync(command, args, {
+        cwd: dir,
+        encoding: "utf8",
+        env: {
+          ...baseEnv,
+          PATH: dir + delimiter + baseEnv.PATH,
+          PROVISION_FIXTURE_ROOT: dir,
+          DROPLET_PROXY_LOCK_TIMEOUT: "0",
+        },
+      });
+    },
+  };
+}
+
+test(
+  "provision holds the proxy lock through start-caddy and preserves its inode",
+  { skip: skipProvision },
+  (t) => {
+    const fixture = provisionFixture(t);
+    const first = fixture.run();
+    assert.equal(first.status, 0, first.stderr);
+    assert.ok(fixture.helperRan());
+    const { ino } = statSync(fixture.lock);
+    const second = fixture.run();
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(statSync(fixture.lock).ino, ino);
+  },
+);
+
+test(
+  "provision preserves Caddy configuration when the proxy lock is unavailable",
+  { skip: skipProvision },
+  (t) => {
+    const fixture = provisionFixture(t);
+    mkdirSync(dirname(fixture.lock), { recursive: true });
+    mkdirSync(dirname(fixture.caddyfile), { recursive: true });
+    writeFileSync(fixture.lock, "");
+    const previous = "# existing configuration\n";
+    writeFileSync(fixture.caddyfile, previous);
+
+    const contended = fixture.run(["flock", fixture.lock]);
+    assert.equal(contended.status, 1, contended.stderr);
+    assert.match(contended.stderr, /could not acquire the proxy lock/);
+    assert.equal(readFileSync(fixture.caddyfile, "utf8"), previous);
+    assert.equal(fixture.helperRan(), false);
+
+    rmSync(fixture.lock);
+    mkdirSync(fixture.lock);
+    const cannotOpen = fixture.run();
+    assert.equal(cannotOpen.status, 1, cannotOpen.stderr);
+    assert.match(cannotOpen.stderr, /could not open the proxy lock file/);
+    assert.equal(readFileSync(fixture.caddyfile, "utf8"), previous);
+    assert.equal(fixture.helperRan(), false);
   },
 );
 
