@@ -625,9 +625,9 @@ func TestExecOutputWindowAndOffsetsWithGaps(t *testing.T) {
 func TestPassEnvValuesNeverInResults(t *testing.T) {
 	needPOSIX(t)
 	const secret = "s3cr3t-value-for-test"
-	env := map[string]string{"NPM_TOKEN": secret}
+	env := map[string]string{"NPM_TOKEN": secret, "EMPTY_TOKEN": ""}
 	h := newHarness(t, Config{
-		PassEnv:   []string{"NPM_TOKEN", "MISSING_TOKEN"},
+		PassEnv:   []string{"NPM_TOKEN", "MISSING_TOKEN", "EMPTY_TOKEN"},
 		LookupEnv: func(k string) (string, bool) { v, ok := env[k]; return v, ok },
 	})
 	id := h.running()
@@ -635,9 +635,14 @@ func TestPassEnvValuesNeverInResults(t *testing.T) {
 	text, isErr := h.call("exec", map[string]any{
 		"session_id": id,
 		"command":    []string{"sh", "-c", `test "$NPM_TOKEN" = "` + secret + `" && echo ok; test -z "$MISSING_TOKEN" && echo unset`},
-		"env":        map[string]string{"NPM_TOKEN": "agent-value"},
+		"env": map[string]string{
+			"NPM_TOKEN":     "agent-value",
+			"MISSING_TOKEN": "agent-missing-value",
+			"EMPTY_TOKEN":   "agent-empty-value",
+			"BUILD_MODE":    "agent-mode",
+		},
 	}, &r)
-	if isErr || r.Stdout.Text != "ok\nunset\n" {
+	if isErr {
 		t.Fatalf("exec = %q %+v", text, r)
 	}
 	if strings.Contains(text, secret) {
@@ -647,8 +652,21 @@ func TestPassEnvValuesNeverInResults(t *testing.T) {
 		t.Fatalf("missing_env = %v", r.MissingEnv)
 	}
 	reqs := h.srv.ExecRequests()
-	if reqs[len(reqs)-1].GetEnv()["NPM_TOKEN"] != secret {
+	requestEnv := reqs[len(reqs)-1].GetEnv()
+	if requestEnv["NPM_TOKEN"] != secret {
 		t.Fatal("the --pass-env value did not reach the guest")
+	}
+	if _, ok := requestEnv["MISSING_TOKEN"]; ok {
+		t.Fatal("the exec request contains the unset --pass-env variable")
+	}
+	if v, ok := requestEnv["EMPTY_TOKEN"]; !ok || v != "" {
+		t.Fatal("the exec request does not contain the empty --pass-env value")
+	}
+	if requestEnv["BUILD_MODE"] != "agent-mode" {
+		t.Fatal("the exec request did not retain the tool-supplied value")
+	}
+	if r.Stdout.Text != "ok\nunset\n" {
+		t.Fatalf("stdout = %q", r.Stdout.Text)
 	}
 	// A tool call cannot read the value back through the output either
 	// except by printing it itself; the server adds nothing of it.

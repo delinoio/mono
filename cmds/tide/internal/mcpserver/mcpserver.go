@@ -661,6 +661,7 @@ func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) 
 		if v, ok := s.cfg.LookupEnv(name); ok {
 			env[name] = v
 		} else {
+			delete(env, name)
 			missing = append(missing, name)
 		}
 	}
