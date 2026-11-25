@@ -15,8 +15,12 @@ const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
 const rsbuild = resolve(dirname(manifestPath), manifest.bin.rsbuild);
 
 describe("development server configuration", () => {
-  for (const name of ["PUBLIC_API_ORIGIN", "PUBLIC_LOGTO_ENDPOINT"]) {
-    test(`rejects a hidden path in ${name} before listening`, () => {
+  for (const [name, appId] of [
+    ["PUBLIC_API_ORIGIN", "tide-local-fixture"],
+    ["PUBLIC_LOGTO_ENDPOINT", "tide-local-fixture"],
+    ["PUBLIC_LOGTO_ENDPOINT", "   "],
+  ] as const) {
+    test(`rejects a hidden path in ${name} with app ID ${JSON.stringify(appId)} before listening`, () => {
       const result = spawnSync(
         process.execPath,
         [rsbuild, "dev", "--no-env", "--host", "127.0.0.1", "--port", "0"],
@@ -28,7 +32,7 @@ describe("development server configuration", () => {
             TMPDIR: process.env.TMPDIR,
             TMP: process.env.TMP,
             TEMP: process.env.TEMP,
-            PUBLIC_LOGTO_APP_ID: "tide-local-fixture",
+            PUBLIC_LOGTO_APP_ID: appId,
             [name]: "https:///api.test/v1/..",
           },
           encoding: "utf8",

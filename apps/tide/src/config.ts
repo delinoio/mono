@@ -124,12 +124,16 @@ export function readConsoleConfig(
     return { apiOrigin, authMode: AuthMode.Mock, logto: undefined };
   }
   const endpoint = (env.PUBLIC_LOGTO_ENDPOINT ?? "").trim();
+  const logtoOrigin =
+    endpoint === ""
+      ? undefined
+      : resolveOrigin("PUBLIC_LOGTO_ENDPOINT", endpoint, endpoint);
   const appId = (env.PUBLIC_LOGTO_APP_ID ?? "").trim();
   const logto =
-    endpoint === "" || appId === ""
+    logtoOrigin === undefined || appId === ""
       ? undefined
       : {
-          endpoint: resolveOrigin("PUBLIC_LOGTO_ENDPOINT", endpoint, endpoint),
+          endpoint: logtoOrigin,
           appId,
           scopes: [
             REQUIRED_API_SCOPE,

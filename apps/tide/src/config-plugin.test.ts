@@ -2,15 +2,23 @@
 import { createRsbuild, type RsbuildMode } from "@rsbuild/core";
 import { describe, expect, test } from "@rstest/core";
 import { pluginConsoleConfig } from "./config-plugin.ts";
+import type { ConsoleBuildEnv } from "./config.ts";
 
-async function readMockDefine(mode: RsbuildMode, value: string | undefined) {
+async function initConsoleConfig(mode: RsbuildMode, env: ConsoleBuildEnv) {
   const rsbuild = await createRsbuild({
     rsbuildConfig: {
       mode,
-      plugins: [pluginConsoleConfig({ PUBLIC_TIDE_MOCK_API: value })],
+      plugins: [pluginConsoleConfig(env)],
     },
   });
   await rsbuild.initConfigs();
+  return rsbuild;
+}
+
+async function readMockDefine(mode: RsbuildMode, value: string | undefined) {
+  const rsbuild = await initConsoleConfig(mode, {
+    PUBLIC_TIDE_MOCK_API: value,
+  });
   return rsbuild.getNormalizedConfig().environments.web.source.define[
     "import.meta.env.PUBLIC_TIDE_MOCK_API"
   ];
@@ -36,6 +44,26 @@ describe("console configuration plugin", () => {
   );
 
   describe.each(["production", "development"] as const)("%s mode", (mode) => {
+    test("rejects a Logto endpoint with a path and a blank app ID", async () => {
+      await expect(
+        initConsoleConfig(mode, {
+          PUBLIC_LOGTO_ENDPOINT: "https://login.example/path",
+          PUBLIC_LOGTO_APP_ID: "  ",
+        }),
+      ).rejects.toThrow(
+        "PUBLIC_LOGTO_ENDPOINT must be an origin without a path, query or fragment",
+      );
+    });
+
+    test("initializes with a valid Logto endpoint and a blank app ID", async () => {
+      await expect(
+        initConsoleConfig(mode, {
+          PUBLIC_LOGTO_ENDPOINT: "https://login.example",
+          PUBLIC_LOGTO_APP_ID: "  ",
+        }),
+      ).resolves.toBeDefined();
+    });
+
     test.each([
       ["false", '"false"'],
       [undefined, '""'],
