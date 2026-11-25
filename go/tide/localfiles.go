@@ -21,6 +21,7 @@ import (
 	"syscall"
 
 	"connectrpc.com/connect"
+	"golang.org/x/text/unicode/norm"
 )
 
 // Manifest modes. They use the Git file modes, so a manifest entry tells a
@@ -262,10 +263,9 @@ func validRelPath(p string) bool {
 
 // Path rules.
 
-// caseCollisions returns the groups of paths that differ only in case. It
-// checks the files and every directory above them, because two directories
-// that differ only in case merge into one on such a file system.
-func caseCollisions(paths []string) [][]string {
+// pathCollisions groups distinct file and parent directory paths by their
+// comparison key. Each group contains the original paths.
+func pathCollisions(paths []string, key func(string) string) [][]string {
 	all := map[string]bool{}
 	for _, p := range paths {
 		all[p] = true
@@ -275,7 +275,7 @@ func caseCollisions(paths []string) [][]string {
 	}
 	groups := map[string][]string{}
 	for p := range all {
-		k := foldCase(p)
+		k := key(p)
 		groups[k] = append(groups[k], p)
 	}
 	var out [][]string
@@ -332,3 +332,47 @@ func invalidWindowsPath(p string) bool {
 // folds the simple Unicode case pairs that those file systems treat as
 // equal.
 func foldCase(p string) string { return strings.ToLower(strings.ToUpper(p)) }
+
+// foldNormalizedCase makes canonically equivalent paths equal before applying
+// the case mapping. Decompose again to compare the results of the case mapping.
+func foldNormalizedCase(p string) string {
+	return canonicalDecomposition(foldCase(canonicalDecomposition(p)))
+}
+
+func canonicalDecomposition(p string) string {
+	decomposed := norm.NFD.String(p)
+	if !strings.Contains(decomposed, norm.GraphemeJoiner) {
+		return decomposed
+	}
+
+	// The stream-safe form inserts a combining grapheme joiner at the 31st
+	// non-starter, which can prevent reordering across that boundary. Decompose
+	// each rune and order the marks without inserting any joiners of our own.
+	type mark struct {
+		value rune
+		class uint8
+	}
+	var result strings.Builder
+	var marks []mark
+	flush := func() {
+		sort.SliceStable(marks, func(i, j int) bool { return marks[i].class < marks[j].class })
+		for _, m := range marks {
+			result.WriteRune(m.value)
+		}
+		marks = marks[:0]
+	}
+	for _, r := range p {
+		part := norm.NFD.String(string(r))
+		for i, value := range part {
+			class := norm.NFD.PropertiesString(part[i:]).CCC()
+			if class == 0 {
+				flush()
+				result.WriteRune(value)
+			} else {
+				marks = append(marks, mark{value, class})
+			}
+		}
+	}
+	flush()
+	return result.String()
+}

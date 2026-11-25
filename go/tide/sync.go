@@ -95,8 +95,9 @@ type SyncResult struct {
 //     fail the sync before any upload (*LimitError). A guest or candidate
 //     manifest above 256 MiB fails with failed_precondition.
 //  5. Paths that are not valid UTF-8 (all guests), paths that differ only
-//     in case (Windows and macOS guests), and paths that are not valid on
-//     Windows (Windows guests) fail before the lock and any upload
+//     in case (Windows and macOS guests), paths that collide after canonical
+//     normalization and case mapping (macOS guests), and paths that are not
+//     valid on Windows (Windows guests) fail before the lock and any upload
 //     (*PathRuleError).
 //  6. The lock directory <workspace_path>.tide-sync.lock is created with one
 //     exec; an existing lock fails with ErrSyncLocked unless Force is set.
@@ -162,8 +163,13 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	}
 	// The remaining path rules depend on the guest OS.
 	if osys == tidev1.GuestOs_GUEST_OS_WINDOWS || osys == tidev1.GuestOs_GUEST_OS_MACOS {
-		if groups := caseCollisions(paths); len(groups) > 0 {
+		if groups := pathCollisions(paths, foldCase); len(groups) > 0 {
 			return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleCaseCollision, Paths: groups})
+		}
+	}
+	if osys == tidev1.GuestOs_GUEST_OS_MACOS {
+		if groups := pathCollisions(paths, foldNormalizedCase); len(groups) > 0 {
+			return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleNormalizationCollision, Paths: groups})
 		}
 	}
 	if osys == tidev1.GuestOs_GUEST_OS_WINDOWS {
