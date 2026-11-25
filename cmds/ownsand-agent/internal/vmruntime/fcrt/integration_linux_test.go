@@ -5,10 +5,13 @@ package fcrt_test
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +25,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/fcrt"
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/uuidv7"
@@ -65,6 +69,14 @@ func (e *env) create(snapshotID string, memMiB int64, memoryRestore bool) *ownsa
 
 func (e *env) createSized(snapshotID string, memMiB, diskGiB int64, memoryRestore bool) *ownsandv1.SandboxStateEntry {
 	e.t.Helper()
+	entry, err := e.m.Create(context.Background(), createCommand(snapshotID, memMiB, diskGiB, memoryRestore))
+	if err != nil {
+		e.t.Fatalf("create: %v", err)
+	}
+	return entry
+}
+
+func createCommand(snapshotID string, memMiB, diskGiB int64, memoryRestore bool) *ownsandv1.CreateSandboxCommand {
 	id, _ := uuidv7.NewString()
 	now := time.Now()
 	cmd := &ownsandv1.CreateSandboxCommand{
@@ -83,11 +95,7 @@ func (e *env) createSized(snapshotID string, memMiB, diskGiB int64, memoryRestor
 	if snapshotID != "" {
 		cmd.Source = &ownsandv1.CreateSandboxCommand_SnapshotId{SnapshotId: snapshotID}
 	}
-	entry, err := e.m.Create(context.Background(), cmd)
-	if err != nil {
-		e.t.Fatalf("create: %v", err)
-	}
-	return entry
+	return cmd
 }
 
 func fieldOr(fields []string, i int) string {
@@ -262,6 +270,14 @@ func TestRequireExplicitExecSuccess(t *testing.T) {
 }
 
 func TestFirecrackerIntegration(t *testing.T) {
+	testFirecrackerIntegration(t, false)
+}
+
+func TestFirecrackerLinuxBaseDiskSizing(t *testing.T) {
+	testFirecrackerIntegration(t, true)
+}
+
+func testFirecrackerIntegration(t *testing.T, diskSizing bool) {
 	binary, kernel, rootfs := os.Getenv(envBinary), os.Getenv(envKernel), os.Getenv(envRootfs)
 	if binary == "" || kernel == "" || rootfs == "" {
 		t.Skipf("set %s, %s and %s to boot real microVMs", envBinary, envKernel, envRootfs)
@@ -297,6 +313,10 @@ func TestFirecrackerIntegration(t *testing.T) {
 		rt.Close()
 	})
 	e := &env{t: t, m: m, d: d}
+	if diskSizing {
+		e.checkBaseDiskSizing(rt, rootfs, st.Path(store.VMsDir))
+		return
+	}
 
 	start := time.Now()
 	sb := e.create("", 256, false)
@@ -375,5 +395,67 @@ func TestFirecrackerIntegration(t *testing.T) {
 	}
 	if len(ids) != 0 {
 		t.Fatalf("microVMs still run: %v", ids)
+	}
+}
+
+func (e *env) checkBaseDiskSizing(rt vmruntime.Runtime, rootfs, vmsDir string) {
+	e.t.Helper()
+	digest := func() [sha256.Size]byte {
+		file, err := os.Open(rootfs)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		defer file.Close()
+		hash := sha256.New()
+		n, err := io.Copy(hash, file)
+		if err != nil || n != 2<<30 {
+			e.t.Fatalf("read base image: %d bytes, want 2 GiB, error %v", n, err)
+		}
+		return [sha256.Size]byte(hash.Sum(nil))
+	}
+	original := digest()
+	ctx := e.t.Context()
+	cmd := createCommand("", 256, 1, false)
+	cmd.Limits.DiskGib = 1
+	entry, err := e.m.Create(ctx, cmd)
+	var commandErr *sandboxes.CommandError
+	if !errors.As(err, &commandErr) || commandErr.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION ||
+		entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED ||
+		entry.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+		e.t.Fatalf("undersized create: entry %v, error %v", entry, err)
+	}
+	if e.m.Busy() {
+		e.t.Fatal("undersized create left an active sandbox")
+	}
+	if ids, err := rt.Running(ctx); err != nil || len(ids) != 0 {
+		e.t.Fatalf("running VMs after undersized create: %v, error %v", ids, err)
+	}
+	if _, err := os.Stat(filepath.Join(vmsDir, cmd.GetSandboxId())); !errors.Is(err, os.ErrNotExist) {
+		e.t.Fatalf("undersized create left a VM directory: %v", err)
+	}
+	for _, diskGiB := range []int64{2, 3} {
+		cmd := createCommand("", 256, diskGiB, false)
+		cmd.Limits.DiskGib = diskGiB
+		entry, err := e.m.Create(ctx, cmd)
+		if err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			e.t.Fatalf("create with %d GiB: entry %v, error %v", diskGiB, entry, err)
+		}
+		id := cmd.GetSandboxId()
+		info, err := os.Stat(filepath.Join(vmsDir, id, "rootfs.ext4"))
+		if err != nil || info.Size() != diskGiB<<30 {
+			e.t.Fatalf("disk file for %d GiB request: %v, error %v", diskGiB, info, err)
+		}
+		out, ex := e.exec(id, "/bin/cat", "/sys/block/vda/size")
+		want := strconv.FormatInt((diskGiB<<30)/512, 10)
+		if !execSucceeded(ex) || strings.TrimSpace(out) != want {
+			e.t.Fatalf("guest disk sectors = %q, want %s, exit %v", out, want, ex)
+		}
+		if entry, err := e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil ||
+			entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			e.t.Fatalf("delete: entry %v, error %v", entry, err)
+		}
+	}
+	if digest() != original {
+		e.t.Fatal("the base image changed")
 	}
 }
