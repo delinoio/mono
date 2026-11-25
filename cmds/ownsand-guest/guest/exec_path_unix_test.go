@@ -220,3 +220,35 @@ func TestExecBareNameUsesRequestPath(t *testing.T) {
 		t.Fatalf("helper PATH changed to %q", os.Getenv("PATH"))
 	}
 }
+
+func TestExecBareNameSkipsInaccessibleCandidate(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can execute the fixture using the other execute bit")
+	}
+	blocked := writeTool(t, "mytool", "blocked")
+	blockedPath := filepath.Join(blocked, "mytool")
+	// The helper owns the file, so the other execute bit does not grant access.
+	if err := os.Chmod(blockedPath, 0o601); err != nil {
+		t.Fatal(err)
+	}
+	runnable := writeTool(t, "mytool", "runnable")
+	path := strings.Join([]string{blocked, runnable}, string(os.PathListSeparator))
+	h := newHarness(t, nil)
+
+	req := execReq(t, blockedPath)
+	req.Env = map[string]string{"PATH": path}
+	evs := h.runExec(req)
+	if got := evs[len(evs)-1].GetFailed().GetReason(); got != ownsandv1.ExecFailureReason_EXEC_FAILURE_REASON_PERMISSION_DENIED {
+		t.Fatalf("explicit path: events %v", evs)
+	}
+
+	req = execReq(t, "mytool")
+	req.Env = map[string]string{"PATH": path}
+	evs = h.runExec(req)
+	if stdout, _ := outputs(evs); stdout != "runnable" {
+		t.Fatalf("bare name: events %v", evs)
+	}
+	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+		t.Fatalf("bare name: %v", err)
+	}
+}
