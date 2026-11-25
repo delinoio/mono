@@ -17,14 +17,17 @@ import { refreshOrganizations } from "../organizations.ts";
 import { orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
 
 /**
- * Route `invitation`: accept an invitation secret as the signed-in user. The
- * secret comes from the link fragment, which the page removes from the
- * address bar at once, or from the input. It stays in component state only.
+ * Accepts an invitation as the signed-in user. The form starts with the
+ * secret captured on entry and can receive a replacement link or typed input.
  */
-export function InvitationPage() {
+export function InvitationPage({
+  initialSecret,
+}: {
+  initialSecret: string | undefined;
+}) {
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
-  const [value, setValue] = useState("");
+  const [value, setValue] = useState(initialSecret ?? "");
   const [inputError, setInputError] = useState<string>();
   const currentAttempt = useRef(0);
   const accept = useMutation(MemberService.method.acceptInvitation, {

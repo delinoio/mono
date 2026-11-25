@@ -73,6 +73,7 @@ import {
   WorkService,
 } from "@delino/tide-protos/v1/work_pb";
 import { QueryClient } from "@tanstack/react-query";
+import { StrictMode } from "react";
 import { invalidateServices, MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
@@ -201,6 +202,168 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+});
+
+describe("entry URLs during session restoration", () => {
+  const invitationPath = "/invitations/accept?source=fixture";
+  const setupPath = "/github/setup#return";
+  const invitationUrl = `${invitationPath}#secret=${MOCK_INVITATION_SECRET}`;
+  const setupUrl =
+    "/github/setup?installation_id=51000001&code=gh_code&state=mock-state#return";
+  const invitationNotice = "Sign in, then open the invitation link again.";
+  const setupNotice = /Sign in, then start the GitHub installation again/;
+
+  function openEntry(url: string, transport: Transport, isLoading = true) {
+    window.history.replaceState(null, "", url);
+    const historyLength = window.history.length;
+    const tree = (isLoading: boolean, isAuthenticated: boolean) => (
+      <StrictMode>
+        <AuthContextProvider
+          value={{
+            isLoading,
+            isAuthenticated,
+            userId: isAuthenticated ? MOCK_USER : undefined,
+            signIn: async () => {},
+            signInFailed: false,
+            signOut: async () => {},
+            getAccessToken: async () => "token",
+          }}
+        >
+          <Console config={config} transport={transport} />
+        </AuthContextProvider>
+      </StrictMode>
+    );
+    const view = render(tree(isLoading, false));
+    return {
+      resolveAuth: (signedIn: boolean) => view.rerender(tree(false, signedIn)),
+      expectScrubbed(path: string) {
+        const { pathname, search, hash } = window.location;
+        expect(pathname + search + hash).toBe(path);
+        expect(window.history.length).toBe(historyLength);
+        expect(window.history.state).toBeNull();
+        expect(storedText()).toBe("{}");
+      },
+    };
+  }
+
+  const entryCases = [
+    {
+      url: invitationUrl,
+      cleanPath: invitationPath,
+      notice: invitationNotice,
+      method: MemberService.method.acceptInvitation.name,
+      expectEmptyEntry() {
+        const input = screen.getByLabelText<HTMLInputElement>(
+          "Invitation link or secret",
+        );
+        expect(input.value).toBe("");
+      },
+    },
+    {
+      url: setupUrl,
+      cleanPath: setupPath,
+      notice: setupNotice,
+      method: GitHubService.method.linkGitHubInstallation.name,
+      expectEmptyEntry() {
+        expect(
+          screen.getByText(/has no GitHub installation details/),
+        ).toBeTruthy();
+      },
+    },
+  ];
+
+  test.each(entryCases)(
+    "scrubs $cleanPath when already signed out",
+    (entry) => {
+      const { transport, calls } = gatedTransport(entry.method);
+      const visit = openEntry(entry.url, transport, false);
+
+      expect(screen.getByText(entry.notice)).toBeTruthy();
+      visit.expectScrubbed(entry.cleanPath);
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  test.each(entryCases)(
+    "discards $cleanPath input when restoration resolves signed out",
+    async (entry) => {
+      const { transport, calls } = gatedTransport(entry.method);
+      const visit = openEntry(entry.url, transport);
+
+      visit.expectScrubbed(entry.cleanPath);
+      expect(screen.queryByText(entry.notice)).toBeNull();
+      expect(calls).toHaveLength(0);
+
+      visit.resolveAuth(false);
+      expect(screen.getByText(entry.notice)).toBeTruthy();
+      visit.resolveAuth(true);
+
+      entry.expectEmptyEntry();
+      await settle();
+      visit.expectScrubbed(entry.cleanPath);
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  test("fills the invitation form after sign-in and accepts only on submit", async () => {
+    const { transport, calls } = gatedTransport(
+      MemberService.method.acceptInvitation.name,
+    );
+    const visit = openEntry(invitationUrl, transport);
+
+    visit.expectScrubbed(invitationPath);
+    expect(calls).toHaveLength(0);
+    visit.resolveAuth(true);
+
+    const input = screen.getByLabelText<HTMLInputElement>(
+      "Invitation link or secret",
+    );
+    expect(input.value).toBe(MOCK_INVITATION_SECRET);
+    expect(calls).toHaveLength(0);
+    await click(screen.getByRole("button", { name: "Join organization" }));
+    expect(calls.map(({ input }) => input)).toEqual([
+      expect.objectContaining({ invitationSecret: MOCK_INVITATION_SECRET }),
+    ]);
+    await act(async () => calls[0]!.settle());
+    await waitFor(() =>
+      expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.contoso}`),
+    );
+
+    await act(async () => {
+      window.history.pushState(null, "", invitationPath);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(
+      screen.getByLabelText<HTMLInputElement>("Invitation link or secret")
+        .value,
+    ).toBe("");
+    expect(calls).toHaveLength(1);
+  });
+
+  test("links the captured GitHub installation once after sign-in", async () => {
+    const { transport, linkRequests } = await organizationPages({
+      lastRole: Role.ADMIN,
+    });
+    const visit = openEntry(setupUrl, transport);
+
+    visit.expectScrubbed(setupPath);
+    expect(linkRequests).toHaveLength(0);
+    visit.resolveAuth(true);
+
+    await waitFor(() =>
+      expect(window.location.pathname).toBe(
+        `/orgs/${MOCK_IDS.globex}/integrations`,
+      ),
+    );
+    expect(linkRequests).toMatchObject([
+      {
+        organizationId: MOCK_IDS.globex,
+        githubInstallationId: 51000001n,
+        code: "gh_code",
+        state: "mock-state",
+      },
+    ]);
+  });
 });
 
 describe("organizations", () => {

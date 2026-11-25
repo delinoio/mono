@@ -9,31 +9,22 @@ import { useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { TopBar } from "../components/shell.tsx";
 import { ErrorNotice, Loading, PageHeader } from "../components/ui.tsx";
-import {
-  type GitHubCallback,
-  parseGitHubCallback,
-  stripCallbackFromAddress,
-} from "../github-callback.ts";
+import type { GitHubCallback } from "../github-callback.ts";
 import { useOrganizations } from "../organizations.ts";
 import { can, Permission } from "../roles.ts";
 import { Link, orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
 
 /**
- * Route `github-setup`: the callback of the GitHub App installation. It
- * reads `installation_id`, `code` and `state`, removes them from the address
- * bar, calls `LinkGitHubInstallation` and continues to `integrations`. The
- * callback URL does not name the tide organization, so the page links to
- * the only organization in which the user is an admin, or asks which one.
+ * Links the captured GitHub App installation and continues to integrations.
+ * The page links to the sole eligible organization or asks which one to use.
  */
-export function GitHubSetupPage() {
+export function GitHubSetupPage({
+  callback,
+}: {
+  callback: GitHubCallback | undefined;
+}) {
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
-  const [callback] = useState<GitHubCallback | undefined>(() =>
-    parseGitHubCallback(window.location.search),
-  );
-  useEffect(() => {
-    stripCallbackFromAddress(window.location, window.history);
-  }, []);
   const orgs = useOrganizations(callback !== undefined);
   const loadingOrgs = orgs.isPending || orgs.fetchStatus !== "idle";
   const adminOrgs =
