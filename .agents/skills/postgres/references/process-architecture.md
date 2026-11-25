@@ -18,7 +18,9 @@ WAL Writer, Background Writer, Checkpointer, Autovacuum Launcher/Workers, Archiv
 
 ## Connection Pooling (Critical)
 
-Each connection = OS process (fork overhead, context switching, memory). PgBouncer can multiplex many app connections to fewer DB connections. Typical: 1000 app connections → pooler → 20–50 backends. Implement pooling before raising `max_connections`; `max_connections` requires a full restart to change (default 100). Note: `superuser_reserved_connections` (default 3) reserves slots for emergency superuser access, so non-superusers are rejected before `max_connections` is fully reached.
+Each connection = OS process (fork overhead, context switching, memory). PgBouncer can multiplex many app connections to fewer DB connections. Typical: 1000 app connections → pooler → 20–50 backends. Implement pooling before raising `max_connections`; `max_connections` requires a full restart to change (default 100).
+
+The `superuser_reserved_connections` setting (default 3) reserves the last available slots for superusers only. PostgreSQL 16 and later also provide `reserved_connections` (default 0). Superusers and roles with privileges of `pg_use_reserved_connections` can use that reserve before the final superuser-only reserve. An ordinary role has neither privilege.
 
 ## Monitoring
 
@@ -27,11 +29,22 @@ SELECT state, count(*) FROM pg_stat_activity WHERE backend_type = 'client backen
 ```
 
 ```sql
--- Show used and free connection slots
-SELECT count(*) AS used, max(max_conn) - count(*) AS free
-FROM pg_stat_activity, (SELECT setting::int AS max_conn FROM pg_settings WHERE name = 'max_connections') s
-WHERE backend_type = 'client backend';
+WITH client_backends AS (
+    SELECT count(*) AS used
+    FROM pg_stat_activity
+    WHERE backend_type = 'client backend'
+)
+SELECT used,
+       GREATEST(0,
+           current_setting('max_connections')::integer
+           - current_setting('superuser_reserved_connections')::integer
+           - COALESCE(current_setting('reserved_connections', true)::integer, 0)
+           - used
+       ) AS ordinary_role_headroom
+FROM client_backends;
 ```
+
+`ordinary_role_headroom` estimates how many more ordinary-role connections the server can accept based on the sampled client-backend count. If the server has no `reserved_connections` setting, the query treats that reserve as zero. Database and role connection limits can reduce actual capacity further.
 
 Use `pg_activity` for interactive top-like monitoring. Alert at 80% connection usage, critical at 95%. Count by state to find idle-in-transaction leaks — these hold locks and **block VACUUM** from reclaiming dead tuples.
 
