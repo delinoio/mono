@@ -7,6 +7,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -127,6 +128,7 @@ export function orgPath(id: OrgRouteId, organizationId: string): string {
 interface RouterValue {
   route: Route;
   navigate: (path: string, options?: { replace?: boolean }) => void;
+  isCurrentVisit: () => boolean;
 }
 
 const RouterContext = createContext<RouterValue | undefined>(undefined);
@@ -136,12 +138,22 @@ const RouterContext = createContext<RouterValue | undefined>(undefined);
  * routing library is not needed.
  */
 export function RouterProvider({ children }: { children: ReactNode }) {
-  const [pathname, setPathname] = useState(() => window.location.pathname);
+  const [visit, setVisit] = useState(() => ({
+    pathname: window.location.pathname,
+  }));
+  const currentVisit = useRef(visit);
+  const updateVisit = useCallback((pathname: string) => {
+    if (pathname === currentVisit.current.pathname) return;
+    // Record each transition before React can batch a leave and return.
+    const nextVisit = { pathname };
+    currentVisit.current = nextVisit;
+    setVisit(nextVisit);
+  }, []);
   useEffect(() => {
-    const onPop = () => setPathname(window.location.pathname);
+    const onPop = () => updateVisit(window.location.pathname);
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
-  }, []);
+  }, [updateVisit]);
   const navigate = useCallback(
     (path: string, options: { replace?: boolean } = {}) => {
       const url = new URL(path, window.location.origin);
@@ -151,14 +163,20 @@ export function RouterProvider({ children }: { children: ReactNode }) {
       } else {
         window.history.pushState(null, "", target);
       }
-      setPathname(url.pathname);
+      updateVisit(url.pathname);
       window.scrollTo?.(0, 0);
     },
-    [],
+    [updateVisit],
   );
   const value = useMemo(
-    () => ({ route: parseRoute(pathname), navigate }),
-    [pathname, navigate],
+    () => ({
+      route: parseRoute(visit.pathname),
+      navigate,
+      isCurrentVisit: () =>
+        currentVisit.current === visit &&
+        window.location.pathname === visit.pathname,
+    }),
+    [visit, navigate],
   );
   return (
     <RouterContext.Provider value={value}>{children}</RouterContext.Provider>
