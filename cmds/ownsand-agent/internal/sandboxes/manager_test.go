@@ -2264,42 +2264,69 @@ func TestCreateKeepsSandboxTrackedWhenTheEndFails(t *testing.T) {
 	}
 }
 
-// TestCreateYieldsToConcurrentTTLEnd checks that a TTL end that started while
-// the create retries its RUNNING record keeps control of the teardown: the
-// create commits no RUNNING record afterwards, and the TTL end stops the VM.
+// TestCreateYieldsToConcurrentTTLEnd checks that a TTL end keeps ownership
+// whether it claims teardown before a retry or after the last failed attempt.
 func TestCreateYieldsToConcurrentTTLEnd(t *testing.T) {
-	e := newEnv(t)
-	e.m.runningBackoff = time.Millisecond
-	cmd := e.createCmd(1, time.Hour, time.Hour)
-	id := cmd.GetSandboxId()
-	var restore func()
-	e.rt.onCreate = func(vmruntime.Spec) { restore = failRevisions(t, e.st) }
-	e.m.onRunningCommitFailed = func(int, bool) {
-		// The TTL passed while the create waits; the end goroutine blocks on
-		// the command lock that the create holds.
-		e.clk.Advance(2 * time.Hour)
-		e.m.Tick(context.Background(), false)
-		restore()
-	}
-	entry, err := e.m.Create(context.Background(), cmd)
-	var ce *CommandError
-	if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
-		t.Fatalf("create %v %v, want an aborted error", entry, err)
-	}
-	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
-	if got := endReason(e.m, id); got != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
-		t.Fatalf("end reason %v, want MAX_TTL_EXPIRED", got)
-	}
-	for _, state := range e.out.states(id) {
-		if state == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-			t.Fatal("a RUNNING update overwrote the TTL end")
-		}
-	}
-	if ids, _ := e.rt.Running(context.Background()); len(ids) != 0 || e.rt.hasFiles(id) {
-		t.Fatalf("VM %v or its files remain", ids)
-	}
-	if e.rt.startCount() != 1 {
-		t.Fatalf("VM starts %d, want 1", e.rt.startCount())
+	for _, tc := range []struct {
+		name    string
+		attempt int
+	}{
+		{name: "before retry", attempt: 1},
+		{name: "after final failure", attempt: DefaultRunningAttempts},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.m.runningBackoff = time.Millisecond
+			cmd := e.createCmd(1, time.Hour, 2*time.Hour)
+			id := cmd.GetSandboxId()
+			var restore func()
+			e.rt.onCreate = func(vmruntime.Spec) { restore = failRevisions(t, e.st) }
+			e.m.onRunningCommitFailed = func(attempt int, willRetry bool) {
+				if attempt != tc.attempt {
+					return
+				}
+				if willRetry != (tc.attempt < DefaultRunningAttempts) {
+					t.Errorf("attempt %d willRetry = %t", attempt, willRetry)
+				}
+				// Tick claims the end while the create holds the command lock.
+				e.clk.Advance(3 * time.Hour)
+				e.m.Tick(context.Background(), false)
+				restore()
+			}
+			entry, err := e.m.Create(context.Background(), cmd)
+			e.m.bg.Wait()
+			var ce *CommandError
+			if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+				t.Fatalf("create %v %v, want an aborted error", entry, err)
+			}
+			const (
+				deleted = ownsandv1.SandboxState_SANDBOX_STATE_DELETED
+				reason  = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED
+			)
+			rec := persistedRecord(t, e.st, id)
+			if rec.State != deleted || rec.EndReason != reason {
+				t.Fatalf("saved record = %v / %v, want %v / %v", rec.State, rec.EndReason, deleted, reason)
+			}
+			requireStates(t, e.out.states(id), []ownsandv1.SandboxState{
+				ownsandv1.SandboxState_SANDBOX_STATE_CREATING,
+				ownsandv1.SandboxState_SANDBOX_STATE_DELETING,
+				deleted,
+			})
+			for _, update := range e.out.entries {
+				if update.GetState() == deleted && update.GetEndReason() != reason {
+					t.Fatalf("reported update %v, want %v", update, reason)
+				}
+			}
+			if calls := e.ex.endedCalls(id); calls != 1 || e.ex.ended[id] != reason {
+				t.Fatalf("exec tracker called %d times with %v, want one call with %v", calls, e.ex.ended[id], reason)
+			}
+			if ids, _ := e.rt.Running(context.Background()); len(ids) != 0 || e.rt.hasFiles(id) {
+				t.Fatalf("VM %v or its files remain", ids)
+			}
+			if starts := e.rt.startCount(); starts != 1 || e.rt.deleteCalls != 1 {
+				t.Fatalf("VM starts %d, deletes %d, want 1 and 1", starts, e.rt.deleteCalls)
+			}
+		})
 	}
 }
 
