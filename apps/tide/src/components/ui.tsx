@@ -308,6 +308,29 @@ export function SecretDialog({
   );
 }
 
+type DialogOpening = { isCurrent(): boolean };
+
+function useDialogOpening(open: boolean) {
+  const opening = useRef(0);
+  const end = () => {
+    opening.current += 1;
+  };
+  useLayoutEffect(() => {
+    // Invalidate the opening during a controlled close or unmount.
+    return () => {
+      opening.current += 1;
+    };
+  }, [open]);
+
+  return {
+    begin(): DialogOpening {
+      const startedIn = opening.current;
+      return { isCurrent: () => opening.current === startedIn };
+    },
+    end,
+  };
+}
+
 /**
  * An explicit confirmation step for a destructive action. The cancel
  * button comes first and gets the focus; Escape closes the dialog.
@@ -326,7 +349,7 @@ export function ConfirmDialog({
   title: string;
   description: ReactNode;
   confirmLabel: string;
-  onConfirm: (opening: { isCurrent(): boolean }) => Promise<unknown>;
+  onConfirm: (opening: DialogOpening) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
 }) {
   const [error, setError] = useState<unknown>();
@@ -338,27 +361,19 @@ export function ConfirmDialog({
     setError(undefined);
   }
 
-  const opening = useRef(0);
-  useLayoutEffect(() => {
-    // Invalidate the opening during a controlled close or unmount.
-    return () => {
-      opening.current += 1;
-    };
-  }, [open]);
-
+  const dialogOpening = useDialogOpening(open);
   const confirm = async () => {
     if (pending) return;
-    const startedIn = opening.current;
-    const isCurrent = () => opening.current === startedIn;
+    const opening = dialogOpening.begin();
     setPending(true);
     setError(undefined);
     try {
-      await onConfirm({ isCurrent });
-      if (isCurrent()) onOpenChange(false);
+      await onConfirm(opening);
+      if (opening.isCurrent()) onOpenChange(false);
     } catch (e) {
-      if (isCurrent()) setError(e);
+      if (opening.isCurrent()) setError(e);
     } finally {
-      if (isCurrent()) setPending(false);
+      if (opening.isCurrent()) setPending(false);
     }
   };
   return (
@@ -366,7 +381,7 @@ export function ConfirmDialog({
       open={open}
       onOpenChange={(next) => {
         if (!next) {
-          opening.current += 1;
+          dialogOpening.end();
           setPending(false);
           setError(undefined);
         }
@@ -412,7 +427,8 @@ export function FormDialog({
   submitDisabled?: boolean;
   /** A wider panel for forms with several fields per row. */
   wide?: boolean;
-  onSubmit: () => Promise<unknown>;
+  /** Apply dialog follow-up only while the opening is current. Refresh data either way. */
+  onSubmit: (opening: DialogOpening) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
   children: ReactNode;
 }) {
@@ -420,30 +436,34 @@ export function FormDialog({
   const [pending, setPending] = useState(false);
   const [wasOpen, setWasOpen] = useState(open);
   if (open !== wasOpen) {
-    // Adjust state while rendering: every time the dialog opens again it
-    // starts without the notice of an earlier failure, including a failure
-    // that arrived after the dialog was already closed.
     setWasOpen(open);
-    if (open) setError(undefined);
+    setPending(false);
+    setError(undefined);
   }
+  const dialogOpening = useDialogOpening(open);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (pending || submitDisabled) return;
+    if (!open || pending || submitDisabled) return;
+    const opening = dialogOpening.begin();
     setPending(true);
     setError(undefined);
     try {
-      await onSubmit();
+      await onSubmit(opening);
     } catch (e) {
-      setError(e);
+      if (opening.isCurrent()) setError(e);
     } finally {
-      setPending(false);
+      if (opening.isCurrent()) setPending(false);
     }
   };
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        if (!next) setError(undefined);
+        if (!next) {
+          dialogOpening.end();
+          setPending(false);
+          setError(undefined);
+        }
         onOpenChange(next);
       }}
     >

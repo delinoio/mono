@@ -118,7 +118,7 @@ export function ApiKeysPage() {
         title="Create a personal API key"
         description="The key authenticates as you, but only on dev session calls."
         submitLabel="Create key"
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           const trimmed = name.trim();
           if (trimmed === "" || trimmed.length > 64) {
             setNameError(
@@ -135,6 +135,7 @@ export function ApiKeysPage() {
                 ? undefined
                 : timestampFromMs(Date.now() + days * DAY_MS),
           });
+          if (!opening.isCurrent()) return;
           setCreating(false);
           setName("");
           setSecret(res.secret);

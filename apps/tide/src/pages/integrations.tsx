@@ -178,7 +178,7 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
         title={dialog === "replace" ? "Replace the API key" : "Link OwnSand"}
         description="tide stores the key encrypted and never shows it again. Create an organization API key in the OwnSand console."
         submitLabel={dialog === "replace" ? "Replace key" : "Link"}
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           const org =
             dialog === "replace"
               ? current!.ownsandOrganizationId
@@ -197,7 +197,7 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
             ownsandOrganizationId: org,
             ownsandApiKey: key,
           });
-          close();
+          if (opening.isCurrent()) close();
         }}
       >
         {dialog === "link" ? (
@@ -378,13 +378,13 @@ function RunnerGroupDialog({
       description="GitHub's runner group settings control which repositories can use the tide runners."
       submitLabel="Save"
       submitDisabled={groups.data === undefined || showsFullError(groups)}
-      onSubmit={async () => {
+      onSubmit={async (opening) => {
         await update.mutateAsync({
           organizationId,
           installationId: installation.installationId,
           githubRunnerGroupId: BigInt(group),
         });
-        onClose();
+        if (opening.isCurrent()) onClose();
       }}
     >
       <QueryBoundary query={groups} loading="Loading runner groups">
@@ -725,7 +725,7 @@ function IntegrationDialog({
           : "Leave a credential empty to keep the stored value. A new value replaces it; tide never shows it again."
       }
       submitLabel={creating ? "Create integration" : "Save changes"}
-      onSubmit={async () => {
+      onSubmit={async (opening) => {
         const found: Record<string, string> = {};
         if (name.trim() === "" || name.trim().length > 64) {
           found.name = "Enter a name of 1 to 64 characters.";
@@ -780,7 +780,7 @@ function IntegrationDialog({
             await updateIntegration.mutateAsync(request);
           }
         }
-        onClose();
+        if (opening.isCurrent()) onClose();
       }}
     >
       {creating ? (

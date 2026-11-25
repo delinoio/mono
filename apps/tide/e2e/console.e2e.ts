@@ -644,7 +644,7 @@ describe("runner profiles", () => {
     ).toBeVisible();
   });
 
-  test("keeps the edit dialog open when a runner profile name already exists", async ({
+  test("lets the user retry an edit when a runner profile name already exists", async ({
     app,
     screen,
     browser,
@@ -667,10 +667,17 @@ describe("runner profiles", () => {
     await expect(
       dialog.getByText("a runner profile with this name exists"),
     ).toBeVisible();
-    await dialog.getByRole("button", "Cancel").tap();
     await expect(profile.getByLabel("runs-on label of linux-build")).toHaveText(
       "tide-linux-build",
     );
+    await dialog.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("linux-build-retry");
+    await dialog.getByRole("button", "Save changes").tap();
+    await expect(dialog).toBeHidden();
+    await expect(
+      screen.getByLabel("runs-on label of linux-build-retry"),
+    ).toHaveText("tide-linux-build-retry");
   });
 
   test("shows field errors and saves after correcting the resource values", async ({

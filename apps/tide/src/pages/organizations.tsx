@@ -107,9 +107,10 @@ export function OrganizationsPage() {
           setCreating(open);
           if (!open) setName("");
         }}
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           const res = await create.mutateAsync({ name: name.trim() });
           await refreshOrganizations(queryClient);
+          if (!opening.isCurrent()) return;
           setCreating(false);
           setName("");
           navigate(orgPath(RouteId.Overview, res.organization!.organizationId));
