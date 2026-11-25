@@ -240,7 +240,18 @@ function LinkBillingDialog({
   const [selected, setSelected] = useState<string | null>(null);
   const [selectionError, setSelectionError] = useState<string>();
   const listRef = useRef<HTMLDivElement>(null);
-  const list = accounts.data?.billingAccounts;
+  const fullError = showsFullError(accounts);
+  const list =
+    accounts.isPending || fullError
+      ? undefined
+      : accounts.data?.billingAccounts;
+  const selectedId = list?.find(
+    (account) => account.billingAccountId === selected,
+  )?.billingAccountId;
+  // Keep the choice while the list is hidden. Clear it when the current list omits it.
+  if (list !== undefined && selected !== null && selectedId === undefined) {
+    setSelected(null);
+  }
 
   // The account choice is the only input, so it gets the focus. The list
   // can arrive after the dialog opened, when the dialog's own initial focus
@@ -265,7 +276,7 @@ function LinkBillingDialog({
   let content;
   if (accounts.isPending) {
     content = <Loading label="Loading your billing accounts" />;
-  } else if (accounts.data === undefined || showsFullError(accounts)) {
+  } else if (accounts.data === undefined || fullError) {
     content = (
       <ErrorNotice
         error={accounts.error}
@@ -284,7 +295,7 @@ function LinkBillingDialog({
       <div ref={listRef}>
         <RadioGroup
           label="Billing account"
-          value={selected}
+          value={selectedId ?? null}
           onValueChange={(v: unknown) => {
             if (typeof v === "string") {
               setSelected(v);
@@ -316,13 +327,13 @@ function LinkBillingDialog({
       submitLabel="Link"
       submitDisabled={list === undefined || list.length === 0}
       onSubmit={async (opening) => {
-        if (selected === null) {
+        if (selectedId === undefined) {
           setSelectionError("Choose a billing account.");
           return;
         }
         const res = await link.mutateAsync({
           organizationId,
-          billingAccountId: selected,
+          billingAccountId: selectedId,
         });
         // The success is real for a dismissed opening too, so its toast
         // stays; only the close of a later opening is guarded.
@@ -330,7 +341,7 @@ function LinkBillingDialog({
         toast.success(`${res.billingAccountName} is linked.`);
       }}
     >
-      {accounts.error && !showsFullError(accounts) ? (
+      {accounts.error && !fullError ? (
         <RefreshFailedNotice query={accounts} />
       ) : null}
       {content}

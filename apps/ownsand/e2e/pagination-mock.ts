@@ -6,6 +6,10 @@ import {
   createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
+import type {
+  LinkBillingAccountRequest,
+  ListLinkableBillingAccountsResponse,
+} from "@delino/ownsand-protos/v1/billing_pb";
 import {
   MemberService,
   type AcceptInvitationResponse,
@@ -202,6 +206,42 @@ export function createMockTransport(): Transport {
             nextPageToken: "",
           },
         };
+      }
+      if (method.name === "ListLinkableBillingAccounts") {
+        const code = sessionStorage.getItem("ownsand-e2e-billing-list-error");
+        if (code !== null) {
+          throw new ConnectError(
+            "Synthetic billing list failure",
+            Number(code) as Code,
+          );
+        }
+        if (
+          sessionStorage.getItem("ownsand-e2e-billing-list-remove-first") ===
+          "true"
+        ) {
+          const response = await base.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+          const { billingAccounts } =
+            response.message as unknown as ListLinkableBillingAccountsResponse;
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              billingAccounts: billingAccounts.slice(1),
+            },
+          };
+        }
+      }
+      if (method.name === "LinkBillingAccount") {
+        const { billingAccountId } =
+          input as unknown as LinkBillingAccountRequest;
+        recordToken("ownsand-e2e-billing-link-requests", billingAccountId);
       }
       if (method.name === "ListOrganizations") {
         await failOrganizationListIfConfigured();
