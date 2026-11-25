@@ -2,7 +2,11 @@
 import { createClient } from "@connectrpc/connect";
 import { useQuery, useTransport } from "@connectrpc/connect-query";
 import { BadgeVariant } from "delino-ui/badge";
-import { DeviceState, RunnerState } from "@delino/tide-protos/v1/common_pb";
+import {
+  DeviceState,
+  OwnSandLinkState,
+  RunnerState,
+} from "@delino/tide-protos/v1/common_pb";
 import { OwnSandLinkService } from "@delino/tide-protos/v1/ownsand_link_pb";
 import {
   type DeviceCapacity,
@@ -31,6 +35,7 @@ import {
   waitingInQueueOrder,
 } from "../queue.ts";
 import { useRunnerProfiles } from "../runner-profiles.ts";
+import { Link, orgPath, RouteId } from "../router.tsx";
 
 const RUNNER_ORDER = [
   RunnerState.CREATING,
@@ -101,7 +106,6 @@ export function OverviewPage() {
       new Map((profiles.data ?? []).map((p) => [p.runnerProfileId, p.name])),
     [profiles.data],
   );
-  const capacity = useQuery(WorkService.method.getCapacity, { organizationId });
   const link = useQuery(OwnSandLinkService.method.getOwnSandLink, {
     organizationId,
   });
@@ -234,39 +238,65 @@ export function OverviewPage() {
             </>
           ) : null}
         </p>
-        <QueryBoundary query={capacity} loading="Loading the device pool">
-          {(data) =>
-            data.devices.length === 0 ? (
-              <Empty title="No devices">
-                Link an OwnSand organization with devices, or enroll a device in
-                the OwnSand console.
-              </Empty>
+        <QueryBoundary
+          query={link}
+          loading="Loading the device pool"
+          errorTitle="Could not load the OwnSand link."
+        >
+          {({ link: ownSandLink }) =>
+            ownSandLink?.state === OwnSandLinkState.ACTIVE ? (
+              <DeviceCapacityTable organizationId={organizationId} />
             ) : (
-              <div className="table-wrap">
-                <table className="table" aria-label="Devices">
-                  <thead>
-                    <tr>
-                      <th scope="col">Device</th>
-                      <th scope="col">State</th>
-                      <th scope="col">Platform</th>
-                      <th scope="col">vCPUs</th>
-                      <th scope="col">Memory</th>
-                      <th scope="col">Disk</th>
-                      <th scope="col">tide runners</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {data.devices.map((d) => (
-                      <DeviceRow key={d.ownsandDeviceId} device={d} />
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              <Empty title="OwnSand link required">
+                {ownSandLink === undefined
+                  ? "An admin must link an OwnSand organization to show its devices."
+                  : "An admin must replace the OwnSand API key to show its devices."}{" "}
+                <Link to={orgPath(RouteId.Integrations, organizationId)}>
+                  Go to integrations
+                </Link>
+              </Empty>
             )
           }
         </QueryBoundary>
       </section>
     </>
+  );
+}
+
+function DeviceCapacityTable({ organizationId }: { organizationId: string }) {
+  const capacity = useQuery(WorkService.method.getCapacity, { organizationId });
+  return (
+    <QueryBoundary query={capacity} loading="Loading the device pool">
+      {(data) =>
+        data.devices.length === 0 ? (
+          <Empty title="No devices">
+            Link an OwnSand organization with devices, or enroll a device in the
+            OwnSand console.
+          </Empty>
+        ) : (
+          <div className="table-wrap">
+            <table className="table" aria-label="Devices">
+              <thead>
+                <tr>
+                  <th scope="col">Device</th>
+                  <th scope="col">State</th>
+                  <th scope="col">Platform</th>
+                  <th scope="col">vCPUs</th>
+                  <th scope="col">Memory</th>
+                  <th scope="col">Disk</th>
+                  <th scope="col">tide runners</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.devices.map((d) => (
+                  <DeviceRow key={d.ownsandDeviceId} device={d} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
+      }
+    </QueryBoundary>
   );
 }
 
