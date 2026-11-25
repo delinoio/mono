@@ -3,7 +3,12 @@
 package e2e
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"slices"
@@ -17,6 +22,8 @@ import (
 // tests below: it writes to both output streams and then exits or blocks.
 const envHelperMode = "OWNSAND_E2E_HELPER_MODE"
 
+const envHelperOutputHoldAddr = "OWNSAND_E2E_HELPER_OUTPUT_HOLD_ADDR"
+
 // helperMode is the behavior of the helper process.
 type helperMode string
 
@@ -27,6 +34,10 @@ const (
 	helperFail helperMode = "fail"
 	// helperBlock writes the output and waits until it is signaled.
 	helperBlock helperMode = "block"
+	// helperSpawn starts a descendant with the same output descriptors.
+	helperSpawn helperMode = "spawn"
+	// helperHoldOutput writes the output and waits for the test to close its connection.
+	helperHoldOutput helperMode = "hold-output"
 	// helperTerminate waits for SIGTERM and logs that it received the signal.
 	helperTerminate helperMode = "terminate"
 )
@@ -37,6 +48,16 @@ func TestHelperProcess(t *testing.T) {
 	mode := helperMode(os.Getenv(envHelperMode))
 	if mode == "" {
 		t.Skip("only runs as a helper process")
+	}
+	if mode == helperSpawn {
+		bin, args := helperArgs()
+		cmd := exec.Command(bin, args...)
+		cmd.Env = append(os.Environ(), envHelperMode+"="+string(helperHoldOutput))
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatal(err)
+		}
+		os.Exit(0)
 	}
 	if mode == helperTerminate {
 		signals := make(chan os.Signal, 1)
@@ -54,6 +75,15 @@ func TestHelperProcess(t *testing.T) {
 	if mode == helperBlock {
 		time.Sleep(time.Minute)
 	}
+	if mode == helperHoldOutput {
+		conn, err := net.DialTimeout("tcp4", os.Getenv(envHelperOutputHoldAddr), 10*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Dialing after the writes signals that diagnostic output is ready.
+		_, _ = io.Copy(io.Discard, conn)
+		conn.Close()
+	}
 	if mode == helperFail {
 		os.Exit(1)
 	}
@@ -62,6 +92,87 @@ func TestHelperProcess(t *testing.T) {
 
 func helperArgs() (string, []string) {
 	return os.Args[0], []string{"-test.run=^TestHelperProcess$"}
+}
+
+func TestTypeScriptSDKLauncherSuccess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	bin, args := helperArgs()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), envHelperMode+"="+string(helperExit))
+	out, err := runTypeScriptSDKCommand(cmd)
+	if err != nil {
+		t.Fatalf("launcher failed: %v\n%s", err, out)
+	}
+	if got, want := string(out), "out-1\nout-finalerr-1\nerr-final"; got != want {
+		t.Fatalf("combined output = %q, want %q", got, want)
+	}
+}
+
+func TestTypeScriptSDKLauncherTimeout(t *testing.T) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := listener.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	bin, args := helperArgs()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), envHelperMode+"="+string(helperSpawn),
+		envHelperOutputHoldAddr+"="+listener.Addr().String())
+	type result struct {
+		out []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := runTypeScriptSDKCommand(cmd)
+		done <- result{out, err}
+	}()
+
+	conn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("descendant did not signal readiness: %v", err)
+	}
+	defer conn.Close()
+
+	// Arm the short deadline after the descendant has inherited the pipe and
+	// written its diagnostics. The launcher sees the same cancellation signal
+	// as it does when the relay test's context deadline expires.
+	deadline, stop := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer stop()
+	<-deadline.Done()
+	cancel()
+	expiresAt, _ := deadline.Deadline()
+	const schedulingTolerance = 2 * time.Second
+	select {
+	case got := <-done:
+		var exitErr *exec.ExitError
+		if !errors.As(got.err, &exitErr) {
+			t.Fatalf("launcher error = %v, want a process exit error\n%s", got.err, got.out)
+		}
+		for _, want := range []string{"out-final", "err-final"} {
+			if !strings.Contains(string(got.out), want) {
+				t.Errorf("missing %q in combined output %q", want, got.out)
+			}
+		}
+	case <-time.After(time.Until(expiresAt.Add(typeScriptSDKPipeDrainDelay + schedulingTolerance))):
+		t.Fatal("launcher did not return within the pipe-drain delay and scheduling tolerance")
+	}
+
+	// The descendant keeps the pipe open until this connection is closed.
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	var probe [1]byte
+	if _, err := conn.Read(probe[:]); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("descendant stopped holding the pipe before the launcher returned: %v", err)
+	}
 }
 
 func wantHelperLines(name string) []string {
