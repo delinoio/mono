@@ -185,10 +185,10 @@ type Manager struct {
 	// beforeSnapshotCapture is a test hook called before the manager marks
 	// a capture as started, while the source sandbox command lock is held.
 	beforeSnapshotCapture func()
-	// removalHook is a test hook that removeSnapshot calls under hookMu
-	// before it deletes the stored copy; see SetSnapshotRemovalHookForTest.
-	hookMu      sync.Mutex
-	removalHook func(id string) error
+	// Snapshot tests can pause publication or fail removal with these hooks.
+	hookMu                sync.Mutex
+	beforeSnapshotPublish func(id string)
+	removalHook           func(id string) error
 	// bg tracks the background sandbox ends (TTL expiries and unexpected
 	// VM exits). Add is called only under mu while closed is false, so
 	// that Close can wait for them.

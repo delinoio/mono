@@ -8,9 +8,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
@@ -105,5 +107,134 @@ func TestDeleteSnapshotReceivedAfterCreateCancelsCreateOnSameChannel(t *testing.
 	}
 	if got := cp.Channels(); got != channels {
 		t.Errorf("channels = %d, want %d: the agent reconnected", got, channels)
+	}
+}
+
+func TestDeleteSnapshotAfterStagingWithFailedCleanup(t *testing.T) {
+	for _, scenario := range []string{"retry", "restart"} {
+		t.Run(scenario, func(t *testing.T) {
+			cp := testcp.New(t)
+			st, id := enrollDevice(t, cp)
+			h := start(t, cp, st, id)
+			isReport := func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil }
+			h.wait(0, "initial state report", isReport)
+			sandboxID, _ := uuidv7.NewString()
+			snapID, _ := uuidv7.NewString()
+			readyID, _ := uuidv7.NewString()
+			create := func(id, source string) *ownsandv1.AgentCommand {
+				return &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSnapshot{
+					CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: id, SandboxId: source},
+				}}
+			}
+			deleteCmd := &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSnapshot{
+				DeleteSnapshot: &ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID},
+			}}
+			if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+				t.Fatalf("create sandbox: %v", res)
+			}
+			if res := h.command(create(readyID, sandboxID)); res.GetCreateSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+				t.Fatalf("create ordinary snapshot: %v", res)
+			}
+
+			staged, resume := make(chan struct{}), make(chan struct{})
+			release := sync.OnceFunc(func() { close(resume) })
+			defer release()
+			h.agent.Sandboxes.SetSnapshotPublishHookForTest(func(id string) {
+				if id == snapID {
+					close(staged)
+					<-resume
+				}
+			})
+			var removals atomic.Int32
+			h.agent.Sandboxes.SetSnapshotRemovalHookForTest(func(id string) error {
+				if id == snapID && removals.Add(1) == 1 {
+					return errors.New("injected snapshot removal failure")
+				}
+				return nil
+			})
+			createID := h.sendCommand(create(snapID, sandboxID))
+			select {
+			case <-staged:
+			case <-time.After(10 * time.Second):
+				t.Fatal("capture did not stage its record")
+			}
+			if res := h.command(deleteCmd); res.GetError() != nil {
+				t.Fatalf("delete during staging: %v", res)
+			}
+			release()
+			res := h.result(createID)
+			if res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ABORTED || res.GetCreateSnapshot() != nil {
+				t.Fatalf("overtaken create: %v, want ABORTED and no snapshot", res)
+			}
+			if removals.Load() != 1 {
+				t.Fatalf("cleanup attempts = %d, want 1", removals.Load())
+			}
+			dir, err := st.SnapshotDir(snapID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "content", "disk")); err != nil {
+				t.Fatalf("expected surviving capture content: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, ".record.pending")); err != nil {
+				t.Fatalf("expected surviving staged record: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "record.json")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("published record after aborted create: %v, want absent", err)
+			}
+			checkUnavailable := func() {
+				t.Helper()
+				if _, release, ok := h.agent.Sandboxes.AcquireSnapshot(snapID); ok {
+					release()
+					t.Fatal("abandoned snapshot was acquirable")
+				}
+			}
+			checkUnavailable()
+			reported := func(report *ownsandv1.StateReport, id string) ownsandv1.SnapshotState {
+				for _, snap := range report.GetSnapshots() {
+					if snap.GetSnapshotId() == id {
+						return snap.GetState()
+					}
+				}
+				return ownsandv1.SnapshotState_SNAPSHOT_STATE_UNSPECIFIED
+			}
+			if state := reported(h.agent.Sandboxes.StateReport(2, nil), snapID); state != ownsandv1.SnapshotState_SNAPSHOT_STATE_DELETING {
+				t.Fatalf("cleanup state = %v, want DELETING", state)
+			}
+			if scenario == "restart" {
+				h.stop()
+				select {
+				case err := <-h.errc:
+					h.errc <- err // The harness cleanup still waits for this result.
+					if err != nil && !errors.Is(err, context.Canceled) {
+						t.Fatalf("agent stopped with an error: %v", err)
+					}
+				case <-time.After(15 * time.Second):
+					t.Fatal("agent did not stop")
+				}
+				from := cp.Received()
+				h = start(t, cp, st, id)
+				env, _ := h.wait(from, "state report after restart", isReport)
+				if snapshots := env.GetStateReport().GetSnapshots(); len(snapshots) != 1 || reported(env.GetStateReport(), readyID) != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+					t.Fatalf("snapshots after restart = %v, want only the ordinary READY snapshot", snapshots)
+				}
+				checkUnavailable()
+				sandboxID, _ = uuidv7.NewString()
+				if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+					t.Fatalf("create sandbox after restart: %v", res)
+				}
+			} else {
+				if res := h.command(deleteCmd); res.GetError() != nil || removals.Load() != 2 {
+					t.Fatalf("retried delete: %v, cleanup attempts = %d", res, removals.Load())
+				}
+			}
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("capture directory after cleanup: %v, want absent", err)
+			}
+			h.agent.Sandboxes.SetSnapshotPublishHookForTest(nil)
+			if res := h.command(create(snapID, sandboxID)); res.GetCreateSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+				t.Fatalf("fresh create for the same ID: %v", res)
+			}
+		})
 	}
 }
