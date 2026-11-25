@@ -81,7 +81,8 @@ test("a failed refresh of a partially loaded list pauses the continuation until 
   renderApp("/billing", { api });
   await screen.findByText(/Some items did not load/);
   expect(rows()).toHaveLength(200);
-  expect(pageTokens(api)).toEqual(["", "p1"]);
+  const initialTokens = pageTokens(api);
+  expect(initialTokens).toEqual(["", expect.stringMatching(/./)]);
 
   // A reconnect refresh now fails on page one. A focus of the tab does not
   // refresh a list that waits for the retry of a failed later page (see
@@ -104,15 +105,21 @@ test("a failed refresh of a partially loaded list pauses the continuation until 
   ).toBeTruthy();
   expect(screen.queryByText(LOADING_MORE)).toBeNull();
   // The refresh made one request, and no continuation request follows.
-  expect(pageTokens(api)).toEqual(["", "p1", ""]);
+  expect(pageTokens(api)).toEqual([...initialTokens, ""]);
 
   // The retry reads page one, then resumes with the second page.
   const held = holdAfterFirstRequest();
   api.gates.set("ListBillingAccounts", held.gate);
   await click(within(notice).getByRole("button", { name: "Try again" }));
   await waitFor(() =>
-    expect(pageTokens(api)).toEqual(["", "p1", "", "", "p1"]),
+    expect(pageTokens(api)).toEqual([
+      ...initialTokens,
+      "",
+      "",
+      expect.stringMatching(/./),
+    ]),
   );
+  const retryTokens = pageTokens(api);
   // The second page request is active: the status shows again.
   expect((await screen.findByText(LOADING_MORE)).getAttribute("role")).toBe(
     "status",
@@ -124,5 +131,5 @@ test("a failed refresh of a partially loaded list pauses the continuation until 
   await waitFor(() => expect(rows()).toHaveLength(201));
   expect(screen.queryByText(LOADING_MORE)).toBeNull();
   expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
-  expect(pageTokens(api)).toEqual(["", "p1", "", "", "p1"]);
+  expect(pageTokens(api)).toEqual(retryTokens);
 });

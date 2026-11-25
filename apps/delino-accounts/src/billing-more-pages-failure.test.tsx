@@ -69,7 +69,7 @@ describe("a failed later page of a complete list", () => {
     expect(signIns).toHaveLength(1);
     expect(rows()).toHaveLength(200);
     // The failure stops the loop and the sign-in action sends no request.
-    expect(pageTokens(api)).toEqual(["", "p1"]);
+    expect(pageTokens(api)).toEqual(["", expect.stringMatching(/./)]);
   });
 
   test("another failure still retries at the failed page", async () => {
@@ -80,9 +80,12 @@ describe("a failed later page of a complete list", () => {
     expect(
       within(notice).queryByRole("button", { name: "Sign in with Delino" }),
     ).toBeNull();
+    const requestsBeforeRetry = pageTokens(api);
+    expect(requestsBeforeRetry).toEqual(["", expect.stringMatching(/./)]);
+    const failedToken = requestsBeforeRetry[1];
     await click(within(notice).getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(rows()).toHaveLength(201));
-    expect(pageTokens(api)).toEqual(["", "p1", "p1"]);
+    expect(pageTokens(api)).toEqual([...requestsBeforeRetry, failedToken]);
     expect(screen.queryByText(/Some items did not load/)).toBeNull();
   });
 });

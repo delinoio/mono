@@ -68,6 +68,63 @@ describe("fake billing history pagination", () => {
     expect(last.nextPageToken).toBe("");
   });
 
+  test("ListLedgerEntries continues at the next row when the page size changes", async () => {
+    const api = createFakeApi();
+    const account = api.accounts.get(ACCOUNT_ID)!;
+    account.ledger = [];
+    addLedgerEntries(account, 6);
+    const credit = createClient(CreditService, api.transport);
+    const request = { billingAccountId: ACCOUNT_ID };
+
+    const first = await credit.listLedgerEntries({ ...request, pageSize: 2 });
+    expect(first.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
+      "org-0001",
+      "org-0002",
+    ]);
+    expect(first.nextPageToken).not.toBe("");
+
+    const continuation = { ...request, pageToken: first.nextPageToken };
+    const larger = await credit.listLedgerEntries({
+      ...continuation,
+      pageSize: 3,
+    });
+    expect(larger.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
+      "org-0003",
+      "org-0004",
+      "org-0005",
+    ]);
+    expect(larger.nextPageToken).not.toBe("");
+
+    const last = await credit.listLedgerEntries({
+      ...request,
+      pageSize: 1,
+      pageToken: larger.nextPageToken,
+    });
+    expect(last.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
+      "org-0006",
+    ]);
+    expect(last.nextPageToken).toBe("");
+
+    const smaller = await credit.listLedgerEntries({
+      ...continuation,
+      pageSize: 1,
+    });
+    expect(smaller.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
+      "org-0003",
+    ]);
+    expect(smaller.nextPageToken).not.toBe("");
+
+    const same = await credit.listLedgerEntries({
+      ...continuation,
+      pageSize: 2,
+    });
+    expect(same.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
+      "org-0003",
+      "org-0004",
+    ]);
+    expect(same.nextPageToken).not.toBe("");
+  });
+
   test("ListInvoices pages by the page size and ends with an empty token", async () => {
     const { credit } = seeded();
     const first = await credit.listInvoices({
@@ -182,16 +239,16 @@ describe("fake billing history pagination", () => {
   test("the role checks still apply to every page", async () => {
     const { api, credit } = seeded();
     api.userId = ADMIN;
-    expect(
-      (await credit.listInvoices({ billingAccountId: ACCOUNT_ID })).invoices,
-    ).toHaveLength(50);
+    const first = await credit.listInvoices({ billingAccountId: ACCOUNT_ID });
+    expect(first.invoices).toHaveLength(50);
+    expect(first.nextPageToken).not.toBe("");
     api.userId = VIEWER;
     expect(
       (
         await rejection(
           credit.listInvoices({
             billingAccountId: ACCOUNT_ID,
-            pageToken: "p1",
+            pageToken: first.nextPageToken,
           }),
         )
       ).code,
