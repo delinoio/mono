@@ -1445,24 +1445,38 @@ describe("members", () => {
     expect(pending.textContent).toContain("pending@example.com");
     await click(screen.getByRole("button", { name: "Invite by email" }));
     await settle(60);
-    const email = screen.getByRole("textbox", { name: "Email" });
+    const dialog = screen.getByRole("dialog", { name: "Invite by email" });
+    const email = within(dialog).getByRole("textbox", { name: "Email" });
+    const send = within(dialog).getByRole("button", {
+      name: "Send invitation",
+    });
     expect(document.activeElement).toBe(email);
-    await type(email, "not-an-email");
-    await click(screen.getByRole("button", { name: "Send invitation" }));
-    expect(
-      screen.getByText("Enter an email address like name@example.com."),
-    ).toBeTruthy();
-    expect(calls(api, "CreateInvitation")).toHaveLength(0);
-    await type(email, " new@example.com ");
-    await click(screen.getByRole("button", { name: "Send invitation" }));
+    for (const malformed of [
+      "not-an-email",
+      "a..b@example.test",
+      "<a@b>",
+      "‹a@b›",
+    ]) {
+      await type(email, malformed);
+      await click(send);
+      expect(
+        within(dialog).getByText(
+          "Enter an email address like name@example.com.",
+        ),
+      ).toBeTruthy();
+      expect(email.getAttribute("aria-invalid")).toBe("true");
+      expect(calls(api, "CreateInvitation")).toHaveLength(0);
+    }
+    await type(email, " a.b@example.test ");
+    await click(send);
     await settle(60);
     expect(calls(api, "CreateInvitation")).toEqual([
-      expect.objectContaining({ email: "new@example.com", role: 3 }),
+      expect.objectContaining({ email: "a.b@example.test", role: 3 }),
     ]);
     expect(
       (await screen.findByRole("list", { name: "Pending invitations" }))
         .textContent,
-    ).toContain("new@example.com");
+    ).toContain("a.b@example.test");
   });
 
   test("revokes a pending invitation", async () => {

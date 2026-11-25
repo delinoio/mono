@@ -59,15 +59,52 @@ export function checkAccountName(input: string): Checked<string> {
 /** Upper limit of an email address in bytes (UTF-8). */
 const MAX_EMAIL_BYTES = 254;
 
+// Go's net/mail allows RFC 5322 dot-atoms, including non-ASCII Unicode
+// scalar values, in both parts of a plain address.
+const EMAIL_ATOM =
+  /^[a-z0-9!#$%&'*+/=?^`_{|}~\u0080-\uD7FF\uE000-\u{10FFFF}-]+$/iu;
+const IPV4_ADDRESS = /^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$/;
+const IPV6_CHARACTERS = /^[0-9a-f:.]+$/i;
+
+function isEmailDotAtom(value: string): boolean {
+  return value.split(".").every((atom) => EMAIL_ATOM.test(atom));
+}
+
+function isEmailDomain(domain: string): boolean {
+  if (isEmailDotAtom(domain)) return true;
+  if (!domain.startsWith("[") || !domain.endsWith("]")) return false;
+
+  // The Go version in go.mod parses the bracket contents as a bare IP address.
+  const address = domain.slice(1, -1);
+  if (IPV4_ADDRESS.test(address)) {
+    return address.split(".").every((octet) => Number(octet) <= 255);
+  }
+  if (!IPV6_CHARACTERS.test(address)) return false;
+
+  try {
+    new URL(`http://[${address}]/`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Checks an invitation email address (`local@domain`, at most 254 bytes). */
 export function checkEmail(input: string): Checked<string> {
-  const email = input.trim();
+  const email = trimGoSpace(input);
   if (email === "") {
     return { ok: false, error: "Enter an email address." };
   }
+  const [local = "", domain = "", extra] = email.split("@", 3);
+  // Pasted angle quotes can wrap an address. Go treats these Unicode
+  // characters as part of the address and would send to a different mailbox.
+  const hasAngleQuotes = email.startsWith("‹") && email.endsWith("›");
   if (
     new TextEncoder().encode(email).length > MAX_EMAIL_BYTES ||
-    !/^[^\s@]+@[^\s@]+$/.test(email)
+    extra !== undefined ||
+    hasAngleQuotes ||
+    !isEmailDotAtom(local) ||
+    !isEmailDomain(domain)
   ) {
     return {
       ok: false,
