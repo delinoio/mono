@@ -1653,32 +1653,68 @@ test("CI workflow aggregates every validation job by the planner output that sel
   }
 });
 
-// Runs the ci-result jq check of CI.yml against a `needs` object.
-function ciResultPasses(jobs, needs) {
-  const ciResult = jobs.get("ci-result");
-  const table = /job_outputs='(\{[^']*\})'/.exec(ciResult)[1];
-  const program =
-    /--argjson outputs "\$job_outputs" '([^']*)' > \/dev\/null/.exec(ciResult);
-  assert.ok(program, "ci-result has no jq check");
-  const result = spawnSync(
-    "jq",
-    ["-e", "--argjson", "outputs", table, program[1]],
-    { input: JSON.stringify(needs), encoding: "utf8" },
-  );
-  if (result.error) {
-    throw result.error;
-  }
-  return result.status === 0;
+function ciResultScript(jobs) {
+  const step =
+    /^ {6}- name: Check validation results\n((?: {8}.*\n|\n)*)/m.exec(
+      jobs.get("ci-result"),
+    );
+  assert.ok(step, "ci-result has no Check validation results step");
+  const run = /^ {8}run: \|\n((?: {10}.*\n|\n)+)/m.exec(step[1]);
+  assert.ok(run, "Check validation results has no run block");
+  return run[1].replace(/^ {10}/gm, "");
 }
 
-// Runs the aggregate check itself. Every GitHub-hosted Ubuntu runner has jq;
-// a local run without jq skips this test.
+function assertCiResult(script, needs, status, label) {
+  const dir = mkdtempSync(join(tmpdir(), "ci-result-"));
+  try {
+    const summary = join(dir, "summary.md");
+    const result = spawnSync(
+      "bash",
+      ["--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+      {
+        cwd: dir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          BASH_ENV: "",
+          NEEDS_RESULTS: JSON.stringify(needs),
+          VALIDATION_REVISION: "fixture-revision",
+          GITHUB_STEP_SUMMARY: summary,
+        },
+      },
+    );
+    if (result.error) {
+      throw result.error;
+    }
+    assert.equal(
+      result.status,
+      status,
+      `${label}\n${result.stdout}${result.stderr}`,
+    );
+    assert.equal(
+      readFileSync(summary, "utf8").trimEnd().split("\n").at(-1),
+      status === 0 ? "CI result: success" : "CI result: failure",
+      label,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// The GitHub-hosted Ubuntu runner provides Bash and jq.
 test("CI aggregate passes only successful or unselected skipped jobs", (t) => {
-  if (spawnSync("jq", ["--version"]).error) {
-    t.skip("jq is not installed");
-    return;
+  for (const command of ["bash", "jq"]) {
+    const { error } = spawnSync(command, ["--version"]);
+    if (error?.code === "ENOENT") {
+      t.skip(`${command} is not installed`);
+      return;
+    }
+    if (error) {
+      throw error;
+    }
   }
   const jobs = workflowJobs();
+  const script = ciResultScript(jobs);
   const table = ciResultTable(jobs);
   // Planner outputs, plus the marker as an output: a skipped job that runs
   // without the planner must fail even if the planner published the marker.
@@ -1700,61 +1736,60 @@ test("CI aggregate passes only successful or unselected skipped jobs", (t) => {
   const allSkipped = Object.fromEntries(
     Object.keys(table).map((id) => [id, "skipped"]),
   );
-  assert.equal(ciResultPasses(jobs, needsOf(allSucceeded, allSelected)), true);
+  assertCiResult(
+    script,
+    needsOf(allSucceeded, allSelected),
+    0,
+    "all jobs succeeded",
+  );
   for (const [id, output] of Object.entries(table)) {
     if (output === ALWAYS_RUN) {
       // A job that runs without the planner must succeed even when the
       // planner selects nothing.
-      assert.equal(
-        ciResultPasses(
-          jobs,
-          needsOf({ ...allSucceeded, [id]: "skipped" }, noneSelected),
-        ),
-        false,
+      assertCiResult(
+        script,
+        needsOf({ ...allSucceeded, [id]: "skipped" }, noneSelected),
+        1,
         `${id} skipped`,
       );
     } else {
-      assert.equal(
-        ciResultPasses(
-          jobs,
-          needsOf(
-            { ...allSucceeded, [id]: "skipped" },
-            { ...allSelected, [output]: "false" },
-          ),
+      assertCiResult(
+        script,
+        needsOf(
+          { ...allSucceeded, [id]: "skipped" },
+          { ...allSelected, [output]: "false" },
         ),
-        true,
+        0,
         `${id} skipped without selection`,
       );
     }
     for (const result of ["skipped", "failure", "cancelled"]) {
-      assert.equal(
-        ciResultPasses(
-          jobs,
-          needsOf({ ...allSucceeded, [id]: result }, allSelected),
-        ),
-        false,
+      assertCiResult(
+        script,
+        needsOf({ ...allSucceeded, [id]: result }, allSelected),
+        1,
         `${id} ${result} with selection`,
       );
     }
   }
-  assert.equal(
-    ciResultPasses(
-      jobs,
-      needsOf({ ...allSucceeded, extra: "success" }, allSelected),
-    ),
-    false,
+  assertCiResult(
+    script,
+    needsOf({ ...allSucceeded, extra: "success" }, allSelected),
+    1,
     "a needed job without a table entry",
   );
   const [firstJob] = Object.keys(table);
   const { [firstJob]: _omitted, ...missingOne } = allSucceeded;
-  assert.equal(
-    ciResultPasses(jobs, needsOf(missingOne, allSelected)),
-    false,
+  assertCiResult(
+    script,
+    needsOf(missingOne, allSelected),
+    1,
     "a table entry without a needed job",
   );
-  assert.equal(
-    ciResultPasses(jobs, needsOf(allSkipped, {}, "failure")),
-    false,
+  assertCiResult(
+    script,
+    needsOf(allSkipped, {}, "failure"),
+    1,
     "a failed planner",
   );
 });
