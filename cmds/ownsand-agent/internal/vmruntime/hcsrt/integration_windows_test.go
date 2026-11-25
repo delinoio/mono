@@ -157,9 +157,12 @@ func hostLANAddress() string {
 	return ""
 }
 
-// consoleTail logs the end of each console.log in the VM directories, for
-// boot debugging after a failure.
-func consoleTail(t *testing.T, vmsDir string) {
+// logFailedVMConsoles logs the end of each VM console after a test failure.
+// Defer it so it runs before the resource cleanups, even if setup calls Fatal.
+func logFailedVMConsoles(t *testing.T, vmsDir string) {
+	if !t.Failed() {
+		return
+	}
 	logs, _ := filepath.Glob(filepath.Join(vmsDir, "*", "console.log"))
 	for _, p := range logs {
 		b, err := os.ReadFile(p)
@@ -205,6 +208,8 @@ func testHyperVIntegration(t *testing.T, diskSizing bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { rt.Close() })
+	defer logFailedVMConsoles(t, vmsDir)
 	caps := rt.Capabilities(context.Background())
 	for _, c := range caps.Checks {
 		t.Logf("check %s passed=%v: %s", c.GetCheckId(), c.GetPassed(), c.GetDetail())
@@ -216,19 +221,16 @@ func testHyperVIntegration(t *testing.T, diskSizing bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(m.Close)
 	d, err := ops.New(m, st, ops.Options{Logger: logger})
+	// A persistence failure can return both a dispatcher and an error.
+	if d != nil {
+		t.Cleanup(d.Close)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	m.SetExecTracker(d)
-	t.Cleanup(func() {
-		if t.Failed() {
-			consoleTail(t, vmsDir)
-		}
-		d.Close()
-		m.Close()
-		rt.Close()
-	})
 	e := &env{t: t, m: m, d: d}
 	if diskSizing {
 		e.checkBaseDiskSizing(rt, rootfs, vmsDir)
