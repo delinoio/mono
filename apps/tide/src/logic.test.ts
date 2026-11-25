@@ -18,12 +18,7 @@ import {
 import { RequestSchema, RunnerSchema } from "@delino/tide-protos/v1/work_pb";
 import { WatchQueueEventKind } from "tide-sdk";
 import { nextSetupStep, SetupStep } from "./components/setup.tsx";
-import {
-  AuthMode,
-  DEFAULT_API_ORIGIN,
-  readConsoleConfig,
-  REQUIRED_API_SCOPE,
-} from "./config.ts";
+import { AuthMode, DEFAULT_API_ORIGIN, readConsoleConfig } from "./config.ts";
 import { formatSpan, queueWaitMs } from "./format.ts";
 import {
   emptyProfileForm,
@@ -58,19 +53,68 @@ import {
 import { parseRoute, RouteId, routePath } from "./router.tsx";
 
 describe("configuration", () => {
-  test("defaults to the production API origin and always requests tide:use", () => {
-    const config = readConsoleConfig(
-      {
-        PUBLIC_LOGTO_ENDPOINT: "https://logto.test",
-        PUBLIC_LOGTO_APP_ID: "app",
-        PUBLIC_LOGTO_SCOPES: "extra tide:use",
+  describe.each([false, true])("production=%s", (production) => {
+    test("normalizes a complete Logto registration and requests tide:use", () => {
+      const config = readConsoleConfig(
+        {
+          PUBLIC_LOGTO_ENDPOINT: " https://login.example/ ",
+          PUBLIC_LOGTO_APP_ID: " app ",
+          PUBLIC_LOGTO_SCOPES: "read:example tide:use",
+        },
+        { production },
+      );
+      expect(config.apiOrigin).toBe(DEFAULT_API_ORIGIN);
+      expect(DEFAULT_API_ORIGIN).toBe("https://tide.api.delino.io");
+      expect(config.logto).toEqual({
+        endpoint: "https://login.example",
+        appId: "app",
+        scopes: ["tide:use", "read:example"],
+      });
+    });
+
+    describe.each([undefined, "", "   ", "app"])("app ID %j", (appId) => {
+      test.each([
+        ["not-a-url", "is not a valid URL"],
+        [
+          "https://login.example/path",
+          "must be an origin without a path, query or fragment",
+        ],
+      ])("rejects Logto endpoint %j", (endpoint, error) => {
+        expect(() =>
+          readConsoleConfig(
+            { PUBLIC_LOGTO_ENDPOINT: endpoint, PUBLIC_LOGTO_APP_ID: appId },
+            { production },
+          ),
+        ).toThrow(`PUBLIC_LOGTO_ENDPOINT ${error}`);
+      });
+    });
+
+    test.each([undefined, "", "   "])(
+      "leaves sign-in unconfigured with a valid endpoint and app ID %j",
+      (appId) => {
+        expect(
+          readConsoleConfig(
+            {
+              PUBLIC_LOGTO_ENDPOINT: "https://login.example",
+              PUBLIC_LOGTO_APP_ID: appId,
+            },
+            { production },
+          ).logto,
+        ).toBeUndefined();
       },
-      { production: true },
     );
-    expect(config.apiOrigin).toBe(DEFAULT_API_ORIGIN);
-    expect(DEFAULT_API_ORIGIN).toBe("https://tide.api.delino.io");
-    expect(config.logto?.scopes).toEqual([REQUIRED_API_SCOPE, "extra"]);
-    expect(REQUIRED_API_SCOPE).toBe("tide:use");
+
+    test.each([undefined, "", "   "])(
+      "leaves sign-in unconfigured with an app ID and endpoint %j",
+      (endpoint) => {
+        expect(
+          readConsoleConfig(
+            { PUBLIC_LOGTO_ENDPOINT: endpoint, PUBLIC_LOGTO_APP_ID: "app" },
+            { production },
+          ).logto,
+        ).toBeUndefined();
+      },
+    );
   });
 
   const pathError = "must be an origin without a path, query or fragment";
@@ -138,16 +182,19 @@ describe("configuration", () => {
     },
   );
 
-  test("enables the mock API only outside production", () => {
-    expect(() =>
-      readConsoleConfig({ PUBLIC_TIDE_MOCK_API: "true" }, { production: true }),
-    ).toThrow();
-    expect(
-      readConsoleConfig(
-        { PUBLIC_TIDE_MOCK_API: " true " },
-        { production: false },
-      ).authMode,
-    ).toBe(AuthMode.Mock);
+  test("gives the mock flag precedence over an invalid Logto endpoint", () => {
+    const env = {
+      PUBLIC_TIDE_MOCK_API: " true ",
+      PUBLIC_LOGTO_ENDPOINT: "not-a-url",
+      PUBLIC_LOGTO_APP_ID: "app",
+    };
+    expect(() => readConsoleConfig(env, { production: true })).toThrow(
+      "PUBLIC_TIDE_MOCK_API must not be set for a production build",
+    );
+    expect(readConsoleConfig(env, { production: false })).toMatchObject({
+      authMode: AuthMode.Mock,
+      logto: undefined,
+    });
   });
 
   test("shows sign-in as not configured without a Logto registration", () => {
