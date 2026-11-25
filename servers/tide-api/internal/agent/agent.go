@@ -115,7 +115,10 @@ type Hub struct {
 	// claimLocks serializes the claim and release calls of one vendor
 	// request; see lockVendorRequest.
 	claimLocksMu sync.Mutex
-	claimLocks   map[string]*claimLock
+	claimLocks   map[vendorRequestKey]*claimLock
+	// pendingAdmissions is guarded by claimLocksMu. Each admission is
+	// resolved under the corresponding vendor request lock.
+	pendingAdmissions map[vendorRequestKey]pendingAdmission
 
 	mu       sync.Mutex
 	watchers map[string]*watcher
@@ -137,7 +140,8 @@ func Register(r *app.Registry, engine *work.Engine, integrations *integration.St
 	}
 	h := &Hub{svc: r.Service, engine: engine, integrations: integrations, timing: timing, log: r.Service.Logger,
 		vendors: map[tidev1.AgentVendor]Vendor{}, bySource: map[work.Source]Vendor{},
-		claimLocks: map[string]*claimLock{}, watchers: map[string]*watcher{}, draining: map[string]map[*watcher]struct{}{},
+		claimLocks: map[vendorRequestKey]*claimLock{}, pendingAdmissions: map[vendorRequestKey]pendingAdmission{},
+		watchers: map[string]*watcher{}, draining: map[string]map[*watcher]struct{}{},
 		stopped: map[string]int{}, syncNow: make(chan struct{}, 1)}
 	engine.RegisterAdapter(&Adapter{h: h})
 	integrations.OnDeletion(h.checkIntegrationDeletion)
@@ -301,6 +305,12 @@ func (h *Hub) releaseRequest(ctx context.Context, req *work.Request) error {
 	return err
 }
 
+type vendorRequestKey struct {
+	orgID           string
+	vendor          tidev1.AgentVendor
+	vendorRequestID string
+}
+
 // claimLock is one entry of Hub.claimLocks.
 type claimLock struct {
 	mu    sync.Mutex
@@ -318,8 +328,7 @@ type claimLock struct {
 // release only claims of requests that they ended before a runner took the
 // session, and the vendor queues the follow-up of such a request only after
 // that release took effect.
-func (h *Hub) lockVendorRequest(orgID string, vendor tidev1.AgentVendor, vendorRequestID string) func() {
-	key := orgID + "/" + VendorLabel(vendor) + "/" + vendorRequestID
+func (h *Hub) lockVendorRequest(key vendorRequestKey) func() {
 	h.claimLocksMu.Lock()
 	l := h.claimLocks[key]
 	if l == nil {
@@ -342,7 +351,7 @@ func (h *Hub) lockVendorRequest(orgID string, vendor tidev1.AgentVendor, vendorR
 // releaseClaim asks the vendor to release c and marks it released when the
 // vendor confirms. It returns whether the claim is released.
 func (h *Hub) releaseClaim(ctx context.Context, c *Claim, req *work.Request) (bool, error) {
-	unlock := h.lockVendorRequest(c.OrganizationID, c.Vendor, c.VendorRequestID)
+	unlock := h.lockVendorRequest(vendorRequestKey{c.OrganizationID, c.Vendor, c.VendorRequestID})
 	defer unlock()
 	return h.releaseClaimLocked(ctx, c, req)
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/devin/devinfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
@@ -44,9 +45,9 @@ func newDevinWorld(t *testing.T, guest tidev1.GuestOs) *devinWorld {
 	return w
 }
 
-func createDevinWorld(t *testing.T, guest tidev1.GuestOs, fake *devinfake.Fake) *devinWorld {
+func createDevinWorld(t *testing.T, guest tidev1.GuestOs, fake *devinfake.Fake, extra ...testenv.Option) *devinWorld {
 	t.Helper()
-	w := newAgentWorld(t, layers.Options{Devin: devin.Options{BaseURL: fake.Server.URL, ReleaseGrace: time.Minute}})
+	w := newAgentWorld(t, layers.Options{Devin: devin.Options{BaseURL: fake.Server.URL, ReleaseGrace: time.Minute}}, extra...)
 	dw := &devinWorld{agentWorld: w, devin: fake}
 	id := w.createIntegration(t, &tidev1.CreateAgentIntegrationRequest{
 		Vendor: tidev1.AgentVendor_AGENT_VENDOR_DEVIN, Name: "devin",

@@ -19,6 +19,9 @@ type Watch struct {
 	In integration.Integration
 	// Logger has the organization, integration and vendor attributes.
 	Logger *slog.Logger
+
+	// leaseContext outlives this watch when its integration changes.
+	leaseContext context.Context
 }
 
 // Credential decrypts one credential of the integration for the call that
@@ -30,7 +33,9 @@ func (w *Watch) Credential(ctx context.Context, cred tidev1.AgentCredential) (st
 // Admit claims a pending vendor request and creates its tide request; a
 // repeated event of the same entry creates nothing. Errors are logged by
 // the caller; the next list retries the entry.
-func (w *Watch) Admit(ctx context.Context, d Demand) error { return w.h.admit(ctx, w.v, w.In, d) }
+func (w *Watch) Admit(ctx context.Context, d Demand) error {
+	return w.h.admit(ctx, w.leaseContext, w.v, w.In, d)
+}
 
 // Lost reports that another worker holds a vendor request or that it left
 // the vendor queue: a QUEUED tide request of it ends with CANCELED and
@@ -230,15 +235,15 @@ func (h *Hub) syncWatchers(ctx context.Context) {
 		h.mu.Unlock()
 		go func() {
 			defer h.finishWatcher(w)
-			h.watch(wctx, v, d.in)
+			h.watch(wctx, ctx, v, d.in)
 		}()
 	}
 }
 
-func (h *Hub) watch(ctx context.Context, v Vendor, in integration.Integration) {
+func (h *Hub) watch(ctx, leaseContext context.Context, v Vendor, in integration.Integration) {
 	log := h.log.With(slog.String("organization_id", in.OrganizationID), slog.String("agent_integration_id", in.ID), slog.String("vendor", VendorLabel(in.Vendor)))
 	log.InfoContext(ctx, "vendor_watch_started")
-	v.Watch(ctx, &Watch{h: h, v: v, In: in, Logger: log})
+	v.Watch(ctx, &Watch{h: h, v: v, leaseContext: leaseContext, In: in, Logger: log})
 }
 
 // Run reconnects an integration's watch sessions until ctx ends. A nil
@@ -279,8 +284,8 @@ func (w *Watch) Run(ctx context.Context, session func() error) {
 }
 
 // runPoller is the agent_claims lease component: every PollInterval it
-// releases the held claims of ended requests and asks the vendors whether
-// the runner programs of STARTING requests took their sessions.
+// reconciles uncertain admissions, releases the held claims of ended
+// requests and checks whether STARTING requests took their sessions.
 func (h *Hub) runPoller(ctx context.Context) error {
 	t := time.NewTicker(h.timing.PollInterval)
 	defer t.Stop()
@@ -298,6 +303,7 @@ func (h *Hub) runPoller(ctx context.Context) error {
 func (h *Hub) Poll(ctx context.Context) { h.poll(ctx) }
 
 func (h *Hub) poll(ctx context.Context) {
+	h.reconcileAdmissions(ctx)
 	ended, err := h.heldClaims(ctx, bestEffortClaimLookup, "NOT (r.state = ANY($1))", work.OpenRequestStates())
 	if err != nil {
 		if ctx.Err() == nil {
