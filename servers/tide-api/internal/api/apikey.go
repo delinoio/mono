@@ -64,14 +64,13 @@ func (h APIKeyHandler) CreateApiKey(ctx context.Context, req *connect.Request[ti
 		if err := ValidateName("name", req.Msg.GetName(), maxAPIKeyNameLength); err != nil {
 			return err
 		}
-		now := h.NowUTC()
 		var expires *time.Time
 		if ts := req.Msg.GetExpiresAt(); ts != nil {
 			if err := ts.CheckValid(); err != nil {
 				return ErrInvalidf("invalid expires_at: %v", err)
 			}
 			t := ts.AsTime().UTC()
-			if !t.After(now) {
+			if !t.After(h.NowUTC()) {
 				return ErrInvalidf("invalid expires_at: must be in the future")
 			}
 			expires = &t
@@ -90,6 +89,10 @@ func (h APIKeyHandler) CreateApiKey(ctx context.Context, req *connect.Request[ti
 		}
 		if err != nil {
 			return err
+		}
+		now := h.NowUTC()
+		if expires != nil && !expires.After(now) {
+			return ErrInvalidf("invalid expires_at: must be in the future")
 		}
 		secret, err := auth.NewSecret(auth.SecretAPIKey)
 		if err != nil {

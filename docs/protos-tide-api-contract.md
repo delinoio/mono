@@ -132,6 +132,7 @@ When the OwnSand link is `ACTIVE`, `CreateRunnerProfile` checks template sources
 ### Personal API key and dev session messages
 
 - `ApiKey`: `api_key_id`, `name`, `display_prefix`, `state`, `created_at`, `expires_at` (absent when the key does not expire), `last_used_at` and `revoked_at`. `CreateApiKeyResponse` adds the `secret` field once.
+- `CreateApiKey` returns `invalid_argument` if the requested expiry is at or before the time the server can issue the key.
 - `DevSession`: `dev_session_id` (the request ID), `runner_profile_id`, `owner_user_id`, `label`, `guest_os`, `workspace_path`, `state` (`RequestState`), `end_reason`, `queued_at`, `started_at`, `ended_at`, `runner_id` and `ownsand_device_id` when a runner serves it.
 - `ExecDevSessionRequest`: `organization_id`, `dev_session_id`, `exec_id`, `command` (argument array), `env` (string map), optional `working_directory` and optional `timeout`. `AttachDevSessionExecRequest`: `organization_id`, `dev_session_id`, `exec_id`, `stdout_offset` and `stderr_offset`.
 - `ExecDevSessionResponse` and `AttachDevSessionExecResponse` wrap one `DevSessionExecEvent`. `DevSessionExecEvent` is a `oneof` of `keepalive`, `started`, `output_truncated` (next offsets for both streams), `stdout` and `stderr` (`offset` and `data`), `exited` (`oneof` of `exit_code` or `signal`, and `timed_out`), `failed` (`ExecFailureReason` and a message) and `sandbox_ended` (the OwnSand end reason as text). It copies the meaning of the OwnSand exec events and does not import OwnSand schemas.

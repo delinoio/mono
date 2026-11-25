@@ -43,6 +43,10 @@ func TestPersonalAPIKeyLifecycle(t *testing.T) {
 	}
 	_, err = member.APIKey.CreateApiKey(ctx, connect.NewRequest(&tidev1.CreateApiKeyRequest{OrganizationId: org.ID, Name: "past", ExpiresAt: timestamppb.New(env.Clock.Now().Add(-time.Second))}))
 	wantCode(t, "past expiry", err, connect.CodeInvalidArgument)
+	_, err = member.APIKey.CreateApiKey(ctx, connect.NewRequest(&tidev1.CreateApiKeyRequest{
+		OrganizationId: org.ID, Name: "malformed", ExpiresAt: &timestamppb.Timestamp{Seconds: env.Clock.Now().Unix(), Nanos: -1},
+	}))
+	wantCode(t, "malformed expiry", err, connect.CodeInvalidArgument)
 
 	// The key works on DevSessionService and nowhere else.
 	keyClient := env.Bearer(secret)
@@ -136,6 +140,92 @@ func TestPersonalAPIKeyExpiry(t *testing.T) {
 	list, _ := env.User(org.Member).APIKey.ListApiKeys(ctx, connect.NewRequest(&tidev1.ListApiKeysRequest{OrganizationId: org.ID}))
 	if s := list.Msg.GetApiKeys()[0].GetState(); s != tidev1.ApiKeyState_API_KEY_STATE_EXPIRED {
 		t.Fatalf("state %v", s)
+	}
+}
+
+func TestCreateApiKeyChecksExpiryAfterLockWait(t *testing.T) {
+	for _, lock := range []struct {
+		name string
+		hold func(*testing.T, *testenv.Env, testenv.Org) func()
+	}{
+		{name: "membership", hold: func(t *testing.T, env *testenv.Env, org testenv.Org) func() {
+			return holdTx(t, env, "SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE", org.ID, org.Member)
+		}},
+		{name: "organization", hold: func(t *testing.T, env *testenv.Env, org testenv.Org) func() {
+			return holdTx(t, env, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", org.ID)
+		}},
+	} {
+		for _, tc := range []struct {
+			name    string
+			elapsed time.Duration
+			accept  bool
+		}{
+			{name: "before expiry", elapsed: 30 * time.Minute, accept: true},
+			{name: "at expiry", elapsed: time.Hour},
+			{name: "after expiry", elapsed: time.Hour + time.Second},
+		} {
+			t.Run(lock.name+"/"+tc.name, func(t *testing.T) {
+				env := testenv.New(t)
+				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+				defer cancel()
+				org := env.NewOrg("alice")
+				member := env.User(org.Member)
+				expires := env.Clock.Now().Add(time.Hour)
+				release := lock.hold(t, env, org)
+				type result struct {
+					response *connect.Response[tidev1.CreateApiKeyResponse]
+					err      error
+				}
+				done := make(chan result, 1)
+				go func() {
+					resp, err := member.APIKey.CreateApiKey(ctx, connect.NewRequest(&tidev1.CreateApiKeyRequest{
+						OrganizationId: org.ID, Name: "locked", ExpiresAt: timestamppb.New(expires),
+					}))
+					done <- result{response: resp, err: err}
+				}()
+				waitForLockWaiter(t, env)
+				env.Clock.Advance(tc.elapsed)
+				checkTime := env.Clock.Now()
+				release()
+				got := <-done
+
+				wantWrites := 0
+				if tc.accept {
+					if got.err != nil {
+						t.Fatal(got.err)
+					}
+					key := got.response.Msg.GetApiKey()
+					if key.GetState() != tidev1.ApiKeyState_API_KEY_STATE_ACTIVE || got.response.Msg.GetSecret() == "" ||
+						!key.GetCreatedAt().AsTime().Equal(checkTime) || !key.GetExpiresAt().AsTime().Equal(expires) {
+						t.Fatal("expected an active key with a secret, the post-lock creation time, and the requested expiry")
+					}
+					var storedTime time.Time
+					if err := env.DB.Pool.QueryRow(ctx, "SELECT create_time FROM api_keys WHERE api_key_id = $1", key.GetApiKeyId()).Scan(&storedTime); err != nil {
+						t.Fatal(err)
+					}
+					if !storedTime.Equal(checkTime) {
+						t.Errorf("stored creation time = %v, want %v", storedTime, checkTime)
+					}
+					wantWrites = 1
+				} else {
+					wantCode(t, "expiry reached during lock wait", got.err, connect.CodeInvalidArgument)
+					if got.err.Error() != "invalid_argument: invalid expires_at: must be in the future" || got.response != nil {
+						t.Errorf("error = %v, response present = %v", got.err, got.response != nil)
+					}
+				}
+
+				var keys int
+				if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM api_keys WHERE organization_id = $1 AND user_id = $2", org.ID, org.Member).Scan(&keys); err != nil {
+					t.Fatal(err)
+				}
+				if keys != wantWrites {
+					t.Errorf("key rows = %d, want %d", keys, wantWrites)
+				}
+				if events := countAction(auditActions(t, env, org.ID), tidev1.AuditAction_AUDIT_ACTION_API_KEY_CREATED); events != wantWrites {
+					t.Errorf("key creation audit events = %d, want %d", events, wantWrites)
+				}
+			})
+		}
 	}
 }
 
