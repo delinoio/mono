@@ -215,7 +215,9 @@ func (a *app) parseUntil(fs *flag.FlagSet, args []string, stopAfter int) ([]stri
 	for {
 		if err := fs.Parse(args); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
-				a.printFlags(fs)
+				if err := a.printFlags(fs); err != nil {
+					return nil, err
+				}
 				return nil, &exitError{code: ExitOK}
 			}
 			return nil, usageErr("%s: %v", fs.Name(), err)
@@ -266,15 +268,19 @@ func endedWithTerminator(fs *flag.FlagSet, consumed []string) bool {
 
 const rootFlagSetName = "tide"
 
-func (a *app) printFlags(fs *flag.FlagSet) {
+func (a *app) printFlags(fs *flag.FlagSet) error {
 	if fs.Name() == rootFlagSetName {
-		a.usage(a.env.Stdout)
-		return
+		return a.usage(a.env.Stdout)
 	}
-	fmt.Fprintf(a.env.Stdout, "Usage: tide %s [flags]\n\nFlags:\n", fs.Name())
-	fs.SetOutput(a.env.Stdout)
+	// PrintDefaults has no error return. Capture the first write error
+	// across the header and flag list.
+	w := &stickyWriter{w: a.env.Stdout}
+	fmt.Fprintf(w, "Usage: tide %s [flags]\n\nFlags:\n", fs.Name())
+	previousOutput := fs.Output()
+	fs.SetOutput(w)
 	fs.PrintDefaults()
-	fs.SetOutput(io.Discard)
+	fs.SetOutput(previousOutput)
+	return w.err
 }
 
 func (a *app) applyGlobals() error {
@@ -301,17 +307,16 @@ func (a *app) run(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(rest) == 0 {
-		a.usage(a.env.Stderr)
+		_ = a.usage(a.env.Stderr)
 		return &exitError{code: ExitUsage}
 	}
 	group := rest[0]
 	switch group {
 	case "help", "-h", "--help":
-		a.usage(a.env.Stdout)
-		return nil
+		return a.usage(a.env.Stdout)
 	case "version":
-		fmt.Fprintln(a.env.Stdout, "tide "+Version)
-		return nil
+		_, err := fmt.Fprintln(a.env.Stdout, "tide "+Version)
+		return err
 	}
 	if cmd, ok := singleCommands[group]; ok {
 		return cmd(a, ctx, group, rest[1:])
@@ -398,7 +403,8 @@ func init() {
 	}
 }
 
-func (a *app) usage(w io.Writer) {
+func (a *app) usage(out io.Writer) error {
+	w := &stickyWriter{w: out}
 	fmt.Fprint(w, `Usage: tide [global flags] <command> [subcommand] [flags] [arguments]
 
 Commands:
@@ -429,6 +435,7 @@ for 'tide session' and 'tide mcp'; otherwise the CLI uses the tokens that
 'tide login' stored. Credentials are read from standard input or from the
 file of a --*-file flag, never from command-line arguments.
 `)
+	return w.err
 }
 
 // store returns the credential store.
