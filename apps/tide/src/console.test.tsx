@@ -2559,6 +2559,151 @@ describe("invitations", () => {
     expect(storedText()).not.toContain(MOCK_INVITATION_SECRET);
   });
 
+  const invalidInvitationNotice =
+    "It was not found, or you no longer have access to it.";
+
+  function invitationInput() {
+    return screen.getByLabelText<HTMLInputElement>("Invitation link or secret");
+  }
+
+  async function changeInvitationHash(hash: string) {
+    await act(async () => {
+      window.history.replaceState(null, "", hash);
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+  }
+
+  test("consumes a replacement link in place and submits only its secret", async () => {
+    const path = "/invitations/accept?source=fixture";
+    const firstSecret = "tdi_fixture_a";
+    const mock = createMockTransport();
+    const requested = rs.fn();
+    renderConsole(`${path}#secret=${firstSecret}`, {
+      transport: {
+        ...mock,
+        unary(method, ...args) {
+          if (method.name === MemberService.method.acceptInvitation.name) {
+            requested(args[3]);
+          }
+          return mock.unary(method, ...args);
+        },
+      },
+    });
+    const input = invitationInput();
+    expect(input.value).toBe(firstSecret);
+    expect(window.location.hash).toBe("");
+
+    await changeInvitationHash(`#secret=${MOCK_INVITATION_SECRET}`);
+
+    expect(invitationInput()).toBe(input);
+    expect(input.value).toBe(MOCK_INVITATION_SECRET);
+    expect(window.location.pathname + window.location.search).toBe(path);
+    expect(window.location.hash).toBe("");
+    expect(requested).not.toHaveBeenCalled();
+    expect(storedText()).not.toContain(firstSecret);
+    expect(storedText()).not.toContain(MOCK_INVITATION_SECRET);
+
+    await click(screen.getByRole("button", { name: "Join organization" }));
+
+    await waitFor(() =>
+      expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.contoso}`),
+    );
+    expect(requested).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ invitationSecret: MOCK_INVITATION_SECRET }),
+    );
+    expect(storedText()).not.toContain(firstSecret);
+    expect(storedText()).not.toContain(MOCK_INVITATION_SECRET);
+  });
+
+  test("clears input and request errors and preserves the field for a fragment without a secret", async () => {
+    renderConsole("/invitations/accept");
+    const join = screen.getByRole("button", { name: "Join organization" });
+    await click(join);
+    expect(
+      screen.getByText("Paste the invitation link or the secret."),
+    ).toBeTruthy();
+
+    await changeInvitationHash("#secret=tdi_fixture_a");
+    expect(
+      screen.queryByText("Paste the invitation link or the secret."),
+    ).toBeNull();
+    await click(join);
+    expect(await screen.findByText(invalidInvitationNotice)).toBeTruthy();
+
+    await changeInvitationHash(`#secret=${MOCK_INVITATION_SECRET}`);
+    expect(screen.queryByText(invalidInvitationNotice)).toBeNull();
+    await changeInvitationHash("#source=fixture");
+    expect(invitationInput().value).toBe(MOCK_INVITATION_SECRET);
+  });
+
+  test.each(["success", "error"] as const)(
+    "keeps a replacement link active after a late accept %s",
+    async (result) => {
+      const { transport, release, requested } = holdInvitationAccept();
+      const queryClient = renderConsole("/", {
+        transport,
+        staleTime: Infinity,
+      });
+      expect(
+        await screen.findByRole("link", { name: /Acme Robotics/ }),
+      ).toBeTruthy();
+      expect(screen.queryByRole("link", { name: /Contoso/ })).toBeNull();
+      const firstSecret =
+        result === "success" ? MOCK_INVITATION_SECRET : "tdi_fixture_a";
+      await act(async () => {
+        window.history.pushState(
+          null,
+          "",
+          `/invitations/accept#secret=${firstSecret}`,
+        );
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+
+      const join = screen.getByRole<HTMLButtonElement>("button", {
+        name: "Join organization",
+      });
+      await click(join);
+      expect(join.disabled).toBe(true);
+      await changeInvitationHash("#secret=tdi_follow_up_invitation");
+
+      expect(join.disabled).toBe(false);
+      expect(requested).toHaveBeenCalledTimes(1);
+      await act(async () => release());
+      await waitFor(() =>
+        expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+          result,
+        ),
+      );
+      expect(window.location.pathname).toBe("/invitations/accept");
+      expect(invitationInput().value).toBe("tdi_follow_up_invitation");
+      expect(screen.queryByText(invalidInvitationNotice)).toBeNull();
+
+      if (result === "success") {
+        await click(screen.getByRole("link", { name: "tide" }));
+        expect(
+          await screen.findByRole("link", { name: /Contoso/ }),
+        ).toBeTruthy();
+      }
+    },
+  );
+
+  test("removes the invitation hash listener when the route unmounts", async () => {
+    const addListener = rs.spyOn(window, "addEventListener");
+    const removeListener = rs.spyOn(window, "removeEventListener");
+    try {
+      renderConsole("/invitations/accept#secret=tdi_fixture_a");
+      const listener = addListener.mock.calls.find(
+        ([event]) => event === "hashchange",
+      )?.[1];
+      expect(listener).toBeDefined();
+      await click(screen.getByRole("link", { name: "tide" }));
+      expect(removeListener).toHaveBeenCalledWith("hashchange", listener);
+    } finally {
+      addListener.mockRestore();
+      removeListener.mockRestore();
+    }
+  });
+
   test.each(["the tide link", "browser Back"])(
     "refreshes organizations without navigating after the user leaves via %s",
     async (departure) => {
