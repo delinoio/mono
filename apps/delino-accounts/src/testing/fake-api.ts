@@ -302,26 +302,25 @@ export function createFakeApi({
     }
   };
   /**
-   * Serves one page of a list like the server: at most `pageSize` items and
-   * a `next_page_token` that is empty on the last page. A token is `p<n>`,
-   * the index of the page. ListBillingAccounts, ListMembers,
-   * ListInvitations, ListLinkedOrganizations, ListLedgerEntries,
-   * ListInvoices and ListUsageSummary page; every other list returns all of
-   * its items.
+   * Returns at most `pageSize` items. The last page has an empty token.
+   * Each nonempty token stores the next unread row's offset independently
+   * of the requested page size.
+   * ListBillingAccounts, ListMembers, ListInvitations, ListLinkedOrganizations,
+   * ListLedgerEntries, ListInvoices and ListUsageSummary use this helper.
    */
   const paginate = <T>(
     items: T[],
     req: { pageSize: number; pageToken: string },
   ): { page: T[]; nextPageToken: string } => {
     const size = req.pageSize > 0 ? Math.min(req.pageSize, 200) : 50;
-    const index = req.pageToken === "" ? 0 : Number(req.pageToken.slice(1));
     if (!/^(|p\d+)$/.test(req.pageToken)) {
       throw new ConnectError("invalid page token", Code.InvalidArgument);
     }
-    const start = index * size;
+    const start = req.pageToken === "" ? 0 : Number(req.pageToken.slice(1));
+    const end = start + size;
     return {
-      page: items.slice(start, start + size),
-      nextPageToken: start + size < items.length ? `p${index + 1}` : "",
+      page: items.slice(start, end),
+      nextPageToken: end < items.length ? `p${end}` : "",
     };
   };
   const member = (account: FakeAccount) =>

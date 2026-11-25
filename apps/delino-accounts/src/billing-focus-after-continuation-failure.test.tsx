@@ -63,12 +63,14 @@ describe("focus of the tab while a complete list is read", () => {
     ) as HTMLElement;
     const rows = () => listRows("Billing accounts");
     expect(rows()).toHaveLength(200);
-    expect(pageTokens(api)).toEqual(["", "p1"]);
+    const requestsBeforeFocus = pageTokens(api);
+    expect(requestsBeforeFocus).toEqual(["", expect.stringMatching(/./)]);
+    const failedToken = requestsBeforeFocus[1];
 
     await focusTab();
     await focusTab();
     // The focus sends no request and keeps the rows and the notice.
-    expect(pageTokens(api)).toEqual(["", "p1"]);
+    expect(pageTokens(api)).toEqual(requestsBeforeFocus);
     expect(rows()).toHaveLength(200);
     expect(screen.getByText(/Some items did not load/)).toBe(
       within(notice).getByText(/Some items did not load/),
@@ -77,7 +79,7 @@ describe("focus of the tab while a complete list is read", () => {
     // The retry requests the failed token first and the list then completes.
     await click(within(notice).getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(rows()).toHaveLength(201));
-    expect(pageTokens(api)).toEqual(["", "p1", "p1"]);
+    expect(pageTokens(api)).toEqual([...requestsBeforeFocus, failedToken]);
     expect(screen.queryByText(/Some items did not load/)).toBeNull();
   });
 
@@ -86,12 +88,15 @@ describe("focus of the tab while a complete list is read", () => {
     addBillingAccounts(api, 200);
     renderApp("/billing", { api });
     await waitFor(() => expect(listRows("Billing accounts")).toHaveLength(201));
-    expect(pageTokens(api)).toEqual(["", "p1"]);
+    expect(pageTokens(api)).toEqual(["", expect.stringMatching(/./)]);
 
     await focusTab();
     await waitFor(() => expect(pageTokens(api).length).toBeGreaterThan(2));
     // The refresh starts with the empty token and continues in order.
-    expect(pageTokens(api).slice(2, 4)).toEqual(["", "p1"]);
+    expect(pageTokens(api).slice(2, 4)).toEqual([
+      "",
+      expect.stringMatching(/./),
+    ]);
     expect(listRows("Billing accounts")).toHaveLength(201);
   });
 });

@@ -157,14 +157,19 @@ for (const entry of lists) {
         '[role="alert"]',
       ) as HTMLElement;
       expect(rowCount(entry.list)).toBe(entry.firstPage);
-      expect(pageTokens(api, entry.method)).toEqual(["", "p1"]);
+      const requestsBeforeRetry = pageTokens(api, entry.method);
+      expect(requestsBeforeRetry).toEqual(["", expect.stringMatching(/./)]);
+      const failedToken = requestsBeforeRetry[1];
       // The button still reads on, and no request starts by itself.
       expect(moreButton(entry.more)!.disabled).toBe(false);
 
       await click(within(notice).getByRole("button", { name: TRY_AGAIN }));
       await waitFor(() => expect(rowCount(entry.list)).toBe(entry.total));
       // The retry sent the failed cursor, not a refetch of the first page.
-      expect(pageTokens(api, entry.method)).toEqual(["", "p1", "p1"]);
+      expect(pageTokens(api, entry.method)).toEqual([
+        ...requestsBeforeRetry,
+        failedToken,
+      ]);
       expect(screen.queryByText(UNAVAILABLE)).toBeNull();
       expect(moreButton(entry.more)).toBeNull();
     });
@@ -178,7 +183,10 @@ for (const entry of lists) {
       const signIn = await screen.findByText(SIGN_IN, { selector: "button" });
       expect(rowCount(entry.list)).toBe(entry.firstPage);
       expect(screen.queryByText(TRY_AGAIN, { selector: "button" })).toBeNull();
-      expect(pageTokens(api, entry.method)).toEqual(["", "p1"]);
+      expect(pageTokens(api, entry.method)).toEqual([
+        "",
+        expect.stringMatching(/./),
+      ]);
       await click(signIn);
       expect(signIns).toHaveLength(1);
       expect(rowCount(entry.list)).toBe(entry.firstPage);

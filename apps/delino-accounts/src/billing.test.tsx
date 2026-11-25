@@ -2008,6 +2008,8 @@ function pageTokens(api: ReturnType<typeof createFakeApi>, method: string) {
   return calls(api, method).map((request) => request.pageToken);
 }
 
+const nonemptyPageToken = expect.stringMatching(/./);
+
 describe("paged lists", () => {
   describe("billing accounts", () => {
     test("reads every page in server order", async () => {
@@ -2023,7 +2025,10 @@ describe("paged lists", () => {
       expect(titles[0]).toBe("Acme Robotics");
       expect(titles[1]).toBe(`Account ${numbered(1)}`);
       expect(titles[200]).toBe(`Account ${numbered(200)}`);
-      expect(pageTokens(api, "ListBillingAccounts")).toEqual(["", "p1"]);
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual([
+        "",
+        nonemptyPageToken,
+      ]);
       expect(calls(api, "ListBillingAccounts")[1]).toMatchObject({
         pageSize: 200,
       });
@@ -2065,7 +2070,9 @@ describe("paged lists", () => {
       expect(rowTitles(list)).toHaveLength(200);
       expect(await screen.findByText(/Some items did not load/)).toBeTruthy();
       // The failure stops the loop: no further request until the retry.
-      expect(pageTokens(api, "ListBillingAccounts")).toEqual(["", "p1"]);
+      const requestsBeforeRetry = pageTokens(api, "ListBillingAccounts");
+      expect(requestsBeforeRetry).toEqual(["", nonemptyPageToken]);
+      const failedToken = requestsBeforeRetry[1];
       await click(screen.getByRole("button", { name: "Try again" }));
       await settle(100);
       const titles = rowTitles(
@@ -2074,7 +2081,10 @@ describe("paged lists", () => {
       expect(titles).toHaveLength(201);
       expect(new Set(titles).size).toBe(201);
       expect(screen.queryByText(/Some items did not load/)).toBeNull();
-      expect(pageTokens(api, "ListBillingAccounts")).toEqual(["", "p1", "p1"]);
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual([
+        ...requestsBeforeRetry,
+        failedToken,
+      ]);
     });
 
     test("opens the last account of the second page", async () => {
@@ -2116,7 +2126,7 @@ describe("paged lists", () => {
           }),
           expect.objectContaining({
             billingAccountId: ACCOUNT_ID,
-            pageToken: "p1",
+            pageToken: nonemptyPageToken,
           }),
         ]);
         const last = listItems(list)[200]!;
@@ -2190,6 +2200,9 @@ describe("paged lists", () => {
       const list = await screen.findByRole("list", { name: "Members" });
       await settle(100);
       expect(rowTitles(list)).toHaveLength(200);
+      const requestsBeforeRetry = pageTokens(api, "ListMembers");
+      expect(requestsBeforeRetry).toEqual(["", nonemptyPageToken]);
+      const failedToken = requestsBeforeRetry[1];
       await click(screen.getByRole("button", { name: "Try again" }));
       await settle(100);
       const titles = rowTitles(
@@ -2197,7 +2210,10 @@ describe("paged lists", () => {
       );
       expect(titles).toHaveLength(201);
       expect(new Set(titles).size).toBe(201);
-      expect(pageTokens(api, "ListMembers")).toEqual(["", "p1", "p1"]);
+      expect(pageTokens(api, "ListMembers")).toEqual([
+        ...requestsBeforeRetry,
+        failedToken,
+      ]);
       const members = screen.getByRole("list", { name: "Members" });
       expect(within(members).queryByRole("button")).toBeNull();
       expect(within(members).queryByRole("combobox")).toBeNull();
@@ -2228,7 +2244,7 @@ describe("paged lists", () => {
         }),
         expect.objectContaining({
           billingAccountId: ACCOUNT_ID,
-          pageToken: "p1",
+          pageToken: nonemptyPageToken,
         }),
       ]);
     });
@@ -2270,6 +2286,9 @@ describe("paged lists", () => {
       });
       await settle(100);
       expect(rowTitles(list)).toHaveLength(200);
+      const requestsBeforeRetry = pageTokens(api, "ListLinkedOrganizations");
+      expect(requestsBeforeRetry).toEqual(["", nonemptyPageToken]);
+      const failedToken = requestsBeforeRetry[1];
       await click(screen.getByRole("button", { name: "Try again" }));
       await settle(100);
       const titles = rowTitles(
@@ -2278,9 +2297,8 @@ describe("paged lists", () => {
       expect(titles).toHaveLength(201);
       expect(new Set(titles).size).toBe(201);
       expect(pageTokens(api, "ListLinkedOrganizations")).toEqual([
-        "",
-        "p1",
-        "p1",
+        ...requestsBeforeRetry,
+        failedToken,
       ]);
     });
 
@@ -2345,7 +2363,7 @@ describe("paged lists", () => {
         }),
         expect.objectContaining({
           billingAccountId: ACCOUNT_ID,
-          pageToken: "p1",
+          pageToken: nonemptyPageToken,
         }),
       ]);
       const last = listItems(list)[200]!;
@@ -2396,6 +2414,9 @@ describe("paged lists", () => {
       });
       await settle(100);
       expect(rowTitles(list)).toHaveLength(200);
+      const requestsBeforeRetry = pageTokens(api, "ListInvitations");
+      expect(requestsBeforeRetry).toEqual(["", nonemptyPageToken]);
+      const failedToken = requestsBeforeRetry[1];
       await click(screen.getByRole("button", { name: "Try again" }));
       await settle(100);
       const titles = rowTitles(
@@ -2403,7 +2424,10 @@ describe("paged lists", () => {
       );
       expect(titles).toHaveLength(201);
       expect(new Set(titles).size).toBe(201);
-      expect(pageTokens(api, "ListInvitations")).toEqual(["", "p1", "p1"]);
+      expect(pageTokens(api, "ListInvitations")).toEqual([
+        ...requestsBeforeRetry,
+        failedToken,
+      ]);
     });
   });
 });
@@ -2692,7 +2716,7 @@ describe("continuation of the billing history lists", () => {
         expect(moreButton(entry).disabled).toBe(false);
         await click(moreButton(entry));
         await settle(60);
-        expect(pageTokens(api, entry.method)).toEqual(["", "p1"]);
+        expect(pageTokens(api, entry.method)).toEqual(["", nonemptyPageToken]);
         expect(rowCount(entry.list)).toBe(entry.total);
         expect(screen.queryByRole("button", { name: entry.more })).toBeNull();
       });
@@ -2721,7 +2745,11 @@ describe("continuation of the billing history lists", () => {
         expect(moreButton(entry).disabled).toBe(false);
         await click(moreButton(entry));
         await settle(60);
-        expect(pageTokens(api, entry.method)).toEqual(["", "", "p1"]);
+        expect(pageTokens(api, entry.method)).toEqual([
+          "",
+          "",
+          nonemptyPageToken,
+        ]);
         expect(rowCount(entry.list)).toBe(entry.total);
       });
 
@@ -2743,7 +2771,12 @@ describe("continuation of the billing history lists", () => {
         expect(moreButton(entry).disabled).toBe(false);
         await click(moreButton(entry));
         await settle(60);
-        expect(pageTokens(api, entry.method)).toEqual(["", "", "", "p1"]);
+        expect(pageTokens(api, entry.method)).toEqual([
+          "",
+          "",
+          "",
+          nonemptyPageToken,
+        ]);
         expect(rowCount(entry.list)).toBe(entry.total);
       });
 
