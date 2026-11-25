@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation } from "@connectrpc/connect-query";
+import { createConnectQueryKey, useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { PasswordInput } from "delino-ui/password-input";
 import { Button } from "delino-ui/button";
 import { MemberService } from "@delino/tide-protos/v1/member_pb";
 import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { invalidateServices } from "../api.ts";
 import { TopBar } from "../components/shell.tsx";
 import { ErrorNotice, PageHeader } from "../components/ui.tsx";
 import {
@@ -14,6 +13,7 @@ import {
   secretFromInput,
   takeSecretFromAddress,
 } from "../invitation.ts";
+import { refreshOrganizations } from "../organizations.ts";
 import { orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
 
 /**
@@ -29,7 +29,17 @@ export function InvitationPage() {
   const currentAttempt = useRef(0);
   const accept = useMutation(MemberService.method.acceptInvitation, {
     // Joining changes the organization list even if the user has moved on.
-    onSuccess: () => invalidateServices(queryClient, OrganizationService),
+    onSuccess: async () => {
+      await Promise.all([
+        refreshOrganizations(queryClient),
+        queryClient.invalidateQueries({
+          queryKey: createConnectQueryKey({
+            schema: OrganizationService.method.getOrganization,
+            cardinality: undefined,
+          }),
+        }),
+      ]);
+    },
   });
   const resetAccept = accept.reset;
   useEffect(() => {

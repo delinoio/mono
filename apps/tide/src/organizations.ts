@@ -44,7 +44,7 @@ export function useOrganizations(enabled = true) {
   });
 }
 
-/** Restarts a load that may have begun before the organization was created. */
+/** Restarts a load that may have begun before the user created or joined an organization. */
 export async function refreshOrganizations(queryClient: QueryClient) {
   const queryKey = createConnectQueryKey({
     schema: listOrganizations,

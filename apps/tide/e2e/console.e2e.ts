@@ -1183,6 +1183,11 @@ describe("invitations", () => {
     );
     await screen.getByRole("combobox", "Organization").tap();
     await expect(screen.getByRole("option", "Contoso")).toBeVisible();
+
+    await browser.keyboard.press("Escape");
+    await screen.getByRole("link", "tide", { exact: true }).tap();
+    await expect(browser).toHaveURL(/\/$/);
+    await expect(screen.getByRole("link", "Contoso Member")).toBeVisible();
   });
 
   test("an expired invitation link keeps the user on the invitation page", async ({
