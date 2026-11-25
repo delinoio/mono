@@ -105,6 +105,8 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { rt.Close() })
+	defer logFailedVMConsoles(t, vmsDir)
 	caps := rt.Capabilities(context.Background())
 	windowsCheck := false
 	for _, c := range caps.Checks {
@@ -120,19 +122,16 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(m.Close)
 	d, err := ops.New(m, st, ops.Options{Logger: logger})
+	// A persistence failure can return both a dispatcher and an error.
+	if d != nil {
+		t.Cleanup(d.Close)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	m.SetExecTracker(d)
-	t.Cleanup(func() {
-		if t.Failed() {
-			consoleTail(t, vmsDir)
-		}
-		d.Close()
-		m.Close()
-		rt.Close()
-	})
 	e := &env{t: t, m: m, d: d}
 	vcpus, mem := max(meta.MinimumCPUCount, 2), max(meta.MinimumMemoryMiB, 4096)
 	create := func(snapshotID string, network ownsandv1.NetworkMode) (*ownsandv1.SandboxStateEntry, error) {
