@@ -3,6 +3,7 @@
 package devsession
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"testing/synctest"
@@ -17,7 +18,7 @@ const testWriteKey = "sandbox/write"
 
 func acquireTestWrite(t *testing.T, w *writes) *writeEntry {
 	t.Helper()
-	e, err := w.acquire(testWriteKey, "/file", func() (ownsandclient.FileWrite, error) { return nil, nil })
+	e, err := w.acquire(t.Context(), testWriteKey, "/file", func() (ownsandclient.FileWrite, error) { return nil, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +117,71 @@ func TestWriteTerminalReleasePreservesReplacement(t *testing.T) {
 				// Run a stale callback as if it had already started when the timer stopped.
 				w.expire(testWriteKey, original)
 				checkCachedWrite(t, w, replacement)
+			})
+		})
+	}
+}
+
+func TestWriteWaitHonorsContext(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		deadline bool
+		want     error
+	}{
+		{name: "cancel", want: context.Canceled},
+		{name: "deadline", deadline: true, want: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				w := newWrites()
+				active := acquireTestWrite(t, w)
+				defer w.release(testWriteKey, active, false, nil)
+
+				var ctx context.Context
+				var cancel context.CancelFunc
+				if tc.deadline {
+					ctx, cancel = context.WithTimeout(t.Context(), time.Second)
+				} else {
+					ctx, cancel = context.WithCancel(t.Context())
+				}
+				defer cancel()
+				open := func() (ownsandclient.FileWrite, error) {
+					return nil, errors.New("unexpected handle open")
+				}
+				result := make(chan error, 1)
+				go func() {
+					entry, err := w.acquire(ctx, testWriteKey, "/file", open)
+					if err == nil {
+						w.release(testWriteKey, entry, false, nil)
+					}
+					result <- err
+				}()
+				synctest.Wait()
+				select {
+				case err := <-result:
+					t.Fatalf("waiter returned before context ended: %v", err)
+				default:
+				}
+
+				if tc.deadline {
+					time.Sleep(time.Second)
+				} else {
+					cancel()
+				}
+				synctest.Wait()
+				select {
+				case err := <-result:
+					if !errors.Is(err, tc.want) {
+						t.Fatalf("waiter error = %v, want %v", err, tc.want)
+					}
+				default:
+					t.Fatal("waiter did not return while the active chunk held the entry")
+				}
+				checkCachedWrite(t, w, active)
+
+				if _, err := w.acquire(ctx, "new/write", "/file", open); !errors.Is(err, tc.want) {
+					t.Fatalf("new write with ended context = %v, want %v", err, tc.want)
+				}
 			})
 		})
 	}

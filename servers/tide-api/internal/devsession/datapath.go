@@ -392,7 +392,7 @@ type writes struct {
 }
 
 type writeEntry struct {
-	mu       sync.Mutex // Serializes chunks and protects the expiry state.
+	busy     chan struct{} // Holds one token while a chunk or the expiry callback owns the entry.
 	fw       ownsandclient.FileWrite
 	path     string
 	deadline time.Time
@@ -403,38 +403,50 @@ const writeIdle = 20 * time.Minute
 
 func newWrites() *writes { return &writes{entries: map[string]*writeEntry{}} }
 
-// acquire returns the current entry with its mutex held until release.
-func (w *writes) acquire(key, path string, open func() (ownsandclient.FileWrite, error)) (*writeEntry, error) {
+// acquire returns the current entry with exclusive ownership until release.
+func (w *writes) acquire(ctx context.Context, key, path string, open func() (ownsandclient.FileWrite, error)) (*writeEntry, error) {
 	for {
-		e, err := w.getOrOpen(key, path, open)
+		e, err := w.getOrOpen(ctx, key, path, open)
 		if err != nil {
 			return nil, err
 		}
-		e.mu.Lock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case e.busy <- struct{}{}:
+		}
 		w.mu.Lock()
 		current := w.entries[key] == e
 		w.mu.Unlock()
+		// Cancellation can race with the entry becoming available.
+		if err := ctx.Err(); err != nil {
+			<-e.busy
+			return nil, err
+		}
 		if !current {
 			// Another chunk or the timer removed this entry while we waited.
-			e.mu.Unlock()
+			<-e.busy
 			continue
 		}
 		if !time.Now().Before(e.deadline) {
 			w.drop(key, e)
-			e.mu.Unlock()
+			<-e.busy
 			continue
 		}
 		if e.path != path {
-			e.mu.Unlock()
+			<-e.busy
 			return nil, api.ErrInvalidf("invalid path: every chunk of a write_id must name the same path")
 		}
 		return e, nil
 	}
 }
 
-func (w *writes) getOrOpen(key, path string, open func() (ownsandclient.FileWrite, error)) (*writeEntry, error) {
+func (w *writes) getOrOpen(ctx context.Context, key, path string, open func() (ownsandclient.FileWrite, error)) (*writeEntry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if e := w.entries[key]; e != nil {
 		return e, nil
 	}
@@ -442,15 +454,15 @@ func (w *writes) getOrOpen(key, path string, open func() (ownsandclient.FileWrit
 	if err != nil {
 		return nil, err
 	}
-	e := &writeEntry{fw: fw, path: path, deadline: time.Now().Add(writeIdle)}
+	e := &writeEntry{busy: make(chan struct{}, 1), fw: fw, path: path, deadline: time.Now().Add(writeIdle)}
 	w.entries[key] = e
 	e.timer = time.AfterFunc(time.Until(e.deadline), func() { w.expire(key, e) })
 	return e, nil
 }
 
 func (w *writes) expire(key string, e *writeEntry) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.busy <- struct{}{}
+	defer func() { <-e.busy }()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.entries[key] != e {
@@ -464,7 +476,7 @@ func (w *writes) expire(key string, e *writeEntry) {
 	delete(w.entries, key)
 }
 
-// drop removes the current entry while its mutex is held.
+// drop removes the current entry while the caller owns it.
 func (w *writes) drop(key string, e *writeEntry) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -473,7 +485,7 @@ func (w *writes) drop(key string, e *writeEntry) {
 }
 
 func (w *writes) release(key string, e *writeEntry, finished bool, err error) {
-	defer e.mu.Unlock()
+	defer func() { <-e.busy }()
 	if finished || connect.CodeOf(err) == connect.CodeNotFound {
 		w.drop(key, e)
 	} else if err == nil {
@@ -520,7 +532,7 @@ func (h *Handler) WriteDevSessionFile(ctx context.Context, req *connect.Request[
 	}
 	sandboxID := sess.runner.SandboxID
 	key := sandboxID + "/" + writeID
-	entry, err := h.writes.acquire(key, path, func() (ownsandclient.FileWrite, error) {
+	entry, err := h.writes.acquire(ctx, key, path, func() (ownsandclient.FileWrite, error) {
 		fw, err := client.OpenFileWrite(sandboxID, ownsand.FileWriteParams{WriteID: writeID, Path: path, BindingSalt: h.bindingSalt(sandboxID, writeID)})
 		if err != nil {
 			return nil, fileTransferError(err)
