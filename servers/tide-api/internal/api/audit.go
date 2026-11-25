@@ -4,9 +4,11 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
@@ -57,11 +59,33 @@ func (h AuditHandler) ListAuditEvents(ctx context.Context, req *connect.Request[
 	if err != nil {
 		return nil, err
 	}
-	// UUID v7 IDs increase with their creation time, so the ID order is the
-	// time order.
-	rows, err := h.DB.Pool.Query(ctx, `SELECT audit_event_id::text, action, actor_user_id, COALESCE(actor_api_key_id::text, ''), target_kind, target_id, subject_user_id, create_time
-		FROM audit_events WHERE organization_id = $1 AND audit_event_id < $2 ORDER BY audit_event_id DESC LIMIT $3`,
-		c.OrganizationID, BeforeKey(after), limit)
+	var q db.Querier = h.DB.Pool
+	query := `SELECT audit_event_id::text, action, actor_user_id, COALESCE(actor_api_key_id::text, ''), target_kind, target_id, subject_user_id, create_time
+		FROM audit_events WHERE organization_id = $1`
+	args := []any{c.OrganizationID, limit}
+	if after != "" {
+		// Read the anchor and the page from the same snapshot so retention
+		// cannot remove the anchor between the two reads.
+		tx, err := h.DB.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		if err != nil {
+			return nil, h.Internal(ctx, "begin audit events page", err)
+		}
+		defer tx.Rollback(ctx)
+
+		var anchorTime time.Time
+		err = tx.QueryRow(ctx, `SELECT create_time FROM audit_events
+			WHERE organization_id = $1 AND audit_event_id = $2`, c.OrganizationID, after).Scan(&anchorTime)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrInvalidf("invalid page_token")
+		}
+		if err != nil {
+			return nil, h.Internal(ctx, "find audit events page anchor", err)
+		}
+		q = tx
+		query += " AND (create_time, audit_event_id) < ($3, $4)"
+		args = append(args, anchorTime, after)
+	}
+	rows, err := q.Query(ctx, query+" ORDER BY create_time DESC, audit_event_id DESC LIMIT $2", args...)
 	if err != nil {
 		return nil, h.Internal(ctx, "list audit events", err)
 	}
