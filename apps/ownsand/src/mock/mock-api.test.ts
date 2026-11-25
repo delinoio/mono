@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { timestampFromMs } from "@bufbuild/protobuf/wkt";
+import { type Timestamp, timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { afterEach, describe, expect, rs, test } from "@rstest/core";
 import {
@@ -155,6 +155,119 @@ describe("mock idempotent createSandbox", () => {
   afterEach(() => {
     rs.useRealTimers();
   });
+
+  const timestampNs = ({ seconds, nanos }: Timestamp) =>
+    seconds * 1_000_000_000n + BigInt(nanos);
+
+  test("keeps the full subsecond deadlines on replay", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(1_750_000_000_999);
+    const client = createClient(SandboxService, createMockTransport());
+    const idleTtl = { seconds: 0n, nanos: 500_000 };
+    const maxTtl = { seconds: 0n, nanos: 500_000_000 };
+    const params = { ...request(uuidV7()), idleTtl, maxTtl };
+    const first = await client.createSandbox(params);
+    const sandbox = first.sandbox!;
+
+    expect(sandbox.idleTtl).toMatchObject(idleTtl);
+    expect(sandbox.maxTtl).toMatchObject(maxTtl);
+    expect(sandbox.idleDeadline).toMatchObject({
+      seconds: 1_750_000_000n,
+      nanos: 999_500_000,
+    });
+    expect(sandbox.maxDeadline).toMatchObject({
+      seconds: 1_750_000_001n,
+      nanos: 499_000_000,
+    });
+    const createdAt = timestampNs(sandbox.createTime!);
+    expect(timestampNs(sandbox.idleDeadline!) - createdAt).toBe(500_000n);
+    expect(timestampNs(sandbox.maxDeadline!) - createdAt).toBe(500_000_000n);
+
+    rs.setSystemTime(Date.now() + 1_000);
+    expect(await client.createSandbox(params)).toEqual(first);
+  });
+
+  test("uses one create time for equal TTLs under an advancing clock", async () => {
+    let clock = createTime;
+    const dateNow = rs.spyOn(Date, "now").mockImplementation(() => clock++);
+    try {
+      const client = createClient(SandboxService, createMockTransport());
+      const ttl = { seconds: 1n };
+      const { sandbox } = await client.createSandbox({
+        ...request(uuidV7()),
+        idleTtl: ttl,
+        maxTtl: ttl,
+      });
+
+      expect(sandbox?.idleDeadline).toEqual(sandbox?.maxDeadline);
+      expect(
+        timestampNs(sandbox!.idleDeadline!) - timestampNs(sandbox!.createTime!),
+      ).toBe(1_000_000_000n);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  test("accepts a maximum TTL of exactly seven days", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const { sandbox } = await client.createSandbox({
+      ...request(uuidV7()),
+      maxTtl: { seconds: 604_800n },
+    });
+    const createdAt = timestampNs(sandbox!.createTime!);
+
+    expect(timestampNs(sandbox!.idleDeadline!) - createdAt).toBe(
+      600_000_000_000n,
+    );
+    expect(timestampNs(sandbox!.maxDeadline!) - createdAt).toBe(
+      604_800_000_000_000n,
+    );
+  });
+
+  test.each([
+    ["missing idle TTL", { idleTtl: undefined }],
+    ["missing maximum TTL", { maxTtl: undefined }],
+    ["zero idle TTL", { idleTtl: { seconds: 0n } }],
+    ["zero maximum TTL", { maxTtl: { seconds: 0n } }],
+    ["negative idle TTL", { idleTtl: { seconds: 0n, nanos: -1 } }],
+    ["negative maximum TTL", { maxTtl: { seconds: -1n } }],
+    ["mixed-sign duration", { idleTtl: { seconds: 600n, nanos: -1 } }],
+    [
+      "noncanonical duration",
+      { maxTtl: { seconds: 600n, nanos: 1_000_000_000 } },
+    ],
+    [
+      "duration out of protobuf range",
+      { maxTtl: { seconds: 315_576_000_001n } },
+    ],
+    ["idle TTL above maximum", { idleTtl: { seconds: 3600n, nanos: 1 } }],
+    [
+      "maximum TTL above seven days",
+      { maxTtl: { seconds: 604_800n, nanos: 1 } },
+    ],
+  ] as const)(
+    "rejects %s without creating a sandbox or reserving its key",
+    async (_, invalid) => {
+      const client = createClient(SandboxService, createMockTransport());
+      const params = request(uuidV7());
+      const list = await client.listSandboxes({ organizationId });
+
+      await expect(
+        client.createSandbox({ ...params, ...invalid }),
+      ).rejects.toMatchObject({
+        code: Code.InvalidArgument,
+      });
+      expect(await client.listSandboxes({ organizationId })).toEqual(list);
+      expect(
+        (await client.createSandbox(params)).sandbox?.sandboxId,
+      ).toBeDefined();
+      await expect(
+        client.createSandbox({ ...params, ...invalid }),
+      ).rejects.toMatchObject({
+        code: Code.InvalidArgument,
+      });
+    },
+  );
 
   test("a retry returns the same sandbox and the request labels", async () => {
     const client = createClient(SandboxService, createMockTransport());
