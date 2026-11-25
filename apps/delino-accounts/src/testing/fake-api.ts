@@ -640,8 +640,9 @@ export function createFakeApi({
         };
         return { settings: account.autoTopUp };
       },
-      getAlertSettings(req) {
+      async getAlertSettings(req) {
         record("GetAlertSettings", req);
+        await awaitDeferredCall(api, "GetAlertSettings");
         return {
           settings: {
             lowBalanceThresholdUsdMicros: load(req.billingAccountId).account
@@ -649,8 +650,9 @@ export function createFakeApi({
           },
         };
       },
-      updateAlertSettings(req) {
+      async updateAlertSettings(req) {
         record("UpdateAlertSettings", req);
+        await awaitDeferredCall(api, "UpdateAlertSettings");
         const { account } = load(req.billingAccountId, PAYMENT_ROLES);
         account.alertThreshold = req.settings!.lowBalanceThresholdUsdMicros;
         return {

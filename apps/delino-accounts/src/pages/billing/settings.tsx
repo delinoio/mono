@@ -27,7 +27,6 @@ import {
 import { formatCount } from "../../format.ts";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import {
-  type AlertSettings,
   type AutoTopUpSettings,
   CreditService,
 } from "@delino/accounts-protos/v1/credit_pb";
@@ -354,25 +353,43 @@ function AlertSection() {
         onRetry={() => void settings.refetch()}
       />
       <AlertForm
-        key={String(settings.data.settings?.lowBalanceThresholdUsdMicros)}
-        settings={settings.data.settings}
+        fetchedThreshold={
+          settings.data.settings?.lowBalanceThresholdUsdMicros ??
+          DEFAULT_ALERT_THRESHOLD_USD_MICROS
+        }
+        fetchedAt={settings.dataUpdatedAt}
       />
     </>
   );
 }
 
-function AlertForm({ settings }: { settings: AlertSettings | undefined }) {
+function AlertForm({
+  fetchedThreshold,
+  fetchedAt,
+}: {
+  fetchedThreshold: bigint;
+  fetchedAt: number;
+}) {
   const { billingAccountId, role } = useBillingAccount();
   const queryClient = useQueryClient();
   const update = useMutation(CreditService.method.updateAlertSettings);
   const editable = can(role, Permission.ManagePayments);
-  const [threshold, setThreshold] = useState(
-    toAmountInput(
-      settings?.lowBalanceThresholdUsdMicros ??
-        DEFAULT_ALERT_THRESHOLD_USD_MICROS,
-    ),
-  );
+  const [draft, setDraft] = useState<{ value: string }>();
+  const [lastRead, setLastRead] = useState<{
+    threshold: bigint;
+    fetchedAt: number;
+    savedThreshold?: bigint;
+  }>({ threshold: fetchedThreshold, fetchedAt });
   const [error, setError] = useState<string>();
+  if (
+    lastRead.fetchedAt !== fetchedAt ||
+    lastRead.threshold !== fetchedThreshold
+  ) {
+    // A successful read replaces the saved response without clearing the draft.
+    setLastRead({ threshold: fetchedThreshold, fetchedAt });
+  }
+  const threshold =
+    draft?.value ?? toAmountInput(lastRead.savedThreshold ?? fetchedThreshold);
   return (
     <SettingsForm
       title="Low-balance alert"
@@ -386,10 +403,17 @@ function AlertForm({ settings }: { settings: AlertSettings | undefined }) {
           return;
         }
         setError(undefined);
-        await update.mutateAsync({
+        const saved = await update.mutateAsync({
           billingAccountId,
           settings: { lowBalanceThresholdUsdMicros: checked.value },
         });
+        setLastRead((current) => ({
+          ...current,
+          savedThreshold:
+            saved.settings?.lowBalanceThresholdUsdMicros ?? checked.value,
+        }));
+        // Each edit creates a separate draft, even if its text is the same.
+        setDraft((latest) => (latest === draft ? undefined : latest));
         await invalidateServices(queryClient, CreditService);
         toast.success("The alert is saved.");
       }}
@@ -398,7 +422,7 @@ function AlertForm({ settings }: { settings: AlertSettings | undefined }) {
         label="Alert threshold (USD)"
         description="At least $0.00. The default is $10.00."
         value={threshold}
-        onChange={(event) => setThreshold(event.target.value)}
+        onChange={(event) => setDraft({ value: event.target.value })}
         error={error}
         disabled={!editable}
         inputMode="decimal"
