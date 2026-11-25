@@ -14,6 +14,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -359,6 +361,23 @@ func TestClaudeWorkOrderExpiry(t *testing.T) {
 // the queue with its stored work order, and the next runner uses it.
 func TestClaudeStartFailureKeepsWorkOrder(t *testing.T) {
 	w := newClaudeWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, 0)
+	retry := make(chan struct{})
+	allowRetry := sync.OnceFunc(func() { close(retry) })
+	t.Cleanup(allowRetry)
+	var creates atomic.Int32
+	w.fake.SetCreateHook(func(ctx context.Context) error {
+		if creates.Add(1) == 1 {
+			return nil
+		}
+		// Keep retries from consuming the start budget while the fixture
+		// checks the work order left by the failed first attempt.
+		select {
+		case <-retry:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
 	w.guest.mu.Lock()
 	w.guest.installCode = 12
 	w.guest.mu.Unlock()
@@ -374,6 +393,7 @@ func TestClaudeStartFailureKeepsWorkOrder(t *testing.T) {
 	w.guest.mu.Lock()
 	w.guest.installCode = 0
 	w.guest.mu.Unlock()
+	allowRetry()
 	eventually(t, "the next runner starts", func() bool {
 		r := w.request(t, req.GetRequestId())
 		return r.GetState() == tidev1.RequestState_REQUEST_STATE_RUNNING
