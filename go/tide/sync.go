@@ -185,6 +185,13 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		if len(bad) > 0 {
 			return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleInvalidWindowsName, Paths: bad})
 		}
+		// Windows reads one symbolic link per line. A line break in a
+		// target would make it interpret the remaining bytes as a new entry.
+		for _, f := range local.files {
+			if f.entry.Mode == modeSymlink && strings.ContainsAny(f.target, "\r\n") {
+				return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("tide: symbolic link %q has a target with a line break, which Windows sync cannot send", f.rel))
+			}
+		}
 	}
 	// Check the encoded manifest before taking the lock or uploading anything.
 	// Apply can only make it smaller by leaving out failed Windows links.
