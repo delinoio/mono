@@ -248,6 +248,78 @@ func TestExecCallbackResumeAttach(t *testing.T) {
 	})
 }
 
+func TestExecTruncationCallbackResume(t *testing.T) {
+	rejected := errors.New("truncation rejected")
+	explicit := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_OutputTruncated{
+		OutputTruncated: &tidev1.DevSessionExecOutputTruncated{StdoutOffset: 7, StderrOffset: 9},
+	}}
+	gap := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Stdout{
+		Stdout: &tidev1.DevSessionExecOutput{Offset: 7, Data: []byte("end")},
+	}}
+	exited := &tidev1.DevSessionExecEvent{Event: &tidev1.DevSessionExecEvent_Exited{
+		Exited: &tidev1.DevSessionExecExited{Status: &tidev1.DevSessionExecExited_ExitCode{}},
+	}}
+
+	for _, tc := range []struct {
+		name                     string
+		finalStdout, finalStderr int64
+		missingStderr            ByteRange
+		stdout                   string
+	}{
+		{name: "explicit notice", finalStdout: 7, finalStderr: 9, missingStderr: ByteRange{From: 2, To: 9}},
+		{name: "inferred stdout gap", finalStdout: 10, finalStderr: 2, stdout: "end"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newExecAttachClient(t, func(req *tidev1.AttachDevSessionExecRequest) []*tidev1.DevSessionExecEvent {
+				if tc.missingStderr.Empty() {
+					return []*tidev1.DevSessionExecEvent{gap, exited}
+				}
+				if req.GetStdoutOffset() < 7 || req.GetStderrOffset() < 9 {
+					return []*tidev1.DevSessionExecEvent{explicit, exited}
+				}
+				return []*tidev1.DevSessionExecEvent{exited}
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			params := AttachParams{ExecID: "exec", StdoutOffset: 3, StderrOffset: 2}
+			params.OnEvent = func(ev ExecEvent) error {
+				if ev.Kind == ExecEventOutputTruncated {
+					return rejected
+				}
+				t.Fatalf("unexpected event before truncation: %+v", ev)
+				return nil
+			}
+			_, err := c.AttachExec(ctx, params)
+			se := requireExecCallbackError(t, err, rejected, 3, 2)
+			if se.Err != rejected {
+				t.Fatalf("stream error cause = %v, want the original callback error", se.Err)
+			}
+
+			var got collected
+			params.ExecID, params.StdoutOffset, params.StderrOffset = se.ExecID, se.StdoutOffset, se.StderrOffset
+			params.OnEvent = got.on
+			res, err := c.AttachExec(ctx, params)
+			if err != nil || res.Kind != ExecResultExited || !res.Incomplete ||
+				res.StdoutOffset != tc.finalStdout || res.StderrOffset != tc.finalStderr {
+				t.Fatalf("reattach result = %+v, error = %v", res, err)
+			}
+			wantStdout := ByteRange{From: 3, To: 7}
+			if len(got.truncated) != 1 || got.truncated[0].MissingStdout != wantStdout ||
+				got.truncated[0].MissingStderr != tc.missingStderr || got.stdout.String() != tc.stdout {
+				t.Fatalf("replayed truncation = %+v, stdout = %q, want missing stdout %+v, missing stderr %+v and stdout %q",
+					got.truncated, got.stdout.String(), wantStdout, tc.missingStderr, tc.stdout)
+			}
+
+			params.OnEvent = nil
+			res, err = c.AttachExec(ctx, params)
+			if err != nil || res.Kind != ExecResultExited || !res.Incomplete ||
+				res.StdoutOffset != tc.finalStdout || res.StderrOffset != tc.finalStderr {
+				t.Fatalf("attach with nil callback result = %+v, error = %v", res, err)
+			}
+		})
+	}
+}
+
 func newExecAttachClient(t *testing.T, events func(*tidev1.AttachDevSessionExecRequest) []*tidev1.DevSessionExecEvent) *Client {
 	t.Helper()
 	_, handler := tidev1connect.NewDevSessionServiceHandler(execAttachScript{events: events})

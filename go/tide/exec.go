@@ -442,18 +442,23 @@ func (o *execOp) handle(ev *tidev1.DevSessionExecEvent) (*ExecResult, error) {
 }
 
 func (o *execOp) lose(out, errRange ByteRange) error {
-	o.incomplete = true
+	nextStdout, nextStderr := o.stdout, o.stderr
 	if !out.Empty() {
-		o.stdout = out.To
+		nextStdout = out.To
 	} else {
 		out = ByteRange{}
 	}
 	if !errRange.Empty() {
-		o.stderr = errRange.To
+		nextStderr = errRange.To
 	} else {
 		errRange = ByteRange{}
 	}
-	return o.emit(ExecEvent{Kind: ExecEventOutputTruncated, MissingStdout: out, MissingStderr: errRange})
+	if err := o.emit(ExecEvent{Kind: ExecEventOutputTruncated, MissingStdout: out, MissingStderr: errRange}); err != nil {
+		return err
+	}
+	o.stdout, o.stderr = nextStdout, nextStderr
+	o.incomplete = true
+	return nil
 }
 
 // output reports one chunk. It drops previously acknowledged bytes,
