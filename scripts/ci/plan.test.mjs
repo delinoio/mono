@@ -446,6 +446,7 @@ test("the repository declares release files that exist and select fixtures", (t)
 
 const WORKSPACE_MANIFEST_NAME = "pnpm-workspace.yaml";
 const WORKSPACE_PACKAGES_KEY = "packages:";
+const WORKSPACE_TRAILING_SETTING = "onlyBuiltDependencies:\n  - esbuild\n";
 // A planner-supported workspace glob is exactly "<root>/*": a plain directory
 // path of one or more segments (such as "apps" or "protos/delino") followed by
 // a single-level wildcard. Anything else (negation, "**", relative prefixes,
@@ -522,6 +523,16 @@ function sortedWorkspaceRootsMatch(manifest) {
   assert.deepEqual([...workspacePackageDirs].sort(), entries.dirs.sort());
 }
 
+function workspaceCrossCheckPackages(...extraLines) {
+  return [
+    WORKSPACE_PACKAGES_KEY,
+    ...workspaceRoots.map((root) => `  - ${root}/*`),
+    ...workspacePackageDirs.map((dir) => `  - ${dir}`),
+    ...extraLines,
+    "",
+  ].join("\n");
+}
+
 test("workspace manifest roots match pnpm-workspace.yaml", () => {
   sortedWorkspaceRootsMatch(
     readFileSync(join(root, WORKSPACE_MANIFEST_NAME), "utf8"),
@@ -566,12 +577,10 @@ test("workspace glob parser fails closed on unsupported entries", async (t) => {
 });
 
 test("workspace glob parser reads only the packages block", () => {
-  assert.deepEqual(
-    workspaceGlobRoots(
-      "packages:\n  - apps/*\nonlyBuiltDependencies:\n  - esbuild\n",
-    ),
-    ["apps"],
-  );
+  const packages = workspaceCrossCheckPackages();
+  const manifest = `${packages}${WORKSPACE_TRAILING_SETTING}`;
+  assert.deepEqual(workspaceEntries(manifest), workspaceEntries(packages));
+  sortedWorkspaceRootsMatch(manifest);
 });
 
 test("workspace glob parser skips comment and blank lines inside the packages block", () => {
@@ -584,12 +593,12 @@ test("workspace glob parser skips comment and blank lines inside the packages bl
 });
 
 test("workspace roots cross-check detects a root after a column-zero comment", () => {
-  const current = readFileSync(join(root, WORKSPACE_MANIFEST_NAME), "utf8");
+  const packages = workspaceCrossCheckPackages(
+    "# additional workspace roots",
+    "  - crates/*",
+  );
   assert.throws(
-    () =>
-      sortedWorkspaceRootsMatch(
-        `${current.trimEnd()}\n# additional workspace roots\n  - crates/*\n`,
-      ),
+    () => sortedWorkspaceRootsMatch(`${packages}${WORKSPACE_TRAILING_SETTING}`),
     assert.AssertionError,
   );
 });
@@ -604,9 +613,9 @@ test("workspace parser reads single package directories", () => {
 });
 
 test("workspace cross-check detects an extra single package directory", () => {
-  const current = readFileSync(join(root, WORKSPACE_MANIFEST_NAME), "utf8");
+  const packages = workspaceCrossCheckPackages("  - cmds/other");
   assert.throws(
-    () => sortedWorkspaceRootsMatch(`${current.trimEnd()}\n  - cmds/other\n`),
+    () => sortedWorkspaceRootsMatch(`${packages}${WORKSPACE_TRAILING_SETTING}`),
     assert.AssertionError,
   );
 });
@@ -641,7 +650,6 @@ test("workspace glob parser rejects an empty packages block", () => {
 });
 
 test("workspace roots cross-check detects extra roots in any spelling", async (t) => {
-  const current = readFileSync(join(root, WORKSPACE_MANIFEST_NAME), "utf8");
   for (const entry of [
     "crates/*",
     "'crates/*'",
@@ -649,8 +657,10 @@ test("workspace roots cross-check detects extra roots in any spelling", async (t
     "crates/*  # note",
   ]) {
     await t.test(entry, () => {
+      const packages = workspaceCrossCheckPackages(`  - ${entry}`);
       assert.throws(
-        () => sortedWorkspaceRootsMatch(`${current.trimEnd()}\n  - ${entry}\n`),
+        () =>
+          sortedWorkspaceRootsMatch(`${packages}${WORKSPACE_TRAILING_SETTING}`),
         assert.AssertionError,
       );
     });
