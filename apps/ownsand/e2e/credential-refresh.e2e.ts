@@ -119,6 +119,9 @@ describe("credential creation during the first list request", () => {
           await releaseCredentialRequest(browser, "list");
           expect(await credentialState(browser, "list")).toBe("delivered");
           await expect(secret).toBeHidden();
+          // The closing modal's backdrop can still intercept a tap after
+          // its dialog disappears from the accessibility tree.
+          await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
           await expect(row).toContainText(
             fixture.path === "api-keys" ? "new-key" : "Not used",
           );
@@ -127,10 +130,9 @@ describe("credential creation during the first list request", () => {
           );
 
           await revoke.tap();
-          await screen
-            .getByRole("alertdialog")
-            .getByRole("button", fixture.revoke)
-            .tap();
+          const confirm = screen.getByRole("alertdialog");
+          await expect(confirm).toBeVisible();
+          await confirm.getByRole("button", fixture.revoke).tap();
           await expect(row).toContainText("Revoked");
           await expect(revoke).toBeHidden();
         },
