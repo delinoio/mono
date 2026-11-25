@@ -552,6 +552,10 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 		h.mu.Lock()
 		_, alive := h.sessions[sess.id]
 		h.mu.Unlock()
+		// The select can receive an answer even when the request has ended.
+		if err := ctx.Err(); err != nil {
+			return abandon("request_canceled", err)
+		}
 		if !alive {
 			return fail(errUnavailable("the session ended before it opened"))
 		}

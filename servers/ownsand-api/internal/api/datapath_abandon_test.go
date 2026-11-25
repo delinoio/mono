@@ -4,13 +4,18 @@ package api_test
 
 import (
 	"context"
+	"errors"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
@@ -109,6 +114,113 @@ func TestOpenSessionCancelRevokesSession(t *testing.T) {
 	requireAbandonedSessionRevoked(t, env, agent, offer.GetSessionId())
 	if got := len(revocationsOf(agent, offer.GetSessionId())); got != 1 {
 		t.Fatalf("revocations of the session = %d, want 1", got)
+	}
+}
+
+// endOnAnswerContext stays active while OpenSession waits for the answer.
+// After the offer has reached the fake agent, the next Err check ends the
+// context. This lets the successful answer win the select every time.
+type endOnAnswerContext struct {
+	context.Context
+	answerReady <-chan struct{}
+	end         context.CancelCauseFunc
+	cause       error
+}
+
+func (c endOnAnswerContext) Err() error {
+	select {
+	case <-c.answerReady:
+		c.end(c.cause)
+	default:
+	}
+	return context.Cause(c.Context)
+}
+
+func TestOpenSessionEndedContextOnSuccessfulAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		cause       error
+		code        connect.Code
+		revokeFirst bool
+	}{
+		{name: "canceled", cause: context.Canceled, code: connect.CodeCanceled},
+		{name: "deadline", cause: context.DeadlineExceeded, code: connect.CodeDeadlineExceeded},
+		{name: "already_revoked", cause: context.Canceled, code: connect.CodeCanceled, revokeFirst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testenv.New(t)
+			org, agent, sandboxID := runningSandbox(t, env)
+			agent.SetAckRevocations(false)
+			silentAgent(agent)
+
+			answerReady := make(chan struct{})
+			handlerErrors := make(chan error, 1)
+			svc := env.App.Service
+			interceptors := svc.Interceptors(&api.Authenticator{Service: svc}, config.ClientAddressDirect)
+			interceptors = append(interceptors, connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
+				return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+					ctx, end := context.WithCancelCause(ctx)
+					defer end(nil)
+					resp, err := next(endOnAnswerContext{Context: ctx, answerReady: answerReady, end: end, cause: tc.cause}, req)
+					handlerErrors <- err
+					return resp, err
+				}
+			}))
+			_, handler := ownsandv1connect.NewDataPathServiceHandler(api.DataPathHandler{DataPlane: env.App.Plane}, connect.WithInterceptors(interceptors...))
+			server := httptest.NewServer(handler)
+			t.Cleanup(server.Close)
+
+			client := ownsandv1connect.NewDataPathServiceClient(server.Client(), server.URL)
+			req := openSessionRequest(org.ID, sandboxID)
+			req.Header().Set("Authorization", "Bearer "+org.APIKey)
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			type result struct {
+				resp *connect.Response[ownsandv1.OpenSessionResponse]
+				err  error
+			}
+			results := make(chan result, 1)
+			go func() {
+				resp, err := client.OpenSession(ctx, req)
+				results <- result{resp: resp, err: err}
+			}()
+
+			offer := agent.WaitFor("offer", isOffer).GetSignaling().GetOffer()
+			sessionID := offer.GetSessionId()
+			if tc.revokeFirst {
+				revokeKey(t, org)
+				agent.WaitFor("revocation by the event", func(e *ownsandv1.AgentEnvelope) bool {
+					return e.GetSessionRevocation().GetSessionId() == sessionID
+				})
+			}
+			close(answerReady)
+			agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Signaling{Signaling: &ownsandv1.SignalingMessage{
+				Message: &ownsandv1.SignalingMessage_Answer{Answer: &ownsandv1.SignalingAnswer{SessionId: sessionID, Sdp: "v=0"}},
+			}}})
+
+			got := <-results
+			if got.resp != nil || connect.CodeOf(got.err) != tc.code {
+				t.Fatalf("OpenSession returned a response: %t, error: %v, want %v", got.resp != nil, got.err, tc.code)
+			}
+			select {
+			case err := <-handlerErrors:
+				if !errors.Is(err, tc.cause) {
+					t.Fatalf("handler error = %v, want %v", err, tc.cause)
+				}
+			default:
+				t.Fatal("OpenSession did not reach the handler")
+			}
+
+			requireAbandonedSessionRevoked(t, env, agent, sessionID)
+			// A later offer on the same channel flushes any duplicate revocation.
+			agent.SetOnOffer(nil)
+			if _, err := org.OwnerClient.DataPath.OpenSession(ctx, openSessionRequest(org.ID, sandboxID)); err != nil {
+				t.Fatalf("settle round trip: %v", err)
+			}
+			if n := len(revocationsOf(agent, sessionID)); n != 1 {
+				t.Fatalf("revocations of the session = %d, want 1", n)
+			}
+		})
 	}
 }
 
