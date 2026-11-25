@@ -542,12 +542,19 @@ func TestReadFileNotFoundIsVisible(t *testing.T) {
 	}
 }
 
+// These fixtures send full-size chunks over WebRTC and assert exact
+// attempt counts. The usual fast test deadline can force an unrelated
+// fallback when the runner is slow to acknowledge a 1 MiB chunk.
+const fullChunkWriteAttemptDeadline = 5 * time.Second
+
 func TestWriteFileChunkedBothTransports(t *testing.T) {
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
 			want := randomBytes(t, 2*datapath.MaxFileChunkSize+77)
-			s := cp.handle(t, cp.client(t, tr))
+			c := cp.client(t, tr)
+			c.timing.writeAttemptDeadline = fullChunkWriteAttemptDeadline
+			s := cp.handle(t, c)
 			n, err := s.WriteFile(context.Background(), "/out", bytes.NewReader(want), WriteOptions{})
 			if err != nil {
 				t.Fatal(err)
@@ -702,7 +709,9 @@ func TestWriteFileObservesCancellationInsideAChunkFill(t *testing.T) {
 			})
 			t.Run("partial read-ahead after an acknowledged chunk", func(t *testing.T) {
 				cp := newFakeCP(t)
-				s := cp.handle(t, cp.client(t, tr))
+				c := cp.client(t, tr)
+				c.timing.writeAttemptDeadline = fullChunkWriteAttemptDeadline
+				s := cp.handle(t, c)
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				src := &scriptedReader{steps: []func([]byte) (int, error){
@@ -1067,7 +1076,9 @@ func TestWriteFileContinuesOnRelayAfterChannelFailure(t *testing.T) {
 		return p2pAction{}
 	}
 	want := randomBytes(t, 2*datapath.MaxFileChunkSize)
-	s := cp.handle(t, cp.client(t, TransportAuto))
+	c := cp.client(t, TransportAuto)
+	c.timing.writeAttemptDeadline = fullChunkWriteAttemptDeadline
+	s := cp.handle(t, c)
 	if err := s.WriteFileBytes(context.Background(), "/w", want, WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
