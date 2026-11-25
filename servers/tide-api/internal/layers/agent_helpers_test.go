@@ -38,6 +38,8 @@ type guestRecorder struct {
 	started  map[string]string // sandbox ID -> start script
 	// installCode is the exit code of install scripts (0: success).
 	installCode int64
+	// installTimedOut reports whether the install scripts exceeded their timeout.
+	installTimedOut bool
 }
 
 func newGuestRecorder(fake *ownsandfake.Fake) *guestRecorder {
@@ -48,8 +50,10 @@ func newGuestRecorder(fake *ownsandfake.Fake) *guestRecorder {
 		g.execs = append(g.execs, p)
 		isProgram := strings.Contains(script, agent.LogFile)
 		code := int64(0)
+		timedOut := false
 		if strings.Contains(script, "install") || strings.Contains(script, "irm ") {
 			code = g.installCode
+			timedOut = g.installTimedOut
 		}
 		if isProgram {
 			g.started[sandboxID] = script
@@ -63,7 +67,7 @@ func newGuestRecorder(fake *ownsandfake.Fake) *guestRecorder {
 				return nil, err
 			}
 		}
-		return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
+		return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code, TimedOut: timedOut}, nil
 	}, func(ctx context.Context, sandboxID, execID string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
 		g.mu.Lock()
 		ch := g.programs[sandboxID]

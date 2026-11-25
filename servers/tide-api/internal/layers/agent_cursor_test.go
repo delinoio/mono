@@ -531,6 +531,26 @@ func TestCursorWindowsNeedsGitBash(t *testing.T) {
 	}
 }
 
+func TestCursorPreparationTimeoutFailsRunner(t *testing.T) {
+	w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	w.guest.mu.Lock()
+	w.guest.installTimedOut = true
+	w.guest.mu.Unlock()
+	w.cursor.AddRequest("bc-timeout", true)
+	req := w.requestBySource(t, "bc-timeout")
+	failed := w.waitRequest(t, req.GetRequestId(), tidev1.RequestState_REQUEST_STATE_FAILED)
+	if got := failed.GetEndReason(); got != tidev1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED {
+		t.Fatalf("request end reason = %v, want runner start failure", got)
+	}
+	logs := w.env.Logs.String()
+	if !strings.Contains(logs, "install the Cursor agent CLI: timed out") || !strings.Contains(logs, `"cause":"prepare_failed"`) {
+		t.Fatal("preparation timeout failure was not logged")
+	}
+	if strings.Contains(w.guest.all(), agent.LogFile) {
+		t.Fatal("Tide started the runner after its preparation timed out")
+	}
+}
+
 // TestCursorOrganizationDeletion: deleting the organization stops the
 // watch and fails the queued request's turn while the key still exists; a
 // failed release stops the deletion.
