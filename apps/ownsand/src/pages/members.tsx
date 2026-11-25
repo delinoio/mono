@@ -24,6 +24,7 @@ import {
   QueryBoundary,
   SecretDialog,
   toastError,
+  isTerminalError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import { invitationLink } from "../invitation.ts";
@@ -65,7 +66,7 @@ export function MembersPage() {
   const [removing, setRemoving] = useState<Member>();
   const [leaving, setLeaving] = useState(false);
 
-  if (members.terminalLoadMoreError && removing !== undefined) {
+  if (isTerminalError(members.error) && removing !== undefined) {
     setRemoving(undefined);
   }
 
@@ -157,9 +158,13 @@ export function MembersPage() {
         title={`Remove ${removing ? displayName(removing) : ""}?`}
         description="They lose access to this organization. Its sandboxes keep running."
         confirmLabel="Remove member"
-        onConfirm={() =>
-          removeMember.mutateAsync({ organizationId, userId: removing!.userId })
-        }
+        onConfirm={async () => {
+          if (!removing) return;
+          await removeMember.mutateAsync({
+            organizationId,
+            userId: removing.userId,
+          });
+        }}
       />
       <ConfirmDialog
         open={leaving}
@@ -216,7 +221,7 @@ function Invitations() {
   const [inviteRole, setInviteRole] = useState(String(Role.MEMBER));
   const [link, setLink] = useState<string>();
   const [revoking, setRevoking] = useState<Invitation>();
-  if (pages.terminalLoadMoreError && revoking !== undefined) {
+  if (isTerminalError(pages.error) && revoking !== undefined) {
     setRevoking(undefined);
   }
 
@@ -277,9 +282,10 @@ function Invitations() {
         description="The invitation link stops working at once. It cannot be restored; create a new link instead."
         confirmLabel="Revoke invitation"
         onConfirm={async () => {
+          if (!revoking) return;
           await revoke.mutateAsync({
             organizationId,
-            invitationId: revoking!.invitationId,
+            invitationId: revoking.invitationId,
           });
           toast.success("The invitation is revoked.");
         }}

@@ -37,6 +37,7 @@ import {
   PageHeader,
   QueryBoundary,
   toastError,
+  isTerminalError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import { useMembers } from "../members.ts";
@@ -225,7 +226,8 @@ function OwnerActions() {
   const [target, setTarget] = useState<string | null>(null);
   const [confirmTransfer, setConfirmTransfer] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  if (members.terminalLoadMoreError && (target !== null || confirmTransfer)) {
+  const terminalMembersError = isTerminalError(members.error);
+  if (terminalMembersError && (target !== null || confirmTransfer)) {
     // Discard the selection and its confirmation when the list loses access.
     setTarget(null);
     setConfirmTransfer(false);
@@ -243,9 +245,9 @@ function OwnerActions() {
         <p className="muted">
           The new owner gets every permission. You become an admin.
         </p>
-        {members.terminalLoadMoreError ? (
+        {terminalMembersError ? (
           <ErrorNotice
-            error={members.terminalLoadMoreError}
+            error={members.error}
             onRetry={() => void members.refetch()}
           />
         ) : (
@@ -294,7 +296,7 @@ function OwnerActions() {
         description="You become an admin. Only the new owner can give ownership back. The transfer removes the billing link, so the organization is blocked until the new owner links a billing account."
         confirmLabel="Transfer ownership"
         onConfirm={async () => {
-          if (members.terminalLoadMoreError || target === null) return;
+          if (terminalMembersError || target === null) return;
           await transfer.mutateAsync({
             organizationId,
             userId: target,

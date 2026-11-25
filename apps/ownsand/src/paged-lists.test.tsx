@@ -6,12 +6,15 @@ import {
   createClient,
   type Transport,
 } from "@connectrpc/connect";
+import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { SnapshotState } from "@delino/ownsand-protos/v1/common_pb";
 import {
   type Invitation,
   type ListInvitationsRequest,
   type ListInvitationsResponse,
+  MemberService,
 } from "@delino/ownsand-protos/v1/member_pb";
 import {
   type ListSnapshotsResponse,
@@ -29,7 +32,12 @@ import {
 import { toast } from "delino-ui/toast";
 import { invalidateServices } from "./api.ts";
 import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
-import { holdingTransport, renderConsole, settle } from "./test-support.tsx";
+import {
+  fullListRefresh,
+  holdingTransport,
+  renderConsole,
+  settle,
+} from "./test-support.tsx";
 
 /**
  * The longest wait for one condition. The console renders a list of more than
@@ -784,6 +792,130 @@ describe.each([
     },
     LONG_LIST_TEST_TIMEOUT_MS,
   );
+});
+
+test.each([
+  {
+    path: "api-keys",
+    method: ApiKeyService.method.listApiKeys,
+    list: "API keys",
+    action: /^Revoke API key/,
+    confirm: "Revoke key",
+    mutation: "RevokeApiKey",
+  },
+  {
+    path: "enrollment-tokens",
+    method: DeviceService.method.listEnrollmentTokens,
+    list: "Enrollment tokens",
+    action: /^Revoke enrollment token/,
+    confirm: "Revoke token",
+    mutation: "RevokeEnrollmentToken",
+    mockOptions: { extraEnrollmentTokens: 1 },
+  },
+  {
+    path: "members",
+    method: MemberService.method.listInvitations,
+    list: "Pending invitations",
+    action: /^Revoke Member invitation/,
+    confirm: "Revoke invitation",
+    mutation: "RevokeInvitation",
+    otherList: "Members",
+  },
+  {
+    path: "members",
+    method: MemberService.method.listMembers,
+    list: "Members",
+    action: "Remove Jun Park",
+    confirm: "Remove member",
+    mutation: "RemoveMember",
+    otherList: "Pending invitations",
+  },
+])(
+  "closes the $list confirmation only after a terminal full refresh",
+  async ({
+    path,
+    method,
+    list,
+    action,
+    confirm,
+    mutation,
+    otherList,
+    mockOptions,
+  }) => {
+    const { transport, queryClient, refetch, failedTokens, seen } =
+      fullListRefresh(method, createMockTransport(mockOptions));
+
+    renderConsole(`/orgs/${MOCK_IDS.acme}/${path}`, { transport, queryClient });
+    const rows = await screen.findByRole("list", { name: list }, WAIT);
+    await act(async () => {
+      fireEvent.click(within(rows).getByRole("button", { name: action }));
+    });
+    expect(await screen.findByRole("alertdialog", {}, WAIT)).toBeTruthy();
+
+    await refetch(Code.Unavailable);
+    expect(
+      await screen.findByText(/The last refresh failed/, {}, WAIT),
+    ).toBeTruthy();
+    expect(failedTokens).toEqual(["", "", ""]);
+    expect(document.body.contains(rows)).toBe(true);
+    const dialog = screen.getByRole("alertdialog");
+    expect(
+      within(dialog)
+        .getByRole("button", { name: confirm })
+        .hasAttribute("disabled"),
+    ).toBe(false);
+
+    await refetch(Code.PermissionDenied);
+    expect(
+      await screen.findByText(
+        "You do not have permission to do this.",
+        {},
+        WAIT,
+      ),
+    ).toBeTruthy();
+    expect(failedTokens).toEqual(["", "", "", ""]);
+    expect(screen.queryByRole("list", { name: list })).toBeNull();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    if (otherList)
+      expect(screen.getByRole("list", { name: otherList })).toBeTruthy();
+
+    await refetch();
+    await screen.findByRole("list", { name: list }, WAIT);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(seen[mutation]).toBeUndefined();
+  },
+);
+
+test("lets a sent revoke settle after a terminal full refresh closes its confirmation", async () => {
+  const held = holdingTransport(["RevokeApiKey"]);
+  const { transport, queryClient, refetch } = fullListRefresh(
+    ApiKeyService.method.listApiKeys,
+    held.transport,
+  );
+  renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport, queryClient });
+  const revoke = await screen.findByRole(
+    "button",
+    { name: /^Revoke API key/ },
+    WAIT,
+  );
+  await act(async () => fireEvent.click(revoke));
+  await act(async () =>
+    fireEvent.click(screen.getByRole("button", { name: "Revoke key" })),
+  );
+  await waitFor(() => expect(held.calls.RevokeApiKey).toHaveLength(1), WAIT);
+
+  await refetch(Code.PermissionDenied);
+  await screen.findByText("You do not have permission to do this.", {}, WAIT);
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  await act(async () => {
+    held.calls.RevokeApiKey![0]!.settle();
+  });
+  await waitFor(() => expect(queryClient.isMutating()).toBe(0), WAIT);
+
+  await refetch();
+  expect(await screen.findByText("ci-runner · Revoked", {}, WAIT)).toBeTruthy();
+  expect(held.seen.RevokeApiKey).toBe(1);
+  expect(screen.queryByRole("alertdialog")).toBeNull();
 });
 
 describe("device inventory", () => {

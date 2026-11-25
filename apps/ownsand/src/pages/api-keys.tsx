@@ -19,6 +19,7 @@ import {
   PageHeader,
   QueryBoundary,
   SecretDialog,
+  isTerminalError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import {
@@ -64,7 +65,7 @@ export function ApiKeysPage() {
   const [secret, setSecret] = useState<string>();
   const [revoking, setRevoking] = useState<ApiKey>();
 
-  if (pages.terminalLoadMoreError && revoking !== undefined) {
+  if (isTerminalError(pages.error) && revoking !== undefined) {
     setRevoking(undefined);
   }
 
@@ -172,9 +173,13 @@ export function ApiKeysPage() {
         title={`Revoke ${revoking?.name ?? "this key"}?`}
         description="Programs that use the key stop working at once. This cannot be undone."
         confirmLabel="Revoke key"
-        onConfirm={() =>
-          revoke.mutateAsync({ organizationId, apiKeyId: revoking!.apiKeyId })
-        }
+        onConfirm={async () => {
+          if (!revoking) return;
+          await revoke.mutateAsync({
+            organizationId,
+            apiKeyId: revoking.apiKeyId,
+          });
+        }}
       />
     </>
   );

@@ -66,6 +66,7 @@ function recordToken(key: string, token: string) {
 
 export function createMockTransport(): Transport {
   const methodName = sessionStorage.getItem("ownsand-e2e-paged-list");
+  const refreshList = sessionStorage.getItem("ownsand-e2e-refresh-list");
   const pagination =
     methodName !== null && Object.hasOwn(lists, methodName)
       ? lists[methodName as keyof typeof lists]
@@ -78,7 +79,10 @@ export function createMockTransport(): Transport {
   const base = createBaseMock({
     extraApiKeys: Number(methodName === "ListApiKeys"),
     extraDevices: pageDevices ? 199 : 0,
-    extraEnrollmentTokens: Number(methodName === "ListEnrollmentTokens"),
+    extraEnrollmentTokens: Number(
+      methodName === "ListEnrollmentTokens" ||
+        refreshList === "ListEnrollmentTokens",
+    ),
     extraInvitations: pageInvitations
       ? Number(sessionStorage.getItem("ownsand-e2e-extra-invitations") ?? 200)
       : 0,
@@ -88,6 +92,21 @@ export function createMockTransport(): Transport {
   return {
     ...base,
     async unary(method, signal, timeout, header, input, contextValues) {
+      if (
+        method.name === sessionStorage.getItem("ownsand-e2e-tracked-mutation")
+      ) {
+        recordToken("ownsand-e2e-mutation-calls", method.name);
+      }
+      if (method.name === refreshList) {
+        const code = sessionStorage.getItem("ownsand-e2e-refresh-error");
+        const { pageToken } = input as { pageToken?: string };
+        if (code !== null && pageToken === "") {
+          throw new ConnectError(
+            "Synthetic full refresh failure",
+            Number(code) as Code,
+          );
+        }
+      }
       if (method.name === "ListOrganizations") {
         await failOrganizationListIfConfigured();
       }

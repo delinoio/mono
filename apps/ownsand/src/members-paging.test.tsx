@@ -21,7 +21,11 @@ import {
 } from "@testing-library/react";
 import { toast } from "delino-ui/toast";
 import { MOCK_IDS, MOCK_USER, createMockTransport } from "./mock/mock-api.ts";
-import { holdingTransport, renderConsole } from "./test-support.tsx";
+import {
+  fullListRefresh,
+  holdingTransport,
+  renderConsole,
+} from "./test-support.tsx";
 
 const OWNER = MOCK_USER;
 const ADMIN = "user-admin-jun";
@@ -195,6 +199,71 @@ describe("ownership transfer picker", () => {
     await screen.findByRole("option", { name: "Jun Park" }, WAIT);
     await flush();
     expect(state.tokens).toEqual([""]);
+  });
+
+  test("keeps the owner choice on a transient refresh and clears it on a terminal refresh", async () => {
+    const { transport, queryClient, refetch, failedTokens, seen } =
+      fullListRefresh(MemberService.method.listMembers);
+
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      transport,
+      queryClient,
+    });
+    await openOwnerPicker();
+    const candidate = await screen.findByRole(
+      "option",
+      { name: "Jun Park" },
+      WAIT,
+    );
+    await act(async () => {
+      fireEvent.click(candidate);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
+    });
+    const dialog = await screen.findByRole("alertdialog", {}, WAIT);
+
+    await refetch(Code.Unavailable);
+    expect(failedTokens).toEqual(["", "", ""]);
+    expect(dialog.textContent).toContain("Make Jun Park the owner?");
+    expect(
+      within(dialog)
+        .getByRole("button", { name: "Transfer ownership" })
+        .hasAttribute("disabled"),
+    ).toBe(false);
+
+    await refetch(Code.PermissionDenied);
+    expect(
+      await screen.findByText(
+        "You do not have permission to do this.",
+        {},
+        WAIT,
+      ),
+    ).toBeTruthy();
+    expect(failedTokens).toEqual(["", "", "", ""]);
+    expect(screen.queryByRole("combobox", { name: "New owner" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Transfer" })).toBeNull();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Delete organization" }),
+    ).toBeTruthy();
+
+    await refetch();
+    const picker = await screen.findByRole(
+      "combobox",
+      { name: "New owner" },
+      WAIT,
+    );
+    expect(picker.textContent).toContain("Choose a member");
+    expect(
+      screen.getByRole("button", { name: "Transfer" }).hasAttribute("disabled"),
+    ).toBe(true);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await openOwnerPicker();
+    expect(
+      await screen.findByRole("option", { name: "Jun Park" }, WAIT),
+    ).toBeTruthy();
+    expect(seen.TransferOwnership).toBeUndefined();
   });
 
   test("closes the transfer confirmation and hides cached choices after a terminal continuation error", async () => {
