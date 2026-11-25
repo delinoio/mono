@@ -224,6 +224,11 @@ echo "security $*" >> "$STUB_LOG"
 if [[ "$1" == list-keychains ]]; then
   if [[ " $* " == *" -s "* ]]; then
     { printf 'security-args'; printf ' [%s]' "$@"; echo; } >> "$STUB_LOG"
+  elif [[ -n "\${STUB_KEYCHAIN_LIST_FAILURE:-}" ]]; then
+    if [[ "$STUB_KEYCHAIN_LIST_FAILURE" == partial ]]; then
+      printf '    "%s"\\n' "/Users/runner/Library/Keychains/login.keychain-db"
+    fi
+    exit 1
   elif [[ -z "\${STUB_EMPTY_KEYCHAIN_LIST:-}" ]]; then
     printf '    "%s"\\n' "/Users/runner/Library/Keychains/login.keychain-db" "/Users/runner/Library/Keychains/other keychain.keychain-db"
   fi
@@ -776,17 +781,51 @@ test(
     assert.deepEqual(
       result.log
         .split("\n")
-        .filter((line) => line.startsWith("security-args ")),
+        .filter((line) =>
+          /^security-args |^security delete-keychain /.test(line),
+        ),
       [
         `security-args [list-keychains] [-d] [user] [-s] [${join(work, "release.keychain-db")}]`,
         "security-args [list-keychains] [-d] [user] [-s]",
+        `security delete-keychain ${join(work, "release.keychain-db")}`,
       ],
     );
     assert.match(result.log, /xcrun notarytool submit/);
-    assert.match(result.log, /security delete-keychain/);
     assert.equal(existsSync(work), false);
   },
 );
+
+for (const output of ["empty", "partial"]) {
+  test(
+    `sign-macos aborts when reading the keychain search list fails with ${output} output`,
+    { skip: macSkip },
+    (t) => {
+      const f = fixture(t, { bash: macBash });
+      const work = join(f.runnerTemp, "macos-signing");
+      const out = join(f.dir, "signed");
+      const result = f.run(["sign-macos", darwinBuilds(f), out], {
+        ...appleEnv,
+        STUB_KEYCHAIN_LIST_FAILURE: output,
+      });
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /Cannot read the user keychain search list/);
+      assert.deepEqual(
+        result.log
+          .split("\n")
+          .filter((line) =>
+            /^security (list-keychains|delete-keychain) /.test(line),
+          ),
+        [
+          "security list-keychains -d user",
+          `security delete-keychain ${join(work, "release.keychain-db")}`,
+        ],
+      );
+      assert.doesNotMatch(result.log, /^(codesign|xcrun) /m);
+      assert.equal(existsSync(out), false);
+      assert.equal(existsSync(work), false);
+    },
+  );
+}
 
 test(
   "sign-macos fails on a rejected notarization and prints the log",
