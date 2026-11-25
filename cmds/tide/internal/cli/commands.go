@@ -470,7 +470,9 @@ func (a *app) githubInstallURL(ctx context.Context, name string, args []string) 
 	if a.fmt == FormatJSON {
 		return a.printMessage(res.Msg)
 	}
-	fmt.Fprintln(a.env.Stdout, res.Msg.GetUrl())
+	if _, err := fmt.Fprintln(a.env.Stdout, res.Msg.GetUrl()); err != nil {
+		return err
+	}
 	fmt.Fprintf(a.env.Stderr, "Open the URL in a browser before %s; the tide console completes the link.\n", ts(res.Msg.GetExpireTime()))
 	return nil
 }
