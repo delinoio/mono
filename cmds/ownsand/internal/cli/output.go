@@ -295,7 +295,8 @@ func (a *app) printList(m proto.Message, next string, headers []string, rows [][
 		return err
 	}
 	if next != "" {
-		fmt.Fprintf(a.env.Stderr, "More results: pass --page-token %s\n", next)
+		_, err := fmt.Fprintf(a.env.Stderr, "More results: pass --page-token %s\n", next)
+		return err
 	}
 	return nil
 }
