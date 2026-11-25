@@ -3,7 +3,6 @@ import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "delino-ui/button";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
-import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { SIGN_IN_NOT_CONFIGURED, useAuth } from "../auth.tsx";
@@ -17,6 +16,7 @@ import {
   pendingInvitation,
   takeSecretFromAddress,
 } from "../invitation.ts";
+import { refreshOrganizations } from "../organizations.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
 /**
@@ -39,15 +39,11 @@ export function InvitationPage({ configured }: { configured: boolean }) {
   const currentInvitation = useRef(invitation);
   const queryClient = useQueryClient();
   const accept = useMutation(MemberService.method.acceptInvitation, {
-    // Joining changes the caller's organizations and their members, so the
-    // cached lists must not outlive the 10 second stale time: the switcher of
-    // the new organization has to list it. This runs for every success,
-    // including the late success of an earlier attempt that no longer
-    // navigates. The promise is not returned: TanStack Query would wait for it
-    // before `mutateAsync` resolves, so the navigation would wait for the
-    // refetch of every query that is active at that moment.
+    // Refresh after every success, even when the user has left the page.
+    // Navigation uses the mutation response while the lists refetch.
     onSuccess: () => {
-      void invalidateServices(queryClient, MemberService, OrganizationService);
+      void refreshOrganizations(queryClient);
+      void invalidateServices(queryClient, MemberService);
     },
   });
   const resetAccept = accept.reset;
