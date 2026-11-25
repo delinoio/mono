@@ -43,6 +43,9 @@ const syncManifestLimit int64 = 256 << 20
 // cleanupTimeout bounds the guest clean-up after a failed sync or download.
 const cleanupTimeout = 30 * time.Second
 
+// syncApplyWait bounds how long a sync can wait for apply after losing its stream.
+const syncApplyWait = 30 * time.Second
+
 // SyncParams describes a sync of a local working tree into the workspace
 // path of a dev session.
 type SyncParams struct {
@@ -107,7 +110,10 @@ type SyncResult struct {
 // held deleted files under the path of a new file are removed when they are
 // empty. A sync that stops before the new manifest is written leaves the
 // old manifest unless apply removed a stale one during workspace recovery.
-// In either case, the next sync sends the same files again.
+// The next sync sends the same files again once it can take the lock. If
+// the SDK loses the apply stream, it keeps the lock and inputs until it
+// observes a terminal result. If the result is unknown after a bounded
+// wait, the lock and inputs stay in the guest.
 func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	return c.sync(ctx, p, syncManifestLimit)
 }
@@ -207,9 +213,9 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	}
 
 	cleanupEnv := map[string]string{guestEnvLock: lock}
-	succeeded := false
+	cleanupOnError := true
 	defer func() {
-		if succeeded {
+		if !cleanupOnError {
 			return
 		}
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
@@ -236,7 +242,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		}
 	}
 	if plan.empty() && !workspaceMissing {
-		succeeded = true
+		cleanupOnError = false
 		res := plan.res
 		if r, err := c.runGuest(ctx, s, opCleanup, cleanupEnv); err != nil || r.exitCode != 0 {
 			res.Warnings = append(res.Warnings, "the guest could not release the sync lock; the next sync may need force")
@@ -344,6 +350,10 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	if workspaceMissing || plan.hasFileChanges() {
 		ar, err := c.runGuest(ctx, s, opApply, applyEnv)
 		if err != nil {
+			var streamErr *ExecStreamError
+			if errors.As(err, &streamErr) {
+				cleanupOnError = c.waitForSyncApply(ctx, s, streamErr)
+			}
 			return nil, err
 		}
 		if ar.exitCode != 0 {
@@ -375,7 +385,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	for _, rel := range plan.ambiguousDeletes {
 		res.Warnings = append(res.Warnings, fmt.Sprintf("%q: skipped deletion because an older SDK may have replaced invalid UTF-8 bytes when it recorded this path", rel))
 	}
-	succeeded = true
+	cleanupOnError = false
 
 	cr, err := c.runGuest(ctx, s, opCleanup, cleanupEnv)
 	if err != nil || cr.exitCode != 0 {
@@ -383,6 +393,25 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	}
 	report(TransferProgress{Phase: TransferDone, BytesDone: res.BytesSent, BytesTotal: res.BytesSent})
 	return res, nil
+}
+
+// waitForSyncApply observes the original exec because its command can keep
+// writing after the stream ends. Cleaning up requires a terminal result.
+func (c *Client) waitForSyncApply(ctx context.Context, s *tidev1.DevSession, streamErr *ExecStreamError) bool {
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), syncApplyWait)
+	defer cancel()
+	_, err := c.AttachExec(waitCtx, AttachParams{
+		OrganizationID: s.GetOrganizationId(),
+		DevSessionID:   s.GetDevSessionId(),
+		ExecID:         streamErr.ExecID,
+		StdoutOffset:   streamErr.StdoutOffset,
+		StderrOffset:   streamErr.StderrOffset,
+	})
+	if err != nil {
+		c.logger.DebugContext(waitCtx, "tide sync kept the lock and inputs after losing the apply stream",
+			"dev_session_id", s.GetDevSessionId(), "exec_id", streamErr.ExecID, "code", codeText(err))
+	}
+	return err == nil
 }
 
 // readManifest reads the guest manifest. A missing or unreadable manifest
