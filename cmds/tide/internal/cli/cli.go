@@ -109,6 +109,10 @@ type globals struct {
 	output  string
 	noColor bool
 	verbose bool
+
+	apiURLSet bool
+	orgSet    bool
+	outputSet bool
 }
 
 type app struct {
@@ -242,6 +246,16 @@ func (a *app) parseUntil(fs *flag.FlagSet, args []string, stopAfter int) ([]stri
 	if err := a.applyGlobals(); err != nil {
 		return nil, err
 	}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "api-url":
+			a.g.apiURLSet = true
+		case "org":
+			a.g.orgSet = true
+		case "output":
+			a.g.outputSet = true
+		}
+	})
 	return positional, nil
 }
 

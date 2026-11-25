@@ -5,8 +5,8 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +25,7 @@ import (
 	"github.com/delinoio/mono/go/tide"
 	"github.com/delinoio/mono/go/tide/tidetest"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 )
 
 // Run main in a subprocess so assertions can use the actual exit status.
@@ -192,10 +193,27 @@ func TestSecondInterruptEndsBlockedCredentialRead(t *testing.T) {
 }
 
 func TestFirstInterruptPrintsExecAttachCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+	}{
+		{name: "explicit JSON", output: "json"},
+		{name: "explicit text", output: "text"},
+		{name: "environment defaults"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testExecAttachCommand(t, tc.output)
+		})
+	}
+}
+
+func testExecAttachCommand(t *testing.T, output string) {
+	t.Helper()
 	srv := tidetest.New()
 	t.Cleanup(srv.Close)
-	org := srv.AddOrganization("tide-org").GetOrganizationId()
-	profile := srv.AddDevSessionProfile(org, "linux", tidev1.GuestOs_GUEST_OS_LINUX, t.TempDir())
+	org := srv.AddOrganization("exec-org").GetOrganizationId()
+	workspace := t.TempDir()
+	profile := srv.AddDevSessionProfile(org, "linux", tidev1.GuestOs_GUEST_OS_LINUX, workspace)
 	client, err := tide.New(tide.Options{BaseURL: srv.URL, APIKey: srv.APIKey})
 	if err != nil {
 		t.Fatal(err)
@@ -207,44 +225,166 @@ func TestFirstInterruptPrintsExecAttachCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := res.Msg.GetDevSession().GetDevSessionId()
-	cmd := tideCommand(t, srv.URL, "--org", org, "session", "exec", session, "--",
-		"sh", "-c", "printf 'exec-ready\n'; exec sleep 60")
 
-	r, w, err := os.Pipe()
-	if err != nil {
+	tidePath := filepath.Join(t.TempDir(), "tide")
+	if err := os.Symlink(os.Args[0], tidePath); err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-	defer w.Close()
-	if err := r.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	fallbackURL, fallbackOrg := srv.URL, org
+	args := []string{"session", "exec", session}
+	hintOptions := ""
+	var fallbackCalls atomic.Int32
+	if output != "" {
+		fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fallbackCalls.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		t.Cleanup(fallback.Close)
+		fallbackURL = fallback.URL
+		fallbackOrg = srv.AddOrganization("fallback-org").GetOrganizationId()
+		// Read options in both parse stages and keep the last output value.
+		args = []string{"--api-url", srv.URL, "--output", "table", "session", "exec", session, "--org", org, "--output", output}
+		hintOptions = fmt.Sprintf(" --org=%s --api-url=%s --output=%s", org, srv.URL, output)
+	}
+	const guestSecret = "guest-fixture-secret"
+	const guest = `
+		printf 'one\n\342\202'
+		printf 'err1\n' >&2
+		while [ ! -f stage2 ]; do sleep 0.02; done
+		printf '\254two\n\342\202'
+		printf 'err2\n' >&2
+		while [ ! -f stage3 ]; do sleep 0.02; done
+		printf '\254done\n'
+		printf 'last\n' >&2
+	`
+	args = append(args, "--env", "FIXTURE_SECRET="+guestSecret, "--", "sh", "-c", guest)
+	cmd := tideCommand(t, fallbackURL, args...)
+	cmd.Path = tidePath
+	cmd.Env = append(cmd.Env, "TIDE_ORG="+fallbackOrg, "PATH="+filepath.Dir(tidePath)+":"+os.Getenv("PATH"))
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	resume := func(hint string) *exec.Cmd {
+		// Replace sh so SIGINT is sent to Tide itself.
+		attach := exec.CommandContext(ctx, "sh", "-c", "exec "+hint)
+		attach.Env = cmd.Env
+		return attach
+	}
+
+	stdoutOne, stderrOne := "one\n\xe2\x82", "err1\n"
+	stdoutTwo, stderrTwo := "\xactwo\n\xe2\x82", "err2\n"
+	firstStdoutOffset, secondStdoutOffset := 6, 13
+	if output == "json" {
+		stdoutOne, stderrOne = `"data":"one\n"`, `"data":"err1\n"`
+		stdoutTwo, stderrTwo = `"data":"€two\n"`, `"data":"err2\n"`
+		firstStdoutOffset, secondStdoutOffset = 4, 11
+	}
+	first := interruptAfterExecOutput(t, cmd, output == "json", stdoutOne, stderrOne)
+	reqs := srv.ExecRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d exec requests, want 1", len(reqs))
+	}
+	checkHint := func(hint string, stdoutOffset, stderrOffset int) {
+		t.Helper()
+		if strings.Contains(hint, srv.APIKey) || strings.Contains(hint, guestSecret) {
+			t.Fatal("the resume command contains a credential")
+		}
+		want := fmt.Sprintf("tide session attach %s %s%s --stdout-offset %d --stderr-offset %d",
+			session, reqs[0].GetExecId(), hintOptions, stdoutOffset, stderrOffset)
+		if hint != want {
+			t.Fatalf("resume command = %q, want %q", hint, want)
+		}
+	}
+	checkHint(first, firstStdoutOffset, 5)
+	if err := os.WriteFile(filepath.Join(workspace, "stage2"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	second := interruptAfterExecOutput(t, resume(first), output == "json", stdoutTwo, stderrTwo)
+	checkHint(second, secondStdoutOffset, 10)
+	if err := os.WriteFile(filepath.Join(workspace, "stage3"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	final := resume(second)
 	var stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = w, &stderr
-	ended := startTide(t, cmd)
-	_ = w.Close()
-	line, err := bufio.NewReader(r).ReadString('\n')
-	if err != nil || line != "exec-ready\n" {
-		t.Fatalf("wait for exec output: got %q, %v", line, err)
+	final.Stderr = &stderr
+	stdout, err := final.Output()
+	if err != nil {
+		t.Fatalf("complete resumed attach: %v, stderr %q", err, stderr.String())
 	}
+	if output == "json" {
+		if !strings.Contains(string(stdout), `"data":"€done\n"`) || !strings.Contains(string(stdout), `"data":"last\n"`) ||
+			strings.Contains(string(stdout), "two") || strings.Contains(string(stdout), "err2") || stderr.Len() != 0 {
+			t.Fatalf("resumed JSON stdout = %q, stderr = %q", stdout, stderr.String())
+		}
+	} else if string(stdout) != "\xacdone\n" || stderr.String() != "last\n" {
+		t.Fatalf("resumed text stdout = %q, stderr = %q", stdout, stderr.String())
+	}
+	if calls := srv.Calls(tidev1connect.DevSessionServiceAttachDevSessionExecProcedure); calls != 2 || fallbackCalls.Load() != 0 {
+		t.Fatalf("API calls: attach = %d, fallback = %d, want 2 and 0", calls, fallbackCalls.Load())
+	}
+}
 
+func interruptAfterExecOutput(t *testing.T, cmd *exec.Cmd, jsonMode bool, stdoutText, stderrText string) string {
+	t.Helper()
+	stdout := newExecOutput(stdoutText)
+	stderr := newExecOutput(stderrText)
+	if jsonMode {
+		stdout = newExecOutput(stdoutText, stderrText)
+		stderr = newExecOutput()
+	}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	ended := startTide(t, cmd)
+	wait := func(ready <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-ready:
+		case <-ended:
+			t.Fatalf("Tide exited before output: stdout %q, stderr %q", stdout.buf.String(), stderr.buf.String())
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for exec output")
+		}
+	}
+	wait(stdout.ready)
+	if !jsonMode {
+		wait(stderr.ready)
+	}
 	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case <-ended:
 		if code := cmd.ProcessState.ExitCode(); code != 130 {
-			t.Fatalf("tide exited with %d, want 130. Stderr: %s", code, &stderr)
+			t.Fatalf("Tide exited with %d, want 130. Stderr: %s", code, stderr.buf.String())
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("tide exec did not exit after the first interrupt")
+		t.Fatal("Tide did not exit after SIGINT")
 	}
-	reqs := srv.ExecRequests()
-	if len(reqs) != 1 {
-		t.Fatalf("got %d exec requests, want 1", len(reqs))
+	_, hint, ok := strings.Cut(stderr.buf.String(), "Continue with: ")
+	if !ok {
+		t.Fatalf("missing resume command on stderr: %s", stderr.buf.String())
 	}
-	attach := fmt.Sprintf("tide session attach %s %s ", session, reqs[0].GetExecId())
-	if !strings.Contains(stderr.String(), attach) {
-		t.Fatalf("stderr did not contain the attach command %q: %s", attach, &stderr)
+	return strings.TrimSuffix(hint, "\n")
+}
+
+type execOutput struct {
+	buf   bytes.Buffer
+	want  []string
+	ready chan struct{}
+}
+
+func newExecOutput(text ...string) *execOutput {
+	return &execOutput{want: text, ready: make(chan struct{})}
+}
+
+func (o *execOutput) Write(p []byte) (int, error) {
+	n, err := o.buf.Write(p)
+	for _, text := range o.want {
+		if !strings.Contains(o.buf.String(), text) {
+			return n, err
+		}
 	}
+	if len(o.want) != 0 {
+		close(o.ready)
+		o.want = nil
+	}
+	return n, err
 }
