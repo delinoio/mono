@@ -38,7 +38,6 @@ out_dir="$(cd "$out_dir" && pwd)"
 stage="$(mktemp -d "$out_dir/.ownsand-image-stage.XXXXXX")"
 outputs=(vmlinux vmlinux.config rootfs.ext4)
 publish_lock="$out_dir/.ownsand-image-publish.lock"
-lock_held=false
 publishing=false
 
 cleanup() {
@@ -51,21 +50,18 @@ cleanup() {
         continue
       fi
       if [ -e "$stage/previous/$name" ] || [ -L "$stage/previous/$name" ]; then
-        if ! mv -f -- "$stage/previous/$name" "$out_dir/"; then
+        if ! mv -f -- "$stage/previous/$name" "$out_dir/" 9>&-; then
           echo "could not restore $out_dir/$name" >&2
           keep_stage=true
         fi
-      elif ! rm -f -- "$out_dir/$name"; then
+      elif ! rm -f -- "$out_dir/$name" 9>&-; then
         keep_stage=true
       fi
     done
   fi
-  if "$lock_held" && ! rmdir -- "$publish_lock" && [ "$status" -eq 0 ]; then
-    status=1
-  fi
   if "$keep_stage"; then
     echo "image rollback incomplete; recovery files are in $stage" >&2
-  elif ! rm -rf -- "$stage" && [ "$status" -eq 0 ]; then
+  elif ! rm -rf -- "$stage" 9>&- && [ "$status" -eq 0 ]; then
     status=1
   fi
   exit "$status"
@@ -98,21 +94,25 @@ for name in "${outputs[@]}"; do
   fi
 done
 
-# Defer signal exits until the shell knows whether it owns the lock.
-interrupted=0
-trap 'interrupted=130' INT
-trap 'interrupted=143' TERM
-if mkdir -- "$publish_lock"; then
-  lock_held=true
-else
-  echo "could not acquire image publication lock: $publish_lock" >&2
+host_os="$(go env GOHOSTOS)"
+host_arch="$(go env GOHOSTARCH)"
+(cd "$repo" && CGO_ENABLED=0 GOOS="$host_os" GOARCH="$host_arch" \
+  go build -mod=readonly -trimpath -buildvcs=false -o "$stage/publish-lock" "$here/publishlock/main.go")
+
+if [ ! -L "$publish_lock" ] && [ -d "$publish_lock" ]; then
+  echo "legacy image publication lock directory: $publish_lock" >&2
+  echo "Confirm no older image builder is active before removing the empty directory with rmdir." >&2
   exit 1
 fi
-trap 'exit 130' INT
-trap 'exit 143' TERM
-if [ "$interrupted" -ne 0 ]; then
-  exit "$interrupted"
+if [ -L "$publish_lock" ] || { [ -e "$publish_lock" ] && [ ! -f "$publish_lock" ]; }; then
+  echo "image publication lock path is not a regular file: $publish_lock" >&2
+  exit 1
 fi
+
+# The helper locks the same open file description that Bash retains on fd 9.
+# Close it in publication children so an orphan cannot keep the lock held.
+exec 9<>"$publish_lock"
+"$stage/publish-lock" "$publish_lock" <&9 9>&-
 
 for name in "${outputs[@]}"; do
   dest="$out_dir/$name"
@@ -121,7 +121,7 @@ for name in "${outputs[@]}"; do
     exit 1
   fi
   if [ -L "$dest" ] || [ -f "$dest" ]; then
-    cp -pP -- "$dest" "$stage/previous/$name"
+    cp -pP -- "$dest" "$stage/previous/$name" 9>&-
   elif [ -e "$dest" ]; then
     echo "output path is not a regular file or symbolic link: $dest" >&2
     exit 1
@@ -131,7 +131,7 @@ done
 publishing=true
 for name in "${outputs[@]}"; do
   # Let mv append the basename, so a directory at the final filename fails.
-  mv -f -- "$stage/out/$name" "$out_dir/"
+  mv -f -- "$stage/out/$name" "$out_dir/" 9>&-
 done
 publishing=false
 echo "wrote $out_dir/vmlinux, $out_dir/vmlinux.config and $out_dir/rootfs.ext4"
