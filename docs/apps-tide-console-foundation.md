@@ -79,6 +79,7 @@ Organization owners, admins and members who sign in with Logto.
 - Empty states guide the first setup in this order: link OwnSand, connect GitHub or create an agent integration, create a runner profile. Each empty state names the next step.
 - The Overview requests device capacity only when the OwnSand link is `ACTIVE`. When the link is missing or inactive, the Device pool shows the next step and links to `integrations` without an error alert or retry button. An active link with no devices shows “No devices.” Link lookup and capacity request failures use the standard error and retry behavior.
 - When the OwnSand link is `INVALID`, every organization route shows a banner that explains that dispatch has stopped and links to `integrations`.
+- The OwnSand API key replacement form targets the OwnSand organization linked when the form opens. If a successful refresh shows that the link is gone or points to another organization, the form clears the key and disables submission. Close the form and start again from Integrations.
 - Credential forms accept a value once and never show it again. After a save, the form shows only that the credential is set and when.
 - For an `OPENAI_CODEX` integration, the console shows the webhook URL to register in OpenAI.
 - The `integrations` and `profiles` routes share one cached agent integration list for the active organization. The console follows every continuation token and shows integrations as their pages load.

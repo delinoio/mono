@@ -79,6 +79,10 @@ function credentialText(set: boolean, at: Parameters<typeof formatTime>[0]) {
   return set ? `Set at ${formatTime(at)}` : "Not set";
 }
 
+type OwnSandLinkDialog =
+  | { kind: "link" | "stale-replacement" }
+  | { kind: "replace"; ownsandOrganizationId: string };
+
 function OwnSandLinkSection({ admin }: { admin: boolean }) {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
@@ -92,7 +96,7 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
   const removeLink = useMutation(OwnSandLinkService.method.removeOwnSandLink, {
     onSuccess: refresh,
   });
-  const [dialog, setDialog] = useState<"link" | "replace">();
+  const [dialog, setDialog] = useState<OwnSandLinkDialog>();
   const [ownsandOrg, setOwnsandOrg] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [errors, setErrors] = useState<{ org?: string; key?: string }>({});
@@ -105,6 +109,18 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
     setErrors({});
   };
   const current = link.data?.link;
+  // Only a returned link result can invalidate this opening.
+  if (
+    dialog?.kind === "replace" &&
+    link.data !== undefined &&
+    current?.ownsandOrganizationId !== dialog.ownsandOrganizationId
+  ) {
+    setDialog({ kind: "stale-replacement" });
+    setApiKey("");
+    setErrors({});
+  }
+  const replacementUnavailable = dialog?.kind === "stale-replacement";
+  const replacing = dialog?.kind === "replace" || replacementUnavailable;
 
   return (
     <section className="section" aria-labelledby="ownsand-title">
@@ -121,7 +137,9 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
                 work, with an organization API key from the OwnSand console.
               </p>
               {admin ? (
-                <Button onClick={() => setDialog("link")}>Link OwnSand</Button>
+                <Button onClick={() => setDialog({ kind: "link" })}>
+                  Link OwnSand
+                </Button>
               ) : (
                 <p className="muted">Ask an admin to link OwnSand.</p>
               )}
@@ -162,7 +180,12 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
                 <div className="actions">
                   <Button
                     variant={ButtonVariant.Secondary}
-                    onClick={() => setDialog("replace")}
+                    onClick={() =>
+                      setDialog({
+                        kind: "replace",
+                        ownsandOrganizationId: current.ownsandOrganizationId,
+                      })
+                    }
                   >
                     Replace API key
                   </Button>
@@ -181,13 +204,16 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
       <FormDialog
         open={dialog !== undefined}
         onOpenChange={(open) => !open && close()}
-        title={dialog === "replace" ? "Replace the API key" : "Link OwnSand"}
+        title={replacing ? "Replace the API key" : "Link OwnSand"}
         description="tide stores the key encrypted and never shows it again. Create an organization API key in the OwnSand console."
-        submitLabel={dialog === "replace" ? "Replace key" : "Link"}
+        submitLabel={replacing ? "Replace key" : "Link"}
+        submitDisabled={replacementUnavailable}
         onSubmit={async (opening) => {
+          if (dialog === undefined || dialog.kind === "stale-replacement")
+            return;
           const org =
-            dialog === "replace"
-              ? current!.ownsandOrganizationId
+            dialog.kind === "replace"
+              ? dialog.ownsandOrganizationId
               : ownsandOrg.trim();
           const found: typeof errors = {};
           if (org === "") found.org = "Enter the OwnSand organization ID.";
@@ -206,7 +232,15 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
           if (opening.isCurrent()) close();
         }}
       >
-        {dialog === "link" ? (
+        {replacementUnavailable ? (
+          <div className="notice notice-error" role="alert">
+            <p>
+              The OwnSand link changed. Close this dialog and start again from
+              Integrations.
+            </p>
+          </div>
+        ) : null}
+        {dialog?.kind === "link" ? (
           <TextField
             label="OwnSand organization ID"
             value={ownsandOrg}
@@ -228,7 +262,8 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
             setErrors((e) => ({ ...e, key: undefined }));
           }}
           error={errors.key}
-          autoFocus={dialog === "replace"}
+          disabled={replacementUnavailable}
+          autoFocus={dialog?.kind === "replace"}
           autoComplete="off"
         />
       </FormDialog>

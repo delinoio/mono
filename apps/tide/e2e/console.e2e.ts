@@ -689,6 +689,28 @@ describe("integrations", () => {
     await expect(screen.getByText("osk_e2e_secret")).toBeHidden();
   });
 
+  test("replaces the API key for the linked OwnSand organization", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${ACME}/integrations`);
+
+    await screen.getByRole("button", "Replace API key").tap();
+    const dialog = screen.getByRole("dialog", "Replace the API key");
+    await expect(dialog.getByLabel("OwnSand API key")).toBeFocused();
+    await browser.keyboard.type("osk_e2e_replacement");
+    await dialog.getByRole("button", "Replace key").tap();
+
+    await expect(dialog).toBeHidden();
+    await expect(
+      screen.getByText("0193a000-0000-7000-8000-000000000001"),
+    ).toBeVisible();
+  });
+
   test("the GitHub callback links the installation and removes code and state", async ({
     app,
     screen,
