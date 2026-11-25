@@ -101,6 +101,7 @@ type Env struct {
 	Logs   *SafeBuffer
 	// SecretKey is the key of the test keyring.
 	SecretKey secrets.Key
+	stop      func()
 }
 
 // Option changes the app options before New wires the app.
@@ -217,13 +218,17 @@ func start(t testing.TB, database *db.DB, clock *Clock, key secrets.Key, opts []
 		defer close(done)
 		a.Run(ctx)
 	}()
-	t.Cleanup(func() {
+	stop := sync.OnceFunc(func() {
 		cancel()
 		<-done
 		srv.Close()
 	})
-	return &Env{T: t, DB: database, App: a, Server: srv, Clock: clock, Logs: logs, SecretKey: key}
+	t.Cleanup(stop)
+	return &Env{T: t, DB: database, App: a, Server: srv, Clock: clock, Logs: logs, SecretKey: key, stop: stop}
 }
+
+// Stop shuts down this instance and leaves its database open for a replica.
+func (e *Env) Stop() { e.stop() }
 
 // FailProgramExitCommits makes PostgreSQL abort transactions that move a
 // runner to DELETING for WORK_DONE. The returned function restores commits.

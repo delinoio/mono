@@ -446,6 +446,8 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 	if req == nil {
 		r.warmProfileRevision = p.WarmRevision
 		r.warmLinkRevision = linkRevision
+	} else if !bind {
+		r.sponsorRequestID = req.ID
 	}
 	// The dispatcher owns the first CreateSandbox call and applies its
 	// result before the driver can retry. A duplicate rejection can bind
@@ -514,10 +516,10 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		}
 		now := e.svc.NowUTC()
 		created, err := scanRunner(tx.QueryRow(ctx, `INSERT INTO runners (runner_id, organization_id, runner_profile_id, kind, guest_os, state, request_id, pool_key,
-			idempotency_key, create_request, workspace_path, create_time, update_time, warm_profile_revision, warm_link_revision)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14) RETURNING `+runnerColumns,
+			idempotency_key, create_request, workspace_path, create_time, update_time, warm_profile_revision, warm_link_revision, sponsor_request_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15) RETURNING `+runnerColumns,
 			r.ID, r.OrganizationID, r.ProfileID, int16(r.Kind), int16(r.GuestOS), int16(runCreating), nullable(r.RequestID), nullable(r.PoolKey),
-			r.IdempotencyKey, createReq, r.WorkspacePath, now, nullable(r.warmProfileRevision), nullable(r.warmLinkRevision)))
+			r.IdempotencyKey, createReq, r.WorkspacePath, now, nullable(r.warmProfileRevision), nullable(r.warmLinkRevision), nullable(r.sponsorRequestID)))
 		if err != nil {
 			return err
 		}
@@ -537,7 +539,7 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 	}
 	stored = true
 	sb, err := e.createSandbox(ctx, client, sreq)
-	res := e.applyCreate(ctx, r, req, sb, err)
+	res := e.applyCreate(ctx, r, sb, err)
 	if res == createFailed && ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || isCode(err, connect.CodeDeadlineExceeded)) {
 		return createStalled
 	}
@@ -561,9 +563,7 @@ func (e *Engine) storedCreateRequest(ctx context.Context, runnerID string) (*own
 var errSkip = errors.New("skip")
 
 // applyCreate applies a CreateSandbox result to a stored CREATING runner.
-// dispatchRequest identifies the queued demand for the initial call, including
-// for pool runners that do not store a request ID.
-func (e *Engine) applyCreate(ctx context.Context, r *Runner, dispatchRequest *Request, sb *ownsandv1.Sandbox, err error) createResult {
+func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandbox, err error) createResult {
 	var expired *Request
 	switch {
 	case err == nil:
@@ -604,11 +604,11 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, dispatchRequest *Re
 	case rejected(err, connect.CodeUnavailable):
 		// No device has free capacity: the sandbox does not exist, so the
 		// runner is removed and its request returns to the queue.
-		e.dropRunner(ctx, r, false, nil)
+		e.dropRunner(ctx, r, false)
 		return createUnavailable
 	case rejected(err, connect.CodeFailedPrecondition):
 		// No device of the OwnSand organization can ever run the profile.
-		e.dropRunner(ctx, r, true, dispatchRequest)
+		e.dropRunner(ctx, r, true)
 		return createFailed
 	case rejected(err, connect.CodeInvalidArgument), rejected(err, connect.CodeNotFound), rejected(err, connect.CodePermissionDenied):
 		// OwnSand rejected the request (for example, an unknown template):
@@ -646,7 +646,7 @@ func rejected(err error, code connect.Code) bool {
 // dropRunner handles a runner whose sandbox was never created. For a
 // capacity rejection it removes the runner. For a no-device rejection it
 // records the failure and ends the request if it is still queued.
-func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool, dispatchRequest *Request) {
+func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool) {
 	var ended *Request
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		cur, err := e.lockRunner(ctx, tx, r.ID)
@@ -662,13 +662,18 @@ func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool, dispa
 			return err
 		}
 		requestID := cur.RequestID
-		if dispatchRequest != nil {
-			requestID = dispatchRequest.ID
+		if requestID == "" {
+			requestID = cur.sponsorRequestID
 		}
 		if requestID == "" {
 			return nil
 		}
 		req, err := e.LockRequest(ctx, tx, requestID)
+		if isCode(err, connect.CodeNotFound) {
+			// Request retention can remove the sponsor while a runner is
+			// still retrying creation.
+			return nil
+		}
 		if err != nil || req.State != reqQueued {
 			return err
 		}
