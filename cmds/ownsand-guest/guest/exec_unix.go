@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/delinoio/mono/internal/procgroup"
 )
 
@@ -27,8 +29,8 @@ func envKeyFold(key string) string { return key }
 func hasPathSeparator(name string) bool { return strings.ContainsRune(name, '/') }
 
 // lookPathIn finds the program that a bare name selects in the PATH of env,
-// like exec.LookPath does for the PATH of the process: the first directory of
-// PATH that holds a regular file with an execute bit. A missing program
+// like exec.LookPath does for the PATH of the process. It selects the first
+// non-directory candidate that the helper can execute. A missing program
 // returns an error that wraps exec.ErrNotFound. A match in a relative
 // directory (an empty entry of a longer list means the current directory)
 // returns exec.ErrDot, which os/exec returns for the same match of the
@@ -40,7 +42,13 @@ func lookPathIn(name string, env []string) (string, error) {
 			dir = "."
 		}
 		path := filepath.Join(dir, name)
-		if st, err := os.Stat(path); err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
+		st, err := os.Stat(path)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		err = unix.Faccessat(unix.AT_FDCWD, path, unix.X_OK, unix.AT_EACCESS)
+		// Keep the mode-bit check only as a fallback on systems without faccessat.
+		if err != nil && (err != unix.ENOSYS || st.Mode()&0o111 == 0) {
 			continue
 		}
 		if !filepath.IsAbs(path) {
