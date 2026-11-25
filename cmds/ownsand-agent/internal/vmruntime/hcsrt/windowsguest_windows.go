@@ -4,6 +4,7 @@ package hcsrt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -69,35 +70,6 @@ func (r *Runtime) windowsImageCheck() (bool, string) {
 	return true, fmt.Sprintf("the Windows base image (%s) is present", m.Source)
 }
 
-// windowsSource returns the disk and the image directory (with image.json)
-// that a Windows sandbox starts from.
-func (r *Runtime) windowsSource(spec vmruntime.Spec) (disk, metaDir string) {
-	if spec.Snapshot != nil {
-		return filepath.Join(spec.Snapshot.Dir, snapWindowsDisk), spec.Snapshot.Dir
-	}
-	r.recoverWindowsImage()
-	return filepath.Join(r.opts.WindowsImage, images.WindowsDisk), r.opts.WindowsImage
-}
-
-// checkWindowsSpec rejects a Windows sandbox that this runtime cannot run.
-func (r *Runtime) checkWindowsSpec(spec vmruntime.Spec) error {
-	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
-		return fmt.Errorf("%w: Windows sandboxes run only with network mode NONE in this version", vmruntime.ErrUnsupported)
-	}
-	disk, metaDir := r.windowsSource(spec)
-	if !fileExists(disk) {
-		if spec.Snapshot != nil {
-			return fmt.Errorf("%w: the snapshot has no Windows disk", vmruntime.ErrUnsupported)
-		}
-		return fmt.Errorf("%w: the Windows base image is not built", vmruntime.ErrUnsupported)
-	}
-	m, err := readWindowsImage(metaDir)
-	if err != nil {
-		return fmt.Errorf("%w: the Windows image metadata is unreadable: %v", vmruntime.ErrUnsupported, err)
-	}
-	return checkWindowsResources(spec.Resources, m)
-}
-
 // checkWindowsResources rejects resources below the minimums of the image.
 func checkWindowsResources(res *ownsandv1.Resources, m images.Metadata) error {
 	if res.GetVcpuCount() < m.MinimumCPUCount {
@@ -109,35 +81,75 @@ func checkWindowsResources(res *ownsandv1.Resources, m images.Metadata) error {
 	return nil
 }
 
-// prepareWindowsDisk copies the Windows disk into the VM directory and
-// grows it to the requested size; the guest helper extends C: at boot. A
-// request below the virtual size of the copy (the source disk, also of a
-// snapshot) fails as unsupported before any compute system exists, and the
-// create removes the VM directory. The copy is a full, self-contained VHDX (no differencing parent), so a
-// snapshot never depends on the base image, which a rebuild replaces.
-func (r *Runtime) prepareWindowsDisk(ctx context.Context, spec vmruntime.Spec, ops vmCreateOps) (vmSpec, int64, error) {
-	src, metaDir := r.windowsSource(spec)
+// prepareWindowsDisk validates and copies the selected source before growing
+// the local disk. The copy is a full VHDX, so the sandbox and its snapshots
+// can keep using it after a rebuild. The guest helper extends C: at boot.
+func (r *Runtime) prepareWindowsDisk(ctx context.Context, spec vmruntime.Spec, ops vmCreateOps, prepareDir func() error) (vmSpec, int64, error) {
 	disk := filepath.Join(spec.Dir, windowsDiskFile)
-	start := time.Now()
-	if err := ops.copyFile(ctx, src, disk); err != nil {
-		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
+	var copyStarted time.Time
+	copySource := func(srcDir, diskName string) error {
+		src := filepath.Join(srcDir, diskName)
+		st, err := os.Stat(src)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("hcsrt: check the Windows source disk: %w", err)
+		}
+		if err != nil || !st.Mode().IsRegular() {
+			if spec.Snapshot != nil {
+				return fmt.Errorf("%w: the snapshot has no Windows disk", vmruntime.ErrUnsupported)
+			}
+			return fmt.Errorf("%w: the Windows base image is not built", vmruntime.ErrUnsupported)
+		}
+		m, err := readWindowsImage(srcDir)
+		if err != nil {
+			return fmt.Errorf("%w: the Windows image metadata is unreadable: %w", vmruntime.ErrUnsupported, err)
+		}
+		if err := checkWindowsResources(spec.Resources, m); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := prepareDir(); err != nil {
+			return err
+		}
+		copyStarted = time.Now()
+		if err := ops.copyFile(ctx, src, disk); err != nil {
+			return fmt.Errorf("hcsrt: prepare disk: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := ops.copyFile(ctx, filepath.Join(srcDir, images.MetadataFile), filepath.Join(spec.Dir, images.MetadataFile)); err != nil {
+			return fmt.Errorf("hcsrt: copy the image metadata: %w", err)
+		}
+		return ctx.Err()
 	}
-	if err := ctx.Err(); err != nil {
+
+	var err error
+	if spec.Snapshot != nil {
+		err = copySource(spec.Snapshot.Dir, snapWindowsDisk)
+	} else {
+		baseDir := r.opts.WindowsImage
+		if baseDir == "" {
+			return vmSpec{}, 0, fmt.Errorf("%w: the Windows base image is not built", vmruntime.ErrUnsupported)
+		}
+		err = images.WithBaseImage(ctx, baseDir, func() error {
+			return copySource(baseDir, images.WindowsDisk)
+		})
+	}
+	if err != nil {
 		return vmSpec{}, 0, err
 	}
 	copied := time.Now()
+	if err := ctx.Err(); err != nil {
+		return vmSpec{}, 0, err
+	}
 	size, err := ops.growVHDX(disk, spec.Resources.GetDiskGib()<<30)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return vmSpec{}, 0, ctxErr
 	}
 	if err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
-	}
-	if err := ops.copyFile(ctx, filepath.Join(metaDir, images.MetadataFile), filepath.Join(spec.Dir, images.MetadataFile)); err != nil {
-		return vmSpec{}, 0, fmt.Errorf("hcsrt: copy the image metadata: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return vmSpec{}, 0, err
 	}
 	if err := grantVMGroup(disk, accessReadWrite, false); err != nil {
 		return vmSpec{}, 0, err
@@ -147,7 +159,7 @@ func (r *Runtime) prepareWindowsDisk(ctx context.Context, spec vmruntime.Spec, o
 		fileBytes = st.Size()
 	}
 	r.logger.Info("Windows disk prepared", "sandbox_id", spec.SandboxID, "virtual_bytes", size, "file_bytes", fileBytes,
-		"copy_ms", copied.Sub(start).Milliseconds(), "resize_ms", time.Since(copied).Milliseconds())
+		"copy_ms", copied.Sub(copyStarted).Milliseconds(), "resize_ms", time.Since(copied).Milliseconds())
 	return vmSpec{Windows: true, AllowReset: true, Disk: disk}, size, nil
 }
 
