@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // happy-dom computes no layout and no cascade, so these tests check the
-// stylesheet source. The rendered widths are checked in a real browser by the
-// OwnSand console end-to-end test for a long dialog title.
+// stylesheet source. The OwnSand console end-to-end tests check the rendered
+// dialog and select popup widths in a browser.
 import { describe, expect, test } from "@rstest/core";
 import { block } from "./stylesheet-source.ts";
 
@@ -17,12 +17,12 @@ describe("long text in dialogs and the select popup", () => {
     expect(title).not.toContain("text-overflow");
   });
 
-  test("keeps the select popup inside the viewport", () => {
+  test("caps the select popup width even when the trigger is wider", () => {
     const content = block(".dui-select-content");
-    // The popup stays at least as wide as the trigger.
-    expect(content).toContain("min-width: var(--anchor-width)");
-    // `max-width` wins over `min-width`, so a wide trigger cannot push the
-    // popup past the viewport either. 16px is 8px on each side.
+    // The minimum takes precedence over the maximum, so cap both widths.
+    expect(content).toContain(
+      "min-width: min(var(--anchor-width), calc(100vw - 16px))",
+    );
     expect(content).toContain("max-width: calc(100vw - 16px)");
   });
 
