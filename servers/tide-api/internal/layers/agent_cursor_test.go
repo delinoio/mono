@@ -568,6 +568,97 @@ func TestCursorOrganizationDeletion(t *testing.T) {
 	stays(t, "the deleted organization's watch stays stopped", func() bool { return w.cursor.Streams() == 0 })
 }
 
+func TestCursorOrganizationDeletionKeepsTerminalHeldClaims(t *testing.T) {
+	timing := fastAgentTiming()
+	timing.PollInterval = time.Hour // Keep the poller from releasing the claims during the test.
+	w := newCursorWorldTiming(t, tidev1.GuestOs_GUEST_OS_LINUX, timing)
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
+	})
+	ctx := t.Context()
+	type request struct {
+		vendorID string
+		id       string
+		attempts int
+	}
+	claims := []request{{vendorID: "bc-ended-first"}, {vendorID: "bc-ended-second"}}
+	for i := range claims {
+		w.cursor.AddRequest(claims[i].vendorID, true)
+		claims[i].id = w.requestBySource(t, claims[i].vendorID).GetRequestId()
+	}
+
+	w.cursor.FailClaimCalls(true)
+	if _, err := w.env.User(w.org.Owner).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+		OrganizationId: w.org.ID, RunnerProfileId: w.profileID,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	for i := range claims {
+		w.waitRequest(t, claims[i].id, tidev1.RequestState_REQUEST_STATE_CANCELED)
+		claims[i].attempts = w.cursor.FailAttempts(claims[i].vendorID)
+	}
+
+	if err := w.deleteOrganization(ctx); connect.CodeOf(err) != connect.CodeInternal {
+		t.Fatalf("DeleteOrganization while Cursor returns 503 = %v, want internal", err)
+	}
+	for _, c := range claims {
+		w.assertOrganizationRetainedClaim(t, c.id, c.vendorID)
+		if got := w.cursor.FailAttempts(c.vendorID); got != c.attempts+1 {
+			t.Fatalf("Cursor fail attempts for %s = %d, want %d", c.vendorID, got, c.attempts+1)
+		}
+	}
+	t.Log("Cursor returned 503 for both ended claims. Tide kept both claims, the organization and the credential.")
+
+	w.cursor.FailClaimCalls(false)
+	if err := w.deleteOrganization(ctx); err != nil {
+		t.Fatalf("DeleteOrganization after Cursor recovered: %v", err)
+	}
+	for _, c := range claims {
+		if _, held := w.cursor.Claim(c.vendorID); held || w.cursor.FailAttempts(c.vendorID) != c.attempts+2 {
+			t.Fatalf("Cursor did not clear the retained claim for %s on the successful deletion retry", c.vendorID)
+		}
+	}
+	if err := w.getOrganization(ctx); connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("GetOrganization after successful deletion = %v, want not found", err)
+	}
+	t.Log("The next deletion call cleared both vendor claims and removed the organization.")
+}
+
+func TestCursorOrganizationDeletionReleasesBusyRunnerClaim(t *testing.T) {
+	timing := fastAgentTiming()
+	timing.PollInterval = time.Hour // Prevent a background release after the work hook ends the request.
+	w := newCursorWorldTiming(t, tidev1.GuestOs_GUEST_OS_LINUX, timing)
+	const id = "bc-busy"
+	w.cursor.AddRequest(id, true)
+	req := w.requestBySource(t, id)
+	workerID, held := w.cursor.Claim(id)
+	if !held {
+		t.Fatal("Cursor has no claim for the request")
+	}
+	eventually(t, "runner waits for work", func() bool {
+		runnerID := w.request(t, req.GetRequestId()).GetRunnerId()
+		return runnerID != "" && w.runner(t, runnerID).GetState() == tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+	})
+	w.cursor.Connect(workerID)
+	w.l.Agents.Poll(t.Context())
+	running := w.waitRequest(t, req.GetRequestId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+	w.waitRunner(t, running.GetRunnerId(), tidev1.RunnerState_RUNNER_STATE_BUSY)
+
+	if err := w.deleteOrganization(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, held := w.cursor.Claim(id); held {
+		t.Fatal("Cursor still holds the busy runner's claim after deletion")
+	}
+	if released := w.cursor.Released(id); released != 1 {
+		t.Fatalf("Cursor release count = %d, want 1", released)
+	}
+	if err := w.getOrganization(t.Context()); connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("GetOrganization after successful deletion = %v, want not found", err)
+	}
+	t.Log("Deletion ended the busy runner and cleared its vendor claim once before removing the organization.")
+}
+
 // cursorRequestReadFault cancels one GetRequest query for the selected
 // request. It leaves the joined claim query and the RPC context usable.
 type cursorRequestReadFault struct {
