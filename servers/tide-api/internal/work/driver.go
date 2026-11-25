@@ -593,8 +593,8 @@ func (e *Engine) startFailed(ctx context.Context, runner *Runner, cause string) 
 		if err != nil || (cur.State != runCreating && cur.State != runPrep && cur.State != runWarm) {
 			return err
 		}
-		// sandbox_cleanup keeps the sandbox deletion below durable: the
-		// reconciler retries it when it fails.
+		// Keep registration removal and sandbox deletion pending for the
+		// reconciler if the inline cleanup fails.
 		r, err = e.setRunnerTx(ctx, tx, runner.ID, []tidev1.RunnerState{cur.State}, runFailed, "end_reason = $4, sandbox_cleanup = $5",
 			int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED), cur.SandboxID != "")
 		if err != nil || r == nil {
@@ -627,11 +627,8 @@ func (e *Engine) startFailed(ctx context.Context, runner *Runner, cause string) 
 		e.svc.Logger.WarnContext(ctx, "warm_runner_fill_stopped", slog.String("organization_id", r.OrganizationID),
 			slog.String("runner_profile_id", r.ProfileID), slog.String("cause", cause))
 	}
-	// The registration removal is not repeated for a FAILED runner: its
-	// failure is logged, and the sandbox goes anyway.
-	_ = e.removeRegistration(context.WithoutCancel(ctx), r)
 	if r.SandboxID != "" {
-		if err := e.cleanUpEnded(context.WithoutCancel(ctx), r.ID, r.OrganizationID); err != nil {
+		if err := e.cleanUpEnded(ctx, r.ID, r.OrganizationID); err != nil {
 			e.svc.Logger.WarnContext(ctx, "runner_sandbox_cleanup_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
 			e.ensureDriver(r.ID)
 		}
@@ -644,17 +641,24 @@ func (e *Engine) startFailed(ctx context.Context, runner *Runner, cause string) 
 	}
 }
 
-// cleanUpEnded deletes a pending sandbox without changing the runner's
-// terminal state. Read the sandbox ID with the mark because a late
-// CreateSandbox response can set both after the caller reads the runner.
+// cleanUpEnded removes any registration left by a failed start and deletes
+// the pending sandbox. Read the runner with the mark because a late
+// CreateSandbox response can set the sandbox ID after the caller reads it.
 func (e *Engine) cleanUpEnded(ctx context.Context, runnerID, orgID string) error {
-	var sandboxID string
-	err := e.svc.DB.Pool.QueryRow(ctx, "SELECT COALESCE(ownsand_sandbox_id::text, '') FROM runners WHERE runner_id = $1 AND sandbox_cleanup", runnerID).Scan(&sandboxID)
+	ctx, cancel := context.WithTimeout(ctx, e.timing.terminalCleanupTimeout())
+	defer cancel()
+
+	r, err := scanRunner(e.svc.DB.Pool.QueryRow(ctx, "SELECT "+runnerColumns+" FROM runners WHERE runner_id = $1 AND organization_id = $2 AND sandbox_cleanup", runnerID, orgID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("read pending sandbox: %w", err)
+		return fmt.Errorf("read pending runner cleanup: %w", err)
+	}
+	if r.EndReason == tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+		if err := e.removeRegistration(ctx, r); err != nil {
+			return fmt.Errorf("remove registration before sandbox cleanup: %w", err)
+		}
 	}
 
 	// If the link is gone or OwnSand rejects the key, the sandbox's
@@ -663,8 +667,8 @@ func (e *Engine) cleanUpEnded(ctx context.Context, runnerID, orgID string) error
 	if err != nil && connect.CodeOf(err) != connect.CodeFailedPrecondition {
 		return fmt.Errorf("load OwnSand client for cleanup: %w", err)
 	}
-	if err == nil && sandboxID != "" {
-		if _, err := client.DeleteSandbox(ctx, sandboxID); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
+	if err == nil && r.SandboxID != "" {
+		if _, err := client.DeleteSandbox(ctx, r.SandboxID); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
 			return fmt.Errorf("delete sandbox: %w", err)
 		}
 	}

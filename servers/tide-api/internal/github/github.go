@@ -322,7 +322,7 @@ func (l *Layer) registration(ctx context.Context, q db.Querier, runnerID string)
 }
 
 func (l *Layer) markRemoved(ctx context.Context, runnerID string) {
-	if _, err := l.svc.DB.Pool.Exec(context.WithoutCancel(ctx), "UPDATE github_runners SET registration_removed = true WHERE runner_id = $1", runnerID); err != nil {
+	if _, err := l.svc.DB.Pool.Exec(ctx, "UPDATE github_runners SET registration_removed = true WHERE runner_id = $1", runnerID); err != nil {
 		l.svc.Logger.WarnContext(ctx, "github_registration_update_failed", slog.String("runner_id", runnerID), slog.Any("error", err))
 	}
 }

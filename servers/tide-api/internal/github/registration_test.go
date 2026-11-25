@@ -3,6 +3,7 @@
 package github_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -158,6 +159,134 @@ func TestJITRegistrationRollback(t *testing.T) {
 			if reg.JIT == "" || strings.Contains(logs, reg.JIT) || strings.Contains(w.ghLogs.String(), reg.JIT) {
 				t.Error("the fixture did not generate a JIT configuration or it appeared in the logs")
 			}
+		})
+	}
+}
+
+func TestJITRegistrationCleanupAfterStartFailure(t *testing.T) {
+	for _, status := range []int{http.StatusNoContent, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			w := newGHWorld(t, worldOpts{})
+			w.link(t, 501, "acme")
+			w.createProfile(t, ghProfile("linux", 0))
+
+			jitEntered, release := make(chan struct{}), make(chan struct{})
+			releaseJIT := sync.OnceFunc(func() { close(release) })
+			defer releaseJIT()
+			w.gh.Update(func() {
+				w.gh.JITGate = func() {
+					close(jitEntered)
+					<-release
+				}
+			})
+			w.send(t, "workflow_job", job("queued", 501, 1, tideLinux, ""))
+			select {
+			case <-jitEntered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("timed out waiting for JIT generation")
+			}
+			starting := w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_PREPARING)
+			if len(starting) != 1 {
+				t.Fatalf("preparing runners = %d, want 1", len(starting))
+			}
+			runnerID := starting[0].GetRunnerId()
+			runnerName := "tide-" + runnerID
+			w.os.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("fixture has no spare capacity"))
+				o.FileError = errors.New("injected JIT file write failure")
+				o.DeleteError = connect.NewWireError(connect.CodeUnavailable, errors.New("injected sandbox deletion failure"))
+			})
+			var mu sync.Mutex
+			var deletedIDs []int64
+			w.gh.Update(func() {
+				w.gh.JITGate = nil
+				w.gh.FailDelete = http.StatusServiceUnavailable
+				w.gh.DeleteGate = func(id int64) {
+					mu.Lock()
+					defer mu.Unlock()
+					deletedIDs = append(deletedIDs, id)
+				}
+			})
+			firstSandboxDelete := make(chan bool, 1)
+			w.os.SetDeleteHook(func(context.Context) error {
+				_, registered := w.gh.RunnerByName(runnerName)
+				select {
+				case firstSandboxDelete <- registered:
+				default:
+				}
+				return nil
+			})
+			releaseJIT()
+
+			eventually(t, "two GitHub deletion attempts with HTTP 503", func() bool {
+				return strings.Count(w.ghLogs.String(), `"op":"delete_runner","status":503`) >= 2
+			})
+			readCleanup := func() (id int64, pending, removed bool) {
+				t.Helper()
+				if err := w.env.DB.Pool.QueryRow(t.Context(), `SELECT g.github_runner_id, r.sandbox_cleanup, g.registration_removed
+					FROM runners r JOIN github_runners g USING (runner_id) WHERE r.runner_id = $1`, runnerID).Scan(&id, &pending, &removed); err != nil {
+					t.Fatal(err)
+				}
+				return id, pending, removed
+			}
+			storedID, pending, removed := readCleanup()
+			reg, registered := w.gh.RunnerByName(runnerName)
+			if !registered || storedID != reg.ID || !pending || removed || w.os.Active(w.osOrg) != 1 || w.os.Calls("DeleteSandbox") != 0 {
+				t.Fatal("retryable GitHub error failed to retain the registration, cleanup mark or sandbox")
+			}
+
+			// The give-up interval is for DELETING runners. Teardown of this
+			// FAILED runner must retain the OwnSand link when GitHub still fails.
+			w.env.Clock.Advance(2 * time.Minute)
+			_, err := w.env.User(w.org.Admin).OwnSandLink.RemoveOwnSandLink(t.Context(), connect.NewRequest(&tidev1.RemoveOwnSandLinkRequest{
+				OrganizationId: w.org.ID,
+			}))
+			if err == nil {
+				t.Fatal("OwnSand link removal succeeded while GitHub was unavailable")
+			}
+			if _, pending, removed = readCleanup(); !pending || removed || w.os.Calls("DeleteSandbox") != 0 {
+				t.Fatal("teardown lost the cleanup mark or began sandbox deletion")
+			}
+			t.Logf("GitHub returned HTTP 503 on repeated deletion of the stored registration. Tide kept the sandbox and cleanup mark. RemoveOwnSandLink returned %s.", connect.CodeOf(err))
+
+			if status == http.StatusNotFound {
+				w.gh.ForgetRunner(storedID)
+			}
+			w.gh.Update(func() { w.gh.FailDelete = 0 })
+			select {
+			case stillRegistered := <-firstSandboxDelete:
+				if stillRegistered {
+					t.Fatal("OwnSand received a delete while the runner was registered")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("OwnSand did not receive a deletion after GitHub recovery")
+			}
+			if _, pending, removed = readCleanup(); !pending || !removed || w.os.Active(w.osOrg) != 1 {
+				t.Fatal("failed OwnSand deletion did not retain the sandbox and completed registration removal")
+			}
+
+			calls := w.gh.Calls("delete_runner")
+			w.os.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
+			eventually(t, "cleanup mark cleared and sandbox deleted", func() bool {
+				_, pending, removed := readCleanup()
+				return !pending && removed && w.os.Active(w.osOrg) == 0
+			})
+			if got := w.gh.Calls("delete_runner"); got != calls {
+				t.Fatalf("GitHub deletions = %d, want %d after the registration was removed", got, calls)
+			}
+			mu.Lock()
+			for _, id := range deletedIDs {
+				if id != storedID {
+					mu.Unlock()
+					t.Fatalf("GitHub deletion targeted runner ID %d, want %d", id, storedID)
+				}
+			}
+			mu.Unlock()
+			if r := w.runner(t, runnerID); r.GetState() != tidev1.RunnerState_RUNNER_STATE_FAILED ||
+				r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+				t.Fatalf("runner after cleanup = %v, want FAILED with START_FAILED", r)
+			}
+			t.Logf("GitHub HTTP %d allowed OwnSand deletion. An OwnSand retry sent no additional GitHub deletion. GetRunner returned FAILED with START_FAILED after the mark cleared.", status)
 		})
 	}
 }

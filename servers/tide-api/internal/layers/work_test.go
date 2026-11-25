@@ -953,6 +953,103 @@ func TestStartFailureCleanupRetry(t *testing.T) {
 	})
 }
 
+func TestStartFailureCleanupRetryAfterCancellationAndTimeout(t *testing.T) {
+	timing := testenv.FastWorkTiming()
+	timing.TerminalCleanupTimeout = 2 * time.Second
+	w := newWorkWorldWithTiming(t, devsession.Timing{}, &timing)
+	w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+		code := int64(1)
+		return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
+	}, nil)
+
+	attempts := make(chan context.Context, 1)
+	allowDelete := make(chan struct{})
+	w.fake.SetDeleteHook(func(ctx context.Context) error {
+		select {
+		case attempts <- ctx:
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.Context().Done():
+			return t.Context().Err()
+		case <-allowDelete:
+			return nil
+		}
+	})
+	nextAttempt := func() context.Context {
+		t.Helper()
+		select {
+		case ctx := <-attempts:
+			return ctx
+		case <-time.After(5 * time.Second):
+			t.Fatal("OwnSand received no cleanup attempt")
+			return nil
+		}
+	}
+	assertAttemptEnded := func(ctx context.Context, want error) {
+		t.Helper()
+		select {
+		case <-ctx.Done():
+			if err := ctx.Err(); !errors.Is(err, want) {
+				t.Fatalf("cleanup attempt ended with %v, want %v", err, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("OwnSand cleanup attempt did not end with %v", want)
+		}
+	}
+
+	// A warm runner fails once and stays in backoff on the fixture clock.
+	w.createProfile(t, devProfileProto("warm", 1, 0))
+	inline := nextAttempt()
+	leaseReleased := make(chan struct{})
+	go func() {
+		defer close(leaseReleased)
+		w.env.App.Lease.Release()
+	}()
+	assertAttemptEnded(inline, context.Canceled)
+	select {
+	case <-leaseReleased:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup blocked lease release")
+	}
+
+	pool := w.env.DB.Pool
+	var runnerID string
+	if err := pool.QueryRow(t.Context(), "SELECT runner_id::text FROM runners WHERE organization_id = $1", w.org.ID).Scan(&runnerID); err != nil {
+		t.Fatal(err)
+	}
+	checkPending := func() bool {
+		t.Helper()
+		var pending bool
+		if err := pool.QueryRow(t.Context(), "SELECT sandbox_cleanup FROM runners WHERE runner_id = $1", runnerID).Scan(&pending); err != nil {
+			t.Fatal(err)
+		}
+		return pending
+	}
+	if !checkPending() || w.fake.Active(w.osOrg) != 1 {
+		t.Fatal("lease cancellation lost the cleanup mark or deleted the sandbox")
+	}
+	t.Log("OwnSand observed cancellation during lease release. The cleanup mark and sandbox remained.")
+
+	replica := w.env.NewReplica(t, testenv.WithLayerOptions(layers.Options{OwnSand: w.fake, WorkTiming: &timing}, &layers.Layers{}))
+	retry := nextAttempt()
+	assertAttemptEnded(retry, context.DeadlineExceeded)
+	if !replica.App.Lease.Held() || !checkPending() || w.fake.Active(w.osOrg) != 1 {
+		t.Fatal("the deadline lost the lease, lost the cleanup mark or deleted the sandbox")
+	}
+	t.Log("OwnSand observed the cleanup deadline while Tide held the lease. The cleanup mark and sandbox remained.")
+
+	close(allowDelete)
+	eventually(t, "cleanup completed", func() bool { return !checkPending() && w.fake.Active(w.osOrg) == 0 })
+	if r := w.runner(t, runnerID); r.GetState() != tidev1.RunnerState_RUNNER_STATE_FAILED ||
+		r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+		t.Fatalf("runner after cleanup = %v, want FAILED with START_FAILED", r)
+	}
+	t.Log("A later OwnSand call deleted the sandbox and cleared the mark. GetRunner returned FAILED with START_FAILED.")
+}
+
 func TestTerminalSandboxCleanupBeforeTeardown(t *testing.T) {
 	for _, teardown := range []struct {
 		name   string
