@@ -9,14 +9,19 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
-// stubGo replaces go. For `go build ... -o <path>` it records $GOARCH and
-// writes the freshly built "binary" to <path>, or it fails with
-// $STUB_GO_STATUS (default 0) after creating a partial file at <path>.
+// stubGo replaces only the guest build so publication uses the real lock helper.
+// It records $GOARCH and writes a fixture binary or fails with $STUB_GO_STATUS.
 const stubGo = `#!/usr/bin/env bash
+if [[ "${@: -1}" != ./cmds/ownsand-guest ]]; then
+  exec "$STUB_REAL_GO" "$@"
+fi
 out=""
 prev=""
 for arg in "$@"; do
@@ -88,6 +93,10 @@ func newImageBuild(t *testing.T) *imageBuild {
 			t.Skipf("%s is not available: %v", tool, err)
 		}
 	}
+	realGo, err := exec.LookPath("go")
+	if err != nil {
+		t.Skipf("go is not available: %v", err)
+	}
 	real, err := os.ReadFile("build-image.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -102,6 +111,17 @@ func newImageBuild(t *testing.T) *imageBuild {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(scripts, "build-kernel.sh"), []byte(stubKernel), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lockSource := filepath.Join("publishlock", "main.go")
+	helper, err := os.ReadFile(lockSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(scripts, "publishlock"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scripts, lockSource), helper, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	bin := filepath.Join(dir, "bin")
@@ -127,15 +147,20 @@ func newImageBuild(t *testing.T) *imageBuild {
 		env: []string{
 			"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
 			"STUB_LOG_DIR=" + logs,
+			"STUB_REAL_GO=" + realGo,
 			"TMPDIR=" + tmp,
 		},
 	}
 }
 
-func (b *imageBuild) run(arch string, extra ...string) (string, error) {
+func (b *imageBuild) command(arch string, extra ...string) *exec.Cmd {
 	cmd := exec.Command("bash", b.script, arch, b.out)
 	cmd.Env = append(append(os.Environ(), b.env...), extra...)
-	out, err := cmd.CombinedOutput()
+	return cmd
+}
+
+func (b *imageBuild) run(arch string, extra ...string) (string, error) {
+	out, err := b.command(arch, extra...).CombinedOutput()
 	return string(out), err
 }
 
@@ -227,7 +252,7 @@ func (b *imageBuild) requireNoStage() {
 			b.t.Fatal(err)
 		}
 		for _, e := range entries {
-			if strings.Contains(e.Name(), "stage") || e.Name() == ".ownsand-image-publish.lock" {
+			if strings.Contains(e.Name(), "stage") {
 				b.t.Fatalf("the build left %q in %s", e.Name(), filepath.Base(dir))
 			}
 		}
@@ -464,29 +489,165 @@ func TestPublicationRejectsADirectoryAtAnOutputPath(t *testing.T) {
 	if out, err := b.run("arm64"); err == nil || !strings.Contains(out, "output path is a directory: "+config) {
 		t.Fatalf("want an output directory error, got %v\n%s", err, out)
 	}
-	entries, err := os.ReadDir(b.out)
-	if err != nil || len(entries) != 1 || entries[0].Name() != "vmlinux.config" || !entries[0].IsDir() {
-		t.Fatalf("want only the existing directory, got %v (read error: %v)", entries, err)
-	}
-	entries, err = os.ReadDir(config)
+	b.requireNoStage()
+	b.requireRegularLock()
+	entries, err := os.ReadDir(config)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("want the existing directory to stay empty, got %v (read error: %v)", entries, err)
 	}
 }
 
-func TestBuildDoesNotPublishWhileAnotherRunHoldsTheLock(t *testing.T) {
+func (b *imageBuild) lockPath() string {
+	return filepath.Join(b.out, ".ownsand-image-publish.lock")
+}
+
+func (b *imageBuild) requireRegularLock() os.FileInfo {
+	b.t.Helper()
+	info, err := os.Lstat(b.lockPath())
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() {
+		b.t.Fatalf("expected a regular lock file, got %v", info.Mode())
+	}
+	return info
+}
+
+func TestPublicationLockReleasesAfterPublisherIsKilled(t *testing.T) {
 	b := newImageBuild(t)
 	b.seedImage("amd64")
-	lock := filepath.Join(b.out, ".ownsand-image-publish.lock")
+	realCP, err := exec.LookPath("cp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const pause = `#!/usr/bin/env bash
+if [[ -n "${STUB_PAUSE_BACKUP:-}" && "$3" == */vmlinux && "$4" == */previous/vmlinux ]]; then
+  printf '%s\n' "$$" > "$STUB_PAUSE_BACKUP"
+  exec sleep 60
+fi
+exec "$STUB_REAL_CP" "$@"
+`
+	if err := os.WriteFile(filepath.Join(b.dir, "bin", "cp"), []byte(pause), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(b.logs, "backup.pid")
+	log, err := os.Create(filepath.Join(b.logs, "publisher.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { log.Close() })
+	holder := b.command("arm64", "STUB_PAUSE_BACKUP="+ready, "STUB_REAL_CP="+realCP)
+	holder.Stdout, holder.Stderr = log, log
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if holder.ProcessState == nil {
+			_ = holder.Process.Kill()
+			_ = holder.Wait()
+		}
+	})
+
+	var child *os.Process
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(ready)
+		if err == nil {
+			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err == nil && len(data) > 0 && data[len(data)-1] == '\n' {
+				child, err = os.FindProcess(pid)
+				if err != nil {
+					t.Fatal(err)
+				}
+				break
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if child == nil {
+		t.Fatalf("publisher did not reach the first backup copy:\n%s", b.readLog("publisher.log"))
+	}
+	t.Cleanup(func() { _ = child.Kill() })
+	lock := b.requireRegularLock()
+	holderStage := filepath.Dir(b.readLog("stage.path"))
+
+	if out, err := b.run("arm64", "STUB_REAL_CP="+realCP); err == nil ||
+		!strings.Contains(out, b.lockPath()+": another publisher holds the lock") {
+		t.Fatalf("want a publication lock contention error, got %v\n%s", err, out)
+	}
+	b.requireImage("amd64")
+	stages, err := filepath.Glob(filepath.Join(b.out, ".ownsand-image-stage.*"))
+	if err != nil || !slices.Equal(stages, []string{holderStage}) {
+		t.Fatalf("want only the holder's stage, got %v (glob error: %v)", stages, err)
+	}
+
+	other := *b
+	other.out = filepath.Join(b.dir, "independent-output")
+	if out, err := other.run("arm64", "STUB_REAL_CP="+realCP); err != nil {
+		t.Fatalf("an independent destination could not publish: %v\n%s", err, out)
+	}
+	other.requireImage("arm64")
+	other.requireNoStage()
+
+	if err := holder.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Wait(); err == nil {
+		t.Fatal("the killed publisher reported success")
+	}
+	b.requireImage("amd64")
+	// Leave the paused copy alive during the retry to check descriptor inheritance.
+	if out, err := b.run("arm64", "STUB_REAL_CP="+realCP); err != nil {
+		t.Fatalf("retry failed while the old copy was still paused: %v\n%s", err, out)
+	}
+	b.requireImage("arm64")
+	if !os.SameFile(lock, b.requireRegularLock()) {
+		t.Fatal("the retry replaced the persistent lock file")
+	}
+	stages, err = filepath.Glob(filepath.Join(b.out, ".ownsand-image-stage.*"))
+	if err != nil || !slices.Equal(stages, []string{holderStage}) {
+		t.Fatalf("want only the killed publisher's stage, got %v (glob error: %v)", stages, err)
+	}
+}
+
+func TestPublicationRejectsLegacyLockDirectory(t *testing.T) {
+	b := newImageBuild(t)
+	b.seedImage("amd64")
+	lock := b.lockPath()
 	if err := os.Mkdir(lock, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := b.run("arm64"); err == nil || !strings.Contains(out, "could not acquire image publication lock: "+lock) {
-		t.Fatalf("want a publication lock error, got %v\n%s", err, out)
+	sentinel := filepath.Join(lock, "keep")
+	if err := os.WriteFile(sentinel, []byte("legacy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := b.run("arm64")
+	if err == nil || !strings.Contains(out, "legacy image publication lock directory: "+lock) ||
+		!strings.Contains(out, "Confirm no older image builder is active before removing the empty directory with rmdir.") {
+		t.Fatalf("want legacy lock removal guidance, got %v\n%s", err, out)
 	}
 	b.requireImage("amd64")
-	if err := os.Remove(lock); err != nil {
-		t.Fatalf("the build did not preserve the other run's lock: %v", err)
-	}
 	b.requireNoStage()
+	if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "legacy" {
+		t.Fatalf("legacy lock directory contents changed: %q (read error: %v)", contents, err)
+	}
+}
+
+func TestPublicationRejectsSymbolicLinkAtLockPath(t *testing.T) {
+	b := newImageBuild(t)
+	b.seedImage("amd64")
+	if err := os.Symlink("vmlinux", b.lockPath()); err != nil {
+		t.Fatal(err)
+	}
+	out, err := b.run("arm64")
+	if err == nil || !strings.Contains(out, "image publication lock path is not a regular file: "+b.lockPath()) {
+		t.Fatalf("want an unsupported lock type error, got %v\n%s", err, out)
+	}
+	b.requireImage("amd64")
+	b.requireNoStage()
+	if target, err := os.Readlink(b.lockPath()); err != nil || target != "vmlinux" {
+		t.Fatalf("lock path changed: target %q (read error: %v)", target, err)
+	}
 }
