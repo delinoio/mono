@@ -111,7 +111,6 @@ func TestFakeReadBinding(t *testing.T) {
 	t.Run("concurrent first reads", func(t *testing.T) {
 		const id = "concurrent-read"
 		sessions := [2]*tidev1.DevSession{first, second}
-		want := [2]string{replacement, independent}
 		var results [2]readResult
 		var requests sync.WaitGroup
 		start := make(chan struct{})
@@ -124,12 +123,17 @@ func TestFakeReadBinding(t *testing.T) {
 		close(start)
 		requests.Wait()
 
+		// Until the minimum Go version includes the fix for golang/go#80127,
+		// select the expected string directly to avoid an ARM64 stack slot overlap.
 		winner, loser := 0, 1
+		want := replacement
 		if results[0].err != nil {
 			winner, loser = 1, 0
+			want = independent
 		}
-		checkRead(t, results[winner], want[winner], int64(len(want[winner])))
+		size := int64(len(want))
+		checkRead(t, results[winner], want, size)
 		checkRejected(t, results[loser], connect.CodeAlreadyExists)
-		checkRead(t, read(sessions[winner], id, path, 1), want[winner][1:], int64(len(want[winner])))
+		checkRead(t, read(sessions[winner], id, path, 1), want[1:], size)
 	})
 }
