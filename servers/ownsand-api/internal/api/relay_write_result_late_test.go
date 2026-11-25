@@ -8,25 +8,24 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 
+	"github.com/delinoio/mono/go/ownsand/datapath"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
-// holdWriteResult makes the WriteFile handler wait, after it took the agent's
-// write result off the stream queue, until the call deadline has expired. It
-// returns a channel that closes when the handler reached that point. The hook
-// waits on the context of the call deadline, not on the clock, so the call is
-// expired for certain when the handler goes on.
-func holdWriteResult(t *testing.T, c *writeResultCall) <-chan struct{} {
+// holdWriteResponse pauses the handler after it dequeues an agent response
+// until the call context ends. The channel signals that the handler paused.
+func holdWriteResponse(t *testing.T, c *writeResultCall) <-chan struct{} {
 	t.Helper()
 	reached := make(chan struct{})
 	plane := c.env.App.Plane
-	plane.SetAfterWriteResultDequeuedForTest(func(cctx context.Context) {
+	plane.SetAfterWriteResponseDequeuedForTest(func(cctx context.Context) {
 		close(reached)
 		<-cctx.Done()
 	})
-	t.Cleanup(func() { plane.SetAfterWriteResultDequeuedForTest(nil) })
+	t.Cleanup(func() { plane.SetAfterWriteResponseDequeuedForTest(nil) })
 	return reached
 }
 
@@ -37,7 +36,7 @@ func holdWriteResult(t *testing.T, c *writeResultCall) <-chan struct{} {
 // record nor consumed (no window update returns its credit).
 func TestRelayWriteFileLateResultIsRejected(t *testing.T) {
 	c := startWriteResultCall(t, 3*time.Second)
-	reached := holdWriteResult(t, c)
+	reached := holdWriteResponse(t, c)
 	c.sendWriteResult()
 	select {
 	case <-reached:
@@ -68,7 +67,7 @@ func TestRelayWriteFileLateResultIsRejected(t *testing.T) {
 // expired call deadline.
 func TestRelayWriteFileLateResultCallerCancelWins(t *testing.T) {
 	c := startWriteResultCall(t, 3*time.Second)
-	reached := holdWriteResult(t, c)
+	reached := holdWriteResponse(t, c)
 	c.sendWriteResult()
 	select {
 	case <-reached:
@@ -85,4 +84,47 @@ func TestRelayWriteFileLateResultCallerCancelWins(t *testing.T) {
 	c.relay.WaitFrame("stream close", func(f *ownsandv1.DataFrame) bool {
 		return f.GetStreamId() == c.stream && f.GetRelayStreamClose() != nil
 	})
+}
+
+// TestRelayWriteFileLateTerminalResponse checks that local cancellation and
+// expiry take precedence over both types of queued terminal agent frame.
+func TestRelayWriteFileLateTerminalResponse(t *testing.T) {
+	for _, terminal := range writeTerminalResponses() {
+		for _, code := range []connect.Code{connect.CodeDeadlineExceeded, connect.CodeCanceled} {
+			t.Run(terminal.name+"/"+code.String(), func(t *testing.T) {
+				c := startWriteResultCall(t, 3*time.Second)
+				defer c.sendWriteResult()
+				reached := holdWriteResponse(t, c)
+				c.relay.SendFrame(datapath.MustNewFrame(c.stream, c.sandboxID, terminal.payload))
+				select {
+				case <-reached:
+				case <-time.After(5 * time.Second):
+					t.Fatal("the handler never dequeued the terminal frame")
+				}
+				if code == connect.CodeCanceled {
+					c.cancel()
+				}
+				err := c.waitDone(t, 5*time.Second)
+				if testenv.Code(err) != code || errDetail(err) != nil {
+					t.Fatalf("WriteFile = %v, detail %v, want local %s", err, errDetail(err), code)
+				}
+				waitRelayRPC(t, c.env, c.grant, code)
+				c.relay.WaitFrame("stream close", func(f *ownsandv1.DataFrame) bool {
+					return f.GetStreamId() == c.stream && f.GetRelayStreamClose() != nil
+				})
+			})
+		}
+	}
+}
+
+type writeTerminalResponse struct {
+	name    string
+	payload proto.Message
+}
+
+func writeTerminalResponses() []writeTerminalResponse {
+	return []writeTerminalResponse{
+		{"error", &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, Message: "the write was rejected"}},
+		{"session_end", &ownsandv1.SessionEnd{Reason: ownsandv1.SessionEndReason_SESSION_END_REASON_GRANT_INVALID}},
+	}
 }

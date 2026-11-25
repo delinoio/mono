@@ -77,14 +77,13 @@ func (c *Control) SetLatestIDForTest(fn func(ctx context.Context) (int64, error)
 	return previous
 }
 
-// SetAfterWriteResultDequeuedForTest sets a hook that WriteFile runs after it
-// took the agent's write result off the stream queue and before it checks the
-// call deadline; the hook gets the call-deadline context. nil removes it. A
-// test blocks the handler there until the deadline has expired.
-func (p *DataPlane) SetAfterWriteResultDequeuedForTest(fn func(cctx context.Context)) {
+// SetAfterWriteResponseDequeuedForTest sets a hook that WriteFile runs with
+// the call context after dequeuing a result or terminal frame and before
+// checking the deadline. A nil hook removes it.
+func (p *DataPlane) SetAfterWriteResponseDequeuedForTest(fn func(cctx context.Context)) {
 	if fn == nil {
-		p.afterWriteResultDequeued.Store(nil)
+		p.afterWriteResponseDequeued.Store(nil)
 		return
 	}
-	p.afterWriteResultDequeued.Store(&fn)
+	p.afterWriteResponseDequeued.Store(&fn)
 }

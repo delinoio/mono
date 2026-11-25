@@ -735,11 +735,8 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 	for {
 		f, nerr := c.stream.Next(cctx, nil)
 		if nerr != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if cctx.Err() != nil {
-				return nil, connect.NewError(connect.CodeDeadlineExceeded, errors.New("the write did not finish within the call deadline"))
+			if err := writeCallContextError(ctx, cctx); err != nil {
+				return nil, err
 			}
 			if errors.Is(nerr, relay.ErrUnknownKind) {
 				// The relay already ended the stream with an error frame.
@@ -748,45 +745,41 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 			}
 			return nil, errUnavailable("the relay connection closed")
 		}
-		if e, ok := endFromAgent(f); ok {
+		agentErr, ended := endFromAgent(f)
+		result := f.GetFileWriteResult()
+		if !ended && result == nil {
+			continue
+		}
+		if hook := h.afterWriteResponseDequeued.Load(); hook != nil {
+			(*hook)(cctx)
+		}
+		// Next can return a queued frame after the call context ends.
+		// Check the budget before accepting any agent response.
+		if err := writeCallContextError(ctx, cctx); err != nil {
+			return nil, err
+		}
+		if ended {
 			sendClose = false
-			return nil, e
+			return nil, agentErr
 		}
-		if r := f.GetFileWriteResult(); r != nil {
-			if hook := h.afterWriteResultDequeued.Load(); hook != nil {
-				(*hook)(cctx)
-			}
-			// Next returns a result that is already queued without looking at
-			// the contexts, so the budget can expire between the arrival of
-			// the result and this point. An expired call does not accept the
-			// result: it is neither counted nor consumed, and the deferred
-			// close tells the agent the stream is over. The caller keeps its
-			// precedence, as when Next fails.
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if cctx.Err() != nil {
-				return nil, connect.NewError(connect.CodeDeadlineExceeded, errors.New("the write did not finish within the call deadline"))
-			}
-			c.frames++
-			c.bytes += datapath.FrameCost(f)
-			// Returning the credit of the result waits for room in the shared
-			// outbound queue of the agent connection, which a stalled agent can
-			// keep full. Bound that wait by the call deadline too, so a
-			// pending credit return cannot hold the call (and the stream's
-			// reserved close frame, which is queued only after this call
-			// returns) beyond the request deadline. The result counts as
-			// received either way: its frame and bytes are accounted above.
-			c.stream.Consumed(cctx, f)
-			if ctx.Err() != nil {
-				// The caller left first and keeps its precedence, as when
-				// Next fails.
-				return nil, ctx.Err()
-			}
-			if cctx.Err() != nil {
-				return nil, connect.NewError(connect.CodeDeadlineExceeded, errors.New("the write did not finish within the call deadline"))
-			}
-			return connect.NewResponse(r), nil
+		c.frames++
+		c.bytes += datapath.FrameCost(f)
+		// Returning credit can wait for room in the agent connection's
+		// outbound queue. Bound that wait by the call deadline too.
+		c.stream.Consumed(cctx, f)
+		if err := writeCallContextError(ctx, cctx); err != nil {
+			return nil, err
 		}
+		return connect.NewResponse(result), nil
 	}
+}
+
+func writeCallContextError(caller, call context.Context) error {
+	if err := caller.Err(); err != nil {
+		return err
+	}
+	if call.Err() != nil {
+		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("the write did not finish within the call deadline"))
+	}
+	return nil
 }
