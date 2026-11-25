@@ -16,6 +16,7 @@
 package images
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -196,32 +197,62 @@ func (r RecoverResult) String() string {
 // takes precedence over any leftover backup, and Recover never touches the
 // build directory.
 //
-// Recover takes the lock of the image destination without waiting, only when
-// it has something to restore, so it never exchanges directories under a
-// running Install; it returns RecoverDeferred then. A caller that already
-// holds the lock (Install) must not call it.
+// Recover takes the build and publication locks without waiting when there
+// is a backup to restore. It returns RecoverDeferred if either lock is busy.
 func Recover(dir string) (RecoverResult, error) {
 	if res, needed := recoveryNeeded(dir); !needed {
 		return res, nil
 	}
-	lock, err := TryLock(dir)
+	res, err := recoverWithLocks(dir, tryLock)
 	if errors.Is(err, ErrLocked) {
-		slog.Debug("image recovery deferred: another process holds the image lock", "dir", dir, "lock_path", LockPath(dir))
+		slog.Debug("image recovery deferred: another process holds an image lock", "dir", dir)
 		return RecoverDeferred, nil
 	}
+	return res, err
+}
+
+func recoverWithLocks(dir string, acquire func(string, lockMode) (*Lock, error)) (RecoverResult, error) {
+	build, err := acquire(LockPath(dir), exclusiveLock)
 	if err != nil {
 		return RecoverNone, fmt.Errorf("images: recover %s: %w", dir, err)
 	}
-	defer func() {
-		if rerr := lock.Release(); rerr != nil {
-			slog.Warn("release the image lock failed", "lock_path", LockPath(dir), "error", rerr)
-		}
-	}()
+	defer build.releaseAndLog()
+	publication, err := acquire(publicationLockPath(dir), exclusiveLock)
+	if err != nil {
+		return RecoverNone, fmt.Errorf("images: recover %s: %w", dir, err)
+	}
+	defer publication.releaseAndLog()
 	return recoverLocked(dir)
 }
 
-// recoveryNeeded reports, without a lock, whether a backup should be
-// restored; when it is not needed it also returns the result to report.
+// WithBaseImage keeps the installed image stable until read returns. Read
+// must finish all validation and copies that use the base directory before
+// returning. When a backup needs recovery, release shared access before
+// taking the build and publication locks, then select the image again.
+func WithBaseImage(ctx context.Context, dir string, read func() error) error {
+	for {
+		lock, err := waitLock(ctx, publicationLockPath(dir), sharedLock)
+		if err != nil {
+			return fmt.Errorf("images: read %s: %w", dir, err)
+		}
+		if _, needed := recoveryNeeded(dir); !needed {
+			defer lock.releaseAndLog()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return read()
+		}
+		lock.releaseAndLog()
+		if _, err := recoverWithLocks(dir, func(path string, mode lockMode) (*Lock, error) {
+			return waitLock(ctx, path, mode)
+		}); err != nil {
+			return err
+		}
+	}
+}
+
+// recoveryNeeded reports whether a backup should be restored. A caller
+// that will rename directories must recheck under exclusive publication access.
 func recoveryNeeded(dir string) (RecoverResult, bool) {
 	if Complete(dir) {
 		return RecoverNone, false
@@ -232,7 +263,7 @@ func recoveryNeeded(dir string) (RecoverResult, bool) {
 	return RecoverNone, true
 }
 
-// recoverLocked is Recover for a caller that holds the lock of dir.
+// recoverLocked requires the build lock and exclusive publication access.
 func recoverLocked(dir string) (RecoverResult, error) {
 	if res, needed := recoveryNeeded(dir); !needed {
 		return res, nil
@@ -270,16 +301,21 @@ func Resolve(dir string) (Metadata, error) {
 }
 
 // Install replaces the image directory dir with the finished build
-// directory. The caller holds the lock of the image destination (TryLock),
-// which keeps Recover of a reader out of the two renames.
+// directory. The caller holds the build lock. Install takes exclusive
+// publication access before it performs recovery or exchanges directories.
 //
 // The old image moves aside first and stays until the new image is in place,
 // so at every point of the exchange one complete image exists, under dir or
-// under `<dir>.old`. Install first calls Recover, so an exchange that an
+// under `<dir>.old`. Install first recovers the backup, so an exchange that an
 // earlier process left half done is repaired instead of deleted, and it
 // removes a leftover `<dir>.old` only when dir holds a complete image. When
 // the second rename fails, the old image moves back.
-func Install(dir string) error {
+func Install(ctx context.Context, dir string) error {
+	lock, err := waitLock(ctx, publicationLockPath(dir), exclusiveLock)
+	if err != nil {
+		return fmt.Errorf("images: install %s: %w", dir, err)
+	}
+	defer lock.releaseAndLog()
 	if _, err := recoverLocked(dir); err != nil {
 		return err
 	}

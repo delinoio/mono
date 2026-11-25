@@ -165,7 +165,7 @@ func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
 		MinimumCPUCount:  minCPUs,
 		MinimumMemoryMiB: minMemMiB,
 	}
-	if err := finishMacOSImage(dir, metadata, downloadedIPSW, func() (string, error) {
+	if err := finishMacOSImage(ctx, dir, metadata, downloadedIPSW, func() (string, error) {
 		return firstBootMacOS(ctx, machine, logger)
 	}); err != nil {
 		return err
@@ -174,7 +174,7 @@ func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
 	return nil
 }
 
-func finishMacOSImage(dir string, metadata images.Metadata, downloadedIPSW string, firstBoot func() (string, error)) error {
+func finishMacOSImage(ctx context.Context, dir string, metadata images.Metadata, downloadedIPSW string, firstBoot func() (string, error)) error {
 	helper, err := firstBoot()
 	if err != nil {
 		return err
@@ -187,7 +187,7 @@ func finishMacOSImage(dir string, metadata images.Metadata, downloadedIPSW strin
 	if downloadedIPSW != "" {
 		os.Remove(downloadedIPSW)
 	}
-	return images.Install(dir)
+	return images.Install(ctx, dir)
 }
 
 // downloadRestoreImage downloads the latest restore image that this Mac

@@ -31,11 +31,11 @@ func build(t *testing.T, dir, marker string, withMetadata bool) {
 func TestInstallReplacesTheImage(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), images.MacOSDir)
 	build(t, dir, "one", true)
-	if err := images.Install(dir); err != nil {
+	if err := images.Install(t.Context(), dir); err != nil {
 		t.Fatal(err)
 	}
 	build(t, dir, "two", true)
-	if err := images.Install(dir); err != nil {
+	if err := images.Install(t.Context(), dir); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(dir, "disk")); string(b) != "two" {
@@ -55,11 +55,11 @@ func TestInstallReplacesTheImage(t *testing.T) {
 func TestInstallKeepsTheOldImageWithoutMetadata(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), images.WindowsDir)
 	build(t, dir, "one", true)
-	if err := images.Install(dir); err != nil {
+	if err := images.Install(t.Context(), dir); err != nil {
 		t.Fatal(err)
 	}
 	build(t, dir, "partial", false)
-	if err := images.Install(dir); err == nil {
+	if err := images.Install(t.Context(), dir); err == nil {
 		t.Fatal("a build without metadata was installed")
 	}
 	if b, _ := os.ReadFile(filepath.Join(dir, "disk")); string(b) != "one" {
@@ -182,7 +182,7 @@ func TestInstallAfterAnInterruptedExchangeKeepsAndThenReplacesTheOnlyImage(t *te
 	if err := os.MkdirAll(images.BuildDir(dir), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := images.Install(dir); err == nil {
+	if err := images.Install(t.Context(), dir); err == nil {
 		t.Fatal("a build without metadata was installed")
 	}
 	if got := diskOf(t, dir); got != "old" {
@@ -197,7 +197,7 @@ func TestInstallAfterAnInterruptedExchangeKeepsAndThenReplacesTheOnlyImage(t *te
 		t.Fatal(err)
 	}
 	writeImage(t, images.BuildDir(dir), "new")
-	if err := images.Install(dir); err != nil {
+	if err := images.Install(t.Context(), dir); err != nil {
 		t.Fatal(err)
 	}
 	if got := diskOf(t, dir); got != "new" {
@@ -224,7 +224,7 @@ func TestInstallKeepsTheOldImageWhenThePublishAndTheRestoreFail(t *testing.T) {
 		}
 		return os.Rename(from, to)
 	})
-	err := images.Install(dir)
+	err := images.Install(t.Context(), dir)
 	restore()
 	if !errors.Is(err, injected) {
 		t.Fatalf("Install = %v", err)
@@ -234,7 +234,7 @@ func TestInstallKeepsTheOldImageWhenThePublishAndTheRestoreFail(t *testing.T) {
 	}
 
 	// The next call recovers it; the retry then publishes the new image.
-	if err := images.Install(dir); err != nil {
+	if err := images.Install(t.Context(), dir); err != nil {
 		t.Fatal(err)
 	}
 	if got := diskOf(t, dir); got != "new" {
@@ -253,7 +253,7 @@ func TestInstallRestoresTheOldImageWhenOnlyThePublishFails(t *testing.T) {
 		}
 		return os.Rename(from, to)
 	})
-	err := images.Install(dir)
+	err := images.Install(t.Context(), dir)
 	restore()
 	if !errors.Is(err, injected) {
 		t.Fatalf("Install = %v", err)
@@ -303,7 +303,7 @@ func TestRecoverPrefersAValidCanonicalImage(t *testing.T) {
 	}
 	// The next Install removes the leftover.
 	writeImage(t, images.BuildDir(dir), "new")
-	if err := images.Install(dir); err != nil {
+	if err := images.Install(t.Context(), dir); err != nil {
 		t.Fatal(err)
 	}
 	if exists(dir + ".old") {
