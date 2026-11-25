@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"strconv"
 	"time"
 
@@ -277,11 +279,15 @@ func (h *Hub) lockDemandProfile(ctx context.Context, tx pgx.Tx, in integration.I
 //     the vendor request ID, with `#<n>` for a later request of the same
 //     vendor request (a Cursor follow-up or a Devin resume reuses the ID);
 //     see nextSourceKey.
-func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d Demand) error {
+func (h *Hub) admit(ctx, leaseContext context.Context, v Vendor, in integration.Integration, d Demand) error {
 	logAttrs := []slog.Attr{slog.String("organization_id", in.OrganizationID), slog.String("agent_integration_id", in.ID),
 		slog.String("vendor", VendorLabel(in.Vendor)), slog.String("vendor_request_id", d.VendorRequestID)}
-	unlock := h.lockVendorRequest(in.OrganizationID, in.Vendor, d.VendorRequestID)
+	vendorKey := vendorRequestKey{in.OrganizationID, in.Vendor, d.VendorRequestID}
+	unlock := h.lockVendorRequest(vendorKey)
 	defer unlock()
+	if h.reconcileAdmission(leaseContext, vendorKey) == admissionUnresolved {
+		return nil
+	}
 	c, req, err := h.latestClaim(ctx, h.svc.DB.Pool, in.OrganizationID, in.Vendor, d.VendorRequestID)
 	if err != nil {
 		return err
@@ -348,7 +354,7 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 	}
 	claim := &Claim{RequestID: requestID, OrganizationID: in.OrganizationID, IntegrationID: in.ID, Vendor: in.Vendor, VendorRequestID: d.VendorRequestID,
 		DemandMarker: d.Marker, WorkerID: workerID, Scope: d.Scope, State: ClaimHeld}
-	var created bool
+	var transactionID string
 	err = h.inTx(ctx, func(tx pgx.Tx) error {
 		p, err := h.lockDemandProfile(ctx, tx, in, profileID)
 		if errors.Is(err, ErrNoProfile) {
@@ -359,32 +365,149 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 			return err
 		}
 		r, ok, err := h.engine.CreateRequest(ctx, tx, work.NewRequest{Profile: p, Source: v.Source(), SourceKey: key, RequestID: requestID})
-		created = ok
 		if err != nil || !ok {
 			return err
 		}
 		now := h.svc.NowUTC()
-		_, err = tx.Exec(ctx, `INSERT INTO agent_claims (request_id, organization_id, agent_integration_id, vendor, vendor_request_id, demand_marker,
-			worker_id, scope, state, create_time, update_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
-			r.ID, in.OrganizationID, in.ID, int16(in.Vendor), d.VendorRequestID, d.Marker, workerID, d.Scope, int16(ClaimHeld), now)
-		return err
-	})
-	if err != nil || !created {
-		// Give the claim back when this admission did not store a request,
-		// so the vendor does not wait for a worker that never comes.
-		probe := &work.Request{ID: requestID, OrganizationID: in.OrganizationID, State: tidev1.RequestState_REQUEST_STATE_CANCELED,
-			EndReason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE}
-		if _, rerr := v.Release(context.WithoutCancel(ctx), in, claim, probe); rerr != nil {
-			h.log.LogAttrs(ctx, slog.LevelWarn, "agent_claim_release_failed", append(logAttrs, slog.Any("error", rerr))...)
+		// Record the top-level transaction ID only when the callback
+		// succeeds. Any later InTx error is then from COMMIT.
+		var xid string
+		if err := tx.QueryRow(ctx, `INSERT INTO agent_claims (request_id, organization_id, agent_integration_id, vendor, vendor_request_id, demand_marker,
+			worker_id, scope, state, create_time, update_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+			RETURNING pg_current_xact_id()::text`,
+			r.ID, in.OrganizationID, in.ID, int16(in.Vendor), d.VendorRequestID, d.Marker, workerID, d.Scope, int16(ClaimHeld), now).Scan(&xid); err != nil {
+			return err
 		}
-		if err != nil {
-			return fmt.Errorf("store request: %w", err)
-		}
+		transactionID = xid
 		return nil
+	})
+	admission := pendingAdmission{claim: claim, integration: in, profileID: profileID, transactionID: transactionID, leaseDone: leaseContext.Done()}
+	switch {
+	case transactionID == "" || errors.Is(err, pgx.ErrTxCommitRollback):
+		h.releaseUnusedClaim(context.WithoutCancel(ctx), admission)
+	case err == nil:
+		h.admissionCommitted(ctx, admission)
+	default:
+		h.claimLocksMu.Lock()
+		h.pendingAdmissions[vendorKey] = admission
+		h.claimLocksMu.Unlock()
+		switch h.reconcileAdmission(leaseContext, vendorKey) {
+		case admissionCommitted:
+			return nil
+		case admissionUnresolved:
+			h.log.LogAttrs(ctx, slog.LevelWarn, "agent_admission_outcome_unknown", append(logAttrs, slog.String("request_id", requestID))...)
+		}
 	}
-	h.log.LogAttrs(ctx, slog.LevelInfo, "agent_request_claimed", append(logAttrs, slog.String("request_id", requestID), slog.String("runner_profile_id", profileID))...)
-	h.svc.WorkChanged(in.OrganizationID)
+	if err != nil {
+		return fmt.Errorf("store request: %w", err)
+	}
 	return nil
+}
+
+type pendingAdmission struct {
+	claim         *Claim
+	integration   integration.Integration
+	profileID     string
+	transactionID string
+	leaseDone     <-chan struct{}
+}
+
+type admissionOutcome string
+
+const (
+	admissionUnresolved admissionOutcome = "in progress"
+	admissionCommitted  admissionOutcome = "committed"
+	admissionAborted    admissionOutcome = "aborted"
+	admissionAbsent     admissionOutcome = ""
+)
+
+const admissionProbeTimeout = 2 * time.Second
+
+func (h *Hub) admissionCommitted(ctx context.Context, p pendingAdmission) {
+	h.log.InfoContext(ctx, "agent_request_claimed", slog.String("organization_id", p.claim.OrganizationID),
+		slog.String("agent_integration_id", p.claim.IntegrationID), slog.String("vendor", VendorLabel(p.claim.Vendor)),
+		slog.String("vendor_request_id", p.claim.VendorRequestID), slog.String("request_id", p.claim.RequestID),
+		slog.String("runner_profile_id", p.profileID))
+	h.svc.WorkChanged(p.claim.OrganizationID)
+}
+
+func (h *Hub) releaseUnusedClaim(ctx context.Context, p pendingAdmission) {
+	probe := &work.Request{ID: p.claim.RequestID, OrganizationID: p.claim.OrganizationID, State: tidev1.RequestState_REQUEST_STATE_CANCELED,
+		EndReason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE}
+	if _, err := h.vendors[p.claim.Vendor].Release(ctx, p.integration, p.claim, probe); err != nil {
+		h.log.WarnContext(ctx, "agent_claim_release_failed", slog.String("organization_id", p.claim.OrganizationID),
+			slog.String("request_id", p.claim.RequestID), slog.Any("error", err))
+	}
+}
+
+func (h *Hub) reconcileAdmissions(ctx context.Context) {
+	h.claimLocksMu.Lock()
+	keys := slices.Collect(maps.Keys(h.pendingAdmissions))
+	h.claimLocksMu.Unlock()
+	for _, key := range keys {
+		if ctx.Err() != nil {
+			return
+		}
+		unlock := h.lockVendorRequest(key)
+		h.reconcileAdmission(ctx, key)
+		unlock()
+	}
+}
+
+// reconcileAdmission runs under the vendor request lock. The poller retries
+// a failed or inconclusive probe even when the vendor sends no new events.
+func (h *Hub) reconcileAdmission(ctx context.Context, key vendorRequestKey) admissionOutcome {
+	h.claimLocksMu.Lock()
+	p, found := h.pendingAdmissions[key]
+	h.claimLocksMu.Unlock()
+	if !found {
+		return admissionAbsent
+	}
+	outcome := admissionAbsent
+	select {
+	case <-p.leaseDone:
+		// A new lease holder can have claimed the same vendor ID. Leave
+		// the old claim alone after the original lease term ends.
+	default:
+		outcome = h.probeAdmission(ctx, p)
+		if outcome == admissionUnresolved {
+			return outcome
+		}
+	}
+	h.claimLocksMu.Lock()
+	delete(h.pendingAdmissions, key)
+	h.claimLocksMu.Unlock()
+	return outcome
+}
+
+func (h *Hub) probeAdmission(ctx context.Context, p pendingAdmission) admissionOutcome {
+	probeCtx, cancel := context.WithTimeout(ctx, admissionProbeTimeout)
+	defer cancel()
+	var status *string
+	// A visible claim proves that the request and claim committed together.
+	// A missing row can precede a late commit. Only PostgreSQL's transaction
+	// status can prove rollback. A NULL status means that evidence expired.
+	err := h.svc.DB.Pool.QueryRow(probeCtx, `SELECT CASE WHEN EXISTS (
+		SELECT 1 FROM agent_claims WHERE request_id = $1
+	) THEN 'committed' ELSE pg_xact_status($2::text::xid8) END`, p.claim.RequestID, p.transactionID).Scan(&status)
+	if err != nil || status == nil {
+		return admissionUnresolved
+	}
+	switch admissionOutcome(*status) {
+	case admissionCommitted:
+		h.admissionCommitted(ctx, p)
+		return admissionCommitted
+	case admissionAborted:
+		// The vendor call honors the lease context, independently of the
+		// failed admission and the probe's deadline.
+		if ctx.Err() != nil {
+			return admissionUnresolved
+		}
+		h.releaseUnusedClaim(ctx, p)
+		return admissionAborted
+	default:
+		return admissionUnresolved
+	}
 }
 
 // canceledBeforeStart reports whether a user canceled the request in tide
@@ -400,7 +523,7 @@ func canceledBeforeStart(req *work.Request) bool {
 // lost records that tide no longer holds the claim. Only a request that
 // is still queued under the dispatch lock ends with CANCELED_BY_SOURCE.
 func (h *Hub) lost(ctx context.Context, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) error {
-	unlock := h.lockVendorRequest(orgID, vendor, vendorRequestID)
+	unlock := h.lockVendorRequest(vendorRequestKey{orgID, vendor, vendorRequestID})
 	defer unlock()
 
 	var canceled *work.Request
