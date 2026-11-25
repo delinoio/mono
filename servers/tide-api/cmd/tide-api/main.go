@@ -245,30 +245,33 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 // timeout. beforeDrain runs first, so the instance releases the lease and
 // stops the lease components before the drain.
 func serve(ctx context.Context, stop func(), srv *http.Server, listener net.Listener, logger *slog.Logger, timeout time.Duration, beforeDrain func()) error {
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(listener) }()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(listener) }()
+	var serveErr error
 	select {
-	case err := <-serveErr:
-		if errors.Is(err, http.ErrServerClosed) {
+	case serveErr = <-serveDone:
+		if errors.Is(serveErr, http.ErrServerClosed) {
 			return nil
 		}
-		return err
 	case <-ctx.Done():
+		stop()
 	}
-	stop()
 	logger.Info("server_shutdown_started")
 	beforeDrain()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	err := srv.Shutdown(shutdownCtx)
-	if errors.Is(err, context.DeadlineExceeded) {
+	drainErr := srv.Shutdown(shutdownCtx)
+	if errors.Is(drainErr, context.DeadlineExceeded) {
 		// Streams that did not end within the drain are closed.
-		err = srv.Close()
+		drainErr = srv.Close()
 	}
-	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	if serveErr == nil {
+		serveErr = <-serveDone
 	}
-	if err != nil {
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		serveErr = nil
+	}
+	if err := errors.Join(serveErr, drainErr); err != nil {
 		return err
 	}
 	logger.Info("server_shutdown_completed")
