@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -207,6 +208,76 @@ func TestTunnelTapReadErrorIsFatalAndClosesEverything(t *testing.T) {
 	waitFor(t, "TAP close", tap.isClosed)
 }
 
+// pausedTunnelAccept holds a connection after the listener has accepted it
+// but before the tunnel can register it.
+type pausedTunnelAccept struct {
+	net.Listener
+	accepted chan struct{}
+	release  chan struct{}
+}
+
+func (l *pausedTunnelAccept) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		close(l.accepted)
+		<-l.release
+	}
+	return c, err
+}
+
+type tunnelReadCounter struct {
+	net.Conn
+	reads atomic.Int32
+}
+
+func (c *tunnelReadCounter) Read(p []byte) (int, error) {
+	c.reads.Add(1)
+	return c.Conn.Read(p)
+}
+
+func TestTunnelShutdownClosesPendingAcceptBeforeNotify(t *testing.T) {
+	tap, listener := newFakeTap(), newFakeListener()
+	l := &pausedTunnelAccept{
+		Listener: listener,
+		accepted: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	release := sync.OnceFunc(func() { close(l.release) })
+	t.Cleanup(release)
+
+	agent, guest := net.Pipe()
+	t.Cleanup(func() { agent.Close(); guest.Close() })
+	pending := &tunnelReadCounter{Conn: guest}
+	listener.conns <- pending
+
+	tun := newTunnel(tap, l, testLogger())
+	tun.start()
+	select {
+	case <-l.accepted:
+	case <-time.After(testTimeout):
+		t.Fatal("listener did not accept the pending connection")
+	}
+
+	readErr := errors.New("tap gone")
+	tap.failC <- readErr
+	waitFor(t, "listener close", listener.isClosed)
+	waitFor(t, "TAP close", tap.isClosed)
+	select {
+	case err := <-tun.fatal:
+		t.Fatalf("reported %v before closing the pending connection", err)
+	default:
+	}
+
+	release()
+	if err := expectFatal(t, tun); !errors.Is(err, readErr) {
+		t.Fatalf("fatal error %v, want it to wrap %v", err, readErr)
+	}
+	expectClosed(t, agent)
+	if reads := pending.reads.Load(); reads != 0 {
+		t.Fatalf("started reading from the pending connection: %d reads", reads)
+	}
+}
+
 func TestTunnelAcceptErrorIsFatalAndClosesEverything(t *testing.T) {
 	tap, l := newFakeTap(), newFakeListener()
 	tun := newTunnel(tap, l, testLogger())
@@ -280,6 +351,7 @@ func TestTunnelPeerDropIsNotFatalAndReplacementWorks(t *testing.T) {
 func TestTunnelFirstTerminalErrorWins(t *testing.T) {
 	tap, l := newFakeTap(), newFakeListener()
 	tun := newTunnel(tap, l, testLogger())
+	tun.start()
 	first, second := errors.New("first"), errors.New("second")
 	tun.fail(first)
 	tun.fail(second) // must neither block nor replace the first error

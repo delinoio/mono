@@ -105,11 +105,11 @@ func systemTunnelDeps() tunnelDeps {
 // for it. It returns after the interface is configured; the relay runs
 // until the process ends. The returned channel is nil when no tunnel runs.
 // Otherwise it receives the terminal error of the relay (the TAP device or
-// the listener failed) after the tunnel closed its connection, listener and
-// TAP device; the caller must then end the helper so that the init process
-// restarts it and the host reconnects. A setup failure, including a failed
-// write of the resolver configuration, is returned as an error and leaves no
-// tunnel running.
+// the listener failed) after the tunnel closed its connections, listener
+// and TAP device; the caller must then end the helper so that the init
+// process restarts it and the host reconnects. A setup failure, including a
+// failed write of the resolver configuration, is returned as an error and
+// leaves no tunnel running.
 func startTunnel(logger *slog.Logger) (<-chan error, error) {
 	cmdline, err := os.ReadFile("/proc/cmdline")
 	if err != nil {
@@ -159,21 +159,32 @@ type tunnel struct {
 	// fatal receives the first terminal error of a worker (capacity 1, so
 	// reporting never blocks). Losing only the current agent connection
 	// is not terminal: a new connection replaces it.
-	fatal    chan error
-	failOnce sync.Once
-	mu       sync.Mutex
-	conn     net.Conn
-	wmu      sync.Mutex
+	fatal      chan error
+	acceptDone chan struct{}
+	mu         sync.Mutex // guards conn and stopped
+	conn       net.Conn
+	stopped    bool
+	wmu        sync.Mutex
 }
 
 func newTunnel(tap io.ReadWriteCloser, l net.Listener, logger *slog.Logger) *tunnel {
-	return &tunnel{tap: tap, listener: l, logger: logger, fatal: make(chan error, 1)}
+	return &tunnel{
+		tap:        tap,
+		listener:   l,
+		logger:     logger,
+		fatal:      make(chan error, 1),
+		acceptDone: make(chan struct{}),
+	}
 }
 
 // start runs the TAP reader and the accept loop.
 func (t *tunnel) start() {
 	go t.readTap()
-	go t.accept(t.listener)
+	go func() {
+		if err := t.accept(); err != nil {
+			t.fail(err)
+		}
+	}()
 }
 
 // fail records the first terminal error of a worker and releases every
@@ -181,48 +192,63 @@ func (t *tunnel) start() {
 // disconnects the agent so that its reconnect loop sees the loss at once.
 // Later calls change nothing.
 func (t *tunnel) fail(err error) {
-	t.failOnce.Do(func() {
-		t.fatal <- err
-		t.listener.Close()
-		t.tap.Close()
-		t.mu.Lock()
-		c := t.conn
-		t.conn = nil
+	t.mu.Lock()
+	if t.stopped {
 		t.mu.Unlock()
-		if c != nil {
-			c.Close()
-		}
-	})
+		return
+	}
+	t.stopped = true
+	c := t.conn
+	t.conn = nil
+	t.mu.Unlock()
+
+	t.listener.Close()
+	t.tap.Close()
+	if c != nil {
+		c.Close()
+	}
+	// Closing the listener unblocks Accept, but a connection it already
+	// accepted must be closed by the accept loop before we report failure.
+	<-t.acceptDone
+	t.fatal <- err
 }
 
-func (t *tunnel) accept(l net.Listener) {
+func (t *tunnel) accept() error {
+	defer close(t.acceptDone)
 	for {
-		c, err := l.Accept()
+		c, err := t.listener.Accept()
 		if err != nil {
 			t.logger.Error("network tunnel accept failed", "error", err)
-			t.fail(fmt.Errorf("tunnel: accept: %w", err))
-			return
+			return fmt.Errorf("tunnel: accept: %w", err)
 		}
 		t.mu.Lock()
+		if t.stopped {
+			t.mu.Unlock()
+			c.Close()
+			return nil
+		}
 		if t.conn != nil {
 			t.conn.Close()
 		}
 		t.conn = c
-		t.mu.Unlock()
 		go t.readConn(c)
+		t.mu.Unlock()
+	}
+}
+
+// closeCurrent closes c if the tunnel still owns it.
+func (t *tunnel) closeCurrent(c net.Conn) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.conn == c {
+		c.Close()
+		t.conn = nil
 	}
 }
 
 // readConn writes the frames of one agent connection to the TAP device.
 func (t *tunnel) readConn(c net.Conn) {
-	defer func() {
-		t.mu.Lock()
-		if t.conn == c {
-			t.conn = nil
-		}
-		t.mu.Unlock()
-		c.Close()
-	}()
+	defer t.closeCurrent(c)
 	var hdr [4]byte
 	buf := make([]byte, maxFrame)
 	for {
@@ -265,7 +291,7 @@ func (t *tunnel) readTap() {
 		_, err = c.Write(buf[:4+n])
 		t.wmu.Unlock()
 		if err != nil {
-			c.Close()
+			t.closeCurrent(c)
 		}
 	}
 }
