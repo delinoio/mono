@@ -220,13 +220,13 @@ type grantInput struct {
 // predates the pending adjustment table creates grants without draining it.
 // A webhook caller holds the purchase lock (lockPurchase) before the lock of
 // acct.
-func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, now time.Time) (grantID string, created bool, err error) {
+func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, eventTime time.Time) (grantID string, created bool, err error) {
 	if in.Amount <= 0 {
 		return "", false, fmt.Errorf("credit grant amount %d is not positive", in.Amount)
 	}
-	// The caller holds both locks. Use the current time for pending adjustments
-	// so they account for credit that expired while the webhook waited.
-	adjustmentTime := s.timestamp()
+	// Use the time after both locks for credit that expired while the webhook
+	// waited. Keep the original event time for the grant's creation and lifetime.
+	accountingTime := s.timestamp()
 	var grantAccountID string
 	err = tx.QueryRow(ctx, `SELECT credit_grant_id::text, billing_account_id::text FROM credit_grants
 		WHERE paddle_transaction_id = $1`, in.PaddleTransactionID).Scan(&grantID, &grantAccountID)
@@ -234,7 +234,7 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 		// The pending rows are applied under the lock of the account of the
 		// grant, which is acct for every grant that a webhook resolves.
 		if grantAccountID == acct.ID {
-			if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, adjustmentTime); err != nil {
+			if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, accountingTime); err != nil {
 				return "", false, err
 			}
 		}
@@ -246,7 +246,7 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	// The balance before the inline expiry is the baseline of the low-balance
 	// check: an expiry that the new grant does not make up for is a decrease.
 	before := acct.Balance
-	if err := s.expireDue(ctx, tx, acct, now); err != nil {
+	if err := s.expireDue(ctx, tx, acct, accountingTime); err != nil {
 		return "", false, err
 	}
 	debtPaid, kept := payoff(acct.Balance, in.Amount)
@@ -256,21 +256,21 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	if _, err := tx.Exec(ctx, `INSERT INTO credit_grants (credit_grant_id, billing_account_id, source, original_usd_micros,
 			remaining_usd_micros, paddle_transaction_id, create_time, expire_time)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		grantID, acct.ID, string(in.Kind), in.Amount, kept, in.PaddleTransactionID, now, GrantExpireTime(now)); err != nil {
+		grantID, acct.ID, string(in.Kind), in.Amount, kept, in.PaddleTransactionID, eventTime, GrantExpireTime(eventTime)); err != nil {
 		return "", false, err
 	}
 	if _, err := writeEntry(ctx, tx, acct, entry{
 		Kind: in.Kind, Amount: in.Amount, PaddleTransactionID: in.PaddleTransactionID, CreditGrantID: grantID,
-	}, now); err != nil {
+	}, accountingTime); err != nil {
 		return "", false, err
 	}
 	// afterIncrease runs first so that a grant that reaches the threshold
 	// re-arms the alert before afterDecrease reads the settings. A purchase
 	// never queues an automatic top-up (usage is false).
-	if err := s.afterIncrease(ctx, tx, acct, now); err != nil {
+	if err := s.afterIncrease(ctx, tx, acct, accountingTime); err != nil {
 		return "", false, err
 	}
-	if _, err := s.afterDecrease(ctx, tx, acct, before, now, false); err != nil {
+	if _, err := s.afterDecrease(ctx, tx, acct, before, accountingTime, false); err != nil {
 		return "", false, err
 	}
 	s.metrics.CreditGrant(string(in.Kind))
@@ -284,7 +284,7 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 		slog.Int64("balance_after_usd_micros", acct.Balance))
 	// Approved refunds and chargebacks of this purchase that arrived before
 	// its payment now reduce the new grant, as if they had arrived after it.
-	if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, adjustmentTime); err != nil {
+	if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, accountingTime); err != nil {
 		return "", false, err
 	}
 	return grantID, true, nil

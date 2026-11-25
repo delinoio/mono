@@ -228,8 +228,8 @@ func TestPaymentWebhookExpiresCreditBeforePendingAdjustment(t *testing.T) {
 			grants: []grant{{"txn_earlier", LedgerManualTopUp, 2500, 0}},
 			wantLedger: []wantEntry{
 				{LedgerManualTopUp, 25 * usd, 25 * usd},
-				{LedgerSubscriptionCredit, 10 * usd, 35 * usd},
-				{LedgerExpiry, -25 * usd, 10 * usd},
+				{LedgerExpiry, -25 * usd, 0},
+				{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
 				{LedgerRefund, -10 * usd, 0},
 			},
 		},
