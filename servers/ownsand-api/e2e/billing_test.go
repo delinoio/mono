@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -122,6 +123,27 @@ func (l *logSink) requireLogMessages(ctx context.Context, t *testing.T, name str
 	}
 }
 
+func waitForBillingState(parent context.Context, want ownsandv1.SandboxState, read func(context.Context) (*ownsandv1.Sandbox, error)) error {
+	ctx, cancel := context.WithTimeout(parent, time.Minute)
+	defer cancel()
+
+	var lastState ownsandv1.SandboxState
+	var lastReadErr error
+	err := pollPhase(ctx, 200*time.Millisecond, func(ctx context.Context) (bool, error) {
+		info, err := read(ctx)
+		if err != nil {
+			lastReadErr = err
+			return false, nil
+		}
+		lastState = info.GetState()
+		return lastState == want, nil
+	})
+	if err != nil {
+		return fmt.Errorf("sandbox did not reach %v (last state %v, last read error %v): %w", want, lastState, lastReadErr, err)
+	}
+	return nil
+}
+
 // TestBillingBlockSuspendRecover runs the billing phases against the real
 // control plane and agent with a fake delino-accounts: a block rejects
 // resource creation, a suspension pauses the running sandbox and rejects the
@@ -167,16 +189,8 @@ func TestBillingBlockSuspendRecover(t *testing.T) {
 	}
 	waitState := func(want ownsandv1.SandboxState) {
 		t.Helper()
-		deadline := time.Now().Add(time.Minute)
-		for {
-			info, err := sb.Get(ctx)
-			if err == nil && info.GetState() == want {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("sandbox did not reach %v: last %v, %v", want, info.GetState(), err)
-			}
-			time.Sleep(200 * time.Millisecond)
+		if err := waitForBillingState(ctx, want, sb.Get); err != nil {
+			t.Fatal(err)
 		}
 	}
 
