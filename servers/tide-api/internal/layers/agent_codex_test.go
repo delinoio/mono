@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"maps"
 	"net/http"
 	"strings"
 	"testing"
@@ -13,14 +14,18 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/codex"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/codex/codexfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/app"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 	"github.com/delinoio/mono/servers/tide-api/internal/webhook"
 )
 
@@ -41,10 +46,10 @@ type codexWorld struct {
 
 // newCodexWorld wires the Codex adapter with the guest OSes of the
 // adapter's scripts, which the interim rule does not verify yet.
-func newCodexWorld(t *testing.T, guest tidev1.GuestOs) *codexWorld {
+func newCodexWorld(t *testing.T, guest tidev1.GuestOs, opts ...testenv.Option) *codexWorld {
 	t.Helper()
 	fake := codexfake.New(t, codexAPIKey)
-	w := newAgentWorld(t, layers.Options{Codex: codex.Options{BaseURL: fake.Server.URL}, CodexGuestOSes: []tidev1.GuestOs{tidev1.GuestOs_GUEST_OS_LINUX, tidev1.GuestOs_GUEST_OS_MACOS}})
+	w := newAgentWorld(t, layers.Options{Codex: codex.Options{BaseURL: fake.Server.URL}, CodexGuestOSes: []tidev1.GuestOs{tidev1.GuestOs_GUEST_OS_LINUX, tidev1.GuestOs_GUEST_OS_MACOS}}, opts...)
 	cw := &codexWorld{agentWorld: w, openai: fake}
 	cw.integrationID = w.createIntegration(t, &tidev1.CreateAgentIntegrationRequest{
 		Vendor: tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, Name: "codex",
@@ -298,6 +303,91 @@ func TestCodexWebhookSignature(t *testing.T) {
 	if strings.Count(logs, `"result":"invalid_signature"`) < 7 || strings.Count(logs, `"result":"ignored"`) < 2 {
 		t.Fatal("results are not logged")
 	}
+}
+
+func TestCodexWebhookCredentialLookup(t *testing.T) {
+	reader := sdkmetric.NewManualReader(sdkmetric.WithTemporalitySelector(func(sdkmetric.InstrumentKind) metricdata.Temporality {
+		return metricdata.DeltaTemporality
+	}))
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	w := newCodexWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, func(o *app.Options) { o.Metrics = provider })
+	w.openai.AddSession("sess_credential", "ccarenv_credential")
+	body := codexfake.ActionRequired("sess_credential")
+	credential := int16(tidev1.AgentCredential_AGENT_CREDENTIAL_WEBHOOK_SECRET)
+	const updateKey = `UPDATE agent_integration_credentials SET key_id = $3
+		WHERE agent_integration_id = $1 AND credential = $2`
+	for _, tc := range []struct {
+		name, deliveryID, signature string
+		query                       string
+		args                        []any
+		status                      int
+		result                      webhook.Result
+	}{
+		{
+			name: "decryption failure", deliveryID: "wh_retry",
+			query: updateKey, args: []any{"unavailable-test-key"},
+			status: http.StatusInternalServerError, result: webhook.ResultFailed,
+		},
+		{
+			name: "bad signature", deliveryID: "wh_bad", signature: "v1,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+			query: updateKey, args: []any{w.env.SecretKey.ID},
+			status: http.StatusUnauthorized, result: webhook.ResultInvalidSignature,
+		},
+		{
+			name: "valid redelivery", deliveryID: "wh_retry",
+			status: http.StatusOK, result: webhook.ResultProcessed,
+		},
+		{
+			name: "missing credential", deliveryID: "wh_missing",
+			query:  "DELETE FROM agent_integration_credentials WHERE agent_integration_id = $1 AND credential = $2",
+			status: http.StatusUnauthorized, result: webhook.ResultInvalidSignature,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			if tc.query != "" {
+				tag, err := w.env.DB.Pool.Exec(ctx, tc.query, append([]any{w.integrationID, credential}, tc.args...)...)
+				if err != nil || tag.RowsAffected() != 1 {
+					t.Fatalf("set credential state: rows=%d error=%v", tag.RowsAffected(), err)
+				}
+			}
+			status := w.sender.Send(t, codexfake.Delivery{ID: tc.deliveryID, Body: body, Signature: tc.signature})
+			seen, err := webhook.Seen(ctx, w.env.DB.Pool, webhook.SenderOpenAI, tc.deliveryID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var rm metricdata.ResourceMetrics
+			if err := reader.Collect(ctx, &rm); err != nil {
+				t.Fatal(err)
+			}
+			counts := map[string]int64{}
+			for _, scope := range rm.ScopeMetrics {
+				for _, m := range scope.Metrics {
+					if m.Name != "tide_webhook_deliveries" {
+						continue
+					}
+					for _, point := range m.Data.(metricdata.Sum[int64]).DataPoints {
+						sender, _ := point.Attributes.Value("sender")
+						result, _ := point.Attributes.Value("result")
+						if sender.AsString() == webhook.SenderOpenAI.Label() {
+							counts[result.AsString()] = point.Value
+						}
+					}
+				}
+			}
+			wantCounts := map[string]int64{string(tc.result): 1}
+			t.Logf("HTTP %d, delivery recorded=%t, OpenAI delivery counters=%v", status, seen, counts)
+			if status != tc.status || seen != (tc.status == http.StatusOK) || !maps.Equal(counts, wantCounts) {
+				t.Fatalf("want HTTP %d, delivery recorded=%t, OpenAI delivery counters=%v", tc.status, tc.status == http.StatusOK, wantCounts)
+			}
+		})
+	}
+	w.requestBySource(t, "sess_credential:ccarenv_credential")
 }
 
 // TestCodexLookupFailureRedelivers: a failed session read answers 500 and

@@ -196,6 +196,11 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	o.integrationID, o.organizationID = in.ID, in.OrganizationID
 	secret, err := v.hub.Credential(ctx, in, tidev1.AgentCredential_AGENT_CREDENTIAL_WEBHOOK_SECRET)
 	if err != nil {
+		if !isNotFound(err) {
+			o.detail = "webhook credential lookup failed"
+			answer(http.StatusInternalServerError, webhook.ResultFailed)
+			return
+		}
 		answer(http.StatusUnauthorized, webhook.ResultInvalidSignature)
 		return
 	}
