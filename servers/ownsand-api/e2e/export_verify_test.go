@@ -4,6 +4,9 @@ package e2e
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +15,7 @@ import (
 
 	ownsand "github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 )
 
 // exportVerifyWait bounds the wait for the export verifier and the R2
@@ -52,6 +56,33 @@ func exportOneSnapshot(ctx context.Context, t *testing.T, s *stack, c *ownsand.C
 		attemptPrefix = "organizations/" + s.orgID + "/snapshots/" + snapID + "/attempts/" + id + "/"
 	}
 	return snapID, attemptPrefix
+}
+
+func waitForExportVerification(parent context.Context, deadline time.Time, readVerified func(context.Context) (bool, error), readState func(context.Context) (ownsandv1.SnapshotExportState, error)) error {
+	ctx, cancel := context.WithDeadline(parent, deadline)
+	defer cancel()
+
+	lastVerified, lastState := "unobserved", "unobserved"
+	err := pollPhase(ctx, time.Second, func(ctx context.Context) (bool, error) {
+		verified, err := readVerified(ctx)
+		if err != nil {
+			return false, fmt.Errorf("read matching export verification: %w", err)
+		}
+		lastVerified = strconv.FormatBool(verified)
+		if err := pollPhaseContextErr(ctx); err != nil {
+			return false, err
+		}
+		state, err := readState(ctx)
+		if err != nil {
+			return false, fmt.Errorf("GetSnapshot: %w", err)
+		}
+		lastState = state.String()
+		return verified && state == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED, nil
+	})
+	if err != nil {
+		return fmt.Errorf("matching export verified = %s, tampered export state = %s (want verified and EXPORT_FAILED): %w", lastVerified, lastState, err)
+	}
+	return nil
 }
 
 // TestSnapshotExportVerification exports two snapshots with the real agent
@@ -119,22 +150,20 @@ func TestSnapshotExportVerification(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(exportVerifyWait)
-	for {
+	readVerified := func(ctx context.Context) (bool, error) {
 		var verified bool
-		if err := conn.QueryRow(ctx, "SELECT export_verified FROM snapshots WHERE snapshot_id = $1", good).Scan(&verified); err != nil {
-			t.Fatal(err)
-		}
+		err := conn.QueryRow(ctx, "SELECT export_verified FROM snapshots WHERE snapshot_id = $1", good).Scan(&verified)
+		return verified, err
+	}
+	readState := func(ctx context.Context) (ownsandv1.SnapshotExportState, error) {
 		bs, err := c.Snapshots().Get(ctx, &ownsandv1.GetSnapshotRequest{SnapshotId: bad})
 		if err != nil {
-			t.Fatalf("GetSnapshot: %v", err)
+			return 0, err
 		}
-		if verified && bs.GetSnapshot().GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("after %v: matching export verified = %v, tampered export state = %v; want verified and EXPORT_FAILED", exportVerifyWait, verified, bs.GetSnapshot().GetExportState())
-		}
-		time.Sleep(time.Second)
+		return bs.GetSnapshot().GetExportState(), nil
+	}
+	if err := waitForExportVerification(ctx, deadline, readVerified, readState); err != nil {
+		t.Fatal(err)
 	}
 
 	gs, err := c.Snapshots().Get(ctx, &ownsandv1.GetSnapshotRequest{SnapshotId: good})
@@ -157,5 +186,27 @@ func TestSnapshotExportVerification(t *testing.T) {
 			t.Fatalf("objects of the failed attempt remain: %v", s.objects.keys(badPrefix))
 		}
 		time.Sleep(time.Second)
+	}
+}
+
+func TestWaitForExportVerificationCancelsPostgresQuery(t *testing.T) {
+	parent, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(parent, dbtest.URL(t))
+	if err != nil {
+		t.Fatalf("connect to the test database: %v", err)
+	}
+	defer conn.Close(parent)
+
+	err = waitForExportVerification(parent, time.Now().Add(time.Second), func(ctx context.Context) (bool, error) {
+		var verified bool
+		err := conn.QueryRow(ctx, "SELECT true FROM pg_sleep(10)").Scan(&verified)
+		return verified, err
+	}, func(context.Context) (ownsandv1.SnapshotExportState, error) {
+		t.Fatal("snapshot RPC started after the stalled database query")
+		return 0, nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "read matching export verification") {
+		t.Fatalf("wait returned %v, want deadline and database query error", err)
 	}
 }
