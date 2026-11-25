@@ -39,6 +39,7 @@ type session struct {
 	id, orgID, sandboxID, deviceID string
 	gen                            uint64
 	principal                      auth.Principal
+	membership                     auth.MembershipSnapshot
 	expireAt                       time.Time
 }
 
@@ -267,12 +268,12 @@ func (p *DataPlane) HandleEnvelope(ctx context.Context, conn *hub.Conn, env *own
 // HandleEvent implements DataPathHooks: it revokes the sessions and relay
 // grants that a revocation event matches.
 func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event) {
-	matchPrincipal := func(orgID string, pr auth.Principal) bool {
+	matchPrincipal := func(orgID string, pr auth.Principal, membership auth.MembershipSnapshot) bool {
 		switch e.Kind {
 		case events.KindAPIKeyRevoked:
 			return pr.IsAPIKey() && pr.ID == e.APIKeyID
 		case events.KindMembershipEnded:
-			return pr.IsUser() && pr.ID == e.UserID && orgID == e.OrganizationID
+			return pr.IsUser() && pr.ID == e.UserID && orgID == e.OrganizationID && e.ID > membership.DeliveryID
 		case events.KindOrganizationDeleted:
 			return orgID == e.OrganizationID
 		}
@@ -282,7 +283,7 @@ func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event) {
 		return (e.Kind == events.KindSandboxDeleted && sandboxID == e.SandboxID) || (e.Kind == events.KindDeviceRemoved && deviceID == e.DeviceID)
 	}
 	revoked := p.Grants.RemoveMatching(func(g *grants.Grant) bool {
-		return matchPrincipal(g.OrgID, g.Principal) || matchSandbox(g.SandboxID, g.DeviceID)
+		return matchPrincipal(g.OrgID, g.Principal, g.Membership) || matchSandbox(g.SandboxID, g.DeviceID)
 	})
 	p.mu.Lock()
 	if e.Kind == events.KindDeviceRemoved {
@@ -297,7 +298,7 @@ func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event) {
 	}
 	var sessions []*session
 	for id, s := range p.sessions {
-		if matchPrincipal(s.orgID, s.principal) || matchSandbox(s.sandboxID, s.deviceID) {
+		if matchPrincipal(s.orgID, s.principal, s.membership) || matchSandbox(s.sandboxID, s.deviceID) {
 			sessions = append(sessions, s)
 			delete(p.sessions, id)
 		}
@@ -474,7 +475,7 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 	if err != nil {
 		return nil, err
 	}
-	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes)
+	pr, membership, err := h.S.authorizeDataPath(ctx, h.S.DB.Pool, orgID)
 	if err != nil {
 		return nil, err
 	}
@@ -491,7 +492,7 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 	now := h.S.now()
 	h.sweepSessions(now)
 	h.sweepRevocations(ctx, now, false)
-	sess := &session{id: newID(), orgID: sb.OrgID, sandboxID: sb.ID, deviceID: sb.DeviceID, gen: conn.Generation, principal: pr, expireAt: now.Add(sessionLifetime)}
+	sess := &session{id: newID(), orgID: sb.OrgID, sandboxID: sb.ID, deviceID: sb.DeviceID, gen: conn.Generation, principal: pr, membership: membership, expireAt: now.Add(sessionLifetime)}
 	// Register the session as pending first, so a revocation processed
 	// before the answer ends it as well.
 	h.mu.Lock()
@@ -527,7 +528,7 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 		return nil, err
 	}
 	// Authorize again after registering, as the contract requires.
-	if _, _, err := h.S.reauthorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+	if err := h.S.reauthorizeDataPath(ctx, h.S.DB.Pool, orgID, sess.membership.ID); err != nil {
 		return fail(err)
 	}
 	key := conn.DeviceID + "/" + sess.id
@@ -606,7 +607,7 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	if err != nil {
 		return nil, err
 	}
-	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes)
+	pr, membership, err := h.S.authorizeDataPath(ctx, h.S.DB.Pool, orgID)
 	if err != nil {
 		return nil, err
 	}
@@ -666,7 +667,7 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	}
 	g, existing, err := h.Grants.Reserve(grants.Request{
 		AuthorizationID: authorizationID, OrgID: sb.OrgID, SandboxID: sb.ID, DeviceID: sb.DeviceID, ChannelGen: conn.Generation,
-		Principal: pr, Kind: m.GetOperationKind(), OperationID: operationID, Digest: m.GetRequestDigest(), ReplacesID: replacesID,
+		Principal: pr, Membership: membership, Kind: m.GetOperationKind(), OperationID: operationID, Digest: m.GetRequestDigest(), ReplacesID: replacesID,
 	}, newID)
 	switch {
 	case errors.Is(err, grants.ErrLimit):
@@ -680,7 +681,7 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	}
 	// The caller's authorization is checked again after the grant is
 	// registered, so a revocation in between reaches the pending grant.
-	if _, _, err := h.S.reauthorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+	if err := h.S.reauthorizeDataPath(ctx, h.S.DB.Pool, orgID, g.Membership.ID); err != nil {
 		if !existing {
 			h.Grants.RemoveMatching(func(x *grants.Grant) bool { return x.ID == g.ID })
 		}

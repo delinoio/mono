@@ -135,20 +135,24 @@ func TestReauthorizeAPIKeyOrganizationDeleted(t *testing.T) {
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	svc := env.App.Service
-	if err := svc.ReauthorizeForTest(keyContext(org), org.ID); err != nil {
+	if err := svc.ReauthorizeForTest(keyContext(org), org.ID, ""); err != nil {
 		t.Fatalf("live key: %v", err)
 	}
 	userCtx := auth.WithPrincipal(context.Background(), auth.Principal{Kind: ownsandv1.PrincipalKind_PRINCIPAL_KIND_USER, ID: org.Owner})
-	if err := svc.ReauthorizeForTest(userCtx, org.ID); err != nil {
+	var membershipID string
+	if err := env.DB.Pool.QueryRow(t.Context(), "SELECT membership_id::text FROM memberships WHERE organization_id = $1 AND user_id = $2", org.ID, org.Owner).Scan(&membershipID); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ReauthorizeForTest(userCtx, org.ID, membershipID); err != nil {
 		t.Fatalf("owner: %v", err)
 	}
 	if _, err := org.OwnerClient.Organization.DeleteOrganization(context.Background(), connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: org.ID})); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.ReauthorizeForTest(keyContext(org), org.ID); testenv.Code(err) != connect.CodeUnauthenticated {
+	if err := svc.ReauthorizeForTest(keyContext(org), org.ID, ""); testenv.Code(err) != connect.CodeUnauthenticated {
 		t.Fatalf("key of a deleted organization: %v", err)
 	}
-	if err := svc.ReauthorizeForTest(userCtx, org.ID); testenv.Code(err) != connect.CodeNotFound {
+	if err := svc.ReauthorizeForTest(userCtx, org.ID, membershipID); testenv.Code(err) != connect.CodeNotFound {
 		t.Fatalf("owner of a deleted organization: %v", err)
 	}
 }
