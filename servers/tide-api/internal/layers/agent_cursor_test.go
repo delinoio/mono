@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -39,6 +40,13 @@ func newCursorWorld(t *testing.T, guest tidev1.GuestOs) *cursorWorld {
 func newCursorWorldTiming(t *testing.T, guest tidev1.GuestOs, timing agent.Timing) *cursorWorld {
 	t.Helper()
 	fake := cursorfake.New(t, cursorKey, "tide-pool")
+	w := startCursorWorld(t, guest, timing, fake)
+	eventually(t, "the Cursor stream", func() bool { return fake.Streams() == 1 })
+	return w
+}
+
+func startCursorWorld(t *testing.T, guest tidev1.GuestOs, timing agent.Timing, fake *cursorfake.Fake) *cursorWorld {
+	t.Helper()
 	w := newAgentWorld(t, layers.Options{Cursor: cursor.Options{BaseURL: fake.Server.URL, RelistInterval: time.Hour}, AgentTiming: timing})
 	cw := &cursorWorld{agentWorld: w, cursor: fake}
 	cw.integrationID = w.createIntegration(t, &tidev1.CreateAgentIntegrationRequest{
@@ -47,8 +55,24 @@ func newCursorWorldTiming(t *testing.T, guest tidev1.GuestOs, timing agent.Timin
 		Credentials: &tidev1.CreateAgentIntegrationRequest_CursorCredentials{CursorCredentials: &tidev1.CursorCredentials{ServiceAccountApiKey: cursorKey}},
 	})
 	cw.profileID = w.createProfile(t, agentProfileProto("cursor-agents", cw.integrationID, guest, time.Hour))
-	eventually(t, "the Cursor stream", func() bool { return fake.Streams() == 1 })
 	return cw
+}
+
+func TestCursorClaimDuringProfileDeletion(t *testing.T) {
+	w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	const id = "bc-deleted-profile"
+	commit := holdTx(t, w.env, "DELETE FROM runner_profiles WHERE runner_profile_id = $1", w.profileID)
+	w.cursor.AddRequest(id, true)
+	waitForLockWaiter(t, w.env)
+	if n := w.cursor.ClaimCount(id); n != 1 {
+		t.Fatalf("%d claims while admission waits for the profile, want 1", n)
+	}
+	commit()
+	eventually(t, "release of the unused vendor claim", func() bool { return w.cursor.Released(id) == 1 })
+	if _, held := w.cursor.Claim(id); held {
+		t.Error("the vendor claim is still active")
+	}
+	w.assertNoRequestsOrClaims(t)
 }
 
 // TestCursorRequestLifecycle: a pending request is claimed with a tide
@@ -265,6 +289,87 @@ func TestCursorClaimEndsBeforeRunner(t *testing.T) {
 	eventually(t, "the watch stops without a profile", func() bool { return w.cursor.Streams() == 0 })
 }
 
+func TestCursorClaimExpiresAtRunnerBinding(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		raceSweep bool
+	}{
+		{"binding", false},
+		{"competing_sweep", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			wait, resume := holdCreateSandbox(t, w.fake, 1)
+			const key = "bc-binding-deadline"
+			w.cursor.AddRequest(key, true)
+			wait()
+			req := w.requestBySource(t, key)
+			if _, ok := w.cursor.Claim(key); !ok || req.GetState() != tidev1.RequestState_REQUEST_STATE_QUEUED {
+				t.Fatalf("expected a held claim and queued request, got %v", req)
+			}
+
+			if tc.raceSweep {
+				commit := holdTx(t, w.env, "SELECT 1 FROM requests WHERE request_id = $1 FOR UPDATE", req.GetRequestId())
+				w.env.Clock.Advance(time.Hour)
+				resume()
+				waitForLockWaiter(t, w.env)
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					w.l.Engine.Pass(ctx, w.org.ID)
+				}()
+				eventually(t, "binding and the sweep both wait for the request lock", func() bool {
+					var n int
+					err := w.env.DB.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+						WHERE datname = current_database() AND wait_event_type = 'Lock'
+						AND query LIKE '%FROM requests WHERE request_id = $1 FOR UPDATE%'`).Scan(&n)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return n == 2
+				})
+				commit()
+				<-done
+			} else {
+				w.env.Clock.Advance(time.Hour)
+				resume()
+			}
+
+			assertQueueExpiry(t, w.waitRequest(t, req.GetRequestId(), tidev1.RequestState_REQUEST_STATE_EXPIRED))
+			eventually(t, "the claim is released after expiry", func() bool {
+				claim, err := w.l.Agents.Claim(ctx, req.GetRequestId())
+				message, ok := w.cursor.Failed(key)
+				return err == nil && claim.State == agent.ClaimReleased && ok && strings.Contains(message, "maximum queue wait")
+			})
+			assertUnusedSandboxDeleted(t, w.fake, w.osOrg)
+			if got := w.cursor.FailAttempts(key); got != 1 {
+				t.Fatalf("vendor failure notifications: %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestCursorClaimRejectedWithoutEligibleDevice(t *testing.T) {
+	w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
+	})
+	w.cursor.AddRequest("bc-no-device", true)
+	req := w.requestBySource(t, "bc-no-device")
+	r := w.waitRequest(t, req.GetRequestId(), tidev1.RequestState_REQUEST_STATE_FAILED)
+	if r.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE {
+		t.Fatalf("request %v", r)
+	}
+	eventually(t, "vendor claim released for no eligible device", func() bool {
+		claim, err := w.l.Agents.Claim(t.Context(), req.GetRequestId())
+		return err == nil && claim.State == agent.ClaimReleased
+	})
+	if message, ok := w.cursor.Failed("bc-no-device"); !ok || !strings.Contains(message, "can run the runner profile") {
+		t.Fatalf("Cursor failure: %q (reported: %t)", message, ok)
+	}
+}
+
 // TestCursorIntegrationDeletionKeepsHeldClaims: when the release of a
 // queued request's claim fails at the profile deletion, the integration
 // cannot be deleted until the claim poller released the claim.
@@ -300,6 +405,86 @@ func TestCursorIntegrationDeletionKeepsHeldClaims(t *testing.T) {
 	if err := del(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCursorWatchPaginationRepeats(t *testing.T) {
+	const (
+		firstToken  = "page-token-A"
+		secondToken = "page-token-B"
+		backoff     = 100 * time.Millisecond
+	)
+	for _, tc := range []struct {
+		name  string
+		extra []cursorfake.Page
+		want  []string
+	}{
+		{name: "same token", want: []string{"", firstToken, "", firstToken}},
+		{name: "cycle", extra: []cursorfake.Page{{NextPageToken: secondToken}}, want: []string{"", firstToken, secondToken, "", firstToken}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := cursorfake.New(t, cursorKey, "tide-pool")
+			for _, id := range []string{"earlier", "offending", "recovered"} {
+				fake.AddRequest(id, false)
+			}
+			pages := []cursorfake.Page{{Requests: []cursorfake.Request{{ID: "earlier"}}, NextPageToken: firstToken}}
+			pages = append(pages, tc.extra...)
+			pages = append(pages,
+				cursorfake.Page{Requests: []cursorfake.Request{{ID: "offending"}}, NextPageToken: firstToken, StreamCursor: "invalid-cursor"},
+				cursorfake.Page{NextPageToken: firstToken},
+				cursorfake.Page{Requests: []cursorfake.Request{{ID: "recovered"}}, StreamCursor: "recovered-cursor"},
+			)
+			fake.ScriptPages(pages...)
+			timing := fastAgentTiming()
+			timing.BackoffMin = backoff
+			w := startCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, timing, fake)
+			eventually(t, "the Cursor recovery stream", func() bool { return fake.Streams() == 1 })
+
+			lists, claims, streams := fake.WatchCalls()
+			var tokens []string
+			for _, call := range lists {
+				tokens = append(tokens, call.PageToken)
+			}
+			if !slices.Equal(tokens, tc.want) {
+				t.Fatalf("list tokens = %q, want %q", tokens, tc.want)
+			}
+			if !slices.Equal(claims, []string{"earlier", "recovered"}) || !slices.Equal(streams, []string{"recovered-cursor"}) {
+				t.Fatalf("claim calls = %q, stream cursors = %q", claims, streams)
+			}
+			offending := 1 + len(tc.extra)
+			if elapsed := lists[offending+1].At.Sub(lists[offending].At); elapsed < backoff {
+				t.Errorf("fresh list started after %v, want at least %v", elapsed, backoff)
+			}
+			logs := w.env.Logs.String()
+			if !strings.Contains(logs, `"msg":"vendor_watch_reconnect"`) || !strings.Contains(logs, `"cause":"error"`) {
+				t.Error("the error reconnect was not logged")
+			}
+			if strings.Contains(logs, firstToken) || strings.Contains(logs, secondToken) {
+				t.Error("a page token appeared in the logs")
+			}
+		})
+	}
+}
+
+func TestCursorWatchPaginationUsesFinalCursor(t *testing.T) {
+	fake := cursorfake.New(t, cursorKey, "tide-pool")
+	fake.AddRequest("first", false)
+	fake.AddRequest("second", false)
+	fake.ScriptPages(
+		cursorfake.Page{Requests: []cursorfake.Request{{ID: "first"}}, NextPageToken: "next", StreamCursor: "first-cursor"},
+		cursorfake.Page{Requests: []cursorfake.Request{{ID: "second"}}, StreamCursor: "final-cursor"},
+	)
+	w := startCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX, agent.Timing{}, fake)
+	eventually(t, "the Cursor stream", func() bool { return fake.Streams() == 1 })
+
+	lists, claims, streams := fake.WatchCalls()
+	if len(lists) != 2 || lists[0].PageToken != "" || lists[1].PageToken != "next" {
+		t.Errorf("list calls = %v, want the initial page then next", lists)
+	}
+	if !slices.Equal(claims, []string{"first", "second"}) || !slices.Equal(streams, []string{"final-cursor"}) {
+		t.Fatalf("claim calls = %q, stream cursors = %q", claims, streams)
+	}
+	w.requestBySource(t, "first")
+	w.requestBySource(t, "second")
 }
 
 // TestCursorWatchReconnect: after the stream drops, tide reconnects with
@@ -360,7 +545,12 @@ func TestCursorOrganizationDeletion(t *testing.T) {
 	if _, ok := w.cursor.Claim("bc-org"); !ok {
 		t.Fatal("the vendor claim is gone")
 	}
+	eventually(t, "the Cursor watch resumes after the failed release", func() bool {
+		return w.cursor.Streams() == 1
+	})
 	w.cursor.FailClaimCalls(false)
+	w.cursor.AddRequest("bc-after", true)
+	w.requestBySource(t, "bc-after")
 	if _, err := w.env.User(w.org.Owner).Organization.DeleteOrganization(context.Background(), connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID})); err != nil {
 		t.Fatal(err)
 	}
@@ -368,4 +558,49 @@ func TestCursorOrganizationDeletion(t *testing.T) {
 		t.Fatalf("fail message %q %v", m, ok)
 	}
 	eventually(t, "the watch stops", func() bool { return w.cursor.Streams() == 0 })
+	stays(t, "the deleted organization's watch stays stopped", func() bool { return w.cursor.Streams() == 0 })
+}
+
+func TestCursorOrganizationDeletionDatabaseFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		setup     string
+		restore   string
+		wantError string
+	}{
+		{
+			name:      "claim query",
+			setup:     "ALTER TABLE agent_claims RENAME TO unavailable_claims",
+			restore:   "ALTER TABLE unavailable_claims RENAME TO agent_claims",
+			wantError: `"msg":"organization_deletion_prepare_failed","hook":"agent"`,
+		},
+		{
+			name: "deletion transaction",
+			setup: `CREATE TABLE deletion_blocker (organization_id uuid REFERENCES organizations);
+				INSERT INTO deletion_blocker SELECT organization_id FROM organizations`,
+			restore:   "DROP TABLE deletion_blocker",
+			wantError: `violates foreign key constraint`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+			ctx := context.Background()
+			if _, err := w.env.DB.Pool.Exec(ctx, tc.setup); err != nil {
+				t.Fatal(err)
+			}
+			owner := w.env.User(w.org.Owner)
+			if _, err := owner.Organization.DeleteOrganization(ctx, connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID})); connect.CodeOf(err) != connect.CodeInternal {
+				t.Fatalf("DeleteOrganization error = %v, want internal", err)
+			}
+			if !strings.Contains(w.env.Logs.String(), tc.wantError) {
+				t.Fatalf("missing deletion error %q", tc.wantError)
+			}
+			if _, err := w.env.DB.Pool.Exec(ctx, tc.restore); err != nil {
+				t.Fatal(err)
+			}
+			eventually(t, "the Cursor watch resumes", func() bool { return w.cursor.Streams() == 1 })
+			w.cursor.AddRequest("bc-after-db-error", true)
+			w.requestBySource(t, "bc-after-db-error")
+		})
+	}
 }

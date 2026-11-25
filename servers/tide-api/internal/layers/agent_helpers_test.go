@@ -163,6 +163,19 @@ func (w *agentWorld) requests(t *testing.T) []*tidev1.Request {
 	return resp.Msg.GetRequests()
 }
 
+func (w *agentWorld) assertNoRequestsOrClaims(t *testing.T) {
+	t.Helper()
+	var requests, claims int
+	if err := w.env.DB.Pool.QueryRow(t.Context(), `SELECT
+		(SELECT count(*) FROM requests WHERE organization_id = $1),
+		(SELECT count(*) FROM agent_claims WHERE organization_id = $1)`, w.org.ID).Scan(&requests, &claims); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 || claims != 0 {
+		t.Fatalf("%d requests and %d claims, want none", requests, claims)
+	}
+}
+
 // requestBySource waits for the request with a source key and returns it.
 func (w *agentWorld) requestBySource(t *testing.T, key string) *tidev1.Request {
 	t.Helper()

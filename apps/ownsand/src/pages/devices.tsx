@@ -30,6 +30,7 @@ import {
   Empty,
   ErrorNotice,
   Loading,
+  MorePagesNotice,
   PageHeader,
   QueryBoundary,
   RefreshFailedNotice,
@@ -37,6 +38,7 @@ import {
   showsFullError,
   toastError,
 } from "../components/ui.tsx";
+import { useDevices } from "../devices.ts";
 import {
   deviceAllocatedVcpu,
   effectiveVcpuLimit,
@@ -60,10 +62,7 @@ function vcpuSummary(d: Device): string {
 /** Route `devices`: devices with state, limits, allocation and agent version. */
 export function DevicesPage() {
   const { organizationId, role } = useOrg();
-  const list = useQuery(DeviceService.method.listDevices, {
-    organizationId,
-    pageSize: 200,
-  });
+  const { devices, boundary, pages } = useDevices(organizationId);
   return (
     <>
       <PageHeader
@@ -80,9 +79,12 @@ export function DevicesPage() {
           ) : undefined
         }
       />
-      <QueryBoundary query={list} loading="Loading devices">
-        {(data) =>
-          data.devices.length === 0 ? (
+      {showsFullError(boundary) ? null : (
+        <MorePagesNotice noun="devices" pages={pages} />
+      )}
+      <QueryBoundary query={boundary} loading="Loading devices">
+        {() =>
+          devices.length === 0 ? (
             <Empty title="No devices yet">
               An admin creates an enrollment token and installs the agent on a
               device.
@@ -102,7 +104,7 @@ export function DevicesPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {data.devices.map((d) => (
+                  {devices.map((d) => (
                     <tr key={d.deviceId}>
                       <td>
                         <Link

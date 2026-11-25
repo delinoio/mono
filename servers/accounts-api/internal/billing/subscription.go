@@ -242,6 +242,17 @@ func (s *Service) activateFromPayment(ctx context.Context, tx pgx.Tx, acct *acco
 		// state.
 		return nil
 	}
+	if current.Status == SubscriptionCanceled && current.PaddleSubscriptionID != "" {
+		// StartSubscription records a pending checkout before a new
+		// subscription can complete. Keep the canceled row here and
+		// retain the credit grant and mapping for this payment.
+		s.logger.InfoContext(ctx, "billing_subscription_payment_ignored",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("paddle_subscription_id", txn.SubscriptionID),
+			slog.String("paddle_transaction_id", txn.ID),
+			slog.String("reason", "different_canceled_subscription"))
+		return nil
+	}
 	if current.PaddleSubscriptionID == txn.SubscriptionID && current.Status == SubscriptionPastDue &&
 		txn.BillingPeriod != nil && current.CurrentPeriodEnd != nil &&
 		txn.BillingPeriod.EndsAt.Before(*current.CurrentPeriodEnd) {
@@ -551,15 +562,12 @@ func (s *Service) cancelSubscriptionNow(ctx context.Context, tx pgx.Tx, acct *ac
 		if outcome == paddle.OutcomeRejected {
 			current, getErr := s.paddle.GetSubscription(ctx, sub.PaddleSubscriptionID)
 			if getErr != nil {
-				// The state at Paddle is unknown, so the deletion can only be
-				// retried later.
 				s.logger.WarnContext(ctx, "billing_paddle_call_failed",
 					slog.String("operation", "get_subscription"),
 					slog.String("billing_account_id", acct.ID),
 					slog.String("paddle_subscription_id", sub.PaddleSubscriptionID),
-					slog.String("paddle_error_code", paddle.ErrorCode(getErr)),
-					slog.Any("error", getErr))
-				return paddleError(getErr, "cancellation")
+					slog.String("paddle_error_code", paddle.ErrorCode(getErr)))
+				return unavailable("the payment provider is unavailable; try again later")
 			}
 			if current.ID == sub.PaddleSubscriptionID && current.Status == paddle.SubscriptionStatusCanceled {
 				s.logger.InfoContext(ctx, "billing_subscription_cancellation_reconciled",
@@ -632,7 +640,15 @@ func (s *Service) closePendingCheckout(ctx context.Context, accountID, transacti
 	default:
 		if outcome == paddle.OutcomeRejected {
 			current, getErr := s.paddle.GetTransaction(ctx, transactionID)
-			if getErr == nil && current.ID == transactionID && current.Status == paddle.TransactionStatusCanceled {
+			if getErr != nil {
+				s.logger.WarnContext(ctx, "billing_paddle_call_failed",
+					slog.String("operation", "get_checkout_transaction"),
+					slog.String("billing_account_id", accountID),
+					slog.String("paddle_transaction_id", transactionID),
+					slog.String("paddle_error_code", paddle.ErrorCode(getErr)))
+				return unavailable("the payment provider is unavailable; try again later")
+			}
+			if current.ID == transactionID && current.Status == paddle.TransactionStatusCanceled {
 				s.logger.InfoContext(ctx, "billing_checkout_transaction_already_canceled",
 					slog.String("billing_account_id", accountID),
 					slog.String("paddle_transaction_id", transactionID))

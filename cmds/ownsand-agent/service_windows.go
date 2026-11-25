@@ -4,11 +4,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,7 +27,17 @@ func runService(cfg config.Config) int {
 	if err != nil || !isService {
 		return runInteractive(cfg)
 	}
-	return runUnderServiceManager(cfg, runAgentOutcome)
+	return runUnderServiceManager(cfg, nil, svc.Run, writeStartupEvent, runUnmigratedService)
+}
+
+type unmigratedServiceInstaller struct{}
+
+func (unmigratedServiceInstaller) Install(string) error {
+	return errors.New("stop the service and run ownsand-agent service migrate before installing updates")
+}
+
+func runUnmigratedService(ctx context.Context, cfg config.Config, _ *os.File) (int, bool) {
+	return runAgentWithInstaller(ctx, cfg, unmigratedServiceInstaller{})
 }
 
 // runConfigError ends `run` when its configuration does not parse. Under the
@@ -36,16 +46,15 @@ func runService(cfg config.Config) int {
 // nonzero exit of run: a service process that exits before it connects is
 // reported only as a start timeout (error 1053, event 7009), its error text
 // is lost because a service has no standard error, and the failure actions
-// do not apply. The error goes to agent.log in the state directory that the
-// environment names, or the default one, because the configuration that would
-// name it did not parse.
+// do not apply. Use the state directory from the environment or the default
+// one to set up startup logging despite the configuration error.
 func runConfigError(cfgErr error, stderr io.Writer) int {
-	fmt.Fprintln(stderr, "ownsand-agent:", cfgErr)
 	isService, err := svc.IsWindowsService()
 	if err != nil || !isService {
+		fmt.Fprintln(stderr, "ownsand-agent:", cfgErr)
 		return exitUsage
 	}
-	return runUnderServiceManager(config.Config{StateDir: configErrorStateDir(os.LookupEnv)}, configErrorRun(cfgErr))
+	return runUnderServiceManager(config.Config{StateDir: configErrorStateDir(os.LookupEnv)}, cfgErr, svc.Run, writeStartupEvent, nil)
 }
 
 // configErrorStateDir returns the state directory for the log of a
@@ -60,34 +69,38 @@ func configErrorStateDir(lookup config.Lookup) string {
 	return config.DefaultStateDir()
 }
 
-// configErrorRun returns the agent run of a service whose configuration did
-// not parse: it logs the error and ends with the usage exit code.
-func configErrorRun(cfgErr error) func(context.Context, config.Config) (int, bool) {
-	return func(context.Context, config.Config) (int, bool) {
-		slog.New(slog.NewJSONHandler(os.Stderr, nil)).With("component", "ownsand-agent").Error("invalid configuration", "error", cfgErr.Error())
-		return exitUsage, false
-	}
-}
-
-// runUnderServiceManager runs the agent with run under the Windows service
-// control manager.
-func runUnderServiceManager(cfg config.Config, run func(context.Context, config.Config) (int, bool)) int {
+func runUnderServiceManager(cfg config.Config, cfgErr error, dispatch func(string, svc.Handler) error, reportStartupError func(string) error, runAgent func(context.Context, config.Config, *os.File) (int, bool)) int {
 	// A Windows service has no standard error; the agent writes its JSON
 	// log to agent.log in the state directory. The file is opened with
 	// delete sharing (see openServiceLog) so that a device removal can delete
 	// it while the service runs, and it is closed when the service ends.
-	if err := os.MkdirAll(cfg.StateDir, 0o700); err == nil {
-		if f, err := openServiceLog(filepath.Join(cfg.StateDir, "agent.log")); err == nil {
-			prev := os.Stderr
-			os.Stderr = f
-			defer func() {
-				os.Stderr = prev
-				_ = f.Close()
-			}()
+	logFile, logFailure := setupServiceLog(cfg.StateDir)
+	if logFile != nil {
+		prev := os.Stderr
+		os.Stderr = logFile
+		defer func() {
+			os.Stderr = prev
+			_ = logFile.Close()
+		}()
+	}
+	run := func(ctx context.Context, cfg config.Config) (int, bool) {
+		if logFailure != "" {
+			message := logFailure
+			if cfgErr != nil {
+				message += ". " + config.RedactedError(cfgErr)
+			}
+			// Reporting is best effort. SCM still receives the agent's exit status.
+			_ = reportStartupError(message)
+		} else if cfgErr != nil {
+			slog.New(slog.NewJSONHandler(os.Stderr, nil)).With("component", "ownsand-agent").Error("invalid configuration", "error", config.RedactedError(cfgErr))
 		}
+		if cfgErr != nil {
+			return exitUsage, false
+		}
+		return runAgent(ctx, cfg, logFile)
 	}
 	h := &handler{cfg: cfg, run: run}
-	if err := svc.Run(service.Name, h); err != nil {
+	if err := dispatch(service.Name, h); err != nil {
 		return exitError
 	}
 	return h.code
@@ -149,7 +162,11 @@ func (h *handler) finish(code int, updated, stopRequested bool) (bool, uint32) {
 }
 
 func serviceDefinition(exe, stateDir string) (string, error) {
-	return service.WindowsDefinition(exe, serviceEnv(stateDir)), nil
+	dir, err := windowsLauncherDirectory()
+	if err != nil {
+		return "", err
+	}
+	return service.WindowsDefinition(exe, launcherPath(dir), serviceEnv(stateDir)), nil
 }
 
 // setServiceEnvironment writes the REG_MULTI_SZ Environment value of the
@@ -176,7 +193,17 @@ func serviceInstall(stateDir string, stdout, stderr io.Writer) int {
 		return exitError
 	}
 	defer m.Disconnect()
-	s, err := m.CreateService(service.Name, exe, mgr.Config{DisplayName: "OwnSand device agent", StartType: mgr.StartAutomatic}, "run")
+	dir, unlock, err := lockWindowsLauncher()
+	if err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent: prepare the service launcher:", err)
+		return exitError
+	}
+	defer unlock()
+	if err := prepareNewWindowsService(m, dir, exe); err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent: prepare the service launcher:", err)
+		return exitError
+	}
+	s, err := m.CreateService(service.Name, launcherPath(dir), mgr.Config{DisplayName: "OwnSand device agent", StartType: mgr.StartAutomatic}, "service", "launch", "run")
 	if err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent: create service:", err)
 		return exitError

@@ -26,15 +26,15 @@
         "references/process-architecture.md": "0845e6c26c4272b9fb2be43e7676b35e169a3de12a5041131ccbb2c308342ff2",
         "references/ps-cli-api-insights.md": "d015138118567c0da8ba88dbfab9023c7d3be8510e161c900154253204bdfd66",
         "references/ps-cli-commands.md": "df8bafeefea6399ac638bbe36b798afda398575818a5aa26e373ec97b805d308",
-        "references/ps-connection-pooling.md": "3bafc9c70e96b4efa37f153b3b0419736e0459088db1361e458a0d3b69c49bda",
+        "references/ps-connection-pooling.md": "253186d6487eeeaf8cbb48a9fb4eb00148d37b04b18196676c1f134d6553feec",
         "references/ps-connections.md": "e166e515a5192ba0eedadffe88f5560f74c6c5c09239d3e5210dec28fa63bc4d",
         "references/ps-extensions.md": "8ce87f920ec90ab4c6c359373935c85876513f627d8afe78d0c45d686a34d6df",
         "references/ps-insights.md": "65ecc4a36c9af29f54c1ae3bbc7aa5bee5dee5bc63daf21301af126d15d070c1",
         "references/query-patterns.md": "1d4aef87ca914548ac0f4833ab5ca3d1714aed5eb0bca0917840faedfa517b70",
-        "references/replication.md": "f2164cc169aedb01f76ee021fbb4f224b4fdaf43b733622c8fef5dff7b73c64c",
-        "references/schema-design.md": "6865a6a73ee451aad6d80f6c2f9bfbd51ca05dc8e16560c84f613ff40666105c",
+        "references/replication.md": "c042b121410adb3f0bfb4cec1a5d124ce5fb283dc32ea56d277aaba9ca5fb63b",
+        "references/schema-design.md": "fab6e3e1882a1d9f4db8b647084693a9c7f82516d17e5cd18cb3238f85adba6b",
         "references/storage-layout.md": "77af9a9d6afea9e4294da88dd1040098b13e5e2db826d87264627b70e0f0ae63",
-        "references/wal-operations.md": "bf90b26df460a15ddd3037e317af08ee8a3e2f6dd7fdaa4c4ca2f8ee2966fe04"
+        "references/wal-operations.md": "7abf0bcd04ae9a5dce0985d621d0354bc30f7a56b66786aaadd8ac9d5c4bd192"
       }
     },
     "vercel-composition-patterns": {
@@ -47,20 +47,20 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "c941a61aa999d45f1c1a5ca577e762f633f3d4781e5b76d065a61d922cc0f745",
+        "AGENTS.md": "8d12f702ebdc2a91255702ab40def913b7185fc9951cd40d815b18c73425dbd5",
         "NOTICE": "695327eeb9dddf8e0a618a8e7d359d376f0393dfcfef1d55c38599f891267446",
         "README.md": "85915a43a6f0b4efe525e3cf6398dd866166da2025837c4460468a24a940da94",
         "SKILL.md": "e38e0eaa609316b10423a9a138ed95e35099accd3f735585295c8a8f165c28a3",
         "rules/_sections.md": "a174213b87e6911e2b766995a2cbaf8d1534057076e82fb79fe3f0ecb38047df",
         "rules/_template.md": "587f7d16b0660eb61fee4a4d3d7df2b3077d6835de170602c7d6e60bee559131",
         "rules/architecture-avoid-boolean-props.md": "007555ebb020f4d552582a2c4db194db71a1fd33094012e5187bcfa4f8c392d5",
-        "rules/architecture-compound-components.md": "0f848dd2f7f83892271b67242a25a290877babee0f85e0908d4be89c37d39210",
+        "rules/architecture-compound-components.md": "2eb1509971e0ba3b2570fbfae0d06dbea6f33fb1712c3f7a6035e0ab7899d0e7",
         "rules/patterns-children-over-render-props.md": "7c45a0d21b3c4126a32cba916ee31adeae195386ad1dbbe6634aedb7457aa0ad",
         "rules/patterns-explicit-variants.md": "8c19e596e61807549d01ce8c6954c6358199f97a8511c0c02c625ec0efda8c0e",
         "rules/react19-no-forwardref.md": "881830adb7534c4b2d70db426556646ad9837f5478f744f35641f635ada22227",
         "rules/state-context-interface.md": "3fad3c3e447df0c48b759edecd25a685e1c69a55a947d9cb96dae5e3aa292ed2",
         "rules/state-decouple-implementation.md": "f2b3c71a489552750818dddb64b85cb9bcda5189b3c37695a53c80ce708b20d5",
-        "rules/state-lift-state.md": "74c54038a6c554c748fe31cec673b80861b5d920b7553cf78cdf10d18b4b759b"
+        "rules/state-lift-state.md": "8c94d648eb1cfe3741f1c559c4a25da822f34d6320f613904655b571b424c7d9"
       }
     },
     "vercel-react-best-practices": {

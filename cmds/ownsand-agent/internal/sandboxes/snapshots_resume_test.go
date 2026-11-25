@@ -153,6 +153,32 @@ func TestSnapshotCaptureAndResumeFailureRecordsSourcePaused(t *testing.T) {
 	requireResumeReachesRuntime(t, e, id)
 }
 
+func TestSnapshotTerminalSourceReleasesCommandLock(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	snapID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started, release := make(chan struct{}), make(chan struct{})
+	e.rt.snapStarted, e.rt.snapBlock = started, release
+	e.rt.snapshotErr = errors.New("resume after snapshot: VM reached a terminal state")
+	source := e.rt.vms[id]
+	go func() {
+		<-started
+		source.stop()
+		close(release)
+	}()
+
+	entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+	requireSnapshotFailedClean(t, e, snapID, entry, err)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_FAILED)
+	if reason := endReason(e.m, id); reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatalf("source end reason %v, want LOST_ON_DEVICE", reason)
+	}
+}
+
 // TestSnapshotRuntimeReportedPausedSourceIsRecorded checks the outcome that a
 // runtime returns directly with its error, like the Firecracker runtime.
 func TestSnapshotRuntimeReportedPausedSourceIsRecorded(t *testing.T) {

@@ -3,9 +3,17 @@
 package e2e
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net"
 	"os"
+	"os/exec"
+	"os/signal"
+	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -14,14 +22,24 @@ import (
 // tests below: it writes to both output streams and then exits or blocks.
 const envHelperMode = "OWNSAND_E2E_HELPER_MODE"
 
+const envHelperOutputHoldAddr = "OWNSAND_E2E_HELPER_OUTPUT_HOLD_ADDR"
+
 // helperMode is the behavior of the helper process.
 type helperMode string
 
 const (
 	// helperExit writes the output and exits with status 0.
 	helperExit helperMode = "exit"
+	// helperFail writes the output and exits with status 1.
+	helperFail helperMode = "fail"
 	// helperBlock writes the output and waits until it is signaled.
 	helperBlock helperMode = "block"
+	// helperSpawn starts a descendant with the same output descriptors.
+	helperSpawn helperMode = "spawn"
+	// helperHoldOutput writes the output and waits for the test to close its connection.
+	helperHoldOutput helperMode = "hold-output"
+	// helperTerminate waits for SIGTERM and logs that it received the signal.
+	helperTerminate helperMode = "terminate"
 )
 
 // TestHelperProcess is the body of the child process, not a test. The final
@@ -31,16 +49,130 @@ func TestHelperProcess(t *testing.T) {
 	if mode == "" {
 		t.Skip("only runs as a helper process")
 	}
+	if mode == helperSpawn {
+		bin, args := helperArgs()
+		cmd := exec.Command(bin, args...)
+		cmd.Env = append(os.Environ(), envHelperMode+"="+string(helperHoldOutput))
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatal(err)
+		}
+		os.Exit(0)
+	}
+	if mode == helperTerminate {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		os.Stderr.WriteString("ready\n")
+		select {
+		case <-signals:
+			os.Stderr.WriteString("sigterm\n")
+		case <-time.After(time.Minute):
+			os.Exit(2)
+		}
+	}
 	os.Stdout.WriteString("out-1\nout-final")
 	os.Stderr.WriteString("err-1\nerr-final")
 	if mode == helperBlock {
 		time.Sleep(time.Minute)
+	}
+	if mode == helperHoldOutput {
+		conn, err := net.DialTimeout("tcp4", os.Getenv(envHelperOutputHoldAddr), 10*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Dialing after the writes signals that diagnostic output is ready.
+		_, _ = io.Copy(io.Discard, conn)
+		conn.Close()
+	}
+	if mode == helperFail {
+		os.Exit(1)
 	}
 	os.Exit(0)
 }
 
 func helperArgs() (string, []string) {
 	return os.Args[0], []string{"-test.run=^TestHelperProcess$"}
+}
+
+func TestTypeScriptSDKLauncherSuccess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	bin, args := helperArgs()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), envHelperMode+"="+string(helperExit))
+	out, err := runTypeScriptSDKCommand(cmd)
+	if err != nil {
+		t.Fatalf("launcher failed: %v\n%s", err, out)
+	}
+	if got, want := string(out), "out-1\nout-finalerr-1\nerr-final"; got != want {
+		t.Fatalf("combined output = %q, want %q", got, want)
+	}
+}
+
+func TestTypeScriptSDKLauncherTimeout(t *testing.T) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := listener.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	bin, args := helperArgs()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), envHelperMode+"="+string(helperSpawn),
+		envHelperOutputHoldAddr+"="+listener.Addr().String())
+	type result struct {
+		out []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := runTypeScriptSDKCommand(cmd)
+		done <- result{out, err}
+	}()
+
+	conn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("descendant did not signal readiness: %v", err)
+	}
+	defer conn.Close()
+
+	// Arm the short deadline after the descendant has inherited the pipe and
+	// written its diagnostics. The launcher sees the same cancellation signal
+	// as it does when the relay test's context deadline expires.
+	deadline, stop := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer stop()
+	<-deadline.Done()
+	cancel()
+	expiresAt, _ := deadline.Deadline()
+	const schedulingTolerance = 2 * time.Second
+	select {
+	case got := <-done:
+		var exitErr *exec.ExitError
+		if !errors.As(got.err, &exitErr) {
+			t.Fatalf("launcher error = %v, want a process exit error\n%s", got.err, got.out)
+		}
+		for _, want := range []string{"out-final", "err-final"} {
+			if !strings.Contains(string(got.out), want) {
+				t.Errorf("missing %q in combined output %q", want, got.out)
+			}
+		}
+	case <-time.After(time.Until(expiresAt.Add(typeScriptSDKPipeDrainDelay + schedulingTolerance))):
+		t.Fatal("launcher did not return within the pipe-drain delay and scheduling tolerance")
+	}
+
+	// The descendant keeps the pipe open until this connection is closed.
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	var probe [1]byte
+	if _, err := conn.Read(probe[:]); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("descendant stopped holding the pipe before the launcher returned: %v", err)
+	}
 }
 
 func wantHelperLines(name string) []string {
@@ -72,16 +204,24 @@ func assertNoScanners(t *testing.T, logs *logSink) {
 func TestStartProcessExitReleasesLogs(t *testing.T) {
 	logs := &logSink{}
 	bin, args := helperArgs()
-	p, err := launchProcess(logs, "child", []string{envHelperMode + "=" + string(helperExit)}, bin, args...)
-	if err != nil {
-		t.Fatal(err)
+	var cleanupStarted time.Time
+	if !t.Run("run", func(t *testing.T) {
+		p := startProcess(t, logs, "child", []string{envHelperMode + "=" + string(helperExit)}, bin, args...)
+		select {
+		case <-p.done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the process did not finish")
+		}
+		if !p.cmd.ProcessState.Success() {
+			t.Fatalf("the process did not exit successfully: %v", p.cmd.ProcessState)
+		}
+		cleanupStarted = time.Now()
+	}) {
+		return
 	}
-	select {
-	case <-p.done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the process did not finish")
+	if elapsed := time.Since(cleanupStarted); elapsed >= 10*time.Second {
+		t.Errorf("cleanup of an exited process took %s, want under 10s", elapsed)
 	}
-	// The scanners are joined before done closes, so no waiting is needed.
 	assertNoScanners(t, logs)
 	assertHelperLines(t, logs, "child")
 }
@@ -89,22 +229,36 @@ func TestStartProcessExitReleasesLogs(t *testing.T) {
 func TestStartProcessCleanupStopsAndReleasesLogs(t *testing.T) {
 	logs := &logSink{}
 	bin, args := helperArgs()
+	mode, ready := helperTerminate, "child: ready"
+	if runtime.GOOS == "windows" {
+		mode, ready = helperBlock, "child: err-1"
+	}
 	var p *proc
-	t.Run("run", func(t *testing.T) {
-		p = startProcess(t, logs, "child", []string{envHelperMode + "=" + string(helperBlock)}, bin, args...)
+	var cleanupStarted time.Time
+	if !t.Run("run", func(t *testing.T) {
+		p = startProcess(t, logs, "child", []string{envHelperMode + "=" + string(mode)}, bin, args...)
 		deadline := time.Now().Add(30 * time.Second)
-		for !logs.hasLine("child: err-1") {
+		for !logs.hasLine(ready) {
 			if time.Now().After(deadline) {
-				t.Fatal("the process wrote no output")
+				t.Fatalf("the process did not log %q", ready)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-	})
+		cleanupStarted = time.Now()
+	}) {
+		return
+	}
+	if elapsed := time.Since(cleanupStarted); runtime.GOOS == "windows" && elapsed >= 10*time.Second {
+		t.Errorf("Windows cleanup took %s, want under 10s", elapsed)
+	}
 	// The subtest cleanup stopped the process.
 	select {
 	case <-p.done:
 	default:
 		t.Fatal("the process is still running after the cleanup")
+	}
+	if mode == helperTerminate && !logs.hasLine("child: sigterm") {
+		t.Error("the process did not log that it received SIGTERM")
 	}
 	assertNoScanners(t, logs)
 	assertHelperLines(t, logs, "child")

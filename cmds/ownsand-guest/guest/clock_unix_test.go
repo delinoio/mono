@@ -6,8 +6,11 @@ package guest
 
 import (
 	"math"
+	"reflect"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestSplitTimevalRoundsUpAndCarries(t *testing.T) {
@@ -37,20 +40,22 @@ func TestSplitTimevalRoundsUpAndCarries(t *testing.T) {
 }
 
 func TestTimevalForFillsPlatformStruct(t *testing.T) {
-	tv, err := timevalFor(time.Unix(10413792000, 0).UTC())
-	if err == nil {
-		if int64(tv.Sec) != 10413792000 || int64(tv.Usec) != 0 {
-			t.Fatalf("timevalFor = (%d, %d), want (10413792000, 0)", tv.Sec, tv.Usec)
+	const seconds int64 = 10413792000
+	tv, err := timevalFor(time.Unix(seconds, 0).UTC())
+	if reflect.TypeOf(tv.Sec).Bits() == 32 {
+		if err == nil {
+			t.Fatalf("timevalFor returned no error for %d seconds with a 32-bit seconds field", seconds)
+		}
+		if tv != (unix.Timeval{}) {
+			t.Fatalf("timevalFor = %+v, want a zero timeval on error", tv)
 		}
 		return
 	}
-	// A platform whose Timeval seconds are 32-bit must reject the value
-	// instead of truncating it.
-	if secondsFitInt32(10413792000) {
-		t.Fatalf("timevalFor returned an error although the value fits")
+	if err != nil {
+		t.Fatalf("timevalFor returned an error for %d seconds: %v", seconds, err)
 	}
-	if tv.Sec != 0 || tv.Usec != 0 {
-		t.Fatalf("timevalFor returned a non-zero timeval with an error")
+	if int64(tv.Sec) != seconds || tv.Usec != 0 {
+		t.Fatalf("timevalFor = (%d, %d), want (%d, 0)", tv.Sec, tv.Usec, seconds)
 	}
 }
 
@@ -82,9 +87,4 @@ func TestFitsIntegerNarrowFields(t *testing.T) {
 	if !fitsInteger(&wide, 10413792000) || wide != 10413792000 {
 		t.Fatalf("fitsInteger rejected or mis-stored an int64 value: %d", wide)
 	}
-}
-
-func secondsFitInt32(v int64) bool {
-	var dst int32
-	return fitsInteger(&dst, v)
 }

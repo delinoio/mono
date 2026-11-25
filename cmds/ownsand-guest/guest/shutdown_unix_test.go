@@ -48,8 +48,11 @@ func TestRunWaitsForOpenStreamAfterContextEnds(t *testing.T) {
 
 	release()
 	evs := s.collectExec()
-	if stdout, _ := outputs(evs); stdout != "readydone" || evs[len(evs)-1].GetExited().GetExitCode() != 0 {
+	if stdout, _ := outputs(evs); stdout != "readydone" {
 		t.Fatalf("exec events %v", evs)
+	}
+	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+		t.Fatalf("exec events %v: %v", evs, err)
 	}
 	s.s.CloseRequest()
 	select {

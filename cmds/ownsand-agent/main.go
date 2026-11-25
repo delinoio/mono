@@ -53,6 +53,8 @@ Commands:
   service print  Print the service definition of this host OS.
   service install
                  Install the service definition of this host OS.
+  service migrate
+                 Move an existing Windows service to the recovery launcher.
   version        Print the agent version.
 
 Flags common to every command:
@@ -89,6 +91,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return exitUsage
 		}
 		cmd, rest = cmd+" "+rest[0], rest[1:]
+	}
+	launch := cmd == "service launch" && len(rest) != 0 && rest[0] == "run"
+	if launch {
+		cmd, rest = "run", rest[1:]
 	}
 	cfg, err := config.FromEnv(os.LookupEnv)
 	if err != nil {
@@ -156,6 +162,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "enroll":
 		return enroll(cfg, *apiURL, *tokenFile, *name, stdin, stdout, stderr, c)
 	case "run":
+		if launch {
+			return runServiceLauncher(cfg, rest, stderr)
+		}
 		if service.Manager(*manager) == service.ManagerLaunchd {
 			return runLaunchd(cfg)
 		}
@@ -170,6 +179,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return servicePrint(explicitStateDir, stdout, stderr)
 	case "service install":
 		return serviceInstall(explicitStateDir, stdout, stderr)
+	case "service migrate", "service prepare":
+		return serviceLauncherSetup(cmd == "service migrate", stdout, stderr)
 	}
 	fmt.Fprint(stderr, usage)
 	return exitUsage
@@ -237,6 +248,10 @@ func runAgent(ctx context.Context, cfg config.Config) int {
 // and whether the agent installed an update and stops so that the service
 // manager starts the new executable.
 func runAgentOutcome(ctx context.Context, cfg config.Config) (code int, updated bool) {
+	return runAgentWithInstaller(ctx, cfg, nil)
+}
+
+func runAgentWithInstaller(ctx context.Context, cfg config.Config, installer update.Installer) (code int, updated bool) {
 	logger := newLogger(cfg)
 	st, err := store.Open(cfg.StateDir)
 	if err != nil {
@@ -274,7 +289,10 @@ func runAgentOutcome(ctx context.Context, cfg config.Config) (code int, updated 
 		logger.Error("sandbox runtime unavailable", "runtime", cfg.Runtime.String(), "error", err)
 		return exitError, false
 	}
-	exe, _ := os.Executable()
+	if installer == nil {
+		exe, _ := os.Executable()
+		installer = update.ExecutableInstaller{Path: exe}
+	}
 	a, err := agent.New(ctx, agent.Options{
 		Store: st, Identity: id, Control: cp, Runtime: rt, Logger: logger,
 		NewDataPath: newDataPath,
@@ -283,7 +301,7 @@ func runAgentOutcome(ctx context.Context, cfg config.Config) (code int, updated 
 			Keys:        cfg.ReleasePublicKeys,
 			Platform:    sysinfo.Platform(),
 			Running:     version.Version,
-			Installer:   update.ExecutableInstaller{Path: exe},
+			Installer:   installer,
 		},
 	})
 	if err != nil {
@@ -341,22 +359,26 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 		return exitError
 	}
 	fmt.Fprintf(stdout, "%s %s (device %s, organization %s)\n", c.bold("Enrollment:"), c.ok("enrolled"), id.DeviceID, id.OrganizationID)
-	if a, err := st.LoadAgent(); err == nil {
+	a, agentErr := st.LoadAgent()
+	var s agent.Status
+	statusErr := st.LoadStatus(&s)
+	if statusErr == nil && s.APIURL != "" {
+		fmt.Fprintf(stdout, "%s %s\n", c.bold("Control plane:"), s.APIURL)
+	} else if agentErr == nil {
 		fmt.Fprintf(stdout, "%s %s\n", c.bold("Control plane:"), a.APIURL)
-		if a.Removal.NoticeReceived {
-			fmt.Fprintf(stdout, "%s %s\n", c.bold("Removal:"), c.bad("in progress"))
-		}
+	}
+	if agentErr == nil && a.Removal.NoticeReceived {
+		fmt.Fprintf(stdout, "%s %s\n", c.bold("Removal:"), c.bad("in progress"))
 	}
 	// Only an absent status.json means the agent has not run. A file that
 	// cannot be read or decoded is an error: the report is skipped, the other
 	// sections still print, and the command exits with exitError.
 	code := exitOK
-	var s agent.Status
-	switch err := st.LoadStatus(&s); {
-	case errors.Is(err, store.ErrNotFound):
+	switch {
+	case errors.Is(statusErr, store.ErrNotFound):
 		fmt.Fprintf(stdout, "%s unknown (the agent has not run)\n", c.bold("Connection:"))
-	case err != nil:
-		fmt.Fprintln(stderr, "ownsand-agent: read status.json:", err)
+	case statusErr != nil:
+		fmt.Fprintln(stderr, "ownsand-agent: read status.json:", statusErr)
 		code = exitError
 	default:
 		conn := c.bad("disconnected")

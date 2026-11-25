@@ -6,9 +6,11 @@ package processrt
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 
@@ -23,6 +25,20 @@ import (
 // copy keeps the modes of the source. Deleting both sandboxes and the
 // snapshot must still succeed for a user that is not root.
 func TestSnapshotAndRestorePreserveModesUnderUmask(t *testing.T) {
+	masks := []int{0o077}
+	if runtime.GOOS == "linux" {
+		// Linux uses abstract sockets. macOS also needs a temporary socket
+		// directory, whose creation is outside the snapshot copy.
+		masks = append(masks, 0o277, 0o177)
+	}
+	for _, mask := range masks {
+		t.Run(fmt.Sprintf("umask%04o", mask), func(t *testing.T) {
+			testSnapshotAndRestoreModes(t, mask)
+		})
+	}
+}
+
+func testSnapshotAndRestoreModes(t *testing.T, mask int) {
 	old := syscall.Umask(0o077)
 	t.Cleanup(func() { syscall.Umask(old) })
 
@@ -38,6 +54,16 @@ func TestSnapshotAndRestorePreserveModesUnderUmask(t *testing.T) {
 		}
 	})
 	rt := newRuntime(t)
+	if mask != 0o077 {
+		// Keep the guest helper's own state creation independent of the
+		// umask under which the process runtime copies the disk.
+		wrapper := filepath.Join(t.TempDir(), "guest")
+		t.Setenv("OWNSAND_TEST_REAL_GUEST", guestBinary)
+		if err := os.WriteFile(wrapper, []byte("#!/bin/sh\numask 077\nexec \"$OWNSAND_TEST_REAL_GUEST\" \"$@\"\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		rt.guestBinary = wrapper
+	}
 
 	id, err := uuidv7.NewString()
 	if err != nil {
@@ -66,7 +92,7 @@ func TestSnapshotAndRestorePreserveModesUnderUmask(t *testing.T) {
 		}
 	}
 	want := map[string]fs.FileMode{
-		"ro": 0o555, "ro/nested": 0o555, "ro/nested/f": 0o444, "ro/g": 0o770, "h": 0o664,
+		".": 0o700, "ro": 0o555, "ro/nested": 0o555, "ro/nested/f": 0o444, "ro/g": 0o770, "h": 0o664,
 	}
 	requireModes := func(what, base string) {
 		t.Helper()
@@ -78,10 +104,17 @@ func TestSnapshotAndRestorePreserveModesUnderUmask(t *testing.T) {
 			if got := info.Mode().Perm(); got != mode {
 				t.Errorf("%s: %s has mode %o, want %o", what, name, got, mode)
 			}
+			if info.Mode().IsRegular() {
+				content, err := os.ReadFile(filepath.Join(base, name))
+				if err != nil || string(content) != name {
+					t.Errorf("%s: content of %s = %q, %v", what, name, content, err)
+				}
+			}
 		}
 	}
 	requireModes("source", root)
 
+	syscall.Umask(mask)
 	if _, err := rt.Snapshot(context.Background(), v, snapDir); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}

@@ -7,6 +7,7 @@ package vzrt
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -27,6 +29,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netstack"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
+	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -35,10 +38,12 @@ const (
 	readyTimeout = 60 * time.Second
 	// macOSReadyTimeout covers a macOS cold boot, which takes far longer
 	// than a Linux boot.
-	macOSReadyTimeout = 5 * time.Minute
-	stopTimeout       = 10 * time.Second
-	dialTimeout       = 10 * time.Second
+	macOSReadyTimeout     = 5 * time.Minute
+	dialTimeout           = 10 * time.Second
+	snapshotResumeTimeout = 10 * time.Second
 )
+
+var errVMTerminalState = errors.New("VM reached a terminal state")
 
 // guestLink is the link of every OUTBOUND sandbox: each sandbox has its own
 // network stack, so every sandbox uses the same addresses.
@@ -87,24 +92,47 @@ func fileExists(p string) bool {
 	return err == nil && st.Mode().IsRegular()
 }
 
-// hasEntitlement reports whether the agent executable is signed with the
-// com.apple.security.virtualization entitlement, which every
-// Virtualization.framework VM needs.
+// hasEntitlement reports whether the signed agent enables the
+// com.apple.security.virtualization entitlement.
 func hasEntitlement(ctx context.Context) (bool, string) {
 	exe, err := os.Executable()
 	if err != nil {
 		return false, "cannot find the agent executable"
 	}
+	return inspectVirtualizationEntitlement(ctx, exe)
+}
+
+func inspectVirtualizationEntitlement(ctx context.Context, exe string) (bool, string) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "/usr/bin/codesign", "-d", "--entitlements", "-", "--xml", exe).Output()
 	if err != nil {
-		return false, "the agent executable is not code-signed"
+		return false, "cannot inspect the signed entitlements of the agent executable"
 	}
-	if !bytes.Contains(out, []byte("com.apple.security.virtualization")) {
-		return false, "the agent executable lacks the com.apple.security.virtualization entitlement"
+	enabled, err := virtualizationEntitlementEnabled(ctx, out)
+	if err != nil {
+		return false, "cannot read the signed entitlement plist of the agent executable"
 	}
-	return true, "the agent executable has the com.apple.security.virtualization entitlement"
+	if !enabled {
+		return false, "the agent executable lacks an enabled com.apple.security.virtualization entitlement"
+	}
+	return true, "the agent executable has an enabled com.apple.security.virtualization entitlement"
+}
+
+func virtualizationEntitlementEnabled(ctx context.Context, plist []byte) (bool, error) {
+	// Read the converted dictionary so dots in the key stay literal.
+	cmd := exec.CommandContext(ctx, "/usr/bin/plutil", "-convert", "json", "-o", "-", "--", "-")
+	cmd.Stdin = bytes.NewReader(plist)
+	out, err := cmd.Output()
+	if err != nil {
+		return false, err
+	}
+	var entitlements map[string]any
+	if err := json.Unmarshal(out, &entitlements); err != nil {
+		return false, err
+	}
+	enabled, _ := entitlements["com.apple.security.virtualization"].(bool)
+	return enabled, nil
 }
 
 // Capabilities runs the hypervisor checks.
@@ -155,7 +183,7 @@ type vm struct {
 	machineID []byte
 	// hardwareModel is the hardware model of a macOS guest.
 	hardwareModel []byte
-	exited        <-chan struct{}
+	watcher       *machineWatcher
 	restore       ownsandv1.SandboxRestorePath
 	network       ownsandv1.NetworkMode
 	net           *netstack.Network
@@ -173,14 +201,21 @@ type vm struct {
 	// current VM configuration. It stays open and unused, so that the guest
 	// never reads an EOF from its console; stopVM closes it.
 	consoleIn *os.File
-	// stopMu serializes stopVM calls of one VM, so a retry of a failed stop
-	// never overlaps the attempt before it.
+	// stopMu serializes cleanup and the installation of each machine and its
+	// watcher, so cleanup always releases the pair it stopped.
 	stopMu sync.Mutex
 }
 
 func (v *vm) SandboxID() string                         { return v.id }
 func (v *vm) RestorePath() ownsandv1.SandboxRestorePath { return v.restore }
-func (v *vm) Exited() <-chan struct{}                   { return v.exited }
+func (v *vm) Exited() <-chan struct{} {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.watcher == nil {
+		return nil
+	}
+	return v.watcher.exited
+}
 
 // current returns the VM object, or an error after the VM was stopped.
 func (v *vm) current() (*vz.VirtualMachine, <-chan struct{}, error) {
@@ -189,7 +224,7 @@ func (v *vm) current() (*vz.VirtualMachine, <-chan struct{}, error) {
 	if v.machine == nil {
 		return nil, nil, fmt.Errorf("vzrt: sandbox %s has no running VM", v.id)
 	}
-	return v.machine, v.exited, nil
+	return v.machine, v.watcher.exited, nil
 }
 
 // Dial connects to the guest helper through the virtio socket device.
@@ -203,12 +238,21 @@ func (v *vm) Dial(ctx context.Context) (net.Conn, error) {
 
 func (r *Runtime) vmDir(id string) string { return filepath.Join(r.opts.VMsDir, id) }
 
-// copyFile copies src to dst with an APFS clone where possible.
-func copyFile(src, dst string) error {
-	_ = os.Remove(dst)
-	if err := unix.Clonefile(src, dst, unix.CLONE_NOFOLLOW); err == nil {
-		return nil
+// copyFile copies src to dst with an APFS clone where possible. Clonefile
+// cannot be interrupted. A streamed copy checks ctx between chunks.
+func copyFile(ctx context.Context, src, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	_ = os.Remove(dst)
+	cloneErr := unix.Clonefile(src, dst, unix.CLONE_NOFOLLOW)
+	if err := ctx.Err(); err != nil || cloneErr == nil {
+		return err
+	}
+	return copyFileStream(ctx, src, dst)
+}
+
+func copyFileStream(ctx context.Context, src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -218,11 +262,20 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	var copyErr error
+	if ctx.Done() == nil {
+		_, copyErr = io.Copy(out, in)
+	} else {
+		_, copyErr = fsutil.CopyContext(ctx, out, in)
+	}
+	if copyErr != nil {
 		out.Close()
+		return copyErr
+	}
+	if err := out.Close(); err != nil {
 		return err
 	}
-	return out.Close()
+	return ctx.Err()
 }
 
 // growFile enlarges a disk image to size bytes; the guest grows its file
@@ -238,6 +291,13 @@ func growFile(path string, size int64) error {
 	return os.Truncate(path, size)
 }
 
+func checkBaseDiskCapacity(sourceBytes, requestedBytes int64) error {
+	if sourceBytes > requestedBytes {
+		return fmt.Errorf("%w: the base disk requires %d bytes, but the request allocates %d bytes", vmruntime.ErrUnsupported, sourceBytes, requestedBytes)
+	}
+	return nil
+}
+
 // Create boots a VM for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
 	switch spec.GuestOS {
@@ -250,8 +310,15 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if !fileExists(r.opts.Kernel) {
 		return nil, fmt.Errorf("%w: the Linux kernel is missing", vmruntime.ErrUnsupported)
 	}
-	if spec.Snapshot == nil && !fileExists(r.opts.Rootfs) {
-		return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+	diskBytes := spec.Resources.GetDiskGib() << 30
+	if spec.Snapshot == nil {
+		baseDisk, err := os.Stat(r.opts.Rootfs)
+		if err != nil || !baseDisk.Mode().IsRegular() {
+			return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+		}
+		if err := checkBaseDiskCapacity(baseDisk.Size(), diskBytes); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.RemoveAll(spec.Dir); err != nil {
 		return nil, err
@@ -278,7 +345,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		src = filepath.Join(spec.Snapshot.Dir, snapDisk)
 	}
 	disk := filepath.Join(spec.Dir, diskFile)
-	if err := copyFile(src, disk); err != nil {
+	if err := copyFile(context.Background(), src, disk); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
 	}
@@ -288,7 +355,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 
 	if memoryRestore {
 		err := r.restoreMemory(ctx, v, spec)
-		if err == nil {
+		if err == nil && ctx.Err() == nil {
 			v.restore = ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE
 			clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			if err := guestclient.New(v.Dial).SetClock(clockCtx, time.Now()); err != nil {
@@ -298,21 +365,16 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			r.logger.Info("VM restored from memory state", "sandbox_id", v.id)
 			return v, nil
 		}
-		// Virtualization.framework could not restore the saved state: boot
-		// the snapshot disk cold.
-		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
-		// Never boot the snapshot disk cold while the failed attempt's VM may
-		// still run on the same disk.
-		if stopErr := r.stopVM(v); stopErr != nil {
-			cleanup()
-			return nil, fmt.Errorf("vzrt: stop the VM of the failed memory-state restore: %w", stopErr)
+		if err := finishFailedRestore(ctx, func() error { return r.stopVM(v) }, cleanup); err != nil {
+			return nil, err
 		}
-		if err := copyFile(src, disk); err != nil {
+		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
+		if err := copyFile(ctx, src, disk); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
 		}
 	}
-	if err := growFile(disk, spec.Resources.GetDiskGib()<<30); err != nil {
+	if err := growFile(disk, diskBytes); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vzrt: resize disk: %w", err)
 	}
@@ -333,6 +395,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 // machine identifier to reuse (for a memory-state restore), or nil for a
 // new one.
 func (r *Runtime) configure(v *vm, spec vmruntime.Spec, machineID []byte) (*vz.VirtualMachineConfiguration, error) {
+	memoryBytes, err := memoryMiBToBytes(spec.Resources.GetMemoryMib())
+	if err != nil {
+		return nil, err
+	}
 	cmdline := "console=hvc0 root=/dev/vda rw init=/sbin/init panic=1 random.trust_cpu=on"
 	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
 		cmdline += " " + guestLink.KernelIPArg()
@@ -341,7 +407,7 @@ func (r *Runtime) configure(v *vm, spec vmruntime.Spec, machineID []byte) (*vz.V
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := vz.NewVirtualMachineConfiguration(boot, uint(spec.Resources.GetVcpuCount()), uint64(spec.Resources.GetMemoryMib())<<20)
+	cfg, err := vz.NewVirtualMachineConfiguration(boot, uint(spec.Resources.GetVcpuCount()), memoryBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -509,7 +575,6 @@ func (r *Runtime) attachNetwork(v *vm, mac net.HardwareAddr) (*vz.VirtioNetworkD
 	dev, err := networkDevice(vmFile, mac)
 	if err != nil {
 		stack.Close()
-		vmFile.Close()
 		conn.Close()
 		return nil, err
 	}
@@ -548,8 +613,10 @@ func datagramPair() (*os.File, net.Conn, error) {
 }
 
 // networkDevice returns a virtio network device with the MAC address mac on
-// a file-handle attachment of vmFile.
+// a file-handle attachment. It takes ownership of vmFile and closes it when
+// configuration ends. The attachment owns its duplicate descriptor.
 func networkDevice(vmFile *os.File, mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfiguration, error) {
+	defer vmFile.Close()
 	attachment, err := vz.NewFileHandleNetworkDeviceAttachment(vmFile)
 	if err != nil {
 		return nil, err
@@ -577,7 +644,6 @@ func NewIdleNetworkDevice(mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfigur
 	}
 	dev, err := networkDevice(vmFile, mac)
 	if err != nil {
-		vmFile.Close()
 		conn.Close()
 		return nil, nil, err
 	}
@@ -590,17 +656,7 @@ func NewIdleNetworkDevice(mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfigur
 			}
 		}
 	}()
-	return dev, closers{vmFile, conn}, nil
-}
-
-type closers []io.Closer
-
-func (c closers) Close() error {
-	var errs []error
-	for _, x := range c {
-		errs = append(errs, x.Close())
-	}
-	return errors.Join(errs...)
+	return dev, conn, nil
 }
 
 // newMachine creates the VM object of v and watches its state.
@@ -609,9 +665,11 @@ func (r *Runtime) newMachine(v *vm, cfg *vz.VirtualMachineConfiguration) error {
 	if err != nil {
 		return err
 	}
-	exited := WatchStopped(machine)
+	v.stopMu.Lock()
+	defer v.stopMu.Unlock()
 	v.mu.Lock()
-	v.machine, v.exited = machine, exited
+	v.machine = machine
+	v.watcher = watchMachine(machine.StateChangedNotify(), terminalState)
 	v.mu.Unlock()
 	return nil
 }
@@ -622,6 +680,9 @@ func (r *Runtime) coldBoot(ctx context.Context, v *vm, spec vmruntime.Spec) erro
 		return err
 	}
 	if err := r.newMachine(v, cfg); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := v.machine.Start(); err != nil {
@@ -645,15 +706,7 @@ func (r *Runtime) waitGuest(ctx context.Context, v *vm) error {
 		_, err := client.WaitReady(rctx, 100*time.Millisecond)
 		done <- err
 	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("vzrt: guest helper not ready: %w", err)
-		}
-		return nil
-	case <-v.exited:
-		return errors.New("vzrt: the VM stopped during boot")
-	}
+	return waitGuestResult(done, v.Exited())
 }
 
 func (r *Runtime) lookup(id string) (*vm, error) {
@@ -666,18 +719,26 @@ func (r *Runtime) lookup(id string) (*vm, error) {
 	return v, nil
 }
 
-// waitState waits until the VM reaches want.
-func waitState(ctx context.Context, machine *vz.VirtualMachine, want vz.VirtualMachineState) error {
+// waitState waits until the VM reaches want, exits, or the context ends.
+func waitState(ctx context.Context, state func() vz.VirtualMachineState, want vz.VirtualMachineState) error {
 	t := time.NewTicker(10 * time.Millisecond)
 	defer t.Stop()
-	for machine.State() != want {
+	for {
+		current := state()
+		if current == want {
+			return nil
+		}
+		if terminalState(current) {
+			return fmt.Errorf("vzrt: VM state %v, want %v: %w", current, want, errVMTerminalState)
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("vzrt: VM state %v, want %v: %w", current, want, err)
+		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("vzrt: VM state %v, want %v: %w", machine.State(), want, ctx.Err())
 		case <-t.C:
 		}
 	}
-	return nil
 }
 
 // Pause flushes the guest page cache and then stops the vCPUs and keeps the
@@ -688,9 +749,17 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err != nil {
 		return err
 	}
+	r.flushForPause(ctx, v)
+	return r.pauseVM(ctx, v)
+}
+
+func (r *Runtime) flushForPause(ctx context.Context, v *vm) {
 	if err := guestsync.Sync(ctx, v.id, v.Dial); err != nil {
 		r.logger.Warn("guest sync before pause failed", "sandbox_id", v.id, "error", err)
 	}
+}
+
+func (r *Runtime) pauseVM(ctx context.Context, v *vm) error {
 	machine, _, err := v.current()
 	if err != nil {
 		return err
@@ -698,7 +767,7 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err := machine.Pause(); err != nil {
 		return fmt.Errorf("vzrt: pause: %w", err)
 	}
-	if err := waitState(ctx, machine, vz.VirtualMachineStatePaused); err != nil {
+	if err := waitState(ctx, machine.State, vz.VirtualMachineStatePaused); err != nil {
 		return err
 	}
 	v.mu.Lock()
@@ -720,7 +789,7 @@ func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 	if err := machine.Resume(); err != nil {
 		return fmt.Errorf("vzrt: resume: %w", err)
 	}
-	if err := waitState(ctx, machine, vz.VirtualMachineStateRunning); err != nil {
+	if err := waitState(ctx, machine.State, vz.VirtualMachineStateRunning); err != nil {
 		return err
 	}
 	v.mu.Lock()
@@ -734,6 +803,9 @@ func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 // network configuration is in memory and would not match a restored
 // sandbox's network stack.
 func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return vmruntime.SnapshotInfo{}, err
+	}
 	v, err := r.lookup(m.SandboxID())
 	if err != nil {
 		return vmruntime.SnapshotInfo{}, err
@@ -744,38 +816,57 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 	v.mu.Lock()
 	wasPaused := v.paused
 	v.mu.Unlock()
-	// A paused VM was flushed by its Pause; Pause flushes a running one. A
-	// failed resume after a completed capture fails the snapshot, so no READY
-	// record is saved for a VM that stays paused.
-	return vmruntime.SnapshotWithPause(r.logger, v.id, wasPaused,
-		func() error { return r.Pause(ctx, m) },
-		func() error { return r.Resume(context.Background(), m) },
-		func() (vmruntime.SnapshotInfo, error) { return r.capture(v, dir) })
+	// A paused VM was flushed by its Pause; flush a running one before capture.
+	info, err := vmruntime.SnapshotWithPause(r.logger, v.id, wasPaused,
+		func() error {
+			r.flushForPause(ctx, v)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			// Wait for a pause that started so SnapshotWithPause can resume
+			// the VM even if the channel closes during the native transition.
+			pauseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), StopTimeout)
+			defer cancel()
+			return r.pauseVM(pauseCtx, v)
+		},
+		func() error {
+			// Recover the source even when the snapshot context has ended.
+			// The deadline bounds the state poll after the native Resume call.
+			resumeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotResumeTimeout)
+			defer cancel()
+			return r.Resume(resumeCtx, m)
+		},
+		func() (vmruntime.SnapshotInfo, error) { return r.capture(ctx, v, dir) })
+	if errors.Is(err, errVMTerminalState) {
+		// The VM exit watcher reconciles a terminal source after Snapshot
+		// returns and the command lock is released.
+		info.SourceState = ownsandv1.SandboxState_SANDBOX_STATE_UNSPECIFIED
+	}
+	return info, err
 }
 
 // capture writes the snapshot content of the paused VM v into dir.
-func (r *Runtime) capture(v *vm, dir string) (vmruntime.SnapshotInfo, error) {
+func (r *Runtime) capture(ctx context.Context, v *vm, dir string) (vmruntime.SnapshotInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return vmruntime.SnapshotInfo{}, err
+	}
 	if v.guestOS == ownsandv1.GuestOs_GUEST_OS_MACOS {
-		return r.snapshotMacOS(v, dir)
+		return r.snapshotMacOS(ctx, v, dir)
 	}
 	info := vmruntime.SnapshotInfo{}
 	if memoryStateSupported && v.network == ownsandv1.NetworkMode_NETWORK_MODE_NONE {
-		machine, _, err := v.current()
+		saved, err := r.saveSnapshotMemory(ctx, v, filepath.Join(dir, snapState))
 		if err != nil {
 			return vmruntime.SnapshotInfo{}, err
 		}
-		if err := saveMemory(machine, filepath.Join(dir, snapState)); err != nil {
-			// A disk-only snapshot is still complete; a create from it
-			// boots cold.
-			r.logger.Warn("saving the memory state failed; taking a disk-only snapshot", "sandbox_id", v.id, "error", err)
-			os.Remove(filepath.Join(dir, snapState))
-		} else if err := os.WriteFile(filepath.Join(dir, snapMachineID), v.machineID, 0o600); err != nil {
-			return vmruntime.SnapshotInfo{}, err
-		} else {
+		if saved {
+			if err := os.WriteFile(filepath.Join(dir, snapMachineID), v.machineID, 0o600); err != nil {
+				return vmruntime.SnapshotInfo{}, err
+			}
 			info.HasMemoryState = true
 		}
 	}
-	if err := copyFile(filepath.Join(v.dir, diskFile), filepath.Join(dir, snapDisk)); err != nil {
+	if err := copyFile(ctx, filepath.Join(v.dir, diskFile), filepath.Join(dir, snapDisk)); err != nil {
 		return vmruntime.SnapshotInfo{}, err
 	}
 	for _, name := range []string{snapState, snapDisk, snapMachineID} {
@@ -783,7 +874,29 @@ func (r *Runtime) capture(v *vm, dir string) (vmruntime.SnapshotInfo, error) {
 			info.SizeBytes += st.Size()
 		}
 	}
-	return info, nil
+	return info, ctx.Err()
+}
+
+// saveSnapshotMemory waits for the native save, which cannot be interrupted.
+// A native save error permits a disk-only snapshot if the channel is still open.
+func (r *Runtime) saveSnapshotMemory(ctx context.Context, v *vm, path string) (bool, error) {
+	machine, _, err := v.current()
+	if err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	saveErr := saveMemory(machine, path)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if saveErr != nil {
+		r.logger.Warn("saving the memory state failed; taking a disk-only snapshot", "sandbox_id", v.id, "error", saveErr)
+		os.Remove(path)
+		return false, nil
+	}
+	return true, nil
 }
 
 // restoreMemory creates the VM of v with the snapshot's machine identifier
@@ -814,19 +927,30 @@ func (r *Runtime) restoreMemory(ctx context.Context, v *vm, spec vmruntime.Spec)
 type vzMachine struct{ m *vz.VirtualMachine }
 
 func (z vzMachine) Terminal() bool {
-	state := z.m.State()
-	return state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError
+	return terminalState(z.m.State())
 }
-func (z vzMachine) CanStop() bool { return z.m.CanStop() }
-func (z vzMachine) Stop() error   { return z.m.Stop() }
 
-// StopVMAfterFailure stops machine after the operation that owns it failed
-// with primary, waiting at most the runtime stop timeout for the terminal
-// state, and returns the error to report: primary when the VM is stopped, or
-// primary joined with the stop failure (which wraps ErrVMMayRun) when the VM
-// may still run.
-func StopVMAfterFailure(primary error, machine *vz.VirtualMachine, exited <-chan struct{}) error {
-	return stopForCleanup(primary, vzMachine{machine}, exited, stopTimeout)
+// A terminal notification can let cleanup discard the last tracked handle
+// while either native call is in progress. Keep the VM and its queue alive
+// until the call returns.
+func (z vzMachine) CanStop() bool {
+	ok := z.m.CanStop()
+	runtime.KeepAlive(z.m)
+	return ok
+}
+
+func (z vzMachine) Stop() error {
+	err := z.m.Stop()
+	runtime.KeepAlive(z.m)
+	return err
+}
+
+// StopVMForCleanup confirms that machine reached a terminal state. It uses
+// the runtime stop timeout for both the request and the wait. It returns
+// primary, if any, on success. If termination is unconfirmed, it joins the
+// stop failure and ErrVMMayRun with primary.
+func StopVMForCleanup(primary error, machine *vz.VirtualMachine, exited <-chan struct{}) error {
+	return stopForCleanup(primary, vzMachine{machine}, exited, StopTimeout)
 }
 
 // stopVM stops the VM of v, if it runs, and then its network stack. It
@@ -839,21 +963,17 @@ func (r *Runtime) stopVM(v *vm) error {
 	v.stopMu.Lock()
 	defer v.stopMu.Unlock()
 	v.mu.Lock()
-	machine, exited := v.machine, v.exited
+	machine, watcher := v.machine, v.watcher
 	v.mu.Unlock()
 	if machine != nil {
-		if err := stopMachine(vzMachine{machine}, exited, stopTimeout); err != nil {
+		if err := watcher.stop(vzMachine{machine}, StopTimeout); err != nil {
 			r.logger.Error("VM did not stop", "sandbox_id", v.id, "error", err)
 			return err
 		}
-		v.mu.Lock()
-		if v.machine == machine {
-			v.machine = nil
-		}
-		v.mu.Unlock()
 	}
 	// The VM is gone: nothing uses the network stack any more.
 	v.mu.Lock()
+	v.machine = nil
 	stack, conn := v.net, v.netConn
 	v.net, v.netConn = nil, nil
 	consoleIn := v.consoleIn
@@ -922,9 +1042,7 @@ func (r *Runtime) Running(context.Context) ([]string, error) {
 	defer r.mu.Unlock()
 	ids := make([]string, 0, len(r.vms))
 	for id, v := range r.vms {
-		v.mu.Lock()
-		exited := v.exited
-		v.mu.Unlock()
+		exited := v.Exited()
 		if exited == nil {
 			continue
 		}

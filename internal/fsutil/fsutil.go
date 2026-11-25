@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 )
@@ -26,8 +28,7 @@ func CopyTree(src, dst string) error {
 	return CopyTreeContext(context.Background(), src, dst)
 }
 
-// dirMode is a directory that CopyTreeContext created and whose final
-// permission bits it applies after the copy.
+// dirMode holds the final permission bits to apply to a directory.
 type dirMode struct {
 	path string
 	perm fs.FileMode
@@ -38,13 +39,12 @@ type dirMode struct {
 // copied before the stop stay in dst; the caller removes them.
 //
 // The permission bits of a copied file are those of its source: CopyFile sets
-// them explicitly, so the umask does not clear any. A directory is created
-// owner-writable, so that its entries can be copied into it, and receives its
-// source permission bits only after the whole tree is copied, deepest
-// directories first; a read-only source directory therefore copies with its
-// content and ends read-only. A copy that fails or stops early skips this
-// step and leaves the directories that it created owner-writable, so that the
-// caller's removal of the partial copy does not meet a read-only directory.
+// them explicitly, so the umask does not clear any. Each newly created
+// directory, including missing parents of dst, gets owner read, write, and
+// search access before the copy uses it. Copied directories receive their
+// source permission bits after the whole tree is copied, deepest first.
+// A copy that stops during the walk keeps that temporary owner access so
+// the caller can remove the partial tree.
 //
 // On Windows a directory keeps the mode that the create call gives it: the
 // read-only attribute of a directory has no effect on its entries there.
@@ -68,7 +68,7 @@ func CopyTreeContext(ctx context.Context, src, dst string) error {
 		}
 		switch {
 		case d.IsDir():
-			if err := os.MkdirAll(target, info.Mode().Perm()|0o700); err != nil {
+			if err := mkdirCopyDir(target, info.Mode().Perm()); err != nil {
 				return err
 			}
 			dirs = append(dirs, dirMode{path: target, perm: info.Mode().Perm()})
@@ -99,6 +99,45 @@ func CopyTreeContext(ctx context.Context, src, dst string) error {
 		}
 	}
 	return nil
+}
+
+// mkdirCopyDir creates missing components in order so that a restrictive
+// umask cannot prevent creation of the next component.
+func mkdirCopyDir(path string, perm fs.FileMode) error {
+	const ownerAccess = 0o700
+	if runtime.GOOS == "windows" {
+		return os.MkdirAll(path, perm|ownerAccess)
+	}
+	if info, err := os.Stat(path); err == nil {
+		if info.IsDir() {
+			return nil
+		}
+		return &fs.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
+	}
+	if parent := filepath.Dir(path); parent != path {
+		if err := mkdirCopyDir(parent, perm); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(path, perm|ownerAccess); err != nil {
+		if info, statErr := os.Lstat(path); statErr == nil && info.IsDir() {
+			return nil
+		}
+		return err
+	}
+	// Keep the group and other permissions that the kernel set at creation.
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	mode := info.Mode()
+	if !mode.IsDir() {
+		return &fs.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
+	}
+	if mode&ownerAccess == ownerAccess {
+		return nil
+	}
+	return os.Chmod(path, mode|ownerAccess)
 }
 
 // CopyFile copies one regular file. The copy has the permission bits perm
@@ -134,11 +173,10 @@ func copyFile(ctx context.Context, src, dst string, perm fs.FileMode) error {
 }
 
 // RemoveAll removes path and the tree below it like os.RemoveAll. A tree that
-// CopyTree copied from a read-only source keeps the read-only directory modes,
-// and a process without the privilege to override them cannot delete the
-// entries of such a directory. When the first attempt fails with a permission
-// error, RemoveAll therefore grants the owner read, write and search access on
-// every directory of the tree (symbolic links are not followed) and removes
+// CopyTree or ReadTar restored with read-only directory modes can contain
+// entries that an unprivileged process cannot delete. When the first attempt
+// fails with a permission error, RemoveAll grants the owner read, write and
+// search access on every directory of the tree (symbolic links are not followed) and removes
 // the tree again. It returns the error of that second attempt, so a tree that
 // stays undeletable (for example because its parent directory is read-only)
 // is still reported. A missing path is not an error.
@@ -199,9 +237,18 @@ func makeDirsWritable(path string) {
 
 // TreeSize returns the total size of the regular files under dir.
 func TreeSize(dir string) (int64, error) {
+	return TreeSizeContext(context.Background(), dir)
+}
+
+// TreeSizeContext returns the size of the regular files under dir and checks
+// for cancellation before visiting each entry.
+func TreeSizeContext(ctx context.Context, dir string) (int64, error) {
 	var total int64
 	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if d.Type().IsRegular() {
@@ -311,6 +358,10 @@ func WriteTarContext(ctx context.Context, w io.Writer, dir string) error {
 // the last entry, ReadTar therefore resolves every symbolic link that it
 // created through the os.Root again and fails when one leaves dir. A link
 // that resolves to nothing stays allowed.
+//
+// On Unix, regular files and explicitly archived directories receive the
+// ordinary permission bits from their headers, regardless of the umask.
+// Directory modes are applied after extraction and link validation.
 func ReadTar(r io.Reader, dir string) error {
 	return ReadTarContext(context.Background(), r, dir)
 }
@@ -329,13 +380,14 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 	// A later entry can turn a path component of an earlier link into
 	// another link, so the links are resolved once, after the last entry.
 	var links []string
+	dirs := make(map[string]fs.FileMode)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return checkLinksConfined(root, links)
+			break
 		}
 		if err != nil {
 			return err
@@ -350,6 +402,10 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 			if err := root.MkdirAll(name, mode|0o700); err != nil {
 				return err
 			}
+			if runtime.GOOS != "windows" {
+				// A repeated directory header supplies the final mode.
+				dirs[strings.TrimRight(name, string(filepath.Separator))] = mode
+			}
 		case tar.TypeReg:
 			if err := root.MkdirAll(filepath.Dir(name), 0o700); err != nil {
 				return err
@@ -361,6 +417,12 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 			if _, err := io.Copy(f, tr); err != nil {
 				f.Close()
 				return err
+			}
+			if runtime.GOOS != "windows" {
+				if err := f.Chmod(mode); err != nil {
+					f.Close()
+					return err
+				}
 			}
 			if err := f.Close(); err != nil {
 				return err
@@ -383,6 +445,50 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 			return fmt.Errorf("fsutil: unsupported tar entry type %d", hdr.Typeflag)
 		}
 	}
+	if err := checkLinksConfined(root, links); err != nil {
+		return err
+	}
+	// A tar can list a directory after its children. Apply the deepest
+	// modes first so that every parent stays searchable until its children
+	// have their final modes.
+	names := slices.SortedFunc(maps.Keys(dirs), func(a, b string) int {
+		return tarDirectoryDepth(b) - tarDirectoryDepth(a)
+	})
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := setTarDirectoryMode(root, name, dirs[name]); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+func tarDirectoryDepth(name string) int {
+	name = filepath.Clean(name)
+	if name == "." {
+		return 0
+	}
+	return 1 + strings.Count(name, string(filepath.Separator))
+}
+
+func setTarDirectoryMode(root *os.Root, name string, mode fs.FileMode) error {
+	// Open within the extraction root and chmod the handle. A path-based
+	// chmod can follow a symlink that replaces the final path component.
+	f, err := root.Open(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("fsutil: tar directory %q is no longer a directory", name)
+	}
+	return f.Chmod(mode)
 }
 
 // checkLinksConfined resolves each symbolic link in links through root and

@@ -35,6 +35,7 @@ import {
   ServiceId,
   type UsageSummaryRow,
 } from "@delino/accounts-protos/v1/usage_pb";
+import { type UtcMonth, utcMonthOf } from "../format.ts";
 import { awaitDeferredCall } from "./form-submit-deferral.ts";
 
 type Init<T> = Omit<T, "$typeName" | "$unknown">;
@@ -259,7 +260,12 @@ const PAYMENT_ROLES = new Set([
   BillingAccountRole.ADMIN,
 ]);
 
-export function createFakeApi(): FakeApi {
+/** Assigns seeded usage to the given UTC month or the current month of each request. */
+export function createFakeApi({
+  usageMonth,
+}: { usageMonth?: UtcMonth } = {}): FakeApi {
+  const fixedUsageMonth =
+    usageMonth === undefined ? undefined : { ...usageMonth };
   const api = {
     userId: OWNER,
     accounts: new Map([[ACCOUNT_ID, seedAccount()]]),
@@ -383,6 +389,7 @@ export function createFakeApi(): FakeApi {
       },
       async getBillingAccount(req) {
         record("GetBillingAccount", req);
+        await awaitDeferredCall(api, "GetBillingAccount");
         await api.gates.get("GetBillingAccount");
         return { billingAccount: view(load(req.billingAccountId).account) };
       },
@@ -397,8 +404,9 @@ export function createFakeApi(): FakeApi {
         );
         return { billingAccounts: page, nextPageToken };
       },
-      updateBillingAccount(req) {
+      async updateBillingAccount(req) {
         record("UpdateBillingAccount", req);
+        await awaitDeferredCall(api, "UpdateBillingAccount");
         const { account } = load(req.billingAccountId, PAYMENT_ROLES);
         account.name = req.name;
         return { billingAccount: view(account) };
@@ -544,6 +552,12 @@ export function createFakeApi(): FakeApi {
           req.billingAccountId,
           new Set([BillingAccountRole.OWNER]),
         );
+        if (req.userId === self.userId) {
+          throw new ConnectError(
+            "user_id must name another member",
+            Code.InvalidArgument,
+          );
+        }
         const target = account.members.find((m) => m.userId === req.userId);
         if (target === undefined) {
           throw new ConnectError("member not found", Code.NotFound);
@@ -653,8 +667,9 @@ export function createFakeApi(): FakeApi {
       },
       async getInvoiceUrl(req) {
         record("GetInvoiceUrl", req);
-        await api.gates.get("GetInvoiceUrl");
         load(req.billingAccountId, PAYMENT_ROLES);
+        // Hold the authorized response so access can change before delivery.
+        await api.gates.get("GetInvoiceUrl");
         return {
           invoiceUrl: `https://sandbox-invoice.paddle.test/${req.paddleTransactionId}.pdf`,
         };
@@ -673,13 +688,9 @@ export function createFakeApi(): FakeApi {
         record("ListUsageSummary", req);
         await api.gates.get("ListUsageSummary");
         const { account } = load(req.billingAccountId);
-        // The seeded usage belongs to the current UTC month.
-        const now = new Date();
+        const { year, month } = fixedUsageMonth ?? utcMonthOf(new Date());
         const rows =
-          req.year === now.getUTCFullYear() &&
-          req.month === now.getUTCMonth() + 1
-            ? account.usage
-            : [];
+          req.year === year && req.month === month ? account.usage : [];
         // The server reports the total of the whole month on every page,
         // so sum all rows before paging them.
         const totalAmountUsdMicros = rows.reduce(

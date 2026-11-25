@@ -317,19 +317,15 @@ func TestVsockHandshakeRefused(t *testing.T) {
 // TestVsockHandshakeClearsDeadline covers the Dial branch that installs its
 // own socket deadline (a ctx without a deadline) and checks that Dial clears
 // that deadline once the handshake succeeds. The test never sets a deadline on
-// the returned connection, so a leftover deadline makes the read time out.
+// the returned connection, so a leftover deadline makes the write time out.
 func TestVsockHandshakeClearsDeadline(t *testing.T) {
 	old := vsockHandshakeTimeout
 	vsockHandshakeTimeout = 100 * time.Millisecond
 	t.Cleanup(func() { vsockHandshakeTimeout = old })
 
-	v, accepted, release, _ := delayedAckPeer(t)
-	// The peer acknowledges at once; the idle connection then gets one byte
-	// after the handshake timeout has passed.
-	go func() {
-		<-accepted
-		close(release)
-	}()
+	v, _, release, _ := delayedAckPeer(t)
+	// The peer can acknowledge as soon as it reads the CONNECT line.
+	close(release)
 	c, err := v.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -785,6 +781,33 @@ func TestCreateOutboundPreflightChecksTools(t *testing.T) {
 	_, err = stubOutbound(t, true).Create(context.Background(), spec(ownsandv1.NetworkMode_NETWORK_MODE_NONE))
 	if !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), "base image") {
 		t.Fatalf("NONE create without tools: %v", err)
+	}
+}
+
+func TestCreateRejectsUndersizedLinuxBaseDisk(t *testing.T) {
+	dir := t.TempDir()
+	kernel, rootfs := filepath.Join(dir, "vmlinux"), filepath.Join(dir, "rootfs.ext4")
+	for _, path := range []string{kernel, rootfs} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Truncate(rootfs, 2<<30); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runtime{opts: Options{Kernel: kernel, Rootfs: rootfs}}
+	// A path under a regular file cannot be prepared. The disk-size error
+	// must occur before the runtime reaches that step.
+	spec := vmruntime.Spec{
+		SandboxID: "sandbox",
+		GuestOS:   ownsandv1.GuestOs_GUEST_OS_LINUX,
+		Dir:       filepath.Join(kernel, "vm"),
+		Resources: &ownsandv1.Resources{DiskGib: 1},
+	}
+	vm, err := r.Create(t.Context(), spec)
+	if vm != nil || !errors.Is(err, vmruntime.ErrUnsupported) ||
+		!strings.Contains(err.Error(), "needs at least 2 GiB of disk (requested 1 GiB)") {
+		t.Fatalf("Create = %v, %v, want the disk-size error", vm, err)
 	}
 }
 

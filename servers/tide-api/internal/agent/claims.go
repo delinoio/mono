@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
@@ -153,15 +154,20 @@ type Demand struct {
 // normal operation, not a failure.
 var ErrClaimTaken = errors.New("another worker holds the vendor request")
 
-// latestClaim returns the newest claim of a vendor request of the
-// organization with the state of its request, or nil.
-func (h *Hub) latestClaim(ctx context.Context, q db.Querier, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) (*Claim, *work.Request, error) {
+// latestVendorClaim returns the newest claim of a vendor request, or nil.
+func (h *Hub) latestVendorClaim(ctx context.Context, q db.Querier, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) (*Claim, error) {
 	c, err := scanClaim(q.QueryRow(ctx, `SELECT `+claimColumns+` FROM agent_claims c WHERE c.organization_id = $1 AND c.vendor = $2 AND c.vendor_request_id = $3
 		ORDER BY c.create_time DESC, c.request_id DESC LIMIT 1`, orgID, int16(vendor), vendorRequestID))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil, nil
+		return nil, nil
 	}
-	if err != nil {
+	return c, err
+}
+
+// latestClaim returns the newest claim of a vendor request with its request.
+func (h *Hub) latestClaim(ctx context.Context, q db.Querier, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) (*Claim, *work.Request, error) {
+	c, err := h.latestVendorClaim(ctx, q, orgID, vendor, vendorRequestID)
+	if err != nil || c == nil {
 		return nil, nil, err
 	}
 	req, err := h.engine.GetRequest(ctx, q, orgID, c.RequestID)
@@ -205,21 +211,41 @@ func (h *Hub) nextSourceKey(ctx context.Context, q db.Querier, orgID string, sou
 	return vendorRequestID + "#" + strconv.Itoa(high+1), nil
 }
 
-// profileFor returns the runner profile that receives the requests of an
-// integration (recorded decision): the oldest AGENT_SESSION profile that
-// names it. Other profiles that name the same integration get no
-// requests; they can still keep warm runners.
-func (h *Hub) profileFor(ctx context.Context, q db.Querier, in integration.Integration) (*profile.Profile, error) {
+// demandProfileID selects the oldest AGENT_SESSION runner profile of the
+// integration. The other profiles can still keep warm runners.
+func demandProfileID(ctx context.Context, q db.Querier, in integration.Integration) (string, error) {
 	var id string
 	err := q.QueryRow(ctx, `SELECT runner_profile_id::text FROM runner_profiles WHERE organization_id = $1 AND agent_integration_id = $2 AND workload_kind = $3
 		ORDER BY create_time, runner_profile_id LIMIT 1`, in.OrganizationID, in.ID, int16(tidev1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION)).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
+		return "", nil
 	}
+	return id, err
+}
+
+// lockDemandProfile locks the organization and profile in that order, then
+// checks that the selected profile still serves this integration.
+func (h *Hub) lockDemandProfile(ctx context.Context, tx pgx.Tx, in integration.Integration, id string) (*profile.Profile, error) {
+	if err := api.LockOrganizationShare(ctx, tx, in.OrganizationID); err != nil {
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			return nil, ErrNoProfile
+		}
+		return nil, err
+	}
+	if err := profile.LockShare(ctx, tx, in.OrganizationID, id); err != nil {
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			return nil, ErrNoProfile
+		}
+		return nil, err
+	}
+	p, err := h.engine.Profiles().Get(ctx, tx, in.OrganizationID, id)
 	if err != nil {
 		return nil, err
 	}
-	return h.engine.Profiles().Get(ctx, q, in.OrganizationID, id)
+	if p.Kind != tidev1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION || p.AgentIntegrationID != in.ID {
+		return nil, ErrNoProfile
+	}
+	return p, nil
 }
 
 // admit claims a pending vendor request and creates its tide request:
@@ -288,11 +314,11 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 	if c != nil && canceledBeforeStart(req) && c.DemandMarker == d.Marker {
 		return nil
 	}
-	p, err := h.profileFor(ctx, h.svc.DB.Pool, in)
+	profileID, err := demandProfileID(ctx, h.svc.DB.Pool, in)
 	if err != nil {
 		return err
 	}
-	if p == nil {
+	if profileID == "" {
 		h.log.LogAttrs(ctx, slog.LevelDebug, "agent_demand_ignored", append(logAttrs, slog.String("cause", "no_profile"))...)
 		return nil
 	}
@@ -313,12 +339,19 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 		DemandMarker: d.Marker, WorkerID: workerID, Scope: d.Scope, State: ClaimHeld}
 	var created bool
 	err = h.inTx(ctx, func(tx pgx.Tx) error {
-		r, ok, err := h.engine.CreateRequest(ctx, tx, work.NewRequest{Profile: p, Source: v.Source(), SourceKey: key, RequestID: requestID})
-		if err != nil || !ok {
-			created = false
+		p, err := h.lockDemandProfile(ctx, tx, in, profileID)
+		if errors.Is(err, ErrNoProfile) {
+			h.log.LogAttrs(ctx, slog.LevelDebug, "agent_demand_ignored", append(logAttrs, slog.String("cause", "profile_deleted"))...)
+			return nil
+		}
+		if err != nil {
 			return err
 		}
-		created = true
+		r, ok, err := h.engine.CreateRequest(ctx, tx, work.NewRequest{Profile: p, Source: v.Source(), SourceKey: key, RequestID: requestID})
+		created = ok
+		if err != nil || !ok {
+			return err
+		}
 		now := h.svc.NowUTC()
 		_, err = tx.Exec(ctx, `INSERT INTO agent_claims (request_id, organization_id, agent_integration_id, vendor, vendor_request_id, demand_marker,
 			worker_id, scope, state, create_time, update_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
@@ -326,9 +359,8 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 		return err
 	})
 	if err != nil || !created {
-		// Another admission of the same vendor request won, or the store
-		// failed: give the claim back so the vendor does not wait for a
-		// worker that never comes.
+		// Give the claim back when this admission did not store a request,
+		// so the vendor does not wait for a worker that never comes.
 		probe := &work.Request{ID: requestID, OrganizationID: in.OrganizationID, State: tidev1.RequestState_REQUEST_STATE_CANCELED,
 			EndReason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE}
 		if _, rerr := v.Release(context.WithoutCancel(ctx), in, claim, probe); rerr != nil {
@@ -339,7 +371,7 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 		}
 		return nil
 	}
-	h.log.LogAttrs(ctx, slog.LevelInfo, "agent_request_claimed", append(logAttrs, slog.String("request_id", requestID), slog.String("runner_profile_id", p.ID))...)
+	h.log.LogAttrs(ctx, slog.LevelInfo, "agent_request_claimed", append(logAttrs, slog.String("request_id", requestID), slog.String("runner_profile_id", profileID))...)
 	h.svc.WorkChanged(in.OrganizationID)
 	return nil
 }
@@ -354,17 +386,38 @@ func canceledBeforeStart(req *work.Request) bool {
 	return req.StartTime == nil && req.EndReason == tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER
 }
 
-// lost marks a claim as no longer tide's and ends its request when no
-// runner started for it yet.
-func (h *Hub) lost(ctx context.Context, c *Claim, req *work.Request) error {
-	if err := h.setClaimState(ctx, h.svc.DB.Pool, c.RequestID, ClaimHeld, ClaimReleased); err != nil {
+// lost records that tide no longer holds the claim. Only a request that
+// is still queued under the dispatch lock ends with CANCELED_BY_SOURCE.
+func (h *Hub) lost(ctx context.Context, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) error {
+	unlock := h.lockVendorRequest(orgID, vendor, vendorRequestID)
+	defer unlock()
+
+	var canceled *work.Request
+	err := h.inTx(ctx, func(tx pgx.Tx) error {
+		c, err := h.latestVendorClaim(ctx, tx, orgID, vendor, vendorRequestID)
+		if err != nil || c == nil {
+			return err
+		}
+		req, err := h.engine.LockRequest(ctx, tx, c.RequestID)
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			// Retention can remove the request and claim after the lookup.
+			return nil
+		}
+		if err != nil || work.RequestTerminal(req.State) {
+			return err
+		}
+		if err := h.setClaimState(ctx, tx, req.ID, ClaimHeld, ClaimReleased); err != nil {
+			return err
+		}
+		if req.State != tidev1.RequestState_REQUEST_STATE_QUEUED {
+			return nil
+		}
+		canceled, err = h.engine.EndRequestTx(ctx, tx, req.ID, work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED,
+			Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE})
 		return err
+	})
+	if err == nil && canceled != nil {
+		h.engine.Kick(orgID)
 	}
-	if req.State != tidev1.RequestState_REQUEST_STATE_QUEUED {
-		// A runner starts or serves the request; its program exit ends it.
-		return nil
-	}
-	_, err := h.engine.EndRequest(ctx, c.OrganizationID, c.RequestID, work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED,
-		Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE})
 	return err
 }

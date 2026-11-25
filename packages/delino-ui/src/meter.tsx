@@ -28,19 +28,21 @@ export function Meter({
   label,
   showValue = false,
   className,
+  "aria-label": ariaLabel,
   "aria-labelledby": ariaLabelledBy,
   ...props
 }: MeterProps) {
-  // Workaround: the UI SDK registers the gauge label only after mount, so
-  // static (server-rendered) markup has a label id that nothing references and
-  // the bar has no accessible name. This id gives the root a reference in the
-  // first render. Scope: `Meter` only. Remove it when the UI SDK registers the
-  // gauge label before it renders the root.
+  // The UI SDK registers the Meter label after mount. Supply its ID on the
+  // first render for the visible-label fallback. An empty aria-labelledby keeps
+  // the SDK from overriding an explicit aria-label after mount. Remove these
+  // overrides when the SDK names the bar correctly in both cases.
   const labelId = React.useId();
+  const callerLabelledBy = ariaLabelledBy?.trim() ? ariaLabelledBy : undefined;
   return (
     <MeterRoot
       className={mergeClassName("dui-progress", className)}
-      aria-labelledby={ariaLabelledBy || labelId}
+      aria-label={ariaLabel}
+      aria-labelledby={callerLabelledBy ?? (ariaLabel?.trim() ? "" : labelId)}
       {...props}
     >
       <div className="dui-progress-header">

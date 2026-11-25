@@ -2,13 +2,14 @@
 //
 // Fixtures for `scripts/ci/release-binaries.sh`, the binary release steps of
 // `.github/workflows/deploy.yml`, against stubbed `go`, `gh`, `curl`, macOS
-// signing tools (`security`, `codesign`, `ditto`, `xcrun`) and a
+// signing tools (`security`, `codesign`, `plutil`, `ditto`, `xcrun`) and a
 // stubbed release manifest tool.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -25,24 +26,37 @@ import test from "node:test";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const script = join(root, "scripts/ci/release-binaries.sh");
-const bashVersion = spawnSync(
-  "bash",
-  ["-c", 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"'],
-  { encoding: "utf8" },
-)
-  .stdout?.trim()
-  .split(" ")
-  .map(Number) ?? [0, 0];
-const hasJq = spawnSync("sh", ["-c", "command -v jq"]).status === 0;
-function skipReason() {
-  if (process.platform === "win32") return "the release scripts run on Linux";
-  if (!hasJq) return "jq is not installed";
-  if (bashVersion[0] < 4 || (bashVersion[0] === 4 && bashVersion[1] < 4)) {
-    return `the release scripts need Bash 4.4 or newer, found ${bashVersion.join(".")}`;
-  }
-  return false;
+function readBashVersion(bash) {
+  return (
+    spawnSync(bash, ["-c", 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"'], {
+      encoding: "utf8",
+    }).stdout?.trim() ?? ""
+  );
 }
-const skip = skipReason();
+
+const bashVersion = readBashVersion("bash");
+const [bashMajor, bashMinor] = bashVersion.split(".").map(Number);
+const bash32 =
+  bashVersion === "3.2"
+    ? "bash"
+    : ["/bin/bash", "bash3.2"].find((bash) => readBashVersion(bash) === "3.2");
+const macBash = bash32 ?? "bash";
+const hasJq = spawnSync("sh", ["-c", "command -v jq"]).status === 0;
+const dependencySkip =
+  process.platform === "win32"
+    ? "the release scripts run on Linux and macOS"
+    : !hasJq && "jq is not installed";
+const skip =
+  dependencySkip ||
+  (!(bashMajor > 4 || (bashMajor === 4 && bashMinor >= 4)) &&
+    `the Linux release fixtures need Bash 4.4 or newer, found ${bashVersion || "none"}`);
+const macSkip = dependencySkip || (!bash32 && skip);
+
+const virtualizationEntitlement = "com.apple.security.virtualization";
+const entitlementKey = `<key>${virtualizationEntitlement}</key>`;
+const entitlementPlist = (body) =>
+  `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>${body}</dict></plist>`;
+const enabledEntitlementPlist = entitlementPlist(`${entitlementKey}<true/>`);
 
 const sha = "c".repeat(40);
 const accountId = "0123456789abcdef0123456789abcdef";
@@ -207,11 +221,12 @@ cp "$path" "$out"
 `,
   security: `#!/usr/bin/env bash
 echo "security $*" >> "$STUB_LOG"
-if [[ "$1" == list-keychains && "$*" == *" -s "* ]]; then
-  printf 'security-args'; printf ' [%s]' "$@"; echo
-fi >> "$STUB_LOG"
-if [[ "$1" == list-keychains && "$*" != *" -s "* ]]; then
-  printf '    "%s"\\n' "/Users/runner/Library/Keychains/login.keychain-db" "/Users/runner/Library/Keychains/other keychain.keychain-db"
+if [[ "$1" == list-keychains ]]; then
+  if [[ " $* " == *" -s "* ]]; then
+    { printf 'security-args'; printf ' [%s]' "$@"; echo; } >> "$STUB_LOG"
+  elif [[ -z "\${STUB_EMPTY_KEYCHAIN_LIST:-}" ]]; then
+    printf '    "%s"\\n' "/Users/runner/Library/Keychains/login.keychain-db" "/Users/runner/Library/Keychains/other keychain.keychain-db"
+  fi
 fi
 if [[ "$1" == find-identity ]]; then
   printf '  1) ABCDEF "%s"\\n     1 valid identities found\\n' "\${STUB_IDENTITY:-Developer ID Application: Delino (TEAM123)}"
@@ -220,12 +235,26 @@ fi
   codesign: `#!/usr/bin/env bash
 echo "codesign $*" >> "$STUB_LOG"
 if [[ "$1" == --display ]]; then
-  [[ -n "\${STUB_NO_ENTITLEMENT:-}" ]] || echo '<key>com.apple.security.virtualization</key>'
+  if [[ -n "\${STUB_ENTITLEMENT_BINARY:-}" ]]; then
+    exec /usr/bin/codesign --display --entitlements - --xml "$STUB_ENTITLEMENT_BINARY"
+  fi
+  printf '%s\\n' "$STUB_ENTITLEMENT_PLIST"
+  [[ -z "\${STUB_CODESIGN_INSPECTION_FAIL:-}" ]] || exit 1
 fi
 if [[ " $* " == *" --check-notarization "* && -n "\${STUB_NOT_NOTARIZED:-}" ]]; then
   echo "test-requirement: code failed to satisfy specified code requirement(s)" >&2
   exit 3
 fi
+`,
+  plutil: `#!/usr/bin/env bash
+echo "plutil $*" >> "$STUB_LOG"
+[[ "$*" == "-convert json -o - -- -" ]] || exit 2
+if [[ "$(uname -s)" == Darwin ]]; then
+  exec /usr/bin/plutil "$@"
+fi
+# Match the fixture input and return the corresponding conversion result.
+[[ "$(cat)" == "$STUB_ENTITLEMENT_PLIST" && -n "$STUB_ENTITLEMENT_JSON" ]] || exit 1
+printf '%s\\n' "$STUB_ENTITLEMENT_JSON"
 `,
   ditto: `#!/usr/bin/env bash
 echo "ditto $*" >> "$STUB_LOG"
@@ -258,7 +287,7 @@ esac
 `,
 };
 
-function fixture(t, parent = tmpdir()) {
+function fixture(t, { parent = tmpdir(), bash = "bash" } = {}) {
   const dir = mkdtempSync(join(parent, "release-binaries-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const bin = join(dir, "bin");
@@ -289,7 +318,7 @@ function fixture(t, parent = tmpdir()) {
     binaries = [agent, cli],
     scriptPath = script,
   ) => {
-    const result = spawnSync("bash", [scriptPath, ...args], {
+    const result = spawnSync(bash, [scriptPath, ...args], {
       encoding: "utf8",
       cwd: root,
       env: {
@@ -297,6 +326,10 @@ function fixture(t, parent = tmpdir()) {
         HOME: dir,
         STUB_DIR: dir,
         STUB_LOG: log,
+        STUB_ENTITLEMENT_PLIST: enabledEntitlementPlist,
+        STUB_ENTITLEMENT_JSON: JSON.stringify({
+          [virtualizationEntitlement]: true,
+        }),
         // No release platform, so the build does not run the stub
         // executables; the version check fixture sets a release platform.
         STUB_GOHOST: "freebsd-amd64",
@@ -474,9 +507,9 @@ test("build fails for a module without a license file", { skip }, (t) => {
 
 test(
   "build cgo builds only the cgo platforms on a matching runner",
-  { skip },
+  { skip: macSkip },
   (t) => {
-    const f = fixture(t);
+    const f = fixture(t, { bash: macBash });
     const out = join(f.dir, "out");
     // Without a version variable, so the build does not run the stub output.
     const binaries = [{ ...agent, versionVariable: "" }, cli];
@@ -501,6 +534,27 @@ test(
       result.stderr,
       /needs a darwin-arm64 runner, not freebsd-amd64/,
     );
+  },
+);
+
+test(
+  "Bash 3.2 rejects the Linux release subcommands",
+  { skip: !bash32 && "Bash 3.2 is not installed" },
+  () => {
+    for (const args of [
+      ["build", "cross", "out"],
+      ["assemble", "artifacts", "assets"],
+      ["github-releases", "assets", "manifests"],
+      ["fetch-manifests", "manifests"],
+      ["prepare-manifests", "manifests", "assets"],
+      ["sign-manifests", "manifests"],
+      ["upload-manifests", "manifests"],
+      ["has-manifests"],
+    ]) {
+      const result = spawnSync(bash32, [script, ...args], { encoding: "utf8" });
+      assert.equal(result.status, 2, args.join(" "));
+      assert.match(result.stderr, /needs Bash 4\.4 or newer/, args.join(" "));
+    }
   },
 );
 
@@ -560,6 +614,22 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
 }
 
+function signedEntitlementFixture(dir, plist) {
+  if (process.platform !== "darwin") return {};
+  const binary = join(dir, "entitlement-fixture");
+  const entitlements = join(dir, "entitlements.plist");
+  copyFileSync("/usr/bin/true", binary);
+  chmodSync(binary, 0o755);
+  writeFileSync(entitlements, plist);
+  const result = spawnSync(
+    "/usr/bin/codesign",
+    ["--force", "--sign", "-", "--entitlements", entitlements, binary],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  return { STUB_ENTITLEMENT_BINARY: binary };
+}
+
 // The scenario runs in the system temporary directory and in a directory whose
 // name contains spaces, because the signing paths come from RUNNER_TEMP and the
 // output directory, and each must stay one argument of the signing tools.
@@ -569,7 +639,7 @@ for (const [label, spaced] of [
 ]) {
   test(
     `sign-macos signs with the hardened runtime and notarizes every darwin executable${label}`,
-    { skip },
+    { skip: macSkip },
     (t) => {
       let parent = tmpdir();
       if (spaced) {
@@ -578,7 +648,7 @@ for (const [label, spaced] of [
         parent = join(base, "temp with spaces");
         mkdirSync(parent);
       }
-      const f = fixture(t, parent);
+      const f = fixture(t, { parent, bash: macBash });
       // The plain scenario inherits TMPDIR, which may itself contain spaces.
       if (spaced) assert.ok(f.dir.includes(" "));
       const input = darwinBuilds(f);
@@ -591,7 +661,10 @@ for (const [label, spaced] of [
       const cliTarget = escapeRegExp(
         join(out, "ownsand-cli/ownsand-darwin-amd64"),
       );
-      const result = f.run(["sign-macos", input, out], appleEnv);
+      const result = f.run(["sign-macos", input, out], {
+        ...appleEnv,
+        ...signedEntitlementFixture(f.dir, enabledEntitlementPlist),
+      });
       assert.equal(result.status, 0, result.stderr);
       assert.equal(
         readFileSync(
@@ -687,6 +760,35 @@ for (const [label, spaced] of [
 }
 
 test(
+  "sign-macos restores an empty keychain search list",
+  { skip: macSkip },
+  (t) => {
+    const f = fixture(t, { bash: macBash });
+    const work = join(f.runnerTemp, "macos-signing");
+    const result = f.run(
+      ["sign-macos", darwinBuilds(f), join(f.dir, "signed")],
+      {
+        ...appleEnv,
+        STUB_EMPTY_KEYCHAIN_LIST: "1",
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(
+      result.log
+        .split("\n")
+        .filter((line) => line.startsWith("security-args ")),
+      [
+        `security-args [list-keychains] [-d] [user] [-s] [${join(work, "release.keychain-db")}]`,
+        "security-args [list-keychains] [-d] [user] [-s]",
+      ],
+    );
+    assert.match(result.log, /xcrun notarytool submit/);
+    assert.match(result.log, /security delete-keychain/);
+    assert.equal(existsSync(work), false);
+  },
+);
+
+test(
   "sign-macos fails on a rejected notarization and prints the log",
   { skip },
   (t) => {
@@ -727,24 +829,61 @@ test(
 );
 
 test(
-  "sign-macos fails without the entitlement, a secret or exactly one identity",
+  "sign-macos rejects invalid signed entitlements before notarization",
   { skip },
   async (t) => {
-    await t.test("entitlement", (t) => {
-      const f = fixture(t);
-      const result = f.run(
-        ["sign-macos", darwinBuilds(f), join(f.dir, "signed")],
-        {
-          ...appleEnv,
-          STUB_NO_ENTITLEMENT: "1",
-        },
-      );
-      assert.notEqual(result.status, 0);
-      assert.match(
-        result.stderr,
-        /no com\.apple\.security\.virtualization entitlement/,
-      );
-    });
+    const disabled = entitlementPlist(`${entitlementKey}<false/>`);
+    for (const [name, plist, converted] of [
+      ["false", disabled, { [virtualizationEntitlement]: false }],
+      ["missing", entitlementPlist(""), {}],
+      [
+        "string",
+        entitlementPlist(`${entitlementKey}<string>true</string>`),
+        { [virtualizationEntitlement]: "true" },
+      ],
+      [
+        "nested",
+        entitlementPlist(
+          `<key>other</key><dict>${entitlementKey}<true/></dict>`,
+        ),
+        { other: { [virtualizationEntitlement]: true } },
+      ],
+      ["malformed", entitlementPlist(`${entitlementKey}<true`), null],
+      [
+        "inspection failed",
+        enabledEntitlementPlist,
+        { [virtualizationEntitlement]: true },
+      ],
+    ]) {
+      await t.test(name, (t) => {
+        const f = fixture(t);
+        const result = f.run(
+          ["sign-macos", darwinBuilds(f), join(f.dir, "signed")],
+          {
+            ...appleEnv,
+            STUB_ENTITLEMENT_PLIST: plist,
+            STUB_ENTITLEMENT_JSON:
+              converted === null ? "" : JSON.stringify(converted),
+            STUB_CODESIGN_INSPECTION_FAIL:
+              name === "inspection failed" ? "1" : "",
+            ...(name === "false" ? signedEntitlementFixture(f.dir, plist) : {}),
+          },
+        );
+        assert.notEqual(result.status, 0);
+        assert.match(
+          result.stderr,
+          /Cannot confirm an enabled com\.apple\.security\.virtualization entitlement/,
+        );
+        assert.doesNotMatch(result.log, /ditto|xcrun notarytool/);
+      });
+    }
+  },
+);
+
+test(
+  "sign-macos fails without a secret or exactly one identity",
+  { skip },
+  async (t) => {
     await t.test("secret", (t) => {
       const f = fixture(t);
       const result = f.run(

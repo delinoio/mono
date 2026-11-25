@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/delinoio/mono/go/uuidv7"
 	"github.com/delinoio/mono/internal/semver"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
@@ -466,6 +467,15 @@ func (s *Service) handleCapabilityReport(ctx context.Context, conn *hub.Conn, r 
 }
 
 func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *ownsandv1.StateReport) error {
+	epoch := r.GetStateEpoch()
+	if !uuidv7.Valid(epoch) {
+		s.Logger.WarnContext(ctx, "agent_state_report_rejected", slog.String("device_id", conn.DeviceID),
+			slog.String("channel_id", conn.ID), slog.String("field", "state_epoch"), slog.Int("value_bytes", len(epoch)))
+		if !conn.Reconciled() {
+			conn.Close(errInitialStateReportFailed)
+		}
+		return nil
+	}
 	res, err := s.reconcileStateReport(ctx, conn.DeviceID, conn.ID, r)
 	if err != nil {
 		if !conn.Reconciled() && ctx.Err() == nil {
@@ -562,6 +572,11 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	var err error
 	switch info.kind {
 	case cmdCreateSandbox:
+		if res.GetError().GetCode() == ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+			// A competing end owns teardown. Apply its state through the
+			// sandbox updates or the next state report.
+			break
+		}
 		if res.GetError() != nil {
 			// A transient database error is retried inside
 			// Timing.CreateFailTimeout; a failure that remains closes this
