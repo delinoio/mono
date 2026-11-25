@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -380,11 +381,15 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 		return nil, err
 	}
 	m := req.Msg
-	if m.GetWriteId() == "" || len(m.GetData()) > 1<<20 {
+	chunkSize := int64(len(m.GetData()))
+	if m.GetWriteId() == "" || chunkSize > 1<<20 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("write_id is required and a chunk holds at most 1 MiB"))
 	}
 	if m.GetOffset() < 0 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid offset: must not be negative"))
+	}
+	if m.GetOffset() > math.MaxInt64-chunkSize {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid offset: the chunk end offset exceeds the maximum int64 value"))
 	}
 	key := writeKey{
 		organizationID: ds.GetOrganizationId(),
@@ -403,9 +408,9 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("every chunk of a write_id must name the same path"))
 	}
 	if w.done {
-		return connect.NewResponse(&tidev1.WriteDevSessionFileResponse{WriteId: m.GetWriteId(), Offset: m.GetOffset(), Length: int64(len(m.GetData())), Finished: true, SizeBytes: int64(len(w.data))}), nil
+		return connect.NewResponse(&tidev1.WriteDevSessionFileResponse{WriteId: m.GetWriteId(), Offset: m.GetOffset(), Length: chunkSize, Finished: true, SizeBytes: int64(len(w.data))}), nil
 	}
-	end := m.GetOffset() + int64(len(m.GetData()))
+	end := m.GetOffset() + chunkSize
 	switch {
 	case m.GetOffset() == int64(len(w.data)):
 		w.data = append(w.data, m.GetData()...)
@@ -414,7 +419,7 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 	default:
 		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("chunk at offset %d does not continue the write at %d", m.GetOffset(), len(w.data)))
 	}
-	res := &tidev1.WriteDevSessionFileResponse{WriteId: m.GetWriteId(), Offset: m.GetOffset(), Length: int64(len(m.GetData()))}
+	res := &tidev1.WriteDevSessionFileResponse{WriteId: m.GetWriteId(), Offset: m.GetOffset(), Length: chunkSize}
 	if m.GetFinal() {
 		if end != int64(len(w.data)) {
 			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("the final chunk does not end the file"))
