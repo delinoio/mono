@@ -193,7 +193,7 @@ func (c *Client) do(ctx context.Context, r request) (http.Header, error) {
 	if r.auth != "" {
 		req.Header.Set("Authorization", "Bearer "+r.auth)
 	}
-	if err := api.CheckOrganizationDeletion(ctx); err != nil {
+	if err := api.CheckTeardown(ctx); err != nil {
 		return nil, err
 	}
 	resp, err := c.http.Do(req)

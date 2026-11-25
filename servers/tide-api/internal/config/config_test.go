@@ -40,7 +40,7 @@ func TestDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Addr != "127.0.0.1:18400" || cfg.LogLevel != LogLevelInfo || !cfg.RunMigrations {
+	if cfg.Addr != "127.0.0.1:18400" || cfg.LogLevel != LogLevelInfo || !cfg.RunMigrations || cfg.ReclaimLegacyOwnSandRemovals {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 	if cfg.LogtoAudience != "https://tide.api.delino.io" || cfg.LogtoJWKSURL != "https://tenant.logto.app/oidc/jwks" {
@@ -65,6 +65,7 @@ func TestOverrides(t *testing.T) {
 	env[EnvAddr] = ":8080"
 	env[EnvLogLevel] = " DEBUG "
 	env[EnvRunMigrations] = "false"
+	env[EnvReclaimLegacyOwnSandRemovals] = "true"
 	env[EnvLogtoJWKSFile] = "/tmp/jwks.json"
 	env[EnvLogtoAudience] = "https://tide.example"
 	env[EnvCORSOrigins] = "https://tide.delino.io, http://127.0.0.1:13400"
@@ -78,7 +79,7 @@ func TestOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Addr != ":8080" || cfg.LogLevel != LogLevelDebug || cfg.RunMigrations || cfg.LogtoJWKSURL != "" || cfg.LogtoJWKSFile != "/tmp/jwks.json" {
+	if cfg.Addr != ":8080" || cfg.LogLevel != LogLevelDebug || cfg.RunMigrations || !cfg.ReclaimLegacyOwnSandRemovals || cfg.LogtoJWKSURL != "" || cfg.LogtoJWKSFile != "/tmp/jwks.json" {
 		t.Fatalf("cfg = %+v", cfg)
 	}
 	if cfg.LogtoAudience != "https://tide.example" || len(cfg.CORSOrigins) != 2 || cfg.MetricsAddr != "0.0.0.0:9400" {

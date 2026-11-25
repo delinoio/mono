@@ -29,7 +29,8 @@ import (
 // Options configures the layers.
 type Options struct {
 	// OwnSand builds the OwnSand clients of organizations.
-	OwnSand ownsandclient.Factory
+	OwnSand        ownsandclient.Factory
+	OwnSandRemoval link.RemovalOptions
 	// PublicOrigin is the public origin of tide-api (webhook URLs).
 	PublicOrigin string
 	// WorkTiming and DevSessionTiming override the engine and stream
@@ -85,7 +86,7 @@ func Extensions(opts Options, out *Layers) []app.Extension {
 			out.Metrics = m
 			// Delivery IDs of every webhook sender are kept for 7 days.
 			r.AddDailyJob(webhook.RetentionJob(r.Service.DB))
-			out.Links = link.Register(r, opts.OwnSand, m)
+			out.Links = link.Register(r, opts.OwnSand, m, opts.OwnSandRemoval)
 			out.Integrations = integration.Register(r, opts.PublicOrigin)
 			rules := profile.DefaultRules()
 			if opts.CodexGuestOSes != nil {

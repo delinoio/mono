@@ -220,7 +220,7 @@ func (c *Client) Do(ctx context.Context, op, method, path string, query url.Valu
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	if err := api.CheckOrganizationDeletion(ctx); err != nil {
+	if err := api.CheckTeardown(ctx); err != nil {
 		return err
 	}
 	resp, err := c.httpClient().Do(req)

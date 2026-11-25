@@ -33,6 +33,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/github"
 	"github.com/delinoio/mono/servers/tide-api/internal/githubapi"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/link"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 )
 
@@ -125,9 +126,10 @@ func run(ctx context.Context, stop context.CancelFunc) error {
 		ClientAddressMode: cfg.ClientAddressMode,
 		Metrics:           tel.MeterProvider,
 		Extensions: layers.Extensions(layers.Options{
-			OwnSand:      ownsandclient.SDKFactory{BaseURL: cfg.OwnSandAPIOrigin, Logger: logger},
-			PublicOrigin: cfg.PublicOrigin,
-			GitHub:       gh,
+			OwnSand:        ownsandclient.SDKFactory{BaseURL: cfg.OwnSandAPIOrigin, Logger: logger},
+			OwnSandRemoval: link.RemovalOptions{ReclaimLegacy: cfg.ReclaimLegacyOwnSandRemovals},
+			PublicOrigin:   cfg.PublicOrigin,
+			GitHub:         gh,
 		}, &layers.Layers{}),
 	})
 	if err != nil {

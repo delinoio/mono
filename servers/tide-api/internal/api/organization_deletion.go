@@ -65,10 +65,22 @@ func (s *Service) releaseOrganizationDeletion(ctx context.Context, d Organizatio
 	}
 }
 
-// CheckOrganizationDeletion admits a cleanup step on the session that owns
-// the deletion lock. Once that session ends, an old attempt cannot admit
-// another step. A provider call already admitted may have reached its peer.
-func CheckOrganizationDeletion(ctx context.Context) error {
+type teardownCheckKey struct{}
+
+// WithTeardownCheck attaches a link claim check to the preparation context.
+func WithTeardownCheck(ctx context.Context, check func(context.Context) error) context.Context {
+	return context.WithValue(ctx, teardownCheckKey{}, check)
+}
+
+// CheckTeardown checks the link claim and organization deletion session before
+// admitting a cleanup step. A provider call already admitted may have reached
+// its peer.
+func CheckTeardown(ctx context.Context) error {
+	if check, ok := ctx.Value(teardownCheckKey{}).(func(context.Context) error); ok {
+		if err := check(ctx); err != nil {
+			return err
+		}
+	}
 	a, _ := ctx.Value(organizationDeletionContextKey{}).(*organizationDeletionAttempt)
 	if a == nil {
 		return nil

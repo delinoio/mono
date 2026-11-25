@@ -62,15 +62,21 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 			if err != nil {
 				return api.OrganizationDeletionSteps{}, err
 			}
+			ctx, stop := links.WatchRemoval(ctx, claim)
+			abort := func(ctx context.Context) {
+				stop()
+				links.ReleaseRemoval(ctx, claim)
+			}
 			if claim.HasLink() {
 				if err := e.cleanUpOrganizationRunners(ctx, d.OrganizationID); err != nil {
-					links.ReleaseRemoval(ctx, claim)
+					abort(ctx)
 					return api.OrganizationDeletionSteps{}, err
 				}
 			}
 			var ended []*Request
 			return api.OrganizationDeletionSteps{
-				Abort: func(ctx context.Context) { links.ReleaseRemoval(ctx, claim) },
+				PrepareContext: ctx,
+				Abort:          abort,
 				InTx: func(ctx context.Context, tx pgx.Tx) error {
 					if err := links.CheckRemoval(ctx, tx, claim); err != nil {
 						return err
@@ -79,7 +85,10 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 					ended, err = e.endOpenTx(ctx, tx, d.OrganizationID, "", RequestEnd{State: reqCanceled, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER})
 					return err
 				},
-				AfterCommit: func(ctx context.Context) { e.releaseClaims(ctx, ended) },
+				AfterCommit: func(ctx context.Context) {
+					stop()
+					e.releaseClaims(ctx, ended)
+				},
 			}, nil
 		},
 	})
@@ -159,6 +168,9 @@ func (e *Engine) cleanUpOrganizationRunners(ctx context.Context, orgID string) e
 	}
 	var errs []error
 	for _, id := range ids {
+		if err := api.CheckTeardown(ctx); err != nil {
+			return err
+		}
 		if err := e.cleanUpEnded(ctx, id, orgID); err != nil {
 			errs = append(errs, fmt.Errorf("clean up sandbox of ended runner %s: %w", id, err))
 		}
@@ -179,6 +191,9 @@ func (e *Engine) cleanUpRunners(ctx context.Context, orgID string, match func(*R
 	for _, r := range runners {
 		if !match(r) {
 			continue
+		}
+		if err := api.CheckTeardown(ctx); err != nil {
+			return err
 		}
 		r, err := e.deleteRunnerMatching(ctx, orgID, r.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP, DeleteCleanUp, match)
 		if err != nil {
@@ -211,7 +226,7 @@ func (e *Engine) cleanUpRunners(ctx context.Context, orgID string, match func(*R
 			}
 		}
 		if id != "" {
-			if err := api.CheckOrganizationDeletion(ctx); err != nil {
+			if err := api.CheckTeardown(ctx); err != nil {
 				return err
 			}
 			if _, err := client.DeleteSandbox(ctx, id); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
@@ -220,6 +235,9 @@ func (e *Engine) cleanUpRunners(ctx context.Context, orgID string, match func(*R
 				errs = append(errs, fmt.Errorf("delete sandbox of runner %s: %w", r.ID, err))
 				continue
 			}
+		}
+		if err := api.CheckTeardown(ctx); err != nil {
+			return err
 		}
 		e.finishDelete(ctx, r.ID)
 	}
