@@ -344,8 +344,14 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			return nil, fmt.Errorf("%w: OUTBOUND sandboxes need CAP_NET_ADMIN, ip and nft: %s", vmruntime.ErrUnsupported, problem)
 		}
 	}
-	if spec.Snapshot == nil && !(fileExists(r.opts.Kernel) && fileExists(r.opts.Rootfs)) {
-		return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+	diskGiB := spec.Resources.GetDiskGib()
+	if spec.Snapshot == nil {
+		if !fileExists(r.opts.Kernel) {
+			return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+		}
+		if err := vmruntime.CheckLinuxBaseDiskSize(r.opts.Rootfs, diskGiB); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.RemoveAll(spec.Dir); err != nil {
 		return nil, err
@@ -384,12 +390,20 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if spec.Snapshot != nil {
 		src = filepath.Join(spec.Snapshot.Dir, snapDisk)
 	}
-	if err := copyDisk(ctx, src, filepath.Join(spec.Dir, diskFile)); err != nil {
+	disk := filepath.Join(spec.Dir, diskFile)
+	if err := copyDisk(ctx, src, disk); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("fcrt: prepare disk: %w", err)
 	}
+	// The local image builder can replace the source between the check and the copy.
+	if spec.Snapshot == nil {
+		if err := vmruntime.CheckLinuxBaseDiskSize(disk, diskGiB); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("fcrt: check copied disk: %w", err)
+		}
+	}
 	if !memoryRestore {
-		if err := growDisk(ctx, filepath.Join(spec.Dir, diskFile), spec.Resources.GetDiskGib()<<30); err != nil {
+		if err := growDisk(ctx, disk, diskGiB<<30); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("fcrt: resize disk: %w", err)
 		}
@@ -431,7 +445,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			cleanup()
 			return nil, fmt.Errorf("fcrt: stop the failed restore process: %w", err)
 		}
-		if err := growDisk(ctx, filepath.Join(spec.Dir, diskFile), spec.Resources.GetDiskGib()<<30); err != nil {
+		if err := growDisk(ctx, disk, diskGiB<<30); err != nil {
 			cleanup()
 			return nil, err
 		}

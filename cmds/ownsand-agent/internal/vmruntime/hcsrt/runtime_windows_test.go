@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -297,6 +298,33 @@ func TestCopyFileEndsWithItsContext(t *testing.T) {
 	}
 	if _, err := os.Stat(bigDst); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("partial copy remains after a canceled copy: %v", err)
+	}
+}
+
+func TestCreateRejectsUndersizedLinuxBaseDisk(t *testing.T) {
+	dir := t.TempDir()
+	kernel, rootfs := filepath.Join(dir, "vmlinux"), filepath.Join(dir, "rootfs.ext4")
+	for _, path := range []string{kernel, rootfs} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Truncate(rootfs, 2<<30); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runtime{opts: Options{Kernel: kernel, Rootfs: rootfs, VMsDir: dir}}
+	// A path under a regular file cannot be prepared. The disk-size error
+	// must occur before the runtime reaches that step.
+	spec := vmruntime.Spec{
+		SandboxID: "sandbox",
+		GuestOS:   ownsandv1.GuestOs_GUEST_OS_LINUX,
+		Dir:       filepath.Join(kernel, "vm"),
+		Resources: &ownsandv1.Resources{DiskGib: 1},
+	}
+	vm, err := r.Create(t.Context(), spec)
+	if vm != nil || !errors.Is(err, vmruntime.ErrUnsupported) ||
+		!strings.Contains(err.Error(), "needs at least 2 GiB of disk (requested 1 GiB)") {
+		t.Fatalf("Create = %v, %v, want the disk-size error", vm, err)
 	}
 }
 

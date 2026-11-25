@@ -26,24 +26,31 @@ import test from "node:test";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const script = join(root, "scripts/ci/release-binaries.sh");
-const bashVersion = spawnSync(
-  "bash",
-  ["-c", 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"'],
-  { encoding: "utf8" },
-)
-  .stdout?.trim()
-  .split(" ")
-  .map(Number) ?? [0, 0];
-const hasJq = spawnSync("sh", ["-c", "command -v jq"]).status === 0;
-function skipReason() {
-  if (process.platform === "win32") return "the release scripts run on Linux";
-  if (!hasJq) return "jq is not installed";
-  if (bashVersion[0] < 4 || (bashVersion[0] === 4 && bashVersion[1] < 4)) {
-    return `the release scripts need Bash 4.4 or newer, found ${bashVersion.join(".")}`;
-  }
-  return false;
+function readBashVersion(bash) {
+  return (
+    spawnSync(bash, ["-c", 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"'], {
+      encoding: "utf8",
+    }).stdout?.trim() ?? ""
+  );
 }
-const skip = skipReason();
+
+const bashVersion = readBashVersion("bash");
+const [bashMajor, bashMinor] = bashVersion.split(".").map(Number);
+const bash32 =
+  bashVersion === "3.2"
+    ? "bash"
+    : ["/bin/bash", "bash3.2"].find((bash) => readBashVersion(bash) === "3.2");
+const macBash = bash32 ?? "bash";
+const hasJq = spawnSync("sh", ["-c", "command -v jq"]).status === 0;
+const dependencySkip =
+  process.platform === "win32"
+    ? "the release scripts run on Linux and macOS"
+    : !hasJq && "jq is not installed";
+const skip =
+  dependencySkip ||
+  (!(bashMajor > 4 || (bashMajor === 4 && bashMinor >= 4)) &&
+    `the Linux release fixtures need Bash 4.4 or newer, found ${bashVersion || "none"}`);
+const macSkip = dependencySkip || (!bash32 && skip);
 
 const virtualizationEntitlement = "com.apple.security.virtualization";
 const entitlementKey = `<key>${virtualizationEntitlement}</key>`;
@@ -214,11 +221,12 @@ cp "$path" "$out"
 `,
   security: `#!/usr/bin/env bash
 echo "security $*" >> "$STUB_LOG"
-if [[ "$1" == list-keychains && "$*" == *" -s "* ]]; then
-  printf 'security-args'; printf ' [%s]' "$@"; echo
-fi >> "$STUB_LOG"
-if [[ "$1" == list-keychains && "$*" != *" -s "* ]]; then
-  printf '    "%s"\\n' "/Users/runner/Library/Keychains/login.keychain-db" "/Users/runner/Library/Keychains/other keychain.keychain-db"
+if [[ "$1" == list-keychains ]]; then
+  if [[ " $* " == *" -s "* ]]; then
+    { printf 'security-args'; printf ' [%s]' "$@"; echo; } >> "$STUB_LOG"
+  elif [[ -z "\${STUB_EMPTY_KEYCHAIN_LIST:-}" ]]; then
+    printf '    "%s"\\n' "/Users/runner/Library/Keychains/login.keychain-db" "/Users/runner/Library/Keychains/other keychain.keychain-db"
+  fi
 fi
 if [[ "$1" == find-identity ]]; then
   printf '  1) ABCDEF "%s"\\n     1 valid identities found\\n' "\${STUB_IDENTITY:-Developer ID Application: Delino (TEAM123)}"
@@ -279,7 +287,7 @@ esac
 `,
 };
 
-function fixture(t, parent = tmpdir()) {
+function fixture(t, { parent = tmpdir(), bash = "bash" } = {}) {
   const dir = mkdtempSync(join(parent, "release-binaries-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const bin = join(dir, "bin");
@@ -310,7 +318,7 @@ function fixture(t, parent = tmpdir()) {
     binaries = [agent, cli],
     scriptPath = script,
   ) => {
-    const result = spawnSync("bash", [scriptPath, ...args], {
+    const result = spawnSync(bash, [scriptPath, ...args], {
       encoding: "utf8",
       cwd: root,
       env: {
@@ -499,9 +507,9 @@ test("build fails for a module without a license file", { skip }, (t) => {
 
 test(
   "build cgo builds only the cgo platforms on a matching runner",
-  { skip },
+  { skip: macSkip },
   (t) => {
-    const f = fixture(t);
+    const f = fixture(t, { bash: macBash });
     const out = join(f.dir, "out");
     // Without a version variable, so the build does not run the stub output.
     const binaries = [{ ...agent, versionVariable: "" }, cli];
@@ -526,6 +534,27 @@ test(
       result.stderr,
       /needs a darwin-arm64 runner, not freebsd-amd64/,
     );
+  },
+);
+
+test(
+  "Bash 3.2 rejects the Linux release subcommands",
+  { skip: !bash32 && "Bash 3.2 is not installed" },
+  () => {
+    for (const args of [
+      ["build", "cross", "out"],
+      ["assemble", "artifacts", "assets"],
+      ["github-releases", "assets", "manifests"],
+      ["fetch-manifests", "manifests"],
+      ["prepare-manifests", "manifests", "assets"],
+      ["sign-manifests", "manifests"],
+      ["upload-manifests", "manifests"],
+      ["has-manifests"],
+    ]) {
+      const result = spawnSync(bash32, [script, ...args], { encoding: "utf8" });
+      assert.equal(result.status, 2, args.join(" "));
+      assert.match(result.stderr, /needs Bash 4\.4 or newer/, args.join(" "));
+    }
   },
 );
 
@@ -610,7 +639,7 @@ for (const [label, spaced] of [
 ]) {
   test(
     `sign-macos signs with the hardened runtime and notarizes every darwin executable${label}`,
-    { skip },
+    { skip: macSkip },
     (t) => {
       let parent = tmpdir();
       if (spaced) {
@@ -619,7 +648,7 @@ for (const [label, spaced] of [
         parent = join(base, "temp with spaces");
         mkdirSync(parent);
       }
-      const f = fixture(t, parent);
+      const f = fixture(t, { parent, bash: macBash });
       // The plain scenario inherits TMPDIR, which may itself contain spaces.
       if (spaced) assert.ok(f.dir.includes(" "));
       const input = darwinBuilds(f);
@@ -729,6 +758,35 @@ for (const [label, spaced] of [
     },
   );
 }
+
+test(
+  "sign-macos restores an empty keychain search list",
+  { skip: macSkip },
+  (t) => {
+    const f = fixture(t, { bash: macBash });
+    const work = join(f.runnerTemp, "macos-signing");
+    const result = f.run(
+      ["sign-macos", darwinBuilds(f), join(f.dir, "signed")],
+      {
+        ...appleEnv,
+        STUB_EMPTY_KEYCHAIN_LIST: "1",
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(
+      result.log
+        .split("\n")
+        .filter((line) => line.startsWith("security-args ")),
+      [
+        `security-args [list-keychains] [-d] [user] [-s] [${join(work, "release.keychain-db")}]`,
+        "security-args [list-keychains] [-d] [user] [-s]",
+      ],
+    );
+    assert.match(result.log, /xcrun notarytool submit/);
+    assert.match(result.log, /security delete-keychain/);
+    assert.equal(existsSync(work), false);
+  },
+);
 
 test(
   "sign-macos fails on a rejected notarization and prints the log",

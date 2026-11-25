@@ -128,3 +128,32 @@ func TestMakeFixedVHD(t *testing.T) {
 		t.Fatal("a raw image passed as a VHD")
 	}
 }
+
+func TestMakeFixedVHDLinuxBaseCapacity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "disk.vhd")
+	for _, want := range []int64{2 << 30, 3 << 30} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(path, 2<<30); err != nil {
+			t.Fatal(err)
+		}
+		got, err := makeFixedVHD(path, want, false)
+		if err != nil || got != want {
+			t.Fatalf("makeFixedVHD = %d, %v, want %d bytes", got, err, want)
+		}
+		disk, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var footer [vhdFooterSize]byte
+		_, err = disk.ReadAt(footer[:], want)
+		disk.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := parseVHDFooter(footer[:]); err != nil || got != want {
+			t.Fatalf("footer size = %d, %v, want %d bytes", got, err, want)
+		}
+	}
+}

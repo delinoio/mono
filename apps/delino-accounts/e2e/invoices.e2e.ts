@@ -12,59 +12,24 @@ import {
 } from "@delino/accounts-protos/v1/credit_pb";
 import { type Browser, describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import { API_RESOURCE } from "../src/config.ts";
+import { API_ORIGIN, seedFixtureSession } from "./fixture-session.ts";
 
-const API_ORIGIN = "http://127.0.0.1:28100";
-const LOGTO_ENDPOINT = "https://logto.test";
-const LOGTO_APP_ID = "accounts-e2e";
 const INVOICE_PATH = "/fixture-invoice.pdf";
 const ACCOUNT_ID = "0193a1b2-0000-7000-8000-000000000001";
 const ACCOUNT_PATH = `/billing/${ACCOUNT_ID}`;
 const ACCOUNT_NAME = "Example billing account";
 
-async function delayInvoiceResponse(
+async function installInvoiceFixture(
   browser: Browser,
   appOrigin: string,
-  popupBlocked: boolean,
+  popupBlocked = false,
 ) {
-  // Let the real SDK read a fixture session. Its tokens are only usable with
-  // the browser's intercepted responses.
-  await browser.addInitScript(
-    ({ appId, appOrigin, endpoint, resource, popupBlocked }) => {
-      if (location.origin !== appOrigin) return;
-      const prefix = `logto:${appId}`;
-      const header = btoa(JSON.stringify({ alg: "ES384", typ: "JWT" }));
-      const now = Math.floor(Date.now() / 1000);
-      const claims = btoa(
-        JSON.stringify({
-          sub: "fixture-user",
-          iss: `${endpoint}/oidc`,
-          aud: appId,
-          iat: now,
-          exp: now + 3600,
-        }),
-      );
-      localStorage.setItem(`${prefix}:idToken`, `${header}.${claims}.fixture`);
-      localStorage.setItem(
-        `${prefix}:accessToken`,
-        JSON.stringify({
-          [`@${resource}`]: {
-            token: "fixture-token",
-            scope: "accounts:billing",
-            expiresAt: now + 3600,
-          },
-        }),
-      );
-      if (popupBlocked) window.open = () => null;
-    },
-    {
-      appId: LOGTO_APP_ID,
-      appOrigin,
-      endpoint: LOGTO_ENDPOINT,
-      resource: API_RESOURCE,
-      popupBlocked,
-    },
-  );
+  await seedFixtureSession(browser, appOrigin);
+  if (popupBlocked) {
+    await browser.addInitScript(() => {
+      window.open = () => null;
+    });
+  }
 
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => {
@@ -80,13 +45,6 @@ async function delayInvoiceResponse(
     callerRole: BillingAccountRole.OWNER,
   };
   const responses = new Map([
-    [
-      "GetBillingAccount",
-      toBinary(
-        GetBillingAccountResponseSchema,
-        create(GetBillingAccountResponseSchema, { billingAccount: account }),
-      ),
-    ],
     [
       "ListBillingAccounts",
       toBinary(
@@ -145,14 +103,39 @@ async function delayInvoiceResponse(
       markStarted();
       await responseGate;
     }
+    const body =
+      method === "GetBillingAccount"
+        ? toBinary(
+            GetBillingAccountResponseSchema,
+            create(GetBillingAccountResponseSchema, {
+              billingAccount: account,
+            }),
+          )
+        : responses.get(method);
     await route.fulfill({
       contentType: "application/proto",
       headers,
       // An empty protobuf response is enough for the Overview reads.
-      body: responses.get(method) ?? new Uint8Array(),
+      body: body ?? new Uint8Array(),
     });
   });
   return {
+    async refetchAs(role: BillingAccountRole) {
+      account.callerRole = role;
+      await browser.evaluate(async () => {
+        const now = Date.now;
+        // Make the cached account stale for the window focus refetch.
+        Date.now = () => now() + 11_000;
+        try {
+          window.dispatchEvent(new Event("visibilitychange"));
+          // React Query checks staleness after resuming paused mutations.
+          await Promise.resolve();
+        } finally {
+          Date.now = now;
+        }
+        return null;
+      });
+    },
     started,
     async respond() {
       const response = browser.waitForResponse(/\/GetInvoiceUrl$/);
@@ -163,6 +146,50 @@ async function delayInvoiceResponse(
   };
 }
 
+describe("invoice access", () => {
+  test("keeps Overview selected when access returns on the open account", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const invoice = await installInvoiceFixture(browser, app.baseUrl);
+    await app.open(ACCOUNT_PATH);
+    const invoices = screen.getByRole("tab", "Invoices");
+    const invoicePanel = screen.getByRole("tabpanel", "Invoices");
+    const overviewPanel = screen.getByRole("tabpanel", "Overview");
+    const selectedTab = browser.locator('[role="tab"][aria-selected="true"]');
+    await invoices.click();
+
+    await invoice.refetchAs(BillingAccountRole.ADMIN);
+    await expect(screen.getByText("Your role: Admin")).toBeVisible();
+    await expect(selectedTab).toHaveText("Invoices");
+    await expect(invoicePanel).toBeVisible();
+    await app.screenshot("invoice-access-retained");
+
+    await invoice.refetchAs(BillingAccountRole.VIEWER);
+    await expect(screen.getByText("Your role: Viewer")).toBeVisible();
+    await expect(invoices).toBeHidden();
+    await expect(invoicePanel).toBeHidden();
+    await expect(selectedTab).toHaveText("Overview");
+    await expect(overviewPanel).toBeVisible();
+    await app.screenshot("invoice-access-removed");
+
+    await invoice.refetchAs(BillingAccountRole.ADMIN);
+    await expect(screen.getByText("Your role: Admin")).toBeVisible();
+    await expect(invoices).toBeVisible();
+    await expect(invoices).toHaveAttribute("aria-selected", "false");
+    await expect(selectedTab).toHaveText("Overview");
+    await expect(overviewPanel).toBeVisible();
+    await expect(browser).toHaveURL(app.baseUrl + ACCOUNT_PATH);
+    await app.screenshot("invoice-access-restored");
+
+    await invoices.click();
+    await expect(selectedTab).toHaveText("Invoices");
+    await expect(invoicePanel).toBeVisible();
+    await app.screenshot("invoices-reselected");
+  });
+});
+
 describe("invoice navigation", () => {
   for (const reopen of [false, true]) {
     test(
@@ -170,7 +197,7 @@ describe("invoice navigation", () => {
         ? "keeps the reopened Invoices panel after a blocked pop-up"
         : "keeps the billing list after a blocked pop-up",
       async ({ app, browser, screen }) => {
-        const invoice = await delayInvoiceResponse(browser, app.baseUrl, true);
+        const invoice = await installInvoiceFixture(browser, app.baseUrl, true);
         try {
           await app.open(ACCOUNT_PATH);
           await screen.getByRole("tab", "Invoices").click();
@@ -215,7 +242,7 @@ describe("invoice navigation", () => {
     browser,
     screen,
   }) => {
-    const invoice = await delayInvoiceResponse(browser, app.baseUrl, true);
+    const invoice = await installInvoiceFixture(browser, app.baseUrl, true);
     try {
       await app.open(ACCOUNT_PATH);
       await screen.getByRole("tab", "Invoices").click();
@@ -239,7 +266,7 @@ describe("invoice navigation", () => {
         ? "discards the link when the user closes the invoice pop-up"
         : "loads the link in an open pop-up after leaving Invoices",
       async ({ app, browser, screen }) => {
-        const invoice = await delayInvoiceResponse(browser, app.baseUrl, false);
+        const invoice = await installInvoiceFixture(browser, app.baseUrl);
         try {
           await app.open(ACCOUNT_PATH);
           await screen.getByRole("tab", "Invoices").click();
