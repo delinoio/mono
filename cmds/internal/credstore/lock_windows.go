@@ -11,6 +11,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func openLockFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+}
+
 // tryLockFile takes an exclusive LockFileEx lock on the first byte without
 // waiting. It reports false when another handle holds the lock.
 func tryLockFile(f *os.File) (bool, error) {
