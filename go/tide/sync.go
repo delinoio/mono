@@ -148,6 +148,9 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 			invalidUTF8 = append(invalidUTF8, []string{f.rel})
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(invalidUTF8) > 0 {
 		return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleInvalidUTF8, Paths: invalidUTF8})
 	}

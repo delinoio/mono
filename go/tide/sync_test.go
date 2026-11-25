@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
 	"maps"
@@ -23,6 +24,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/iotest"
+	"testing/synctest"
 	"time"
 	"unicode/utf8"
 
@@ -1195,9 +1198,60 @@ func TestSyncUnstagedDirectoryToFile(t *testing.T) {
 	}
 }
 
+// hashTestReader also exposes WriterTo through strings.Reader. A copy that
+// uses WriterTo would bypass Read and miss the cancellation.
+type hashTestReader struct {
+	*strings.Reader
+	afterRead func()
+	reads     int
+}
+
+func (r *hashTestReader) Read(p []byte) (int, error) {
+	r.reads++
+	n, err := r.Reader.Read(p[:1])
+	r.afterRead()
+	return n, err
+}
+
+func TestReadLocalFileHashCancellation(t *testing.T) {
+	for _, want := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(want.Error(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				afterRead := cancel
+				if want == context.DeadlineExceeded {
+					deadlineCtx, stop := context.WithTimeout(ctx, time.Second)
+					defer stop()
+					ctx = deadlineCtx
+					afterRead = func() { <-deadlineCtx.Done() }
+				}
+				src := &hashTestReader{Reader: strings.NewReader("abc"), afterRead: afterRead}
+				if _, _, err := hashLocalFile(ctx, src); err != want || src.reads != 1 {
+					t.Fatalf("hash error = %v after %d reads, want %v after 1 read", err, src.reads, want)
+				}
+			})
+		})
+	}
+}
+
+func TestReadLocalFileHashWithLiveContext(t *testing.T) {
+	const text = "abc"
+	src := &hashTestReader{Reader: strings.NewReader(text), afterRead: func() {}}
+	size, digest, err := hashLocalFile(t.Context(), src)
+	sum := sha256.Sum256([]byte(text))
+	if err != nil || size != int64(len(text)) || digest != hex.EncodeToString(sum[:]) || src.reads != len(text)+1 {
+		t.Fatalf("hash = (%d, %q, %v) after %d reads", size, digest, err, src.reads)
+	}
+
+	if _, _, err := hashLocalFile(t.Context(), iotest.ErrReader(io.ErrUnexpectedEOF)); err != io.ErrUnexpectedEOF {
+		t.Fatalf("hash error = %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+}
+
 func TestReadLocalFileLookupError(t *testing.T) {
 	needPOSIX(t)
-	_, ok, err := readLocalFile(t.TempDir(), strings.Repeat("a", 4096), "")
+	_, ok, err := readLocalFile(t.Context(), t.TempDir(), strings.Repeat("a", 4096), "")
 	if ok || !errors.Is(err, syscall.ENAMETOOLONG) {
 		t.Fatalf("readLocalFile = present %t, error %v, want ENAMETOOLONG", ok, err)
 	}
