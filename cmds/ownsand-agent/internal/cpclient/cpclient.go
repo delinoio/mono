@@ -14,10 +14,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strings"
 	"time"
 
 	"connectrpc.com/connect"
+	"golang.org/x/net/idna"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/identity"
 	"github.com/delinoio/mono/go/ownsand/datapath"
@@ -100,7 +103,43 @@ func NewHTTPClient(apiURL string, tlsConfig *tls.Config) (*http.Client, error) {
 	}
 	// HTTP/2 health checks detect a dead connection under a long stream.
 	transport.HTTP2 = &http.HTTP2Config{SendPingTimeout: 15 * time.Second, PingTimeout: 15 * time.Second}
-	return &http.Client{Transport: transport}, nil
+	originHost, originPort := redirectHostname(u), effectivePort(u)
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Keep the default net/http redirect limit.
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			target := req.URL
+			if target.Scheme != u.Scheme || redirectHostname(target) != originHost || effectivePort(target) != originPort {
+				return errors.New("cpclient: redirect leaves the control plane origin")
+			}
+			return nil
+		},
+	}, nil
+}
+
+func redirectHostname(u *url.URL) string {
+	host := u.Hostname()
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.String()
+	}
+	// Use the same IDNA lookup profile as net/http for DNS names.
+	if ascii, err := idna.Lookup.ToASCII(host); err == nil {
+		return ascii
+	}
+	return host
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return strings.TrimLeft(port, "0")
+	}
+	if u.Scheme == "https" {
+		return "443"
+	}
+	return "80"
 }
 
 // New returns the clients of apiURL.
