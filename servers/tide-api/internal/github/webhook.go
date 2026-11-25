@@ -521,11 +521,13 @@ func (l *Layer) retireRenamed(ctx context.Context, orgID, profileID, pool string
 // count is kept as a reserve (recorded decision), so the rule does not
 // delete the warm runners that the dispatcher keeps.
 func (l *Layer) removeSurplus(ctx context.Context, orgID, profileID, pool string) {
-	reserve := 0
-	if p, err := l.profiles.Get(ctx, l.svc.DB.Pool, orgID, profileID); err == nil {
-		reserve = int(p.WarmCount)
+	p, err := l.profiles.Get(ctx, l.svc.DB.Pool, orgID, profileID)
+	if err != nil {
+		l.svc.Logger.WarnContext(ctx, "github_surplus_profile_read_failed",
+			slog.String("organization_id", orgID), slog.String("runner_profile_id", profileID), slog.Any("error", err))
+		return
 	}
-	surplus, err := l.engine.PoolSurplus(ctx, orgID, profileID, pool, reserve)
+	surplus, err := l.engine.PoolSurplus(ctx, orgID, profileID, pool, int(p.WarmCount))
 	if err != nil {
 		l.svc.Logger.WarnContext(ctx, "github_surplus_failed", slog.String("organization_id", orgID), slog.Any("error", err))
 		return

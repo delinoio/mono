@@ -19,6 +19,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
@@ -394,6 +395,123 @@ func TestCanceledJobSurplus(t *testing.T) {
 	})
 	if _, ok := w.gh.RunnerByName("tide-" + first.GetRunnerId()); !ok {
 		t.Fatal("the busy registration was removed")
+	}
+}
+
+func TestCanceledJobSurplusReserve(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		failLookup bool
+		retained   int
+	}{
+		{name: "profile read fails", failLookup: true, retained: 2},
+		{name: "reserve of one", retained: 1},
+		{name: "explicit zero", retained: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newGHWorld(t, worldOpts{manualDispatch: true})
+			// Start the runner drivers without starting the automatic dispatcher.
+			ctx, stop := context.WithCancel(t.Context())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_ = w.l.Engine.RunReconciler(ctx)
+			}()
+			defer func() {
+				stop()
+				<-done
+			}()
+			w.link(t, 501, "acme")
+			profileID := w.createProfile(t, ghProfile("linux", 1))
+			waiting := tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+			w.l.Engine.Pass(t.Context(), w.org.ID)
+			eventually(t, "the warm runner", func() bool { return len(w.runnersIn(t, waiting)) == 1 })
+			oldest := w.runnersIn(t, waiting)[0]
+			w.env.Clock.Advance(time.Second)
+			w.send(t, "workflow_job", job("queued", 501, 1, tideLinux, ""))
+			w.l.GitHub.Wait()
+			w.l.Engine.Pass(t.Context(), w.org.ID)
+			eventually(t, "two idle runners", func() bool { return len(w.runnersIn(t, waiting)) == 2 })
+			idle := w.runnersIn(t, waiting)
+			if idle[0].GetRunnerId() != oldest.GetRunnerId() {
+				idle[0], idle[1] = idle[1], idle[0]
+			}
+			var registrationIDs [2]int64
+			for i, r := range idle {
+				reg, ok := w.gh.RunnerByName("tide-" + r.GetRunnerId())
+				if !ok {
+					t.Fatalf("runner %s has no registration", r.GetRunnerId())
+				}
+				registrationIDs[i] = reg.ID
+			}
+			if req := w.requestOfJob(t, 1); req.GetState() != tidev1.RequestState_REQUEST_STATE_QUEUED {
+				t.Fatalf("request before completion: %v", req)
+			}
+			if tc.retained == 0 {
+				if _, err := w.env.User(w.org.Admin).Profile.UpdateRunnerProfile(t.Context(), connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+					OrganizationId: w.org.ID, RunnerProfileId: profileID, Profile: &tidev1.RunnerProfile{WarmCount: 0},
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"warm_count"}},
+				})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.failLookup {
+				// Only the completion's post-commit work reads this view. Its
+				// first lookup checks for renamed runners. Fail the second.
+				if _, err := w.env.DB.Pool.Exec(t.Context(), `
+					CREATE SEQUENCE surplus_profile_reads;
+					CREATE FUNCTION read_warm_count(stored_count integer) RETURNS integer LANGUAGE plpgsql AS $$
+					BEGIN
+						IF nextval('surplus_profile_reads') = 2 THEN
+							RAISE EXCEPTION 'injected surplus profile read failure' USING ERRCODE = '40001';
+						END IF;
+						RETURN stored_count;
+					END;
+					$$;
+					ALTER TABLE runner_profiles RENAME COLUMN warm_count TO stored_warm_count;
+					ALTER TABLE runner_profiles RENAME TO stored_runner_profiles;
+					CREATE VIEW runner_profiles AS
+						SELECT p.*, read_warm_count(stored_warm_count) AS warm_count FROM stored_runner_profiles p;`); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			w.send(t, "workflow_job", job("completed", 501, 1, tideLinux, ""))
+			w.l.GitHub.Wait()
+			if req := w.requestOfJob(t, 1); req.GetState() != tidev1.RequestState_REQUEST_STATE_CANCELED || req.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE {
+				t.Fatalf("request after completion: %v", req)
+			}
+			t.Log("completion webhook returned HTTP 204 and the request RPC returned CANCELED/CANCELED_BY_SOURCE")
+			sandboxStates := map[string]ownsandv1.SandboxState{}
+			for _, s := range w.os.Sandboxes(w.osOrg) {
+				sandboxStates[s.GetSandboxId()] = s.GetState()
+			}
+			for i, before := range idle {
+				id, sandboxID := before.GetRunnerId(), before.GetOwnsandSandboxId()
+				r := w.runner(t, id)
+				reg, registered := w.gh.RunnerByName("tide-" + id)
+				if i < tc.retained {
+					if r.GetState() != waiting || r.GetOwnsandSandboxId() != sandboxID || !registered || reg.ID != registrationIDs[i] ||
+						sandboxStates[sandboxID] != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+						t.Fatalf("runner %s did not keep its registration %d and sandbox %s", id, registrationIDs[i], sandboxID)
+					}
+					t.Logf("retained runner %s, registration %d and sandbox %s", id, reg.ID, sandboxID)
+				} else {
+					if r.GetState() != tidev1.RunnerState_RUNNER_STATE_DELETED || r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_SURPLUS ||
+						registered || sandboxStates[sandboxID] != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+						t.Fatalf("surplus runner %s, registration %d or sandbox %s survived cleanup", id, registrationIDs[i], sandboxID)
+					}
+					t.Logf("removed surplus runner %s, registration %d and sandbox %s", id, registrationIDs[i], sandboxID)
+				}
+			}
+			if tc.failLookup {
+				logs := w.env.Logs.String()
+				if !strings.Contains(logs, `"msg":"github_surplus_profile_read_failed"`) || !strings.Contains(logs, "injected surplus profile read failure") {
+					t.Fatal("missing surplus profile read failure log")
+				}
+				t.Log("Tide logged the injected PostgreSQL error during the surplus profile read")
+			}
+		})
 	}
 }
 
