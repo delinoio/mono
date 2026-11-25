@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -55,6 +56,10 @@ type MembershipEnd struct {
 	// RevokedAPIKeyIDs are the keys that the core revoked.
 	RevokedAPIKeyIDs []string
 }
+
+// ErrRetryMembershipEnd tells RemoveMember to roll back and retry its
+// transaction. A hook can return it when continuing would violate lock order.
+var ErrRetryMembershipEnd = errors.New("membership end must retry")
 
 // MembershipEndHook lets a layer act when a membership ends. The dev session
 // layer uses it to end the user's dev sessions of the organization: InTx

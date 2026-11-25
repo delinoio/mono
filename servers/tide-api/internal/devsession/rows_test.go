@@ -113,7 +113,6 @@ func TestDevSessionMembershipEndTxRowError(t *testing.T) {
 	// hook uses the work engine to end any session.
 	tx := sessionTx{rows: &sessionRows{remaining: 1, iteration: errSessionRows, scan: func(dest []any) error {
 		*dest[0].(*string) = "session"
-		*dest[1].(*int16) = int16(tidev1.RequestState_REQUEST_STATE_QUEUED)
 		return nil
 	}}}
 	if err := (&Handler{}).membershipEndTx(t.Context(), tx, api.MembershipEnd{}); !errors.Is(err, errSessionRows) {

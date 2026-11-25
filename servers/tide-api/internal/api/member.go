@@ -390,15 +390,17 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 	return connect.NewResponse(resp), nil
 }
 
+const removeMemberAttempts = 3
+
 // RemoveMember ends a membership: removal by an owner or admin, or leaving.
 // In one transaction it deletes the membership, revokes every personal API
 // key of the user in the organization, runs the InTx membership end hooks
 // and records the audit events; after the commit it runs the AfterCommit
-// hooks (the dev session layer ends the user's dev sessions there).
+// hooks to start sandbox cleanup.
 func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[tidev1.RemoveMemberRequest]) (*connect.Response[tidev1.RemoveMemberResponse], error) {
 	target := req.Msg.GetUserId()
 	var end MembershipEnd
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	remove := func(tx pgx.Tx) error {
 		p, err := principal(ctx)
 		if err != nil {
 			return err
@@ -446,10 +448,17 @@ func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[ti
 			OrganizationID: c.OrganizationID, Action: tidev1.AuditAction_AUDIT_ACTION_MEMBER_REMOVED, Actor: c.Principal,
 			TargetKind: tidev1.AuditTargetKind_AUDIT_TARGET_KIND_MEMBERSHIP, TargetID: membershipID, SubjectUserID: target,
 		})
-	})
-	if err != nil {
-		return nil, h.Internal(ctx, "remove member", err)
 	}
-	h.membershipEndAfterCommit(ctx, end)
-	return connect.NewResponse(&tidev1.RemoveMemberResponse{}), nil
+	for range removeMemberAttempts {
+		err := h.DB.InTx(ctx, remove)
+		if errors.Is(err, ErrRetryMembershipEnd) {
+			continue
+		}
+		if err != nil {
+			return nil, h.Internal(ctx, "remove member", err)
+		}
+		h.membershipEndAfterCommit(ctx, end)
+		return connect.NewResponse(&tidev1.RemoveMemberResponse{}), nil
+	}
+	return nil, ErrUnavailable("a dev session is starting; try again")
 }
