@@ -397,7 +397,9 @@ func TestAuditEventsNewestFirst(t *testing.T) {
 		t.Fatalf("oldest event %v", last)
 	}
 	for i := 1; i < len(events); i++ {
-		if events[i-1].GetAuditEventId() <= events[i].GetAuditEventId() {
+		previous, current := events[i-1], events[i]
+		byTime := previous.GetCreateTime().AsTime().Compare(current.GetCreateTime().AsTime())
+		if byTime < 0 || byTime == 0 && previous.GetAuditEventId() <= current.GetAuditEventId() {
 			t.Fatal("events are not newest first")
 		}
 	}
@@ -405,6 +407,92 @@ func TestAuditEventsNewestFirst(t *testing.T) {
 	wantCode(t, "outsider", err, connect.CodeNotFound)
 	_, err = env.User(org.Member).Audit.ListAuditEvents(ctx, connect.NewRequest(&tidev1.ListAuditEventsRequest{OrganizationId: "not-a-uuid"}))
 	wantCode(t, "bad organization id", err, connect.CodeInvalidArgument)
+}
+
+func TestAuditEventPaginationByCreationTime(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	foreignOrg := env.NewOrg("bob")
+
+	// The UUIDs share a millisecond prefix, but the newest two events have
+	// smaller UUIDs than the oldest event.
+	const (
+		a = "01900000-0000-77ff-8000-000000000001"
+		b = "01900000-0000-7000-8000-000000000002"
+		c = "01900000-0000-7001-8000-000000000003"
+	)
+	if _, err := env.DB.Pool.Exec(ctx, "DELETE FROM audit_events WHERE organization_id = $1", org.ID); err != nil {
+		t.Fatal(err)
+	}
+	early := env.Clock.Now().Add(100 * time.Microsecond)
+	late := env.Clock.Now().Add(900 * time.Microsecond)
+	_, err := env.DB.Pool.Exec(ctx, `INSERT INTO audit_events (audit_event_id, organization_id, action, actor_user_id, target_kind, target_id, subject_user_id, rpc_id, create_time)
+		VALUES ($1, $4, $5, $6, $7, $4::uuid::text, '', '', $8),
+		       ($2, $4, $5, $6, $7, $4::uuid::text, '', '', $9),
+		       ($3, $4, $5, $6, $7, $4::uuid::text, '', '', $9)`,
+		a, b, c, org.ID, int16(tidev1.AuditAction_AUDIT_ACTION_ORGANIZATION_CREATED), org.Owner,
+		int16(tidev1.AuditTargetKind_AUDIT_TARGET_KIND_ORGANIZATION), early, late)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list := func(user, token string, size int32) (*tidev1.ListAuditEventsResponse, error) {
+		resp, err := env.User(user).Audit.ListAuditEvents(ctx, connect.NewRequest(&tidev1.ListAuditEventsRequest{
+			OrganizationId: org.ID, PageSize: size, PageToken: token,
+		}))
+		if err != nil {
+			return nil, err
+		}
+		return resp.Msg, nil
+	}
+	checkPage := func(token string, size int32, want []string) string {
+		t.Helper()
+		page, err := list(org.Member, token, size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, event := range page.GetEvents() {
+			ids = append(ids, event.GetAuditEventId())
+		}
+		if !slices.Equal(ids, want) {
+			t.Fatalf("page IDs = %v, want %v", ids, want)
+		}
+		return page.GetNextPageToken()
+	}
+	legacyToken := func(id string) string {
+		return base64.RawURLEncoding.EncodeToString([]byte("v1:" + id))
+	}
+	if token := checkPage("", 10, []string{c, b, a}); token != "" {
+		t.Fatalf("full listing returned token %q", token)
+	}
+	token := ""
+	for _, id := range []string{c, b, a} {
+		token = checkPage(token, 1, []string{id})
+		if token != legacyToken(id) {
+			t.Fatalf("token for %s = %q, want existing token format", id, token)
+		}
+	}
+	if token := checkPage(token, 1, nil); token != "" {
+		t.Fatalf("empty page returned token %q", token)
+	}
+	checkPage(legacyToken(b), 1, []string{a})
+
+	var foreignID string
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT audit_event_id::text FROM audit_events WHERE organization_id = $1 LIMIT 1", foreignOrg.ID).Scan(&foreignID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = list(org.Member, legacyToken(foreignID), 1)
+	wantCode(t, "foreign anchor", err, connect.CodeInvalidArgument)
+	if _, err := env.DB.Pool.Exec(ctx, "DELETE FROM audit_events WHERE audit_event_id = $1", b); err != nil {
+		t.Fatal(err)
+	}
+	_, err = list(org.Member, legacyToken(b), 1)
+	wantCode(t, "deleted anchor", err, connect.CodeInvalidArgument)
+	_, err = list("outsider", legacyToken(b), 1)
+	wantCode(t, "outsider with deleted anchor", err, connect.CodeNotFound)
+	checkPage("", 0, []string{c, a})
 }
 
 // TestRequestSizeLimit checks that an oversized message is rejected.

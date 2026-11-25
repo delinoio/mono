@@ -145,7 +145,9 @@ Each `output_truncated` event gives the next stdout and stderr offsets for resum
 
 ### Audit messages
 
-- `AuditEvent`: `audit_event_id`, `action` (`AuditAction`), `actor_user_id`, `actor_api_key_id` when the actor used a personal API key, `target_kind` (`AuditTargetKind`), `target_id`, `subject_user_id` (the dev session owner for dev session events and the affected member for membership events) and `create_time`. `ListAuditEvents` returns the newest events first.
+- `AuditEvent`: `audit_event_id`, `action` (`AuditAction`), `actor_user_id`, `actor_api_key_id` when the actor used a personal API key, `target_kind` (`AuditTargetKind`), `target_id`, `subject_user_id` (the dev session owner for dev session events and the affected member for membership events) and `create_time`.
+- `ListAuditEvents` sorts by descending `create_time` and uses descending `audit_event_id` for events with the same timestamp. The page token resumes after its event in that order. For an authorized request, the server returns `invalid_argument` when the token's event is missing or belongs to another organization.
+- Existing UUID-based page tokens still work while their events are retained. If the previous page used the old UUID-only order, start again with an empty token to traverse the complete list in creation-time order.
 
 ### Request and runner messages
 
