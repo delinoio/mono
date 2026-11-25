@@ -23,7 +23,7 @@ func requireRefusedOffer(t *testing.T, a *ownsandv1.SignalingAnswer) {
 	}
 }
 
-// A revocation that reaches the agent before the offer registers its session
+// A revocation that reaches the agent before the offer reserves a slot
 // is remembered: the offer is refused, no session or peer connection remains
 // and the tombstone is consumed.
 func TestRevokeBeforeOfferRefusesTheOffer(t *testing.T) {
@@ -55,19 +55,15 @@ type statesFunc func(sandboxID string) (ownsandv1.SandboxState, bool)
 
 func (f statesFunc) State(sandboxID string) (ownsandv1.SandboxState, bool) { return f(sandboxID) }
 
-// A revocation that arrives after the offer started but before it registers
-// its session (here: while the sandbox state is read, before the peer
-// connection exists) finds no session. The registration step checks for the
-// tombstone in the critical section of the insertion, so the offer ends
-// without a session.
-func TestRevokeBetweenOfferStartAndRegistration(t *testing.T) {
+// A revocation while Offer reads the sandbox state cancels the reservation
+// before Offer constructs a peer connection.
+func TestRevokeWhileCheckingSandboxState(t *testing.T) {
 	w := newWorld(t)
 	var dp *DataPlane
 	var ch *fakeChannel
 	id := newID(t)
 	dp = New(Options{Dispatcher: w.d, Logger: logger(), IncludeLoopback: true, InterfaceFilter: loopbackOnly,
 		Sandboxes: statesFunc(func(string) (ownsandv1.SandboxState, bool) {
-			// Runs inside Offer, after its entry check and before the insertion.
 			dp.Revoke(ch, &ownsandv1.SessionRevocation{RevocationId: "r", Target: &ownsandv1.SessionRevocation_SessionId{SessionId: id}})
 			return ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, true
 		})})
