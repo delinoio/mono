@@ -3,10 +3,12 @@
 package hcsrt_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -85,6 +87,20 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	vmsDir := st.Path(store.VMsDir)
+	imageMetadata, err := os.ReadFile(filepath.Join(imageDir, images.MetadataFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkImageMetadata := func(sandboxID string) {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(vmsDir, sandboxID, images.MetadataFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(data, imageMetadata) {
+			t.Fatalf("sandbox %s metadata differs from the source image", sandboxID)
+		}
+	}
 	rt, err := hcsrt.New(hcsrt.Options{WindowsImage: imageDir, VMsDir: vmsDir, Logger: logger})
 	if err != nil {
 		t.Fatal(err)
@@ -164,6 +180,7 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 		}
 	}
 	checkDiskSize(sb.GetSandboxId())
+	checkImageMetadata(sb.GetSandboxId())
 	out, ex := e.exec(sb.GetSandboxId(), "cmd.exe", "/c", "echo hello")
 	if !execSucceeded(ex) || out != "hello\r\n" {
 		t.Fatalf("exec output %q exited %q", out, ex)
@@ -244,6 +261,7 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 		t.Fatalf("restore path %v", cold.GetRestorePath())
 	}
 	checkDiskSize(cold.GetSandboxId())
+	checkImageMetadata(cold.GetSandboxId())
 	if out, _ := e.exec(cold.GetSandboxId(), "cmd.exe", "/c", `type C:\marker.txt`); out != "state\r\n" {
 		t.Fatalf("sandbox from snapshot %q", out)
 	}
