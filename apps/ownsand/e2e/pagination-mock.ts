@@ -36,6 +36,7 @@ const lists = {
   ListEnrollmentTokens: { field: "tokens", firstPageSize: 1 },
   ListMembers: { field: "members", firstPageSize: 2 },
   ListOrganizations: { field: "organizations", firstPageSize: 1 },
+  ListSandboxes: { field: "sandboxes", firstPageSize: 1 },
 };
 
 const CONTINUATION = "e2e-next-page";
@@ -488,6 +489,12 @@ export function createMockTransport(): Transport {
           );
         }
         await failContinuationIfConfigured();
+      } else if (
+        methodName === "ListSandboxes" &&
+        sessionStorage.getItem("ownsand-e2e-sandbox-first-page-error") ===
+          "true"
+      ) {
+        throw new ConnectError("Synthetic first page failure", Code.Internal);
       }
 
       if (pagination === undefined) {

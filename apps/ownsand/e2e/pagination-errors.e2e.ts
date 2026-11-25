@@ -8,7 +8,11 @@ const NORTHWIND = "0193a000-0000-7000-8000-000000000002";
 
 const paginationTest = test.extend<{
   pagedList: {
-    open(method: string, path: string, hold?: boolean): Promise<void>;
+    open(
+      method: string,
+      path: string,
+      options?: { hold?: boolean; failFirstSandboxPage?: boolean },
+    ): Promise<void>;
     release(code: Code): Promise<void>;
     allowRetry(): Promise<void>;
     tokens(): Promise<string[]>;
@@ -16,19 +20,29 @@ const paginationTest = test.extend<{
 }>({
   pagedList: async ({ app, browser, screen }, use) => {
     await use({
-      async open(method, path, hold = true) {
+      async open(
+        method,
+        path,
+        { hold = true, failFirstSandboxPage = false } = {},
+      ) {
         await app.open("/");
         await screen.getByRole("button", "Sign in with Delino").tap();
         await expect(
           screen.getByRole("link", "Acme Robotics Owner"),
         ).toBeVisible();
         await browser.evaluate(
-          ({ name, hold }) => {
+          ({ name, hold, failFirstSandboxPage }) => {
             sessionStorage.setItem("ownsand-e2e-paged-list", name);
             if (hold) sessionStorage.setItem("ownsand-e2e-page-error", "hold");
+            if (failFirstSandboxPage) {
+              sessionStorage.setItem(
+                "ownsand-e2e-sandbox-first-page-error",
+                "true",
+              );
+            }
             return true;
           },
-          { name: method, hold },
+          { name: method, hold, failFirstSandboxPage },
         );
         await app.open(path);
       },
@@ -42,6 +56,7 @@ const paginationTest = test.extend<{
       async allowRetry() {
         await browser.evaluate(() => {
           sessionStorage.removeItem("ownsand-e2e-page-error");
+          sessionStorage.removeItem("ownsand-e2e-sandbox-first-page-error");
           return true;
         });
       },
@@ -55,6 +70,105 @@ const paginationTest = test.extend<{
       },
     });
   },
+});
+
+describe("sandbox pagination errors", () => {
+  const path = `/orgs/${ACME}/sandboxes`;
+
+  for (const [code, message] of [
+    [Code.NotFound, "It was not found, or you no longer have access to it."],
+    [Code.PermissionDenied, "You do not have permission to do this."],
+    [Code.Unauthenticated, "Your session ended. Sign in again."],
+  ] as const) {
+    paginationTest(
+      `hides the sandbox list and Show more after ${Code[code]}`,
+      async ({ app, pagedList, screen }) => {
+        await pagedList.open("ListSandboxes", path);
+        const list = screen.getByRole("region", "Sandbox list");
+        const more = screen.getByRole("button", "Show more");
+        await expect(list.getByRole("link")).toHaveCount(1);
+        const initialRequests = await pagedList.tokens();
+        await more.tap();
+        await pagedList.release(code);
+
+        await expect(screen.getByText(message)).toBeVisible();
+        await app.screenshot(`sandbox-terminal-${Code[code]}`);
+        await expect(list).toHaveCount(0);
+        await expect(more).toHaveCount(0);
+        await expect(screen.getByRole("heading", "Sandboxes")).toBeVisible();
+        await expect(screen.getByRole("combobox", "State")).toBeVisible();
+        await expect(screen.getByRole("combobox", "Device")).toBeVisible();
+        if (code === Code.Unauthenticated) {
+          await expect(
+            screen.getByRole("button", "Sign in with Delino"),
+          ).toBeVisible();
+        }
+        expect(await pagedList.tokens()).toEqual([
+          ...initialRequests,
+          "e2e-next-page",
+        ]);
+      },
+    );
+  }
+
+  paginationTest(
+    "keeps sandbox rows during a continuation error and retries the same token",
+    async ({ app, pagedList, screen }) => {
+      await pagedList.open("ListSandboxes", path);
+      const list = screen.getByRole("region", "Sandbox list");
+      const more = screen.getByRole("button", "Show more");
+      const error = screen.getByText("Something went wrong. Try again.");
+      await expect(more).toBeVisible();
+      const initialRequests = await pagedList.tokens();
+      await more.tap();
+      await pagedList.release(Code.Internal);
+
+      await expect(error).toBeVisible();
+      await expect(list.getByRole("link")).toHaveCount(1);
+      await expect(more).toBeVisible();
+      await app.screenshot("sandbox-continuation-error");
+
+      await pagedList.allowRetry();
+      await screen.getByRole("button", "Try again").tap();
+      await expect(list.getByRole("link")).toHaveCount(3);
+      await expect(error).toHaveCount(0);
+      await expect(more).toHaveCount(0);
+      expect(await pagedList.tokens()).toEqual([
+        ...initialRequests,
+        "e2e-next-page",
+        "e2e-next-page",
+      ]);
+      await app.screenshot("sandbox-continuation-recovered");
+    },
+  );
+
+  paginationTest(
+    "recovers the first sandbox page using an empty token",
+    async ({ app, pagedList, screen }) => {
+      await pagedList.open("ListSandboxes", path, {
+        hold: false,
+        failFirstSandboxPage: true,
+      });
+      const list = screen.getByRole("region", "Sandbox list");
+      const more = screen.getByRole("button", "Show more");
+      const error = screen.getByText("Something went wrong. Try again.");
+      await expect(error).toBeVisible();
+      await expect(list).toHaveCount(0);
+      await expect(more).toHaveCount(0);
+      await app.screenshot("sandbox-first-page-error");
+
+      const failedRequests = await pagedList.tokens();
+      expect(failedRequests.length).toBeGreaterThan(0);
+      expect(failedRequests.every((token) => token === "")).toBe(true);
+      await pagedList.allowRetry();
+      await screen.getByRole("button", "Try again").tap();
+      await expect(list.getByRole("link")).toHaveCount(1);
+      await expect(more).toBeVisible();
+      await expect(error).toHaveCount(0);
+      expect(await pagedList.tokens()).toEqual([...failedRequests, ""]);
+      await app.screenshot("sandbox-first-page-recovered");
+    },
+  );
 });
 
 describe("continuation errors", () => {
@@ -354,7 +468,9 @@ describe("device inventory pagination", () => {
   paginationTest(
     "opens, places on and filters by a device beyond the first page",
     async ({ app, browser, pagedList, screen }) => {
-      await pagedList.open("ListDevices", `/orgs/${ACME}/devices`, false);
+      await pagedList.open("ListDevices", `/orgs/${ACME}/devices`, {
+        hold: false,
+      });
       const device = screen.getByRole("link", "Device 201");
       await expect(device).toHaveCount(1);
       await expect(
