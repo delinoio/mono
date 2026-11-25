@@ -242,6 +242,17 @@ function addTtl(timestamp: Timestamp, durationNanos: bigint): Timestamp {
   });
 }
 
+function isPendingInvitation(
+  { state, expireTime }: Invitation,
+  cutoff: number,
+): boolean {
+  return (
+    state === InvitationState.PENDING &&
+    expireTime !== undefined &&
+    timestampMs(expireTime) > cutoff
+  );
+}
+
 interface OrgState {
   organization: Organization;
   members: Member[];
@@ -1223,12 +1234,7 @@ export function createMockTransport(
         const cutoff = now();
         const invitations = org.invitations
           .map(({ invitation }) => invitation)
-          .filter(
-            ({ state, expireTime }) =>
-              state === InvitationState.PENDING &&
-              expireTime !== undefined &&
-              timestampMs(expireTime) > cutoff,
-          );
+          .filter((invitation) => isPendingInvitation(invitation, cutoff));
         const { page, nextPageToken } = pageOf(
           invitations,
           req,
@@ -1244,6 +1250,12 @@ export function createMockTransport(
         );
         if (entry === undefined)
           throw new ConnectError("invitation not found", Code.NotFound);
+        if (!isPendingInvitation(entry.invitation, now())) {
+          throw new ConnectError(
+            "only a pending invitation can be revoked",
+            Code.FailedPrecondition,
+          );
+        }
         entry.invitation.state = InvitationState.REVOKED;
         return { invitation: entry.invitation };
       },
