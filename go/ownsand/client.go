@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -94,9 +95,9 @@ func ParseTransport(s string) (Transport, error) {
 type Options struct {
 	// BaseURL is the API origin, for example https://ownsand.api.delino.io
 	// or http://127.0.0.1:18300 for a local control plane. An http:// origin
-	// uses HTTP/2 without TLS (h2c with prior knowledge). It must not have a
-	// path, query marker ("?"), fragment marker ("#") or user info. Empty
-	// means DefaultBaseURL.
+	// uses HTTP/2 without TLS (h2c with prior knowledge). An explicit port
+	// must be at most 65535. The origin must not have a path, query marker
+	// ("?"), fragment marker ("#") or user info. Empty means DefaultBaseURL.
 	BaseURL string
 	// APIKey is an organization API key (osk_...). Set at most one of
 	// APIKey and TokenSource. When both are empty, the client reads
@@ -152,6 +153,8 @@ var ErrNoCredential = errors.New("ownsand: no credential: set Options.APIKey, Op
 // before it sends the request.
 var ErrNoOrganization = errors.New("ownsand: no organization: set the organization ID, Options.OrganizationID or OWNSAND_ORG")
 
+var errInvalidBaseURL = errors.New("ownsand: invalid base URL: want an http or https origin")
+
 // New returns a client.
 func New(opts Options) (*Client, error) {
 	lookup := opts.LookupEnv
@@ -167,13 +170,18 @@ func New(opts Options) (*Client, error) {
 	// Hostname drops the port, so "http://:18300" has a nonempty Host but no
 	// hostname.
 	if err != nil || origin.Hostname() == "" || (origin.Scheme != "https" && origin.Scheme != "http") {
-		return nil, fmt.Errorf("ownsand: invalid base URL: want an http or https origin")
+		return nil, errInvalidBaseURL
 	}
 	// url.Parse drops an empty fragment and records a bare "?" only as
 	// ForceQuery, so check the raw string. The Connect clients append the RPC
 	// path to it, which a query marker or fragment would swallow.
 	if strings.ContainsAny(base, "?#") || origin.Path != "" || origin.RawQuery != "" || origin.User != nil || origin.Opaque != "" {
 		return nil, fmt.Errorf("ownsand: invalid base URL: want an origin without path, query, fragment or user info")
+	}
+	if port := origin.Port(); port != "" {
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			return nil, errInvalidBaseURL
+		}
 	}
 
 	var cred credential
