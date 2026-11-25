@@ -30,10 +30,10 @@ describe("mock invitation expiry", () => {
     rs.useRealTimers();
   });
 
-  const start = () => {
+  const start = (userId?: string) => {
     rs.useFakeTimers({ toFake: ["Date"] });
     rs.setSystemTime(T0);
-    const transport = createMockTransport();
+    const transport = createMockTransport({ userId });
     return {
       members: createClient(MemberService, transport),
       organizations: createClient(OrganizationService, transport),
@@ -123,23 +123,121 @@ describe("mock invitation expiry", () => {
     expect(await listInvitations()).toEqual([invitation]);
   });
 
-  test("omits a revoked invitation while another pending invitation is active", async () => {
+  test("revokes a pending invitation just before expiry and rejects a repeat", async () => {
     const { members } = start();
     const organizationId = MOCK_IDS.acme;
-    const before = await members.listInvitations({ organizationId });
-    expect(before.invitations).toHaveLength(1);
+    const existing = await members.listInvitations({ organizationId });
+    expect(existing.invitations).toHaveLength(1);
     const { invitation, invitationSecret } = await members.createInvitation({
       organizationId,
       role: Role.MEMBER,
     });
-    await members.revokeInvitation({
-      organizationId,
-      invitationId: invitation!.invitationId,
+    const request = { organizationId, invitationId: invitation!.invitationId };
+    rs.setSystemTime(T0 + CREATED_TTL_MS - 1);
+    const revoked = await members.revokeInvitation(request);
+    expect(revoked.invitation).toEqual({
+      ...invitation,
+      state: InvitationState.REVOKED,
     });
-    expect(await members.listInvitations({ organizationId })).toEqual(before);
+
+    const memberships = await members.listMembers({ organizationId });
+    await expect(members.revokeInvitation(request)).rejects.toMatchObject({
+      code: Code.FailedPrecondition,
+      rawMessage: "only a pending invitation can be revoked",
+    });
+    // The seeded invitation has expired by this point. Rewind to check that
+    // the revoked invitation stays hidden while the other one is still pending.
+    rs.setSystemTime(T0);
+    expect(await members.listInvitations({ organizationId })).toEqual(existing);
+    expect(await members.listMembers({ organizationId })).toEqual(memberships);
     expect(await codeOf(members.acceptInvitation({ invitationSecret }))).toBe(
       Code.NotFound,
     );
+  });
+
+  test.each([0, 1])(
+    "rejects revocation at expiry plus %i ms",
+    async (offset) => {
+      const { members } = start();
+      const organizationId = MOCK_IDS.acme;
+      const { invitation } = await members.createInvitation({
+        organizationId,
+        role: Role.MEMBER,
+      });
+      const memberships = await members.listMembers({ organizationId });
+      const expiry = T0 + CREATED_TTL_MS;
+      rs.setSystemTime(expiry + offset);
+      await expect(
+        members.revokeInvitation({
+          organizationId,
+          invitationId: invitation!.invitationId,
+        }),
+      ).rejects.toMatchObject({
+        code: Code.FailedPrecondition,
+        rawMessage: "only a pending invitation can be revoked",
+      });
+      expect(await members.listMembers({ organizationId })).toEqual(
+        memberships,
+      );
+
+      rs.setSystemTime(expiry - 1);
+      const { invitations } = await members.listInvitations({ organizationId });
+      expect(invitations).toEqual([invitation]);
+      expect(invitations[0]?.state).toBe(InvitationState.PENDING);
+    },
+  );
+
+  test("rejects revocation of an accepted invitation and preserves the new membership", async () => {
+    const userId = "user-admin-jun";
+    const { members } = start(userId);
+    const organizationId = MOCK_IDS.acme;
+    const { invitation, invitationSecret } = await members.createInvitation({
+      organizationId,
+      role: Role.ADMIN,
+    });
+    await members.removeMember({ organizationId, userId });
+    const accepted = await members.acceptInvitation({ invitationSecret });
+    expect(accepted.member).toMatchObject({ userId, role: Role.ADMIN });
+    const memberships = await members.listMembers({ organizationId });
+
+    await expect(
+      members.revokeInvitation({
+        organizationId,
+        invitationId: invitation!.invitationId,
+      }),
+    ).rejects.toMatchObject({
+      code: Code.FailedPrecondition,
+      rawMessage: "only a pending invitation can be revoked",
+    });
+    expect(await members.listMembers({ organizationId })).toEqual(memberships);
+  });
+
+  test("checks access before looking up the invitation ID", async () => {
+    const { members } = start();
+    const member = createClient(
+      MemberService,
+      createMockTransport({ userId: "user-member-ada" }),
+    );
+    const request = {
+      organizationId: MOCK_IDS.acme,
+      invitationId: "0193a000-0000-7000-8000-0000000000ff",
+    };
+
+    await expect(members.revokeInvitation(request)).rejects.toMatchObject({
+      code: Code.NotFound,
+      rawMessage: "invitation not found",
+    });
+    expect(await codeOf(member.revokeInvitation(request))).toBe(
+      Code.PermissionDenied,
+    );
+    expect(
+      await codeOf(
+        members.revokeInvitation({
+          ...request,
+          organizationId: MOCK_IDS.contoso,
+        }),
+      ),
+    ).toBe(Code.NotFound);
   });
 
   test("requires organization membership and an owner or admin role to list invitations", async () => {

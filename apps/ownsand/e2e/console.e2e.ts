@@ -618,6 +618,39 @@ describe("invitations", () => {
     await app.screenshot("invitation-at-expiry");
   });
 
+  test("rejects a confirmation submitted when the invitation expires", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    const start = Date.UTC(2026, 0, 1, 12);
+    const expiry = start + 6 * 24 * 60 * 60 * 1000;
+    await browser.addInitScript((ms) => {
+      Date.now = () => ms;
+    }, start);
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/members`);
+
+    const invitations = screen.getByRole("region", "Invitations");
+    await invitations.getByRole("button", /^Revoke/).tap();
+    const confirmation = screen.getByRole("alertdialog");
+    await expect(confirmation).toBeVisible();
+    await browser.evaluate((ms) => {
+      Date.now = () => ms;
+      return null;
+    }, expiry);
+    await confirmation.getByRole("button", "Revoke invitation").tap();
+
+    await expect(
+      confirmation.getByText("only a pending invitation can be revoked", {
+        exact: false,
+      }),
+    ).toBeVisible();
+    await expect(screen.getByText("The invitation is revoked.")).toHaveCount(0);
+    await app.screenshot("invitation-revocation-at-expiry");
+  });
+
   test("accepts an invitation link through sign-in and removes the secret from the address", async ({
     app,
     screen,
