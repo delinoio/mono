@@ -81,9 +81,40 @@ type watcher struct {
 	done    chan struct{}
 }
 
-func (w *watcher) stop() {
-	w.cancel()
-	<-w.done
+// drainWatcher moves an active watcher to the draining set under h.mu.
+// The caller cancels and joins it after releasing h.mu.
+func (h *Hub) drainWatcher(w *watcher) {
+	delete(h.watchers, w.in.ID)
+	select {
+	case <-w.done:
+		return
+	default:
+	}
+	orgID := w.in.OrganizationID
+	if h.draining[orgID] == nil {
+		h.draining[orgID] = map[*watcher]struct{}{}
+	}
+	h.draining[orgID][w] = struct{}{}
+}
+
+func (h *Hub) finishWatcher(w *watcher) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	close(w.done)
+	orgID := w.in.OrganizationID
+	delete(h.draining[orgID], w)
+	if len(h.draining[orgID]) == 0 {
+		delete(h.draining, orgID)
+	}
+}
+
+func stopWatchers(watchers []*watcher) {
+	for _, w := range watchers {
+		w.cancel()
+	}
+	for _, w := range watchers {
+		<-w.done
+	}
 }
 
 // desired is one integration that needs a watcher.
@@ -131,12 +162,17 @@ func (h *Hub) desiredWatchers(ctx context.Context) (map[string]desired, error) {
 func (h *Hub) runWatchers(ctx context.Context) error {
 	defer func() {
 		h.mu.Lock()
-		all := h.watchers
-		h.watchers = map[string]*watcher{}
-		h.mu.Unlock()
-		for _, w := range all {
-			w.stop()
+		for _, w := range h.watchers {
+			h.drainWatcher(w)
 		}
+		var stop []*watcher
+		for _, watchers := range h.draining {
+			for w := range watchers {
+				stop = append(stop, w)
+			}
+		}
+		h.mu.Unlock()
+		stopWatchers(stop)
 	}()
 	t := time.NewTicker(h.timing.SyncInterval)
 	defer t.Stop()
@@ -165,7 +201,7 @@ func (h *Hub) syncWatchers(ctx context.Context) {
 		d, ok := want[id]
 		if !ok || d.version != w.version || h.stopped[w.in.OrganizationID] > 0 {
 			stop = append(stop, w)
-			delete(h.watchers, id)
+			h.drainWatcher(w)
 		}
 	}
 	var start []desired
@@ -175,8 +211,8 @@ func (h *Hub) syncWatchers(ctx context.Context) {
 		}
 	}
 	h.mu.Unlock()
+	stopWatchers(stop)
 	for _, w := range stop {
-		w.stop()
 		h.log.InfoContext(ctx, "vendor_watch_stopped", slog.String("organization_id", w.in.OrganizationID), slog.String("agent_integration_id", w.in.ID),
 			slog.String("vendor", VendorLabel(w.in.Vendor)))
 	}
@@ -193,7 +229,7 @@ func (h *Hub) syncWatchers(ctx context.Context) {
 		h.watchers[d.in.ID] = w
 		h.mu.Unlock()
 		go func() {
-			defer close(w.done)
+			defer h.finishWatcher(w)
 			h.watch(wctx, v, d.in)
 		}()
 	}

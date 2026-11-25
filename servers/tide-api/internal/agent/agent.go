@@ -123,6 +123,9 @@ type Hub struct {
 
 	mu       sync.Mutex
 	watchers map[string]*watcher
+	// draining keeps watchers visible to organization deletion until the
+	// vendor watch returns. It is keyed by organization and watcher identity.
+	draining map[string]map[*watcher]struct{}
 	// stopped counts deletion attempts that are holding an organization's
 	// watchers stopped.
 	stopped map[string]int
@@ -138,7 +141,8 @@ func Register(r *app.Registry, engine *work.Engine, integrations *integration.St
 	}
 	h := &Hub{svc: r.Service, engine: engine, integrations: integrations, timing: timing, log: r.Service.Logger,
 		vendors: map[tidev1.AgentVendor]Vendor{}, bySource: map[work.Source]Vendor{},
-		claimLocks: map[string]*claimLock{}, watchers: map[string]*watcher{}, stopped: map[string]int{}, syncNow: make(chan struct{}, 1)}
+		claimLocks: map[string]*claimLock{}, watchers: map[string]*watcher{}, draining: map[string]map[*watcher]struct{}{},
+		stopped: map[string]int{}, syncNow: make(chan struct{}, 1)}
 	engine.RegisterAdapter(&Adapter{h: h})
 	integrations.OnDeletion(h.checkIntegrationDeletion)
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "agent_watchers", RunFunc: h.runWatchers})
@@ -391,12 +395,14 @@ func (h *Hub) releaseClaimLocked(ctx context.Context, c *Claim, req *work.Reques
 func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion) (err error) {
 	h.mu.Lock()
 	h.stopped[d.OrganizationID]++
-	var stop []*watcher
-	for id, w := range h.watchers {
+	for _, w := range h.watchers {
 		if w.in.OrganizationID == d.OrganizationID {
-			stop = append(stop, w)
-			delete(h.watchers, id)
+			h.drainWatcher(w)
 		}
+	}
+	stop := make([]*watcher, 0, len(h.draining[d.OrganizationID]))
+	for w := range h.draining[d.OrganizationID] {
+		stop = append(stop, w)
 	}
 	h.mu.Unlock()
 	defer func() {
@@ -404,9 +410,7 @@ func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion
 			h.resumeOrg(d.OrganizationID)
 		}
 	}()
-	for _, w := range stop {
-		w.stop()
-	}
+	stopWatchers(stop)
 	claims, err := h.heldClaims(ctx, "c.organization_id = $1 AND r.state = ANY($2)", d.OrganizationID, work.OpenRequestStates())
 	if err != nil {
 		return err
