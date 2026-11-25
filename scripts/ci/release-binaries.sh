@@ -344,13 +344,17 @@ sign_macos() {
   # search list ("no identity found" otherwise), so put the job keychain
   # first and keep the existing entries. Each entry is a separate argument;
   # cleanup restores the saved list before it deletes the keychain.
-  local entry
+  local keychain_list entry
+  if ! keychain_list="$(security list-keychains -d user)"; then
+    echo "::error::Cannot read the user keychain search list." >&2
+    exit 1
+  fi
   while IFS= read -r entry; do
     entry="${entry#"${entry%%[![:space:]]*}"}"
     entry="${entry#\"}"
     entry="${entry%\"}"
     [[ -n "$entry" ]] && keychain_search_list+=("$entry")
-  done < <(security list-keychains -d user)
+  done <<< "$keychain_list"
   keychain_search_list_saved=1
   security list-keychains -d user -s "$keychain" ${keychain_search_list[@]+"${keychain_search_list[@]}"}
   rm -f "$work/certificate.p12"
