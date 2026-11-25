@@ -448,6 +448,7 @@ The Go SDK implements download for the CLI and the MCP server. Download copies a
   - `codex`: the `@openai/codex` npm package at the version that tide pins. The guest needs Node.js. When the guest has no Node.js, tide first installs the official Node.js 24 distribution at the version that tide pins.
   - `devin`: the official Devin CLI installer.
 - tide installs the runner programs on every guest OS that the runner profile allows for its workload kind and vendor: Linux, macOS and Windows.
+- When OwnSand reports that an agent runner preparation step timed out, tide treats the step as failed even if the command exits with code zero. Tide records `prepare_failed` and stops that runner before it can start or become warm.
 - Version policy (recorded decision):
   - Pinned programs: the GitHub Actions runner, `codex` and Node.js. tide-api pins an exact version of each in its source. Renovate updates the pins through a custom manager that the runner implementation adds to `renovate.json`.
   - Unpinned programs: `claude`, Cursor `agent` and `devin`. tide installs the version that the official installer gives at installation time. tide checks the minimum version only for `claude` (2.1.224). Cursor `agent` and `devin` have no minimum version.

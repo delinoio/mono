@@ -117,8 +117,7 @@ func PrependPath(guest tidev1.GuestOs, bins ...string) string {
 `
 }
 
-// StepError is a guest step that failed with an exit code that the step
-// explains.
+// StepError describes a failed guest step.
 type StepError struct {
 	Step string
 	Code int64
@@ -132,9 +131,9 @@ func (e *StepError) Error() string {
 	return fmt.Sprintf("%s failed with exit code %d", e.Step, e.Code)
 }
 
-// RunStep runs a script and waits for it. A result other than exit code 0
-// fails with a StepError; codes maps the step's own exit codes to clear
-// messages (for example a missing Git Bash).
+// RunStep runs a script and waits for it. Only an exit with code 0 before the
+// timeout succeeds. Other results return a StepError. The codes map gives
+// messages for the step's nonzero exit codes.
 func RunStep(ctx context.Context, g *work.Guest, step, script string, timeout time.Duration, codes map[int64]string) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout+30*time.Second)
 	defer cancel()
@@ -142,12 +141,11 @@ func RunStep(ctx context.Context, g *work.Guest, step, script string, timeout ti
 	if err != nil {
 		return fmt.Errorf("%s: %w", step, err)
 	}
+	if res.TimedOut {
+		return &StepError{Step: step, Code: -1, Msg: "timed out"}
+	}
 	if res.Kind != ownsand.ExecResultExited || res.ExitCode == nil {
-		msg := res.Kind.String()
-		if res.TimedOut {
-			msg = "timed out"
-		}
-		return &StepError{Step: step, Code: -1, Msg: msg}
+		return &StepError{Step: step, Code: -1, Msg: res.Kind.String()}
 	}
 	if *res.ExitCode != 0 {
 		return &StepError{Step: step, Code: *res.ExitCode, Msg: codes[*res.ExitCode]}
