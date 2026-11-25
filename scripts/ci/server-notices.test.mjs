@@ -14,7 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -33,8 +33,8 @@ function write(path, content) {
   writeFileSync(path, content);
 }
 
-// A module `example.com/app` whose command imports `example.com/lib`
-// everywhere, `example.com/windowsonly` only on Windows and
+// A module `example.com/app` whose command imports `example.com/lib` and
+// `example.com/otherlib` everywhere, `example.com/windowsonly` only on Windows and
 // `example.com/cgoonly` only with CGO. The last two have no license file, so
 // the bundle succeeds only when the helper builds for linux/amd64 with CGO
 // disabled whatever the caller's environment says.
@@ -49,11 +49,13 @@ function fixture(options = {}) {
       "",
       "require (",
       "\texample.com/lib v1.2.3",
+      "\texample.com/otherlib v0.0.1",
       "\texample.com/windowsonly v0.0.1",
       "\texample.com/cgoonly v0.0.1",
       ")",
       "",
       "replace example.com/lib => ./lib",
+      "replace example.com/otherlib => ./otherlib",
       "replace example.com/windowsonly => ./windowsonly",
       "replace example.com/cgoonly => ./cgoonly",
       "",
@@ -65,6 +67,7 @@ function fixture(options = {}) {
       "package main",
       "",
       'import _ "example.com/lib"',
+      'import _ "example.com/otherlib"',
       "",
       "func main() {}",
       "",
@@ -78,7 +81,7 @@ function fixture(options = {}) {
     join(dir, "cmd/app/cgo.go"),
     '//go:build cgo\n\npackage main\n\nimport _ "example.com/cgoonly"\n',
   );
-  for (const name of ["lib", "windowsonly", "cgoonly"]) {
+  for (const name of ["lib", "otherlib", "windowsonly", "cgoonly"]) {
     write(join(dir, name, "go.mod"), `module example.com/${name}\n\ngo 1.21\n`);
     write(join(dir, name, `${name}.go`), `package ${name}\n`);
   }
@@ -88,6 +91,7 @@ function fixture(options = {}) {
     // Beyond the collector's maximum depth: not part of the bundle.
     write(join(dir, "lib/a/b/LICENSE"), "Too deep license text\n");
   }
+  write(join(dir, "otherlib/LICENSE"), "Other fixture license text\n");
   return dir;
 }
 
@@ -117,13 +121,77 @@ test(
     assert.match(bundle, /^Third-party licenses of app\n/);
     assert.match(bundle, /example\.com\/lib v1\.2\.3: LICENSE\n/);
     assert.match(bundle, /example\.com\/lib v1\.2\.3: NOTICE\.md\n/);
+    assert.match(bundle, /example\.com\/otherlib v0\.0\.1: LICENSE\n/);
     assert.match(bundle, /Fixture license text/);
     assert.match(bundle, /Fixture notice text/);
     assert.doesNotMatch(bundle, /Too deep license text/);
     assert.doesNotMatch(bundle, /windowsonly|cgoonly/);
-    assert.match(result.stderr, /licenses of 1 third-party modules of app/);
+    assert.match(result.stderr, /licenses of 2 third-party modules of app/);
   },
 );
+
+for (const { stage, tool, partialOutput, diagnostic } of [
+  {
+    stage: "module sort",
+    tool: "sort",
+    partialOutput: [
+      '[[ "$1" == -u ]] || exec sort "$@"',
+      "sort \"$@\" | awk 'NF && !printed { print; printed = 1 }'",
+    ],
+    diagnostic: /Cannot sort the Go modules that app links/,
+  },
+  {
+    stage: "license search",
+    tool: "find",
+    partialOutput: [
+      '[[ "$1" == */lib ]] || exec find "$@"',
+      'printf "%s\\0" "$1/LICENSE"',
+    ],
+    diagnostic:
+      /Cannot find license files for example\.com\/lib v1\.2\.3 that app links/,
+  },
+  {
+    stage: "license path sort",
+    tool: "sort",
+    partialOutput: [
+      '[[ "$1" == -z ]] || exec sort "$@"',
+      'sort "$@" | { IFS= read -r -d "" path && printf "%s\\0" "$path"; }',
+    ],
+    diagnostic:
+      /Cannot sort license paths for example\.com\/lib v1\.2\.3 that app links/,
+  },
+]) {
+  test(`fails when the ${stage} emits partial results`, { skip }, (t) => {
+    const dir = fixture();
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const shimDir = join(dir, "bin");
+    mkdirSync(shimDir);
+    writeFileSync(
+      join(shimDir, tool),
+      [
+        "#!/usr/bin/env bash",
+        'export PATH="${PATH#*:}"',
+        ...partialOutput,
+        "exit 1",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const out = join(dir, "out/THIRD-PARTY-LICENSES.txt");
+    const env = { PATH: [shimDir, process.env.PATH].join(delimiter) };
+    for (const existing of [false, true]) {
+      if (existing) write(out, "Existing bundle\n");
+      const result = run(dir, ["app", "./cmd/app", out], env);
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, diagnostic);
+      if (existing) {
+        assert.equal(readFileSync(out, "utf8"), "Existing bundle\n");
+      } else {
+        assert.equal(existsSync(out), false);
+      }
+    }
+  });
+}
 
 test(
   "fails with the module name when a linked module has no license file",
