@@ -925,8 +925,17 @@ export function createMockTransport(
     previous: AgentIntegration["credentials"],
     req: Pick<CreateAgentIntegrationRequest, "credentials">,
   ): AgentIntegration["credentials"] => {
-    const supplied: [AgentCredential, string][] = [];
     const c = req.credentials;
+    if (c.case === undefined) {
+      throw new ConnectError("credentials are required", Code.InvalidArgument);
+    }
+    if (c.case !== VENDOR_CREDENTIAL_CASE[vendor]) {
+      throw new ConnectError(
+        "credentials do not match the vendor",
+        Code.InvalidArgument,
+      );
+    }
+    const supplied: [AgentCredential, string][] = [];
     switch (c.case) {
       case "claudeCodeCredentials":
         supplied.push([
@@ -953,13 +962,6 @@ export function createMockTransport(
           [AgentCredential.OUTPOST_TOKEN, c.value.outpostToken],
         );
         break;
-    }
-    const expected = VENDOR_CREDENTIAL_CASE[vendor];
-    if (c.case !== undefined && c.case !== expected) {
-      throw new ConnectError(
-        "credentials do not match the vendor",
-        Code.InvalidArgument,
-      );
     }
     return supplied.map(([credential, value]) => {
       const old = previous.find((p) => p.credential === credential);

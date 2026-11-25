@@ -604,6 +604,34 @@ describe("integrations", () => {
     await expect(screen.getByText("claude-team · Claude Code")).toBeVisible();
   });
 
+  test("renames an integration without replacing its credentials", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+    const integrations = screen.getByRole("list", "Agent integrations");
+    await integrations
+      .getByRole("listitem")
+      .filter({ hasText: "claude-team · Claude Code" })
+      .getByRole("button", "Edit")
+      .tap();
+    const dialog = screen.getByRole("dialog", "Edit claude-team");
+    await dialog.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("claude-renamed");
+    await dialog.getByRole("button", "Save changes").tap();
+
+    await expect(dialog).toBeHidden();
+    await expect(
+      integrations
+        .getByRole("listitem")
+        .filter({ hasText: "claude-renamed · Claude Code" }),
+    ).toContainText("Environment key: Set at");
+  });
+
   test("saves a Cursor integration name, pool, and credential together", async ({
     app,
     screen,
