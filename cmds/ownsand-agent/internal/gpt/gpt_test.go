@@ -4,13 +4,16 @@ package gpt
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -314,9 +317,14 @@ func (r *readSpy) entryReads() []spyRead {
 func headerOnlyDisk(t *testing.T, entriesLBA uint64, numEntries, entrySize, entriesCRC uint32) (*readSpy, int64) {
 	t.Helper()
 	const sectors = 1 << 14
+	entrySectors := (uint64(numEntries)*uint64(entrySize) + SectorSize - 1) / SectorSize
+	var lastUsable uint64
+	if entrySectors < sectors-2 {
+		lastUsable = sectors - 2 - entrySectors
+	}
 	h := header{
 		Revision: 0x00010000, HeaderSize: headerSize, CurrentLBA: 1, BackupLBA: sectors - 1,
-		FirstUsableLBA: 34, LastUsableLBA: sectors - 34, EntriesLBA: entriesLBA,
+		FirstUsableLBA: 2 + entrySectors, LastUsableLBA: lastUsable, EntriesLBA: entriesLBA,
 		NumEntries: numEntries, EntrySize: entrySize, EntriesCRC: entriesCRC,
 	}
 	copy(h.Signature[:], signature)
@@ -352,7 +360,7 @@ func TestReadBoundsEntryArrayBeforeReading(t *testing.T) {
 		{name: "exactly the cap is read and parsed", entriesLBA: 2, num: 4096, size: 128, wantRead: true},
 		{name: "exactly the cap keeps the checksum check", entriesLBA: 2, num: 4096, size: 128, badCRC: true, wantErr: "entry array checksum does not match", wantRead: true},
 		{name: "extended entries within the cap", entriesLBA: 2, num: 128, size: 256, wantRead: true},
-		{name: "ends at the disk boundary", entriesLBA: sectors - 64, num: 128, size: 256, wantRead: true},
+		{name: "ends at the disk boundary", entriesLBA: sectors - 64, num: 128, size: 256, wantErr: "overlaps the backup layout"},
 		{name: "one sector beyond the disk", entriesLBA: sectors - 63, num: 128, size: 256, wantErr: "lies outside the disk"},
 		{name: "starts at the disk end", entriesLBA: sectors, num: 128, size: 128, wantErr: "lies outside the disk"},
 		{name: "starts far beyond the disk", entriesLBA: 1 << 40, num: 128, size: 128, wantErr: "lies outside the disk"},
@@ -429,5 +437,158 @@ func TestFitAndRemoveTrailingRejectOversizedEntryArray(t *testing.T) {
 		if !bytes.Equal(before, after) {
 			t.Fatalf("%s changed the disk image", name)
 		}
+	}
+}
+
+func openSizedDisk(t *testing.T, sectors uint64) *os.File {
+	t.Helper()
+	f, err := os.Create(filepath.Join(t.TempDir(), "disk.img"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	if err := f.Truncate(int64(sectors) * SectorSize); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func diskDigest(t *testing.T, f *os.File) [sha256.Size]byte {
+	t.Helper()
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, f); err != nil {
+		t.Fatal(err)
+	}
+	return [sha256.Size]byte(digest.Sum(nil))
+}
+
+type writeCounter int
+
+func (w *writeCounter) WriteAt(p []byte, _ int64) (int, error) {
+	(*w)++
+	return len(p), nil
+}
+
+func TestRejectUnwritableLayout(t *testing.T) {
+	cases := []struct {
+		name       string
+		sectors    uint64
+		entriesLBA uint64
+		first      uint64
+		last       uint64
+		numEntries uint32
+		used       bool
+	}{
+		{name: "large array consumes the backup header", sectors: 1026, entriesLBA: 2, first: 34, numEntries: 4096, used: true},
+		{name: "empty overlapping arrays on 1027 sectors", sectors: 1027, entriesLBA: 2, first: 34, numEntries: 4096},
+		{name: "empty overlapping arrays on 1030 sectors", sectors: 1030, entriesLBA: 2, first: 34, numEntries: 4096},
+		{name: "large arrays overlap by one sector", sectors: 2050, entriesLBA: 2, first: 1026, numEntries: 4096},
+		{name: "no sector between adjacent arrays", sectors: 2051, entriesLBA: 2, first: 1026, numEntries: 4096},
+		{name: "large disk with entries in the backup array", sectors: 1 << 21, entriesLBA: 1<<21 - 1024, first: 34, numEntries: 4096, used: true},
+		{name: "standard array in the backup array", sectors: 68, entriesLBA: 36, first: 34, numEntries: 128, used: true},
+		{name: "first usable sector inside the primary array", sectors: 68, entriesLBA: 2, first: 33, last: 34, numEntries: 128},
+		{name: "first usable sector inside the backup array", sectors: 68, entriesLBA: 2, first: 35, last: 34, numEntries: 128},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := openSizedDisk(t, c.sectors)
+			h := header{
+				Revision: 0x00010000, HeaderSize: headerSize, CurrentLBA: 1, BackupLBA: c.sectors - 1,
+				FirstUsableLBA: c.first, LastUsableLBA: c.last, EntriesLBA: c.entriesLBA,
+				NumEntries: c.numEntries, EntrySize: 128,
+			}
+			copy(h.Signature[:], signature)
+			entries := make([]byte, int(h.NumEntries*h.EntrySize))
+			if c.used {
+				copy(entries[:16], guidBytes(t, AppleAPFSRecovery))
+				binary.LittleEndian.PutUint64(entries[32:40], c.first)
+				binary.LittleEndian.PutUint64(entries[40:48], c.first)
+			}
+			h.EntriesCRC = crc32.ChecksumIEEE(entries)
+			sector, err := encodeHeader(h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteAt(sector, SectorSize); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteAt(entries, int64(c.entriesLBA)*SectorSize); err != nil {
+				t.Fatal(err)
+			}
+
+			var writer writeCounter
+			table := &Table{hdr: h, entries: entries, sectors: c.sectors}
+			if err := table.Write(&writer); err == nil || !strings.HasPrefix(err.Error(), "gpt:") {
+				t.Errorf("Write error = %v, want a gpt error", err)
+			}
+			if writer != 0 {
+				t.Errorf("Write called WriteAt %d times, want 0", writer)
+			}
+
+			before := diskDigest(t, f)
+			for _, op := range []struct {
+				name string
+				run  func() error
+			}{
+				{"Read", func() error { _, err := Read(f, int64(c.sectors)*SectorSize); return err }},
+				{"Fit", func() error { return Fit(f.Name()) }},
+				{"RemoveTrailing", func() error { _, err := RemoveTrailing(f.Name(), AppleAPFSRecovery); return err }},
+			} {
+				if err := op.run(); err == nil || !strings.HasPrefix(err.Error(), "gpt:") {
+					t.Errorf("%s error = %v, want a gpt error", op.name, err)
+				}
+				if diskDigest(t, f) != before {
+					t.Fatalf("%s changed the disk image", op.name)
+				}
+			}
+		})
+	}
+}
+
+func TestFitAcceptsMaximumEntryArray(t *testing.T) {
+	const (
+		sectors     = 2 + 2*1024 + 2
+		firstUsable = 2 + 1024
+	)
+	f := openSizedDisk(t, sectors)
+	table := &Table{
+		hdr: header{
+			Revision: 0x00010000, HeaderSize: headerSize, FirstUsableLBA: firstUsable,
+			EntriesLBA: 2, NumEntries: 4096, EntrySize: 128,
+		},
+		entries: make([]byte, 4096*128),
+		sectors: sectors,
+	}
+	copy(table.hdr.Signature[:], signature)
+	copy(table.entries[:16], guidBytes(t, appleAPFS))
+	binary.LittleEndian.PutUint64(table.entries[32:40], firstUsable)
+	binary.LittleEndian.PutUint64(table.entries[40:48], firstUsable)
+	if err := table.Write(f); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.verify(f); err != nil {
+		t.Fatal(err)
+	}
+	if before := read(t, f.Name()); before.hdr.LastUsableLBA != firstUsable {
+		t.Fatalf("last usable sector = %d, want %d", before.hdr.LastUsableLBA, firstUsable)
+	}
+	if err := f.Truncate((sectors + 1) * SectorSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := Fit(f.Name()); err != nil {
+		t.Fatal(err)
+	}
+	after := read(t, f.Name())
+	if after.hdr.BackupLBA != sectors || after.hdr.LastUsableLBA != firstUsable+1 {
+		t.Fatalf("unexpected fitted header %+v", after.hdr)
+	}
+	if err := after.verify(f); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := after.Partitions(), table.Partitions(); !slices.Equal(got, want) {
+		t.Fatalf("fitted partitions = %+v, want %+v", got, want)
 	}
 }
