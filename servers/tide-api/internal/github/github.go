@@ -173,8 +173,8 @@ type rowLock int
 const (
 	// lockNone reads the row without a lock.
 	lockNone rowLock = iota
-	// lockShare serializes a reader (a workflow_job delivery) with the
-	// changes of the link, but not with other readers.
+	// lockShare lets workflow_job deliveries and JIT registrations share the
+	// link while excluding changes to it.
 	lockShare
 	// lockUpdate serializes a change of the link (an installation event or
 	// an RPC) with every other lock of the row.
@@ -321,21 +321,17 @@ func (l *Layer) registration(ctx context.Context, q db.Querier, runnerID string)
 	return &reg, nil
 }
 
-func (l *Layer) markRemoved(ctx context.Context, runnerID string) {
-	if _, err := l.svc.DB.Pool.Exec(ctx, "UPDATE github_runners SET registration_removed = true WHERE runner_id = $1", runnerID); err != nil {
-		l.svc.Logger.WarnContext(ctx, "github_registration_update_failed", slog.String("runner_id", runnerID), slog.Any("error", err))
-	}
-}
-
 // removeRegistration removes the GitHub registration of a runner of inst.
 // It reports refused=true when GitHub refused because the runner took a
 // job.
-func (l *Layer) removeRegistration(ctx context.Context, inst *Installation, runnerID string) (refused bool, err error) {
-	reg, err := l.registration(ctx, l.svc.DB.Pool, runnerID)
+func (l *Layer) removeRegistration(ctx context.Context, q db.Querier, inst *Installation, runnerID string) (bool, error) {
+	reg, err := l.registration(ctx, q, runnerID)
 	if err != nil || reg == nil || reg.removed || reg.githubRunnerID == 0 {
 		return false, err
 	}
-	err = l.gh.DeleteRunner(ctx, inst.GitHubID, inst.Login, reg.githubRunnerID)
+	deleteCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	err = l.gh.DeleteRunner(deleteCtx, inst.GitHubID, inst.Login, reg.githubRunnerID)
 	if errors.Is(err, githubapi.ErrRunnerRefused) {
 		l.svc.Logger.InfoContext(ctx, "github_runner_removal_refused", slog.String("organization_id", inst.OrganizationID), slog.String("runner_id", runnerID),
 			slog.Int64("github_runner_id", reg.githubRunnerID))
@@ -344,7 +340,10 @@ func (l *Layer) removeRegistration(ctx context.Context, inst *Installation, runn
 	if err != nil {
 		return false, err
 	}
-	l.markRemoved(ctx, runnerID)
+	if _, err := q.Exec(ctx, "UPDATE github_runners SET registration_removed = true WHERE runner_id = $1 AND github_runner_id = $2", runnerID, reg.githubRunnerID); err != nil {
+		l.svc.Logger.WarnContext(ctx, "github_registration_update_failed", slog.String("runner_id", runnerID), slog.Any("error", err))
+		return false, err
+	}
 	l.svc.Logger.InfoContext(ctx, "github_runner_removed", slog.String("organization_id", inst.OrganizationID), slog.String("runner_id", runnerID),
 		slog.Int64("github_runner_id", reg.githubRunnerID))
 	return false, nil
