@@ -65,16 +65,20 @@ func (s *Service) ReauthorizeForTest(ctx context.Context, orgID string) error {
 }
 
 // SetLatestIDForTest replaces the read of the newest control event ID that
-// seeds the cursor, and returns the function it replaced, so a test can fail
-// or delay the baseline of a lease period. It takes the control lock, and the
-// event processor reads the seam only while the cursor is unset, so a caller
-// installs it while the cursor is set (or before the lease transition that
-// the test drives) to keep the replacement ordered before every read.
+// seeds the cursor. It returns the previous function so a test can fail or
+// delay a baseline read before calling the original function.
 func (c *Control) SetLatestIDForTest(fn func(ctx context.Context) (int64, error)) (previous func(ctx context.Context) (int64, error)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	previous, c.latestID = c.latestID, fn
 	return previous
+}
+
+// PollEventsForTest runs one event poll while the lease is held.
+func (c *Control) PollEventsForTest(ctx context.Context) {
+	if c.held() {
+		c.processEvents(ctx)
+	}
 }
 
 // SetAfterWriteResponseDequeuedForTest sets a hook that WriteFile runs with

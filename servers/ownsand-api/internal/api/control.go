@@ -30,13 +30,12 @@ type Control struct {
 	mu sync.Mutex
 	// cursor is the last processed control event; -1 means unset.
 	cursor int64
-	// cursorGen counts the lease transitions that stored the cursor. Every
-	// LeaseAcquired and LeaseLost increments it in the same critical section
-	// as its cursor store, even when the stored value is unchanged. A batch
-	// in processEvents copies it together with the cursor and stops as soon
-	// as it differs, so a batch that started under an earlier lease period
-	// never delivers an event or stores a cursor in a later one.
+	// cursorGen changes when acquisition starts or the lease is lost.
+	// Reads and event batches use it to detect a change of lease period.
 	cursorGen uint64
+	// retryBaseline allows polling to establish the baseline after the
+	// acquisition read has failed in this lease period.
+	retryBaseline bool
 
 	// Seams of the event processor. NewControl sets them to the database
 	// functions; tests replace them to interleave lease transitions with a
@@ -101,43 +100,56 @@ func (c *Control) Kick() {
 // until the cursor is stored (baselineReady), so no channel is admitted
 // before the baseline.
 func (c *Control) LeaseAcquired(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	id, err := c.latestID(ctx)
-	if err != nil {
-		c.S.Logger.Warn("control_event_cursor_failed", slog.Any("error", err))
-		id = -1
-	}
 	c.mu.Lock()
-	c.cursor = id
 	c.cursorGen++
+	gen := c.cursorGen
+	c.cursor = -1
+	c.retryBaseline = false
 	c.mu.Unlock()
+
+	id, err := c.readBaseline(ctx)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cursorGen != gen {
+		return
+	}
+	if err != nil {
+		c.retryBaseline = true
+		return
+	}
+	c.cursor = id
 }
 
-// initCursor sets an unset cursor to the newest event for the event processor
-// batch that copied generation gen. Unlike LeaseAcquired it is not a lease
-// transition: it reads the newest event ID before it takes the lock and
-// stores it only when no transition ran since the batch copied gen and the
-// cursor is still unset, and it never increments cursorGen. A read that
-// started in an earlier lease period therefore cannot replace the cursor that
-// a later LeaseAcquired stored, or set a cursor that a later LeaseLost
-// cleared. A failed read leaves the cursor and the generation unchanged and
-// the event processor repeats it while the lease is held.
-func (c *Control) initCursor(ctx context.Context, gen uint64) {
+func (c *Control) readBaseline(ctx context.Context) (int64, error) {
+	c.mu.Lock()
+	latestID := c.latestID
+	c.mu.Unlock()
+
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	id, err := c.latestID(ctx)
+	id, err := latestID(ctx)
 	if err != nil {
 		c.S.Logger.Warn("control_event_cursor_failed", slog.Any("error", err))
+	}
+	return id, err
+}
+
+// initCursor retries a failed acquisition read. It can publish a baseline
+// only for the lease period that allowed the retry. If the read fails,
+// the next poll can retry again while the lease is held.
+func (c *Control) initCursor(ctx context.Context, gen uint64) {
+	id, err := c.readBaseline(ctx)
+	if err != nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.cursorGen != gen || c.cursor >= 0 {
+	if c.cursorGen != gen || c.cursor >= 0 || !c.retryBaseline {
 		c.S.Logger.Info("control_event_batch_superseded", slog.Int64("cursor", c.cursor))
 		return
 	}
 	c.cursor = id
+	c.retryBaseline = false
 }
 
 // ProcessedCursor returns the delivery ID of the last control event that this
@@ -157,11 +169,12 @@ func (c *Control) ProcessedCursor() (id int64, ok bool) {
 
 // LeaseLost closes every agent channel; agents reconnect to the new holder.
 func (c *Control) LeaseLost() {
-	c.S.Hub.CloseAll(errLeaseLost)
 	c.mu.Lock()
 	c.cursor = -1
+	c.retryBaseline = false
 	c.cursorGen++
 	c.mu.Unlock()
+	c.S.Hub.CloseAll(errLeaseLost)
 }
 
 var errLeaseLost = leaseLostError{}
@@ -199,8 +212,8 @@ func (c *Control) runEvents(ctx context.Context) {
 	}
 }
 
-// processEvents delivers the events after the cursor; an unset cursor is
-// first initialized by initCursor. The cursor belongs to
+// processEvents delivers the events after the cursor. It retries baseline
+// initialization only after the acquisition read fails. The cursor belongs to
 // the lease period in which the batch started: when LeaseLost or
 // LeaseAcquired runs while the batch is in flight, the batch stops before
 // its next read, its next delivery and its cursor store, so it neither
@@ -216,10 +229,12 @@ func (c *Control) runEvents(ctx context.Context) {
 // for as long as it lasts; there is no retry bound.
 func (c *Control) processEvents(ctx context.Context) {
 	c.mu.Lock()
-	cursor, gen := c.cursor, c.cursorGen
+	cursor, gen, retryBaseline := c.cursor, c.cursorGen, c.retryBaseline
 	c.mu.Unlock()
 	if cursor < 0 {
-		c.initCursor(ctx, gen)
+		if retryBaseline {
+			c.initCursor(ctx, gen)
+		}
 		return
 	}
 	for {
@@ -277,8 +292,7 @@ func (c *Control) storeCursor(gen uint64, cursor int64) bool {
 	return true
 }
 
-// cursorCurrent reports whether no lease transition stored the cursor since
-// the batch copied generation gen.
+// cursorCurrent reports whether the lease generation still matches gen.
 func (c *Control) cursorCurrent(gen uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

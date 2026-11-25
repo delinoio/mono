@@ -14,8 +14,91 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
+
+func TestControlBaselinePreservesLimitsDuringAcquisition(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: time.Hour, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: time.Second}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	ctx := t.Context()
+	org := env.NewOrg("alice")
+	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	control := env.App.Control
+	replaceLimits := func(vcpus int32) int64 {
+		t.Helper()
+		if _, err := org.OwnerClient.Device.ReplaceDeviceLimits(ctx, connect.NewRequest(&ownsandv1.ReplaceDeviceLimitsRequest{
+			OrganizationId: org.ID, DeviceId: dev.ID,
+			Limits: &ownsandv1.DeviceLimitsInput{VcpuCount: i32(vcpus), MemoryMib: i64(8192), DiskGib: i64(100), VcpuOvercommitPercent: i32(100)},
+		})); err != nil {
+			t.Fatal(err)
+		}
+		id, err := events.LatestID(ctx, env.DB.Pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	baselineID := replaceLimits(6)
+	testenv.Eventually(t, "the first lease period to reach the baseline event", func() bool {
+		id, ok := control.ProcessedCursor()
+		return ok && id == baselineID
+	})
+
+	// Drive a poll after the lease is held and before the acquisition
+	// callback reads Postgres, with the same ordering as the race.
+	refused := env.NewFakeAgent(dev)
+	var realLatestID func(context.Context) (int64, error)
+	realLatestID = control.SetLatestIDForTest(func(ctx context.Context) (int64, error) {
+		if !env.App.Lease.Held() {
+			t.Fatal("expected the lease to be held before the baseline read")
+		}
+		control.SetLatestIDForTest(realLatestID)
+		control.PollEventsForTest(ctx)
+		if id, ok := control.ProcessedCursor(); ok {
+			t.Fatalf("poll published cursor %d while the acquisition read was pending", id)
+		}
+		refused.OpenChannel()
+		select {
+		case <-refused.Closed():
+		case <-ctx.Done():
+			t.Fatal("channel stayed open while the acquisition read was pending")
+		}
+		if code := testenv.Code(refused.CloseErr()); code != connect.CodeUnavailable {
+			t.Fatalf("channel ended with %v, want unavailable", refused.CloseErr())
+		}
+		return realLatestID(ctx)
+	})
+	control.LeaseLost()
+	control.LeaseAcquired(ctx)
+	if id, ok := control.ProcessedCursor(); !ok || id != baselineID {
+		t.Fatalf("acquired baseline = %d, %v, want %d", id, ok, baselineID)
+	}
+
+	agent := env.NewFakeAgent(dev)
+	agent.Connect()
+	first := agent.WaitFor("initial configuration", func(e *ownsandv1.AgentEnvelope) bool { return e.GetConfiguration() != nil })
+	if got := first.GetConfiguration().GetLimits().GetVcpuCount(); got != 6 {
+		t.Fatalf("initial configuration has %d vCPUs, want 6", got)
+	}
+	conn := env.App.Service.Hub.Get(dev.ID)
+	updateID := replaceLimits(8)
+	if updateID <= baselineID {
+		t.Fatalf("limits update delivery ID = %d, want above %d", updateID, baselineID)
+	}
+	agent.WaitFor("updated configuration on the same channel", func(e *ownsandv1.AgentEnvelope) bool {
+		limits := e.GetConfiguration().GetLimits()
+		return limits.GetVcpuCount() == 8 && limits.GetMemoryMib() == 8192 &&
+			limits.GetDiskGib() == 100 && limits.GetVcpuOvercommitPercent() == 100
+	})
+	testenv.Eventually(t, "the event processor to reach the limits update", func() bool {
+		id, ok := control.ProcessedCursor()
+		return ok && id == updateID
+	})
+	if conn == nil || env.App.Service.Hub.Get(dev.ID) != conn {
+		t.Fatal("the channel changed during the limits update")
+	}
+}
 
 // TestControlBaselinePrecedesChannelAdmission drives a lease period whose
 // first control event cursor read fails, with real Postgres and a real agent
