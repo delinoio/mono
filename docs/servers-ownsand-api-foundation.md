@@ -42,6 +42,10 @@ Layout, following the `accounts-api` server conventions:
 - Operational endpoint: `GET /healthz` without authentication returns `200` with `{"status":"ok"}` while the process can serve HTTP requests. `GET /metrics` on `METRICS_ADDR` serves the metrics in the Prometheus format on an internal listener; see [Billing metrics](#billing-metrics).
 - Browser access: CORS allows only `https://ownsand.delino.io` in production and the console's loopback development origin locally.
 
+### Shutdown
+
+A termination signal or a permanent error from the public HTTP or configured metrics listener starts shutdown. The process stops the workers and releases the instance lease before giving active public requests up to 10 seconds to finish. At the deadline, it closes the remaining public connections. It then [finishes usage metering](#metering), closes the metrics server if enabled, and collects its serve result. A listener error that overlaps a termination signal remains in the `server_exited` log, along with any cleanup or usage error. A listener failure exits with status 1. A clean signal shutdown can exit successfully.
+
 ### Authentication
 
 The server accepts three kinds of credentials in the `Authorization: Bearer` header. It selects the validator from the credential shape and never tries a second validator after the first one rejects the credential.
