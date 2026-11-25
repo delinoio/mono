@@ -356,6 +356,116 @@ func TestCloseAfterExecStartFailure(t *testing.T) {
 	}
 }
 
+func TestExecRequestPath(t *testing.T) {
+	const tool = "tidetest-path-tool"
+	requestDir, inheritedDir := t.TempDir(), t.TempDir()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	image, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	install := func(dir, name string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, image, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	pathKey, suffix := "PATH", ""
+	if runtime.GOOS == "windows" {
+		pathKey, suffix = "Path", ".exe"
+		t.Setenv("PATHEXT", ".EXE")
+	}
+	requestTool := install(requestDir, tool+suffix)
+	requestOnlyTool := install(requestDir, tool+"-request-only"+suffix)
+	inheritedTool := install(inheritedDir, tool+suffix)
+	t.Setenv("PATH", inheritedDir)
+
+	s := New()
+	t.Cleanup(s.Close)
+	client, ds := createExecTestSession(t, t.Context(), s, t.TempDir())
+	run := func(t *testing.T, name string, env map[string]string, wantPath string) {
+		t.Helper()
+		stream, err := client.ExecDevSession(t.Context(), listTestRequest(&tidev1.ExecDevSessionRequest{
+			OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(), ExecId: s.newID(),
+			Command: []string{name, "-test.run=^TestExecRequestPathProcess$"},
+			Env:     env,
+		}))
+		events := receiveExecEvents(t, stream, err)
+		if len(events) == 0 {
+			t.Fatal("exec returned no events")
+		}
+		final := events[len(events)-1]
+		if wantPath == "" {
+			want := tidev1.ExecFailureReason_EXEC_FAILURE_REASON_PROGRAM_NOT_FOUND
+			if final.GetFailed().GetReason() != want {
+				t.Fatalf("got %v, want %v", final, want)
+			}
+			return
+		}
+		if exited := final.GetExited(); exited == nil || exited.GetExitCode() != 0 {
+			t.Fatalf("got %v, want exit code 0", final)
+		}
+		var stdout strings.Builder
+		for _, event := range events {
+			stdout.Write(event.GetStdout().GetData())
+		}
+		gotPath, argv0, _ := strings.Cut(stdout.String(), "\n")
+		if argv0 != name {
+			t.Errorf("got argv[0] %q, want %q", argv0, name)
+		}
+		gotFile, err := os.Stat(gotPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantFile, err := os.Stat(wantPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(gotFile, wantFile) {
+			t.Errorf("ran %q, want %q", gotPath, wantPath)
+		}
+	}
+
+	t.Run("request-only executable", func(t *testing.T) {
+		run(t, tool+"-request-only", map[string]string{pathKey: requestDir}, requestOnlyTool)
+	})
+	t.Run("request takes precedence", func(t *testing.T) {
+		run(t, tool, map[string]string{pathKey: requestDir}, requestTool)
+	})
+	t.Run("PATH omitted", func(t *testing.T) {
+		run(t, tool, nil, inheritedTool)
+	})
+	t.Run("PATH empty", func(t *testing.T) {
+		run(t, tool, map[string]string{pathKey: ""}, "")
+	})
+	t.Run("explicit path", func(t *testing.T) {
+		run(t, inheritedTool, map[string]string{pathKey: requestDir}, inheritedTool)
+	})
+	if runtime.GOOS == "windows" {
+		t.Run("request PATHEXT order", func(t *testing.T) {
+			path := install(requestDir, tool+".com")
+			run(t, tool, map[string]string{pathKey: requestDir, "PathExt": ".COM;.EXE"}, path)
+		})
+	}
+}
+
+func TestExecRequestPathProcess(t *testing.T) {
+	if !strings.HasPrefix(filepath.Base(os.Args[0]), "tidetest-path-tool") {
+		return
+	}
+	path, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Printf("%s\n%s", path, os.Args[0])
+	os.Exit(0)
+}
+
 func TestExecStreamEventLimit(t *testing.T) {
 	const outputSize = 2*chunkLimit + 1
 	for _, limit := range []int{0, 1, 2} {
