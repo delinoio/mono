@@ -220,6 +220,7 @@ func (r *R2) do(ctx context.Context, method string, u *url.URL) (*http.Response,
 }
 
 type listResult struct {
+	XMLName  xml.Name `xml:"ListBucketResult"`
 	Contents []struct {
 		Key  string `xml:"Key"`
 		Size int64  `xml:"Size"`
@@ -229,10 +230,11 @@ type listResult struct {
 }
 
 // ListPrefix lists the objects under prefix (ListObjectsV2, following the
-// continuation tokens) and implements Store. A truncated page without a
-// continuation token is an error: the listing would silently miss objects.
+// continuation tokens) and implements Store. An invalid page fails the entire
+// listing.
 func (r *R2) ListPrefix(ctx context.Context, prefix string) ([]Object, error) {
 	var objects []Object
+	seenTokens := make(map[string]struct{})
 	token := ""
 	for {
 		u, err := url.Parse(strings.TrimSuffix(r.Endpoint, "/") + "/" + r.Bucket)
@@ -269,6 +271,10 @@ func (r *R2) ListPrefix(ctx context.Context, prefix string) ([]Object, error) {
 		if list.NextContinuationToken == "" {
 			return nil, errors.New("objectstore: truncated list without a continuation token")
 		}
+		if _, seen := seenTokens[list.NextContinuationToken]; seen {
+			return nil, errors.New("objectstore: repeated list continuation token")
+		}
+		seenTokens[list.NextContinuationToken] = struct{}{}
 		token = list.NextContinuationToken
 	}
 }
