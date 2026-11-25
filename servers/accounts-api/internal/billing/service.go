@@ -78,6 +78,11 @@ type Service struct {
 	autoTopUpBudget time.Duration
 	elapsed         func() time.Time
 
+	// pendingReconcileRun serializes local reconciliation runs so they can
+	// share a cursor. A waiting run can still stop when its context ends.
+	pendingReconcileRun    chan struct{}
+	pendingReconcileCursor *string
+
 	// wake asks the worker to charge queued automatic top-ups at once.
 	wake chan struct{}
 }
@@ -108,6 +113,8 @@ func New(cfg Config) *Service {
 		autoTopUpBudget:   autoTopUpBudget,
 		elapsed:           time.Now,
 		wake:              make(chan struct{}, 1),
+
+		pendingReconcileRun: make(chan struct{}, 1),
 	}
 }
 

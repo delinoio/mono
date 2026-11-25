@@ -3,9 +3,13 @@
 package billing
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -357,5 +361,123 @@ func TestReconcilePendingAdjustmentsIsExactlyOnce(t *testing.T) {
 	}
 	if f.pendingCount() != 1 || f.refundCount() != 3 || f.balance(acct3) != 10*usd {
 		t.Fatalf("deleted account: pending %d, refunds %d, balance %d", f.pendingCount(), f.refundCount(), f.balance(acct3))
+	}
+}
+
+// A sequence records attempts even when PostgreSQL rolls back the purchase.
+// Failing the delete also checks that the refund writes roll back with it.
+func (f *fixture) injectPendingAdjustmentFailures() {
+	f.t.Helper()
+	_, err := f.db.Pool.Exec(ctx(), `
+		CREATE TABLE reconciliation_faults (paddle_transaction_id text PRIMARY KEY);
+		CREATE SEQUENCE reconciliation_attempts;
+		CREATE FUNCTION count_reconciliation_attempt() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			PERFORM nextval('reconciliation_attempts');
+			IF EXISTS (SELECT FROM reconciliation_faults WHERE paddle_transaction_id = OLD.paddle_transaction_id) THEN
+				RAISE EXCEPTION 'injected reconciliation failure';
+			END IF;
+			RETURN OLD;
+		END;
+		$$;
+		CREATE TRIGGER fail_reconciliation BEFORE DELETE ON pending_credit_adjustments
+			FOR EACH ROW EXECUTE FUNCTION count_reconciliation_attempt();`)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *fixture) seedPendingPurchase(transactionID, action string, failing bool) string {
+	f.t.Helper()
+	now := f.clock.Now()
+	accountID := f.account()
+	oldReleaseGrant(f.t, f.db, accountID, transactionID, 10*usd, now)
+	insertPending(f.t, f.db, "adj_"+transactionID, transactionID, action, 4*usd, now)
+	if failing {
+		if _, err := f.db.Pool.Exec(ctx(), `INSERT INTO reconciliation_faults VALUES ($1)`, transactionID); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	return accountID
+}
+
+func TestReconcilePendingAdjustmentsContinuesAfterPurchaseFailure(t *testing.T) {
+	f := newFixture(t)
+	f.injectPendingAdjustmentFailures()
+	failed := f.seedPendingPurchase("txn_01", "refund", true)
+	healthy := f.seedPendingPurchase("txn_02", "chargeback", false)
+
+	err := f.s.ReconcilePendingAdjustments(ctx())
+	if err == nil || !strings.Contains(err.Error(), "txn_01") || !strings.Contains(err.Error(), "injected reconciliation failure") {
+		t.Fatalf("run error = %v, want the injected failure for txn_01", err)
+	}
+	credit := wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd}
+	refund := wantEntry{LedgerRefund, -4 * usd, 6 * usd}
+	f.wantLedger(failed, credit)
+	f.wantLedger(healthy, credit, refund)
+	if f.pendingCount() != 1 || f.refundCount() != 1 {
+		t.Fatalf("pending = %d, refunds = %d, want 1 and 1", f.pendingCount(), f.refundCount())
+	}
+
+	if _, err := f.db.Pool.Exec(ctx(), `DELETE FROM reconciliation_faults`); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := f.s.ReconcilePendingAdjustments(ctx()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.wantLedger(failed, credit, refund)
+	f.wantLedger(healthy, credit, refund)
+	if f.pendingCount() != 0 || f.refundCount() != 2 {
+		t.Fatalf("pending = %d, refunds = %d, want 0 and 2", f.pendingCount(), f.refundCount())
+	}
+}
+
+func TestReconcilePendingAdjustmentsReachesHealthyPurchaseBeyondBatch(t *testing.T) {
+	f := newFixture(t)
+	f.injectPendingAdjustmentFailures()
+	for i := range 100 {
+		f.seedPendingPurchase(fmt.Sprintf("txn_%03d", i), "refund", true)
+	}
+	healthy := f.seedPendingPurchase("txn_100", "chargeback", false)
+
+	for _, run := range []struct{ attempts, pending, refunds int }{{100, 101, 0}, {200, 100, 1}} {
+		if err := f.s.ReconcilePendingAdjustments(ctx()); err == nil {
+			t.Fatal("run did not report the purchase failures")
+		}
+		if attempts := f.count(`SELECT last_value FROM reconciliation_attempts`); attempts != run.attempts {
+			t.Fatalf("total purchase attempts = %d, want %d", attempts, run.attempts)
+		}
+		if f.pendingCount() != run.pending || f.refundCount() != run.refunds {
+			t.Fatalf("pending = %d, refunds = %d, want %d and %d", f.pendingCount(), f.refundCount(), run.pending, run.refunds)
+		}
+	}
+	f.wantLedger(healthy, wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd}, wantEntry{LedgerRefund, -4 * usd, 6 * usd})
+}
+
+func TestReconcilePendingAdjustmentsStopsOnCancellation(t *testing.T) {
+	f := newFixture(t)
+	first := f.seedPendingPurchase("txn_01", "refund", false)
+	f.seedPendingPurchase("txn_02", "chargeback", false)
+	release := f.holdAccountLock(first)
+	runCtx, cancel := context.WithCancel(ctx())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.s.ReconcilePendingAdjustments(runCtx) }()
+	f.waitForAccountLockWait()
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not stop on cancellation")
+	}
+	release()
+	if f.pendingCount() != 2 || f.refundCount() != 0 {
+		t.Fatalf("pending = %d, refunds = %d, want 2 and 0", f.pendingCount(), f.refundCount())
 	}
 }
