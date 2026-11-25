@@ -4728,6 +4728,10 @@ test(
         labels: "NaN",
         env: "Infinity",
         tag: "-Infinity",
+        mode: "non-blocking",
+        "max-buffer-size": "1m",
+        "cache-disabled": "false",
+        "cache-max-size": "10m",
       },
       "default-address-pools": [{ base: "10.10.0.0/16", size: 24 }],
     };
@@ -4751,6 +4755,51 @@ test(
     assert.equal(second.status, 0, second.stderr);
     assert.equal(second.read(), written);
     assert.deepEqual(second.calls, [queryLogDriver]);
+  },
+);
+
+test(
+  "configure-docker-logs refuses unsupported logging options before switching",
+  { skip },
+  (t) => {
+    for (const [original, driver, option] of [
+      [
+        {
+          "log-driver": "syslog",
+          "log-opts": { "syslog-address": "udp://127.0.0.1:514" },
+          "data-root": "/srv/docker",
+        },
+        "syslog",
+        "syslog-address",
+      ],
+      [
+        { "log-opts": { "syslog-address": "udp://127.0.0.1:514" } },
+        "json-file",
+        "syslog-address",
+      ],
+      [
+        { "log-opts": { "cache-syslog-address": "udp://127.0.0.1:514" } },
+        "json-file",
+        "cache-syslog-address",
+      ],
+    ]) {
+      const content = `${JSON.stringify(original, null, 2)}\n\n`;
+      const result = logsFixture(t, { content, driver }).run();
+      assert.notEqual(result.status, 0, option);
+      assert.ok(
+        result.stderr.includes(
+          `unsupported by the local log driver ('${option}')`,
+        ),
+        result.stderr,
+      );
+      assert.match(
+        result.stderr,
+        /Review log-opts before rerunning provisioning/,
+      );
+      assert.equal(result.read(), content, option);
+      assert.deepEqual(result.calls, [], option);
+      assert.deepEqual(result.leftovers(), [], option);
+    }
   },
 );
 
@@ -4874,6 +4923,7 @@ test(
       "",
       "[]",
       '["log-driver", "local"]',
+      '{"log-opts": ["max-size"]}',
       '"local"',
       "null",
       "42",
