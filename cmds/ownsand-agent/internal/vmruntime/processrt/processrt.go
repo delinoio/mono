@@ -54,9 +54,8 @@ const (
 	helperStopPoll    = 10 * time.Millisecond
 )
 
-// errHelperExited reports that the guest helper of a sandbox was reaped. The
-// operating system may have given its process ID, and so its process group ID,
-// to an unrelated process, so the runtime sends no signal to that group.
+// errHelperExited reports that the runtime has ended signaling for an exited
+// helper. The operating system can reuse the process ID after reaping.
 var errHelperExited = errors.New("processrt: guest helper has exited")
 
 // Runtime is the process test runtime.
@@ -223,8 +222,8 @@ func (v *vm) hasExited() bool {
 	}
 }
 
-// signalHelper sends sig to the helper's process group. A process ID may
-// be reused after reaping, so a known exited helper receives no signal.
+// signalHelper sends sig through the platform-specific helper signal path.
+// The exit notification lets callers skip signals after cleanup is complete.
 func (v *vm) signalHelper(sig syscall.Signal) error {
 	if v.hasExited() {
 		return errHelperExited
@@ -376,7 +375,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	cmd.Env = append(os.Environ(), "HOME="+root)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
-	helper, wait, err := startHelper(cmd)
+	helper, wait, err := startHelper(cmd, r.logger.With("sandbox_id", v.id))
 	if err != nil {
 		fsutil.RemoveAll(dir)
 		removeSocketDir(v)
