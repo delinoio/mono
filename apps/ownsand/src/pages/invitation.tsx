@@ -14,6 +14,7 @@ import {
 import {
   openInvitationFromAddress,
   pendingInvitation,
+  secretFromFragment,
   takeSecretFromAddress,
 } from "../invitation.ts";
 import { refreshOrganizations } from "../organizations.ts";
@@ -157,7 +158,12 @@ export function InvitationPage({ configured }: { configured: boolean }) {
               try {
                 res = await accept.mutateAsync({ invitationSecret: secret });
               } finally {
-                current = attempt === currentAttempt.current;
+                // The address can change before hashchange runs. Leave the
+                // fragment in place for the listener to consume.
+                const addressSecret = secretFromFragment(window.location.hash);
+                current =
+                  attempt === currentAttempt.current &&
+                  (addressSecret === undefined || addressSecret === secret);
               }
               // The server request is not aborted. Only a result that still
               // belongs to the shown invitation may change the route.

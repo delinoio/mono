@@ -586,6 +586,99 @@ describe("agent version policy", () => {
   });
 });
 
+const heldInvitation = test.extend<{ holdInvitation(): Promise<void> }>({
+  holdInvitation: async ({ app, browser, screen }, use) => {
+    await use(async () => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await expect(
+        screen.getByRole("link", "Acme Robotics Owner"),
+      ).toBeVisible();
+      await browser.evaluate(() => {
+        sessionStorage.setItem("ownsand-e2e-acceptance", "hold");
+        return null;
+      });
+      await app.open(`/invitations/accept#secret=${ACME_INVITATION_SECRET}`);
+      const accept = screen.getByRole("button", "Accept invitation");
+      await accept.tap();
+      await expect(accept).toHaveAttribute("data-pending", "");
+      expect(
+        await browser.evaluate(() =>
+          sessionStorage.getItem("ownsand-e2e-acceptance"),
+        ),
+      ).toEqual("held");
+    });
+  },
+});
+
+describe("invitation acceptance while opening another link", () => {
+  for (const eventFirst of [false, true]) {
+    heldInvitation(
+      eventFirst
+        ? "accepts the newer link when hashchange ran before the earlier response"
+        : "accepts the newer link when the earlier response arrives before hashchange",
+      async ({ app, browser, screen, holdInvitation }) => {
+        await holdInvitation();
+        await browser.evaluate(
+          ({ secret, deliverEvent }) => {
+            window.history.replaceState(null, "", `#secret=${secret}`);
+            if (deliverEvent)
+              window.dispatchEvent(new HashChangeEvent("hashchange"));
+            window.dispatchEvent(new Event("ownsand-e2e-release-acceptance"));
+            return null;
+          },
+          { secret: INVITATION_SECRET, deliverEvent: eventFirst },
+        );
+
+        const accept = screen.getByRole("button", "Accept invitation");
+        await expect(accept).toBeEnabled();
+        if (!eventFirst) {
+          expect(
+            await browser.evaluate(
+              (secret) =>
+                window.location.pathname === "/invitations/accept" &&
+                window.location.hash === `#secret=${secret}`,
+              INVITATION_SECRET,
+            ),
+          ).toEqual(true);
+          await app.screenshot("new-invitation-before-hashchange");
+          await browser.evaluate(() => {
+            window.dispatchEvent(new HashChangeEvent("hashchange"));
+            return null;
+          });
+        }
+        await expect(browser).toHaveURL("/invitations/accept");
+        await accept.tap();
+        await expect(browser).toHaveURL(`/orgs/${CONTOSO}/sandboxes`);
+        await expect(
+          screen.getByRole("heading", "Sandboxes", { level: 1 }),
+        ).toBeVisible();
+        await app.screenshot(
+          eventFirst ? "new-invitation-event-first" : "new-invitation-accepted",
+        );
+      },
+    );
+  }
+
+  heldInvitation(
+    "redirects when the fragment still identifies the held invitation",
+    async ({ app, browser, screen, holdInvitation }) => {
+      await holdInvitation();
+      await browser.evaluate((secret) => {
+        window.history.replaceState(null, "", `#secret=%20${secret}%20`);
+        window.dispatchEvent(new Event("ownsand-e2e-release-acceptance"));
+        return null;
+      }, ACME_INVITATION_SECRET);
+
+      await expect(browser).toHaveURL(`/orgs/${ACME}/sandboxes`);
+      await expect(
+        screen.getByRole("heading", "Sandboxes", { level: 1 }),
+      ).toBeVisible();
+      await app.screenshot("current-invitation-accepted");
+    },
+  );
+});
+
 describe("invitations", () => {
   test("hides the seeded pending invitation from Members at expiry", async ({
     app,
