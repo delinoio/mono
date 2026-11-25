@@ -143,10 +143,12 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
   const device = devices.data?.devices.find((d) => d.deviceId === s.deviceId);
   const ended =
     s.state === SandboxState.DELETED || s.state === SandboxState.FAILED;
-  const act = async (run: () => Promise<unknown>, done: string) => {
+  const act = async <T,>(
+    run: () => Promise<T>,
+    notify: (response: T) => void,
+  ) => {
     try {
-      await run();
-      toast.success(done);
+      notify(await run());
     } catch (error) {
       toastError(error);
     }
@@ -165,7 +167,18 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
               <Button
                 variant={ButtonVariant.Secondary}
                 onClick={() =>
-                  act(() => pause.mutateAsync(ids), "The sandbox is paused.")
+                  act(
+                    () => pause.mutateAsync(ids),
+                    ({ sandbox }) => {
+                      if (sandbox?.state === SandboxState.PAUSED) {
+                        toast.success("The sandbox is paused.");
+                      } else {
+                        toast.info(
+                          "Pause requested. Check the sandbox status.",
+                        );
+                      }
+                    },
+                  )
                 }
               >
                 Pause
@@ -174,7 +187,18 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
             {s.state === SandboxState.PAUSED ? (
               <Button
                 onClick={() =>
-                  act(() => resume.mutateAsync(ids), "The sandbox is running.")
+                  act(
+                    () => resume.mutateAsync(ids),
+                    ({ sandbox }) => {
+                      if (sandbox?.state === SandboxState.RUNNING) {
+                        toast.success("The sandbox is running.");
+                      } else {
+                        toast.info(
+                          "Resume requested. Check the sandbox status.",
+                        );
+                      }
+                    },
+                  )
                 }
               >
                 Resume
@@ -191,7 +215,7 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
                 onClick={() =>
                   act(
                     () => snapshot.mutateAsync(ids),
-                    "The snapshot is being created.",
+                    () => toast.success("The snapshot is being created."),
                   )
                 }
               >

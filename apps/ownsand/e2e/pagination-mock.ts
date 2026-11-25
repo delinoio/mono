@@ -20,6 +20,7 @@ import {
   createMockTransport as createBaseMock,
   MOCK_IDS,
 } from "../src/mock/mock-api.ts";
+import { browserSandboxTransitionMock } from "./sandbox-transition-mock.ts";
 
 const lists = {
   ListApiKeys: { field: "apiKeys", firstPageSize: 1 },
@@ -112,19 +113,21 @@ export function createMockTransport(): Transport {
     credentialList === "ListApiKeys" ? "apiKeys" : "tokens";
   let credentialCreated = false;
   // Seed enough rows to split the selected list across two pages.
-  const base = createBaseMock({
-    extraApiKeys: Number(methodName === "ListApiKeys"),
-    extraDevices: pageDevices ? 199 : 0,
-    extraEnrollmentTokens: Number(
-      methodName === "ListEnrollmentTokens" ||
-        refreshList === "ListEnrollmentTokens",
-    ),
-    extraInvitations: pageInvitations
-      ? Number(sessionStorage.getItem("ownsand-e2e-extra-invitations") ?? 200)
-      : 0,
-    extraSnapshots: pageSources ? 200 : 0,
-    extraTemplates: pageSources ? 200 : 0,
-  });
+  const base = browserSandboxTransitionMock(
+    createBaseMock({
+      extraApiKeys: Number(methodName === "ListApiKeys"),
+      extraDevices: pageDevices ? 199 : 0,
+      extraEnrollmentTokens: Number(
+        methodName === "ListEnrollmentTokens" ||
+          refreshList === "ListEnrollmentTokens",
+      ),
+      extraInvitations: pageInvitations
+        ? Number(sessionStorage.getItem("ownsand-e2e-extra-invitations") ?? 200)
+        : 0,
+      extraSnapshots: pageSources ? 200 : 0,
+      extraTemplates: pageSources ? 200 : 0,
+    }),
+  );
   const earlierAcceptance = createRouterTransport((router) => {
     router.rpc(MemberService.method.acceptInvitation, () => ({
       organization: { organizationId: MOCK_IDS.acme },
