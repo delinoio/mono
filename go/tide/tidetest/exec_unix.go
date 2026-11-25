@@ -5,15 +5,13 @@
 package tidetest
 
 import (
-	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"syscall"
 )
 
-func newExecCommand(ctx context.Context, args []string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+func configureExecCommand(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		// The command leads its own group. A negative PID signals every
@@ -24,5 +22,4 @@ func newExecCommand(ctx context.Context, args []string) *exec.Cmd {
 		}
 		return err
 	}
-	return cmd
 }
