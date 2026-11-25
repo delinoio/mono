@@ -15,6 +15,7 @@ func TestCanonical(t *testing.T) {
 	}{
 		{"https://accounts.delino.io", "https://accounts.delino.io", true},
 		{"HTTPS://Accounts.Delino.IO", "https://accounts.delino.io", true},
+		{"https://exa%25mple.test", "", false},
 		{"https://accounts.delino.io:443", "https://accounts.delino.io", true},
 		{"http://accounts.delino.io:80", "http://accounts.delino.io", true},
 		{"https://accounts.delino.io:0443", "https://accounts.delino.io", true},
