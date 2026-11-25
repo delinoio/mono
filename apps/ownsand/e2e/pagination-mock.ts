@@ -7,6 +7,7 @@ import {
 } from "@connectrpc/connect";
 import {
   MemberService,
+  type AcceptInvitationResponse,
   type ListInvitationsResponse,
   type RevokeInvitationRequest,
 } from "@delino/ownsand-protos/v1/member_pb";
@@ -245,6 +246,47 @@ export function createMockTransport(): Transport {
           input,
           contextValues,
         );
+      }
+      if (method.name === "AcceptInvitation") {
+        const mode = sessionStorage.getItem("ownsand-e2e-accept-response");
+        if (mode !== null) {
+          const count = Number(
+            sessionStorage.getItem("ownsand-e2e-accept-count"),
+          );
+          sessionStorage.setItem("ownsand-e2e-accept-count", String(count + 1));
+          const response = await base.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+          if (mode === "hold") {
+            await new Promise<void>((resolve) => {
+              window.addEventListener(
+                "ownsand-e2e-release-accept",
+                () => resolve(),
+                {
+                  once: true,
+                },
+              );
+              sessionStorage.setItem("ownsand-e2e-accept-held", "true");
+            });
+          }
+          const { organization } =
+            response.message as unknown as AcceptInvitationResponse;
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              organization:
+                mode === "empty-id" && organization
+                  ? { ...organization, organizationId: "" }
+                  : undefined,
+            },
+          };
+        }
       }
       if (
         pageInvitations &&

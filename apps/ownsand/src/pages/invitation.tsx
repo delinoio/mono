@@ -37,6 +37,7 @@ export function InvitationPage({ configured }: { configured: boolean }) {
     generation: 0,
   }));
   const { secret, generation } = invitation;
+  const [recoveryGeneration, setRecoveryGeneration] = useState<number>();
   const currentInvitation = useRef(invitation);
   const queryClient = useQueryClient();
   const accept = useMutation(MemberService.method.acceptInvitation, {
@@ -86,6 +87,18 @@ export function InvitationPage({ configured }: { configured: boolean }) {
           description="This page needs an invitation link. Ask an admin of the organization for a new one."
         />
         <Link to="/">Go to your organizations</Link>
+      </main>
+    );
+  }
+
+  if (recoveryGeneration === generation) {
+    return (
+      <main className="content content-narrow">
+        <PageHeader title="Join the organization" />
+        <div className="notice">
+          <p role="alert">You may have joined the organization.</p>
+          <Link to="/">Go to your organizations</Link>
+        </div>
       </main>
     );
   }
@@ -166,14 +179,19 @@ export function InvitationPage({ configured }: { configured: boolean }) {
                   (addressSecret === undefined || addressSecret === secret);
               }
               // The server request is not aborted. Only a result that still
-              // belongs to the shown invitation may change the route.
+              // belongs to the shown invitation may change the page.
               if (!current) {
+                return;
+              }
+              const organizationId = res.organization?.organizationId?.trim();
+              if (!organizationId) {
+                setRecoveryGeneration(generation);
                 return;
               }
               navigate(
                 routePath({
                   id: RouteId.Sandboxes,
-                  organizationId: res.organization!.organizationId,
+                  organizationId,
                 }),
                 { replace: true },
               );
