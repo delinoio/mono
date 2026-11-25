@@ -2,7 +2,7 @@
 import { useInfiniteQuery, useTransport } from "@connectrpc/connect-query";
 import { createClient } from "@connectrpc/connect";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
-import { useMemo } from "react";
+import { useLayoutEffect, useMemo, useRef } from "react";
 import { LIST_PAGE_SIZE } from "../../api.ts";
 import { useActionFailure } from "../../components/action-failure.tsx";
 import { useBillingAccount } from "../../components/shell.tsx";
@@ -22,26 +22,26 @@ import { formatUsd } from "../../money.ts";
 /**
  * Opens an empty tab synchronously, inside the click, so that pop-up
  * blockers allow it, and returns functions that navigate it to the invoice
- * once the link arrives or close it on failure.
+ * once the link arrives or close it on failure. A blocked pop-up can use the
+ * current tab while the initiating view is still active.
  */
 const invoiceWindow = {
-  prepare(): { navigate(url: string): void; close(): void } {
+  prepare(): {
+    navigate(url: string, canNavigateCurrentTab: boolean): void;
+    close(): void;
+  } {
     const opened = window.open("", "_blank");
     if (opened !== null) {
       // The invoice page must not reach back into the app.
       opened.opener = null;
     }
     return {
-      navigate(url) {
-        if (opened === null) {
-          // A blocked pop-up: open the invoice in this tab instead.
+      navigate(url, canNavigateCurrentTab) {
+        if (opened === null && canNavigateCurrentTab) {
           window.location.assign(url);
-        } else if (!opened.closed) {
+        } else if (opened !== null && !opened.closed) {
           opened.location.replace(url);
         }
-        // Otherwise the user closed the blank tab while the link was in
-        // flight. They no longer want the invoice, so discard the link and
-        // leave the billing page where it is.
       },
       close() {
         opened?.close();
@@ -74,14 +74,23 @@ export function InvoicesSection() {
   );
   const list = invoices.data?.pages.flatMap((page) => page.invoices) ?? [];
   const actionFailure = useActionFailure();
+  const viewSignal = useRef<AbortSignal | undefined>(undefined);
+  useLayoutEffect(() => {
+    const controller = new AbortController();
+    viewSignal.current = controller.signal;
+    // Revoke same-tab navigation as soon as this view leaves the screen.
+    return () => controller.abort();
+  }, [billingAccountId]);
+
   const open = async (invoice: Invoice) => {
+    const initiatingView = viewSignal.current;
     const target = invoiceWindow.prepare();
     try {
       const res = await client.getInvoiceUrl({
         billingAccountId,
         paddleTransactionId: invoice.paddleTransactionId,
       });
-      target.navigate(res.invoiceUrl);
+      target.navigate(res.invoiceUrl, initiatingView?.aborted === false);
       actionFailure.clear();
     } catch (error) {
       target.close();

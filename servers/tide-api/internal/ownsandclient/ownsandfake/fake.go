@@ -50,7 +50,8 @@ type Fake struct {
 	// createHook runs before each CreateSandbox call without the fake lock
 	// (for example to stall a call until its context ends); its error is
 	// the call's error.
-	createHook func(ctx context.Context) error
+	createHook func(context.Context, *ownsandv1.CreateSandboxRequest) error
+	deleteHook func(ctx context.Context) error
 }
 
 // Org is one fake OwnSand organization.
@@ -73,6 +74,8 @@ type Org struct {
 	// DeleteError, when set, is the error of the next DeleteSandbox calls
 	// (for example a transient OwnSand failure).
 	DeleteError error
+	// FileError, when set, is returned for reads, write chunks and finalization.
+	FileError error
 	// StartRunning makes new sandboxes RUNNING at once (the default);
 	// false keeps them CREATING until the test calls SetRunning.
 	StartRunning bool
@@ -273,6 +276,16 @@ func (c *client) TemplateGuestOS(ctx context.Context, templateID string) (ownsan
 // SetCreateHook sets the hook that runs before each CreateSandbox call; nil
 // removes it.
 func (f *Fake) SetCreateHook(fn func(ctx context.Context) error) {
+	if fn == nil {
+		f.SetCreateRequestHook(nil)
+		return
+	}
+	f.SetCreateRequestHook(func(ctx context.Context, _ *ownsandv1.CreateSandboxRequest) error { return fn(ctx) })
+}
+
+// SetCreateRequestHook sets a hook that can inspect each CreateSandbox request.
+// A nil hook removes it.
+func (f *Fake) SetCreateRequestHook(fn func(context.Context, *ownsandv1.CreateSandboxRequest) error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createHook = fn
@@ -283,7 +296,7 @@ func (c *client) CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandbox
 	hook := c.f.createHook
 	c.f.mu.Unlock()
 	if hook != nil {
-		if err := hook(ctx); err != nil {
+		if err := hook(ctx, req); err != nil {
 			return nil, err
 		}
 	}
@@ -354,7 +367,23 @@ func (c *client) GetSandbox(ctx context.Context, sandboxID string) (*ownsandv1.S
 	return proto.Clone(s.sb).(*ownsandv1.Sandbox), nil
 }
 
+// SetDeleteHook sets the hook that runs before each DeleteSandbox call. The
+// hook runs without the fake lock. Passing nil removes it.
+func (f *Fake) SetDeleteHook(fn func(ctx context.Context) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteHook = fn
+}
+
 func (c *client) DeleteSandbox(ctx context.Context, sandboxID string) (*ownsandv1.Sandbox, error) {
+	c.f.mu.Lock()
+	hook := c.f.deleteHook
+	c.f.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx); err != nil {
+			return nil, err
+		}
+	}
 	o, s, err := c.sandbox("DeleteSandbox", sandboxID)
 	if err != nil {
 		return nil, err
@@ -428,7 +457,12 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 		return 0, err
 	}
 	c.f.mu.Lock()
-	s := c.f.orgs[c.org].sandboxes[sandboxID]
+	org := c.f.orgs[c.org]
+	if err := org.FileError; err != nil {
+		c.f.mu.Unlock()
+		return 0, err
+	}
+	s := org.sandboxes[sandboxID]
 	snap, ok := s.reads[p.ReadID]
 	if !ok {
 		src, exists := s.files[p.Path]
@@ -477,7 +511,11 @@ func (w *fileWrite) send(offset int64, data []byte, size *int64) (*ownsandv1.Wri
 	}
 	w.c.f.mu.Lock()
 	defer w.c.f.mu.Unlock()
-	s := w.c.f.orgs[w.c.org].sandboxes[w.sandboxID]
+	org := w.c.f.orgs[w.c.org]
+	if err := org.FileError; err != nil {
+		return nil, err
+	}
+	s := org.sandboxes[w.sandboxID]
 	fw := s.writes[w.p.WriteID]
 	if fw == nil {
 		fw = &fakeWrite{path: w.p.Path, ranges: map[int64][]byte{}}

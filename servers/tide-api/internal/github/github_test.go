@@ -7,8 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,9 +22,14 @@ import (
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
+	"github.com/delinoio/mono/servers/tide-api/internal/app"
 	"github.com/delinoio/mono/servers/tide-api/internal/github"
 	"github.com/delinoio/mono/servers/tide-api/internal/githubapi"
+	"github.com/delinoio/mono/servers/tide-api/internal/githubapi/githubfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/lease"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
 	"github.com/delinoio/mono/servers/tide-api/internal/webhook"
 )
 
@@ -94,10 +103,20 @@ func TestJobLifecycle(t *testing.T) {
 	}
 	// The JIT runner exits after its job: tide deletes the sandbox and keeps
 	// the request until the completed event.
+	restore := w.env.FailProgramExitCommits()
+	eventually(t, "one AttachExec call", func() bool { return w.os.Calls("AttachExec") == 1 })
 	w.progs.exit(r.GetOwnsandSandboxId())
+	eventually(t, "PostgreSQL rejecting the exit commit", func() bool {
+		return strings.Contains(w.env.Logs.String(), "injected program exit commit failure")
+	})
+	if w.runner(t, r.GetRunnerId()).GetState() != tidev1.RunnerState_RUNNER_STATE_BUSY ||
+		w.requestOfJob(t, 9001).GetState() != tidev1.RequestState_REQUEST_STATE_RUNNING || w.os.Active(w.osOrg) != 1 {
+		t.Fatal("the failed exit commit changed the runner or request")
+	}
+	restore()
 	eventually(t, "runner deleted", func() bool { return w.runner(t, r.GetRunnerId()).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED })
 	if got := w.runner(t, r.GetRunnerId()); got.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE ||
-		w.requestOfJob(t, 9001).GetState() != tidev1.RequestState_REQUEST_STATE_RUNNING {
+		w.requestOfJob(t, 9001).GetState() != tidev1.RequestState_REQUEST_STATE_RUNNING || w.os.Active(w.osOrg) != 0 || w.os.Calls("AttachExec") != 1 {
 		t.Fatalf("runner %v", got)
 	}
 	w.send(t, "workflow_job", job("completed", 501, 9001, tideLinux, "tide-"+r.GetRunnerId()))
@@ -665,6 +684,92 @@ func TestLostDeliveries(t *testing.T) {
 	w.l.GitHub.Wait()
 }
 
+func TestLostDeliveriesBeyondPage100(t *testing.T) {
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	w.link(t, 501, "acme")
+	w.createProfile(t, ghProfile("linux", 0))
+	ctx := t.Context()
+
+	w.env.Clock.Advance(-24 * time.Hour)
+	w.gh.SendLost("workflow_job", job("queued", 501, 7, tideLinux, ""))
+	w.env.Clock.Advance(24 * time.Hour)
+	now := w.env.Clock.Now()
+	recorded := make([]string, 0, 10_000)
+	for range 10_000 {
+		recorded = append(recorded, w.gh.SendLost("workflow_job", nil))
+	}
+	if _, err := w.env.DB.Pool.Exec(ctx, `INSERT INTO webhook_deliveries (sender, delivery_id, receive_time)
+		SELECT $1, guid, $2 FROM unnest($3::text[]) AS guid`, int16(webhook.SenderGitHub), now, recorded); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := w.l.GitHub.RedeliverOnce(ctx); n != 1 {
+		t.Fatalf("requested %d redeliveries, want 1", n)
+	}
+	if calls := w.gh.Calls("list_hook_deliveries"); calls != 101 {
+		t.Errorf("listed %d pages, want 101", calls)
+	}
+	if calls := w.gh.Calls("redeliver_hook_delivery"); calls != 1 {
+		t.Errorf("sent %d redelivery requests, want 1", calls)
+	}
+	eventually(t, "redelivered request", func() bool { return w.requestOfJob(t, 7) != nil })
+}
+
+func TestLostDeliveriesIncompleteListing(t *testing.T) {
+	f := githubfake.New(nil)
+	t.Cleanup(f.Server.Close)
+	for _, mode := range []string{"http error", "canceled"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var pages, attempts atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					attempts.Add(1)
+					w.WriteHeader(http.StatusAccepted)
+					return
+				}
+				if pages.Add(1) == 1 {
+					w.Header().Set("Link", fmt.Sprintf(`<http://%s/app/hook/deliveries?cursor=2>; rel="next"`, r.Host))
+					err := json.NewEncoder(w).Encode([]githubapi.Delivery{{ID: 1, GUID: "unseen", DeliveredAt: time.Now(), StatusCode: 500}})
+					if err != nil {
+						t.Errorf("encode deliveries: %v", err)
+					}
+					return
+				}
+				if mode == "canceled" {
+					cancel()
+					<-r.Context().Done()
+					return
+				}
+				http.Error(w, "listing failed", http.StatusBadGateway)
+			}))
+			t.Cleanup(upstream.Close)
+			cfg := f.Config()
+			cfg.APIOrigin = upstream.URL
+			opts := layers.Options{GitHub: github.Options{
+				Client:        githubapi.New(cfg, upstream.Client(), slog.New(slog.DiscardHandler), nil),
+				WebhookSecret: f.WebhookSecret,
+			}}
+			var l layers.Layers
+			env := testenv.New(t, testenv.WithLayerOptions(opts, &l), func(ao *app.Options) {
+				// Hold the lease elsewhere so only the explicit pass runs.
+				if _, err := ao.DB.Pool.Exec(t.Context(), "INSERT INTO instance_leases (lease_name, holder, expire_time) VALUES ($1, $2, $3)",
+					lease.Name, "manual-redelivery", ao.Now().Add(time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			})
+
+			if n := l.GitHub.RedeliverOnce(ctx); n != 0 || attempts.Load() != 0 || pages.Load() != 2 {
+				t.Errorf("requested %d redeliveries after %d page requests and %d attempts", n, pages.Load(), attempts.Load())
+			}
+			if mode == "http error" && !strings.Contains(env.Logs.String(), "github_redelivery_list_failed") {
+				t.Error("the later page failure did not take the listing-error path")
+			}
+		})
+	}
+}
+
 // TestCompletedBeforeQueued: a completed event of a job without a request
 // (its queued delivery failed and waits for the redelivery) stores an
 // ended request, so the late queued and in_progress deliveries start
@@ -730,6 +835,119 @@ func TestJobWaitsForDeactivation(t *testing.T) {
 	}
 	if n := len(w.requests(t)); n != 0 {
 		t.Fatalf("%d requests for a suspended installation", n)
+	}
+}
+
+func TestJobWaitsForProfileChange(t *testing.T) {
+	for _, tc := range []struct {
+		name, action, change string
+	}{
+		{"queued after delete", "queued", "DELETE FROM runner_profiles WHERE runner_profile_id = $1"},
+		{"in progress after delete", "in_progress", "DELETE FROM runner_profiles WHERE runner_profile_id = $1"},
+		{"completed after delete", "completed", "DELETE FROM runner_profiles WHERE runner_profile_id = $1"},
+		{"queued after rename", "queued", "UPDATE runner_profiles SET name = 'renamed' WHERE runner_profile_id = $1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newGHWorld(t, worldOpts{manualDispatch: true})
+			w.link(t, 501, "acme")
+			profileID := w.createProfile(t, ghProfile("linux", 0))
+			ctx := t.Context()
+			tx, err := w.env.DB.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			if _, err := tx.Exec(ctx, "SELECT 1 FROM runner_profiles WHERE runner_profile_id = $1 FOR UPDATE", profileID); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan int, 1)
+			go func() {
+				_, status := w.gh.Send("workflow_job", job(tc.action, 501, 60, tideLinux, ""))
+				done <- status
+			}()
+			eventually(t, "delivery to wait for the profile lock", func() bool {
+				select {
+				case status := <-done:
+					t.Fatalf("delivery finished before the profile changed (status %d)", status)
+				default:
+				}
+				var waiting bool
+				if err := w.env.DB.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+					WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)))`, tx.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				return waiting
+			})
+			if _, err := tx.Exec(ctx, tc.change, profileID); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if status := <-done; status != http.StatusNoContent {
+				t.Fatalf("status %d, want %d", status, http.StatusNoContent)
+			}
+			if !strings.Contains(w.env.Logs.String(), `"detail":"labels match no runner profile"`) {
+				t.Error("delivery did not report that the labels match no runner profile")
+			}
+			if got := len(w.requests(t)); got != 0 {
+				t.Errorf("%d requests, want none", got)
+			}
+			var jobs int
+			if err := w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM github_jobs WHERE organization_id = $1", w.org.ID).Scan(&jobs); err != nil || jobs != 0 {
+				t.Errorf("%d GitHub jobs, want none (query error %v)", jobs, err)
+			}
+		})
+	}
+}
+
+func TestQueuedJobsShareProfileLock(t *testing.T) {
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	w.link(t, 501, "acme")
+	profileID := w.createProfile(t, ghProfile("linux", 0))
+	ctx := t.Context()
+	tx, err := w.env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM runner_profiles WHERE runner_profile_id = $1 FOR SHARE", profileID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 2)
+	for _, id := range []int64{60, 61} {
+		go func() {
+			_, status := w.gh.Send("workflow_job", job("queued", 501, id, tideLinux, ""))
+			done <- status
+		}()
+	}
+	timeout := time.After(10 * time.Second)
+	for range 2 {
+		select {
+		case status := <-done:
+			if status != http.StatusNoContent {
+				t.Fatalf("status %d, want %d", status, http.StatusNoContent)
+			}
+		case <-timeout:
+			t.Fatal("queued jobs did not finish while a shared profile lock was held")
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+		OrganizationId: w.org.ID, RunnerProfileId: profileID,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	requests := w.requests(t)
+	if len(requests) != 2 {
+		t.Fatalf("%d requests, want 2", len(requests))
+	}
+	for _, r := range requests {
+		if r.GetState() != tidev1.RequestState_REQUEST_STATE_CANCELED || r.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_PROFILE_DELETED {
+			t.Errorf("request state %v and end reason %v, want CANCELED and PROFILE_DELETED", r.GetState(), r.GetEndReason())
+		}
 	}
 }
 

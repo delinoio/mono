@@ -363,10 +363,10 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 			if _, err := a.env.Stdout.Write(ev.Data); err != nil {
 				return &localWriteError{err: err}
 			}
-			return nil
 		case ownsand.ExecEventStderr:
-			_, err := a.env.Stderr.Write(ev.Data)
-			return err
+			if _, err := a.env.Stderr.Write(ev.Data); err != nil {
+				return &localWriteError{err: err}
+			}
 		case ownsand.ExecEventOutputTruncated:
 			var parts []string
 			if !ev.MissingStdout.Empty() {
@@ -389,9 +389,8 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 		}
 		var lw *localWriteError
 		if errors.As(err, &lw) {
-			// The local standard output rejected the guest output. The data
-			// path worked, so this is an ordinary CLI error (exit 1 with the
-			// write error on standard error), like a failed result write.
+			// The CLI received the guest output. A local write failure uses
+			// the ordinary CLI error status.
 			return lw.err
 		}
 		var dp *ownsand.DataPathError
@@ -661,7 +660,7 @@ func openDownloadTarget(ctx context.Context, to string) (*downloadTarget, error)
 	info, err := os.Stat(to)
 	switch {
 	case err == nil && !info.Mode().IsRegular():
-		f, err := openWriteOnlyOrCancel(ctx, to)
+		f, err := openFileOrCancel(ctx, to, os.O_WRONLY)
 		if err != nil {
 			return nil, err
 		}
@@ -711,35 +710,37 @@ func openDownloadTarget(ctx context.Context, to string) (*downloadTarget, error)
 	return nil, fmt.Errorf("create a temporary file beside %s: too many name collisions", to)
 }
 
-// openWriteOnlyOrCancel opens an existing file that is not a regular file for
-// writing. Opening a FIFO for writing blocks until a reader opens it, and
-// open(2) does not observe a context, so the open runs in its own goroutine
-// and a cancelled ctx ends the wait with ctx.Err(). The goroutine stays
-// blocked in open(2) until a reader appears or the process exits (the command
-// ends right after the cancellation); when the open succeeds after the
-// cancellation, the goroutine closes the file, so no descriptor leaks in a
-// long-lived caller.
-func openWriteOnlyOrCancel(ctx context.Context, to string) (*os.File, error) {
+// openFileOrCancel opens an existing path for reading or writing. A FIFO open
+// blocks until the other end opens. Cancellation ends the caller's wait, but
+// open(2) stays blocked until the other end opens or the process exits. If
+// the open returns after cancellation, the helper closes the descriptor.
+func openFileOrCancel(ctx context.Context, path string, flag int) (*os.File, error) {
 	type opened struct {
 		f   *os.File
 		err error
 	}
-	// The channel has room for the one result, so the goroutine never blocks
-	// on a send that nobody receives.
-	ch := make(chan opened, 1)
+	// An unbuffered send transfers ownership only when the caller receives it.
+	ch := make(chan opened)
 	go func() {
-		f, err := os.OpenFile(to, os.O_WRONLY, 0)
-		ch <- opened{f, err}
+		f, err := os.OpenFile(path, flag, 0)
+		select {
+		case ch <- opened{f, err}:
+		case <-ctx.Done():
+			if f != nil {
+				_ = f.Close()
+			}
+		}
 	}()
 	select {
 	case o := <-ch:
-		return o.f, o.err
-	case <-ctx.Done():
-		go func() {
-			if o := <-ch; o.f != nil {
+		if err := ctx.Err(); err != nil {
+			if o.f != nil {
 				_ = o.f.Close()
 			}
-		}()
+			return nil, err
+		}
+		return o.f, o.err
+	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
@@ -868,7 +869,7 @@ func (a *app) fileWrite(ctx context.Context, name string, args []string) error {
 	// when an interrupt cancels ctx.
 	var r io.Reader = newCtxReader(ctx, a.env.Stdin)
 	if *from != "" {
-		f, err := os.Open(*from)
+		f, err := openFileOrCancel(ctx, *from, os.O_RDONLY)
 		if err != nil {
 			return err
 		}
@@ -892,8 +893,7 @@ func (a *app) fileWrite(ctx context.Context, name string, args []string) error {
 	return nil
 }
 
-// localWriteError marks a failed write of guest output to the local standard
-// output, so that exec does not report it as a data path failure.
+// localWriteError identifies a failed local write of guest stdout or stderr.
 type localWriteError struct{ err error }
 
 func (e *localWriteError) Error() string { return e.err.Error() }

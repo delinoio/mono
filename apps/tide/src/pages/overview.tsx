@@ -4,14 +4,12 @@ import { useQuery, useTransport } from "@connectrpc/connect-query";
 import { BadgeVariant } from "delino-ui/badge";
 import { DeviceState, RunnerState } from "@delino/tide-protos/v1/common_pb";
 import { OwnSandLinkService } from "@delino/tide-protos/v1/ownsand_link_pb";
-import { RunnerProfileService } from "@delino/tide-protos/v1/runner_profile_pb";
 import {
   type DeviceCapacity,
   WorkService,
 } from "@delino/tide-protos/v1/work_pb";
 import { useEffect, useMemo, useReducer, useState } from "react";
 import { watchQueue } from "tide-sdk";
-import { MAX_PAGE_SIZE } from "../api.ts";
 import { SetupGuide } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
@@ -19,6 +17,7 @@ import {
   ErrorNotice,
   Loading,
   PageHeader,
+  QueryBoundary,
   ShortId,
   StateBadge,
 } from "../components/ui.tsx";
@@ -31,6 +30,7 @@ import {
   QueueViewActionKind,
   waitingInQueueOrder,
 } from "../queue.ts";
+import { useRunnerProfiles } from "../runner-profiles.ts";
 
 const RUNNER_ORDER = [
   RunnerState.CREATING,
@@ -45,6 +45,7 @@ const LIVE_TEXT: Record<LiveState, string> = {
   [LiveState.Connecting]: "Connecting",
   [LiveState.Live]: "Live",
   [LiveState.Reconnecting]: "Reconnecting",
+  [LiveState.Disconnected]: "Disconnected",
 };
 
 /** How often the waiting time of queued requests is redrawn. */
@@ -85,21 +86,19 @@ export function OverviewPage() {
           dispatch(event);
         }
       } catch (error) {
-        if (!abort.signal.aborted) setStreamError(error);
+        if (!abort.signal.aborted) {
+          dispatch({ kind: QueueViewActionKind.StreamFailed });
+          setStreamError(error);
+        }
       }
     })();
     return () => abort.abort();
   }, [transport, organizationId, attempt]);
 
-  const profiles = useQuery(RunnerProfileService.method.listRunnerProfiles, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const profiles = useRunnerProfiles(organizationId);
   const profileNames = useMemo(
     () =>
-      new Map(
-        (profiles.data?.profiles ?? []).map((p) => [p.runnerProfileId, p.name]),
-      ),
+      new Map((profiles.data ?? []).map((p) => [p.runnerProfileId, p.name])),
     [profiles.data],
   );
   const capacity = useQuery(WorkService.method.getCapacity, { organizationId });
@@ -146,6 +145,13 @@ export function OverviewPage() {
       ) : null}
       <section className="section" aria-labelledby="queue-title">
         <h2 id="queue-title">Waiting requests</h2>
+        {profiles.error ? (
+          <ErrorNotice
+            title="Could not load runner profiles."
+            error={profiles.error}
+            onRetry={() => void profiles.refetch()}
+          />
+        ) : null}
         {view.live === LiveState.Connecting ? (
           <Loading label="Loading the queue" />
         ) : waiting.length === 0 ? (
@@ -228,40 +234,37 @@ export function OverviewPage() {
             </>
           ) : null}
         </p>
-        {capacity.isPending ? (
-          <Loading label="Loading the device pool" />
-        ) : capacity.error ? (
-          <ErrorNotice
-            error={capacity.error}
-            onRetry={() => void capacity.refetch()}
-          />
-        ) : capacity.data.devices.length === 0 ? (
-          <Empty title="No devices">
-            Link an OwnSand organization with devices, or enroll a device in the
-            OwnSand console.
-          </Empty>
-        ) : (
-          <div className="table-wrap">
-            <table className="table" aria-label="Devices">
-              <thead>
-                <tr>
-                  <th scope="col">Device</th>
-                  <th scope="col">State</th>
-                  <th scope="col">Platform</th>
-                  <th scope="col">vCPUs</th>
-                  <th scope="col">Memory</th>
-                  <th scope="col">Disk</th>
-                  <th scope="col">tide runners</th>
-                </tr>
-              </thead>
-              <tbody>
-                {capacity.data.devices.map((d) => (
-                  <DeviceRow key={d.ownsandDeviceId} device={d} />
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+        <QueryBoundary query={capacity} loading="Loading the device pool">
+          {(data) =>
+            data.devices.length === 0 ? (
+              <Empty title="No devices">
+                Link an OwnSand organization with devices, or enroll a device in
+                the OwnSand console.
+              </Empty>
+            ) : (
+              <div className="table-wrap">
+                <table className="table" aria-label="Devices">
+                  <thead>
+                    <tr>
+                      <th scope="col">Device</th>
+                      <th scope="col">State</th>
+                      <th scope="col">Platform</th>
+                      <th scope="col">vCPUs</th>
+                      <th scope="col">Memory</th>
+                      <th scope="col">Disk</th>
+                      <th scope="col">tide runners</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.devices.map((d) => (
+                      <DeviceRow key={d.ownsandDeviceId} device={d} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )
+          }
+        </QueryBoundary>
       </section>
     </>
   );

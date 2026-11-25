@@ -4,8 +4,11 @@ package e2e
 
 import (
 	"os"
+	"os/signal"
+	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -20,8 +23,12 @@ type helperMode string
 const (
 	// helperExit writes the output and exits with status 0.
 	helperExit helperMode = "exit"
+	// helperFail writes the output and exits with status 1.
+	helperFail helperMode = "fail"
 	// helperBlock writes the output and waits until it is signaled.
 	helperBlock helperMode = "block"
+	// helperTerminate waits for SIGTERM and logs that it received the signal.
+	helperTerminate helperMode = "terminate"
 )
 
 // TestHelperProcess is the body of the child process, not a test. The final
@@ -31,10 +38,24 @@ func TestHelperProcess(t *testing.T) {
 	if mode == "" {
 		t.Skip("only runs as a helper process")
 	}
+	if mode == helperTerminate {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		os.Stderr.WriteString("ready\n")
+		select {
+		case <-signals:
+			os.Stderr.WriteString("sigterm\n")
+		case <-time.After(time.Minute):
+			os.Exit(2)
+		}
+	}
 	os.Stdout.WriteString("out-1\nout-final")
 	os.Stderr.WriteString("err-1\nerr-final")
 	if mode == helperBlock {
 		time.Sleep(time.Minute)
+	}
+	if mode == helperFail {
+		os.Exit(1)
 	}
 	os.Exit(0)
 }
@@ -72,16 +93,24 @@ func assertNoScanners(t *testing.T, logs *logSink) {
 func TestStartProcessExitReleasesLogs(t *testing.T) {
 	logs := &logSink{}
 	bin, args := helperArgs()
-	p, err := launchProcess(logs, "child", []string{envHelperMode + "=" + string(helperExit)}, bin, args...)
-	if err != nil {
-		t.Fatal(err)
+	var cleanupStarted time.Time
+	if !t.Run("run", func(t *testing.T) {
+		p := startProcess(t, logs, "child", []string{envHelperMode + "=" + string(helperExit)}, bin, args...)
+		select {
+		case <-p.done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the process did not finish")
+		}
+		if !p.cmd.ProcessState.Success() {
+			t.Fatalf("the process did not exit successfully: %v", p.cmd.ProcessState)
+		}
+		cleanupStarted = time.Now()
+	}) {
+		return
 	}
-	select {
-	case <-p.done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the process did not finish")
+	if elapsed := time.Since(cleanupStarted); elapsed >= 10*time.Second {
+		t.Errorf("cleanup of an exited process took %s, want under 10s", elapsed)
 	}
-	// The scanners are joined before done closes, so no waiting is needed.
 	assertNoScanners(t, logs)
 	assertHelperLines(t, logs, "child")
 }
@@ -89,22 +118,36 @@ func TestStartProcessExitReleasesLogs(t *testing.T) {
 func TestStartProcessCleanupStopsAndReleasesLogs(t *testing.T) {
 	logs := &logSink{}
 	bin, args := helperArgs()
+	mode, ready := helperTerminate, "child: ready"
+	if runtime.GOOS == "windows" {
+		mode, ready = helperBlock, "child: err-1"
+	}
 	var p *proc
-	t.Run("run", func(t *testing.T) {
-		p = startProcess(t, logs, "child", []string{envHelperMode + "=" + string(helperBlock)}, bin, args...)
+	var cleanupStarted time.Time
+	if !t.Run("run", func(t *testing.T) {
+		p = startProcess(t, logs, "child", []string{envHelperMode + "=" + string(mode)}, bin, args...)
 		deadline := time.Now().Add(30 * time.Second)
-		for !logs.hasLine("child: err-1") {
+		for !logs.hasLine(ready) {
 			if time.Now().After(deadline) {
-				t.Fatal("the process wrote no output")
+				t.Fatalf("the process did not log %q", ready)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-	})
+		cleanupStarted = time.Now()
+	}) {
+		return
+	}
+	if elapsed := time.Since(cleanupStarted); runtime.GOOS == "windows" && elapsed >= 10*time.Second {
+		t.Errorf("Windows cleanup took %s, want under 10s", elapsed)
+	}
 	// The subtest cleanup stopped the process.
 	select {
 	case <-p.done:
 	default:
 		t.Fatal("the process is still running after the cleanup")
+	}
+	if mode == helperTerminate && !logs.hasLine("child: sigterm") {
+		t.Error("the process did not log that it received SIGTERM")
 	}
 	assertNoScanners(t, logs)
 	assertHelperLines(t, logs, "child")

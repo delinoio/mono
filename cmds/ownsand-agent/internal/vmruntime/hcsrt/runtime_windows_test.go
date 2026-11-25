@@ -10,8 +10,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // failOpenSystem makes openSystemFunc return err for the test.
@@ -292,6 +298,136 @@ func TestCopyFileEndsWithItsContext(t *testing.T) {
 	}
 	if _, err := os.Stat(bigDst); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("partial copy remains after a canceled copy: %v", err)
+	}
+}
+
+func TestCreateRejectsUndersizedLinuxBaseDisk(t *testing.T) {
+	dir := t.TempDir()
+	kernel, rootfs := filepath.Join(dir, "vmlinux"), filepath.Join(dir, "rootfs.ext4")
+	for _, path := range []string{kernel, rootfs} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Truncate(rootfs, 2<<30); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runtime{opts: Options{Kernel: kernel, Rootfs: rootfs, VMsDir: dir}}
+	// A path under a regular file cannot be prepared. The disk-size error
+	// must occur before the runtime reaches that step.
+	spec := vmruntime.Spec{
+		SandboxID: "sandbox",
+		GuestOS:   ownsandv1.GuestOs_GUEST_OS_LINUX,
+		Dir:       filepath.Join(kernel, "vm"),
+		Resources: &ownsandv1.Resources{DiskGib: 1},
+	}
+	vm, err := r.Create(t.Context(), spec)
+	if vm != nil || !errors.Is(err, vmruntime.ErrUnsupported) ||
+		!strings.Contains(err.Error(), "needs at least 2 GiB of disk (requested 1 GiB)") {
+		t.Fatalf("Create = %v, %v, want the disk-size error", vm, err)
+	}
+}
+
+func TestDiskPreparationCancellation(t *testing.T) {
+	const (
+		linux    = ownsandv1.GuestOs_GUEST_OS_LINUX
+		windows  = ownsandv1.GuestOs_GUEST_OS_WINDOWS
+		copyDisk = "copy disk"
+		growDisk = "grow disk"
+		copyMeta = "copy metadata"
+	)
+	for _, tc := range []struct {
+		name      string
+		guestOS   ownsandv1.GuestOs
+		wantCalls []string
+		abortCopy bool
+	}{
+		{"Linux copy interrupted", linux, []string{copyDisk}, true},
+		{"Linux copy finishes as cancellation arrives", linux, []string{copyDisk}, false},
+		{"Linux growth in progress", linux, []string{copyDisk, growDisk}, false},
+		{"Windows copy interrupted", windows, []string{copyDisk}, true},
+		{"Windows copy finishes as cancellation arrives", windows, []string{copyDisk}, false},
+		{"Windows growth in progress", windows, []string{copyDisk, growDisk}, false},
+		{"Windows metadata copy interrupted", windows, []string{copyDisk, growDisk, copyMeta}, true},
+		{"Windows metadata finishes as cancellation arrives", windows, []string{copyDisk, growDisk, copyMeta}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			r := &Runtime{
+				opts:   Options{Kernel: filepath.Join(dir, "kernel"), VMsDir: dir},
+				logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+				vms:    map[string]*vm{},
+			}
+			if err := os.WriteFile(r.opts.Kernel, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			failOpenSystem(t, &hcsError{op: "HcsOpenComputeSystem", hr: hrSystemNotFound})
+			spec := vmruntime.Spec{
+				SandboxID: "sandbox",
+				GuestOS:   tc.guestOS,
+				Dir:       r.vmDir("sandbox"),
+				Resources: &ownsandv1.Resources{DiskGib: 2},
+			}
+			if tc.guestOS == windows {
+				spec.Snapshot = &vmruntime.SnapshotSource{Dir: filepath.Join(dir, "snapshot")}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			cancelAt := tc.wantCalls[len(tc.wantCalls)-1]
+			var calls []string
+			record := func(call string) {
+				calls = append(calls, call)
+				if call == cancelAt {
+					cancel()
+				}
+			}
+			grow := func(_ string, size int64) (int64, error) {
+				record(growDisk)
+				return size, nil
+			}
+			ops := vmCreateOps{
+				copyFile: func(copyCtx context.Context, src, dst string) error {
+					if copyCtx != ctx || copyCtx.Err() != nil {
+						t.Fatalf("copy %q requires the live create context", src)
+					}
+					if err := os.WriteFile(dst, []byte("copy"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					if filepath.Base(dst) == images.MetadataFile {
+						record(copyMeta)
+					} else {
+						record(copyDisk)
+					}
+					if tc.abortCopy && copyCtx.Err() != nil {
+						if err := os.Remove(dst); err != nil {
+							t.Fatal(err)
+						}
+						return copyCtx.Err()
+					}
+					return nil
+				},
+				makeFixedVHD: func(path string, size int64, _ bool) (int64, error) {
+					return grow(path, size)
+				},
+				growVHDX: grow,
+				createSystem: func(string, any) (*system, error) {
+					t.Fatal("attempted to create a compute system after cancellation")
+					return nil, nil
+				},
+			}
+			if v, err := r.createVM(ctx, spec, ops); v != nil || !errors.Is(err, context.Canceled) {
+				t.Fatalf("create returned VM %v, error %v, want context.Canceled", v, err)
+			}
+			if !slices.Equal(calls, tc.wantCalls) {
+				t.Errorf("disk operations %v, want %v", calls, tc.wantCalls)
+			}
+			if len(r.vms) != 0 {
+				t.Error("canceled create left a VM registered")
+			}
+			if _, err := os.Stat(spec.Dir); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("VM directory remains after canceled create: %v", err)
+			}
+		})
 	}
 }
 

@@ -485,13 +485,13 @@ async function* mapEvents(
  */
 export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
   readonly execId: string;
-  readonly #generator: AsyncGenerator<ExecStreamEvent, ExecResult>;
+  readonly #generator: AsyncGenerator<ExecStreamEvent, ExecResult | undefined>;
   readonly #selector: DataPathSelector;
   readonly #hold: ConsumerHold | undefined;
   #iterated = false;
   #result: ExecResult | undefined;
   /**
-   * The first rejection of the generator. It is boxed because an abort reason
+   * The first failure of the stream. It is boxed because an abort reason
    * can be any value, including `undefined`, so the box tells "failed" apart
    * from "not failed".
    */
@@ -503,10 +503,13 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
    * produces an unhandled rejection. The first reader takes it.
    */
   #primed:
-    | Promise<
-        | { readonly next: IteratorResult<ExecStreamEvent, ExecResult> }
-        | { readonly error: unknown }
-      >
+    | {
+        readonly read: Promise<
+          | { readonly next: IteratorResult<ExecStreamEvent, ExecResult> }
+          | { readonly error: unknown }
+        >;
+        readonly callerSignal: AbortSignal | undefined;
+      }
     | undefined;
 
   /**
@@ -524,16 +527,20 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
     selector: DataPathSelector,
     hold?: ConsumerHold,
     startNow = false,
+    callerSignal?: AbortSignal,
   ) {
     this.#hold = hold;
     this.execId = execId;
     this.#generator = generator;
     this.#selector = selector;
     if (startNow) {
-      this.#primed = generator.next().then(
-        (next) => ({ next }),
-        (error: unknown) => ({ error }),
-      );
+      this.#primed = {
+        read: generator.next().then(
+          (next) => ({ next }),
+          (error: unknown) => ({ error }),
+        ),
+        callerSignal,
+      };
     }
   }
 
@@ -612,24 +619,35 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
    * and every read that ends without a result after it, and every later
    * read, rethrows the same rejection.
    */
-  async #read(): Promise<IteratorResult<ExecStreamEvent, ExecResult>> {
+  async #read(): Promise<
+    IteratorResult<ExecStreamEvent, ExecResult | undefined>
+  > {
     if (this.#failure !== undefined && this.#result === undefined) {
       throw this.#failure.error;
     }
-    let next: IteratorResult<ExecStreamEvent, ExecResult>;
+    let next: IteratorResult<ExecStreamEvent, ExecResult | undefined>;
     try {
       const primed = this.#primed;
-      this.#primed = undefined;
       if (primed !== undefined) {
         // The event that the stream yielded at creation is now held by this
         // reader, so the idle clock pauses until the reader asks for more.
         this.#hold?.claim();
-        const settled = await primed;
-        if ("error" in settled) throw settled.error;
-        next = settled.next;
-      } else {
-        next = await this.#generator.next();
+        const settled = await primed.read;
+        // Readers wait for the same first read. Only the first reader can
+        // take the cached event or close the stream and record cancellation.
+        if (this.#primed === primed) {
+          this.#primed = undefined;
+          if ("error" in settled) throw settled.error;
+          if (!settled.next.done && primed.callerSignal?.aborted) {
+            this.#failure = { error: primed.callerSignal.reason };
+            await this.#generator.return(undefined);
+            throw this.#failure.error;
+          }
+          return settled.next;
+        }
+        if (this.#failure !== undefined) throw this.#failure.error;
       }
+      next = await this.#generator.next();
     } catch (error) {
       this.#failure ??= { error };
       throw this.#failure.error;

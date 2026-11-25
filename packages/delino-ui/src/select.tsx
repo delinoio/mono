@@ -109,7 +109,9 @@ export function Select({
             />
           </svg>
         </SelectTrigger>
-        <SelectContent className="dui-select-content">{children}</SelectContent>
+        <SelectContent className="dui-select-content">
+          {withBigintOptionLabels(children)}
+        </SelectContent>
       </SelectRoot>
       {/* Workaround: the UI SDK Field predicts the description id in
           aria-describedby before the field binds on the client, so static
@@ -137,19 +139,22 @@ export type SelectOptionProps = Omit<
   "children"
 > & {
   /**
-   * The visible name of the option. Text, numbers and nested elements are
-   * allowed; an option whose children hold no text shows its value.
+   * The visible name of the option. Strings, numbers, bigints and nested
+   * elements are allowed. An option whose children hold no text shows its value.
    */
   children: React.ReactNode;
 };
 
 /**
- * Collects the text of `node` the way it renders: strings and numbers as they
- * are, arrays and element children in order, and nothing for booleans, null
- * and undefined.
+ * Collects text from strings, numbers and bigints. Reads arrays and element
+ * children in order and skips booleans, null and undefined.
  */
 function nodeText(node: React.ReactNode): string {
-  if (typeof node === "string" || typeof node === "number") {
+  if (
+    typeof node === "string" ||
+    typeof node === "number" ||
+    typeof node === "bigint"
+  ) {
     return String(node);
   }
   if (Array.isArray(node)) {
@@ -159,6 +164,43 @@ function nodeText(node: React.ReactNode): string {
     return nodeText(node.props.children);
   }
   return "";
+}
+
+function hasBigintChild(node: React.ReactNode): boolean {
+  if (Array.isArray(node)) {
+    return node.some(hasBigintChild);
+  }
+  if (React.isValidElement<{ children?: React.ReactNode }>(node)) {
+    return hasBigintChild(node.props.children);
+  }
+  return typeof node === "bigint";
+}
+
+// UI SDK learns selected labels from the JSX tree before SelectOption renders.
+// Supply the derived label for options with bigint children so closed and
+// server-rendered selects show those digits. Remove this step when UI SDK
+// learns bigint text from children itself.
+function withBigintOptionLabels(node: React.ReactNode): React.ReactNode {
+  if (Array.isArray(node)) {
+    return node.map(withBigintOptionLabels);
+  }
+  if (
+    !React.isValidElement<{ children?: React.ReactNode; label?: string }>(node)
+  ) {
+    return node;
+  }
+
+  const { children, label } = node.props;
+  if (node.type === SelectOption) {
+    return label == null && hasBigintChild(children)
+      ? React.cloneElement(node, { label: nodeText(children) })
+      : node;
+  }
+
+  const nested = withBigintOptionLabels(children);
+  return nested === children
+    ? node
+    : React.cloneElement(node, { children: nested });
 }
 
 /** One option of a `Select`. A check marks the selected option. */

@@ -243,9 +243,8 @@ func TestExecNoTimeoutWhenDescendantHoldsPipeAfterExit(t *testing.T) {
 	evs := h.runExec(req)
 	elapsed := time.Since(start)
 	pid := waitForPidFile(t, pidFile)
-	ex := evs[len(evs)-1].GetExited()
-	if ex.GetTimedOut() || ex.GetExitCode() != 0 {
-		t.Fatalf("exited %v after %v", ex, elapsed)
+	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+		t.Fatalf("exec ended after %v: %v", elapsed, err)
 	}
 	if elapsed < req.GetTimeout().AsDuration() {
 		t.Fatalf("the command ended after %v, before its timeout, so the test did not cover the drain", elapsed)
