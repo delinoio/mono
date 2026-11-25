@@ -672,6 +672,10 @@ func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool, dispa
 		if err != nil || req.State != reqQueued {
 			return err
 		}
+		ended, err = e.expireQueuedTx(ctx, tx, req)
+		if err != nil || ended != nil {
+			return err
+		}
 		ended, _, err = e.endRequestTx(ctx, tx, requestID, RequestEnd{State: reqFailed, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE})
 		return err
 	})
