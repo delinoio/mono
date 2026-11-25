@@ -27,23 +27,29 @@ exit 0
 // rejects a busybox that file does not call static and the stub busybox is a
 // shell script. Like the real file, it describes a symbolic link as a link
 // unless -L is given, and it prints "cannot open" and exits 0 for a missing
-// target.
+// target. It prints the path unless -b is given.
 const stubFile = `#!/usr/bin/env bash
 follow=0
+brief=0
 target=""
 for arg in "$@"; do
   case "$arg" in
     -L) follow=1 ;;
+    -b) brief=1 ;;
     --) ;;
     *) target="$arg" ;;
   esac
 done
+prefix=""
+if [ "$brief" = 0 ]; then
+  prefix="$target: "
+fi
 if [ "$follow" = 0 ] && [ -L "$target" ]; then
-  echo "$target: symbolic link to $(readlink "$target")"
+  echo "${prefix}symbolic link to $(readlink "$target")"
 elif [ ! -e "$target" ]; then
-  echo "$target: cannot open ('No such file or directory')"
+  echo "${prefix}cannot open ('No such file or directory')"
 else
-  echo "$target: ELF 64-bit LSB executable, ${STUB_FILE_DESCRIPTION:-statically linked}"
+  echo "${prefix}ELF 64-bit LSB executable, ${STUB_FILE_DESCRIPTION:-statically linked}"
 fi
 `
 
@@ -205,25 +211,39 @@ func TestBusyboxLinkageCheck(t *testing.T) {
 		}
 	}
 	const applets = "STUB_APPLETS=sh\nls\nbusybox\ninit"
+	const dynamic = "dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2"
 	cases := []struct {
-		name        string
-		description string
-		link        bool
-		dangling    bool
-		wantBuild   bool
+		name          string
+		description   string
+		pathDirectory string
+		link          bool
+		dangling      bool
+		wantBuild     bool
 	}{
 		{name: "static", description: "statically linked", wantBuild: true},
 		{name: "static-pie", description: "static-pie linked", wantBuild: true},
 		{name: "symlink to static", description: "statically linked", link: true, wantBuild: true},
 		{name: "symlink to static-pie", description: "static-pie linked", link: true, wantBuild: true},
-		{name: "dynamic", description: "dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2"},
-		{name: "symlink to dynamic", description: "dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2", link: true},
+		{name: "dynamic", description: dynamic},
+		{name: "dynamic with static text in directory", description: dynamic, pathDirectory: "statically linked"},
+		{name: "symlink to dynamic", description: dynamic, link: true},
 		{name: "dangling symlink", description: "statically linked", link: true, dangling: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newRootfsBuild(t)
 			busybox := filepath.Join(b.dir, "bin", "busybox")
+			if tc.pathDirectory != "" {
+				dir := filepath.Join(b.dir, tc.pathDirectory)
+				if err := os.Mkdir(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				input := filepath.Join(dir, "busybox")
+				if err := os.Rename(busybox, input); err != nil {
+					t.Fatal(err)
+				}
+				busybox = input
+			}
 			if tc.link {
 				target := busybox
 				if tc.dangling {
