@@ -5,6 +5,7 @@ package dataplane
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -27,6 +28,29 @@ const (
 	// gatherTimeout bounds the non-trickle ICE gathering of an answer.
 	gatherTimeout = 10 * time.Second
 )
+
+// A pending session holds its slot until Offer transfers it to a live
+// session or closes the peer connection. DataPlane.mu guards its end reason.
+type pendingSession struct {
+	gen       uint64
+	endReason ownsandv1.SessionEndReason
+}
+
+func (p *pendingSession) end(reason ownsandv1.SessionEndReason) {
+	if p.endReason == ownsandv1.SessionEndReason_SESSION_END_REASON_UNSPECIFIED {
+		p.endReason = reason
+	}
+}
+
+// checkChannel also catches a channel that closed before the reservation.
+// The caller holds DataPlane.mu.
+func (p *pendingSession) checkChannel(ch agent.Channel) {
+	select {
+	case <-ch.Done():
+		p.end(ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST)
+	default:
+	}
+}
 
 type session struct {
 	d         *DataPlane
@@ -78,97 +102,98 @@ func answerError(sessionID string, code ownsandv1.ErrorCode, msg string) *ownsan
 // counts against the lifetime. An offer whose deadline passes during setup
 // gets an error answer and leaves no session.
 func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv1.SignalingOffer) *ownsandv1.SignalingAnswer {
-	logger := d.logger.With("session_id", offer.GetSessionId(), "sandbox_id", offer.GetSandboxId())
+	id := offer.GetSessionId()
+	logger := d.logger.With("session_id", id, "sandbox_id", offer.GetSandboxId())
 	// Both forms of the lifetime become one deadline at this point. The
 	// time.Time value carries a monotonic reading, so a wall clock step does
 	// not move the deadline.
 	received := time.Now()
 	deadline := offerDeadline(offer, received)
+	pending := &pendingSession{gen: ch.Generation()}
 	d.mu.Lock()
-	closed, stun := d.closed, append([]string(nil), d.stunURLs...)
-	_, dup := d.sessions[offer.GetSessionId()]
-	// Cheap early check; the authoritative one shares the critical section
-	// that inserts the session, below. A full data plane leaves a pending
-	// tombstone for the caller's next attempt.
-	full := !closed && !dup && len(d.sessions) >= d.limits.MaxSessions
-	// A revocation that arrived before this offer registered its session
-	// already ended it: the tombstone is consumed by the offer it names.
-	preRevoked := !closed && !dup && !full && offer.GetSessionId() != "" && d.revoked.take(offer.GetSessionId(), time.Now())
-	d.mu.Unlock()
-	if closed {
-		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
-	}
-	if dup || offer.GetSessionId() == "" || offer.GetSdp() == "" {
-		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "offer needs a new session ID and an SDP body")
-	}
-	if full {
+	switch {
+	case d.closed:
+		d.mu.Unlock()
+		return answerError(id, ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
+	case d.sessions[id] != nil || d.pendingSessions[id] != nil || id == "" || offer.GetSdp() == "":
+		d.mu.Unlock()
+		return answerError(id, ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "offer needs a new session ID and an SDP body")
+	case len(d.sessions)+len(d.pendingSessions) >= d.limits.MaxSessions:
+		// Preserve any revocation tombstone for the next attempt.
+		d.mu.Unlock()
 		return d.rejectSessionCapacity(offer)
+	case d.revoked.take(id, time.Now()):
+		d.mu.Unlock()
+		return canceledOfferAnswer(logger, id, ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED, false)
 	}
-	if preRevoked {
-		logger.Warn("session revoked before its offer was handled", "cancellation_reason", ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED.String())
-		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session ended before it was answered")
-	}
+	d.pendingSessions[id] = pending
+	stun := append([]string(nil), d.stunURLs...)
+	d.mu.Unlock()
+
+	var pc *webrtc.PeerConnection
+	var s *session
+	defer func() {
+		if s != nil {
+			return
+		}
+		// Setup still owns the slot until its peer connection closes.
+		if pc != nil {
+			pc.Close()
+		}
+		d.mu.Lock()
+		delete(d.pendingSessions, id)
+		d.mu.Unlock()
+	}()
 	if state, ok := d.opts.Sandboxes.State(offer.GetSandboxId()); !ok || state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is not running on this device")
+		return answerError(id, ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is not running on this device")
 	}
-	if !deadline.After(received) {
-		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session already expired")
+	if !time.Now().Before(deadline) {
+		return answerError(id, ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session already expired")
 	}
 
-	var se webrtc.SettingEngine
-	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4, webrtc.NetworkTypeUDP6})
-	if d.opts.IncludeLoopback {
-		se.SetIncludeLoopbackCandidate(true)
+	d.mu.Lock()
+	pending.checkChannel(ch)
+	closed, reason := d.closed, pending.endReason
+	d.mu.Unlock()
+	if closed || reason != ownsandv1.SessionEndReason_SESSION_END_REASON_UNSPECIFIED {
+		return canceledOfferAnswer(logger, id, reason, closed)
 	}
-	if d.opts.InterfaceFilter != nil {
-		se.SetInterfaceFilter(d.opts.InterfaceFilter)
+	if err := ctx.Err(); err != nil {
+		return answerError(id, ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "offer could not be answered: candidate gathering")
 	}
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
-	var servers []webrtc.ICEServer
-	if len(stun) > 0 {
-		servers = []webrtc.ICEServer{{URLs: stun}}
-	}
-	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: servers})
-	if err != nil {
+
+	var err error
+	pc, err = d.newPeerConnection(stun)
+	// Change ownership under the same lock used by Revoke, ChannelLost and
+	// Close. Each finds either the reservation or the live session.
+	d.mu.Lock()
+	pending.checkChannel(ch)
+	closed, reason = d.closed, pending.endReason
+	ctxErr := ctx.Err()
+	switch {
+	case closed || reason != ownsandv1.SessionEndReason_SESSION_END_REASON_UNSPECIFIED:
+		d.mu.Unlock()
+		return canceledOfferAnswer(logger, id, reason, closed)
+	case err != nil:
+		d.mu.Unlock()
 		logger.Error("create peer connection failed", "error", err)
-		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "peer connection could not be created")
+		return answerError(id, ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "peer connection could not be created")
+	case ctxErr != nil:
+		d.mu.Unlock()
+		logger.Warn("answer failed", "step", "candidate gathering", "error", ctxErr)
+		return answerError(id, ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "offer could not be answered: candidate gathering")
+	case !time.Now().Before(deadline):
+		d.mu.Unlock()
+		logger.Warn("session expired before it was answered", "setup_overrun_ms", time.Since(deadline).Milliseconds())
+		return answerError(id, ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session already expired")
 	}
 	sctx, cancel := context.WithCancel(context.Background())
-	s := &session{d: d, id: offer.GetSessionId(), sandboxID: offer.GetSandboxId(), gen: ch.Generation(), pc: pc,
+	s = &session{d: d, id: id, sandboxID: offer.GetSandboxId(), gen: pending.gen, pc: pc,
 		ctx: sctx, cancel: cancel, streams: map[uint64]context.CancelFunc{}, activity: time.Now(),
 		decoder: datapath.NewDecoder(), low: make(chan struct{}, 1), stop: make(chan struct{})}
-	// The session is visible to Revoke, ChannelLost and Close from here on,
-	// so each of them can end it while its candidates are gathered. The
-	// closed check and the insertion share one critical section: Close
-	// either finds the session in the map or the offer sees closed.
-	d.mu.Lock()
-	_, dup = d.sessions[s.id]
-	closed = d.closed
-	// A revocation that arrived while the peer connection was created found
-	// no session; the tombstone check shares this critical section with the
-	// insertion, so a revocation either left a tombstone here or finds the
-	// session in the map.
-	full = !closed && !dup && len(d.sessions) >= d.limits.MaxSessions
-	preRevoked = !closed && !dup && !full && d.revoked.take(s.id, time.Now())
-	if !closed && !dup && !full && !preRevoked {
-		d.sessions[s.id] = s
-	}
+	delete(d.pendingSessions, id)
+	d.sessions[id] = s
 	d.mu.Unlock()
-	if closed || dup || full || preRevoked {
-		cancel()
-		pc.Close()
-		if full {
-			return d.rejectSessionCapacity(offer)
-		}
-		if preRevoked {
-			logger.Warn("session revoked before it was registered", "cancellation_reason", ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED.String())
-			return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session ended before it was answered")
-		}
-		if closed {
-			return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
-		}
-		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "offer needs a new session ID and an SDP body")
-	}
 	pc.OnDataChannel(s.onDataChannel)
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
 		if st == webrtc.PeerConnectionStateFailed || st == webrtc.PeerConnectionStateClosed {
@@ -187,17 +212,10 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	// answers unavailable like an offer that arrives after Close; every other
 	// end answers failed_precondition.
 	ended := func() *ownsandv1.SignalingAnswer {
-		s.mu.Lock()
-		reason := s.endReason
-		s.mu.Unlock()
 		d.mu.Lock()
 		closed := d.closed
 		d.mu.Unlock()
-		logger.Warn("session ended before it was answered", "cancellation_reason", reason.String(), "data_plane_closed", closed)
-		if closed {
-			return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
-		}
-		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session ended before it was answered")
+		return canceledOfferAnswer(logger, id, s.endedBy(), closed)
 	}
 	// expired answers an offer whose lifetime ran out during setup. It ends
 	// the session, which closes the peer connection and removes the session
@@ -210,10 +228,7 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 		logger.Warn("session expired before it was answered", "setup_overrun_ms", time.Since(deadline).Milliseconds())
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session already expired")
 	}
-	// A channel that closed before or during the answer ends the session.
-	// ChannelLost covers the sessions in the map by channel generation;
-	// this also covers a channel whose loss was reported before the
-	// insertion above.
+	// Catch a channel that closed just after the reservation was promoted.
 	select {
 	case <-ch.Done():
 		s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST)
@@ -278,11 +293,36 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 		select {
 		case <-ch.Done():
 			s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST)
-		case <-sctx.Done():
+		case <-s.ctx.Done():
 		}
 	}()
 	logger.Info("session answered", "transport", ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER.String(), "remaining_lifetime_ms", remaining.Milliseconds())
 	return &ownsandv1.SignalingAnswer{SessionId: s.id, Sdp: pc.LocalDescription().SDP}
+}
+
+func canceledOfferAnswer(logger *slog.Logger, id string, reason ownsandv1.SessionEndReason, closed bool) *ownsandv1.SignalingAnswer {
+	logger.Warn("session ended before it was answered", "cancellation_reason", reason.String(), "data_plane_closed", closed)
+	if closed {
+		return answerError(id, ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
+	}
+	return answerError(id, ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session ended before it was answered")
+}
+
+func (d *DataPlane) createPeerConnection(stun []string) (*webrtc.PeerConnection, error) {
+	var se webrtc.SettingEngine
+	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4, webrtc.NetworkTypeUDP6})
+	if d.opts.IncludeLoopback {
+		se.SetIncludeLoopbackCandidate(true)
+	}
+	if d.opts.InterfaceFilter != nil {
+		se.SetInterfaceFilter(d.opts.InterfaceFilter)
+	}
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
+	var servers []webrtc.ICEServer
+	if len(stun) > 0 {
+		servers = []webrtc.ICEServer{{URLs: stun}}
+	}
+	return api.NewPeerConnection(webrtc.Configuration{ICEServers: servers})
 }
 
 // rejectSessionCapacity answers an offer that arrives while the data plane

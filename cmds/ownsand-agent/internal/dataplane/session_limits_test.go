@@ -6,10 +6,13 @@ package dataplane
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/pion/webrtc/v4"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
@@ -224,4 +227,114 @@ func TestOfferSessionLimitCountsSessionsInSetup(t *testing.T) {
 	// without waiting for the gathering timeout.
 	dp.Close()
 	requireEndedAnswer(t, answers, ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE)
+}
+
+func TestOfferSessionReservationDuringConstruction(t *testing.T) {
+	revoke := func(dp *DataPlane, ch *fakeChannel, id string) {
+		dp.Revoke(ch, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_SessionId{SessionId: id}})
+	}
+	for _, tt := range []struct {
+		name   string
+		code   ownsandv1.ErrorCode
+		cancel func(*DataPlane, *fakeChannel, string)
+	}{
+		{"constructor failure", ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, nil},
+		{"revoked", ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, revoke},
+		{"channel lost", ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, func(dp *DataPlane, ch *fakeChannel, _ string) { dp.ChannelLost(ch) }},
+		{"channel closed", ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, func(_ *DataPlane, ch *fakeChannel, _ string) { ch.Close() }},
+		{"shutdown", ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, func(dp *DataPlane, _ *fakeChannel, _ string) { dp.Close() }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := newWorld(t)
+			dp := New(Options{
+				Dispatcher: w.d, Sandboxes: w.m, Logger: logger(), SessionLimits: SessionLimits{MaxSessions: 1},
+				IncludeLoopback: true, InterfaceFilter: loopbackOnly,
+			})
+			t.Cleanup(dp.Close)
+			started := make(chan struct{})
+			release := make(chan struct{})
+			releaseConstructor := sync.OnceFunc(func() { close(release) })
+			t.Cleanup(releaseConstructor)
+			constructed := make(chan *webrtc.PeerConnection, 1)
+			var calls atomic.Int32
+			failConstruction := tt.cancel == nil
+			shutdown := tt.code == ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE
+			dp.newPeerConnection = func(stun []string) (*webrtc.PeerConnection, error) {
+				if calls.Add(1) != 1 {
+					return dp.createPeerConnection(stun)
+				}
+				close(started)
+				<-release
+				if failConstruction {
+					return nil, errors.New("test constructor failed")
+				}
+				pc, err := dp.createPeerConnection(stun)
+				constructed <- pc
+				return pc, err
+			}
+
+			ch := newChannel(1)
+			dp.ChannelOpened(ch)
+			_, id, answers := w.startOffer(t, dp, ch)
+			select {
+			case <-started:
+			case <-time.After(3 * time.Second):
+				t.Fatal("peer construction did not start")
+			}
+
+			nextChannel := newChannel(2)
+			nextCaller, sdp := newCaller(t, DataChannelLabel)
+			next := &ownsandv1.SignalingOffer{SessionId: newID(t), SandboxId: w.sandbox, ExpiresIn: durationpb.New(time.Hour), Sdp: sdp}
+			dup := &ownsandv1.SignalingOffer{SessionId: id, SandboxId: w.sandbox, ExpiresIn: durationpb.New(time.Hour), Sdp: sdp}
+			if failConstruction {
+				revoke(dp, ch, next.GetSessionId())
+			}
+			requireSessionCapacityAnswer(t, dp.Offer(context.Background(), nextChannel, next), next.GetSessionId())
+			if a := dp.Offer(context.Background(), ch, dup); a.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT || a.GetSdp() != "" {
+				t.Fatalf("duplicate answer %v", a)
+			}
+
+			if tt.cancel != nil {
+				tt.cancel(dp, ch, id)
+			}
+			if shutdown {
+				if a := dp.Offer(context.Background(), nextChannel, next); a.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE || a.GetSdp() != "" {
+					t.Fatalf("offer after shutdown: %v", a)
+				}
+			} else {
+				// Cancellation must not free the slot while construction owns it.
+				requireSessionCapacityAnswer(t, dp.Offer(context.Background(), nextChannel, next), next.GetSessionId())
+			}
+			if n := calls.Load(); n != 1 {
+				t.Errorf("constructor ran %d times while one slot was reserved, want 1", n)
+			}
+			releaseConstructor()
+			requireEndedAnswer(t, answers, tt.code)
+			if !failConstruction {
+				pc := <-constructed
+				if pc == nil || pc.ConnectionState() != webrtc.PeerConnectionStateClosed || pc.RemoteDescription() != nil {
+					t.Fatal("canceled construction must close the connection without using it")
+				}
+			}
+			requireNoSession(t, dp)
+			dp.mu.Lock()
+			pending := len(dp.pendingSessions)
+			dp.mu.Unlock()
+			if pending != 0 {
+				t.Fatalf("pending reservations after setup returned = %d, want 0", pending)
+			}
+			if shutdown {
+				return
+			}
+			if failConstruction {
+				// Capacity refusals leave the revocation for the next attempt.
+				requireRefusedOffer(t, dp.Offer(context.Background(), nextChannel, next))
+			}
+			dp.ChannelOpened(nextChannel)
+			nextCaller.accept(dp.Offer(context.Background(), nextChannel, next))
+			if n := calls.Load(); n != 2 {
+				t.Fatalf("constructor ran %d times after a valid retry, want 2", n)
+			}
+		})
+	}
 }

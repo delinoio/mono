@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/webrtc/v4"
+
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/agent"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -133,11 +135,14 @@ type DataPlane struct {
 	sessionRejected limitRejectLog
 	streamRejected  limitRejectLog
 
-	mu       sync.Mutex
-	stunURLs []string
-	sessions map[string]*session
+	newPeerConnection func([]string) (*webrtc.PeerConnection, error)
+
+	mu              sync.Mutex
+	stunURLs        []string
+	pendingSessions map[string]*pendingSession
+	sessions        map[string]*session
 	// revoked holds the IDs of sessions that a revocation named before they
-	// were registered (see tombstones.go).
+	// reserved a slot (see tombstones.go).
 	revoked tombstones
 	relay   *relay
 	closed  bool
@@ -150,7 +155,11 @@ func New(opts Options) *DataPlane {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	d := &DataPlane{opts: opts, timing: opts.Timing.withDefaults(), logger: opts.Logger, limits: opts.SessionLimits.withDefaults(), sessions: map[string]*session{}}
+	d := &DataPlane{
+		opts: opts, timing: opts.Timing.withDefaults(), logger: opts.Logger, limits: opts.SessionLimits.withDefaults(),
+		pendingSessions: make(map[string]*pendingSession), sessions: make(map[string]*session),
+	}
+	d.newPeerConnection = d.createPeerConnection
 	d.relay = newRelay(d)
 	return d
 }
@@ -162,10 +171,16 @@ func (d *DataPlane) ChannelOpened(ch agent.Channel) {
 
 // ChannelLost ends every session and relay grant of the channel.
 func (d *DataPlane) ChannelLost(ch agent.Channel) {
+	gen := ch.Generation()
 	d.mu.Lock()
+	for _, p := range d.pendingSessions {
+		if p.gen == gen {
+			p.end(ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST)
+		}
+	}
 	var ended []*session
 	for _, s := range d.sessions {
-		if s.gen == ch.Generation() {
+		if s.gen == gen {
 			ended = append(ended, s)
 		}
 	}
@@ -189,16 +204,18 @@ func (d *DataPlane) Revoke(_ agent.Channel, rev *ownsandv1.SessionRevocation) {
 	case *ownsandv1.SessionRevocation_SessionId:
 		d.mu.Lock()
 		s := d.sessions[t.SessionId]
-		if s == nil && t.SessionId != "" {
-			// The offer for this session is not registered yet (or never
-			// arrives): remember the revocation so that Offer refuses it.
+		p := d.pendingSessions[t.SessionId]
+		if p != nil {
+			p.end(ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED)
+		} else if s == nil && t.SessionId != "" {
+			// Remember the revocation so that Offer refuses this ID.
 			d.revoked.add(t.SessionId, time.Now())
 		}
 		d.mu.Unlock()
 		if s != nil {
 			s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED)
-		} else if t.SessionId != "" {
-			d.logger.Info("revocation of a session that is not registered; remembered until its offer or expiry", "session_id", t.SessionId)
+		} else if p == nil && t.SessionId != "" {
+			d.logger.Info("revocation of a session without a reservation; remembered until its offer or expiry", "session_id", t.SessionId)
 		}
 	case *ownsandv1.SessionRevocation_RelayGrantId:
 		d.relay.revoke(t.RelayGrantId)
@@ -214,6 +231,9 @@ func (d *DataPlane) Grant(ch agent.Channel, g *ownsandv1.RelayGrant) *ownsandv1.
 func (d *DataPlane) Close() {
 	d.mu.Lock()
 	d.closed = true
+	for _, p := range d.pendingSessions {
+		p.end(ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST)
+	}
 	sessions := make([]*session, 0, len(d.sessions))
 	for _, s := range d.sessions {
 		sessions = append(sessions, s)
