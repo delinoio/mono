@@ -2,7 +2,6 @@
 import type { Transport } from "@connectrpc/connect";
 import { TransportProvider } from "@connectrpc/connect-query";
 import { type QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { Button } from "delino-ui/button";
 import { ToastRegion } from "delino-ui/toast";
 import { type ReactNode, useCallback, useMemo, useState } from "react";
 import { createApiTransport, createQueryClient } from "./api.ts";
@@ -15,7 +14,7 @@ import {
   useAuth,
 } from "./auth.tsx";
 import { OrgShell, TopBar } from "./components/shell.tsx";
-import { PageHeader } from "./components/ui.tsx";
+import { PageHeader, SignInAction } from "./components/ui.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { ApiKeysPage } from "./pages/api-keys.tsx";
 import { AuditPage } from "./pages/audit.tsx";
@@ -215,7 +214,6 @@ function SignIn({
   configured: boolean;
   notice?: string;
 }) {
-  const auth = useAuth();
   return (
     <main className="sign-in">
       <h1>tide</h1>
@@ -225,14 +223,7 @@ function SignIn({
       </p>
       {notice !== undefined && configured ? <p>{notice}</p> : null}
       {configured ? (
-        <>
-          <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
-          {auth.signInFailed ? (
-            <p role="alert">
-              Sign-in did not start. Check your connection and try again.
-            </p>
-          ) : null}
-        </>
+        <SignInAction />
       ) : (
         <p role="alert">{SIGN_IN_NOT_CONFIGURED}</p>
       )}
