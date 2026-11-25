@@ -203,7 +203,7 @@ func (a *app) orgList(ctx context.Context, name string, args []string) error {
 	rows := make([][]string, 0, len(orgs))
 	for _, o := range orgs {
 		mark := ""
-		if o.GetOrganizationId() == selected {
+		if strings.EqualFold(o.GetOrganizationId(), selected) {
 			mark = "*"
 		}
 		rows = append(rows, []string{mark, o.GetOrganizationId(), o.GetName(), enumName(o.GetCallerRole())})

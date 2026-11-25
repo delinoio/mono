@@ -9,6 +9,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -553,6 +554,73 @@ func TestGitHubInstallURLWriteError(t *testing.T) {
 				t.Fatalf("exit = %d, stderr = %q, want exit %d and only the write error", code, stderr.String(), ExitError)
 			}
 		})
+	}
+}
+
+type organizationListFixture struct {
+	tidev1connect.UnimplementedOrganizationServiceHandler
+	organizations []*tidev1.Organization
+}
+
+func (f organizationListFixture) ListOrganizations(context.Context, *connect.Request[tidev1.ListOrganizationsRequest]) (*connect.Response[tidev1.ListOrganizationsResponse], error) {
+	return connect.NewResponse(&tidev1.ListOrganizationsResponse{Organizations: f.organizations}), nil
+}
+
+func TestOrgListMarksSelectedUUIDRegardlessOfCase(t *testing.T) {
+	const selected = "019abcde-1234-7abc-8def-012345abcdef"
+	const other = "019abcde-1234-7abc-8def-012345abcdea"
+	f := newFixture(t)
+	_, handler := tidev1connect.NewOrganizationServiceHandler(organizationListFixture{
+		organizations: []*tidev1.Organization{{OrganizationId: selected}, {OrganizationId: other}},
+	})
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	f.env[EnvAPIURL] = srv.URL
+	f.httpClient = srv.Client()
+	jsonList := f.ok("", "--output", "json", "org", "list").stdout
+
+	for _, source := range []string{"flag", "environment", "settings"} {
+		for _, spelling := range []struct{ name, id string }{
+			{"lowercase", selected},
+			{"uppercase", strings.ToUpper(selected)},
+			{"mixed-case", "019aBCde-1234-7aBc-8DeF-012345abcdef"},
+		} {
+			t.Run(source+"/"+spelling.name, func(t *testing.T) {
+				f := *f
+				f.t = t
+				args := []string{"org", "list"}
+				saved := other
+				delete(f.env, EnvOrganization)
+				switch source {
+				case "flag":
+					args = append(args, "--org", spelling.id)
+					f.env[EnvOrganization] = other
+				case "environment":
+					f.env[EnvOrganization] = spelling.id
+				case "settings":
+					saved = spelling.id
+				}
+				config := []byte(`{"organization_id":"` + saved + `"}`)
+				if err := os.WriteFile(filepath.Join(f.cfg, configFile), config, 0o600); err != nil {
+					t.Fatal(err)
+				}
+
+				out := f.ok("", args...).stdout
+				var marked []string
+				for line := range strings.SplitSeq(out, "\n") {
+					fields := strings.Fields(line)
+					if len(fields) >= 2 && fields[0] == "*" {
+						marked = append(marked, fields[1])
+					}
+				}
+				if !slices.Equal(marked, []string{selected}) || !strings.Contains(out, other) {
+					t.Fatalf("want only %s marked with %s listed, got:\n%s", selected, other, out)
+				}
+				if got := f.ok("", append(args, "--output", "json")...).stdout; got != jsonList {
+					t.Fatalf("selection changed JSON output: got %q, want %q", got, jsonList)
+				}
+			})
+		}
 	}
 }
 
