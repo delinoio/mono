@@ -226,10 +226,7 @@ func TestLoadR2AndSTUN(t *testing.T) {
 	}
 }
 
-// TestLoadR2EndpointPath checks that an account endpoint with a path stops the
-// server at startup without echoing the endpoint, and that the root forms and
-// the all-unset form still load.
-func TestLoadR2EndpointPath(t *testing.T) {
+func TestLoadR2Endpoint(t *testing.T) {
 	setR2 := func(v map[string]string, endpoint string) {
 		v[EnvR2Endpoint], v[EnvR2Bucket], v[EnvR2AccessKeyID], v[EnvR2SecretAccessKey] = endpoint, "b", "k", "s"
 	}
@@ -238,6 +235,14 @@ func TestLoadR2EndpointPath(t *testing.T) {
 		"https://acct.example.test/storage/",
 		"https://acct.example.test//",
 		"http://127.0.0.1:13100/s3",
+		"https://acct.example.test?source=copy",
+		"https://acct.example.test?",
+		"https://acct.example.test#copy",
+		"https://acct.example.test#",
+		"https://acct.example.test/?source=copy",
+		"https://acct.example.test/?",
+		"https://acct.example.test/#copy",
+		"https://acct.example.test/#",
 	} {
 		v := minimal()
 		setR2(v, endpoint)
@@ -246,8 +251,10 @@ func TestLoadR2EndpointPath(t *testing.T) {
 			t.Errorf("%q: err = %v, want an error that names %s", endpoint, err, EnvR2Endpoint)
 			continue
 		}
-		if strings.Contains(err.Error(), "example.test") || strings.Contains(err.Error(), "127.0.0.1") || strings.Contains(err.Error(), "/s3") {
-			t.Errorf("%q: error %q contains the rejected value", endpoint, err)
+		for _, value := range []string{"example.test", "127.0.0.1", "/s3", "source=", "copy", "?", "#"} {
+			if strings.Contains(err.Error(), value) {
+				t.Errorf("%q: error %q contains %q from the rejected value", endpoint, err, value)
+			}
 		}
 	}
 	for _, endpoint := range []string{
