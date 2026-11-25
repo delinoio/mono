@@ -618,15 +618,13 @@ func TestExportStopsWhenTheContextIsDone(t *testing.T) {
 	})
 }
 
-// stalledResponseTransport answers every request with HTTP 200 headers and
-// a body whose Read blocks until the request context is done. It signals
-// started once the body is being read.
-type stalledResponseTransport struct {
-	started chan struct{}
-	once    sync.Once
+// cancelOnReadTransport returns HTTP 200 and cancels the export when it reads
+// the response body.
+type cancelOnReadTransport struct {
+	cancel context.CancelFunc
 }
 
-func (s *stalledResponseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (c cancelOnReadTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Body != nil {
 		req.Body.Close()
 	}
@@ -634,45 +632,64 @@ func (s *stalledResponseTransport) RoundTrip(req *http.Request) (*http.Response,
 		StatusCode: http.StatusOK,
 		Status:     "200 OK",
 		Header:     http.Header{},
-		Body:       &stalledBody{ctx: req.Context(), started: func() { s.once.Do(func() { close(s.started) }) }},
+		Body:       cancelOnReadBody{ctx: req.Context(), cancel: c.cancel},
 		Request:    req,
 	}, nil
 }
 
-type stalledBody struct {
-	ctx     context.Context
-	started func()
+type cancelOnReadBody struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-func (b *stalledBody) Read([]byte) (int, error) {
-	b.started()
-	<-b.ctx.Done()
+func (b cancelOnReadBody) Read([]byte) (int, error) {
+	b.cancel()
 	return 0, b.ctx.Err()
 }
 
-func (b *stalledBody) Close() error { return nil }
+func (cancelOnReadBody) Close() error { return nil }
+
+func TestExportReturnsWhenTheTempArchiveCannotBeCreated(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	urls := &countingURLs{}
+	tr := &Transfer{
+		HTTP:    &http.Client{Transport: cancelOnReadTransport{cancel: cancel}},
+		URLs:    urls,
+		Logger:  quietLogger(),
+		TempDir: filepath.Join(t.TempDir(), "missing"),
+	}
+
+	parts, size, err := tr.Export(ctx, "snap", t.TempDir(), 1<<30)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("err = %v, want os.ErrNotExist", err)
+	}
+	if parts != nil || size != 0 {
+		t.Fatalf("parts = %v, size = %d, want nil parts and zero size", parts, size)
+	}
+	if urls.calls != 0 || ctx.Err() != nil {
+		t.Fatalf("URL requests = %d, context error = %v, want no URL requests and an active context", urls.calls, ctx.Err())
+	}
+}
 
 // TestExportReturnsTheContextErrorWhenItIsCancelledDuringTheResponseRead
 // checks that a cancellation that arrives while the upload response body is
 // read is not reported as a successful upload, for the final part too.
 func TestExportReturnsTheContextErrorWhenItIsCancelledDuringTheResponseRead(t *testing.T) {
 	src := t.TempDir()
-	os.WriteFile(filepath.Join(src, "disk"), []byte(strings.Repeat("snapshot-", 100)), 0o600)
+	if err := os.WriteFile(filepath.Join(src, "disk"), []byte(strings.Repeat("snapshot-", 100)), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	tempDir := t.TempDir()
-	rt := &stalledResponseTransport{started: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	tr := &Transfer{
-		HTTP:    &http.Client{Transport: rt},
+		HTTP:    &http.Client{Transport: cancelOnReadTransport{cancel: cancel}},
 		URLs:    fixedURLs{url: "http://upload.invalid/part?sig=secret"},
 		Logger:  quietLogger(),
 		TempDir: tempDir,
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		<-rt.started
-		cancel()
-	}()
-	// One part holds the whole archive, so the stalled upload is the final one.
+	// One part holds the whole archive, so the canceled upload is the final one.
 	type result struct {
 		parts []*ownsandv1.SnapshotPart
 		err   error
