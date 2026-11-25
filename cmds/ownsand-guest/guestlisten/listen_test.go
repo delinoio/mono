@@ -117,6 +117,9 @@ func TestListenUnixAbstractAddress(t *testing.T) {
 	if got, err := os.ReadFile("@" + name); err != nil || string(got) != "data" {
 		t.Fatalf("file content %q %v", got, err)
 	}
+	if _, err := os.Lstat("@" + name + unixLockSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abstract listener sidecar check = %v, want no file", err)
+	}
 }
 
 func TestHvsockNotImplemented(t *testing.T) {
