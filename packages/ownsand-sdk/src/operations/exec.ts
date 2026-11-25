@@ -283,6 +283,7 @@ export async function* runExec(
                 stdout: isStdout ? { start: next, end: offset } : undefined,
                 stderr: isStdout ? undefined : { start: next, end: offset },
               };
+              throwIfAborted(signal);
             }
             const end = offset + BigInt(data.length);
             const from = offset > next ? offset : next;
