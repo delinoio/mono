@@ -75,6 +75,7 @@ type Lease struct {
 	expireAt time.Time // confirmed expiry of the current ownership period
 	epoch    uint64    // changes at every acquisition and every loss
 	acquired chan struct{}
+	period   *Period
 }
 
 func (l *Lease) init() {
@@ -112,19 +113,80 @@ func (l *Lease) Held() bool {
 // that clears ownership takes the same lock before it runs OnLose. So fn
 // either completes before the transition (and OnLose sees its effects) or
 // is not run at all. Agent channel admission uses it to register a channel
-// in the hub as one step with the ownership check.
+// in the hub and capture its ownership period as one step.
 //
 // fn must be short, in-memory work: it must not do database or stream I/O,
 // block, or call a method of the lease (Held, WhileHeld, Wait), because the
 // lock is not reentrant and the lock stalls the renewal loop.
-func (l *Lease) WhileHeld(fn func()) bool {
+func (l *Lease) WhileHeld(fn func(*Period)) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if !l.heldLocked() {
 		return false
 	}
-	fn()
+	fn(l.period)
 	return true
+}
+
+// Period identifies one acquisition of the lease. Renewals keep the same
+// period. A later acquisition, even by the same instance, creates a new one.
+type Period struct {
+	lease  *Lease
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func (p *Period) remaining() time.Duration {
+	if p == nil {
+		return 0
+	}
+	l := p.lease
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.period != p {
+		return 0
+	}
+	return l.expireAt.Sub(l.deadlineNow())
+}
+
+// Context bounds work by this period's confirmed deadline at the start of
+// the work and cancels it when ownership ends. An ended period gives an
+// already-canceled context.
+func (p *Period) Context(parent context.Context) (context.Context, context.CancelFunc) {
+	remaining := p.remaining()
+	ctx, cancel := context.WithTimeout(parent, remaining)
+	if remaining <= 0 {
+		return ctx, cancel
+	}
+	stop := context.AfterFunc(p.ctx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+// LockRow shares the lock on this period's lease row through the end of tx.
+// Release, renewal and takeover need a conflicting row lock. The caller
+// must check the returned expiry against the database clock at the write.
+// A zero expiry means the caller lost its period or the shared row.
+func (p *Period) LockRow(ctx context.Context, tx pgx.Tx) (time.Time, error) {
+	if p.remaining() <= 0 {
+		return time.Time{}, nil
+	}
+	var expiry time.Time
+	err := tx.QueryRow(ctx, `SELECT expire_time FROM instance_leases
+		WHERE lease_name = $1 AND holder = $2 FOR SHARE`, Name, p.lease.InstanceID).Scan(&expiry)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	// The query may have waited for a concurrent lease row update or loss.
+	if p.remaining() <= 0 {
+		return time.Time{}, nil
+	}
+	return expiry, nil
 }
 
 // Wait blocks until the instance holds the lease or ctx ends. It returns nil
@@ -193,6 +255,8 @@ func (l *Lease) TryAcquire(ctx context.Context) (bool, error) {
 // loseLocked releases mu and runs the callback.
 func (l *Lease) loseLocked(reason string) {
 	l.held = false
+	l.period.cancel()
+	l.period = nil
 	l.expireAt = time.Time{}
 	l.epoch++
 	l.acquired = make(chan struct{})
@@ -262,6 +326,8 @@ func (l *Lease) applyRenewal(ctx context.Context, epoch uint64, ok bool, reason 
 		l.held = true
 		l.expireAt = expireAt
 		l.epoch++
+		periodCtx, cancelPeriod := context.WithCancel(context.Background())
+		l.period = &Period{lease: l, ctx: periodCtx, cancel: cancelPeriod}
 		close(l.acquired)
 		// OnAcquire holds transitionMu, which the expiry transition needs
 		// before it can run OnLose. Bound it by the confirmed expiry, so

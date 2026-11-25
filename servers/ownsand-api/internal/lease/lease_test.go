@@ -90,18 +90,43 @@ func eventually(t *testing.T, what string, cond func() bool) {
 func TestWhileHeldRunsOnlyWhileHeld(t *testing.T) {
 	l, _ := newTestLease()
 	ran := false
-	if l.WhileHeld(func() { ran = true }) || ran {
+	if l.WhileHeld(func(*Period) { ran = true }) || ran {
 		t.Fatal("fn ran without the lease")
 	}
 	acquireFor(t, l, time.Now().Add(time.Hour))
-	if !l.WhileHeld(func() { ran = true }) || !ran {
+	if !l.WhileHeld(func(*Period) { ran = true }) || !ran {
 		t.Fatal("fn did not run with the lease")
 	}
 	l.lose(reasonReleased)
 	ran = false
-	if l.WhileHeld(func() { ran = true }) || ran {
+	if l.WhileHeld(func(*Period) { ran = true }) || ran {
 		t.Fatal("fn ran after the lease was lost")
 	}
+}
+
+func TestWhileHeldCapturesPeriodAcrossRenewalAndLoss(t *testing.T) {
+	l, _ := newTestLease()
+	acquireFor(t, l, time.Now().Add(time.Hour))
+	var first *Period
+	l.WhileHeld(func(p *Period) { first = p })
+	ctx, cancel := first.Context(context.Background())
+	defer cancel()
+
+	acquireFor(t, l, time.Now().Add(2*time.Hour))
+	l.WhileHeld(func(p *Period) {
+		if p != first || ctx.Err() != nil {
+			t.Error("renewal ended or replaced the current period")
+		}
+	})
+
+	l.lose(reasonReleased)
+	acquireFor(t, l, time.Now().Add(time.Hour))
+	l.WhileHeld(func(p *Period) {
+		if p == first {
+			t.Error("reacquisition reused the earlier period")
+		}
+	})
+	eventually(t, "the earlier period's context to be canceled", func() bool { return ctx.Err() != nil })
 }
 
 // waitLossBlockedOnOwnership waits until a goroutine that runs
@@ -148,7 +173,7 @@ func TestWhileHeldSerializesWithLoss(t *testing.T) {
 	releaseFn := make(chan struct{})
 	whileHeldDone := make(chan bool, 1)
 	go func() {
-		whileHeldDone <- l.WhileHeld(func() {
+		whileHeldDone <- l.WhileHeld(func(*Period) {
 			close(inFn)
 			<-releaseFn
 		})
@@ -185,7 +210,7 @@ func TestWhileHeldSerializesWithLoss(t *testing.T) {
 	if got := lost.Load(); got != 1 {
 		t.Fatalf("OnLose ran %d times, want 1", got)
 	}
-	if l.WhileHeld(func() { t.Error("fn ran after the loss transition") }) {
+	if l.WhileHeld(func(*Period) { t.Error("fn ran after the loss transition") }) {
 		t.Fatal("WhileHeld ran fn after the loss transition")
 	}
 }
@@ -201,11 +226,11 @@ func TestHeldEndsAtConfirmedExpiry(t *testing.T) {
 	epoch, expireAt, _ := l.snapshot()
 
 	clock.Advance(TTL - time.Millisecond)
-	if !l.Held() || !l.WhileHeld(func() {}) {
+	if !l.Held() || !l.WhileHeld(func(*Period) {}) {
 		t.Fatal("ownership ended before the expiry")
 	}
 	clock.Advance(time.Millisecond)
-	if l.Held() || l.WhileHeld(func() { t.Error("fn ran at the expiry") }) {
+	if l.Held() || l.WhileHeld(func(*Period) { t.Error("fn ran at the expiry") }) {
 		t.Fatal("ownership continued at the expiry")
 	}
 

@@ -1302,6 +1302,13 @@ func TestDeviceRemovalOverTheChannel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the channel stayed open after the removal")
 	}
+	var state int16
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT state FROM devices WHERE device_id = $1", dev.ID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if got := ownsandv1.DeviceState(state); got != ownsandv1.DeviceState_DEVICE_STATE_REMOVED {
+		t.Fatalf("device state after channel cleanup = %s, want REMOVED", got)
+	}
 	sb := getSandbox(t, org.OwnerClient, org.ID, id)
 	if sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || sb.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DEVICE_REMOVED {
 		t.Fatalf("sandbox after removal = %v", sb)
@@ -1591,7 +1598,7 @@ func (g *gateLease) Held() bool {
 	return g.held
 }
 
-func (g *gateLease) WhileHeld(fn func()) bool {
+func (g *gateLease) WhileHeld(fn func(*lease.Period)) bool {
 	if g.entered != nil {
 		g.parked.Add(1)
 		// Neither step blocks after release, even when entered is already
@@ -1608,7 +1615,7 @@ func (g *gateLease) WhileHeld(fn func()) bool {
 	if !g.held {
 		return false
 	}
-	fn()
+	fn(nil)
 	return true
 }
 
@@ -1626,8 +1633,8 @@ type alwaysHeld struct{}
 
 func (alwaysHeld) Held() bool { return true }
 
-func (alwaysHeld) WhileHeld(fn func()) bool {
-	fn()
+func (alwaysHeld) WhileHeld(fn func(*lease.Period)) bool {
+	fn(nil)
 	return true
 }
 
@@ -1749,7 +1756,7 @@ func TestGateLeaseRelease(t *testing.T) {
 	t.Cleanup(gate.release)
 
 	done := make(chan bool, 2)
-	go func() { done <- gate.WhileHeld(func() {}) }()
+	go func() { done <- gate.WhileHeld(func(*lease.Period) {}) }()
 	select {
 	case <-gate.entered:
 	case <-time.After(10 * time.Second):
@@ -1777,7 +1784,7 @@ func TestGateLeaseRelease(t *testing.T) {
 
 	// A late admission, with the entered signal already unconsumed, passes.
 	gate.entered <- struct{}{}
-	go func() { done <- gate.WhileHeld(func() {}) }()
+	go func() { done <- gate.WhileHeld(func(*lease.Period) {}) }()
 	select {
 	case ok := <-done:
 		if !ok {
