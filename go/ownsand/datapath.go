@@ -488,8 +488,12 @@ func (g *relayGrant) authorize(ctx context.Context, rec *recovery) error {
 		}
 		cancel(context.Canceled)
 		if err == nil {
+			grantID := res.Msg.GetGrantId()
+			if grantID == "" {
+				return errMissingRelayGrantID
+			}
 			now := time.Now()
-			g.grantID = res.Msg.GetGrantId()
+			g.grantID = grantID
 			g.expiresAt = now.Add(res.Msg.GetExpiresIn().AsDuration())
 			g.idleSince = now
 			g.stale = false

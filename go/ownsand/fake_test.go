@@ -150,6 +150,7 @@ type p2pAction struct {
 type authAction struct {
 	err             error
 	abortAfterGrant bool
+	missingGrantID  bool
 	stall           bool // keep the connection open and never respond
 }
 
@@ -715,6 +716,9 @@ func (f *fakeDataPath) AuthorizeRelay(ctx context.Context, req *connect.Request[
 	cp.mu.Unlock()
 	if act.abortAfterGrant {
 		panic(http.ErrAbortHandler)
+	}
+	if act.missingGrantID {
+		id = ""
 	}
 	return connect.NewResponse(&ownsandv1.AuthorizeRelayResponse{GrantId: id, ExpireTime: timestamppb.New(time.Now().Add(exp + offset)), ExpiresIn: durationpb.New(exp)}), nil
 }

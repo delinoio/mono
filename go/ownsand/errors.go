@@ -152,6 +152,8 @@ var errAttemptDeadline = errors.New("ownsand: WriteFile attempt passed its deadl
 // so the window then ends the operation with it.
 var errAuthorizeDeadline = errors.New("ownsand: AuthorizeRelay got no response within the recovery window")
 
+var errMissingRelayGrantID = errors.New("ownsand: AuthorizeRelay response is missing a relay grant ID")
+
 // errCreateDeadline is the cancellation cause of a CreateSandbox retry that
 // was still in flight when the retry window ended. CreateSandbox then returns
 // the last failure of the window; the cause only tells the SDK deadline apart

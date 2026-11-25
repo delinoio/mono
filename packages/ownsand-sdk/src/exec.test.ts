@@ -3,9 +3,15 @@ import { getEventListeners } from "node:events";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import type { Clock } from "./clock.ts";
+import { ActivityRegistry } from "./connection.ts";
 import { execBinding, requestDigest } from "./digest.ts";
-import { DataPathError, OwnSandValidationError } from "./errors.ts";
+import {
+  billingReasonOf,
+  DataPathError,
+  OwnSandValidationError,
+} from "./errors.ts";
 import { Timing } from "./relay/context.ts";
+import { GrantKeeper, RelayCallKind } from "./relay/grant.ts";
 import { AcceptanceDeadlineError } from "./relay/stream.ts";
 import {
   BillingReason,
@@ -18,7 +24,6 @@ import {
 import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import type { DataPathSelector } from "./datapath.ts";
-import { billingReasonOf } from "./errors.ts";
 import {
   ExecEventType,
   ExecHandle,
@@ -50,6 +55,7 @@ import {
   expectUnacceptedStreamEnd,
   expectWindowExhausted,
 } from "./testing/recovery-assert.ts";
+import { UuidV7Generator } from "./uuidv7.ts";
 
 const MIN = 60_000;
 
@@ -1263,6 +1269,75 @@ describe("exec over the relay", () => {
     const auths = h.api.callsOf("AuthorizeRelay").map((c) => c.request as any);
     expect(auths).toHaveLength(2);
     expect(auths[1].replacesGrantId).toBe("grant-1");
+  });
+
+  test.each([
+    { phase: "initial authorization", authCalls: 1, execCalls: 0 },
+    { phase: "renewal in recovery", authCalls: 2, execCalls: 1 },
+  ])(
+    "rejects a missing grant ID during $phase",
+    async ({ authCalls, execCalls }) => {
+      const h = setup();
+      h.api.unary(DataPathService, "AuthorizeRelay", (_req, call) => ({
+        grantId: call.index + 1 === authCalls ? "" : "grant-1",
+        expiresIn: { seconds: 900n },
+      }));
+      h.api.stream(RelayService, "Exec", async function* () {
+        throw ownsandError(Code.Unavailable, "agent unreachable");
+      });
+
+      await expect(
+        h.clock.run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        ),
+      ).rejects.toMatchObject({
+        code: Code.Internal,
+        rawMessage: "AuthorizeRelay response is missing a relay grant ID",
+      });
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(authCalls);
+      expect(h.api.callsOf("Exec")).toHaveLength(execCalls);
+      expect(h.api.callsOf("AttachExec")).toHaveLength(0);
+    },
+  );
+
+  test("keeps the previous grant ID after a malformed renewal", async () => {
+    const h = setup();
+    h.api.unary(DataPathService, "AuthorizeRelay", (_req, call) => ({
+      grantId: call.index === 1 ? "" : `grant-${call.index}`,
+      expiresIn: { seconds: 900n },
+    }));
+    const ids = new UuidV7Generator();
+    const keeper = new GrantKeeper(
+      {
+        clock: h.clock,
+        ids,
+        dataPath: h.client.dataPath,
+        relay: h.client.relay,
+        sandboxes: h.client.sandboxes,
+        activity: new ActivityRegistry(),
+        logger: undefined,
+        organizationId: ORG,
+        sandboxId: SANDBOX,
+      },
+      RelayOperationKind.EXEC,
+      ids.next(),
+      undefined,
+    );
+    const acquire = () =>
+      h.clock.run(keeper.acquire(RelayCallKind.ServerStream, undefined));
+
+    const previousId = await acquire();
+    keeper.discard();
+    await expect(acquire()).rejects.toMatchObject({ code: Code.Internal });
+    await expect(acquire()).resolves.toBe("grant-2");
+
+    const auths = h.api.callsOf("AuthorizeRelay");
+    expect(auths).toHaveLength(3);
+    expect(auths[1]?.request).toMatchObject({ replacesGrantId: previousId });
+    expect(auths[2]?.request).toMatchObject({ replacesGrantId: previousId });
   });
 
   test("waits at least the retry delay after AuthorizeRelay fails with resource_exhausted", async () => {

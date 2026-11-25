@@ -182,6 +182,12 @@ export class GrantKeeper {
           },
           { signal: controller.signal },
         );
+        if (res.grantId === "") {
+          throw new ConnectError(
+            "AuthorizeRelay response is missing a relay grant ID",
+            Code.Internal,
+          );
+        }
         const receivedAt = this.#ctx.clock.now();
         const expiresInMs =
           res.expiresIn === undefined

@@ -427,6 +427,63 @@ func TestRelayRenewsGrantAtRotation(t *testing.T) {
 	}
 }
 
+func TestExecRejectsMissingRelayGrantID(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		authCalls int
+		execCalls int
+	}{
+		{name: "initial authorization", authCalls: 1},
+		{name: "renewal in recovery", authCalls: 2, execCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.authScript = func(n int, _ *ownsandv1.AuthorizeRelayRequest) authAction {
+				return authAction{missingGrantID: n == tc.authCalls}
+			}
+			cp.relayScript = func(string, int) relayAction {
+				return relayAction{err: connect.NewError(connect.CodeUnavailable, errors.New("agent unreachable"))}
+			}
+			s := cp.handle(t, cp.client(t, TransportRelay))
+			_, err := s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
+			var dp *DataPathError
+			if !errors.As(err, &dp) || !errors.Is(err, errMissingRelayGrantID) {
+				t.Fatalf("want DataPathError for the missing grant ID, got %v", err)
+			}
+			if auths := cp.authRequests(); len(auths) != tc.authCalls {
+				t.Fatalf("AuthorizeRelay called %d times, want %d", len(auths), tc.authCalls)
+			}
+			if exec, attach := cp.relayCount("Exec"), cp.relayCount("AttachExec"); exec != tc.execCalls || attach != 0 {
+				t.Fatalf("relay calls: Exec = %d, AttachExec = %d, want %d and 0", exec, attach, tc.execCalls)
+			}
+		})
+	}
+}
+
+func TestMalformedRelayRenewalKeepsPreviousGrantID(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.authScript = func(n int, _ *ownsandv1.AuthorizeRelayRequest) authAction {
+		return authAction{missingGrantID: n == 2}
+	}
+	s := cp.handle(t, cp.client(t, TransportRelay))
+	grant := newRelayGrant(s, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, mustID(t), nil)
+	ctx := context.Background()
+	if err := grant.authorize(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	previousID := grant.grantID
+	if err := grant.authorize(ctx, nil); !errors.Is(err, errMissingRelayGrantID) {
+		t.Fatalf("want a missing grant ID error, got %v", err)
+	}
+	if err := grant.authorize(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	auths := cp.authRequests()
+	if len(auths) != 3 || auths[1].GetReplacesGrantId() != previousID || auths[2].GetReplacesGrantId() != previousID {
+		t.Fatalf("both renewal requests must replace %q: %v", previousID, auths)
+	}
+}
+
 func TestRelayRecoveryAfterAbruptDisconnect(t *testing.T) {
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(6, 10*time.Millisecond)
