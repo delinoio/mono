@@ -3129,6 +3129,90 @@ describe("invitations", () => {
     }
   });
 
+  test("restarts the first organization page after accepting an invitation", async () => {
+    const { transport, calls } = gatedTransport("AcceptInvitation");
+    const listRequested = rs.fn();
+    let releaseFirstPage = () => {};
+    const firstPage = new Promise<void>((resolve) => {
+      releaseFirstPage = resolve;
+    });
+    renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`, {
+      transport: {
+        ...transport,
+        async unary(method, ...args) {
+          const response = await transport.unary(method, ...args);
+          if (
+            method.name === OrganizationService.method.listOrganizations.name
+          ) {
+            listRequested(args[3]);
+            if (listRequested.mock.calls.length === 1) {
+              // Hold the response after the mock has captured the old list.
+              await firstPage;
+            }
+          }
+          return response;
+        },
+      },
+      staleTime: 10_000,
+    });
+
+    await click(screen.getByRole("button", { name: "Join organization" }));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    await click(screen.getByRole("link", { name: "tide" }));
+    await waitFor(() => expect(listRequested).toHaveBeenCalledTimes(1));
+
+    try {
+      await act(async () => calls[0].settle());
+      await screen.findByRole("link", { name: /Contoso/ });
+      expect(listRequested.mock.calls).toEqual([
+        [expect.objectContaining({ pageToken: "" })],
+        [expect.objectContaining({ pageToken: "" })],
+      ]);
+    } finally {
+      await act(async () => releaseFirstPage());
+    }
+
+    expect(screen.getByRole("link", { name: /Contoso/ })).toBeTruthy();
+    expect(window.location.pathname).toBe("/");
+  });
+
+  test("does not refresh organizations after a late invitation failure", async () => {
+    const { transport, calls } = gatedTransport("AcceptInvitation");
+    const listRequested = rs.fn();
+    const queryClient = renderConsole(
+      `/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+      {
+        transport: {
+          ...transport,
+          unary(method, ...args) {
+            if (
+              method.name === OrganizationService.method.listOrganizations.name
+            ) {
+              listRequested();
+            }
+            return transport.unary(method, ...args);
+          },
+        },
+      },
+    );
+
+    await click(screen.getByRole("button", { name: "Join organization" }));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    await click(screen.getByRole("link", { name: "tide" }));
+    await screen.findByRole("link", { name: /Acme Robotics/ });
+
+    const failure = new ConnectError("Invitation failed", Code.NotFound);
+    await act(async () => calls[0].settle(failure));
+    await waitFor(() =>
+      expect(queryClient.getMutationCache().getAll()[0]?.state.error).toBe(
+        failure,
+      ),
+    );
+
+    expect(listRequested).toHaveBeenCalledTimes(1);
+    expect(window.location.pathname).toBe("/");
+  });
+
   test.each(["the tide link", "browser Back"])(
     "refreshes organizations without navigating after the user leaves via %s",
     async (departure) => {
