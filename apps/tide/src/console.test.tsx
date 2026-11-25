@@ -32,6 +32,7 @@ import {
 } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
 import {
+  AgentIntegrationService,
   DeleteAgentIntegrationRequestSchema,
   ListAgentIntegrationsRequestSchema,
   UpdateAgentIntegrationRequestSchema,
@@ -143,6 +144,22 @@ async function type(element: HTMLElement, value: string) {
   await act(async () => {
     fireEvent.input(element, { target: { value } });
   });
+}
+
+function failingTransport(
+  methodName: string,
+  code: Code,
+  mock = createMockTransport(),
+): Transport {
+  return {
+    ...mock,
+    async unary(method, ...args) {
+      if (method.name === methodName) {
+        throw new ConnectError("Request failed", code);
+      }
+      return mock.unary(method, ...args);
+    },
+  };
 }
 
 function gatedTransport(methodName: string) {
@@ -542,19 +559,6 @@ describe("organization member pagination", () => {
 }, 20_000);
 
 describe("failed requests", () => {
-  function failingTransport(methodName: string, code: Code): Transport {
-    const mock = createMockTransport();
-    return {
-      ...mock,
-      async unary(method, ...args) {
-        if (method.name === methodName) {
-          throw new ConnectError("Request failed", code);
-        }
-        return mock.unary(method, ...args);
-      },
-    };
-  }
-
   test.each([
     ["/", "ListOrganizations"],
     [`/orgs/${MOCK_IDS.acme}`, "GetOrganization"],
@@ -2008,20 +2012,138 @@ describe("overview", () => {
       expect(warmCount()).toBe("0");
     },
   );
+});
 
-  test("guides the first setup of a new organization", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.globex}`);
-    expect(await screen.findByText("Set up tide")).toBeTruthy();
-    expect(
-      screen
-        .getAllByRole("link", { name: "Link OwnSand" })[0]!
-        .getAttribute("href"),
-    ).toBe(`/orgs/${MOCK_IDS.globex}/integrations`);
+describe("setup guidance", () => {
+  const globexPath = `/orgs/${MOCK_IDS.globex}`;
+  const acmePath = `/orgs/${MOCK_IDS.acme}`;
+
+  async function linkOwnSandAction(route: string) {
+    if (route === "") {
+      const checklist = await screen.findByRole("region", {
+        name: "Set up tide",
+      });
+      return within(checklist).getByRole("link", { name: "Link OwnSand" });
+    }
+    await screen.findByText(/Next step: link ownsand/);
+    return screen.getByRole("link", { name: "Link OwnSand" });
+  }
+
+  test.each(["", "/runners"])(
+    "offers Link OwnSand on %s when a work-source query fails",
+    async (route) => {
+      renderConsole(globexPath + route, {
+        transport: failingTransport("ListAgentIntegrations", Code.Unavailable),
+      });
+      const action = await linkOwnSandAction(route);
+      expect(action.getAttribute("href")).toBe(`${globexPath}/integrations`);
+    },
+  );
+
+  test.each(["", "/runners"])(
+    "offers Link OwnSand on %s while profiles are pending",
+    async (route) => {
+      const { transport, calls } = gatedTransport("ListRunnerProfiles");
+      renderConsole(globexPath + route, { transport });
+      try {
+        const action = await linkOwnSandAction(route);
+        expect(action.getAttribute("href")).toBe(`${globexPath}/integrations`);
+        expect(calls).toContainEqual(
+          expect.objectContaining({
+            input: expect.objectContaining({ pageSize: 1 }),
+          }),
+        );
+      } finally {
+        await act(() => {
+          for (const call of calls) call.settle();
+        });
+      }
+    },
+  );
+
+  test.each(["", "/runners"])(
+    "uses the existing fallback on %s when the link lookup fails",
+    async (route) => {
+      const transport = failingTransport("GetOwnSandLink", Code.Unavailable);
+      const client = renderConsole(globexPath + route, { transport });
+      const linkOptions = createQueryOptions(
+        OwnSandLinkService.method.getOwnSandLink,
+        { organizationId: MOCK_IDS.globex },
+        { transport },
+      );
+      await waitFor(() =>
+        expect(client.getQueryState(linkOptions.queryKey)?.status).toBe(
+          "error",
+        ),
+      );
+      expect(screen.queryByRole("region", { name: "Set up tide" })).toBeNull();
+      if (route === "/runners") {
+        expect(
+          await screen.findByText(/Runners start for waiting requests/),
+        ).toBeTruthy();
+        expect(screen.queryByRole("link", { name: "Link OwnSand" })).toBeNull();
+      }
+    },
+  );
+
+  function linkedSetupTransport(
+    empty: (
+      "ListGitHubInstallations" | "ListAgentIntegrations" | "ListRunnerProfiles"
+    )[],
+  ): Transport {
+    const mock = createMockTransport();
+    const emptyLists = createRouterTransport((router) => {
+      router.service(GitHubService, { listGitHubInstallations: () => ({}) });
+      router.service(AgentIntegrationService, {
+        listAgentIntegrations: () => ({}),
+      });
+      router.service(RunnerProfileService, { listRunnerProfiles: () => ({}) });
+    });
+    const emptyMethods = new Set<string>(empty);
+    return {
+      ...mock,
+      unary(method, ...args) {
+        const transport = emptyMethods.has(method.name) ? emptyLists : mock;
+        return transport.unary(method, ...args);
+      },
+    };
+  }
+
+  test("offers a work source when both lists are empty and profiles fail", async () => {
+    const mock = linkedSetupTransport([
+      "ListGitHubInstallations",
+      "ListAgentIntegrations",
+    ]);
+    renderConsole(acmePath, {
+      transport: failingTransport("ListRunnerProfiles", Code.Unavailable, mock),
+    });
+
+    const checklist = await screen.findByRole("region", {
+      name: "Set up tide",
+    });
+    const action = within(checklist).getByRole("link", {
+      name: "Connect GitHub or create an agent integration",
+    });
+    expect(action.getAttribute("href")).toBe(`${acmePath}/integrations`);
   });
 
-  test("an empty list names the next setup step", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.globex}/runners`);
-    expect(await screen.findByText(/Next step: link ownsand/)).toBeTruthy();
+  test("offers a runner profile when GitHub is connected and agent integrations fail", async () => {
+    const mock = linkedSetupTransport(["ListRunnerProfiles"]);
+    renderConsole(acmePath, {
+      transport: failingTransport(
+        "ListAgentIntegrations",
+        Code.Unavailable,
+        mock,
+      ),
+    });
+
+    const checklist = await screen.findByRole("region", {
+      name: "Set up tide",
+    });
+    const action = within(checklist).getByRole("link", {
+      name: "Create a runner profile",
+    });
+    expect(action.getAttribute("href")).toBe(`${acmePath}/profiles`);
   });
 });
 

@@ -631,6 +631,54 @@ describe("setup guide", () => {
       }),
     ).toBe(SetupStep.Done);
   });
+
+  const unknown = {
+    linked: undefined,
+    hasGitHubInstallation: undefined,
+    hasAgentIntegration: undefined,
+    hasRunnerProfile: undefined,
+  };
+
+  test.each([
+    ["no OwnSand link", { linked: false }, SetupStep.LinkOwnSand],
+    [
+      "neither work source",
+      {
+        linked: true,
+        hasGitHubInstallation: false,
+        hasAgentIntegration: false,
+      },
+      SetupStep.ConnectWorkSource,
+    ],
+    [
+      "a GitHub installation and no profile",
+      { linked: true, hasGitHubInstallation: true, hasRunnerProfile: false },
+      SetupStep.CreateRunnerProfile,
+    ],
+    [
+      "an agent integration and no profile",
+      { linked: true, hasAgentIntegration: true, hasRunnerProfile: false },
+      SetupStep.CreateRunnerProfile,
+    ],
+    [
+      "an agent integration and a profile",
+      { linked: true, hasAgentIntegration: true, hasRunnerProfile: true },
+      SetupStep.Done,
+    ],
+    ["an unknown link", { hasGitHubInstallation: true }, undefined],
+    [
+      "an empty list and an unknown work source",
+      { linked: true, hasGitHubInstallation: false, hasRunnerProfile: false },
+      undefined,
+    ],
+    [
+      "an unknown profile list",
+      { linked: true, hasGitHubInstallation: true },
+      undefined,
+    ],
+  ] as const)("resolves partial setup data with %s", (_name, facts, step) => {
+    expect(nextSetupStep({ ...unknown, ...facts })).toBe(step);
+  });
 });
 
 describe("GitHub callback", () => {
