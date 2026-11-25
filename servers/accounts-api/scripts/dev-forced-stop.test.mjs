@@ -119,6 +119,31 @@ net
   });
 `;
 
+// The descendant ignores SIGTERM and has independent standard streams. When
+// the build exits on SIGTERM, it leaves that descendant for the supervisor.
+const cancelBuild = `
+const { appendFileSync, renameSync, writeFileSync } = process.getBuiltinModule("node:fs");
+const { join } = process.getBuiltinModule("node:path");
+const { spawn } = process.getBuiltinModule("node:child_process");
+const marker = (name) => join(process.env.MARKER_DIR, name);
+const publishPid = (file) => {
+  writeFileSync(file + ".tmp", String(process.pid));
+  renameSync(file + ".tmp", file);
+};
+if (process.argv[2] === "descendant") {
+  process.on("SIGTERM", () => appendFileSync(marker("descendant.signals"), "TERM\\n"));
+  publishPid(marker("descendant.pid"));
+} else {
+  process.on("SIGTERM", () => {
+    appendFileSync(marker("go.signals"), "TERM\\n");
+    if (!process.env.FAKE_STUBBORN) process.exit(0);
+  });
+  spawn(process.execPath, [process.argv[1], "descendant"], { stdio: "ignore" }).unref();
+  publishPid(marker("go.pid"));
+}
+setInterval(() => {}, 1000);
+`;
+
 // The fake go: records its pid, then either builds the fake server (mode
 // "server") or stays in a build that runs a descendant (mode "build"). With
 // FAKE_STUBBORN the build ignores SIGTERM, as does its descendant, so only
@@ -127,6 +152,7 @@ function fakeGo(t) {
   const dir = mkdtempSync(join(tmpdir(), "accounts-api-fake-go-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const file = join(dir, "go");
+  writeFileSync(join(dir, "cancel-build.cjs"), cancelBuild);
   writeFileSync(
     file,
     `#!/bin/sh
@@ -148,6 +174,9 @@ while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done
 cat > "$out" <<'PROGRAM'
 ${fakeServer}PROGRAM
 chmod 755 "$out"
+if [ "$FAKE_PHASE" = cancel-build ]; then
+  exec "${process.execPath}" "$(dirname "$0")/cancel-build.cjs"
+fi
 `,
   );
   chmodSync(file, 0o755);
@@ -282,6 +311,62 @@ async function waitBuild(run) {
 
 const waitGone = (run, pids, what) =>
   waitFor(run, () => pids.every((pid) => !isRunning(pid)), what);
+
+for (const stubborn of [false, true]) {
+  test(
+    stubborn
+      ? "SIGTERM ends a resistant build group after the grace period"
+      : "SIGTERM ends surviving build descendants when the build exits",
+    { skip, timeout: Timeout },
+    async (t) => {
+      const run = await startLauncher(t, {
+        env: { FAKE_PHASE: "cancel-build", FAKE_STUBBORN: stubborn ? "1" : "" },
+      });
+      const build = await waitBuild(run);
+      const pids = [build.go, build.descendant, run.supervisor];
+      assertSupervised(run, build.go);
+      assert.ok(pids.every(isRunning), "a recorded process is not running");
+      assert.equal(readdirSync(run.buildTmp).length, 1);
+
+      const start = performance.now();
+      process.kill(run.child.pid, "SIGTERM");
+      await waitFor(run, () => run.exit !== null, "the launcher to exit");
+      const elapsed = performance.now() - start;
+
+      assert.deepEqual(run.exit, { code: 143, signal: null }, run.stderr);
+      assert.ok(
+        pids.every((pid) => !isRunning(pid)),
+        "a build process survived",
+      );
+      assert.equal(
+        readFileSync(join(run.markerDir, "go.signals"), "utf8"),
+        "TERM\n",
+      );
+      if (stubborn) {
+        assert.equal(
+          readFileSync(join(run.markerDir, "descendant.signals"), "utf8"),
+          "TERM\n",
+        );
+        assert.ok(
+          elapsed >= 4_900 && elapsed < 10_000,
+          `shutdown took ${elapsed} ms`,
+        );
+      } else {
+        assert.ok(elapsed < 5_000, `shutdown took ${elapsed} ms`);
+      }
+      assert.equal(
+        events(run.stdout, "fake_server").length,
+        0,
+        "server started",
+      );
+      assert.deepEqual(
+        readdirSync(run.buildTmp),
+        [],
+        "build output was not removed",
+      );
+    },
+  );
+}
 
 // The supervisor is the launcher's child and leads the group of the phase.
 function assertSupervised(run, server) {

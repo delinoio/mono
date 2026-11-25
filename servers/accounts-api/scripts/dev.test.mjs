@@ -669,28 +669,35 @@ test(
   },
 );
 
-test(
-  "a process-group SIGQUIT during the build never starts the server",
-  { skip, timeout: Timeout * 2 },
-  async (t) => {
-    const port = await freePort();
-    // The fake go waits, then on SIGQUIT completes a build and exits 0. A
-    // launcher that ignored the signal would run the built program next.
-    const { markers, env, pathPrefix } = signalDuringBuildFixture(t, "QUIT");
-    const run = startLauncher(t, { port, env, pathPrefix });
-    await waitFor(run, () => existsSync(markers.ready), "the build trap");
+for (const [signal, status] of [
+  ["INT", StatusSigint],
+  ["QUIT", StatusSigquit],
+]) {
+  test(
+    `a process-group SIG${signal} during the build never starts the server`,
+    { skip, timeout: Timeout * 2 },
+    async (t) => {
+      const port = await freePort();
+      const { markers, env, pathPrefix } = signalDuringBuildFixture(t, signal);
+      const run = startLauncher(t, { port, env, pathPrefix });
+      await waitFor(run, () => existsSync(markers.ready), "the build trap");
 
-    process.kill(-run.child.pid, "SIGQUIT");
-    const { code } = await run.exited;
+      process.kill(-run.child.pid, `SIG${signal}`);
+      const { code } = await run.exited;
 
-    assert.equal(code, StatusSigquit, run.stderr);
-    assert.equal(countEvents(run.stderr, "accounts_api_dev_signal"), 1);
-    assertBuiltAndNeverRan(markers);
-    assert.doesNotMatch(run.stdout, /"server_started"/);
-    await assertNoListener(port);
-    assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
-  },
-);
+      assert.equal(code, status, run.stderr);
+      assert.equal(countEvents(run.stderr, "accounts_api_dev_signal"), 1);
+      assertBuiltAndNeverRan(markers);
+      assert.doesNotMatch(run.stdout, /"server_started"/);
+      await assertNoListener(port);
+      assert.deepEqual(
+        readdirSync(run.tmp),
+        [],
+        "build output was not removed",
+      );
+    },
+  );
+}
 
 // Polls until none of the processes runs.
 const waitGone = (run, pids, what) =>
