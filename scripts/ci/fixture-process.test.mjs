@@ -59,7 +59,7 @@ import test from "node:test";
 import { spawnProcessGroup } from ${JSON.stringify(helperUrl)};
 
 const dir = ${JSON.stringify(dir)};
-const script = \`out=$(echo "$BASHPID" > "$DIR/blocked.pid"; while [[ ! -e "$DIR/release" ]]; do sleep 0.05; done; printf 200)
+const script = \`out=$(bash -c 'echo "$$" > "$DIR/blocked.pid.tmp"; mv "$DIR/blocked.pid.tmp" "$DIR/blocked.pid"; while [[ ! -e "$DIR/release" ]]; do sleep 0.05; done; printf 200')
 echo "$out"\`;
 
 test("fails before it releases the blocked command", async (t) => {
