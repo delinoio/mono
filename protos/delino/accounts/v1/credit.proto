@@ -207,8 +207,9 @@ message AutoTopUpSettings {
   // After 2, accounts-api sets enabled to false and emails owners and
   // admins. A successful top-up and enabling the setting reset it to 0.
   int32 consecutive_failures = 5;
-  // Output only; ignored in updates. Sum of the automatic top-ups charged in
-  // the current UTC calendar month.
+  // Output only. Updates ignore this field. Monthly cap usage in the current
+  // UTC calendar month. The total includes completed and in-flight automatic
+  // top-ups, including queued entries, and excludes failed automatic top-ups.
   int64 month_to_date_usd_micros = 6;
 }
 

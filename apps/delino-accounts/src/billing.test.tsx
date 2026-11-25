@@ -12,6 +12,7 @@ import {
   cleanup,
   fireEvent,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -36,6 +37,7 @@ import {
   OWNER,
   VIEWER,
 } from "./testing/fake-api.ts";
+import { deferNextCall } from "./testing/form-submit-deferral.ts";
 import { listItems } from "./testing/list-rows.ts";
 import { fakeCheckout, renderApp, settle } from "./testing/render.tsx";
 
@@ -290,6 +292,12 @@ describe("billing accounts", () => {
     }) as HTMLInputElement;
   }
 
+  function saveNameButton() {
+    return within(nameField().closest("form")!).getByRole("button", {
+      name: "Save",
+    }) as HTMLButtonElement;
+  }
+
   test("an unedited name field and the header follow a refetched account name", async () => {
     const { api } = await renderAccount(ADMIN);
     await openTab("Settings");
@@ -348,33 +356,74 @@ describe("billing accounts", () => {
     ]);
   });
 
-  test("a failed name save keeps the edit for a retry, then the field follows the saved name", async () => {
+  for (const [draft, nextName] of [
+    ["  Beta  ", "Beta"],
+    ["Acme Robotics", "Acme Robotics"],
+  ]) {
+    test(`keeps the newer name draft "${draft}" through a successful save and refetch`, async () => {
+      const { api } = await renderAccount(ADMIN);
+      await openTab("Settings");
+      const pending = deferNextCall(api, "UpdateBillingAccount");
+      await type(nameField(), "  Alpha  ");
+      await click(saveNameButton());
+      expect(calls(api, "UpdateBillingAccount")).toEqual([
+        expect.objectContaining({ name: "Alpha" }),
+      ]);
+      expect(saveNameButton().disabled).toBe(true);
+      expect(nameField().disabled).toBe(false);
+      await type(nameField(), draft);
+
+      pending.release();
+      await screen.findByRole("heading", { name: "Alpha", level: 1 });
+      expect(nameField().value).toBe(draft);
+      await waitFor(() => expect(saveNameButton().disabled).toBe(false));
+      await click(saveNameButton());
+      await screen.findByRole("heading", { name: nextName, level: 1 });
+      expect(calls(api, "UpdateBillingAccount")).toEqual([
+        expect.objectContaining({ name: "Alpha" }),
+        expect.objectContaining({ name: nextName }),
+      ]);
+    });
+  }
+
+  test("a failed name save keeps the latest edit for a retry", async () => {
     const { api } = await renderAccount(ADMIN);
     await openTab("Settings");
+    const pending = deferNextCall(api, "UpdateBillingAccount");
+    await type(nameField(), "Alpha");
+    await click(saveNameButton());
     await type(nameField(), "  Gamma  ");
-    const save = () =>
-      click(
-        within(nameField().closest("form")!).getByRole("button", {
-          name: "Save",
-        }),
-      );
-    api.failNext.set("UpdateBillingAccount", BACKGROUND_FAILURE);
-    await save();
-    await settle(60);
-    expect(screen.getByText(BUSY)).toBeTruthy();
+    pending.fail(BACKGROUND_FAILURE);
+    await screen.findByText(BUSY);
     expect(nameField().value).toBe("  Gamma  ");
 
-    await save();
-    await settle(60);
+    await click(saveNameButton());
+    await screen.findByRole("heading", { name: "Gamma", level: 1 });
     expect(calls(api, "UpdateBillingAccount")).toEqual([
-      expect.objectContaining({ name: "Gamma" }),
+      expect.objectContaining({ name: "Alpha" }),
       expect.objectContaining({ name: "Gamma" }),
     ]);
+    expect(nameField().value).toBe("Gamma");
+  });
+
+  test("shows the normalized saved name during and after a failed refetch", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    const refetch = deferNextCall(api, "GetBillingAccount");
+    await type(nameField(), "  Gamma  ");
+    await click(saveNameButton());
+    await waitFor(() => expect(nameField().value).toBe("Gamma"));
     expect(
-      await screen.findByRole("heading", { name: "Gamma", level: 1 }),
+      screen.getByRole("heading", { name: "Acme Robotics", level: 1 }),
     ).toBeTruthy();
+    expect(saveNameButton().disabled).toBe(true);
+
+    refetch.fail(BACKGROUND_FAILURE);
+    await screen.findByText(BUSY);
     expect(nameField().value).toBe("Gamma");
 
+    await click(screen.getByRole("button", { name: "Try again" }));
+    await screen.findByRole("heading", { name: "Gamma", level: 1 });
     renameElsewhere(api, "Beta");
     await refocus();
     expect(nameField().value).toBe("Beta");
@@ -818,7 +867,7 @@ describe("invoices", () => {
     await settle();
   }
 
-  test("demotion to viewer while Invoices is open selects Overview", async () => {
+  test("Overview stays selected after invoice access returns", async () => {
     const api = createFakeApi();
     await renderAccount(ADMIN, { api });
     await openTab("Invoices");
@@ -831,11 +880,26 @@ describe("invoices", () => {
     await changeRoleAndRefetch(api, ADMIN, BillingAccountRole.VIEWER);
 
     expect(screen.queryByRole("tab", { name: "Invoices" })).toBeNull();
-    const selected = screen
-      .getAllByRole("tab")
-      .filter((t) => t.getAttribute("aria-selected") === "true");
-    expect(selected.map((t) => t.textContent)).toEqual(["Overview"]);
-    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+    expect(screen.queryByRole("tabpanel", { name: "Invoices" })).toBeNull();
+    expect(screen.getAllByRole("tab", { selected: true })).toEqual([
+      screen.getByRole("tab", { name: "Overview" }),
+    ]);
+
+    await changeRoleAndRefetch(api, ADMIN, BillingAccountRole.ADMIN);
+
+    expect(
+      screen.getByRole("tab", { name: "Invoices", selected: false }),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("tab", { selected: true })).toEqual([
+      screen.getByRole("tab", { name: "Overview" }),
+    ]);
+    expect(screen.getByRole("tabpanel", { name: "Overview" })).toBeTruthy();
+
+    await openTab("Invoices");
+
+    expect(
+      screen.getByRole("tab", { name: "Invoices", selected: true }),
+    ).toBeTruthy();
   });
 
   test("a role change that keeps access keeps the Invoices tab selected", async () => {
@@ -1050,6 +1114,108 @@ describe("invoices", () => {
         expect(harness.assigned).toEqual([]);
         await harness.respond();
         expect(harness.assigned).toEqual([INVOICE_URL]);
+      } finally {
+        harness.restore();
+      }
+    });
+
+    test.each([false, true])(
+      "a blocked pop-up cannot redirect after leaving the account (reopen: %s)",
+      async (reopen) => {
+        const harness = await openInvoiceWith(null);
+        try {
+          await click(screen.getByRole("link", { name: "Billing accounts" }));
+          const account = await screen.findByRole("link", {
+            name: /Acme Robotics/,
+          });
+          if (reopen) {
+            await click(account);
+            await openTab("Invoices");
+          }
+
+          await harness.respond();
+
+          expect(harness.assigned).toEqual([]);
+          expect(window.location.pathname).toBe(
+            reopen ? ACCOUNT_PATH : "/billing",
+          );
+          const heading = reopen ? "Invoices" : "Billing accounts";
+          expect(screen.getByRole("heading", { name: heading })).toBeTruthy();
+        } finally {
+          harness.restore();
+        }
+      },
+    );
+
+    test("a blocked pop-up cannot redirect after switching to another panel", async () => {
+      const harness = await openInvoiceWith(null);
+      try {
+        await openTab("Members");
+        await screen.findByRole("heading", { name: "Members" });
+        await harness.respond();
+
+        expect(harness.assigned).toEqual([]);
+        expect(screen.getByRole("heading", { name: "Members" })).toBeTruthy();
+      } finally {
+        harness.restore();
+      }
+    });
+
+    test("a blocked pop-up cannot redirect after the caller loses invoice access", async () => {
+      const harness = await openInvoiceWith(null);
+      try {
+        await changeRoleAndRefetch(
+          harness.api,
+          ADMIN,
+          BillingAccountRole.VIEWER,
+        );
+        expect(screen.queryByRole("tab", { name: "Invoices" })).toBeNull();
+        await harness.respond();
+
+        expect(harness.assigned).toEqual([]);
+        expect(screen.getByText("Your role: Viewer")).toBeTruthy();
+      } finally {
+        harness.restore();
+      }
+    });
+
+    test("a blocked pop-up cannot redirect after another account replaces the page", async () => {
+      const api = createFakeApi();
+      api.userId = ADMIN;
+      addBillingAccounts(api, 1);
+      const replacement = [...api.accounts.values()].find(
+        (account) => account.id !== ACCOUNT_ID,
+      )!;
+      const harness = await openInvoiceWith(null, undefined, api);
+      try {
+        await act(async () => {
+          window.history.pushState(null, "", `/billing/${replacement.id}`);
+          window.dispatchEvent(new PopStateEvent("popstate"));
+        });
+        await screen.findByRole("heading", { name: replacement.name });
+        await openTab("Invoices");
+        await harness.respond();
+
+        expect(harness.assigned).toEqual([]);
+        expect(window.location.pathname).toBe(`/billing/${replacement.id}`);
+        expect(
+          screen.getByRole("heading", { name: replacement.name }),
+        ).toBeTruthy();
+      } finally {
+        harness.restore();
+      }
+    });
+
+    test("an open pop-up receives the invoice after the user leaves the account", async () => {
+      const tab = fakeTab();
+      const harness = await openInvoiceWith(tab);
+      try {
+        await click(screen.getByRole("link", { name: "Billing accounts" }));
+        await screen.findByRole("heading", { name: "Billing accounts" });
+        await harness.respond();
+
+        expect(tab.replaced).toEqual([INVOICE_URL]);
+        expect(harness.assigned).toEqual([]);
       } finally {
         harness.restore();
       }
@@ -1638,6 +1804,25 @@ describe("invitation acceptance", () => {
 });
 
 describe("settings", () => {
+  test("shows a queued automatic top-up as monthly cap usage", async () => {
+    const api = createFakeApi();
+    const account = api.accounts.get(ACCOUNT_ID)!;
+    account.autoTopUp = {
+      ...account.autoTopUp,
+      monthToDateUsdMicros: 25_000_000n,
+    };
+    await renderAccount(ADMIN, { api });
+    await openTab("Settings");
+
+    expect(
+      (await screen.findByText("Monthly cap usage")).nextSibling?.textContent,
+    ).toBe("$25.00");
+    expect(
+      screen.getByText(/Automatic top-ups in progress count toward the cap\./),
+    ).toBeTruthy();
+    expect(screen.queryByText("Charged this month")).toBeNull();
+  });
+
   test("checks the automatic top-up minimums and the required cap before saving", async () => {
     const { api } = await renderAccount(ADMIN);
     await openTab("Settings");
@@ -1685,9 +1870,9 @@ describe("settings", () => {
       name: "Top-up amount (USD)",
     });
     await type(amount, "75");
-    expect(
-      screen.getByText("Charged this month").nextSibling?.textContent,
-    ).toBe("$0.00");
+    expect(screen.getByText("Monthly cap usage").nextSibling?.textContent).toBe(
+      "$0.00",
+    );
     const fake = api.accounts.get(ACCOUNT_ID)!;
     fake.autoTopUp = {
       ...fake.autoTopUp,
@@ -1700,9 +1885,9 @@ describe("settings", () => {
     });
     await settle(60);
     expect(calls(api, "GetAutoTopUpSettings").length).toBeGreaterThan(before);
-    expect(
-      screen.getByText("Charged this month").nextSibling?.textContent,
-    ).toBe("$30.00");
+    expect(screen.getByText("Monthly cap usage").nextSibling?.textContent).toBe(
+      "$30.00",
+    );
     expect(
       screen.getByText("Failed top-ups in a row").nextSibling?.textContent,
     ).toBe("1");

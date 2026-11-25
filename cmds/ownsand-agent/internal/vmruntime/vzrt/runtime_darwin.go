@@ -38,9 +38,12 @@ const (
 	readyTimeout = 60 * time.Second
 	// macOSReadyTimeout covers a macOS cold boot, which takes far longer
 	// than a Linux boot.
-	macOSReadyTimeout = 5 * time.Minute
-	dialTimeout       = 10 * time.Second
+	macOSReadyTimeout     = 5 * time.Minute
+	dialTimeout           = 10 * time.Second
+	snapshotResumeTimeout = 10 * time.Second
 )
+
+var errVMTerminalState = errors.New("VM reached a terminal state")
 
 // guestLink is the link of every OUTBOUND sandbox: each sandbox has its own
 // network stack, so every sandbox uses the same addresses.
@@ -288,6 +291,13 @@ func growFile(path string, size int64) error {
 	return os.Truncate(path, size)
 }
 
+func checkBaseDiskCapacity(sourceBytes, requestedBytes int64) error {
+	if sourceBytes > requestedBytes {
+		return fmt.Errorf("%w: the base disk requires %d bytes, but the request allocates %d bytes", vmruntime.ErrUnsupported, sourceBytes, requestedBytes)
+	}
+	return nil
+}
+
 // Create boots a VM for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
 	switch spec.GuestOS {
@@ -300,8 +310,15 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if !fileExists(r.opts.Kernel) {
 		return nil, fmt.Errorf("%w: the Linux kernel is missing", vmruntime.ErrUnsupported)
 	}
-	if spec.Snapshot == nil && !fileExists(r.opts.Rootfs) {
-		return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+	diskBytes := spec.Resources.GetDiskGib() << 30
+	if spec.Snapshot == nil {
+		baseDisk, err := os.Stat(r.opts.Rootfs)
+		if err != nil || !baseDisk.Mode().IsRegular() {
+			return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+		}
+		if err := checkBaseDiskCapacity(baseDisk.Size(), diskBytes); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.RemoveAll(spec.Dir); err != nil {
 		return nil, err
@@ -338,7 +355,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 
 	if memoryRestore {
 		err := r.restoreMemory(ctx, v, spec)
-		if err == nil {
+		if err == nil && ctx.Err() == nil {
 			v.restore = ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE
 			clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			if err := guestclient.New(v.Dial).SetClock(clockCtx, time.Now()); err != nil {
@@ -348,21 +365,16 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			r.logger.Info("VM restored from memory state", "sandbox_id", v.id)
 			return v, nil
 		}
-		// Virtualization.framework could not restore the saved state: boot
-		// the snapshot disk cold.
-		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
-		// Never boot the snapshot disk cold while the failed attempt's VM may
-		// still run on the same disk.
-		if stopErr := r.stopVM(v); stopErr != nil {
-			cleanup()
-			return nil, fmt.Errorf("vzrt: stop the VM of the failed memory-state restore: %w", stopErr)
+		if err := finishFailedRestore(ctx, func() error { return r.stopVM(v) }, cleanup); err != nil {
+			return nil, err
 		}
-		if err := copyFile(context.Background(), src, disk); err != nil {
+		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
+		if err := copyFile(ctx, src, disk); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
 		}
 	}
-	if err := growFile(disk, spec.Resources.GetDiskGib()<<30); err != nil {
+	if err := growFile(disk, diskBytes); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vzrt: resize disk: %w", err)
 	}
@@ -383,6 +395,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 // machine identifier to reuse (for a memory-state restore), or nil for a
 // new one.
 func (r *Runtime) configure(v *vm, spec vmruntime.Spec, machineID []byte) (*vz.VirtualMachineConfiguration, error) {
+	memoryBytes, err := memoryMiBToBytes(spec.Resources.GetMemoryMib())
+	if err != nil {
+		return nil, err
+	}
 	cmdline := "console=hvc0 root=/dev/vda rw init=/sbin/init panic=1 random.trust_cpu=on"
 	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
 		cmdline += " " + guestLink.KernelIPArg()
@@ -391,7 +407,7 @@ func (r *Runtime) configure(v *vm, spec vmruntime.Spec, machineID []byte) (*vz.V
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := vz.NewVirtualMachineConfiguration(boot, uint(spec.Resources.GetVcpuCount()), uint64(spec.Resources.GetMemoryMib())<<20)
+	cfg, err := vz.NewVirtualMachineConfiguration(boot, uint(spec.Resources.GetVcpuCount()), memoryBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -666,6 +682,9 @@ func (r *Runtime) coldBoot(ctx context.Context, v *vm, spec vmruntime.Spec) erro
 	if err := r.newMachine(v, cfg); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := v.machine.Start(); err != nil {
 		return fmt.Errorf("vzrt: start VM: %w", err)
 	}
@@ -687,15 +706,7 @@ func (r *Runtime) waitGuest(ctx context.Context, v *vm) error {
 		_, err := client.WaitReady(rctx, 100*time.Millisecond)
 		done <- err
 	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("vzrt: guest helper not ready: %w", err)
-		}
-		return nil
-	case <-v.Exited():
-		return errors.New("vzrt: the VM stopped during boot")
-	}
+	return waitGuestResult(done, v.Exited())
 }
 
 func (r *Runtime) lookup(id string) (*vm, error) {
@@ -708,18 +719,26 @@ func (r *Runtime) lookup(id string) (*vm, error) {
 	return v, nil
 }
 
-// waitState waits until the VM reaches want.
-func waitState(ctx context.Context, machine *vz.VirtualMachine, want vz.VirtualMachineState) error {
+// waitState waits until the VM reaches want, exits, or the context ends.
+func waitState(ctx context.Context, state func() vz.VirtualMachineState, want vz.VirtualMachineState) error {
 	t := time.NewTicker(10 * time.Millisecond)
 	defer t.Stop()
-	for machine.State() != want {
+	for {
+		current := state()
+		if current == want {
+			return nil
+		}
+		if terminalState(current) {
+			return fmt.Errorf("vzrt: VM state %v, want %v: %w", current, want, errVMTerminalState)
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("vzrt: VM state %v, want %v: %w", current, want, err)
+		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("vzrt: VM state %v, want %v: %w", machine.State(), want, ctx.Err())
 		case <-t.C:
 		}
 	}
-	return nil
 }
 
 // Pause flushes the guest page cache and then stops the vCPUs and keeps the
@@ -748,7 +767,7 @@ func (r *Runtime) pauseVM(ctx context.Context, v *vm) error {
 	if err := machine.Pause(); err != nil {
 		return fmt.Errorf("vzrt: pause: %w", err)
 	}
-	if err := waitState(ctx, machine, vz.VirtualMachineStatePaused); err != nil {
+	if err := waitState(ctx, machine.State, vz.VirtualMachineStatePaused); err != nil {
 		return err
 	}
 	v.mu.Lock()
@@ -770,7 +789,7 @@ func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 	if err := machine.Resume(); err != nil {
 		return fmt.Errorf("vzrt: resume: %w", err)
 	}
-	if err := waitState(ctx, machine, vz.VirtualMachineStateRunning); err != nil {
+	if err := waitState(ctx, machine.State, vz.VirtualMachineStateRunning); err != nil {
 		return err
 	}
 	v.mu.Lock()
@@ -797,10 +816,8 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 	v.mu.Lock()
 	wasPaused := v.paused
 	v.mu.Unlock()
-	// A paused VM was flushed by its Pause; Pause flushes a running one. A
-	// failed resume after a completed capture fails the snapshot, so no READY
-	// record is saved for a VM that stays paused.
-	return vmruntime.SnapshotWithPause(r.logger, v.id, wasPaused,
+	// A paused VM was flushed by its Pause; flush a running one before capture.
+	info, err := vmruntime.SnapshotWithPause(r.logger, v.id, wasPaused,
 		func() error {
 			r.flushForPause(ctx, v)
 			if err := ctx.Err(); err != nil {
@@ -812,8 +829,20 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 			defer cancel()
 			return r.pauseVM(pauseCtx, v)
 		},
-		func() error { return r.Resume(context.Background(), m) },
+		func() error {
+			// Recover the source even when the snapshot context has ended.
+			// The deadline bounds the state poll after the native Resume call.
+			resumeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotResumeTimeout)
+			defer cancel()
+			return r.Resume(resumeCtx, m)
+		},
 		func() (vmruntime.SnapshotInfo, error) { return r.capture(ctx, v, dir) })
+	if errors.Is(err, errVMTerminalState) {
+		// The VM exit watcher reconciles a terminal source after Snapshot
+		// returns and the command lock is released.
+		info.SourceState = ownsandv1.SandboxState_SANDBOX_STATE_UNSPECIFIED
+	}
+	return info, err
 }
 
 // capture writes the snapshot content of the paused VM v into dir.

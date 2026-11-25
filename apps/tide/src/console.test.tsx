@@ -50,6 +50,7 @@ import {
   GetOrganizationResponseSchema,
   OrganizationService,
 } from "@delino/tide-protos/v1/organization_pb";
+import { OwnSandLinkService } from "@delino/tide-protos/v1/ownsand_link_pb";
 import {
   CreateRunnerProfileRequestSchema,
   type ListRunnerProfilesRequest,
@@ -139,6 +140,27 @@ async function type(element: HTMLElement, value: string) {
   await act(async () => {
     fireEvent.input(element, { target: { value } });
   });
+}
+
+function gatedTransport(methodName: string) {
+  const mock = createMockTransport();
+  const calls: {
+    input: unknown;
+    settle(error?: ConnectError): void;
+  }[] = [];
+  const transport: Transport = {
+    ...mock,
+    async unary(method, ...args) {
+      if (method.name === methodName) {
+        const error = await new Promise<ConnectError | undefined>((settle) => {
+          calls.push({ input: args[3], settle });
+        });
+        if (error) throw error;
+      }
+      return mock.unary(method, ...args);
+    },
+  };
+  return { transport, calls };
 }
 
 /** Every value that the console keeps in browser storage. */
@@ -1590,6 +1612,80 @@ describe("runner profiles", () => {
 });
 
 describe("overview", () => {
+  test.each([
+    [MOCK_IDS.globex, "link an OwnSand organization", false],
+    [MOCK_IDS.northwind, "replace the OwnSand API key", true],
+  ])(
+    "guides organization %s to integrations when the OwnSand link is inactive",
+    async (organizationId, nextStep, hasInvalidLink) => {
+      const mock = createMockTransport();
+      const getCapacity = rs.fn();
+      const transport: Transport = {
+        ...mock,
+        unary: (method, ...rest) => {
+          if (method.name === "GetCapacity") getCapacity();
+          return mock.unary(method, ...rest);
+        },
+      };
+      renderConsole(`/orgs/${organizationId}`, { transport });
+      const pool = within(
+        await screen.findByRole("region", { name: "Device pool" }),
+      );
+      const integrations = await pool.findByRole("link", {
+        name: "Go to integrations",
+      });
+      expect(integrations.getAttribute("href")).toBe(
+        `/orgs/${organizationId}/integrations`,
+      );
+      expect(pool.getByText(new RegExp(nextStep))).toBeTruthy();
+      expect(pool.queryByRole("alert")).toBeNull();
+      expect(pool.queryByRole("button", { name: "Try again" })).toBeNull();
+      expect(getCapacity).not.toHaveBeenCalled();
+      if (hasInvalidLink) {
+        const banner = screen.getByRole("alert", { name: "OwnSand link" });
+        expect(within(banner).getByText("Dispatch has stopped")).toBeTruthy();
+      }
+    },
+  );
+
+  test("shows no devices when the active OwnSand link has an empty pool", async () => {
+    const transport = createMockTransport();
+    await createClient(OwnSandLinkService, transport).setOwnSandLink({
+      organizationId: MOCK_IDS.globex,
+      ownsandOrganizationId: "ownsand-globex-fixture",
+      ownsandApiKey: "osk_fixture",
+    });
+    renderConsole(`/orgs/${MOCK_IDS.globex}`, { transport });
+    const pool = within(
+      await screen.findByRole("region", { name: "Device pool" }),
+    );
+    expect(await pool.findByText("No devices")).toBeTruthy();
+  });
+
+  test("offers to retry a failed capacity request for an active link", async () => {
+    const mock = createMockTransport();
+    let failCapacity = true;
+    const transport: Transport = {
+      ...mock,
+      unary: async (method, ...rest) => {
+        if (method.name === "GetCapacity" && failCapacity) {
+          throw new ConnectError("Capacity unavailable", Code.Unavailable);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
+    const pool = within(
+      await screen.findByRole("region", { name: "Device pool" }),
+    );
+    const alert = await pool.findByRole("alert");
+    expect(alert.textContent).toContain("tide is not available right now");
+    failCapacity = false;
+    await click(within(alert).getByRole("button", { name: "Try again" }));
+    expect(await pool.findByText("build-box")).toBeTruthy();
+    expect(pool.queryByRole("alert")).toBeNull();
+  });
+
   test("shows waiting requests in queue order and the device pool", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}`);
     const table = await screen.findByRole("table", {
@@ -1925,6 +2021,165 @@ describe("personal API keys", () => {
   });
 });
 
+describe("form dialog openings", () => {
+  const apiKeysPath = `/orgs/${MOCK_IDS.acme}/api-keys`;
+  const secretTitle = "Your new personal API key";
+
+  function createKeyButton(dialog: HTMLElement) {
+    return within(dialog).getByRole<HTMLButtonElement>("button", {
+      name: "Create key",
+    });
+  }
+
+  async function openCreateKey(name: string) {
+    await click(await screen.findByRole("button", { name: "Create API key" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Create a personal API key",
+    });
+    await type(within(dialog).getByRole("textbox", { name: "Name" }), name);
+    return dialog;
+  }
+
+  async function dismiss(dialog: HTMLElement) {
+    await act(async () => fireEvent.keyDown(dialog, { key: "Escape" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  }
+
+  test("submits a reopened form while the first request is still pending", async () => {
+    const { transport, calls } = gatedTransport("CreateApiKey");
+    renderConsole(apiKeysPath, { transport });
+    const first = await openCreateKey("first-key");
+    await click(createKeyButton(first));
+    expect(createKeyButton(first).disabled).toBe(true);
+    await dismiss(first);
+
+    const second = await openCreateKey("second-key");
+    const submit = createKeyButton(second);
+    expect(submit.disabled).toBe(false);
+    await click(submit);
+    expect(calls.map(({ input }) => input)).toEqual([
+      expect.objectContaining({ name: "first-key" }),
+      expect.objectContaining({ name: "second-key" }),
+    ]);
+
+    await act(async () =>
+      calls[0].settle(
+        new ConnectError("First request failed", Code.FailedPrecondition),
+      ),
+    );
+    await settle();
+    expect(within(second).queryByRole("alert")).toBeNull();
+    expect(submit.disabled).toBe(true);
+
+    await act(async () => calls[1].settle());
+    expect(
+      await screen.findByRole("dialog", { name: secretTitle }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("dialog", { name: "Create a personal API key" }),
+    ).toBeNull();
+  });
+
+  test("shows a current failure and allows a retry", async () => {
+    const { transport, calls } = gatedTransport("CreateApiKey");
+    renderConsole(apiKeysPath, { transport });
+    const dialog = await openCreateKey("retry-key");
+    const submit = createKeyButton(dialog);
+    await click(submit);
+    await act(async () =>
+      calls[0].settle(
+        new ConnectError("Key creation failed", Code.FailedPrecondition),
+      ),
+    );
+    expect(await within(dialog).findByRole("alert")).toHaveProperty(
+      "textContent",
+      "Key creation failed",
+    );
+    expect(submit.disabled).toBe(false);
+
+    await click(submit);
+    expect(calls).toHaveLength(2);
+    expect(within(dialog).queryByRole("alert")).toBeNull();
+    await act(async () => calls[1].settle());
+    const secret = await screen.findByRole("dialog", { name: secretTitle });
+    expect(within(secret).getByLabelText("API key").textContent).toMatch(
+      /^tide_/,
+    );
+    await dismiss(secret);
+    expect(await screen.findByText("retry-key · Active")).toBeTruthy();
+  });
+
+  test.each([true, false])(
+    "refreshes the key list after a dismissed success with a reopened form: %s",
+    async (reopen) => {
+      const { transport, calls } = gatedTransport("CreateApiKey");
+      renderConsole(apiKeysPath, { transport });
+      const first = await openCreateKey("created-key");
+      await click(createKeyButton(first));
+      await dismiss(first);
+      const second = reopen ? await openCreateKey("draft-key") : undefined;
+
+      await act(async () => calls[0].settle());
+      expect(await screen.findByText("created-key · Active")).toBeTruthy();
+      expect(screen.queryByRole("dialog", { name: secretTitle })).toBeNull();
+      if (second !== undefined) {
+        expect(
+          screen.getByRole("dialog", { name: "Create a personal API key" }),
+        ).toBe(second);
+        expect(
+          within(second).getByRole("textbox", { name: "Name" }),
+        ).toHaveProperty("value", "draft-key");
+      }
+    },
+  );
+
+  test("refreshes the invitation list without replacing the reopened form with a link", async () => {
+    const { transport, calls } = gatedTransport("CreateInvitation");
+    renderConsole(`/orgs/${MOCK_IDS.globex}/members`, { transport });
+    const invite = await screen.findByRole("button", {
+      name: "Invite someone",
+    });
+    await click(invite);
+    const first = await screen.findByRole("dialog", { name: "Invite someone" });
+    await click(within(first).getByRole("button", { name: "Create link" }));
+    await dismiss(first);
+    await click(invite);
+    const second = await screen.findByRole("dialog", {
+      name: "Invite someone",
+    });
+
+    await act(async () => calls[0].settle());
+    expect(await screen.findByText(/Member invitation/)).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Invite someone" })).toBe(second);
+    expect(
+      screen.queryByRole("dialog", { name: "Your invitation link" }),
+    ).toBeNull();
+  });
+
+  test("refreshes the organization list without navigating after dismissal", async () => {
+    const { transport, calls } = gatedTransport("CreateOrganization");
+    renderConsole("/", { transport });
+    await click(
+      await screen.findByRole("button", { name: "Create organization" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Create an organization",
+    });
+    await type(
+      within(dialog).getByRole("textbox", { name: "Organization name" }),
+      "New testing org",
+    );
+    await click(within(dialog).getByRole("button", { name: "Create" }));
+    await dismiss(dialog);
+
+    await act(async () => calls[0].settle());
+    expect(
+      await screen.findByRole("link", { name: /New testing org/ }),
+    ).toBeTruthy();
+    expect(window.location.pathname).toBe("/");
+  });
+});
+
 describe("personal API key pages", () => {
   test("shows the keys after the first page", async () => {
     const transport = createMockTransport();
@@ -2251,29 +2506,6 @@ describe("failed query refreshes", () => {
 });
 
 describe("confirmation dialog requests", () => {
-  function gatedTransport(methodName: string) {
-    const mock = createMockTransport();
-    const calls: {
-      input: unknown;
-      settle(error?: ConnectError): void;
-    }[] = [];
-    const transport: Transport = {
-      ...mock,
-      async unary(method, ...args) {
-        if (method.name === methodName) {
-          const error = await new Promise<ConnectError | undefined>(
-            (settle) => {
-              calls.push({ input: args[3], settle });
-            },
-          );
-          if (error) throw error;
-        }
-        return mock.unary(method, ...args);
-      },
-    };
-    return { transport, calls };
-  }
-
   const seededKey = "claude-on-laptop";
   const failure = new ConnectError(
     "Revocation failed",
@@ -2557,6 +2789,151 @@ describe("invitations", () => {
     await settle(80);
     expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.contoso}`);
     expect(storedText()).not.toContain(MOCK_INVITATION_SECRET);
+  });
+
+  const invalidInvitationNotice =
+    "It was not found, or you no longer have access to it.";
+
+  function invitationInput() {
+    return screen.getByLabelText<HTMLInputElement>("Invitation link or secret");
+  }
+
+  async function changeInvitationHash(hash: string) {
+    await act(async () => {
+      window.history.replaceState(null, "", hash);
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+  }
+
+  test("consumes a replacement link in place and submits only its secret", async () => {
+    const path = "/invitations/accept?source=fixture";
+    const firstSecret = "tdi_fixture_a";
+    const mock = createMockTransport();
+    const requested = rs.fn();
+    renderConsole(`${path}#secret=${firstSecret}`, {
+      transport: {
+        ...mock,
+        unary(method, ...args) {
+          if (method.name === MemberService.method.acceptInvitation.name) {
+            requested(args[3]);
+          }
+          return mock.unary(method, ...args);
+        },
+      },
+    });
+    const input = invitationInput();
+    expect(input.value).toBe(firstSecret);
+    expect(window.location.hash).toBe("");
+
+    await changeInvitationHash(`#secret=${MOCK_INVITATION_SECRET}`);
+
+    expect(invitationInput()).toBe(input);
+    expect(input.value).toBe(MOCK_INVITATION_SECRET);
+    expect(window.location.pathname + window.location.search).toBe(path);
+    expect(window.location.hash).toBe("");
+    expect(requested).not.toHaveBeenCalled();
+    expect(storedText()).not.toContain(firstSecret);
+    expect(storedText()).not.toContain(MOCK_INVITATION_SECRET);
+
+    await click(screen.getByRole("button", { name: "Join organization" }));
+
+    await waitFor(() =>
+      expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.contoso}`),
+    );
+    expect(requested).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ invitationSecret: MOCK_INVITATION_SECRET }),
+    );
+    expect(storedText()).not.toContain(firstSecret);
+    expect(storedText()).not.toContain(MOCK_INVITATION_SECRET);
+  });
+
+  test("clears input and request errors and preserves the field for a fragment without a secret", async () => {
+    renderConsole("/invitations/accept");
+    const join = screen.getByRole("button", { name: "Join organization" });
+    await click(join);
+    expect(
+      screen.getByText("Paste the invitation link or the secret."),
+    ).toBeTruthy();
+
+    await changeInvitationHash("#secret=tdi_fixture_a");
+    expect(
+      screen.queryByText("Paste the invitation link or the secret."),
+    ).toBeNull();
+    await click(join);
+    expect(await screen.findByText(invalidInvitationNotice)).toBeTruthy();
+
+    await changeInvitationHash(`#secret=${MOCK_INVITATION_SECRET}`);
+    expect(screen.queryByText(invalidInvitationNotice)).toBeNull();
+    await changeInvitationHash("#source=fixture");
+    expect(invitationInput().value).toBe(MOCK_INVITATION_SECRET);
+  });
+
+  test.each(["success", "error"] as const)(
+    "keeps a replacement link active after a late accept %s",
+    async (result) => {
+      const { transport, release, requested } = holdInvitationAccept();
+      const queryClient = renderConsole("/", {
+        transport,
+        staleTime: Infinity,
+      });
+      expect(
+        await screen.findByRole("link", { name: /Acme Robotics/ }),
+      ).toBeTruthy();
+      expect(screen.queryByRole("link", { name: /Contoso/ })).toBeNull();
+      const firstSecret =
+        result === "success" ? MOCK_INVITATION_SECRET : "tdi_fixture_a";
+      await act(async () => {
+        window.history.pushState(
+          null,
+          "",
+          `/invitations/accept#secret=${firstSecret}`,
+        );
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+
+      const join = screen.getByRole<HTMLButtonElement>("button", {
+        name: "Join organization",
+      });
+      await click(join);
+      expect(join.disabled).toBe(true);
+      await changeInvitationHash("#secret=tdi_follow_up_invitation");
+
+      expect(join.disabled).toBe(false);
+      expect(requested).toHaveBeenCalledTimes(1);
+      await act(async () => release());
+      await waitFor(() =>
+        expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+          result,
+        ),
+      );
+      expect(window.location.pathname).toBe("/invitations/accept");
+      expect(invitationInput().value).toBe("tdi_follow_up_invitation");
+      expect(screen.queryByText(invalidInvitationNotice)).toBeNull();
+
+      if (result === "success") {
+        await click(screen.getByRole("link", { name: "tide" }));
+        expect(
+          await screen.findByRole("link", { name: /Contoso/ }),
+        ).toBeTruthy();
+      }
+    },
+  );
+
+  test("removes the invitation hash listener when the route unmounts", async () => {
+    const addListener = rs.spyOn(window, "addEventListener");
+    const removeListener = rs.spyOn(window, "removeEventListener");
+    try {
+      renderConsole("/invitations/accept#secret=tdi_fixture_a");
+      const listener = addListener.mock.calls.find(
+        ([event]) => event === "hashchange",
+      )?.[1];
+      expect(listener).toBeDefined();
+      await click(screen.getByRole("link", { name: "tide" }));
+      expect(removeListener).toHaveBeenCalledWith("hashchange", listener);
+    } finally {
+      addListener.mockRestore();
+      removeListener.mockRestore();
+    }
   });
 
   test.each(["the tide link", "browser Back"])(

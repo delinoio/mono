@@ -90,7 +90,7 @@ export function renderApp(
     </AuthContextProvider>
   );
   render(options.strict ? <StrictMode>{app}</StrictMode> : app);
-  return { api, signIns };
+  return { api, queryClient, signIns };
 }
 
 /** Lets pending requests and effects finish. */

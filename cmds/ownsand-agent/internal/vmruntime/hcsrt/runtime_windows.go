@@ -297,8 +297,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		if !fileExists(r.opts.Kernel) {
 			return nil, fmt.Errorf("%w: the Linux kernel is missing", vmruntime.ErrUnsupported)
 		}
-		if spec.Snapshot == nil && !fileExists(r.opts.Rootfs) {
-			return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+		if spec.Snapshot == nil {
+			if err := vmruntime.CheckLinuxBaseDiskSize(r.opts.Rootfs, spec.Resources.GetDiskGib()); err != nil {
+				return nil, err
+			}
 		}
 	case ownsandv1.GuestOs_GUEST_OS_WINDOWS:
 		if err := r.checkWindowsSpec(spec); err != nil {
@@ -472,7 +474,14 @@ func (r *Runtime) prepareLinuxDisk(ctx context.Context, spec vmruntime.Spec, ops
 	if err := ctx.Err(); err != nil {
 		return vmSpec{}, 0, err
 	}
-	size, err := ops.makeFixedVHD(disk, spec.Resources.GetDiskGib()<<30, hasFooter)
+	diskGiB := spec.Resources.GetDiskGib()
+	// The local image builder can replace the source between the check and the copy.
+	if !hasFooter {
+		if err := vmruntime.CheckLinuxBaseDiskSize(disk, diskGiB); err != nil {
+			return vmSpec{}, 0, fmt.Errorf("hcsrt: check copied disk: %w", err)
+		}
+	}
+	size, err := ops.makeFixedVHD(disk, diskGiB<<30, hasFooter)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return vmSpec{}, 0, ctxErr
 	}

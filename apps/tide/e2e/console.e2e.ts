@@ -242,6 +242,31 @@ describe("organization member pagination", () => {
 });
 
 describe("overview", () => {
+  test("guides an unlinked organization to integrations from the device pool", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}`);
+
+    const pool = screen.getByRole("region", "Device pool");
+    const integrations = pool.getByRole("link", "Go to integrations");
+    await expect(pool).toContainText(
+      "An admin must link an OwnSand organization",
+    );
+    await expect(pool.getByRole("alert")).toBeHidden();
+    await expect(pool.getByRole("button", "Try again")).toBeHidden();
+    await expect(integrations).toHaveAttribute(
+      "href",
+      `/orgs/${GLOBEX}/integrations`,
+    );
+    await integrations.tap();
+    await expect(
+      screen.getByRole("heading", "Integrations", { level: 1 }),
+    ).toBeVisible();
+  });
+
   test("shows the live queue and the device pool", async ({
     app,
     browser,
@@ -280,6 +305,35 @@ describe("overview", () => {
     await expect(screen.getByRole("table", "Devices")).toContainText(
       "build-box",
     );
+  });
+
+  test("opens a fresh live queue after leaving Overview", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("link", "Acme Robotics Owner").tap();
+    const status = screen.getByRole("status", "Queue updates");
+    const queue = screen.getByRole("table", "Waiting requests");
+    await expect(status).toContainText("Live");
+    await expect(queue).toContainText("GitHub job");
+
+    await screen.getByRole("link", "Requests").tap();
+    const job = screen
+      .getByRole("table", "Requests")
+      .getByRole("row")
+      .filter({ hasText: "acme-robotics/firmware · test (ubuntu)" });
+    await job.getByRole("button", "Cancel").tap();
+    const dialog = screen.getByRole("alertdialog", "Cancel this request?");
+    await dialog.getByRole("button", "Cancel request").tap();
+    await expect(dialog).toBeHidden();
+    await expect(job).toBeHidden();
+
+    await screen.getByRole("link", "Overview").tap();
+    await expect(status).toContainText("Live");
+    await expect(queue).toContainText("Agent session");
+    await expect(queue).not.toContainText("GitHub job");
   });
 
   test("an invalid OwnSand link shows the dispatch banner", async ({
@@ -615,7 +669,7 @@ describe("runner profiles", () => {
     ).toBeVisible();
   });
 
-  test("keeps the edit dialog open when a runner profile name already exists", async ({
+  test("lets the user retry an edit when a runner profile name already exists", async ({
     app,
     screen,
     browser,
@@ -638,10 +692,17 @@ describe("runner profiles", () => {
     await expect(
       dialog.getByText("a runner profile with this name exists"),
     ).toBeVisible();
-    await dialog.getByRole("button", "Cancel").tap();
     await expect(profile.getByLabel("runs-on label of linux-build")).toHaveText(
       "tide-linux-build",
     );
+    await dialog.getByLabel("Name").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("linux-build-retry");
+    await dialog.getByRole("button", "Save changes").tap();
+    await expect(dialog).toBeHidden();
+    await expect(
+      screen.getByLabel("runs-on label of linux-build-retry"),
+    ).toHaveText("tide-linux-build-retry");
   });
 
   test("shows field errors and saves after correcting the resource values", async ({
@@ -824,6 +885,41 @@ describe("invitations", () => {
     await expect(screen.getByRole("button", "Invite someone")).toBeHidden();
   });
 
+  test("accepts the replacement invitation after a fragment-only navigation", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    const path = "/invitations/accept?source=fixture";
+    const firstSecret = "tdi_fixture_a";
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`${path}#secret=${firstSecret}`);
+
+    const join = screen.getByRole("button", "Join organization");
+    const invalid = screen.getByText(
+      "It was not found, or you no longer have access to it.",
+    );
+    await expect(browser).toHaveURL(path);
+    await join.tap();
+    await expect(invalid).toBeVisible();
+
+    await browser.evaluate((secret) => {
+      window.location.hash = `secret=${secret}`;
+      return null;
+    }, INVITATION_SECRET);
+
+    await expect(browser).toHaveURL(path);
+    await expect(invalid).toBeHidden();
+    await join.tap();
+
+    await expect(browser).toHaveURL(`/orgs/${CONTOSO}`);
+    await expect(screen.getByRole("combobox", "Organization")).toContainText(
+      "Contoso",
+    );
+  });
+
   test("accepts an invitation link and removes the secret from the address", async ({
     app,
     screen,
@@ -848,6 +944,31 @@ describe("invitations", () => {
     );
     await screen.getByRole("combobox", "Organization").tap();
     await expect(screen.getByRole("option", "Contoso")).toBeVisible();
+  });
+
+  test("an expired invitation link keeps the user on the invitation page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/invitations/accept#secret=${INVITATION_SECRET}`);
+    const join = screen.getByRole("button", "Join organization");
+    await expect(join).toBeVisible();
+
+    // Advance the clock after the mock creates its seeded invitation.
+    await browser.evaluate(() => {
+      const later = Date.now() + 7 * 24 * 60 * 60 * 1000;
+      Date.now = () => later;
+      return null;
+    });
+    await join.tap();
+
+    await expect(
+      screen.getByText("It was not found, or you no longer have access to it."),
+    ).toBeVisible();
+    await expect(browser).toHaveURL("/invitations/accept");
   });
 });
 

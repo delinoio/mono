@@ -892,6 +892,53 @@ describe("narrow screens", () => {
   });
 });
 
+describe("organization switcher popup width", () => {
+  for (const width of [390, 240]) {
+    test(`fits a ${width}px trigger within the popup width limit`, async ({
+      app,
+      screen,
+      browser,
+    }) => {
+      const viewportWidth = 390;
+      const popupWidthLimit = viewportWidth - 16;
+      await browser.setViewport({ width: viewportWidth, height: 844 });
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(`/orgs/${ACME}/sandboxes`);
+
+      const trigger = screen.getByRole("combobox", "Organization");
+      await expect(trigger).toBeVisible();
+      const triggerWidth = await browser.evaluate((width) => {
+        const element = document.querySelector<HTMLElement>(
+          '.org-switcher [role="combobox"]',
+        );
+        if (!element) throw new Error("Organization trigger is missing");
+        element.style.width = `${width}px`;
+        element.style.minWidth = `${width}px`;
+        return element.offsetWidth;
+      }, width);
+      expect(triggerWidth).toBe(width);
+
+      await trigger.tap();
+      await expect(screen.getByRole("listbox")).toBeVisible();
+      await expect(screen.getByRole("option", "Northwind Labs")).toBeVisible();
+      const popupWidth = await browser.evaluate(() => {
+        const popup = document.querySelector<HTMLElement>(
+          ".dui-select-content",
+        );
+        if (!popup) throw new Error("Organization popup is missing");
+        // offsetWidth measures the border box during the opening animation.
+        return popup.offsetWidth;
+      });
+      await app.screenshot(`organization-popup-trigger-${width}`);
+      expect(popupWidth).toBeLessThanOrEqual(popupWidthLimit);
+      expect(popupWidth).toBeGreaterThanOrEqual(
+        Math.min(triggerWidth, popupWidthLimit),
+      );
+    });
+  }
+});
+
 // A name that is one 100-character word, the longest the console accepts. It
 // has no space to break at, so it must wrap inside its container.
 const LONG_NAME_PREFIX = "LONGNAME_";
@@ -998,6 +1045,7 @@ describe("long names", () => {
       expect(m.right).toBeLessThanOrEqual(m.viewportWidth);
       // The whole name stays readable: it wraps instead of being cut off.
       await expect(screen.getByRole("option", LONG_NAME)).toBeVisible();
+      await app.screenshot(`organization-popup-long-option-${width}`);
       await browser.keyboard.press("Escape");
     }
   });

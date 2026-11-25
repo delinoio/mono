@@ -556,6 +556,7 @@ The server records audit events for: organization creation and deletion, ownersh
 `DeleteOrganization` revokes every personal API key of the organization, ends every queued request with `CANCELED`, deletes every runner as described in [Runner lifecycle](#runner-lifecycle), stops the Claude Code orchestrators and vendor watchers of the organization, removes the GitHub installation links, and then deletes the stored credentials. tide cannot uninstall the GitHub App; the console tells the owner to uninstall it in GitHub.
 
 - Each layer does its part through an organization deletion hook of the core, registered in the order above: a step before the deletion transaction that may call OwnSand or GitHub (a failure stops the deletion and keeps the organization, so the step is idempotent), a step in the transaction under the organization row lock, and a step after the commit. The core then revokes the personal API keys, records the audit events and deletes the organization row with its memberships, invitations and keys.
+- If the agent hook or the deletion transaction fails, tide resumes the organization's eligible vendor watchers.
 
 ## Storage
 

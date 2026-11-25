@@ -21,6 +21,8 @@ import (
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
 
+const typeScriptSDKPipeDrainDelay = 2 * time.Second
+
 // TestTypeScriptSDKRelay runs packages/ownsand-sdk/src/e2e.test.ts against
 // the real control plane and agent over the relay. It needs the workspace
 // dependencies (`pnpm install`) and is skipped when pnpm is not on PATH.
@@ -42,13 +44,19 @@ func TestTypeScriptSDKRelay(t *testing.T) {
 		"OWNSAND_E2E_ORG="+s.orgID,
 		"OWNSAND_E2E_BILLING_URL="+control.URL,
 	)
-	out, err := cmd.CombinedOutput()
+	out, err := runTypeScriptSDKCommand(cmd)
 	if err != nil {
 		t.Fatalf("TypeScript SDK end-to-end test: %v\n%s", err, out)
 	}
 	t.Logf("TypeScript SDK end-to-end test:\n%s", out)
 	// The log scanner stores the records asynchronously, so wait for them.
 	s.requireAPILogMessages(ctx, t, "billing_sandbox_paused", "billing_sandbox_resumed")
+}
+
+func runTypeScriptSDKCommand(cmd *exec.Cmd) ([]byte, error) {
+	// A descendant can keep the output pipe open after pnpm is killed.
+	cmd.WaitDelay = typeScriptSDKPipeDrainDelay
+	return cmd.CombinedOutput()
 }
 
 // billingControlPath is the path prefix of the billing control endpoint.

@@ -363,10 +363,10 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 			if _, err := a.env.Stdout.Write(ev.Data); err != nil {
 				return &localWriteError{err: err}
 			}
-			return nil
 		case ownsand.ExecEventStderr:
-			_, err := a.env.Stderr.Write(ev.Data)
-			return err
+			if _, err := a.env.Stderr.Write(ev.Data); err != nil {
+				return &localWriteError{err: err}
+			}
 		case ownsand.ExecEventOutputTruncated:
 			var parts []string
 			if !ev.MissingStdout.Empty() {
@@ -389,9 +389,8 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 		}
 		var lw *localWriteError
 		if errors.As(err, &lw) {
-			// The local standard output rejected the guest output. The data
-			// path worked, so this is an ordinary CLI error (exit 1 with the
-			// write error on standard error), like a failed result write.
+			// The CLI received the guest output. A local write failure uses
+			// the ordinary CLI error status.
 			return lw.err
 		}
 		var dp *ownsand.DataPathError
@@ -894,8 +893,7 @@ func (a *app) fileWrite(ctx context.Context, name string, args []string) error {
 	return nil
 }
 
-// localWriteError marks a failed write of guest output to the local standard
-// output, so that exec does not report it as a data path failure.
+// localWriteError identifies a failed local write of guest stdout or stderr.
 type localWriteError struct{ err error }
 
 func (e *localWriteError) Error() string { return e.err.Error() }

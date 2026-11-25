@@ -278,8 +278,9 @@ export type AutoTopUpSettings = Message<"delino.accounts.v1.AutoTopUpSettings"> 
   consecutiveFailures: number;
 
   /**
-   * Output only; ignored in updates. Sum of the automatic top-ups charged in
-   * the current UTC calendar month.
+   * Output only. Updates ignore this field. Monthly cap usage in the current
+   * UTC calendar month. The total includes completed and in-flight automatic
+   * top-ups, including queued entries, and excludes failed automatic top-ups.
    *
    * @generated from field: int64 month_to_date_usd_micros = 6;
    */

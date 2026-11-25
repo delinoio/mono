@@ -775,8 +775,8 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 // A delete or a TTL end that took over (sb.ending, or a record that left
 // CREATING and RUNNING) keeps control of the teardown: publishRunning commits
 // nothing more and returns ABORTED, and that end stops the VM after the create
-// released sb.cmdMu. When the attempts are used up, the create does not report
-// success: it ends the sandbox as CREATE_FAILED, which stops the VM. When
+// released sb.cmdMu. When the attempts are used up and the create can claim
+// teardown, it ends the sandbox as CREATE_FAILED, which stops the VM. When
 // that end fails too, the sandbox stays tracked with its VM, ending cleared,
 // so that a TTL tick, a delete or the VM exit ends it later.
 func (m *Manager) publishRunning(ctx context.Context, sb *sandbox, vm vmruntime.VM) (*ownsandv1.SandboxStateEntry, error) {
@@ -798,14 +798,10 @@ func (m *Manager) publishRunning(ctx context.Context, sb *sandbox, vm vmruntime.
 		if err == nil {
 			return entry, nil
 		}
-		if errors.Is(err, errSandboxGone) {
-			m.logger.Warn("sandbox ended during its create; the end stops the VM", "sandbox_id", id)
-			m.mu.Lock()
-			entry := sb.rec.Entry(m.epoch)
-			m.mu.Unlock()
-			return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "sandbox was deleted during its create")
-		}
 		lastErr = err
+		if errors.Is(err, errSandboxGone) {
+			break
+		}
 		// The record state after the error tells the failures apart: a
 		// revision failure did not change the record, a save failure did.
 		m.mu.Lock()
@@ -827,6 +823,16 @@ func (m *Manager) publishRunning(ctx context.Context, sb *sandbox, vm vmruntime.
 		case <-ctx.Done():
 		}
 	}
+	// Tick can claim teardown while the create still holds sb.cmdMu.
+	m.mu.Lock()
+	if errors.Is(lastErr, errSandboxGone) || !live() {
+		entry := sb.rec.Entry(m.epoch)
+		m.mu.Unlock()
+		m.logger.Warn("sandbox ended during its create; the end stops the VM", "sandbox_id", id)
+		return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "sandbox was deleted during its create")
+	}
+	sb.ending = true
+	m.mu.Unlock()
 	m.logger.Error("sandbox running record could not be published; ending the sandbox", "sandbox_id", id, "error", lastErr)
 	entry, err := m.endLocked(context.Background(), sb, ownsandv1.SandboxState_SANDBOX_STATE_FAILED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED)
 	if err != nil {

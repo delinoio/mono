@@ -20,7 +20,11 @@ describe("e2e app command", () => {
       directory: "delino-accounts",
       config: accountsConfig,
       configArgs: ["--config", "e2e/rsbuild.config.ts"],
-      env: { PUBLIC_API_ORIGIN: "http://127.0.0.1:28100" },
+      env: {
+        PUBLIC_API_ORIGIN: "http://127.0.0.1:28100",
+        PUBLIC_LOGTO_ENDPOINT: "https://logto.test",
+        PUBLIC_LOGTO_APP_ID: "accounts-e2e",
+      },
     },
     {
       directory: "ownsand",
