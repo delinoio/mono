@@ -565,12 +565,8 @@ func (g *guest) start(ds *tidev1.DevSession, req *tidev1.ExecDevSessionRequest) 
 	if t := req.GetTimeout(); t != nil {
 		ctx, cancel = context.WithTimeout(ctx, t.AsDuration())
 	}
-	cmd := newExecCommand(ctx, req.GetCommand())
+	cmd := newExecCommand(ctx, req.GetCommand(), req.GetEnv())
 	cmd.Dir = dir
-	cmd.Env = os.Environ()
-	for k, v := range req.GetEnv() {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
 	cmd.Stdout = writerFunc(func(b []byte) (int, error) { p.append(0, b); return len(b), nil })
 	cmd.Stderr = writerFunc(func(b []byte) (int, error) { p.append(1, b); return len(b), nil })
 	cmd.WaitDelay = time.Second
