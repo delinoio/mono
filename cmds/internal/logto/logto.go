@@ -27,7 +27,7 @@ import (
 
 // Config identifies the tenant, the application and the API resource.
 type Config struct {
-	// Endpoint is the tenant endpoint, for example https://auth.example.com.
+	// Endpoint is an HTTP or HTTPS tenant URL without a query or fragment.
 	Endpoint string
 	// AppID is the ID of the native application with device flow.
 	AppID string
@@ -177,6 +177,10 @@ func (c Config) Validate() error {
 	u, err := url.Parse(c.Endpoint)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return errors.New("logto: the tenant endpoint must be an http or https URL")
+	}
+	// Check for delimiters in the original URL because url.Parse drops an empty fragment.
+	if strings.ContainsAny(c.Endpoint, "?#") {
+		return errors.New("logto: the tenant endpoint must not contain a query or fragment")
 	}
 	return nil
 }

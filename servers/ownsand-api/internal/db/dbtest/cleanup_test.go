@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
@@ -119,13 +120,21 @@ func TestNewURLDropsDatabaseOnCleanup(t *testing.T) {
 	admin := URL(t)
 	ctx := context.Background()
 	var name string
-	t.Run("fixture", func(t *testing.T) {
-		u := NewURL(t)
-		conn, err := pgx.Connect(ctx, u)
+	connect := func(t *testing.T, url string) *pgx.Conn {
+		t.Helper()
+		cfg, err := pgxpool.ParseConfig(url)
 		if err != nil {
-			t.Fatal("connect to the generated database failed")
+			t.Fatal("parse database configuration failed")
 		}
-		defer func() { _ = conn.Close(ctx) }()
+		conn, err := pgx.ConnectConfig(ctx, cfg.ConnConfig)
+		if err != nil {
+			t.Fatal("connect to the database failed")
+		}
+		t.Cleanup(func() { _ = conn.Close(ctx) })
+		return conn
+	}
+	t.Run("fixture", func(t *testing.T) {
+		conn := connect(t, NewURL(t))
 		if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&name); err != nil {
 			t.Fatal("read the generated database name failed")
 		}
@@ -133,11 +142,7 @@ func TestNewURLDropsDatabaseOnCleanup(t *testing.T) {
 	if !strings.HasPrefix(name, "ownsand_test_") {
 		t.Fatalf("generated database name = %q", name)
 	}
-	conn, err := pgx.Connect(ctx, admin)
-	if err != nil {
-		t.Fatal("connect to the admin database failed")
-	}
-	defer func() { _ = conn.Close(ctx) }()
+	conn := connect(t, admin)
 	var exists bool
 	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists); err != nil {
 		t.Fatal("query pg_database failed")

@@ -26,17 +26,21 @@ type Fake struct {
 	OutpostID   string
 	OutpostName string
 
-	mu          sync.Mutex
-	entries     map[string]*entry
-	order       []string
-	streams     map[int]chan string
-	nextID      int
-	lists       int
-	failWatch   int
-	failRelease bool
-	claims      map[string]int
-	releases    map[string]int
-	messages    map[string][]string
+	mu              sync.Mutex
+	entries         map[string]*entry
+	order           []string
+	streams         map[int]chan string
+	nextID          int
+	lists           int
+	failWatch       int
+	failRelease     bool
+	queuePages      map[string]map[string]any
+	claimAttempts   []string
+	watchCursors    []string
+	claims          map[string]int
+	releaseAttempts map[string]int
+	releases        map[string]int
+	messages        map[string][]string
 }
 
 type entry struct {
@@ -59,7 +63,7 @@ func (e *entry) object(outpost string) map[string]any {
 // New starts a fake with one outpost and one API token.
 func New(t testing.TB, token, outpostName string) *Fake {
 	f := &Fake{Token: token, OutpostID: "outpost_env-0001", OutpostName: outpostName, entries: map[string]*entry{}, streams: map[int]chan string{},
-		claims: map[string]int{}, releases: map[string]int{}, messages: map[string][]string{}}
+		claims: map[string]int{}, releaseAttempts: map[string]int{}, releases: map[string]int{}, messages: map[string][]string{}}
 	f.Server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(func() {
 		f.EndStreams()
@@ -96,6 +100,16 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		f.mu.Lock()
 		f.lists++
+		if f.queuePages != nil {
+			page, ok := f.queuePages[q.Get("cursor")]
+			f.mu.Unlock()
+			if !ok {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unexpected queue cursor"})
+				return
+			}
+			writeJSON(w, http.StatusOK, page)
+			return
+		}
 		var items []any
 		for _, id := range f.order {
 			e := f.entries[id]
@@ -124,6 +138,9 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		sid, action, _ := strings.Cut(rest, "/")
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if r.Method == http.MethodPost && action == "release" {
+			f.releaseAttempts[sid]++
+		}
 		e, ok := f.entries[sid]
 		if !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
@@ -140,6 +157,7 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		case r.Method == http.MethodGet && action == "":
 			writeJSON(w, http.StatusOK, e.object(f.OutpostID))
 		case r.Method == http.MethodPost && action == "claim":
+			f.claimAttempts = append(f.claimAttempts, sid)
 			if body.AcceptorID == "" || (e.Phase == "claimed" && e.AcceptorID != body.AcceptorID) {
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "already claimed"})
 				return
@@ -192,6 +210,7 @@ func (f *Fake) watch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ch := make(chan string, 64)
+	f.watchCursors = append(f.watchCursors, r.URL.Query().Get("cursor"))
 	id := f.nextID
 	f.nextID++
 	f.streams[id] = ch
@@ -281,6 +300,15 @@ func (f *Fake) Forget(sid string) {
 	delete(f.entries, sid)
 }
 
+// DeleteSession removes a session and sends a DELETED event. A repeated
+// call delivers the deletion again.
+func (f *Fake) DeleteSession(sid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.entries, sid)
+	f.broadcastLocked("DELETED", &entry{SessionID: sid})
+}
+
 // ClaimElsewhere lets another acceptor take a pending session.
 func (f *Fake) ClaimElsewhere(sid string) {
 	f.mu.Lock()
@@ -338,6 +366,47 @@ func (f *Fake) Lists() int {
 	return f.lists
 }
 
+// QueuePage describes a scripted list response for a request cursor.
+type QueuePage struct {
+	SessionIDs  []string
+	Cursor      string
+	HasNextPage bool
+}
+
+// SetQueuePages serves fixed pages, including after a claim changes the live
+// queue. Each key is the cursor that tide sends to request that page.
+func (f *Fake) SetQueuePages(t testing.TB, pages map[string]QueuePage) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queuePages = make(map[string]map[string]any, len(pages))
+	for cursor, page := range pages {
+		items := make([]any, 0, len(page.SessionIDs))
+		for _, sid := range page.SessionIDs {
+			e := f.entries[sid]
+			if e == nil {
+				t.Fatalf("queue page names unknown session %q", sid)
+			}
+			items = append(items, e.object(f.OutpostID))
+		}
+		f.queuePages[cursor] = map[string]any{"items": items, "cursor": page.Cursor, "has_next_page": page.HasNextPage}
+	}
+}
+
+// ClaimAttempts returns the session IDs of claim requests in order.
+func (f *Fake) ClaimAttempts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.claimAttempts...)
+}
+
+// WatchCursors returns the request cursors of successfully opened watches.
+func (f *Fake) WatchCursors() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.watchCursors...)
+}
+
 // State returns the phase and acceptor ID of a session.
 func (f *Fake) State(sid string) (phase, acceptorID string) {
 	f.mu.Lock()
@@ -354,6 +423,13 @@ func (f *Fake) Claims(sid string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.claims[sid]
+}
+
+// ReleaseAttempts returns the number of release calls, including rejected calls.
+func (f *Fake) ReleaseAttempts(sid string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.releaseAttempts[sid]
 }
 
 // Releases returns how often a session's claim was released.

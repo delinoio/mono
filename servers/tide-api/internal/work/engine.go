@@ -95,6 +95,8 @@ type Engine struct {
 
 	mu      sync.Mutex
 	drivers map[string]chan struct{}
+	// initialCreates holds runner IDs while the dispatcher calls CreateSandbox.
+	initialCreates sync.Map
 	// runCtx and runWG belong to the running reconciler component.
 	runCtx context.Context
 	runWG  *sync.WaitGroup
@@ -188,7 +190,9 @@ func (e *Engine) GetRequest(ctx context.Context, q db.Querier, orgID, id string)
 	return r, err
 }
 
-func (e *Engine) lockRequest(ctx context.Context, tx pgx.Tx, id string) (*Request, error) {
+// LockRequest loads and locks a request by its ID in the caller's transaction.
+// When a transition needs both locks, take the runner lock first.
+func (e *Engine) LockRequest(ctx context.Context, tx pgx.Tx, id string) (*Request, error) {
 	r, err := scanRequest(tx.QueryRow(ctx, "SELECT "+requestColumns+" FROM requests WHERE request_id = $1 FOR UPDATE", id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, api.ErrNotFound("request")
@@ -199,6 +203,14 @@ func (e *Engine) lockRequest(ctx context.Context, tx pgx.Tx, id string) (*Reques
 // GetRunner loads a runner of the organization (not_found otherwise).
 func (e *Engine) GetRunner(ctx context.Context, q db.Querier, orgID, id string) (*Runner, error) {
 	r, err := scanRunner(q.QueryRow(ctx, "SELECT "+runnerColumns+" FROM runners WHERE organization_id = $1 AND runner_id = $2", orgID, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, api.ErrNotFound("runner")
+	}
+	return r, err
+}
+
+func (e *Engine) lockOrganizationRunner(ctx context.Context, tx pgx.Tx, orgID, id string) (*Runner, error) {
+	r, err := scanRunner(tx.QueryRow(ctx, "SELECT "+runnerColumns+" FROM runners WHERE organization_id = $1 AND runner_id = $2 FOR UPDATE", orgID, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, api.ErrNotFound("runner")
 	}
@@ -254,7 +266,8 @@ type NewRequest struct {
 // CreateRequest creates a QUEUED request in tx, or returns the existing
 // request of the same organization, source and source key (created is then
 // false), so a repeated event or claim never creates a second request. The
-// caller kicks the dispatcher after the commit (Service.WorkChanged).
+// caller holds the organization and profile share locks, in that order,
+// and kicks the dispatcher after the commit (Service.WorkChanged).
 func (e *Engine) CreateRequest(ctx context.Context, tx pgx.Tx, n NewRequest) (*Request, bool, error) {
 	p := n.Profile
 	id := n.RequestID
@@ -297,7 +310,7 @@ func (e *Engine) CreateRequest(ctx context.Context, tx pgx.Tx, n NewRequest) (*R
 // log and clears the stored work order. Run ReleaseClaim with
 // releaseAfterCommit when the request ended before a runner took its work.
 func (e *Engine) endRequestTx(ctx context.Context, tx pgx.Tx, id string, end RequestEnd) (*Request, tidev1.RequestState, error) {
-	r, err := e.lockRequest(ctx, tx, id)
+	r, err := e.LockRequest(ctx, tx, id)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -498,7 +511,7 @@ func (e *Engine) DeleteIdleRunnerTx(ctx context.Context, tx pgx.Tx, orgID, runne
 
 // startRequestTx moves a request to STARTING or RUNNING with its runner.
 func (e *Engine) startRequestTx(ctx context.Context, tx pgx.Tx, requestID, runnerID string, from []tidev1.RequestState, to tidev1.RequestState) error {
-	req, err := e.lockRequest(ctx, tx, requestID)
+	req, err := e.LockRequest(ctx, tx, requestID)
 	if err != nil {
 		return err
 	}

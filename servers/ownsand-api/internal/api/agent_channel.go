@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/delinoio/mono/go/uuidv7"
 	"github.com/delinoio/mono/internal/semver"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
@@ -55,7 +56,7 @@ type commandInfo struct {
 	snapshotID string
 }
 
-// errDeviceRemoved closes a channel after the clean-up command.
+// errDeviceRemoved indicates that the device is removed or missing.
 var errDeviceRemoved = errors.New("the device was removed")
 
 // errInitialStateReportFailed closes a channel whose first full state report
@@ -466,6 +467,15 @@ func (s *Service) handleCapabilityReport(ctx context.Context, conn *hub.Conn, r 
 }
 
 func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *ownsandv1.StateReport) error {
+	epoch := r.GetStateEpoch()
+	if !uuidv7.Valid(epoch) {
+		s.Logger.WarnContext(ctx, "agent_state_report_rejected", slog.String("device_id", conn.DeviceID),
+			slog.String("channel_id", conn.ID), slog.String("field", "state_epoch"), slog.Int("value_bytes", len(epoch)))
+		if !conn.Reconciled() {
+			conn.Close(errInitialStateReportFailed)
+		}
+		return nil
+	}
 	res, err := s.reconcileStateReport(ctx, conn.DeviceID, conn.ID, r)
 	if err != nil {
 		if !conn.Reconciled() && ctx.Err() == nil {
@@ -562,6 +572,11 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	var err error
 	switch info.kind {
 	case cmdCreateSandbox:
+		if res.GetError().GetCode() == ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+			// A competing end owns teardown. Apply its state through the
+			// sandbox updates or the next state report.
+			break
+		}
 		if res.GetError() != nil {
 			// A transient database error is retried inside
 			// Timing.CreateFailTimeout; a failure that remains closes this
@@ -717,7 +732,7 @@ func (s *Service) applyResultEntry(ctx context.Context, conn *hub.Conn, e *ownsa
 	return nil
 }
 
-// releaseKey is the per-channel value of the last update decision sent.
+// releaseKey is the per-channel value of the last update decision queued.
 type releaseKey struct{}
 
 // withdrawKey is the releaseKey value after a withdrawal. It cannot equal a
@@ -753,8 +768,12 @@ type updateDecision struct {
 func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDecision, error) {
 	var orgID, running string
 	var hostOS, arch int16
-	if err := s.DB.Pool.QueryRow(ctx, "SELECT organization_id::text, agent_version, host_os, arch FROM devices WHERE device_id = $1", deviceID).
-		Scan(&orgID, &running, &hostOS, &arch); err != nil {
+	err := s.DB.Pool.QueryRow(ctx, "SELECT organization_id::text, agent_version, host_os, arch FROM devices WHERE device_id = $1 AND state <> $2",
+		deviceID, int16(ownsandv1.DeviceState_DEVICE_STATE_REMOVED)).Scan(&orgID, &running, &hostOS, &arch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return updateDecision{}, errDeviceRemoved
+	}
+	if err != nil {
 		return updateDecision{}, err
 	}
 	policy, err := s.loadPolicy(ctx, s.DB.Pool, orgID)
@@ -831,39 +850,53 @@ func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDeci
 // send its command after the command of a newer decision.
 func (s *Service) evaluateUpdate(ctx context.Context, conn *hub.Conn) error {
 	defer conn.LockUpdates()()
+	if conn.Context().Err() != nil {
+		return nil
+	}
 	d, err := s.updateTarget(ctx, conn.DeviceID)
+	if errors.Is(err, errDeviceRemoved) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
+	lastDecision := conn.Value(releaseKey{})
 	if d.withdraw {
-		if conn.Value(releaseKey{}) == withdrawKey {
+		if lastDecision == withdrawKey {
 			return nil
 		}
-		conn.SetValue(releaseKey{}, withdrawKey)
 		_, err = s.sendCommand(ctx, conn, commandInfo{kind: cmdWithdrawUpdate, orgID: conn.OrganizationID},
 			&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_WithdrawAgentUpdate{WithdrawAgentUpdate: &ownsandv1.WithdrawAgentUpdateCommand{}}})
+		if err == nil {
+			conn.SetValue(releaseKey{}, withdrawKey)
+		}
 		return err
 	}
-	// A decision that is not a withdrawal ends the HOLD period, also when it
-	// sends no command (for example a default that is not newer than the
-	// running version). Clearing the marker makes the next HOLD send its own
-	// withdrawal instead of being skipped as a duplicate.
-	if conn.Value(releaseKey{}) == withdrawKey {
-		conn.SetValue(releaseKey{}, nil)
-	}
 	var running string
-	if err := s.DB.Pool.QueryRow(ctx, "SELECT agent_version FROM devices WHERE device_id = $1", conn.DeviceID).Scan(&running); err != nil {
+	err = s.DB.Pool.QueryRow(ctx, "SELECT agent_version FROM devices WHERE device_id = $1 AND state <> $2",
+		conn.DeviceID, int16(ownsandv1.DeviceState_DEVICE_STATE_REMOVED)).Scan(&running)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	// A revocation recovery is sent even when the same target was sent
 	// before without it, because only a recovery allows a downgrade.
 	sent := fmt.Sprintf("%s/%t", d.target, d.recovery)
-	if d.target == "" || (d.target == running && !d.pinned) || conn.Value(releaseKey{}) == sent {
+	if d.target == "" || (d.target == running && !d.pinned) || lastDecision == sent {
+		// A completed decision can end the HOLD period even without a
+		// target. The next HOLD then sends its own withdrawal.
+		if lastDecision == withdrawKey {
+			conn.SetValue(releaseKey{}, nil)
+		}
 		return nil
 	}
-	conn.SetValue(releaseKey{}, sent)
 	_, err = s.sendCommand(ctx, conn, commandInfo{kind: cmdUpdateAgent, orgID: conn.OrganizationID},
 		&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_UpdateAgent{UpdateAgent: &ownsandv1.UpdateAgentCommand{TargetVersion: d.target, RevocationRecovery: d.recovery}}})
+	if err == nil {
+		conn.SetValue(releaseKey{}, sent)
+	}
 	return err
 }
 

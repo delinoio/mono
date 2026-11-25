@@ -3,6 +3,7 @@
 package ownsand
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"runtime"
@@ -10,9 +11,183 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
+
+// recvTestContext lets a test coordinate cancellation with a receive check.
+type recvTestContext struct {
+	context.Context
+	beforeDone func()
+	beforeErr  func()
+}
+
+func (c *recvTestContext) Done() <-chan struct{} {
+	if c.beforeDone != nil {
+		c.beforeDone()
+	}
+	return c.Context.Done()
+}
+
+func (c *recvTestContext) Err() error {
+	if c.beforeErr != nil {
+		c.beforeErr()
+	}
+	return c.Context.Err()
+}
+
+func TestStreamRecvContextWinsAtHandoff(t *testing.T) {
+	tests := []struct {
+		name  string
+		ready func(s *p2pSession, st *p2pStream)
+	}{
+		{name: "queued frame", ready: func(_ *p2pSession, st *p2pStream) {
+			st.ch <- datapath.MustNewFrame(st.id, "", &ownsandv1.ErrorDetail{Message: "queued"})
+		}},
+		{name: "stream failure", ready: func(_ *p2pSession, st *p2pStream) {
+			st.fail(errors.New("stream failed"))
+		}},
+		{name: "session end", ready: func(s *p2pSession, _ *p2pStream) {
+			s.endErr = errors.New("session ended")
+			close(s.done)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, st, _ := newDispatchSession(t)
+			tt.ready(s, st)
+			ctx := newExpiringContext()
+			entered := false
+			gated := &recvTestContext{Context: ctx, beforeErr: func() {
+				if entered {
+					ctx.expire()
+				}
+				entered = true
+			}}
+			if f, err := st.recv(gated); f != nil || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("recv = (%v, %v), want (nil, context.DeadlineExceeded)", f, err)
+			}
+		})
+	}
+}
+
+func TestStreamRecvCancelWithReadyFrame(t *testing.T) {
+	tests := []struct {
+		name string
+		end  func(st *p2pStream)
+	}{
+		{name: "active stream", end: func(*p2pStream) {}},
+		{name: "failed stream", end: func(st *p2pStream) { st.fail(errors.New("stream failed")) }},
+		{name: "ended session", end: func(st *p2pStream) {
+			st.s.endErr = errors.New("session ended")
+			close(st.s.done)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Done runs after the fast queue check. Repeat so select can take
+			// the frame directly or drain it after a failure or session end.
+			for i := range 32 {
+				_, st, _ := newDispatchSession(t)
+				ctx, cancel := context.WithCancel(t.Context())
+				gated := &recvTestContext{Context: ctx, beforeDone: func() {
+					st.ch <- datapath.MustNewFrame(st.id, "", &ownsandv1.ErrorDetail{Message: "queued"})
+					tt.end(st)
+					cancel()
+				}}
+				f, err := st.recv(gated)
+				cancel()
+				if f != nil || !errors.Is(err, context.Canceled) {
+					t.Fatalf("iteration %d: recv = (%v, %v), want (nil, context.Canceled)", i, f, err)
+				}
+			}
+		})
+	}
+}
+
+func TestStreamRecvRejectsLatePeerEvents(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload proto.Message
+	}{
+		{name: "exec output", payload: &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{
+			Stdout: &ownsandv1.ExecOutput{Data: []byte("output")},
+		}}},
+		{name: "exec exit", payload: exitedEvent(0)},
+		{name: "file chunk", payload: &ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_Chunk{
+			Chunk: &ownsandv1.FileChunk{Data: []byte("data")},
+		}}},
+		{name: "file end", payload: &ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_End{
+			End: &ownsandv1.FileReadEnd{},
+		}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, stop := context.WithTimeout(t.Context(), 10*time.Second)
+			defer stop()
+			cp := newFakeCP(t)
+			waiting := make(chan struct{})
+			cp.p2pScript = func(int) p2pAction {
+				return p2pAction{raw: func(id uint64, sandboxID string) *ownsandv1.DataFrame {
+					select {
+					case <-waiting:
+					case <-ctx.Done():
+					}
+					return datapath.MustNewFrame(id, sandboxID, tt.payload)
+				}}
+			}
+			s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+			sess, err := s.dp.route(ctx)
+			if err != nil || sess == nil {
+				t.Fatalf("open peer session: %v", err)
+			}
+			callCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			waitingToSend := true
+			atReceive := false
+			gated := &recvTestContext{Context: callCtx, beforeDone: func() {
+				// The send turn also checks Done. Let the request go out first.
+				if waitingToSend {
+					waitingToSend = false
+					return
+				}
+				close(waiting)
+				requireReady(t, ctx, "peer frame queued", func() bool {
+					sess.mu.Lock()
+					defer sess.mu.Unlock()
+					st := sess.streams[1]
+					return st != nil && len(st.ch) > 0
+				}, nil)
+				atReceive = true
+			}, beforeErr: func() {
+				// Let select take the frame, then cancel at the handoff check.
+				if atReceive {
+					cancel()
+				}
+			}}
+
+			switch tt.payload.(type) {
+			case *ownsandv1.ExecEvent:
+				calls := 0
+				result, err := s.Exec(gated, ExecParams{Command: []string{"run"}, OnEvent: func(ExecEvent) error {
+					calls++
+					return nil
+				}})
+				if result != nil || calls != 0 || !errors.Is(err, context.Canceled) {
+					t.Fatalf("Exec = (%+v, %v), callbacks = %d; want context.Canceled and no result or callback", result, err, calls)
+				}
+			case *ownsandv1.FileReadEvent:
+				var output bytes.Buffer
+				n, err := s.ReadFile(gated, "/file", &output)
+				if n != 0 || output.Len() != 0 || !errors.Is(err, context.Canceled) {
+					t.Fatalf("ReadFile = (%d, %v), output = %q; want context.Canceled and no output", n, err, output.Bytes())
+				}
+			}
+		})
+	}
+}
 
 // TestStreamRecvCanceledContextSkipsQueuedFrames checks that a caller whose
 // context is done receives its context error and no queued frame, even when

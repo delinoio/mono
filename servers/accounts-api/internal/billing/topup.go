@@ -507,7 +507,6 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 		var claimed topUp
 		var ok bool
 		err = s.db.InTx(ctx, func(tx pgx.Tx) error {
-			now := s.timestamp()
 			acct, err := lockAccount(ctx, tx, candidate.BillingAccountID)
 			if err != nil {
 				return err
@@ -516,6 +515,9 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 			if err != nil || claimed.Status != TopUpPending {
 				return err
 			}
+			// A lock wait can cross a UTC month boundary. Use one timestamp
+			// for the cap check and the charging update.
+			now := s.timestamp()
 			// Charge the current subscription; the one of the time of the
 			// deduction may have been replaced.
 			sub, err := LoadSubscription(ctx, tx, acct.ID, false)
@@ -545,9 +547,6 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 			claimed.PaddleSubscriptionID = sub.PaddleSubscriptionID
 			claimed.Status = TopUpCharging
 			ok = true
-			// now is the one claim time: the cap check above and the cap
-			// month of the claimed top-up use it, so the top-up counts in
-			// the UTC month in which the cap allowed it.
 			_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charging', paddle_subscription_id = $2, update_time = $3,
 					cap_time = $3
 				WHERE top_up_id = $1`, claimed.ID, claimed.PaddleSubscriptionID, now)

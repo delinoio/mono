@@ -206,7 +206,7 @@ func TestConcurrentSnapshotRemovalNeverDeletesReplacement(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, contentDir), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.m.AddImportedSnapshot(&ownsandv1.SnapshotStateEntry{SnapshotId: snapID, GuestOs: ownsandv1.GuestOs_GUEST_OS_LINUX}); err != nil {
+	if _, err := e.m.AddImportedSnapshot(context.Background(), &ownsandv1.SnapshotStateEntry{SnapshotId: snapID, GuestOs: ownsandv1.GuestOs_GUEST_OS_LINUX}); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.m.removeSnapshotEntry(old); err != nil {

@@ -7,8 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 )
 
 func TestChildURL(t *testing.T) {
@@ -60,20 +61,20 @@ func TestChildURLErrorOmitsURL(t *testing.T) {
 func TestNewTargetsGeneratedDatabase(t *testing.T) {
 	u := NewURL(t)
 	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, u)
+	database, err := db.Open(ctx, u)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = conn.Close(ctx) }()
+	defer database.Close()
 	var current string
-	if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
+	if err := database.Pool.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(current, "ownsand_test_") {
 		t.Fatalf("current_database = %q, want a generated database", current)
 	}
 	var migrated bool
-	if err := conn.QueryRow(ctx, "SELECT to_regclass('goose_db_version') IS NOT NULL").Scan(&migrated); err != nil {
+	if err := database.Pool.QueryRow(ctx, "SELECT to_regclass('goose_db_version') IS NOT NULL").Scan(&migrated); err != nil {
 		t.Fatal(err)
 	}
 	if !migrated {

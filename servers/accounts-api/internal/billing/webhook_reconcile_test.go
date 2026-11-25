@@ -167,6 +167,140 @@ func TestPaymentDeliveryWithExistingGrantAppliesPending(t *testing.T) {
 	}
 }
 
+func TestPaymentWebhookExpiresCreditBeforePendingAdjustment(t *testing.T) {
+	type grant struct {
+		transactionID string
+		kind          LedgerKind
+		cents         int64
+		remaining     int64
+	}
+	for _, tc := range []struct {
+		name          string
+		kind          LedgerKind
+		cents         int64
+		grants        []grant
+		releaseOffset time.Duration
+		wantLedger    []wantEntry
+	}{
+		{
+			name: "expired top-up leaves debt",
+			kind: LedgerManualTopUp, cents: 2500,
+			grants: []grant{{"txn_buy", LedgerManualTopUp, 2500, 0}},
+			wantLedger: []wantEntry{
+				{LedgerManualTopUp, 25 * usd, 25 * usd},
+				{LedgerExpiry, -25 * usd, 0},
+				{LedgerRefund, -25 * usd, -25 * usd},
+			},
+		},
+		{
+			name: "expired subscription uses other grants in FIFO order",
+			kind: LedgerSubscriptionCredit, cents: 1000,
+			grants: []grant{
+				{"txn_buy", LedgerSubscriptionCredit, 1000, 0},
+				{"txn_earlier", LedgerManualTopUp, 2500, 15 * usd},
+				{"txn_later", LedgerManualTopUp, 2500, 25 * usd},
+			},
+			wantLedger: []wantEntry{
+				{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
+				{LedgerManualTopUp, 25 * usd, 35 * usd},
+				{LedgerManualTopUp, 25 * usd, 60 * usd},
+				{LedgerExpiry, -10 * usd, 50 * usd},
+				{LedgerRefund, -10 * usd, 40 * usd},
+			},
+		},
+		{
+			name: "usable purchased grant pays before earlier grant",
+			kind: LedgerSubscriptionCredit, cents: 1000,
+			grants: []grant{
+				{"txn_earlier", LedgerManualTopUp, 2500, 25 * usd},
+				{"txn_buy", LedgerSubscriptionCredit, 1000, 0},
+			},
+			releaseOffset: -time.Minute,
+			wantLedger: []wantEntry{
+				{LedgerManualTopUp, 25 * usd, 25 * usd},
+				{LedgerSubscriptionCredit, 10 * usd, 35 * usd},
+				{LedgerRefund, -10 * usd, 25 * usd},
+			},
+		},
+		{
+			name: "first payment expires other credit before reversing new grant",
+			kind: LedgerSubscriptionCredit, cents: 1000,
+			grants: []grant{{"txn_earlier", LedgerManualTopUp, 2500, 0}},
+			wantLedger: []wantEntry{
+				{LedgerManualTopUp, 25 * usd, 25 * usd},
+				{LedgerSubscriptionCredit, 10 * usd, 35 * usd},
+				{LedgerExpiry, -25 * usd, 10 * usd},
+				{LedgerRefund, -10 * usd, 0},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			for _, g := range tc.grants {
+				if code := f.webhook(paddle.EventTransactionCompleted, purchase(g.transactionID, acct, g.kind, g.cents)); code != http.StatusOK {
+					t.Fatalf("seed payment status %d", code)
+				}
+				f.clock.Advance(24 * time.Hour)
+			}
+			// Model an adjustment left pending by an older release.
+			const txnID, adjustmentID, eventID = "txn_buy", "adj_pending", "evt_payment"
+			insertPending(t, f.db, adjustmentID, txnID, string(paddle.AdjustmentActionRefund),
+				tc.cents*MicrosPerCent, f.clock.Now())
+			accountingTime := f.grantExpireTime(tc.grants[0].transactionID).Add(tc.releaseOffset)
+			eventTime := accountingTime.Add(-time.Minute)
+			f.clock.Set(eventTime)
+			data := purchase(txnID, acct, tc.kind, tc.cents)
+			body := paddletest.Event(eventID, paddle.EventTransactionCompleted, eventTime, data)
+			sig := paddle.SignatureHeaderValue(whSecret, eventTime, body)
+			release := f.holdAccountLock(acct)
+			status := make(chan int, 1)
+			go func() { status <- f.deliver(body, sig) }()
+			f.waitForAccountLockWait()
+			f.clock.Set(accountingTime)
+			release()
+			if code := <-status; code != http.StatusOK {
+				t.Fatalf("payment status %d", code)
+			}
+
+			f.wantLedger(acct, tc.wantLedger...)
+			for _, g := range tc.grants {
+				if got := f.remaining(f.grantIDOf(g.transactionID)); got != g.remaining {
+					t.Errorf("grant %s remaining %d, want %d", g.transactionID, got, g.remaining)
+				}
+			}
+			var processedAt, refundedAt time.Time
+			if err := f.db.Pool.QueryRow(ctx(), `SELECT process_time FROM paddle_events WHERE paddle_event_id = $1`, eventID).Scan(&processedAt); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.db.Pool.QueryRow(ctx(), `SELECT create_time FROM credit_refunds WHERE paddle_adjustment_id = $1`, adjustmentID).Scan(&refundedAt); err != nil {
+				t.Fatal(err)
+			}
+			if !processedAt.Equal(eventTime) || !refundedAt.Equal(accountingTime) {
+				t.Errorf("payment processed at %s, refund at %s, want %s and %s", processedAt, refundedAt, eventTime, accountingTime)
+			}
+			if f.pendingCount() != 0 || f.refundCount() != 1 {
+				t.Fatalf("after drain: pending %d, refunds %d, want 0 and 1", f.pendingCount(), f.refundCount())
+			}
+
+			if code := f.deliver(body, paddle.SignatureHeaderValue(whSecret, accountingTime, body)); code != http.StatusOK {
+				t.Fatalf("same event replay status %d", code)
+			}
+			if code := f.webhook(paddle.EventTransactionCompleted, data); code != http.StatusOK {
+				t.Fatalf("new event replay status %d", code)
+			}
+			if err := f.s.ReconcilePendingAdjustments(ctx()); err != nil {
+				t.Fatal(err)
+			}
+			f.wantLedger(acct, tc.wantLedger...)
+			grantCount := f.count(`SELECT count(*) FROM credit_grants WHERE paddle_transaction_id = $1`, txnID)
+			if grantCount != 1 || f.pendingCount() != 0 || f.refundCount() != 1 {
+				t.Fatalf("after replays: grants %d, pending %d, refunds %d, want 1, 0 and 1", grantCount, f.pendingCount(), f.refundCount())
+			}
+		})
+	}
+}
+
 // TestReconcilePendingAdjustmentsIsExactlyOnce checks the cases that keep the
 // effect single: a row whose adjustment credit_refunds already has is only
 // deleted, the cap of the purchase applies in arrival order, and a deleted

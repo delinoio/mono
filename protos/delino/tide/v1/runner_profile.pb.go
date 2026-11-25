@@ -587,7 +587,9 @@ type UpdateRunnerProfileRequest struct {
 	Profile         *RunnerProfile         `protobuf:"bytes,3,opt,name=profile,proto3" json:"profile,omitempty"`
 	// Paths of RunnerProfile to change. `workload_kind` and
 	// `agent_integration_id` are rejected with `invalid_argument`. `source`
-	// changes the source oneof.
+	// changes the source oneof. `resources` replaces all resource values.
+	// `resources.vcpu_count`, `resources.memory_mib` and `resources.disk_gib`
+	// each change only the named value.
 	UpdateMask    *fieldmaskpb.FieldMask `protobuf:"bytes,4,opt,name=update_mask,json=updateMask,proto3" json:"update_mask,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

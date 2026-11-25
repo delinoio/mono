@@ -4,6 +4,9 @@
 
 package store
 
+// SyncPendingIdentityDirectories does nothing outside Linux. See syncDirectory.
+func (s *Store) SyncPendingIdentityDirectories() error { return nil }
+
 // syncDirectory does nothing outside Linux. Flushing the directory entry of
 // the pending identity is a Linux guarantee only: Windows has no directory
 // fsync, and macOS stays unchanged until its own durability behavior is

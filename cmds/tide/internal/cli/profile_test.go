@@ -41,9 +41,8 @@ func (u *updateRecorder) UpdateRunnerProfile(_ context.Context, req *connect.Req
 	return connect.NewResponse(&tidev1.UpdateRunnerProfileResponse{Profile: proto.CloneOf(u.current)}), nil
 }
 
-// TestProfileUpdateMask checks that profile update sends only the mask
-// paths that UpdateRunnerProfile accepts, and keeps the resource values
-// without a flag.
+// TestProfileUpdateMask checks that each update sends only the fields named
+// by flags and makes no GetRunnerProfile call.
 func TestProfileUpdateMask(t *testing.T) {
 	f := newFixture(t)
 	rec := &updateRecorder{current: &tidev1.RunnerProfile{
@@ -61,34 +60,62 @@ func TestProfileUpdateMask(t *testing.T) {
 	t.Cleanup(srv.Close)
 	f.env[EnvAPIURL] = srv.URL
 
-	f.ok("", "--org", f.org, "profile", "update", "p1", "--vcpu", "8", "--image", "linux")
-	f.ok("", "--org", f.org, "profile", "update", "p1", "--template", "tpl", "--vcpu", "2", "--memory-mib", "4096", "--disk-gib", "32")
-	f.ok("", "--org", f.org, "profile", "update", "p1", "--name", "renamed")
-	if len(rec.updates) != 3 {
-		t.Fatalf("updates = %d", len(rec.updates))
-	}
-	// Only the partial resource update reads the current profile.
-	if rec.gets != 1 {
-		t.Fatalf("GetRunnerProfile calls = %d, want 1", rec.gets)
-	}
-	for i, tc := range []struct {
-		paths     []string
-		resources *tidev1.Resources
+	for _, tc := range []struct {
+		name    string
+		flags   []string
+		paths   []string
+		profile *tidev1.RunnerProfile
 	}{
-		{[]string{"source", "resources"}, &tidev1.Resources{VcpuCount: 8, MemoryMib: 8192, DiskGib: 64}},
-		{[]string{"source", "resources"}, &tidev1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 32}},
-		{[]string{"name"}, nil},
+		{
+			name:  "vCPU and disk with image",
+			flags: []string{"--vcpu", "8", "--disk-gib", "96", "--image", "linux"},
+			paths: []string{"source", "resources.vcpu_count", "resources.disk_gib"},
+			profile: &tidev1.RunnerProfile{
+				Resources: &tidev1.Resources{VcpuCount: 8, DiskGib: 96},
+				Source:    &tidev1.RunnerProfile_BaseImage{BaseImage: tidev1.GuestOs_GUEST_OS_LINUX},
+			},
+		},
+		{
+			name:    "memory only",
+			flags:   []string{"--memory-mib", "16384"},
+			paths:   []string{"resources.memory_mib"},
+			profile: &tidev1.RunnerProfile{Resources: &tidev1.Resources{MemoryMib: 16384}},
+		},
+		{
+			name:  "all resources with template",
+			flags: []string{"--template", "tpl", "--vcpu", "2", "--memory-mib", "4096", "--disk-gib", "32"},
+			paths: []string{"source", "resources"},
+			profile: &tidev1.RunnerProfile{
+				Resources: &tidev1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 32},
+				Source:    &tidev1.RunnerProfile_OwnsandTemplateId{OwnsandTemplateId: "tpl"},
+			},
+		},
+		{
+			name:    "name only",
+			flags:   []string{"--name", "renamed"},
+			paths:   []string{"name"},
+			profile: &tidev1.RunnerProfile{Name: "renamed"},
+		},
 	} {
-		got := rec.updates[i]
-		if !slices.Equal(got.GetUpdateMask().GetPaths(), tc.paths) {
-			t.Errorf("update %d paths = %v, want %v", i, got.GetUpdateMask().GetPaths(), tc.paths)
-		}
-		if !proto.Equal(got.GetProfile().GetResources(), tc.resources) {
-			t.Errorf("update %d resources = %v, want %v", i, got.GetProfile().GetResources(), tc.resources)
-		}
-	}
-	if rec.updates[0].GetProfile().GetBaseImage() != tidev1.GuestOs_GUEST_OS_LINUX || rec.updates[1].GetProfile().GetOwnsandTemplateId() != "tpl" {
-		t.Errorf("sources = %v, %v", rec.updates[0].GetProfile().GetSource(), rec.updates[1].GetProfile().GetSource())
+		t.Run(tc.name, func(t *testing.T) {
+			r := f.run("", append([]string{"--org", f.org, "profile", "update", "p1"}, tc.flags...)...)
+			if r.code != 0 {
+				t.Fatalf("tide exited %d: %s%s", r.code, r.stdout, r.stderr)
+			}
+			rec.mu.Lock()
+			defer rec.mu.Unlock()
+			if rec.gets != 0 || len(rec.updates) != 1 {
+				t.Fatalf("GetRunnerProfile calls = %d, UpdateRunnerProfile calls = %d, want 0 and 1", rec.gets, len(rec.updates))
+			}
+			got := rec.updates[0]
+			rec.updates = nil
+			if !slices.Equal(got.GetUpdateMask().GetPaths(), tc.paths) {
+				t.Errorf("update paths = %v, want %v", got.GetUpdateMask().GetPaths(), tc.paths)
+			}
+			if !proto.Equal(got.GetProfile(), tc.profile) {
+				t.Errorf("update profile = %v, want %v", got.GetProfile(), tc.profile)
+			}
+		})
 	}
 	if r := f.run("", "--org", f.org, "profile", "update", "p1"); r.code != ExitUsage {
 		t.Fatalf("update without flags = %d", r.code)

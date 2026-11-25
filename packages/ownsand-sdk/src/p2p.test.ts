@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import assert from "node:assert/strict";
 import { runInNewContext } from "node:vm";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -6,9 +7,12 @@ import { describe, expect, test } from "@rstest/core";
 import { encodeMessages } from "./codec.ts";
 import {
   billingReasonOf,
+  classifyFailure,
   DataPathError,
+  FailureClass,
   InvalidFrameError,
   OwnSandConfigError,
+  OwnSandCredentialError,
   OwnSandHandleClosedError,
   OwnSandValidationError,
 } from "./errors.ts";
@@ -125,6 +129,43 @@ function execEvent(
 }
 
 describe("peer-to-peer data path", () => {
+  describe.each([DataPathTransport.RELAY, DataPathTransport.PEER_TO_PEER])(
+    "exec validation with transport %s",
+    (transport) => {
+      test.each([
+        ["program", { command: ["program\ud800"] }, "command"],
+        ["argument", { command: ["echo", "argument\udfff"] }, "command"],
+        [
+          "environment key",
+          { env: { "\ud800": "first", "\ufffd": "second" } },
+          "env",
+        ],
+        ["environment value", { env: { example: "value\udfff" } }, "env"],
+        [
+          "working directory",
+          { workingDirectory: "/tmp/\ud800" },
+          "working_directory",
+        ],
+      ] as const)(
+        "rejects a lone surrogate in the %s before transport setup",
+        (_name, override, field) => {
+          const { h, rtc } = p2pSetup(() => {}, { transport });
+          const sandbox = h.client.sandbox(SANDBOX);
+          assert.throws(
+            () => sandbox.exec({ command: ["echo"], ...override }),
+            {
+              name: "OwnSandValidationError",
+              field,
+              message: `${field} must be valid UTF-8`,
+            },
+          );
+          expect(h.api.calls).toHaveLength(0);
+          expect(rtc.connections).toHaveLength(0);
+        },
+      );
+    },
+  );
+
   test("runs an exec over one data channel without a relay grant", async () => {
     const { h, rtc } = p2pSetup((frame, peer) => {
       if (frame.kind === DataFrameKind.EXEC_REQUEST) {
@@ -134,7 +175,12 @@ describe("peer-to-peer data path", () => {
       }
     });
     const sandbox = h.client.sandbox(SANDBOX);
-    const run = await h.clock.run(sandbox.run({ command: ["echo", "p2p"] }));
+    const input = {
+      command: ["echo", "p2p 😀\ufffd"],
+      env: { "key😀": "\ufffd", "key\ufffd": "😀" },
+      workingDirectory: "/tmp/😀\ufffd",
+    };
+    const run = await h.clock.run(sandbox.run(input));
     expect(text(run.stdout)).toBe("p2p");
     expect(run.result.kind).toBe(ExecResultKind.Exited);
     expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
@@ -154,6 +200,10 @@ describe("peer-to-peer data path", () => {
     expect(request!.kind).toBe(DataFrameKind.EXEC_REQUEST);
     expect(request!.streamId).toBe(1n);
     expect(request!.sandboxId).toBe(SANDBOX);
+    expect(request!.payload).toMatchObject({
+      case: "execRequest",
+      value: input,
+    });
     // A second operation uses the same session with a new stream ID.
     await h.clock.run(sandbox.run({ command: ["true"] }));
     expect(h.api.callsOf("OpenSession")).toHaveLength(1);
@@ -596,6 +646,105 @@ describe("peer-to-peer data path", () => {
     }
     expect(h.api.calls).toHaveLength(0);
     expect(rtc.connections).toHaveLength(0);
+  });
+
+  describe.each([
+    { mode: "auto", transport: undefined },
+    { mode: "forced peer", transport: DataPathTransport.PEER_TO_PEER },
+  ])("local peer setup credentials ($mode)", ({ transport }) => {
+    const token = "osk_test_0123456789abcdef";
+
+    describe.each([
+      { rpc: "GetIceServers", iceCalls: 0 },
+      { rpc: "OpenSession", iceCalls: 1 },
+    ])("$rpc", ({ iceCalls }) => {
+      test.each([
+        {
+          failure: "throws",
+          accessToken: () => {
+            throw new Error("token source failed");
+          },
+        },
+        {
+          failure: "rejects",
+          accessToken: () => Promise.reject(new Error("token source failed")),
+        },
+        { failure: "returns an empty token", accessToken: () => "" },
+      ])(
+        "keeps peer routing when the callback $failure",
+        async ({ accessToken }) => {
+          let tokenCalls = 0;
+          const { h, rtc } = p2pSetup(exitingAgent, {
+            transport,
+            accessToken: () =>
+              ++tokenCalls === iceCalls + 1 ? accessToken() : token,
+          });
+          const sandbox = h.client.sandbox(SANDBOX);
+          const error = await h.clock
+            .run(sandbox.run({ command: ["x"] }))
+            .catch((error: unknown) => error);
+
+          expect(error).toBeInstanceOf(ConnectError);
+          expect((error as ConnectError).cause).toBeInstanceOf(
+            OwnSandCredentialError,
+          );
+          expect(classifyFailure(error)).toBe(FailureClass.Terminal);
+          expect(h.api.callsOf("GetIceServers")).toHaveLength(iceCalls);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+          expect(rtc.connections).toHaveLength(iceCalls);
+          expect(rtc.closedConnections).toBe(iceCalls);
+          expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+
+          const run = await h.clock.run(sandbox.run({ command: ["x"] }));
+          expect(run.result.kind).toBe(ExecResultKind.Exited);
+          expect(h.api.callsOf("GetIceServers")).toHaveLength(iceCalls + 1);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+          expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+        },
+      );
+    });
+  });
+
+  test("retries peer setup after a local token failure following a session end", async () => {
+    let peer: FakeAgentPeer | undefined;
+    let tokenCalls = 0;
+    const { h, rtc } = p2pSetup(
+      (frame, activePeer) => {
+        peer = activePeer;
+        exitingAgent(frame, activePeer);
+      },
+      {
+        accessToken: () =>
+          ++tokenCalls === 3 ? "" : "osk_test_0123456789abcdef",
+      },
+    );
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(sandbox.run({ command: ["x"] }));
+    peer!.endSession(SessionEndReason.EXPIRED);
+    await h.clock.settle();
+
+    const error = await h.clock
+      .run(sandbox.run({ command: ["x"] }))
+      .catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).cause).toBeInstanceOf(
+      OwnSandCredentialError,
+    );
+    expect(classifyFailure(error)).toBe(FailureClass.Terminal);
+    expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    expect(rtc.closedConnections).toBe(1);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+
+    const run = await h.clock.run(sandbox.run({ command: ["x"] }));
+    expect(run.result.kind).toBe(ExecResultKind.Exited);
+    expect(h.api.callsOf("GetIceServers")).toHaveLength(2);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
   });
 
   test("ends the operation when a new session cannot be authorized", async () => {

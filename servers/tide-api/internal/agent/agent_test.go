@@ -61,8 +61,35 @@ func TestQuote(t *testing.T) {
 	if got := Quote(linux, "a'b $x"); got != `'a'\''b $x'` {
 		t.Fatalf("posix %s", got)
 	}
-	if got := Quote(windows, "a'b $x"); got != `'a''b $x'` {
-		t.Fatalf("powershell %s", got)
+	if got := Quote(linux, "a’b"); got != "'a’b'" {
+		t.Fatalf("POSIX quote = %q, want %q", got, "'a’b'")
+	}
+	for _, tt := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"ascii", "a'b $x", "'a''b $x'"},
+		{"left", "a‘b", "'a‘‘b'"},
+		{"right", "a’b", "'a’’b'"},
+		{"low", "a‚b", "'a‚‚b'"},
+		{"reversed", "a‛b", "'a‛‛b'"},
+		{"mixed", "O'Neil’s ‘workspace’", "'O''Neil’’s ‘‘workspace’’'"},
+		{"path", `C:\Users\O’Brien\ws`, `'C:\Users\O’’Brien\ws'`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Quote(windows, tt.value); got != tt.want {
+				t.Fatalf("PowerShell quote = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQuoteInMakeDirScript(t *testing.T) {
+	script := makeDirScript(windows, `C:\Users\O’Brien\runner`)
+	want := `$d = 'C:\Users\O’’Brien\runner'` + "\n"
+	if !strings.Contains(script, want) {
+		t.Fatalf("script lacks %q:\n%s", want, script)
 	}
 }
 
@@ -109,13 +136,18 @@ func TestStartScriptPOSIX(t *testing.T) {
 }
 
 func TestStartScriptWindows(t *testing.T) {
-	s := StartScript(windows, Program{Dir: `C:\ProgramData\tide\runners\r1`, CredentialEnv: "CURSOR_API_KEY", Env: [][2]string{{"CURSOR_AGENT_WORKER_ID", "tide-1"}},
-		Args: []string{"agent", "worker", "--pool", "it's", "--worker-dir", HomeArg, "--base", HomeArg + `\w`, "start"}})
+	s := StartScript(windows, Program{
+		Dir:           `C:\ProgramData\tide\runners\r1`,
+		CredentialEnv: "CURSOR_API_KEY",
+		Env:           [][2]string{{"CURSOR_AGENT_WORKER_ID", "tide-1"}, {"TIDE_TEST_LABEL", "O’Brien"}},
+		Args:          []string{"agent", "worker", "--pool", "it's", "--worker-dir", HomeArg, "--base", HomeArg + `\w`, "Bob’s pool", "start"},
+	})
 	for _, want := range []string{
 		`$env:CURSOR_API_KEY = [IO.File]::ReadAllText('C:\ProgramData\tide\runners\r1\credential')`,
 		`Remove-Item -Force -LiteralPath 'C:\ProgramData\tide\runners\r1\credential'`,
 		`$env:CURSOR_AGENT_WORKER_ID = 'tide-1'`,
-		`& 'agent' 'worker' '--pool' 'it''s' '--worker-dir' $env:USERPROFILE '--base' ($env:USERPROFILE + '\w') 'start' *>> 'C:\ProgramData\tide\runners\r1\runner.log'`,
+		`$env:TIDE_TEST_LABEL = 'O’’Brien'`,
+		`& 'agent' 'worker' '--pool' 'it''s' '--worker-dir' $env:USERPROFILE '--base' ($env:USERPROFILE + '\w') 'Bob’’s pool' 'start' *>> 'C:\ProgramData\tide\runners\r1\runner.log'`,
 		"exit $LASTEXITCODE",
 	} {
 		if !strings.Contains(s, want) {

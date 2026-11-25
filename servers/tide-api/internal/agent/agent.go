@@ -144,11 +144,13 @@ func Register(r *app.Registry, engine *work.Engine, integrations *integration.St
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "agent_watchers", RunFunc: h.runWatchers})
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "agent_claims", RunFunc: h.runPoller})
 	r.OnOrganizationDeletion(api.OrganizationDeletionHook{
-		Name:    "agent",
-		Prepare: h.prepareOrgDeletion,
-		Abort:   func(ctx context.Context, d api.OrganizationDeletion) { h.resumeOrg(d.OrganizationID) },
-		AfterCommit: func(ctx context.Context, d api.OrganizationDeletion) {
-			h.resumeOrg(d.OrganizationID)
+		Name: "agent",
+		Prepare: func(ctx context.Context, d api.OrganizationDeletion) (api.OrganizationDeletionSteps, error) {
+			if err := h.prepareOrgDeletion(ctx, d); err != nil {
+				return api.OrganizationDeletionSteps{}, err
+			}
+			resume := func(context.Context) { h.resumeOrg(d.OrganizationID) }
+			return api.OrganizationDeletionSteps{Abort: resume, AfterCommit: resume}, nil
 		},
 	})
 	return h
@@ -305,8 +307,8 @@ type claimLock struct {
 	users int
 }
 
-// lockVendorRequest locks the claim and release calls of one vendor request
-// and returns the unlock function. The vendor APIs identify a claim only by
+// lockVendorRequest serializes claim, release and loss handling for one
+// vendor request and returns the unlock function. The vendor APIs identify a claim only by
 // the vendor request ID (Cursor `claims/{id}/release`, Devin
 // `devins/{session_id}/release`), so a release of an earlier claim that
 // runs after the claim of a follow-up would end the follow-up's claim.

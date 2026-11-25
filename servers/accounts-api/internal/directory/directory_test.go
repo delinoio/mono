@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -106,6 +108,110 @@ func TestLogtoUser(t *testing.T) {
 	if _, err := l.User(ctx, "broken"); err == nil || errors.Is(err, directory.ErrUserNotFound) {
 		t.Fatalf("User(broken) error = %v, want an unavailable error", err)
 	}
+}
+
+func TestLogtoUserEvictsTokenRejectedOnRetry(t *testing.T) {
+	l, trace := newLogtoRejectionClient(t, func(r *http.Request) bool {
+		return r.Header.Get("Authorization") == "Bearer tok3"
+	})
+
+	if _, err := l.User(t.Context(), "u1"); err == nil || err.Error() != "logto user status 401" {
+		t.Fatalf("User(u1) error = %v, want logto user status 401", err)
+	}
+	trace.check(t, 2, "u1 Bearer tok1", "u1 Bearer tok2")
+
+	if user, err := l.User(t.Context(), "u2"); err != nil || user.Name != "Ann" {
+		t.Fatalf("User(u2) = %+v, %v, want the user", user, err)
+	}
+	trace.check(t, 3, "u1 Bearer tok1", "u1 Bearer tok2", "u2 Bearer tok3")
+}
+
+func TestLogtoUserLateRetryRejectionPreservesNewToken(t *testing.T) {
+	retryStarted := make(chan struct{})
+	releaseRetry := make(chan struct{})
+	l, trace := newLogtoRejectionClient(t, func(r *http.Request) bool {
+		auth := r.Header.Get("Authorization")
+		if r.URL.Path == "/api/users/u1" && auth == "Bearer tok2" {
+			close(retryStarted)
+			select {
+			case <-releaseRetry:
+			case <-r.Context().Done():
+			}
+		}
+		return auth == "Bearer tok3"
+	})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(releaseRetry) }) }
+	t.Cleanup(unblock)
+
+	delayed := startUser(t.Context(), l)
+	select {
+	case <-retryStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry did not start")
+	}
+	trace.check(t, 2, "u1 Bearer tok1", "u1 Bearer tok2")
+
+	if user, err := l.User(t.Context(), "u2"); err != nil || user.Name != "Ann" {
+		t.Fatalf("User(u2) = %+v, %v, want the user", user, err)
+	}
+	trace.check(t, 3, "u1 Bearer tok1", "u1 Bearer tok2", "u2 Bearer tok2", "u2 Bearer tok3")
+
+	unblock()
+	if r := receive(t, delayed, "delayed lookup"); r.err == nil || r.err.Error() != "logto user status 401" {
+		t.Fatalf("delayed lookup error = %v, want logto user status 401", r.err)
+	}
+	if user, err := l.User(t.Context(), "u3"); err != nil || user.Name != "Ann" {
+		t.Fatalf("User(u3) = %+v, %v, want the user", user, err)
+	}
+	trace.check(t, 3, "u1 Bearer tok1", "u1 Bearer tok2", "u2 Bearer tok2", "u2 Bearer tok3", "u3 Bearer tok3")
+}
+
+type logtoRequestTrace struct {
+	mu       sync.Mutex
+	tokens   int
+	profiles []string
+}
+
+func (trace *logtoRequestTrace) check(t *testing.T, tokens int, profiles ...string) {
+	t.Helper()
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	if trace.tokens != tokens || !slices.Equal(trace.profiles, profiles) {
+		t.Fatalf("got %d token requests and profile requests %q, want %d and %q", trace.tokens, trace.profiles, tokens, profiles)
+	}
+}
+
+func newLogtoRejectionClient(t *testing.T, acceptProfile func(*http.Request) bool) (*directory.Logto, *logtoRequestTrace) {
+	t.Helper()
+	trace := &logtoRequestTrace{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/oidc/token":
+			trace.mu.Lock()
+			trace.tokens++
+			n := trace.tokens
+			trace.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": fmt.Sprintf("tok%d", n), "expires_in": 3600})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/users/"):
+			trace.mu.Lock()
+			trace.profiles = append(trace.profiles, strings.TrimPrefix(r.URL.Path, "/api/users/")+" "+r.Header.Get("Authorization"))
+			trace.mu.Unlock()
+			if !acceptProfile(r) {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"name": "Ann"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return directory.NewLogto(directory.LogtoConfig{
+		Endpoint: srv.URL, ClientID: "m2m", ClientSecret: "s3cret",
+		Now:    func() time.Time { return time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC) },
+		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	}), trace
 }
 
 func TestLogtoTokenFailure(t *testing.T) {

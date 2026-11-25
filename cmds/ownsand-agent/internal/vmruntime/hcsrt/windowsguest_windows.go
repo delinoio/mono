@@ -115,20 +115,29 @@ func checkWindowsResources(res *ownsandv1.Resources, m images.Metadata) error {
 // snapshot) fails as unsupported before any compute system exists, and the
 // create removes the VM directory. The copy is a full, self-contained VHDX (no differencing parent), so a
 // snapshot never depends on the base image, which a rebuild replaces.
-func (r *Runtime) prepareWindowsDisk(spec vmruntime.Spec) (vmSpec, int64, error) {
+func (r *Runtime) prepareWindowsDisk(ctx context.Context, spec vmruntime.Spec, ops vmCreateOps) (vmSpec, int64, error) {
 	src, metaDir := r.windowsSource(spec)
 	disk := filepath.Join(spec.Dir, windowsDiskFile)
 	start := time.Now()
-	if err := copyFile(context.Background(), src, disk); err != nil {
+	if err := ops.copyFile(ctx, src, disk); err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return vmSpec{}, 0, err
+	}
 	copied := time.Now()
-	size, err := growVHDX(disk, spec.Resources.GetDiskGib()<<30)
+	size, err := ops.growVHDX(disk, spec.Resources.GetDiskGib()<<30)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return vmSpec{}, 0, ctxErr
+	}
 	if err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
 	}
-	if err := copyFile(context.Background(), filepath.Join(metaDir, images.MetadataFile), filepath.Join(spec.Dir, images.MetadataFile)); err != nil {
+	if err := ops.copyFile(ctx, filepath.Join(metaDir, images.MetadataFile), filepath.Join(spec.Dir, images.MetadataFile)); err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: copy the image metadata: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return vmSpec{}, 0, err
 	}
 	if err := grantVMGroup(disk, accessReadWrite, false); err != nil {
 		return vmSpec{}, 0, err

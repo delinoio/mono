@@ -57,7 +57,7 @@ func TestMakeSnapshotAbortsWhenPathSwappedForFIFO(t *testing.T) {
 		m.openHook = swapForFIFO(t, path)
 		done := make(chan error, 1)
 		go func() {
-			_, _, err := m.makeSnapshot(path, filepath.Join(m.dir, "snap"))
+			_, _, _, err := m.makeSnapshot(path, filepath.Join(m.dir, "snap"))
 			done <- err
 		}()
 		select {

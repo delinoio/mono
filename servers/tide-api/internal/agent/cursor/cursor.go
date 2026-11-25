@@ -138,14 +138,19 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) error {
 	pool := w.In.PoolName
 	cursor := ""
 	token := ""
+	usedTokens := make(map[string]struct{})
 	for {
 		q := url.Values{"pool": {pool}, "limit": {"100"}}
 		if token != "" {
 			q.Set("pageToken", token)
+			usedTokens[token] = struct{}{}
 		}
 		var page pendingPage
 		if err := c.Do(ctx, "list_pending_requests", http.MethodGet, "/v0/private-workers/pending-requests", q, nil, &page); err != nil {
 			return err
+		}
+		if _, used := usedTokens[page.NextPageToken]; used {
+			return errors.New("the Cursor pending request list repeated a page token")
 		}
 		for _, r := range page.Requests {
 			v.admit(ctx, w, c, r)

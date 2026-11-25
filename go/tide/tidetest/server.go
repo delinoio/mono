@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -52,11 +53,12 @@ const (
 type Server struct {
 	// URL is the origin of the server, for example http://127.0.0.1:1234.
 	URL string
-	// AccessToken is the accepted Logto access token, APIKey the accepted
-	// personal API key. An API key is accepted only on DevSessionService.
+	// AccessToken is the accepted Logto access token. APIKey is the
+	// built-in fixture key. Active, unexpired keys issued by ApiKeyService
+	// also work on DevSessionService in the organization that issued them.
 	AccessToken string
 	APIKey      string
-	// UserID is the user of both credentials.
+	// UserID is the user associated with all accepted credentials.
 	UserID string
 	// ExecStreamEventLimit ends every exec and attach stream with an OK
 	// status after this many events, like the 14-minute limit of tide-api.
@@ -181,10 +183,37 @@ func (s *Server) newID() string {
 	return id
 }
 
+const issuedAPIKeyPrefix = "tide_secret-"
+
+// apiKeyOrganization returns the scope of a valid personal API key. The
+// configured fixture key has no organization scope.
+func (s *Server) apiKeyOrganization(token string) (string, bool) {
+	if token == s.APIKey && strings.HasPrefix(token, "tide_") {
+		return "", true
+	}
+	id, ok := strings.CutPrefix(token, issuedAPIKeyPrefix)
+	if !ok {
+		return "", false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, key := range s.apiKeys {
+		if key.GetApiKeyId() != id || key.GetState() != tidev1.ApiKeyState_API_KEY_STATE_ACTIVE {
+			continue
+		}
+		if expiresAt := key.GetExpiresAt(); expiresAt != nil && !time.Now().Before(expiresAt.AsTime()) {
+			return "", false
+		}
+		return key.GetOrganizationId(), true
+	}
+	return "", false
+}
+
 // interceptor checks credentials and injects faults.
 type interceptor struct{ s *Server }
 
-func (i *interceptor) check(procedure string, h http.Header) error {
+func (i *interceptor) check(procedure string, h http.Header) (string, error) {
 	s := i.s
 	s.mu.Lock()
 	s.calls[procedure]++
@@ -194,27 +223,44 @@ func (i *interceptor) check(procedure string, h http.Header) error {
 	}
 	s.mu.Unlock()
 	tok, ok := strings.CutPrefix(h.Get("Authorization"), "Bearer ")
-	switch {
-	case !ok || tok == "":
+	if !ok || tok == "" {
 		s.lastCred.Store(int32(CredentialNone))
-		return connect.NewError(connect.CodeUnauthenticated, errors.New("missing credential"))
-	case tok == s.AccessToken:
-		s.lastCred.Store(int32(CredentialAccessToken))
-	case tok == s.APIKey && strings.HasPrefix(tok, "tide_"):
-		s.lastCred.Store(int32(CredentialAPIKey))
-		if !strings.HasPrefix(procedure, "/"+tidev1connect.DevSessionServiceName+"/") {
-			return connect.NewError(connect.CodePermissionDenied, errors.New("a personal API key is accepted only on DevSessionService"))
-		}
-	default:
-		s.lastCred.Store(int32(CredentialNone))
-		return connect.NewError(connect.CodeUnauthenticated, errors.New("invalid credential"))
+		return "", connect.NewError(connect.CodeUnauthenticated, errors.New("missing credential"))
 	}
-	return fault
+	if tok == s.AccessToken {
+		s.lastCred.Store(int32(CredentialAccessToken))
+		return "", fault
+	}
+	org, ok := s.apiKeyOrganization(tok)
+	if !ok {
+		s.lastCred.Store(int32(CredentialNone))
+		return "", connect.NewError(connect.CodeUnauthenticated, errors.New("invalid credential"))
+	}
+	s.lastCred.Store(int32(CredentialAPIKey))
+	if !strings.HasPrefix(procedure, "/"+tidev1connect.DevSessionServiceName+"/") {
+		return "", connect.NewError(connect.CodePermissionDenied, errors.New("a personal API key is accepted only on DevSessionService"))
+	}
+	return org, fault
+}
+
+func checkAPIKeyOrganization(org string, msg any) error {
+	if org == "" {
+		return nil
+	}
+	req, ok := msg.(interface{ GetOrganizationId() string })
+	if !ok || req.GetOrganizationId() != org {
+		return notFound("organization")
+	}
+	return nil
 }
 
 func (i *interceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
 	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-		if err := i.check(req.Spec().Procedure, req.Header()); err != nil {
+		org, err := i.check(req.Spec().Procedure, req.Header())
+		if err != nil {
+			return nil, err
+		}
+		if err := checkAPIKeyOrganization(org, req.Any()); err != nil {
 			return nil, err
 		}
 		return next(ctx, req)
@@ -227,20 +273,38 @@ func (i *interceptor) WrapStreamingClient(next connect.StreamingClientFunc) conn
 
 func (i *interceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
 	return func(ctx context.Context, conn connect.StreamingHandlerConn) error {
-		if err := i.check(conn.Spec().Procedure, conn.RequestHeader()); err != nil {
+		org, err := i.check(conn.Spec().Procedure, conn.RequestHeader())
+		if err != nil {
 			return err
+		}
+		if org != "" {
+			conn = &apiKeyOrganizationConn{StreamingHandlerConn: conn, organization: org}
 		}
 		return next(ctx, conn)
 	}
 }
 
-// page returns one page of items with the protos contract rules: page
-// size 50 by default and at most 200, and an opaque token.
-func page[T any](items []T, size int32, token string) ([]T, string, error) {
-	if size <= 0 {
-		size = 50
+type apiKeyOrganizationConn struct {
+	connect.StreamingHandlerConn
+	organization string
+}
+
+func (c *apiKeyOrganizationConn) Receive(msg any) error {
+	if err := c.StreamingHandlerConn.Receive(msg); err != nil {
+		return err
 	}
-	if size > 200 {
+	return checkAPIKeyOrganization(c.organization, msg)
+}
+
+// page rejects negative sizes and returns one page of items with an opaque token.
+// A size of zero defaults to 50. The maximum size is 200.
+func page[T any](items []T, size int32, token string) ([]T, string, error) {
+	switch {
+	case size < 0:
+		return nil, "", connect.NewError(connect.CodeInvalidArgument, errors.New("invalid page_size: must not be negative"))
+	case size == 0:
+		size = 50
+	case size > 200:
 		size = 200
 	}
 	start := 0

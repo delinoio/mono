@@ -12,6 +12,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
 	"github.com/delinoio/mono/go/ownsand/validate"
@@ -61,6 +62,8 @@ func (r ByteRange) Empty() bool { return r.To <= r.From }
 type ExecEvent struct {
 	Kind   ExecEventKind
 	ExecID string
+	// StartTime is the guest time of an ExecEventStarted, if available.
+	StartTime *time.Time
 	// Offset and Data of a stdout or stderr chunk. Data is sandbox content.
 	Offset int64
 	Data   []byte
@@ -102,6 +105,8 @@ type ExecResult struct {
 	// ExitCode or Signal is set for ExecResultExited.
 	ExitCode *int64
 	Signal   *int32
+	// EndTime is the guest time of an ExecResultExited, if available.
+	EndTime *time.Time
 	// TimedOut is true when the exec timeout stopped the command.
 	TimedOut bool
 	// FailureReason and FailureMessage are set for ExecResultFailed.
@@ -519,6 +524,14 @@ func (op *execOp) relayAttempt(ctx context.Context) attempt {
 	return at
 }
 
+func guestExecTime(ts *timestamppb.Timestamp) *time.Time {
+	if !ts.IsValid() {
+		return nil
+	}
+	t := ts.AsTime()
+	return &t
+}
+
 // handleEvent applies one exec event and reports whether the stream is done.
 func (op *execOp) handleEvent(ev *ownsandv1.ExecEvent, at *attempt, transport ownsandv1.DataPathTransport) bool {
 	emit := func(e ExecEvent) bool {
@@ -540,7 +553,7 @@ func (op *execOp) handleEvent(ev *ownsandv1.ExecEvent, at *attempt, transport ow
 	case *ownsandv1.ExecEvent_Started:
 		if !op.started {
 			op.started = true
-			if !emit(ExecEvent{Kind: ExecEventStarted}) {
+			if !emit(ExecEvent{Kind: ExecEventStarted, StartTime: guestExecTime(e.Started.GetStartTime())}) {
 				return true
 			}
 		}
@@ -574,7 +587,10 @@ func (op *execOp) handleEvent(ev *ownsandv1.ExecEvent, at *attempt, transport ow
 		}
 	case *ownsandv1.ExecEvent_Exited:
 		op.rec.reset()
-		r := &ExecResult{ExecID: op.execID, Kind: ExecResultExited, TimedOut: e.Exited.GetTimedOut(), Transport: transport}
+		r := &ExecResult{
+			ExecID: op.execID, Kind: ExecResultExited, TimedOut: e.Exited.GetTimedOut(),
+			EndTime: guestExecTime(e.Exited.GetEndTime()), Transport: transport,
+		}
 		switch st := e.Exited.GetStatus().(type) {
 		case *ownsandv1.ExecExited_ExitCode:
 			code := st.ExitCode
