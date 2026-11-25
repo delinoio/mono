@@ -3,7 +3,13 @@ import type { Transport } from "@connectrpc/connect";
 import { TransportProvider } from "@connectrpc/connect-query";
 import { type QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ToastRegion } from "delino-ui/toast";
-import { type ReactNode, useCallback, useMemo, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useState,
+} from "react";
 import { createApiTransport, createQueryClient } from "./api.ts";
 import {
   type Auth,
@@ -16,6 +22,12 @@ import {
 import { OrgShell, TopBar } from "./components/shell.tsx";
 import { PageHeader, SignInAction } from "./components/ui.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
+import {
+  type GitHubCallback,
+  parseGitHubCallback,
+  stripCallbackFromAddress,
+} from "./github-callback.ts";
+import { takeSecretFromAddress } from "./invitation.ts";
 import { ApiKeysPage } from "./pages/api-keys.tsx";
 import { AuditPage } from "./pages/audit.tsx";
 import { LogtoCallbackPage, MockCallbackPage } from "./pages/callback.tsx";
@@ -136,30 +148,18 @@ function Routes({ config }: { config: ConsoleConfig }) {
     }
     return <SignIn configured={false} />;
   }
+  if (route.id === RouteId.Invitation || route.id === RouteId.GitHubSetup) {
+    return <EntryRoute key={route.id} id={route.id} configured={configured} />;
+  }
   if (auth.isLoading) {
     return null;
   }
   if (!auth.isAuthenticated) {
-    return (
-      <SignIn
-        configured={configured}
-        notice={
-          route.id === RouteId.Invitation
-            ? "Sign in, then open the invitation link again."
-            : route.id === RouteId.GitHubSetup
-              ? "Sign in, then start the GitHub installation again from the integrations of your organization."
-              : undefined
-        }
-      />
-    );
+    return <SignIn configured={configured} />;
   }
   switch (route.id) {
     case RouteId.Organizations:
       return <OrganizationsPage />;
-    case RouteId.Invitation:
-      return <InvitationPage />;
-    case RouteId.GitHubSetup:
-      return <GitHubSetupPage />;
     case RouteId.NotFound:
       return (
         <>
@@ -180,6 +180,58 @@ function Routes({ config }: { config: ConsoleConfig }) {
         </OrgShell>
       );
   }
+}
+
+function EntryRoute({
+  id,
+  configured,
+}: {
+  id: RouteId.Invitation | RouteId.GitHubSetup;
+  configured: boolean;
+}) {
+  const { isLoading, isAuthenticated } = useAuth();
+  const signedOut = !isLoading && !isAuthenticated;
+  const [input, setInput] = useState<{
+    invitationSecret?: string;
+    githubCallback?: GitHubCallback;
+  }>();
+
+  useLayoutEffect(() => {
+    const { location, history } = window;
+    // Strict Mode runs this effect again after the address is clean. Keep
+    // the values from the first capture for the rest of this visit.
+    if (id === RouteId.Invitation) {
+      const invitationSecret = takeSecretFromAddress(location, history);
+      setInput((current) => current ?? { invitationSecret });
+    } else {
+      const githubCallback = parseGitHubCallback(location.search);
+      stripCallbackFromAddress(location, history);
+      setInput((current) => current ?? { githubCallback });
+    }
+  }, [id]);
+
+  useLayoutEffect(() => {
+    if (signedOut) setInput({});
+  }, [signedOut]);
+
+  if (isLoading || input === undefined) return null;
+  if (signedOut) {
+    return (
+      <SignIn
+        configured={configured}
+        notice={
+          id === RouteId.Invitation
+            ? "Sign in, then open the invitation link again."
+            : "Sign in, then start the GitHub installation again from the integrations of your organization."
+        }
+      />
+    );
+  }
+  return id === RouteId.Invitation ? (
+    <InvitationPage initialSecret={input.invitationSecret} />
+  ) : (
+    <GitHubSetupPage callback={input.githubCallback} />
+  );
 }
 
 function OrgPage({ id }: { id: OrgRouteId }) {

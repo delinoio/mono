@@ -13,6 +13,31 @@ const UNKNOWN_ORG = "0193b000-0000-7000-8000-0000000000ff";
 const INVITATION_SECRET = "tdi_mock_contoso_invitation";
 
 describe("sign-in", () => {
+  for (const { url, cleanPath, notice } of [
+    {
+      url: `/invitations/accept?source=fixture#secret=${INVITATION_SECRET}`,
+      cleanPath: "/invitations/accept?source=fixture",
+      notice: "Sign in, then open the invitation link again.",
+    },
+    {
+      url: "/github/setup?installation_id=51000001&code=gh_code&state=mock-state#return",
+      cleanPath: "/github/setup#return",
+      notice:
+        "Sign in, then start the GitHub installation again from the integrations of your organization.",
+    },
+  ]) {
+    test(`cleans ${cleanPath} before sign-in`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open(url);
+
+      await expect(screen.getByText(notice)).toBeVisible();
+      await expect(browser).toHaveURL(cleanPath);
+    });
+  }
+
   test("returns to sign-in from a direct mock callback visit", async ({
     app,
     browser,
