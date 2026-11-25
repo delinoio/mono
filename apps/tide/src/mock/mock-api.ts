@@ -246,6 +246,28 @@ function profile(
   return p;
 }
 
+/** Give a seeded organization an installation beyond the first full page. */
+function seedMoreGitHubInstallations(
+  org: OrgState,
+  accountPrefix: string,
+  firstGitHubId: bigint,
+) {
+  for (let row = 2; row <= 201; row++) {
+    org.installations.push(
+      create(GitHubInstallationSchema, {
+        installationId: uuidV7(),
+        organizationId: org.organization.organizationId,
+        githubInstallationId: firstGitHubId + BigInt(row),
+        githubAccountLogin: `${accountPrefix}-${row}`,
+        state: GitHubInstallationState.ACTIVE,
+        githubRunnerGroupId: 1n,
+        runnerGroupName: "Default",
+        createTime: ts(-9 * 86400),
+      }),
+    );
+  }
+}
+
 function seed(
   userId: string,
   runnerProfileCount: number,
@@ -298,6 +320,7 @@ function seed(
       createTime: ts(-9 * 86400),
     }),
   );
+  seedMoreGitHubInstallations(acme, "acme-robotics", 42_000_000n);
   acme.integrations.push(
     create(AgentIntegrationSchema, {
       agentIntegrationId: MOCK_IDS.codexIntegration,
@@ -697,6 +720,7 @@ function seed(
       createTime: ts(-40 * 86400),
     }),
   );
+  seedMoreGitHubInstallations(northwind, "northwind", 43_000_000n);
   northwind.integrations.push(
     create(AgentIntegrationSchema, {
       agentIntegrationId: "0193b000-0000-7000-8000-0000000000c3",

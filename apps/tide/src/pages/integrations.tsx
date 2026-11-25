@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "@bufbuild/protobuf";
 import { FieldMaskSchema } from "@bufbuild/protobuf/wkt";
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+} from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { BadgeVariant } from "delino-ui/badge";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
@@ -39,6 +43,7 @@ import {
   Detail,
   Empty,
   FormDialog,
+  ListPagination,
   Loading,
   PageHeader,
   QueryBoundary,
@@ -242,10 +247,14 @@ function GitHubSection({ admin }: { admin: boolean }) {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, GitHubService);
-  const list = useQuery(GitHubService.method.listGitHubInstallations, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const list = useInfiniteQuery(
+    GitHubService.method.listGitHubInstallations,
+    { organizationId, pageSize: MAX_PAGE_SIZE, pageToken: "" },
+    {
+      pageParamKey: "pageToken",
+      getNextPageParam: (page) => page.nextPageToken || undefined,
+    },
+  );
   const installUrl = useMutation(GitHubService.method.createGitHubInstallUrl);
   const unlink = useMutation(GitHubService.method.unlinkGitHubInstallation, {
     onSuccess: refresh,
@@ -283,8 +292,13 @@ function GitHubSection({ admin }: { admin: boolean }) {
       </p>
       <QueryBoundary query={list} loading="Loading GitHub installations">
         {(data) => {
-          const { installations } = data;
-          return installations.length === 0 ? (
+          const installations = new Map<string, GitHubInstallation>();
+          for (const page of data.pages) {
+            for (const installation of page.installations) {
+              installations.set(installation.installationId, installation);
+            }
+          }
+          return installations.size === 0 ? (
             <Empty title="No GitHub organization is connected">
               {admin
                 ? "Connect GitHub to run GitHub Actions jobs, or create an agent integration below."
@@ -292,7 +306,7 @@ function GitHubSection({ admin }: { admin: boolean }) {
             </Empty>
           ) : (
             <ul className="list" aria-label="GitHub installations">
-              {installations.map((i) => (
+              {Array.from(installations.values(), (i) => (
                 <li key={i.installationId} className="list-row">
                   <div className="list-main">
                     <span className="list-title">
@@ -330,6 +344,7 @@ function GitHubSection({ admin }: { admin: boolean }) {
           );
         }}
       </QueryBoundary>
+      <ListPagination query={list} />
       {grouping !== undefined ? (
         <RunnerGroupDialog
           installation={grouping}

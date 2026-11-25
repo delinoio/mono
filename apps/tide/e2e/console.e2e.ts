@@ -537,6 +537,67 @@ describe("integrations", () => {
     ).toBeVisible();
   });
 
+  test("an owner can change the runner group and unlink an installation on the next page", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+
+    const list = screen.getByRole("list", "GitHub installations");
+    const later = list
+      .getByRole("listitem")
+      .filter({ hasText: "acme-robotics-201" });
+    await expect(later).toBeHidden();
+    await screen.getByRole("button", "Show more").tap();
+    await expect(later).toBeVisible();
+    await expect(list.getByText("acme-robotics · Active")).toBeVisible();
+    await expect(screen.getByRole("button", "Show more")).toBeHidden();
+
+    await later.getByRole("button", "Change runner group").tap();
+    const runnerGroup = screen.getByRole("dialog", "Change the runner group");
+    await runnerGroup.getByRole("combobox", "Runner group").tap();
+    await screen.getByRole("option", "tide-private · selected").tap();
+    await runnerGroup.getByRole("button", "Save").tap();
+    await expect(runnerGroup).toBeHidden();
+    await expect(later).toContainText("Runner group: tide-private");
+
+    await later.getByRole("button", "Unlink").tap();
+    const confirm = screen.getByRole(
+      "alertdialog",
+      "Unlink acme-robotics-201?",
+    );
+    await confirm.getByRole("button", "Unlink").tap();
+    await expect(later).toBeHidden();
+    await expect(list.getByText("acme-robotics · Active")).toBeVisible();
+  });
+
+  test("a member can read a later page and switch to another organization's list", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${NORTHWIND}/integrations`);
+
+    const list = screen.getByRole("list", "GitHub installations");
+    const later = list
+      .getByRole("listitem")
+      .filter({ hasText: "northwind-201" });
+    await screen.getByRole("button", "Show more").tap();
+    await expect(later).toBeVisible();
+    await expect(later.getByRole("button", "Unlink")).toBeHidden();
+    await expect(later.getByRole("button", "Change runner group")).toBeHidden();
+
+    await screen.getByRole("combobox", "Organization").tap();
+    await screen.getByRole("option", "Acme Robotics").tap();
+    await expect(list.getByText("acme-robotics · Active")).toBeVisible();
+    await expect(list.getByText("northwind · Active")).toBeHidden();
+    await expect(later).toBeHidden();
+    await expect(screen.getByRole("button", "Show more")).toBeVisible();
+  });
+
   test("an expired GitHub callback stays on setup and shows restart guidance", async ({
     app,
     screen,
