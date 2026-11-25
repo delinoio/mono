@@ -245,7 +245,7 @@ func (t *Transfer) Import(ctx context.Context, snapshotID string, parts []*ownsa
 			}
 		}
 	}()
-	if err := os.MkdirAll(staging, 0o700); err != nil {
+	if err := fsutil.MkdirAllWithOwnerAccess(staging, 0o700); err != nil {
 		return err
 	}
 	if err := fsutil.ReadTarContext(ctx, tmp, staging); err != nil {
