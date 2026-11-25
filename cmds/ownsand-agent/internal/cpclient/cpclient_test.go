@@ -5,6 +5,9 @@ package cpclient
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +17,48 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
+
+func TestHTTPClientRedirectPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		origin string
+		target string
+		hops   int
+		err    string
+	}{
+		{name: "same origin", origin: "https://agent.test", target: "https://agent.test/next", hops: 9},
+		{name: "explicit HTTPS default", origin: "https://agent.test", target: "https://AGENT.test:443/next", hops: 1},
+		{name: "implicit HTTP default", origin: "http://agent.test:80", target: "http://agent.test/next", hops: 1},
+		{name: "same custom port", origin: "https://agent.test:8443", target: "https://agent.test:8443/next", hops: 1},
+		{name: "zero-padded default", origin: "https://agent.test", target: "https://agent.test:0443/next", hops: 1},
+		{name: "limit", origin: "https://agent.test", target: "https://agent.test/next", hops: 10, err: "stopped after 10 redirects"},
+		{name: "different scheme", origin: "https://agent.test", target: "http://agent.test:443/next", hops: 1, err: "redirect leaves the control plane origin"},
+		{name: "different hostname", origin: "https://agent.test", target: "https://other.agent.test/next", hops: 2, err: "redirect leaves the control plane origin"},
+		{name: "different port", origin: "https://agent.test", target: "https://agent.test:8443/next", hops: 1, err: "redirect leaves the control plane origin"},
+		{name: "different IPv6 zone", origin: "http://[fe80::1%25link]", target: "http://[fe80::1%25LINK]/next", hops: 1, err: "redirect leaves the control plane origin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := NewHTTPClient(tc.origin, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := url.Parse(tc.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.CheckRedirect(&http.Request{URL: target}, make([]*http.Request, tc.hops))
+			if tc.err == "" {
+				if err != nil {
+					t.Fatalf("CheckRedirect() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Fatalf("CheckRedirect() = %v, want %q", err, tc.err)
+			}
+		})
+	}
+}
 
 // authTestTimeout is the shortened attempt deadline of these tests. The
 // production default is DefaultAuthTimeout.
