@@ -478,14 +478,16 @@ func validateURL(name, value string) error {
 	return nil
 }
 
-// validateR2Endpoint requires an http or https account endpoint without a path.
-// The object store addresses objects as /<bucket>/<key> under the endpoint
-// host and replaces any path of the endpoint in some requests while it keeps
-// the path in others, so an endpoint with a path would send requests to
-// different locations. The error never includes the endpoint value.
+// validateR2Endpoint requires a root HTTP or HTTPS account endpoint.
+// The object store appends the bucket to the endpoint for list requests.
+// A path, query or fragment can send those requests to the wrong location.
 func validateR2Endpoint(value string) error {
 	if err := validateURL(EnvR2Endpoint, value); err != nil {
 		return err
+	}
+	// Check the original value because url.Parse drops an empty fragment.
+	if strings.ContainsAny(value, "?#") {
+		return fmt.Errorf("%s must be an account endpoint without a query or fragment", EnvR2Endpoint)
 	}
 	// validateURL has already parsed value, so Parse cannot fail here.
 	if u, _ := url.Parse(value); u.Path != "" && u.Path != "/" {
