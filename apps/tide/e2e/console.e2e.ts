@@ -920,6 +920,31 @@ describe("invitations", () => {
     await screen.getByRole("combobox", "Organization").tap();
     await expect(screen.getByRole("option", "Contoso")).toBeVisible();
   });
+
+  test("an expired invitation link keeps the user on the invitation page", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/invitations/accept#secret=${INVITATION_SECRET}`);
+    const join = screen.getByRole("button", "Join organization");
+    await expect(join).toBeVisible();
+
+    // Advance the clock after the mock creates its seeded invitation.
+    await browser.evaluate(() => {
+      const later = Date.now() + 7 * 24 * 60 * 60 * 1000;
+      Date.now = () => later;
+      return null;
+    });
+    await join.tap();
+
+    await expect(
+      screen.getByText("It was not found, or you no longer have access to it."),
+    ).toBeVisible();
+    await expect(browser).toHaveURL("/invitations/accept");
+  });
 });
 
 describe("routing", () => {
