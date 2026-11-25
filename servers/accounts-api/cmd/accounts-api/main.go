@@ -308,7 +308,8 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 //
 // stop is the callback that can release the signal registration. When ctx is
 // done first, serve calls it before logging server_shutdown_started and starting
-// the drain. When Serve fails first, the caller's deferred stop handles cleanup.
+// the drain. When Serve fails first, serve drains with the signal registration
+// still active and the caller's deferred stop handles cleanup.
 // stop must be safe to call more than once.
 //
 // Request contexts derive from a server-lifetime context that is deliberately
@@ -334,21 +335,21 @@ func serve(ctx context.Context, stop func(), srv *http.Server, listener net.List
 
 // awaitServe waits for the Serve result on serveErr or for ctx to be done. It
 // takes the result channel so tests can inject a Serve outcome deterministically.
-// When ctx is done first it calls stop before anything else; see serve.
+// Either trigger starts the bounded drain unless Serve has closed normally.
 func awaitServe(ctx context.Context, stop func(), srv *http.Server, serveErr <-chan error, logger *slog.Logger, timeout time.Duration) error {
+	var listenerErr error
 	select {
-	case err := <-serveErr:
-		if errors.Is(err, http.ErrServerClosed) {
+	case listenerErr = <-serveErr:
+		if listenerErr == nil || errors.Is(listenerErr, http.ErrServerClosed) {
 			return nil
 		}
-		return err
+		serveErr = nil
 	case <-ctx.Done():
+		// Release the signal registration synchronously when a signal led the
+		// drain so that a second signal can terminate the process promptly.
+		stop()
 	}
 
-	// Call stop explicitly, and before the drain, rather than through
-	// context.AfterFunc: AfterFunc runs asynchronously, so a second signal could
-	// still arrive before the registration is released.
-	stop()
 	logger.Info("server_shutdown_started")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -357,14 +358,14 @@ func awaitServe(ctx context.Context, stop func(), srv *http.Server, serveErr <-c
 		logger.Error("server_shutdown_failed", slog.Any("error", shutdownErr))
 	}
 
-	// ctx can win the select above while Serve has already failed, which would
-	// otherwise discard the serve error. Shutdown makes Serve return, so this
-	// receive does not block.
-	var drainedErr error
-	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
-		drainedErr = err
+	// If cancellation won the select, collect the Serve result now to retain
+	// any concurrent listener failure. Shutdown makes Serve return.
+	if serveErr != nil {
+		if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
+			listenerErr = err
+		}
 	}
-	if err := errors.Join(shutdownErr, drainedErr); err != nil {
+	if err := errors.Join(shutdownErr, listenerErr); err != nil {
 		return err
 	}
 	logger.Info("server_shutdown_completed")

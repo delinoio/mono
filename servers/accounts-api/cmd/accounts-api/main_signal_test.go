@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,21 +32,24 @@ const (
 	signalHelperEnv            = "ACCOUNTS_API_SIGNAL_HELPER"
 	signalHelperHealthy        = "healthy"
 	signalHelperMetricsFailure = "metrics-failure"
+	signalHelperPublicFailure  = "public-failure"
 	// helperDrainTimeout is the drain timeout of the helper. It is far above
 	// every limit the parent test waits for, so an exit that waits for the drain
 	// to time out is distinguishable from a prompt one.
 	helperDrainTimeout = 30 * time.Second
 )
 
+var errPublicAccept = errors.New("public accept failed permanently")
+
 // TestSignalHelperProcess is not a test. The signal tests re-execute the test
 // binary into it. It serves /ping, /slow?ms=<n> (a handler that blocks for n
 // milliseconds) and /hold (a handler that blocks until the parent releases it
 // over the helper's stdin), prints "listening <addr>", "slow_started" and
-// "hold_started" lines, and exits with runServers' result. In the metrics
+// "hold_started" lines, and exits with runServers' result. In either listener
 // failure mode, the first byte fails Accept and the third lets the worker finish.
 func TestSignalHelperProcess(t *testing.T) {
 	mode := os.Getenv(signalHelperEnv)
-	if mode != signalHelperHealthy && mode != signalHelperMetricsFailure {
+	if mode != signalHelperHealthy && mode != signalHelperMetricsFailure && mode != signalHelperPublicFailure {
 		t.Skip("helper process for the signal tests")
 	}
 
@@ -55,10 +59,19 @@ func TestSignalHelperProcess(t *testing.T) {
 	releaseRequest := make(chan struct{})
 	worker := func(ctx context.Context) { <-ctx.Done() }
 	timeout := helperDrainTimeout
-	if mode == signalHelperMetricsFailure {
-		failMetrics := make(chan struct{})
+	if mode != signalHelperHealthy {
+		failListener := make(chan struct{})
 		finishWorker := make(chan struct{})
-		metricsListener = gatedMetricsListener{Listener: metricsListener, fail: failMetrics}
+		if mode == signalHelperMetricsFailure {
+			metricsListener = gatedMetricsListener{Listener: metricsListener, fail: failListener}
+		} else {
+			publicListener := listener
+			listener = acceptErrorOnCloseListener{Listener: publicListener, err: errPublicAccept}
+			go func() {
+				<-failListener
+				_ = publicListener.Close()
+			}()
+		}
 		timeout = shutdownTimeout
 		worker = func(ctx context.Context) {
 			<-ctx.Done()
@@ -66,7 +79,7 @@ func TestSignalHelperProcess(t *testing.T) {
 			<-finishWorker
 			logger.Info("worker_finished")
 		}
-		go releaseOnControlInput(failMetrics, releaseRequest, finishWorker)
+		go releaseOnControlInput(failListener, releaseRequest, finishWorker)
 	} else {
 		go releaseOnControlInput(releaseRequest)
 	}
@@ -80,7 +93,16 @@ func TestSignalHelperProcess(t *testing.T) {
 	})
 	mux.HandleFunc("GET /hold", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("hold_started")
-		<-releaseRequest
+		select {
+		case <-releaseRequest:
+		case <-r.Context().Done():
+		}
+		if err := r.Context().Err(); err != nil {
+			logger.Info("held_request_cancelled", slog.Any("error", err))
+			http.Error(w, "request cancelled", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, "completed")
 	})
 
 	serveMetrics := func(ctx context.Context) error {
@@ -396,6 +418,52 @@ func TestFirstTerminationSignalPreservesMetricsFailureDrain(t *testing.T) {
 			exitLog := h.waitForLine(`"msg":"server_exited"`)
 			if !strings.Contains(exitLog, errMetricsAccept.Error()) {
 				t.Fatalf("exit log lacks the original metrics error: %s", exitLog)
+			}
+		})
+	}
+}
+
+func TestServePublicListenerFailureDrainsProcess(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		signal syscall.Signal
+	}{
+		{name: "without signal"},
+		{name: "with SIGTERM", signal: syscall.SIGTERM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := startHelperProcess(t, signalHelperPublicFailure)
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			status := getAsyncContext(ctx, "http://"+h.addr+"/hold")
+			h.waitForLine("hold_started")
+
+			h.release() // Close the public socket and inject a permanent Accept error.
+			h.waitForLine("server_shutdown_started")
+			h.waitForListenerClosure()
+			if tc.signal != 0 {
+				h.signal(tc.signal)
+			}
+			h.release() // Let the held request finish with a live context.
+			select {
+			case got := <-status:
+				if got != http.StatusOK {
+					t.Fatalf("in-flight response status = %d, want 200; output:\n%s", got, h.out.String())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("held request did not finish after release; output:\n%s", h.out.String())
+			}
+
+			h.waitForLine(`"msg":"worker_draining"`)
+			h.release()
+			ws := h.wait(5 * time.Second)
+			if !ws.Exited() || ws.ExitStatus() != 1 {
+				t.Fatalf("wait status = %v, want exit status 1; output:\n%s", ws, h.out.String())
+			}
+			h.waitForLine(`"msg":"worker_finished"`)
+			exitLog := h.waitForLine(`"msg":"server_exited"`)
+			if !strings.Contains(exitLog, errPublicAccept.Error()) {
+				t.Fatalf("exit log lacks the original public listener error: %s", exitLog)
 			}
 		})
 	}
