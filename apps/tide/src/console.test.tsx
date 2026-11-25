@@ -1375,6 +1375,31 @@ describe("GitHub setup callback", () => {
       await screen.findByText(/has no GitHub installation details/),
     ).toBeTruthy();
   });
+
+  test.each([
+    ["one eligible organization", Role.MEMBER],
+    ["two eligible organizations", Role.OWNER],
+  ] as const)(
+    "rejects an out-of-range installation ID with %s",
+    async (_scenario, firstRole) => {
+      const { transport, linkRequests } = await organizationPages({
+        firstRole,
+        lastRole: Role.ADMIN,
+      });
+      renderConsole(
+        "/github/setup?installation_id=9223372036854775808&code=c&state=s",
+        { transport },
+      );
+
+      const alert = await within(screen.getByRole("main")).findByRole("alert");
+      expect(alert.textContent).toContain("has no GitHub installation details");
+      expect(window.location.search).toBe("");
+      expect(
+        screen.queryByRole("combobox", { name: "tide organization" }),
+      ).toBeNull();
+      expect(linkRequests).toHaveLength(0);
+    },
+  );
 });
 
 describe("runner profiles", () => {
