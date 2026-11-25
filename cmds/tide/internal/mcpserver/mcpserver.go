@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -41,10 +42,9 @@ const (
 	tailBytes = 24 << 10
 )
 
-// startGrace bounds how long an exec with a short wait waits for the
-// started event, so that the command is known to run before the tool
-// returns its exec_id.
-const startGrace = 10 * time.Second
+// confirmationGrace bounds the extra wait for the first exec or attach
+// response before the tool can report the command as running.
+const confirmationGrace = 10 * time.Second
 
 // Config configures a Server.
 type Config struct {
@@ -337,19 +337,22 @@ func (s *Server) waitSession(ctx context.Context, _ *mcp.CallToolRequest, in wai
 	if err != nil {
 		return nil, sessionResult{}, err
 	}
+	singleLookup := wait == 0
+	if singleLookup {
+		wait = s.cfg.maxWait
+	}
 	wctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
-	d, err := c.WaitDevSession(wctx, tide.WaitDevSessionParams{OrganizationID: s.cfg.OrganizationID, DevSessionID: in.SessionID})
-	if err != nil && !(errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil) {
-		return nil, sessionResult{}, toolError(err)
-	}
-	if d == nil {
-		// The wait ended before the first read (wait_seconds 0).
-		res, gerr := c.DevSessions().GetDevSession(ctx, connect.NewRequest(&tidev1.GetDevSessionRequest{OrganizationId: s.cfg.OrganizationID, DevSessionId: in.SessionID}))
-		if gerr != nil {
-			return nil, sessionResult{}, toolError(gerr)
+	if singleLookup {
+		res, err := c.DevSessions().GetDevSession(wctx, connect.NewRequest(&tidev1.GetDevSessionRequest{OrganizationId: s.cfg.OrganizationID, DevSessionId: in.SessionID}))
+		if err != nil {
+			return nil, sessionResult{}, toolError(err)
 		}
-		d = res.Msg.GetDevSession()
+		return nil, sessionResult{Session: sessionOf(res.Msg.GetDevSession())}, nil
+	}
+	d, err := c.WaitDevSession(wctx, tide.WaitDevSessionParams{OrganizationID: s.cfg.OrganizationID, DevSessionID: in.SessionID})
+	if err != nil && (d == nil || ctx.Err() != nil || wctx.Err() != context.DeadlineExceeded || !errors.Is(err, context.DeadlineExceeded)) {
+		return nil, sessionResult{}, toolError(err)
 	}
 	return nil, sessionResult{Session: sessionOf(d)}, nil
 }
@@ -400,12 +403,14 @@ func (s *Server) deleteSession(ctx context.Context, _ *mcp.CallToolRequest, in s
 
 // Exec.
 
+const maxExecTimeoutSeconds = math.MaxInt64 / int64(time.Second)
+
 type execArgs struct {
 	SessionID      string            `json:"session_id" jsonschema:"the dev session ID"`
 	Command        []string          `json:"command" jsonschema:"the argument array; the first element is the program"`
 	Cwd            string            `json:"cwd,omitempty" jsonschema:"working directory: an absolute guest path or a path relative to the workspace path"`
 	Env            map[string]string `json:"env,omitempty" jsonschema:"environment variables for the command"`
-	TimeoutSeconds int               `json:"timeout_seconds,omitempty" jsonschema:"stop the command after this many seconds; 0 means no timeout"`
+	TimeoutSeconds int64             `json:"timeout_seconds,omitempty" jsonschema:"seconds before stopping the command, 0 to 9223372036 inclusive, 0 means no timeout"`
 	WaitSeconds    *int              `json:"wait_seconds,omitempty" jsonschema:"seconds to wait for the command to end, 0 to 50, default 50"`
 }
 
@@ -455,20 +460,23 @@ type execResult struct {
 	MissingEnv []string `json:"missing_env,omitempty"`
 }
 
-// window keeps the first headBytes and the last tailBytes of a stream.
+// window keeps the first headBytes and up to tailBytes after the last gap.
 type window struct {
-	from  int64
-	next  int64
-	head  []byte
-	tail  []byte
-	total int64
+	from    int64
+	next    int64
+	head    []byte
+	headEnd int64
+	tail    []byte
+	total   int64
 }
 
-func (w *window) add(data []byte) {
+func (w *window) add(offset int64, data []byte) {
+	w.next = offset + int64(len(data))
 	w.total += int64(len(data))
 	if room := headBytes - len(w.head); room > 0 {
 		n := min(room, len(data))
 		w.head = append(w.head, data[:n]...)
+		w.headEnd = offset + int64(n)
 		data = data[n:]
 	}
 	w.tail = append(w.tail, data...)
@@ -477,12 +485,20 @@ func (w *window) add(data []byte) {
 	}
 }
 
+func (w *window) skipTo(offset int64) {
+	if offset > w.next {
+		w.next = offset
+		// Keep the tail contiguous so its start is next minus its size.
+		w.tail = w.tail[:0]
+	}
+}
+
 func (w *window) output() Output {
 	o := Output{From: w.from, To: w.next}
 	kept := int64(len(w.head) + len(w.tail))
 	text := string(w.head) + string(w.tail)
 	if w.total > kept {
-		o.Omitted = &tide.ByteRange{From: w.from + int64(len(w.head)), To: w.next - int64(len(w.tail))}
+		o.Omitted = &tide.ByteRange{From: w.headEnd, To: w.next - int64(len(w.tail))}
 		text = string(w.head) + "\n[... output omitted ...]\n" + string(w.tail)
 	}
 	o.Text = strings.ToValidUTF8(text, "�")
@@ -495,19 +511,19 @@ type collector struct {
 	execID    string
 	out, err  window
 	truncated []Truncated
-	started   chan struct{}
+	confirmed chan struct{}
 	once      sync.Once
 }
 
 func newCollector(so, se int64) *collector {
-	return &collector{out: window{from: so, next: so}, err: window{from: se, next: se}, started: make(chan struct{})}
+	return &collector{out: window{from: so, next: so}, err: window{from: se, next: se}, confirmed: make(chan struct{})}
 }
 
-// hasStarted reports whether the stream reported its first event, which
-// for an exec is the started event.
-func (c *collector) hasStarted() bool {
+// hasConfirmation reports whether the SDK delivered a callback. For an
+// attach, the SDK delivers output or truncation and skips keepalives.
+func (c *collector) hasConfirmation() bool {
 	select {
-	case <-c.started:
+	case <-c.confirmed:
 		return true
 	default:
 		return false
@@ -518,25 +534,23 @@ func (c *collector) on(ev tide.ExecEvent) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.execID = ev.ExecID
-	c.once.Do(func() { close(c.started) })
+	c.once.Do(func() { close(c.confirmed) })
 	switch ev.Kind {
 	case tide.ExecEventStdout:
-		c.out.add(ev.Data)
-		c.out.next = ev.Offset + int64(len(ev.Data))
+		c.out.add(ev.Offset, ev.Data)
 	case tide.ExecEventStderr:
-		c.err.add(ev.Data)
-		c.err.next = ev.Offset + int64(len(ev.Data))
+		c.err.add(ev.Offset, ev.Data)
 	case tide.ExecEventOutputTruncated:
 		t := Truncated{}
 		if !ev.MissingStdout.Empty() {
 			r := ev.MissingStdout
 			t.MissingStdout = &r
-			c.out.next = max(c.out.next, r.To)
+			c.out.skipTo(r.To)
 		}
 		if !ev.MissingStderr.Empty() {
 			r := ev.MissingStderr
 			t.MissingStderr = &r
-			c.err.next = max(c.err.next, r.To)
+			c.err.skipTo(r.To)
 		}
 		c.truncated = append(c.truncated, t)
 	}
@@ -566,21 +580,19 @@ func (c *collector) result(execID string, res *tide.ExecResult) execResult {
 	return r
 }
 
-// errStartUnconfirmed is returned by runWithWait when the wait and the
-// start grace passed before the exec reported its started event, so the
-// command may not run.
-var errStartUnconfirmed = errors.New("start unconfirmed")
+// errExecUnconfirmed is returned by runWithWait when the wait and grace
+// period end before a callback or a definite outcome.
+var errExecUnconfirmed = errors.New("exec unconfirmed")
 
 type execOutcome struct {
 	res *tide.ExecResult
 	err error
 }
 
-// runWithWait runs fn in the background and waits up to wait for it. When
-// the wait passes, it waits further (at most startGrace, and never beyond
-// MaxWait in total) until the stream reported its first event, then cancels
-// the stream; the command keeps running in the guest. When the stream did
-// not report its first event, it returns errStartUnconfirmed.
+// runWithWait waits for fn to return. After wait, it allows up to
+// confirmationGrace for the first callback or outcome, within MaxWait
+// overall. It then cancels the stream and lets the command keep running
+// in the guest. Without confirmation, it returns errExecUnconfirmed.
 func (s *Server) runWithWait(ctx context.Context, wait time.Duration, col *collector, fn func(context.Context) (*tide.ExecResult, error)) (*tide.ExecResult, error) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -597,11 +609,11 @@ func (s *Server) runWithWait(ctx context.Context, wait time.Duration, col *colle
 		return o.res, o.err
 	case <-timer.C:
 	}
-	grace := min(startGrace, max(s.cfg.maxWait-time.Since(start), 0))
+	grace := min(confirmationGrace, max(s.cfg.maxWait-time.Since(start), 0))
 	select {
 	case o := <-done:
 		return o.res, o.err
-	case <-col.started:
+	case <-col.confirmed:
 	case <-time.After(grace):
 	}
 	cancel()
@@ -611,10 +623,8 @@ func (s *Server) runWithWait(ctx context.Context, wait time.Duration, col *colle
 	}
 	var se *tide.ExecStreamError
 	if errors.As(o.err, &se) && errors.Is(se.Err, context.Canceled) && ctx.Err() == nil {
-		if !col.hasStarted() {
-			// Without the started event, the command may not exist, so
-			// its exec_id must not be returned as running.
-			return nil, errStartUnconfirmed
+		if !col.hasConfirmation() {
+			return nil, errExecUnconfirmed
 		}
 		return nil, nil // still running
 	}
@@ -631,6 +641,9 @@ func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) 
 	}
 	if in.TimeoutSeconds < 0 {
 		return nil, execResult{}, invalid("timeout_seconds must not be negative")
+	}
+	if in.TimeoutSeconds > maxExecTimeoutSeconds {
+		return nil, execResult{}, invalid("timeout_seconds must be between 0 and %d", maxExecTimeoutSeconds)
 	}
 	c, err := s.client()
 	if err != nil {
@@ -665,7 +678,7 @@ func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) 
 			Timeout: time.Duration(in.TimeoutSeconds) * time.Second, OnEvent: col.on,
 		})
 	})
-	if errors.Is(err, errStartUnconfirmed) {
+	if errors.Is(err, errExecUnconfirmed) {
 		s.cfg.Logger.WarnContext(ctx, "tide mcp exec start unconfirmed", "dev_session_id", in.SessionID, "exec_id", execID)
 		return nil, execResult{}, toolError(connect.NewError(connect.CodeDeadlineExceeded, fmt.Errorf(
 			"exec %s did not confirm its start before the wait passed, so it may not run; exec_output with this exec_id returns not_found if it did not start", execID)))
@@ -691,15 +704,17 @@ func (s *Server) execOutput(ctx context.Context, _ *mcp.CallToolRequest, in exec
 		return nil, execResult{}, err
 	}
 	col := newCollector(in.StdoutOffset, in.StderrOffset)
-	// An attach reports no started event; the stream is known once the
-	// request was sent.
-	col.once.Do(func() { close(col.started) })
 	res, err := s.runWithWait(ctx, wait, col, func(sctx context.Context) (*tide.ExecResult, error) {
 		return c.AttachExec(sctx, tide.AttachParams{
 			OrganizationID: s.cfg.OrganizationID, DevSessionID: in.SessionID, ExecID: in.ExecID,
 			StdoutOffset: in.StdoutOffset, StderrOffset: in.StderrOffset, OnEvent: col.on,
 		})
 	})
+	if errors.Is(err, errExecUnconfirmed) {
+		return nil, execResult{}, toolError(connect.NewError(connect.CodeDeadlineExceeded, fmt.Errorf(
+			"exec_output did not confirm exec %s before the wait expired. Retry with the same exec_id, stdout_offset %d, and stderr_offset %d.",
+			in.ExecID, in.StdoutOffset, in.StderrOffset)))
+	}
 	if err != nil {
 		return nil, execResult{}, toolError(err)
 	}

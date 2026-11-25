@@ -36,11 +36,7 @@ func (w *Watch) Admit(ctx context.Context, d Demand) error { return w.h.admit(ct
 // the vendor queue: a QUEUED tide request of it ends with CANCELED and
 // CANCELED_BY_SOURCE.
 func (w *Watch) Lost(ctx context.Context, vendorRequestID string) error {
-	c, req, err := w.h.latestClaim(ctx, w.h.svc.DB.Pool, w.In.OrganizationID, w.In.Vendor, vendorRequestID)
-	if err != nil || c == nil || work.RequestTerminal(req.State) {
-		return err
-	}
-	return w.h.lost(ctx, c, req)
+	return w.h.lost(ctx, w.In.OrganizationID, w.In.Vendor, vendorRequestID)
 }
 
 // Claim returns the newest claim of a vendor request and its request, or

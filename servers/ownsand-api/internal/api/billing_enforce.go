@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
@@ -190,10 +191,10 @@ func (e *BillingEnforcer) targets(ctx context.Context, sql string, args ...any) 
 // The mark and the command run under the sandbox ordering lock, so a caller's
 // pause of the same sandbox is ordered before the mark or after the command:
 // a caller pause that completed first leaves no stale mark on its sandbox
-// (the mark applies only to a RUNNING sandbox), and one that runs later
-// removes the mark.
+// (the mark applies only to a RUNNING sandbox). A later caller takes ownership
+// by adopting an existing pause or successfully queueing its own pause command.
 func (e *BillingEnforcer) pause(ctx context.Context, t billingTarget) {
-	err := e.s.withSandboxOrder(ctx, t.sandboxID, func() error {
+	err := e.s.withSandboxOrder(ctx, t.sandboxID, func(_ *pgx.Conn) error {
 		e.pauseOrdered(ctx, t)
 		return nil
 	})
@@ -232,10 +233,10 @@ func (e *BillingEnforcer) pauseOrdered(ctx context.Context, t billingTarget) {
 		s.Logger.DebugContext(ctx, "billing_sandbox_pause_deferred", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
 		return
 	}
-	sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, true, func() error {
+	sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, true, pauseOrResumeHooks{beforeSend: func() error {
 		return e.recheck(ctx, `SELECT EXISTS (SELECT 1 FROM organization_billing b WHERE b.organization_id = $1 AND `+pausingPhaseSQL("$2")+`)`,
 			t.orgID, s.now().Add(-billing.SuspendAfter))
-	}, nil)
+	}})
 	if errors.Is(err, errBillingStale) {
 		s.Logger.DebugContext(ctx, "billing_sandbox_pause_stale", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
 		return
@@ -318,8 +319,8 @@ func (e *BillingEnforcer) resume(ctx context.Context, t billingTarget) {
 	// it ran first: it removes the mark, which the recheck requires. The mark
 	// stays after the resume (see above).
 	var sent, resumed bool
-	err := s.withSandboxOrder(ctx, t.sandboxID, func() error {
-		sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, false, func() error {
+	err := s.withSandboxOrder(ctx, t.sandboxID, func(_ *pgx.Conn) error {
+		sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, false, pauseOrResumeHooks{beforeSend: func() error {
 			if err := e.recheck(ctx, `SELECT EXISTS (SELECT 1 FROM sandboxes s JOIN organization_billing b ON b.organization_id = s.organization_id
 			WHERE s.sandbox_id = $1 AND s.paused_by_billing AND s.agent_state = $2 AND NOT s.delete_pending AND `+allowedPhaseSQL+`)`,
 				t.sandboxID, int16(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)); err != nil {
@@ -327,7 +328,7 @@ func (e *BillingEnforcer) resume(ctx context.Context, t billingTarget) {
 			}
 			sent = true
 			return nil
-		}, nil)
+		}})
 		if err != nil {
 			return err
 		}

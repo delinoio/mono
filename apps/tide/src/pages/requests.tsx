@@ -1,26 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-import {
-  useInfiniteQuery,
-  useMutation,
-  useQuery,
-} from "@connectrpc/connect-query";
+import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { BadgeVariant } from "delino-ui/badge";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Checkbox } from "delino-ui/checkbox";
 import { Select, SelectOption } from "delino-ui/select";
 import { RequestState, WorkloadKind } from "@delino/tide-protos/v1/common_pb";
-import { RunnerProfileService } from "@delino/tide-protos/v1/runner_profile_pb";
 import { type Request, WorkService } from "@delino/tide-protos/v1/work_pb";
 import { useMemo, useState } from "react";
-import { invalidateServices, MAX_PAGE_SIZE, PAGE_SIZE } from "../api.ts";
+import { invalidateServices, PAGE_SIZE } from "../api.ts";
 import { SetupEmpty } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   ErrorNotice,
-  Loading,
+  ListPagination,
   PageHeader,
+  QueryBoundary,
   ShortId,
   StateBadge,
 } from "../components/ui.tsx";
@@ -32,6 +28,7 @@ import {
   TERMINAL_REQUEST_STATES,
 } from "../format.ts";
 import { can, Permission } from "../roles.ts";
+import { useRunnerProfiles } from "../runner-profiles.ts";
 
 const ALL = "all";
 
@@ -75,15 +72,10 @@ export function RequestsPage() {
   const [profileId, setProfileId] = useState<string>(ALL);
   const [includeEnded, setIncludeEnded] = useState(false);
   const [canceling, setCanceling] = useState<Request>();
-  const profiles = useQuery(RunnerProfileService.method.listRunnerProfiles, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const profiles = useRunnerProfiles(organizationId);
   const profileNames = useMemo(
     () =>
-      new Map(
-        (profiles.data?.profiles ?? []).map((p) => [p.runnerProfileId, p.name]),
-      ),
+      new Map((profiles.data ?? []).map((p) => [p.runnerProfileId, p.name])),
     [profiles.data],
   );
   const stateFilter = state === ALL ? [] : [Number(state) as RequestState];
@@ -110,7 +102,6 @@ export function RequestsPage() {
   const cancel = useMutation(WorkService.method.cancelRequest, {
     onSuccess: () => invalidateServices(queryClient, WorkService),
   });
-  const requests = list.data?.pages.flatMap((p) => p.requests) ?? [];
   const admin = can(role, Permission.CancelRequests);
   const now = Date.now();
 
@@ -147,11 +138,12 @@ export function RequestsPage() {
         </Select>
         <Select
           label="Runner profile"
+          disabled={!profiles.isSuccess}
           value={profileId}
           onValueChange={(v) => setProfileId(v ?? ALL)}
         >
           <SelectOption value={ALL}>All profiles</SelectOption>
-          {(profiles.data?.profiles ?? []).map((p) => (
+          {(profiles.data ?? []).map((p) => (
             <SelectOption key={p.runnerProfileId} value={p.runnerProfileId}>
               {p.name}
             </SelectOption>
@@ -163,89 +155,94 @@ export function RequestsPage() {
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
-      {list.isPending ? (
-        <Loading label="Loading requests" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : requests.length === 0 ? (
-        <SetupEmpty organizationId={organizationId} title="No requests match">
-          Requests appear when GitHub queues a job with a tide label, a vendor
-          asks for an agent session or a member creates a dev session.
-        </SetupEmpty>
-      ) : (
-        <div className="table-wrap">
-          <table className="table" aria-label="Requests">
-            <thead>
-              <tr>
-                <th scope="col">Request</th>
-                <th scope="col">Kind</th>
-                <th scope="col">Profile</th>
-                <th scope="col">Source</th>
-                <th scope="col">State</th>
-                <th scope="col">End reason</th>
-                <th scope="col">Priority</th>
-                <th scope="col">Queue wait</th>
-                <th scope="col">Queued</th>
-                {admin ? <th scope="col">Actions</th> : null}
-              </tr>
-            </thead>
-            <tbody>
-              {requests.map((r) => {
-                const wait = queueWaitMs(r, now);
-                return (
-                  <tr key={r.requestId}>
-                    <td>
-                      <ShortId id={r.requestId} />
-                    </td>
-                    <td>{labels.workloadKind[r.kind]}</td>
-                    <td>
-                      {profileNames.get(r.runnerProfileId) ?? (
-                        <ShortId id={r.runnerProfileId} />
-                      )}
-                    </td>
-                    <td className="wrap">{requestSource(r) || "—"}</td>
-                    <td>
-                      <StateBadge
-                        text={labels.requestState[r.state]}
-                        tone={requestStateTone(r.state)}
-                      />
-                    </td>
-                    <td>
-                      {TERMINAL_REQUEST_STATES.has(r.state)
-                        ? labels.requestEndReason[r.endReason]
-                        : "—"}
-                    </td>
-                    <td>{labels.priority[r.priority]}</td>
-                    <td>{wait === undefined ? "—" : formatSpan(wait)}</td>
-                    <td>{formatTime(r.queuedAt)}</td>
-                    {admin ? (
-                      <td>
-                        {r.state === RequestState.QUEUED ? (
-                          <Button
-                            variant={ButtonVariant.Danger}
-                            size={ButtonSize.Small}
-                            onClick={() => setCanceling(r)}
-                          >
-                            Cancel
-                          </Button>
-                        ) : null}
-                      </td>
-                    ) : null}
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-      {list.hasNextPage ? (
-        <Button
-          variant={ButtonVariant.Secondary}
-          onClick={() => void list.fetchNextPage()}
-        >
-          Show more
-        </Button>
+      {profiles.error ? (
+        <ErrorNotice
+          title="Could not load runner profiles."
+          error={profiles.error}
+          onRetry={() => void profiles.refetch()}
+        />
       ) : null}
+      <QueryBoundary query={list} loading="Loading requests">
+        {(data) => {
+          const requests = data.pages.flatMap((p) => p.requests);
+          return requests.length === 0 ? (
+            <SetupEmpty
+              organizationId={organizationId}
+              title="No requests match"
+            >
+              Requests appear when GitHub queues a job with a tide label, a
+              vendor asks for an agent session or a member creates a dev
+              session.
+            </SetupEmpty>
+          ) : (
+            <div className="table-wrap">
+              <table className="table" aria-label="Requests">
+                <thead>
+                  <tr>
+                    <th scope="col">Request</th>
+                    <th scope="col">Kind</th>
+                    <th scope="col">Profile</th>
+                    <th scope="col">Source</th>
+                    <th scope="col">State</th>
+                    <th scope="col">End reason</th>
+                    <th scope="col">Priority</th>
+                    <th scope="col">Queue wait</th>
+                    <th scope="col">Queued</th>
+                    {admin ? <th scope="col">Actions</th> : null}
+                  </tr>
+                </thead>
+                <tbody>
+                  {requests.map((r) => {
+                    const wait = queueWaitMs(r, now);
+                    return (
+                      <tr key={r.requestId}>
+                        <td>
+                          <ShortId id={r.requestId} />
+                        </td>
+                        <td>{labels.workloadKind[r.kind]}</td>
+                        <td>
+                          {profileNames.get(r.runnerProfileId) ?? (
+                            <ShortId id={r.runnerProfileId} />
+                          )}
+                        </td>
+                        <td className="wrap">{requestSource(r) || "—"}</td>
+                        <td>
+                          <StateBadge
+                            text={labels.requestState[r.state]}
+                            tone={requestStateTone(r.state)}
+                          />
+                        </td>
+                        <td>
+                          {TERMINAL_REQUEST_STATES.has(r.state)
+                            ? labels.requestEndReason[r.endReason]
+                            : "—"}
+                        </td>
+                        <td>{labels.priority[r.priority]}</td>
+                        <td>{wait === undefined ? "—" : formatSpan(wait)}</td>
+                        <td>{formatTime(r.queuedAt)}</td>
+                        {admin ? (
+                          <td>
+                            {r.state === RequestState.QUEUED ? (
+                              <Button
+                                variant={ButtonVariant.Danger}
+                                size={ButtonSize.Small}
+                                onClick={() => setCanceling(r)}
+                              >
+                                Cancel
+                              </Button>
+                            ) : null}
+                          </td>
+                        ) : null}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          );
+        }}
+      </QueryBoundary>
+      <ListPagination query={list} />
       <ConfirmDialog
         open={canceling !== undefined}
         onOpenChange={(open) => !open && setCanceling(undefined)}

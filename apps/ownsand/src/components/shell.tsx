@@ -116,7 +116,9 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
       <Link to="/" className="brand">
         OwnSand
       </Link>
-      {organizationId !== undefined && orgs.isLoaded ? (
+      {organizationId !== undefined &&
+      orgs.isLoaded &&
+      orgs.terminalLoadMoreError === null ? (
         <div className="org-switcher">
           <Select
             label="Organization"

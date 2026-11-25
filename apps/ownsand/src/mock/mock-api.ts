@@ -217,10 +217,12 @@ interface OrgState {
   sandboxes: Sandbox[];
   /**
    * Create idempotency bookkeeping, kept apart from the user-visible sandbox
-   * labels. Maps an idempotency key to the sandbox it created and to the
-   * encoded request it is bound to, like the real API.
+   * labels. Each key reserves the sandbox and encoded request for 24 hours.
    */
-  createKeys: Map<string, { sandboxId: string; request: string }>;
+  createKeys: Map<
+    string,
+    { sandboxId: string; request: string; expiresAtMs: number }
+  >;
   snapshots: Snapshot[];
   templates: Template[];
   policy: AgentVersionPolicy;
@@ -577,6 +579,14 @@ export interface MockTransportOptions {
    * row.
    */
   extraApiKeys?: number;
+  /** Pending invitations to add after the seeded Acme invitation. */
+  extraInvitations?: number;
+  /** Online Linux devices to add after the two seeded Acme devices. */
+  extraDevices?: number;
+  /** Ready snapshots to add after the seeded Acme snapshot. */
+  extraSnapshots?: number;
+  /** Templates to add after the seeded Acme template. */
+  extraTemplates?: number;
   /**
    * How many running sandboxes, labelled `extra=<index>`, to add to the Acme
    * organization after the seeded ones, on the seeded `build-box` device with
@@ -810,6 +820,29 @@ export function createMockTransport(
   }
   const acmeOrg = orgs.get(MOCK_IDS.acme);
   if (acmeOrg !== undefined) {
+    const seededSnapshot = acmeOrg.snapshots[0]!;
+    for (let i = 0; i < (options.extraSnapshots ?? 0); i++) {
+      const snapshot = clone(SnapshotSchema, seededSnapshot);
+      snapshot.snapshotId = newMockId();
+      acmeOrg.snapshots.push(snapshot);
+    }
+    const seededTemplate = acmeOrg.templates[0]!;
+    for (let i = 0; i < (options.extraTemplates ?? 0); i++) {
+      const template = clone(TemplateSchema, seededTemplate);
+      template.templateId = newMockId();
+      template.name = `Template ${String(i + 2).padStart(3, "0")}`;
+      acmeOrg.templates.push(template);
+    }
+    const seededInvitation = acmeOrg.invitations[0]!.invitation;
+    for (let i = 0; i < (options.extraInvitations ?? 0); i++) {
+      const invitation = clone(InvitationSchema, seededInvitation);
+      invitation.invitationId = newMockId();
+      invitation.secretPrefix = `osi_${String(i).padStart(4, "0")}`;
+      acmeOrg.invitations.push({
+        invitation,
+        secret: `${invitation.secretPrefix}_unused`,
+      });
+    }
     for (let i = 0; i < (options.extraEnrollmentTokens ?? 0); i++) {
       acmeOrg.tokens.push(
         create(EnrollmentTokenSchema, {
@@ -835,6 +868,20 @@ export function createMockTransport(
       extra.sandboxId = newMockId();
       extra.labels = { extra: String(i) };
       acmeOrg.sandboxes.push(extra);
+    }
+    const buildBox = acmeOrg.devices.find(
+      (d) => d.deviceId === MOCK_IDS.buildBox,
+    );
+    for (
+      let i = 0;
+      buildBox !== undefined && i < (options.extraDevices ?? 0);
+      i++
+    ) {
+      const device = clone(DeviceSchema, buildBox);
+      device.deviceId = newMockId();
+      device.name = `Device ${String(i + 3).padStart(3, "0")}`;
+      device.allocation = undefined;
+      acmeOrg.devices.push(device);
     }
     for (let i = 0; i < (options.extraApiKeys ?? 0); i++) {
       acmeOrg.apiKeys.push(
@@ -1138,7 +1185,21 @@ export function createMockTransport(
       listInvitations(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
-        return { invitations: org.invitations.map((i) => i.invitation) };
+        const cutoff = now();
+        const invitations = org.invitations
+          .map(({ invitation }) => invitation)
+          .filter(
+            ({ state, expireTime }) =>
+              state === InvitationState.PENDING &&
+              expireTime !== undefined &&
+              timestampMs(expireTime) > cutoff,
+          );
+        const { page, nextPageToken } = pageOf(
+          invitations,
+          req,
+          (invitation) => invitation.invitationId,
+        );
+        return { invitations: page, nextPageToken };
       },
       revokeInvitation(req) {
         const { org, role } = membership(req.organizationId);
@@ -1225,13 +1286,22 @@ export function createMockTransport(
           }
         } else {
           requireAdmin(role);
-          const target = org.members.find((m) => m.userId === req.userId);
-          if (target?.role === Role.OWNER) {
-            throw new ConnectError(
-              "the owner cannot be removed",
-              Code.PermissionDenied,
-            );
-          }
+        }
+        if (req.userId === "") {
+          throw new ConnectError(
+            "invalid user_id: is required",
+            Code.InvalidArgument,
+          );
+        }
+        const target = org.members.find((m) => m.userId === req.userId);
+        if (target === undefined) {
+          throw new ConnectError("member not found", Code.NotFound);
+        }
+        if (target.role === Role.OWNER) {
+          throw new ConnectError(
+            "the owner cannot be removed",
+            Code.PermissionDenied,
+          );
         }
         org.members = org.members.filter((m) => m.userId !== req.userId);
         return {};
@@ -1321,13 +1391,13 @@ export function createMockTransport(
             Code.InvalidArgument,
           );
         }
-        return {
-          devices: org.devices.filter((d) =>
-            req.state === undefined
-              ? d.state !== DeviceState.REMOVED
-              : d.state === req.state,
-          ),
-        };
+        const devices = org.devices.filter((d) =>
+          req.state === undefined
+            ? d.state !== DeviceState.REMOVED
+            : d.state === req.state,
+        );
+        const { page, nextPageToken } = pageOf(devices, req, (d) => d.deviceId);
+        return { devices: page, nextPageToken };
       },
       getDevice(req) {
         const { org } = membership(req.organizationId);
@@ -1380,6 +1450,7 @@ export function createMockTransport(
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
         const device = findDevice(org, req.deviceId);
+        const endTime = ts();
         device.state = DeviceState.REMOVED;
         for (const s of org.sandboxes) {
           if (
@@ -1388,6 +1459,7 @@ export function createMockTransport(
           ) {
             s.state = SandboxState.DELETED;
             s.endReason = SandboxEndReason.DEVICE_REMOVED;
+            s.endTime = endTime;
           }
         }
         // Like the real control plane, delete the records of snapshots that
@@ -1504,8 +1576,9 @@ export function createMockTransport(
           toBinary(CreateSandboxRequestSchema, canonical),
           (b) => b.toString(16).padStart(2, "0"),
         ).join("");
+        const nowMs = now();
         const known = org.createKeys.get(req.idempotencyKey);
-        if (known !== undefined) {
+        if (known !== undefined && known.expiresAtMs > nowMs) {
           // Same as the real API: a known key bound to other parameters fails.
           if (known.request !== request) {
             throw new ConnectError(
@@ -1549,6 +1622,7 @@ export function createMockTransport(
         org.createKeys.set(req.idempotencyKey, {
           sandboxId: sandbox.sandboxId,
           request,
+          expiresAtMs: nowMs + DAY_MS,
         });
         return { sandbox };
       },
@@ -1715,7 +1789,12 @@ export function createMockTransport(
       },
       listTemplates(req) {
         const { org } = membership(req.organizationId);
-        return { templates: org.templates };
+        const { page, nextPageToken } = pageOf(
+          org.templates,
+          req,
+          (t) => t.templateId,
+        );
+        return { templates: page, nextPageToken };
       },
       deleteTemplate(req) {
         const { org } = membership(req.organizationId);

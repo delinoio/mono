@@ -1,34 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
-import { useQueryClient } from "@tanstack/react-query";
+import { create } from "@bufbuild/protobuf";
+import {
+  callUnaryMethod,
+  createQueryOptions,
+  useMutation,
+  useTransport,
+} from "@connectrpc/connect-query";
+import {
+  useQuery as useReactQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { toast } from "delino-ui/toast";
 import { InvitationState, Role } from "@delino/tide-protos/v1/common_pb";
-import { type Member, MemberService } from "@delino/tide-protos/v1/member_pb";
+import {
+  type Invitation,
+  ListInvitationsResponseSchema,
+  type Member,
+  MemberService,
+} from "@delino/tide-protos/v1/member_pb";
 import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
 import { useState } from "react";
 import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
 import { useAuth } from "../auth.tsx";
+import { MemberListStatus } from "../components/member-list-status.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Empty,
-  ErrorNotice,
   FormDialog,
-  Loading,
   PageHeader,
+  QueryBoundary,
   SecretDialog,
   toastError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import { invitationLink } from "../invitation.ts";
+import { displayName, useMembers } from "../members.ts";
 import { can, canManageMember, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
-
-function displayName(m: Member): string {
-  return m.displayName !== "" ? m.displayName : m.userId;
-}
 
 /** Route `members`: members, roles, leaving and invitations. */
 export function MembersPage() {
@@ -38,10 +49,7 @@ export function MembersPage() {
   const queryClient = useQueryClient();
   const refresh = () =>
     invalidateServices(queryClient, MemberService, OrganizationService);
-  const members = useQuery(MemberService.method.listMembers, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const roster = useMembers(organizationId);
   const updateRole = useMutation(MemberService.method.updateMemberRole, {
     onSuccess: refresh,
   });
@@ -67,16 +75,9 @@ export function MembersPage() {
           ) : undefined
         }
       />
-      {members.isPending ? (
-        <Loading label="Loading members" />
-      ) : members.error ? (
-        <ErrorNotice
-          error={members.error}
-          onRetry={() => void members.refetch()}
-        />
-      ) : (
+      <MemberListStatus roster={roster}>
         <ul className="list" aria-label="Members">
-          {members.data.members.map((m) => {
+          {roster.members.map((m) => {
             const manageable = canManageMember(role, userId, m);
             return (
               <li key={m.userId} className="list-row">
@@ -130,7 +131,7 @@ export function MembersPage() {
             );
           })}
         </ul>
-      )}
+      </MemberListStatus>
       {can(role, Permission.ManageInvitations) ? <Invitations /> : null}
       <ConfirmDialog
         open={removing !== undefined}
@@ -148,12 +149,12 @@ export function MembersPage() {
         title="Leave this organization?"
         description="You lose access to this organization. tide revokes your personal API keys and ends your dev sessions. An admin can invite you again."
         confirmLabel="Leave organization"
-        onConfirm={async () => {
+        onConfirm={async (opening) => {
           await removeMember.mutateAsync({
             organizationId,
             userId: userId ?? "",
           });
-          navigate("/");
+          if (opening.isCurrent()) navigate("/");
         }}
       />
     </>
@@ -162,13 +163,35 @@ export function MembersPage() {
 
 function Invitations() {
   const { organizationId } = useOrg();
+  const transport = useTransport();
   const queryClient = useQueryClient();
-  const refresh = () => invalidateServices(queryClient, MemberService);
-  const list = useQuery(MemberService.method.listInvitations, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
+  const method = MemberService.method.listInvitations;
+  const input = { organizationId, pageSize: MAX_PAGE_SIZE };
+  const query = createQueryOptions(method, input, { transport });
+  const list = useReactQuery({
+    ...query,
+    queryFn: async ({ signal }) => {
+      const invitations: Invitation[] = [];
+      let pageToken = "";
+      do {
+        const page = await callUnaryMethod(
+          transport,
+          method,
+          { ...input, pageToken },
+          { signal },
+        );
+        invitations.push(...page.invitations);
+        pageToken = page.nextPageToken;
+      } while (pageToken !== "");
+      return create(ListInvitationsResponseSchema, { invitations });
+    },
   });
-  const create = useMutation(MemberService.method.createInvitation, {
+  const refresh = async () => {
+    // A write can finish while the first load is still paging.
+    await queryClient.cancelQueries({ queryKey: query.queryKey, exact: true });
+    await invalidateServices(queryClient, MemberService);
+  };
+  const createInvitation = useMutation(MemberService.method.createInvitation, {
     onSuccess: refresh,
   });
   const revoke = useMutation(MemberService.method.revokeInvitation, {
@@ -177,9 +200,6 @@ function Invitations() {
   const [creating, setCreating] = useState(false);
   const [inviteRole, setInviteRole] = useState(String(Role.MEMBER));
   const [link, setLink] = useState<string>();
-  const pending =
-    list.data?.invitations.filter((i) => i.state === InvitationState.PENDING) ??
-    [];
 
   return (
     <section className="section" aria-labelledby="invitations-title">
@@ -192,57 +212,61 @@ function Invitations() {
           Invite someone
         </Button>
       </div>
-      {list.isPending ? (
-        <Loading label="Loading invitations" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : pending.length === 0 ? (
-        <Empty title="No pending invitations" />
-      ) : (
-        <ul className="list" aria-label="Pending invitations">
-          {pending.map((i) => (
-            <li key={i.invitationId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">
-                  {labels.role[i.role]} invitation{" "}
-                  <code>{i.secretPrefix}…</code>
-                </span>
-                <span className="muted">
-                  Expires {formatTime(i.expireTime)}
-                </span>
-              </div>
-              <Button
-                variant={ButtonVariant.Secondary}
-                size={ButtonSize.Small}
-                onClick={async () => {
-                  try {
-                    await revoke.mutateAsync({
-                      organizationId,
-                      invitationId: i.invitationId,
-                    });
-                    toast.success("The invitation is revoked.");
-                  } catch (error) {
-                    toastError(error);
-                  }
-                }}
-              >
-                Revoke
-              </Button>
-            </li>
-          ))}
-        </ul>
-      )}
+      <QueryBoundary query={list} loading="Loading invitations">
+        {(data) => {
+          const pending = data.invitations.filter(
+            (i) => i.state === InvitationState.PENDING,
+          );
+          return pending.length === 0 ? (
+            <Empty title="No pending invitations" />
+          ) : (
+            <ul className="list" aria-label="Pending invitations">
+              {pending.map((i) => (
+                <li key={i.invitationId} className="list-row">
+                  <div className="list-main">
+                    <span className="list-title">
+                      {labels.role[i.role]} invitation{" "}
+                      <code>{i.secretPrefix}…</code>
+                    </span>
+                    <span className="muted">
+                      Expires {formatTime(i.expireTime)}
+                    </span>
+                  </div>
+                  <Button
+                    variant={ButtonVariant.Secondary}
+                    size={ButtonSize.Small}
+                    onClick={async () => {
+                      try {
+                        await revoke.mutateAsync({
+                          organizationId,
+                          invitationId: i.invitationId,
+                        });
+                        toast.success("The invitation is revoked.");
+                      } catch (error) {
+                        toastError(error);
+                      }
+                    }}
+                  >
+                    Revoke
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          );
+        }}
+      </QueryBoundary>
       <FormDialog
         open={creating}
         onOpenChange={setCreating}
         title="Invite someone"
         description="You get a one-time link that works for 7 days. Send it to the person you invite."
         submitLabel="Create link"
-        onSubmit={async () => {
-          const res = await create.mutateAsync({
+        onSubmit={async (opening) => {
+          const res = await createInvitation.mutateAsync({
             organizationId,
             role: Number(inviteRole) as Role,
           });
+          if (!opening.isCurrent()) return;
           setCreating(false);
           setLink(invitationLink(window.location.origin, res.invitationSecret));
         }}

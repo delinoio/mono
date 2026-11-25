@@ -4,15 +4,22 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"net/url"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
@@ -634,6 +641,8 @@ func TestCallerPauseSurvivesControlPlaneReplacement(t *testing.T) {
 	}
 }
 
+const sandboxOrderLockTestKey = "hashtextextended('ownsand.sandbox-order:' || $1::text, 0)"
+
 // holdSandboxOrderLock takes the Postgres advisory lock that serializes the
 // caller pause and the billing worker of one sandbox, as another API
 // instance in the middle of its own critical section would hold it, and
@@ -645,14 +654,17 @@ func holdSandboxOrderLock(t *testing.T, env *testenv.Env, sandboxID string) (rel
 	if err != nil {
 		t.Fatal(err)
 	}
-	const key = "hashtextextended('ownsand.sandbox-order:' || $1::text, 0)"
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock("+key+")", sandboxID); err != nil {
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock("+sandboxOrderLockTestKey+")", sandboxID); err != nil {
+		// PostgreSQL may have granted the lock before the query failed.
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = conn.Hijack().Close(closeCtx)
 		t.Fatal(err)
 	}
 	var once sync.Once
 	release = func() {
 		once.Do(func() {
-			if _, err := conn.Exec(ctx, "SELECT pg_advisory_unlock("+key+")", sandboxID); err != nil {
+			if _, err := conn.Exec(ctx, "SELECT pg_advisory_unlock("+sandboxOrderLockTestKey+")", sandboxID); err != nil {
 				t.Errorf("release the sandbox ordering lock: %v", err)
 			}
 			conn.Release()
@@ -660,6 +672,111 @@ func holdSandboxOrderLock(t *testing.T, env *testenv.Env, sandboxID string) (rel
 	}
 	t.Cleanup(release)
 	return release
+}
+
+func TestSandboxOrderLockQueryFailureClosesConnection(t *testing.T) {
+	const (
+		childEnv   = "OWNSAND_TEST_SANDBOX_ORDER_LOCK_FAILURE"
+		poolClosed = "sandbox ordering lock fixture pool closed"
+		sandboxID  = "lock-query-failure"
+	)
+	if os.Getenv(childEnv) == "1" {
+		config, err := pgxpool.ParseConfig(dbtest.URL(t))
+		if err != nil {
+			t.Fatal("parse sandbox ordering lock test database configuration")
+		}
+		config.ConnConfig.RuntimeParams["lock_timeout"] = "100ms"
+		var checkout *pgx.Conn
+		config.PrepareConn = func(_ context.Context, conn *pgx.Conn) (bool, error) {
+			checkout = conn
+			return true, nil
+		}
+		pool, err := pgxpool.NewWithConfig(t.Context(), config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			sessionClosed := checkout != nil && checkout.IsClosed()
+			pool.Close()
+			if !sessionClosed {
+				t.Error("the failed lock query left its session open")
+				return
+			}
+			t.Log(poolClosed)
+		})
+		holdSandboxOrderLock(t, &testenv.Env{DB: &db.DB{Pool: pool}}, sandboxID)
+		t.Fatal("the sandbox ordering lock query succeeded while another session held the lock")
+	}
+
+	// The parent owns the database and holding session so it can clean up even
+	// if the child leaks its pool checkout and hangs during teardown.
+	databaseURL := dbtest.NewURL(t)
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal("parse sandbox ordering lock test database configuration")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	holder, err := pgx.ConnectConfig(ctx, config.ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Close(ctx) }()
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_lock("+sandboxOrderLockTestKey+")", sandboxID); err != nil {
+		t.Fatal(err)
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, executable,
+		"-test.run=^TestSandboxOrderLockQueryFailureClosesConnection$", "-test.v", "-test.timeout=30s")
+	cmd.Env = append(cmd.Environ(), childEnv+"=1", dbtest.EnvTestDatabaseURL+"="+databaseURL)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("lock query subprocess timed out: %s", output)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("lock query subprocess should fail with exit code 1, got %v: %s", err, output)
+	}
+	for _, want := range []string{"SQLSTATE 55P03", poolClosed} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("lock query subprocess output is missing %q: %s", want, output)
+		}
+	}
+}
+
+func TestSandboxOrderLockQuerySuccessReleasesConnection(t *testing.T) {
+	database := dbtest.New(t)
+	env := &testenv.Env{DB: database}
+	const sandboxID = "lock-query-success"
+
+	observer, err := database.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(observer.Release)
+	assertLockAvailable := func(t *testing.T, want bool) {
+		t.Helper()
+		var available bool
+		err := observer.QueryRow(t.Context(), "SELECT pg_try_advisory_xact_lock("+sandboxOrderLockTestKey+")", sandboxID).Scan(&available)
+		if err != nil || available != want {
+			t.Fatalf("sandbox ordering lock available = %v, error = %v, want %v", available, err, want)
+		}
+	}
+	t.Run("explicit release", func(t *testing.T) {
+		release := holdSandboxOrderLock(t, env, sandboxID)
+		assertLockAvailable(t, false)
+		release()
+		assertLockAvailable(t, true)
+	})
+	t.Run("test cleanup", func(t *testing.T) {
+		holdSandboxOrderLock(t, env, sandboxID)
+		assertLockAvailable(t, false)
+	})
+	assertLockAvailable(t, true)
 }
 
 // TestCallerPauseWaitsForTheSandboxOrderLock checks that the caller pause

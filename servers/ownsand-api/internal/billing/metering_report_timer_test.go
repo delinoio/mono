@@ -9,6 +9,7 @@ import (
 	"time"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
 )
 
@@ -53,6 +54,27 @@ func (t *fakeReportTimer) NextReset(tb testing.TB) time.Duration {
 	}
 }
 
+func runWithFakeReportTimer(t *testing.T, m *billing.Metering) (*fakeReportTimer, func()) {
+	t.Helper()
+	timer := &fakeReportTimer{fire: make(chan time.Time, 1), resets: make(chan time.Duration, 8)}
+	created := make(chan struct{})
+	billing.SetReportTimerForTest(m, func(time.Duration) billing.TestReportTimer {
+		close(created)
+		return timer
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { m.Run(ctx); close(done) }()
+	stop := func() { cancel(); <-done }
+	t.Cleanup(stop)
+	select {
+	case <-created:
+	case <-time.After(guardTimeout):
+		t.Fatal("timed out waiting for the reporter to create its timer")
+	}
+	return timer, stop
+}
+
 // A new lease holder reports the due rows that another instance sealed, even
 // when it seals no window itself, on the first idle timer pass after the
 // lease handover. The test replaces the idle timer of the reporter with a
@@ -82,23 +104,7 @@ func TestRunReportsDueRowsAfterLeaseHandover(t *testing.T) {
 		o.Timing = &timing
 		o.Held = held.Load
 	})
-	timers := make(chan *fakeReportTimer, 1)
-	billing.SetReportTimerForTest(m, func(time.Duration) billing.TestReportTimer {
-		timer := &fakeReportTimer{fire: make(chan time.Time, 1), resets: make(chan time.Duration, 8)}
-		timers <- timer
-		return timer
-	})
-	runCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() { m.Run(runCtx); close(done) }()
-	defer func() { cancel(); <-done }()
-
-	var timer *fakeReportTimer
-	select {
-	case timer = <-timers:
-	case <-time.After(guardTimeout):
-		t.Fatal("timed out waiting for the reporter to create its timer")
-	}
+	timer, _ := runWithFakeReportTimer(t, m)
 
 	// Without the lease a pass reports nothing and checks the lease again
 	// after one Tick. The reporter arms the timer after the lease check, so
@@ -151,5 +157,100 @@ func TestRunReportsDueRowsAfterLeaseHandover(t *testing.T) {
 	}
 	if s, _ := f.outbox(t, org1, classB, t0); !s.reported {
 		t.Fatal("the class B row is not marked reported")
+	}
+}
+
+func TestRunReportsDueRowsAfterLeaseReacquisition(t *testing.T) {
+	f := newFixture(t, t0.Add(time.Minute))
+	accounts, client := newFakeAccounts(t)
+	ctx := t.Context()
+	timing := billing.Timing{Flush: time.Hour, Tick: time.Hour, Report: 2 * time.Hour, BackoffMin: time.Second, BackoffMax: time.Minute}
+	opts := app.Options{DB: f.db, Logger: f.logger, Now: f.clock.Now, BillingTiming: &timing}
+	b, err := app.New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.UsageClient = client
+	a, err := app.New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	takeLease := func(instance *app.App) func() {
+		t.Helper()
+		runCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() { instance.Lease.Run(runCtx); close(done) }()
+		stop := func() { cancel(); <-done }
+		t.Cleanup(stop)
+		waitCtx, cancelWait := context.WithTimeout(ctx, guardTimeout)
+		defer cancelWait()
+		if err := instance.Lease.Wait(waitCtx); err != nil {
+			t.Fatalf("wait for lease: %v", err)
+		}
+		return stop
+	}
+	seal := func(window time.Time) {
+		t.Helper()
+		release := takeLease(b)
+		defer release()
+		b.Metering.Add(org1, classA, window.Add(time.Minute), 2)
+		if err := b.Metering.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		f.clock.Set(window.Add(7 * time.Minute))
+		if n, err := b.Metering.Seal(ctx); err != nil || n != 1 {
+			t.Fatalf("seal: %d %v", n, err)
+		}
+	}
+
+	// Use the timer for the first pass so A reaches its long idle wait
+	// regardless of whether the acquisition callback wakes the reporter.
+	onAcquire := a.Lease.OnAcquire
+	a.Lease.OnAcquire = a.Control.LeaseAcquired
+	timer, stopReporter := runWithFakeReportTimer(t, a.Metering)
+	release := takeLease(a)
+	timer.Fire(t)
+	if d := timer.NextReset(t); d != timing.Report {
+		t.Fatalf("initial holder reset = %s, want %s", d, timing.Report)
+	}
+	release()
+	a.Lease.OnAcquire = onAcquire
+	seal(t0)
+
+	// Keep the old idle timer unfired. Only the production lease callback can
+	// wake the reporter because A has sealed nothing.
+	release = takeLease(a)
+	if d := timer.NextReset(t); d != timing.Report {
+		t.Fatalf("reset after reacquisition = %s, want %s", d, timing.Report)
+	}
+	if requests, reports := accounts.count(); requests != 1 || reports != 1 {
+		t.Fatalf("requests = %d, reports = %d after reacquisition, want 1 and 1", requests, reports)
+	}
+	if s, ok := f.outbox(t, org1, classA, t0); !ok || !s.reported {
+		t.Fatalf("sealed row after reacquisition: %+v %v", s, ok)
+	}
+	release()
+	stopReporter()
+
+	// Queue an acquisition wake while A's reporter is stopped. Release the
+	// lease before starting the reporter so it consumes the wake as a nonholder.
+	window := t0.Add(5 * time.Minute)
+	seal(window)
+	before, ok := f.outbox(t, org1, classA, window)
+	if !ok || before.reported || before.attempts != 0 {
+		t.Fatalf("second sealed row: %+v %v", before, ok)
+	}
+	release = takeLease(a)
+	release()
+	timer, _ = runWithFakeReportTimer(t, a.Metering)
+	if d := timer.NextReset(t); d != timing.Tick {
+		t.Fatalf("reset after a stale wake = %s, want %s", d, timing.Tick)
+	}
+	if requests, reports := accounts.count(); requests != 1 || reports != 1 {
+		t.Fatalf("requests = %d, reports = %d after a stale wake, want 1 and 1", requests, reports)
+	}
+	if after, ok := f.outbox(t, org1, classA, window); !ok || after != before {
+		t.Fatalf("unsent row changed: before %+v, after %+v", before, after)
 	}
 }

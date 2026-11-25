@@ -29,6 +29,10 @@ case "$arch" in
     exit 2
     ;;
 esac
+if [ -d "$out" ]; then
+  echo "kernel output path is a directory: $out" >&2
+  exit 1
+fi
 
 version="6.18.64"
 # From https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc.
@@ -100,7 +104,27 @@ docker run --rm \
     done < /src/kernel.config
     [ "$missing" = 0 ]
     make -s ARCH="$karch" CROSS_COMPILE="$cross" -j"$(nproc)" "$target"
-    cp "$built" "/out/$OUT_NAME"
-    cp .config "/out/$OUT_NAME.config"
-  '
-echo "wrote $out ($(shasum -a 256 "$out" | cut -d" " -f1))"
+    cp -T -- "$built" "/out/$OUT_NAME"
+    cp -T -- .config "/out/$OUT_NAME.config"
+  ' || {
+  status=$?
+  echo "kernel build failed for $out" >&2
+  exit "$status"
+}
+
+if command -v shasum >/dev/null 2>&1; then
+  checksum_tool=(shasum -a 256)
+elif command -v sha256sum >/dev/null 2>&1; then
+  checksum_tool=(sha256sum)
+else
+  echo "could not compute SHA-256 for $out: install shasum or sha256sum" >&2
+  exit 1
+fi
+
+# Hash stdin so checksum output stays the same even for escaped filenames.
+if ! checksum="$("${checksum_tool[@]}" < "$out")" ||
+  ! [[ "${checksum%% *}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "could not compute SHA-256 for $out with ${checksum_tool[0]}" >&2
+  exit 1
+fi
+echo "wrote $out (${checksum%% *})"

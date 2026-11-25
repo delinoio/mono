@@ -111,6 +111,44 @@ func TestDeleteWhileCreateWaitsForSandboxLockAbortsCreate(t *testing.T) {
 	requireNoSnapshotTrace(t, e, snapID)
 }
 
+func TestDeleteSnapshotBeforeCaptureAbortsCreate(t *testing.T) {
+	e := newEnv(t)
+	sandboxID := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	snapID, _ := uuidv7.NewString()
+	cmd := &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}
+	e.rt.snapStarted = make(chan struct{})
+	e.rt.snapBlock = make(chan struct{})
+	close(e.rt.snapBlock)
+
+	e.m.beforeSnapshotCapture = func() {
+		if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}); err != nil {
+			t.Fatalf("delete before capture = %v", err)
+		}
+	}
+	entry, err := e.m.CreateSnapshot(context.Background(), cmd)
+	requireErrCode(t, err, ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "create after a delete")
+	if entry != nil {
+		t.Errorf("entry = %v, want nil", entry)
+	}
+	select {
+	case <-e.rt.snapStarted:
+		t.Fatal("runtime started the deleted snapshot capture")
+	default:
+	}
+	requireNoSnapshotTrace(t, e, snapID)
+
+	e.m.beforeSnapshotCapture = nil
+	entry, err = e.m.CreateSnapshot(context.Background(), cmd)
+	if err != nil || entry.GetSnapshotId() != snapID || entry.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("create after the aborted create = %v, %v; want the ready snapshot", entry, err)
+	}
+	select {
+	case <-e.rt.snapStarted:
+	default:
+		t.Fatal("runtime did not start the fresh snapshot capture")
+	}
+}
+
 // TestDeleteCancelsEveryReceivedCreateOfTheSnapshot checks that two create
 // commands of one snapshot, which wait for the sandbox lock, are both
 // canceled by a delete that arrived after both.

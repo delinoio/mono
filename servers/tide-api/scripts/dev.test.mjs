@@ -65,7 +65,7 @@ function fakeGo(t, script) {
 // received and exits.
 function fakeGoBuildingEnvPrinter(t) {
   const program = `#!${process.execPath}
-console.log(JSON.stringify({ event: "env", cors: process.env.CORS_ORIGINS, direct: process.env.ALLOW_DIRECT_CLIENT_ADDRESS, metrics: process.env.METRICS_ADDR }));
+console.log(JSON.stringify({ event: "env", database: process.env.DATABASE_URL, cors: process.env.CORS_ORIGINS, direct: process.env.ALLOW_DIRECT_CLIENT_ADDRESS, metrics: process.env.METRICS_ADDR }));
 `;
   return fakeGo(
     t,
@@ -101,7 +101,7 @@ const envRecord = (output) =>
 
 for (const [label, value] of [
   ["empty", ""],
-  ["white space", "   "],
+  ["ASCII white space", " \t\n\v\f\r"],
 ]) {
   test(
     `DATABASE_URL that is ${label} skips and starts no build`,
@@ -136,9 +136,55 @@ for (const [label, value] of [
       assert.equal(code, 0, output);
       assert.deepEqual(envRecord(output), {
         event: "env",
+        database: "postgres://launcher-test",
         cors: DefaultCorsOrigins,
         direct: "true",
         metrics: "127.0.0.1:19400",
+      });
+    },
+  );
+}
+
+for (const [label, value] of [
+  ["U+00A0", "\u00a0"],
+  ["U+3000", "\u3000"],
+]) {
+  test(
+    `DATABASE_URL that is only ${label} reaches the child unchanged`,
+    { skip, timeout: Timeout },
+    async (t) => {
+      const { code, output } = await runLauncher(t, {
+        env: { DATABASE_URL: value },
+        goDir: fakeGoBuildingEnvPrinter(t),
+      });
+
+      assert.equal(code, 0, output);
+      assert.doesNotMatch(output, /tide_api_dev_skipped/);
+      assert.equal(envRecord(output).database, value);
+    },
+  );
+
+  test(
+    `CORS_ORIGINS, ALLOW_DIRECT_CLIENT_ADDRESS and METRICS_ADDR that are only ${label} reach the child unchanged`,
+    { skip, timeout: Timeout },
+    async (t) => {
+      const { code, output } = await runLauncher(t, {
+        env: {
+          DATABASE_URL: "postgres://launcher-test",
+          CORS_ORIGINS: value,
+          ALLOW_DIRECT_CLIENT_ADDRESS: value,
+          METRICS_ADDR: value,
+        },
+        goDir: fakeGoBuildingEnvPrinter(t),
+      });
+
+      assert.equal(code, 0, output);
+      assert.deepEqual(envRecord(output), {
+        event: "env",
+        database: "postgres://launcher-test",
+        cors: value,
+        direct: value,
+        metrics: value,
       });
     },
   );
@@ -156,6 +202,7 @@ test(
     assert.equal(code, 0, output);
     assert.deepEqual(envRecord(output), {
       event: "env",
+      database: "postgres://launcher-test",
       cors: DefaultCorsOrigins,
       direct: "true",
       metrics: "127.0.0.1:19400",
@@ -169,10 +216,10 @@ test(
   async (t) => {
     const { code, output } = await runLauncher(t, {
       env: {
-        DATABASE_URL: "postgres://launcher-test",
-        CORS_ORIGINS: "https://a.example",
-        ALLOW_DIRECT_CLIENT_ADDRESS: "false",
-        METRICS_ADDR: "127.0.0.1:9999",
+        DATABASE_URL: " postgres://launcher-test ",
+        CORS_ORIGINS: " https://a.example ",
+        ALLOW_DIRECT_CLIENT_ADDRESS: " false ",
+        METRICS_ADDR: " 127.0.0.1:9999 ",
       },
       goDir: fakeGoBuildingEnvPrinter(t),
     });
@@ -180,9 +227,10 @@ test(
     assert.equal(code, 0, output);
     assert.deepEqual(envRecord(output), {
       event: "env",
-      cors: "https://a.example",
-      direct: "false",
-      metrics: "127.0.0.1:9999",
+      database: " postgres://launcher-test ",
+      cors: " https://a.example ",
+      direct: " false ",
+      metrics: " 127.0.0.1:9999 ",
     });
   },
 );
