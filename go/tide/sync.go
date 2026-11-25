@@ -97,6 +97,7 @@ type SyncResult struct {
 //     (*PathRuleError).
 //  6. The lock directory <workspace_path>.tide-sync.lock is created with one
 //     exec; an existing lock fails with ErrSyncLocked unless Force is set.
+//     Sync checks the manifest under the lock before returning an unchanged result.
 //  7. The changed files go in one tar archive next to the workspace, which
 //     the guest tar extracts into the workspace; then the new manifest is
 //     written and the archive and the lock are removed.
@@ -170,11 +171,6 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 			return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleInvalidWindowsName, Paths: bad})
 		}
 	}
-	if plan.empty() {
-		report(TransferProgress{Phase: TransferDone})
-		return plan.res, nil
-	}
-
 	// Check the encoded manifest before taking the lock or uploading anything.
 	// Apply can only make it smaller by leaving out failed Windows links.
 	next := manifest{Version: manifestVersion, Files: make(map[string]manifestEntry, len(local.files)), PathsValidated: true}
@@ -238,15 +234,15 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		if plan, err = planSync(local, cur); err != nil {
 			return nil, err
 		}
-		if plan.empty() && !workspaceMissing {
-			succeeded = true
-			res := plan.res
-			if r, err := c.runGuest(ctx, s, opCleanup, cleanupEnv); err != nil || r.exitCode != 0 {
-				res.Warnings = append(res.Warnings, "the guest could not release the sync lock; the next sync may need force")
-			}
-			report(TransferProgress{Phase: TransferDone})
-			return res, nil
+	}
+	if plan.empty() && !workspaceMissing {
+		succeeded = true
+		res := plan.res
+		if r, err := c.runGuest(ctx, s, opCleanup, cleanupEnv); err != nil || r.exitCode != 0 {
+			res.Warnings = append(res.Warnings, "the guest could not release the sync lock; the next sync may need force")
 		}
+		report(TransferProgress{Phase: TransferDone})
+		return res, nil
 	}
 	res, changed, deleted, changedTotal := plan.res, plan.changed, plan.deleted, plan.changedTotal
 
