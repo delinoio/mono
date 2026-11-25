@@ -818,7 +818,7 @@ describe("invoices", () => {
     await settle();
   }
 
-  test("demotion to viewer while Invoices is open selects Overview", async () => {
+  test("Overview stays selected after invoice access returns", async () => {
     const api = createFakeApi();
     await renderAccount(ADMIN, { api });
     await openTab("Invoices");
@@ -831,11 +831,26 @@ describe("invoices", () => {
     await changeRoleAndRefetch(api, ADMIN, BillingAccountRole.VIEWER);
 
     expect(screen.queryByRole("tab", { name: "Invoices" })).toBeNull();
-    const selected = screen
-      .getAllByRole("tab")
-      .filter((t) => t.getAttribute("aria-selected") === "true");
-    expect(selected.map((t) => t.textContent)).toEqual(["Overview"]);
-    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+    expect(screen.queryByRole("tabpanel", { name: "Invoices" })).toBeNull();
+    expect(screen.getAllByRole("tab", { selected: true })).toEqual([
+      screen.getByRole("tab", { name: "Overview" }),
+    ]);
+
+    await changeRoleAndRefetch(api, ADMIN, BillingAccountRole.ADMIN);
+
+    expect(
+      screen.getByRole("tab", { name: "Invoices", selected: false }),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("tab", { selected: true })).toEqual([
+      screen.getByRole("tab", { name: "Overview" }),
+    ]);
+    expect(screen.getByRole("tabpanel", { name: "Overview" })).toBeTruthy();
+
+    await openTab("Invoices");
+
+    expect(
+      screen.getByRole("tab", { name: "Invoices", selected: true }),
+    ).toBeTruthy();
   });
 
   test("a role change that keeps access keeps the Invoices tab selected", async () => {
