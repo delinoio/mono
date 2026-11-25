@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -3345,6 +3346,172 @@ func TestFailedCreateRetriesStopUntilItSucceeds(t *testing.T) {
 	e.tickAndWait()
 	if calls := e.rt.deleteCallCount(); calls != 3 {
 		t.Fatalf("runtime Delete calls after a completed clean-up = %d, want 3", calls)
+	}
+}
+
+// failCreateSave lets the runtime fail after the initial CREATING save,
+// while the store cannot commit the subsequent failed-create transition.
+func failCreateSave(t *testing.T, e *env, fault func(string) func()) (string, Record, func()) {
+	t.Helper()
+	cmd := e.createCmd(1, time.Hour, 2*time.Hour)
+	id := cmd.GetSandboxId()
+	e.rt.createErr = errors.New("injected create failure")
+	e.rt.retainFailedCreate(id)
+	started, release := make(chan struct{}), make(chan struct{})
+	e.rt.createStarted, e.rt.block = started, release
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	type result struct {
+		entry *ownsandv1.SandboxStateEntry
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		entry, err := e.m.Create(ctx, cmd)
+		done <- result{entry: entry, err: err}
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("runtime create did not start")
+	}
+	creating := persistedRecord(t, e.st, id)
+	restore := fault(id)
+	close(release)
+	select {
+	case got := <-done:
+		requireInternal(t, got.err)
+		if got.entry != nil {
+			t.Fatalf("failed save returned an entry: %v", got.entry)
+		}
+	case <-ctx.Done():
+		t.Fatal("failed create did not return")
+	}
+	return id, creating, restore
+}
+
+func TestFailedCreateRetriesTerminalSaveBeforeCleanup(t *testing.T) {
+	for _, fault := range []string{"revision", "record"} {
+		t.Run(fault, func(t *testing.T) {
+			e := newEnv(t)
+			id, creating, restore := failCreateSave(t, e, func(id string) func() {
+				if fault == "revision" {
+					return failRevisions(t, e.st)
+				}
+				return breakFile(t, e.st.Path(store.SandboxesDir, id+".json"))
+			})
+
+			for attempt := range 3 {
+				if attempt > 0 {
+					e.m.Tick(t.Context(), true)
+					e.m.bg.Wait()
+				}
+				current := e.m.StateReport(1, nil).GetSandboxes()[0]
+				if current.GetState() != creating.State || current.GetRevision().GetCounter() != creating.Revision {
+					t.Fatalf("state report during storage fault = %v, want saved CREATING revision %d", current, creating.Revision)
+				}
+				if states := e.out.states(id); !slices.Equal(states, []ownsandv1.SandboxState{creating.State}) {
+					t.Fatalf("published states during storage fault = %v, want only CREATING", states)
+				}
+				if fault == "revision" && persistedRecord(t, e.st, id) != creating {
+					t.Fatal("failed revision write changed the saved CREATING record")
+				}
+			}
+			if calls := e.rt.deleteCallCount(); calls != 0 || e.pendingCleanups() != 1 {
+				t.Fatalf("during storage fault: Delete calls = %d, pending = %d, want 0 and 1", calls, e.pendingCleanups())
+			}
+
+			restore()
+			e.rt.deleteFails = 1
+			e.tickAndWait()
+			failed := persistedRecord(t, e.st, id)
+			if failed.State != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || failed.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED || failed.Revision <= creating.Revision {
+				t.Fatalf("saved record after recovery = %+v, want a new FAILED/CREATE_FAILED revision", failed)
+			}
+			update := e.out.entries[len(e.out.entries)-1]
+			if !proto.Equal(update, failed.Entry(e.m.Epoch())) {
+				t.Fatalf("published update = %v, want saved record %v", update, failed.Entry(e.m.Epoch()))
+			}
+			if calls := e.rt.deleteCallCount(); calls != 1 || !e.rt.hasFiles(id) {
+				t.Fatalf("after first cleanup: Delete calls = %d, files present = %t, want 1 and true", calls, e.rt.hasFiles(id))
+			}
+			e.tickAndWait()
+			e.tickAndWait()
+			running, _ := e.rt.Running(t.Context())
+			if calls := e.rt.deleteCallCount(); calls != 2 || len(running) != 0 || e.rt.hasFiles(id) || e.pendingCleanups() != 0 {
+				t.Fatalf("after cleanup: Delete calls = %d, running = %v, files present = %t, pending = %d", calls, running, e.rt.hasFiles(id), e.pendingCleanups())
+			}
+		})
+	}
+}
+
+func TestFailedCreateRetryPreservesEndOwner(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason ownsandv1.SandboxEndReason
+	}{
+		{name: "caller", reason: ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER},
+		{name: "TTL", reason: ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED},
+		{name: "removal", reason: ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DEVICE_REMOVED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			id, _, restore := failCreateSave(t, e, func(string) func() { return failRevisions(t, e.st) })
+			restore()
+			started, block := make(chan struct{}), make(chan struct{})
+			e.rt.deleteStarted, e.rt.deleteBlock = started, block
+			release := sync.OnceFunc(func() { close(block) })
+			defer release()
+			done := make(chan error, 1)
+			switch tc.name {
+			case "caller":
+				go func() {
+					_, err := e.m.Delete(t.Context(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+					done <- err
+				}()
+			case "TTL":
+				e.clk.Advance(2 * time.Hour)
+				e.m.Tick(t.Context(), false)
+			case "removal":
+				go func() { done <- e.m.RemoveAll(t.Context()) }()
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			select {
+			case <-started:
+			case <-ctx.Done():
+				t.Fatal("end did not start runtime cleanup")
+			}
+			e.m.Tick(t.Context(), false)
+			if calls := e.rt.deleteCallCount(); calls != 1 {
+				t.Fatalf("overlapping Delete calls = %d, want 1", calls)
+			}
+			release()
+			if tc.name != "TTL" {
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-ctx.Done():
+					t.Fatal("end did not finish")
+				}
+			}
+			e.tickAndWait()
+			if slices.Contains(e.out.states(id), ownsandv1.SandboxState_SANDBOX_STATE_FAILED) {
+				t.Fatal("failed-create retry replaced the end")
+			}
+			if tc.name == "removal" {
+				if _, ok := e.m.State(id); ok {
+					t.Fatal("device removal kept the sandbox")
+				}
+			} else if rec := persistedRecord(t, e.st, id); rec.State != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || rec.EndReason != tc.reason {
+				t.Fatalf("saved end = %v/%v, want DELETED/%v", rec.State, rec.EndReason, tc.reason)
+			}
+			if e.ex.ended[id] != tc.reason || e.rt.deleteCallCount() != 1 {
+				t.Fatalf("exec end reason = %v, Delete calls = %d, want %v and 1", e.ex.ended[id], e.rt.deleteCallCount(), tc.reason)
+			}
+		})
 	}
 }
 
