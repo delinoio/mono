@@ -347,9 +347,9 @@ func TestDiskPreparationCancellation(t *testing.T) {
 		{"Linux growth in progress", linux, []string{copyDisk, growDisk}, false},
 		{"Windows copy interrupted", windows, []string{copyDisk}, true},
 		{"Windows copy finishes as cancellation arrives", windows, []string{copyDisk}, false},
-		{"Windows growth in progress", windows, []string{copyDisk, growDisk}, false},
-		{"Windows metadata copy interrupted", windows, []string{copyDisk, growDisk, copyMeta}, true},
-		{"Windows metadata finishes as cancellation arrives", windows, []string{copyDisk, growDisk, copyMeta}, false},
+		{"Windows growth in progress", windows, []string{copyDisk, copyMeta, growDisk}, false},
+		{"Windows metadata copy interrupted", windows, []string{copyDisk, copyMeta}, true},
+		{"Windows metadata finishes as cancellation arrives", windows, []string{copyDisk, copyMeta}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -370,6 +370,7 @@ func TestDiskPreparationCancellation(t *testing.T) {
 			}
 			if tc.guestOS == windows {
 				spec.Snapshot = &vmruntime.SnapshotSource{Dir: filepath.Join(dir, "snapshot")}
+				writeWindowsGeneration(t, spec.Snapshot.Dir, snapWindowsDisk, "snapshot", 0, 0)
 			}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()

@@ -303,8 +303,8 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			}
 		}
 	case ownsandv1.GuestOs_GUEST_OS_WINDOWS:
-		if err := r.checkWindowsSpec(spec); err != nil {
-			return nil, err
+		if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
+			return nil, fmt.Errorf("%w: Windows sandboxes run only with network mode NONE in this version", vmruntime.ErrUnsupported)
 		}
 	default:
 		return nil, fmt.Errorf("%w: Hyper-V runs Linux and Windows guests, not %v", vmruntime.ErrUnsupported, spec.GuestOS)
@@ -332,9 +332,6 @@ type vmCreateOps struct {
 func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreateOps) (vmruntime.VM, error) {
 	windowsGuest := spec.GuestOS == ownsandv1.GuestOs_GUEST_OS_WINDOWS
 	start := time.Now()
-	if err := r.resetVMDir(spec.SandboxID, spec.Dir); err != nil {
-		return nil, err
-	}
 	v := &vm{id: spec.SandboxID, dir: spec.Dir, guestOS: spec.GuestOS, network: spec.NetworkMode,
 		exited: make(chan struct{}), stopping: make(chan struct{})}
 	// cleanup releases everything of a failed create. When the stop of the VM
@@ -356,9 +353,13 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 			r.logger.Warn("remove VM directory failed", "sandbox_id", v.id, "error", err)
 		}
 	}
-	if err := grantVMGroup(spec.Dir, accessReadWrite, true); err != nil {
-		cleanup()
-		return nil, err
+	dirReady := false
+	prepareDir := func() error {
+		if err := r.resetVMDir(spec.SandboxID, spec.Dir); err != nil {
+			return err
+		}
+		dirReady = true
+		return grantVMGroup(spec.Dir, accessReadWrite, true)
 	}
 	var (
 		vs   vmSpec
@@ -366,12 +367,14 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 		err  error
 	)
 	if windowsGuest {
-		vs, size, err = r.prepareWindowsDisk(ctx, spec, ops)
-	} else {
+		vs, size, err = r.prepareWindowsDisk(ctx, spec, ops, prepareDir)
+	} else if err = prepareDir(); err == nil {
 		vs, size, err = r.prepareLinuxDisk(ctx, spec, ops)
 	}
 	if err != nil {
-		cleanup()
+		if dirReady {
+			cleanup()
+		}
 		return nil, err
 	}
 	vs.ConsolePipe = consolePipe(v.id)
