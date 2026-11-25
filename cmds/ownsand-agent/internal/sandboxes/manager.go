@@ -94,7 +94,9 @@ type sandbox struct {
 	// ending is true while the agent itself stops the VM.
 	ending bool
 	// createCleanupTracked is set when the runtime failed to create this
-	// sandbox. The pending set tracks cleanup even if the record is dropped.
+	// sandbox. While its record is CREATING, the failed-create transition
+	// still needs to be saved. The pending set tracks runtime cleanup even
+	// if the record is dropped.
 	createCleanupTracked bool
 	// stopped is true once an end attempt stopped the VM and told the exec
 	// tracker, so a retry after a later failure does not repeat them.
@@ -724,12 +726,8 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	if err != nil {
 		m.logger.Warn("sandbox create failed", "sandbox_id", id, "error", err)
 		m.mu.Lock()
-		deleting := sb.ending || sb.rec.State != ownsandv1.SandboxState_SANDBOX_STATE_CREATING
-		m.mu.Unlock()
-		if deleting {
-			// A delete or a TTL canceled the create; that path reports the
-			// end.
-			m.mu.Lock()
+		if m.removing || sb.ending || sb.rec.State != ownsandv1.SandboxState_SANDBOX_STATE_CREATING {
+			// The operation that took over the sandbox handles its end.
 			entry := sb.rec.Entry(m.epoch)
 			m.mu.Unlock()
 			return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "sandbox was deleted during its create")
@@ -737,17 +735,16 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 		// The runtime cleans up a failed create itself, but a runtime whose
 		// stop failed keeps the VM handle and files. Tick retries the stop
 		// until the runtime Delete succeeds.
-		m.mu.Lock()
 		m.cleanupPending[id] = struct{}{}
 		sb.createCleanupTracked = true
+		entry, saveErr := m.commitCreateFailureLocked(sb)
+		outbox := m.outbox
 		m.mu.Unlock()
-		entry, uerr := m.update(sb, func(r *Record) {
-			r.State = ownsandv1.SandboxState_SANDBOX_STATE_FAILED
-			r.EndReason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED
-		})
-		if uerr != nil {
+		if saveErr != nil {
+			m.logger.Warn("save failed sandbox create; retrying on a later tick", "sandbox_id", id, "error", saveErr)
 			return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "agent could not record the failed create")
 		}
+		m.sendUpdate(outbox, ownsandv1.SandboxState_SANDBOX_STATE_CREATING, entry)
 		code := ownsandv1.ErrorCode_ERROR_CODE_INTERNAL
 		if errors.Is(err, vmruntime.ErrUnsupported) {
 			code = ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION
@@ -762,6 +759,22 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	// the VM still runs, and its later exit must end the record.
 	go m.watchVM(sb, vm)
 	return m.publishRunning(ctx, sb, vm)
+}
+
+// commitCreateFailureLocked keeps the saved CREATING record visible until
+// the failed-create transition commits. The caller holds m.mu and checks
+// that the failed create still owns the sandbox.
+func (m *Manager) commitCreateFailureLocked(sb *sandbox) (*ownsandv1.SandboxStateEntry, error) {
+	rec := sb.rec
+	if err := m.commitLocked(&rec, func(r *Record) {
+		r.State = ownsandv1.SandboxState_SANDBOX_STATE_FAILED
+		r.EndReason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED
+	}); err != nil {
+		return nil, err
+	}
+	sb.rec.State, sb.rec.EndReason = rec.State, rec.EndReason
+	sb.rec.Revision, sb.rec.Acked = rec.Revision, rec.Acked
+	return sb.rec.Entry(m.epoch), nil
 }
 
 // publishRunning records and reports RUNNING for a sandbox whose VM started.
@@ -1140,9 +1153,9 @@ func (sb *sandbox) retryEndBeforeDeadline() bool {
 	return false
 }
 
-// Tick enforces the TTLs, retries cleanup of exited VMs, reports moved idle
-// deadlines at most once per minute and resends unacknowledged updates when
-// resend is true.
+// Tick enforces the TTLs, retries failed creates and cleanup of exited VMs,
+// reports moved idle deadlines at most once per minute and resends
+// unacknowledged updates when resend is true.
 func (m *Manager) Tick(ctx context.Context, resend bool) {
 	now := m.now()
 	type expiry struct {
@@ -1160,7 +1173,7 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 		previous time.Time
 	}
 	var reports []idleReport
-	var unacked []*ownsandv1.SandboxStateEntry
+	var failedCreates, unacked []*ownsandv1.SandboxStateEntry
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -1198,6 +1211,14 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 				continue
 			}
 		}
+		if !m.removing && sb.createCleanupTracked && sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_CREATING {
+			entry, err := m.commitCreateFailureLocked(sb)
+			if err == nil {
+				failedCreates = append(failedCreates, entry)
+				continue
+			}
+			m.logger.Warn("save failed sandbox create; retrying on a later tick", "sandbox_id", sb.rec.SandboxID, "error", err)
+		}
 		if sb.idleDirty && now.Sub(sb.lastIdleReport) >= IdleReportInterval {
 			reports = append(reports, idleReport{sb: sb, previous: sb.lastIdleReport})
 			sb.idleDirty = false
@@ -1223,6 +1244,9 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 	outbox := m.outbox
 	m.bg.Add(len(expired))
 	m.mu.Unlock()
+	for _, entry := range failedCreates {
+		m.sendUpdate(outbox, ownsandv1.SandboxState_SANDBOX_STATE_CREATING, entry)
+	}
 	for _, e := range expired {
 		if e.retry {
 			m.logger.Info("retrying sandbox cleanup", "sandbox_id", e.sb.rec.SandboxID, "end_reason", e.reason.String())
