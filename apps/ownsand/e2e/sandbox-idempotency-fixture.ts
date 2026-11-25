@@ -104,3 +104,7 @@ declare global {
 window.createSandboxForIdempotencyTest = createSandbox;
 window.createSandboxWithTtls = createSandboxWithTtls;
 window.listSandboxIds = listSandboxIds;
+
+const ready = document.createElement("p");
+ready.textContent = "Sandbox RPC fixture ready";
+document.body.append(ready);

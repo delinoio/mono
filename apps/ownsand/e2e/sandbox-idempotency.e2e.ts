@@ -8,8 +8,10 @@ describe("sandbox create idempotency", () => {
   test("reuses a key after 24 hours even when the first reuse fails", async ({
     app,
     browser,
+    screen,
   }) => {
     await app.open("/sandbox-idempotency.html");
+    await expect(screen.getByText("Sandbox RPC fixture ready")).toBeVisible();
     const start = Date.UTC(2026, 0, 1);
     const expiry = start + 24 * 60 * 60 * 1000;
     const create = (

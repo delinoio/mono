@@ -8,8 +8,10 @@ describe("sandbox create TTLs", () => {
   test("rejects an over-limit TTL and replays a corrected subsecond create", async ({
     app,
     browser,
+    screen,
   }) => {
     await app.open("/sandbox-idempotency.html");
+    await expect(screen.getByText("Sandbox RPC fixture ready")).toBeVisible();
     const start = 1_750_000_000_999;
     const sevenDaysNanos = 604_800_000_000_000;
     const list = () => browser.evaluate(() => window.listSandboxIds());
@@ -38,8 +40,10 @@ describe("sandbox create TTLs", () => {
   test("sets equal deadlines at the seven-day limit under an advancing clock", async ({
     app,
     browser,
+    screen,
   }) => {
     await app.open("/sandbox-idempotency.html");
+    await expect(screen.getByText("Sandbox RPC fixture ready")).toBeVisible();
     const sevenDaysNanos = 604_800_000_000_000;
     const result = await browser.evaluate(
       (ttl) => window.createSandboxWithTtls(1_750_000_000_000, 1, ttl, ttl),
