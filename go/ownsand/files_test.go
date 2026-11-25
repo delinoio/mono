@@ -1229,6 +1229,43 @@ func TestWriteFileRetryKeepsOperationIdentity(t *testing.T) {
 	}
 }
 
+func TestReadFileFromValidationErrorPreservesOffset(t *testing.T) {
+	cp := newFakeCP(t)
+	s := cp.handle(t, cp.client(t, TransportRelay))
+	readID := mustID(t)
+	salt := randomBytes(t, relaybinding.SaltSize)
+
+	for _, tc := range []struct {
+		name       string
+		path       string
+		salt       []byte
+		offset     int64
+		wantOffset int64
+		wantError  validate.Error
+	}{
+		{"relative path", "relative/file", salt, 4096, 4096, validate.Error{Field: "path", Rule: "must be an absolute guest path"}},
+		{"invalid salt", "/f", salt[:1], 4096, 4096, validate.Error{Field: "binding_salt", Rule: "must be 32 bytes"}},
+		{"negative offset", "/f", salt, -1, 0, validate.Error{Field: "offset", Rule: "must not be negative"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writes := 0
+			w := writerFunc(func(p []byte) (int, error) {
+				writes++
+				return len(p), nil
+			})
+			p := FileReadParams{ReadID: readID, Path: tc.path, BindingSalt: tc.salt, Offset: tc.offset}
+			offset, err := s.ReadFileFrom(t.Context(), p, w)
+			var validationErr *validate.Error
+			if offset != tc.wantOffset || !errors.As(err, &validationErr) || *validationErr != tc.wantError {
+				t.Errorf("ReadFileFrom = (%d, %v), want (%d, %v)", offset, err, tc.wantOffset, &tc.wantError)
+			}
+			if reads, auths := len(cp.agent.readRequests()), len(cp.authRequests()); writes != 0 || reads != 0 || auths != 0 {
+				t.Errorf("got %d writer calls, %d agent reads and %d relay authorizations, want zero", writes, reads, auths)
+			}
+		})
+	}
+}
+
 // TestReadFileFromOffsetAcrossCalls checks that a read keeps its snapshot
 // across calls with different spellings of the same read_id and across a
 // relay disconnect.
