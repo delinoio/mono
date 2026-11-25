@@ -392,6 +392,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 // machine identifier to reuse (for a memory-state restore), or nil for a
 // new one.
 func (r *Runtime) configure(v *vm, spec vmruntime.Spec, machineID []byte) (*vz.VirtualMachineConfiguration, error) {
+	memoryBytes, err := memoryMiBToBytes(spec.Resources.GetMemoryMib())
+	if err != nil {
+		return nil, err
+	}
 	cmdline := "console=hvc0 root=/dev/vda rw init=/sbin/init panic=1 random.trust_cpu=on"
 	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
 		cmdline += " " + guestLink.KernelIPArg()
@@ -400,7 +404,7 @@ func (r *Runtime) configure(v *vm, spec vmruntime.Spec, machineID []byte) (*vz.V
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := vz.NewVirtualMachineConfiguration(boot, uint(spec.Resources.GetVcpuCount()), uint64(spec.Resources.GetMemoryMib())<<20)
+	cfg, err := vz.NewVirtualMachineConfiguration(boot, uint(spec.Resources.GetVcpuCount()), memoryBytes)
 	if err != nil {
 		return nil, err
 	}
