@@ -8,6 +8,16 @@ import (
 	"testing"
 )
 
+func TestExecJSONStdoutWriteErrorExitsWithError(t *testing.T) {
+	r := newRunner(t)
+	stdout := &firstWriteFails{err: errDiskFull}
+	var stderr bytes.Buffer
+	code := r.runWriters(stdout, &stderr, "--no-color", "--format", "json", "sandbox", "exec", r.f.sb, "--", "echo", "hello")
+	if want := "error: " + errDiskFull.Error() + "\n"; code != ExitError || stdout.buf.Len() != 0 || stderr.String() != want {
+		t.Fatalf("exit %d, stdout %q, stderr %q; want exit %d, empty stdout and stderr %q", code, stdout.buf.String(), stderr.String(), ExitError, want)
+	}
+}
+
 // TestExecTextStdoutWriteErrorExitsWithError checks that a failed write of the
 // guest output to the local standard output exits with 1 and the write error
 // on standard error, not as a data path failure.
