@@ -176,8 +176,13 @@ function binaryFields(name, deploy, dir) {
     ...reservedAssetNames,
     ...assetNames(deploy.binary, platforms),
   ]);
-  for (const file of licenseFiles) {
+  for (const [index, file] of licenseFiles.entries()) {
     const base = posix.basename(file);
+    if (base.includes("#")) {
+      throw new DeployPlanError(
+        `${name}: deploy.licenseFiles path ${JSON.stringify(rawLicenses[index])} has # in its basename`,
+      );
+    }
     if (taken.has(base)) {
       throw new DeployPlanError(
         `${name}: deploy.licenseFiles has a second release asset named ${base}`,
