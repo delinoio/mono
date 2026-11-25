@@ -149,6 +149,10 @@ func Read(f io.ReaderAt, size int64) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
+	t := &Table{hdr: h, sectors: uint64(size / SectorSize)}
+	if _, err := t.backupEntriesLBA(); err != nil {
+		return nil, err
+	}
 	entries := make([]byte, length)
 	if _, err := f.ReadAt(entries, offset); err != nil {
 		return nil, fmt.Errorf("gpt: read the entries: %w", err)
@@ -156,7 +160,8 @@ func Read(f io.ReaderAt, size int64) (*Table, error) {
 	if crc32.ChecksumIEEE(entries) != h.EntriesCRC {
 		return nil, errors.New("gpt: the entry array checksum does not match")
 	}
-	return &Table{hdr: h, entries: entries, sectors: uint64(size / SectorSize)}, nil
+	t.entries = entries
+	return t, nil
 }
 
 // Partitions returns the used entries.
@@ -186,13 +191,38 @@ func (t *Table) entrySectors() uint64 {
 	return (n + SectorSize - 1) / SectorSize
 }
 
+// backupEntriesLBA checks that the layout Write produces fits the disk and
+// leaves a usable sector between the entry arrays.
+func (t *Table) backupEntriesLBA() (uint64, error) {
+	entrySectors := t.entrySectors()
+	if t.sectors <= entrySectors+1 || t.sectors > math.MaxInt64/SectorSize {
+		return 0, fmt.Errorf("gpt: disk of %d sectors cannot hold the backup table", t.sectors)
+	}
+	backupEntries := t.sectors - 1 - entrySectors
+	primaryEntries := t.hdr.EntriesLBA
+	if primaryEntries < 2 {
+		return 0, fmt.Errorf("gpt: the primary entry array starts at sector %d before the end of the primary header", primaryEntries)
+	}
+	if primaryEntries >= backupEntries || entrySectors > backupEntries-primaryEntries {
+		return 0, fmt.Errorf("gpt: the primary entry array at sector %d overlaps the backup layout starting at sector %d",
+			primaryEntries, backupEntries)
+	}
+	if firstUsable := t.hdr.FirstUsableLBA; firstUsable < primaryEntries+entrySectors || firstUsable >= backupEntries {
+		return 0, fmt.Errorf("gpt: the first usable sector %d is outside the range between the entry arrays", firstUsable)
+	}
+	return backupEntries, nil
+}
+
 // Write writes the primary and the backup tables for a disk of the table's
 // size: the backup header goes to the last sector and the backup entries
-// right before it, and the last usable sector follows them. It also updates
+// right before it, and the last usable sector precedes them. It also updates
 // the protective MBR to the disk size.
 func (t *Table) Write(f io.WriterAt) error {
+	backupEntries, err := t.backupEntriesLBA()
+	if err != nil {
+		return err
+	}
 	last := t.sectors - 1
-	backupEntries := last - t.entrySectors()
 	lastUsable := backupEntries - 1
 	for _, p := range t.Partitions() {
 		if p.LastLBA > lastUsable {
