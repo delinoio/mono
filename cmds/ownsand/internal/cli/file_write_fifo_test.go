@@ -82,6 +82,58 @@ func TestFileWriteFIFOWithoutWriterEndsOnCancel(t *testing.T) {
 	}
 }
 
+func TestFileWriteFIFOWithStalledWriterEndsOnCancel(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{name: "idle"},
+		{name: "partial chunk", data: "partial first chunk"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRunner(t)
+			fifo := makeFIFO(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan result, 1)
+			go func() {
+				done <- r.runCtx(ctx, "--no-color", "file", "write", r.f.sb, "/tmp/x", "--from", fifo)
+			}()
+			writer := openTestFIFOWriter(t, fifo)
+			defer writer.Close()
+			if tc.data != "" {
+				if _, err := writer.WriteString(tc.data); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case res := <-done:
+				t.Fatalf("the command ended while the writer was still open: %+v", res)
+			case <-time.After(100 * time.Millisecond):
+			}
+			cancel()
+			select {
+			case res := <-done:
+				if res.code != ExitInterrupted || res.stderr != "error: interrupted; the write was not finished\n" {
+					t.Fatalf("want exit %d and the interruption message, got %+v", ExitInterrupted, res)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("the command did not end while the FIFO writer stayed open")
+			}
+			if calls := r.f.callNames(); len(calls) != 0 {
+				t.Fatalf("API received calls before the first chunk: %v", calls)
+			}
+			probe, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+			if probe != nil {
+				_ = probe.Close()
+			}
+			if !errors.Is(err, syscall.ENXIO) {
+				t.Fatalf("want the FIFO reader closed after cancellation, got %v", err)
+			}
+		})
+	}
+}
+
 func TestFileWriteFIFOWithWriterSendsBytes(t *testing.T) {
 	r := newRunner(t)
 	fifo := makeFIFO(t)

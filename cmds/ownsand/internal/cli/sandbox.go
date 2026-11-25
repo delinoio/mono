@@ -874,7 +874,10 @@ func (a *app) fileWrite(ctx context.Context, name string, args []string) error {
 			return err
 		}
 		defer f.Close()
-		r = f
+		r, err = uploadFileReader(ctx, f)
+		if err != nil {
+			return err
+		}
 	}
 	n, err := s.WriteFile(ctx, rest[1], r, ownsand.WriteOptions{Mode: uint32(m)})
 	if err != nil {
