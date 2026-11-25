@@ -631,7 +631,7 @@ func (e *Engine) startFailed(ctx context.Context, runner *Runner, cause string) 
 	// failure is logged, and the sandbox goes anyway.
 	_ = e.removeRegistration(context.WithoutCancel(ctx), r)
 	if r.SandboxID != "" {
-		if err := e.cleanUpEnded(context.WithoutCancel(ctx), r.ID, r.OrganizationID); err != nil {
+		if err := e.cleanUpEnded(ctx, r.ID, r.OrganizationID); err != nil {
 			e.svc.Logger.WarnContext(ctx, "runner_sandbox_cleanup_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
 			e.ensureDriver(r.ID)
 		}
@@ -648,6 +648,9 @@ func (e *Engine) startFailed(ctx context.Context, runner *Runner, cause string) 
 // terminal state. Read the sandbox ID with the mark because a late
 // CreateSandbox response can set both after the caller reads the runner.
 func (e *Engine) cleanUpEnded(ctx context.Context, runnerID, orgID string) error {
+	ctx, cancel := context.WithTimeout(ctx, e.timing.terminalCleanupTimeout())
+	defer cancel()
+
 	var sandboxID string
 	err := e.svc.DB.Pool.QueryRow(ctx, "SELECT COALESCE(ownsand_sandbox_id::text, '') FROM runners WHERE runner_id = $1 AND sandbox_cleanup", runnerID).Scan(&sandboxID)
 	if errors.Is(err, pgx.ErrNoRows) {

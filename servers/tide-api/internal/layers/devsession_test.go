@@ -26,6 +26,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
+	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
 // TestDevSessionQueueAndDeletion: a session waits in the queue while the
@@ -809,8 +810,13 @@ func TestDevSessionFilesOwnSandErrors(t *testing.T) {
 
 func newWorkWorld(t *testing.T, ds devsession.Timing) *workWorld {
 	t.Helper()
+	return newWorkWorldWithTiming(t, ds, nil)
+}
+
+func newWorkWorldWithTiming(t *testing.T, ds devsession.Timing, timing *work.Timing) *workWorld {
+	t.Helper()
 	w := &world{fake: ownsandfake.New(), l: &layers.Layers{}}
-	w.env = testenv.New(t, testenv.WithLayerOptions(layers.Options{OwnSand: w.fake, DevSessionTiming: ds}, w.l))
+	w.env = testenv.New(t, testenv.WithLayerOptions(layers.Options{OwnSand: w.fake, WorkTiming: timing, DevSessionTiming: ds}, w.l))
 	w.org = w.env.NewOrg("alice")
 	ww := &workWorld{world: w, osOrg: api.NewID()}
 	w.fake.AddOrg(ww.osOrg, ownsandKey('a'))

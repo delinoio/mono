@@ -54,10 +54,15 @@ type Timing struct {
 	// call that reaches it is an uncertain result: the runner keeps its key
 	// and its driver repeats the call.
 	CreateTimeout time.Duration
+	// TerminalCleanupTimeout bounds one attempt to clean up an ended runner.
+	TerminalCleanupTimeout time.Duration
 }
 
 // defaultCreateTimeout is the CreateTimeout of a zero Timing field.
 const defaultCreateTimeout = 15 * time.Second
+
+// OwnSand can wait 60 seconds for the agent to confirm DeleteSandbox.
+const defaultTerminalCleanupTimeout = 75 * time.Second
 
 func (t Timing) createTimeout() time.Duration {
 	if t.CreateTimeout > 0 {
@@ -66,15 +71,23 @@ func (t Timing) createTimeout() time.Duration {
 	return defaultCreateTimeout
 }
 
+func (t Timing) terminalCleanupTimeout() time.Duration {
+	if t.TerminalCleanupTimeout > 0 {
+		return t.TerminalCleanupTimeout
+	}
+	return defaultTerminalCleanupTimeout
+}
+
 // DefaultTiming returns the production intervals.
 func DefaultTiming() Timing {
 	return Timing{
-		PassInterval:      15 * time.Second,
-		ReconcileInterval: 5 * time.Second,
-		SandboxPoll:       10 * time.Second,
-		StartTimeout:      30 * time.Minute,
-		GaugeInterval:     15 * time.Second,
-		CreateTimeout:     defaultCreateTimeout,
+		PassInterval:           15 * time.Second,
+		ReconcileInterval:      5 * time.Second,
+		SandboxPoll:            10 * time.Second,
+		StartTimeout:           30 * time.Minute,
+		GaugeInterval:          15 * time.Second,
+		CreateTimeout:          defaultCreateTimeout,
+		TerminalCleanupTimeout: defaultTerminalCleanupTimeout,
 	}
 }
 
