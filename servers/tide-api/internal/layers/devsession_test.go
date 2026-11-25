@@ -685,6 +685,111 @@ func TestDevSessionFiles(t *testing.T) {
 	}
 }
 
+func TestDevSessionWindowsUNCPaths(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	const workspace = `C:\work`
+	profile := devProfileProto("windows-dev", 0, 0)
+	profile.GuestOs = tidev1.GuestOs_GUEST_OS_WINDOWS
+	profile.Source = &tidev1.RunnerProfile_BaseImage{BaseImage: profile.GuestOs}
+	profile.WorkspacePath = workspace
+	owner := w.env.User(w.org.Member)
+	session := w.createSession(t, owner, w.createProfile(t, profile))
+	sessionID := session.GetDevSessionId()
+	session = w.waitState(t, sessionID, tidev1.RequestState_REQUEST_STATE_RUNNING)
+	sandboxID := w.runner(t, session.GetRunnerId()).GetOwnsandSandboxId()
+	ctx := t.Context()
+
+	exec := func(t *testing.T, input, want string) {
+		t.Helper()
+		dirs := make(chan string, 1)
+		w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+			dirs <- p.WorkingDirectory
+			code := int64(0)
+			return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
+		}, nil)
+		stream, err := owner.DevSession.ExecDevSession(ctx, connect.NewRequest(&tidev1.ExecDevSessionRequest{
+			OrganizationId: w.org.ID, DevSessionId: sessionID, ExecId: api.NewID(),
+			Command: []string{"cmd.exe", "/c", "cd"}, WorkingDirectory: input,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		events, err := collectExec(t, stream, func() *tidev1.DevSessionExecEvent { return stream.Msg().GetEvent() })
+		if err != nil || len(events) != 1 || events[0].GetExited() == nil {
+			t.Fatalf("exec events %v, error %v", events, err)
+		}
+		select {
+		case got := <-dirs:
+			if got != want {
+				t.Errorf("forwarded working directory %q, want %q", got, want)
+			}
+		default:
+			t.Error("working directory did not reach OwnSand")
+		}
+	}
+	write := func(path string) (*connect.Response[tidev1.WriteDevSessionFileResponse], error) {
+		return owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&tidev1.WriteDevSessionFileRequest{
+			OrganizationId: w.org.ID, DevSessionId: sessionID, WriteId: api.NewID(),
+			Path: path, Data: []byte("written"), Final: true,
+		}))
+	}
+	read := func(path string) (*connect.ServerStreamForClient[tidev1.ReadDevSessionFileResponse], error) {
+		return owner.DevSession.ReadDevSessionFile(ctx, connect.NewRequest(&tidev1.ReadDevSessionFileRequest{
+			OrganizationId: w.org.ID, DevSessionId: sessionID, ReadId: api.NewID(), Path: path,
+		}))
+	}
+
+	for _, tc := range []struct{ name, dir, path string }{
+		{"forward", "//buildhost/share", "//buildhost/share/results.txt"},
+		{"forward then back", `/\buildhost/share`, `/\buildhost/share/results.txt`},
+		{"back then forward", `\/buildhost/share`, `\/buildhost/share/results.txt`},
+		{"back", `\\buildhost\share`, `\\buildhost\share\results.txt`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec(t, tc.dir, tc.dir)
+
+			resp, err := write(tc.path)
+			if err != nil || !resp.Msg.GetFinished() {
+				t.Fatalf("write response %v, error %v", resp, err)
+			}
+			if data, ok := w.fake.File(w.osOrg, sandboxID, tc.path); !ok || string(data) != "written" {
+				t.Errorf("file at exact path %q: found %t, contents %q", tc.path, ok, data)
+			}
+
+			w.fake.SetFile(w.osOrg, sandboxID, tc.path, []byte("seeded"))
+			stream, err := read(tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var data []byte
+			var end *tidev1.DevSessionFileEnd
+			for stream.Receive() {
+				data = append(data, stream.Msg().GetChunk().GetData()...)
+				if e := stream.Msg().GetEnd(); e != nil {
+					end = e
+				}
+			}
+			if err := stream.Err(); err != nil || string(data) != "seeded" || end.GetSizeBytes() != int64(len(data)) {
+				t.Fatalf("read at exact path %q: contents %q, end %v, error %v", tc.path, data, end, err)
+			}
+		})
+	}
+
+	t.Run("empty working directory", func(t *testing.T) {
+		exec(t, "", workspace)
+	})
+	_, err := write("")
+	wantCode(t, "empty write path", err, connect.CodeInvalidArgument)
+	stream, err := read("")
+	if err == nil {
+		for stream.Receive() {
+			t.Error("empty read path returned a message")
+		}
+		err = stream.Err()
+	}
+	wantCode(t, "empty read path", err, connect.CodeInvalidArgument)
+}
+
 func TestDevSessionExecOwnSandValidation(t *testing.T) {
 	w := newWorkWorld(t, devsession.Timing{})
 	s, _ := w.runningSession(t)

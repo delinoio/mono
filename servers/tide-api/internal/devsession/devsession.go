@@ -606,7 +606,9 @@ func resolvePath(guest tidev1.GuestOs, workspace, path string) (string, error) {
 		return workspace, nil
 	}
 	if guest == tidev1.GuestOs_GUEST_OS_WINDOWS {
-		if len(path) >= 3 && isLetter(path[0]) && path[1] == ':' && (path[2] == '\\' || path[2] == '/') || strings.HasPrefix(path, `\\`) {
+		driveRooted := len(path) >= 3 && isLetter(path[0]) && path[1] == ':' && isWindowsPathSeparator(path[2])
+		unc := len(path) >= 2 && isWindowsPathSeparator(path[0]) && isWindowsPathSeparator(path[1])
+		if driveRooted || unc {
 			return path, nil
 		}
 		return strings.TrimRight(workspace, `\`) + `\` + strings.ReplaceAll(path, "/", `\`), nil
@@ -616,6 +618,8 @@ func resolvePath(guest tidev1.GuestOs, workspace, path string) (string, error) {
 	}
 	return strings.TrimRight(workspace, "/") + "/" + path, nil
 }
+
+func isWindowsPathSeparator(c byte) bool { return c == '\\' || c == '/' }
 
 func isLetter(c byte) bool { return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' }
 
