@@ -14,6 +14,7 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/agent"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/identity"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 )
@@ -56,6 +57,78 @@ func TestCLIEnrollStatusReset(t *testing.T) {
 	}
 	if code := run([]string{"enroll", "--api-url", cp.URL}, strings.NewReader(""), &out, &errb); code != exitUsage {
 		t.Fatalf("enroll without token: %d", code)
+	}
+}
+
+func TestCLIEnrollRejectsMissingDeviceIDAndRetries(t *testing.T) {
+	clearAgentEnv(t)
+	t.Setenv("NO_COLOR", "1")
+	dir := t.TempDir()
+	t.Setenv(config.EnvStateDir, dir)
+	cp := testcp.New(t)
+	cp.ConsumeEnrollToken()
+	cp.OmitNextEnrollDeviceID()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const previousOrigin = "https://previous.example"
+	removal := store.RemovalRecord{NoticeReceived: true, CleanupDone: true}
+	if _, err := st.UpdateAgent(func(a *store.AgentState) error {
+		a.APIURL = previousOrigin
+		a.Removal = removal
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errb bytes.Buffer
+	args := []string{"enroll", "--api-url", cp.URL}
+	code := run(args, strings.NewReader(testcp.Token+"\n"), &out, &errb)
+	if code != exitError || strings.Contains(out.String(), "Enrolled") || !strings.Contains(errb.String(), "missing device ID") {
+		t.Fatalf("incomplete enroll: exit %d, stdout %q, stderr %q", code, out.String(), errb.String())
+	}
+	pending, err := st.LoadIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.DeviceID != "" || pending.OrganizationID != "" {
+		t.Fatal("incomplete response changed the pending identity")
+	}
+	key, err := identity.FromSeed(pending.PrivateKeySeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := st.LoadAgent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.APIURL != previousOrigin || saved.Removal != removal {
+		t.Fatalf("incomplete response changed saved origin or removal: %q, %+v", saved.APIURL, saved.Removal)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := run(args, strings.NewReader(testcp.Token+"\n"), &out, &errb); code != exitOK || !strings.Contains(out.String(), "Enrolled device") {
+		t.Fatalf("retry enroll: exit %d, stdout %q, stderr %q", code, out.String(), errb.String())
+	}
+	enrolled, err := st.LoadIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enrolled.DeviceID == "" || enrolled.OrganizationID != testcp.OrganizationID || !bytes.Equal(enrolled.PrivateKeySeed, pending.PrivateKeySeed) {
+		t.Fatal("retry did not finalize the pending identity")
+	}
+	keys := cp.EnrollPublicKeys()
+	if len(keys) != 2 || !key.PublicKey().Equal(keys[0]) || !key.PublicKey().Equal(keys[1]) {
+		t.Fatal("both requests must use the stored pending key")
+	}
+	saved, err = st.LoadAgent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.APIURL != cp.URL || saved.Removal != (store.RemovalRecord{}) {
+		t.Fatalf("successful retry did not update saved origin and removal: %q, %+v", saved.APIURL, saved.Removal)
 	}
 }
 

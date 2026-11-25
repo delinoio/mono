@@ -79,13 +79,14 @@ type Server struct {
 	stallAuth  bool
 	stallEnr   bool
 	enrollKeys []ed25519.PublicKey
-	// Enroll hooks; see ConsumeEnrollToken, DropNextEnrollResponse and
-	// HoldNextEnroll.
-	singleUse   bool
-	consumedKey ed25519.PublicKey
-	consumedDev string
-	dropReply   bool
-	hold        *EnrollHold
+	// Enroll hooks; see ConsumeEnrollToken, DropNextEnrollResponse,
+	// OmitNextEnrollDeviceID and HoldNextEnroll.
+	singleUse    bool
+	consumedKey  ed25519.PublicKey
+	consumedDev  string
+	dropReply    bool
+	omitDeviceID bool
+	hold         *EnrollHold
 }
 
 // EnrollHold holds one Enroll call after it reached the fake and before the
@@ -131,6 +132,14 @@ func (s *Server) ConsumeEnrollToken() {
 func (s *Server) DropNextEnrollResponse() {
 	s.mu.Lock()
 	s.dropReply = true
+	s.mu.Unlock()
+}
+
+// OmitNextEnrollDeviceID makes the next successful Enroll response omit the
+// device ID after the fake records the enrollment.
+func (s *Server) OmitNextEnrollDeviceID() {
+	s.mu.Lock()
+	s.omitDeviceID = true
 	s.mu.Unlock()
 }
 
@@ -272,6 +281,10 @@ func (s *Server) Enroll(ctx context.Context, req *connect.Request[ownsandv1.Enro
 	if s.dropReply {
 		s.dropReply = false
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("response lost"))
+	}
+	if s.omitDeviceID {
+		s.omitDeviceID = false
+		id = ""
 	}
 	return connect.NewResponse(&ownsandv1.EnrollResponse{DeviceId: id, OrganizationId: OrganizationID}), nil
 }
