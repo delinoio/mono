@@ -32,8 +32,8 @@ const (
 	linkCallGrace = 15 * time.Second
 )
 
-// ErrLinkInProgress marks an organization whose link attempt can still be
-// running: its LinkOrganization call has not returned or timed out yet.
+// ErrLinkInProgress marks an organization whose LinkOrganization call can
+// still be running or can still take effect in Accounts.
 var ErrLinkInProgress = errors.New("billing: a link attempt is in progress")
 
 // BeginLinkAttemptTx records the link attempt attemptID of the organization
@@ -85,10 +85,10 @@ func CompleteLinkAttemptTx(ctx context.Context, tx pgx.Tx, orgID, attemptID stri
 	return tag.RowsAffected() == 1, nil
 }
 
-// ReleaseLinkAttempt records that the LinkOrganization call of the attempt
-// has returned without a confirmed local link: the row stays for the
-// reconciliation, which the lease holder starts after the first back-off.
-// It changes nothing when another operation took the attempt over.
+// ReleaseLinkAttempt clears the deadline when dispatch did not start or
+// Accounts confirmed the link but the local write failed. The row stays
+// for reconciliation after the first back-off. It changes nothing when
+// another operation took the attempt over.
 func (s *Statuses) ReleaseLinkAttempt(ctx context.Context, orgID, attemptID string) error {
 	now := s.now()
 	_, err := s.db.Pool.Exec(ctx, `UPDATE billing_pending_unlinks SET link_call_deadline = NULL, attempts = 0, next_attempt_time = $3
