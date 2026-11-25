@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/gpt"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
@@ -84,13 +83,13 @@ func (r *Runtime) reserveMachineID(v *vm, id []byte) bool {
 // snapshot. Every cold boot gets a new machine identifier; only a
 // memory-state restore uses the snapshot's identifier, and only while no
 // other VM uses it.
-func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
+func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec, ops vmCreateOps) (vmruntime.VM, error) {
 	if !macOSGuestsSupported {
 		return nil, fmt.Errorf("%w: macOS guests need an Apple silicon Mac", vmruntime.ErrUnsupported)
 	}
 	diskBytes := spec.Resources.GetDiskGib() << 30
 	start := time.Now()
-	model, err := prepareMacOSSource(ctx, spec, r.opts.MacOSImage, macOSHardwareModelSupported, copyFile)
+	model, err := prepareMacOSSource(ctx, spec, r.opts.MacOSImage, macOSHardwareModelSupported, ops.copyFile)
 	if err != nil {
 		return nil, err
 	}
@@ -121,19 +120,19 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 		r.mu.Lock()
 		v.machineID = nil
 		r.mu.Unlock()
-		if err := copyMacOSSource(ctx, spec.Snapshot.Dir, spec.Dir, copyFile); err != nil {
+		if err := copyMacOSSource(ctx, spec.Snapshot.Dir, spec.Dir, ops.copyFile); err != nil {
 			cleanup()
 			return nil, err
 		}
 	}
 	disk := filepath.Join(spec.Dir, diskFile)
-	if err := growFile(disk, diskBytes); err != nil {
+	if err := runCreateStep(ctx, func() error { return ops.growFile(disk, diskBytes) }); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vzrt: resize disk: %w", err)
 	}
 	// Move the backup partition table to the end of the grown disk; the
 	// guest helper then grows the system container into the free space.
-	if err := gpt.Fit(disk); err != nil {
+	if err := runCreateStep(ctx, func() error { return ops.fitGPT(disk) }); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vzrt: resize the partition table: %w", err)
 	}
@@ -179,6 +178,9 @@ func (r *Runtime) configureMacOS(v *vm, spec vmruntime.Spec, id []byte) error {
 }
 
 func (r *Runtime) coldBootMacOS(ctx context.Context, v *vm, spec vmruntime.Spec) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := r.configureMacOS(v, spec, nil); err != nil {
 		return err
 	}
@@ -194,6 +196,9 @@ func (r *Runtime) coldBootMacOS(ctx context.Context, v *vm, spec vmruntime.Spec)
 // restoreMacOS restores the saved state of a macOS snapshot with the
 // snapshot's machine identifier, which no other VM may use at that time.
 func (r *Runtime) restoreMacOS(ctx context.Context, v *vm, spec vmruntime.Spec) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	id, err := os.ReadFile(filepath.Join(spec.Snapshot.Dir, images.MacOSMachineID))
 	if err != nil {
 		return err
@@ -204,7 +209,14 @@ func (r *Runtime) restoreMacOS(ctx context.Context, v *vm, spec vmruntime.Spec) 
 	if err := r.configureMacOS(v, spec, id); err != nil {
 		return err
 	}
-	if err := restoreMemory(v.machine, filepath.Join(spec.Snapshot.Dir, snapState)); err != nil {
+	statePath := filepath.Join(spec.Snapshot.Dir, snapState)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := restoreMemory(v.machine, statePath); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := v.machine.Resume(); err != nil {

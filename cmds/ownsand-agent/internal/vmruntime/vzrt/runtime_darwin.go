@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/gpt"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestsync"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
@@ -241,11 +242,18 @@ func (r *Runtime) vmDir(id string) string { return filepath.Join(r.opts.VMsDir, 
 // copyFile copies src to dst with an APFS clone where possible. Clonefile
 // cannot be interrupted. A streamed copy checks ctx between chunks.
 func copyFile(ctx context.Context, src, dst string) error {
+	return copyFileWithClone(ctx, src, dst, unix.Clonefile)
+}
+
+func copyFileWithClone(ctx context.Context, src, dst string, cloneFile func(string, string, int) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	_ = os.Remove(dst)
-	cloneErr := unix.Clonefile(src, dst, unix.CLONE_NOFOLLOW)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cloneErr := cloneFile(src, dst, unix.CLONE_NOFOLLOW)
 	if err := ctx.Err(); err != nil || cloneErr == nil {
 		return err
 	}
@@ -293,10 +301,37 @@ func growFile(path string, size int64) error {
 
 // Create boots a VM for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
+	return r.createVM(ctx, spec, vmCreateOps{cloneFile: unix.Clonefile, growFile: growFile, fitGPT: gpt.Fit})
+}
+
+// vmCreateOps lets tests cancel create during a disk operation.
+type vmCreateOps struct {
+	cloneFile func(string, string, int) error
+	growFile  func(string, int64) error
+	fitGPT    func(string) error
+}
+
+func (ops vmCreateOps) copyFile(ctx context.Context, src, dst string) error {
+	return copyFileWithClone(ctx, src, dst, ops.cloneFile)
+}
+
+// runCreateStep checks cancellation around a synchronous create operation.
+func runCreateStep(ctx context.Context, run func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stepErr := run()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return stepErr
+}
+
+func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreateOps) (vmruntime.VM, error) {
 	switch spec.GuestOS {
 	case ownsandv1.GuestOs_GUEST_OS_LINUX:
 	case ownsandv1.GuestOs_GUEST_OS_MACOS:
-		return r.createMacOS(ctx, spec)
+		return r.createMacOS(ctx, spec, ops)
 	default:
 		return nil, fmt.Errorf("%w: macOS hosts run Linux and macOS guests", vmruntime.ErrUnsupported)
 	}
@@ -338,7 +373,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		src = filepath.Join(spec.Snapshot.Dir, snapDisk)
 	}
 	disk := filepath.Join(spec.Dir, diskFile)
-	if err := copyFile(context.Background(), src, disk); err != nil {
+	if err := ops.copyFile(ctx, src, disk); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
 	}
@@ -362,12 +397,12 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			return nil, err
 		}
 		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
-		if err := copyFile(ctx, src, disk); err != nil {
+		if err := ops.copyFile(ctx, src, disk); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
 		}
 	}
-	if err := growFile(disk, diskBytes); err != nil {
+	if err := runCreateStep(ctx, func() error { return ops.growFile(disk, diskBytes) }); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vzrt: resize disk: %w", err)
 	}
@@ -668,6 +703,9 @@ func (r *Runtime) newMachine(v *vm, cfg *vz.VirtualMachineConfiguration) error {
 }
 
 func (r *Runtime) coldBoot(ctx context.Context, v *vm, spec vmruntime.Spec) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	cfg, err := r.configure(v, spec, nil)
 	if err != nil {
 		return err
@@ -896,6 +934,9 @@ func (r *Runtime) saveSnapshotMemory(ctx context.Context, v *vm, path string) (b
 // and restores its saved state, then resumes it and waits for the guest
 // helper.
 func (r *Runtime) restoreMemory(ctx context.Context, v *vm, spec vmruntime.Spec) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	machineID, err := os.ReadFile(filepath.Join(spec.Snapshot.Dir, snapMachineID))
 	if err != nil {
 		return err
@@ -907,7 +948,14 @@ func (r *Runtime) restoreMemory(ctx context.Context, v *vm, spec vmruntime.Spec)
 	if err := r.newMachine(v, cfg); err != nil {
 		return err
 	}
-	if err := restoreMemory(v.machine, filepath.Join(spec.Snapshot.Dir, snapState)); err != nil {
+	statePath := filepath.Join(spec.Snapshot.Dir, snapState)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := restoreMemory(v.machine, statePath); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := v.machine.Resume(); err != nil {
