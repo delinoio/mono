@@ -505,6 +505,84 @@ test("build fails for a module without a license file", { skip }, (t) => {
   );
 });
 
+for (const { command, operation, script, error } of [
+  {
+    command: "sort",
+    operation: "module sorting",
+    script: `[[ "$1" == -u ]] || exec sort "$@"
+if [[ "$STUB_PARTIAL_NOTICE_OUTPUT" == 1 ]]; then head -n 1 -- "$2"; fi`,
+    error: /Could not sort the linked modules for ownsand-cli/,
+  },
+  {
+    command: "sort",
+    operation: "license path sorting",
+    script: `[[ "$1" == -z ]] || exec sort "$@"
+if [[ "$STUB_PARTIAL_NOTICE_OUTPUT" == 1 ]]; then
+  IFS= read -r -d '' file
+  printf '%s\\0' "$file"
+fi`,
+    error: /Could not enumerate license files for module example\.com\/a/,
+  },
+  {
+    command: "find",
+    operation: "license path discovery",
+    script: `[[ "$1" == "$STUB_DIR/modules/b" ]] || exec find "$@"
+if [[ "$STUB_PARTIAL_NOTICE_OUTPUT" == 1 ]]; then
+  printf '%s\\0' "$1/COPYING.md"
+fi`,
+    error: /Could not enumerate license files for module example\.com\/b/,
+  },
+]) {
+  for (const partial of [false, true]) {
+    const output = partial ? "partial" : "empty";
+    test(
+      `build and assembly fail when ${operation} fails after ${output} output`,
+      { skip },
+      (t) => {
+        const f = fixture(t);
+        const out = join(f.dir, "out");
+        const release = join(out, "release/ownsand-cli");
+        const notice = join(release, "THIRD-PARTY-LICENSES.txt");
+        const binaries = [{ ...cli, platforms: ["linux-arm64"] }];
+        write(join(f.dir, "modules/a/LICENSE.extra"), "Extra license\n");
+        if (partial) write(notice, "Notice from an earlier build\n");
+
+        const shim = join(f.dir, "bin", command);
+        write(
+          shim,
+          `#!/usr/bin/env bash
+set -euo pipefail
+export PATH="\${PATH#*:}"
+${script}
+exit 19
+`,
+          0o755,
+        );
+        const build = f.run(
+          ["build", "cross", out],
+          { STUB_PARTIAL_NOTICE_OUTPUT: partial ? "1" : "0" },
+          binaries,
+        );
+        assert.notEqual(build.status, 0);
+        assert.match(build.stderr, error);
+        assert.deepEqual(readdirSync(release).sort(), [
+          "GO-LICENSE",
+          "ownsand-linux-arm64",
+        ]);
+
+        rmSync(shim);
+        const assemble = f.run(
+          ["assemble", out, join(f.dir, "assets")],
+          {},
+          binaries,
+        );
+        assert.notEqual(assemble.status, 0);
+        assert.match(assemble.stderr, /THIRD-PARTY-LICENSES\.txt/);
+      },
+    );
+  }
+}
+
 test(
   "build cgo builds only the cgo platforms on a matching runner",
   { skip: macSkip },
