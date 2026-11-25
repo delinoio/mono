@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create, toBinary } from "@bufbuild/protobuf";
-import { timestampFromMs } from "@bufbuild/protobuf/wkt";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { durationFromMs, timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { describe, expect, test } from "@rstest/core";
 import {
   AgentVendor,
@@ -320,7 +320,7 @@ describe("runner profile form", () => {
     for (const idleTtlMinutes of [59.5, 60]) {
       expect(profileErrors({ ...form, idleTtlMinutes }, undefined)).toEqual({});
     }
-    for (const maxTtlHours of [null, 0, -1, 200]) {
+    for (const maxTtlHours of [null, 0, -1, 1.0000001, 200]) {
       expect(
         profileErrors(
           { ...form, maxTtlHours, idleTtlMinutes: 1_000_000 },
@@ -335,6 +335,81 @@ describe("runner profile form", () => {
         idleTtlMinutes: "Enter an idle TTL greater than zero.",
       },
     );
+    expect(
+      profileErrors(
+        { ...form, idleTtlMinutes: 1 / 60_000, maxTtlHours: 1 / 3_600_000 },
+        undefined,
+      ),
+    ).toEqual({});
+  });
+
+  test.each([
+    ["idleTtlMinutes", "idleTtl", 1.001, 60_060],
+    ["maxTtlHours", "maxTtl", 1.001, 3_603_600],
+    ["maxQueueWaitMinutes", "maxQueueWait", 1.001, 60_060],
+    ["idleTtlMinutes", "idleTtl", 1, 60_000],
+  ] as const)(
+    "serializes whole milliseconds for %s",
+    (field, duration, value, ms) => {
+      const form = {
+        ...emptyProfileForm(),
+        name: "linux-build",
+        [field]: value,
+      };
+      expect(profileErrors(form, undefined)).toEqual({});
+      const profile = profileFromForm(form);
+      const createRequest = create(CreateRunnerProfileRequestSchema, {
+        profile,
+      });
+      const updateRequest = create(UpdateRunnerProfileRequestSchema, {
+        profile,
+        updateMask: profileUpdateMask(emptyProfileForm(), form),
+      });
+      expect(
+        fromBinary(
+          CreateRunnerProfileRequestSchema,
+          toBinary(CreateRunnerProfileRequestSchema, createRequest),
+        ).profile?.[duration],
+      ).toEqual(durationFromMs(ms));
+      expect(
+        fromBinary(
+          UpdateRunnerProfileRequestSchema,
+          toBinary(UpdateRunnerProfileRequestSchema, updateRequest),
+        ).profile?.[duration],
+      ).toEqual(durationFromMs(ms));
+    },
+  );
+
+  test("serializes a resource-only update with a stored whole-millisecond TTL", () => {
+    const idleTtl = durationFromMs(60_060);
+    const before = formFromProfile({
+      ...profileFromForm({ ...emptyProfileForm(), name: "linux-build" }),
+      idleTtl,
+    });
+    const after = { ...before, vcpuCount: 3 };
+    expect(profileErrors(after, undefined)).toEqual({});
+    const request = create(UpdateRunnerProfileRequestSchema, {
+      profile: profileFromForm(after),
+      updateMask: profileUpdateMask(before, after),
+    });
+    const decoded = fromBinary(
+      UpdateRunnerProfileRequestSchema,
+      toBinary(UpdateRunnerProfileRequestSchema, request),
+    );
+    expect(decoded.profile?.idleTtl).toEqual(idleTtl);
+    expect(decoded.profile?.resources?.vcpuCount).toBe(3);
+    expect(decoded.updateMask?.paths).toEqual(["resources"]);
+  });
+
+  test.each([
+    ["idleTtlMinutes", 1.000001],
+    ["maxTtlHours", 1.0000001],
+    ["maxQueueWaitMinutes", 1.000001],
+  ] as const)("rejects sub-millisecond precision for %s", (field, value) => {
+    const form = { ...emptyProfileForm(), name: "linux-build", [field]: value };
+    expect(profileErrors(form, undefined)).toEqual({
+      [field]: "Enter a duration in whole milliseconds.",
+    });
   });
 
   test.each([
