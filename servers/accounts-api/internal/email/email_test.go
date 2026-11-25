@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,16 +52,27 @@ func TestInvitationMessage(t *testing.T) {
 }
 
 func TestResendSend(t *testing.T) {
-	var got map[string]any
-	var idem, authz string
+	type requestCapture struct {
+		idempotencyKey string
+		authorization  string
+		body           map[string]any
+		decodeErr      error
+	}
+	var captureMu sync.Mutex
+	var captured *requestCapture
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/emails" {
 			http.NotFound(w, r)
 			return
 		}
-		idem = r.Header.Get("Idempotency-Key")
-		authz = r.Header.Get("Authorization")
-		_ = json.NewDecoder(r.Body).Decode(&got)
+		request := requestCapture{
+			idempotencyKey: r.Header.Get("Idempotency-Key"),
+			authorization:  r.Header.Get("Authorization"),
+		}
+		request.decodeErr = json.NewDecoder(r.Body).Decode(&request.body)
+		captureMu.Lock()
+		captured = &request
+		captureMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"email-1"}`))
 	}))
@@ -77,11 +89,20 @@ func TestResendSend(t *testing.T) {
 	if err := sender.Send(context.Background(), msg); err != nil {
 		t.Fatalf("Send() error = %v", err)
 	}
-	if idem != "invitation/1" || authz != "Bearer re_secret" {
-		t.Fatalf("headers: idempotency %q, authorization %q", idem, authz)
+	captureMu.Lock()
+	request := captured
+	captureMu.Unlock()
+	if request == nil {
+		t.Fatal("Resend request was not captured")
 	}
-	if got["from"] != "Delino <billing@delino.io>" || got["subject"] != "S" || got["text"] != "secret-body" {
-		t.Fatalf("request = %v", got)
+	if request.decodeErr != nil {
+		t.Fatalf("decode Resend request: %v", request.decodeErr)
+	}
+	if request.idempotencyKey != "invitation/1" || request.authorization != "Bearer re_secret" {
+		t.Fatalf("headers: idempotency %q, authorization %q", request.idempotencyKey, request.authorization)
+	}
+	if request.body["from"] != "Delino <billing@delino.io>" || request.body["subject"] != "S" || request.body["text"] != "secret-body" {
+		t.Fatalf("request = %v", request.body)
 	}
 	for _, secret := range []string{"b@example.com", "secret-body", "re_secret"} {
 		if strings.Contains(logs.String(), secret) {
