@@ -97,39 +97,53 @@ export async function waitForSnapshotReady(
 ): Promise<void> {
   options.signal?.throwIfAborted();
   const clock = options.clock ?? systemClock;
+  const deadline = clock.now() + options.timeoutMs;
   const stop = new AbortController();
   const onCallerAbort = () => stop.abort(options.signal?.reason);
   options.signal?.addEventListener("abort", onCallerAbort, { once: true });
   let lastState: SnapshotState | undefined;
-  // The deadline timer ends with the wait: `stop.abort()` below rejects its
-  // sleep, which the catch ignores.
-  clock.sleep(options.timeoutMs, stop.signal).then(
-    () =>
-      stop.abort(
-        new Error(
-          `snapshot did not become READY within ${options.timeoutMs} ms: last state ${
-            lastState === undefined ? "unknown" : SnapshotState[lastState]
-          }`,
-        ),
+  const expire = () =>
+    stop.abort(
+      new Error(
+        `snapshot did not become READY within ${options.timeoutMs} ms: last state ${
+          lastState === undefined ? "unknown" : SnapshotState[lastState]
+        }`,
       ),
-    () => {},
-  );
-  const aborted = new Promise<never>((_, reject) => {
-    const fail = () => reject(stop.signal.reason);
-    if (stop.signal.aborted) fail();
-    else stop.signal.addEventListener("abort", fail, { once: true });
-  });
-  aborted.catch(() => {});
-  try {
+    );
+  const checkDeadline = () => {
+    // The timer callback can run after a poll delay or RPC has settled.
+    if (clock.now() >= deadline && !stop.signal.aborted) expire();
+    stop.signal.throwIfAborted();
+  };
+  const poll = async () => {
     for (;;) {
-      const snapshot = await Promise.race([getSnapshot(stop.signal), aborted]);
+      checkDeadline();
+      let snapshot: SnapshotStatus;
+      try {
+        snapshot = await getSnapshot(stop.signal);
+      } catch (error) {
+        checkDeadline();
+        throw error;
+      }
+      checkDeadline();
       lastState = snapshot.state;
-      if (snapshot.state === SnapshotState.READY) return;
-      if (snapshot.state === SnapshotState.FAILED) {
+      if (lastState === SnapshotState.READY) return;
+      if (lastState === SnapshotState.FAILED) {
         throw new Error("snapshot reached FAILED");
       }
       await clock.sleep(options.pollMs, stop.signal);
     }
+  };
+
+  const aborted = new Promise<never>((_, reject) => {
+    stop.signal.addEventListener("abort", () => reject(stop.signal.reason), {
+      once: true,
+    });
+  });
+  clock.sleep(options.timeoutMs, stop.signal).then(expire, () => {});
+  try {
+    // Race the whole poll so that an RPC that ignores abort cannot block cleanup.
+    await Promise.race([aborted, poll()]);
   } finally {
     options.signal?.removeEventListener("abort", onCallerAbort);
     stop.abort();

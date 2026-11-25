@@ -158,6 +158,79 @@ describe("waitForSnapshotReady", () => {
     expect(clock.now()).toBe(1_000);
   });
 
+  test.each([
+    { replyAt: 1_000, outcome: "READY" },
+    { replyAt: 1_001, outcome: "READY" },
+    { replyAt: 1_000, outcome: "RPC error" },
+    { replyAt: 1_000, outcome: "FAILED" },
+  ])(
+    "times out when $outcome arrives at $replyAt ms before the timer callback",
+    async ({ replyAt, outcome }) => {
+      const clock = new VirtualClock();
+      const sleep = clock.sleep.bind(clock);
+      rs.spyOn(clock, "sleep").mockImplementationOnce((_, signal) =>
+        sleep(replyAt + 1, signal),
+      );
+      const getSnapshot = rs.fn(async (signal: AbortSignal) => {
+        await sleep(replyAt, signal);
+        if (outcome === "RPC error") throw new Error("late RPC error");
+        return snap(
+          outcome === "FAILED" ? SnapshotState.FAILED : SnapshotState.READY,
+        );
+      });
+      const wait = waitForSnapshotReady(getSnapshot, {
+        timeoutMs: 1_000,
+        pollMs: 200,
+        clock,
+      });
+
+      await expect(clock.run(wait)).rejects.toThrow(
+        "did not become READY within 1000 ms: last state unknown",
+      );
+      expect(clock.now()).toBe(replyAt);
+      expect(getSnapshot.mock.calls[0]?.[0].aborted).toBe(true);
+      expect(getSnapshot).toHaveBeenCalledOnce();
+    },
+  );
+
+  test("reports the last timely state without polling after the deadline", async () => {
+    const clock = new VirtualClock();
+    const sleep = clock.sleep.bind(clock);
+    rs.spyOn(clock, "sleep").mockImplementationOnce((_, signal) =>
+      sleep(1_101, signal),
+    );
+    const getSnapshot = rs.fn(async (signal: AbortSignal) => {
+      await sleep(900, signal);
+      return snap(SnapshotState.CREATING);
+    });
+    const wait = waitForSnapshotReady(getSnapshot, {
+      timeoutMs: 1_000,
+      pollMs: 200,
+      clock,
+    });
+
+    await expect(clock.run(wait)).rejects.toThrow(
+      "did not become READY within 1000 ms: last state CREATING",
+    );
+    expect(clock.now()).toBe(1_100);
+    expect(getSnapshot.mock.calls[0]?.[0].aborted).toBe(true);
+    expect(getSnapshot).toHaveBeenCalledOnce();
+  });
+
+  test("accepts READY one millisecond before the deadline", async () => {
+    const clock = new VirtualClock();
+    const wait = waitForSnapshotReady(
+      async (signal) => {
+        await clock.sleep(999, signal);
+        return snap(SnapshotState.READY);
+      },
+      { timeoutMs: 1_000, pollMs: 200, clock },
+    );
+
+    await clock.run(wait);
+    expect(clock.now()).toBe(999);
+  });
+
   test("cancels a poll that hangs at the deadline", async () => {
     const clock = new VirtualClock();
     let signalSeen: AbortSignal | undefined;
@@ -175,13 +248,14 @@ describe("waitForSnapshotReady", () => {
 
   test("rejects with the error of a failed poll", async () => {
     const clock = new VirtualClock();
+    const failure = new Error("poll failed");
     const wait = waitForSnapshotReady(
       async () => {
-        throw new Error("poll failed");
+        throw failure;
       },
       { timeoutMs: 60_000, pollMs: 200, clock },
     );
-    await expect(clock.run(wait)).rejects.toThrow("poll failed");
+    await expect(clock.run(wait)).rejects.toBe(failure);
   });
 
   test("fails on a FAILED snapshot", async () => {
