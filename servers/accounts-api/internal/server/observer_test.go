@@ -1280,9 +1280,8 @@ const (
 	// its 4096-byte connection buffer return a full buffer, which is what its
 	// Peek(4) wait after a response buffers when a large head arrives at once.
 	readBoundaryFullPrebuffer
-	// readBoundaryShortPrebuffer makes that read return at most
-	// shortPrebufferBytes, about one TCP segment, and holds the rest back for
-	// the reads after it.
+	// readBoundaryShortPrebuffer fills shortPrebufferBytes, about one TCP
+	// segment, and leaves the remaining bytes for later reads.
 	readBoundaryShortPrebuffer
 )
 
@@ -1356,12 +1355,63 @@ func (c *boundedConn) Read(p []byte) (int, error) {
 		if !c.owner.mode.CompareAndSwap(int32(readBoundaryShortPrebuffer), int32(readBoundaryOff)) {
 			return n, nil
 		}
+		if n < shortPrebufferBytes {
+			// Fill the short prebuffer before the keep-alive peek can read again.
+			more, err := io.ReadFull(c.Conn, p[n:shortPrebufferBytes])
+			return n + more, err
+		}
 		if n > shortPrebufferBytes {
 			c.held = append([]byte(nil), p[shortPrebufferBytes:n]...)
 			n = shortPrebufferBytes
 		}
 	}
 	return n, nil
+}
+
+type readerConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c readerConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func TestShortPrebufferReadBoundary(t *testing.T) {
+	data := strings.Repeat("0123456789", connReadBufferBytes/10+1)
+	for _, tc := range []struct {
+		name   string
+		reader io.Reader
+	}{
+		{"segmented initial reads", io.MultiReader(
+			strings.NewReader(data[:1]),
+			strings.NewReader(data[1:3]),
+			strings.NewReader(data[3:]),
+		)},
+		{"full initial read", strings.NewReader(data)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bounds := &readBoundaries{}
+			bounds.set(readBoundaryShortPrebuffer)
+			conn := &boundedConn{Conn: readerConn{reader: tc.reader}, owner: bounds}
+			reader := bufio.NewReaderSize(conn, connReadBufferBytes)
+
+			// Match the keep-alive wait in net/http.
+			if _, err := reader.Peek(4); err != nil {
+				t.Fatalf("peek: %v", err)
+			}
+			if got := reader.Buffered(); got != shortPrebufferBytes {
+				t.Fatalf("buffered bytes after peek = %d, want %d", got, shortPrebufferBytes)
+			}
+			got, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatalf("read all: %v", err)
+			}
+			if string(got) != data {
+				t.Errorf("read after peek did not preserve the input stream (read %d bytes, want %d)", len(got), len(data))
+			}
+		})
+	}
 }
 
 // serveObservedBounded is serveObservedWith on a listener whose reads the test
