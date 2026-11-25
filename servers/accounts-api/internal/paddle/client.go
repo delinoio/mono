@@ -458,22 +458,36 @@ const (
 // /subscriptions/{id}/cancel`,
 // https://developer.paddle.com/build/subscriptions/cancel-subscriptions). With
 // EffectiveNextBillingPeriod Paddle schedules a change with the action
-// `cancel` and the subscription stays active until the period ends.
+// `cancel` and the subscription stays active until the period ends. The
+// response must confirm the scheduled cancellation.
 func (c *Client) CancelSubscription(ctx context.Context, id string, when EffectiveFrom) (Subscription, error) {
 	var sub Subscription
 	err := c.do(ctx, http.MethodPost, "/subscriptions/"+url.PathEscape(id)+"/cancel",
 		map[string]any{"effective_from": string(when)}, &sub)
+	if err == nil && when == EffectiveNextBillingPeriod && !sub.CancelsAtPeriodEnd() {
+		return Subscription{}, errors.New("paddle response did not confirm the scheduled cancellation")
+	}
 	return sub, err
 }
 
 // RemoveScheduledChange removes a scheduled cancellation (`PATCH
 // /subscriptions/{id}` with `scheduled_change: null`,
 // https://developer.paddle.com/build/subscriptions/cancel-subscriptions).
+// The response must explicitly confirm that the schedule is null.
 func (c *Client) RemoveScheduledChange(ctx context.Context, id string) (Subscription, error) {
-	var sub Subscription
-	err := c.do(ctx, http.MethodPatch, "/subscriptions/"+url.PathEscape(id),
-		map[string]any{"scheduled_change": nil}, &sub)
-	return sub, err
+	var response struct {
+		Subscription
+		// Keep the raw field so omission and explicit null are distinct.
+		ScheduledChange json.RawMessage `json:"scheduled_change"`
+	}
+	if err := c.do(ctx, http.MethodPatch, "/subscriptions/"+url.PathEscape(id),
+		map[string]any{"scheduled_change": nil}, &response); err != nil {
+		return Subscription{}, err
+	}
+	if !bytes.Equal(response.ScheduledChange, []byte("null")) {
+		return Subscription{}, errors.New("paddle response did not confirm removal of the scheduled cancellation")
+	}
+	return response.Subscription, nil
 }
 
 // Charge is a one-time charge of a non-catalog price on an existing

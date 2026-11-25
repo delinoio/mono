@@ -268,6 +268,137 @@ func TestSubscriptionLifecycle(t *testing.T) {
 // checkout transaction at Paddle, so a late payment cannot create a
 // subscription for the deleted account. A Paddle failure fails the deletion
 // and leaves the account and its open checkout.
+func TestSubscriptionChangeRequiresPaddleConfirmation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		paddleCall string
+		auditKind  api.AuditKind
+		wantCancel bool
+	}{
+		{"cancel", "POST /subscriptions/", api.AuditSubscriptionCanceled, true},
+		{"resume", "PATCH /subscriptions/", api.AuditSubscriptionResumed, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testenv.New(t)
+			f := newFixture(t, env)
+			subID := subscribe(t, env, f)
+			observedAt := time.Now().UTC().Truncate(time.Second)
+			end := observedAt.AddDate(0, 1, 0)
+			cancel := &paddle.ScheduledChange{Action: "cancel", EffectiveAt: end}
+			current := paddle.Subscription{
+				ID: subID, Status: paddle.SubscriptionStatusActive, UpdatedAt: observedAt,
+				CurrentBillingPeriod: &paddle.Period{StartsAt: observedAt, EndsAt: end},
+			}
+			if !tc.wantCancel {
+				current.ScheduledChange = cancel
+			}
+			if code := env.Webhook("subscription.updated", current); code != http.StatusOK {
+				t.Fatalf("subscription webhook status = %d, want 200", code)
+			}
+			client := env.Credit(f.Owner.ID)
+			change := func() (*accountsv1.Subscription, error) {
+				if tc.wantCancel {
+					r, err := client.CancelSubscription(ctx(), connect.NewRequest(&accountsv1.CancelSubscriptionRequest{BillingAccountId: f.AccountID}))
+					if err != nil {
+						return nil, err
+					}
+					return r.Msg.GetSubscription(), nil
+				}
+				r, err := client.ResumeSubscription(ctx(), connect.NewRequest(&accountsv1.ResumeSubscriptionRequest{BillingAccountId: f.AccountID}))
+				if err != nil {
+					return nil, err
+				}
+				return r.Msg.GetSubscription(), nil
+			}
+			readStored := func() (string, bool) {
+				t.Helper()
+				var row string
+				var cancel bool
+				if err := env.DB.Pool.QueryRow(ctx(), `SELECT to_jsonb(s)::text, cancel_at_period_end
+					FROM subscriptions s WHERE billing_account_id = $1`, f.AccountID).Scan(&row, &cancel); err != nil {
+					t.Fatal(err)
+				}
+				return row, cancel
+			}
+			before, initialCancel := readStored()
+			if initialCancel == tc.wantCancel {
+				t.Fatalf("initial cancel_at_period_end = %v, want %v", initialCancel, !tc.wantCancel)
+			}
+			entity := func(id, status string, at time.Time, schedule string) string {
+				return fmt.Sprintf(`{"data":{"id":%q,"status":%q,"updated_at":%q,"current_billing_period":{"starts_at":%q,"ends_at":%q}%s}}`,
+					id, status, at.Format(time.RFC3339), observedAt.Format(time.RFC3339), end.Format(time.RFC3339), schedule)
+			}
+			fresh := observedAt.Add(time.Minute)
+			cancelSchedule := fmt.Sprintf(`,"scheduled_change":{"action":"cancel","effective_at":%q}`, end.Format(time.RFC3339))
+			nullSchedule := `,"scheduled_change":null`
+			confirmed, unchanged := cancelSchedule, nullSchedule
+			if !tc.wantCancel {
+				confirmed, unchanged = nullSchedule, cancelSchedule
+			}
+			for _, invalid := range []struct{ name, body string }{
+				{"blank body", " "},
+				{"null entity", `{"data":null}`},
+				{"empty entity", `{"data":{}}`},
+				{"other subscription", entity("sub_other", current.Status, fresh, confirmed)},
+				{"stale response", entity(subID, current.Status, observedAt.Add(-time.Minute), confirmed)},
+				{"zero provider timestamp", entity(subID, current.Status, time.Time{}, confirmed)},
+				{"unmanageable subscription", entity(subID, paddle.SubscriptionStatusCanceled, fresh, confirmed)},
+				{"missing schedule", entity(subID, current.Status, fresh, "")},
+				{"unchanged schedule", entity(subID, current.Status, fresh, unchanged)},
+				{"wrong action", entity(subID, current.Status, fresh, `,"scheduled_change":{"action":"pause"}`)},
+			} {
+				t.Run(invalid.name, func(t *testing.T) {
+					env.Paddle.Respond(tc.paddleCall, http.StatusOK, invalid.body)
+					calls := len(env.Paddle.Requests())
+					_, err := change()
+					wantCode(t, err, connect.CodeUnavailable)
+					if count := len(env.Paddle.Requests()); count != calls+1 {
+						t.Fatalf("unconfirmed change sent %d Paddle requests, want 1", count-calls)
+					}
+					if row, _ := readStored(); row != before {
+						t.Fatalf("subscription row changed: %s", row)
+					}
+					if count := auditRowCount(t, env, f.AccountID, tc.auditKind); count != 0 {
+						t.Fatalf("audit rows = %d, want 0", count)
+					}
+					var mappings int
+					if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM paddle_subscriptions
+						WHERE billing_account_id = $1`, f.AccountID).Scan(&mappings); err != nil || mappings != 1 {
+						t.Fatalf("subscription mappings = %d, %v, want one", mappings, err)
+					}
+				})
+			}
+
+			env.Paddle.Respond(tc.paddleCall, http.StatusOK, entity(subID, current.Status, fresh, confirmed))
+			got, err := change()
+			if err != nil || got.GetCancelAtPeriodEnd() != tc.wantCancel || !got.GetCurrentPeriodEnd().AsTime().Equal(end) {
+				t.Fatalf("confirmed change = %v, %v, want cancel_at_period_end = %v", got, err, tc.wantCancel)
+			}
+			after, storedCancel := readStored()
+			if storedCancel != tc.wantCancel {
+				t.Fatalf("stored cancel_at_period_end = %v, want %v", storedCancel, tc.wantCancel)
+			}
+			if count := auditRowCount(t, env, f.AccountID, tc.auditKind); count != 1 {
+				t.Fatalf("audit rows after confirmed change = %d, want 1", count)
+			}
+			calls := len(env.Paddle.Requests())
+			got, err = change()
+			if err != nil || got.GetCancelAtPeriodEnd() != tc.wantCancel {
+				t.Fatalf("repeated change = %v, %v", got, err)
+			}
+			if count := len(env.Paddle.Requests()); count != calls {
+				t.Fatalf("repeated change sent %d Paddle requests, want 0", count-calls)
+			}
+			if row, _ := readStored(); row != after {
+				t.Fatalf("repeated change modified subscription row: %s", row)
+			}
+			if count := auditRowCount(t, env, f.AccountID, tc.auditKind); count != 1 {
+				t.Fatalf("audit rows after repeated change = %d, want 1", count)
+			}
+		})
+	}
+}
+
 func TestDeleteBillingAccountCancelsPendingCheckout(t *testing.T) {
 	env := testenv.New(t)
 	f := newFixture(t, env)
