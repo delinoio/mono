@@ -53,6 +53,7 @@ const (
 	ImagesDir      = "images"
 	UpdateDir      = "update"
 	snapshotRecord = "record.json"
+	stagedSnapshot = ".record.pending"
 )
 
 // ErrNotFound reports a missing record.
@@ -357,6 +358,15 @@ func (s *Store) SnapshotDir(id string) (string, error) {
 
 // SaveSnapshot writes the record of one snapshot.
 func (s *Store) SaveSnapshot(id string, v any) error {
+	return s.writeSnapshotRecord(id, snapshotRecord, v)
+}
+
+// StageSnapshot saves a capture record under a name that LoadSnapshots ignores.
+func (s *Store) StageSnapshot(id string, v any) error {
+	return s.writeSnapshotRecord(id, stagedSnapshot, v)
+}
+
+func (s *Store) writeSnapshotRecord(id, name string, v any) error {
 	dir, err := s.SnapshotDir(id)
 	if err != nil {
 		return err
@@ -364,7 +374,17 @@ func (s *Store) SaveSnapshot(id string, v any) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return s.writeJSON(filepath.Join(dir, snapshotRecord), v)
+	return s.writeJSON(filepath.Join(dir, name), v)
+}
+
+// PublishSnapshot installs the staged capture record under the loader's name.
+// The caller serializes publication with the decision to discard the capture.
+func (s *Store) PublishSnapshot(id string) error {
+	dir, err := s.SnapshotDir(id)
+	if err != nil {
+		return err
+	}
+	return replaceFile(filepath.Join(dir, stagedSnapshot), filepath.Join(dir, snapshotRecord))
 }
 
 // DeleteSnapshot deletes a snapshot with its content.
@@ -403,7 +423,7 @@ func (s *Store) LoadSnapshots(decode func(data []byte) error) error {
 		data, err := os.ReadFile(s.Path(SnapshotsDir, e.Name(), snapshotRecord))
 		if errors.Is(err, fs.ErrNotExist) {
 			if err := removeAll(s.Path(SnapshotsDir, e.Name())); err != nil {
-				return err
+				return fmt.Errorf("store: remove incomplete snapshot %s: %w", e.Name(), err)
 			}
 			continue
 		}

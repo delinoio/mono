@@ -76,9 +76,9 @@ type pendingSnapshot struct {
 // the create reaches Manager.CreateSnapshot, and the create can wait for the
 // sandbox lock for a long time. The claim is taken in the receive order of
 // the commands, so the delete finds it and cancels the create: the create
-// then returns ABORTED and neither publishes a record nor keeps content. A
-// delete cancels the claims that exist when it runs; a create received after
-// the delete is not affected.
+// then returns ABORTED without publishing a ready record. A failed cleanup
+// stays available to a repeated delete. A delete cancels the claims that
+// exist when it runs. A create received after the delete is not canceled.
 type SnapshotCreateClaim struct {
 	m  *Manager
 	id string
@@ -185,8 +185,7 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 // CreateClaimedSnapshot takes a snapshot of a running or paused sandbox for
 // a create command whose receipt was registered with ClaimSnapshotCreate. A
 // delete that arrived after the claim was taken, even before this call, makes
-// the create return ABORTED without it capturing, publishing or keeping
-// anything. The caller releases the claim.
+// the create return ABORTED without publishing. The caller releases the claim.
 //
 // A duplicate create of the same snapshot ID, each with its own claim, that
 // waits for the sandbox lock while another create captures or publishes the
@@ -251,6 +250,11 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 		m.mu.Unlock()
 		return nil, m.abortedSnapshotError(id)
 	}
+	if snap := m.snapshots[id]; snap != nil {
+		entry, err := existingSnapshotEntry(snap)
+		m.mu.Unlock()
+		return entry, err
+	}
 	pending := m.pending[id]
 	if pending == nil || pending.capturing {
 		m.mu.Unlock()
@@ -287,11 +291,11 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 	// A runtime can return success after ctx ended, for example when it
 	// ignores the cancellation of its disk copy. The command result can no
 	// longer reach the control plane, so the capture is not published.
+	if m.snapshotDeletedDuringCreate(claim) {
+		return nil, m.abortSnapshotCreate(id)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, m.abortCanceledSnapshotCreate(id, dir, err)
-	}
-	if m.snapshotDeletedDuringCreate(claim) {
-		return nil, m.abortSnapshotCreate(id, dir)
 	}
 	snap := &snapshot{dir: filepath.Join(dir, contentDir), rec: SnapshotRecord{
 		SnapshotID:         cmd.GetSnapshotId(),
@@ -306,30 +310,38 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 		SizeBytes:          info.SizeBytes,
 		MacOSHardwareModel: info.MacOSHardwareModel,
 	}}
-	if err := m.st.SaveSnapshot(snap.rec.SnapshotID, snap.rec); err != nil {
-		fsutil.RemoveAll(dir)
-		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot record could not be saved")
+	saveErr := m.st.StageSnapshot(id, snap.rec)
+	if saveErr == nil {
+		m.hookMu.Lock()
+		beforePublish := m.beforeSnapshotPublish
+		m.hookMu.Unlock()
+		if beforePublish != nil {
+			beforePublish(id)
+		}
 	}
-	// A delete can also arrive while the record is saved. Check again under
-	// the lock that publishes the snapshot, so that exactly one of the two
-	// wins: either the delete is recorded here, or the delete finds the
-	// published snapshot and deletes it.
+	// Publish on disk and in memory under the same lock as the delete check.
+	// Until that point a restart treats any saved record as incomplete.
 	m.mu.Lock()
 	if claim.deleted {
 		m.mu.Unlock()
-		_ = m.st.DeleteSnapshot(id)
-		return nil, m.abortedSnapshotError(id)
+		return nil, m.abortSnapshotCreate(id)
 	}
 	// The same critical section checks the cancellation, so that a capture
 	// whose context ended while the record was saved is never published.
 	if err := ctx.Err(); err != nil {
 		m.mu.Unlock()
-		if derr := m.st.DeleteSnapshot(id); derr != nil {
-			m.logger.Error("canceled snapshot could not be removed", "snapshot_id", id, "error", derr)
-		}
-		return nil, m.canceledSnapshotError(id, err)
+		return nil, m.abortCanceledSnapshotCreate(id, dir, err)
 	}
-	m.snapshots[snap.rec.SnapshotID] = snap
+	if saveErr == nil {
+		saveErr = m.st.PublishSnapshot(id)
+	}
+	if saveErr != nil {
+		m.mu.Unlock()
+		m.logger.Error("snapshot record could not be saved", "snapshot_id", id, "error", saveErr)
+		fsutil.RemoveAll(dir)
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot record could not be saved")
+	}
+	m.snapshots[id] = snap
 	m.mu.Unlock()
 	m.logger.Info("snapshot ready", "snapshot_id", snap.rec.SnapshotID, "size_bytes", snap.rec.SizeBytes, "has_memory_state", snap.rec.HasMemoryState)
 	return snap.entry(), nil
@@ -374,19 +386,24 @@ func (m *Manager) snapshotDeletedDuringCreate(claim *SnapshotCreateClaim) bool {
 	return claim.deleted
 }
 
-// abortSnapshotCreate removes the content of a capture that a delete
-// overtook and returns the error of the create. The caller releases the
-// claim of the create.
-func (m *Manager) abortSnapshotCreate(id, dir string) error {
-	if err := removeDirIfExists(dir); err != nil {
-		m.logger.Error("aborted snapshot content could not be removed", "snapshot_id", id, "error", err)
-	}
+// abortSnapshotCreate tracks an unpublished capture until its cleanup
+// succeeds. A failed removal stays unavailable and a later delete can retry
+// it. The caller still holds the capture reservation for this ID.
+func (m *Manager) abortSnapshotCreate(id string) error {
+	snap := &snapshot{rec: SnapshotRecord{
+		SnapshotID: id,
+		State:      ownsandv1.SnapshotState_SNAPSHOT_STATE_DELETING,
+	}, deleting: true}
+	m.mu.Lock()
+	m.snapshots[id] = snap
+	m.mu.Unlock()
+	// removeSnapshotEntry logs any failure. The create returns its own error.
+	_ = m.removeSnapshotEntry(snap)
 	return m.abortedSnapshotError(id)
 }
 
-// abortCanceledSnapshotCreate removes the record and content of a capture
-// whose context ended before publication and returns the error of the
-// create. The caller releases the claim of the create.
+// abortCanceledSnapshotCreate removes a capture whose channel ended before
+// publication. Any remaining staged record is incomplete at startup.
 func (m *Manager) abortCanceledSnapshotCreate(id, dir string, cause error) error {
 	if err := removeDirIfExists(dir); err != nil {
 		m.logger.Error("canceled snapshot content could not be removed", "snapshot_id", id, "error", err)
@@ -453,6 +470,14 @@ func (m *Manager) SetSnapshotRemovalHookForTest(hook func(id string) error) {
 	m.hookMu.Lock()
 	defer m.hookMu.Unlock()
 	m.removalHook = hook
+}
+
+// SetSnapshotPublishHookForTest installs a hook that runs after staging a
+// capture record and before checking whether the capture can publish.
+func (m *Manager) SetSnapshotPublishHookForTest(hook func(id string)) {
+	m.hookMu.Lock()
+	defer m.hookMu.Unlock()
+	m.beforeSnapshotPublish = hook
 }
 
 // removeSnapshot deletes the stored record and content of a snapshot.
