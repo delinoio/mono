@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { resolveChildEnv } from "./dev.mjs";
 
 // These tests start the real launcher without a database and with a fake
 // `go` whose build output prints the environment it received.
@@ -27,6 +28,79 @@ const DefaultCorsOrigins = [
   "https://tide.delino.localhost",
   "http://tide.delino.localhost",
 ].join(",");
+
+const DefaultSettings = {
+  ALLOW_DIRECT_CLIENT_ADDRESS: "true",
+  CORS_ORIGINS: DefaultCorsOrigins,
+  METRICS_ADDR: "127.0.0.1:19400",
+};
+
+for (const [label, spelling] of [
+  ["uppercase", (name) => name],
+  ["lowercase", (name) => name.toLowerCase()],
+  ["mixed case", (name) => name[0] + name.slice(1).toLowerCase()],
+]) {
+  test(`Windows preserves explicit ${label} settings`, () => {
+    const env = Object.freeze({
+      [spelling("ALLOW_DIRECT_CLIENT_ADDRESS")]: " false ",
+      [spelling("CORS_ORIGINS")]: " https://a.example ",
+      [spelling("METRICS_ADDR")]: " 127.0.0.1:9999 ",
+      Unrelated: "keep",
+    });
+
+    assert.deepEqual(resolveChildEnv(env, "win32"), env);
+  });
+
+  test(`Windows applies defaults to blank ${label} settings`, () => {
+    const blank = {};
+    const expected = {};
+    for (const [name, value] of Object.entries(DefaultSettings)) {
+      blank[spelling(name)] = " \t\n\v\f\r";
+      expected[spelling(name)] = value;
+    }
+
+    assert.deepEqual(resolveChildEnv(blank, "win32"), expected);
+  });
+}
+
+test("Windows applies defaults to absent settings", () => {
+  assert.deepEqual(resolveChildEnv({}, "win32"), DefaultSettings);
+});
+
+test("Windows keeps one explicit value per setting in spawn sort order", () => {
+  assert.deepEqual(
+    resolveChildEnv(
+      {
+        allow_direct_client_address: "true",
+        ALLOW_DIRECT_CLIENT_ADDRESS: "false",
+        Cors_Origins: "https://b.example",
+        CORS_ORIGINS: "",
+        cors_origins: "https://a.example",
+        METRICS_ADDR: "\t",
+        metrics_addr: "\u00a0",
+      },
+      "win32",
+    ),
+    {
+      ALLOW_DIRECT_CLIENT_ADDRESS: "false",
+      Cors_Origins: "https://b.example",
+      metrics_addr: "\u00a0",
+    },
+  );
+});
+
+test("POSIX keeps differently cased settings distinct", () => {
+  const env = {
+    allow_direct_client_address: "false",
+    Cors_Origins: "https://a.example",
+    metrics_addr: "127.0.0.1:9999",
+  };
+
+  assert.deepEqual(resolveChildEnv(env, "linux"), {
+    ...env,
+    ...DefaultSettings,
+  });
+});
 
 function start(env) {
   const child = spawn(process.execPath, [launcher], {

@@ -58,6 +58,36 @@ const AsciiWhiteSpaceOnly = /^[\t\n\v\f\r ]*$/;
 const isUnset = (value) =>
   value === undefined || AsciiWhiteSpaceOnly.test(value);
 
+function applyEnvDefault(env, name, value, platform) {
+  // Windows treats case variants as one variable. Use Node's spawn sort order
+  // to choose between explicit values, and keep only the chosen spelling.
+  const aliases =
+    platform === "win32"
+      ? Object.keys(env)
+          .filter((key) => key.toUpperCase() === name)
+          .sort()
+      : [];
+  const key =
+    aliases.find((alias) => !isUnset(env[alias])) ?? aliases[0] ?? name;
+  for (const alias of aliases) {
+    if (alias !== key) delete env[alias];
+  }
+  if (isUnset(env[key])) env[key] = value;
+}
+
+export function resolveChildEnv(baseEnv, platform = process.platform) {
+  const env = { ...baseEnv };
+  applyEnvDefault(env, "ALLOW_DIRECT_CLIENT_ADDRESS", "true", platform);
+  applyEnvDefault(env, "METRICS_ADDR", DevelopmentMetricsAddr, platform);
+  applyEnvDefault(
+    env,
+    "CORS_ORIGINS",
+    [ProductionConsoleOrigin, ...DevelopmentConsoleOrigins].join(","),
+    platform,
+  );
+  return env;
+}
+
 const launcherPath = fileURLToPath(import.meta.url);
 const packageDir = resolve(dirname(launcherPath), "..");
 const binaryName = process.platform === "win32" ? "tide-api.exe" : "tide-api";
@@ -181,19 +211,7 @@ async function main() {
     );
     return 0;
   }
-  const env = { ...process.env };
-  if (isUnset(env.ALLOW_DIRECT_CLIENT_ADDRESS)) {
-    env.ALLOW_DIRECT_CLIENT_ADDRESS = "true";
-  }
-  if (isUnset(env.METRICS_ADDR)) {
-    env.METRICS_ADDR = DevelopmentMetricsAddr;
-  }
-  if (isUnset(env.CORS_ORIGINS)) {
-    env.CORS_ORIGINS = [
-      ProductionConsoleOrigin,
-      ...DevelopmentConsoleOrigins,
-    ].join(",");
-  }
+  const env = resolveChildEnv(process.env);
   const buildDir = await mkdtemp(join(tmpdir(), "tide-api-dev-"));
   try {
     if (received) return stoppedStatus();
