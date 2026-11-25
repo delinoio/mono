@@ -61,7 +61,7 @@ This contract owns the tide command-line interface, component `tide-cli`, of [`t
 
 `tide mcp` serves the Model Context Protocol over standard input and output for one coding agent. The agent's MCP configuration starts it, for example `tide mcp --org <organization-id> --pass-env NPM_TOKEN`. It has no network listener.
 
-- Credential: `TIDE_API_KEY` when set, otherwise the stored Logto tokens of `tide login`. With Logto tokens, the server refreshes the access token as the CLI does. Without a usable credential, every tool returns an error that tells the user to run `tide login` or set `TIDE_API_KEY`.
+- The server uses `TIDE_API_KEY` when set. Otherwise, it looks up stored Logto tokens on each tool call that needs a client until initialization succeeds. Without a usable credential, the tool returns an error that tells the user to run `tide login` or set `TIDE_API_KEY`. Running `tide login` lets the next call use the stored tokens without a server restart. The server reuses the client after initialization and refreshes its Logto access token as the CLI does.
 - `--pass-env NAME` (repeatable) names local environment variables that the server adds to every `exec` call. The server reads their values from its own environment when it runs the command, so the values never pass through the agent's model context. A tool call cannot add names to this list. When a named variable is not set, the server leaves it out and reports its name, without a value, in the tool result.
 - Standard output carries only MCP messages. Logs go to standard error.
 - Dev sessions do not depend on the server process. When it exits, its dev sessions stay until they are deleted or their TTL ends; `list_sessions` finds them again.

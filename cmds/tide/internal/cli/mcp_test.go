@@ -6,10 +6,14 @@ import (
 	"bytes"
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/delinoio/mono/cmds/internal/credstore"
+	"github.com/delinoio/mono/go/tide/tidetest"
 )
 
 // TestMCPCommand starts tide mcp on an in-memory transport: without a
@@ -19,14 +23,68 @@ import (
 func TestMCPCommand(t *testing.T) {
 	f := newFixture(t)
 	f.env[EnvConfigDir] = t.TempDir() // no stored tokens
+	ctx, cs := startMCPCommand(t, f)
+	checkMCPCommandUnauthenticated(t, ctx, cs)
+}
+
+func TestMCPCommandPicksUpLoginAfterStart(t *testing.T) {
+	f := newFixture(t)
+	creds, err := (credstore.Store{Dir: f.cfg, Program: "tide"}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.env[EnvConfigDir] = t.TempDir()
+	ctx, cs := startMCPCommand(t, f)
+	checkMCPCommandUnauthenticated(t, ctx, cs)
+
+	st := credstore.Store{Dir: f.env[EnvConfigDir], Program: "tide"}
+	if err := st.Save(creds); err != nil {
+		t.Fatal(err)
+	}
+	var calls sync.WaitGroup
+	for range 4 {
+		calls.Go(func() {
+			res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "list_sessions", Arguments: map[string]any{}})
+			if err != nil {
+				t.Errorf("call list_sessions after login: %v", err)
+			} else if res.IsError {
+				t.Errorf("list_sessions returned an error after login: %v", res.Content[0].(*mcp.TextContent).Text)
+			}
+		})
+	}
+	calls.Wait()
+	if f.srv.LastCredential() != tidetest.CredentialAccessToken {
+		t.Error("the stored Logto access token was not used")
+	}
+}
+
+func startMCPCommand(t *testing.T, f *fixture) (context.Context, *mcp.ClientSession) {
+	t.Helper()
 	serverT, clientT := mcp.NewInMemoryTransports()
 	old := mcpTransport
 	mcpTransport = func(Env) mcp.Transport { return serverT }
 	t.Cleanup(func() { mcpTransport = old })
 
 	var out, errb bytes.Buffer
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	done := make(chan int, 1)
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case code := <-done:
+			if code != 0 {
+				t.Fatalf("tide mcp exited %d: %s", code, errb.String())
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("tide mcp did not stop")
+		}
+		if out.Len() != 0 {
+			t.Fatalf("tide mcp wrote to standard output: %q", out.String())
+		}
+		if !strings.Contains(errb.String(), "tide mcp serves") {
+			t.Fatalf("logs = %q", errb.String())
+		}
+	})
 	go func() {
 		done <- Run(ctx, Env{
 			Args: []string{"mcp", "--org", f.org, "--pass-env", "NPM_TOKEN"}, Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errb,
@@ -38,6 +96,12 @@ func TestMCPCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cs.Close() })
+	return ctx, cs
+}
+
+func checkMCPCommandUnauthenticated(t *testing.T, ctx context.Context, cs *mcp.ClientSession) {
+	t.Helper()
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "list_sessions", Arguments: map[string]any{}})
 	if err != nil {
 		t.Fatal(err)
@@ -45,21 +109,5 @@ func TestMCPCommand(t *testing.T) {
 	text := res.Content[0].(*mcp.TextContent).Text
 	if !res.IsError || !strings.Contains(text, "tide login") || !strings.Contains(text, EnvAPIKey) || !strings.HasPrefix(text, "unauthenticated") {
 		t.Fatalf("tool without credential = %v %q", res.IsError, text)
-	}
-	cs.Close()
-	cancel()
-	select {
-	case code := <-done:
-		if code != 0 {
-			t.Fatalf("tide mcp exited %d: %s", code, errb.String())
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("tide mcp did not stop")
-	}
-	if out.Len() != 0 {
-		t.Fatalf("tide mcp wrote to standard output: %q", out.String())
-	}
-	if !strings.Contains(errb.String(), "tide mcp serves") {
-		t.Fatalf("logs = %q", errb.String())
 	}
 }
