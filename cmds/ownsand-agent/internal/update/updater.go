@@ -406,20 +406,25 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 		u.opts.Logger.Info("agent update command superseded", "target_version", target, "order", order)
 		return ErrSuperseded
 	}
-	// A new command supersedes the queued artifact, whatever its outcome:
-	// a failed or same-version target must not install the stale artifact.
+	comparison, comparisonErr := semver.CompareStrings(target, u.opts.Running)
+	// A pin to the running version acts as a withdrawal. Keep signed
+	// revocation recovery even if the control plane has not learned of it.
+	if u.revokedRunning && comparisonErr == nil && comparison == 0 {
+		u.mu.Unlock()
+		return ErrRunningRevoked
+	}
+	// An admitted command supersedes the queued artifact. A failed or
+	// same-version target must not install the stale artifact.
 	u.applied = order
 	u.clearPendingLocked()
 	u.mu.Unlock()
-	// The target is parsed only after the supersession check and the
-	// clearing of the queued artifact, like every other outcome: an invalid
-	// target of a current command must not leave the stale artifact queued,
-	// and one of a superseded command must not touch the newer command's state.
+	// An invalid target still clears the queued artifact if its command
+	// passed the order check.
 	if _, err := semver.Parse(target); err != nil {
 		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
 		return err
 	}
-	if c, err := semver.CompareStrings(target, u.opts.Running); err == nil && c == 0 {
+	if comparisonErr == nil && comparison == 0 {
 		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
 		return nil
 	}
@@ -452,7 +457,7 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	// The control plane decides lower targets: a pinned version or a
 	// revocation recovery. The agent cannot see the organization policy,
 	// so it installs the verified target that the control plane sent.
-	if c, err := semver.CompareStrings(target, u.opts.Running); err == nil && c < 0 {
+	if comparisonErr == nil && comparison < 0 {
 		u.opts.Logger.Info("agent update installs a lower version", "target_version", target, "revocation_recovery", cmd.GetRevocationRecovery())
 	}
 	return nil
