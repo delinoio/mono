@@ -378,9 +378,13 @@ export function SandboxStateBadge({
   state: SandboxState;
   lastKnownState?: SandboxState | undefined;
 }) {
+  const lastKnownLabel =
+    lastKnownState === undefined
+      ? undefined
+      : labels.sandboxState[lastKnownState];
   const text =
-    state === SandboxState.UNREACHABLE && lastKnownState !== undefined
-      ? `${labels.sandboxState[state]} (last ${labels.sandboxState[lastKnownState].toLowerCase()})`
+    state === SandboxState.UNREACHABLE && typeof lastKnownLabel === "string"
+      ? `${labels.sandboxState[state]} (last ${lastKnownLabel.toLowerCase()})`
       : labels.sandboxState[state];
   return (
     <Badge variant={SANDBOX_BADGE[state] ?? BadgeVariant.Neutral}>{text}</Badge>
