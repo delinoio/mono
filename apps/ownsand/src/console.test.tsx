@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { setTimeout as delay } from "node:timers/promises";
 import {
   afterEach,
   beforeEach,
@@ -37,6 +38,7 @@ import {
   type LinkBillingAccountRequest,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import type { AcceptInvitationRequest } from "@delino/ownsand-protos/v1/member_pb";
 import { type Sandbox } from "@delino/ownsand-protos/v1/sandbox_pb";
 import {
   ListOrganizationsResponseSchema,
@@ -2578,44 +2580,87 @@ describe("invitations", () => {
     ).toBeTruthy();
   });
 
-  /** Delays AcceptInvitation until the returned function releases it. */
+  /** Holds AcceptInvitation and records each request with its mock response. */
   function delayedAcceptTransport() {
     const mock = createMockTransport();
+    const calls: {
+      invitationSecret: string;
+      response: ReturnType<Transport["unary"]>;
+    }[] = [];
     let release = () => {};
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
     const transport: Transport = {
       ...mock,
-      async unary(method, ...rest) {
-        if (method.name === "AcceptInvitation") {
-          await gate;
+      unary(method, ...rest) {
+        if (method.name !== "AcceptInvitation") {
+          return mock.unary(method, ...rest);
         }
-        return mock.unary(method, ...rest);
+        const { invitationSecret } = rest[3] as AcceptInvitationRequest;
+        const response = gate.then(() => mock.unary(method, ...rest));
+        calls.push({ invitationSecret, response });
+        return response;
       },
     };
-    return { transport, release };
+
+    async function expectContosoRequest() {
+      await waitFor(() => {
+        expect(calls.map((call) => call.invitationSecret)).toEqual([
+          MOCK_INVITATION_SECRET,
+        ]);
+      });
+    }
+
+    async function releaseAndExpectContosoResponse() {
+      const timeout = new AbortController();
+      const response = Promise.race([
+        calls[0]!.response,
+        delay(1_000, undefined, { signal: timeout.signal }).then(() => {
+          throw new Error("Timed out waiting for AcceptInvitation");
+        }),
+      ]).finally(() => timeout.abort());
+      await act(async () => {
+        release();
+        await Promise.allSettled([response]);
+      });
+      expect((await response).message).toMatchObject({
+        organization: { organizationId: MOCK_IDS.contoso },
+      });
+    }
+
+    return {
+      transport,
+      release,
+      expectContosoRequest,
+      releaseAndExpectContosoResponse,
+    };
   }
 
   test("does not navigate when an earlier accept succeeds after a new link opened", async () => {
-    const { transport, release } = delayedAcceptTransport();
+    const held = delayedAcceptTransport();
     pendingInvitation.save(MOCK_INVITATION_SECRET);
-    renderConsole("/invitations/accept", { transport });
-    await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Accept invitation" }),
-      );
+    renderConsole("/invitations/accept", { transport: held.transport });
+    const earlierButton = await screen.findByRole("button", {
+      name: "Accept invitation",
     });
+    await act(async () => {
+      fireEvent.click(earlierButton);
+    });
+    await held.expectContosoRequest();
     await act(async () => {
       window.location.hash = `secret=${MOCK_ACME_INVITATION_SECRET}`;
       window.dispatchEvent(new HashChangeEvent("hashchange"));
     });
-    release();
-    await settle(60);
+    const replacementButton = screen.getByRole("button", {
+      name: "Accept invitation",
+    });
+    expect(replacementButton).not.toBe(earlierButton);
+    await held.releaseAndExpectContosoResponse();
     expect(window.location.pathname).toBe("/invitations/accept");
-    expect(
-      screen.getByRole("button", { name: "Accept invitation" }),
-    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Accept invitation" })).toBe(
+      replacementButton,
+    );
   });
 
   /** Counts ListOrganizations calls and records their page tokens. */
@@ -2730,22 +2775,23 @@ describe("invitations", () => {
   });
 
   test("does not navigate when an earlier accept succeeds after the user left the page", async () => {
-    const { transport, release } = delayedAcceptTransport();
+    const held = delayedAcceptTransport();
     pendingInvitation.save(MOCK_INVITATION_SECRET);
-    renderConsole("/invitations/accept", { transport });
+    renderConsole("/invitations/accept", { transport: held.transport });
     await act(async () => {
       fireEvent.click(
         await screen.findByRole("button", { name: "Accept invitation" }),
       );
     });
+    await held.expectContosoRequest();
     await act(async () => {
       fireEvent.click(screen.getByRole("link", { name: "Not now" }));
     });
-    expect(window.location.pathname).not.toBe("/invitations/accept");
-    const leftPath = window.location.pathname;
-    release();
-    await settle(60);
-    expect(window.location.pathname).toBe(leftPath);
+    expect(window.location.pathname).toBe("/");
+    expect(screen.getByRole("heading", { name: "Organizations" })).toBeTruthy();
+    await held.releaseAndExpectContosoResponse();
+    expect(window.location.pathname).toBe("/");
+    expect(screen.getByRole("heading", { name: "Organizations" })).toBeTruthy();
   });
 
   test("a new link drops the stored secret of an earlier link", async () => {
