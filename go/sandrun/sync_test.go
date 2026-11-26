@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"maps"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2071,6 +2072,204 @@ func TestSyncLockAndRestartAfterStoppedSync(t *testing.T) {
 	if _, err := c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}); connect.CodeOf(err) != connect.CodeFailedPrecondition {
 		t.Fatalf("sync of a starting session = %v", err)
 	}
+}
+
+func TestSyncLockAcquisitionStreamLoss(t *testing.T) {
+	needPOSIX(t)
+	for _, tc := range []struct {
+		name     string
+		exitCode int64
+		unknown  bool
+	}{
+		{name: "existing workspace", exitCode: 0},
+		{name: "missing workspace", exitCode: exitWorkspaceMissing},
+		{name: "contention", exitCode: exitLocked},
+		{name: "unavailable replay", exitCode: 0, unknown: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, stop := context.WithTimeout(t.Context(), 10*time.Second)
+			defer stop()
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+			ws := ds.GetWorkspacePath()
+			lock := ws + lockSuffix
+			manifestPath := ws + manifestSuffix
+			params := SyncParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+				LocalDir: newRepo(t, map[string]string{"a.txt": "previous"}, nil, ""),
+			}
+			if _, err := c.Sync(ctx, params); err != nil {
+				t.Fatal(err)
+			}
+			previous, err := os.ReadFile(manifestPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(params.LocalDir, "a.txt"), []byte("pending"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			missing := tc.exitCode == exitWorkspaceMissing
+			if missing {
+				if err := os.RemoveAll(ws); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.exitCode == exitLocked {
+				if err := os.Mkdir(lock, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(lock, "owner"), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			attachProc := sandrunv1connect.DevSessionServiceAttachDevSessionExecProcedure
+			if tc.unknown {
+				srv.Fail(attachProc, connect.NewError(connect.CodeNotFound, errors.New("exec unknown")))
+			}
+			syncCtx, cancelSync := context.WithCancel(ctx)
+			defer cancelSync()
+			fault := &syncLockStreamFault{ctx: syncCtx, cancel: cancelSync}
+			c.devSessions = sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, srv.URL,
+				connect.WithInterceptors(&authInterceptor{client: c}, fault))
+
+			commands, writes, attaches := len(srv.ExecRequests()), srv.Calls(writeProc), srv.Calls(attachProc)
+			res, err := c.Sync(syncCtx, params)
+			var streamErr *ExecStreamError
+			if res != nil || !errors.As(err, &streamErr) || !errors.Is(err, context.Canceled) || !streamErr.Started {
+				t.Fatalf("sync = %+v, %v, want original stream cancellation after Started", res, err)
+			}
+			if !fault.withheld || fault.exitCode != tc.exitCode {
+				t.Fatalf("withheld exit = %t and code = %d, want code %d", fault.withheld, fault.exitCode, tc.exitCode)
+			}
+			if got := srv.Calls(attachProc) - attaches; got != 1 {
+				t.Fatalf("attach calls = %d, want 1", got)
+			}
+			if got := srv.Calls(writeProc) - writes; got != 0 {
+				t.Fatalf("interrupted sync made %d write calls", got)
+			}
+			requests := srv.ExecRequests()[commands:]
+			acquired := !tc.unknown && tc.exitCode != exitLocked
+			wantCommands := 1
+			if acquired {
+				wantCommands++
+			}
+			if len(requests) != wantCommands || requests[0].GetExecId() != streamErr.ExecID {
+				t.Fatalf("sync issued %d commands, want %d starting with the original lock exec", len(requests), wantCommands)
+			}
+			if acquired && !maps.Equal(requests[1].GetEnv(), map[string]string{guestEnvLock: lock}) {
+				t.Fatal("recovery cleanup must target only the lock")
+			}
+			_, statErr := os.Stat(lock)
+			if acquired && !errors.Is(statErr, os.ErrNotExist) || !acquired && statErr != nil {
+				t.Fatalf("lock stat = %v, confirmed acquisition = %t", statErr, acquired)
+			}
+			current, err := os.ReadFile(manifestPath)
+			if err != nil || !bytes.Equal(current, previous) {
+				t.Fatalf("manifest changed after interrupted acquisition: read error = %v", err)
+			}
+			if missing {
+				if _, err := os.Stat(ws); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("interrupted acquisition restored workspace: %v", err)
+				}
+			} else if got := readGuest(t, ds, "a.txt"); got != "previous" {
+				t.Fatalf("interrupted acquisition changed the guest file to %q", got)
+			}
+			if !acquired {
+				if tc.exitCode == exitLocked {
+					if _, err := os.Stat(filepath.Join(lock, "owner")); err != nil {
+						t.Fatalf("other sync's lock marker: %v", err)
+					}
+				}
+				if _, err := c.Sync(ctx, params); !errors.Is(err, ErrSyncLocked) {
+					t.Fatalf("retry with retained lock = %v, want ErrSyncLocked", err)
+				}
+				return
+			}
+			if res, err := c.Sync(ctx, params); err != nil || res.Uploaded != 1 {
+				t.Fatalf("ordinary retry = %+v, %v", res, err)
+			}
+			if got := readGuest(t, ds, "a.txt"); got != "pending" {
+				t.Errorf("guest file after retry = %q, want pending", got)
+			}
+		})
+	}
+}
+
+type syncLockStreamFault struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	withheld bool
+	exitCode int64
+}
+
+func (*syncLockStreamFault) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc { return next }
+
+func (*syncLockStreamFault) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return next
+}
+
+func (f *syncLockStreamFault) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
+		conn := next(ctx, spec)
+		if ctx == f.ctx && spec.Procedure == execProc {
+			return &syncLockStreamConn{StreamingClientConn: conn, fault: f}
+		}
+		return conn
+	}
+}
+
+type syncLockStreamConn struct {
+	connect.StreamingClientConn
+	fault *syncLockStreamFault
+}
+
+func (c *syncLockStreamConn) Receive(msg any) error {
+	if err := c.StreamingClientConn.Receive(msg); err != nil {
+		return err
+	}
+	if exited := msg.(*sandrunv1.ExecDevSessionResponse).GetEvent().GetExited(); exited != nil {
+		// The real guest command ended. Cancel before the SDK receives Exited
+		// and let the fixture replay the original result through Attach.
+		c.fault.withheld, c.fault.exitCode = true, exited.GetExitCode()
+		c.fault.cancel()
+		return context.Canceled
+	}
+	return nil
+}
+
+type syncLockAttachTimeout struct {
+	sandrunv1connect.DevSessionServiceClient
+	req *sandrunv1.AttachDevSessionExecRequest
+}
+
+func (a *syncLockAttachTimeout) AttachDevSessionExec(ctx context.Context, req *connect.Request[sandrunv1.AttachDevSessionExecRequest]) (*connect.ServerStreamForClient[sandrunv1.AttachDevSessionExecResponse], error) {
+	a.req = req.Msg
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestSyncLockAcquisitionRecoveryTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		attach := &syncLockAttachTimeout{}
+		c := &Client{devSessions: attach, logger: slog.New(slog.DiscardHandler)}
+		ds := &sandrunv1.DevSession{OrganizationId: "org", DevSessionId: "session"}
+		streamErr := &ExecStreamError{ExecID: "lock-exec", StdoutOffset: 9, StderrOffset: 7}
+		start := time.Now()
+		if c.syncLockAcquired(ctx, ds, streamErr) {
+			t.Fatal("timeout confirmed acquisition")
+		}
+		if elapsed := time.Since(start); elapsed != 30*time.Second {
+			t.Errorf("recovery elapsed = %v, want 30s", elapsed)
+		}
+		req := attach.req
+		if req.GetOrganizationId() != "org" || req.GetDevSessionId() != "session" ||
+			req.GetExecId() != "lock-exec" || req.GetStdoutOffset() != 9 || req.GetStderrOffset() != 7 {
+			t.Errorf("recovery attached with unexpected request: %v", req)
+		}
+	})
 }
 
 func TestSyncApplyStreamLoss(t *testing.T) {
