@@ -4,7 +4,8 @@
 // scratch directory on success and on failure, and keep the exit status of
 // the failing command, when the temporary directory path contains a space and
 // an apostrophe. The script runs in a throwaway Git repository with a fake
-// `go` executable that stands in for `go run buf@<version>`.
+// `go` executable that stands in for `go run buf@<version>`. The breaking
+// cases also check that the script passes the archived base schema to Buf.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -33,12 +34,16 @@ const skip = process.platform === "win32" && "scripts/protos.sh needs bash";
 // trap that changes the exit status is detected.
 const generateFailureStatus = 7;
 const breakingFailureStatus = 9;
+const comparisonFixtureErrorStatus = 10;
+const schemaPath = "delino/ownsand/v1/fixture.proto";
+const baseSchema =
+  'syntax = "proto3";\nmessage Fixture { string value = 1; }\n';
+const headSchema = 'syntax = "proto3";\nmessage Fixture { int32 value = 1; }\n';
 
-// Fake `go`. `go run <module>@<version> <buf args>` behaves like buf: `lint`,
-// `format` and `breaking` succeed, and `generate --output <dir>` writes one
-// Go binding and one TypeScript binding per target, which the fixture
-// repository commits unchanged, so `check` finds no drift. FAKE_GO_FAIL
-// selects a failing subcommand: `generate` or `breaking`.
+// Fake `go`. `lint` and `format` succeed. `breaking` checks the comparison
+// tree before returning success or a simulated Buf failure. `generate` writes
+// the same bindings that the fixture commits, so `check` finds no drift.
+// FAKE_GO_FAIL selects the failing subcommand.
 const fakeGo = `#!/usr/bin/env bash
 set -euo pipefail
 shift 2
@@ -48,9 +53,31 @@ if [[ "$subcommand" == "generate" && "\${FAKE_GO_FAIL:-}" == "generate" ]]; then
   echo "fake go: generate failure" >&2
   exit ${generateFailureStatus}
 fi
-if [[ "$subcommand" == "breaking" && "\${FAKE_GO_FAIL:-}" == "breaking" ]]; then
-  echo "fake go: breaking failure" >&2
-  exit ${breakingFailureStatus}
+comparison_fixture_error() {
+  echo "fake go: comparison fixture: $1" >&2
+  exit ${comparisonFixtureErrorStatus}
+}
+if [[ "$subcommand" == "breaking" ]]; then
+  while [[ $# -gt 0 && "$1" != "--against" ]]; do
+    shift
+  done
+  if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+    comparison_fixture_error "missing --against value"
+  fi
+  against="$(cd -- "$2" 2>/dev/null && pwd -P)" ||
+    comparison_fixture_error "--against is not a directory"
+  scratch="$(cd -- "$TMPDIR" && pwd -P)"
+  if [[ "$against" != "$scratch/"*/protos || ! -f "$against/buf.yaml" ]]; then
+    comparison_fixture_error "--against must point to the extracted protos tree under TMPDIR"
+  fi
+  if ! cmp -s "$FAKE_GO_BASE_SCHEMA" "$against/${schemaPath}"; then
+    comparison_fixture_error "archived schema differs from the base schema"
+  fi
+  if [[ "\${FAKE_GO_FAIL:-}" == "breaking" ]]; then
+    echo "fake go: breaking failure" >&2
+    exit ${breakingFailureStatus}
+  fi
+  exit 0
 fi
 if [[ "$subcommand" != "generate" ]]; then
   exit 0
@@ -84,6 +111,29 @@ function write(file, content) {
   writeFileSync(file, content);
 }
 
+function commitFixture(repo, env, message) {
+  execFileSync("git", ["add", "."], { cwd: repo, env });
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=Fixture",
+      "-c",
+      "user.email=fixture@example.com",
+      "commit",
+      "--quiet",
+      "-m",
+      message,
+    ],
+    { cwd: repo, env },
+  );
+  return execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: repo,
+    env,
+    encoding: "utf8",
+  }).trim();
+}
+
 // Creates a committed repository with the real script, the bindings that the
 // fake go generates, a fake protoc-gen-es per TypeScript target and the fake
 // go in a bin directory. `scratch` is the TMPDIR of every script run.
@@ -104,6 +154,7 @@ function fixture(scratchName) {
   copyFileSync(protosScript, join(repo, "scripts", "protos.sh"));
   chmodSync(join(repo, "scripts", "protos.sh"), 0o755);
   write(join(repo, "protos", "buf.yaml"), "version: v2\n");
+  write(join(repo, "protos", schemaPath), baseSchema);
   write(join(repo, "protos", "delino", "ownsand", "v1", "gen.pb.go"), "go\n");
   for (const pkg of ["ownsand", "accounts", "sandrun"]) {
     const pkgDir = join(repo, "protos", "delino", pkg);
@@ -115,22 +166,17 @@ function fixture(scratchName) {
   }
   write(join(bin, "go"), fakeGo);
   chmodSync(join(bin, "go"), 0o755);
-  execFileSync("git", ["add", "."], { cwd: repo, env });
-  execFileSync(
-    "git",
-    [
-      "-c",
-      "user.name=Fixture",
-      "-c",
-      "user.email=fixture@example.com",
-      "commit",
-      "--quiet",
-      "-m",
-      "fixture",
-    ],
-    { cwd: repo, env },
-  );
-  return { dir, repo, scratch, env };
+  const baseSha = commitFixture(repo, env, "fixture base");
+  return { dir, repo, scratch, env, baseSha };
+}
+
+function breakingFixture(scratchName) {
+  const f = fixture(scratchName);
+  f.env.FAKE_GO_BASE_SCHEMA = join(f.dir, "expected-base.proto");
+  write(f.env.FAKE_GO_BASE_SCHEMA, baseSchema);
+  write(join(f.repo, "protos", schemaPath), headSchema);
+  commitFixture(f.repo, f.env, "change fixture schema");
+  return f;
 }
 
 function run({ repo, env }, args, extraEnv = {}) {
@@ -230,9 +276,9 @@ for (const scratchName of scratchNames) {
     `breaking removes its scratch directory on success (${label})`,
     { skip },
     (t) => {
-      const f = fixture(scratchName);
+      const f = breakingFixture(scratchName);
       t.after(() => rmSync(f.dir, { recursive: true, force: true }));
-      assertRun(f, ["breaking", "HEAD"], {}, { status: 0, stderr: /^$/ });
+      assertRun(f, ["breaking", f.baseSha], {}, { status: 0, stderr: /^$/ });
     },
   );
 
@@ -240,11 +286,11 @@ for (const scratchName of scratchNames) {
     `breaking removes its scratch directory and keeps the exit status on failure (${label})`,
     { skip },
     (t) => {
-      const f = fixture(scratchName);
+      const f = breakingFixture(scratchName);
       t.after(() => rmSync(f.dir, { recursive: true, force: true }));
       assertRun(
         f,
-        ["breaking", "HEAD"],
+        ["breaking", f.baseSha],
         { FAKE_GO_FAIL: "breaking" },
         { status: breakingFailureStatus, stderr: /fake go: breaking failure/ },
       );

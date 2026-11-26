@@ -32,6 +32,8 @@ const fixtureInputs = new Set([
   "rstack.config.ts",
   "lefthook.yml",
   "scripts/install-git-hooks.sh",
+  // The Droplet fixtures run provisioning with stubbed host commands.
+  "scripts/droplet/provision.sh",
   // The Droplet fixtures run this helper against a stubbed `docker`.
   "scripts/droplet/start-caddy.sh",
   // The Droplet fixtures run this helper against a stubbed `systemctl`.

@@ -6,10 +6,12 @@ import {
   createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
-import type {
-  LinkBillingAccountRequest,
-  ListLinkableBillingAccountsResponse,
-  UnlinkBillingAccountRequest,
+import {
+  BillingPhase,
+  BillingService,
+  type LinkBillingAccountRequest,
+  type ListLinkableBillingAccountsResponse,
+  type UnlinkBillingAccountRequest,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import {
   MemberService,
@@ -36,8 +38,15 @@ import type {
 import {
   createMockTransport as createBaseMock,
   MOCK_IDS,
+  MockBillingState,
 } from "../src/mock/mock-api.ts";
+import { apiKeyCollisionTransport } from "./api-key-collision-fixture.ts";
+import { revokeCollisionTransport } from "../src/mock/revoke-collision-fixture.ts";
 import { organizationUuidTransport } from "./organization-uuid-fixture.ts";
+import {
+  lastKnownStateCases,
+  withLastKnownState,
+} from "./sandbox-last-known-state-fixture.ts";
 import { browserSandboxTransitionMock } from "./sandbox-transition-mock.ts";
 
 const lists = {
@@ -121,6 +130,56 @@ function holdTemplateRequest(request: "first-page" | "create") {
 }
 
 export function createMockTransport(): Transport {
+  const billingSeed = sessionStorage.getItem("ownsand-e2e-billing-status-seed");
+  const billingRefresh = createRouterTransport((router) => {
+    router.rpc(BillingService.method.getBillingStatus, () => {
+      const result = sessionStorage.getItem(
+        "ownsand-e2e-billing-status-result",
+      );
+      recordToken("ownsand-e2e-billing-status-refreshes", result ?? "");
+      if (result === "allowed") {
+        return { billing: { phase: BillingPhase.ALLOWED, linked: true } };
+      }
+      throw new ConnectError(
+        "Synthetic billing status failure",
+        Number(result) as Code,
+      );
+    });
+  });
+  const revokeCollision = sessionStorage.getItem(
+    "ownsand-e2e-revoke-collision",
+  );
+  if (revokeCollision === "same" || revokeCollision === "cross-role") {
+    const { transport, requests } = revokeCollisionTransport(createBaseMock(), {
+      variant: revokeCollision,
+      async waitForContinuation() {
+        const key = "ownsand-e2e-revoke-continuation";
+        if (sessionStorage.getItem(key) === "released") return;
+        await new Promise<void>((resolve) => {
+          window.addEventListener(`${key}-release`, () => resolve(), {
+            once: true,
+          });
+          sessionStorage.setItem(key, "held");
+        });
+      },
+    });
+    return {
+      ...transport,
+      async unary(method, ...args) {
+        const response = await transport.unary(method, ...args);
+        if (
+          method.name === "RevokeEnrollmentToken" ||
+          method.name === "RevokeInvitation"
+        ) {
+          sessionStorage.setItem(
+            "ownsand-e2e-revoke-requests",
+            JSON.stringify(requests),
+          );
+        }
+        return response;
+      },
+    };
+  }
   const methodName = sessionStorage.getItem("ownsand-e2e-paged-list");
   const refreshList = sessionStorage.getItem("ownsand-e2e-refresh-list");
   const pagination =
@@ -129,6 +188,8 @@ export function createMockTransport(): Transport {
       : undefined;
   // These lists use the base mock's control-plane page size and cursor.
   const pageDevices = methodName === "ListDevices";
+  const twoRestoreDevices =
+    sessionStorage.getItem("ownsand-e2e-restore-devices") === "true";
   const pageInvitations = methodName === "ListInvitations";
   const pageSources = methodName === "SnapshotSources";
   const holdTemplateFirstPage =
@@ -168,8 +229,17 @@ export function createMockTransport(): Transport {
   // Seed enough rows to split the selected list across two pages.
   const mock = browserSandboxTransitionMock(
     createBaseMock({
+      billing:
+        billingSeed === null
+          ? undefined
+          : {
+              [MOCK_IDS.acme]:
+                billingSeed === "suspended"
+                  ? MockBillingState.Suspended
+                  : MockBillingState.BlockedUnlinked,
+            },
       extraApiKeys: Number(methodName === "ListApiKeys"),
-      extraDevices: pageDevices ? 199 : 0,
+      extraDevices: pageDevices ? 199 : Number(twoRestoreDevices),
       extraEnrollmentTokens: Number(
         methodName === "ListEnrollmentTokens" ||
           refreshList === "ListEnrollmentTokens",
@@ -184,10 +254,48 @@ export function createMockTransport(): Transport {
       extraTemplates: pageSources ? 200 : 0,
     }),
   );
-  const base =
+  if (sessionStorage.getItem("ownsand-e2e-api-key-collision") === "true") {
+    const continuation = "ownsand-e2e-api-key-continuation";
+    const hold = sessionStorage.getItem(continuation) === "hold";
+    return apiKeyCollisionTransport(mock, {
+      beforeContinuation: hold
+        ? async () => {
+            if (sessionStorage.getItem(continuation) !== "hold") return;
+            await new Promise<void>((resolve) => {
+              window.addEventListener(
+                `${continuation}-release`,
+                () => resolve(),
+                {
+                  once: true,
+                },
+              );
+              sessionStorage.setItem(continuation, "held");
+            });
+          }
+        : undefined,
+      onRevoke({ organizationId, apiKeyId }) {
+        const key = "ownsand-e2e-api-key-revokes";
+        const requests = JSON.parse(sessionStorage.getItem(key) ?? "[]");
+        sessionStorage.setItem(
+          key,
+          JSON.stringify([...requests, { organizationId, apiKeyId }]),
+        );
+      },
+    });
+  }
+  const organizationMock =
     sessionStorage.getItem("ownsand-e2e-organization-uuid-case") === "true"
       ? organizationUuidTransport(mock)
       : mock;
+  const lastKnownState = sessionStorage.getItem(
+    "ownsand-e2e-sandbox-last-known-state",
+  );
+  const lastKnownStateCase = lastKnownStateCases.find(
+    ({ name }) => name === lastKnownState,
+  );
+  const base = lastKnownStateCase
+    ? withLastKnownState(organizationMock, lastKnownStateCase.lastKnownState)
+    : organizationMock;
   const earlierAcceptance = createRouterTransport((router) => {
     router.rpc(MemberService.method.acceptInvitation, () => ({
       organization: { organizationId: MOCK_IDS.acme },
@@ -358,6 +466,20 @@ export function createMockTransport(): Transport {
             nextPageToken: "",
           },
         };
+      }
+      if (
+        billingSeed !== null &&
+        method.name === "GetBillingStatus" &&
+        sessionStorage.getItem("ownsand-e2e-billing-status-result") !== null
+      ) {
+        return billingRefresh.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
       }
       if (method.name === "ListLinkableBillingAccounts") {
         const code = sessionStorage.getItem("ownsand-e2e-billing-list-error");

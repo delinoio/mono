@@ -251,6 +251,11 @@ h1[tabindex="-1"]:focus {
   overflow-wrap: anywhere;
 }
 
+.api-key-metadata,
+.list-record-id {
+  overflow-wrap: anywhere;
+}
+
 .list-actions {
   display: flex;
   align-items: center;

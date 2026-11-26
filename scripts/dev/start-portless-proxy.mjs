@@ -42,7 +42,16 @@
 // Child processes use explicit argument arrays and `shell: false` according
 // to the repository environment contract.
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+} from "node:fs";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,12 +60,16 @@ import { isWorkspaceCli } from "../ci/workspace-node.mjs";
 // Values of `PORTLESS` that make `portless run` start the app without the
 // proxy. They match `isPortlessSkipped` in portless 0.18.1.
 const PortlessSkipValues = Object.freeze(new Set(["0", "false", "skip"]));
+const DefaultProxyAddress = "127.0.0.1";
+const DefaultProxyPort = 443;
+const ProbeTimeoutMs = 1000;
 
 const PreflightEvent = Object.freeze({
   Disabled: "portless_proxy_preflight_disabled",
   NoPortlessApp: "portless_proxy_preflight_skipped",
   Starting: "portless_proxy_start",
   Failed: "portless_proxy_start_failed",
+  StateMismatch: "portless_proxy_state_mismatch",
   Outdated: "portless_proxy_outdated",
   StopFailed: "portless_proxy_stop_failed",
 });
@@ -160,27 +173,180 @@ function portlessVersionOf(path) {
   }
 }
 
-// Returns { pid, version } of the proxy that the portless state directory
-// records, or null when no proxy is recorded or its version is unknown.
-// The launcher resolves relative overrides before this lookup. An empty or
-// unset override selects the default in portless 0.18.1.
-function findRunningProxy() {
-  if (process.platform === "win32") return null;
-  const stateDir =
-    process.env.PORTLESS_STATE_DIR || join(homedir(), ".portless");
-  let pid;
-  try {
-    pid = Number.parseInt(
-      readFileSync(join(stateDir, "proxy.pid"), "utf8"),
-      10,
+// Portless accepts HTTP HEAD on its HTTPS listener and marks the response.
+// End the probe at the first response headers or at a fixed deadline.
+function probePortless(ca) {
+  return new Promise((resolve) => {
+    const request = ca ? httpsRequest : httpRequest;
+    const req = request(
+      {
+        hostname: DefaultProxyAddress,
+        port: DefaultProxyPort,
+        method: "HEAD",
+        agent: false,
+        ...(ca && { ca, servername: "localhost", rejectUnauthorized: true }),
+      },
+      (res) => finish(res.headers["x-portless"] === "1"),
     );
+    const timer = setTimeout(() => finish(false), ProbeTimeoutMs);
+    function finish(isPortless) {
+      clearTimeout(timer);
+      resolve(isPortless);
+      req.destroy();
+    }
+    req.on("error", () => finish(false));
+    req.end();
+  });
+}
+
+function defaultHttpsMode() {
+  // Match the pinned CLI's parsing of valid port and mode overrides.
+  const port = process.env.PORTLESS_PORT?.trim() ?? "";
+  if (/^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535) {
+    if (Number(port) !== DefaultProxyPort) return false;
+  }
+  const https = process.env.PORTLESS_HTTPS;
+  const unprivileged = process.env.PORTLESS_UNPRIVILEGED;
+  return (
+    https !== "0" &&
+    https !== "false" &&
+    (https !== undefined || (unprivileged !== "1" && unprivileged !== "true"))
+  );
+}
+
+// Match Portless's state directory trust rules. A sticky ancestor such as
+// /tmp can hold a directory owned by the user, but the state itself must be
+// private to its owner and must not be a symlink to a different state store.
+function trustedDirectory(dir, owners, ancestor = false, links = 0) {
+  const parent = dirname(dir);
+  if (parent !== dir && !trustedDirectory(parent, owners, true, links)) {
+    return false;
+  }
+  const stat = lstatSync(dir);
+  if (!owners.has(stat.uid)) return false;
+  if (ancestor && stat.isSymbolicLink() && links < 40) {
+    return trustedDirectory(
+      resolve(parent, readlinkSync(dir)),
+      owners,
+      true,
+      links + 1,
+    );
+  }
+  return (
+    stat.isDirectory() &&
+    ((stat.mode & 0o022) === 0 || (ancestor && (stat.mode & 0o1000) !== 0))
+  );
+}
+
+function readTrustedDefaultState(stateDir) {
+  const uid = process.getuid();
+  const owners = new Set([0, uid]);
+  if (uid === 0 && /^\d+$/.test(process.env.SUDO_UID ?? "")) {
+    owners.add(Number(process.env.SUDO_UID));
+  }
+  try {
+    if (!trustedDirectory(stateDir, owners)) return () => null;
+  } catch {
+    return () => null;
+  }
+  return (name) => {
+    const path = join(stateDir, name);
+    try {
+      const stat = lstatSync(path);
+      if (
+        stat.isFile() &&
+        owners.has(stat.uid) &&
+        (stat.mode & 0o022) === 0 &&
+        stat.size <= 64 * 1024
+      ) {
+        return readFileSync(path, "utf8").trim();
+      }
+    } catch {
+      // Missing state and unreadable files provide no evidence.
+    }
+    return null;
+  };
+}
+
+function proxyStartTime(pid) {
+  // Portless records Linux's boot-relative start time in proxy.start and
+  // uses ps with a fixed locale and time zone on other POSIX platforms.
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      return fields[0] === "Z" ? null : (fields[19] ?? null);
+    } catch {
+      return null;
+    }
+  }
+  const ps = spawnSync(
+    "ps",
+    ["-o", "stat=", "-o", "lstart=", "-p", String(pid)],
+    {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+      shell: false,
+      timeout: ProbeTimeoutMs,
+    },
+  );
+  if (ps.status !== 0) return null;
+  const [status, ...start] = ps.stdout.trim().split(/\s+/);
+  return status.startsWith("Z") ? null : start.join(" ") || null;
+}
+
+async function matchesDefaultProxy(readState, pid) {
+  if (pid === null || readState("proxy.port") !== String(DefaultProxyPort)) {
+    return false;
+  }
+  const start = readState("proxy.start");
+  const liveStart = proxyStartTime(pid);
+  if (liveStart === null) return false;
+  if (start) return start === liveStart;
+
+  // Older same-state proxies have no process start time record. Check the
+  // listening PID when visible, or verify HTTPS with only this state's CA.
+  const lsof = spawnSync(
+    "lsof",
+    [
+      "-nP",
+      "-a",
+      "-p",
+      String(pid),
+      `-i4TCP:${DefaultProxyPort}`,
+      "-sTCP:LISTEN",
+      "-Fn",
+    ],
+    { encoding: "utf8", shell: false, timeout: ProbeTimeoutMs },
+  );
+  if (lsof.status === 0 && /^(?:n127\.0\.0\.1|n\*):443$/m.test(lsof.stdout)) {
+    return true;
+  }
+  const ca = readState("ca.pem");
+  return Boolean(ca && (await probePortless(ca).catch(() => false)));
+}
+
+function recordedProxyPid(stateDir, readState) {
+  if (process.platform === "win32") return null;
+  try {
+    const raw = readState
+      ? readState("proxy.pid")
+      : readFileSync(join(stateDir, "proxy.pid"), "utf8");
+    if (readState && !/^\d+$/.test(raw)) return null;
+    const pid = Number.parseInt(raw, 10);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
   } catch {
     return null;
   }
-  if (!Number.isInteger(pid) || pid <= 0) return null;
+}
+
+// Returns the recorded proxy's version, when its command identifies Portless.
+function findRunningProxy(pid) {
+  if (pid === null) return null;
   const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], {
     encoding: "utf8",
     shell: false,
+    timeout: ProbeTimeoutMs,
   });
   if (ps.status !== 0 || typeof ps.stdout !== "string") return null;
   // The proxy runs as `node <portless cli> proxy start ...`. A path that
@@ -195,8 +361,8 @@ function findRunningProxy() {
 
 // Stops a running proxy that is older than the pinned portless. Returns 0 when
 // no such proxy runs or it stopped, otherwise the exit status for the script.
-function stopOutdatedProxy(found) {
-  const running = findRunningProxy();
+function stopOutdatedProxy(found, pid) {
+  const running = findRunningProxy(pid);
   if (running === null || !isOlderVersion(running.version, found.version)) {
     return 0;
   }
@@ -223,7 +389,7 @@ function stopOutdatedProxy(found) {
   return result.status || 1;
 }
 
-export function startPortlessProxy() {
+export async function startPortlessProxy() {
   const portlessSetting = process.env.PORTLESS;
   if (
     portlessSetting !== undefined &&
@@ -253,12 +419,33 @@ export function startPortlessProxy() {
 
   // Keep the state directory the proxy previously used from this app's cwd.
   // Set it on the launcher so the proxy and Turbo's package tasks inherit it.
-  const stateDir = process.env.PORTLESS_STATE_DIR;
-  if (stateDir && !isAbsolute(stateDir)) {
-    process.env.PORTLESS_STATE_DIR = resolve(found.appDir, stateDir);
+  const stateOverride = process.env.PORTLESS_STATE_DIR;
+  if (stateOverride && !isAbsolute(stateOverride)) {
+    process.env.PORTLESS_STATE_DIR = resolve(found.appDir, stateOverride);
+  }
+  const stateDir =
+    process.env.PORTLESS_STATE_DIR || join(homedir(), ".portless");
+  // Portless 0.18.1 can report success based on the response header alone.
+  // Remove this guard once the pinned CLI checks the listener's state itself.
+  const needsStateMatch =
+    !stateOverride &&
+    process.platform !== "win32" &&
+    defaultHttpsMode() &&
+    (await probePortless());
+  const readState = needsStateMatch ? readTrustedDefaultState(stateDir) : null;
+  const pid = recordedProxyPid(stateDir, readState);
+  if (readState && !(await matchesDefaultProxy(readState, pid))) {
+    log({
+      event: PreflightEvent.StateMismatch,
+      address: DefaultProxyAddress,
+      port: DefaultProxyPort,
+      expectedStateDir: stateDir,
+      hint: "Stop the proxy with `portless proxy stop` from the Portless installation that started it, then rerun `pnpm dev`.",
+    });
+    return 1;
   }
 
-  const stopStatus = stopOutdatedProxy(found);
+  const stopStatus = stopOutdatedProxy(found, pid);
   if (stopStatus !== 0) return stopStatus;
 
   log({ event: PreflightEvent.Starting, app: found.appDir });
@@ -285,5 +472,5 @@ export function startPortlessProxy() {
 }
 
 if (isWorkspaceCli(import.meta)) {
-  process.exitCode = startPortlessProxy();
+  process.exitCode = await startPortlessProxy();
 }

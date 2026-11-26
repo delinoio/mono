@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
-import { describe, expect, test } from "@rstest/core";
+import { describe, expect, rs, test } from "@rstest/core";
 import {
   BaseImage,
   DeviceState,
@@ -55,22 +55,33 @@ describe("mock sandbox list paging", () => {
 
   test("lists sandboxes created in one millisecond in creation order", async () => {
     const client = createClient(SandboxService, createMockTransport());
-    const created: string[] = [];
-    for (let i = 0; i < 3; i++) {
-      const { sandbox } = await client.createSandbox({
-        organizationId,
-        idempotencyKey: uuidV7(),
-        source: {
-          source: { case: "baseImage", value: BaseImage.LINUX },
-        },
-        resources: { vcpuCount: 1, memoryMib: 512n, diskGib: 5n },
-        idleTtl: { seconds: 3600n },
-        maxTtl: { seconds: 7200n },
-      });
-      created.push(sandbox!.sandboxId);
+    const fixedNow = Date.now();
+    const timestamp = fixedNow.toString(16).padStart(12, "0");
+    const uuidPrefix = `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7`;
+    const dateNow = rs.spyOn(Date, "now").mockReturnValue(fixedNow);
+    try {
+      const created: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const { sandbox } = await client.createSandbox({
+          organizationId,
+          idempotencyKey: uuidV7(),
+          source: {
+            source: { case: "baseImage", value: BaseImage.LINUX },
+          },
+          resources: { vcpuCount: 1, memoryMib: 512n, diskGib: 5n },
+          idleTtl: { seconds: 3600n },
+          maxTtl: { seconds: 7200n },
+        });
+        const id = sandbox!.sandboxId;
+        expect(id.slice(0, uuidPrefix.length)).toBe(uuidPrefix);
+        created.push(id);
+      }
+      expect(new Set(created).size).toBe(3);
+      const { sandboxes } = await client.listSandboxes({ organizationId });
+      expect(sandboxes.map((s) => s.sandboxId).slice(-3)).toEqual(created);
+    } finally {
+      dateNow.mockRestore();
     }
-    const { sandboxes } = await client.listSandboxes({ organizationId });
-    expect(sandboxes.map((s) => s.sandboxId).slice(-3)).toEqual(created);
   });
 
   test("caps the page size at 200", async () => {

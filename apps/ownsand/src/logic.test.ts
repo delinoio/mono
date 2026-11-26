@@ -446,6 +446,15 @@ describe("roles", () => {
     expect(can(Role.MEMBER, Permission.ManageBillingLink)).toBe(false);
   });
 
+  test.each([Role.OWNER, Role.ADMIN])(
+    "an unresolved caller with role %s cannot manage members",
+    (role) => {
+      expect(
+        canManageMember(role, undefined, { userId: "a", role: Role.MEMBER }),
+      ).toBe(false);
+    },
+  );
+
   test("an admin cannot manage the owner or itself", () => {
     expect(
       canManageMember(Role.ADMIN, "me", { userId: "o", role: Role.OWNER }),

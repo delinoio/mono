@@ -9,6 +9,7 @@ import { BillingReason, Role } from "@delino/ownsand-protos/v1/common_pb";
 import { ACCOUNTS_URL } from "../config.ts";
 import { formatTime } from "../format.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
+import { showsFullError } from "./ui.tsx";
 
 /** Why the organization is blocked, in plain words. */
 function reasonText(billing: OrganizationBilling): string {
@@ -29,7 +30,7 @@ function reasonText(billing: OrganizationBilling): string {
 }
 
 const BLOCKED_ACTIONS =
-  "creating sandboxes, snapshots, templates and enrollment tokens, resuming sandboxes and exporting snapshots";
+  "creating sandboxes, snapshots, templates and enrollment tokens, resuming sandboxes, exporting snapshots, and enrolling a device even with an existing enrollment token";
 
 /**
  * The billing banner of every organization page. Every member sees it while
@@ -49,6 +50,7 @@ export function BillingBanner({
   });
   const billing = status.data?.billing;
   if (
+    showsFullError(status) ||
     billing === undefined ||
     (billing.phase !== BillingPhase.BLOCKED &&
       billing.phase !== BillingPhase.SUSPENDED)

@@ -9,12 +9,13 @@
 #
 # The script:
 #   - installs Docker Engine from the Docker apt repository,
-#   - makes Docker rotate container logs (`local` log driver) with
-#     configure-docker-logs.sh, which keeps every other daemon setting,
 #   - creates the `deploy` user that the deploy workflow connects as, with
 #     the given public key as its only SSH key,
-#   - creates /srv/delino (server env files, reverse proxy routes, deployment
-#     state) and the `delino` Docker network,
+#   - creates /srv/delino (server env files, reverse proxy routes and
+#     deployment state) and acquires the proxy lock,
+#   - makes Docker rotate container logs (`local` log driver) with
+#     configure-docker-logs.sh, which keeps every other daemon setting,
+#   - enables Docker and creates the `delino` network,
 #   - brings the Caddy reverse proxy to the running state with
 #     start-caddy.sh: it creates the container, starts a stopped one, or
 #     reloads a running one, and recreates it only when the pinned image
@@ -102,15 +103,6 @@ if [[ "$install_docker" == true ]]; then
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
 fi
 
-log "Rotate container logs"
-# The `local` log driver keeps at most 100 MB per container by default.
-# configure-docker-logs.sh sets only the `log-driver` key and keeps the other
-# daemon settings. It also recovers from an interrupted run by verifying the
-# active driver and restarting Docker if necessary. The helper is resolved
-# from this script, so provisioning works from any current directory.
-"$(dirname "${BASH_SOURCE[0]}")/configure-docker-logs.sh" /etc/docker/daemon.json
-systemctl enable --now docker
-
 log "Create the $deploy_user user"
 if ! id "$deploy_user" > /dev/null 2>&1; then
   useradd --create-home --shell /bin/bash "$deploy_user"
@@ -145,8 +137,18 @@ if ! flock --wait "$proxy_lock_timeout" "$proxy_lock_fd"; then
   exit 1
 fi
 
-# Deployments and rollbacks use the same lock. Keep it through the Caddy
-# helper, which can read every service route while reloading or starting.
+# Restarting Docker can interrupt a deployment or rollback and start Caddy
+# while route files are being changed. Keep the lock from logging setup
+# through the Caddy helper, including its readiness checks.
+log "Rotate container logs"
+# The `local` log driver keeps at most 100 MB per container by default.
+# configure-docker-logs.sh sets only the `log-driver` key and keeps the other
+# daemon settings. It also recovers from an interrupted run by verifying the
+# active driver and restarting Docker if necessary. The helper is resolved
+# from this script, so provisioning works from any current directory.
+"$(dirname "${BASH_SOURCE[0]}")/configure-docker-logs.sh" /etc/docker/daemon.json
+systemctl enable --now docker
+
 install -d -m 0755 -o "$deploy_user" -g "$deploy_user" "$root/caddy" "$root/caddy/sites"
 caddyfile="{
 	email $acme_email
