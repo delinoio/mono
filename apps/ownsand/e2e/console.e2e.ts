@@ -436,35 +436,37 @@ describe("devices", () => {
     await app.open(`/orgs/${ACME}/enrollment-tokens`);
     await screen.getByRole("button", "Create token").tap();
     await screen.getByRole("dialog").getByRole("button", "Create token").tap();
-    await screen.getByRole("button", "Done").tap();
-    await expect(
-      screen.getByRole("dialog", "Your new enrollment token"),
-    ).toBeHidden();
-    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+    const result = screen.getByRole("dialog", "Your new enrollment token");
+    await expect(result).toBeVisible();
+    const prefix = await browser.evaluate(() =>
+      document.querySelector(".secret-value")!.textContent!.slice(0, 8),
+    );
+    expect(prefix).toMatch(/^ose_/);
+    await result.getByRole("button", "Done").tap();
+    await expect(result).toBeHidden();
+    await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
 
-    await screen
-      .getByRole("button", "Revoke enrollment token ose_", { exact: false })
-      .tap();
-    const dialog = screen.getByRole("alertdialog", "Revoke token ose_", {
-      exact: false,
-    });
+    const revoke = screen.getByRole(
+      "button",
+      `Revoke enrollment token ${prefix}`,
+      {
+        exact: true,
+      },
+    );
+    await expect(revoke).toBeVisible();
+    await revoke.tap();
+    const dialog = screen.getByRole("alertdialog", `Revoke token ${prefix}…?`);
     await expect(dialog).toBeVisible();
     await expect(dialog.getByRole("button", "Cancel")).toBeFocused();
-    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
 
     await browser.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
-    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+    await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
 
-    await screen
-      .getByRole("button", "Revoke enrollment token ose_", { exact: false })
-      .tap();
-    await screen
-      .getByRole("alertdialog", "Revoke token ose_", { exact: false })
-      .getByRole("button", "Revoke token")
-      .tap();
+    await revoke.tap();
+    await dialog.getByRole("button", "Revoke token").tap();
     await expect(screen.getByText("The token is revoked.")).toBeVisible();
-    await expect(screen.getByText("Not used", { exact: false })).toBeHidden();
+    await expect(revoke).toBeHidden();
   });
 
   test("moves the focus to the page heading after a confirmed removal", async ({
