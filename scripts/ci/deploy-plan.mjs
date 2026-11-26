@@ -26,6 +26,7 @@ import {
   readWorkspacePackages,
   relativePath,
 } from "./workspace-packages.mjs";
+import { isWorkspaceCli } from "./workspace-node.mjs";
 
 export { readWorkspacePackages };
 
@@ -945,7 +946,7 @@ export function main({
   return result;
 }
 
-if (import.meta.main) {
+if (isWorkspaceCli(import.meta)) {
   try {
     main();
   } catch (error) {

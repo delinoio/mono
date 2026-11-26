@@ -35,6 +35,7 @@ import { Socket } from "node:net";
 import { constants, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isWorkspaceCli } from "../../../scripts/ci/workspace-node.mjs";
 
 const ForwardedSignal = Object.freeze({
   Interrupt: "SIGINT",
@@ -235,9 +236,10 @@ async function main() {
   }
 }
 
-if (import.meta.main && process.argv[2] === SuperviseFlag) {
+const isMain = isWorkspaceCli(import.meta);
+if (isMain && process.argv[2] === SuperviseFlag) {
   supervise(process.argv[3], process.argv.slice(4));
-} else if (import.meta.main) {
+} else if (isMain) {
   const handlers = installSignalHandlers();
   try {
     process.exitCode = await main();
