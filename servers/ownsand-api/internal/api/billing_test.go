@@ -540,6 +540,84 @@ func TestBillingUnlinkedOrganization(t *testing.T) {
 	}
 }
 
+func TestBillingConditionalUnlink(t *testing.T) {
+	env, fake := billingEnv(t)
+	ctx := t.Context()
+	org := linkedOrg(t, env, fake, "owner", billingAccountA)
+	status := func(client *testenv.Clients) *ownsandv1.GetBillingStatusResponse {
+		t.Helper()
+		resp, err := client.Billing.GetBillingStatus(ctx, connect.NewRequest(&ownsandv1.GetBillingStatusRequest{OrganizationId: org.ID}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.Msg
+	}
+	unlink := func(expected *string) (*connect.Response[ownsandv1.UnlinkBillingAccountResponse], error) {
+		return org.OwnerClient.Billing.UnlinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.UnlinkBillingAccountRequest{
+			OrganizationId: org.ID, ExpectedBillingAccountId: expected,
+		}))
+	}
+
+	expectedA := status(org.OwnerClient).GetBillingAccountId()
+	if expectedA != billingAccountA {
+		t.Fatalf("owner status account = %q, want %q", expectedA, billingAccountA)
+	}
+	for _, client := range []*testenv.Clients{env.User(org.Admin), env.User(org.Member), env.Clients(org.APIKey)} {
+		if got := status(client); !got.GetBilling().GetLinked() || got.BillingAccountId != nil {
+			t.Fatalf("non-owner status = %v", got)
+		}
+	}
+	if _, err := unlink(nil); err != nil {
+		t.Fatalf("legacy unlink: %v", err)
+	}
+	calls := fake.Calls(accountstest.MethodUnlinkOrganization)
+	if _, err := unlink(&expectedA); testenv.Code(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("conditional unlink with no local link: %v", err)
+	}
+	if got := fake.Calls(accountstest.MethodUnlinkOrganization); got != calls {
+		t.Fatalf("unlink without a local link dispatched to Accounts: %d calls, want %d", got, calls)
+	}
+
+	fake.AddAccount(billingAccountB, "Replacement", map[string]accountsv1.BillingAccountRole{
+		org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER,
+	})
+	if _, err := org.OwnerClient.Billing.LinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{
+		OrganizationId: org.ID, BillingAccountId: billingAccountB,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	calls = fake.Calls(accountstest.MethodUnlinkOrganization)
+	for _, expected := range []string{expectedA, ""} {
+		if _, err := unlink(&expected); testenv.Code(err) != connect.CodeFailedPrecondition {
+			t.Fatalf("conditional unlink with expected account %q: %v", expected, err)
+		}
+	}
+	if got := fake.Calls(accountstest.MethodUnlinkOrganization); got != calls {
+		t.Fatalf("stale unlink dispatched to Accounts: %d calls, want %d", got, calls)
+	}
+	if got, _, ok := fake.Link(org.ID); !ok || got != billingAccountB {
+		t.Fatalf("Accounts link = %q, linked = %v", got, ok)
+	}
+	replacement := status(org.OwnerClient)
+	if replacement.GetBillingAccountId() != billingAccountB || replacement.GetBilling().GetPhase() != billing.PhaseAllowed {
+		t.Fatalf("replacement status = %v", replacement)
+	}
+
+	resp, err := unlink(replacement.BillingAccountId)
+	if err != nil {
+		t.Fatalf("conditional unlink of replacement: %v", err)
+	}
+	if got := resp.Msg.GetBilling(); got.GetLinked() || got.GetReason() != ownsandv1.BillingReason_BILLING_REASON_ACCOUNT_REQUIRED {
+		t.Fatalf("status after unlink = %v", got)
+	}
+	if _, _, ok := fake.Link(org.ID); ok {
+		t.Fatal("Accounts still has the link after the confirmed unlink")
+	}
+	if got := status(org.OwnerClient); got.GetBilling().GetLinked() || got.BillingAccountId != nil {
+		t.Fatalf("owner status after unlink = %v", got)
+	}
+}
+
 // TestBillingFailOpen checks that a linked organization whose cached status
 // is more than 1 hour old is allowed by the RPC gates, with a warning, and
 // that the fail open never resumes a billing-paused sandbox.

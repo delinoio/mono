@@ -565,11 +565,24 @@ describe("billing", () => {
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${ACME}/settings`);
 
+    await expect(screen.getByRole("region", "Billing")).toContainText(
+      "Acme Robotics billing",
+    );
     await screen.getByRole("button", "Unlink billing account").tap();
     const confirm = screen.getByRole("alertdialog");
+    await expect(
+      confirm.getByRole("heading", "Unlink Acme Robotics billing?"),
+    ).toBeVisible();
     await expect(confirm).toContainText("becomes blocked at once");
     await confirm.getByRole("button", "Unlink billing account").tap();
     await expect(confirm).toBeHidden();
+    expect(
+      await browser.evaluate(() =>
+        JSON.parse(
+          sessionStorage.getItem("ownsand-e2e-billing-unlink-requests") ?? "[]",
+        ),
+      ),
+    ).toEqual([acmeBillingId]);
     await expect(
       screen.getByRole("region", "This organization is blocked"),
     ).toBeVisible();
