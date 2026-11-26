@@ -756,6 +756,40 @@ describe("billing", () => {
     ).toBeHidden();
   });
 
+  test("shows the sorted first page of linkable billing accounts", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await browser.evaluate(() => {
+      sessionStorage.setItem(
+        "ownsand-e2e-paged-list",
+        "ListLinkableBillingAccounts",
+      );
+      return null;
+    });
+    await app.open(`/orgs/${ACME}/settings`);
+    const dialog = await openBillingLinkDialog(screen);
+    await expect(dialog.getByRole("radio").first()).toBeVisible();
+    await app.screenshot("linkable-billing-accounts-first-page");
+
+    const names = await browser.evaluate(() => {
+      return Array.from(
+        document.querySelectorAll('[role="dialog"] [role="radio"]'),
+        (radio) => radio.closest("label")?.textContent?.trim() ?? null,
+      );
+    });
+    expect(names).toHaveLength(200);
+    expect(names).toEqual(
+      Array.from(
+        { length: 200 },
+        (_, i) => `Billing fixture ${String(i + 1).padStart(3, "0")} · Owner`,
+      ),
+    );
+  });
+
   test("unlinks after a confirmation and links again", async ({
     app,
     screen,

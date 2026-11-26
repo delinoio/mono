@@ -137,8 +137,9 @@ function commitFixture(repo, env, message) {
 // Creates a committed repository with the real script, the bindings that the
 // fake go generates, a fake protoc-gen-es per TypeScript target and the fake
 // go in a bin directory. `scratch` is the TMPDIR of every script run.
-function fixture(scratchName) {
+function fixture(t, scratchName) {
   const dir = mkdtempSync(join(tmpdir(), "protos-scratch-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
   const repo = join(dir, "repo");
   const bin = join(dir, "bin");
   const scratch = join(dir, scratchName);
@@ -170,8 +171,8 @@ function fixture(scratchName) {
   return { dir, repo, scratch, env, baseSha };
 }
 
-function breakingFixture(scratchName) {
-  const f = fixture(scratchName);
+function breakingFixture(t, scratchName) {
+  const f = fixture(t, scratchName);
   f.env.FAKE_GO_BASE_SCHEMA = join(f.dir, "expected-base.proto");
   write(f.env.FAKE_GO_BASE_SCHEMA, baseSchema);
   write(join(f.repo, "protos", schemaPath), headSchema);
@@ -204,8 +205,7 @@ for (const scratchName of scratchNames) {
     `generate removes its scratch directory on success (${label})`,
     { skip },
     (t) => {
-      const f = fixture(scratchName);
-      t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+      const f = fixture(t, scratchName);
       assertRun(f, ["generate"], {}, { status: 0, stderr: /^$/ });
     },
   );
@@ -214,8 +214,7 @@ for (const scratchName of scratchNames) {
     `generate removes its scratch directory and keeps the exit status on failure (${label})`,
     { skip },
     (t) => {
-      const f = fixture(scratchName);
-      t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+      const f = fixture(t, scratchName);
       assertRun(
         f,
         ["generate"],
@@ -229,8 +228,7 @@ for (const scratchName of scratchNames) {
     `check removes its scratch directory on success (${label})`,
     { skip },
     (t) => {
-      const f = fixture(scratchName);
-      t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+      const f = fixture(t, scratchName);
       assertRun(f, ["check"], {}, { status: 0, stderr: /^$/ });
     },
   );
@@ -239,8 +237,7 @@ for (const scratchName of scratchNames) {
     `check removes its scratch directory and keeps the exit status when generation fails (${label})`,
     { skip },
     (t) => {
-      const f = fixture(scratchName);
-      t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+      const f = fixture(t, scratchName);
       assertRun(
         f,
         ["check"],
@@ -254,8 +251,7 @@ for (const scratchName of scratchNames) {
     `check removes its scratch directory and keeps the exit status on binding drift (${label})`,
     { skip },
     (t) => {
-      const f = fixture(scratchName);
-      t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+      const f = fixture(t, scratchName);
       write(
         join(f.repo, "protos", "delino", "ownsand", "v1", "gen.pb.go"),
         "drifted\n",
@@ -276,8 +272,7 @@ for (const scratchName of scratchNames) {
     `breaking removes its scratch directory on success (${label})`,
     { skip },
     (t) => {
-      const f = breakingFixture(scratchName);
-      t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+      const f = breakingFixture(t, scratchName);
       assertRun(f, ["breaking", f.baseSha], {}, { status: 0, stderr: /^$/ });
     },
   );
@@ -286,8 +281,7 @@ for (const scratchName of scratchNames) {
     `breaking removes its scratch directory and keeps the exit status on failure (${label})`,
     { skip },
     (t) => {
-      const f = breakingFixture(scratchName);
-      t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+      const f = breakingFixture(t, scratchName);
       assertRun(
         f,
         ["breaking", f.baseSha],

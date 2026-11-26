@@ -39,15 +39,18 @@ SELECT * FROM app_user WHERE created_at >= '2023-01-01' AND created_at < '2023-0
 
 ## N+1 Detection
 
-**Queries inside loops → batch with ANY/IN:**
+**Batch queries with `ANY` in Psycopg 3**
+
+With the default cursor, pass a Python list as the single query parameter.
+Psycopg binds the list as a PostgreSQL array. An empty list matches no rows.
+
 ```python
-# Bad
+# Bad: one query per ID
 for uid in user_ids:
     cursor.execute("SELECT name FROM app_user WHERE id = %s", (uid,))
-# Good (Postgres specific)
+
+# Good: one query for all IDs
 cursor.execute("SELECT id, name FROM app_user WHERE id = ANY(%s)", (list(user_ids),))
-# Good (Standard SQL)
-# cursor.execute("SELECT id, name FROM app_user WHERE id IN %s", (tuple(user_ids),))
 ```
 
 **ORM lazy loading → eager loading:**
