@@ -99,10 +99,15 @@ function write(path, content, mode) {
   if (mode) chmodSync(path, mode);
 }
 
-// Every stub appends `<command> <arguments...>` to $STUB_LOG.
+// Every stub writes a text log for diagnostics. These three stubs also record
+// a command name, argument count and arguments as NUL-delimited fields.
+const logArgv = (command) =>
+  `printf '%s\\0' "${command}" "$#" "$@" >> "$STUB_ARGV_LOG"`;
+
 const stubs = {
   go: `#!/usr/bin/env bash
 set -euo pipefail
+${logArgv("go")}
 echo "go $* CGO_ENABLED=\${CGO_ENABLED:-} GOOS=\${GOOS:-} GOARCH=\${GOARCH:-}" >> "$STUB_LOG"
 case "$1" in
   env)
@@ -132,6 +137,7 @@ esac
 `,
   gh: `#!/usr/bin/env bash
 set -euo pipefail
+${logArgv("gh")}
 echo "gh $*" >> "$STUB_LOG"
 if [[ "$1" == api ]]; then
   file="$STUB_DIR/gh-api/\${2//\\//_}.json"
@@ -282,6 +288,7 @@ echo 0123456789abcdef
 `,
   "release-manifest": `#!/usr/bin/env bash
 set -euo pipefail
+${logArgv("release-manifest")}
 echo "release-manifest $*" >> "$STUB_LOG"
 case "$1" in
   check-keys) [[ -z "\${STUB_NO_KEYS:-}" ]] || { echo "no built-in key" >&2; exit 1; } ;;
@@ -296,6 +303,34 @@ case "$1" in
 esac
 `,
 };
+
+function readInvocations(log) {
+  const fields = log.split("\0");
+  assert.equal(fields.pop(), "", "argument log must end at a field boundary");
+  const invocations = [];
+  for (let i = 0; i < fields.length;) {
+    const command = fields[i];
+    const count = Number(fields[i + 1]);
+    const end = i + 2 + count;
+    assert.ok(
+      Number.isInteger(count) && count >= 0 && end <= fields.length,
+      "invalid argument count in stub log",
+    );
+    invocations.push({ command, args: fields.slice(i + 2, end) });
+    i = end;
+  }
+  return invocations;
+}
+
+function loggedArgs(result, command, ...prefix) {
+  return result.invocations
+    .filter(
+      (call) =>
+        call.command === command &&
+        prefix.every((arg, i) => call.args[i] === arg),
+    )
+    .map((call) => call.args);
+}
 
 function fixture(t, { parent = tmpdir(), bash = "bash" } = {}) {
   const dir = mkdtempSync(join(parent, "release-binaries-"));
@@ -316,6 +351,8 @@ function fixture(t, { parent = tmpdir(), bash = "bash" } = {}) {
   );
   const log = join(dir, "log");
   writeFileSync(log, "");
+  const argvLog = join(dir, "argv-log");
+  writeFileSync(argvLog, "");
   const summary = join(dir, "summary");
   writeFileSync(summary, "");
   const githubEnv = join(dir, "github-env");
@@ -336,6 +373,7 @@ function fixture(t, { parent = tmpdir(), bash = "bash" } = {}) {
         HOME: dir,
         STUB_DIR: dir,
         STUB_LOG: log,
+        STUB_ARGV_LOG: argvLog,
         STUB_ENTITLEMENT_PLIST: enabledEntitlementPlist,
         STUB_ENTITLEMENT_JSON: JSON.stringify({
           [virtualizationEntitlement]: true,
@@ -357,6 +395,7 @@ function fixture(t, { parent = tmpdir(), bash = "bash" } = {}) {
     return {
       ...result,
       log: readFileSync(log, "utf8"),
+      invocations: readInvocations(readFileSync(argvLog, "utf8")),
       summary: readFileSync(summary, "utf8"),
     };
   };
@@ -379,6 +418,54 @@ const appleEnv = {
   APPLE_NOTARY_API_ISSUER_ID: "issuer",
 };
 
+test("the stub argument log preserves argument boundaries", { skip }, (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "release-argv-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const argvLog = join(dir, "argv-log");
+  const path = join(dir, "release+ with spaces", "out/tools/release-manifest");
+  const args = [
+    ["build", "-o", path, ""],
+    ["build", "-o", ...path.split(" "), ""],
+    ["release", "create", "SHA256SUMS", "ownsand-agent-linux-amd64"],
+    ["release", "create", "SHA256SUMS ownsand-agent-linux-amd64"],
+  ];
+  for (const call of args) {
+    const result = spawnSync("bash", ["-c", logArgv("stub"), "stub", ...call], {
+      encoding: "utf8",
+      env: { ...process.env, STUB_ARGV_LOG: argvLog },
+    });
+    assert.equal(result.status, 0, result.stderr);
+  }
+  assert.deepEqual(
+    readInvocations(readFileSync(argvLog, "utf8")),
+    args.map((call) => ({ command: "stub", args: call })),
+  );
+});
+
+function assertManifestToolBuild(result, out) {
+  const pkg = "./cmds/ownsand-agent/release-manifest";
+  const expected = [
+    "build",
+    "-trimpath",
+    "-buildvcs=false",
+    "-o",
+    join(out, "tools/release-manifest"),
+    pkg,
+  ];
+  const builds = loggedArgs(result, "go", "build").filter(
+    (args) => args.at(-1) === pkg,
+  );
+  assert.deepEqual(builds, [expected]);
+  assert.ok(
+    result.log
+      .split("\n")
+      .some((line) =>
+        line.startsWith(`go ${expected.join(" ")} CGO_ENABLED=0 `),
+      ),
+    result.log,
+  );
+}
+
 test(
   "build cross builds every platform without cgo and writes the notices",
   { skip },
@@ -391,13 +478,7 @@ test(
       RELEASE_MANIFEST_TOOL: "",
     });
     assert.equal(result.status, 0, result.stderr);
-    assert.match(
-      result.log,
-      new RegExp(
-        `^go build -trimpath -buildvcs=false -o ${out}/tools/release-manifest \\./cmds/ownsand-agent/release-manifest CGO_ENABLED=0 `,
-        "m",
-      ),
-    );
+    assertManifestToolBuild(result, out);
     // The agent has an update manifest, so the build checks the built-in keys.
     assert.match(result.log, /^release-manifest check-keys$/m);
     assert.ok(
@@ -488,15 +569,12 @@ test(
   { skip },
   (t) => {
     const f = fixture(t);
-    const result = f.run(
-      ["build", "cross", join(f.dir, "out")],
-      { STUB_NO_KEYS: "1" },
-      [cli],
-    );
+    const out = join(f.dir, "out");
+    const result = f.run(["build", "cross", out], { STUB_NO_KEYS: "1" }, [cli]);
     assert.equal(result.status, 0, result.stderr);
     assert.doesNotMatch(result.log, /check-keys/);
     // The publish job downloads the tool for every binary release.
-    assert.match(result.log, /go build .*-o \S+\/tools\/release-manifest /);
+    assertManifestToolBuild(result, out);
   },
 );
 
@@ -1400,11 +1478,28 @@ test(
     const f = fixture(t);
     tagApi(f, "ownsand-agent@0.1.0");
     tagApi(f, "ownsand-cli@0.0.1");
-    const result = f.run(["github-releases", assembled(f), prepared(f)]);
+    const assets = assembled(f);
+    const result = f.run(["github-releases", assets, prepared(f)]);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(
-      result.log,
-      /gh release create ownsand-agent@0\.1\.0 --repo owner\/repo --verify-tag --title ownsand-agent@0\.1\.0 --notes .*CHANGELOG\.md.* --latest=false \S+\/SHA256SUMS \S+\/ownsand-agent-linux-amd64$/m,
+    assert.deepEqual(
+      loggedArgs(result, "gh", "release", "create", "ownsand-agent@0.1.0"),
+      [
+        [
+          "release",
+          "create",
+          "ownsand-agent@0.1.0",
+          "--repo",
+          "owner/repo",
+          "--verify-tag",
+          "--title",
+          "ownsand-agent@0.1.0",
+          "--notes",
+          `Release of \`ownsand-agent\` 0.1.0 from ${sha}. See [the changelog](https://github.com/owner/repo/blob/ownsand-agent%400.1.0/cmds/ownsand-agent/CHANGELOG.md). Verify the downloads with \`SHA256SUMS\`.`,
+          "--latest=false",
+          join(assets, "ownsand-agent/SHA256SUMS"),
+          join(assets, "ownsand-agent/ownsand-agent-linux-amd64"),
+        ],
+      ],
     );
     assert.match(result.log, /gh release create ownsand-cli@0\.0\.1 /);
     assert.match(result.summary, /ownsand-agent%400\.1\.0\): 2 assets/);
@@ -1746,22 +1841,39 @@ test(
     const f = fixture(t);
     const dir = join(f.dir, "manifests");
     const assets = join(f.dir, "assets");
+    const expected = [
+      "add-release",
+      "--version",
+      "0.1.0",
+      "--binary",
+      "ownsand-agent",
+      "--platforms",
+      "linux-amd64,darwin-arm64,windows-arm64",
+      "--artifacts",
+      join(assets, "ownsand-agent"),
+      "--url-prefix",
+      "https://github.com/owner/repo/releases/download/ownsand-agent%400.1.0",
+      "--out",
+      join(dir, "ownsand-agent/manifest.json"),
+    ];
     let result = f.run(["prepare-manifests", dir, assets]);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(
-      result.log,
-      new RegExp(
-        `release-manifest add-release --version 0\\.1\\.0 --binary ownsand-agent --platforms linux-amd64,darwin-arm64,windows-arm64 --artifacts ${assets}/ownsand-agent --url-prefix https://github\\.com/owner/repo/releases/download/ownsand-agent%400\\.1\\.0 --out ${dir}/ownsand-agent/manifest\\.json$`,
-        "m",
-      ),
-    );
+    assert.deepEqual(loggedArgs(result, "release-manifest", "add-release"), [
+      expected,
+    ]);
     write(join(dir, "ownsand-agent/current.json"), "{}\n");
     result = f.run(["prepare-manifests", dir, assets]);
-    assert.match(
-      result.log,
-      /--current \S+\/current\.json --current-signature \S+\/current\.json\.sig$/m,
-    );
-    assert.equal(result.log.match(/add-release/g).length, 2);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(loggedArgs(result, "release-manifest", "add-release"), [
+      expected,
+      [
+        ...expected,
+        "--current",
+        join(dir, "ownsand-agent/current.json"),
+        "--current-signature",
+        join(dir, "ownsand-agent/current.json.sig"),
+      ],
+    ]);
   },
 );
 
@@ -1828,10 +1940,15 @@ test(
       readFileSync(join(dir, "ownsand-agent/manifest.json.sig"), "utf8"),
       "signature\n",
     );
-    assert.match(
-      result.log,
-      /release-manifest verify --manifest \S+ --signature \S+manifest\.json\.sig/,
-    );
+    assert.deepEqual(loggedArgs(result, "release-manifest", "verify"), [
+      [
+        "verify",
+        "--manifest",
+        join(dir, "ownsand-agent/manifest.json"),
+        "--signature",
+        join(dir, "ownsand-agent/manifest.json.sig"),
+      ],
+    ]);
   },
 );
 
