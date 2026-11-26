@@ -36,6 +36,11 @@ const guard = join(root, "scripts/ci/check-pending-changesets.sh");
 const release = join(root, "scripts/ci/deploy-release.sh");
 const recovery = join(root, "scripts/ci/release-recovery.sh");
 const baseEnv = isolateGitEnvironment({ ...process.env });
+const targetsEnv = { ...baseEnv };
+delete targetsEnv.BUILD_VARIABLES;
+delete targetsEnv.SITES_ROOT;
+const dropletEnv = { ...baseEnv };
+delete dropletEnv.DROPLET_STOP_TIMEOUT;
 const provider = join(root, "scripts/ci/deploy-provider.sh");
 // The scripts need Bash 4.4 or newer (`mapfile`, empty arrays under `set -u`);
 // macOS ships Bash 3.2.
@@ -1903,7 +1908,7 @@ function runTargets(
     cwd: dir,
     encoding: "utf8",
     env: {
-      ...baseEnv,
+      ...targetsEnv,
       PATH: `${bin}${delimiter}${baseEnv.PATH}`,
       GITHUB_STEP_SUMMARY: summary,
       STUB_DIR: dir,
@@ -2200,7 +2205,7 @@ test(
       cwd: dir,
       encoding: "utf8",
       env: {
-        ...baseEnv,
+        ...targetsEnv,
         SITES: JSON.stringify([
           {
             name: "docs",
@@ -2382,6 +2387,7 @@ const httpArgs = [
 ];
 
 const accountsArgs = ["accounts-api", ...httpArgs.slice(1)];
+const sandrunArgs = ["sandrun-api", ...httpArgs.slice(1)];
 
 // Runs droplet-deploy.sh the way deploy-targets.sh does (`bash -s` with the
 // script on standard input) against stubbed `docker` and `curl`. `old` lists
@@ -2395,8 +2401,9 @@ const accountsArgs = ["accounts-api", ...httpArgs.slice(1)];
 //   STUB_LOGS     exit code of `docker logs` (default 0).
 //   STUB_STOP_FAIL  space-separated container name or ID patterns that
 //                   `docker stop` fails for.
-//   STUB_RM_FAIL    space-separated container IDs that `docker rm` fails for
-//                 (`docker rm --force` of a replacement still succeeds).
+//   STUB_RM_FAIL    space-separated container IDs that plain `docker rm` fails for.
+//   STUB_FORCE_RM_FAIL glob for the replacement name that `docker rm --force`
+//                      fails for.
 //   STUB_START_FAIL glob of the container names that `docker start` fails for.
 //   STUB_OLD_IMAGES space-separated `<container ID>=<image>` pairs: the image
 //                 that `docker inspect --format {{.Config.Image}}` prints for
@@ -2500,8 +2507,21 @@ case "$1" in
     done ;;
   start) [[ -z "\${STUB_START_FAIL:-}" || "\$2" != \$STUB_START_FAIL ]] || exit 1 ;;
   image) [[ "\$2" != rm || " \${STUB_IMAGE_RM_FAIL:-} " != *" \$3 "* ]] || exit 1 ;;
-  rm) [[ "\$2" == --force || " \${STUB_RM_FAIL:-} " != *" \$2 "* ]] || exit 1 ;;
-  logs) echo "server log line"; exit "\${STUB_LOGS:-0}" ;;
+  rm)
+    if [[ "$2" == --force ]]; then
+      if [[ -n "\${STUB_FORCE_RM_FAIL:-}" && "$3" == $STUB_FORCE_RM_FAIL ]]; then
+        echo "docker: forced removal failed for $3" >&2
+        exit 1
+      fi
+    else
+      [[ " \${STUB_RM_FAIL:-} " != *" $2 "* ]] || exit 1
+    fi ;;
+  logs)
+    echo "server log line"
+    if [[ "\${STUB_LOGS:-0}" != 0 ]]; then
+      echo "docker: log read failed for $4" >&2
+      exit "$STUB_LOGS"
+    fi ;;
 esac`,
   );
   shellStub(
@@ -2523,7 +2543,7 @@ esac`,
   const calls = () =>
     readFileSync(join(dir, "calls.log"), "utf8").trim().split("\n");
   const spawnEnv = (env = {}) => ({
-    ...baseEnv,
+    ...dropletEnv,
     PATH: `${bin}${delimiter}${baseEnv.PATH}`,
     STUB_DIR: dir,
     DROPLET_ROOT: deployRoot,
@@ -2605,10 +2625,7 @@ test(
       result.calls.find((call) => call.startsWith("docker exec")),
       /^docker exec caddy caddy reload --config \/etc\/caddy\/Caddyfile --adapter caddyfile$/,
     );
-    assert.match(
-      result.calls.find((call) => call.startsWith("docker stop")),
-      / old1$/,
-    );
+    assert.ok(result.calls.includes("docker stop --time 30 old1"));
     const route = result.read("caddy/sites/api.caddy");
     assert.match(route, /^api\.example\.com \{$/m);
     assert.equal(route.includes(`reverse_proxy ${alias}:8080 {`), true, route);
@@ -2798,6 +2815,138 @@ test(
       ),
     );
     assert.ok(!result.calls.some((call) => call.startsWith("docker rm ")));
+  },
+);
+
+test(
+  "droplet deploy publishes the SandRun route and image state before stopping the outgoing container",
+  { skip: skipDroplet },
+  (t) => {
+    for (const [image, current, env, timeout] of [
+      [dropletImage, olderImage, {}, 80],
+      [olderImage, dropletImage, {}, 80],
+      [olderImage, dropletImage, { DROPLET_STOP_TIMEOUT: "00090" }, 90],
+    ]) {
+      const result = runDroplet(
+        t,
+        [sandrunArgs[0], image, ...httpArgs.slice(2)],
+        {
+          old: ["old1"],
+          state: `${current}\n`,
+          previous: `${image}\n`,
+          env,
+          stubs: { mv: 'exec /bin/mv "$@"' },
+        },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      const reload = result.calls.findIndex((call) =>
+        call.startsWith("docker exec caddy "),
+      );
+      const writePrevious = result.calls.findIndex(
+        (call) =>
+          call.startsWith("mv ") &&
+          call.endsWith("/state/sandrun-api.previous"),
+      );
+      const writeCurrent = result.calls.findIndex(
+        (call) =>
+          call.startsWith("mv ") && call.endsWith("/state/sandrun-api.current"),
+      );
+      const stop = result.calls.indexOf(`docker stop --time ${timeout} old1`);
+      assert.ok(
+        reload >= 0 &&
+          reload < writePrevious &&
+          writePrevious < writeCurrent &&
+          writeCurrent < stop,
+        result.calls.join("\n"),
+      );
+      assert.equal(result.read("state/sandrun-api.current"), `${image}\n`);
+      assert.equal(result.read("state/sandrun-api.previous"), `${current}\n`);
+    }
+  },
+);
+
+test(
+  "droplet deploy rejects invalid SandRun stop timeouts before any change",
+  { skip: skipDroplet },
+  (t) => {
+    const route = "# old route\n";
+    for (const timeout of ["", "79", "80s", "9223372037"]) {
+      const result = runDroplet(t, sandrunArgs, {
+        old: ["old1"],
+        route,
+        state: `${olderImage}\n`,
+        previous: `${oldestImage}\n`,
+        env: { DROPLET_STOP_TIMEOUT: timeout },
+      });
+      assert.equal(result.status, 1, JSON.stringify(timeout));
+      assert.match(
+        result.stderr,
+        /DROPLET_STOP_TIMEOUT for sandrun-api must be a whole number of seconds from 80 to 9223372036/,
+      );
+      assert.deepEqual(result.calls, [""]);
+      assert.equal(result.read("state/sandrun-api.lock"), undefined);
+      assert.equal(result.read("state/.proxy.lock"), undefined);
+      assert.equal(result.read("caddy/sites/sandrun-api.caddy"), route);
+      assert.equal(result.read("state/sandrun-api.current"), `${olderImage}\n`);
+      assert.equal(
+        result.read("state/sandrun-api.previous"),
+        `${oldestImage}\n`,
+      );
+    }
+  },
+);
+
+test(
+  "droplet deploy stops failed SandRun replacements and preserves the serving route and state",
+  { skip: skipDroplet },
+  (t) => {
+    const route = "# old route\n";
+    for (const [env, timeout, diagnostic] of [
+      [{ STUB_HEALTHY: "0" }, 80, /did not pass the health check/],
+      [{ STUB_RELOAD: "1" }, 80, /the route of sandrun-api was not switched/],
+      [
+        { STUB_RELOAD: "1", DROPLET_STOP_TIMEOUT: "0009223372036" },
+        9223372036,
+        /the route of sandrun-api was not switched/,
+      ],
+      [
+        { STUB_RELOAD: "1", STUB_STOP_FAIL: "sandrun-api-*" },
+        80,
+        /the route of sandrun-api was not switched/,
+      ],
+    ]) {
+      const result = runDroplet(t, sandrunArgs, {
+        route,
+        old: ["old1"],
+        state: `${olderImage}\n`,
+        previous: `${oldestImage}\n`,
+        env,
+      });
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, diagnostic);
+      const run = result.calls.find((call) => call.startsWith("docker run "));
+      const replacement = run.match(/--name (sandrun-api-\S+)/)[1];
+      const stop = `docker stop --time ${timeout} ${replacement}`;
+      const cleanup = result.calls.filter(
+        (call) =>
+          call.startsWith("docker stop ") || call.startsWith("docker rm "),
+      );
+      if (env.STUB_STOP_FAIL) {
+        assert.deepEqual(cleanup, [stop]);
+        assert.match(
+          result.stderr,
+          /docker stop failed for the replacement sandrun-api-.*; it was not removed/,
+        );
+      } else {
+        assert.deepEqual(cleanup, [stop, `docker rm ${replacement}`]);
+      }
+      assert.equal(result.read("caddy/sites/sandrun-api.caddy"), route);
+      assert.equal(result.read("state/sandrun-api.current"), `${olderImage}\n`);
+      assert.equal(
+        result.read("state/sandrun-api.previous"),
+        `${oldestImage}\n`,
+      );
+    }
   },
 );
 
@@ -3683,7 +3832,7 @@ test(
 );
 
 test(
-  "droplet deploy removes the replacement and keeps everything else when docker run fails",
+  "droplet deploy preserves the start failure and serving state when replacement cleanup fails",
   { skip: skipDroplet },
   (t) => {
     const route = "# old route\n";
@@ -3694,14 +3843,14 @@ test(
       previous: `${oldestImage}\n`,
     };
     for (const [label, env] of [
-      ["run fails", { STUB_RUN_EXIT: "125" }],
-      // A failed log read or removal must not hide the start failure.
-      [
-        "cleanup fails",
-        { STUB_RUN_EXIT: "125", STUB_LOGS: "1", STUB_RM_FAIL: "old1" },
-      ],
+      ["cleanup succeeds", {}],
+      ["log read fails", { STUB_LOGS: "1" }],
+      ["forced removal fails", { STUB_FORCE_RM_FAIL: "api-*" }],
     ]) {
-      const result = runDroplet(t, undefined, { ...options, env });
+      const result = runDroplet(t, undefined, {
+        ...options,
+        env: { STUB_RUN_EXIT: "125", ...env },
+      });
       assert.equal(result.status, 1, `${label}: ${result.stderr}`);
       assert.match(
         result.stderr,
@@ -3722,7 +3871,36 @@ test(
         ],
         label,
       );
-      assert.match(result.calls.at(-1), /^docker rm --force api-/, label);
+      const replacement = result.calls[3].match(/--name (api-\S+)/)[1];
+      assert.equal(
+        result.calls[4],
+        `docker logs --tail 200 ${replacement}`,
+        label,
+      );
+      assert.equal(result.calls[5], `docker rm --force ${replacement}`, label);
+      assert.match(result.stdout, /server log line/, label);
+      if (env.STUB_LOGS) {
+        assert.ok(
+          result.stdout.includes(`docker: log read failed for ${replacement}`),
+          label,
+        );
+      } else {
+        assert.doesNotMatch(result.stdout, /docker: log read failed/, label);
+      }
+      if (env.STUB_FORCE_RM_FAIL) {
+        assert.ok(
+          result.stderr.includes(
+            `docker: forced removal failed for ${replacement}`,
+          ),
+          label,
+        );
+      } else {
+        assert.doesNotMatch(
+          result.stderr,
+          /docker: forced removal failed/,
+          label,
+        );
+      }
       assert.equal(result.read("caddy/sites/api.caddy"), route, label);
       assert.equal(result.read("state/api.current"), `${olderImage}\n`, label);
       assert.equal(

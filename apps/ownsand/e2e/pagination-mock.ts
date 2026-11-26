@@ -16,12 +16,16 @@ import {
   type ListInvitationsResponse,
   type RevokeInvitationRequest,
 } from "@delino/ownsand-protos/v1/member_pb";
-import { SnapshotExportState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  SandboxState,
+  SnapshotExportState,
+} from "@delino/ownsand-protos/v1/common_pb";
 import type { CreateOrganizationResponse } from "@delino/ownsand-protos/v1/organization_pb";
 import {
   CreateSandboxRequestSchema,
   type CreateSandboxRequest,
   type CreateSandboxResponse,
+  type ListSandboxesResponse,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import type {
   ListSnapshotsResponse,
@@ -581,6 +585,13 @@ export function createMockTransport(): Transport {
         { ...request, pageToken: "" },
         contextValues,
       );
+      if (
+        methodName === "ListSandboxes" &&
+        sessionStorage.getItem("ownsand-e2e-sandbox-creating") === "true"
+      ) {
+        const { sandboxes } = response.message as ListSandboxesResponse;
+        sandboxes[0]!.state = SandboxState.CREATING;
+      }
       const rows = (response.message as unknown as Record<string, unknown[]>)[
         field
       ]!;

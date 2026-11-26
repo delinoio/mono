@@ -53,6 +53,7 @@ import {
 import { useDevices } from "../devices.ts";
 import { deviceOptionLabel, formatMib, formatTime, labels } from "../format.ts";
 import { parseLabels, resourceErrors, ttlErrors } from "../forms.ts";
+import { lastRequestFailedOnLaterPage } from "../pagination.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 import { useSnapshots, useTemplates } from "../snapshot-lists.ts";
 import { uuidV7 } from "../uuid.ts";
@@ -115,10 +116,20 @@ export function SandboxesPage() {
   );
   const list = useInfiniteQuery({
     ...listOptions,
-    refetchInterval: (q) =>
-      q.state.data?.pages.some((p) => p.sandboxes.some(sandboxSettling))
+    refetchInterval: (query) => {
+      // A poll only reloads cached pages and would clear the continuation error.
+      if (
+        lastRequestFailedOnLaterPage(query) &&
+        !isTerminalError(query.state.error)
+      ) {
+        return false;
+      }
+      return query.state.data?.pages.some((p) =>
+        p.sandboxes.some(sandboxSettling),
+      )
         ? POLL_INTERVAL_MS
-        : false,
+        : false;
+    },
   });
   const listKey = hashKey(listOptions.queryKey);
   const pendingNextPages = useRef(new Set<string>());

@@ -311,6 +311,24 @@ describe("API keys", () => {
     await expect(screen.getByText("nightly-ci · Active")).toBeVisible();
     await expect(screen.getByRole("button", "Create API key")).toBeFocused();
   });
+
+  test("shows the revoked key and removes its Revoke action", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    const revoke = screen.getByRole("button", /^Revoke API key ci-runner/);
+    await revoke.tap();
+    await screen
+      .getByRole("alertdialog", "Revoke ci-runner?")
+      .getByRole("button", "Revoke key")
+      .tap();
+
+    await expect(screen.getByText("ci-runner · Revoked")).toBeVisible();
+    await expect(revoke).toBeHidden();
+  });
 });
 
 describe("devices", () => {

@@ -71,84 +71,91 @@ buf_generate_ts() {
   PATH="$plugin_bin:$PATH" buf generate --template "$package/buf.gen.yaml" --path "$schemas" --output "$out"
 }
 
-# Generated Go files, relative to protos/, sorted.
-generated_files() {
-  local dir="$1"
-  (cd "$dir" && find . -type f \( -name '*.pb.go' -o -name '*.connect.go' \) | LC_ALL=C sort)
+# List generated paths relative to $1. When $2 names a TypeScript target,
+# restrict the listing to that package and skip its node_modules and dist.
+list_bindings() {
+  local dir="$1" schemas="$2"
+  if [[ -z "$schemas" ]]; then
+    (cd "$dir" && find . -type f \( -name '*.pb.go' -o -name '*.connect.go' \) | LC_ALL=C sort)
+  elif [[ -d "$dir/$schemas" ]]; then
+    (cd "$dir" && find "./$schemas" \( -name node_modules -o -name dist \) -prune -o -type f -name '*_pb.ts' -print | LC_ALL=C sort)
+  fi
 }
 
-# Generated TypeScript files of the schema path $2 under the directory $1,
-# relative to $1, sorted. The package's node_modules and dist are skipped.
-generated_ts_files() {
-  local dir="$1" schemas="$2"
-  if [[ ! -d "$dir/$schemas" ]]; then
-    return 0
+# Generate one target and save both checked lists for replacement or comparison.
+stage_bindings() {
+  local out="$1" target="$2" schemas="${3:-}"
+  mkdir -p "$out"
+  if [[ -z "$schemas" ]]; then
+    buf generate --output "$out"
+  else
+    buf_generate_ts "$schemas" "$out"
   fi
-  (cd "$dir" && find "./$schemas" \( -name node_modules -o -name dist \) -prune -o -type f -name '*_pb.ts' -print | LC_ALL=C sort)
+
+  if ! list_bindings "$protos_dir" "$schemas" > "$out.existing"; then
+    echo "protos: cannot list existing $target" >&2
+    exit 1
+  fi
+  if ! list_bindings "$out" "$schemas" > "$out.staged"; then
+    echo "protos: cannot list staged $target" >&2
+    exit 1
+  fi
+}
+
+require_staged_bindings() {
+  local out="$1" target="$2"
+  if [[ ! -s "$out.staged" ]]; then
+    echo "protos: no staged $target; the committed bindings are unchanged" >&2
+    exit 1
+  fi
+}
+
+replace_bindings() {
+  local out="$1" file
+  while IFS= read -r file; do
+    rm -f -- "$protos_dir/$file"
+  done < "$out.existing"
+  while IFS= read -r file; do
+    mkdir -p "$protos_dir/$(dirname "$file")"
+    cp "$out/$file" "$protos_dir/$file"
+  done < "$out.staged"
 }
 
 generate() {
   buf format --write
-  # Generate every language and target into a temporary directory first. The
-  # committed bindings are replaced only after every generator succeeded, so
-  # a failing generator or a missing TypeScript plugin leaves every committed
-  # binding untouched. buf_generate_ts exits the script on a missing plugin;
-  # the EXIT trap still removes the temporary directory then.
   scratch_dir="$(mktemp -d)"
   local tmp="$scratch_dir"
-  local go_out="$tmp/go"
-  mkdir -p "$go_out"
-  buf generate --output "$go_out"
-  if [[ -z "$(generated_files "$go_out")" ]]; then
-    echo "protos: a generator produced no files; the committed bindings are unchanged" >&2
-    exit 1
-  fi
-  local schemas ts_out="$tmp/ts"
-  mkdir -p "$ts_out"
+  local schemas target
+
+  # Validate every generator and file list before deleting any binding.
+  stage_bindings "$tmp/go" "Go bindings"
+  require_staged_bindings "$tmp/go" "Go bindings"
   for schemas in "${ts_targets[@]}"; do
-    buf_generate_ts "$schemas" "$ts_out"
-    if [[ -z "$(generated_ts_files "$ts_out" "$schemas")" ]]; then
-      echo "protos: a generator produced no files; the committed bindings are unchanged" >&2
-      exit 1
-    fi
+    target="TypeScript bindings in protos/$schemas"
+    stage_bindings "$tmp/$schemas" "$target" "$schemas"
+    require_staged_bindings "$tmp/$schemas" "$target"
   done
 
-  # Replace the committed bindings. Removing the old generated files first
-  # leaves no stale binding behind for a removed schema file.
-  local file
-  (cd "$protos_dir" && find . -type f \( -name '*.pb.go' -o -name '*.connect.go' \) -delete)
-  while IFS= read -r file; do
-    mkdir -p "$protos_dir/$(dirname "$file")"
-    cp "$go_out/$file" "$protos_dir/$file"
-  done < <(generated_files "$go_out")
+  replace_bindings "$tmp/go"
   for schemas in "${ts_targets[@]}"; do
-    while IFS= read -r file; do
-      rm -f "$protos_dir/$file"
-    done < <(generated_ts_files "$protos_dir" "$schemas")
-    while IFS= read -r file; do
-      mkdir -p "$protos_dir/$(dirname "$file")"
-      cp "$ts_out/$file" "$protos_dir/$file"
-    done < <(generated_ts_files "$ts_out" "$schemas")
+    replace_bindings "$tmp/$schemas"
   done
   echo "protos: regenerated Go and TypeScript bindings with buf ${BUF_VERSION}"
 }
 
-# Compares the committed TypeScript bindings of the target $1 (schema path)
-# with a fresh generation in the temporary directory $2.
-check_ts() {
-  local schemas="$1" tmp="$2"
-  buf_generate_ts "$schemas" "$tmp"
-  if ! diff -u <(generated_ts_files "$protos_dir" "$schemas") <(generated_ts_files "$tmp" "$schemas"); then
-    echo "protos: the set of committed TypeScript bindings in protos/$schemas differs from the generated output; run scripts/protos.sh generate" >&2
+check_bindings() {
+  local out="$1" target="$2"
+  if ! diff -u "$out.existing" "$out.staged"; then
+    echo "protos: the set of committed $target differs from the generated output; run scripts/protos.sh generate" >&2
     exit 1
   fi
   local file drift=0
   while IFS= read -r file; do
-    if ! cmp -s "$protos_dir/$file" "$tmp/$file"; then
+    if ! cmp -s "$protos_dir/$file" "$out/$file"; then
       echo "protos: committed binding differs from the generated output: protos/${file#./}" >&2
       drift=1
     fi
-  done < <(generated_ts_files "$tmp" "$schemas")
+  done < "$out.staged"
   if [[ "$drift" -ne 0 ]]; then
     echo "protos: run scripts/protos.sh generate and commit the result" >&2
     exit 1
@@ -163,28 +170,13 @@ check() {
   fi
   scratch_dir="$(mktemp -d)"
   local tmp="$scratch_dir"
-  local go_out="$tmp/go"
-  mkdir -p "$go_out"
-  buf generate --output "$go_out"
-  if ! diff -u <(generated_files "$protos_dir") <(generated_files "$go_out"); then
-    echo "protos: the set of committed Go bindings differs from the generated output; run scripts/protos.sh generate" >&2
-    exit 1
-  fi
-  local file drift=0
-  while IFS= read -r file; do
-    if ! cmp -s "$protos_dir/$file" "$go_out/$file"; then
-      echo "protos: committed binding differs from the generated output: protos/${file#./}" >&2
-      drift=1
-    fi
-  done < <(generated_files "$go_out")
-  if [[ "$drift" -ne 0 ]]; then
-    echo "protos: run scripts/protos.sh generate and commit the result" >&2
-    exit 1
-  fi
-  local schemas
-  mkdir -p "$tmp/ts"
+  local schemas target
+  stage_bindings "$tmp/go" "Go bindings"
+  check_bindings "$tmp/go" "Go bindings"
   for schemas in "${ts_targets[@]}"; do
-    check_ts "$schemas" "$tmp/ts"
+    target="TypeScript bindings in protos/$schemas"
+    stage_bindings "$tmp/$schemas" "$target" "$schemas"
+    check_bindings "$tmp/$schemas" "$target"
   done
   echo "protos: lint, format and generated Go and TypeScript bindings are up to date"
 }

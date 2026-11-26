@@ -1594,6 +1594,7 @@ export function createMockTransport(
         const key = org.apiKeys.find((k) => k.apiKeyId === req.apiKeyId);
         if (key === undefined)
           throw new ConnectError("API key not found", Code.NotFound);
+        if (key.state === ApiKeyState.REVOKED) return { apiKey: key };
         key.state = ApiKeyState.REVOKED;
         key.revokeTime = ts();
         return { apiKey: key };
