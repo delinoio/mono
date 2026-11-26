@@ -226,6 +226,7 @@ func (da *DeviceAuthorization) lifetime() time.Duration {
 // positive; see DeviceAuthorization.ExpiresAt) bounds the wait between requests and every
 // token request: PollToken starts no request at or after the deadline, cancels
 // a request that is still in flight at the deadline and returns ErrExpired.
+// It checks for cancellation and expiry again after processing each response.
 // A cancellation or deadline of ctx ends the polling earlier and is returned
 // as ctx.Err(), so callers can tell it from the expiry. A code that has
 // already expired when PollToken starts returns ErrExpired without any
@@ -280,14 +281,14 @@ func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInter
 		}
 		var tok Token
 		err := c.post(pollCtx, "/oidc/token", form, &tok)
+		if stop := ended(nil); stop != nil {
+			return nil, stop
+		}
 		if err == nil {
 			return &tok, nil
 		}
 		var oe *Error
 		if !errors.As(err, &oe) {
-			if stop := ended(nil); stop != nil {
-				return nil, stop
-			}
 			if !isDialTimeout(err) {
 				return nil, err
 			}
