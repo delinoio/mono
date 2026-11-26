@@ -74,6 +74,10 @@ import {
   organizationUuidTransport,
 } from "../e2e/organization-uuid-fixture.ts";
 import {
+  lastKnownStateCases,
+  withLastKnownState,
+} from "../e2e/sandbox-last-known-state-fixture.ts";
+import {
   mockSandboxTransition,
   SandboxTransitionOutcome,
 } from "../e2e/sandbox-transition-mock.ts";
@@ -663,6 +667,40 @@ describe("organizations", () => {
     expect(screen.queryByText("Deleted")).toBeNull();
     expect(screen.getByText(/Unreachable \(last running\)/)).toBeTruthy();
   });
+});
+
+describe("last-known sandbox states", () => {
+  for (const { name, lastKnownState, label } of lastKnownStateCases) {
+    test(`shows the sandbox with a ${name} last-known state on both routes`, async () => {
+      renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+        transport: withLastKnownState(createMockTransport(), lastKnownState),
+      });
+
+      const sandbox = await screen.findByRole("link", {
+        name: shortIdText(MOCK_IDS.unreachableSandbox),
+      });
+      const runningSandbox = screen.getByRole("link", {
+        name: shortIdText(MOCK_IDS.runningSandbox),
+      });
+      expect(
+        within(runningSandbox.closest("tr")!).getByText("Running"),
+      ).toBeTruthy();
+      expect(
+        within(sandbox.closest("tr")!)
+          .getByText(label)
+          .getAttribute("data-variant"),
+      ).toBe("danger");
+
+      fireEvent.click(sandbox);
+      await screen.findByRole("heading", { name: "Sandbox", level: 1 });
+      expect(
+        (await screen.findByText(label)).getAttribute("data-variant"),
+      ).toBe("danger");
+      expect(
+        await screen.findByRole("link", { name: "studio-mac" }),
+      ).toBeTruthy();
+    });
+  }
 });
 
 describe("roles", () => {

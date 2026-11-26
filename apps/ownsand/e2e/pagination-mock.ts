@@ -38,6 +38,10 @@ import {
   MOCK_IDS,
 } from "../src/mock/mock-api.ts";
 import { organizationUuidTransport } from "./organization-uuid-fixture.ts";
+import {
+  lastKnownStateCases,
+  withLastKnownState,
+} from "./sandbox-last-known-state-fixture.ts";
 import { browserSandboxTransitionMock } from "./sandbox-transition-mock.ts";
 
 const lists = {
@@ -183,10 +187,19 @@ export function createMockTransport(): Transport {
       extraTemplates: pageSources ? 200 : 0,
     }),
   );
-  const base =
+  const organizationMock =
     sessionStorage.getItem("ownsand-e2e-organization-uuid-case") === "true"
       ? organizationUuidTransport(mock)
       : mock;
+  const lastKnownState = sessionStorage.getItem(
+    "ownsand-e2e-sandbox-last-known-state",
+  );
+  const lastKnownStateCase = lastKnownStateCases.find(
+    ({ name }) => name === lastKnownState,
+  );
+  const base = lastKnownStateCase
+    ? withLastKnownState(organizationMock, lastKnownStateCase.lastKnownState)
+    : organizationMock;
   const earlierAcceptance = createRouterTransport((router) => {
     router.rpc(MemberService.method.acceptInvitation, () => ({
       organization: { organizationId: MOCK_IDS.acme },
