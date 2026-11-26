@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "652a12520fa43fc190376a842ba71ce1ed5a64e6c69d22253d0712a7ac5eb5d4",
+        "AGENTS.md": "e9ba56c59de165c9a7a3fa15bf039e86f219d5c9033dceb730d53f9d0440d785",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "9eafb2123d3b8b2aef41fba0db2648a3f4f49996f8c7c8bb2c86263befd8b48a",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -98,7 +98,7 @@
         "rules/client-event-listeners.md": "30a3141a17f4b8853d4a440633d8106f2cf53914ab2ee8cf96e6b667ad642c6f",
         "rules/client-localstorage-schema.md": "34141c691626fdf96f96d257fe2fba959dbf6e174f154e50223a7796fc932f3c",
         "rules/client-passive-event-listeners.md": "1f35016f9053de69e884ee9be00654e37979c2ca85f5e57764dc2626ff7acb4b",
-        "rules/client-swr-dedup.md": "177911c203725c6fb691a18ff31d4588f74d5b5fd152197f8dfb162f7aee2ac6",
+        "rules/client-swr-dedup.md": "d6cfd65bdbaa1e9344ddf952e82d5db8fbb61175cb1e5b2a962c1984d9c950e4",
         "rules/js-batch-dom-css.md": "480b891b9eaf96e929dc1e964274a4828e3a78009b7d00ccd965a0d425215959",
         "rules/js-cache-function-results.md": "3daaa11d24f4295cb6be8bc6f407f2ce83cc7b5bd1f0e68891ea8ab835721dc7",
         "rules/js-cache-property-access.md": "73e47431e74878a927061bf0ddc7cd91a7556cb35d2573f3421e82300d9ae311",
