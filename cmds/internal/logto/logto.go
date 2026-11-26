@@ -252,6 +252,13 @@ func (c Config) post(ctx context.Context, path string, form url.Values, out any)
 		return oauthError(res.StatusCode, body)
 	}
 	if err := json.Unmarshal(body, out); err != nil {
+		var fieldErr *json.UnmarshalTypeError
+		if _, ok := out.(*DeviceAuthorization); ok && errors.As(err, &fieldErr) {
+			switch fieldErr.Field {
+			case "expires_in", "interval":
+				return invalidDeviceTiming(fieldErr.Field)
+			}
+		}
 		return fmt.Errorf("logto: %s: invalid response", path)
 	}
 	return nil
@@ -286,7 +293,14 @@ func (c Config) StartDeviceAuthorization(ctx context.Context) (*DeviceAuthorizat
 	if da.DeviceCode == "" || da.UserCode == "" || da.VerificationURI == "" {
 		return nil, errors.New("logto: incomplete device authorization response")
 	}
-	da.ExpiresAt = time.Now().Add(da.lifetime())
+	lifetime, err := da.lifetime()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := deviceDuration(da.Interval, "interval"); err != nil {
+		return nil, err
+	}
+	da.ExpiresAt = time.Now().Add(lifetime)
 	return &da, nil
 }
 
@@ -294,12 +308,32 @@ func (c Config) StartDeviceAuthorization(ctx context.Context) (*DeviceAuthorizat
 // device authorization response has no positive expires_in.
 const defaultDeviceCodeLifetime = 10 * time.Minute
 
-// lifetime returns how long the device code lives after the response.
-func (da *DeviceAuthorization) lifetime() time.Duration {
-	if da.ExpiresIn <= 0 {
-		return defaultDeviceCodeLifetime
+func invalidDeviceTiming(field string) error {
+	return fmt.Errorf("logto: invalid device authorization response: %s must be an integer in the supported duration range", field)
+}
+
+// deviceDuration converts a positive number of whole seconds. Zero signals
+// that the caller should use the default timing.
+func deviceDuration(seconds int, field string) (time.Duration, error) {
+	if seconds <= 0 {
+		return 0, nil
 	}
-	return time.Duration(da.ExpiresIn) * time.Second
+	if int64(seconds) > math.MaxInt64/int64(time.Second) {
+		return 0, invalidDeviceTiming(field)
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+// lifetime returns how long the device code lives after the response.
+func (da *DeviceAuthorization) lifetime() (time.Duration, error) {
+	lifetime, err := deviceDuration(da.ExpiresIn, "expires_in")
+	if err != nil {
+		return 0, err
+	}
+	if lifetime == 0 {
+		return defaultDeviceCodeLifetime, nil
+	}
+	return lifetime, nil
 }
 
 // PollToken polls the token endpoint until the user signs in, denies the
@@ -322,14 +356,24 @@ func (da *DeviceAuthorization) lifetime() time.Duration {
 // only to the device grant: the returned token does not depend on it, and ctx
 // stays usable for the refresh grant afterwards.
 func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInterval time.Duration) (*Token, error) {
-	interval := time.Duration(da.Interval) * time.Second
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	interval, err := deviceDuration(da.Interval, "interval")
+	if err != nil {
+		return nil, err
+	}
 	if minInterval == 0 {
 		minInterval = 5 * time.Second
 	}
 	interval = max(interval, minInterval)
 	deadline := da.ExpiresAt
 	if deadline.IsZero() {
-		deadline = time.Now().Add(da.lifetime())
+		lifetime, err := da.lifetime()
+		if err != nil {
+			return nil, err
+		}
+		deadline = time.Now().Add(lifetime)
 	}
 	pollCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -390,7 +434,7 @@ func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInter
 		switch oe.Code() {
 		case authorizationPending:
 		case slowDown:
-			interval += 5 * time.Second
+			interval += min(5*time.Second, math.MaxInt64-interval)
 		case accessDenied:
 			return nil, ErrAccessDenied
 		case expiredToken:
