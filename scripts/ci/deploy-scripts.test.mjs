@@ -10,6 +10,7 @@
 // `deploy-release.sh` and `release-recovery.sh` (against a local bare remote).
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -4609,14 +4610,51 @@ test(
 // --- provision.sh ----------------------------------------------------------
 
 const skipProvision = skip || (!hasFlock && "flock is not installed");
+const systemDockerHost = "unix:///var/run/docker.sock";
+const systemDocker = `docker --host ${systemDockerHost}`;
+const alternateDockerSelectors = ["host", "context", "saved context"];
+
+function provisioningDockerEnv(dir, selector) {
+  const config = join(dir, "docker-config");
+  const context = "alternate";
+  const host = "unix:///alternate/docker.sock";
+  const contextId = createHash("sha256").update(context).digest("hex");
+  const metadata = join(config, "contexts", "meta", contextId);
+  mkdirSync(metadata, { recursive: true });
+  writeFileSync(
+    join(metadata, "meta.json"),
+    JSON.stringify({ Name: context, Endpoints: { docker: { Host: host } } }),
+  );
+  writeFileSync(
+    join(config, "config.json"),
+    JSON.stringify({
+      currentContext: selector === "saved context" ? context : "default",
+    }),
+  );
+  return {
+    DOCKER_CONFIG: config,
+    DOCKER_HOST: selector === "host" ? host : undefined,
+    DOCKER_CONTEXT: selector === "context" ? context : undefined,
+  };
+}
 
 function provisionFixture(
   t,
-  { cli = true, loadState = "loaded", queryStatus = 0, aptStatus = 0 } = {},
+  {
+    cli = true,
+    loadState = "loaded",
+    queryStatus = 0,
+    aptStatus = 0,
+    endpoint,
+    networkMissing = false,
+    daemonDown = false,
+  } = {},
 ) {
   const dir = scratch(t);
   const provision = join(dir, "provision.sh");
   const calls = join(dir, "calls");
+  const dockerCalls = join(dir, "docker-calls");
+  const dockerEnv = provisioningDockerEnv(dir, endpoint);
   const source = readFileSync(
     join(root, "scripts/droplet/provision.sh"),
     "utf8",
@@ -4655,7 +4693,22 @@ function provisionFixture(
     symlinkSync(executable, join(dir, name));
   }
   for (const [name, body] of Object.entries({
-    ...(cli && { docker: "exit 0" }),
+    ...(cli && { docker: 'exec bash ./docker-stub "$@"' }),
+    "docker-stub": `
+printf 'docker %s\\n' "$*" >> docker-calls
+if [[ "\${DOCKER_CONTEXT:-}" || "$1" != --host || "$2" != "${systemDockerHost}" ]]; then
+  echo alternate >> docker-calls
+  exit 0
+fi
+shift 2
+if [[ "$PROVISION_DAEMON_DOWN" == true ]]; then
+  echo "Cannot connect to the system Docker daemon" >&2
+  exit 1
+fi
+if [[ "$*" == "network inspect delino" && "$PROVISION_NETWORK_MISSING" == true ]]; then
+  exit 1
+fi
+`,
     systemctl: `
 printf 'systemctl %s\\n' "$*" >> calls
 case "$*" in
@@ -4675,7 +4728,7 @@ if [[ "$1" == install && "$3" == docker-ce ]]; then
     exit "$PROVISION_APT_STATUS"
   fi
   printf 'loaded\\n' > load-state
-  printf '#!/usr/bin/env bash\\nexit 0\\n' > docker
+  printf '#!/usr/bin/env bash\\nexec bash ./docker-stub "$@"\\n' > docker
   chmod +x docker
 fi
 `,
@@ -4708,6 +4761,7 @@ flock --nonblock --conflict-exit-code 13 "$lock" true
     helperRan: () => existsSync(join(dir, "caddy-started")),
     run: (prefix = []) => {
       writeFileSync(calls, "");
+      writeFileSync(dockerCalls, "");
       const [command, ...args] = [
         ...prefix,
         "bash",
@@ -4720,16 +4774,23 @@ flock --nonblock --conflict-exit-code 13 "$lock" true
         encoding: "utf8",
         env: {
           ...baseEnv,
+          ...dockerEnv,
           PATH: dir,
           PROVISION_FIXTURE_ROOT: dir,
           PROVISION_QUERY_STATUS: String(queryStatus),
           PROVISION_APT_STATUS: String(aptStatus),
+          PROVISION_NETWORK_MISSING: String(networkMissing),
+          PROVISION_DAEMON_DOWN: String(daemonDown),
           DROPLET_PROXY_LOCK_TIMEOUT: "0",
         },
       });
       return {
         ...result,
         calls: readFileSync(calls, "utf8").trim().split("\n"),
+        dockerCalls: readFileSync(dockerCalls, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean),
       };
     },
   };
@@ -4747,6 +4808,41 @@ const configureDockerEngine = [
   "configure-docker-logs.sh ./daemon.json",
   "systemctl enable --now docker",
 ];
+const networkCreateCalls = [
+  `${systemDocker} network inspect delino`,
+  `${systemDocker} network create delino`,
+];
+
+test(
+  "provision creates the network on the system daemon",
+  { skip: skipProvision },
+  (t) => {
+    for (const endpoint of alternateDockerSelectors) {
+      const fixture = provisionFixture(t, { endpoint, networkMissing: true });
+      const result = fixture.run();
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(result.dockerCalls, networkCreateCalls, endpoint);
+      assert.ok(fixture.helperRan());
+    }
+  },
+);
+
+test(
+  "provision fails when the system Docker daemon is unavailable",
+  { skip: skipProvision },
+  (t) => {
+    const fixture = provisionFixture(t, {
+      endpoint: "context",
+      daemonDown: true,
+    });
+    const result = fixture.run();
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Cannot connect to the system Docker daemon/);
+    assert.doesNotMatch(result.stdout, /Done/);
+    assert.deepEqual(result.dockerCalls, networkCreateCalls);
+    assert.equal(fixture.helperRan(), false);
+  },
+);
 
 test(
   "provision installs Engine on a CLI-only host and skips apt on rerun",
@@ -4902,6 +4998,7 @@ function setupCaddy(
     gone,
     wgetFails,
     allowLateProbe,
+    endpoint,
     env: extra,
   } = {},
 ) {
@@ -4914,7 +5011,12 @@ function setupCaddy(
   shellStub(
     bin,
     "docker",
-    `if [[ "\${STUB_FAIL:-}" == "$1" ]]; then
+    `if [[ "\${DOCKER_CONTEXT:-}" || "$1" != --host || "$2" != "${systemDockerHost}" ]]; then
+  echo "Docker command did not select the system daemon" >&2
+  exit 2
+fi
+shift 2
+if [[ "\${STUB_FAIL:-}" == "$1" ]]; then
   echo "Error response from daemon: stub $1 failed" >&2
   exit 1
 fi
@@ -4971,7 +5073,11 @@ case "$1" in
     ;;
 esac`,
   );
-  const env = { ...baseEnv, PATH: `${bin}${delimiter}${baseEnv.PATH}` };
+  const env = {
+    ...baseEnv,
+    ...provisioningDockerEnv(dir, endpoint),
+    PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+  };
   env.STUB_DIR = dir;
   env.STUB_DAEMON_LOG_DRIVER = daemonLogDriver;
   if (fail !== undefined) env.STUB_FAIL = fail;
@@ -4987,7 +5093,7 @@ esac`,
     writeFileSync(
       env.BASH_ENV,
       `timeout() {
-        if [[ "$3" == docker && "$4" == exec ]]; then
+        if [[ "$3" == docker && "$6" == exec ]]; then
           shift 2
           "$@"
         else
@@ -5024,19 +5130,38 @@ function runCaddy(t, options) {
   return setupCaddy(t, options)();
 }
 
-const caddyRun = `docker run --detach --name caddy --network delino --restart unless-stopped --log-driver local --publish 80:80 --publish 443:443 --publish 443:443/udp --volume /srv/delino/caddy:/etc/caddy:ro --volume caddy-data:/data --volume caddy-config:/config ${caddyImage}`;
-const caddyList =
-  "docker container ls --all --no-trunc --filter name=^/caddy$ --format {{.ID}}";
-const caddyInspect =
-  "docker container inspect --format {{.Config.Image}} {{.State.Running}} {{.HostConfig.LogConfig.Type}} caddy-id";
-const caddyRemove = "docker rm --force caddy-id";
-const caddyState = "docker inspect --format {{.State.Status}} caddy";
-const caddyProbe =
-  "docker exec caddy wget -q -T 2 -O /dev/null http://127.0.0.1:2019/config/";
-const caddyImageInspect = `docker image inspect ${caddyImage}`;
-const caddyPull = `docker pull ${caddyImage}`;
-const caddyReload =
-  "docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile";
+const caddyRun = `${systemDocker} run --detach --name caddy --network delino --restart unless-stopped --log-driver local --publish 80:80 --publish 443:443 --publish 443:443/udp --volume /srv/delino/caddy:/etc/caddy:ro --volume caddy-data:/data --volume caddy-config:/config ${caddyImage}`;
+const caddyList = `${systemDocker} container ls --all --no-trunc --filter name=^/caddy$ --format {{.ID}}`;
+const caddyInspect = `${systemDocker} container inspect --format {{.Config.Image}} {{.State.Running}} {{.HostConfig.LogConfig.Type}} caddy-id`;
+const caddyRemove = `${systemDocker} rm --force caddy-id`;
+const caddyStart = `${systemDocker} start caddy`;
+const caddyState = `${systemDocker} inspect --format {{.State.Status}} caddy`;
+const caddyProbe = `${systemDocker} exec caddy wget -q -T 2 -O /dev/null http://127.0.0.1:2019/config/`;
+const caddyImageInspect = `${systemDocker} image inspect ${caddyImage}`;
+const caddyPull = `${systemDocker} pull ${caddyImage}`;
+const caddyReload = `${systemDocker} exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile`;
+const caddyLogs = `DOCKER_CONTEXT= ${systemDocker} logs caddy`;
+
+test(
+  "start-caddy uses the system daemon for create, start and reload",
+  { skip },
+  (t) => {
+    for (const endpoint of alternateDockerSelectors) {
+      for (const [inspect, operations] of [
+        [undefined, [caddyImageInspect, caddyRun, caddyState, caddyProbe]],
+        [
+          `${caddyImage} false`,
+          [caddyInspect, caddyStart, caddyState, caddyProbe],
+        ],
+        [`${caddyImage} true`, [caddyInspect, caddyReload]],
+      ]) {
+        const result = runCaddy(t, { endpoint, inspect });
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(result.calls, [caddyList, ...operations], endpoint);
+      }
+    }
+  },
+);
 
 test("start-caddy creates a missing container", { skip }, (t) => {
   const result = runCaddy(t, { daemonLogDriver: "json-file" });
@@ -5063,7 +5188,7 @@ test("start-caddy starts a stopped container", { skip }, (t) => {
   assert.deepEqual(result.calls, [
     caddyList,
     caddyInspect,
-    "docker start caddy",
+    caddyStart,
     caddyState,
     caddyProbe,
   ]);
@@ -5074,7 +5199,7 @@ test(
   { skip },
   (t) => {
     const createCalls = [caddyImageInspect, caddyRun];
-    const startCalls = [caddyInspect, "docker start caddy"];
+    const startCalls = [caddyInspect, caddyStart];
     for (const timeout of ["08", "8", "09", "9"]) {
       for (const [inspect, operationCalls] of [
         [undefined, createCalls],
@@ -5223,7 +5348,7 @@ test("start-caddy needs no pull for a same-image container", { skip }, (t) => {
       fail: "pull",
     });
     assert.equal(result.status, 0, result.stderr);
-    assert.ok(!result.calls.some((call) => call.startsWith("docker pull")));
+    assert.ok(!result.calls.includes(caddyPull));
   }
 });
 
@@ -5665,7 +5790,7 @@ test(
         const label = `${inspect} ${state}`;
         assert.notEqual(result.status, 0, label);
         assert.match(result.stderr, new RegExp(`container is ${state}`), label);
-        assert.match(result.stderr, /docker logs caddy/, label);
+        assert.ok(result.stderr.includes(caddyLogs), label);
         assert.deepEqual(
           result.calls.filter((call) => call === caddyProbe),
           [],
@@ -5693,7 +5818,7 @@ test("start-caddy fails when Caddy never answers", { skip }, (t) => {
     assert.match(result.stderr, /did not answer its admin API/, label);
     assert.match(result.stderr, /within 2 seconds/, label);
     assert.match(result.stderr, /container state is running/, label);
-    assert.match(result.stderr, /docker logs caddy/, label);
+    assert.ok(result.stderr.includes(caddyLogs), label);
     const probes = result.calls.filter((call) => call === caddyProbe).length;
     // The deadline bounds the attempts: at least two, far below an
     // unbounded loop.
@@ -5713,11 +5838,7 @@ test(
       assert.equal(result.status, 1, result.stderr);
       assert.match(result.stderr, new RegExp(`within ${timeout} seconds`));
       assert.match(result.stderr, /container state is unavailable/);
-      assert.deepEqual(result.calls, [
-        caddyList,
-        caddyInspect,
-        "docker start caddy",
-      ]);
+      assert.deepEqual(result.calls, [caddyList, caddyInspect, caddyStart]);
     }
   },
 );
@@ -5731,7 +5852,7 @@ test("start-caddy accepts a probe before the deadline", { skip }, (t) => {
   assert.deepEqual(result.calls, [
     caddyList,
     caddyInspect,
-    "docker start caddy",
+    caddyStart,
     caddyState,
     caddyProbe,
   ]);
@@ -5782,11 +5903,11 @@ for (const { name, env, wgetFails, allowLateProbe, state, attempts } of [
     assert.ok(result.elapsedMs < 3_000, `took ${result.elapsedMs} ms`);
     assert.match(result.stderr, /within 1 seconds/);
     assert.match(result.stderr, new RegExp(`container state is ${state}`));
-    assert.match(result.stderr, /docker logs caddy/);
+    assert.ok(result.stderr.includes(caddyLogs));
     assert.deepEqual(result.calls, [
       caddyList,
       caddyInspect,
-      "docker start caddy",
+      caddyStart,
       caddyState,
       ...attempts,
     ]);
@@ -5797,7 +5918,7 @@ test("start-caddy fails when the container disappears", { skip }, (t) => {
   const result = runCaddy(t, { gone: true });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /cannot read the state of the caddy container/);
-  assert.match(result.stderr, /docker logs caddy/);
+  assert.ok(result.stderr.includes(caddyLogs));
   assert.deepEqual(
     result.calls.filter((call) => call === caddyProbe),
     [],

@@ -250,6 +250,8 @@ Caddy route requirements: the `h2c` route must deliver HTTP/2 to the upstream wh
 
 The Caddy lifecycle in step 3 assumes that an existing container already uses the `local` log driver. Provisioning creates every Caddy container with the pinned image and `--log-driver local`. If an existing container uses another driver, `start-caddy.sh` pulls the pinned image if needed, recreates the container and waits for readiness. The first rerun can interrupt open connections even when the existing image already matches. If the helper cannot read the log driver or pull the image, provisioning exits with an error and leaves the existing container in place.
 
+Provisioning uses the system Docker socket (`unix:///var/run/docker.sock`) to check the active log driver, manage the `delino` network and manage Caddy. Caddy readiness probes use the same socket. If the system daemon remains unavailable, provisioning exits with an error.
+
 Provision a new Droplet once:
 
 1. Create the Droplet and a DigitalOcean Cloud Firewall that allows inbound TCP 22, TCP 80, TCP 443, UDP 443 and UDP 3478 (STUN of `ownsand-api`) and denies all other inbound traffic. Add a rule for every UDP port in a `deploy.udpPorts` list before the first deployment of its server. SSH stays open to all addresses, because GitHub-hosted runners have no fixed addresses; the `deploy` user accepts only its key.

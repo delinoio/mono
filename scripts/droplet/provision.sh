@@ -158,8 +158,11 @@ printf '%s\n' "$caddyfile" > "$root/caddy/Caddyfile"
 chown "$deploy_user:$deploy_user" "$root/caddy/Caddyfile"
 
 log "Create the $network Docker network"
-if ! docker network inspect "$network" > /dev/null 2>&1; then
-  docker network create "$network"
+# Use the same system daemon as configure-docker-logs.sh.
+unset DOCKER_CONTEXT
+docker_command=(docker --host unix:///var/run/docker.sock)
+if ! "${docker_command[@]}" network inspect "$network" > /dev/null 2>&1; then
+  "${docker_command[@]}" network create "$network"
 fi
 
 log "Start the Caddy reverse proxy"

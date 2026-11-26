@@ -29,7 +29,7 @@
 # state; a container that is exited, dead or restarting fails the script at
 # once. The state reads, probes and retry delays share one 30-second
 # deadline. On timeout the failure message reports the last known state
-# and points to `docker logs caddy`. The reload path does not wait.
+# and points to the Caddy logs. The reload path does not wait.
 # The running process already answered, and `caddy reload` validates the
 # new configuration itself.
 #
@@ -53,6 +53,10 @@ fi
 caddy_image="$1"
 root="$2"
 network="$3"
+# The network and bind mounts belong to the Droplet's system daemon.
+unset DOCKER_CONTEXT
+docker_command=(docker --host unix:///var/run/docker.sock)
+logs_command="DOCKER_CONTEXT= ${docker_command[*]} logs caddy"
 ready_timeout="${START_CADDY_READY_TIMEOUT:-30}"
 ready_interval="${START_CADDY_READY_INTERVAL:-1}"
 if [[ ! "$ready_timeout" =~ ^[0-9]+$ ]] || [[ ! "$ready_interval" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -87,11 +91,11 @@ wait_ready() {
   local deadline=$(( $(readiness_clock) + 10#$ready_timeout * 100 ))
   local remaining probe_budget state last_state=unavailable attempts=0
   while readiness_budget; do
-    if state="$(run_with_readiness_limit "$remaining" docker inspect --format '{{.State.Status}}' caddy 2>&1)"; then
+    if state="$(run_with_readiness_limit "$remaining" "${docker_command[@]}" inspect --format '{{.State.Status}}' caddy 2>&1)"; then
       last_state="$state"
     elif readiness_budget; then
       echo "error: cannot read the state of the caddy container: $state" >&2
-      echo "Run \`docker logs caddy\` and \`docker ps --all\` for details." >&2
+      echo "Run \`$logs_command\` and \`DOCKER_CONTEXT= ${docker_command[*]} ps --all\` for details." >&2
       return 1
     else
       break
@@ -102,7 +106,7 @@ wait_ready() {
       running)
         attempts=$((attempts + 1))
         probe_budget=$((remaining < 1000 ? remaining : 1000))
-        if { run_with_readiness_limit "$probe_budget" docker exec caddy wget -q -T 2 -O /dev/null http://127.0.0.1:2019/config/; } > /dev/null 2>&1 &&
+        if { run_with_readiness_limit "$probe_budget" "${docker_command[@]}" exec caddy wget -q -T 2 -O /dev/null http://127.0.0.1:2019/config/; } > /dev/null 2>&1 &&
           readiness_budget; then
           return 0
         fi
@@ -110,7 +114,7 @@ wait_ready() {
       created) ;;
       *)
         echo "error: the caddy container is $state, not running; Caddy exited before it answered its admin API." >&2
-        echo "Run \`docker logs caddy\` to see why Caddy stopped (for example an invalid Caddyfile or route file)." >&2
+        echo "Run \`$logs_command\` to see why Caddy stopped (for example an invalid Caddyfile or route file)." >&2
         return 1
         ;;
     esac
@@ -122,18 +126,18 @@ wait_ready() {
   done
 
   echo "error: Caddy did not answer its admin API (http://127.0.0.1:2019/config/) within ${ready_timeout} seconds; the container state is $last_state after $attempts probe attempts." >&2
-  echo "Run \`docker logs caddy\` to see why Caddy is not ready." >&2
+  echo "Run \`$logs_command\` to see why Caddy is not ready." >&2
   return 1
 }
 
 # List by exact name to distinguish an absent container from an inspect
 # failure. Keep the ID so removal targets only the container we inspected.
-current_id="$(docker container ls --all --no-trunc --filter 'name=^/caddy$' --format '{{.ID}}')"
+current_id="$("${docker_command[@]}" container ls --all --no-trunc --filter 'name=^/caddy$' --format '{{.ID}}')"
 current_image=""
 running=""
 current_log_driver=""
 if [[ -n "$current_id" ]]; then
-  if ! settings="$(docker container inspect --format '{{.Config.Image}} {{.State.Running}} {{.HostConfig.LogConfig.Type}}' "$current_id")"; then
+  if ! settings="$("${docker_command[@]}" container inspect --format '{{.Config.Image}} {{.State.Running}} {{.HostConfig.LogConfig.Type}}' "$current_id")"; then
     echo "error: cannot inspect the settings of the caddy container." >&2
     exit 1
   fi
@@ -150,11 +154,11 @@ if [[ "$current_image" != "$caddy_image" || "$current_log_driver" != "local" ]];
   # registry would leave the Droplet without a proxy. When the pull fails,
   # `set -e` ends the script here with the pull diagnostic and the old
   # container keeps running.
-  docker image inspect "$caddy_image" > /dev/null 2>&1 || docker pull "$caddy_image"
+  "${docker_command[@]}" image inspect "$caddy_image" > /dev/null 2>&1 || "${docker_command[@]}" pull "$caddy_image"
   if [[ -n "$current_id" ]]; then
-    docker rm --force "$current_id" > /dev/null
+    "${docker_command[@]}" rm --force "$current_id" > /dev/null
   fi
-  docker run --detach --name caddy \
+  "${docker_command[@]}" run --detach --name caddy \
     --network "$network" \
     --restart unless-stopped \
     --log-driver local \
@@ -165,8 +169,8 @@ if [[ "$current_image" != "$caddy_image" || "$current_log_driver" != "local" ]];
     "$caddy_image"
   wait_ready
 elif [[ "$running" != "true" ]]; then
-  docker start caddy
+  "${docker_command[@]}" start caddy
   wait_ready
 else
-  docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+  "${docker_command[@]}" exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 fi
