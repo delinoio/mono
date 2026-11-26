@@ -99,6 +99,7 @@ type Server struct {
 	profiles        []*sandrunv1.RunnerProfile
 	sessions        []*sandrunv1.DevSession
 	sessionGets     map[string]int
+	sessionExecs    map[string]*sessionExecs
 	apiKeys         []*sandrunv1.ApiKey
 	requests        []*sandrunv1.Request
 	runners         []*sandrunv1.Runner
@@ -123,6 +124,7 @@ func New() *Server {
 		calls:         map[string]int{},
 		members:       map[string][]*sandrunv1.Member{},
 		sessionGets:   map[string]int{},
+		sessionExecs:  map[string]*sessionExecs{},
 		links:         map[string]*sandrunv1.OwnSandLink{},
 		queueByOrg:    map[string]chan *sandrunv1.WatchQueueResponse{},
 		unscopedQueue: make(chan *sandrunv1.WatchQueueResponse, queueBufferSize),
