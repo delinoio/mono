@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"slices"
 	"strings"
 	"testing"
 
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -151,7 +154,7 @@ func TestTextResultWriteErrorExitsWithError(t *testing.T) {
 		{"sandbox get", nil, []string{"sandbox", "get", "SANDBOX"}},
 		{"list", nil, []string{"api-key", "list"}},
 		{"sandbox list", nil, []string{"sandbox", "list"}},
-		{"billing status", func(r *runner) { r.f.billing, r.f.usage = linkedAllowed(), billingUsage() }, []string{"billing", "status"}},
+		{"billing status with API key", func(r *runner) { r.f.billing = linkedAllowed() }, []string{"billing", "status"}},
 		{"billing status without usage", func(r *runner) { r.f.billing = unlinkedBlocked() }, []string{"billing", "status"}},
 	} {
 		for _, mode := range []string{"text", "json"} {
@@ -178,6 +181,99 @@ func TestTextResultWriteErrorExitsWithError(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+type billingWriteFailure struct {
+	marker   string
+	accepted bytes.Buffer
+	rejected string
+}
+
+func (w *billingWriteFailure) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(w.marker)) {
+		w.rejected = string(p)
+		return 0, errDiskFull
+	}
+	return w.accepted.Write(p)
+}
+
+func runOwnerBillingStatus(t *testing.T, stdout io.Writer, suspended bool, format string) (int, string) {
+	t.Helper()
+	r := newRunner(t)
+	r.signInAs("owner")
+	r.f.billing, r.f.usage = linkedAllowed(), billingUsage()
+	if suspended {
+		// Keep the block and suspension times from the unlinked fixture.
+		r.f.billing = unlinkedBlocked()
+		r.f.billing.Linked = true
+		r.f.billing.Phase = ownsandv1.BillingPhase_BILLING_PHASE_SUSPENDED
+		r.f.billing.Reason = ownsandv1.BillingReason_BILLING_REASON_SUSPENDED
+		r.f.usage.BalanceUsdMicros = -1_234_567
+	}
+	var stderr bytes.Buffer
+	code := r.runWriters(stdout, &stderr, "billing", "status", "--no-color", "--format", format)
+	// Both fake handlers reject requests for any other organization.
+	if calls, want := r.f.callNames(), []string{"GetBillingStatus", "GetBillingUsage"}; !slices.Equal(calls, want) {
+		t.Fatalf("RPCs = %v, want %v (stderr %q)", calls, want, stderr.String())
+	}
+	return code, stderr.String()
+}
+
+func TestBillingStatusUsageTextWriteErrors(t *testing.T) {
+	const freshness = "Usage of the last 5 to 10 minutes may not be included yet."
+	for _, tc := range []struct {
+		name, marker, preceding string
+		suspended               bool
+	}{
+		{name: "usage table", marker: "relay egress", preceding: "month start:"},
+		{name: "freshness note", marker: freshness, preceding: "Class B RPCs"},
+		{name: "suspension note", marker: "running sandboxes are paused", preceding: freshness, suspended: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var control bytes.Buffer
+			if code, stderr := runOwnerBillingStatus(t, &control, tc.suspended, "text"); code != ExitOK || stderr != "" {
+				t.Fatalf("control exit = %d, stderr = %q", code, stderr)
+			}
+			stdout := &billingWriteFailure{marker: tc.marker}
+			code, stderr := runOwnerBillingStatus(t, stdout, tc.suspended, "text")
+			// Each run gets a new organization ID. Compare the rest of the output.
+			_, controlBody, _ := strings.Cut(control.String(), "\n")
+			_, acceptedBody, _ := strings.Cut(stdout.accepted.String(), "\n")
+			if !strings.Contains(acceptedBody, tc.preceding) || !strings.Contains(stdout.rejected, tc.marker) ||
+				!strings.HasPrefix(controlBody, acceptedBody+stdout.rejected) {
+				t.Fatalf("want accepted %q before rejected %q, matching the control\naccepted: %q\nrejected: %q\ncontrol: %q",
+					tc.preceding, tc.marker, stdout.accepted.String(), stdout.rejected, control.String())
+			}
+			if code != ExitError || !strings.Contains(stderr, errDiskFull.Error()) {
+				t.Fatalf("exit = %d, want %d with %q on stderr; got %q", code, ExitError, errDiskFull, stderr)
+			}
+		})
+	}
+}
+
+func TestBillingStatusUsageJSONWriteError(t *testing.T) {
+	var control bytes.Buffer
+	if code, stderr := runOwnerBillingStatus(t, &control, false, "json"); code != ExitOK || stderr != "" {
+		t.Fatalf("control exit = %d, stderr = %q", code, stderr)
+	}
+	var out struct {
+		Usage json.RawMessage `json:"usage"`
+	}
+	if err := json.Unmarshal(control.Bytes(), &out); err != nil {
+		t.Fatalf("decode billing result: %v", err)
+	}
+	var usage ownsandv1.GetBillingUsageResponse
+	if err := protojson.Unmarshal(out.Usage, &usage); err != nil || !proto.Equal(&usage, billingUsage()) {
+		t.Fatalf("want the fixture usage and its meters, got %s (decode error: %v)", out.Usage, err)
+	}
+	stdout := &billingWriteFailure{marker: `"meter_usages"`}
+	code, stderr := runOwnerBillingStatus(t, stdout, false, "json")
+	if stdout.accepted.Len() != 0 || stdout.rejected != control.String() {
+		t.Fatalf("want the first write of the usage-bearing JSON rejected, got accepted %q, rejected %q", stdout.accepted.String(), stdout.rejected)
+	}
+	if code != ExitError || !strings.Contains(stderr, errDiskFull.Error()) {
+		t.Fatalf("exit = %d, want %d with %q on stderr; got %q", code, ExitError, errDiskFull, stderr)
 	}
 }
 
