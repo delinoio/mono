@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -100,7 +101,7 @@ if (process.argv[3] === "wait" || process.argv[3] === "stubborn") {
 // `scripts/dev/with-infisical.mjs`, so that the launcher resolves the
 // fixture as its repository root.
 function fixture(t, { config = null, cli = true, env = {} } = {}) {
-  const root = mkdtempSync(join(tmpdir(), "with-infisical-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "with-infisical-")));
   // Launchers started from this fixture register their teardown here. It runs
   // before the directory is removed, because the teardown reads the command's
   // start record from that directory and `t.after` hooks run in order.

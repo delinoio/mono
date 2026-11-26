@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -57,7 +58,7 @@ function fixture(
   t,
   manifest = { name: "@rspress/core", bin: { rspress: "./bin/rspress.cjs" } },
 ) {
-  const root = mkdtempSync(join(tmpdir(), "rspress-preview-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "rspress-preview-")));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const pkg = join(root, "node_modules", "@rspress", "core");
   mkdirSync(join(pkg, "bin"), { recursive: true });
