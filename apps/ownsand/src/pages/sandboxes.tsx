@@ -14,7 +14,7 @@ import {
 import { Badge } from "delino-ui/badge";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { Checkbox } from "delino-ui/checkbox";
-import { NumberInput } from "delino-ui/number-input";
+import { NumberInput, type NumberInputDraft } from "delino-ui/number-input";
 import { Select, SelectOption } from "delino-ui/select";
 import { Textarea } from "delino-ui/textarea";
 import {
@@ -356,6 +356,9 @@ function CreateSandboxDialog({
   const firstSubmittedAt = useRef<number>(undefined);
   const [attempt, setAttempt] = useState<CreateAttempt>();
   const [source, setSource] = useState(`base:${BaseImage.LINUX}`);
+  const vcpuDraft = useRef<NumberInputDraft>(null);
+  const memoryDraft = useRef<NumberInputDraft>(null);
+  const diskDraft = useRef<NumberInputDraft>(null);
   const [vcpu, setVcpu] = useState<number | null>(2);
   const [memory, setMemory] = useState<number | null>(4096);
   const [disk, setDisk] = useState<number | null>(20);
@@ -444,7 +447,14 @@ function CreateSandboxDialog({
           const ttl = ttlErrors({ idleMinutes, maxHours });
           if (ttl.idle) next.idle = ttl.idle;
           if (ttl.max) next.max = ttl.max;
-          Object.assign(next, resourceErrors({ vcpu, memory, disk }));
+          Object.assign(
+            next,
+            resourceErrors({
+              vcpu: vcpuDraft.current?.hasFraction() ? Number.NaN : vcpu,
+              memory: memoryDraft.current?.hasFraction() ? Number.NaN : memory,
+              disk: diskDraft.current?.hasFraction() ? Number.NaN : disk,
+            }),
+          );
           const parsed = parseLabels(labelText);
           if ("error" in parsed) next.labels = parsed.error;
           setErrors(next);
@@ -571,6 +581,7 @@ function CreateSandboxDialog({
           value={vcpu}
           disabled={fieldsLocked}
           onValueChange={setVcpu}
+          draftRef={vcpuDraft}
           min={1}
           error={errors.vcpu}
         />
@@ -579,6 +590,7 @@ function CreateSandboxDialog({
           value={memory}
           disabled={fieldsLocked}
           onValueChange={setMemory}
+          draftRef={memoryDraft}
           min={256}
           // `step` is also the grid that Enter and blur snap the typed value
           // to, so 256 here would turn 1000 into 1,024. The arrow keys and
@@ -592,6 +604,7 @@ function CreateSandboxDialog({
           value={disk}
           disabled={fieldsLocked}
           onValueChange={setDisk}
+          draftRef={diskDraft}
           min={1}
           error={errors.disk}
         />

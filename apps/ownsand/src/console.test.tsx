@@ -2102,6 +2102,28 @@ describe("sandbox create form resources", () => {
     await settle(60);
   };
 
+  test("rejects fractional memory below the control minimum or beyond number precision", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    const memory = within(dialog).getByLabelText(
+      "Memory (MiB)",
+    ) as HTMLInputElement;
+    for (const value of ["255.5", "1000.00000000000000001"]) {
+      await commit(memory, value);
+      await create(dialog);
+      expect(created).toHaveLength(0);
+      expect(dialog.textContent, value).toContain(
+        "Enter a whole number of MiB from 1 to 9007199254740991.",
+      );
+      expect(memory.value).toBe(value);
+      expect(memory.getAttribute("aria-invalid")).toBe("true");
+    }
+    await commit(memory, "1000");
+    await create(dialog);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.memoryMib).toBe(1000n);
+  });
+
   test("rejects a vCPU count above the int32 range without a request", async () => {
     const { transport, created } = recordingTransport();
     const dialog = await openForm(transport);

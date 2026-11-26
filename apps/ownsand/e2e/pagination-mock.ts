@@ -154,6 +154,17 @@ export function createMockTransport(): Transport {
         method.name === sessionStorage.getItem("ownsand-e2e-tracked-mutation")
       ) {
         recordToken("ownsand-e2e-mutation-calls", method.name);
+        if (
+          method.name === "CreateSandbox" ||
+          method.name === "ReplaceDeviceLimits"
+        ) {
+          recordToken(
+            "ownsand-e2e-resource-mutation-inputs",
+            toJsonString(method.input, create(method.input, input), {
+              alwaysEmitImplicit: true,
+            }),
+          );
+        }
       }
       if (method.name === refreshList) {
         const code = sessionStorage.getItem("ownsand-e2e-refresh-error");
