@@ -1094,6 +1094,9 @@ export function createMockTransport(
       );
     }
     const device = findDevice(org, deviceId);
+    if (device.state === DeviceState.REMOVED) {
+      throw new ConnectError("device not found", Code.NotFound);
+    }
     device.limits = l;
     // Like the server: the exact int64 value, and the int32 field capped.
     const effective = effectiveVcpuLimit(l.vcpuCount, p);
@@ -1500,9 +1503,17 @@ export function createMockTransport(
       removeDevice(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
-        const device = findDevice(org, req.deviceId);
+        const previous = findDevice(org, req.deviceId);
+        const device = create(DeviceSchema, {
+          deviceId: previous.deviceId,
+          organizationId: previous.organizationId,
+          createTime: previous.createTime,
+          state: DeviceState.REMOVED,
+          limits: { vcpuOvercommitPercent: 100 },
+          allocation: { vcpuTotalCount: 0n },
+        });
+        org.devices[org.devices.indexOf(previous)] = device;
         const endTime = ts();
-        device.state = DeviceState.REMOVED;
         for (const s of org.sandboxes) {
           if (
             s.deviceId === device.deviceId &&
