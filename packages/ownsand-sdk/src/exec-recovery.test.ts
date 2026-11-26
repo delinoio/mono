@@ -3,7 +3,6 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { DataPathError } from "./errors.ts";
 import { ExecResultKind } from "./operations/exec.ts";
-import { RecoveryDeadlineError } from "./operations/common.ts";
 
 import { Disconnect } from "./testing/fake-api.ts";
 import {
@@ -13,6 +12,7 @@ import {
   setup,
   type Harness,
 } from "./testing/harness.ts";
+import { expectTransportInterruption } from "./testing/recovery-assert.ts";
 import {
   SandboxEndReason,
   SandboxState,
@@ -60,8 +60,7 @@ describe("the pre-start state lookup after AttachExec not_found", () => {
       return new Promise<never>(() => {});
     });
     const error = await h.clock.run(runExec(h)).catch((e) => e);
-    expect(error).toBeInstanceOf(ConnectError);
-    expect(error).not.toBeInstanceOf(RecoveryDeadlineError);
+    expectTransportInterruption(error);
     expect(h.clock.now()).toBe(MIN);
     expect(h.api.callsOf("GetSandbox")).toHaveLength(1);
     expect(lookupSignal?.aborted).toBe(true);
