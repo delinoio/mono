@@ -267,11 +267,15 @@ func (l *linkService) SetOwnSandLink(_ context.Context, req *connect.Request[san
 func (l *linkService) GetOwnSandLink(_ context.Context, req *connect.Request[sandrunv1.GetOwnSandLinkRequest]) (*connect.Response[sandrunv1.GetOwnSandLinkResponse], error) {
 	l.s.mu.Lock()
 	defer l.s.mu.Unlock()
-	link := l.s.links[req.Msg.GetOrganizationId()]
-	if link == nil {
-		return nil, notFound("link")
+	org := req.Msg.GetOrganizationId()
+	if _, err := l.s.requireOrg(org); err != nil {
+		return nil, err
 	}
-	return connect.NewResponse(&sandrunv1.GetOwnSandLinkResponse{Link: proto.CloneOf(link)}), nil
+	res := &sandrunv1.GetOwnSandLinkResponse{}
+	if link := l.s.links[org]; link != nil {
+		res.Link = proto.CloneOf(link)
+	}
+	return connect.NewResponse(res), nil
 }
 
 func (l *linkService) RemoveOwnSandLink(_ context.Context, req *connect.Request[sandrunv1.RemoveOwnSandLinkRequest]) (*connect.Response[sandrunv1.RemoveOwnSandLinkResponse], error) {
