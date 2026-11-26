@@ -160,6 +160,15 @@ func (s *Server) session(org, id string) (*sandrunv1.DevSession, error) {
 func (s *Server) runningSession(org, id string) (*sandrunv1.DevSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	x, err := s.runningSessionLocked(org, id)
+	if err != nil {
+		return nil, err
+	}
+	return proto.CloneOf(x), nil
+}
+
+// runningSessionLocked checks the session state while the caller holds s.mu.
+func (s *Server) runningSessionLocked(org, id string) (*sandrunv1.DevSession, error) {
 	x, err := s.session(org, id)
 	if err != nil {
 		return nil, err
@@ -167,7 +176,7 @@ func (s *Server) runningSession(org, id string) (*sandrunv1.DevSession, error) {
 	if x.GetState() != sandrunv1.RequestState_REQUEST_STATE_RUNNING {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the dev session is not running"))
 	}
-	return proto.CloneOf(x), nil
+	return x, nil
 }
 
 func (d *devSessionService) GetDevSession(_ context.Context, req *connect.Request[sandrunv1.GetDevSessionRequest]) (*connect.Response[sandrunv1.GetDevSessionResponse], error) {
@@ -231,9 +240,9 @@ func (d *devSessionService) ListDevSessions(_ context.Context, req *connect.Requ
 func (d *devSessionService) DeleteDevSession(_ context.Context, req *connect.Request[sandrunv1.DeleteDevSessionRequest]) (*connect.Response[sandrunv1.DeleteDevSessionResponse], error) {
 	s := d.s
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	x, err := s.session(req.Msg.GetOrganizationId(), req.Msg.GetDevSessionId())
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
 	switch {
@@ -247,7 +256,25 @@ func (d *devSessionService) DeleteDevSession(_ context.Context, req *connect.Req
 		x.EndReason = sandrunv1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED
 		x.EndedAt = timestamppb.Now()
 	}
-	return connect.NewResponse(&sandrunv1.DeleteDevSessionResponse{DevSession: proto.CloneOf(x)}), nil
+	res := &sandrunv1.DeleteDevSessionResponse{DevSession: proto.CloneOf(x)}
+	id := x.GetDevSessionId()
+	execs := s.sessionExecs[id]
+	if execs != nil {
+		execs.cancel()
+	}
+	s.mu.Unlock()
+
+	if execs != nil {
+		// Keep the canceled scope until all execs finish so concurrent deletes
+		// wait for the same shutdown. Other sessions can proceed during the wait.
+		execs.wg.Wait()
+		s.mu.Lock()
+		if s.sessionExecs[id] == execs {
+			delete(s.sessionExecs, id)
+		}
+		s.mu.Unlock()
+	}
+	return connect.NewResponse(res), nil
 }
 
 func (d *devSessionService) ExecDevSession(ctx context.Context, req *connect.Request[sandrunv1.ExecDevSessionRequest], stream *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error {
@@ -467,6 +494,14 @@ type readSnapshot struct {
 	data           []byte
 }
 
+// sessionExecs tracks the commands admitted to one dev session. Server.mu
+// serializes admission and cancellation.
+type sessionExecs struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
 type guest struct {
 	s        *Server
 	ctx      context.Context
@@ -537,37 +572,63 @@ func (p *proc) finish(ev *sandrunv1.DevSessionExecEvent) {
 	p.notifyLocked()
 }
 
-// start starts a local process for the exec request.
-func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionRequest) (*proc, error) {
+// admitExec registers the command before either deletion or Close can wait.
+func (g *guest) admitExec(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionRequest) (*proc, *sessionExecs, error) {
+	s := g.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.closed {
-		g.mu.Unlock()
-		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the fake guest is closed"))
+		return nil, nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the fake guest is closed"))
+	}
+	id := ds.GetDevSessionId()
+	// BeforeExec runs outside the lock. Recheck the state at admission.
+	if _, err := s.runningSessionLocked(ds.GetOrganizationId(), id); err != nil {
+		return nil, nil, err
 	}
 	if g.execs[req.GetExecId()] != nil {
-		g.mu.Unlock()
-		return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("the exec_id is in use"))
+		return nil, nil, connect.NewError(connect.CodeAlreadyExists, errors.New("the exec_id is in use"))
 	}
-	p := &proc{session: ds.GetDevSessionId(), execID: req.GetExecId(), changed: make(chan struct{}), start: time.Now(), keep: g.s.OutputKeepBytes}
+	execs := s.sessionExecs[id]
+	if execs == nil {
+		ctx, cancel := context.WithCancel(g.ctx)
+		execs = &sessionExecs{ctx: ctx, cancel: cancel}
+		s.sessionExecs[id] = execs
+	} else if execs.ctx.Err() != nil {
+		return nil, nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the dev session is stopping"))
+	}
+	p := &proc{session: id, execID: req.GetExecId(), changed: make(chan struct{}), start: time.Now(), keep: s.OutputKeepBytes}
 	g.execs[req.GetExecId()] = p
 	g.requests = append(g.requests, proto.CloneOf(req))
-	// Register the exec before close can stop admission and wait.
+	execs.wg.Add(1)
 	g.wg.Add(1)
-	g.mu.Unlock()
+	return p, execs, nil
+}
 
+// start starts a local process for the exec request.
+func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionRequest) (*proc, error) {
+	p, execs, err := g.admitExec(ds, req)
+	if err != nil {
+		return nil, err
+	}
+	done := func() {
+		execs.wg.Done()
+		g.wg.Done()
+	}
 	dir := ds.GetWorkspacePath()
 	if wd := req.GetWorkingDirectory(); wd != "" {
 		dir = guestPath(ds, wd)
 	}
 	failed := func(reason sandrunv1.ExecFailureReason, msg string) (*proc, error) {
 		p.finish(&sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Failed{Failed: &sandrunv1.DevSessionExecFailed{Reason: reason, Message: msg}}})
-		g.wg.Done()
+		done()
 		return p, nil
 	}
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return failed(sandrunv1.ExecFailureReason_EXEC_FAILURE_REASON_WORKING_DIRECTORY_INVALID, "the working directory does not exist")
 	}
-	ctx := g.ctx
+	ctx := execs.ctx
 	var cancel context.CancelFunc = func() {}
 	if t := req.GetTimeout(); t != nil {
 		ctx, cancel = context.WithTimeout(ctx, t.AsDuration())
@@ -588,10 +649,10 @@ func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionReq
 		return failed(sandrunv1.ExecFailureReason_EXEC_FAILURE_REASON_OTHER, err.Error())
 	}
 	go func() {
-		defer g.wg.Done()
+		defer done()
 		defer cancel()
 		_ = cmd.Wait()
-		timedOut := ctx.Err() != nil && g.ctx.Err() == nil
+		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 		ex := &sandrunv1.DevSessionExecExited{TimedOut: timedOut, EndTime: timestamppb.Now()}
 		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 			ex.Status = &sandrunv1.DevSessionExecExited_Signal{Signal: int32(ws.Signal())}
