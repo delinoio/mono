@@ -103,6 +103,14 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
   const auth = useAuth();
   const { route, navigate } = useRouter();
   const orgs = useOrganizations();
+  const normalizedOrganizationId = organizationId?.toLowerCase();
+  const selectedOrganization =
+    normalizedOrganizationId === undefined
+      ? undefined
+      : orgs.organizations.find(
+          (org) =>
+            org.organizationId.toLowerCase() === normalizedOrganizationId,
+        );
   const section =
     "organizationId" in route &&
     route.id !== RouteId.Sandbox &&
@@ -124,16 +132,9 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
             label="Organization"
             placeholder="Choose an organization"
             value={
-              // An organization that is not in a complete list (a deleted or
-              // foreign one) shows the placeholder, not its raw ID. While the
-              // list still loads or a later page failed, the organization may
-              // just be unloaded, so the current value stays.
-              !orgs.isIncomplete &&
-              !orgs.organizations.some(
-                (o) => o.organizationId === organizationId,
-              )
-                ? null
-                : organizationId
+              selectedOrganization?.organizationId ??
+              // A later page can still contain the route organization.
+              (orgs.isIncomplete ? organizationId : null)
             }
             onValueChange={(value) => {
               if (value === null) return;
