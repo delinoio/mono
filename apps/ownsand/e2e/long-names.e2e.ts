@@ -6,6 +6,8 @@ import { expect, type Screen } from "e2e";
 // e2e.config.ts). The ID of the seeded organization comes from
 // src/mock/mock-api.ts.
 const ACME = "0193a000-0000-7000-8000-000000000001";
+const BUILD_BOX = "0193a000-0000-7000-8000-0000000000d1";
+const LONG_DEVICE_NAME = "w".repeat(253);
 
 // An unbroken name of the longest length that the name fields accept. Each
 // test uses its own prefix, so the page finds its row by the title text.
@@ -142,6 +144,73 @@ async function signIn(screen: Screen, open: () => Promise<void>) {
 }
 
 describe("long names", () => {
+  for (const { width, name } of [
+    { width: 320, name: LONG_DEVICE_NAME },
+    { width: 761, name: LONG_DEVICE_NAME },
+    { width: 320, name: "build-box-1" },
+  ]) {
+    const long = name === LONG_DEVICE_NAME;
+    const scenario = `${long ? "long" : "short"}-device-name-${width}px`;
+    test(`contains the ${scenario} detail heading and controls`, async ({
+      app,
+      screen,
+      browser,
+    }) => {
+      await browser.setViewport({ width, height: 800 });
+      await signIn(screen, () => app.open("/"));
+      if (long) {
+        await browser.evaluate((deviceName) => {
+          sessionStorage.setItem("ownsand-e2e-device-name", deviceName);
+          return null;
+        }, name);
+      }
+      await app.open(`/orgs/${ACME}/devices/${BUILD_BOX}`);
+
+      await expect(
+        screen.getByRole("heading", name, { level: 1, exact: true }),
+      ).toBeVisible();
+      const status = screen.getByText("Online", { exact: true });
+      const save = screen.getByRole("button", "Save limits");
+      const remove = screen.getByRole("button", "Remove device");
+      await expect(status).toBeVisible();
+      await expect(save).toBeEnabled();
+      await expect(remove).toBeEnabled();
+      await app.screenshot(scenario);
+
+      const { lines, headerFits, textFits } = await browser.evaluate(() => {
+        const header = document.querySelector(".page-header")!;
+        const heading = header.querySelector("h1")!;
+        const badge = header.querySelector(".dui-badge")!;
+        const headerBox = header.getBoundingClientRect();
+        const headingBox = heading.getBoundingClientRect();
+        const badgeBox = badge.getBoundingClientRect();
+        const range = document.createRange();
+        range.selectNodeContents(heading);
+        const rects = Array.from(range.getClientRects());
+        return {
+          lines: new Set(rects.map((rect) => rect.top)).size,
+          headerFits: [headingBox, badgeBox].every(
+            (box) => box.left >= headerBox.left && box.right <= headerBox.right,
+          ),
+          textFits: rects.every(
+            (rect) =>
+              rect.left >= headingBox.left &&
+              rect.right <= headingBox.right + 0.5,
+          ),
+        };
+      });
+      const { scrollWidth, clientWidth } = await documentWidths(browser);
+      expect(scrollWidth).toBeLessThanOrEqual(clientWidth);
+      expect(headerFits).toBe(true);
+      expect(textFits).toBe(true);
+      if (long) expect(lines).toBeGreaterThan(1);
+      else expect(lines).toBe(1);
+
+      await remove.tap();
+      await expect(screen.getByRole("alertdialog")).toBeVisible();
+    });
+  }
+
   test("wraps an unbroken template name away from the Delete button", async ({
     app,
     screen,
