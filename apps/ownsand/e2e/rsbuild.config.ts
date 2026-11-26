@@ -11,6 +11,7 @@ export default mergeRsbuildConfig(consoleConfig, {
   source: {
     entry: {
       index: "./src/index.tsx",
+      "enrollment-token": "./e2e/enrollment-token-fixture.ts",
       "sandbox-idempotency": "./e2e/sandbox-idempotency-fixture.ts",
     },
   },
