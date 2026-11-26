@@ -109,6 +109,11 @@ func (d *devSessionService) CreateDevSession(_ context.Context, req *connect.Req
 	if utf8.RuneCountInString(req.Msg.GetLabel()) > 100 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("label has more than 100 characters"))
 	}
+	for _, r := range req.Msg.GetLabel() {
+		if r < 0x20 || (r >= 0x7f && r < 0xa0) {
+			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid label: must not contain control characters"))
+		}
+	}
 	var prof *sandrunv1.RunnerProfile
 	for _, p := range s.profiles {
 		if p.GetOrganizationId() == org.GetOrganizationId() && p.GetRunnerProfileId() == req.Msg.GetRunnerProfileId() && p.GetWorkloadKind() == sandrunv1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION {
