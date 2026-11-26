@@ -47,13 +47,13 @@ isolateGitEnvironment(process.env);
 // GIT_* variable set after this module loads, and the production planner
 // intentionally honors GIT_DIR. Drops inherited GITHUB_* variables: a
 // push-to-main runner sets GITHUB_EVENT_NAME and GITHUB_REF, which would force
-// go, fixtures and e2e.
+// go, fixtures and e2e. Drops inherited CI_BASE so a fixture can leave it unset.
 function plannerEnvironment(extra = {}) {
   return {
     ...isolateGitEnvironment(
       Object.fromEntries(
         Object.entries(process.env).filter(
-          ([key]) => !key.startsWith("GITHUB_"),
+          ([key]) => key !== "CI_BASE" && !key.startsWith("GITHUB_"),
         ),
       ),
     ),
@@ -2297,13 +2297,8 @@ test("planner CLI reports an unset or malformed comparison as a ci_format_error 
   const f = fixture(t);
   f.write("docs/guide.md");
   const head = f.commit();
-  for (const comparison of [
-    { CI_HEAD: head },
-    { CI_BASE: "not-a-sha", CI_HEAD: head },
-    { CI_BASE: "0".repeat(40), CI_HEAD: head },
-  ]) {
+  function assertInvalidComparison(comparison, label) {
     const { result, output, summary } = runPlannerCli(f, comparison);
-    const label = JSON.stringify(comparison);
     assert.equal(result.status, 2, `${label}: ${result.stderr}`);
     assert.equal(result.stdout, "", label);
     const lines = result.stderr.split("\n").filter(Boolean);
@@ -2314,6 +2309,27 @@ test("planner CLI reports an unset or malformed comparison as a ci_format_error 
     assert.equal(existsSync(output), false, label);
     assert.equal(existsSync(summary), false, label);
   }
+
+  assertInvalidComparison({ CI_HEAD: head }, "unset base");
+  assertInvalidComparison(
+    { CI_BASE: "not-a-sha", CI_HEAD: head },
+    "malformed base",
+  );
+  assertInvalidComparison(
+    { CI_BASE: "0".repeat(40), CI_HEAD: head },
+    "zero base",
+  );
+
+  const originalBase = process.env.CI_BASE;
+  t.after(() => {
+    if (originalBase === undefined) {
+      delete process.env.CI_BASE;
+    } else {
+      process.env.CI_BASE = originalBase;
+    }
+  });
+  process.env.CI_BASE = "deadbeef".repeat(5);
+  assertInvalidComparison({ CI_HEAD: head }, "unset base with inherited SHA");
 });
 
 test("planner CLI fails with one ci_format_error and publishes nothing when a publication target is unusable", (t) => {

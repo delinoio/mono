@@ -4432,32 +4432,87 @@ test(
 
 const skipProvision = skip || (!hasFlock && "flock is not installed");
 
-function provisionFixture(t) {
+function provisionFixture(
+  t,
+  { cli = true, loadState = "loaded", queryStatus = 0, aptStatus = 0 } = {},
+) {
   const dir = scratch(t);
   const provision = join(dir, "provision.sh");
+  const calls = join(dir, "calls");
   const source = readFileSync(
     join(root, "scripts/droplet/provision.sh"),
     "utf8",
   );
-  // Redirect the provisioning root and bypass the root check for the fixture.
+  // Keep privileged writes in the fixture and bypass the root check.
   writeFileSync(
     provision,
     source
       .replace('root="/srv/delino"', 'root="$PROVISION_FIXTURE_ROOT"')
-      .replace("if (( EUID != 0 )); then", "if false; then"),
+      .replace("if (( EUID != 0 )); then", "if false; then")
+      .replaceAll("/etc/apt/", "./apt/")
+      .replace("/etc/os-release", "./os-release")
+      .replace("/etc/docker/daemon.json", "./daemon.json"),
   );
+  mkdirSync(join(dir, "apt", "sources.list.d"), { recursive: true });
+  writeFileSync(join(dir, "os-release"), "VERSION_CODENAME=noble\n");
   writeFileSync(join(dir, "key.pub"), "ssh-ed25519 AAAA fixture\n");
+  writeFileSync(join(dir, "load-state"), loadState);
+  // Keep a Docker CLI on the host out of the fresh-install fixture.
+  for (const name of [
+    "bash",
+    "chmod",
+    "cut",
+    "dirname",
+    "flock",
+    "mkdir",
+    "touch",
+  ]) {
+    const executable = execFileSync(
+      "sh",
+      ["-c", 'command -v "$1"', "sh", name],
+      {
+        encoding: "utf8",
+      },
+    ).trim();
+    symlinkSync(executable, join(dir, name));
+  }
   for (const [name, body] of Object.entries({
-    docker: "exit 0",
-    systemctl: "exit 0",
+    ...(cli && { docker: "exit 0" }),
+    systemctl: `
+printf 'systemctl %s\\n' "$*" >> calls
+case "$*" in
+  'show --property=LoadState --value docker.service')
+    printf '%s\\n' "$(< load-state)"
+    exit "$PROVISION_QUERY_STATUS"
+    ;;
+  'enable --now docker') exit 0 ;;
+  *) exit 2 ;;
+esac
+`,
+    "apt-get": `
+printf 'apt-get %s\\n' "$*" >> calls
+if [[ "$1" == install && "$3" == docker-ce ]]; then
+  if (( PROVISION_APT_STATUS != 0 )); then
+    echo "fixture apt install failed" >&2
+    exit "$PROVISION_APT_STATUS"
+  fi
+  printf 'loaded\\n' > load-state
+  printf '#!/usr/bin/env bash\\nexit 0\\n' > docker
+  chmod +x docker
+fi
+`,
+    curl: 'printf "fixture signing key\\n" > "${@: -1}"',
+    dpkg: "echo amd64",
     usermod: "exit 0",
     id: "exit 0",
     getent:
       'printf "deploy:x:1:1::%s/home:/bin/bash\\n" "$PROVISION_FIXTURE_ROOT"',
-    install: 'mkdir -p "${@:8}"',
+    install:
+      'if [[ "$*" == "-m 0755 -d ./apt/keyrings" ]]; then mkdir -p ./apt/keyrings; else mkdir -p "${@:8}"; fi',
     chown: "exit 0",
     runuser: '[[ "$1 $2 $3" == "-u deploy --" ]] && exec "${@:4}"',
-    "configure-docker-logs.sh": "exit 0",
+    "configure-docker-logs.sh":
+      'printf "configure-docker-logs.sh %s\\n" "$*" >> calls',
     "start-caddy.sh": `
 lock="$2/state/.proxy.lock"
 [[ -f "$2/caddy/Caddyfile" && -f "$lock" ]] || exit 1
@@ -4474,6 +4529,7 @@ flock --nonblock --conflict-exit-code 13 "$lock" true
     lock: join(dir, "state", ".proxy.lock"),
     helperRan: () => existsSync(join(dir, "caddy-started")),
     run: (prefix = []) => {
+      writeFileSync(calls, "");
       const [command, ...args] = [
         ...prefix,
         "bash",
@@ -4481,19 +4537,115 @@ flock --nonblock --conflict-exit-code 13 "$lock" true
         join(dir, "key.pub"),
         "test@example.com",
       ];
-      return spawnSync(command, args, {
+      const result = spawnSync(command, args, {
         cwd: dir,
         encoding: "utf8",
         env: {
           ...baseEnv,
-          PATH: dir + delimiter + baseEnv.PATH,
+          PATH: dir,
           PROVISION_FIXTURE_ROOT: dir,
+          PROVISION_QUERY_STATUS: String(queryStatus),
+          PROVISION_APT_STATUS: String(aptStatus),
           DROPLET_PROXY_LOCK_TIMEOUT: "0",
         },
       });
+      return {
+        ...result,
+        calls: readFileSync(calls, "utf8").trim().split("\n"),
+      };
     },
   };
 }
+
+const queryDockerUnit =
+  "systemctl show --property=LoadState --value docker.service";
+const installDockerEngine = [
+  "apt-get update",
+  "apt-get install -y ca-certificates curl",
+  "apt-get update",
+  "apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin",
+];
+const configureDockerEngine = [
+  "configure-docker-logs.sh ./daemon.json",
+  "systemctl enable --now docker",
+];
+
+test(
+  "provision installs Engine on a CLI-only host and skips apt on rerun",
+  { skip: skipProvision },
+  (t) => {
+    const fixture = provisionFixture(t, { loadState: "not-found" });
+    const first = fixture.run();
+    assert.equal(first.status, 0, first.stderr);
+    assert.deepEqual(first.calls, [
+      queryDockerUnit,
+      ...installDockerEngine,
+      ...configureDockerEngine,
+    ]);
+    const second = fixture.run();
+    assert.equal(second.status, 0, second.stderr);
+    assert.deepEqual(second.calls, [queryDockerUnit, ...configureDockerEngine]);
+  },
+);
+
+test(
+  "provision reaches log setup and startup with a loaded but stopped Docker unit",
+  { skip: skipProvision },
+  (t) => {
+    const result = provisionFixture(t).run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.calls, [queryDockerUnit, ...configureDockerEngine]);
+  },
+);
+
+test(
+  "provision installs Engine when the Docker CLI is absent",
+  { skip: skipProvision },
+  (t) => {
+    const result = provisionFixture(t, { cli: false }).run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.calls, [
+      ...installDockerEngine,
+      ...configureDockerEngine,
+    ]);
+  },
+);
+
+test(
+  "provision stops before log setup when the Engine install fails",
+  { skip: skipProvision },
+  (t) => {
+    const result = provisionFixture(t, {
+      loadState: "not-found",
+      aptStatus: 42,
+    }).run();
+    assert.equal(result.status, 42, result.stderr);
+    assert.match(result.stderr, /fixture apt install failed/);
+    assert.deepEqual(result.calls, [queryDockerUnit, ...installDockerEngine]);
+  },
+);
+
+test(
+  "provision stops before apt or log setup when it cannot establish the Docker unit state",
+  { skip: skipProvision },
+  (t) => {
+    for (const [options, diagnostic] of [
+      [
+        { loadState: "", queryStatus: 1 },
+        /could not query the load state of docker\.service/,
+      ],
+      [
+        { loadState: "unknown" },
+        /unexpected load state for docker\.service: unknown/,
+      ],
+    ]) {
+      const result = provisionFixture(t, options).run();
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, diagnostic);
+      assert.deepEqual(result.calls, [queryDockerUnit]);
+    }
+  },
+);
 
 test(
   "provision holds the proxy lock through start-caddy and preserves its inode",
