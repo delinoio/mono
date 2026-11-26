@@ -13,6 +13,12 @@ import (
 )
 
 func main() {
+	os.Exit(run(nil))
+}
+
+// run calls afterFirstInterrupt after it restores the default interrupt action.
+// The Linux subprocess test uses this callback to synchronize its two signals.
+func run(afterFirstInterrupt func()) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	// The first interrupt cancels ctx. Stop catching the signal at that point
 	// so that a second interrupt takes the default action and ends a command
@@ -21,8 +27,11 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		stop()
+		if afterFirstInterrupt != nil {
+			afterFirstInterrupt()
+		}
 	}()
 	code := cli.Run(ctx, cli.Env{Args: os.Args[1:]})
 	stop()
-	os.Exit(code)
+	return code
 }
