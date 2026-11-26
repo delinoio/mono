@@ -183,3 +183,60 @@ func TestListApiKeysExpiryBoundary(t *testing.T) {
 		}
 	})
 }
+
+func TestRevokeApiKeyPreservesTimestamp(t *testing.T) {
+	const revoked = sandrunv1.ApiKeyState_API_KEY_STATE_REVOKED
+	req := connect.NewRequest(&sandrunv1.RevokeApiKeyRequest{OrganizationId: "org-1", ApiKeyId: "key-1"})
+	t.Run("first revoke", func(t *testing.T) {
+		key := &sandrunv1.ApiKey{
+			OrganizationId: req.Msg.GetOrganizationId(), ApiKeyId: req.Msg.GetApiKeyId(),
+			State: sandrunv1.ApiKeyState_API_KEY_STATE_ACTIVE,
+		}
+		service := &apiKeyService{s: &Server{apiKeys: []*sandrunv1.ApiKey{key}}}
+
+		res, err := service.RevokeApiKey(t.Context(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := res.Msg.GetApiKey(); got.GetState() != revoked || got.GetRevokedAt() == nil {
+			t.Fatalf("got key %v, want REVOKED with a timestamp", got)
+		}
+	})
+
+	t.Run("retry and list", func(t *testing.T) {
+		key := &sandrunv1.ApiKey{
+			OrganizationId: req.Msg.GetOrganizationId(), ApiKeyId: req.Msg.GetApiKeyId(),
+			State: revoked, RevokedAt: timestamppb.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)),
+		}
+		want := proto.CloneOf(key)
+		service := &apiKeyService{s: &Server{apiKeys: []*sandrunv1.ApiKey{key}}}
+
+		res, err := service.RevokeApiKey(t.Context(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := res.Msg.GetApiKey(); !proto.Equal(got, want) {
+			t.Errorf("retry returned %v, want %v", got, want)
+		}
+
+		list, err := service.ListApiKeys(t.Context(), connect.NewRequest(&sandrunv1.ListApiKeysRequest{
+			OrganizationId: req.Msg.GetOrganizationId(),
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if keys := list.Msg.GetApiKeys(); len(keys) != 1 || !proto.Equal(keys[0], want) {
+			t.Errorf("list returned %v, want only %v", keys, want)
+		}
+
+		for _, missing := range []*sandrunv1.RevokeApiKeyRequest{
+			{OrganizationId: req.Msg.GetOrganizationId(), ApiKeyId: "unknown"},
+			{OrganizationId: "org-2", ApiKeyId: req.Msg.GetApiKeyId()},
+		} {
+			_, err := service.RevokeApiKey(t.Context(), connect.NewRequest(missing))
+			if connect.CodeOf(err) != connect.CodeNotFound {
+				t.Errorf("revoke %v returned %v, want NotFound", missing, err)
+			}
+		}
+	})
+}
