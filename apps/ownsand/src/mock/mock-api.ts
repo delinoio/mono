@@ -807,24 +807,28 @@ function newMockId(): string {
  * One page of a list, like the control plane: rows in ascending ID order, 50
  * rows by default and at most 200 (a negative size fails with
  * `invalid_argument`), starting after the row ID that the opaque page token
- * names, and a continuation token whenever a page is full, even when no row
- * follows. The token is the unpadded base64url form of `v1:` and the ID of
- * the last row; a token that is not that form of a UUID v7 fails with
- * `invalid_argument`. A token names a position, not a row, so it keeps
- * working after the row it names is deleted.
+ * names. Most lists return a continuation token whenever a page is full.
+ * The Accounts-backed billing list requires another eligible row and scopes
+ * its token to the RPC and caller. The token is the unpadded base64url form
+ * of the prefix and the last UUID v7, so it also works after that row is deleted.
  */
 function pageOf<T>(
   rows: readonly T[],
   req: { pageSize: number; pageToken: string },
   idOf: (row: T) => string,
+  {
+    tokenPrefix = PAGE_TOKEN_PREFIX,
+    requireMoreRows = false,
+  }: { tokenPrefix?: string; requireMoreRows?: boolean } = {},
 ): { page: T[]; nextPageToken: string } {
   if (req.pageSize < 0) {
     throw new ConnectError("invalid page_size", Code.InvalidArgument);
   }
   const pageSize = req.pageSize === 0 ? 50 : Math.min(req.pageSize, 200);
+  const limit = requireMoreRows ? pageSize + 1 : pageSize;
   let after = "";
   if (req.pageToken !== "") {
-    after = decodePageToken(req.pageToken);
+    after = decodePageToken(req.pageToken, tokenPrefix);
   }
   const page = rows
     .filter((row) => after === "" || idOf(row).toLowerCase() > after)
@@ -833,25 +837,27 @@ function pageOf<T>(
       const y = idOf(b).toLowerCase();
       return x < y ? -1 : x > y ? 1 : 0;
     })
-    .slice(0, pageSize);
+    .slice(0, limit);
+  const hasContinuation = page.length === limit;
+  if (page.length > pageSize) page.pop();
   const last = page.at(-1);
   return {
     page,
     nextPageToken:
-      page.length === pageSize && last !== undefined
-        ? encodePageToken(idOf(last))
+      hasContinuation && last !== undefined
+        ? encodePageToken(idOf(last), tokenPrefix)
         : "",
   };
 }
 
-function encodePageToken(id: string): string {
-  return btoa(PAGE_TOKEN_PREFIX + id.toLowerCase())
+function encodePageToken(id: string, prefix: string): string {
+  return btoa(prefix + id.toLowerCase())
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
 }
 
-function decodePageToken(token: string): string {
+function decodePageToken(token: string, prefix: string): string {
   const invalid = new ConnectError("invalid page_token", Code.InvalidArgument);
   if (!/^[A-Za-z0-9_-]+$/.test(token)) throw invalid;
   let raw: string;
@@ -860,8 +866,8 @@ function decodePageToken(token: string): string {
   } catch {
     throw invalid;
   }
-  if (!raw.startsWith(PAGE_TOKEN_PREFIX)) throw invalid;
-  const after = raw.slice(PAGE_TOKEN_PREFIX.length);
+  if (!raw.startsWith(prefix)) throw invalid;
+  const after = raw.slice(prefix.length);
   if (!UUID_V7.test(after)) throw invalid;
   return after.toLowerCase();
 }
@@ -1971,14 +1977,24 @@ export function createMockTransport(
       listLinkableBillingAccounts(req) {
         const { role } = membership(req.organizationId);
         requireOwner(role);
+        const { page, nextPageToken } = pageOf(
+          linkable,
+          req,
+          (a) => a.billingAccountId,
+          {
+            tokenPrefix: `v1:ListLinkableBillingAccounts:${encodeURIComponent(userId)}:`,
+            requireMoreRows: true,
+          },
+        );
         return {
-          billingAccounts: linkable.map((a) =>
+          billingAccounts: page.map((a) =>
             create(LinkableBillingAccountSchema, {
               billingAccountId: a.billingAccountId,
               name: a.name,
               role: a.role,
             }),
           ),
+          nextPageToken,
         };
       },
       linkBillingAccount(req) {

@@ -7,6 +7,7 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import {
+  BillingAccountRole,
   BillingPhase,
   BillingService,
   type LinkBillingAccountRequest,
@@ -192,6 +193,7 @@ export function createMockTransport(): Transport {
     sessionStorage.getItem("ownsand-e2e-restore-devices") === "true";
   const pageInvitations = methodName === "ListInvitations";
   const pageSources = methodName === "SnapshotSources";
+  const pageBilling = methodName === "ListLinkableBillingAccounts";
   const holdTemplateFirstPage =
     sessionStorage.getItem("ownsand-e2e-template-first-page") === "hold";
   let heldTemplateFirstPage = false;
@@ -252,6 +254,18 @@ export function createMockTransport(): Transport {
       ),
       extraSnapshots: pageSources ? 200 : 0,
       extraTemplates: pageSources ? 200 : 0,
+      linkableBillingAccounts: pageBilling
+        ? Array.from({ length: 201 }, (_, i) => {
+            const index = 201 - i;
+            return {
+              billingAccountId: `0193a000-0000-7000-8000-${index.toString(16).padStart(12, "0")}`,
+              name: `Billing fixture ${String(index).padStart(3, "0")}`,
+              role: BillingAccountRole.OWNER,
+              balanceUsdMicros: 1_000_000n,
+              subscriptionActive: true,
+            };
+          })
+        : undefined,
     }),
   );
   if (sessionStorage.getItem("ownsand-e2e-api-key-collision") === "true") {
