@@ -1862,6 +1862,14 @@ test("plan and --check validate binary license asset basenames", async (t) => {
   }
 });
 
+test("check rejects a malformed workspace manifest", (t) => {
+  const dir = releaseFixture(t);
+  const unrelated = join(dir, "apps/unrelated");
+  mkdirSync(unrelated, { recursive: true });
+  writeFileSync(join(unrelated, "package.json"), "{ malformed");
+  assert.throws(() => check(dir), SyntaxError);
+});
+
 test("check rejects a directory at a license or entitlements path", (t) => {
   const dir = releaseFixture(t);
   mkdirSync(join(dir, "LICENSE"));

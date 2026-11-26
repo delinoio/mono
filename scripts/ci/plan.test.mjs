@@ -397,6 +397,53 @@ test("changes to declared release files select fixtures", async (t) => {
   }
 });
 
+test("failed manifest reads preserve other packages' release inputs", async (t) => {
+  for (const manifestPath of [
+    "apps/unrelated/package.json",
+    "cmds/ownsand/package.json",
+  ]) {
+    for (const failingPath of [manifestPath, `${manifestPath}/placeholder`]) {
+      await t.test(failingPath, (t) => {
+        const f = fixture(t);
+        writeReleasePackage(f, { licenseFiles: ["NOTICE"] });
+        f.write("NOTICE");
+        f.write(failingPath, "{ malformed");
+        const base = f.commit();
+
+        const entitlements = "cmds/ownsand-agent/entitlements.plist";
+        assert.deepEqual(
+          declaredReleaseInputs(f.cwd),
+          new Set([entitlements, "NOTICE"]),
+        );
+        for (const path of [entitlements, "NOTICE"]) {
+          for (const change of [
+            () => f.write(path, "changed\n"),
+            () => f.git("rm", "--quiet", path),
+            () => f.git("mv", path, `${path}.moved`),
+          ]) {
+            change();
+            const result = plan(f.cwd, base, f.commit());
+            assert.equal(result.fixtures, true, path);
+            assert.equal(result.quality, true, path);
+            f.git("reset", "--hard", base);
+          }
+        }
+
+        f.write("unrelated.plist");
+        const unrelated = plan(f.cwd, base, f.commit());
+        assert.equal(unrelated.fixtures, false);
+        assert.equal(unrelated.quality, false);
+
+        if (failingPath === manifestPath) {
+          f.git("reset", "--hard", base);
+          f.write(manifestPath, "{ still malformed");
+          assert.equal(plan(f.cwd, base, f.commit()).fixtures, true);
+        }
+      });
+    }
+  }
+});
+
 test("release file selection ignores files that no release declares", async (t) => {
   await t.test("an unreferenced asset beside the declared files", (t) => {
     const f = fixture(t);

@@ -25,27 +25,29 @@ export const workspacePackageDirs = [
 ];
 
 // Reads the manifest of every workspace package under `repoRoot`.
-export function readWorkspacePackages(repoRoot) {
+export function readWorkspacePackages(
+  repoRoot,
+  { skipUnreadableManifests = false } = {},
+) {
   const packages = [];
-  for (const dir of workspacePackageDirs) {
+  const addPackage = (dir) => {
     const manifestPath = join(repoRoot, dir, "package.json");
-    if (!existsSync(manifestPath)) continue;
-    packages.push({
-      dir,
-      manifest: JSON.parse(readFileSync(manifestPath, "utf8")),
-    });
+    if (!existsSync(manifestPath)) return;
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      packages.push({ dir, manifest });
+    } catch (error) {
+      if (!skipUnreadableManifests) throw error;
+    }
+  };
+  for (const dir of workspacePackageDirs) {
+    addPackage(dir);
   }
   for (const workspaceRoot of workspaceRoots) {
     const rootPath = join(repoRoot, workspaceRoot);
     if (!existsSync(rootPath)) continue;
     for (const entry of readdirSync(rootPath, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const manifestPath = join(rootPath, entry.name, "package.json");
-      if (!existsSync(manifestPath)) continue;
-      packages.push({
-        dir: `${workspaceRoot}/${entry.name}`,
-        manifest: JSON.parse(readFileSync(manifestPath, "utf8")),
-      });
+      if (entry.isDirectory()) addPackage(`${workspaceRoot}/${entry.name}`);
     }
   }
   return packages;
@@ -105,7 +107,9 @@ export function declaredReleasePaths({ dir, manifest }) {
 export function declaredReleaseInputs(repoRoot) {
   let packages;
   try {
-    packages = readWorkspacePackages(repoRoot);
+    packages = readWorkspacePackages(repoRoot, {
+      skipUnreadableManifests: true,
+    });
   } catch {
     return new Set();
   }
