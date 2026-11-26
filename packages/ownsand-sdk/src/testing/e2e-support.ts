@@ -10,42 +10,92 @@ import {
   SnapshotState,
 } from "@delino/ownsand-protos/v1/common_pb";
 
-/** Waits for one billing transition, including time spent in RPCs and delays. */
-export async function waitForSandboxState(
-  sandbox: { get(signal: AbortSignal): Promise<{ state: SandboxState }> },
+interface SandboxStateReader {
+  get(signal: AbortSignal): Promise<{ state: SandboxState }>;
+}
+
+interface SandboxWaitOptions {
+  timeoutMs?: number;
+  clock?: Clock;
+}
+
+/** Waits for a new sandbox to reach RUNNING. */
+export function waitForSandboxStartup(
+  sandbox: SandboxStateReader,
+  options?: SandboxWaitOptions,
+): Promise<void> {
+  return waitForSandboxState(sandbox, SandboxState.RUNNING, options);
+}
+
+/** Applies a billing status and waits for its sandbox state on one deadline. */
+export function transitionBilling(
+  sandbox: SandboxStateReader,
+  billingUrl: string,
+  status: BillingControlStatus,
+  options?: SandboxWaitOptions,
+): Promise<void> {
+  const target =
+    status === BillingControlStatus.Suspended
+      ? SandboxState.PAUSED
+      : SandboxState.RUNNING;
+  return waitForSandboxState(sandbox, target, options, { billingUrl, status });
+}
+
+async function waitForSandboxState(
+  sandbox: SandboxStateReader,
   target: SandboxState,
-  {
-    timeoutMs = 60_000,
-    clock = systemClock,
-  }: {
-    timeoutMs?: number;
-    clock?: Clock;
-  } = {},
+  { timeoutMs = 60_000, clock = systemClock }: SandboxWaitOptions = {},
+  billing?: { billingUrl: string; status: BillingControlStatus },
 ): Promise<void> {
   const deadline = clock.now() + timeoutMs;
   const stop = new AbortController();
+  const stage = billing === undefined ? "sandbox startup" : "sandbox";
+  let pendingBilling = billing;
   let lastState: SandboxState | undefined;
   const expire = () =>
     stop.abort(
       new Error(
-        `sandbox did not reach ${SandboxState[target]} within ${timeoutMs} ms: last state ${
-          lastState === undefined ? "unknown" : SandboxState[lastState]
-        }`,
+        pendingBilling === undefined
+          ? `${stage} did not reach ${SandboxState[target]} within ${timeoutMs} ms: last state ${
+              lastState === undefined ? "unknown" : SandboxState[lastState]
+            }`
+          : `billing control ${pendingBilling.status} timed out after ${timeoutMs} ms`,
       ),
     );
   const checkDeadline = () => {
-    // The timer callback can run after a poll delay or RPC has settled.
+    // A request or poll delay can settle before the timer callback runs.
     if (clock.now() >= deadline && !stop.signal.aborted) expire();
     stop.signal.throwIfAborted();
   };
   const poll = async () => {
     try {
+      if (billing !== undefined) {
+        checkDeadline();
+        await setBilling(
+          billing.billingUrl,
+          billing.status,
+          stop.signal,
+          checkDeadline,
+        );
+        checkDeadline();
+        pendingBilling = undefined;
+      }
       for (;;) {
         checkDeadline();
         const { state } = await sandbox.get(stop.signal);
         checkDeadline();
         lastState = state;
         if (state === target) return;
+        if (
+          billing === undefined &&
+          (state === SandboxState.PAUSED ||
+            state === SandboxState.DELETED ||
+            state === SandboxState.FAILED)
+        ) {
+          throw new Error(
+            `sandbox startup reached ${SandboxState[state]} while waiting for RUNNING`,
+          );
+        }
         await clock.sleep(200, stop.signal);
       }
     } catch (error) {
@@ -59,9 +109,11 @@ export async function waitForSandboxState(
       once: true,
     });
   });
-  clock.sleep(timeoutMs, stop.signal).then(expire, () => {});
+  clock
+    .sleep(Math.ceil(deadline - clock.now()), stop.signal)
+    .then(expire, () => {});
   try {
-    // Race the whole poll so that an RPC that ignores abort cannot block cleanup.
+    // A request that ignores abort must still let cleanup start.
     await Promise.race([aborted, poll()]);
   } finally {
     stop.abort();
@@ -248,15 +300,17 @@ export enum BillingControlStatus {
 }
 
 /** Applies a billing status to the organization at once. */
-export async function setBilling(
+async function setBilling(
   billingUrl: string,
   status: BillingControlStatus,
-  signal?: AbortSignal,
+  signal: AbortSignal,
+  checkDeadline = () => signal.throwIfAborted(),
 ): Promise<void> {
   const res = await fetch(`${billingUrl}/billing/${status}`, {
     method: "POST",
     signal,
   });
+  checkDeadline();
   if (!res.ok) {
     throw new Error(
       `billing control ${status}: ${res.status} ${await res.text()}`,
