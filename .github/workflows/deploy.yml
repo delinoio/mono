@@ -528,13 +528,13 @@ jobs:
           name: release-manifest-tool
           path: ${{ runner.temp }}/binaries/tools
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-release
           path: ${{ runner.temp }}/binaries/release
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-unsigned-darwin-cross
@@ -614,7 +614,7 @@ jobs:
           name: binaries-signed-darwin
           path: ${{ runner.temp }}/signed
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
   publish-binaries:
     name: Publish binary releases

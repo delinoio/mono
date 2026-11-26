@@ -2101,19 +2101,51 @@ test(
   },
 );
 
-// The steps of the `publish-binaries` job of `deploy.yml`, as text.
-function publishSteps() {
+// The steps of a `deploy.yml` job, as text.
+function workflowJobSteps(jobId) {
   const workflow = readFileSync(
     join(root, ".github/workflows/deploy.yml"),
     "utf8",
   );
-  const job =
-    workflow.match(/^ {2}publish-binaries:\n(?:(?: {4}.*)?\n)+/m)?.[0] ?? "";
+  const job = workflow
+    .split(/^ {2}(?=\S)/m)
+    .find((section) => section.startsWith(`${jobId}:\n`));
+  assert.ok(job, `workflow job ${jobId} is missing`);
   return job.split(/^ {6}- /m).slice(1);
 }
 
+test("publish-binaries artifacts are retained for the 30-day rerun window", () => {
+  const downloads = workflowJobSteps("publish-binaries").filter((step) =>
+    step.includes("actions/download-artifact@"),
+  );
+  const artifactName = (step) => step.match(/^ {10}name: (.+)$/m)?.[1];
+  const producers = {
+    "binaries-release": "build-binaries",
+    "binaries-signed-darwin": "sign-macos-binaries",
+    "release-manifest-tool": "build-binaries",
+  };
+  assert.deepEqual(downloads.map(artifactName).sort(), Object.keys(producers));
+
+  for (const download of downloads) {
+    const name = artifactName(download);
+    const uploads = workflowJobSteps(producers[name]).filter(
+      (step) =>
+        step.includes("actions/upload-artifact@") &&
+        artifactName(step) === name,
+    );
+    assert.equal(uploads.length, 1, `${name} must have one producer upload`);
+    assert.match(uploads[0], /^ {10}retention-days: 30$/m, name);
+    if (name === "binaries-signed-darwin") {
+      assert.match(
+        download,
+        /^ {8}if: needs\.plan\.outputs\.has_darwin_binaries == 'true'$/m,
+      );
+    }
+  }
+});
+
 test("publish-binaries checks the signed manifest before it changes a release", () => {
-  const steps = publishSteps();
+  const steps = workflowJobSteps("publish-binaries");
   const index = (needle) => steps.findIndex((step) => step.includes(needle));
   const order = [
     "release-binaries.sh assemble",
@@ -2140,7 +2172,7 @@ test("publish-binaries checks the signed manifest before it changes a release", 
 });
 
 test("publish-binaries stores the signed manifests before the first R2 upload", () => {
-  const steps = publishSteps();
+  const steps = workflowJobSteps("publish-binaries");
   const index = (needle) => steps.findIndex((step) => step.includes(needle));
   const saveAt = index("actions/upload-artifact@");
   const save = steps[saveAt];
@@ -2195,7 +2227,7 @@ test(
 );
 
 test("publish-binaries saves the manifests under an attempt-specific name", () => {
-  const steps = publishSteps();
+  const steps = workflowJobSteps("publish-binaries");
   const saves = steps.filter((step) =>
     step.includes("actions/upload-artifact@"),
   );
