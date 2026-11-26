@@ -320,6 +320,16 @@ h1[tabindex="-1"]:focus {
   list-style: none;
 }
 
+.detail .labels > li,
+.detail .labels .dui-badge {
+  max-inline-size: 100%;
+}
+
+.detail .labels .dui-badge {
+  padding-block: 4px;
+  white-space: normal;
+}
+
 .details {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
