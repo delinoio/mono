@@ -9,7 +9,9 @@ import (
 	"math"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
@@ -487,26 +489,80 @@ func TestSendWindowConsumeEndedContext(t *testing.T) {
 		t.Fatalf("active consume: %v, available %d", err, w.Available())
 	}
 
-	// A waiter that is canceled and woken by a window update at the same
-	// time must not deduct the new credit.
-	waiter, err := NewSendWindow(10)
-	if err != nil {
-		t.Fatal(err)
+	synctest.Test(t, func(t *testing.T) {
+		waiter, err := NewSendWindow(10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		gate := &sendWindowWakeContext{
+			Context: ctx,
+			arm:     make(chan struct{}, 1),
+			entered: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		release := sync.OnceFunc(func() { close(gate.release) })
+		done := make(chan error, 1)
+		go func() {
+			defer close(done)
+			done <- waiter.Consume(gate, 50)
+		}()
+		defer func() {
+			cancel()
+			release()
+			for range done {
+			}
+		}()
+
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("Consume returned before credit update: %v", err)
+		default:
+		}
+
+		// Keep the context live until the credit update wakes Consume and
+		// it reaches the next context check.
+		gate.arm <- struct{}{}
+		if err := waiter.Add(100); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("Consume returned before the post-wake context check: %v", err)
+		case <-gate.entered:
+		default:
+			t.Fatal("credit update did not wake Consume into its next context check")
+		}
+
+		cancel()
+		release()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled waiter: %v", err)
+		}
+		if got := waiter.Available(); got != 110 {
+			t.Fatalf("available %d, want 110", got)
+		}
+	})
+}
+
+// sendWindowWakeContext pauses the first Err call after the test arms it.
+type sendWindowWakeContext struct {
+	context.Context
+	arm     chan struct{}
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (ctx *sendWindowWakeContext) Err() error {
+	select {
+	case <-ctx.arm:
+		close(ctx.entered)
+		<-ctx.release
+	default:
 	}
-	wctx, wcancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- waiter.Consume(wctx, 50) }()
-	time.Sleep(10 * time.Millisecond)
-	wcancel()
-	if err := waiter.Add(100); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled waiter: %v", err)
-	}
-	if waiter.Available() != 110 {
-		t.Fatalf("available %d, want 110", waiter.Available())
-	}
+	return ctx.Context.Err()
 }
 
 func TestReceiveWindow(t *testing.T) {
