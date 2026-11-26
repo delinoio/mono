@@ -166,6 +166,9 @@ type fakeCP struct {
 	t   testing.TB
 	srv *httptest.Server
 
+	beforeGetSandbox func(context.Context) error
+	onExecRequest    func(*ownsandv1.ExecRequest)
+
 	mu          sync.Mutex
 	orgID       string
 	sandboxID   string
@@ -480,8 +483,13 @@ func (f *fakeSandboxes) CreateSandbox(ctx context.Context, req *connect.Request[
 	return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: sb}), nil
 }
 
-func (f *fakeSandboxes) GetSandbox(_ context.Context, req *connect.Request[ownsandv1.GetSandboxRequest]) (*connect.Response[ownsandv1.GetSandboxResponse], error) {
+func (f *fakeSandboxes) GetSandbox(ctx context.Context, req *connect.Request[ownsandv1.GetSandboxRequest]) (*connect.Response[ownsandv1.GetSandboxResponse], error) {
 	cp := f.cp
+	if cp.beforeGetSandbox != nil {
+		if err := cp.beforeGetSandbox(ctx); err != nil {
+			return nil, err
+		}
+	}
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 	for _, sb := range cp.created {
@@ -925,6 +933,9 @@ func (f *fakeRelay) execLike(ctx context.Context, method string, h http.Header, 
 
 func (f *fakeRelay) Exec(ctx context.Context, req *connect.Request[ownsandv1.ExecRequest], stream *connect.ServerStream[ownsandv1.ExecResponse]) error {
 	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
+	if f.cp.onExecRequest != nil {
+		f.cp.onExecRequest(req.Msg)
+	}
 	return f.execLike(ctx, "Exec", req.Header(), nil, req.Msg, func(ev *ownsandv1.ExecEvent) error {
 		return stream.Send(&ownsandv1.ExecResponse{Event: ev})
 	})
