@@ -148,7 +148,7 @@ export interface ConnectionOptions {
  * not set, reports byte activity and redacts the credential from errors.
  */
 export function createApiTransport(options: ConnectionOptions): Transport {
-  return createConnectTransport({
+  const transport = createConnectTransport({
     baseUrl: options.origin,
     useBinaryFormat: true,
     fetch: guardedFetch(options),
@@ -159,6 +159,16 @@ export function createApiTransport(options: ConnectionOptions): Transport {
       credentialInterceptor(options),
     ],
   });
+  return {
+    unary: transport.unary,
+    stream(...args) {
+      const opening = transport.stream(...args);
+      // Connect starts the call now and first awaits it when the caller reads.
+      // Handle an early rejection while keeping it on the original promise.
+      void opening.catch(() => {});
+      return opening;
+    },
+  };
 }
 
 /**
