@@ -129,6 +129,8 @@ export function createMockTransport(): Transport {
       : undefined;
   // These lists use the base mock's control-plane page size and cursor.
   const pageDevices = methodName === "ListDevices";
+  const twoRestoreDevices =
+    sessionStorage.getItem("ownsand-e2e-restore-devices") === "true";
   const pageInvitations = methodName === "ListInvitations";
   const pageSources = methodName === "SnapshotSources";
   const holdTemplateFirstPage =
@@ -169,7 +171,7 @@ export function createMockTransport(): Transport {
   const mock = browserSandboxTransitionMock(
     createBaseMock({
       extraApiKeys: Number(methodName === "ListApiKeys"),
-      extraDevices: pageDevices ? 199 : 0,
+      extraDevices: pageDevices ? 199 : Number(twoRestoreDevices),
       extraEnrollmentTokens: Number(
         methodName === "ListEnrollmentTokens" ||
           refreshList === "ListEnrollmentTokens",

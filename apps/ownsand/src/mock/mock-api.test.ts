@@ -26,7 +26,10 @@ import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
-import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
+import {
+  type SandboxSource,
+  SandboxService,
+} from "@delino/ownsand-protos/v1/sandbox_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { uuidV7 } from "../uuid.ts";
 import {
@@ -747,11 +750,11 @@ describe("mock createSandbox base image placement", () => {
 
 describe("mock sandbox guest OS", () => {
   const organizationId = MOCK_IDS.acme;
-  const request = (source: Parameters<typeof sourceOf>[0]) => ({
+  const request = (source: Parameters<typeof sourceOf>[0], diskGib = 10n) => ({
     organizationId,
     idempotencyKey: uuidV7(),
     source: sourceOf(source),
-    resources: { vcpuCount: 1, memoryMib: 1024n, diskGib: 10n },
+    resources: { vcpuCount: 1, memoryMib: 1024n, diskGib },
     idleTtl: { seconds: 600n },
     maxTtl: { seconds: 3600n },
   });
@@ -829,10 +832,10 @@ describe("mock sandbox guest OS", () => {
   test("the seeded snapshot and template keep the Linux guest", async () => {
     const client = createClient(SandboxService, createMockTransport());
     const a = await client.createSandbox(
-      request({ snapshotId: MOCK_IDS.snapshot }),
+      request({ snapshotId: MOCK_IDS.snapshot }, 20n),
     );
     const b = await client.createSandbox(
-      request({ templateId: MOCK_IDS.template }),
+      request({ templateId: MOCK_IDS.template }, 20n),
     );
     expect(a.sandbox?.guestOs).toBe(GuestOs.LINUX);
     expect(b.sandbox?.guestOs).toBe(GuestOs.LINUX);
@@ -852,6 +855,158 @@ describe("mock sandbox guest OS", () => {
     await expect(
       client.createSandbox(request({ baseImage: BaseImage.UNSPECIFIED })),
     ).rejects.toMatchObject({ code: Code.InvalidArgument });
+  });
+});
+
+describe("mock createSandbox restore restrictions", () => {
+  const organizationId = MOCK_IDS.acme;
+  const baseImage = { case: "baseImage", value: BaseImage.LINUX } as const;
+  const request = (source: SandboxSource["source"], deviceId?: string) => ({
+    organizationId,
+    source: { source },
+    idempotencyKey: uuidV7(),
+    resources: { vcpuCount: 2, memoryMib: 4096n, diskGib: 20n },
+    idleTtl: { seconds: 600n },
+    maxTtl: { seconds: 3600n },
+    placement: deviceId === undefined ? undefined : { deviceId },
+  });
+
+  async function twoLinuxDevices() {
+    const transport = createMockTransport({ extraDevices: 1 });
+    const devices = createClient(DeviceService, transport);
+    const list = await devices.listDevices({
+      organizationId,
+      state: DeviceState.ONLINE,
+    });
+    const other = list.devices.find(
+      (device) =>
+        device.deviceId !== MOCK_IDS.buildBox &&
+        device.hostOs === HostOs.LINUX &&
+        device.arch === Arch.AMD64,
+    );
+    return {
+      sandboxes: createClient(SandboxService, transport),
+      snapshots: createClient(SnapshotService, transport),
+      otherDeviceId: other!.deviceId,
+    };
+  }
+
+  test.each([
+    { case: "snapshotId", value: MOCK_IDS.snapshot },
+    { case: "templateId", value: MOCK_IDS.template },
+  ] as const)(
+    "enforces the disk minimum for $case before placement",
+    async (source) => {
+      const sandboxes = createClient(SandboxService, createMockTransport());
+      const restore = request(source, MOCK_IDS.buildBox);
+      const before = await sandboxes.listSandboxes({ organizationId });
+
+      await expect(
+        sandboxes.createSandbox({
+          ...restore,
+          resources: { ...restore.resources, diskGib: 19n },
+        }),
+      ).rejects.toMatchObject({
+        code: Code.InvalidArgument,
+        rawMessage:
+          "invalid resources.disk_gib: must be at least the snapshot's disk size",
+      });
+      const after = await sandboxes.listSandboxes({ organizationId });
+      expect(after.sandboxes).toHaveLength(before.sandboxes.length);
+
+      const equal = await sandboxes.createSandbox(restore);
+      expect(equal.sandbox).toMatchObject({
+        deviceId: MOCK_IDS.buildBox,
+        state: SandboxState.RUNNING,
+        resources: { diskGib: 20n },
+      });
+      const replay = await sandboxes.createSandbox(restore);
+      expect(replay.sandbox?.sandboxId).toBe(equal.sandbox?.sandboxId);
+
+      const larger = await sandboxes.createSandbox({
+        ...request(source, MOCK_IDS.buildBox),
+        resources: { ...restore.resources, diskGib: 21n },
+      });
+      expect(larger.sandbox?.resources?.diskGib).toBe(21n);
+    },
+  );
+
+  test("a base-image sandbox can use a smaller disk", async () => {
+    const sandboxes = createClient(SandboxService, createMockTransport());
+    const base = request(baseImage, MOCK_IDS.buildBox);
+    const { sandbox } = await sandboxes.createSandbox({
+      ...base,
+      resources: { ...base.resources, diskGib: 19n },
+    });
+    expect(sandbox).toMatchObject({
+      deviceId: MOCK_IDS.buildBox,
+      state: SandboxState.RUNNING,
+      resources: { diskGib: 19n },
+    });
+  });
+
+  test.each([
+    { case: "snapshotId", value: MOCK_IDS.snapshot },
+    { case: "templateId", value: MOCK_IDS.template },
+  ] as const)(
+    "rejects explicit non-holder placement for $case",
+    async (source) => {
+      const { sandboxes, otherDeviceId } = await twoLinuxDevices();
+      const restore = request(source, otherDeviceId);
+      const before = await sandboxes.listSandboxes({ organizationId });
+
+      await expect(sandboxes.createSandbox(restore)).rejects.toMatchObject({
+        code: Code.FailedPrecondition,
+        rawMessage: "the snapshot is not on this device and is not exported",
+      });
+      const after = await sandboxes.listSandboxes({ organizationId });
+      expect(after.sandboxes).toHaveLength(before.sandboxes.length);
+
+      const corrected = {
+        ...restore,
+        placement: { deviceId: MOCK_IDS.buildBox },
+      };
+      const { sandbox } = await sandboxes.createSandbox(corrected);
+      expect(sandbox).toMatchObject({
+        deviceId: MOCK_IDS.buildBox,
+        state: SandboxState.RUNNING,
+      });
+      const replay = await sandboxes.createSandbox(corrected);
+      expect(replay.sandbox?.sandboxId).toBe(sandbox?.sandboxId);
+    },
+  );
+
+  test("automatic placement skips non-holders until the snapshot is exported", async () => {
+    const { sandboxes, snapshots, otherDeviceId } = await twoLinuxDevices();
+    const { sandbox } = await sandboxes.createSandbox(
+      request(baseImage, otherDeviceId),
+    );
+    const { snapshot } = await snapshots.createSnapshot({
+      organizationId,
+      sandboxId: sandbox!.sandboxId,
+    });
+    const snapshotId = snapshot!.snapshotId;
+    const { template } = await snapshots.createTemplate({
+      organizationId,
+      snapshotId,
+      name: "second-device-template",
+    });
+    const sources = [
+      { case: "snapshotId", value: snapshotId },
+      { case: "templateId", value: template!.templateId },
+    ] as const;
+    for (const source of sources) {
+      const restore = await sandboxes.createSandbox(request(source));
+      expect(restore.sandbox?.deviceId).toBe(otherDeviceId);
+    }
+
+    await snapshots.exportSnapshot({ organizationId, snapshotId });
+    for (const source of sources) {
+      const restore = await sandboxes.createSandbox(
+        request(source, MOCK_IDS.buildBox),
+      );
+      expect(restore.sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
+    }
   });
 });
 
