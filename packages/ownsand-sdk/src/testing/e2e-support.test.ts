@@ -5,11 +5,13 @@ import {
   SnapshotState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import {
+  BillingControlStatus,
   CLEANUP_STEP_TIMEOUT_MS,
   type CleanupStep,
   runCleanup,
   type SnapshotStatus,
-  waitForSandboxState,
+  transitionBilling,
+  waitForSandboxStartup,
   waitForSnapshotReady,
   withBillingCleanup,
   withCleanup,
@@ -18,61 +20,69 @@ import { VirtualClock } from "./virtual-clock.ts";
 
 const snap = (state: SnapshotState): SnapshotStatus => ({ state });
 
-describe("waitForSandboxState", () => {
-  test.each([
-    [SandboxState.RUNNING, SandboxState.PAUSED],
-    [SandboxState.PAUSED, SandboxState.RUNNING],
-  ])(
-    "returns when state changes from %s to %s within the deadline",
-    async (initial, target) => {
-      const clock = new VirtualClock();
-      const get = rs.fn(async () => ({ state: initial }));
-      get.mockResolvedValueOnce({ state: initial });
-      get.mockResolvedValueOnce({ state: target });
+describe("waitForSandboxStartup", () => {
+  test("returns when the sandbox reaches RUNNING before the deadline", async () => {
+    const clock = new VirtualClock();
+    const get = rs.fn(async () => ({ state: SandboxState.RUNNING }));
+    get.mockResolvedValueOnce({ state: SandboxState.CREATING });
 
-      await clock.run(waitForSandboxState({ get }, target, { clock }));
+    await clock.run(waitForSandboxStartup({ get }, { clock }));
 
-      expect(get).toHaveBeenCalledTimes(2);
-      expect(clock.now()).toBe(200);
-    },
-  );
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(clock.now()).toBe(200);
+  });
 
-  test.each([SandboxState.PAUSED, SandboxState.RUNNING])(
-    "aborts a stalled first read for %s at the deadline and reaches cleanup",
-    async (target) => {
-      const clock = new VirtualClock();
-      const reply = Promise.withResolvers<{ state: SandboxState }>();
-      const get = rs.fn((_signal: AbortSignal) => reply.promise);
-      const cleanup = rs.fn();
-      const wait = waitForSandboxState({ get }, target, { clock }).finally(
-        cleanup,
-      );
+  test("aborts a stalled first read and reaches lifecycle cleanup", async () => {
+    const clock = new VirtualClock();
+    const reply = Promise.withResolvers<{ state: SandboxState }>();
+    const get = rs.fn((_signal: AbortSignal) => reply.promise);
+    const steps: string[] = [];
+    const reported: unknown[] = [];
+    const deleteError = new Error("sandbox delete failed");
+    const wait = withCleanup(
+      () => waitForSandboxStartup({ get }, { clock }),
+      [
+        () => {
+          steps.push("delete");
+          throw deleteError;
+        },
+        () => void steps.push("close"),
+      ],
+      {
+        clock,
+        stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS,
+        onCleanupError: (error) => reported.push(error),
+      },
+    );
 
-      await expect(clock.run(wait)).rejects.toThrow(
-        `did not reach ${SandboxState[target]} within 60000 ms: last state unknown`,
-      );
-      expect(clock.now()).toBe(60_000);
-      expect(get.mock.calls[0]?.[0].aborted).toBe(true);
-      expect(cleanup).toHaveBeenCalledOnce();
+    await expect(clock.run(wait)).rejects.toThrow(
+      "sandbox startup did not reach RUNNING within 60000 ms: last state unknown",
+    );
+    expect(clock.now()).toBe(60_000);
+    expect(get.mock.calls[0]?.[0].aborted).toBe(true);
+    expect(steps).toEqual(["delete", "close"]);
+    expect(reported).toEqual([deleteError]);
 
-      reply.resolve({ state: target });
-      await clock.advance(200);
-      expect(get).toHaveBeenCalledOnce();
-    },
-  );
+    reply.resolve({ state: SandboxState.RUNNING });
+    await clock.advance(200);
+    expect(get).toHaveBeenCalledOnce();
+  });
 
   test.each([60_000, 500])(
     "stops polling at %s ms and reports the last state",
     async (timeoutMs) => {
       const clock = new VirtualClock();
-      const get = rs.fn(async () => ({ state: SandboxState.RUNNING }));
-      const wait = waitForSandboxState({ get }, SandboxState.PAUSED, {
-        clock,
-        timeoutMs,
-      });
+      const get = rs.fn(async () => ({ state: SandboxState.CREATING }));
+      const wait = waitForSandboxStartup(
+        { get },
+        {
+          clock,
+          timeoutMs,
+        },
+      );
 
       await expect(clock.run(wait)).rejects.toThrow(
-        `did not reach PAUSED within ${timeoutMs} ms: last state RUNNING`,
+        `sandbox startup did not reach RUNNING within ${timeoutMs} ms: last state CREATING`,
       );
       expect(clock.now()).toBe(timeoutMs);
       const expectedReads = Math.ceil(timeoutMs / 200);
@@ -93,16 +103,32 @@ describe("waitForSandboxState", () => {
       const get = rs.fn(async (signal: AbortSignal) => {
         await sleep(60_000, signal);
         if (outcome === "error") throw new Error("late RPC error");
-        return { state: SandboxState.PAUSED };
+        return { state: SandboxState.RUNNING };
       });
 
       await expect(
-        clock.run(waitForSandboxState({ get }, SandboxState.PAUSED, { clock })),
+        clock.run(waitForSandboxStartup({ get }, { clock })),
       ).rejects.toThrow(
-        "did not reach PAUSED within 60000 ms: last state unknown",
+        "sandbox startup did not reach RUNNING within 60000 ms: last state unknown",
       );
       expect(clock.now()).toBe(60_000);
       expect(get.mock.calls[0]?.[0].aborted).toBe(true);
+    },
+  );
+
+  test.each([SandboxState.PAUSED, SandboxState.DELETED, SandboxState.FAILED])(
+    "fails promptly on unexpected stable state %s",
+    async (state) => {
+      const clock = new VirtualClock();
+      const get = rs.fn(async () => ({ state }));
+
+      await expect(
+        clock.run(waitForSandboxStartup({ get }, { clock })),
+      ).rejects.toThrow(
+        `sandbox startup reached ${SandboxState[state]} while waiting for RUNNING`,
+      );
+      expect(get).toHaveBeenCalledOnce();
+      expect(clock.now()).toBe(0);
     },
   );
 
@@ -114,7 +140,7 @@ describe("waitForSandboxState", () => {
     });
 
     await expect(
-      clock.run(waitForSandboxState({ get }, SandboxState.RUNNING, { clock })),
+      clock.run(waitForSandboxStartup({ get }, { clock })),
     ).rejects.toBe(failure);
     expect(get).toHaveBeenCalledOnce();
     expect(clock.now()).toBe(0);
@@ -438,8 +464,11 @@ describe("withBillingCleanup", () => {
   });
 
   function fixture(
-    restore: () => Promise<Response>,
-    remove: (signal: AbortSignal, clock: VirtualClock) => Promise<void>,
+    restore: () => Promise<Response> = async () => new Response(),
+    remove: (
+      signal: AbortSignal,
+      clock: VirtualClock,
+    ) => Promise<void> = async () => {},
   ) {
     const clock = new VirtualClock();
     const steps: string[] = [];
@@ -459,28 +488,219 @@ describe("withBillingCleanup", () => {
         steps.push("close");
       },
     };
+    const run = (body: () => Promise<void>) =>
+      clock.run(
+        withBillingCleanup(body, billingUrl, sandbox, {
+          stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS,
+          clock,
+          onCleanupError: (error) => reported.push(error),
+        }),
+      );
     return {
       clock,
       steps,
       reported,
       restoreFetch,
       sandbox,
-      run: (body: () => Promise<void>) =>
-        clock.run(
-          withBillingCleanup(body, billingUrl, sandbox, {
-            stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS,
-            clock,
-            onCleanupError: (error) => reported.push(error),
-          }),
-        ),
+      run,
+      runTransition: (
+        get: (signal: AbortSignal) => Promise<{ state: SandboxState }>,
+        status: BillingControlStatus,
+      ) => run(() => transitionBilling({ get }, billingUrl, status, { clock })),
     };
   }
 
-  test("attempts each step once in order when the body passes", async () => {
-    const cleanup = fixture(
-      async () => new Response(),
-      async () => {},
+  test("reaches billing cleanup when the startup read stalls", async () => {
+    const cleanup = fixture();
+    const reply = Promise.withResolvers<{ state: SandboxState }>();
+    const get = rs.fn((_signal: AbortSignal) => reply.promise);
+
+    await expect(
+      cleanup.run(() =>
+        waitForSandboxStartup({ get }, { clock: cleanup.clock }),
+      ),
+    ).rejects.toThrow(
+      "sandbox startup did not reach RUNNING within 60000 ms: last state unknown",
     );
+    expect(cleanup.clock.now()).toBe(60_000);
+    expect(get.mock.calls[0]?.[0].aborted).toBe(true);
+    expect(cleanup.steps).toEqual(["restore", "delete", "close"]);
+    reply.resolve({ state: SandboxState.RUNNING });
+    await cleanup.clock.advance(200);
+    expect(get).toHaveBeenCalledOnce();
+  });
+
+  describe("transitionBilling", () => {
+    test.each([BillingControlStatus.Suspended, BillingControlStatus.Allowed])(
+      "aborts a stalled %s POST and reaches cleanup",
+      async (status) => {
+        const cleanup = fixture();
+        const reply = Promise.withResolvers<Response>();
+        cleanup.restoreFetch.mockImplementationOnce(() => reply.promise);
+        const get = rs.fn(async () => ({ state: SandboxState.RUNNING }));
+
+        await expect(cleanup.runTransition(get, status)).rejects.toThrow(
+          `billing control ${status} timed out after 60000 ms`,
+        );
+        expect(cleanup.clock.now()).toBe(60_000);
+        const [url, post] = cleanup.restoreFetch.mock.calls[0]!;
+        expect(url).toBe(`${billingUrl}/billing/${status}`);
+        expect(post?.signal?.aborted).toBe(true);
+        expect(cleanup.restoreFetch.mock.calls[1]?.[1]?.signal).not.toBe(
+          post?.signal,
+        );
+        expect(cleanup.steps).toEqual(["restore", "delete", "close"]);
+        expect(get).not.toHaveBeenCalled();
+
+        reply.resolve(new Response());
+        await cleanup.clock.advance(200);
+        expect(get).not.toHaveBeenCalled();
+        expect(cleanup.restoreFetch).toHaveBeenCalledTimes(2);
+      },
+    );
+
+    test("uses separate cleanup budgets and keeps the POST timeout", async () => {
+      const cleanup = fixture(
+        () => new Promise<Response>(() => {}),
+        () => new Promise<void>(() => {}),
+      );
+      cleanup.restoreFetch.mockImplementationOnce(
+        () => new Promise<Response>(() => {}),
+      );
+      const get = rs.fn(async () => ({ state: SandboxState.PAUSED }));
+
+      await expect(
+        cleanup.runTransition(get, BillingControlStatus.Suspended),
+      ).rejects.toThrow("billing control suspended timed out after 60000 ms");
+      expect(cleanup.clock.now()).toBe(90_000);
+      expect(cleanup.steps).toEqual(["restore", "delete", "close"]);
+      expect(cleanup.reported).toEqual([
+        new Error("cleanup step timed out after 15000 ms"),
+        new Error("cleanup step timed out after 15000 ms"),
+      ]);
+      expect(get).not.toHaveBeenCalled();
+    });
+
+    test("aborts while reading a stalled HTTP error body", async () => {
+      const cleanup = fixture();
+      const response = new Response(null, { status: 500 });
+      const text = rs
+        .spyOn(response, "text")
+        .mockImplementation(() => new Promise<string>(() => {}));
+      cleanup.restoreFetch.mockResolvedValueOnce(response);
+      const get = rs.fn(async () => ({ state: SandboxState.PAUSED }));
+
+      await expect(
+        cleanup.runTransition(get, BillingControlStatus.Suspended),
+      ).rejects.toThrow("billing control suspended timed out after 60000 ms");
+      expect(cleanup.clock.now()).toBe(60_000);
+      expect(text).toHaveBeenCalledOnce();
+      expect(cleanup.restoreFetch.mock.calls[0]?.[1]?.signal?.aborted).toBe(
+        true,
+      );
+      expect(cleanup.steps).toEqual(["restore", "delete", "close"]);
+      expect(get).not.toHaveBeenCalled();
+    });
+
+    test("preserves a timely HTTP error and its response body", async () => {
+      const cleanup = fixture();
+      cleanup.restoreFetch.mockResolvedValueOnce(
+        new Response("link failed", { status: 500 }),
+      );
+      const get = rs.fn(async () => ({ state: SandboxState.PAUSED }));
+
+      await expect(
+        cleanup.runTransition(get, BillingControlStatus.Suspended),
+      ).rejects.toThrow("billing control suspended: 500 link failed");
+      expect(cleanup.clock.now()).toBe(0);
+      expect(get).not.toHaveBeenCalled();
+    });
+
+    test("does not poll after a POST settles at the deadline before the timer fires", async () => {
+      const cleanup = fixture();
+      const sleep = cleanup.clock.sleep.bind(cleanup.clock);
+      rs.spyOn(cleanup.clock, "sleep").mockImplementationOnce((ms, signal) =>
+        sleep(ms + 1, signal),
+      );
+      cleanup.restoreFetch.mockImplementationOnce(async () => {
+        await sleep(60_000);
+        return new Response();
+      });
+      const get = rs.fn(async () => ({ state: SandboxState.PAUSED }));
+
+      await expect(
+        cleanup.runTransition(get, BillingControlStatus.Suspended),
+      ).rejects.toThrow("billing control suspended timed out after 60000 ms");
+      expect(cleanup.clock.now()).toBe(60_000);
+      expect(cleanup.restoreFetch.mock.calls[0]?.[1]?.signal?.aborted).toBe(
+        true,
+      );
+      expect(get).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      {
+        status: BillingControlStatus.Suspended,
+        initial: SandboxState.RUNNING,
+        target: SandboxState.PAUSED,
+      },
+      {
+        status: BillingControlStatus.Allowed,
+        initial: SandboxState.PAUSED,
+        target: SandboxState.RUNNING,
+      },
+    ])(
+      "accepts a timely $status transition after a 40-second POST",
+      async ({ status, initial, target }) => {
+        const cleanup = fixture();
+        cleanup.restoreFetch.mockImplementationOnce(async () => {
+          await cleanup.clock.sleep(40_000);
+          return new Response();
+        });
+        const get = rs.fn(async (_signal: AbortSignal) => ({ state: target }));
+        get.mockResolvedValueOnce({ state: initial });
+
+        await cleanup.runTransition(get, status);
+        expect(cleanup.clock.now()).toBe(40_200);
+        expect(get).toHaveBeenCalledTimes(2);
+        expect(get.mock.calls[0]?.[0]).toBe(
+          cleanup.restoreFetch.mock.calls[0]?.[1]?.signal,
+        );
+      },
+    );
+
+    test.each([
+      { state: undefined, last: "unknown" },
+      { state: SandboxState.RUNNING, last: "RUNNING" },
+    ])(
+      "gives polling only 20 seconds after a 40-second POST with last state $last",
+      async ({ state, last }) => {
+        const cleanup = fixture();
+        cleanup.restoreFetch.mockImplementationOnce(async () => {
+          await cleanup.clock.sleep(40_000);
+          return new Response();
+        });
+        const reply = Promise.withResolvers<{ state: SandboxState }>();
+        const get = rs.fn((_signal: AbortSignal) => reply.promise);
+        if (state !== undefined) get.mockResolvedValueOnce({ state });
+
+        await expect(
+          cleanup.runTransition(get, BillingControlStatus.Suspended),
+        ).rejects.toThrow(
+          `sandbox did not reach PAUSED within 60000 ms: last state ${last}`,
+        );
+        expect(cleanup.clock.now()).toBe(60_000);
+        expect(get.mock.calls.at(-1)?.[0].aborted).toBe(true);
+        expect(cleanup.steps).toEqual(["restore", "delete", "close"]);
+        reply.resolve({ state: SandboxState.PAUSED });
+        await cleanup.clock.advance(200);
+        expect(get).toHaveBeenCalledTimes(state === undefined ? 1 : 2);
+      },
+    );
+  });
+
+  test("attempts each step once in order when the body passes", async () => {
+    const cleanup = fixture();
     await cleanup.run(async () => {});
     expect(cleanup.steps).toEqual(["restore", "delete", "close"]);
     expect(cleanup.restoreFetch).toHaveBeenCalledWith(

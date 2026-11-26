@@ -23,8 +23,8 @@ import {
 import {
   BillingControlStatus,
   CLEANUP_STEP_TIMEOUT_MS,
-  setBilling,
-  waitForSandboxState,
+  transitionBilling,
+  waitForSandboxStartup,
   waitForSnapshotReady,
   withBillingCleanup,
   withCleanup,
@@ -43,9 +43,8 @@ const billingUrl = env.OWNSAND_E2E_BILLING_URL ?? "";
 
 // Time budget of the lifecycle test. The rstest limit is 3 minutes and the Go
 // launcher (servers/ownsand-api/e2e/tssdk_test.go) bounds the whole command
-// at 5 minutes. The snapshot poll gives up after 60 seconds, and each of the
-// two network cleanup steps after 15 seconds, so a snapshot that never
-// becomes READY still leaves time for the cleanup inside both limits.
+// at 5 minutes. Startup and snapshot polling each have 60 seconds. Each
+// of the two network cleanup steps has 15 seconds.
 const SNAPSHOT_READY_TIMEOUT_MS = 60_000;
 const cleanupOptions = {
   stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS,
@@ -154,8 +153,7 @@ async function expectSuspended(
         let snapshotId = "";
         await withCleanup(
           async () => {
-            const info = await sandbox.waitUntilStable({ pollMs: 200 });
-            expect(info.state).toBe(SandboxState.RUNNING);
+            await waitForSandboxStartup(sandbox);
 
             const run = await sandbox.run({
               command: ["/bin/sh", "-c", "echo out; echo err >&2; exit 4"],
@@ -275,9 +273,7 @@ async function expectSuspended(
         });
         await withBillingCleanup(
           async () => {
-            expect((await sandbox.waitUntilStable({ pollMs: 200 })).state).toBe(
-              SandboxState.RUNNING,
-            );
+            await waitForSandboxStartup(sandbox);
             const pwd = await sandbox.run({ command: ["/bin/pwd"] });
             const root = decoder.decode(pwd.stdout).trim().replace(/\/$/, "");
             const path = `${root}/billing.bin`;
@@ -286,8 +282,11 @@ async function expectSuspended(
 
             // The suspension pauses the running sandbox and rejects the data
             // path. Each relay operation ends with its first AuthorizeRelay.
-            await setBilling(billingUrl, BillingControlStatus.Suspended);
-            await waitForSandboxState(sandbox, SandboxState.PAUSED);
+            await transitionBilling(
+              sandbox,
+              billingUrl,
+              BillingControlStatus.Suspended,
+            );
             await expectSuspended(requests, () =>
               sandbox.run({ command: ["/bin/echo", "suspended"] }),
             );
@@ -295,8 +294,11 @@ async function expectSuspended(
 
             // The recovery resumes the sandbox that billing paused, and the
             // same operations work again.
-            await setBilling(billingUrl, BillingControlStatus.Allowed);
-            await waitForSandboxState(sandbox, SandboxState.RUNNING);
+            await transitionBilling(
+              sandbox,
+              billingUrl,
+              BillingControlStatus.Allowed,
+            );
             const run = await sandbox.run({
               command: ["/bin/echo", "recovered"],
             });
