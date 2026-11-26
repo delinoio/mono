@@ -5,6 +5,7 @@ package sandruntest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -108,6 +109,11 @@ func (d *devSessionService) CreateDevSession(_ context.Context, req *connect.Req
 	}
 	if utf8.RuneCountInString(req.Msg.GetLabel()) > 100 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("label has more than 100 characters"))
+	}
+	for _, r := range req.Msg.GetLabel() {
+		if r < 0x20 || (r >= 0x7f && r < 0xa0) {
+			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid label: must not contain control characters"))
+		}
 	}
 	var prof *sandrunv1.RunnerProfile
 	for _, p := range s.profiles {
@@ -298,16 +304,21 @@ func (d *devSessionService) ExecDevSession(ctx context.Context, req *connect.Req
 }
 
 func (d *devSessionService) AttachDevSessionExec(ctx context.Context, req *connect.Request[sandrunv1.AttachDevSessionExecRequest], stream *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error {
-	if _, err := d.s.runningSession(req.Msg.GetOrganizationId(), req.Msg.GetDevSessionId()); err != nil {
+	m := req.Msg
+	if _, err := d.s.runningSession(m.GetOrganizationId(), m.GetDevSessionId()); err != nil {
 		return err
 	}
+	stdout, stderr := m.GetStdoutOffset(), m.GetStderrOffset()
+	if stdout < 0 || stderr < 0 {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("invalid offsets: must not be negative"))
+	}
 	d.s.guest.mu.Lock()
-	p := d.s.guest.execs[req.Msg.GetExecId()]
+	p := d.s.guest.execs[m.GetExecId()]
 	d.s.guest.mu.Unlock()
-	if p == nil || p.session != req.Msg.GetDevSessionId() {
+	if p == nil || p.session != m.GetDevSessionId() {
 		return notFound("exec")
 	}
-	return d.s.guest.serve(ctx, p, req.Msg.GetStdoutOffset(), req.Msg.GetStderrOffset(), func(ev *sandrunv1.DevSessionExecEvent) error {
+	return d.s.guest.serve(ctx, p, stdout, stderr, func(ev *sandrunv1.DevSessionExecEvent) error {
 		return stream.Send(&sandrunv1.AttachDevSessionExecResponse{Event: ev})
 	})
 }
@@ -443,8 +454,13 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 	} else if w.path != path {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("every chunk of a write_id must name the same path"))
 	}
-	if w.done {
-		return connect.NewResponse(&sandrunv1.WriteDevSessionFileResponse{WriteId: m.GetWriteId(), Offset: m.GetOffset(), Length: chunkSize, Finished: true, SizeBytes: int64(len(w.data))}), nil
+	if completed := w.completed; completed != nil {
+		if !m.GetFinal() || m.GetMode() != completed.mode ||
+			m.GetOffset() != completed.response.GetOffset() || chunkSize != completed.response.GetLength() ||
+			sha256.Sum256(m.GetData()) != completed.digest {
+			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("write already finished with a different final request"))
+		}
+		return connect.NewResponse(proto.CloneOf(completed.response)), nil
 	}
 	end := m.GetOffset() + chunkSize
 	switch {
@@ -472,9 +488,14 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 			_ = os.Remove(tmp)
 			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 		}
-		w.done = true
 		res.Finished = true
 		res.SizeBytes = int64(len(w.data))
+		w.completed = &completedWrite{
+			mode:     m.GetMode(),
+			digest:   sha256.Sum256(m.GetData()),
+			response: proto.CloneOf(res),
+		}
+		w.data = nil
 	}
 	return connect.NewResponse(res), nil
 }
@@ -503,9 +524,15 @@ type writeKey struct {
 }
 
 type pendingWrite struct {
-	path string
-	data []byte
-	done bool
+	path      string
+	data      []byte
+	completed *completedWrite
+}
+
+type completedWrite struct {
+	mode     uint32
+	digest   [sha256.Size]byte
+	response *sandrunv1.WriteDevSessionFileResponse
 }
 
 type readSnapshot struct {

@@ -85,8 +85,8 @@ func TestSessionTextOutputEscapesLabels(t *testing.T) {
 	f := newFixture(t)
 	f.srv.AddDevSessionProfile(f.org, "linux", sandrunv1.GuestOs_GUEST_OS_LINUX, f.wd)
 	f.env[EnvOrganization] = f.org
-	const label = "café\u202e\u2028\u2029\nlabel\ttext"
-	const escaped = "café\\u202e\\u2028\\u2029\\nlabel\\ttext"
+	const label = "café\u202e\u2028\u2029label text"
+	const escaped = "café\\u202e\\u2028\\u2029label text"
 	created := f.ok("", "session", "create", "linux", "--label", label)
 	if !strings.Contains(created.stdout, "\nlabel: "+escaped+"\n") {
 		t.Fatalf("session create stdout = %q", created.stdout)

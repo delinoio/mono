@@ -43,8 +43,8 @@ const syncManifestLimit int64 = 256 << 20
 // cleanupTimeout bounds the guest clean-up after a failed sync or download.
 const cleanupTimeout = 30 * time.Second
 
-// syncApplyWait bounds how long a sync can wait for apply after losing its stream.
-const syncApplyWait = 30 * time.Second
+// syncExecRecoveryWait bounds the wait for a result after sync loses an exec stream.
+const syncExecRecoveryWait = 30 * time.Second
 
 // SyncParams describes a sync of a local working tree into the workspace
 // path of a dev session.
@@ -112,7 +112,9 @@ type SyncResult struct {
 // empty. A sync that stops before the new manifest is written leaves the
 // old manifest unless apply removed a stale one during workspace recovery.
 // The next sync sends the same files again once it can take the lock. If
-// the SDK loses the apply stream, it keeps the lock and inputs until it
+// the SDK loses the lock acquisition stream, it releases the lock only
+// if it recovers a result that confirms acquisition. If the SDK loses
+// the apply stream, it keeps the lock and inputs until it
 // observes a terminal result. If the result is unknown after a bounded
 // wait, the lock and inputs stay in the guest.
 func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
@@ -224,10 +226,15 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	if p.Force {
 		force = "1"
 	}
+	cleanupEnv := map[string]string{guestEnvLock: lock}
 	lr, err := c.runGuest(ctx, s, opLock, map[string]string{
 		guestEnvLock: lock, guestEnvForce: force, guestEnvWorkspace: s.GetWorkspacePath(),
 	})
 	if err != nil {
+		var streamErr *ExecStreamError
+		if errors.As(err, &streamErr) && c.syncLockAcquired(ctx, s, streamErr) {
+			c.cleanupFailedSync(ctx, s, cleanupEnv)
+		}
 		return nil, err
 	}
 	workspaceMissing := lr.exitCode == exitWorkspaceMissing
@@ -239,16 +246,10 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		return nil, lr.failure(opLock)
 	}
 
-	cleanupEnv := map[string]string{guestEnvLock: lock}
 	cleanupOnError := true
 	defer func() {
-		if !cleanupOnError {
-			return
-		}
-		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-		defer cancel()
-		if r, err := c.runGuest(cctx, s, opCleanup, cleanupEnv); err != nil || r.exitCode != 0 {
-			c.logger.DebugContext(ctx, "sandrun sync clean-up failed", "dev_session_id", s.GetDevSessionId(), "code", codeText(err))
+		if cleanupOnError {
+			c.cleanupFailedSync(ctx, s, cleanupEnv)
 		}
 	}()
 
@@ -422,23 +423,47 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	return res, nil
 }
 
+func (c *Client) cleanupFailedSync(ctx context.Context, s *sandrunv1.DevSession, env map[string]string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if r, err := c.runGuest(cleanupCtx, s, opCleanup, env); err != nil || r.exitCode != 0 {
+		c.logger.DebugContext(ctx, "sandrun sync clean-up failed", "dev_session_id", s.GetDevSessionId(), "code", codeText(err))
+	}
+}
+
+// syncLockAcquired requires an explicit exit code that proves ownership.
+func (c *Client) syncLockAcquired(ctx context.Context, s *sandrunv1.DevSession, streamErr *ExecStreamError) bool {
+	result, err := c.recoverSyncExec(ctx, s, streamErr)
+	if err != nil {
+		c.logger.DebugContext(ctx, "sandrun sync kept the lock after losing the acquisition stream",
+			"dev_session_id", s.GetDevSessionId(), "exec_id", streamErr.ExecID, "code", codeText(err))
+		return false
+	}
+	return result.Kind == ExecResultExited && result.ExitCode != nil &&
+		(*result.ExitCode == 0 || *result.ExitCode == exitWorkspaceMissing)
+}
+
 // waitForSyncApply observes the original exec because its command can keep
 // writing after the stream ends. Cleaning up requires a terminal result.
 func (c *Client) waitForSyncApply(ctx context.Context, s *sandrunv1.DevSession, streamErr *ExecStreamError) bool {
-	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), syncApplyWait)
+	_, err := c.recoverSyncExec(ctx, s, streamErr)
+	if err != nil {
+		c.logger.DebugContext(ctx, "sandrun sync kept the lock and inputs after losing the apply stream",
+			"dev_session_id", s.GetDevSessionId(), "exec_id", streamErr.ExecID, "code", codeText(err))
+	}
+	return err == nil
+}
+
+func (c *Client) recoverSyncExec(ctx context.Context, s *sandrunv1.DevSession, streamErr *ExecStreamError) (*ExecResult, error) {
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), syncExecRecoveryWait)
 	defer cancel()
-	_, err := c.AttachExec(waitCtx, AttachParams{
+	return c.AttachExec(waitCtx, AttachParams{
 		OrganizationID: s.GetOrganizationId(),
 		DevSessionID:   s.GetDevSessionId(),
 		ExecID:         streamErr.ExecID,
 		StdoutOffset:   streamErr.StdoutOffset,
 		StderrOffset:   streamErr.StderrOffset,
 	})
-	if err != nil {
-		c.logger.DebugContext(waitCtx, "sandrun sync kept the lock and inputs after losing the apply stream",
-			"dev_session_id", s.GetDevSessionId(), "exec_id", streamErr.ExecID, "code", codeText(err))
-	}
-	return err == nil
 }
 
 // readManifest reads the guest manifest. A missing or unreadable manifest

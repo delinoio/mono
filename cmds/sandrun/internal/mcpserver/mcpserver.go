@@ -657,8 +657,8 @@ func (s *Server) runWithWait(ctx context.Context, wait time.Duration, col *colle
 	if o.err == nil {
 		return o.res, nil
 	}
-	var se *sandrun.ExecStreamError
-	if errors.As(o.err, &se) && errors.Is(se.Err, context.Canceled) && ctx.Err() == nil {
+	// The wait can cancel credential acquisition before the exec stream opens.
+	if errors.Is(o.err, context.Canceled) && ctx.Err() == nil {
 		if !col.hasConfirmation() {
 			return nil, errExecUnconfirmed
 		}

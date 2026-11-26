@@ -66,6 +66,61 @@ func TestCreateDevSessionLabelLength(t *testing.T) {
 	}
 }
 
+func TestCreateDevSessionLabelControls(t *testing.T) {
+	s := New()
+	t.Cleanup(s.Close)
+	org := s.AddOrganization("label test").GetOrganizationId()
+	profile := s.AddDevSessionProfile(org, "label", sandrunv1.GuestOs_GUEST_OS_LINUX, t.TempDir())
+	client := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+
+	for _, tt := range []struct {
+		name        string
+		label       string
+		wantInvalid bool
+	}{
+		{name: "omitted"},
+		{name: "U+0020", label: "a b"},
+		{name: "U+007E", label: "a~b"},
+		{name: "U+00A0", label: "a\u00A0b"},
+		{name: "U+0000", label: "a\x00b", wantInvalid: true},
+		{name: "U+001F", label: "a\x1fb", wantInvalid: true},
+		{name: "U+007F", label: "a\x7fb", wantInvalid: true},
+		{name: "U+0085", label: "a\u0085b", wantInvalid: true},
+		{name: "U+009F", label: "a\u009Fb", wantInvalid: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := len(s.Sessions())
+			req := connect.NewRequest(&sandrunv1.CreateDevSessionRequest{
+				OrganizationId: org, RunnerProfileId: profile.GetRunnerProfileId(), Label: tt.label,
+			})
+			req.Header().Set("Authorization", "Bearer "+s.APIKey)
+			res, err := client.CreateDevSession(t.Context(), req)
+			sessions := s.Sessions()
+			if tt.wantInvalid {
+				if connect.CodeOf(err) != connect.CodeInvalidArgument {
+					t.Errorf("CreateDevSession error = %v, want invalid_argument", err)
+				}
+				if len(sessions) != before {
+					t.Errorf("session count = %d, want %d", len(sessions), before)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(sessions) != before+1 {
+				t.Fatalf("session count = %d, want %d", len(sessions), before+1)
+			}
+			if got := res.Msg.GetDevSession().GetLabel(); got != tt.label {
+				t.Errorf("response label = %q, want %q", got, tt.label)
+			}
+			if got := sessions[before].GetLabel(); got != tt.label {
+				t.Errorf("stored label = %q, want %q", got, tt.label)
+			}
+		})
+	}
+}
+
 func TestWriteDevSessionFileRejectsInvalidOffsets(t *testing.T) {
 	const writeID, fileName = "write-offset", "out.txt"
 	workspace := t.TempDir()
@@ -794,6 +849,64 @@ func TestExecStreamEventLimit(t *testing.T) {
 				requireStarted(t, events, limit)
 			}
 		})
+	}
+}
+
+func TestAttachDevSessionExecOffsets(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake guest runs POSIX sh commands")
+	}
+	s := New()
+	t.Cleanup(s.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	client, ds := createExecTestSession(t, ctx, s, t.TempDir())
+	exec, err := client.ExecDevSession(ctx, listTestRequest(&sandrunv1.ExecDevSessionRequest{
+		OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(), ExecId: streamTestExecID,
+		Command: []string{"sh", "-c", "printf abc; printf xyz >&2"},
+	}))
+	events := receiveExecEvents(t, exec, err)
+	if len(events) == 0 || !hasExplicitZeroExitCode(events[len(events)-1]) {
+		t.Fatalf("expected the initial stream to end with exit code 0, got %v", events)
+	}
+
+	attach := func(stdout, stderr int64) (*connect.ServerStreamForClient[sandrunv1.AttachDevSessionExecResponse], error) {
+		return client.AttachDevSessionExec(ctx, listTestRequest(&sandrunv1.AttachDevSessionExecRequest{
+			OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(), ExecId: streamTestExecID,
+			StdoutOffset: stdout, StderrOffset: stderr,
+		}))
+	}
+	for _, tc := range []struct {
+		name           string
+		stdout, stderr int64
+	}{
+		{name: "negative stdout", stdout: -1},
+		{name: "negative stderr", stderr: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream, err := attach(tc.stdout, tc.stderr)
+			if err == nil {
+				defer stream.Close()
+				if stream.Receive() {
+					t.Fatalf("expected no events, got %v", stream.Msg().GetEvent())
+				}
+				err = stream.Err()
+			}
+			var connectErr *connect.Error
+			if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeInvalidArgument ||
+				connectErr.Message() != "invalid offsets: must not be negative" {
+				t.Fatalf("attach error = %v, want invalid_argument for negative offsets", err)
+			}
+		})
+	}
+
+	replay, err := attach(1, 2)
+	events = receiveExecEvents(t, replay, err)
+	requireStarted(t, events, 4)
+	stdout, stderr := events[1].GetStdout(), events[2].GetStderr()
+	if stdout.GetOffset() != 1 || string(stdout.GetData()) != "bc" ||
+		stderr.GetOffset() != 2 || string(stderr.GetData()) != "z" || !hasExplicitZeroExitCode(events[3]) {
+		t.Fatalf("expected stdout bc at offset 1, stderr z at offset 2, and exit code 0, got %v", events)
 	}
 }
 

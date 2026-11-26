@@ -110,6 +110,37 @@ func TestTerminalTokenSourceFailure(t *testing.T) {
 	}
 }
 
+func TestExecReturnsTokenSourceInterruptionBeforeSend(t *testing.T) {
+	c, srv, org := newTestClient(t, "")
+	session := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	cause := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("network interrupted")}
+	providerErr := fmt.Errorf("refresh: %w", cause)
+	tokenCalls := 0
+	c.credential = tokenCredential(func(context.Context) (string, error) {
+		tokenCalls++
+		if tokenCalls == 1 {
+			return "", providerErr
+		}
+		return srv.AccessToken, nil
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result, err := c.Exec(ctx, ExecParams{OrganizationID: org, DevSessionID: session.GetDevSessionId(), Command: []string{"unused"}})
+	var streamErr *ExecStreamError
+	if result != nil || !errors.Is(err, providerErr) || errors.As(err, &streamErr) {
+		t.Errorf("Exec = (%v, %v), want no result and the provider error", result, err)
+	}
+	if tokenCalls != 1 {
+		t.Errorf("token source called %d times, want 1", tokenCalls)
+	}
+	if n := srv.Calls(sandrunv1connect.DevSessionServiceExecDevSessionProcedure); n != 0 {
+		t.Errorf("start received %d requests, want 0", n)
+	}
+	if n := srv.Calls(sandrunv1connect.DevSessionServiceAttachDevSessionExecProcedure); n != 0 {
+		t.Errorf("attach received %d requests, want 0", n)
+	}
+}
+
 func TestWaitAndWatchRecoverAfterTokenSourceInterruption(t *testing.T) {
 	for _, cause := range []error{
 		&net.OpError{Op: "read", Net: "tcp", Err: errors.New("network interrupted")},

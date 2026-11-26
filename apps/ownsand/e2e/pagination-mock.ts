@@ -21,6 +21,7 @@ import {
   SandboxState,
   SnapshotExportState,
 } from "@delino/ownsand-protos/v1/common_pb";
+import type { GetDeviceResponse } from "@delino/ownsand-protos/v1/device_pb";
 import type { CreateOrganizationResponse } from "@delino/ownsand-protos/v1/organization_pb";
 import {
   CreateSandboxRequestSchema,
@@ -259,6 +260,27 @@ export function createMockTransport(): Transport {
           sessionStorage.setItem(deviceReadback, "held");
         });
         sessionStorage.setItem(deviceReadback, "released");
+      }
+      if (method.name === "GetDevice") {
+        const name = sessionStorage.getItem("ownsand-e2e-device-name");
+        if (name !== null) {
+          const response = await base.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+          const { device } = response.message as GetDeviceResponse;
+          if (device?.deviceId === MOCK_IDS.buildBox) {
+            return {
+              ...response,
+              message: { ...response.message, device: { ...device, name } },
+            };
+          }
+          return response;
+        }
       }
       const isFixturePage =
         pagination !== undefined && method.name === methodName;
