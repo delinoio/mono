@@ -673,8 +673,14 @@ func (a *apiKeyService) ListApiKeys(_ context.Context, req *connect.Request[sand
 		return nil, err
 	}
 	res := &sandrunv1.ListApiKeysResponse{NextPageToken: next}
+	now := time.Now()
 	for _, it := range items {
-		res.ApiKeys = append(res.ApiKeys, proto.CloneOf(it))
+		key := proto.CloneOf(it)
+		if expiresAt := key.GetExpiresAt(); key.GetState() == sandrunv1.ApiKeyState_API_KEY_STATE_ACTIVE &&
+			expiresAt != nil && !now.Before(expiresAt.AsTime()) {
+			key.State = sandrunv1.ApiKeyState_API_KEY_STATE_EXPIRED
+		}
+		res.ApiKeys = append(res.ApiKeys, key)
 	}
 	return connect.NewResponse(res), nil
 }
