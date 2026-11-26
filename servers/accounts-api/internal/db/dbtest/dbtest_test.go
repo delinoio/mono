@@ -6,30 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
 )
-
-func TestChildURL(t *testing.T) {
-	for _, tc := range []struct{ admin, want string }{
-		{"postgres://u:p@127.0.0.1:5432/postgres", "postgres://u:p@127.0.0.1:5432/accounts_test_x?dbname=accounts_test_x"},
-		{"postgres://u@h/postgres?sslmode=disable&dbname=postgres", "postgres://u@h/accounts_test_x?sslmode=disable&dbname=postgres&dbname=accounts_test_x"},
-	} {
-		got, err := childURL(tc.admin, "accounts_test_x")
-		if err != nil {
-			t.Fatalf("childURL(%q) error = %v", tc.admin, err)
-		}
-		if got != tc.want {
-			t.Errorf("childURL(%q) = %q, want %q", tc.admin, got, tc.want)
-		}
-	}
-	if _, err := childURL("postgres://u:secret@[::1", "x"); err == nil {
-		t.Fatal("childURL accepted a malformed URL")
-	}
-}
 
 // recordingTB captures Errorf calls so a test can assert on what cleanup
 // reports without failing itself.
@@ -102,11 +83,11 @@ func TestCleanupDropsGeneratedDatabase(t *testing.T) {
 	var name string
 	t.Run("create", func(t *testing.T) {
 		child := NewURL(t)
-		u, err := url.Parse(child)
+		cfg, err := pgx.ParseConfig(child)
 		if err != nil {
-			t.Fatalf("parse child URL: %v", err)
+			t.Fatal("parse child database configuration failed")
 		}
-		name = strings.TrimPrefix(u.Path, "/")
+		name = cfg.Database
 		if !databaseExists(t, admin, name) {
 			t.Fatalf("database %s missing while the test runs", name)
 		}
