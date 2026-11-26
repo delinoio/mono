@@ -29,12 +29,19 @@ function Form() {
 
 **Correct (do it in the handler):**
 
+The `post` helper returns a promise that rejects when registration fails.
+
 ```tsx
 function Form() {
   const theme = useContext(ThemeContext)
 
-  function handleSubmit() {
-    post('/api/register')
+  async function handleSubmit() {
+    try {
+      await post('/api/register')
+    } catch {
+      showToast('Registration failed', theme)
+      return
+    }
     showToast('Registered', theme)
   }
 

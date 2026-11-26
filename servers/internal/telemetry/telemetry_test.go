@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -21,6 +22,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -92,28 +95,45 @@ func TestPrometheusNames(t *testing.T) {
 
 // otlpServer records the OTLP/HTTP requests it receives.
 type otlpServer struct {
-	mu      sync.Mutex
-	paths   []string
-	headers []http.Header
-	logs    []string
+	mu            sync.Mutex
+	paths         []string
+	headers       []http.Header
+	logs          []string
+	metrics       []*colmetricspb.ExportMetricsServiceRequest
+	requestErrors []error
 }
 
 func (s *otlpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var body io.Reader = r.Body
-	if r.Header.Get("Content-Encoding") == "gzip" {
-		zr, err := gzip.NewReader(r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		body = zr
-	}
-	data, _ := io.ReadAll(body)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.paths = append(s.paths, r.URL.Path)
 	s.headers = append(s.headers, r.Header.Clone())
-	if r.URL.Path == "/v1/logs" {
+
+	var body io.Reader = r.Body
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		zr, err := gzip.NewReader(r.Body)
+		if err != nil {
+			s.rejectRequest(w, r.URL.Path, fmt.Errorf("open gzip body: %w", err))
+			return
+		}
+		defer zr.Close()
+		body = zr
+	}
+	data, err := io.ReadAll(body)
+	if err != nil {
+		s.rejectRequest(w, r.URL.Path, fmt.Errorf("read body: %w", err))
+		return
+	}
+
+	switch r.URL.Path {
+	case "/v1/metrics":
+		req := new(colmetricspb.ExportMetricsServiceRequest)
+		if err := proto.Unmarshal(data, req); err != nil {
+			s.rejectRequest(w, r.URL.Path, fmt.Errorf("decode metrics: %w", err))
+			return
+		}
+		s.metrics = append(s.metrics, req)
+	case "/v1/logs":
 		var req collogspb.ExportLogsServiceRequest
 		if err := proto.Unmarshal(data, &req); err == nil {
 			for _, rl := range req.ResourceLogs {
@@ -127,6 +147,40 @@ func (s *otlpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *otlpServer) rejectRequest(w http.ResponseWriter, path string, err error) {
+	s.requestErrors = append(s.requestErrors, fmt.Errorf("%s: %w", path, err))
+	http.Error(w, err.Error(), http.StatusBadRequest)
+}
+
+// assertTestCounter requires the caller to hold s.mu.
+func (s *otlpServer) assertTestCounter(t *testing.T) {
+	t.Helper()
+	for _, err := range s.requestErrors {
+		t.Errorf("OTLP collector: %v", err)
+	}
+	for _, req := range s.metrics {
+		for _, resource := range req.GetResourceMetrics() {
+			for _, scope := range resource.GetScopeMetrics() {
+				if scope.GetScope().GetName() != "test" {
+					continue
+				}
+				for _, metric := range scope.GetMetrics() {
+					sum := metric.GetSum()
+					if metric.GetName() != "test_events" || !sum.GetIsMonotonic() {
+						continue
+					}
+					for _, point := range sum.GetDataPoints() {
+						if value, ok := point.GetValue().(*metricspb.NumberDataPoint_AsInt); ok && value.AsInt == 1 {
+							return
+						}
+					}
+				}
+			}
+		}
+	}
+	t.Error("OTLP metrics lack a monotonic sum test_events in scope test with integer value 1")
 }
 
 // TestOTLPExport checks that OTEL_EXPORTER_OTLP_ENDPOINT turns on the export
@@ -166,6 +220,7 @@ func TestOTLPExport(t *testing.T) {
 	if !strings.Contains(out.String(), "exported") {
 		t.Errorf("stdout = %s", out.String())
 	}
+	collector.assertTestCounter(t)
 }
 
 // clearOTLPEnv removes every OTEL_EXPORTER_OTLP_* variable of the parent
@@ -301,13 +356,14 @@ func TestShutdownWithoutLogExport(t *testing.T) {
 	if !slices.Contains(collector.paths, "/v1/metrics") || slices.Contains(collector.paths, "/v1/logs") {
 		t.Errorf("OTLP paths = %v", collector.paths)
 	}
+	collector.assertTestCounter(t)
 }
 
 // TestOTLPExportIgnoresInheritedSettings checks that OTLP settings that the
 // test process inherits (signal-specific endpoints, generic and
 // signal-specific headers and compression) cannot redirect or alter the export
-// of the fixture tests: they reach the fixture collector alone, without the
-// inherited headers.
+// of the fixture tests. The requests reach only the fixture collector, with
+// no inherited headers or compression.
 func TestOTLPExportIgnoresInheritedSettings(t *testing.T) {
 	alternate := &otlpServer{}
 	altSrv := httptest.NewServer(alternate)
@@ -351,5 +407,9 @@ func TestOTLPExportIgnoresInheritedSettings(t *testing.T) {
 		if v := h.Get("X-Inherited"); v != "" {
 			t.Errorf("request %d to %s carries the inherited header X-Inherited=%s", i, collector.paths[i], v)
 		}
+		if encoding := h.Get("Content-Encoding"); encoding != "" {
+			t.Errorf("request %d to %s has Content-Encoding %q, want empty", i, collector.paths[i], encoding)
+		}
 	}
+	collector.assertTestCounter(t)
 }

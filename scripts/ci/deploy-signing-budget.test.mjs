@@ -32,7 +32,10 @@ function darwinAssetCount() {
 }
 
 function jobBlock() {
-  const workflow = read(".github/workflows/deploy.yml");
+  const workflow = read(".github/workflows/deploy.yml").replaceAll(
+    "\r\n",
+    "\n",
+  );
   const match = workflow.match(
     new RegExp(`^ {2}${JOB}:\\n((?:(?: {4}.*)?\\n)*)`, "m"),
   );

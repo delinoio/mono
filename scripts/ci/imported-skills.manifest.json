@@ -13,7 +13,7 @@
       "files": {
         "LICENSE": "13990a7ef816ecccad065c66f3ecd66cff7ec9da3b7aa49124dd78bacd3fee66",
         "SKILL.md": "d87bb3e172df60cf1b0c57cd938ddac366be2cc7f59e484b9a6b0d130bdff4ef",
-        "references/backup-recovery.md": "fcf264d86d664768280c23ec07e005799186c1268f3a0c19178c173ec0af0213",
+        "references/backup-recovery.md": "5972f257d6b02e29bc2b8d9e45a9cbc0f2094c78d70f076e9f6302f21e1b47c6",
         "references/index-optimization.md": "1f978e6da54900fcbceefe0ac5b2cc2e0f88a445cd8098310bed0f42ba303c97",
         "references/indexing.md": "609fdceeeba6b01246ccb599b9761d0346281e3d015ab87d782293ea585d0813",
         "references/memory-management-ops.md": "254473cffe6b6d61c24de3bb993f142462a54612bb7e4fbfbfd1ded9ed39747d",
@@ -34,7 +34,7 @@
         "references/replication.md": "c042b121410adb3f0bfb4cec1a5d124ce5fb283dc32ea56d277aaba9ca5fb63b",
         "references/schema-design.md": "fab6e3e1882a1d9f4db8b647084693a9c7f82516d17e5cd18cb3238f85adba6b",
         "references/storage-layout.md": "77af9a9d6afea9e4294da88dd1040098b13e5e2db826d87264627b70e0f0ae63",
-        "references/wal-operations.md": "7abf0bcd04ae9a5dce0985d621d0354bc30f7a56b66786aaadd8ac9d5c4bd192"
+        "references/wal-operations.md": "772b2768ae649a95af5e79ba710235ff0ccc93a3ba7db44e973c2a5df6378578"
       }
     },
     "vercel-composition-patterns": {
@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "9c5821e48e85836046ecfc60de1cea86a71fb65dfcb0e2d09eada4ee95607bd1",
+        "AGENTS.md": "ccac4cfb3e0449d8768ab7a3fa675c9accd60f495f5802f06f0d5df218009d1b",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "8d9f8517adee6028be8ba0a9cd8869cf27d3dbc3ca56d1414c8ed4751afbe516",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -96,7 +96,7 @@
         "rules/bundle-dynamic-imports.md": "401817a7369f315fc5a68a1095742ff7d53d0461906880dc9d64a41495ee1986",
         "rules/bundle-preload.md": "ed606ad34f9e5573573a833f498e7b938fd1a445b43e16c5d437c2a071864b5f",
         "rules/client-event-listeners.md": "30a3141a17f4b8853d4a440633d8106f2cf53914ab2ee8cf96e6b667ad642c6f",
-        "rules/client-localstorage-schema.md": "34141c691626fdf96f96d257fe2fba959dbf6e174f154e50223a7796fc932f3c",
+        "rules/client-localstorage-schema.md": "50b3a54bc30ace7e9925d55ed801a3318d713ea22529af4f45a506d175bbc5e5",
         "rules/client-passive-event-listeners.md": "1f35016f9053de69e884ee9be00654e37979c2ca85f5e57764dc2626ff7acb4b",
         "rules/client-swr-dedup.md": "d6cfd65bdbaa1e9344ddf952e82d5db8fbb61175cb1e5b2a962c1984d9c950e4",
         "rules/js-batch-dom-css.md": "480b891b9eaf96e929dc1e964274a4828e3a78009b7d00ccd965a0d425215959",
@@ -132,7 +132,7 @@
         "rules/rerender-lazy-state-init.md": "4bd7dcaeee8a77dbef38f6f39614048fee715a1dada77da39644caed8a365fac",
         "rules/rerender-memo-with-default-value.md": "96b72c57abc1c57a50d5c535cb0575800756ecdbe3ae376ba83c84f518d08526",
         "rules/rerender-memo.md": "1f258990c2f27ff6256b3cc5c43300631bb3f0d81f749aed08d07fcdcc131dd1",
-        "rules/rerender-move-effect-to-event.md": "abc2cbf167bee056743023351e96806a411d3398da8802093620aecf0721f029",
+        "rules/rerender-move-effect-to-event.md": "3d01623ed271f52faa895e05819c2b40b477335b9d1590fa4b55061da5a1236a",
         "rules/rerender-no-inline-components.md": "1cc32907a770272524ba682eef9e7efdd8ad4533b6f89b718a1fcd7d1d0eb6a3",
         "rules/rerender-simple-expression-in-memo.md": "5bdcf2d1558ba5204e643c887b7b4060f89630969425651eb68e96427d97f800",
         "rules/rerender-split-combined-hooks.md": "6f45d703343484ef9acef9388397f3642966ae6a5a258899a0cf1f9977cfbf6c",

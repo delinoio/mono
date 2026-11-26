@@ -83,6 +83,10 @@ esac
 
 // Read stdout from a file so the test case can provide NUL bytes.
 const executableStub = `#!/usr/bin/env bash
+if [[ $# -ne 1 || "\${1-}" != version ]]; then
+  echo "release version fixture expected one 'version' argument" >&2
+  exit 64
+fi
 cat "$STUB_DIR/stdout"
 printf '%s' "\${STUB_VERSION_STDERR-}" >&2
 exit "\${STUB_VERSION_STATUS:-0}"

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,7 +26,7 @@ func TestPollTokenStates(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if n < len(tc.responses) {
 				w.WriteHeader(http.StatusBadRequest)
-				fmt.Fprintf(w, `{"error":%q}`, tc.responses[n])
+				fmt.Fprintf(w, `{"error":%q,"error_description":"synthetic-description-marker"}`, tc.responses[n])
 				n++
 				return
 			}
@@ -414,19 +413,37 @@ func TestPollTokenSucceedsBeforeResponseRelativeDeadline(t *testing.T) {
 	}
 }
 
-func TestErrorsNeverContainTokens(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, `{"error":"invalid_grant","error_description":"grant request is invalid"}`)
-	}))
-	defer srv.Close()
-	_, err := Config{Endpoint: srv.URL, AppID: "app"}.Refresh(context.Background(), "refresh-secret")
-	var oe *Error
-	if !errors.As(err, &oe) || oe.Code != "invalid_grant" {
-		t.Fatalf("err %v", err)
-	}
-	if got := err.Error(); got == "" || strings.Contains(got, "refresh-secret") {
-		t.Fatalf("error %q", got)
+func TestOAuthErrorDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		code   ErrorCode
+		want   string
+	}{
+		{"recognized", 400, `{"error":"invalid_grant","error_description":"synthetic-description-marker"}`, InvalidGrant, "logto: invalid_grant"},
+		{"unknown", 400, `{"error":"synthetic-code-marker","error_description":"synthetic-description-marker"}`, "", "logto: http_400"},
+		{"missing code", 401, `{"error_description":"synthetic-description-marker"}`, "", "logto: http_401"},
+		{"empty code", 401, `{"error":"","error_description":"synthetic-description-marker"}`, "", "logto: http_401"},
+		{"wrong code type", 400, `{"error":["synthetic-code-marker"],"error_description":"synthetic-description-marker"}`, "", "logto: http_400"},
+		{"malformed", 503, `{"error":"invalid_grant","error_description":"synthetic-description-marker"`, "", "logto: http_503"},
+		{"empty body", 503, "", "", "logto: http_503"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer srv.Close()
+			_, err := Config{Endpoint: srv.URL, AppID: "app"}.Refresh(t.Context(), "synthetic-refresh-marker")
+			var oe *Error
+			if !errors.As(err, &oe) {
+				t.Fatalf("got %v, want an OAuth error", err)
+			}
+			if oe.Status != tc.status || oe.Code() != tc.code || err.Error() != tc.want {
+				t.Errorf("got status %d, code %q and message %q, want %d, %q and %q", oe.Status, oe.Code(), err, tc.status, tc.code, tc.want)
+			}
+		})
 	}
 }
 

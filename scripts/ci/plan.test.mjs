@@ -200,10 +200,12 @@ test("every shared fixture input selects tests", async (t) => {
   }
 });
 
-test("only the shared fixture input selects Droplet validation", async (t) => {
+test("Droplet validation selects fixtures for provisioning inputs", async (t) => {
   for (const [path, selected] of [
+    ["scripts/droplet/provision.sh", true],
     ["scripts/droplet/configure-docker-logs.sh", true],
-    ["scripts/droplet/provision.sh", false],
+    ["scripts/droplet/start-caddy.sh", true],
+    ["assets/image.svg", false],
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
@@ -1710,8 +1712,10 @@ test("planner CLI ignores GIT_* variables set after the suite loaded", (t) => {
 
 // Splits CI.yml into its jobs, keyed by job ID, in file order. A job body is
 // every following line that is empty or indented by at least four spaces.
-function workflowJobs() {
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
+function workflowJobs(
+  workflowText = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8"),
+) {
+  const workflow = workflowText.replaceAll("\r\n", "\n");
   const jobsStart = workflow.indexOf("\njobs:\n");
   assert.notEqual(jobsStart, -1, "CI.yml has no jobs section");
   const jobs = new Map();
@@ -1722,6 +1726,29 @@ function workflowJobs() {
   }
   return jobs;
 }
+
+test("CI workflow preserves job order and bodies with LF and CRLF", () => {
+  const workflow = [
+    "name: CI",
+    "jobs:",
+    "  z-job:",
+    "    runs-on: ubuntu-latest",
+    "  a-job:",
+    "    needs: z-job",
+    "",
+  ];
+  const expected = [
+    ["z-job", "    runs-on: ubuntu-latest\n"],
+    ["a-job", "    needs: z-job\n"],
+  ];
+  for (const lineEnding of ["\n", "\r\n"]) {
+    assert.deepEqual([...workflowJobs(workflow.join(lineEnding))], expected);
+    assert.throws(() => workflowJobs(`name: CI${lineEnding}`), {
+      code: "ERR_ASSERTION",
+      message: "CI.yml has no jobs section",
+    });
+  }
+});
 
 // The table value of a job that runs for every event without the planner.
 const ALWAYS_RUN = "always";

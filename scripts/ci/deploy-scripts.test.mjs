@@ -3,7 +3,7 @@
 // Fixtures for the shell steps of `.github/workflows/deploy.yml`:
 // `check-pending-changesets.sh` (against a stubbed `gh`),
 // `deploy-provider.sh` and `deploy-targets.sh` (against stubbed CLIs),
-// `droplet-deploy.sh` (against stubbed `docker` and `curl`),
+// `droplet-deploy.sh` (against stubbed `docker` and stubbed or real `curl`),
 // `provision.sh` (against stubbed host commands),
 // `start-caddy.sh` (against a stubbed `docker`),
 // `configure-docker-logs.sh` (against stubbed `docker`, `dockerd` and
@@ -12,6 +12,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import {
   chmodSync,
   existsSync,
@@ -25,11 +26,13 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { main as deployPlan } from "./deploy-plan.mjs";
+import { deadlineSkipReason } from "./fixture-deadline.mjs";
 import { spawnProcessGroup } from "./fixture-process.mjs";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 
@@ -67,6 +70,10 @@ function skipReason() {
   return false;
 }
 const skip = skipReason();
+
+function readYamlFixture(path) {
+  return readFileSync(join(root, path), "utf8").replaceAll("\r\n", "\n");
+}
 
 function scratch(t) {
   const dir = mkdtempSync(join(tmpdir(), "deploy-scripts-"));
@@ -190,10 +197,7 @@ const changeset = (id, ...list) => ({
 });
 
 test("deploy.yml keeps pending runs in the concurrency queue", () => {
-  const workflow = readFileSync(
-    join(root, ".github/workflows/deploy.yml"),
-    "utf8",
-  );
+  const workflow = readYamlFixture(".github/workflows/deploy.yml");
   const block = workflow.match(/^concurrency:\n((?:  .*\n|\n)+)/m);
   assert.ok(block, "deploy.yml has a workflow-level concurrency block");
   const keys = block[1]
@@ -205,7 +209,7 @@ test("deploy.yml keeps pending runs in the concurrency queue", () => {
   assert.ok(keys.some((key) => key.startsWith("group: ")));
   // actionlint v1.7.12 rejects `queue`; the exception must name only that
   // diagnostic and only this workflow.
-  const lint = readFileSync(join(root, ".github/actionlint.yaml"), "utf8");
+  const lint = readYamlFixture(".github/actionlint.yaml");
   assert.match(
     lint,
     /^paths:\n {2}\.github\/workflows\/deploy\.yml:\n {4}ignore:\n {6}- 'unexpected key "queue" for "concurrency" section\.\*'\n$/m,
@@ -810,10 +814,7 @@ function planRelease(work) {
     repoRoot: work,
   });
   const outputs = readOutputs(planOutput);
-  const workflow = readFileSync(
-    join(root, ".github/workflows/deploy.yml"),
-    "utf8",
-  );
+  const workflow = readYamlFixture(".github/workflows/deploy.yml");
   const script = workflow.match(
     /^        id: blobs\n[\s\S]*?^        run: \|\n((?: {10}.*\n)+)/m,
   )?.[1];
@@ -1481,10 +1482,7 @@ test("recovery rejects a superseding deployment", { skip }, (t) => {
 });
 
 test("deploy.yml tries the recovery before the stale-plan check", () => {
-  const workflow = readFileSync(
-    join(root, ".github/workflows/deploy.yml"),
-    "utf8",
-  );
+  const workflow = readYamlFixture(".github/workflows/deploy.yml");
   const job = workflow.match(/^ {2}release:\n(?:(?: {4}.*)?\n)+/m)?.[0] ?? "";
   const steps = job.split(/^ {6}- /m).slice(1);
   const index = (needle) => steps.findIndex((step) => step.includes(needle));
@@ -2364,22 +2362,19 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
 // --- droplet-deploy.sh -----------------------------------------------------
 
 // droplet-deploy.sh serializes deployments with util-linux `flock`.
-const hasFlock = spawnSync("sh", ["-c", "command -v flock"]).status === 0;
+const realFlock = spawnSync("sh", ["-c", "command -v flock"], {
+  encoding: "utf8",
+}).stdout?.trim();
+const hasPgrep = spawnSync("sh", ["-c", "command -v pgrep"]).status === 0;
 
 const isProxyLoad = (call) => call.startsWith("docker exec -i ");
 const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
 const skipDroplet =
   skip ||
-  (!hasFlock && "flock is not installed") ||
+  (!realFlock && "flock is not installed") ||
   (spawnSync("sh", ["-c", "command -v python3"]).status !== 0 &&
     "python3 is not installed") ||
-  (process.platform !== "linux" &&
-    "the Droplet deadline needs Linux /proc/uptime") ||
-  (spawnSync("timeout", ["--version"], { encoding: "utf8" }).stdout?.includes(
-    "GNU coreutils",
-  )
-    ? false
-    : "the Droplet deadline needs GNU coreutils timeout");
+  deadlineSkipReason();
 const dropletDeploymentUuid = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
 const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(64)}`;
 const httpArgs = [
@@ -2429,6 +2424,7 @@ const sandrunArgs = ["sandrun-api", ...httpArgs.slice(1)];
 //                 so that a test can send a signal while the call runs.
 //   STUB_BLOCK_IGNORES_TERM makes the blocked command ignore TERM for four seconds.
 //   STUB_STATUS_DELAY delays the replacement's status inspection.
+//   STUB_ADDRESS overrides the replacement's inspected address.
 // `stubs` adds stub commands (name -> shell body) that shadow system tools, and
 // `prepare(deployRoot)` changes the scratch state before the run.
 function setupDroplet(
@@ -2438,6 +2434,7 @@ function setupDroplet(
     old = [],
     envFile = "LOG_LEVEL=info\n",
     route,
+    deploymentUuid = dropletDeploymentUuid,
     state,
     previous,
     stubs = {},
@@ -2453,7 +2450,7 @@ function setupDroplet(
   writeFileSync(join(dir, "calls.log"), "");
   // The deployment identifier that droplet-deploy.sh reads (a fixed UUID, and
   // a file that exists on every platform).
-  writeFileSync(join(dir, "id-source"), `${dropletDeploymentUuid}\n`);
+  writeFileSync(join(dir, "id-source"), `${deploymentUuid}\n`);
   // `null` leaves the env file out.
   if (envFile !== null) {
     writeFileSync(join(deployRoot, "env", `${args[0]}.env`), envFile);
@@ -2547,7 +2544,7 @@ case "$1" in
           [[ "\${pair%%=*}" != "\$4" ]] || { echo "\${pair#*=}"; exit 0; }
         done
         echo "${olderImage}" ;;
-      *) echo 172.18.0.5 ;;
+      *) echo "\${STUB_ADDRESS:-172.18.0.5}" ;;
     esac ;;
   run|create)
     code="\${STUB_RUN_EXIT:-0}"
@@ -2731,15 +2728,30 @@ test(
   "droplet deploy switches the route to the new alias on every deployment",
   { skip: skipDroplet },
   (t) => {
+    const routePath = "caddy/sites/api.caddy";
+    const upstream = /^[ \t]+reverse_proxy (\S+)/m;
     const first = runDroplet(t);
     assert.equal(first.status, 0, first.stderr);
-    const route = first.read("caddy/sites/api.caddy");
-    // A second run of the same image, in a fresh root with the route of the
-    // first run, still reloads the proxy: every deployment has its own alias.
-    const second = runDroplet(t, undefined, { old: ["old1"], route });
+    const route = first.read(routePath);
+    assert.equal(
+      route?.match(upstream)?.[1],
+      `api-${dropletDeploymentUuid.replaceAll("-", "")}:8080`,
+    );
+
+    // Seed the first route and deploy the same image with a new identifier.
+    const secondUuid = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+    const second = runDroplet(t, undefined, {
+      old: ["old1"],
+      route,
+      deploymentUuid: secondUuid,
+    });
     assert.equal(second.status, 0, second.stderr);
-    assert.ok(second.calls.some((call) => call.startsWith("docker exec")));
+    assert.ok(second.calls.some(isProxyLoad));
     assert.equal(second.read("state/api.current"), `${dropletImage}\n`);
+    assert.equal(
+      second.read(routePath)?.match(upstream)?.[1],
+      `api-${secondUuid.replaceAll("-", "")}:8080`,
+    );
   },
 );
 
@@ -4275,6 +4287,92 @@ test(
 );
 
 test(
+  "droplet deploy probes the replacement directly despite HTTP proxy settings",
+  {
+    skip:
+      skipDroplet ||
+      (spawnSync("curl", ["--version"]).status !== 0 &&
+        "curl is not installed"),
+  },
+  async (t) => {
+    for (const [name, response, noProxy] of [
+      ["200 with an empty bypass list", 200, ""],
+      ["200 with a nonmatching bypass list", 200, "example.invalid"],
+      ["503", 503, ""],
+      ["transport failure", null, ""],
+    ]) {
+      await t.test(name, { timeout: 10000 }, async (t) => {
+        const requests = [];
+        const proxyRequests = [];
+        const origin = createServer((req, res) => {
+          requests.push(`${req.method} ${req.url}`);
+          if (response === null) {
+            req.socket.destroy();
+            return;
+          }
+          res.writeHead(response).end();
+        });
+        const proxy = createServer((req, res) => {
+          proxyRequests.push(req.url);
+          res.writeHead(502).end();
+        });
+        for (const server of [origin, proxy]) {
+          server.listen(0, "127.0.0.1");
+          t.after(() => new Promise((resolve) => server.close(resolve)));
+          await once(server, "listening");
+        }
+
+        const args = [...httpArgs];
+        args[2] = String(origin.address().port);
+        const route = "# old route\n";
+        const current = `${olderImage}\n`;
+        const previous = `${oldestImage}\n`;
+        const setup = setupDroplet(t, args, {
+          old: ["old1"],
+          route,
+          state: current,
+          previous,
+          stubs: {
+            curl: 'exec "$(PATH="${PATH#*:}" command -v curl)" --disable "$@"',
+          },
+        });
+        const result = await startDroplet(t, setup, args, {
+          STUB_ADDRESS: "127.0.0.1",
+          http_proxy: `http://127.0.0.1:${proxy.address().port}`,
+          NO_PROXY: noProxy,
+          no_proxy: noProxy,
+        }).done;
+
+        assert.deepEqual(proxyRequests, [], "the proxy must receive no probes");
+        assert.ok(requests.length > 0, "the origin must receive a probe");
+        assert.ok(requests.every((request) => request === "GET /healthz"));
+        if (response === 200) {
+          assert.equal(result.status, 0, result.stdout + result.stderr);
+          assert.match(
+            setup.read("caddy/sites/api.caddy"),
+            /reverse_proxy api-/,
+          );
+          assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+          assert.equal(setup.read("state/api.previous"), current);
+        } else {
+          assert.equal(result.status, 1, result.stdout + result.stderr);
+          assert.match(
+            result.stderr,
+            /did not pass the health check within 3 seconds/,
+          );
+          assert.ok(
+            !setup.calls().some((call) => call.startsWith("docker exec")),
+          );
+          assert.equal(setup.read("caddy/sites/api.caddy"), route);
+          assert.equal(setup.read("state/api.current"), current);
+          assert.equal(setup.read("state/api.previous"), previous);
+        }
+      });
+    }
+  },
+);
+
+test(
   "droplet deploy restores the route when the proxy rejects it",
   { skip: skipDroplet },
   (t) => {
@@ -4546,6 +4644,49 @@ async function waitFor(condition, what) {
   assert.fail(`timed out waiting for ${what}`);
 }
 
+// The contender must encounter the held lock before the test releases it.
+async function startContendingDroplet(t, setup, args, lockName) {
+  const bin = join(setup.dir, "lock-probe-bin");
+  const marker = join(setup.dir, "lock-contended");
+  mkdirSync(bin);
+  shellStub(
+    bin,
+    "flock",
+    `fd="\${@: -1}"
+# Check the inherited descriptor against the expected lock file's inode.
+if [[ "$fd" =~ ^[0-9]+$ && /proc/self/fd/"$fd" -ef "$STUB_EXPECTED_LOCK" ]]; then
+  "$STUB_REAL_FLOCK" --nonblock --conflict-exit-code 99 "$fd"
+  result=$?
+  if [[ "$result" != 99 ]]; then
+    printf 'expected contention on %s, but the flock probe exited %s\\n' "$STUB_EXPECTED_LOCK" "$result" >&2
+    exit 1
+  fi
+  : > "$STUB_LOCK_MARKER" || exit 1
+fi
+exec "$STUB_REAL_FLOCK" "$@"`,
+  );
+
+  const run = startDroplet(t, setup, args, {
+    PATH: `${bin}${delimiter}${setup.spawnEnv().PATH}`,
+    STUB_EXPECTED_LOCK: join(setup.deployRoot, "state", lockName),
+    STUB_REAL_FLOCK: realFlock,
+    STUB_LOCK_MARKER: marker,
+  });
+  let outcome;
+  void run.done.then(
+    (result) => (outcome = result),
+    (error) => (outcome = error),
+  );
+  await waitFor(() => {
+    assert.ok(
+      !outcome,
+      `deployment exited before contending for ${lockName}: ${outcome?.stderr ?? outcome}`,
+    );
+    return existsSync(marker);
+  }, `contention on ${lockName}`);
+  return run;
+}
+
 // The `curl` of a run with STUB_BLOCK set does not answer until `release`
 // exists, so that the run holds its deployment lock for as long as the test
 // needs.
@@ -4577,15 +4718,12 @@ test(
     );
     // The second run is the direct rollback of the documentation: another
     // image of the same service while the first deployment still runs.
-    const second = startDroplet(t, setup, [
-      "api",
-      concurrentImage,
-      "8080",
-      "api.example.com",
-      "http1",
-      "none",
-    ]);
-    await sleep(750);
+    const second = await startContendingDroplet(
+      t,
+      setup,
+      ["api", concurrentImage, "8080", "api.example.com", "http1", "none"],
+      "api.lock",
+    );
     assert.deepEqual(
       setup.calls().filter((call) => call.includes(concurrentImage)),
       [],
@@ -4828,7 +4966,7 @@ test(
 
 // --- provision.sh ----------------------------------------------------------
 
-const skipProvision = skip || (!hasFlock && "flock is not installed");
+const skipProvision = skip || (!realFlock && "flock is not installed");
 const systemDockerHost = "unix:///var/run/docker.sock";
 const systemDocker = `docker --host ${systemDockerHost}`;
 const alternateDockerSelectors = ["host", "context", "saved context"];
@@ -4873,6 +5011,7 @@ function provisionFixture(
   const provision = join(dir, "provision.sh");
   const calls = join(dir, "calls");
   const dockerCalls = join(dir, "docker-calls");
+  const route = join(dir, "caddy", "sites", "api.caddy");
   const dockerEnv = provisioningDockerEnv(dir, endpoint);
   const source = readFileSync(
     join(root, "scripts/droplet/provision.sh"),
@@ -4911,6 +5050,13 @@ function provisionFixture(
     ).trim();
     symlinkSync(executable, join(dir, name));
   }
+  // Open a separate descriptor so flock tests the lock held by provision.sh.
+  const requireProxyLock = `
+lock="$PROVISION_FIXTURE_ROOT/state/.proxy.lock"
+[[ -f "$lock" ]] || exit 1
+flock --nonblock --conflict-exit-code 13 "$lock" true
+[[ "$?" == 13 ]] || exit 1
+`;
   for (const [name, body] of Object.entries({
     ...(cli && { docker: 'exec bash ./docker-stub "$@"' }),
     "docker-stub": `
@@ -4935,7 +5081,7 @@ case "$*" in
     printf '%s\\n' "$(< load-state)"
     exit "$PROVISION_QUERY_STATUS"
     ;;
-  'enable --now docker') exit 0 ;;
+  'enable --now docker') ${requireProxyLock} ;;
   *) exit 2 ;;
 esac
 `,
@@ -4961,34 +5107,41 @@ fi
       'if [[ "$*" == "-m 0755 -d ./apt/keyrings" ]]; then mkdir -p ./apt/keyrings; else mkdir -p "${@:8}"; fi',
     chown: "exit 0",
     runuser: '[[ "$1 $2 $3" == "-u deploy --" ]] && exec "${@:4}"',
-    "configure-docker-logs.sh":
-      'printf "configure-docker-logs.sh %s\\n" "$*" >> calls',
+    "configure-docker-logs.sh": `
+printf 'configure-docker-logs.sh %s\\n' "$*" >> calls
+${requireProxyLock}
+route="$PROVISION_FIXTURE_ROOT/caddy/sites/api.caddy"
+if [[ -f "$route" ]]; then
+  printf '%s\\n' "$(< "$route")" > route-seen-by-log-setup
+fi
+`,
     "start-caddy.sh": `
-lock="$2/state/.proxy.lock"
-[[ -f "$2/caddy/Caddyfile" && -f "$lock" ]] || exit 1
-flock --nonblock --conflict-exit-code 13 "$lock" true
-[[ "$?" == 13 ]] && touch "$2/caddy-started"
+echo start-caddy.sh >> calls
+[[ -f "$2/caddy/Caddyfile" ]] || exit 1
+${requireProxyLock}
+touch "$2/caddy-started"
 `,
   })) {
     writeFileSync(join(dir, name), `#!/usr/bin/env bash\n${body}\n`, {
       mode: 0o755,
     });
   }
-  return {
-    caddyfile: join(dir, "caddy", "Caddyfile"),
-    lock: join(dir, "state", ".proxy.lock"),
-    helperRan: () => existsSync(join(dir, "caddy-started")),
-    run: (prefix = []) => {
-      writeFileSync(calls, "");
-      writeFileSync(dockerCalls, "");
-      const [command, ...args] = [
-        ...prefix,
-        "bash",
-        provision,
-        join(dir, "key.pub"),
-        "test@example.com",
-      ];
-      const result = spawnSync(command, args, {
+  const readCalls = (path) =>
+    readFileSync(path, "utf8").trim().split("\n").filter(Boolean);
+  const invocation = (prefix, env = {}) => {
+    writeFileSync(calls, "");
+    writeFileSync(dockerCalls, "");
+    const [command, ...args] = [
+      ...prefix,
+      "bash",
+      provision,
+      join(dir, "key.pub"),
+      "test@example.com",
+    ];
+    return [
+      command,
+      args,
+      {
         cwd: dir,
         encoding: "utf8",
         env: {
@@ -5001,15 +5154,26 @@ flock --nonblock --conflict-exit-code 13 "$lock" true
           PROVISION_NETWORK_MISSING: String(networkMissing),
           PROVISION_DAEMON_DOWN: String(daemonDown),
           DROPLET_PROXY_LOCK_TIMEOUT: "0",
+          ...env,
         },
-      });
+      },
+    ];
+  };
+  return {
+    dir,
+    caddyfile: join(dir, "caddy", "Caddyfile"),
+    lock: join(dir, "state", ".proxy.lock"),
+    route,
+    routeSeenByLogSetup: join(dir, "route-seen-by-log-setup"),
+    helperRan: () => existsSync(join(dir, "caddy-started")),
+    calls: () => readCalls(calls),
+    start: (env) => spawnProcessGroup(t, ...invocation([], env)),
+    run: (prefix = []) => {
+      const result = spawnSync(...invocation(prefix));
       return {
         ...result,
-        calls: readFileSync(calls, "utf8").trim().split("\n"),
-        dockerCalls: readFileSync(dockerCalls, "utf8")
-          .trim()
-          .split("\n")
-          .filter(Boolean),
+        calls: readCalls(calls),
+        dockerCalls: readCalls(dockerCalls),
       };
     },
   };
@@ -5023,9 +5187,10 @@ const installDockerEngine = [
   "apt-get update",
   "apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin",
 ];
-const configureDockerEngine = [
+const configureDockerAndCaddy = [
   "configure-docker-logs.sh ./daemon.json",
   "systemctl enable --now docker",
+  "start-caddy.sh",
 ];
 const networkCreateCalls = [
   `${systemDocker} network inspect delino`,
@@ -5073,11 +5238,14 @@ test(
     assert.deepEqual(first.calls, [
       queryDockerUnit,
       ...installDockerEngine,
-      ...configureDockerEngine,
+      ...configureDockerAndCaddy,
     ]);
     const second = fixture.run();
     assert.equal(second.status, 0, second.stderr);
-    assert.deepEqual(second.calls, [queryDockerUnit, ...configureDockerEngine]);
+    assert.deepEqual(second.calls, [
+      queryDockerUnit,
+      ...configureDockerAndCaddy,
+    ]);
   },
 );
 
@@ -5087,7 +5255,10 @@ test(
   (t) => {
     const result = provisionFixture(t).run();
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(result.calls, [queryDockerUnit, ...configureDockerEngine]);
+    assert.deepEqual(result.calls, [
+      queryDockerUnit,
+      ...configureDockerAndCaddy,
+    ]);
   },
 );
 
@@ -5099,7 +5270,7 @@ test(
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.calls, [
       ...installDockerEngine,
-      ...configureDockerEngine,
+      ...configureDockerAndCaddy,
     ]);
   },
 );
@@ -5151,12 +5322,59 @@ test(
     const { ino } = statSync(fixture.lock);
     const second = fixture.run();
     assert.equal(second.status, 0, second.stderr);
+    assert.deepEqual(second.calls, [
+      queryDockerUnit,
+      ...configureDockerAndCaddy,
+    ]);
     assert.equal(statSync(fixture.lock).ino, ino);
   },
 );
 
 test(
-  "provision preserves Caddy configuration when the proxy lock is unavailable",
+  "provision waits for a route rollback before configuring Docker or Caddy",
+  { skip: skipProvision || (!hasPgrep && "pgrep is not installed") },
+  async (t) => {
+    const fixture = provisionFixture(t);
+    mkdirSync(dirname(fixture.lock), { recursive: true });
+    mkdirSync(dirname(fixture.route), { recursive: true });
+    writeFileSync(fixture.route, "# uncommitted route\n");
+    const ready = join(fixture.dir, "proxy-locked");
+    const lock = spawnProcessGroup(t, "bash", [
+      "-c",
+      'exec 9>> "$1"; flock 9 && touch "$2" && read -r _',
+      "bash",
+      fixture.lock,
+      ready,
+    ]);
+    await waitFor(() => existsSync(ready), "the proxy lock to be held");
+    const run = fixture.start({
+      DROPLET_PROXY_LOCK_TIMEOUT: "",
+      DROPLET_LOCK_TIMEOUT: "20",
+    });
+    await waitForLockWait(run, "provisioning to wait for the proxy lock");
+    assert.deepEqual(fixture.calls(), [queryDockerUnit]);
+
+    const restoredRoute = "# restored route\n";
+    writeFileSync(fixture.route, restoredRoute);
+    lock.child.stdin.end("release\n");
+    assert.equal((await lock.done).status, 0);
+
+    const result = await run.done;
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(fixture.calls(), [
+      queryDockerUnit,
+      ...configureDockerAndCaddy,
+    ]);
+    assert.equal(
+      readFileSync(fixture.routeSeenByLogSetup, "utf8"),
+      restoredRoute,
+    );
+    assert.ok(fixture.helperRan());
+  },
+);
+
+test(
+  "provision leaves Docker and Caddy untouched when the proxy lock is unavailable",
   { skip: skipProvision },
   (t) => {
     const fixture = provisionFixture(t);
@@ -5168,7 +5386,12 @@ test(
 
     const contended = fixture.run(["flock", fixture.lock]);
     assert.equal(contended.status, 1, contended.stderr);
-    assert.match(contended.stderr, /could not acquire the proxy lock/);
+    assert.match(
+      contended.stderr,
+      /could not acquire the proxy lock .*wait limit: 0 seconds/,
+    );
+    assert.deepEqual(contended.calls, [queryDockerUnit]);
+    assert.deepEqual(contended.dockerCalls, []);
     assert.equal(readFileSync(fixture.caddyfile, "utf8"), previous);
     assert.equal(fixture.helperRan(), false);
 
@@ -5177,6 +5400,8 @@ test(
     const cannotOpen = fixture.run();
     assert.equal(cannotOpen.status, 1, cannotOpen.stderr);
     assert.match(cannotOpen.stderr, /could not open the proxy lock file/);
+    assert.deepEqual(cannotOpen.calls, [queryDockerUnit]);
+    assert.deepEqual(cannotOpen.dockerCalls, []);
     assert.equal(readFileSync(fixture.caddyfile, "utf8"), previous);
     assert.equal(fixture.helperRan(), false);
   },
@@ -5368,6 +5593,11 @@ function runCaddy(t, options) {
   return setupCaddy(t, options)();
 }
 
+const caddyReadiness = { skip: skip || deadlineSkipReason() };
+const caddyZeroDeadline = {
+  skip: skip || deadlineSkipReason({ needsTimeout: false }),
+};
+
 const caddyRun = `${systemDocker} run --detach --name caddy --network delino --restart unless-stopped --log-driver local --publish 80:80 --publish 443:443 --publish 443:443/udp --volume /srv/delino/caddy:/etc/caddy:ro --volume caddy-data:/data --volume caddy-config:/config ${caddyImage}`;
 const caddyList = `${systemDocker} container ls --all --no-trunc --filter name=^/caddy$ --format {{.ID}}`;
 const caddyInspect = `${systemDocker} container inspect --format {{.Config.Image}}|{{.State.Running}}|{{.HostConfig.LogConfig.Type}} caddy-id`;
@@ -5382,7 +5612,7 @@ const caddyLogs = `DOCKER_CONTEXT= ${systemDocker} logs caddy`;
 
 test(
   "start-caddy uses the system daemon for create, start and reload",
-  { skip },
+  caddyReadiness,
   (t) => {
     for (const endpoint of alternateDockerSelectors) {
       for (const [inspect, operations] of [
@@ -5401,7 +5631,7 @@ test(
   },
 );
 
-test("start-caddy creates a missing container", { skip }, (t) => {
+test("start-caddy creates a missing container", caddyReadiness, (t) => {
   const result = runCaddy(t, { daemonLogDriver: "json-file" });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.container, `${caddyImage} true local`);
@@ -5420,7 +5650,7 @@ test("start-caddy reloads a running container", { skip }, (t) => {
   assert.deepEqual(result.calls, [caddyList, caddyInspect, caddyReload]);
 });
 
-test("start-caddy starts a stopped container", { skip }, (t) => {
+test("start-caddy starts a stopped container", caddyReadiness, (t) => {
   const result = runCaddy(t, { inspect: `${caddyImage} false` });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.calls, [
@@ -5434,7 +5664,7 @@ test("start-caddy starts a stopped container", { skip }, (t) => {
 
 test(
   "start-caddy probes after create and start with padded timeouts",
-  { skip },
+  caddyReadiness,
   (t) => {
     const createCalls = [caddyImageInspect, caddyRun];
     const startCalls = [caddyInspect, caddyStart];
@@ -5459,31 +5689,35 @@ test(
   },
 );
 
-test("start-caddy recreates a container with another image", { skip }, (t) => {
-  for (const running of ["true", "false"]) {
-    const result = runCaddy(t, {
-      inspect: `caddy:2.10.0@sha256:${"a".repeat(64)} ${running}`,
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(
-      result.calls,
-      [
-        caddyList,
-        caddyInspect,
-        caddyImageInspect,
-        caddyRemove,
-        caddyRun,
-        caddyState,
-        caddyProbe,
-      ],
-      running,
-    );
-  }
-});
+test(
+  "start-caddy recreates a container with another image",
+  caddyReadiness,
+  (t) => {
+    for (const running of ["true", "false"]) {
+      const result = runCaddy(t, {
+        inspect: `caddy:2.10.0@sha256:${"a".repeat(64)} ${running}`,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(
+        result.calls,
+        [
+          caddyList,
+          caddyInspect,
+          caddyImageInspect,
+          caddyRemove,
+          caddyRun,
+          caddyState,
+          caddyProbe,
+        ],
+        running,
+      );
+    }
+  },
+);
 
 test(
   "start-caddy migrates same-image legacy containers and then reuses them",
-  { skip },
+  caddyReadiness,
   (t) => {
     for (const running of ["true", "false"]) {
       const run = setupCaddy(t, {
@@ -5513,9 +5747,7 @@ test(
 
 test(
   "start-caddy pulls a missing image before it removes the container",
-  {
-    skip,
-  },
+  caddyReadiness,
   (t) => {
     for (const inspect of [
       undefined,
@@ -5578,17 +5810,21 @@ test(
   },
 );
 
-test("start-caddy needs no pull for a same-image container", { skip }, (t) => {
-  for (const running of ["true", "false"]) {
-    const result = runCaddy(t, {
-      inspect: `${caddyImage} ${running}`,
-      noImage: true,
-      fail: "pull",
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.ok(!result.calls.includes(caddyPull));
-  }
-});
+test(
+  "start-caddy needs no pull for a same-image container",
+  caddyReadiness,
+  (t) => {
+    for (const running of ["true", "false"]) {
+      const result = runCaddy(t, {
+        inspect: `${caddyImage} ${running}`,
+        noImage: true,
+        fail: "pull",
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(!result.calls.includes(caddyPull));
+    }
+  },
+);
 
 test(
   "start-caddy keeps the existing container when its settings are incomplete",
@@ -6167,26 +6403,28 @@ test(
   },
 );
 
-test("start-caddy waits until Caddy answers its admin API", { skip }, (t) => {
-  for (const inspect of [undefined, `${caddyImage} false`]) {
-    const result = runCaddy(t, { inspect, wgetFails: 2 });
-    const label = String(inspect);
-    assert.equal(result.status, 0, `${label}: ${result.stderr}`);
-    const probes = result.calls.filter((call) => call === caddyProbe);
-    assert.equal(probes.length, 3, label);
-    assert.equal(
-      result.calls.filter((call) => call === caddyState).length,
-      3,
-      label,
-    );
-  }
-});
+test(
+  "start-caddy waits until Caddy answers its admin API",
+  caddyReadiness,
+  (t) => {
+    for (const inspect of [undefined, `${caddyImage} false`]) {
+      const result = runCaddy(t, { inspect, wgetFails: 2 });
+      const label = String(inspect);
+      assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+      const probes = result.calls.filter((call) => call === caddyProbe);
+      assert.equal(probes.length, 3, label);
+      assert.equal(
+        result.calls.filter((call) => call === caddyState).length,
+        3,
+        label,
+      );
+    }
+  },
+);
 
 test(
   "start-caddy fails at once for a container that is not running",
-  {
-    skip,
-  },
+  caddyReadiness,
   (t) => {
     for (const inspect of [undefined, `${caddyImage} false`]) {
       for (const state of ["exited", "dead", "restarting"]) {
@@ -6210,7 +6448,7 @@ test(
   },
 );
 
-test("start-caddy fails when Caddy never answers", { skip }, (t) => {
+test("start-caddy fails when Caddy never answers", caddyReadiness, (t) => {
   for (const [inspect, logDriver] of [
     [undefined, "local"],
     [`${caddyImage} false`, "local"],
@@ -6232,7 +6470,7 @@ test("start-caddy fails when Caddy never answers", { skip }, (t) => {
 
 test(
   "start-caddy skips readiness commands at a zero deadline",
-  { skip },
+  caddyZeroDeadline,
   (t) => {
     for (const timeout of ["0", "000"]) {
       const result = runCaddy(t, {
@@ -6247,7 +6485,7 @@ test(
   },
 );
 
-test("start-caddy accepts a probe before the deadline", { skip }, (t) => {
+test("start-caddy accepts a probe before the deadline", caddyReadiness, (t) => {
   const result = runCaddy(t, {
     inspect: `${caddyImage} false`,
     env: { START_CADDY_READY_TIMEOUT: "1", STUB_WGET_DELAY: "0.2" },
@@ -6296,29 +6534,33 @@ for (const { name, env, wgetFails, allowLateProbe, state, attempts } of [
     attempts: [caddyProbe],
   },
 ]) {
-  test(`start-caddy enforces the deadline with ${name}`, { skip }, (t) => {
-    const result = runCaddy(t, {
-      inspect: `${caddyImage} false`,
-      wgetFails,
-      allowLateProbe,
-      env: { START_CADDY_READY_TIMEOUT: "1", ...env },
-    });
-    assert.equal(result.status, 1, result.stderr);
-    assert.ok(result.elapsedMs < 3_000, `took ${result.elapsedMs} ms`);
-    assert.match(result.stderr, /within 1 seconds/);
-    assert.match(result.stderr, new RegExp(`container state is ${state}`));
-    assert.ok(result.stderr.includes(caddyLogs));
-    assert.deepEqual(result.calls, [
-      caddyList,
-      caddyInspect,
-      caddyStart,
-      caddyState,
-      ...attempts,
-    ]);
-  });
+  test(
+    `start-caddy enforces the deadline with ${name}`,
+    caddyReadiness,
+    (t) => {
+      const result = runCaddy(t, {
+        inspect: `${caddyImage} false`,
+        wgetFails,
+        allowLateProbe,
+        env: { START_CADDY_READY_TIMEOUT: "1", ...env },
+      });
+      assert.equal(result.status, 1, result.stderr);
+      assert.ok(result.elapsedMs < 3_000, `took ${result.elapsedMs} ms`);
+      assert.match(result.stderr, /within 1 seconds/);
+      assert.match(result.stderr, new RegExp(`container state is ${state}`));
+      assert.ok(result.stderr.includes(caddyLogs));
+      assert.deepEqual(result.calls, [
+        caddyList,
+        caddyInspect,
+        caddyStart,
+        caddyState,
+        ...attempts,
+      ]);
+    },
+  );
 }
 
-test("start-caddy fails when the container disappears", { skip }, (t) => {
+test("start-caddy fails when the container disappears", caddyReadiness, (t) => {
   const result = runCaddy(t, { gone: true });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /cannot read the state of the caddy container/);
@@ -6355,9 +6597,20 @@ test("start-caddy rejects a bad readiness setting", { skip }, (t) => {
 // proxy reload of every service on the Droplet. The tests below pause the
 // first deployment inside the admin POST (STUB_BLOCK_ON, released by the
 // `release-docker` file) and start the deployment of another service.
-const hasPgrep = spawnSync("sh", ["-c", "command -v pgrep"]).status === 0;
 const skipProxyLock =
   skipDroplet || (!hasPgrep && "pgrep is not installed (procps is missing)");
+// Waits until the run waits for the proxy lock: its `flock` child process is
+// alive only while the lock is held by another process, because the service
+// lock of the run was free.
+async function waitForLockWait(run, what) {
+  await waitFor(
+    () =>
+      spawnSync("pgrep", ["-P", String(run.child.pid), "-x", "flock"])
+        .status === 0,
+    what,
+  );
+}
+
 const workerArgs = [
   "worker",
   concurrentImage,
@@ -6399,21 +6652,9 @@ async function startPausedApiReload(t, env = {}) {
   return { setup, first };
 }
 
-// Waits until the run waits for the proxy lock: its `flock` child process is
-// alive only while the lock is held by another process, because the service
-// lock of the run was free.
-async function waitForLockWait(run, what) {
-  await waitFor(
-    () =>
-      spawnSync("pgrep", ["-P", String(run.child.pid), "-x", "flock"])
-        .status === 0,
-    what,
-  );
-}
-
 test(
   "droplet deploy cleans up an HTTP replacement on a signal while waiting for the proxy lock",
-  { skip: skipProxyLock },
+  { skip: skipDroplet },
   async (t) => {
     const route = "# old route\n";
     const state = `${olderImage}\n`;
@@ -6433,11 +6674,7 @@ test(
       ready,
     ]);
     await waitFor(() => existsSync(ready), "the proxy lock to be held");
-    const run = startDroplet(t, setup, httpArgs);
-    await waitForLockWait(
-      run,
-      "the HTTP deployment to wait for the proxy lock",
-    );
+    const run = await startContendingDroplet(t, setup, httpArgs, ".proxy.lock");
     run.child.kill("SIGTERM");
     lock.child.stdin.end("release\n");
     assert.equal((await lock.done).status, 0);
@@ -6461,13 +6698,14 @@ test(
 
 test(
   "droplet deploy serializes the route changes and proxy reloads of different services",
-  { skip: skipProxyLock },
+  { skip: skipDroplet },
   async (t) => {
     const { setup, first } = await startPausedApiReload(t);
-    const second = startDroplet(t, setup, workerArgs);
-    await waitForLockWait(
-      second,
-      "the second deployment to wait for the proxy lock",
+    const second = await startContendingDroplet(
+      t,
+      setup,
+      workerArgs,
+      ".proxy.lock",
     );
     // The second run did not touch its route file or the proxy, while the
     // first run still reloads.
@@ -6494,15 +6732,16 @@ test(
 
 test(
   "droplet deploy restores a rejected route before another service adapts the Caddyfile",
-  { skip: skipProxyLock },
+  { skip: skipDroplet },
   async (t) => {
     const { setup, first } = await startPausedApiReload(t, {
       STUB_RELOAD: "1",
     });
-    const second = startDroplet(t, setup, workerArgs);
-    await waitForLockWait(
-      second,
-      "the second deployment to wait for the proxy lock",
+    const second = await startContendingDroplet(
+      t,
+      setup,
+      workerArgs,
+      ".proxy.lock",
     );
     // The rejected route of the first run is still installed while it reloads.
     assert.match(setup.read("caddy/sites/api.caddy"), /api\.example\.com/);
@@ -6535,7 +6774,7 @@ test(
 
 test(
   "droplet deploy changes no route when the proxy lock stays held",
-  { skip: skipProxyLock },
+  { skip: skipDroplet },
   async (t) => {
     const { setup, first } = await startPausedApiReload(t);
     const second = await startDroplet(t, setup, workerArgs, {
