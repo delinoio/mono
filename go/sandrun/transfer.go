@@ -226,8 +226,14 @@ func transferContextError(ctx context.Context) error {
 	return ctx.Err()
 }
 
+// transferContext keeps deadlines local while forwarding cancellation and values.
+type transferContext struct{ context.Context }
+
+func (transferContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+
 // transferWindow covers RPCs and backoff for a write chunk or a read.
 type transferWindow struct {
+	caller context.Context
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 	budget time.Duration
@@ -238,10 +244,11 @@ type transferWindow struct {
 }
 
 func newTransferWindow(ctx context.Context, budget time.Duration) *transferWindow {
-	// Keep the SDK budget local. Connect rounds a transmitted deadline
-	// down to milliseconds, so the server could expire it first.
-	callCtx, cancel := context.WithCancelCause(ctx)
+	// Connect rounds transmitted deadlines down to milliseconds. Keep the
+	// caller deadline local too, so the server cannot expire it first.
+	callCtx, cancel := context.WithCancelCause(transferContext{ctx})
 	w := &transferWindow{
+		caller:   ctx,
 		ctx:      callCtx,
 		cancel:   cancel,
 		budget:   budget,
@@ -264,8 +271,11 @@ func (w *transferWindow) check(progress bool) error {
 	if err := transferContextError(w.ctx); err != nil {
 		return err
 	}
+	if err := w.caller.Err(); err != nil {
+		return err
+	}
 	now := time.Now()
-	if callerDeadline, ok := w.ctx.Deadline(); ok && !now.Before(callerDeadline) && !callerDeadline.After(w.deadline) {
+	if callerDeadline, ok := w.caller.Deadline(); ok && !now.Before(callerDeadline) && !callerDeadline.After(w.deadline) {
 		return context.DeadlineExceeded
 	}
 	if !now.Before(w.deadline) {
