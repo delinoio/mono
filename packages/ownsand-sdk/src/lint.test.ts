@@ -9,9 +9,6 @@ import { afterEach, describe, expect, test } from "@rstest/core";
 const script = fileURLToPath(new URL("../scripts/lint.mjs", import.meta.url));
 const header = "// SPDX-License-Identifier: Apache-2.0";
 const roots: string[] = [];
-// Assembled from parts so that this file's own source does not look like an
-// import from servers/ to the lint script.
-const serversImport = ["import x from", '"../../servers/x"'].join(" ");
 
 afterEach(() => {
   for (const root of roots.splice(0)) {
@@ -81,7 +78,7 @@ describe("ownsand-sdk lint SPDX header", () => {
   test("still rejects console use and servers imports in CRLF sources", () => {
     const result = lint({
       "a.ts": `${header}\r\nconsole.log("x");\r\n`,
-      "b.ts": `${header}\r\n${serversImport};\r\n`,
+      "b.ts": `${header}\r\nimport x from "../../../servers/x";\r\n`,
     });
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(
@@ -91,5 +88,44 @@ describe("ownsand-sdk lint SPDX header", () => {
       "b.ts: the SDK must not import from servers/",
     );
     expect(result.stderr).not.toContain("SPDX");
+  });
+});
+
+describe("ownsand-sdk lint server imports", () => {
+  test.each([
+    'import x from "../../../servers/x";',
+    'import "../../../servers/x";',
+    'void import("../../../servers/x");',
+    'export { x } from "../../../servers/x";',
+    "void import(`../../../servers/x`);",
+    'void import("../../../packages/../servers/x", {});',
+  ])("rejects %s", (source) => {
+    const result = lint({ "a.ts": `${header}\n${source}\n` });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe("a.ts: the SDK must not import from servers/\n");
+  });
+
+  test("checks paths relative to nested source files", () => {
+    const result = lint({
+      "nested/a.ts": `${header}\nimport "../../../../servers/x";\n`,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("the SDK must not import from servers/");
+  });
+
+  test.each([
+    'import x from "./local";',
+    'import "./local";',
+    'void import("./local");',
+    'import x from "./servers/local";',
+    '// import x from "../../../servers/x";',
+    '/* import "../../../servers/x"; void import("../../../servers/x"); */',
+    "const example = 'import x from \"../../../servers/x\";';",
+    'const example = `void import("../../../servers/x");`;',
+    "void import(`../../../servers/${name}`);",
+  ])("allows %s", (source) => {
+    const result = lint({ "a.ts": `${header}\n${source}\n` });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
   });
 });
