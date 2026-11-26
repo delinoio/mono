@@ -281,7 +281,7 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 				// request was in flight is rejected as spent: retry once
 				// with the stored generation instead of failing.
 				var oe *logto.Error
-				if attempt < maxRefreshAttempts && errors.As(err, &oe) && oe.Code == "invalid_grant" {
+				if attempt < maxRefreshAttempts && errors.As(err, &oe) && oe.Code() == logto.InvalidGrant {
 					rotated, aerr := adopt()
 					if aerr != nil {
 						return "", aerr
