@@ -3,7 +3,7 @@
 // Fixtures for the shell steps of `.github/workflows/deploy.yml`:
 // `check-pending-changesets.sh` (against a stubbed `gh`),
 // `deploy-provider.sh` and `deploy-targets.sh` (against stubbed CLIs),
-// `droplet-deploy.sh` (against stubbed `docker` and `curl`),
+// `droplet-deploy.sh` (against stubbed `docker` and stubbed or real `curl`),
 // `provision.sh` (against stubbed host commands),
 // `start-caddy.sh` (against a stubbed `docker`),
 // `configure-docker-logs.sh` (against stubbed `docker`, `dockerd` and
@@ -12,6 +12,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import {
   chmodSync,
   existsSync,
@@ -25,6 +26,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2427,6 +2429,7 @@ const sandrunArgs = ["sandrun-api", ...httpArgs.slice(1)];
 //                 so that a test can send a signal while the call runs.
 //   STUB_BLOCK_IGNORES_TERM makes the blocked command ignore TERM for four seconds.
 //   STUB_STATUS_DELAY delays the replacement's status inspection.
+//   STUB_ADDRESS overrides the replacement's inspected address.
 // `stubs` adds stub commands (name -> shell body) that shadow system tools, and
 // `prepare(deployRoot)` changes the scratch state before the run.
 function setupDroplet(
@@ -2546,7 +2549,7 @@ case "$1" in
           [[ "\${pair%%=*}" != "\$4" ]] || { echo "\${pair#*=}"; exit 0; }
         done
         echo "${olderImage}" ;;
-      *) echo 172.18.0.5 ;;
+      *) echo "\${STUB_ADDRESS:-172.18.0.5}" ;;
     esac ;;
   run|create)
     code="\${STUB_RUN_EXIT:-0}"
@@ -4284,6 +4287,92 @@ test(
       );
       assert.equal(result.read("caddy/sites/api.caddy"), undefined, code);
       assert.equal(result.read("state/api.current"), undefined, code);
+    }
+  },
+);
+
+test(
+  "droplet deploy probes the replacement directly despite HTTP proxy settings",
+  {
+    skip:
+      skipDroplet ||
+      (spawnSync("curl", ["--version"]).status !== 0 &&
+        "curl is not installed"),
+  },
+  async (t) => {
+    for (const [name, response, noProxy] of [
+      ["200 with an empty bypass list", 200, ""],
+      ["200 with a nonmatching bypass list", 200, "example.invalid"],
+      ["503", 503, ""],
+      ["transport failure", null, ""],
+    ]) {
+      await t.test(name, { timeout: 10000 }, async (t) => {
+        const requests = [];
+        const proxyRequests = [];
+        const origin = createServer((req, res) => {
+          requests.push(`${req.method} ${req.url}`);
+          if (response === null) {
+            req.socket.destroy();
+            return;
+          }
+          res.writeHead(response).end();
+        });
+        const proxy = createServer((req, res) => {
+          proxyRequests.push(req.url);
+          res.writeHead(502).end();
+        });
+        for (const server of [origin, proxy]) {
+          server.listen(0, "127.0.0.1");
+          t.after(() => new Promise((resolve) => server.close(resolve)));
+          await once(server, "listening");
+        }
+
+        const args = [...httpArgs];
+        args[2] = String(origin.address().port);
+        const route = "# old route\n";
+        const current = `${olderImage}\n`;
+        const previous = `${oldestImage}\n`;
+        const setup = setupDroplet(t, args, {
+          old: ["old1"],
+          route,
+          state: current,
+          previous,
+          stubs: {
+            curl: 'exec "$(PATH="${PATH#*:}" command -v curl)" --disable "$@"',
+          },
+        });
+        const result = await startDroplet(t, setup, args, {
+          STUB_ADDRESS: "127.0.0.1",
+          http_proxy: `http://127.0.0.1:${proxy.address().port}`,
+          NO_PROXY: noProxy,
+          no_proxy: noProxy,
+        }).done;
+
+        assert.deepEqual(proxyRequests, [], "the proxy must receive no probes");
+        assert.ok(requests.length > 0, "the origin must receive a probe");
+        assert.ok(requests.every((request) => request === "GET /healthz"));
+        if (response === 200) {
+          assert.equal(result.status, 0, result.stdout + result.stderr);
+          assert.match(
+            setup.read("caddy/sites/api.caddy"),
+            /reverse_proxy api-/,
+          );
+          assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+          assert.equal(setup.read("state/api.previous"), current);
+        } else {
+          assert.equal(result.status, 1, result.stdout + result.stderr);
+          assert.match(
+            result.stderr,
+            /did not pass the health check within 3 seconds/,
+          );
+          assert.ok(
+            !setup.calls().some((call) => call.startsWith("docker exec")),
+          );
+          assert.equal(setup.read("caddy/sites/api.caddy"), route);
+          assert.equal(setup.read("state/api.current"), current);
+          assert.equal(setup.read("state/api.previous"), previous);
+        }
+      });
     }
   },
 );
