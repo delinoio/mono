@@ -667,6 +667,90 @@ func TestSyncSkipsSubmodulesAndNeedsGit(t *testing.T) {
 	}
 }
 
+func TestSyncContextEndsDuringGit(t *testing.T) {
+	needPOSIX(t)
+	dir := newRepo(t, map[string]string{"tracked.txt": "tracked"}, nil, "")
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shimDir := t.TempDir()
+	shim := `#!/bin/sh
+matches() {
+	# Skip -C <dir> -c core.quotepath=off.
+	shift 4
+	[ "$*" = "$SANDRUN_TEST_GIT_COMMAND" ]
+}
+if matches "$@"; then
+	: > "$SANDRUN_TEST_GIT_STARTED"
+	exec sleep 30
+fi
+PATH="$SANDRUN_TEST_GIT_PATH" exec "$SANDRUN_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := os.Getenv("PATH")
+	t.Setenv("SANDRUN_TEST_REAL_GIT", realGit)
+	t.Setenv("SANDRUN_TEST_GIT_PATH", path)
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+path)
+
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	for _, command := range []string{
+		"rev-parse --is-inside-work-tree",
+		"ls-files -z --cached --others --exclude-standard",
+		"ls-files -z --stage",
+	} {
+		t.Run(command, func(t *testing.T) {
+			t.Setenv("SANDRUN_TEST_GIT_COMMAND", command)
+			for _, reason := range []struct {
+				name    string
+				timeout time.Duration
+				err     error
+			}{
+				{"canceled", 5 * time.Second, context.Canceled},
+				{"deadline", 2 * time.Second, context.DeadlineExceeded},
+			} {
+				t.Run(reason.name, func(t *testing.T) {
+					started := filepath.Join(t.TempDir(), "started")
+					t.Setenv("SANDRUN_TEST_GIT_STARTED", started)
+					ctx, cancel := context.WithTimeout(t.Context(), reason.timeout)
+					defer cancel()
+					if reason.err == context.Canceled {
+						go func() {
+							ticker := time.NewTicker(5 * time.Millisecond)
+							defer ticker.Stop()
+							for {
+								select {
+								case <-ctx.Done():
+									return
+								case <-ticker.C:
+									if _, err := os.Stat(started); err == nil {
+										cancel()
+										return
+									}
+								}
+							}
+						}()
+					}
+					result, err := c.Sync(ctx, params)
+					if _, statErr := os.Stat(started); statErr != nil {
+						t.Fatalf("Git command did not signal before Sync returned %v: %v", err, statErr)
+					}
+					if result != nil || !errors.Is(err, reason.err) {
+						t.Fatalf("Sync = (%+v, %v), want (nil, %v)", result, err, reason.err)
+					}
+					if reads, execs, writes := srv.Calls(sandrunv1connect.DevSessionServiceReadDevSessionFileProcedure), srv.Calls(execProc), srv.Calls(writeProc); reads != 0 || execs != 0 || writes != 0 {
+						t.Fatalf("Sync made %d manifest reads, %d execs and %d writes before returning", reads, execs, writes)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestSyncLimits(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")

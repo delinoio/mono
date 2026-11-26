@@ -112,6 +112,9 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 		return nil, localError(connect.CodeInvalidArgument, fmt.Errorf("sandrun: %s is not a directory", dir))
 	}
 	inside, err := runGit(ctx, dir, "rev-parse", "--is-inside-work-tree")
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil || strings.TrimSpace(string(inside)) != "true" {
 		return nil, localError(connect.CodeFailedPrecondition, ErrNotGitWorkTree)
 	}
@@ -307,6 +310,9 @@ func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
 		msg := strings.TrimSpace(stderr.String())
 		return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sandrun: git %s: %v: %s", args[0], err, msg))
