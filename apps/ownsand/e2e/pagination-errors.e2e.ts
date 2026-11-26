@@ -5,6 +5,11 @@ import { expect } from "e2e";
 
 const ACME = "0193a000-0000-7000-8000-000000000001";
 const NORTHWIND = "0193a000-0000-7000-8000-000000000002";
+const TERMINAL_ERRORS = [
+  [Code.NotFound, "It was not found, or you no longer have access to it."],
+  [Code.PermissionDenied, "You do not have permission to do this."],
+  [Code.Unauthenticated, "Your session ended. Sign in again."],
+] as const;
 
 const paginationTest = test.extend<{
   pagedList: {
@@ -86,11 +91,7 @@ const paginationTest = test.extend<{
 describe("sandbox pagination errors", () => {
   const path = `/orgs/${ACME}/sandboxes`;
 
-  for (const [code, message] of [
-    [Code.NotFound, "It was not found, or you no longer have access to it."],
-    [Code.PermissionDenied, "You do not have permission to do this."],
-    [Code.Unauthenticated, "Your session ended. Sign in again."],
-  ] as const) {
+  for (const [code, message] of TERMINAL_ERRORS) {
     paginationTest(
       `hides the sandbox list and Show more after ${Code[code]}`,
       async ({ app, pagedList, screen }) => {
@@ -350,6 +351,91 @@ describe("continuation errors", () => {
       await app.screenshot("recovered-organizations");
     },
   );
+});
+
+describe("automatic pagination after terminal refresh", () => {
+  for (const [code, message] of TERMINAL_ERRORS) {
+    paginationTest(
+      `stops after ${Code[code]} and resumes with a fresh organization token`,
+      async ({ app, browser, pagedList, screen }) => {
+        await pagedList.open("ListOrganizations", "/");
+        const list = screen.getByRole("list", "Your organizations");
+        await expect(
+          list.getByRole("link", "Acme Robotics Owner"),
+        ).toBeVisible();
+        await expect
+          .poll(async () => (await pagedList.tokens()).at(-1))
+          .toBe("e2e-next-page");
+        const initial = await pagedList.tokens();
+
+        // Dismiss the form while creation is pending. Its success refreshes
+        // the cached list from page one and leaves the user on this page.
+        const mutation = "ownsand-e2e-organization-refresh-mutation";
+        await browser.evaluate(
+          ({ mutation, code }) => {
+            sessionStorage.setItem(mutation, "hold");
+            sessionStorage.setItem("ownsand-e2e-refresh-error", String(code));
+            return null;
+          },
+          { mutation, code },
+        );
+        await screen.getByRole("button", "Create organization").tap();
+        await browser.keyboard.type("Fabrikam");
+        await screen.getByRole("button", "Create").tap();
+        await expect
+          .poll(() =>
+            browser.evaluate((key) => sessionStorage.getItem(key), mutation),
+          )
+          .toBe("held");
+        await browser.keyboard.press("Escape");
+        await expect
+          .poll(() =>
+            browser.evaluate(
+              () => document.querySelector('[role="dialog"]') === null,
+            ),
+          )
+          .toBe(true);
+        await browser.evaluate((key) => {
+          window.dispatchEvent(new Event(`${key}-release`));
+          return null;
+        }, mutation);
+
+        await expect(screen.getByText(message)).toBeVisible();
+        await expect(list).toBeHidden();
+        await app.screenshot(`organizations-refresh-${Code[code]}`);
+        expect(await pagedList.tokens()).toEqual([...initial, ""]);
+
+        await pagedList.release(Code.Internal);
+        await pagedList.allowRetry();
+        await browser.evaluate(async () => {
+          sessionStorage.removeItem("ownsand-e2e-refresh-error");
+          sessionStorage.setItem("ownsand-e2e-paged-next-token", "fresh-token");
+          // Advance staleness for the visibility-triggered refresh.
+          const now = Date.now;
+          Date.now = () => now() + 11_000;
+          try {
+            window.dispatchEvent(new Event("visibilitychange"));
+            await Promise.resolve();
+          } finally {
+            Date.now = now;
+          }
+          return null;
+        });
+        await expect(
+          list.getByRole("link", "Northwind Labs Member"),
+        ).toBeVisible();
+        await expect(list.getByRole("link", "Fabrikam Owner")).toBeVisible();
+        await expect(screen.getByText(message)).toBeHidden();
+        expect(await pagedList.tokens()).toEqual([
+          ...initial,
+          "",
+          "",
+          "fresh-token",
+        ]);
+        await app.screenshot(`organizations-recovered-${Code[code]}`);
+      },
+    );
+  }
 });
 
 const refreshTest = test.extend<{
