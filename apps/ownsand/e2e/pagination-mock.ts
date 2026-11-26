@@ -176,10 +176,13 @@ export function createMockTransport(): Transport {
         });
         sessionStorage.setItem(deviceReadback, "released");
       }
-      if (method.name === refreshList) {
+      const isFixturePage =
+        pagination !== undefined && method.name === methodName;
+      if (method.name === refreshList || isFixturePage) {
         const code = sessionStorage.getItem("ownsand-e2e-refresh-error");
         const { pageToken } = input as { pageToken?: string };
         if (code !== null && pageToken === "") {
+          if (isFixturePage) recordToken("ownsand-e2e-page-tokens", pageToken);
           throw new ConnectError(
             "Synthetic full refresh failure",
             Number(code) as Code,
@@ -549,8 +552,10 @@ export function createMockTransport(): Transport {
       const request = input as typeof input & { pageToken?: string };
       const token = request.pageToken ?? "";
       recordToken("ownsand-e2e-page-tokens", token);
+      const nextPageToken =
+        sessionStorage.getItem("ownsand-e2e-paged-next-token") ?? CONTINUATION;
       if (token !== "") {
-        if (pagination !== undefined && token !== CONTINUATION) {
+        if (pagination !== undefined && token !== nextPageToken) {
           throw new ConnectError(
             "Unexpected continuation token",
             Code.InvalidArgument,
@@ -611,7 +616,7 @@ export function createMockTransport(): Transport {
           ? {
               ...response.message,
               [field]: rows.slice(0, firstPageSize),
-              nextPageToken: CONTINUATION,
+              nextPageToken,
             }
           : {
               ...response.message,

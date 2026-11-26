@@ -30,7 +30,7 @@ import {
   within,
 } from "@testing-library/react";
 import { toast } from "delino-ui/toast";
-import { invalidateServices } from "./api.ts";
+import { createQueryClient, invalidateServices } from "./api.ts";
 import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
 import {
   fullListRefresh,
@@ -885,6 +885,150 @@ test.each([
     expect(seen[mutation]).toBeUndefined();
   },
 );
+
+describe.each([
+  {
+    service: MemberService,
+    method: "ListMembers",
+    path: `/orgs/${MOCK_IDS.acme}/members`,
+    list: "Members",
+    field: "members",
+  },
+  {
+    service: OrganizationService,
+    method: "ListOrganizations",
+    path: "/",
+    list: "Your organizations",
+    field: "organizations",
+  },
+])("$list automatic pagination after a refresh", (fixture) => {
+  async function loadCachedPage() {
+    const mock = createMockTransport();
+    const queryClient = createQueryClient();
+    const defaults = queryClient.getDefaultOptions();
+    queryClient.setDefaultOptions({
+      ...defaults,
+      queries: { ...defaults.queries, retryDelay: 0 },
+    });
+    const state = {
+      tokens: [] as string[],
+      refreshError: undefined as Code | undefined,
+      continuationError: undefined as Code | undefined,
+      nextPageToken: "cached-token",
+    };
+    const transport: Transport = {
+      ...mock,
+      async unary(method, signal, timeout, header, input, contextValues) {
+        if (method.name !== fixture.method) {
+          return mock.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+        }
+        const request = input as typeof input & { pageToken: string };
+        const token = request.pageToken;
+        state.tokens.push(token);
+        const code =
+          token === "" ? state.refreshError : state.continuationError;
+        if (code !== undefined) throw new ConnectError("the page failed", code);
+        // Keep only the first page cached until the full refresh cancels this request.
+        if (token === "cached-token" && state.tokens.length === 2) {
+          await new Promise<never>((_, reject) => {
+            signal?.addEventListener("abort", () => reject(signal.reason), {
+              once: true,
+            });
+          });
+        }
+        const response = await mock.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          { ...request, pageToken: "" },
+          contextValues,
+        );
+        const message =
+          token === ""
+            ? { ...response.message, nextPageToken: state.nextPageToken }
+            : { ...response.message, [fixture.field]: [], nextPageToken: "" };
+        return { ...response, message };
+      },
+    };
+    renderConsole(fixture.path, { queryClient, transport });
+    const list = { name: fixture.list };
+    await screen.findByRole("list", list, WAIT);
+    await waitFor(
+      () => expect(state.tokens).toEqual(["", "cached-token"]),
+      WAIT,
+    );
+    return {
+      list,
+      state,
+      refetch: () =>
+        act(() => invalidateServices(queryClient, fixture.service)),
+    };
+  }
+
+  test.each([
+    [Code.NotFound, "It was not found, or you no longer have access to it."],
+    [Code.PermissionDenied, "You do not have permission to do this."],
+    [Code.Unauthenticated, "Your session ended. Sign in again."],
+  ])(
+    "preserves terminal refresh error %s until recovery",
+    async (code, error) => {
+      const { list, state, refetch } = await loadCachedPage();
+      state.tokens.length = 0;
+      state.refreshError = code;
+      // If the old token is requested, a transient failure would replace the full error.
+      state.continuationError = Code.Internal;
+      await refetch();
+      await settle();
+      expect(state.tokens).toEqual([""]);
+      await screen.findByText(error, {}, WAIT);
+      expect(screen.queryByRole("list", list)).toBeNull();
+
+      state.refreshError = undefined;
+      state.continuationError = undefined;
+      state.nextPageToken = "fresh-token";
+      await refetch();
+      await screen.findByRole("list", list, WAIT);
+      await waitFor(
+        () => expect(state.tokens).toEqual(["", "", "fresh-token"]),
+        WAIT,
+      );
+      await settle();
+      expect(screen.queryByText(error)).toBeNull();
+      expect(state.tokens).toEqual(["", "", "fresh-token"]);
+    },
+  );
+
+  test("follows a cached token after a transient refresh and waits for continuation retry", async () => {
+    const { list, state, refetch } = await loadCachedPage();
+    state.tokens.length = 0;
+    state.refreshError = Code.Unavailable;
+    state.continuationError = Code.Internal;
+    await refetch();
+    await screen.findByText(
+      `Some ${fixture.field} are not shown yet.`,
+      {},
+      WAIT,
+    );
+    expect(screen.getByRole("list", list)).toBeTruthy();
+    await settle();
+    expect(state.tokens).toEqual(["", "", "", "cached-token"]);
+
+    state.continuationError = undefined;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    }, WAIT);
+    expect(state.tokens).toEqual(["", "", "", "cached-token", "cached-token"]);
+  });
+});
 
 test("lets a sent revoke settle after a terminal full refresh closes its confirmation", async () => {
   const held = holdingTransport(["RevokeApiKey"]);
