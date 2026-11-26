@@ -1623,7 +1623,8 @@ const VERSION = 'v2'
 
 function saveConfig(config: { theme: string; language: string }): boolean {
   try {
-    localStorage.setItem(`userConfig:${VERSION}`, JSON.stringify(config))
+    const preferences = { theme: config.theme, language: config.language }
+    localStorage.setItem(`userConfig:${VERSION}`, JSON.stringify(preferences))
     return true
   } catch {
     // Throws in incognito/private browsing, quota exceeded, or disabled
