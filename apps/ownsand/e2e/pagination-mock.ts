@@ -159,6 +159,23 @@ export function createMockTransport(): Transport {
       ) {
         recordToken("ownsand-e2e-mutation-calls", method.name);
       }
+      const deviceReadback = "ownsand-e2e-device-readback";
+      if (
+        method.name === "GetDevice" &&
+        sessionStorage.getItem(deviceReadback) === "hold"
+      ) {
+        await new Promise<void>((resolve) => {
+          window.addEventListener(
+            `${deviceReadback}-release`,
+            () => resolve(),
+            {
+              once: true,
+            },
+          );
+          sessionStorage.setItem(deviceReadback, "held");
+        });
+        sessionStorage.setItem(deviceReadback, "released");
+      }
       if (method.name === refreshList) {
         const code = sessionStorage.getItem("ownsand-e2e-refresh-error");
         const { pageToken } = input as { pageToken?: string };
