@@ -328,12 +328,20 @@ func (d *devSessionService) ReadDevSessionFile(ctx context.Context, req *connect
 	if req.Msg.GetReadId() == "" {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("read_id is required"))
 	}
-	data, err := d.s.guest.readSnapshot(ds, req.Msg)
+	guest := d.s.guest
+	guest.mu.Lock()
+	guest.reads = append(guest.reads, proto.CloneOf(req.Msg))
+	guest.mu.Unlock()
+
+	off := req.Msg.GetOffset()
+	if off < 0 {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("the offset is outside the file"))
+	}
+	data, err := guest.readSnapshot(ds, req.Msg)
 	if err != nil {
 		return err
 	}
-	off := req.Msg.GetOffset()
-	if off < 0 || off > int64(len(data)) {
+	if off > int64(len(data)) {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("the offset is outside the file"))
 	}
 	sent := 0
@@ -360,7 +368,6 @@ func (g *guest) readSnapshot(ds *sandrunv1.DevSession, req *sandrunv1.ReadDevSes
 	id, path := req.GetReadId(), guestPath(ds, req.GetPath())
 	orgID, sessionID := ds.GetOrganizationId(), ds.GetDevSessionId()
 	g.mu.Lock()
-	g.reads = append(g.reads, proto.CloneOf(req))
 	snapshot, ok := g.snapshots[id]
 	g.mu.Unlock()
 	if !ok {

@@ -107,6 +107,15 @@ func TestFakeReadBinding(t *testing.T) {
 		absolute := filepath.Join(first.GetWorkspacePath(), path)
 		checkRead(t, read(first, retainedID, absolute, offset), original[offset:], int64(len(original)))
 	})
+	t.Run("snapshot size boundary", func(t *testing.T) {
+		size := int64(len(original))
+		atEnd := read(first, retainedID, path, size)
+		checkRead(t, atEnd, "", size)
+		if atEnd.events != 1 {
+			t.Fatalf("read at size sent %d events, want one end event", atEnd.events)
+		}
+		checkRejected(t, read(first, retainedID, path, size+1), connect.CodeInvalidArgument)
+	})
 
 	t.Run("concurrent first reads", func(t *testing.T) {
 		const id = "concurrent-read"
@@ -135,5 +144,35 @@ func TestFakeReadBinding(t *testing.T) {
 		checkRead(t, results[winner], want, size)
 		checkRejected(t, results[loser], connect.CodeAlreadyExists)
 		checkRead(t, read(sessions[winner], id, path, 1), want[1:], size)
+	})
+
+	t.Run("negative offsets", func(t *testing.T) {
+		checkNegative := func(t *testing.T, id, path string) {
+			t.Helper()
+			before := len(s.ReadRequests())
+			checkRejected(t, read(first, id, path, -1), connect.CodeInvalidArgument)
+			requests := s.ReadRequests()[before:]
+			if len(requests) != 1 {
+				t.Fatalf("recorded %d requests, want one", len(requests))
+			}
+			got := requests[0]
+			if got.GetReadId() != id || got.GetPath() != path || got.GetOffset() != -1 {
+				t.Fatalf("recorded request %v, want read ID %q, path %q and offset -1", got, id, path)
+			}
+		}
+		t.Run("retry on another path", func(t *testing.T) {
+			const id = "negative-read-other-path"
+			checkNegative(t, id, path)
+			checkRead(t, read(first, id, otherPath, 0), "different path", int64(len("different path")))
+		})
+		t.Run("retry after file changes", func(t *testing.T) {
+			const id = "negative-read-edited-file"
+			checkNegative(t, id, path)
+			writeFixture(first, path, "new")
+			checkRead(t, read(first, id, path, 0), "new", 3)
+		})
+		t.Run("missing path", func(t *testing.T) {
+			checkNegative(t, "negative-read-missing-path", "missing.txt")
+		})
 	})
 }
