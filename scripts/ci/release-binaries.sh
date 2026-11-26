@@ -173,7 +173,11 @@ write_notices() (
   } > "$work/THIRD-PARTY-LICENSES.txt"
   while IFS=$'\t' read -r -u 3 module version module_dir; do
     [[ -n "$module" ]] || continue
-    if ! find "$module_dir" -maxdepth 2 -type f \( -ipath "$module_dir/licen[cs]e*" -o -ipath "$module_dir/copying*" -o -ipath "$module_dir/notice*" -o -ipath "$module_dir/patents*" -o -ipath "$module_dir/licenses/*" \) -print0 |
+    # Keep the module directory out of the find patterns so its name is literal.
+    if ! (
+      [[ -n "$module_dir" ]] && cd -- "$module_dir" &&
+        find . -maxdepth 2 -type f \( -ipath './licen[cs]e*' -o -ipath './copying*' -o -ipath './notice*' -o -ipath './patents*' -o -ipath './licenses/*' \) -print0
+    ) |
       sort -z > "$work/license-paths"; then
       echo "::error::Could not enumerate license files for module $module $version that $name links." >&2
       exit 1
@@ -186,10 +190,10 @@ write_notices() (
       {
         echo
         echo "================================================================"
-        echo "$module $version: ${file#"$module_dir"/}"
+        echo "$module $version: ${file#./}"
         echo "================================================================"
         echo
-        cat -- "$file"
+        cat -- "$module_dir/$file"
       } >> "$work/THIRD-PARTY-LICENSES.txt"
     done < "$work/license-paths"
   done 3< "$work/sorted-modules"

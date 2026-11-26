@@ -231,13 +231,66 @@ const commandArgs = (exitCode, ...rest) => [
 
 const started = (f) => JSON.parse(readFileSync(`${f.out}.start`, "utf8"));
 
-function alive(pid) {
+function respondsToSignalZero(id) {
   try {
-    process.kill(pid, 0);
+    process.kill(id, 0);
     return true;
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+function readLinuxProcessStat(procRoot, pid) {
+  let stat;
+  try {
+    stat = readFileSync(join(procRoot, String(pid), "stat"), "utf8");
+  } catch {
+    return null;
+  }
+  // The command name can contain spaces and closing parentheses.
+  const commandEnd = stat.lastIndexOf(")");
+  if (commandEnd === -1) return null;
+  const fields = /^ (\S) \d+ (\d+) /.exec(stat.slice(commandEnd + 1));
+  return fields ? { state: fields[1], groupId: Number(fields[2]) } : null;
+}
+
+function groupHasOnlyZombies(procRoot, groupId) {
+  let entries;
+  try {
+    entries = readdirSync(procRoot);
   } catch {
     return false;
   }
+
+  let foundZombie = false;
+  for (const pid of entries) {
+    if (!/^\d+$/.test(pid)) continue;
+    const stat = readLinuxProcessStat(procRoot, pid);
+    if (stat === null) {
+      // The PID may have disappeared since readdirSync. If it still
+      // exists, its group membership may be unknown.
+      if (respondsToSignalZero(Number(pid))) return false;
+      continue;
+    }
+    if (stat.groupId !== groupId) continue;
+    if (stat.state !== "Z") return false;
+    foundZombie = true;
+  }
+  return foundZombie;
+}
+
+function alive(id, procRoot = "/proc") {
+  if (!respondsToSignalZero(id)) return false;
+  if (process.platform !== "linux") return true;
+
+  // Linux keeps accepting signal zero until the parent reaps the zombie.
+  // Group members can still run after the group leader has been reaped.
+  if (id < 0) {
+    return !groupHasOnlyZombies(procRoot, -id) && respondsToSignalZero(id);
+  }
+  const stat = readLinuxProcessStat(procRoot, id);
+  return stat === null ? respondsToSignalZero(id) : stat.state !== "Z";
 }
 
 async function waitFor(predicate, what) {
@@ -942,6 +995,72 @@ test(
         assert.equal(readFileSync(`${f.out}.signals`, "utf8"), "SIGINT\n");
       });
     }
+  },
+);
+
+test(
+  "Linux liveness distinguishes zombies, live group members and unknown state",
+  { skip: process.platform !== "linux" },
+  (t) => {
+    const procRoot = mkdtempSync(join(tmpdir(), "with-infisical-proc-"));
+    t.after(() => rmSync(procRoot, { recursive: true, force: true }));
+    const writeStat = (pid, state, groupId) => {
+      const directory = join(procRoot, String(pid));
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        join(directory, "stat"),
+        `${pid} (command ) S 1 1 name) ${state} 1 ${groupId} 1\n`,
+      );
+    };
+    const leader = 100;
+    const member = 101;
+    const otherMember = 102;
+    const noSuchProcess = Object.assign(new Error("no such process"), {
+      code: "ESRCH",
+    });
+    let signalZeroError;
+    let reapedPid;
+    t.mock.method(process, "kill", (id, signal) => {
+      assert.equal(signal, 0);
+      if (id === reapedPid) throw noSuchProcess;
+      if (signalZeroError) throw signalZeroError;
+      return true;
+    });
+
+    assert.equal(alive(member, procRoot), true, "PID state is unavailable");
+    assert.equal(alive(-leader, procRoot), true, "the scan found no members");
+
+    writeStat(member, "Z", leader);
+    writeStat(otherMember, "S", leader);
+    assert.equal(alive(member, procRoot), false, "the PID is a zombie");
+    assert.equal(alive(otherMember, procRoot), true, "the PID is live");
+    assert.equal(alive(-leader, procRoot), true, "a group member is live");
+
+    writeStat(otherMember, "Z", leader);
+    writeStat(103, "S", 103);
+    assert.equal(alive(-leader, procRoot), false, "the group has only zombies");
+
+    rmSync(join(procRoot, String(otherMember), "stat"));
+    assert.equal(alive(-leader, procRoot), true, "a member's state is missing");
+    assert.equal(
+      alive(otherMember, procRoot),
+      true,
+      "the PID state is missing",
+    );
+
+    reapedPid = otherMember;
+    assert.equal(alive(otherMember, procRoot), false, "the PID disappeared");
+    assert.equal(alive(-leader, procRoot), false, "an entry vanished mid-scan");
+
+    reapedPid = undefined;
+    signalZeroError = noSuchProcess;
+    assert.equal(alive(-leader, procRoot), false, "the group disappeared");
+
+    signalZeroError = Object.assign(new Error("permission denied"), {
+      code: "EPERM",
+    });
+    assert.throws(() => alive(otherMember, procRoot), signalZeroError);
+    assert.throws(() => alive(-leader, procRoot), signalZeroError);
   },
 );
 

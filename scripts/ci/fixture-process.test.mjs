@@ -30,13 +30,27 @@ const helperUrl = pathToFileURL(
   fileURLToPath(new URL("./fixture-process.mjs", import.meta.url)),
 ).href;
 
-function alive(pid) {
+function alive(pid, readStat = readFileSync) {
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
     if (error?.code === "ESRCH") return false;
     throw error;
+  }
+
+  if (process.platform !== "linux") return true;
+
+  try {
+    // Signal zero still succeeds until the parent reaps a Linux zombie.
+    const stat = readStat(`/proc/${pid}/stat`, "utf8");
+    // The command name can contain spaces and closing parentheses.
+    const commandEnd = stat.lastIndexOf(")");
+    return !(
+      stat.startsWith(`${pid} (`) && stat.startsWith(") Z ", commandEnd)
+    );
+  } catch {
+    // Keep the signal-zero result when procfs cannot supply the state.
+    return true;
   }
 }
 
@@ -122,6 +136,34 @@ test(
     // The same call the teardown makes; it must not throw.
     killProcessGroup(child);
     killProcessGroup(child);
+  },
+);
+
+test(
+  "Linux fixture liveness requires a parseable zombie state to override signal zero",
+  { skip: process.platform !== "linux" },
+  () => {
+    const pid = process.pid;
+    assert.equal(
+      alive(pid, () => `${pid} (name) with spaces) Z 1 2 3`),
+      false,
+    );
+    assert.equal(
+      alive(pid, () => `${pid} (name) Z in command) S 1 2 3`),
+      true,
+    );
+    assert.equal(
+      alive(pid, () => `${pid} (name Z 1 2 3`),
+      true,
+    );
+    assert.equal(
+      alive(pid, () => "malformed) Z 1 2 3"),
+      true,
+    );
+    assert.equal(
+      alive(pid, (path, encoding) => readFileSync(`${path}.missing`, encoding)),
+      true,
+    );
   },
 );
 
