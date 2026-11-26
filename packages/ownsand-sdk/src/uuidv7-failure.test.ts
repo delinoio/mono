@@ -41,6 +41,8 @@ describe("UuidV7Generator after a failed generation", () => {
 
     now = Number.POSITIVE_INFINITY;
     expect(() => gen.next()).toThrow(RangeError);
+    now = Number.NEGATIVE_INFINITY;
+    expect(() => gen.next()).toThrow(RangeError);
     now = Number.NaN;
     expect(() => gen.next()).toThrow(RangeError);
 
