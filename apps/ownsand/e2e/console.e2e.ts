@@ -394,8 +394,18 @@ describe("devices", () => {
     try {
       await dialog.getByRole("button", "Remove device").tap();
       await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
-      await expect(screen.getByText("studio-mac").first()).toBeVisible();
-      await expect(screen.getByText("build-box-1")).toBeHidden();
+      // The mock API omits a removed device from a list request that sets no
+      // state, like the real API.
+      const deviceList = screen.getByRole("region", "Device list");
+      await expect(
+        deviceList.getByRole("link", "studio-mac", { exact: true }),
+      ).toBeVisible();
+      await expect(
+        deviceList.getByText("Offline", { exact: true }),
+      ).toBeVisible();
+      await expect(
+        deviceList.getByRole("link", "build-box-1", { exact: true }),
+      ).toBeHidden();
       expect(
         await browser.evaluate(() => ({
           readback: sessionStorage.getItem("ownsand-e2e-device-readback"),
