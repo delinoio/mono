@@ -3,7 +3,8 @@
 // Fixtures for the license notices of `scripts/ci/release-binaries.sh build
 // cross`: the module scan of each platform uses the cgo setting that the
 // build of that platform uses, and the notices hold the licenses of every
-// platform. The stubbed `go` answers `go list` per GOOS and GOARCH.
+// platform. The stubbed `go list` can return different modules for each cgo
+// setting of a platform.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
@@ -62,7 +63,6 @@ function binary(name, dir, platforms, cgoPlatforms) {
 // setting; `go build` writes a placeholder executable.
 const goStub = `#!/usr/bin/env bash
 set -euo pipefail
-echo "go $1 \${*: -1} CGO_ENABLED=\${CGO_ENABLED:-} GOOS=\${GOOS:-} GOARCH=\${GOARCH:-}" >> "$STUB_LOG"
 case "$1" in
   env)
     case "$2" in
@@ -77,7 +77,14 @@ case "$1" in
       shift
     done
     printf 'binary\\n' > "$out" ;;
-  list) cat "$STUB_DIR/go-list-$GOOS-$GOARCH.tsv" ;;
+  list)
+    printf '%s %s-%s CGO_ENABLED=%s\\n' "\${*: -1}" "$GOOS" "$GOARCH" "$CGO_ENABLED" >> "$STUB_LOG"
+    modules="$STUB_DIR/go-list-$GOOS-$GOARCH"
+    if [[ -f "$modules-$CGO_ENABLED.tsv" ]]; then
+      cat "$modules-$CGO_ENABLED.tsv"
+    else
+      cat "$modules.tsv"
+    fi ;;
   *) echo "unexpected go $*" >&2; exit 1 ;;
 esac
 `;
@@ -88,7 +95,8 @@ function write(path, content) {
 }
 
 // Runs `build cross` for the binaries. `modules` maps a platform to the
-// module names that its `go list` prints; every module has a license file.
+// module names that its `go list` prints. Append -0 or -1 to a platform key
+// to supply modules for a specific cgo setting. Every module has a license file.
 function buildCross(t, binaries, modules) {
   const dir = mkdtempSync(join(tmpdir(), "release-binaries-notices-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -122,15 +130,7 @@ function buildCross(t, binaries, modules) {
     },
   });
   assert.equal(result.status, 0, result.stderr);
-  const lines = readFileSync(log, "utf8").split("\n");
-  // The cgo setting of each `go list` scan, keyed by `<dir> <platform>`.
-  const scans = {};
-  for (const line of lines) {
-    const match = line.match(
-      /^go list \.\/(\S+) CGO_ENABLED=(\S*) GOOS=(\S+) GOARCH=(\S+)$/,
-    );
-    if (match) scans[`${match[1]} ${match[3]}-${match[4]}`] = match[2];
-  }
+  const scans = readFileSync(log, "utf8").trimEnd().split("\n").sort();
   const notices = (name) =>
     readFileSync(
       join(out, "release", name, "THIRD-PARTY-LICENSES.txt"),
@@ -152,25 +152,26 @@ test(
     const cli = binary("cli", "cmds/cli", ["linux-arm64", "darwin-amd64"], []);
     const everyPlatform = {
       "linux-amd64": ["common", "linux-only"],
-      "darwin-arm64": ["common", "darwin-only"],
+      "darwin-arm64-0": ["common", "darwin-arm64-nocgo-only"],
+      "darwin-arm64-1": ["common", "darwin-arm64-cgo-only"],
       "windows-arm64": ["common", "windows-only"],
       "linux-arm64": ["common", "cli-linux"],
       "darwin-amd64": ["common", "cli-darwin"],
     };
     const { scans, notices } = buildCross(t, [agent, cli], everyPlatform);
-    assert.deepEqual(scans, {
-      "cmds/agent linux-amd64": "0",
-      "cmds/agent darwin-arm64": "1",
-      "cmds/agent windows-arm64": "0",
-      "cmds/cli linux-arm64": "0",
-      "cmds/cli darwin-amd64": "0",
-    });
+    assert.deepEqual(scans, [
+      "./cmds/agent darwin-arm64 CGO_ENABLED=1",
+      "./cmds/agent linux-amd64 CGO_ENABLED=0",
+      "./cmds/agent windows-arm64 CGO_ENABLED=0",
+      "./cmds/cli darwin-amd64 CGO_ENABLED=0",
+      "./cmds/cli linux-arm64 CGO_ENABLED=0",
+    ]);
     // The notices keep the licenses of every platform of the binary.
     const agentNotices = notices("agent");
     for (const module of [
       "common",
       "linux-only",
-      "darwin-only",
+      "darwin-arm64-cgo-only",
       "windows-only",
     ]) {
       assert.match(
@@ -178,6 +179,7 @@ test(
         new RegExp(`example\\.com/${module} v1\\.0\\.0: LICENSE\\n`),
       );
     }
+    assert.doesNotMatch(agentNotices, /darwin-arm64-nocgo-only/);
     assert.doesNotMatch(agentNotices, /cli-linux|cli-darwin/);
     assert.equal(
       agentNotices.match(/example\.com\/common v1\.0\.0: LICENSE\n/g).length,
@@ -208,10 +210,10 @@ test(
       "darwin-arm64": ["a"],
       "windows-arm64": ["a"],
     });
-    assert.deepEqual(scans, {
-      "cmds/agent linux-amd64": "0",
-      "cmds/agent darwin-arm64": "0",
-      "cmds/agent windows-arm64": "0",
-    });
+    assert.deepEqual(scans, [
+      "./cmds/agent darwin-arm64 CGO_ENABLED=0",
+      "./cmds/agent linux-amd64 CGO_ENABLED=0",
+      "./cmds/agent windows-arm64 CGO_ENABLED=0",
+    ]);
   },
 );
