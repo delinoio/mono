@@ -30,6 +30,7 @@ import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { main as deployPlan } from "./deploy-plan.mjs";
+import { deadlineSkipReason } from "./fixture-deadline.mjs";
 import { spawnProcessGroup } from "./fixture-process.mjs";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 
@@ -2374,13 +2375,7 @@ const skipDroplet =
   (!hasFlock && "flock is not installed") ||
   (spawnSync("sh", ["-c", "command -v python3"]).status !== 0 &&
     "python3 is not installed") ||
-  (process.platform !== "linux" &&
-    "the Droplet deadline needs Linux /proc/uptime") ||
-  (spawnSync("timeout", ["--version"], { encoding: "utf8" }).stdout?.includes(
-    "GNU coreutils",
-  )
-    ? false
-    : "the Droplet deadline needs GNU coreutils timeout");
+  deadlineSkipReason();
 const dropletDeploymentUuid = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
 const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(64)}`;
 const httpArgs = [
@@ -5456,6 +5451,11 @@ function runCaddy(t, options) {
   return setupCaddy(t, options)();
 }
 
+const caddyReadiness = { skip: skip || deadlineSkipReason() };
+const caddyZeroDeadline = {
+  skip: skip || deadlineSkipReason({ needsTimeout: false }),
+};
+
 const caddyRun = `${systemDocker} run --detach --name caddy --network delino --restart unless-stopped --log-driver local --publish 80:80 --publish 443:443 --publish 443:443/udp --volume /srv/delino/caddy:/etc/caddy:ro --volume caddy-data:/data --volume caddy-config:/config ${caddyImage}`;
 const caddyList = `${systemDocker} container ls --all --no-trunc --filter name=^/caddy$ --format {{.ID}}`;
 const caddyInspect = `${systemDocker} container inspect --format {{.Config.Image}}|{{.State.Running}}|{{.HostConfig.LogConfig.Type}} caddy-id`;
@@ -5470,7 +5470,7 @@ const caddyLogs = `DOCKER_CONTEXT= ${systemDocker} logs caddy`;
 
 test(
   "start-caddy uses the system daemon for create, start and reload",
-  { skip },
+  caddyReadiness,
   (t) => {
     for (const endpoint of alternateDockerSelectors) {
       for (const [inspect, operations] of [
@@ -5489,7 +5489,7 @@ test(
   },
 );
 
-test("start-caddy creates a missing container", { skip }, (t) => {
+test("start-caddy creates a missing container", caddyReadiness, (t) => {
   const result = runCaddy(t, { daemonLogDriver: "json-file" });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.container, `${caddyImage} true local`);
@@ -5508,7 +5508,7 @@ test("start-caddy reloads a running container", { skip }, (t) => {
   assert.deepEqual(result.calls, [caddyList, caddyInspect, caddyReload]);
 });
 
-test("start-caddy starts a stopped container", { skip }, (t) => {
+test("start-caddy starts a stopped container", caddyReadiness, (t) => {
   const result = runCaddy(t, { inspect: `${caddyImage} false` });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.calls, [
@@ -5522,7 +5522,7 @@ test("start-caddy starts a stopped container", { skip }, (t) => {
 
 test(
   "start-caddy probes after create and start with padded timeouts",
-  { skip },
+  caddyReadiness,
   (t) => {
     const createCalls = [caddyImageInspect, caddyRun];
     const startCalls = [caddyInspect, caddyStart];
@@ -5547,31 +5547,35 @@ test(
   },
 );
 
-test("start-caddy recreates a container with another image", { skip }, (t) => {
-  for (const running of ["true", "false"]) {
-    const result = runCaddy(t, {
-      inspect: `caddy:2.10.0@sha256:${"a".repeat(64)} ${running}`,
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(
-      result.calls,
-      [
-        caddyList,
-        caddyInspect,
-        caddyImageInspect,
-        caddyRemove,
-        caddyRun,
-        caddyState,
-        caddyProbe,
-      ],
-      running,
-    );
-  }
-});
+test(
+  "start-caddy recreates a container with another image",
+  caddyReadiness,
+  (t) => {
+    for (const running of ["true", "false"]) {
+      const result = runCaddy(t, {
+        inspect: `caddy:2.10.0@sha256:${"a".repeat(64)} ${running}`,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(
+        result.calls,
+        [
+          caddyList,
+          caddyInspect,
+          caddyImageInspect,
+          caddyRemove,
+          caddyRun,
+          caddyState,
+          caddyProbe,
+        ],
+        running,
+      );
+    }
+  },
+);
 
 test(
   "start-caddy migrates same-image legacy containers and then reuses them",
-  { skip },
+  caddyReadiness,
   (t) => {
     for (const running of ["true", "false"]) {
       const run = setupCaddy(t, {
@@ -5601,9 +5605,7 @@ test(
 
 test(
   "start-caddy pulls a missing image before it removes the container",
-  {
-    skip,
-  },
+  caddyReadiness,
   (t) => {
     for (const inspect of [
       undefined,
@@ -5666,17 +5668,21 @@ test(
   },
 );
 
-test("start-caddy needs no pull for a same-image container", { skip }, (t) => {
-  for (const running of ["true", "false"]) {
-    const result = runCaddy(t, {
-      inspect: `${caddyImage} ${running}`,
-      noImage: true,
-      fail: "pull",
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.ok(!result.calls.includes(caddyPull));
-  }
-});
+test(
+  "start-caddy needs no pull for a same-image container",
+  caddyReadiness,
+  (t) => {
+    for (const running of ["true", "false"]) {
+      const result = runCaddy(t, {
+        inspect: `${caddyImage} ${running}`,
+        noImage: true,
+        fail: "pull",
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(!result.calls.includes(caddyPull));
+    }
+  },
+);
 
 test(
   "start-caddy keeps the existing container when its settings are incomplete",
@@ -6255,26 +6261,28 @@ test(
   },
 );
 
-test("start-caddy waits until Caddy answers its admin API", { skip }, (t) => {
-  for (const inspect of [undefined, `${caddyImage} false`]) {
-    const result = runCaddy(t, { inspect, wgetFails: 2 });
-    const label = String(inspect);
-    assert.equal(result.status, 0, `${label}: ${result.stderr}`);
-    const probes = result.calls.filter((call) => call === caddyProbe);
-    assert.equal(probes.length, 3, label);
-    assert.equal(
-      result.calls.filter((call) => call === caddyState).length,
-      3,
-      label,
-    );
-  }
-});
+test(
+  "start-caddy waits until Caddy answers its admin API",
+  caddyReadiness,
+  (t) => {
+    for (const inspect of [undefined, `${caddyImage} false`]) {
+      const result = runCaddy(t, { inspect, wgetFails: 2 });
+      const label = String(inspect);
+      assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+      const probes = result.calls.filter((call) => call === caddyProbe);
+      assert.equal(probes.length, 3, label);
+      assert.equal(
+        result.calls.filter((call) => call === caddyState).length,
+        3,
+        label,
+      );
+    }
+  },
+);
 
 test(
   "start-caddy fails at once for a container that is not running",
-  {
-    skip,
-  },
+  caddyReadiness,
   (t) => {
     for (const inspect of [undefined, `${caddyImage} false`]) {
       for (const state of ["exited", "dead", "restarting"]) {
@@ -6298,7 +6306,7 @@ test(
   },
 );
 
-test("start-caddy fails when Caddy never answers", { skip }, (t) => {
+test("start-caddy fails when Caddy never answers", caddyReadiness, (t) => {
   for (const [inspect, logDriver] of [
     [undefined, "local"],
     [`${caddyImage} false`, "local"],
@@ -6320,7 +6328,7 @@ test("start-caddy fails when Caddy never answers", { skip }, (t) => {
 
 test(
   "start-caddy skips readiness commands at a zero deadline",
-  { skip },
+  caddyZeroDeadline,
   (t) => {
     for (const timeout of ["0", "000"]) {
       const result = runCaddy(t, {
@@ -6335,7 +6343,7 @@ test(
   },
 );
 
-test("start-caddy accepts a probe before the deadline", { skip }, (t) => {
+test("start-caddy accepts a probe before the deadline", caddyReadiness, (t) => {
   const result = runCaddy(t, {
     inspect: `${caddyImage} false`,
     env: { START_CADDY_READY_TIMEOUT: "1", STUB_WGET_DELAY: "0.2" },
@@ -6384,29 +6392,33 @@ for (const { name, env, wgetFails, allowLateProbe, state, attempts } of [
     attempts: [caddyProbe],
   },
 ]) {
-  test(`start-caddy enforces the deadline with ${name}`, { skip }, (t) => {
-    const result = runCaddy(t, {
-      inspect: `${caddyImage} false`,
-      wgetFails,
-      allowLateProbe,
-      env: { START_CADDY_READY_TIMEOUT: "1", ...env },
-    });
-    assert.equal(result.status, 1, result.stderr);
-    assert.ok(result.elapsedMs < 3_000, `took ${result.elapsedMs} ms`);
-    assert.match(result.stderr, /within 1 seconds/);
-    assert.match(result.stderr, new RegExp(`container state is ${state}`));
-    assert.ok(result.stderr.includes(caddyLogs));
-    assert.deepEqual(result.calls, [
-      caddyList,
-      caddyInspect,
-      caddyStart,
-      caddyState,
-      ...attempts,
-    ]);
-  });
+  test(
+    `start-caddy enforces the deadline with ${name}`,
+    caddyReadiness,
+    (t) => {
+      const result = runCaddy(t, {
+        inspect: `${caddyImage} false`,
+        wgetFails,
+        allowLateProbe,
+        env: { START_CADDY_READY_TIMEOUT: "1", ...env },
+      });
+      assert.equal(result.status, 1, result.stderr);
+      assert.ok(result.elapsedMs < 3_000, `took ${result.elapsedMs} ms`);
+      assert.match(result.stderr, /within 1 seconds/);
+      assert.match(result.stderr, new RegExp(`container state is ${state}`));
+      assert.ok(result.stderr.includes(caddyLogs));
+      assert.deepEqual(result.calls, [
+        caddyList,
+        caddyInspect,
+        caddyStart,
+        caddyState,
+        ...attempts,
+      ]);
+    },
+  );
 }
 
-test("start-caddy fails when the container disappears", { skip }, (t) => {
+test("start-caddy fails when the container disappears", caddyReadiness, (t) => {
   const result = runCaddy(t, { gone: true });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /cannot read the state of the caddy container/);
