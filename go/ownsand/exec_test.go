@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -864,16 +865,35 @@ func TestExecBeforeStartedResendsIdenticalRequestAfterNotFound(t *testing.T) {
 		return relayAction{}
 	}
 	s := cp.handle(t, cp.client(t, TransportRelay))
-	res, r := runExec(t, s)
+	r := &recorder{}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	res, err := s.Exec(ctx, ExecParams{
+		Command:          []string{"run", "--verbose"},
+		Env:              map[string]string{"MODE": "test"},
+		WorkingDirectory: "/workspace",
+		Timeout:          5 * time.Second,
+		OnEvent:          r.on,
+	})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
 	checkLines(t, res, r, 2)
 	cp.mu.Lock()
 	log := strings.Join(cp.relayLog, ",")
+	reqs := cp.relayExecs
 	cp.mu.Unlock()
 	if log != "Exec,AttachExec,Exec" {
 		t.Fatalf("relay calls %s, want Exec,AttachExec,Exec", log)
 	}
 	if cp.agent.totalRuns() != 1 {
 		t.Fatalf("ran %d times", cp.agent.totalRuns())
+	}
+	if len(reqs) != 2 {
+		t.Fatalf("relay received %d Exec requests, want 2", len(reqs))
+	}
+	if !proto.Equal(reqs[0], reqs[1]) {
+		t.Fatal("resent ExecRequest differs from the initial ExecRequest")
 	}
 }
 
