@@ -726,6 +726,12 @@ describe("billing", () => {
     const banner = screen.getByRole("region", "This organization is suspended");
     await expect(banner).toBeVisible();
     await expect(banner).toContainText("Running sandboxes are paused");
+    await expect(banner).toContainText(
+      "creating sandboxes, snapshots, templates and enrollment tokens",
+    );
+    await expect(banner).toContainText(
+      "enrolling a device even with an existing enrollment token",
+    );
     await expect(
       banner.getByRole("link", "Manage billing at accounts.delino.io"),
     ).toHaveAttribute("href", "https://accounts.delino.io");
@@ -777,9 +783,14 @@ describe("billing", () => {
         ),
       ),
     ).toEqual([acmeBillingId]);
-    await expect(
-      screen.getByRole("region", "This organization is blocked"),
-    ).toBeVisible();
+    const banner = screen.getByRole("region", "This organization is blocked");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText(
+      "creating sandboxes, snapshots, templates and enrollment tokens",
+    );
+    await expect(banner).toContainText(
+      "enrolling a device even with an existing enrollment token",
+    );
 
     await screen.getByRole("button", "Link a billing account").tap();
     const dialog = screen.getByRole("dialog", "Link a billing account");
@@ -1306,6 +1317,8 @@ const MEMBER_PAGES: PageUnderTest[] = [
   { path: "sandboxes", heading: "Sandboxes" },
   { path: "snapshots", heading: "Snapshots" },
   { path: "devices", heading: "Devices" },
+  { path: "members", heading: "Members" },
+  { path: "settings", heading: "Settings" },
 ];
 
 async function expectLoaded(
@@ -1362,6 +1375,19 @@ describe("narrow screens", () => {
       for (const page of MEMBER_PAGES) {
         await app.open(`/orgs/${NORTHWIND}/${page.path}`);
         await expectLoaded(screen, page);
+        if (page.path === "members") {
+          const roster = screen.getByRole("list", "Members");
+          await expect(roster.getByText("Seo-yeon Lee")).toBeVisible();
+          await expect(roster.getByText("Mina Kim (you)")).toBeVisible();
+          await expect(
+            screen.getByRole("button", "Leave organization"),
+          ).toBeVisible();
+        } else if (page.path === "settings") {
+          const policy = screen.getByRole("region", "Agent version policy");
+          const updateMode = policy.getByRole("radiogroup", "Update mode");
+          await expect(updateMode).toBeVisible();
+          await expect(updateMode).toBeDisabled();
+        }
         const m = await measureLayout(browser);
         const where = `${width}px ${page.path}`;
         expect(

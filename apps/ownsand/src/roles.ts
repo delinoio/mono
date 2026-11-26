@@ -49,16 +49,16 @@ export function can(role: Role | undefined, permission: Permission): boolean {
 }
 
 /**
- * Whether the caller may change the role of, or remove, another member. An
- * admin cannot change or remove the owner, and nobody changes their own
- * role here (leaving is a separate action).
+ * Whether the caller may change the role of, or remove, another member.
+ * Wait for the caller ID so the caller's own row stays read-only. The
+ * owner's row is also read-only. Leaving is a separate action.
  */
 export function canManageMember(
   callerRole: Role | undefined,
   callerUserId: string | undefined,
   target: { userId: string; role: Role },
 ): boolean {
-  if (!can(callerRole, Permission.ManageMembers)) return false;
+  if (!callerUserId || !can(callerRole, Permission.ManageMembers)) return false;
   if (target.userId === callerUserId) return false;
   return target.role !== Role.OWNER;
 }

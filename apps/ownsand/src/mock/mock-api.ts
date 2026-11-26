@@ -667,38 +667,36 @@ export function guestOsOfBaseImage(image: BaseImage): GuestOs {
   }
 }
 
-/** What a device must offer to run a new sandbox. */
-interface PlacementRequirement {
+type ResolvedSandboxSource = {
   guestOs: GuestOs;
-  /** The base image of a base-image source; absent for a snapshot source. */
   baseImage?: BaseImage;
-}
+  snapshot?: Snapshot;
+};
 
-/** The permanent rule: whether the device advertises the guest and image. */
-function deviceCanRun(device: Device, need: PlacementRequirement): boolean {
+function placementMismatch(
+  device: Device,
+  source: ResolvedSandboxSource,
+): string | undefined {
   const caps = device.capabilities;
-  if (caps === undefined) return false;
-  if (!caps.guestOses.includes(need.guestOs)) return false;
-  return (
-    need.baseImage === undefined ||
-    caps.builtBaseImages.includes(need.baseImage)
-  );
+  const { guestOs, baseImage, snapshot } = source;
+  if (
+    !caps?.guestOses.includes(guestOs) ||
+    (baseImage !== undefined && !caps.builtBaseImages.includes(baseImage))
+  ) {
+    return baseImage === undefined
+      ? "the device does not support the guest OS"
+      : "the device does not support the guest OS or has not built the base image";
+  }
+  if (
+    snapshot !== undefined &&
+    snapshot.exportState !== SnapshotExportState.EXPORTED &&
+    snapshot.deviceId !== device.deviceId
+  ) {
+    return "the snapshot is not on this device and is not exported";
+  }
+  return undefined;
 }
 
-/**
- * Picks the device for a new sandbox like the control plane scheduler.
- *
- * A device can run a sandbox only when it advertises the guest operating
- * system of the source and, for a base-image source, has built that base
- * image. An explicit device ID is an exclusive selection: the request never
- * falls back to another device. An ID that names no visible device fails with
- * `NotFound` (a removed device is a tombstone, so it counts as not found), a
- * device that cannot run the source fails with `FailedPrecondition` (a
- * permanent rule, checked before the online state like the scheduler does),
- * and a device that is not `ONLINE` fails with `Unavailable`, the code for a
- * transient condition. Without an ID, the first `ONLINE` device that can run
- * the source runs the sandbox, and the result is `undefined` when none can.
- */
 /**
  * Returns the request with every UUID field in lowercase text, like the real
  * API's canonicalization: the organization, the idempotency key, the explicit
@@ -726,14 +724,17 @@ function canonicalizeCreateSandbox(
   });
 }
 
+/** An explicit device is exclusive and its permanent rules precede availability. */
 function placeSandbox(
   devices: Device[],
   deviceId: string | undefined,
-  need: PlacementRequirement,
+  source: ResolvedSandboxSource,
 ): Device | undefined {
   if (deviceId === undefined || deviceId === "") {
     return devices.find(
-      (d) => d.state === DeviceState.ONLINE && deviceCanRun(d, need),
+      (d) =>
+        d.state === DeviceState.ONLINE &&
+        placementMismatch(d, source) === undefined,
     );
   }
   const device = devices.find(
@@ -742,13 +743,9 @@ function placeSandbox(
   if (device === undefined) {
     throw new ConnectError("device not found", Code.NotFound);
   }
-  if (!deviceCanRun(device, need)) {
-    throw new ConnectError(
-      need.baseImage === undefined
-        ? "the device does not support the guest OS"
-        : "the device does not support the guest OS or has not built the base image",
-      Code.FailedPrecondition,
-    );
+  const mismatch = placementMismatch(device, source);
+  if (mismatch !== undefined) {
+    throw new ConnectError(mismatch, Code.FailedPrecondition);
   }
   if (device.state !== DeviceState.ONLINE) {
     throw new ConnectError("the device is offline", Code.Unavailable);
@@ -1111,16 +1108,11 @@ export function createMockTransport(
       throw new ConnectError("snapshot not found", Code.NotFound);
     return s;
   };
-  /**
-   * The guest operating system of a sandbox source, like the control plane: a
-   * base image boots its own guest, a snapshot keeps the guest of its sandbox,
-   * and a template has the guest of its snapshot. `baseImage` is set for a
-   * base-image source only, because only that source needs a built image.
-   */
-  const sourceGuest = (
+  const resolveSource = (
     org: OrgState,
     source: SandboxSource | undefined,
-  ): PlacementRequirement => {
+  ): ResolvedSandboxSource => {
+    let snapshot: Snapshot;
     switch (source?.source.case) {
       case "baseImage":
         return {
@@ -1128,13 +1120,15 @@ export function createMockTransport(
           baseImage: source.source.value,
         };
       case "snapshotId":
-        return { guestOs: findSnapshot(org, source.source.value).guestOs };
+        snapshot = findSnapshot(org, source.source.value);
+        break;
       case "templateId": {
         const id = source.source.value;
         const template = org.templates.find((t) => t.templateId === id);
         if (template === undefined)
           throw new ConnectError("template not found", Code.NotFound);
-        return { guestOs: findSnapshot(org, template.snapshotId).guestOs };
+        snapshot = findSnapshot(org, template.snapshotId);
+        break;
       }
       default:
         throw new ConnectError(
@@ -1142,6 +1136,7 @@ export function createMockTransport(
           Code.InvalidArgument,
         );
     }
+    return { guestOs: snapshot.guestOs, snapshot };
   };
   const secret = (prefix: string) =>
     `${prefix}_${Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
@@ -1669,11 +1664,22 @@ export function createMockTransport(
           }
           return { sandbox: findSandbox(org, known.sandboxId) };
         }
-        const { guestOs, baseImage } = sourceGuest(org, req.source);
-        const device = placeSandbox(org.devices, req.placement?.deviceId, {
-          guestOs,
-          baseImage,
-        });
+        const source = resolveSource(org, req.source);
+        const minimumDiskGib = source.snapshot?.resources?.diskGib;
+        if (
+          minimumDiskGib !== undefined &&
+          (req.resources?.diskGib ?? 0n) < minimumDiskGib
+        ) {
+          throw new ConnectError(
+            "invalid resources.disk_gib: must be at least the snapshot's disk size",
+            Code.InvalidArgument,
+          );
+        }
+        const device = placeSandbox(
+          org.devices,
+          req.placement?.deviceId,
+          source,
+        );
         if (device === undefined) {
           throw new ConnectError(
             "no device can run this sandbox",
@@ -1690,7 +1696,7 @@ export function createMockTransport(
           resources: req.resources,
           hostOs: device.hostOs,
           arch: device.arch,
-          guestOs,
+          guestOs: source.guestOs,
           network: req.network ?? { mode: NetworkMode.OUTBOUND },
           labels: { ...req.labels },
           idleTtl: req.idleTtl,

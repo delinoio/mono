@@ -9,9 +9,17 @@ import {
   cleanup,
   fireEvent,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { createMockTransport, MOCK_IDS } from "./mock/mock-api.ts";
+import {
+  FIRST_REVOCATION_ID,
+  INVITATION_PREFIX,
+  revokeCollisionTransport,
+  SECOND_REVOCATION_ID,
+  TOKEN_PREFIX,
+} from "./mock/revoke-collision-fixture.ts";
 import { renderConsole, settle } from "./test-support.tsx";
 
 beforeEach(() => {
@@ -175,4 +183,132 @@ describe.each(FLOWS)("revoking a $name", (flow) => {
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(await screen.findByText(flow.revokedText)).toBeTruthy();
   });
+});
+
+describe.each([
+  {
+    path: "enrollment-tokens",
+    list: "Enrollment tokens",
+    prefix: TOKEN_PREFIX,
+    otherPrefix: "ose_34cd",
+    action: "Revoke enrollment token",
+    confirm: "Revoke token",
+    idField: "enrollmentTokenId",
+  },
+  {
+    path: "members",
+    list: "Pending invitations",
+    prefix: INVITATION_PREFIX,
+    otherPrefix: "osi_34cd",
+    action: "Revoke Member invitation",
+    confirm: "Revoke invitation",
+    idField: "invitationId",
+  },
+])("$list with repeated prefixes", (flow) => {
+  const title = (id?: string) =>
+    `${flow.confirm} ${flow.prefix}…${id ? ` (${id})` : ""}?`;
+  const button = (id?: string) =>
+    screen.findByRole("button", {
+      name: `${flow.action} ${flow.prefix}${id ? ` (${id})` : ""}`,
+    });
+  const dialog = (id?: string) =>
+    screen.findByRole("alertdialog", { name: title(id) });
+
+  function start(options?: Parameters<typeof revokeCollisionTransport>[1]) {
+    const { transport, requests } = revokeCollisionTransport(
+      createMockTransport(),
+      options,
+    );
+    renderConsole(`/orgs/${MOCK_IDS.acme}/${flow.path}`, { transport });
+    return requests;
+  }
+
+  function holdPage() {
+    let release!: () => void;
+    const continuation = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { release, waitForContinuation: () => continuation };
+  }
+
+  test("names both rows and confirms only the selected record", async () => {
+    const requests = start();
+    for (const id of [FIRST_REVOCATION_ID, SECOND_REVOCATION_ID]) {
+      const action = await button(id);
+      const row = action.closest("li")!;
+      expect(within(row).getByText(id)).toBeTruthy();
+      expect(within(row).getAllByRole("button")).toEqual([action]);
+      expect(action.textContent).toBe("Revoke");
+    }
+
+    await press(await button(FIRST_REVOCATION_ID));
+    await press(
+      within(await dialog(FIRST_REVOCATION_ID)).getByRole("button", {
+        name: "Cancel",
+      }),
+    );
+    expect(requests).toEqual([]);
+
+    await press(await button(SECOND_REVOCATION_ID));
+    await press(
+      within(await dialog(SECOND_REVOCATION_ID)).getByRole("button", {
+        name: flow.confirm,
+      }),
+    );
+    expect(requests).toEqual([
+      { organizationId: MOCK_IDS.acme, [flow.idField]: SECOND_REVOCATION_ID },
+    ]);
+    expect(await button()).toBeTruthy();
+  });
+
+  test("updates an open confirmation when another page introduces a collision", async () => {
+    const { release, waitForContinuation } = holdPage();
+    const requests = start({ waitForContinuation });
+    await press(await button());
+    expect(await dialog()).toBeTruthy();
+
+    await act(async () => release());
+    const updated = await dialog(FIRST_REVOCATION_ID);
+    expect(within(updated).getByRole("button", { name: "Cancel" })).toBe(
+      document.activeElement,
+    );
+    await press(within(updated).getByRole("button", { name: flow.confirm }));
+    expect(requests).toEqual([
+      { organizationId: MOCK_IDS.acme, [flow.idField]: FIRST_REVOCATION_ID },
+    ]);
+    expect(await button()).toBeTruthy();
+  });
+
+  test.each(["unique", "duplicate", "inactive"] as const)(
+    "keeps the usual copy when the continuation is %s",
+    async (variant) => {
+      const { release, waitForContinuation } = holdPage();
+      start({ variant, waitForContinuation });
+      await press(await button());
+      expect(await dialog()).toBeTruthy();
+
+      await act(async () => release());
+      await waitFor(() =>
+        expect(screen.queryByText(/^Loading more /)).toBeNull(),
+      );
+      await press(
+        within(await dialog()).getByRole("button", { name: "Cancel" }),
+      );
+      expect(await button()).toBeTruthy();
+      expect(screen.queryByText(FIRST_REVOCATION_ID)).toBeNull();
+      expect(screen.queryByText(SECOND_REVOCATION_ID)).toBeNull();
+      if (variant === "unique") {
+        await press(
+          screen.getByRole("button", {
+            name: `${flow.action} ${flow.otherPrefix}`,
+          }),
+        );
+        expect(
+          await screen.findByRole("alertdialog", {
+            name: `${flow.confirm} ${flow.otherPrefix}…?`,
+          }),
+        ).toBeTruthy();
+      }
+    },
+  );
 });

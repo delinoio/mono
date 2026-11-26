@@ -401,6 +401,7 @@ function CreateSandboxDialog({
     (option) => option.value === source,
   );
   const selectedDevice = devices.find((item) => item.deviceId === device);
+  const deviceUnavailable = device !== ALL && !selectedDevice;
   const retryDeadline =
     attempt?.status === "unconfirmed" ? attempt.expiresAt : undefined;
   const expired = attempt?.status === "expired";
@@ -440,7 +441,7 @@ function CreateSandboxDialog({
       submitDisabled={
         attempt?.status === "pending" ||
         expired ||
-        (attempt === undefined && !selectedSource)
+        (!fieldsLocked && (!selectedSource || deviceUnavailable))
       }
       onOpenChange={(next) => {
         onOpenChange(next);
@@ -456,7 +457,7 @@ function CreateSandboxDialog({
             return;
           }
         } else {
-          if (!selectedSource) return;
+          if (!selectedSource || deviceUnavailable) return;
           const next: Record<string, string> = {};
           const ttl = ttlErrors({ idleMinutes, maxHours });
           if (ttl.idle) next.idle = ttl.idle;
@@ -494,7 +495,9 @@ function CreateSandboxDialog({
               },
               idleTtl: { seconds: BigInt(Math.round(idleMinutes! * 60)) },
               maxTtl: { seconds: BigInt(Math.round(maxHours! * 3600)) },
-              placement: device === ALL ? undefined : { deviceId: device },
+              placement: selectedDevice
+                ? { deviceId: selectedDevice.deviceId }
+                : undefined,
               network: { mode: Number(network) as NetworkMode },
               labels: parsed.labels,
             },
@@ -650,9 +653,15 @@ function CreateSandboxDialog({
         </Select>
         <Select
           label="Device"
-          value={device}
+          value={deviceUnavailable && !fieldsLocked ? null : device}
+          placeholder="Choose a device"
+          error={
+            deviceUnavailable && !fieldsLocked
+              ? "The selected device is unavailable. Choose a device or select Any device that fits."
+              : undefined
+          }
           disabled={fieldsLocked}
-          onValueChange={(v) => setDevice(v ?? ALL)}
+          onValueChange={(v) => v && setDevice(v)}
         >
           <SelectOption value={ALL}>Any device that fits</SelectOption>
           {devices.map((d) => (

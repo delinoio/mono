@@ -64,6 +64,7 @@ import {
   MockBillingState,
 } from "./mock/mock-api.ts";
 import {
+  fullListRefresh,
   type HeldCall,
   holdingTransport as holdMockTransport,
 } from "./test-support.tsx";
@@ -73,6 +74,10 @@ import {
   MIXED_CASE_ORGANIZATION_ID,
   organizationUuidTransport,
 } from "../e2e/organization-uuid-fixture.ts";
+import {
+  lastKnownStateCases,
+  withLastKnownState,
+} from "../e2e/sandbox-last-known-state-fixture.ts";
 import {
   mockSandboxTransition,
   SandboxTransitionOutcome,
@@ -663,6 +668,40 @@ describe("organizations", () => {
     expect(screen.queryByText("Deleted")).toBeNull();
     expect(screen.getByText(/Unreachable \(last running\)/)).toBeTruthy();
   });
+});
+
+describe("last-known sandbox states", () => {
+  for (const { name, lastKnownState, label } of lastKnownStateCases) {
+    test(`shows the sandbox with a ${name} last-known state on both routes`, async () => {
+      renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+        transport: withLastKnownState(createMockTransport(), lastKnownState),
+      });
+
+      const sandbox = await screen.findByRole("link", {
+        name: shortIdText(MOCK_IDS.unreachableSandbox),
+      });
+      const runningSandbox = screen.getByRole("link", {
+        name: shortIdText(MOCK_IDS.runningSandbox),
+      });
+      expect(
+        within(runningSandbox.closest("tr")!).getByText("Running"),
+      ).toBeTruthy();
+      expect(
+        within(sandbox.closest("tr")!)
+          .getByText(label)
+          .getAttribute("data-variant"),
+      ).toBe("danger");
+
+      fireEvent.click(sandbox);
+      await screen.findByRole("heading", { name: "Sandbox", level: 1 });
+      expect(
+        (await screen.findByText(label)).getAttribute("data-variant"),
+      ).toBe("danger");
+      expect(
+        await screen.findByRole("link", { name: "studio-mac" }),
+      ).toBeTruthy();
+    });
+  }
 });
 
 describe("roles", () => {
@@ -3099,6 +3138,12 @@ describe("billing banner", () => {
         }
         expect(banner).not.toBeNull();
         const text = banner!.textContent!;
+        expect(text).toContain(
+          "creating sandboxes, snapshots, templates and enrollment tokens",
+        );
+        expect(text).toContain(
+          "enrolling a device even with an existing enrollment token",
+        );
         const link = within(banner!).getByRole("link", {
           name: "Manage billing at accounts.delino.io",
         });
@@ -3674,14 +3719,17 @@ describe("leaving and deleting an organization", () => {
       queryClient: createQueryClient(),
     });
     const watcher = watchNotice();
-    await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Leave organization" }),
-      );
-    });
-    await confirmIn("Leave organization");
-    await settle(400);
-    watcher.stop();
+    try {
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Leave organization" }),
+        );
+      });
+      await confirmIn("Leave organization");
+      await settle(400);
+    } finally {
+      watcher.stop();
+    }
     expect(watcher.seen.notice).toBe(false);
     expect(window.location.pathname).toBe("/");
     expect(
@@ -3698,14 +3746,17 @@ describe("leaving and deleting an organization", () => {
       queryClient: createQueryClient(),
     });
     const watcher = watchNotice();
-    await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Leave organization" }),
-      );
-    });
-    await confirmIn("Leave organization");
-    await settle(400);
-    watcher.stop();
+    try {
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Leave organization" }),
+        );
+      });
+      await confirmIn("Leave organization");
+      await settle(400);
+    } finally {
+      watcher.stop();
+    }
     expect(watcher.seen.notice).toBe(false);
     expect(window.location.pathname).toBe("/");
   });
@@ -3716,14 +3767,17 @@ describe("leaving and deleting an organization", () => {
       queryClient: createQueryClient(),
     });
     const watcher = watchNotice();
-    await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Delete organization" }),
-      );
-    });
-    await confirmIn("Delete organization");
-    await settle(400);
-    watcher.stop();
+    try {
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Delete organization" }),
+        );
+      });
+      await confirmIn("Delete organization");
+      await settle(400);
+    } finally {
+      watcher.stop();
+    }
     expect(watcher.seen.notice).toBe(false);
     expect(window.location.pathname).toBe("/");
     expect(
@@ -4036,6 +4090,72 @@ describe("a failed refetch of loaded data", () => {
           screen.getByRole("button", { name: "Sign in with Delino" }),
         ).toBeTruthy();
       }
+    },
+  );
+
+  test.each([
+    [Code.NotFound, false],
+    [Code.PermissionDenied, false],
+    [Code.Unauthenticated, false],
+    [Code.Unavailable, true],
+  ] as const)(
+    "updates the open organization switcher after a full refresh error %s",
+    async (code, keepsChoices) => {
+      const mock = createMockTransport();
+      const organizationMethod = OrganizationService.method.listOrganizations;
+      const { transport, queryClient, refetch, failedTokens, seen } =
+        fullListRefresh(organizationMethod, mock);
+      const path = `/orgs/${MOCK_IDS.acme}/sandboxes`;
+      renderConsole(path, { transport, queryClient });
+
+      const switcher = await screen.findByRole("combobox", {
+        name: "Organization",
+      });
+      await act(async () => fireEvent.click(switcher));
+      expect(
+        screen.getByRole("option", { name: "Acme Robotics" }),
+      ).toBeTruthy();
+      expect(
+        screen.getByRole("option", { name: "Northwind Labs" }),
+      ).toBeTruthy();
+      const heading = await screen.findByRole("heading", { name: "Sandboxes" });
+      const organizationReads = seen.GetOrganization;
+
+      await refetch(code);
+      expect(failedTokens).toEqual(keepsChoices ? ["", "", ""] : [""]);
+      await waitFor(() =>
+        expect(screen.queryByRole("combobox", { name: "Organization" })).toBe(
+          keepsChoices ? switcher : null,
+        ),
+      );
+      const options = screen.queryAllByRole("option");
+      expect(options.map((option) => option.textContent)).toEqual(
+        keepsChoices ? ["Acme Robotics", "Northwind Labs"] : [],
+      );
+      expect(screen.getByRole("link", { name: "OwnSand" })).toBeTruthy();
+      expect(
+        screen.getByRole("link", { name: "Account settings" }),
+      ).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Sign out" })).toBeTruthy();
+      expect(screen.getByRole("heading", { name: "Sandboxes" })).toBe(heading);
+      expect(window.location.pathname).toBe(path);
+      expect(seen.GetOrganization).toBe(organizationReads);
+
+      await createClient(OrganizationService, mock).createOrganization({
+        name: "Fabrikam",
+      });
+      await refetch();
+      if (!keepsChoices) {
+        await act(async () =>
+          fireEvent.click(
+            await screen.findByRole("combobox", { name: "Organization" }),
+          ),
+        );
+      }
+      expect(
+        await screen.findByRole("option", { name: "Fabrikam" }),
+      ).toBeTruthy();
+      expect(screen.getAllByRole("option")).toHaveLength(3);
     },
   );
 
