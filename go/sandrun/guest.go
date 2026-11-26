@@ -283,8 +283,9 @@ func encodePowerShell(script string) string {
 // guestResult is the captured result of a guest command.
 type guestResult struct {
 	exitCode int64
-	// stdout and stderr hold at most the first guestOutputLimit bytes.
+	// stdout holds the initial chunks through the one that reaches guestOutputLimit.
 	stdout []byte
+	// stderr holds up to the last guestOutputLimit bytes.
 	stderr []byte
 	// linkFailures lists the paths of all linkFailedPrefix lines of
 	// stdout, also those after the captured start of stdout.
@@ -294,9 +295,21 @@ type guestResult struct {
 	outputLost bool
 }
 
-// guestOutputLimit bounds the captured output of a guest command and the
-// length of one stdout line that the link failure scan reads.
+// guestOutputLimit sets the stdout capture threshold, the stderr capture
+// limit and the maximum line length for the link failure scan.
 const guestOutputLimit = 64 << 10
+
+// appendGuestStderr keeps the latest guestOutputLimit bytes in stream order.
+func appendGuestStderr(tail, chunk []byte) []byte {
+	if len(chunk) >= guestOutputLimit {
+		return append(tail[:0], chunk[len(chunk)-guestOutputLimit:]...)
+	}
+	if overflow := len(tail) + len(chunk) - guestOutputLimit; overflow > 0 {
+		copy(tail, tail[overflow:])
+		tail = tail[:len(tail)-overflow]
+	}
+	return append(tail, chunk...)
+}
 
 // linkFailureScan finds the linkFailedPrefix lines in a stdout stream
 // that arrives in chunks.
@@ -366,7 +379,8 @@ func (c *Client) runGuest(ctx context.Context, s *sandrunv1.DevSession, op guest
 		// Keep macOS tar from adding AppleDouble (._) files.
 		env["COPYFILE_DISABLE"] = "1"
 	}
-	var out, errb bytes.Buffer
+	var out bytes.Buffer
+	var stderr []byte
 	var scan linkFailureScan
 	res, err := c.Exec(ctx, ExecParams{
 		OrganizationID:   s.GetOrganizationId(),
@@ -382,9 +396,7 @@ func (c *Client) runGuest(ctx context.Context, s *sandrunv1.DevSession, op guest
 				}
 				scan.write(ev.Data)
 			case ExecEventStderr:
-				if errb.Len() < guestOutputLimit {
-					errb.Write(ev.Data)
-				}
+				stderr = appendGuestStderr(stderr, ev.Data)
 			}
 			return nil
 		},
@@ -403,7 +415,7 @@ func (c *Client) runGuest(ctx context.Context, s *sandrunv1.DevSession, op guest
 		return nil, localError(connect.CodeInternal, fmt.Errorf("sandrun: the guest %s command ended with signal %d", op, *res.Signal))
 	}
 	scan.end()
-	r := &guestResult{stdout: out.Bytes(), stderr: errb.Bytes(), linkFailures: scan.paths, outputLost: scan.lost || res.Incomplete}
+	r := &guestResult{stdout: out.Bytes(), stderr: stderr, linkFailures: scan.paths, outputLost: scan.lost || res.Incomplete}
 	if res.ExitCode != nil {
 		r.exitCode = *res.ExitCode
 	}
