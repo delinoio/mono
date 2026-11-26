@@ -200,10 +200,12 @@ test("every shared fixture input selects tests", async (t) => {
   }
 });
 
-test("only the shared fixture input selects Droplet validation", async (t) => {
+test("Droplet validation selects fixtures for provisioning inputs", async (t) => {
   for (const [path, selected] of [
+    ["scripts/droplet/provision.sh", true],
     ["scripts/droplet/configure-docker-logs.sh", true],
-    ["scripts/droplet/provision.sh", false],
+    ["scripts/droplet/start-caddy.sh", true],
+    ["assets/image.svg", false],
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
