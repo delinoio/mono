@@ -150,8 +150,9 @@ type AttachParams struct {
 // ExecStreamError reports that the SDK could not deliver the result of an
 // exec whose request it sent: ctx ended, OnEvent failed, the server
 // rejected a continuation, or transient failures lasted longer than the
-// retry budget. The command may still run in the guest; StdoutOffset and
-// StderrOffset tell a later AttachExec where to continue.
+// retry budget or streams ended repeatedly without command progress. The
+// command may still run in the guest. StdoutOffset and StderrOffset tell a
+// later AttachExec where to continue.
 type ExecStreamError struct {
 	ExecID       string
 	StdoutOffset int64
@@ -181,11 +182,13 @@ func (e *ExecStreamError) Unwrap() error { return e.Err }
 // Exec runs a command in a running dev session and reports its events to
 // p.OnEvent. The SDK generates the exec_id when p.ExecID is empty, never
 // sends ExecDevSession twice, and continues with AttachDevSessionExec from
-// the last offsets after each stream end without a final event (the server
-// ends every stream before 14 minutes) and after transient failures, with
-// exponential backoff. Output that the continuation can no longer read is
-// reported with an ExecEventOutputTruncated event and marks the result
-// incomplete.
+// the last offsets after each stream end without a final event. The server
+// ends each stream before 14 minutes. Transient failures and short clean
+// ends without command progress start a bounded recovery window with
+// exponential backoff. A clean end after command progress or a healthy idle
+// stream continues immediately. Output that the continuation can no longer
+// read is reported with an ExecEventOutputTruncated event and marks the
+// result incomplete.
 //
 // For stdout and stderr, a nil callback or a nil return from the callback
 // acknowledges the entire data range. If the callback returns an error, the
@@ -281,6 +284,7 @@ type eventStream interface {
 	Receive() bool
 	Err() error
 	Close() error
+	event() *sandrunv1.DevSessionExecEvent
 }
 
 type execStream struct {
@@ -297,62 +301,23 @@ func (s attachStream) event() *sandrunv1.DevSessionExecEvent { return s.Msg().Ge
 
 func (o *execOp) run(ctx context.Context) (*ExecResult, error) {
 	bo := backoff{min: o.c.timing.backoffMin, max: o.c.timing.backoffMax}
-	lastProgress := time.Now()
-	for attempt := 0; ; attempt++ {
-		var (
-			stream eventStream
-			next   func() *sandrunv1.DevSessionExecEvent
-			err    error
-		)
-		first := o.start != nil
-		if first {
-			var s *connect.ServerStreamForClient[sandrunv1.ExecDevSessionResponse]
-			s, err = o.c.devSessions.ExecDevSession(ctx, connect.NewRequest(o.start))
-			if s != nil {
-				es := execStream{s}
-				stream, next = es, es.event
-			}
-		} else {
-			var s *connect.ServerStreamForClient[sandrunv1.AttachDevSessionExecResponse]
-			s, err = o.c.devSessions.AttachDevSessionExec(ctx, connect.NewRequest(&sandrunv1.AttachDevSessionExecRequest{
-				OrganizationId: o.org, DevSessionId: o.session, ExecId: o.execID,
-				StdoutOffset: o.stdout, StderrOffset: o.stderr,
-			}))
-			if s != nil {
-				as := attachStream{s}
-				stream, next = as, as.event
-			}
+	var retryDeadline time.Time
+	var retryErr error
+	for attempt := 1; ; attempt++ {
+		a := o.receive(ctx, retryDeadline)
+		if a.result != nil {
+			return a.result, nil
 		}
-		progressed := false
-		var res *ExecResult
-		if err == nil {
-			for stream.Receive() {
-				progressed = true
-				r, herr := o.handle(next())
-				if herr != nil {
-					_ = stream.Close()
-					return nil, o.streamErr(herr, false)
-				}
-				if r != nil {
-					res = r
-					break
-				}
-			}
-			if res == nil {
-				err = stream.Err()
-			}
-			_ = stream.Close()
+		if a.callbackErr != nil {
+			return nil, o.streamErr(a.callbackErr, false)
 		}
-		if res != nil {
-			return res, nil
-		}
-		if first {
+		if o.start != nil {
 			// A terminal credential failure prevents the initial send.
 			// A terminal wire status before any event also ends the exec.
-			if err != nil && !progressed {
+			if a.err != nil && !a.received {
 				var credentialErr *CredentialError
-				if errors.As(err, &credentialErr) || (connect.IsWireError(err) && connect.CodeOf(err) != connect.CodeUnavailable) {
-					return nil, err
+				if errors.As(a.err, &credentialErr) || (connect.IsWireError(a.err) && connect.CodeOf(a.err) != connect.CodeUnavailable) {
+					return nil, a.err
 				}
 			}
 			o.start = nil
@@ -360,33 +325,115 @@ func (o *execOp) run(ctx context.Context) (*ExecResult, error) {
 		if ctx.Err() != nil {
 			return nil, o.streamErr(ctx.Err(), false)
 		}
-		if progressed {
-			lastProgress = time.Now()
+		if a.expired {
+			if retryErr == nil {
+				retryErr = errors.New("the exec streams ended repeatedly without command progress")
+			}
+			return nil, o.streamErr(retryErr, false)
+		}
+		if a.err != nil && !transient(ctx, a.err) {
+			unknown := connect.CodeOf(a.err) == connect.CodeNotFound && !o.started
+			return nil, o.streamErr(a.err, unknown)
+		}
+		rotated := a.err == nil && (a.progressed || a.healthyIdle)
+		if a.progressed || rotated {
+			retryDeadline = time.Time{}
+			retryErr = nil
 			bo.reset()
 		}
-		if err == nil {
-			// The server ended the stream without a final event: continue
-			// at once after a stream that delivered events.
-			if progressed {
-				o.c.logger.DebugContext(ctx, "sandrun exec stream rotated", "exec_id", o.execID)
-				continue
-			}
-		} else if !transient(ctx, err) {
-			unknown := connect.CodeOf(err) == connect.CodeNotFound && !o.started
-			return nil, o.streamErr(err, unknown)
+		if rotated {
+			o.c.logger.DebugContext(ctx, "sandrun exec stream rotated", "exec_id", o.execID)
+			continue
 		}
-		if time.Since(lastProgress) > o.c.timing.retryBudget {
-			if err == nil {
-				err = errors.New("the exec streams ended repeatedly without events")
-			}
+		if retryDeadline.IsZero() {
+			retryDeadline = time.Now().Add(o.c.timing.retryBudget)
+		}
+		if a.err != nil {
+			retryErr = a.err
+		}
+		delay := max(0, min(bo.next(), time.Until(retryDeadline)))
+		o.c.logger.DebugContext(ctx, "sandrun exec continues", "exec_id", o.execID, "attempt", attempt, "delay", delay, "code", codeText(a.err))
+		if err := sleep(ctx, min(delay, time.Until(retryDeadline))); err != nil {
 			return nil, o.streamErr(err, false)
 		}
-		delay := bo.next()
-		o.c.logger.DebugContext(ctx, "sandrun exec continues", "exec_id", o.execID, "attempt", attempt+1, "delay", delay, "code", codeText(err))
-		if serr := sleep(ctx, delay); serr != nil {
-			return nil, o.streamErr(serr, false)
+	}
+}
+
+type execAttempt struct {
+	result      *ExecResult
+	err         error
+	callbackErr error
+	received    bool
+	progressed  bool
+	healthyIdle bool
+	expired     bool
+}
+
+func (o *execOp) receive(ctx context.Context, retryDeadline time.Time) (a execAttempt) {
+	var retryTimer *time.Timer
+	if !retryDeadline.IsZero() {
+		remaining := time.Until(retryDeadline)
+		if remaining <= 0 {
+			return execAttempt{expired: true}
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		// Stop the timer when the stream makes progress so a recovered
+		// command can remain idle on the same stream.
+		retryTimer = time.AfterFunc(remaining, cancel)
+		defer func() {
+			retryTimer.Stop()
+			a.expired = !a.progressed && ctx.Err() != nil && !connect.IsWireError(a.err)
+		}()
+	}
+
+	stream, err := o.openStream(ctx)
+	if err != nil {
+		return execAttempt{err: err}
+	}
+	defer stream.Close()
+
+	started, stdout, stderr := o.started, o.stdout, o.stderr
+	var idleSince time.Time
+	for stream.Receive() {
+		a.received = true
+		ev := stream.event()
+		if !a.progressed && idleSince.IsZero() && (ev.GetKeepalive() != nil || (o.started && ev.GetStarted() != nil)) {
+			idleSince = time.Now()
+		}
+		a.result, a.callbackErr = o.handle(ev)
+		if a.result != nil || a.callbackErr != nil {
+			return a
+		}
+		if !a.progressed && (o.started != started || o.stdout > stdout || o.stderr > stderr) {
+			a.progressed = true
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 		}
 	}
+	a.err = stream.Err()
+	a.healthyIdle = !idleSince.IsZero() && time.Since(idleSince) >= o.c.timing.retryBudget
+	return a
+}
+
+func (o *execOp) openStream(ctx context.Context) (eventStream, error) {
+	if o.start != nil {
+		s, err := o.c.devSessions.ExecDevSession(ctx, connect.NewRequest(o.start))
+		if err != nil {
+			return nil, err
+		}
+		return execStream{s}, nil
+	}
+	s, err := o.c.devSessions.AttachDevSessionExec(ctx, connect.NewRequest(&sandrunv1.AttachDevSessionExecRequest{
+		OrganizationId: o.org, DevSessionId: o.session, ExecId: o.execID,
+		StdoutOffset: o.stdout, StderrOffset: o.stderr,
+	}))
+	if err != nil {
+		return nil, err
+	}
+	return attachStream{s}, nil
 }
 
 // handle processes one event and returns the result for a final event.
