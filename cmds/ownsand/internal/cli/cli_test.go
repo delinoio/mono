@@ -835,6 +835,116 @@ func TestFileReadWrite(t *testing.T) {
 	}
 }
 
+func TestFileReadDotDotAfterMissingDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows can normalize user-typed paths before lookup")
+	}
+	r := newRunner(t)
+	r.f.files["/tmp/x"] = []byte("downloaded contents")
+	for _, tc := range []struct {
+		name  string
+		dir   string
+		file  string
+		guest string
+	}{
+		{name: "missing directory", dir: "missing", file: "out.txt", guest: "/tmp/x"},
+		{name: "dangling directory link", dir: "dangling-link", file: "out.txt", guest: "/tmp/x"},
+		{name: "existing ancestor file", dir: "missing", file: "existing.txt", guest: "/tmp/x"},
+		{name: "missing guest file", dir: "missing", file: "out.txt", guest: "/missing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			var wantEntries []string
+			if tc.dir == "dangling-link" {
+				if err := os.Symlink("missing", filepath.Join(dir, tc.dir)); err != nil {
+					t.Fatal(err)
+				}
+				wantEntries = append(wantEntries, tc.dir)
+			}
+			if tc.file == "existing.txt" {
+				if err := os.WriteFile(filepath.Join(dir, tc.file), []byte("original"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				wantEntries = append(wantEntries, tc.file)
+			}
+
+			// Keep the missing component in the path passed to the CLI.
+			to := filepath.Join(dir, tc.dir) + "/../" + tc.file
+			dst, err := openDownloadTarget(t.Context(), to)
+			if dst != nil {
+				t.Error("opening the invalid destination created a staging file")
+				_ = dst.finish(errors.New("discard staging file"))
+			}
+			var pathErr *os.PathError
+			if !errors.Is(err, os.ErrNotExist) || !errors.As(err, &pathErr) || pathErr.Op != "open" {
+				t.Errorf("openDownloadTarget: got %v, want a local open error wrapping os.ErrNotExist", err)
+			}
+
+			before := len(r.f.callNames())
+			res := r.run("file", "read", "--to", to, r.f.sb, tc.guest)
+			if res.code != ExitError || !strings.Contains(res.stderr, "open "+filepath.Join(dir, tc.dir)+"/../.ownsand-") {
+				t.Errorf("read --to: got %+v, want a local staging open error", res)
+			}
+			for _, call := range r.f.callNames()[before:] {
+				if call == "AuthorizeRelay" || call == "ReadFile" {
+					t.Errorf("sent %s for an invalid local destination", call)
+				}
+			}
+			if entries := mustReadDir(t, dir); !slices.Equal(entries, wantEntries) {
+				t.Errorf("destination directory entries: got %v, want %v", entries, wantEntries)
+			}
+			if tc.file == "existing.txt" {
+				if b, err := os.ReadFile(filepath.Join(dir, tc.file)); err != nil || string(b) != "original" {
+					t.Errorf("ancestor file: got %q, %v, want original contents", b, err)
+				}
+			}
+		})
+	}
+}
+
+func TestFileReadBareDestination(t *testing.T) {
+	r := newRunner(t)
+	r.f.files["/tmp/x"] = []byte("downloaded contents")
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if res := r.run("file", "read", "--to", "out.txt", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("read --to: %+v", res)
+	}
+	if b, err := os.ReadFile("out.txt"); err != nil || string(b) != "downloaded contents" {
+		t.Fatalf("destination content %q, %v", b, err)
+	}
+	if entries := mustReadDir(t, dir); !slices.Equal(entries, []string{"out.txt"}) {
+		t.Fatalf("unexpected destination directory entries: %v", entries)
+	}
+}
+
+func TestFileReadDotDotAfterDirectorySymlink(t *testing.T) {
+	r := newRunner(t)
+	r.f.files["/tmp/x"] = []byte("downloaded contents")
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.MkdirAll(filepath.Join(real, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "real-link")
+	if err := os.Symlink(filepath.Join(real, "sub"), link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	to := link + string(filepath.Separator) + ".." + string(filepath.Separator) + "out.txt"
+	if res := r.run("file", "read", "--to", to, r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("read --to: %+v", res)
+	}
+	if b, err := os.ReadFile(filepath.Join(real, "out.txt")); err != nil || string(b) != "downloaded contents" {
+		t.Fatalf("destination content %q, %v", b, err)
+	}
+	if entries := mustReadDir(t, dir); !slices.Equal(entries, []string{"real", "real-link"}) {
+		t.Fatalf("unexpected ancestor directory entries: %v", entries)
+	}
+	if entries := mustReadDir(t, real); !slices.Equal(entries, []string{"out.txt", "sub"}) {
+		t.Fatalf("unexpected destination directory entries: %v", entries)
+	}
+}
+
 func TestFileReadFailureKeepsDestination(t *testing.T) {
 	r := newRunner(t)
 	dir := t.TempDir()

@@ -689,7 +689,9 @@ func openDownloadTarget(ctx context.Context, to string) (*downloadTarget, error)
 		}
 		// The staging name does not contain the destination base name, so a
 		// destination name at the filesystem limit still has room for it.
-		tmp := filepath.Join(dir, ".ownsand-"+hex.EncodeToString(b[:])+".tmp")
+		// Keep the directory prefix from Split so the OS checks each path
+		// component, including a missing directory before "..".
+		tmp := dir + ".ownsand-" + hex.EncodeToString(b[:]) + ".tmp"
 		// 0666 before the umask gives a new destination the mode that
 		// os.Create would give it.
 		f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
