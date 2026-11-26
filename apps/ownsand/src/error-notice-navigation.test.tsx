@@ -61,8 +61,11 @@ describe("ErrorNotice retry", () => {
         <a href="/">Elsewhere</a>
       </ErrorNotice>,
     );
-    expect(screen.getByRole("link", { name: "Elsewhere" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+    const retry = screen.getByRole("button", { name: "Try again" });
+    const link = screen.getByRole("link", { name: "Elsewhere" });
+    expect(
+      retry.compareDocumentPosition(link) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
 });
 
