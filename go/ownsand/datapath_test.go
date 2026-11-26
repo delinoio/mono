@@ -66,6 +66,38 @@ func waitGate(t *testing.T, cp *fakeCP, kind string) {
 	}
 }
 
+type setupWaitContext struct {
+	context.Context
+	observeSlot func()
+}
+
+func (ctx setupWaitContext) Done() <-chan struct{} {
+	ctx.observeSlot()
+	return ctx.Context.Done()
+}
+
+func startSetupWaiter(ctx context.Context, s *Sandbox) (<-chan execResult, <-chan bool) {
+	occupied := make(chan bool, 1)
+	// Exec first calls Done in acquireOpen after checking Err and before
+	// trying to take the slot. Record whether the opener still holds it.
+	ctx = setupWaitContext{Context: ctx, observeSlot: sync.OnceFunc(func() {
+		occupied <- len(s.dp.openSlot) == cap(s.dp.openSlot)
+	})}
+	return startExec(ctx, s), occupied
+}
+
+func waitForSetupWaiter(t *testing.T, name string, occupied <-chan bool) {
+	t.Helper()
+	select {
+	case busy := <-occupied:
+		if !busy {
+			t.Fatalf("waiter %s reached a free setup slot", name)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("waiter %s did not reach the setup slot", name)
+	}
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -189,14 +221,15 @@ func TestWaitingOperationCancelsWithoutEndingTheSetup(t *testing.T) {
 	cp.gateHits = make(chan string, 4)
 	s := cp.handle(t, cp.client(t, TransportAuto))
 
-	a := startExec(context.Background(), s)
+	a := startExec(t.Context(), s)
 	waitGate(t, cp, "ice")
 	// Waiter C keeps waiting; waiter B cancels.
-	c := startExec(context.Background(), s)
-	bctx, cancelB := context.WithCancel(context.Background())
+	c, cOccupied := startSetupWaiter(t.Context(), s)
+	bctx, cancelB := context.WithCancel(t.Context())
 	defer cancelB()
-	b := startExec(bctx, s)
-	time.Sleep(100 * time.Millisecond)
+	b, bOccupied := startSetupWaiter(bctx, s)
+	waitForSetupWaiter(t, "B", bOccupied)
+	waitForSetupWaiter(t, "C", cOccupied)
 	canceledAt := time.Now()
 	cancelB()
 	rb := waitExec(t, b)
@@ -242,12 +275,12 @@ func TestWaiterRunsTheSetupWhenTheOpenerEnds(t *testing.T) {
 	cp.gateHits = make(chan string, 4)
 	s := cp.handle(t, cp.client(t, TransportAuto))
 
-	actx, cancelA := context.WithCancel(context.Background())
+	actx, cancelA := context.WithCancel(t.Context())
 	defer cancelA()
 	a := startExec(actx, s)
 	waitGate(t, cp, "ice")
-	w := startExec(context.Background(), s)
-	time.Sleep(100 * time.Millisecond)
+	w, wOccupied := startSetupWaiter(t.Context(), s)
+	waitForSetupWaiter(t, "W", wOccupied)
 	cancelA()
 	if ra := waitExec(t, a); !errors.Is(ra.err, context.Canceled) {
 		t.Fatalf("opener error: %v", ra.err)
