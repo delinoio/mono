@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation } from "@connectrpc/connect-query";
+import { useMutation, useTransport } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
@@ -29,13 +29,19 @@ import {
   toastError,
 } from "../components/ui.tsx";
 import { formatBytes, formatTime, labels } from "../format.ts";
+import { cancelUncachedList } from "../pagination.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
-import { useSnapshots, useTemplates } from "../snapshot-lists.ts";
+import {
+  templateListOptions,
+  useSnapshots,
+  useTemplates,
+} from "../snapshot-lists.ts";
 
 /** Route `snapshots`: snapshots, their export, and templates. */
 export function SnapshotsPage() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
+  const transport = useTransport();
   const refresh = () => invalidateServices(queryClient, SnapshotService);
   const snapshots = useSnapshots(organizationId, "management");
   const templates = useTemplates(organizationId, "management");
@@ -46,7 +52,16 @@ export function SnapshotsPage() {
     onSuccess: refresh,
   });
   const createTemplate = useMutation(SnapshotService.method.createTemplate, {
-    onSuccess: refresh,
+    onSuccess: async (_, { organizationId: submittedOrganizationId }) => {
+      if (submittedOrganizationId !== undefined) {
+        await cancelUncachedList(
+          queryClient,
+          templateListOptions(transport, submittedOrganizationId, "management")
+            .queryKey,
+        );
+      }
+      return refresh();
+    },
   });
   const deleteTemplate = useMutation(SnapshotService.method.deleteTemplate, {
     onSuccess: refresh,

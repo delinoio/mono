@@ -110,6 +110,14 @@ async function holdOrganizationRefreshStep(step: "list" | "mutation") {
   sessionStorage.setItem(key, "released");
 }
 
+function holdTemplateRequest(request: "first-page" | "create") {
+  const key = `ownsand-e2e-template-${request}`;
+  return new Promise<void>((resolve) => {
+    window.addEventListener(`${key}-release`, () => resolve(), { once: true });
+    sessionStorage.setItem(key, "held");
+  });
+}
+
 export function createMockTransport(): Transport {
   const methodName = sessionStorage.getItem("ownsand-e2e-paged-list");
   const refreshList = sessionStorage.getItem("ownsand-e2e-refresh-list");
@@ -121,6 +129,9 @@ export function createMockTransport(): Transport {
   const pageDevices = methodName === "ListDevices";
   const pageInvitations = methodName === "ListInvitations";
   const pageSources = methodName === "SnapshotSources";
+  const holdTemplateFirstPage =
+    sessionStorage.getItem("ownsand-e2e-template-first-page") === "hold";
+  let heldTemplateFirstPage = false;
   const credentialList = sessionStorage.getItem(
     "ownsand-e2e-credential-method",
   );
@@ -176,6 +187,41 @@ export function createMockTransport(): Transport {
   return {
     ...base,
     async unary(method, signal, timeout, header, input, contextValues) {
+      if (holdTemplateFirstPage && method.name === "ListTemplates") {
+        const response = await base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+        // Ignore the request React Strict Mode aborts on its test mount.
+        if (signal?.aborted) return response;
+        const { pageToken } = input as { pageToken: string };
+        recordToken("ownsand-e2e-template-list-tokens", pageToken);
+        if (heldTemplateFirstPage) return response;
+
+        heldTemplateFirstPage = true;
+        // Deliver the pre-create page even after cancellation.
+        await holdTemplateRequest("first-page");
+        sessionStorage.setItem("ownsand-e2e-template-first-page", "delivered");
+        return {
+          ...response,
+          message: { ...response.message, templates: [], nextPageToken: "" },
+        };
+      }
+      if (holdTemplateFirstPage && method.name === "CreateTemplate") {
+        await holdTemplateRequest("create");
+        return base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+      }
       if (
         method.name === sessionStorage.getItem("ownsand-e2e-tracked-mutation")
       ) {
