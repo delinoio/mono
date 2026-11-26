@@ -2400,8 +2400,9 @@ const accountsArgs = ["accounts-api", ...httpArgs.slice(1)];
 //   STUB_LOGS     exit code of `docker logs` (default 0).
 //   STUB_STOP_FAIL  space-separated container name or ID patterns that
 //                   `docker stop` fails for.
-//   STUB_RM_FAIL    space-separated container IDs that `docker rm` fails for
-//                 (`docker rm --force` of a replacement still succeeds).
+//   STUB_RM_FAIL    space-separated container IDs that plain `docker rm` fails for.
+//   STUB_FORCE_RM_FAIL glob for the replacement name that `docker rm --force`
+//                      fails for.
 //   STUB_START_FAIL glob of the container names that `docker start` fails for.
 //   STUB_OLD_IMAGES space-separated `<container ID>=<image>` pairs: the image
 //                 that `docker inspect --format {{.Config.Image}}` prints for
@@ -2505,8 +2506,21 @@ case "$1" in
     done ;;
   start) [[ -z "\${STUB_START_FAIL:-}" || "\$2" != \$STUB_START_FAIL ]] || exit 1 ;;
   image) [[ "\$2" != rm || " \${STUB_IMAGE_RM_FAIL:-} " != *" \$3 "* ]] || exit 1 ;;
-  rm) [[ "\$2" == --force || " \${STUB_RM_FAIL:-} " != *" \$2 "* ]] || exit 1 ;;
-  logs) echo "server log line"; exit "\${STUB_LOGS:-0}" ;;
+  rm)
+    if [[ "$2" == --force ]]; then
+      if [[ -n "\${STUB_FORCE_RM_FAIL:-}" && "$3" == $STUB_FORCE_RM_FAIL ]]; then
+        echo "docker: forced removal failed for $3" >&2
+        exit 1
+      fi
+    else
+      [[ " \${STUB_RM_FAIL:-} " != *" $2 "* ]] || exit 1
+    fi ;;
+  logs)
+    if [[ "\${STUB_LOGS:-0}" != 0 ]]; then
+      echo "docker: log read failed for $4" >&2
+      exit "$STUB_LOGS"
+    fi
+    echo "server log line" ;;
 esac`,
   );
   shellStub(
@@ -3688,7 +3702,7 @@ test(
 );
 
 test(
-  "droplet deploy removes the replacement and keeps everything else when docker run fails",
+  "droplet deploy preserves the start failure and serving state when replacement cleanup fails",
   { skip: skipDroplet },
   (t) => {
     const route = "# old route\n";
@@ -3699,14 +3713,14 @@ test(
       previous: `${oldestImage}\n`,
     };
     for (const [label, env] of [
-      ["run fails", { STUB_RUN_EXIT: "125" }],
-      // A failed log read or removal must not hide the start failure.
-      [
-        "cleanup fails",
-        { STUB_RUN_EXIT: "125", STUB_LOGS: "1", STUB_RM_FAIL: "old1" },
-      ],
+      ["cleanup succeeds", {}],
+      ["log read fails", { STUB_LOGS: "1" }],
+      ["forced removal fails", { STUB_FORCE_RM_FAIL: "api-*" }],
     ]) {
-      const result = runDroplet(t, undefined, { ...options, env });
+      const result = runDroplet(t, undefined, {
+        ...options,
+        env: { STUB_RUN_EXIT: "125", ...env },
+      });
       assert.equal(result.status, 1, `${label}: ${result.stderr}`);
       assert.match(
         result.stderr,
@@ -3727,7 +3741,36 @@ test(
         ],
         label,
       );
-      assert.match(result.calls.at(-1), /^docker rm --force api-/, label);
+      const replacement = result.calls[3].match(/--name (api-\S+)/)[1];
+      assert.equal(
+        result.calls[4],
+        `docker logs --tail 200 ${replacement}`,
+        label,
+      );
+      assert.equal(result.calls[5], `docker rm --force ${replacement}`, label);
+      if (env.STUB_LOGS) {
+        assert.ok(
+          result.stdout.includes(`docker: log read failed for ${replacement}`),
+          label,
+        );
+        assert.doesNotMatch(result.stdout, /server log line/, label);
+      } else {
+        assert.match(result.stdout, /server log line/, label);
+      }
+      if (env.STUB_FORCE_RM_FAIL) {
+        assert.ok(
+          result.stderr.includes(
+            `docker: forced removal failed for ${replacement}`,
+          ),
+          label,
+        );
+      } else {
+        assert.doesNotMatch(
+          result.stderr,
+          /docker: forced removal failed/,
+          label,
+        );
+      }
       assert.equal(result.read("caddy/sites/api.caddy"), route, label);
       assert.equal(result.read("state/api.current"), `${olderImage}\n`, label);
       assert.equal(
