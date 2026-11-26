@@ -18,6 +18,7 @@ import {
 } from "@delino/ownsand-protos/v1/member_pb";
 import {
   type ListSnapshotsResponse,
+  type ListTemplatesRequest,
   SnapshotService,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { QueryClient } from "@tanstack/react-query";
@@ -242,6 +243,167 @@ describe("snapshot source lists", () => {
       ).toHaveLength(2),
     );
     expect(state.tokens).toHaveLength(6);
+  });
+});
+
+describe("template creation and management pages", () => {
+  const templateName = "review-template";
+  const formTitle = "Make a template";
+
+  function renderTemplates({ holdFirstPage = false, pageSize = 200 } = {}) {
+    const mock = createMockTransport();
+    const requests: ListTemplatesRequest[] = [];
+    let releaseFirstPage!: () => void;
+    const firstPage = new Promise<void>((resolve) => {
+      releaseFirstPage = resolve;
+    });
+    const held = holdingTransport(["CreateTemplate"], () => true, {
+      ...mock,
+      async unary(method, signal, timeout, header, input, contextValues) {
+        if (method.name !== "ListTemplates") {
+          return mock.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+        }
+        const request = input as typeof input & ListTemplatesRequest;
+        requests.push(request);
+        if (holdFirstPage && requests.length === 1) {
+          // Deliver a pre-create response even if its request was cancelled.
+          await firstPage;
+          const response = await mock.unary(
+            method,
+            undefined,
+            timeout,
+            header,
+            request,
+            contextValues,
+          );
+          return {
+            ...response,
+            message: { ...response.message, templates: [], nextPageToken: "" },
+          };
+        }
+        return mock.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          { ...request, pageSize },
+          contextValues,
+        );
+      },
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/snapshots`, {
+      transport: held.transport,
+    });
+    return { ...held, requests, releaseFirstPage };
+  }
+
+  async function openForm(name: string) {
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^Make template/ }),
+    );
+    const form = await screen.findByRole("dialog", { name: formTitle });
+    fireEvent.input(
+      within(form).getByRole("textbox", { name: "Template name" }),
+      {
+        target: { value: name },
+      },
+    );
+    return form;
+  }
+
+  const submit = (form: HTMLElement) =>
+    fireEvent.click(
+      within(form).getByRole("button", { name: "Create template" }),
+    );
+  const deleteAction = () =>
+    screen.findByRole("button", { name: /^Delete template review-template / });
+
+  test.each([false, true])(
+    "restarts an uncached first page before its stale response arrives (dismissed: %s)",
+    async (dismissed) => {
+      const { calls, requests, releaseFirstPage } = renderTemplates({
+        holdFirstPage: true,
+      });
+      const form = await openForm(templateName);
+      submit(form);
+      await waitFor(() => expect(calls.CreateTemplate).toHaveLength(1));
+      expect(requests).toHaveLength(1);
+      let newerForm: HTMLElement | undefined;
+      if (dismissed) {
+        fireEvent.keyDown(form, { key: "Escape" });
+        await waitFor(() =>
+          expect(screen.queryByRole("dialog", { name: formTitle })).toBeNull(),
+        );
+        newerForm = await openForm("another-template");
+      }
+      await act(async () => calls.CreateTemplate![0]!.settle());
+      if (newerForm) {
+        expect(screen.getByRole("dialog", { name: formTitle })).toBe(newerForm);
+        fireEvent.keyDown(newerForm, { key: "Escape" });
+      }
+      await deleteAction();
+      expect(
+        requests.map(({ organizationId, pageSize, pageToken }) => [
+          organizationId,
+          pageSize,
+          pageToken,
+        ]),
+      ).toEqual([
+        [MOCK_IDS.acme, 200, ""],
+        [MOCK_IDS.acme, 200, ""],
+      ]);
+
+      await act(async () => releaseFirstPage());
+      expect(await deleteAction()).toBeTruthy();
+      expect(screen.queryByRole("dialog", { name: formTitle })).toBeNull();
+    },
+  );
+
+  test("shows the failure in the current form without refreshing the first page", async () => {
+    const { calls, requests, releaseFirstPage } = renderTemplates({
+      holdFirstPage: true,
+    });
+    const form = await openForm(templateName);
+    submit(form);
+    await waitFor(() => expect(calls.CreateTemplate).toHaveLength(1));
+    await act(async () => {
+      calls.CreateTemplate![0]!.settle(
+        new ConnectError("Template creation failed", Code.InvalidArgument),
+      );
+    });
+    expect(
+      await within(form).findByText("Template creation failed"),
+    ).toBeTruthy();
+    await act(async () => releaseFirstPage());
+    expect(await screen.findByText("No templates")).toBeTruthy();
+    expect(requests).toHaveLength(1);
+  });
+
+  test("refreshes cached templates from the first page and keeps the continuation", async () => {
+    const { calls, requests } = renderTemplates({ pageSize: 1 });
+    await waitForRows("Templates", 1);
+    const form = await openForm(templateName);
+    submit(form);
+    await waitFor(() => expect(calls.CreateTemplate).toHaveLength(1));
+    await act(async () => calls.CreateTemplate![0]!.settle());
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: formTitle })).toBeNull(),
+    );
+    expect(requests.map(({ pageToken }) => pageToken)).toEqual(["", ""]);
+    expect(itemsOf("Templates")).toHaveLength(1);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show more templates" }),
+    );
+    expect(await deleteAction()).toBeTruthy();
+    expect(requests).toHaveLength(3);
+    expect(requests[2]!.pageToken).not.toBe("");
   });
 });
 

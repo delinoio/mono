@@ -47,6 +47,64 @@ const pagedSources = test.extend<{
 
 describe("snapshot and template pagination", () => {
   pagedSources(
+    "refreshes an uncached Templates page after a dismissed create",
+    async ({ app, browser, screen, sources }) => {
+      await sources.open("snapshots", {
+        "template-first-page": "hold",
+        "paged-list": "",
+      });
+      await expect(
+        screen.getByRole("status", "Loading templates"),
+      ).toBeVisible();
+      const opener = screen.getByRole("button", /^Make template/);
+      await opener.tap();
+      const form = screen.getByRole("dialog", "Make a template");
+      const name = form.getByLabel("Template name");
+      await name.fill("review-template");
+      const submit = form.getByRole("button", "Create template");
+      await submit.tap();
+      await expect(submit).toBeDisabled();
+      expect(await sources.value("template-create")).toBe("held");
+      expect(await sources.value("template-list-tokens")).toBe('[""]');
+
+      await browser.keyboard.press("Escape");
+      await expect(form).toBeHidden();
+      await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
+      await opener.tap();
+      await name.fill("another-template");
+      await browser.evaluate(() => {
+        window.dispatchEvent(new Event("ownsand-e2e-template-create-release"));
+        return true;
+      });
+
+      const deleteTemplate = screen.getByRole(
+        "button",
+        /^Delete template review-template /,
+      );
+      const row = browser
+        .locator('ul[aria-label="Templates"] li')
+        .filter({ hasText: "review-template" });
+      await expect(row).toHaveCount(1);
+      await expect(name).toHaveValue("another-template");
+      expect(await sources.value("template-list-tokens")).toBe('["",""]');
+      expect(await sources.value("template-first-page")).toBe("held");
+      await browser.evaluate(() => {
+        window.dispatchEvent(
+          new Event("ownsand-e2e-template-first-page-release"),
+        );
+        return true;
+      });
+
+      expect(await sources.value("template-first-page")).toBe("delivered");
+      await expect(name).toHaveValue("another-template");
+      await browser.keyboard.press("Escape");
+      await expect(deleteTemplate).toBeVisible();
+      await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
+      await app.screenshot("fresh-template-after-late-first-page");
+    },
+  );
+
+  pagedSources(
     "loads management pages independently and refreshes a later snapshot",
     async ({ app, browser, screen, sources }) => {
       await sources.open("snapshots", { "snapshot-exporting": "true" });
