@@ -3,6 +3,7 @@
 package guest
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -178,5 +179,191 @@ func TestReadLateCleanupKeepsReplacementSnapshot(t *testing.T) {
 	}
 	if files := filesUnder(t, filepath.Join(dir, "reads")); len(files) != 1 {
 		t.Fatalf("files after the late cleanup: %v, want only the replacement snapshot", files)
+	}
+}
+
+func TestReadShutdownHandsOffWhileSnapshotIOBlocked(t *testing.T) {
+	for _, phase := range []string{"create", "created", "failed preparation", "expiry", "admission retry"} {
+		t.Run(phase, func(t *testing.T) {
+			const grace = 40 * time.Millisecond
+			setReadCloseGrace(t, grace)
+			dir := t.TempDir()
+			first := newHarness(t, func(cfg *Config) { cfg.StateDir = dir })
+			m := first.srv.reads
+			m.forceCopy = true
+			src := filepath.Join(t.TempDir(), "src")
+			payload := "original"
+			if err := os.WriteFile(src, []byte(payload), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			req := readReq(t, src)
+			oldSnapshot := filepath.Join(m.dir, req.GetReadId())
+
+			gate, entered, release := newReadPreparationGate(t)
+			defer release()
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			var call *stream
+			var swept chan struct{}
+			remove := func(path string) error {
+				if path != oldSnapshot {
+					t.Errorf("old helper removed %q, want %q", path, oldSnapshot)
+				}
+				gate()
+				return os.Remove(path)
+			}
+
+			switch phase {
+			case "create", "created":
+				m.createFile = func(path string, flag int, perm os.FileMode) (*os.File, error) {
+					if phase == "create" {
+						gate()
+						return os.OpenFile(path, flag, perm)
+					}
+					f, err := os.OpenFile(path, flag, perm)
+					if err != nil {
+						t.Errorf("snapshot create: %v", err)
+					}
+					gate()
+					return f, err
+				}
+			case "failed preparation":
+				payload = "changed to invalidate the first copy"
+				m.copyHook = func() {
+					if err := os.WriteFile(src, []byte(payload), 0o600); err != nil {
+						t.Error(err)
+					}
+				}
+				m.removeFile = remove
+			case "expiry", "admission retry":
+				requireReadPayload(t, first, req, payload)
+				first.waitReadCallsEnded(req.GetReadId())
+				first.clock.Advance(OperationRetention)
+				if phase == "expiry" {
+					m.removeFile = remove
+					swept = make(chan struct{})
+					t.Cleanup(func() { waitReadShutdownStep(t, swept, "old sweep cleanup") })
+					go func() {
+						defer close(swept)
+						first.srv.Sweep()
+					}()
+				} else {
+					m.removeFile = func(string) error { return fs.ErrPermission }
+					first.srv.Sweep()
+					first.clock.Advance(ExpiredMemory)
+					first.srv.Sweep()
+					m.removeFile = remove
+				}
+			}
+			if swept == nil {
+				call = first.open(ctx)
+				defer call.s.CloseRequest()
+				call.send(1, req)
+			}
+			waitReadShutdownStep(t, entered, "filesystem call entry")
+
+			closed := make(chan struct{})
+			start := time.Now()
+			var elapsed time.Duration
+			go func() {
+				first.srv.Close()
+				elapsed = time.Since(start)
+				close(closed)
+			}()
+			waitReadShutdownStep(t, m.stop, "read admission fence")
+			if _, _, got := first.readAll(readReq(t, src)); got.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+				t.Fatalf("new read after close began: %v, want unavailable", got)
+			}
+			waitReadShutdownStep(t, closed, "close with snapshot I/O still blocked")
+			if elapsed < grace {
+				t.Fatalf("close returned in %v with unfinished work, want at least %v", elapsed, grace)
+			}
+
+			replacement := newHarness(t, func(cfg *Config) { cfg.StateDir = dir })
+			requireReadPayload(t, replacement, req, payload)
+			release()
+			if swept != nil {
+				waitReadShutdownStep(t, swept, "old sweep completion")
+			} else {
+				if got := call.recv().GetError(); got.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+					t.Fatalf("old read after I/O returned: %v, want unavailable", got)
+				}
+			}
+			requireReadPayload(t, replacement, req, payload)
+			if files := filesUnder(t, filepath.Join(dir, "reads")); len(files) != 1 {
+				t.Fatalf("snapshot files after old I/O completed: %v, want only the replacement snapshot", files)
+			}
+			t.Logf("close returned after %v with snapshot I/O blocked; replacement read the same ID before and after release", elapsed)
+		})
+	}
+}
+
+func TestReadPendingRemovalReservesIDAfterExpiry(t *testing.T) {
+	h := newHarness(t, nil)
+	src := filepath.Join(t.TempDir(), "src")
+	const original, updated = "original", "updated after expiry"
+	if err := os.WriteFile(src, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req := readReq(t, src)
+	requireReadPayload(t, h, req, original)
+	h.waitReadCallsEnded(req.GetReadId())
+
+	gate, entered, release := newReadPreparationGate(t)
+	defer release()
+	h.srv.reads.removeFile = func(path string) error {
+		gate()
+		return os.Remove(path)
+	}
+	h.clock.Advance(OperationRetention)
+	swept := make(chan struct{})
+	t.Cleanup(func() { waitReadShutdownStep(t, swept, "expiry removal cleanup") })
+	go func() {
+		defer close(swept)
+		h.srv.Sweep()
+	}()
+	waitReadShutdownStep(t, entered, "expiry removal entry")
+	if _, _, got := h.readAll(req); got.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
+		t.Fatalf("read during expiry memory: %v, want not_found", got)
+	}
+
+	h.clock.Advance(ExpiredMemory)
+	memorySwept := make(chan struct{})
+	t.Cleanup(func() { waitReadShutdownStep(t, memorySwept, "expiry memory sweep cleanup") })
+	go func() {
+		defer close(memorySwept)
+		h.srv.Sweep()
+	}()
+	waitReadShutdownStep(t, memorySwept, "expiry memory sweep with removal still active")
+	if _, _, got := h.readAll(req); got.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("read after expiry memory with removal still active: %v, want unavailable", got)
+	}
+	if err := os.WriteFile(src, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requireReadPayload(t, h, readReq(t, src), updated)
+
+	release()
+	waitReadShutdownStep(t, swept, "expiry removal completion")
+	requireReadPayload(t, h, req, updated)
+	h.waitReadCallsEnded(req.GetReadId())
+	h.srv.Sweep()
+	requireReadPayload(t, h, req, updated)
+}
+
+func waitReadShutdownStep(t *testing.T, done <-chan struct{}, step string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for %s", step)
+	}
+}
+
+func requireReadPayload(t *testing.T, h *harness, req *ownsandv1.ReadFileRequest, want string) {
+	t.Helper()
+	data, size, got := h.readAll(req)
+	if got != nil || string(data) != want || size != int64(len(want)) {
+		t.Fatalf("read returned %q, size %d, error %v, want %q", data, size, got, want)
 	}
 }

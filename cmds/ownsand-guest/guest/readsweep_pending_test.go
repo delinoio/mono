@@ -86,8 +86,8 @@ func TestReadSweepRetriesFailedRemoval(t *testing.T) {
 	if !f.exists(t) {
 		t.Fatal("snapshot was removed although the removal failed")
 	}
-	if got := m.pending["read-1"]; got != f.snap {
-		t.Fatalf("pending = %q, want the snapshot path", got)
+	if got := m.pending["read-1"]; got == nil || got.path != f.snap {
+		t.Fatalf("pending = %v, want the snapshot path", got)
 	}
 	if _, ok := m.entries["read-1"]; ok {
 		t.Fatal("entry stayed after expiry")
@@ -208,7 +208,7 @@ func TestReadSweepPendingSkipsLiveEntries(t *testing.T) {
 	active := settledReadEntry(f.snap, f.end)
 	active.open = 1
 	m.entries["read-1"] = active
-	m.pending["read-1"] = f.snap
+	m.pending["read-1"] = &readRemoval{path: f.snap, failed: true}
 	preparing := filepath.Join(m.dir, "read-2")
 	if err := os.WriteFile(preparing, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
@@ -347,12 +347,16 @@ func TestReadPreparationRetriesFailedRemoval(t *testing.T) {
 			}
 
 			m.sweep(h.clock.Now())
-			if _, err := os.Lstat(snap); err != nil || m.pending[id] != snap {
+			if pending := m.pending[id]; pending == nil || pending.path != snap || !pending.failed {
+				t.Fatalf("failed sweep lost the pending removal: %v", pending)
+			}
+			if _, err := os.Lstat(snap); err != nil {
 				t.Fatalf("failed sweep lost the snapshot or pending removal: stat error %v, pending %v", err, m.pending)
 			}
 			if _, _, got := h.readAll(req); got.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
 				t.Fatalf("retry while removal fails returned %v, want unavailable", got)
 			}
+			m.wg.Wait()
 			if got := logs.String(); strings.Count(got, "remove read snapshot failed") != 1 ||
 				strings.Contains(got, filepath.Base(m.dir)) || strings.Contains(got, filepath.Base(path)) ||
 				strings.Contains(got, updated) || strings.Contains(got, "before") {
