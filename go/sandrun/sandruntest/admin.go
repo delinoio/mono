@@ -99,9 +99,41 @@ func (s *Server) AddDevice(d *sandrunv1.DeviceCapacity) {
 	s.devices = append(s.devices, proto.CloneOf(d))
 }
 
-// SendQueueEvent sends an event to the open WatchQueue streams (one
-// stream receives it).
-func (s *Server) SendQueueEvent(ev *sandrunv1.WatchQueueResponse) { s.queue <- ev }
+const queueBufferSize = 64
+
+// SendQueueEvent queues a request or runner update for one WatchQueue stream
+// of the event's organization. Updates with no organization ID are ignored.
+// Other event types can go to any one WatchQueue stream.
+func (s *Server) SendQueueEvent(ev *sandrunv1.WatchQueueResponse) {
+	var orgID string
+	switch event := ev.GetEvent().(type) {
+	case *sandrunv1.WatchQueueResponse_Request:
+		if event != nil {
+			orgID = event.Request.GetOrganizationId()
+		}
+	case *sandrunv1.WatchQueueResponse_Runner:
+		if event != nil {
+			orgID = event.Runner.GetOrganizationId()
+		}
+	default:
+		s.unscopedQueue <- ev
+		return
+	}
+	if orgID != "" {
+		s.queueForOrganization(orgID) <- proto.CloneOf(ev)
+	}
+}
+
+func (s *Server) queueForOrganization(orgID string) chan *sandrunv1.WatchQueueResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	queue := s.queueByOrg[orgID]
+	if queue == nil {
+		queue = make(chan *sandrunv1.WatchQueueResponse, queueBufferSize)
+		s.queueByOrg[orgID] = queue
+	}
+	return queue
+}
 
 // OwnSandLink returns the stored link of an organization and the API key
 // that SetOwnSandLink received, for credential input tests.
@@ -594,19 +626,20 @@ func (w *workService) GetCapacity(_ context.Context, req *connect.Request[sandru
 }
 
 func (w *workService) WatchQueue(ctx context.Context, req *connect.Request[sandrunv1.WatchQueueRequest], stream *connect.ServerStream[sandrunv1.WatchQueueResponse]) error {
+	orgID := req.Msg.GetOrganizationId()
 	w.s.mu.Lock()
-	if _, err := w.s.requireOrg(req.Msg.GetOrganizationId()); err != nil {
+	if _, err := w.s.requireOrg(orgID); err != nil {
 		w.s.mu.Unlock()
 		return err
 	}
 	var snap []*sandrunv1.WatchQueueResponse
 	for _, r := range w.s.requests {
-		if r.GetOrganizationId() == req.Msg.GetOrganizationId() && !terminalRequest(r.GetState()) {
+		if r.GetOrganizationId() == orgID && !terminalRequest(r.GetState()) {
 			snap = append(snap, &sandrunv1.WatchQueueResponse{Event: &sandrunv1.WatchQueueResponse_Request{Request: proto.CloneOf(r)}})
 		}
 	}
 	for _, r := range w.s.runners {
-		if r.GetOrganizationId() == req.Msg.GetOrganizationId() && !terminalRunner(r.GetState()) {
+		if r.GetOrganizationId() == orgID && !terminalRunner(r.GetState()) {
 			snap = append(snap, &sandrunv1.WatchQueueResponse{Event: &sandrunv1.WatchQueueResponse_Runner{Runner: proto.CloneOf(r)}})
 		}
 	}
@@ -626,14 +659,17 @@ func (w *workService) WatchQueue(ctx context.Context, req *connect.Request[sandr
 			return err
 		}
 	}
+	queue := w.s.queueForOrganization(orgID)
 	for {
+		var m *sandrunv1.WatchQueueResponse
 		select {
 		case <-ctx.Done():
 			return nil
-		case m := <-w.s.queue:
-			if done, err := send(m); done || err != nil {
-				return err
-			}
+		case m = <-queue:
+		case m = <-w.s.unscopedQueue:
+		}
+		if done, err := send(m); done || err != nil {
+			return err
 		}
 	}
 }
@@ -675,8 +711,14 @@ func (a *apiKeyService) ListApiKeys(_ context.Context, req *connect.Request[sand
 		return nil, err
 	}
 	res := &sandrunv1.ListApiKeysResponse{NextPageToken: next}
+	now := time.Now()
 	for _, it := range items {
-		res.ApiKeys = append(res.ApiKeys, proto.CloneOf(it))
+		key := proto.CloneOf(it)
+		if expiresAt := key.GetExpiresAt(); key.GetState() == sandrunv1.ApiKeyState_API_KEY_STATE_ACTIVE &&
+			expiresAt != nil && !now.Before(expiresAt.AsTime()) {
+			key.State = sandrunv1.ApiKeyState_API_KEY_STATE_EXPIRED
+		}
+		res.ApiKeys = append(res.ApiKeys, key)
 	}
 	return connect.NewResponse(res), nil
 }

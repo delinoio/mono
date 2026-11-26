@@ -7,8 +7,12 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
@@ -133,4 +137,49 @@ func TestListRunnersFilters(t *testing.T) {
 	if connect.CodeOf(err) != connect.CodeInvalidArgument {
 		t.Errorf("UUID with wrong version: got %v, want InvalidArgument", err)
 	}
+}
+
+func TestListApiKeysExpiryBoundary(t *testing.T) {
+	const (
+		active  = sandrunv1.ApiKeyState_API_KEY_STATE_ACTIVE
+		expired = sandrunv1.ApiKeyState_API_KEY_STATE_EXPIRED
+	)
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		expires := start.Add(time.Nanosecond)
+		key := &sandrunv1.ApiKey{
+			ApiKeyId: "key-1", OrganizationId: "org-1", Name: "test key",
+			DisplayPrefix: "sandrun_abcd", State: active,
+			CreatedAt: timestamppb.New(start), ExpiresAt: timestamppb.New(expires),
+		}
+		stored := proto.CloneOf(key)
+		service := &apiKeyService{s: &Server{apiKeys: []*sandrunv1.ApiKey{key}}}
+		req := connect.NewRequest(&sandrunv1.ListApiKeysRequest{OrganizationId: key.GetOrganizationId()})
+		for _, tt := range []struct {
+			offset time.Duration
+			state  sandrunv1.ApiKeyState
+		}{
+			{-time.Nanosecond, active},
+			{0, expired},
+			{time.Nanosecond, expired},
+		} {
+			time.Sleep(time.Until(expires.Add(tt.offset)))
+			res, err := service.ListApiKeys(t.Context(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keys := res.Msg.GetApiKeys()
+			if len(keys) != 1 {
+				t.Fatalf("at expiry %+v: got %d keys, want 1", tt.offset, len(keys))
+			}
+			want := proto.CloneOf(stored)
+			want.State = tt.state
+			if keys[0] == key || !proto.Equal(keys[0], want) {
+				t.Errorf("at expiry %+v: got %v, want a clone equal to %v", tt.offset, keys[0], want)
+			}
+			if !proto.Equal(key, stored) {
+				t.Errorf("at expiry %+v: stored key changed to %v", tt.offset, key)
+			}
+		}
+	})
 }
