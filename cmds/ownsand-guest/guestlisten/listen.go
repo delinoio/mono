@@ -41,6 +41,9 @@ const (
 // connects to this port.
 const DefaultVsockPort uint32 = 1024
 
+// vsockPortAny is VMADDR_PORT_ANY, which asks the kernel to choose a port.
+const vsockPortAny = 1<<32 - 1
+
 // DefaultSpec is the listener of the guest helper inside a sandbox guest.
 var DefaultSpec = fmt.Sprintf("vsock://:%d", DefaultVsockPort)
 
@@ -92,7 +95,7 @@ func Parse(spec string) (Spec, error) {
 	case SchemeVsock:
 		portText := strings.TrimPrefix(rest, ":")
 		port, err := strconv.ParseUint(portText, 10, 32)
-		if err != nil || port == 0 {
+		if err != nil || port == 0 || port == vsockPortAny {
 			return Spec{}, fmt.Errorf("guestlisten: invalid vsock port %q", portText)
 		}
 		s.Port = uint32(port)

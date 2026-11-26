@@ -377,7 +377,8 @@ func TestTunnelWorkersStopAfterFailure(t *testing.T) {
 }
 
 func TestParseTunnelSpec(t *testing.T) {
-	spec, ok, err := parseTunnelSpec("console=ttyS0 root=/dev/sda rw ownsand.tunnel=1025,172.30.0.6/30,172.30.0.5 panic=1")
+	const cmdline = "console=ttyS0 root=/dev/sda rw ownsand.tunnel=1025,172.30.0.6/30,172.30.0.5 panic=1"
+	spec, ok, err := parseTunnelSpec(cmdline)
 	if !ok || err != nil {
 		t.Fatalf("parse: %v %v", ok, err)
 	}
@@ -390,6 +391,7 @@ func TestParseTunnelSpec(t *testing.T) {
 	for _, bad := range []string{
 		"ownsand.tunnel=1025",
 		"ownsand.tunnel=0,172.30.0.6/30,172.30.0.5",
+		strings.Replace(cmdline, "ownsand.tunnel=1025,", "ownsand.tunnel=4294967295,", 1),
 		"ownsand.tunnel=1025,fd00::2/64,172.30.0.5",
 		"ownsand.tunnel=1025,172.30.0.6/30,nope",
 	} {

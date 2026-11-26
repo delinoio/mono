@@ -21,8 +21,7 @@ func TestParse(t *testing.T) {
 	}{
 		{"vsock://:1024", Spec{Scheme: SchemeVsock, Port: 1024}, true},
 		{"vsock://52", Spec{Scheme: SchemeVsock, Port: 52}, true},
-		{"vsock://:0", Spec{}, false},
-		{"vsock://:x", Spec{}, false},
+		{"vsock://:4294967294", Spec{Scheme: SchemeVsock, Port: 4294967294}, true},
 		{"unix:///run/g.sock", Spec{Scheme: SchemeUnix, Address: "/run/g.sock"}, true},
 		{"tcp://127.0.0.1:0", Spec{Scheme: SchemeTCP, Address: "127.0.0.1:0"}, true},
 		{"udp://x", Spec{}, false},
@@ -32,6 +31,13 @@ func TestParse(t *testing.T) {
 		got, err := Parse(c.spec)
 		if (err == nil) != c.ok || (c.ok && got != c.want) {
 			t.Errorf("Parse(%q) = %+v, %v", c.spec, got, err)
+		}
+	}
+	for _, port := range []string{"0", "x", "4294967295", "4294967296"} {
+		spec := "vsock://:" + port
+		want := fmt.Sprintf("guestlisten: invalid vsock port %q", port)
+		if got, err := Parse(spec); got != (Spec{}) || err == nil || err.Error() != want {
+			t.Errorf("Parse(%q) = %+v, %v, want empty spec and %q", spec, got, err, want)
 		}
 	}
 	if DefaultSpec != "vsock://:1024" {
