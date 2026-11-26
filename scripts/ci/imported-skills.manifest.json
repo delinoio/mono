@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "16d2b8ac846f3785c2b0fccd63b33ce5bdb573ff3d147acc4f152a2dd9c05f1b",
+        "AGENTS.md": "ccac4cfb3e0449d8768ab7a3fa675c9accd60f495f5802f06f0d5df218009d1b",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "8d9f8517adee6028be8ba0a9cd8869cf27d3dbc3ca56d1414c8ed4751afbe516",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -132,7 +132,7 @@
         "rules/rerender-lazy-state-init.md": "4bd7dcaeee8a77dbef38f6f39614048fee715a1dada77da39644caed8a365fac",
         "rules/rerender-memo-with-default-value.md": "96b72c57abc1c57a50d5c535cb0575800756ecdbe3ae376ba83c84f518d08526",
         "rules/rerender-memo.md": "1f258990c2f27ff6256b3cc5c43300631bb3f0d81f749aed08d07fcdcc131dd1",
-        "rules/rerender-move-effect-to-event.md": "abc2cbf167bee056743023351e96806a411d3398da8802093620aecf0721f029",
+        "rules/rerender-move-effect-to-event.md": "3d01623ed271f52faa895e05819c2b40b477335b9d1590fa4b55061da5a1236a",
         "rules/rerender-no-inline-components.md": "1cc32907a770272524ba682eef9e7efdd8ad4533b6f89b718a1fcd7d1d0eb6a3",
         "rules/rerender-simple-expression-in-memo.md": "5bdcf2d1558ba5204e643c887b7b4060f89630969425651eb68e96427d97f800",
         "rules/rerender-split-combined-hooks.md": "6f45d703343484ef9acef9388397f3642966ae6a5a258899a0cf1f9977cfbf6c",
