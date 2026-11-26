@@ -6,8 +6,9 @@
 // `droplet-deploy.sh` (against stubbed `docker` and `curl`),
 // `provision.sh` (against stubbed host commands),
 // `start-caddy.sh` (against a stubbed `docker`),
-// `configure-docker-logs.sh` (against stubbed `docker` and `systemctl`) and
-// `deploy-release.sh` and `release-recovery.sh` (against a local bare remote).
+// `configure-docker-logs.sh` (against stubbed `docker`, `dockerd` and
+// `systemctl`), and `deploy-release.sh` and `release-recovery.sh`
+// (against a local bare remote).
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -5719,6 +5720,21 @@ function logsFixture(
   mkdirSync(bin);
   const calls = join(dir, "calls.log");
   writeFileSync(join(dir, "driver"), driver);
+  const dockerd = shellStub(
+    dir,
+    "dockerd",
+    `[[ "$*" == "--version" ]] || exit 2
+[[ -n "$STUB_ENGINE_VERSION" ]] || exit 1
+printf 'Docker version %s, build abc123\\n' "$STUB_ENGINE_VERSION"`,
+  );
+  // Redirect the service's absolute daemon path in the fixture copy only.
+  const script = join(dir, "configure-docker-logs.sh");
+  writeFileSync(
+    script,
+    readFileSync(configureLogs, "utf8").replace('"/usr/bin/dockerd"', () =>
+      JSON.stringify(dockerd),
+    ),
+  );
   shellStub(
     bin,
     "docker",
@@ -5742,10 +5758,14 @@ printf '%s' "$STUB_RESTARTED_DRIVER" > "$STUB_DIR/driver"`,
   if (content !== undefined) writeFileSync(config, content, { mode: 0o600 });
 
   return {
-    run({ restartStatus = 0, restartedDriver = "local" } = {}) {
+    run({
+      restartStatus = 0,
+      restartedDriver = "local",
+      engineVersion = "",
+    } = {}) {
       writeFileSync(calls, "");
       if (readOnlyDirectory) chmodSync(configDirectory, 0o555);
-      const result = spawnSync("bash", [configureLogs, config], {
+      const result = spawnSync("bash", [script, config], {
         encoding: "utf8",
         env: {
           ...baseEnv,
@@ -5753,6 +5773,7 @@ printf '%s' "$STUB_RESTARTED_DRIVER" > "$STUB_DIR/driver"`,
           DOCKER_CONTEXT: "remote-context",
           DOCKER_HOST: "tcp://remote.example:2375",
           STUB_DIR: dir,
+          STUB_ENGINE_VERSION: engineVersion,
           STUB_RESTART_STATUS: String(restartStatus),
           STUB_RESTARTED_DRIVER: restartedDriver,
         },
@@ -5776,6 +5797,7 @@ printf '%s' "$STUB_RESTARTED_DRIVER" > "$STUB_DIR/driver"`,
 }
 
 const restartDocker = "systemctl restart docker";
+const queryEngineVersion = "dockerd --version";
 const queryLogDriver =
   "docker --host unix:///var/run/docker.sock info --format {{.LoggingDriver}}";
 
@@ -5804,6 +5826,7 @@ test(
         "max-buffer-size": "1m",
         "cache-disabled": "false",
         "cache-max-size": "10m",
+        "cache-labels": "service",
       },
       "default-address-pools": [{ base: "10.10.0.0/16", size: 24 }],
     };
@@ -5811,13 +5834,17 @@ test(
       content: JSON.stringify(original),
       driver: "json-file",
     });
-    const first = fixture.run();
+    const first = fixture.run({ engineVersion: "29.5.0" });
     assert.equal(first.status, 0, first.stderr);
     assert.deepEqual(JSON.parse(first.read()), {
       ...original,
       "log-driver": "local",
     });
-    assert.deepEqual(first.calls, [restartDocker, queryLogDriver]);
+    assert.deepEqual(first.calls, [
+      queryEngineVersion,
+      restartDocker,
+      queryLogDriver,
+    ]);
     assert.equal(statSync(first.config).mode & 0o777, 0o600);
     assert.deepEqual(first.leftovers(), []);
 
@@ -5827,6 +5854,83 @@ test(
     assert.equal(second.status, 0, second.stderr);
     assert.equal(second.read(), written);
     assert.deepEqual(second.calls, [queryLogDriver]);
+  },
+);
+
+test(
+  "configure-docker-logs rejects version-dependent options before switching on an older or unverified Engine",
+  { skip },
+  (t) => {
+    for (const [engineVersion, option, reason] of [
+      ["28.5.2", "labels", "found Docker Engine 28.5.2"],
+      ["29.4.3", "labels", "found Docker Engine 29.4.3"],
+      ["29.4.3", "cache-labels", "found Docker Engine 29.4.3"],
+      ["", "labels", "could not verify a stable release"],
+      ["29.5", "env", "could not verify a stable release"],
+      ["30.0.0-rc.1", "cache-tag", "could not verify a stable release"],
+    ]) {
+      const original = {
+        "log-driver": "json-file",
+        "log-opts": { [option]: "service" },
+      };
+      const content = `${JSON.stringify(original, null, 2)}\n\n`;
+      const result = logsFixture(t, { content, driver: "json-file" }).run({
+        engineVersion,
+      });
+      assert.equal(result.status, 1, result.stderr);
+      assert.ok(result.stderr.includes(`('${option}')`), result.stderr);
+      assert.ok(result.stderr.includes(reason), result.stderr);
+      assert.match(result.stderr, /require Docker Engine 29\.5\.0 or newer/);
+      assert.equal(result.read(), content);
+      assert.deepEqual(result.calls, [queryEngineVersion]);
+      assert.deepEqual(result.leftovers(), []);
+    }
+  },
+);
+
+test(
+  "configure-docker-logs compares Engine version components numerically",
+  { skip },
+  (t) => {
+    const original = {
+      "log-driver": "json-file",
+      "log-opts": { "labels-regex": "^service$", "cache-env-regex": "^APP_" },
+    };
+    const result = logsFixture(t, {
+      content: JSON.stringify(original),
+      driver: "json-file",
+    }).run({ engineVersion: "29.10.0" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.read()), {
+      ...original,
+      "log-driver": "local",
+    });
+    assert.deepEqual(result.calls, [
+      queryEngineVersion,
+      restartDocker,
+      queryLogDriver,
+    ]);
+  },
+);
+
+test(
+  "configure-docker-logs switches with baseline options without an Engine probe",
+  { skip },
+  (t) => {
+    const original = {
+      "log-driver": "json-file",
+      "log-opts": { "max-size": "10m", "cache-max-size": "10m" },
+    };
+    const result = logsFixture(t, {
+      content: JSON.stringify(original),
+      driver: "json-file",
+    }).run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.read()), {
+      ...original,
+      "log-driver": "local",
+    });
+    assert.deepEqual(result.calls, [restartDocker, queryLogDriver]);
   },
 );
 

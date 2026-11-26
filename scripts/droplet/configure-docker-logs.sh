@@ -18,7 +18,8 @@
 #     `local`: leave it byte for byte as it is.
 #   - The file is a JSON object with another `log-driver` value or none: set
 #     the key and keep every other setting. If a retained logging option
-#     key is unsupported by `local`, exit before writing or restarting.
+#     key is unsupported by `local` on the installed Docker Engine, exit
+#     before writing or restarting.
 #   - The file is not valid JSON, or valid JSON that is not an object: print
 #     a diagnostic and exit non-zero before it writes a file or restarts
 #     Docker.
@@ -55,7 +56,9 @@ status=0
 python3 - "$config" << 'PY' || status=$?
 import json
 import os
+import re
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -73,6 +76,27 @@ def fail(message):
 
 def reject_constant(literal):
     raise ValueError(f"unexpected literal {literal}")
+
+
+def docker_ce_version():
+    try:
+        # The standard Docker CE systemd unit starts this binary. The Docker
+        # client and the currently running daemon can have different versions.
+        output = subprocess.check_output(
+            ["/usr/bin/dockerd", "--version"],
+            stderr=subprocess.DEVNULL,
+            encoding="utf-8",
+            timeout=5,
+        )
+        match = re.fullmatch(
+            r"Docker version ([0-9]+)\.([0-9]+)\.([0-9]+), build \S+",
+            output.strip(),
+        )
+        if match:
+            return tuple(map(int, match.groups()))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return None
 
 
 try:
@@ -105,14 +129,14 @@ if options is not None:
     # Match Moby's local.LogOptKeys and the built-in keys that
     # logger.ValidateLogOpts filters out, including the dual-logging cache
     # keys registered by logger/loggerutils/cache.
-    local_keys = {
-        "max-file", "max-size", "compress",
-        "labels", "labels-regex", "env", "env-regex", "tag",
-    }
+    baseline_local_keys = {"max-file", "max-size", "compress"}
+    attribute_keys = {"labels", "labels-regex", "env", "env-regex", "tag"}
+    versioned_keys = attribute_keys | {f"cache-{key}" for key in attribute_keys}
     supported_keys = (
-        local_keys
+        baseline_local_keys
+        | {f"cache-{key}" for key in baseline_local_keys}
         | {"mode", "max-buffer-size", "cache-disabled"}
-        | {f"cache-{key}" for key in local_keys}
+        | versioned_keys
     )
     unsupported = options.keys() - supported_keys
     if unsupported:
@@ -121,6 +145,23 @@ if options is not None:
             f"{path} has log-opts keys unsupported by the local log driver ({keys}). "
             "Review log-opts before rerunning provisioning."
         )
+    needs_version_check = options.keys() & versioned_keys
+    if needs_version_check:
+        # Docker Engine 29.5.0 added these keys to the local driver's allowlist
+        # and the matching cache keys to the dual-logging cache validator.
+        version = docker_ce_version()
+        if version is None or version < (29, 5, 0):
+            keys = ", ".join(repr(key) for key in sorted(needs_version_check))
+            reason = (
+                "could not verify a stable release from /usr/bin/dockerd --version"
+                if version is None
+                else f"found Docker Engine {'.'.join(map(str, version))}"
+            )
+            fail(
+                f"{path} has local log-opts keys ({keys}) that require "
+                f"Docker Engine 29.5.0 or newer ({reason}). "
+                "Review log-opts before rerunning provisioning."
+            )
 
 config["log-driver"] = "local"
 content = (json.dumps(config, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
