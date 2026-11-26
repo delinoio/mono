@@ -18,7 +18,7 @@
         "references/indexing.md": "609fdceeeba6b01246ccb599b9761d0346281e3d015ab87d782293ea585d0813",
         "references/memory-management-ops.md": "254473cffe6b6d61c24de3bb993f142462a54612bb7e4fbfbfd1ded9ed39747d",
         "references/monitoring.md": "006c6992f882a223e4da36d8dc65393849f0f5387317f81b5f11165967680ca9",
-        "references/mvcc-transactions.md": "d852c5104a815ceb631fe13062da627f6de07a8592be5b45e855cc3a7f777958",
+        "references/mvcc-transactions.md": "c7fdee938cfbfa9bf5ebfe5ff0e6ea4a942eef2533bdf86edb96756e00eabbd8",
         "references/mvcc-vacuum.md": "836a24743b6f0fb088ac36a8c35f2e487fd56b4bc0ba61552348f360704a20bf",
         "references/optimization-checklist.md": "7babe582af123bc5e9772cb4c311914093a07faf3a18aa4d0ff8f85abc673c99",
         "references/partitioning.md": "35b36d2e843b38383f3939e1bbaf77744f3d3f94e1ce51794b73b42270d2ba70",
