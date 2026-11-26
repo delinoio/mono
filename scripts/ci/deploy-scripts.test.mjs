@@ -2387,6 +2387,7 @@ const httpArgs = [
 ];
 
 const accountsArgs = ["accounts-api", ...httpArgs.slice(1)];
+const sandrunArgs = ["sandrun-api", ...httpArgs.slice(1)];
 
 // Runs droplet-deploy.sh the way deploy-targets.sh does (`bash -s` with the
 // script on standard input) against stubbed `docker` and `curl`. `old` lists
@@ -2624,10 +2625,7 @@ test(
       result.calls.find((call) => call.startsWith("docker exec")),
       /^docker exec caddy caddy reload --config \/etc\/caddy\/Caddyfile --adapter caddyfile$/,
     );
-    assert.match(
-      result.calls.find((call) => call.startsWith("docker stop")),
-      / old1$/,
-    );
+    assert.ok(result.calls.includes("docker stop --time 30 old1"));
     const route = result.read("caddy/sites/api.caddy");
     assert.match(route, /^api\.example\.com \{$/m);
     assert.equal(route.includes(`reverse_proxy ${alias}:8080 {`), true, route);
@@ -2817,6 +2815,138 @@ test(
       ),
     );
     assert.ok(!result.calls.some((call) => call.startsWith("docker rm ")));
+  },
+);
+
+test(
+  "droplet deploy publishes the SandRun route and image state before stopping the outgoing container",
+  { skip: skipDroplet },
+  (t) => {
+    for (const [image, current, env, timeout] of [
+      [dropletImage, olderImage, {}, 80],
+      [olderImage, dropletImage, {}, 80],
+      [olderImage, dropletImage, { DROPLET_STOP_TIMEOUT: "00090" }, 90],
+    ]) {
+      const result = runDroplet(
+        t,
+        [sandrunArgs[0], image, ...httpArgs.slice(2)],
+        {
+          old: ["old1"],
+          state: `${current}\n`,
+          previous: `${image}\n`,
+          env,
+          stubs: { mv: 'exec /bin/mv "$@"' },
+        },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      const reload = result.calls.findIndex((call) =>
+        call.startsWith("docker exec caddy "),
+      );
+      const writePrevious = result.calls.findIndex(
+        (call) =>
+          call.startsWith("mv ") &&
+          call.endsWith("/state/sandrun-api.previous"),
+      );
+      const writeCurrent = result.calls.findIndex(
+        (call) =>
+          call.startsWith("mv ") && call.endsWith("/state/sandrun-api.current"),
+      );
+      const stop = result.calls.indexOf(`docker stop --time ${timeout} old1`);
+      assert.ok(
+        reload >= 0 &&
+          reload < writePrevious &&
+          writePrevious < writeCurrent &&
+          writeCurrent < stop,
+        result.calls.join("\n"),
+      );
+      assert.equal(result.read("state/sandrun-api.current"), `${image}\n`);
+      assert.equal(result.read("state/sandrun-api.previous"), `${current}\n`);
+    }
+  },
+);
+
+test(
+  "droplet deploy rejects invalid SandRun stop timeouts before any change",
+  { skip: skipDroplet },
+  (t) => {
+    const route = "# old route\n";
+    for (const timeout of ["", "79", "80s", "9223372037"]) {
+      const result = runDroplet(t, sandrunArgs, {
+        old: ["old1"],
+        route,
+        state: `${olderImage}\n`,
+        previous: `${oldestImage}\n`,
+        env: { DROPLET_STOP_TIMEOUT: timeout },
+      });
+      assert.equal(result.status, 1, JSON.stringify(timeout));
+      assert.match(
+        result.stderr,
+        /DROPLET_STOP_TIMEOUT for sandrun-api must be a whole number of seconds from 80 to 9223372036/,
+      );
+      assert.deepEqual(result.calls, [""]);
+      assert.equal(result.read("state/sandrun-api.lock"), undefined);
+      assert.equal(result.read("state/.proxy.lock"), undefined);
+      assert.equal(result.read("caddy/sites/sandrun-api.caddy"), route);
+      assert.equal(result.read("state/sandrun-api.current"), `${olderImage}\n`);
+      assert.equal(
+        result.read("state/sandrun-api.previous"),
+        `${oldestImage}\n`,
+      );
+    }
+  },
+);
+
+test(
+  "droplet deploy stops failed SandRun replacements and preserves the serving route and state",
+  { skip: skipDroplet },
+  (t) => {
+    const route = "# old route\n";
+    for (const [env, timeout, diagnostic] of [
+      [{ STUB_HEALTHY: "0" }, 80, /did not pass the health check/],
+      [{ STUB_RELOAD: "1" }, 80, /the route of sandrun-api was not switched/],
+      [
+        { STUB_RELOAD: "1", DROPLET_STOP_TIMEOUT: "0009223372036" },
+        9223372036,
+        /the route of sandrun-api was not switched/,
+      ],
+      [
+        { STUB_RELOAD: "1", STUB_STOP_FAIL: "sandrun-api-*" },
+        80,
+        /the route of sandrun-api was not switched/,
+      ],
+    ]) {
+      const result = runDroplet(t, sandrunArgs, {
+        route,
+        old: ["old1"],
+        state: `${olderImage}\n`,
+        previous: `${oldestImage}\n`,
+        env,
+      });
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, diagnostic);
+      const run = result.calls.find((call) => call.startsWith("docker run "));
+      const replacement = run.match(/--name (sandrun-api-\S+)/)[1];
+      const stop = `docker stop --time ${timeout} ${replacement}`;
+      const cleanup = result.calls.filter(
+        (call) =>
+          call.startsWith("docker stop ") || call.startsWith("docker rm "),
+      );
+      if (env.STUB_STOP_FAIL) {
+        assert.deepEqual(cleanup, [stop]);
+        assert.match(
+          result.stderr,
+          /docker stop failed for the replacement sandrun-api-.*; it was not removed/,
+        );
+      } else {
+        assert.deepEqual(cleanup, [stop, `docker rm ${replacement}`]);
+      }
+      assert.equal(result.read("caddy/sites/sandrun-api.caddy"), route);
+      assert.equal(result.read("state/sandrun-api.current"), `${olderImage}\n`);
+      assert.equal(
+        result.read("state/sandrun-api.previous"),
+        `${oldestImage}\n`,
+      );
+    }
   },
 );
 

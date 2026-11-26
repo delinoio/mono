@@ -99,9 +99,11 @@
 #                           from 0 to 9223372036 (unset or empty: 120).
 #                           Inspections, probes and retries share this deadline.
 #   DROPLET_STOP_TIMEOUT    seconds between SIGTERM and SIGKILL. Accounts API
-#                           defaults to 60 and requires at least 60 for old
-#                           containers and failed replacements. Other
-#                           services default to 30 for old containers.
+#                           defaults to 60 and SandRun API defaults to 80 for
+#                           outgoing containers and failed replacements.
+#                           Overrides for these services accept whole decimal
+#                           seconds from the service default to 9223372036.
+#                           Other services default to 30 for outgoing containers.
 #   DROPLET_LOCK_TIMEOUT    seconds to wait for a running deployment of the
 #                           same service to finish before the script gives up
 #                           without a change (default 600).
@@ -184,13 +186,18 @@ main() {
   health_timeout="${BASH_REMATCH[1]}"
   local stop_timeout="${DROPLET_STOP_TIMEOUT:-30}"
   local replacement_stop_timeout=""
-  if [[ "$service" == accounts-api ]]; then
-    stop_timeout="${DROPLET_STOP_TIMEOUT-60}"
+  local minimum_stop_timeout=""
+  case "$service" in
+    accounts-api) minimum_stop_timeout=60 ;;
+    sandrun-api) minimum_stop_timeout=80 ;;
+  esac
+  if [[ -n "$minimum_stop_timeout" ]]; then
+    stop_timeout="${DROPLET_STOP_TIMEOUT-$minimum_stop_timeout}"
     # Capture decimal digits without leading zeros for Bash and Docker. The
     # upper bound keeps Docker's conversion to a nanosecond duration in range.
     if [[ ! "$stop_timeout" =~ ^0*([1-9][0-9]{0,9})$ ]] ||
-      (( BASH_REMATCH[1] < 60 || BASH_REMATCH[1] > 9223372036 )); then
-      fail "DROPLET_STOP_TIMEOUT for accounts-api must be a whole number of seconds from 60 to 9223372036."
+      (( BASH_REMATCH[1] < minimum_stop_timeout || BASH_REMATCH[1] > 9223372036 )); then
+      fail "DROPLET_STOP_TIMEOUT for $service must be a whole number of seconds from $minimum_stop_timeout to 9223372036."
     fi
     stop_timeout="${BASH_REMATCH[1]}"
     replacement_stop_timeout="$stop_timeout"
@@ -547,7 +554,7 @@ discard_replacement() {
     docker rm --force "$replacement" > /dev/null || true
     return 0
   fi
-  # A running Accounts replacement can start a charge before it serves
+  # Accounts and SandRun can start background workers before they serve
   # traffic. If graceful stop fails, leave the container for cleanup.
   if ! docker stop --time "$stop_timeout" "$replacement" > /dev/null; then
     echo "::error::docker stop failed for the replacement $replacement; it was not removed." >&2
