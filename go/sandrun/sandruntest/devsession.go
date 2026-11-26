@@ -211,11 +211,21 @@ func (d *devSessionService) ListDevSessions(_ context.Context, req *connect.Requ
 	if _, err := s.requireOrg(m.GetOrganizationId()); err != nil {
 		return nil, err
 	}
+	ownerID := ""
+	if owner, ok := m.GetOwner().(*sandrunv1.ListDevSessionsRequest_OwnerUserId); ok {
+		ownerID = owner.OwnerUserId
+		if ownerID == "" {
+			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid owner_user_id: is empty"))
+		}
+	}
 	profileID, err := normalizeListProfileID(m.GetRunnerProfileId())
 	if err != nil {
 		return nil, err
 	}
-	states := listStates(m.GetStates(), openRequestStates, m.GetIncludeEnded())
+	states, err := listStates(m.GetStates(), openRequestStates, m.GetIncludeEnded(), "RequestState", sandrunv1.RequestState_name)
+	if err != nil {
+		return nil, err
+	}
 	var mine []*sandrunv1.DevSession
 	for _, x := range s.sessions {
 		if x.GetOrganizationId() != m.GetOrganizationId() || (profileID != "" && x.GetRunnerProfileId() != profileID) {
@@ -224,7 +234,7 @@ func (d *devSessionService) ListDevSessions(_ context.Context, req *connect.Requ
 		if m.GetOwnedByCaller() && x.GetOwnerUserId() != s.UserID {
 			continue
 		}
-		if o := m.GetOwnerUserId(); o != "" && x.GetOwnerUserId() != o {
+		if ownerID != "" && x.GetOwnerUserId() != ownerID {
 			continue
 		}
 		if len(states) > 0 && !slices.Contains(states, x.GetState()) {
