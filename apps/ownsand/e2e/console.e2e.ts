@@ -311,6 +311,24 @@ describe("API keys", () => {
     await expect(screen.getByText("nightly-ci · Active")).toBeVisible();
     await expect(screen.getByRole("button", "Create API key")).toBeFocused();
   });
+
+  test("shows the revoked key and removes its Revoke action", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    const revoke = screen.getByRole("button", /^Revoke API key ci-runner/);
+    await revoke.tap();
+    await screen
+      .getByRole("alertdialog", "Revoke ci-runner?")
+      .getByRole("button", "Revoke key")
+      .tap();
+
+    await expect(screen.getByText("ci-runner · Revoked")).toBeVisible();
+    await expect(revoke).toBeHidden();
+  });
 });
 
 describe("devices", () => {
@@ -352,7 +370,7 @@ describe("devices", () => {
     await expect(disk).toHaveValue("600");
   });
 
-  test("removes a device and drops it from the device list", async ({
+  test("returns to Devices while the removed device refresh is pending", async ({
     app,
     screen,
     browser,
@@ -367,21 +385,45 @@ describe("devices", () => {
     await screen.getByRole("button", "Remove device").tap();
     const dialog = screen.getByRole("alertdialog", "Remove build-box-1?");
     await expect(dialog).toBeVisible();
-    await dialog.getByRole("button", "Remove device").tap();
+    const entries = await browser.evaluate(() => {
+      sessionStorage.setItem("ownsand-e2e-device-readback", "hold");
+      sessionStorage.setItem("ownsand-e2e-tracked-mutation", "RemoveDevice");
+      return history.length;
+    });
 
-    // The console returns to the device list. The mock API omits a removed
-    // device from a list request that sets no state, like the real API.
-    await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
-    const deviceList = screen.getByRole("region", "Device list");
-    await expect(
-      deviceList.getByRole("link", "studio-mac", { exact: true }),
-    ).toBeVisible();
-    await expect(
-      deviceList.getByText("Offline", { exact: true }),
-    ).toBeVisible();
-    await expect(
-      deviceList.getByRole("link", "build-box-1", { exact: true }),
-    ).toBeHidden();
+    try {
+      await dialog.getByRole("button", "Remove device").tap();
+      await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
+      // The mock API omits a removed device from a list request that sets no
+      // state, like the real API.
+      const deviceList = screen.getByRole("region", "Device list");
+      await expect(
+        deviceList.getByRole("link", "studio-mac", { exact: true }),
+      ).toBeVisible();
+      await expect(
+        deviceList.getByText("Offline", { exact: true }),
+      ).toBeVisible();
+      await expect(
+        deviceList.getByRole("link", "build-box-1", { exact: true }),
+      ).toBeHidden();
+      expect(
+        await browser.evaluate(() => ({
+          readback: sessionStorage.getItem("ownsand-e2e-device-readback"),
+          calls: sessionStorage.getItem("ownsand-e2e-mutation-calls"),
+          entries: history.length,
+        })),
+      ).toEqual({
+        readback: "held",
+        calls: JSON.stringify(["RemoveDevice"]),
+        entries: entries + 1,
+      });
+      await app.screenshot("devices-before-readback");
+    } finally {
+      await browser.evaluate(() => {
+        dispatchEvent(new Event("ownsand-e2e-device-readback-release"));
+        return null;
+      });
+    }
 
     await screen.getByRole("link", "Sandboxes", { exact: true }).tap();
     const sandbox = screen.getByRole("link", "0193a000…00a1");
@@ -404,35 +446,37 @@ describe("devices", () => {
     await app.open(`/orgs/${ACME}/enrollment-tokens`);
     await screen.getByRole("button", "Create token").tap();
     await screen.getByRole("dialog").getByRole("button", "Create token").tap();
-    await screen.getByRole("button", "Done").tap();
-    await expect(
-      screen.getByRole("dialog", "Your new enrollment token"),
-    ).toBeHidden();
-    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+    const result = screen.getByRole("dialog", "Your new enrollment token");
+    await expect(result).toBeVisible();
+    const prefix = await browser.evaluate(() =>
+      document.querySelector(".secret-value")!.textContent!.slice(0, 8),
+    );
+    expect(prefix).toMatch(/^ose_/);
+    await result.getByRole("button", "Done").tap();
+    await expect(result).toBeHidden();
+    await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
 
-    await screen
-      .getByRole("button", "Revoke enrollment token ose_", { exact: false })
-      .tap();
-    const dialog = screen.getByRole("alertdialog", "Revoke token ose_", {
-      exact: false,
-    });
+    const revoke = screen.getByRole(
+      "button",
+      `Revoke enrollment token ${prefix}`,
+      {
+        exact: true,
+      },
+    );
+    await expect(revoke).toBeVisible();
+    await revoke.tap();
+    const dialog = screen.getByRole("alertdialog", `Revoke token ${prefix}…?`);
     await expect(dialog).toBeVisible();
     await expect(dialog.getByRole("button", "Cancel")).toBeFocused();
-    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
 
     await browser.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
-    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+    await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
 
-    await screen
-      .getByRole("button", "Revoke enrollment token ose_", { exact: false })
-      .tap();
-    await screen
-      .getByRole("alertdialog", "Revoke token ose_", { exact: false })
-      .getByRole("button", "Revoke token")
-      .tap();
+    await revoke.tap();
+    await dialog.getByRole("button", "Revoke token").tap();
     await expect(screen.getByText("The token is revoked.")).toBeVisible();
-    await expect(screen.getByText("Not used", { exact: false })).toBeHidden();
+    await expect(revoke).toBeHidden();
   });
 
   test("moves the focus to the page heading after a confirmed removal", async ({

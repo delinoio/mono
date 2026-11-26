@@ -16,12 +16,16 @@ import {
   type ListInvitationsResponse,
   type RevokeInvitationRequest,
 } from "@delino/ownsand-protos/v1/member_pb";
-import { SnapshotExportState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  SandboxState,
+  SnapshotExportState,
+} from "@delino/ownsand-protos/v1/common_pb";
 import type { CreateOrganizationResponse } from "@delino/ownsand-protos/v1/organization_pb";
 import {
   CreateSandboxRequestSchema,
   type CreateSandboxRequest,
   type CreateSandboxResponse,
+  type ListSandboxesResponse,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import type {
   ListSnapshotsResponse,
@@ -86,7 +90,7 @@ function recordToken(key: string, token: string) {
   sessionStorage.setItem(key, JSON.stringify([...tokens, token]));
 }
 
-function holdCredentialRequest(name: "create" | "list") {
+function holdCredentialRequest(name: "create" | "list" | "refresh") {
   const key = `ownsand-e2e-credential-${name}`;
   if (sessionStorage.getItem(key) === "release") return Promise.resolve();
   return new Promise<void>((resolve) => {
@@ -119,11 +123,32 @@ export function createMockTransport(): Transport {
   const credentialList = sessionStorage.getItem(
     "ownsand-e2e-credential-method",
   );
-  const credentialCreate =
-    credentialList === "ListApiKeys" ? "CreateApiKey" : "CreateEnrollmentToken";
-  const credentialField =
-    credentialList === "ListApiKeys" ? "apiKeys" : "tokens";
+  const credentialMethods = {
+    ListApiKeys: {
+      create: "CreateApiKey",
+      rows: "apiKeys",
+      secret: "apiKeySecret",
+      fixture: "osk_fixture",
+    },
+    ListEnrollmentTokens: {
+      create: "CreateEnrollmentToken",
+      rows: "tokens",
+      secret: "enrollmentToken",
+      fixture: "ose_fixture",
+    },
+    ListInvitations: {
+      create: "CreateInvitation",
+      rows: "invitations",
+      secret: "invitationSecret",
+      fixture: "osi_fixture",
+    },
+  };
+  const credential =
+    credentialMethods[credentialList as keyof typeof credentialMethods];
+  const holdRefresh =
+    sessionStorage.getItem("ownsand-e2e-credential-hold-refresh") === "true";
   let credentialCreated = false;
+  let heldRefresh = false;
   const createResponse = sessionStorage.getItem("ownsand-e2e-create-response");
   const creates: { request: string; sandboxId: string }[] = [];
   // Seed enough rows to split the selected list across two pages.
@@ -155,6 +180,23 @@ export function createMockTransport(): Transport {
       ) {
         recordToken("ownsand-e2e-mutation-calls", method.name);
       }
+      const deviceReadback = "ownsand-e2e-device-readback";
+      if (
+        method.name === "GetDevice" &&
+        sessionStorage.getItem(deviceReadback) === "hold"
+      ) {
+        await new Promise<void>((resolve) => {
+          window.addEventListener(
+            `${deviceReadback}-release`,
+            () => resolve(),
+            {
+              once: true,
+            },
+          );
+          sessionStorage.setItem(deviceReadback, "held");
+        });
+        sessionStorage.setItem(deviceReadback, "released");
+      }
       if (method.name === refreshList) {
         const code = sessionStorage.getItem("ownsand-e2e-refresh-error");
         const { pageToken } = input as { pageToken?: string };
@@ -165,7 +207,7 @@ export function createMockTransport(): Transport {
           );
         }
       }
-      if (credentialList !== null && method.name === credentialCreate) {
+      if (credential && method.name === credential.create) {
         await holdCredentialRequest("create");
         if (sessionStorage.getItem("ownsand-e2e-credential-create-fails")) {
           throw new ConnectError(
@@ -182,10 +224,16 @@ export function createMockTransport(): Transport {
           contextValues,
         );
         credentialCreated = true;
-        return response;
+        return {
+          ...response,
+          message: {
+            ...response.message,
+            [credential.secret]: credential.fixture,
+          },
+        };
       }
-      if (method.name === credentialList) {
-        const hold = !credentialCreated;
+      if (credential && method.name === credentialList) {
+        const afterCreate = credentialCreated;
         const response = await base.unary(
           method,
           signal,
@@ -198,7 +246,15 @@ export function createMockTransport(): Transport {
         if (signal?.aborted) return response;
         const token = (input as typeof input & { pageToken: string }).pageToken;
         recordToken("ownsand-e2e-credential-tokens", token);
-        if (!hold) return response;
+        if (holdRefresh) {
+          if (afterCreate && !heldRefresh) {
+            heldRefresh = true;
+            await holdCredentialRequest("refresh");
+            throw new ConnectError("Synthetic refresh failure", Code.Internal);
+          }
+          return response;
+        }
+        if (afterCreate) return response;
 
         // Deliver the empty pre-create page even if the client cancels it.
         await holdCredentialRequest("list");
@@ -207,7 +263,7 @@ export function createMockTransport(): Transport {
           ...response,
           message: {
             ...response.message,
-            [credentialField]: [],
+            [credential.rows]: [],
             nextPageToken: "",
           },
         };
@@ -575,6 +631,13 @@ export function createMockTransport(): Transport {
         { ...request, pageToken: "" },
         contextValues,
       );
+      if (
+        methodName === "ListSandboxes" &&
+        sessionStorage.getItem("ownsand-e2e-sandbox-creating") === "true"
+      ) {
+        const { sandboxes } = response.message as ListSandboxesResponse;
+        sandboxes[0]!.state = SandboxState.CREATING;
+      }
       const rows = (response.message as unknown as Record<string, unknown[]>)[
         field
       ]!;

@@ -11,7 +11,11 @@ const paginationTest = test.extend<{
     open(
       method: string,
       path: string,
-      options?: { hold?: boolean; failFirstSandboxPage?: boolean },
+      options?: {
+        hold?: boolean;
+        failFirstSandboxPage?: boolean;
+        creatingSandbox?: boolean;
+      },
     ): Promise<void>;
     release(code: Code): Promise<void>;
     allowRetry(): Promise<void>;
@@ -23,7 +27,11 @@ const paginationTest = test.extend<{
       async open(
         method,
         path,
-        { hold = true, failFirstSandboxPage = false } = {},
+        {
+          hold = true,
+          failFirstSandboxPage = false,
+          creatingSandbox = false,
+        } = {},
       ) {
         await app.open("/");
         await screen.getByRole("button", "Sign in with Delino").tap();
@@ -31,7 +39,7 @@ const paginationTest = test.extend<{
           screen.getByRole("link", "Acme Robotics Owner"),
         ).toBeVisible();
         await browser.evaluate(
-          ({ name, hold, failFirstSandboxPage }) => {
+          ({ name, hold, failFirstSandboxPage, creatingSandbox }) => {
             sessionStorage.setItem("ownsand-e2e-paged-list", name);
             if (hold) sessionStorage.setItem("ownsand-e2e-page-error", "hold");
             if (failFirstSandboxPage) {
@@ -40,9 +48,12 @@ const paginationTest = test.extend<{
                 "true",
               );
             }
+            if (creatingSandbox) {
+              sessionStorage.setItem("ownsand-e2e-sandbox-creating", "true");
+            }
             return true;
           },
-          { name: method, hold, failFirstSandboxPage },
+          { name: method, hold, failFirstSandboxPage, creatingSandbox },
         );
         await app.open(path);
       },
@@ -112,33 +123,56 @@ describe("sandbox pagination errors", () => {
   }
 
   paginationTest(
-    "keeps sandbox rows during a continuation error and retries the same token",
-    async ({ app, pagedList, screen }) => {
-      await pagedList.open("ListSandboxes", path);
+    "pauses sandbox polling until the failed continuation succeeds",
+    async ({ app, browser, pagedList, screen }) => {
+      await pagedList.open("ListSandboxes", path, { creatingSandbox: true });
       const list = screen.getByRole("region", "Sandbox list");
       const more = screen.getByRole("button", "Show more");
       const error = screen.getByText("Something went wrong. Try again.");
       await expect(more).toBeVisible();
-      const initialRequests = await pagedList.tokens();
+      await expect(list.getByRole("cell", "Creating")).toBeVisible();
       await more.tap();
       await pagedList.release(Code.Internal);
 
       await expect(error).toBeVisible();
+      const failedRequests = await pagedList.tokens();
+      expect(failedRequests.at(-1)).toBe("e2e-next-page");
+      // Let two three-second intervals elapse in the running app.
+      await browser.evaluate(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 6_100));
+        return true;
+      });
+      expect(await pagedList.tokens()).toEqual(failedRequests);
+      await expect(error).toBeVisible();
       await expect(list.getByRole("link")).toHaveCount(1);
       await expect(more).toBeVisible();
+      const retry = screen.getByRole("button", "Try again");
+      await expect(retry).toBeVisible();
       await app.screenshot("sandbox-continuation-error");
 
+      await retry.tap();
+      await expect
+        .poll(() => pagedList.tokens())
+        .toEqual([...failedRequests, "e2e-next-page"]);
+      await expect(retry).toBeVisible();
+      await expect(list.getByRole("link")).toHaveCount(1);
+
       await pagedList.allowRetry();
-      await screen.getByRole("button", "Try again").tap();
+      await retry.tap();
       await expect(list.getByRole("link")).toHaveCount(3);
       await expect(error).toHaveCount(0);
       await expect(more).toHaveCount(0);
-      expect(await pagedList.tokens()).toEqual([
-        ...initialRequests,
-        "e2e-next-page",
-        "e2e-next-page",
-      ]);
       await app.screenshot("sandbox-continuation-recovered");
+      await expect
+        .poll(() => pagedList.tokens(), { timeout: 5_000 })
+        .toEqual([
+          ...failedRequests,
+          "e2e-next-page",
+          "e2e-next-page",
+          "",
+          "e2e-next-page",
+        ]);
+      await expect(list.getByRole("link")).toHaveCount(3);
     },
   );
 

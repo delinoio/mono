@@ -8,6 +8,7 @@ import {
   BillingService,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import {
+  ApiKeyState,
   BaseImage,
   BillingReason,
   DeviceState,
@@ -1415,6 +1416,63 @@ describe("mock enrollment token list paging", () => {
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ConnectError);
     expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+  });
+});
+
+describe("mock API key revocation", () => {
+  const organizationId = MOCK_IDS.acme;
+
+  afterEach(() => {
+    rs.useRealTimers();
+  });
+
+  test("keeps the first revocation time in a retry and a later list", async () => {
+    const client = createClient(ApiKeyService, createMockTransport());
+    const { apiKey } = await client.createApiKey({
+      organizationId,
+      name: "revocation test",
+    });
+    expect(apiKey?.state).toBe(ApiKeyState.ACTIVE);
+    const apiKeyId = apiKey!.apiKeyId;
+    const firstTime = Date.UTC(2026, 0, 1);
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(firstTime);
+
+    const first = await client.revokeApiKey({ organizationId, apiKeyId });
+    expect(first.apiKey).toMatchObject({
+      state: ApiKeyState.REVOKED,
+      revokeTime: timestampFromMs(firstTime),
+    });
+
+    rs.setSystemTime(firstTime + 1_000);
+    const retry = await client.revokeApiKey({ organizationId, apiKeyId });
+    expect(retry.apiKey).toMatchObject({
+      state: ApiKeyState.REVOKED,
+      revokeTime: timestampFromMs(firstTime),
+    });
+    const { apiKeys } = await client.listApiKeys({ organizationId });
+    expect(
+      apiKeys.find((key) => key.apiKeyId === apiKeyId)?.revokeTime,
+    ).toEqual(timestampFromMs(firstTime));
+  });
+
+  test("returns NotFound when an owner revokes an unknown key", async () => {
+    const owner = createClient(ApiKeyService, createMockTransport());
+    await expect(
+      owner.revokeApiKey({ organizationId, apiKeyId: uuidV7() }),
+    ).rejects.toMatchObject({ code: Code.NotFound });
+  });
+
+  test("rejects a member revoking a seeded key", async () => {
+    const owner = createClient(ApiKeyService, createMockTransport());
+    const member = createClient(
+      ApiKeyService,
+      createMockTransport({ userId: "user-member-ada" }),
+    );
+    const { apiKeys } = await owner.listApiKeys({ organizationId });
+    await expect(
+      member.revokeApiKey({ organizationId, apiKeyId: apiKeys[0]!.apiKeyId }),
+    ).rejects.toMatchObject({ code: Code.PermissionDenied });
   });
 });
 
