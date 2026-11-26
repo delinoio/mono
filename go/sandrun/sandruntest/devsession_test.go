@@ -26,6 +26,44 @@ import (
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
 )
 
+func TestCreateDevSessionLabelLength(t *testing.T) {
+	s := New()
+	t.Cleanup(s.Close)
+	org := s.AddOrganization("label test").GetOrganizationId()
+	profile := s.AddDevSessionProfile(org, "label", sandrunv1.GuestOs_GUEST_OS_LINUX, t.TempDir())
+	client := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+
+	for _, tt := range []struct {
+		name        string
+		label       string
+		wantInvalid bool
+	}{
+		{name: "34 multibyte code points", label: strings.Repeat("한", 34)},
+		{name: "100 multibyte code points", label: strings.Repeat("한", 100)},
+		{name: "101 multibyte code points", label: strings.Repeat("한", 101), wantInvalid: true},
+		{name: "100 ASCII code points", label: strings.Repeat("a", 100)},
+		{name: "101 ASCII code points", label: strings.Repeat("a", 101), wantInvalid: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := client.CreateDevSession(t.Context(), listTestRequest(&sandrunv1.CreateDevSessionRequest{
+				OrganizationId: org, RunnerProfileId: profile.GetRunnerProfileId(), Label: tt.label,
+			}))
+			if tt.wantInvalid {
+				if connect.CodeOf(err) != connect.CodeInvalidArgument {
+					t.Fatalf("CreateDevSession error = %v, want invalid_argument", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := res.Msg.GetDevSession().GetLabel(); got != tt.label {
+				t.Errorf("label = %q, want %q", got, tt.label)
+			}
+		})
+	}
+}
+
 func TestWriteDevSessionFileRejectsInvalidOffsets(t *testing.T) {
 	const writeID, fileName = "write-offset", "out.txt"
 	workspace := t.TempDir()
@@ -116,6 +154,73 @@ func TestWriteDevSessionFileRejectsInvalidOffsets(t *testing.T) {
 	}
 	if string(data) != "abcdefghi" {
 		t.Errorf("got file contents %q, want abcdefghi", data)
+	}
+}
+
+func TestDevSessionRunnerID(t *testing.T) {
+	const running = sandrunv1.RequestState_REQUEST_STATE_RUNNING
+	for _, tt := range []struct {
+		name  string
+		state sandrunv1.RequestState
+	}{
+		{"queued", sandrunv1.RequestState_REQUEST_STATE_QUEUED},
+		{"starting", sandrunv1.RequestState_REQUEST_STATE_STARTING},
+		{"running", running},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New()
+			t.Cleanup(s.Close)
+			s.NewSessionState = tt.state
+			s.PromoteAfterGets = 2
+			org := s.AddOrganization("runner ID test").GetOrganizationId()
+			profile := s.AddDevSessionProfile(org, "linux", sandrunv1.GuestOs_GUEST_OS_LINUX, t.TempDir())
+			client := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+			ctx := t.Context()
+			created, err := client.CreateDevSession(ctx, listTestRequest(&sandrunv1.CreateDevSessionRequest{
+				OrganizationId: org, RunnerProfileId: profile.GetRunnerProfileId(),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := created.Msg.GetDevSession()
+			sessionID := session.GetDevSessionId()
+			get := func() *sandrunv1.DevSession {
+				t.Helper()
+				res, err := client.GetDevSession(ctx, listTestRequest(&sandrunv1.GetDevSessionRequest{
+					OrganizationId: org, DevSessionId: sessionID,
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return res.Msg.GetDevSession()
+			}
+			if tt.state != running {
+				for _, pending := range []*sandrunv1.DevSession{session, get()} {
+					if pending.GetState() != tt.state || pending.GetRunnerId() != "" || pending.GetStartedAt() != nil {
+						t.Fatalf("expected pending session in state %v without a runner ID or start time, got %v", tt.state, pending)
+					}
+				}
+				session = get()
+			}
+			runnerID := session.GetRunnerId()
+			if session.GetState() != running || runnerID == "" || session.GetStartedAt() == nil {
+				t.Fatalf("expected a running session with a runner ID and start time, got %v", session)
+			}
+			if got := get().GetRunnerId(); got != runnerID {
+				t.Errorf("subsequent get returned runner ID %q, want %q", got, runnerID)
+			}
+			listed, err := client.ListDevSessions(ctx, listTestRequest(&sandrunv1.ListDevSessionsRequest{OrganizationId: org}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sessions := listed.Msg.GetDevSessions()
+			if len(sessions) != 1 || sessions[0].GetDevSessionId() != sessionID {
+				t.Fatalf("expected only session %q, got %v", sessionID, sessions)
+			}
+			if got := sessions[0].GetRunnerId(); got != runnerID {
+				t.Errorf("list returned runner ID %q, want %q", got, runnerID)
+			}
+		})
 	}
 }
 
@@ -407,8 +512,8 @@ func TestExecRequestPath(t *testing.T) {
 			}
 			return
 		}
-		if exited := final.GetExited(); exited == nil || exited.GetExitCode() != 0 {
-			t.Fatalf("got %v, want exit code 0", final)
+		if !hasExplicitZeroExitCode(final) {
+			t.Fatalf("got %v, want Exited with explicit exit code 0", final)
 		}
 		var stdout strings.Builder
 		for _, event := range events {
@@ -541,8 +646,43 @@ func TestExecStreamEventLimitCountsTruncation(t *testing.T) {
 	}
 	events = attach(chunk.GetOffset() + int64(len(chunk.GetData())))
 	requireStarted(t, events, limit)
-	if exited := events[1].GetExited(); exited == nil || exited.GetExitCode() != 0 {
-		t.Fatalf("expected exit code 0, got %v", events[1])
+	if !hasExplicitZeroExitCode(events[1]) {
+		t.Fatalf("expected Exited with explicit exit code 0, got %v", events[1])
+	}
+}
+
+func hasExplicitZeroExitCode(event *sandrunv1.DevSessionExecEvent) bool {
+	status, ok := event.GetExited().GetStatus().(*sandrunv1.DevSessionExecExited_ExitCode)
+	return ok && status != nil && status.ExitCode == 0
+}
+
+func TestHasExplicitZeroExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		exited *sandrunv1.DevSessionExecExited
+		want   bool
+	}{
+		{name: "missing Exited"},
+		{name: "unset status", exited: &sandrunv1.DevSessionExecExited{}},
+		{name: "signal", exited: &sandrunv1.DevSessionExecExited{
+			Status: &sandrunv1.DevSessionExecExited_Signal{Signal: 15},
+		}},
+		{name: "nonzero code", exited: &sandrunv1.DevSessionExecExited{
+			Status: &sandrunv1.DevSessionExecExited_ExitCode{ExitCode: 7},
+		}},
+		{name: "explicit zero", exited: &sandrunv1.DevSessionExecExited{
+			Status: &sandrunv1.DevSessionExecExited_ExitCode{ExitCode: 0},
+		}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			event := &sandrunv1.DevSessionExecEvent{}
+			if tc.exited != nil {
+				event.Event = &sandrunv1.DevSessionExecEvent_Exited{Exited: tc.exited}
+			}
+			if got := hasExplicitZeroExitCode(event); got != tc.want {
+				t.Errorf("hasExplicitZeroExitCode(%v) = %t, want %t", event, got, tc.want)
+			}
+		})
 	}
 }
 

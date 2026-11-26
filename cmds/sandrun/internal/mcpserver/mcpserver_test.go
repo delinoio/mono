@@ -885,6 +885,73 @@ func TestSyncAndDownloadThroughTransferStatus(t *testing.T) {
 	}
 }
 
+func TestTransferStatusWhileSyncUploads(t *testing.T) {
+	needPOSIX(t)
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	repo := t.TempDir()
+	cmd := exec.Command("git", "-C", repo, "init", "-q")
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), bytes.Repeat([]byte("a"), sandrun.ChunkSize+1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	secondWrite := make(chan struct{})
+	paused, resume := context.WithCancel(t.Context())
+	defer resume()
+	var writes atomic.Int32
+	transport := toolDeadlineTransport(func(req *http.Request) (*http.Response, error) {
+		// At the second write, the SDK has reported the first archive chunk.
+		if req.URL.Path == sandrunv1connect.DevSessionServiceWriteDevSessionFileProcedure && writes.Add(1) == 2 {
+			close(secondWrite)
+			select {
+			case <-paused.Done():
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+	var h *harness
+	h = newHarness(t, Config{WorkDir: repo, Client: func(context.Context) (*sandrun.Client, error) {
+		return sandrun.New(sandrun.Options{BaseURL: h.srv.URL, APIKey: h.srv.APIKey,
+			HTTPClient: &http.Client{Transport: transport}})
+	}})
+	id := h.running()
+	var transfer transferResult
+	if text, isErr := h.call("sync", map[string]any{"session_id": id, "wait_seconds": 0}, &transfer); isErr || !transfer.Running || transfer.TransferID == "" {
+		t.Fatalf("sync = %q %+v", text, transfer)
+	}
+	select {
+	case <-secondWrite:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync did not reach its second archive chunk")
+	}
+
+	var status struct {
+		Running  bool                       `json:"running"`
+		Progress map[string]json.RawMessage `json:"progress"`
+	}
+	args := map[string]any{"transfer_id": transfer.TransferID, "wait_seconds": 0}
+	if text, isErr := h.call("transfer_status", args, &status); isErr || !status.Running {
+		t.Fatalf("transfer_status = %q %+v", text, status)
+	}
+	if string(status.Progress["phase"]) != `"uploading"` || string(status.Progress["bytes_done"]) != strconv.Itoa(sandrun.ChunkSize) {
+		t.Fatalf("upload progress = %s", status.Progress)
+	}
+	if _, ok := status.Progress["bytes_total"]; ok {
+		t.Fatalf("upload progress has bytes_total: %s", status.Progress)
+	}
+	resume()
+	if text, isErr := h.call("transfer_status", map[string]any{"transfer_id": transfer.TransferID}, &transfer); isErr || transfer.Running || transfer.Sync == nil || transfer.Sync.Uploaded != 1 {
+		t.Fatalf("completed transfer_status = %q %+v", text, transfer)
+	}
+}
+
 func TestErrorMapping(t *testing.T) {
 	h := newHarness(t, Config{})
 	if text, isErr := h.call("create_session", map[string]any{"profile": "missing"}, nil); !isErr || !strings.HasPrefix(text, "not_found") {

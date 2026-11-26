@@ -231,9 +231,15 @@ function dryRunDev(cwd) {
   return dry;
 }
 
-// Check the dry run and name each `dev` task that does not match the contract.
-function devTaskProblems(dry) {
+function devTaskProblems(cwd) {
+  const dry = dryRunDev(cwd);
+  const config = JSON.parse(readFileSync(join(cwd, "turbo.json"), "utf8"));
   const problems = [];
+  // Root pass-through entries apply to every task and are separate from each
+  // task's resolved passThroughEnv.
+  if (config.globalPassThroughEnv?.length > 0) {
+    problems.push("Root turbo.json globalPassThroughEnv must be empty");
+  }
   if (dry.envMode !== "strict") {
     problems.push(`envMode is ${dry.envMode}, expected strict`);
   }
@@ -278,7 +284,19 @@ function devTaskProblems(dry) {
 
 test("dev tasks pass only their documented variables through strict mode", (t) => {
   const cwd = copyTurboConfiguration(t);
-  assert.deepEqual(devTaskProblems(dryRunDev(cwd)), []);
+  assert.deepEqual(devTaskProblems(cwd), []);
+});
+
+test("adding a global pass-through entry fails and names the root setting", (t) => {
+  const cwd = copyTurboConfiguration(t);
+  const file = join(cwd, "turbo.json");
+  const config = JSON.parse(readFileSync(file, "utf8"));
+  config.globalPassThroughEnv = ["ADDR"];
+  writeFileSync(file, JSON.stringify(config));
+
+  assert.deepEqual(devTaskProblems(cwd), [
+    "Root turbo.json globalPassThroughEnv must be empty",
+  ]);
 });
 
 test("removing a pass-through entry fails and names the dev task", async (t) => {
@@ -322,7 +340,7 @@ test("removing a pass-through entry fails and names the dev task", async (t) => 
         (name) => name !== entry,
       );
       writeFileSync(file, JSON.stringify(config));
-      const problems = devTaskProblems(dryRunDev(cwd));
+      const problems = devTaskProblems(cwd);
       assert.ok(
         problems.some((problem) => problem.startsWith(taskId)),
         `expected a problem for ${taskId}, got ${JSON.stringify(problems)}`,

@@ -110,16 +110,16 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 		return nil, pr.failure(opProbe)
 	}
 	kind, sizeText, _ := strings.Cut(strings.TrimSpace(lastLine(string(pr.stdout))), " ")
-	size, perr := strconv.ParseInt(strings.TrimSpace(sizeText), 10, 64)
+	probeSize, perr := strconv.ParseInt(strings.TrimSpace(sizeText), 10, 64)
 	if perr != nil || (kind != "file" && kind != "dir") {
 		return nil, localError(connect.CodeInternal, errors.New("sandrun: the guest probe returned an unexpected result"))
 	}
 	dir := kind == "dir"
 	switch {
-	case !dir && size > DownloadFileLimit:
-		return nil, localError(connect.CodeFailedPrecondition, &LimitError{Operation: "download", FileLimit: DownloadFileLimit, TotalLimit: DownloadTotalLimit, Paths: []PathSize{{Path: guestPath, Size: size}}})
-	case dir && size > DownloadTotalLimit:
-		return nil, localError(connect.CodeFailedPrecondition, &LimitError{Operation: "download", FileLimit: DownloadFileLimit, TotalLimit: DownloadTotalLimit, Total: size})
+	case !dir && probeSize > DownloadFileLimit:
+		return nil, localError(connect.CodeFailedPrecondition, &LimitError{Operation: "download", FileLimit: DownloadFileLimit, TotalLimit: DownloadTotalLimit, Paths: []PathSize{{Path: guestPath, Size: probeSize}}})
+	case dir && probeSize > DownloadTotalLimit:
+		return nil, localError(connect.CodeFailedPrecondition, &LimitError{Operation: "download", FileLimit: DownloadFileLimit, TotalLimit: DownloadTotalLimit, Total: probeSize})
 	}
 
 	dest, err := filepath.Abs(p.LocalPath)
@@ -138,15 +138,16 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 
 	res := &DownloadResult{LocalPath: dest, Directory: dir}
 	progress := func(done int64) {
-		report(TransferProgress{Phase: TransferDownloading, BytesDone: done, BytesTotal: size})
+		report(TransferProgress{Phase: TransferDownloading, BytesDone: done})
 	}
 	var staged string
+	var wireBytes int64
 	if dir {
 		af, err := os.CreateTemp(tmp, "archive-*.tar")
 		if err != nil {
 			return nil, err
 		}
-		_, err = c.readGuestFile(ctx, s, archive, DownloadTotalLimit, af, progress)
+		wireBytes, err = c.readGuestFile(ctx, s, archive, DownloadTotalLimit, af, progress)
 		if err == nil {
 			_, err = af.Seek(0, 0)
 		}
@@ -154,7 +155,7 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 			af.Close()
 			return nil, wrapLimit(err)
 		}
-		report(TransferProgress{Phase: TransferApplying, BytesDone: size, BytesTotal: size})
+		report(TransferProgress{Phase: TransferApplying, BytesDone: wireBytes, BytesTotal: wireBytes})
 		staged = filepath.Join(tmp, "result")
 		if err := os.Mkdir(staged, 0o755); err != nil {
 			af.Close()
@@ -176,14 +177,14 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 		if err != nil {
 			return nil, err
 		}
-		n, err := c.readGuestFile(ctx, s, guestPath, DownloadFileLimit, f, progress)
+		wireBytes, err = c.readGuestFile(ctx, s, guestPath, DownloadFileLimit, f, progress)
 		if cerr := f.Close(); err == nil {
 			err = cerr
 		}
 		if err != nil {
 			return nil, wrapLimit(err)
 		}
-		res.Files, res.Bytes = 1, n
+		res.Files, res.Bytes = 1, wireBytes
 	}
 	warning, err := replacePath(staged, dest, os.Rename)
 	if err != nil {
@@ -192,7 +193,7 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 	if warning != "" {
 		res.Warnings = append(res.Warnings, warning)
 	}
-	report(TransferProgress{Phase: TransferDone, BytesDone: size, BytesTotal: size})
+	report(TransferProgress{Phase: TransferDone, BytesDone: wireBytes, BytesTotal: wireBytes})
 	return res, nil
 }
 

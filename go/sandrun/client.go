@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,9 +49,10 @@ type TokenSource func(ctx context.Context) (string, error)
 type Options struct {
 	// BaseURL is the API origin, for example https://sandrun.api.delino.io or
 	// http://127.0.0.1:18400 for a local control plane. The origin must
-	// have a hostname. An http:// origin uses HTTP/2 without TLS (h2c
-	// with prior knowledge) or HTTP/1.1. It must not have a path, query,
-	// fragment or user info. Empty means DefaultBaseURL.
+	// have a hostname. A nonempty port must be between 0 and 65535.
+	// An http:// origin uses HTTP/2 without TLS (h2c with prior knowledge)
+	// or HTTP/1.1. It must not have a path, query, fragment or user info.
+	// Empty means DefaultBaseURL.
 	BaseURL string
 	// APIKey is a personal API key (sandrun_...). Set exactly one of APIKey and
 	// TokenSource.
@@ -89,8 +91,8 @@ type timing struct {
 	// backoffMin and backoffMax bound the reconnect delay of WatchQueue
 	// and the retry delay of exec continuations.
 	backoffMin, backoffMax time.Duration
-	// retryBudget bounds how long an exec continuation or a file chunk
-	// retries transient failures without progress.
+	// retryBudget bounds exec retries without progress, each write chunk,
+	// and the time between accepted bytes during a read.
 	retryBudget time.Duration
 	// waitInterval is the default polling interval of WaitDevSession.
 	waitInterval time.Duration
@@ -126,6 +128,11 @@ func New(opts Options) (*Client, error) {
 	// swallow.
 	if strings.ContainsAny(base, "?#") || origin.Path != "" || origin.RawQuery != "" || origin.User != nil || origin.Opaque != "" {
 		return nil, errors.New("sandrun: invalid base URL: want an origin without path, query, fragment or user info")
+	}
+	if port := origin.Port(); port != "" {
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			return nil, errors.New("sandrun: invalid base URL: want a port between 0 and 65535")
+		}
 	}
 	var cred credential
 	switch {
