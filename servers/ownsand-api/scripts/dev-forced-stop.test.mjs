@@ -119,14 +119,48 @@ net
   });
 `;
 
-// The fake go: records its pid, then either builds the fake server (mode
-// "server") or stays in a build that runs a descendant (mode "build"). With
-// FAKE_STUBBORN the build ignores SIGTERM, as does its descendant, so only
-// SIGKILL ends it.
+// The fake build reports readiness after both processes install handlers.
+// Its descendant records forwarded signals and stays alive. The direct
+// build can ignore SIGTERM, wait for permission to exit, or exit immediately.
+const fakeBuild = `import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const isDescendant = process.argv[2] === "descendant";
+const report = (record) => writeFileSync(1, JSON.stringify(record) + "\\n");
+const mode = process.env.FAKE_BUILD_STOP;
+let canExit = false;
+for (const signal of ["SIGINT", "SIGTERM", "SIGQUIT"]) {
+  process.on(signal, () => {
+    report({ event: isDescendant ? "descendant_signal" : "build_signal", signal });
+    if (isDescendant || (mode === "ignore-term" && signal === "SIGTERM")) return;
+    canExit = true;
+  });
+}
+if (isDescendant) {
+  process.send("ready");
+  setInterval(() => {}, 1000);
+} else {
+  const child = spawn(process.execPath, [process.argv[1], "descendant"], {
+    stdio: ["ignore", "inherit", "inherit", "ipc"],
+  });
+  await once(child, "message");
+  report({ event: "build_ready", pid: process.pid, descendant: child.pid });
+  setInterval(() => {
+    if (!canExit) return;
+    if (mode === "wait" && !existsSync(join(process.env.MARKER_DIR, "exit"))) return;
+    report({ event: "build_completed" });
+    process.exit(0);
+  }, 20);
+}
+`;
+
 function fakeGo(t) {
   const dir = mkdtempSync(join(tmpdir(), "ownsand-api-fake-go-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const file = join(dir, "go");
+  writeFileSync(join(dir, "go.mjs"), fakeBuild);
   writeFileSync(
     file,
     `#!/bin/sh
@@ -136,18 +170,11 @@ if [ "$FAKE_PHASE" = fd ]; then
   echo done >> "$MARKER_DIR/fds"
   exit 0
 fi
-if [ "$FAKE_PHASE" = build ]; then
-  [ -n "$FAKE_STUBBORN" ] && trap '' TERM
-  echo "$$" > "$MARKER_DIR/go.pid"
-  sleep 300 &
-  echo "$!" > "$MARKER_DIR/descendant.pid"
-  wait
-  exit 0
-fi
 while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done
 cat > "$out" <<'PROGRAM'
 ${fakeServer}PROGRAM
 chmod 755 "$out"
+if [ "$FAKE_PHASE" = build ]; then exec "$FAKE_NODE" "$0.mjs"; fi
 `,
   );
   chmodSync(file, 0o755);
@@ -167,6 +194,7 @@ async function startLauncher(t, { env = {} } = {}) {
     ...process.env,
     DATABASE_URL: "postgres://placeholder@127.0.0.1:1/placeholder",
     FAKE_SERVER_PORT: String(port),
+    FAKE_NODE: process.execPath,
     MARKER_DIR: markerDir,
     PATH: `${fakeGo(t)}${delimiter}${process.env.PATH}`,
     TMPDIR: buildTmp,
@@ -198,6 +226,7 @@ async function startLauncher(t, { env = {} } = {}) {
       resolve(run.exit);
     }),
   );
+  run.closed = new Promise((resolve) => child.once("close", resolve));
   t.after(() => {
     stopAll(run);
     rmSync(tmp, { recursive: true, force: true });
@@ -228,8 +257,8 @@ function stopAll(run) {
   }
 }
 
-async function waitFor(run, predicate, what) {
-  const deadline = Date.now() + WaitTimeout;
+async function waitFor(run, predicate, what, timeout = WaitTimeout) {
+  const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (predicate()) return;
     await pause(25);
@@ -261,27 +290,45 @@ async function waitServer(run) {
   return server;
 }
 
-const readPid = (file) => Number(readFileSync(file, "utf8").trim());
-
 // Waits for the fake build and records its pid, its descendant and its
 // supervisor.
 async function waitBuild(run) {
-  const go = join(run.markerDir, "go.pid");
-  const descendant = join(run.markerDir, "descendant.pid");
   await waitFor(
     run,
-    () => existsSync(go) && existsSync(descendant),
+    () => events(run.stdout, "build_ready").length > 0,
     "the build",
   );
-  const pids = { go: readPid(go), descendant: readPid(descendant) };
+  const [{ pid, descendant }] = events(run.stdout, "build_ready");
+  const pids = { go: pid, descendant };
   for (const pid of Object.values(pids)) run.pids.add(pid);
   run.supervisor = parentOf(pids.go);
   run.pids.add(run.supervisor);
   return pids;
 }
 
-const waitGone = (run, pids, what) =>
-  waitFor(run, () => pids.every((pid) => !isRunning(pid)), what);
+const waitGone = (run, pids, what, timeout) =>
+  waitFor(run, () => pids.every((pid) => !isRunning(pid)), what, timeout);
+
+const buildSignals = (run, source) =>
+  events(run.stdout, source).map(({ signal }) => signal);
+
+const waitBuildSignal = (run, index, signal) =>
+  waitFor(
+    run,
+    () =>
+      buildSignals(run, "build_signal").length > index &&
+      buildSignals(run, "descendant_signal").length > index,
+    `the build group to receive ${signal}`,
+    4_000,
+  );
+
+function assertCanceledBuild(run, requests, completions) {
+  assert.deepEqual(buildSignals(run, "build_signal"), requests);
+  assert.deepEqual(buildSignals(run, "descendant_signal"), requests);
+  assert.equal(events(run.stdout, "build_completed").length, completions);
+  assert.equal(events(run.stdout, "fake_server").length, 0);
+  assert.deepEqual(readdirSync(run.buildTmp), []);
+}
 
 // The supervisor is the launcher's child and leads the group of the phase.
 function assertSupervised(run, server) {
@@ -348,7 +395,7 @@ for (const [phase, label] of [
         env:
           phase === "server"
             ? { FAKE_MODE: "ignore-term" }
-            : { FAKE_PHASE: "build", FAKE_STUBBORN: "1" },
+            : { FAKE_PHASE: "build", FAKE_BUILD_STOP: "ignore-term" },
       });
       let all;
       if (phase === "server") {
@@ -367,6 +414,70 @@ for (const [phase, label] of [
     },
   );
 }
+
+for (const [requests, code] of [
+  [["SIGINT"], 130],
+  [["SIGTERM"], 143],
+  [["SIGQUIT", "SIGINT"], 131],
+]) {
+  test(
+    `${requests.join(" then ")} reaches the build group once per request (status ${code})`,
+    { skip, timeout: Timeout },
+    async (t) => {
+      const run = await startLauncher(t, {
+        env: { FAKE_PHASE: "build", FAKE_BUILD_STOP: "wait" },
+      });
+      const build = await waitBuild(run);
+      const pids = [build.go, build.descendant, run.supervisor];
+      for (const [index, signal] of requests.entries()) {
+        process.kill(
+          signal === "SIGTERM" ? run.child.pid : -run.child.pid,
+          signal,
+        );
+        await waitBuildSignal(run, index, signal);
+      }
+      assert.equal(run.exit, null, "the launcher exited before the build");
+      assert.ok(pids.every(isRunning));
+      assert.equal(readdirSync(run.buildTmp).length, 1);
+      writeFileSync(join(run.markerDir, "exit"), "");
+
+      await waitGone(run, pids, "the build group to stop promptly", 4_000);
+      assert.deepEqual(await run.exited, { code, signal: null });
+      await run.closed;
+      assertCanceledBuild(run, requests, 1);
+    },
+  );
+}
+
+test(
+  "SIGTERM kills a resistant build group at the deadline",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const run = await startLauncher(t, {
+      env: { FAKE_PHASE: "build", FAKE_BUILD_STOP: "ignore-term" },
+    });
+    const build = await waitBuild(run);
+    const pids = [build.go, build.descendant, run.supervisor];
+
+    const started = performance.now();
+    process.kill(run.child.pid, "SIGTERM");
+    await waitBuildSignal(run, 0, "SIGTERM");
+    assert.equal(run.exit, null);
+    assert.ok(pids.every(isRunning));
+    assert.equal(readdirSync(run.buildTmp).length, 1);
+    await waitGone(
+      run,
+      pids,
+      "the build group to stop at the deadline",
+      12_000,
+    );
+    assert.ok(performance.now() - started >= 4_900);
+
+    assert.deepEqual(await run.exited, { code: 143, signal: null });
+    await run.closed;
+    assertCanceledBuild(run, ["SIGTERM"], 0);
+  },
+);
 
 test(
   "SIGHUP to the launcher ends the server as well",
