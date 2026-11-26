@@ -35,6 +35,7 @@ import {
   MOCK_USER,
   MockBillingState,
 } from "./mock-api.ts";
+import { walkFixturePages } from "./walk-fixture-pages.ts";
 
 describe("mock device list", () => {
   const organizationId = MOCK_IDS.acme;
@@ -1048,13 +1049,13 @@ describe("mock organization list paging", () => {
 
   test("walks every page once, in order, with the caller's role", async () => {
     const client = await withExtras(4);
-    const ids: string[] = [];
-    let pageToken = "";
-    do {
-      const page = await client.listOrganizations({ pageSize: 2, pageToken });
-      ids.push(...page.organizations.map((o) => o.organizationId));
-      pageToken = page.nextPageToken;
-    } while (pageToken !== "");
+    const ids = await walkFixturePages(6, 2, async (request) => {
+      const page = await client.listOrganizations(request);
+      return {
+        rows: page.organizations.map((o) => o.organizationId),
+        nextPageToken: page.nextPageToken,
+      };
+    });
     const all = await client.listOrganizations({ pageSize: 200 });
     expect(ids).toEqual(all.organizations.map((o) => o.organizationId));
     expect(new Set(ids).size).toBe(6);
@@ -1450,17 +1451,16 @@ describe("mock enrollment token list paging", () => {
 
   test("walks every page once, in creation order, and lists a new token last", async () => {
     const { client, ids } = await withTokens(5);
-    const walked: string[] = [];
-    let pageToken = "";
-    do {
+    const walked = await walkFixturePages(6, 2, async (request) => {
       const page = await client.listEnrollmentTokens({
         organizationId,
-        pageSize: 2,
-        pageToken,
+        ...request,
       });
-      walked.push(...page.tokens.map((t) => t.enrollmentTokenId));
-      pageToken = page.nextPageToken;
-    } while (pageToken !== "");
+      return {
+        rows: page.tokens.map((t) => t.enrollmentTokenId),
+        nextPageToken: page.nextPageToken,
+      };
+    });
     expect(walked).toHaveLength(6);
     expect(new Set(walked).size).toBe(6);
     expect(walked.slice(1)).toEqual(ids);
@@ -1592,17 +1592,16 @@ describe("mock API key list paging", () => {
 
   test("walks every page once, in creation order, and lists a new key last", async () => {
     const { client, ids } = await withKeys(5);
-    const walked: string[] = [];
-    let pageToken = "";
-    do {
+    const walked = await walkFixturePages(6, 2, async (request) => {
       const page = await client.listApiKeys({
         organizationId,
-        pageSize: 2,
-        pageToken,
+        ...request,
       });
-      walked.push(...page.apiKeys.map((k) => k.apiKeyId));
-      pageToken = page.nextPageToken;
-    } while (pageToken !== "");
+      return {
+        rows: page.apiKeys.map((k) => k.apiKeyId),
+        nextPageToken: page.nextPageToken,
+      };
+    });
     expect(walked).toHaveLength(6);
     expect(new Set(walked).size).toBe(6);
     expect(walked.slice(1)).toEqual(ids);
