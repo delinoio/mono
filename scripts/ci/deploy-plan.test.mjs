@@ -1402,7 +1402,14 @@ test("repository deployables use the documented targets", () => {
         "h2c",
         "3478",
       ],
-      ["tide-api", "tide-api", "tide.api.delino.io", "8080", "h2c", "none"],
+      [
+        "sandrun-api",
+        "sandrun-api",
+        "sandrun.api.delino.io",
+        "8080",
+        "h2c",
+        "none",
+      ],
     ],
   );
   // The billing rollout deploys accounts-api before ownsand-api.
@@ -1411,9 +1418,10 @@ test("repository deployables use the documented targets", () => {
       .needs,
     ["accounts-api"],
   );
-  // tide-api calls ownsand-api, so ownsand-api deploys first.
+  // sandrun-api calls ownsand-api, so ownsand-api deploys first.
   assert.deepEqual(
-    packages.find((p) => p.manifest.name === "tide-api").manifest.deploy.needs,
+    packages.find((p) => p.manifest.name === "sandrun-api").manifest.deploy
+      .needs,
     ["ownsand-api"],
   );
   assert.deepEqual(
@@ -1423,7 +1431,7 @@ test("repository deployables use the documented targets", () => {
       ["delino-docs", "delino-docs", "apps/delino-docs/dist"],
       ["delino-site", "delino-site", "apps/delino-site/dist"],
       ["ownsand-console", "ownsand-console", "apps/ownsand/dist"],
-      ["tide-console", "tide-console", "apps/tide/dist"],
+      ["sandrun-console", "sandrun-console", "apps/sandrun/dist"],
     ],
   );
   assert.deepEqual(
@@ -1472,9 +1480,9 @@ test("repository deployables use the documented targets", () => {
         "",
       ],
       [
-        "tide-cli",
-        "cmds/tide",
-        "tide",
+        "sandrun-cli",
+        "cmds/sandrun",
+        "sandrun",
         [
           "linux-amd64",
           "linux-arm64",

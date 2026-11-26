@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { describe, expect, test } from "@rstest/core";
 import ownsandConfig from "../../ownsand/e2e.config.ts";
-import tideConfig from "../../tide/e2e.config.ts";
+import sandRunConfig from "../../sandrun/e2e.config.ts";
 import accountsConfig from "../e2e.config.ts";
 
 // An e2e app command that lets Rsbuild read `.env` and `.env.local` makes the
@@ -33,10 +33,10 @@ describe("e2e app command", () => {
       env: { PUBLIC_OWNSAND_MOCK_API: " true " },
     },
     {
-      directory: "tide",
-      config: tideConfig,
+      directory: "sandrun",
+      config: sandRunConfig,
       configArgs: ["--mode", "development"],
-      env: { NODE_ENV: "production", PUBLIC_TIDE_MOCK_API: " true " },
+      env: { NODE_ENV: "production", PUBLIC_SANDRUN_MOCK_API: " true " },
     },
   ]) {
     test(`starts ${directory} through Node on the selected loopback port`, () => {

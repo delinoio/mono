@@ -698,7 +698,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "pnpm-workspace.yaml",
     "servers/ownsand-api/internal/db/migrations/0001_initial.sql",
     "servers/accounts-api/internal/db/migrations/00001_billing_accounts.sql",
-    "servers/tide-api/internal/db/migrations/00001_core.sql",
+    "servers/sandrun-api/internal/db/migrations/00001_core.sql",
     "go/ownsand/relaybinding/testdata/request-digest-vectors.json",
     "servers/ownsand-api/scripts/dev.mjs",
     "cmds/ownsand-agent/images/linux/build-rootfs.sh",

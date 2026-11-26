@@ -2,7 +2,7 @@
 
 // Package logto implements the OAuth 2.0 device authorization flow
 // (RFC 8628) and the refresh token grant against a Logto tenant, as the
-// ownsand and tide CLIs use them: each CLI is a Logto native application with
+// ownsand and SandRun CLIs use them: each CLI is a Logto native application with
 // device flow, asks for offline_access in the device authorization and
 // exchanges the refresh token for an access token of its API resource.
 // See https://docs.logto.io/quick-starts/device-flow.

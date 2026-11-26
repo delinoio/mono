@@ -1,5 +1,5 @@
 ---
-"tide-api": patch
+"sandrun-api": patch
 ---
 
-Preserve Cursor and Devin claims while Tide confirms whether the admission transaction committed.
+Preserve Cursor and Devin claims while SandRun confirms whether the admission transaction committed.

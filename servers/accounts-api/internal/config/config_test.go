@@ -641,7 +641,7 @@ func TestUsageServiceClients(t *testing.T) {
 	if got := fmt.Sprint(cfg.UsageServiceClients); got != "map[app1:[SERVICE_ID_OWNSAND] app2:[SERVICE_ID_OWNSAND]]" {
 		t.Errorf("UsageServiceClients = %s", got)
 	}
-	for _, value := range []string{"app1", "=ownsand", "app1=", "app1=OWNSAND", "app1=unspecified", "app1=tide", "app 1=ownsand", "app1=ownsand=x", "app1=ownſand", "app1=ownſAND", "app1=ownsand\u00a0", "app1=ownsand,app2=ownſand"} {
+	for _, value := range []string{"app1", "=ownsand", "app1=", "app1=OWNSAND", "app1=unspecified", "app1=sandrun", "app 1=ownsand", "app1=ownsand=x", "app1=ownſand", "app1=ownſAND", "app1=ownsand\u00a0", "app1=ownsand,app2=ownſand"} {
 		if _, err := Load(lookupFrom(map[string]string{EnvUsageServiceClients: value})); err == nil ||
 			!strings.Contains(err.Error(), EnvUsageServiceClients) {
 			t.Errorf("Load(%q) error = %v, want an error that names %s", value, err, EnvUsageServiceClients)

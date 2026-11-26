@@ -105,7 +105,7 @@ function fixture(scratchName) {
   chmodSync(join(repo, "scripts", "protos.sh"), 0o755);
   write(join(repo, "protos", "buf.yaml"), "version: v2\n");
   write(join(repo, "protos", "delino", "ownsand", "v1", "gen.pb.go"), "go\n");
-  for (const pkg of ["ownsand", "accounts", "tide"]) {
+  for (const pkg of ["ownsand", "accounts", "sandrun"]) {
     const pkgDir = join(repo, "protos", "delino", pkg);
     write(join(pkgDir, "buf.gen.yaml"), "version: v2\n");
     write(join(pkgDir, "v1", "gen_pb.ts"), `ts delino/${pkg}\n`);

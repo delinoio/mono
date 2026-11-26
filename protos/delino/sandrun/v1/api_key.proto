@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.sandrun.v1;
+
+import "delino/sandrun/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/sandrun/v1;sandrunv1";
+
+// ApiKeyService manages the personal API keys of the caller. A personal API
+// key authenticates only on DevSessionService RPCs.
+service ApiKeyService {
+  // Create a personal API key of the caller with a name and an optional
+  // expiry. Returns the secret once.
+  rpc CreateApiKey(CreateApiKeyRequest) returns (CreateApiKeyResponse);
+  // List the caller's own keys without secrets.
+  rpc ListApiKeys(ListApiKeysRequest) returns (ListApiKeysResponse);
+  // Revoke one of the caller's own keys.
+  rpc RevokeApiKey(RevokeApiKeyRequest) returns (RevokeApiKeyResponse);
+}
+
+// Personal API key metadata. It never carries the secret.
+message ApiKey {
+  string api_key_id = 1;
+  string organization_id = 2;
+  // 1 to 64 characters.
+  string name = 3;
+  // Short non-secret prefix of the secret, for display.
+  string display_prefix = 4;
+  ApiKeyState state = 5;
+  google.protobuf.Timestamp created_at = 6;
+  // Absent when the key does not expire.
+  google.protobuf.Timestamp expires_at = 7;
+  google.protobuf.Timestamp last_used_at = 8;
+  google.protobuf.Timestamp revoked_at = 9;
+}
+
+message CreateApiKeyRequest {
+  string organization_id = 1;
+  string name = 2;
+  // Optional. Must be in the future.
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+message CreateApiKeyResponse {
+  ApiKey api_key = 1;
+  // `sandrun_` followed by 32 random bytes in unpadded base64url. Returned once.
+  // Secret: never log.
+  string secret = 2;
+}
+
+message ListApiKeysRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListApiKeysResponse {
+  repeated ApiKey api_keys = 1;
+  string next_page_token = 2;
+}
+
+message RevokeApiKeyRequest {
+  string organization_id = 1;
+  string api_key_id = 2;
+}
+
+message RevokeApiKeyResponse {
+  ApiKey api_key = 1;
+}

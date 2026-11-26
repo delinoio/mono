@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package credstore stores the Logto tokens of a command-line program (the
-// ownsand and tide CLIs) in a file in the user configuration directory that
+// ownsand and SandRun CLIs) in a file in the user configuration directory that
 // only the user can read: mode 0600 (directory 0700) on Linux and macOS, a
 // protected user-only ACL on Windows. OS keychain storage is not used; see
-// docs/cmds-ownsand-cli-foundation.md and docs/cmds-tide-cli-foundation.md.
+// docs/cmds-ownsand-cli-foundation.md and docs/cmds-sandrun-cli-foundation.md.
 package credstore
 
 import (

@@ -582,7 +582,7 @@ jobs:
     # Notarization usually takes minutes, but the job notarizes the darwin
     # executables one after another and notarytool waits up to 45 minutes
     # for each of them. The limit is the number of darwin assets of all
-    # release binaries (5: ownsand 2, ownsand-agent 1, tide 2) times 45
+    # release binaries (5: ownsand 2, ownsand-agent 1, SandRun 2) times 45
     # minutes, plus 15 minutes for the setup, the signing and the checks.
     # Raise it with every added darwin platform;
     # scripts/ci/deploy-signing-budget.test.mjs enforces the sum.

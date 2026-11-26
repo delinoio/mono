@@ -193,7 +193,7 @@ jobs:
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Postgres for the Postgres-backed accounts-api, ownsand-api and tide-api
+    # Postgres for the Postgres-backed accounts-api, ownsand-api and sandrun-api
     # tests and the OwnSand end-to-end suite (servers/ownsand-api/e2e). The credentials
     # exist only inside this job. Each suite creates its own uniquely named
     # databases on this one server.
@@ -261,7 +261,7 @@ jobs:
         env:
           ACCOUNTS_TEST_DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres?sslmode=disable
           OWNSAND_TEST_DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres?sslmode=disable
-          TIDE_TEST_DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres?sslmode=disable
+          SANDRUN_TEST_DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres?sslmode=disable
           OWNSAND_E2E: "1"
         # -count=1 bypasses cached test results, so every run executes the
         # tests; the restored build cache only skips recompilation.
@@ -284,7 +284,7 @@ jobs:
         run: |
           {
             echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
-            echo 'Commands in the root Go module: pnpm install --frozen-lockfile --ignore-scripts; go test -count=1 ./... with a Postgres service, ACCOUNTS_TEST_DATABASE_URL, OWNSAND_TEST_DATABASE_URL, TIDE_TEST_DATABASE_URL and OWNSAND_E2E=1 (Postgres-backed accounts-api, ownsand-api and tide-api tests and the OwnSand end-to-end suite with the process runtime)'
+            echo 'Commands in the root Go module: pnpm install --frozen-lockfile --ignore-scripts; go test -count=1 ./... with a Postgres service, ACCOUNTS_TEST_DATABASE_URL, OWNSAND_TEST_DATABASE_URL, SANDRUN_TEST_DATABASE_URL and OWNSAND_E2E=1 (Postgres-backed accounts-api, ownsand-api and sandrun-api tests and the OwnSand end-to-end suite with the process runtime)'
             echo "Result: $RESULT"
             echo 'Runtime, deployment and release acceptance: not performed. The OwnSand end-to-end suite uses the process test runtime, not a hypervisor. The go-fmt and go-vet jobs check formatting and vet findings, and the protos job checks the protobuf schemas and bindings.'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -474,10 +474,10 @@ jobs:
           echo "Other architecture vetted: $other_arch" >> "$GITHUB_STEP_SUMMARY"
       - name: Test Go module
         # No Postgres service: Docker service containers run only on Linux
-        # runners. The Postgres-backed accounts-api, ownsand-api and tide-api
+        # runners. The Postgres-backed accounts-api, ownsand-api and sandrun-api
         # tests and the OwnSand end-to-end suite skip without
         # ACCOUNTS_TEST_DATABASE_URL, OWNSAND_TEST_DATABASE_URL,
-        # TIDE_TEST_DATABASE_URL and OWNSAND_E2E; the go-test job runs them
+        # SANDRUN_TEST_DATABASE_URL and OWNSAND_E2E; the go-test job runs them
         # on Linux. The hypervisor
         # integration tests skip without their image variables.
         #

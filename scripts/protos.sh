@@ -18,7 +18,7 @@ set -euo pipefail
 # Exact tool versions. protoc-gen-go and protoc-gen-connect-go are pinned in
 # protos/buf.gen.yaml; protoc-gen-es is pinned in the package.json of each
 # TypeScript package below (protos/delino/ownsand, protos/delino/accounts and
-# protos/delino/tide).
+# protos/delino/sandrun).
 readonly BUF_MODULE="github.com/bufbuild/buf/cmd/buf"
 readonly BUF_VERSION="v1.72.0"
 
@@ -33,11 +33,11 @@ readonly protos_dir="$root/protos"
 #   (docs/protos-ownsand-api-contract.md).
 # - delino/accounts: @delino/accounts-protos
 #   (docs/protos-delino-accounts-api-contract.md).
-# - delino/tide: @delino/tide-protos (docs/protos-tide-api-contract.md).
+# - delino/sandrun: @delino/sandrun-protos (docs/protos-sandrun-api-contract.md).
 readonly ts_targets=(
   "delino/ownsand"
   "delino/accounts"
-  "delino/tide"
+  "delino/sandrun"
 )
 
 # The scratch directory that the EXIT trap removes. It is a script-global

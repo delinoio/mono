@@ -85,7 +85,7 @@ function write(file, content) {
 
 // TypeScript targets of the script: the schema directories under protos/,
 // which are also the binding package directories.
-const tsPackages = ["ownsand", "accounts", "tide"];
+const tsPackages = ["ownsand", "accounts", "sandrun"];
 
 // Creates a repository with the real script, committed (old) bindings of both
 // languages and every TypeScript target, and the fake go in a bin directory.
@@ -300,8 +300,8 @@ test(
           "new ts delino/accounts\n",
         ],
         [
-          join("protos", "delino", "tide", "v1", "new_pb.ts"),
-          "new ts delino/tide\n",
+          join("protos", "delino", "sandrun", "v1", "new_pb.ts"),
+          "new ts delino/sandrun\n",
         ],
         [join("protos", "delino", "ownsand", "v1", "new.pb.go"), "new go\n"],
         [

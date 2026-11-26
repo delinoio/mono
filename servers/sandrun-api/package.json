@@ -1,0 +1,22 @@
+{
+  "name": "sandrun-api",
+  "version": "0.0.0",
+  "private": true,
+  "license": "FSL-1.1-ALv2",
+  "deploy": {
+    "target": "droplet",
+    "service": "sandrun-api",
+    "hostname": "sandrun.api.delino.io",
+    "port": 8080,
+    "upstreamProtocol": "h2c",
+    "needs": [
+      "ownsand-api"
+    ]
+  },
+  "scripts": {
+    "build": "go build -buildvcs=false -o dist/sandrun-api ./cmd/sandrun-api",
+    "dev": "node ../../scripts/dev/with-infisical.mjs --path=/servers/sandrun-api -- node scripts/dev.mjs",
+    "lint": "go vet ./...",
+    "test": "go test ./... && node --test \"scripts/*.test.mjs\""
+  }
+}

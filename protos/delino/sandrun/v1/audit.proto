@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.sandrun.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/sandrun/v1;sandrunv1";
+
+// AuditService reads the audit events of an organization.
+service AuditService {
+  // List audit events of the organization, newest first.
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
+}
+
+// Audit actions.
+enum AuditAction {
+  AUDIT_ACTION_UNSPECIFIED = 0;
+  AUDIT_ACTION_ORGANIZATION_CREATED = 1;
+  AUDIT_ACTION_ORGANIZATION_DELETED = 2;
+  AUDIT_ACTION_OWNERSHIP_TRANSFERRED = 3;
+  AUDIT_ACTION_INVITATION_CREATED = 4;
+  AUDIT_ACTION_INVITATION_REVOKED = 5;
+  AUDIT_ACTION_MEMBER_JOINED = 6;
+  AUDIT_ACTION_MEMBER_ROLE_CHANGED = 7;
+  AUDIT_ACTION_MEMBER_REMOVED = 8;
+  AUDIT_ACTION_OWNSAND_LINK_SET = 9;
+  AUDIT_ACTION_OWNSAND_LINK_REMOVED = 10;
+  AUDIT_ACTION_GITHUB_INSTALLATION_LINKED = 11;
+  AUDIT_ACTION_GITHUB_INSTALLATION_UPDATED = 12;
+  AUDIT_ACTION_GITHUB_INSTALLATION_UNLINKED = 13;
+  AUDIT_ACTION_AGENT_INTEGRATION_CREATED = 14;
+  AUDIT_ACTION_AGENT_INTEGRATION_UPDATED = 15;
+  AUDIT_ACTION_AGENT_INTEGRATION_CREDENTIALS_REPLACED = 16;
+  AUDIT_ACTION_AGENT_INTEGRATION_DELETED = 17;
+  AUDIT_ACTION_RUNNER_PROFILE_CREATED = 18;
+  AUDIT_ACTION_RUNNER_PROFILE_UPDATED = 19;
+  AUDIT_ACTION_RUNNER_PROFILE_DELETED = 20;
+  AUDIT_ACTION_REQUEST_CANCELED = 21;
+  AUDIT_ACTION_RUNNER_DELETED = 22;
+  AUDIT_ACTION_ORGANIZATION_SETTINGS_CHANGED = 23;
+  AUDIT_ACTION_API_KEY_CREATED = 24;
+  AUDIT_ACTION_API_KEY_REVOKED = 25;
+  AUDIT_ACTION_DEV_SESSION_CREATED = 26;
+  AUDIT_ACTION_DEV_SESSION_DELETED = 27;
+}
+
+// Kind of the target of an audit event.
+enum AuditTargetKind {
+  AUDIT_TARGET_KIND_UNSPECIFIED = 0;
+  AUDIT_TARGET_KIND_ORGANIZATION = 1;
+  AUDIT_TARGET_KIND_MEMBERSHIP = 2;
+  AUDIT_TARGET_KIND_INVITATION = 3;
+  AUDIT_TARGET_KIND_OWNSAND_LINK = 4;
+  AUDIT_TARGET_KIND_GITHUB_INSTALLATION = 5;
+  AUDIT_TARGET_KIND_AGENT_INTEGRATION = 6;
+  AUDIT_TARGET_KIND_RUNNER_PROFILE = 7;
+  AUDIT_TARGET_KIND_REQUEST = 8;
+  AUDIT_TARGET_KIND_RUNNER = 9;
+  AUDIT_TARGET_KIND_API_KEY = 10;
+  AUDIT_TARGET_KIND_DEV_SESSION = 11;
+}
+
+// One audit event. It never contains credentials, command arguments,
+// environment values, command output or file contents.
+message AuditEvent {
+  string audit_event_id = 1;
+  string organization_id = 2;
+  AuditAction action = 3;
+  // Logto `sub` of the acting user. Empty for actions of SandRun itself.
+  string actor_user_id = 4;
+  // Set when the actor authenticated with a personal API key.
+  string actor_api_key_id = 5;
+  AuditTargetKind target_kind = 6;
+  string target_id = 7;
+  // The dev session owner for dev session events, and the affected member for
+  // membership events.
+  string subject_user_id = 8;
+  google.protobuf.Timestamp create_time = 9;
+}
+
+message ListAuditEventsRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListAuditEventsResponse {
+  repeated AuditEvent events = 1;
+  string next_page_token = 2;
+}

@@ -337,14 +337,14 @@ func TestListStatusChangesSuspendsMoreThanOneBatchOfAccounts(t *testing.T) {
 
 func TestSuspendDueFiltersStillSelectOnlyMatchingLinks(t *testing.T) {
 	const (
-		tideLinks    = 5
+		sandRunLinks = 5
 		ownsandLinks = suspendBatchSize + 3
 	)
 	f := newFixture(t)
-	accounts, orgs := f.dueLinks(ownsandLinks + tideLinks)
+	accounts, orgs := f.dueLinks(ownsandLinks + sandRunLinks)
 
 	// SuspendDue walks the accounts in ID order, so the five accounts with
-	// the highest IDs get the tide links. The remaining ownsand links are
+	// the highest IDs get the SandRun links. The remaining ownsand links are
 	// then more than one batch even after the account filter picked some.
 	// The IDs are UUID v7 values, so creation order does not guarantee ID
 	// order: sort the pairs explicitly.
@@ -354,19 +354,19 @@ func TestSuspendDueFiltersStillSelectOnlyMatchingLinks(t *testing.T) {
 		pairs[i] = pair{accounts[i], orgs[i]}
 	}
 	sort.Slice(pairs, func(i, j int) bool { return pairs[i].account < pairs[j].account })
-	ownsand, tide := pairs[:ownsandLinks], pairs[ownsandLinks:]
-	tideOrgs := make([]string, len(tide))
-	for i, p := range tide {
-		tideOrgs[i] = p.org
+	ownsand, sandrun := pairs[:ownsandLinks], pairs[ownsandLinks:]
+	sandRunOrgs := make([]string, len(sandrun))
+	for i, p := range sandrun {
+		sandRunOrgs[i] = p.org
 	}
-	if _, err := f.db.Pool.Exec(ctx(), `UPDATE organization_links SET service = 'tide' WHERE organization_id = ANY($1)`, tideOrgs); err != nil {
+	if _, err := f.db.Pool.Exec(ctx(), `UPDATE organization_links SET service = 'sandrun' WHERE organization_id = ANY($1)`, sandRunOrgs); err != nil {
 		t.Fatal(err)
 	}
 	f.clock.Advance(SuspendAfter)
 
 	// A billing account filter touches only the listed accounts: the two
-	// lowest ownsand accounts and the lowest tide account.
-	picked := []pair{ownsand[0], ownsand[1], tide[0]}
+	// lowest ownsand accounts and the lowest SandRun account.
+	picked := []pair{ownsand[0], ownsand[1], sandrun[0]}
 	pickedAccounts := make([]string, len(picked))
 	for i, p := range picked {
 		pickedAccounts[i] = p.account
@@ -377,20 +377,20 @@ func TestSuspendDueFiltersStillSelectOnlyMatchingLinks(t *testing.T) {
 	if got := f.countStatus(StatusSuspended); got != len(picked) {
 		t.Fatalf("%d suspended links after the account filter, want %d", got, len(picked))
 	}
-	// The status helpers read the ownsand service; the tide link is checked
+	// The status helpers read the ownsand service; the SandRun link is checked
 	// by the counts below.
 	f.wantStatus(ownsand[0].org, StatusSuspended, ReasonNoActiveSubscription)
 	f.wantStatus(ownsand[1].org, StatusSuspended, ReasonNoActiveSubscription)
 	if got, want := f.count(`SELECT count(*) FROM organization_links WHERE service = 'ownsand' AND billing_status = 'suspended'`), 2; got != want {
 		t.Fatalf("%d suspended ownsand links after the account filter, want %d", got, want)
 	}
-	if got, want := f.count(`SELECT count(*) FROM organization_links WHERE service = 'tide' AND billing_status = 'suspended'`), 1; got != want {
-		t.Fatalf("%d suspended tide links after the account filter, want %d", got, want)
+	if got, want := f.count(`SELECT count(*) FROM organization_links WHERE service = 'sandrun' AND billing_status = 'suspended'`), 1; got != want {
+		t.Fatalf("%d suspended SandRun links after the account filter, want %d", got, want)
 	}
 	f.wantStatus(ownsand[2].org, StatusBlocked, ReasonNoActiveSubscription)
 
 	// A service filter suspends the 101 remaining ownsand links, more than
-	// one batch of suspendBatchSize accounts, and leaves the other tide
+	// one batch of suspendBatchSize accounts, and leaves the other SandRun
 	// links blocked.
 	logs := f.captureLogs()
 	if err := f.s.SuspendDue(ctx(), SuspendFilter{Service: "ownsand"}); err != nil {
@@ -402,14 +402,14 @@ func TestSuspendDueFiltersStillSelectOnlyMatchingLinks(t *testing.T) {
 	if got, want := f.count(`SELECT count(*) FROM organization_links WHERE service = 'ownsand' AND billing_status = 'blocked'`), 0; got != want {
 		t.Fatalf("%d blocked ownsand links, want %d", got, want)
 	}
-	if got, want := f.count(`SELECT count(*) FROM organization_links WHERE service = 'tide' AND billing_status = 'suspended'`), 1; got != want {
-		t.Fatalf("%d suspended tide links, want %d (only the one picked by the account filter)", got, want)
+	if got, want := f.count(`SELECT count(*) FROM organization_links WHERE service = 'sandrun' AND billing_status = 'suspended'`), 1; got != want {
+		t.Fatalf("%d suspended SandRun links, want %d (only the one picked by the account filter)", got, want)
 	}
-	if got, want := f.count(`SELECT count(*) FROM organization_links WHERE service = 'tide' AND billing_status = 'blocked'`), tideLinks-1; got != want {
-		t.Fatalf("%d blocked tide links, want %d", got, want)
+	if got, want := f.count(`SELECT count(*) FROM organization_links WHERE service = 'sandrun' AND billing_status = 'blocked'`), sandRunLinks-1; got != want {
+		t.Fatalf("%d blocked SandRun links, want %d", got, want)
 	}
-	if got := f.countStatus(StatusBlocked); got != tideLinks-1 {
-		t.Fatalf("%d blocked links, want %d", got, tideLinks-1)
+	if got := f.countStatus(StatusBlocked); got != sandRunLinks-1 {
+		t.Fatalf("%d blocked links, want %d", got, sandRunLinks-1)
 	}
 	// The 101 accounts take a full batch and a second one with one account.
 	for _, want := range []string{`"msg":"billing_suspend_due"`, fmt.Sprintf(`"accounts":%d`, ownsandLinks-2), `"batches":2`} {

@@ -10,3 +10,10 @@ lint:
 breaking:
   use:
     - FILE
+  # Workaround: the unreleased `delino.tide.v1` package was renamed to
+  # `delino.sandrun.v1` before any client used it. buf reports the removed
+  # `delino/tide` files of the comparison base as deleted files, so this
+  # entry ignores only that path. Remove it when no comparison base that CI
+  # uses contains `protos/delino/tide/` (after the rename reaches main).
+  ignore:
+    - delino/tide

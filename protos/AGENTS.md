@@ -18,5 +18,5 @@
 - [Repository workflow](../docs/repository-workflow-contract.md)
 - `protos/delino/ownsand/`: [project index](../docs/project-ownsand.md) and [API contract](../docs/protos-ownsand-api-contract.md)
 - `protos/delino/accounts/`: [project index](../docs/project-delino-accounts.md) and [API contract](../docs/protos-delino-accounts-api-contract.md)
-- `protos/delino/tide/`: [project index](../docs/project-tide.md) and [API contract](../docs/protos-tide-api-contract.md)
+- `protos/delino/sandrun/`: [project index](../docs/project-sandrun.md) and [API contract](../docs/protos-sandrun-api-contract.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.

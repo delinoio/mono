@@ -334,10 +334,10 @@ test("each launcher folder is the package directory", () => {
   assert.deepEqual(found.sort(), [
     "apps/delino-accounts",
     "apps/ownsand",
-    "apps/tide",
+    "apps/sandrun",
     "servers/accounts-api",
     "servers/ownsand-api",
-    "servers/tide-api",
+    "servers/sandrun-api",
   ]);
 });
 
