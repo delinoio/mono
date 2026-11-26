@@ -106,6 +106,7 @@ export class RecoveryDeadlineError extends Error {
  * Reads the sandbox state once, bounded by the relay recovery window. While
  * the window is active, a lookup that is still pending when the window's
  * remaining time has passed is aborted and throws `RecoveryDeadlineError`.
+ * Replies at or after expiry are rejected even if the timer has not run.
  * The lookup does not run when the window has no time left. A caller abort
  * cancels the lookup and rejects with the caller's own reason. An inactive
  * window does not bound the lookup.
@@ -134,8 +135,9 @@ export async function sandboxStateWithin(
     () => controller.abort(deadline),
     () => {},
   );
+  let current;
   try {
-    return await sandboxState(ctx, controller.signal);
+    current = await sandboxState(ctx, controller.signal);
   } catch (error) {
     // The caller's abort wins over the deadline.
     throwIfAborted(signal);
@@ -147,6 +149,11 @@ export async function sandboxStateWithin(
     stop.abort();
     dispose();
   }
+  throwIfAborted(signal);
+  if (controller.signal.reason === deadline || window.remainingMs() <= 0) {
+    throw deadline;
+  }
+  return current;
 }
 
 /**
