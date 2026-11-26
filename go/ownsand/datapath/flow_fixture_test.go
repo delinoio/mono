@@ -45,6 +45,11 @@ type flowFixtureOptions struct {
 	// stopAfter makes the receiver return after that many frames; zero
 	// means it receives all of them.
 	stopAfter int
+	// senderFrameLimit makes the sender finish after that many frames. Zero
+	// leaves the usual frame count in place.
+	senderFrameLimit int
+	// senderErr is the error the sender returns after sending its frames.
+	senderErr error
 }
 
 // flowFixtureResult reports one fixture run.
@@ -53,6 +58,29 @@ type flowFixtureResult struct {
 	// running counts the workers that have not exited yet. The fixture joins
 	// both workers before it returns, so the count is zero by then.
 	running int32
+}
+
+type flowFixtureWorkers struct {
+	errs    chan error
+	running atomic.Int32
+	wait    sync.WaitGroup
+}
+
+func (w *flowFixtureWorkers) start(ctx context.Context, name string, run func() error, complete func()) {
+	w.running.Add(1)
+	w.wait.Add(1)
+	go func() {
+		defer w.wait.Done()
+		defer w.running.Add(-1)
+		if complete != nil {
+			// Publish the worker error before signaling completion.
+			defer complete()
+		}
+		// The fixture reports its own outcome when it cancels a worker.
+		if err := run(); err != nil && ctx.Err() == nil {
+			w.errs <- fmt.Errorf("%s: %w", name, err)
+		}
+	}()
 }
 
 // runFlowFixture runs a sender, a credit worker and a slow receiver through a
@@ -75,32 +103,18 @@ func runFlowFixture(ctx context.Context, opts flowFixtureOptions) (result flowFi
 	frames := make(chan int64, flowFixtureFrames)
 	updates := make(chan int64, flowFixtureFrames)
 	workerErrs := make(chan error, 2)
-	var running atomic.Int32
-	var workers sync.WaitGroup
-	start := func(name string, run func() error) {
-		running.Add(1)
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			defer running.Add(-1)
-			// A worker that ends because the fixture cancelled it is not a
-			// failure; the run reports its own outcome.
-			if err := run(); err != nil && ctx.Err() == nil {
-				workerErrs <- fmt.Errorf("%s: %w", name, err)
-			}
-		}()
-	}
+	workers := flowFixtureWorkers{errs: workerErrs}
 	// Cancel first and join afterwards, so that a worker blocked on credit or
 	// on a channel send always wakes up. The results are named so that this
 	// deferred function can set running after the return statement has copied
 	// the other fields: with an unnamed result the caller would never see it.
 	defer func() {
 		cancel()
-		workers.Wait()
-		result.running = running.Load()
+		workers.wait.Wait()
+		result.running = workers.running.Load()
 	}()
 
-	start("credit worker", func() error {
+	workers.start(ctx, "credit worker", func() error {
 		for {
 			select {
 			case <-ctx.Done():
@@ -117,10 +131,13 @@ func runFlowFixture(ctx context.Context, opts flowFixtureOptions) (result flowFi
 				}
 			}
 		}
-	})
-	start("sender", func() error {
-		defer close(frames)
-		for i := 0; i < flowFixtureFrames; i++ {
+	}, nil)
+	workers.start(ctx, "sender", func() error {
+		frameCount := flowFixtureFrames
+		if opts.senderFrameLimit > 0 {
+			frameCount = opts.senderFrameLimit
+		}
+		for i := 0; i < frameCount; i++ {
 			f := maxChunkFrame()
 			if i%2 == 0 {
 				f = MustNewFrame(7, sandboxID, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: make([]byte, 1000)}}})
@@ -135,7 +152,9 @@ func runFlowFixture(ctx context.Context, opts flowFixtureOptions) (result flowFi
 				return ctx.Err()
 			}
 		}
-		return nil
+		return opts.senderErr
+	}, func() {
+		close(frames)
 	})
 
 	stalled := func() error {
@@ -207,9 +226,62 @@ func TestFlowControlEndToEnd(t *testing.T) {
 	}
 }
 
-// TestFlowControlFixtureFaults checks that the fixture reports a stall or an
-// early receiver exit instead of hanging, and that it joins its workers.
+func TestFlowControlFixtureSenderErrorBeforeClose(t *testing.T) {
+	frames := make(chan int64)
+	workerErrs := make(chan error, 2)
+	workers := flowFixtureWorkers{errs: workerErrs}
+	cause := errors.New("injected sender failure")
+	var queuedErr error
+	workers.start(t.Context(), "sender", func() error {
+		return cause
+	}, func() {
+		select {
+		case queuedErr = <-workerErrs:
+		default:
+		}
+		close(frames)
+	})
+	workers.wait.Wait()
+
+	select {
+	case <-frames:
+	default:
+		t.Fatal("sender did not close frames")
+	}
+	if !errors.Is(queuedErr, cause) || queuedErr.Error() != "sender: "+cause.Error() {
+		t.Fatalf("error queued before closing frames = %v, want wrapped sender error", queuedErr)
+	}
+	if running := workers.running.Load(); running != 0 {
+		t.Fatalf("%d workers still running after the join", running)
+	}
+}
+
+// TestFlowControlFixtureFaults checks the diagnostic and worker cleanup for
+// each failed transfer.
 func TestFlowControlFixtureFaults(t *testing.T) {
+	t.Run("sender failure retains its cause", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), flowFixtureDeadline)
+		defer cancel()
+		cause := errors.New("injected sender failure")
+		result, err := runFlowFixture(ctx, flowFixtureOptions{senderFrameLimit: 1, senderErr: cause})
+		if !errors.Is(err, cause) || err.Error() != "sender: "+cause.Error() {
+			t.Fatalf("sender failure: want wrapped sender error, got %v", err)
+		}
+		if result.running != 0 {
+			t.Fatalf("%d workers still running after the fixture returned", result.running)
+		}
+	})
+	t.Run("short transfer without a sender error reports the count", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), flowFixtureDeadline)
+		defer cancel()
+		result, err := runFlowFixture(ctx, flowFixtureOptions{senderFrameLimit: 1})
+		if want := fmt.Sprintf("received 1 of %d frames", flowFixtureFrames); err == nil || err.Error() != want {
+			t.Fatalf("short transfer: want %q, got %v", want, err)
+		}
+		if result.received != 1 || result.running != 0 {
+			t.Fatalf("result = %+v, want one received frame and zero running workers", result)
+		}
+	})
 	t.Run("withheld credit stalls the sender", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), flowFixtureStallDeadline)
 		defer cancel()

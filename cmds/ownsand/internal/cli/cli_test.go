@@ -115,9 +115,9 @@ func TestUsageErrors(t *testing.T) {
 	}
 }
 
-// TestFileWriteMode checks that file write rejects a zero --mode, which the
-// SDK would turn into 0644, names --mode in the error, and sends every other
-// valid mode, including the 0644 default, to the relay unchanged.
+// TestFileWriteMode checks that file write rejects a zero mode before any RPC
+// and names --mode in the error. It also checks that the relay receives the
+// default and explicit modes.
 func TestFileWriteMode(t *testing.T) {
 	for _, mode := range []string{"0", "0000", "00"} {
 		r := newRunner(t)
@@ -126,11 +126,8 @@ func TestFileWriteMode(t *testing.T) {
 		if res.code != ExitUsage || !strings.Contains(res.stderr, "--mode") {
 			t.Errorf("--mode %s: %+v", mode, res)
 		}
-		r.f.mu.Lock()
-		writes := r.f.writes
-		r.f.mu.Unlock()
-		if writes != 0 {
-			t.Errorf("--mode %s sent %d write requests", mode, writes)
+		if calls := r.f.callNames(); len(calls) != 0 {
+			t.Errorf("--mode %s sent RPCs: %v", mode, calls)
 		}
 	}
 	for _, c := range []struct {
@@ -335,8 +332,11 @@ func TestExecJSONDataPathErrorCarriesExecID(t *testing.T) {
 	if len(ids) == 0 || ids[0] == "" {
 		t.Fatalf("the fake recorded no exec ID: %q", ids)
 	}
-	if last["event"] != "data_path_error" || last["exec_id"] != ids[len(ids)-1] || last["message"] == "" {
+	if last["event"] != "data_path_error" || last["exec_id"] != ids[len(ids)-1] {
 		t.Fatalf("last line %v, want data_path_error with exec_id %q", last, ids[len(ids)-1])
+	}
+	if message, ok := last["message"].(string); !ok || message == "" {
+		t.Fatalf("message = %#v, want a non-empty string", last["message"])
 	}
 	// Text mode is unchanged: no JSON on stdout.
 	res = r.run("sandbox", "exec", r.f.sb, "--", "denied")
@@ -357,8 +357,11 @@ func TestDataPathErrorEventWithoutExecID(t *testing.T) {
 	if jerr := json.Unmarshal(out.Bytes(), &line); jerr != nil {
 		t.Fatal(jerr)
 	}
-	if _, ok := line["exec_id"]; ok || line["event"] != "data_path_error" || line["message"] == "" {
+	if _, ok := line["exec_id"]; ok || line["event"] != "data_path_error" {
 		t.Fatalf("line %v", line)
+	}
+	if message, ok := line["message"].(string); !ok || message == "" {
+		t.Fatalf("message = %#v, want a non-empty string", line["message"])
 	}
 	with := dataPathErrorEvent(&ownsand.DataPathError{Operation: "exec", OperationID: "e1", Err: errors.New("x")})
 	if with.ExecID != "e1" {

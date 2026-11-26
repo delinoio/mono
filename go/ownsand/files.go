@@ -180,6 +180,12 @@ func (op *readOp) run(ctx context.Context) (int64, error) {
 		if errors.As(err, &cb) {
 			return op.next, cb.err
 		}
+		if isLocalCredentialError(err) {
+			if cerr := ctx.Err(); cerr != nil {
+				return op.next, cerr
+			}
+			return op.next, op.dpErr(err)
+		}
 		if errors.Is(err, io.EOF) {
 			if at.accepted {
 				op.rec.reset()
@@ -513,10 +519,10 @@ type FileWriteParams struct {
 	WriteID string
 	// Path is the absolute guest target path.
 	Path string
-	// BindingSalt is the binding salt of the write (32 bytes). A program
-	// that can open the same write in another process (for example after a
-	// restart) passes the same salt there, because the agent compares the
-	// digest with the one of the first call. Empty generates a salt.
+	// BindingSalt is the binding salt of the write (32 bytes). OpenFileWrite
+	// copies the salt, so the caller can reuse the buffer after it returns.
+	// To reopen the same write, pass the original salt value. An empty
+	// slice generates a salt.
 	BindingSalt []byte
 }
 
@@ -546,6 +552,8 @@ func (s *Sandbox) OpenFileWrite(p FileWriteParams) (*FileWrite, error) {
 		if salt, err = relaybinding.NewSalt(); err != nil {
 			return nil, err
 		}
+	} else {
+		salt = bytes.Clone(salt)
 	}
 	first := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: id, Path: p.Path, BindingSalt: salt}
 	if err := validate.WriteFileRequest(first, true); err != nil {

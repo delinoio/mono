@@ -6,6 +6,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,31 +16,33 @@ import (
 	"time"
 )
 
-// envRunMain makes the test binary run main instead of the tests, so that a
-// test can start the real entry point as a child process.
+// envRunMain makes the test binary run the CLI entry point as a child process.
 const envRunMain = "OWNSAND_TEST_RUN_MAIN"
 
 func TestMain(m *testing.M) {
 	if os.Getenv(envRunMain) == "1" {
-		main()
-		return
+		// The parent passes the acknowledgement pipe as the first ExtraFile.
+		ack := os.NewFile(3, "interrupt acknowledgement")
+		os.Exit(run(func() {
+			_, _ = ack.Write([]byte{1})
+		}))
 	}
 	os.Exit(m.Run())
 }
 
 // holdsFile reports whether the process has path open, by reading /proc.
-func holdsFile(pid int, path string) (held, supported bool) {
+func holdsFile(pid int, path string) (bool, error) {
 	dir := filepath.Join("/proc", strconv.Itoa(pid), "fd")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return false, false
+		return false, err
 	}
 	for _, e := range entries {
 		if target, err := os.Readlink(filepath.Join(dir, e.Name())); err == nil && target == path {
-			return true, true
+			return true, nil
 		}
 	}
-	return false, true
+	return false, nil
 }
 
 // A command that cannot observe the context (here, a read of a FIFO through
@@ -47,6 +50,11 @@ func holdsFile(pid int, path string) (held, supported bool) {
 // the process: main stops catching the signal once the first one canceled the
 // context.
 func TestSecondInterruptEndsACommandThatIgnoresTheFirst(t *testing.T) {
+	const phaseTimeout = 30 * time.Second
+
+	if _, err := os.ReadDir("/proc/self/fd"); err != nil {
+		t.Skipf("/proc is not available: %v", err)
+	}
 	fifo := filepath.Join(t.TempDir(), "secret.fifo")
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
 		t.Skipf("mkfifo is not available: %v", err)
@@ -57,17 +65,28 @@ func TestSecondInterruptEndsACommandThatIgnoresTheFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open the FIFO: %v", err)
 	}
-	defer hold.Close()
+	t.Cleanup(func() { _ = hold.Close() })
+
+	ackReader, ackWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create the acknowledgement pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = ackReader.Close() })
 
 	cmd := exec.Command(os.Args[0], "member", "accept", "--secret-file", fifo)
+	cmd.ExtraFiles = []*os.File{ackWriter}
 	cmd.Env = append(os.Environ(),
 		envRunMain+"=1",
 		"OWNSAND_API_KEY=osk_testkey",
 		"OWNSAND_API_URL=http://127.0.0.1:1",
 		"OWNSAND_ORG=00000000-0000-7000-8000-000000000000",
 	)
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start the command: %v", err)
+	startErr := cmd.Start()
+	// Close the parent's writer so that a child exit before acknowledgement
+	// produces EOF on the reader.
+	_ = ackWriter.Close()
+	if startErr != nil {
+		t.Fatalf("start the command: %v", startErr)
 	}
 	var waitErr error
 	ended := make(chan struct{})
@@ -79,11 +98,11 @@ func TestSecondInterruptEndsACommandThatIgnoresTheFirst(t *testing.T) {
 
 	// Wait until the command reads the FIFO, which is after main installed
 	// the interrupt handler.
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(phaseTimeout)
 	for {
-		held, supported := holdsFile(cmd.Process.Pid, fifo)
-		if !supported {
-			t.Skip("/proc is not available")
+		held, err := holdsFile(cmd.Process.Pid, fifo)
+		if err != nil {
+			t.Fatalf("inspect the command before FIFO readiness: %v", err)
 		}
 		if held {
 			break
@@ -98,27 +117,41 @@ func TestSecondInterruptEndsACommandThatIgnoresTheFirst(t *testing.T) {
 		}
 	}
 
-	// Send interrupts until the process ends. The first one cancels the
-	// context and is otherwise ignored by this command; a later one takes the
-	// default action. Sending more than one is safe: the process is gone
-	// after the one that arrives after main stopped catching the signal.
-	for {
-		_ = cmd.Process.Signal(syscall.SIGINT)
-		select {
-		case <-ended:
-			var ee *exec.ExitError
-			if !errors.As(waitErr, &ee) {
-				t.Fatalf("the command ended without a signal: %v", waitErr)
-			}
-			ws, ok := ee.Sys().(syscall.WaitStatus)
-			if !ok || !ws.Signaled() || ws.Signal() != syscall.SIGINT {
-				t.Fatalf("the command ended with %v, want termination by SIGINT", ee)
-			}
-			return
-		case <-time.After(20 * time.Millisecond):
+	if err := ackReader.SetReadDeadline(time.Now().Add(phaseTimeout)); err != nil {
+		t.Fatalf("set the acknowledgement deadline: %v", err)
+	}
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("send the first SIGINT: %v", err)
+	}
+	var ack [1]byte
+	if _, err := io.ReadFull(ackReader, ack[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			t.Fatal("the command exited before acknowledging the first SIGINT")
 		}
-		if time.Now().After(deadline.Add(30 * time.Second)) {
-			t.Fatal("the process did not end after repeated interrupts")
+		t.Fatalf("the command did not acknowledge the first SIGINT: %v", err)
+	}
+	held, err := holdsFile(cmd.Process.Pid, fifo)
+	if err != nil {
+		t.Fatalf("inspect the command after the first SIGINT: %v", err)
+	}
+	if !held {
+		t.Fatal("the command did not keep the FIFO open after the first SIGINT")
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("send the second SIGINT: %v", err)
+	}
+	select {
+	case <-ended:
+		var exitErr *exec.ExitError
+		if !errors.As(waitErr, &exitErr) {
+			t.Fatalf("the command ended without a signal: %v", waitErr)
 		}
+		status, ok := exitErr.Sys().(syscall.WaitStatus)
+		if !ok || !status.Signaled() || status.Signal() != syscall.SIGINT {
+			t.Fatalf("the command ended with %v, want termination by SIGINT", exitErr)
+		}
+	case <-time.After(phaseTimeout):
+		t.Fatal("the command did not end after the second SIGINT")
 	}
 }

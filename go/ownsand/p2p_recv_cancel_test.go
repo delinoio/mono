@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -313,57 +312,66 @@ func TestStreamRecvCancelStopsDrainingRefilledQueue(t *testing.T) {
 // the events that are already queued on its stream.
 func TestExecPeerStopsDeliveringQueuedEventsAfterCancel(t *testing.T) {
 	cp := newFakeCP(t)
-	// The agent finishes writing before the callback returns, so the stream
-	// queue holds the remaining events when the callback cancels.
-	written := make(chan struct{})
-	cp.agent.run = func(_ []string, e *fakeExec) {
-		e.write(0, []byte("first\n"))
-		<-written
-		for i := 0; i < 8; i++ {
-			e.write(0, []byte("later\n"))
-		}
-		e.finish(exitedEvent(0))
+	const first = "first\n"
+	var streamID atomic.Uint64
+	cp.p2pScript = func(int) p2pAction {
+		return p2pAction{raw: func(id uint64, sandboxID string) *ownsandv1.DataFrame {
+			streamID.Store(id)
+			return datapath.MustNewFrame(id, sandboxID, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{
+				Stdout: &ownsandv1.ExecOutput{Data: []byte(first)},
+			}})
+		}}
 	}
 	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 	execCtx, cancelExec := context.WithCancel(ctx)
 	defer cancelExec()
 
-	var canceled atomic.Bool
-	var after atomic.Int64
-	_, err := s.Exec(execCtx, ExecParams{Command: []string{"run"}, OnEvent: func(ev ExecEvent) error {
-		if canceled.Load() {
-			after.Add(1)
+	calls := 0
+	result, err := s.Exec(execCtx, ExecParams{Command: []string{"run"}, OnEvent: func(ev ExecEvent) error {
+		calls++
+		if calls > 1 {
 			return nil
 		}
-		if ev.Kind != ExecEventStdout {
-			return nil
+		if ev.Kind != ExecEventStdout || ev.Offset != 0 || string(ev.Data) != first {
+			t.Fatalf("fixture: first event = (%v, %d, %q), want stdout at offset 0 with %q", ev.Kind, ev.Offset, ev.Data, first)
 		}
-		canceled.Store(true)
-		cancelExec()
-		close(written)
-		// Wait until the peer's next event is queued on the stream, so that
-		// the receive after this callback finds a queued frame.
 		sess := s.installedSession()
-		for {
-			sess.mu.Lock()
-			queued := 0
-			for _, st := range sess.streams {
-				queued += len(st.ch)
-			}
-			sess.mu.Unlock()
-			if queued > 0 || ctx.Err() != nil {
-				return nil
-			}
-			runtime.Gosched()
+		if sess == nil {
+			t.Fatal("fixture: missing peer session for the active exec stream")
 		}
+		id := streamID.Load()
+		sess.mu.Lock()
+		st := sess.streams[id]
+		sess.mu.Unlock()
+		if st == nil {
+			t.Fatalf("fixture: missing active exec stream %d", id)
+		}
+		offset := ev.Offset + int64(len(ev.Data))
+		followUp := datapath.MustNewFrame(id, s.id, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{
+			Stdout: &ownsandv1.ExecOutput{Offset: offset, Data: []byte("later\n")},
+		}})
+		// Exec waits for this callback before reading the stream again.
+		// Check the queued frame, then put it back for the next receive.
+		sess.dispatch(followUp)
+		select {
+		case queued := <-st.ch:
+			if queued != followUp {
+				t.Fatalf("fixture: exec stream %d has the wrong frame, want follow-up stdout at offset %d", id, offset)
+			}
+			st.ch <- queued
+		default:
+			t.Fatalf("fixture: exec stream %d is missing queued follow-up stdout at offset %d", id, offset)
+		}
+		cancelExec()
+		return nil
 	}})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("exec error = %v, want context.Canceled", err)
+	if result != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Exec = (%+v, %v), want (nil, context.Canceled)", result, err)
 	}
-	if n := after.Load(); n != 0 {
-		t.Fatalf("%d callbacks after the cancellation, want 0", n)
+	if calls != 1 {
+		t.Fatalf("Exec callbacks = %d, want exactly one before cancellation", calls)
 	}
 }
 

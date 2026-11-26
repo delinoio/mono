@@ -46,7 +46,9 @@ func dataPathOperationError(operation, operationID string, unknown bool, err err
 	if errors.As(err, &cb) {
 		return cb.err
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// A relay recovery window that expired is a data path failure, not a caller
+	// cancellation, even though its cancellation cause wraps a context error.
+	if !errors.Is(err, errRecoveryDeadline) && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		return err
 	}
 	var sessionClosed *errSessionClosedByCaller

@@ -592,8 +592,8 @@ func (c *Client) stallContext(ctx context.Context, budget time.Duration) (actx c
 // cause: errStall for a stalled stream, and for a continuation that passed
 // its recovery budget before acceptance the deadline error of rec.
 func streamErr(actx context.Context, err error, rec *recovery) error {
-	if err == nil {
-		return nil
+	if err == nil || isLocalCredentialError(err) {
+		return err
 	}
 	switch cause := context.Cause(actx); {
 	case errors.Is(cause, errStall):

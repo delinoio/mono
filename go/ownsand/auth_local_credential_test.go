@@ -3,14 +3,17 @@
 package ownsand
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // errLocalCredTestSentinel is the error that the test token sources return.
@@ -210,6 +213,93 @@ func TestLocalCredentialFailureAfterCallerCancellationReturnsContextError(t *tes
 	}
 	if n := len(cp.authRequests()); n != 0 {
 		t.Fatalf("%d AuthorizeRelay calls", n)
+	}
+}
+
+func TestRelayStreamCredentialEOF(t *testing.T) {
+	wrappedEOF := fmt.Errorf("read token: %w", io.EOF)
+	for _, tc := range []struct {
+		name         string
+		callbackErr  error
+		cancelCaller bool
+	}{
+		{name: "plain", callbackErr: io.EOF},
+		{name: "wrapped", callbackErr: wrappedEOF},
+		{name: "canceled caller", callbackErr: wrappedEOF, cancelCaller: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, method := range []string{"Exec", "AttachExec", "ReadFile"} {
+				t.Run(method, func(t *testing.T) {
+					cp := newFakeCP(t)
+					cp.agent.setFile("/f", []byte("contents"))
+					execID := mustID(t)
+					if method == "AttachExec" {
+						cp.agent.startExec(cp, &ownsandv1.ExecRequest{ExecId: execID, Command: []string{"run"}})
+					}
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					ts := &localCredTokenSource{failFrom: 2, failTo: 2, onFail: func() error {
+						if tc.cancelCaller {
+							cancel()
+						}
+						return tc.callbackErr
+					}}
+					s := cp.handle(t, localCredClient(t, cp, TransportRelay, ts))
+					run := func(ctx context.Context) error {
+						t.Helper()
+						if method == "ReadFile" {
+							var dst bytes.Buffer
+							n, err := s.ReadFile(ctx, "/f", &dst)
+							if err == nil && (n != 8 || dst.String() != "contents") {
+								t.Fatalf("ReadFile = %d, %q, want 8, contents", n, dst.String())
+							}
+							return err
+						}
+
+						var result *ExecResult
+						var err error
+						if method == "Exec" {
+							result, err = localCredExecOnce(s, ctx)
+						} else {
+							result, err = s.AttachExec(ctx, execID, AttachParams{})
+						}
+						if err == nil && (result == nil || result.Kind != ExecResultExited || result.ExitCode == nil || *result.ExitCode != 0) {
+							t.Fatalf("%s = %+v, want exit code 0", method, result)
+						}
+						return err
+					}
+
+					err := run(ctx)
+					if tc.cancelCaller {
+						if err != context.Canceled {
+							t.Fatalf("error = %v, want caller cancellation", err)
+						}
+					} else {
+						if ctx.Err() != nil || !errors.Is(err, tc.callbackErr) || !errors.Is(err, io.EOF) {
+							t.Fatalf("error = %v, caller context = %v, want credential EOF with a live caller", err, ctx.Err())
+						}
+						var dp *DataPathError
+						if !errors.As(err, &dp) || dp.OutcomeUnknown {
+							t.Fatalf("error = %v, want DataPathError with a known outcome", err)
+						}
+					}
+					if calls, auths := ts.callCount(), len(cp.authRequests()); calls != 2 || auths != 1 {
+						t.Fatalf("token calls = %d, wire authorizations = %d, want 2, 1", calls, auths)
+					}
+					for _, name := range []string{"Exec", "AttachExec", "ReadFile"} {
+						if n := cp.relayCount(name); n != 0 {
+							t.Fatalf("%s sent %d relay requests after credential failure", name, n)
+						}
+					}
+					if err := run(t.Context()); err != nil {
+						t.Fatalf("%s after token source recovery: %v", method, err)
+					}
+					if n := cp.relayCount(method); n != 1 {
+						t.Fatalf("%s sent %d relay requests after token source recovery, want 1", method, n)
+					}
+				})
+			}
+		})
 	}
 }
 

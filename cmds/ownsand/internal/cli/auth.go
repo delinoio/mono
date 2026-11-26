@@ -26,6 +26,8 @@ const refreshMargin = time.Minute
 // other processes keep rotating the stored refresh token meanwhile.
 const maxRefreshAttempts = 3
 
+var errRefreshContention = errors.New("the Logto token was refreshed by another process too often while this command refreshed it; run the command again")
+
 // defaultRefreshAdoptWait bounds how long a token request waits for another
 // process to publish the rotated refresh token after the token endpoint
 // rejected the one that this process sent with invalid_grant.
@@ -216,41 +218,6 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 		*creds = *stored
 		return rotated, nil
 	}
-	// awaitRotation waits for another process to publish a new generation of
-	// the same session after the token endpoint rejected the refresh token
-	// with invalid_grant while the store still holds that token. The other
-	// process refreshes without the store lock, so the issuer may already
-	// have rotated the token that this process sent while the rotation is not
-	// published yet. It returns true once a new generation is adopted, false
-	// when none appeared within the bound (a revoked token), and an error when
-	// ctx ends or the session was removed or replaced.
-	awaitRotation := func(ctx context.Context) (bool, error) {
-		wait, poll := a.env.RefreshAdoptWait, a.env.RefreshAdoptPoll
-		if wait <= 0 {
-			wait = defaultRefreshAdoptWait
-		}
-		if poll <= 0 {
-			poll = defaultRefreshAdoptPoll
-		}
-		a.logger.Debug("ownsand waits for another process to publish the rotated Logto refresh token",
-			slog.Duration("wait", wait), slog.Duration("poll", poll))
-		deadline := time.NewTimer(wait)
-		defer deadline.Stop()
-		tick := time.NewTicker(poll)
-		defer tick.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return false, fmt.Errorf("wait for the rotated Logto refresh token: %w", ctx.Err())
-			case <-deadline.C:
-				return false, nil
-			case <-tick.C:
-				if rotated, err := adopt(); err != nil || rotated {
-					return rotated, err
-				}
-			}
-		}
-	}
 	return func(ctx context.Context) (string, error) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -277,11 +244,10 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 			sent := creds.RefreshToken
 			tok, err := cfg.Refresh(ctx, sent)
 			if err != nil {
-				// A refresh token that another process rotated while this
-				// request was in flight is rejected as spent: retry once
-				// with the stored generation instead of failing.
+				// Another process may have spent this refresh token while
+				// the request was in flight.
 				var oe *logto.Error
-				if attempt < maxRefreshAttempts && errors.As(err, &oe) && oe.Code() == logto.InvalidGrant {
+				if errors.As(err, &oe) && oe.Code() == logto.InvalidGrant {
 					rotated, aerr := adopt()
 					if aerr != nil {
 						return "", aerr
@@ -289,11 +255,18 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 					if !rotated {
 						// The refresh in another process may have rotated
 						// the token without publishing the result yet.
-						if rotated, aerr = awaitRotation(ctx); aerr != nil {
+						if rotated, aerr = a.awaitRefreshRotation(ctx, adopt); aerr != nil {
 							return "", aerr
 						}
 					}
 					if rotated {
+						if fresh() {
+							a.logger.Debug("ownsand adopted the Logto access token that another process refreshed")
+							return creds.AccessToken, nil
+						}
+						if attempt >= maxRefreshAttempts {
+							return "", errRefreshContention
+						}
 						a.logger.Debug("ownsand retries the Logto token refresh with the token that another process stored")
 						continue
 					}
@@ -330,7 +303,7 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 					return creds.AccessToken, nil
 				}
 				if attempt >= maxRefreshAttempts {
-					return "", errors.New("the Logto token was refreshed by another process too often while this command refreshed it; run the command again")
+					return "", errRefreshContention
 				}
 				continue
 			default:
@@ -341,6 +314,41 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 			return creds.AccessToken, nil
 		}
 	}, nil
+}
+
+// awaitRefreshRotation polls for a newer credential generation in the same
+// session. Another process can spend the refresh token before publishing its
+// replacement. Check the store at the deadline to catch publications after
+// the final poll.
+func (a *app) awaitRefreshRotation(ctx context.Context, adopt func() (bool, error)) (bool, error) {
+	wait, poll := a.env.RefreshAdoptWait, a.env.RefreshAdoptPoll
+	if wait <= 0 {
+		wait = defaultRefreshAdoptWait
+	}
+	if poll <= 0 {
+		poll = defaultRefreshAdoptPoll
+	}
+	a.logger.Debug("ownsand waits for another process to publish the rotated Logto refresh token",
+		slog.Duration("wait", wait), slog.Duration("poll", poll))
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	tick := time.NewTicker(poll)
+	defer tick.Stop()
+	for {
+		reachedDeadline := false
+		select {
+		case <-ctx.Done():
+		case <-deadline.C:
+			reachedDeadline = true
+		case <-tick.C:
+		}
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Errorf("wait for the rotated Logto refresh token: %w", err)
+		}
+		if rotated, err := adopt(); reachedDeadline || rotated || err != nil {
+			return rotated, err
+		}
+	}
 }
 
 // credentialMismatch reports the first explicitly configured Logto setting

@@ -101,36 +101,41 @@ func startResourceControlPlane(t *testing.T, empty bool) (*resourceControlPlane,
 // sandbox or snapshot is an error, and that a response with the resource keeps
 // the current result.
 func TestMissingResourceResponses(t *testing.T) {
-	calls := map[string]func(*testing.T, *Client, *Sandbox) (any, error){
-		"CreateSandbox": func(t *testing.T, c *Client, _ *Sandbox) (any, error) {
+	calls := map[string]func(*testing.T, *Client, *Sandbox) (hasResource bool, err error){
+		"CreateSandbox": func(t *testing.T, c *Client, _ *Sandbox) (bool, error) {
 			sb, err := c.CreateSandbox(context.Background(), validParams())
 			if err == nil && (sb == nil || sb.ID() == "") {
 				t.Fatalf("CreateSandbox returned an empty handle without an error: %+v", sb)
 			}
-			return sb, err
+			return sb != nil, err
 		},
-		"Get": func(_ *testing.T, _ *Client, s *Sandbox) (any, error) {
-			return s.Get(context.Background())
+		"Get": func(_ *testing.T, _ *Client, s *Sandbox) (bool, error) {
+			sb, err := s.Get(context.Background())
+			return sb != nil, err
 		},
-		"Pause": func(_ *testing.T, _ *Client, s *Sandbox) (any, error) {
-			return s.Pause(context.Background())
+		"Pause": func(_ *testing.T, _ *Client, s *Sandbox) (bool, error) {
+			sb, err := s.Pause(context.Background())
+			return sb != nil, err
 		},
-		"Resume": func(_ *testing.T, _ *Client, s *Sandbox) (any, error) {
-			return s.Resume(context.Background())
+		"Resume": func(_ *testing.T, _ *Client, s *Sandbox) (bool, error) {
+			sb, err := s.Resume(context.Background())
+			return sb != nil, err
 		},
-		"Delete": func(_ *testing.T, _ *Client, s *Sandbox) (any, error) {
-			return s.Delete(context.Background())
+		"Delete": func(_ *testing.T, _ *Client, s *Sandbox) (bool, error) {
+			sb, err := s.Delete(context.Background())
+			return sb != nil, err
 		},
-		"Snapshot": func(_ *testing.T, _ *Client, s *Sandbox) (any, error) {
-			return s.Snapshot(context.Background())
+		"Snapshot": func(_ *testing.T, _ *Client, s *Sandbox) (bool, error) {
+			snap, err := s.Snapshot(context.Background())
+			return snap != nil, err
 		},
 	}
 	for name, call := range calls {
 		t.Run(name+"/without resource", func(t *testing.T) {
 			cp, c, s := startResourceControlPlane(t, true)
-			got, err := call(t, c, s)
+			_, err := call(t, c, s)
 			if err == nil {
-				t.Fatalf("%s accepted a response without its resource: %v", name, got)
+				t.Fatalf("%s accepted a response without its resource", name)
 			}
 			if !strings.Contains(err.Error(), "response carried no") {
 				t.Fatalf("%s error does not name the missing resource: %v", name, err)
@@ -147,11 +152,11 @@ func TestMissingResourceResponses(t *testing.T) {
 		})
 		t.Run(name+"/with resource", func(t *testing.T) {
 			_, c, s := startResourceControlPlane(t, false)
-			got, err := call(t, c, s)
+			hasResource, err := call(t, c, s)
 			if err != nil {
 				t.Fatalf("%s: %v", name, err)
 			}
-			if got == nil {
+			if !hasResource {
 				t.Fatalf("%s returned no resource", name)
 			}
 		})
