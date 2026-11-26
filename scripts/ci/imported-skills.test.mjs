@@ -25,6 +25,7 @@ import {
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const script = join(repositoryRoot, "scripts/ci/imported-skills.mjs");
+const demoNoticePath = `${SkillsDirectory}/demo/NOTICE`;
 
 const commit = "a".repeat(40);
 
@@ -87,6 +88,29 @@ function kinds(root) {
   return verifyImportedSkills(root).map((problem) => problem.kind);
 }
 
+function assertNoticeProblem(f, kind, message) {
+  f.remove(`${SkillsDirectory}/licensed/SKILL.md`);
+  const result = spawnSync(process.execPath, [script, "--root", f.root], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 1, result.stderr);
+  const noticeProblems = result.stderr
+    .split("\n")
+    .filter((line) => line.includes(`${demoNoticePath} `));
+  assert.equal(noticeProblems.length, 1, result.stderr);
+  assert.ok(
+    noticeProblems[0].startsWith(
+      `imported_skills_problem kind=${kind} ${demoNoticePath} ${message}`,
+    ),
+    result.stderr,
+  );
+  assert.match(
+    result.stderr,
+    /^imported_skills_problem kind=skill-file-missing \.agents\/skills\/licensed\/SKILL\.md /mu,
+  );
+  assert.match(result.stderr, /^imported_skills_failed problems=\d+$/mu);
+}
+
 test("a consistent fixture has no problem", (t) => {
   const f = fixture(t);
   assert.deepEqual(verifyImportedSkills(f.root), []);
@@ -110,6 +134,13 @@ test("a missing NOTICE is reported", (t) => {
   const found = kinds(f.root);
   assert.ok(found.includes(ProblemKind.LicenseMissing));
   assert.ok(found.includes(ProblemKind.FileMissing));
+});
+
+test("the command line reports a NOTICE directory and checks later skills", (t) => {
+  const f = fixture(t);
+  f.remove(demoNoticePath);
+  mkdirSync(join(f.root, demoNoticePath));
+  assertNoticeProblem(f, "notice-invalid", "must be a regular file");
 });
 
 test("a missing LICENSE is reported", (t) => {
@@ -301,6 +332,22 @@ test("the repository copy test reads the checked-in tree unchanged", (t) => {
 // Creating a symbolic link needs a privilege or developer mode on Windows, so
 // the link fixtures run on other platforms only.
 const symlinkTest = process.platform === "win32" ? test.skip : test;
+
+for (const [targetKind, target] of [
+  ["directory", "rules"],
+  ["dangling", "missing-target"],
+  ["file", "SKILL.md"],
+]) {
+  symlinkTest(
+    `the command line reports a ${targetKind} link at NOTICE once and checks later skills`,
+    (t) => {
+      const f = fixture(t);
+      f.remove(demoNoticePath);
+      symlinkSync(target, join(f.root, demoNoticePath));
+      assertNoticeProblem(f, "symlink-unsupported", "is a symbolic link");
+    },
+  );
+}
 
 for (const targetExists of [true, false]) {
   symlinkTest(

@@ -59,6 +59,7 @@ export const ProblemKind = Object.freeze({
   SkillDirectoryMissing: "skill-directory-missing",
   SkillFileMissing: "skill-file-missing",
   LicenseMissing: "license-missing",
+  NoticeInvalid: "notice-invalid",
   NoticeMismatch: "notice-mismatch",
   FileMissing: "file-missing",
   FileChanged: "file-changed",
@@ -92,13 +93,16 @@ export function hashFile(path) {
 // `directory`, each sorted. A `Dirent` of a symbolic link is neither a file
 // nor a directory, so the walk records it separately and neither recurses into
 // nor stats its target (a dangling or looping link must not fail the walk).
-function listEntries(directory) {
+function listEntries(directory, { skipNotice = false } = {}) {
   const files = [];
   const symlinks = [];
   const walk = (current) => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
       const relativePath = relative(directory, path).split(sep).join("/");
+      if (skipNotice && relativePath === "NOTICE") {
+        continue;
+      }
       if (entry.isSymbolicLink()) {
         symlinks.push(relativePath);
       } else if (entry.isDirectory()) {
@@ -112,7 +116,7 @@ function listEntries(directory) {
   return { files: files.sort(), symlinks: symlinks.sort() };
 }
 
-function skillRootStats(path) {
+function entryStats(path) {
   try {
     return lstatSync(path);
   } catch (error) {
@@ -194,7 +198,7 @@ export function buildManifest(root) {
     }
     const directory = join(root, SkillsDirectory, name);
     const directoryPath = `${SkillsDirectory}/${name}`;
-    const stats = skillRootStats(directory);
+    const stats = entryStats(directory);
     if (stats?.isSymbolicLink()) {
       throw new Error(symlinkMessage(directoryPath, "directory"));
     }
@@ -280,7 +284,7 @@ export function verifyImportedSkills(root) {
 
     const directory = join(root, SkillsDirectory, name);
     const directoryPath = `${SkillsDirectory}/${name}`;
-    const stats = skillRootStats(directory);
+    const stats = entryStats(directory);
     if (stats?.isSymbolicLink()) {
       report(
         ProblemKind.SymlinkUnsupported,
@@ -307,17 +311,32 @@ export function verifyImportedSkills(root) {
     }
 
     const hasLicense = existsSync(join(directory, "LICENSE"));
-    const hasNotice = existsSync(join(directory, "NOTICE"));
-    if (!hasLicense && !hasNotice) {
+    const noticePath = join(directory, "NOTICE");
+    const noticeStats = entryStats(noticePath);
+    const invalidNotice = noticeStats !== undefined && !noticeStats.isFile();
+    if (!hasLicense && noticeStats === undefined) {
       report(
         ProblemKind.LicenseMissing,
         `${directoryPath} has neither a LICENSE nor a NOTICE file; restore it from Git`,
         { skill: name },
       );
     }
-    if (hasNotice) {
+    if (invalidNotice) {
+      const path = `${directoryPath}/NOTICE`;
+      if (noticeStats.isSymbolicLink()) {
+        report(ProblemKind.SymlinkUnsupported, symlinkMessage(path), {
+          skill: name,
+          path: "NOTICE",
+        });
+      } else {
+        report(ProblemKind.NoticeInvalid, `${path} must be a regular file`, {
+          skill: name,
+          path: "NOTICE",
+        });
+      }
+    } else if (noticeStats !== undefined) {
       // Line endings do not matter for the comparison.
-      const notice = readFileSync(join(directory, "NOTICE"), "utf8")
+      const notice = readFileSync(noticePath, "utf8")
         .replaceAll("\r\n", "\n")
         .split("\n");
       for (const line of noticeLines(entry)) {
@@ -352,7 +371,10 @@ export function verifyImportedSkills(root) {
         );
       }
     }
-    const { files: actual, symlinks } = listEntries(directory);
+    // The NOTICE type check already reported an invalid entry.
+    const { files: actual, symlinks } = listEntries(directory, {
+      skipNotice: invalidNotice,
+    });
     for (const file of symlinks) {
       report(
         ProblemKind.SymlinkUnsupported,
@@ -361,6 +383,9 @@ export function verifyImportedSkills(root) {
       );
     }
     for (const file of Object.keys(baseline.files).sort()) {
+      if (invalidNotice && file === "NOTICE") {
+        continue;
+      }
       if (!actual.includes(file)) {
         report(
           ProblemKind.FileMissing,
