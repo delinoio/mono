@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
-import { DataPathError } from "./errors.ts";
+import { DataPathError, OwnSandError } from "./errors.ts";
 import { ExecResultKind } from "./operations/exec.ts";
 
 import { Disconnect } from "./testing/fake-api.ts";
@@ -141,6 +141,17 @@ describe("the pre-start state lookup after AttachExec not_found", () => {
     const h = setup();
     disconnectThenNoRecord(h);
     h.state.value = SandboxState.PAUSED;
+    h.api.unary(SandboxService, "GetSandbox", (req, call) => {
+      if (call.index === 1) {
+        throw new ConnectError("lookup failed", Code.Unavailable);
+      }
+      return {
+        sandbox: {
+          sandboxId: req.sandboxId,
+          state: call.index === 2 ? SandboxState.UNREACHABLE : h.state.value,
+        },
+      };
+    });
     after(h, 3 * MIN, () => {
       h.state.value = SandboxState.RUNNING;
     });
@@ -150,6 +161,36 @@ describe("the pre-start state lookup after AttachExec not_found", () => {
     const execs = h.api.callsOf("Exec");
     expect(execs).toHaveLength(2);
     expect(execs[1]?.request).toEqual(execs[0]?.request);
+  });
+
+  test("rejects a missing sandbox on the first resume poll", async () => {
+    const h = setup();
+    disconnectThenNoRecord(h);
+    h.api.unary(SandboxService, "GetSandbox", (req, call) => {
+      if (call.index === 1) return {};
+      return {
+        sandbox: {
+          sandboxId: req.sandboxId,
+          state: call.index === 0 ? SandboxState.PAUSED : SandboxState.RUNNING,
+        },
+      };
+    });
+    const error = await h.clock.run(runExec(h)).catch((e) => e);
+    expect(error).toBeInstanceOf(OwnSandError);
+    expect(error.message).toBe("the response carried no sandbox");
+    expect(h.api.callsOf("GetSandbox")).toHaveLength(2);
+    expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+  });
+
+  test("a missing sandbox in the advisory lookup still allows the resend", async () => {
+    const h = setup();
+    disconnectThenNoRecord(h);
+    h.api.unary(SandboxService, "GetSandbox", () => ({}));
+    const result = await h.clock.run(runExec(h));
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    expect(h.api.callsOf("GetSandbox")).toHaveLength(1);
+    expect(h.api.callsOf("Exec")).toHaveLength(2);
   });
 
   test("a prompt lookup failure still resends the request while budget remains", async () => {

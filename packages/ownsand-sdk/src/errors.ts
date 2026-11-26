@@ -21,6 +21,13 @@ export class RelayStreamCompletedError extends OwnSandError {
   override name = "RelayStreamCompletedError";
 }
 
+/** A successful sandbox RPC omitted its sandbox resource. */
+export class MissingSandboxError extends OwnSandError {
+  constructor() {
+    super("the response carried no sandbox");
+  }
+}
+
 /** The client configuration is incomplete or invalid. */
 export class OwnSandConfigError extends OwnSandError {
   override name = "OwnSandConfigError";
@@ -199,7 +206,10 @@ export function isLocalCredentialError(error: unknown): boolean {
 export function classifyFailure(error: unknown): FailureClass {
   // Every other DataPathError is an interruption (the write path relies on
   // that for its deadline retry), so this terminal subclass is checked first.
-  if (error instanceof InvalidFrameError) {
+  if (
+    error instanceof InvalidFrameError ||
+    error instanceof MissingSandboxError
+  ) {
     return FailureClass.Terminal;
   }
   if (isLocalCredentialError(error)) {

@@ -8,6 +8,7 @@ import { execBinding, requestDigest } from "./digest.ts";
 import {
   billingReasonOf,
   DataPathError,
+  OwnSandError,
   OwnSandValidationError,
 } from "./errors.ts";
 import { Timing } from "./relay/context.ts";
@@ -23,6 +24,7 @@ import {
 } from "@delino/ownsand-protos/v1/common_pb";
 import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
+import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import type { DataPathSelector } from "./datapath.ts";
 import {
   ExecEventType,
@@ -1182,6 +1184,29 @@ describe("exec over the relay", () => {
     expect(h.clock.now()).toBeGreaterThan(150_000);
   });
 
+  test("rejects a missing sandbox after an exec reports paused", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", async function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started());
+      yield execMsg(ev.paused());
+    });
+    h.api.unary(SandboxService, "GetSandbox", (req, call) =>
+      call.index === 0
+        ? {}
+        : {
+            sandbox: { sandboxId: req.sandboxId, state: SandboxState.RUNNING },
+          },
+    );
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["x"] });
+    const error = await h.clock.run(handle.wait()).catch((e) => e);
+    expect(error).toBeInstanceOf(OwnSandError);
+    expect(error.message).toBe("the response carried no sandbox");
+    expect(h.api.callsOf("GetSandbox")).toHaveLength(1);
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+    expect(h.api.callsOf("AttachExec")).toHaveLength(0);
+  });
+
   test("ends with the sandbox end reason when a paused sandbox ends", async () => {
     const h = setup();
     h.api.stream(RelayService, "Exec", async function* () {
@@ -1190,17 +1215,13 @@ describe("exec over the relay", () => {
       yield execMsg(ev.paused());
     });
     h.state.value = SandboxState.DELETED;
-    h.api.unary(
-      (await import("@delino/ownsand-protos/v1/sandbox_pb")).SandboxService,
-      "GetSandbox",
-      () => ({
-        sandbox: {
-          sandboxId: SANDBOX,
-          state: SandboxState.DELETED,
-          endReason: SandboxEndReason.IDLE_TTL_EXPIRED,
-        },
-      }),
-    );
+    h.api.unary(SandboxService, "GetSandbox", () => ({
+      sandbox: {
+        sandboxId: SANDBOX,
+        state: SandboxState.DELETED,
+        endReason: SandboxEndReason.IDLE_TTL_EXPIRED,
+      },
+    }));
     const result = await h.clock.run(
       h.client
         .sandbox(SANDBOX)
