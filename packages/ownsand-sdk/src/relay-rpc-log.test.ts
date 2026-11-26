@@ -3,6 +3,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { LogEvent, type LogRecord } from "./logger.ts";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
+import { ExecFailureReason } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { SandboxEndReason } from "@delino/ownsand-protos/v1/common_pb";
 import { Hang, Sleep } from "./testing/fake-api.ts";
 import {
@@ -162,4 +163,169 @@ describe("relay stream rpc records", () => {
       ]);
     });
   });
+});
+
+describe("direct relay stream rpc records", () => {
+  test("breaking after ReadFile end logs one ok record", async () => {
+    const { h, rpcs } = loggedSetup();
+    h.api.stream(RelayService, "ReadFile", function* () {
+      yield file.accepted();
+      yield file.chunk(0, "hello");
+      yield new Sleep(250);
+      yield file.end(5);
+      yield new Hang();
+    });
+    await h.clock.run(
+      (async () => {
+        for await (const response of h.client.relay.readFile({
+          sandboxId: SANDBOX,
+          path: "/f",
+        })) {
+          if (response.event?.event.case === "end") {
+            break;
+          }
+        }
+      })(),
+    );
+    expect(rpcs(READ)).toEqual([
+      { event: LogEvent.Rpc, rpc: READ, durationMs: 250, code: "ok" },
+    ]);
+  });
+
+  const terminalEvents = [
+    ev.exited(0),
+    {
+      case: "failed",
+      value: { reason: ExecFailureReason.UNSPECIFIED, message: "no such file" },
+    },
+    {
+      case: "sandboxEnded",
+      value: { reason: SandboxEndReason.UNSPECIFIED },
+    },
+  ] as const;
+
+  for (const [method, rpc, message] of [
+    ["Exec", EXEC, execMsg],
+    ["AttachExec", ATTACH, attachMsg],
+  ] as const) {
+    for (const terminal of terminalEvents) {
+      test(`breaking after ${method} ${terminal.case} logs one ok record`, async () => {
+        const { h, rpcs } = loggedSetup();
+        h.api.stream(RelayService, method, function* () {
+          yield message(ev.accepted());
+          yield new Sleep(120);
+          yield message(terminal);
+          yield new Hang();
+        });
+        const request = { sandboxId: SANDBOX, execId: EXEC_ID };
+        const stream =
+          method === "Exec"
+            ? h.client.relay.exec({ ...request, command: ["x"] })
+            : h.client.relay.attachExec(request);
+        await h.clock.run(
+          (async () => {
+            for await (const response of stream) {
+              if (response.event?.event.case === terminal.case) {
+                break;
+              }
+            }
+          })(),
+        );
+        expect(rpcs(rpc)).toEqual([
+          { event: LogEvent.Rpc, rpc, durationMs: 120, code: "ok" },
+        ]);
+      });
+    }
+  }
+
+  test("breaking before ReadFile end logs one Canceled record", async () => {
+    const { h, rpcs } = loggedSetup();
+    h.api.stream(RelayService, "ReadFile", function* () {
+      yield file.accepted();
+      yield new Sleep(250);
+      yield file.end(0);
+    });
+    await h.clock.run(
+      (async () => {
+        for await (const response of h.client.relay.readFile({
+          sandboxId: SANDBOX,
+          path: "/f",
+        })) {
+          expect(response.event?.event.case).toBe("accepted");
+          break;
+        }
+      })(),
+    );
+    expect(rpcs(READ)).toEqual([
+      { event: LogEvent.Rpc, rpc: READ, durationMs: 0, code: "Canceled" },
+    ]);
+  });
+
+  for (const terminal of [false, true]) {
+    const phase = terminal ? "after" : "before";
+
+    test(`a caller abort ${phase} the terminal event logs Canceled`, async () => {
+      const { h, rpcs } = loggedSetup();
+      h.api.stream(RelayService, "Exec", function* () {
+        yield terminal ? execMsg(ev.exited(0)) : execMsg(ev.accepted());
+        yield new Hang();
+      });
+      const controller = new AbortController();
+      const iterator = h.client.relay
+        .exec(
+          { sandboxId: SANDBOX, command: ["x"] },
+          { signal: controller.signal },
+        )
+        [Symbol.asyncIterator]();
+      const first = await h.clock.run(iterator.next());
+      expect(first.value?.event?.event.case).toBe(
+        terminal ? "exited" : "accepted",
+      );
+      // Before the terminal event, abort while the next read is pending.
+      // After it, abort while the iterator still holds the terminal event.
+      const pending = terminal ? undefined : iterator.next();
+      await h.clock.settle();
+      controller.abort();
+      await expect(
+        h.clock.run(pending ?? iterator.next()),
+      ).rejects.toMatchObject({
+        code: Code.Canceled,
+      });
+      expect(rpcs(EXEC)).toEqual([
+        { event: LogEvent.Rpc, rpc: EXEC, durationMs: 0, code: "Canceled" },
+      ]);
+    });
+
+    test(`a wire error read ${phase} the terminal event keeps its Connect code`, async () => {
+      const { h, rpcs } = loggedSetup();
+      h.api.stream(RelayService, "Exec", function* () {
+        yield terminal ? execMsg(ev.exited(0)) : execMsg(ev.accepted());
+        yield new Sleep(100);
+        throw new ConnectError("denied", Code.PermissionDenied);
+      });
+      const iterator = h.client.relay
+        .exec({
+          sandboxId: SANDBOX,
+          command: ["x"],
+        })
+        [Symbol.asyncIterator]();
+      const first = await h.clock.run(iterator.next());
+      expect(first.value?.event?.event.case).toBe(
+        terminal ? "exited" : "accepted",
+      );
+      expect(rpcs(EXEC)).toEqual([]);
+      await expect(h.clock.run(iterator.next())).rejects.toMatchObject({
+        code: Code.PermissionDenied,
+        rawMessage: "denied",
+      });
+      expect(rpcs(EXEC)).toEqual([
+        {
+          event: LogEvent.Rpc,
+          rpc: EXEC,
+          durationMs: 100,
+          code: "PermissionDenied",
+        },
+      ]);
+    });
+  }
 });
