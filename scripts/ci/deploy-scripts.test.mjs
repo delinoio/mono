@@ -2439,6 +2439,7 @@ function setupDroplet(
     old = [],
     envFile = "LOG_LEVEL=info\n",
     route,
+    deploymentUuid = dropletDeploymentUuid,
     state,
     previous,
     stubs = {},
@@ -2454,7 +2455,7 @@ function setupDroplet(
   writeFileSync(join(dir, "calls.log"), "");
   // The deployment identifier that droplet-deploy.sh reads (a fixed UUID, and
   // a file that exists on every platform).
-  writeFileSync(join(dir, "id-source"), `${dropletDeploymentUuid}\n`);
+  writeFileSync(join(dir, "id-source"), `${deploymentUuid}\n`);
   // `null` leaves the env file out.
   if (envFile !== null) {
     writeFileSync(join(deployRoot, "env", `${args[0]}.env`), envFile);
@@ -2732,15 +2733,30 @@ test(
   "droplet deploy switches the route to the new alias on every deployment",
   { skip: skipDroplet },
   (t) => {
+    const routePath = "caddy/sites/api.caddy";
+    const upstream = /^[ \t]+reverse_proxy (\S+)/m;
     const first = runDroplet(t);
     assert.equal(first.status, 0, first.stderr);
-    const route = first.read("caddy/sites/api.caddy");
-    // A second run of the same image, in a fresh root with the route of the
-    // first run, still reloads the proxy: every deployment has its own alias.
-    const second = runDroplet(t, undefined, { old: ["old1"], route });
+    const route = first.read(routePath);
+    assert.equal(
+      route?.match(upstream)?.[1],
+      `api-${dropletDeploymentUuid.replaceAll("-", "")}:8080`,
+    );
+
+    // Seed the first route and deploy the same image with a new identifier.
+    const secondUuid = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+    const second = runDroplet(t, undefined, {
+      old: ["old1"],
+      route,
+      deploymentUuid: secondUuid,
+    });
     assert.equal(second.status, 0, second.stderr);
-    assert.ok(second.calls.some((call) => call.startsWith("docker exec")));
+    assert.ok(second.calls.some(isProxyLoad));
     assert.equal(second.read("state/api.current"), `${dropletImage}\n`);
+    assert.equal(
+      second.read(routePath)?.match(upstream)?.[1],
+      `api-${secondUuid.replaceAll("-", "")}:8080`,
+    );
   },
 );
 
