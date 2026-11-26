@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
@@ -105,7 +106,7 @@ func (d *devSessionService) CreateDevSession(_ context.Context, req *connect.Req
 	if err != nil {
 		return nil, err
 	}
-	if len(req.Msg.GetLabel()) > 100 {
+	if utf8.RuneCountInString(req.Msg.GetLabel()) > 100 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("label has more than 100 characters"))
 	}
 	var prof *sandrunv1.RunnerProfile
