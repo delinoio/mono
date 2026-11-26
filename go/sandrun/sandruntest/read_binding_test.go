@@ -3,11 +3,15 @@
 package sandruntest
 
 import (
+	"context"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -17,7 +21,19 @@ import (
 
 func TestFakeReadBinding(t *testing.T) {
 	s := New()
-	t.Cleanup(s.Close)
+	const timeout = 5 * time.Second
+	t.Cleanup(func() {
+		done := make(chan struct{})
+		go func() {
+			s.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			t.Error("the fake server did not close within the timeout")
+		}
+	})
 	org := s.AddOrganization("read binding").GetOrganizationId()
 	client := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
 	ctx := t.Context()
@@ -46,8 +62,10 @@ func TestFakeReadBinding(t *testing.T) {
 		err    error
 	}
 	read := func(session *sandrunv1.DevSession, id, path string, offset int64) readResult {
+		readCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
 		result := readResult{size: -1}
-		stream, err := client.ReadDevSessionFile(ctx, listTestRequest(&sandrunv1.ReadDevSessionFileRequest{
+		stream, err := client.ReadDevSessionFile(readCtx, listTestRequest(&sandrunv1.ReadDevSessionFileRequest{
 			OrganizationId: org, DevSessionId: session.GetDevSessionId(), ReadId: id, Path: path, Offset: offset,
 		}))
 		if err != nil {
@@ -77,7 +95,7 @@ func TestFakeReadBinding(t *testing.T) {
 	checkRejected := func(t *testing.T, got readResult, code connect.Code) {
 		t.Helper()
 		if connect.CodeOf(got.err) != code || got.events != 0 {
-			t.Fatalf("read returned %+v, want %v and zero events", got, code)
+			t.Fatalf("read returned %v and %d events, want %v and zero events", got.err, got.events, code)
 		}
 	}
 
@@ -93,6 +111,35 @@ func TestFakeReadBinding(t *testing.T) {
 	writeFixture(second, path, independent)
 	const retainedID = "retained-read"
 	checkRead(t, read(first, retainedID, path, 0), original, int64(len(original)))
+
+	t.Run("directory", func(t *testing.T) {
+		checkRejected(t, read(first, "directory-read", ".", 0), connect.CodeFailedPrecondition)
+	})
+	t.Run("missing file", func(t *testing.T) {
+		checkRejected(t, read(first, "missing-read", "missing.txt", 0), connect.CodeNotFound)
+	})
+	t.Run("symlink to regular file", func(t *testing.T) {
+		const link = "link.txt"
+		if err := os.Symlink(path, filepath.Join(first.GetWorkspacePath(), link)); err != nil {
+			if runtime.GOOS == "windows" {
+				t.Skipf("cannot create a symlink on this Windows host: %v", err)
+			}
+			t.Fatal(err)
+		}
+		checkRead(t, read(first, "symlink-read", link, 0), original, int64(len(original)))
+	})
+	t.Run("FIFO without a writer", func(t *testing.T) {
+		if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+			t.Skip("the FIFO fixture runs on Linux and macOS")
+		}
+		const pipe = "input.pipe"
+		setupCtx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		if out, err := exec.CommandContext(setupCtx, "mkfifo", filepath.Join(first.GetWorkspacePath(), pipe)).CombinedOutput(); err != nil {
+			t.Fatalf("mkfifo: %v: %s", err, out)
+		}
+		checkRejected(t, read(first, "fifo-read", pipe, 0), connect.CodeFailedPrecondition)
+	})
 
 	t.Run("different session", func(t *testing.T) {
 		checkRejected(t, read(second, retainedID, path, 0), connect.CodeAlreadyExists)
