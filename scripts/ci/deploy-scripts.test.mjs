@@ -2517,11 +2517,11 @@ case "$1" in
       [[ " \${STUB_RM_FAIL:-} " != *" $2 "* ]] || exit 1
     fi ;;
   logs)
+    echo "server log line"
     if [[ "\${STUB_LOGS:-0}" != 0 ]]; then
       echo "docker: log read failed for $4" >&2
       exit "$STUB_LOGS"
-    fi
-    echo "server log line" ;;
+    fi ;;
 esac`,
   );
   shellStub(
@@ -3878,14 +3878,14 @@ test(
         label,
       );
       assert.equal(result.calls[5], `docker rm --force ${replacement}`, label);
+      assert.match(result.stdout, /server log line/, label);
       if (env.STUB_LOGS) {
         assert.ok(
           result.stdout.includes(`docker: log read failed for ${replacement}`),
           label,
         );
-        assert.doesNotMatch(result.stdout, /server log line/, label);
       } else {
-        assert.match(result.stdout, /server log line/, label);
+        assert.doesNotMatch(result.stdout, /docker: log read failed/, label);
       }
       if (env.STUB_FORCE_RM_FAIL) {
         assert.ok(
