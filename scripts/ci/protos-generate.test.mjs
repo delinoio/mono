@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, relative } from "node:path";
+import { delimiter, dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
@@ -114,8 +114,8 @@ const tsPackages = ["ownsand", "accounts", "sandrun"];
 
 // Creates a repository with the real script, committed (old) bindings of both
 // languages and every TypeScript target, and the fake go in a bin directory.
-function fixture({ plugin = true } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "protos-generate-"));
+function fixture({ parent = tmpdir(), plugin = true } = {}) {
+  const dir = mkdtempSync(join(parent, "protos-generate-"));
   const repo = join(dir, "repo");
   const bin = join(dir, "bin");
   const scratch = join(dir, "tmp");
@@ -206,9 +206,11 @@ function bindings(repo) {
   };
   add(join(repo, "protos"), (f) => /\.(pb|connect)\.go$/.test(f));
   for (const pkg of tsPackages) {
+    const dir = join(repo, "protos", "delino", pkg);
     add(
-      join(repo, "protos", "delino", pkg),
-      (f) => !f.includes("node_modules"),
+      dir,
+      (file) =>
+        !dirname(relative(dir, file)).split(sep).includes("node_modules"),
     );
   }
   return result;
@@ -231,6 +233,27 @@ function assertPreserved(f, result, diagnostic) {
   assert.equal(before.size, 21);
   assert.deepEqual(readdirSync(f.scratch), []);
 }
+
+test(
+  "the snapshot excludes only package-local node_modules directories",
+  { skip },
+  (t) => {
+    const parent = mkdtempSync(join(tmpdir(), "protos-generate-parent-"));
+    t.after(() => rmSync(parent, { recursive: true, force: true }));
+    const fixtureParent = join(parent, "node_modules");
+    mkdirSync(fixtureParent);
+    const f = fixture({ parent: fixtureParent });
+    const packagePath = join("protos", "delino", "accounts");
+    const dependency = join(packagePath, "node_modules", "dependency.txt");
+    const notes = join(packagePath, "node_modules-notes", "notes.txt");
+    write(join(f.repo, dependency), "dependency\n");
+    write(join(f.repo, notes), "keep these notes\n");
+
+    const snapshot = bindings(f.repo);
+    assert.equal(snapshot.has(dependency), false);
+    assert.equal(snapshot.get(notes), "keep these notes\n");
+  },
+);
 
 test(
   "a failing Go generator preserves the Go and TypeScript bindings",
