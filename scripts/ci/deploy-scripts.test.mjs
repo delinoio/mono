@@ -2364,13 +2364,15 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
 // --- droplet-deploy.sh -----------------------------------------------------
 
 // droplet-deploy.sh serializes deployments with util-linux `flock`.
-const hasFlock = spawnSync("sh", ["-c", "command -v flock"]).status === 0;
+const realFlock = spawnSync("sh", ["-c", "command -v flock"], {
+  encoding: "utf8",
+}).stdout?.trim();
 
 const isProxyLoad = (call) => call.startsWith("docker exec -i ");
 const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
 const skipDroplet =
   skip ||
-  (!hasFlock && "flock is not installed") ||
+  (!realFlock && "flock is not installed") ||
   (spawnSync("sh", ["-c", "command -v python3"]).status !== 0 &&
     "python3 is not installed") ||
   (process.platform !== "linux" &&
@@ -4546,6 +4548,49 @@ async function waitFor(condition, what) {
   assert.fail(`timed out waiting for ${what}`);
 }
 
+// The contender must encounter the held lock before the test releases it.
+async function startContendingDroplet(t, setup, args, lockName) {
+  const bin = join(setup.dir, "lock-probe-bin");
+  const marker = join(setup.dir, "lock-contended");
+  mkdirSync(bin);
+  shellStub(
+    bin,
+    "flock",
+    `fd="\${@: -1}"
+# Check the inherited descriptor against the expected lock file's inode.
+if [[ "$fd" =~ ^[0-9]+$ && /proc/self/fd/"$fd" -ef "$STUB_EXPECTED_LOCK" ]]; then
+  "$STUB_REAL_FLOCK" --nonblock --conflict-exit-code 99 "$fd"
+  result=$?
+  if [[ "$result" != 99 ]]; then
+    printf 'expected contention on %s, but the flock probe exited %s\\n' "$STUB_EXPECTED_LOCK" "$result" >&2
+    exit 1
+  fi
+  : > "$STUB_LOCK_MARKER" || exit 1
+fi
+exec "$STUB_REAL_FLOCK" "$@"`,
+  );
+
+  const run = startDroplet(t, setup, args, {
+    PATH: `${bin}${delimiter}${setup.spawnEnv().PATH}`,
+    STUB_EXPECTED_LOCK: join(setup.deployRoot, "state", lockName),
+    STUB_REAL_FLOCK: realFlock,
+    STUB_LOCK_MARKER: marker,
+  });
+  let outcome;
+  void run.done.then(
+    (result) => (outcome = result),
+    (error) => (outcome = error),
+  );
+  await waitFor(() => {
+    assert.ok(
+      !outcome,
+      `deployment exited before contending for ${lockName}: ${outcome?.stderr ?? outcome}`,
+    );
+    return existsSync(marker);
+  }, `contention on ${lockName}`);
+  return run;
+}
+
 // The `curl` of a run with STUB_BLOCK set does not answer until `release`
 // exists, so that the run holds its deployment lock for as long as the test
 // needs.
@@ -4577,15 +4622,12 @@ test(
     );
     // The second run is the direct rollback of the documentation: another
     // image of the same service while the first deployment still runs.
-    const second = startDroplet(t, setup, [
-      "api",
-      concurrentImage,
-      "8080",
-      "api.example.com",
-      "http1",
-      "none",
-    ]);
-    await sleep(750);
+    const second = await startContendingDroplet(
+      t,
+      setup,
+      ["api", concurrentImage, "8080", "api.example.com", "http1", "none"],
+      "api.lock",
+    );
     assert.deepEqual(
       setup.calls().filter((call) => call.includes(concurrentImage)),
       [],
@@ -4828,7 +4870,7 @@ test(
 
 // --- provision.sh ----------------------------------------------------------
 
-const skipProvision = skip || (!hasFlock && "flock is not installed");
+const skipProvision = skip || (!realFlock && "flock is not installed");
 const systemDockerHost = "unix:///var/run/docker.sock";
 const systemDocker = `docker --host ${systemDockerHost}`;
 const alternateDockerSelectors = ["host", "context", "saved context"];
@@ -6355,9 +6397,6 @@ test("start-caddy rejects a bad readiness setting", { skip }, (t) => {
 // proxy reload of every service on the Droplet. The tests below pause the
 // first deployment inside the admin POST (STUB_BLOCK_ON, released by the
 // `release-docker` file) and start the deployment of another service.
-const hasPgrep = spawnSync("sh", ["-c", "command -v pgrep"]).status === 0;
-const skipProxyLock =
-  skipDroplet || (!hasPgrep && "pgrep is not installed (procps is missing)");
 const workerArgs = [
   "worker",
   concurrentImage,
@@ -6399,21 +6438,9 @@ async function startPausedApiReload(t, env = {}) {
   return { setup, first };
 }
 
-// Waits until the run waits for the proxy lock: its `flock` child process is
-// alive only while the lock is held by another process, because the service
-// lock of the run was free.
-async function waitForLockWait(run, what) {
-  await waitFor(
-    () =>
-      spawnSync("pgrep", ["-P", String(run.child.pid), "-x", "flock"])
-        .status === 0,
-    what,
-  );
-}
-
 test(
   "droplet deploy cleans up an HTTP replacement on a signal while waiting for the proxy lock",
-  { skip: skipProxyLock },
+  { skip: skipDroplet },
   async (t) => {
     const route = "# old route\n";
     const state = `${olderImage}\n`;
@@ -6433,11 +6460,7 @@ test(
       ready,
     ]);
     await waitFor(() => existsSync(ready), "the proxy lock to be held");
-    const run = startDroplet(t, setup, httpArgs);
-    await waitForLockWait(
-      run,
-      "the HTTP deployment to wait for the proxy lock",
-    );
+    const run = await startContendingDroplet(t, setup, httpArgs, ".proxy.lock");
     run.child.kill("SIGTERM");
     lock.child.stdin.end("release\n");
     assert.equal((await lock.done).status, 0);
@@ -6461,13 +6484,14 @@ test(
 
 test(
   "droplet deploy serializes the route changes and proxy reloads of different services",
-  { skip: skipProxyLock },
+  { skip: skipDroplet },
   async (t) => {
     const { setup, first } = await startPausedApiReload(t);
-    const second = startDroplet(t, setup, workerArgs);
-    await waitForLockWait(
-      second,
-      "the second deployment to wait for the proxy lock",
+    const second = await startContendingDroplet(
+      t,
+      setup,
+      workerArgs,
+      ".proxy.lock",
     );
     // The second run did not touch its route file or the proxy, while the
     // first run still reloads.
@@ -6494,15 +6518,16 @@ test(
 
 test(
   "droplet deploy restores a rejected route before another service adapts the Caddyfile",
-  { skip: skipProxyLock },
+  { skip: skipDroplet },
   async (t) => {
     const { setup, first } = await startPausedApiReload(t, {
       STUB_RELOAD: "1",
     });
-    const second = startDroplet(t, setup, workerArgs);
-    await waitForLockWait(
-      second,
-      "the second deployment to wait for the proxy lock",
+    const second = await startContendingDroplet(
+      t,
+      setup,
+      workerArgs,
+      ".proxy.lock",
     );
     // The rejected route of the first run is still installed while it reloads.
     assert.match(setup.read("caddy/sites/api.caddy"), /api\.example\.com/);
@@ -6535,7 +6560,7 @@ test(
 
 test(
   "droplet deploy changes no route when the proxy lock stays held",
-  { skip: skipProxyLock },
+  { skip: skipDroplet },
   async (t) => {
     const { setup, first } = await startPausedApiReload(t);
     const second = await startDroplet(t, setup, workerArgs, {
