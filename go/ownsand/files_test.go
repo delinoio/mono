@@ -1364,6 +1364,53 @@ type writerFunc func(p []byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
+func TestOpenFileWriteBindingSalt(t *testing.T) {
+	s := &Sandbox{org: mustID(t), id: mustID(t)}
+	params := FileWriteParams{WriteID: mustID(t), Path: "/out"}
+
+	t.Run("provided", func(t *testing.T) {
+		want := bytes.Repeat([]byte{0x5a}, relaybinding.SaltSize)
+		params := params
+		params.BindingSalt = bytes.Clone(want)
+		fw, err := s.OpenFileWrite(params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clear(params.BindingSalt)
+		if !bytes.Equal(fw.salt, want) {
+			t.Fatal("reusing the caller's buffer changed the binding salt")
+		}
+		first := &ownsandv1.WriteFileRequest{
+			OrganizationId: s.org,
+			SandboxId:      s.id,
+			WriteId:        fw.op.id,
+			Path:           fw.path,
+			BindingSalt:    fw.salt,
+		}
+		if !bytes.Equal(fw.op.grant.digest, relaybinding.WriteFileDigest(first)) {
+			t.Fatal("grant digest differs from the first request digest")
+		}
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		fw, err := s.OpenFileWrite(params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := len(fw.salt); got != relaybinding.SaltSize {
+			t.Fatalf("binding salt length = %d, want %d", got, relaybinding.SaltSize)
+		}
+	})
+
+	t.Run("invalid length", func(t *testing.T) {
+		params := params
+		params.BindingSalt = make([]byte, relaybinding.SaltSize-1)
+		if _, err := s.OpenFileWrite(params); !validate.IsValidationError(err) {
+			t.Fatalf("expected a validation error for an invalid binding salt length, got %v", err)
+		}
+	})
+}
+
 // TestFileWriteChunksAcrossCalls checks a write whose chunks arrive in
 // separate calls and out of order, and that a second FileWrite with the same
 // write_id and salt (another process) continues it.
@@ -1382,12 +1429,14 @@ func TestFileWriteChunksAcrossCalls(t *testing.T) {
 					return relayAction{}
 				}
 			}
-			salt := randomBytes(t, 32)
+			salt := randomBytes(t, relaybinding.SaltSize)
+			originalSalt := bytes.Clone(salt)
 			data := randomBytes(t, 3000)
 			fw, err := s.OpenFileWrite(FileWriteParams{WriteID: strings.ToUpper(writeID), Path: "/out", BindingSalt: salt})
 			if err != nil {
 				t.Fatal(err)
 			}
+			clear(salt)
 			if res, err := fw.WriteChunk(ctx, 1000, data[1000:2000]); err != nil || res.GetOffset() != 1000 || res.GetLength() != 1000 {
 				t.Fatalf("middle chunk: %v %v", res, err)
 			}
@@ -1396,7 +1445,7 @@ func TestFileWriteChunksAcrossCalls(t *testing.T) {
 			}
 			// Another FileWrite of the same write (for example after a
 			// process restart) finishes it.
-			fw2, err := s.OpenFileWrite(FileWriteParams{WriteID: writeID, Path: "/out", BindingSalt: salt})
+			fw2, err := s.OpenFileWrite(FileWriteParams{WriteID: writeID, Path: "/out", BindingSalt: originalSalt})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1431,12 +1480,12 @@ func TestFileWriteChunksAcrossCalls(t *testing.T) {
 				}
 			}
 			for _, req := range reqs[:firstRequests] {
-				if req.GetPath() != "/out" || req.GetOffset() != 1000 || !bytes.Equal(req.GetData(), data[1000:2000]) {
-					t.Fatal("first write request did not keep its path, offset and data")
+				if req.GetPath() != "/out" || req.GetOffset() != 1000 || !bytes.Equal(req.GetData(), data[1000:2000]) || !bytes.Equal(req.GetBindingSalt(), originalSalt) {
+					t.Fatal("first write request did not keep its path, offset, data and salt")
 				}
 			}
-			if chunk, finish := reqs[firstRequests], reqs[firstRequests+1]; chunk.GetPath() != "" || finish.GetPath() != "/out" || finish.GetFinish().GetMode() != 0o755 {
-				t.Fatal("write continuation did not use the expected paths and mode")
+			if chunk, finish := reqs[firstRequests], reqs[firstRequests+1]; chunk.GetPath() != "" || len(chunk.GetBindingSalt()) != 0 || finish.GetPath() != "/out" || !bytes.Equal(finish.GetBindingSalt(), originalSalt) || finish.GetFinish().GetMode() != 0o755 {
+				t.Fatal("write continuation did not use the expected paths, salts and mode")
 			}
 			for _, auth := range auths {
 				if got := auth.GetOperationId(); got != writeID {
