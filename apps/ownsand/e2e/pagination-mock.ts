@@ -37,6 +37,7 @@ import {
   createMockTransport as createBaseMock,
   MOCK_IDS,
 } from "../src/mock/mock-api.ts";
+import { revokeCollisionTransport } from "../src/mock/revoke-collision-fixture.ts";
 import { organizationUuidTransport } from "./organization-uuid-fixture.ts";
 import {
   lastKnownStateCases,
@@ -125,6 +126,40 @@ function holdTemplateRequest(request: "first-page" | "create") {
 }
 
 export function createMockTransport(): Transport {
+  const revokeCollision = sessionStorage.getItem(
+    "ownsand-e2e-revoke-collision",
+  );
+  if (revokeCollision === "same" || revokeCollision === "cross-role") {
+    const { transport, requests } = revokeCollisionTransport(createBaseMock(), {
+      variant: revokeCollision,
+      async waitForContinuation() {
+        const key = "ownsand-e2e-revoke-continuation";
+        if (sessionStorage.getItem(key) === "released") return;
+        await new Promise<void>((resolve) => {
+          window.addEventListener(`${key}-release`, () => resolve(), {
+            once: true,
+          });
+          sessionStorage.setItem(key, "held");
+        });
+      },
+    });
+    return {
+      ...transport,
+      async unary(method, ...args) {
+        const response = await transport.unary(method, ...args);
+        if (
+          method.name === "RevokeEnrollmentToken" ||
+          method.name === "RevokeInvitation"
+        ) {
+          sessionStorage.setItem(
+            "ownsand-e2e-revoke-requests",
+            JSON.stringify(requests),
+          );
+        }
+        return response;
+      },
+    };
+  }
   const methodName = sessionStorage.getItem("ownsand-e2e-paged-list");
   const refreshList = sessionStorage.getItem("ownsand-e2e-refresh-list");
   const pagination =

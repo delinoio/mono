@@ -35,6 +35,7 @@ import {
   uniqueRows,
   useFollowAllPages,
 } from "../pagination.ts";
+import { repeatedPrefixes } from "../revocation.ts";
 
 /** Token lifetimes that the console offers; the maximum is 24 hours. */
 const TTL_HOURS = [1, 6, 12, 24] as const;
@@ -70,6 +71,15 @@ export function EnrollmentTokensPage() {
       ),
     [list.data],
   );
+  const collisions = useMemo(
+    () =>
+      repeatedPrefixes(
+        tokens
+          .filter((token) => token.state === EnrollmentTokenState.PENDING)
+          .map((token) => token.tokenPrefix),
+      ),
+    [tokens],
+  );
   const create = useMutation(DeviceService.method.createEnrollmentToken, {
     onSuccess: (_, { organizationId: submittedOrganizationId }) => {
       if (submittedOrganizationId === undefined) {
@@ -89,6 +99,10 @@ export function EnrollmentTokensPage() {
   const [ttl, setTtl] = useState("1");
   const [token, setToken] = useState<string>();
   const [revoking, setRevoking] = useState<EnrollmentToken>();
+  const revokingId =
+    revoking && collisions.has(revoking.tokenPrefix)
+      ? ` (${revoking.enrollmentTokenId})`
+      : "";
 
   if (isTerminalError(pages.error) && revoking !== undefined) {
     setRevoking(undefined);
@@ -112,36 +126,45 @@ export function EnrollmentTokensPage() {
             <>
               {tokens.length > 0 ? (
                 <ul className="list" aria-label="Enrollment tokens">
-                  {tokens.map((t) => (
-                    <li key={t.enrollmentTokenId} className="list-row">
-                      <div className="list-main">
-                        <span className="list-title">
-                          <code>{t.tokenPrefix}…</code> ·{" "}
-                          {labels.tokenState[t.state]}
-                        </span>
-                        <span className="muted">
-                          Created {formatTime(t.createTime)} · expires{" "}
-                          {formatTime(t.expireTime)}
-                          {t.deviceId ? (
-                            <>
-                              {" "}
-                              · device <ShortId id={t.deviceId} />
-                            </>
+                  {tokens.map((t) => {
+                    const pending = t.state === EnrollmentTokenState.PENDING;
+                    const showId = pending && collisions.has(t.tokenPrefix);
+                    return (
+                      <li key={t.enrollmentTokenId} className="list-row">
+                        <div className="list-main">
+                          <span className="list-title">
+                            <code>{t.tokenPrefix}…</code> ·{" "}
+                            {labels.tokenState[t.state]}
+                          </span>
+                          <span className="muted">
+                            Created {formatTime(t.createTime)} · expires{" "}
+                            {formatTime(t.expireTime)}
+                            {t.deviceId ? (
+                              <>
+                                {" "}
+                                · device <ShortId id={t.deviceId} />
+                              </>
+                            ) : null}
+                          </span>
+                          {showId ? (
+                            <span className="muted list-record-id">
+                              ID <code>{t.enrollmentTokenId}</code>
+                            </span>
                           ) : null}
-                        </span>
-                      </div>
-                      {t.state === EnrollmentTokenState.PENDING ? (
-                        <Button
-                          variant={ButtonVariant.Secondary}
-                          size={ButtonSize.Small}
-                          aria-label={`Revoke enrollment token ${t.tokenPrefix}`}
-                          onClick={() => setRevoking(t)}
-                        >
-                          Revoke
-                        </Button>
-                      ) : null}
-                    </li>
-                  ))}
+                        </div>
+                        {pending ? (
+                          <Button
+                            variant={ButtonVariant.Secondary}
+                            size={ButtonSize.Small}
+                            aria-label={`Revoke enrollment token ${t.tokenPrefix}${showId ? ` (${t.enrollmentTokenId})` : ""}`}
+                            onClick={() => setRevoking(t)}
+                          >
+                            Revoke
+                          </Button>
+                        ) : null}
+                      </li>
+                    );
+                  })}
                 </ul>
               ) : null}
               <MorePagesNotice noun="enrollment tokens" pages={pages} />
@@ -152,7 +175,7 @@ export function EnrollmentTokensPage() {
       <ConfirmDialog
         open={revoking !== undefined}
         onOpenChange={(open) => !open && setRevoking(undefined)}
-        title={`Revoke token ${revoking ? `${revoking.tokenPrefix}…` : ""}?`}
+        title={`Revoke token ${revoking ? `${revoking.tokenPrefix}…${revokingId}` : ""}?`}
         description="The token stops working at once. It cannot be restored; create a new token instead."
         confirmLabel="Revoke token"
         onConfirm={async () => {
