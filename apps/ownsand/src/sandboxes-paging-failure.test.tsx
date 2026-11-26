@@ -1,7 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  rs,
+  test,
+} from "@rstest/core";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
-import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
+import { SandboxState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  type ListSandboxesResponse,
+  SandboxService,
+} from "@delino/ownsand-protos/v1/sandbox_pb";
 import { QueryClient } from "@tanstack/react-query";
 import {
   act,
@@ -11,7 +22,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { toast } from "delino-ui/toast";
-import { invalidateServices } from "./api.ts";
+import { invalidateServices, POLL_INTERVAL_MS } from "./api.ts";
 import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
 import { renderConsole } from "./test-support.tsx";
 
@@ -25,6 +36,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  rs.useRealTimers();
   // The toaster is module state outside the rendered tree.
   toast.dismiss();
 });
@@ -42,33 +54,42 @@ const rows = () => document.querySelectorAll("tbody tr");
  * the first one) fails with `state.code`; `state.failFirst` fails the request
  * without a token instead.
  */
-function failingTransport() {
+function failingTransport(firstRowState?: SandboxState) {
   const mock = createMockTransport({ extraSandboxes: 48 });
   const state = {
     tokens: [] as string[],
     failLater: false,
     failFirst: false,
     code: Code.Internal,
+    firstRowState,
   };
   const transport: Transport = {
     ...mock,
     async unary(m, ...rest) {
-      if (m.name === "ListSandboxes") {
-        const token = (rest[3] as { pageToken: string }).pageToken;
-        state.tokens.push(token);
-        if (token === "" ? state.failFirst : state.failLater) {
-          throw new ConnectError("the page failed", state.code);
-        }
+      if (m.name !== "ListSandboxes") return mock.unary(m, ...rest);
+
+      const token = (rest[3] as { pageToken: string }).pageToken;
+      state.tokens.push(token);
+      if (token === "" ? state.failFirst : state.failLater) {
+        throw new ConnectError("the page failed", state.code);
       }
-      return mock.unary(m, ...rest);
+      const response = await mock.unary(m, ...rest);
+      if (token === "" && state.firstRowState !== undefined) {
+        const { sandboxes } = response.message as ListSandboxesResponse;
+        sandboxes[0]!.state = state.firstRowState;
+      }
+      return response;
     },
   };
   return { transport, state };
 }
 
 /** Opens the list on its full first page and clicks Show more while the next page fails. */
-async function showMoreThatFails(code = Code.Internal) {
-  const { transport, state } = failingTransport();
+async function showMoreThatFails(
+  code = Code.Internal,
+  firstRowState?: SandboxState,
+) {
+  const { transport, state } = failingTransport(firstRowState);
   renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
   const more = await screen.findByRole("button", { name: "Show more" }, WAIT);
   expect(rows()).toHaveLength(50);
@@ -81,34 +102,52 @@ async function showMoreThatFails(code = Code.Internal) {
 }
 
 describe("sandboxes page when a Show more request fails", () => {
-  test("keeps the rows, shows the error next to Show more and retries the failed token", async () => {
-    const state = await showMoreThatFails();
+  for (const settling of [SandboxState.CREATING, SandboxState.DELETING]) {
+    test(`pauses polling while a ${SandboxState[settling]} row has a continuation error`, async () => {
+      rs.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+      const state = await showMoreThatFails(Code.Internal, settling);
 
-    await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
-    expect(notices()[0]?.textContent).toContain(FAILED_TEXT);
-    // It is a pagination error, not the notice of a failed refresh.
-    expect(notices()[0]?.textContent).not.toContain("refresh");
-    expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(
-      1,
-    );
-    expect(rows()).toHaveLength(50);
-    expect(screen.getByRole("button", { name: "Show more" })).toBeTruthy();
-    const failedToken = state.tokens[1];
-    expect(failedToken).not.toBe("");
-    expect(state.tokens).toEqual(["", failedToken]);
+      await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
+      const failedToken = state.tokens[1];
+      expect(failedToken).toBeTruthy();
+      await act(async () => {
+        rs.advanceTimersByTime(2 * POLL_INTERVAL_MS);
+      });
+      expect(state.tokens).toEqual(["", failedToken]);
+      expect(notices()[0]?.textContent).toContain(FAILED_TEXT);
+      expect(notices()[0]?.textContent).not.toContain("refresh");
+      expect(rows()).toHaveLength(50);
 
-    // Retry and Show more share the same pending continuation.
-    state.failLater = false;
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-      fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+      state.failLater = false;
+      const retry = screen.getByRole("button", { name: "Try again" });
+      const more = screen.getByRole("button", { name: "Show more" });
+      await act(async () => {
+        fireEvent.click(retry);
+        fireEvent.click(retry);
+        fireEvent.click(more);
+      });
+      await waitFor(() => expect(rows()).toHaveLength(51), WAIT);
+      expect(notices()).toHaveLength(0);
+      expect(state.tokens).toEqual(["", failedToken, failedToken]);
+      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+
+      state.firstRowState = SandboxState.RUNNING;
+      await act(async () => {
+        rs.advanceTimersByTime(POLL_INTERVAL_MS);
+      });
+      const afterPoll = ["", failedToken, failedToken, "", failedToken];
+      expect(state.tokens).toEqual(afterPoll);
+      await waitFor(
+        () => expect(rows()[0]?.textContent).toContain("Running"),
+        WAIT,
+      );
+      await act(async () => {
+        rs.advanceTimersByTime(POLL_INTERVAL_MS);
+      });
+      expect(state.tokens).toEqual(afterPoll);
+      expect(rows()).toHaveLength(51);
     });
-    await waitFor(() => expect(rows()).toHaveLength(51), WAIT);
-    await waitFor(() => expect(notices()).toHaveLength(0), WAIT);
-    expect(state.tokens).toEqual(["", failedToken, failedToken]);
-    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
-    expect(rows()).toHaveLength(51);
-  });
+  }
 
   test("a failed retry keeps the error and the rows", async () => {
     const state = await showMoreThatFails();
