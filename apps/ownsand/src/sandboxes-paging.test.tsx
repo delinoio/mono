@@ -23,7 +23,7 @@ import {
 import { toast } from "delino-ui/toast";
 import { POLL_INTERVAL_MS } from "./api.ts";
 import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
-import { renderConsole, settle } from "./test-support.tsx";
+import { TEST_SETUP_MS, renderConsole, settle } from "./test-support.tsx";
 
 /** The longest wait for one condition; a loaded CI runner needs more than one second. */
 const WAIT = { timeout: 10_000 };
@@ -80,88 +80,112 @@ function sandboxPagingTransport({ settling = false } = {}) {
 }
 
 describe("sandboxes page against the mock paging", () => {
-  test("Show more supersedes a poll and appends the final row once", async () => {
-    rs.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
-    const { transport, calls } = sandboxPagingTransport({ settling: true });
-    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+  test(
+    "Show more supersedes a poll and appends the final row once",
+    async () => {
+      rs.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+      const { transport, calls } = sandboxPagingTransport({ settling: true });
+      renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
 
-    const more = await screen.findByRole("button", { name: "Show more" }, WAIT);
-    expect(rows()).toHaveLength(50);
-    await act(async () => {
-      rs.advanceTimersByTime(POLL_INTERVAL_MS);
-    });
-    expect(calls.map(({ input }) => input.pageToken)).toEqual(["", ""]);
-
-    await act(async () => {
-      fireEvent.click(more);
-      fireEvent.click(more);
-    });
-    expect(calls[1]?.signal?.aborted).toBe(true);
-    const token = calls[2]?.input.pageToken;
-    expect(token).toBeTruthy();
-
-    await act(async () => {
-      rs.advanceTimersByTime(POLL_INTERVAL_MS);
-    });
-    expect(calls.map(({ input }) => input.pageToken)).toEqual(["", "", token]);
-
-    calls[2]!.release();
-    await waitFor(() => expect(rows()).toHaveLength(51), WAIT);
-    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
-
-    calls[1]!.release();
-    await settle();
-    expect(rows()).toHaveLength(51);
-    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
-  });
-
-  test("loads a continuation for a new filter while the old response is held", async () => {
-    const { transport, calls } = sandboxPagingTransport();
-    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
-
-    const more = await screen.findByRole("button", { name: "Show more" }, WAIT);
-    await act(async () => {
-      fireEvent.click(more);
-    });
-    const oldPage = calls[1]!;
-    expect(oldPage.input.includeEnded).toBe(false);
-    expect(oldPage.input.pageToken).toBeTruthy();
-
-    await act(async () => {
-      fireEvent.click(
-        screen.getByRole("checkbox", { name: "Show ended sandboxes" }),
+      const more = await screen.findByRole(
+        "button",
+        { name: "Show more" },
+        WAIT,
       );
-    });
-    const filteredMore = await screen.findByRole(
-      "button",
-      { name: "Show more" },
-      WAIT,
-    );
-    await act(async () => {
-      fireEvent.click(filteredMore);
-      fireEvent.click(filteredMore);
-    });
-    const filteredPage = calls[3]!;
-    expect(calls).toHaveLength(4);
-    expect(calls[2]!.input).toMatchObject({
-      includeEnded: true,
-      pageToken: "",
-    });
-    expect(filteredPage.input.includeEnded).toBe(true);
-    expect(filteredPage.input.pageToken).toBeTruthy();
+      expect(rows()).toHaveLength(50);
+      await act(async () => {
+        rs.advanceTimersByTime(POLL_INTERVAL_MS);
+      });
+      expect(calls.map(({ input }) => input.pageToken)).toEqual(["", ""]);
 
-    oldPage.release();
-    await settle();
-    expect(rows()).toHaveLength(50);
-    expect((filteredMore as HTMLButtonElement).disabled).toBe(true);
-    filteredPage.release();
-    await waitFor(() => expect(rows()).toHaveLength(52), WAIT);
-    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
-  });
+      await act(async () => {
+        fireEvent.click(more);
+        fireEvent.click(more);
+      });
+      expect(calls[1]?.signal?.aborted).toBe(true);
+      const token = calls[2]?.input.pageToken;
+      expect(token).toBeTruthy();
 
-  test("offers no Show more for fewer than 50 sandboxes", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`);
-    await waitFor(() => expect(rows()).toHaveLength(3), WAIT);
-    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
-  });
+      await act(async () => {
+        rs.advanceTimersByTime(POLL_INTERVAL_MS);
+      });
+      expect(calls.map(({ input }) => input.pageToken)).toEqual([
+        "",
+        "",
+        token,
+      ]);
+
+      calls[2]!.release();
+      await waitFor(() => expect(rows()).toHaveLength(51), WAIT);
+      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+
+      calls[1]!.release();
+      await settle();
+      expect(rows()).toHaveLength(51);
+      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+    },
+    2 * WAIT.timeout + TEST_SETUP_MS,
+  );
+
+  test(
+    "loads a continuation for a new filter while the old response is held",
+    async () => {
+      const { transport, calls } = sandboxPagingTransport();
+      renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+
+      const more = await screen.findByRole(
+        "button",
+        { name: "Show more" },
+        WAIT,
+      );
+      await act(async () => {
+        fireEvent.click(more);
+      });
+      const oldPage = calls[1]!;
+      expect(oldPage.input.includeEnded).toBe(false);
+      expect(oldPage.input.pageToken).toBeTruthy();
+
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("checkbox", { name: "Show ended sandboxes" }),
+        );
+      });
+      const filteredMore = await screen.findByRole(
+        "button",
+        { name: "Show more" },
+        WAIT,
+      );
+      await act(async () => {
+        fireEvent.click(filteredMore);
+        fireEvent.click(filteredMore);
+      });
+      const filteredPage = calls[3]!;
+      expect(calls).toHaveLength(4);
+      expect(calls[2]!.input).toMatchObject({
+        includeEnded: true,
+        pageToken: "",
+      });
+      expect(filteredPage.input.includeEnded).toBe(true);
+      expect(filteredPage.input.pageToken).toBeTruthy();
+
+      oldPage.release();
+      await settle();
+      expect(rows()).toHaveLength(50);
+      expect((filteredMore as HTMLButtonElement).disabled).toBe(true);
+      filteredPage.release();
+      await waitFor(() => expect(rows()).toHaveLength(52), WAIT);
+      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+    },
+    3 * WAIT.timeout + TEST_SETUP_MS,
+  );
+
+  test(
+    "offers no Show more for fewer than 50 sandboxes",
+    async () => {
+      renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`);
+      await waitFor(() => expect(rows()).toHaveLength(3), WAIT);
+      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+    },
+    WAIT.timeout + TEST_SETUP_MS,
+  );
 });

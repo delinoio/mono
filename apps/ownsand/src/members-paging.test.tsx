@@ -22,6 +22,7 @@ import {
 import { toast } from "delino-ui/toast";
 import { MOCK_IDS, MOCK_USER, createMockTransport } from "./mock/mock-api.ts";
 import {
+  TEST_SETUP_MS,
   fullListRefresh,
   holdingTransport,
   renderConsole,
@@ -116,251 +117,293 @@ async function openOwnerPicker() {
 }
 
 describe("members page", () => {
-  test("lists the members of every page", async () => {
-    const { transport, state } = await pagedMembers([
-      [OWNER],
-      [ADMIN],
-      [MEMBER],
-    ]);
-    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
-    await waitFor(() => expect(memberRows()).toHaveLength(3), WAIT);
-    expect(screen.getByText("Mina Kim")).toBeTruthy();
-    expect(screen.getByText("Jun Park")).toBeTruthy();
-    expect(screen.getByText(MEMBER)).toBeTruthy();
-    // The first request has no token; each next one sends the token of the
-    // response before it, and the page sends nothing after the last page.
-    expect(state.tokens).toEqual(["", "page-2", "page-3"]);
-    expect(screen.queryByText("Loading more members")).toBeNull();
-    // A member of a later page can be managed like a member of the first.
-    expect(
-      screen.getByRole("combobox", { name: "Role of Jun Park" }),
-    ).toBeTruthy();
-  });
+  test(
+    "lists the members of every page",
+    async () => {
+      const { transport, state } = await pagedMembers([
+        [OWNER],
+        [ADMIN],
+        [MEMBER],
+      ]);
+      renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
+      await waitFor(() => expect(memberRows()).toHaveLength(3), WAIT);
+      expect(screen.getByText("Mina Kim")).toBeTruthy();
+      expect(screen.getByText("Jun Park")).toBeTruthy();
+      expect(screen.getByText(MEMBER)).toBeTruthy();
+      // The first request has no token; each next one sends the token of the
+      // response before it, and the page sends nothing after the last page.
+      expect(state.tokens).toEqual(["", "page-2", "page-3"]);
+      expect(screen.queryByText("Loading more members")).toBeNull();
+      // A member of a later page can be managed like a member of the first.
+      expect(
+        screen.getByRole("combobox", { name: "Role of Jun Park" }),
+      ).toBeTruthy();
+    },
+    WAIT.timeout + TEST_SETUP_MS,
+  );
 
-  test("sends one request when the response has no token", async () => {
-    const { transport, state } = await pagedMembers([[OWNER, ADMIN, MEMBER]]);
-    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
-    await waitFor(() => expect(memberRows()).toHaveLength(3), WAIT);
-    await flush();
-    expect(state.tokens).toEqual([""]);
-    expect(screen.queryByText("Loading more members")).toBeNull();
-  });
+  test(
+    "sends one request when the response has no token",
+    async () => {
+      const { transport, state } = await pagedMembers([[OWNER, ADMIN, MEMBER]]);
+      renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
+      await waitFor(() => expect(memberRows()).toHaveLength(3), WAIT);
+      await flush();
+      expect(state.tokens).toEqual([""]);
+      expect(screen.queryByText("Loading more members")).toBeNull();
+    },
+    WAIT.timeout + TEST_SETUP_MS,
+  );
 
-  test("keeps the loaded members and continues from the token on Try again", async () => {
-    const { transport, state } = await pagedMembers([[OWNER, ADMIN], [MEMBER]]);
-    state.failPage = 2;
-    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
-    expect(
-      await screen.findByText("Some members are not shown yet.", {}, WAIT),
-    ).toBeTruthy();
-    expect(memberRows()).toHaveLength(2);
-    expect(state.tokens).toEqual(["", "page-2"]);
+  test(
+    "keeps the loaded members and continues from the token on Try again",
+    async () => {
+      const { transport, state } = await pagedMembers([
+        [OWNER, ADMIN],
+        [MEMBER],
+      ]);
+      state.failPage = 2;
+      renderConsole(`/orgs/${MOCK_IDS.acme}/members`, { transport });
+      expect(
+        await screen.findByText("Some members are not shown yet.", {}, WAIT),
+      ).toBeTruthy();
+      expect(memberRows()).toHaveLength(2);
+      expect(state.tokens).toEqual(["", "page-2"]);
 
-    state.failPage = undefined;
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-    await waitFor(() => expect(memberRows()).toHaveLength(3), WAIT);
-    expect(screen.queryByText("Some members are not shown yet.")).toBeNull();
-    // The retry asks for the failed page again; it does not start over.
-    expect(state.tokens).toEqual(["", "page-2", "page-2"]);
-  });
+      state.failPage = undefined;
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      });
+      await waitFor(() => expect(memberRows()).toHaveLength(3), WAIT);
+      expect(screen.queryByText("Some members are not shown yet.")).toBeNull();
+      // The retry asks for the failed page again; it does not start over.
+      expect(state.tokens).toEqual(["", "page-2", "page-2"]);
+    },
+    2 * WAIT.timeout + TEST_SETUP_MS,
+  );
 });
 
 describe("ownership transfer picker", () => {
-  test("offers the non-owner members of every page and confirms the one chosen", async () => {
-    const { transport, state } = await pagedMembers([
-      [OWNER],
-      [ADMIN],
-      [MEMBER],
-    ]);
-    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
-    await openOwnerPicker();
-    await screen.findByRole("option", { name: MEMBER }, WAIT);
-    expect(screen.getByRole("option", { name: "Jun Park" })).toBeTruthy();
-    // The owner is not eligible, whatever page they are on.
-    expect(screen.queryByRole("option", { name: "Mina Kim" })).toBeNull();
-    expect(state.tokens).toEqual(["", "page-2", "page-3"]);
+  test(
+    "offers the non-owner members of every page and confirms the one chosen",
+    async () => {
+      const { transport, state } = await pagedMembers([
+        [OWNER],
+        [ADMIN],
+        [MEMBER],
+      ]);
+      renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
+      await openOwnerPicker();
+      await screen.findByRole("option", { name: MEMBER }, WAIT);
+      expect(screen.getByRole("option", { name: "Jun Park" })).toBeTruthy();
+      // The owner is not eligible, whatever page they are on.
+      expect(screen.queryByRole("option", { name: "Mina Kim" })).toBeNull();
+      expect(state.tokens).toEqual(["", "page-2", "page-3"]);
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("option", { name: MEMBER }));
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
-    });
-    const dialog = await screen.findByRole("alertdialog", {}, WAIT);
-    expect(dialog.textContent).toContain(`Make ${MEMBER} the owner?`);
-  });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("option", { name: MEMBER }));
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
+      });
+      const dialog = await screen.findByRole("alertdialog", {}, WAIT);
+      expect(dialog.textContent).toContain(`Make ${MEMBER} the owner?`);
+    },
+    3 * WAIT.timeout + TEST_SETUP_MS,
+  );
 
-  test("sends one request when the response has no token", async () => {
-    const { transport, state } = await pagedMembers([[OWNER, ADMIN, MEMBER]]);
-    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
-    await openOwnerPicker();
-    await screen.findByRole("option", { name: "Jun Park" }, WAIT);
-    await flush();
-    expect(state.tokens).toEqual([""]);
-  });
+  test(
+    "sends one request when the response has no token",
+    async () => {
+      const { transport, state } = await pagedMembers([[OWNER, ADMIN, MEMBER]]);
+      renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
+      await openOwnerPicker();
+      await screen.findByRole("option", { name: "Jun Park" }, WAIT);
+      await flush();
+      expect(state.tokens).toEqual([""]);
+    },
+    2 * WAIT.timeout + TEST_SETUP_MS,
+  );
 
-  test("keeps the owner choice on a transient refresh and clears it on a terminal refresh", async () => {
-    const { transport, queryClient, refetch, failedTokens, seen } =
-      fullListRefresh(MemberService.method.listMembers);
+  test(
+    "keeps the owner choice on a transient refresh and clears it on a terminal refresh",
+    async () => {
+      const { transport, queryClient, refetch, failedTokens, seen } =
+        fullListRefresh(MemberService.method.listMembers);
 
-    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
-      transport,
-      queryClient,
-    });
-    await openOwnerPicker();
-    const candidate = await screen.findByRole(
-      "option",
-      { name: "Jun Park" },
-      WAIT,
-    );
-    await act(async () => {
-      fireEvent.click(candidate);
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
-    });
-    const dialog = await screen.findByRole("alertdialog", {}, WAIT);
-
-    await refetch(Code.Unavailable);
-    expect(failedTokens).toEqual(["", "", ""]);
-    expect(dialog.textContent).toContain("Make Jun Park the owner?");
-    expect(
-      within(dialog)
-        .getByRole("button", { name: "Transfer ownership" })
-        .hasAttribute("disabled"),
-    ).toBe(false);
-
-    await refetch(Code.PermissionDenied);
-    expect(
-      await screen.findByText(
-        "You do not have permission to do this.",
-        {},
+      renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+        transport,
+        queryClient,
+      });
+      await openOwnerPicker();
+      const candidate = await screen.findByRole(
+        "option",
+        { name: "Jun Park" },
         WAIT,
-      ),
-    ).toBeTruthy();
-    expect(failedTokens).toEqual(["", "", "", ""]);
-    expect(screen.queryByRole("combobox", { name: "New owner" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Transfer" })).toBeNull();
-    expect(screen.queryByRole("alertdialog")).toBeNull();
-    expect(
-      screen.getByRole("button", { name: "Delete organization" }),
-    ).toBeTruthy();
+      );
+      await act(async () => {
+        fireEvent.click(candidate);
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
+      });
+      const dialog = await screen.findByRole("alertdialog", {}, WAIT);
 
-    await refetch();
-    const picker = await screen.findByRole(
-      "combobox",
-      { name: "New owner" },
-      WAIT,
-    );
-    expect(picker.textContent).toContain("Choose a member");
-    expect(
-      screen.getByRole("button", { name: "Transfer" }).hasAttribute("disabled"),
-    ).toBe(true);
-    expect(screen.queryByRole("alertdialog")).toBeNull();
-    await openOwnerPicker();
-    expect(
-      await screen.findByRole("option", { name: "Jun Park" }, WAIT),
-    ).toBeTruthy();
-    expect(seen.TransferOwnership).toBeUndefined();
-  });
+      await refetch(Code.Unavailable);
+      expect(failedTokens).toEqual(["", "", ""]);
+      expect(dialog.textContent).toContain("Make Jun Park the owner?");
+      expect(
+        within(dialog)
+          .getByRole("button", { name: "Transfer ownership" })
+          .hasAttribute("disabled"),
+      ).toBe(false);
 
-  test("closes the transfer confirmation and hides cached choices after a terminal continuation error", async () => {
-    const paged = await pagedMembers([[OWNER, ADMIN], [MEMBER]]);
-    const { transport, calls, seen } = holdingTransport(
-      ["ListMembers"],
-      () => true,
-      paged.transport,
-    );
-    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
-    await waitFor(() => expect(calls.ListMembers).toHaveLength(1), WAIT);
-    await act(async () => calls.ListMembers![0]!.settle());
-    await openOwnerPicker();
-    const candidate = await screen.findByRole(
-      "option",
-      { name: "Jun Park" },
-      WAIT,
-    );
-    await act(async () => fireEvent.click(candidate));
-    await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Transfer" })),
-    );
-    await screen.findByRole(
-      "alertdialog",
-      { name: "Make Jun Park the owner?" },
-      WAIT,
-    );
+      await refetch(Code.PermissionDenied);
+      expect(
+        await screen.findByText(
+          "You do not have permission to do this.",
+          {},
+          WAIT,
+        ),
+      ).toBeTruthy();
+      expect(failedTokens).toEqual(["", "", "", ""]);
+      expect(screen.queryByRole("combobox", { name: "New owner" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Transfer" })).toBeNull();
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(
+        screen.getByRole("button", { name: "Delete organization" }),
+      ).toBeTruthy();
 
-    await act(async () =>
-      calls.ListMembers![1]!.settle(
-        new ConnectError("the page failed", Code.PermissionDenied),
-      ),
-    );
-    expect(
-      await screen.findByText(
-        "You do not have permission to do this.",
-        {},
+      await refetch();
+      const picker = await screen.findByRole(
+        "combobox",
+        { name: "New owner" },
         WAIT,
-      ),
-    ).toBeTruthy();
-    expect(screen.queryByRole("alertdialog")).toBeNull();
-    expect(screen.queryByRole("combobox", { name: "New owner" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Transfer" })).toBeNull();
-    expect(screen.queryByText("Some members are not shown yet.")).toBeNull();
-    expect(seen.TransferOwnership).toBeUndefined();
-    expect(
-      screen.getByRole("button", { name: "Delete organization" }),
-    ).toBeTruthy();
+      );
+      expect(picker.textContent).toContain("Choose a member");
+      expect(
+        screen
+          .getByRole("button", { name: "Transfer" })
+          .hasAttribute("disabled"),
+      ).toBe(true);
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      await openOwnerPicker();
+      expect(
+        await screen.findByRole("option", { name: "Jun Park" }, WAIT),
+      ).toBeTruthy();
+      expect(seen.TransferOwnership).toBeUndefined();
+    },
+    7 * WAIT.timeout + TEST_SETUP_MS,
+  );
 
-    await act(async () =>
-      fireEvent.click(screen.getByRole("link", { name: "Members" })),
-    );
-    expect(
-      await screen.findByText(
-        "You do not have permission to do this.",
-        {},
+  test(
+    "closes the transfer confirmation and hides cached choices after a terminal continuation error",
+    async () => {
+      const paged = await pagedMembers([[OWNER, ADMIN], [MEMBER]]);
+      const { transport, calls, seen } = holdingTransport(
+        ["ListMembers"],
+        () => true,
+        paged.transport,
+      );
+      renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
+      await waitFor(() => expect(calls.ListMembers).toHaveLength(1), WAIT);
+      await act(async () => calls.ListMembers![0]!.settle());
+      await openOwnerPicker();
+      const candidate = await screen.findByRole(
+        "option",
+        { name: "Jun Park" },
         WAIT,
-      ),
-    ).toBeTruthy();
-    expect(screen.queryByRole("list", { name: "Members" })).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: "Remove Jun Park" }),
-    ).toBeNull();
-    expect(screen.queryByText("Some members are not shown yet.")).toBeNull();
-    expect(screen.getByRole("button", { name: "Invite someone" })).toBeTruthy();
-    expect(calls.ListMembers).toHaveLength(2);
-  });
+      );
+      await act(async () => fireEvent.click(candidate));
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Transfer" })),
+      );
+      await screen.findByRole(
+        "alertdialog",
+        { name: "Make Jun Park the owner?" },
+        WAIT,
+      );
 
-  test("says that members are missing when a later page fails and recovers on Try again", async () => {
-    const { transport, state } = await pagedMembers([[OWNER, ADMIN], [MEMBER]]);
-    state.failPage = 2;
-    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
-    expect(
-      await screen.findByText("Some members are not shown yet.", {}, WAIT),
-    ).toBeTruthy();
-    await act(async () => {
-      fireEvent.click(screen.getByRole("combobox", { name: "New owner" }));
-    });
-    await screen.findByRole("option", { name: "Jun Park" }, WAIT);
-    expect(screen.queryByRole("option", { name: MEMBER })).toBeNull();
-    await act(async () => {
-      fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
-    });
+      await act(async () =>
+        calls.ListMembers![1]!.settle(
+          new ConnectError("the page failed", Code.PermissionDenied),
+        ),
+      );
+      expect(
+        await screen.findByText(
+          "You do not have permission to do this.",
+          {},
+          WAIT,
+        ),
+      ).toBeTruthy();
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(screen.queryByRole("combobox", { name: "New owner" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Transfer" })).toBeNull();
+      expect(screen.queryByText("Some members are not shown yet.")).toBeNull();
+      expect(seen.TransferOwnership).toBeUndefined();
+      expect(
+        screen.getByRole("button", { name: "Delete organization" }),
+      ).toBeTruthy();
 
-    state.failPage = undefined;
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-    await waitFor(
-      () =>
-        expect(
-          screen.queryByText("Some members are not shown yet."),
-        ).toBeNull(),
-      WAIT,
-    );
-    await openOwnerPicker();
-    await screen.findByRole("option", { name: MEMBER }, WAIT);
-    expect(state.tokens).toEqual(["", "page-2", "page-2"]);
-  });
+      await act(async () =>
+        fireEvent.click(screen.getByRole("link", { name: "Members" })),
+      );
+      expect(
+        await screen.findByText(
+          "You do not have permission to do this.",
+          {},
+          WAIT,
+        ),
+      ).toBeTruthy();
+      expect(screen.queryByRole("list", { name: "Members" })).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: "Remove Jun Park" }),
+      ).toBeNull();
+      expect(screen.queryByText("Some members are not shown yet.")).toBeNull();
+      expect(
+        screen.getByRole("button", { name: "Invite someone" }),
+      ).toBeTruthy();
+      expect(calls.ListMembers).toHaveLength(2);
+    },
+    6 * WAIT.timeout + TEST_SETUP_MS,
+  );
+
+  test(
+    "says that members are missing when a later page fails and recovers on Try again",
+    async () => {
+      const { transport, state } = await pagedMembers([
+        [OWNER, ADMIN],
+        [MEMBER],
+      ]);
+      state.failPage = 2;
+      renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
+      expect(
+        await screen.findByText("Some members are not shown yet.", {}, WAIT),
+      ).toBeTruthy();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("combobox", { name: "New owner" }));
+      });
+      await screen.findByRole("option", { name: "Jun Park" }, WAIT);
+      expect(screen.queryByRole("option", { name: MEMBER })).toBeNull();
+      await act(async () => {
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+      });
+
+      state.failPage = undefined;
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      });
+      await waitFor(
+        () =>
+          expect(
+            screen.queryByText("Some members are not shown yet."),
+          ).toBeNull(),
+        WAIT,
+      );
+      await openOwnerPicker();
+      await screen.findByRole("option", { name: MEMBER }, WAIT);
+      expect(state.tokens).toEqual(["", "page-2", "page-2"]);
+    },
+    5 * WAIT.timeout + TEST_SETUP_MS,
+  );
 });
