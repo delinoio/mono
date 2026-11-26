@@ -38,6 +38,9 @@ const hasFlock = spawnSync("sh", ["-c", "command -v flock"]).status === 0;
 function skipReason() {
   if (process.platform === "win32") return "the deploy scripts run on Linux";
   if (!hasFlock) return "flock is not installed";
+  if (spawnSync("sh", ["-c", "command -v python3"]).status !== 0) {
+    return "python3 is not installed";
+  }
   if (bashVersion[0] < 4 || (bashVersion[0] === 4 && bashVersion[1] < 4)) {
     return `the deploy scripts need Bash 4.4 or newer, found ${bashVersion.join(".")}`;
   }
@@ -76,8 +79,7 @@ function shellStub(bin, name, body) {
 // `<id> <name> <service label> <image>`. It supports exactly the commands that
 // the deploy script runs. `docker run` and `docker create` fail with the
 // message of the Docker daemon when the name is taken, and nothing else
-// changes. `STUB_RM_FAIL` lists the targets that a plain `docker rm` fails for,
-// and `STUB_RELOAD` is the exit code of the proxy reload.
+// changes. `STUB_RM_FAIL` lists the targets that a plain `docker rm` fails for.
 const dockerBody = `
 containers="$STUB_DIR/containers"
 touch "$containers"
@@ -115,7 +117,26 @@ case "$1" in
     echo "$count" > "$STUB_DIR/counter"
     echo "new$count $name $service \${args[\${#args[@]}-1]}" >> "$containers"
     echo "new$count" ;;
-  exec) exit "\${STUB_RELOAD:-0}" ;;
+  exec)
+    if [[ "$2" == -i ]]; then
+      cat > /dev/null
+      printf '%s' 200
+    elif [[ "$3" == caddy && "$4" == adapt ]]; then
+      awk '/^[a-z0-9.-]+ [{]$/ { host = $1 } /reverse_proxy / { print host, $2 }' "$DROPLET_ROOT"/caddy/sites/*.caddy |
+        python3 -c '
+import json
+import sys
+routes = []
+for line in sys.stdin:
+    host, dial = line.split()
+    proxy = {"handler": "reverse_proxy", "upstreams": [{"dial": dial}]}
+    subroute = {"handler": "subroute", "routes": [{"handle": [proxy]}]}
+    routes.append({"match": [{"host": [host]}], "handle": [subroute]})
+print(json.dumps({"apps": {"http": {"servers": {"srv0": {"routes": routes}}}}}))
+'
+    else
+      printf '%s' '"/config/ abcd"'
+    fi ;;
   rm)
     force=""; target="$2"
     if [[ "$2" == --force ]]; then force=1; target="$3"; fi

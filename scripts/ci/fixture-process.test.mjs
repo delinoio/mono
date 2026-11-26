@@ -8,6 +8,7 @@
 // must be gone.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { once } from "node:events";
 import {
   existsSync,
   mkdtempSync,
@@ -163,5 +164,49 @@ test(
       alive(pid, (path, encoding) => readFileSync(`${path}.missing`, encoding)),
       true,
     );
+  },
+);
+
+test(
+  "captures split UTF-8 characters independently on stdout and stderr",
+  { skip, timeout: 5_000 },
+  async (t) => {
+    const { child, done } = spawnProcessGroup(t, process.execPath, [
+      "-e",
+      `
+        process.stdout.write(Buffer.from("41ed", "hex"));
+        process.stderr.write(Buffer.from("42ed", "hex"));
+        process.stdin.once("data", () => {
+          process.stdout.write(Buffer.from("959c", "hex"));
+          process.stderr.write(Buffer.from("959c", "hex"));
+        });
+      `,
+    ]);
+    const [[stdoutPrefix], [stderrPrefix]] = await Promise.all([
+      once(child.stdout, "data", { signal: t.signal }),
+      once(child.stderr, "data", { signal: t.signal }),
+    ]);
+    assert.deepEqual(stdoutPrefix, Buffer.from("41ed", "hex"));
+    assert.deepEqual(stderrPrefix, Buffer.from("42ed", "hex"));
+    child.stdin.end("continue");
+
+    assert.deepEqual(await done, { status: 0, stdout: "A한", stderr: "B한" });
+  },
+);
+
+test(
+  "flushes incomplete UTF-8 when the child closes",
+  { skip, timeout: 5_000 },
+  async (t) => {
+    const { done } = spawnProcessGroup(t, process.execPath, [
+      "-e",
+      `
+        process.stdout.write(Buffer.from("6f6bed", "hex"));
+        process.stderr.write("한");
+        process.exitCode = 3;
+      `,
+    ]);
+
+    assert.deepEqual(await done, { status: 3, stdout: "ok�", stderr: "한" });
   },
 );

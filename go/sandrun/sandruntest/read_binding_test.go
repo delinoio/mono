@@ -3,11 +3,15 @@
 package sandruntest
 
 import (
+	"context"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -17,7 +21,19 @@ import (
 
 func TestFakeReadBinding(t *testing.T) {
 	s := New()
-	t.Cleanup(s.Close)
+	const timeout = 5 * time.Second
+	t.Cleanup(func() {
+		done := make(chan struct{})
+		go func() {
+			s.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			t.Error("the fake server did not close within the timeout")
+		}
+	})
 	org := s.AddOrganization("read binding").GetOrganizationId()
 	client := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
 	ctx := t.Context()
@@ -46,8 +62,10 @@ func TestFakeReadBinding(t *testing.T) {
 		err    error
 	}
 	read := func(session *sandrunv1.DevSession, id, path string, offset int64) readResult {
+		readCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
 		result := readResult{size: -1}
-		stream, err := client.ReadDevSessionFile(ctx, listTestRequest(&sandrunv1.ReadDevSessionFileRequest{
+		stream, err := client.ReadDevSessionFile(readCtx, listTestRequest(&sandrunv1.ReadDevSessionFileRequest{
 			OrganizationId: org, DevSessionId: session.GetDevSessionId(), ReadId: id, Path: path, Offset: offset,
 		}))
 		if err != nil {
@@ -77,7 +95,7 @@ func TestFakeReadBinding(t *testing.T) {
 	checkRejected := func(t *testing.T, got readResult, code connect.Code) {
 		t.Helper()
 		if connect.CodeOf(got.err) != code || got.events != 0 {
-			t.Fatalf("read returned %+v, want %v and zero events", got, code)
+			t.Fatalf("read returned %v and %d events, want %v and zero events", got.err, got.events, code)
 		}
 	}
 
@@ -94,6 +112,35 @@ func TestFakeReadBinding(t *testing.T) {
 	const retainedID = "retained-read"
 	checkRead(t, read(first, retainedID, path, 0), original, int64(len(original)))
 
+	t.Run("directory", func(t *testing.T) {
+		checkRejected(t, read(first, "directory-read", ".", 0), connect.CodeFailedPrecondition)
+	})
+	t.Run("missing file", func(t *testing.T) {
+		checkRejected(t, read(first, "missing-read", "missing.txt", 0), connect.CodeNotFound)
+	})
+	t.Run("symlink to regular file", func(t *testing.T) {
+		const link = "link.txt"
+		if err := os.Symlink(path, filepath.Join(first.GetWorkspacePath(), link)); err != nil {
+			if runtime.GOOS == "windows" {
+				t.Skipf("cannot create a symlink on this Windows host: %v", err)
+			}
+			t.Fatal(err)
+		}
+		checkRead(t, read(first, "symlink-read", link, 0), original, int64(len(original)))
+	})
+	t.Run("FIFO without a writer", func(t *testing.T) {
+		if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+			t.Skip("the FIFO fixture runs on Linux and macOS")
+		}
+		const pipe = "input.pipe"
+		setupCtx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		if out, err := exec.CommandContext(setupCtx, "mkfifo", filepath.Join(first.GetWorkspacePath(), pipe)).CombinedOutput(); err != nil {
+			t.Fatalf("mkfifo: %v: %s", err, out)
+		}
+		checkRejected(t, read(first, "fifo-read", pipe, 0), connect.CodeFailedPrecondition)
+	})
+
 	t.Run("different session", func(t *testing.T) {
 		checkRejected(t, read(second, retainedID, path, 0), connect.CodeAlreadyExists)
 		checkRead(t, read(second, "independent-read", path, 0), independent, int64(len(independent)))
@@ -106,6 +153,15 @@ func TestFakeReadBinding(t *testing.T) {
 		const offset = 4
 		absolute := filepath.Join(first.GetWorkspacePath(), path)
 		checkRead(t, read(first, retainedID, absolute, offset), original[offset:], int64(len(original)))
+	})
+	t.Run("snapshot size boundary", func(t *testing.T) {
+		size := int64(len(original))
+		atEnd := read(first, retainedID, path, size)
+		checkRead(t, atEnd, "", size)
+		if atEnd.events != 1 {
+			t.Fatalf("read at size sent %d events, want one end event", atEnd.events)
+		}
+		checkRejected(t, read(first, retainedID, path, size+1), connect.CodeInvalidArgument)
 	})
 
 	t.Run("concurrent first reads", func(t *testing.T) {
@@ -135,5 +191,35 @@ func TestFakeReadBinding(t *testing.T) {
 		checkRead(t, results[winner], want, size)
 		checkRejected(t, results[loser], connect.CodeAlreadyExists)
 		checkRead(t, read(sessions[winner], id, path, 1), want[1:], size)
+	})
+
+	t.Run("negative offsets", func(t *testing.T) {
+		checkNegative := func(t *testing.T, id, path string) {
+			t.Helper()
+			before := len(s.ReadRequests())
+			checkRejected(t, read(first, id, path, -1), connect.CodeInvalidArgument)
+			requests := s.ReadRequests()[before:]
+			if len(requests) != 1 {
+				t.Fatalf("recorded %d requests, want one", len(requests))
+			}
+			got := requests[0]
+			if got.GetReadId() != id || got.GetPath() != path || got.GetOffset() != -1 {
+				t.Fatalf("recorded request %v, want read ID %q, path %q and offset -1", got, id, path)
+			}
+		}
+		t.Run("retry on another path", func(t *testing.T) {
+			const id = "negative-read-other-path"
+			checkNegative(t, id, path)
+			checkRead(t, read(first, id, otherPath, 0), "different path", int64(len("different path")))
+		})
+		t.Run("retry after file changes", func(t *testing.T) {
+			const id = "negative-read-edited-file"
+			checkNegative(t, id, path)
+			writeFixture(first, path, "new")
+			checkRead(t, read(first, id, path, 0), "new", 3)
+		})
+		t.Run("missing path", func(t *testing.T) {
+			checkNegative(t, "negative-read-missing-path", "missing.txt")
+		})
 	})
 }

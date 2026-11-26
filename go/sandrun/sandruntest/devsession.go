@@ -5,6 +5,7 @@ package sandruntest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -210,11 +211,21 @@ func (d *devSessionService) ListDevSessions(_ context.Context, req *connect.Requ
 	if _, err := s.requireOrg(m.GetOrganizationId()); err != nil {
 		return nil, err
 	}
+	ownerID := ""
+	if owner, ok := m.GetOwner().(*sandrunv1.ListDevSessionsRequest_OwnerUserId); ok {
+		ownerID = owner.OwnerUserId
+		if ownerID == "" {
+			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid owner_user_id: is empty"))
+		}
+	}
 	profileID, err := normalizeListProfileID(m.GetRunnerProfileId())
 	if err != nil {
 		return nil, err
 	}
-	states := listStates(m.GetStates(), openRequestStates, m.GetIncludeEnded())
+	states, err := listStates(m.GetStates(), openRequestStates, m.GetIncludeEnded(), "RequestState", sandrunv1.RequestState_name)
+	if err != nil {
+		return nil, err
+	}
 	var mine []*sandrunv1.DevSession
 	for _, x := range s.sessions {
 		if x.GetOrganizationId() != m.GetOrganizationId() || (profileID != "" && x.GetRunnerProfileId() != profileID) {
@@ -223,7 +234,7 @@ func (d *devSessionService) ListDevSessions(_ context.Context, req *connect.Requ
 		if m.GetOwnedByCaller() && x.GetOwnerUserId() != s.UserID {
 			continue
 		}
-		if o := m.GetOwnerUserId(); o != "" && x.GetOwnerUserId() != o {
+		if ownerID != "" && x.GetOwnerUserId() != ownerID {
 			continue
 		}
 		if len(states) > 0 && !slices.Contains(states, x.GetState()) {
@@ -338,12 +349,20 @@ func (d *devSessionService) ReadDevSessionFile(ctx context.Context, req *connect
 	if req.Msg.GetReadId() == "" {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("read_id is required"))
 	}
-	data, err := d.s.guest.readSnapshot(ds, req.Msg)
+	guest := d.s.guest
+	guest.mu.Lock()
+	guest.reads = append(guest.reads, proto.CloneOf(req.Msg))
+	guest.mu.Unlock()
+
+	off := req.Msg.GetOffset()
+	if off < 0 {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("the offset is outside the file"))
+	}
+	data, err := guest.readSnapshot(ds, req.Msg)
 	if err != nil {
 		return err
 	}
-	off := req.Msg.GetOffset()
-	if off < 0 || off > int64(len(data)) {
+	if off > int64(len(data)) {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("the offset is outside the file"))
 	}
 	sent := 0
@@ -370,7 +389,6 @@ func (g *guest) readSnapshot(ds *sandrunv1.DevSession, req *sandrunv1.ReadDevSes
 	id, path := req.GetReadId(), guestPath(ds, req.GetPath())
 	orgID, sessionID := ds.GetOrganizationId(), ds.GetDevSessionId()
 	g.mu.Lock()
-	g.reads = append(g.reads, proto.CloneOf(req))
 	snapshot, ok := g.snapshots[id]
 	g.mu.Unlock()
 	if !ok {
@@ -404,7 +422,7 @@ func readSnapshotFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 	}
-	if info.IsDir() {
+	if !info.Mode().IsRegular() {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("not a regular file"))
 	}
 	data, err := os.ReadFile(path)
@@ -446,8 +464,13 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 	} else if w.path != path {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("every chunk of a write_id must name the same path"))
 	}
-	if w.done {
-		return connect.NewResponse(&sandrunv1.WriteDevSessionFileResponse{WriteId: m.GetWriteId(), Offset: m.GetOffset(), Length: chunkSize, Finished: true, SizeBytes: int64(len(w.data))}), nil
+	if completed := w.completed; completed != nil {
+		if !m.GetFinal() || m.GetMode() != completed.mode ||
+			m.GetOffset() != completed.response.GetOffset() || chunkSize != completed.response.GetLength() ||
+			sha256.Sum256(m.GetData()) != completed.digest {
+			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("write already finished with a different final request"))
+		}
+		return connect.NewResponse(proto.CloneOf(completed.response)), nil
 	}
 	end := m.GetOffset() + chunkSize
 	switch {
@@ -475,9 +498,14 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 			_ = os.Remove(tmp)
 			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 		}
-		w.done = true
 		res.Finished = true
 		res.SizeBytes = int64(len(w.data))
+		w.completed = &completedWrite{
+			mode:     m.GetMode(),
+			digest:   sha256.Sum256(m.GetData()),
+			response: proto.CloneOf(res),
+		}
+		w.data = nil
 	}
 	return connect.NewResponse(res), nil
 }
@@ -506,9 +534,15 @@ type writeKey struct {
 }
 
 type pendingWrite struct {
-	path string
-	data []byte
-	done bool
+	path      string
+	data      []byte
+	completed *completedWrite
+}
+
+type completedWrite struct {
+	mode     uint32
+	digest   [sha256.Size]byte
+	response *sandrunv1.WriteDevSessionFileResponse
 }
 
 type readSnapshot struct {

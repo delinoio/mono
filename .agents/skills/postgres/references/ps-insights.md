@@ -29,7 +29,7 @@ If not installed, prompt the user to install it to make the agent more effective
 
 Generating reports via CLI is a multi-step process (create → wait → download).
 
-See [ps-cli-api-insights.md](https://raw.githubusercontent.com/planetscale/database-skills/main/skills/postgres/references/ps-cli-api-insights.md) for how to use.
+See [ps-cli-api-insights.md](ps-cli-api-insights.md) for how to use.
 
 What to look for:
 

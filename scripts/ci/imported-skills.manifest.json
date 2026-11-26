@@ -29,7 +29,7 @@
         "references/ps-connection-pooling.md": "72197e8287f199267da14fa0fde94a0e90952a97c851bca06f9311f972ad2f7d",
         "references/ps-connections.md": "e166e515a5192ba0eedadffe88f5560f74c6c5c09239d3e5210dec28fa63bc4d",
         "references/ps-extensions.md": "8ce87f920ec90ab4c6c359373935c85876513f627d8afe78d0c45d686a34d6df",
-        "references/ps-insights.md": "65ecc4a36c9af29f54c1ae3bbc7aa5bee5dee5bc63daf21301af126d15d070c1",
+        "references/ps-insights.md": "7b4727f900d32873c6fad2d3ea8b8005bb771d252cf31863bddadacbe43a0fdf",
         "references/query-patterns.md": "1d4aef87ca914548ac0f4833ab5ca3d1714aed5eb0bca0917840faedfa517b70",
         "references/replication.md": "c042b121410adb3f0bfb4cec1a5d124ce5fb283dc32ea56d277aaba9ca5fb63b",
         "references/schema-design.md": "fab6e3e1882a1d9f4db8b647084693a9c7f82516d17e5cd18cb3238f85adba6b",
@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "e9ba56c59de165c9a7a3fa15bf039e86f219d5c9033dceb730d53f9d0440d785",
+        "AGENTS.md": "c2b3a3335a8cfa82d8f2e34e2b4dcae4f10cb1f5fbd65030e3c4cea1f6766f01",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "8d9f8517adee6028be8ba0a9cd8869cf27d3dbc3ca56d1414c8ed4751afbe516",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -104,7 +104,7 @@
         "rules/js-cache-property-access.md": "73e47431e74878a927061bf0ddc7cd91a7556cb35d2573f3421e82300d9ae311",
         "rules/js-cache-storage.md": "6cb4b8d78c0829c5f05f4609207a2a14aeca8622936173e40475f750879e98e5",
         "rules/js-combine-iterations.md": "71add08aeeb43091d4ff4c0b2842cce8b4bdef8ad3e732cc034bb5a84827e746",
-        "rules/js-early-exit.md": "925ce5ce87f3347186ca62212f29cc6baa2b8c85a96d2720ad07c3d0abf781c0",
+        "rules/js-early-exit.md": "efa505f992323af85397df012ee8bf88461d31c4aa3e6d9a0031ca41247a2183",
         "rules/js-flatmap-filter.md": "57d9e94a989d989906f01c135c427bdd3218373125753d5d70531a6184521a57",
         "rules/js-hoist-regexp.md": "f9e9aef2f7c2307dd7310f283df85dcada45fc43e9bb941b0c3aa414dec21ec4",
         "rules/js-index-maps.md": "2d91943d22de8fc40b4ee6ca271b299f7565e9af65970e69e46892758462ba1e",

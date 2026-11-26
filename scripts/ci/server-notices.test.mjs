@@ -54,10 +54,10 @@ function fixture(options = {}) {
       "\texample.com/cgoonly v0.0.1",
       ")",
       "",
-      "replace example.com/lib => ./lib",
-      "replace example.com/otherlib => ./otherlib",
-      "replace example.com/windowsonly => ./windowsonly",
-      "replace example.com/cgoonly => ./cgoonly",
+      'replace example.com/lib => "./[cache]/lib"',
+      'replace example.com/otherlib => "./[cache]/otherlib"',
+      'replace example.com/windowsonly => "./[cache]/windowsonly"',
+      'replace example.com/cgoonly => "./[cache]/cgoonly"',
       "",
     ].join("\n"),
   );
@@ -82,16 +82,23 @@ function fixture(options = {}) {
     '//go:build cgo\n\npackage main\n\nimport _ "example.com/cgoonly"\n',
   );
   for (const name of ["lib", "otherlib", "windowsonly", "cgoonly"]) {
-    write(join(dir, name, "go.mod"), `module example.com/${name}\n\ngo 1.21\n`);
-    write(join(dir, name, `${name}.go`), `package ${name}\n`);
+    write(
+      join(dir, "[cache]", name, "go.mod"),
+      `module example.com/${name}\n\ngo 1.21\n`,
+    );
+    write(join(dir, "[cache]", name, `${name}.go`), `package ${name}\n`);
   }
   if (options.license !== false) {
-    write(join(dir, "lib/LICENSE"), "Fixture license text\n");
-    write(join(dir, "lib/NOTICE.md"), "Fixture notice text\n");
+    write(join(dir, "[cache]/lib/LICENSE"), "Fixture license text\n");
+    write(
+      join(dir, "[cache]/lib/LiCeNsEs/extra.txt"),
+      "Extra fixture license text\n",
+    );
+    write(join(dir, "[cache]/lib/NOTICE.md"), "Fixture notice text\n");
     // Beyond the collector's maximum depth: not part of the bundle.
-    write(join(dir, "lib/a/b/LICENSE"), "Too deep license text\n");
+    write(join(dir, "[cache]/lib/a/b/LICENSE"), "Too deep license text\n");
   }
-  write(join(dir, "otherlib/LICENSE"), "Other fixture license text\n");
+  write(join(dir, "[cache]/otherlib/LICENSE"), "Other fixture license text\n");
   return dir;
 }
 
@@ -125,11 +132,21 @@ test(
     assert.equal(result.status, 0, result.stderr);
     const bundle = readFileSync(out, "utf8");
     assert.match(bundle, /^Third-party licenses of app\n/);
-    assert.match(bundle, /example\.com\/lib v1\.2\.3: LICENSE\n/);
-    assert.match(bundle, /example\.com\/lib v1\.2\.3: NOTICE\.md\n/);
-    assert.match(bundle, /example\.com\/otherlib v0\.0\.1: LICENSE\n/);
-    assert.match(bundle, /Fixture license text/);
-    assert.match(bundle, /Fixture notice text/);
+    assert.deepEqual(
+      Array.from(
+        bundle.matchAll(/^(example\.com\/[^\n]+)\n=+\n\n([^\n]+)$/gm),
+        ([, header, text]) => [header, text],
+      ),
+      [
+        ["example.com/lib v1.2.3: LICENSE", "Fixture license text"],
+        [
+          "example.com/lib v1.2.3: LiCeNsEs/extra.txt",
+          "Extra fixture license text",
+        ],
+        ["example.com/lib v1.2.3: NOTICE.md", "Fixture notice text"],
+        ["example.com/otherlib v0.0.1: LICENSE", "Other fixture license text"],
+      ],
+    );
     assert.doesNotMatch(bundle, /Too deep license text/);
     assert.doesNotMatch(bundle, /windowsonly|cgoonly/);
     assert.match(result.stderr, /licenses of 2 third-party modules of app/);
@@ -150,7 +167,7 @@ for (const { stage, tool, partialOutput, diagnostic } of [
     stage: "license search",
     tool: "find",
     partialOutput: [
-      '[[ "$1" == */lib ]] || exec find "$@"',
+      '[[ "$PWD" == */lib ]] || exec find "$@"',
       'printf "%s\\0" "$1/LICENSE"',
     ],
     diagnostic:
