@@ -259,9 +259,13 @@ func (c *Cursor) TryNext() (*ownsandv1.ExecEvent, <-chan struct{}) {
 }
 
 // Next waits for the next event. When keepalive is positive and no event
-// arrives within it, Next returns a keepalive event. It returns io.EOF after
-// the final event and the context error when ctx ends.
+// arrives within it, Next returns a keepalive event. After the final event,
+// Next returns io.EOF. An active cursor checks ctx before reading an event
+// so a call with an ended context leaves the event available for a retry.
 func (c *Cursor) Next(ctx context.Context, keepalive time.Duration) (*ownsandv1.ExecEvent, error) {
+	if c.Done() {
+		return nil, io.EOF
+	}
 	var timeout <-chan time.Time
 	if keepalive > 0 {
 		timer := time.NewTimer(keepalive)
@@ -269,17 +273,20 @@ func (c *Cursor) Next(ctx context.Context, keepalive time.Duration) (*ownsandv1.
 		timeout = timer.C
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		ev, changed := c.TryNext()
 		if ev != nil {
 			return ev, nil
-		}
-		if changed == nil {
-			return nil, io.EOF
 		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-timeout:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			return KeepaliveEvent(), nil
 		case <-changed:
 		}
