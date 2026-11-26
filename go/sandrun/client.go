@@ -89,8 +89,8 @@ type timing struct {
 	// backoffMin and backoffMax bound the reconnect delay of WatchQueue
 	// and the retry delay of exec continuations.
 	backoffMin, backoffMax time.Duration
-	// retryBudget bounds how long an exec continuation or a file chunk
-	// retries transient failures without progress.
+	// retryBudget bounds exec retries without progress, each write chunk,
+	// and the time between accepted bytes during a read.
 	retryBudget time.Duration
 	// waitInterval is the default polling interval of WaitDevSession.
 	waitInterval time.Duration
