@@ -240,6 +240,70 @@ func TestPagination(t *testing.T) {
 	}
 }
 
+func TestPaginationConcurrentNilRequest(t *testing.T) {
+	var mu sync.Mutex
+	tokenCounts := make(map[string]int)
+	handler := connect.NewUnaryHandler(sandrunv1connect.OrganizationServiceListOrganizationsProcedure,
+		func(_ context.Context, req *connect.Request[sandrunv1.ListOrganizationsRequest]) (*connect.Response[sandrunv1.ListOrganizationsResponse], error) {
+			token := req.Msg.GetPageToken()
+			mu.Lock()
+			tokenCounts[token]++
+			mu.Unlock()
+
+			var id, next string
+			switch token {
+			case "":
+				id, next = "org-1", "next"
+			case "next":
+				id = "org-2"
+			default:
+				return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("unexpected page token %q", token))
+			}
+			return connect.NewResponse(&sandrunv1.ListOrganizationsResponse{
+				Organizations: []*sandrunv1.Organization{{OrganizationId: id}},
+				NextPageToken: next,
+			}), nil
+		})
+	srv := httptest.NewTLSServer(handler)
+	t.Cleanup(srv.Close)
+	client, err := New(Options{BaseURL: srv.URL, HTTPClient: srv.Client(), APIKey: sandruntest.DefaultAccessToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seq := client.AllOrganizations(t.Context(), nil)
+	start := make(chan struct{})
+	var traversals sync.WaitGroup
+	for i := range 2 {
+		traversals.Go(func() {
+			<-start
+			orgs, err := Collect(seq)
+			if err != nil {
+				t.Errorf("traversal %d: Collect: %v", i, err)
+				return
+			}
+			var gotIDs []string
+			for _, org := range orgs {
+				gotIDs = append(gotIDs, org.GetOrganizationId())
+			}
+			wantIDs := []string{"org-1", "org-2"}
+			t.Logf("traversal %d: collected organization IDs = %q", i, gotIDs)
+			if !slices.Equal(gotIDs, wantIDs) {
+				t.Errorf("traversal %d: got %q, want %q", i, gotIDs, wantIDs)
+			}
+		})
+	}
+	close(start)
+	traversals.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	t.Logf("request counts by token = %v", tokenCounts)
+	if len(tokenCounts) != 2 || tokenCounts[""] != 2 || tokenCounts["next"] != 2 {
+		t.Errorf("request counts by token = %v, want two requests each for the empty token and next", tokenCounts)
+	}
+}
+
 func TestFakePageSizeValidation(t *testing.T) {
 	c, srv, _ := newTestClient(t, "")
 	for i := range 200 {
@@ -294,6 +358,7 @@ func TestFakePageSizeValidation(t *testing.T) {
 
 func TestPaginationRepeatedStartingToken(t *testing.T) {
 	const loopError = "sandrun: the server returned the page token of an earlier page again"
+	const pageSize = 10
 	for _, tc := range []struct {
 		name       string
 		nextTokens map[string]string
@@ -329,6 +394,9 @@ func TestPaginationRepeatedStartingToken(t *testing.T) {
 			handler := connect.NewUnaryHandler(sandrunv1connect.OrganizationServiceListOrganizationsProcedure,
 				func(_ context.Context, req *connect.Request[sandrunv1.ListOrganizationsRequest]) (*connect.Response[sandrunv1.ListOrganizationsResponse], error) {
 					token := req.Msg.GetPageToken()
+					if got := req.Msg.GetPageSize(); got != pageSize {
+						t.Errorf("page size for token %q = %d, want %d", token, got, pageSize)
+					}
 					mu.Lock()
 					tokens = append(tokens, token)
 					mu.Unlock()
@@ -348,7 +416,7 @@ func TestPaginationRepeatedStartingToken(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			req := &sandrunv1.ListOrganizationsRequest{PageToken: "resume"}
+			req := &sandrunv1.ListOrganizationsRequest{PageToken: "resume", PageSize: pageSize}
 			orgs, err := Collect(client.AllOrganizations(t.Context(), req))
 			var gotIDs []string
 			for _, org := range orgs {
@@ -373,6 +441,9 @@ func TestPaginationRepeatedStartingToken(t *testing.T) {
 			}
 			if req.GetPageToken() != "resume" {
 				t.Errorf("caller request token = %q, want resume", req.GetPageToken())
+			}
+			if req.GetPageSize() != pageSize {
+				t.Errorf("caller request page size = %d, want %d", req.GetPageSize(), pageSize)
 			}
 		})
 	}
