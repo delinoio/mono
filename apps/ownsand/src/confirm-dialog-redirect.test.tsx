@@ -6,9 +6,10 @@ import {
   cleanup,
   fireEvent,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
-import { MOCK_IDS } from "./mock/mock-api.ts";
+import { createMockTransport, MOCK_IDS } from "./mock/mock-api.ts";
 import { holdingTransport, renderConsole, settle } from "./test-support.tsx";
 
 beforeEach(() => {
@@ -75,6 +76,41 @@ const FLOWS: Flow[] = [
     pageSurvives: false,
   },
 ];
+
+test("device removal redirects while the detail refresh is pending", async () => {
+  const devicesPath = `/orgs/${MOCK_IDS.acme}/devices`;
+  const userId = "user-admin-jun";
+  let holdDetail = false;
+  const { transport, calls, seen } = holdingTransport(
+    ["GetDevice"],
+    () => holdDetail,
+    createMockTransport({ userId }),
+  );
+  renderConsole(`${devicesPath}/${MOCK_IDS.buildBox}`, { transport, userId });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Remove device" }));
+  const dialog = await screen.findByRole("alertdialog");
+  const entries = window.history.length;
+  try {
+    holdDetail = true;
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Remove device" }),
+    );
+
+    await waitFor(() => expect(calls.GetDevice).toHaveLength(1));
+    expect(
+      await screen.findByRole("link", { name: "studio-mac" }),
+    ).toBeTruthy();
+    expect(window.location.pathname).toBe(devicesPath);
+    expect(window.history.length).toBe(entries + 1);
+    expect(screen.queryByRole("link", { name: "build-box-1" })).toBeNull();
+    expect(seen.RemoveDevice).toBe(1);
+  } finally {
+    await act(async () => {
+      for (const call of calls.GetDevice ?? []) call.settle();
+    });
+  }
+});
 
 describe.each(FLOWS)("$name confirmation redirect", (flow) => {
   async function start() {

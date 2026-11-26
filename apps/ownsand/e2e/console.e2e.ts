@@ -352,7 +352,7 @@ describe("devices", () => {
     await expect(disk).toHaveValue("600");
   });
 
-  test("removes a device and drops it from the device list", async ({
+  test("returns to Devices while the removed device refresh is pending", async ({
     app,
     screen,
     browser,
@@ -367,13 +367,35 @@ describe("devices", () => {
     await screen.getByRole("button", "Remove device").tap();
     const dialog = screen.getByRole("alertdialog", "Remove build-box-1?");
     await expect(dialog).toBeVisible();
-    await dialog.getByRole("button", "Remove device").tap();
+    const entries = await browser.evaluate(() => {
+      sessionStorage.setItem("ownsand-e2e-device-readback", "hold");
+      sessionStorage.setItem("ownsand-e2e-tracked-mutation", "RemoveDevice");
+      return history.length;
+    });
 
-    // The console returns to the device list. The mock API omits a removed
-    // device from a list request that sets no state, like the real API.
-    await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
-    await expect(screen.getByText("studio-mac").first()).toBeVisible();
-    await expect(screen.getByText("build-box-1")).toBeHidden();
+    try {
+      await dialog.getByRole("button", "Remove device").tap();
+      await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
+      await expect(screen.getByText("studio-mac").first()).toBeVisible();
+      await expect(screen.getByText("build-box-1")).toBeHidden();
+      expect(
+        await browser.evaluate(() => ({
+          readback: sessionStorage.getItem("ownsand-e2e-device-readback"),
+          calls: sessionStorage.getItem("ownsand-e2e-mutation-calls"),
+          entries: history.length,
+        })),
+      ).toEqual({
+        readback: "held",
+        calls: JSON.stringify(["RemoveDevice"]),
+        entries: entries + 1,
+      });
+      await app.screenshot("devices-before-readback");
+    } finally {
+      await browser.evaluate(() => {
+        dispatchEvent(new Event("ownsand-e2e-device-readback-release"));
+        return null;
+      });
+    }
 
     await screen.getByRole("link", "Sandboxes", { exact: true }).tap();
     const sandbox = screen.getByRole("link", "0193a000…00a1");
