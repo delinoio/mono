@@ -43,31 +43,35 @@ func TestListenUnixRemovesStaleSocket(t *testing.T) {
 	// A short relative path: a unix socket path under a deep TMPDIR can
 	// exceed the 108-byte limit.
 	t.Chdir(t.TempDir())
-	path := "g.sock"
-	for range 2 {
-		l, err := Listen("unix://" + path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		go func() {
-			c, err := l.Accept()
-			if err == nil {
-				c.Write([]byte("x"))
-				c.Close()
+	const path = "g.sock"
+	for _, name := range []string{"first", "replacement"} {
+		if !t.Run(name, func(t *testing.T) {
+			l, err := Listen("unix://" + path)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}()
-		c, err := net.Dial("unix", path)
-		if err != nil {
-			t.Fatal(err)
+			done := make(chan struct{})
+			t.Cleanup(func() {
+				l.Close()
+				<-done
+			})
+			go func() {
+				defer close(done)
+				c, err := l.Accept()
+				if err == nil {
+					defer c.Close()
+					c.Write([]byte("x"))
+				}
+			}()
+			requireAnswers(t, path)
+			// Leave the socket file behind like a crashed helper would.
+			l.(*net.UnixListener).SetUnlinkOnClose(false)
+		}) {
+			return
 		}
-		buf := make([]byte, 1)
-		if _, err := c.Read(buf); err != nil || buf[0] != 'x' {
-			t.Fatalf("read %q %v", buf, err)
+		if info, err := os.Lstat(path); err != nil || info.Mode().Type() != os.ModeSocket {
+			t.Fatalf("stale socket file missing after %s: %v", name, err)
 		}
-		c.Close()
-		// Leave the socket file behind like a crashed helper would.
-		l.(*net.UnixListener).SetUnlinkOnClose(false)
-		l.Close()
 	}
 }
 

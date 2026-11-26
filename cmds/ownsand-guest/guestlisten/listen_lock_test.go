@@ -48,13 +48,19 @@ type listenResult struct {
 	err error
 }
 
-func listenAsync(spec string) <-chan listenResult {
-	out := make(chan listenResult, 1)
+type listenerStart struct {
+	done   chan struct{}
+	result listenResult
+}
+
+func listenAsync(spec string) *listenerStart {
+	worker := &listenerStart{done: make(chan struct{})}
 	go func() {
+		defer close(worker.done)
 		l, err := Listen(spec)
-		out <- listenResult{l, err}
+		worker.result = listenResult{l, err}
 	}()
-	return out
+	return worker
 }
 
 func receive[T any](t *testing.T, ch <-chan T, what string) T {
@@ -98,19 +104,10 @@ func TestListenUnixSecondStartWaitsForStaleSocketReplacement(t *testing.T) {
 		time.Sleep(d)
 	}
 
-	type listenerStart struct {
-		done   chan struct{}
-		result listenResult
-	}
 	var started []*listenerStart
 	start := func() *listenerStart {
-		worker := &listenerStart{done: make(chan struct{})}
+		worker := listenAsync("unix://" + path)
 		started = append(started, worker)
-		go func() {
-			l, err := Listen("unix://" + path)
-			worker.result = listenResult{l, err}
-			close(worker.done)
-		}()
 		return worker
 	}
 	// Join all starts before restoring the hooks or working directory. Keep
@@ -167,13 +164,30 @@ func TestListenUnixConcurrentStartsOnStaleSocket(t *testing.T) {
 	makeStaleSocket(t, path)
 
 	const starts = 6
-	results := make([]<-chan listenResult, starts)
-	for i := range results {
-		results[i] = listenAsync("unix://" + path)
+	workers := make([]*listenerStart, 0, starts)
+	var servingDone chan struct{}
+	t.Cleanup(func() {
+		// Keep the winner open until every start finishes probing the path.
+		for _, worker := range workers {
+			<-worker.done
+		}
+		for _, worker := range workers {
+			if l := worker.result.l; l != nil {
+				l.Close()
+			}
+		}
+		if servingDone != nil {
+			<-servingDone
+		}
+	})
+
+	for range starts {
+		workers = append(workers, listenAsync("unix://"+path))
 	}
 	var winners []net.Listener
-	for i, ch := range results {
-		r := receive(t, ch, "a start")
+	for i, worker := range workers {
+		receive(t, worker.done, "a start")
+		r := worker.result
 		if r.err == nil {
 			winners = append(winners, r.l)
 			continue
@@ -182,13 +196,14 @@ func TestListenUnixConcurrentStartsOnStaleSocket(t *testing.T) {
 			t.Errorf("start %d err = %v, want ErrAddressInUse", i, r.err)
 		}
 	}
-	for _, l := range winners {
-		defer l.Close()
-	}
 	if len(winners) != 1 {
 		t.Fatalf("%d starts won the path, want exactly 1", len(winners))
 	}
-	go serveOnce(winners[0])
+	servingDone = make(chan struct{})
+	go func() {
+		defer close(servingDone)
+		serveOnce(winners[0])
+	}()
 	requireAnswers(t, path)
 }
 
