@@ -10,6 +10,7 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -80,15 +81,14 @@ case "$1" in
 esac
 `;
 
-// The built executable: its standard output, standard error and exit status
-// come from the environment of the case.
+// Read stdout from a file so the test case can provide NUL bytes.
 const executableStub = `#!/usr/bin/env bash
-printf '%s' "\${STUB_VERSION_STDOUT-}"
+cat "$STUB_DIR/stdout"
 printf '%s' "\${STUB_VERSION_STDERR-}" >&2
 exit "\${STUB_VERSION_STATUS:-0}"
 `;
 
-function runBuild(t, env) {
+function runBuild(t, stdout, env = {}) {
   const dir = mkdtempSync(join(tmpdir(), "release-binaries-version-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   mkdirSync(join(dir, "bin"));
@@ -97,22 +97,29 @@ function runBuild(t, env) {
   writeFileSync(join(dir, "goroot/LICENSE"), "Go license\n");
   writeFileSync(join(dir, "bin/go"), goStub);
   writeFileSync(join(dir, "executable"), executableStub);
+  writeFileSync(join(dir, "stdout"), stdout);
   writeFileSync(join(dir, "summary"), "");
   chmodSync(join(dir, "bin/go"), 0o755);
-  return spawnSync("bash", [script, "build", "cross", join(dir, "out")], {
-    encoding: "utf8",
-    cwd: root,
-    env: {
-      PATH: `${join(dir, "bin")}${delimiter}${process.env.PATH}`,
-      HOME: dir,
-      TMPDIR: dir,
-      STUB_DIR: dir,
-      BINARIES: JSON.stringify([binary]),
-      RUNNER_TEMP: join(dir, "runner"),
-      GITHUB_STEP_SUMMARY: join(dir, "summary"),
-      ...env,
+  const result = spawnSync(
+    "bash",
+    [script, "build", "cross", join(dir, "out")],
+    {
+      encoding: "utf8",
+      cwd: root,
+      env: {
+        PATH: `${join(dir, "bin")}${delimiter}${process.env.PATH}`,
+        HOME: dir,
+        TMPDIR: join(dir, "runner"),
+        STUB_DIR: dir,
+        BINARIES: JSON.stringify([binary]),
+        RUNNER_TEMP: join(dir, "runner"),
+        GITHUB_STEP_SUMMARY: join(dir, "summary"),
+        ...env,
+      },
     },
-  });
+  );
+  assert.deepEqual(readdirSync(join(dir, "runner")), []);
+  return result;
 }
 
 const asset = "ownsand-agent-linux-amd64";
@@ -121,7 +128,7 @@ test(
   "the host executable that prints exactly the version passes",
   { skip },
   (t) => {
-    const result = runBuild(t, { STUB_VERSION_STDOUT: `${version}\n` });
+    const result = runBuild(t, `${version}\n`);
     assert.equal(result.status, 0, result.stderr);
   },
 );
@@ -130,7 +137,7 @@ test(
   "the host executable that prints the version without a newline passes",
   { skip },
   (t) => {
-    const result = runBuild(t, { STUB_VERSION_STDOUT: version });
+    const result = runBuild(t, version);
     assert.equal(result.status, 0, result.stderr);
   },
 );
@@ -139,8 +146,7 @@ test(
   "standard error output does not fail an exact version on standard output",
   { skip },
   (t) => {
-    const result = runBuild(t, {
-      STUB_VERSION_STDOUT: `${version}\n`,
+    const result = runBuild(t, `${version}\n`, {
       STUB_VERSION_STDERR: "a diagnostic\n",
     });
     assert.equal(result.status, 0, result.stderr);
@@ -151,14 +157,18 @@ for (const [label, printed] of [
   ["a longer version that contains it", `11.2.3\n`],
   ["a prefix before it", `v${version}\n`],
   ["text around it", `ownsand-agent ${version} (linux)\n`],
+  ["two trailing newlines", `${version}\n\n`],
+  ["a leading NUL byte", `\0${version}\n`],
+  ["an embedded NUL byte", "1.2\0.3\n"],
+  ["a trailing NUL byte", `${version}\n\0`],
   ["nothing", ""],
 ]) {
   test(`the host executable that prints ${label} fails`, { skip }, (t) => {
-    const result = runBuild(t, { STUB_VERSION_STDOUT: printed });
+    const result = runBuild(t, printed);
     assert.notEqual(result.status, 0);
-    assert.match(
+    assert.ok(
+      result.stderr.includes(`${asset} version must print exactly ${version}`),
       result.stderr,
-      new RegExp(`${asset} version printed .*, not the version 1\\.2\\.3\\.`),
     );
   });
 }
@@ -167,11 +177,11 @@ test(
   "the host executable that prints the version on standard error only fails",
   { skip },
   (t) => {
-    const result = runBuild(t, { STUB_VERSION_STDERR: `${version}\n` });
+    const result = runBuild(t, "", { STUB_VERSION_STDERR: `${version}\n` });
     assert.notEqual(result.status, 0);
-    assert.match(
+    assert.ok(
+      result.stderr.includes(`${asset} version must print exactly ${version}`),
       result.stderr,
-      /version printed nothing, not the version 1\.2\.3\./,
     );
   },
 );
@@ -180,17 +190,16 @@ test(
   "the host executable that exits with a nonzero status fails even with the version",
   { skip },
   (t) => {
-    const result = runBuild(t, {
-      STUB_VERSION_STDOUT: `${version}\n`,
+    const result = runBuild(t, `${version}\n`, {
       STUB_VERSION_STDERR: "boom\n",
       STUB_VERSION_STATUS: "3",
     });
     assert.notEqual(result.status, 0);
-    assert.match(
-      result.stderr,
-      new RegExp(
-        `${asset} version exited with status 3 \\(printed ${version.replace(/\./g, "\\.")}, standard error: boom \\)`,
+    assert.ok(
+      result.stderr.includes(
+        `${asset} version exited with status 3 (standard error: boom )`,
       ),
+      result.stderr,
     );
   },
 );
