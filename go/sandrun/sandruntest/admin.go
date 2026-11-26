@@ -184,7 +184,9 @@ func (o *orgService) UpdateOrganizationSettings(_ context.Context, req *connect.
 		return nil, err
 	}
 	paths := req.Msg.GetUpdateMask().GetPaths()
-	if !slices.Contains(paths, "max_dev_sessions_per_user") {
+	if len(paths) == 0 || slices.ContainsFunc(paths, func(path string) bool {
+		return path != "max_dev_sessions_per_user"
+	}) {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("update_mask must name max_dev_sessions_per_user"))
 	}
 	if settings := req.Msg.GetSettings(); settings != nil && settings.MaxDevSessionsPerUser != nil {
