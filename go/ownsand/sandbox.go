@@ -301,10 +301,10 @@ func (s *Sandbox) Snapshot(ctx context.Context) (*ownsandv1.Snapshot, error) {
 // Close closes the handle's peer-to-peer session and cancels a session setup
 // that is in flight: that operation returns a "sandbox handle closed" error,
 // and a session that the setup still opens is closed and never installed.
-// A closed handle rejects later operations that use the peer-to-peer path
-// (every transport except TransportRelay) with the same error. Running execs
-// continue on the agent and can be attached again with a new handle. Close is
-// idempotent.
+// Interrupted peer operations and later operations on a closed peer-capable
+// handle return the same error directly. Closing the handle stops delivery
+// of queued peer exec events. Running execs continue on the agent and can
+// be attached again with a new handle. Close is idempotent.
 func (s *Sandbox) Close() error {
 	s.dp.close()
 	return nil

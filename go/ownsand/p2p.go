@@ -506,19 +506,37 @@ func (s *p2pSession) openStream(ctx context.Context, payload proto.Message) (*p2
 // context ends the receive early; a stream failure or session end still
 // delivers the frames that were queued before it to a caller that is active.
 func (st *p2pStream) recv(ctx context.Context) (*ownsandv1.DataFrame, error) {
-	if err := ctx.Err(); err != nil {
+	return st.recvUntilHandleClose(ctx, nil)
+}
+
+// recvUntilHandleClose also stops delivery when handleDone closes. A peer
+// exec can still hold a stream from a session the handle has since detached.
+func (st *p2pStream) recvUntilHandleClose(ctx context.Context, handleDone <-chan struct{}) (*ownsandv1.DataFrame, error) {
+	if err := peerReceiveError(ctx, handleDone); err != nil {
 		return nil, err
 	}
-	f, err := st.recvNext(ctx)
-	// A frame or transport error can win the select when the context ends.
+	f, err := st.recvNext(ctx, handleDone)
+	// A frame or transport error can win the select when delivery must stop.
 	// Check again before handing the selected result to the caller.
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+	if recvErr := peerReceiveError(ctx, handleDone); recvErr != nil {
+		return nil, recvErr
 	}
 	return f, err
 }
 
-func (st *p2pStream) recvNext(ctx context.Context) (*ownsandv1.DataFrame, error) {
+func peerReceiveError(ctx context.Context, handleDone <-chan struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-handleDone:
+		return closedHandleError(ctx)
+	default:
+		return nil
+	}
+}
+
+func (st *p2pStream) recvNext(ctx context.Context, handleDone <-chan struct{}) (*ownsandv1.DataFrame, error) {
 	select {
 	case f := <-st.ch:
 		return f, nil
@@ -543,6 +561,8 @@ func (st *p2pStream) recvNext(ctx context.Context) (*ownsandv1.DataFrame, error)
 		return nil, st.s.endErr
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-handleDone:
+		return nil, errHandleClosed
 	}
 }
 

@@ -247,6 +247,7 @@ func TestStreamRecvDrainsQueuedFramesForActiveContext(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s, st, _ := newDispatchSession(t)
+			handleDone := make(chan struct{})
 			want := []*ownsandv1.DataFrame{
 				datapath.MustNewFrame(st.id, "", &ownsandv1.ErrorDetail{Message: "one"}),
 				datapath.MustNewFrame(st.id, "", &ownsandv1.ErrorDetail{Message: "two"}),
@@ -256,12 +257,12 @@ func TestStreamRecvDrainsQueuedFramesForActiveContext(t *testing.T) {
 			}
 			tt.setup(s, st)
 			for i, w := range want {
-				f, err := st.recv(context.Background())
+				f, err := st.recvUntilHandleClose(t.Context(), handleDone)
 				if err != nil || f != w {
 					t.Fatalf("recv %d = (%v, %v), want the queued frame", i, f, err)
 				}
 			}
-			if f, err := st.recv(context.Background()); f != nil || !errors.Is(err, tt.wantErr) {
+			if f, err := st.recvUntilHandleClose(t.Context(), handleDone); f != nil || !errors.Is(err, tt.wantErr) {
 				t.Fatalf("recv after drain = (%v, %v), want (nil, %v)", f, err, tt.wantErr)
 			}
 		})
@@ -363,5 +364,138 @@ func TestExecPeerStopsDeliveringQueuedEventsAfterCancel(t *testing.T) {
 	}
 	if n := after.Load(); n != 0 {
 		t.Fatalf("%d callbacks after the cancellation, want 0", n)
+	}
+}
+
+func TestPeerCloseDuringOperationWakesDetachedReceive(t *testing.T) {
+	_, st, _ := newDispatchSession(t)
+	receiving := make(chan struct{})
+	d := newDataPath(nil)
+	ctx := &recvTestContext{Context: t.Context(), beforeDone: func() { close(receiving) }}
+	done := make(chan error, 1)
+	go func() {
+		_, err := st.recvUntilHandleClose(ctx, d.done)
+		done <- err
+	}()
+	select {
+	case <-receiving:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stream did not start waiting for a frame")
+	}
+	// This stream is outside the handle's current session. Its own end
+	// signal stays open when the handle closes.
+	d.close()
+	requireHandleClosed(t, waitOpErr(t, done))
+}
+
+func TestPeerCloseQueuedReceiveChecksDeliveryBoundary(t *testing.T) {
+	for _, cancelCaller := range []bool{false, true} {
+		_, st, _ := newDispatchSession(t)
+		st.ch <- datapath.MustNewFrame(st.id, "", exitedEvent(0))
+		d := newDataPath(nil)
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(cancel)
+		checks := 0
+		gated := &recvTestContext{Context: ctx, beforeErr: func() {
+			checks++
+			if checks == 2 {
+				d.close()
+				if cancelCaller {
+					cancel()
+				}
+			}
+		}}
+		want := errHandleClosed
+		if cancelCaller {
+			want = context.Canceled
+		}
+		if f, err := st.recvUntilHandleClose(gated, d.done); f != nil || err != want {
+			t.Fatalf("recv with caller canceled = %v: got (%v, %v), want (nil, %v)", cancelCaller, f, err, want)
+		}
+	}
+}
+
+func TestPeerExecCloseWithQueuedOutputAndExit(t *testing.T) {
+	for _, tr := range []Transport{TransportAuto, TransportPeerToPeer} {
+		for _, cc := range closeCases {
+			for _, attach := range []bool{false, true} {
+				op := "Exec"
+				if attach {
+					op = "AttachExec"
+				}
+				t.Run(tr.String()+"/"+cc.name+"/"+op, func(t *testing.T) {
+					cp := newFakeCP(t)
+					cp.p2pScript = func(int) p2pAction { return p2pAction{omitKeepalives: true} }
+					s := cp.handle(t, cp.client(t, tr))
+					queue := make(chan struct{})
+					cp.agent.run = func(_ []string, e *fakeExec) {
+						e.write(0, []byte("first\n"))
+						select {
+						case <-queue:
+							e.write(0, []byte("queued\n"))
+							e.finish(exitedEvent(0))
+						case <-t.Context().Done():
+						}
+					}
+					const id = "01900000-0000-7000-8000-000000000001"
+					if attach {
+						cp.agent.startExec(cp, &ownsandv1.ExecRequest{ExecId: id, Command: []string{"run"}})
+					}
+					entered, release := make(chan struct{}), make(chan struct{})
+					defer close(release)
+					out := make(chan execResult, 1)
+					var stdout []string
+					onEvent := func(ev ExecEvent) error {
+						if ev.Kind == ExecEventStdout {
+							stdout = append(stdout, string(ev.Data))
+							if len(stdout) == 1 {
+								close(entered)
+								<-release
+							}
+						}
+						return nil
+					}
+					go func() {
+						var res *ExecResult
+						var err error
+						if attach {
+							res, err = s.AttachExec(t.Context(), id, AttachParams{OnEvent: onEvent})
+						} else {
+							res, err = s.Exec(t.Context(), ExecParams{ExecID: id, Command: []string{"run"}, OnEvent: onEvent})
+						}
+						out <- execResult{res: res, err: err}
+					}()
+					select {
+					case <-entered:
+					case r := <-out:
+						t.Fatalf("operation ended before stdout: %+v", r)
+					case <-time.After(10 * time.Second):
+						t.Fatal("first stdout did not reach the callback")
+					}
+					sess := s.installedSession()
+					close(queue)
+					waitFor(t, "queued stdout and exit", func() bool {
+						sess.mu.Lock()
+						defer sess.mu.Unlock()
+						for _, st := range sess.streams {
+							if len(st.ch) == 2 {
+								return true
+							}
+						}
+						return false
+					})
+					cc.close(t, s)
+					release <- struct{}{}
+					r := waitExec(t, out)
+					requireHandleClosed(t, r.err)
+					if r.res != nil || len(stdout) != 1 || stdout[0] != "first\n" {
+						t.Fatalf("result = %+v, stdout = %q", r.res, stdout)
+					}
+					if s.Transport() != p2pTransport || len(cp.authRequests()) != 0 || cp.agent.totalRuns() != 1 {
+						t.Fatalf("transport = %v, AuthorizeRelay calls = %d, runs = %d", s.Transport(), len(cp.authRequests()), cp.agent.totalRuns())
+					}
+				})
+			}
+		}
 	}
 }

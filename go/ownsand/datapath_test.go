@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,9 +110,7 @@ func TestCloseDuringSetupReleasesTheSetup(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := waitExec(t, ch)
-	if !errors.Is(r.err, errHandleClosed) {
-		t.Fatalf("exec after Close during setup: %v", r.err)
-	}
+	requireHandleClosed(t, r.err)
 	waitFor(t, "the held request to end", func() bool { return cp.gateCanceledCount() == 1 })
 	close(cp.iceGate)
 	if s.installedSession() != nil {
@@ -124,11 +123,43 @@ func TestCloseDuringSetupReleasesTheSetup(t *testing.T) {
 	// the control plane.
 	before := cp.iceCallCount()
 	_, err := s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
-	if !errors.Is(err, errHandleClosed) {
-		t.Fatalf("exec on a closed handle: %v", err)
-	}
+	requireHandleClosed(t, err)
 	if cp.iceCallCount() != before || cp.openSessionCount() != 0 {
 		t.Fatal("a closed handle called the control plane")
+	}
+}
+
+func TestCloseDuringFailedSetupPreventsFallback(t *testing.T) {
+	for _, cc := range closeCases {
+		t.Run(cc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.iceGate = make(chan struct{})
+			cp.gateErr = connect.NewError(connect.CodeUnavailable, errors.New("ICE setup failed"))
+			c := cp.client(t, TransportAuto)
+			logs := captureLogs(c)
+			s := cp.handle(t, c)
+			transport := s.Transport()
+			var setupReturned, closed atomic.Bool
+			c.p2p.setupDone = func() { setupReturned.Store(true) }
+			ctx := &recvTestContext{Context: t.Context(), beforeErr: func() {
+				// The failing route checks the caller after the initial
+				// closed-state check and before it selects the relay.
+				if setupReturned.Load() && closed.CompareAndSwap(false, true) {
+					cc.close(t, s)
+				}
+			}}
+			res, err := s.Exec(ctx, ExecParams{Command: []string{"run"}})
+			requireHandleClosed(t, err)
+			if res != nil || !closed.Load() || cp.iceCallCount() != 1 {
+				t.Fatalf("exec result = %+v, closed = %v, GetIceServers calls = %d", res, closed.Load(), cp.iceCallCount())
+			}
+			if s.usesRelay() || s.Transport() != transport {
+				t.Fatalf("transport = %v after close during setup, want %v", s.Transport(), transport)
+			}
+			if len(cp.authRequests()) != 0 || strings.Contains(logs.String(), "falls back to the relay") {
+				t.Fatal("failed setup fell back to relay after the handle closed")
+			}
+		})
 	}
 }
 
@@ -552,6 +583,24 @@ func waitOpErr(t *testing.T, ch <-chan error) error {
 	}
 }
 
+func requireHandleClosed(t *testing.T, err error) {
+	t.Helper()
+	var dpErr *DataPathError
+	if errors.As(err, &dpErr) || err != errHandleClosed {
+		t.Fatalf("operation error = %T(%v), want direct errHandleClosed", err, err)
+	}
+}
+
+func TestCloseOperationErrorNormalizesSessionMarker(t *testing.T) {
+	for _, op := range []func(error) error{
+		func(err error) error { return (&execOp{}).dpErr(err, false) },
+		(&readOp{}).dpErr,
+		(&writeOp{}).dpErr,
+	} {
+		requireHandleClosed(t, op(&errSessionClosedByCaller{}))
+	}
+}
+
 // closeCases lists the ways that the caller ends a handle: Close and a
 // successful Delete both close the data path.
 var closeCases = []struct {
@@ -587,9 +636,7 @@ func TestCloseDuringOperationKeepsThePeerToPeerTransport(t *testing.T) {
 					t.Fatalf("transport %v before the close, want peer-to-peer", s.Transport())
 				}
 				cc.close(t, s)
-				if err := waitOpErr(t, ch); !errors.Is(err, errHandleClosed) {
-					t.Fatalf("operation after the close: %v, want errHandleClosed", err)
-				}
+				requireHandleClosed(t, waitOpErr(t, ch))
 				if n := len(cp.authRequests()); n != 0 {
 					t.Fatalf("%d AuthorizeRelay calls after the close, want 0", n)
 				}
@@ -610,15 +657,12 @@ func TestCloseDuringOperationKeepsThePeerToPeerTransport(t *testing.T) {
 				// plane method.
 				ice, open := cp.iceCallCount(), cp.openSessionCount()
 				_, err := s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
-				if !errors.Is(err, errHandleClosed) {
-					t.Fatalf("exec after the close: %v", err)
-				}
-				if _, err := s.ReadFileBytes(context.Background(), "/f"); !errors.Is(err, errHandleClosed) {
-					t.Fatalf("read after the close: %v", err)
-				}
-				if err := s.WriteFileBytes(context.Background(), "/g", []byte("x"), WriteOptions{}); !errors.Is(err, errHandleClosed) {
-					t.Fatalf("write after the close: %v", err)
-				}
+				requireHandleClosed(t, err)
+				_, err = s.AttachExec(context.Background(), "01900000-0000-7000-8000-000000000001", AttachParams{})
+				requireHandleClosed(t, err)
+				_, err = s.ReadFileBytes(context.Background(), "/f")
+				requireHandleClosed(t, err)
+				requireHandleClosed(t, s.WriteFileBytes(context.Background(), "/g", []byte("x"), WriteOptions{}))
 				if cp.iceCallCount() != ice || cp.openSessionCount() != open {
 					t.Fatal("an operation on a closed handle called the control plane")
 				}
@@ -634,23 +678,21 @@ func TestCloseDuringOperationKeepsThePeerToPeerTransport(t *testing.T) {
 // peer-to-peer ends the operation with errHandleClosed too.
 func TestCloseDuringOperationOnForcedPeerToPeer(t *testing.T) {
 	for _, op := range heldOps {
-		t.Run(op.name, func(t *testing.T) {
-			cp := newFakeCP(t)
-			s := cp.handle(t, cp.client(t, TransportPeerToPeer))
-			ch := op.start(t, cp, s)
-			if err := s.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if err := waitOpErr(t, ch); !errors.Is(err, errHandleClosed) {
-				t.Fatalf("operation after the close: %v, want errHandleClosed", err)
-			}
-			if n := len(cp.authRequests()); n != 0 {
-				t.Fatalf("%d AuthorizeRelay calls, want 0", n)
-			}
-			if got := s.Transport(); got != p2pTransport {
-				t.Fatalf("transport %v, want peer-to-peer", got)
-			}
-		})
+		for _, cc := range closeCases {
+			t.Run(op.name+"/"+cc.name, func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+				ch := op.start(t, cp, s)
+				cc.close(t, s)
+				requireHandleClosed(t, waitOpErr(t, ch))
+				if n := len(cp.authRequests()); n != 0 {
+					t.Fatalf("%d AuthorizeRelay calls, want 0", n)
+				}
+				if got := s.Transport(); got != p2pTransport {
+					t.Fatalf("transport %v, want peer-to-peer", got)
+				}
+			})
+		}
 	}
 }
 

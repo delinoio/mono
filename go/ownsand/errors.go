@@ -41,6 +41,21 @@ func (e *DataPathError) Error() string {
 
 func (e *DataPathError) Unwrap() error { return e.Err }
 
+func dataPathOperationError(operation, operationID string, unknown bool, err error) error {
+	var cb *callbackError
+	if errors.As(err, &cb) {
+		return cb.err
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	var sessionClosed *errSessionClosedByCaller
+	if errors.Is(err, errHandleClosed) || errors.As(err, &sessionClosed) {
+		return errHandleClosed
+	}
+	return &DataPathError{Operation: operation, OperationID: operationID, OutcomeUnknown: unknown, Err: err}
+}
+
 // frameError is an error that the agent reported explicitly in an error
 // frame on the peer-to-peer data channel. Like a Connect wire error it is a
 // valid terminal status, not a transport interruption; the marker keeps

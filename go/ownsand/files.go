@@ -142,14 +142,7 @@ type readAttempt struct {
 }
 
 func (op *readOp) dpErr(err error) error {
-	var cb *callbackError
-	if errors.As(err, &cb) {
-		return cb.err
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
-	}
-	return &DataPathError{Operation: "read-file", OperationID: op.base.GetReadId(), Err: err}
+	return dataPathOperationError("read-file", op.base.GetReadId(), false, err)
 }
 
 func (op *readOp) request() *ownsandv1.ReadFileRequest {
@@ -657,10 +650,7 @@ type writeOp struct {
 }
 
 func (op *writeOp) dpErr(err error) error {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
-	}
-	return &DataPathError{Operation: "write-file", OperationID: op.id, Err: err}
+	return dataPathOperationError("write-file", op.id, false, err)
 }
 
 // send delivers one chunk or finish request until the agent acknowledges

@@ -136,6 +136,8 @@ type p2pAction struct {
 	// of an exec, so a test can end or retire the session after the agent
 	// served the continuation.
 	afterStarted func()
+	// omitKeepalives lets a test count queued exec frames without idle traffic.
+	omitKeepalives bool
 	// afterReadKeepalive, when set, answers a file read request with one
 	// keepalive event and then runs the callback instead of serving the read:
 	// the agent served the read, so a test can end or retire the session
@@ -1355,6 +1357,9 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 	}
 	outputs := 0
 	sendExec := func(ev *ownsandv1.ExecEvent) error {
+		if act.omitKeepalives && ev.GetKeepalive() != nil {
+			return nil
+		}
 		if act.endNow || act.failNow {
 			if act.endNow {
 				_ = s.send(frame(&ownsandv1.SessionEnd{Reason: act.reason}))

@@ -259,14 +259,7 @@ func (op *execOp) opName() string {
 }
 
 func (op *execOp) dpErr(err error, unknown bool) error {
-	var cb *callbackError
-	if errors.As(err, &cb) {
-		return cb.err
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
-	}
-	return &DataPathError{Operation: op.opName(), OperationID: op.execID, OutcomeUnknown: unknown, Err: err}
+	return dataPathOperationError(op.opName(), op.execID, unknown, err)
 }
 
 func (op *execOp) sandboxEnded(e *ErrSandboxEnded) *ExecResult {
@@ -314,6 +307,9 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 			continue
 		}
 		err = at.err
+		if err == errHandleClosed {
+			return nil, err
+		}
 		var cb *callbackError
 		if errors.As(err, &cb) {
 			return nil, cb.err
@@ -438,7 +434,7 @@ func (op *execOp) p2pAttempt(ctx context.Context, sess *p2pSession) attempt {
 	}
 	defer st.close()
 	for {
-		f, err := st.recv(ctx)
+		f, err := st.recvUntilHandleClose(ctx, op.s.dp.done)
 		if err != nil {
 			at.err = err
 			return at
