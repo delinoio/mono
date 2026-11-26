@@ -5,6 +5,7 @@ import {
   FieldError,
   FieldLabel,
 } from "@ui-sdk/react/field";
+import { numberFormatter, parseNumber } from "@ui-sdk/core/number";
 import {
   NumberInputControl,
   NumberInputDecrement,
@@ -12,9 +13,15 @@ import {
   NumberInputIncrement,
   NumberInput as NumberInputRoot,
 } from "@ui-sdk/react/number-input";
+import { useImperativeHandle, useRef } from "react";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
 import { useForwardedAutoFocus } from "./dialog-context.ts";
+
+export interface NumberInputDraft {
+  /** Whether the text currently contains a fractional value. */
+  hasFraction: () => boolean;
+}
 
 export type NumberInputProps = Omit<
   React.ComponentProps<typeof NumberInputRoot>,
@@ -38,13 +45,40 @@ export type NumberInputProps = Omit<
   placeholder?: string;
   /** Focuses the input when it is shown. */
   autoFocus?: boolean;
+  /**
+   * Gives the form access to the typed draft in a plain decimal field.
+   * When supplied, Enter and blur keep fractions for the form to validate.
+   */
+  draftRef?: React.Ref<NumberInputDraft>;
 };
+
+function hasFraction(input: HTMLInputElement, locale: string | undefined) {
+  const inputLocale =
+    locale ??
+    (input.closest("[lang]")?.getAttribute("lang") || navigator.language);
+  const value = parseNumber(input.value, inputLocale);
+  if (value !== null && !Number.isInteger(value)) return true;
+
+  // Parsing can round a fractional draft to an integer. Check the typed
+  // digits after the decimal separator before allowing that integer through.
+  const formatter = numberFormatter(inputLocale);
+  const separator = formatter
+    .formatToParts(0.1)
+    .find((part) => part.type === "decimal")?.value;
+  if (!separator) return false;
+  const [, fraction] = input.value.split(separator);
+  if (!fraction) return false;
+  return Boolean(
+    parseNumber(fraction.replaceAll(formatter.format(0), ""), inputLocale),
+  );
+}
 
 /**
  * A labeled number field with minus and plus buttons, built from UI SDK
  * `Field` and `NumberInput`. Typing, arrow keys and the buttons change the
  * value; Enter or leaving the input clamps it to `min` and `max` and snaps
- * it to `step`. An empty input has the value `null`.
+ * it to `step` unless `draftRef` keeps a typed fraction. An empty
+ * input has the value `null`.
  */
 export function NumberInput({
   label,
@@ -56,6 +90,7 @@ export function NumberInput({
   autoFocus,
   className,
   disabled,
+  draftRef,
   ...props
 }: NumberInputProps) {
   // A caller `data-autofocus` would be spread onto the non-tabbable root
@@ -82,6 +117,16 @@ export function NumberInput({
     "data-autofocus"?: unknown;
   };
   const forwardedAutoFocus = useForwardedAutoFocus(autoFocus);
+  const inputRef = useRef<HTMLInputElement>(null);
+  useImperativeHandle(
+    draftRef,
+    () => ({
+      hasFraction: () =>
+        inputRef.current !== null &&
+        hasFraction(inputRef.current, rootProps.locale),
+    }),
+    [rootProps.locale],
+  );
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
   const hasDescription =
@@ -138,6 +183,35 @@ export function NumberInput({
             aria-label={ariaLabel}
             aria-labelledby={ariaLabelledBy}
             data-autofocus={autoFocus ? "" : undefined}
+            // The UI SDK snaps typed text before the form submits on Enter or
+            // after blur. Skip only those SDK handlers for fractional drafts.
+            // The browser still submits on Enter and the SDK still handles steps.
+            // Remove when the UI SDK supports validating unsnapped typed values.
+            ref={draftRef ? inputRef : undefined}
+            render={
+              draftRef
+                ? ({ onKeyDown, onBlur, ...control }) => (
+                    <input
+                      {...control}
+                      onKeyDown={(event) => {
+                        if (
+                          event.key !== "Enter" ||
+                          !hasFraction(event.currentTarget, rootProps.locale)
+                        ) {
+                          onKeyDown?.(event);
+                        }
+                      }}
+                      onBlur={(event) => {
+                        if (
+                          !hasFraction(event.currentTarget, rootProps.locale)
+                        ) {
+                          onBlur?.(event);
+                        }
+                      }}
+                    />
+                  )
+                : undefined
+            }
           />
           <NumberInputIncrement
             className="dui-number-input-button"

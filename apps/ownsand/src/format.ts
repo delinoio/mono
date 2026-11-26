@@ -165,8 +165,8 @@ function wholeCount(n: number): bigint {
 /**
  * Effective vCPU limit: floor(vCPU limit × percent / 100), in integers.
  * The device page calls it with the live value of a number input, which can
- * be fractional (for example, "1.5") until the input snaps it on Enter or
- * blur, so the inputs are first floored to non-negative integers.
+ * be fractional (for example, "1.5") while the user edits it. Floor the
+ * inputs to non-negative integers before calculating the effective limit.
  */
 export function effectiveVcpuLimit(
   vcpuCount: number,

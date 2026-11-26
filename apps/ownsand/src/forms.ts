@@ -70,23 +70,24 @@ export function resourceErrors(input: ResourceInput): {
   disk?: string;
 } {
   const errors: { vcpu?: string; memory?: string; disk?: string } = {};
-  if (input.vcpu === null || !(input.vcpu > 0)) {
-    errors.vcpu = "Enter at least 1 vCPU.";
-  } else if (!Number.isInteger(input.vcpu) || input.vcpu > MAX_INT32) {
+  const { vcpu, memory, disk } = input;
+  if (vcpu !== null && (!Number.isInteger(vcpu) || vcpu > MAX_INT32)) {
     errors.vcpu = `Enter a whole number of vCPUs from 1 to ${MAX_INT32}.`;
+  } else if (vcpu === null || vcpu <= 0) {
+    errors.vcpu = "Enter at least 1 vCPU.";
   }
-  if (input.memory === null || !(input.memory > 0)) {
-    errors.memory = "Enter the memory in MiB.";
-  } else if (
-    !Number.isInteger(input.memory) ||
-    input.memory > MAX_RESOURCE_INT64
+  if (
+    memory !== null &&
+    (!Number.isInteger(memory) || memory > MAX_RESOURCE_INT64)
   ) {
     errors.memory = `Enter a whole number of MiB from 1 to ${MAX_RESOURCE_INT64}.`;
+  } else if (memory === null || memory <= 0) {
+    errors.memory = "Enter the memory in MiB.";
   }
-  if (input.disk === null || !(input.disk > 0)) {
-    errors.disk = "Enter the disk size in GiB.";
-  } else if (!Number.isInteger(input.disk) || input.disk > MAX_DISK_GIB) {
+  if (disk !== null && (!Number.isInteger(disk) || disk > MAX_DISK_GIB)) {
     errors.disk = `Enter a whole number of GiB from 1 to ${MAX_DISK_GIB}.`;
+  } else if (disk === null || disk <= 0) {
+    errors.disk = "Enter the disk size in GiB.";
   }
   return errors;
 }
