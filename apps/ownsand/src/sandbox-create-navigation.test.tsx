@@ -14,8 +14,13 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { Code, ConnectError } from "@connectrpc/connect";
-import type { CreateSandboxResponse } from "@delino/ownsand-protos/v1/sandbox_pb";
+import { Code, ConnectError, createClient } from "@connectrpc/connect";
+import type { Transport } from "@connectrpc/connect";
+import {
+  type CreateSandboxRequest,
+  type CreateSandboxResponse,
+  SandboxService,
+} from "@delino/ownsand-protos/v1/sandbox_pb";
 import { MOCK_IDS } from "./mock/mock-api.ts";
 import { holdingTransport, renderConsole, settle } from "./test-support.tsx";
 
@@ -27,6 +32,51 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
 });
+
+const SANDBOXES = `/orgs/${MOCK_IDS.acme}/sandboxes`;
+const RESERVATION_MS = 24 * 60 * 60 * 1000;
+
+async function openForm(transport: Transport) {
+  renderConsole(SANDBOXES, { transport });
+  await act(async () => {
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Create sandbox" }),
+    );
+  });
+  return within(
+    await screen.findByRole("dialog", { name: "Create a sandbox" }),
+  );
+}
+
+async function submit(dialog: ReturnType<typeof within>, name: string) {
+  await act(async () => {
+    fireEvent.click(dialog.getByRole("button", { name }));
+  });
+}
+
+function loseCreateReplies(replayError?: Code) {
+  const { transport: base } = holdingTransport([]);
+  const requests: CreateSandboxRequest[] = [];
+  const sandboxIds: string[] = [];
+  const transport: Transport = {
+    ...base,
+    async unary(method, ...args) {
+      if (method.name !== "CreateSandbox") return base.unary(method, ...args);
+      requests.push(args[3] as CreateSandboxRequest);
+      if (requests.length === 2 && replayError !== undefined) {
+        throw new ConnectError("Replay failed", replayError);
+      }
+      const response = await base.unary(method, ...args);
+      const { sandbox } = response.message as unknown as CreateSandboxResponse;
+      sandboxIds.push(sandbox!.sandboxId);
+      if (requests.length === 1) {
+        throw new ConnectError("Response lost", Code.Unavailable);
+      }
+      return response;
+    },
+  };
+  return { transport, base, requests, sandboxIds };
+}
 
 describe("create sandbox navigation", () => {
   test("opens the new sandbox without waiting for the list refetch", async () => {
@@ -71,46 +121,109 @@ describe("create sandbox navigation", () => {
     expect(window.location.pathname).toMatch(/\/sandboxes\/[0-9a-f-]{36}$/);
   });
 
-  test("keeps the dialog open with the error and reuses the idempotency key on retry", async () => {
-    const keys: string[] = [];
-    let failures = 1;
-    const { transport } = holdingTransport(["CreateSandbox"], () => false);
-    const failing = {
-      ...transport,
-      async unary(...args: Parameters<typeof transport.unary>) {
-        if (args[0].name === "CreateSandbox") {
-          keys.push((args[4] as { idempotencyKey: string }).idempotencyKey);
-          if (failures-- > 0) {
-            throw new ConnectError("The control plane is busy.", Code.Internal);
+  test("recovers a committed create with the full original request after losing its reply", async () => {
+    const { transport, base, requests, sandboxIds } = loseCreateReplies();
+    const dialog = await openForm(transport);
+    const labels = dialog.getByLabelText<HTMLTextAreaElement>("Labels");
+    const vcpus = dialog.getByLabelText<HTMLInputElement>("vCPUs");
+    await act(async () => {
+      fireEvent.input(labels, { target: { value: "team=recover" } });
+    });
+    const form = labels.closest("form")!;
+    const submitTwice = async () => {
+      await act(async () => {
+        fireEvent.submit(form);
+        fireEvent.submit(form);
+      });
+    };
+    await submitTwice();
+
+    expect(
+      await dialog.findByText(/The sandbox may have been created/),
+    ).toBeTruthy();
+    expect(window.location.pathname).toBe(SANDBOXES);
+    expect(labels.disabled).toBe(true);
+    expect(labels.value).toBe("team=recover");
+    expect(vcpus.disabled).toBe(true);
+    expect(dialog.queryByRole("button", { name: "Create" })).toBeNull();
+
+    await submitTwice();
+    expect(requests).toEqual([requests[0], requests[0]]);
+    expect(requests[0]?.labels).toEqual({ team: "recover" });
+    expect(sandboxIds).toEqual([sandboxIds[0], sandboxIds[0]]);
+    expect(window.location.pathname).toBe(`${SANDBOXES}/${sandboxIds[0]}`);
+    const list = await createClient(SandboxService, base).listSandboxes({
+      organizationId: MOCK_IDS.acme,
+    });
+    expect(
+      list.sandboxes.filter((sandbox) => sandbox.labels.team === "recover"),
+    ).toHaveLength(1);
+  });
+
+  for (const replayError of [Code.Unavailable, Code.InvalidArgument]) {
+    test(`keeps the original deadline after replay returns ${Code[replayError]}`, async () => {
+      const start = Date.now();
+      const now = rs.spyOn(Date, "now").mockReturnValue(start);
+      try {
+        const { transport, requests } = loseCreateReplies(replayError);
+        const dialog = await openForm(transport);
+        await submit(dialog, "Create");
+
+        now.mockReturnValue(start + RESERVATION_MS - 1);
+        await submit(dialog, "Retry original request");
+        expect(requests).toEqual([requests[0], requests[0]]);
+        expect(dialog.getByLabelText<HTMLInputElement>("vCPUs").disabled).toBe(
+          true,
+        );
+        const retry = dialog.getByRole<HTMLButtonElement>("button", {
+          name: "Retry original request",
+        });
+        expect(retry.disabled).toBe(false);
+
+        // The UI timer has not run. The submit handler must enforce expiry.
+        now.mockReturnValue(start + RESERVATION_MS);
+        await submit(dialog, "Retry original request");
+        expect(requests).toHaveLength(2);
+        expect(retry.disabled).toBe(true);
+        expect(dialog.getByText(/Check the sandbox list/)).toBeTruthy();
+        expect(window.location.pathname).toBe(SANDBOXES);
+      } finally {
+        now.mockRestore();
+      }
+    });
+  }
+
+  test("allows editing and resubmitting after a definitive first rejection", async () => {
+    const { transport: base } = holdingTransport([]);
+    const requests: CreateSandboxRequest[] = [];
+    const dialog = await openForm({
+      ...base,
+      async unary(method, ...args) {
+        if (method.name === "CreateSandbox") {
+          requests.push(args[3] as CreateSandboxRequest);
+          if (requests.length === 1) {
+            throw new ConnectError(
+              "Change the team label.",
+              Code.InvalidArgument,
+            );
           }
         }
-        return transport.unary(...args);
+        return base.unary(method, ...args);
       },
-    };
-    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
-      transport: failing as typeof transport,
     });
+
+    await submit(dialog, "Create");
+    expect(await dialog.findByText("Change the team label.")).toBeTruthy();
+    const labels = dialog.getByLabelText<HTMLTextAreaElement>("Labels");
+    expect(labels.disabled).toBe(false);
+
     await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Create sandbox" }),
-      );
+      fireEvent.input(labels, { target: { value: "team=corrected" } });
     });
-    await settle(60);
-    const dialog = await screen.findByRole("dialog", {
-      name: "Create a sandbox",
-    });
-    const create = async () => {
-      await act(async () => {
-        fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
-      });
-      await settle(60);
-    };
-    await create();
-    expect(dialog.querySelector(".notice-error")).not.toBeNull();
-    expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}/sandboxes`);
-    await create();
-    expect(keys).toHaveLength(2);
-    expect(keys[1]).toBe(keys[0]);
+    await submit(dialog, "Create");
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.idempotencyKey).not.toBe(requests[0]?.idempotencyKey);
+    expect(requests[1]?.labels).toEqual({ team: "corrected" });
     expect(window.location.pathname).toMatch(/\/sandboxes\/[0-9a-f-]{36}$/);
   });
 
@@ -159,7 +272,7 @@ describe("create sandbox navigation", () => {
       expect(retry.disabled).toBe(false);
       // The click must check the deadline even if the browser has not run
       // the timer that disables the button yet.
-      now.mockReturnValue(start + 24 * 60 * 60 * 1000);
+      now.mockReturnValue(start + RESERVATION_MS);
       await act(async () => {
         fireEvent.click(retry);
       });

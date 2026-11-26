@@ -19,7 +19,6 @@ import { Select, SelectOption } from "delino-ui/select";
 import { Textarea } from "delino-ui/textarea";
 import {
   BaseImage,
-  DeviceState,
   NetworkMode,
   SandboxState,
   SnapshotState,
@@ -52,13 +51,7 @@ import {
   shortIdText,
 } from "../components/ui.tsx";
 import { useDevices } from "../devices.ts";
-import {
-  deviceOptionLabel,
-  formatMib,
-  formatTime,
-  labels,
-  offlineDeviceMessage,
-} from "../format.ts";
+import { deviceOptionLabel, formatMib, formatTime, labels } from "../format.ts";
 import { parseLabels, resourceErrors, ttlErrors } from "../forms.ts";
 import { lastRequestFailedOnLaterPage } from "../pagination.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
@@ -76,6 +69,19 @@ interface CreateAttempt {
   status: "pending" | "unconfirmed" | "expired";
   sourceLabel: string;
   deviceLabel: string | undefined;
+}
+
+/** Whether CreateSandbox rejected the request before reserving a sandbox. */
+function isCreateRejection(error: unknown): boolean {
+  return (
+    error instanceof ConnectError &&
+    (error.code === Code.InvalidArgument ||
+      error.code === Code.FailedPrecondition ||
+      error.code === Code.NotFound ||
+      error.code === Code.PermissionDenied ||
+      error.code === Code.Unauthenticated ||
+      error.code === Code.ResourceExhausted)
+  );
 }
 
 /** Route `sandboxes`: the sandbox list with filters and creation. */
@@ -361,11 +367,8 @@ function CreateSandboxDialog({
     [snapshots.rows],
   );
   const create = useMutation(SandboxService.method.createSandbox);
-  // One idempotency key per logical create: a retry after a lost response
-  // reuses it, so the control plane returns the original sandbox.
-  const [idempotencyKey, setIdempotencyKey] = useState(uuidV7);
-  const firstSubmittedAt = useRef<number>(undefined);
   const [attempt, setAttempt] = useState<CreateAttempt>();
+  const sending = useRef(false);
   const [source, setSource] = useState(`base:${BaseImage.LINUX}`);
   const [vcpu, setVcpu] = useState<number | null>(2);
   const [memory, setMemory] = useState<number | null>(4096);
@@ -418,9 +421,8 @@ function CreateSandboxDialog({
   }, [retryDeadline]);
 
   const reset = () => {
-    firstSubmittedAt.current = undefined;
+    sending.current = false;
     setAttempt(undefined);
-    setIdempotencyKey(uuidV7());
     setErrors({});
     setLabelText("");
   };
@@ -442,6 +444,7 @@ function CreateSandboxDialog({
         if (!next) reset();
       }}
       onSubmit={async (opening) => {
+        if (sending.current) return;
         let submission = attempt;
         if (submission) {
           if (submission.status !== "unconfirmed") return;
@@ -461,19 +464,18 @@ function CreateSandboxDialog({
           setErrors(next);
           if (Object.keys(next).length > 0 || "error" in parsed) return;
 
-          // A response can be lost after the server reserves the key. Start
-          // the retry window with the first request that used this key.
-          firstSubmittedAt.current ??= Date.now();
+          // Start the retry window before dispatch. A lost response can
+          // hide a reservation made with this key.
           submission = {
             status: "pending",
-            expiresAt: firstSubmittedAt.current + CREATE_RESERVATION_MS,
+            expiresAt: Date.now() + CREATE_RESERVATION_MS,
             sourceLabel: selectedSource.label,
             deviceLabel: selectedDevice
               ? deviceOptionLabel(selectedDevice.name, selectedDevice.state)
               : undefined,
             request: {
               organizationId,
-              idempotencyKey,
+              idempotencyKey: uuidV7(),
               source: sourceRequest,
               resources: {
                 vcpuCount: vcpu!,
@@ -489,41 +491,32 @@ function CreateSandboxDialog({
           };
           setAttempt(submission);
         }
+        sending.current = true;
         let res;
         try {
           res = await create.mutateAsync(submission.request);
         } catch (error) {
-          if (submission.status === "pending" && opening.isCurrent()) {
+          if (!opening.isCurrent()) return;
+          if (submission.status === "pending" && isCreateRejection(error)) {
             setAttempt(undefined);
+            throw error;
           }
-          // The control plane answers `Unavailable` without a reason. When
-          // the selected device is offline in the loaded device list, name
-          // it, so the notice does not read as an outage of OwnSand.
-          if (
-            error instanceof ConnectError &&
-            error.code === Code.Unavailable &&
-            selectedDevice?.state === DeviceState.OFFLINE
-          ) {
-            throw new ConnectError(
-              offlineDeviceMessage(selectedDevice.name),
-              Code.FailedPrecondition,
-              undefined,
-              undefined,
-              error,
-            );
-          }
-          throw error;
+          // An error on a replay cannot rule out a reservation from the
+          // first request. Unavailable is also ambiguous on the first
+          // request, even when the cached device state is offline.
+        } finally {
+          if (opening.isCurrent()) sending.current = false;
         }
-        // A new sandbox changes the allocation of its device. The device
-        // and sandbox queries are marked stale and refetched in the
-        // background. Navigation can use the response without waiting for
-        // either list to refetch.
-        void invalidateServices(queryClient, DeviceService);
-        void invalidateServices(queryClient, SandboxService);
+        if (res) {
+          // Refresh allocation and sandbox data in the background so
+          // navigation can use the reply immediately.
+          void invalidateServices(queryClient, DeviceService);
+          void invalidateServices(queryClient, SandboxService);
+        }
         // A request of a dismissed opening neither closes the form of a
         // later opening nor moves the user away from the page they went to.
         if (!opening.isCurrent()) return;
-        const sandboxId = res.sandbox?.sandboxId;
+        const sandboxId = res?.sandbox?.sandboxId;
         if (!sandboxId || !SANDBOX_ID.test(sandboxId)) {
           setAttempt({
             ...submission,
