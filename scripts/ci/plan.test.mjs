@@ -397,6 +397,147 @@ test("changes to declared release files select fixtures", async (t) => {
   }
 });
 
+test("failed manifest reads preserve other packages' release inputs", async (t) => {
+  for (const manifestPath of [
+    "apps/unrelated/package.json",
+    "cmds/ownsand/package.json",
+  ]) {
+    for (const failingPath of [manifestPath, `${manifestPath}/placeholder`]) {
+      await t.test(failingPath, (t) => {
+        const f = fixture(t);
+        writeReleasePackage(f, { licenseFiles: ["NOTICE"] });
+        f.write("NOTICE");
+        f.write(failingPath, "{ malformed");
+        const base = f.commit();
+
+        const entitlements = "cmds/ownsand-agent/entitlements.plist";
+        assert.deepEqual(
+          declaredReleaseInputs(f.cwd),
+          new Set([entitlements, "NOTICE"]),
+        );
+        for (const path of [entitlements, "NOTICE"]) {
+          for (const change of [
+            () => f.write(path, "changed\n"),
+            () => f.git("rm", "--quiet", path),
+            () => f.git("mv", path, `${path}.moved`),
+          ]) {
+            change();
+            const result = plan(f.cwd, base, f.commit());
+            assert.equal(result.fixtures, true, path);
+            assert.equal(result.quality, true, path);
+            f.git("reset", "--hard", base);
+          }
+        }
+
+        f.write("unrelated.plist");
+        const unrelated = plan(f.cwd, base, f.commit());
+        assert.equal(unrelated.fixtures, false);
+        assert.equal(unrelated.quality, false);
+
+        if (failingPath === manifestPath) {
+          f.git("reset", "--hard", base);
+          f.write(manifestPath, "{ still malformed");
+          assert.equal(plan(f.cwd, base, f.commit()).fixtures, true);
+        }
+      });
+    }
+  }
+});
+
+test("entitlements symlink paths select fixtures even after a link breaks", async (t) => {
+  const dir = "cmds/ownsand-agent";
+  const declared = `${dir}/entitlements.plist`;
+  const configurations = [
+    { name: "direct", entry: "files/real.plist" },
+    {
+      name: "file chain with an unrelated malformed manifest",
+      malformedManifest: true,
+      entry: "links/middle.plist",
+      middle: "links/middle.plist",
+      middleTarget: "../files/real.plist",
+    },
+    {
+      name: "directory link",
+      entry: "alias/real.plist",
+      middle: "alias",
+      middleTarget: "files",
+      type: "dir",
+    },
+  ];
+  for (const {
+    name,
+    entry,
+    middle,
+    middleTarget,
+    type,
+    malformedManifest,
+  } of configurations) {
+    await t.test(name, (t) => {
+      const f = fixture(t);
+      writeReleasePackage(f);
+      const target = `${dir}/files/real.plist`;
+      f.write(target);
+      const middlePath = middle && `${dir}/${middle}`;
+      if (malformedManifest) {
+        f.write("apps/unrelated/package.json", "{ malformed");
+      }
+      rmSync(join(f.cwd, declared));
+      try {
+        if (middlePath) {
+          mkdirSync(dirname(join(f.cwd, middlePath)), { recursive: true });
+          symlinkSync(middleTarget, join(f.cwd, middlePath), type);
+        }
+        symlinkSync(entry, join(f.cwd, declared));
+      } catch (error) {
+        if (error?.code !== "EPERM") throw error;
+        t.skip("cannot create a symlink on this system");
+        return;
+      }
+      f.git("config", "core.symlinks", "true");
+      const base = f.commit();
+      const paths = [target, ...(middlePath ? [middlePath] : [])];
+      for (const path of paths) {
+        for (const change of [
+          () => {
+            rmSync(join(f.cwd, path));
+            if (path === target) f.write(path, "changed\n");
+            else symlinkSync("missing", join(f.cwd, path), type);
+          },
+          () => f.git("rm", "--quiet", path),
+          () => f.git("mv", path, `${path}.moved`),
+        ]) {
+          change();
+          const result = plan(f.cwd, base, f.commit());
+          assert.equal(result.fixtures, true, path);
+          assert.equal(result.quality, true, path);
+          f.git("reset", "--hard", base);
+        }
+      }
+    });
+  }
+});
+
+test("entitlements symlink discovery stops at cycles and repository escapes", (t) => {
+  const f = fixture(t);
+  writeReleasePackage(f, { licenseFiles: [] });
+  const link = "cmds/ownsand-agent/entitlements.plist";
+  const middle = "cmds/ownsand-agent/middle.plist";
+  rmSync(join(f.cwd, link));
+  try {
+    symlinkSync("middle.plist", join(f.cwd, link));
+    symlinkSync("entitlements.plist", join(f.cwd, middle));
+  } catch (error) {
+    if (error?.code !== "EPERM") throw error;
+    t.skip("cannot create a symlink on this system");
+    return;
+  }
+  assert.deepEqual(declaredReleaseInputs(f.cwd), new Set([link, middle]));
+
+  rmSync(join(f.cwd, middle));
+  symlinkSync("../../../outside.plist", join(f.cwd, middle));
+  assert.deepEqual(declaredReleaseInputs(f.cwd), new Set([link, middle]));
+});
+
 test("release file selection ignores files that no release declares", async (t) => {
   await t.test("an unreferenced asset beside the declared files", (t) => {
     const f = fixture(t);
