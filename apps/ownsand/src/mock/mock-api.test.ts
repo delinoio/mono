@@ -1443,6 +1443,71 @@ describe("mock enrollment token expiry", () => {
     return tokens.find((t) => t.enrollmentTokenId === id)?.state;
   };
 
+  test("lists a one-nanosecond token as pending until the clock advances", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(T0 + 750);
+    const client = createClient(DeviceService, createMockTransport());
+
+    const { token } = await client.createEnrollmentToken({
+      organizationId,
+      ttl: { nanos: 1 },
+    });
+
+    expect(token?.expireTime).toMatchObject({
+      seconds: BigInt(T0 / 1000),
+      nanos: 750_000_001,
+    });
+    expect(await stateOf(client, token!.enrollmentTokenId)).toBe(
+      EnrollmentTokenState.PENDING,
+    );
+    rs.setSystemTime(T0 + 751);
+    expect(await stateOf(client, token!.enrollmentTokenId)).toBe(
+      EnrollmentTokenState.EXPIRED,
+    );
+  });
+
+  test("uses one creation time when the clock advances during a request", async () => {
+    let clock = T0;
+    const dateNow = rs.spyOn(Date, "now").mockImplementation(() => clock++);
+    try {
+      const client = createClient(DeviceService, createMockTransport());
+
+      const { token } = await client.createEnrollmentToken({
+        organizationId,
+        ttl: { seconds: 1n, nanos: 500_000_000 },
+      });
+
+      const { createTime, expireTime } = token!;
+      const elapsedNanos =
+        (expireTime!.seconds - createTime!.seconds) * 1_000_000_000n +
+        BigInt(expireTime!.nanos - createTime!.nanos);
+      expect(elapsedNanos).toBe(1_500_000_000n);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  test("checks the caller's role and billing before validating the TTL", async () => {
+    const billing = { [organizationId]: MockBillingState.BlockedUnlinked };
+    const member = createClient(
+      DeviceService,
+      createMockTransport({ userId: "user-member-ada", billing }),
+    );
+    const owner = createClient(DeviceService, createMockTransport({ billing }));
+    const request = { organizationId, ttl: { seconds: 0n } };
+    const before = await owner.listEnrollmentTokens({ organizationId });
+
+    await expect(member.createEnrollmentToken(request)).rejects.toMatchObject({
+      code: Code.PermissionDenied,
+    });
+    await expect(owner.createEnrollmentToken(request)).rejects.toMatchObject({
+      code: Code.ResourceExhausted,
+    });
+    expect(await owner.listEnrollmentTokens({ organizationId })).toEqual(
+      before,
+    );
+  });
+
   test("an unused token is PENDING before expiry and EXPIRED at and after it", async () => {
     rs.useFakeTimers({ toFake: ["Date"] });
     rs.setSystemTime(T0);

@@ -202,6 +202,7 @@ const DEFAULT_BILLING: Readonly<Record<string, MockBillingState>> = {
 
 const HOUR = 3600;
 const NANOS_PER_SECOND = 1_000_000_000n;
+const MAX_ENROLLMENT_TTL_NANOS = BigInt(24 * HOUR) * NANOS_PER_SECOND;
 const MAX_TTL_NANOS = BigInt(MAX_TTL_SECONDS) * NANOS_PER_SECOND;
 const DAY_MS = 24 * HOUR * 1000;
 /** A non-paying organization becomes suspended 3 days after its block. */
@@ -214,7 +215,7 @@ const dur = (seconds: number): Duration =>
 
 function ttlNanos(
   ttl: Duration | undefined,
-  field: "idle_ttl" | "max_ttl",
+  field: "idle_ttl" | "max_ttl" | "ttl",
 ): bigint {
   if (ttl === undefined) {
     throw new ConnectError(`${field} is required`, Code.InvalidArgument);
@@ -1359,21 +1360,22 @@ export function createMockTransport(
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
         requireBillingAllowed(org);
-        const ttl = Number(req.ttl?.seconds ?? 0n);
-        if (ttl <= 0 || ttl > 24 * HOUR) {
+        const durationNanos = ttlNanos(req.ttl, "ttl");
+        if (durationNanos > MAX_ENROLLMENT_TTL_NANOS) {
           throw new ConnectError(
             "ttl must be at most 24 hours",
             Code.InvalidArgument,
           );
         }
+        const createTime = ts();
         const value = secret("ose");
         const token = create(EnrollmentTokenSchema, {
           enrollmentTokenId: newMockId(),
           organizationId: req.organizationId,
           state: EnrollmentTokenState.PENDING,
           createdBy: { kind: PrincipalKind.USER, id: userId },
-          createTime: ts(),
-          expireTime: ts(ttl),
+          createTime,
+          expireTime: addTtl(createTime, durationNanos),
           tokenPrefix: value.slice(0, 8),
         });
         // The control plane lists in ascending ID order (UUID v7), so a new
@@ -1387,7 +1389,7 @@ export function createMockTransport(
         // The control plane derives EXPIRED when it reads an unused, unrevoked
         // token at or after its expiry. The stored record stays PENDING, so the
         // list returns a copy and a later revoke still finds a pending token.
-        const at = now();
+        const nowNanos = BigInt(now()) * 1_000_000n;
         const { page, nextPageToken } = pageOf(
           org.tokens,
           req,
@@ -1397,7 +1399,9 @@ export function createMockTransport(
           tokens: page.map((t) =>
             t.state === EnrollmentTokenState.PENDING &&
             t.expireTime !== undefined &&
-            at >= timestampMs(t.expireTime)
+            nowNanos >=
+              t.expireTime.seconds * NANOS_PER_SECOND +
+                BigInt(t.expireTime.nanos)
               ? (() => {
                   const expired = clone(EnrollmentTokenSchema, t);
                   expired.state = EnrollmentTokenState.EXPIRED;
