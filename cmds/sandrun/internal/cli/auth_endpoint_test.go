@@ -14,10 +14,12 @@ import (
 
 type loginEndpointTransport struct {
 	requests []string
+	port     string
 }
 
 func (tr *loginEndpointTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.Body.Close()
+	tr.port = req.URL.Port()
 	tr.requests = append(tr.requests, req.Method+" "+req.URL.EscapedPath())
 	return &http.Response{
 		StatusCode: http.StatusBadRequest,
@@ -32,6 +34,7 @@ func TestLoginValidatesLogtoEndpoint(t *testing.T) {
 		name         string
 		endpoint     string
 		wantRequests []string
+		wantPort     string
 		wantError    string
 	}{
 		{name: "query", endpoint: tenantEndpoint + "?mode=test", wantError: queryOrFragmentError},
@@ -44,14 +47,34 @@ func TestLoginValidatesLogtoEndpoint(t *testing.T) {
 			wantError: "logto: the tenant endpoint must be an http or https URL",
 		},
 		{
+			name:      "port out of range",
+			endpoint:  "https://auth.example:65536/tenant",
+			wantError: "logto: the tenant endpoint port must be at most 65535",
+		},
+		{
+			name:         "maximum port with path prefix and trailing slash",
+			endpoint:     "https://auth.example:65535/tenant/",
+			wantRequests: []string{"POST /tenant/oidc/device/auth"},
+			wantPort:     "65535",
+			wantError:    "logto: http_400",
+		},
+		{
+			name:         "HTTPS without explicit port",
+			endpoint:     "https://auth.example",
+			wantRequests: []string{"POST /oidc/device/auth"},
+			wantError:    "logto: http_400",
+		},
+		{
 			name:         "HTTPS with explicit port",
 			endpoint:     "https://auth.example:8443",
+			wantPort:     "8443",
 			wantRequests: []string{"POST /oidc/device/auth"},
 			wantError:    "logto: http_400",
 		},
 		{
 			name:         "path prefix with trailing slash",
 			endpoint:     tenantEndpoint + "/",
+			wantPort:     "8080",
 			wantRequests: []string{"POST /tenant/oidc/device/auth"},
 			wantError:    "logto: http_400",
 		},
@@ -72,6 +95,9 @@ func TestLoginValidatesLogtoEndpoint(t *testing.T) {
 			}
 			if !slices.Equal(tr.requests, tc.wantRequests) {
 				t.Errorf("requests = %v, want %v", tr.requests, tc.wantRequests)
+			}
+			if tr.port != tc.wantPort {
+				t.Errorf("request port = %q, want %q", tr.port, tc.wantPort)
 			}
 		})
 	}

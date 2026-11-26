@@ -457,7 +457,7 @@ func TestValidate(t *testing.T) {
 		}
 	}
 	const invalidURL = "logto: the tenant endpoint must be an http or https URL"
-	for _, endpoint := range []string{"ftp://x", "https://:443"} {
+	for _, endpoint := range []string{"ftp://x", "https://:443", "https://auth.example:not-a-port"} {
 		err := (Config{Endpoint: endpoint, AppID: "a"}).Validate()
 		if err == nil || err.Error() != invalidURL {
 			t.Errorf("Validate(%q) = %v, want %q", endpoint, err, invalidURL)
@@ -467,6 +467,9 @@ func TestValidate(t *testing.T) {
 	for _, endpoint := range []string{
 		"https://auth.example",
 		"https://auth.example/tenant/",
+		"https://auth.example:/tenant/",
+		"https://auth.example:0/tenant/",
+		"http://[::1]:65535/tenant/",
 		"http://auth.example:8080/tenant/",
 		"https://auth.example/tenant%3F%23/",
 	} {
@@ -475,9 +478,21 @@ func TestValidate(t *testing.T) {
 		}
 	}
 
+	const invalidPort = "logto: the tenant endpoint port must be at most 65535"
+	for _, endpoint := range []string{
+		"https://auth.example:65536/tenant",
+		"http://[::1]:65536",
+		"https://auth.example:999999999999999999999999",
+	} {
+		err := (Config{Endpoint: endpoint, AppID: "app"}).Validate()
+		if err == nil || err.Error() != invalidPort {
+			t.Errorf("Validate(%q) = %v, want %q", endpoint, err, invalidPort)
+		}
+	}
+
 	const wantError = "logto: the tenant endpoint must not contain a query or fragment"
 	for _, suffix := range []string{"?mode=test", "#login", "?", "#"} {
-		endpoint := "https://auth.example/tenant" + suffix
+		endpoint := "https://auth.example:65536/tenant" + suffix
 		err := (Config{Endpoint: endpoint, AppID: "a"}).Validate()
 		if err == nil || err.Error() != wantError {
 			t.Errorf("Validate(%q) = %v, want %q", endpoint, err, wantError)
