@@ -98,6 +98,7 @@ function fixture({ plugin = true } = {}) {
   const env = isolateGitEnvironment({ ...process.env });
   env.PATH = `${bin}${delimiter}${env.PATH}`;
   env.TMPDIR = scratch;
+  delete env.FAKE_GO_FAIL;
 
   mkdirSync(repo);
   execFileSync("git", ["init", "--quiet", repo], { env });
