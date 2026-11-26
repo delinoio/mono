@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -269,6 +270,11 @@ func (c Config) Validate() error {
 	// Check for delimiters in the original URL because url.Parse drops an empty fragment.
 	if strings.ContainsAny(c.Endpoint, "?#") {
 		return errors.New("logto: the tenant endpoint must not contain a query or fragment")
+	}
+	if port := u.Port(); port != "" {
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			return errors.New("logto: the tenant endpoint port must be at most 65535")
+		}
 	}
 	return nil
 }
