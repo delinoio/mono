@@ -1460,6 +1460,132 @@ describe("mock updateMemberRole", () => {
   });
 });
 
+describe("mock member pagination", () => {
+  const organizationId = MOCK_IDS.acme;
+  const admin = "user-admin-jun";
+  const member = "user-member-ada";
+
+  test("lists members in seeded order and ends after an empty page", async () => {
+    const client = createClient(MemberService, createMockTransport());
+    const first = await client.listMembers({ organizationId });
+    expect(first.members.map((row) => row.userId)).toEqual([
+      MOCK_USER,
+      admin,
+      member,
+    ]);
+    expect(first.nextPageToken).toBe("");
+    expect(first.members[0]).toMatchObject({
+      organizationId,
+      userId: MOCK_USER,
+      role: Role.OWNER,
+      displayName: "Mina Kim",
+      joinTime: expect.any(Object),
+    });
+    expect(first.members[0]).not.toHaveProperty("membershipId");
+
+    let pageToken = "";
+    for (const row of first.members) {
+      const page = await client.listMembers({
+        organizationId,
+        pageSize: 1,
+        pageToken,
+      });
+      expect(page.members).toEqual([row]);
+      expect(page.nextPageToken).not.toBe("");
+      pageToken = page.nextPageToken;
+    }
+    const end = await client.listMembers({
+      organizationId,
+      pageSize: 1,
+      pageToken,
+    });
+    expect(end.members).toEqual([]);
+    expect(end.nextPageToken).toBe("");
+  });
+
+  test("defaults to 50 rows and caps a larger request at 200", async () => {
+    const client = createClient(
+      MemberService,
+      createMockTransport({ extraMembers: 198 }),
+    );
+    const defaults = await client.listMembers({ organizationId });
+    expect(defaults.members).toHaveLength(50);
+    expect(defaults.nextPageToken).not.toBe("");
+
+    const first = await client.listMembers({ organizationId, pageSize: 500 });
+    expect(first.members).toHaveLength(200);
+    expect(first.nextPageToken).not.toBe("");
+    const last = await client.listMembers({
+      organizationId,
+      pageSize: 500,
+      pageToken: first.nextPageToken,
+    });
+    expect(last.members.map((row) => row.userId)).toEqual(["user-extra-198"]);
+    expect(last.nextPageToken).toBe("");
+  });
+
+  test("continues after the cursor membership is removed", async () => {
+    const client = createClient(MemberService, createMockTransport());
+    const first = await client.listMembers({ organizationId, pageSize: 2 });
+    expect(first.members.map((row) => row.userId)).toEqual([MOCK_USER, admin]);
+    expect(first.nextPageToken).not.toBe("");
+
+    await client.removeMember({ organizationId, userId: admin });
+    const next = await client.listMembers({
+      organizationId,
+      pageSize: 2,
+      pageToken: first.nextPageToken,
+    });
+    expect(next.members.map((row) => row.userId)).toEqual([member]);
+    expect(next.nextPageToken).toBe("");
+  });
+
+  test("places a returning user after their former membership cursor", async () => {
+    const client = createClient(
+      MemberService,
+      createMockTransport({ userId: admin }),
+    );
+    const first = await client.listMembers({ organizationId, pageSize: 2 });
+    expect(first.members.at(-1)?.userId).toBe(admin);
+    expect(first.nextPageToken).not.toBe("");
+    const { invitationSecret } = await client.createInvitation({
+      organizationId,
+      role: Role.MEMBER,
+    });
+
+    await client.removeMember({ organizationId, userId: admin });
+    const { member: rejoined } = await client.acceptInvitation({
+      invitationSecret,
+    });
+    const next = await client.listMembers({
+      organizationId,
+      pageSize: 2,
+      pageToken: first.nextPageToken,
+    });
+    expect(next.members.map((row) => row.userId)).toEqual([member, admin]);
+    expect(next.members.at(-1)).toEqual(rejoined);
+    expect(rejoined?.role).toBe(Role.MEMBER);
+  });
+
+  test("authorizes the organization before validating pagination", async () => {
+    const client = createClient(MemberService, createMockTransport());
+    for (const invalid of [{ pageSize: -1 }, { pageToken: "not-a-token" }]) {
+      await expect(
+        client.listMembers({ organizationId, ...invalid }),
+      ).rejects.toMatchObject({ code: Code.InvalidArgument });
+      await expect(
+        client.listMembers({ organizationId: MOCK_IDS.contoso, ...invalid }),
+      ).rejects.toMatchObject({ code: Code.NotFound });
+    }
+    await expect(
+      client.listMembers({
+        organizationId: uuidV7(),
+        pageToken: "not-a-token",
+      }),
+    ).rejects.toMatchObject({ code: Code.NotFound });
+  });
+});
+
 describe("mock removeMember", () => {
   const organizationId = MOCK_IDS.acme;
   const admin = "user-admin-jun";

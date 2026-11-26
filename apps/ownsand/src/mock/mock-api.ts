@@ -255,9 +255,14 @@ function isPendingInvitation(
   );
 }
 
+interface Membership {
+  membershipId: string;
+  member: Member;
+}
+
 interface OrgState {
   organization: Organization;
-  members: Member[];
+  members: Membership[];
   invitations: { invitation: Invitation; secret: string }[];
   devices: Device[];
   tokens: EnrollmentToken[];
@@ -338,19 +343,22 @@ function applyBillingState(org: OrgState, state: MockBillingState): void {
   }
 }
 
-function member(
+function newMembership(
   orgId: string,
   userId: string,
   role: Role,
   displayName: string,
-): Member {
-  return create(MemberSchema, {
-    organizationId: orgId,
-    userId,
-    role,
-    displayName,
-    joinTime: ts(-30 * 24 * HOUR),
-  });
+): Membership {
+  return {
+    membershipId: newMockId(),
+    member: create(MemberSchema, {
+      organizationId: orgId,
+      userId,
+      role,
+      displayName,
+      joinTime: ts(-30 * 24 * HOUR),
+    }),
+  };
 }
 
 function emptyOrg(id: string, name: string): OrgState {
@@ -386,9 +394,9 @@ function seed(): Map<string, OrgState> {
   const orgs = new Map<string, OrgState>();
   const acme = emptyOrg(MOCK_IDS.acme, "Acme Robotics");
   acme.members.push(
-    member(MOCK_IDS.acme, MOCK_USER, Role.OWNER, "Mina Kim"),
-    member(MOCK_IDS.acme, "user-admin-jun", Role.ADMIN, "Jun Park"),
-    member(MOCK_IDS.acme, "user-member-ada", Role.MEMBER, ""),
+    newMembership(MOCK_IDS.acme, MOCK_USER, Role.OWNER, "Mina Kim"),
+    newMembership(MOCK_IDS.acme, "user-admin-jun", Role.ADMIN, "Jun Park"),
+    newMembership(MOCK_IDS.acme, "user-member-ada", Role.MEMBER, ""),
   );
   acme.invitations.push({
     invitation: create(InvitationSchema, {
@@ -570,14 +578,19 @@ function seed(): Map<string, OrgState> {
 
   const northwind = emptyOrg(MOCK_IDS.northwind, "Northwind Labs");
   northwind.members.push(
-    member(MOCK_IDS.northwind, "user-owner-lee", Role.OWNER, "Seo-yeon Lee"),
-    member(MOCK_IDS.northwind, MOCK_USER, Role.MEMBER, "Mina Kim"),
+    newMembership(
+      MOCK_IDS.northwind,
+      "user-owner-lee",
+      Role.OWNER,
+      "Seo-yeon Lee",
+    ),
+    newMembership(MOCK_IDS.northwind, MOCK_USER, Role.MEMBER, "Mina Kim"),
   );
   orgs.set(MOCK_IDS.northwind, northwind);
 
   const contoso = emptyOrg(MOCK_IDS.contoso, "Contoso Research");
   contoso.members.push(
-    member(MOCK_IDS.contoso, "user-owner-ray", Role.OWNER, "Ray Choi"),
+    newMembership(MOCK_IDS.contoso, "user-owner-ray", Role.OWNER, "Ray Choi"),
   );
   contoso.invitations.push({
     invitation: create(InvitationSchema, {
@@ -627,6 +640,8 @@ export interface MockTransportOptions {
    * row.
    */
   extraApiKeys?: number;
+  /** Members to add after the three seeded Acme members. */
+  extraMembers?: number;
   /** Pending invitations to add after the seeded Acme invitation. */
   extraInvitations?: number;
   /** Online Linux devices to add after the two seeded Acme devices. */
@@ -871,6 +886,17 @@ export function createMockTransport(
   }
   const acmeOrg = orgs.get(MOCK_IDS.acme);
   if (acmeOrg !== undefined) {
+    for (let i = 0; i < (options.extraMembers ?? 0); i++) {
+      const number = String(i + 1).padStart(3, "0");
+      acmeOrg.members.push(
+        newMembership(
+          MOCK_IDS.acme,
+          `user-extra-${number}`,
+          Role.MEMBER,
+          `Fixture member ${number}`,
+        ),
+      );
+    }
     const seededSnapshot = acmeOrg.snapshots[0]!;
     for (let i = 0; i < (options.extraSnapshots ?? 0); i++) {
       const snapshot = clone(SnapshotSchema, seededSnapshot);
@@ -1042,7 +1068,9 @@ export function createMockTransport(
 
   const membership = (orgId: string): { org: OrgState; role: Role } => {
     const org = orgs.get(orgId);
-    const m = org?.members.find((x) => x.userId === userId);
+    const m = org?.members.find(
+      ({ member }) => member.userId === userId,
+    )?.member;
     if (org === undefined || m === undefined) {
       throw new ConnectError("organization not found", Code.NotFound);
     }
@@ -1157,7 +1185,7 @@ export function createMockTransport(
           throw new ConnectError("name is required", Code.InvalidArgument);
         const id = newMockId();
         const org = emptyOrg(id, name);
-        org.members.push(member(id, userId, Role.OWNER, "Mina Kim"));
+        org.members.push(newMembership(id, userId, Role.OWNER, "Mina Kim"));
         orgs.set(id, org);
         return { organization: withRole(org.organization, Role.OWNER) };
       },
@@ -1169,7 +1197,8 @@ export function createMockTransport(
         const all = [...orgs.values()]
           .map((org) => ({
             org,
-            m: org.members.find((x) => x.userId === userId),
+            m: org.members.find(({ member }) => member.userId === userId)
+              ?.member,
           }))
           .filter((x) => x.m !== undefined)
           .map((x) => withRole(x.org.organization, x.m!.role));
@@ -1197,11 +1226,13 @@ export function createMockTransport(
             Code.InvalidArgument,
           );
         }
-        const target = org.members.find((m) => m.userId === req.userId);
+        const target = org.members.find(
+          ({ member }) => member.userId === req.userId,
+        )?.member;
         if (target === undefined)
           throw new ConnectError("member not found", Code.NotFound);
-        for (const m of org.members) {
-          if (m.userId === userId) m.role = Role.ADMIN;
+        for (const { member } of org.members) {
+          if (member.userId === userId) member.role = Role.ADMIN;
         }
         target.role = Role.OWNER;
         // An ownership transfer removes the billing link.
@@ -1279,30 +1310,35 @@ export function createMockTransport(
           const { expireTime } = entry.invitation;
           if (expireTime !== undefined && now() >= timestampMs(expireTime))
             continue;
-          if (org.members.some((m) => m.userId === userId)) {
+          if (org.members.some(({ member }) => member.userId === userId)) {
             throw new ConnectError(
               "you are already a member",
               Code.AlreadyExists,
             );
           }
           entry.invitation.state = InvitationState.ACCEPTED;
-          const m = member(
+          const row = newMembership(
             org.organization.organizationId,
             userId,
             entry.invitation.role,
             "Mina Kim",
           );
-          org.members.push(m);
+          org.members.push(row);
           return {
-            organization: withRole(org.organization, m.role),
-            member: m,
+            organization: withRole(org.organization, row.member.role),
+            member: row.member,
           };
         }
         throw new ConnectError("invitation not found", Code.NotFound);
       },
       listMembers(req) {
         const { org } = membership(req.organizationId);
-        return { members: org.members };
+        const { page, nextPageToken } = pageOf(
+          org.members,
+          req,
+          (row) => row.membershipId,
+        );
+        return { members: page.map(({ member }) => member), nextPageToken };
       },
       updateMemberRole(req) {
         const { org, role } = membership(req.organizationId);
@@ -1316,7 +1352,9 @@ export function createMockTransport(
             Code.InvalidArgument,
           );
         }
-        const target = org.members.find((m) => m.userId === req.userId);
+        const target = org.members.find(
+          ({ member }) => member.userId === req.userId,
+        )?.member;
         if (target === undefined)
           throw new ConnectError("member not found", Code.NotFound);
         if (target.role === Role.OWNER) {
@@ -1346,7 +1384,9 @@ export function createMockTransport(
             Code.InvalidArgument,
           );
         }
-        const target = org.members.find((m) => m.userId === req.userId);
+        const target = org.members.find(
+          ({ member }) => member.userId === req.userId,
+        )?.member;
         if (target === undefined) {
           throw new ConnectError("member not found", Code.NotFound);
         }
@@ -1356,7 +1396,9 @@ export function createMockTransport(
             Code.PermissionDenied,
           );
         }
-        org.members = org.members.filter((m) => m.userId !== req.userId);
+        org.members = org.members.filter(
+          ({ member }) => member.userId !== req.userId,
+        );
         return {};
       },
     });
