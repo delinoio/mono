@@ -66,7 +66,27 @@ For each folder, read which names already exist, without their values:
 
 ```sh
 infisical export --env=dev --path="<folder>" --format=json --silent \
-  | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s);console.log((Array.isArray(v)?v.map(e=>e.key):Object.keys(v)).sort().join("\n"))})'
+  | node -e '
+    let input = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => {
+      input += chunk;
+    });
+    process.stdin.on("end", () => {
+      let exported;
+      try {
+        exported = JSON.parse(input);
+      } catch {
+        console.error("infisical export did not print JSON");
+        process.exitCode = 1;
+        return;
+      }
+      const names = Array.isArray(exported)
+        ? exported.map((entry) => entry.key)
+        : Object.keys(exported);
+      console.log(names.sort().join("\n"));
+    });
+  '
 ```
 
 The command fails when the folder does not exist; check the folder with the `folders get` command of your command family. The export includes your personal overrides, so a name can be your own override and not a shared value.

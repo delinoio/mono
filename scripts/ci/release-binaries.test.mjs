@@ -229,6 +229,7 @@ fi
 path="$STUB_DIR/public/\${url#https://releases.example.com/}"
 [[ -f "$path" ]] || exit 22
 cp "$path" "$out"
+echo "public GET succeeded $url" >> "$STUB_LOG"
 `,
   security: `#!/usr/bin/env bash
 echo "security $*" >> "$STUB_LOG"
@@ -2022,7 +2023,37 @@ test(
         assert.doesNotMatch(result.stdout, /::warning::/);
       });
     }
-    await t.test("stale public URL", (t) => {
+    await t.test("stale public manifest after a successful GET", (t) => {
+      const f = fixture(t);
+      const dir = join(f.dir, "manifests");
+      const key = "ownsand-agent/manifest.json";
+      const publicManifest = join(f.dir, "public", key);
+      const oldManifest = '{"new":false}\n';
+      const newManifest = '{"new":true}\n';
+      const signature = "sig\n";
+      write(publicManifest, oldManifest);
+      writeFileSync(join(f.dir, "public-stale"), "");
+      write(join(dir, key), newManifest);
+      write(join(dir, `${key}.sig`), signature);
+
+      const result = f.run(["upload-manifests", dir], r2Env);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(readFileSync(objectPath(f, key), "utf8"), newManifest);
+      assert.equal(
+        readFileSync(objectPath(f, `${key}.sig`), "utf8"),
+        signature,
+      );
+      assert.equal(readFileSync(publicManifest, "utf8"), oldManifest);
+      assert.match(
+        result.log,
+        /^public GET succeeded https:\/\/releases\.example\.com\/ownsand-agent\/manifest\.json$/m,
+      );
+      assert.match(
+        result.stdout,
+        /::warning::https:\/\/releases\.example\.com\/ownsand-agent\/manifest\.json does not serve the uploaded manifest yet/,
+      );
+    });
+    await t.test("missing public manifest", (t) => {
       const f = fixture(t);
       writeFileSync(join(f.dir, "public-stale"), "");
       const dir = join(f.dir, "manifests");

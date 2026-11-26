@@ -68,6 +68,10 @@ function skipReason() {
 }
 const skip = skipReason();
 
+function readYamlFixture(path) {
+  return readFileSync(join(root, path), "utf8").replaceAll("\r\n", "\n");
+}
+
 function scratch(t) {
   const dir = mkdtempSync(join(tmpdir(), "deploy-scripts-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -190,10 +194,7 @@ const changeset = (id, ...list) => ({
 });
 
 test("deploy.yml keeps pending runs in the concurrency queue", () => {
-  const workflow = readFileSync(
-    join(root, ".github/workflows/deploy.yml"),
-    "utf8",
-  );
+  const workflow = readYamlFixture(".github/workflows/deploy.yml");
   const block = workflow.match(/^concurrency:\n((?:  .*\n|\n)+)/m);
   assert.ok(block, "deploy.yml has a workflow-level concurrency block");
   const keys = block[1]
@@ -205,7 +206,7 @@ test("deploy.yml keeps pending runs in the concurrency queue", () => {
   assert.ok(keys.some((key) => key.startsWith("group: ")));
   // actionlint v1.7.12 rejects `queue`; the exception must name only that
   // diagnostic and only this workflow.
-  const lint = readFileSync(join(root, ".github/actionlint.yaml"), "utf8");
+  const lint = readYamlFixture(".github/actionlint.yaml");
   assert.match(
     lint,
     /^paths:\n {2}\.github\/workflows\/deploy\.yml:\n {4}ignore:\n {6}- 'unexpected key "queue" for "concurrency" section\.\*'\n$/m,
@@ -810,10 +811,7 @@ function planRelease(work) {
     repoRoot: work,
   });
   const outputs = readOutputs(planOutput);
-  const workflow = readFileSync(
-    join(root, ".github/workflows/deploy.yml"),
-    "utf8",
-  );
+  const workflow = readYamlFixture(".github/workflows/deploy.yml");
   const script = workflow.match(
     /^        id: blobs\n[\s\S]*?^        run: \|\n((?: {10}.*\n)+)/m,
   )?.[1];
@@ -1481,10 +1479,7 @@ test("recovery rejects a superseding deployment", { skip }, (t) => {
 });
 
 test("deploy.yml tries the recovery before the stale-plan check", () => {
-  const workflow = readFileSync(
-    join(root, ".github/workflows/deploy.yml"),
-    "utf8",
-  );
+  const workflow = readYamlFixture(".github/workflows/deploy.yml");
   const job = workflow.match(/^ {2}release:\n(?:(?: {4}.*)?\n)+/m)?.[0] ?? "";
   const steps = job.split(/^ {6}- /m).slice(1);
   const index = (needle) => steps.findIndex((step) => step.includes(needle));
@@ -2365,6 +2360,7 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
 
 // droplet-deploy.sh serializes deployments with util-linux `flock`.
 const hasFlock = spawnSync("sh", ["-c", "command -v flock"]).status === 0;
+const hasPgrep = spawnSync("sh", ["-c", "command -v pgrep"]).status === 0;
 
 const isProxyLoad = (call) => call.startsWith("docker exec -i ");
 const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
@@ -2438,6 +2434,7 @@ function setupDroplet(
     old = [],
     envFile = "LOG_LEVEL=info\n",
     route,
+    deploymentUuid = dropletDeploymentUuid,
     state,
     previous,
     stubs = {},
@@ -2453,7 +2450,7 @@ function setupDroplet(
   writeFileSync(join(dir, "calls.log"), "");
   // The deployment identifier that droplet-deploy.sh reads (a fixed UUID, and
   // a file that exists on every platform).
-  writeFileSync(join(dir, "id-source"), `${dropletDeploymentUuid}\n`);
+  writeFileSync(join(dir, "id-source"), `${deploymentUuid}\n`);
   // `null` leaves the env file out.
   if (envFile !== null) {
     writeFileSync(join(deployRoot, "env", `${args[0]}.env`), envFile);
@@ -2731,15 +2728,30 @@ test(
   "droplet deploy switches the route to the new alias on every deployment",
   { skip: skipDroplet },
   (t) => {
+    const routePath = "caddy/sites/api.caddy";
+    const upstream = /^[ \t]+reverse_proxy (\S+)/m;
     const first = runDroplet(t);
     assert.equal(first.status, 0, first.stderr);
-    const route = first.read("caddy/sites/api.caddy");
-    // A second run of the same image, in a fresh root with the route of the
-    // first run, still reloads the proxy: every deployment has its own alias.
-    const second = runDroplet(t, undefined, { old: ["old1"], route });
+    const route = first.read(routePath);
+    assert.equal(
+      route?.match(upstream)?.[1],
+      `api-${dropletDeploymentUuid.replaceAll("-", "")}:8080`,
+    );
+
+    // Seed the first route and deploy the same image with a new identifier.
+    const secondUuid = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+    const second = runDroplet(t, undefined, {
+      old: ["old1"],
+      route,
+      deploymentUuid: secondUuid,
+    });
     assert.equal(second.status, 0, second.stderr);
-    assert.ok(second.calls.some((call) => call.startsWith("docker exec")));
+    assert.ok(second.calls.some(isProxyLoad));
     assert.equal(second.read("state/api.current"), `${dropletImage}\n`);
+    assert.equal(
+      second.read(routePath)?.match(upstream)?.[1],
+      `api-${secondUuid.replaceAll("-", "")}:8080`,
+    );
   },
 );
 
@@ -4873,6 +4885,7 @@ function provisionFixture(
   const provision = join(dir, "provision.sh");
   const calls = join(dir, "calls");
   const dockerCalls = join(dir, "docker-calls");
+  const route = join(dir, "caddy", "sites", "api.caddy");
   const dockerEnv = provisioningDockerEnv(dir, endpoint);
   const source = readFileSync(
     join(root, "scripts/droplet/provision.sh"),
@@ -4911,6 +4924,13 @@ function provisionFixture(
     ).trim();
     symlinkSync(executable, join(dir, name));
   }
+  // Open a separate descriptor so flock tests the lock held by provision.sh.
+  const requireProxyLock = `
+lock="$PROVISION_FIXTURE_ROOT/state/.proxy.lock"
+[[ -f "$lock" ]] || exit 1
+flock --nonblock --conflict-exit-code 13 "$lock" true
+[[ "$?" == 13 ]] || exit 1
+`;
   for (const [name, body] of Object.entries({
     ...(cli && { docker: 'exec bash ./docker-stub "$@"' }),
     "docker-stub": `
@@ -4935,7 +4955,7 @@ case "$*" in
     printf '%s\\n' "$(< load-state)"
     exit "$PROVISION_QUERY_STATUS"
     ;;
-  'enable --now docker') exit 0 ;;
+  'enable --now docker') ${requireProxyLock} ;;
   *) exit 2 ;;
 esac
 `,
@@ -4961,34 +4981,41 @@ fi
       'if [[ "$*" == "-m 0755 -d ./apt/keyrings" ]]; then mkdir -p ./apt/keyrings; else mkdir -p "${@:8}"; fi',
     chown: "exit 0",
     runuser: '[[ "$1 $2 $3" == "-u deploy --" ]] && exec "${@:4}"',
-    "configure-docker-logs.sh":
-      'printf "configure-docker-logs.sh %s\\n" "$*" >> calls',
+    "configure-docker-logs.sh": `
+printf 'configure-docker-logs.sh %s\\n' "$*" >> calls
+${requireProxyLock}
+route="$PROVISION_FIXTURE_ROOT/caddy/sites/api.caddy"
+if [[ -f "$route" ]]; then
+  printf '%s\\n' "$(< "$route")" > route-seen-by-log-setup
+fi
+`,
     "start-caddy.sh": `
-lock="$2/state/.proxy.lock"
-[[ -f "$2/caddy/Caddyfile" && -f "$lock" ]] || exit 1
-flock --nonblock --conflict-exit-code 13 "$lock" true
-[[ "$?" == 13 ]] && touch "$2/caddy-started"
+echo start-caddy.sh >> calls
+[[ -f "$2/caddy/Caddyfile" ]] || exit 1
+${requireProxyLock}
+touch "$2/caddy-started"
 `,
   })) {
     writeFileSync(join(dir, name), `#!/usr/bin/env bash\n${body}\n`, {
       mode: 0o755,
     });
   }
-  return {
-    caddyfile: join(dir, "caddy", "Caddyfile"),
-    lock: join(dir, "state", ".proxy.lock"),
-    helperRan: () => existsSync(join(dir, "caddy-started")),
-    run: (prefix = []) => {
-      writeFileSync(calls, "");
-      writeFileSync(dockerCalls, "");
-      const [command, ...args] = [
-        ...prefix,
-        "bash",
-        provision,
-        join(dir, "key.pub"),
-        "test@example.com",
-      ];
-      const result = spawnSync(command, args, {
+  const readCalls = (path) =>
+    readFileSync(path, "utf8").trim().split("\n").filter(Boolean);
+  const invocation = (prefix, env = {}) => {
+    writeFileSync(calls, "");
+    writeFileSync(dockerCalls, "");
+    const [command, ...args] = [
+      ...prefix,
+      "bash",
+      provision,
+      join(dir, "key.pub"),
+      "test@example.com",
+    ];
+    return [
+      command,
+      args,
+      {
         cwd: dir,
         encoding: "utf8",
         env: {
@@ -5001,15 +5028,26 @@ flock --nonblock --conflict-exit-code 13 "$lock" true
           PROVISION_NETWORK_MISSING: String(networkMissing),
           PROVISION_DAEMON_DOWN: String(daemonDown),
           DROPLET_PROXY_LOCK_TIMEOUT: "0",
+          ...env,
         },
-      });
+      },
+    ];
+  };
+  return {
+    dir,
+    caddyfile: join(dir, "caddy", "Caddyfile"),
+    lock: join(dir, "state", ".proxy.lock"),
+    route,
+    routeSeenByLogSetup: join(dir, "route-seen-by-log-setup"),
+    helperRan: () => existsSync(join(dir, "caddy-started")),
+    calls: () => readCalls(calls),
+    start: (env) => spawnProcessGroup(t, ...invocation([], env)),
+    run: (prefix = []) => {
+      const result = spawnSync(...invocation(prefix));
       return {
         ...result,
-        calls: readFileSync(calls, "utf8").trim().split("\n"),
-        dockerCalls: readFileSync(dockerCalls, "utf8")
-          .trim()
-          .split("\n")
-          .filter(Boolean),
+        calls: readCalls(calls),
+        dockerCalls: readCalls(dockerCalls),
       };
     },
   };
@@ -5023,9 +5061,10 @@ const installDockerEngine = [
   "apt-get update",
   "apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin",
 ];
-const configureDockerEngine = [
+const configureDockerAndCaddy = [
   "configure-docker-logs.sh ./daemon.json",
   "systemctl enable --now docker",
+  "start-caddy.sh",
 ];
 const networkCreateCalls = [
   `${systemDocker} network inspect delino`,
@@ -5073,11 +5112,14 @@ test(
     assert.deepEqual(first.calls, [
       queryDockerUnit,
       ...installDockerEngine,
-      ...configureDockerEngine,
+      ...configureDockerAndCaddy,
     ]);
     const second = fixture.run();
     assert.equal(second.status, 0, second.stderr);
-    assert.deepEqual(second.calls, [queryDockerUnit, ...configureDockerEngine]);
+    assert.deepEqual(second.calls, [
+      queryDockerUnit,
+      ...configureDockerAndCaddy,
+    ]);
   },
 );
 
@@ -5087,7 +5129,10 @@ test(
   (t) => {
     const result = provisionFixture(t).run();
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(result.calls, [queryDockerUnit, ...configureDockerEngine]);
+    assert.deepEqual(result.calls, [
+      queryDockerUnit,
+      ...configureDockerAndCaddy,
+    ]);
   },
 );
 
@@ -5099,7 +5144,7 @@ test(
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.calls, [
       ...installDockerEngine,
-      ...configureDockerEngine,
+      ...configureDockerAndCaddy,
     ]);
   },
 );
@@ -5151,12 +5196,59 @@ test(
     const { ino } = statSync(fixture.lock);
     const second = fixture.run();
     assert.equal(second.status, 0, second.stderr);
+    assert.deepEqual(second.calls, [
+      queryDockerUnit,
+      ...configureDockerAndCaddy,
+    ]);
     assert.equal(statSync(fixture.lock).ino, ino);
   },
 );
 
 test(
-  "provision preserves Caddy configuration when the proxy lock is unavailable",
+  "provision waits for a route rollback before configuring Docker or Caddy",
+  { skip: skipProvision || (!hasPgrep && "pgrep is not installed") },
+  async (t) => {
+    const fixture = provisionFixture(t);
+    mkdirSync(dirname(fixture.lock), { recursive: true });
+    mkdirSync(dirname(fixture.route), { recursive: true });
+    writeFileSync(fixture.route, "# uncommitted route\n");
+    const ready = join(fixture.dir, "proxy-locked");
+    const lock = spawnProcessGroup(t, "bash", [
+      "-c",
+      'exec 9>> "$1"; flock 9 && touch "$2" && read -r _',
+      "bash",
+      fixture.lock,
+      ready,
+    ]);
+    await waitFor(() => existsSync(ready), "the proxy lock to be held");
+    const run = fixture.start({
+      DROPLET_PROXY_LOCK_TIMEOUT: "",
+      DROPLET_LOCK_TIMEOUT: "20",
+    });
+    await waitForLockWait(run, "provisioning to wait for the proxy lock");
+    assert.deepEqual(fixture.calls(), [queryDockerUnit]);
+
+    const restoredRoute = "# restored route\n";
+    writeFileSync(fixture.route, restoredRoute);
+    lock.child.stdin.end("release\n");
+    assert.equal((await lock.done).status, 0);
+
+    const result = await run.done;
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(fixture.calls(), [
+      queryDockerUnit,
+      ...configureDockerAndCaddy,
+    ]);
+    assert.equal(
+      readFileSync(fixture.routeSeenByLogSetup, "utf8"),
+      restoredRoute,
+    );
+    assert.ok(fixture.helperRan());
+  },
+);
+
+test(
+  "provision leaves Docker and Caddy untouched when the proxy lock is unavailable",
   { skip: skipProvision },
   (t) => {
     const fixture = provisionFixture(t);
@@ -5168,7 +5260,12 @@ test(
 
     const contended = fixture.run(["flock", fixture.lock]);
     assert.equal(contended.status, 1, contended.stderr);
-    assert.match(contended.stderr, /could not acquire the proxy lock/);
+    assert.match(
+      contended.stderr,
+      /could not acquire the proxy lock .*wait limit: 0 seconds/,
+    );
+    assert.deepEqual(contended.calls, [queryDockerUnit]);
+    assert.deepEqual(contended.dockerCalls, []);
     assert.equal(readFileSync(fixture.caddyfile, "utf8"), previous);
     assert.equal(fixture.helperRan(), false);
 
@@ -5177,6 +5274,8 @@ test(
     const cannotOpen = fixture.run();
     assert.equal(cannotOpen.status, 1, cannotOpen.stderr);
     assert.match(cannotOpen.stderr, /could not open the proxy lock file/);
+    assert.deepEqual(cannotOpen.calls, [queryDockerUnit]);
+    assert.deepEqual(cannotOpen.dockerCalls, []);
     assert.equal(readFileSync(fixture.caddyfile, "utf8"), previous);
     assert.equal(fixture.helperRan(), false);
   },
@@ -6355,7 +6454,6 @@ test("start-caddy rejects a bad readiness setting", { skip }, (t) => {
 // proxy reload of every service on the Droplet. The tests below pause the
 // first deployment inside the admin POST (STUB_BLOCK_ON, released by the
 // `release-docker` file) and start the deployment of another service.
-const hasPgrep = spawnSync("sh", ["-c", "command -v pgrep"]).status === 0;
 const skipProxyLock =
   skipDroplet || (!hasPgrep && "pgrep is not installed (procps is missing)");
 const workerArgs = [

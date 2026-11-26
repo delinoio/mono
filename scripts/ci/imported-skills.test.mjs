@@ -197,6 +197,18 @@ test("an added and a removed skill file are reported", (t) => {
   assert.ok(found.includes(ProblemKind.FileMissing));
 });
 
+test("a file named like an inherited property needs an explicit manifest entry", (t) => {
+  const f = fixture(t);
+  f.write(`${SkillsDirectory}/demo/constructor`, "extra\n");
+  const [problem, ...otherProblems] = verifyImportedSkills(f.root);
+  assert.equal(problem?.kind, ProblemKind.FileUnexpected);
+  assert.equal(problem.path, "constructor");
+  assert.deepEqual(otherProblems, []);
+
+  f.write(ManifestFile, JSON.stringify(buildManifest(f.root)));
+  assert.deepEqual(verifyImportedSkills(f.root), []);
+});
+
 test("a missing skill directory is reported", (t) => {
   const f = fixture(t);
   rmSync(join(f.root, SkillsDirectory, "licensed"), { recursive: true });
@@ -217,6 +229,51 @@ test("a missing SKILL.md is reported", (t) => {
   f.remove(`${SkillsDirectory}/licensed/SKILL.md`);
   const found = kinds(f.root);
   assert.ok(found.includes(ProblemKind.SkillFileMissing));
+});
+
+for (const [path, kind] of [
+  ["SKILL.md", ProblemKind.SkillFileMissing],
+  ["LICENSE", ProblemKind.LicenseMissing],
+]) {
+  test(`a directory at ${path} does not satisfy the required file check`, (t) => {
+    const f = fixture(t);
+    const requiredPath = `${SkillsDirectory}/licensed/${path}`;
+    f.remove(requiredPath);
+    f.write(`${requiredPath}/nested.txt`, "tracked file in a directory\n");
+    f.write(ManifestFile, JSON.stringify(buildManifest(f.root)));
+
+    const [problem, ...otherProblems] = verifyImportedSkills(f.root);
+    assert.equal(problem?.kind, kind);
+    assert.equal(problem.skill, "licensed");
+    assert.equal(problem.path, path);
+    assert.deepEqual(otherProblems, []);
+
+    const result = spawnSync(process.execPath, [script, "--root", f.root], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.ok(
+      result.stderr.startsWith(
+        `imported_skills_problem kind=${kind} ${requiredPath} `,
+      ),
+      result.stderr,
+    );
+    assert.match(result.stderr, /^imported_skills_failed problems=1$/mu);
+  });
+}
+
+test("a LICENSE directory leaves the NOTICE requirement in effect", (t) => {
+  const f = fixture(t);
+  mkdirSync(join(f.root, SkillsDirectory, "demo/LICENSE"));
+  assert.deepEqual(verifyImportedSkills(f.root), []);
+
+  f.write(demoNoticePath, notice(lockEntry({ commit: "d".repeat(40) })));
+  f.write(ManifestFile, JSON.stringify(buildManifest(f.root)));
+  const problems = verifyImportedSkills(f.root);
+  assert.deepEqual(problems.map(({ kind, path }) => [kind, path]).sort(), [
+    [ProblemKind.LicenseMissing, "LICENSE"],
+    [ProblemKind.NoticeMismatch, "NOTICE"],
+  ]);
 });
 
 test("a hand-edited lock entry is reported", (t) => {
@@ -247,6 +304,28 @@ test("a skill that the manifest lacks, and one that the lock lacks, are reported
   const found = kinds(f.root);
   assert.ok(found.includes(ProblemKind.ManifestUnknownSkill));
   assert.ok(found.includes(ProblemKind.ManifestMissingSkill));
+});
+
+test("a skill named like an inherited property needs an explicit lock entry", (t) => {
+  const f = fixture(t);
+  const manifest = JSON.parse(f.read(ManifestFile));
+  manifest.skills.constructor = manifest.skills.licensed;
+  f.write(ManifestFile, JSON.stringify(manifest));
+
+  const [problem, ...otherProblems] = verifyImportedSkills(f.root);
+  assert.equal(problem?.kind, ProblemKind.ManifestUnknownSkill);
+  assert.equal(problem.skill, "constructor");
+  assert.deepEqual(otherProblems, []);
+
+  const lock = JSON.parse(f.read(LockFile));
+  lock.skills.constructor = lock.skills.licensed;
+  f.write(LockFile, JSON.stringify(lock));
+  cpSync(
+    join(f.root, SkillsDirectory, "licensed"),
+    join(f.root, SkillsDirectory, "constructor"),
+    { recursive: true },
+  );
+  assert.deepEqual(verifyImportedSkills(f.root), []);
 });
 
 test("a missing lock file and a missing manifest are reported", (t) => {

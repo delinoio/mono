@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
-import { createClient, type Transport } from "@connectrpc/connect";
+import {
+  createClient,
+  createRouterTransport,
+  type Transport,
+} from "@connectrpc/connect";
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
+import { ApiKeyState } from "@delino/ownsand-protos/v1/common_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import {
@@ -168,24 +173,48 @@ describe("enrollment token, API key and member rows", () => {
   });
 
   test("API key Revoke names the key and its prefix, also for equal names", async () => {
-    const transport = createMockTransport();
-    const keys = createClient(ApiKeyService, transport);
-    for (let i = 0; i < 2; i += 1) {
-      await keys.createApiKey({
-        organizationId: MOCK_IDS.acme,
-        name: "ci-key",
-      });
-    }
+    const keys = [
+      {
+        apiKeyId: "01900000-0000-7000-8000-000000000001",
+        keyPrefix: "osk_12ab",
+      },
+      {
+        apiKeyId: "01900000-0000-7000-8000-000000000002",
+        keyPrefix: "osk_34cd",
+      },
+    ];
+    const listApiKeys = ApiKeyService.method.listApiKeys;
+    const fixture = createRouterTransport((router) =>
+      router.rpc(listApiKeys, () => ({
+        apiKeys: keys.map((key) => ({
+          ...key,
+          organizationId: MOCK_IDS.acme,
+          name: "ci-key",
+          state: ApiKeyState.ACTIVE,
+        })),
+      })),
+    );
+    const mock = createMockTransport();
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...args) {
+        return (method.name === listApiKeys.name ? fixture : mock).unary(
+          method,
+          ...args,
+        );
+      },
+    };
     renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
     const list = await screen.findByRole("list", { name: "API keys" });
-    await settle(60);
-    const names = namesOf(list);
-    const ci = names.filter((n) => n!.startsWith("Revoke API key ci-key ("));
-    expect(ci).toHaveLength(2);
-    expect(new Set(ci).size).toBe(2);
-    expect(
-      ci.every((n) => /^Revoke API key ci-key \(osk_[0-9a-f]+\)$/.test(n!)),
-    ).toBe(true);
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    for (const { keyPrefix } of keys) {
+      const row = within(list).getByText(`${keyPrefix}…`).closest("li")!;
+      expect(
+        within(row).getByRole("button", {
+          name: `Revoke API key ci-key (${keyPrefix})`,
+        }),
+      ).toBeTruthy();
+    }
   });
 
   test("Remove names the member, and Revoke names the invitation", async () => {

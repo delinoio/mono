@@ -216,7 +216,7 @@ func (a *app) tokenSource() (sandrun.TokenSource, error) {
 			tok, err := cfg.Refresh(ctx, sent)
 			if err != nil {
 				var oe *logto.Error
-				if attempt < maxRefreshAttempts && errors.As(err, &oe) && oe.Code == "invalid_grant" {
+				if attempt < maxRefreshAttempts && errors.As(err, &oe) && oe.Code() == logto.InvalidGrant {
 					rotated, adoptErr := adopt()
 					if adoptErr != nil {
 						return "", adoptErr

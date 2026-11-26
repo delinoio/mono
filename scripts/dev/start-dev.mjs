@@ -8,7 +8,7 @@ import { startPortlessProxy } from "./start-portless-proxy.mjs";
 const require = createRequire(import.meta.url);
 
 async function main() {
-  const status = startPortlessProxy();
+  const status = await startPortlessProxy();
   if (status !== 0) return status;
 
   // Run the installed CLI with Node because shell-free spawn cannot run a

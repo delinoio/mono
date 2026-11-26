@@ -1623,7 +1623,8 @@ const VERSION = 'v2'
 
 function saveConfig(config: { theme: string; language: string }): boolean {
   try {
-    localStorage.setItem(`userConfig:${VERSION}`, JSON.stringify(config))
+    const preferences = { theme: config.theme, language: config.language }
+    localStorage.setItem(`userConfig:${VERSION}`, JSON.stringify(preferences))
     return true
   } catch {
     // Throws in incognito/private browsing, quota exceeded, or disabled
@@ -2024,12 +2025,19 @@ function Form() {
 
 **Correct: do it in the handler**
 
+The `post` helper returns a promise that rejects when registration fails.
+
 ```tsx
 function Form() {
   const theme = useContext(ThemeContext)
 
-  function handleSubmit() {
-    post('/api/register')
+  async function handleSubmit() {
+    try {
+      await post('/api/register')
+    } catch {
+      showToast('Registration failed', theme)
+      return
+    }
     showToast('Registered', theme)
   }
 

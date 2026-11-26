@@ -30,8 +30,8 @@ const skip = process.platform === "win32" && "scripts/protos.sh needs bash";
 
 // Fake `go`. `go run <module>@<version> <buf args>` behaves like buf:
 // `lint` and `format` succeed, and `generate --output <dir>` writes bindings per
-// language (the TypeScript template runs are the ones with --template; each
-// writes under the schema path that --path names). The FAKE_GO_FAIL variable
+// language. TypeScript runs must use the template and plugin of the binding
+// package that --path names. The FAKE_GO_FAIL variable
 // selects a failing generator: `go`, `ts` (every TypeScript target) or
 // `ts-accounts` (only the delino/accounts target, which runs second).
 const fakeGo = `#!/usr/bin/env bash
@@ -48,15 +48,28 @@ if [[ "$subcommand" != "generate" ]]; then
 fi
 out=""
 ts=0
+template=""
 schemas="go"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output) out="$2"; shift 2 ;;
-    --template) ts=1; shift 2 ;;
-    --path) schemas="$2"; shift 2 ;;
+    --template) ts=1; template="$2"; shift 2 ;;
+    --path) ts=1; schemas="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
+if [[ "$ts" -eq 1 ]]; then
+  package="$PWD/$schemas"
+  if [[ "$template" != "$package/buf.gen.yaml" ]]; then
+    echo "fake go: TypeScript template mismatch for $schemas: expected $package/buf.gen.yaml, got \${template:-<missing>}" >&2
+    exit 2
+  fi
+  plugin="$(command -v protoc-gen-es || true)"
+  if [[ "$plugin" != "$package/node_modules/.bin/protoc-gen-es" ]]; then
+    echo "fake go: protoc-gen-es path mismatch for $schemas: expected $package/node_modules/.bin/protoc-gen-es, got \${plugin:-<not found>}" >&2
+    exit 2
+  fi
+fi
 if [[ "\${FAKE_GO_EMPTY_TARGET:-}" == "$schemas" ]]; then
   exit 0
 fi
@@ -175,6 +188,10 @@ function fixture({ parent = tmpdir(), plugin = true } = {}) {
   chmodSync(join(bin, "go"), 0o755);
   write(join(bin, "find"), fakeFind);
   chmodSync(join(bin, "find"), 0o755);
+  // This inherited plugin must lose to each package-local plugin.
+  const decoy = join(bin, "protoc-gen-es");
+  write(decoy, "#!/bin/sh\n");
+  chmodSync(decoy, 0o755);
   return { dir, repo, scratch, env };
 }
 

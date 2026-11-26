@@ -33,11 +33,9 @@ function write(path, content) {
   writeFileSync(path, content);
 }
 
-// A module `example.com/app` whose command imports `example.com/lib` and
-// `example.com/otherlib` everywhere, `example.com/windowsonly` only on Windows and
-// `example.com/cgoonly` only with CGO. The last two have no license file, so
-// the bundle succeeds only when the helper builds for linux/amd64 with CGO
-// disabled whatever the caller's environment says.
+// The command always imports lib and otherlib. Go selects targetamd64 or
+// targetarm64 by filename suffix. The Windows and CGO imports have no license
+// files, so including either fails notice collection.
 function fixture(options = {}) {
   const dir = mkdtempSync(join(tmpdir(), "server-notices-"));
   write(
@@ -50,12 +48,16 @@ function fixture(options = {}) {
       "require (",
       "\texample.com/lib v1.2.3",
       "\texample.com/otherlib v0.0.1",
+      "\texample.com/targetamd64 v0.0.1",
+      "\texample.com/targetarm64 v0.0.1",
       "\texample.com/windowsonly v0.0.1",
       "\texample.com/cgoonly v0.0.1",
       ")",
       "",
       'replace example.com/lib => "./[cache]/lib"',
       'replace example.com/otherlib => "./[cache]/otherlib"',
+      'replace example.com/targetamd64 => "./[cache]/targetamd64"',
+      'replace example.com/targetarm64 => "./[cache]/targetarm64"',
       'replace example.com/windowsonly => "./[cache]/windowsonly"',
       'replace example.com/cgoonly => "./[cache]/cgoonly"',
       "",
@@ -74,6 +76,14 @@ function fixture(options = {}) {
     ].join("\n"),
   );
   write(
+    join(dir, "cmd/app/module_amd64.go"),
+    'package main\n\nimport _ "example.com/targetamd64"\n',
+  );
+  write(
+    join(dir, "cmd/app/module_arm64.go"),
+    'package main\n\nimport _ "example.com/targetarm64"\n',
+  );
+  write(
     join(dir, "cmd/app/windows.go"),
     '//go:build windows\n\npackage main\n\nimport _ "example.com/windowsonly"\n',
   );
@@ -81,7 +91,14 @@ function fixture(options = {}) {
     join(dir, "cmd/app/cgo.go"),
     '//go:build cgo\n\npackage main\n\nimport _ "example.com/cgoonly"\n',
   );
-  for (const name of ["lib", "otherlib", "windowsonly", "cgoonly"]) {
+  for (const name of [
+    "lib",
+    "otherlib",
+    "targetamd64",
+    "targetarm64",
+    "windowsonly",
+    "cgoonly",
+  ]) {
     write(
       join(dir, "[cache]", name, "go.mod"),
       `module example.com/${name}\n\ngo 1.21\n`,
@@ -99,6 +116,14 @@ function fixture(options = {}) {
     write(join(dir, "[cache]/lib/a/b/LICENSE"), "Too deep license text\n");
   }
   write(join(dir, "[cache]/otherlib/LICENSE"), "Other fixture license text\n");
+  write(
+    join(dir, "[cache]/targetamd64/LICENSE"),
+    "AMD64 fixture license text\n",
+  );
+  write(
+    join(dir, "[cache]/targetarm64/LICENSE"),
+    "ARM64 fixture license text\n",
+  );
   return dir;
 }
 
@@ -145,11 +170,15 @@ test(
         ],
         ["example.com/lib v1.2.3: NOTICE.md", "Fixture notice text"],
         ["example.com/otherlib v0.0.1: LICENSE", "Other fixture license text"],
+        [
+          "example.com/targetamd64 v0.0.1: LICENSE",
+          "AMD64 fixture license text",
+        ],
       ],
     );
     assert.doesNotMatch(bundle, /Too deep license text/);
-    assert.doesNotMatch(bundle, /windowsonly|cgoonly/);
-    assert.match(result.stderr, /licenses of 2 third-party modules of app/);
+    assert.doesNotMatch(bundle, /targetarm64|windowsonly|cgoonly/);
+    assert.match(result.stderr, /licenses of 3 third-party modules of app/);
   },
 );
 

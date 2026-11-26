@@ -257,16 +257,44 @@ describe("continuation errors", () => {
   }
 
   paginationTest(
+    "keeps cached choices and offers a retry after a transient continuation error",
+    async ({ app, pagedList, screen }) => {
+      await pagedList.open("ListOrganizations", `/orgs/${ACME}/sandboxes`);
+      const switcher = screen.getByRole("combobox", "Organization");
+      await switcher.tap();
+      const acme = screen.getByRole("option", "Acme Robotics");
+      const northwind = screen.getByRole("option", "Northwind Labs");
+      await expect(acme).toBeVisible();
+      await app.screenshot("switcher-continuation-pending");
+      await pagedList.release(Code.Internal);
+      const retry = screen.getByRole(
+        "option",
+        "Some organizations did not load. Try again",
+      );
+      await expect(retry).toBeVisible();
+      await expect(acme).toBeVisible();
+      await expect(northwind).toHaveCount(0);
+      await app.screenshot("switcher-continuation-retry");
+      await pagedList.allowRetry();
+      await retry.tap();
+      await switcher.tap();
+      await expect(northwind).toBeVisible();
+      await expect(retry).toHaveCount(0);
+    },
+  );
+  paginationTest(
     "hides loaded organizations in the switcher and on the list",
     async ({ app, pagedList, screen }) => {
       await pagedList.open("ListOrganizations", `/orgs/${ACME}/sandboxes`);
       await screen.getByRole("combobox", "Organization").tap();
       await expect(screen.getByRole("option", "Acme Robotics")).toBeVisible();
 
+      await app.screenshot("switcher-before-terminal-continuation");
       await pagedList.release(Code.Unauthenticated);
 
       await expect(screen.getByRole("combobox", "Organization")).toBeHidden();
       await expect(screen.getByRole("option", "Acme Robotics")).toBeHidden();
+      await app.screenshot("switcher-after-terminal-continuation");
       await screen.getByRole("link", "OwnSand").tap();
       await expect(
         screen.getByRole("button", "Sign in with Delino"),
@@ -351,6 +379,84 @@ describe("continuation errors", () => {
       await app.screenshot("recovered-organizations");
     },
   );
+});
+
+describe("organization switcher full refresh errors", () => {
+  const path = `/orgs/${ACME}/sandboxes`;
+
+  for (const code of [
+    ...TERMINAL_ERRORS.map(([code]) => code),
+    Code.Unavailable,
+  ]) {
+    paginationTest(
+      `updates the open switcher after ${Code[code]}`,
+      async ({ app, browser, pagedList, screen }) => {
+        await pagedList.open("ListOrganizations", path, { hold: false });
+        const switcher = screen.getByRole("combobox", "Organization");
+        const acme = screen.getByRole("option", "Acme Robotics");
+        const northwind = screen.getByRole("option", "Northwind Labs");
+        await switcher.tap();
+        await expect(acme).toBeVisible();
+        await expect(northwind).toBeVisible();
+        await app.screenshot(`switcher-before-${Code[code]}`);
+
+        const refresh = async (errorCode: Code | null) => {
+          await browser.evaluate(async (errorCode) => {
+            if (errorCode === null) {
+              sessionStorage.removeItem("ownsand-e2e-refresh-error");
+              // The recovered list ends after its first page.
+              sessionStorage.setItem("ownsand-e2e-paged-next-token", "");
+            } else {
+              sessionStorage.setItem(
+                "ownsand-e2e-refresh-error",
+                String(errorCode),
+              );
+            }
+            const now = Date.now;
+            Date.now = () => now() + 11_000;
+            try {
+              window.dispatchEvent(new Event("visibilitychange"));
+              await Promise.resolve();
+            } finally {
+              Date.now = now;
+            }
+            return null;
+          }, errorCode);
+        };
+
+        const keepsChoices = code === Code.Unavailable;
+        const initialTokens = await pagedList.tokens();
+        await refresh(code);
+        await expect
+          .poll(() => pagedList.tokens())
+          .toEqual([...initialTokens, ...(keepsChoices ? ["", "", ""] : [""])]);
+        if (keepsChoices) {
+          await expect(switcher).toBeVisible();
+          await expect(acme).toBeVisible();
+          await expect(northwind).toBeVisible();
+        } else {
+          await expect(switcher).toHaveCount(0);
+          await expect(acme).toHaveCount(0);
+          await expect(northwind).toHaveCount(0);
+        }
+        await expect(screen.getByRole("link", "OwnSand")).toBeVisible();
+        await expect(
+          screen.getByRole("link", "Account settings"),
+        ).toBeVisible();
+        await expect(screen.getByRole("button", "Sign out")).toBeVisible();
+        await expect(screen.getByRole("heading", "Sandboxes")).toBeVisible();
+        await expect(browser).toHaveURL(path);
+        await app.screenshot(`switcher-after-${Code[code]}`);
+
+        await refresh(null);
+        await expect(switcher).toBeVisible();
+        if (!keepsChoices) await switcher.tap();
+        await expect(acme).toBeVisible();
+        await expect(northwind).toHaveCount(0);
+        await app.screenshot(`switcher-recovered-${Code[code]}`);
+      },
+    );
+  }
 });
 
 describe("automatic pagination after terminal refresh", () => {
