@@ -3079,6 +3079,68 @@ function countingTransport(mock: Transport) {
 }
 
 describe("billing banner", () => {
+  test.each([
+    [Code.NotFound, MockBillingState.BlockedUnlinked, "blocked"],
+    [Code.PermissionDenied, MockBillingState.BlockedUnlinked, "blocked"],
+    [Code.Unauthenticated, MockBillingState.BlockedUnlinked, "blocked"],
+    [Code.NotFound, MockBillingState.Suspended, "suspended"],
+  ] as const)(
+    "hides cached billing after terminal status error %s from %s",
+    async (code, state, phase) => {
+      const mock = createMockTransport({
+        billing: { [MOCK_IDS.acme]: state },
+      });
+      let refreshError: ConnectError | undefined;
+      const { transport, calls } = countingTransport({
+        ...mock,
+        async unary(method, ...rest) {
+          if (method.name === "GetBillingStatus" && refreshError) {
+            throw refreshError;
+          }
+          return mock.unary(method, ...rest);
+        },
+      });
+      const queryClient = createQueryClient();
+      const path = `/orgs/${MOCK_IDS.acme}/enrollment-tokens`;
+      renderConsole(path, { transport, queryClient });
+      const bannerName = `This organization is ${phase}`;
+      const banner = await screen.findByRole("region", { name: bannerName });
+      expect(
+        within(banner).getByRole("link", {
+          name: "Manage billing at accounts.delino.io",
+        }),
+      ).toBeTruthy();
+      expect(
+        within(banner).queryByRole("link", {
+          name: "Link a billing account",
+        }) !== null,
+      ).toBe(state === MockBillingState.BlockedUnlinked);
+      const heading = await screen.findByRole("heading", {
+        name: "Enrollment tokens",
+        level: 1,
+      });
+      const statusReads = calls.GetBillingStatus ?? 0;
+      const organizationReads = calls.GetOrganization;
+
+      refreshError = new ConnectError("Billing status refresh failed", code);
+      fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Create token" }),
+      );
+
+      await waitFor(() =>
+        expect(screen.queryByRole("region", { name: bannerName })).toBeNull(),
+      );
+      expect(calls.GetBillingStatus).toBe(statusReads + 1);
+      expect(calls.GetOrganization).toBe(organizationReads);
+      expect(window.location.pathname).toBe(path);
+      expect(
+        screen.getByRole("heading", { name: "Enrollment tokens", level: 1 }),
+      ).toBe(heading);
+    },
+  );
+
   for (const [roleName, userId] of ACME_ROLES) {
     for (const state of BILLING_STATES) {
       test(`the ${roleName} in ${state}`, async () => {
