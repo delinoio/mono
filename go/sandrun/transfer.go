@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -103,10 +104,7 @@ func (c *Client) writeGuestFile(ctx context.Context, s *sandrunv1.DevSession, pa
 		if final {
 			req.Mode = mode
 		}
-		if err := c.retry(ctx, "write-file", writeID, func() error {
-			_, err := c.devSessions.WriteDevSessionFile(ctx, connect.NewRequest(req))
-			return err
-		}); err != nil {
+		if err := c.writeGuestChunk(ctx, req); err != nil {
 			return offset, err
 		}
 		offset += int64(len(cur))
@@ -131,13 +129,18 @@ func (c *Client) writeGuestFile(ctx context.Context, s *sandrunv1.DevSession, pa
 func (c *Client) readGuestFile(ctx context.Context, s *sandrunv1.DevSession, path string, limit int64, w io.Writer, progress func(int64)) (int64, error) {
 	var offset int64
 	bo := backoff{min: c.timing.backoffMin, max: c.timing.backoffMax}
-	lastProgress := time.Now()
 	readID, err := uuidv7.NewString()
 	if err != nil {
 		return 0, err
 	}
+	idle := newTransferWindow(ctx, c.timing.retryBudget)
+	defer idle.close()
+
 	for attempt := 0; ; attempt++ {
-		stream, err := c.devSessions.ReadDevSessionFile(ctx, connect.NewRequest(&sandrunv1.ReadDevSessionFileRequest{
+		if err := idle.check(false); err != nil {
+			return offset, err
+		}
+		stream, err := c.devSessions.ReadDevSessionFile(idle.ctx, connect.NewRequest(&sandrunv1.ReadDevSessionFileRequest{
 			OrganizationId: s.GetOrganizationId(),
 			DevSessionId:   s.GetDevSessionId(),
 			ReadId:         readID,
@@ -146,6 +149,10 @@ func (c *Client) readGuestFile(ctx context.Context, s *sandrunv1.DevSession, pat
 		}))
 		if err == nil {
 			for stream.Receive() {
+				if err := idle.check(false); err != nil {
+					_ = stream.Close()
+					return offset, err
+				}
 				msg := stream.Msg()
 				if end := msg.GetEnd(); end != nil {
 					_ = stream.Close()
@@ -162,16 +169,28 @@ func (c *Client) readGuestFile(ctx context.Context, s *sandrunv1.DevSession, pat
 					_ = stream.Close()
 					return offset, errorf("read of the guest file returned offset %d, want %d", ch.GetOffset(), offset)
 				}
-				if offset+int64(len(ch.GetData())) > limit {
-					_ = stream.Close()
-					return offset, &LimitError{Operation: "download", FileLimit: limit, TotalLimit: limit, Paths: []PathSize{{Path: path, Size: offset + int64(len(ch.GetData()))}}}
+				data := ch.GetData()
+				if len(data) == 0 {
+					continue
 				}
-				if _, err := w.Write(ch.GetData()); err != nil {
+				if offset+int64(len(data)) > limit {
+					_ = stream.Close()
+					return offset, &LimitError{Operation: "download", FileLimit: limit, TotalLimit: limit, Paths: []PathSize{{Path: path, Size: offset + int64(len(data))}}}
+				}
+				n, err := w.Write(data)
+				if err != nil {
 					_ = stream.Close()
 					return offset, err
 				}
-				offset += int64(len(ch.GetData()))
-				lastProgress = time.Now()
+				if n != len(data) {
+					_ = stream.Close()
+					return offset, io.ErrShortWrite
+				}
+				offset += int64(n)
+				if err := idle.check(true); err != nil {
+					_ = stream.Close()
+					return offset, err
+				}
 				bo.reset()
 				if progress != nil {
 					progress(offset)
@@ -183,31 +202,104 @@ func (c *Client) readGuestFile(ctx context.Context, s *sandrunv1.DevSession, pat
 				err = errors.New("the read stream ended without its end message")
 			}
 		}
-		if !transient(ctx, err) || time.Since(lastProgress) > c.timing.retryBudget {
+		retry := transient(ctx, err)
+		if ctxErr := idle.check(false); ctxErr != nil {
+			return offset, ctxErr
+		}
+		if !retry {
 			return offset, err
 		}
 		delay := bo.next()
 		c.logger.DebugContext(ctx, "SandRun read file retries", "read_id", readID, "attempt", attempt+1, "delay", delay, "code", codeText(err))
-		if err := sleep(ctx, delay); err != nil {
-			return offset, err
+		if err := sleep(idle.ctx, delay); err != nil {
+			return offset, transferContextError(idle.ctx)
 		}
 	}
 }
 
-// retry runs fn until it succeeds, fails with a non-transient error, or the
-// retry budget passes.
-func (c *Client) retry(ctx context.Context, op, id string, fn func() error) error {
+var errTransferBudget = fmt.Errorf("sandrun: file transfer retry budget expired: %w", context.DeadlineExceeded)
+
+func transferContextError(ctx context.Context) error {
+	if context.Cause(ctx) == errTransferBudget {
+		return localError(connect.CodeDeadlineExceeded, errTransferBudget)
+	}
+	return ctx.Err()
+}
+
+// transferWindow covers RPCs and backoff for a write chunk or a read.
+type transferWindow struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	budget time.Duration
+	timer  *time.Timer
+
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func newTransferWindow(ctx context.Context, budget time.Duration) *transferWindow {
+	// Keep the SDK budget local. Connect rounds a transmitted deadline
+	// down to milliseconds, so the server could expire it first.
+	callCtx, cancel := context.WithCancelCause(ctx)
+	w := &transferWindow{
+		ctx:      callCtx,
+		cancel:   cancel,
+		budget:   budget,
+		deadline: time.Now().Add(budget),
+	}
+	w.timer = time.AfterFunc(time.Until(w.deadline), func() { _ = w.check(false) })
+	return w
+}
+
+func (w *transferWindow) close() {
+	w.timer.Stop()
+	w.cancel(nil)
+}
+
+// check serializes expiry with progress. A callback from before a timer
+// reset may still run, so it checks the current deadline under the lock.
+func (w *transferWindow) check(progress bool) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := transferContextError(w.ctx); err != nil {
+		return err
+	}
+	now := time.Now()
+	if callerDeadline, ok := w.ctx.Deadline(); ok && !now.Before(callerDeadline) && !callerDeadline.After(w.deadline) {
+		return context.DeadlineExceeded
+	}
+	if !now.Before(w.deadline) {
+		w.cancel(errTransferBudget)
+		return transferContextError(w.ctx)
+	}
+	if progress {
+		w.deadline = now.Add(w.budget)
+		w.timer.Reset(time.Until(w.deadline))
+	}
+	return nil
+}
+
+// writeGuestChunk shares one deadline across the chunk's attempts and backoff.
+func (c *Client) writeGuestChunk(ctx context.Context, req *sandrunv1.WriteDevSessionFileRequest) error {
+	window := newTransferWindow(ctx, c.timing.retryBudget)
+	defer window.close()
 	bo := backoff{min: c.timing.backoffMin, max: c.timing.backoffMax}
-	start := time.Now()
 	for attempt := 0; ; attempt++ {
-		err := fn()
-		if err == nil || !transient(ctx, err) || time.Since(start) > c.timing.retryBudget {
+		if err := window.check(false); err != nil {
+			return err
+		}
+		_, err := c.devSessions.WriteDevSessionFile(window.ctx, connect.NewRequest(req))
+		retry := transient(ctx, err)
+		if ctxErr := window.check(false); ctxErr != nil {
+			return ctxErr
+		}
+		if !retry {
 			return err
 		}
 		delay := bo.next()
-		c.logger.DebugContext(ctx, "sandrun rpc retries", "op", op, "id", id, "attempt", attempt+1, "delay", delay, "code", codeText(err))
-		if err := sleep(ctx, delay); err != nil {
-			return err
+		c.logger.DebugContext(ctx, "sandrun rpc retries", "op", "write-file", "id", req.GetWriteId(), "attempt", attempt+1, "delay", delay, "code", codeText(err))
+		if err := sleep(window.ctx, delay); err != nil {
+			return transferContextError(window.ctx)
 		}
 	}
 }
