@@ -2409,9 +2409,8 @@ func TestReplacePathRollback(t *testing.T) {
 	}
 }
 
-// TestDownloadResumeKeepsReadID checks that a read that continues after a
-// stream ended early uses the same read_id, so it reads the same snapshot
-// also when the guest file changes in between.
+// TestDownloadResumeKeepsReadID checks that a resumed download keeps one
+// read ID and reads the original snapshot after the guest file changes.
 func TestDownloadResumeKeepsReadID(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
@@ -2419,25 +2418,48 @@ func TestDownloadResumeKeepsReadID(t *testing.T) {
 	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	guestFile := filepath.Join(ds.GetWorkspacePath(), "data.bin")
 	size := 2*ChunkSize + 10
-	if err := os.WriteFile(guestFile, bytes.Repeat([]byte("a"), size), 0o644); err != nil {
+	original := bytes.Repeat([]byte("a"), size)
+	replacement := bytes.Repeat([]byte("b"), size)
+	if err := os.WriteFile(guestFile, original, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	changed := false
 	local := filepath.Join(t.TempDir(), "data.bin")
 	_, err := c.Download(context.Background(), DownloadParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: "data.bin", LocalPath: local, Progress: func(p TransferProgress) {
-		if p.Phase == TransferDownloading && p.BytesDone > 0 && !changed {
-			// A same-size replacement after the first stream.
-			changed = true
-			if err := os.WriteFile(guestFile, bytes.Repeat([]byte("b"), size), 0o644); err != nil {
-				t.Error(err)
-			}
+		if p.Phase != TransferDownloading || p.BytesDone <= 0 || changed {
+			return
 		}
+		reads := srv.ReadRequests()
+		if len(reads) != 1 {
+			t.Fatalf("before source replacement, got %d read requests, want 1", len(reads))
+		}
+		if reads[0].GetPath() != guestFile || reads[0].GetOffset() != 0 {
+			t.Fatalf("initial request path = %q, offset = %d, want %q at offset 0", reads[0].GetPath(), reads[0].GetOffset(), guestFile)
+		}
+		if err := os.WriteFile(guestFile, replacement, 0o644); err != nil {
+			t.Fatalf("replace guest source: %v", err)
+		}
+		changed = true
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(local); !bytes.Equal(b, bytes.Repeat([]byte("a"), size)) {
-		t.Fatal("the resumed download joined two versions of the file")
+	if !changed {
+		t.Fatal("guest source was not replaced during download")
+	}
+	gotSource, err := os.ReadFile(guestFile)
+	if err != nil {
+		t.Fatalf("read replaced guest source: %v", err)
+	}
+	if !bytes.Equal(gotSource, replacement) {
+		t.Fatal("guest source does not contain the replacement bytes")
+	}
+	gotLocal, err := os.ReadFile(local)
+	if err != nil {
+		t.Fatalf("read downloaded file: %v", err)
+	}
+	if !bytes.Equal(gotLocal, original) {
+		t.Fatal("resumed download does not contain the original bytes")
 	}
 	reads := srv.ReadRequests()
 	var ids []string
@@ -2446,7 +2468,7 @@ func TestDownloadResumeKeepsReadID(t *testing.T) {
 			ids = append(ids, r.GetReadId())
 		}
 	}
-	if len(ids) != 3 || ids[0] != ids[1] || ids[1] != ids[2] {
+	if len(ids) != 3 || ids[0] == "" || ids[0] != ids[1] || ids[1] != ids[2] {
 		t.Fatalf("read_ids of the download = %v, want one read_id in 3 calls", ids)
 	}
 }
