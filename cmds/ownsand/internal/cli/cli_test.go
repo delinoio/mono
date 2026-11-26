@@ -335,8 +335,11 @@ func TestExecJSONDataPathErrorCarriesExecID(t *testing.T) {
 	if len(ids) == 0 || ids[0] == "" {
 		t.Fatalf("the fake recorded no exec ID: %q", ids)
 	}
-	if last["event"] != "data_path_error" || last["exec_id"] != ids[len(ids)-1] || last["message"] == "" {
+	if last["event"] != "data_path_error" || last["exec_id"] != ids[len(ids)-1] {
 		t.Fatalf("last line %v, want data_path_error with exec_id %q", last, ids[len(ids)-1])
+	}
+	if message, ok := last["message"].(string); !ok || message == "" {
+		t.Fatalf("message = %#v, want a non-empty string", last["message"])
 	}
 	// Text mode is unchanged: no JSON on stdout.
 	res = r.run("sandbox", "exec", r.f.sb, "--", "denied")
@@ -357,8 +360,11 @@ func TestDataPathErrorEventWithoutExecID(t *testing.T) {
 	if jerr := json.Unmarshal(out.Bytes(), &line); jerr != nil {
 		t.Fatal(jerr)
 	}
-	if _, ok := line["exec_id"]; ok || line["event"] != "data_path_error" || line["message"] == "" {
+	if _, ok := line["exec_id"]; ok || line["event"] != "data_path_error" {
 		t.Fatalf("line %v", line)
+	}
+	if message, ok := line["message"].(string); !ok || message == "" {
+		t.Fatalf("message = %#v, want a non-empty string", line["message"])
 	}
 	with := dataPathErrorEvent(&ownsand.DataPathError{Operation: "exec", OperationID: "e1", Err: errors.New("x")})
 	if with.ExecID != "e1" {
