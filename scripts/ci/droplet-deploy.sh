@@ -37,9 +37,10 @@
 # script creates the replacement, stops the running containers to free the
 # ports, and only then starts the replacement and waits for its health check.
 # The service does not answer between the stop and the route switch. When the
-# replacement fails to start, fails its health check or the route switch
-# fails, the script removes it and starts the stopped containers again; the
-# route still names them.
+# replacement fails to start, fails its health check or Caddy rejects the
+# route, the script removes it and restarts the containers stopped for UDP.
+# An unresolved route switch keeps the replacement running and the prior
+# containers stopped, so only the replacement can hold the UDP ports.
 #
 # On `SIGTERM`, `SIGINT` or `SIGHUP`, the script cleans up an HTTP-only
 # replacement from launch through proxy-lock acquisition. For UDP, the same
@@ -51,9 +52,10 @@
 # the UDP containers stopped. For both HTTP-only and UDP deployments,
 # the script defers these signals during the route switch and image-state
 # publication. When the reload succeeds, the script records the state and
-# exits with the signal status before cleanup. When the reload fails, the
-# script restores the route file and removes the replacement, then restarts
-# any containers that it stopped for UDP and reports the route failure.
+# exits with the signal status before cleanup. When Caddy rejects the route,
+# the script restores the route file, removes the replacement and restarts
+# the containers it stopped for UDP. An unresolved switch retains the
+# installed route and backup and exits without publishing state or cleanup.
 #
 # Every deployment reads a fresh identifier under the service lock, before it
 # runs any `docker` command: a UUID that the kernel generates for each read
@@ -205,6 +207,9 @@ main() {
   if ! command -v timeout > /dev/null || [[ ! -r /proc/uptime ]]; then
     fail "droplet-deploy.sh needs GNU coreutils timeout and /proc/uptime for the health-check deadline."
   fi
+  if ! command -v python3 > /dev/null; then
+    fail "droplet-deploy.sh needs python3 to read the active proxy configuration."
+  fi
   local lock_timeout="${DROPLET_LOCK_TIMEOUT:-600}"
   local proxy_lock_timeout="${DROPLET_PROXY_LOCK_TIMEOUT:-$lock_timeout}"
   local id_source="${DROPLET_ID_SOURCE:-/proc/sys/kernel/random/uuid}"
@@ -354,30 +359,23 @@ main() {
     fi
   fi
 
-  # One route change and proxy reload at a time on the Droplet. `caddy reload`
-  # adapts and applies the whole Caddyfile with every `sites/*.caddy` file, so
-  # a run of another service that adapts it between this run's route install
-  # and a rejected reload could apply, or restore, an obsolete route. The lock
-  # is taken after the service lock (never the other way round, so no deadlock)
-  # and before the first route file is touched, and it stays held until the
-  # reload succeeded or the route file is restored. A run that cannot take it
-  # changes no route file and takes the same failure path as a rejected
-  # route. The pre-switch traps stay active through the lock wait.
-  local pending_signal=""
-  local proxy_lock_fd="" route_switched=""
+  # Deployments and provisioning share the proxy lock because each switch
+  # applies the whole Caddyfile. Take it after the service lock. Keep the
+  # pre-switch traps active while waiting for it.
+  local pending_signal="" route_result=1 proxy_lock_fd=""
   if acquire_proxy_lock "$root/state/.proxy.lock" "$proxy_lock_timeout" "$service" proxy_lock_fd; then
-    # Defer signals until a rejected route is restored and its replacement
-    # removed, or until a successful switch is recorded in the state files.
     trap 'pending_signal=TERM' TERM
     trap 'pending_signal=INT' INT
     trap 'pending_signal=HUP' HUP
-    if write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol"; then
-      route_switched=1
-    fi
-    # Closing the descriptor releases the lock; the route file is final now.
+    route_result=0
+    write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol" "$deployment_id" ||
+      route_result=$?
     exec {proxy_lock_fd}>&-
   fi
-  if [[ -z "$route_switched" ]]; then
+  if (( route_result != 0 && route_result != 1 )); then
+    fail "the route switch for $service is unresolved. Retained $new and the previous containers, the installed route and its backups. Image state and container cleanup were skipped. Retry the deployment or rollback after Caddy's admin API is available."
+  fi
+  if (( route_result == 1 )); then
     discard_replacement "$new" "$replacement_stop_timeout"
     if (( ${#stopped[@]} > 0 )); then
       restart_previous "${stopped[@]}"
@@ -646,16 +644,57 @@ acquire_proxy_lock() {
   printf -v "$4" '%s' "$fd"
 }
 
-# Writes the reverse proxy route of the service to the unique alias of its
-# replacement container and reloads the proxy. The caller evaluates this function as an `if` condition, which
-# disables `set -e` inside it, so every step checks its own status and names
-# the failed operation. The previous route stays in place until the new route
-# is complete (the new route goes to a temporary file that `mv` renames over
-# the route file), and the proxy reloads only after that. Restores the
-# previous route when the proxy rejects the new one. The caller holds the
-# proxy lock (`acquire_proxy_lock`) for the whole call.
+# Caddy's loopback API is available inside the pinned proxy container. Bound
+# both the Docker command and the HTTP request. A timed-out write is ambiguous.
+proxy_admin() {
+  local proxy="$1" interactive="$2"
+  shift 2
+  local -a exec_args=()
+  if [[ "$interactive" == yes ]]; then exec_args=(-i); fi
+  timeout --signal=KILL 25s docker exec "${exec_args[@]}" "$proxy" curl --disable \
+    --silent --show-error --noproxy '*' --max-time 20 "$@" http://127.0.0.1:2019/config/
+}
+
+# Match the exact site and its single upstream in the Caddyfile adapter's
+# host -> subroute -> reverse_proxy structure. An unfamiliar shape cannot
+# prove that this deployment is serving.
+config_serves() {
+  local config="$1" hostname="$2" dial="$3"
+  python3 -c '
+import json
+import sys
+
+hostname, dial = sys.argv[1:]
+try:
+    servers = json.load(sys.stdin)["apps"]["http"]["servers"]
+    sites = [
+        route
+        for server in servers.values()
+        for route in server.get("routes", [])
+        if route.get("match") == [{"host": [hostname]}]
+    ]
+    [site] = sites
+    [subroute] = site["handle"]
+    [route] = subroute["routes"]
+    [proxy] = route["handle"]
+    [upstream] = proxy["upstreams"]
+    serving = (
+        subroute["handler"] == "subroute"
+        and not route.get("match")
+        and proxy["handler"] == "reverse_proxy"
+        and upstream["dial"] == dial
+    )
+except (KeyError, TypeError, ValueError, AttributeError):
+    serving = False
+sys.exit(0 if serving else 1)
+' "$hostname" "$dial" <<< "$config"
+}
+
+# Switches the route under the proxy lock. Status 0 confirms the replacement,
+# 1 permits cleanup of a rejected replacement, and 2 retains it for recovery.
+# The caller uses this function in a conditional, so check each operation.
 write_route() {
-  local site="$1" service="$2" upstream="$3" port="$4" hostname="$5" proxy="$6" protocol="$7"
+  local site="$1" service="$2" upstream="$3" port="$4" hostname="$5" proxy="$6" protocol="$7" deployment_id="$8"
   local route
   # `lb_try_duration` retries a failed connection for 10 seconds, so a request
   # that reaches the old container while it stops is sent to the new one.
@@ -685,7 +724,7 @@ write_route() {
     return 1
   fi
   if [[ -f "$site" ]]; then
-    backup="$site.previous"
+    backup="$site.previous.$deployment_id"
     if ! cp "$site" "$backup"; then
       echo "::error::could not back up the route file $site to $backup." >&2
       return 1
@@ -701,17 +740,57 @@ write_route() {
     rm -f "$pending"
     return 1
   fi
-  if docker exec "$proxy" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile; then
-    echo "Reloaded the reverse proxy with the route https://$hostname -> $upstream:$port"
-    return 0
+  local candidate http_status active etag etag_pattern='^"/config/ [0-9a-f]+"$'
+  # Adapt while the proxy lock is held and pass the resulting JSON by value.
+  # A delayed Docker exec must not read a later deployment's route files.
+  if ! candidate="$(timeout --signal=KILL 25s docker exec "$proxy" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile)" ||
+    ! config_serves "$candidate" "$hostname" "$upstream:$port"; then
+    echo "::error::the adapted Caddy configuration does not select $upstream:$port for $hostname." >&2
+  # Caddy checks the tag under its config lock before applying the POST.
+  # Each successful switch uses a unique alias, which changes the tag and
+  # prevents a delayed load from bringing back a removed upstream.
+  elif ! etag="$(proxy_admin "$proxy" no --fail --output /dev/null --write-out '%header{etag}')" ||
+    [[ ! "$etag" =~ $etag_pattern ]]; then
+    echo "::error::could not read the current Caddy configuration tag for $service." >&2
+  else
+    http_status="$(proxy_admin "$proxy" yes --header "If-Match: $etag" \
+      --header 'Content-Type: application/json' \
+      --header 'Caddy-Config-Source-File: /etc/caddy/Caddyfile' \
+      --header 'Caddy-Config-Source-Adapter: caddyfile' \
+      --data-binary @- --output /dev/stderr --write-out '%{http_code}' <<< "$candidate")" || http_status=""
+    case "$http_status" in
+      200)
+        echo "Reloaded the reverse proxy with the route https://$hostname -> $upstream:$port"
+        ;;
+      400|412|500)
+        # An explicit error response from the loopback API completes this load.
+        ;;
+      *)
+        if ! active="$(proxy_admin "$proxy" no --fail)" ||
+          ! config_serves "$active" "$hostname" "$upstream:$port"; then
+          # The previous upstream could still be visible before the POST applies.
+          # Preserve both deployments until a later conditional switch succeeds.
+          return 2
+        fi
+        echo "Confirmed the active reverse proxy route https://$hostname -> $upstream:$port"
+        http_status=200
+        ;;
+    esac
+    if [[ "$http_status" == 200 ]]; then
+      rm -f -- "$site".previous.* || echo "Could not remove prior route backups for $service." >&2
+      return 0
+    fi
   fi
+
   echo "::error::the reverse proxy rejected the route of $service; restoring the previous route." >&2
   if [[ -n "$backup" ]]; then
     if ! mv -f "$backup" "$site"; then
       echo "::error::could not restore the previous route from $backup to $site." >&2
+      return 2
     fi
   elif ! rm -f "$site"; then
     echo "::error::could not remove the rejected route $site." >&2
+    return 2
   fi
   return 1
 }
