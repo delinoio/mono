@@ -764,7 +764,7 @@ test(
       assert.notEqual(result.status, 0);
       assert.match(
         result.stderr,
-        /version printed binary linux-amd64 0 ?, not the version 0\.1\.0/,
+        /ownsand-agent-linux-amd64 version must print exactly 0\.1\.0/,
       );
     });
   },

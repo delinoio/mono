@@ -2,6 +2,7 @@
 // Covers state directory selection and propagation to the proxy and app tasks.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import {
   copyFileSync,
   existsSync,
@@ -14,8 +15,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
+import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { spawnProcessGroup } from "./fixture-process.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const preflight = "start-portless-proxy.mjs";
@@ -59,6 +62,19 @@ for (const name of ${JSON.stringify(appNames)}) {
 }
 `;
 
+// A fake Turbo CLI that waits for the test to close stdin after a signal.
+const signalCountingTurbo = `
+import assert from "node:assert/strict";
+assert.deepEqual(process.argv.slice(2), ["run", "dev", "--filter=web"]);
+assert.equal(process.env.PORTLESS, "0");
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, () => console.log(signal));
+}
+process.stdin.on("end", () => { process.exitCode = 42; });
+process.stdin.resume();
+console.log("ready");
+`;
+
 // A fake proxy process that runs until the test kills it.
 const fakeProxyCli = `setInterval(() => {}, 1000);`;
 
@@ -69,6 +85,11 @@ function fixture(t) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "portless-state-dir-")));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   mkdirSync(join(dir, "scripts", "dev"), { recursive: true });
+  mkdirSync(join(dir, "scripts", "ci"), { recursive: true });
+  copyFileSync(
+    join(root, "scripts", "ci", "workspace-node.mjs"),
+    join(dir, "scripts", "ci", "workspace-node.mjs"),
+  );
   for (const script of [preflight, launcher]) {
     copyFileSync(
       join(root, "scripts", "dev", script),
@@ -318,3 +339,42 @@ test("root dev starts Turbo without a proxy when PORTLESS=0", (t) => {
   assert.deepEqual(result.calls, appCalls(appDir, siblingDir, null));
   assert.match(result.stderr, /portless_proxy_preflight_disabled/);
 });
+
+for (const { signal, group } of [
+  { signal: "SIGTERM", group: false },
+  { signal: "SIGINT", group: true },
+]) {
+  test(
+    `root dev waits for Turbo after ${group ? "group" : "PID-directed"} ${signal}`,
+    {
+      skip: process.platform === "win32" && "needs POSIX signals",
+      timeout: 5000,
+    },
+    async (t) => {
+      const { dir } = fixture(t);
+      writeFileSync(
+        join(dir, "node_modules", "turbo", "cli.mjs"),
+        signalCountingTurbo,
+      );
+      const { child, done } = spawnProcessGroup(
+        t,
+        process.execPath,
+        [join(dir, "scripts", "dev", launcher), "--filter=web"],
+        { cwd: dir, env: { ...process.env, PORTLESS: "0" } },
+      );
+      const lines = createInterface({ input: child.stdout });
+      const options = { signal: t.signal };
+      assert.deepEqual(await once(lines, "line", options), ["ready"]);
+
+      process.kill(group ? -child.pid : child.pid, signal);
+      assert.deepEqual(await once(lines, "line", options), [signal]);
+      assert.equal(child.exitCode, null);
+      assert.equal(child.signalCode, null);
+
+      child.stdin.end();
+      const result = await done;
+      assert.equal(result.status, 42, result.stderr);
+      assert.equal(result.stdout, `ready\n${signal}\n`);
+    },
+  );
+}

@@ -200,6 +200,31 @@ write_notices() (
   mv -- "$work/THIRD-PARTY-LICENSES.txt" "$out/THIRD-PARTY-LICENSES.txt"
 )
 
+# The host executable must print the planned version with zero or one LF.
+# Keep stdout in a file because Bash command substitution removes trailing LFs
+# and cannot store NUL bytes.
+check_host_version() (
+  local executable="$1" version="$2" work status=0
+  work="$(mktemp -d "${TMPDIR:-/tmp}/release-version.XXXXXXXX")"
+  trap 'rm -rf -- "$work"' EXIT
+
+  "$executable" version < /dev/null 2> "$work/stderr" > "$work/stdout" || status=$?
+  if (( status != 0 )); then
+    echo "::error::$executable version exited with status $status (standard error: $(tr '\n' ' ' < "$work/stderr")), expected status 0 with version $version." >&2
+    exit 1
+  fi
+
+  printf '%s' "$version" > "$work/expected"
+  if cmp -s "$work/stdout" "$work/expected"; then
+    return 0
+  fi
+  printf '\n' >> "$work/expected"
+  if ! cmp -s "$work/stdout" "$work/expected"; then
+    echo "::error::$executable version must print exactly $version on standard output with at most one trailing LF." >&2
+    exit 1
+  fi
+)
+
 build() {
   local mode="$1" out="$2"
   require_binaries
@@ -207,8 +232,7 @@ build() {
     cross | cgo) ;;
     *) usage ;;
   esac
-  local name version dir binary platform asset target ldflags variable printed
-  local version_error version_status
+  local name version dir binary platform asset target ldflags variable
   local host filter
   host="$(go env GOHOSTOS < /dev/null)-$(go env GOHOSTARCH < /dev/null)"
   # jq filters of platforms_of; `$is_cgo` is a jq variable.
@@ -255,25 +279,9 @@ build() {
       GOOS="${platform%-*}" GOARCH="${platform#*-}" CGO_ENABLED="$([[ "$mode" == cgo ]] && echo 1 || echo 0)" \
         go build -trimpath -buildvcs=false -ldflags "$ldflags" -o "$target/$asset" "./$dir" < /dev/null
       # `-trimpath` keeps `-ldflags` out of the build information, so run
-      # the executable of the host platform: a binary with a version
-      # variable prints exactly the version with its `version` command and
-      # exits with 0. Standard output must equal the version (a trailing
-      # newline aside), so `11.2.3` does not pass for `1.2.3`; standard
-      # error is only a diagnostic.
+      # the executable of the host platform to check its version.
       if [[ -n "$variable" && "$platform" == "$host" ]]; then
-        version_error="$(mktemp)"
-        version_status=0
-        printed="$("$target/$asset" version < /dev/null 2> "$version_error")" || version_status=$?
-        if (( version_status != 0 )); then
-          echo "::error::$target/$asset version exited with status $version_status (printed ${printed:-nothing}, standard error: $(tr '\n' ' ' < "$version_error")), not 0 with the version $version." >&2
-          rm -f "$version_error"
-          exit 1
-        fi
-        rm -f "$version_error"
-        if [[ "$printed" != "$version" ]]; then
-          echo "::error::$target/$asset version printed ${printed:-nothing}, not the version $version." >&2
-          exit 1
-        fi
+        check_host_version "$target/$asset" "$version"
       fi
       echo "::endgroup::"
       echo "- $name@$version: \`$asset\` ($(sha256_line "$target/$asset" | cut -d ' ' -f 1))" >> "$summary"

@@ -24,7 +24,7 @@ import {
 import { toast } from "delino-ui/toast";
 import { invalidateServices, POLL_INTERVAL_MS } from "./api.ts";
 import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
-import { renderConsole } from "./test-support.tsx";
+import { TEST_SETUP_MS, renderConsole } from "./test-support.tsx";
 
 /** The longest wait for one condition; a loaded CI runner needs more than one second. */
 const WAIT = { timeout: 10_000 };
@@ -103,161 +103,187 @@ async function showMoreThatFails(
 
 describe("sandboxes page when a Show more request fails", () => {
   for (const settling of [SandboxState.CREATING, SandboxState.DELETING]) {
-    test(`pauses polling while a ${SandboxState[settling]} row has a continuation error`, async () => {
-      rs.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
-      const state = await showMoreThatFails(Code.Internal, settling);
+    test(
+      `pauses polling while a ${SandboxState[settling]} row has a continuation error`,
+      async () => {
+        rs.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+        const state = await showMoreThatFails(Code.Internal, settling);
 
-      await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
-      const failedToken = state.tokens[1];
-      expect(failedToken).toBeTruthy();
-      await act(async () => {
-        rs.advanceTimersByTime(2 * POLL_INTERVAL_MS);
-      });
-      expect(state.tokens).toEqual(["", failedToken]);
-      expect(notices()[0]?.textContent).toContain(FAILED_TEXT);
-      expect(notices()[0]?.textContent).not.toContain("refresh");
-      expect(rows()).toHaveLength(50);
+        await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
+        const failedToken = state.tokens[1];
+        expect(failedToken).toBeTruthy();
+        await act(async () => {
+          rs.advanceTimersByTime(2 * POLL_INTERVAL_MS);
+        });
+        expect(state.tokens).toEqual(["", failedToken]);
+        expect(notices()[0]?.textContent).toContain(FAILED_TEXT);
+        expect(notices()[0]?.textContent).not.toContain("refresh");
+        expect(rows()).toHaveLength(50);
 
-      state.failLater = false;
-      const retry = screen.getByRole("button", { name: "Try again" });
-      const more = screen.getByRole("button", { name: "Show more" });
-      await act(async () => {
-        fireEvent.click(retry);
-        fireEvent.click(retry);
-        fireEvent.click(more);
-      });
-      await waitFor(() => expect(rows()).toHaveLength(51), WAIT);
-      expect(notices()).toHaveLength(0);
-      expect(state.tokens).toEqual(["", failedToken, failedToken]);
-      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+        state.failLater = false;
+        const retry = screen.getByRole("button", { name: "Try again" });
+        const more = screen.getByRole("button", { name: "Show more" });
+        await act(async () => {
+          fireEvent.click(retry);
+          fireEvent.click(retry);
+          fireEvent.click(more);
+        });
+        await waitFor(() => expect(rows()).toHaveLength(51), WAIT);
+        expect(notices()).toHaveLength(0);
+        expect(state.tokens).toEqual(["", failedToken, failedToken]);
+        expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
 
-      state.firstRowState = SandboxState.RUNNING;
-      await act(async () => {
-        rs.advanceTimersByTime(POLL_INTERVAL_MS);
-      });
-      const afterPoll = ["", failedToken, failedToken, "", failedToken];
-      expect(state.tokens).toEqual(afterPoll);
-      await waitFor(
-        () => expect(rows()[0]?.textContent).toContain("Running"),
-        WAIT,
-      );
-      await act(async () => {
-        rs.advanceTimersByTime(POLL_INTERVAL_MS);
-      });
-      expect(state.tokens).toEqual(afterPoll);
-      expect(rows()).toHaveLength(51);
-    });
+        state.firstRowState = SandboxState.RUNNING;
+        await act(async () => {
+          rs.advanceTimersByTime(POLL_INTERVAL_MS);
+        });
+        const afterPoll = ["", failedToken, failedToken, "", failedToken];
+        expect(state.tokens).toEqual(afterPoll);
+        await waitFor(
+          () => expect(rows()[0]?.textContent).toContain("Running"),
+          WAIT,
+        );
+        await act(async () => {
+          rs.advanceTimersByTime(POLL_INTERVAL_MS);
+        });
+        expect(state.tokens).toEqual(afterPoll);
+        expect(rows()).toHaveLength(51);
+      },
+      4 * WAIT.timeout + TEST_SETUP_MS,
+    );
   }
 
-  test("a failed retry keeps the error and the rows", async () => {
-    const state = await showMoreThatFails();
-    await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-    await waitFor(() => expect(state.tokens).toHaveLength(3), WAIT);
-    await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
-    expect(notices()[0]?.textContent).toContain(FAILED_TEXT);
-    expect(rows()).toHaveLength(50);
-    expect(state.tokens[2]).toBe(state.tokens[1]);
-  });
+  test(
+    "a failed retry keeps the error and the rows",
+    async () => {
+      const state = await showMoreThatFails();
+      await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      });
+      await waitFor(() => expect(state.tokens).toHaveLength(3), WAIT);
+      await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
+      expect(notices()[0]?.textContent).toContain(FAILED_TEXT);
+      expect(rows()).toHaveLength(50);
+      expect(state.tokens[2]).toBe(state.tokens[1]);
+    },
+    4 * WAIT.timeout + TEST_SETUP_MS,
+  );
 
   for (const [code, message] of [
     [Code.NotFound, "It was not found, or you no longer have access to it."],
     [Code.PermissionDenied, "You do not have permission to do this."],
     [Code.Unauthenticated, "Your session ended. Sign in again."],
   ] as const) {
-    test(`hides the list and Show more after ${Code[code]}`, async () => {
-      const state = await showMoreThatFails(code);
-      await screen.findByText(message, {}, WAIT);
-      expect(rows()).toHaveLength(0);
-      expect(notices()).toHaveLength(1);
-      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+    test(
+      `hides the list and Show more after ${Code[code]}`,
+      async () => {
+        const state = await showMoreThatFails(code);
+        await screen.findByText(message, {}, WAIT);
+        expect(rows()).toHaveLength(0);
+        expect(notices()).toHaveLength(1);
+        expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
 
-      if (code === Code.PermissionDenied) {
-        // The full error offers a list refresh starting at the first page.
-        await act(async () => {
-          fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-        });
-        await waitFor(() => expect(rows()).toHaveLength(50), WAIT);
-        const failedToken = state.tokens[1];
-        expect(failedToken).toBeTruthy();
-        expect(state.tokens).toEqual(["", failedToken, ""]);
-      } else {
-        expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
-      }
-      if (code === Code.Unauthenticated) {
-        expect(
-          screen.getByRole("button", { name: "Sign in with Delino" }),
-        ).toBeTruthy();
-      }
-    });
+        if (code === Code.PermissionDenied) {
+          // The full error offers a list refresh starting at the first page.
+          await act(async () => {
+            fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+          });
+          await waitFor(() => expect(rows()).toHaveLength(50), WAIT);
+          const failedToken = state.tokens[1];
+          expect(failedToken).toBeTruthy();
+          expect(state.tokens).toEqual(["", failedToken, ""]);
+        } else {
+          expect(
+            screen.queryByRole("button", { name: "Try again" }),
+          ).toBeNull();
+        }
+        if (code === Code.Unauthenticated) {
+          expect(
+            screen.getByRole("button", { name: "Sign in with Delino" }),
+          ).toBeTruthy();
+        }
+      },
+      (code === Code.PermissionDenied ? 3 : 2) * WAIT.timeout + TEST_SETUP_MS,
+    );
   }
 });
 
 describe("sandboxes page when the first page fails", () => {
-  test("shows the initial error and its retry reads the first page again", async () => {
-    const { transport, state } = failingTransport();
-    state.failFirst = true;
-    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
-    await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
-    expect(notices()[0]?.textContent).toContain(FAILED_TEXT);
-    expect(rows()).toHaveLength(0);
-    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
-
-    state.failFirst = false;
-    const before = state.tokens.length;
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-    await screen.findByRole("button", { name: "Show more" }, WAIT);
-    expect(rows()).toHaveLength(50);
-    expect(state.tokens.slice(before)).toEqual([""]);
-  });
-});
-
-describe("sandboxes page when a list refresh fails", () => {
-  for (const code of [Code.PermissionDenied, Code.Internal]) {
-    test(`handles the loaded list and Show more after ${Code[code]}`, async () => {
-      const queryClient = new QueryClient({
-        defaultOptions: { queries: { retry: false } },
-      });
+  test(
+    "shows the initial error and its retry reads the first page again",
+    async () => {
       const { transport, state } = failingTransport();
-      renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
-        queryClient,
-        transport,
-      });
-      await screen.findByRole("button", { name: "Show more" }, WAIT);
-      expect(rows()).toHaveLength(50);
-      expect(state.tokens).toEqual([""]);
-
       state.failFirst = true;
-      state.code = code;
-      await act(async () => {
-        await invalidateServices(queryClient, SandboxService);
-      });
+      renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
       await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
-      expect(state.tokens).toEqual(["", ""]);
-
-      if (code === Code.Internal) {
-        expect(notices()[0]?.textContent).toContain("The last refresh failed");
-        expect(rows()).toHaveLength(50);
-        expect(screen.getByRole("button", { name: "Show more" })).toBeTruthy();
-        return;
-      }
-
-      expect(notices()[0]?.textContent).toContain(
-        "You do not have permission to do this.",
-      );
+      expect(notices()[0]?.textContent).toContain(FAILED_TEXT);
       expect(rows()).toHaveLength(0);
       expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+
       state.failFirst = false;
+      const before = state.tokens.length;
       await act(async () => {
         fireEvent.click(screen.getByRole("button", { name: "Try again" }));
       });
       await screen.findByRole("button", { name: "Show more" }, WAIT);
       expect(rows()).toHaveLength(50);
-      expect(state.tokens).toEqual(["", "", ""]);
-    });
+      expect(state.tokens.slice(before)).toEqual([""]);
+    },
+    2 * WAIT.timeout + TEST_SETUP_MS,
+  );
+});
+
+describe("sandboxes page when a list refresh fails", () => {
+  for (const code of [Code.PermissionDenied, Code.Internal]) {
+    test(
+      `handles the loaded list and Show more after ${Code[code]}`,
+      async () => {
+        const queryClient = new QueryClient({
+          defaultOptions: { queries: { retry: false } },
+        });
+        const { transport, state } = failingTransport();
+        renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+          queryClient,
+          transport,
+        });
+        await screen.findByRole("button", { name: "Show more" }, WAIT);
+        expect(rows()).toHaveLength(50);
+        expect(state.tokens).toEqual([""]);
+
+        state.failFirst = true;
+        state.code = code;
+        await act(async () => {
+          await invalidateServices(queryClient, SandboxService);
+        });
+        await waitFor(() => expect(notices()).toHaveLength(1), WAIT);
+        expect(state.tokens).toEqual(["", ""]);
+
+        if (code === Code.Internal) {
+          expect(notices()[0]?.textContent).toContain(
+            "The last refresh failed",
+          );
+          expect(rows()).toHaveLength(50);
+          expect(
+            screen.getByRole("button", { name: "Show more" }),
+          ).toBeTruthy();
+          return;
+        }
+
+        expect(notices()[0]?.textContent).toContain(
+          "You do not have permission to do this.",
+        );
+        expect(rows()).toHaveLength(0);
+        expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+        state.failFirst = false;
+        await act(async () => {
+          fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+        });
+        await screen.findByRole("button", { name: "Show more" }, WAIT);
+        expect(rows()).toHaveLength(50);
+        expect(state.tokens).toEqual(["", "", ""]);
+      },
+      (code === Code.Internal ? 2 : 3) * WAIT.timeout + TEST_SETUP_MS,
+    );
   }
 });

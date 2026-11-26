@@ -11,6 +11,7 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { repositoryRoot } from "./format-changed.mjs";
+import { isWorkspaceCli } from "./workspace-node.mjs";
 
 // The workflow events that CI.yml runs on.
 export const ComparisonEvent = Object.freeze({
@@ -206,7 +207,7 @@ export function main(env = process.env, cwd = process.cwd()) {
 
 // A resolution failure must reach the log as one parseable record, like the
 // planner's. Exit code 2 tells a handled failure apart from a crash (1).
-if (import.meta.main) {
+if (isWorkspaceCli(import.meta)) {
   try {
     main();
   } catch (error) {

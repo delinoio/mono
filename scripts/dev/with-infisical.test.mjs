@@ -115,6 +115,11 @@ function fixture(t, { config = null, cli = true, env = {} } = {}) {
   mkdirSync(join(root, "scripts", "dev"), { recursive: true });
   const launcher = join(root, "scripts", "dev", "with-infisical.mjs");
   copyFileSync(launcherSource, launcher);
+  mkdirSync(join(root, "scripts", "ci"), { recursive: true });
+  copyFileSync(
+    new URL("../ci/workspace-node.mjs", import.meta.url),
+    join(root, "scripts", "ci", "workspace-node.mjs"),
+  );
   if (config) writeFileSync(join(root, config), "version: 1\n");
   const bin = join(root, "bin");
   mkdirSync(bin);

@@ -26,6 +26,7 @@ import {
   readWorkspacePackages,
   relativePath,
 } from "./workspace-packages.mjs";
+import { isWorkspaceCli } from "./workspace-node.mjs";
 
 export { readWorkspacePackages };
 
@@ -77,6 +78,9 @@ const cgoPlatforms = new Set([ReleasePlatform.DarwinArm64]);
 
 // The executable name, which also names the release assets.
 const binaryName = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+
+// GitHub must preserve license asset names so they match SHA256SUMS.
+const licenseAssetName = /^[A-Za-z0-9_+@-]+(?:\.[A-Za-z0-9_+@-]+)*$/;
 
 // The release assets that the workflow adds to every binary release. A
 // license file must not have one of these names.
@@ -178,9 +182,9 @@ function binaryFields(name, deploy, dir) {
   ]);
   for (const [index, file] of licenseFiles.entries()) {
     const base = posix.basename(file);
-    if (base.includes("#")) {
+    if (!licenseAssetName.test(base)) {
       throw new DeployPlanError(
-        `${name}: deploy.licenseFiles path ${JSON.stringify(rawLicenses[index])} has # in its basename`,
+        `${name}: deploy.licenseFiles path ${JSON.stringify(rawLicenses[index])} has an invalid release asset basename`,
       );
     }
     if (taken.has(base)) {
@@ -945,7 +949,7 @@ export function main({
   return result;
 }
 
-if (import.meta.main) {
+if (isWorkspaceCli(import.meta)) {
   try {
     main();
   } catch (error) {

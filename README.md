@@ -44,7 +44,7 @@ Imported skills keep their original licenses and notices. See [NOTICE](NOTICE).
 
 ### Requirements
 
-- Node.js 24
+- Node.js 24.8.0 or newer. If you use nvm, run `nvm install` and `nvm use` from the repository root to select the release pinned in `.nvmrc`.
 - pnpm 10.26.2
 - The Go toolchain that the root `go.mod` selects (Go 1.26.1 or later)
 

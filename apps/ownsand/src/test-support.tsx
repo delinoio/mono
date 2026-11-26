@@ -11,6 +11,12 @@ import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { createMockTransport, MOCK_USER } from "./mock/mock-api.ts";
 
+/** Testing Library's timeout when a query or wait has no timeout option. */
+export const DEFAULT_WAIT_MS = 1_000;
+
+/** Add this allowance for setup and actions to the longest sequence of waits. */
+export const TEST_SETUP_MS = 5_000;
+
 export const testConfig: ConsoleConfig = {
   apiOrigin: "https://api.test",
   authMode: AuthMode.Mock,

@@ -22,6 +22,8 @@ import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
 import {
   fullListRefresh,
   holdingTransport,
+  DEFAULT_WAIT_MS,
+  TEST_SETUP_MS,
   renderConsole,
   settle,
 } from "./test-support.tsx";
@@ -56,6 +58,8 @@ describe("device option label", () => {
   });
 });
 
+const DEVICE_OPTION_WAIT_MS = 10_000;
+
 describe("create sandbox device select", () => {
   async function openForm(transport: Transport, queryClient?: QueryClient) {
     renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
@@ -78,7 +82,7 @@ describe("create sandbox device select", () => {
     const option = await screen.findByRole(
       "option",
       { name },
-      { timeout: 10_000 },
+      { timeout: DEVICE_OPTION_WAIT_MS },
     );
     await act(async () => {
       fireEvent.click(option);
@@ -116,35 +120,39 @@ describe("create sandbox device select", () => {
     expect(trigger.textContent).toContain("studio-mac (Offline)");
   });
 
-  test("sends the ID of a device from the second page for explicit placement", async () => {
-    const organizationId = MOCK_IDS.acme;
-    const mock = createMockTransport({ extraDevices: 199 });
-    const client = createClient(DeviceService, mock);
-    const first = await client.listDevices({ organizationId, pageSize: 200 });
-    const { devices } = await client.listDevices({
-      organizationId,
-      pageSize: 200,
-      pageToken: first.nextPageToken,
-    });
-    const requests: CreateSandboxRequest[] = [];
-    const transport: Transport = {
-      ...mock,
-      unary(method, ...rest) {
-        if (method.name === "CreateSandbox") {
-          requests.push(rest[3] as CreateSandboxRequest);
-        }
-        return mock.unary(method, ...rest);
-      },
-    };
+  test(
+    "sends the ID of a device from the second page for explicit placement",
+    async () => {
+      const organizationId = MOCK_IDS.acme;
+      const mock = createMockTransport({ extraDevices: 199 });
+      const client = createClient(DeviceService, mock);
+      const first = await client.listDevices({ organizationId, pageSize: 200 });
+      const { devices } = await client.listDevices({
+        organizationId,
+        pageSize: 200,
+        pageToken: first.nextPageToken,
+      });
+      const requests: CreateSandboxRequest[] = [];
+      const transport: Transport = {
+        ...mock,
+        unary(method, ...rest) {
+          if (method.name === "CreateSandbox") {
+            requests.push(rest[3] as CreateSandboxRequest);
+          }
+          return mock.unary(method, ...rest);
+        },
+      };
 
-    const dialog = await openForm(transport);
-    await chooseDevice(dialog, "Device 201 (Online)");
-    await create(dialog);
+      const dialog = await openForm(transport);
+      await chooseDevice(dialog, "Device 201 (Online)");
+      await create(dialog);
 
-    expect(requests.map((request) => request.placement?.deviceId)).toEqual([
-      devices[0]!.deviceId,
-    ]);
-  });
+      expect(requests.map((request) => request.placement?.deviceId)).toEqual([
+        devices[0]!.deviceId,
+      ]);
+    },
+    DEVICE_OPTION_WAIT_MS + 2 * DEFAULT_WAIT_MS + TEST_SETUP_MS,
+  );
 
   function deviceFixture(mock = createMockTransport()) {
     let omitSelected = false;
@@ -325,39 +333,43 @@ describe("create sandbox device select", () => {
     expect(fixture.requests[0]?.placement?.deviceId).toBe(MOCK_IDS.buildBox);
   });
 
-  test("locks the original request after Unavailable for a selected offline device", async () => {
-    const mock = createMockTransport();
-    const requests: CreateSandboxRequest[] = [];
-    const transport: Transport = {
-      ...mock,
-      unary(method, ...rest) {
-        if (method.name === "CreateSandbox") {
-          requests.push(rest[3] as CreateSandboxRequest);
-        }
-        return mock.unary(method, ...rest);
-      },
-    };
-    const dialog = await openForm(transport);
-    await chooseDevice(dialog, "studio-mac (Offline)");
-    await create(dialog);
-    expect(
-      await within(dialog).findByText(/The sandbox may have been created/),
-    ).toBeTruthy();
-    const device = within(dialog).getByRole<HTMLButtonElement>("combobox", {
-      name: "Device",
-    });
-    expect(device.textContent).toContain("studio-mac (Offline)");
-    expect(device.disabled).toBe(true);
-    expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}/sandboxes`);
+  test(
+    "locks the original request after Unavailable for a selected offline device",
+    async () => {
+      const mock = createMockTransport();
+      const requests: CreateSandboxRequest[] = [];
+      const transport: Transport = {
+        ...mock,
+        unary(method, ...rest) {
+          if (method.name === "CreateSandbox") {
+            requests.push(rest[3] as CreateSandboxRequest);
+          }
+          return mock.unary(method, ...rest);
+        },
+      };
+      const dialog = await openForm(transport);
+      await chooseDevice(dialog, "studio-mac (Offline)");
+      await create(dialog);
+      expect(
+        await within(dialog).findByText(/The sandbox may have been created/),
+      ).toBeTruthy();
+      const device = within(dialog).getByRole<HTMLButtonElement>("combobox", {
+        name: "Device",
+      });
+      expect(device.textContent).toContain("studio-mac (Offline)");
+      expect(device.disabled).toBe(true);
+      expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}/sandboxes`);
 
-    await act(async () => {
-      fireEvent.click(
-        within(dialog).getByRole("button", {
-          name: "Retry original request",
-        }),
-      );
-    });
-    expect(requests).toEqual([requests[0], requests[0]]);
-    expect(device.disabled).toBe(true);
-  });
+      await act(async () => {
+        fireEvent.click(
+          within(dialog).getByRole("button", {
+            name: "Retry original request",
+          }),
+        );
+      });
+      expect(requests).toEqual([requests[0], requests[0]]);
+      expect(device.disabled).toBe(true);
+    },
+    DEVICE_OPTION_WAIT_MS + 3 * DEFAULT_WAIT_MS + TEST_SETUP_MS,
+  );
 });

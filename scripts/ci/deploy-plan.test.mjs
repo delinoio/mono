@@ -1802,30 +1802,47 @@ function releaseFixture(
   return dir;
 }
 
-test("plan and --check reject # in a binary license basename", async (t) => {
+test("plan and --check validate binary license asset basenames", async (t) => {
   const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
-  for (const file of [
-    "NOTICE",
-    "licenses#upstream/NOTICE",
-    "NOTICE#upstream.txt",
+  for (const { files, message } of [
+    {
+      files: ["NOTICE", "licenses#upstream/LICENSE", "third party/NOTICE.txt"],
+    },
+    { files: ["licenses/License-2_0+UPSTREAM@v1.txt"] },
+    ...[
+      "licenses/NOTICE upstream.txt",
+      "licenses/.license",
+      "licenses/NOTICE.",
+      "licenses/NOTICE..txt",
+      "licenses/NOTICE#upstream.txt",
+      "licenses/LICENßE.txt",
+    ].map((file) => ({
+      files: [file],
+      message: `tool: deploy.licenseFiles path ${JSON.stringify(file)} has an invalid release asset basename`,
+    })),
+    {
+      files: ["third party/NOTICE.txt", "licenses/NOTICE.txt"],
+      message:
+        "tool: deploy.licenseFiles has a second release asset named NOTICE.txt",
+    },
   ]) {
-    await t.test(file, (t) => {
+    await t.test(files.join(", "), (t) => {
       const dir = releaseFixture(t, {
         entitlements: null,
-        licenseFiles: [file],
+        licenseFiles: files,
       });
-      const path = join(dir, file);
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, "license\n");
+      for (const file of files) {
+        const path = join(dir, file);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, "license\n");
+      }
       const makePlan = () =>
         plan(status(["tool", "1.2.3"]), readWorkspacePackages(dir));
       const run = spawnSync(process.execPath, [cli, "--check", dir], {
         encoding: "utf8",
       });
 
-      if (file === "NOTICE#upstream.txt") {
-        const message =
-          'tool: deploy.licenseFiles path "NOTICE#upstream.txt" has # in its basename';
+      if (message) {
         assert.throws(makePlan, (error) => {
           assert.ok(error instanceof DeployPlanError);
           assert.equal(error.message, message);
@@ -1837,7 +1854,7 @@ test("plan and --check reject # in a binary license basename", async (t) => {
           message,
         });
       } else {
-        assert.deepEqual(makePlan().binaries[0].licenseFiles, [file]);
+        assert.deepEqual(makePlan().binaries[0].licenseFiles, files);
         assert.equal(run.status, 0, run.stderr);
         assert.equal(JSON.parse(run.stdout.trim()).event, "deploy_plan_check");
       }
