@@ -3674,14 +3674,17 @@ describe("leaving and deleting an organization", () => {
       queryClient: createQueryClient(),
     });
     const watcher = watchNotice();
-    await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Leave organization" }),
-      );
-    });
-    await confirmIn("Leave organization");
-    await settle(400);
-    watcher.stop();
+    try {
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Leave organization" }),
+        );
+      });
+      await confirmIn("Leave organization");
+      await settle(400);
+    } finally {
+      watcher.stop();
+    }
     expect(watcher.seen.notice).toBe(false);
     expect(window.location.pathname).toBe("/");
     expect(
@@ -3698,14 +3701,17 @@ describe("leaving and deleting an organization", () => {
       queryClient: createQueryClient(),
     });
     const watcher = watchNotice();
-    await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Leave organization" }),
-      );
-    });
-    await confirmIn("Leave organization");
-    await settle(400);
-    watcher.stop();
+    try {
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Leave organization" }),
+        );
+      });
+      await confirmIn("Leave organization");
+      await settle(400);
+    } finally {
+      watcher.stop();
+    }
     expect(watcher.seen.notice).toBe(false);
     expect(window.location.pathname).toBe("/");
   });
@@ -3716,14 +3722,17 @@ describe("leaving and deleting an organization", () => {
       queryClient: createQueryClient(),
     });
     const watcher = watchNotice();
-    await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Delete organization" }),
-      );
-    });
-    await confirmIn("Delete organization");
-    await settle(400);
-    watcher.stop();
+    try {
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Delete organization" }),
+        );
+      });
+      await confirmIn("Delete organization");
+      await settle(400);
+    } finally {
+      watcher.stop();
+    }
     expect(watcher.seen.notice).toBe(false);
     expect(window.location.pathname).toBe("/");
     expect(
