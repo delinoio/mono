@@ -281,7 +281,23 @@ func TestExecNoTimeoutWhenDescendantHoldsPipeAfterExit(t *testing.T) {
 
 func TestExecRunsIndependentlyAndAttach(t *testing.T) {
 	h := newHarness(t, nil)
-	req := execReq(t, "/bin/sh", "-c", "printf hello; sleep 0.3; printf world")
+	markerPath := filepath.Join(t.TempDir(), "starts")
+	req := execReq(t, "/bin/sh", "-c", `printf 'started\n' >> "$EXEC_MARKER" || exit 1
+printf hello
+sleep 0.3
+printf world`)
+	req.Env = map[string]string{"EXEC_MARKER": markerPath}
+	requireOneStart := func() {
+		t.Helper()
+		marker, err := os.ReadFile(markerPath)
+		if err != nil {
+			t.Fatalf("read exec start marker: %v", err)
+		}
+		if string(marker) != "started\n" {
+			t.Fatalf("exec start marker %q, want one start", marker)
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	s := h.open(ctx)
 	s.send(1, req)
@@ -302,12 +318,18 @@ func TestExecRunsIndependentlyAndAttach(t *testing.T) {
 	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
 		t.Fatalf("attach events %v: %v", evs, err)
 	}
+	requireOneStart()
+
 	// A repeated exec request attaches from offset 0 and does not run the
 	// command again.
 	evs = h.runExec(req)
 	if stdout, _ := outputs(evs); stdout != "helloworld" {
 		t.Fatalf("repeated exec stdout %q", stdout)
 	}
+	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+		t.Fatalf("repeated exec: %v", err)
+	}
+	requireOneStart()
 
 	s2.send(6, &ownsandv1.AttachExecRequest{SandboxId: testSandbox, ExecId: newID(t)})
 	if f := s2.recv(); f.GetStreamId() != 6 || f.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
