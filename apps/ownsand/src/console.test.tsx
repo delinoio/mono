@@ -68,6 +68,13 @@ import {
   holdingTransport as holdMockTransport,
 } from "./test-support.tsx";
 import {
+  FIRST_KEY_ID,
+  KEY_PREFIX,
+  OTHER_KEY_PREFIX,
+  SECOND_KEY_ID,
+  apiKeyCollisionTransport,
+} from "../e2e/api-key-collision-fixture.ts";
+import {
   FIXTURE_ORGANIZATION_ID,
   FIXTURE_ORGANIZATION_NAME,
   MIXED_CASE_ORGANIZATION_ID,
@@ -863,6 +870,120 @@ describe("dialog focus return", () => {
     await escape();
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(opener);
+  });
+});
+
+describe("API key revoke identity", () => {
+  const baseLabel = `Revoke API key ci-key (${KEY_PREFIX})`;
+  const collidingLabel = (id: string) => `${baseLabel}, key ID ${id}`;
+
+  function renderKeys(options?: {
+    secondPrefix?: string;
+    beforeContinuation?: () => Promise<void>;
+  }) {
+    const requests: { organizationId: string; apiKeyId: string }[] = [];
+    const transport = apiKeyCollisionTransport(createMockTransport(), {
+      ...options,
+      onRevoke: ({ organizationId, apiKeyId }) =>
+        requests.push({ organizationId, apiKeyId }),
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    return requests;
+  }
+
+  async function open(button: HTMLElement) {
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    return screen.getByRole("alertdialog", { name: "Revoke ci-key?" });
+  }
+
+  async function choose(dialog: HTMLElement, name: "Cancel" | "Revoke key") {
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name }));
+    });
+  }
+
+  test("identifies same-name, same-prefix keys by full ID and revokes only the confirmed key", async () => {
+    const requests = renderKeys();
+    const first = await screen.findByRole("button", {
+      name: collidingLabel(FIRST_KEY_ID),
+    });
+    const second = screen.getByRole("button", {
+      name: collidingLabel(SECOND_KEY_ID),
+    });
+    expect(first.textContent).toBe("Revoke");
+    expect(second.textContent).toBe("Revoke");
+    expect(first.closest("li")?.textContent).toContain(FIRST_KEY_ID);
+    expect(second.closest("li")?.textContent).toContain(SECOND_KEY_ID);
+
+    const firstDialog = await open(first);
+    expect(within(firstDialog).getByText(FIRST_KEY_ID)).toBeTruthy();
+    expect(within(firstDialog).queryByText(SECOND_KEY_ID)).toBeNull();
+    await choose(firstDialog, "Cancel");
+    expect(requests).toEqual([]);
+
+    const secondDialog = await open(second);
+    expect(within(secondDialog).getByText(SECOND_KEY_ID)).toBeTruthy();
+    expect(within(secondDialog).queryByText(FIRST_KEY_ID)).toBeNull();
+    await choose(secondDialog, "Revoke key");
+    await screen.findByText("ci-key · Revoked");
+    expect(requests).toEqual([
+      { organizationId: MOCK_IDS.acme, apiKeyId: SECOND_KEY_ID },
+    ]);
+    expect(second.closest("li")).toBeNull();
+    expect(first.closest("li")?.textContent).toContain("ci-key · Active");
+    expect(screen.getByRole("button", { name: baseLabel })).toBe(first);
+  });
+
+  test("updates the open confirmation when a continuation introduces a collision", async () => {
+    let releaseContinuation!: () => void;
+    const continuation = new Promise<void>((resolve) => {
+      releaseContinuation = resolve;
+    });
+    const requests = renderKeys({ beforeContinuation: () => continuation });
+    const first = await screen.findByRole("button", { name: baseLabel });
+    const dialog = await open(first);
+    expect(within(dialog).getByText(KEY_PREFIX)).toBeTruthy();
+    expect(within(dialog).queryByText(FIRST_KEY_ID)).toBeNull();
+
+    await act(async () => releaseContinuation());
+    expect(await within(dialog).findByText(FIRST_KEY_ID)).toBeTruthy();
+    expect(within(dialog).queryByText(SECOND_KEY_ID)).toBeNull();
+    const buttons = screen.getAllByRole("button", { hidden: true });
+    expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual(
+      expect.arrayContaining([
+        collidingLabel(FIRST_KEY_ID),
+        collidingLabel(SECOND_KEY_ID),
+      ]),
+    );
+
+    await choose(dialog, "Revoke key");
+    await screen.findByText("ci-key · Revoked");
+    expect(requests).toEqual([
+      { organizationId: MOCK_IDS.acme, apiKeyId: FIRST_KEY_ID },
+    ]);
+  });
+
+  test("shows each prefix when names match and prefixes differ", async () => {
+    renderKeys({ secondPrefix: OTHER_KEY_PREFIX });
+    const first = await screen.findByRole("button", { name: baseLabel });
+    const second = screen.getByRole("button", {
+      name: `Revoke API key ci-key (${OTHER_KEY_PREFIX})`,
+    });
+    expect(first.closest("li")?.textContent).not.toContain(FIRST_KEY_ID);
+    expect(second.closest("li")?.textContent).not.toContain(SECOND_KEY_ID);
+
+    const firstDialog = await open(first);
+    expect(within(firstDialog).getByText(KEY_PREFIX)).toBeTruthy();
+    expect(within(firstDialog).queryByText(OTHER_KEY_PREFIX)).toBeNull();
+    expect(within(firstDialog).queryByText(FIRST_KEY_ID)).toBeNull();
+    await choose(firstDialog, "Cancel");
+
+    const secondDialog = await open(second);
+    expect(within(secondDialog).getByText(OTHER_KEY_PREFIX)).toBeTruthy();
+    expect(within(secondDialog).queryByText(KEY_PREFIX)).toBeNull();
+    expect(within(secondDialog).queryByText(SECOND_KEY_ID)).toBeNull();
   });
 });
 

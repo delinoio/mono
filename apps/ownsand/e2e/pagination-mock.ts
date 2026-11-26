@@ -37,6 +37,7 @@ import {
   createMockTransport as createBaseMock,
   MOCK_IDS,
 } from "../src/mock/mock-api.ts";
+import { apiKeyCollisionTransport } from "./api-key-collision-fixture.ts";
 import { organizationUuidTransport } from "./organization-uuid-fixture.ts";
 import { browserSandboxTransitionMock } from "./sandbox-transition-mock.ts";
 
@@ -181,6 +182,35 @@ export function createMockTransport(): Transport {
       extraTemplates: pageSources ? 200 : 0,
     }),
   );
+  if (sessionStorage.getItem("ownsand-e2e-api-key-collision") === "true") {
+    const continuation = "ownsand-e2e-api-key-continuation";
+    const hold = sessionStorage.getItem(continuation) === "hold";
+    return apiKeyCollisionTransport(mock, {
+      beforeContinuation: hold
+        ? async () => {
+            if (sessionStorage.getItem(continuation) !== "hold") return;
+            await new Promise<void>((resolve) => {
+              window.addEventListener(
+                `${continuation}-release`,
+                () => resolve(),
+                {
+                  once: true,
+                },
+              );
+              sessionStorage.setItem(continuation, "held");
+            });
+          }
+        : undefined,
+      onRevoke({ organizationId, apiKeyId }) {
+        const key = "ownsand-e2e-api-key-revokes";
+        const requests = JSON.parse(sessionStorage.getItem(key) ?? "[]");
+        sessionStorage.setItem(
+          key,
+          JSON.stringify([...requests, { organizationId, apiKeyId }]),
+        );
+      },
+    });
+  }
   const base =
     sessionStorage.getItem("ownsand-e2e-organization-uuid-case") === "true"
       ? organizationUuidTransport(mock)
