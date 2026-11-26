@@ -198,6 +198,34 @@ describe("console configuration", () => {
     );
   });
 
+  test.each([
+    "https://@api.example.test",
+    "https://a\tpi.example.test",
+    "https://a\rpi.example.test",
+    "https://a\npi.example.test",
+  ])("rejects the malformed written authority in %j", (value) => {
+    const options = { production: false };
+    expect(() =>
+      readConsoleConfig({ PUBLIC_API_ORIGIN: value }, options),
+    ).toThrow(
+      new Error(
+        "PUBLIC_API_ORIGIN must use an authority without @, tabs or line breaks",
+      ),
+    );
+    for (const appId of [undefined, "app123"]) {
+      expect(() =>
+        readConsoleConfig(
+          { PUBLIC_LOGTO_ENDPOINT: value, PUBLIC_LOGTO_APP_ID: appId },
+          options,
+        ),
+      ).toThrow(
+        new Error(
+          "PUBLIC_LOGTO_ENDPOINT must use an authority without @, tabs or line breaks",
+        ),
+      );
+    }
+  });
+
   test.each(["", "   ", "\t\n"])(
     "falls back to the default API origin for the blank value %j",
     (value) => {

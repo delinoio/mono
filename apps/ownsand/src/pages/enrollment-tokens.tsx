@@ -71,14 +71,15 @@ export function EnrollmentTokensPage() {
     [list.data],
   );
   const create = useMutation(DeviceService.method.createEnrollmentToken, {
-    onSuccess: async (_, { organizationId: submittedOrganizationId }) => {
-      if (submittedOrganizationId !== undefined) {
-        await cancelUncachedList(
-          queryClient,
-          listOptions(submittedOrganizationId).queryKey,
-        );
+    onSuccess: (_, { organizationId: submittedOrganizationId }) => {
+      if (submittedOrganizationId === undefined) {
+        void refresh();
+        return;
       }
-      return refresh();
+      void cancelUncachedList(
+        queryClient,
+        listOptions(submittedOrganizationId).queryKey,
+      ).then(refresh);
     },
   });
   const revoke = useMutation(DeviceService.method.revokeEnrollmentToken, {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code } from "@connectrpc/connect";
-import { describe, test } from "@e2e-dev/web";
+import { describe, test, type Browser } from "@e2e-dev/web";
 import { expect, type Screen } from "e2e";
 
 // The suite runs the development server with PUBLIC_OWNSAND_MOCK_API=true
@@ -14,6 +14,32 @@ const INVITATION_SECRET = "osi_mock_contoso_invitation";
 // A seeded Acme invitation. The mock user already belongs to Acme, so
 // accepting it fails and leaves the invitation unused.
 const ACME_INVITATION_SECRET = "osi_7f3a_unused";
+
+type ResourceWrite = {
+  resources?: { vcpuCount: number; memoryMib: string; diskGib: string };
+  limits?: { vcpuCount: number };
+};
+
+function trackResourceMutation(
+  browser: Browser,
+  method: "CreateSandbox" | "ReplaceDeviceLimits",
+) {
+  return browser.evaluate((method) => {
+    sessionStorage.setItem("ownsand-e2e-tracked-mutation", method);
+    return true;
+  }, method);
+}
+
+function resourceWrites(browser: Browser) {
+  return browser.evaluate(() => {
+    const calls = sessionStorage.getItem(
+      "ownsand-e2e-resource-mutation-inputs",
+    );
+    return (JSON.parse(calls ?? "[]") as string[]).map(
+      (call) => JSON.parse(call) as ResourceWrite,
+    );
+  });
+}
 
 async function failOnWindowFocus({ key, code }: { key: string; code: Code }) {
   sessionStorage.setItem(key, String(code));
@@ -266,6 +292,82 @@ describe("sandboxes", () => {
     ).toBeVisible();
   });
 
+  for (const [field, name, fraction, correction, expected, message] of [
+    [
+      "vCPUs",
+      "vcpuCount",
+      "2.5",
+      "3",
+      3,
+      "Enter a whole number of vCPUs from 1 to 2147483647.",
+    ],
+    [
+      "Memory (MiB)",
+      "memoryMib",
+      "1000.5",
+      "1000",
+      "1000",
+      "Enter a whole number of MiB from 1 to 9007199254740991.",
+    ],
+    [
+      "Disk (GiB)",
+      "diskGib",
+      "20.5",
+      "21",
+      "21",
+      "Enter a whole number of GiB from 1 to 8589934591.",
+    ],
+  ] as const) {
+    test(`rejects fractional sandbox ${field} on Enter and after blur`, async ({
+      app,
+      screen,
+      browser,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(`/orgs/${ACME}/sandboxes`);
+      await screen.getByRole("button", "Create sandbox").tap();
+
+      const dialog = screen.getByRole("dialog", "Create a sandbox");
+      const input = dialog.getByLabel(field);
+      await trackResourceMutation(browser, "CreateSandbox");
+      await input.fill(fraction);
+      await browser.keyboard.press("Enter");
+      await expect(input).toHaveAttribute("aria-invalid", "true");
+      await expect(dialog.getByText(message)).toBeVisible();
+      expect(await resourceWrites(browser)).toHaveLength(0);
+
+      const secondFraction = `${fraction}5`;
+      await input.fill(secondFraction);
+      await browser.keyboard.press("Tab");
+      await dialog.getByRole("button", "Create").tap();
+      await expect(dialog).toBeVisible();
+      await expect(input).toHaveValue(secondFraction);
+      await expect(dialog.getByText(message)).toBeVisible();
+      expect(await resourceWrites(browser)).toHaveLength(0);
+      await app.screenshot(`sandbox-fraction-${name}`);
+
+      await input.fill(correction);
+      if (name === "memoryMib") {
+        await browser.keyboard.press("Tab");
+        await expect(input).toHaveValue("1,000");
+        await input.tap();
+        await browser.keyboard.press("ArrowUp");
+        await expect(input).toHaveValue("1,001");
+        await input.fill("1000");
+        await browser.keyboard.press("Shift+ArrowUp");
+        await expect(input).toHaveValue("1,256");
+        await input.fill(correction);
+      }
+      await dialog.getByRole("button", "Create").tap();
+      await expect(dialog).toBeHidden();
+      await expect(browser).toHaveURL(/\/sandboxes\/[0-9a-f-]+$/);
+      const writes = await resourceWrites(browser);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]?.resources?.[name]).toBe(expected);
+    });
+  }
+
   test("pauses and resumes a sandbox", async ({ app, screen }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
@@ -346,6 +448,43 @@ describe("devices", () => {
     await expect(screen.getByRole("button", "Remove device")).toBeVisible();
   });
 
+  test("rejects a fractional device vCPU limit on Enter and after blur", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/devices/${BUILD_BOX}`);
+
+    const input = screen.getByLabel("vCPU limit");
+    const message = "vCPU limit must be a whole number from 0 to 2147483647.";
+    await trackResourceMutation(browser, "ReplaceDeviceLimits");
+    await input.fill("2.5");
+    await browser.keyboard.press("Enter");
+    await expect(input).toHaveAttribute("aria-invalid", "true");
+    await expect(screen.getByText(message)).toHaveCount(2);
+    expect(await resourceWrites(browser)).toHaveLength(0);
+
+    await input.fill("0.5");
+    await browser.keyboard.press("Tab");
+    await screen.getByRole("button", "Save limits").tap();
+    await expect(input).toHaveValue("0.5");
+    await expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(await resourceWrites(browser)).toHaveLength(0);
+    await app.screenshot("device-fraction-field-and-toast");
+
+    await input.fill("0");
+    await screen.getByRole("button", "Save limits").tap();
+    await expect(
+      screen.getByText("The device limits are saved."),
+    ).toBeVisible();
+    const writes = await resourceWrites(browser);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.limits?.vcpuCount).toBe(0);
+    await expect(input).toHaveValue("0");
+  });
+
   test("shows saved device limits when returning to the device page", async ({
     app,
     screen,
@@ -396,8 +535,18 @@ describe("devices", () => {
     try {
       await dialog.getByRole("button", "Remove device").tap();
       await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
-      await expect(screen.getByText("studio-mac").first()).toBeVisible();
-      await expect(screen.getByText("build-box-1")).toBeHidden();
+      // The mock API omits a removed device from a list request that sets no
+      // state, like the real API.
+      const deviceList = screen.getByRole("region", "Device list");
+      await expect(
+        deviceList.getByRole("link", "studio-mac", { exact: true }),
+      ).toBeVisible();
+      await expect(
+        deviceList.getByText("Offline", { exact: true }),
+      ).toBeVisible();
+      await expect(
+        deviceList.getByRole("link", "build-box-1", { exact: true }),
+      ).toBeHidden();
       await expect(studioDisk).toBeVisible();
       expect(
         await browser.evaluate(() => ({
@@ -439,35 +588,37 @@ describe("devices", () => {
     await app.open(`/orgs/${ACME}/enrollment-tokens`);
     await screen.getByRole("button", "Create token").tap();
     await screen.getByRole("dialog").getByRole("button", "Create token").tap();
-    await screen.getByRole("button", "Done").tap();
-    await expect(
-      screen.getByRole("dialog", "Your new enrollment token"),
-    ).toBeHidden();
-    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+    const result = screen.getByRole("dialog", "Your new enrollment token");
+    await expect(result).toBeVisible();
+    const prefix = await browser.evaluate(() =>
+      document.querySelector(".secret-value")!.textContent!.slice(0, 8),
+    );
+    expect(prefix).toMatch(/^ose_/);
+    await result.getByRole("button", "Done").tap();
+    await expect(result).toBeHidden();
+    await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
 
-    await screen
-      .getByRole("button", "Revoke enrollment token ose_", { exact: false })
-      .tap();
-    const dialog = screen.getByRole("alertdialog", "Revoke token ose_", {
-      exact: false,
-    });
+    const revoke = screen.getByRole(
+      "button",
+      `Revoke enrollment token ${prefix}`,
+      {
+        exact: true,
+      },
+    );
+    await expect(revoke).toBeVisible();
+    await revoke.tap();
+    const dialog = screen.getByRole("alertdialog", `Revoke token ${prefix}…?`);
     await expect(dialog).toBeVisible();
     await expect(dialog.getByRole("button", "Cancel")).toBeFocused();
-    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
 
     await browser.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
-    await expect(screen.getByText("Not used", { exact: false })).toBeVisible();
+    await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
 
-    await screen
-      .getByRole("button", "Revoke enrollment token ose_", { exact: false })
-      .tap();
-    await screen
-      .getByRole("alertdialog", "Revoke token ose_", { exact: false })
-      .getByRole("button", "Revoke token")
-      .tap();
+    await revoke.tap();
+    await dialog.getByRole("button", "Revoke token").tap();
     await expect(screen.getByText("The token is revoked.")).toBeVisible();
-    await expect(screen.getByText("Not used", { exact: false })).toBeHidden();
+    await expect(revoke).toBeHidden();
   });
 
   test("moves the focus to the page heading after a confirmed removal", async ({
@@ -608,11 +759,24 @@ describe("billing", () => {
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${ACME}/settings`);
 
+    await expect(screen.getByRole("region", "Billing")).toContainText(
+      "Acme Robotics billing",
+    );
     await screen.getByRole("button", "Unlink billing account").tap();
     const confirm = screen.getByRole("alertdialog");
+    await expect(
+      confirm.getByRole("heading", "Unlink Acme Robotics billing?"),
+    ).toBeVisible();
     await expect(confirm).toContainText("becomes blocked at once");
     await confirm.getByRole("button", "Unlink billing account").tap();
     await expect(confirm).toBeHidden();
+    expect(
+      await browser.evaluate(() =>
+        JSON.parse(
+          sessionStorage.getItem("ownsand-e2e-billing-unlink-requests") ?? "[]",
+        ),
+      ),
+    ).toEqual([acmeBillingId]);
     await expect(
       screen.getByRole("region", "This organization is blocked"),
     ).toBeVisible();

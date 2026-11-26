@@ -8,7 +8,7 @@ import {
 } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonVariant } from "delino-ui/button";
-import { NumberInput } from "delino-ui/number-input";
+import { NumberInput, type NumberInputDraft } from "delino-ui/number-input";
 import { Select, SelectOption } from "delino-ui/select";
 import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
@@ -204,6 +204,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   // The fields the user has edited and not saved yet. A field that is absent
   // (`undefined`) is untouched and shows the cached limit, so a refresh
   // that changes the limits updates it and never replaces an edit.
+  const vcpuDraft = useRef<NumberInputDraft>(null);
   const [draft, setDraft] = useState<DeviceLimitsDraft>({});
   const [fieldError, setFieldError] = useState<{
     field: DeviceLimitField;
@@ -258,7 +259,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
     // ReplaceDeviceLimits needs every value. A blank field is not zero: the
     // form asks for the value instead of sending a silent zero.
     const input = deviceLimitsInput({
-      vcpu,
+      vcpu: vcpuDraft.current?.hasFraction() ? Number.NaN : vcpu,
       memoryMib: memory,
       diskGib: disk,
       overcommitPercent: Number(overcommit),
@@ -336,6 +337,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
               label="vCPU limit"
               value={vcpu}
               onValueChange={edit(DeviceLimitField.Vcpu, "vcpu")}
+              draftRef={vcpuDraft}
               min={0}
               error={errorOf(DeviceLimitField.Vcpu)}
               disabled={!admin || pending}

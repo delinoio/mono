@@ -9,6 +9,7 @@ import {
 import type {
   LinkBillingAccountRequest,
   ListLinkableBillingAccountsResponse,
+  UnlinkBillingAccountRequest,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import {
   MemberService,
@@ -35,6 +36,7 @@ import {
   createMockTransport as createBaseMock,
   MOCK_IDS,
 } from "../src/mock/mock-api.ts";
+import { organizationUuidTransport } from "./organization-uuid-fixture.ts";
 import { browserSandboxTransitionMock } from "./sandbox-transition-mock.ts";
 
 const lists = {
@@ -90,7 +92,7 @@ function recordToken(key: string, token: string) {
   sessionStorage.setItem(key, JSON.stringify([...tokens, token]));
 }
 
-function holdCredentialRequest(name: "create" | "list") {
+function holdCredentialRequest(name: "create" | "list" | "refresh") {
   const key = `ownsand-e2e-credential-${name}`;
   if (sessionStorage.getItem(key) === "release") return Promise.resolve();
   return new Promise<void>((resolve) => {
@@ -109,6 +111,14 @@ async function holdOrganizationRefreshStep(step: "list" | "mutation") {
   sessionStorage.setItem(key, "released");
 }
 
+function holdTemplateRequest(request: "first-page" | "create") {
+  const key = `ownsand-e2e-template-${request}`;
+  return new Promise<void>((resolve) => {
+    window.addEventListener(`${key}-release`, () => resolve(), { once: true });
+    sessionStorage.setItem(key, "held");
+  });
+}
+
 export function createMockTransport(): Transport {
   const methodName = sessionStorage.getItem("ownsand-e2e-paged-list");
   const refreshList = sessionStorage.getItem("ownsand-e2e-refresh-list");
@@ -120,18 +130,42 @@ export function createMockTransport(): Transport {
   const pageDevices = methodName === "ListDevices";
   const pageInvitations = methodName === "ListInvitations";
   const pageSources = methodName === "SnapshotSources";
+  const holdTemplateFirstPage =
+    sessionStorage.getItem("ownsand-e2e-template-first-page") === "hold";
+  let heldTemplateFirstPage = false;
   const credentialList = sessionStorage.getItem(
     "ownsand-e2e-credential-method",
   );
-  const credentialCreate =
-    credentialList === "ListApiKeys" ? "CreateApiKey" : "CreateEnrollmentToken";
-  const credentialField =
-    credentialList === "ListApiKeys" ? "apiKeys" : "tokens";
+  const credentialMethods = {
+    ListApiKeys: {
+      create: "CreateApiKey",
+      rows: "apiKeys",
+      secret: "apiKeySecret",
+      fixture: "osk_fixture",
+    },
+    ListEnrollmentTokens: {
+      create: "CreateEnrollmentToken",
+      rows: "tokens",
+      secret: "enrollmentToken",
+      fixture: "ose_fixture",
+    },
+    ListInvitations: {
+      create: "CreateInvitation",
+      rows: "invitations",
+      secret: "invitationSecret",
+      fixture: "osi_fixture",
+    },
+  };
+  const credential =
+    credentialMethods[credentialList as keyof typeof credentialMethods];
+  const holdRefresh =
+    sessionStorage.getItem("ownsand-e2e-credential-hold-refresh") === "true";
   let credentialCreated = false;
+  let heldRefresh = false;
   const createResponse = sessionStorage.getItem("ownsand-e2e-create-response");
   const creates: { request: string; sandboxId: string }[] = [];
   // Seed enough rows to split the selected list across two pages.
-  const base = browserSandboxTransitionMock(
+  const mock = browserSandboxTransitionMock(
     createBaseMock({
       extraApiKeys: Number(methodName === "ListApiKeys"),
       extraDevices: pageDevices ? 199 : 0,
@@ -146,6 +180,10 @@ export function createMockTransport(): Transport {
       extraTemplates: pageSources ? 200 : 0,
     }),
   );
+  const base =
+    sessionStorage.getItem("ownsand-e2e-organization-uuid-case") === "true"
+      ? organizationUuidTransport(mock)
+      : mock;
   const earlierAcceptance = createRouterTransport((router) => {
     router.rpc(MemberService.method.acceptInvitation, () => ({
       organization: { organizationId: MOCK_IDS.acme },
@@ -154,10 +192,56 @@ export function createMockTransport(): Transport {
   return {
     ...base,
     async unary(method, signal, timeout, header, input, contextValues) {
+      if (holdTemplateFirstPage && method.name === "ListTemplates") {
+        const response = await base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+        // Ignore the request React Strict Mode aborts on its test mount.
+        if (signal?.aborted) return response;
+        const { pageToken } = input as { pageToken: string };
+        recordToken("ownsand-e2e-template-list-tokens", pageToken);
+        if (heldTemplateFirstPage) return response;
+
+        heldTemplateFirstPage = true;
+        // Deliver the pre-create page even after cancellation.
+        await holdTemplateRequest("first-page");
+        sessionStorage.setItem("ownsand-e2e-template-first-page", "delivered");
+        return {
+          ...response,
+          message: { ...response.message, templates: [], nextPageToken: "" },
+        };
+      }
+      if (holdTemplateFirstPage && method.name === "CreateTemplate") {
+        await holdTemplateRequest("create");
+        return base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+      }
       if (
         method.name === sessionStorage.getItem("ownsand-e2e-tracked-mutation")
       ) {
         recordToken("ownsand-e2e-mutation-calls", method.name);
+        if (
+          method.name === "CreateSandbox" ||
+          method.name === "ReplaceDeviceLimits"
+        ) {
+          recordToken(
+            "ownsand-e2e-resource-mutation-inputs",
+            toJsonString(method.input, create(method.input, input), {
+              alwaysEmitImplicit: true,
+            }),
+          );
+        }
       }
       const deviceReadback = "ownsand-e2e-device-readback";
       if (
@@ -186,7 +270,7 @@ export function createMockTransport(): Transport {
           );
         }
       }
-      if (credentialList !== null && method.name === credentialCreate) {
+      if (credential && method.name === credential.create) {
         await holdCredentialRequest("create");
         if (sessionStorage.getItem("ownsand-e2e-credential-create-fails")) {
           throw new ConnectError(
@@ -203,10 +287,16 @@ export function createMockTransport(): Transport {
           contextValues,
         );
         credentialCreated = true;
-        return response;
+        return {
+          ...response,
+          message: {
+            ...response.message,
+            [credential.secret]: credential.fixture,
+          },
+        };
       }
-      if (method.name === credentialList) {
-        const hold = !credentialCreated;
+      if (credential && method.name === credentialList) {
+        const afterCreate = credentialCreated;
         const response = await base.unary(
           method,
           signal,
@@ -219,7 +309,15 @@ export function createMockTransport(): Transport {
         if (signal?.aborted) return response;
         const token = (input as typeof input & { pageToken: string }).pageToken;
         recordToken("ownsand-e2e-credential-tokens", token);
-        if (!hold) return response;
+        if (holdRefresh) {
+          if (afterCreate && !heldRefresh) {
+            heldRefresh = true;
+            await holdCredentialRequest("refresh");
+            throw new ConnectError("Synthetic refresh failure", Code.Internal);
+          }
+          return response;
+        }
+        if (afterCreate) return response;
 
         // Deliver the empty pre-create page even if the client cancels it.
         await holdCredentialRequest("list");
@@ -228,7 +326,7 @@ export function createMockTransport(): Transport {
           ...response,
           message: {
             ...response.message,
-            [credentialField]: [],
+            [credential.rows]: [],
             nextPageToken: "",
           },
         };
@@ -263,6 +361,13 @@ export function createMockTransport(): Transport {
             },
           };
         }
+      }
+      if (method.name === "UnlinkBillingAccount") {
+        const request = input as UnlinkBillingAccountRequest;
+        recordToken(
+          "ownsand-e2e-billing-unlink-requests",
+          request.expectedBillingAccountId ?? "",
+        );
       }
       if (method.name === "LinkBillingAccount") {
         const { billingAccountId } =
@@ -456,6 +561,12 @@ export function createMockTransport(): Transport {
           sandboxId: sandbox.sandboxId,
         });
         sessionStorage.setItem("ownsand-e2e-creates", JSON.stringify(creates));
+        if (
+          (createResponse === "lost" && creates.length === 1) ||
+          (createResponse === "lost-twice" && creates.length <= 2)
+        ) {
+          throw new ConnectError("Response lost", Code.Unavailable);
+        }
         if (creates.length > 1 || createResponse === "valid") return response;
         if (createResponse === "held") {
           await new Promise<void>((resolve) => {

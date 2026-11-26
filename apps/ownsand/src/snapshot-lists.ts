@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { DescMessage } from "@bufbuild/protobuf";
+import type { Transport } from "@connectrpc/connect";
 import {
   type ConnectQueryKey,
   createInfiniteQueryOptions,
@@ -82,12 +83,11 @@ export function useSnapshots(
   return { rows, boundary, pages, fetchNextPage: query.fetchNextPage };
 }
 
-export function useTemplates(
+export function templateListOptions(
+  transport: Transport,
   organizationId: string,
   surface: ListSurface,
-  enabled = true,
 ) {
-  const transport = useTransport();
   const options = createInfiniteQueryOptions(
     SnapshotService.method.listTemplates,
     { organizationId, pageSize: 200, pageToken: "" },
@@ -97,10 +97,18 @@ export function useTemplates(
       getNextPageParam: (last) => last.nextPageToken || undefined,
     },
   );
+  return { ...options, queryKey: listKey(options.queryKey, surface) };
+}
+
+export function useTemplates(
+  organizationId: string,
+  surface: ListSurface,
+  enabled = true,
+) {
+  const transport = useTransport();
   const query = useInfiniteQuery({
-    ...options,
+    ...templateListOptions(transport, organizationId, surface),
     ...FOLLOW_ALL_PAGES_OPTIONS,
-    queryKey: listKey(options.queryKey, surface),
     enabled,
   });
   const pages = useFollowAllPages(

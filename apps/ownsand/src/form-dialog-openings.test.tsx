@@ -195,6 +195,11 @@ describe.each(FORMS)("$name form dialog openings", (form) => {
   const unavailable = () =>
     new ConnectError("the request failed", Code.Unavailable);
 
+  const editableFailure = () =>
+    form.method === "CreateSandbox"
+      ? new ConnectError("The request is invalid", Code.InvalidArgument)
+      : unavailable();
+
   test("a new opening starts without the pending state of a dismissed request", async () => {
     const held = await start();
     const first = await open();
@@ -220,7 +225,7 @@ describe.each(FORMS)("$name form dialog openings", (form) => {
     expect(notice(second)).toBeNull();
     expect(submitButton(second).disabled).toBe(true);
     // The new request is still the only one that decides the new opening.
-    await settleCall(held, 1, unavailable());
+    await settleCall(held, 1, editableFailure());
     expect(notice(second)).not.toBeNull();
     expect(submitButton(second).disabled).toBe(false);
   });
@@ -263,7 +268,7 @@ describe.each(FORMS)("$name form dialog openings", (form) => {
     await submit(dialog);
     await submit(dialog);
     expect(held.calls[form.method]).toHaveLength(1);
-    await settleCall(held, 0, unavailable());
+    await settleCall(held, 0, editableFailure());
     expect(notice(dialog)).not.toBeNull();
     expect(window.location.pathname).toBe(
       new URL(form.path, "http://x").pathname,

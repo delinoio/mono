@@ -165,8 +165,8 @@ function wholeCount(n: number): bigint {
 /**
  * Effective vCPU limit: floor(vCPU limit × percent / 100), in integers.
  * The device page calls it with the live value of a number input, which can
- * be fractional (for example, "1.5") until the input snaps it on Enter or
- * blur, so the inputs are first floored to non-negative integers.
+ * be fractional (for example, "1.5") while the user edits it. Floor the
+ * inputs to non-negative integers before calculating the effective limit.
  */
 export function effectiveVcpuLimit(
   vcpuCount: number,
@@ -266,15 +266,6 @@ export function formatTime(ts: Timestamp | undefined): string {
  */
 export function deviceOptionLabel(name: string, state: DeviceState): string {
   return `${name} (${labels.deviceState[state] ?? labels.deviceState[DeviceState.UNSPECIFIED]})`;
-}
-
-/**
- * The create-sandbox notice for an explicitly selected device that is
- * offline. The control plane answers `Unavailable` without a reason, so the
- * console derives this text from the loaded device state.
- */
-export function offlineDeviceMessage(name: string): string {
-  return `${name} is offline, so the sandbox cannot start on it. Choose another device or "Any device that fits", or try again when it is back online.`;
 }
 
 /**

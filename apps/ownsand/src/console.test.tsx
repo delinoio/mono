@@ -63,6 +63,12 @@ import {
 } from "./mock/mock-api.ts";
 import { holdingTransport as holdPagedTransport } from "./test-support.tsx";
 import {
+  FIXTURE_ORGANIZATION_ID,
+  FIXTURE_ORGANIZATION_NAME,
+  MIXED_CASE_ORGANIZATION_ID,
+  organizationUuidTransport,
+} from "../e2e/organization-uuid-fixture.ts";
+import {
   mockSandboxTransition,
   SandboxTransitionOutcome,
 } from "../e2e/sandbox-transition-mock.ts";
@@ -217,8 +223,10 @@ describe("organizations", () => {
    * n. `pages[i]` lists the organization IDs of page i + 1. `failPage` is
    * the 1-based page that fails with `unavailable` while it is set.
    */
-  async function pagedOrganizations(pages: string[][]) {
-    const mock = createMockTransport();
+  async function pagedOrganizations(
+    pages: string[][],
+    mock = createMockTransport(),
+  ) {
     const real = await createClient(
       OrganizationService,
       mock,
@@ -261,6 +269,77 @@ describe("organizations", () => {
     };
     return { transport, state };
   }
+
+  test.each([
+    FIXTURE_ORGANIZATION_ID,
+    FIXTURE_ORGANIZATION_ID.toUpperCase(),
+    MIXED_CASE_ORGANIZATION_ID,
+  ])("shows the listed organization for route UUID %s", async (id) => {
+    const path = `/orgs/${id}/sandboxes`;
+    renderConsole(path, {
+      transport: organizationUuidTransport(createMockTransport()),
+    });
+    await screen.findByRole("heading", { name: "Sandboxes" });
+    const switcher = await screen.findByRole("combobox", {
+      name: "Organization",
+    });
+    expect(switcher.textContent).toBe(FIXTURE_ORGANIZATION_NAME);
+    expect(window.location.pathname).toBe(path);
+  });
+
+  test("shows the placeholder for an inaccessible organization after the list completes", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.contoso}/sandboxes`, {
+      transport: organizationUuidTransport(createMockTransport()),
+    });
+    await screen.findByText(
+      "It was not found, or you no longer have access to it.",
+    );
+    const switcher = await screen.findByRole("combobox", {
+      name: "Organization",
+    });
+    expect(switcher.textContent).toBe("Choose an organization");
+  });
+
+  test.each([true, false])(
+    "selects an uppercase route organization when its page loads (on first page: %s)",
+    async (firstPage) => {
+      const id = FIXTURE_ORGANIZATION_ID.toUpperCase();
+      const pages = [[FIXTURE_ORGANIZATION_ID], [MOCK_IDS.northwind]];
+      if (!firstPage) pages.reverse();
+      const { transport } = await pagedOrganizations(
+        pages,
+        organizationUuidTransport(createMockTransport()),
+      );
+      const { transport: heldTransport, calls } = holdPagedTransport(
+        ["ListOrganizations"],
+        undefined,
+        transport,
+      );
+      renderConsole(`/orgs/${id}/sandboxes`, { transport: heldTransport });
+      await waitFor(() => expect(calls.ListOrganizations).toHaveLength(1));
+      await act(async () => calls.ListOrganizations![0]!.settle());
+      const switcher = await screen.findByRole("combobox", {
+        name: "Organization",
+      });
+      await waitFor(() => expect(calls.ListOrganizations).toHaveLength(2));
+      expect(switcher.textContent).toBe(
+        firstPage ? FIXTURE_ORGANIZATION_NAME : id,
+      );
+      await act(async () => calls.ListOrganizations![1]!.settle());
+      await waitFor(() =>
+        expect(switcher.textContent).toBe(FIXTURE_ORGANIZATION_NAME),
+      );
+
+      await act(async () => fireEvent.click(switcher));
+      await act(async () =>
+        fireEvent.click(screen.getByRole("option", { name: "Northwind Labs" })),
+      );
+      expect(window.location.pathname).toBe(
+        `/orgs/${MOCK_IDS.northwind}/sandboxes`,
+      );
+      await screen.findByRole("heading", { name: "Sandboxes" });
+    },
+  );
 
   test("follows the continuation token and lists a later-page organization with its role", async () => {
     const { transport, state } = await pagedOrganizations([
@@ -2101,6 +2180,28 @@ describe("sandbox create form resources", () => {
     });
     await settle(60);
   };
+
+  test("rejects fractional memory below the control minimum or beyond number precision", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    const memory = within(dialog).getByLabelText(
+      "Memory (MiB)",
+    ) as HTMLInputElement;
+    for (const value of ["255.5", "1000.00000000000000001"]) {
+      await commit(memory, value);
+      await create(dialog);
+      expect(created).toHaveLength(0);
+      expect(dialog.textContent, value).toContain(
+        "Enter a whole number of MiB from 1 to 9007199254740991.",
+      );
+      expect(memory.value).toBe(value);
+      expect(memory.getAttribute("aria-invalid")).toBe("true");
+    }
+    await commit(memory, "1000");
+    await create(dialog);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.memoryMib).toBe(1000n);
+  });
 
   test("rejects a vCPU count above the int32 range without a request", async () => {
     const { transport, created } = recordingTransport();

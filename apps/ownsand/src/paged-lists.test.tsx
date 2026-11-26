@@ -6,6 +6,7 @@ import {
   createClient,
   type Transport,
 } from "@connectrpc/connect";
+import { createInfiniteQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
@@ -18,9 +19,10 @@ import {
 } from "@delino/ownsand-protos/v1/member_pb";
 import {
   type ListSnapshotsResponse,
+  type ListTemplatesRequest,
   SnapshotService,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
-import { QueryClient } from "@tanstack/react-query";
+import { InfiniteQueryObserver, QueryClient } from "@tanstack/react-query";
 import {
   act,
   cleanup,
@@ -245,6 +247,167 @@ describe("snapshot source lists", () => {
   });
 });
 
+describe("template creation and management pages", () => {
+  const templateName = "review-template";
+  const formTitle = "Make a template";
+
+  function renderTemplates({ holdFirstPage = false, pageSize = 200 } = {}) {
+    const mock = createMockTransport();
+    const requests: ListTemplatesRequest[] = [];
+    let releaseFirstPage!: () => void;
+    const firstPage = new Promise<void>((resolve) => {
+      releaseFirstPage = resolve;
+    });
+    const held = holdingTransport(["CreateTemplate"], () => true, {
+      ...mock,
+      async unary(method, signal, timeout, header, input, contextValues) {
+        if (method.name !== "ListTemplates") {
+          return mock.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+        }
+        const request = input as typeof input & ListTemplatesRequest;
+        requests.push(request);
+        if (holdFirstPage && requests.length === 1) {
+          // Deliver a pre-create response even if its request was cancelled.
+          await firstPage;
+          const response = await mock.unary(
+            method,
+            undefined,
+            timeout,
+            header,
+            request,
+            contextValues,
+          );
+          return {
+            ...response,
+            message: { ...response.message, templates: [], nextPageToken: "" },
+          };
+        }
+        return mock.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          { ...request, pageSize },
+          contextValues,
+        );
+      },
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/snapshots`, {
+      transport: held.transport,
+    });
+    return { ...held, requests, releaseFirstPage };
+  }
+
+  async function openForm(name: string) {
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^Make template/ }),
+    );
+    const form = await screen.findByRole("dialog", { name: formTitle });
+    fireEvent.input(
+      within(form).getByRole("textbox", { name: "Template name" }),
+      {
+        target: { value: name },
+      },
+    );
+    return form;
+  }
+
+  const submit = (form: HTMLElement) =>
+    fireEvent.click(
+      within(form).getByRole("button", { name: "Create template" }),
+    );
+  const deleteAction = () =>
+    screen.findByRole("button", { name: /^Delete template review-template / });
+
+  test.each([false, true])(
+    "restarts an uncached first page before its stale response arrives (dismissed: %s)",
+    async (dismissed) => {
+      const { calls, requests, releaseFirstPage } = renderTemplates({
+        holdFirstPage: true,
+      });
+      const form = await openForm(templateName);
+      submit(form);
+      await waitFor(() => expect(calls.CreateTemplate).toHaveLength(1));
+      expect(requests).toHaveLength(1);
+      let newerForm: HTMLElement | undefined;
+      if (dismissed) {
+        fireEvent.keyDown(form, { key: "Escape" });
+        await waitFor(() =>
+          expect(screen.queryByRole("dialog", { name: formTitle })).toBeNull(),
+        );
+        newerForm = await openForm("another-template");
+      }
+      await act(async () => calls.CreateTemplate![0]!.settle());
+      if (newerForm) {
+        expect(screen.getByRole("dialog", { name: formTitle })).toBe(newerForm);
+        fireEvent.keyDown(newerForm, { key: "Escape" });
+      }
+      await deleteAction();
+      expect(
+        requests.map(({ organizationId, pageSize, pageToken }) => [
+          organizationId,
+          pageSize,
+          pageToken,
+        ]),
+      ).toEqual([
+        [MOCK_IDS.acme, 200, ""],
+        [MOCK_IDS.acme, 200, ""],
+      ]);
+
+      await act(async () => releaseFirstPage());
+      expect(await deleteAction()).toBeTruthy();
+      expect(screen.queryByRole("dialog", { name: formTitle })).toBeNull();
+    },
+  );
+
+  test("shows the failure in the current form without refreshing the first page", async () => {
+    const { calls, requests, releaseFirstPage } = renderTemplates({
+      holdFirstPage: true,
+    });
+    const form = await openForm(templateName);
+    submit(form);
+    await waitFor(() => expect(calls.CreateTemplate).toHaveLength(1));
+    await act(async () => {
+      calls.CreateTemplate![0]!.settle(
+        new ConnectError("Template creation failed", Code.InvalidArgument),
+      );
+    });
+    expect(
+      await within(form).findByText("Template creation failed"),
+    ).toBeTruthy();
+    await act(async () => releaseFirstPage());
+    expect(await screen.findByText("No templates")).toBeTruthy();
+    expect(requests).toHaveLength(1);
+  });
+
+  test("refreshes cached templates from the first page and keeps the continuation", async () => {
+    const { calls, requests } = renderTemplates({ pageSize: 1 });
+    await waitForRows("Templates", 1);
+    const form = await openForm(templateName);
+    submit(form);
+    await waitFor(() => expect(calls.CreateTemplate).toHaveLength(1));
+    await act(async () => calls.CreateTemplate![0]!.settle());
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: formTitle })).toBeNull(),
+    );
+    expect(requests.map(({ pageToken }) => pageToken)).toEqual(["", ""]);
+    expect(itemsOf("Templates")).toHaveLength(1);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show more templates" }),
+    );
+    expect(await deleteAction()).toBeTruthy();
+    expect(requests).toHaveLength(3);
+    expect(requests[2]!.pageToken).not.toBe("");
+  });
+});
+
 describe("pending invitations list", () => {
   const name = "Pending invitations";
   const path = `/orgs/${MOCK_IDS.acme}/members`;
@@ -336,6 +499,88 @@ describe("pending invitations list", () => {
       organizationId: organization!.organizationId,
       pageToken: "",
     });
+  });
+
+  test("restarts only the submitted organization's uncached invitation request", async () => {
+    const mock = createMockTransport();
+    const { organization } = await createClient(
+      OrganizationService,
+      mock,
+    ).createOrganization({ name: "Initech" });
+    const otherId = organization!.organizationId;
+    const requests: {
+      input: ListInvitationsRequest;
+      signal?: AbortSignal;
+      release(): void;
+    }[] = [];
+    const transport: Transport = {
+      ...mock,
+      async unary(method, signal, timeout, header, input, contextValues) {
+        if (method.name === "ListInvitations") {
+          await new Promise<void>((release) => {
+            requests.push({
+              input: input as typeof input & ListInvitationsRequest,
+              signal,
+              release,
+            });
+          });
+        }
+        return mock.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+      },
+    };
+    const queryClient = new QueryClient();
+    const otherList = new InfiniteQueryObserver(
+      queryClient,
+      createInfiniteQueryOptions(
+        MemberService.method.listInvitations,
+        { organizationId: otherId, pageSize: 200, pageToken: "" },
+        {
+          transport,
+          pageParamKey: "pageToken",
+          getNextPageParam: (last) => last.nextPageToken || undefined,
+        },
+      ),
+    );
+    const unsubscribe = otherList.subscribe(() => {});
+    try {
+      renderConsole(path, { transport, queryClient });
+      await waitFor(() => expect(requests).toHaveLength(2));
+      const other = requests.find(
+        ({ input }) => input.organizationId === otherId,
+      )!;
+      const first = requests.find(
+        ({ input }) => input.organizationId === MOCK_IDS.acme,
+      )!;
+
+      fireEvent.click(screen.getByRole("button", { name: "Invite someone" }));
+      fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+      await waitFor(() => expect(requests).toHaveLength(3));
+      const fresh = requests[2]!;
+      expect(fresh.input).toMatchObject({
+        organizationId: MOCK_IDS.acme,
+        pageSize: 200,
+        pageToken: "",
+      });
+      expect(first.signal?.aborted).toBe(true);
+      expect(other.signal?.aborted).toBe(false);
+
+      other.release();
+      fresh.release();
+      await waitFor(() =>
+        expect(otherList.getCurrentResult().isSuccess).toBe(true),
+      );
+      expect(requests).toHaveLength(3);
+    } finally {
+      unsubscribe();
+      for (const request of requests) request.release();
+    }
   });
 
   test.each([

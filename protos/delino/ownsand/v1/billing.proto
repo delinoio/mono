@@ -129,6 +129,8 @@ message GetBillingStatusRequest {
 
 message GetBillingStatusResponse {
   OrganizationBilling billing = 1;
+  // Set only for the organization owner when an account is linked.
+  optional string billing_account_id = 2;
 }
 
 message GetBillingUsageRequest {
@@ -175,6 +177,8 @@ message LinkBillingAccountResponse {
 
 message UnlinkBillingAccountRequest {
   string organization_id = 1;
+  // When set, unlink only if this is the current billing account.
+  optional string expected_billing_account_id = 2;
 }
 
 message UnlinkBillingAccountResponse {
