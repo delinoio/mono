@@ -26,10 +26,12 @@ func paginate[Req, Res any, PReq interface {
 }, Item any](ctx context.Context, call func(context.Context, *connect.Request[Req]) (*connect.Response[Res], error), req PReq, items func(PRes) []Item) iter.Seq2[Item, error] {
 	return func(yield func(Item, error) bool) {
 		var zero Item
+		var page PReq
 		if req == nil {
-			req = PReq(new(Req))
+			page = PReq(new(Req))
+		} else {
+			page = proto.Clone(req).(PReq)
 		}
-		page := proto.Clone(req).(PReq)
 		pageMessage := page.ProtoReflect()
 		tokenField := pageMessage.Descriptor().Fields().ByName("page_token")
 		seen := map[string]bool{}
