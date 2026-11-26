@@ -32,11 +32,10 @@ type WaitDevSessionParams struct {
 }
 
 // WaitDevSession calls GetDevSession repeatedly until the dev session is
-// RUNNING or terminal, and returns it. When ctx ends first (for example at
-// the caller's deadline), it returns the last dev session that it read
-// (nil when it read none) together with ctx.Err(). Transient failures are
-// retried at the next poll and logged at debug level; other errors end the
-// wait.
+// RUNNING or terminal, and returns it. If ctx ends before the wait accepts
+// a poll result, it returns the last accepted dev session (or nil) and
+// ctx.Err(). The wait logs transient failures at debug level and retries
+// them at the next poll. Other errors end the wait.
 func (c *Client) WaitDevSession(ctx context.Context, p WaitDevSessionParams) (*sandrunv1.DevSession, error) {
 	interval := p.Interval
 	if interval <= 0 {
@@ -48,14 +47,15 @@ func (c *Client) WaitDevSession(ctx context.Context, p WaitDevSessionParams) (*s
 			OrganizationId: p.OrganizationID,
 			DevSessionId:   p.DevSessionID,
 		}))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return last, ctxErr
+		}
 		switch {
 		case err == nil:
 			last = res.Msg.GetDevSession()
 			if s := last.GetState(); s == sandrunv1.RequestState_REQUEST_STATE_RUNNING || IsTerminalState(s) {
 				return last, nil
 			}
-		case ctx.Err() != nil:
-			return last, ctx.Err()
 		case transient(ctx, err):
 			c.logger.DebugContext(ctx, "sandrun wait dev session retries", "dev_session_id", p.DevSessionID, "code", codeText(err))
 		default:
