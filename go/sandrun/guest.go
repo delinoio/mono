@@ -439,13 +439,14 @@ func guestSep(os sandrunv1.GuestOs) string {
 // guestIsAbs reports whether p is an absolute path of os.
 func guestIsAbs(os sandrunv1.GuestOs, p string) bool {
 	if os == sandrunv1.GuestOs_GUEST_OS_WINDOWS {
-		if strings.HasPrefix(p, `\\`) || strings.HasPrefix(p, "//") {
-			return true
-		}
-		return len(p) >= 3 && isASCIILetter(p[0]) && p[1] == ':' && (p[2] == '\\' || p[2] == '/')
+		driveRooted := len(p) >= 3 && isASCIILetter(p[0]) && p[1] == ':' && isWindowsPathSeparator(p[2])
+		unc := len(p) >= 2 && isWindowsPathSeparator(p[0]) && isWindowsPathSeparator(p[1])
+		return driveRooted || unc
 	}
 	return strings.HasPrefix(p, "/")
 }
+
+func isWindowsPathSeparator(b byte) bool { return b == '\\' || b == '/' }
 
 func isASCIILetter(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') }
 
