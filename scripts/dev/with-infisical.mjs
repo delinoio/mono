@@ -53,6 +53,7 @@ import { existsSync } from "node:fs";
 import { constants } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isWorkspaceCli } from "../ci/workspace-node.mjs";
 
 // How the development command receives its environment.
 export const InjectionMode = Object.freeze({
@@ -469,9 +470,7 @@ async function main() {
 }
 
 // The module also exports its pure helpers for tests; run only as a script.
-// import.meta.main needs Node 24.2+; unlike comparing process.argv[1] with the
-// module URL, it also holds when a symlinked path starts the script.
-if (import.meta.main) {
+if (isWorkspaceCli(import.meta)) {
   const removeSignalRecording = installSignalRecording();
   try {
     process.exitCode = await main();

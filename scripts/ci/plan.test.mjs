@@ -2153,6 +2153,7 @@ test("planner without installed dependencies defers missing and non-regular entr
     "plan.mjs",
     "format-changed.mjs",
     "workspace-packages.mjs",
+    "workspace-node.mjs",
   ]) {
     copyFileSync(join(root, "scripts/ci", file), join(bare, file));
   }
@@ -2219,6 +2220,7 @@ test("planner without installed dependencies publishes format=true for non-UTF-8
     "plan.mjs",
     "format-changed.mjs",
     "workspace-packages.mjs",
+    "workspace-node.mjs",
   ]) {
     copyFileSync(join(root, "scripts/ci", file), join(bare, file));
   }

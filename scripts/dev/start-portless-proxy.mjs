@@ -46,6 +46,7 @@ import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isWorkspaceCli } from "../ci/workspace-node.mjs";
 
 // Values of `PORTLESS` that make `portless run` start the app without the
 // proxy. They match `isPortlessSkipped` in portless 0.18.1.
@@ -283,6 +284,6 @@ export function startPortlessProxy() {
   return result.status ?? 1;
 }
 
-if (import.meta.main) {
+if (isWorkspaceCli(import.meta)) {
   process.exitCode = startPortlessProxy();
 }

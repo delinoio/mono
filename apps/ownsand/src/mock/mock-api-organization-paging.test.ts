@@ -3,6 +3,7 @@ import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { createMockTransport, MOCK_IDS } from "./mock-api.ts";
+import { walkFixturePages } from "./walk-fixture-pages.ts";
 
 /** The page token that the control plane builds: base64url("v1:" + last ID). */
 const tokenOf = (id: string) =>
@@ -59,18 +60,17 @@ describe("mock organization list order and cursor", () => {
 
   test("a walk with page size 1 returns the same rows as one large page", async () => {
     const client = newClient();
-    await createOrganizations(client, 3);
+    const created = await createOrganizations(client, 3);
     const all = (await listIds(client, { pageSize: 200 })).ids;
-    const walked: string[] = [];
-    let pageToken = "";
-    do {
-      // A cursor that does not advance must fail the test, not loop forever.
-      expect(walked.length).toBeLessThanOrEqual(all.length);
-      const page = await listIds(client, { pageSize: 1, pageToken });
-      expect(page.ids.length).toBeLessThanOrEqual(1);
-      walked.push(...page.ids);
-      pageToken = page.nextPageToken;
-    } while (pageToken !== "");
+    const walked = await walkFixturePages(
+      2 + created.length,
+      1,
+      async (request) => {
+        const page = await listIds(client, request);
+        expect(page.ids.length).toBeLessThanOrEqual(1);
+        return { rows: page.ids, nextPageToken: page.nextPageToken };
+      },
+    );
     expect(walked).toEqual(all);
   });
 
@@ -122,5 +122,81 @@ describe("mock organization list order and cursor", () => {
       expect(error).toBeInstanceOf(ConnectError);
       expect((error as ConnectError).code).toBe(Code.InvalidArgument);
     }
+  });
+});
+
+describe("pagination fixture guard", () => {
+  function stubPages(pages: { rows: string[]; nextPageToken: string }[]) {
+    const requests: string[] = [];
+    return {
+      requests,
+      async listPage({ pageToken }: { pageToken: string }) {
+        const page = pages[requests.length];
+        requests.push(pageToken);
+        if (!page) {
+          throw new Error("Unexpected page request");
+        }
+        return page;
+      },
+    };
+  }
+
+  test("rejects an empty page that repeats the request token", async () => {
+    const { requests, listPage } = stubPages([
+      { rows: ["id-1"], nextPageToken: "cursor-a" },
+      { rows: [], nextPageToken: "cursor-a" },
+    ]);
+
+    await expect(walkFixturePages(2, 1, listPage)).rejects.toThrow(
+      'Pagination repeated continuation token "cursor-a"',
+    );
+    expect(requests).toEqual(["", "cursor-a"]);
+  });
+
+  test("rejects a token that repeats after an intervening token", async () => {
+    const { requests, listPage } = stubPages([
+      { rows: ["id-1"], nextPageToken: "cursor-a" },
+      { rows: ["id-2"], nextPageToken: "cursor-b" },
+      { rows: [], nextPageToken: "cursor-a" },
+    ]);
+
+    await expect(walkFixturePages(2, 1, listPage)).rejects.toThrow(
+      'Pagination repeated continuation token "cursor-a"',
+    );
+    expect(requests).toEqual(["", "cursor-a", "cursor-b"]);
+  });
+
+  test("rejects a distinct token on the last allowed response", async () => {
+    const { requests, listPage } = stubPages([
+      { rows: ["id-1"], nextPageToken: "cursor-a" },
+      { rows: ["id-2"], nextPageToken: "cursor-b" },
+      { rows: [], nextPageToken: "cursor-c" },
+    ]);
+
+    await expect(walkFixturePages(2, 1, listPage)).rejects.toThrow(
+      "Pagination reached the request limit of 3 with a continuation token",
+    );
+    expect(requests).toEqual(["", "cursor-a", "cursor-b"]);
+  });
+
+  test("accepts an empty terminal page after five full pages", async () => {
+    const ids = ["id-1", "id-2", "id-3", "id-4", "id-5"];
+    const cursors = [
+      "cursor-a",
+      "cursor-b",
+      "cursor-c",
+      "cursor-d",
+      "cursor-e",
+    ];
+    const { requests, listPage } = stubPages([
+      ...ids.map((id, index) => ({
+        rows: [id],
+        nextPageToken: cursors[index]!,
+      })),
+      { rows: [], nextPageToken: "" },
+    ]);
+
+    await expect(walkFixturePages(5, 1, listPage)).resolves.toEqual(ids);
+    expect(requests).toEqual(["", ...cursors]);
   });
 });

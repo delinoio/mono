@@ -85,6 +85,7 @@ describe("mock createSandbox UUID case variants", () => {
     expect(upper).not.toBe(MOCK_IDS.snapshot);
     const { sandbox } = await client.createSandbox({
       ...request(KEY_A),
+      resources: { vcpuCount: 1, memoryMib: 1024n, diskGib: 20n },
       source: { source: { case: "snapshotId" as const, value: upper } },
     });
     expect(sandbox?.source?.source).toEqual({

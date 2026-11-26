@@ -30,7 +30,7 @@ function reasonText(billing: OrganizationBilling): string {
 }
 
 const BLOCKED_ACTIONS =
-  "creating sandboxes, snapshots, templates and enrollment tokens, resuming sandboxes and exporting snapshots";
+  "creating sandboxes, snapshots, templates and enrollment tokens, resuming sandboxes, exporting snapshots, and enrolling a device even with an existing enrollment token";
 
 /**
  * The billing banner of every organization page. Every member sees it while
