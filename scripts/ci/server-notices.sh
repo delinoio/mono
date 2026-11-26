@@ -64,7 +64,11 @@ while IFS=$'\t' read -r -u 3 module version module_dir; do
     echo "::error::Module $module $version that $service links has no source directory; download the modules before you generate the notices." >&2
     exit 1
   fi
-  if ! find "$module_dir" -maxdepth 2 -type f \( -ipath "$module_dir/licen[cs]e*" -o -ipath "$module_dir/copying*" -o -ipath "$module_dir/notice*" -o -ipath "$module_dir/patents*" -o -ipath "$module_dir/licenses/*" \) -print0 > "$license_paths"; then
+  # Keep the module directory out of the find patterns so its name is literal.
+  if ! (
+    cd -- "$module_dir" &&
+      find . -maxdepth 2 -type f \( -ipath './licen[cs]e*' -o -ipath './copying*' -o -ipath './notice*' -o -ipath './patents*' -o -ipath './licenses/*' \) -print0
+  ) > "$license_paths"; then
     echo "::error::Cannot find license files for $module $version that $service links." >&2
     exit 1
   fi
@@ -78,10 +82,10 @@ while IFS=$'\t' read -r -u 3 module version module_dir; do
     {
       echo
       echo "================================================================"
-      echo "$module $version: ${file#"$module_dir"/}"
+      echo "$module $version: ${file#./}"
       echo "================================================================"
       echo
-      cat -- "$file"
+      cat -- "$module_dir/$file"
     } >> "$bundle"
   done < "$sorted_license_paths"
   if (( found == 0 )); then

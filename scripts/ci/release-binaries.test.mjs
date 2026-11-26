@@ -305,8 +305,10 @@ function fixture(t, { parent = tmpdir(), bash = "bash" } = {}) {
     write(join(bin, name), content, 0o755);
   }
   write(join(dir, "goroot/LICENSE"), "Go license\n");
-  const modules = join(dir, "modules");
+  const modules = join(dir, "[cache]");
   write(join(modules, "a/LICENSE"), "A license\n");
+  write(join(modules, "a/LiCeNsEs/extra.txt"), "A extra license\n");
+  write(join(modules, "a/a/b/LICENSE"), "Too deep license text\n");
   write(join(modules, "b/COPYING.md"), "B copying\n");
   write(join(modules, "b/LICENSES/MIT.txt"), "B MIT\n");
   write(join(modules, "b/src/LICENSE"), "not a module license\n");
@@ -446,24 +448,20 @@ test(
       join(out, "release/ownsand-agent/THIRD-PARTY-LICENSES.txt"),
       "utf8",
     );
-    assert.match(
-      notices,
-      /example\.com\/a v1\.0\.0: LICENSE\n=+\n\nA license\n/,
-    );
-    assert.match(
-      notices,
-      /example\.com\/b v2\.0\.0: COPYING\.md\n=+\n\nB copying\n/,
-    );
-    assert.match(
-      notices,
-      /example\.com\/b v2\.0\.0: LICENSES\/MIT\.txt\n=+\n\nB MIT\n/,
+    assert.deepEqual(
+      Array.from(
+        notices.matchAll(/^(example\.com\/[^\n]+)\n=+\n\n([^\n]+)$/gm),
+        ([, header, text]) => [header, text],
+      ),
+      [
+        ["example.com/a v1.0.0: LICENSE", "A license"],
+        ["example.com/a v1.0.0: LiCeNsEs/extra.txt", "A extra license"],
+        ["example.com/b v2.0.0: COPYING.md", "B copying"],
+        ["example.com/b v2.0.0: LICENSES/MIT.txt", "B MIT"],
+      ],
     );
     assert.doesNotMatch(notices, /not a module license/);
-    // Each module appears once although every platform lists it.
-    assert.equal(
-      notices.match(/example\.com\/a v1\.0\.0: LICENSE\n/g).length,
-      1,
-    );
+    assert.doesNotMatch(notices, /Too deep license text/);
     assert.match(result.summary, /ownsand-cli@0\.0\.1: `ownsand-linux-arm64`/);
   },
 );
@@ -502,17 +500,21 @@ test(
 
 test("build fails for a module without a license file", { skip }, (t) => {
   const f = fixture(t);
-  mkdirSync(join(f.dir, "modules/c"));
+  mkdirSync(join(f.dir, "[cache]/c"));
   writeFileSync(
     join(f.dir, "go-list.tsv"),
-    `example.com/c\tv0.1.0\t${f.dir}/modules/c\n`,
+    `example.com/c\tv0.1.0\t${f.dir}/[cache]/c\n`,
   );
-  const result = f.run(["build", "cross", join(f.dir, "out")], {}, [cli]);
+  const out = join(f.dir, "out");
+  const notice = join(out, "release/ownsand-cli/THIRD-PARTY-LICENSES.txt");
+  write(notice, "Notice from an earlier build\n");
+  const result = f.run(["build", "cross", out], {}, [cli]);
   assert.notEqual(result.status, 0);
   assert.match(
     result.stderr,
     /Module example\.com\/c v0\.1\.0 that ownsand-cli links has no license file/,
   );
+  assert.equal(existsSync(notice), false);
 });
 
 for (const { command, operation, script, error } of [
@@ -536,7 +538,7 @@ fi`,
   {
     command: "find",
     operation: "license path discovery",
-    script: `[[ "$1" == "$STUB_DIR/modules/b" ]] || exec find "$@"
+    script: `[[ "$PWD" == "$STUB_DIR/[cache]/b" ]] || exec find "$@"
 if [[ "$STUB_PARTIAL_NOTICE_OUTPUT" == 1 ]]; then
   printf '%s\\0' "$1/COPYING.md"
 fi`,
@@ -554,7 +556,7 @@ fi`,
         const release = join(out, "release/ownsand-cli");
         const notice = join(release, "THIRD-PARTY-LICENSES.txt");
         const binaries = [{ ...cli, platforms: ["linux-arm64"] }];
-        write(join(f.dir, "modules/a/LICENSE.extra"), "Extra license\n");
+        write(join(f.dir, "[cache]/a/LICENSE.extra"), "Extra license\n");
         if (partial) write(notice, "Notice from an earlier build\n");
 
         const shim = join(f.dir, "bin", command);
