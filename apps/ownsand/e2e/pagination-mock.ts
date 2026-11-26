@@ -177,6 +177,9 @@ export function createMockTransport(): Transport {
       extraInvitations: pageInvitations
         ? Number(sessionStorage.getItem("ownsand-e2e-extra-invitations") ?? 200)
         : 0,
+      extraMembers: Number(
+        sessionStorage.getItem("ownsand-e2e-extra-members") ?? 0,
+      ),
       extraSnapshots: pageSources ? 200 : 0,
       extraTemplates: pageSources ? 200 : 0,
     }),
