@@ -71,21 +71,19 @@ export function resolveOrigin(
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     throw new Error(`${name} must use http or https`);
   }
-  if (
-    url.pathname !== "/" ||
-    raw.includes("?") ||
-    raw.includes("#") ||
-    // The URL parser treats a backslash as a path separator for http(s), so
-    // it can hide a path (`https://host\tenant\..` normalizes to `/`).
-    raw.includes("\\") ||
-    // The URL parser also accepts zero, one or three or more slashes after
-    // the scheme and resolves dot segments, so `https:///host/a/..` and
-    // `https:host/a/..` normalize to a bare origin and hide a path. Accept
-    // only the written shape `scheme://host[:port][/]`.
-    !/^https?:\/\/[^/?#\\]+\/?$/i.test(raw.trim())
-  ) {
+  // The URL parser can normalize extra or missing scheme slashes, backslashes
+  // and dot segments to a bare origin. Check the written shape as well.
+  const authority = /^https?:\/\/([^/?#\\]+)\/?$/i.exec(raw.trim())?.[1];
+  if (url.pathname !== "/" || authority === undefined) {
     throw new Error(
       `${name} must be an origin without a path, query or fragment`,
+    );
+  }
+  // The URL parser drops empty user information and embedded ASCII tabs and
+  // line breaks. Reject them in the written authority.
+  if (/[@\t\r\n]/.test(authority)) {
+    throw new Error(
+      `${name} must use an authority without @, tabs or line breaks`,
     );
   }
   return url.origin;

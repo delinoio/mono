@@ -1,20 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
 import type { E2EConfig } from "e2e";
 import { web } from "@e2e-dev/web";
 import { gateway } from "ai";
-
-// The runner starts commands without a shell, so it needs the CLI file behind
-// pnpm's Windows command shim.
-const manifestPath = createRequire(import.meta.url).resolve(
-  "@rsbuild/core/package.json",
-);
-const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-  bin: { rsbuild: string };
-};
-const rsbuildBin = resolve(dirname(manifestPath), manifest.bin.rsbuild);
+import { rsbuildBin } from "./e2e/rsbuild-bin.ts";
 
 export default {
   projectId: "ownsand-console",
