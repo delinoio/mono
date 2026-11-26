@@ -36,9 +36,10 @@ function isFormattableExtension(name) {
 
 const Mode = Object.freeze({ Check: "check", Write: "write" });
 const GitMaxBuffer = 32 * 1024 * 1024;
-const git = (cwd, ...args) =>
+const git = (cwd, args, env) =>
   execFileSync("git", args, {
     cwd,
+    env,
     encoding: "utf8",
     maxBuffer: GitMaxBuffer,
   });
@@ -160,11 +161,14 @@ function gitPaths(cwd, args) {
 // single newline that terminates Git's output is removed: the path itself may
 // legitimately end in whitespace (a checkout directory named `checkout `), and
 // trimming it would point every selector at a directory that does not exist.
-export function repositoryRoot(start) {
+export function repositoryRoot(start, env) {
   try {
-    return git(start, "rev-parse", "--show-toplevel").replace(/\n$/u, "");
+    return git(start, ["rev-parse", "--show-toplevel"], env).replace(
+      /\n$/u,
+      "",
+    );
   } catch (error) {
-    throw nonUtf8RootDiagnosis(start, error) ?? error;
+    throw nonUtf8RootDiagnosis(start, error, env) ?? error;
   }
 }
 
@@ -177,11 +181,12 @@ export function repositoryRoot(start) {
 // another checkout keeps the original error, as does a missing Git. Removal:
 // when the formatter can run from such a root (that needs every child process
 // to avoid absolute paths) and this diagnosis is no longer needed.
-function nonUtf8RootDiagnosis(start, error) {
+function nonUtf8RootDiagnosis(start, error, env) {
   if (error?.code !== "ENOENT" || existsSync(start)) return null;
   let raw;
   try {
     raw = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      env,
       encoding: "buffer",
       maxBuffer: GitMaxBuffer,
     });
@@ -198,7 +203,7 @@ function revision(cwd, value) {
       "Formatting requires a nonzero 40-character comparison SHA",
     );
   }
-  git(cwd, "cat-file", "-e", `${value}^{commit}`);
+  git(cwd, ["cat-file", "-e", `${value}^{commit}`]);
   return value;
 }
 
@@ -554,10 +559,11 @@ const signalExitCode = (signal) => 128 + constants.signals[signal];
 // Runs one Rstack batch. Resolves after the child has exited with its status
 // and the first forwarded signal received meanwhile (null when none). The
 // handlers are removed on every exit path so batches never stack listeners.
-function runBatch(cwd, args) {
+function runBatch(cwd, args, env) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(process.execPath, args, {
       cwd,
+      env,
       stdio: "inherit",
       shell: false,
     });
@@ -685,6 +691,8 @@ export function splitBatches(
 // convention `128 + signal` as `status` and starts no further batch. Callers
 // that must tell a stopped run from a failed check read `signal`, because a
 // signal exit code is indistinguishable from a check status by value alone.
+// `options.env` supplies the environment for Git root lookup and Rstack.
+// When omitted, those child processes inherit the caller's environment.
 // `options.commandLineLimit` and `options.onBatch` are test seams: the first
 // replaces the platform command-line limit, the second observes each batch's
 // paths before its process starts.
@@ -693,7 +701,8 @@ async function runFormatterBatches(start, paths, mode, options = {}) {
     throw new Error("Unknown formatting mode");
   if (!paths.length) return { status: 0, signal: null };
   // Selected paths are repository-root-relative, so Rstack must run there too.
-  const cwd = repositoryRoot(start);
+  const { env } = options;
+  const cwd = repositoryRoot(start, env);
   const entry = rstackEntry();
   const fixedArgs = [
     entry,
@@ -717,10 +726,11 @@ async function runFormatterBatches(start, paths, mode, options = {}) {
   let status = 0;
   for (const batch of batches) {
     options.onBatch?.(batch);
-    const { status: batchStatus, signal } = await runBatch(cwd, [
-      ...fixedArgs,
-      ...batch.map((name) => `./${name}`),
-    ]);
+    const { status: batchStatus, signal } = await runBatch(
+      cwd,
+      [...fixedArgs, ...batch.map((name) => `./${name}`)],
+      env,
+    );
     // A stopped run must not start another batch; report the shell convention
     // for the received signal instead of the child's own status.
     if (signal) return { status: signalExitCode(signal), signal };
@@ -790,13 +800,13 @@ export async function main(env = process.env) {
       ? null
       : explicit
         ? (values.head ?? env.TURBO_SCM_HEAD)
-        : git(cwd, "rev-parse", "HEAD").trim();
+        : git(cwd, ["rev-parse", "HEAD"]).trim();
   const base =
     values.staged || values.all
       ? null
       : explicit
         ? (values.base ?? env.TURBO_SCM_BASE)
-        : git(cwd, "merge-base", "origin/main", head).trim();
+        : git(cwd, ["merge-base", "origin/main", head]).trim();
   if (values.all && ci) throw new Error("CI formatting must use changed files");
   // `--all` selects every tracked file and never reads the comparison, so
   // honoring it would silently drop the requested range and skip revision
@@ -819,7 +829,7 @@ export async function main(env = process.env) {
       head,
       validationRevision: values.staged
         ? null
-        : git(cwd, "rev-parse", "HEAD").trim(),
+        : git(cwd, ["rev-parse", "HEAD"]).trim(),
       staged: values.staged ?? false,
       mode,
       candidates: paths.length,

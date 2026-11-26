@@ -67,15 +67,17 @@ The classic poisoning case: maintenance sets `default_transaction_read_only = on
 
 ## Connecting
 
+For each command, enter your database password when `psql` prompts you.
+
 ```bash
 # Local PgBouncer (same credentials, port 6432)
-psql 'host=xxx.horizon.psdb.cloud port=6432 user=postgres.xxx password=pscale_pw_xxx dbname=mydb sslnegotiation=direct sslmode=verify-full sslrootcert=system'
+psql -W 'host=xxx.horizon.psdb.cloud port=6432 user=postgres.xxx dbname=mydb sslnegotiation=direct sslmode=verify-full sslrootcert=system'
 
 # Dedicated primary PgBouncer (append |pgbouncer-name to user)
-psql 'host=xxx.horizon.psdb.cloud port=6432 user=postgres.xxx|write-pool password=pscale_pw_xxx dbname=mydb sslnegotiation=direct sslmode=verify-full sslrootcert=system'
+psql -W 'host=xxx.horizon.psdb.cloud port=6432 user=postgres.xxx|write-pool dbname=mydb sslnegotiation=direct sslmode=verify-full sslrootcert=system'
 
 # Dedicated replica PgBouncer (append |pgbouncer-name to user)
-psql 'host=xxx.horizon.psdb.cloud port=6432 user=postgres.xxx|read-bouncer password=pscale_pw_xxx dbname=mydb sslnegotiation=direct sslmode=verify-full sslrootcert=system'
+psql -W 'host=xxx.horizon.psdb.cloud port=6432 user=postgres.xxx|read-bouncer dbname=mydb sslnegotiation=direct sslmode=verify-full sslrootcert=system'
 ```
 
 Docs: https://planetscale.com/docs/postgres/connecting/pgbouncer

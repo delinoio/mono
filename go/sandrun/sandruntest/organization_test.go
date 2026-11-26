@@ -17,6 +17,7 @@ import (
 func TestUpdateOrganizationSettings(t *testing.T) {
 	limitMask := &fieldmaskpb.FieldMask{Paths: []string{"max_dev_sessions_per_user"}}
 	positive := &sandrunv1.OrganizationSettings{MaxDevSessionsPerUser: proto.Int32(2)}
+	higher := &sandrunv1.OrganizationSettings{MaxDevSessionsPerUser: proto.Int32(3)}
 	empty := &sandrunv1.OrganizationSettings{}
 	for _, tt := range []struct {
 		name     string
@@ -25,6 +26,7 @@ func TestUpdateOrganizationSettings(t *testing.T) {
 		want     *sandrunv1.OrganizationSettings
 		invalid  bool
 	}{
+		{"positive limit", limitMask, higher, higher, false},
 		{"omitted settings", limitMask, nil, empty, false},
 		{"empty settings", limitMask, empty, empty, false},
 		{"zero limit", limitMask, &sandrunv1.OrganizationSettings{MaxDevSessionsPerUser: proto.Int32(0)}, positive, true},
@@ -32,6 +34,8 @@ func TestUpdateOrganizationSettings(t *testing.T) {
 		{"omitted mask", nil, nil, positive, true},
 		{"empty mask", &fieldmaskpb.FieldMask{}, nil, positive, true},
 		{"unknown path", &fieldmaskpb.FieldMask{Paths: []string{"unknown"}}, nil, positive, true},
+		{"unknown path after supported path", &fieldmaskpb.FieldMask{Paths: []string{"max_dev_sessions_per_user", "unknown"}}, higher, positive, true},
+		{"unknown path before supported path", &fieldmaskpb.FieldMask{Paths: []string{"unknown", "max_dev_sessions_per_user"}}, nil, positive, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			server := sandruntest.New()

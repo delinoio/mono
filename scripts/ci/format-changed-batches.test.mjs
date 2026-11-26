@@ -235,6 +235,7 @@ function scratchRepository(t) {
   };
   return {
     cwd: parent,
+    env,
     write,
     read: (name) => readFileSync(join(parent, name), "utf8"),
   };
@@ -271,6 +272,7 @@ test("runFormatter processes every path once, in order, across length-split batc
   // Room for exactly two of these paths in write mode (the longer mode name),
   // so a three-path batch could never be built and every run needs batches.
   const options = {
+    env: f.env,
     commandLineLimit: commandLineLength("write", names.slice(0, 2)),
     onBatch: (batch) => seen.push(batch),
   };
@@ -301,6 +303,7 @@ test("runFormatter reports an unaddressable path by name before it starts any ba
   const seen = [];
   await assert.rejects(
     runFormatter(f.cwd, ["short.ts", long], "write", {
+      env: f.env,
       commandLineLimit: commandLineLength("write", ["short.ts"]),
       onBatch: (batch) => seen.push(batch),
     }),

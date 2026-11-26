@@ -99,7 +99,13 @@ function run(dir, args, env = {}) {
   return spawnSync("bash", [script, ...args], {
     cwd: dir,
     encoding: "utf8",
-    env: { ...process.env, GOTOOLCHAIN: "local", GOFLAGS: "", ...env },
+    env: {
+      ...process.env,
+      GOTOOLCHAIN: "local",
+      GOFLAGS: "",
+      GOWORK: "off",
+      ...env,
+    },
   });
 }
 
