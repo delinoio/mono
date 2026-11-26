@@ -6,10 +6,12 @@ import {
   createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
-import type {
-  LinkBillingAccountRequest,
-  ListLinkableBillingAccountsResponse,
-  UnlinkBillingAccountRequest,
+import {
+  BillingPhase,
+  BillingService,
+  type LinkBillingAccountRequest,
+  type ListLinkableBillingAccountsResponse,
+  type UnlinkBillingAccountRequest,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import {
   MemberService,
@@ -36,6 +38,7 @@ import type {
 import {
   createMockTransport as createBaseMock,
   MOCK_IDS,
+  MockBillingState,
 } from "../src/mock/mock-api.ts";
 import { apiKeyCollisionTransport } from "./api-key-collision-fixture.ts";
 import { revokeCollisionTransport } from "../src/mock/revoke-collision-fixture.ts";
@@ -127,6 +130,22 @@ function holdTemplateRequest(request: "first-page" | "create") {
 }
 
 export function createMockTransport(): Transport {
+  const billingSeed = sessionStorage.getItem("ownsand-e2e-billing-status-seed");
+  const billingRefresh = createRouterTransport((router) => {
+    router.rpc(BillingService.method.getBillingStatus, () => {
+      const result = sessionStorage.getItem(
+        "ownsand-e2e-billing-status-result",
+      );
+      recordToken("ownsand-e2e-billing-status-refreshes", result ?? "");
+      if (result === "allowed") {
+        return { billing: { phase: BillingPhase.ALLOWED, linked: true } };
+      }
+      throw new ConnectError(
+        "Synthetic billing status failure",
+        Number(result) as Code,
+      );
+    });
+  });
   const revokeCollision = sessionStorage.getItem(
     "ownsand-e2e-revoke-collision",
   );
@@ -210,6 +229,15 @@ export function createMockTransport(): Transport {
   // Seed enough rows to split the selected list across two pages.
   const mock = browserSandboxTransitionMock(
     createBaseMock({
+      billing:
+        billingSeed === null
+          ? undefined
+          : {
+              [MOCK_IDS.acme]:
+                billingSeed === "suspended"
+                  ? MockBillingState.Suspended
+                  : MockBillingState.BlockedUnlinked,
+            },
       extraApiKeys: Number(methodName === "ListApiKeys"),
       extraDevices: pageDevices ? 199 : Number(twoRestoreDevices),
       extraEnrollmentTokens: Number(
@@ -435,6 +463,20 @@ export function createMockTransport(): Transport {
             nextPageToken: "",
           },
         };
+      }
+      if (
+        billingSeed !== null &&
+        method.name === "GetBillingStatus" &&
+        sessionStorage.getItem("ownsand-e2e-billing-status-result") !== null
+      ) {
+        return billingRefresh.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
       }
       if (method.name === "ListLinkableBillingAccounts") {
         const code = sessionStorage.getItem("ownsand-e2e-billing-list-error");
