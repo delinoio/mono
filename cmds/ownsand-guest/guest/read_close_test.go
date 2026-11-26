@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -98,34 +99,70 @@ func TestReadWorkerCannotCreateAfterClose(t *testing.T) {
 // Close waits for a worker that ends within the grace, and a handler that
 // waits for the snapshot is released by the snapshot result.
 func TestReadCloseWaitsForWorkerWithinGrace(t *testing.T) {
-	setReadCloseGrace(t, 10*time.Second)
-	dir := t.TempDir()
-	src := filepath.Join(t.TempDir(), "src")
-	if err := os.WriteFile(src, []byte("0123456789"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	srv := newCloseTestServer(t, dir)
-	hook, started, release := newReadPreparationGate(t)
-	srv.reads.openHook = hook
-	e, err := srv.reads.begin("read-close-wait", src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitStarted(t, started)
-	go func() {
-		time.Sleep(50 * time.Millisecond)
+	synctest.Test(t, func(t *testing.T) {
+		const grace = 10 * time.Second
+		dir := t.TempDir()
+		src := filepath.Join(t.TempDir(), "src")
+		if err := os.WriteFile(src, []byte("0123456789"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		srv := newCloseTestServer(t, dir)
+		hook, started, release := newReadPreparationGate(t)
+		srv.reads.openHook = hook
+		e, err := srv.reads.begin("read-close-wait", src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitStarted(t, started)
+
+		type closeResult struct {
+			finished bool
+			ready    bool
+		}
+		result := make(chan closeResult, 1)
+		go func() {
+			got := closeResult{finished: srv.reads.close(grace)}
+			select {
+			case <-e.ready:
+				got.ready = true
+			default:
+			}
+			result <- got
+		}()
+		select {
+		case <-srv.reads.stop:
+		case <-time.After(grace):
+			t.Fatal("timed out waiting for close to signal shutdown")
+		}
+
+		// Let close reach its wait while the worker is still gated.
+		synctest.Wait()
+		select {
+		case got := <-result:
+			t.Fatalf("close returned %t while the snapshot worker was still gated", got.finished)
+		default:
+		}
 		release()
-	}()
-	if !srv.reads.close(readCloseGrace) {
-		t.Fatal("close gave up although the worker ended within the grace")
-	}
-	waitClosed(t, e.ready)
-	if e.err == nil {
-		t.Fatal("snapshot succeeded although close ended the worker before it created the file")
-	}
-	if files := filesUnder(t, filepath.Join(dir, "reads")); len(files) != 0 {
-		t.Fatalf("files left after close: %v", files)
-	}
+
+		select {
+		case got := <-result:
+			if !got.finished {
+				t.Fatal("close gave up although the worker ended within the grace")
+			}
+			if !got.ready {
+				t.Fatal("close reported success before the snapshot result was ready")
+			}
+		case <-time.After(2 * grace):
+			t.Fatal("timed out waiting for close to return after releasing the worker")
+		}
+		var op *opError
+		if !errors.As(e.err, &op) || op.code != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+			t.Fatalf("snapshot error after close: %v, want unavailable", e.err)
+		}
+		if files := filesUnder(t, filepath.Join(dir, "reads")); len(files) != 0 {
+			t.Fatalf("files left after close: %v", files)
+		}
+	})
 }
 
 // A late cleanup of an old worker must keep the snapshot of the same read_id
