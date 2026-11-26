@@ -298,16 +298,21 @@ func (d *devSessionService) ExecDevSession(ctx context.Context, req *connect.Req
 }
 
 func (d *devSessionService) AttachDevSessionExec(ctx context.Context, req *connect.Request[sandrunv1.AttachDevSessionExecRequest], stream *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error {
-	if _, err := d.s.runningSession(req.Msg.GetOrganizationId(), req.Msg.GetDevSessionId()); err != nil {
+	m := req.Msg
+	if _, err := d.s.runningSession(m.GetOrganizationId(), m.GetDevSessionId()); err != nil {
 		return err
 	}
+	stdout, stderr := m.GetStdoutOffset(), m.GetStderrOffset()
+	if stdout < 0 || stderr < 0 {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("invalid offsets: must not be negative"))
+	}
 	d.s.guest.mu.Lock()
-	p := d.s.guest.execs[req.Msg.GetExecId()]
+	p := d.s.guest.execs[m.GetExecId()]
 	d.s.guest.mu.Unlock()
-	if p == nil || p.session != req.Msg.GetDevSessionId() {
+	if p == nil || p.session != m.GetDevSessionId() {
 		return notFound("exec")
 	}
-	return d.s.guest.serve(ctx, p, req.Msg.GetStdoutOffset(), req.Msg.GetStderrOffset(), func(ev *sandrunv1.DevSessionExecEvent) error {
+	return d.s.guest.serve(ctx, p, stdout, stderr, func(ev *sandrunv1.DevSessionExecEvent) error {
 		return stream.Send(&sandrunv1.AttachDevSessionExecResponse{Event: ev})
 	})
 }
