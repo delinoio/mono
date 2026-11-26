@@ -115,9 +115,9 @@ func TestUsageErrors(t *testing.T) {
 	}
 }
 
-// TestFileWriteMode checks that file write rejects a zero --mode, which the
-// SDK would turn into 0644, names --mode in the error, and sends every other
-// valid mode, including the 0644 default, to the relay unchanged.
+// TestFileWriteMode checks that file write rejects a zero mode before any RPC
+// and names --mode in the error. It also checks that the relay receives the
+// default and explicit modes.
 func TestFileWriteMode(t *testing.T) {
 	for _, mode := range []string{"0", "0000", "00"} {
 		r := newRunner(t)
@@ -126,11 +126,8 @@ func TestFileWriteMode(t *testing.T) {
 		if res.code != ExitUsage || !strings.Contains(res.stderr, "--mode") {
 			t.Errorf("--mode %s: %+v", mode, res)
 		}
-		r.f.mu.Lock()
-		writes := r.f.writes
-		r.f.mu.Unlock()
-		if writes != 0 {
-			t.Errorf("--mode %s sent %d write requests", mode, writes)
+		if calls := r.f.callNames(); len(calls) != 0 {
+			t.Errorf("--mode %s sent RPCs: %v", mode, calls)
 		}
 	}
 	for _, c := range []struct {
