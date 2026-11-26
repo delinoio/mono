@@ -318,6 +318,12 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 		if errors.As(err, &cb) {
 			return nil, cb.err
 		}
+		if isLocalCredentialError(err) {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
+			}
+			return nil, op.dpErr(err, false)
+		}
 		if errors.Is(err, io.EOF) {
 			if at.accepted {
 				// A routine stream rotation: continue at once.

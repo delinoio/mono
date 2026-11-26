@@ -127,7 +127,9 @@ func (a *authInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc
 	return next
 }
 
-// failedConn reports a credential failure on the first send.
+// failedConn reports a credential failure before any request is sent.
+// Connect ignores EOF from Send on a server stream, so CloseRequest also
+// returns the failure to preserve token source errors that wrap EOF.
 type failedConn struct {
 	connect.StreamingClientConn
 	err error
@@ -135,7 +137,7 @@ type failedConn struct {
 
 func (f *failedConn) Send(any) error             { return f.err }
 func (f *failedConn) Receive(any) error          { return f.err }
-func (f *failedConn) CloseRequest() error        { return nil }
+func (f *failedConn) CloseRequest() error        { return f.err }
 func (f *failedConn) CloseResponse() error       { return nil }
 func (f *failedConn) RequestHeader() http.Header { return http.Header{} }
 
