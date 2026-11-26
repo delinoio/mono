@@ -57,14 +57,26 @@ export function ApiKeysPage() {
     ...FOLLOW_ALL_PAGES_OPTIONS,
   });
   const pages = useFollowAllPages(list);
-  const apiKeys = useMemo(
-    () =>
-      uniqueRows(
-        list.data?.pages.map((page) => page.apiKeys) ?? [],
-        (k) => k.apiKeyId,
-      ),
-    [list.data],
-  );
+  const { apiKeys, collidingIds } = useMemo(() => {
+    const apiKeys = uniqueRows(
+      list.data?.pages.map((page) => page.apiKeys) ?? [],
+      (key) => key.apiKeyId,
+    );
+    const firstIdByNameAndPrefix = new Map<string, string>();
+    const collidingIds = new Set<string>();
+    for (const key of apiKeys) {
+      if (key.state !== ApiKeyState.ACTIVE) continue;
+      const nameAndPrefix = JSON.stringify([key.name, key.keyPrefix]);
+      const firstId = firstIdByNameAndPrefix.get(nameAndPrefix);
+      if (firstId === undefined) {
+        firstIdByNameAndPrefix.set(nameAndPrefix, key.apiKeyId);
+      } else {
+        collidingIds.add(firstId);
+        collidingIds.add(key.apiKeyId);
+      }
+    }
+    return { apiKeys, collidingIds };
+  }, [list.data]);
   const create = useMutation(ApiKeyService.method.createApiKey, {
     onSuccess: (_, { organizationId: submittedOrganizationId }) => {
       if (submittedOrganizationId === undefined) {
@@ -107,29 +119,37 @@ export function ApiKeysPage() {
             <>
               {apiKeys.length > 0 ? (
                 <ul className="list" aria-label="API keys">
-                  {apiKeys.map((k) => (
-                    <li key={k.apiKeyId} className="list-row">
-                      <div className="list-main">
-                        <span className="list-title">
-                          {k.name} · {labels.apiKeyState[k.state]}
-                        </span>
-                        <span className="muted">
-                          <code>{k.keyPrefix}…</code> · created{" "}
-                          {formatTime(k.createTime)}
-                        </span>
-                      </div>
-                      {k.state === ApiKeyState.ACTIVE ? (
-                        <Button
-                          variant={ButtonVariant.Danger}
-                          size={ButtonSize.Small}
-                          aria-label={`Revoke API key ${k.name} (${k.keyPrefix})`}
-                          onClick={() => setRevoking(k)}
-                        >
-                          Revoke
-                        </Button>
-                      ) : null}
-                    </li>
-                  ))}
+                  {apiKeys.map((k) => {
+                    const showId = collidingIds.has(k.apiKeyId);
+                    return (
+                      <li key={k.apiKeyId} className="list-row">
+                        <div className="list-main">
+                          <span className="list-title">
+                            {k.name} · {labels.apiKeyState[k.state]}
+                          </span>
+                          <span className="muted">
+                            <code>{k.keyPrefix}…</code> · created{" "}
+                            {formatTime(k.createTime)}
+                          </span>
+                          {showId ? (
+                            <span className="muted api-key-metadata">
+                              Key ID <code>{k.apiKeyId}</code>
+                            </span>
+                          ) : null}
+                        </div>
+                        {k.state === ApiKeyState.ACTIVE ? (
+                          <Button
+                            variant={ButtonVariant.Danger}
+                            size={ButtonSize.Small}
+                            aria-label={`Revoke API key ${k.name} (${k.keyPrefix})${showId ? `, key ID ${k.apiKeyId}` : ""}`}
+                            onClick={() => setRevoking(k)}
+                          >
+                            Revoke
+                          </Button>
+                        ) : null}
+                      </li>
+                    );
+                  })}
                 </ul>
               ) : null}
               <MorePagesNotice noun="API keys" pages={pages} />
@@ -192,7 +212,24 @@ export function ApiKeysPage() {
         open={revoking !== undefined}
         onOpenChange={(open) => !open && setRevoking(undefined)}
         title={`Revoke ${revoking?.name ?? "this key"}?`}
-        description="Programs that use the key stop working at once. This cannot be undone."
+        description={
+          <>
+            {revoking ? (
+              <span className="api-key-metadata">
+                Prefix <code>{revoking.keyPrefix}</code>
+                {collidingIds.has(revoking.apiKeyId) ? (
+                  <>
+                    <br />
+                    Key ID <code>{revoking.apiKeyId}</code>
+                  </>
+                ) : null}
+                <br />
+              </span>
+            ) : null}
+            Programs that use the key stop working at once. This cannot be
+            undone.
+          </>
+        }
         confirmLabel="Revoke key"
         onConfirm={async () => {
           if (!revoking) return;

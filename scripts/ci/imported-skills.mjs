@@ -302,25 +302,22 @@ export function verifyImportedSkills(root) {
       continue;
     }
 
-    if (!existsSync(join(directory, "SKILL.md"))) {
+    const descriptorStats = entryStats(join(directory, "SKILL.md"));
+    if (!descriptorStats?.isFile()) {
       report(
         ProblemKind.SkillFileMissing,
-        `${directoryPath}/SKILL.md does not exist; restore it from Git`,
+        descriptorStats === undefined
+          ? `${directoryPath}/SKILL.md does not exist; restore it from Git`
+          : `${directoryPath}/SKILL.md must be a regular file; restore it from Git`,
         { skill: name, path: "SKILL.md" },
       );
     }
 
-    const hasLicense = existsSync(join(directory, "LICENSE"));
+    const licenseStats = entryStats(join(directory, "LICENSE"));
     const noticePath = join(directory, "NOTICE");
     const noticeStats = entryStats(noticePath);
     const invalidNotice = noticeStats !== undefined && !noticeStats.isFile();
-    if (!hasLicense && noticeStats === undefined) {
-      report(
-        ProblemKind.LicenseMissing,
-        `${directoryPath} has neither a LICENSE nor a NOTICE file; restore it from Git`,
-        { skill: name },
-      );
-    }
+    let hasValidNotice = noticeStats !== undefined && !invalidNotice;
     if (invalidNotice) {
       const path = `${directoryPath}/NOTICE`;
       if (noticeStats.isSymbolicLink()) {
@@ -334,13 +331,14 @@ export function verifyImportedSkills(root) {
           path: "NOTICE",
         });
       }
-    } else if (noticeStats !== undefined) {
+    } else if (hasValidNotice) {
       // Line endings do not matter for the comparison.
       const notice = readFileSync(noticePath, "utf8")
         .replaceAll("\r\n", "\n")
         .split("\n");
       for (const line of noticeLines(entry)) {
         if (!notice.includes(line)) {
+          hasValidNotice = false;
           report(
             ProblemKind.NoticeMismatch,
             `${directoryPath}/NOTICE does not contain the line "${line}" that ${LockFile} requires`,
@@ -348,6 +346,15 @@ export function verifyImportedSkills(root) {
           );
         }
       }
+    }
+    if (!licenseStats?.isFile() && !hasValidNotice) {
+      report(
+        ProblemKind.LicenseMissing,
+        licenseStats === undefined && noticeStats === undefined
+          ? `${directoryPath} has neither a LICENSE nor a NOTICE file; restore it from Git`
+          : `${directoryPath}/LICENSE must be a regular file when there is no valid NOTICE; restore it from Git`,
+        { skill: name, path: "LICENSE" },
+      );
     }
 
     if (manifest === undefined) {
@@ -401,7 +408,7 @@ export function verifyImportedSkills(root) {
       }
     }
     for (const file of actual) {
-      if (!(file in baseline.files)) {
+      if (!Object.hasOwn(baseline.files, file)) {
         report(
           ProblemKind.FileUnexpected,
           `${directoryPath}/${file} is not listed in ${ManifestFile}; remove it, or run --write-manifest when it is a deliberate addition`,
@@ -413,7 +420,7 @@ export function verifyImportedSkills(root) {
 
   if (manifest !== undefined) {
     for (const name of Object.keys(manifest.skills).sort()) {
-      if (!(name in lock.skills)) {
+      if (!Object.hasOwn(lock.skills, name)) {
         report(
           ProblemKind.ManifestUnknownSkill,
           `${ManifestFile} lists ${name}, which ${LockFile} does not record`,

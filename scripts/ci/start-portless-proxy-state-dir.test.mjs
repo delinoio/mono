@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -11,6 +12,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -78,6 +80,43 @@ console.log("ready");
 // A fake proxy process that runs until the test kills it.
 const fakeProxyCli = `setInterval(() => {}, 1000);`;
 
+// Keep launcher fixtures independent of the developer's listener on port 443.
+const fakeProbe = `
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import http from "node:http";
+import { syncBuiltinESMExports } from "node:module";
+import { dirname, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+const fixtureRoot = dirname(fileURLToPath(import.meta.url));
+const lstat = fs.lstatSync;
+fs.lstatSync = (path) => {
+  const stat = lstat(path);
+  // TMPDIR can live in a group-writable checkout. Only fixture-owned paths
+  // use their actual permissions in these tests.
+  if (fixtureRoot.startsWith(path + sep)) stat.mode &= ~0o022;
+  return stat;
+};
+http.request = (options, onResponse) => {
+  assert.equal(options.hostname, "127.0.0.1");
+  assert.equal(options.port, 443);
+  assert.equal(options.method, "HEAD");
+  const socket = new EventEmitter();
+  socket.destroy = () => {};
+  socket.end = () => queueMicrotask(() => {
+    const probe = process.env.FAKE_PORTLESS_PROBE;
+    if (probe === "refused") {
+      socket.emit("error", new Error("ECONNREFUSED"));
+    } else {
+      onResponse({ headers: probe === "portless" ? { "x-portless": "1" } : {} });
+    }
+  });
+  return socket;
+};
+syncBuiltinESMExports();
+`;
+
 // Creates a repository fixture with two Portless apps and a Turbo CLI.
 function fixture(t) {
   // The real path keeps working directories comparable where the temporary
@@ -96,6 +135,7 @@ function fixture(t) {
       join(dir, "scripts", "dev", script),
     );
   }
+  writeFileSync(join(dir, "probe.mjs"), fakeProbe);
   const turboDir = join(dir, "node_modules", "turbo");
   mkdirSync(turboDir, { recursive: true });
   writeFileSync(
@@ -168,20 +208,33 @@ function startOutdatedProxy(t, dir, stateDir) {
     { stdio: "ignore" },
   );
   t.after(() => proxy.kill());
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(join(stateDir, "proxy.pid"), String(proxy.pid));
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(stateDir, "proxy.pid"), String(proxy.pid), {
+    mode: 0o600,
+  });
   return proxy.pid;
 }
 
 // Runs the requested entry point from the fixture root.
 function run(
   dir,
-  { stateDir, home = dir, script = preflight, portless, proxyStatus = 0 },
+  {
+    stateDir,
+    home = dir,
+    script = preflight,
+    portless,
+    proxyStatus = 0,
+    probe = "refused",
+    mode,
+  },
 ) {
   const record = join(dir, "record.jsonl");
   const {
     PORTLESS: _shellPortless,
+    PORTLESS_HTTPS: _shellHttps,
+    PORTLESS_PORT: _shellPort,
     PORTLESS_STATE_DIR: _shellStateDir,
+    PORTLESS_UNPRIVILEGED: _shellUnprivileged,
     ...shellEnv
   } = process.env;
   const env = {
@@ -190,12 +243,14 @@ function run(
     USERPROFILE: home,
     FAKE_PORTLESS_RECORD: record,
     FAKE_PORTLESS_STATUS: String(proxyStatus),
+    FAKE_PORTLESS_PROBE: probe,
+    ...mode,
   };
   if (portless !== undefined) env.PORTLESS = portless;
   if (stateDir !== undefined) env.PORTLESS_STATE_DIR = stateDir;
   const result = spawnSync(
     process.execPath,
-    [join(dir, "scripts", "dev", script)],
+    ["--import", join(dir, "probe.mjs"), join(dir, "scripts", "dev", script)],
     { encoding: "utf8", env, cwd: dir },
   );
   const calls = existsSync(record)
@@ -334,10 +389,159 @@ test("root dev exits before Turbo when the proxy preflight fails", (t) => {
 
 test("root dev starts Turbo without a proxy when PORTLESS=0", (t) => {
   const { dir, appDir, siblingDir } = fixture(t);
-  const result = run(dir, { script: launcher, portless: "0" });
+  const result = run(dir, {
+    script: launcher,
+    portless: "0",
+    probe: "portless",
+  });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.calls, appCalls(appDir, siblingDir, null));
   assert.match(result.stderr, /portless_proxy_preflight_disabled/);
+});
+
+test(
+  "root dev rejects a Portless listener with no matching default state",
+  { skip: psSkip },
+  async (t) => {
+    for (const stateDir of [undefined, ""]) {
+      await t.test(
+        stateDir === undefined ? "unset override" : "empty override",
+        (t) => {
+          const { dir } = fixture(t);
+          const result = run(dir, {
+            stateDir,
+            script: launcher,
+            probe: "portless",
+          });
+          assert.equal(result.status, 1, result.stderr);
+          assert.deepEqual(result.calls, []);
+          assert.deepEqual(JSON.parse(result.stderr), {
+            event: "portless_proxy_state_mismatch",
+            address: "127.0.0.1",
+            port: 443,
+            expectedStateDir: join(dir, ".portless"),
+            hint: "Stop the proxy with `portless proxy stop` from the Portless installation that started it, then rerun `pnpm dev`.",
+          });
+        },
+      );
+    }
+  },
+);
+
+test(
+  "root dev ignores PID files from writable or linked default state",
+  { skip: psSkip },
+  async (t) => {
+    for (const location of ["directory", "directory symlink", "PID symlink"]) {
+      await t.test(location, (t) => {
+        const { dir } = fixture(t);
+        const stateDir = join(dir, ".portless");
+        const legacyDir =
+          location === "directory" ? stateDir : join(dir, "legacy");
+        const pid = startOutdatedProxy(t, dir, legacyDir);
+        chmodSync(legacyDir, 0o1777);
+        const legacyPid = join(legacyDir, "proxy.pid");
+        const legacyRoutes = join(legacyDir, "routes.json");
+        writeFileSync(legacyRoutes, "legacy routes sentinel");
+        if (location === "directory symlink") symlinkSync(legacyDir, stateDir);
+        if (location === "PID symlink") {
+          mkdirSync(stateDir);
+          symlinkSync(legacyPid, join(stateDir, "proxy.pid"));
+        }
+
+        const result = run(dir, { script: launcher, probe: "portless" });
+        assert.equal(result.status, 1, result.stderr);
+        assert.equal(
+          JSON.parse(result.stderr).event,
+          "portless_proxy_state_mismatch",
+        );
+        assert.deepEqual(result.calls, []);
+        assert.equal(readFileSync(legacyPid, "utf8"), String(pid));
+        assert.equal(
+          readFileSync(legacyRoutes, "utf8"),
+          "legacy routes sentinel",
+        );
+        assert.doesNotThrow(() => process.kill(pid, 0));
+      });
+    }
+  },
+);
+
+test(
+  "root dev checks the recorded listener port and process start time",
+  { skip: psSkip },
+  async (t) => {
+    for (const record of ["matching", "wrong port", "stale start time"]) {
+      await t.test(record, (t) => {
+        const repo = versionedProxyFixture(t);
+        if (repo === null) return;
+        const { dir, appDir, siblingDir } = repo;
+        const stateDir = join(dir, ".portless");
+        const pid = startOutdatedProxy(t, dir, stateDir);
+        const start =
+          process.platform === "linux"
+            ? /^\d+ \(.*\) (?:\S+ ){19}(\d+)/.exec(
+                readFileSync(`/proc/${pid}/stat`, "utf8"),
+              )[1]
+            : spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+                encoding: "utf8",
+                env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+              })
+                .stdout.trim()
+                .replace(/\s+/g, " ");
+        writeFileSync(
+          join(stateDir, "proxy.port"),
+          record === "wrong port" ? "80" : "443",
+          { mode: 0o600 },
+        );
+        writeFileSync(
+          join(stateDir, "proxy.start"),
+          record === "stale start time" ? "stale" : start,
+          { mode: 0o600 },
+        );
+
+        const result = run(dir, { script: launcher, probe: "portless" });
+        if (record === "matching") {
+          assert.equal(result.status, 0, result.stderr);
+          assert.deepEqual(result.calls, [
+            ...stopThenStart(appDir),
+            ...appCalls(appDir, siblingDir, null),
+          ]);
+        } else {
+          assert.equal(result.status, 1, result.stderr);
+          assert.equal(
+            JSON.parse(result.stderr).event,
+            "portless_proxy_state_mismatch",
+          );
+          assert.deepEqual(result.calls, []);
+        }
+      });
+    }
+  },
+);
+
+test("root dev keeps the pinned startup path for unrelated listeners and overrides", async (t) => {
+  for (const [name, config] of [
+    ["unrelated listener", { probe: "unrelated" }],
+    ["state override", { stateDir: "override", probe: "portless" }],
+    ["custom port", { mode: { PORTLESS_PORT: "1355" }, probe: "portless" }],
+    ["plain HTTP", { mode: { PORTLESS_HTTPS: "0" }, probe: "portless" }],
+    [
+      "unprivileged HTTP",
+      { mode: { PORTLESS_UNPRIVILEGED: "1" }, probe: "portless" },
+    ],
+  ]) {
+    await t.test(name, (t) => {
+      const { dir, appDir, siblingDir } = fixture(t);
+      const result = run(dir, { script: launcher, ...config });
+      const stateDir = config.stateDir ? join(appDir, config.stateDir) : null;
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(result.calls, [
+        ...startOnly(appDir, stateDir),
+        ...appCalls(appDir, siblingDir, stateDir),
+      ]);
+    });
+  }
 });
 
 for (const { signal, group } of [

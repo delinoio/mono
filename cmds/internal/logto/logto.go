@@ -68,19 +68,52 @@ type Token struct {
 	TokenType    string `json:"token_type"`
 }
 
-// Error is an OAuth error response. It carries only the error code and the
-// description.
+// ErrorCode is a recognized OAuth error code.
+type ErrorCode string
+
+const (
+	// InvalidGrant can indicate a spent refresh token.
+	InvalidGrant ErrorCode = "invalid_grant"
+
+	authorizationPending ErrorCode = "authorization_pending"
+	slowDown             ErrorCode = "slow_down"
+	accessDenied         ErrorCode = "access_denied"
+	expiredToken         ErrorCode = "expired_token"
+)
+
+// Error is an OAuth error response with the HTTP status and a recognized code,
+// if present.
 type Error struct {
-	Code        string `json:"error"`
-	Description string `json:"error_description"`
-	Status      int    `json:"-"`
+	Status int
+	code   ErrorCode
 }
 
+// Code returns the recognized OAuth code or an empty value.
+func (e *Error) Code() ErrorCode { return e.code }
+
 func (e *Error) Error() string {
-	if e.Description != "" {
-		return fmt.Sprintf("logto: %s: %s", e.Code, e.Description)
+	if e.code != "" {
+		return "logto: " + string(e.code)
 	}
-	return "logto: " + e.Code
+	return fmt.Sprintf("logto: http_%d", e.Status)
+}
+
+func oauthError(status int, body []byte) *Error {
+	e := &Error{Status: status}
+	var response struct {
+		Code ErrorCode `json:"error"`
+	}
+	if json.Unmarshal(body, &response) == nil {
+		// Allow only the token and device-flow error codes from RFC 6749
+		// section 5.2 and RFC 8628 section 3.5.
+		switch response.Code {
+		case "invalid_request", "invalid_client", InvalidGrant, "unauthorized_client",
+			"unsupported_grant_type", "invalid_scope",
+			authorizationPending, slowDown, accessDenied, expiredToken:
+			e.code = response.Code
+		}
+	}
+	return e
 }
 
 // ErrMissingConfig reports a configuration without a tenant endpoint or an
@@ -216,11 +249,7 @@ func (c Config) post(ctx context.Context, path string, form url.Values, out any)
 		return fmt.Errorf("logto: %s: %w", path, err)
 	}
 	if res.StatusCode/100 != 2 {
-		e := &Error{Status: res.StatusCode}
-		if json.Unmarshal(body, e) != nil || e.Code == "" {
-			e.Code = fmt.Sprintf("http_%d", res.StatusCode)
-		}
-		return e
+		return oauthError(res.StatusCode, body)
 	}
 	if err := json.Unmarshal(body, out); err != nil {
 		return fmt.Errorf("logto: %s: invalid response", path)
@@ -358,13 +387,13 @@ func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInter
 			}
 			continue
 		}
-		switch oe.Code {
-		case "authorization_pending":
-		case "slow_down":
+		switch oe.Code() {
+		case authorizationPending:
+		case slowDown:
 			interval += 5 * time.Second
-		case "access_denied":
+		case accessDenied:
 			return nil, ErrAccessDenied
-		case "expired_token":
+		case expiredToken:
 			return nil, ErrExpired
 		default:
 			return nil, err

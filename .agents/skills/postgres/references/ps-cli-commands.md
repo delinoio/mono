@@ -30,10 +30,12 @@ export PLANETSCALE_SERVICE_TOKEN="<token>"
 
 ## Core Commands
 
+If you omit `--engine`, `pscale database create` selects Vitess (`mysql`).
+
 ```bash
 # Databases
 pscale database list
-pscale database create <name>
+pscale database create <name> --engine postgresql
 
 # Branches
 pscale branch list <db>
