@@ -196,6 +196,7 @@ type fakeCP struct {
 	authScript  func(n int, req *ownsandv1.AuthorizeRelayRequest) authAction
 	relayCalls  map[string]int
 	relayLog    []string
+	relayExecs  []*ownsandv1.ExecRequest
 	// heldEnded records when a held (holdOpen or keepalivesOnly) relay
 	// stream ended because the caller cancelled it, and when it began.
 	heldStarts  []time.Time
@@ -932,6 +933,11 @@ func (f *fakeRelay) execLike(ctx context.Context, method string, h http.Header, 
 }
 
 func (f *fakeRelay) Exec(ctx context.Context, req *connect.Request[ownsandv1.ExecRequest], stream *connect.ServerStream[ownsandv1.ExecResponse]) error {
+	// Capture the decoded payload before normalization or a scripted abort.
+	cp := f.cp
+	cp.mu.Lock()
+	cp.relayExecs = append(cp.relayExecs, proto.Clone(req.Msg).(*ownsandv1.ExecRequest))
+	cp.mu.Unlock()
 	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
 	if f.cp.onExecRequest != nil {
 		f.cp.onExecRequest(req.Msg)
