@@ -187,6 +187,12 @@ func (op *readOp) run(ctx context.Context) (int64, error) {
 		if errors.As(err, &cb) {
 			return op.next, cb.err
 		}
+		if isLocalCredentialError(err) {
+			if cerr := ctx.Err(); cerr != nil {
+				return op.next, cerr
+			}
+			return op.next, op.dpErr(err)
+		}
 		if errors.Is(err, io.EOF) {
 			if at.accepted {
 				op.rec.reset()
