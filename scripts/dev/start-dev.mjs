@@ -21,11 +21,16 @@ async function main() {
     { stdio: "inherit", shell: false },
   );
 
-  // Turbo shares the terminal process group. Let it handle shutdown and wait
-  // for its exit without sending it a second signal.
+  // Turbo receives terminal Ctrl-C directly in the shared process group.
+  // Relay a PID-directed SIGTERM once. In a group SIGTERM, the CLI forwards
+  // at most once and native Turbo counts its direct and relayed signals as one.
   const signals = ["SIGINT", "SIGTERM", "SIGQUIT", "SIGHUP"];
-  const onSignal = (signal) =>
+  const onSignal = (signal) => {
     console.error(JSON.stringify({ event: "root_dev_signal", signal }));
+    if (process.platform !== "win32" && signal === "SIGTERM" && !child.killed) {
+      child.kill(signal);
+    }
+  };
   for (const signal of signals) process.on(signal, onSignal);
   try {
     return await new Promise((resolveStatus, reject) => {
