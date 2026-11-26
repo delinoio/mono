@@ -14,6 +14,7 @@ import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 import { BillingBanner } from "./billing.tsx";
 import {
   ErrorNotice,
+  isTerminalError,
   Loading,
   RefreshFailedNotice,
   showsFullError,
@@ -126,6 +127,7 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
       </Link>
       {organizationId !== undefined &&
       orgs.isLoaded &&
+      !isTerminalError(orgs.error) &&
       orgs.terminalLoadMoreError === null ? (
         <div className="org-switcher">
           <Select

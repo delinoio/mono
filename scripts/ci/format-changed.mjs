@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { constants } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { isWorkspaceCli } from "./workspace-node.mjs";
 
 const require = createRequire(import.meta.url);
 const extensions = new Set([
@@ -860,10 +861,7 @@ export async function main(env = process.env) {
   return status;
 }
 
-// import.meta.main needs Node 24.2+ (Rstack already requires 24.3+). Unlike
-// comparing process.argv[1] with the module URL, it also holds when the script
-// path goes through a symlink.
-if (import.meta.main) {
+if (isWorkspaceCli(import.meta)) {
   try {
     process.exitCode = await main();
   } catch (error) {

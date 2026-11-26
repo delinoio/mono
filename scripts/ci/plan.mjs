@@ -12,6 +12,7 @@ import {
   workspacePackageDirs,
   workspaceRoots,
 } from "./workspace-packages.mjs";
+import { isWorkspaceCli } from "./workspace-node.mjs";
 
 // Re-exported for the planner's callers and fixtures.
 export { workspacePackageDirs, workspaceRoots };
@@ -497,7 +498,6 @@ export function main(env = process.env, cwd = process.cwd()) {
   console.log(JSON.stringify(record));
 }
 
-// import.meta.main needs Node 24.2+; it also holds for symlinked script paths.
 // A selection failure (a comparison revision that does not exist, an unset or
 // malformed comparison, an unreadable checkout) must reach the log as one
 // parseable record, like the formatter's, not as a stack trace. Exit code 2 is
@@ -508,7 +508,7 @@ export function main(env = process.env, cwd = process.cwd()) {
 // `changes` job still fails closed. Residual limit: a real I/O failure on the
 // second write (the summary) can still leave the outputs file written; atomic
 // publishing is out of scope.
-if (import.meta.main) {
+if (isWorkspaceCli(import.meta)) {
   try {
     main();
   } catch (error) {

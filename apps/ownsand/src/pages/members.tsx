@@ -40,6 +40,7 @@ import {
   uniqueRows,
   useFollowAllPages,
 } from "../pagination.ts";
+import { repeatedPrefixes } from "../revocation.ts";
 import { can, canManageMember, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
 
@@ -223,6 +224,11 @@ function Invitations() {
       ).filter((invitation) => invitation.state === InvitationState.PENDING),
     [list.data],
   );
+  const collisions = useMemo(
+    () =>
+      repeatedPrefixes(pending.map((invitation) => invitation.secretPrefix)),
+    [pending],
+  );
   const create = useMutation(MemberService.method.createInvitation, {
     onSuccess: (_, { organizationId: submittedOrganizationId }) => {
       if (submittedOrganizationId === undefined) {
@@ -242,6 +248,10 @@ function Invitations() {
   const [inviteRole, setInviteRole] = useState(String(Role.MEMBER));
   const [link, setLink] = useState<string>();
   const [revoking, setRevoking] = useState<Invitation>();
+  const revokingId =
+    revoking && collisions.has(revoking.secretPrefix)
+      ? ` (${revoking.invitationId})`
+      : "";
   if (isTerminalError(pages.error) && revoking !== undefined) {
     setRevoking(undefined);
   }
@@ -268,27 +278,35 @@ function Invitations() {
             <>
               {pending.length > 0 ? (
                 <ul className="list" aria-label="Pending invitations">
-                  {pending.map((i) => (
-                    <li key={i.invitationId} className="list-row">
-                      <div className="list-main">
-                        <span className="list-title">
-                          {labels.role[i.role]} invitation{" "}
-                          <code>{i.secretPrefix}…</code>
-                        </span>
-                        <span className="muted">
-                          Expires {formatTime(i.expireTime)}
-                        </span>
-                      </div>
-                      <Button
-                        variant={ButtonVariant.Secondary}
-                        size={ButtonSize.Small}
-                        aria-label={`Revoke ${labels.role[i.role]} invitation ${i.secretPrefix}`}
-                        onClick={() => setRevoking(i)}
-                      >
-                        Revoke
-                      </Button>
-                    </li>
-                  ))}
+                  {pending.map((i) => {
+                    const showId = collisions.has(i.secretPrefix);
+                    return (
+                      <li key={i.invitationId} className="list-row">
+                        <div className="list-main">
+                          <span className="list-title">
+                            {labels.role[i.role]} invitation{" "}
+                            <code>{i.secretPrefix}…</code>
+                          </span>
+                          <span className="muted">
+                            Expires {formatTime(i.expireTime)}
+                          </span>
+                          {showId ? (
+                            <span className="muted list-record-id">
+                              ID <code>{i.invitationId}</code>
+                            </span>
+                          ) : null}
+                        </div>
+                        <Button
+                          variant={ButtonVariant.Secondary}
+                          size={ButtonSize.Small}
+                          aria-label={`Revoke ${labels.role[i.role]} invitation ${i.secretPrefix}${showId ? ` (${i.invitationId})` : ""}`}
+                          onClick={() => setRevoking(i)}
+                        >
+                          Revoke
+                        </Button>
+                      </li>
+                    );
+                  })}
                 </ul>
               ) : null}
               <MorePagesNotice noun="pending invitations" pages={pages} />
@@ -299,7 +317,7 @@ function Invitations() {
       <ConfirmDialog
         open={revoking !== undefined}
         onOpenChange={(open) => !open && setRevoking(undefined)}
-        title={`Revoke invitation ${revoking ? `${revoking.secretPrefix}…` : ""}?`}
+        title={`Revoke invitation ${revoking ? `${revoking.secretPrefix}…${revokingId}` : ""}?`}
         description="The invitation link stops working at once. It cannot be restored; create a new link instead."
         confirmLabel="Revoke invitation"
         onConfirm={async () => {
