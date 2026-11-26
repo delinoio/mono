@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { spawn } from "node:child_process";
 import { createServer, type Server } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
@@ -9,6 +10,8 @@ import { rspressBin } from "./rspress-bin";
 // The fixed development port that `rspress.config.ts` declares.
 const FIXED_PORT = 13600;
 const LOOPBACK_HOST = "127.0.0.1";
+const BIND_TIMEOUT_MS = 1_000;
+const BIND_RETRY_MS = 50;
 const EXIT_TIMEOUT_MS = 60_000;
 const APP_DIRECTORY = fileURLToPath(new URL("..", import.meta.url));
 
@@ -17,28 +20,50 @@ interface DevServerResult {
   output: string;
 }
 
-// Holds a loopback port so a development server cannot bind it. A port that
-// another process already holds is just as occupied, so `EADDRINUSE` is not a
-// failure: the conflict the test needs exists either way.
-const occupy = (port: number): Promise<Server | undefined> =>
+const listen = (port: number): Promise<Server> =>
   new Promise((resolve, reject) => {
     const holder = createServer();
-    holder.once("error", (error: NodeJS.ErrnoException) => {
-      if (error.code === "EADDRINUSE") {
-        resolve(undefined);
-        return;
-      }
-      reject(error);
+    holder.once("error", reject);
+    holder.listen(port, LOOPBACK_HOST, () => {
+      holder.off("error", reject);
+      resolve(holder);
     });
-    holder.listen(port, LOOPBACK_HOST, () => resolve(holder));
   });
 
-const release = (holder: Server | undefined): Promise<void> =>
-  new Promise((resolve) => {
-    if (holder === undefined) {
-      resolve();
-      return;
+// The fixture must hold the port itself because an unrelated listener can
+// close at any time before Rspress tries to bind.
+const occupy = async (port: number): Promise<Server> => {
+  const deadline = performance.now() + BIND_TIMEOUT_MS;
+  while (true) {
+    try {
+      return await listen(port);
+    } catch (error) {
+      if (
+        port === 0 ||
+        !(error instanceof Error) ||
+        !("code" in error) ||
+        error.code !== "EADDRINUSE"
+      ) {
+        throw error;
+      }
+      const remaining = deadline - performance.now();
+      if (remaining > 0) {
+        await delay(Math.min(BIND_RETRY_MS, remaining));
+      }
+      if (performance.now() >= deadline) {
+        throw new Error(
+          `Could not bind the test listener to ${LOOPBACK_HOST}:${port} within ${BIND_TIMEOUT_MS} ms`,
+          {
+            cause: error,
+          },
+        );
+      }
     }
+  }
+};
+
+const release = (holder: Server): Promise<void> =>
+  new Promise((resolve) => {
     holder.close(() => resolve());
   });
 
@@ -59,10 +84,8 @@ const hostEnv = (): NodeJS.ProcessEnv => {
   return env;
 };
 
-// Runs `rspress dev` from the app directory with an argument array and no
-// shell (through the CLI file that `rspressBin` resolves), and waits for it to
-// exit. A server that survives the timeout counts as a failure of the rule
-// under test and is killed.
+// Wait for close even after a timeout or spawn error so the caller can keep
+// its listener open until the child has terminated and its output is drained.
 const runDevServer = (args: string[]): Promise<DevServerResult> =>
   new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [rspressBin(), "dev", ...args], {
@@ -72,22 +95,31 @@ const runDevServer = (args: string[]): Promise<DevServerResult> =>
       stdio: ["ignore", "pipe", "pipe"],
     });
     let output = "";
+    let timedOut = false;
+    let childError: Error | undefined;
     child.stdout.on("data", (chunk: Buffer) => (output += chunk.toString()));
     child.stderr.on("data", (chunk: Buffer) => (output += chunk.toString()));
     const timer = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGKILL");
-      reject(
-        new Error(`rspress dev did not exit within ${EXIT_TIMEOUT_MS} ms`, {
-          cause: output,
-        }),
-      );
     }, EXIT_TIMEOUT_MS);
     child.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+      childError = error;
     });
     child.once("close", (exitCode) => {
       clearTimeout(timer);
+      if (timedOut) {
+        reject(
+          new Error(`rspress dev did not exit within ${EXIT_TIMEOUT_MS} ms`, {
+            cause: output,
+          }),
+        );
+        return;
+      }
+      if (childError) {
+        reject(childError);
+        return;
+      }
       resolve({ exitCode, output });
     });
   });
@@ -100,6 +132,7 @@ describe("development server port", () => {
     try {
       const result = await runDevServer([]);
 
+      expect(result.exitCode).not.toBe(null);
       expect(result.exitCode).not.toBe(0);
       expect(result.output).toContain(`Port ${FIXED_PORT} is occupied`);
       expect(result.output).not.toContain("Local:");
@@ -113,7 +146,7 @@ describe("development server port", () => {
     // the runner starts the server on a free port.
     const holder = await occupy(0);
     try {
-      const address = holder?.address();
+      const address = holder.address();
       if (address === null || typeof address !== "object") {
         throw new Error("the port holder has no address");
       }
@@ -125,8 +158,10 @@ describe("development server port", () => {
         String(address.port),
       ]);
 
+      expect(result.exitCode).not.toBe(null);
       expect(result.exitCode).not.toBe(0);
       expect(result.output).toContain(`Port ${address.port} is occupied`);
+      expect(result.output).not.toContain("Local:");
     } finally {
       await release(holder);
     }
