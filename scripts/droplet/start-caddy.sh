@@ -132,20 +132,28 @@ wait_ready() {
 
 # List by exact name to distinguish an absent container from an inspect
 # failure. Keep the ID so removal targets only the container we inspected.
-current_id="$("${docker_command[@]}" container ls --all --no-trunc --filter 'name=^/caddy$' --format '{{.ID}}')"
+if ! current_id="$("${docker_command[@]}" container ls --all --no-trunc --filter 'name=^/caddy$' --format '{{.ID}}')"; then
+  echo "error: cannot look up the caddy container." >&2
+  exit 1
+fi
 current_image=""
 running=""
 current_log_driver=""
 if [[ -n "$current_id" ]]; then
-  if ! settings="$("${docker_command[@]}" container inspect --format '{{.Config.Image}} {{.State.Running}} {{.HostConfig.LogConfig.Type}}' "$current_id")"; then
+  if ! settings="$("${docker_command[@]}" container inspect --format '{{.Config.Image}}|{{.State.Running}}|{{.HostConfig.LogConfig.Type}}' "$current_id")"; then
     echo "error: cannot inspect the settings of the caddy container." >&2
     exit 1
   fi
-  read -r current_image running current_log_driver <<< "$settings"
-  if [[ -z "$current_log_driver" || "$current_log_driver" == '<no value>' ]]; then
-    echo "error: cannot determine the log driver of the caddy container." >&2
+  # Preserve field boundaries and reject missing fields and Docker's
+  # placeholders before a settings mismatch can trigger removal.
+  settings_pattern='^([^[:space:]|<>]+)\|(true|false)\|([^[:space:]|<>]+)$'
+  if [[ ! "$settings" =~ $settings_pattern ]]; then
+    echo "error: cannot determine the image, running state and log driver of the caddy container." >&2
     exit 1
   fi
+  current_image="${BASH_REMATCH[1]}"
+  running="${BASH_REMATCH[2]}"
+  current_log_driver="${BASH_REMATCH[3]}"
 fi
 
 if [[ "$current_image" != "$caddy_image" || "$current_log_driver" != "local" ]]; then
