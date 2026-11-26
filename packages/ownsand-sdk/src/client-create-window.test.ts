@@ -92,16 +92,33 @@ describe("the 60-second create retry window after a late back-off wake", () => {
     );
   });
 
-  test("keeps the in-flight bound of a retry that starts with positive time", async () => {
+  test("aborts an in-flight retry at the original deadline", async () => {
     const h = setup((clock) => ({ clock: lateWakeClock(clock, lateFor(5)) }));
+    let retrySignal: AbortSignal | undefined;
     h.api.unary(SandboxService, "CreateSandbox", (_req, call) => {
       if (call.index === 0) throw firstFailure();
+      retrySignal ??= call.signal;
       return new Promise<never>(() => {});
     });
-    const error = await h.clock
-      .run(h.client.createSandbox(validCreate))
-      .catch((e) => e);
-    expectFirstFailure(error);
+
+    let settled = false;
+    const outcome = h.client
+      .createSandbox(validCreate)
+      .catch((error: unknown) => error)
+      .then((result) => {
+        settled = true;
+        return result;
+      });
+
+    await h.clock.advance(FIRST_BACKOFF_MS + 4);
+    expect(h.api.callsOf("CreateSandbox")).toHaveLength(2);
+    expect(retrySignal?.aborted).toBe(false);
+    expect(settled).toBe(false);
+
+    await h.clock.advance(1);
+    expect(retrySignal?.aborted).toBe(true);
+    expect(settled).toBe(true);
+    expectFirstFailure(await outcome);
     expect(h.api.callsOf("CreateSandbox")).toHaveLength(2);
   });
 

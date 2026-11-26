@@ -40,11 +40,7 @@ func TestRunWaitsForOpenStreamAfterContextEnds(t *testing.T) {
 	}
 
 	rig.stop()
-	select {
-	case err := <-rig.result:
-		t.Fatalf("Run returned %v while a stream was open", err)
-	case <-time.After(500 * time.Millisecond):
-	}
+	rig.waitForShutdownWithOpenRequest(t, 500*time.Millisecond)
 
 	release()
 	evs := s.collectExec()

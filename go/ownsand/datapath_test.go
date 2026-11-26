@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,6 +67,38 @@ func waitGate(t *testing.T, cp *fakeCP, kind string) {
 	}
 }
 
+type setupWaitContext struct {
+	context.Context
+	observeSlot func()
+}
+
+func (ctx setupWaitContext) Done() <-chan struct{} {
+	ctx.observeSlot()
+	return ctx.Context.Done()
+}
+
+func startSetupWaiter(ctx context.Context, s *Sandbox) (<-chan execResult, <-chan bool) {
+	occupied := make(chan bool, 1)
+	// Exec first calls Done in acquireOpen after checking Err and before
+	// trying to take the slot. Record whether the opener still holds it.
+	ctx = setupWaitContext{Context: ctx, observeSlot: sync.OnceFunc(func() {
+		occupied <- len(s.dp.openSlot) == cap(s.dp.openSlot)
+	})}
+	return startExec(ctx, s), occupied
+}
+
+func waitForSetupWaiter(t *testing.T, name string, occupied <-chan bool) {
+	t.Helper()
+	select {
+	case busy := <-occupied:
+		if !busy {
+			t.Fatalf("waiter %s reached a free setup slot", name)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("waiter %s did not reach the setup slot", name)
+	}
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -109,9 +142,7 @@ func TestCloseDuringSetupReleasesTheSetup(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := waitExec(t, ch)
-	if !errors.Is(r.err, errHandleClosed) {
-		t.Fatalf("exec after Close during setup: %v", r.err)
-	}
+	requireHandleClosed(t, r.err)
 	waitFor(t, "the held request to end", func() bool { return cp.gateCanceledCount() == 1 })
 	close(cp.iceGate)
 	if s.installedSession() != nil {
@@ -124,11 +155,43 @@ func TestCloseDuringSetupReleasesTheSetup(t *testing.T) {
 	// the control plane.
 	before := cp.iceCallCount()
 	_, err := s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
-	if !errors.Is(err, errHandleClosed) {
-		t.Fatalf("exec on a closed handle: %v", err)
-	}
+	requireHandleClosed(t, err)
 	if cp.iceCallCount() != before || cp.openSessionCount() != 0 {
 		t.Fatal("a closed handle called the control plane")
+	}
+}
+
+func TestCloseDuringFailedSetupPreventsFallback(t *testing.T) {
+	for _, cc := range closeCases {
+		t.Run(cc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.iceGate = make(chan struct{})
+			cp.gateErr = connect.NewError(connect.CodeUnavailable, errors.New("ICE setup failed"))
+			c := cp.client(t, TransportAuto)
+			logs := captureLogs(c)
+			s := cp.handle(t, c)
+			transport := s.Transport()
+			var setupReturned, closed atomic.Bool
+			c.p2p.setupDone = func() { setupReturned.Store(true) }
+			ctx := &recvTestContext{Context: t.Context(), beforeErr: func() {
+				// The failing route checks the caller after the initial
+				// closed-state check and before it selects the relay.
+				if setupReturned.Load() && closed.CompareAndSwap(false, true) {
+					cc.close(t, s)
+				}
+			}}
+			res, err := s.Exec(ctx, ExecParams{Command: []string{"run"}})
+			requireHandleClosed(t, err)
+			if res != nil || !closed.Load() || cp.iceCallCount() != 1 {
+				t.Fatalf("exec result = %+v, closed = %v, GetIceServers calls = %d", res, closed.Load(), cp.iceCallCount())
+			}
+			if s.usesRelay() || s.Transport() != transport {
+				t.Fatalf("transport = %v after close during setup, want %v", s.Transport(), transport)
+			}
+			if len(cp.authRequests()) != 0 || strings.Contains(logs.String(), "falls back to the relay") {
+				t.Fatal("failed setup fell back to relay after the handle closed")
+			}
+		})
 	}
 }
 
@@ -189,14 +252,15 @@ func TestWaitingOperationCancelsWithoutEndingTheSetup(t *testing.T) {
 	cp.gateHits = make(chan string, 4)
 	s := cp.handle(t, cp.client(t, TransportAuto))
 
-	a := startExec(context.Background(), s)
+	a := startExec(t.Context(), s)
 	waitGate(t, cp, "ice")
 	// Waiter C keeps waiting; waiter B cancels.
-	c := startExec(context.Background(), s)
-	bctx, cancelB := context.WithCancel(context.Background())
+	c, cOccupied := startSetupWaiter(t.Context(), s)
+	bctx, cancelB := context.WithCancel(t.Context())
 	defer cancelB()
-	b := startExec(bctx, s)
-	time.Sleep(100 * time.Millisecond)
+	b, bOccupied := startSetupWaiter(bctx, s)
+	waitForSetupWaiter(t, "B", bOccupied)
+	waitForSetupWaiter(t, "C", cOccupied)
 	canceledAt := time.Now()
 	cancelB()
 	rb := waitExec(t, b)
@@ -242,12 +306,12 @@ func TestWaiterRunsTheSetupWhenTheOpenerEnds(t *testing.T) {
 	cp.gateHits = make(chan string, 4)
 	s := cp.handle(t, cp.client(t, TransportAuto))
 
-	actx, cancelA := context.WithCancel(context.Background())
+	actx, cancelA := context.WithCancel(t.Context())
 	defer cancelA()
 	a := startExec(actx, s)
 	waitGate(t, cp, "ice")
-	w := startExec(context.Background(), s)
-	time.Sleep(100 * time.Millisecond)
+	w, wOccupied := startSetupWaiter(t.Context(), s)
+	waitForSetupWaiter(t, "W", wOccupied)
 	cancelA()
 	if ra := waitExec(t, a); !errors.Is(ra.err, context.Canceled) {
 		t.Fatalf("opener error: %v", ra.err)
@@ -406,6 +470,96 @@ func TestCallerDeadlineEndsStalledSetupWithoutRelayRecovery(t *testing.T) {
 	}
 }
 
+func TestLateDataChannelOpen(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		transport     Transport
+		setupTimeout  bool
+		callerCancels bool
+		wantTransport ownsandv1.DataPathTransport
+		wantRelayAuth int
+	}{
+		{name: "auto-timeout", transport: TransportAuto, setupTimeout: true, wantTransport: relayTransport, wantRelayAuth: 1},
+		{name: "forced-peer-timeout", transport: TransportPeerToPeer, setupTimeout: true},
+		{name: "caller-cancels", transport: TransportAuto, callerCancels: true},
+		{name: "timely-open", transport: TransportAuto, wantTransport: p2pTransport},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			c := cp.client(t, tc.transport)
+			if tc.setupTimeout {
+				c.timing.p2pOpenTimeout = 2 * time.Second
+			}
+			s := cp.handle(t, c)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var peer *webrtc.PeerConnection
+			c.p2p.gateDataChannelOpen = func(setup context.Context, pc *webrtc.PeerConnection, opened <-chan struct{}) <-chan struct{} {
+				peer = pc
+				t.Cleanup(func() { _ = pc.Close() })
+				select {
+				case <-opened:
+				case <-time.After(10 * time.Second):
+					t.Fatal("the loopback data channel did not open")
+				}
+				if tc.callerCancels {
+					cancel()
+				}
+				if tc.setupTimeout || tc.callerCancels {
+					<-setup.Done()
+				}
+				// Release the open notification after any cancellation so both
+				// signals are already ready when the final select starts.
+				released := make(chan struct{})
+				close(released)
+				return released
+			}
+
+			rec := &recorder{}
+			res, err := s.Exec(ctx, ExecParams{Command: []string{"run"}, OnEvent: rec.on})
+			switch {
+			case tc.callerCancels:
+				if err != context.Canceled {
+					t.Fatalf("Exec error = %v, want context.Canceled", err)
+				}
+			case tc.setupTimeout && tc.transport == TransportPeerToPeer:
+				var openErr *errP2POpen
+				if !errors.As(err, &openErr) || !errors.Is(err, errSetupTimeout) {
+					t.Fatalf("Exec error = %v, want peer setup timeout", err)
+				}
+			default:
+				if err != nil {
+					t.Fatal(err)
+				}
+				checkLines(t, res, rec, 3)
+				if res.Transport != tc.wantTransport || s.Transport() != tc.wantTransport {
+					t.Fatalf("Exec transport = %v, handle transport = %v, want %v", res.Transport, s.Transport(), tc.wantTransport)
+				}
+			}
+			if got := len(cp.authRequests()); got != tc.wantRelayAuth {
+				t.Fatalf("AuthorizeRelay calls = %d, want %d", got, tc.wantRelayAuth)
+			}
+			if peer == nil {
+				t.Fatal("setup did not reach the final data channel wait")
+			}
+			installed := s.installedSession()
+			if tc.wantTransport == p2pTransport {
+				if installed == nil || installed.pc != peer {
+					t.Fatal("the timely peer connection did not become the installed session")
+				}
+			} else {
+				if installed != nil {
+					t.Fatal("a peer connection was installed after setup cancellation")
+				}
+				waitFor(t, "the canceled peer connection to close", func() bool {
+					return peer.ConnectionState() == webrtc.PeerConnectionStateClosed
+				})
+			}
+		})
+	}
+}
+
 // A control plane that applies the caller's deadline (Connect sends the time
 // left as a timeout header) can answer deadline_exceeded slightly before the
 // caller's own timer fires. The test makes that order deterministic: the held
@@ -552,6 +706,24 @@ func waitOpErr(t *testing.T, ch <-chan error) error {
 	}
 }
 
+func requireHandleClosed(t *testing.T, err error) {
+	t.Helper()
+	var dpErr *DataPathError
+	if errors.As(err, &dpErr) || err != errHandleClosed {
+		t.Fatalf("operation error = %T(%v), want direct errHandleClosed", err, err)
+	}
+}
+
+func TestCloseOperationErrorNormalizesSessionMarker(t *testing.T) {
+	for _, op := range []func(error) error{
+		func(err error) error { return (&execOp{}).dpErr(err, false) },
+		(&readOp{}).dpErr,
+		(&writeOp{}).dpErr,
+	} {
+		requireHandleClosed(t, op(&errSessionClosedByCaller{}))
+	}
+}
+
 // closeCases lists the ways that the caller ends a handle: Close and a
 // successful Delete both close the data path.
 var closeCases = []struct {
@@ -587,9 +759,7 @@ func TestCloseDuringOperationKeepsThePeerToPeerTransport(t *testing.T) {
 					t.Fatalf("transport %v before the close, want peer-to-peer", s.Transport())
 				}
 				cc.close(t, s)
-				if err := waitOpErr(t, ch); !errors.Is(err, errHandleClosed) {
-					t.Fatalf("operation after the close: %v, want errHandleClosed", err)
-				}
+				requireHandleClosed(t, waitOpErr(t, ch))
 				if n := len(cp.authRequests()); n != 0 {
 					t.Fatalf("%d AuthorizeRelay calls after the close, want 0", n)
 				}
@@ -610,15 +780,12 @@ func TestCloseDuringOperationKeepsThePeerToPeerTransport(t *testing.T) {
 				// plane method.
 				ice, open := cp.iceCallCount(), cp.openSessionCount()
 				_, err := s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
-				if !errors.Is(err, errHandleClosed) {
-					t.Fatalf("exec after the close: %v", err)
-				}
-				if _, err := s.ReadFileBytes(context.Background(), "/f"); !errors.Is(err, errHandleClosed) {
-					t.Fatalf("read after the close: %v", err)
-				}
-				if err := s.WriteFileBytes(context.Background(), "/g", []byte("x"), WriteOptions{}); !errors.Is(err, errHandleClosed) {
-					t.Fatalf("write after the close: %v", err)
-				}
+				requireHandleClosed(t, err)
+				_, err = s.AttachExec(context.Background(), "01900000-0000-7000-8000-000000000001", AttachParams{})
+				requireHandleClosed(t, err)
+				_, err = s.ReadFileBytes(context.Background(), "/f")
+				requireHandleClosed(t, err)
+				requireHandleClosed(t, s.WriteFileBytes(context.Background(), "/g", []byte("x"), WriteOptions{}))
 				if cp.iceCallCount() != ice || cp.openSessionCount() != open {
 					t.Fatal("an operation on a closed handle called the control plane")
 				}
@@ -634,23 +801,21 @@ func TestCloseDuringOperationKeepsThePeerToPeerTransport(t *testing.T) {
 // peer-to-peer ends the operation with errHandleClosed too.
 func TestCloseDuringOperationOnForcedPeerToPeer(t *testing.T) {
 	for _, op := range heldOps {
-		t.Run(op.name, func(t *testing.T) {
-			cp := newFakeCP(t)
-			s := cp.handle(t, cp.client(t, TransportPeerToPeer))
-			ch := op.start(t, cp, s)
-			if err := s.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if err := waitOpErr(t, ch); !errors.Is(err, errHandleClosed) {
-				t.Fatalf("operation after the close: %v, want errHandleClosed", err)
-			}
-			if n := len(cp.authRequests()); n != 0 {
-				t.Fatalf("%d AuthorizeRelay calls, want 0", n)
-			}
-			if got := s.Transport(); got != p2pTransport {
-				t.Fatalf("transport %v, want peer-to-peer", got)
-			}
-		})
+		for _, cc := range closeCases {
+			t.Run(op.name+"/"+cc.name, func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+				ch := op.start(t, cp, s)
+				cc.close(t, s)
+				requireHandleClosed(t, waitOpErr(t, ch))
+				if n := len(cp.authRequests()); n != 0 {
+					t.Fatalf("%d AuthorizeRelay calls, want 0", n)
+				}
+				if got := s.Transport(); got != p2pTransport {
+					t.Fatalf("transport %v, want peer-to-peer", got)
+				}
+			})
+		}
 	}
 }
 
