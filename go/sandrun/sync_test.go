@@ -438,6 +438,93 @@ func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
 	}
 }
 
+type syncUploadRecorder struct {
+	sandrunv1connect.DevSessionServiceClient
+	attempts     int
+	acknowledged []int64
+}
+
+func (r *syncUploadRecorder) WriteDevSessionFile(ctx context.Context, req *connect.Request[sandrunv1.WriteDevSessionFileRequest]) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
+	res, err := r.DevSessionServiceClient.WriteDevSessionFile(ctx, req)
+	if strings.HasSuffix(req.Msg.GetPath(), ".tar") {
+		r.attempts++
+		if err == nil {
+			r.acknowledged = append(r.acknowledged, res.Msg.GetOffset()+res.Msg.GetLength())
+		}
+	}
+	return res, err
+}
+
+func TestSyncUploadProgress(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	dir := newRepo(t, map[string]string{"a.txt": "a"}, nil, "")
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := &syncUploadRecorder{DevSessionServiceClient: c.devSessions}
+	c.devSessions = recorder
+	for _, tc := range []struct {
+		name    string
+		content string
+		chunks  int
+		retry   bool
+	}{
+		{name: "one-byte change", content: "b", chunks: 1},
+		{name: "multi-chunk change with retry", content: strings.Repeat("c", ChunkSize+1), chunks: 2, retry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder.attempts, recorder.acknowledged = 0, nil
+			if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			wantAttempts := tc.chunks
+			if tc.retry {
+				srv.Fail(writeProc, connect.NewError(connect.CodeUnavailable, errors.New("retry the archive chunk")))
+				wantAttempts++
+			}
+			var got []TransferProgress
+			params.Progress = func(p TransferProgress) { got = append(got, p) }
+			res, err := c.Sync(t.Context(), params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			acks := recorder.acknowledged
+			if recorder.attempts != wantAttempts || len(acks) != tc.chunks {
+				t.Fatalf("archive attempts = %d, acknowledged offsets = %v, want %d attempts and %d chunks", recorder.attempts, acks, wantAttempts, tc.chunks)
+			}
+			sent := acks[len(acks)-1]
+			if res.Uploaded != 1 || res.BytesSent != sent || sent <= int64(len(tc.content)) {
+				t.Fatalf("sync = %+v, archive offsets = %v, file size = %d", res, acks, len(tc.content))
+			}
+			want := []TransferProgress{{Phase: TransferPreparing}}
+			for _, offset := range acks {
+				want = append(want, TransferProgress{Phase: TransferUploading, BytesDone: offset})
+			}
+			want = append(want, TransferProgress{Phase: TransferApplying, BytesDone: sent, BytesTotal: sent},
+				TransferProgress{Phase: TransferDone, BytesDone: sent, BytesTotal: sent})
+			if !slices.Equal(got, want) {
+				t.Fatalf("progress = %+v, want %+v", got, want)
+			}
+			if readGuest(t, ds, "a.txt") != tc.content {
+				t.Fatal("guest file differs from the changed file")
+			}
+		})
+	}
+
+	var got []TransferProgress
+	params.Progress = func(p TransferProgress) { got = append(got, p) }
+	writesBefore := srv.Calls(writeProc)
+	res, err := c.Sync(t.Context(), params)
+	want := []TransferProgress{{Phase: TransferPreparing}, {Phase: TransferDone}}
+	if err != nil || res.BytesSent != 0 || res.Uploaded != 0 || srv.Calls(writeProc) != writesBefore || !slices.Equal(got, want) {
+		t.Fatalf("unchanged sync = %+v, %v; progress = %+v", res, err, got)
+	}
+}
+
 func TestSyncGitSymlinkPlaceholder(t *testing.T) {
 	needPOSIX(t)
 	const target = "targets/literal\\backslash and spaces "
