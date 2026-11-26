@@ -295,6 +295,13 @@ func (h *fakeRelay) Exec(_ context.Context, r *connect.Request[ownsandv1.ExecReq
 		events = append(events, stdout(0, "ab"),
 			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_OutputTruncated{OutputTruncated: &ownsandv1.ExecOutputTruncated{StdoutOffset: 5}}},
 			stdout(5, "z"), exited(0, false))
+	case "truncboth":
+		events = append(events, stdout(0, "ab"),
+			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stderr{Stderr: &ownsandv1.ExecOutput{Offset: 0, Data: []byte("abcd")}}},
+			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_OutputTruncated{OutputTruncated: &ownsandv1.ExecOutputTruncated{StdoutOffset: 5, StderrOffset: 8}}},
+			stdout(5, "z"),
+			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stderr{Stderr: &ownsandv1.ExecOutput{Offset: 8, Data: []byte("z")}}},
+			exited(0, false))
 	}
 	for _, e := range events {
 		if err := s.Send(ev(e)); err != nil {
