@@ -160,10 +160,11 @@ describe("organization failure", () => {
     ).toBeTruthy();
   });
 
-  test("an incomplete organization list keeps the route ID in the switcher", async () => {
+  test("a failed organization continuation keeps the route ID in the switcher", async () => {
     // The first page lacks the route organization and a later page fails, so
     // the organization may exist on a page that did not load.
     const mock = createMockTransport();
+    const pageTokens: string[] = [];
     const transport: Transport = {
       ...mock,
       async unary(method, ...rest) {
@@ -171,6 +172,7 @@ describe("organization failure", () => {
           return mock.unary(method, ...rest);
         }
         const token = (rest[3] as { pageToken: string }).pageToken;
+        pageTokens.push(token);
         if (token !== "") throw new ConnectError("page", Code.Unavailable);
         const res = await mock.unary(method, ...rest);
         return {
@@ -183,10 +185,20 @@ describe("organization failure", () => {
       },
     };
     renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
-    const trigger = await screen.findByRole("combobox", {
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("combobox", { name: "Organization" }),
+      );
+    });
+    expect(
+      await screen.findByRole("option", {
+        name: "Some organizations did not load. Try again",
+      }),
+    ).toBeTruthy();
+    expect(pageTokens).toEqual(["", "page-2"]);
+    const trigger = screen.getByRole("combobox", {
       name: "Organization",
     });
-    await settle(60);
     expect(trigger.textContent).not.toContain("Choose an organization");
   });
 });
