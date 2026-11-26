@@ -5,6 +5,7 @@ package sandruntest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -391,10 +392,14 @@ func (p *profileService) ListRunnerProfiles(_ context.Context, req *connect.Requ
 	if _, err := p.s.requireOrg(req.Msg.GetOrganizationId()); err != nil {
 		return nil, err
 	}
+	kind := req.Msg.GetWorkloadKind()
+	if err := definedListEnum("workload_kind", "WorkloadKind", kind, sandrunv1.WorkloadKind_name); err != nil {
+		return nil, err
+	}
 	var mine []*sandrunv1.RunnerProfile
 	for _, it := range p.s.profiles {
 		if it.GetOrganizationId() == req.Msg.GetOrganizationId() &&
-			(req.Msg.GetWorkloadKind() == sandrunv1.WorkloadKind_WORKLOAD_KIND_UNSPECIFIED || req.Msg.GetWorkloadKind() == it.GetWorkloadKind()) {
+			(kind == sandrunv1.WorkloadKind_WORKLOAD_KIND_UNSPECIFIED || kind == it.GetWorkloadKind()) {
 			mine = append(mine, it)
 		}
 	}
@@ -485,15 +490,28 @@ var openRunnerStates = []sandrunv1.RunnerState{
 	sandrunv1.RunnerState_RUNNER_STATE_DELETING,
 }
 
-// listStates returns the states to match. An empty result allows every state.
-func listStates[T ~int32](states, open []T, includeEnded bool) []T {
+func definedListEnum[T ~int32](field, enum string, value T, names map[int32]string) error {
+	if _, ok := names[int32(value)]; !ok {
+		return connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("invalid %s: must be a defined %s value", field, enum))
+	}
+	return nil
+}
+
+// listStates validates explicit states and returns the states to match. An
+// empty result allows every state.
+func listStates[T ~int32](states, open []T, includeEnded bool, enum string, names map[int32]string) ([]T, error) {
 	if len(states) > 0 {
-		return states
+		for _, state := range states {
+			if err := definedListEnum("states", enum, state, names); err != nil {
+				return nil, err
+			}
+		}
+		return states, nil
 	}
 	if includeEnded {
-		return nil
+		return nil, nil
 	}
-	return open
+	return open, nil
 }
 
 func normalizeListProfileID(value string) (string, error) {
@@ -519,7 +537,13 @@ func (w *workService) ListRequests(_ context.Context, req *connect.Request[sandr
 		return nil, err
 	}
 	kind := m.GetKind()
-	states := listStates(m.GetStates(), openRequestStates, m.GetIncludeEnded())
+	if err := definedListEnum("kind", "WorkloadKind", kind, sandrunv1.WorkloadKind_name); err != nil {
+		return nil, err
+	}
+	states, err := listStates(m.GetStates(), openRequestStates, m.GetIncludeEnded(), "RequestState", sandrunv1.RequestState_name)
+	if err != nil {
+		return nil, err
+	}
 	var mine []*sandrunv1.Request
 	for _, r := range w.s.requests {
 		if r.GetOrganizationId() != m.GetOrganizationId() || (profileID != "" && r.GetRunnerProfileId() != profileID) {
@@ -583,7 +607,10 @@ func (w *workService) ListRunners(_ context.Context, req *connect.Request[sandru
 	if err != nil {
 		return nil, err
 	}
-	states := listStates(m.GetStates(), openRunnerStates, m.GetIncludeEnded())
+	states, err := listStates(m.GetStates(), openRunnerStates, m.GetIncludeEnded(), "RunnerState", sandrunv1.RunnerState_name)
+	if err != nil {
+		return nil, err
+	}
 	var mine []*sandrunv1.Runner
 	for _, r := range w.s.runners {
 		if r.GetOrganizationId() != m.GetOrganizationId() || (profileID != "" && r.GetRunnerProfileId() != profileID) {

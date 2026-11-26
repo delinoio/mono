@@ -257,6 +257,14 @@ func TestListDevSessionsFilters(t *testing.T) {
 		{"ended", &sandrunv1.ListDevSessionsRequest{States: []sandrunv1.RequestState{ended}}, []string{"second-ended", "other-owner", "first-ended"}},
 		{"ended with include_ended", &sandrunv1.ListDevSessionsRequest{States: []sandrunv1.RequestState{ended}, IncludeEnded: true}, []string{"second-ended", "other-owner", "first-ended"}},
 		{
+			"explicit false includes both owners",
+			&sandrunv1.ListDevSessionsRequest{
+				States: []sandrunv1.RequestState{ended},
+				Owner:  &sandrunv1.ListDevSessionsRequest_OwnedByCaller{OwnedByCaller: false},
+			},
+			[]string{"second-ended", "other-owner", "first-ended"},
+		},
+		{
 			"caller ownership intersection before pagination",
 			&sandrunv1.ListDevSessionsRequest{
 				RunnerProfileId: firstListProfile,
@@ -295,6 +303,17 @@ func TestListDevSessionsFilters(t *testing.T) {
 	if connect.CodeOf(err) != connect.CodeInvalidArgument {
 		t.Errorf("whitespace-only profile: got %v, want InvalidArgument", err)
 	}
+	for _, states := range [][]sandrunv1.RequestState{{99}, {running, 99}} {
+		for _, includeEnded := range []bool{false, true} {
+			_, err := client.ListDevSessions(t.Context(), listTestRequest(&sandrunv1.ListDevSessionsRequest{OrganizationId: org, States: states, IncludeEnded: includeEnded}))
+			assertInvalidListFilter(t, err, "invalid states: must be a defined RequestState value")
+		}
+	}
+	_, err = client.ListDevSessions(t.Context(), listTestRequest(&sandrunv1.ListDevSessionsRequest{
+		OrganizationId: org,
+		Owner:          &sandrunv1.ListDevSessionsRequest_OwnerUserId{OwnerUserId: ""},
+	}))
+	assertInvalidListFilter(t, err, "invalid owner_user_id: is empty")
 }
 
 const streamTestExecID = "018f0000-0000-7000-8000-00000000000a"
