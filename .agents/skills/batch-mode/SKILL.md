@@ -49,9 +49,11 @@ An issue is unprocessable when the rules of this skill do not permit the batch t
 For each unprocessable issue in the batch work list:
 
 1. Do not implement a fix and do not create a PR for the issue.
-2. Move the issue to the `Backlog` status with `save_issue` (Linear MCP server). If the `Backlog` status cannot be resolved, run `list_issue_statuses` for the `DELI` team and use the status named `Backlog`. Do not substitute another status.
-3. Add a comment to the issue with `save_comment`. State which rule prevents the fix and what the issue needs before it can be fixed.
-4. In the batch report, list the issue with its identifier, its title, its URL and the reason.
+2. Use `list_comments` to look for an existing comment on the issue that states which rule prevents the fix and what the issue needs before it can be fixed. Check further pages as needed. Reuse a comment that describes the current blocker, including when retrying a failed move. If the lookup is incomplete and no matching comment is confirmed, report an incomplete handoff and leave the issue in `Todo`.
+3. If no matching comment exists, use `save_comment` to add one that names the rule and what the issue needs. Confirm that the response identifies the saved comment. If the write fails or its response is uncertain, use `list_comments` to check whether the comment exists. If you still cannot confirm the comment, report an incomplete handoff and leave the issue in `Todo` so a later batch can retry.
+4. After confirming the comment, move the issue to `Backlog` with `save_issue` (Linear MCP server). If the `Backlog` status cannot be resolved, run `list_issue_statuses` for the `DELI` team and use the status named `Backlog`. Do not substitute another status.
+5. If the move fails or its response is uncertain, use `get_issue` to check the current status. Report an incomplete handoff unless you confirm `Backlog`. On retry, reuse the confirmed comment for the same blocker.
+6. In the batch report, list the issue with its identifier, its title, its URL and the blocking reason. Mark incomplete handoffs and state which step could not be confirmed.
 
 Move an issue to `Backlog` only when a rule of this skill prevents the fix. Do not move an issue because it is difficult, large or slow to fix.
 
