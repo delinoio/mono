@@ -119,6 +119,73 @@ func TestWriteDevSessionFileRejectsInvalidOffsets(t *testing.T) {
 	}
 }
 
+func TestDevSessionRunnerID(t *testing.T) {
+	const running = sandrunv1.RequestState_REQUEST_STATE_RUNNING
+	for _, tt := range []struct {
+		name  string
+		state sandrunv1.RequestState
+	}{
+		{"queued", sandrunv1.RequestState_REQUEST_STATE_QUEUED},
+		{"starting", sandrunv1.RequestState_REQUEST_STATE_STARTING},
+		{"running", running},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New()
+			t.Cleanup(s.Close)
+			s.NewSessionState = tt.state
+			s.PromoteAfterGets = 2
+			org := s.AddOrganization("runner ID test").GetOrganizationId()
+			profile := s.AddDevSessionProfile(org, "linux", sandrunv1.GuestOs_GUEST_OS_LINUX, t.TempDir())
+			client := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+			ctx := t.Context()
+			created, err := client.CreateDevSession(ctx, listTestRequest(&sandrunv1.CreateDevSessionRequest{
+				OrganizationId: org, RunnerProfileId: profile.GetRunnerProfileId(),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := created.Msg.GetDevSession()
+			sessionID := session.GetDevSessionId()
+			get := func() *sandrunv1.DevSession {
+				t.Helper()
+				res, err := client.GetDevSession(ctx, listTestRequest(&sandrunv1.GetDevSessionRequest{
+					OrganizationId: org, DevSessionId: sessionID,
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return res.Msg.GetDevSession()
+			}
+			if tt.state != running {
+				for _, pending := range []*sandrunv1.DevSession{session, get()} {
+					if pending.GetState() != tt.state || pending.GetRunnerId() != "" || pending.GetStartedAt() != nil {
+						t.Fatalf("expected pending session in state %v without a runner ID or start time, got %v", tt.state, pending)
+					}
+				}
+				session = get()
+			}
+			runnerID := session.GetRunnerId()
+			if session.GetState() != running || runnerID == "" || session.GetStartedAt() == nil {
+				t.Fatalf("expected a running session with a runner ID and start time, got %v", session)
+			}
+			if got := get().GetRunnerId(); got != runnerID {
+				t.Errorf("subsequent get returned runner ID %q, want %q", got, runnerID)
+			}
+			listed, err := client.ListDevSessions(ctx, listTestRequest(&sandrunv1.ListDevSessionsRequest{OrganizationId: org}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sessions := listed.Msg.GetDevSessions()
+			if len(sessions) != 1 || sessions[0].GetDevSessionId() != sessionID {
+				t.Fatalf("expected only session %q, got %v", sessionID, sessions)
+			}
+			if got := sessions[0].GetRunnerId(); got != runnerID {
+				t.Errorf("list returned runner ID %q, want %q", got, runnerID)
+			}
+		})
+	}
+}
+
 func TestListDevSessionsFilters(t *testing.T) {
 	const (
 		running    = sandrunv1.RequestState_REQUEST_STATE_RUNNING

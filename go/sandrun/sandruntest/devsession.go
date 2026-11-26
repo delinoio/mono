@@ -180,6 +180,7 @@ func (d *devSessionService) GetDevSession(_ context.Context, req *connect.Reques
 	s.sessionGets[x.GetDevSessionId()]++
 	if s.PromoteAfterGets > 0 && s.sessionGets[x.GetDevSessionId()] >= s.PromoteAfterGets &&
 		(x.GetState() == sandrunv1.RequestState_REQUEST_STATE_QUEUED || x.GetState() == sandrunv1.RequestState_REQUEST_STATE_STARTING) {
+		x.RunnerId = s.newID()
 		x.State = sandrunv1.RequestState_REQUEST_STATE_RUNNING
 		x.StartedAt = timestamppb.Now()
 	}
