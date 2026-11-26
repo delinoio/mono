@@ -203,9 +203,10 @@ func (e *ExecStreamError) Unwrap() error { return e.Err }
 // The ExecStreamError offset for that stream points to the start of the
 // chunk so a later AttachExec can replay it.
 //
-// Exec returns an initial credential failure or a terminal server status
-// before the first event unchanged. Later stream failures return an
-// *ExecStreamError.
+// If credential acquisition fails before the first request, Exec returns
+// that error with its cause and sends no start or attach request. Exec also
+// returns a terminal server status before the first event unchanged.
+// Later stream failures return an *ExecStreamError.
 func (c *Client) Exec(ctx context.Context, p ExecParams) (*ExecResult, error) {
 	if len(p.Command) == 0 {
 		return nil, localError(connect.CodeInvalidArgument, errors.New("sandrun: exec needs a command"))
@@ -318,11 +319,12 @@ func (o *execOp) run(ctx context.Context) (*ExecResult, error) {
 			return nil, o.streamErr(a.eventErr, false)
 		}
 		if o.start != nil {
-			// A terminal credential failure prevents the initial send.
-			// A terminal wire status before any event also ends the exec.
 			if a.err != nil && !a.received {
-				var credentialErr *CredentialError
-				if errors.As(a.err, &credentialErr) || (connect.IsWireError(a.err) && connect.CodeOf(a.err) != connect.CodeUnavailable) {
+				var credentialErr *streamCredentialError
+				if errors.As(a.err, &credentialErr) {
+					return nil, credentialErr.err
+				}
+				if connect.IsWireError(a.err) && connect.CodeOf(a.err) != connect.CodeUnavailable {
 					return nil, a.err
 				}
 			}

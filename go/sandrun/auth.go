@@ -66,7 +66,7 @@ func (a *authInterceptor) WrapStreamingClient(next connect.StreamingClientFunc) 
 		conn := next(ctx, spec)
 		tok, err := a.client.credential.bearer(ctx)
 		if err != nil {
-			return &failedConn{StreamingClientConn: conn, err: err}
+			return &failedConn{StreamingClientConn: conn, err: &streamCredentialError{err: err}}
 		}
 		conn.RequestHeader().Set("Authorization", "Bearer "+tok)
 		return &redactingConn{StreamingClientConn: conn, client: a.client, token: tok, start: time.Now(), ctx: ctx}
@@ -76,6 +76,12 @@ func (a *authInterceptor) WrapStreamingClient(next connect.StreamingClientFunc) 
 func (a *authInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
 	return next
 }
+
+// streamCredentialError marks a credential failure before the stream sends a request.
+type streamCredentialError struct{ err error }
+
+func (e *streamCredentialError) Error() string { return e.err.Error() }
+func (e *streamCredentialError) Unwrap() error { return e.err }
 
 // failedConn reports a credential failure on the first send or receive.
 type failedConn struct {
