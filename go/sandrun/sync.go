@@ -266,7 +266,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		report(TransferProgress{Phase: TransferDone})
 		return res, nil
 	}
-	res, changed, deleted, changedTotal := plan.res, plan.changed, plan.deleted, plan.changedTotal
+	res, changed, deleted := plan.res, plan.changed, plan.deleted
 
 	// Step 7: archive, deletions, manifest and clean-up.
 	syncID, err := uuidv7.NewString()
@@ -304,9 +304,8 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		go func() {
 			pw.CloseWithError(writeSyncArchive(ctx, pw, p.LocalDir, changed, windows))
 		}()
-		sent := res.BytesSent
 		n, err := c.writeGuestFile(ctx, s, archive, 0o644, pr, func(done int64) {
-			report(TransferProgress{Phase: TransferUploading, BytesDone: sent + done, BytesTotal: changedTotal})
+			report(TransferProgress{Phase: TransferUploading, BytesDone: done})
 		})
 		_ = pr.CloseWithError(errors.New("sandrun: upload ended"))
 		res.BytesSent += n
