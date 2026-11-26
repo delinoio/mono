@@ -588,9 +588,10 @@ run_with_health_limit() {
 }
 
 # Waits for a 2xx response to GET /healthz before one shared deadline.
-# Inspections and retry pauses also use the remaining time. Redirects,
-# other non-2xx responses and transport failures are retried. A container
-# that is no longer running fails immediately.
+# The probe connects directly to the bridge address and bypasses host proxies.
+# Inspections and retry pauses also use the remaining time. The probe retries
+# redirects, other non-2xx responses and transport failures. A container that
+# is no longer running fails immediately.
 wait_healthy() {
   local container="$1" network="$2" port="$3" timeout="$4"
   local deadline remaining status address code probe_budget
@@ -609,7 +610,7 @@ wait_healthy() {
     health_budget || break
     if [[ -n "$address" ]]; then
       probe_budget=$((remaining < 500 ? remaining : 500))
-      if code="$(run_with_health_limit "$probe_budget" curl --silent --show-error --output /dev/null \
+      if code="$(run_with_health_limit "$probe_budget" curl --silent --show-error --noproxy '*' --output /dev/null \
         --write-out '%{http_code}' --max-time 5 "http://$address:$port/healthz" 2> /dev/null)" &&
         health_budget && [[ "$code" =~ ^2[0-9]{2}$ ]]; then
         echo "$container passed the health check."
