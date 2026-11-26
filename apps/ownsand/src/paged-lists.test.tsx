@@ -6,6 +6,7 @@ import {
   createClient,
   type Transport,
 } from "@connectrpc/connect";
+import { createInfiniteQueryOptions } from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
@@ -20,7 +21,7 @@ import {
   type ListSnapshotsResponse,
   SnapshotService,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
-import { QueryClient } from "@tanstack/react-query";
+import { InfiniteQueryObserver, QueryClient } from "@tanstack/react-query";
 import {
   act,
   cleanup,
@@ -336,6 +337,88 @@ describe("pending invitations list", () => {
       organizationId: organization!.organizationId,
       pageToken: "",
     });
+  });
+
+  test("restarts only the submitted organization's uncached invitation request", async () => {
+    const mock = createMockTransport();
+    const { organization } = await createClient(
+      OrganizationService,
+      mock,
+    ).createOrganization({ name: "Initech" });
+    const otherId = organization!.organizationId;
+    const requests: {
+      input: ListInvitationsRequest;
+      signal?: AbortSignal;
+      release(): void;
+    }[] = [];
+    const transport: Transport = {
+      ...mock,
+      async unary(method, signal, timeout, header, input, contextValues) {
+        if (method.name === "ListInvitations") {
+          await new Promise<void>((release) => {
+            requests.push({
+              input: input as typeof input & ListInvitationsRequest,
+              signal,
+              release,
+            });
+          });
+        }
+        return mock.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+      },
+    };
+    const queryClient = new QueryClient();
+    const otherList = new InfiniteQueryObserver(
+      queryClient,
+      createInfiniteQueryOptions(
+        MemberService.method.listInvitations,
+        { organizationId: otherId, pageSize: 200, pageToken: "" },
+        {
+          transport,
+          pageParamKey: "pageToken",
+          getNextPageParam: (last) => last.nextPageToken || undefined,
+        },
+      ),
+    );
+    const unsubscribe = otherList.subscribe(() => {});
+    try {
+      renderConsole(path, { transport, queryClient });
+      await waitFor(() => expect(requests).toHaveLength(2));
+      const other = requests.find(
+        ({ input }) => input.organizationId === otherId,
+      )!;
+      const first = requests.find(
+        ({ input }) => input.organizationId === MOCK_IDS.acme,
+      )!;
+
+      fireEvent.click(screen.getByRole("button", { name: "Invite someone" }));
+      fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+      await waitFor(() => expect(requests).toHaveLength(3));
+      const fresh = requests[2]!;
+      expect(fresh.input).toMatchObject({
+        organizationId: MOCK_IDS.acme,
+        pageSize: 200,
+        pageToken: "",
+      });
+      expect(first.signal?.aborted).toBe(true);
+      expect(other.signal?.aborted).toBe(false);
+
+      other.release();
+      fresh.release();
+      await waitFor(() =>
+        expect(otherList.getCurrentResult().isSuccess).toBe(true),
+      );
+      expect(requests).toHaveLength(3);
+    } finally {
+      unsubscribe();
+      for (const request of requests) request.release();
+    }
   });
 
   test.each([
