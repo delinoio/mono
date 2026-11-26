@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "c2b3a3335a8cfa82d8f2e34e2b4dcae4f10cb1f5fbd65030e3c4cea1f6766f01",
+        "AGENTS.md": "9c5821e48e85836046ecfc60de1cea86a71fb65dfcb0e2d09eada4ee95607bd1",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "8d9f8517adee6028be8ba0a9cd8869cf27d3dbc3ca56d1414c8ed4751afbe516",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -139,7 +139,7 @@
         "rules/rerender-transitions.md": "60f4033909a62df5e5b8c601494f9e50a562e2f8c1c2d81eac24f38142265f1c",
         "rules/rerender-use-deferred-value.md": "8c3579576a61a949884167745dcfaf1d5426ba305cc61fd0a79602d70fda4909",
         "rules/rerender-use-ref-transient-values.md": "f1a649af9d1d0b5c762f6c9c4c1c70c90d7df82aa10296ee87aadb78c1b76c54",
-        "rules/server-after-nonblocking.md": "9430d6ab2fc8d8fe7470a3ba20240ed5ae417e10b878f523f6bf9eefb6e33c9c",
+        "rules/server-after-nonblocking.md": "21cb035f2fc89566ba54cda38258d1337b55317f93c080469c15643277581786",
         "rules/server-auth-actions.md": "a2ca8aa102839251c7971ec784560fab943c20b36fe6f80365d4110c13260c23",
         "rules/server-cache-lru.md": "1924b64561841923b88a657085097a0aeba3e0ba2d5470b9f5c15cc10d6ae70f",
         "rules/server-cache-react.md": "fddeea6c870bb3da4134b61d54b7d09b83d2603f929b7547cd3dc1dc269edd5c",
