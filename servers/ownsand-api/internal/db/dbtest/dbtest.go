@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -62,23 +63,32 @@ func newURL(t testing.TB, maxVersion int64) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := pgx.ConnectConfig(ctx, adminConfig.ConnConfig)
+	createConfig := adminConfig.ConnConfig.Copy()
+	// Close on a server error so pgx returns the error even if the
+	// connection fails before ReadyForQuery. This connection runs one statement.
+	createConfig.OnPgError = func(*pgconn.PgConn, *pgconn.PgError) bool { return false }
+	conn, err := pgx.ConnectConfig(ctx, createConfig)
 	if err != nil {
 		t.Fatalf("connect to test database: %v", err)
 	}
 	var b [8]byte
 	_, _ = rand.Read(b[:])
 	name := "ownsand_test_" + hex.EncodeToString(b[:])
-	if _, err := conn.Exec(ctx, "CREATE DATABASE "+name); err != nil {
-		_ = conn.Close(ctx)
-		t.Fatalf("create test database: %v", err)
-	}
-	_ = conn.Close(ctx)
-	t.Cleanup(func() {
-		dropDatabase(t, name, func(ctx context.Context) (adminConn, error) {
-			return pgx.ConnectConfig(ctx, adminConfig.ConnConfig)
+	createErr := createDatabase(name, func(sql string) error {
+		// Read the response directly. pgx.Conn.Exec can replace a read EOF
+		// with a "conn closed" error that SafeToRetry treats as before-send.
+		return conn.PgConn().Exec(ctx, sql).Close()
+	}, func() {
+		t.Cleanup(func() {
+			dropDatabase(t, name, func(ctx context.Context) (adminConn, error) {
+				return pgx.ConnectConfig(ctx, adminConfig.ConnConfig)
+			})
 		})
 	})
+	_ = conn.Close(ctx)
+	if createErr != nil {
+		t.Fatalf("create test database: %v", createErr)
+	}
 	child, err := dbtesturl.Child(admin, name)
 	if err != nil {
 		t.Fatalf("derive test database URL from %s: %v", EnvTestDatabaseURL, err)
@@ -92,6 +102,22 @@ func newURL(t testing.TB, maxVersion int64) string {
 		t.Fatalf("migrate test database: %v", err)
 	}
 	return child
+}
+
+func createDatabase(name string, exec func(string) error, registerCleanup func()) error {
+	err := exec("CREATE DATABASE " + name)
+	if pgconn.SafeToRetry(err) {
+		return err
+	}
+
+	// A statement error, including a duplicate name, confirms that this
+	// create failed. A session or transport failure may hide a commit.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.SeverityUnlocalized == "ERROR" {
+		return err
+	}
+	registerCleanup()
+	return err
 }
 
 // cleanupTimeout bounds the whole cleanup of one generated database.
