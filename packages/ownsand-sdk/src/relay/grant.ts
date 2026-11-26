@@ -8,6 +8,7 @@ import {
   retryAfterMs,
 } from "../errors.ts";
 import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
+import type { AuthorizeRelayResponse } from "@delino/ownsand-protos/v1/data_path_pb";
 import { LogEvent, safeLog } from "../logger.ts";
 import { type OperationContext, Timing, throwIfAborted } from "./context.ts";
 import { backoffMs, FixedBudget, type RetryBudget } from "./recovery.ts";
@@ -152,7 +153,8 @@ export class GrantKeeper {
       // bound is enforced with a timer and an abort controller, not with a
       // Connect timeout, so a response that never arrives ends the operation.
       const left = budget.remainingMs();
-      if (Number.isFinite(left) && left <= 0) {
+      const hasDeadline = Number.isFinite(left);
+      if (hasDeadline && left <= 0) {
         throw lastError === undefined
           ? this.#deadlineError(undefined)
           : toConnectError(lastError);
@@ -160,7 +162,7 @@ export class GrantKeeper {
       const { controller, dispose } = linkedController(signal);
       const stop = new AbortController();
       let deadlineReached = false;
-      if (Number.isFinite(left)) {
+      if (hasDeadline) {
         this.#ctx.clock.sleep(left, stop.signal).then(
           () => {
             deadlineReached = true;
@@ -169,8 +171,9 @@ export class GrantKeeper {
           () => {},
         );
       }
+      let res: AuthorizeRelayResponse;
       try {
-        const res = await this.#ctx.dataPath.authorizeRelay(
+        res = await this.#ctx.dataPath.authorizeRelay(
           {
             organizationId: this.#ctx.organizationId,
             sandboxId: this.#ctx.sandboxId,
@@ -182,30 +185,6 @@ export class GrantKeeper {
           },
           { signal: controller.signal },
         );
-        if (res.grantId === "") {
-          throw new ConnectError(
-            "AuthorizeRelay response is missing a relay grant ID",
-            Code.Internal,
-          );
-        }
-        const receivedAt = this.#ctx.clock.now();
-        const expiresInMs =
-          res.expiresIn === undefined
-            ? 0
-            : Number(res.expiresIn.seconds) * 1000 +
-              Math.floor(res.expiresIn.nanos / 1e6);
-        this.#grant = {
-          id: res.grantId,
-          expiresAt: receivedAt + expiresInMs,
-          fresh: true,
-        };
-        this.#lastGrantId = res.grantId;
-        safeLog(this.#ctx.logger, {
-          event: LogEvent.RelayGrant,
-          sandboxId: this.#ctx.sandboxId,
-          reason: replacesGrantId === undefined ? "authorized" : "renewed",
-        });
-        return res.grantId;
       } catch (error) {
         // Stop the attempt's timer and listener before any back-off sleep.
         stop.abort();
@@ -230,10 +209,41 @@ export class GrantKeeper {
           throw toConnectError(error);
         }
         await this.#ctx.clock.sleep(delay, signal);
+        continue;
       } finally {
         stop.abort();
         dispose();
       }
+
+      throwIfAborted(signal);
+      // The reply can resume this attempt before the deadline callback runs.
+      if (deadlineReached || (hasDeadline && budget.remainingMs() <= 0)) {
+        throw this.#deadlineError(undefined);
+      }
+      if (res.grantId === "") {
+        throw new ConnectError(
+          "AuthorizeRelay response is missing a relay grant ID",
+          Code.Internal,
+        );
+      }
+      const receivedAt = this.#ctx.clock.now();
+      const expiresInMs =
+        res.expiresIn === undefined
+          ? 0
+          : Number(res.expiresIn.seconds) * 1000 +
+            Math.floor(res.expiresIn.nanos / 1e6);
+      this.#grant = {
+        id: res.grantId,
+        expiresAt: receivedAt + expiresInMs,
+        fresh: true,
+      };
+      this.#lastGrantId = res.grantId;
+      safeLog(this.#ctx.logger, {
+        event: LogEvent.RelayGrant,
+        sandboxId: this.#ctx.sandboxId,
+        reason: replacesGrantId === undefined ? "authorized" : "renewed",
+      });
+      return res.grantId;
     }
   }
 

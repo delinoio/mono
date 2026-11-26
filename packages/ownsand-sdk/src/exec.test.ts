@@ -10,6 +10,7 @@ import {
   DataPathError,
   OwnSandValidationError,
 } from "./errors.ts";
+import { LogEvent, type LogRecord } from "./logger.ts";
 import { Timing } from "./relay/context.ts";
 import { GrantKeeper, RelayCallKind } from "./relay/grant.ts";
 import { AcceptanceDeadlineError } from "./relay/stream.ts";
@@ -1391,6 +1392,60 @@ describe("exec over the relay", () => {
     expect(issued).toHaveLength(2);
     expect(issued[0]).toBe(issued[1]);
   });
+
+  test.each([59_999, 60_000, 60_001])(
+    "checks the authorization deadline when a grant arrives at %i ms before timer dispatch",
+    async (replyAt) => {
+      let now = 0;
+      const logs: LogRecord[] = [];
+      const h = setup((clock) => ({
+        clock: {
+          now: () => now,
+          wallNow: () => clock.wallNow(),
+          sleep: (ms, signal) => clock.sleep(ms, signal),
+        },
+        logger: (record) => logs.push(record),
+      }));
+      h.api.unary(DataPathService, "AuthorizeRelay", () => {
+        // Advance monotonic time while the virtual timer remains pending.
+        now = replyAt;
+        return { grantId: "grant", expiresIn: { seconds: 900n } };
+      });
+      h.api.stream(RelayService, "Exec", async function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.exited(0));
+      });
+
+      const caller = new AbortController();
+      const outcome = h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"], signal: caller.signal })
+        .wait();
+
+      if (replyAt < 60_000) {
+        await expect(outcome).resolves.toMatchObject({
+          kind: ExecResultKind.Exited,
+        });
+        const calls = h.api.callsOf("Exec");
+        expect(calls).toHaveLength(1);
+        expect(calls[0]!.headers.get("ownsand-relay-grant-id")).toBe("grant");
+      } else {
+        const error = await outcome.catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(DataPathError);
+        expect(error).toMatchObject({
+          message: "AuthorizeRelay got no response within the window",
+          code: Code.Unavailable,
+          outcomeUnknown: false,
+        });
+        expect(h.api.callsOf("Exec")).toHaveLength(0);
+      }
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+      expect(
+        logs.filter((record) => record.event === LogEvent.RelayGrant),
+      ).toHaveLength(replyAt < 60_000 ? 1 : 0);
+      expect(h.clock.now()).toBe(0);
+    },
+  );
 
   describe("a stalled AuthorizeRelay call", () => {
     /** A response that never arrives; the fake aborts it with its signal. */
