@@ -2,4 +2,4 @@
 "ownsand-agent": patch
 ---
 
-Retry failed cleanup of OwnSand guest read snapshots so callers can reuse the read ID once the snapshot is removed.
+The OwnSand guest helper now retries removal of partial read snapshots left by failed preparation. Once cleanup succeeds, callers can retry with the same read ID. This fix requires a guest image that contains the updated guest helper.
