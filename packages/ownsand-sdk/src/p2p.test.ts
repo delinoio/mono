@@ -5,6 +5,7 @@ import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { encodeMessages } from "./codec.ts";
+import { ActivityRegistry } from "./connection.ts";
 import {
   billingReasonOf,
   classifyFailure,
@@ -32,9 +33,10 @@ import {
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { ExecEventType, ExecResultKind } from "./operations/exec.ts";
-import { PeerUnavailableError } from "./p2p/session.ts";
+import { PeerSession, PeerUnavailableError } from "./p2p/session.ts";
 import type { PeerConnectionConstructor } from "./p2p/webrtc.ts";
-import type { Sandbox } from "./sandbox.ts";
+import type { OperationContext } from "./relay/context.ts";
+import { Sandbox } from "./sandbox.ts";
 import {
   type FakeAgent,
   type FakeAgentPeer,
@@ -49,10 +51,12 @@ import {
   execMsg,
   file,
   type Harness,
+  ORG,
   SANDBOX,
   setup,
   text,
 } from "./testing/harness.ts";
+import { UuidV7Generator } from "./uuidv7.ts";
 
 function p2pSetup(
   agent: FakeAgent,
@@ -113,6 +117,37 @@ function p2pSetup(
     };
   });
   return { h, rtc: rtc! };
+}
+
+function lateOpenSessionSetup() {
+  const { h, rtc } = p2pSetup(() => {});
+  const entered = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<ConnectError>();
+  const signals: (AbortSignal | undefined)[] = [];
+  const deliveredErrors: ConnectError[] = [];
+  const ctx: OperationContext = {
+    clock: h.clock,
+    ids: new UuidV7Generator(() => h.clock.wallNow()),
+    dataPath: {
+      ...h.client.dataPath,
+      // Keep the RPC pending across abort and deliver the scripted error
+      // directly. Connect can substitute the signal's reason after abort.
+      async openSession(_request, options) {
+        signals.push(options?.signal);
+        entered.resolve();
+        const error = await response.promise;
+        deliveredErrors.push(error);
+        throw error;
+      },
+    },
+    relay: h.client.relay,
+    sandboxes: h.client.sandboxes,
+    activity: new ActivityRegistry(),
+    logger: undefined,
+    organizationId: ORG,
+    sandboxId: SANDBOX,
+  };
+  return { h, rtc, ctx, entered, response, signals, deliveredErrors };
 }
 
 function execEvent(
@@ -530,33 +565,62 @@ describe("peer-to-peer data path", () => {
     expect(rtc.connections).toHaveLength(2);
   });
 
-  test("a Canceled error from OpenSession after an abort is not a peer failure", async () => {
-    const { h, rtc } = p2pSetup(exitingAgent);
-    h.api.unary(DataPathService, "OpenSession", async (_req, call) => {
-      await h.clock.sleep(5_000);
-      if (call.index === 0) {
-        // A transport reports an abort as Canceled, not as the abort reason.
-        throw new ConnectError("canceled", Code.Canceled);
-      }
-      return {
-        sessionId: `session-${call.index + 1}`,
-        sdpAnswer: "v=0 fake-answer",
-        expiresIn: { seconds: 3600n },
-      };
-    });
-    const sandbox = h.client.sandbox(SANDBOX);
+  test("keeps peer routing when OpenSession returns Canceled after the last caller aborts", async () => {
+    const { h, rtc, ctx, entered, response, signals, deliveredErrors } =
+      lateOpenSessionSetup();
+    const sandbox = new Sandbox(
+      ctx,
+      h.client.snapshots,
+      rtc.RTCPeerConnection,
+      undefined,
+      undefined,
+    );
     const controller = new AbortController();
     const reason = new Error("caller cancelled");
+    const scriptedError = new ConnectError(
+      "scripted transport cancellation",
+      Code.Canceled,
+    );
     const pending = sandbox
       .run({ command: ["a"], signal: controller.signal })
-      .catch((e) => e);
-    await h.clock.advance(1_000);
+      .catch((error: unknown) => error);
+    await h.clock.run(entered.promise);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(false);
     controller.abort(reason);
-    expect(await h.clock.run(pending)).toBe(reason);
-    // Let the abandoned OpenSession answer with Canceled.
-    await h.clock.advance(10_000);
+    expect(await h.clock.run(pending, 0)).toBe(reason);
+    expect(signals[0]?.reason).toBe(reason);
+    expect(deliveredErrors).toHaveLength(0);
+    expect(rtc.channels[0]!.readyState).toBe("connecting");
+
+    response.resolve(scriptedError);
+    await h.clock.settle();
+    expect(signals).toHaveLength(1);
+    expect(deliveredErrors).toHaveLength(1);
+    expect(deliveredErrors[0]).toBe(scriptedError);
+    expect(rtc.channels[0]!.readyState).toBe("closed");
+    expect(rtc.frames).toHaveLength(0);
     expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
     expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+  });
+
+  test("peer setup preserves the exact OpenSession error delivered after abort", async () => {
+    const { h, rtc, ctx, entered, response } = lateOpenSessionSetup();
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled");
+    const scriptedError = new ConnectError(
+      "scripted transport cancellation",
+      Code.Canceled,
+    );
+    const pending = PeerSession.open(
+      ctx,
+      rtc.RTCPeerConnection,
+      controller.signal,
+    ).catch((error: unknown) => error);
+    await h.clock.run(entered.promise);
+    controller.abort(reason);
+    response.resolve(scriptedError);
+    expect(await h.clock.run(pending, 0)).toBe(scriptedError);
     expect(rtc.channels[0]!.readyState).toBe("closed");
   });
 
