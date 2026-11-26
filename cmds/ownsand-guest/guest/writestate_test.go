@@ -821,6 +821,92 @@ func TestWriteRecoveryDropsRecordsWithoutStagingFile(t *testing.T) {
 	}
 }
 
+func TestWriteRecoveryRetriesStaleRecordRemoval(t *testing.T) {
+	for _, recordType := range []string{"canonical", "temporary"} {
+		t.Run(recordType, func(t *testing.T) {
+			h := newHarness(t, nil)
+			target, req := startPartialWrite(t, h)
+			id := req.GetWriteId()
+			staging := tempPath(target, id)
+			releaseWriteFiles(h)
+			if err := os.Remove(staging); err != nil {
+				t.Fatal(err)
+			}
+			path := h.srv.writes.recordPath(id)
+			if recordType == "temporary" {
+				_, path = demoteRecordToTemp(t, h, req)
+			}
+			record, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			originalRemove := removeRecordFile
+			t.Cleanup(func() { removeRecordFile = originalRemove })
+			blockRemoval := true
+			attempts := 0
+			removeRecordFile = func(name string) error {
+				if name == path {
+					attempts++
+					if blockRemoval {
+						return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrPermission}
+					}
+				}
+				return originalRemove(name)
+			}
+
+			var h2 *harness
+			if recordType == "temporary" {
+				h2 = restartWithFailedRecordPromotion(t, h, h.srv.writes.recordPath(id), path)
+			} else {
+				h2 = restart(t, h, nil)
+			}
+
+			if err := os.WriteFile(staging, []byte("replacement"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// Use another directory so creating a new write would succeed
+			// if the pending cleanup failed to reserve the ID.
+			req.Path = filepath.Join(t.TempDir(), "other")
+			checkPending := func(wantAttempts int) {
+				t.Helper()
+				assertWriteNotFound(t, h2, req, "write expired")
+				if attempts != wantAttempts {
+					t.Fatalf("record removal attempts = %d, want %d", attempts, wantAttempts)
+				}
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, record) {
+					t.Fatalf("pending record missing or changed: %v", err)
+				}
+				if files := recordFiles(t, h2); len(files) != 1 || files[0] != filepath.Base(path) {
+					t.Fatalf("records while cleanup pending: %v", files)
+				}
+				if exists(tempPath(req.GetPath(), id)) {
+					t.Fatal("same-ID request created a staging file during cleanup")
+				}
+			}
+			checkPending(1)
+			h2.srv.Sweep()
+			checkPending(2)
+
+			blockRemoval = false
+			h2.srv.Sweep()
+			if attempts != 3 || len(recordFiles(t, h2)) != 0 {
+				t.Fatalf("record remains after successful retry: attempts=%d", attempts)
+			}
+			if _, ok := h2.srv.writes.entries[id]; ok {
+				t.Fatal("pending entry remains after successful retry")
+			}
+			assertWriteNotFound(t, h2, req, "write expired")
+			if got, err := os.ReadFile(staging); err != nil || string(got) != "replacement" {
+				t.Fatalf("replacement after cleanup: %q, %v", got, err)
+			}
+			if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
+				t.Fatalf("target after cleanup: %q, %v", got, err)
+			}
+		})
+	}
+}
+
 func TestWriteFinishedUploadSurvivesRestartAndExpiry(t *testing.T) {
 	h := newHarness(t, nil)
 	target := filepath.Join(t.TempDir(), "f")

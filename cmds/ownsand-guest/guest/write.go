@@ -87,6 +87,8 @@ type writeEntry struct {
 	identity *fileIdentity
 	// recordPath is the canonical or retained temporary record location.
 	recordPath string
+	// recordOnly marks a startup cleanup whose staging file was already absent.
+	recordOnly bool
 	// recovered marks a write of an earlier helper process: it has a staging
 	// file but no open file and no written ranges, so it can only expire.
 	recovered bool
