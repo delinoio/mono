@@ -3,6 +3,7 @@ import { type Timestamp, timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { afterEach, describe, expect, rs, test } from "@rstest/core";
 import {
+  BillingAccountRole,
   BillingMeter,
   BillingPhase,
   BillingService,
@@ -34,6 +35,7 @@ import {
   MOCK_IDS,
   MOCK_USER,
   MockBillingState,
+  type MockBillingAccount,
 } from "./mock-api.ts";
 import { walkFixturePages } from "./walk-fixture-pages.ts";
 
@@ -853,6 +855,137 @@ describe("mock sandbox guest OS", () => {
     await expect(
       client.createSandbox(request({ baseImage: BaseImage.UNSPECIFIED })),
     ).rejects.toMatchObject({ code: Code.InvalidArgument });
+  });
+});
+
+describe("mock linkable billing account pagination", () => {
+  const organizationId = MOCK_IDS.acme;
+
+  function account(index: number, role = BillingAccountRole.OWNER) {
+    return {
+      billingAccountId: `0193a000-0000-7000-8000-${index.toString(16).padStart(12, "0")}`,
+      name: `Billing fixture ${index}`,
+      role,
+      balanceUsdMicros: 1_000_000n,
+      subscriptionActive: true,
+    };
+  }
+
+  function client(linkableBillingAccounts: MockBillingAccount[]) {
+    return createClient(
+      BillingService,
+      createMockTransport({ linkableBillingAccounts }),
+    );
+  }
+
+  test("orders eligible accounts by ID and resumes after the last account", async () => {
+    const owner = account(1);
+    const admin = account(3, BillingAccountRole.ADMIN);
+    const billing = client([
+      admin,
+      account(2, BillingAccountRole.VIEWER),
+      owner,
+    ]);
+    const request = { organizationId, pageSize: 1 };
+
+    const first = await billing.listLinkableBillingAccounts(request);
+    expect(first.billingAccounts).toMatchObject([
+      { billingAccountId: owner.billingAccountId, role: owner.role },
+    ]);
+    expect(first.nextPageToken).not.toBe("");
+
+    const last = await billing.listLinkableBillingAccounts({
+      ...request,
+      pageToken: first.nextPageToken,
+    });
+    expect(last.billingAccounts).toMatchObject([
+      { billingAccountId: admin.billingAccountId, role: admin.role },
+    ]);
+    expect(last.nextPageToken).toBe("");
+  });
+
+  test("defaults to 50 and caps the page at 200", async () => {
+    const accounts = Array.from({ length: 201 }, (_, i) => account(i + 1));
+    const billing = client(accounts);
+    const ids = accounts.map((a) => a.billingAccountId);
+
+    for (const pageSize of [undefined, 0]) {
+      const page = await billing.listLinkableBillingAccounts({
+        organizationId,
+        pageSize,
+      });
+      expect(page.billingAccounts.map((a) => a.billingAccountId)).toEqual(
+        ids.slice(0, 50),
+      );
+      expect(page.nextPageToken).not.toBe("");
+    }
+
+    const capped = await billing.listLinkableBillingAccounts({
+      organizationId,
+      pageSize: 500,
+    });
+    expect(capped.billingAccounts.map((a) => a.billingAccountId)).toEqual(
+      ids.slice(0, 200),
+    );
+    expect(capped.nextPageToken).not.toBe("");
+
+    const last = await billing.listLinkableBillingAccounts({
+      organizationId,
+      pageSize: 200,
+      pageToken: capped.nextPageToken,
+    });
+    expect(last.billingAccounts.map((a) => a.billingAccountId)).toEqual(
+      ids.slice(200),
+    );
+    expect(last.nextPageToken).toBe("");
+  });
+
+  test("omits the cursor when a full page has no eligible account after it", async () => {
+    const accounts = Array.from({ length: 200 }, (_, i) => account(i + 1));
+    const page = await client([
+      ...accounts,
+      account(201, BillingAccountRole.VIEWER),
+    ]).listLinkableBillingAccounts({ organizationId, pageSize: 200 });
+    expect(page.billingAccounts).toHaveLength(200);
+    expect(page.nextPageToken).toBe("");
+  });
+
+  test("rejects negative sizes and invalid tokens for an authorized caller", async () => {
+    const first = account(1);
+    const billing = client([first, account(2)]);
+    const organizations = createClient(
+      OrganizationService,
+      createMockTransport(),
+    );
+    const otherList = await organizations.listOrganizations({ pageSize: 1 });
+    expect(otherList.nextPageToken).not.toBe("");
+
+    const otherOwner = createClient(
+      BillingService,
+      createMockTransport({
+        userId: "user-owner-lee",
+        linkableBillingAccounts: [first, account(2)],
+      }),
+    );
+    const otherCaller = await otherOwner.listLinkableBillingAccounts({
+      organizationId: MOCK_IDS.northwind,
+      pageSize: 1,
+    });
+    expect(otherCaller.nextPageToken).not.toBe("");
+
+    await expect(
+      billing.listLinkableBillingAccounts({ organizationId, pageSize: -1 }),
+    ).rejects.toMatchObject({ code: Code.InvalidArgument });
+    for (const pageToken of [
+      "not-a-token",
+      first.billingAccountId,
+      otherList.nextPageToken,
+      otherCaller.nextPageToken,
+    ]) {
+      await expect(
+        billing.listLinkableBillingAccounts({ organizationId, pageToken }),
+      ).rejects.toMatchObject({ code: Code.InvalidArgument });
+    }
   });
 });
 

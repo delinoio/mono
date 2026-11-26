@@ -6,10 +6,11 @@ import {
   createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
-import type {
-  LinkBillingAccountRequest,
-  ListLinkableBillingAccountsResponse,
-  UnlinkBillingAccountRequest,
+import {
+  BillingAccountRole,
+  type LinkBillingAccountRequest,
+  type ListLinkableBillingAccountsResponse,
+  type UnlinkBillingAccountRequest,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import {
   MemberService,
@@ -131,6 +132,7 @@ export function createMockTransport(): Transport {
   const pageDevices = methodName === "ListDevices";
   const pageInvitations = methodName === "ListInvitations";
   const pageSources = methodName === "SnapshotSources";
+  const pageBilling = methodName === "ListLinkableBillingAccounts";
   const holdTemplateFirstPage =
     sessionStorage.getItem("ownsand-e2e-template-first-page") === "hold";
   let heldTemplateFirstPage = false;
@@ -179,6 +181,18 @@ export function createMockTransport(): Transport {
         : 0,
       extraSnapshots: pageSources ? 200 : 0,
       extraTemplates: pageSources ? 200 : 0,
+      linkableBillingAccounts: pageBilling
+        ? Array.from({ length: 201 }, (_, i) => {
+            const index = 201 - i;
+            return {
+              billingAccountId: `0193a000-0000-7000-8000-${index.toString(16).padStart(12, "0")}`,
+              name: `Billing fixture ${String(index).padStart(3, "0")}`,
+              role: BillingAccountRole.OWNER,
+              balanceUsdMicros: 1_000_000n,
+              subscriptionActive: true,
+            };
+          })
+        : undefined,
     }),
   );
   const base =
