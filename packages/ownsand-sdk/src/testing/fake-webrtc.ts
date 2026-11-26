@@ -190,6 +190,7 @@ export function fakeWebRtc(
     release: (method) => {
       const hold = holds.get(method);
       if (hold !== undefined) {
+        hold.released = true;
         hold.waiting = 0;
         hold.open();
       }
@@ -197,18 +198,23 @@ export function fakeWebRtc(
   };
   const holds = new Map<
     HoldableMethod,
-    { waiting: number; gate: Promise<void>; open: () => void }
+    {
+      released: boolean;
+      waiting: number;
+      gate: Promise<void>;
+      open: () => void;
+    }
   >();
   for (const method of options.hold ?? []) {
     let open!: () => void;
     const gate = new Promise<void>((resolve) => (open = resolve));
-    holds.set(method, { waiting: 0, gate, open });
+    holds.set(method, { released: false, waiting: 0, gate, open });
   }
   /** Waits for the release of `method` when a test holds it. */
   const held = async (method: HoldableMethod): Promise<void> => {
     const hold = holds.get(method);
     if (hold !== undefined) {
-      hold.waiting++;
+      if (!hold.released) hold.waiting++;
       await hold.gate;
     }
   };
