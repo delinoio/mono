@@ -32,11 +32,13 @@ function report(event) {
 }
 
 // Run the fixture under the real launcher as either the fake Go build or its
-// output binary. The descendant always ignores SIGTERM so a graceful exit of
-// its parent still leaves a process for the supervisor to stop.
+// output binary. The descendant records signals but stays alive so a
+// successful exit of its parent leaves a process for the supervisor to stop.
 async function runFixture(phase, args) {
   if (phase === "descendant") {
-    process.on("SIGTERM", () => {});
+    for (const signal of signals) {
+      process.on(signal, () => report({ event: "descendant_signal", signal }));
+    }
     process.send("ready");
     setInterval(() => {}, 1000);
     return;
@@ -61,9 +63,9 @@ async function runFixture(phase, args) {
   }
 
   let descendant;
-  if (process.env.FIXTURE_STOP !== "wait") {
+  if (phase === "build" || process.env.FIXTURE_STOP !== "wait") {
     descendant = spawn(process.execPath, [fixture, "--fixture", "descendant"], {
-      stdio: ["ignore", "ignore", "inherit", "ipc"],
+      stdio: ["ignore", "inherit", "inherit", "ipc"],
     });
     await once(descendant, "message");
   }
@@ -203,9 +205,9 @@ const ready = (run) =>
     "phase readiness",
   );
 
-const observedSignals = (run) =>
+const observedSignals = (run, source = "signal") =>
   run.records
-    .filter(({ event }) => event === "signal")
+    .filter(({ event }) => event === source)
     .map(({ signal }) => signal);
 
 async function assertPortsReleased(ports) {
@@ -266,7 +268,6 @@ if (process.argv[2] === "--fixture") {
     ["server", "SIGINT", 130],
     ["server", "SIGTERM", 143],
     ["server", "SIGQUIT", 131],
-    ["build", "SIGINT", 130],
   ]) {
     test(
       `${signal} reaches the ${phase} once and the launcher waits (status ${code})`,
@@ -304,4 +305,103 @@ if (process.argv[2] === "--fixture") {
       },
     );
   }
+
+  for (const [requests, code] of [
+    [["SIGINT"], 130],
+    [["SIGTERM"], 143],
+    [["SIGQUIT", "SIGINT"], 131],
+  ]) {
+    test(
+      `${requests.join(" then ")} reaches the build group once per request (status ${code})`,
+      options,
+      async (t) => {
+        const run = startLauncher(t, "build", "wait");
+        const active = await ready(run);
+        assert.ok(active.hasNullFd);
+
+        for (const [index, signal] of requests.entries()) {
+          process.kill(
+            signal === "SIGTERM" ? run.task.pid : -run.task.pid,
+            signal,
+          );
+          await waitFor(
+            run,
+            () =>
+              observedSignals(run).length > index &&
+              observedSignals(run, "descendant_signal").length > index,
+            `the build group to receive ${signal}`,
+            4_000,
+          );
+        }
+
+        assert.equal(run.exit, null, "the launcher exited before the build");
+        assert.ok(isRunning(active.pid) && isRunning(active.descendant));
+        assert.equal(readdirSync(run.buildTmp).length, 1);
+        writeFileSync(run.exitFile, "");
+
+        await waitFor(
+          run,
+          () => !isRunning(active.pid) && !isRunning(active.descendant),
+          "the build group to stop promptly",
+          4_000,
+        );
+        assert.deepEqual(await run.exited, { code, signal: null });
+        await run.closed;
+        assert.deepEqual(observedSignals(run), requests);
+        assert.deepEqual(observedSignals(run, "descendant_signal"), requests);
+        assert.equal(
+          run.records.filter(({ event }) => event === "completed").length,
+          1,
+        );
+        assert.equal(
+          run.records.filter(({ event }) => event === "ready").length,
+          1,
+        );
+        assert.deepEqual(readdirSync(run.buildTmp), []);
+      },
+    );
+  }
+
+  test(
+    "SIGTERM kills a resistant build group at the deadline",
+    options,
+    async (t) => {
+      const run = startLauncher(t, "build", "ignore-term");
+      const active = await ready(run);
+
+      const started = performance.now();
+      process.kill(run.task.pid, "SIGTERM");
+      await waitFor(
+        run,
+        () =>
+          observedSignals(run).length &&
+          observedSignals(run, "descendant_signal").length,
+        "the build group to receive SIGTERM",
+      );
+      assert.equal(run.exit, null);
+      assert.ok(isRunning(active.pid) && isRunning(active.descendant));
+      assert.equal(readdirSync(run.buildTmp).length, 1);
+      await waitFor(
+        run,
+        () => !isRunning(active.pid) && !isRunning(active.descendant),
+        "the build group to stop at the deadline",
+        12_000,
+      );
+      assert.ok(performance.now() - started >= 4_900);
+
+      assert.deepEqual(await run.exited, { code: 143, signal: null });
+      await run.closed;
+      assert.deepEqual(observedSignals(run), ["SIGTERM"]);
+      assert.deepEqual(observedSignals(run, "descendant_signal"), ["SIGTERM"]);
+      assert.equal(
+        run.records.filter(({ event }) => event === "ready").length,
+        1,
+      );
+      assert.equal(
+        run.records.filter(({ event }) => event === "completed").length,
+        0,
+      );
+      assert.deepEqual(readdirSync(run.buildTmp), []);
+    },
+  );
 }

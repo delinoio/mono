@@ -116,7 +116,7 @@ const binaryName =
   process.platform === "win32" ? "ownsand-api.exe" : "ownsand-api";
 
 let received = null;
-let activeChild = null;
+let forwardSignal = null;
 function installSignalHandlers() {
   return Object.values(ForwardedSignal).map((signal) => {
     const handler = () => {
@@ -124,7 +124,8 @@ function installSignalHandlers() {
       console.error(
         JSON.stringify({ event: "ownsand_api_dev_signal", signal }),
       );
-      activeChild?.kill(signal);
+      // Between phases there is no child; the phase boundary checks received.
+      forwardSignal?.(signal);
     };
     process.on(signal, handler);
     return [signal, handler];
@@ -136,23 +137,27 @@ function installSignalHandlers() {
 // cannot be forwarded, so a build or server would survive it and keep its
 // port. The launcher therefore starts each phase through a supervisor: this
 // file started again with `--supervise` in a process group of its own, with a
-// private pipe (file descriptor 3) to the launcher. The supervisor runs the
-// build or server as its child in the same group and relays the signals that
-// the launcher forwards to it, once each. When the launcher dies for any
-// reason, the kernel closes the pipe; the supervisor then stops its whole
-// group: SIGTERM first, so a server can drain, and SIGKILL when the child has
-// exited or after the grace period, which also ends descendants that
-// outlive it. The launcher's end of the pipe stays in the launcher: the
+// private channel (file descriptor 3) to the launcher. The supervisor runs the
+// build or server as its child in the same group. The build supervisor reads
+// stop requests from the channel and signals its whole group. The server
+// supervisor relays OS signals to the server once per delivery. When the
+// launcher dies, the kernel closes the channel. The supervisor then sends
+// SIGTERM to its group so a server can drain. A group stop ends with SIGKILL
+// when the child exits or the grace period expires. This ends surviving
+// descendants. The launcher's end of the channel stays in the launcher. The
 // supervisor's child gets /dev/null as descriptor 3, so the pipe does not
 // reach the build, the server or their descendants.
 // Windows starts the child directly (`ownProcessGroup` is false there).
 const SuperviseFlag = "--supervise";
 const StopGraceMs = 5000;
+const Phase = Object.freeze({ Build: "build", Server: "server" });
+const BuildMessage = Object.freeze({ Exited: "exited", Finish: "finish" });
 
-// Entry point of the supervisor process: `dev.mjs --supervise <command> <args>`.
-function supervise(command, args) {
-  let launcherGone = false;
+function supervise(phase, command, args) {
+  const isBuild = phase === Phase.Build;
+  let stoppingGroup = false;
   let child = null;
+  let childStatus = null;
   // The supervisor leads its group (the launcher starts it detached), so the
   // group id is its own pid and the child and its descendants are members.
   const stopGroup = (signal) => {
@@ -164,24 +169,45 @@ function supervise(command, args) {
   };
   for (const signal of Object.values(ForwardedSignal)) {
     process.on(signal, () => {
-      // After the launcher died, the group signal below reaches the supervisor
-      // too; the child has already received it.
-      if (!launcherGone) child?.kill(signal);
+      // A group signal reaches the supervisor too. Only the server supervisor
+      // relays OS signals, and only before a group stop.
+      if (!isBuild && !stoppingGroup) child?.kill(signal);
     });
   }
-  const onLauncherGone = () => {
-    if (launcherGone) return;
-    launcherGone = true;
-    console.error(JSON.stringify({ event: "ownsand_api_dev_launcher_gone" }));
-    stopGroup("SIGTERM");
-    setTimeout(() => stopGroup("SIGKILL"), StopGraceMs);
+  const finish = () => {
+    if (stoppingGroup) stopGroup("SIGKILL");
+    process.exit(childStatus);
   };
-  const pipe = new net.Socket({ fd: 3, readable: true, writable: false });
-  pipe.on("error", onLauncherGone);
-  pipe.on("close", onLauncherGone);
-  pipe.resume();
+  const requestGroupStop = (signal) => {
+    if (!stoppingGroup) {
+      stoppingGroup = true;
+      setTimeout(() => stopGroup("SIGKILL"), StopGraceMs);
+    }
+    stopGroup(signal);
+    if (childStatus !== null) finish();
+  };
+  const onLauncherGone = () => {
+    if (stoppingGroup) return;
+    console.error(JSON.stringify({ event: "ownsand_api_dev_launcher_gone" }));
+    requestGroupStop("SIGTERM");
+  };
+  if (isBuild) {
+    process.on("disconnect", onLauncherGone);
+    process.on("message", (message) => {
+      if (message === BuildMessage.Finish) {
+        finish();
+      } else {
+        requestGroupStop(message);
+      }
+    });
+  } else {
+    const pipe = new net.Socket({ fd: 3, readable: true, writable: false });
+    pipe.on("error", onLauncherGone);
+    pipe.on("close", onLauncherGone);
+    pipe.resume();
+  }
 
-  // Descriptor 3 is the pipe here. Spawning with an "ignore" entry would leave
+  // Descriptor 3 is the channel here. Spawning with an "ignore" entry would leave
   // it open in the child (libuv skips ignored descriptors above 2), so the
   // child gets /dev/null there instead, which replaces it.
   const devNull = openSync("/dev/null", "r");
@@ -196,29 +222,51 @@ function supervise(command, args) {
   }
   child.once("error", (error) => {
     console.error(
-      JSON.stringify({ event: "ownsand_api_dev_failed", error: String(error) }),
+      JSON.stringify({
+        event: "ownsand_api_dev_failed",
+        error: String(error),
+      }),
     );
     process.exit(1);
   });
   child.once("close", (code, signal) => {
-    // A dead launcher means a group stop: end what the child left behind too.
-    if (launcherGone) stopGroup("SIGKILL");
-    process.exit(code ?? (signal ? signalExitCode(signal) : 1));
+    childStatus = code ?? (signal ? signalExitCode(signal) : 1);
+    if (isBuild && !stoppingGroup) {
+      // Wait for the launcher to acknowledge the exit. A stop it has already
+      // forwarded arrives before that acknowledgment on the same channel.
+      process.send(BuildMessage.Exited, (error) => {
+        if (error) onLauncherGone();
+      });
+    } else {
+      finish();
+    }
   });
 }
 
-function run(command, args, env) {
+function run(phase, command, args, env) {
   return new Promise((resolvePromise, reject) => {
     // On POSIX the child runs under a supervisor in its own process group (see
     // the forced-stop protection above); the supervisor exits with the child's
     // status, or the shell convention for a fatal signal.
+    const superviseBuild = ownProcessGroup && phase === Phase.Build;
     const child = ownProcessGroup
       ? spawn(
           process.execPath,
-          [fileURLToPath(import.meta.url), SuperviseFlag, command, ...args],
+          [
+            fileURLToPath(import.meta.url),
+            SuperviseFlag,
+            phase,
+            command,
+            ...args,
+          ],
           {
             cwd: packageDir,
-            stdio: ["inherit", "inherit", "inherit", "pipe"],
+            stdio: [
+              "inherit",
+              "inherit",
+              "inherit",
+              superviseBuild ? "ipc" : "pipe",
+            ],
             shell: false,
             detached: true,
             env,
@@ -230,17 +278,26 @@ function run(command, args, env) {
           shell: false,
           env,
         });
-    // The supervisor only watches this end for closing. It must stay open for
-    // as long as the launcher lives and must never be read or written.
+    // The server supervisor uses this pipe only to detect launcher death.
     const lifetimePipe = child.stdio[3];
     lifetimePipe?.on("error", () => {});
-    activeChild = child;
+    if (superviseBuild) {
+      // A signal can arrive as the build supervisor closes. In that case the
+      // launcher has already recorded the signal and will skip the server.
+      const send = (message) => child.send(message, () => {});
+      child.once("message", (message) => {
+        if (message === BuildMessage.Exited) send(BuildMessage.Finish);
+      });
+      forwardSignal = send;
+    } else {
+      forwardSignal = (signal) => child.kill(signal);
+    }
     child.once("error", (error) => {
-      activeChild = null;
+      forwardSignal = null;
       reject(error);
     });
     child.once("close", (code, signal) => {
-      activeChild = null;
+      forwardSignal = null;
       lifetimePipe?.destroy();
       resolvePromise(code ?? (signal ? signalExitCode(signal) : 1));
     });
@@ -268,13 +325,14 @@ async function main() {
     // -buildvcs=false matches the `build` script (VCS discovery can fail in
     // a linked Git worktree).
     const buildStatus = await run(
+      Phase.Build,
       "go",
       ["build", "-buildvcs=false", "-o", binary, "./cmd/ownsand-api"],
       env,
     );
     if (received) return stoppedStatus();
     if (buildStatus !== 0) return buildStatus;
-    const serverStatus = await run(binary, [], env);
+    const serverStatus = await run(Phase.Server, binary, [], env);
     return received ? stoppedStatus() : serverStatus;
   } finally {
     await rm(buildDir, { recursive: true, force: true });
@@ -285,7 +343,7 @@ async function main() {
 // the helpers above without starting a build.
 const isMain = isWorkspaceCli(import.meta);
 if (isMain && process.argv[2] === SuperviseFlag) {
-  supervise(process.argv[3], process.argv.slice(4));
+  supervise(process.argv[3], process.argv[4], process.argv.slice(5));
 } else if (isMain) {
   const handlers = installSignalHandlers();
   try {
