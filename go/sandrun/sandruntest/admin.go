@@ -732,8 +732,10 @@ func (a *apiKeyService) RevokeApiKey(_ context.Context, req *connect.Request[san
 	defer a.s.mu.Unlock()
 	for _, k := range a.s.apiKeys {
 		if k.GetOrganizationId() == req.Msg.GetOrganizationId() && k.GetApiKeyId() == req.Msg.GetApiKeyId() {
-			k.State = sandrunv1.ApiKeyState_API_KEY_STATE_REVOKED
-			k.RevokedAt = timestamppb.Now()
+			if k.GetState() != sandrunv1.ApiKeyState_API_KEY_STATE_REVOKED {
+				k.State = sandrunv1.ApiKeyState_API_KEY_STATE_REVOKED
+				k.RevokedAt = timestamppb.Now()
+			}
 			return connect.NewResponse(&sandrunv1.RevokeApiKeyResponse{ApiKey: proto.CloneOf(k)}), nil
 		}
 	}
