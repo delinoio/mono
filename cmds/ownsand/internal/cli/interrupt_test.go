@@ -7,10 +7,18 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"connectrpc.com/connect"
+
+	ownsand "github.com/delinoio/mono/go/ownsand"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
 
 // notifyReader reports the first Read call on started and then delegates, so
@@ -94,6 +102,61 @@ func TestMemberAcceptInterruptedWhileReadingStandardInput(t *testing.T) {
 		if c == "AcceptInvitation" {
 			t.Fatal("AcceptInvitation was sent after the interrupt")
 		}
+	}
+}
+
+func TestMemberAcceptRPCCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		interrupt  bool
+		wantCode   int
+		wantStderr string
+	}{
+		{"local interrupt", true, ExitInterrupted, "error: interrupted\n"},
+		{"server cancellation", false, ExitError, "error: canceled: fixture server cancellation\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			release := make(chan struct{})
+			defer close(release)
+			handler := connect.NewUnaryHandler(
+				ownsandv1connect.MemberServiceAcceptInvitationProcedure,
+				func(context.Context, *connect.Request[ownsandv1.AcceptInvitationRequest]) (*connect.Response[ownsandv1.AcceptInvitationResponse], error) {
+					if tc.interrupt {
+						cancel()
+						// Keep the RPC in flight until the client reports its result.
+						select {
+						case <-release:
+						case <-time.After(30 * time.Second):
+						}
+					}
+					return nil, connect.NewError(connect.CodeCanceled, errors.New("fixture server cancellation"))
+				},
+			)
+			srv := httptest.NewUnstartedServer(handler)
+			srv.Config.Protocols = new(http.Protocols)
+			srv.Config.Protocols.SetUnencryptedHTTP2(true)
+			srv.Start()
+			t.Cleanup(srv.Close)
+
+			var out, errb bytes.Buffer
+			code := Run(ctx, Env{
+				Args:   []string{"--no-color", "--api-url", srv.URL, "member", "accept"},
+				Stdin:  strings.NewReader("osi_fixture\n"),
+				Stdout: &out,
+				Stderr: &errb,
+				LookupEnv: func(key string) (string, bool) {
+					if key == ownsand.EnvAPIKey {
+						return "osk_testkey", true
+					}
+					return "", false
+				},
+			})
+			if code != tc.wantCode || out.Len() != 0 || errb.String() != tc.wantStderr {
+				t.Fatalf("exit %d, stdout %q, stderr %q; want exit %d, empty stdout, stderr %q", code, out.String(), errb.String(), tc.wantCode, tc.wantStderr)
+			}
+		})
 	}
 }
 
