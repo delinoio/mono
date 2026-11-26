@@ -246,11 +246,19 @@ func (s *Sandbox) setInfo(sb *ownsandv1.Sandbox) *ownsandv1.Sandbox {
 
 // Get reads the sandbox.
 func (s *Sandbox) Get(ctx context.Context) (*ownsandv1.Sandbox, error) {
+	sb, err := s.getSandbox(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.accept("GetSandbox", sb)
+}
+
+func (s *Sandbox) getSandbox(ctx context.Context) (*ownsandv1.Sandbox, error) {
 	res, err := s.c.sandboxes.GetSandbox(ctx, connect.NewRequest(&ownsandv1.GetSandboxRequest{OrganizationId: s.org, SandboxId: s.id}))
 	if err != nil {
 		return nil, err
 	}
-	return s.accept("GetSandbox", res.Msg.GetSandbox())
+	return res.Msg.GetSandbox(), nil
 }
 
 // Delete deletes the sandbox and closes the handle's data path.
@@ -377,18 +385,6 @@ func (s *Sandbox) waitForResume(ctx context.Context) error {
 	})
 	if err != nil {
 		return err
-	}
-	if IsTerminal(sb.GetState()) {
-		return &ErrSandboxEnded{State: sb.GetState(), Reason: sb.GetEndReason()}
-	}
-	return nil
-}
-
-// endedState returns ErrSandboxEnded when the sandbox is terminal now.
-func (s *Sandbox) endedState(ctx context.Context) *ErrSandboxEnded {
-	sb, err := s.Get(ctx)
-	if err != nil {
-		return nil
 	}
 	if IsTerminal(sb.GetState()) {
 		return &ErrSandboxEnded{State: sb.GetState(), Reason: sb.GetEndReason()}

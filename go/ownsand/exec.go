@@ -263,7 +263,7 @@ func (op *execOp) dpErr(err error, unknown bool) error {
 	if errors.As(err, &cb) {
 		return cb.err
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if !errors.Is(err, errRecoveryDeadline) && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		return err
 	}
 	return &DataPathError{Operation: op.opName(), OperationID: op.execID, OutcomeUnknown: unknown, Err: err}
@@ -354,16 +354,11 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 		if cerr := callerDeadlineEnded(ctx, err, s.c.timing.callerDeadlineSkew); cerr != nil {
 			return nil, cerr
 		}
-		if at.authErr {
-			if connect.CodeOf(err) == connect.CodeFailedPrecondition {
-				if ended := s.endedState(ctx); ended != nil {
-					return op.sandboxEnded(ended), nil
-				}
-			}
+		if at.authErr && connect.CodeOf(err) != connect.CodeFailedPrecondition {
 			return nil, op.dpErr(err, false)
 		}
 		kind, delay := classify(ctx, err)
-		if kind == failTerminal {
+		if at.authErr || kind == failTerminal {
 			switch connect.CodeOf(err) {
 			case connect.CodeNotFound:
 				if !at.sentExec && !op.started && op.req != nil {
@@ -374,11 +369,14 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 				}
 				return nil, op.dpErr(err, true)
 			case connect.CodeFailedPrecondition:
-				sb, gerr := s.Get(ctx)
-				if gerr == nil && IsTerminal(sb.GetState()) {
+				sb, gerr := op.lookupSandbox(ctx)
+				if gerr != nil {
+					return nil, op.dpErr(gerr, false)
+				}
+				if IsTerminal(sb.GetState()) {
 					return op.sandboxEnded(&ErrSandboxEnded{State: sb.GetState(), Reason: sb.GetEndReason()}), nil
 				}
-				if gerr == nil && isPaused(sb) && op.req != nil && !op.started {
+				if !at.authErr && isPaused(sb) && op.req != nil && !op.started {
 					// A paused sandbox without an exec record: end the
 					// recovery window and send the identical request after
 					// the resume.
@@ -412,6 +410,56 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 			return nil, op.dpErr(berr, false)
 		}
 	}
+}
+
+// lookupSandbox checks the sandbox after failed_precondition. A lookup
+// failure leaves the original status in effect unless the caller or the
+// recovery window ends the lookup.
+func (op *execOp) lookupSandbox(ctx context.Context) (*ownsandv1.Sandbox, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s := op.s
+	lookupCtx := ctx
+	var deadline time.Time
+	if op.rec.inRecovery() {
+		deadline = time.Now().Add(op.rec.remaining())
+		// Cancel locally so Connect sends only the caller's timeout.
+		var cancel context.CancelCauseFunc
+		lookupCtx, cancel = context.WithCancelCause(ctx)
+		defer cancel(nil)
+		left := time.Until(deadline)
+		if left <= 0 {
+			return nil, op.rec.deadlineErr()
+		}
+		timer := time.AfterFunc(left, func() { cancel(errRecoveryDeadline) })
+		defer timer.Stop()
+	}
+	sb, err := s.getSandbox(lookupCtx)
+	callerDeadline, hasCallerDeadline := ctx.Deadline()
+	callerDeadlineFirst := hasCallerDeadline && (deadline.IsZero() || !deadline.Before(callerDeadline))
+	if context.Cause(lookupCtx) == errRecoveryDeadline && !callerDeadlineFirst {
+		return nil, op.rec.deadlineErr()
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
+	// A reply can arrive after a deadline before its timer runs.
+	now := time.Now()
+	if callerDeadlineFirst && !now.Before(callerDeadline) {
+		return nil, context.DeadlineExceeded
+	}
+	if !deadline.IsZero() && !now.Before(deadline) {
+		return nil, op.rec.deadlineErr()
+	}
+	if err != nil {
+		if callerDeadlineFirst {
+			return nil, callerDeadlineEnded(ctx, err, s.c.timing.callerDeadlineSkew)
+		}
+		return nil, nil
+	}
+	sb, _ = s.accept("GetSandbox", sb)
+	return sb, nil
 }
 
 // request returns the payload of the next attempt.
