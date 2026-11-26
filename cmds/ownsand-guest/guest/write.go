@@ -170,15 +170,6 @@ func (m *writeManager) entry(req *ownsandv1.WriteFileRequest) (*writeEntry, erro
 		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write expired")
 	}
 	if e, ok := m.entries[id]; ok {
-		if e.recovered {
-			// The ranges and the open file of the write died with the
-			// earlier helper process, so the upload cannot continue. The
-			// staging file is removed when the write expires.
-			return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write was lost in a helper restart")
-		}
-		if req.GetPath() != "" && nativePath(req.GetPath()) != e.path {
-			return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write_id is bound to another path")
-		}
 		return e, nil
 	}
 	if req.GetPath() == "" {
@@ -243,6 +234,13 @@ func (m *writeManager) apply(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteF
 	defer e.mu.Unlock()
 	if e.gone {
 		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write expired")
+	}
+	if e.recovered {
+		// The earlier helper process lost the written ranges and open file.
+		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write was lost in a helper restart")
+	}
+	if req.GetPath() != "" && nativePath(req.GetPath()) != e.path {
+		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write_id is bound to another path")
 	}
 	finish := req.GetFinish()
 	if e.finished {

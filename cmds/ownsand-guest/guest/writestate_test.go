@@ -492,6 +492,11 @@ func restartWithFailedRecordPromotion(t *testing.T, h *harness, canonical, temp 
 
 func assertWriteLostAfterRestart(t *testing.T, h *harness, chunk *ownsandv1.WriteFileRequest) {
 	t.Helper()
+	assertWriteNotFound(t, h, chunk, "write was lost in a helper restart")
+}
+
+func assertWriteNotFound(t *testing.T, h *harness, chunk *ownsandv1.WriteFileRequest, message string) {
+	t.Helper()
 	finish := &ownsandv1.WriteFileRequest{
 		SandboxId: testSandbox,
 		WriteId:   chunk.GetWriteId(),
@@ -500,8 +505,8 @@ func assertWriteLostAfterRestart(t *testing.T, h *harness, chunk *ownsandv1.Writ
 	for _, req := range []*ownsandv1.WriteFileRequest{chunk, finish} {
 		_, errd := h.write(req)
 		if errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND ||
-			errd.GetMessage() != "write was lost in a helper restart" {
-			t.Fatalf("recovered write response: %v", errd)
+			errd.GetMessage() != message {
+			t.Fatalf("write response with finish=%t: %v, want not_found (%q)", req.GetFinish() != nil, errd, message)
 		}
 	}
 }
@@ -535,6 +540,7 @@ func TestWriteRecoveryFailedPromotionExpiresStagingFile(t *testing.T) {
 		t.Fatalf("staging file before expiry: %q, %v", got, err)
 	}
 	checkRecord()
+	assertWriteLostAfterRestart(t, h2, req)
 
 	h2.srv.writes.removeFile = func(path string) error {
 		if path != staging {
@@ -548,7 +554,7 @@ func TestWriteRecoveryFailedPromotionExpiresStagingFile(t *testing.T) {
 		t.Fatal("staging file disappeared after failed cleanup")
 	}
 	checkRecord()
-	assertWriteLostAfterRestart(t, h2, req)
+	assertWriteNotFound(t, h2, req, "write expired")
 
 	h2.srv.writes.removeFile = func(path string) error {
 		checkRecord()
@@ -561,10 +567,7 @@ func TestWriteRecoveryFailedPromotionExpiresStagingFile(t *testing.T) {
 	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
 		t.Fatalf("target after expiry: %q, %v", got, err)
 	}
-	if _, errd := h2.write(req); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND ||
-		errd.GetMessage() != "write expired" {
-		t.Fatalf("write after expiry: %v", errd)
-	}
+	assertWriteNotFound(t, h2, req, "write expired")
 }
 
 func TestWriteRecoveryFailedPromotionRetriesOnRestart(t *testing.T) {
