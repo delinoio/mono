@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"slices"
 	"strings"
@@ -392,16 +391,45 @@ func TestSecretCommandWriteErrors(t *testing.T) {
 	}
 }
 
-// TestStickyWriterKeepsFirstError checks that later writes do nothing after
-// the first error.
+type outputWriterFunc func([]byte) (int, error)
+
+func (f outputWriterFunc) Write(p []byte) (int, error) {
+	return f(p)
+}
+
 func TestStickyWriterKeepsFirstError(t *testing.T) {
-	under := &failingWriter{failAfter: 1, err: errDiskFull}
-	w := &stickyWriter{w: under}
-	fmt.Fprint(w, "a")
-	fmt.Fprint(w, "b")
-	fmt.Fprint(w, "c")
-	if !errors.Is(w.err, errDiskFull) || under.buf.String() != "a" {
-		t.Fatalf("err %v, wrote %q", w.err, under.buf.String())
+	var out bytes.Buffer
+	wrappedCalls := 0
+	unexpectedErr := errors.New("unexpected wrapped write")
+	w := &stickyWriter{w: outputWriterFunc(func(p []byte) (int, error) {
+		wrappedCalls++
+		switch wrappedCalls {
+		case 1:
+			return out.Write(p)
+		case 2:
+			return 0, errDiskFull
+		default:
+			return 0, unexpectedErr
+		}
+	})}
+
+	if n, err := w.Write([]byte("a")); n != 1 || err != nil {
+		t.Errorf("Write(a) = (%d, %v), want (1, nil)", n, err)
+	}
+	if n, err := w.Write([]byte("b")); n != 0 || err != errDiskFull {
+		t.Errorf("Write(b) = (%d, %v), want (0, %v)", n, err, errDiskFull)
+	}
+	if n, err := w.Write([]byte("c")); n != 0 || err != errDiskFull {
+		t.Errorf("Write(c) = (%d, %v), want (0, %v)", n, err, errDiskFull)
+	}
+	if wrappedCalls != 2 {
+		t.Errorf("wrapped writer called %d times, want 2", wrappedCalls)
+	}
+	if w.err != errDiskFull {
+		t.Errorf("stored error = %v, want %v", w.err, errDiskFull)
+	}
+	if got := out.String(); got != "a" {
+		t.Errorf("wrapped writer output = %q, want %q", got, "a")
 	}
 }
 
