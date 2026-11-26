@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError } from "@connectrpc/connect";
 import { useMutation, useQuery } from "@connectrpc/connect-query";
 import { skipToken, useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonVariant } from "delino-ui/button";
@@ -79,15 +80,24 @@ export function BillingSection() {
     organizationId,
   });
   const linked = status.data?.billing?.linked;
+  const billingAccountId = status.data?.billingAccountId;
   const usage = useQuery(
     BillingService.method.getBillingUsage,
     linked === true ? { organizationId } : skipToken,
   );
   const unlink = useMutation(BillingService.method.unlinkBillingAccount, {
     onSuccess: () => invalidateServices(queryClient, BillingService),
+    onError: (error) => {
+      if (error.code === Code.FailedPrecondition) {
+        return invalidateServices(queryClient, BillingService);
+      }
+    },
   });
   const [linking, setLinking] = useState(false);
-  const [confirmUnlink, setConfirmUnlink] = useState(false);
+  const [unlinkTarget, setUnlinkTarget] = useState<{
+    id: string;
+    name: string;
+  }>();
   const owner = can(role, Permission.ManageBillingLink);
 
   let body;
@@ -177,7 +187,16 @@ export function BillingSection() {
           <div className="actions">
             <Button
               variant={ButtonVariant.Secondary}
-              onClick={() => setConfirmUnlink(true)}
+              disabled={!billingAccountId || unlink.isPending || status.isError}
+              onClick={() => {
+                if (!billingAccountId) return;
+                const name =
+                  !usage.isError &&
+                  usage.data?.billingAccountId === billingAccountId
+                    ? usage.data.billingAccountName
+                    : "the billing account";
+                setUnlinkTarget({ id: billingAccountId, name });
+              }}
             >
               Unlink billing account
             </Button>
@@ -204,12 +223,31 @@ export function BillingSection() {
         <>
           <LinkBillingDialog open={linking} onOpenChange={setLinking} />
           <ConfirmDialog
-            open={confirmUnlink}
-            onOpenChange={setConfirmUnlink}
-            title={`Unlink ${usage.data?.billingAccountName ?? "the billing account"}?`}
+            open={unlinkTarget !== undefined}
+            onOpenChange={(open) => {
+              if (!open) setUnlinkTarget(undefined);
+            }}
+            title={`Unlink ${unlinkTarget?.name ?? "the billing account"}?`}
             description="The organization becomes blocked at once: OwnSand rejects new sandboxes, snapshots, templates and enrollment tokens until you link a billing account again. Usage so far stays on this billing account."
             confirmLabel="Unlink billing account"
-            onConfirm={() => unlink.mutateAsync({ organizationId })}
+            onConfirm={async (opening) => {
+              if (unlinkTarget === undefined) return;
+              try {
+                await unlink.mutateAsync({
+                  organizationId,
+                  expectedBillingAccountId: unlinkTarget.id,
+                });
+              } catch (error) {
+                if (ConnectError.from(error).code !== Code.FailedPrecondition) {
+                  throw error;
+                }
+                if (opening.isCurrent()) {
+                  toast.error(
+                    "The linked billing account changed. Review the current account and confirm again.",
+                  );
+                }
+              }
+            }}
           />
         </>
       ) : null}

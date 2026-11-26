@@ -1594,6 +1594,7 @@ export function createMockTransport(
         const key = org.apiKeys.find((k) => k.apiKeyId === req.apiKeyId);
         if (key === undefined)
           throw new ConnectError("API key not found", Code.NotFound);
+        if (key.state === ApiKeyState.REVOKED) return { apiKey: key };
         key.state = ApiKeyState.REVOKED;
         key.revokeTime = ts();
         return { apiKey: key };
@@ -1869,8 +1870,12 @@ export function createMockTransport(
 
     router.service(BillingService, {
       getBillingStatus(req) {
-        const { org } = membership(req.organizationId);
-        return { billing: billingOf(org) };
+        const { org, role } = membership(req.organizationId);
+        return {
+          billing: billingOf(org),
+          billingAccountId:
+            role === Role.OWNER ? org.billing.billingAccountId : undefined,
+        };
       },
       getBillingUsage(req) {
         const { org, role } = membership(req.organizationId);
@@ -1937,6 +1942,16 @@ export function createMockTransport(
       unlinkBillingAccount(req) {
         const { org, role } = membership(req.organizationId);
         requireOwner(role);
+        if (
+          req.expectedBillingAccountId !== undefined &&
+          req.expectedBillingAccountId.toLowerCase() !==
+            org.billing.billingAccountId
+        ) {
+          throw new ConnectError(
+            "the linked billing account changed; review the current account and confirm again",
+            Code.FailedPrecondition,
+          );
+        }
         unlink(org);
         return { billing: billingOf(org) };
       },

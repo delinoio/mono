@@ -7,7 +7,13 @@ const SANDBOXES = "/orgs/0193a000-0000-7000-8000-000000000001/sandboxes";
 const createSandbox = test.extend<{
   fixture: {
     open(
-      response: "missing-sandbox" | "empty-id" | "held" | "valid",
+      response:
+        | "missing-sandbox"
+        | "empty-id"
+        | "held"
+        | "valid"
+        | "lost"
+        | "lost-twice",
     ): Promise<void>;
     creates(): Promise<{ request: string; sandboxId: string }[]>;
   };
@@ -37,7 +43,7 @@ const createSandbox = test.extend<{
 });
 
 describe("sandbox create replies", () => {
-  for (const response of ["missing-sandbox", "empty-id"] as const) {
+  for (const response of ["missing-sandbox", "empty-id", "lost"] as const) {
     createSandbox(
       `recovers a committed create after ${response}`,
       async ({ app, browser, screen, fixture }) => {
@@ -74,6 +80,52 @@ describe("sandbox create replies", () => {
       },
     );
   }
+
+  createSandbox(
+    "blocks retry at the original deadline after two lost replies",
+    async ({ app, browser, screen, fixture }) => {
+      const windowMs = 24 * 60 * 60 * 1000;
+      await fixture.open("lost-twice");
+      const dialog = screen.getByRole("dialog", "Create a sandbox");
+      const start = await browser.evaluate(() => {
+        const now = Date.now();
+        Date.now = () => now;
+        return now;
+      });
+      await dialog.getByRole("button", "Create").tap();
+
+      const retry = dialog.getByRole("button", "Retry original request");
+      await expect(retry).toBeEnabled();
+      await expect(dialog.getByLabel("vCPUs")).toBeDisabled();
+      await browser.evaluate(
+        (time) => {
+          Date.now = () => time;
+          return true;
+        },
+        start + windowMs - 60_000,
+      );
+      await retry.tap();
+      await expect(retry).toBeEnabled();
+      const [first] = await fixture.creates();
+      expect(first?.sandboxId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(await fixture.creates()).toEqual([first, first]);
+
+      // Advance the wall clock without waiting for the scheduled timer.
+      await browser.evaluate((time) => {
+        Date.now = () => time;
+        return true;
+      }, start + windowMs);
+      await expect(retry).toBeEnabled();
+      await retry.tap();
+      await expect(retry).toBeDisabled();
+      await expect(dialog.getByRole("alert")).toContainText(
+        "Check the sandbox list",
+      );
+      await expect(browser).toHaveURL(SANDBOXES);
+      expect(await fixture.creates()).toEqual([first, first]);
+      await app.screenshot("sandbox-create-lost-expired");
+    },
+  );
 
   createSandbox(
     "opens the sandbox when the current reply has a valid ID",

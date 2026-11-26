@@ -190,12 +190,15 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   });
   const remove = useMutation(DeviceService.method.removeDevice, {
     onSuccess: () => {
-      // Removing a device ends its sandboxes and deletes the snapshots and
-      // templates that exist only on it, so their cached lists are stale
-      // too. They are not awaited: no page needs them before it navigates,
-      // and a refetch that is still running must not delay the navigation.
-      void invalidateServices(queryClient, SandboxService, SnapshotService);
-      return invalidateServices(queryClient, DeviceService);
+      // Removing a device ends its sandboxes and deletes its local snapshots
+      // and templates. Refresh all three services in the background so the
+      // confirmation can navigate even while GetDevice is still pending.
+      void invalidateServices(
+        queryClient,
+        DeviceService,
+        SandboxService,
+        SnapshotService,
+      );
     },
   });
   // The fields the user has edited and not saved yet. A field that is absent

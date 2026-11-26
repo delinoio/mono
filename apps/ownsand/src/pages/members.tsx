@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
-import { useQueryClient } from "@tanstack/react-query";
+import {
+  createInfiniteQueryOptions,
+  useMutation,
+  useTransport,
+} from "@connectrpc/connect-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { toast } from "delino-ui/toast";
@@ -32,6 +36,7 @@ import { membersBoundary, useMembers } from "../members.ts";
 import {
   FOLLOW_ALL_PAGES_OPTIONS,
   boundaryOf,
+  cancelUncachedList,
   uniqueRows,
   useFollowAllPages,
 } from "../pagination.ts";
@@ -193,15 +198,22 @@ export function MembersPage() {
 function Invitations() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
+  const transport = useTransport();
   const refresh = () => invalidateServices(queryClient, MemberService);
-  const list = useInfiniteQuery(
-    MemberService.method.listInvitations,
-    { organizationId, pageSize: 200, pageToken: "" },
-    {
-      ...FOLLOW_ALL_PAGES_OPTIONS,
-      getNextPageParam: (last) => last.nextPageToken || undefined,
-    },
-  );
+  const listOptions = (listOrganizationId: string) =>
+    createInfiniteQueryOptions(
+      MemberService.method.listInvitations,
+      { organizationId: listOrganizationId, pageSize: 200, pageToken: "" },
+      {
+        transport,
+        pageParamKey: FOLLOW_ALL_PAGES_OPTIONS.pageParamKey,
+        getNextPageParam: (last) => last.nextPageToken || undefined,
+      },
+    );
+  const list = useInfiniteQuery({
+    ...listOptions(organizationId),
+    ...FOLLOW_ALL_PAGES_OPTIONS,
+  });
   const pages = useFollowAllPages(list);
   const pending = useMemo(
     () =>
@@ -212,7 +224,16 @@ function Invitations() {
     [list.data],
   );
   const create = useMutation(MemberService.method.createInvitation, {
-    onSuccess: refresh,
+    onSuccess: (_, { organizationId: submittedOrganizationId }) => {
+      if (submittedOrganizationId === undefined) {
+        void refresh();
+        return;
+      }
+      void cancelUncachedList(
+        queryClient,
+        listOptions(submittedOrganizationId).queryKey,
+      ).then(refresh);
+    },
   });
   const revoke = useMutation(MemberService.method.revokeInvitation, {
     onSuccess: refresh,
