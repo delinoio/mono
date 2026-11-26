@@ -26,6 +26,44 @@ import (
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
 )
 
+func TestCreateDevSessionLabelLength(t *testing.T) {
+	s := New()
+	t.Cleanup(s.Close)
+	org := s.AddOrganization("label test").GetOrganizationId()
+	profile := s.AddDevSessionProfile(org, "label", sandrunv1.GuestOs_GUEST_OS_LINUX, t.TempDir())
+	client := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+
+	for _, tt := range []struct {
+		name        string
+		label       string
+		wantInvalid bool
+	}{
+		{name: "34 multibyte code points", label: strings.Repeat("한", 34)},
+		{name: "100 multibyte code points", label: strings.Repeat("한", 100)},
+		{name: "101 multibyte code points", label: strings.Repeat("한", 101), wantInvalid: true},
+		{name: "100 ASCII code points", label: strings.Repeat("a", 100)},
+		{name: "101 ASCII code points", label: strings.Repeat("a", 101), wantInvalid: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := client.CreateDevSession(t.Context(), listTestRequest(&sandrunv1.CreateDevSessionRequest{
+				OrganizationId: org, RunnerProfileId: profile.GetRunnerProfileId(), Label: tt.label,
+			}))
+			if tt.wantInvalid {
+				if connect.CodeOf(err) != connect.CodeInvalidArgument {
+					t.Fatalf("CreateDevSession error = %v, want invalid_argument", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := res.Msg.GetDevSession().GetLabel(); got != tt.label {
+				t.Errorf("label = %q, want %q", got, tt.label)
+			}
+		})
+	}
+}
+
 func TestWriteDevSessionFileRejectsInvalidOffsets(t *testing.T) {
 	const writeID, fileName = "write-offset", "out.txt"
 	workspace := t.TempDir()
