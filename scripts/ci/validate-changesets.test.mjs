@@ -23,8 +23,8 @@ const skip = process.platform === "win32" && "the CI scripts run on Linux";
 
 // A Git repository with `.changeset/` and a `pnpm` stub that logs its
 // arguments and exits with `pnpmExit`.
-function run(t, files, pnpmExit = 0) {
-  const dir = mkdtempSync(join(tmpdir(), "validate-changesets-"));
+function run(t, files, { pnpmExit = 0, temporaryParent = tmpdir() } = {}) {
+  const dir = mkdtempSync(join(temporaryParent, "validate-changesets-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   execFileSync("git", ["init", "--quiet"], { cwd: dir, env: baseEnv });
   mkdirSync(join(dir, ".changeset"));
@@ -32,25 +32,30 @@ function run(t, files, pnpmExit = 0) {
     writeFileSync(join(dir, ".changeset", name), content);
   }
   const bin = join(dir, "bin");
+  const callsLog = join(dir, "calls.log");
   mkdirSync(bin);
   writeFileSync(
     join(bin, "pnpm"),
-    `#!/usr/bin/env bash\necho "$*" >> "${join(dir, "calls.log")}"\nexit ${pnpmExit}\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "$PNPM_CALLS_LOG"\nexit ${pnpmExit}\n`,
   );
   chmodSync(join(bin, "pnpm"), 0o755);
-  writeFileSync(join(dir, "calls.log"), "");
+  writeFileSync(callsLog, "");
   const result = spawnSync("bash", [script], {
     cwd: dir,
     encoding: "utf8",
-    env: { ...baseEnv, PATH: `${bin}${delimiter}${baseEnv.PATH}` },
+    env: {
+      ...baseEnv,
+      PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+      PNPM_CALLS_LOG: callsLog,
+    },
   });
-  return { ...result, calls: readFileSync(join(dir, "calls.log"), "utf8") };
+  return { ...result, calls: readFileSync(callsLog, "utf8") };
 }
 
 const base = { "README.md": "# Changesets\n", "config.json": "{}\n" };
 
 test("passes without running changeset when none is pending", { skip }, (t) => {
-  const result = run(t, base, 1);
+  const result = run(t, base, { pnpmExit: 1 });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /No pending changesets/);
   assert.equal(result.calls, "");
@@ -81,17 +86,29 @@ test("ignores the files that Changesets ignores", { skip }, (t) => {
       "readme.md": "# lower\n",
       ".draft.md": "x\n",
     },
-    1,
+    { pnpmExit: 1 },
   );
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /No pending changesets/);
   assert.equal(result.calls, "");
 });
 
-test("runs changeset version for a pending changeset", { skip }, (t) => {
-  const ok = run(t, { ...base, "brave.md": '---\n"a": patch\n---\n\nx\n' });
-  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
-  assert.equal(ok.calls, "exec changeset version\n");
-  const bad = run(t, { ...base, "brave.md": '---\n"a": patch\n---\n\nx\n' }, 1);
-  assert.equal(bad.status, 1);
-});
+test(
+  "runs changeset version under a temporary parent with a double quote",
+  { skip },
+  (t) => {
+    const temporaryParent = mkdtempSync(
+      join(tmpdir(), 'validate-changesets-"'),
+    );
+    t.after(() => rmSync(temporaryParent, { recursive: true, force: true }));
+    const files = { ...base, "brave.md": '---\n"a": patch\n---\n\nx\n' };
+
+    const ok = run(t, files, { temporaryParent });
+    assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+    assert.equal(ok.calls, "exec changeset version\n");
+
+    const bad = run(t, files, { pnpmExit: 1, temporaryParent });
+    assert.equal(bad.status, 1, bad.stdout + bad.stderr);
+    assert.equal(bad.calls, "exec changeset version\n");
+  },
+);
