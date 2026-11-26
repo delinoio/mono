@@ -70,8 +70,25 @@ log() {
 }
 
 log "Install Docker Engine"
+install_docker=true
+if command -v docker > /dev/null; then
+  # LoadState distinguishes a missing unit from an installed, stopped daemon.
+  if ! docker_load_state="$(systemctl show --property=LoadState --value docker.service)"; then
+    echo "error: could not query the load state of docker.service." >&2
+    exit 1
+  fi
+  case "$docker_load_state" in
+    loaded) install_docker=false ;;
+    not-found) ;;
+    *)
+      printf 'error: unexpected load state for docker.service: %q.\n' "$docker_load_state" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 # https://docs.docker.com/engine/install/ubuntu/
-if ! command -v docker > /dev/null; then
+if [[ "$install_docker" == true ]]; then
   apt-get update
   apt-get install -y ca-certificates curl
   install -m 0755 -d /etc/apt/keyrings
