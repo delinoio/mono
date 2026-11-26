@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.sandrun.v1;
+
+import "delino/sandrun/v1/common.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/sandrun/v1;sandrunv1";
+
+// OrganizationService manages SandRun organizations. CreateOrganization and
+// ListOrganizations take no organization_id.
+service OrganizationService {
+  // Create an organization. The caller becomes its owner.
+  rpc CreateOrganization(CreateOrganizationRequest) returns (CreateOrganizationResponse);
+  // Read one organization.
+  rpc GetOrganization(GetOrganizationRequest) returns (GetOrganizationResponse);
+  // List the organizations of the signed-in user.
+  rpc ListOrganizations(ListOrganizationsRequest) returns (ListOrganizationsResponse);
+  // Delete the organization and start its clean-up.
+  rpc DeleteOrganization(DeleteOrganizationRequest) returns (DeleteOrganizationResponse);
+  // Make another member the owner. The previous owner becomes admin.
+  rpc TransferOwnership(TransferOwnershipRequest) returns (TransferOwnershipResponse);
+  // Change the organization settings with a field mask.
+  rpc UpdateOrganizationSettings(UpdateOrganizationSettingsRequest) returns (UpdateOrganizationSettingsResponse);
+}
+
+// Settings of an organization.
+message OrganizationSettings {
+  // Maximum number of dev sessions in QUEUED, STARTING and RUNNING per user.
+  // Unset means no limit. When set, greater than zero.
+  optional int32 max_dev_sessions_per_user = 1;
+}
+
+message Organization {
+  string organization_id = 1;
+  string name = 2;
+  google.protobuf.Timestamp create_time = 3;
+  // Role of the calling user in the organization.
+  Role caller_role = 4;
+  OrganizationSettings settings = 5;
+}
+
+message CreateOrganizationRequest {
+  // 1 to 100 characters.
+  string name = 1;
+}
+
+message CreateOrganizationResponse {
+  Organization organization = 1;
+}
+
+message GetOrganizationRequest {
+  string organization_id = 1;
+}
+
+message GetOrganizationResponse {
+  Organization organization = 1;
+}
+
+message ListOrganizationsRequest {
+  // Default 50, maximum 200.
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListOrganizationsResponse {
+  repeated Organization organizations = 1;
+  string next_page_token = 2;
+}
+
+message DeleteOrganizationRequest {
+  string organization_id = 1;
+}
+
+message DeleteOrganizationResponse {}
+
+message TransferOwnershipRequest {
+  string organization_id = 1;
+  // Logto `sub` of an existing member that becomes the owner.
+  string user_id = 2;
+}
+
+message TransferOwnershipResponse {}
+
+message UpdateOrganizationSettingsRequest {
+  string organization_id = 1;
+  OrganizationSettings settings = 2;
+  // Paths of OrganizationSettings to change. Today only
+  // `max_dev_sessions_per_user`; an unset value in a masked path clears it.
+  google.protobuf.FieldMask update_mask = 3;
+}
+
+message UpdateOrganizationSettingsResponse {
+  Organization organization = 1;
+}

@@ -17,5 +17,5 @@
 - [Repository workflow](../docs/repository-workflow-contract.md)
 - `go/uuidv7/`: [repository workflow](../docs/repository-workflow-contract.md#public-go-packages)
 - `go/ownsand/`: [project index](../docs/project-ownsand.md) and [SDK foundation contract](../docs/packages-ownsand-sdk-foundation.md)
-- `go/tide/`: [project index](../docs/project-tide.md) and [SDK foundation contract](../docs/packages-tide-sdk-foundation.md)
+- `go/sandrun/`: [project index](../docs/project-sandrun.md) and [SDK foundation contract](../docs/packages-sandrun-sdk-foundation.md)
 - Register each new package tree in its project index and domain contract before implementation.

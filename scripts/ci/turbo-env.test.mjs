@@ -103,7 +103,7 @@ const expectedPassThroughEnv = {
     "TRUST_PROXY_CLIENT_ADDRESS",
   ],
   "delino-site#dev": ["PORTLESS", "PORTLESS_*"],
-  "tide-api#dev": [
+  "sandrun-api#dev": [
     "ADDR",
     "ALLOW_DIRECT_CLIENT_ADDRESS",
     "CORS_ORIGINS",
@@ -126,7 +126,7 @@ const expectedPassThroughEnv = {
     "OWNSAND_API_ORIGIN",
     "PUBLIC_ORIGIN",
     "RUN_MIGRATIONS",
-    "TIDE_SECRET_KEYS",
+    "SANDRUN_SECRET_KEYS",
     "TRUST_PROXY_CLIENT_ADDRESS",
   ],
   "ownsand-console#dev": [
@@ -138,14 +138,14 @@ const expectedPassThroughEnv = {
     "PUBLIC_LOGTO_SCOPES",
     "PUBLIC_OWNSAND_MOCK_API",
   ],
-  "tide-console#dev": [
+  "sandrun-console#dev": [
     "PORTLESS",
     "PORTLESS_*",
     "PUBLIC_API_ORIGIN",
     "PUBLIC_LOGTO_APP_ID",
     "PUBLIC_LOGTO_ENDPOINT",
     "PUBLIC_LOGTO_SCOPES",
-    "PUBLIC_TIDE_MOCK_API",
+    "PUBLIC_SANDRUN_MOCK_API",
   ],
 };
 

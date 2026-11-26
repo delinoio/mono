@@ -21,7 +21,7 @@ export const workspaceRoots = ["apps", "packages", "protos/delino", "servers"];
 export const workspacePackageDirs = [
   "cmds/ownsand",
   "cmds/ownsand-agent",
-  "cmds/tide",
+  "cmds/sandrun",
 ];
 
 // Reads the manifest of every workspace package under `repoRoot`.

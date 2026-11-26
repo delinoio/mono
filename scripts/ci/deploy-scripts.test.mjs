@@ -694,7 +694,7 @@ const changesetConfig = readFileSync(
 // A workspace with packages `a`, `b` and `delidev` (ignored by the
 // repository Changesets config), the repository Changesets config, a
 // pushed `main` and the repository `node_modules` for the Changesets CLI.
-function releaseFixture(t, { tide = false } = {}) {
+function releaseFixture(t, { sandrun = false } = {}) {
   const dir = scratch(t);
   const remote = join(dir, "remote.git");
   const work = join(dir, "work");
@@ -706,14 +706,14 @@ function releaseFixture(t, { tide = false } = {}) {
     join(work, "package.json"),
     JSON.stringify({ name: "fixture", private: true }),
   );
-  const packageRoot = tide ? "packages" : "pkgs";
+  const packageRoot = sandrun ? "packages" : "pkgs";
   const workspace = ["packages:", `  - ${packageRoot}/*`];
-  if (tide) {
-    workspace.push("  - cmds/tide");
-    mkdirSync(join(work, "cmds/tide"), { recursive: true });
+  if (sandrun) {
+    workspace.push("  - cmds/sandrun");
+    mkdirSync(join(work, "cmds/sandrun"), { recursive: true });
     writeFileSync(
-      join(work, "cmds/tide/package.json"),
-      readFileSync(join(root, "cmds/tide/package.json")),
+      join(work, "cmds/sandrun/package.json"),
+      readFileSync(join(root, "cmds/sandrun/package.json")),
     );
   }
   writeFileSync(join(work, "pnpm-workspace.yaml"), workspace.join("\n") + "\n");
@@ -1104,9 +1104,9 @@ const recoveryRunId = "555";
 // the planned revision again. `moved` moves `main` during the deployment, so
 // that the release pushes a cherry-picked copy of the tagged commit.
 function landedRelease(t, { moved = false, land = true, mixed = false } = {}) {
-  const fixture = releaseFixture(t, { tide: mixed });
+  const fixture = releaseFixture(t, { sandrun: mixed });
   const { dir, remote, work } = fixture;
-  const name = mixed ? "tide-cli" : "a";
+  const name = mixed ? "sandrun-cli" : "a";
   if (mixed) {
     addChangeset(work, "native", { delidev: "patch" });
     addChangeset(work, "empty", {});
@@ -1215,7 +1215,7 @@ test("recovery accepts a cherry-picked version commit", { skip }, (t) => {
 for (const moved of [false, true]) {
   const mode = moved ? "cherry-picked" : "direct";
   test(
-    `recovery accepts a ${mode} Tide release with an ignored changeset`,
+    `recovery accepts a ${mode} SandRun release with an ignored changeset`,
     { skip },
     (t) => {
       const state = landedRelease(t, { mixed: true, moved });
@@ -1228,7 +1228,7 @@ for (const moved of [false, true]) {
       assert.deepEqual(consumedBlobs, consumed);
       assert.equal(state.hasBinaries, "true");
       assert.deepEqual(state.releases, [
-        { name: "tide-cli", version: "0.0.1" },
+        { name: "sandrun-cli", version: "0.0.1" },
       ]);
       for (const id of Object.keys(consumed)) {
         assert.equal(

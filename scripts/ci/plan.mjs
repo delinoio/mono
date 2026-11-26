@@ -54,7 +54,7 @@ const e2eInputs = new Set([
 ]);
 
 // Workspace packages that the apps depend on through `workspace:*` (the shared
-// UI package, the tide TypeScript SDK and the generated TypeScript binding
+// UI package, the SandRun TypeScript SDK and the generated TypeScript binding
 // packages). The app e2e
 // suites render these sources in a browser, so a change inside one of them
 // changes the app behavior without touching an `apps/<app>/` path. Keep this
@@ -64,10 +64,10 @@ const e2eInputs = new Set([
 // `packages/ownsand-sdk/` is not an app dependency and stays out.
 export const e2eWorkspacePackages = [
   "packages/delino-ui/",
-  "packages/tide-sdk/",
+  "packages/sandrun-sdk/",
   "protos/delino/accounts/",
   "protos/delino/ownsand/",
-  "protos/delino/tide/",
+  "protos/delino/sandrun/",
 ];
 
 // Paths inside an app package or inside a workspace package that an app
@@ -182,13 +182,13 @@ const goWorkspaceInputs = new Set([
   "pnpm-workspace.yaml",
 ]);
 
-// The accounts-api, ownsand-api and tide-api schema migrations, embedded into
+// The accounts-api, ownsand-api and sandrun-api schema migrations, embedded into
 // each service and applied by the Postgres-backed tests (and the OwnSand
 // end-to-end suite) that the go-test job runs.
 const goMigrations = [
   "servers/accounts-api/internal/db/migrations/",
   "servers/ownsand-api/internal/db/migrations/",
-  "servers/tide-api/internal/db/migrations/",
+  "servers/sandrun-api/internal/db/migrations/",
 ];
 
 // The relay request digest vectors are read by the Go relaybinding tests and by

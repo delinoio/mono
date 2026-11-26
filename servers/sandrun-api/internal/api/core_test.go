@@ -1,0 +1,526 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package api_test
+
+import (
+	"context"
+	"encoding/base64"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
+
+	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/auth"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
+)
+
+func TestOrganizationLifecycleAndPagination(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	alice := env.User("alice")
+	var ids []string
+	for i := 0; i < 5; i++ {
+		resp, err := alice.Organization.CreateOrganization(ctx, connect.NewRequest(&sandrunv1.CreateOrganizationRequest{Name: "org"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		o := resp.Msg.GetOrganization()
+		if o.GetCallerRole() != sandrunv1.Role_ROLE_OWNER || o.GetSettings() == nil || o.GetSettings().MaxDevSessionsPerUser != nil {
+			t.Fatalf("created %+v", o)
+		}
+		ids = append(ids, o.GetOrganizationId())
+	}
+	var listed []string
+	token := ""
+	for {
+		resp, err := alice.Organization.ListOrganizations(ctx, connect.NewRequest(&sandrunv1.ListOrganizationsRequest{PageSize: 2, PageToken: token}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range resp.Msg.GetOrganizations() {
+			listed = append(listed, o.GetOrganizationId())
+		}
+		if token = resp.Msg.GetNextPageToken(); token == "" {
+			break
+		}
+	}
+	if strings.Join(listed, ",") != strings.Join(ids, ",") {
+		t.Fatalf("listed %v, want %v", listed, ids)
+	}
+	_, err := alice.Organization.ListOrganizations(ctx, connect.NewRequest(&sandrunv1.ListOrganizationsRequest{PageToken: "bogus"}))
+	wantCode(t, "bogus page token", err, connect.CodeInvalidArgument)
+	for _, name := range []string{"", " ", strings.Repeat("x", 101), "a\nb"} {
+		_, err := alice.Organization.CreateOrganization(ctx, connect.NewRequest(&sandrunv1.CreateOrganizationRequest{Name: name}))
+		wantCode(t, "name "+name, err, connect.CodeInvalidArgument)
+	}
+	if _, err := alice.Organization.CreateOrganization(ctx, connect.NewRequest(&sandrunv1.CreateOrganizationRequest{Name: strings.Repeat("가", 100)})); err != nil {
+		t.Fatalf("100 characters: %v", err)
+	}
+	// Another user sees none of them; a get of one is not_found.
+	bob := env.User("bob")
+	resp, err := bob.Organization.ListOrganizations(ctx, connect.NewRequest(&sandrunv1.ListOrganizationsRequest{}))
+	if err != nil || len(resp.Msg.GetOrganizations()) != 0 {
+		t.Fatalf("bob sees %v, %v", resp, err)
+	}
+	_, err = bob.Organization.GetOrganization(ctx, connect.NewRequest(&sandrunv1.GetOrganizationRequest{OrganizationId: ids[0]}))
+	wantCode(t, "outsider get", err, connect.CodeNotFound)
+	// Without a credential or with a bad token: unauthenticated.
+	_, err = env.Bearer("").Organization.ListOrganizations(ctx, connect.NewRequest(&sandrunv1.ListOrganizationsRequest{}))
+	wantCode(t, "no credential", err, connect.CodeUnauthenticated)
+	_, err = env.Bearer("garbage").Organization.ListOrganizations(ctx, connect.NewRequest(&sandrunv1.ListOrganizationsRequest{}))
+	wantCode(t, "bad token", err, connect.CodeUnauthenticated)
+	if got := countAction(auditActions(t, env, ids[0]), sandrunv1.AuditAction_AUDIT_ACTION_ORGANIZATION_CREATED); got != 1 {
+		t.Fatalf("ORGANIZATION_CREATED events = %d", got)
+	}
+}
+
+func TestUpdateOrganizationSettings(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	mask := &fieldmaskpb.FieldMask{Paths: []string{"max_dev_sessions_per_user"}}
+	update := func(user string, settings *sandrunv1.OrganizationSettings, m *fieldmaskpb.FieldMask) (*sandrunv1.Organization, error) {
+		resp, err := env.User(user).Organization.UpdateOrganizationSettings(ctx, connect.NewRequest(&sandrunv1.UpdateOrganizationSettingsRequest{
+			OrganizationId: org.ID, Settings: settings, UpdateMask: m}))
+		if err != nil {
+			return nil, err
+		}
+		return resp.Msg.GetOrganization(), nil
+	}
+	o, err := update(org.Admin, &sandrunv1.OrganizationSettings{MaxDevSessionsPerUser: proto.Int32(3)}, mask)
+	if err != nil || o.GetSettings().GetMaxDevSessionsPerUser() != 3 || o.GetCallerRole() != sandrunv1.Role_ROLE_ADMIN {
+		t.Fatalf("admin update: %v %v", o, err)
+	}
+	got, err := env.User(org.Member).Organization.GetOrganization(ctx, connect.NewRequest(&sandrunv1.GetOrganizationRequest{OrganizationId: org.ID}))
+	if err != nil || got.Msg.GetOrganization().GetSettings().GetMaxDevSessionsPerUser() != 3 {
+		t.Fatalf("member reads settings: %v %v", got, err)
+	}
+	_, err = update(org.Member, &sandrunv1.OrganizationSettings{MaxDevSessionsPerUser: proto.Int32(1)}, mask)
+	wantCode(t, "member update", err, connect.CodePermissionDenied)
+	for name, tc := range map[string]struct {
+		s *sandrunv1.OrganizationSettings
+		m *fieldmaskpb.FieldMask
+	}{
+		"zero":         {&sandrunv1.OrganizationSettings{MaxDevSessionsPerUser: proto.Int32(0)}, mask},
+		"negative":     {&sandrunv1.OrganizationSettings{MaxDevSessionsPerUser: proto.Int32(-1)}, mask},
+		"empty mask":   {&sandrunv1.OrganizationSettings{MaxDevSessionsPerUser: proto.Int32(1)}, nil},
+		"unknown path": {&sandrunv1.OrganizationSettings{}, &fieldmaskpb.FieldMask{Paths: []string{"name"}}},
+	} {
+		_, err := update(org.Owner, tc.s, tc.m)
+		wantCode(t, name, err, connect.CodeInvalidArgument)
+	}
+	// A masked path without a value clears the limit; a repeated clear
+	// records no second event.
+	for i := 0; i < 2; i++ {
+		o, err = update(org.Owner, &sandrunv1.OrganizationSettings{}, mask)
+		if err != nil || o.GetSettings().MaxDevSessionsPerUser != nil {
+			t.Fatalf("clear: %v %v", o, err)
+		}
+	}
+	// An omitted settings message also clears the limit.
+	if _, err := update(org.Owner, &sandrunv1.OrganizationSettings{MaxDevSessionsPerUser: proto.Int32(2)}, mask); err != nil {
+		t.Fatal(err)
+	}
+	o, err = update(org.Owner, nil, mask)
+	if err != nil || o.GetSettings().MaxDevSessionsPerUser != nil {
+		t.Fatalf("clear without settings: %v %v", o, err)
+	}
+	if n := countAction(auditActions(t, env, org.ID), sandrunv1.AuditAction_AUDIT_ACTION_ORGANIZATION_SETTINGS_CHANGED); n != 4 {
+		t.Fatalf("settings events = %d, want 4", n)
+	}
+}
+
+func TestInvitationsAndMembers(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	owner := env.User(org.Owner)
+	inv, err := owner.Member.CreateInvitation(ctx, connect.NewRequest(&sandrunv1.CreateInvitationRequest{OrganizationId: org.ID, Role: sandrunv1.Role_ROLE_MEMBER}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := inv.Msg.GetInvitationSecret()
+	i := inv.Msg.GetInvitation()
+	if !strings.HasPrefix(secret, "sri_") || len(secret) != 4+43 || i.GetSecretPrefix() != secret[:8] || strings.Contains(i.String(), secret) {
+		t.Fatalf("invitation %v / secret of %d bytes", i, len(secret))
+	}
+	if i.GetExpireTime().AsTime().Sub(i.GetCreateTime().AsTime()) != 7*24*time.Hour || i.GetState() != sandrunv1.InvitationState_INVITATION_STATE_PENDING ||
+		i.GetCreatedByUserId() != org.Owner {
+		t.Fatalf("invitation %v", i)
+	}
+	// The database holds only the hash.
+	var stored int
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM invitations WHERE secret_prefix = $1 AND position($2::bytea in secret_sha256) = 0", i.GetSecretPrefix(), []byte(secret)).Scan(&stored); err != nil || stored != 1 {
+		t.Fatalf("stored %d, %v", stored, err)
+	}
+	_, err = owner.Member.CreateInvitation(ctx, connect.NewRequest(&sandrunv1.CreateInvitationRequest{OrganizationId: org.ID, Role: sandrunv1.Role_ROLE_OWNER}))
+	wantCode(t, "owner invitation", err, connect.CodeInvalidArgument)
+	list, err := owner.Member.ListInvitations(ctx, connect.NewRequest(&sandrunv1.ListInvitationsRequest{OrganizationId: org.ID}))
+	if err != nil || len(list.Msg.GetInvitations()) != 1 {
+		t.Fatalf("pending invitations: %v %v", list, err)
+	}
+
+	carol := env.User("carol")
+	_, err = carol.Member.AcceptInvitation(ctx, connect.NewRequest(&sandrunv1.AcceptInvitationRequest{InvitationSecret: "sri_bad"}))
+	wantCode(t, "malformed secret", err, connect.CodeNotFound)
+	missing, err := auth.NewSecret(auth.SecretInvitation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = carol.Member.AcceptInvitation(ctx, connect.NewRequest(&sandrunv1.AcceptInvitationRequest{InvitationSecret: missing.Value}))
+	wantCode(t, "missing invitation", err, connect.CodeNotFound)
+	acc, err := carol.Member.AcceptInvitation(ctx, connect.NewRequest(&sandrunv1.AcceptInvitationRequest{InvitationSecret: secret}))
+	if err != nil || acc.Msg.GetMember().GetRole() != sandrunv1.Role_ROLE_MEMBER || acc.Msg.GetOrganization().GetOrganizationId() != org.ID {
+		t.Fatalf("accept: %v %v", acc, err)
+	}
+	_, err = env.User("dave").Member.AcceptInvitation(ctx, connect.NewRequest(&sandrunv1.AcceptInvitationRequest{InvitationSecret: secret}))
+	wantCode(t, "used invitation", err, connect.CodeNotFound)
+	// A second invitation for an existing member.
+	inv2, _ := owner.Member.CreateInvitation(ctx, connect.NewRequest(&sandrunv1.CreateInvitationRequest{OrganizationId: org.ID, Role: sandrunv1.Role_ROLE_ADMIN}))
+	_, err = carol.Member.AcceptInvitation(ctx, connect.NewRequest(&sandrunv1.AcceptInvitationRequest{InvitationSecret: inv2.Msg.GetInvitationSecret()}))
+	wantCode(t, "existing member", err, connect.CodeAlreadyExists)
+	// Revocation and expiry.
+	rev, err := owner.Member.RevokeInvitation(ctx, connect.NewRequest(&sandrunv1.RevokeInvitationRequest{OrganizationId: org.ID, InvitationId: inv2.Msg.GetInvitation().GetInvitationId()}))
+	if err != nil || rev.Msg.GetInvitation().GetState() != sandrunv1.InvitationState_INVITATION_STATE_REVOKED {
+		t.Fatalf("revoke: %v %v", rev, err)
+	}
+	_, err = owner.Member.RevokeInvitation(ctx, connect.NewRequest(&sandrunv1.RevokeInvitationRequest{OrganizationId: org.ID, InvitationId: inv2.Msg.GetInvitation().GetInvitationId()}))
+	wantCode(t, "revoke twice", err, connect.CodeFailedPrecondition)
+	_, err = env.User("dave").Member.AcceptInvitation(ctx, connect.NewRequest(&sandrunv1.AcceptInvitationRequest{InvitationSecret: inv2.Msg.GetInvitationSecret()}))
+	wantCode(t, "revoked invitation", err, connect.CodeNotFound)
+	inv3, _ := owner.Member.CreateInvitation(ctx, connect.NewRequest(&sandrunv1.CreateInvitationRequest{OrganizationId: org.ID, Role: sandrunv1.Role_ROLE_MEMBER}))
+	env.Clock.Advance(7 * 24 * time.Hour)
+	_, err = env.User("erin").Member.AcceptInvitation(ctx, connect.NewRequest(&sandrunv1.AcceptInvitationRequest{InvitationSecret: inv3.Msg.GetInvitationSecret()}))
+	wantCode(t, "expired invitation", err, connect.CodeNotFound)
+
+	// Members, roles and display names (none are wired).
+	members, err := env.User(org.Member).Member.ListMembers(ctx, connect.NewRequest(&sandrunv1.ListMembersRequest{OrganizationId: org.ID}))
+	if err != nil || len(members.Msg.GetMembers()) != 4 {
+		t.Fatalf("members: %v %v", members, err)
+	}
+	up, err := env.User(org.Admin).Member.UpdateMemberRole(ctx, connect.NewRequest(&sandrunv1.UpdateMemberRoleRequest{OrganizationId: org.ID, UserId: "carol", Role: sandrunv1.Role_ROLE_ADMIN}))
+	if err != nil || up.Msg.GetMember().GetRole() != sandrunv1.Role_ROLE_ADMIN {
+		t.Fatalf("update role: %v %v", up, err)
+	}
+	_, err = env.User(org.Admin).Member.UpdateMemberRole(ctx, connect.NewRequest(&sandrunv1.UpdateMemberRoleRequest{OrganizationId: org.ID, UserId: org.Owner, Role: sandrunv1.Role_ROLE_MEMBER}))
+	wantCode(t, "owner role change", err, connect.CodePermissionDenied)
+	_, err = env.User(org.Admin).Member.UpdateMemberRole(ctx, connect.NewRequest(&sandrunv1.UpdateMemberRoleRequest{OrganizationId: org.ID, UserId: "carol", Role: sandrunv1.Role_ROLE_OWNER}))
+	wantCode(t, "role owner", err, connect.CodeInvalidArgument)
+
+	// Ownership transfer: the old owner becomes admin.
+	_, err = env.User(org.Admin).Organization.TransferOwnership(ctx, connect.NewRequest(&sandrunv1.TransferOwnershipRequest{OrganizationId: org.ID, UserId: "carol"}))
+	wantCode(t, "admin transfer", err, connect.CodePermissionDenied)
+	_, err = owner.Organization.TransferOwnership(ctx, connect.NewRequest(&sandrunv1.TransferOwnershipRequest{OrganizationId: org.ID, UserId: "nobody"}))
+	wantCode(t, "transfer to a non-member", err, connect.CodeNotFound)
+	_, err = owner.Member.RemoveMember(ctx, connect.NewRequest(&sandrunv1.RemoveMemberRequest{OrganizationId: org.ID, UserId: org.Owner}))
+	wantCode(t, "owner leaves", err, connect.CodeFailedPrecondition)
+	if _, err := owner.Organization.TransferOwnership(ctx, connect.NewRequest(&sandrunv1.TransferOwnershipRequest{OrganizationId: org.ID, UserId: "carol"})); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := owner.Organization.GetOrganization(ctx, connect.NewRequest(&sandrunv1.GetOrganizationRequest{OrganizationId: org.ID}))
+	if got.Msg.GetOrganization().GetCallerRole() != sandrunv1.Role_ROLE_ADMIN {
+		t.Fatalf("old owner role %v", got.Msg.GetOrganization().GetCallerRole())
+	}
+	// The old owner can leave now; the member cannot remove others.
+	_, err = env.User(org.Member).Member.RemoveMember(ctx, connect.NewRequest(&sandrunv1.RemoveMemberRequest{OrganizationId: org.ID, UserId: org.Admin}))
+	wantCode(t, "member removes admin", err, connect.CodePermissionDenied)
+	_, err = env.User(org.Admin).Member.RemoveMember(ctx, connect.NewRequest(&sandrunv1.RemoveMemberRequest{OrganizationId: org.ID, UserId: "carol"}))
+	wantCode(t, "remove the new owner", err, connect.CodePermissionDenied)
+	if _, err := owner.Member.RemoveMember(ctx, connect.NewRequest(&sandrunv1.RemoveMemberRequest{OrganizationId: org.ID, UserId: org.Owner})); err != nil {
+		t.Fatalf("old owner leaves: %v", err)
+	}
+	_, err = owner.Organization.GetOrganization(ctx, connect.NewRequest(&sandrunv1.GetOrganizationRequest{OrganizationId: org.ID}))
+	wantCode(t, "after leaving", err, connect.CodeNotFound)
+
+	actions := auditActions(t, env, org.ID)
+	for a, want := range map[sandrunv1.AuditAction]int{
+		sandrunv1.AuditAction_AUDIT_ACTION_INVITATION_CREATED:    5,
+		sandrunv1.AuditAction_AUDIT_ACTION_INVITATION_REVOKED:    1,
+		sandrunv1.AuditAction_AUDIT_ACTION_MEMBER_JOINED:         3,
+		sandrunv1.AuditAction_AUDIT_ACTION_MEMBER_ROLE_CHANGED:   1,
+		sandrunv1.AuditAction_AUDIT_ACTION_OWNERSHIP_TRANSFERRED: 1,
+		sandrunv1.AuditAction_AUDIT_ACTION_MEMBER_REMOVED:        1,
+	} {
+		if got := countAction(actions, a); got != want {
+			t.Errorf("%v events = %d, want %d", a, got, want)
+		}
+	}
+}
+
+func TestListInvitationsUsesOneCutoff(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	ctx := auth.WithPrincipal(context.Background(), auth.Principal{Kind: auth.PrincipalUser, UserID: org.Owner})
+	created, err := env.User(org.Owner).Member.CreateInvitation(ctx, connect.NewRequest(&sandrunv1.CreateInvitationRequest{
+		OrganizationId: org.ID, Role: sandrunv1.Role_ROLE_MEMBER,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv := created.Msg.GetInvitation()
+	expiry := inv.GetExpireTime().AsTime()
+	calls := 0
+	handler := api.MemberHandler{Service: &api.Service{
+		DB:     env.DB,
+		Logger: env.App.Service.Logger,
+		Now: func() time.Time {
+			calls++
+			if calls == 1 {
+				return expiry.Add(-time.Second)
+			}
+			return expiry
+		},
+	}}
+
+	resp, err := handler.ListInvitations(ctx, connect.NewRequest(&sandrunv1.ListInvitationsRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := resp.Msg.GetInvitations()
+	if len(got) != 1 || got[0].GetInvitationId() != inv.GetInvitationId() || got[0].GetState() != sandrunv1.InvitationState_INVITATION_STATE_PENDING {
+		t.Fatalf("before expiry, got %v, want %s pending", got, inv.GetInvitationId())
+	}
+	if calls != 1 {
+		t.Fatalf("clock calls for the first page = %d, want 1", calls)
+	}
+	resp, err = handler.ListInvitations(ctx, connect.NewRequest(&sandrunv1.ListInvitationsRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Msg.GetInvitations(); len(got) != 0 {
+		t.Fatalf("at expiry, got %v, want no invitations", got)
+	}
+}
+
+func TestListInvitationsPaginatesOnlyPendingInvitations(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	member := env.User(org.Owner).Member
+	var secrets []string
+	create := func() *sandrunv1.CreateInvitationResponse {
+		t.Helper()
+		resp, err := member.CreateInvitation(ctx, connect.NewRequest(&sandrunv1.CreateInvitationRequest{
+			OrganizationId: org.ID, Role: sandrunv1.Role_ROLE_MEMBER,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		secrets = append(secrets, resp.Msg.GetInvitationSecret())
+		return resp.Msg
+	}
+	create()
+	env.Clock.Advance(api.InvitationLifetime + time.Second)
+	first := create()
+	accepted := create()
+	if _, err := env.User("carol").Member.AcceptInvitation(ctx, connect.NewRequest(&sandrunv1.AcceptInvitationRequest{
+		InvitationSecret: accepted.GetInvitationSecret(),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	revoked := create()
+	if _, err := member.RevokeInvitation(ctx, connect.NewRequest(&sandrunv1.RevokeInvitationRequest{
+		OrganizationId: org.ID, InvitationId: revoked.GetInvitation().GetInvitationId(),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	second := create()
+	ids := []string{first.GetInvitation().GetInvitationId(), second.GetInvitation().GetInvitationId()}
+	slices.Sort(ids)
+
+	token := ""
+	for _, id := range ids {
+		resp, err := member.ListInvitations(ctx, connect.NewRequest(&sandrunv1.ListInvitationsRequest{
+			OrganizationId: org.ID, PageSize: 1, PageToken: token,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := resp.Msg.GetInvitations()
+		if len(got) != 1 || got[0].GetInvitationId() != id || got[0].GetState() != sandrunv1.InvitationState_INVITATION_STATE_PENDING {
+			t.Fatalf("page after %q, got %v, want %s pending", token, got, id)
+		}
+		for _, secret := range secrets {
+			if strings.Contains(resp.Msg.String(), secret) {
+				t.Fatal("list response contains an invitation secret")
+			}
+		}
+		token = resp.Msg.GetNextPageToken()
+		if want := base64.RawURLEncoding.EncodeToString([]byte("v1:" + id)); token != want {
+			t.Fatalf("page token = %q, want %q", token, want)
+		}
+	}
+	resp, err := member.ListInvitations(ctx, connect.NewRequest(&sandrunv1.ListInvitationsRequest{
+		OrganizationId: org.ID, PageSize: 1, PageToken: token,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Msg.GetInvitations()) != 0 || resp.Msg.GetNextPageToken() != "" {
+		t.Fatalf("last page returned %d invitations and token %q", len(resp.Msg.GetInvitations()), resp.Msg.GetNextPageToken())
+	}
+}
+
+func TestAuditEventsNewestFirst(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	keyID, _ := env.NewAPIKey(org.ID, org.Member)
+	var events []*sandrunv1.AuditEvent
+	token := ""
+	for {
+		resp, err := env.User(org.Member).Audit.ListAuditEvents(ctx, connect.NewRequest(&sandrunv1.ListAuditEventsRequest{OrganizationId: org.ID, PageSize: 2, PageToken: token}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, resp.Msg.GetEvents()...)
+		if token = resp.Msg.GetNextPageToken(); token == "" {
+			break
+		}
+	}
+	// Created, 2 invitations, 2 joins, 1 key.
+	if len(events) != 6 {
+		t.Fatalf("%d events", len(events))
+	}
+	first := events[0]
+	if first.GetAction() != sandrunv1.AuditAction_AUDIT_ACTION_API_KEY_CREATED || first.GetTargetId() != keyID || first.GetActorUserId() != org.Member ||
+		first.GetSubjectUserId() != org.Member || first.GetTargetKind() != sandrunv1.AuditTargetKind_AUDIT_TARGET_KIND_API_KEY {
+		t.Fatalf("newest event %v", first)
+	}
+	if last := events[len(events)-1]; last.GetAction() != sandrunv1.AuditAction_AUDIT_ACTION_ORGANIZATION_CREATED {
+		t.Fatalf("oldest event %v", last)
+	}
+	for i := 1; i < len(events); i++ {
+		previous, current := events[i-1], events[i]
+		byTime := previous.GetCreateTime().AsTime().Compare(current.GetCreateTime().AsTime())
+		if byTime < 0 || byTime == 0 && previous.GetAuditEventId() <= current.GetAuditEventId() {
+			t.Fatal("events are not newest first")
+		}
+	}
+	_, err := env.User("outsider").Audit.ListAuditEvents(ctx, connect.NewRequest(&sandrunv1.ListAuditEventsRequest{OrganizationId: org.ID}))
+	wantCode(t, "outsider", err, connect.CodeNotFound)
+	_, err = env.User(org.Member).Audit.ListAuditEvents(ctx, connect.NewRequest(&sandrunv1.ListAuditEventsRequest{OrganizationId: "not-a-uuid"}))
+	wantCode(t, "bad organization id", err, connect.CodeInvalidArgument)
+}
+
+func TestAuditEventPaginationByCreationTime(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	foreignOrg := env.NewOrg("bob")
+
+	// The UUIDs share a millisecond prefix, but the newest two events have
+	// smaller UUIDs than the oldest event.
+	const (
+		a = "01900000-0000-77ff-8000-000000000001"
+		b = "01900000-0000-7000-8000-000000000002"
+		c = "01900000-0000-7001-8000-000000000003"
+	)
+	if _, err := env.DB.Pool.Exec(ctx, "DELETE FROM audit_events WHERE organization_id = $1", org.ID); err != nil {
+		t.Fatal(err)
+	}
+	early := env.Clock.Now().Add(100 * time.Microsecond)
+	late := env.Clock.Now().Add(900 * time.Microsecond)
+	_, err := env.DB.Pool.Exec(ctx, `INSERT INTO audit_events (audit_event_id, organization_id, action, actor_user_id, target_kind, target_id, subject_user_id, rpc_id, create_time)
+		VALUES ($1, $4, $5, $6, $7, $4::uuid::text, '', '', $8),
+		       ($2, $4, $5, $6, $7, $4::uuid::text, '', '', $9),
+		       ($3, $4, $5, $6, $7, $4::uuid::text, '', '', $9)`,
+		a, b, c, org.ID, int16(sandrunv1.AuditAction_AUDIT_ACTION_ORGANIZATION_CREATED), org.Owner,
+		int16(sandrunv1.AuditTargetKind_AUDIT_TARGET_KIND_ORGANIZATION), early, late)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list := func(user, token string, size int32) (*sandrunv1.ListAuditEventsResponse, error) {
+		resp, err := env.User(user).Audit.ListAuditEvents(ctx, connect.NewRequest(&sandrunv1.ListAuditEventsRequest{
+			OrganizationId: org.ID, PageSize: size, PageToken: token,
+		}))
+		if err != nil {
+			return nil, err
+		}
+		return resp.Msg, nil
+	}
+	checkPage := func(token string, size int32, want []string) string {
+		t.Helper()
+		page, err := list(org.Member, token, size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, event := range page.GetEvents() {
+			ids = append(ids, event.GetAuditEventId())
+		}
+		if !slices.Equal(ids, want) {
+			t.Fatalf("page IDs = %v, want %v", ids, want)
+		}
+		return page.GetNextPageToken()
+	}
+	legacyToken := func(id string) string {
+		return base64.RawURLEncoding.EncodeToString([]byte("v1:" + id))
+	}
+	if token := checkPage("", 10, []string{c, b, a}); token != "" {
+		t.Fatalf("full listing returned token %q", token)
+	}
+	token := ""
+	for _, id := range []string{c, b, a} {
+		token = checkPage(token, 1, []string{id})
+		if token != legacyToken(id) {
+			t.Fatalf("token for %s = %q, want existing token format", id, token)
+		}
+	}
+	if token := checkPage(token, 1, nil); token != "" {
+		t.Fatalf("empty page returned token %q", token)
+	}
+	checkPage(legacyToken(b), 1, []string{a})
+
+	var foreignID string
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT audit_event_id::text FROM audit_events WHERE organization_id = $1 LIMIT 1", foreignOrg.ID).Scan(&foreignID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = list(org.Member, legacyToken(foreignID), 1)
+	wantCode(t, "foreign anchor", err, connect.CodeInvalidArgument)
+	if _, err := env.DB.Pool.Exec(ctx, "DELETE FROM audit_events WHERE audit_event_id = $1", b); err != nil {
+		t.Fatal(err)
+	}
+	_, err = list(org.Member, legacyToken(b), 1)
+	wantCode(t, "deleted anchor", err, connect.CodeInvalidArgument)
+	_, err = list("outsider", legacyToken(b), 1)
+	wantCode(t, "outsider with deleted anchor", err, connect.CodeNotFound)
+	checkPage("", 0, []string{c, a})
+}
+
+// TestRequestSizeLimit checks that an oversized message is rejected.
+func TestRequestSizeLimit(t *testing.T) {
+	env := testenv.New(t)
+	_, err := env.User("alice").Organization.CreateOrganization(context.Background(), connect.NewRequest(&sandrunv1.CreateOrganizationRequest{Name: strings.Repeat("x", api.MaxRequestBytes+1)}))
+	wantCode(t, "oversized", err, connect.CodeResourceExhausted)
+}
+
+// An admin's change of its own role that overlaps its demotion must not
+// restore the admin role.
+func TestSelfRoleUpdateAfterConcurrentDemotion(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	// The held update stands in for the owner's demotion that commits while
+	// the admin's request runs.
+	commit := holdTx(t, env, "UPDATE memberships SET role = $3 WHERE organization_id = $1 AND user_id = $2", org.ID, org.Admin, int16(sandrunv1.Role_ROLE_MEMBER))
+	errc := make(chan error, 1)
+	go func() {
+		_, err := env.User(org.Admin).Member.UpdateMemberRole(ctx, connect.NewRequest(&sandrunv1.UpdateMemberRoleRequest{OrganizationId: org.ID, UserId: org.Admin, Role: sandrunv1.Role_ROLE_ADMIN}))
+		errc <- err
+	}()
+	waitForLockWaiter(t, env)
+	commit()
+	wantCode(t, "self update after demotion", <-errc, connect.CodePermissionDenied)
+	var role int16
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2", org.ID, org.Admin).Scan(&role); err != nil || sandrunv1.Role(role) != sandrunv1.Role_ROLE_MEMBER {
+		t.Fatalf("role = %v, %v; want ROLE_MEMBER", sandrunv1.Role(role), err)
+	}
+}

@@ -340,7 +340,7 @@ func TestCreateSandboxRequest(t *testing.T) {
 			Resources: &ownsandv1.Resources{VcpuCount: 2, MemoryMib: 2048, DiskGib: 10},
 			IdleTtl:   durationpb.New(10 * time.Minute), MaxTtl: durationpb.New(time.Hour),
 			Placement: &ownsandv1.Placement{HostOs: &host},
-			Labels:    map[string]string{"tide.runner-id": "x"},
+			Labels:    map[string]string{"sandrun.runner-id": "x"},
 		}
 	}
 	if err := CreateSandboxRequest(valid()); err != nil {

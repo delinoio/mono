@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.sandrun.v1;
+
+import "delino/sandrun/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/sandrun/v1;sandrunv1";
+
+// OwnSandLinkService manages the link of a SandRun organization to one OwnSand
+// organization.
+service OwnSandLinkService {
+  // Link an OwnSand organization with an organization API key, or replace
+  // the key of the existing link.
+  rpc SetOwnSandLink(SetOwnSandLinkRequest) returns (SetOwnSandLinkResponse);
+  // Read the link and its state, without the key.
+  rpc GetOwnSandLink(GetOwnSandLinkRequest) returns (GetOwnSandLinkResponse);
+  // Remove the link after SandRun deletes its runners.
+  rpc RemoveOwnSandLink(RemoveOwnSandLinkRequest) returns (RemoveOwnSandLinkResponse);
+}
+
+// The OwnSand link. It never carries the API key.
+message OwnSandLink {
+  string organization_id = 1;
+  string ownsand_organization_id = 2;
+  OwnSandLinkState state = 3;
+  bool credential_set = 4;
+  google.protobuf.Timestamp credential_set_at = 5;
+  google.protobuf.Timestamp create_time = 6;
+}
+
+message SetOwnSandLinkRequest {
+  string organization_id = 1;
+  string ownsand_organization_id = 2;
+  // OwnSand organization API key (`osk_...`). Secret: never log.
+  string ownsand_api_key = 3;
+}
+
+message SetOwnSandLinkResponse {
+  OwnSandLink link = 1;
+}
+
+message GetOwnSandLinkRequest {
+  string organization_id = 1;
+}
+
+message GetOwnSandLinkResponse {
+  // Absent when the organization has no link.
+  OwnSandLink link = 1;
+}
+
+message RemoveOwnSandLinkRequest {
+  string organization_id = 1;
+}
+
+message RemoveOwnSandLinkResponse {}

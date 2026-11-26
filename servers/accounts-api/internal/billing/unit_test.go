@@ -219,7 +219,7 @@ func TestServiceAndMeterKeys(t *testing.T) {
 			t.Errorf("ServiceKey(%d) is ok", bad)
 		}
 	}
-	for _, bad := range []string{"", "OWNSAND", "unspecified", "tide", "ownſand", "ownsand\u00a0", "ownsand "} {
+	for _, bad := range []string{"", "OWNSAND", "unspecified", "sandrun", "ownſand", "ownsand\u00a0", "ownsand "} {
 		if _, ok := ServiceFromKey(bad); ok {
 			t.Errorf("ServiceFromKey(%q) is ok", bad)
 		}

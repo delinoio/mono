@@ -4,15 +4,15 @@ Delino is the monorepo for Delino services. It contains web apps, a desktop and 
 
 ## Repository contents
 
-| Path             | Contents                                                                                                                                                                                                                                                 |
-| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apps/`          | The `delino-site`, `delino-docs`, `delino-accounts` and `ownsand` web apps, the tide web console in `apps/tide` (package `tide-console`) and the `delidev` desktop and mobile app                                                                        |
-| `servers/`       | The `accounts-api`, `ownsand-api` and `tide-api` Go servers                                                                                                                                                                                              |
-| `packages/`      | The shared React UI component package `delino-ui` and the TypeScript SDKs `ownsand-sdk` and `tide-sdk`                                                                                                                                                   |
-| `go/`            | The public Go package tree, including the Go SDKs `ownsand-sdk-go` in `go/ownsand` and `tide-sdk-go` in `go/tide`                                                                                                                                        |
-| `cmds/`          | The Go command tools `cmds/ownsand`, `cmds/ownsand-agent`, `cmds/ownsand-guest` and `cmds/tide`                                                                                                                                                          |
-| `protos/delino/` | Connect RPC schemas in `protos/delino/ownsand/v1`, `protos/delino/accounts/v1` and `protos/delino/tide/v1`, with committed Go bindings and the TypeScript binding packages `@delino/ownsand-protos`, `@delino/accounts-protos` and `@delino/tide-protos` |
-| `crates/`        | Reserved. It holds only its scoped `AGENTS.md` instructions today.                                                                                                                                                                                       |
+| Path             | Contents                                                                                                                                                                                                                                                       |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/`          | The `delino-site`, `delino-docs`, `delino-accounts` and `ownsand` web apps, the SandRun web console in `apps/sandrun` (package `sandrun-console`) and the `delidev` desktop and mobile app                                                                     |
+| `servers/`       | The `accounts-api`, `ownsand-api` and `sandrun-api` Go servers                                                                                                                                                                                                 |
+| `packages/`      | The shared React UI component package `delino-ui` and the TypeScript SDKs `ownsand-sdk` and `sandrun-sdk`                                                                                                                                                      |
+| `go/`            | The public Go package tree, including the Go SDKs `ownsand-sdk-go` in `go/ownsand` and `sandrun-sdk-go` in `go/sandrun`                                                                                                                                        |
+| `cmds/`          | The Go command tools `cmds/ownsand`, `cmds/ownsand-agent`, `cmds/ownsand-guest` and `cmds/sandrun`                                                                                                                                                             |
+| `protos/delino/` | Connect RPC schemas in `protos/delino/ownsand/v1`, `protos/delino/accounts/v1` and `protos/delino/sandrun/v1`, with committed Go bindings and the TypeScript binding packages `@delino/ownsand-protos`, `@delino/accounts-protos` and `@delino/sandrun-protos` |
+| `crates/`        | Reserved. It holds only its scoped `AGENTS.md` instructions today.                                                                                                                                                                                             |
 
 The repository also contains shared instructions, skills, documentation and formatting tooling.
 
@@ -48,7 +48,7 @@ Imported skills keep their original licenses and notices. See [NOTICE](NOTICE).
 - pnpm 10.26.2
 - The Go toolchain that the root `go.mod` selects (Go 1.26.1 or later)
 
-The root `pnpm build`, `pnpm dev`, `pnpm lint` and `pnpm test` tasks also run the Go server scripts in `servers/accounts-api`, `servers/ownsand-api` and `servers/tide-api`. The scripts of these servers call `go`.
+The root `pnpm build`, `pnpm dev`, `pnpm lint` and `pnpm test` tasks also run the Go server scripts in `servers/accounts-api`, `servers/ownsand-api` and `servers/sandrun-api`. The scripts of these servers call `go`.
 
 ### Install and check
 

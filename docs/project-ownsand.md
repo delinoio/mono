@@ -86,7 +86,7 @@ The project has one hosted server deployable (the control plane on the shared Di
 
 Status: recorded decisions. Metering, usage reporting, the status sync, enforcement, the suspension, linking and the `BillingService` RPCs run in `ownsand-api`; the console, the CLI and both SDKs implement the billing surfaces and the terminal billing errors. The [control plane contract](servers-ownsand-api-foundation.md#billing) owns metering, reporting and enforcement, and the [protos contract](protos-ownsand-api-contract.md#billing) owns the RPC classification, the billing RPCs and the billing error reasons.
 
-- Model: OwnSand organizations pay from prepaid USD credits that [`delino-accounts`](project-delino-accounts.md) keeps in shared billing accounts, according to the [billing contract](repository-billing-contract.md). Paddle is the payment provider and merchant of record. Each organization links to at most one billing account, and the billing account needs an active $10/month subscription for any billable use. OwnSand never calls Paddle and keeps no balance. The [tide project](project-tide.md), which uses the public API, pays as a normal OwnSand customer; billing changes nothing in tide.
+- Model: OwnSand organizations pay from prepaid USD credits that [`delino-accounts`](project-delino-accounts.md) keeps in shared billing accounts, according to the [billing contract](repository-billing-contract.md). Paddle is the payment provider and merchant of record. Each organization links to at most one billing account, and the billing account needs an active $10/month subscription for any billable use. OwnSand never calls Paddle and keeps no balance. The [SandRun project](project-sandrun.md), which uses the public API, pays as a normal OwnSand customer; billing changes nothing in SandRun.
 - OwnSand charges for four meters only. It does not charge per device, per member or for sandbox runtime, and it has no free tier, starting credit or trial.
 
 | Meter (stable ID)                          | Unit price            | Measurement                                                                                                                                                                                                             |
@@ -167,7 +167,7 @@ The cross-component suite in `servers/ownsand-api/e2e/` (package `e2e`, licensed
 
 - Update this index and every affected domain contract together when component IDs, origins, ownership paths, the authentication exception, the data path or the licensing boundary change.
 - Change a `planned` path to an actual path in the same change that creates it. That change also adds the workspace membership, the package scripts and the validation commands that the owning domain contract defines.
-- Update the [protos contract](protos-ownsand-api-contract.md) before or with every RPC, message or enum change. Check the [tide project](project-tide.md), which consumes the public API, when a public RPC changes. Update the SDK, CLI and console contracts when a change affects their surface.
+- Update the [protos contract](protos-ownsand-api-contract.md) before or with every RPC, message or enum change. Check the [SandRun project](project-sandrun.md), which consumes the public API, when a public RPC changes. Update the SDK, CLI and console contracts when a change affects their surface.
 - Update [repository-auth-contract.md](repository-auth-contract.md) when the API key, enrollment token or device credential exception changes.
 - Update [Billing](#billing), the [control plane contract](servers-ownsand-api-foundation.md#billing) and the [protos contract](protos-ownsand-api-contract.md#billing) together when a price, a meter, the RPC classification or the enforcement changes. A meter change also updates the [`delino-accounts` protos contract](protos-delino-accounts-api-contract.md#enums).
 - Update the [documentation catalog](README.md) when contracts are added, renamed or removed.
@@ -178,7 +178,7 @@ The cross-component suite in `servers/ownsand-api/e2e/` (package `e2e`, licensed
 ## References
 
 - [servers-ownsand-api-foundation.md](servers-ownsand-api-foundation.md)
-- [project-tide.md](project-tide.md): a consumer of the public API that runs GitHub Actions jobs and coding-agent sessions on OwnSand devices.
+- [project-sandrun.md](project-sandrun.md): a consumer of the public API that runs GitHub Actions jobs and coding-agent sessions on OwnSand devices.
 - [DigitalOcean bandwidth billing](https://docs.digitalocean.com/platform/billing/bandwidth/)
 - [repository-defaults.md](repository-defaults.md)
 - [repository-auth-contract.md](repository-auth-contract.md)
