@@ -198,6 +198,7 @@ type fakeCP struct {
 	authScript  func(n int, req *ownsandv1.AuthorizeRelayRequest) authAction
 	relayCalls  map[string]int
 	relayLog    []string
+	relayExecs  []*ownsandv1.ExecRequest
 	// heldEnded records when a held (holdOpen or keepalivesOnly) relay
 	// stream ended because the caller cancelled it, and when it began.
 	heldStarts  []time.Time
@@ -934,6 +935,11 @@ func (f *fakeRelay) execLike(ctx context.Context, method string, h http.Header, 
 }
 
 func (f *fakeRelay) Exec(ctx context.Context, req *connect.Request[ownsandv1.ExecRequest], stream *connect.ServerStream[ownsandv1.ExecResponse]) error {
+	// Capture the decoded payload before normalization or a scripted abort.
+	cp := f.cp
+	cp.mu.Lock()
+	cp.relayExecs = append(cp.relayExecs, proto.Clone(req.Msg).(*ownsandv1.ExecRequest))
+	cp.mu.Unlock()
 	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
 	if f.cp.onExecRequest != nil {
 		f.cp.onExecRequest(req.Msg)
@@ -1082,6 +1088,11 @@ type fakeAgent struct {
 	reads     map[string][]byte
 	writes    map[string]*fakeWrite
 	readChunk int
+
+	// execOutputOffsetBias shifts chunk offsets on the wire without sending
+	// an explicit truncation event. Gap tests use one chunk per exec.
+	execOutputOffsetBias int64
+
 	// endSizeDelta is added to the size that serveRead reports in the final
 	// FileReadEnd event. Zero reports the real size.
 	endSizeDelta int64
@@ -1177,7 +1188,7 @@ func (a *fakeAgent) serveExec(ctx context.Context, cp *fakeCP, e *fakeExec, outO
 			for off[s] < e.base[s]+int64(len(e.out[s])) {
 				start := off[s] - e.base[s]
 				end := min(start+int64(a.execChunk), int64(len(e.out[s])))
-				out := &ownsandv1.ExecOutput{Offset: off[s], Data: append([]byte(nil), e.out[s][start:end]...)}
+				out := &ownsandv1.ExecOutput{Offset: off[s] + a.execOutputOffsetBias, Data: append([]byte(nil), e.out[s][start:end]...)}
 				if s == 0 {
 					pending = append(pending, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: out}})
 				} else {

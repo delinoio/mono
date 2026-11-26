@@ -496,7 +496,7 @@ func (op *execOp) p2pAttempt(ctx context.Context, sess *p2pSession) attempt {
 		switch f.GetKind() {
 		case ownsandv1.DataFrameKind_DATA_FRAME_KIND_EXEC_EVENT:
 			at.served = true
-			if done := op.handleEvent(f.GetExecEvent(), &at, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER); done {
+			if done := op.handleEvent(ctx, f.GetExecEvent(), &at, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER); done {
 				return at
 			}
 		case ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED:
@@ -556,7 +556,7 @@ func (op *execOp) relayAttempt(ctx context.Context) attempt {
 	}
 	defer stream.Close()
 	for stream.Receive() {
-		done := op.handleEvent(next(), &at, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY)
+		done := op.handleEvent(ctx, next(), &at, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY)
 		if at.accepted || !op.rec.inRecovery() {
 			// The agent accepted the continuation, or progress ended the
 			// window: the recovery budget no longer bounds the stream.
@@ -583,7 +583,7 @@ func guestExecTime(ts *timestamppb.Timestamp) *time.Time {
 }
 
 // handleEvent applies one exec event and reports whether the stream is done.
-func (op *execOp) handleEvent(ev *ownsandv1.ExecEvent, at *attempt, transport ownsandv1.DataPathTransport) bool {
+func (op *execOp) handleEvent(ctx context.Context, ev *ownsandv1.ExecEvent, at *attempt, transport ownsandv1.DataPathTransport) bool {
 	emit := func(e ExecEvent) bool {
 		if op.onEvent == nil {
 			return true
@@ -627,12 +627,12 @@ func (op *execOp) handleEvent(ev *ownsandv1.ExecEvent, at *attempt, transport ow
 		}
 	case *ownsandv1.ExecEvent_Stdout:
 		op.started = true
-		if !op.deliver(ExecEventStdout, &op.outOff, e.Stdout, at, emit) {
+		if !op.deliver(ctx, ExecEventStdout, &op.outOff, e.Stdout, at, emit) {
 			return true
 		}
 	case *ownsandv1.ExecEvent_Stderr:
 		op.started = true
-		if !op.deliver(ExecEventStderr, &op.errOff, e.Stderr, at, emit) {
+		if !op.deliver(ctx, ExecEventStderr, &op.errOff, e.Stderr, at, emit) {
 			return true
 		}
 	case *ownsandv1.ExecEvent_Exited:
@@ -669,7 +669,7 @@ func (op *execOp) handleEvent(ev *ownsandv1.ExecEvent, at *attempt, transport ow
 // deliver passes the new bytes of one output chunk to the caller and
 // advances the offset. Bytes before the offset were delivered already; a
 // gap after it is lost output.
-func (op *execOp) deliver(kind ExecEventKind, cur *int64, out *ownsandv1.ExecOutput, at *attempt, emit func(ExecEvent) bool) bool {
+func (op *execOp) deliver(ctx context.Context, kind ExecEventKind, cur *int64, out *ownsandv1.ExecOutput, at *attempt, emit func(ExecEvent) bool) bool {
 	off, data := out.GetOffset(), out.GetData()
 	end := off + int64(len(data))
 	if end <= *cur {
@@ -683,10 +683,15 @@ func (op *execOp) deliver(kind ExecEventKind, cur *int64, out *ownsandv1.ExecOut
 			ev.MissingStderr = ByteRange{From: *cur, To: off}
 		}
 		op.incomplete = true
-		*cur = off
 		if !emit(ev) {
 			return false
 		}
+		// The gap callback can cancel before this frame's output is delivered.
+		if err := ctx.Err(); err != nil {
+			at.err = err
+			return false
+		}
+		*cur = off
 	}
 	data = data[*cur-off:]
 	*cur = end

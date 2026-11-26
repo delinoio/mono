@@ -67,6 +67,38 @@ func waitGate(t *testing.T, cp *fakeCP, kind string) {
 	}
 }
 
+type setupWaitContext struct {
+	context.Context
+	observeSlot func()
+}
+
+func (ctx setupWaitContext) Done() <-chan struct{} {
+	ctx.observeSlot()
+	return ctx.Context.Done()
+}
+
+func startSetupWaiter(ctx context.Context, s *Sandbox) (<-chan execResult, <-chan bool) {
+	occupied := make(chan bool, 1)
+	// Exec first calls Done in acquireOpen after checking Err and before
+	// trying to take the slot. Record whether the opener still holds it.
+	ctx = setupWaitContext{Context: ctx, observeSlot: sync.OnceFunc(func() {
+		occupied <- len(s.dp.openSlot) == cap(s.dp.openSlot)
+	})}
+	return startExec(ctx, s), occupied
+}
+
+func waitForSetupWaiter(t *testing.T, name string, occupied <-chan bool) {
+	t.Helper()
+	select {
+	case busy := <-occupied:
+		if !busy {
+			t.Fatalf("waiter %s reached a free setup slot", name)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("waiter %s did not reach the setup slot", name)
+	}
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -220,14 +252,15 @@ func TestWaitingOperationCancelsWithoutEndingTheSetup(t *testing.T) {
 	cp.gateHits = make(chan string, 4)
 	s := cp.handle(t, cp.client(t, TransportAuto))
 
-	a := startExec(context.Background(), s)
+	a := startExec(t.Context(), s)
 	waitGate(t, cp, "ice")
 	// Waiter C keeps waiting; waiter B cancels.
-	c := startExec(context.Background(), s)
-	bctx, cancelB := context.WithCancel(context.Background())
+	c, cOccupied := startSetupWaiter(t.Context(), s)
+	bctx, cancelB := context.WithCancel(t.Context())
 	defer cancelB()
-	b := startExec(bctx, s)
-	time.Sleep(100 * time.Millisecond)
+	b, bOccupied := startSetupWaiter(bctx, s)
+	waitForSetupWaiter(t, "B", bOccupied)
+	waitForSetupWaiter(t, "C", cOccupied)
 	canceledAt := time.Now()
 	cancelB()
 	rb := waitExec(t, b)
@@ -273,12 +306,12 @@ func TestWaiterRunsTheSetupWhenTheOpenerEnds(t *testing.T) {
 	cp.gateHits = make(chan string, 4)
 	s := cp.handle(t, cp.client(t, TransportAuto))
 
-	actx, cancelA := context.WithCancel(context.Background())
+	actx, cancelA := context.WithCancel(t.Context())
 	defer cancelA()
 	a := startExec(actx, s)
 	waitGate(t, cp, "ice")
-	w := startExec(context.Background(), s)
-	time.Sleep(100 * time.Millisecond)
+	w, wOccupied := startSetupWaiter(t.Context(), s)
+	waitForSetupWaiter(t, "W", wOccupied)
 	cancelA()
 	if ra := waitExec(t, a); !errors.Is(ra.err, context.Canceled) {
 		t.Fatalf("opener error: %v", ra.err)
@@ -432,6 +465,96 @@ func TestCallerDeadlineEndsStalledSetupWithoutRelayRecovery(t *testing.T) {
 			}
 			if s.Transport() == relayTransport {
 				t.Fatal("the handle moved to the relay on a caller deadline")
+			}
+		})
+	}
+}
+
+func TestLateDataChannelOpen(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		transport     Transport
+		setupTimeout  bool
+		callerCancels bool
+		wantTransport ownsandv1.DataPathTransport
+		wantRelayAuth int
+	}{
+		{name: "auto-timeout", transport: TransportAuto, setupTimeout: true, wantTransport: relayTransport, wantRelayAuth: 1},
+		{name: "forced-peer-timeout", transport: TransportPeerToPeer, setupTimeout: true},
+		{name: "caller-cancels", transport: TransportAuto, callerCancels: true},
+		{name: "timely-open", transport: TransportAuto, wantTransport: p2pTransport},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			c := cp.client(t, tc.transport)
+			if tc.setupTimeout {
+				c.timing.p2pOpenTimeout = 2 * time.Second
+			}
+			s := cp.handle(t, c)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var peer *webrtc.PeerConnection
+			c.p2p.gateDataChannelOpen = func(setup context.Context, pc *webrtc.PeerConnection, opened <-chan struct{}) <-chan struct{} {
+				peer = pc
+				t.Cleanup(func() { _ = pc.Close() })
+				select {
+				case <-opened:
+				case <-time.After(10 * time.Second):
+					t.Fatal("the loopback data channel did not open")
+				}
+				if tc.callerCancels {
+					cancel()
+				}
+				if tc.setupTimeout || tc.callerCancels {
+					<-setup.Done()
+				}
+				// Release the open notification after any cancellation so both
+				// signals are already ready when the final select starts.
+				released := make(chan struct{})
+				close(released)
+				return released
+			}
+
+			rec := &recorder{}
+			res, err := s.Exec(ctx, ExecParams{Command: []string{"run"}, OnEvent: rec.on})
+			switch {
+			case tc.callerCancels:
+				if err != context.Canceled {
+					t.Fatalf("Exec error = %v, want context.Canceled", err)
+				}
+			case tc.setupTimeout && tc.transport == TransportPeerToPeer:
+				var openErr *errP2POpen
+				if !errors.As(err, &openErr) || !errors.Is(err, errSetupTimeout) {
+					t.Fatalf("Exec error = %v, want peer setup timeout", err)
+				}
+			default:
+				if err != nil {
+					t.Fatal(err)
+				}
+				checkLines(t, res, rec, 3)
+				if res.Transport != tc.wantTransport || s.Transport() != tc.wantTransport {
+					t.Fatalf("Exec transport = %v, handle transport = %v, want %v", res.Transport, s.Transport(), tc.wantTransport)
+				}
+			}
+			if got := len(cp.authRequests()); got != tc.wantRelayAuth {
+				t.Fatalf("AuthorizeRelay calls = %d, want %d", got, tc.wantRelayAuth)
+			}
+			if peer == nil {
+				t.Fatal("setup did not reach the final data channel wait")
+			}
+			installed := s.installedSession()
+			if tc.wantTransport == p2pTransport {
+				if installed == nil || installed.pc != peer {
+					t.Fatal("the timely peer connection did not become the installed session")
+				}
+			} else {
+				if installed != nil {
+					t.Fatal("a peer connection was installed after setup cancellation")
+				}
+				waitFor(t, "the canceled peer connection to close", func() bool {
+					return peer.ConnectionState() == webrtc.PeerConnectionStateClosed
+				})
 			}
 		})
 	}
