@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1024,6 +1025,103 @@ func testTruncation(t *testing.T, tr Transport) {
 
 func TestOutputTruncatedRelay(t *testing.T)      { testTruncation(t, TransportRelay) }
 func TestOutputTruncatedPeerToPeer(t *testing.T) { testTruncation(t, TransportPeerToPeer) }
+
+func TestExecOutputGap(t *testing.T) {
+	sentinel := errors.New("stop from gap callback")
+	for _, tr := range []Transport{TransportRelay, TransportPeerToPeer} {
+		for _, method := range []string{"Exec", "AttachExec"} {
+			for _, kind := range []ExecEventKind{ExecEventStdout, ExecEventStderr} {
+				for _, tc := range []struct {
+					name        string
+					callbackErr error
+					wantErr     error
+				}{
+					{name: "live"},
+					{name: "cancel", wantErr: context.Canceled},
+					{name: "callback-error", callbackErr: sentinel, wantErr: sentinel},
+				} {
+					t.Run(fmt.Sprintf("%s/%s/%s/%s", tr, method, kind, tc.name), func(t *testing.T) {
+						testExecOutputGap(t, tr, method, kind, tc.callbackErr, tc.wantErr)
+					})
+				}
+			}
+		}
+	}
+}
+
+func testExecOutputGap(t *testing.T, tr Transport, method string, kind ExecEventKind, callbackErr, wantErr error) {
+	t.Helper()
+	streamIndex := 0
+	var missingStdout, missingStderr ByteRange
+	if kind == ExecEventStdout {
+		missingStdout = ByteRange{To: 2}
+	} else {
+		streamIndex = 1
+		missingStderr = ByteRange{To: 2}
+	}
+	cp := newFakeCP(t)
+	cp.agent.execOutputOffsetBias = 2
+	cp.agent.run = func(_ []string, e *fakeExec) {
+		e.write(streamIndex, []byte("x"))
+		e.finish(exitedEvent(0))
+	}
+	s := cp.handle(t, cp.client(t, tr))
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	var kinds []ExecEventKind
+	onEvent := func(ev ExecEvent) error {
+		kinds = append(kinds, ev.Kind)
+		switch ev.Kind {
+		case ExecEventOutputTruncated:
+			if ev.MissingStdout != missingStdout || ev.MissingStderr != missingStderr {
+				t.Errorf("gap stdout = %+v, stderr = %+v, want %+v and %+v",
+					ev.MissingStdout, ev.MissingStderr, missingStdout, missingStderr)
+			}
+			if wantErr != nil {
+				cancel()
+			}
+			return callbackErr
+		case ExecEventStdout, ExecEventStderr:
+			if ev.Offset != 2 || string(ev.Data) != "x" {
+				t.Errorf("output at %d = %q, want x at offset 2", ev.Offset, ev.Data)
+			}
+		}
+		return nil
+	}
+	var res *ExecResult
+	var err error
+	if method == "Exec" {
+		res, err = s.Exec(ctx, ExecParams{Command: []string{"x"}, OnEvent: onEvent})
+	} else {
+		id := "019c7aa6-e577-7c23-a0fa-6b1f02f04894"
+		cp.agent.startExec(cp, &ownsandv1.ExecRequest{ExecId: id, Command: []string{"x"}})
+		res, err = s.AttachExec(ctx, id, AttachParams{OnEvent: onEvent})
+	}
+	wantKinds := []ExecEventKind{ExecEventStarted, ExecEventOutputTruncated}
+	if wantErr == nil {
+		wantKinds = append(wantKinds, kind)
+		if err != nil || res == nil || res.Kind != ExecResultExited || !res.Incomplete {
+			t.Errorf("result = %+v, error = %v, want an incomplete exit", res, err)
+		}
+	} else if res != nil || err != wantErr {
+		t.Errorf("result = %+v, error = %v, want nil result and %v", res, err, wantErr)
+	}
+	if !slices.Equal(kinds, wantKinds) {
+		t.Errorf("events = %v, want %v", kinds, wantKinds)
+	}
+
+	cp.mu.Lock()
+	relayCalls := slices.Clone(cp.relayLog)
+	peerCalls := cp.p2pRequests
+	cp.mu.Unlock()
+	if tr == TransportRelay {
+		if !slices.Equal(relayCalls, []string{method}) || peerCalls != 0 {
+			t.Errorf("relay calls = %v, peer calls = %d, want one relay %s", relayCalls, peerCalls, method)
+		}
+	} else if len(relayCalls) != 0 || peerCalls != 1 {
+		t.Errorf("relay calls = %v, peer calls = %d, want one peer call", relayCalls, peerCalls)
+	}
+}
 
 func TestExecFailedAndSignal(t *testing.T) {
 	cp := newFakeCP(t)
