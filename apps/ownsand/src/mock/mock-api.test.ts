@@ -8,13 +8,16 @@ import {
   BillingService,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import {
+  AgentUpdateState,
   ApiKeyState,
+  Arch,
   BaseImage,
   BillingReason,
   DeviceState,
   EnrollmentTokenState,
   ErrorDetailSchema,
   GuestOs,
+  HostOs,
   Role,
   SandboxEndReason,
   SandboxState,
@@ -49,21 +52,102 @@ describe("mock device list", () => {
     expect(ids).toContain(MOCK_IDS.studioMac);
   });
 
-  test("omits removed devices unless the state filter asks for them", async () => {
-    const client = createClient(DeviceService, createMockTransport());
-    await client.removeDevice({ organizationId, deviceId: MOCK_IDS.buildBox });
-
-    const all = await client.listDevices({ organizationId });
-    expect(all.devices.map((d) => d.deviceId)).not.toContain(MOCK_IDS.buildBox);
-    expect(all.devices.every((d) => d.state !== DeviceState.REMOVED)).toBe(
-      true,
+  test("returns the same scrubbed tombstone from remove, get and filtered list", async () => {
+    const client = createClient(
+      DeviceService,
+      createMockTransport({ userId: "user-admin-jun" }),
     );
+    const request = { organizationId, deviceId: MOCK_IDS.buildBox };
+    const { device: before } = await client.getDevice(request);
+    expect(before).toMatchObject({
+      name: "build-box-1",
+      hostOs: HostOs.LINUX,
+      arch: Arch.AMD64,
+      agentVersion: "1.4.2",
+      updateState: AgentUpdateState.UP_TO_DATE,
+      capabilities: { logicalCpuCount: 32 },
+      limits: { vcpuCount: 16, vcpuOvercommitPercent: 150 },
+      effectiveVcpuLimit: 24,
+      effectiveVcpuLimitCount: 24n,
+      allocation: { vcpuTotalCount: 10n },
+    });
+    expect(before?.createTime).toBeDefined();
+    expect(before?.lastSeenTime).toBeDefined();
+    const studio = await client.getDevice({
+      organizationId,
+      deviceId: MOCK_IDS.studioMac,
+    });
+    expect(studio.device).toMatchObject({
+      name: "studio-mac",
+      capabilities: { logicalCpuCount: 12 },
+    });
 
+    const { device: tombstone } = await client.removeDevice(request);
+    expect(tombstone).toMatchObject({
+      deviceId: before?.deviceId,
+      organizationId: before?.organizationId,
+      createTime: before?.createTime,
+      state: DeviceState.REMOVED,
+      name: "",
+      hostOs: HostOs.UNSPECIFIED,
+      arch: Arch.UNSPECIFIED,
+      agentVersion: "",
+      updateState: AgentUpdateState.UNSPECIFIED,
+      limits: {
+        vcpuCount: 0,
+        memoryMib: 0n,
+        diskGib: 0n,
+        vcpuOvercommitPercent: 100,
+      },
+      effectiveVcpuLimit: 0,
+      effectiveVcpuLimitCount: 0n,
+      allocation: {
+        vcpuCount: 0,
+        vcpuTotalCount: 0n,
+        memoryMib: 0n,
+        diskGib: 0n,
+        macosGuestCount: 0,
+      },
+    });
+    expect(tombstone?.capabilities).toBeUndefined();
+    expect(tombstone?.lastSeenTime).toBeUndefined();
+    expect(tombstone?.pendingIdleSince).toBeUndefined();
+    expect((await client.getDevice(request)).device).toEqual(tombstone);
     const removed = await client.listDevices({
       organizationId,
       state: DeviceState.REMOVED,
     });
-    expect(removed.devices.map((d) => d.deviceId)).toEqual([MOCK_IDS.buildBox]);
+    expect(removed.devices).toEqual([tombstone]);
+
+    const { devices } = await client.listDevices({ organizationId });
+    expect(devices).toEqual([studio.device]);
+  });
+
+  test("rejects both limits updates on a removed device", async () => {
+    const client = createClient(
+      DeviceService,
+      createMockTransport({ userId: "user-admin-jun" }),
+    );
+    const request = { organizationId, deviceId: MOCK_IDS.buildBox };
+    const { device } = await client.removeDevice(request);
+    const limits = {
+      vcpuCount: 4,
+      memoryMib: 2048n,
+      diskGib: 20n,
+      vcpuOvercommitPercent: 125,
+    };
+
+    await expect(
+      client.updateDeviceLimits({ ...request, limits }),
+    ).rejects.toMatchObject({
+      code: Code.NotFound,
+    });
+    await expect(
+      client.replaceDeviceLimits({ ...request, limits }),
+    ).rejects.toMatchObject({
+      code: Code.NotFound,
+    });
+    expect((await client.getDevice(request)).device).toEqual(device);
   });
 
   test("rejects an explicit unspecified state", async () => {

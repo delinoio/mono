@@ -380,6 +380,8 @@ describe("devices", () => {
     await app.open(`/orgs/${ACME}/devices`);
     await expect(screen.getByText("build-box-1").first()).toBeVisible();
     await expect(screen.getByText("studio-mac").first()).toBeVisible();
+    const studioDisk = screen.getByRole("cell", "20 of 0 GiB", { exact: true });
+    await expect(studioDisk).toBeVisible();
 
     await app.open(`/orgs/${ACME}/devices/${BUILD_BOX}`);
     await screen.getByRole("button", "Remove device").tap();
@@ -396,6 +398,7 @@ describe("devices", () => {
       await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
       await expect(screen.getByText("studio-mac").first()).toBeVisible();
       await expect(screen.getByText("build-box-1")).toBeHidden();
+      await expect(studioDisk).toBeVisible();
       expect(
         await browser.evaluate(() => ({
           readback: sessionStorage.getItem("ownsand-e2e-device-readback"),
