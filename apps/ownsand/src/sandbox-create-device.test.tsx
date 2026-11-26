@@ -5,16 +5,26 @@ import {
   cleanup,
   fireEvent,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import type { Transport } from "@connectrpc/connect";
+import type { QueryClient } from "@tanstack/react-query";
 import { DeviceState } from "@delino/ownsand-protos/v1/common_pb";
-import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import {
+  DeviceService,
+  type ListDevicesResponse,
+} from "@delino/ownsand-protos/v1/device_pb";
 import type { CreateSandboxRequest } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { deviceOptionLabel, errorMessage } from "./format.ts";
 import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
-import { renderConsole, settle } from "./test-support.tsx";
+import {
+  fullListRefresh,
+  holdingTransport,
+  renderConsole,
+  settle,
+} from "./test-support.tsx";
 
 beforeEach(() => {
   window.sessionStorage.clear();
@@ -47,8 +57,11 @@ describe("device option label", () => {
 });
 
 describe("create sandbox device select", () => {
-  async function openForm(transport: Transport) {
-    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+  async function openForm(transport: Transport, queryClient?: QueryClient) {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+      transport,
+      queryClient,
+    });
     await act(async () => {
       fireEvent.click(
         await screen.findByRole("button", { name: "Create sandbox" }),
@@ -131,6 +144,185 @@ describe("create sandbox device select", () => {
     expect(requests.map((request) => request.placement?.deviceId)).toEqual([
       devices[0]!.deviceId,
     ]);
+  });
+
+  function deviceFixture(mock = createMockTransport()) {
+    let omitSelected = false;
+    let failContinuation = false;
+    const requests: CreateSandboxRequest[] = [];
+    const refresh = fullListRefresh(DeviceService.method.listDevices, {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          requests.push(rest[3] as CreateSandboxRequest);
+        }
+        if (
+          method.name === "ListDevices" &&
+          failContinuation &&
+          (rest[3] as { pageToken: string }).pageToken !== ""
+        ) {
+          throw new ConnectError("Continuation failed", Code.Unavailable);
+        }
+        const response = await mock.unary(method, ...rest);
+        if (method.name === "ListDevices" && omitSelected) {
+          const { devices } = response.message as ListDevicesResponse;
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              devices: devices.filter(
+                (device) => device.deviceId !== MOCK_IDS.buildBox,
+              ),
+            },
+          };
+        }
+        return response;
+      },
+    });
+    return {
+      ...refresh,
+      requests,
+      omitSelected() {
+        omitSelected = true;
+        return refresh.refetch();
+      },
+      failContinuation() {
+        failContinuation = true;
+      },
+    };
+  }
+
+  const unavailable = /The selected device is unavailable/;
+  const permissionDenied = "You do not have permission to do this.";
+
+  for (const replacement of ["Any device that fits", "Device 003 (Online)"]) {
+    test(`blocks a missing selection until the user chooses ${replacement}`, async () => {
+      const mock = createMockTransport({ extraDevices: 1 });
+      const { devices } = await createClient(DeviceService, mock).listDevices({
+        organizationId: MOCK_IDS.acme,
+      });
+      const deviceId =
+        replacement === "Any device that fits"
+          ? undefined
+          : devices.find((device) => device.name === "Device 003")!.deviceId;
+      const fixture = deviceFixture(mock);
+      const dialog = await openForm(fixture.transport, fixture.queryClient);
+      await chooseDevice(dialog, "build-box-1 (Online)");
+      const form = within(dialog);
+      const label = form.getByRole<HTMLTextAreaElement>("textbox", {
+        name: "Labels",
+      });
+      await act(async () => {
+        fireEvent.input(label, { target: { value: "team=placement" } });
+      });
+
+      await fixture.omitSelected();
+      await form.findByText(unavailable);
+      expect(
+        form.getByRole<HTMLButtonElement>("button", { name: "Create" })
+          .disabled,
+      ).toBe(true);
+      await act(async () => {
+        fireEvent.submit(label.form!);
+        fireEvent.click(form.getByRole("combobox", { name: "Device" }));
+      });
+      expect(
+        screen.queryByRole("option", { name: "build-box-1 (Online)" }),
+      ).toBeNull();
+      expect(fixture.requests).toEqual([]);
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("option", { name: replacement }));
+      });
+      expect(form.queryByText(unavailable)).toBeNull();
+      await create(dialog);
+
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.requests[0]?.placement?.deviceId).toBe(deviceId);
+      expect(fixture.requests[0]?.labels).toEqual({ team: "placement" });
+    });
+  }
+
+  test("restores a selection when the device list recovers from a terminal error", async () => {
+    const fixture = deviceFixture();
+    const dialog = await openForm(fixture.transport, fixture.queryClient);
+    await chooseDevice(dialog, "build-box-1 (Online)");
+    const form = within(dialog);
+    const submit = form.getByRole<HTMLButtonElement>("button", {
+      name: "Create",
+    });
+    const label = form.getByRole<HTMLTextAreaElement>("textbox", {
+      name: "Labels",
+    });
+    await act(async () => {
+      fireEvent.input(label, { target: { value: "team=recovery" } });
+    });
+
+    await fixture.refetch(Code.PermissionDenied);
+    await form.findByText(permissionDenied);
+    expect(form.getByText(unavailable)).toBeTruthy();
+    expect(submit.disabled).toBe(true);
+    await act(async () => {
+      fireEvent.submit(label.form!);
+    });
+    expect(fixture.requests).toEqual([]);
+
+    await fixture.refetch();
+    await waitFor(() => expect(form.queryByText(unavailable)).toBeNull());
+    expect(
+      form.getByRole("combobox", { name: "Device" }).textContent,
+    ).toContain("build-box-1 (Online)");
+    expect(submit.disabled).toBe(false);
+    await create(dialog);
+    expect(fixture.requests).toHaveLength(1);
+    expect(fixture.requests[0]?.placement?.deviceId).toBe(MOCK_IDS.buildBox);
+    expect(fixture.requests[0]?.labels).toEqual({ team: "recovery" });
+  });
+
+  test("keeps a visible device usable when a later page fails", async () => {
+    const fixture = deviceFixture(createMockTransport({ extraDevices: 199 }));
+    fixture.failContinuation();
+    const dialog = await openForm(fixture.transport, fixture.queryClient);
+    await within(dialog).findByText("Some devices are not shown yet.");
+    await chooseDevice(dialog, "build-box-1 (Online)");
+    await create(dialog);
+    expect(
+      fixture.requests.map((request) => request.placement?.deviceId),
+    ).toEqual([MOCK_IDS.buildBox]);
+  });
+
+  test("replays a submitted request with its original device and key after a terminal list error", async () => {
+    let hold = true;
+    const held = holdingTransport(["CreateSandbox"], () => hold);
+    const fixture = deviceFixture(held.transport);
+    const dialog = await openForm(fixture.transport, fixture.queryClient);
+    await chooseDevice(dialog, "build-box-1 (Online)");
+    await create(dialog);
+
+    await fixture.refetch(Code.PermissionDenied);
+    await within(dialog).findByText(permissionDenied);
+    expect(within(dialog).queryByText(unavailable)).toBeNull();
+    expect(
+      within(dialog).getByRole("combobox", { name: "Device" }).textContent,
+    ).toContain("build-box-1 (Online)");
+    const [original] = held.calls.CreateSandbox!;
+    await act(async () => {
+      original!.settle(new ConnectError("Lost reply", Code.Unavailable));
+    });
+    hold = false;
+
+    const retry = await within(dialog).findByRole<HTMLButtonElement>("button", {
+      name: "Retry original request",
+    });
+    expect(retry.disabled).toBe(false);
+    await act(async () => {
+      fireEvent.click(retry);
+    });
+    expect(fixture.requests).toEqual([
+      fixture.requests[0],
+      fixture.requests[0],
+    ]);
+    expect(fixture.requests[0]?.placement?.deviceId).toBe(MOCK_IDS.buildBox);
   });
 
   test("locks the original request after Unavailable for a selected offline device", async () => {
