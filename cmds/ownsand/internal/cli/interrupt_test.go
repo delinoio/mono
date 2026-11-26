@@ -136,34 +136,67 @@ func TestCtxReaderPassesDataAndEOF(t *testing.T) {
 	}
 }
 
+const ctxReaderPhaseTimeout = 30 * time.Second
+
+func readCtxAsync(r *ctxReader, buf []byte) <-chan readResult {
+	done := make(chan readResult, 1)
+	go func() {
+		n, err := r.Read(buf)
+		done <- readResult{n: n, err: err}
+	}()
+	return done
+}
+
+func cancelReadAfterStart(t *testing.T, cancel context.CancelFunc, started <-chan struct{}, done <-chan readResult) {
+	t.Helper()
+	select {
+	case <-started:
+	case end := <-done:
+		t.Fatalf("Read returned (%d, %v) before the underlying read started", end.n, end.err)
+	case <-time.After(ctxReaderPhaseTimeout):
+		t.Fatal("the underlying read did not start before the deadline")
+	}
+	select {
+	case end := <-done:
+		t.Fatalf("Read returned (%d, %v) before cancellation", end.n, end.err)
+	default:
+	}
+	cancel()
+}
+
+func requireCanceledRead(t *testing.T, done <-chan readResult, phase string) {
+	t.Helper()
+	select {
+	case end := <-done:
+		if end.n != 0 || !errors.Is(end.err, context.Canceled) {
+			t.Fatalf("%s returned (%d, %v), want (0, context.Canceled)", phase, end.n, end.err)
+		}
+	case <-time.After(ctxReaderPhaseTimeout):
+		t.Fatalf("%s did not return before the deadline", phase)
+	}
+}
+
 func TestCtxReaderReturnsTheContextErrorWhileBlocked(t *testing.T) {
 	stdin := blockedStdin(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cr := newCtxReader(ctx, stdin)
-	type readEnd struct {
-		n   int
-		err error
-	}
-	done := make(chan readEnd, 1)
 	buf := make([]byte, 8)
-	go func() {
-		n, err := cr.Read(buf)
-		done <- readEnd{n, err}
-	}()
-	<-stdin.started
-	cancel()
-	select {
-	case end := <-done:
-		if end.n != 0 || !errors.Is(end.err, context.Canceled) {
-			t.Fatalf("Read = %d, %v; want 0 and context.Canceled", end.n, end.err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("Read did not return after the cancellation")
-	}
-	if n, err := cr.Read(buf); n != 0 || !errors.Is(err, context.Canceled) {
-		t.Fatalf("Read after the cancellation = %d, %v", n, err)
-	}
+	done := readCtxAsync(cr, buf)
+	cancelReadAfterStart(t, cancel, stdin.started, done)
+	requireCanceledRead(t, done, "initial Read after cancellation")
+	requireCanceledRead(t, readCtxAsync(cr, buf), "repeat Read after cancellation")
+}
+
+type pipeReadRecorder struct {
+	pipe     *io.PipeReader
+	received chan string
+}
+
+func (r *pipeReadRecorder) Read(buf []byte) (int, error) {
+	n, err := r.pipe.Read(buf)
+	r.received <- string(buf[:n])
+	return n, err
 }
 
 // After Read returned for the context, a late result of the abandoned read
@@ -171,25 +204,40 @@ func TestCtxReaderReturnsTheContextErrorWhileBlocked(t *testing.T) {
 func TestCtxReaderDoesNotWriteToTheCallerBufferAfterCancellation(t *testing.T) {
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { _ = pw.Close(); _ = pr.Close() })
-	stdin := newNotifyReader(pr)
+	received := make(chan string, 1)
+	stdin := newNotifyReader(&pipeReadRecorder{pipe: pr, received: received})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cr := newCtxReader(ctx, stdin)
-	buf := bytes.Repeat([]byte{'.'}, 8)
-	done := make(chan struct{})
+	const sentinel = "........"
+	buf := []byte(sentinel)
+	done := readCtxAsync(cr, buf)
+	cancelReadAfterStart(t, cancel, stdin.started, done)
+	requireCanceledRead(t, done, "initial Read after cancellation")
+
+	const late = "late"
+	written := make(chan readResult, 1)
 	go func() {
-		defer close(done)
-		_, _ = cr.Read(buf)
+		n, err := pw.Write([]byte(late))
+		written <- readResult{n: n, err: err}
 	}()
-	<-stdin.started
-	cancel()
-	<-done
-	// Unblock the abandoned read with data. Write returns after the read
-	// has consumed the data.
-	if _, err := pw.Write([]byte("late")); err != nil {
-		t.Fatalf("write to the pipe: %v", err)
+	select {
+	case result := <-written:
+		if result.n != len(late) || result.err != nil {
+			t.Fatalf("late pipe write returned (%d, %v), want (%d, nil)", result.n, result.err, len(late))
+		}
+	case <-time.After(ctxReaderPhaseTimeout):
+		t.Fatal("the late pipe write did not complete before the deadline")
 	}
-	if string(buf) != "........" {
-		t.Fatalf("the caller buffer changed after the cancellation: %q", buf)
+	select {
+	case got := <-received:
+		if got != late {
+			t.Fatalf("the abandoned read received %q, want %q", got, late)
+		}
+	case <-time.After(ctxReaderPhaseTimeout):
+		t.Fatal("the abandoned read did not report receiving late input before the deadline")
+	}
+	if string(buf) != sentinel {
+		t.Fatalf("the caller buffer contains %q after cancellation, want %q", buf, sentinel)
 	}
 }
