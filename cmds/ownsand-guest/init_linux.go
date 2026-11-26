@@ -92,18 +92,23 @@ func runInit(args []string) int {
 			time.Sleep(time.Second)
 			continue
 		}
-		helper := cmd.Process.Pid
-		for {
-			var ws syscall.WaitStatus
-			pid, err := syscall.Wait4(-1, &ws, 0, nil)
-			if errors.Is(err, syscall.EINTR) {
-				continue
-			}
-			if err != nil || pid == helper {
-				break
-			}
-		}
+		waitInitHelper(cmd.Process)
 		fmt.Fprintln(os.Stderr, "ownsand-guest init: helper exited; restarting")
 		time.Sleep(time.Second)
 	}
+}
+
+func waitInitHelper(helper *os.Process) {
+	for {
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &ws, 0, nil)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil || pid == helper.Pid {
+			break
+		}
+	}
+	// Wait4 reaps the child. Release closes the process handle opened by Start.
+	_ = helper.Release()
 }
