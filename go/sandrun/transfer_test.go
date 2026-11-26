@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -72,6 +73,107 @@ func transferTestEnd(stream *connect.ServerStream[sandrunv1.ReadDevSessionFileRe
 	return stream.Send(&sandrunv1.ReadDevSessionFileResponse{Event: &sandrunv1.ReadDevSessionFileResponse_End{
 		End: &sandrunv1.DevSessionFileEnd{SizeBytes: size},
 	}})
+}
+
+func writeAcknowledgement(req *sandrunv1.WriteDevSessionFileRequest) *sandrunv1.WriteDevSessionFileResponse {
+	ack := &sandrunv1.WriteDevSessionFileResponse{
+		WriteId:  req.GetWriteId(),
+		Offset:   req.GetOffset(),
+		Length:   int64(len(req.GetData())),
+		Finished: req.GetFinal(),
+	}
+	if ack.Finished {
+		ack.SizeBytes = ack.Offset + ack.Length
+	}
+	return ack
+}
+
+func TestTransferWriteAcknowledgement(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		dataSize int
+		progress []int64
+	}{
+		{name: "empty", progress: []int64{0}},
+		{name: "single chunk", dataSize: 3, progress: []int64{3}},
+		{name: "full final chunk", dataSize: ChunkSize, progress: []int64{ChunkSize}},
+		{name: "multiple chunks", dataSize: ChunkSize + 1, progress: []int64{ChunkSize, ChunkSize + 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			c := transferTestClient(t, "", transferHandlers{write: func(_ context.Context, req *connect.Request[sandrunv1.WriteDevSessionFileRequest]) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
+				calls.Add(1)
+				return connect.NewResponse(writeAcknowledgement(req.Msg)), nil
+			}})
+			var progress []int64
+			n, err := c.writeGuestFile(t.Context(), &sandrunv1.DevSession{}, "/test", 0o644,
+				strings.NewReader(strings.Repeat("a", tc.dataSize)), func(done int64) { progress = append(progress, done) })
+			if err != nil || n != int64(tc.dataSize) || calls.Load() != int32(len(tc.progress)) || !slices.Equal(progress, tc.progress) {
+				t.Fatalf("upload = %d bytes, %v, %d requests, progress %v", n, err, calls.Load(), progress)
+			}
+		})
+	}
+}
+
+func TestTransferWriteRejectsInvalidAcknowledgement(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		field  string
+		final  bool
+		change func(*sandrunv1.WriteDevSessionFileResponse)
+	}{
+		{name: "first offset", field: "offset", change: func(m *sandrunv1.WriteDevSessionFileResponse) { m.Offset++ }},
+		{name: "first length", field: "length", change: func(m *sandrunv1.WriteDevSessionFileResponse) { m.Length-- }},
+		{name: "premature finish", field: "finished", change: func(m *sandrunv1.WriteDevSessionFileResponse) { m.Finished = true }},
+		{name: "empty response", field: "write_id", change: func(m *sandrunv1.WriteDevSessionFileResponse) { m.Reset() }},
+		{name: "final write ID", field: "write_id", final: true, change: func(m *sandrunv1.WriteDevSessionFileResponse) { m.WriteId = "private-payload" }},
+		{name: "final offset", field: "offset", final: true, change: func(m *sandrunv1.WriteDevSessionFileResponse) { m.Offset-- }},
+		{name: "final length", field: "length", final: true, change: func(m *sandrunv1.WriteDevSessionFileResponse) { m.Length++ }},
+		{name: "unfinished final chunk", field: "finished", final: true, change: func(m *sandrunv1.WriteDevSessionFileResponse) { m.Finished = false }},
+		{name: "final size", field: "size_bytes", final: true, change: func(m *sandrunv1.WriteDevSessionFileResponse) { m.SizeBytes-- }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			c := transferTestClient(t, "", transferHandlers{write: func(_ context.Context, req *connect.Request[sandrunv1.WriteDevSessionFileRequest]) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
+				calls.Add(1)
+				ack := writeAcknowledgement(req.Msg)
+				if tc.final == req.Msg.GetFinal() {
+					tc.change(ack)
+				}
+				return connect.NewResponse(ack), nil
+			}})
+			var progress []int64
+			const private = "private-payload"
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			n, err := c.writeGuestFile(ctx, &sandrunv1.DevSession{}, "/"+private, 0o644,
+				strings.NewReader(private+strings.Repeat("a", ChunkSize+1-len(private))),
+				func(done int64) { progress = append(progress, done) })
+			if connect.CodeOf(err) != connect.CodeDataLoss || connect.IsWireError(err) ||
+				!strings.Contains(err.Error(), tc.field) || strings.Contains(err.Error(), private) {
+				t.Errorf("upload error = %v, want local data_loss for %s without private data", err, tc.field)
+			}
+			var wantBytes int64
+			var wantProgress []int64
+			wantCalls := int32(1)
+			if tc.final {
+				wantBytes, wantProgress, wantCalls = ChunkSize, []int64{ChunkSize}, 2
+			}
+			if n != wantBytes || calls.Load() != wantCalls || !slices.Equal(progress, wantProgress) {
+				t.Errorf("upload = %d bytes, %d requests, progress %v, want %d bytes, %d requests, progress %v",
+					n, calls.Load(), progress, wantBytes, wantCalls, wantProgress)
+			}
+		})
+	}
+}
+
+func TestTransferWriteRejectsMissingAcknowledgement(t *testing.T) {
+	for _, reply := range []*connect.Response[sandrunv1.WriteDevSessionFileResponse]{nil, {}} {
+		err := checkWriteAcknowledgement(&sandrunv1.WriteDevSessionFileRequest{WriteId: "test"}, reply)
+		if connect.CodeOf(err) != connect.CodeDataLoss || connect.IsWireError(err) || !strings.Contains(err.Error(), "missing") {
+			t.Errorf("upload error = %v, want local data_loss for a missing acknowledgement", err)
+		}
+	}
 }
 
 func requireTransferDeadline(t *testing.T, caller context.Context, err error) {
@@ -166,16 +268,19 @@ func TestTransferWriteResumeAndNextChunkBudget(t *testing.T) {
 		if err := sleep(ctx, 375*time.Millisecond); err != nil {
 			return nil, err
 		}
-		return connect.NewResponse(&sandrunv1.WriteDevSessionFileResponse{}), nil
+		return connect.NewResponse(writeAcknowledgement(req.Msg)), nil
 	}})
 	c.timing.retryBudget = budget
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
 	defer cancel()
 	start := time.Now()
 	data := strings.Repeat("a", ChunkSize) + "z"
-	n, err := c.writeGuestFile(ctx, &sandrunv1.DevSession{}, "/test", 0o640, strings.NewReader(data), nil)
-	if err != nil || n != int64(len(data)) || calls.Load() != 3 || time.Since(start) <= budget {
-		t.Fatalf("wrote %d bytes in %d requests: %v", n, calls.Load(), err)
+	var progress []int64
+	n, err := c.writeGuestFile(ctx, &sandrunv1.DevSession{}, "/test", 0o640, strings.NewReader(data),
+		func(done int64) { progress = append(progress, done) })
+	if err != nil || n != int64(len(data)) || calls.Load() != 3 || time.Since(start) <= budget ||
+		!slices.Equal(progress, []int64{ChunkSize, ChunkSize + 1}) {
+		t.Fatalf("wrote %d bytes in %d requests with progress %v: %v", n, calls.Load(), progress, err)
 	}
 	first, retry, last := <-requests, <-requests, <-requests
 	if first.GetWriteId() == "" || !proto.Equal(first, retry) || first.GetOffset() != 0 || first.GetFinal() || string(first.GetData()) != data[:ChunkSize] {
@@ -357,6 +462,72 @@ func TestSyncUploadDeadlineReleasesLock(t *testing.T) {
 	requireTransferDeadline(t, ctx, err)
 	if _, err := os.Stat(lock); !errors.Is(err, os.ErrNotExist) || calls.Load() != 1 {
 		t.Errorf("stat of lock after stalled upload = %v, upload attempts = %d", err, calls.Load())
+	}
+}
+
+func TestSyncRejectsInvalidWriteAcknowledgement(t *testing.T) {
+	needPOSIX(t)
+	for _, target := range []string{"archive", "manifest"} {
+		t.Run(target, func(t *testing.T) {
+			upstream, srv, org := newTestClient(t, "")
+			ds := newSession(t, upstream, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+			const content = "local sync input"
+			local := newRepo(t, map[string]string{"fixture.txt": content}, nil, "")
+			var mismatches atomic.Int32
+			c := transferTestClient(t, srv.URL, transferHandlers{write: func(ctx context.Context, req *connect.Request[sandrunv1.WriteDevSessionFileRequest]) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
+				if strings.HasSuffix(req.Msg.GetPath(), manifestSuffix) && target == "manifest" {
+					ack := writeAcknowledgement(req.Msg)
+					ack.Finished = false
+					mismatches.Add(1)
+					return connect.NewResponse(ack), nil
+				}
+				reply, err := upstream.DevSessions().WriteDevSessionFile(ctx, connect.NewRequest(req.Msg))
+				if err == nil && target == "archive" && strings.HasSuffix(req.Msg.GetPath(), ".tar") {
+					reply.Msg.Length++
+					mismatches.Add(1)
+				}
+				return reply, err
+			}})
+			var phases []TransferPhase
+			res, err := c.Sync(t.Context(), SyncParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: local,
+				Progress: func(p TransferProgress) { phases = append(phases, p.Phase) },
+			})
+			field := "length"
+			if target == "manifest" {
+				field = "finished"
+			}
+			if res != nil || connect.CodeOf(err) != connect.CodeDataLoss || !strings.Contains(err.Error(), field) || mismatches.Load() != 1 {
+				t.Fatalf("sync = %+v, %v, %d malformed replies, want one local data_loss for %s", res, err, mismatches.Load(), field)
+			}
+			if slices.Contains(phases, TransferDone) {
+				t.Errorf("sync reported completion: %v", phases)
+			}
+			applies := 0
+			for _, req := range srv.ExecRequests() {
+				if env := req.GetEnv(); env[guestEnvWorkspace] != "" && env[guestEnvArchive] != "" {
+					applies++
+				}
+			}
+			ws := ds.GetWorkspacePath()
+			if target == "archive" {
+				if applies != 0 || slices.Contains(phases, TransferUploading) || slices.Contains(phases, TransferApplying) {
+					t.Errorf("sync applied or counted the unacknowledged archive: %d apply calls, phases %v", applies, phases)
+				}
+				if _, err := os.Stat(filepath.Join(ws, "fixture.txt")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("archive input was applied: %v", err)
+				}
+			} else {
+				if applies != 1 || !slices.Contains(phases, TransferApplying) || readGuest(t, ds, "fixture.txt") != content {
+					t.Errorf("sync did not apply before the manifest write: %d apply calls, phases %v", applies, phases)
+				}
+			}
+			for _, suffix := range []string{manifestSuffix, lockSuffix} {
+				if _, err := os.Stat(ws + suffix); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("unexpected guest path with suffix %s: %v", suffix, err)
+				}
+			}
+		})
 	}
 }
 

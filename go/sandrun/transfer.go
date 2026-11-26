@@ -66,9 +66,9 @@ type TransferProgress struct {
 
 // writeGuestFile uploads r to the guest path with WriteDevSessionFile in
 // chunks of at most 1 MiB that share one write_id; the last chunk has final
-// set. An empty r writes an empty file. Transient failures of a chunk are
-// retried with the same write_id and offset. progress receives the bytes
-// written so far.
+// set. An empty r writes an empty file. Transient RPC failures are retried
+// with the same chunk request. progress receives the bytes confirmed by
+// valid write acknowledgements.
 func (c *Client) writeGuestFile(ctx context.Context, s *sandrunv1.DevSession, path string, mode uint32, r io.Reader, progress func(int64)) (int64, error) {
 	writeID, err := uuidv7.NewString()
 	if err != nil {
@@ -288,10 +288,13 @@ func (c *Client) writeGuestChunk(ctx context.Context, req *sandrunv1.WriteDevSes
 		if err := window.check(false); err != nil {
 			return err
 		}
-		_, err := c.devSessions.WriteDevSessionFile(window.ctx, connect.NewRequest(req))
+		reply, err := c.devSessions.WriteDevSessionFile(window.ctx, connect.NewRequest(req))
 		retry := transient(ctx, err)
 		if ctxErr := window.check(false); ctxErr != nil {
 			return ctxErr
+		}
+		if err == nil {
+			return checkWriteAcknowledgement(req, reply)
 		}
 		if !retry {
 			return err
@@ -302,6 +305,30 @@ func (c *Client) writeGuestChunk(ctx context.Context, req *sandrunv1.WriteDevSes
 			return transferContextError(window.ctx)
 		}
 	}
+}
+
+func checkWriteAcknowledgement(req *sandrunv1.WriteDevSessionFileRequest, reply *connect.Response[sandrunv1.WriteDevSessionFileResponse]) error {
+	if reply == nil || reply.Msg == nil {
+		return localError(connect.CodeDataLoss, errorf("missing guest file write acknowledgement"))
+	}
+	ack := reply.Msg
+	length := int64(len(req.GetData()))
+	var field string
+	switch {
+	case ack.GetWriteId() != req.GetWriteId():
+		field = "write_id"
+	case ack.GetOffset() != req.GetOffset():
+		field = "offset"
+	case ack.GetLength() != length:
+		field = "length"
+	case ack.GetFinished() != req.GetFinal():
+		field = "finished"
+	case req.GetFinal() && ack.GetSizeBytes() != req.GetOffset()+length:
+		field = "size_bytes"
+	default:
+		return nil
+	}
+	return localError(connect.CodeDataLoss, errorf("guest file write acknowledgement mismatch for %s", field))
 }
 
 // runningSession reads the dev session and checks that it is RUNNING and
