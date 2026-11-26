@@ -460,10 +460,12 @@ func (x *GetBillingStatusRequest) GetOrganizationId() string {
 }
 
 type GetBillingStatusResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Billing       *OrganizationBilling   `protobuf:"bytes,1,opt,name=billing,proto3" json:"billing,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Billing *OrganizationBilling   `protobuf:"bytes,1,opt,name=billing,proto3" json:"billing,omitempty"`
+	// Set only for the organization owner when an account is linked.
+	BillingAccountId *string `protobuf:"bytes,2,opt,name=billing_account_id,json=billingAccountId,proto3,oneof" json:"billing_account_id,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *GetBillingStatusResponse) Reset() {
@@ -501,6 +503,13 @@ func (x *GetBillingStatusResponse) GetBilling() *OrganizationBilling {
 		return x.Billing
 	}
 	return nil
+}
+
+func (x *GetBillingStatusResponse) GetBillingAccountId() string {
+	if x != nil && x.BillingAccountId != nil {
+		return *x.BillingAccountId
+	}
+	return ""
 }
 
 type GetBillingUsageRequest struct {
@@ -851,8 +860,10 @@ func (x *LinkBillingAccountResponse) GetBillingAccountName() string {
 type UnlinkBillingAccountRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// When set, unlink only if this is the current billing account.
+	ExpectedBillingAccountId *string `protobuf:"bytes,2,opt,name=expected_billing_account_id,json=expectedBillingAccountId,proto3,oneof" json:"expected_billing_account_id,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *UnlinkBillingAccountRequest) Reset() {
@@ -888,6 +899,13 @@ func (*UnlinkBillingAccountRequest) Descriptor() ([]byte, []int) {
 func (x *UnlinkBillingAccountRequest) GetOrganizationId() string {
 	if x != nil {
 		return x.OrganizationId
+	}
+	return ""
+}
+
+func (x *UnlinkBillingAccountRequest) GetExpectedBillingAccountId() string {
+	if x != nil && x.ExpectedBillingAccountId != nil {
+		return *x.ExpectedBillingAccountId
 	}
 	return ""
 }
@@ -957,9 +975,11 @@ const file_delino_ownsand_v1_billing_proto_rawDesc = "" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x129\n" +
 	"\x04role\x18\x03 \x01(\x0e2%.delino.ownsand.v1.BillingAccountRoleR\x04role\"B\n" +
 	"\x17GetBillingStatusRequest\x12'\n" +
-	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\"\\\n" +
+	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\"\xa6\x01\n" +
 	"\x18GetBillingStatusResponse\x12@\n" +
-	"\abilling\x18\x01 \x01(\v2&.delino.ownsand.v1.OrganizationBillingR\abilling\"A\n" +
+	"\abilling\x18\x01 \x01(\v2&.delino.ownsand.v1.OrganizationBillingR\abilling\x121\n" +
+	"\x12billing_account_id\x18\x02 \x01(\tH\x00R\x10billingAccountId\x88\x01\x01B\x15\n" +
+	"\x13_billing_account_id\"A\n" +
 	"\x16GetBillingUsageRequest\x12'\n" +
 	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\"\xad\x02\n" +
 	"\x17GetBillingUsageResponse\x12,\n" +
@@ -982,9 +1002,11 @@ const file_delino_ownsand_v1_billing_proto_rawDesc = "" +
 	"\x12billing_account_id\x18\x02 \x01(\tR\x10billingAccountId\"\x90\x01\n" +
 	"\x1aLinkBillingAccountResponse\x12@\n" +
 	"\abilling\x18\x01 \x01(\v2&.delino.ownsand.v1.OrganizationBillingR\abilling\x120\n" +
-	"\x14billing_account_name\x18\x02 \x01(\tR\x12billingAccountName\"F\n" +
+	"\x14billing_account_name\x18\x02 \x01(\tR\x12billingAccountName\"\xaa\x01\n" +
 	"\x1bUnlinkBillingAccountRequest\x12'\n" +
-	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\"`\n" +
+	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x12B\n" +
+	"\x1bexpected_billing_account_id\x18\x02 \x01(\tH\x00R\x18expectedBillingAccountId\x88\x01\x01B\x1e\n" +
+	"\x1c_expected_billing_account_id\"`\n" +
 	"\x1cUnlinkBillingAccountResponse\x12@\n" +
 	"\abilling\x18\x01 \x01(\v2&.delino.ownsand.v1.OrganizationBillingR\abilling*\x80\x01\n" +
 	"\fBillingPhase\x12\x1d\n" +
@@ -1080,6 +1102,8 @@ func file_delino_ownsand_v1_billing_proto_init() {
 		return
 	}
 	file_delino_ownsand_v1_common_proto_init()
+	file_delino_ownsand_v1_billing_proto_msgTypes[4].OneofWrappers = []any{}
+	file_delino_ownsand_v1_billing_proto_msgTypes[11].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

@@ -9,6 +9,7 @@ import {
 import type {
   LinkBillingAccountRequest,
   ListLinkableBillingAccountsResponse,
+  UnlinkBillingAccountRequest,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import {
   MemberService,
@@ -298,6 +299,13 @@ export function createMockTransport(): Transport {
             },
           };
         }
+      }
+      if (method.name === "UnlinkBillingAccount") {
+        const request = input as UnlinkBillingAccountRequest;
+        recordToken(
+          "ownsand-e2e-billing-unlink-requests",
+          request.expectedBillingAccountId ?? "",
+        );
       }
       if (method.name === "LinkBillingAccount") {
         const { billingAccountId } =

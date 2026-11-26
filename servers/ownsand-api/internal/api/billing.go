@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"connectrpc.com/connect"
@@ -150,7 +151,8 @@ func (h BillingHandler) GetBillingStatus(ctx context.Context, req *connect.Reque
 	if err != nil {
 		return nil, err
 	}
-	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionReadBillingStatus); err != nil {
+	_, role, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionReadBillingStatus)
+	if err != nil {
 		return nil, err
 	}
 	statuses, err := h.statuses()
@@ -161,7 +163,11 @@ func (h BillingHandler) GetBillingStatus(ctx context.Context, req *connect.Reque
 	if err != nil {
 		return nil, h.internal(ctx, "get billing status", err)
 	}
-	return connect.NewResponse(&ownsandv1.GetBillingStatusResponse{Billing: st.Proto(h.now())}), nil
+	out := &ownsandv1.GetBillingStatusResponse{Billing: st.Proto(h.now())}
+	if role == ownsandv1.Role_ROLE_OWNER && st.Linked() {
+		out.BillingAccountId = &st.BillingAccountID
+	}
+	return connect.NewResponse(out), nil
 }
 
 func (h BillingHandler) GetBillingUsage(ctx context.Context, req *connect.Request[ownsandv1.GetBillingUsageRequest]) (*connect.Response[ownsandv1.GetBillingUsageResponse], error) {
@@ -547,6 +553,9 @@ func (h BillingHandler) UnlinkBillingAccount(ctx context.Context, req *connect.R
 		}
 		if !ok {
 			return errNotFound("organization")
+		}
+		if expected := req.Msg.ExpectedBillingAccountId; expected != nil && (!cur.Linked() || !strings.EqualFold(*expected, cur.BillingAccountID)) {
+			return connect.NewError(connect.CodeFailedPrecondition, errors.New("the linked billing account changed; review the current account and confirm again"))
 		}
 		if !cur.Linked() {
 			// No local link, but a link attempt with an unknown outcome, an

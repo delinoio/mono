@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
-import { Code, ConnectError, type Transport } from "@connectrpc/connect";
+import {
+  Code,
+  ConnectError,
+  createClient,
+  type Transport,
+} from "@connectrpc/connect";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
+import {
+  BillingService,
+  type UnlinkBillingAccountRequest,
+} from "@delino/ownsand-protos/v1/billing_pb";
+import { QueryClient } from "@tanstack/react-query";
 import {
   act,
   cleanup,
@@ -142,6 +153,127 @@ describe("the unlink action without usage", () => {
     expect(
       within(section).queryByRole("button", { name: "Try again" }),
     ).toBeNull();
+  });
+
+  test("a stale confirmation keeps its original target and requires a new opening", async () => {
+    const mock = createMockTransport();
+    const client = createClient(BillingService, mock);
+    const organizationId = MOCK_IDS.acme;
+    const { billingAccountId: accountA } = await client.getBillingStatus({
+      organizationId,
+    });
+    const accounts = await client.listLinkableBillingAccounts({
+      organizationId,
+    });
+    const accountB = accounts.billingAccounts.find(
+      (account) => account.billingAccountId !== accountA,
+    )!;
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const requestedIds: (string | undefined)[] = [];
+    let statusCalls = 0;
+    let failUsage = false;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "GetBillingStatus") statusCalls++;
+        if (method.name === "GetBillingUsage" && failUsage) {
+          throw new ConnectError("usage is unavailable", Code.Unavailable);
+        }
+        if (method.name === "UnlinkBillingAccount") {
+          requestedIds.push(
+            (rest[3] as UnlinkBillingAccountRequest).expectedBillingAccountId,
+          );
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    renderConsole(SETTINGS, { transport, queryClient });
+    const section = await billing();
+    await within(section).findByText("Acme Robotics billing", undefined, WAIT);
+    const unlink = () =>
+      within(section).getByRole("button", { name: "Unlink billing account" });
+    const confirm = (dialog: HTMLElement) =>
+      click(
+        within(dialog).getByRole("button", { name: "Unlink billing account" }),
+      );
+
+    await click(unlink());
+    const opening = await screen.findByRole("alertdialog", {
+      name: "Unlink Acme Robotics billing?",
+    });
+    await client.unlinkBillingAccount({ organizationId });
+    await client.linkBillingAccount({
+      organizationId,
+      billingAccountId: accountB.billingAccountId,
+    });
+    await act(async () => {
+      await queryClient.invalidateQueries({
+        queryKey: createConnectQueryKey({
+          schema: BillingService.method.getBillingStatus,
+          cardinality: undefined,
+        }),
+      });
+    });
+    expect(within(section).getByText("Acme Robotics billing")).toBeTruthy();
+    expect(
+      within(opening).getByRole("heading", {
+        name: "Unlink Acme Robotics billing?",
+      }),
+    ).toBeTruthy();
+
+    failUsage = true;
+    const priorStatusCalls = statusCalls;
+    await confirm(opening);
+    await screen.findByText(
+      "The linked billing account changed. Review the current account and confirm again.",
+    );
+    await waitFor(
+      () => expect(screen.queryByRole("alertdialog")).toBeNull(),
+      WAIT,
+    );
+    expect(statusCalls).toBeGreaterThan(priorStatusCalls);
+    expect(requestedIds).toEqual([accountA]);
+    expect(
+      (await client.getBillingStatus({ organizationId })).billingAccountId,
+    ).toBe(accountB.billingAccountId);
+
+    await click(unlink());
+    const newOpening = await screen.findByRole("alertdialog", {
+      name: "Unlink the billing account?",
+    });
+    await confirm(newOpening);
+    await within(section).findByRole(
+      "button",
+      { name: "Link a billing account" },
+      WAIT,
+    );
+    expect(requestedIds).toEqual([accountA, accountB.billingAccountId]);
+  });
+
+  test("the owner cannot confirm with a status that has no linked account ID", async () => {
+    const mock = createMockTransport();
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        const response = await mock.unary(method, ...rest);
+        return method.name === "GetBillingStatus"
+          ? {
+              ...response,
+              message: { ...response.message, billingAccountId: undefined },
+            }
+          : response;
+      },
+    };
+    renderConsole(SETTINGS, { transport });
+    const section = await billing();
+    const unlink = await within(section).findByRole("button", {
+      name: "Unlink billing account",
+    });
+    expect((unlink as HTMLButtonElement).disabled).toBe(true);
+    await click(unlink);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 
   test("a failed unlink keeps the confirmation open with the error", async () => {
