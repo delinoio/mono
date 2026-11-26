@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  rs,
+  test,
+} from "@rstest/core";
 import {
   act,
   cleanup,
@@ -225,11 +232,11 @@ describe("sign-in that fails before the redirect (real SDK)", () => {
   );
 
   test(
-    "the ended-session notice shows the alert and a token error does not",
+    "sign-in from the ended-session notice shows the alert and recovers on retry",
     async () => {
       storeSession();
-      // Discovery works for the token request, which the token endpoint
-      // rejects: this error is not a sign-in failure.
+      // Allow discovery so the SDK reaches the token endpoint and receives
+      // the expired-session error.
       discoveryWorks = true;
       renderAt("/");
       await screen.findByText(
@@ -239,11 +246,48 @@ describe("sign-in that fails before the redirect (real SDK)", () => {
       );
       expect(tokenRequests).toBeGreaterThan(0);
       expect(screen.queryByText(FAILURE_TEXT)).toBeNull();
-      // The sign-in starts, so the token error of before is not its failure.
+
+      // The token request cached discovery. Fail the next PKCE digest to stop
+      // sign-in before the SDK saves a session or navigates.
+      const digestError = new Error("test PKCE digest failure");
+      const digest = rs
+        .spyOn(globalThis.crypto.subtle, "digest")
+        .mockRejectedValueOnce(digestError);
+      try {
+        await click("Sign in with Delino");
+        const alert = await screen.findByText(
+          FAILURE_TEXT,
+          {},
+          { timeout: SDK_WAIT_MS },
+        );
+        expect(alert.getAttribute("role")).toBe("alert");
+        expect(digest).toHaveBeenCalledTimes(1);
+        expect(document.body.textContent).not.toContain(digestError.message);
+        expect(
+          (
+            screen.getByRole("button", {
+              name: "Sign in with Delino",
+            }) as HTMLButtonElement
+          ).disabled,
+        ).toBe(false);
+        expect(window.location.href).toBe(APP_URL);
+        expect(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)).toBeNull();
+      } finally {
+        digest.mockRestore();
+      }
+
       await click("Sign in with Delino");
       await expectRedirectStarted();
       expect(screen.queryByText(FAILURE_TEXT)).toBeNull();
+      expect(
+        JSON.parse(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)!)
+          .redirectUri,
+      ).toBe(`${new URL(APP_URL).origin}/callback`);
+      const authorizationUrl = new URL(window.location.href);
+      expect(authorizationUrl.origin + authorizationUrl.pathname).toBe(
+        `${LOGTO_ENDPOINT}/oidc/auth`,
+      );
     },
-    TEST_TIMEOUT_MS,
+    TEST_TIMEOUT_MS + SDK_WAIT_MS,
   );
 });
