@@ -205,7 +205,11 @@ function deploy(
     DROPLET_HEALTH_TIMEOUT: "3",
     ...env,
   };
-  if (idSource !== null) spawnEnv.DROPLET_ID_SOURCE = idSource ?? source;
+  if (idSource === null) {
+    delete spawnEnv.DROPLET_ID_SOURCE;
+  } else {
+    spawnEnv.DROPLET_ID_SOURCE = idSource ?? source;
+  }
   const result = spawnSync(
     "bash",
     [

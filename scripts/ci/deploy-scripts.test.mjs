@@ -36,6 +36,11 @@ const guard = join(root, "scripts/ci/check-pending-changesets.sh");
 const release = join(root, "scripts/ci/deploy-release.sh");
 const recovery = join(root, "scripts/ci/release-recovery.sh");
 const baseEnv = isolateGitEnvironment({ ...process.env });
+const targetsEnv = { ...baseEnv };
+delete targetsEnv.BUILD_VARIABLES;
+delete targetsEnv.SITES_ROOT;
+const dropletEnv = { ...baseEnv };
+delete dropletEnv.DROPLET_STOP_TIMEOUT;
 const provider = join(root, "scripts/ci/deploy-provider.sh");
 // The scripts need Bash 4.4 or newer (`mapfile`, empty arrays under `set -u`);
 // macOS ships Bash 3.2.
@@ -1903,7 +1908,7 @@ function runTargets(
     cwd: dir,
     encoding: "utf8",
     env: {
-      ...baseEnv,
+      ...targetsEnv,
       PATH: `${bin}${delimiter}${baseEnv.PATH}`,
       GITHUB_STEP_SUMMARY: summary,
       STUB_DIR: dir,
@@ -2200,7 +2205,7 @@ test(
       cwd: dir,
       encoding: "utf8",
       env: {
-        ...baseEnv,
+        ...targetsEnv,
         SITES: JSON.stringify([
           {
             name: "docs",
@@ -2523,7 +2528,7 @@ esac`,
   const calls = () =>
     readFileSync(join(dir, "calls.log"), "utf8").trim().split("\n");
   const spawnEnv = (env = {}) => ({
-    ...baseEnv,
+    ...dropletEnv,
     PATH: `${bin}${delimiter}${baseEnv.PATH}`,
     STUB_DIR: dir,
     DROPLET_ROOT: deployRoot,
