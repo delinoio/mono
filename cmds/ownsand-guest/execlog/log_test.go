@@ -127,6 +127,47 @@ func TestCursorTruncatedAfterStarted(t *testing.T) {
 	}
 }
 
+func TestCursorNextPreservesReadyEventsOnCancellation(t *testing.T) {
+	l := New("e", 64)
+	l.Start(time.Now())
+	l.WriteStdout([]byte("abc"))
+	l.Finish(exited(3), time.Now())
+	c := l.Cursor(0, 0)
+
+	ctx := t.Context()
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if ev, err := c.Next(canceled, 0); ev != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled before start: event %v, error %v", ev, err)
+	}
+	if ev, err := c.Next(ctx, 0); err != nil || ev.GetStarted().GetExecId() != "e" {
+		t.Fatalf("retried start: event %v, error %v", ev, err)
+	}
+
+	expired, stop := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+	defer stop()
+	if ev, err := c.Next(expired, 0); ev != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired before stdout: event %v, error %v", ev, err)
+	}
+	if stdout, stderr := c.Offsets(); stdout != 0 || stderr != 0 {
+		t.Fatalf("offsets after deadline: stdout %d, stderr %d", stdout, stderr)
+	}
+	ev, err := c.Next(ctx, 0)
+	if stdout := ev.GetStdout(); err != nil || stdout.GetOffset() != 0 || string(stdout.GetData()) != "abc" {
+		t.Fatalf("retried stdout: event %v, error %v", ev, err)
+	}
+
+	if ev, err := c.Next(canceled, 0); ev != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled before exit: event %v, error %v", ev, err)
+	}
+	if ev, err := c.Next(ctx, 0); err != nil || ev.GetExited().GetExitCode() != 3 {
+		t.Fatalf("retried exit: event %v, error %v", ev, err)
+	}
+	if ev, err := c.Next(canceled, 0); ev != nil || !errors.Is(err, io.EOF) {
+		t.Fatalf("canceled after exit: event %v, error %v", ev, err)
+	}
+}
+
 func TestCursorWaitsAndKeepalive(t *testing.T) {
 	l := New("e", 64)
 	c := l.Cursor(0, 0)

@@ -19,11 +19,25 @@ import (
 
 // shutdownRig is a server whose Run the test ends itself.
 type shutdownRig struct {
-	srv    *Server
-	client ownsandv1connect.GuestServiceClient
-	stop   context.CancelFunc
+	srv            *Server
+	client         ownsandv1connect.GuestServiceClient
+	stop           context.CancelFunc
+	listenerClosed <-chan struct{}
 	// result receives the return value of Run.
 	result chan error
+}
+
+type shutdownListener struct {
+	net.Listener
+	closed chan struct{}
+}
+
+func (l *shutdownListener) Close() error {
+	err := l.Listener.Close()
+	if err == nil {
+		close(l.closed)
+	}
+	return err
 }
 
 func startShutdownRig(t *testing.T) *shutdownRig {
@@ -36,12 +50,13 @@ func startShutdownRig(t *testing.T) *shutdownRig {
 	if err != nil {
 		t.Fatal(err)
 	}
+	listener := &shutdownListener{Listener: l, closed: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		result <- srv.Run(ctx, l)
+		result <- srv.Run(ctx, listener)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -66,7 +81,36 @@ func startShutdownRig(t *testing.T) *shutdownRig {
 			return d.DialContext(ctx, "tcp", l.Addr().String())
 		},
 	}}
-	return &shutdownRig{srv: srv, client: ownsandv1connect.NewGuestServiceClient(hc, "http://guest"), stop: cancel, result: result}
+	return &shutdownRig{
+		srv:            srv,
+		client:         ownsandv1connect.NewGuestServiceClient(hc, "http://guest"),
+		stop:           cancel,
+		listenerClosed: listener.closed,
+		result:         result,
+	}
+}
+
+func (rig *shutdownRig) waitForShutdownWithOpenRequest(t *testing.T, observation time.Duration) {
+	t.Helper()
+	select {
+	case <-rig.listenerClosed:
+	case err := <-rig.result:
+		t.Fatalf("Run returned %v before listener closure was observed", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener did not close after shutdown was requested")
+	}
+
+	select {
+	case err := <-rig.result:
+		t.Fatalf("Run returned %v while the request was blocked during shutdown", err)
+	case <-time.After(observation):
+	}
+	// The timer and Run can both be ready when the test goroutine resumes.
+	select {
+	case err := <-rig.result:
+		t.Fatalf("Run returned %v while the request was blocked during shutdown", err)
+	default:
+	}
 }
 
 // setShutdownGrace replaces the grace period for the test.
@@ -189,11 +233,7 @@ func TestRunWriteShutdownLockHandoff(t *testing.T) {
 				requireStateDirBusy(t, dir)
 				release()
 			} else {
-				select {
-				case err := <-rig.result:
-					t.Fatalf("Run returned %v while the write was blocked", err)
-				case <-time.After(50 * time.Millisecond):
-				}
+				rig.waitForShutdownWithOpenRequest(t, 50*time.Millisecond)
 				release()
 				f := s.recv()
 				if resp := f.GetFileWriteResult(); !resp.GetFinished() || resp.GetSizeBytes() != 1 {

@@ -17,13 +17,12 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// escalationProbe replaces the grace timer and the process-group operations of
-// a pending SIGKILL. The timer is held until release, and the signal calls are
-// recorded and never sent, so a test controls the order of the events without
-// a wall clock.
+// escalationProbe controls grace timer and poll delivery and records SIGKILL
+// calls without sending a signal.
 type escalationProbe struct {
 	timerStarted chan time.Duration
 	fire         chan time.Time
+	poll         chan time.Time
 	alive        atomic.Bool
 	probes       atomic.Int64
 	timerStops   atomic.Int64
@@ -35,17 +34,18 @@ func newEscalationProbe(h *harness, alive bool) *escalationProbe {
 	p := &escalationProbe{
 		timerStarted: make(chan time.Duration, 1),
 		fire:         make(chan time.Time, 1),
+		poll:         make(chan time.Time, 3),
 	}
 	p.alive.Store(alive)
 	h.srv.execs.mu.Lock()
 	h.srv.execs.killGrace = time.Hour
-	// A short poll lets the test observe that the escalation is running
-	// while its timer is held.
-	h.srv.execs.groupPoll = time.Millisecond
 	h.srv.execs.escalationHooks = escalationHooks{
 		graceTimer: func(d time.Duration) (<-chan time.Time, func() bool) {
 			p.timerStarted <- d
 			return p.fire, func() bool { p.timerStops.Add(1); return true }
+		},
+		pollTicker: func(time.Duration) (<-chan time.Time, func()) {
+			return p.poll, func() {}
 		},
 		groupAlive: func(*os.Process) bool {
 			p.probes.Add(1)
@@ -61,13 +61,36 @@ func newEscalationProbe(h *harness, alive bool) *escalationProbe {
 	// A test that fails while the timer is held must not leave the
 	// escalation goroutine behind.
 	h.t.Cleanup(func() {
-		select {
-		case p.fire <- time.Time{}:
-		default:
-		}
-		h.srv.execs.escalations.Wait()
+		close(p.fire)
+		waitForEscalation(h.t, &h.srv.execs.escalations)
 	})
 	return p
+}
+
+func (p *escalationProbe) waitForTimerStart(t *testing.T) {
+	t.Helper()
+	select {
+	case d := <-p.timerStarted:
+		if d != time.Hour {
+			t.Fatalf("grace timer started with %v", d)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the escalation did not start its grace timer")
+	}
+}
+
+func waitForEscalation(t *testing.T, escalations *sync.WaitGroup) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		escalations.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the escalation did not finish")
+	}
 }
 
 func (p *escalationProbe) killCalls() []*os.Process {
@@ -160,18 +183,13 @@ func TestExecTimeoutEscalationKillsGroupOnlyAfterGraceTimer(t *testing.T) {
 	if !ex.GetTimedOut() {
 		t.Fatalf("exited %v", ex)
 	}
-	select {
-	case d := <-p.timerStarted:
-		if d != time.Hour {
-			t.Fatalf("grace timer started with %v", d)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("the escalation did not start its grace timer")
-	}
+	p.waitForTimerStart(t)
 	// The escalation polls the group while its timer is held, and it must
 	// not signal the group in that time.
-	base := p.probes.Load()
-	waitFor(t, "group polls while the timer is held", func() bool { return p.probes.Load() >= base+3 })
+	for range cap(p.poll) {
+		p.poll <- time.Time{}
+	}
+	waitFor(t, "group polls while the timer is held", func() bool { return p.probes.Load() >= int64(cap(p.poll)) })
 	if n := len(p.killCalls()); n != 0 {
 		t.Fatalf("%d SIGKILL calls while the grace timer was held", n)
 	}
@@ -180,7 +198,7 @@ func TestExecTimeoutEscalationKillsGroupOnlyAfterGraceTimer(t *testing.T) {
 	}
 
 	p.fire <- time.Now()
-	h.srv.execs.escalations.Wait()
+	waitForEscalation(t, &h.srv.execs.escalations)
 	kills := p.killCalls()
 	if len(kills) != 1 || kills[0] == nil || kills[0].Pid <= 0 {
 		t.Fatalf("kill calls after the grace timer fired: %v", kills)
@@ -196,15 +214,16 @@ func TestExecTimeoutEscalationSkipsKillWhenGroupGoneAtGraceTimer(t *testing.T) {
 	if ex := evs[len(evs)-1].GetExited(); !ex.GetTimedOut() {
 		t.Fatalf("exited %v", ex)
 	}
-	<-p.timerStarted
-	base := p.probes.Load()
-	waitFor(t, "group polls while the timer is held", func() bool { return p.probes.Load() >= base+1 })
-	// The escalation can end on its own once a poll finds the group empty;
-	// both endings must leave no SIGKILL behind.
+	p.waitForTimerStart(t)
+	// Keep the poll channel empty so only the grace timer can trigger a
+	// group liveness check.
 	p.alive.Store(false)
-	p.fire <- time.Now()
-	h.srv.execs.escalations.Wait()
+	p.fire <- time.Time{}
+	waitForEscalation(t, &h.srv.execs.escalations)
 	if n := len(p.killCalls()); n != 0 {
 		t.Fatalf("%d SIGKILL calls for an empty group", n)
+	}
+	if n := p.probes.Load(); n != 1 {
+		t.Fatalf("grace timer checked group liveness %d times, want 1", n)
 	}
 }

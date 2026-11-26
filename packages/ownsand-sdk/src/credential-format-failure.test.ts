@@ -142,19 +142,21 @@ describe("a cancellation while the access token callback is pending", () => {
     );
     const abort = new AbortController();
     const reason = new Error("caller gave up");
-    let error: any;
     const unhandled = await collectUnhandled(async () => {
-      const outcome = h.clock
-        .run(client.sandbox(SANDBOX).get(abort.signal))
+      const outcome = client
+        .sandbox(SANDBOX)
+        .get(abort.signal)
         .catch((e) => e);
       await h.clock.settle();
+      expect(rejectToken).toBeDefined();
       abort.abort(reason);
-      error = await outcome;
+      const error = await h.clock.run(outcome);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(Code.Canceled);
+      expect(error.cause).toBe(reason);
       rejectToken(unformattable());
       await h.clock.settle();
     });
-    expect(error).not.toBeInstanceOf(OwnSandCredentialError);
-    expect(error?.cause).not.toBeInstanceOf(OwnSandCredentialError);
     expect(h.api.calls).toHaveLength(0);
     expect(unhandled).toEqual([]);
   });

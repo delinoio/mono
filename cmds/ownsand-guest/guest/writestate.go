@@ -166,12 +166,15 @@ func saveWriteRecord(e *writeEntry, durable bool) error {
 	return nil
 }
 
+// Tests replace removeRecordFile to fail record removal without blocking reads.
+var removeRecordFile = os.Remove
+
 // removeWriteRecord removes a record if it exists.
 func removeWriteRecord(path string) error {
 	if path == "" {
 		return nil
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := removeRecordFile(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -196,8 +199,9 @@ var promoteWriteRecord = os.Rename
 
 // loadRecords registers the writes of an earlier helper process. It loads a
 // validated first record from its temporary path if promotion fails. It drops
-// unreadable records and records whose staging file is confirmed gone. It
-// clamps the last chunk time to now to handle a guest clock set backwards.
+// unreadable records. If staging is absent and the record cannot be removed,
+// it reserves the ID for a record-only retry. It clamps the last chunk time
+// to now to handle a guest clock set backwards.
 func (m *writeManager) loadRecords() error {
 	if m.dir == "" {
 		return nil
@@ -243,9 +247,16 @@ func (m *writeManager) loadRecords() error {
 		}
 		if _, err := lstatStaging(rec.TmpPath); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				m.logger.Info("drop write record without staging file", "write_id", rec.WriteID)
 				if err := removeWriteRecord(path); err != nil {
 					m.logger.Warn("remove write record failed", "write_id", rec.WriteID, "error", sanitizedError(err))
+					m.entries[rec.WriteID] = &writeEntry{
+						id:         rec.WriteID,
+						gone:       true,
+						recordPath: path,
+						recordOnly: true,
+					}
+				} else {
+					m.logger.Info("drop write record without staging file", "write_id", rec.WriteID)
 				}
 				continue
 			}
@@ -372,10 +383,10 @@ func readWriteRecord(path string) (writeRecord, error) {
 // cleanup removes the staging file of an expired write when it still is the
 // file that the helper created, then the record. It returns the first error
 // and keeps the record when the staging file stays, so a retry has what it
-// needs. A finished write has no staging file any more and only loses its
-// record.
+// needs. For a finished write or a record whose staging file was absent at
+// startup, cleanup only removes the record.
 func (m *writeManager) cleanup(e *writeEntry) error {
-	if !e.finished {
+	if !e.finished && !e.recordOnly {
 		if err := m.removeStaging(e); err != nil {
 			return err
 		}

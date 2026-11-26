@@ -19,6 +19,14 @@ import (
 // was closed, and by one whose session setup was still running at Close.
 var errHandleClosed = errors.New("ownsand: sandbox handle closed")
 
+// closedHandleError preserves the caller's context error if it has also ended.
+func closedHandleError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errHandleClosed
+}
+
 // dataPath selects the transport of one sandbox handle: one peer-to-peer
 // session shared by all operations, or the relay after an ICE failure or a
 // session that could not open.
@@ -29,8 +37,8 @@ type dataPath struct {
 	// not a mutex, so an operation that waits for the setup of another
 	// operation can stop waiting when its own context ends.
 	openSlot chan struct{}
-	// done is closed by close. It wakes the operations that wait for the
-	// setup slot and cancels the setup that is in flight.
+	// done is closed by close. It wakes setup waiters and peer exec
+	// receivers, and cancels the setup that is in flight.
 	done chan struct{}
 
 	mu     sync.Mutex
@@ -57,7 +65,7 @@ func (d *dataPath) acquireOpen(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-d.done:
-		return errHandleClosed
+		return closedHandleError(ctx)
 	}
 }
 
@@ -125,7 +133,7 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 		if err == nil {
 			sess.close()
 		}
-		return nil, errHandleClosed
+		return nil, closedHandleError(ctx)
 	}
 	if err == nil {
 		c.logger.DebugContext(ctx, "ownsand data path session opened", "sandbox_id", d.s.id, "session_id", sess.sessionID, "transport", "peer-to-peer", "duration", time.Since(start))
@@ -185,6 +193,11 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 			if c.transport == TransportPeerToPeer {
 				return nil, err
 			}
+			select {
+			case <-d.done:
+				return nil, closedHandleError(ctx)
+			default:
+			}
 			c.logger.DebugContext(ctx, "ownsand data path session not open for this sandbox state; using the relay once", "sandbox_id", d.s.id)
 			return nil, nil
 		}
@@ -192,11 +205,17 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 	if c.transport == TransportPeerToPeer {
 		return nil, err
 	}
-	c.logger.DebugContext(ctx, "ownsand data path falls back to the relay", "sandbox_id", d.s.id, "code", connect.CodeOf(err).String())
+	// Close can run while the setup error is being classified. Check again
+	// under the lock that commits persistent relay fallback.
 	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return nil, closedHandleError(ctx)
+	}
 	d.relay = true
 	d.inUse = ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY
 	d.mu.Unlock()
+	c.logger.DebugContext(ctx, "ownsand data path falls back to the relay", "sandbox_id", d.s.id, "code", connect.CodeOf(err).String())
 	return nil, nil
 }
 

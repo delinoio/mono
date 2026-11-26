@@ -150,17 +150,48 @@ func TestReadCopyDetectsChange(t *testing.T) {
 }
 
 func TestReadKeepaliveWhilePreparing(t *testing.T) {
-	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 20 * time.Millisecond })
+	// Cleanup releases the gate before stopping the harness, then removes
+	// the source file.
 	path := filepath.Join(t.TempDir(), "f")
-	os.WriteFile(path, []byte("x"), 0o644)
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 20 * time.Millisecond })
+	hook, started, release := newReadPreparationGate(t)
 	h.srv.reads.forceCopy = true
-	h.srv.reads.copyHook = func() { time.Sleep(200 * time.Millisecond) }
+	h.srv.reads.copyHook = hook
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	s := h.open(ctx)
+	defer s.s.CloseRequest()
 	s.send(1, readReq(t, path))
-	if ev := s.recv().GetFileReadEvent(); ev.GetKeepalive() == nil {
-		t.Fatalf("first event %v", ev)
+	waitStarted(t, started)
+	if frame := s.recv(); frame.GetFileReadEvent().GetKeepalive() == nil {
+		t.Fatalf("first frame while preparation is blocked: %v, want keepalive", frame)
+	}
+	release()
+
+	var sawChunk bool
+	for {
+		frame := s.recv()
+		ev := frame.GetFileReadEvent()
+		switch {
+		case ev.GetKeepalive() != nil:
+			continue
+		case ev.GetChunk() != nil:
+			chunk := ev.GetChunk()
+			if sawChunk || chunk.GetOffset() != 0 || string(chunk.GetData()) != "x" {
+				t.Fatalf("chunk %v, want a single chunk containing x at offset 0", chunk)
+			}
+			sawChunk = true
+		case ev.GetEnd() != nil:
+			if !sawChunk || ev.GetEnd().GetSizeBytes() != 1 {
+				t.Fatalf("end size %d, received chunk: %t, want size 1 after the chunk", ev.GetEnd().GetSizeBytes(), sawChunk)
+			}
+			return
+		default:
+			t.Fatalf("unexpected frame after releasing the copy gate: %v", frame)
+		}
 	}
 }
 

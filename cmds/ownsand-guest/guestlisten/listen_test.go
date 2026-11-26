@@ -21,8 +21,7 @@ func TestParse(t *testing.T) {
 	}{
 		{"vsock://:1024", Spec{Scheme: SchemeVsock, Port: 1024}, true},
 		{"vsock://52", Spec{Scheme: SchemeVsock, Port: 52}, true},
-		{"vsock://:0", Spec{}, false},
-		{"vsock://:x", Spec{}, false},
+		{"vsock://:4294967294", Spec{Scheme: SchemeVsock, Port: 4294967294}, true},
 		{"unix:///run/g.sock", Spec{Scheme: SchemeUnix, Address: "/run/g.sock"}, true},
 		{"tcp://127.0.0.1:0", Spec{Scheme: SchemeTCP, Address: "127.0.0.1:0"}, true},
 		{"udp://x", Spec{}, false},
@@ -34,6 +33,13 @@ func TestParse(t *testing.T) {
 			t.Errorf("Parse(%q) = %+v, %v", c.spec, got, err)
 		}
 	}
+	for _, port := range []string{"0", "x", "4294967295", "4294967296"} {
+		spec := "vsock://:" + port
+		want := fmt.Sprintf("guestlisten: invalid vsock port %q", port)
+		if got, err := Parse(spec); got != (Spec{}) || err == nil || err.Error() != want {
+			t.Errorf("Parse(%q) = %+v, %v, want empty spec and %q", spec, got, err, want)
+		}
+	}
 	if DefaultSpec != "vsock://:1024" {
 		t.Fatalf("default spec %q", DefaultSpec)
 	}
@@ -43,31 +49,35 @@ func TestListenUnixRemovesStaleSocket(t *testing.T) {
 	// A short relative path: a unix socket path under a deep TMPDIR can
 	// exceed the 108-byte limit.
 	t.Chdir(t.TempDir())
-	path := "g.sock"
-	for range 2 {
-		l, err := Listen("unix://" + path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		go func() {
-			c, err := l.Accept()
-			if err == nil {
-				c.Write([]byte("x"))
-				c.Close()
+	const path = "g.sock"
+	for _, name := range []string{"first", "replacement"} {
+		if !t.Run(name, func(t *testing.T) {
+			l, err := Listen("unix://" + path)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}()
-		c, err := net.Dial("unix", path)
-		if err != nil {
-			t.Fatal(err)
+			done := make(chan struct{})
+			t.Cleanup(func() {
+				l.Close()
+				<-done
+			})
+			go func() {
+				defer close(done)
+				c, err := l.Accept()
+				if err == nil {
+					defer c.Close()
+					c.Write([]byte("x"))
+				}
+			}()
+			requireAnswers(t, path)
+			// Leave the socket file behind like a crashed helper would.
+			l.(*net.UnixListener).SetUnlinkOnClose(false)
+		}) {
+			return
 		}
-		buf := make([]byte, 1)
-		if _, err := c.Read(buf); err != nil || buf[0] != 'x' {
-			t.Fatalf("read %q %v", buf, err)
+		if info, err := os.Lstat(path); err != nil || info.Mode().Type() != os.ModeSocket {
+			t.Fatalf("stale socket file missing after %s: %v", name, err)
 		}
-		c.Close()
-		// Leave the socket file behind like a crashed helper would.
-		l.(*net.UnixListener).SetUnlinkOnClose(false)
-		l.Close()
 	}
 }
 

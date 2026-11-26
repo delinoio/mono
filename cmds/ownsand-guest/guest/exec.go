@@ -52,9 +52,9 @@ type execManager struct {
 	wg        sync.WaitGroup
 	// escalations tracks the pending SIGKILL goroutines, which outlive run.
 	escalations sync.WaitGroup
-	// escalationHooks are the timer and the process-group operations of a
-	// pending SIGKILL. Tests replace them to control the grace period and to
-	// record signals; production keeps the defaults of newExecManager.
+	// escalationHooks are the clock and process-group operations of a
+	// pending SIGKILL. Tests replace them to control timer and poll delivery
+	// and to record signals.
 	escalationHooks escalationHooks
 }
 
@@ -64,6 +64,9 @@ type escalationHooks struct {
 	// graceTimer starts the grace period and returns the channel that fires
 	// when it ends, plus a function that releases the timer.
 	graceTimer func(d time.Duration) (<-chan time.Time, func() bool)
+	// pollTicker starts periodic group checks and returns the tick channel
+	// and a function that stops the ticker.
+	pollTicker func(d time.Duration) (<-chan time.Time, func())
 	// groupAlive reports whether the process group of p has a member.
 	groupAlive func(p *os.Process) bool
 	// killGroup sends SIGKILL to the process group of p.
@@ -74,6 +77,10 @@ func defaultEscalationHooks() escalationHooks {
 	return escalationHooks{
 		graceTimer: func(d time.Duration) (<-chan time.Time, func() bool) {
 			t := time.NewTimer(d)
+			return t.C, t.Stop
+		},
+		pollTicker: func(d time.Duration) (<-chan time.Time, func()) {
+			t := time.NewTicker(d)
 			return t.C, t.Stop
 		},
 		groupAlive: processGroupAlive,
@@ -365,11 +372,11 @@ func (m *execManager) escalate(p *os.Process, grace, poll time.Duration, hooks e
 		defer m.escalations.Done()
 		deadline, stopDeadline := hooks.graceTimer(grace)
 		defer stopDeadline()
-		tick := time.NewTicker(poll)
-		defer tick.Stop()
+		tick, stopPoll := hooks.pollTicker(poll)
+		defer stopPoll()
 		for {
 			select {
-			case <-tick.C:
+			case <-tick:
 				if !hooks.groupAlive(p) {
 					return
 				}

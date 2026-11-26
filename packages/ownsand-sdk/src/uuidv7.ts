@@ -19,15 +19,15 @@ export class UuidV7Generator {
   }
 
   next(): string {
-    // Work on local candidates and commit them to the generator state only
-    // after the bytes are encoded. A clock reading outside the 48-bit
-    // timestamp range makes the encoding throw, and the generator must then
-    // keep its previous state so that it recovers once the clock does.
-    let ms = Math.floor(this.#nowMs());
-    if (!Number.isFinite(ms)) {
-      // NaN would pass the comparisons below and be encoded as timestamp 0.
+    // Work on local candidates and update state only after encoding succeeds.
+    // Encoding throws if the timestamp exceeds the 48-bit limit, including
+    // after a counter rollover.
+    const nowMs = this.#nowMs();
+    if (!Number.isFinite(nowMs)) {
       throw new RangeError("clock returned a non-finite timestamp");
     }
+    // Match the Go generator by treating pre-epoch readings as timestamp zero.
+    let ms = Math.max(0, Math.floor(nowMs));
     let counter: number;
     if (ms <= this.#lastMs) {
       // Same millisecond, or a wall clock that went back: keep the last
