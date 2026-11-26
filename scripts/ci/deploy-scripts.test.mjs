@@ -2364,10 +2364,13 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
 // droplet-deploy.sh serializes deployments with util-linux `flock`.
 const hasFlock = spawnSync("sh", ["-c", "command -v flock"]).status === 0;
 
+const isProxyLoad = (call) => call.startsWith("docker exec -i ");
 const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
 const skipDroplet =
   skip ||
   (!hasFlock && "flock is not installed") ||
+  (spawnSync("sh", ["-c", "command -v python3"]).status !== 0 &&
+    "python3 is not installed") ||
   (process.platform !== "linux" &&
     "the Droplet deadline needs Linux /proc/uptime") ||
   (spawnSync("timeout", ["--version"], { encoding: "utf8" }).stdout?.includes(
@@ -2397,7 +2400,11 @@ const sandrunArgs = ["sandrun-api", ...httpArgs.slice(1)];
 //                 fails with a transport error and no status.
 //   STUB_HTTP_CODE  HTTP status that a completed `curl` request prints (default 200).
 //   STUB_PS_EXIT exit code of `docker ps` (default 0).
-//   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
+//   STUB_RELOAD   0 applies the candidate, 1 rejects it, lost-applied applies
+//                 it and loses the result, lost leaves the load pending.
+//   STUB_ADMIN    unavailable fails the verification read after a lost load.
+//   STUB_OLD_IDS and STUB_RUNNING_IDS   override the two container lists.
+//   STUB_STATE_ON_STOP expected image state when the named old container stops.
 //   STUB_LOGS     exit code of `docker logs` (default 0).
 //   STUB_STOP_FAIL  space-separated container name or ID patterns that
 //                   `docker stop` fails for.
@@ -2464,6 +2471,45 @@ function setupDroplet(
       route,
     );
   }
+  writeFileSync(join(dir, "active-caddy.json"), "{}");
+  if (route) {
+    const site = route.match(/^(\S+) \{\s+reverse_proxy (\S+)/m);
+    if (site) {
+      writeFileSync(
+        join(dir, "active-caddy.json"),
+        JSON.stringify({
+          apps: {
+            http: {
+              servers: {
+                srv0: {
+                  routes: [
+                    {
+                      match: [{ host: [site[1]] }],
+                      handle: [
+                        {
+                          handler: "subroute",
+                          routes: [
+                            {
+                              handle: [
+                                {
+                                  handler: "reverse_proxy",
+                                  upstreams: [{ dial: site[2] }],
+                                },
+                              ],
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      );
+    }
+  }
   shellStub(
     bin,
     "docker",
@@ -2481,7 +2527,13 @@ case "$1" in
     [[ "\${STUB_PS_EXIT:-0}" == 0 ]] || exit "\$STUB_PS_EXIT"
     # The name check before the start: no container has the new name.
     [[ "$*" != *"--filter name="* ]] || exit 0
-    printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
+    if [[ "$2" == --quiet && -n "\${STUB_RUNNING_IDS:-}" ]]; then
+      printf '%s\\n' $STUB_RUNNING_IDS
+    elif [[ -n "\${STUB_OLD_IDS:-}" ]]; then
+      printf '%s\\n' $STUB_OLD_IDS
+    else
+      printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true
+    fi ;;
   inspect)
     case "$3" in
       *State.Status*)
@@ -2500,8 +2552,45 @@ case "$1" in
     [[ "\$1" == run ]] || code="\${STUB_CREATE_EXIT:-0}"
     [[ "\$code" == 0 ]] || echo "docker: Error response from daemon: OCI runtime create failed" >&2
     exit "\$code" ;;
-  exec) exit "\${STUB_RELOAD:-0}" ;;
+  exec)
+    active="$STUB_DIR/active-caddy.json"
+    read -r checksum _ < <(cksum < "$active")
+    etag="$(printf '"/config/ %s"' "$checksum")"
+    if [[ "$2" == -i ]]; then
+      if [[ "$*" != *"If-Match: $etag"* ]]; then
+        echo -n 412
+        exit 0
+      fi
+      case "\${STUB_RELOAD:-0}" in
+        1) echo -n 500 ;;
+        lost|lost-applied)
+          cat > "$STUB_DIR/pending-caddy.json"
+          printf '%s' "$etag" > "$STUB_DIR/pending-caddy.tag"
+          if [[ "$STUB_RELOAD" == lost-applied ]]; then
+            cp "$STUB_DIR/pending-caddy.json" "$active"
+          fi
+          exit 1 ;;
+        *) cat > "$active"; echo -n 200 ;;
+      esac
+    elif [[ "$3" == caddy && "$4" == adapt ]]; then
+      awk '/^[a-z0-9.-]+ \{$/ { host = $1 } /reverse_proxy / { print host, $2 }' "$DROPLET_ROOT"/caddy/sites/*.caddy |
+        jq -Rn '{apps: {http: {servers: {srv0: {routes: [inputs | split(" ") |
+          {match: [{host: [.[0]]}], handle: [{handler: "subroute",
+            routes: [{handle: [{handler: "reverse_proxy", upstreams: [{dial: .[1]}]}]}]}]}]}}}}}'
+    elif [[ "$*" == *'%header{etag}'* ]]; then
+      printf '%s' "$etag"
+    else
+      case "\${STUB_ADMIN:-}" in
+        unavailable) exit 1 ;;
+        wrong-host) sed 's/api.example.com/other.example.com/g' "$STUB_DIR/pending-caddy.json" ;;
+        wrong-port) sed 's/:8080/:8081/g' "$STUB_DIR/pending-caddy.json" ;;
+        *) cat "$active" ;;
+      esac
+    fi ;;
   stop)
+    if [[ -n "\${STUB_STATE_ON_STOP:-}" && "$4" == old1 ]]; then
+      [[ "$(cat "$DROPLET_ROOT/state/api.current")" == "$STUB_STATE_ON_STOP" ]] || exit 1
+    fi
     for pattern in \${STUB_STOP_FAIL:-}; do
       [[ "$4" != $pattern ]] || exit 1
     done ;;
@@ -2595,6 +2684,8 @@ test(
       "docker inspect",
       "curl --silent",
       "docker exec",
+      "docker exec",
+      "docker exec",
       "docker inspect",
       "docker stop",
       "docker rm",
@@ -2623,7 +2714,7 @@ test(
     );
     assert.match(
       result.calls.find((call) => call.startsWith("docker exec")),
-      /^docker exec caddy caddy reload --config \/etc\/caddy\/Caddyfile --adapter caddyfile$/,
+      /^docker exec caddy caddy adapt --config \/etc\/caddy\/Caddyfile --adapter caddyfile$/,
     );
     assert.ok(result.calls.includes("docker stop --time 30 old1"));
     const route = result.read("caddy/sites/api.caddy");
@@ -3029,6 +3120,8 @@ test(
       "docker inspect",
       "curl --silent",
       "docker exec",
+      "docker exec",
+      "docker exec",
       "docker inspect",
       "docker stop",
       "docker rm",
@@ -3313,12 +3406,9 @@ test(
       state: `${olderImage}\n`,
     });
     const run = startDroplet(t, setup, udpArgs, {
-      STUB_BLOCK_ON: "exec *",
+      STUB_BLOCK_ON: "exec -i *",
     });
-    await waitFor(
-      () => setup.calls().some((call) => call.startsWith("docker exec")),
-      "the proxy reload",
-    );
+    await waitFor(() => setup.calls().some(isProxyLoad), "the proxy reload");
     run.child.kill("SIGTERM");
     writeFileSync(join(setup.dir, "release-docker"), "");
     const result = await run.done;
@@ -3346,13 +3436,10 @@ test(
       state: `${olderImage}\n`,
     });
     const run = startDroplet(t, setup, udpArgs, {
-      STUB_BLOCK_ON: "exec *",
+      STUB_BLOCK_ON: "exec -i *",
       STUB_RELOAD: "1",
     });
-    await waitFor(
-      () => setup.calls().some((call) => call.startsWith("docker exec")),
-      "the proxy reload",
-    );
+    await waitFor(() => setup.calls().some(isProxyLoad), "the proxy reload");
     run.child.kill("SIGTERM");
     writeFileSync(join(setup.dir, "release-docker"), "");
     const result = await run.done;
@@ -3392,7 +3479,7 @@ exec /bin/mv "$@"`,
                 },
           });
           const run = startDroplet(t, setup, httpArgs, {
-            STUB_BLOCK_ON: duringReload ? "exec *" : "",
+            STUB_BLOCK_ON: duringReload ? "exec -i *" : "",
           });
           await waitFor(
             () =>
@@ -3400,7 +3487,7 @@ exec /bin/mv "$@"`,
                 .calls()
                 .some((call) =>
                   duringReload
-                    ? call.startsWith("docker exec")
+                    ? isProxyLoad(call)
                     : call.startsWith("mv ") &&
                       call.endsWith("/state/api.current"),
                 ),
@@ -3452,11 +3539,11 @@ test(
           previous,
         });
         const run = startDroplet(t, setup, httpArgs, {
-          STUB_BLOCK_ON: "exec *",
+          STUB_BLOCK_ON: "exec -i *",
           STUB_RELOAD: "1",
         });
         await waitFor(
-          () => setup.calls().some((call) => call.startsWith("docker exec")),
+          () => setup.calls().some(isProxyLoad),
           "the proxy reload",
         );
         run.child.kill("SIGTERM");
@@ -4197,6 +4284,7 @@ test(
     });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /proxy rejected the route/);
+    assert.ok(result.calls.some(isProxyLoad), result.stderr);
     assert.match(result.stderr, /route of api was not switched/);
     assert.equal(result.read("caddy/sites/api.caddy"), previous);
     assert.equal(result.read("caddy/sites/api.caddy.new"), undefined);
@@ -4208,6 +4296,137 @@ test(
     const first = runDroplet(t, undefined, { env: { STUB_RELOAD: "1" } });
     assert.equal(first.status, 1);
     assert.equal(first.read("caddy/sites/api.caddy"), undefined);
+  },
+);
+
+const oldApiRoute = "api.example.com {\n\treverse_proxy api-old:8080\n}\n";
+const expectedApiDial = `api-${dropletDeploymentUuid.replaceAll("-", "")}:8080`;
+const activeDial = (dir) =>
+  JSON.parse(readFileSync(join(dir, "active-caddy.json"), "utf8")).apps.http
+    .servers.srv0.routes[0].handle[0].routes[0].handle[0].upstreams[0].dial;
+
+test(
+  "droplet deploy confirms a replacement from Caddy after losing the load result",
+  { skip: skipDroplet },
+  async (t) => {
+    const setup = setupDroplet(t, httpArgs, {
+      old: ["old1"],
+      route: oldApiRoute,
+      state: `${olderImage}\n`,
+      previous: `${oldestImage}\n`,
+    });
+    const run = startDroplet(t, setup, httpArgs, {
+      STUB_RELOAD: "lost-applied",
+      STUB_STATE_ON_STOP: dropletImage,
+    });
+    const result = await run.done;
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Confirmed the active reverse proxy route/);
+    assert.equal(activeDial(setup.dir), expectedApiDial);
+    assert.ok(setup.read("caddy/sites/api.caddy").includes(expectedApiDial));
+    assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+    assert.equal(setup.read("state/api.previous"), `${olderImage}\n`);
+    assert.deepEqual(
+      setup.calls().filter((call) => /^docker rm /.test(call)),
+      ["docker rm old1"],
+    );
+  },
+);
+
+test(
+  "droplet deploy preserves both deployments when it cannot confirm a lost load",
+  { skip: skipDroplet },
+  async (t) => {
+    for (const admin of ["active", "unavailable", "wrong-host", "wrong-port"]) {
+      await t.test(admin, async (t) => {
+        const setup = setupDroplet(t, udpArgs, {
+          old: ["old1"],
+          route: oldApiRoute,
+          state: `${olderImage}\n`,
+          previous: `${oldestImage}\n`,
+        });
+        const run = startDroplet(t, setup, udpArgs, {
+          STUB_RELOAD: "lost",
+          STUB_ADMIN: admin,
+        });
+        const result = await run.done;
+        assert.equal(result.status, 1);
+        assert.match(
+          result.stderr,
+          /route switch for api is unresolved.*Retained api-/,
+        );
+        assert.equal(activeDial(setup.dir), "api-old:8080");
+        assert.ok(
+          setup.read("caddy/sites/api.caddy").includes(expectedApiDial),
+        );
+        assert.equal(
+          setup.read(
+            `caddy/sites/api.caddy.previous.${dropletDeploymentUuid.replaceAll("-", "")}`,
+          ),
+          oldApiRoute,
+        );
+        assert.equal(setup.read("state/api.current"), `${olderImage}\n`);
+        assert.equal(setup.read("state/api.previous"), `${oldestImage}\n`);
+        assert.ok(setup.calls().includes("docker stop --time 30 old1"));
+        assert.ok(
+          !setup.calls().some((call) => /^docker (rm|image) /.test(call)),
+        );
+        assert.ok(!setup.calls().includes("docker start old1"));
+      });
+    }
+  },
+);
+
+test(
+  "droplet deploy can switch after a lost load and fences the delayed request",
+  { skip: skipDroplet },
+  async (t) => {
+    const setup = setupDroplet(t, udpArgs, {
+      old: ["old1"],
+      route: oldApiRoute,
+      state: `${olderImage}\n`,
+      previous: `${oldestImage}\n`,
+    });
+    const first = startDroplet(t, setup, udpArgs, { STUB_RELOAD: "lost" });
+    assert.equal((await first.done).status, 1);
+    const retained = setup
+      .calls()
+      .find((call) => call.startsWith("docker create "))
+      .split(" ")[3];
+    const pending = readFileSync(join(setup.dir, "pending-caddy.json"), "utf8");
+    const tag = readFileSync(join(setup.dir, "pending-caddy.tag"), "utf8");
+    const docker = join(setup.bin, "docker");
+    const nextUuid = "0790a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    writeFileSync(join(setup.dir, "id-source"), nextUuid);
+    const nextArgs = [udpArgs[0], concurrentImage, ...udpArgs.slice(2)];
+    const next = startDroplet(t, setup, nextArgs, {
+      STUB_OLD_IDS: `old1 ${retained}`,
+      STUB_RUNNING_IDS: retained,
+    });
+    const result = await next.done;
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(setup.read("state/api.current"), `${concurrentImage}\n`);
+    assert.deepEqual(
+      setup.calls().filter((call) => /^docker rm /.test(call)),
+      ["docker rm old1", `docker rm ${retained}`],
+    );
+    assert.deepEqual(readdirSync(join(setup.deployRoot, "caddy/sites")), [
+      "api.caddy",
+    ]);
+    const late = spawnSync(
+      docker,
+      ["exec", "-i", "caddy", "curl", "--header", `If-Match: ${tag}`],
+      {
+        env: setup.spawnEnv(),
+        encoding: "utf8",
+        input: pending,
+      },
+    );
+    assert.equal(late.stdout, "412");
+    assert.equal(
+      activeDial(setup.dir),
+      `api-${nextUuid.replaceAll("-", "")}:8080`,
+    );
   },
 );
 
@@ -4396,10 +4615,9 @@ test(
     assert.equal(setup.read("state/api.current"), `${concurrentImage}\n`);
     assert.equal(setup.read("state/api.previous"), `${dropletImage}\n`);
     assert.equal(setup.read("caddy/sites/api.caddy.new"), undefined);
-    assert.equal(
-      setup.read("caddy/sites/api.caddy.previous") !== undefined,
-      true,
-    );
+    assert.deepEqual(readdirSync(join(setup.deployRoot, "caddy/sites")), [
+      "api.caddy",
+    ]);
   },
 );
 
@@ -5828,7 +6046,7 @@ test("start-caddy rejects a bad readiness setting", { skip }, (t) => {
 
 // The proxy lock `state/.proxy.lock` serializes the route change and the
 // proxy reload of every service on the Droplet. The tests below pause the
-// first deployment inside `caddy reload` (STUB_BLOCK_ON, released by the
+// first deployment inside the admin POST (STUB_BLOCK_ON, released by the
 // `release-docker` file) and start the deployment of another service.
 const hasPgrep = spawnSync("sh", ["-c", "command -v pgrep"]).status === 0;
 const skipProxyLock =
@@ -5864,11 +6082,11 @@ async function startPausedApiReload(t, env = {}) {
       writeFileSync(join(deployRoot, "env", "worker.env"), "LOG_LEVEL=info\n"),
   });
   const first = startDroplet(t, setup, apiArgs, {
-    STUB_BLOCK_ON: "exec *",
+    STUB_BLOCK_ON: "exec -i *",
     ...env,
   });
   await waitFor(
-    () => setup.calls().some((call) => call.startsWith("docker exec")),
+    () => setup.calls().some(isProxyLoad),
     "the first proxy reload",
   );
   return { setup, first };
@@ -5948,10 +6166,7 @@ test(
     // first run still reloads.
     assert.equal(setup.read("caddy/sites/worker.caddy"), undefined);
     assert.equal(setup.read("caddy/sites/worker.caddy.new"), undefined);
-    assert.equal(
-      setup.calls().filter((call) => call.startsWith("docker exec")).length,
-      1,
-    );
+    assert.equal(setup.calls().filter(isProxyLoad).length, 1);
     writeFileSync(join(setup.dir, "release-docker"), "");
     const [firstResult, secondResult] = await Promise.all([
       first.done,
@@ -5966,10 +6181,7 @@ test(
     );
     assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
     assert.equal(setup.read("state/worker.current"), `${concurrentImage}\n`);
-    assert.equal(
-      setup.calls().filter((call) => call.startsWith("docker exec")).length,
-      2,
-    );
+    assert.equal(setup.calls().filter(isProxyLoad).length, 2);
   },
 );
 
@@ -6005,7 +6217,7 @@ test(
       (call) => call.includes("mv -f") && call.includes("api.caddy.previous"),
     );
     const execs = calls
-      .map((call, index) => (call.startsWith("docker exec") ? index : -1))
+      .map((call, index) => (isProxyLoad(call) ? index : -1))
       .filter((index) => index >= 0);
     assert.equal(execs.length, 2, calls.join("\n"));
     // The restore of the rejected route happens before the second reload,
@@ -6035,10 +6247,7 @@ test(
     assert.equal(setup.read("caddy/sites/worker.caddy.new"), undefined);
     assert.equal(setup.read("caddy/sites/worker.caddy.previous"), undefined);
     assert.equal(setup.read("state/worker.current"), undefined);
-    assert.equal(
-      setup.calls().filter((call) => call.startsWith("docker exec")).length,
-      1,
-    );
+    assert.equal(setup.calls().filter(isProxyLoad).length, 1);
     // The replacement of the failed run is removed; the first run is intact.
     assert.ok(
       setup.calls().some((call) => /^docker rm --force worker-/.test(call)),
