@@ -4,6 +4,9 @@
   "license": "Apache-2.0",
   "type": "module",
   "packageManager": "pnpm@10.26.2",
+  "engines": {
+    "node": ">=24.8.0"
+  },
   "scripts": {
     "prepare": "./scripts/install-git-hooks.sh",
     "build": "turbo run build",

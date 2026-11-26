@@ -188,7 +188,7 @@
 ## Runtime Baselines
 
 - Root `.nvmrc` is the canonical Node.js runtime selector for local development workflows.
-- The current required runtime is Node.js `24` (LTS major line).
+- Workspace tooling requires Node.js 24.8.0 or newer. Use the Node.js 24 LTS release pinned in `.nvmrc` for local development.
 - When bumping the runtime baseline, update `.nvmrc` and relevant CI/runtime docs in the same change set.
 
 ## Frontend Design Rules

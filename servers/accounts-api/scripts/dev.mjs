@@ -52,6 +52,7 @@ import net from "node:net";
 import { constants, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isWorkspaceCli } from "../../../scripts/ci/workspace-node.mjs";
 
 // Signals that stop the launcher. Each one is forwarded to the active phase.
 const ForwardedSignal = Object.freeze({
@@ -374,11 +375,11 @@ async function main() {
 }
 
 // Run only when started as the entry point, so the launcher tests can import
-// the helpers above without starting a build. import.meta.main needs Node.js
-// 24.2 or later, as the launchers in scripts/dev do.
-if (import.meta.main && process.argv[2] === SuperviseFlag) {
+// the helpers above without starting a build.
+const isMain = isWorkspaceCli(import.meta);
+if (isMain && process.argv[2] === SuperviseFlag) {
   supervise(process.argv[3], process.argv[4], process.argv.slice(5));
-} else if (import.meta.main) {
+} else if (isMain) {
   const handlers = installSignalHandlers();
   try {
     process.exitCode = await main();

@@ -85,6 +85,11 @@ function fixture(t) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "portless-state-dir-")));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   mkdirSync(join(dir, "scripts", "dev"), { recursive: true });
+  mkdirSync(join(dir, "scripts", "ci"), { recursive: true });
+  copyFileSync(
+    join(root, "scripts", "ci", "workspace-node.mjs"),
+    join(dir, "scripts", "ci", "workspace-node.mjs"),
+  );
   for (const script of [preflight, launcher]) {
     copyFileSync(
       join(root, "scripts", "dev", script),

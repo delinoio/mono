@@ -43,6 +43,13 @@ const lefthook = require("lefthook/get-exe.js").getExePath();
 // inherit this process's environment; isolate it before any test runs.
 isolateGitEnvironment(process.env);
 
+function writeFormatterScripts(write) {
+  for (const name of ["format-changed.mjs", "workspace-node.mjs"]) {
+    const path = `scripts/ci/${name}`;
+    write(path, readFileSync(join(root, path), "utf8"));
+  }
+}
+
 function fixture(
   t,
   initialCommit = true,
@@ -104,10 +111,7 @@ function fixture(
   };
   const installHook = () => {
     copyFileSync(join(root, "lefthook.yml"), join(cwd, "lefthook.yml"));
-    write(
-      "scripts/ci/format-changed.mjs",
-      readFileSync(join(root, "scripts/ci/format-changed.mjs"), "utf8"),
-    );
+    writeFormatterScripts(write);
     git("config", "--unset", "core.hooksPath");
     execFileSync(lefthook, ["install"], { cwd, env, encoding: "utf8" });
   };
@@ -2339,10 +2343,7 @@ function standInFixture(t, fileCount) {
     '{"name":"rstack","version":"0.0.0","bin":{"rs":"./bin/rs.js"}}\n',
   );
   f.write("node_modules/rstack/bin/rs.js", standIn);
-  f.write(
-    "scripts/ci/format-changed.mjs",
-    readFileSync(join(root, "scripts/ci/format-changed.mjs"), "utf8"),
-  );
+  writeFormatterScripts(f.write);
   for (let index = 0; index < fileCount; index += 1)
     f.write(`files/f${index}.ts`, `export const value${index} = 1;\n`);
   f.commit();
