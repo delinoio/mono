@@ -2,15 +2,50 @@ package cli
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 )
 
-// TestHelpWriteErrorExitsWithError checks that a failed write of the root
-// help or of a subcommand help exits with 1 and the writer error on standard
-// error, as a failed write of a result does, and that the help of a working
-// standard output is unchanged.
+const (
+	rootHelpTail = "Authentication: OWNSAND_API_KEY selects an organization API key; otherwise\n" +
+		"the CLI uses the tokens that 'ownsand login' stored.\n"
+	listHelpTail   = "  -verbose\n    \twrite structured logs to standard error\n"
+	createHelpTail = "  -wait\n    \twait until the sandbox is running, paused, failed or deleted (default true)\n"
+)
+
+// createHelpFailingWriter records earlier output and rejects the final flag write.
+type createHelpFailingWriter struct {
+	accepted bytes.Buffer
+	rejected string
+}
+
+func (w *createHelpFailingWriter) Write(p []byte) (int, error) {
+	text := string(p)
+	if text == createHelpTail {
+		w.rejected = text
+		return 0, errDiskFull
+	}
+	return w.accepted.Write(p)
+}
+
+// TestHelpWriteErrorExitsWithError checks that a failed help write exits
+// with 1 and reports the writer error on standard error.
 func TestHelpWriteErrorExitsWithError(t *testing.T) {
+	checkWriteError := func(t *testing.T, r *runner, stdout io.Writer, args ...string) {
+		t.Helper()
+		var stderr bytes.Buffer
+		if code := r.runWriters(stdout, &stderr, args...); code != ExitError {
+			t.Errorf("exit %d, want %d (stderr %q)", code, ExitError, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), errDiskFull.Error()) {
+			t.Errorf("stderr misses the writer error: %q", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "Run 'ownsand help' for usage.") {
+			t.Errorf("stderr contains a usage hint: %q", stderr.String())
+		}
+	}
+
 	for _, tc := range []struct {
 		name      string
 		args      []string
@@ -24,42 +59,58 @@ func TestHelpWriteErrorExitsWithError(t *testing.T) {
 		{"usage fails in the command list", []string{"help"}, 2},
 		{"subcommand help fails in the header", []string{"sandbox", "list", "-h"}, 0},
 		{"subcommand help fails in the flag list", []string{"sandbox", "list", "-h"}, 1},
-		{"subcommand help fails at the last flag", []string{"sandbox", "create", "--help"}, 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout := &failingWriter{failAfter: tc.failAfter, err: errDiskFull}
+			checkWriteError(t, newRunner(t), stdout, tc.args...)
+		})
+	}
+
+	t.Run("subcommand help fails at the last flag", func(t *testing.T) {
+		r := newRunner(t)
+		args := []string{"sandbox", "create", "--help"}
+		stdout := &createHelpFailingWriter{}
+		checkWriteError(t, r, stdout, args...)
+		if stdout.rejected != createHelpTail {
+			t.Errorf("rejected write %q, want %q", stdout.rejected, createHelpTail)
+		}
+		wantAccepted, found := strings.CutSuffix(r.run(args...).stdout, createHelpTail)
+		if !found || stdout.accepted.Len() == 0 || stdout.accepted.String() != wantAccepted {
+			t.Errorf("accepted output %q, want all help before the final flag: %q", stdout.accepted.String(), wantAccepted)
+		}
+	})
+}
+
+// TestHelpWriteSucceedsWithUnlimitedWriter checks that help reaches its
+// expected ending and exits with 0 when standard output accepts every write.
+func TestHelpWriteSucceedsWithUnlimitedWriter(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		tail string
+	}{
+		{"root help", []string{"--help"}, rootHelpTail},
+		{"sandbox list help", []string{"sandbox", "list", "-h"}, listHelpTail},
+		{"sandbox create help", []string{"sandbox", "create", "--help"}, createHelpTail},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newRunner(t)
+			stdout := &failingWriter{failAfter: -1}
 			var stderr bytes.Buffer
-			stdout := &failingWriter{failAfter: tc.failAfter, err: errDiskFull}
-			if code := r.runWriters(stdout, &stderr, tc.args...); code != ExitError {
-				t.Fatalf("exit %d, want %d (stderr %q)", code, ExitError, stderr.String())
+			if code := r.runWriters(stdout, &stderr, tc.args...); code != ExitOK {
+				t.Fatalf("exit %d, want %d (stderr %q)", code, ExitOK, stderr.String())
 			}
-			if !strings.Contains(stderr.String(), errDiskFull.Error()) {
-				t.Fatalf("stderr misses the writer error: %q", stderr.String())
+			if stderr.Len() != 0 {
+				t.Errorf("stderr %q, want empty", stderr.String())
 			}
-			if strings.Contains(stderr.String(), "Run 'ownsand help' for usage.") {
-				t.Fatalf("a failed help write is not a usage error: %q", stderr.String())
+			output := stdout.buf.String()
+			if !strings.HasPrefix(output, "Usage: ownsand") {
+				t.Errorf("stdout %q, want the usage", output)
+			}
+			if !strings.HasSuffix(output, tc.tail) {
+				t.Errorf("stdout %q, want it to end with %q", output, tc.tail)
 			}
 		})
-	}
-}
-
-// TestHelpWriteSucceedsWithUnlimitedWriter checks that the help that fails
-// above in the middle of its text is complete and exits with 0 when standard
-// output accepts every write.
-func TestHelpWriteSucceedsWithUnlimitedWriter(t *testing.T) {
-	r := newRunner(t)
-	for _, args := range [][]string{{"--help"}, {"sandbox", "list", "-h"}, {"sandbox", "create", "--help"}} {
-		stdout := &failingWriter{failAfter: -1}
-		var stderr bytes.Buffer
-		if code := r.runWriters(stdout, &stderr, args...); code != ExitOK {
-			t.Fatalf("%v: exit %d, want %d (stderr %q)", args, code, ExitOK, stderr.String())
-		}
-		if stderr.Len() != 0 {
-			t.Errorf("%v: stderr %q, want empty", args, stderr.String())
-		}
-		if !strings.HasPrefix(stdout.buf.String(), "Usage: ownsand") {
-			t.Errorf("%v: stdout %q, want the usage", args, stdout.buf.String())
-		}
 	}
 }
 
