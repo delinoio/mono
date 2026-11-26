@@ -394,7 +394,7 @@ func readSnapshotFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 	}
-	if info.IsDir() {
+	if !info.Mode().IsRegular() {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("not a regular file"))
 	}
 	data, err := os.ReadFile(path)
