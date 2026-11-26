@@ -99,6 +99,7 @@ type Server struct {
 	profiles        []*sandrunv1.RunnerProfile
 	sessions        []*sandrunv1.DevSession
 	sessionGets     map[string]int
+	sessionExecs    map[string]*sessionExecs
 	apiKeys         []*sandrunv1.ApiKey
 	requests        []*sandrunv1.Request
 	runners         []*sandrunv1.Runner
@@ -107,7 +108,8 @@ type Server struct {
 	linkKeys        map[string]string
 	integrationReqs []*sandrunv1.CreateAgentIntegrationRequest
 	integration     []*sandrunv1.AgentIntegration
-	queue           chan *sandrunv1.WatchQueueResponse
+	queueByOrg      map[string]chan *sandrunv1.WatchQueueResponse
+	unscopedQueue   chan *sandrunv1.WatchQueueResponse
 
 	guest *guest
 }
@@ -115,15 +117,17 @@ type Server struct {
 // New starts a fake server. Call Close when the test ends.
 func New() *Server {
 	s := &Server{
-		AccessToken: DefaultAccessToken,
-		APIKey:      DefaultAPIKey,
-		UserID:      DefaultUserID,
-		faults:      map[string][]error{},
-		calls:       map[string]int{},
-		members:     map[string][]*sandrunv1.Member{},
-		sessionGets: map[string]int{},
-		links:       map[string]*sandrunv1.OwnSandLink{},
-		queue:       make(chan *sandrunv1.WatchQueueResponse, 64),
+		AccessToken:   DefaultAccessToken,
+		APIKey:        DefaultAPIKey,
+		UserID:        DefaultUserID,
+		faults:        map[string][]error{},
+		calls:         map[string]int{},
+		members:       map[string][]*sandrunv1.Member{},
+		sessionGets:   map[string]int{},
+		sessionExecs:  map[string]*sessionExecs{},
+		links:         map[string]*sandrunv1.OwnSandLink{},
+		queueByOrg:    map[string]chan *sandrunv1.WatchQueueResponse{},
+		unscopedQueue: make(chan *sandrunv1.WatchQueueResponse, queueBufferSize),
 	}
 	s.guest = newGuest(s)
 	opts := connect.WithInterceptors(&interceptor{s: s})

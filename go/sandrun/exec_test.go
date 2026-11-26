@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -317,6 +319,132 @@ func TestExecTruncationCallbackResume(t *testing.T) {
 				t.Fatalf("attach with nil callback result = %+v, error = %v", res, err)
 			}
 		})
+	}
+}
+
+func TestExecInferredGapCancellation(t *testing.T) {
+	const execID = "exec"
+	rejected := errors.New("gap rejected")
+	started := ExecEvent{Kind: ExecEventStarted, ExecID: execID}
+	output := func(kind ExecEventKind, offset int64, data string) *sandrunv1.DevSessionExecEvent {
+		chunk := &sandrunv1.DevSessionExecOutput{Offset: offset, Data: []byte(data)}
+		if kind == ExecEventStdout {
+			return &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Stdout{Stdout: chunk}}
+		}
+		return &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Stderr{Stderr: chunk}}
+	}
+	for _, kind := range []ExecEventKind{ExecEventStdout, ExecEventStderr} {
+		gap := ExecEvent{Kind: ExecEventOutputTruncated, ExecID: execID}
+		gapCall := execRetryCall{id: execID, stdout: 1, stderr: 2}
+		finalStdout, finalStderr := int64(1), int64(2)
+		if kind == ExecEventStdout {
+			gap.MissingStdout = ByteRange{From: 1, To: 4}
+			gapCall.stdout, finalStdout = 4, 7
+		} else {
+			gap.MissingStderr = ByteRange{From: 2, To: 4}
+			gapCall.stderr, finalStderr = 4, 7
+		}
+		chunk := ExecEvent{Kind: kind, ExecID: execID, Offset: 4, Data: []byte("end")}
+		for _, method := range []struct {
+			name    string
+			initial bool
+		}{
+			{name: "Exec", initial: true},
+			{name: "AttachExec"},
+		} {
+			for _, tc := range []struct {
+				name string
+				err  error
+			}{
+				{name: "cancel", err: context.Canceled},
+				{name: "active"},
+				{name: "reject", err: rejected},
+			} {
+				t.Run(kind.String()+"/"+method.name+"/"+tc.name, func(t *testing.T) {
+					c, fixture := newExecRetryFixture(t, func(_ context.Context, call int, send func(*sandrunv1.DevSessionExecEvent) error) error {
+						events := []*sandrunv1.DevSessionExecEvent{retryStarted}
+						if method.initial && call == 0 {
+							events = append(events, output(ExecEventStdout, 0, "a"), output(ExecEventStderr, 0, "bc"))
+						}
+						events = append(events, output(kind, 4, "end"), retryExited)
+						for _, ev := range events {
+							if err := send(ev); err != nil {
+								return err
+							}
+						}
+						return nil
+					})
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					var got, want []ExecEvent
+					onEvent := func(ev ExecEvent) error {
+						got = append(got, ev)
+						if ev.Kind == ExecEventOutputTruncated && tc.err != nil {
+							cancel()
+							if tc.err == rejected {
+								return rejected
+							}
+						}
+						return nil
+					}
+					params := AttachParams{ExecID: execID, StdoutOffset: 1, StderrOffset: 2, OnEvent: onEvent}
+					firstCall := execRetryCall{id: execID, stdout: 1, stderr: 2}
+					var res *ExecResult
+					var err error
+					if method.initial {
+						firstCall = execRetryCall{initial: true, id: execID}
+						want = append(want, started,
+							ExecEvent{Kind: ExecEventStdout, ExecID: execID, Data: []byte("a")},
+							ExecEvent{Kind: ExecEventStderr, ExecID: execID, Data: []byte("bc")})
+						res, err = c.Exec(ctx, ExecParams{ExecID: execID, Command: []string{"fixture"}, OnEvent: onEvent})
+					} else {
+						res, err = c.AttachExec(ctx, params)
+					}
+					want = append(want, gap)
+					if tc.err == nil {
+						want = append(want, chunk)
+					}
+					if !reflect.DeepEqual(got, want) {
+						t.Errorf("events = %+v, want %+v", got, want)
+					}
+					if calls := fixture.calls(); !slices.Equal(calls, []execRetryCall{firstCall}) {
+						t.Errorf("calls = %+v, want only %+v", calls, firstCall)
+					}
+					if tc.err == nil {
+						if err != nil || res == nil || res.Kind != ExecResultExited || !res.Incomplete ||
+							res.StdoutOffset != finalStdout || res.StderrOffset != finalStderr {
+							t.Fatalf("active result = %+v, error = %v", res, err)
+						}
+						return
+					}
+					if res != nil {
+						t.Fatalf("result = %+v, want nil", res)
+					}
+					if tc.err == rejected {
+						se := requireExecRetryError(t, err, execID, 1, 2, true)
+						if se.Err != rejected {
+							t.Fatalf("error cause = %v, want original rejection", se.Err)
+						}
+						return
+					}
+					se := requireExecRetryError(t, err, execID, gapCall.stdout, gapCall.stderr, true)
+					if !errors.Is(se, context.Canceled) {
+						t.Fatalf("error = %v, want wrapped context.Canceled", se)
+					}
+					got = nil
+					params.ExecID, params.StdoutOffset, params.StderrOffset = se.ExecID, se.StdoutOffset, se.StderrOffset
+					res, err = c.AttachExec(t.Context(), params)
+					if err != nil || res == nil || res.Kind != ExecResultExited || res.Incomplete ||
+						res.StdoutOffset != finalStdout || res.StderrOffset != finalStderr ||
+						!reflect.DeepEqual(got, []ExecEvent{chunk}) {
+						t.Fatalf("reattach result = %+v, error = %v, events = %+v, want one replay of %+v", res, err, got, chunk)
+					}
+					if calls := fixture.calls(); !slices.Equal(calls, []execRetryCall{firstCall, gapCall}) {
+						t.Fatalf("calls = %+v, want %+v followed by %+v", calls, firstCall, gapCall)
+					}
+				})
+			}
+		}
 	}
 }
 

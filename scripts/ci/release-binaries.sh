@@ -439,44 +439,77 @@ take() {
 assemble() {
   local artifacts="$1" assets="$2"
   require_binaries
-  local name version dir binary platform asset file entry
-  local -A expected
+  local name version dir binary platform asset file entry output
+  local -a executables licenses notices=(GO-LICENSE THIRD-PARTY-LICENSES.txt)
+  local -A expected_artifacts expected_output
   while IFS=$'\t' read -r -u 3 name version dir binary; do
-    mkdir -p "$assets/$name"
-    expected=()
+    output="$assets/$name"
+    executables=()
+    expected_artifacts=()
+    expected_output=([SHA256SUMS]=1)
     while IFS= read -r -u 4 platform; do
       asset="$(asset_name "$binary" "$platform")"
       if [[ "$platform" == darwin-* ]]; then
-        expected["signed/$name/$asset"]=1
-        take "$artifacts/signed/$name/$asset" "$assets/$name/$asset"
+        file="signed/$name/$asset"
       else
-        expected["release/$name/$asset"]=1
-        take "$artifacts/release/$name/$asset" "$assets/$name/$asset"
+        file="release/$name/$asset"
       fi
-      chmod 755 "$assets/$name/$asset"
+      executables+=("$file")
+      expected_artifacts["$file"]=1
+      expected_output["$asset"]=1
     done 4< <(platforms_of "$name" 'true')
-    for file in GO-LICENSE THIRD-PARTY-LICENSES.txt; do
-      expected["release/$name/$file"]=1
-      take "$artifacts/release/$name/$file" "$assets/$name/$file"
+    for file in "${notices[@]}"; do
+      expected_artifacts["release/$name/$file"]=1
+      expected_output["$file"]=1
+    done
+    mapfile -t licenses < <(jq -r --arg name "$name" '.[] | select(.name == $name) | .licenseFiles[]' <<< "$BINARIES")
+    for file in "${licenses[@]}"; do
+      expected_output["${file##*/}"]=1
+    done
+
+    if [[ -L "$output" || ( -e "$output" && ! -d "$output" ) ]]; then
+      echo "::error::The output directory for $name is not a real directory: $output. Use a clean output directory." >&2
+      exit 1
+    fi
+    if [[ -d "$output" ]]; then
+      (cd -- "$output" && find . -mindepth 1 -maxdepth 1 -print0) |
+        while IFS= read -r -d '' entry; do
+          asset="${entry#./}"
+          file="$output/$asset"
+          if [[ -z "${expected_output[$asset]:-}" || ! -f "$file" || -L "$file" ]]; then
+            echo "::error::The output for $name contains an unexpected or nonregular entry: $file. Use a clean output directory." >&2
+            exit 1
+          fi
+        done
+    fi
+
+    mkdir -p -- "$output"
+    for file in "${executables[@]}"; do
+      asset="${file##*/}"
+      take "$artifacts/$file" "$output/$asset"
+      chmod 755 -- "$output/$asset"
+    done
+    for file in "${notices[@]}"; do
+      take "$artifacts/release/$name/$file" "$output/$file"
     done
     # The build artifacts must hold exactly the planned files: no symlink,
     # special file, directory or extra file may become a release asset.
     while IFS= read -r -d '' entry; do
-      if [[ -z "${expected[$entry]:-}" ]]; then
+      if [[ -z "${expected_artifacts[$entry]:-}" ]]; then
         echo "::error::The artifacts of $name contain an unexpected entry: $entry" >&2
         exit 1
       fi
     done < <(cd "$artifacts" && find "release/$name" "signed/$name" -mindepth 1 -print0 2> /dev/null)
-    while IFS= read -r -u 4 file; do
-      take "$repo_root/$file" "$assets/$name/$(basename "$file")"
-    done 4< <(jq -r --arg name "$name" '.[] | select(.name == $name) | .licenseFiles[]' <<< "$BINARIES")
+    for file in "${licenses[@]}"; do
+      take "$repo_root/$file" "$output/${file##*/}"
+    done
     # Hash every top-level regular file, the same selection that
     # `github_releases` uploads, so a dot-prefixed license file is covered
     # (`*` does not match it). SHA256SUMS is the manifest itself: a copy from
     # an earlier run in the same directory must not list itself.
-    (cd "$assets/$name" && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z |
+    (cd -- "$output" && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z |
       while IFS= read -r -d '' file; do sha256_line "${file#./}"; done) > "$assets/SHA256SUMS.tmp"
-    mv "$assets/SHA256SUMS.tmp" "$assets/$name/SHA256SUMS"
+    mv -- "$assets/SHA256SUMS.tmp" "$output/SHA256SUMS"
   done 3< <(binary_rows)
 }
 

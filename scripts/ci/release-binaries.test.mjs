@@ -1174,6 +1174,116 @@ test(
 );
 
 test(
+  "assemble rejects output left by a different release plan",
+  { skip },
+  (t) => {
+    const f = fixture(t);
+    const assets = join(f.dir, "assets");
+    const output = join(assets, cli.name);
+    const first = f.run(["assemble", artifacts(f), assets], {}, [cli]);
+    assert.equal(first.status, 0, first.stderr);
+    const previous = readdirSync(output)
+      .sort()
+      .map((file) => [file, readFileSync(join(output, file))]);
+
+    const next = { ...cli, version: "0.0.2", platforms: ["linux-arm64"] };
+    const nextArtifacts = join(f.dir, "next-artifacts");
+    const linuxAsset = "ownsand-linux-arm64";
+    for (const file of ["GO-LICENSE", "THIRD-PARTY-LICENSES.txt", linuxAsset]) {
+      write(join(nextArtifacts, "release", cli.name, file), `new ${file}\n`);
+    }
+    const result = f.run(["assemble", nextArtifacts, assets], {}, [next]);
+    assert.notEqual(result.status, 0);
+    assert.ok(result.stderr.includes(cli.name), result.stderr);
+    assert.ok(
+      result.stderr.includes(join(output, "ownsand-darwin-amd64")),
+      result.stderr,
+    );
+    assert.match(result.stderr, /Use a clean output directory/);
+    const after = readdirSync(output)
+      .sort()
+      .map((file) => [file, readFileSync(join(output, file))]);
+    assert.deepEqual(after, previous);
+
+    const fresh = join(f.dir, "fresh");
+    const freshOutput = join(fresh, cli.name);
+    const expected = [
+      "GO-LICENSE",
+      "LICENSE",
+      "NOTICE",
+      "THIRD-PARTY-LICENSES.txt",
+      linuxAsset,
+    ];
+    for (const run of ["first", "retry"]) {
+      const result = f.run(["assemble", nextArtifacts, fresh], {}, [next]);
+      assert.equal(result.status, 0, `${run}: ${result.stderr}`);
+      assert.deepEqual(
+        readdirSync(freshOutput).sort(),
+        [...expected, "SHA256SUMS"].sort(),
+      );
+      const sums = readFileSync(join(freshOutput, "SHA256SUMS"), "utf8");
+      assert.deepEqual(listedNames(sums), expected);
+      const check = sha256Check(freshOutput);
+      assert.equal(check.status, 0, check.stdout + check.stderr);
+    }
+  },
+);
+
+test(
+  "assemble rejects invalid pre-existing output entries",
+  { skip },
+  async (t) => {
+    for (const [label, entry, create] of [
+      ["unplanned dotfile", ".stale", (path) => write(path, "stale\n")],
+      ["directory", "LICENSE", (path) => mkdirSync(path)],
+      [
+        "symlink",
+        "SHA256SUMS",
+        (path) => symlinkSync("ownsand-linux-arm64", path),
+      ],
+    ]) {
+      await t.test(label, (t) => {
+        const f = fixture(t);
+        const assets = join(f.dir, "assets");
+        const output = join(assets, cli.name);
+        const oldExecutable = join(output, "ownsand-linux-arm64");
+        write(oldExecutable, "previous executable\n");
+        const offending = join(output, entry);
+        create(offending);
+
+        const result = f.run(["assemble", artifacts(f), assets], {}, [cli]);
+        assert.notEqual(result.status, 0);
+        assert.ok(result.stderr.includes(offending), result.stderr);
+        assert.match(result.stderr, /Use a clean output directory/);
+        assert.deepEqual(readdirSync(output).sort(), [
+          entry,
+          "ownsand-linux-arm64",
+        ]);
+        assert.equal(
+          readFileSync(oldExecutable, "utf8"),
+          "previous executable\n",
+        );
+      });
+    }
+    await t.test("linked package directory", (t) => {
+      const f = fixture(t);
+      const assets = join(f.dir, "assets");
+      const output = join(assets, cli.name);
+      const target = join(f.dir, "elsewhere");
+      mkdirSync(assets);
+      mkdirSync(target);
+      symlinkSync(target, output);
+
+      const result = f.run(["assemble", artifacts(f), assets], {}, [cli]);
+      assert.notEqual(result.status, 0);
+      assert.ok(result.stderr.includes(output), result.stderr);
+      assert.match(result.stderr, /Use a clean output directory/);
+      assert.deepEqual(readdirSync(target), []);
+    });
+  },
+);
+
+test(
   "assemble rejects missing, extra and linked artifact entries",
   { skip },
   async (t) => {

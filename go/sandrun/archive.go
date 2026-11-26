@@ -22,11 +22,11 @@ import (
 // writeSyncArchive writes the files to w as one tar archive (PAX format,
 // slash-separated relative names, owner 0). Regular files carry their mode
 // (0644 or 0755); symbolic links are link entries unless skipLinks is set.
-// The content of each file is read again and must still have the hashed
-// size and SHA-256, so that the manifest describes what the guest
-// receives. A file that changed since it was hashed fails the archive, and
+// Each regular file must have the same identity before its header is written.
+// Its content must still have the hashed size and SHA-256 so the manifest
+// describes what the guest receives. A change fails the archive, and
 // so the upload, before the guest can extract it.
-func writeSyncArchive(ctx context.Context, w io.Writer, root string, files []localFile, skipLinks bool) error {
+func writeSyncArchive(ctx context.Context, w io.Writer, root *os.Root, files []localFile, skipLinks bool) error {
 	tw := tar.NewWriter(w)
 	dirs := map[string]bool{}
 	now := time.Now()
@@ -59,7 +59,10 @@ func writeSyncArchive(ctx context.Context, w io.Writer, root string, files []loc
 		if f.entry.Mode == modeExecutable {
 			mode = 0o755
 		}
-		file, err := os.Open(filepath.Join(root, filepath.FromSlash(f.rel)))
+		if err := checkSyncFile(root, f.rel, f.identity); err != nil {
+			return err
+		}
+		file, err := openSyncFile(root, f.rel, f.identity)
 		if err != nil {
 			return err
 		}
@@ -69,7 +72,7 @@ func writeSyncArchive(ctx context.Context, w io.Writer, root string, files []loc
 				return err
 			}
 			h := sha256.New()
-			n, err := io.Copy(io.MultiWriter(tw, h), io.LimitReader(file, f.entry.Size))
+			n, err := io.Copy(io.MultiWriter(tw, h), io.LimitReader(localContextReader{ctx: ctx, src: file}, f.entry.Size))
 			if err != nil {
 				return err
 			}

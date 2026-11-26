@@ -68,8 +68,10 @@ type QueueEvent struct {
 // reconnects after transient errors and normal stream ends. It reports a
 // QueueEventGap before each reconnect and uses exponential backoff from
 // 1 second to 30 seconds. The backoff resets after a stream delivers its
-// snapshot. WatchQueue returns ctx.Err() when ctx ends and the handler's
-// error unchanged.
+// snapshot. After each successful receive, WatchQueue checks ctx before
+// dispatch. If ctx has ended, it closes the stream and returns ctx.Err().
+// A callback that has started can finish, and WatchQueue returns its error
+// unchanged.
 func (c *Client) WatchQueue(ctx context.Context, organizationID string, handle func(QueueEvent) error) error {
 	bo := backoff{min: c.timing.backoffMin, max: c.timing.backoffMax}
 	for attempt := 0; ; attempt++ {
@@ -115,6 +117,9 @@ func (c *Client) watchOnce(ctx context.Context, organizationID string, handle fu
 	}
 	defer stream.Close()
 	for stream.Receive() {
+		if err := ctx.Err(); err != nil {
+			return healthy, err
+		}
 		msg := stream.Msg()
 		var ev QueueEvent
 		switch {

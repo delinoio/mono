@@ -390,6 +390,28 @@ func TestUsageErrors(t *testing.T) {
 	}
 }
 
+func TestSessionListRejectsOutOfRangeAPIPort(t *testing.T) {
+	const invalidOrigin = "https://127.0.0.1:65536"
+	const wantDiagnostic = "error: sandrun: invalid base URL: want a port between 0 and 65535\n"
+	f := newFixture(t)
+	f.env[EnvOrganization] = f.org
+	f.env[EnvAPIKey] = f.srv.APIKey
+	f.env[EnvAPIURL] = invalidOrigin
+
+	attempts := 0
+	f.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		return nil, errors.New("unexpected HTTP request")
+	})}
+	r := f.run("", "session", "list")
+	if r.code != ExitUsage || !strings.HasPrefix(r.stderr, wantDiagnostic) || strings.Contains(r.stderr, invalidOrigin) {
+		t.Errorf("session list = exit %d, stderr %q, want exit %d and a sanitized port diagnostic", r.code, r.stderr, ExitUsage)
+	}
+	if attempts != 0 {
+		t.Errorf("session list attempted %d HTTP requests, want none", attempts)
+	}
+}
+
 func TestCredentialPrecedenceAndErrors(t *testing.T) {
 	f := newFixture(t)
 	f.ok("", "--org", f.org, "session", "list")

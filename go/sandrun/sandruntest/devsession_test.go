@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
@@ -381,6 +383,16 @@ func TestCloseReapsRunningExec(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stream.Close()
+	process := readRunningExecProcess(t, stream)
+
+	s.Close()
+	if err := process.Signal(syscall.Signal(0)); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("signal after Close returned %v, want os.ErrProcessDone", err)
+	}
+}
+
+func readRunningExecProcess(t *testing.T, stream *connect.ServerStreamForClient[sandrunv1.ExecDevSessionResponse]) *os.Process {
+	t.Helper()
 	var stdout strings.Builder
 	for stream.Receive() {
 		stdout.Write(stream.Msg().GetEvent().GetStdout().GetData())
@@ -396,14 +408,180 @@ func TestCloseReapsRunningExec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer process.Release()
+	t.Cleanup(func() { _ = process.Release() })
 	if err := process.Signal(syscall.Signal(0)); err != nil {
-		t.Fatalf("exec was not running before Close: %v", err)
+		t.Fatalf("exec process %d was not running: %v", pid, err)
+	}
+	return process
+}
+
+func TestDeleteDevSessionReapsRunningExecs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the test inspects POSIX process state")
+	}
+	s := New()
+	t.Cleanup(s.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	client, ds := createExecTestSession(t, ctx, s, t.TempDir())
+	other, err := client.CreateDevSession(ctx, listTestRequest(&sandrunv1.CreateDevSessionRequest{
+		OrganizationId: ds.GetOrganizationId(), RunnerProfileId: ds.GetRunnerProfileId(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := func(session *sandrunv1.DevSession) (*connect.ServerStreamForClient[sandrunv1.ExecDevSessionResponse], *os.Process) {
+		t.Helper()
+		stream, err := client.ExecDevSession(ctx, listTestRequest(&sandrunv1.ExecDevSessionRequest{
+			OrganizationId: session.GetOrganizationId(), DevSessionId: session.GetDevSessionId(),
+			ExecId: s.newID(), Command: []string{"sh", "-c", "echo $$; exec sleep 30"},
+			Timeout: durationpb.New(time.Minute),
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = stream.Close() })
+		return stream, readRunningExecProcess(t, stream)
+	}
+	first, firstProcess := start(ds)
+	second, secondProcess := start(ds)
+	_, otherProcess := start(other.Msg.GetDevSession())
+	type deletion struct {
+		session *sandrunv1.DevSession
+		alive   [2]error
+		err     error
+	}
+	deleted := make(chan deletion, 2)
+	for range cap(deleted) {
+		go func() {
+			res, err := client.DeleteDevSession(ctx, listTestRequest(&sandrunv1.DeleteDevSessionRequest{
+				OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(),
+			}))
+			check := deletion{err: err}
+			if err == nil {
+				check.session = res.Msg.GetDevSession()
+				check.alive = [2]error{firstProcess.Signal(syscall.Signal(0)), secondProcess.Signal(syscall.Signal(0))}
+			}
+			deleted <- check
+		}()
+	}
+	var previous *sandrunv1.DevSession
+	for range cap(deleted) {
+		check := <-deleted
+		if check.err != nil {
+			t.Error(check.err)
+			continue
+		}
+		if check.session.GetState() != sandrunv1.RequestState_REQUEST_STATE_ENDED ||
+			check.session.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED ||
+			check.session.GetEndedAt() == nil {
+			t.Errorf("unexpected deleted session: %v", check.session)
+		}
+		for _, err := range check.alive {
+			if !errors.Is(err, os.ErrProcessDone) {
+				t.Errorf("signal after delete returned %v, want os.ErrProcessDone", err)
+			}
+		}
+		if previous != nil && !proto.Equal(check.session, previous) {
+			t.Errorf("repeated delete returned %v, want %v", check.session, previous)
+		}
+		previous = check.session
+	}
+	if err := otherProcess.Signal(syscall.Signal(0)); err != nil {
+		t.Errorf("exec in the other session stopped: %v", err)
+	}
+	for _, stream := range []*connect.ServerStreamForClient[sandrunv1.ExecDevSessionResponse]{first, second} {
+		events := receiveExecEvents(t, stream, nil)
+		if len(events) != 1 || events[0].GetExited() == nil || events[0].GetExited().GetTimedOut() {
+			t.Fatalf("delete should deliver an exit without timeout, got %v", events)
+		}
 	}
 
-	s.Close()
-	if err := process.Signal(syscall.Signal(0)); !errors.Is(err, os.ErrProcessDone) {
-		t.Fatalf("signal after Close returned %v, want os.ErrProcessDone", err)
+	stream, err := client.ExecDevSession(ctx, listTestRequest(&sandrunv1.ExecDevSessionRequest{
+		OrganizationId: ds.GetOrganizationId(), DevSessionId: other.Msg.GetDevSession().GetDevSessionId(),
+		ExecId: s.newID(), Command: []string{"sleep", "30"}, Timeout: durationpb.New(500 * time.Millisecond),
+	}))
+	events := receiveExecEvents(t, stream, err)
+	if len(events) != 2 || !events[1].GetExited().GetTimedOut() {
+		t.Fatalf("request timeout should deliver a timed-out exit, got %v", events)
+	}
+}
+
+func TestDeleteDevSessionRejectsExecPausedBeforeAdmission(t *testing.T) {
+	s := New()
+	t.Cleanup(s.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	entered, resume := make(chan struct{}), make(chan struct{})
+	s.BeforeExec = func(*sandrunv1.ExecDevSessionRequest) {
+		close(entered)
+		select {
+		case <-resume:
+		case <-ctx.Done():
+		}
+	}
+	client, ds := createExecTestSession(t, ctx, s, t.TempDir())
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		stream, err := client.ExecDevSession(ctx, listTestRequest(&sandrunv1.ExecDevSessionRequest{
+			OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(),
+			ExecId: s.newID(), Command: []string{executable, "-test.run=^$"},
+		}))
+		if err == nil {
+			defer stream.Close()
+			for stream.Receive() {
+			}
+			err = stream.Err()
+		}
+		result <- err
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("exec did not reach BeforeExec")
+	}
+	_, err = client.DeleteDevSession(ctx, listTestRequest(&sandrunv1.DeleteDevSessionRequest{
+		OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(resume)
+	if err := <-result; connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Errorf("exec after deletion returned %v, want failed_precondition", err)
+	}
+	if admitted := s.ExecRequests(); len(admitted) != 0 {
+		t.Errorf("deleted session admitted exec requests: %v", admitted)
+	}
+}
+
+func TestDeleteQueuedDevSessionIsIdempotent(t *testing.T) {
+	s := New()
+	t.Cleanup(s.Close)
+	s.NewSessionState = sandrunv1.RequestState_REQUEST_STATE_QUEUED
+	client, ds := createExecTestSession(t, t.Context(), s, t.TempDir())
+	remove := func() *sandrunv1.DevSession {
+		t.Helper()
+		res, err := client.DeleteDevSession(t.Context(), listTestRequest(&sandrunv1.DeleteDevSessionRequest{
+			OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(),
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Msg.GetDevSession()
+	}
+	deleted := remove()
+	if deleted.GetState() != sandrunv1.RequestState_REQUEST_STATE_CANCELED ||
+		deleted.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER ||
+		deleted.GetEndedAt() == nil {
+		t.Fatalf("unexpected deleted queued session: %v", deleted)
+	}
+	if again := remove(); !proto.Equal(again, deleted) {
+		t.Errorf("repeated delete returned %v, want %v", again, deleted)
 	}
 }
 
@@ -512,8 +690,8 @@ func TestExecRequestPath(t *testing.T) {
 			}
 			return
 		}
-		if exited := final.GetExited(); exited == nil || exited.GetExitCode() != 0 {
-			t.Fatalf("got %v, want exit code 0", final)
+		if !hasExplicitZeroExitCode(final) {
+			t.Fatalf("got %v, want Exited with explicit exit code 0", final)
 		}
 		var stdout strings.Builder
 		for _, event := range events {
@@ -646,8 +824,43 @@ func TestExecStreamEventLimitCountsTruncation(t *testing.T) {
 	}
 	events = attach(chunk.GetOffset() + int64(len(chunk.GetData())))
 	requireStarted(t, events, limit)
-	if exited := events[1].GetExited(); exited == nil || exited.GetExitCode() != 0 {
-		t.Fatalf("expected exit code 0, got %v", events[1])
+	if !hasExplicitZeroExitCode(events[1]) {
+		t.Fatalf("expected Exited with explicit exit code 0, got %v", events[1])
+	}
+}
+
+func hasExplicitZeroExitCode(event *sandrunv1.DevSessionExecEvent) bool {
+	status, ok := event.GetExited().GetStatus().(*sandrunv1.DevSessionExecExited_ExitCode)
+	return ok && status != nil && status.ExitCode == 0
+}
+
+func TestHasExplicitZeroExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		exited *sandrunv1.DevSessionExecExited
+		want   bool
+	}{
+		{name: "missing Exited"},
+		{name: "unset status", exited: &sandrunv1.DevSessionExecExited{}},
+		{name: "signal", exited: &sandrunv1.DevSessionExecExited{
+			Status: &sandrunv1.DevSessionExecExited_Signal{Signal: 15},
+		}},
+		{name: "nonzero code", exited: &sandrunv1.DevSessionExecExited{
+			Status: &sandrunv1.DevSessionExecExited_ExitCode{ExitCode: 7},
+		}},
+		{name: "explicit zero", exited: &sandrunv1.DevSessionExecExited{
+			Status: &sandrunv1.DevSessionExecExited_ExitCode{ExitCode: 0},
+		}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			event := &sandrunv1.DevSessionExecEvent{}
+			if tc.exited != nil {
+				event.Event = &sandrunv1.DevSessionExecEvent_Exited{Exited: tc.exited}
+			}
+			if got := hasExplicitZeroExitCode(event); got != tc.want {
+				t.Errorf("hasExplicitZeroExitCode(%v) = %t, want %t", event, got, tc.want)
+			}
+		})
 	}
 }
 
