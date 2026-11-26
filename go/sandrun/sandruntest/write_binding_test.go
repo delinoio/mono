@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/delinoio/mono/go/sandrun/sandruntest"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
@@ -36,9 +37,15 @@ func TestFakeWriteBinding(t *testing.T) {
 		}
 		return res.Msg.GetDevSession()
 	}
+	sendWrite := func(t *testing.T, message *sandrunv1.WriteDevSessionFileRequest) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
+		t.Helper()
+		req := connect.NewRequest(message)
+		req.Header().Set("Authorization", "Bearer "+server.APIKey)
+		return client.WriteDevSessionFile(t.Context(), req)
+	}
 	write := func(t *testing.T, session *sandrunv1.DevSession, writeID, path string, offset int64, data string, final bool) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
 		t.Helper()
-		req := connect.NewRequest(&sandrunv1.WriteDevSessionFileRequest{
+		return sendWrite(t, &sandrunv1.WriteDevSessionFileRequest{
 			OrganizationId: orgID,
 			DevSessionId:   session.GetDevSessionId(),
 			WriteId:        writeID,
@@ -47,8 +54,6 @@ func TestFakeWriteBinding(t *testing.T) {
 			Data:           []byte(data),
 			Final:          final,
 		})
-		req.Header().Set("Authorization", "Bearer "+server.APIKey)
-		return client.WriteDevSessionFile(t.Context(), req)
 	}
 	checkChunk := func(t *testing.T, session *sandrunv1.DevSession, writeID, path string, offset int64, data string, final bool) {
 		t.Helper()
@@ -124,5 +129,63 @@ func TestFakeWriteBinding(t *testing.T) {
 		checkRejected()
 		checkFile(t, session, original, "ab")
 		checkAbsent(t, session, changed)
+	})
+
+	t.Run("completed retry", func(t *testing.T) {
+		session := newSession(t)
+		const id, path = "retry-completed", "fixture.txt"
+		checkChunk(t, session, id, path, 0, "ab", false)
+		final := &sandrunv1.WriteDevSessionFileRequest{
+			OrganizationId: orgID,
+			DevSessionId:   session.GetDevSessionId(),
+			WriteId:        id,
+			Path:           path,
+			Offset:         2,
+			Data:           []byte("cd"),
+			Mode:           0o644,
+			Final:          true,
+		}
+		completed, err := sendWrite(t, final)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := &sandrunv1.WriteDevSessionFileResponse{WriteId: id, Offset: 2, Length: 2, Finished: true, SizeBytes: 4}
+		if !proto.Equal(completed.Msg, want) {
+			t.Fatalf("final response = %v, want %v", completed.Msg, want)
+		}
+		checkFile(t, session, path, "abcd")
+
+		for _, tc := range []struct {
+			name   string
+			change func(*sandrunv1.WriteDevSessionFileRequest)
+		}{
+			{"non-final", func(m *sandrunv1.WriteDevSessionFileRequest) { m.Final = false }},
+			{"mode", func(m *sandrunv1.WriteDevSessionFileRequest) { m.Mode = 0o600 }},
+			{"raw mode with same permissions", func(m *sandrunv1.WriteDevSessionFileRequest) { m.Mode = 0o10644 }},
+			{"offset", func(m *sandrunv1.WriteDevSessionFileRequest) { m.Offset = 1 }},
+			{"length", func(m *sandrunv1.WriteDevSessionFileRequest) { m.Data = []byte("c") }},
+			{"data", func(m *sandrunv1.WriteDevSessionFileRequest) { m.Data = []byte("xy") }},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				retry := proto.CloneOf(final)
+				tc.change(retry)
+				if _, err := sendWrite(t, retry); connect.CodeOf(err) != connect.CodeFailedPrecondition {
+					t.Errorf("retry error = %v, want failed_precondition", err)
+				}
+				checkFile(t, session, path, "abcd")
+			})
+		}
+
+		if err := os.WriteFile(filepath.Join(session.GetWorkspacePath(), path), []byte("edited"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		replayed, err := sendWrite(t, final)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !proto.Equal(replayed.Msg, completed.Msg) {
+			t.Fatalf("replayed response = %v, want %v", replayed.Msg, completed.Msg)
+		}
+		checkFile(t, session, path, "edited")
 	})
 }
