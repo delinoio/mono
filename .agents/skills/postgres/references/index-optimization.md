@@ -33,15 +33,33 @@ SELECT
 
 Indexes with identical definitions (after normalizing names) on the same table are duplicates:
 
+Render each index name as a SQL identifier to match quoted names exactly. Keep the full definition if the prefix does not match.
+
 ```sql
+WITH index_definitions AS (
+  SELECT
+    schemaname,
+    tablename,
+    indexname,
+    indexdef,
+    format('%I', indexname) AS quoted_indexname,
+    CASE WHEN starts_with(indexdef, 'CREATE UNIQUE INDEX ')
+      THEN 'CREATE UNIQUE INDEX '
+      ELSE 'CREATE INDEX '
+    END AS create_prefix
+  FROM pg_indexes
+  WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+)
 SELECT
   schemaname || '.' || tablename AS table,
   array_agg(indexname) AS duplicate_indexes,
   pg_size_pretty(sum(pg_relation_size(format('%I.%I', schemaname, indexname)::regclass))) AS total_size
-FROM pg_indexes
-WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+FROM index_definitions
 GROUP BY schemaname, tablename,
-  regexp_replace(indexdef, 'INDEX \S+ ON ', 'INDEX ON ')
+  CASE WHEN starts_with(indexdef, create_prefix || quoted_indexname || ' ON ')
+    THEN overlay(indexdef PLACING '' FROM length(create_prefix) + 1 FOR length(quoted_indexname) + 1)
+    ELSE indexdef
+  END
 HAVING count(*) > 1;
 ```
 

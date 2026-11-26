@@ -23,6 +23,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/delinoio/mono/go/ownsand/validate"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
@@ -171,26 +172,31 @@ type fakeDevices struct {
 }
 
 func (h *fakeDevices) GetDevice(context.Context, *connect.Request[ownsandv1.GetDeviceRequest]) (*connect.Response[ownsandv1.GetDeviceResponse], error) {
-	return connect.NewResponse(&ownsandv1.GetDeviceResponse{Device: &ownsandv1.Device{DeviceId: h.f.dev, Limits: &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 1, DiskGib: 1, VcpuOvercommitPercent: 150}}}), nil
+	limits := &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 1, DiskGib: 1, VcpuOvercommitPercent: 150}
+	return connect.NewResponse(&ownsandv1.GetDeviceResponse{Device: h.deviceWithLimits(limits)}), nil
 }
 
 // ReplaceDeviceLimits is the only limits RPC that the fake implements, so a
 // CLI that called the legacy UpdateDeviceLimits would fail with unimplemented.
 func (h *fakeDevices) ReplaceDeviceLimits(_ context.Context, r *connect.Request[ownsandv1.ReplaceDeviceLimitsRequest]) (*connect.Response[ownsandv1.ReplaceDeviceLimitsResponse], error) {
-	h.f.mu.Lock()
-	h.f.limit = r.Msg.GetLimits()
-	h.f.mu.Unlock()
 	in := r.Msg.GetLimits()
+	h.f.mu.Lock()
+	h.f.limit = in
+	h.f.mu.Unlock()
 	limits := &ownsandv1.DeviceLimits{VcpuCount: in.GetVcpuCount(), MemoryMib: in.GetMemoryMib(), DiskGib: in.GetDiskGib(), VcpuOvercommitPercent: in.GetVcpuOvercommitPercent()}
+	return connect.NewResponse(&ownsandv1.ReplaceDeviceLimitsResponse{Device: h.deviceWithLimits(limits)}), nil
+}
+
+func (h *fakeDevices) deviceWithLimits(limits *ownsandv1.DeviceLimits) *ownsandv1.Device {
 	// The control plane derives the effective limit from the limits and caps
 	// the int32 field at its largest value.
-	exact := int64(limits.GetVcpuCount()) * int64(limits.GetVcpuOvercommitPercent()) / 100
-	return connect.NewResponse(&ownsandv1.ReplaceDeviceLimitsResponse{Device: &ownsandv1.Device{
+	exact := validate.EffectiveVCPULimit(limits)
+	return &ownsandv1.Device{
 		DeviceId:                h.f.dev,
 		Limits:                  limits,
 		EffectiveVcpuLimit:      int32(min(exact, math.MaxInt32)),
 		EffectiveVcpuLimitCount: exact,
-	}}), nil
+	}
 }
 
 type fakeSandbox struct {
@@ -295,6 +301,13 @@ func (h *fakeRelay) Exec(_ context.Context, r *connect.Request[ownsandv1.ExecReq
 		events = append(events, stdout(0, "ab"),
 			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_OutputTruncated{OutputTruncated: &ownsandv1.ExecOutputTruncated{StdoutOffset: 5}}},
 			stdout(5, "z"), exited(0, false))
+	case "truncboth":
+		events = append(events, stdout(0, "ab"),
+			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stderr{Stderr: &ownsandv1.ExecOutput{Offset: 0, Data: []byte("abcd")}}},
+			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_OutputTruncated{OutputTruncated: &ownsandv1.ExecOutputTruncated{StdoutOffset: 5, StderrOffset: 8}}},
+			stdout(5, "z"),
+			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stderr{Stderr: &ownsandv1.ExecOutput{Offset: 8, Data: []byte("z")}}},
+			exited(0, false))
 	}
 	for _, e := range events {
 		if err := s.Send(ev(e)); err != nil {

@@ -254,11 +254,67 @@ func TestExecJSONEvents(t *testing.T) {
 		cmd  string
 		code int
 		ev   string
-	}{{"fail", 0, "failed"}, {"ended", 0, "sandbox_ended"}, {"sig9", 0, "exited"}, {"trunc", 255, "output_truncated"}, {"denied", 255, "data_path_error"}} {
+	}{{"fail", 0, "failed"}, {"ended", 0, "sandbox_ended"}, {"sig9", 0, "exited"}, {"denied", 255, "data_path_error"}} {
 		res := r.run("--format", "json", "sandbox", "exec", r.f.sb, "--", c.cmd)
 		if res.code != c.code || !strings.Contains(res.stdout, `"event":"`+c.ev+`"`) {
 			t.Errorf("%s: %+v", c.cmd, res)
 		}
+	}
+	for _, tt := range []struct {
+		cmd           string
+		missingStderr *[2]int
+	}{
+		{cmd: "trunc"},
+		{cmd: "truncboth", missingStderr: &[2]int{4, 8}},
+	} {
+		t.Run(tt.cmd, func(t *testing.T) {
+			res := r.run("--format", "json", "sandbox", "exec", r.f.sb, "--", tt.cmd)
+			if res.code != 255 {
+				t.Fatalf("exit %d, want 255: %+v", res.code, res)
+			}
+			var truncated map[string]any
+			for _, event := range decodeExecJSONEvents(t, res.stdout) {
+				if event["event"] == "output_truncated" {
+					if truncated != nil {
+						t.Fatalf("multiple output_truncated events: %s", res.stdout)
+					}
+					truncated = event
+				}
+			}
+			if truncated == nil {
+				t.Fatalf("missing output_truncated event: %s", res.stdout)
+			}
+			assertExecJSONMissingRange(t, truncated, "missing_stdout", &[2]int{2, 5})
+			assertExecJSONMissingRange(t, truncated, "missing_stderr", tt.missingStderr)
+		})
+	}
+}
+
+func decodeExecJSONEvents(t *testing.T, output string) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("%q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+func assertExecJSONMissingRange(t *testing.T, event map[string]any, field string, want *[2]int) {
+	t.Helper()
+	value, present := event[field]
+	if want == nil {
+		if present {
+			t.Errorf("%s = %v, want field omitted", field, value)
+		}
+		return
+	}
+	got, ok := value.(map[string]any)
+	if !ok || got["from"] != float64(want[0]) || got["to"] != float64(want[1]) {
+		t.Errorf("%s = %v, want [%d, %d)", field, value, want[0], want[1])
 	}
 }
 
@@ -312,31 +368,31 @@ func TestDataPathErrorEventWithoutExecID(t *testing.T) {
 
 func TestExecJSONDecodesUTF8AcrossChunks(t *testing.T) {
 	r := newRunner(t)
-	lines := func(res result) []string {
+	lines := func(output string, missingStdout *[2]int) []string {
 		var out []string
-		for _, l := range strings.Split(strings.TrimSpace(res.stdout), "\n") {
-			var v map[string]any
-			if err := json.Unmarshal([]byte(l), &v); err != nil {
-				t.Fatalf("%q: %v", l, err)
-			}
-			switch v["event"] {
+		for _, event := range decodeExecJSONEvents(t, output) {
+			switch event["event"] {
 			case "stdout", "stderr":
-				out = append(out, fmt.Sprintf("%s@%v:%s", v["event"], v["offset"], v["data"]))
+				out = append(out, fmt.Sprintf("%s@%v:%s", event["event"], event["offset"], event["data"]))
+			case "output_truncated":
+				assertExecJSONMissingRange(t, event, "missing_stdout", missingStdout)
+				assertExecJSONMissingRange(t, event, "missing_stderr", nil)
+				out = append(out, "output_truncated")
 			default:
-				out = append(out, v["event"].(string))
+				out = append(out, event["event"].(string))
 			}
 		}
 		return out
 	}
 	res := r.run("--format", "json", "sandbox", "exec", r.f.sb, "--", "split")
 	want := []string{"started", "stdout@0:h", "stdout@1:é ", "stdout@4:€", "stderr@0:x", "stderr@1:\ufffd", "exited"}
-	if got := lines(res); res.code != 0 || fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("split: %d %q, want %q", res.code, got, want)
+	if got := lines(res.stdout, nil); res.code != 0 || !slices.Equal(got, want) {
+		t.Fatalf("split: exit %d and events %q, want exit 0 and %q", res.code, got, want)
 	}
 	res = r.run("--format", "json", "sandbox", "exec", r.f.sb, "--", "splitgap")
 	want = []string{"started", "stdout@0:a", "stdout@1:\ufffd", "output_truncated", "stdout@5:\ufffdz", "exited"}
-	if got := lines(res); fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("splitgap: %q, want %q", got, want)
+	if got := lines(res.stdout, &[2]int{3, 5}); res.code != 255 || !slices.Equal(got, want) {
+		t.Fatalf("splitgap: exit %d and events %q, want exit 255 and %q", res.code, got, want)
 	}
 }
 

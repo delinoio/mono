@@ -3,11 +3,76 @@
 package cli
 
 import (
+	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
+
+func TestDeviceEffectiveVCPULimitOutput(t *testing.T) {
+	r := newRunner(t)
+
+	t.Run("get text", func(t *testing.T) {
+		res := r.run("device", "get", r.f.dev, "--no-color")
+		if res.code != ExitOK || res.stderr != "" {
+			t.Fatalf("device get: %+v", res)
+		}
+		lines := strings.Split(res.stdout, "\n")
+		for _, want := range []string{"effective_vcpu_limit: 6", "effective_vcpu_limit_count: 6"} {
+			if !slices.Contains(lines, want) {
+				t.Errorf("stdout misses %q:\n%s", want, res.stdout)
+			}
+		}
+	})
+
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		wantLimit string
+		wantCount string
+	}{
+		{
+			name:      "get JSON",
+			args:      []string{"device", "get", r.f.dev},
+			wantLimit: "6",
+			wantCount: `"6"`,
+		},
+		{
+			name:      "set limits JSON",
+			args:      []string{"device", "set-limits", r.f.dev, "--vcpu", "4", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "150"},
+			wantLimit: "6",
+			wantCount: `"6"`,
+		},
+		{
+			name:      "set limits above int32 JSON",
+			args:      []string{"device", "set-limits", r.f.dev, "--vcpu", "536870912", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "400"},
+			wantLimit: "2147483647",
+			wantCount: `"2147483648"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := r.run(append(tc.args, "--format", "json")...)
+			if res.code != ExitOK || res.stderr != "" {
+				t.Fatalf("%+v", res)
+			}
+			var device struct {
+				Limit json.RawMessage `json:"effective_vcpu_limit"`
+				Count json.RawMessage `json:"effective_vcpu_limit_count"`
+			}
+			if err := json.Unmarshal([]byte(res.stdout), &device); err != nil {
+				t.Fatalf("decode device JSON: %v", err)
+			}
+			if got := string(device.Limit); got != tc.wantLimit {
+				t.Errorf("effective_vcpu_limit = %q, want %q", got, tc.wantLimit)
+			}
+			if got := string(device.Count); got != tc.wantCount {
+				t.Errorf("effective_vcpu_limit_count = %q, want %q", got, tc.wantCount)
+			}
+		})
+	}
+}
 
 func TestDeviceRowsEffectiveVCPULimit(t *testing.T) {
 	limits := func(vcpu, percent int32) *ownsandv1.DeviceLimits {
