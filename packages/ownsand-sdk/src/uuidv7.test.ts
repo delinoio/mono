@@ -15,6 +15,29 @@ describe("UuidV7Generator", () => {
     expect(uuidV7TimestampMs(id)).toBe(1_700_000_000_123);
   });
 
+  test.each([-1, -10, -0.25])(
+    "clamps a first reading of %s ms to zero",
+    (nowMs) => {
+      const id = new UuidV7Generator(() => nowMs).next();
+      expect(isUuidV7(id)).toBe(true);
+      expect(uuidV7TimestampMs(id)).toBe(0);
+    },
+  );
+
+  test("is strictly increasing across the Unix epoch and a rollback", () => {
+    let now = -1;
+    const gen = new UuidV7Generator(() => now);
+    const ids = [-1, -1, 0, 1, -1].map((reading) => {
+      now = reading;
+      return gen.next();
+    });
+
+    expect(ids.map(uuidV7TimestampMs)).toEqual([0, 0, 0, 1, 1]);
+    for (let i = 1; i < ids.length; i++) {
+      expect(ids[i]! > ids[i - 1]!).toBe(true);
+    }
+  });
+
   test("is strictly increasing within one millisecond and across a clock step back", () => {
     let now = 1_700_000_000_000;
     const gen = new UuidV7Generator(() => now);
