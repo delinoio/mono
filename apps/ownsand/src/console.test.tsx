@@ -3099,6 +3099,12 @@ describe("billing banner", () => {
         }
         expect(banner).not.toBeNull();
         const text = banner!.textContent!;
+        expect(text).toContain(
+          "creating sandboxes, snapshots, templates and enrollment tokens",
+        );
+        expect(text).toContain(
+          "enrolling a device even with an existing enrollment token",
+        );
         const link = within(banner!).getByRole("link", {
           name: "Manage billing at accounts.delino.io",
         });
