@@ -124,6 +124,18 @@ func (r *runner) signInAs(role string) {
 }
 
 func TestBillingStatus(t *testing.T) {
+	assertUsageCalls := func(t *testing.T, calls []string, want int) {
+		t.Helper()
+		count := 0
+		for _, call := range calls {
+			if call == "GetBillingUsage" {
+				count++
+			}
+		}
+		if count != want {
+			t.Fatalf("GetBillingUsage calls = %d, want %d (all calls: %v)", count, want, calls)
+		}
+	}
 	for _, role := range []string{"owner", "admin", "member", "api-key"} {
 		full := role == "owner" || role == "admin"
 		t.Run(role+" linked text", func(t *testing.T) {
@@ -169,6 +181,11 @@ func TestBillingStatus(t *testing.T) {
 			if res.code != ExitOK {
 				t.Fatalf("%+v", res)
 			}
+			wantUsageCalls := 1
+			if role == "api-key" {
+				wantUsageCalls = 0
+			}
+			assertUsageCalls(t, r.f.callNames(), wantUsageCalls)
 			var out struct {
 				Status struct {
 					Billing struct {
@@ -176,14 +193,7 @@ func TestBillingStatus(t *testing.T) {
 						Linked bool   `json:"linked"`
 					} `json:"billing"`
 				} `json:"status"`
-				Usage *struct {
-					BillingAccountID string `json:"billing_account_id"`
-					Balance          string `json:"balance_usd_micros"`
-					MeterUsages      []struct {
-						Meter  string `json:"meter"`
-						Amount string `json:"amount_usd_micros"`
-					} `json:"meter_usages"`
-				} `json:"usage"`
+				Usage json.RawMessage `json:"usage"`
 			}
 			if err := json.Unmarshal([]byte(res.stdout), &out); err != nil {
 				t.Fatalf("%v: %q", err, res.stdout)
@@ -192,14 +202,25 @@ func TestBillingStatus(t *testing.T) {
 				t.Fatalf("status %+v", out.Status)
 			}
 			if full {
-				if out.Usage == nil || out.Usage.Balance != "12345678" || out.Usage.BillingAccountID != billingAcctID || len(out.Usage.MeterUsages) != 4 || out.Usage.MeterUsages[3].Amount != "4" {
-					t.Fatalf("usage %+v", out.Usage)
+				var usage struct {
+					BillingAccountID string `json:"billing_account_id"`
+					Balance          string `json:"balance_usd_micros"`
+					MeterUsages      []struct {
+						Meter  string `json:"meter"`
+						Amount string `json:"amount_usd_micros"`
+					} `json:"meter_usages"`
+				}
+				if err := json.Unmarshal(out.Usage, &usage); err != nil {
+					t.Fatalf("invalid usage: %v: %q", err, out.Usage)
+				}
+				if usage.Balance != "12345678" || usage.BillingAccountID != billingAcctID || len(usage.MeterUsages) != 4 || usage.MeterUsages[3].Amount != "4" {
+					t.Fatalf("usage %+v", usage)
 				}
 			} else if out.Usage != nil {
-				t.Fatalf("%s must see the status only, got usage %+v", role, out.Usage)
+				t.Fatalf("%s must see the status only, got usage %s", role, out.Usage)
 			}
 		})
-		t.Run(role+" not linked", func(t *testing.T) {
+		t.Run(role+" not linked text", func(t *testing.T) {
 			r := newRunner(t)
 			r.signInAs(role)
 			r.f.billing = unlinkedBlocked()
@@ -219,11 +240,47 @@ func TestBillingStatus(t *testing.T) {
 			if strings.Contains(strings.Join(r.f.callNames(), ","), "GetBillingUsage") {
 				t.Fatal("an organization without a link must not call GetBillingUsage")
 			}
-			res = r.run("billing", "status", "--format", "json")
-			if res.code != ExitOK || !json.Valid([]byte(res.stdout)) || strings.Contains(res.stdout, `"usage"`) {
+		})
+		t.Run(role+" not linked json", func(t *testing.T) {
+			r := newRunner(t)
+			r.signInAs(role)
+			fixture := unlinkedBlocked()
+			r.f.billing = fixture
+			res := r.run("billing", "status", "--format", "json")
+			if res.code != ExitOK {
 				t.Fatalf("%+v", res)
 			}
-			if !strings.Contains(res.stderr, "https://accounts.delino.io") {
+			assertUsageCalls(t, r.f.callNames(), 0)
+			type billingFields struct {
+				Phase        string `json:"phase"`
+				Reason       string `json:"reason"`
+				Linked       bool   `json:"linked"`
+				BlockedSince string `json:"blocked_since"`
+				SuspendTime  string `json:"suspend_time"`
+			}
+			var out struct {
+				Status struct {
+					Billing billingFields `json:"billing"`
+				} `json:"status"`
+				Usage json.RawMessage `json:"usage"`
+			}
+			if err := json.Unmarshal([]byte(res.stdout), &out); err != nil {
+				t.Fatalf("%v: %q", err, res.stdout)
+			}
+			want := billingFields{
+				Phase:        fixture.GetPhase().String(),
+				Reason:       fixture.GetReason().String(),
+				Linked:       fixture.GetLinked(),
+				BlockedSince: fixture.GetBlockedSince().AsTime().Format(time.RFC3339Nano),
+				SuspendTime:  fixture.GetSuspendTime().AsTime().Format(time.RFC3339Nano),
+			}
+			if got := out.Status.Billing; got != want {
+				t.Fatalf("status.billing = %+v, want %+v", got, want)
+			}
+			if out.Usage != nil {
+				t.Fatalf("an unlinked organization must see the status only, got usage %s", out.Usage)
+			}
+			if !strings.Contains(res.stderr, "organization settings page") || !strings.Contains(res.stderr, "https://accounts.delino.io") {
 				t.Fatalf("the JSON mode note goes to standard error: %+v", res)
 			}
 		})
