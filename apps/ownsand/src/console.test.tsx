@@ -63,7 +63,10 @@ import {
   MOCK_USER,
   MockBillingState,
 } from "./mock/mock-api.ts";
-import { holdingTransport as holdPagedTransport } from "./test-support.tsx";
+import {
+  type HeldCall,
+  holdingTransport as holdMockTransport,
+} from "./test-support.tsx";
 import {
   FIXTURE_ORGANIZATION_ID,
   FIXTURE_ORGANIZATION_NAME,
@@ -312,7 +315,7 @@ describe("organizations", () => {
         pages,
         organizationUuidTransport(createMockTransport()),
       );
-      const { transport: heldTransport, calls } = holdPagedTransport(
+      const { transport: heldTransport, calls } = holdMockTransport(
         ["ListOrganizations"],
         undefined,
         transport,
@@ -459,7 +462,7 @@ describe("organizations", () => {
       [MOCK_IDS.acme],
       [MOCK_IDS.northwind],
     ]);
-    const { transport, calls } = holdPagedTransport(
+    const { transport, calls } = holdMockTransport(
       ["ListOrganizations"],
       () => true,
       paged.transport,
@@ -863,6 +866,43 @@ describe("dialog focus return", () => {
   });
 });
 
+async function seededApiKeyId(transport: Transport) {
+  const { apiKeys } = await createClient(ApiKeyService, transport).listApiKeys({
+    organizationId: MOCK_IDS.acme,
+  });
+  const [key] = apiKeys;
+  expect(key?.name).toBe("ci-runner");
+  return key.apiKeyId;
+}
+
+async function waitForPendingApiKeyCall(
+  queryClient: QueryClient,
+  calls: Record<string, HeldCall[]>,
+  method: string,
+  variables: { organizationId: string } & (
+    { apiKeyId: string } | { name: string }
+  ),
+) {
+  await waitFor(() => expect(calls[method] ?? []).toHaveLength(1));
+  const [call] = calls[method];
+  expect(call.input).toMatchObject(variables);
+
+  const mutations = queryClient.getMutationCache().getAll();
+  expect(mutations).toHaveLength(1);
+  const [mutation] = mutations;
+  expect(mutation.state).toMatchObject({ status: "pending", variables });
+
+  return async (error: ConnectError) => {
+    await act(async () => {
+      call.settle(error);
+    });
+    await waitFor(() => {
+      expect(mutation.state.status).toBe("error");
+      expect(mutation.state.error).toBe(error);
+    });
+  };
+}
+
 describe("confirmation dialog errors", () => {
   /** A transport whose RevokeApiKey fails for the first `failures` calls. */
   function revokeTransport(failures: number) {
@@ -937,21 +977,13 @@ describe("confirmation dialog errors", () => {
   });
 
   test("a failure that arrives after Escape does not show on the next opening", async () => {
-    const mock = createMockTransport();
-    let release: (() => void) | undefined;
-    const transport: Transport = {
-      ...mock,
-      async unary(method, ...rest) {
-        if (method.name === "RevokeApiKey") {
-          await new Promise<void>((resolve) => {
-            release = resolve;
-          });
-          throw new ConnectError("revoke failed", Code.Unavailable);
-        }
-        return mock.unary(method, ...rest);
-      },
-    };
-    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    const queryClient = createQueryClient();
+    const { transport, calls } = holdMockTransport(["RevokeApiKey"]);
+    const apiKeyId = await seededApiKeyId(transport);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, {
+      transport,
+      queryClient,
+    });
     await screen.findByText(/ci-runner/);
     const dialog = await openRevoke();
     await act(async () => {
@@ -959,16 +991,23 @@ describe("confirmation dialog errors", () => {
         within(dialog).getByRole("button", { name: "Revoke key" }),
       );
     });
+    const reject = await waitForPendingApiKeyCall(
+      queryClient,
+      calls,
+      "RevokeApiKey",
+      {
+        organizationId: MOCK_IDS.acme,
+        apiKeyId,
+      },
+    );
     await act(async () => {
       fireEvent.keyDown(dialog, { key: "Escape" });
     });
     await settle(60);
     expect(screen.queryByRole("alertdialog")).toBeNull();
-    await act(async () => {
-      release?.();
-    });
-    await settle(60);
+    await reject(new ConnectError("revoke failed", Code.Unavailable));
     const reopened = await openRevoke();
+    expect(calls.RevokeApiKey).toHaveLength(1);
     expect(noticeIn(reopened)).toBeNull();
   });
 });
@@ -1008,12 +1047,15 @@ describe("confirmation dialog requests", () => {
     dialog.querySelector(".notice-error");
 
   /** Renders the API keys page with the seeded ci-runner key and a newer deploy-bot key. */
-  async function renderKeys(transport: Transport) {
+  async function renderKeys(transport: Transport, queryClient?: QueryClient) {
     await createClient(ApiKeyService, transport).createApiKey({
       organizationId: MOCK_IDS.acme,
       name: "deploy-bot",
     });
-    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, {
+      transport,
+      queryClient,
+    });
     await screen.findByText(/ci-runner/);
   }
 
@@ -1110,20 +1152,31 @@ describe("confirmation dialog requests", () => {
   });
 
   test("a late failure of a dismissed confirmation does not show on the next opening, also for the same target", async () => {
-    const { transport, calls } = gatedRevokeTransport();
-    await renderKeys(transport);
+    const queryClient = createQueryClient();
+    const { transport, calls } = holdMockTransport(["RevokeApiKey"]);
+    const apiKeyId = await seededApiKeyId(transport);
+    await renderKeys(transport, queryClient);
     const first = await openRevokeOf("ci-runner");
     await press(confirmButton(first));
+    const reject = await waitForPendingApiKeyCall(
+      queryClient,
+      calls,
+      "RevokeApiKey",
+      {
+        organizationId: MOCK_IDS.acme,
+        apiKeyId,
+      },
+    );
     await press(within(first).getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("alertdialog")).toBeNull();
-    await openRevokeOf("ci-runner");
-    await settleCall(
-      calls[0],
-      new ConnectError("revoke failed", Code.Unavailable),
+    const reopened = await openRevokeOf("ci-runner");
+    await reject(new ConnectError("revoke failed", Code.Unavailable));
+    expect(calls.RevokeApiKey).toHaveLength(1);
+    expect(screen.getByRole("alertdialog", { name: "Revoke ci-runner?" })).toBe(
+      reopened,
     );
-    const open = screen.getByRole("alertdialog");
-    expect(noticeIn(open)).toBeNull();
-    expect(confirmButton(open).disabled).toBe(false);
+    expect(noticeIn(reopened)).toBeNull();
+    expect(confirmButton(reopened).disabled).toBe(false);
   });
 
   test("a failure that arrives while the dialog is open shows its own notice", async () => {
@@ -1155,26 +1208,15 @@ describe("confirmation dialog requests", () => {
 });
 
 describe("form dialog errors", () => {
-  /**
-   * A transport whose CreateApiKey waits for `release()` and then fails for
-   * the first `failures` calls; without a `gate`, it fails at once.
-   */
-  function createKeyTransport(failures: number, gate = false) {
+  /** A transport whose CreateApiKey fails for the first `failures` calls. */
+  function createKeyTransport(failures: number) {
     const mock = createMockTransport();
-    const state = {
-      calls: 0,
-      release: undefined as (() => void) | undefined,
-    };
+    const state = { calls: 0 };
     const transport: Transport = {
       ...mock,
       async unary(method, ...rest) {
         if (method.name === "CreateApiKey") {
           state.calls += 1;
-          if (gate) {
-            await new Promise<void>((resolve) => {
-              state.release = resolve;
-            });
-          }
           if (state.calls <= failures) {
             throw new ConnectError("create failed", Code.Unavailable);
           }
@@ -1251,11 +1293,24 @@ describe("form dialog errors", () => {
   });
 
   test("a failure that arrives after Escape does not show on the next opening", async () => {
-    const { transport, state } = createKeyTransport(1, true);
-    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    const queryClient = createQueryClient();
+    const { transport, calls } = holdMockTransport(["CreateApiKey"]);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, {
+      transport,
+      queryClient,
+    });
     await screen.findByText(/ci-runner/);
     const dialog = await openCreate();
     await submitCreate(dialog);
+    const reject = await waitForPendingApiKeyCall(
+      queryClient,
+      calls,
+      "CreateApiKey",
+      {
+        organizationId: MOCK_IDS.acme,
+        name: "deploy-bot",
+      },
+    );
     await act(async () => {
       fireEvent.keyDown(dialog, { key: "Escape" });
     });
@@ -1263,12 +1318,9 @@ describe("form dialog errors", () => {
     expect(
       screen.queryByRole("dialog", { name: "Create an API key" }),
     ).toBeNull();
-    // The request fails only now, while the dialog is closed.
-    await act(async () => {
-      state.release?.();
-    });
-    await settle(60);
+    await reject(new ConnectError("create failed", Code.Unavailable));
     const reopened = await openCreate();
+    expect(calls.CreateApiKey).toHaveLength(1);
     expect(noticeIn(reopened)).toBeNull();
   });
 });
@@ -1668,7 +1720,7 @@ describe("sandbox transition notices", () => {
         SandboxTransitionOutcome.Pending,
       );
       let holdRefresh = false;
-      const { transport, calls, seen } = holdPagedTransport(
+      const { transport, calls, seen } = holdMockTransport(
         [method, "GetSandbox"],
         (name) => name === method || holdRefresh,
         mock,
@@ -3254,7 +3306,7 @@ describe("billing settings", () => {
     const listMethod = BillingService.method.listLinkableBillingAccounts.name;
     const links: string[] = [];
     let hideAcme = false;
-    const { transport, calls } = holdPagedTransport([listMethod], undefined, {
+    const { transport, calls } = holdMockTransport([listMethod], undefined, {
       ...mock,
       unary(method, ...rest) {
         if (method.name === BillingService.method.linkBillingAccount.name) {
@@ -3910,7 +3962,7 @@ describe("a failed refetch of loaded data", () => {
   ])(
     "keeps loaded organizations and retries a transient refresh error: %s",
     async (error) => {
-      const { transport, calls } = holdPagedTransport(["ListOrganizations"]);
+      const { transport, calls } = holdMockTransport(["ListOrganizations"]);
       const queryClient = newQueryClient();
       renderConsole("/", { transport, queryClient });
       await waitFor(() => expect(calls.ListOrganizations).toHaveLength(1));
