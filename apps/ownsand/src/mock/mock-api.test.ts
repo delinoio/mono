@@ -65,16 +65,33 @@ describe("mock device list", () => {
     expect(removed.devices.map((d) => d.deviceId)).toEqual([MOCK_IDS.buildBox]);
   });
 
-  test("rejects an explicit unspecified state", async () => {
+  test.each([DeviceState.UNSPECIFIED, 999 as DeviceState, -1 as DeviceState])(
+    "rejects invalid device state %s",
+    async (state) => {
+      const client = createClient(DeviceService, createMockTransport());
+      const error = await client
+        .listDevices({ organizationId, state })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect((error as ConnectError).code).toBe(Code.InvalidArgument);
+      expect((error as ConnectError).rawMessage).toBe(
+        "invalid state: must be a device state",
+      );
+    },
+  );
+
+  test.each([
+    { state: DeviceState.ONLINE, ids: [MOCK_IDS.buildBox] },
+    { state: DeviceState.OFFLINE, ids: [MOCK_IDS.studioMac] },
+    { state: DeviceState.REMOVED, ids: [] },
+  ])("lists devices for valid state $state", async ({ state, ids }) => {
     const client = createClient(DeviceService, createMockTransport());
-    const error = await client
-      .listDevices({ organizationId, state: DeviceState.UNSPECIFIED })
-      .catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(ConnectError);
-    expect((error as ConnectError).code).toBe(Code.InvalidArgument);
-    expect((error as ConnectError).rawMessage).toBe(
-      "invalid state: must be a device state",
-    );
+    const { devices, nextPageToken } = await client.listDevices({
+      organizationId,
+      state,
+    });
+    expect(devices.map((d) => d.deviceId)).toEqual(ids);
+    expect(nextPageToken).toBe("");
   });
 
   test("still returns a removed device and ends its sandboxes", async () => {

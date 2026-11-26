@@ -44,6 +44,7 @@ import {
   type DeviceLimits,
   DeviceLimitsSchema,
   DeviceState,
+  DeviceStateSchema,
   EnrollmentTokenState,
   ErrorCode,
   ErrorDetailSchema,
@@ -1430,18 +1431,21 @@ export function createMockTransport(
       },
       listDevices(req) {
         const { org } = membership(req.organizationId);
-        // Mirrors the real API: an absent state means every device that is not
-        // removed, and an explicit UNSPECIFIED state is invalid.
-        if (req.state === DeviceState.UNSPECIFIED) {
+        const { state } = req;
+        if (
+          state !== undefined &&
+          (state === DeviceState.UNSPECIFIED ||
+            !DeviceStateSchema.values.some((value) => value.number === state))
+        ) {
           throw new ConnectError(
             "invalid state: must be a device state",
             Code.InvalidArgument,
           );
         }
         const devices = org.devices.filter((d) =>
-          req.state === undefined
+          state === undefined
             ? d.state !== DeviceState.REMOVED
-            : d.state === req.state,
+            : d.state === state,
         );
         const { page, nextPageToken } = pageOf(devices, req, (d) => d.deviceId);
         return { devices: page, nextPageToken };
