@@ -116,7 +116,13 @@ type SyncResult struct {
 // observes a terminal result. If the result is unknown after a bounded
 // wait, the lock and inputs stay in the guest.
 func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
-	return c.sync(ctx, p, syncManifestLimit)
+	result, err := c.sync(ctx, p, syncManifestLimit)
+	var changed *syncFileChangedError
+	if errors.As(err, &changed) {
+		c.logger.DebugContext(ctx, "sandrun sync file changed after listing",
+			"dev_session_id", p.DevSessionID, "reason", changed.reason)
+	}
+	return result, err
 }
 
 func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*SyncResult, error) {
@@ -134,7 +140,12 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	if _, err := guestCommand(osys, opLock); err != nil {
 		return nil, err
 	}
-	local, err := listLocalFiles(ctx, p.LocalDir)
+	root, err := openSyncRoot(p.LocalDir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	local, err := listLocalFiles(ctx, root)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +277,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		report(TransferProgress{Phase: TransferDone})
 		return res, nil
 	}
-	res, changed, deleted, changedTotal := plan.res, plan.changed, plan.deleted, plan.changedTotal
+	res, changed, deleted := plan.res, plan.changed, plan.deleted
 
 	// Step 7: archive, deletions, manifest and clean-up.
 	syncID, err := uuidv7.NewString()
@@ -301,14 +312,16 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		applyEnv[guestEnvArchive] = archive
 		cleanupEnv[guestEnvArchive] = archive
 		pr, pw := io.Pipe()
+		done := make(chan struct{})
 		go func() {
-			pw.CloseWithError(writeSyncArchive(ctx, pw, p.LocalDir, changed, windows))
+			defer close(done)
+			pw.CloseWithError(writeSyncArchive(ctx, pw, root, changed, windows))
 		}()
-		sent := res.BytesSent
 		n, err := c.writeGuestFile(ctx, s, archive, 0o644, pr, func(done int64) {
-			report(TransferProgress{Phase: TransferUploading, BytesDone: sent + done, BytesTotal: changedTotal})
+			report(TransferProgress{Phase: TransferUploading, BytesDone: done})
 		})
 		_ = pr.CloseWithError(errors.New("sandrun: upload ended"))
+		<-done
 		res.BytesSent += n
 		if err != nil {
 			return nil, err

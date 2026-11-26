@@ -74,9 +74,10 @@ func parseManifest(b []byte) manifest {
 
 // localFile is one file of the local file list.
 type localFile struct {
-	rel    string // slash-separated path relative to the sync root
-	entry  manifestEntry
-	target string // link target of a symbolic link, slash-separated
+	rel      string // slash-separated path relative to the sync root
+	entry    manifestEntry
+	target   string      // link target of a symbolic link, slash-separated
+	identity os.FileInfo // identity of the regular file hashed for this entry
 }
 
 // localList is the result of the local file selection.
@@ -96,22 +97,25 @@ func (e gitIndexEntry) isSymlink() bool {
 	return e.stageZero && e.mode == indexSymlink
 }
 
-// listLocalFiles selects the local files of a sync: the output of
-// `git ls-files --cached --others --exclude-standard` in dir (tracked
-// files and untracked files that are not ignored), without submodules.
-// It reads each file and hashes its content.
-func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
+func openSyncRoot(dir string) (*os.Root, error) {
 	if _, err := exec.LookPath("git"); err != nil {
 		return nil, localError(connect.CodeFailedPrecondition, errors.New("sandrun: sync needs git on the local machine"))
 	}
-	st, err := os.Stat(dir)
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, localError(connect.CodeInvalidArgument, fmt.Errorf("sandrun: local directory: %w", err))
 	}
-	if !st.IsDir() {
-		return nil, localError(connect.CodeInvalidArgument, fmt.Errorf("sandrun: %s is not a directory", dir))
-	}
+	return root, nil
+}
+
+// listLocalFiles selects tracked and unignored files with Git, skips submodules
+// and hashes the selected files under root.
+func listLocalFiles(ctx context.Context, root *os.Root) (*localList, error) {
+	dir := root.Name()
 	inside, err := runGit(ctx, dir, "rev-parse", "--is-inside-work-tree")
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil || strings.TrimSpace(string(inside)) != "true" {
 		return nil, localError(connect.CodeFailedPrecondition, ErrNotGitWorkTree)
 	}
@@ -176,7 +180,7 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 		if !validRelPath(p) {
 			return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sandrun: git listed a path that is not a local relative path: %q", p))
 		}
-		f, ok, err := readLocalFile(ctx, dir, p, entry.mode, symlinkPlaceholders && entry.isSymlink())
+		f, ok, err := readLocalFile(ctx, root, p, entry.mode, symlinkPlaceholders && entry.isSymlink())
 		if err != nil {
 			return nil, err
 		}
@@ -189,46 +193,117 @@ func listLocalFiles(ctx context.Context, dir string) (*localList, error) {
 	return out, nil
 }
 
-// readLocalFile hashes one listed path. Missing paths, directories, and paths
-// below a file or symbolic link are absent from the local file list.
-func readLocalFile(ctx context.Context, dir, rel, indexMode string, symlinkPlaceholder bool) (localFile, bool, error) {
+// lookupLocalFile returns the entry at rel, or nil for an absent path or a
+// path below a nondirectory. It reports a symbolic link at the final component
+// without following it.
+func lookupLocalFile(root *os.Root, rel string) (os.FileInfo, error) {
+	name := filepath.FromSlash(rel)
+	if !filepath.IsLocal(name) {
+		return nil, &syncFileChangedError{rel: rel, reason: syncFileOutsideRoot}
+	}
 	// Lstat follows symbolic links in parent components, so check each
 	// parent from the root outwards before looking up the final component.
 	for i := range rel {
 		if rel[i] != '/' {
 			continue
 		}
-		parent := filepath.Join(dir, filepath.FromSlash(rel[:i]))
-		info, err := os.Lstat(parent)
+		info, err := root.Lstat(filepath.FromSlash(rel[:i]))
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-			return localFile{}, false, nil
+			return nil, nil
 		}
 		if err != nil {
-			return localFile{}, false, err
+			return nil, err
 		}
-		if info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return localFile{}, false, nil
+		if !info.IsDir() {
+			return nil, nil
 		}
 	}
 
-	full := filepath.Join(dir, filepath.FromSlash(rel))
-	info, err := os.Lstat(full)
+	info, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-		return localFile{}, false, nil
+		return nil, nil
+	}
+	return info, err
+}
+
+type syncFileChange string
+
+const (
+	syncFileIdentityChanged syncFileChange = "syncFileIdentityChanged"
+	syncFileNotRegular      syncFileChange = "syncFileNotRegular"
+	syncFileOutsideRoot     syncFileChange = "syncFileOutsideRoot"
+)
+
+type syncFileChangedError struct {
+	rel    string
+	reason syncFileChange
+}
+
+func (e *syncFileChangedError) Error() string {
+	return fmt.Sprintf("sandrun: %s changed during the sync; sync again", e.rel)
+}
+
+func checkSyncFile(root *os.Root, rel string, expected os.FileInfo) error {
+	info, err := lookupLocalFile(root, rel)
+	if err != nil {
+		if _, changed := err.(*syncFileChangedError); changed {
+			return err
+		}
+		return &syncFileChangedError{rel: rel, reason: syncFileIdentityChanged}
+	}
+	return checkSyncFileInfo(rel, expected, info)
+}
+
+func checkSyncFileInfo(rel string, expected, info os.FileInfo) error {
+	switch {
+	case info == nil || info.Mode()&os.ModeSymlink != 0:
+		return &syncFileChangedError{rel: rel, reason: syncFileIdentityChanged}
+	case !info.Mode().IsRegular():
+		return &syncFileChangedError{rel: rel, reason: syncFileNotRegular}
+	case !os.SameFile(expected, info):
+		return &syncFileChangedError{rel: rel, reason: syncFileIdentityChanged}
+	}
+	return nil
+}
+
+// openSyncFile checks the file handle before the caller can read it. Recheck
+// the path after opening because Root allows links that stay inside the root.
+func openSyncFile(root *os.Root, rel string, expected os.FileInfo) (*os.File, error) {
+	file, err := root.OpenFile(filepath.FromSlash(rel), syncFileOpenFlags, 0)
+	if err != nil {
+		return nil, &syncFileChangedError{rel: rel, reason: syncFileIdentityChanged}
+	}
+	info, err := file.Stat()
+	if err == nil {
+		err = checkSyncFileInfo(rel, expected, info)
+	}
+	if err == nil {
+		err = checkSyncFile(root, rel, info)
 	}
 	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+// readLocalFile hashes one listed path. Missing paths, directories, and paths
+// below a file or symbolic link are absent from the local file list.
+func readLocalFile(ctx context.Context, root *os.Root, rel, indexMode string, symlinkPlaceholder bool) (localFile, bool, error) {
+	info, err := lookupLocalFile(root, rel)
+	if err != nil || info == nil {
 		return localFile{}, false, err
 	}
 	f := localFile{rel: rel}
 	switch {
 	case info.Mode()&os.ModeSymlink != 0:
-		target, err := os.Readlink(full)
+		target, err := root.Readlink(filepath.FromSlash(rel))
 		if err != nil {
 			return localFile{}, false, err
 		}
 		return localSymlink(rel, filepath.ToSlash(target)), true, nil
 	case info.Mode().IsRegular():
-		file, err := os.Open(full)
+		file, err := openSyncFile(root, rel, info)
 		if err != nil {
 			return localFile{}, false, err
 		}
@@ -261,6 +336,7 @@ func readLocalFile(ctx context.Context, dir, rel, indexMode string, symlinkPlace
 			mode = modeExecutable
 		}
 		f.entry = manifestEntry{Size: size, SHA256: digest, Mode: mode}
+		f.identity = info
 	default:
 		return localFile{}, false, nil
 	}
@@ -307,6 +383,9 @@ func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
 		msg := strings.TrimSpace(stderr.String())
 		return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sandrun: git %s: %v: %s", args[0], err, msg))

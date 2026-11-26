@@ -12,7 +12,11 @@ Every `UPDATE` creates a new tuple and marks the old one dead; `DELETE` marks tu
 
 ## VACUUM vs VACUUM FULL
 
-`VACUUM` is non-blocking (ShareUpdateExclusive lock) and marks dead space reusable. `VACUUM FULL` rewrites the table and requires an AccessExclusive lock — use only as a last resort. For online bloat reduction prefer `pg_squeeze` or `pg_repack`.
+Ordinary `VACUUM` takes a `SHARE UPDATE EXCLUSIVE` table lock, which allows normal reads and writes to continue. If truncation is enabled and PostgreSQL can readily acquire an `ACCESS EXCLUSIVE` lock, `VACUUM` can remove empty pages at the end of the table and return their disk space to the operating system. Reads and writes on the table can wait while `VACUUM` holds that lock.
+
+Use `VACUUM (TRUNCATE FALSE)` to skip tail truncation and avoid its `ACCESS EXCLUSIVE` lock. `VACUUM` still removes dead row versions and makes their space available for reuse within the table. Empty pages at the end of the table stay allocated to the table.
+
+`VACUUM FULL` rewrites the table and requires an `ACCESS EXCLUSIVE` lock. Use it only as a last resort. For online bloat reduction, prefer `pg_squeeze` or `pg_repack`.
 
 ## Autovacuum Tuning
 

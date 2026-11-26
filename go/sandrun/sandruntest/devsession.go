@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
@@ -105,7 +106,7 @@ func (d *devSessionService) CreateDevSession(_ context.Context, req *connect.Req
 	if err != nil {
 		return nil, err
 	}
-	if len(req.Msg.GetLabel()) > 100 {
+	if utf8.RuneCountInString(req.Msg.GetLabel()) > 100 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("label has more than 100 characters"))
 	}
 	var prof *sandrunv1.RunnerProfile
@@ -429,11 +430,10 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 		if mode == 0 {
 			mode = 0o644
 		}
-		tmp := w.path + ".sandruntest-write"
-		if err := os.WriteFile(tmp, w.data, mode); err != nil {
+		tmp, err := stageWrite(w.path, w.data, mode)
+		if err != nil {
 			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 		}
-		_ = os.Chmod(tmp, mode)
 		if err := os.Rename(tmp, w.path); err != nil {
 			_ = os.Remove(tmp)
 			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
@@ -443,6 +443,21 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 		res.SizeBytes = int64(len(w.data))
 	}
 	return connect.NewResponse(res), nil
+}
+
+func stageWrite(path string, data []byte, mode fs.FileMode) (string, error) {
+	file, err := os.CreateTemp(filepath.Dir(path), ".sandrun-write-")
+	if err != nil {
+		return "", err
+	}
+	if _, err = file.Write(data); err == nil {
+		err = file.Chmod(mode)
+	}
+	if err := errors.Join(err, file.Close()); err != nil {
+		_ = os.Remove(file.Name())
+		return "", err
+	}
+	return file.Name(), nil
 }
 
 // The fake guest.
