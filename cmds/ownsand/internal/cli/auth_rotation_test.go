@@ -14,9 +14,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/delinoio/mono/cmds/internal/credstore"
+	"github.com/delinoio/mono/cmds/internal/logto"
 )
 
 // rotatingLogto is a mock Logto issuer that rotates refresh tokens like the
@@ -87,11 +89,12 @@ func (l *rotatingLogto) handler() http.Handler {
 }
 
 type rotationFixture struct {
-	t   *testing.T
-	l   *rotatingLogto
-	url string
-	st  credstore.Store
-	env map[string]string
+	t      *testing.T
+	l      *rotatingLogto
+	url    string
+	st     credstore.Store
+	env    map[string]string
+	client *http.Client
 }
 
 // newRotationFixture stores an expired access token of the session "s" with
@@ -101,7 +104,30 @@ func newRotationFixture(t *testing.T) *rotationFixture {
 	l := newRotatingLogto("rt-0")
 	ls := httptest.NewServer(l.handler())
 	t.Cleanup(ls.Close)
-	f := &rotationFixture{t: t, l: l, url: ls.URL, st: credstore.Store{Dir: t.TempDir()}}
+	return newRotationFixtureForIssuer(t, l, ls.URL, nil)
+}
+
+// rotationTransport runs the same issuer handler without network I/O, so
+// synctest can advance the wait clock while the issuer or source is blocked.
+type rotationTransport struct{ http.Handler }
+
+func (tr rotationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	defer req.Body.Close()
+	recorder := httptest.NewRecorder()
+	tr.ServeHTTP(recorder, req)
+	return recorder.Result(), nil
+}
+
+func newControlledRotationFixture(t *testing.T) *rotationFixture {
+	t.Helper()
+	l := newRotatingLogto()
+	client := &http.Client{Transport: rotationTransport{l.handler()}}
+	return newRotationFixtureForIssuer(t, l, "http://issuer.example", client)
+}
+
+func newRotationFixtureForIssuer(t *testing.T, l *rotatingLogto, url string, client *http.Client) *rotationFixture {
+	t.Helper()
+	f := &rotationFixture{t: t, l: l, url: url, st: credstore.Store{Dir: t.TempDir()}, client: client}
 	f.env = map[string]string{EnvConfigDir: f.st.Dir}
 	f.save("s", "rt-0", "expired", time.Now().Add(-time.Hour))
 	return f
@@ -132,6 +158,7 @@ func (f *rotationFixture) sourceWith(wait, poll time.Duration, logs io.Writer) f
 	a := &app{
 		env: Env{
 			LookupEnv:        func(k string) (string, bool) { v, ok := f.env[k]; return v, ok },
+			HTTPClient:       f.client,
 			RefreshAdoptWait: wait,
 			RefreshAdoptPoll: poll,
 		},
@@ -406,23 +433,217 @@ func TestInvalidGrantWaitRetriesWithPublishedToken(t *testing.T) {
 	}
 }
 
-// A revoked token is reported after the bound of the wait.
+func requirePendingRotation(t *testing.T, done <-chan tokenResult) {
+	t.Helper()
+	synctest.Wait()
+	select {
+	case res := <-done:
+		t.Fatalf("the token request ended before the rotation deadline: %q %v", res.tok, res.err)
+	default:
+	}
+}
+
+func resultAtRotationDeadline(t *testing.T, done <-chan tokenResult) tokenResult {
+	t.Helper()
+	synctest.Wait()
+	select {
+	case res := <-done:
+		return res
+	default:
+		t.Fatal("the token request is still pending at the rotation deadline")
+		return tokenResult{}
+	}
+}
+
+// The time spent at the issuer is independent of the bounded rotation wait.
 func TestInvalidGrantWaitEndsAtTheBound(t *testing.T) {
-	f := newRotationFixture(t)
-	f.l.setValid()
 	const bound = 150 * time.Millisecond
-	ts := f.sourceWith(bound, 5*time.Millisecond, io.Discard)
-	start := time.Now()
-	done := tokenAsync(context.Background(), ts)
-	res := awaitResult(t, done)
-	if res.err == nil || !strings.Contains(res.err.Error(), "invalid_grant") || !strings.Contains(res.err.Error(), "ownsand login") {
-		t.Fatalf("got %q %v", res.tok, res.err)
+	synctest.Test(t, func(t *testing.T) {
+		f := newControlledRotationFixture(t)
+		started, release := f.hold(func(string) bool { return true })
+		defer release()
+		logs := newSignalWriter(waitMarker)
+		ts := f.sourceWith(bound, 5*time.Millisecond, logs)
+		done := tokenAsync(t.Context(), ts)
+		awaitHeld(t, started, done)
+		time.Sleep(2 * bound)
+		requirePendingRotation(t, done)
+		select {
+		case <-logs.signal:
+			t.Fatal("the rotation wait started before the issuer responded")
+		default:
+		}
+		release()
+		synctest.Wait()
+		select {
+		case <-logs.signal:
+		default:
+			t.Fatal("the invalid_grant response did not start the rotation wait")
+		}
+
+		time.Sleep(bound - time.Nanosecond)
+		requirePendingRotation(t, done)
+		time.Sleep(time.Nanosecond)
+		res := resultAtRotationDeadline(t, done)
+		var oauthErr *logto.Error
+		if res.tok != "" || !errors.As(res.err, &oauthErr) || oauthErr.Code() != logto.InvalidGrant ||
+			!strings.Contains(res.err.Error(), "ownsand login") {
+			t.Fatalf("got %q %v, want wrapped invalid_grant with sign-in guidance", res.tok, res.err)
+		}
+		if calls := f.l.refreshCalls(); !slices.Equal(calls, []string{"rt-0"}) {
+			t.Fatalf("refresh requests %v, want only the rejected one", calls)
+		}
+	})
+}
+
+func TestInvalidGrantAdoptsAtRotationDeadline(t *testing.T) {
+	const bound, poll = 150 * time.Millisecond, 100 * time.Millisecond
+	for _, tc := range []struct {
+		name     string
+		publish  func(*rotationFixture)
+		wantTok  string
+		wantErr  string
+		wantCall []string
+	}{
+		{
+			name: "fresh rotation",
+			publish: func(f *rotationFixture) {
+				f.save("s", "rt-other", "published-jwt", time.Now().Add(time.Hour))
+			},
+			wantTok: "published-jwt", wantCall: []string{"rt-0"},
+		},
+		{
+			name: "expired rotation",
+			publish: func(f *rotationFixture) {
+				f.l.setValid("rt-other")
+				f.save("s", "rt-other", "expired", time.Now().Add(-time.Hour))
+			},
+			wantTok: "jwt-1", wantCall: []string{"rt-0", "rt-other"},
+		},
+		{
+			name: "logout",
+			publish: func(f *rotationFixture) {
+				if err := f.st.Delete(); err != nil {
+					f.t.Fatal(err)
+				}
+			},
+			wantErr: "signed out", wantCall: []string{"rt-0"},
+		},
+		{
+			name: "replacement",
+			publish: func(f *rotationFixture) {
+				f.save("other", "rt-other", "replacement-jwt", time.Now().Add(time.Hour))
+			},
+			wantErr: "replaced", wantCall: []string{"rt-0"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newControlledRotationFixture(t)
+				logs := newSignalWriter(waitMarker)
+				ts := f.sourceWith(bound, poll, logs)
+				done := tokenAsync(t.Context(), ts)
+				awaitWaiting(t, logs, done)
+				synctest.Wait()
+				time.Sleep(bound - time.Nanosecond)
+				requirePendingRotation(t, done)
+				// The first poll has read the unchanged store. The next
+				// poll is due after the deadline.
+				tc.publish(f)
+				time.Sleep(time.Nanosecond)
+				res := resultAtRotationDeadline(t, done)
+				if res.tok != tc.wantTok || (tc.wantErr == "" && res.err != nil) ||
+					(tc.wantErr != "" && (res.err == nil || !strings.Contains(res.err.Error(), tc.wantErr))) {
+					t.Fatalf("got %q %v, want token %q and error containing %q", res.tok, res.err, tc.wantTok, tc.wantErr)
+				}
+				if calls := f.l.refreshCalls(); !slices.Equal(calls, tc.wantCall) {
+					t.Fatalf("refresh requests %v, want %v", calls, tc.wantCall)
+				}
+			})
+		})
 	}
-	if elapsed := time.Since(start); elapsed < bound {
-		t.Fatalf("the error came after %v, before the %v bound", elapsed, bound)
-	}
-	if calls := f.l.refreshCalls(); len(calls) != 1 {
-		t.Fatalf("refresh requests %v", calls)
+}
+
+func TestInvalidGrantRotationDeadlinePrefersCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const bound, poll = 150 * time.Millisecond, 100 * time.Millisecond
+		a := app{
+			env:    Env{RefreshAdoptWait: bound, RefreshAdoptPoll: poll},
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		reads := 0
+		rotated, err := a.awaitRefreshRotation(ctx, func() (bool, error) {
+			reads++
+			// Cancel at the deadline while a poll is still processing.
+			// Both events are ready when the wait selects again.
+			time.Sleep(bound - poll)
+			cancel()
+			return false, nil
+		})
+		if rotated || !errors.Is(err, context.Canceled) || reads != 1 {
+			t.Fatalf("got rotated=%v, error=%v, reads=%d, want cancellation and one poll", rotated, err, reads)
+		}
+	})
+}
+
+func TestInvalidGrantRecoversAfterFinalRefreshRequest(t *testing.T) {
+	const bound, poll = 150 * time.Millisecond, 50 * time.Millisecond
+	for _, tc := range []struct {
+		name          string
+		beforeReject  bool
+		accessExpires time.Duration
+		wantTok       string
+		wantErr       error
+	}{
+		{name: "before rejection", beforeReject: true, accessExpires: time.Hour, wantTok: "published-jwt"},
+		{name: "during wait", accessExpires: time.Hour, wantTok: "published-jwt"},
+		{name: "expired", accessExpires: -time.Hour, wantErr: errRefreshContention},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newControlledRotationFixture(t)
+				logs := newSignalWriter(waitMarker)
+				ts := f.sourceWith(bound, poll, logs)
+				started, release := f.hold(func(rt string) bool { return rt == "rt-0" })
+				defer release()
+				done := tokenAsync(t.Context(), ts)
+				for _, next := range []string{"rt-1", "rt-2"} {
+					awaitHeld(t, started, done)
+					f.save("s", next, "expired", time.Now().Add(-time.Hour))
+					nextStarted, nextRelease := f.hold(func(rt string) bool { return rt == next })
+					defer nextRelease()
+					release()
+					started, release = nextStarted, nextRelease
+				}
+				awaitHeld(t, started, done)
+				expiry := time.Now().Add(tc.accessExpires)
+				if tc.beforeReject {
+					f.save("s", "rt-3", "published-jwt", expiry)
+					release()
+				} else {
+					release()
+					awaitWaiting(t, logs, done)
+					synctest.Wait()
+					f.save("s", "rt-3", "published-jwt", expiry)
+					time.Sleep(poll)
+				}
+				synctest.Wait()
+				res := awaitResult(t, done)
+				if res.tok != tc.wantTok || !errors.Is(res.err, tc.wantErr) {
+					t.Fatalf("got %q %v, want %q %v", res.tok, res.err, tc.wantTok, tc.wantErr)
+				}
+				if calls := f.l.refreshCalls(); !slices.Equal(calls, []string{"rt-0", "rt-1", "rt-2"}) {
+					t.Fatalf("refresh requests %v, want the three previous generations", calls)
+				}
+				got := f.stored()
+				if got.SessionID != "s" || got.RefreshToken != "rt-3" || got.AccessToken != "published-jwt" ||
+					!got.AccessTokenExpiry.Equal(expiry) {
+					t.Fatalf("the third publication changed: %+v", got)
+				}
+			})
+		})
 	}
 }
 
