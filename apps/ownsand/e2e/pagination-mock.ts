@@ -435,6 +435,12 @@ export function createMockTransport(): Transport {
           sandboxId: sandbox.sandboxId,
         });
         sessionStorage.setItem("ownsand-e2e-creates", JSON.stringify(creates));
+        if (
+          (createResponse === "lost" && creates.length === 1) ||
+          (createResponse === "lost-twice" && creates.length <= 2)
+        ) {
+          throw new ConnectError("Response lost", Code.Unavailable);
+        }
         if (creates.length > 1 || createResponse === "valid") return response;
         if (createResponse === "held") {
           await new Promise<void>((resolve) => {
