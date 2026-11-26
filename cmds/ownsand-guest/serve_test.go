@@ -18,15 +18,21 @@ func TestServeExitsWithFailureOnTerminalTunnelError(t *testing.T) {
 	started := make(chan struct{})
 	stopped := make(chan struct{})
 	result := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	go func() {
-		result <- serve(context.Background(), serveLogger(), fatal, func(ctx context.Context) error {
+		result <- serve(ctx, serveLogger(), fatal, func(ctx context.Context) error {
 			close(started)
 			<-ctx.Done()
 			close(stopped)
 			return nil
 		})
 	}()
-	<-started
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the guest service to start")
+	}
 	fatal <- errors.New("tunnel: TAP read: gone")
 	select {
 	case code := <-result:

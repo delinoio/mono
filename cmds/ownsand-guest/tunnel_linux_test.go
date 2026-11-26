@@ -108,8 +108,13 @@ func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 
 // connect makes the listener accept a new agent connection and returns the
 // agent side of it.
-func connect(l *fakeListener) net.Conn {
+func connect(t *testing.T, l *fakeListener) net.Conn {
+	t.Helper()
 	agent, guest := net.Pipe()
+	t.Cleanup(func() {
+		agent.Close()
+		guest.Close()
+	})
 	l.conns <- guest
 	return agent
 }
@@ -190,8 +195,7 @@ func TestTunnelTapReadErrorIsFatalAndClosesEverything(t *testing.T) {
 	tap, l := newFakeTap(), newFakeListener()
 	tun := newTunnel(tap, l, testLogger())
 	tun.start()
-	agent := connect(l)
-	defer agent.Close()
+	agent := connect(t, l)
 	waitConnected(t, tun)
 	tap.in <- []byte("ping")
 	if got := readFrame(t, agent); string(got) != "ping" {
@@ -282,14 +286,19 @@ func TestTunnelAcceptErrorIsFatalAndClosesEverything(t *testing.T) {
 	tap, l := newFakeTap(), newFakeListener()
 	tun := newTunnel(tap, l, testLogger())
 	tun.start()
-	agent := connect(l)
-	defer agent.Close()
+	t.Cleanup(func() { tun.fail(errors.New("test cleanup")) })
+	agent := connect(t, l)
 	agent.SetWriteDeadline(time.Now().Add(testTimeout))
 	if _, err := agent.Write(frame([]byte("hello"))); err != nil {
 		t.Fatal(err)
 	}
-	if got := <-tap.written; string(got) != "hello" {
-		t.Fatalf("TAP frame %q", got)
+	select {
+	case got := <-tap.written:
+		if string(got) != "hello" {
+			t.Fatalf("TAP frame %q", got)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the TAP frame from the agent")
 	}
 
 	acceptErr := errors.New("vsock listener failed")
@@ -306,9 +315,9 @@ func TestTunnelPeerDropIsNotFatalAndReplacementWorks(t *testing.T) {
 	tap, l := newFakeTap(), newFakeListener()
 	tun := newTunnel(tap, l, testLogger())
 	tun.start()
-	defer tun.fail(errors.New("test cleanup"))
+	t.Cleanup(func() { tun.fail(errors.New("test cleanup")) })
 
-	first := connect(l)
+	first := connect(t, l)
 	waitConnected(t, tun)
 	tun.mu.Lock()
 	firstGuest := tun.conn
@@ -323,8 +332,7 @@ func TestTunnelPeerDropIsNotFatalAndReplacementWorks(t *testing.T) {
 		t.Fatal("dropping the peer closed the TAP device or the listener")
 	}
 
-	second := connect(l)
-	defer second.Close()
+	second := connect(t, l)
 	// The dropped connection clears itself once its reader ends and the
 	// replacement then becomes current; wait until the current one is the
 	// replacement before sending, because frames for a closed connection
@@ -342,8 +350,13 @@ func TestTunnelPeerDropIsNotFatalAndReplacementWorks(t *testing.T) {
 	if _, err := second.Write(frame([]byte("back"))); err != nil {
 		t.Fatal(err)
 	}
-	if got := <-tap.written; !bytes.Equal(got, []byte("back")) {
-		t.Fatalf("TAP frame %q", got)
+	select {
+	case got := <-tap.written:
+		if !bytes.Equal(got, []byte("back")) {
+			t.Fatalf("TAP frame %q", got)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the TAP frame from the replacement agent")
 	}
 	expectNoFatal(t, tun)
 }
