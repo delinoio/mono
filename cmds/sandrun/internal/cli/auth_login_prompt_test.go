@@ -18,6 +18,20 @@ import (
 	"github.com/delinoio/mono/cmds/internal/credstore"
 )
 
+func TestLoginReportsSafeOAuthError(t *testing.T) {
+	f := newFixture(t)
+	lg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":"invalid_client","error_description":"synthetic-description-marker"}`)
+	}))
+	defer lg.Close()
+	f.env[EnvLogtoEndpoint] = lg.URL
+	f.env[EnvLogtoAppID] = "app"
+	if got := f.run("", "login"); got != (result{code: ExitError, stderr: "error: logto: invalid_client\n"}) {
+		t.Fatalf("login = %+v, want a fixed OAuth error", got)
+	}
+}
+
 func TestLoginPromptWrite(t *testing.T) {
 	writeErr := errors.New("stderr write rejected")
 	for _, tt := range []struct {
