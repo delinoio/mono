@@ -406,6 +406,96 @@ func TestCallerDeadlineEndsStalledSetupWithoutRelayRecovery(t *testing.T) {
 	}
 }
 
+func TestLateDataChannelOpen(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		transport     Transport
+		setupTimeout  bool
+		callerCancels bool
+		wantTransport ownsandv1.DataPathTransport
+		wantRelayAuth int
+	}{
+		{name: "auto-timeout", transport: TransportAuto, setupTimeout: true, wantTransport: relayTransport, wantRelayAuth: 1},
+		{name: "forced-peer-timeout", transport: TransportPeerToPeer, setupTimeout: true},
+		{name: "caller-cancels", transport: TransportAuto, callerCancels: true},
+		{name: "timely-open", transport: TransportAuto, wantTransport: p2pTransport},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			c := cp.client(t, tc.transport)
+			if tc.setupTimeout {
+				c.timing.p2pOpenTimeout = 2 * time.Second
+			}
+			s := cp.handle(t, c)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var peer *webrtc.PeerConnection
+			c.p2p.gateDataChannelOpen = func(setup context.Context, pc *webrtc.PeerConnection, opened <-chan struct{}) <-chan struct{} {
+				peer = pc
+				t.Cleanup(func() { _ = pc.Close() })
+				select {
+				case <-opened:
+				case <-time.After(10 * time.Second):
+					t.Fatal("the loopback data channel did not open")
+				}
+				if tc.callerCancels {
+					cancel()
+				}
+				if tc.setupTimeout || tc.callerCancels {
+					<-setup.Done()
+				}
+				// Release the open notification after any cancellation so both
+				// signals are already ready when the final select starts.
+				released := make(chan struct{})
+				close(released)
+				return released
+			}
+
+			rec := &recorder{}
+			res, err := s.Exec(ctx, ExecParams{Command: []string{"run"}, OnEvent: rec.on})
+			switch {
+			case tc.callerCancels:
+				if err != context.Canceled {
+					t.Fatalf("Exec error = %v, want context.Canceled", err)
+				}
+			case tc.setupTimeout && tc.transport == TransportPeerToPeer:
+				var openErr *errP2POpen
+				if !errors.As(err, &openErr) || !errors.Is(err, errSetupTimeout) {
+					t.Fatalf("Exec error = %v, want peer setup timeout", err)
+				}
+			default:
+				if err != nil {
+					t.Fatal(err)
+				}
+				checkLines(t, res, rec, 3)
+				if res.Transport != tc.wantTransport || s.Transport() != tc.wantTransport {
+					t.Fatalf("Exec transport = %v, handle transport = %v, want %v", res.Transport, s.Transport(), tc.wantTransport)
+				}
+			}
+			if got := len(cp.authRequests()); got != tc.wantRelayAuth {
+				t.Fatalf("AuthorizeRelay calls = %d, want %d", got, tc.wantRelayAuth)
+			}
+			if peer == nil {
+				t.Fatal("setup did not reach the final data channel wait")
+			}
+			installed := s.installedSession()
+			if tc.wantTransport == p2pTransport {
+				if installed == nil || installed.pc != peer {
+					t.Fatal("the timely peer connection did not become the installed session")
+				}
+			} else {
+				if installed != nil {
+					t.Fatal("a peer connection was installed after setup cancellation")
+				}
+				waitFor(t, "the canceled peer connection to close", func() bool {
+					return peer.ConnectionState() == webrtc.PeerConnectionStateClosed
+				})
+			}
+		})
+	}
+}
+
 // A control plane that applies the caller's deadline (Connect sends the time
 // left as a timeout header) can answer deadline_exceeded slightly before the
 // caller's own timer fires. The test makes that order deterministic: the held
