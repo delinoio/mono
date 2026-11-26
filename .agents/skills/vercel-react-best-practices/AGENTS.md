@@ -3549,9 +3549,11 @@ This new approach is more efficient because:
 
 **Impact: LOW-MEDIUM (avoids unnecessary computation)**
 
-Return early when result is determined to skip unnecessary processing.
+Use an early return to skip work once you know the result.
 
-**Incorrect: processes all items even after finding answer**
+**Full scan**
+
+Each failure replaces the previous error. The full scan returns the last error it finds.
 
 ```typescript
 function validateUsers(users: User[]) {
@@ -3567,23 +3569,25 @@ function validateUsers(users: User[]) {
       hasError = true
       errorMessage = 'Name required'
     }
-    // Continues checking all users even after error found
   }
   
   return hasError ? { valid: false, error: errorMessage } : { valid: true }
 }
 ```
 
-**Correct: returns immediately on first error**
+**Early return**
+
+Start with the last user and check name before email. The first failure in this order is the one the full scan would return.
 
 ```typescript
 function validateUsers(users: User[]) {
-  for (const user of users) {
-    if (!user.email) {
-      return { valid: false, error: 'Email required' }
-    }
+  for (let i = users.length - 1; i >= 0; i--) {
+    const user = users[i]
     if (!user.name) {
       return { valid: false, error: 'Name required' }
+    }
+    if (!user.email) {
+      return { valid: false, error: 'Email required' }
     }
   }
 
