@@ -64,6 +64,7 @@ import {
   MockBillingState,
 } from "./mock/mock-api.ts";
 import {
+  fullListRefresh,
   type HeldCall,
   holdingTransport as holdMockTransport,
 } from "./test-support.tsx";
@@ -4089,6 +4090,72 @@ describe("a failed refetch of loaded data", () => {
           screen.getByRole("button", { name: "Sign in with Delino" }),
         ).toBeTruthy();
       }
+    },
+  );
+
+  test.each([
+    [Code.NotFound, false],
+    [Code.PermissionDenied, false],
+    [Code.Unauthenticated, false],
+    [Code.Unavailable, true],
+  ] as const)(
+    "updates the open organization switcher after a full refresh error %s",
+    async (code, keepsChoices) => {
+      const mock = createMockTransport();
+      const organizationMethod = OrganizationService.method.listOrganizations;
+      const { transport, queryClient, refetch, failedTokens, seen } =
+        fullListRefresh(organizationMethod, mock);
+      const path = `/orgs/${MOCK_IDS.acme}/sandboxes`;
+      renderConsole(path, { transport, queryClient });
+
+      const switcher = await screen.findByRole("combobox", {
+        name: "Organization",
+      });
+      await act(async () => fireEvent.click(switcher));
+      expect(
+        screen.getByRole("option", { name: "Acme Robotics" }),
+      ).toBeTruthy();
+      expect(
+        screen.getByRole("option", { name: "Northwind Labs" }),
+      ).toBeTruthy();
+      const heading = await screen.findByRole("heading", { name: "Sandboxes" });
+      const organizationReads = seen.GetOrganization;
+
+      await refetch(code);
+      expect(failedTokens).toEqual(keepsChoices ? ["", "", ""] : [""]);
+      await waitFor(() =>
+        expect(screen.queryByRole("combobox", { name: "Organization" })).toBe(
+          keepsChoices ? switcher : null,
+        ),
+      );
+      const options = screen.queryAllByRole("option");
+      expect(options.map((option) => option.textContent)).toEqual(
+        keepsChoices ? ["Acme Robotics", "Northwind Labs"] : [],
+      );
+      expect(screen.getByRole("link", { name: "OwnSand" })).toBeTruthy();
+      expect(
+        screen.getByRole("link", { name: "Account settings" }),
+      ).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Sign out" })).toBeTruthy();
+      expect(screen.getByRole("heading", { name: "Sandboxes" })).toBe(heading);
+      expect(window.location.pathname).toBe(path);
+      expect(seen.GetOrganization).toBe(organizationReads);
+
+      await createClient(OrganizationService, mock).createOrganization({
+        name: "Fabrikam",
+      });
+      await refetch();
+      if (!keepsChoices) {
+        await act(async () =>
+          fireEvent.click(
+            await screen.findByRole("combobox", { name: "Organization" }),
+          ),
+        );
+      }
+      expect(
+        await screen.findByRole("option", { name: "Fabrikam" }),
+      ).toBeTruthy();
+      expect(screen.getAllByRole("option")).toHaveLength(3);
     },
   );
 
