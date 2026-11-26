@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { dirname, join, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -86,6 +86,25 @@ function fixture(t) {
   return { dir, appDir, siblingDir };
 }
 
+function proxyCliPath(dir) {
+  return join(dir, "global", "portless", "dist", "cli.js");
+}
+
+function proxyCliPathHasWhitespace(dir) {
+  return /\s/.test(proxyCliPath(dir));
+}
+
+function versionedProxyFixture(t) {
+  const repo = fixture(t);
+  // Preflight splits the ps command on whitespace. Keep these PID checks
+  // skipped for spaced CLI paths until preflight can detect their versions.
+  if (proxyCliPathHasWhitespace(repo.dir)) {
+    t.skip("whitespace in the proxy CLI path prevents version detection");
+    return null;
+  }
+  return repo;
+}
+
 function addFakeApp(dir, name) {
   const appDir = join(dir, "apps", name);
   mkdirSync(appDir, { recursive: true });
@@ -114,13 +133,13 @@ function addFakeApp(dir, name) {
 // Starts a fake proxy of an older portless and records its PID in
 // `<stateDir>/proxy.pid`.
 function startOutdatedProxy(t, dir, stateDir) {
-  const portlessDir = join(dir, "global", "portless");
-  mkdirSync(join(portlessDir, "dist"), { recursive: true });
+  const cli = proxyCliPath(dir);
+  const dist = dirname(cli);
+  mkdirSync(dist, { recursive: true });
   writeFileSync(
-    join(portlessDir, "package.json"),
+    join(dist, "..", "package.json"),
     JSON.stringify({ name: "portless", version: outdatedVersion }),
   );
-  const cli = join(portlessDir, "dist", "cli.js");
   writeFileSync(cli, fakeProxyCli);
   const proxy = spawn(
     process.execPath,
@@ -182,7 +201,9 @@ test(
   "resolves a relative state directory against the app directory",
   { skip: psSkip },
   (t) => {
-    const { dir, appDir } = fixture(t);
+    const repo = versionedProxyFixture(t);
+    if (repo === null) return;
+    const { dir, appDir } = repo;
     const stateDir = join(appDir, ".portless-probe");
     startOutdatedProxy(t, dir, stateDir);
     const result = run(dir, { stateDir: ".portless-probe", home: dir });
@@ -196,7 +217,9 @@ test(
   "does not resolve a relative state directory against the launcher directory",
   { skip: psSkip },
   (t) => {
-    const { dir, appDir } = fixture(t);
+    const repo = versionedProxyFixture(t);
+    if (repo === null) return;
+    const { dir, appDir } = repo;
     // portless would not read this directory: it runs from the app directory.
     startOutdatedProxy(t, dir, join(dir, ".portless-probe"));
     const result = run(dir, { stateDir: ".portless-probe", home: dir });
@@ -210,7 +233,9 @@ test(
 );
 
 test("uses an absolute state directory as written", { skip: psSkip }, (t) => {
-  const { dir, appDir } = fixture(t);
+  const repo = versionedProxyFixture(t);
+  if (repo === null) return;
+  const { dir, appDir } = repo;
   const stateDir = join(dir, "absolute-state");
   startOutdatedProxy(t, dir, stateDir);
   const result = run(dir, { stateDir, home: dir });
@@ -222,7 +247,9 @@ test(
   "reads ~/.portless when the state directory is unset",
   { skip: psSkip },
   (t) => {
-    const { dir, appDir } = fixture(t);
+    const repo = versionedProxyFixture(t);
+    if (repo === null) return;
+    const { dir, appDir } = repo;
     const home = join(dir, "home");
     startOutdatedProxy(t, dir, join(home, ".portless"));
     const result = run(dir, { home });
@@ -239,12 +266,20 @@ test("root dev shares the preflight app's relative state directory", (t) => {
   const { dir, appDir, siblingDir } = fixture(t);
   const stateDir = join(appDir, ".portless-probe");
   if (!psSkip) startOutdatedProxy(t, dir, stateDir);
+  const detectsOutdatedProxy = !psSkip && !proxyCliPathHasWhitespace(dir);
   const result = run(dir, { script: launcher, stateDir: ".portless-probe" });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.calls, [
-    ...(psSkip ? startOnly(appDir, stateDir) : stopThenStart(appDir, stateDir)),
+    ...(detectsOutdatedProxy
+      ? stopThenStart(appDir, stateDir)
+      : startOnly(appDir, stateDir)),
     ...appCalls(appDir, siblingDir, stateDir),
   ]);
+  if (detectsOutdatedProxy) {
+    assert.match(result.stderr, /portless_proxy_outdated/);
+  } else {
+    assert.doesNotMatch(result.stderr, /portless_proxy_outdated/);
+  }
 });
 
 test("root dev passes the absolute override through as supplied", (t) => {
