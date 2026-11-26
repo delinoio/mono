@@ -23,6 +23,9 @@ const DataChannelLabel = "ownsand-data"
 // p2pConfig holds peer-to-peer settings. Tests restrict ICE to loopback.
 type p2pConfig struct {
 	settingEngine func() *webrtc.SettingEngine
+	// gateDataChannelOpen lets tests delay delivery of the open notification
+	// before the final setup wait.
+	gateDataChannelOpen func(context.Context, *webrtc.PeerConnection, <-chan struct{}) <-chan struct{}
 	// setupDone, when set, runs after a session setup ends and before the
 	// handle installs the session. Tests use it to close the handle at that
 	// exact point, which a real setup cannot reach deterministically.
@@ -262,19 +265,26 @@ func openP2PSession(ctx context.Context, c *Client, org, sandboxID string) (*p2p
 		closePC()
 		return nil, &errP2POpen{cause: err}
 	}
+	var openSignal <-chan struct{} = opened
+	if c.p2p.gateDataChannelOpen != nil {
+		openSignal = c.p2p.gateDataChannelOpen(sctx, pc, opened)
+	}
 	select {
-	case <-opened:
-		return s, nil
+	case <-openSignal:
+		// The open signal and setup cancellation can both be ready.
+		if sctx.Err() == nil {
+			return s, nil
+		}
 	case <-s.done:
 		closePC()
 		return nil, &errP2POpen{cause: s.endErr}
 	case <-sctx.Done():
-		closePC()
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, expired(context.Cause(sctx))
 	}
+	closePC()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, expired(context.Cause(sctx))
 }
 
 // end ends the session once with err and closes the peer connection.
