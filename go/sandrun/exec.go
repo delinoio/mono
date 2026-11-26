@@ -198,6 +198,11 @@ func (e *ExecStreamError) Unwrap() error { return e.Err }
 // prefix again. To avoid duplicate writes, use atomic chunk writes or track
 // durable bytes by stream and offset.
 //
+// If the caller context ends while the callback accepts an inferred gap,
+// the stream stops before delivering the chunk that revealed the gap.
+// The ExecStreamError offset for that stream points to the start of the
+// chunk so a later AttachExec can replay it.
+//
 // Exec returns an initial credential failure or a terminal server status
 // before the first event unchanged. Later stream failures return an
 // *ExecStreamError.
@@ -235,9 +240,10 @@ func (c *Client) Exec(ctx context.Context, p ExecParams) (*ExecResult, error) {
 // with the same continuation rules as Exec. It suppresses the callback for
 // the started event.
 //
-// The callback acknowledges stdout and stderr chunks as described in
-// [Client.Exec]. A callback error returns an *ExecStreamError with the offset
-// of the first byte in the rejected range, which a later AttachExec can replay.
+// The callback acknowledges stdout and stderr chunks and inferred gaps as
+// described in [Client.Exec]. A callback error returns an *ExecStreamError
+// with the offset of the first byte in the rejected range, which a later
+// AttachExec can replay.
 func (c *Client) AttachExec(ctx context.Context, p AttachParams) (*ExecResult, error) {
 	op := &execOp{
 		c: c, org: p.OrganizationID, session: p.DevSessionID, execID: p.ExecID, onEvent: p.OnEvent,
@@ -308,8 +314,8 @@ func (o *execOp) run(ctx context.Context) (*ExecResult, error) {
 		if a.result != nil {
 			return a.result, nil
 		}
-		if a.callbackErr != nil {
-			return nil, o.streamErr(a.callbackErr, false)
+		if a.eventErr != nil {
+			return nil, o.streamErr(a.eventErr, false)
 		}
 		if o.start != nil {
 			// A terminal credential failure prevents the initial send.
@@ -362,7 +368,7 @@ func (o *execOp) run(ctx context.Context) (*ExecResult, error) {
 type execAttempt struct {
 	result      *ExecResult
 	err         error
-	callbackErr error
+	eventErr    error
 	received    bool
 	progressed  bool
 	healthyIdle bool
@@ -370,6 +376,7 @@ type execAttempt struct {
 }
 
 func (o *execOp) receive(ctx context.Context, retryDeadline time.Time) (a execAttempt) {
+	streamCtx := ctx
 	var retryTimer *time.Timer
 	if !retryDeadline.IsZero() {
 		remaining := time.Until(retryDeadline)
@@ -377,18 +384,18 @@ func (o *execOp) receive(ctx context.Context, retryDeadline time.Time) (a execAt
 			return execAttempt{expired: true}
 		}
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithCancel(ctx)
+		streamCtx, cancel = context.WithCancel(ctx)
 		defer cancel()
 		// Stop the timer when the stream makes progress so a recovered
 		// command can remain idle on the same stream.
 		retryTimer = time.AfterFunc(remaining, cancel)
 		defer func() {
 			retryTimer.Stop()
-			a.expired = !a.progressed && ctx.Err() != nil && !connect.IsWireError(a.err)
+			a.expired = !a.progressed && streamCtx.Err() != nil && !connect.IsWireError(a.err)
 		}()
 	}
 
-	stream, err := o.openStream(ctx)
+	stream, err := o.openStream(streamCtx)
 	if err != nil {
 		return execAttempt{err: err}
 	}
@@ -402,8 +409,8 @@ func (o *execOp) receive(ctx context.Context, retryDeadline time.Time) (a execAt
 		if !a.progressed && idleSince.IsZero() && (ev.GetKeepalive() != nil || (o.started && ev.GetStarted() != nil)) {
 			idleSince = time.Now()
 		}
-		a.result, a.callbackErr = o.handle(ev)
-		if a.result != nil || a.callbackErr != nil {
+		a.result, a.eventErr = o.handle(ctx, ev)
+		if a.result != nil || a.eventErr != nil {
 			return a
 		}
 		if !a.progressed && (o.started != started || o.stdout > stdout || o.stderr > stderr) {
@@ -437,7 +444,7 @@ func (o *execOp) openStream(ctx context.Context) (eventStream, error) {
 }
 
 // handle processes one event and returns the result for a final event.
-func (o *execOp) handle(ev *sandrunv1.DevSessionExecEvent) (*ExecResult, error) {
+func (o *execOp) handle(ctx context.Context, ev *sandrunv1.DevSessionExecEvent) (*ExecResult, error) {
 	switch {
 	case ev.GetKeepalive() != nil:
 		return nil, nil
@@ -459,9 +466,9 @@ func (o *execOp) handle(ev *sandrunv1.DevSessionExecEvent) (*ExecResult, error) 
 		}
 		return nil, o.lose(missOut, missErr)
 	case ev.GetStdout() != nil:
-		return nil, o.output(ExecEventStdout, &o.stdout, ev.GetStdout())
+		return nil, o.output(ctx, ExecEventStdout, &o.stdout, ev.GetStdout())
 	case ev.GetStderr() != nil:
-		return nil, o.output(ExecEventStderr, &o.stderr, ev.GetStderr())
+		return nil, o.output(ctx, ExecEventStderr, &o.stderr, ev.GetStderr())
 	case ev.GetExited() != nil:
 		x := ev.GetExited()
 		r := o.result(ExecResultExited)
@@ -511,7 +518,7 @@ func (o *execOp) lose(out, errRange ByteRange) error {
 // output reports one chunk. It drops previously acknowledged bytes,
 // reports skipped bytes as lost output, and advances past the chunk
 // when the callback accepts it.
-func (o *execOp) output(kind ExecEventKind, next *int64, ch *sandrunv1.DevSessionExecOutput) error {
+func (o *execOp) output(ctx context.Context, kind ExecEventKind, next *int64, ch *sandrunv1.DevSessionExecOutput) error {
 	off, data := ch.GetOffset(), ch.GetData()
 	if off > *next {
 		missing := ByteRange{From: *next, To: off}
@@ -522,6 +529,9 @@ func (o *execOp) output(kind ExecEventKind, next *int64, ch *sandrunv1.DevSessio
 			err = o.lose(ByteRange{}, missing)
 		}
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}
