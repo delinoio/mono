@@ -726,6 +726,12 @@ describe("billing", () => {
     const banner = screen.getByRole("region", "This organization is suspended");
     await expect(banner).toBeVisible();
     await expect(banner).toContainText("Running sandboxes are paused");
+    await expect(banner).toContainText(
+      "creating sandboxes, snapshots, templates and enrollment tokens",
+    );
+    await expect(banner).toContainText(
+      "enrolling a device even with an existing enrollment token",
+    );
     await expect(
       banner.getByRole("link", "Manage billing at accounts.delino.io"),
     ).toHaveAttribute("href", "https://accounts.delino.io");
@@ -777,9 +783,14 @@ describe("billing", () => {
         ),
       ),
     ).toEqual([acmeBillingId]);
-    await expect(
-      screen.getByRole("region", "This organization is blocked"),
-    ).toBeVisible();
+    const banner = screen.getByRole("region", "This organization is blocked");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText(
+      "creating sandboxes, snapshots, templates and enrollment tokens",
+    );
+    await expect(banner).toContainText(
+      "enrolling a device even with an existing enrollment token",
+    );
 
     await screen.getByRole("button", "Link a billing account").tap();
     const dialog = screen.getByRole("dialog", "Link a billing account");
