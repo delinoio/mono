@@ -439,6 +439,9 @@ func (a *app) memberAccept(ctx context.Context, name string, args []string) erro
 	}
 	res, err := c.Members().AcceptInvitation(ctx, &ownsandv1.AcceptInvitationRequest{InvitationSecret: secret})
 	if err != nil {
+		if ctx.Err() == context.Canceled && errors.Is(err, context.Canceled) {
+			return &exitError{code: ExitInterrupted, msg: "interrupted"}
+		}
 		return err
 	}
 	return a.printMessage(res)
