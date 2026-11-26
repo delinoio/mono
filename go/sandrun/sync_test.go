@@ -47,7 +47,10 @@ func newRepo(t *testing.T, tracked, untracked map[string]string, gitignore strin
 		t.Skip("git is not installed")
 	}
 	dir := t.TempDir()
+	isolateGitEnvironment(t, dir)
 	git(t, dir, "init", "-q")
+	// Git uses the default XDG ignore file even without a global config.
+	git(t, dir, "config", "--local", "core.excludesFile", os.DevNull)
 	write := func(files map[string]string) {
 		for p, content := range files {
 			full := filepath.Join(dir, filepath.FromSlash(p))
@@ -69,15 +72,40 @@ func newRepo(t *testing.T, tracked, untracked map[string]string, gitignore strin
 	return dir
 }
 
+func isolateGitEnvironment(t *testing.T, dir string) {
+	t.Helper()
+	// The SDK's Git subprocesses inherit the test environment too.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	for _, name := range strings.Fields(git(t, dir, "rev-parse", "--local-env-vars")) {
+		if _, set := os.LookupEnv(name); set {
+			// Register restoration with testing.T before unsetting the variable.
+			t.Setenv(name, "")
+			if err := os.Unsetenv(name); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)
 	}
 	return string(out)
+}
+
+func openTestSyncRoot(t *testing.T, dir string) *os.Root {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	return root
 }
 
 func readGuest(t *testing.T, ds *sandrunv1.DevSession, rel string) string {
@@ -290,12 +318,21 @@ func requireTransferWorkingDirectories(t *testing.T, ds *sandrunv1.DevSession, s
 
 func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
 	needPOSIX(t)
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	if err := os.Mkdir(filepath.Join(xdg, "git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(xdg, "git", "ignore"), []byte("a.txt\nnew.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	c, srv, org := newTestClient(t, "")
 	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	dir := newRepo(t,
 		map[string]string{"a.txt": "a", "src/main.go": "package main", "old.txt": "old", "run.sh": "#!/bin/sh\necho hi\n"},
 		map[string]string{"new.txt": "untracked", "build/out.bin": "ignored", "debug.log": "ignored"},
 		"build/\n*.log\n")
+	git(t, dir, "ls-files", "--error-unmatch", "--", "a.txt")
 	if err := os.Chmod(filepath.Join(dir, "run.sh"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -398,6 +435,93 @@ func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
 	res, err = c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds2.GetDevSessionId(), LocalDir: sub})
 	if err != nil || res.Uploaded != 1 || readGuest(t, ds2, "main.go") != "package main" {
 		t.Fatalf("subdirectory sync = %+v %v", res, err)
+	}
+}
+
+type syncUploadRecorder struct {
+	sandrunv1connect.DevSessionServiceClient
+	attempts     int
+	acknowledged []int64
+}
+
+func (r *syncUploadRecorder) WriteDevSessionFile(ctx context.Context, req *connect.Request[sandrunv1.WriteDevSessionFileRequest]) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
+	res, err := r.DevSessionServiceClient.WriteDevSessionFile(ctx, req)
+	if strings.HasSuffix(req.Msg.GetPath(), ".tar") {
+		r.attempts++
+		if err == nil {
+			r.acknowledged = append(r.acknowledged, res.Msg.GetOffset()+res.Msg.GetLength())
+		}
+	}
+	return res, err
+}
+
+func TestSyncUploadProgress(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	dir := newRepo(t, map[string]string{"a.txt": "a"}, nil, "")
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := &syncUploadRecorder{DevSessionServiceClient: c.devSessions}
+	c.devSessions = recorder
+	for _, tc := range []struct {
+		name    string
+		content string
+		chunks  int
+		retry   bool
+	}{
+		{name: "one-byte change", content: "b", chunks: 1},
+		{name: "multi-chunk change with retry", content: strings.Repeat("c", ChunkSize+1), chunks: 2, retry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder.attempts, recorder.acknowledged = 0, nil
+			if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			wantAttempts := tc.chunks
+			if tc.retry {
+				srv.Fail(writeProc, connect.NewError(connect.CodeUnavailable, errors.New("retry the archive chunk")))
+				wantAttempts++
+			}
+			var got []TransferProgress
+			params.Progress = func(p TransferProgress) { got = append(got, p) }
+			res, err := c.Sync(t.Context(), params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			acks := recorder.acknowledged
+			if recorder.attempts != wantAttempts || len(acks) != tc.chunks {
+				t.Fatalf("archive attempts = %d, acknowledged offsets = %v, want %d attempts and %d chunks", recorder.attempts, acks, wantAttempts, tc.chunks)
+			}
+			sent := acks[len(acks)-1]
+			if res.Uploaded != 1 || res.BytesSent != sent || sent <= int64(len(tc.content)) {
+				t.Fatalf("sync = %+v, archive offsets = %v, file size = %d", res, acks, len(tc.content))
+			}
+			want := []TransferProgress{{Phase: TransferPreparing}}
+			for _, offset := range acks {
+				want = append(want, TransferProgress{Phase: TransferUploading, BytesDone: offset})
+			}
+			want = append(want, TransferProgress{Phase: TransferApplying, BytesDone: sent, BytesTotal: sent},
+				TransferProgress{Phase: TransferDone, BytesDone: sent, BytesTotal: sent})
+			if !slices.Equal(got, want) {
+				t.Fatalf("progress = %+v, want %+v", got, want)
+			}
+			if readGuest(t, ds, "a.txt") != tc.content {
+				t.Fatal("guest file differs from the changed file")
+			}
+		})
+	}
+
+	var got []TransferProgress
+	params.Progress = func(p TransferProgress) { got = append(got, p) }
+	writesBefore := srv.Calls(writeProc)
+	res, err := c.Sync(t.Context(), params)
+	want := []TransferProgress{{Phase: TransferPreparing}, {Phase: TransferDone}}
+	if err != nil || res.BytesSent != 0 || res.Uploaded != 0 || srv.Calls(writeProc) != writesBefore || !slices.Equal(got, want) {
+		t.Fatalf("unchanged sync = %+v, %v; progress = %+v", res, err, got)
 	}
 }
 
@@ -564,7 +688,7 @@ func TestSyncSkipsStaleSymlinkDescendants(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			local, err := listLocalFiles(ctx, dir)
+			local, err := listLocalFiles(ctx, openTestSyncRoot(t, dir))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -664,6 +788,90 @@ func TestSyncSkipsSubmodulesAndNeedsGit(t *testing.T) {
 	_, err = c.Sync(context.Background(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: plain})
 	if !errors.Is(err, ErrNotGitWorkTree) || connect.CodeOf(err) != connect.CodeFailedPrecondition {
 		t.Fatalf("not a work tree: %v", err)
+	}
+}
+
+func TestSyncContextEndsDuringGit(t *testing.T) {
+	needPOSIX(t)
+	dir := newRepo(t, map[string]string{"tracked.txt": "tracked"}, nil, "")
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shimDir := t.TempDir()
+	shim := `#!/bin/sh
+matches() {
+	# Skip -C <dir> -c core.quotepath=off.
+	shift 4
+	[ "$*" = "$SANDRUN_TEST_GIT_COMMAND" ]
+}
+if matches "$@"; then
+	: > "$SANDRUN_TEST_GIT_STARTED"
+	exec sleep 30
+fi
+PATH="$SANDRUN_TEST_GIT_PATH" exec "$SANDRUN_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := os.Getenv("PATH")
+	t.Setenv("SANDRUN_TEST_REAL_GIT", realGit)
+	t.Setenv("SANDRUN_TEST_GIT_PATH", path)
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+path)
+
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	for _, command := range []string{
+		"rev-parse --is-inside-work-tree",
+		"ls-files -z --cached --others --exclude-standard",
+		"ls-files -z --stage",
+	} {
+		t.Run(command, func(t *testing.T) {
+			t.Setenv("SANDRUN_TEST_GIT_COMMAND", command)
+			for _, reason := range []struct {
+				name    string
+				timeout time.Duration
+				err     error
+			}{
+				{"canceled", 5 * time.Second, context.Canceled},
+				{"deadline", 2 * time.Second, context.DeadlineExceeded},
+			} {
+				t.Run(reason.name, func(t *testing.T) {
+					started := filepath.Join(t.TempDir(), "started")
+					t.Setenv("SANDRUN_TEST_GIT_STARTED", started)
+					ctx, cancel := context.WithTimeout(t.Context(), reason.timeout)
+					defer cancel()
+					if reason.err == context.Canceled {
+						go func() {
+							ticker := time.NewTicker(5 * time.Millisecond)
+							defer ticker.Stop()
+							for {
+								select {
+								case <-ctx.Done():
+									return
+								case <-ticker.C:
+									if _, err := os.Stat(started); err == nil {
+										cancel()
+										return
+									}
+								}
+							}
+						}()
+					}
+					result, err := c.Sync(ctx, params)
+					if _, statErr := os.Stat(started); statErr != nil {
+						t.Fatalf("Git command did not signal before Sync returned %v: %v", err, statErr)
+					}
+					if result != nil || !errors.Is(err, reason.err) {
+						t.Fatalf("Sync = (%+v, %v), want (nil, %v)", result, err, reason.err)
+					}
+					if reads, execs, writes := srv.Calls(sandrunv1connect.DevSessionServiceReadDevSessionFileProcedure), srv.Calls(execProc), srv.Calls(writeProc); reads != 0 || execs != 0 || writes != 0 {
+						t.Fatalf("Sync made %d manifest reads, %d execs and %d writes before returning", reads, execs, writes)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -1367,9 +1575,92 @@ func TestReadLocalFileHashWithLiveContext(t *testing.T) {
 
 func TestReadLocalFileLookupError(t *testing.T) {
 	needPOSIX(t)
-	_, ok, err := readLocalFile(t.Context(), t.TempDir(), strings.Repeat("a", 4096), "", false)
+	root := openTestSyncRoot(t, t.TempDir())
+	_, ok, err := readLocalFile(t.Context(), root, strings.Repeat("a", 4096), "", false)
 	if ok || !errors.Is(err, syscall.ENAMETOOLONG) {
 		t.Fatalf("readLocalFile = present %t, error %v, want ENAMETOOLONG", ok, err)
+	}
+}
+
+func TestReadLocalFileRejectsSwapBeforeOpen(t *testing.T) {
+	root := openTestSyncRoot(t, t.TempDir())
+	const name = "file.txt"
+	if err := root.WriteFile(name, []byte("sample"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := root.Lstat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceSyncTestFile(root.Name(), name, "saved.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := openSyncFile(root, name, listed)
+	if file != nil {
+		file.Close()
+		t.Fatal("opened a different file")
+	}
+	requireSyncFileChange(t, err, name, syncFileIdentityChanged)
+}
+
+// Keep the old file allocated so the replacement has a different identity.
+func replaceSyncTestFile(dir, name, saved string) error {
+	if err := os.Rename(filepath.Join(dir, name), filepath.Join(dir, saved)); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, name), []byte("sample"), 0o644)
+}
+
+func requireSyncFileChange(t *testing.T, err error, rel string, reason syncFileChange) {
+	t.Helper()
+	var changed *syncFileChangedError
+	if !errors.As(err, &changed) || changed.rel != rel || changed.reason != reason ||
+		err.Error() != "sandrun: "+rel+" changed during the sync; sync again" {
+		t.Fatalf("sync error = %v, want change of %q with reason %s", err, rel, reason)
+	}
+}
+
+func TestSyncRejectsLocalIdentityChangeBeforeUpload(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	const name = "source.txt"
+	dir := newRepo(t, map[string]string{name: "sample"}, nil, "")
+	var logs bytes.Buffer
+	c.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv.BeforeExec = func(req *sandrunv1.ExecDevSessionRequest) {
+		if req.GetEnv()[guestEnvLock] != "" && req.GetEnv()[guestEnvForce] != "" {
+			if err := replaceSyncTestFile(dir, name, filepath.Join(".git", "saved.txt")); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	_, err := c.Sync(t.Context(), params)
+	requireSyncFileChange(t, err, name, syncFileIdentityChanged)
+	if got := srv.Calls(writeProc); got != 0 {
+		t.Fatalf("sync sent %d file writes after refusing the source file", got)
+	}
+	const message = "sandrun sync file changed after listing"
+	var refusals int
+	for _, line := range bytes.Split(bytes.TrimSpace(logs.Bytes()), []byte("\n")) {
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatal(err)
+		}
+		if record["msg"] != message {
+			continue
+		}
+		refusals++
+		if record["level"] != "DEBUG" || record["reason"] != string(syncFileIdentityChanged) ||
+			record["dev_session_id"] != ds.GetDevSessionId() || bytes.Contains(line, []byte(name)) {
+			t.Errorf("unexpected refusal record %s", line)
+		}
+	}
+	if refusals != 1 {
+		t.Errorf("logged %d refusals, want 1", refusals)
 	}
 }
 
@@ -2458,7 +2749,8 @@ func TestSyncArchiveRejectsChangedFiles(t *testing.T) {
 	needPOSIX(t)
 	for name, content := range map[string]string{"same size": "bbbb", "grown": "aaaaa", "shrunk": "aaa"} {
 		dir := newRepo(t, map[string]string{"f.txt": "aaaa"}, nil, "")
-		local, err := listLocalFiles(context.Background(), dir)
+		root := openTestSyncRoot(t, dir)
+		local, err := listLocalFiles(t.Context(), root)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2466,18 +2758,66 @@ func TestSyncArchiveRejectsChangedFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		var b bytes.Buffer
-		if err := writeSyncArchive(context.Background(), &b, dir, local.files, false); err == nil || !strings.Contains(err.Error(), "changed during the sync") {
+		if err := writeSyncArchive(t.Context(), &b, root, local.files, false); err == nil || !strings.Contains(err.Error(), "changed during the sync") {
 			t.Errorf("%s: archive of a changed file = %v", name, err)
 		}
 	}
 	dir := newRepo(t, map[string]string{"f.txt": "aaaa"}, nil, "")
-	local, err := listLocalFiles(context.Background(), dir)
+	root := openTestSyncRoot(t, dir)
+	local, err := listLocalFiles(t.Context(), root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var b bytes.Buffer
-	if err := writeSyncArchive(context.Background(), &b, dir, local.files, false); err != nil {
+	if err := writeSyncArchive(t.Context(), &b, root, local.files, false); err != nil {
 		t.Fatalf("archive of an unchanged file = %v", err)
+	}
+}
+
+func TestSyncArchiveRejectsLinkedPaths(t *testing.T) {
+	needPOSIX(t)
+	const rel = "src/file.txt"
+	for _, replaced := range []string{rel, "src"} {
+		t.Run(replaced, func(t *testing.T) {
+			dir := newRepo(t, map[string]string{rel: "sample"}, nil, "")
+			root := openTestSyncRoot(t, dir)
+			local, err := listLocalFiles(t.Context(), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			name := filepath.FromSlash(replaced)
+			if err := root.Rename(name, name+".saved"); err != nil {
+				t.Fatal(err)
+			}
+			// The link resolves to the listed identity inside the fixture.
+			// The archive must still require a regular path.
+			if err := root.Symlink(filepath.Base(name)+".saved", name); err != nil {
+				t.Fatal(err)
+			}
+			file, err := openSyncFile(root, rel, local.files[0].identity)
+			if file != nil {
+				file.Close()
+				t.Fatal("opened a symbolic link path as a regular file")
+			}
+			requireSyncFileChange(t, err, rel, syncFileIdentityChanged)
+
+			var b bytes.Buffer
+			err = writeSyncArchive(t.Context(), &b, root, local.files, false)
+			requireSyncFileChange(t, err, rel, syncFileIdentityChanged)
+			tr := tar.NewReader(&b)
+			for {
+				header, err := tr.Next()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if header.Typeflag != tar.TypeDir {
+					t.Fatalf("archive emitted a header for %q", header.Name)
+				}
+			}
+		})
 	}
 }
 

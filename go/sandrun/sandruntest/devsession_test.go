@@ -690,8 +690,8 @@ func TestExecRequestPath(t *testing.T) {
 			}
 			return
 		}
-		if exited := final.GetExited(); exited == nil || exited.GetExitCode() != 0 {
-			t.Fatalf("got %v, want exit code 0", final)
+		if !hasExplicitZeroExitCode(final) {
+			t.Fatalf("got %v, want Exited with explicit exit code 0", final)
 		}
 		var stdout strings.Builder
 		for _, event := range events {
@@ -824,8 +824,43 @@ func TestExecStreamEventLimitCountsTruncation(t *testing.T) {
 	}
 	events = attach(chunk.GetOffset() + int64(len(chunk.GetData())))
 	requireStarted(t, events, limit)
-	if exited := events[1].GetExited(); exited == nil || exited.GetExitCode() != 0 {
-		t.Fatalf("expected exit code 0, got %v", events[1])
+	if !hasExplicitZeroExitCode(events[1]) {
+		t.Fatalf("expected Exited with explicit exit code 0, got %v", events[1])
+	}
+}
+
+func hasExplicitZeroExitCode(event *sandrunv1.DevSessionExecEvent) bool {
+	status, ok := event.GetExited().GetStatus().(*sandrunv1.DevSessionExecExited_ExitCode)
+	return ok && status != nil && status.ExitCode == 0
+}
+
+func TestHasExplicitZeroExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		exited *sandrunv1.DevSessionExecExited
+		want   bool
+	}{
+		{name: "missing Exited"},
+		{name: "unset status", exited: &sandrunv1.DevSessionExecExited{}},
+		{name: "signal", exited: &sandrunv1.DevSessionExecExited{
+			Status: &sandrunv1.DevSessionExecExited_Signal{Signal: 15},
+		}},
+		{name: "nonzero code", exited: &sandrunv1.DevSessionExecExited{
+			Status: &sandrunv1.DevSessionExecExited_ExitCode{ExitCode: 7},
+		}},
+		{name: "explicit zero", exited: &sandrunv1.DevSessionExecExited{
+			Status: &sandrunv1.DevSessionExecExited_ExitCode{ExitCode: 0},
+		}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			event := &sandrunv1.DevSessionExecEvent{}
+			if tc.exited != nil {
+				event.Event = &sandrunv1.DevSessionExecEvent_Exited{Exited: tc.exited}
+			}
+			if got := hasExplicitZeroExitCode(event); got != tc.want {
+				t.Errorf("hasExplicitZeroExitCode(%v) = %t, want %t", event, got, tc.want)
+			}
+		})
 	}
 }
 
