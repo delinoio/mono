@@ -47,7 +47,10 @@ func newRepo(t *testing.T, tracked, untracked map[string]string, gitignore strin
 		t.Skip("git is not installed")
 	}
 	dir := t.TempDir()
+	isolateGitEnvironment(t, dir)
 	git(t, dir, "init", "-q")
+	// Git uses the default XDG ignore file even without a global config.
+	git(t, dir, "config", "--local", "core.excludesFile", os.DevNull)
 	write := func(files map[string]string) {
 		for p, content := range files {
 			full := filepath.Join(dir, filepath.FromSlash(p))
@@ -69,10 +72,25 @@ func newRepo(t *testing.T, tracked, untracked map[string]string, gitignore strin
 	return dir
 }
 
+func isolateGitEnvironment(t *testing.T, dir string) {
+	t.Helper()
+	// The SDK's Git subprocesses inherit the test environment too.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	for _, name := range strings.Fields(git(t, dir, "rev-parse", "--local-env-vars")) {
+		if _, set := os.LookupEnv(name); set {
+			// Register restoration with testing.T before unsetting the variable.
+			t.Setenv(name, "")
+			if err := os.Unsetenv(name); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)
@@ -300,12 +318,21 @@ func requireTransferWorkingDirectories(t *testing.T, ds *sandrunv1.DevSession, s
 
 func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
 	needPOSIX(t)
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	if err := os.Mkdir(filepath.Join(xdg, "git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(xdg, "git", "ignore"), []byte("a.txt\nnew.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	c, srv, org := newTestClient(t, "")
 	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	dir := newRepo(t,
 		map[string]string{"a.txt": "a", "src/main.go": "package main", "old.txt": "old", "run.sh": "#!/bin/sh\necho hi\n"},
 		map[string]string{"new.txt": "untracked", "build/out.bin": "ignored", "debug.log": "ignored"},
 		"build/\n*.log\n")
+	git(t, dir, "ls-files", "--error-unmatch", "--", "a.txt")
 	if err := os.Chmod(filepath.Join(dir, "run.sh"), 0o755); err != nil {
 		t.Fatal(err)
 	}
