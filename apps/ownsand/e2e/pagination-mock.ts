@@ -36,6 +36,7 @@ import {
   createMockTransport as createBaseMock,
   MOCK_IDS,
 } from "../src/mock/mock-api.ts";
+import { organizationUuidTransport } from "./organization-uuid-fixture.ts";
 import { browserSandboxTransitionMock } from "./sandbox-transition-mock.ts";
 
 const lists = {
@@ -164,7 +165,7 @@ export function createMockTransport(): Transport {
   const createResponse = sessionStorage.getItem("ownsand-e2e-create-response");
   const creates: { request: string; sandboxId: string }[] = [];
   // Seed enough rows to split the selected list across two pages.
-  const base = browserSandboxTransitionMock(
+  const mock = browserSandboxTransitionMock(
     createBaseMock({
       extraApiKeys: Number(methodName === "ListApiKeys"),
       extraDevices: pageDevices ? 199 : 0,
@@ -179,6 +180,10 @@ export function createMockTransport(): Transport {
       extraTemplates: pageSources ? 200 : 0,
     }),
   );
+  const base =
+    sessionStorage.getItem("ownsand-e2e-organization-uuid-case") === "true"
+      ? organizationUuidTransport(mock)
+      : mock;
   const earlierAcceptance = createRouterTransport((router) => {
     router.rpc(MemberService.method.acceptInvitation, () => ({
       organization: { organizationId: MOCK_IDS.acme },
