@@ -80,6 +80,16 @@ func git(t *testing.T, dir string, args ...string) string {
 	return string(out)
 }
 
+func openTestSyncRoot(t *testing.T, dir string) *os.Root {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	return root
+}
+
 func readGuest(t *testing.T, ds *sandrunv1.DevSession, rel string) string {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(ds.GetWorkspacePath(), rel))
@@ -564,7 +574,7 @@ func TestSyncSkipsStaleSymlinkDescendants(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			local, err := listLocalFiles(ctx, dir)
+			local, err := listLocalFiles(ctx, openTestSyncRoot(t, dir))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1367,9 +1377,92 @@ func TestReadLocalFileHashWithLiveContext(t *testing.T) {
 
 func TestReadLocalFileLookupError(t *testing.T) {
 	needPOSIX(t)
-	_, ok, err := readLocalFile(t.Context(), t.TempDir(), strings.Repeat("a", 4096), "", false)
+	root := openTestSyncRoot(t, t.TempDir())
+	_, ok, err := readLocalFile(t.Context(), root, strings.Repeat("a", 4096), "", false)
 	if ok || !errors.Is(err, syscall.ENAMETOOLONG) {
 		t.Fatalf("readLocalFile = present %t, error %v, want ENAMETOOLONG", ok, err)
+	}
+}
+
+func TestReadLocalFileRejectsSwapBeforeOpen(t *testing.T) {
+	root := openTestSyncRoot(t, t.TempDir())
+	const name = "file.txt"
+	if err := root.WriteFile(name, []byte("sample"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := root.Lstat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceSyncTestFile(root.Name(), name, "saved.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := openSyncFile(root, name, listed)
+	if file != nil {
+		file.Close()
+		t.Fatal("opened a different file")
+	}
+	requireSyncFileChange(t, err, name, syncFileIdentityChanged)
+}
+
+// Keep the old file allocated so the replacement has a different identity.
+func replaceSyncTestFile(dir, name, saved string) error {
+	if err := os.Rename(filepath.Join(dir, name), filepath.Join(dir, saved)); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, name), []byte("sample"), 0o644)
+}
+
+func requireSyncFileChange(t *testing.T, err error, rel string, reason syncFileChange) {
+	t.Helper()
+	var changed *syncFileChangedError
+	if !errors.As(err, &changed) || changed.rel != rel || changed.reason != reason ||
+		err.Error() != "sandrun: "+rel+" changed during the sync; sync again" {
+		t.Fatalf("sync error = %v, want change of %q with reason %s", err, rel, reason)
+	}
+}
+
+func TestSyncRejectsLocalIdentityChangeBeforeUpload(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	const name = "source.txt"
+	dir := newRepo(t, map[string]string{name: "sample"}, nil, "")
+	var logs bytes.Buffer
+	c.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv.BeforeExec = func(req *sandrunv1.ExecDevSessionRequest) {
+		if req.GetEnv()[guestEnvLock] != "" && req.GetEnv()[guestEnvForce] != "" {
+			if err := replaceSyncTestFile(dir, name, filepath.Join(".git", "saved.txt")); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	_, err := c.Sync(t.Context(), params)
+	requireSyncFileChange(t, err, name, syncFileIdentityChanged)
+	if got := srv.Calls(writeProc); got != 0 {
+		t.Fatalf("sync sent %d file writes after refusing the source file", got)
+	}
+	const message = "sandrun sync file changed after listing"
+	var refusals int
+	for _, line := range bytes.Split(bytes.TrimSpace(logs.Bytes()), []byte("\n")) {
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatal(err)
+		}
+		if record["msg"] != message {
+			continue
+		}
+		refusals++
+		if record["level"] != "DEBUG" || record["reason"] != string(syncFileIdentityChanged) ||
+			record["dev_session_id"] != ds.GetDevSessionId() || bytes.Contains(line, []byte(name)) {
+			t.Errorf("unexpected refusal record %s", line)
+		}
+	}
+	if refusals != 1 {
+		t.Errorf("logged %d refusals, want 1", refusals)
 	}
 }
 
@@ -2458,7 +2551,8 @@ func TestSyncArchiveRejectsChangedFiles(t *testing.T) {
 	needPOSIX(t)
 	for name, content := range map[string]string{"same size": "bbbb", "grown": "aaaaa", "shrunk": "aaa"} {
 		dir := newRepo(t, map[string]string{"f.txt": "aaaa"}, nil, "")
-		local, err := listLocalFiles(context.Background(), dir)
+		root := openTestSyncRoot(t, dir)
+		local, err := listLocalFiles(t.Context(), root)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2466,18 +2560,66 @@ func TestSyncArchiveRejectsChangedFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		var b bytes.Buffer
-		if err := writeSyncArchive(context.Background(), &b, dir, local.files, false); err == nil || !strings.Contains(err.Error(), "changed during the sync") {
+		if err := writeSyncArchive(t.Context(), &b, root, local.files, false); err == nil || !strings.Contains(err.Error(), "changed during the sync") {
 			t.Errorf("%s: archive of a changed file = %v", name, err)
 		}
 	}
 	dir := newRepo(t, map[string]string{"f.txt": "aaaa"}, nil, "")
-	local, err := listLocalFiles(context.Background(), dir)
+	root := openTestSyncRoot(t, dir)
+	local, err := listLocalFiles(t.Context(), root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var b bytes.Buffer
-	if err := writeSyncArchive(context.Background(), &b, dir, local.files, false); err != nil {
+	if err := writeSyncArchive(t.Context(), &b, root, local.files, false); err != nil {
 		t.Fatalf("archive of an unchanged file = %v", err)
+	}
+}
+
+func TestSyncArchiveRejectsLinkedPaths(t *testing.T) {
+	needPOSIX(t)
+	const rel = "src/file.txt"
+	for _, replaced := range []string{rel, "src"} {
+		t.Run(replaced, func(t *testing.T) {
+			dir := newRepo(t, map[string]string{rel: "sample"}, nil, "")
+			root := openTestSyncRoot(t, dir)
+			local, err := listLocalFiles(t.Context(), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			name := filepath.FromSlash(replaced)
+			if err := root.Rename(name, name+".saved"); err != nil {
+				t.Fatal(err)
+			}
+			// The link resolves to the listed identity inside the fixture.
+			// The archive must still require a regular path.
+			if err := root.Symlink(filepath.Base(name)+".saved", name); err != nil {
+				t.Fatal(err)
+			}
+			file, err := openSyncFile(root, rel, local.files[0].identity)
+			if file != nil {
+				file.Close()
+				t.Fatal("opened a symbolic link path as a regular file")
+			}
+			requireSyncFileChange(t, err, rel, syncFileIdentityChanged)
+
+			var b bytes.Buffer
+			err = writeSyncArchive(t.Context(), &b, root, local.files, false)
+			requireSyncFileChange(t, err, rel, syncFileIdentityChanged)
+			tr := tar.NewReader(&b)
+			for {
+				header, err := tr.Next()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if header.Typeflag != tar.TypeDir {
+					t.Fatalf("archive emitted a header for %q", header.Name)
+				}
+			}
+		})
 	}
 }
 
