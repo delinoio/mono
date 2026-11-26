@@ -6,6 +6,7 @@ import {
   cleanup,
   fireEvent,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import {
@@ -42,7 +43,7 @@ interface Form {
   /** Whether a success opens another page. */
   navigates?: boolean;
   /** A read that the success refreshes. */
-  refreshed?: string;
+  refreshed: string;
   billing?: MockBillingState;
 }
 
@@ -236,7 +237,7 @@ describe.each(FORMS)("$name form dialog openings", (form) => {
     await submit(first);
     await dismiss(first);
     const second = await open();
-    const before = held.seen[form.refreshed!] ?? 0;
+    const before = held.seen[form.refreshed] ?? 0;
     await settleCall(held, 0);
     expect(screen.getByRole("dialog", { name: form.dialog })).toBe(second);
     expect(submitButton(second).disabled).toBe(false);
@@ -247,15 +248,31 @@ describe.each(FORMS)("$name form dialog openings", (form) => {
       expect(screen.queryByRole("dialog", { name: form.secret })).toBeNull();
     }
     // The cache refresh of the success still ran.
-    expect(held.seen[form.refreshed!] ?? 0).toBeGreaterThan(before);
+    expect(held.seen[form.refreshed] ?? 0).toBeGreaterThan(before);
   });
 
   test("a late success leaves the page alone when no form is open", async () => {
     const held = await start();
     const first = await open();
+    await waitFor(() =>
+      expect(held.seen[form.refreshed] ?? 0).toBeGreaterThan(0),
+    );
     await submit(first);
+    const [call] = await waitFor(() => {
+      const calls = held.calls[form.method] ?? [];
+      expect(calls).toHaveLength(1);
+      return calls;
+    });
     await dismiss(first);
-    await settleCall(held, 0);
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    const before = held.seen[form.refreshed];
+    await act(async () => {
+      call.settle();
+    });
+    await waitFor(() =>
+      expect(held.seen[form.refreshed]).toBeGreaterThan(before),
+    );
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(window.location.pathname).toBe(
       new URL(form.path, "http://x").pathname,

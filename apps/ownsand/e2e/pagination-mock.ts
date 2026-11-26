@@ -37,6 +37,7 @@ import {
   createMockTransport as createBaseMock,
   MOCK_IDS,
 } from "../src/mock/mock-api.ts";
+import { organizationUuidTransport } from "./organization-uuid-fixture.ts";
 import { browserSandboxTransitionMock } from "./sandbox-transition-mock.ts";
 
 const lists = {
@@ -165,7 +166,7 @@ export function createMockTransport(): Transport {
   const createResponse = sessionStorage.getItem("ownsand-e2e-create-response");
   const creates: { request: string; sandboxId: string }[] = [];
   // Seed enough rows to split the selected list across two pages.
-  const base = browserSandboxTransitionMock(
+  const mock = browserSandboxTransitionMock(
     createBaseMock({
       extraApiKeys: Number(methodName === "ListApiKeys"),
       extraDevices: pageDevices ? 199 : 0,
@@ -180,6 +181,10 @@ export function createMockTransport(): Transport {
       extraTemplates: pageSources ? 200 : 0,
     }),
   );
+  const base =
+    sessionStorage.getItem("ownsand-e2e-organization-uuid-case") === "true"
+      ? organizationUuidTransport(mock)
+      : mock;
   const earlierAcceptance = createRouterTransport((router) => {
     router.rpc(MemberService.method.acceptInvitation, () => ({
       organization: { organizationId: MOCK_IDS.acme },
@@ -277,10 +282,13 @@ export function createMockTransport(): Transport {
           return response;
         }
       }
-      if (method.name === refreshList) {
+      const isFixturePage =
+        pagination !== undefined && method.name === methodName;
+      if (method.name === refreshList || isFixturePage) {
         const code = sessionStorage.getItem("ownsand-e2e-refresh-error");
         const { pageToken } = input as { pageToken?: string };
         if (code !== null && pageToken === "") {
+          if (isFixturePage) recordToken("ownsand-e2e-page-tokens", pageToken);
           throw new ConnectError(
             "Synthetic full refresh failure",
             Number(code) as Code,
@@ -677,8 +685,10 @@ export function createMockTransport(): Transport {
       const request = input as typeof input & { pageToken?: string };
       const token = request.pageToken ?? "";
       recordToken("ownsand-e2e-page-tokens", token);
+      const nextPageToken =
+        sessionStorage.getItem("ownsand-e2e-paged-next-token") ?? CONTINUATION;
       if (token !== "") {
-        if (pagination !== undefined && token !== CONTINUATION) {
+        if (pagination !== undefined && token !== nextPageToken) {
           throw new ConnectError(
             "Unexpected continuation token",
             Code.InvalidArgument,
@@ -739,7 +749,7 @@ export function createMockTransport(): Transport {
           ? {
               ...response.message,
               [field]: rows.slice(0, firstPageSize),
-              nextPageToken: CONTINUATION,
+              nextPageToken,
             }
           : {
               ...response.message,

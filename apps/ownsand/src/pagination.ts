@@ -107,6 +107,7 @@ export interface FollowedPages {
  * list incomplete and lets the user retry from the last loaded page. A
  * terminal error replaces the list. Automatic refetch triggers leave the
  * failed query in place (see `FOLLOW_ALL_PAGES_OPTIONS`).
+ * A terminal full refresh also stops paging until a refresh succeeds.
  */
 export function useFollowAllPages(
   query: PagedQuery,
@@ -114,6 +115,7 @@ export function useFollowAllPages(
 ): FollowedPages {
   const { data, hasNextPage, isFetching, isFetchNextPageError, fetchNextPage } =
     query;
+  const hasTerminalError = isTerminalError(query.error);
 
   // Several surfaces can observe one entry, and all of them run this effect
   // in the same commit. `cancelRefetch: false` joins the request that is in
@@ -124,7 +126,13 @@ export function useFollowAllPages(
   // `isFetching` have the same values in two commits, and only the new page
   // tells the effect to request the page after it.
   useEffect(() => {
-    if (enabled && hasNextPage && !isFetching && !isFetchNextPageError) {
+    if (
+      enabled &&
+      hasNextPage &&
+      !isFetching &&
+      !isFetchNextPageError &&
+      !hasTerminalError
+    ) {
       void fetchNextPage({ cancelRefetch: false });
     }
   }, [
@@ -133,6 +141,7 @@ export function useFollowAllPages(
     hasNextPage,
     isFetching,
     isFetchNextPageError,
+    hasTerminalError,
     fetchNextPage,
   ]);
 
