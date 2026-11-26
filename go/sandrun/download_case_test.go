@@ -5,22 +5,15 @@ package sandrun
 import (
 	"archive/tar"
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 
 	"connectrpc.com/connect"
-
-	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
-	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
 )
 
 func TestDownloadDestinationCaseCollision(t *testing.T) {
@@ -40,18 +33,9 @@ func TestDownloadDestinationCaseCollision(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fake := &downloadCaseSession{archive: archive.Bytes()}
-	_, handler := sandrunv1connect.NewDevSessionServiceHandler(fake)
-	server := httptest.NewUnstartedServer(handler)
-	server.Config.Protocols = new(http.Protocols)
-	server.Config.Protocols.SetHTTP1(true)
-	server.Config.Protocols.SetUnencryptedHTTP2(true)
-	server.Start()
-	defer server.Close()
-	client, err := New(Options{BaseURL: server.URL, APIKey: "fixture"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	size := int64(archive.Len())
+	fake := &scriptedDownloadSession{probe: fmt.Sprintf("dir %d", size), chunks: [][]byte{archive.Bytes()}, endSize: size}
+	client := newScriptedDownloadClient(t, fake)
 	parent := t.TempDir()
 	probeDir := filepath.Join(parent, "probe")
 	if err := os.Mkdir(probeDir, 0o755); err != nil {
@@ -128,61 +112,6 @@ func checkDownloadedFiles(t *testing.T, dir string, names, contents []string) {
 			t.Errorf("%s = %q, %v, want %q", name, data, err, contents[i])
 		}
 	}
-}
-
-type downloadCaseSession struct {
-	sandrunv1connect.UnimplementedDevSessionServiceHandler
-	archive []byte
-	mu      sync.Mutex
-	path    string
-}
-
-func (s *downloadCaseSession) GetDevSession(context.Context, *connect.Request[sandrunv1.GetDevSessionRequest]) (*connect.Response[sandrunv1.GetDevSessionResponse], error) {
-	return connect.NewResponse(&sandrunv1.GetDevSessionResponse{DevSession: &sandrunv1.DevSession{
-		State: sandrunv1.RequestState_REQUEST_STATE_RUNNING, GuestOs: sandrunv1.GuestOs_GUEST_OS_LINUX, WorkspacePath: "/fixture",
-	}}), nil
-}
-
-func (s *downloadCaseSession) ExecDevSession(_ context.Context, req *connect.Request[sandrunv1.ExecDevSessionRequest], stream *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error {
-	send := func(event *sandrunv1.DevSessionExecEvent) error {
-		return stream.Send(&sandrunv1.ExecDevSessionResponse{Event: event})
-	}
-	if err := send(&sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Started{
-		Started: &sandrunv1.DevSessionExecStarted{ExecId: req.Msg.GetExecId()},
-	}}); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if env := req.Msg.GetEnv(); env[guestEnvPath] != "" {
-		s.path = env[guestEnvDLArchive]
-		if err := send(&sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Stdout{
-			Stdout: &sandrunv1.DevSessionExecOutput{Data: fmt.Appendf(nil, "dir %d\n", len(s.archive))},
-		}}); err != nil {
-			return err
-		}
-	} else if env[guestEnvDLArchive] == s.path {
-		s.path = ""
-	}
-	return send(&sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Exited{
-		Exited: &sandrunv1.DevSessionExecExited{Status: &sandrunv1.DevSessionExecExited_ExitCode{ExitCode: 0}},
-	}})
-}
-
-func (s *downloadCaseSession) ReadDevSessionFile(_ context.Context, req *connect.Request[sandrunv1.ReadDevSessionFileRequest], stream *connect.ServerStream[sandrunv1.ReadDevSessionFileResponse]) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.path == "" || s.path != req.Msg.GetPath() {
-		return connect.NewError(connect.CodeNotFound, errors.New("fixture archive not found"))
-	}
-	if err := stream.Send(&sandrunv1.ReadDevSessionFileResponse{Event: &sandrunv1.ReadDevSessionFileResponse_Chunk{
-		Chunk: &sandrunv1.DevSessionFileChunk{Data: s.archive},
-	}}); err != nil {
-		return err
-	}
-	return stream.Send(&sandrunv1.ReadDevSessionFileResponse{Event: &sandrunv1.ReadDevSessionFileResponse_End{
-		End: &sandrunv1.DevSessionFileEnd{SizeBytes: int64(len(s.archive))},
-	}})
 }
 
 func TestDownloadArchiveRepeatedName(t *testing.T) {
