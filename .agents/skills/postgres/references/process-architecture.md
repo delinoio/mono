@@ -14,7 +14,13 @@ WAL Writer, Background Writer, Checkpointer, Autovacuum Launcher/Workers, Archiv
 
 ## Memory Risk
 
-`work_mem` is per-operation, not per-query. Estimate: `work_mem × operations_per_query × parallel_workers × connections` can grow very large at high concurrency. Scale connections and parallelism before raising `work_mem`.
+Each sort has its own `work_mem` budget. For a capacity estimate, multiply each independent operation's memory budget by the number of processes that can execute it.
+
+- For a serial operation, count one client backend. A serial sort with `work_mem = 64MB` has a 64 MiB budget.
+- For an independent operation below `Gather` or `Gather Merge`, count up to the planned number of workers plus the leader if it participates. At the same setting, a parallel sort with two workers and a participating leader can use three 64 MiB budgets, for an estimate of 192 MiB. If no workers launch, the leader executes the parallel part of the plan alone.
+- For an operation above `Gather` or `Gather Merge`, count the leader once, even when `parallel_leader_participation` is off.
+
+Add the budgets for operations that can use memory at the same time across active queries. Actual use depends on the plan, worker availability, and concurrency. See [Memory Architecture and OOM Prevention](memory-management-ops.md#memory-multiplication-danger) for hash operation budgets. A `Parallel Hash` node builds one shared hash table. Scale connections and parallelism before raising `work_mem`.
 
 ## Connection Pooling (Critical)
 
