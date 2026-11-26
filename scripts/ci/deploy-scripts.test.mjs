@@ -68,6 +68,10 @@ function skipReason() {
 }
 const skip = skipReason();
 
+function readYamlFixture(path) {
+  return readFileSync(join(root, path), "utf8").replaceAll("\r\n", "\n");
+}
+
 function scratch(t) {
   const dir = mkdtempSync(join(tmpdir(), "deploy-scripts-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -190,10 +194,7 @@ const changeset = (id, ...list) => ({
 });
 
 test("deploy.yml keeps pending runs in the concurrency queue", () => {
-  const workflow = readFileSync(
-    join(root, ".github/workflows/deploy.yml"),
-    "utf8",
-  );
+  const workflow = readYamlFixture(".github/workflows/deploy.yml");
   const block = workflow.match(/^concurrency:\n((?:  .*\n|\n)+)/m);
   assert.ok(block, "deploy.yml has a workflow-level concurrency block");
   const keys = block[1]
@@ -205,7 +206,7 @@ test("deploy.yml keeps pending runs in the concurrency queue", () => {
   assert.ok(keys.some((key) => key.startsWith("group: ")));
   // actionlint v1.7.12 rejects `queue`; the exception must name only that
   // diagnostic and only this workflow.
-  const lint = readFileSync(join(root, ".github/actionlint.yaml"), "utf8");
+  const lint = readYamlFixture(".github/actionlint.yaml");
   assert.match(
     lint,
     /^paths:\n {2}\.github\/workflows\/deploy\.yml:\n {4}ignore:\n {6}- 'unexpected key "queue" for "concurrency" section\.\*'\n$/m,
@@ -810,10 +811,7 @@ function planRelease(work) {
     repoRoot: work,
   });
   const outputs = readOutputs(planOutput);
-  const workflow = readFileSync(
-    join(root, ".github/workflows/deploy.yml"),
-    "utf8",
-  );
+  const workflow = readYamlFixture(".github/workflows/deploy.yml");
   const script = workflow.match(
     /^        id: blobs\n[\s\S]*?^        run: \|\n((?: {10}.*\n)+)/m,
   )?.[1];
@@ -1481,10 +1479,7 @@ test("recovery rejects a superseding deployment", { skip }, (t) => {
 });
 
 test("deploy.yml tries the recovery before the stale-plan check", () => {
-  const workflow = readFileSync(
-    join(root, ".github/workflows/deploy.yml"),
-    "utf8",
-  );
+  const workflow = readYamlFixture(".github/workflows/deploy.yml");
   const job = workflow.match(/^ {2}release:\n(?:(?: {4}.*)?\n)+/m)?.[0] ?? "";
   const steps = job.split(/^ {6}- /m).slice(1);
   const index = (needle) => steps.findIndex((step) => step.includes(needle));
