@@ -306,8 +306,8 @@ func TestShutdownWithoutLogExport(t *testing.T) {
 // TestOTLPExportIgnoresInheritedSettings checks that OTLP settings that the
 // test process inherits (signal-specific endpoints, generic and
 // signal-specific headers and compression) cannot redirect or alter the export
-// of the fixture tests: they reach the fixture collector alone, without the
-// inherited headers.
+// of the fixture tests. The requests reach only the fixture collector, with
+// no inherited headers or compression.
 func TestOTLPExportIgnoresInheritedSettings(t *testing.T) {
 	alternate := &otlpServer{}
 	altSrv := httptest.NewServer(alternate)
@@ -350,6 +350,9 @@ func TestOTLPExportIgnoresInheritedSettings(t *testing.T) {
 	for i, h := range collector.headers {
 		if v := h.Get("X-Inherited"); v != "" {
 			t.Errorf("request %d to %s carries the inherited header X-Inherited=%s", i, collector.paths[i], v)
+		}
+		if encoding := h.Get("Content-Encoding"); encoding != "" {
+			t.Errorf("request %d to %s has Content-Encoding %q, want empty", i, collector.paths[i], encoding)
 		}
 	}
 }
