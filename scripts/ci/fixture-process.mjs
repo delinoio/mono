@@ -3,6 +3,7 @@
 // Starts a fixture subprocess in its own process group and stops the whole
 // group when the test ends. POSIX only: the callers skip on Windows.
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 // Sends SIGKILL to the process group of `child`. A group that already exited
 // is normal teardown (ESRCH); any other error is a real failure.
@@ -33,13 +34,21 @@ export function spawnProcessGroup(t, command, args, options = {}) {
     stdio: ["pipe", "pipe", "pipe"],
     detached: true,
   });
+  const stdoutDecoder = new StringDecoder("utf8");
+  const stderrDecoder = new StringDecoder("utf8");
   let stdout = "";
   let stderr = "";
-  child.stdout.on("data", (chunk) => (stdout += chunk));
-  child.stderr.on("data", (chunk) => (stderr += chunk));
+  child.stdout.on("data", (chunk) => (stdout += stdoutDecoder.write(chunk)));
+  child.stderr.on("data", (chunk) => (stderr += stderrDecoder.write(chunk)));
   const done = new Promise((resolve, reject) => {
     child.on("error", reject);
-    child.on("close", (status) => resolve({ status, stdout, stderr }));
+    child.on("close", (status) =>
+      resolve({
+        status,
+        stdout: stdout + stdoutDecoder.end(),
+        stderr: stderr + stderrDecoder.end(),
+      }),
+    );
   });
   // An unawaited `done` must not turn a spawn error into an unhandled
   // rejection after the test has already failed.
