@@ -35,6 +35,8 @@ import { toast } from "delino-ui/toast";
 import { createQueryClient, invalidateServices } from "./api.ts";
 import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
 import {
+  DEFAULT_WAIT_MS,
+  TEST_SETUP_MS,
   fullListRefresh,
   holdingTransport,
   renderConsole,
@@ -164,30 +166,34 @@ describe("snapshot source lists", () => {
   const showMore = () =>
     screen.getByRole("button", { name: "Show more snapshots" });
 
-  test("retries the same token, shows an ID once and stops after an empty last page", async () => {
-    const { transport, state } = sourcePages();
-    state.laterSnapshotError = Code.Unavailable;
-    renderConsole(`/orgs/${MOCK_IDS.acme}/snapshots`, { transport });
-    await waitForRows("Snapshots", 1);
-    fireEvent.click(showMore());
+  test(
+    "retries the same token, shows an ID once and stops after an empty last page",
+    async () => {
+      const { transport, state } = sourcePages();
+      state.laterSnapshotError = Code.Unavailable;
+      renderConsole(`/orgs/${MOCK_IDS.acme}/snapshots`, { transport });
+      await waitForRows("Snapshots", 1);
+      fireEvent.click(showMore());
 
-    const retry = await screen.findByRole("button", { name: "Try again" });
-    expect(itemsOf("Snapshots")).toHaveLength(1);
-    state.laterSnapshotError = undefined;
-    fireEvent.click(retry);
-    await waitForRows("Snapshots", 2);
-    expect(state.tokens).toEqual(["", state.tokens[1], state.tokens[1]]);
-    expect(state.tokens[1]).not.toBe("");
+      const retry = await screen.findByRole("button", { name: "Try again" });
+      expect(itemsOf("Snapshots")).toHaveLength(1);
+      state.laterSnapshotError = undefined;
+      fireEvent.click(retry);
+      await waitForRows("Snapshots", 2);
+      expect(state.tokens).toEqual(["", state.tokens[1], state.tokens[1]]);
+      expect(state.tokens[1]).not.toBe("");
 
-    fireEvent.click(showMore());
-    await waitFor(() =>
-      expect(
-        screen.queryByRole("button", { name: "Show more snapshots" }),
-      ).toBeNull(),
-    );
-    expect(itemsOf("Snapshots")).toHaveLength(2);
-    expect(state.tokens[3]).not.toBe(state.tokens[1]);
-  });
+      fireEvent.click(showMore());
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("button", { name: "Show more snapshots" }),
+        ).toBeNull(),
+      );
+      expect(itemsOf("Snapshots")).toHaveLength(2);
+      expect(state.tokens[3]).not.toBe(state.tokens[1]);
+    },
+    2 * WAIT.timeout + 2 * DEFAULT_WAIT_MS + TEST_SETUP_MS,
+  );
 
   test.each([
     [Code.NotFound, "It was not found, or you no longer have access to it."],
@@ -212,6 +218,7 @@ describe("snapshot source lists", () => {
       expect(screen.getByText(notice)).toBeTruthy();
       expect(itemsOf("Templates")).toHaveLength(1);
     },
+    2 * WAIT.timeout + DEFAULT_WAIT_MS + TEST_SETUP_MS,
   );
 
   test("offers a later snapshot once it becomes ready after invalidation", async () => {
@@ -387,25 +394,29 @@ describe("template creation and management pages", () => {
     expect(requests).toHaveLength(1);
   });
 
-  test("refreshes cached templates from the first page and keeps the continuation", async () => {
-    const { calls, requests } = renderTemplates({ pageSize: 1 });
-    await waitForRows("Templates", 1);
-    const form = await openForm(templateName);
-    submit(form);
-    await waitFor(() => expect(calls.CreateTemplate).toHaveLength(1));
-    await act(async () => calls.CreateTemplate![0]!.settle());
-    await waitFor(() =>
-      expect(screen.queryByRole("dialog", { name: formTitle })).toBeNull(),
-    );
-    expect(requests.map(({ pageToken }) => pageToken)).toEqual(["", ""]);
-    expect(itemsOf("Templates")).toHaveLength(1);
-    fireEvent.click(
-      screen.getByRole("button", { name: "Show more templates" }),
-    );
-    expect(await deleteAction()).toBeTruthy();
-    expect(requests).toHaveLength(3);
-    expect(requests[2]!.pageToken).not.toBe("");
-  });
+  test(
+    "refreshes cached templates from the first page and keeps the continuation",
+    async () => {
+      const { calls, requests } = renderTemplates({ pageSize: 1 });
+      await waitForRows("Templates", 1);
+      const form = await openForm(templateName);
+      submit(form);
+      await waitFor(() => expect(calls.CreateTemplate).toHaveLength(1));
+      await act(async () => calls.CreateTemplate![0]!.settle());
+      await waitFor(() =>
+        expect(screen.queryByRole("dialog", { name: formTitle })).toBeNull(),
+      );
+      expect(requests.map(({ pageToken }) => pageToken)).toEqual(["", ""]);
+      expect(itemsOf("Templates")).toHaveLength(1);
+      fireEvent.click(
+        screen.getByRole("button", { name: "Show more templates" }),
+      );
+      expect(await deleteAction()).toBeTruthy();
+      expect(requests).toHaveLength(3);
+      expect(requests[2]!.pageToken).not.toBe("");
+    },
+    WAIT.timeout + 5 * DEFAULT_WAIT_MS + TEST_SETUP_MS,
+  );
 });
 
 describe("pending invitations list", () => {
@@ -468,38 +479,46 @@ describe("pending invitations list", () => {
     return { transport, state, userId };
   }
 
-  test("shows each invitation once and starts a new organization without a cursor", async () => {
-    const { transport, state, userId } = invitationPages();
-    const { organization } = await createClient(
-      OrganizationService,
-      transport,
-    ).createOrganization({ name: "Initech" });
-    renderConsole(path, { transport, userId });
+  test(
+    "shows each invitation once and starts a new organization without a cursor",
+    async () => {
+      const { transport, state, userId } = invitationPages();
+      const { organization } = await createClient(
+        OrganizationService,
+        transport,
+      ).createOrganization({ name: "Initech" });
+      renderConsole(path, { transport, userId });
 
-    await waitForRows(name, 2);
-    await waitFor(() => expect(state.requests).toHaveLength(3));
-    expect(state.requests.map((request) => request.pageSize)).toEqual([
-      200, 200, 200,
-    ]);
-    expect(state.requests[0]!.pageToken).toBe("");
-    expect(state.requests[1]!.pageToken).not.toBe("");
-    expect(state.requests[2]!.pageToken).not.toBe("");
-    expect(state.requests[2]!.pageToken).not.toBe(state.requests[1]!.pageToken);
-    expect(
-      screen.getByRole("button", { name: "Revoke Member invitation osi_0000" }),
-    ).toBeTruthy();
+      await waitForRows(name, 2);
+      await waitFor(() => expect(state.requests).toHaveLength(3));
+      expect(state.requests.map((request) => request.pageSize)).toEqual([
+        200, 200, 200,
+      ]);
+      expect(state.requests[0]!.pageToken).toBe("");
+      expect(state.requests[1]!.pageToken).not.toBe("");
+      expect(state.requests[2]!.pageToken).not.toBe("");
+      expect(state.requests[2]!.pageToken).not.toBe(
+        state.requests[1]!.pageToken,
+      );
+      expect(
+        screen.getByRole("button", {
+          name: "Revoke Member invitation osi_0000",
+        }),
+      ).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("combobox", { name: "Organization" }));
-    fireEvent.click(await screen.findByRole("option", { name: "Initech" }));
+      fireEvent.click(screen.getByRole("combobox", { name: "Organization" }));
+      fireEvent.click(await screen.findByRole("option", { name: "Initech" }));
 
-    expect(await screen.findByText("No pending invitations")).toBeTruthy();
-    expect(screen.queryByRole("list", { name })).toBeNull();
-    expect(state.requests).toHaveLength(4);
-    expect(state.requests[3]).toMatchObject({
-      organizationId: organization!.organizationId,
-      pageToken: "",
-    });
-  });
+      expect(await screen.findByText("No pending invitations")).toBeTruthy();
+      expect(screen.queryByRole("list", { name })).toBeNull();
+      expect(state.requests).toHaveLength(4);
+      expect(state.requests[3]).toMatchObject({
+        organizationId: organization!.organizationId,
+        pageToken: "",
+      });
+    },
+    WAIT.timeout + 3 * DEFAULT_WAIT_MS + TEST_SETUP_MS,
+  );
 
   test("restarts only the submitted organization's uncached invitation request", async () => {
     const mock = createMockTransport();
@@ -616,37 +635,45 @@ describe("enrollment tokens list", () => {
   const withTokens = () =>
     createMockTransport({ extraEnrollmentTokens: EXTRA_ROWS });
 
-  test("shows the seeded token from one request of 200 rows", async () => {
-    const { transport, state } = pagedTransport(
-      "ListEnrollmentTokens",
-      createMockTransport(),
-    );
-    renderConsole(`/orgs/${MOCK_IDS.acme}/enrollment-tokens`, { transport });
-    expect(await screen.findByText(/ose_91c2/, {}, WAIT)).toBeTruthy();
-    // The absence of a second request cannot be awaited; give a request that
-    // the console would wrongly send time to arrive.
-    await settle(60);
-    expect(state.tokens).toEqual([""]);
-    expect(itemsOf("Enrollment tokens")).toHaveLength(1);
-    expect(screen.queryByText(/Loading more enrollment tokens/)).toBeNull();
-  });
+  test(
+    "shows the seeded token from one request of 200 rows",
+    async () => {
+      const { transport, state } = pagedTransport(
+        "ListEnrollmentTokens",
+        createMockTransport(),
+      );
+      renderConsole(`/orgs/${MOCK_IDS.acme}/enrollment-tokens`, { transport });
+      expect(await screen.findByText(/ose_91c2/, {}, WAIT)).toBeTruthy();
+      // The absence of a second request cannot be awaited; give a request that
+      // the console would wrongly send time to arrive.
+      await settle(60);
+      expect(state.tokens).toEqual([""]);
+      expect(itemsOf("Enrollment tokens")).toHaveLength(1);
+      expect(screen.queryByText(/Loading more enrollment tokens/)).toBeNull();
+    },
+    WAIT.timeout + TEST_SETUP_MS,
+  );
 
-  test("shows the empty state of an organization without tokens", async () => {
-    const mock = createMockTransport();
-    const { organization } = await createClient(
-      OrganizationService,
-      mock,
-    ).createOrganization({ name: "Initech" });
-    renderConsole(`/orgs/${organization!.organizationId}/enrollment-tokens`, {
-      transport: mock,
-    });
-    expect(
-      await screen.findByText("No enrollment tokens", {}, WAIT),
-    ).toBeTruthy();
-    expect(
-      screen.queryByRole("list", { name: "Enrollment tokens" }),
-    ).toBeNull();
-  });
+  test(
+    "shows the empty state of an organization without tokens",
+    async () => {
+      const mock = createMockTransport();
+      const { organization } = await createClient(
+        OrganizationService,
+        mock,
+      ).createOrganization({ name: "Initech" });
+      renderConsole(`/orgs/${organization!.organizationId}/enrollment-tokens`, {
+        transport: mock,
+      });
+      expect(
+        await screen.findByText("No enrollment tokens", {}, WAIT),
+      ).toBeTruthy();
+      expect(
+        screen.queryByRole("list", { name: "Enrollment tokens" }),
+      ).toBeNull();
+    },
+    WAIT.timeout + TEST_SETUP_MS,
+  );
 
   test(
     "lists every page and revokes a new token that sorts after the first page",
@@ -799,33 +826,41 @@ describe("API keys list", () => {
   /** A mock whose acme organization holds the seeded key and `EXTRA_ROWS` active ones. */
   const withKeys = () => createMockTransport({ extraApiKeys: EXTRA_ROWS });
 
-  test("shows the seeded key from one request of 200 rows", async () => {
-    const { transport, state } = pagedTransport(
-      "ListApiKeys",
-      createMockTransport(),
-    );
-    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
-    expect(await screen.findByText(/ci-runner/, {}, WAIT)).toBeTruthy();
-    // The absence of a second request cannot be awaited; give a request that
-    // the console would wrongly send time to arrive.
-    await settle(60);
-    expect(state.tokens).toEqual([""]);
-    expect(itemsOf("API keys")).toHaveLength(1);
-    expect(screen.queryByText(/Loading more API keys/)).toBeNull();
-  });
+  test(
+    "shows the seeded key from one request of 200 rows",
+    async () => {
+      const { transport, state } = pagedTransport(
+        "ListApiKeys",
+        createMockTransport(),
+      );
+      renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+      expect(await screen.findByText(/ci-runner/, {}, WAIT)).toBeTruthy();
+      // The absence of a second request cannot be awaited; give a request that
+      // the console would wrongly send time to arrive.
+      await settle(60);
+      expect(state.tokens).toEqual([""]);
+      expect(itemsOf("API keys")).toHaveLength(1);
+      expect(screen.queryByText(/Loading more API keys/)).toBeNull();
+    },
+    WAIT.timeout + TEST_SETUP_MS,
+  );
 
-  test("shows the empty state of an organization without keys", async () => {
-    const mock = createMockTransport();
-    const { organization } = await createClient(
-      OrganizationService,
-      mock,
-    ).createOrganization({ name: "Initech" });
-    renderConsole(`/orgs/${organization!.organizationId}/api-keys`, {
-      transport: mock,
-    });
-    expect(await screen.findByText("No API keys", {}, WAIT)).toBeTruthy();
-    expect(screen.queryByRole("list", { name: "API keys" })).toBeNull();
-  });
+  test(
+    "shows the empty state of an organization without keys",
+    async () => {
+      const mock = createMockTransport();
+      const { organization } = await createClient(
+        OrganizationService,
+        mock,
+      ).createOrganization({ name: "Initech" });
+      renderConsole(`/orgs/${organization!.organizationId}/api-keys`, {
+        transport: mock,
+      });
+      expect(await screen.findByText("No API keys", {}, WAIT)).toBeTruthy();
+      expect(screen.queryByRole("list", { name: "API keys" })).toBeNull();
+    },
+    WAIT.timeout + TEST_SETUP_MS,
+  );
 
   test(
     "lists every page and revokes a new key that sorts after the first page",
@@ -1129,6 +1164,7 @@ test.each([
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(seen[mutation]).toBeUndefined();
   },
+  5 * WAIT.timeout + TEST_SETUP_MS,
 );
 
 describe.each([
@@ -1249,63 +1285,83 @@ describe.each([
       expect(screen.queryByText(error)).toBeNull();
       expect(state.tokens).toEqual(["", "", "fresh-token"]);
     },
+    5 * WAIT.timeout + TEST_SETUP_MS,
   );
 
-  test("follows a cached token after a transient refresh and waits for continuation retry", async () => {
-    const { list, state, refetch } = await loadCachedPage();
-    state.tokens.length = 0;
-    state.refreshError = Code.Unavailable;
-    state.continuationError = Code.Internal;
-    await refetch();
-    await screen.findByText(
-      `Some ${fixture.field} are not shown yet.`,
-      {},
+  test(
+    "follows a cached token after a transient refresh and waits for continuation retry",
+    async () => {
+      const { list, state, refetch } = await loadCachedPage();
+      state.tokens.length = 0;
+      state.refreshError = Code.Unavailable;
+      state.continuationError = Code.Internal;
+      await refetch();
+      await screen.findByText(
+        `Some ${fixture.field} are not shown yet.`,
+        {},
+        WAIT,
+      );
+      expect(screen.getByRole("list", list)).toBeTruthy();
+      await settle();
+      expect(state.tokens).toEqual(["", "", "", "cached-token"]);
+
+      state.continuationError = undefined;
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+      }, WAIT);
+      expect(state.tokens).toEqual([
+        "",
+        "",
+        "",
+        "cached-token",
+        "cached-token",
+      ]);
+    },
+    4 * WAIT.timeout + TEST_SETUP_MS,
+  );
+});
+
+test(
+  "lets a sent revoke settle after a terminal full refresh closes its confirmation",
+  async () => {
+    const held = holdingTransport(["RevokeApiKey"]);
+    const { transport, queryClient, refetch } = fullListRefresh(
+      ApiKeyService.method.listApiKeys,
+      held.transport,
+    );
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, {
+      transport,
+      queryClient,
+    });
+    const revoke = await screen.findByRole(
+      "button",
+      { name: /^Revoke API key/ },
       WAIT,
     );
-    expect(screen.getByRole("list", list)).toBeTruthy();
-    await settle();
-    expect(state.tokens).toEqual(["", "", "", "cached-token"]);
+    await act(async () => fireEvent.click(revoke));
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Revoke key" })),
+    );
+    await waitFor(() => expect(held.calls.RevokeApiKey).toHaveLength(1), WAIT);
 
-    state.continuationError = undefined;
-    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    await waitFor(() => {
-      expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
-    }, WAIT);
-    expect(state.tokens).toEqual(["", "", "", "cached-token", "cached-token"]);
-  });
-});
+    await refetch(Code.PermissionDenied);
+    await screen.findByText("You do not have permission to do this.", {}, WAIT);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await act(async () => {
+      held.calls.RevokeApiKey![0]!.settle();
+    });
+    await waitFor(() => expect(queryClient.isMutating()).toBe(0), WAIT);
 
-test("lets a sent revoke settle after a terminal full refresh closes its confirmation", async () => {
-  const held = holdingTransport(["RevokeApiKey"]);
-  const { transport, queryClient, refetch } = fullListRefresh(
-    ApiKeyService.method.listApiKeys,
-    held.transport,
-  );
-  renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport, queryClient });
-  const revoke = await screen.findByRole(
-    "button",
-    { name: /^Revoke API key/ },
-    WAIT,
-  );
-  await act(async () => fireEvent.click(revoke));
-  await act(async () =>
-    fireEvent.click(screen.getByRole("button", { name: "Revoke key" })),
-  );
-  await waitFor(() => expect(held.calls.RevokeApiKey).toHaveLength(1), WAIT);
-
-  await refetch(Code.PermissionDenied);
-  await screen.findByText("You do not have permission to do this.", {}, WAIT);
-  expect(screen.queryByRole("alertdialog")).toBeNull();
-  await act(async () => {
-    held.calls.RevokeApiKey![0]!.settle();
-  });
-  await waitFor(() => expect(queryClient.isMutating()).toBe(0), WAIT);
-
-  await refetch();
-  expect(await screen.findByText("ci-runner · Revoked", {}, WAIT)).toBeTruthy();
-  expect(held.seen.RevokeApiKey).toBe(1);
-  expect(screen.queryByRole("alertdialog")).toBeNull();
-});
+    await refetch();
+    expect(
+      await screen.findByText("ci-runner · Revoked", {}, WAIT),
+    ).toBeTruthy();
+    expect(held.seen.RevokeApiKey).toBe(1);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  },
+  5 * WAIT.timeout + TEST_SETUP_MS,
+);
 
 describe("device inventory", () => {
   test(

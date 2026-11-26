@@ -19,7 +19,7 @@ import {
 } from "@testing-library/react";
 import { toast } from "delino-ui/toast";
 import { createMockTransport, MOCK_IDS } from "./mock/mock-api.ts";
-import { renderConsole } from "./test-support.tsx";
+import { TEST_SETUP_MS, renderConsole } from "./test-support.tsx";
 
 /** The longest wait for one condition; a loaded CI runner needs more than one second. */
 const WAIT = { timeout: 10_000 };
@@ -145,171 +145,191 @@ const CHANGED: Limits = {
 };
 
 describe("device limits during a refresh", () => {
-  test("a refresh keeps the edited field, updates the others and saves all four", async () => {
-    const { transport, serverChange, state } = await controlPlane(FIRST);
-    const queryClient = renderDevice(BUILD_BOX, transport);
-    await loaded("4", "4096", "20");
-    await commit("Memory limit (MiB)", "8192");
-    await serverChange(MOCK_IDS.buildBox, CHANGED);
-    await refresh(queryClient, () => {
+  test(
+    "a refresh keeps the edited field, updates the others and saves all four",
+    async () => {
+      const { transport, serverChange, state } = await controlPlane(FIRST);
+      const queryClient = renderDevice(BUILD_BOX, transport);
+      await loaded("4", "4096", "20");
+      await commit("Memory limit (MiB)", "8192");
+      await serverChange(MOCK_IDS.buildBox, CHANGED);
+      await refresh(queryClient, () => {
+        expect(input("vCPU limit").value).toBe("6");
+        expect(input("Disk limit (GiB)").value).toBe("30");
+      });
+      expect(input("Memory limit (MiB)").value).toBe("8192");
+      // The untouched overcommit select follows the fetched 125%: 6 * 1.25.
+      expect(effective()).toContain("7");
+
+      await save();
+      await waitFor(() => expect(state.saves).toHaveLength(1), WAIT);
+      expect(state.saves[0]?.vcpuCount).toBe(6);
+      expect(state.saves[0]?.memoryMib).toBe(8192n);
+      expect(state.saves[0]?.diskGib).toBe(30n);
+      expect(state.saves[0]?.vcpuOvercommitPercent).toBe(125);
+    },
+    3 * WAIT.timeout + TEST_SETUP_MS,
+  );
+
+  test(
+    "a saved edit is cleared, so a later change of the server updates the field",
+    async () => {
+      const { transport, serverChange, state } = await controlPlane(FIRST);
+      const queryClient = renderDevice(BUILD_BOX, transport);
+      await loaded("4", "4096", "20");
+      await commit("Memory limit (MiB)", "8192");
+      await save();
+      await waitFor(() => expect(state.saves).toHaveLength(1), WAIT);
+      await waitFor(() => {
+        expect(
+          (
+            screen.getByRole("button", {
+              name: "Save limits",
+            }) as HTMLButtonElement
+          ).disabled,
+        ).toBe(false);
+      }, WAIT);
+      expect(input("Memory limit (MiB)").value).toBe("8192");
+
+      await serverChange(MOCK_IDS.buildBox, CHANGED);
+      await refresh(queryClient, () => {
+        expect(input("Memory limit (MiB)").value).toBe("6144");
+      });
+      expect(input("vCPU limit").value).toBe("6");
+    },
+    4 * WAIT.timeout + TEST_SETUP_MS,
+  );
+
+  test(
+    "a failed readback keeps confirmed limits until a later read succeeds",
+    async () => {
+      const { transport, serverChange, state } = await controlPlane(FIRST);
+      renderDevice(BUILD_BOX, transport);
+      await loaded("4", "4096", "20");
+      await commit("vCPU limit", "6");
+      state.failReads = true;
+      await save();
+
+      const refreshNotice = /The last refresh failed/;
+      await within(
+        screen.getByRole("region", { name: "Notifications" }),
+      ).findByText("The device limits are saved.", {}, WAIT);
+      expect(screen.getByText(refreshNotice)).toBeTruthy();
+      expect(input("vCPU limit").value).toBe("6");
+      expect(input("Memory limit (MiB)").value).toBe("4096");
+      expect(input("Disk limit (GiB)").value).toBe("20");
+      expect(input("vCPU limit").disabled).toBe(false);
+      expect(input("Memory limit (MiB)").disabled).toBe(false);
+      expect(input("Disk limit (GiB)").disabled).toBe(false);
+
+      await commit("Disk limit (GiB)", "30");
+      await save();
+      await waitFor(() => expect(state.saves).toHaveLength(2), WAIT);
+      expect(state.saves[1]).toMatchObject({
+        ...FIRST,
+        vcpuCount: 6,
+        diskGib: 30n,
+      });
+      await waitFor(
+        () => expect(input("Disk limit (GiB)").disabled).toBe(false),
+        WAIT,
+      );
+      await loaded("6", "4096", "30");
+      expect(screen.getByText(refreshNotice)).toBeTruthy();
+
+      await serverChange(MOCK_IDS.buildBox, {
+        ...FIRST,
+        vcpuCount: 8,
+        diskGib: 30n,
+      });
+      state.failReads = false;
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      });
+      await loaded("8", "4096", "30");
+      expect(screen.queryByText(refreshNotice)).toBeNull();
+    },
+    6 * WAIT.timeout + TEST_SETUP_MS,
+  );
+
+  test(
+    "a failed save shows an error and keeps the draft for a retry",
+    async () => {
+      const { transport, server, serverChange, state } =
+        await controlPlane(FIRST);
+      const queryClient = renderDevice(BUILD_BOX, transport);
+      await loaded("4", "4096", "20");
+      await commit("Disk limit (GiB)", "99");
+      state.failSaves = true;
+      await save();
+      await within(
+        screen.getByRole("region", { name: "Notifications" }),
+      ).findByText(
+        "OwnSand is not available right now. Try again in a moment.",
+        {},
+        WAIT,
+      );
+      await waitFor(() => expect(state.saves).toHaveLength(1), WAIT);
+      await waitFor(() => {
+        expect(
+          (
+            screen.getByRole("button", {
+              name: "Save limits",
+            }) as HTMLButtonElement
+          ).disabled,
+        ).toBe(false);
+      }, WAIT);
+      expect(input("Disk limit (GiB)").value).toBe("99");
+      const saved = await server.getDevice({
+        organizationId: MOCK_IDS.acme,
+        deviceId: MOCK_IDS.buildBox,
+      });
+      expect(saved.device?.limits).toMatchObject(FIRST);
+
+      // A refresh after the failure still keeps the edit.
+      await serverChange(MOCK_IDS.buildBox, CHANGED);
+      await refresh(queryClient, () => {
+        expect(input("vCPU limit").value).toBe("6");
+      });
+      expect(input("Disk limit (GiB)").value).toBe("99");
+
+      state.failSaves = false;
+      await save();
+      await waitFor(() => expect(state.saves).toHaveLength(2), WAIT);
+      expect(state.saves[1]?.vcpuCount).toBe(6);
+      expect(state.saves[1]?.diskGib).toBe(99n);
+      expect(state.saves[1]?.memoryMib).toBe(6144n);
+    },
+    6 * WAIT.timeout + TEST_SETUP_MS,
+  );
+
+  test(
+    "a clean form shows the latest limits and another device shows its own",
+    async () => {
+      const { transport, serverChange } = await controlPlane(FIRST);
+      await serverChange(MOCK_IDS.studioMac, {
+        vcpuCount: 2,
+        memoryMib: 2048n,
+        diskGib: 10n,
+        vcpuOvercommitPercent: 100,
+      });
+      const queryClient = renderDevice(BUILD_BOX, transport);
+      await loaded("4", "4096", "20");
+      await serverChange(MOCK_IDS.buildBox, CHANGED);
+      await refresh(queryClient, () => {
+        expect(input("Memory limit (MiB)").value).toBe("6144");
+      });
       expect(input("vCPU limit").value).toBe("6");
       expect(input("Disk limit (GiB)").value).toBe("30");
-    });
-    expect(input("Memory limit (MiB)").value).toBe("8192");
-    // The untouched overcommit select follows the fetched 125%: 6 * 1.25.
-    expect(effective()).toContain("7");
 
-    await save();
-    await waitFor(() => expect(state.saves).toHaveLength(1), WAIT);
-    expect(state.saves[0]?.vcpuCount).toBe(6);
-    expect(state.saves[0]?.memoryMib).toBe(8192n);
-    expect(state.saves[0]?.diskGib).toBe(30n);
-    expect(state.saves[0]?.vcpuOvercommitPercent).toBe(125);
-  });
-
-  test("a saved edit is cleared, so a later change of the server updates the field", async () => {
-    const { transport, serverChange, state } = await controlPlane(FIRST);
-    const queryClient = renderDevice(BUILD_BOX, transport);
-    await loaded("4", "4096", "20");
-    await commit("Memory limit (MiB)", "8192");
-    await save();
-    await waitFor(() => expect(state.saves).toHaveLength(1), WAIT);
-    await waitFor(() => {
-      expect(
-        (
-          screen.getByRole("button", {
-            name: "Save limits",
-          }) as HTMLButtonElement
-        ).disabled,
-      ).toBe(false);
-    }, WAIT);
-    expect(input("Memory limit (MiB)").value).toBe("8192");
-
-    await serverChange(MOCK_IDS.buildBox, CHANGED);
-    await refresh(queryClient, () => {
-      expect(input("Memory limit (MiB)").value).toBe("6144");
-    });
-    expect(input("vCPU limit").value).toBe("6");
-  });
-
-  test("a failed readback keeps confirmed limits until a later read succeeds", async () => {
-    const { transport, serverChange, state } = await controlPlane(FIRST);
-    renderDevice(BUILD_BOX, transport);
-    await loaded("4", "4096", "20");
-    await commit("vCPU limit", "6");
-    state.failReads = true;
-    await save();
-
-    const refreshNotice = /The last refresh failed/;
-    await within(
-      screen.getByRole("region", { name: "Notifications" }),
-    ).findByText("The device limits are saved.", {}, WAIT);
-    expect(screen.getByText(refreshNotice)).toBeTruthy();
-    expect(input("vCPU limit").value).toBe("6");
-    expect(input("Memory limit (MiB)").value).toBe("4096");
-    expect(input("Disk limit (GiB)").value).toBe("20");
-    expect(input("vCPU limit").disabled).toBe(false);
-    expect(input("Memory limit (MiB)").disabled).toBe(false);
-    expect(input("Disk limit (GiB)").disabled).toBe(false);
-
-    await commit("Disk limit (GiB)", "30");
-    await save();
-    await waitFor(() => expect(state.saves).toHaveLength(2), WAIT);
-    expect(state.saves[1]).toMatchObject({
-      ...FIRST,
-      vcpuCount: 6,
-      diskGib: 30n,
-    });
-    await waitFor(
-      () => expect(input("Disk limit (GiB)").disabled).toBe(false),
-      WAIT,
-    );
-    await loaded("6", "4096", "30");
-    expect(screen.getByText(refreshNotice)).toBeTruthy();
-
-    await serverChange(MOCK_IDS.buildBox, {
-      ...FIRST,
-      vcpuCount: 8,
-      diskGib: 30n,
-    });
-    state.failReads = false;
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-    await loaded("8", "4096", "30");
-    expect(screen.queryByText(refreshNotice)).toBeNull();
-  });
-
-  test("a failed save shows an error and keeps the draft for a retry", async () => {
-    const { transport, server, serverChange, state } =
-      await controlPlane(FIRST);
-    const queryClient = renderDevice(BUILD_BOX, transport);
-    await loaded("4", "4096", "20");
-    await commit("Disk limit (GiB)", "99");
-    state.failSaves = true;
-    await save();
-    await within(
-      screen.getByRole("region", { name: "Notifications" }),
-    ).findByText(
-      "OwnSand is not available right now. Try again in a moment.",
-      {},
-      WAIT,
-    );
-    await waitFor(() => expect(state.saves).toHaveLength(1), WAIT);
-    await waitFor(() => {
-      expect(
-        (
-          screen.getByRole("button", {
-            name: "Save limits",
-          }) as HTMLButtonElement
-        ).disabled,
-      ).toBe(false);
-    }, WAIT);
-    expect(input("Disk limit (GiB)").value).toBe("99");
-    const saved = await server.getDevice({
-      organizationId: MOCK_IDS.acme,
-      deviceId: MOCK_IDS.buildBox,
-    });
-    expect(saved.device?.limits).toMatchObject(FIRST);
-
-    // A refresh after the failure still keeps the edit.
-    await serverChange(MOCK_IDS.buildBox, CHANGED);
-    await refresh(queryClient, () => {
-      expect(input("vCPU limit").value).toBe("6");
-    });
-    expect(input("Disk limit (GiB)").value).toBe("99");
-
-    state.failSaves = false;
-    await save();
-    await waitFor(() => expect(state.saves).toHaveLength(2), WAIT);
-    expect(state.saves[1]?.vcpuCount).toBe(6);
-    expect(state.saves[1]?.diskGib).toBe(99n);
-    expect(state.saves[1]?.memoryMib).toBe(6144n);
-  });
-
-  test("a clean form shows the latest limits and another device shows its own", async () => {
-    const { transport, serverChange } = await controlPlane(FIRST);
-    await serverChange(MOCK_IDS.studioMac, {
-      vcpuCount: 2,
-      memoryMib: 2048n,
-      diskGib: 10n,
-      vcpuOvercommitPercent: 100,
-    });
-    const queryClient = renderDevice(BUILD_BOX, transport);
-    await loaded("4", "4096", "20");
-    await serverChange(MOCK_IDS.buildBox, CHANGED);
-    await refresh(queryClient, () => {
-      expect(input("Memory limit (MiB)").value).toBe("6144");
-    });
-    expect(input("vCPU limit").value).toBe("6");
-    expect(input("Disk limit (GiB)").value).toBe("30");
-
-    // An edit of this device does not follow the user to the other one.
-    await commit("Disk limit (GiB)", "77");
-    await act(async () => {
-      window.history.pushState(null, "", STUDIO_MAC);
-      window.dispatchEvent(new PopStateEvent("popstate"));
-    });
-    await loaded("2", "2048", "10");
-  });
+      // An edit of this device does not follow the user to the other one.
+      await commit("Disk limit (GiB)", "77");
+      await act(async () => {
+        window.history.pushState(null, "", STUDIO_MAC);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+      await loaded("2", "2048", "10");
+    },
+    3 * WAIT.timeout + TEST_SETUP_MS,
+  );
 });
