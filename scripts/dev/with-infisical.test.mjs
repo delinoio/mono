@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -49,15 +50,46 @@ const secretValue = "s3cr3t-value-that-must-not-be-logged";
 // package.json; fixture() writes a CommonJS one next to it, because the file
 // uses require().
 const fakeInfisical = `#!/usr/bin/env node
-const { writeFileSync } = require("node:fs");
+const { spawn } = require("node:child_process");
+const { appendFileSync, writeFileSync } = require("node:fs");
+const argsFile = process.env.FAKE_INFISICAL_ARGS;
 writeFileSync(
-  process.env.FAKE_INFISICAL_ARGS,
+  argsFile,
   JSON.stringify({
     args: process.argv.slice(2),
     cwd: process.cwd(),
     LOG_LEVEL: process.env.LOG_LEVEL ?? null,
   }),
 );
+const mode = process.env.FAKE_INFISICAL_SIZE_MODE;
+if (mode) {
+  const limit = 16 * 1024 * 1024;
+  writeFileSync(argsFile + ".pid", String(process.pid));
+  if (mode === "exact") {
+    const output = Buffer.alloc(limit, 0x20);
+    output.write("[]");
+    process.stdout.write(output);
+  } else {
+    process.on("SIGTERM", () => {
+      appendFileSync(argsFile + ".signals", "SIGTERM\\n");
+      if (mode === "cooperative") process.exit(0);
+    });
+    if (mode === "held-pipe") {
+      const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+        stdio: ["ignore", "inherit", "ignore"],
+      });
+      writeFileSync(argsFile + ".holder", String(holder.pid));
+      holder.unref();
+    } else {
+      setInterval(() => {}, 1000);
+    }
+    const extraBytes = mode === "stubborn" ? 256 * 1024 : 1;
+    const output = Buffer.alloc(limit + extraBytes, 0x78);
+    output.write(${JSON.stringify(secretValue)});
+    process.stdout.write(output);
+  }
+  return;
+}
 const finish = () => {
   process.stdout.write(process.env.FAKE_INFISICAL_OUTPUT ?? "[]");
   process.exitCode = Number(process.env.FAKE_INFISICAL_EXIT ?? "0");
@@ -100,7 +132,7 @@ if (process.argv[3] === "wait" || process.argv[3] === "stubborn") {
 // `scripts/dev/with-infisical.mjs`, so that the launcher resolves the
 // fixture as its repository root.
 function fixture(t, { config = null, cli = true, env = {} } = {}) {
-  const root = mkdtempSync(join(tmpdir(), "with-infisical-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "with-infisical-")));
   // Launchers started from this fixture register their teardown here. It runs
   // before the directory is removed, because the teardown reads the command's
   // start record from that directory and `t.after` hooks run in order.
@@ -1140,6 +1172,76 @@ test(
     }
   },
 );
+
+test(
+  "an export of exactly 16 MiB starts the development command",
+  posixOnly,
+  async (t) => {
+    const f = fixture(t, {
+      config: ProjectConfigFile.Yaml,
+      env: { FAKE_INFISICAL_SIZE_MODE: "exact" },
+    });
+    const launcher = startLauncher(f, ["--path=/api", ...commandArgs(7)]);
+    const result = await within(launcher.exited, exitDeadlineMs, "the command");
+    assert.equal(result.code, 7, result.stderr);
+    assert.deepEqual(started(f).args, ["7"]);
+  },
+);
+
+test("an oversized export stops the launcher", posixOnly, async (t) => {
+  for (const [mode, deadlineMs] of [
+    ["cooperative", 4_000],
+    ["held-pipe", 4_000],
+    ["stubborn", 9_000],
+  ]) {
+    await t.test(mode, async (t) => {
+      const f = fixture(t, {
+        config: ProjectConfigFile.Yaml,
+        env: { FAKE_INFISICAL_SIZE_MODE: mode },
+      });
+      // startLauncher also force-stops the fixture group, including the pipe
+      // holder, if the launcher fails to meet this deadline.
+      const startTime = performance.now();
+      const launcher = startLauncher(f, ["--path=/api", ...commandArgs(0)]);
+      const result = await within(
+        launcher.exited,
+        deadlineMs,
+        "export shutdown",
+      );
+      assert.equal(result.code, 1, result.stderr);
+      assert.deepEqual(records(result.stderr), [
+        {
+          event: "dev_env_failed",
+          reason: FailureReason.OutputInvalid,
+          error: "infisical export printed more than 16777216 bytes",
+        },
+      ]);
+      assert.equal(result.stdout, "");
+      assert.equal(result.stderr.includes(secretValue), false);
+      assert.equal(existsSync(`${f.out}.start`), false);
+
+      const pid = Number(readFileSync(`${f.infisicalArgs}.pid`, "utf8"));
+      assert.equal(alive(pid), false, "the export process exited");
+      if (mode === "held-pipe") {
+        const holder = Number(
+          readFileSync(`${f.infisicalArgs}.holder`, "utf8"),
+        );
+        assert.equal(alive(holder), true, "the fixture still holds stdout");
+      } else {
+        assert.equal(
+          readFileSync(`${f.infisicalArgs}.signals`, "utf8"),
+          "SIGTERM\n",
+        );
+      }
+      if (mode === "stubborn") {
+        assert.ok(
+          performance.now() - startTime >= 4_900,
+          "SIGTERM grace period",
+        );
+      }
+    });
+  }
+});
 
 test(
   "a signal during the fetch prevents the command from starting",

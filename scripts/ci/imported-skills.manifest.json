@@ -13,12 +13,12 @@
       "files": {
         "LICENSE": "13990a7ef816ecccad065c66f3ecd66cff7ec9da3b7aa49124dd78bacd3fee66",
         "SKILL.md": "d87bb3e172df60cf1b0c57cd938ddac366be2cc7f59e484b9a6b0d130bdff4ef",
-        "references/backup-recovery.md": "fcf264d86d664768280c23ec07e005799186c1268f3a0c19178c173ec0af0213",
+        "references/backup-recovery.md": "5972f257d6b02e29bc2b8d9e45a9cbc0f2094c78d70f076e9f6302f21e1b47c6",
         "references/index-optimization.md": "1f978e6da54900fcbceefe0ac5b2cc2e0f88a445cd8098310bed0f42ba303c97",
         "references/indexing.md": "609fdceeeba6b01246ccb599b9761d0346281e3d015ab87d782293ea585d0813",
         "references/memory-management-ops.md": "254473cffe6b6d61c24de3bb993f142462a54612bb7e4fbfbfd1ded9ed39747d",
         "references/monitoring.md": "006c6992f882a223e4da36d8dc65393849f0f5387317f81b5f11165967680ca9",
-        "references/mvcc-transactions.md": "d852c5104a815ceb631fe13062da627f6de07a8592be5b45e855cc3a7f777958",
+        "references/mvcc-transactions.md": "c7fdee938cfbfa9bf5ebfe5ff0e6ea4a942eef2533bdf86edb96756e00eabbd8",
         "references/mvcc-vacuum.md": "836a24743b6f0fb088ac36a8c35f2e487fd56b4bc0ba61552348f360704a20bf",
         "references/optimization-checklist.md": "7babe582af123bc5e9772cb4c311914093a07faf3a18aa4d0ff8f85abc673c99",
         "references/partitioning.md": "35b36d2e843b38383f3939e1bbaf77744f3d3f94e1ce51794b73b42270d2ba70",
@@ -30,11 +30,11 @@
         "references/ps-connections.md": "e166e515a5192ba0eedadffe88f5560f74c6c5c09239d3e5210dec28fa63bc4d",
         "references/ps-extensions.md": "8ce87f920ec90ab4c6c359373935c85876513f627d8afe78d0c45d686a34d6df",
         "references/ps-insights.md": "7b4727f900d32873c6fad2d3ea8b8005bb771d252cf31863bddadacbe43a0fdf",
-        "references/query-patterns.md": "1d4aef87ca914548ac0f4833ab5ca3d1714aed5eb0bca0917840faedfa517b70",
+        "references/query-patterns.md": "2e9bb1b05520517736d8faea1e131c2a2479994cfa5ef5053fce27662b608c39",
         "references/replication.md": "c042b121410adb3f0bfb4cec1a5d124ce5fb283dc32ea56d277aaba9ca5fb63b",
         "references/schema-design.md": "fab6e3e1882a1d9f4db8b647084693a9c7f82516d17e5cd18cb3238f85adba6b",
         "references/storage-layout.md": "77af9a9d6afea9e4294da88dd1040098b13e5e2db826d87264627b70e0f0ae63",
-        "references/wal-operations.md": "7abf0bcd04ae9a5dce0985d621d0354bc30f7a56b66786aaadd8ac9d5c4bd192"
+        "references/wal-operations.md": "772b2768ae649a95af5e79ba710235ff0ccc93a3ba7db44e973c2a5df6378578"
       }
     },
     "vercel-composition-patterns": {

@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { deadlineSkipReason } from "./fixture-deadline.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
@@ -44,7 +45,7 @@ function skipReason() {
   if (bashVersion[0] < 4 || (bashVersion[0] === 4 && bashVersion[1] < 4)) {
     return `the deploy scripts need Bash 4.4 or newer, found ${bashVersion.join(".")}`;
   }
-  return false;
+  return deadlineSkipReason();
 }
 const skip = skipReason();
 

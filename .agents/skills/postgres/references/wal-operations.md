@@ -8,7 +8,13 @@ tags: postgres, wal, checkpoints, durability, crash-recovery, fsync, operations
 
 ## WAL Fundamentals
 
-Write-Ahead Logging: logs changes to `pg_wal/` **before** modifying data files. WAL segments are 16MB by default; `initdb --wal-segsize` sets another power-of-two size from 1MB to 1024MB, and only when the cluster is initialized. On COMMIT, PostgreSQL fsyncs WAL to disk and returns SUCCESS — data files are updated lazily. WAL records are written for all changes (including uncommitted transactions and rollbacks). **Never disable `fsync` in production** — power loss without fsync risks unrecoverable data loss.
+Write-ahead logging flushes WAL records in `pg_wal/` before PostgreSQL writes the corresponding changes to data files. WAL segments are 16MB by default. At cluster initialization, `initdb --wal-segsize` can set another power-of-two size from 1MB to 1024MB. PostgreSQL can write WAL records for transactions that have yet to commit or that later roll back.
+
+For an ordinary WAL-logged transaction with `fsync` enabled and the default `synchronous_commit = on`, PostgreSQL waits for the local WAL flush before it reports commit success. PostgreSQL can write the modified data pages later.
+
+With `synchronous_commit = off` and `fsync` enabled, PostgreSQL can report commit success before the local WAL flush. If PostgreSQL crashes before that flush, it can lose recent acknowledged commits. With normal crash-safety settings, PostgreSQL replays WAL up to the last flushed record and recovers to a consistent state. Certain operations, including two-phase commit commands, still commit synchronously. [PostgreSQL WAL settings](https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT) · [Asynchronous commit](https://www.postgresql.org/docs/current/wal-async-commit.html)
+
+**Never disable `fsync` in production.** Power loss with `fsync` disabled can cause unrecoverable data loss.
 
 `wal_level`: `minimal` (crash recovery only), `replica` (default; replication + archiving), `logical` (logical replication).
 

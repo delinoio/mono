@@ -103,6 +103,8 @@ const VariableName = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 // Upper bound of the CLI output that the launcher reads.
 const MaxExportBytes = 16 * 1024 * 1024;
+const ExportTermGraceMs = 5_000;
+const ExportKillGraceMs = 1_000;
 
 const StopSignal = Object.freeze({
   Interrupt: "SIGINT",
@@ -357,16 +359,52 @@ function fetchVariables(folder) {
     const chunks = [];
     let size = 0;
     let overflow = false;
-    child.stdout.on("data", (chunk) => {
-      size += chunk.length;
-      if (size > MaxExportBytes) {
-        overflow = true;
-        child.kill("SIGTERM");
-      } else {
-        chunks.push(chunk);
+    let shutdownTimer;
+    const finishOverflow = () => {
+      clearTimeout(shutdownTimer);
+      child.off("exit", finishOverflow);
+      child.stdout.destroy();
+      child.unref();
+      reject(
+        new LaunchFailure(
+          FailureReason.OutputInvalid,
+          `infisical export printed more than ${MaxExportBytes} bytes`,
+        ),
+      );
+    };
+    const signalExport = (signal) => {
+      try {
+        child.kill(signal);
+      } catch {
+        // Signal errors do not change the overflow diagnostic or deadline.
       }
+    };
+
+    child.stdout.on("data", (chunk) => {
+      if (overflow) return;
+      size += chunk.length;
+      if (size <= MaxExportBytes) {
+        chunks.push(chunk);
+        return;
+      }
+      overflow = true;
+      chunks.length = 0;
+      // A descendant can hold stdout open even after the direct child exits.
+      // The last data event can also follow that exit.
+      if (child.exitCode !== null || child.signalCode !== null) {
+        finishOverflow();
+        return;
+      }
+      child.once("exit", finishOverflow);
+      shutdownTimer = setTimeout(() => {
+        shutdownTimer = setTimeout(finishOverflow, ExportKillGraceMs);
+        signalExport("SIGKILL");
+      }, ExportTermGraceMs);
+      signalExport("SIGTERM");
     });
-    child.once("error", (error) => {
+    child.on("error", (error) => {
+      // A failed kill can emit an error on either shutdown attempt.
+      if (overflow) return;
       reject(
         error.code === "ENOENT"
           ? new LaunchFailure(
@@ -377,14 +415,8 @@ function fetchVariables(folder) {
       );
     });
     child.once("close", (code, signal) => {
-      if (overflow) {
-        reject(
-          new LaunchFailure(
-            FailureReason.OutputInvalid,
-            `infisical export printed more than ${MaxExportBytes} bytes`,
-          ),
-        );
-      } else if (code !== 0) {
+      if (overflow) return;
+      if (code !== 0) {
         reject(
           new LaunchFailure(
             FailureReason.FetchFailed,

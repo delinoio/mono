@@ -51,8 +51,7 @@ afterEach(() => {
  * seeded members one page each, with the token `page-<n>` that leads to page
  * n. `pages[i]` lists the user IDs of page i + 1; the last page has no token.
  * While `state.failPage` is set, that 1-based page fails with `unavailable`.
- * The mock ignores `page_size`, so the pages are cut here and no test needs
- * more than 200 members.
+ * The adapter slices the seeded roster and handles its own continuation tokens.
  */
 async function pagedMembers(pages: string[][]) {
   const mock = createMockTransport();
@@ -65,16 +64,33 @@ async function pagedMembers(pages: string[][]) {
   };
   const transport: Transport = {
     ...mock,
-    async unary(method, ...rest) {
-      if (method.name !== "ListMembers") return mock.unary(method, ...rest);
-      const token = (rest[3] as { pageToken: string }).pageToken;
+    async unary(method, signal, timeout, header, input, contextValues) {
+      if (method.name !== "ListMembers") {
+        return mock.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+      }
+      const token = (input as { pageToken: string }).pageToken;
       state.tokens.push(token);
       const page = token === "" ? 1 : Number(token.slice("page-".length));
       if (state.failPage === page) {
         throw new ConnectError("the page failed", Code.Unavailable);
       }
       // Only the envelope of the response matters; the rows come from `real`.
-      const res = await mock.unary(method, ...rest);
+      const firstPage = { ...input, pageToken: "" };
+      const res = await mock.unary(
+        method,
+        signal,
+        timeout,
+        header,
+        firstPage,
+        contextValues,
+      );
       return {
         ...res,
         message: create(ListMembersResponseSchema, {

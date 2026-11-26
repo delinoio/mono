@@ -11,7 +11,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -21,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/delinoio/mono/servers/internal/dbtesturl"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 )
 
@@ -89,7 +89,7 @@ func newURL(t testing.TB, maxVersion int64) string {
 	if createErr != nil {
 		t.Fatalf("create test database: %v", createErr)
 	}
-	child, err := childURL(admin, name)
+	child, err := dbtesturl.Child(admin, name)
 	if err != nil {
 		t.Fatalf("derive test database URL from %s: %v", EnvTestDatabaseURL, err)
 	}
@@ -153,30 +153,6 @@ func dropDatabase(t errorfer, name string, connect func(ctx context.Context) (ad
 	if _, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)"); err != nil {
 		t.Errorf("dbtest: drop test database %s failed", name)
 	}
-}
-
-// childURL returns the admin URL retargeted to the database name. It rewrites
-// the path for path-only URLs and appends dbname=name as the last query
-// setting, because pgx lets the dbname and database query settings override
-// the path and the last duplicate wins. The rest of the query keeps its raw
-// bytes and order. The error never contains the URL.
-func childURL(admin, name string) (string, error) {
-	u, err := url.Parse(admin)
-	if err != nil {
-		var uerr *url.Error
-		if errors.As(err, &uerr) {
-			return "", uerr.Err
-		}
-		return "", errors.New("invalid URL")
-	}
-	u.Path = "/" + name
-	u.RawPath = ""
-	if u.RawQuery == "" {
-		u.RawQuery = "dbname=" + name
-	} else {
-		u.RawQuery += "&dbname=" + name
-	}
-	return u.String(), nil
 }
 
 // testPoolMaxConns is the pool size of the connections that New opens.

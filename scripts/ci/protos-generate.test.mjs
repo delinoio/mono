@@ -127,8 +127,9 @@ const tsPackages = ["ownsand", "accounts", "sandrun"];
 
 // Creates a repository with the real script, committed (old) bindings of both
 // languages and every TypeScript target, and the fake go in a bin directory.
-function fixture({ parent = tmpdir(), plugin = true } = {}) {
+function fixture(t, { parent = tmpdir(), plugin = true } = {}) {
   const dir = mkdtempSync(join(parent, "protos-generate-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
   const repo = join(dir, "repo");
   const bin = join(dir, "bin");
   const scratch = join(dir, "tmp");
@@ -192,7 +193,7 @@ function fixture({ parent = tmpdir(), plugin = true } = {}) {
   const decoy = join(bin, "protoc-gen-es");
   write(decoy, "#!/bin/sh\n");
   chmodSync(decoy, 0o755);
-  return { dir, repo, scratch, env };
+  return { repo, scratch, env };
 }
 
 function listFiles(dir) {
@@ -259,7 +260,7 @@ test(
     t.after(() => rmSync(parent, { recursive: true, force: true }));
     const fixtureParent = join(parent, "node_modules");
     mkdirSync(fixtureParent);
-    const f = fixture({ parent: fixtureParent });
+    const f = fixture(t, { parent: fixtureParent });
     const packagePath = join("protos", "delino", "accounts");
     const dependency = join(packagePath, "node_modules", "dependency.txt");
     const notes = join(packagePath, "node_modules-notes", "notes.txt");
@@ -276,8 +277,7 @@ test(
   "a failing Go generator preserves the Go and TypeScript bindings",
   { skip },
   (t) => {
-    const f = fixture();
-    t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+    const f = fixture(t);
     assertPreserved(
       f,
       () => run(f, "generate", { FAKE_GO_FAIL: "go" }),
@@ -290,8 +290,7 @@ test(
   "a failing TypeScript generator preserves the Go and TypeScript bindings",
   { skip },
   (t) => {
-    const f = fixture();
-    t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+    const f = fixture(t);
     assertPreserved(
       f,
       () => run(f, "generate", { FAKE_GO_FAIL: "ts" }),
@@ -304,8 +303,7 @@ test(
   "a missing protoc-gen-es preserves the Go and TypeScript bindings",
   { skip },
   (t) => {
-    const f = fixture({ plugin: false });
-    t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+    const f = fixture(t, { plugin: false });
     assertPreserved(
       f,
       () => run(f, "generate"),
@@ -318,8 +316,7 @@ test(
   "a failing second TypeScript target preserves every binding",
   { skip },
   (t) => {
-    const f = fixture();
-    t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+    const f = fixture(t);
     assertPreserved(
       f,
       () => run(f, "generate", { FAKE_GO_FAIL: "ts-accounts" }),
@@ -332,8 +329,7 @@ test(
   "a missing protoc-gen-es of the accounts package preserves every binding",
   { skip },
   (t) => {
-    const f = fixture({ plugin: "ownsand" });
-    t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+    const f = fixture(t, { plugin: "ownsand" });
     assertPreserved(
       f,
       () => run(f, "generate"),
@@ -346,8 +342,7 @@ test(
   "a successful run replaces the bindings and removes stale files",
   { skip },
   (t) => {
-    const f = fixture();
-    t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+    const f = fixture(t);
     const result = run(f, "generate");
     assert.equal(result.status, 0, result.stderr);
     const kept = tsPackages.flatMap((pkg) => {
@@ -412,8 +407,7 @@ for (const { target, label, binding, extra } of [
       `generate preserves every binding when listing ${phase} ${label} fails`,
       { skip },
       (t) => {
-        const f = fixture();
-        t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+        const f = fixture(t);
         assertPreserved(
           f,
           () => run(f, "generate", { FAKE_FIND_FAIL: `${phase}:${target}` }),
@@ -427,8 +421,7 @@ for (const { target, label, binding, extra } of [
     `generate preserves every binding when the generator stages no ${label}`,
     { skip },
     (t) => {
-      const f = fixture();
-      t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+      const f = fixture(t);
       assertPreserved(
         f,
         () => run(f, "generate", { FAKE_GO_EMPTY_TARGET: target }),
@@ -438,8 +431,7 @@ for (const { target, label, binding, extra } of [
   );
 
   test(`check rejects matching partial lists of ${label}`, { skip }, (t) => {
-    const f = fixture();
-    t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+    const f = fixture(t);
     const generated = run(f, "generate");
     assert.equal(generated.status, 0, generated.stderr);
     write(join(f.repo, dirname(binding), extra), "extra binding\n");
@@ -450,8 +442,7 @@ for (const { target, label, binding, extra } of [
   });
 
   test(`check compares the paths and bytes of ${label}`, { skip }, (t) => {
-    const f = fixture();
-    t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+    const f = fixture(t);
     const generated = run(f, "generate");
     assert.equal(generated.status, 0, generated.stderr);
     const identical = run(f, "check");

@@ -255,9 +255,14 @@ function isPendingInvitation(
   );
 }
 
+interface Membership {
+  membershipId: string;
+  member: Member;
+}
+
 interface OrgState {
   organization: Organization;
-  members: Member[];
+  members: Membership[];
   invitations: { invitation: Invitation; secret: string }[];
   devices: Device[];
   tokens: EnrollmentToken[];
@@ -338,19 +343,22 @@ function applyBillingState(org: OrgState, state: MockBillingState): void {
   }
 }
 
-function member(
+function newMembership(
   orgId: string,
   userId: string,
   role: Role,
   displayName: string,
-): Member {
-  return create(MemberSchema, {
-    organizationId: orgId,
-    userId,
-    role,
-    displayName,
-    joinTime: ts(-30 * 24 * HOUR),
-  });
+): Membership {
+  return {
+    membershipId: newMockId(),
+    member: create(MemberSchema, {
+      organizationId: orgId,
+      userId,
+      role,
+      displayName,
+      joinTime: ts(-30 * 24 * HOUR),
+    }),
+  };
 }
 
 function emptyOrg(id: string, name: string): OrgState {
@@ -386,9 +394,9 @@ function seed(): Map<string, OrgState> {
   const orgs = new Map<string, OrgState>();
   const acme = emptyOrg(MOCK_IDS.acme, "Acme Robotics");
   acme.members.push(
-    member(MOCK_IDS.acme, MOCK_USER, Role.OWNER, "Mina Kim"),
-    member(MOCK_IDS.acme, "user-admin-jun", Role.ADMIN, "Jun Park"),
-    member(MOCK_IDS.acme, "user-member-ada", Role.MEMBER, ""),
+    newMembership(MOCK_IDS.acme, MOCK_USER, Role.OWNER, "Mina Kim"),
+    newMembership(MOCK_IDS.acme, "user-admin-jun", Role.ADMIN, "Jun Park"),
+    newMembership(MOCK_IDS.acme, "user-member-ada", Role.MEMBER, ""),
   );
   acme.invitations.push({
     invitation: create(InvitationSchema, {
@@ -570,14 +578,19 @@ function seed(): Map<string, OrgState> {
 
   const northwind = emptyOrg(MOCK_IDS.northwind, "Northwind Labs");
   northwind.members.push(
-    member(MOCK_IDS.northwind, "user-owner-lee", Role.OWNER, "Seo-yeon Lee"),
-    member(MOCK_IDS.northwind, MOCK_USER, Role.MEMBER, "Mina Kim"),
+    newMembership(
+      MOCK_IDS.northwind,
+      "user-owner-lee",
+      Role.OWNER,
+      "Seo-yeon Lee",
+    ),
+    newMembership(MOCK_IDS.northwind, MOCK_USER, Role.MEMBER, "Mina Kim"),
   );
   orgs.set(MOCK_IDS.northwind, northwind);
 
   const contoso = emptyOrg(MOCK_IDS.contoso, "Contoso Research");
   contoso.members.push(
-    member(MOCK_IDS.contoso, "user-owner-ray", Role.OWNER, "Ray Choi"),
+    newMembership(MOCK_IDS.contoso, "user-owner-ray", Role.OWNER, "Ray Choi"),
   );
   contoso.invitations.push({
     invitation: create(InvitationSchema, {
@@ -627,6 +640,8 @@ export interface MockTransportOptions {
    * row.
    */
   extraApiKeys?: number;
+  /** Members to add after the three seeded Acme members. */
+  extraMembers?: number;
   /** Pending invitations to add after the seeded Acme invitation. */
   extraInvitations?: number;
   /** Online Linux devices to add after the two seeded Acme devices. */
@@ -792,24 +807,28 @@ function newMockId(): string {
  * One page of a list, like the control plane: rows in ascending ID order, 50
  * rows by default and at most 200 (a negative size fails with
  * `invalid_argument`), starting after the row ID that the opaque page token
- * names, and a continuation token whenever a page is full, even when no row
- * follows. The token is the unpadded base64url form of `v1:` and the ID of
- * the last row; a token that is not that form of a UUID v7 fails with
- * `invalid_argument`. A token names a position, not a row, so it keeps
- * working after the row it names is deleted.
+ * names. Most lists return a continuation token whenever a page is full.
+ * The Accounts-backed billing list requires another eligible row and scopes
+ * its token to the RPC and caller. The token is the unpadded base64url form
+ * of the prefix and the last UUID v7, so it also works after that row is deleted.
  */
 function pageOf<T>(
   rows: readonly T[],
   req: { pageSize: number; pageToken: string },
   idOf: (row: T) => string,
+  {
+    tokenPrefix = PAGE_TOKEN_PREFIX,
+    requireMoreRows = false,
+  }: { tokenPrefix?: string; requireMoreRows?: boolean } = {},
 ): { page: T[]; nextPageToken: string } {
   if (req.pageSize < 0) {
     throw new ConnectError("invalid page_size", Code.InvalidArgument);
   }
   const pageSize = req.pageSize === 0 ? 50 : Math.min(req.pageSize, 200);
+  const limit = requireMoreRows ? pageSize + 1 : pageSize;
   let after = "";
   if (req.pageToken !== "") {
-    after = decodePageToken(req.pageToken);
+    after = decodePageToken(req.pageToken, tokenPrefix);
   }
   const page = rows
     .filter((row) => after === "" || idOf(row).toLowerCase() > after)
@@ -818,25 +837,27 @@ function pageOf<T>(
       const y = idOf(b).toLowerCase();
       return x < y ? -1 : x > y ? 1 : 0;
     })
-    .slice(0, pageSize);
+    .slice(0, limit);
+  const hasContinuation = page.length === limit;
+  if (page.length > pageSize) page.pop();
   const last = page.at(-1);
   return {
     page,
     nextPageToken:
-      page.length === pageSize && last !== undefined
-        ? encodePageToken(idOf(last))
+      hasContinuation && last !== undefined
+        ? encodePageToken(idOf(last), tokenPrefix)
         : "",
   };
 }
 
-function encodePageToken(id: string): string {
-  return btoa(PAGE_TOKEN_PREFIX + id.toLowerCase())
+function encodePageToken(id: string, prefix: string): string {
+  return btoa(prefix + id.toLowerCase())
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
 }
 
-function decodePageToken(token: string): string {
+function decodePageToken(token: string, prefix: string): string {
   const invalid = new ConnectError("invalid page_token", Code.InvalidArgument);
   if (!/^[A-Za-z0-9_-]+$/.test(token)) throw invalid;
   let raw: string;
@@ -845,8 +866,8 @@ function decodePageToken(token: string): string {
   } catch {
     throw invalid;
   }
-  if (!raw.startsWith(PAGE_TOKEN_PREFIX)) throw invalid;
-  const after = raw.slice(PAGE_TOKEN_PREFIX.length);
+  if (!raw.startsWith(prefix)) throw invalid;
+  const after = raw.slice(prefix.length);
   if (!UUID_V7.test(after)) throw invalid;
   return after.toLowerCase();
 }
@@ -865,6 +886,17 @@ export function createMockTransport(
   }
   const acmeOrg = orgs.get(MOCK_IDS.acme);
   if (acmeOrg !== undefined) {
+    for (let i = 0; i < (options.extraMembers ?? 0); i++) {
+      const number = String(i + 1).padStart(3, "0");
+      acmeOrg.members.push(
+        newMembership(
+          MOCK_IDS.acme,
+          `user-extra-${number}`,
+          Role.MEMBER,
+          `Fixture member ${number}`,
+        ),
+      );
+    }
     const seededSnapshot = acmeOrg.snapshots[0]!;
     for (let i = 0; i < (options.extraSnapshots ?? 0); i++) {
       const snapshot = clone(SnapshotSchema, seededSnapshot);
@@ -1036,7 +1068,9 @@ export function createMockTransport(
 
   const membership = (orgId: string): { org: OrgState; role: Role } => {
     const org = orgs.get(orgId);
-    const m = org?.members.find((x) => x.userId === userId);
+    const m = org?.members.find(
+      ({ member }) => member.userId === userId,
+    )?.member;
     if (org === undefined || m === undefined) {
       throw new ConnectError("organization not found", Code.NotFound);
     }
@@ -1151,7 +1185,7 @@ export function createMockTransport(
           throw new ConnectError("name is required", Code.InvalidArgument);
         const id = newMockId();
         const org = emptyOrg(id, name);
-        org.members.push(member(id, userId, Role.OWNER, "Mina Kim"));
+        org.members.push(newMembership(id, userId, Role.OWNER, "Mina Kim"));
         orgs.set(id, org);
         return { organization: withRole(org.organization, Role.OWNER) };
       },
@@ -1163,7 +1197,8 @@ export function createMockTransport(
         const all = [...orgs.values()]
           .map((org) => ({
             org,
-            m: org.members.find((x) => x.userId === userId),
+            m: org.members.find(({ member }) => member.userId === userId)
+              ?.member,
           }))
           .filter((x) => x.m !== undefined)
           .map((x) => withRole(x.org.organization, x.m!.role));
@@ -1191,11 +1226,13 @@ export function createMockTransport(
             Code.InvalidArgument,
           );
         }
-        const target = org.members.find((m) => m.userId === req.userId);
+        const target = org.members.find(
+          ({ member }) => member.userId === req.userId,
+        )?.member;
         if (target === undefined)
           throw new ConnectError("member not found", Code.NotFound);
-        for (const m of org.members) {
-          if (m.userId === userId) m.role = Role.ADMIN;
+        for (const { member } of org.members) {
+          if (member.userId === userId) member.role = Role.ADMIN;
         }
         target.role = Role.OWNER;
         // An ownership transfer removes the billing link.
@@ -1273,30 +1310,35 @@ export function createMockTransport(
           const { expireTime } = entry.invitation;
           if (expireTime !== undefined && now() >= timestampMs(expireTime))
             continue;
-          if (org.members.some((m) => m.userId === userId)) {
+          if (org.members.some(({ member }) => member.userId === userId)) {
             throw new ConnectError(
               "you are already a member",
               Code.AlreadyExists,
             );
           }
           entry.invitation.state = InvitationState.ACCEPTED;
-          const m = member(
+          const row = newMembership(
             org.organization.organizationId,
             userId,
             entry.invitation.role,
             "Mina Kim",
           );
-          org.members.push(m);
+          org.members.push(row);
           return {
-            organization: withRole(org.organization, m.role),
-            member: m,
+            organization: withRole(org.organization, row.member.role),
+            member: row.member,
           };
         }
         throw new ConnectError("invitation not found", Code.NotFound);
       },
       listMembers(req) {
         const { org } = membership(req.organizationId);
-        return { members: org.members };
+        const { page, nextPageToken } = pageOf(
+          org.members,
+          req,
+          (row) => row.membershipId,
+        );
+        return { members: page.map(({ member }) => member), nextPageToken };
       },
       updateMemberRole(req) {
         const { org, role } = membership(req.organizationId);
@@ -1310,7 +1352,9 @@ export function createMockTransport(
             Code.InvalidArgument,
           );
         }
-        const target = org.members.find((m) => m.userId === req.userId);
+        const target = org.members.find(
+          ({ member }) => member.userId === req.userId,
+        )?.member;
         if (target === undefined)
           throw new ConnectError("member not found", Code.NotFound);
         if (target.role === Role.OWNER) {
@@ -1340,7 +1384,9 @@ export function createMockTransport(
             Code.InvalidArgument,
           );
         }
-        const target = org.members.find((m) => m.userId === req.userId);
+        const target = org.members.find(
+          ({ member }) => member.userId === req.userId,
+        )?.member;
         if (target === undefined) {
           throw new ConnectError("member not found", Code.NotFound);
         }
@@ -1350,7 +1396,9 @@ export function createMockTransport(
             Code.PermissionDenied,
           );
         }
-        org.members = org.members.filter((m) => m.userId !== req.userId);
+        org.members = org.members.filter(
+          ({ member }) => member.userId !== req.userId,
+        );
         return {};
       },
     });
@@ -1929,14 +1977,24 @@ export function createMockTransport(
       listLinkableBillingAccounts(req) {
         const { role } = membership(req.organizationId);
         requireOwner(role);
+        const { page, nextPageToken } = pageOf(
+          linkable,
+          req,
+          (a) => a.billingAccountId,
+          {
+            tokenPrefix: `v1:ListLinkableBillingAccounts:${encodeURIComponent(userId)}:`,
+            requireMoreRows: true,
+          },
+        );
         return {
-          billingAccounts: linkable.map((a) =>
+          billingAccounts: page.map((a) =>
             create(LinkableBillingAccountSchema, {
               billingAccountId: a.billingAccountId,
               name: a.name,
               role: a.role,
             }),
           ),
+          nextPageToken,
         };
       },
       linkBillingAccount(req) {

@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
+	"github.com/delinoio/mono/servers/internal/dbtesturl"
 )
 
 // EnvTestDatabaseURL names a Postgres URL whose user may create databases.
@@ -89,7 +90,7 @@ func newURL(t testing.TB, version int64) string {
 	if createErr != nil {
 		t.Fatalf("create test database: %v", createErr)
 	}
-	child, err := childURL(admin, name)
+	child, err := dbtesturl.Child(admin, name)
 	if err != nil {
 		t.Fatalf("derive test database URL from %s: %v", EnvTestDatabaseURL, err)
 	}
@@ -164,29 +165,6 @@ func redact(err error, admin string) string {
 		}
 	}
 	return msg
-}
-
-// childURL returns the admin URL retargeted to the database name. It rewrites
-// the path and appends dbname=name as the last query setting, because pgx
-// lets the dbname query setting override the path and the last duplicate
-// wins. The error never contains the URL.
-func childURL(admin, name string) (string, error) {
-	u, err := url.Parse(admin)
-	if err != nil {
-		var uerr *url.Error
-		if errors.As(err, &uerr) {
-			return "", uerr.Err
-		}
-		return "", errors.New("invalid URL")
-	}
-	u.Path = "/" + name
-	u.RawPath = ""
-	if u.RawQuery == "" {
-		u.RawQuery = "dbname=" + name
-	} else {
-		u.RawQuery += "&dbname=" + name
-	}
-	return u.String(), nil
 }
 
 // New returns an open pool on a fresh, migrated database.
