@@ -19,10 +19,13 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/idna"
 )
 
 // Config identifies the tenant, the application and the API resource.
@@ -98,6 +101,8 @@ func (c Config) client() *http.Client {
 }
 
 const (
+	// maxRedirects keeps the redirect limit of the default HTTP client.
+	maxRedirects = 10
 	// defaultRequestTimeout bounds a whole request of the default client.
 	defaultRequestTimeout = 30 * time.Second
 	// defaultDialTimeout bounds establishing the connection of the default
@@ -140,6 +145,33 @@ func (c Config) scope() string {
 	return strings.Join(out, " ")
 }
 
+var errRedirectOrigin = errors.New("logto: redirect leaves the configured tenant origin")
+
+type origin struct {
+	scheme string
+	host   string
+	port   string
+}
+
+func requestOrigin(u *url.URL) origin {
+	host := u.Hostname()
+	if ip, err := netip.ParseAddr(host); err == nil {
+		host = ip.String()
+	} else if ascii, err := idna.Lookup.ToASCII(host); err == nil {
+		// Use the lookup profile that net/http uses for DNS names.
+		host = strings.ToLower(ascii)
+	}
+	port := u.Port()
+	if port != "" {
+		port = strings.TrimLeft(port, "0")
+	} else if u.Scheme == "https" {
+		port = "443"
+	} else if u.Scheme == "http" {
+		port = "80"
+	}
+	return origin{scheme: u.Scheme, host: host, port: port}
+}
+
 func (c Config) post(ctx context.Context, path string, form url.Values, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(path), strings.NewReader(form.Encode()))
 	if err != nil {
@@ -147,7 +179,34 @@ func (c Config) post(ctx context.Context, path string, form url.Values, out any)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	res, err := c.client().Do(req)
+	// Copy the client so this request can enforce the tenant origin while
+	// preserving the caller's transport, timeouts, and redirect policy.
+	client := *c.client()
+	checkRedirect := client.CheckRedirect
+	tenant := requestOrigin(req.URL)
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if requestOrigin(next.URL) != tenant {
+			return errRedirectOrigin
+		}
+		if len(via) >= maxRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxRedirects)
+		}
+		if checkRedirect != nil {
+			if err := checkRedirect(next, via); err != nil {
+				return err
+			}
+			// A caller policy can edit the proposed request.
+			if next.URL == nil || requestOrigin(next.URL) != tenant {
+				return errRedirectOrigin
+			}
+		}
+		return nil
+	}
+	res, err := client.Do(req)
+	if errors.Is(err, errRedirectOrigin) {
+		// net/http wraps redirect errors with the destination URL.
+		return errRedirectOrigin
+	}
 	if err != nil {
 		return fmt.Errorf("logto: %s: %w", path, err)
 	}
@@ -226,6 +285,7 @@ func (da *DeviceAuthorization) lifetime() time.Duration {
 // positive; see DeviceAuthorization.ExpiresAt) bounds the wait between requests and every
 // token request: PollToken starts no request at or after the deadline, cancels
 // a request that is still in flight at the deadline and returns ErrExpired.
+// It checks for cancellation and expiry again after processing each response.
 // A cancellation or deadline of ctx ends the polling earlier and is returned
 // as ctx.Err(), so callers can tell it from the expiry. A code that has
 // already expired when PollToken starts returns ErrExpired without any
@@ -280,14 +340,14 @@ func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInter
 		}
 		var tok Token
 		err := c.post(pollCtx, "/oidc/token", form, &tok)
+		if stop := ended(nil); stop != nil {
+			return nil, stop
+		}
 		if err == nil {
 			return &tok, nil
 		}
 		var oe *Error
 		if !errors.As(err, &oe) {
-			if stop := ended(nil); stop != nil {
-				return nil, stop
-			}
 			if !isDialTimeout(err) {
 				return nil, err
 			}
