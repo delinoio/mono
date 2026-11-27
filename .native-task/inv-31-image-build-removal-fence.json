@@ -1,0 +1,111 @@
+{
+  "gid": "inv-31-image-build-removal-fence",
+  "commit": "8cf876dc2027e89ea4207c7380c6f2f3a67c5550",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "8cf876dc2027e89ea4207c7380c6f2f3a67c5550",
+    "targets": [
+      {
+        "host": "m3-16",
+        "platform": "darwin/arm64",
+        "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+        "shell": "Bash"
+      },
+      {
+        "host": "delino-win-1",
+        "platform": "windows/amd64",
+        "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+        "shell": "PowerShell"
+      }
+    ],
+    "setup": "Use a clean checkout of the exact worker commit. On macOS, run the initial setup through mkdir, copy the probe source into the listed path, then continue in the same Bash session. Each host can run the main commands as a standard user.",
+    "commands": {
+      "m3-16": [
+        "set -euo pipefail",
+        "test \"$(git rev-parse HEAD)\" = \"8cf876dc2027e89ea4207c7380c6f2f3a67c5550\"",
+        "git rev-parse HEAD",
+        "test \"$(go env GOOS)/$(go env GOARCH)\" = \"darwin/arm64\"",
+        "probe_dir=\"$PWD/.t3-tmp/validation\"",
+        "mkdir -p \"$probe_dir\"",
+        "test -f \"$probe_dir/fence_cli_probe_test.go\"",
+        "export TMPDIR=\"$probe_dir\" GOTMPDIR=\"$probe_dir\" COPYFILE_DISABLE=1",
+        "unset OWNSAND_IMAGE_FENCE_BIN_DIR OWNSAND_IMAGE_FENCE_IPSW",
+        "node -e 'const p = require(\"node:path\"); process.stdout.write(JSON.stringify({Replace: {[p.resolve(\"cmds/ownsand-agent/fence_cli_probe_test.go\")]: p.resolve(\".t3-tmp/validation/fence_cli_probe_test.go\")}}))' > \"$probe_dir/fence-overlay.json\"",
+        "CGO_ENABLED=0 go test -count=1 -v ./cmds/ownsand-agent/... -run '^Test(ImageBuildRefusedBeforeOpeningStore|ImageBuildLockAcrossProcesses|EnrollmentLockAcrossProcesses|ResetDirKeepsHeldLockAndStateUntilRetry|BuildLockRefusesASecondProcessBeforeTouchingStaging|BuildLockDistinctDestinationsDoNotContend|RemovalWaitsForImageBuild)$' 2>&1 | tee \"$probe_dir/macos-focused.log\"",
+        "CGO_ENABLED=0 go test -count=1 -v -overlay \"$probe_dir/fence-overlay.json\" ./cmds/ownsand-agent -run '^TestImageFenceCLIProbe$' 2>&1 | tee \"$probe_dir/macos-cli-probe.log\""
+      ],
+      "delino-win-1": [
+        "$ErrorActionPreference = 'Stop'",
+        "if ((git rev-parse HEAD) -ne \"8cf876dc2027e89ea4207c7380c6f2f3a67c5550\") { throw \"Unexpected source revision\" }",
+        "git rev-parse HEAD",
+        "if ((go env GOOS) -ne \"windows\" -or (go env GOARCH) -ne \"amd64\") { throw \"Expected Windows amd64\" }",
+        "New-Item -ItemType Directory -Force '.t3-tmp/validation' | Out-Null",
+        "$probeDir = (Resolve-Path '.t3-tmp/validation').Path",
+        "$env:TEMP = $probeDir; $env:TMP = $probeDir; $env:GOTMPDIR = $probeDir",
+        "go test -count=1 -v ./cmds/ownsand-agent/... -run '^Test(ImageBuildRefusedBeforeOpeningStore|ImageBuildLockAcrossProcesses|EnrollmentLockAcrossProcesses|ResetDirKeepsHeldLockAndStateUntilRetry|BuildLockRefusesASecondProcessBeforeTouchingStaging|BuildLockDistinctDestinationsDoNotContend)$' 2>&1 | Tee-Object \"$probeDir/windows-focused.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        "go build -o \"$probeDir/ownsand-agent.exe\" ./cmds/ownsand-agent; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        "go version -m \"$probeDir/ownsand-agent.exe\" | Select-String 'vcs.revision|vcs.modified' "
+      ]
+    },
+    "expectedResults": {
+      "m3-16": [
+        "Focused tests pass. Shared holders coexist across processes. A standalone reset that cannot take the exclusive lock reaches its deadline and keeps staging, then resets after release.",
+        "In the CLI probe, authenticated removal keeps the same per-image lock and staging and refuses a second CLI build. SIGTERM leaves the pending notice and identity with zero confirmations. Retry waits for release, confirms once and leaves only the empty enrollment lock. Standalone CLI reset waits and leaves the same empty lock."
+      ],
+      "delino-win-1": [
+        "The focused tests run without skips or elevation. Pending removal and exclusive lock both refuse the CLI before layout creation. Two shared handles in separate processes coexist, an exclusive reset waits, and reset completes after release.",
+        "The same-destination image lock rejects a second holder, distinct destinations work concurrently, and the Windows executable reports the worker revision with vcs.modified=false."
+      ]
+    },
+    "privilegedScenarios": [
+      {
+        "host": "m3-16",
+        "status": "blocked-on-current-account",
+        "reason": "The macOS builder requires root to install the guest helper. This host account has no available administrator password. Use a compatible local test IPSW, the macOS SDK and a provisioned root-capable test session to run the signed image build.",
+        "setup": "Run after the non-elevated setup. Place a compatible non-production Apple Silicon IPSW at \"$probe_dir/restore.ipsw\". Check for enough free space for a disposable 64 GiB sparse build disk.",
+        "commands": [
+          "test -r \"$probe_dir/restore.ipsw\"",
+          "mkdir -p \"$probe_dir/signed-bin\"",
+          "CGO_ENABLED=1 go build -o \"$probe_dir/signed-bin/ownsand-agent\" ./cmds/ownsand-agent",
+          "CGO_ENABLED=0 go build -o \"$probe_dir/signed-bin/ownsand-guest\" ./cmds/ownsand-guest",
+          "codesign --force --sign - --entitlements cmds/ownsand-agent/entitlements.plist \"$probe_dir/signed-bin/ownsand-agent\"",
+          "codesign --verify --strict \"$probe_dir/signed-bin/ownsand-agent\"",
+          "codesign -d --entitlements :- \"$probe_dir/signed-bin/ownsand-agent\"",
+          "CGO_ENABLED=1 go test -c -overlay \"$probe_dir/fence-overlay.json\" -o \"$probe_dir/fence-cli.test\" ./cmds/ownsand-agent",
+          "sudo -n env COPYFILE_DISABLE=1 TMPDIR=\"$probe_dir\" OWNSAND_IMAGE_FENCE_BIN_DIR=\"$probe_dir/signed-bin\" OWNSAND_IMAGE_FENCE_IPSW=\"$probe_dir/restore.ipsw\" \"$probe_dir/fence-cli.test\" -test.v -test.timeout=8m -test.run '^TestImageFenceCLIProbe/authenticated-removal$' 2>&1 | tee \"$probe_dir/macos-signed-image-build.log\""
+        ],
+        "expectedResults": [
+          "The signed macOS image CLI reaches native disk staging and the probe pauses it before publication. Authenticated removal leaves the lock and staging present, rejects another build and keeps the notice and identity when interrupted.",
+          "On retry, cancel and resume the paused builder. After the builder exits, removal confirms exactly once and leaves only the empty enrollment lock."
+        ]
+      },
+      {
+        "host": "delino-win-1",
+        "status": "blocked-on-current-account",
+        "reason": "A full Hyper-V image build and Windows service-control validation require elevation, configured Hyper-V and a test Windows ISO. The required Windows lock and admission checks use ordinary files and processes."
+      }
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-image-build-removal-fence/worker/.t3-tmp/validation/fence_cli_probe_test.go",
+      "copyTo": ".t3-tmp/validation/fence_cli_probe_test.go",
+      "regressionTests": [
+        "cmds/ownsand-agent/image_test.go",
+        "cmds/ownsand-agent/internal/agent/removal_image_test.go",
+        "cmds/ownsand-agent/internal/store/enrollment_lock_test.go",
+        "cmds/ownsand-agent/internal/imagebuild/lock_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/validation/macos-focused.log",
+        ".t3-tmp/validation/macos-cli-probe.log",
+        ".t3-tmp/validation/windows-focused.log",
+        ".t3-tmp/validation/macos-signed-image-build.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-image-build-removal-fence/worker/.t3-tmp/validation/ownsand-agent-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-image-build-removal-fence/worker/.t3-tmp/validation/ownsand-agent-darwin-arm64",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-image-build-removal-fence/worker/.t3-tmp/validation/windows-amd64-tests",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-image-build-removal-fence/worker/.t3-tmp/validation/darwin-arm64-tests"
+      ]
+    }
+  }
+}
