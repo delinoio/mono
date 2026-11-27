@@ -1964,6 +1964,17 @@ describe("ToastRegion", () => {
     expect(block(".dui-toast-button::before")).toContain("display: none");
   });
 
+  // happy-dom computes no layout. Check the styles that let the message and
+  // controls flow onto multiple lines while keeping each control in bounds.
+  test("wraps the toast row and constrains long control labels", () => {
+    expect(block(".dui-toast")).toContain("flex-wrap: wrap");
+    expect(block(".dui-toast-text")).toContain("flex: 1 1 min(10ch, 100%)");
+    const button = block(".dui-toast-button");
+    expect(button).toContain("max-inline-size: 100%");
+    expect(button).toContain("white-space: normal");
+    expect(button).toContain("overflow-wrap: anywhere");
+  });
+
   // happy-dom computes no layout, so this checks the stylesheet source: the
   // toast hides overflow, so an unbroken token in the title or description
   // (for example an email address) must break inside the text column, and the
