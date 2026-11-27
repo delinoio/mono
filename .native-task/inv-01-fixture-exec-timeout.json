@@ -1,0 +1,40 @@
+{
+  "gid": "inv-01-fixture-exec-timeout",
+  "commit": "051324c2f7d6475b48c39ff29867a9ed982a884c",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "051324c2f7d6475b48c39ff29867a9ed982a884c",
+    "platform": "darwin/arm64",
+    "host": "m3-16",
+    "reason": "The implementation worker has Linux access only. The coordinator must run the recorded validation on m3-16 before native acceptance.",
+    "setup": "Use the commit at the recorded SHA. Run the first four commands from the native worktree root. Copy the listed probe source into the new .t3-tmp directory before running the remaining commands in the same shell.",
+    "commands": [
+      "test \"$(git rev-parse HEAD)\" = \"051324c2f7d6475b48c39ff29867a9ed982a884c\"",
+      "uname -sm",
+      "go version",
+      "mkdir -p '.t3-tmp'",
+      "export TMPDIR=\"$PWD/.t3-tmp\" GOFLAGS=-mod=readonly",
+      "go test -count=1 ./go/sandrun/...",
+      "go test -race -count=1 -v ./go/sandrun/sandruntest -run '^(TestExecDeadlineDuringOutputDrain|TestExecGroupCancellation|TestExecDeadlineSkipsExitedGroupLeader)$'",
+      "go run './.t3-tmp/fixture-exec-probe.go'"
+    ],
+    "files": [
+      {
+        "source": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-fixture-exec-timeout/worker/.t3-tmp/fixture-exec-probe.go",
+        "destination": ".t3-tmp/fixture-exec-probe.go",
+        "purpose": "Loopback Connect and local process acceptance on the native host"
+      },
+      {
+        "path": "go/sandrun/sandruntest/exec_unix_test.go",
+        "source": "part of the committed tree",
+        "purpose": "Native timed-out status, process group checks, and already-exited leader tests"
+      }
+    ],
+    "expectedResults": [
+      "uname reports Darwin arm64. All Go commands exit 0.",
+      "The output-drain probe reports one explicit exit 0 with timed_out=false. It replays the same ready output and terminal status on attach. The descendant is alive after the deadline.",
+      "A deadline against a running shell stops its process group and returns SIGKILL with timed_out=true. Server.Close stops the active group and the regression test confirms timed_out=false.",
+      "The direct cancellation test leaves the descendant alive when the group leader has exited, both before and after reaping."
+    ]
+  }
+}
