@@ -584,6 +584,95 @@ test.each([0, 1])(
   },
 );
 
+test("a cross-organization GitHub installation conflict consumes its issued state without changing either organization", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const audit = createClient(AuditService, transport);
+  const source = { organizationId: MOCK_IDS.acme };
+  const destination = { organizationId: MOCK_IDS.globex };
+  const original = await github.listGitHubInstallations(source);
+  expect(original.installations[0]).toMatchObject({
+    githubInstallationId: 41_000_001n,
+  });
+  const auditBefore = await audit.listAuditEvents(destination);
+  const { url } = await github.createGitHubInstallUrl(destination);
+  const state = new URL(url).searchParams.get("state");
+  if (!state) throw new Error("Expected an issued installation state");
+  const callback = { ...destination, code: "fixture-code", state };
+
+  await expect(
+    github.linkGitHubInstallation({
+      ...callback,
+      githubInstallationId: 41_000_001n,
+    }),
+  ).rejects.toMatchObject({ code: Code.AlreadyExists });
+  await expect(
+    github.linkGitHubInstallation({
+      ...callback,
+      githubInstallationId: 51_000_002n,
+    }),
+  ).rejects.toMatchObject(invalidInstallationState);
+  expect(
+    (await github.listGitHubInstallations(destination)).installations,
+  ).toEqual([]);
+  expect(await github.listGitHubInstallations(source)).toEqual(original);
+  expect(await audit.listAuditEvents(destination)).toEqual(auditBefore);
+});
+
+test("a GitHub installation linked in the mock can move to another organization after unlink", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const audit = createClient(AuditService, transport);
+  const githubInstallationId = 51_000_002n;
+  const link = async (organizationId: string) => {
+    const { url } = await github.createGitHubInstallUrl({ organizationId });
+    const state = new URL(url).searchParams.get("state");
+    if (!state) throw new Error("Expected an issued installation state");
+    return github.linkGitHubInstallation({
+      organizationId,
+      githubInstallationId,
+      code: "fixture-code",
+      state,
+    });
+  };
+  const { installation } = await link(MOCK_IDS.acme);
+  if (!installation) throw new Error("Expected the linked installation");
+
+  for (const organizationId of [MOCK_IDS.acme, MOCK_IDS.globex]) {
+    const request = { organizationId };
+    const installationsBefore = await github.listGitHubInstallations(request);
+    const auditBefore = await audit.listAuditEvents(request);
+    await expect(link(organizationId)).rejects.toMatchObject({
+      code: Code.AlreadyExists,
+    });
+    expect(await github.listGitHubInstallations(request)).toEqual(
+      installationsBefore,
+    );
+    expect(await audit.listAuditEvents(request)).toEqual(auditBefore);
+  }
+
+  await github.unlinkGitHubInstallation({
+    organizationId: MOCK_IDS.acme,
+    installationId: installation.installationId,
+  });
+  await expect(link(MOCK_IDS.globex)).resolves.toMatchObject({
+    installation: { organizationId: MOCK_IDS.globex, githubInstallationId },
+  });
+  await expect(
+    github.linkGitHubInstallation({
+      organizationId: MOCK_IDS.acme,
+      githubInstallationId: 51_000_003n,
+      code: "fixture-code",
+      state: "mock-state",
+    }),
+  ).resolves.toMatchObject({
+    installation: {
+      organizationId: MOCK_IDS.acme,
+      githubInstallationId: 51_000_003n,
+    },
+  });
+});
+
 test("an agent integration name conflict preserves the integration list and audit history", async () => {
   const transport = createMockTransport();
   const integrations = createClient(AgentIntegrationService, transport);

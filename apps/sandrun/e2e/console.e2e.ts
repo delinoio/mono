@@ -1057,6 +1057,66 @@ describe("integrations", () => {
     ).toBeVisible();
   });
 
+  test("the GitHub callback rejects an installation linked to another organization", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}/integrations`);
+    await browser.evaluate(() => {
+      // Keep the transport that issued the state when GitHub returns.
+      window.navigation.addEventListener(
+        "navigate",
+        (event) => {
+          const destination = new URL(event.destination.url);
+          if (destination.origin !== "https://github.com") return;
+          event.preventDefault();
+          const state = destination.searchParams.get("state");
+          if (!state) throw new Error("Expected an issued state");
+          const query = new URLSearchParams({
+            installation_id: "41000001",
+            code: "fixture-code",
+            state,
+          });
+          setTimeout(() => {
+            window.history.pushState(null, "", `/github/setup?${query}`);
+            window.dispatchEvent(new PopStateEvent("popstate"));
+          }, 0);
+        },
+        { once: true },
+      );
+      return null;
+    });
+    await screen.getByRole("button", "Connect GitHub").tap();
+    await screen.getByRole("combobox", "SandRun organization").tap();
+    await screen.getByRole("option", "Globex (admin)").tap();
+    await screen.getByRole("button", "Link installation").tap();
+
+    await expect(screen.getByRole("main").getByRole("alert")).toContainText(
+      "the installation is already linked",
+    );
+    await expect(browser).toHaveURL("/github/setup");
+    await screen.getByRole("link", "Go to your organizations").tap();
+    await screen.getByRole("link", "Globex Admin").tap();
+    await screen.getByRole("link", "Integrations", { exact: true }).tap();
+    await expect(
+      screen.getByText("No GitHub organization is connected"),
+    ).toBeVisible();
+    await screen.getByRole("link", "Audit events").tap();
+    await expect(screen.getByText("No audit events")).toBeVisible();
+
+    await screen.getByRole("link", "SandRun").tap();
+    await screen.getByRole("link", "Acme Robotics Owner").tap();
+    await screen.getByRole("link", "Integrations", { exact: true }).tap();
+    await expect(
+      screen
+        .getByRole("list", "GitHub installations")
+        .getByText("acme-robotics · Active"),
+    ).toBeVisible();
+  });
+
   test("the GitHub callback rejects an installation ID above the signed int64 limit", async ({
     app,
     screen,
