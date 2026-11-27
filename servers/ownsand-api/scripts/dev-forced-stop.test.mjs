@@ -14,7 +14,7 @@ import {
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 // Process lifecycle of the ownsand-api development launcher with a fake `go`
@@ -27,6 +27,7 @@ const skip = process.platform === "win32";
 const launcher = fileURLToPath(new URL("./dev.mjs", import.meta.url));
 const SignalEvent = "ownsand_api_dev_signal";
 const Timeout = 60_000;
+const StopObservationTimeout = 4_000;
 // Stays below Timeout so that the diagnostic of waitFor is printed before the
 // runner reports a bare timeout.
 const WaitTimeout = 45_000;
@@ -41,11 +42,14 @@ async function freePort() {
   return port;
 }
 
-// Resolves true when binding the port fails, which means a listener holds it.
+// An address-in-use error confirms that a listener holds the port.
 function portInUse(port) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const probe = createServer();
-    probe.once("error", () => resolve(true));
+    probe.once("error", (error) => {
+      if (error.code === "EADDRINUSE") resolve(true);
+      else reject(error);
+    });
     probe.listen(port, "127.0.0.1", () => probe.close(() => resolve(false)));
   });
 }
@@ -181,9 +185,50 @@ if [ "$FAKE_PHASE" = build ]; then exec "$FIXTURE_NODE" "$0.mjs"; fi
   return dir;
 }
 
+// Hold the target supervisor's first timer until the test verifies that the
+// phase received SIGTERM and is still running. Record the delay the supervisor
+// requested, including an incorrect delay, before replacing the timer.
+function graceTimerPreload(markerDir, phase) {
+  const file = join(markerDir, "hold-grace.mjs");
+  writeFileSync(
+    file,
+    `import { existsSync, writeFileSync } from "node:fs";
+import { clearInterval, setInterval } from "node:timers";
+
+if (process.argv[1] === ${JSON.stringify(launcher)} &&
+    process.argv[2] === "--supervise" &&
+    process.argv[3] === ${JSON.stringify(phase)}) {
+  const releaseFile = ${JSON.stringify(join(markerDir, "release-grace"))};
+  const report = (record) => writeFileSync(2, JSON.stringify(record) + "\\n");
+  const setTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    globalThis.setTimeout = setTimeout;
+    const timer = setInterval(() => {
+      if (!existsSync(releaseFile)) return;
+      clearInterval(timer);
+      const kill = process.kill;
+      process.kill = (pid, signal) => {
+        report({ event: "fixture_escalation", pid, signal });
+        return kill(pid, signal);
+      };
+      try {
+        callback(...args);
+      } finally {
+        process.kill = kill;
+      }
+    }, 20);
+    report({ event: "fixture_grace_timer", delay });
+    return timer;
+  };
+}
+`,
+  );
+  return `--import=${pathToFileURL(file)}`;
+}
+
 // Starts the launcher as the leader of a process group of its own, as a task
 // runner does, so a test can signal the group.
-async function startLauncher(t, { env = {} } = {}) {
+async function startLauncher(t, { env = {}, holdGraceFor } = {}) {
   const tmp = mkdtempSync(join(tmpdir(), "ownsand-api-forced-stop-"));
   const markerDir = join(tmp, "markers");
   const buildTmp = join(tmp, "tmp");
@@ -201,6 +246,14 @@ async function startLauncher(t, { env = {} } = {}) {
     ...env,
   };
   delete childEnv.LOG_LEVEL;
+  if (holdGraceFor) {
+    childEnv.NODE_OPTIONS = [
+      childEnv.NODE_OPTIONS,
+      graceTimerPreload(markerDir, holdGraceFor),
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
   const child = spawn(process.execPath, [launcher], {
     env: childEnv,
     stdio: ["ignore", "pipe", "pipe"],
@@ -319,7 +372,7 @@ const waitBuildSignal = (run, index, signal) =>
       buildSignals(run, "build_signal").length > index &&
       buildSignals(run, "descendant_signal").length > index,
     `the build group to receive ${signal}`,
-    4_000,
+    StopObservationTimeout,
   );
 
 function assertCanceledBuild(run, requests, completions) {
@@ -392,6 +445,7 @@ for (const [phase, label] of [
     { skip, timeout: Timeout },
     async (t) => {
       const run = await startLauncher(t, {
+        holdGraceFor: phase,
         env:
           phase === "server"
             ? { FAKE_MODE: "ignore-term" }
@@ -407,9 +461,58 @@ for (const [phase, label] of [
       }
 
       process.kill(-run.child.pid, "SIGKILL");
-      await run.exited;
+      assert.deepEqual(await run.exited, { code: null, signal: "SIGKILL" });
 
-      await waitGone(run, all, "the phase to be killed");
+      const graceTimers = () => events(run.stderr, "fixture_grace_timer");
+      await waitFor(
+        run,
+        () => graceTimers().length > 0,
+        `the ${phase} supervisor to request a grace timer`,
+        StopObservationTimeout,
+      );
+      assert.equal(graceTimers()[0].delay, 5_000, "grace period in ms");
+      if (phase === "server") {
+        const signals = () => events(run.stdout, "fake_signal");
+        await waitFor(
+          run,
+          () => signals().length > 0,
+          "the server to receive SIGTERM",
+          StopObservationTimeout,
+        );
+        assert.deepEqual(
+          signals().map(({ signal, n }) => [signal, n]),
+          [["SIGTERM", 1]],
+        );
+        assert.equal(
+          await portInUse(run.port),
+          true,
+          "the server stopped listening during grace",
+        );
+      } else {
+        await waitBuildSignal(run, 0, "SIGTERM");
+        assert.deepEqual(buildSignals(run, "build_signal"), ["SIGTERM"]);
+        assert.deepEqual(buildSignals(run, "descendant_signal"), ["SIGTERM"]);
+      }
+      assert.ok(
+        all.every(isRunning),
+        `a ${phase} process stopped during grace`,
+      );
+
+      writeFileSync(join(run.markerDir, "release-grace"), "");
+      await waitGone(
+        run,
+        all,
+        `the ${phase} group to be killed after releasing the timer`,
+        StopObservationTimeout,
+      );
+      await run.closed;
+      assert.deepEqual(events(run.stderr, "fixture_escalation"), [
+        {
+          event: "fixture_escalation",
+          pid: -run.supervisor,
+          signal: "SIGKILL",
+        },
+      ]);
       assert.equal(await portInUse(run.port), false, "a listener survived");
     },
   );
