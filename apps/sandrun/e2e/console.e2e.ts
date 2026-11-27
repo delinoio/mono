@@ -1206,6 +1206,21 @@ describe("runner profiles", () => {
       profiles.getByRole("listitem").filter({ hasText: "fixture-linux-197 ·" }),
     ).toBeVisible();
 
+    for (const page of ["Requests", "Runners"]) {
+      await screen.getByRole("link", page).tap();
+      const table = screen.getByRole("table", page);
+      await expect(table).toContainText("0193b000…00b1");
+      await expect(table).not.toContainText("linux-build-renamed");
+      const filter = screen.getByRole("combobox", "Runner profile");
+      await expect(filter).toContainText("All profiles");
+      await filter.tap();
+      await expect(
+        screen.getByRole("option", "linux-build-renamed"),
+      ).toBeHidden();
+      await browser.keyboard.press("Escape");
+    }
+    await screen.getByRole("link", "Runner profiles").tap();
+
     await screen.getByRole("button", "Create runner profile").tap();
     const create = screen.getByRole("dialog", "Create a runner profile");
     await create.getByLabel("Name").tap();
