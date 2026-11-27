@@ -72,7 +72,9 @@ type SnapshotServiceClient interface {
 	// Delete a snapshot. Fails with failed_precondition while a template
 	// references it.
 	DeleteSnapshot(context.Context, *connect.Request[v1.DeleteSnapshotRequest]) (*connect.Response[v1.DeleteSnapshotResponse], error)
-	// Export a snapshot to R2. Returns at once in EXPORTING.
+	// Export a snapshot to R2. A new attempt returns at once in EXPORTING.
+	// A successful request for an EXPORTED snapshot returns the existing
+	// snapshot without sending a new export command.
 	ExportSnapshot(context.Context, *connect.Request[v1.ExportSnapshotRequest]) (*connect.Response[v1.ExportSnapshotResponse], error)
 	// Make a named template from a snapshot.
 	CreateTemplate(context.Context, *connect.Request[v1.CreateTemplateRequest]) (*connect.Response[v1.CreateTemplateResponse], error)
@@ -207,7 +209,9 @@ type SnapshotServiceHandler interface {
 	// Delete a snapshot. Fails with failed_precondition while a template
 	// references it.
 	DeleteSnapshot(context.Context, *connect.Request[v1.DeleteSnapshotRequest]) (*connect.Response[v1.DeleteSnapshotResponse], error)
-	// Export a snapshot to R2. Returns at once in EXPORTING.
+	// Export a snapshot to R2. A new attempt returns at once in EXPORTING.
+	// A successful request for an EXPORTED snapshot returns the existing
+	// snapshot without sending a new export command.
 	ExportSnapshot(context.Context, *connect.Request[v1.ExportSnapshotRequest]) (*connect.Response[v1.ExportSnapshotResponse], error)
 	// Make a named template from a snapshot.
 	CreateTemplate(context.Context, *connect.Request[v1.CreateTemplateRequest]) (*connect.Response[v1.CreateTemplateResponse], error)

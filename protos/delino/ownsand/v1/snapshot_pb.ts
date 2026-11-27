@@ -549,7 +549,9 @@ export const SnapshotService: GenService<{
     output: typeof DeleteSnapshotResponseSchema;
   },
   /**
-   * Export a snapshot to R2. Returns at once in EXPORTING.
+   * Export a snapshot to R2. A new attempt returns at once in EXPORTING.
+   * A successful request for an EXPORTED snapshot returns the existing
+   * snapshot without sending a new export command.
    *
    * @generated from rpc delino.ownsand.v1.SnapshotService.ExportSnapshot
    */

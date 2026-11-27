@@ -20,7 +20,9 @@ service SnapshotService {
   // Delete a snapshot. Fails with failed_precondition while a template
   // references it.
   rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
-  // Export a snapshot to R2. Returns at once in EXPORTING.
+  // Export a snapshot to R2. A new attempt returns at once in EXPORTING.
+  // A successful request for an EXPORTED snapshot returns the existing
+  // snapshot without sending a new export command.
   rpc ExportSnapshot(ExportSnapshotRequest) returns (ExportSnapshotResponse);
   // Make a named template from a snapshot.
   rpc CreateTemplate(CreateTemplateRequest) returns (CreateTemplateResponse);
