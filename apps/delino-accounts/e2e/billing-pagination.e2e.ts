@@ -27,10 +27,16 @@ async function serveBillingPages(
   {
     failPage,
     firstPageSize = 1,
-  }: { failPage?: number; firstPageSize?: number } = {},
+    retryResponses = [],
+  }: {
+    failPage?: number;
+    firstPageSize?: number;
+    retryResponses?: Promise<"fail" | "succeed">[];
+  } = {},
 ) {
   await seedFixtureSession(browser, appOrigin);
   const requestedTokens: string[] = [];
+  const retryPage = failPage;
   let firstPageRequests = 0;
   await browser.route(`${API_ORIGIN}/**/ListBillingAccounts`, async (route) => {
     const headers = {
@@ -50,8 +56,12 @@ async function serveBillingPages(
     }
     requestedTokens.push(tokens[page]);
     if (page === 0) firstPageRequests += 1;
-    if (page === failPage) {
-      failPage = undefined;
+    const initialFailure = page === failPage;
+    if (initialFailure) failPage = undefined;
+    if (
+      initialFailure ||
+      (page === retryPage && (await retryResponses.shift()) === "fail")
+    ) {
       await route.fulfill({
         status: 429,
         contentType: "application/json",
@@ -151,6 +161,80 @@ describe("billing account pagination", () => {
     await expect(loading).toBeHidden();
     expect(requestedTokens).toEqual(["", "p1", "p2", "p2", "p3"]);
     await app.screenshot("billing-continuation-recovered");
+  });
+
+  test("keeps a continuation retry pending and recovers after it fails", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    let failRetry!: () => void;
+    let completeRetry!: () => void;
+    const requestedTokens = await serveBillingPages(browser, app.baseUrl, 2, {
+      failPage: 1,
+      firstPageSize: 200,
+      retryResponses: [
+        new Promise((resolve) => {
+          failRetry = () => resolve("fail");
+        }),
+        new Promise((resolve) => {
+          completeRetry = () => resolve("succeed");
+        }),
+      ],
+    });
+    await app.open("/billing");
+
+    const rows = screen
+      .getByRole("list", "Billing accounts")
+      .getByRole("listitem");
+    const notice = screen.getByText(/Some items did not load/);
+    const retry = screen.getByRole("button", "Try again");
+    const activateRetryAgain = async () => {
+      const bounds = await retry.boundingBox();
+      if (bounds === null) throw new Error("Retry button has no bounds");
+      await screen.doubleTapAt({
+        x: bounds.x + bounds.width / 2,
+        y: bounds.y + bounds.height / 2,
+      });
+    };
+    await expect(notice).toBeVisible();
+    await expect(rows).toHaveCount(200);
+    expect(requestedTokens).toEqual(["", "p1"]);
+
+    await browser.evaluate(() => {
+      document.querySelector('[role="alert"]')?.scrollIntoView();
+      return null;
+    });
+    await app.screenshot("billing-before-continuation-retry");
+    try {
+      await retry.click();
+      await expect(retry).toHaveAttribute("aria-busy", "true");
+      await activateRetryAgain();
+      await expect(rows).toHaveCount(200);
+      await app.screenshot("billing-continuation-retry-pending");
+      expect(requestedTokens).toEqual(["", "p1", "p1"]);
+
+      failRetry();
+      await expect(retry).toBeEnabled();
+      await expect(rows).toHaveCount(200);
+      await app.screenshot("billing-continuation-retry-failed");
+
+      await retry.click();
+      await expect(retry).toHaveAttribute("aria-busy", "true");
+      await activateRetryAgain();
+      await expect(rows).toHaveCount(200);
+      completeRetry();
+      await expect(rows).toHaveCount(201);
+      await expect(
+        rows.nth(200).getByRole("link", "Bravo Owner"),
+      ).toBeVisible();
+      await expect(notice).toBeHidden();
+      expect(requestedTokens).toEqual(["", "p1", "p1", "p1"]);
+      await app.screenshot("billing-after-continuation-retry");
+    } finally {
+      failRetry();
+      completeRetry();
+    }
   });
 });
 

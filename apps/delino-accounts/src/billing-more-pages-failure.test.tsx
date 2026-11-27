@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  rs,
+  test,
+} from "@rstest/core";
 import {
   act,
   cleanup,
@@ -88,4 +95,59 @@ describe("a failed later page of a complete list", () => {
     expect(pageTokens(api)).toEqual([...requestsBeforeRetry, failedToken]);
     expect(screen.queryByText(/Some items did not load/)).toBeNull();
   });
+
+  test.each(["success", "failure"] as const)(
+    "keeps one pending retry until it settles with %s",
+    async (outcome) => {
+      const unavailable = new ConnectError("unavailable", Code.Unavailable);
+      const { api, notice, rows } = await renderFailingSecondPage(unavailable);
+      const loadedRows = rows().map((row) => row.textContent);
+      const retry = () =>
+        within(notice).getByRole("button", { name: "Try again" });
+      const request = rs.spyOn(api.transport, "unary");
+      let settleRetry!: () => void;
+      const response = new Promise<void>((resolve, reject) => {
+        settleRetry =
+          outcome === "success" ? resolve : () => reject(unavailable);
+      });
+      api.gates.set("ListBillingAccounts", response);
+
+      await click(retry());
+      await waitFor(() =>
+        expect(pageTokens(api)).toEqual(["", "p200", "p200"]),
+      );
+      const retrySignal = request.mock.calls[0]?.[1];
+      await click(retry());
+      await click(retry());
+      expect(rows().map((row) => row.textContent)).toEqual(loadedRows);
+      expect(pageTokens(api)).toEqual(["", "p200", "p200"]);
+      expect(retrySignal?.aborted).toBe(false);
+      expect(retry().getAttribute("aria-busy")).toBe("true");
+
+      api.gates.delete("ListBillingAccounts");
+      settleRetry();
+      if (outcome === "failure") {
+        await waitFor(() =>
+          expect(retry().hasAttribute("data-pending")).toBe(false),
+        );
+        expect(rows().map((row) => row.textContent)).toEqual(loadedRows);
+        expect(pageTokens(api)).toEqual(["", "p200", "p200"]);
+        await click(retry());
+      }
+
+      await waitFor(() => expect(rows()).toHaveLength(201));
+      expect(
+        rows()
+          .slice(0, 200)
+          .map((row) => row.textContent),
+      ).toEqual(loadedRows);
+      expect(rows().at(-1)?.textContent).toContain("Account 0200");
+      expect(pageTokens(api)).toEqual(
+        outcome === "success"
+          ? ["", "p200", "p200"]
+          : ["", "p200", "p200", "p200"],
+      );
+      expect(screen.queryByText(/Some items did not load/)).toBeNull();
+    },
+  );
 });
