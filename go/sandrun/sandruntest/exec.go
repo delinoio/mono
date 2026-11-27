@@ -4,10 +4,12 @@ package sandruntest
 
 import (
 	"context"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 )
 
@@ -16,7 +18,14 @@ func newExecCommand(ctx context.Context, args []string, requestEnv map[string]st
 	pathExt := os.Getenv("PATHEXT")
 	var searchPath string
 	var hasSearchPath bool
-	for key, value := range requestEnv {
+	keys := maps.Keys(requestEnv)
+	if runtime.GOOS == "windows" {
+		// Match the OwnSand guest. The last spelling wins in both lookup
+		// and the child environment after os/exec removes duplicates.
+		keys = slices.Values(slices.Sorted(keys))
+	}
+	for key := range keys {
+		value := requestEnv[key]
 		env = append(env, key+"="+value)
 		switch {
 		case key == "PATH" || runtime.GOOS == "windows" && strings.EqualFold(key, "PATH"):
