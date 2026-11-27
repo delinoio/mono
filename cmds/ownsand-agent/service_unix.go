@@ -32,7 +32,7 @@ func serviceLauncherSetup(_ bool, _, stderr io.Writer) int {
 // runConfigError ends `run` when its configuration does not parse. systemd
 // and launchd read the standard error of the agent, so it only prints the
 // error and returns the usage exit code.
-func runConfigError(cfgErr error, stderr io.Writer) int {
+func runConfigError(cfgErr error, _ string, stderr io.Writer) int {
 	fmt.Fprintln(stderr, "ownsand-agent:", cfgErr)
 	return exitUsage
 }

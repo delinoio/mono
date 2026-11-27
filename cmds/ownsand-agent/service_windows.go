@@ -46,21 +46,25 @@ func runUnmigratedService(ctx context.Context, cfg config.Config, _ *os.File) (i
 // nonzero exit of run: a service process that exits before it connects is
 // reported only as a start timeout (error 1053, event 7009), its error text
 // is lost because a service has no standard error, and the failure actions
-// do not apply. Use the state directory from the environment or the default
-// one to set up startup logging despite the configuration error.
-func runConfigError(cfgErr error, stderr io.Writer) int {
+// do not apply.
+func runConfigError(cfgErr error, explicitStateDir string, stderr io.Writer) int {
 	isService, err := svc.IsWindowsService()
 	if err != nil || !isService {
 		fmt.Fprintln(stderr, "ownsand-agent:", cfgErr)
 		return exitUsage
 	}
-	return runUnderServiceManager(config.Config{StateDir: configErrorStateDir(os.LookupEnv)}, cfgErr, svc.Run, writeStartupEvent, nil)
+	return runServiceConfigError(cfgErr, explicitStateDir, svc.Run, writeStartupEvent)
 }
 
-// configErrorStateDir returns the state directory for the log of a
-// configuration error: the value of OWNSAND_AGENT_STATE_DIR when it is set,
-// otherwise the default state directory of the host OS.
-func configErrorStateDir(lookup config.Lookup) string {
+func runServiceConfigError(cfgErr error, explicitStateDir string, dispatch func(string, svc.Handler) error, reportStartupError func(string) error) int {
+	stateDir := configErrorStateDir(explicitStateDir, os.LookupEnv)
+	return runUnderServiceManager(config.Config{StateDir: stateDir}, cfgErr, dispatch, reportStartupError, nil)
+}
+
+func configErrorStateDir(explicitStateDir string, lookup config.Lookup) string {
+	if strings.TrimSpace(explicitStateDir) != "" {
+		return explicitStateDir
+	}
 	if v, ok := lookup(config.EnvStateDir); ok {
 		if v = strings.TrimSpace(v); v != "" {
 			return v

@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -21,6 +22,44 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/version"
 )
+
+func TestRunConfigErrorUsesRunStateDirFlagGrammar(t *testing.T) {
+	clearAgentEnv(t)
+	t.Setenv(config.EnvLogLevel, "fixture-invalid-level")
+	t.Setenv(config.EnvStateDir, "Fallback State")
+	const stateDir = "Agent State"
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"direct", []string{"run", "--state-dir", stateDir}, stateDir},
+		{"launcher", []string{"service", "launch", "run", "--no-color", "--state-dir=" + stateDir}, stateDir},
+		{"last flag wins", []string{"run", "--state-dir=first", "-state-dir=" + stateDir}, stateDir},
+		{"flag value is not another flag", []string{"run", "--name", "--state-dir=" + stateDir}, ""},
+		{"positional argument ends flags", []string{"run", "operand", "--state-dir=" + stateDir}, ""},
+		{"flag terminator", []string{"run", "--", "--state-dir=" + stateDir}, ""},
+		{"no flag", []string{"run"}, ""},
+		{"missing value", []string{"run", "--state-dir"}, ""},
+		{"invalid flag follows state directory", []string{"run", "--state-dir=" + stateDir, "--unknown"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			called := false
+			report := func(err error, dir string, _ io.Writer) int {
+				called = true
+				if !strings.Contains(config.RedactedError(err), config.EnvLogLevel) || dir != tc.want {
+					t.Errorf("reported error %v, state directory %q, want log level error and %q", err, dir, tc.want)
+				}
+				return exitUsage
+			}
+			code := runWithConfigErrorHandler(tc.args, nil, io.Discard, &stderr, report)
+			if code != exitUsage || !called || stderr.Len() != 0 {
+				t.Fatalf("run = %d, called = %v, stderr = %q", code, called, stderr.String())
+			}
+		})
+	}
+}
 
 func TestCLIEnrollStatusReset(t *testing.T) {
 	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
