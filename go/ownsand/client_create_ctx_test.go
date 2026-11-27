@@ -7,8 +7,11 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
@@ -75,7 +78,7 @@ func (f *failingCreateClient) idempotencyKeys() []string {
 	return append([]string(nil), f.keys...)
 }
 
-func newFailingCreateClient(t *testing.T, hook func(attempt int)) (*Client, *failingCreateClient) {
+func newCreateContextClient(t *testing.T) *Client {
 	t.Helper()
 	c, err := New(Options{
 		BaseURL:        "http://127.0.0.1:1",
@@ -88,6 +91,12 @@ func newFailingCreateClient(t *testing.T, hook func(attempt int)) (*Client, *fai
 		t.Fatal(err)
 	}
 	c.timing = testTiming()
+	return c
+}
+
+func newFailingCreateClient(t *testing.T, hook func(attempt int)) (*Client, *failingCreateClient) {
+	t.Helper()
+	c := newCreateContextClient(t)
 	f := &failingCreateClient{hook: hook}
 	c.sandboxes = f
 	return c, f
@@ -198,4 +207,183 @@ func (f *succeedingAfterCreateClient) CreateSandbox(_ context.Context, req *conn
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("test control plane unavailable"))
 	}
 	return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: &ownsandv1.Sandbox{SandboxId: req.Msg.GetIdempotencyKey()}}), nil
+}
+
+// scriptedCreateClient can release a response after cancellation. Connect can
+// otherwise end the RPC itself before the SDK gets a chance to check the result.
+type scriptedCreateClient struct {
+	ownsandv1connect.SandboxServiceClient
+	requests []*ownsandv1.CreateSandboxRequest
+	reply    func(ctx context.Context, attempt int) (*connect.Response[ownsandv1.CreateSandboxResponse], error)
+}
+
+func (f *scriptedCreateClient) CreateSandbox(ctx context.Context, req *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
+	f.requests = append(f.requests, proto.CloneOf(req.Msg))
+	return f.reply(ctx, len(f.requests))
+}
+
+func (f *scriptedCreateClient) checkRequests(t *testing.T, count int) {
+	t.Helper()
+	if len(f.requests) != count {
+		t.Fatalf("sent %d requests, want %d", len(f.requests), count)
+	}
+	if f.requests[0].GetIdempotencyKey() == "" {
+		t.Fatal("request has no idempotency key")
+	}
+	for _, req := range f.requests[1:] {
+		if !proto.Equal(f.requests[0], req) {
+			t.Fatal("retry changed the request")
+		}
+	}
+}
+
+func TestCreateSandboxRejectsSuccessAfterCallerEnds(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		attempts  int
+		callerErr error
+	}{
+		{"initial canceled", 1, context.Canceled},
+		{"retry canceled", 2, context.Canceled},
+		{"initial caller deadline", 1, context.DeadlineExceeded},
+		{"retry caller deadline", 2, context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := newCreateContextClient(t)
+				var ctx context.Context
+				var cancel context.CancelFunc
+				if tc.callerErr == context.DeadlineExceeded {
+					ctx, cancel = context.WithTimeout(context.Background(), 2*c.timing.backoffMin)
+				} else {
+					ctx, cancel = context.WithCancel(context.Background())
+				}
+				defer cancel()
+				created := &ownsandv1.Sandbox{SandboxId: mustID(t), State: ownsandv1.SandboxState_SANDBOX_STATE_CREATING}
+				rpc := &scriptedCreateClient{
+					reply: func(_ context.Context, attempt int) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
+						if attempt < tc.attempts {
+							return nil, connect.NewError(connect.CodeUnavailable, errors.New("first failure"))
+						}
+						if tc.callerErr == context.Canceled {
+							cancel()
+						}
+						<-ctx.Done()
+						return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: created}), nil
+					},
+				}
+				c.sandboxes = rpc
+				sb, err := c.CreateSandbox(ctx, validParams())
+				if sb != nil || err != tc.callerErr {
+					t.Fatalf("received sandbox=%t, error=%v, want no sandbox and %v", sb != nil, err, tc.callerErr)
+				}
+				rpc.checkRequests(t, tc.attempts)
+			})
+		})
+	}
+}
+
+func TestCreateSandboxChecksRetryWindowAtSettlement(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		attempts int
+		wait     func(context.Context, time.Duration)
+		want     error
+		missing  bool
+	}{
+		{"late retry", 2, func(ctx context.Context, _ time.Duration) { <-ctx.Done() }, errCreateDeadline, false},
+		{"timely retry", 2, func(_ context.Context, left time.Duration) { time.Sleep(left - time.Nanosecond) }, nil, false},
+		{"slow initial success", 1, func(_ context.Context, window time.Duration) { time.Sleep(window + time.Nanosecond) }, nil, false},
+		{"timely retry missing sandbox", 2, func(context.Context, time.Duration) {}, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := newCreateContextClient(t)
+				firstFailure := connect.NewError(connect.CodeUnavailable, errors.New("first failure"))
+				created := &ownsandv1.Sandbox{SandboxId: mustID(t), State: ownsandv1.SandboxState_SANDBOX_STATE_CREATING}
+				rpc := &scriptedCreateClient{
+					reply: func(ctx context.Context, attempt int) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
+						if attempt < tc.attempts {
+							return nil, firstFailure
+						}
+						left := c.timing.createRetryWindow
+						if attempt > 1 {
+							left -= c.timing.backoffMin
+						}
+						tc.wait(ctx, left)
+						if cause := context.Cause(ctx); cause != tc.want {
+							t.Fatalf("attempt context cause %v, want %v", cause, tc.want)
+						}
+						res := &ownsandv1.CreateSandboxResponse{}
+						if !tc.missing {
+							res.Sandbox = created
+						}
+						return connect.NewResponse(res), nil
+					},
+				}
+				c.sandboxes = rpc
+				sb, err := c.CreateSandbox(context.Background(), validParams())
+				switch {
+				case tc.want != nil:
+					if sb != nil || err != firstFailure {
+						t.Fatalf("received sandbox=%t, error=%v, want no sandbox and the first failure", sb != nil, err)
+					}
+				case tc.missing:
+					if sb != nil || err == nil || err.Error() != "ownsand: CreateSandbox response carried no sandbox" {
+						t.Fatalf("received sandbox=%t, error=%v, want the missing-sandbox error", sb != nil, err)
+					}
+				default:
+					if err != nil || sb == nil || sb.ID() != created.GetSandboxId() {
+						t.Fatalf("received sandbox=%t, error=%v, want the created sandbox", sb != nil, err)
+					}
+				}
+				rpc.checkRequests(t, tc.attempts)
+			})
+		})
+	}
+}
+
+// createSettlementContext lets the test move the clock while the SDK is
+// processing a settled RPC, after the attempt timer has been stopped.
+type createSettlementContext struct {
+	context.Context
+	onErr func()
+}
+
+func (c *createSettlementContext) Err() error {
+	if c.onErr != nil {
+		hook := c.onErr
+		c.onErr = nil
+		hook()
+	}
+	return c.Context.Err()
+}
+
+func TestCreateSandboxChecksElapsedTimeWithoutTimerCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCreateContextClient(t)
+		caller := &createSettlementContext{Context: context.Background()}
+		firstFailure := connect.NewError(connect.CodeUnavailable, errors.New("first failure"))
+		created := &ownsandv1.Sandbox{SandboxId: mustID(t), State: ownsandv1.SandboxState_SANDBOX_STATE_CREATING}
+		rpc := &scriptedCreateClient{
+			reply: func(ctx context.Context, attempt int) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
+				if attempt == 1 {
+					return nil, firstFailure
+				}
+				caller.onErr = func() {
+					time.Sleep(c.timing.createRetryWindow - c.timing.backoffMin)
+					if errors.Is(context.Cause(ctx), errCreateDeadline) {
+						t.Fatal("retry timer delivered cancellation")
+					}
+				}
+				return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: created}), nil
+			},
+		}
+		c.sandboxes = rpc
+		sb, err := c.CreateSandbox(caller, validParams())
+		if sb != nil || err != firstFailure {
+			t.Fatalf("received sandbox=%t, error=%v, want no sandbox and the first failure", sb != nil, err)
+		}
+		rpc.checkRequests(t, 2)
+	})
 }

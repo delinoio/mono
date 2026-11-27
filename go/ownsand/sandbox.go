@@ -130,11 +130,13 @@ func (c *Client) CreateSandbox(ctx context.Context, p CreateSandboxParams) (*San
 		if timer != nil {
 			timer.Stop()
 		}
-		timedOut := err != nil && ctx.Err() == nil && errors.Is(context.Cause(attemptCtx), errCreateDeadline)
+		retryCanceled := errors.Is(context.Cause(attemptCtx), errCreateDeadline)
 		cancel(context.Canceled)
-		if timedOut {
-			// The window ended during the attempt: end with the last
-			// failure of the window, not with the cancellation.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+		// Check the clock in case the retry timer callback has not run.
+		if retryCanceled || rec.expired() {
 			return nil, rec.err()
 		}
 		if err == nil {
@@ -148,14 +150,6 @@ func (c *Client) CreateSandbox(ctx context.Context, p CreateSandboxParams) (*San
 			}
 			c.logger.DebugContext(ctx, "ownsand sandbox created", "sandbox_id", sb.GetSandboxId())
 			return c.handle(org, sb), nil
-		}
-		if cerr := ctx.Err(); cerr != nil {
-			// The caller's context ended during the attempt. The failure
-			// that the RPC reported (a server status or a transport error)
-			// need not wrap the context error, so return the caller's
-			// error itself, with no further attempt. This comes after the
-			// window check above, which needs a live caller context.
-			return nil, cerr
 		}
 		kind, delay := classify(ctx, err)
 		if kind == failTerminal {
