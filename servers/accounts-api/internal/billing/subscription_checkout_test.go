@@ -3,6 +3,7 @@
 package billing
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -107,6 +108,95 @@ func TestStartSubscriptionReusesThePendingCheckout(t *testing.T) {
 	}
 	if n := f.checkoutRows(acct); n != 1 {
 		t.Fatalf("checkout rows = %d, want 1", n)
+	}
+}
+
+func TestStartSubscriptionPreflightsNewAndPendingCheckouts(t *testing.T) {
+	conversions := paddletest.USDOnlyCurrencyConversions()
+	conversions["GBP"] = map[string]bool{"enabled": true}
+	enabledGBP, err := json.Marshal(map[string]any{"data": conversions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const price = "GET /prices/" + priceID
+	const settings = "GET /settings/currency-conversions"
+	for _, tc := range []struct {
+		name   string
+		path   string
+		status int
+		body   string
+		code   connect.Code
+	}{
+		{"EUR base", price, http.StatusOK, `{"data":{"id":"pri_subscription","unit_price":{"currency_code":"EUR"},"unit_price_overrides":[]}}`, connect.CodeFailedPrecondition},
+		{"GBP override", price, http.StatusOK, `{"data":{"id":"pri_subscription","unit_price":{"currency_code":"USD"},"unit_price_overrides":[{"country_codes":["GB"],"unit_price":{"currency_code":"GBP"}}]}}`, connect.CodeFailedPrecondition},
+		{"GBP enabled", settings, http.StatusOK, string(enabledGBP), connect.CodeFailedPrecondition},
+		{"missing base currency", price, http.StatusOK, `{"data":{"id":"pri_subscription","unit_price":{},"unit_price_overrides":[]}}`, connect.CodeUnavailable},
+		{"missing country overrides", price, http.StatusOK, `{"data":{"id":"pri_subscription","unit_price":{"currency_code":"USD"}}}`, connect.CodeUnavailable},
+		{"missing override currency", price, http.StatusOK, `{"data":{"id":"pri_subscription","unit_price":{"currency_code":"USD"},"unit_price_overrides":[{"unit_price":{}}]}}`, connect.CodeUnavailable},
+		{"mismatched price", price, http.StatusOK, `{"data":{"id":"pri_other","unit_price":{"currency_code":"USD"},"unit_price_overrides":[]}}`, connect.CodeUnavailable},
+		{"price unreadable", price, http.StatusForbidden, `{"error":{"code":"forbidden"}}`, connect.CodeUnavailable},
+		{"settings unreadable", settings, http.StatusForbidden, `{"error":{"code":"forbidden"}}`, connect.CodeUnavailable},
+		{"malformed settings", settings, http.StatusOK, "{", connect.CodeUnavailable},
+		{"incomplete settings", settings, http.StatusOK, `{"data":{"USD":{"enabled":true}}}`, connect.CodeUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			pending, fresh := f.account(), f.account()
+			first, err := f.startCheckout(pending)
+			if err != nil || first == "" {
+				t.Fatalf("first start = %q, %v", first, err)
+			}
+			f.paddle.Respond(tc.path, tc.status, tc.body)
+			for _, account := range []string{pending, fresh} {
+				if id, err := f.startCheckout(account); id != "" || connect.CodeOf(err) != tc.code {
+					t.Fatalf("start = %q, %v, want empty ID and %s", id, err, tc.code)
+				}
+			}
+			if n := f.createTransactionRequests(); n != 1 {
+				t.Fatalf("create requests = %d, want only the original start", n)
+			}
+			if sub, err := LoadSubscription(ctx(), f.db.Pool, pending, false); err != nil ||
+				sub.Status != SubscriptionPending || sub.CheckoutTransactionID != first || f.checkoutRows(pending) != 1 {
+				t.Fatalf("pending subscription = %+v, %v; want the original checkout %q", sub, err, first)
+			}
+			if sub, err := LoadSubscription(ctx(), f.db.Pool, fresh, false); err != nil || sub.exists || f.checkoutRows(fresh) != 0 {
+				t.Fatalf("new subscription = %+v, %v; want no subscription or checkout", sub, err)
+			}
+			f.paddle.Respond(tc.path, 0, "")
+			if id, err := f.startCheckout(pending); err != nil || id != first || f.createTransactionRequests() != 1 {
+				t.Fatalf("retry = %q, %v; want the original checkout %q without an extra create", id, err, first)
+			}
+		})
+	}
+}
+
+func TestStartSubscriptionRejectsNonUSDTransaction(t *testing.T) {
+	f := newFixture(t)
+	pending, fresh := f.account(), f.account()
+	first, err := f.startCheckout(pending)
+	if err != nil || first == "" {
+		t.Fatalf("first start = %q, %v", first, err)
+	}
+	f.paddle.Respond("POST /transactions", http.StatusCreated,
+		`{"data":{"id":"txn_other","currency_code":"GBP"}}`)
+	if id, err := f.startCheckout(fresh); id != "" || connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("new checkout = %q, %v; want empty ID and failed_precondition", id, err)
+	}
+	if sub, err := LoadSubscription(ctx(), f.db.Pool, fresh, false); err != nil || sub.exists || f.checkoutRows(fresh) != 0 {
+		t.Fatalf("new subscription = %+v, %v; want no subscription or checkout", sub, err)
+	}
+
+	f.paddle.Respond("GET /transactions/"+first, http.StatusOK, strings.ReplaceAll(
+		`{"data":{"id":"{id}","status":"draft","collection_mode":"automatic","currency_code":"GBP"}}`, "{id}", first))
+	if id, err := f.startCheckout(pending); id != "" || connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("pending checkout = %q, %v; want empty ID and failed_precondition", id, err)
+	}
+	if sub, err := LoadSubscription(ctx(), f.db.Pool, pending, false); err != nil ||
+		sub.Status != SubscriptionPending || sub.CheckoutTransactionID != first || f.checkoutRows(pending) != 1 {
+		t.Fatalf("pending subscription = %+v, %v; want the original checkout %q", sub, err, first)
+	}
+	if n := f.createTransactionRequests(); n != 2 {
+		t.Fatalf("create requests = %d, want the two new starts only", n)
 	}
 }
 

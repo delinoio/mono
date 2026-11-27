@@ -186,6 +186,14 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	const currencySettings = "GET /settings/currency-conversions"
+	env.Paddle.Fail(currencySettings, &paddletest.Failure{Status: http.StatusForbidden, Code: "forbidden"})
+	blocked, err := owner.StartSubscription(ctx(), connect.NewRequest(&accountsv1.StartSubscriptionRequest{BillingAccountId: f.AccountID}))
+	wantCode(t, err, connect.CodeUnavailable)
+	if blocked != nil {
+		t.Fatalf("failed preflight returned a response: %v", blocked)
+	}
+	env.Paddle.Fail(currencySettings, nil)
 	second, err := env.Credit(f.Admin.ID).StartSubscription(ctx(), connect.NewRequest(&accountsv1.StartSubscriptionRequest{BillingAccountId: f.AccountID}))
 	if err != nil || second.Msg.GetPaddleTransactionId() != first.Msg.GetPaddleTransactionId() {
 		t.Fatalf("retry returned %v, %v", second, err)
@@ -193,8 +201,13 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	if s := get(); s.GetStatus() != accountsv1.SubscriptionStatus_SUBSCRIPTION_STATUS_PENDING || s.GetCurrentPeriodEnd() != nil {
 		t.Fatalf("pending subscription = %v", s)
 	}
-	checkout := env.Paddle.Requests()[0]
-	if checkout.Path != "/transactions" || checkout.Body["custom_data"].(map[string]any)["billing_account_id"] != f.AccountID {
+	requests := env.Paddle.Requests()
+	if len(requests) < 3 || requests[0].Path != "/prices/"+testenv.PaddlePriceID || requests[1].Path != "/settings/currency-conversions" {
+		t.Fatalf("expected a currency preflight before creation, got %+v", requests)
+	}
+	checkout := requests[2]
+	if checkout.Method != http.MethodPost || checkout.Path != "/transactions" ||
+		checkout.Body["custom_data"].(map[string]any)["billing_account_id"] != f.AccountID {
 		t.Fatalf("checkout request = %+v", checkout)
 	}
 

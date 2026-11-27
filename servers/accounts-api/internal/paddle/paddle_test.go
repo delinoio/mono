@@ -4,6 +4,7 @@ package paddle_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -70,6 +71,56 @@ func TestParseEvent(t *testing.T) {
 func newClient(t *testing.T) (*paddle.Client, *paddletest.Server) {
 	fake := paddletest.New(t)
 	return paddle.New(paddle.Config{BaseURL: fake.URL, APIKey: paddletest.APIKey}), fake
+}
+
+func TestVerifyUSDCheckoutCurrencyAcceptsUSDOverride(t *testing.T) {
+	client, fake := newClient(t)
+	fake.Respond("GET /prices/pri_sub", http.StatusOK, `{"data":{
+		"id":"pri_sub","unit_price":{"currency_code":"USD"},
+		"unit_price_overrides":[{"country_codes":["GB"],"unit_price":{"currency_code":"USD"}}]
+	}}`)
+	if err := client.VerifyUSDCheckoutCurrency(context.Background(), "pri_sub"); err != nil {
+		t.Fatal(err)
+	}
+	reqs := fake.Requests()
+	if len(reqs) != 2 || reqs[0].Method != http.MethodGet || reqs[0].Path != "/prices/pri_sub" ||
+		reqs[1].Method != http.MethodGet || reqs[1].Path != "/settings/currency-conversions" {
+		t.Fatalf("unexpected Paddle requests: %+v", reqs)
+	}
+}
+
+func TestVerifyUSDCheckoutCurrencyValidatesAllConversions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		code   string
+		value  any
+		unsafe bool
+	}{
+		{name: "missing entry", code: "GBP"},
+		{name: "null enabled", code: "GBP", value: map[string]any{"enabled": nil}},
+		{name: "missing enabled", code: "GBP", value: map[string]any{}},
+		{name: "wrong type", code: "GBP", value: map[string]string{"enabled": "false"}},
+		{name: "new enabled currency", code: "AED", value: map[string]bool{"enabled": true}, unsafe: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, fake := newClient(t)
+			settings := paddletest.USDOnlyCurrencyConversions()
+			if tc.value == nil {
+				delete(settings, tc.code)
+			} else {
+				settings[tc.code] = tc.value
+			}
+			body, err := json.Marshal(map[string]any{"data": settings})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fake.Respond("GET /settings/currency-conversions", http.StatusOK, string(body))
+			err = client.VerifyUSDCheckoutCurrency(context.Background(), "pri_sub")
+			if err == nil || errors.Is(err, paddle.ErrUnsafeCheckoutCurrency) != tc.unsafe {
+				t.Fatalf("VerifyUSDCheckoutCurrency = %v, want failure (unsafe = %t)", err, tc.unsafe)
+			}
+		})
+	}
 }
 
 func TestClientCheckoutAndSubscription(t *testing.T) {

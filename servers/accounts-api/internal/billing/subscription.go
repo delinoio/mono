@@ -330,6 +330,9 @@ func (s *Service) pendingCheckoutPayable(ctx context.Context, accountID, transac
 			return false, nil
 		case paddle.TransactionStatusDraft, paddle.TransactionStatusReady, paddle.TransactionStatusBilled:
 			if current.CollectionMode == paddle.CollectionModeAutomatic {
+				if err := s.checkCheckoutTransactionCurrency(ctx, accountID, current); err != nil {
+					return false, err
+				}
 				return true, nil
 			}
 		case paddle.TransactionStatusPaid, paddle.TransactionStatusCompleted:
@@ -340,6 +343,18 @@ func (s *Service) pendingCheckoutPayable(ctx context.Context, accountID, transac
 		slog.String("billing_account_id", accountID),
 		slog.String("paddle_transaction_id", transactionID))
 	return false, unavailable("the payment provider is unavailable; try again later")
+}
+
+func (s *Service) checkCheckoutTransactionCurrency(ctx context.Context, accountID string, txn paddle.Transaction) error {
+	// The preflight already verified the catalog and conversion settings.
+	// A reported currency is a separate check on the individual transaction.
+	if txn.CurrencyCode == "" || txn.CurrencyCode == paddle.CurrencyUSD {
+		return nil
+	}
+	s.logger.WarnContext(ctx, "billing_checkout_transaction_currency_rejected",
+		slog.String("billing_account_id", accountID),
+		slog.String("paddle_transaction_id", txn.ID))
+	return failedPrecondition("the payment provider checkout must use USD")
 }
 
 // StartSubscription returns the checkout transaction of the subscription.
@@ -357,15 +372,24 @@ func (s *Service) StartSubscription(ctx context.Context, tx pgx.Tx, accountID st
 	switch sub.Status {
 	case SubscriptionActive, SubscriptionPastDue:
 		return "", Subscription{}, false, alreadyExists("the billing account already has a subscription")
-	case SubscriptionPending:
-		if sub.CheckoutTransactionID != "" {
-			payable, err := s.pendingCheckoutPayable(ctx, accountID, sub.CheckoutTransactionID)
-			if err != nil {
-				return "", Subscription{}, false, err
-			}
-			if payable {
-				return sub.CheckoutTransactionID, sub, false, nil
-			}
+	}
+	if err := s.paddle.VerifyUSDCheckoutCurrency(ctx, s.priceID); err != nil {
+		s.logger.WarnContext(ctx, "billing_checkout_currency_preflight_failed",
+			slog.String("billing_account_id", accountID),
+			slog.String("paddle_error_code", paddle.ErrorCode(err)),
+			slog.Any("error", err))
+		if errors.Is(err, paddle.ErrUnsafeCheckoutCurrency) {
+			return "", Subscription{}, false, failedPrecondition("subscription checkout requires a USD price, USD country overrides, and automatic conversion disabled for non-USD currencies")
+		}
+		return "", Subscription{}, false, unavailable("the payment provider could not verify the subscription checkout currency; try again later")
+	}
+	if sub.Status == SubscriptionPending && sub.CheckoutTransactionID != "" {
+		payable, err := s.pendingCheckoutPayable(ctx, accountID, sub.CheckoutTransactionID)
+		if err != nil {
+			return "", Subscription{}, false, err
+		}
+		if payable {
+			return sub.CheckoutTransactionID, sub, false, nil
 		}
 	}
 	txn, err := s.paddle.CreateCheckoutTransaction(ctx, s.priceID, paddle.CustomData{paddle.CustomDataBillingAccountID: accountID})
@@ -376,6 +400,9 @@ func (s *Service) StartSubscription(ctx context.Context, tx pgx.Tx, accountID st
 			slog.String("paddle_error_code", paddle.ErrorCode(err)),
 			slog.Any("error", err))
 		return "", Subscription{}, false, paddleError(err, "checkout")
+	}
+	if err := s.checkCheckoutTransactionCurrency(ctx, accountID, txn); err != nil {
+		return "", Subscription{}, false, err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO paddle_checkouts (paddle_transaction_id, billing_account_id, create_time)
 		VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, txn.ID, accountID, now); err != nil {

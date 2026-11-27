@@ -171,6 +171,15 @@ func (s *Server) Charges() []Request {
 	return out
 }
 
+// USDOnlyCurrencyConversions returns the fake's default settings payload.
+func USDOnlyCurrencyConversions() map[string]any {
+	settings := make(map[string]any)
+	for code := range strings.FieldsSeq("ARS AUD BRL CAD CHF CLP CNY COP CZK DKK EUR GBP HKD HUF ILS INR JPY KRW MXN NOK NZD PEN PLN RUB SEK SGD THB TRY TWD UAH USD VND ZAR") {
+		settings[code] = map[string]bool{"enabled": code == "USD"}
+	}
+	return settings
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -243,10 +252,19 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	switch {
+	case r.Method == http.MethodGet && len(parts) == 2 && parts[0] == "prices":
+		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
+			"id":                   parts[1],
+			"unit_price":           map[string]string{"amount": "1000", "currency_code": "USD"},
+			"unit_price_overrides": []any{},
+		}})
+	case r.Method == http.MethodGet && r.URL.Path == "/settings/currency-conversions":
+		writeJSON(w, http.StatusOK, map[string]any{"data": USDOnlyCurrencyConversions()})
 	case r.Method == http.MethodPost && r.URL.Path == "/transactions":
 		now := time.Now().UTC()
 		mode, _ := body["collection_mode"].(string)
-		txn := paddle.Transaction{ID: s.NewID("txn"), Status: paddle.TransactionStatusDraft, CollectionMode: mode, CreatedAt: now, UpdatedAt: now}
+		txn := paddle.Transaction{ID: s.NewID("txn"), Status: paddle.TransactionStatusDraft, CollectionMode: mode,
+			CurrencyCode: "USD", CreatedAt: now, UpdatedAt: now}
 		if custom, ok := body["custom_data"].(map[string]any); ok {
 			txn.CustomData = custom
 		}

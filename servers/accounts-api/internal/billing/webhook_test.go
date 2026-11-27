@@ -72,6 +72,26 @@ func TestWebhookSignatureRejection(t *testing.T) {
 	}
 }
 
+func TestWebhookSubscriptionPaymentIgnoresNonUSD(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	txnID := f.checkout(acct)
+	data := paddletest.Transaction(paddletest.TransactionData{
+		ID: txnID, SubscriptionID: f.paddle.NewID("sub"), Origin: paddle.OriginWeb,
+		PriceID: priceID, SubtotalCents: 1000, Currency: "GBP",
+	})
+	if result := f.webhookResult(paddle.EventTransactionCompleted, data); result != "ignored" {
+		t.Fatalf("webhook result = %q, want ignored", result)
+	}
+	if f.balance(acct) != 0 || f.count("SELECT count(*) FROM credit_grants WHERE billing_account_id = $1", acct) != 0 {
+		t.Fatal("non-USD payment added credit")
+	}
+	sub, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if err != nil || sub.Status != SubscriptionPending || sub.CheckoutTransactionID != txnID {
+		t.Fatalf("subscription = %+v, %v; want original pending checkout", sub, err)
+	}
+}
+
 func TestWebhookSubscriptionPaymentAndReplay(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()

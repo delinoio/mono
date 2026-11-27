@@ -106,6 +106,7 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 
 ### Subscription checkout
 
+- `StartSubscription` verifies the payment provider's USD-only price and currency settings before it creates or returns a checkout. It returns `failed_precondition` when verified settings allow non-USD checkout or the provider reports a non-USD currency on a new or payable pending transaction. It returns retryable `unavailable` when it cannot verify the settings. These failures preserve the pending checkout and return no checkout ID.
 - While the subscription is `PENDING`, `StartSubscription` reuses a verified payable checkout or returns a replacement if Paddle confirms that the original is canceled or missing. An inconclusive lookup or a payment awaiting its verified webhook returns retryable `unavailable` and preserves the pending checkout.
 
 ### Subscription cancellation and resumption
