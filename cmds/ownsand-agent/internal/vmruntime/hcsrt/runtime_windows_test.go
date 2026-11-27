@@ -326,9 +326,12 @@ func TestVMWatcherForwardsConfirmedExit(t *testing.T) {
 				sys.close()
 				v.attachSystem(sys)
 			case "disconnect and running status":
-				queried := make(chan struct{})
+				queried := make(chan struct{}, 1)
 				sys.verifyExitFn = func(string, time.Time) (bool, error) {
-					close(queried)
+					select {
+					case queried <- struct{}{}:
+					default:
+					}
 					return false, nil
 				}
 				v.attachSystem(sys)
