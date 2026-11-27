@@ -5,11 +5,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +22,113 @@ import (
 // errMetricsAccept is the permanent listener error that the tests inject. It
 // does not implement net.Error with Temporary, so net/http does not retry it.
 var errMetricsAccept = errors.New("metrics accept failed permanently")
+
+func TestRunServersClosesActivePublicConnectionAtDrainDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		acceptErr error
+	}{
+		{name: "shutdown signal"},
+		{name: "public listener failure", acceptErr: errPublicAccept},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			publicListener := newTestListener(t)
+			listener := publicListener
+			if tc.acceptErr != nil {
+				listener = acceptErrorOnCloseListener{Listener: publicListener, err: tc.acceptErr}
+			}
+			requestStarted := make(chan struct{})
+			requestCancelled := make(chan struct{})
+			releaseHandler := make(chan struct{})
+			defer close(releaseHandler)
+			logger := newTestLogger()
+			srv := newServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				close(requestStarted)
+				<-r.Context().Done()
+				close(requestCancelled)
+				<-releaseHandler
+			}), logger)
+
+			workerDraining := make(chan struct{})
+			releaseWorker := make(chan struct{})
+			workerFinished := make(chan struct{})
+			worker := func(ctx context.Context) {
+				<-ctx.Done()
+				close(workerDraining)
+				select {
+				case <-releaseWorker:
+				case <-t.Context().Done():
+				}
+				close(workerFinished)
+			}
+			const drainTimeout = 200 * time.Millisecond
+			result := runAsync(func() error {
+				return runServers(ctx, noStop, srv, listener, logger, drainTimeout, worker, nil)
+			})
+
+			conn, err := net.DialTimeout("tcp", publicListener.Addr().String(), handlerStartTimeout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			if err := awaitHandlerStarted(requestStarted, nil, result, handlerStartTimeout); err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.acceptErr == nil {
+				cancel()
+			} else if err := publicListener.Close(); err != nil {
+				t.Fatalf("fail public listener: %v", err)
+			}
+			select {
+			case <-workerDraining:
+			case <-time.After(handlerStartTimeout):
+				t.Fatal("worker did not start draining after the public deadline")
+			}
+			select {
+			case <-requestCancelled:
+			case <-time.After(handlerStartTimeout):
+				t.Fatal("request context remained live after the public deadline")
+			}
+			// Both gates are still closed, so neither a handler response nor
+			// process shutdown can account for the connection closing.
+			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			var data [1]byte
+			if n, err := conn.Read(data[:]); n != 0 || (!errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET)) {
+				t.Fatalf("read %d bytes with error %v, want EOF or connection reset", n, err)
+			}
+			select {
+			case err := <-result:
+				t.Fatalf("runServers returned %v while the worker was still draining", err)
+			default:
+			}
+			close(releaseWorker)
+			select {
+			case err := <-result:
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("runServers error = %v, want the drain deadline error", err)
+				}
+				if tc.acceptErr != nil && !errors.Is(err, tc.acceptErr) {
+					t.Errorf("runServers error = %v, want the public listener error", err)
+				}
+			case <-time.After(handlerStartTimeout):
+				t.Fatal("runServers did not return after the worker finished")
+			}
+			select {
+			case <-workerFinished:
+			default:
+				t.Fatal("runServers returned before the worker finished")
+			}
+		})
+	}
+}
 
 // backgroundRig is a runServers call with a live public server, a billing
 // worker stand-in and a metrics listener under the control of the test.
