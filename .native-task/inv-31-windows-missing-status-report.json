@@ -1,0 +1,51 @@
+{
+  "gid": "inv-31-windows-missing-status-report",
+  "commit": "c55f83117d9abf1759a44e15155330268eaa1d25",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows amd64 on local NTFS",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "c55f83117d9abf1759a44e15155330268eaa1d25",
+    "setup": "Run the commands in order in a short local NTFS checkout at the fix revision using the non-elevated account from the baseline. After commands 1 and 2, copy files.copyFrom to files.copyTo. The fixture uses no symlink, Unicode archive, SCM or Hyper-V operation.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne 'c55f83117d9abf1759a44e15155330268eaa1d25') { throw 'Unexpected fix revision' }; $fixedRoot = (Get-Location).Path; $volume = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($fixedRoot)); if ($volume.DriveFormat -ne 'NTFS') { throw 'Run on a local NTFS checkout' }",
+      "$traceRoot = (New-Item -ItemType Directory -Path (Join-Path $fixedRoot '.t3-tmp') -Force).FullName",
+      "$probe = Join-Path $traceRoot 'status-trace.mjs'; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe).Hash.ToLowerInvariant() -ne 'b20be839655f3f360fe54d6130d8223ea20759e0c1ba5b81d8569a47ca418487') { throw 'Unexpected probe checksum' }; $env:TEMP = $traceRoot; $env:TMP = $traceRoot; $env:GOTMPDIR = $traceRoot; $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'; go version; node --version",
+      "go test -count=100 -timeout=15m -v -run '^(TestConcurrentStatusReadsDoNotLoseWrites|TestWriteFileAtomicRetriesWhileReaderHoldsFile|TestWriteFileAtomicGivesUpOnStuckReader)$' ./cmds/ownsand-agent/internal/store 2>&1 | Tee-Object -FilePath (Join-Path $traceRoot 'status-fixed-retained-tests.log'); if ($LASTEXITCODE -ne 0) { throw 'Retained Windows tests failed' }",
+      "go test -count=5 -timeout=5m -v -run '^(TestStatusReadWaitsForPublication|TestStatusReadTimesOutDuringStuckPublication|TestStatusReadPreservesGenuineAbsence|TestStatusWriteCancellationKeepsPreviousReport|TestStatusPublicationWithLongPaths|TestResetRemovesStatusLockWhileReaderHasItOpen)$' ./cmds/ownsand-agent/internal/store 2>&1 | Tee-Object -FilePath (Join-Path $traceRoot 'status-fixed-regressions.log'); if ($LASTEXITCODE -ne 0) { throw 'Status regressions failed' }",
+      "$overlay = node $probe windows-fixed; if ($LASTEXITCODE -ne 0) { throw 'Overlay setup failed' }; $storeTest = Join-Path $traceRoot 'store-status-fixed.test.exe'; $agent = Join-Path $traceRoot 'ownsand-agent-status-fixed.exe'; go test -c -overlay $overlay -o $storeTest ./cmds/ownsand-agent/internal/store; if ($LASTEXITCODE -ne 0) { throw 'Instrumented store build failed' }; go build -overlay $overlay -o $agent ./cmds/ownsand-agent; if ($LASTEXITCODE -ne 0) { throw 'Instrumented status CLI build failed' }",
+      "$env:OWNSAND_STATUS_TRACE_READERS = '4'; $env:OWNSAND_STATUS_TRACE_CLI = $agent; try { & $storeTest '-test.timeout=10m' '-test.v' '-test.count=10' '-test.run=^TestTraceStatusReplacement$' 2>&1 | Tee-Object -FilePath (Join-Path $traceRoot 'status-fixed-four-readers-cli.log'); if ($LASTEXITCODE -ne 0) { throw 'Four-reader and CLI native stress test failed' } } finally { Remove-Item Env:OWNSAND_STATUS_TRACE_READERS,Env:OWNSAND_STATUS_TRACE_CLI -ErrorAction SilentlyContinue }"
+    ],
+    "expectedResults": [
+      "All three retained tests execute and pass each repetition under the non-elevated account. The concurrent test treats every read error or partial report after first publication as a failure.",
+      "The injected Win32 2, 5 and 32 paths recover across the exclusive publication lock. A stuck publisher returns a deadline error. Genuine absence returns ErrNotFound, cancellation preserves the previous report, long paths work, and reset removes the sidecar with a reader handle open.",
+      "All ten four-reader plus independent status CLI iterations pass. The CLI reports genuine absence before publication and returns complete reports thereafter. Raw transient errors can still appear in trace counters when the production retry recovers them."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-missing-status-report/worker/.t3-tmp/windows-status/status-trace.mjs",
+      "copyTo": ".t3-tmp/status-trace.mjs",
+      "sha256": "b20be839655f3f360fe54d6130d8223ea20759e0c1ba5b81d8569a47ca418487",
+      "outputLogs": [
+        ".t3-tmp/status-fixed-retained-tests.log",
+        ".t3-tmp/status-fixed-regressions.log",
+        ".t3-tmp/status-fixed-four-readers-cli.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-missing-status-report/worker/.t3-tmp/windows-status/ownsand-agent-fixed-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-missing-status-report/worker/.t3-tmp/windows-status/store-fixed-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-missing-status-report/worker/.t3-tmp/windows-status/agent-fixed-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-missing-status-report/worker/.t3-tmp/windows-status/store-trace-fixed-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-missing-status-report/worker/.t3-tmp/windows-status/agent-trace-fixed-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-missing-status-report/worker/.t3-tmp/windows-status/ownsand-agent-fixed-windows-arm64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-missing-status-report/worker/.t3-tmp/windows-status/store-fixed-windows-arm64.test.exe"
+      ]
+    },
+    "requiresElevation": [
+      {
+        "scenario": "Run the full Windows agent with the production state ACL and a concurrent status CLI against a disposable control plane.",
+        "reason": "Store.Open allows SYSTEM or elevated administrators. The non-elevated probe exercises the production status store calls and actual status command with a disposable producer fixture."
+      }
+    ]
+  }
+}
