@@ -2354,28 +2354,50 @@ func TestAcksDropEndedRecords(t *testing.T) {
 
 func TestResendAndIdleReports(t *testing.T) {
 	e := newEnv(t)
-	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
-	n := len(e.out.entries)
+	const idleTTL = 10 * time.Minute
+	created := e.create(idleTTL, 2*time.Hour)
+	id := created.GetSandboxId()
+	n := e.out.count()
 	e.m.Tick(context.Background(), true)
-	if len(e.out.entries) != n+1 {
-		t.Fatal("unacknowledged update not resent")
+	if e.out.count() != n+1 {
+		t.Fatalf("resend: %d entries, want %d", e.out.count(), n+1)
 	}
-	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: e.out.entries[len(e.out.entries)-1].GetRevision()})
-	n = len(e.out.entries)
+	resent := e.out.lastEntry(id)
+	if !proto.Equal(resent, created) {
+		t.Fatalf("resent update %v, want %v", resent, created)
+	}
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: resent.GetRevision()})
+	n = e.out.count()
+
+	e.clk.Advance(10 * time.Second)
 	e.m.Touch(id)
+	wantDeadline := e.clk.Now().Add(idleTTL)
 	e.m.Tick(context.Background(), true)
-	if len(e.out.entries) != n+1 {
-		t.Fatal("moved idle deadline not reported")
+	if e.out.count() != n+1 {
+		t.Fatalf("moved idle deadline: %d entries, want %d", e.out.count(), n+1)
 	}
+	got := e.out.lastEntry(id)
+	if got.GetRevision().GetCounter() <= resent.GetRevision().GetCounter() {
+		t.Fatalf("revision %d, want newer than %d", got.GetRevision().GetCounter(), resent.GetRevision().GetCounter())
+	}
+	if !got.GetIdleDeadline().AsTime().Equal(wantDeadline) {
+		t.Fatalf("idle deadline %v, want %v", got.GetIdleDeadline().AsTime(), wantDeadline)
+	}
+
+	e.clk.Advance(10 * time.Second)
 	e.m.Touch(id)
+	wantDeadline = e.clk.Now().Add(idleTTL)
 	e.m.Tick(context.Background(), false)
-	if len(e.out.entries) != n+1 {
+	if e.out.count() != n+1 {
 		t.Fatal("idle deadline reported twice within a minute")
 	}
-	e.clk.Advance(time.Minute)
+	e.clk.Advance(50 * time.Second)
 	e.m.Tick(context.Background(), false)
-	if len(e.out.entries) != n+2 {
-		t.Fatal("idle deadline not reported after a minute")
+	if e.out.count() != n+2 {
+		t.Fatalf("idle deadline at the one-minute boundary: %d entries, want %d", e.out.count(), n+2)
+	}
+	if deadline := e.out.lastEntry(id).GetIdleDeadline().AsTime(); !deadline.Equal(wantDeadline) {
+		t.Fatalf("idle deadline %v, want %v", deadline, wantDeadline)
 	}
 }
 
@@ -3181,14 +3203,15 @@ func TestLockSnapshotImportCanceledContextAbortsWithFreeLock(t *testing.T) {
 // another activity event, and a successful report still follows the throttle.
 func TestIdleReportRetriesAfterRevisionWriteFailure(t *testing.T) {
 	e := newEnv(t)
-	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	const idleTTL = 10 * time.Minute
+	id := e.create(idleTTL, 2*time.Hour).GetSandboxId()
 	acked := e.out.lastEntry(id)
 	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: acked.GetRevision()})
 	n := e.out.count()
 
 	e.clk.Advance(30 * time.Second)
 	e.m.Touch(id)
-	wantDeadline := e.clk.Now().Add(10 * time.Minute)
+	wantDeadline := e.clk.Now().Add(idleTTL)
 
 	// A directory in place of agent.json makes the revision write fail: the
 	// store cannot read the file that holds the revision counter. The fault
@@ -3239,15 +3262,20 @@ func TestIdleReportRetriesAfterRevisionWriteFailure(t *testing.T) {
 
 	// The successful report starts the one-minute throttle.
 	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: got.GetRevision()})
+	e.clk.Advance(10 * time.Second)
 	e.m.Touch(id)
+	wantDeadline = e.clk.Now().Add(idleTTL)
 	e.m.Tick(context.Background(), false)
 	if e.out.count() != n+1 {
 		t.Fatal("idle deadline reported again within a minute of a successful report")
 	}
-	e.clk.Advance(time.Minute)
+	e.clk.Advance(50 * time.Second)
 	e.m.Tick(context.Background(), false)
 	if e.out.count() != n+2 {
-		t.Fatal("idle deadline not reported after the throttle")
+		t.Fatalf("idle deadline at the one-minute boundary: %d entries, want %d", e.out.count(), n+2)
+	}
+	if deadline := e.out.lastEntry(id).GetIdleDeadline().AsTime(); !deadline.Equal(wantDeadline) {
+		t.Fatalf("idle deadline %v, want %v", deadline, wantDeadline)
 	}
 }
 
