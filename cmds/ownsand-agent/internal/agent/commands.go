@@ -159,6 +159,9 @@ func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *own
 	case *ownsandv1.AgentCommand_ImportSnapshot:
 		var e *ownsandv1.SnapshotStateEntry
 		e, err = a.importSnapshot(chanCtx, c.ImportSnapshot)
+		if interruption := snapshotImportInterruption(err); interruption != nil {
+			err = interruption
+		}
 		if e != nil {
 			res.Result = &ownsandv1.AgentCommandResult_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotResult{Snapshot: e}}
 		}
@@ -231,6 +234,19 @@ func (a *Agent) exportSnapshot(ctx context.Context, cmd *ownsandv1.ExportSnapsho
 	}
 	a.logger.Info("snapshot exported", "snapshot_id", cmd.GetSnapshotId(), "part_count", len(parts), "size_bytes", size)
 	return &ownsandv1.ExportSnapshotResult{Parts: parts, SizeBytes: size}, nil
+}
+
+// snapshotImportInterruption reports the context status without exposing
+// details from wrapped transfer errors.
+func snapshotImportInterruption(err error) *sandboxes.CommandError {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_CANCELED, Message: "snapshot import canceled"}
+	case errors.Is(err, context.DeadlineExceeded):
+		return &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_DEADLINE_EXCEEDED, Message: "snapshot import deadline exceeded"}
+	default:
+		return nil
+	}
 }
 
 // importSnapshot downloads, verifies and publishes a snapshot copy. Imports
@@ -329,6 +345,10 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 		return nil, fmt.Errorf("remove stale snapshot import: %w", err)
 	}
 	if err := a.transfer.Import(ctx, snapshotID, cmd.GetParts(), filepath.Join(dir, "content")); err != nil {
+		if interruption := snapshotImportInterruption(err); interruption != nil {
+			a.logger.Warn("snapshot import interrupted during transfer", "snapshot_id", snapshotID, "error", interruption)
+			return nil, err
+		}
 		a.logger.Error("snapshot import failed", "snapshot_id", snapshotID, "error", err)
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS, Message: "snapshot import failed its download or hash check"}
 	}
@@ -337,7 +357,11 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	}
 	e, err := a.Sandboxes.AddImportedSnapshot(ctx, entry)
 	if err != nil {
-		a.logger.Warn("snapshot import stopped before publication", "snapshot_id", snapshotID, "error", err)
+		loggedErr := err
+		if interruption := snapshotImportInterruption(err); interruption != nil {
+			loggedErr = interruption
+		}
+		a.logger.Warn("snapshot import stopped before publication", "snapshot_id", snapshotID, "error", loggedErr)
 		return nil, err
 	}
 	published = true
