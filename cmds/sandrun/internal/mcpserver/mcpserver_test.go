@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"connectrpc.com/connect"
@@ -881,6 +882,28 @@ func TestSyncAndDownloadThroughTransferStatus(t *testing.T) {
 	if text, isErr := h.call("sync", map[string]any{"session_id": id}, nil); !isErr || !strings.HasPrefix(text, "failed_precondition") {
 		t.Fatalf("sync of a starting session = %q", text)
 	}
+}
+
+func TestAwaitTransferStopsOnServerCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{})
+		pending := &transfer{id: "pending", done: make(chan struct{})}
+		result := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			_, err := s.awaitTransfer(t.Context(), pending, MaxWait)
+			result <- err
+		}()
+
+		synctest.Wait()
+		s.Close()
+		if err := <-result; err == nil || !strings.HasPrefix(err.Error(), "canceled:") {
+			t.Fatalf("awaitTransfer error = %v, want canceled", err)
+		}
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Fatalf("awaitTransfer took %v, want immediate cancellation", elapsed)
+		}
+	})
 }
 
 func TestTransferStatusWhileSyncUploads(t *testing.T) {
