@@ -9,6 +9,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from "@testing-library/react";
 import {
   AlertDialog,
@@ -31,6 +32,13 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "./dialog.tsx";
+import {
+  Drawer,
+  DrawerClose,
+  DrawerContent,
+  DrawerTitle,
+  DrawerTrigger,
+} from "./drawer.tsx";
 import { NumberInput } from "./number-input.tsx";
 import { PasswordInput } from "./password-input.tsx";
 import { Progress } from "./progress.tsx";
@@ -831,6 +839,231 @@ describe("autoFocus inside Dialog", () => {
     await settle();
 
     expect(document.activeElement).toBe(trigger);
+  });
+});
+
+describe("panel autofocus boundaries", () => {
+  const fields = [TextField, Textarea, NumberInput, PasswordInput];
+  const panels = [
+    {
+      Root: Dialog,
+      Content: DialogContent,
+      Title: DialogTitle,
+      Close: DialogClose,
+      Trigger: DialogTrigger,
+      role: "dialog",
+    },
+    {
+      Root: AlertDialog,
+      Content: AlertDialogContent,
+      Title: AlertDialogTitle,
+      Close: AlertDialogClose,
+      Trigger: AlertDialogTrigger,
+      role: "alertdialog",
+    },
+    {
+      Root: Drawer,
+      Content: DrawerContent,
+      Title: DrawerTitle,
+      Close: DrawerClose,
+      Trigger: DrawerTrigger,
+      role: "dialog",
+    },
+  ] as const;
+
+  function PanelFixture({
+    panel: { Root, Content, Title, Close, Trigger },
+    children,
+    useTrigger = false,
+    explicitFocus = false,
+  }: {
+    panel: (typeof panels)[number];
+    children: React.ReactNode;
+    useTrigger?: boolean;
+    explicitFocus?: boolean;
+  }) {
+    const [open, setOpen] = React.useState(false);
+    const cancelRef = React.useRef<HTMLButtonElement>(null);
+    const returnRef = React.useRef<HTMLButtonElement>(null);
+    return (
+      <>
+        {useTrigger ? null : (
+          <button type="button" onClick={() => setOpen(true)}>
+            Open
+          </button>
+        )}
+        <button type="button" ref={returnRef}>
+          Return here
+        </button>
+        <Root {...(useTrigger ? {} : { open, onOpenChange: setOpen })}>
+          {useTrigger ? <Trigger>Open</Trigger> : null}
+          <Content
+            initialFocus={explicitFocus ? () => cancelRef.current : undefined}
+            finalFocus={explicitFocus ? () => returnRef.current : undefined}
+          >
+            <Title>Rename</Title>
+            <Close ref={cancelRef}>Cancel</Close>
+            {children}
+          </Content>
+        </Root>
+      </>
+    );
+  }
+
+  async function openPanel() {
+    const opener = screen.getByRole("button", { name: "Open" });
+    await act(async () => {
+      opener.focus();
+      fireEvent.click(opener);
+    });
+    return opener;
+  }
+
+  async function closePanel(dismissal: "Escape" | "Cancel") {
+    await act(async () => {
+      if (dismissal === "Escape") {
+        fireEvent.keyDown(document.activeElement as Element, { key: "Escape" });
+      } else {
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      }
+    });
+  }
+
+  for (const Field of fields) {
+    for (const autoFocus of [true, undefined]) {
+      test(`mounts ${Field.name} beside a closed Dialog with autoFocus=${autoFocus}`, () => {
+        render(
+          <Dialog>
+            <form>
+              <Field label="Outside" autoFocus={autoFocus} />
+            </form>
+            <DialogTrigger>Open</DialogTrigger>
+            <DialogContent>
+              <DialogTitle>Rename</DialogTitle>
+            </DialogContent>
+          </Dialog>,
+        );
+
+        const field = screen.getByLabelText("Outside");
+        expect(document.activeElement === field).toBe(autoFocus === true);
+        expect(screen.queryByRole("dialog")).toBeNull();
+      });
+    }
+  }
+
+  for (const panel of panels) {
+    describe(panel.Root.name, () => {
+      for (const Field of fields) {
+        for (const dismissal of ["Escape", "Cancel"] as const) {
+          test(`focuses ${Field.name} and restores the controlled opener after ${dismissal}`, async () => {
+            render(
+              <PanelFixture panel={panel}>
+                <Field label="Inside" autoFocus />
+              </PanelFixture>,
+            );
+            const opener = await openPanel();
+            await waitFor(() => {
+              expect(document.activeElement).toBe(
+                screen.getByLabelText("Inside"),
+              );
+            });
+
+            await closePanel(dismissal);
+
+            await waitFor(() => {
+              expect(screen.queryByRole(panel.role)).toBeNull();
+              expect(document.activeElement).toBe(opener);
+            });
+          });
+        }
+      }
+
+      test("restores focus to the SDK trigger", async () => {
+        render(
+          <PanelFixture panel={panel} useTrigger>
+            <TextField label="Inside" autoFocus />
+          </PanelFixture>,
+        );
+        const opener = await openPanel();
+        await waitFor(() => {
+          expect(document.activeElement).toBe(screen.getByLabelText("Inside"));
+        });
+
+        await closePanel("Escape");
+        await waitFor(() => expect(document.activeElement).toBe(opener));
+      });
+
+      test("honors explicit initial and final focus", async () => {
+        render(
+          <PanelFixture panel={panel} explicitFocus>
+            <TextField label="Inside" autoFocus />
+          </PanelFixture>,
+        );
+        const returnTarget = screen.getByRole("button", {
+          name: "Return here",
+        });
+        await openPanel();
+        await waitFor(() => {
+          expect(document.activeElement).toBe(
+            screen.getByRole("button", { name: "Cancel" }),
+          );
+        });
+
+        await closePanel("Escape");
+        await waitFor(() => expect(document.activeElement).toBe(returnTarget));
+      });
+    });
+  }
+
+  test("focuses Cancel when the AlertDialog field is unmarked", async () => {
+    render(
+      <PanelFixture panel={panels[1]}>
+        <TextField label="Inside" />
+      </PanelFixture>,
+    );
+    await openPanel();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Cancel" }),
+      );
+    });
+  });
+
+  test("defers autofocus for fields created by a custom content render", async () => {
+    function CustomDialog() {
+      const [open, setOpen] = React.useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen(true)}>
+            Open
+          </button>
+          <Dialog open={open} onOpenChange={setOpen}>
+            <DialogContent
+              render={({ children, ...props }) => (
+                <section {...props}>
+                  {children}
+                  <TextField label="Inside" autoFocus />
+                </section>
+              )}
+            >
+              <DialogTitle>Rename</DialogTitle>
+              <DialogClose>Cancel</DialogClose>
+            </DialogContent>
+          </Dialog>
+        </>
+      );
+    }
+
+    render(<CustomDialog />);
+    const opener = await openPanel();
+    const dialog = await screen.findByRole("dialog", { name: "Rename" });
+    expect(dialog.tagName).toBe("SECTION");
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByLabelText("Inside"));
+    });
+
+    await closePanel("Escape");
+    await waitFor(() => expect(document.activeElement).toBe(opener));
   });
 });
 

@@ -8,7 +8,7 @@ import {
 import { Input } from "@ui-sdk/react/input";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
-import { useForwardedAutoFocus } from "./dialog-context.ts";
+import { useForwardedAutoFocus } from "./panel-autofocus.ts";
 
 export type TextFieldProps = React.ComponentProps<typeof Input> & {
   /** The visible name of the field. */

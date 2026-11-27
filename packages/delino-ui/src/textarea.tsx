@@ -8,7 +8,7 @@ import {
 import { Textarea as TextareaPart } from "@ui-sdk/react/textarea";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
-import { useForwardedAutoFocus } from "./dialog-context.ts";
+import { useForwardedAutoFocus } from "./panel-autofocus.ts";
 
 export type TextareaProps = React.ComponentProps<typeof TextareaPart> & {
   /** The visible name of the field. */
