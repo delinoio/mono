@@ -3677,6 +3677,41 @@ func TestFailedCreateRetriesStopUntilItSucceeds(t *testing.T) {
 	}
 }
 
+func TestBusyUntilAllFailedCreateCleanupCompletes(t *testing.T) {
+	e := newEnv(t)
+	e.rt.createErr = errors.New("injected create failure")
+	e.rt.deleteFails = 1
+	for _, retainVM := range []bool{true, false} {
+		cmd := e.createCmd(1, time.Hour, time.Hour)
+		id := cmd.GetSandboxId()
+		if retainVM {
+			e.rt.retainFailedCreate(id)
+		}
+		entry, err := e.m.Create(t.Context(), cmd)
+		if err == nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED {
+			t.Fatalf("Create = (%v, %v), want a failed create", entry, err)
+		}
+		e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: entry.GetRevision()})
+		if entry := e.m.StateEntry(id); entry != nil {
+			t.Fatalf("terminal acknowledgement kept the record: %v", entry)
+		}
+	}
+	if !e.m.Busy() {
+		t.Fatal("idle with two acknowledged failed creates awaiting cleanup")
+	}
+	e.tickAndWait()
+	if pending := e.pendingCleanups(); pending != 1 || !e.m.Busy() {
+		t.Fatalf("after one Delete succeeded: pending = %d, busy = %t, want (1, true)", pending, e.m.Busy())
+	}
+	e.tickAndWait()
+	if pending := e.pendingCleanups(); pending != 0 || e.m.Busy() {
+		t.Fatalf("after the last Delete succeeded: pending = %d, busy = %t, want (0, false)", pending, e.m.Busy())
+	}
+	if calls := e.rt.deleteCallCount(); calls != 3 {
+		t.Fatalf("runtime Delete calls = %d, want 3 including idempotent confirmation", calls)
+	}
+}
+
 // failCreateSave lets the runtime fail after the initial CREATING save,
 // while the store cannot commit the subsequent failed-create transition.
 func failCreateSave(t *testing.T, e *env, fault func(string) func()) (string, Record, func()) {

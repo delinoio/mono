@@ -549,11 +549,15 @@ func (m *Manager) SetLimits(l *ownsandv1.DeviceLimits) {
 // only when not busy. A DELETING record whose runtime Delete is still running
 // or failed (sb.stopped is false) may still have a live VM, so it keeps the
 // agent busy until a Delete returns nil or startup reconciliation ends the
-// record. Snapshot transfers reserve the device with the updater and are not
-// counted here.
+// record. Pending runtime cleanup also keeps the agent busy, even after
+// acknowledgement drops a terminal record. The updater tracks snapshot
+// transfer reservations separately.
 func (m *Manager) Busy() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if len(m.cleanupPending) != 0 {
+		return true
+	}
 	for _, sb := range m.sandboxes {
 		switch sb.rec.State {
 		case ownsandv1.SandboxState_SANDBOX_STATE_CREATING, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED:
