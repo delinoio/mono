@@ -352,14 +352,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		list := guestSibling(s, ".sandrun-sync-"+syncID+".links")
 		applyEnv[guestEnvLinks] = list
 		cleanupEnv[guestEnvLinks] = list
-		var b bytes.Buffer
-		for _, l := range links {
-			b.WriteString(strings.ReplaceAll(l.rel, "/", `\`))
-			b.WriteByte('\t')
-			b.WriteString(strings.ReplaceAll(l.target, "/", `\`))
-			b.WriteByte('\n')
-		}
-		n, err := c.writeGuestFile(ctx, s, list, 0o644, &b, nil)
+		n, err := c.writeGuestFile(ctx, s, list, 0o644, bytes.NewReader(windowsLinkList(links)), nil)
 		res.BytesSent += n
 		if err != nil {
 			return nil, err
@@ -576,11 +569,18 @@ func planSync(local *localList, old manifest) (*syncPlan, error) {
 	return plan, nil
 }
 
+// PowerShell's ReadAllLines consumes one UTF-8 BOM. Write it explicitly
+// so it preserves a leading U+FEFF in the first path.
+const windowsListPreamble = "\xef\xbb\xbf"
+
 // pathList returns the guest list file of relative paths: NUL-separated
 // for Linux and macOS guests, newline-separated with backslashes for
 // Windows guests.
 func pathList(paths []string, windows bool) []byte {
 	var b bytes.Buffer
+	if windows {
+		b.WriteString(windowsListPreamble)
+	}
 	for _, p := range paths {
 		if windows {
 			b.WriteString(strings.ReplaceAll(p, "/", `\`))
@@ -589,6 +589,18 @@ func pathList(paths []string, windows bool) []byte {
 			b.WriteString(p)
 			b.WriteByte(0)
 		}
+	}
+	return b.Bytes()
+}
+
+func windowsLinkList(links []localFile) []byte {
+	var b bytes.Buffer
+	b.WriteString(windowsListPreamble)
+	for _, l := range links {
+		b.WriteString(strings.ReplaceAll(l.rel, "/", `\`))
+		b.WriteByte('\t')
+		b.WriteString(strings.ReplaceAll(l.target, "/", `\`))
+		b.WriteByte('\n')
 	}
 	return b.Bytes()
 }
