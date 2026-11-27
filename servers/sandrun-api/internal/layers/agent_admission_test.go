@@ -20,9 +20,11 @@ import (
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/cursor/cursorfake"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/devin"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/devin/devinfake"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/app"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
 )
 
@@ -85,7 +87,11 @@ func TestDevinAdmissionConfirmedRollback(t *testing.T) {
 	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
 	timing := fastAgentTiming()
 	timing.PollInterval = time.Hour // Each step runs one poll explicitly.
-	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, timing, proxy.option(t, &kicks))
+	opts := layers.Options{
+		AgentTiming: timing,
+		Devin:       devin.Options{BaseURL: fake.Server.URL, ReleaseGrace: time.Minute},
+	}
+	w := createDevinWorldWithOptions(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, opts, proxy.option(t, &kicks))
 	eventually(t, "the Devin stream", func() bool { return fake.Streams() == 1 })
 	kicks.Store(0)
 	const key = "devin-admission"
