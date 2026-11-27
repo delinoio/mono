@@ -190,7 +190,7 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 				t.Fatal(err)
 			}
 			log := string(data)
-			if strings.Count(log, `"msg":"invalid configuration"`) != 1 || !strings.Contains(log, wantSetting) || strings.Contains(log, rawLevel) {
+			if strings.Count(log, `"msg":"invalid configuration"`) != 1 || !strings.Contains(log, wantSetting) || strings.Contains(log, rawPath) || strings.Contains(log, rawLevel) {
 				t.Fatalf("unexpected log contents: %s", log)
 			}
 		})
