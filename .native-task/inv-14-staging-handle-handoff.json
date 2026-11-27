@@ -1,0 +1,44 @@
+{
+  "gid": "inv-14-staging-handle-handoff",
+  "commit": "e803ddb0a73b7b2a9ab144fa0f97cf65ce2ac0bc",
+  "nativeValidation": {
+    "status": "pending",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "platform": "Windows amd64",
+    "sha": "e803ddb0a73b7b2a9ab144fa0f97cf65ce2ac0bc",
+    "setup": "Use a standard non-elevated PowerShell session on delino-win-1. Run from a clean Windows checkout of the covered revision or a source-identical integration checkout on a local Windows filesystem. Copy the standalone probe to files.copyTo before building it.",
+    "commands": [
+      "git rev-parse HEAD",
+      "git status --porcelain=v1",
+      "$principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()); if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Use a non-elevated PowerShell session' }",
+      "New-Item -ItemType Directory -Force .t3-tmp/staging-handoff-validation | Out-Null",
+      "$validationDir = (Resolve-Path .t3-tmp/staging-handoff-validation).Path",
+      "$env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir; $env:GOTOOLCHAIN = 'go1.26.1'",
+      "go version; go env GOHOSTOS GOHOSTARCH GOOS GOARCH",
+      "go test -count=3 -v ./cmds/ownsand-guest/guest -run '^(TestRunWriteShutdownLockHandoff|TestWriteSweepRetainsStateDirDuringConcurrentClose|TestWriteCloseRejectsNewWork)$' 2>&1 | Tee-Object \"$validationDir/windows-handoff-fixture.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go build -o \"$validationDir/verify-staging-handoff.exe\" \"$validationDir/verify-staging-handoff.go\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "& \"$validationDir/verify-staging-handoff.exe\" 2>&1 | Tee-Object \"$validationDir/windows-handoff-probe.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "Record the clean checkout revision and the native Windows amd64 Go environment. The shell runs without elevation.",
+      "All three runs of the focused tests exit 0. Both within_grace and after_forced_close accept ERROR_INVALID_HANDLE as proof of closure on Windows and check the handle before the replacement sweeps. The deferred write and active sweep block replacement until their barriers release. The replacement expires both staging paths and preserves the published file.",
+      "The standalone probe exits 0. It reports that the replacement found the staging file and record and rejected continuation before expiry, then reports that the sweep removed both expired paths and preserved the published bytes."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-14-staging-handle-handoff/worker/.t3-tmp/verify-staging-handoff.go",
+      "copyTo": ".t3-tmp/staging-handoff-validation/verify-staging-handoff.go",
+      "regressionTests": ["cmds/ownsand-guest/guest/shutdown_test.go"],
+      "outputLogs": [
+        ".t3-tmp/staging-handoff-validation/windows-handoff-fixture.log",
+        ".t3-tmp/staging-handoff-validation/windows-handoff-probe.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/followup/wt/stk-inv-14-staging-handle-handoff/worker/.t3-tmp/guest-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/followup/wt/stk-inv-14-staging-handle-handoff/worker/.t3-tmp/ownsand-guest-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/followup/wt/stk-inv-14-staging-handle-handoff/worker/.t3-tmp/verify-staging-handoff-windows-amd64.exe"
+      ]
+    },
+    "runnerElevated": false
+  }
+}
