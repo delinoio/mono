@@ -30,7 +30,10 @@ import {
   createConnectQueryKey,
   createQueryOptions,
 } from "@connectrpc/connect-query";
-import { ApiKeyService } from "@delino/sandrun-protos/v1/api_key_pb";
+import {
+  ApiKeyService,
+  type ListApiKeysRequest,
+} from "@delino/sandrun-protos/v1/api_key_pb";
 import {
   AgentIntegrationService,
   DeleteAgentIntegrationRequestSchema,
@@ -3725,6 +3728,103 @@ describe("form dialog openings", () => {
 });
 
 describe("personal API key pages", () => {
+  test.each([true, false])(
+    "refreshes a pending, uncached first page only after a successful create: %s",
+    async (succeeds) => {
+      const mock = createMockTransport();
+      const apiKeys = createClient(ApiKeyService, mock);
+      const requests: ListApiKeysRequest[] = [];
+      let releaseFirstPage!: () => void;
+      const firstPage = new Promise<void>((resolve) => {
+        releaseFirstPage = resolve;
+      });
+      let deliverFirstPage!: () => void;
+      const firstPageDelivered = new Promise<void>((resolve) => {
+        deliverFirstPage = resolve;
+      });
+      const fixture = createRouterTransport((router) => {
+        router.service(ApiKeyService, {
+          async listApiKeys(req, { signal }) {
+            requests.push(req);
+            if (requests.length === 1) {
+              await firstPage;
+              deliverFirstPage();
+              return { apiKeys: [], nextPageToken: "" };
+            }
+            return apiKeys.listApiKeys(req, { signal });
+          },
+          createApiKey(req, { signal }) {
+            if (!succeeds) {
+              throw new ConnectError(
+                "Key creation failed",
+                Code.InvalidArgument,
+              );
+            }
+            return apiKeys.createApiKey(req, { signal });
+          },
+        });
+      });
+      const transport: Transport = {
+        ...mock,
+        unary(method, ...args) {
+          return (method.parent === ApiKeyService ? fixture : mock).unary(
+            method,
+            ...args,
+          );
+        },
+      };
+      const organizationId = MOCK_IDS.acme;
+      renderConsole(`/orgs/${organizationId}/api-keys`, { transport });
+      const request = expect.objectContaining({
+        organizationId,
+        pageSize: PAGE_SIZE,
+        pageToken: "",
+      });
+      await waitFor(() => expect(requests).toEqual([request]));
+
+      await click(screen.getByRole("button", { name: "Create API key" }));
+      await type(screen.getByRole("textbox", { name: "Name" }), "deploy-bot");
+      await click(screen.getByRole("button", { name: "Create key" }));
+
+      const result = { name: "Your new personal API key" };
+      if (succeeds) {
+        expect(await screen.findByRole("dialog", result)).toBeTruthy();
+        await waitFor(() => expect(requests).toEqual([request, request]));
+        await click(screen.getByRole("button", { name: "Done" }));
+        expect(await screen.findByText("deploy-bot · Active")).toBeTruthy();
+      } else {
+        const form = screen.getByRole("dialog", {
+          name: "Create a personal API key",
+        });
+        expect(await within(form).findByRole("alert")).toHaveProperty(
+          "textContent",
+          "Key creation failed",
+        );
+        expect(
+          within(form).getByRole<HTMLButtonElement>("button", {
+            name: "Create key",
+          }).disabled,
+        ).toBe(false);
+      }
+
+      await act(async () => {
+        releaseFirstPage();
+        await firstPageDelivered;
+      });
+      expect(screen.queryByRole("dialog", result)).toBeNull();
+      if (succeeds) {
+        const row = screen.getByText("deploy-bot · Active").closest("li")!;
+        expect(
+          within(row).getByRole("button", { name: "Revoke" }),
+        ).toBeTruthy();
+        expect(requests).toEqual([request, request]);
+      } else {
+        expect(await screen.findByText("No personal API keys")).toBeTruthy();
+        expect(requests).toEqual([request]);
+      }
+    },
+  );
+
   test("shows the keys after the first page", async () => {
     const transport = createMockTransport();
     const apiKeys = createClient(ApiKeyService, transport);

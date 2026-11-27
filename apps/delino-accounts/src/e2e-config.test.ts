@@ -35,7 +35,12 @@ describe("e2e app command", () => {
     {
       directory: "sandrun",
       config: sandRunConfig,
-      configArgs: ["--mode", "development"],
+      configArgs: [
+        "--config",
+        "e2e/rsbuild.config.ts",
+        "--mode",
+        "development",
+      ],
       env: { NODE_ENV: "production", PUBLIC_SANDRUN_MOCK_API: " true " },
     },
   ]) {

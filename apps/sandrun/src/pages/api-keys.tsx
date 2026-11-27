@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
-import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
-import { useQueryClient } from "@tanstack/react-query";
+import type { Transport } from "@connectrpc/connect";
+import {
+  createInfiniteQueryOptions,
+  useMutation,
+  useTransport,
+} from "@connectrpc/connect-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { TextField } from "delino-ui/text-field";
@@ -29,6 +34,21 @@ import { API_KEY_NAME_LIMIT, isNameLengthValid } from "../name.ts";
 export const EXPIRY_DAYS = [30, 90, 365, 0] as const;
 const DAY_MS = 24 * 3600 * 1000;
 
+function apiKeyListOptions(
+  organizationId: string | undefined,
+  transport: Transport,
+) {
+  return createInfiniteQueryOptions(
+    ApiKeyService.method.listApiKeys,
+    { organizationId, pageSize: PAGE_SIZE, pageToken: "" },
+    {
+      transport,
+      pageParamKey: "pageToken",
+      getNextPageParam: (last) => last.nextPageToken || undefined,
+    },
+  );
+}
+
 /**
  * Route `api-keys`: the signed-in user's personal API keys. A key works only
  * for dev sessions; the secret appears once.
@@ -36,17 +56,22 @@ const DAY_MS = 24 * 3600 * 1000;
 export function ApiKeysPage() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
+  const transport = useTransport();
   const refresh = () => invalidateServices(queryClient, ApiKeyService);
-  const list = useInfiniteQuery(
-    ApiKeyService.method.listApiKeys,
-    { organizationId, pageSize: PAGE_SIZE, pageToken: "" },
-    {
-      pageParamKey: "pageToken",
-      getNextPageParam: (last) => last.nextPageToken || undefined,
-    },
-  );
+  const list = useInfiniteQuery(apiKeyListOptions(organizationId, transport));
   const create = useMutation(ApiKeyService.method.createApiKey, {
-    onSuccess: refresh,
+    onSuccess: (_, request) => {
+      // Invalidation alone can reuse the first fetch when it has no cached data.
+      const { queryKey } = apiKeyListOptions(request.organizationId, transport);
+      void queryClient
+        .cancelQueries({
+          queryKey,
+          exact: true,
+          fetchStatus: "fetching",
+          predicate: (query) => query.state.data === undefined,
+        })
+        .then(refresh);
+    },
   });
   const revoke = useMutation(ApiKeyService.method.revokeApiKey, {
     onSuccess: refresh,

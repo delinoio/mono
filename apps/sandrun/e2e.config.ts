@@ -35,6 +35,8 @@ export default {
             rsbuildBin,
             "dev",
             "--no-env",
+            "--config",
+            "e2e/rsbuild.config.ts",
             "--mode",
             "development",
             "--host",
