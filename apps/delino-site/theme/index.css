@@ -99,6 +99,17 @@ html:not(.rp-dark) {
 }
 
 /*
+ * Rspress 2.1.3 uses a gray that reaches only 2.22:1 for destination
+ * titles in unselected light-mode search results. Use the secondary text
+ * color until Rspress provides at least 4.5:1 in this state.
+ */
+html:not(.rp-dark)
+  .rp-suggest-item:not(.rp-suggest-item--current)
+  .rp-suggest-item__title {
+  color: var(--rp-c-text-2);
+}
+
+/*
  * Workaround: Rspress 2.1.3 paints the current search suggestion with
  * --rp-c-brand as background and hard-coded #fff text. The brighter dark brand
  * would drop that white text to about 2.6:1, so keep the original brand blue
