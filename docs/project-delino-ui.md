@@ -58,6 +58,7 @@ The project is a library, not a deployable. It has no `apps`, `cmds`, `servers`,
 
 - Consumers import components only from the exports above. They must not import files under `packages/delino-ui/src/` by path.
 - Apps that use the components must import `delino-ui/styles.css` before their own stylesheet.
+- The SegmentedControl selection cue meets 3:1 contrast against the indicator fill and track in both color schemes.
 - Behavior, focus handling and ARIA come from UI SDK. This package must not reimplement them; it only composes UI SDK parts and styles them. Components without behavior (`badge`, `card` and `skeleton`) render plain elements.
 - The package follows the [frontend design rules](../AGENTS.md#frontend-design-rules): dialogs, alert dialogs, drawers and popovers always close with the Escape key, and the single critical input of a form receives focus when the form is shown.
 - The package ships TypeScript source and has no build step, so it never writes a `dist` directory. Consumers compile the source with their own Rsbuild or Rspress build.

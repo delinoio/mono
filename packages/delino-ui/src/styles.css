@@ -1660,8 +1660,8 @@
   /* Segmented control. UI SDK measures the checked item into the indicator's
      `--segmented-control-indicator-*` properties. Unchecked text contrast:
      #4e5968 on #f2f4f6 6.45:1, dark #b0b8c1 on #2c2c35 6.90:1. The optional UI
-     SDK stylesheet draws a 1px border on the track and on the indicator; the
-     track and the pill here are borderless, so both reset it. */
+     SDK stylesheet draws a 1px border on the track and on the indicator.
+     Reset both borders and draw the selection stroke inside the indicator. */
   .dui-segmented-control {
     position: relative;
     display: inline-flex;
@@ -1689,7 +1689,9 @@
     border: 0;
     border-radius: 9px;
     background: var(--dui-color-surface);
-    box-shadow: 0 1px 3px rgb(0 0 0 / 12%);
+    box-shadow:
+      inset 0 0 0 2px var(--dui-color-accent-graphic),
+      0 1px 3px rgb(0 0 0 / 12%);
     transition-property: top, left, width, height;
     transition-duration: 0.2s;
   }
@@ -2017,10 +2019,9 @@
      so every cue pairs a fill or a border with the idle state instead of
      relying on one fixed color. */
   @media (forced-colors: active) {
-    /* SegmentedControl: the indicator background and shadow are the only cue
-       of the checked item. Draw the indicator as a system-color border, and
-       keep the focus ring on another system color with an offset so it stays
-       distinct from the selection. */
+    /* SegmentedControl: forced colors remove the inset shadow. Draw a
+       Highlight border for selection and an offset CanvasText outline for
+       keyboard focus. */
     .dui-segmented-control-indicator {
       box-sizing: border-box;
       border: 2px solid Highlight;
