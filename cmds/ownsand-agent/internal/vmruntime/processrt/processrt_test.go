@@ -598,6 +598,17 @@ func TestPSStopped(t *testing.T) {
 	})
 }
 
+func TestPSStoppedDeadlineRetainsCompletedFailure(t *testing.T) {
+	installPSFixture(t, "exit 2")
+	out, probeErr := exec.Command("ps").Output()
+	// Model the deadline firing after ps exits but before its result is checked.
+	stopped, err := psStoppedResult(out, probeErr, context.DeadlineExceeded)
+	var exitErr *exec.ExitError
+	if stopped || !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("probe result = %v, %v; want false and ps exit 2", stopped, err)
+	}
+}
+
 func installPSFixture(t *testing.T, script string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -852,7 +863,9 @@ if [ "$1" = "-A" ]; then
 elif [ "$PROCESSRT_TEST_PS_FAILURE" = "deadline" ]; then
     printf '%s\n' "$$" > "$PROCESSRT_TEST_PS_FAILED" || exit 3
     exec /bin/sleep 30
-elif [ "$PROCESSRT_TEST_PS_FAILURE" = "persistent" ] || [ ! -e "$PROCESSRT_TEST_PS_FAILED" ]; then
+elif [ "$PROCESSRT_TEST_PS_FAILURE" = "persistent" ]; then
+    exit 2
+elif [ ! -e "$PROCESSRT_TEST_PS_FAILED" ]; then
     touch "$PROCESSRT_TEST_PS_FAILED" || exit 3
     exit 2
 fi
@@ -861,11 +874,9 @@ exec "$PROCESSRT_TEST_PS" "$@"
 				observations := 0
 				observedStopped := false
 				var probeErr error
-				wait := 100 * time.Millisecond
+				wait := 500 * time.Millisecond
 				if failure == "transient" {
 					wait = 0 // Use the real timeout while waiting for the stop signal to take effect.
-				} else if failure == "deadline" {
-					wait = 500 * time.Millisecond
 				}
 				useStopSeams(t, h, func(ctx context.Context, pid int) (bool, error) {
 					mustNotExist(t, listed)
@@ -888,7 +899,7 @@ exec "$PROCESSRT_TEST_PS" "$@"
 				t.Setenv("PATH", oldPath)
 				if failure != "transient" {
 					if failure == "deadline" {
-						if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(probeErr, context.DeadlineExceeded) || observations != 1 || elapsed >= psTimeout/2 {
+						if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "ps:") || !errors.Is(probeErr, context.DeadlineExceeded) || observations != 1 || elapsed >= psTimeout/2 {
 							t.Fatalf("%s = %v, last probe = %v, probes = %d, elapsed = %s; want one probe canceled by the %s wait", op.name, err, probeErr, observations, elapsed, wait)
 						}
 						data, readErr := os.ReadFile(failed)
@@ -901,8 +912,8 @@ exec "$PROCESSRT_TEST_PS" "$@"
 						}
 					} else {
 						var exitErr *exec.ExitError
-						if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
-							t.Fatalf("%s = %v; want an error from the failed ps probe", op.name, err)
+						if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+							t.Fatalf("%s = %v; want both context.DeadlineExceeded and ps exit 2", op.name, err)
 						}
 					}
 					mustNotExist(t, listed)
@@ -947,6 +958,18 @@ func TestWaitHelperStoppedSharesDeadline(t *testing.T) {
 		defer cancel()
 		testSharedHelperStopDeadline(t, ctx, time.Second)
 	})
+}
+
+func TestWaitHelperStoppedReportsPSFailureAtCallerDeadline(t *testing.T) {
+	installPSFixture(t, "exit 2")
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	h := &vm{helper: helperProcess{pid: os.Getpid()}, observeStopped: psStopped}
+	err := h.waitHelperStopped(ctx)
+	var exitErr *exec.ExitError
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("wait = %v; want both context.DeadlineExceeded and ps exit 2", err)
+	}
 }
 
 func testSharedHelperStopDeadline(t *testing.T, ctx context.Context, wait time.Duration) {
