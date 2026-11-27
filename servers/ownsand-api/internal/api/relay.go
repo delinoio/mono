@@ -194,12 +194,9 @@ func relayGateFrom(ctx context.Context) *relayGate {
 	return g
 }
 
-// RelayReadDeadlines makes the response controller of each request available
-// to the relay request gate. A Connect gate sees no response writer, but only
-// the controller can interrupt a request body read that blocks: net/http does
-// not cancel a body read when the request context ends. Wrap the RelayService
-// handler with it.
-func RelayReadDeadlines(next http.Handler) http.Handler {
+// WithRelayResponseController gives the RelayService request gate access to
+// the transport deadlines for the request body and streaming response.
+func WithRelayResponseController(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), relayControllerKey{}, http.NewResponseController(w))
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -212,9 +209,10 @@ func RelayReadDeadlines(next http.Handler) http.Handler {
 // opens the relay stream, so that the request deadline starts at the stream
 // allocation and covers the upload of the body: it arms a read deadline on
 // the request body at that deadline, and an upload that exceeds it ends with
-// deadline_exceeded. A call whose handler never runs, because the body failed
-// to arrive or to decode, closes its stream when the RPC ends. The handler
-// takes the call with begin.
+// deadline_exceeded. Server-streaming calls also get an absolute response
+// write deadline from that same allocation time. If the body cannot be read
+// or decoded, the gate closes the stream when the RPC ends. Otherwise the
+// handler takes the call with begin.
 //
 // The checks that need request fields (organization, sandbox, kind and
 // operation ID against the grant) stay in begin, after Connect decoded the
@@ -226,9 +224,23 @@ func (p *DataPlane) RelayGate(authn *Authenticator, mode config.ClientAddressMod
 		start := p.S.Now()
 		ctx, info := logs.start(ctx, peer, header)
 		ctx, err := auths.authenticate(ctx, spec.Procedure, header)
+		rc, _ := ctx.Value(relayControllerKey{}).(*http.ResponseController)
 		var c *relayCall
 		if err == nil {
 			c, err = p.open(ctx, spec.Procedure, header)
+		}
+		if err == nil && spec.StreamType == connect.StreamTypeServer {
+			// Keep the deadline armed so it also covers the final status
+			// Connect writes and flushes after the service method returns.
+			var deadlineErr error = http.ErrNotSupported
+			if rc != nil {
+				deadlineErr = rc.SetWriteDeadline(c.stream.Started.Add(p.Timing.ResponseWriteDeadline))
+			}
+			if deadlineErr != nil {
+				err = connect.NewError(connect.CodeInternal, fmt.Errorf("set relay response write deadline: %w", deadlineErr))
+				c.stream.Close(true)
+				p.logCall(ctx, c, err)
+			}
 		}
 		if err != nil {
 			// A rejected RPC never reaches the interceptor chain, so the gate
@@ -237,7 +249,7 @@ func (p *DataPlane) RelayGate(authn *Authenticator, mode config.ClientAddressMod
 			return nil, err
 		}
 		g := &relayGate{call: c, deadline: c.stream.Started.Add(p.Timing.RequestDeadline), clearRead: func() {}}
-		if rc, ok := ctx.Value(relayControllerKey{}).(*http.ResponseController); ok {
+		if rc != nil {
 			if err := rc.SetReadDeadline(g.deadline); err != nil {
 				// Without the controller the request body read is unbounded,
 				// as before the gate existed; the forwarding deadline still holds.
@@ -564,7 +576,7 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 		}
 		if f == nil {
 			if now.Sub(lastEmit) >= p.Timing.Keepalive {
-				if err := ev.keepalive(); err != nil {
+				if err := relayResponseError(ctx, ev.keepalive()); err != nil {
 					return err
 				}
 				lastEmit = now
@@ -586,7 +598,7 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 					uploadDone = nil
 				}
 				accepted = true
-				if err := ev.accepted(); err != nil {
+				if err := relayResponseError(ctx, ev.accepted()); err != nil {
 					return err
 				}
 				lastEmit = now
@@ -597,7 +609,7 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 		if !ok {
 			return connect.NewError(connect.CodeInternal, errors.New("unexpected frame from the agent"))
 		}
-		if err := ev.send(resp); err != nil {
+		if err := relayResponseError(ctx, ev.send(resp)); err != nil {
 			return err
 		}
 		c.frames++
@@ -608,6 +620,16 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 			return nil
 		}
 	}
+}
+
+// Connect can return nil from Send after a failed flush. Check the request
+// context even then, so a canceled stream unwinds without consuming credit
+// or reporting successful completion.
+func relayResponseError(ctx context.Context, sendErr error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return sendErr
 }
 
 func isTerminalExecEvent(e *ownsandv1.ExecEvent) bool {
