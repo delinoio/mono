@@ -5,6 +5,7 @@ package sandrun
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -43,7 +44,7 @@ func requireRemoved(t *testing.T, path string) {
 }
 
 func TestWindowsGuestSyncRetryFileToDirectory(t *testing.T) {
-	makeJunction := func(t *testing.T, link, target string) {
+	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", func(t *testing.T, link, target string) {
 		t.Helper()
 		// A junction is a directory reparse point and needs no symlink privilege.
 		const script = `$ErrorActionPreference = 'Stop'
@@ -55,58 +56,168 @@ New-Item -ItemType Junction -Path $parent -Name $name -Value $env:SANDRUN_TEST_T
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("create junction: %v: %s", err, out)
 		}
-	}
-	t.Run("nested path", func(t *testing.T) {
-		testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", makeJunction)
-	})
-	t.Run("leading U+FEFF", func(t *testing.T) {
-		testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "\ufeffconfig", makeJunction)
 	})
 }
 
 func TestWindowsGuestSyncListPaths(t *testing.T) {
-	testSyncListPaths(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+	for _, tc := range []struct {
+		name  string
+		paths []string
+	}{
+		{"single deletion", []string{"\ufeffnote.txt"}},
+		{"U+FEFF first and later", []string{"\ufefffirst.txt", "\ufefflater.txt"}},
+		{"ordinary first", []string{"plain.txt", "\ufefflater.txt"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+			ws := ds.GetWorkspacePath()
+			dir := newRepo(t, nil, nil, "")
+			// Seed an already synced workspace. A Windows tar.exe that cannot
+			// decode a Unicode PAX path would otherwise block the deletion test.
+			before := manifest{Version: manifestVersion, PathsValidated: true, Files: map[string]manifestEntry{}}
+			for _, path := range tc.paths {
+				writeWindowsFixtureFile(t, filepath.Join(ws, path))
+				before.Files[path] = manifestEntry{Mode: modeFile}
+			}
+			writeWindowsFixtureFile(t, filepath.Join(ws, "note.txt"))
+			body, err := json.Marshal(before)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(guestSibling(ds, manifestSuffix), body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			res, err := c.Sync(t.Context(), p)
+			if err != nil || res.Deleted != len(tc.paths) || res.Uploaded != 0 {
+				t.Fatalf("deletion sync = %+v, %v", res, err)
+			}
+			for _, path := range tc.paths {
+				requireRemoved(t, filepath.Join(ws, path))
+			}
+			readGuest(t, ds, "note.txt")
+			if files := guestManifest(t, ds).Files; len(files) != 0 {
+				t.Fatalf("manifest contains deleted paths: %+v", files)
+			}
+		})
+	}
 }
 
-func TestWindowsGuestSyncLinkListPaths(t *testing.T) {
+func TestWindowsGuestApplyReplacementAndPruneListPaths(t *testing.T) {
 	for _, tc := range []struct{ name, first string }{
 		{"U+FEFF first", "\ufefffirst"},
 		{"ordinary first", "plain"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			names := []string{tc.first, "\ufefflater"}
-			c, srv, org := newTestClient(t, "")
-			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
-			target := filepath.Join(ds.GetWorkspacePath(), "target.txt")
-			if err := os.WriteFile(target, []byte("target"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			dir := newRepo(t, nil, nil, "")
-			for _, name := range names {
-				if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
-					if errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
-						t.Skipf("creating Windows symbolic links requires privilege: %v", err)
-					}
+			ws := t.TempDir()
+			var replacements, prunes []string
+			for _, prefix := range []string{tc.first, "\ufefflater"} {
+				config, prune := prefix+"-config", prefix+"-prune"
+				replacements = append(replacements, config)
+				prunes = append(prunes, prune)
+				writeWindowsFixtureFile(t, filepath.Join(ws, config))
+				if err := os.Mkdir(filepath.Join(ws, prune), 0o755); err != nil {
 					t.Fatal(err)
 				}
 			}
-			p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
-			res, err := c.Sync(t.Context(), p)
-			if err != nil || res.Uploaded != len(names) || len(res.Warnings) != 0 {
-				t.Fatalf("link sync = %+v, %v", res, err)
+			lists := map[string][]byte{
+				guestEnvReplaceFiles: pathList(replacements, true),
+				guestEnvPrunes:       pathList(prunes, true),
 			}
-			files := guestManifest(t, ds).Files
-			for _, name := range names {
-				got, err := os.Readlink(filepath.Join(ds.GetWorkspacePath(), name))
-				if err != nil || got != target {
-					t.Errorf("guest link %q target = %q, %v, want %q", name, got, err, target)
+			applyWindowsSyncLists(t, ws, lists)
+			for _, path := range prunes {
+				requireRemoved(t, filepath.Join(ws, path))
+			}
+			for _, path := range replacements {
+				// Materialize the directory that an intervening extraction
+				// would create before the manifest write fails.
+				if err := os.Mkdir(filepath.Join(ws, path), 0o755); err != nil {
+					t.Fatalf("replacement did not remove %q: %v", path, err)
 				}
-				if files[name].Mode != modeSymlink {
-					t.Errorf("manifest omits link %q: %+v", name, files)
+				writeWindowsFixtureFile(t, filepath.Join(ws, path, "guest.txt"))
+			}
+			applyWindowsSyncLists(t, ws, lists)
+			for _, path := range replacements {
+				if got, err := os.ReadFile(filepath.Join(ws, path, "guest.txt")); err != nil || string(got) != "fixture" {
+					t.Errorf("file under %q after retry = %q, %v", path, got, err)
 				}
 			}
 		})
 	}
+}
+
+func TestWindowsGuestApplyLinkListPaths(t *testing.T) {
+	for _, tc := range []struct{ name, first string }{
+		{"U+FEFF first", "\ufefffirst"},
+		{"ordinary first", "plain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := t.TempDir()
+			target := filepath.Join(ws, "target.txt")
+			writeWindowsFixtureFile(t, target)
+			names := []string{tc.first, "\ufefflater"}
+			links := make([]localFile, 0, len(names))
+			for _, name := range names {
+				// Apply removes this exact file before it attempts the link.
+				// The removal is observable even without symlink privilege.
+				writeWindowsFixtureFile(t, filepath.Join(ws, name))
+				links = append(links, localSymlink(name, target))
+			}
+			out := applyWindowsSyncLists(t, ws, map[string][]byte{guestEnvLinks: windowsLinkList(links)})
+			failed := 0
+			for _, name := range names {
+				got, err := os.Readlink(filepath.Join(ws, name))
+				switch {
+				case errors.Is(err, os.ErrNotExist):
+					failed++
+				case err != nil || got != target:
+					t.Errorf("guest link %q target = %q, %v, want %q", name, got, err, target)
+				}
+			}
+			if reported := bytes.Count(out, []byte("SANDRUN-LINK-FAILED ")); reported != failed {
+				t.Fatalf("found %d link failure diagnostics for %d absent paths: %s", reported, failed, out)
+			}
+			t.Logf("created %d symbolic links and reported %d failures after removing the original paths", len(names)-failed, failed)
+		})
+	}
+}
+
+func writeWindowsFixtureFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// applyWindowsSyncLists runs the production PowerShell reader without
+// extracting an archive, so the result depends on the list encoding.
+func applyWindowsSyncLists(t *testing.T, workspace string, lists map[string][]byte) []byte {
+	t.Helper()
+	args, err := guestCommand(sandrunv1.GuestOs_GUEST_OS_WINDOWS, opApply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), args[0], args[1:]...)
+	cmd.Env = append(os.Environ(), guestEnvWorkspace+"="+workspace,
+		guestEnvStaleManifest+"=", guestEnvArchive+"=")
+	inputs := t.TempDir()
+	for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvLinks} {
+		path := ""
+		if data, ok := lists[key]; ok {
+			path = filepath.Join(inputs, key)
+			if err := os.WriteFile(path, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cmd.Env = append(cmd.Env, key+"="+path)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Windows apply failed: %v: %s", err, out)
+	}
+	return out
 }
 
 func TestWindowsGuestCleanup(t *testing.T) {

@@ -1267,15 +1267,10 @@ func TestInvalidWindowsPath(t *testing.T) {
 
 func TestSyncPOSIXListPaths(t *testing.T) {
 	needPOSIX(t)
-	testSyncListPaths(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
-}
-
-func testSyncListPaths(t *testing.T, guestOS sandrunv1.GuestOs) {
-	t.Helper()
 	t.Run("single deletion", func(t *testing.T) {
 		const name = "\ufeffnote.txt"
 		c, srv, org := newTestClient(t, "")
-		ds := newSession(t, c, srv, org, guestOS)
+		ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
 		dir := newRepo(t, map[string]string{name: "original"}, nil, "")
 		p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
 		if _, err := c.Sync(t.Context(), p); err != nil {
@@ -1309,7 +1304,7 @@ func testSyncListPaths(t *testing.T, guestOS sandrunv1.GuestOs) {
 				tracked[prefix+"-prune/child.txt"] = "old child"
 			}
 			c, srv, org := newTestClient(t, "")
-			ds := newSession(t, c, srv, org, guestOS)
+			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
 			dir := newRepo(t, tracked, nil, "")
 			p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
 			if _, err := c.Sync(t.Context(), p); err != nil {
