@@ -8,11 +8,17 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmacl"
 )
 
 // Windows ignores POSIX modes, so the state directory is protected with an
@@ -23,14 +29,9 @@ import (
 // NT AUTHORITY\SYSTEM and BUILTIN\Administrators, so every file and
 // directory that the agent creates later inherits them.
 //
-// Hyper-V worker processes run as virtual accounts of the group
-// NT VIRTUAL MACHINE\Virtual Machines. The runtime grants that group access
-// to each VM directory and VM file it uses with an explicit entry (see
-// hcsrt.grantVMGroup). Those entries stay: the restriction below keeps
-// explicit entries of that group. The worker reaches the files without
-// access to the protected parent directories because Windows bypasses the
-// traverse check for an account that holds SeChangeNotifyPrivilege, which
-// every account holds by default.
+// Hyper-V workers reach explicitly granted files below the protected state
+// directory through the default SeChangeNotifyPrivilege, which bypasses
+// traverse checks on the parent directories.
 
 const (
 	// fileAllAccess is FILE_ALL_ACCESS. An explicit ACE on an existing
@@ -41,21 +42,17 @@ const (
 	inheritFlags = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
 	// aceInheritMask selects the inheritance bits of ACE_HEADER.AceFlags.
 	aceInheritMask = 0x0F
-	// virtualMachinesSID is the group of the Hyper-V worker processes.
-	virtualMachinesSID = "S-1-5-83-0"
 )
 
 // principals holds the SIDs that the restriction handles.
 type principals struct {
-	system   *windows.SID
-	admins   *windows.SID
-	vmGroup  *windows.SID
-	trusted  []*windows.SID // SYSTEM and Administrators: the entries of the DACL
-	retained []*windows.SID // SIDs whose explicit ACEs may stay on a child
+	system  *windows.SID
+	admins  *windows.SID
+	vmGroup *windows.SID
+	trusted []*windows.SID // SYSTEM and Administrators: the entries of the DACL
 	// rootOwners and childOwners are the SIDs that may own the state
 	// directory and an entry below it. They add the user of an elevated
-	// administrator process to trusted and retained (see processIdentity).
-	// They never widen a DACL: only trusted and retained select ACEs.
+	// administrator process as an owner only (see processIdentity).
 	rootOwners  []*windows.SID
 	childOwners []*windows.SID
 }
@@ -111,19 +108,18 @@ func newPrincipals(user *windows.SID, elevated bool) (*principals, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve the Administrators SID: %w", err)
 	}
-	vm, err := windows.StringToSid(virtualMachinesSID)
+	vm, err := windows.StringToSid(vmacl.GroupSID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve the Virtual Machines SID: %w", err)
 	}
 	p := &principals{
-		system:   system,
-		admins:   admins,
-		vmGroup:  vm,
-		trusted:  []*windows.SID{system, admins},
-		retained: []*windows.SID{system, admins, vm},
+		system:  system,
+		admins:  admins,
+		vmGroup: vm,
+		trusted: []*windows.SID{system, admins},
 	}
 	p.rootOwners = append([]*windows.SID{}, p.trusted...)
-	p.childOwners = append([]*windows.SID{}, p.retained...)
+	p.childOwners = []*windows.SID{system, admins, vm}
 	if elevated && user != nil {
 		p.rootOwners = append(p.rootOwners, user)
 		p.childOwners = append(p.childOwners, user)
@@ -316,17 +312,20 @@ func protectRoot(dir string, p *principals) error {
 	return nil
 }
 
-// resetChildren walks the existing entries of the state directory. An entry
-// that has an untrusted owner stops the walk with an error. An entry whose
-// ACL is protected from inheritance, or holds an entry for another account
-// than SYSTEM, Administrators or the Virtual Machines group, gets a DACL
-// that keeps only its explicit entries of those three accounts and inherits
-// the rest from its parent. Explicit entries of the Virtual Machines group
-// stay because a running VM needs them.
+// resetChildren checks the owners and ACLs of existing state files.
 func resetChildren(root string, p *principals) error {
-	// An owner of a child may be the Virtual Machines group too: the group
-	// has no logon, but Hyper-V can create files for a VM in its name.
-	childOwners := p.childOwners
+	vmPrefix := strings.ToLower(filepath.Join(root, VMsDir)) + string(os.PathSeparator)
+	winImage := filepath.Join(root, ImagesDir, images.WindowsDir)
+	buildDir := images.BuildDir(winImage)
+	var buildLock *images.Lock
+	var activeBuildDisk string
+	defer func() {
+		if buildLock != nil {
+			if err := buildLock.Release(); err != nil {
+				slog.Warn("release the Windows image build lock failed", "image_dir", winImage, "error", err)
+			}
+		}
+	}()
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// An entry that disappears during the walk (a VM file that a
@@ -346,7 +345,30 @@ func resetChildren(root string, p *principals) error {
 			}
 			return nil
 		}
-		if err := resetChild(path, p, childOwners); err != nil {
+		if d.IsDir() && strings.EqualFold(path, buildDir) {
+			// The builder holds this lock from before staging until after
+			// installation. Preserve its live disk grant if it is running.
+			lockPath := images.LockPath(winImage)
+			if info, err := os.Lstat(lockPath); err == nil {
+				if !info.Mode().IsRegular() {
+					return fmt.Errorf("the Windows image build lock is not a regular file: %s", lockPath)
+				}
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			lock, err := images.TryLock(winImage)
+			switch {
+			case errors.Is(err, images.ErrLocked):
+				activeBuildDisk = filepath.Join(path, images.WindowsDisk)
+			case err != nil:
+				return fmt.Errorf("check the Windows image build lock: %w", err)
+			default:
+				buildLock = lock
+			}
+		}
+		keepWorker := strings.HasPrefix(strings.ToLower(path), vmPrefix) ||
+			strings.EqualFold(path, activeBuildDisk)
+		if err := resetChild(path, p, keepWorker); err != nil {
 			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
 				return nil
 			}
@@ -369,8 +391,26 @@ func aclFromEntries(entries []windows.EXPLICIT_ACCESS) (*windows.ACL, error) {
 	return windows.ACLFromEntries(entries, nil)
 }
 
-func resetChild(path string, p *principals, owners []*windows.SID) error {
-	if err := checkOwner(path, p, owners); err != nil {
+func (p *principals) keepACE(a aceInfo, keepWorker bool) bool {
+	if a.aceType != windows.ACCESS_ALLOWED_ACE_TYPE || a.sid == nil {
+		return false
+	}
+	if sidIn(a.sid, p.trusted) {
+		return true
+	}
+	switch vmacl.Classify(a.sid) {
+	case vmacl.Worker:
+		return keepWorker
+	case vmacl.WorkerGroup:
+		return a.flags&aceInheritMask == 0 && vmacl.ReadOnly(a.mask)
+	default:
+		return false
+	}
+}
+
+func resetChild(path string, p *principals, keepWorker bool) error {
+	// Hyper-V can create files in the name of the Virtual Machines group.
+	if err := checkOwner(path, p, p.childOwners); err != nil {
 		return err
 	}
 	aces, protected, nullDACL, release, err := readDACL(path)
@@ -380,10 +420,11 @@ func resetChild(path string, p *principals, owners []*windows.SID) error {
 	defer release()
 	dirty := protected || nullDACL
 	var keep []windows.EXPLICIT_ACCESS
+	var removedGroup bool
 	for _, a := range aces {
-		allowedSID := a.aceType == windows.ACCESS_ALLOWED_ACE_TYPE && a.sid != nil && sidIn(a.sid, p.retained)
-		if !allowedSID {
+		if !p.keepACE(a, keepWorker) {
 			dirty = true
+			removedGroup = removedGroup || vmacl.Classify(a.sid) == vmacl.WorkerGroup
 			continue
 		}
 		if !a.inherited {
@@ -408,6 +449,9 @@ func resetChild(path string, p *principals, owners []*windows.SID) error {
 		nil, nil, acl, nil)
 	if err != nil {
 		return fmt.Errorf("reset the ACL of %s: %w", path, err)
+	}
+	if removedGroup {
+		slog.Info("removed Hyper-V worker group access entry", "path", path, "sid", vmacl.GroupSID)
 	}
 	return nil
 }

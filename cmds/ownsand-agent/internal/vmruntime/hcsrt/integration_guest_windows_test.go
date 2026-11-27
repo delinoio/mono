@@ -180,6 +180,12 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 	}
 	checkDiskSize(sb.GetSandboxId())
 	checkImageMetadata(sb.GetSandboxId())
+	worker := checkSandboxDiskACL(t, filepath.Join(vmsDir, sb.GetSandboxId()), images.WindowsDisk)
+	for _, path := range []string{imageDir, filepath.Join(imageDir, images.WindowsDisk), filepath.Join(imageDir, images.MetadataFile)} {
+		if aces := vmACEs(t, path); len(aces) != 0 {
+			t.Fatalf("base image path %s grants Hyper-V workers access: %+v", path, aces)
+		}
+	}
 	out, ex := e.exec(sb.GetSandboxId(), "cmd.exe", "/c", "echo hello")
 	if !execSucceeded(ex) || out != "hello\r\n" {
 		t.Fatalf("exec output %q exited %q", out, ex)
@@ -261,6 +267,9 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 	}
 	checkDiskSize(cold.GetSandboxId())
 	checkImageMetadata(cold.GetSandboxId())
+	if got := checkSandboxDiskACL(t, filepath.Join(vmsDir, cold.GetSandboxId()), images.WindowsDisk); got == worker {
+		t.Fatalf("source and restored disk grant the same worker SID %s", got)
+	}
 	if out, _ := e.exec(cold.GetSandboxId(), "cmd.exe", "/c", `type C:\marker.txt`); out != "state\r\n" {
 		t.Fatalf("sandbox from snapshot %q", out)
 	}
