@@ -82,7 +82,7 @@ func (a *Agent) runChannel(ctx context.Context) error {
 		// up to a year, so an unknown device without a recorded removal
 		// notice keeps its data; an operator runs `ownsand-agent reset`.
 		a.logger.Error("authentication failed: the control plane does not know this device; keeping local data")
-		a.setConnected(false)
+		a.setConnected(ctx, false)
 		return err
 	}
 	if err != nil {
@@ -115,7 +115,8 @@ func (a *Agent) runChannel(ctx context.Context) error {
 		}
 		a.mu.Unlock()
 		a.dataPath.ChannelLost(c)
-		a.setConnected(false)
+		// Publish the disconnect even when cancellation closed the channel.
+		a.setConnected(context.WithoutCancel(ctx), false)
 		a.logger.Info("agent channel disconnected", "generation", c.gen)
 	}()
 
@@ -145,7 +146,7 @@ func (a *Agent) runChannel(ctx context.Context) error {
 	a.mu.Unlock()
 	c.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_StateReport{StateReport: a.Sandboxes.StateReport(seq, a.rt.Capabilities(ctx).BaseImages)}})
 	a.dataPath.ChannelOpened(c)
-	a.setConnected(true)
+	a.setConnected(ctx, true)
 	a.logger.Info("agent channel connected", "generation", c.gen)
 
 	go a.heartbeats(cctx, c, cancel)
@@ -238,7 +239,7 @@ func (a *Agent) capabilityReport(ctx context.Context) *ownsandv1.CapabilityRepor
 			HypervisorChecks:     caps.Checks,
 		},
 	}
-	a.setCapabilities(report.GetCapabilities())
+	a.setCapabilities(ctx, report.GetCapabilities())
 	return report
 }
 
