@@ -1630,20 +1630,29 @@ func TestRestartPendingCleanupRejectsVMOperations(t *testing.T) {
 	e.rt.files[running], e.rt.files[paused] = true, true
 	e.rt.deleteFails = 2
 	e.restart()
-	if _, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: running}); err == nil {
-		t.Fatal("pause accepted while the restart cleanup is pending")
+
+	checkFailedPrecondition := func(operation string, err error) {
+		t.Helper()
+		const want = ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION
+		var commandErr *CommandError
+		if !errors.As(err, &commandErr) || commandErr == nil {
+			t.Errorf("%s during pending restart cleanup: got %T (%v), want *CommandError with code %v", operation, err, err, want)
+		} else if commandErr.Code != want {
+			t.Errorf("%s during pending restart cleanup: got code %v, want %v", operation, commandErr.Code, want)
+		}
 	}
-	if _, err := e.m.Resume(ctx, &ownsandv1.ResumeSandboxCommand{SandboxId: paused}); err == nil {
-		t.Fatal("resume accepted while the restart cleanup is pending")
-	}
+
+	_, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: running})
+	checkFailedPrecondition("pause", err)
+	_, err = e.m.Resume(ctx, &ownsandv1.ResumeSandboxCommand{SandboxId: paused})
+	checkFailedPrecondition("resume", err)
 	for _, id := range []string{running, paused} {
 		snapshotID, err := uuidv7.NewString()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := e.m.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: snapshotID, SandboxId: id}); err == nil {
-			t.Fatalf("snapshot of %s accepted while the restart cleanup is pending", id)
-		}
+		_, err = e.m.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: snapshotID, SandboxId: id})
+		checkFailedPrecondition("snapshot of "+id, err)
 	}
 	if s, _ := e.m.State(running); s != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		t.Fatalf("state %v, want RUNNING", s)
