@@ -106,6 +106,8 @@ The control plane serves every public service at `https://sandrun.api.delino.io`
 
 `RunnerProfile` carries the fields of the [control plane runner profile table](servers-sandrun-api-foundation.md#runner-profiles). `source` is a `oneof` of `base_image` (`GuestOs`) and `ownsand_template_id`. `CreateRunnerProfile` sets every field. `UpdateRunnerProfile` uses a field mask and rejects a change of `workload_kind` or `agent_integration_id` with `invalid_argument`.
 
+If the selected agent integration is missing during validation or when SandRun saves the profile, `CreateRunnerProfile` returns `not_found` with `agent integration not found`. The failed request creates no profile or profile-created audit event.
+
 Use `resources` to replace all resource values. Use `resources.vcpu_count`, `resources.memory_mib` or `resources.disk_gib` to change individual values. The server keeps the current value of each omitted resource and validates the resulting profile.
 
 When the OwnSand link is `ACTIVE`, `CreateRunnerProfile` checks template sources. `UpdateRunnerProfile` checks a template source when the template ID changes or the mask includes `guest_os`. A missing or `INVALID` link skips this check. If the check fails, the RPC saves no profile changes.
