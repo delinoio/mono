@@ -5,6 +5,7 @@ package layers_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
@@ -20,6 +21,54 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/secrets"
 )
+
+func TestCreateAndUpdateAgentIntegrationValidateCursorPoolName(t *testing.T) {
+	w := newWorld(t)
+	admin := w.env.User(w.org.Admin).Integration
+	const invalidPool = `team"a`
+	assertInvalidPool := func(t *testing.T, err error) {
+		t.Helper()
+		const message = "invalid settings.cursor.pool_name: must not contain a double quote"
+		var connectErr *connect.Error
+		if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeInvalidArgument || connectErr.Message() != message {
+			t.Fatalf("got %v, want invalid_argument with %q", err, message)
+		}
+	}
+	create := func(pool string) (*connect.Response[sandrunv1.CreateAgentIntegrationResponse], error) {
+		return admin.CreateAgentIntegration(t.Context(), connect.NewRequest(&sandrunv1.CreateAgentIntegrationRequest{
+			OrganizationId: w.org.ID,
+			Vendor:         sandrunv1.AgentVendor_AGENT_VENDOR_CURSOR,
+			Name:           "cursor",
+			Settings:       &sandrunv1.CreateAgentIntegrationRequest_Cursor{Cursor: &sandrunv1.CursorSettings{PoolName: pool}},
+			Credentials: &sandrunv1.CreateAgentIntegrationRequest_CursorCredentials{
+				CursorCredentials: &sandrunv1.CursorCredentials{ServiceAccountApiKey: "test-key"},
+			},
+		}))
+	}
+
+	_, err := create(invalidPool)
+	assertInvalidPool(t, err)
+	const originalPool = "Bob’s pool"
+	created, err := create(originalPool)
+	if err != nil || created.Msg.GetIntegration().GetCursor().GetPoolName() != originalPool {
+		t.Fatalf("create with a supported pool name = %v, %v", created, err)
+	}
+	update := func(pool string) (*connect.Response[sandrunv1.UpdateAgentIntegrationResponse], error) {
+		return admin.UpdateAgentIntegration(t.Context(), connect.NewRequest(&sandrunv1.UpdateAgentIntegrationRequest{
+			OrganizationId:     w.org.ID,
+			AgentIntegrationId: created.Msg.GetIntegration().GetAgentIntegrationId(),
+			Settings:           &sandrunv1.UpdateAgentIntegrationRequest_Cursor{Cursor: &sandrunv1.CursorSettings{PoolName: pool}},
+			UpdateMask:         &fieldmaskpb.FieldMask{Paths: []string{"settings"}},
+		}))
+	}
+	_, err = update(invalidPool)
+	assertInvalidPool(t, err)
+	const updatedPool = "Bob's pool"
+	updated, err := update(updatedPool)
+	if err != nil || updated.Msg.GetIntegration().GetCursor().GetPoolName() != updatedPool {
+		t.Fatalf("update with a supported pool name = %v, %v", updated, err)
+	}
+}
 
 func TestAgentIntegrations(t *testing.T) {
 	w := newWorld(t)
