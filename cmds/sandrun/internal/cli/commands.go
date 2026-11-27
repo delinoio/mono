@@ -1291,24 +1291,32 @@ func (a *app) status(ctx context.Context, name string, args []string) error {
 func (a *app) apiKeyCreate(ctx context.Context, name string, args []string) error {
 	fs := a.newFlags(name)
 	keyName := fs.String("name", "", "key name (1 to 64 characters)")
-	expiresIn := fs.String("expires-in", "", "expiry after now, for example 30d (default: no expiry)")
+	var expiresIn stringFlag
+	fs.Var(&expiresIn, "expires-in", "positive duration, for example 30d (omit for no expiry)")
 	if _, err := a.positional(fs, args); err != nil {
 		return err
 	}
 	if *keyName == "" {
 		return usageErr("--name is required")
 	}
-	d, err := parseDuration("expires-in", *expiresIn)
-	if err != nil {
-		return err
+	var duration time.Duration
+	if expiresIn.set {
+		var err error
+		duration, err = parseDuration("expires-in", expiresIn.v)
+		if err != nil {
+			return err
+		}
+		if duration == 0 {
+			return usageErr("--expires-in: duration must be positive")
+		}
 	}
 	org, c, err := a.orgSetup()
 	if err != nil {
 		return err
 	}
 	req := &sandrunv1.CreateApiKeyRequest{OrganizationId: org, Name: *keyName}
-	if d > 0 {
-		req.ExpiresAt = timestamppb.New(time.Now().Add(d))
+	if expiresIn.set {
+		req.ExpiresAt = timestamppb.New(time.Now().Add(duration))
 	}
 	res, err := c.APIKeys().CreateApiKey(ctx, connect.NewRequest(req))
 	if err != nil {
