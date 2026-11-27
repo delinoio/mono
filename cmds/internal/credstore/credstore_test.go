@@ -17,6 +17,9 @@ func TestSaveLoadDelete(t *testing.T) {
 	if _, err := s.Load(); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
+	if _, err := os.Stat(s.Dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("load left a configuration directory: %v", err)
+	}
 	want := &Credentials{LogtoEndpoint: "https://auth.example", AppID: "app", RefreshToken: "r", AccessToken: "a", AccessTokenExpiry: time.Unix(1700000000, 0).UTC()}
 	if err := s.Save(want); err != nil {
 		t.Fatal(err)

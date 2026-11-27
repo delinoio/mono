@@ -497,7 +497,7 @@ func reset(cfg config.Config, yes bool, stdout, stderr io.Writer) int {
 	if err := store.ResetDir(cfg.StateDir); err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		if errors.Is(err, store.ErrEnrollmentBusy) {
-			fmt.Fprintln(stderr, "ownsand-agent: run reset again after enrollment or the other reset ends")
+			fmt.Fprintln(stderr, "ownsand-agent: run reset again after enrollment, image builds or other cleanup ends")
 		}
 		return exitError
 	}

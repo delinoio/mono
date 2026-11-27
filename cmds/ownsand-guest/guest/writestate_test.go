@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -88,14 +89,19 @@ func startPartialWrite(t *testing.T, h *harness) (target string, req *ownsandv1.
 	t.Helper()
 	target = filepath.Join(t.TempDir(), "f")
 	releaseOnCleanup(t, h)
+	return target, writePartialTo(t, h, target)
+}
+
+func writePartialTo(t *testing.T, h *harness, target string) *ownsandv1.WriteFileRequest {
+	t.Helper()
 	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	req = &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("partial")}
+	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("partial")}
 	if _, errd := h.write(req); errd != nil {
 		t.Fatal(errd)
 	}
-	return target, req
+	return req
 }
 
 func TestWriteRecoveryExpiresStagingFileAfterRestart(t *testing.T) {
@@ -149,6 +155,83 @@ func TestWriteRecoveryExpiresStagingFileAfterRestart(t *testing.T) {
 	h2.srv.writes.mu.Unlock()
 	if left != 0 {
 		t.Fatalf("write state left after the expired memory: %d", left)
+	}
+}
+
+func TestWriteExpiryOfLongStagingPath(t *testing.T) {
+	testWriteExpiryOfLongStagingPath(t, func(path string) string { return path })
+}
+
+func testWriteExpiryOfLongStagingPath(t *testing.T, requestPath func(string) string) {
+	t.Helper()
+	for _, tc := range []struct {
+		name    string
+		restart bool
+		replace bool
+	}{
+		{name: "live"},
+		{name: "recovered", restart: true},
+		{name: "recovered replacement", restart: true, replace: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			part := strings.Repeat("d", 90)
+			dir := requestPath(filepath.Join(t.TempDir(), part, part, part))
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			releaseOnCleanup(t, h)
+			target := filepath.Join(dir, "out.txt")
+			if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			id := newID(t)
+			staging := tempPath(target, id)
+			if units := len(utf16.Encode([]rune(staging))); units <= 260 {
+				t.Fatalf("staging path is only %d UTF-16 code units", units)
+			}
+			req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: id, Path: target, BindingSalt: make([]byte, 32), Data: []byte("partial")}
+			if _, errd := h.write(req); errd != nil {
+				t.Fatal(errd)
+			}
+			if _, err := os.Stat(staging); err != nil {
+				t.Fatalf("staging after the first chunk: %v", err)
+			}
+			recordPath := filepath.Join(h.srv.cfg.StateDir, "writes", writeRecordName(id))
+			if rec, err := readWriteRecord(recordPath); err != nil || rec.TmpPath != staging {
+				t.Fatalf("record staging path %q, error %v", rec.TmpPath, err)
+			}
+
+			if tc.restart {
+				h = restart(t, h, nil)
+				assertWriteLostAfterRestart(t, h, req)
+			}
+			if tc.replace {
+				// Keep the original file so the replacement gets a different identity.
+				if err := os.Rename(staging, staging+".held"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(staging, []byte("replacement"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			h.clock.Advance(16 * time.Minute)
+			h.srv.Sweep()
+			if tc.replace {
+				if got, err := os.ReadFile(staging); err != nil || string(got) != "replacement" {
+					t.Fatalf("replacement after expiry: %q, error %v", got, err)
+				}
+			} else if _, err := os.Lstat(staging); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("staging path should be absent after expiry, stat error: %v", err)
+			}
+			if got := recordFiles(t, h); len(got) != 0 {
+				t.Fatalf("records after expiry: %v", got)
+			}
+			if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
+				t.Fatalf("target after expiry: %q, error %v", got, err)
+			}
+		})
 	}
 }
 

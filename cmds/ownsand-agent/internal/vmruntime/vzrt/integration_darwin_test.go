@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -247,15 +248,28 @@ func (e *env) create(snapshotID string, memMiB int64, network ownsandv1.NetworkM
 
 func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExited) {
 	e.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), integrationExecTimeout)
+	defer cancel()
+	out, exited, err := e.execContext(ctx, sandboxID, cmd...)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return out, exited
+}
+
+func (e *env) execContext(ctx context.Context, sandboxID string, cmd ...string) (string, *ownsandv1.ExecExited, error) {
 	id, _ := uuidv7.NewString()
 	salt := make([]byte, 32)
 	rand.Read(salt)
 	s := &sink{}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	e.d.Handle(ctx, ops.Request{Frame: datapath.MustNewFrame(1, sandboxID, &ownsandv1.ExecRequest{
+	req := ops.Request{Frame: datapath.MustNewFrame(1, sandboxID, &ownsandv1.ExecRequest{
 		OrganizationId: orgID, SandboxId: sandboxID, ExecId: id, Command: cmd, BindingSalt: salt,
-	}), SandboxID: sandboxID}, s)
+	}), SandboxID: sandboxID}
+	// Check the deadline at dispatch in case the context timer has not fired yet.
+	if deadline, ok := ctx.Deadline(); ctx.Err() != nil || (ok && !time.Now().Before(deadline)) {
+		return "", nil, nil
+	}
+	result := e.d.Handle(ctx, req, s)
 	var out strings.Builder
 	var exited *ownsandv1.ExecExited
 	for _, f := range s.frames {
@@ -264,16 +278,11 @@ func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExit
 		if ex := f.GetExecEvent().GetExited(); ex != nil {
 			exited = ex
 		}
-		if f.GetError() != nil {
-			e.t.Fatalf("exec error %v", f.GetError())
-		}
 	}
-	return out.String(), exited
-}
-
-func execSucceeded(exited *ownsandv1.ExecExited) bool {
-	code, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
-	return ok && code != nil && code.ExitCode == 0
+	if result.Error != nil {
+		return out.String(), exited, fmt.Errorf("exec error %v", result.Error)
+	}
+	return out.String(), exited, nil
 }
 
 // waitFor polls cond until it holds or 30 seconds passed.

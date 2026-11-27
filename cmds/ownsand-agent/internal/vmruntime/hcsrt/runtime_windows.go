@@ -26,6 +26,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netstack"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmacl"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -331,6 +332,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		copyFile:     copyFile,
 		makeFixedVHD: makeFixedVHD,
 		growVHDX:     growVHDX,
+		grantVM:      grantVM,
 		createSystem: createSystem,
 	})
 }
@@ -341,6 +343,7 @@ type vmCreateOps struct {
 	copyFile     func(context.Context, string, string) error
 	makeFixedVHD func(string, int64, bool) (int64, error)
 	growVHDX     func(string, int64) (int64, error)
+	grantVM      func(string, string) error
 	createSystem func(string, any) (*system, error)
 }
 
@@ -374,7 +377,7 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 			return err
 		}
 		dirReady = true
-		return grantVMGroup(spec.Dir, accessReadWrite, true)
+		return vmacl.RemoveWorkers(spec.Dir)
 	}
 	var (
 		vs   vmSpec
@@ -390,6 +393,15 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 		if dirReady {
 			cleanup()
 		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		cleanup()
+		return nil, err
+	}
+	id := systemID(v.id)
+	if err := ops.grantVM(id, vs.Disk); err != nil {
+		cleanup()
 		return nil, err
 	}
 	vs.ConsolePipe = consolePipe(v.id)
@@ -408,7 +420,7 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 		cleanup()
 		return nil, err
 	}
-	sys, err := ops.createSystem(systemID(v.id), newComputeSystemDoc(vs))
+	sys, err := ops.createSystem(id, newComputeSystemDoc(vs))
 	if err != nil {
 		cleanup()
 		return nil, err
@@ -472,7 +484,7 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 // prepareLinuxDisk makes the fixed VHD of a Linux guest from the root file
 // system or a snapshot disk.
 func (r *Runtime) prepareLinuxDisk(ctx context.Context, spec vmruntime.Spec, ops vmCreateOps) (vmSpec, int64, error) {
-	if err := grantVMGroup(r.opts.Kernel, accessRead, false); err != nil {
+	if err := grantKernelRead(r.opts.Kernel); err != nil {
 		return vmSpec{}, 0, err
 	}
 	src, hasFooter := r.opts.Rootfs, false
@@ -499,9 +511,6 @@ func (r *Runtime) prepareLinuxDisk(ctx context.Context, spec vmruntime.Spec, ops
 	}
 	if err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
-	}
-	if err := grantVMGroup(disk, accessReadWrite, false); err != nil {
-		return vmSpec{}, 0, err
 	}
 	vs := vmSpec{Kernel: r.opts.Kernel, Disk: disk}
 	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {

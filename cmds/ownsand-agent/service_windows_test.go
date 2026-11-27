@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,6 +21,28 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/service"
 )
+
+func checkServiceEnvironment(definition, name, want string) error {
+	for line := range strings.SplitSeq(definition, "\n") {
+		if !strings.HasPrefix(line, "reg.exe add ") {
+			continue
+		}
+		args, err := windows.DecomposeCommandLine(line)
+		if err != nil {
+			return fmt.Errorf("decode service registry command: %w", err)
+		}
+		if len(args) != 12 || args[3] != "/v" || args[4] != service.WindowsEnvironmentValue ||
+			args[5] != "/t" || args[6] != "REG_MULTI_SZ" || args[9] != "/d" {
+			return fmt.Errorf("unexpected service registry command: %q", line)
+		}
+		// The CLI fixture sets only the variable under test, so /d has one entry.
+		if expected := name + "=" + want; args[10] != expected {
+			return fmt.Errorf("service registry environment = %q, want %q", args[10], expected)
+		}
+		return nil
+	}
+	return errors.New("missing service registry environment command")
+}
 
 func TestServiceMigrationPreservesRunArguments(t *testing.T) {
 	launcher := `C:\Program Files\OwnSand Agent\ownsand-service.exe`
@@ -213,7 +236,7 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 				t.Fatal(err)
 			}
 			log := string(data)
-			if strings.Count(log, `"msg":"invalid configuration"`) != 1 || !strings.Contains(log, wantSetting) || strings.Contains(log, rawLevel) {
+			if strings.Count(log, `"msg":"invalid configuration"`) != 1 || !strings.Contains(log, wantSetting) || strings.Contains(log, rawPath) || strings.Contains(log, rawLevel) {
 				t.Fatalf("unexpected log contents: %s", log)
 			}
 		})
