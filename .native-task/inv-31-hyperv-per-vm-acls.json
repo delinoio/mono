@@ -1,0 +1,62 @@
+{
+  "gid": "inv-31-hyperv-per-vm-acls",
+  "commit": "71334ea61b3ae1f321a4dfbe8940fd37055977af",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows amd64",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "71334ea61b3ae1f321a4dfbe8940fd37055977af",
+    "setup": "Use PowerShell at the root of a short checkout at the worker SHA. Use an NTFS volume and the normal validation account for commands. Use Git or transfer the individual script and binaries directly. These commands require no service control or symlink privilege.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne '71334ea61b3ae1f321a4dfbe8940fd37055977af') { throw 'Unexpected validation revision' }",
+      "New-Item -ItemType Directory -Force '.t3-tmp/hv-acl' | Out-Null",
+      "$validationDir = (Resolve-Path '.t3-tmp/hv-acl').Path; $env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir",
+      "go test -count=1 -v -run '^(TestStripVMGroupWrite|TestRemoveWorkersClearsInheritedEntries|TestVMWorkerACERetention|TestWindowsBaseImageGeneration.*|TestFailedCreateReleasesWatcherAndKeepsUnconfirmedVM|TestDiskPreparationCancellation)$' ./cmds/ownsand-agent/internal/vmacl ./cmds/ownsand-agent/internal/store ./cmds/ownsand-agent/internal/vmruntime/hcsrt 2>&1 | Tee-Object -FilePath (Join-Path $validationDir 'windows-acl-fixtures.log'); if ($LASTEXITCODE -ne 0) { throw 'Native ACL fixture failed' }"
+    ],
+    "requiresElevation": [
+      "Opening the agent store under the real Windows ownership policy and migrating legacy state through agent startup.",
+      "Creating, pausing and deleting actual HCS compute systems and building a Windows image from an ISO."
+    ],
+    "elevatedSetup": "Use an elevated terminal on a disposable Hyper-V host with no existing OwnSand service, sandboxes or image build running. Supply paths to the amd64 vmlinux, rootfs.ext4 and a supported Windows x64 ISO in OWNSAND_VALIDATION_LINUX_KERNEL, OWNSAND_VALIDATION_LINUX_ROOTFS and OWNSAND_VALIDATION_WINDOWS_ISO. Set OWNSAND_VALIDATION_WINDOWS_EDITION to the ISO edition index or name. Copy the probe to files.copyTo in the validation checkout.",
+    "elevatedCommands": [
+      "New-Item -ItemType Directory -Force '.t3-tmp/hv-acl' | Out-Null",
+      "$probe = (Resolve-Path '.t3-tmp/hv-acl/validate-hyperv-acl.ps1').Path; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe).Hash.ToLowerInvariant() -ne 'a893a5e45a64e196b1410d1cf9d8a84cdcef8e16c68c2e0f4d7ce49d4982544e') { throw 'Unexpected validation probe checksum' }",
+      "& $probe -ExpectedRevision '71334ea61b3ae1f321a4dfbe8940fd37055977af' -LinuxKernel $env:OWNSAND_VALIDATION_LINUX_KERNEL -LinuxRootfs $env:OWNSAND_VALIDATION_LINUX_ROOTFS -WindowsISO $env:OWNSAND_VALIDATION_WINDOWS_ISO -Edition $env:OWNSAND_VALIDATION_WINDOWS_EDITION"
+    ],
+    "expectedResults": [
+      "Non-elevated fixtures PASS. Writable group allow entries disappear, read and execute allows and write denies remain, inherited worker entries disappear only from the target disk, and no compute system is needed.",
+      "The disposable legacy startup returns code 3 because it has no enrollment, after removing the inherited worker-group grant from the legacy base image and disk. The elevated store tests also PASS, retaining each sandbox and live build disk grant, retaining the kernel read-only grant and removing expired staging entries.",
+      "The ISO build returns 0. The published images/windows directory, disk.vhdx and image.json have no S-1-5-83-* ACE before any sandbox uses the image.",
+      "Both Hyper-V guests boot, run commands, pause and resume, snapshot, boot from the snapshot and delete. Each private disk has one explicit per-VM write grant, the two VM identities differ, the VM directory has no worker ACE and the shared Linux kernel has only the group read/execute entry. The blank-VHD duplicate-ID test also passes."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-hyperv-per-vm-acls/worker/.t3-tmp/validate-hyperv-acl.ps1",
+      "copyTo": ".t3-tmp/hv-acl/validate-hyperv-acl.ps1",
+      "sha256": "a893a5e45a64e196b1410d1cf9d8a84cdcef8e16c68c2e0f4d7ce49d4982544e",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/vmacl/acl_windows_test.go",
+        "cmds/ownsand-agent/internal/store/store_windows_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/integration_acl_windows_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/integration_windows_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/integration_guest_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/hv-acl/windows-acl-fixtures.log",
+        ".t3-tmp/hv-<id>/legacy-startup.log",
+        ".t3-tmp/hv-<id>/store-acl.log",
+        ".t3-tmp/hv-<id>/image-build.log",
+        ".t3-tmp/hv-<id>/hyperv-lifecycle.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-hyperv-per-vm-acls/worker/.t3-tmp/vmacl.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-hyperv-per-vm-acls/worker/.t3-tmp/store.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-hyperv-per-vm-acls/worker/.t3-tmp/hcsrt.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-hyperv-per-vm-acls/worker/.t3-tmp/imagebuild.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-hyperv-per-vm-acls/worker/.t3-tmp/images.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-hyperv-per-vm-acls/worker/.t3-tmp/ownsand-agent-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-hyperv-per-vm-acls/worker/.t3-tmp/ownsand-agent-arm64.exe"
+      ]
+    }
+  }
+}
