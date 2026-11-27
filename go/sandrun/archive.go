@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // writeSyncArchive writes the files to w as one tar archive (PAX format,
@@ -50,7 +51,13 @@ func writeSyncArchive(ctx context.Context, w io.Writer, root *os.Root, files []l
 			}
 		}
 		if f.entry.Mode == modeSymlink {
-			if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeSymlink, Name: f.rel, Linkname: f.target, Mode: 0o777, ModTime: now, Format: tar.FormatPAX}); err != nil {
+			header := &tar.Header{Typeflag: tar.TypeSymlink, Name: f.rel, Linkname: f.target, Mode: 0o777, ModTime: now, Format: tar.FormatPAX}
+			if !utf8.ValidString(f.target) {
+				// PAX defaults to UTF-8. Mark raw link targets so bsdtar
+				// copies their bytes without converting them to its locale.
+				header.PAXRecords = map[string]string{"hdrcharset": "BINARY"}
+			}
+			if err := tw.WriteHeader(header); err != nil {
 				return err
 			}
 			continue

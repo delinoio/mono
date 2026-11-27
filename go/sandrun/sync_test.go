@@ -3154,6 +3154,36 @@ func TestSyncArchiveRejectsLinkedPaths(t *testing.T) {
 	}
 }
 
+func TestSyncArchiveLinkTargetCharset(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		target  string
+		charset string
+	}{
+		{name: "valid UTF-8", target: "dest-\uFFFD"},
+		{name: "invalid UTF-8", target: "dest-\xff", charset: "BINARY"},
+		{name: "long invalid UTF-8", target: strings.Repeat("a", 100) + "\xff", charset: "BINARY"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := []localFile{{rel: "link", target: tc.target, entry: manifestEntry{Mode: modeSymlink}}}
+			var b bytes.Buffer
+			if err := writeSyncArchive(t.Context(), &b, nil, files, false); err != nil {
+				t.Fatal(err)
+			}
+			header, err := tar.NewReader(&b).Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if header.Typeflag != tar.TypeSymlink || header.Linkname != tc.target {
+				t.Fatalf("tar entry type = %q, link target = %x, want symlink with target %x", header.Typeflag, header.Linkname, tc.target)
+			}
+			if got := header.PAXRecords["hdrcharset"]; got != tc.charset {
+				t.Errorf("PAX hdrcharset = %q, want %q", got, tc.charset)
+			}
+		})
+	}
+}
+
 // tarOf builds an archive from headers; regular entries get body content.
 func tarOf(t *testing.T, entries ...*tar.Header) *bytes.Reader {
 	t.Helper()
