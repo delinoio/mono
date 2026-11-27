@@ -387,7 +387,7 @@ func (s *Store) SaveSnapshot(id string, v any) error {
 	return s.writeSnapshotRecord(id, snapshotRecord, v)
 }
 
-// StageSnapshot saves a capture record under a name that LoadSnapshots ignores.
+// StageSnapshot saves a snapshot record under a name that LoadSnapshots ignores.
 func (s *Store) StageSnapshot(id string, v any) error {
 	return s.writeSnapshotRecord(id, stagedSnapshot, v)
 }
@@ -403,8 +403,8 @@ func (s *Store) writeSnapshotRecord(id, name string, v any) error {
 	return s.writeJSON(filepath.Join(dir, name), v)
 }
 
-// PublishSnapshot installs the staged capture record under the loader's name.
-// The caller serializes publication with the decision to discard the capture.
+// PublishSnapshot installs the staged snapshot record under the loader's name.
+// The caller serializes publication with the decision to discard the snapshot.
 func (s *Store) PublishSnapshot(id string) error {
 	dir, err := s.SnapshotDir(id)
 	if err != nil {
