@@ -29,11 +29,8 @@ func TestResetDeletesStateWhileServiceLogIsOpen(t *testing.T) {
 	if _, err := f.WriteString("{\"msg\":\"first\"}\n"); err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.Reset(); err != nil {
+	// ResetDir can use a temporary directory owned by a standard Windows user.
+	if err := store.ResetDir(dir); err != nil {
 		t.Fatalf("Reset with the log open: %v", err)
 	}
 	// The open handle can still write after the delete.
