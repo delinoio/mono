@@ -11,7 +11,7 @@ import {
   AuditService,
   AuditTargetKind,
 } from "@delino/sandrun-protos/v1/audit_pb";
-import { AgentVendor } from "@delino/sandrun-protos/v1/common_pb";
+import { AgentVendor, ApiKeyState } from "@delino/sandrun-protos/v1/common_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
 import { WorkService } from "@delino/sandrun-protos/v1/work_pb";
 import { expect, rs, test } from "@rstest/core";
@@ -21,6 +21,72 @@ const invalidInstallationState = {
   code: Code.FailedPrecondition,
   rawMessage: "the installation state is not valid or has expired",
 };
+
+test("listing personal API keys reports expiry at the current time", async () => {
+  const issuedAt = Date.UTC(2026, 0, 1);
+  const expiresAt = timestampFromMs(issuedAt + 2_250);
+  const clock = rs.spyOn(Date, "now").mockReturnValue(issuedAt);
+  try {
+    const apiKeys = createClient(ApiKeyService, createMockTransport());
+    const organizationId = MOCK_IDS.acme;
+    const { apiKey: expiring } = await apiKeys.createApiKey({
+      organizationId,
+      name: "expiring",
+      expiresAt,
+    });
+    const { apiKey: permanent } = await apiKeys.createApiKey({
+      organizationId,
+      name: "permanent",
+    });
+    const { apiKey: revocable } = await apiKeys.createApiKey({
+      organizationId,
+      name: "revocable",
+      expiresAt,
+    });
+    if (!revocable) throw new Error("Expected a key to revoke");
+    const { apiKey: revoked } = await apiKeys.revokeApiKey({
+      organizationId,
+      apiKeyId: revocable.apiKeyId,
+    });
+
+    const firstPage = await apiKeys.listApiKeys({
+      organizationId,
+      pageSize: 1,
+    });
+    expect(firstPage.apiKeys.map((key) => key.apiKeyId)).toEqual([
+      MOCK_IDS.apiKey,
+    ]);
+    expect(firstPage.nextPageToken).toBe("1");
+
+    for (const [offsetMs, state] of [
+      [-1, ApiKeyState.ACTIVE],
+      [0, ApiKeyState.EXPIRED],
+      [1, ApiKeyState.EXPIRED],
+    ] as const) {
+      clock.mockReturnValue(timestampMs(expiresAt) + offsetMs);
+      const page = await apiKeys.listApiKeys({
+        organizationId,
+        pageToken: firstPage.nextPageToken,
+        pageSize: 1,
+      });
+      expect(page.apiKeys).toEqual([{ ...expiring, expiresAt, state }]);
+      expect(page.nextPageToken).toBe("2");
+    }
+
+    const lastPage = await apiKeys.listApiKeys({
+      organizationId,
+      pageToken: "2",
+      pageSize: 2,
+    });
+    expect(lastPage.apiKeys).toEqual([
+      { ...permanent, state: ApiKeyState.ACTIVE },
+      { ...revoked, expiresAt, state: ApiKeyState.REVOKED },
+    ]);
+    expect(lastPage.nextPageToken).toBe("");
+  } finally {
+    clock.mockRestore();
+  }
+});
 
 const apiKeyClock = Date.UTC(2026, 0, 1) + 250;
 const apiKeyClockTimestamp = timestampFromMs(apiKeyClock);

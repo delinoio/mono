@@ -1989,8 +1989,17 @@ export function createMockTransport(
           org.apiKeys.filter((k) => k.userId === userId),
           req,
         );
+        const listedAt = ts();
         return {
-          apiKeys: p.items.map(({ userId: _u, ...k }) => k),
+          apiKeys: p.items.map(({ userId: _u, ...key }) => {
+            if (key.state !== ApiKeyState.REVOKED) {
+              const expired =
+                key.expiresAt !== undefined &&
+                compareTimestamps(key.expiresAt, listedAt) <= 0;
+              key.state = expired ? ApiKeyState.EXPIRED : ApiKeyState.ACTIVE;
+            }
+            return key;
+          }),
           nextPageToken: p.nextPageToken,
         };
       },
