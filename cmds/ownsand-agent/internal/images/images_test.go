@@ -146,6 +146,44 @@ func TestCompleteNeedsTheFilesOfTheGuestOS(t *testing.T) {
 	}
 }
 
+func TestMacOSImageRecoveryRejectsLinkedStorage(t *testing.T) {
+	for _, name := range []string{images.MacOSDisk, images.MacOSAuxStorage} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, images.MacOSDir)
+			writeImage(t, dir, "current")
+			file := filepath.Join(dir, name)
+			target := filepath.Join(root, "target")
+			if err := os.Rename(file, target); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, file); err != nil {
+				t.Skipf("cannot create a symlink on this system: %v", err)
+			}
+			if images.Complete(dir) {
+				t.Fatalf("image with linked %s is complete", name)
+			}
+			if res, err := images.Recover(dir); err != nil || res != images.RecoverNoBackup {
+				t.Fatalf("Recover without backup = %v, %v", res, err)
+			}
+
+			writeImage(t, images.OldDir(dir), "backup")
+			if res, err := images.Recover(dir); err != nil || res != images.RecoverRestored {
+				t.Fatalf("Recover with backup = %v, %v", res, err)
+			}
+			if got := diskOf(t, dir); got != "backup" || !images.Complete(dir) || exists(images.OldDir(dir)) {
+				t.Fatalf("backup was not installed as a complete image: disk marker %q", got)
+			}
+			if got, err := os.Readlink(filepath.Join(dir+".invalid", name)); err != nil || got != target {
+				t.Fatalf("moved invalid image link = %q, %v, want %q", got, err, target)
+			}
+			if got, err := os.ReadFile(target); err != nil || string(got) != "current" {
+				t.Fatalf("linked target = %q, %v, want unchanged contents", got, err)
+			}
+		})
+	}
+}
+
 // Layout 1: the process ended between the two renames of Install, so dir is
 // missing, the previous image is in dir.old and the new one is still in
 // dir.build.
