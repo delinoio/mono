@@ -75,6 +75,7 @@ This contract owns the SandRun command-line interface, component `sandrun-cli`, 
 - Standard output carries only MCP messages. Logs go to standard error.
 - Dev sessions do not depend on the server process. When it exits, its dev sessions stay until they are deleted or their TTL ends; `list_sessions` finds them again.
 - Tool waits: a tool call waits at most 50 seconds. OpenAI Codex stops an MCP tool call after 60 seconds by default (`tool_timeout_sec`), so 50 seconds leaves time for the response. The `wait_seconds` arguments accept 0 to 50, with a default of 50.
+- `transfer_status` validates the wait and polls known transfers in the current process. The process keeps all active transfers and the 64 most recent outcomes across sync and download, including failures, in completion order. Repeated polls return the same terminal outcome while the ID is retained. A call that already found a transfer can return its outcome even after the process evicts the ID. For an unknown or evicted ID, the tool checks local credentials. It returns sign-in guidance when credentials are missing or `not_found` with the retention limit when it has a client. This check makes no API request or token refresh.
 - `transfer_status` validates the wait and polls known transfers in the current process. For an unknown transfer ID, it checks local credential configuration and returns sign-in guidance when credentials are missing or `not_found` when it has a client. This check makes no API request or token refresh.
 - When a transfer tool call times out or the client cancels the call, the transfer continues and remains queryable by ID. The first Ctrl-C cancels active transfers and releases their tool waits so the server can close gracefully, even while the client keeps standard input open. Client disconnect also cancels active transfers.
 - Each call to `list_profiles`, `create_session`, `list_sessions`, `get_session` or `delete_session` uses one deadline for client setup and all RPCs. This includes each page of a list and the profile lookup before session creation. An earlier caller deadline or cancellation also stops the call.
@@ -104,7 +105,7 @@ This contract owns the SandRun command-line interface, component `sandrun-cli`, 
 
 ## Storage
 
-Only the stored Logto tokens and the selected organization in the user configuration directory. The MCP server keeps transfer progress only in memory. Sync state lives in the guest manifest, not on the local machine.
+Only the stored Logto tokens and the selected organization in the user configuration directory. The MCP server keeps transfer progress and recent outcomes only in memory. Sync state lives in the guest manifest, not on the local machine.
 
 ## Security
 
