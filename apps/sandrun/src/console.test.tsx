@@ -3172,26 +3172,77 @@ describe("overview", () => {
   });
 
   test("reconnects when the WatchQueue stream ends", async () => {
-    const mock = createMockTransport({ watchQueueEndsAfterMs: 20 });
+    let endFirstStream!: () => void;
+    const firstStreamEnd = new Promise<void>((resolve) => {
+      endFirstStream = resolve;
+    });
     let streams = 0;
+    const queue = createRouterTransport((router) => {
+      router.service(WorkService, {
+        async *watchQueue(
+          _request,
+          { signal },
+        ): AsyncGenerator<MessageInitShape<typeof WatchQueueResponseSchema>> {
+          const first = ++streams === 1;
+          yield {
+            event: {
+              case: "request",
+              value: {
+                requestId: first ? "first-queue" : "second-queue",
+                state: RequestState.QUEUED,
+              },
+            },
+          };
+          yield { event: { case: "snapshotComplete", value: {} } };
+          if (first) {
+            await firstStreamEnd;
+            return;
+          }
+          // Keep the replacement stream open until the console unmounts.
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) => {
+              signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+          }
+        },
+      });
+    });
+    const mock = createMockTransport();
     const transport: Transport = {
       ...mock,
-      stream: (method, ...rest) => {
-        if (method.name === "WatchQueue") streams += 1;
-        return mock.stream(method, ...rest);
-      },
+      stream: (method, ...rest) =>
+        (method.name === "WatchQueue" ? queue : mock).stream(method, ...rest),
     };
     renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
-    await screen.findByRole("table", { name: "Waiting requests" });
-    // The SDK waits 1 second before it reconnects.
-    await settle(1300);
-    expect(streams).toBeGreaterThanOrEqual(2);
-    expect(
-      screen.getByRole("status", { name: "Queue updates" }).textContent,
-    ).toBe("Live");
-    expect(
-      screen.getByRole("table", { name: "Waiting requests" }),
-    ).toBeTruthy();
+
+    try {
+      const table = await screen.findByRole("table", {
+        name: "Waiting requests",
+      });
+      expect(
+        within(table).getByRole("cell", { name: "first-queue" }),
+      ).toBeTruthy();
+      expect(streams).toBe(1);
+    } finally {
+      endFirstStream();
+    }
+
+    await waitFor(
+      () => {
+        const table = screen.getByRole("table", { name: "Waiting requests" });
+        expect(
+          within(table).getByRole("cell", { name: "second-queue" }),
+        ).toBeTruthy();
+        expect(
+          within(table).queryByRole("cell", { name: "first-queue" }),
+        ).toBeNull();
+        expect(
+          screen.getByRole("status", { name: "Queue updates" }).textContent,
+        ).toBe("Live");
+        expect(streams).toBe(2);
+      },
+      { timeout: 3000 },
+    );
   });
 
   test.each([false, true])(
