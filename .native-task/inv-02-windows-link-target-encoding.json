@@ -1,0 +1,44 @@
+{
+  "gid": "inv-02-windows-link-target-encoding",
+  "commit": "0d9100d852cf8719f62e3f89e312e57d33cc171d",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "0d9100d852cf8719f62e3f89e312e57d33cc171d",
+    "setup": "Run in PowerShell from the checkout root with Go, Git, cmd.exe and Windows PowerShell available. Record the checkout SHA. After creating the validation directory, copy the probe source using files.copyFrom and files.copyTo.",
+    "commands": [
+      "git rev-parse HEAD",
+      "New-Item -ItemType Directory -Force '.t3-tmp/validation' | Out-Null",
+      "$fixtureTemp = (Resolve-Path '.t3-tmp').Path",
+      "$env:TEMP = $fixtureTemp; $env:TMP = $fixtureTemp; $env:GOTMPDIR = $fixtureTemp",
+      "go test -count=1 -v ./go/sandrun -run '^TestSync(RejectsGitSymlinkPlaceholder(LineBreak|InvalidUTF8)OnWindows|GitSymlinkPlaceholderReplacementRuneOnWindows)$' 2>&1 | Tee-Object '.t3-tmp/validation/windows-link-tests.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go test -count=1 ./go/sandrun/... 2>&1 | Tee-Object '.t3-tmp/validation/windows-sandrun-tests.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go build -o '.t3-tmp/validation/sandrun.exe' ./cmds/sandrun 2>&1 | Tee-Object '.t3-tmp/validation/windows-cli-build.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go run '.t3-tmp/validation/sync-link-probe.go' '.t3-tmp/validation/sandrun.exe' 2>&1 | Tee-Object '.t3-tmp/validation/windows-real-world.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "The worker checkout reports 0d9100d852cf8719f62e3f89e312e57d33cc171d. If validating after integration, record the actual checkout SHA.",
+      "The focused and package tests pass. A Windows link target with a line break returns failed_precondition. Both malformed UTF-8 fixture cases report the link path without printing the target and make zero guest exec or write RPCs.",
+      "The CLI probe exits 0. It confirms that the workspace and missing or matching manifest stay intact after rejection. For valid U+FFFD, the Windows PowerShell fixture reaches apply and the staged link list is exactly 6c696e6b09646573742defbfbd0a.",
+      "The staged-list assertion can pass on a Windows fixture that lacks permission to create symlinks. Actual link creation is a separate outcome."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-windows-link-target-encoding/worker/.t3-tmp/validation/sync-link-probe.go",
+      "copyTo": ".t3-tmp/validation/sync-link-probe.go",
+      "regressionTest": "go/sandrun/sync_test.go",
+      "outputLogs": [
+        ".t3-tmp/validation/windows-link-tests.log",
+        ".t3-tmp/validation/windows-sandrun-tests.log",
+        ".t3-tmp/validation/windows-cli-build.log",
+        ".t3-tmp/validation/windows-real-world.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-windows-link-target-encoding/worker/.t3-tmp/validation/sandrun.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-windows-link-target-encoding/worker/.t3-tmp/validation/sandrun.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-windows-link-target-encoding/worker/.t3-tmp/validation/sync-link-probe.exe"
+      ]
+    }
+  }
+}
