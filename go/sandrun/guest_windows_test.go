@@ -5,7 +5,9 @@ package sandrun
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -40,6 +42,117 @@ func requireRemoved(t *testing.T, path string) {
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("%s should be removed, stat returned %v", path, err)
 	}
+}
+
+func TestWindowsGuestSyncRelativeLinks(t *testing.T) {
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+	dir := newRepo(t, map[string]string{"src/main.txt": "payload"}, nil, "")
+	git(t, dir, "config", "core.symlinks", "true")
+	if err := os.Mkdir(filepath.Join(dir, "links"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	links := []struct{ path, target string }{
+		{"links/main.txt", `..\src\main.txt`},
+		{"links/src", `..\src`},
+		{"links/missing", `..\missing.txt`},
+		{"links/absolute", filepath.Join(ds.GetWorkspacePath(), "src", "main.txt")},
+	}
+	for _, link := range links {
+		if err := os.Symlink(link.target, filepath.Join(dir, link.path)); errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
+			t.Skip("Windows account cannot create symbolic links")
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	git(t, dir, "add", "--", "links")
+	git(t, dir, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "links")
+
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	res, err := c.Sync(t.Context(), params)
+	if err != nil || res.Uploaded != len(links)+1 || len(res.Warnings) != 0 {
+		t.Fatalf("first sync = %+v, %v", res, err)
+	}
+	m := guestManifest(t, ds)
+	if m.Version != 1 || len(m.Files) != len(links)+1 {
+		t.Fatalf("manifest = %+v", m)
+	}
+	for _, link := range links {
+		sourceTarget, err := os.Readlink(filepath.Join(dir, link.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target, err := os.Readlink(filepath.Join(ds.GetWorkspacePath(), link.path)); err != nil || target != link.target {
+			t.Errorf("%s target = %q, %v, want %q", link.path, target, err, link.target)
+		}
+		want := manifestEntry{Size: int64(len(sourceTarget)), SHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(sourceTarget))), Mode: modeSymlink}
+		if got := m.Files[link.path]; got != want {
+			t.Errorf("manifest entry for %s = %+v, want %+v", link.path, got, want)
+		}
+	}
+	for _, path := range []string{"links/main.txt", "links/src/main.txt", "links/absolute"} {
+		if got := readGuest(t, ds, path); got != "payload" {
+			t.Errorf("%s contains %q", path, got)
+		}
+	}
+
+	res, err = c.Sync(t.Context(), params)
+	if err != nil || res.Uploaded != 0 || res.Skipped != len(links)+1 || res.BytesSent != 0 || len(res.Warnings) != 0 {
+		t.Fatalf("unchanged sync = %+v, %v", res, err)
+	}
+
+	// Retarget a directory link whose old target is still populated.
+	oldLink := filepath.Join(dir, "links", "src")
+	if err := os.Remove(oldLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(`..\src\main.txt`, oldLink); err != nil {
+		t.Fatal(err)
+	}
+	res, err = c.Sync(t.Context(), params)
+	if err != nil || res.Uploaded != 1 || len(res.Warnings) != 0 {
+		t.Fatalf("retargeted sync = %+v, %v", res, err)
+	}
+	for _, path := range []string{"links/src", "src/main.txt"} {
+		if got := readGuest(t, ds, path); got != "payload" {
+			t.Errorf("%s contains %q after retargeting", path, got)
+		}
+	}
+}
+
+func TestWindowsGuestLinkPermissionFailureUTF8(t *testing.T) {
+	if os.Getenv("SANDRUN_TEST_WINDOWS_LINK_DENIED") != "1" {
+		t.Skip("run explicitly in a code page 437 console as a user without symbolic link permission")
+	}
+	if cp, err := windows.GetConsoleOutputCP(); err != nil || cp != 437 {
+		t.Fatalf("console output code page = %d, %v, want 437", cp, err)
+	}
+	ws := t.TempDir()
+	target := filepath.Join(ws, "target")
+	if err := os.WriteFile(target, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(ws, "probe")); !errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
+		t.Fatalf("symbolic link permission probe = %v, want ERROR_PRIVILEGE_NOT_HELD", err)
+	}
+	list := filepath.Join(t.TempDir(), "links")
+	if err := os.WriteFile(list, []byte("dir\\café\t"+target+"\nascii\ttarget\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args, err := guestCommand(sandrunv1.GuestOs_GUEST_OS_WINDOWS, opApply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), args[0], args[1:]...)
+	cmd.Env = append(os.Environ(), guestEnvWorkspace+"="+ws, guestEnvLinks+"="+list)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	want := linkFailedPrefix + "dir\\café\r\n" + linkFailedPrefix + "ascii\r\n"
+	if err != nil || string(out) != want {
+		t.Fatalf("apply = %v, stdout hex %x, stderr %q, want stdout hex %x", err, out, stderr.String(), want)
+	}
+	t.Logf("code page 437, apply exited 0, stdout hex %x", out)
 }
 
 func TestWindowsGuestSyncRetryFileToDirectory(t *testing.T) {

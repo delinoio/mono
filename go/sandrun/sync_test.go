@@ -3250,8 +3250,13 @@ func TestLinkOutcomeInSyncManifest(t *testing.T) {
 	c, srv, org := newTestClient(t, "")
 	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
 	dir := newRepo(t, nil, nil, "")
-	if err := os.Symlink("target", filepath.Join(dir, "link")); err != nil {
+	if err := os.Mkdir(filepath.Join(dir, "dir"), 0o755); err != nil {
 		t.Fatal(err)
+	}
+	for _, path := range []string{"dir/café", "link"} {
+		if err := os.Symlink("target", filepath.Join(dir, path)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Emulate the Windows command results on the fake POSIX guest.
@@ -3262,7 +3267,7 @@ if [ -n "${SANDRUN_SYNC_FORCE-}" ]; then
     mkdir "$SANDRUN_SYNC_LOCK"
 elif [ -n "${SANDRUN_SYNC_WORKSPACE-}" ]; then
     test -s "$SANDRUN_SYNC_LINK_LIST"
-    echo 'SANDRUN-LINK-FAILED link'
+    printf '%s\r\n' 'SANDRUN-LINK-FAILED dir\café'
 else
     rm -f "$SANDRUN_SYNC_LINK_LIST"
     rmdir "$SANDRUN_SYNC_LOCK"
@@ -3272,13 +3277,38 @@ fi
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
-	res, err := c.Sync(context.Background(), params)
-	if err != nil || res.Uploaded != 0 || !slices.Equal(res.Warnings, []string{"link: the guest could not create the symbolic link"}) {
-		t.Fatalf("sync with a failed Windows link = %+v, %v", res, err)
+	var stagedLists []string
+	params := SyncParams{
+		OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir,
+		Progress: func(p TransferProgress) {
+			if p.Phase != TransferApplying {
+				return
+			}
+			lists, err := filepath.Glob(guestSibling(ds, ".sandrun-sync-*.links"))
+			if err != nil || len(lists) != 1 {
+				t.Fatalf("staged link list = %v, %v", lists, err)
+			}
+			list, err := os.ReadFile(lists[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			stagedLists = append(stagedLists, string(list))
+		},
 	}
-	if m := guestManifest(t, ds); len(m.Files) != 0 {
-		t.Fatalf("manifest contains the failed link: %+v", m)
+	for _, uploaded := range []int{1, 0} {
+		res, err := c.Sync(t.Context(), params)
+		if err != nil || res.Uploaded != uploaded || !slices.Equal(res.Warnings, []string{"dir/café: the guest could not create the symbolic link"}) {
+			t.Fatalf("sync with a failed Windows link = %+v, %v, want %d uploads and the original warning path", res, err, uploaded)
+		}
+		sum := sha256.Sum256([]byte("target"))
+		want := manifestEntry{Size: 6, SHA256: hex.EncodeToString(sum[:]), Mode: modeSymlink}
+		if m := guestManifest(t, ds); m.Version != 1 || len(m.Files) != 1 || m.Files["link"] != want {
+			t.Fatalf("manifest = %+v, want only the successful link", m)
+		}
+	}
+	want := []string{"dir\\café\ttarget\nlink\ttarget\n", "dir\\café\ttarget\n"}
+	if !slices.Equal(stagedLists, want) {
+		t.Fatalf("staged link lists = %q, want %q", stagedLists, want)
 	}
 }
 

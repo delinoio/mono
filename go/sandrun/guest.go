@@ -134,6 +134,19 @@ if (Test-Path -LiteralPath $l) { exit 75 }
 exit 1`,
 	opApply: `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+function Remove-SyncItem($path) {
+  try {
+    $item = Get-Item -LiteralPath $path -Force
+  } catch [System.Management.Automation.ItemNotFoundException] {
+    return
+  }
+  if ($item.PSIsContainer -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+    # Windows PowerShell 5.1 can prompt for the contents of a directory link.
+    [System.IO.Directory]::Delete($path)
+  } else {
+    Remove-Item -LiteralPath $path -Force
+  }
+}
 $ws = $env:SANDRUN_SYNC_WORKSPACE
 if ($env:SANDRUN_SYNC_STALE_MANIFEST) { [System.IO.File]::Delete($env:SANDRUN_SYNC_STALE_MANIFEST) }
 [System.IO.Directory]::CreateDirectory($ws) | Out-Null
@@ -141,7 +154,7 @@ if ($env:SANDRUN_SYNC_DELETE_LIST) {
   foreach ($p in [System.IO.File]::ReadAllLines($env:SANDRUN_SYNC_DELETE_LIST, [System.Text.Encoding]::UTF8)) {
     if ($p -eq '') { continue }
     $t = Join-Path $ws $p
-    if (Test-Path -LiteralPath $t) { Remove-Item -LiteralPath $t -Force }
+    Remove-SyncItem $t
   }
 }
 if ($env:SANDRUN_SYNC_REPLACE_FILE_LIST) {
@@ -176,16 +189,62 @@ if ($env:SANDRUN_SYNC_ARCHIVE) {
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 if ($env:SANDRUN_SYNC_LINK_LIST) {
+  $stdout = [Console]::OpenStandardOutput()
   foreach ($line in [System.IO.File]::ReadAllLines($env:SANDRUN_SYNC_LINK_LIST, [System.Text.Encoding]::UTF8)) {
     if ($line -eq '') { continue }
     $parts = $line.Split([char]9, 2)
     $t = Join-Path $ws $parts[0]
     try {
       [System.IO.Directory]::CreateDirectory((Split-Path -Parent $t)) | Out-Null
-      if (Test-Path -LiteralPath $t) { Remove-Item -LiteralPath $t -Force }
-      New-Item -ItemType SymbolicLink -Path $t -Value $parts[1] | Out-Null
+      Remove-SyncItem $t
+      $target = $parts[1]
+      if ([System.IO.Path]::IsPathRooted($target)) {
+        New-Item -ItemType SymbolicLink -Path $t -Value $target | Out-Null
+      } else {
+        # Windows PowerShell 5.1 New-Item requires a fully qualified target.
+        if (-not ('SandRun.SymbolicLink' -as [type])) {
+          Add-Type -TypeDefinition @'
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+
+namespace SandRun {
+    public static class SymbolicLink {
+        private const uint DirectoryFlag = 1;
+        private const uint AllowUnprivilegedCreate = 2;
+        private const int InvalidParameter = 87;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool CreateSymbolicLinkW(string path, string target, uint flags);
+
+        public static void CreateRelative(string path, string target) {
+            string resolved = Path.Combine(Path.GetDirectoryName(path), target);
+            uint flags = Directory.Exists(resolved) ? DirectoryFlag : 0;
+            if (CreateSymbolicLinkW(path, target, flags | AllowUnprivilegedCreate)) {
+                return;
+            }
+            int error = Marshal.GetLastWin32Error();
+            // Older Windows versions reject the Developer Mode flag.
+            if (error == InvalidParameter) {
+                if (CreateSymbolicLinkW(path, target, flags)) {
+                    return;
+                }
+                error = Marshal.GetLastWin32Error();
+            }
+            throw new Win32Exception(error);
+        }
+    }
+}
+'@
+        }
+        [SandRun.SymbolicLink]::CreateRelative($t, $target)
+      }
     } catch {
-      [Console]::Out.WriteLine('SANDRUN-LINK-FAILED ' + $parts[0])
+      # Write bytes directly because Windows PowerShell uses the console code page.
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes('SANDRUN-LINK-FAILED ' + $parts[0] + [Environment]::NewLine)
+      $stdout.Write($bytes, 0, $bytes.Length)
+      $stdout.Flush()
     }
   }
 }
