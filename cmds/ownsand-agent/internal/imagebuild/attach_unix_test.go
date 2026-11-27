@@ -6,7 +6,9 @@ package imagebuild
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,7 +20,13 @@ import (
 const fakeHdiutilScript = `#!/bin/sh
 echo "hdiutil $*" >> "$FAKE_LOG"
 case "$1" in
-attach) cat "$FAKE_ATTACH_OUT" ;;
+attach)
+	cat "$FAKE_ATTACH_OUT"
+	if [ -n "$FAKE_ATTACH_FAIL" ]; then
+		echo "hdiutil: interrupted attach" >&2
+		exit 23
+	fi ;;
+info) cat "$FAKE_INFO_OUT" ;;
 detach)
 	if [ -n "$FAKE_DETACH_FAIL_ONCE" ] && [ "$2" != "-force" ] && [ ! -e "$FAKE_LOG.failed" ]; then
 		: > "$FAKE_LOG.failed"
@@ -53,6 +61,7 @@ func TestWithAttachedDiskRealProcesses(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		attachOut    string
+		failAttach   bool
 		failDetach   bool
 		use          func(ctx context.Context, cancel context.CancelFunc) error
 		wantErr      string
@@ -89,6 +98,16 @@ func TestWithAttachedDiskRealProcesses(t *testing.T) {
 			wantLogLines: []string{"hdiutil detach /dev/disk4", "hdiutil detach -force /dev/disk4"},
 		},
 		{
+			name: "attach reports a device and exits nonzero", attachOut: attachPlist, failAttach: true,
+			wantErr:      "hdiutil: interrupted attach",
+			wantLogLines: []string{"hdiutil info -plist", "hdiutil detach /dev/disk4"},
+		},
+		{
+			name: "attach truncates stdout and exits nonzero", attachOut: attachPlist[:disk4EntryEnd], failAttach: true, failDetach: true,
+			wantErr:      "hdiutil: interrupted attach",
+			wantLogLines: []string{"hdiutil info -plist", "hdiutil detach /dev/disk4", "hdiutil info -plist", "hdiutil detach -force /dev/disk4"},
+		},
+		{
 			name: "happy path", attachOut: attachPlist,
 			use:          func(context.Context, context.CancelFunc) error { return nil },
 			wantLogLines: []string{"hdiutil detach /dev/disk4"},
@@ -103,6 +122,16 @@ func TestWithAttachedDiskRealProcesses(t *testing.T) {
 			}
 			t.Setenv("FAKE_LOG", logPath)
 			t.Setenv("FAKE_ATTACH_OUT", attachPath)
+			infoPath := filepath.Join(work, "info.plist")
+			if err := os.WriteFile(infoPath, []byte(diskInfoPlist("/build/disk.img", "/dev/disk4")), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("FAKE_INFO_OUT", infoPath)
+			attachFail := ""
+			if tc.failAttach {
+				attachFail = "1"
+			}
+			t.Setenv("FAKE_ATTACH_FAIL", attachFail)
 			if tc.failDetach {
 				t.Setenv("FAKE_DETACH_FAIL_ONCE", "1")
 			} else {
@@ -111,8 +140,17 @@ func TestWithAttachedDiskRealProcesses(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			err := withAttachedDisk(ctx, run, "/build/disk.img", discardLogger(), func(string) error {
+				if tc.failAttach {
+					t.Fatal("use called after a failed attach process")
+				}
 				return tc.use(ctx, cancel)
 			})
+			if tc.failAttach {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 23 {
+					t.Fatalf("error = %v, want the original attach exit status 23", err)
+				}
+			}
 			if tc.wantErr == "" && err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
