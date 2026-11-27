@@ -64,7 +64,7 @@ function UsageSummary() {
     },
   );
   const rows = summary.data?.pages.flatMap((page) => page.rows) ?? [];
-  const total = summary.data?.pages[0]?.totalAmountUsdMicros;
+  const total = summary.data?.pages.at(-1)?.totalAmountUsdMicros;
   return (
     <section className="section" aria-labelledby="usage-title">
       <div className="section-header">

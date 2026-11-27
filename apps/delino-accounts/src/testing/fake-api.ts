@@ -829,16 +829,20 @@ export function addInvoices(account: FakeAccount, count: number) {
 
 /**
  * Adds usage summary rows for the organizations `usage-org-0001` and so on,
- * after the seeded rows. Each row bills 1 micro-USD.
+ * after the seeded rows. Each row bills 1 micro-USD by default.
  */
-export function addUsageRows(account: FakeAccount, count: number) {
+export function addUsageRows(
+  account: FakeAccount,
+  count: number,
+  amountUsdMicros = 1n,
+) {
   for (let n = 1; n <= count; n++) {
     account.usage.push({
       service: ServiceId.OWNSAND,
       organizationId: `usage-org-${numbered(n)}`,
       meter: Meter.OWNSAND_RELAY_EGRESS,
       quantity: 1n,
-      amountUsdMicros: 1n,
+      amountUsdMicros,
     });
   }
 }
