@@ -1,0 +1,70 @@
+{
+  "gid": "inv-10-fifo-download-cancel",
+  "commit": "5e2f304332f4c56d5a60b71c8f677764fcedc3e5",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "5e2f304332f4c56d5a60b71c8f677764fcedc3e5",
+    "treeSha": "d6310d47439ec1d69037f6cb148a37dc36ead8e0",
+    "reason": "The assigned worker runs on Linux and has no access to the native host.",
+    "targets": [
+      {
+        "host": "m3-16",
+        "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+        "platform": "darwin/arm64",
+        "shell": "bash"
+      }
+    ],
+    "commands": {
+      "m3-16": [
+        "set -e",
+        "set -o pipefail",
+        "test \"$(uname -s)\" = Darwin",
+        "test \"$(uname -m)\" = arm64",
+        "test \"$(git rev-parse 'HEAD^{tree}')\" = \"d6310d47439ec1d69037f6cb148a37dc36ead8e0\"",
+        "git rev-parse HEAD",
+        "go version",
+        "mkdir -p \".t3-tmp/fifo-validation\"",
+        "export TMPDIR=\"$PWD/.t3-tmp\"",
+        "test -f \".t3-tmp/fifo-validation/built_fifo_probe_test.go\"",
+        "printf '%s\\n' '{\"Replace\":{\"cmds/ownsand/internal/cli/built_fifo_probe_test.go\":\".t3-tmp/fifo-validation/built_fifo_probe_test.go\"}}' > '.t3-tmp/fifo-validation/overlay.json'",
+        "go vet ./cmds/ownsand/...",
+        "go test -race -count=1 -timeout=45s -v ./cmds/ownsand/internal/cli -run '^TestFileRead' 2>&1 | tee \".t3-tmp/fifo-validation/macos-file-read-tests.log\"",
+        "if grep -E '^[[:space:]]*--- SKIP: TestFileReadFIFO' \".t3-tmp/fifo-validation/macos-file-read-tests.log\"; then exit 1; fi",
+        "go build -o \".t3-tmp/fifo-validation/ownsand-macos\" ./cmds/ownsand",
+        "go version -m \".t3-tmp/fifo-validation/ownsand-macos\" | sed -n '1p;/vcs/p' ",
+        "unset OWNSAND_FIFO_EXPECT_STALL",
+        "OWNSAND_FIFO_PROBE_BINARY=\"$PWD/.t3-tmp/fifo-validation/ownsand-macos\" go test -overlay=\".t3-tmp/fifo-validation/overlay.json\" -timeout=45s -count=1 -v ./cmds/ownsand/internal/cli -run '^TestBuiltOwnsandFIFODownload$' 2>&1 | tee \".t3-tmp/fifo-validation/macos-built-cli.log\"",
+        "grep -F 'before the reader drained.' \".t3-tmp/fifo-validation/macos-built-cli.log\"",
+        "grep -F 'prefix followed by EOF.' \".t3-tmp/fifo-validation/macos-built-cli.log\"",
+        "grep -F 'delivered all 1572864 bytes in order through EOF.' \".t3-tmp/fifo-validation/macos-built-cli.log\"",
+        "grep -F 'successful read replaced it with the exact payload and left no staging files.' \".t3-tmp/fifo-validation/macos-built-cli.log\""
+      ]
+    },
+    "expectedResults": [
+      "The Go vet check passes and the file-read race suite passes without skipping FIFO tests.",
+      "The subprocess logs show that the attached reader could read and the full FIFO could not accept more data before SIGINT. The reader stays idle while a single SIGINT yields exit status 1 and 'error: context canceled' within five seconds.",
+      "After the process exits, the reader receives the exact accepted prefix followed by EOF. The FIFO stays in place.",
+      "A draining reader receives exactly 1,572,864 bytes in order, through EOF, and the CLI exits 0.",
+      "A missing guest file leaves the previous regular destination in place. A successful download replaces it with the exact payload and leaves no staging files."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-10-fifo-download-cancel/worker/.t3-tmp/fifo-validation/built_fifo_probe_test.go",
+      "copyTo": ".t3-tmp/fifo-validation/built_fifo_probe_test.go",
+      "regressionTests": [
+        "cmds/ownsand/internal/cli/file_read_fifo_test.go",
+        "cmds/ownsand/internal/cli/file_read_fifo_write_test.go",
+        "cmds/ownsand/internal/cli/cli_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/fifo-validation/macos-file-read-tests.log",
+        ".t3-tmp/fifo-validation/macos-built-cli.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-10-fifo-download-cancel/worker/.t3-tmp/fifo-validation/ownsand-darwin-arm64",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-10-fifo-download-cancel/worker/.t3-tmp/fifo-validation/cli-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-10-fifo-download-cancel/worker/.t3-tmp/fifo-validation/ownsand-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-10-fifo-download-cancel/worker/.t3-tmp/fifo-validation/cli-windows-amd64.test.exe"
+      ]
+    }
+  }
+}
