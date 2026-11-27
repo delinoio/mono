@@ -1553,6 +1553,44 @@ describe("organization switcher popup width", () => {
   }
 });
 
+describe("template creation", () => {
+  test("keeps the form open for a duplicate name and accepts a corrected name", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${ACME}/snapshots`);
+
+    const rows = browser.locator('ul[aria-label="Templates"] li');
+    const original = rows.filter({ hasText: "node-24-toolchain" });
+    await expect(original).toBeVisible();
+    await expect(rows).toHaveCount(1);
+    await screen.getByRole("button", /^Make template from snapshot/).tap();
+    const form = screen.getByRole("dialog", "Make a template");
+    const name = form.getByLabel("Template name");
+    const submit = form.getByRole("button", "Create template");
+
+    await name.fill("node-24-toolchain");
+    await submit.tap();
+    await expect(
+      form.getByText("a template with this name exists"),
+    ).toBeVisible();
+    await expect(name).toHaveValue("node-24-toolchain");
+    await expect(rows).toHaveCount(1);
+    await expect(original).toHaveCount(1);
+
+    await name.fill("review-template");
+    await submit.tap();
+    await expect(form).toBeHidden();
+    await expect(rows.filter({ hasText: "review-template" })).toBeVisible();
+    await expect(rows).toHaveCount(2);
+    await expect(original).toHaveCount(1);
+  });
+});
+
 // A name that is one 100-character word, the longest the console accepts. It
 // has no space to break at, so it must wrap inside its container.
 const LONG_NAME_PREFIX = "LONGNAME_";
