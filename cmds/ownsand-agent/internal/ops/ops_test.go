@@ -505,7 +505,7 @@ func TestExecHeldLimitEvictsOldestEnded(t *testing.T) {
 	requireCleanExit(t, frames)
 
 	// A failed save leaves the oldest result attachable and permits a retry.
-	next := e.execReq("/bin/true")
+	next := e.execReq("/bin/sh", "-c", "exit 0")
 	path := e.st.Path(store.ExecsFile)
 	backup := path + ".backup"
 	if err := os.Rename(path, backup); err != nil {
@@ -572,10 +572,10 @@ func TestExecHeldLimitEvictsOldestEnded(t *testing.T) {
 func TestExecHeldLimitPerSandbox(t *testing.T) {
 	e := newEnvWith(t, envOptions{maxHeldExecs: 1})
 	e.heldExec()
-	out, frames, _ := e.handle(e.execReq("/bin/true"), nil)
+	out, frames, _ := e.handle(e.execReq("/bin/sh", "-c", "exit 0"), nil)
 	requireCapacityRejection(t, out, frames)
 	e.sandbox = e.createSandbox()
-	out, frames, accepted := e.handle(e.execReq("/bin/true"), nil)
+	out, frames, accepted := e.handle(e.execReq("/bin/sh", "-c", "exit 0"), nil)
 	if !out.Finished || !accepted {
 		t.Fatalf("other sandbox: outcome %+v accepted %v", out, accepted)
 	}
@@ -586,7 +586,7 @@ func TestExecHeldLimitRejectLog(t *testing.T) {
 	var logs bytes.Buffer
 	e := newEnvWith(t, envOptions{maxHeldExecs: 1, execLog: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))})
 	e.heldExec()
-	req := e.execReq("/bin/true")
+	req := e.execReq("/bin/sh", "-c", "exit 0")
 	reject := func() {
 		out, frames, _ := e.handle(req, nil)
 		requireCapacityRejection(t, out, frames)
