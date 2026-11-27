@@ -2182,7 +2182,10 @@ describe("exec handle iteration that ends early", () => {
       (async () => {
         for (;;) {
           const next = await iterator.next();
-          if (next.value?.type === ExecEventType.Stdout) return;
+          if (next.done) {
+            throw new Error("Exec ended before the first stdout event");
+          }
+          if (next.value.type === ExecEventType.Stdout) return;
         }
       })(),
     );
