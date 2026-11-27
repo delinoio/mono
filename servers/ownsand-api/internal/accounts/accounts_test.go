@@ -524,19 +524,24 @@ type lateRejectionFixture struct {
 	calls  [2]chan error
 }
 
+func newGatedUsageClient(t *testing.T, src *TokenSource) (*gatedUsageHandler, accountsv1connect.UsageServiceClient) {
+	t.Helper()
+	h := &gatedUsageHandler{gated: "Bearer token-1", arrived: make(chan struct{}, 2), reject: make(chan struct{})}
+	mux := http.NewServeMux()
+	mux.Handle(accountsv1connect.NewUsageServiceHandler(h))
+	api := httptest.NewServer(mux)
+	t.Cleanup(api.Close)
+	// Runs before api.Close, so a failed test never hangs on a held call.
+	t.Cleanup(func() { close(h.reject) })
+	return h, NewUsageClient(api.Client(), api.URL+"/", src)
+}
+
 func newLateRejectionFixture(t *testing.T) *lateRejectionFixture {
 	t.Helper()
 	c := &clock{now: time.Now()}
 	f := &lateRejectionFixture{ts: &tokenServer{t: t, expires: 3600}}
 	f.src = newSource(t, f.ts, c)
-	f.h = &gatedUsageHandler{gated: "Bearer token-1", arrived: make(chan struct{}, 2), reject: make(chan struct{})}
-	mux := http.NewServeMux()
-	mux.Handle(accountsv1connect.NewUsageServiceHandler(f.h))
-	api := httptest.NewServer(mux)
-	t.Cleanup(api.Close)
-	// Runs before api.Close, so a failed test never hangs on a held call.
-	t.Cleanup(func() { close(f.h.reject) })
-	f.client = NewUsageClient(api.Client(), api.URL+"/", f.src)
+	f.h, f.client = newGatedUsageClient(t, f.src)
 	for i := range f.calls {
 		f.calls[i] = make(chan error, 1)
 		go func() {
@@ -618,6 +623,54 @@ func TestUsageClientLateRejectionKeepsTheReplacementRefreshInProgress(t *testing
 	// did not start a third request.
 	if tok, err := f.src.Token(context.Background()); err != nil || tok != "token-2" || f.ts.calls.Load() != 2 {
 		t.Fatalf("cached token = %q, %v (token requests %d)", tok, err, f.ts.calls.Load())
+	}
+}
+
+func TestUsageClientRejectionKeepsTheTimeBasedRefreshInProgress(t *testing.T) {
+	c := &clock{now: time.Now()}
+	ts := &tokenServer{t: t, expires: 3600}
+	src := newSource(t, ts, c)
+	h, client := newGatedUsageClient(t, src)
+	ctx := t.Context()
+	report := make(chan error, 1)
+	go func() {
+		_, err := client.ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{}))
+		report <- err
+	}()
+	select {
+	case <-h.arrived:
+	case err := <-report:
+		t.Fatalf("ReportUsage returned before reaching Accounts with token-1: %v", err)
+	case <-time.After(entryTimeout):
+		t.Fatal("ReportUsage with token-1 did not reach Accounts")
+	}
+
+	ts.block, ts.entered = make(chan struct{}), make(chan struct{}, 4)
+	c.Advance(59 * time.Minute)
+	refresh := tokenAsync(src, ctx)
+	awaitEntry(t, ts.entered, refresh, "the time-based refresh")
+
+	h.reject <- struct{}{}
+	select {
+	case err := <-report:
+		if connect.CodeOf(err) != connect.CodeUnauthenticated {
+			t.Fatalf("ReportUsage rejection = %v", err)
+		}
+	case <-time.After(entryTimeout):
+		t.Fatal("ReportUsage did not return after Accounts rejected token-1")
+	}
+
+	waiter := tokenAsync(src, ctx)
+	waitForFlightWaiters(t, src, 2)
+	ts.release()
+	if r := receive(t, refresh, "the caller that started the refresh"); r.err != nil || r.token != "token-2" {
+		t.Fatalf("refresh = %+v", r)
+	}
+	if r := receive(t, waiter, "the caller that joined the refresh"); r.err != nil || r.token != "token-2" {
+		t.Fatalf("waiter = %+v", r)
+	}
+	if tok, err := src.Token(ctx); err != nil || tok != "token-2" || ts.calls.Load() != 2 {
+		t.Fatalf("cached token = %q, %v (token requests %d)", tok, err, ts.calls.Load())
 	}
 }
 
