@@ -1643,8 +1643,8 @@ describe("runner profiles", () => {
       "true",
     );
 
-    await setDuration("Idle TTL (minutes)", "1.001");
-    await setDuration("Maximum TTL (hours)", "1.001");
+    await setDuration("Idle TTL (minutes)", "0.005");
+    await setDuration("Maximum TTL (hours)", "0.0002");
     await setDuration("Maximum queue wait (minutes)", "1.000001");
     await browser.keyboard.press("Enter");
     await expect(message).toBeVisible();
@@ -1652,12 +1652,24 @@ describe("runner profiles", () => {
       dialog.getByLabel("Maximum queue wait (minutes)"),
     ).toHaveAttribute("aria-invalid", "true");
 
-    await setDuration("Maximum queue wait (minutes)", "1.001");
+    await setDuration("Maximum queue wait (minutes)", "0.001");
     await browser.keyboard.press("Enter");
     await expect(dialog).toBeHidden();
     await expect(
       screen.getByLabel("runs-on label of precise-linux"),
     ).toHaveText("sandrun-precise-linux");
+
+    await screen
+      .getByRole("listitem")
+      .filter({ hasText: "precise-linux ·" })
+      .getByRole("button", "Edit")
+      .tap();
+    const edit = screen.getByRole("dialog", "Edit precise-linux");
+    await expect(edit.getByLabel("Idle TTL (minutes)")).toHaveValue("0.005");
+    await expect(edit.getByLabel("Maximum TTL (hours)")).toHaveValue("0.0002");
+    await expect(edit.getByLabel("Maximum queue wait (minutes)")).toHaveValue(
+      "0.001",
+    );
   });
 
   test("shows field errors and saves after correcting the resource values", async ({
