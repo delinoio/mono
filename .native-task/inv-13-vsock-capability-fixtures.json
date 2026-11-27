@@ -1,0 +1,57 @@
+{
+  "gid": "inv-13-vsock-capability-fixtures",
+  "commit": "2e63cf895fca86b03d6d3144fa29d7fbe33be249",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "2e63cf895fca86b03d6d3144fa29d7fbe33be249",
+    "setup": "Use the same macOS ARM64 environment where AF_VSOCK socket creation returned ENODEV. Run these commands in order from a clean checkout at the stated revision. Preserve the log even if the Go command fails.",
+    "commands": [
+      "test \"$(git rev-parse HEAD)\" = '2e63cf895fca86b03d6d3144fa29d7fbe33be249'",
+      "mkdir -p .t3-tmp",
+      "go test -count=1 -v ./cmds/ownsand-guest/... > .t3-tmp/vsock-no-device.log 2>&1",
+      "grep -F -- 'raw AF_VSOCK stream socket device unavailable:' .t3-tmp/vsock-no-device.log",
+      "grep -F -- '--- SKIP: TestSocketCloexec' .t3-tmp/vsock-no-device.log",
+      "grep -F -- '--- PASS: TestCreateCloexecMarkFailureClosesDescriptor' .t3-tmp/vsock-no-device.log"
+    ],
+    "expectedResults": [
+      "The full guest suite exits 0.",
+      "TestSocketCloexec skips with 'raw AF_VSOCK stream socket device unavailable:' followed by the platform's ENODEV diagnostic.",
+      "TestCreateCloexecMarkFailureClosesDescriptor passes."
+    ],
+    "files": {
+      "regressionTests": [
+        "cmds/ownsand-guest/guestlisten/vsock_linux_test.go",
+        "cmds/ownsand-guest/guestlisten/vsock_unix_test.go"
+      ],
+      "outputLogs": [".t3-tmp/vsock-no-device.log"],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-vsock-capability-fixtures/worker/.t3-tmp/vsock-followup/darwin",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-vsock-capability-fixtures/worker/.t3-tmp/vsock-followup/windows"
+      ]
+    },
+    "positiveCapabilityValidation": {
+      "status": "pending",
+      "setup": "Use a disposable Apple silicon macOS guest with a virtio socket device. Copy the validator and run it from a clean checkout at the stated revision.",
+      "commands": [
+        "mkdir -p .t3-tmp",
+        "sh .t3-tmp/validate-vsock-fixtures.sh darwin 2e63cf895fca86b03d6d3144fa29d7fbe33be249"
+      ],
+      "expectedResults": [
+        "The script confirms the commit and runs TestSocketCloexec against the guest's AF_VSOCK device. TestSocketCloexec and TestCreateCloexecMarkFailureClosesDescriptor both pass with no skips.",
+        "An overlay injects EIO into setCloseOnExec before invoking the native socketCloexec. The injected go test exits 1 and reports 'socketCloexec: guestlisten: mark close-on-exec: input/output error' in a failed TestSocketCloexec.",
+        "The script exits 0 after it verifies both runs. If the raw-capability test skips, the guest has not provided positive native validation and the script exits 1."
+      ],
+      "files": {
+        "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-vsock-capability-fixtures/worker/.t3-tmp/vsock-followup/validate-vsock-fixtures.sh",
+        "copyTo": ".t3-tmp/validate-vsock-fixtures.sh",
+        "outputLogs": [
+          ".t3-tmp/vsock-followup-validation/positive.log",
+          ".t3-tmp/vsock-followup-validation/descriptor-mark-io-error.log"
+        ]
+      }
+    }
+  }
+}
