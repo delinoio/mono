@@ -47,9 +47,32 @@ func TestLifecycleHyperV(t *testing.T) {
 		})
 		t.Run("cli-"+tr.String(), func(t *testing.T) { cliLifecycle(t, s, tr) })
 	}
-	t.Run("control-plane-restart", func(t *testing.T) { hyperVControlPlaneRestart(t, s) })
-	t.Run("agent-crash", func(t *testing.T) { hyperVAgentCrash(t, s) })
-	t.Run("device-removal", func(t *testing.T) { hyperVDeviceRemoval(t, s) })
+	runHyperVRecoveryCases(t,
+		func(t *testing.T) { hyperVControlPlaneRestart(t, s) },
+		func(t *testing.T) { hyperVAgentCrash(t, s) },
+		func(t *testing.T) { hyperVDeviceRemoval(t, s) },
+	)
+}
+
+func runHyperVRecoveryCases(t *testing.T, controlPlaneRestart, agentCrash, deviceRemoval func(*testing.T)) {
+	// Run returns true for a filtered case, so a directly selected case can
+	// use the initial stack.
+	apiAvailable := t.Run("control-plane-restart", controlPlaneRestart)
+	agentAvailable := t.Run("agent-crash", func(t *testing.T) {
+		if !apiAvailable {
+			t.Skip("control-plane-restart failed and the shared control plane may be unavailable")
+		}
+		agentCrash(t)
+	})
+	t.Run("device-removal", func(t *testing.T) {
+		if !apiAvailable {
+			t.Skip("control-plane-restart failed and the shared control plane may be unavailable")
+		}
+		if !agentAvailable {
+			t.Skip("agent-crash failed and the shared agent may be unavailable")
+		}
+		deviceRemoval(t)
+	})
 }
 
 // createHyperVSandbox creates a running sandbox and writes a marker file.
@@ -224,8 +247,8 @@ func hyperVControlPlaneRestart(t *testing.T, s *stack) {
 	ctx := s.ctx(5 * time.Minute)
 	c := s.apiKeyClient(ownsand.TransportRelay)
 	sb := createHyperVSandbox(ctx, t, c)
-	s.killAPI()
-	s.restartAPI()
+	s.killAPI(t)
+	s.restartAPI(t)
 	// After a crash the device stays ONLINE in the database until the
 	// offline sweep of the new process, so a RUNNING sandbox does not show
 	// that the agent reconnected: wait until the new process reconciled the
@@ -263,7 +286,7 @@ func hyperVAgentCrash(t *testing.T, s *stack) {
 	ctx := s.ctx(5 * time.Minute)
 	c := s.apiKeyClient(ownsand.TransportRelay)
 	sb := createHyperVSandbox(ctx, t, c)
-	s.killAgent(0)
+	s.killAgent(t, 0)
 	// The compute system is bound to the agent process
 	// (ShouldTerminateOnLastHandleClosed), so the VM ends with the agent
 	// even before a restarted agent stops leftover VMs.
@@ -271,7 +294,7 @@ func hyperVAgentCrash(t *testing.T, s *stack) {
 	waitSandboxState(ctx, t, sb, "UNREACHABLE", func(info *ownsandv1.Sandbox) bool {
 		return info.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE
 	})
-	s.restartAgent(0)
+	s.restartAgent(t, 0)
 	// The reconciliation may report the end reason a moment after the state,
 	// so the wait covers both and a different end reason fails at the
 	// deadline with the last observed sandbox in the message.
