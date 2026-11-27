@@ -151,3 +151,72 @@ func logHasRevocationSent(logs, id string) bool {
 	}
 	return false
 }
+
+func TestOpenSessionRevocationPastNominalExpiry(t *testing.T) {
+	env := testenv.New(t)
+	env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
+	org, agent, sandboxID := runningSandbox(t, env)
+	agent.SetAckRevocations(false)
+	const answerDelay = 10 * time.Second
+	agent.SetOnOffer(func(offer *ownsandv1.SignalingOffer) *ownsandv1.SignalingAnswer {
+		env.Clock.Advance(answerDelay)
+		return &ownsandv1.SignalingAnswer{SessionId: offer.GetSessionId(), Sdp: "v=0"}
+	})
+	client := env.Clients(org.APIKey).DataPath
+	resp, err := client.OpenSession(t.Context(), openSessionRequest(org.ID, sandboxID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	offer := agent.WaitFor("offer", isOffer).GetSignaling().GetOffer()
+	lifetime := offer.GetExpiresIn().AsDuration()
+	nominalExpiry := offer.GetExpireTime().AsTime()
+	if lifetime != time.Hour || !resp.Msg.GetExpireTime().AsTime().Equal(nominalExpiry) ||
+		resp.Msg.GetExpiresIn().AsDuration() != lifetime-answerDelay {
+		t.Fatal("the offer and response must keep their original wire deadlines")
+	}
+
+	env.Clock.Advance(nominalExpiry.Add(time.Second).Sub(env.Clock.Now()))
+	env.App.Plane.SweepExpired(t.Context())
+	// A failed second offer runs the admission sweep without leaving another
+	// answered session that could match the deletion event.
+	agent.SetOnOffer(func(offer *ownsandv1.SignalingOffer) *ownsandv1.SignalingAnswer {
+		return &ownsandv1.SignalingAnswer{SessionId: offer.GetSessionId(), Error: &ownsandv1.ErrorDetail{
+			Code: ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, Message: "too many sessions",
+		}}
+	})
+	if _, err := client.OpenSession(t.Context(), openSessionRequest(org.ID, sandboxID)); testenv.Code(err) != connect.CodeResourceExhausted {
+		t.Fatalf("second OpenSession error = %v, want resource exhausted", err)
+	}
+	if n := env.App.Plane.OpenSessionCount(); n != 1 {
+		t.Fatalf("tracked sessions after both sweeps = %d, want 1", n)
+	}
+
+	saturate(t, env, agent)
+	t.Cleanup(agent.ResumeReads)
+	conn := env.App.Service.Hub.Get(agent.Device.ID)
+	eventCtx, cancelEvent := context.WithCancel(t.Context())
+	cancelEvent()
+	env.App.Plane.HandleEventForTest(eventCtx, events.Event{Kind: events.KindSandboxDeleted, SandboxID: sandboxID}, conn.Generation)
+	id := deferredRevocationID(t, env, agent.Device.ID, "session")
+	if n := env.App.Plane.PendingRevocations(); id == "" || n != 1 {
+		t.Fatalf("deferred revocation ID = %q, pending count = %d, want one deferred revocation", id, n)
+	}
+
+	agent.ResumeReads()
+	agent.WaitFor("periodic revocation retry", func(e *ownsandv1.AgentEnvelope) bool {
+		r := e.GetSessionRevocation()
+		return r.GetRevocationId() == id && r.GetSessionId() == resp.Msg.GetSessionId()
+	})
+	ackRevocation(agent, id)
+	testenv.Eventually(t, "revocation acknowledged", func() bool { return env.App.Plane.PendingRevocations() == 0 })
+	agent.Heartbeat(901)
+	agent.WaitFor("heartbeat after revocation acknowledgement", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetHeartbeatAck().GetSequence() == 901
+	})
+	if env.App.Service.Hub.Get(agent.Device.ID) != conn {
+		t.Fatal("revocation delivery must keep the original agent channel")
+	}
+	if n := len(revocationsOf(agent, resp.Msg.GetSessionId())); n != 1 {
+		t.Fatalf("revocations received = %d, want 1", n)
+	}
+}

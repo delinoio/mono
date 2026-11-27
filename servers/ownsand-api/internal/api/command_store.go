@@ -27,35 +27,67 @@ type pendingCommand struct {
 	closedAt time.Time
 }
 
-// commandStore holds the pending commands by command ID. Its mutex
-// serializes add with markClosed, so a command sent on a channel that is
-// closing is either seen as closed by add or marked by markClosed. The zero
-// value is ready to use.
-type commandStore struct {
-	mu sync.Mutex
-	m  map[string]pendingCommand
+// deleteCommandKey identifies in-flight deletes on one channel generation.
+type deleteCommandKey struct {
+	generation uint64
+	sandboxID  string
 }
 
-// add remembers the command sent on conn. When conn is already closed (its
-// close precedes markClosed), the record starts expiring at once.
-func (c *commandStore) add(id string, info commandInfo, conn *hub.Conn, now time.Time) {
+// commandStore holds the pending commands by command ID and coalesces
+// outstanding deletes on each channel. Its mutex serializes add with
+// markClosed, so a command sent on a channel that is closing is either
+// seen as closed by add or marked by markClosed. The zero value is ready
+// to use.
+type commandStore struct {
+	mu      sync.Mutex
+	m       map[string]pendingCommand
+	deletes map[deleteCommandKey]string
+}
+
+// add remembers the command, or returns the ID of an outstanding delete
+// for the same sandbox on conn. When conn is already closed (its close
+// precedes markClosed), the new record starts expiring at once.
+func (c *commandStore) add(id string, info commandInfo, conn *hub.Conn, now time.Time) string {
 	p := pendingCommand{info: info}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if conn.Context().Err() != nil {
 		p.closedAt = now
+	} else if info.kind == cmdDeleteSandbox {
+		key := deleteCommandKey{generation: info.generation, sandboxID: info.sandboxID}
+		if existingID := c.deletes[key]; existingID != "" {
+			return existingID
+		}
+		if c.deletes == nil {
+			c.deletes = make(map[deleteCommandKey]string)
+		}
+		c.deletes[key] = id
 	}
 	if c.m == nil {
 		c.m = map[string]pendingCommand{}
 	}
 	c.m[id] = p
+	return ""
 }
 
 // remove forgets a command at once (its enqueue failed).
 func (c *commandStore) remove(id string) {
 	c.mu.Lock()
+	c.releaseDelete(id, c.m[id].info)
 	delete(c.m, id)
 	c.mu.Unlock()
+}
+
+// releaseDelete frees only the active delete that belongs to id.
+// The caller holds c.mu.
+func (c *commandStore) releaseDelete(id string, info commandInfo) {
+	if info.kind != cmdDeleteSandbox {
+		return
+	}
+	key := deleteCommandKey{generation: info.generation, sandboxID: info.sandboxID}
+	if c.deletes[key] == id {
+		delete(c.deletes, key)
+	}
 }
 
 // takeOutcome is the result of commandStore.take.
@@ -92,6 +124,7 @@ func (c *commandStore) take(id, deviceID string, now time.Time, grace time.Durat
 	if p.info.deviceID != deviceID {
 		return commandInfo{}, takeWrongDevice
 	}
+	c.releaseDelete(id, p.info)
 	delete(c.m, id)
 	return p.info, takeFound
 }
@@ -106,6 +139,7 @@ func (c *commandStore) markClosed(deviceID string, generation uint64, now time.T
 	n := 0
 	for id, p := range c.m {
 		if p.info.deviceID == deviceID && p.info.generation == generation && p.closedAt.IsZero() {
+			c.releaseDelete(id, p.info)
 			p.closedAt = now
 			c.m[id] = p
 			n++

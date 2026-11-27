@@ -308,6 +308,21 @@ main() {
       previous_serving="the service awaits a healthy compatible replacement"
     fi
   fi
+  # Use the same inventory for the OwnSand preflight and UDP recovery.
+  local -a running=()
+  if (( ${#publish[@]} > 0 )) || [[ "$service" == ownsand-api ]]; then
+    local running_ids running_id
+    running_ids="$(docker ps --quiet --filter "label=io.delino.service=$service")" ||
+      fail "could not list the running containers of $service; no replacement was started."
+    while IFS= read -r running_id; do
+      if [[ -n "$running_id" ]]; then
+        running+=("$running_id")
+      fi
+    done <<< "$running_ids"
+  fi
+  if [[ "$service" == ownsand-api ]]; then
+    ownsand_unlink_preflight "$state" "$image" "${running[@]}"
+  fi
   # The replacement takes no `--network-alias "$service"`. The running
   # container keeps that alias (and the route still names it), and Docker DNS
   # would hand out the replacement address with the shared alias while the
@@ -343,15 +358,7 @@ main() {
       fail "$new did not pass the health check; $previous_serving."
     fi
   else
-    local running_ids
-    running_ids="$(docker ps --quiet --filter "label=io.delino.service=$service")" ||
-      fail "could not list the running containers of $service; no replacement was started."
-    local running_id
-    while IFS= read -r running_id; do
-      if [[ -n "$running_id" ]]; then
-        stopped+=("$running_id")
-      fi
-    done <<< "$running_ids"
+    stopped=("${running[@]}")
     echo "Create $new as $upstream with the UDP ports $udp_ports"
     # No container is stopped yet, so the previous containers keep serving.
     if ! docker create "${create[@]}" > /dev/null; then
@@ -624,6 +631,46 @@ sandrun_guard_failure() {
     *)
       echo "::error::SandRun could not verify OwnSand removal state in the target database." >&2 ;;
   esac
+}
+
+# An unlabelled build needs an exact registry digest reviewed by an operator.
+# For a running container, bind that digest to the actual image ID before
+# trusting it. A container's configured image reference alone is insufficient.
+ownsand_unlink_image() {
+  local allowlist="$1" reference="$2" image="$3" capability reviewed_id
+  capability="$(docker image inspect --format '{{index .Config.Labels "io.delino.ownsand.pending-unlinks"}}' "$image")" ||
+    return 1
+  if [[ "$capability" == nullable-account-v1 ]]; then
+    return 0
+  fi
+  [[ -z "$capability" && "$reference" =~ ^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ && -f "$allowlist" ]] &&
+    grep -Fxq -- "$reference" "$allowlist" || return 1
+  if [[ "$reference" != "$image" ]]; then
+    reviewed_id="$(docker image inspect --format '{{.Id}}' "$reference")" || return 1
+    [[ "$reviewed_id" == "$image" ]] || return 1
+  fi
+}
+
+# Even a failed replacement can apply migration 0012 and write NULL account
+# IDs. Check the target and every running fallback before creating a
+# replacement or stopping a container. A readiness check cannot detect an
+# older worker that repeatedly selects rows it cannot scan.
+ownsand_unlink_preflight() {
+  local state="$1" target="$2"
+  shift 2
+  local allowlist="$state.pending-unlink-compatible-images"
+  local id details reference image_id
+  ownsand_unlink_image "$allowlist" "$target" "$target" ||
+    fail "OwnSand target $target has no verified nullable pending unlink support; no replacement was started."
+  for id in "$@"; do
+    details="$(docker inspect --format '{{.Config.Image}} {{.Image}}' "$id")" ||
+      fail "could not inspect OwnSand fallback container $id; no replacement was started."
+    read -r reference image_id <<< "$details"
+    if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+      ! ownsand_unlink_image "$allowlist" "$reference" "$image_id"; then
+      fail "OwnSand fallback container $id ($reference) has no verified nullable pending unlink support; no replacement was started."
+    fi
+  done
 }
 
 # Inspect the actual image ID of existing containers. The optional allowlist

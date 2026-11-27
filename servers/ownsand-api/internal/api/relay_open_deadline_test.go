@@ -298,14 +298,25 @@ func TestRelayAdmissionStreamOpenWait(t *testing.T) {
 			}
 		}
 	}
-	expect := func(t *testing.T, want relayAdmissionWait) {
+	expect := func(t *testing.T, want relayAdmissionWait, activeStreams int) {
 		t.Helper()
+		checkStreams := func(t *testing.T) {
+			t.Helper()
+			if got := conn.StreamCount(); got != activeStreams {
+				t.Fatalf("open streams after rejected admission = %d, want %d", got, activeStreams)
+			}
+		}
 		t.Run("deadline", func(t *testing.T) {
 			before := countRPCCode(env, readFileProcedure, connect.CodeDeadlineExceeded)
+			start := time.Now()
 			_, done := startCall(t, serverDeadline)
 			requireWait(t, want)
 			requireCode(t, done, connect.CodeDeadlineExceeded)
+			if took := time.Since(start); took > serverDeadline+waitWithin {
+				t.Fatalf("the call ended after %v, want about the %v server deadline", took, serverDeadline)
+			}
 			waitRPCCode(t, env, readFileProcedure, connect.CodeDeadlineExceeded, before)
+			checkStreams(t)
 		})
 		t.Run("cancel", func(t *testing.T) {
 			before := countRPCCode(env, readFileProcedure, connect.CodeCanceled)
@@ -323,11 +334,12 @@ func TestRelayAdmissionStreamOpenWait(t *testing.T) {
 			cancel()
 			requireCode(t, done, connect.CodeCanceled)
 			waitRPCCode(t, env, readFileProcedure, connect.CodeCanceled, before)
+			checkStreams(t)
 		})
 	}
 
 	t.Run("queue full", func(t *testing.T) {
-		expect(t, relayAdmissionQueue)
+		expect(t, relayAdmissionQueue, fillerCount)
 	})
 	t.Run("open order held", func(t *testing.T) {
 		holderCtx, stopHolder := context.WithCancel(t.Context())
@@ -354,7 +366,7 @@ func TestRelayAdmissionStreamOpenWait(t *testing.T) {
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		expect(t, relayAdmissionGate)
+		expect(t, relayAdmissionGate, fillerCount+1)
 		t.Run("close", func(t *testing.T) {
 			// The client has no deadline, and the server deadline is longer
 			// than the wait for the RPC to reach the gate and return.
