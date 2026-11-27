@@ -1931,24 +1931,26 @@ export function createMockTransport(
         const { org } = membership(req.organizationId);
         validateListFilter("kind", WorkloadKindSchema, [req.kind]);
         validateListFilter("states", RequestStateSchema, req.states);
+        const hasStateFilter = req.states.length > 0;
         const active = org.requests
           .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
           .sort(compareQueueOrder);
-        const ended = req.includeEnded
-          ? org.requests
-              .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
-              .sort(
-                (a, b) =>
-                  compareTimestamps(b.endedAt, a.endedAt) ||
-                  a.requestId.localeCompare(b.requestId),
-              )
-          : [];
+        const ended =
+          hasStateFilter || req.includeEnded
+            ? org.requests
+                .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
+                .sort(
+                  (a, b) =>
+                    compareTimestamps(b.endedAt, a.endedAt) ||
+                    a.requestId.localeCompare(b.requestId),
+                )
+            : [];
         const items = [...active, ...ended].filter(
           (r) =>
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
             (req.kind === WorkloadKind.UNSPECIFIED || r.kind === req.kind) &&
-            (req.states.length === 0 || req.states.includes(r.state)),
+            (!hasStateFilter || req.states.includes(r.state)),
         );
         const p = page(items, req);
         return { requests: p.items, nextPageToken: p.nextPageToken };
@@ -1990,10 +1992,11 @@ export function createMockTransport(
         validateListFilter("states", RunnerStateSchema, req.states);
         const items = org.runners.filter(
           (r) =>
-            (req.includeEnded || !TERMINAL_RUNNER_STATES.has(r.state)) &&
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
-            (req.states.length === 0 || req.states.includes(r.state)),
+            (req.states.length > 0
+              ? req.states.includes(r.state)
+              : req.includeEnded || !TERMINAL_RUNNER_STATES.has(r.state)),
         );
         const p = page(items, req);
         return { runners: p.items, nextPageToken: p.nextPageToken };
@@ -2211,7 +2214,6 @@ export function createMockTransport(
         validateListFilter("states", RequestStateSchema, req.states);
         const items = org.devSessions.filter(
           (s) =>
-            (req.includeEnded || !TERMINAL_REQUEST_STATES.has(s.state)) &&
             (req.owner.case !== "ownedByCaller" ||
               !req.owner.value ||
               s.ownerUserId === userId) &&
@@ -2219,7 +2221,9 @@ export function createMockTransport(
               s.ownerUserId === req.owner.value) &&
             (req.runnerProfileId === "" ||
               s.runnerProfileId === req.runnerProfileId) &&
-            (req.states.length === 0 || req.states.includes(s.state)),
+            (req.states.length > 0
+              ? req.states.includes(s.state)
+              : req.includeEnded || !TERMINAL_REQUEST_STATES.has(s.state)),
         );
         const p = page(items, req);
         return { devSessions: p.items, nextPageToken: p.nextPageToken };

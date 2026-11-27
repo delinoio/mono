@@ -919,13 +919,19 @@ describe("requests", () => {
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${ACME}/requests`);
 
-    await screen.getByRole("checkbox", "Show ended requests").tap();
     const table = screen.getByRole("table", "Requests");
+    const endedRequest = screen.getByText("acme-robotics/site · deploy", {
+      exact: true,
+    });
+    await expect(table).toContainText("build (ubuntu)");
+    await expect(endedRequest).toBeHidden();
+    await screen.getByRole("checkbox", "Show ended requests").tap();
     await expect(table).toContainText("deploy");
     const queuedJob = table
       .getByRole("row")
       .filter({ hasText: "acme-robotics/firmware · test (ubuntu)" });
     await expect(queuedJob.getByRole("button", "Cancel")).toBeVisible();
+    await expect(endedRequest).toBeVisible();
     const sources = await browser.evaluate(() =>
       Array.from(
         document.querySelectorAll(
@@ -941,6 +947,9 @@ describe("requests", () => {
       "—",
       "acme-robotics/site · deploy",
     ]);
+    await screen.getByRole("checkbox", "Show ended requests").tap();
+    await expect(table).toContainText("build (ubuntu)");
+    await expect(endedRequest).toBeHidden();
   });
 });
 
