@@ -22,8 +22,8 @@ var fetchKernelBody = []byte("the pinned guest kernel")
 // call to $STUB_OUTS, optionally waits until two stubs run at the same time
 // ($STUB_BARRIER: each creates a marker file and waits for the second one, so
 // the overlap does not depend on timing), then writes $STUB_BODY to the -o
-// file. With STUB_PARTIAL set it writes only the first bytes and fails with
-// the curl exit status 18 (partial file), like an interrupted download.
+// file. With STUB_FAIL set, it writes the full body before returning a curl
+// error so that a matching checksum cannot hide an ignored exit status.
 // STUB_DESTINATION_DIRECTORY makes the destination a directory during the download.
 const fetchKernelStubCurl = `#!/usr/bin/env bash
 set -e
@@ -46,15 +46,14 @@ if [ -n "${STUB_BARRIER:-}" ]; then
     exit 1
   fi
 fi
-if [ -n "${STUB_PARTIAL:-}" ]; then
-  head -c 3 "$STUB_BODY" > "$out"
-  exit 18
-fi
 if [ -n "${STUB_DESTINATION_DIRECTORY:-}" ]; then
   mkdir "$STUB_DESTINATION_DIRECTORY"
   cp "$STUB_BODY" "$STUB_DESTINATION_DIRECTORY/sentinel"
 fi
 cp "$STUB_BODY" "$out"
+if [ -n "${STUB_FAIL:-}" ]; then
+  exit 56
+fi
 `
 
 // fetchKernelStubUname reports the architecture in $STUB_ARCH, so the tests
@@ -390,8 +389,10 @@ func TestFetchKernelFailedDownloadLeavesAnExistingKernel(t *testing.T) {
 	older := []byte("an older kernel")
 	k.seed(older)
 	body := k.body("good", fetchKernelBody)
-	if out, err := k.run(body, "STUB_PARTIAL=1"); err == nil {
-		t.Fatalf("fetch succeeded with an interrupted download\n%s", out)
+	out, err := k.run(body, "STUB_FAIL=1")
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		t.Fatalf("want a nonzero exit after curl fails with a complete body, got %v\n%s", err, out)
 	}
 	k.requireKernel(older)
 }

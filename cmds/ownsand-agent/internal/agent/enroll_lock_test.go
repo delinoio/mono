@@ -93,6 +93,22 @@ func TestEnrollArrivalReportsEarlyError(t *testing.T) {
 	}
 }
 
+func TestEnrollWithExpiredLockContextDoesNotPrepareIdentity(t *testing.T) {
+	cp, st, client := newEnrollFixture(t)
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	id, err := Enroll(ctx, st, client, testcp.Token, "host", quietLogger())
+	if id != nil || !errors.Is(err, store.ErrEnrollmentBusy) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired enrollment = (%v, %v), want ErrEnrollmentBusy and DeadlineExceeded", id, err)
+	}
+	if _, err := os.Stat(st.Path(store.IdentityFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired enrollment changed the identity file: %v", err)
+	}
+	if calls := len(cp.EnrollPublicKeys()); calls != 0 {
+		t.Fatalf("expired enrollment sent %d RPCs, want 0", calls)
+	}
+}
+
 // TestEnrollWaitingAttemptKeepsCompletedIdentity starts a second enrollment
 // on one state directory while the first is in its Enroll call. The second
 // waits for the lock, then finds the completed identity, ends with
