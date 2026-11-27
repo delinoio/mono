@@ -1,0 +1,51 @@
+{
+  "gid": "inv-19-usage-table-keyboard-scroll",
+  "commit": "2931c6d3e5a628a7657cea67b051826e9208424d",
+  "nativeValidation": {
+    "status": "pending",
+    "host": "m3-16",
+    "reason": "The assigned Linux worker cannot access the macOS host.",
+    "platform": "macOS Safari",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "2931c6d3e5a628a7657cea67b051826e9208424d",
+    "setup": "Use a signed-in macOS desktop session with native Safari, Node 24.22.3 and pnpm 10.26.2. Use a clean checkout with the worker change, record the tested SHA and copy the probe to the listed destination. In Safari Settings, Advanced, enable Press Tab to highlight each item on a webpage. Enable Keyboard navigation in macOS System Settings, Keyboard. The WebDriver probe uses a 360 px same-origin frame because Safari can enforce a minimum window width.",
+    "references": [
+      "https://developer.apple.com/documentation/safari-developer-tools/macos-enabling-webdriver",
+      "https://support.apple.com/en-ie/guide/safari/ibrw1075/mac"
+    ],
+    "commands": [
+      "mkdir -p \"$PWD/.t3-tmp/safari-usage\"",
+      "export TMPDIR=\"$PWD/.t3-tmp\"",
+      "pnpm install --frozen-lockfile",
+      "pnpm exec turbo run build --filter='delino-accounts^...'",
+      "/usr/bin/safaridriver --enable",
+      "bash -s <<'SAFARI_VALIDATION'\nset -euo pipefail\nroot=\"$(git rev-parse --show-toplevel)\"\ncd \"$root\"\nexport TMPDIR=\"$root/.t3-tmp\"\noutput=\"$TMPDIR/safari-usage\"\nmkdir -p \"$output\"\ntest -z \"$(git status --porcelain)\"\ngit rev-parse HEAD | tee \"$output/revision.txt\"\nsw_vers | tee \"$output/macos.txt\"\nif curl -sS http://127.0.0.1:4444/status >/dev/null 2>&1; then\n  printf '%s\\n' 'Expected unused WebDriver port 4444.' >&2\n  exit 1\nfi\n(\n  cd apps/delino-accounts\n  exec node node_modules/@rsbuild/core/bin/rsbuild.js dev --no-env --config e2e/rsbuild.config.ts --host 127.0.0.1 --port 0\n) > \"$output/rsbuild.log\" 2>&1 &\napp_pid=$!\n/usr/bin/safaridriver -p 4444 > \"$output/safaridriver.log\" 2>&1 &\ndriver_pid=$!\ncleanup() {\n  kill \"$app_pid\" \"$driver_pid\" 2>/dev/null || true\n  wait \"$app_pid\" \"$driver_pid\" 2>/dev/null || true\n}\ntrap cleanup EXIT\napp_url=\"\"\nfor attempt in {1..60}; do\n  app_url=\"$(sed -nE 's/.*(http:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/billing-usage).*/\\1/p' \"$output/rsbuild.log\")\"\n  if [[ -n \"$app_url\" ]] && curl -fsS \"$app_url\" >/dev/null 2>&1 &&\n    curl -fsS http://127.0.0.1:4444/status >/dev/null 2>&1; then\n    break\n  fi\n  sleep 0.25\ndone\nkill -0 \"$app_pid\" \"$driver_pid\"\ntest -n \"$app_url\"\nnode \"$TMPDIR/usage-keyboard-webdriver.mjs\" safari http://127.0.0.1:4444 \"$app_url\" \"$output\" 2>&1 | tee \"$output/results.log\"\nSAFARI_VALIDATION",
+      "rm -rf -- protos/delino/accounts/dist"
+    ],
+    "expectedResults": [
+      "The probe exits 0 and logs the native Safari version and platform.",
+      "At 360 px, Tab from Previous month focuses the single region named by the native caption. It has an explicit tabindex of 0 and a visible solid 2 px outline. Positive overflow clips Cost at first. ArrowRight reveals it, and ArrowLeft restores scrollLeft 0. Tab moves past the region and Shift+Tab can move back into it and exit backwards.",
+      "At 1280 px, the native caption, five headers, and seeded row display in the table. Quantity is 1,048,576 bytes and Cost and monthly total read $0.004567. Previous month shows the empty message and has no focusable usage-table wrapper.",
+      "Inspect the two 360 px screenshots for the focus outline and the fully revealed Cost cell. Preserve the revision, environment, log, and screenshots as native evidence."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-19-usage-table-keyboard-scroll/worker/.t3-tmp/usage-keyboard-webdriver.mjs",
+      "copyTo": ".t3-tmp/usage-keyboard-webdriver.mjs",
+      "regressionTests": [
+        "apps/delino-accounts/e2e/billing-usage-keyboard.e2e.ts",
+        "apps/delino-accounts/e2e/billing-usage.fixture.tsx"
+      ],
+      "outputs": [
+        ".t3-tmp/safari-usage/revision.txt",
+        ".t3-tmp/safari-usage/macos.txt",
+        ".t3-tmp/safari-usage/results.log",
+        ".t3-tmp/safari-usage/rsbuild.log",
+        ".t3-tmp/safari-usage/safaridriver.log",
+        ".t3-tmp/safari-usage/360-keyboard-focus.png",
+        ".t3-tmp/safari-usage/360-keyboard-cost.png",
+        ".t3-tmp/safari-usage/1280-native-table.png",
+        ".t3-tmp/safari-usage/1280-empty-month.png"
+      ]
+    }
+  }
+}
