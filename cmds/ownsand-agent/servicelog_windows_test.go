@@ -20,25 +20,21 @@ import (
 // delete the state directory content, including the log and the identity.
 func TestResetDeletesStateWhileServiceLogIsOpen(t *testing.T) {
 	requireElevatedServiceLogTest(t)
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "state")
+	f, failure := setupServiceLog(dir)
+	if f == nil || failure != "" {
+		t.Fatalf("setupServiceLog = %v, %q", f, failure)
+	}
+	defer f.Close()
 	for _, name := range []string{store.IdentityFile, store.AgentFile} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	f, err := openServiceLog(filepath.Join(dir, "agent.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
 	if _, err := f.WriteString("{\"msg\":\"first\"}\n"); err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.Reset(); err != nil {
+	if err := store.ResetDir(dir); err != nil {
 		t.Fatalf("Reset with the log open: %v", err)
 	}
 	// The open handle can still write after the delete.
@@ -80,8 +76,8 @@ func TestOpenServiceLogAppends(t *testing.T) {
 	}
 }
 
-// A second handle can read the log while the service holds it open.
-func TestOpenServiceLogAllowsConcurrentRead(t *testing.T) {
+// The sharing modes allow reading and deleting an open log without elevation.
+func TestOpenServiceLogAllowsConcurrentReadAndDelete(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.log")
 	f, err := openServiceLog(path)
 	if err != nil {
@@ -93,6 +89,18 @@ func TestOpenServiceLogAllowsConcurrentRead(t *testing.T) {
 	}
 	if b, err := os.ReadFile(path); err != nil || string(b) != "x" {
 		t.Fatalf("read while open = %q, %v", b, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("delete while open: %v", err)
+	}
+	if _, err := f.WriteString("after delete"); err != nil {
+		t.Fatalf("write after delete: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat after delete and close = %v, want os.ErrNotExist", err)
 	}
 }
 

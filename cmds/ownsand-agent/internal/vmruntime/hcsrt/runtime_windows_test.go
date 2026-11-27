@@ -728,8 +728,8 @@ func TestResetVMDirStopsLeftoverSystemBeforeRemovingDir(t *testing.T) {
 	}
 }
 
-// stubInventory makes Running see the given HCS load result and compute
-// systems for the test, without a Hyper-V host.
+// stubInventory supplies the HCS load and owner inventory results for tests
+// without a Hyper-V host.
 func stubInventory(t *testing.T, loadErr error, systems []systemProperties, enumErr error) {
 	t.Helper()
 	origLoad, origEnum := hcsLoadFunc, enumerateSystemsFunc
@@ -803,11 +803,47 @@ func TestRunningListsSurvivorsOfThisOwner(t *testing.T) {
 }
 
 func TestRunningEmptyEnumeration(t *testing.T) {
-	stubInventory(t, nil, nil, nil)
+	stubInventory(t, nil, []systemProperties{}, nil)
 	r := &Runtime{logger: slog.New(slog.NewTextHandler(io.Discard, nil)), vms: map[string]*vm{}}
 	ids, err := r.Running(t.Context())
 	if err != nil || len(ids) != 0 {
 		t.Fatalf("Running = %v, %v, want no IDs and no error", ids, err)
+	}
+	passed, detail := hyperVCheck(func() bool { return true })
+	if !passed || !strings.Contains(detail, "0 compute systems") {
+		t.Errorf("hyperVCheck = %t, %q, want success with zero compute systems", passed, detail)
+	}
+}
+
+func TestMissingInventory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		doc  string
+	}{
+		{name: "missing"},
+		{name: "null", doc: "null"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			list, err := decodeSystemList(tc.doc)
+			if !errors.Is(err, errMissingSystemList) {
+				t.Fatalf("decodeSystemList(%q) error = %v, want %v", tc.doc, err, errMissingSystemList)
+			}
+			stubInventory(t, nil, list, err)
+			r := newRunningTestRuntime()
+			ids, err := r.Running(t.Context())
+			if !slices.Equal(ids, []string{"tracked"}) || !errors.Is(err, errMissingSystemList) {
+				t.Errorf("Running = %v, %v, want [tracked] and an error wrapping %v", ids, err, errMissingSystemList)
+			}
+			clear(r.vms)
+			ids, err = r.Running(t.Context())
+			if len(ids) != 0 || !errors.Is(err, errMissingSystemList) {
+				t.Errorf("Running = %v, %v, want no IDs and an error wrapping %v", ids, err, errMissingSystemList)
+			}
+			passed, detail := hyperVCheck(func() bool { return true })
+			if passed || !strings.Contains(detail, errMissingSystemList.Error()) {
+				t.Errorf("hyperVCheck = %t, %q, want failure with %v", passed, detail, errMissingSystemList)
+			}
+		})
 	}
 }
 

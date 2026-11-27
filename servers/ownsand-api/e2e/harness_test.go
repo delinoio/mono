@@ -242,6 +242,7 @@ func buildBinaries(t *testing.T) string {
 }
 
 func TestMain(m *testing.M) {
+	runRestartStandIn()
 	code := m.Run()
 	if buildDir != "" {
 		_ = os.RemoveAll(buildDir)
@@ -456,14 +457,21 @@ func launchProcess(logs *logSink, name string, env []string, bin string, args ..
 // startProcess starts a child process and stops it when the test ends.
 func startProcess(t *testing.T, logs *logSink, name string, env []string, bin string, args ...string) *proc {
 	t.Helper()
+	return startProcessFor(t, t, logs, name, env, bin, args...)
+}
+
+// startProcessFor reports launch failures to the caller and keeps the process
+// running until its owner cleans up.
+func startProcessFor(t, owner *testing.T, logs *logSink, name string, env []string, bin string, args ...string) *proc {
+	t.Helper()
 	p, err := launchProcess(logs, name, env, bin, args...)
 	if err != nil {
 		t.Fatalf("start %s: %v", name, err)
 	}
-	t.Cleanup(func() {
+	owner.Cleanup(func() {
 		// Go cannot deliver SIGTERM to a child on Windows.
 		if runtime.GOOS == "windows" {
-			killProcess(t, p)
+			killProcess(owner, p)
 			return
 		}
 		_ = p.cmd.Process.Signal(syscall.SIGTERM)
@@ -706,22 +714,22 @@ func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work strin
 }
 
 // killAgent kills agent i, as a crash does.
-func (s *stack) killAgent(i int) {
-	s.t.Helper()
-	killProcess(s.t, s.agents[i].proc)
+func (s *stack) killAgent(t *testing.T, i int) {
+	t.Helper()
+	killProcess(t, s.agents[i].proc)
 }
 
 // restartAgent starts agent i again over its state directory.
-func (s *stack) restartAgent(i int) {
-	s.t.Helper()
+func (s *stack) restartAgent(t *testing.T, i int) {
+	t.Helper()
 	a := &s.agents[i]
-	a.proc = startProcess(s.t, s.logs, fmt.Sprintf("agent%d-restarted", i), a.env, filepath.Join(s.bins, "ownsand-agent"), "run")
+	a.proc = startProcessFor(t, s.t, s.logs, fmt.Sprintf("agent%d-restarted", i), a.env, filepath.Join(s.bins, "ownsand-agent"), "run")
 }
 
 // killAPI kills the control plane, as a crash does.
-func (s *stack) killAPI() {
-	s.t.Helper()
-	killProcess(s.t, s.api)
+func (s *stack) killAPI(t *testing.T) {
+	t.Helper()
+	killProcess(t, s.api)
 }
 
 // apiStartAttempts bounds the starts of the control plane on new ports.
@@ -787,13 +795,13 @@ func (s *stack) startAPI(env []string) {
 // address counts only after the replacement logged "server_started", which
 // it does after it bound the listener. Another server that holds the address
 // therefore cannot stand in for the replacement.
-func (s *stack) restartAPI() {
-	s.t.Helper()
+func (s *stack) restartAPI(t *testing.T) {
+	t.Helper()
 	const name = "api-restarted"
-	s.api = startProcess(s.t, s.logs, name, s.apiEnv, filepath.Join(s.bins, "ownsand-api"))
+	s.api = startProcessFor(t, s.t, s.logs, name, s.apiEnv, filepath.Join(s.bins, "ownsand-api"))
 	owned := func() bool { return s.logs.hasLogMessage(name, "server_started") }
 	if err := pollReadyWhile(s.apiURL+"/healthz", healthStartupBudget, s.api.done, owned); err != nil {
-		s.t.Fatalf("the restarted control plane did not become healthy: %v", err)
+		t.Fatalf("the restarted control plane did not become healthy: %v", err)
 	}
 }
 

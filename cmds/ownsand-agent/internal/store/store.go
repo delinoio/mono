@@ -22,6 +22,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -136,6 +137,10 @@ func (s *Store) Path(elem ...string) string {
 // same directory, syncs it and renames it into place. On Windows the rename
 // retries for a short time while a reader holds the destination open.
 func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error {
+	return writeFileAtomic(path, data, perm, replaceFile)
+}
+
+func writeFileAtomic(path string, data []byte, perm fs.FileMode, replace func(string, string) error) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
@@ -156,19 +161,28 @@ func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return replaceFile(tmp.Name(), path)
+	return replace(tmp.Name(), path)
 }
 
 func (s *Store) writeJSON(path string, v any) error {
-	data, err := json.MarshalIndent(v, "", "  ")
+	data, err := encodeJSON(v)
 	if err != nil {
 		return err
 	}
-	return WriteFileAtomic(path, append(data, '\n'), 0o600)
+	return WriteFileAtomic(path, data, 0o600)
+}
+
+func encodeJSON(v any) ([]byte, error) {
+	data, err := json.MarshalIndent(v, "", "  ")
+	return append(data, '\n'), err
 }
 
 func (s *Store) readJSON(path string, v any) error {
 	data, err := os.ReadFile(path)
+	return decodeJSON(path, data, err, v)
+}
+
+func decodeJSON(path string, data []byte, err error, v any) error {
 	if errors.Is(err, fs.ErrNotExist) {
 		return ErrNotFound
 	}
@@ -314,12 +328,24 @@ func (s *Store) UpdateAgent(fn func(*AgentState) error) (*AgentState, error) {
 
 // SaveStatus writes the status file of the running agent.
 func (s *Store) SaveStatus(v any) error {
-	return s.writeJSON(s.Path(StatusFile), v)
+	return s.SaveStatusContext(context.Background(), v)
+}
+
+// SaveStatusContext writes the report. On Windows, ctx can cancel a wait
+// for the publication lock or for another process to release the file.
+func (s *Store) SaveStatusContext(ctx context.Context, v any) error {
+	data, err := encodeJSON(v)
+	if err != nil {
+		return err
+	}
+	return writeStatusFile(ctx, s.Path(StatusFile), data)
 }
 
 // LoadStatus reads the status file into v.
 func (s *Store) LoadStatus(v any) error {
-	return s.readJSON(s.Path(StatusFile), v)
+	path := s.Path(StatusFile)
+	data, err := readStatusFile(path)
+	return decodeJSON(path, data, err, v)
 }
 
 // SaveSandbox writes one sandbox record.

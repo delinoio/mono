@@ -3,9 +3,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -140,35 +142,49 @@ func TestHandlerReportsTheRestartStatus(t *testing.T) {
 }
 
 func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
-	const rawLevel = "private-fixture-level"
-	const rawPath = "private-fixture-state"
+	clearAgentEnv(t)
+	const rawLevel = "fixture-invalid-level"
+	const rawPath = "Private Fixture State"
+	const fallbackPath = "Fallback State"
+	t.Setenv(config.EnvLogLevel, rawLevel)
 	wantSetting := "invalid OWNSAND_AGENT_LOG_LEVEL: expected debug, info, warn or error"
-	_, cfgErr := config.FromEnv(func(name string) (string, bool) {
-		if name == config.EnvLogLevel {
-			return rawLevel, true
-		}
-		return "", false
-	})
-	if cfgErr == nil {
-		t.Fatal("invalid log level accepted")
+	buildDirectArgs := func(dir string) []string {
+		return []string{"run", "--state-dir", dir}
+	}
+	buildLauncherArgs := func(dir string) []string {
+		return []string{"service", "launch", "run", "--state-dir=" + dir}
 	}
 	for _, tc := range []struct {
 		name       string
+		args       func(string) []string
+		fallback   bool
 		blockMkdir bool
 		blockOpen  bool
 		eventError error
 		wantEvent  string
 	}{
-		{name: "directory creation fails", blockMkdir: true, wantEvent: "could not prepare the service state directory"},
-		{name: "file open fails", blockOpen: true, wantEvent: "could not open agent.log"},
-		{name: "Event Log write fails", blockOpen: true, eventError: errors.New("write failed"), wantEvent: "could not open agent.log"},
-		{name: "file log works"},
+		{name: "direct service", args: buildDirectArgs},
+		{name: "migrated service", args: buildLauncherArgs},
+		{name: "directory creation fails", args: buildDirectArgs, blockMkdir: true, wantEvent: "could not prepare the service state directory"},
+		{name: "file open fails", args: buildLauncherArgs, blockOpen: true, wantEvent: "could not open agent.log"},
+		{name: "Event Log write fails", args: buildDirectArgs, blockOpen: true, eventError: errors.New("write failed"), wantEvent: "could not open agent.log"},
+		{name: "missing flag", args: func(string) []string { return []string{"run"} }, fallback: true},
+		{name: "blank value", args: func(string) []string { return []string{"run", "--state-dir=  "} }, fallback: true},
+		{name: "missing value", args: func(string) []string { return []string{"run", "--state-dir"} }, fallback: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !tc.blockMkdir {
 				requireElevatedServiceLogTest(t)
 			}
-			dir := filepath.Join(t.TempDir(), rawPath)
+			root := t.TempDir()
+			explicit := filepath.Join(root, rawPath)
+			fallback := filepath.Join(root, fallbackPath)
+			t.Setenv(config.EnvStateDir, " "+fallback+" ")
+			dir := explicit
+			otherDir := fallback
+			if tc.fallback {
+				dir, otherDir = fallback, explicit
+			}
 			path := filepath.Join(dir, "agent.log")
 			if tc.blockMkdir {
 				if err := os.WriteFile(dir, nil, 0o600); err != nil {
@@ -203,8 +219,16 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 				events = append(events, message)
 				return tc.eventError
 			}
-			if code := runUnderServiceManager(config.Config{StateDir: dir}, cfgErr, dispatch, writeEvent, nil); code != exitUsage {
-				t.Fatalf("runUnderServiceManager = %d, want %d", code, exitUsage)
+			var stderr bytes.Buffer
+			report := func(cfgErr error, explicitStateDir string, _ io.Writer) int {
+				return runServiceConfigError(cfgErr, explicitStateDir, dispatch, writeEvent)
+			}
+			code := runWithConfigErrorHandler(tc.args(explicit), nil, io.Discard, &stderr, report)
+			if code != exitUsage || stderr.Len() != 0 {
+				t.Fatalf("run = %d, want %d, stderr = %q", code, exitUsage, stderr.String())
+			}
+			if _, err := os.Stat(otherDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unexpected use of directory %q: %v", otherDir, err)
 			}
 			if tc.wantEvent != "" {
 				if len(events) != 1 || !strings.HasPrefix(events[0], tc.wantEvent) || !strings.Contains(events[0], wantSetting) {
@@ -223,7 +247,7 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 				t.Fatal(err)
 			}
 			log := string(data)
-			if strings.Count(log, `"msg":"invalid configuration"`) != 1 || !strings.Contains(log, wantSetting) || strings.Contains(log, rawPath) || strings.Contains(log, rawLevel) {
+			if strings.Count(log, `"msg":"invalid configuration"`) != 1 || !strings.Contains(log, wantSetting) || strings.Contains(log, rawPath) || strings.Contains(log, fallbackPath) || strings.Contains(log, rawLevel) {
 				t.Fatalf("unexpected log contents: %s", log)
 			}
 		})
@@ -232,16 +256,18 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 
 func TestConfigErrorStateDir(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		env  map[string]string
-		want string
+		name     string
+		explicit string
+		env      map[string]string
+		want     string
 	}{
-		{"set", map[string]string{config.EnvStateDir: ` C:\agent-state `}, `C:\agent-state`},
-		{"blank", map[string]string{config.EnvStateDir: "  "}, config.DefaultStateDir()},
-		{"unset", nil, config.DefaultStateDir()},
+		{"explicit", `C:\Agent State`, map[string]string{config.EnvStateDir: `C:\Fallback State`}, `C:\Agent State`},
+		{"set", "", map[string]string{config.EnvStateDir: ` C:\agent-state `}, `C:\agent-state`},
+		{"blank", "", map[string]string{config.EnvStateDir: "  "}, config.DefaultStateDir()},
+		{"unset", "", nil, config.DefaultStateDir()},
 	} {
 		lookup := func(k string) (string, bool) { v, ok := tc.env[k]; return v, ok }
-		if got := configErrorStateDir(lookup); got != tc.want {
+		if got := configErrorStateDir(tc.explicit, lookup); got != tc.want {
 			t.Errorf("%s: configErrorStateDir = %q, want %q", tc.name, got, tc.want)
 		}
 	}

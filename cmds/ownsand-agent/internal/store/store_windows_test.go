@@ -639,15 +639,12 @@ func TestWriteFileAtomicGivesUpOnStuckReader(t *testing.T) {
 	}
 }
 
-// Concurrent status readers (LoadStatus reads with os.ReadFile, the default
-// Go sharing mode, as `ownsand-agent status` does) never make a write fail
-// and never read an incomplete report.
+// The status command uses a separate Store from the writer. The test only
+// needs a writable directory, so it also runs without elevation.
 func TestConcurrentStatusReadsDoNotLoseWrites(t *testing.T) {
-	requireTrustedProcess(t)
-	s, err := Open(t.TempDir())
-	if err != nil {
-		t.Fatalf("open the store: %v", err)
-	}
+	dir := t.TempDir()
+	s := &Store{dir: dir}
+	reader := &Store{dir: dir}
 	type report struct {
 		Seq     int    `json:"seq"`
 		Padding string `json:"padding"`
@@ -660,6 +657,7 @@ func TestConcurrentStatusReadsDoNotLoseWrites(t *testing.T) {
 	readerErr := make(chan error, 1)
 	go func() {
 		defer close(readerErr)
+		last := 0
 		for {
 			select {
 			case <-stop:
@@ -667,17 +665,12 @@ func TestConcurrentStatusReadsDoNotLoseWrites(t *testing.T) {
 			default:
 			}
 			var r report
-			err := s.LoadStatus(&r)
-			// An open that races with the rename may see a sharing error
-			// or access denied. It is not an incomplete report, and the
-			// next read succeeds, so the test does not count it.
-			if err != nil && isSharingError(err) {
-				continue
-			}
-			if err != nil || r.Padding != padding {
-				readerErr <- fmt.Errorf("incomplete report: %v (padding %d bytes)", err, len(r.Padding))
+			err := reader.LoadStatus(&r)
+			if err != nil || r.Padding != padding || r.Seq < last || r.Seq > 300 {
+				readerErr <- fmt.Errorf("invalid report: %v (sequence %d, previous %d, padding %d bytes)", err, r.Seq, last, len(r.Padding))
 				return
 			}
+			last = r.Seq
 		}
 	}()
 	for i := 1; i <= 300; i++ {
@@ -691,8 +684,8 @@ func TestConcurrentStatusReadsDoNotLoseWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	var last report
-	if err := s.LoadStatus(&last); err != nil || last.Seq != 300 {
-		t.Fatalf("last report %+v, %v", last, err)
+	if err := reader.LoadStatus(&last); err != nil || last.Seq != 300 || last.Padding != padding {
+		t.Fatalf("last report: %v (sequence %d, padding %d bytes)", err, last.Seq, len(last.Padding))
 	}
 }
 

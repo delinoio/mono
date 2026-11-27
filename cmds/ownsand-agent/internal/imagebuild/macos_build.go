@@ -11,6 +11,7 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/vzrt"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // withMacOSBuildDir owns the staging directory through publication and cleanup.
@@ -49,5 +50,5 @@ func finishMacOSImage(ctx context.Context, dir string, metadata images.Metadata,
 	if downloadedIPSW != "" {
 		os.Remove(downloadedIPSW)
 	}
-	return images.Install(ctx, dir)
+	return images.Install(ctx, dir, ownsandv1.GuestOs_GUEST_OS_MACOS)
 }

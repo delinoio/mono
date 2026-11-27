@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 )
 
 // BuildOwner is the HCS owner of the image build VM. It differs from Owner,
@@ -182,10 +182,11 @@ func (b *BuildVM) close() {
 	}
 }
 
-// copyConsole copies the COM1 output of the build VM to path.
+// copyConsole keeps the first 1 MiB of COM1 output across pipe redials.
+// It continues draining the pipe after the log reaches the cap.
 func (b *BuildVM) copyConsole(pipe, path string) {
 	defer close(b.console)
-	out, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	out, err := vmruntime.OpenCappedLog(path, vmruntime.ConsoleLogLimit, b.logger, b.sys.id, vmruntime.ConsoleLogKindConsole)
 	if err != nil {
 		b.logger.Warn("open console log failed", "error", err)
 		return

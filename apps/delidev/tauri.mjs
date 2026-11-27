@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run } from "@tauri-apps/cli";
@@ -241,6 +241,33 @@ function preserveClears(base, override, additions) {
   return patch;
 }
 
+async function runDebianCli(cli, args, options) {
+  const child = spawn(cli, args, options);
+  let interrupted;
+  const onSignal = (signal) => {
+    interrupted ??= signal;
+    // Terminal Ctrl-C already reaches the CLI in the shared process group.
+    if (signal === "SIGTERM" && !child.killed) child.kill(signal);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  try {
+    let failure;
+    child.on("error", (error) => {
+      failure = error;
+    });
+    const [code, signal] = await new Promise((resolve) => {
+      child.once("close", (code, signal) => resolve([code, signal]));
+    });
+    if (failure) throw failure;
+    const stoppingSignal = interrupted ?? signal;
+    return stoppingSignal ? 128 + constants.signals[stoppingSignal] : code;
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  }
+}
+
 async function runNoticeBuild({
   config,
   baseConfig,
@@ -300,16 +327,19 @@ async function runNoticeBuild({
     }
 
     // A CLI subprocess lets us clean up even when Tauri exits during argument parsing.
-    const cliArgs =
-      platformName === "macos"
-        ? [require.resolve("@tauri-apps/cli/tauri.js"), ...args]
-        : args;
-    const { error, status } = spawnSync(cli, cliArgs, {
+    const options = {
       env: { ...process.env, DELIDEV_CEF_NOTICE_DIR: noticeDir },
       stdio: "inherit",
-    });
-    if (error) throw error;
-    process.exitCode = status ?? 1;
+      shell: false,
+    };
+    if (platformName === "linux") {
+      process.exitCode = await runDebianCli(cli, args, options);
+    } else {
+      const cliArgs = [require.resolve("@tauri-apps/cli/tauri.js"), ...args];
+      const { error, status } = spawnSync(cli, cliArgs, options);
+      if (error) throw error;
+      process.exitCode = status ?? 1;
+    }
   } finally {
     rmSync(noticeDir, { recursive: true, force: true });
   }

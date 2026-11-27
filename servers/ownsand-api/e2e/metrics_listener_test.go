@@ -48,8 +48,8 @@ func TestFixtureIgnoresInheritedMetricsAddr(t *testing.T) {
 	}
 	// A restart reuses the environment of the first start (and a start that
 	// is not isolated would fail on the held address).
-	s.killAPI()
-	s.restartAPI()
+	s.killAPI(t)
+	s.restartAPI(t)
 	select {
 	case <-accepted:
 		t.Error("the control plane connected to the inherited metrics address")

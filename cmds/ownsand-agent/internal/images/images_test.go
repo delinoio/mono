@@ -7,64 +7,175 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-func build(t *testing.T, dir, marker string, withMetadata bool) {
-	t.Helper()
-	b := images.BuildDir(dir)
-	if err := os.MkdirAll(b, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(b, "disk"), []byte(marker), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if withMetadata {
-		if err := images.WriteMetadata(b, images.Metadata{GuestOS: ownsandv1.GuestOs_GUEST_OS_MACOS, Source: marker}); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
+const (
+	macOS   = ownsandv1.GuestOs_GUEST_OS_MACOS
+	windows = ownsandv1.GuestOs_GUEST_OS_WINDOWS
+)
+
+var macOSFiles = []string{images.MacOSDisk, images.MacOSAuxStorage, images.MacOSHardwareModel}
 
 func TestInstallReplacesTheImage(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), images.MacOSDir)
-	build(t, dir, "one", true)
-	if err := images.Install(t.Context(), dir); err != nil {
-		t.Fatal(err)
-	}
-	build(t, dir, "two", true)
-	if err := images.Install(t.Context(), dir); err != nil {
-		t.Fatal(err)
-	}
-	if b, _ := os.ReadFile(filepath.Join(dir, "disk")); string(b) != "two" {
-		t.Fatalf("installed image %q", b)
-	}
-	m, err := images.ReadMetadata(dir)
-	if err != nil || m.Source != "two" || m.GuestOS != ownsandv1.GuestOs_GUEST_OS_MACOS {
-		t.Fatalf("metadata %+v %v", m, err)
-	}
-	for _, p := range []string{images.BuildDir(dir), dir + ".old"} {
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Fatalf("%s left behind: %v", p, err)
-		}
+	for _, tt := range []struct {
+		guestOS ownsandv1.GuestOs
+		files   []string
+	}{
+		{macOS, macOSFiles},
+		{windows, []string{images.WindowsDisk}},
+	} {
+		t.Run(tt.guestOS.String(), func(t *testing.T) {
+			dir, err := images.Dir(t.TempDir(), tt.guestOS)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stage := images.BuildDir(dir)
+			backup := images.OldDir(dir)
+			writeImageFiles(t, dir, "previous", tt.guestOS, tt.files)
+			writeImageFiles(t, backup, "stale", tt.guestOS, tt.files)
+			writeImageFiles(t, stage, "next", tt.guestOS, tt.files)
+
+			if err := images.Install(t.Context(), dir, tt.guestOS); err != nil {
+				t.Fatal(err)
+			}
+			assertImageFiles(t, dir, "next", tt.guestOS, tt.files)
+			assertAbsent(t, stage)
+			assertAbsent(t, backup)
+		})
 	}
 }
 
-func TestInstallKeepsTheOldImageWithoutMetadata(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), images.WindowsDir)
-	build(t, dir, "one", true)
-	if err := images.Install(t.Context(), dir); err != nil {
-		t.Fatal(err)
+func TestInstallRejectsInvalidStaging(t *testing.T) {
+	for _, tt := range []struct {
+		guestOS      ownsandv1.GuestOs
+		files        []string
+		requiredFile string
+		otherOS      ownsandv1.GuestOs
+		otherFiles   []string
+	}{
+		{macOS, macOSFiles, images.MacOSAuxStorage, windows, []string{images.WindowsDisk}},
+		{windows, []string{images.WindowsDisk}, images.WindowsDisk, macOS, macOSFiles},
+	} {
+		t.Run(tt.guestOS.String(), func(t *testing.T) {
+			for _, fault := range []struct {
+				name      string
+				wantError string
+				inject    func(*testing.T, string)
+			}{
+				{"missing metadata", images.MetadataFile, func(t *testing.T, stage string) {
+					if err := os.Remove(filepath.Join(stage, images.MetadataFile)); err != nil {
+						t.Fatal(err)
+					}
+				}},
+				{"malformed metadata", "parse " + images.MetadataFile, func(t *testing.T, stage string) {
+					if err := os.WriteFile(filepath.Join(stage, images.MetadataFile), []byte("{"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}},
+				{"missing required file", tt.requiredFile, func(t *testing.T, stage string) {
+					if err := os.Remove(filepath.Join(stage, tt.requiredFile)); err != nil {
+						t.Fatal(err)
+					}
+				}},
+				{"directory in place of required file", tt.requiredFile + " is not a regular file", func(t *testing.T, stage string) {
+					path := filepath.Join(stage, tt.requiredFile)
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(path, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}},
+				{"wrong guest OS", "declares guest OS " + tt.otherOS.String() + ", want " + tt.guestOS.String(), func(t *testing.T, stage string) {
+					if err := os.RemoveAll(stage); err != nil {
+						t.Fatal(err)
+					}
+					writeImageFiles(t, stage, "wrong OS", tt.otherOS, tt.otherFiles)
+				}},
+			} {
+				t.Run(fault.name, func(t *testing.T) {
+					dir, err := images.Dir(t.TempDir(), tt.guestOS)
+					if err != nil {
+						t.Fatal(err)
+					}
+					stage := images.BuildDir(dir)
+					backup := images.OldDir(dir)
+					writeImageFiles(t, dir, "previous", tt.guestOS, tt.files)
+					writeImageFiles(t, backup, "stale", tt.guestOS, tt.files)
+					writeImageFiles(t, stage, "next", tt.guestOS, tt.files)
+					fault.inject(t, stage)
+
+					err = images.Install(t.Context(), dir, tt.guestOS)
+					if err == nil || !strings.Contains(err.Error(), fault.wantError) {
+						t.Fatalf("Install = %v, want an error about %q", err, fault.wantError)
+					}
+					assertImageFiles(t, dir, "previous", tt.guestOS, tt.files)
+					assertImageFiles(t, backup, "stale", tt.guestOS, tt.files)
+				})
+			}
+		})
 	}
-	build(t, dir, "partial", false)
-	if err := images.Install(t.Context(), dir); err == nil {
-		t.Fatal("a build without metadata was installed")
+}
+
+func TestInstallRejectsIncompleteStagingWithoutACanonicalImage(t *testing.T) {
+	for _, tt := range []struct {
+		guestOS ownsandv1.GuestOs
+		files   []string
+	}{
+		{macOS, macOSFiles},
+		{windows, []string{images.WindowsDisk}},
+	} {
+		t.Run(tt.guestOS.String(), func(t *testing.T) {
+			dir, err := images.Dir(t.TempDir(), tt.guestOS)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stage := images.BuildDir(dir)
+			writeImageFiles(t, stage, "next", tt.guestOS, tt.files)
+			if err := os.Remove(filepath.Join(stage, tt.files[0])); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := images.Install(t.Context(), dir, tt.guestOS); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("first Install = %v, want a missing file error", err)
+			}
+			assertAbsent(t, dir)
+
+			backup := images.OldDir(dir)
+			writeImageFiles(t, backup, "previous", tt.guestOS, tt.files)
+			if err := images.Install(t.Context(), dir, tt.guestOS); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Install after interruption = %v, want a missing file error", err)
+			}
+			assertImageFiles(t, dir, "previous", tt.guestOS, tt.files)
+			assertAbsent(t, backup)
+		})
 	}
-	if b, _ := os.ReadFile(filepath.Join(dir, "disk")); string(b) != "one" {
-		t.Fatalf("installed image %q", b)
+}
+
+func assertAbsent(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Lstat %s = %v, want os.ErrNotExist", path, err)
+	}
+}
+
+func assertImageFiles(t *testing.T, dir, marker string, guestOS ownsandv1.GuestOs, files []string) {
+	t.Helper()
+	metadata, err := images.ReadMetadata(dir)
+	if err != nil || metadata.Source != marker || metadata.GuestOS != guestOS {
+		t.Fatalf("metadata in %s = %+v, %v, want source %q and guest OS %v", dir, metadata, err, marker, guestOS)
+	}
+	for _, name := range files {
+		path := filepath.Join(dir, name)
+		b, err := os.ReadFile(path)
+		if err != nil || string(b) != marker {
+			t.Fatalf("%s = %q, %v, want %q", path, b, err, marker)
+		}
 	}
 }
 
@@ -87,15 +198,20 @@ func TestDir(t *testing.T) {
 // (dir itself, not its build directory).
 func writeImage(t *testing.T, dir, marker string) {
 	t.Helper()
+	writeImageFiles(t, dir, marker, macOS, macOSFiles)
+}
+
+func writeImageFiles(t *testing.T, dir, marker string, guestOS ownsandv1.GuestOs, files []string) {
+	t.Helper()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{images.MacOSDisk, images.MacOSAuxStorage, images.MacOSHardwareModel} {
+	for _, name := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(marker), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := images.WriteMetadata(dir, images.Metadata{GuestOS: ownsandv1.GuestOs_GUEST_OS_MACOS, Source: marker}); err != nil {
+	if err := images.WriteMetadata(dir, images.Metadata{GuestOS: guestOS, Source: marker}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -221,7 +337,7 @@ func TestInstallAfterAnInterruptedExchangeKeepsAndThenReplacesTheOnlyImage(t *te
 	if err := os.MkdirAll(images.BuildDir(dir), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := images.Install(t.Context(), dir); err == nil {
+	if err := images.Install(t.Context(), dir, macOS); err == nil {
 		t.Fatal("a build without metadata was installed")
 	}
 	if got := diskOf(t, dir); got != "old" {
@@ -236,7 +352,7 @@ func TestInstallAfterAnInterruptedExchangeKeepsAndThenReplacesTheOnlyImage(t *te
 		t.Fatal(err)
 	}
 	writeImage(t, images.BuildDir(dir), "new")
-	if err := images.Install(t.Context(), dir); err != nil {
+	if err := images.Install(t.Context(), dir, macOS); err != nil {
 		t.Fatal(err)
 	}
 	if got := diskOf(t, dir); got != "new" {
@@ -273,7 +389,7 @@ func TestInstallCancellationAroundExchange(t *testing.T) {
 				}
 				return err
 			}))
-			err := images.Install(ctx, dir)
+			err := images.Install(ctx, dir, macOS)
 			if ctx.Err() != context.Canceled {
 				t.Fatal("the fixture did not cancel at the expected rename")
 			}
@@ -310,7 +426,7 @@ func TestInstallKeepsTheOldImageWhenThePublishAndTheRestoreFail(t *testing.T) {
 		}
 		return os.Rename(from, to)
 	})
-	err := images.Install(t.Context(), dir)
+	err := images.Install(t.Context(), dir, macOS)
 	restore()
 	if !errors.Is(err, injected) {
 		t.Fatalf("Install = %v", err)
@@ -320,7 +436,7 @@ func TestInstallKeepsTheOldImageWhenThePublishAndTheRestoreFail(t *testing.T) {
 	}
 
 	// The next call recovers it; the retry then publishes the new image.
-	if err := images.Install(t.Context(), dir); err != nil {
+	if err := images.Install(t.Context(), dir, macOS); err != nil {
 		t.Fatal(err)
 	}
 	if got := diskOf(t, dir); got != "new" {
@@ -339,7 +455,7 @@ func TestInstallRestoresTheOldImageWhenOnlyThePublishFails(t *testing.T) {
 		}
 		return os.Rename(from, to)
 	})
-	err := images.Install(t.Context(), dir)
+	err := images.Install(t.Context(), dir, macOS)
 	restore()
 	if !errors.Is(err, injected) {
 		t.Fatalf("Install = %v", err)
@@ -389,7 +505,7 @@ func TestRecoverPrefersAValidCanonicalImage(t *testing.T) {
 	}
 	// The next Install removes the leftover.
 	writeImage(t, images.BuildDir(dir), "new")
-	if err := images.Install(t.Context(), dir); err != nil {
+	if err := images.Install(t.Context(), dir, macOS); err != nil {
 		t.Fatal(err)
 	}
 	if exists(dir + ".old") {

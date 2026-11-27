@@ -82,6 +82,10 @@ func (c colors) bad(s string) string  { return c.wrap("31", s) }
 func (c colors) bold(s string) string { return c.wrap("1", s) }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return runWithConfigErrorHandler(args, stdin, stdout, stderr, runConfigError)
+}
+
+func runWithConfigErrorHandler(args []string, stdin io.Reader, stdout, stderr io.Writer, reportConfigError func(error, string, io.Writer) int) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usage)
 		return exitUsage
@@ -98,18 +102,18 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if launch {
 		cmd, rest = "run", rest[1:]
 	}
-	cfg, err := config.FromEnv(os.LookupEnv)
-	if err != nil {
-		if cmd == "run" {
-			// The Windows service must report the error to the service
-			// control manager (see runConfigError).
-			return runConfigError(err, stderr)
-		}
-		fmt.Fprintln(stderr, "ownsand-agent:", err)
+	cfg, cfgErr := config.FromEnv(os.LookupEnv)
+	if cfgErr != nil && cmd != "run" {
+		fmt.Fprintln(stderr, "ownsand-agent:", cfgErr)
 		return exitUsage
 	}
 	fs := flag.NewFlagSet("ownsand-agent "+cmd, flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	if cfgErr != nil {
+		// Resolve the service log directory without replacing the configuration error.
+		fs.SetOutput(io.Discard)
+	} else {
+		fs.SetOutput(stderr)
+	}
 	fs.StringVar(&cfg.StateDir, "state-dir", cfg.StateDir, "state directory")
 	noColor := fs.Bool("no-color", false, "turn off ANSI color")
 	apiURL := fs.String("api-url", "", "control plane origin (enroll; env "+config.EnvAPIURL+")")
@@ -129,7 +133,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// passes it so that `run` maps its exit codes to the launchd KeepAlive
 	// predicate. See service.LaunchdExitCode.
 	manager := fs.String(strings.TrimPrefix(service.ManagerFlag, "--"), "", "service manager that starts run (launchd)")
-	if err := fs.Parse(rest); err != nil {
+	parseErr := fs.Parse(rest)
+	var explicitStateDir string
+	if parseErr == nil {
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "state-dir" {
+				explicitStateDir = cfg.StateDir
+			}
+		})
+	}
+	if cfgErr != nil {
+		return reportConfigError(cfgErr, explicitStateDir, stderr)
+	}
+	if parseErr != nil {
 		return exitUsage
 	}
 	if cmd == "reset" && fs.NArg() > 0 {
@@ -146,12 +162,6 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// is set: a directory that comes from the environment or the host default
 	// keeps the behavior of the environment-only service definition. The
 	// service runs in another working directory, so the path is made absolute.
-	var explicitStateDir string
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "state-dir" {
-			explicitStateDir = cfg.StateDir
-		}
-	})
 	if explicitStateDir != "" && (cmd == "service print" || cmd == "service install") {
 		abs, err := filepath.Abs(explicitStateDir)
 		if err != nil {
