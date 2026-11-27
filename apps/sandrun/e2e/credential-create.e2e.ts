@@ -5,7 +5,7 @@ import {
   CREDENTIAL_FIXTURE,
   FIXTURE_INVITATION,
   FIXTURE_KEY,
-} from "./credential-mock.ts";
+} from "./credential-fixture-values.ts";
 
 const KEY_NAME = "deploy-bot";
 const apiKey = {

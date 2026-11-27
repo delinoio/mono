@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import type { MockTransportOptions } from "../src/mock/mock-api.ts";
+import {
+  CREDENTIAL_FIXTURE,
+  FIXTURE_INVITATION,
+  FIXTURE_KEY,
+} from "./credential-fixture-values.ts";
 import { createMockTransport as createInvitationMock } from "./invitation-mock.ts";
-
-export const CREDENTIAL_FIXTURE = "sandrun-e2e-credential";
-export const FIXTURE_KEY = "sandrun_e2e_fixture_key";
-export const FIXTURE_INVITATION = "sri_e2e_fixture_invitation";
 
 type RequestKind = "list" | "create";
 
