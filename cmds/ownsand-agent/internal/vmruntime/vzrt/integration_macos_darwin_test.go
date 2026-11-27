@@ -186,8 +186,9 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 	}
 	// A NONE sandbox has no virtio network device, which would carry the
 	// macOS guest MAC address.
-	if out, _ := e.exec(sb.GetSandboxId(), "/sbin/ifconfig", "-a"); strings.Contains(out, vzrt.MacOSGuestMAC.String()) {
-		t.Fatalf("NONE sandbox has a network device: %q", out)
+	out, ex = e.exec(sb.GetSandboxId(), "/sbin/ifconfig", "-a")
+	if err := checkMacOSNoneInterfaces(out, ex, vzrt.MacOSGuestMAC.String()); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: sb.GetSandboxId()}); err != nil {
 		t.Fatal(err)

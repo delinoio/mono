@@ -271,11 +271,6 @@ func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExit
 	return out.String(), exited
 }
 
-func execSucceeded(exited *ownsandv1.ExecExited) bool {
-	code, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
-	return ok && code != nil && code.ExitCode == 0
-}
-
 // waitFor polls cond until it holds or 30 seconds passed.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
