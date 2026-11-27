@@ -280,6 +280,8 @@ The server records its metrics with the OpenTelemetry SDK through the shared `se
 
 ## Storage
 
+Before the first deployment from a release that uses creation-time cap accounting, follow the [Accounts API cap-time cutover](repository-workflow-contract.md#accounts-api-cap-time-cutover). Stop all legacy usage handlers and workers before the compatible API starts. If claim history for the activation month is uncertain, activate in a new UTC month after the drain. A compatible image can still settle earlier claims through verified, deduplicated Paddle webhooks. Recovery uses a compatible image from the time the cutover activates.
+
 The database is PlanetScale Postgres, according to the repository defaults. File uploads, such as invoice documents, use Cloudflare R2 with signed URLs according to the repository defaults unless this contract documents another choice. Invoices stay in Paddle: the server stores no invoice documents and fetches the Paddle invoice link on demand.
 
 - Driver: `github.com/jackc/pgx/v5` (`pgxpool`). goose runs on a `database/sql` handle over the same pool (`pgx/v5/stdlib`).

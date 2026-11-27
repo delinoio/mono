@@ -151,8 +151,55 @@ func testAutoTopUpClaimUsesMonthAfterLock(t *testing.T, lockQuery string) {
 	if res := f.deduct(acct, 25*usd); res.AutoTopUpQueued {
 		t.Fatal("a top-up was queued although the claimed top-up used the whole January cap")
 	}
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(f.paddle.Charges()); got != 1 {
+		t.Fatalf("charges after the second deduction = %d, want 1", got)
+	}
 	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "completed" {
 		t.Fatalf("top-ups = %v", got)
+	}
+}
+
+func TestAutoTopUpClaimCutoverSettlesPriorLegacyChargeOnce(t *testing.T) {
+	f, acct := capFixture(t)
+	if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued")
+	}
+	// Model an automatic top-up claimed by the creation-time binary before
+	// the drain. Its claim updated the status and update time with no cap time.
+	var topUpID string
+	if err := f.db.Pool.QueryRow(ctx(), `UPDATE top_ups SET
+		status = 'charging',
+		paddle_subscription_id = (SELECT paddle_subscription_id FROM subscriptions WHERE billing_account_id = $1),
+		update_time = $2, cap_time = NULL
+		WHERE billing_account_id = $1 AND status = 'pending' RETURNING top_up_id`,
+		acct, beforeMonthEnd.Add(30*time.Second)).Scan(&topUpID); err != nil {
+		t.Fatal(err)
+	}
+
+	f.clock.Set(afterMonthEnd)
+	body := paddletest.Event("evt_legacy_auto_top_up", paddle.EventTransactionCompleted, f.clock.Now(),
+		paddletest.Transaction(paddletest.TransactionData{
+			ID: f.paddle.NewID("txn"), Origin: paddle.OriginSubscriptionCharge, TopUpID: topUpID,
+			SubtotalCents: 2500, TaxCents: 250,
+		}))
+	signature := paddle.SignatureHeaderValue(whSecret, f.clock.Now(), body)
+	for range 2 {
+		if code := f.deliver(body, signature); code != http.StatusOK {
+			t.Fatalf("webhook status %d", code)
+		}
+	}
+	wantStatuses(t, "after the legacy claim settles", f.topUpStatuses(acct), "completed")
+	if got := f.balance(acct); got != 30*usd {
+		t.Fatalf("balance = %d, want one 25 USD credit after the deduction", got)
+	}
+	if got := f.monthToDate(acct, beforeMonthEnd); got != 25*usd {
+		t.Fatalf("December month to date = %d, want the legacy claim", got)
+	}
+	if got := f.monthToDate(acct, afterMonthEnd); got != 0 {
+		t.Fatalf("January month to date = %d, want 0", got)
 	}
 }
 
@@ -247,7 +294,7 @@ func TestMonthToDateFallsBackToCreateTimeWithoutCapTime(t *testing.T) {
 	f, acct := capFixture(t)
 	// A row that exists before the cap time column has no cap time, and a
 	// manual top-up never has one; the first counts by create_time, the
-	// second not at all.
+	// second not at all. A subscription payment also uses no cap.
 	if _, err := f.db.Pool.Exec(ctx(), `INSERT INTO top_ups (top_up_id, billing_account_id, kind, amount_usd_micros, status,
 			create_time, update_time)
 		VALUES ('01900000-0000-7000-8000-0000000000a1', $1, 'auto', $2, 'completed', $3, $3)`,
@@ -263,7 +310,9 @@ func TestMonthToDateFallsBackToCreateTimeWithoutCapTime(t *testing.T) {
 	if got := f.monthToDate(acct, beforeMonthEnd); got != 25*usd {
 		t.Fatalf("December month to date = %d", got)
 	}
+	f.clock.Set(afterMonthEnd)
+	f.grant(acct, LedgerSubscriptionCredit, 10*usd)
 	if got := f.monthToDate(acct, afterMonthEnd); got != 0 {
-		t.Fatalf("January month to date = %d, want 0 (manual top-ups are outside the cap)", got)
+		t.Fatalf("January month to date = %d, want 0 for manual top-ups and subscription payments", got)
 	}
 }

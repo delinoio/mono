@@ -2416,6 +2416,9 @@ const sandrunArgs = ["sandrun-api", ...httpArgs.slice(1)];
 //                 `docker inspect` cannot read.
 //   STUB_IMAGE_RM_FAIL space-separated image references that `docker image rm`
 //                 fails for.
+//   STUB_UNLABELLED_IMAGES space-separated image references and IDs without
+//                 the claim-time cap capability label.
+//   STUB_INVENTORY_REMAINS 1 leaves removed IDs in the inventory.
 //   STUB_RUN_EXIT   exit code of `docker run` (default 0), printed with a
 //                 Docker diagnostic when not 0.
 //   STUB_CREATE_EXIT exit code of `docker create` (default 0), like STUB_RUN_EXIT.
@@ -2527,12 +2530,15 @@ case "$1" in
     # The name check before the start: no container has the new name.
     [[ "$*" != *"--filter name="* ]] || exit 0
     if [[ "$2" == --quiet && -n "\${STUB_RUNNING_IDS:-}" ]]; then
-      printf '%s\\n' $STUB_RUNNING_IDS
+      ids="$STUB_RUNNING_IDS"
     elif [[ -n "\${STUB_OLD_IDS:-}" ]]; then
-      printf '%s\\n' $STUB_OLD_IDS
+      ids="$STUB_OLD_IDS"
     else
-      printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true
-    fi ;;
+      ids="${old.join(" ")}"
+    fi
+    for id in $ids; do
+      if [[ "\${STUB_INVENTORY_REMAINS:-0}" == 1 || ! -f "$STUB_DIR/removed-$id" ]]; then echo "$id"; fi
+    done ;;
   inspect)
     case "$3" in
       *State.Status*)
@@ -2540,13 +2546,21 @@ case "$1" in
         echo "\${STUB_STATUS:-running}" ;;
       *Config.Image*)
         [[ " \${STUB_INSPECT_IMAGE_FAIL:-} " != *" \$4 "* ]] || exit 1
+        image="${olderImage}"
         for pair in \${STUB_OLD_IMAGES:-}; do
-          [[ "\${pair%%=*}" != "\$4" ]] || { echo "\${pair#*=}"; exit 0; }
+          [[ "\${pair%%=*}" != "\$4" ]] || image="\${pair#*=}"
         done
-        echo "${olderImage}" ;;
+        if [[ "$3" == *'{{.Image}}'* ]]; then
+          echo "$image \${image##*@}"
+        else
+          echo "$image"
+        fi ;;
       *) echo "\${STUB_ADDRESS:-172.18.0.5}" ;;
     esac ;;
   run|create)
+    if [[ "\${STUB_REQUIRE_CAP_ACTIVE:-0}" == 1 ]]; then
+      [[ "$(cat "$DROPLET_ROOT/state/accounts-api.cap-accounting")" == active ]] || exit 1
+    fi
     code="\${STUB_RUN_EXIT:-0}"
     [[ "\$1" == run ]] || code="\${STUB_CREATE_EXIT:-0}"
     [[ "\$code" == 0 ]] || echo "docker: Error response from daemon: OCI runtime create failed" >&2
@@ -2594,7 +2608,12 @@ case "$1" in
       [[ "$4" != $pattern ]] || exit 1
     done ;;
   start) [[ -z "\${STUB_START_FAIL:-}" || "\$2" != \$STUB_START_FAIL ]] || exit 1 ;;
-  image) [[ "\$2" != rm || " \${STUB_IMAGE_RM_FAIL:-} " != *" \$3 "* ]] || exit 1 ;;
+  image)
+    case "$2" in
+      inspect)
+        if [[ " \${STUB_UNLABELLED_IMAGES:-} " != *" $5 "* ]]; then echo claim-time; fi ;;
+      rm) [[ " \${STUB_IMAGE_RM_FAIL:-} " != *" $3 "* ]] || exit 1 ;;
+    esac ;;
   rm)
     if [[ "$2" == --force ]]; then
       if [[ -n "\${STUB_FORCE_RM_FAIL:-}" && "$3" == $STUB_FORCE_RM_FAIL ]]; then
@@ -2603,6 +2622,7 @@ case "$1" in
       fi
     else
       [[ " \${STUB_RM_FAIL:-} " != *" $2 "* ]] || exit 1
+      touch "$STUB_DIR/removed-$2"
     fi ;;
   logs)
     echo "server log line"
@@ -2648,6 +2668,11 @@ function runDroplet(
   { env = {}, watchdog, ...options } = {},
 ) {
   const setup = setupDroplet(t, args, options);
+  return executeDroplet(setup, args, env, watchdog);
+}
+
+function executeDroplet(setup, args, env, watchdog) {
+  writeFileSync(join(setup.dir, "calls.log"), "");
   const start = performance.now();
   const result = spawnSync("bash", ["-s", "--", ...args], {
     encoding: "utf8",
@@ -2791,16 +2816,170 @@ test(
   },
 );
 
+const accountsCapState = "state/accounts-api.cap-accounting";
+const accountsCapDate = {
+  date: 'if [[ "$*" == "-u +%Y-%m" ]]; then echo "$STUB_CAP_MONTH"; else exec /bin/date "$@"; fi',
+};
+
 test(
-  "droplet deploy applies the Accounts stop timeout to deployment and rollback",
+  "Accounts cap cutover drains every old container before the new UTC month and rejects legacy rollback",
+  { skip: skipDroplet },
+  (t) => {
+    const legacyID = oldestImage.split("@")[1];
+    const route = "# old route\n";
+    const setup = setupDroplet(t, accountsArgs, {
+      old: ["old1", "legacy"],
+      state: `${oldestImage}\n`,
+      route,
+      stubs: accountsCapDate,
+    });
+    const december = {
+      STUB_CAP_MONTH: "2026-12",
+      STUB_OLD_IMAGES: `legacy=${oldestImage}`,
+      STUB_UNLABELLED_IMAGES: `${legacyID} ${oldestImage}`,
+      STUB_REQUIRE_CAP_ACTIVE: "1",
+    };
+    const drainEnv = { ...december, DROPLET_ACCOUNTS_CAP_CUTOVER: "drain" };
+    const rejected = executeDroplet(setup, accountsArgs, december);
+    assert.equal(rejected.status, 1, rejected.stderr);
+    assert.match(
+      rejected.stderr,
+      /container legacy has no verified claim-time/,
+    );
+    assert.ok(!rejected.calls.some((call) => /^docker (run|stop) /.test(call)));
+    assert.equal(rejected.read(accountsCapState), undefined);
+
+    const stopFailed = executeDroplet(setup, accountsArgs, {
+      ...drainEnv,
+      STUB_STOP_FAIL: "legacy",
+    });
+    assert.equal(stopFailed.status, 1, stopFailed.stderr);
+    assert.match(
+      stopFailed.stderr,
+      /could not confirm.*container legacy stopped/,
+    );
+    assert.equal(stopFailed.read(accountsCapState), "draining\n");
+    assert.ok(
+      !stopFailed.calls.some((call) => /^docker (run|start) /.test(call)),
+    );
+
+    const unconfirmed = executeDroplet(setup, accountsArgs, {
+      ...drainEnv,
+      STUB_INVENTORY_REMAINS: "1",
+    });
+    assert.equal(unconfirmed.status, 1, unconfirmed.stderr);
+    assert.match(
+      unconfirmed.stderr,
+      /could not confirm.*all Accounts API containers/,
+    );
+    assert.equal(unconfirmed.read(accountsCapState), "draining\n");
+    assert.ok(
+      !unconfirmed.calls.some((call) => /^docker (run|start) /.test(call)),
+    );
+
+    const drained = executeDroplet(setup, accountsArgs, drainEnv);
+    assert.equal(drained.status, 0, drained.stderr);
+    assert.equal(drained.read(accountsCapState), "drained 2026-12\n");
+    assert.equal(drained.read("caddy/sites/accounts-api.caddy"), route);
+
+    const tooEarly = executeDroplet(setup, accountsArgs, {
+      ...december,
+      DROPLET_ACCOUNTS_CAP_SAFE_MONTH: "2026-11",
+    });
+    assert.equal(tooEarly.status, 1, tooEarly.stderr);
+    assert.match(tooEarly.stderr, /wait for a new UTC month/);
+    assert.ok(!tooEarly.calls.some((call) => call.startsWith("docker run ")));
+    assert.equal(tooEarly.read(accountsCapState), "drained 2026-12\n");
+
+    const january = { ...december, STUB_CAP_MONTH: "2027-01" };
+    const startupFailed = executeDroplet(setup, accountsArgs, {
+      ...january,
+      STUB_RUN_EXIT: "1",
+    });
+    assert.equal(startupFailed.status, 1, startupFailed.stderr);
+    assert.match(
+      startupFailed.stderr,
+      /awaits a healthy compatible replacement/,
+    );
+    assert.equal(startupFailed.read(accountsCapState), "active\n");
+    assert.equal(
+      startupFailed.read("state/accounts-api.current"),
+      `${oldestImage}\n`,
+    );
+
+    const rollback = executeDroplet(
+      setup,
+      ["accounts-api", oldestImage, ...accountsArgs.slice(2)],
+      january,
+    );
+    assert.equal(rollback.status, 1, rollback.stderr);
+    assert.match(rollback.stderr, /image .* has no verified claim-time/);
+    assert.ok(
+      !rollback.calls.some((call) => /^docker (run|start) /.test(call)),
+    );
+    assert.equal(rollback.read(accountsCapState), "active\n");
+
+    const activated = executeDroplet(setup, accountsArgs, january);
+    assert.equal(activated.status, 0, activated.stderr);
+    assert.equal(
+      activated.read("state/accounts-api.current"),
+      `${dropletImage}\n`,
+    );
+  },
+);
+
+test(
+  "Accounts cap cutover accepts a reviewed UTC month only after the drain",
+  { skip: skipDroplet },
+  (t) => {
+    const setup = setupDroplet(t, accountsArgs, { stubs: accountsCapDate });
+    const env = { STUB_CAP_MONTH: "2027-01" };
+    const reviewed = { ...env, DROPLET_ACCOUNTS_CAP_SAFE_MONTH: "2027-01" };
+    const beforeDrain = executeDroplet(setup, accountsArgs, reviewed);
+    assert.equal(beforeDrain.status, 1, beforeDrain.stderr);
+    assert.match(beforeDrain.stderr, /run the Accounts API drain/);
+
+    const drain = { ...env, DROPLET_ACCOUNTS_CAP_CUTOVER: "drain" };
+    const drained = executeDroplet(setup, accountsArgs, drain);
+    assert.equal(drained.status, 0, drained.stderr);
+    const nextMonth = executeDroplet(setup, accountsArgs, {
+      ...drain,
+      STUB_CAP_MONTH: "2027-02",
+    });
+    assert.equal(nextMonth.status, 0, nextMonth.stderr);
+    assert.equal(nextMonth.read(accountsCapState), "drained 2027-01\n");
+
+    const activated = executeDroplet(setup, accountsArgs, reviewed);
+    assert.equal(activated.status, 0, activated.stderr);
+    assert.equal(activated.read(accountsCapState), "active\n");
+  },
+);
+
+test(
+  "Accounts deploys and rolls back verified compatible images with the normal route order",
   { skip: skipDroplet },
   (t) => {
     const first = runDroplet(t, accountsArgs, {
       old: ["old1"],
       state: `${olderImage}\n`,
+      env: { STUB_UNLABELLED_IMAGES: olderImage.split("@")[1] },
+      prepare(deployRoot) {
+        writeFileSync(
+          join(deployRoot, "state/accounts-api.cap-compatible-images"),
+          `${olderImage}\n`,
+        );
+      },
     });
     assert.equal(first.status, 0, first.stderr);
     assert.ok(first.calls.includes("docker stop --time 60 old1"));
+    const order = [
+      first.calls.findIndex((call) => call.startsWith("docker run ")),
+      first.calls.findIndex((call) => call.startsWith("curl ")),
+      first.calls.findIndex(isProxyLoad),
+      first.calls.indexOf("docker stop --time 60 old1"),
+    ];
+    assert.ok(order.every((index, step) => index > (order[step - 1] ?? -1)));
+    assert.equal(first.read(accountsCapState), "active\n");
     assert.equal(first.read("state/accounts-api.previous"), `${olderImage}\n`);
 
     const rollback = runDroplet(
@@ -2906,6 +3085,7 @@ test(
   { skip: skipDroplet },
   (t) => {
     const result = runDroplet(t, accountsArgs, {
+      old: ["old1"],
       env: { STUB_RELOAD: "1", STUB_STOP_FAIL: "accounts-api-*" },
     });
     assert.equal(result.status, 1, result.stderr);
