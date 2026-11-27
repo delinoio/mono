@@ -290,14 +290,15 @@ func TestDevinClaimLossAfterDispatchWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commitBinding := holdTx(t, w.env, "SELECT pg_advisory_xact_lock(42)")
+	binding := holdTx(t, w.env, "SELECT pg_advisory_xact_lock(42)")
 	const sid = "ses-dispatch-wins"
 	w.devin.AddSession(sid, true)
 	req := w.requestBySource(t, sid)
 	id := req.GetRequestId()
-	waitForLockWaiter(t, w.env)
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: binding.pid,
+		query: "UPDATE requests SET state = $2, runner_id = $3, update_time = $4"})
 	// Keep the claim change uncommitted until the fake guest starts.
-	commitClaim := holdTx(t, w.env, "SELECT 1 FROM agent_claims WHERE request_id = $1 FOR UPDATE", id)
+	claim := holdTx(t, w.env, "SELECT 1 FROM agent_claims WHERE request_id = $1 FOR UPDATE", id)
 	// Use a separate connection to observe the locks. The two fixture
 	// transactions, dispatch and claim loss can fill the default pool.
 	observer, err := pgx.ConnectConfig(ctx, w.env.DB.Pool.Config().ConnConfig)
@@ -316,9 +317,9 @@ func TestDevinClaimLossAfterDispatchWins(t *testing.T) {
 		}
 		return waiting
 	})
-	commitBinding()
+	binding.commit()
 	w.waitRunner(t, warm.GetRunnerId(), sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)
-	commitClaim()
+	claim.commit()
 	eventually(t, "the lost claim is released locally", func() bool {
 		claim, err := w.l.Agents.Claim(ctx, id)
 		return err == nil && claim.State == agent.ClaimReleased
@@ -375,12 +376,12 @@ func TestDevinClaimLossBeforeDispatchWins(t *testing.T) {
 			w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 			warm := w.warmRunner(t)
 			// Dispatch selects the warm runner and waits for its lock.
-			resumeDispatch := holdTx(t, w.env, "SELECT 1 FROM runners WHERE runner_id = $1 FOR UPDATE", warm.GetRunnerId())
+			dispatch := holdTx(t, w.env, "SELECT 1 FROM runners WHERE runner_id = $1 FOR UPDATE", warm.GetRunnerId())
 			const sid = "ses-loss-wins"
 			w.devin.AddSession(sid, true)
 			req := w.requestBySource(t, sid)
 			id := req.GetRequestId()
-			waitForLockWaiter(t, w.env)
+			waitForLockWaiter(t, w.env, lockWait{blockerPID: dispatch.pid, query: "FROM runners WHERE runner_id = $1 FOR UPDATE"})
 			w.assertClaim(t, id, agent.ClaimHeld)
 
 			tc.lost(w.devin, sid)
@@ -389,7 +390,7 @@ func TestDevinClaimLossBeforeDispatchWins(t *testing.T) {
 				t.Fatalf("unexpected cancellation: %v", canceled)
 			}
 			w.assertClaim(t, id, agent.ClaimReleased)
-			resumeDispatch()
+			dispatch.commit()
 
 			tc.lost(w.devin, sid)
 			stays(t, "the canceled request and the unassigned warm runner", func() bool {
@@ -805,6 +806,65 @@ func TestDevinWatchDefaultPagination(t *testing.T) {
 	}
 	t.Logf("SandRun listed %d pages, claimed %q, persisted requests for %q and opened a watch at %q",
 		fake.Lists(), fake.ClaimAttempts(), sources, fake.WatchCursors())
+}
+
+func TestDevinWatchRejectsMaintenancePages(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
+	fake.ServeHTMLWatches(2)
+	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, func(o *app.Options) {
+		o.Metrics = provider
+	})
+	w.full()
+	eventually(t, "the recovered Devin stream", func() bool { return fake.Streams() == 1 })
+	fake.AddSession("ses-restored-stream", true)
+	w.requestBySource(t, "ses-restored-stream")
+
+	lists := fake.ListTimes()
+	if len(lists) != 3 {
+		t.Fatalf("list calls = %d, want one per watch attempt", len(lists))
+	}
+	backoff := fastAgentTiming().BackoffMin
+	for i := 1; i < len(lists); i++ {
+		elapsed := lists[i].Sub(lists[i-1])
+		if elapsed < backoff {
+			t.Errorf("list %d started after %v, want at least %v", i+1, elapsed, backoff)
+		}
+		backoff *= 2
+	}
+
+	logs := w.env.Logs.String()
+	if strings.Count(logs, `"msg":"vendor_watch_reconnect"`) != 2 || strings.Count(logs, `"cause":"error"`) != 2 {
+		t.Error("expected one error reconnect log per maintenance page")
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var reconnects int64
+	for _, scope := range rm.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			if metric.Name != "sandrun_vendor_watch_reconnects" {
+				continue
+			}
+			for _, point := range metric.Data.(metricdata.Sum[int64]).DataPoints {
+				vendor, _ := point.Attributes.Value("vendor")
+				if vendor.AsString() == "DEVIN" {
+					reconnects += point.Value
+				}
+			}
+		}
+	}
+	if reconnects != 2 {
+		t.Errorf("DEVIN error reconnects = %d, want 2", reconnects)
+	}
 }
 
 func TestDevinWatchPagination(t *testing.T) {

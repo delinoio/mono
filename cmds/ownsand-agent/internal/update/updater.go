@@ -25,11 +25,10 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// maxDownload bounds the manifest and artifact downloads.
-const (
-	maxManifestBytes = 1 << 20
-	maxArtifactBytes = 512 << 20
-)
+const maxManifestBytes = 1 << 20
+
+// MaxArtifactBytes is the inclusive size limit for an update executable.
+const MaxArtifactBytes = 512 << 20
 
 // ErrInstalling rejects creates and snapshot transfers once the installation
 // started.
@@ -39,7 +38,7 @@ var ErrInstalling = errors.New("update: an agent update is installing")
 var ErrRunningRevoked = errors.New("update: the running agent version is revoked")
 
 // ErrSuperseded rejects an update command that a newer update or withdrawal
-// command overtook before it published its artifact.
+// command overtook before it recorded its final state or queued its artifact.
 var ErrSuperseded = errors.New("update: a newer update command superseded this one")
 
 // ErrRemoving rejects new update commands during device removal.
@@ -152,8 +151,8 @@ type Updater struct {
 	applied uint64
 }
 
-// New removes abandoned downloads and confirms any installation that the
-// previous process recorded. The running version must equal the recorded target.
+// New removes abandoned downloads, confirms the recorded installation and
+// restores a verified revocation that applies to the running version.
 func New(opts Options) (*Updater, error) {
 	if opts.HTTP == nil {
 		opts.HTTP = http.DefaultClient
@@ -180,7 +179,21 @@ func New(opts Options) (*Updater, error) {
 			return nil, err
 		}
 	}
+	if st != nil && revocationApplies(st.RunningRevocation, opts.Running) {
+		u.revokedRunning = true
+		u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
+		u.target = st.RunningRevocation.TargetVersion
+		opts.Logger.Info("restored agent update revocation", "running_version", opts.Running, "target_version", u.target)
+	}
 	return u, nil
+}
+
+func revocationApplies(record *store.RunningRevocation, running string) bool {
+	if record == nil {
+		return false
+	}
+	comparison, err := semver.CompareStrings(record.Version, running)
+	return err == nil && comparison == 0
 }
 
 // These patterns match the file names from download and store.WriteFileAtomic,
@@ -319,10 +332,10 @@ func (u *Updater) setStateFor(order uint64, s ownsandv1.AgentUpdateState, target
 		u.mu.Unlock()
 		return err
 	}
-	// A retry keeps the last verified revocation while it fetches and
-	// verifies a new manifest.
-	if s == ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING && u.revokedRunning {
-		s = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
+	// Only a verified manifest can replace the recovery target or lift the gate.
+	if u.revokedRunning {
+		u.mu.Unlock()
+		return nil
 	}
 	u.state, u.target = s, target
 	u.mu.Unlock()
@@ -341,19 +354,38 @@ func (u *Updater) clearPendingLocked() {
 	u.artifact = ""
 }
 
-// recordRunningRevocation applies a verified manifest to the create gate
-// and the heartbeat state before the artifact download begins.
+// recordRunningRevocation saves the verified decision under the command
+// lock before applying it and fetching the artifact.
 func (u *Updater) recordRunningRevocation(order uint64, revoked bool, target string) error {
 	u.mu.Lock()
 	if err := u.commandInvalidationLocked(order); err != nil {
 		u.mu.Unlock()
 		return err
 	}
-	u.revokedRunning = revoked
 	state := ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING
 	if revoked {
 		state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
 	}
+	if revoked || u.revokedRunning {
+		if _, err := u.opts.Store.UpdateAgent(func(a *store.AgentState) error {
+			if revoked {
+				a.RunningRevocation = &store.RunningRevocation{Version: u.opts.Running, TargetVersion: target}
+			} else if revocationApplies(a.RunningRevocation, u.opts.Running) {
+				a.RunningRevocation = nil
+			}
+			return nil
+		}); err != nil {
+			// A verified revocation must close the gate even if it cannot
+			// survive a restart. Keep any previous recovery target on failure.
+			if revoked && !u.revokedRunning {
+				u.revokedRunning = true
+				u.state, u.target = state, target
+			}
+			u.mu.Unlock()
+			return fmt.Errorf("update: save running-version revocation: %w", err)
+		}
+	}
+	u.revokedRunning = revoked
 	u.state, u.target = state, target
 	u.mu.Unlock()
 	u.opts.Logger.Info("agent update state", "update_state", state.String(), "target_version", target)
@@ -418,18 +450,26 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	u.applied = order
 	u.clearPendingLocked()
 	u.mu.Unlock()
+	return u.prepareAdmittedUpdate(ctx, cmd, order, comparison, comparisonErr)
+}
+
+func (u *Updater) prepareAdmittedUpdate(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand, order uint64, comparison int, comparisonErr error) error {
+	target := cmd.GetTargetVersion()
 	// An invalid target still clears the queued artifact if its command
 	// passed the order check.
 	if _, err := semver.Parse(target); err != nil {
-		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
+		if invalidated := u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target); invalidated != nil {
+			return invalidated
+		}
 		return err
 	}
 	if comparisonErr == nil && comparison == 0 {
-		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
-		return nil
+		return u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
 	}
 	if u.opts.ManifestURL == "" {
-		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
+		if err := u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target); err != nil {
+			return err
+		}
 		return errors.New("update: no release manifest URL is configured")
 	}
 	if err := u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING, target); err != nil {
@@ -437,21 +477,13 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	}
 	data, err := u.download(ctx, target, order)
 	if err == nil {
-		err = u.queueVerified(order, target, data)
+		err = u.queueVerified(ctx, order, target, data)
 	}
 	if err != nil {
-		// Keep the last verified revocation after any download or
-		// verification failure.
-		failedState := ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
-		u.mu.Lock()
-		if u.revokedRunning {
-			failedState = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
-		}
-		u.mu.Unlock()
-		if invalidated := u.setStateFor(order, failedState, target); invalidated != nil {
+		if invalidated := u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target); invalidated != nil {
 			return invalidated
 		}
-		u.opts.Logger.Error("agent update verification failed", "target_version", target, "update_state", failedState.String(), "error", err)
+		u.opts.Logger.Error("agent update preparation failed", "target_version", target, "error", err)
 		return err
 	}
 	// The control plane decides lower targets: a pinned version or a
@@ -463,19 +495,31 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	return nil
 }
 
-// queueVerified holds the removal fence lock from the final admission check
-// through the disk write and queue publication.
-func (u *Updater) queueVerified(order uint64, target string, data []byte) error {
+// queueVerified holds the updater lock through the disk write and queue
+// publication. The last context check decides whether the update can pass
+// from the channel command to the process-level installer.
+func (u *Updater) queueVerified(ctx context.Context, order uint64, target string, data []byte) error {
 	u.mu.Lock()
 	if err := u.commandInvalidationLocked(order); err != nil {
 		u.mu.Unlock()
 		u.opts.Logger.Info("agent update download discarded", "target_version", target, "order", order)
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		u.mu.Unlock()
+		return err
+	}
 	// Each command has a unique artifact path.
 	path := u.opts.Store.Path(store.UpdateDir, fmt.Sprintf("ownsand-agent-%s-%d", target, order))
 	if err := store.WriteFileAtomic(path, data, 0o700); err != nil {
 		u.mu.Unlock()
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		u.mu.Unlock()
+		if cleanupErr := os.Remove(path); cleanupErr != nil && !errors.Is(cleanupErr, fs.ErrNotExist) {
+			u.opts.Logger.Warn("canceled update artifact removal failed", "target_version", target, "order", order, "error", cleanupErr)
+		}
 		return err
 	}
 	u.artifact = path
@@ -567,7 +611,7 @@ func (u *Updater) download(ctx context.Context, target string, order uint64) ([]
 	if err != nil {
 		return nil, err
 	}
-	data, err := u.fetch(ctx, art.URL, maxArtifactBytes)
+	data, err := u.fetch(ctx, art.URL, MaxArtifactBytes)
 	if err != nil {
 		return nil, fmt.Errorf("update: download artifact: %w", err)
 	}

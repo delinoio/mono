@@ -286,7 +286,7 @@ func TestOwnSandRemovalLeaseFinalization(t *testing.T) {
 						resume()
 						w.waitForBlockedQuery(t, "SELECT ownsand_link_id::text FROM ownsand_links")
 						w.waitForBlockedQuery(t, "SELECT removal_expires_at FROM ownsand_links WHERE ownsand_link_id = $1 AND removal_token = $2 FOR UPDATE")
-						releaseLink()
+						releaseLink.commit()
 						t.Log("Finalization and renewal both waited on the link row. Finalization queued first.")
 					} else {
 						go func() { result <- rpc.call(ctx, replica, w.org) }()
@@ -320,7 +320,7 @@ func TestOwnSandRemovalLeaseFinalization(t *testing.T) {
 							return id != "" && !removing
 						})
 					}
-					release()
+					release.commit()
 					switch outcome.code {
 					case 0:
 						if err := <-result; err != nil {
@@ -401,7 +401,7 @@ func TestOwnSandRemovalLeaseRejectsBeforeFinalization(t *testing.T) {
 							t.Fatalf("original lease was not live after the renewal failure: %v", err)
 						}
 					}
-					release()
+					release.commit()
 					wantCode(t, "claim rejected before finalization", <-result, tc.code)
 					w.checkFinalizationRollback(t, rpc.audit)
 					if tc.code == connect.CodeFailedPrecondition {

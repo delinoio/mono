@@ -82,8 +82,11 @@ func exportedMacSnapshot(t *testing.T, org *testenv.Org, deviceID string) string
 		return err == nil && s.Msg.GetSnapshot().GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED
 	})
 	got, err := c.Snapshot.GetSnapshot(ctx, connect.NewRequest(&ownsandv1.GetSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID}))
-	if err != nil || string(got.Msg.GetSnapshot().GetMacosHardwareModel()) != string(macModelA) {
-		t.Fatalf("snapshot hardware model = %q, %v", got.Msg.GetSnapshot().GetMacosHardwareModel(), err)
+	if err != nil {
+		t.Fatalf("get exported snapshot: %v", err)
+	}
+	if model := got.Msg.GetSnapshot().GetMacosHardwareModel(); string(model) != string(macModelA) {
+		t.Fatalf("snapshot hardware model = %q, want %q", model, macModelA)
 	}
 	return snapID
 }

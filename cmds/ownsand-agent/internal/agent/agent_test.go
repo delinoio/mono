@@ -69,7 +69,7 @@ type harness struct {
 	st    *store.Store
 	id    *store.Identity
 	agent *Agent
-	errc  chan error
+	errc  <-chan error
 	stop  context.CancelFunc
 }
 
@@ -113,12 +113,17 @@ func startWith(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Ident
 	t.Helper()
 	a := newAgent(t, cp, st, id, tweak)
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &harness{t: t, cp: cp, st: st, id: id, agent: a, errc: make(chan error, 1), stop: cancel}
-	go func() { h.errc <- a.Run(ctx) }()
+	errc := make(chan error, 1)
+	done := make(chan struct{})
+	h := &harness{t: t, cp: cp, st: st, id: id, agent: a, errc: errc, stop: cancel}
+	go func() {
+		errc <- a.Run(ctx)
+		close(done)
+	}()
 	t.Cleanup(func() {
 		cancel()
 		select {
-		case <-h.errc:
+		case <-done:
 		case <-time.After(15 * time.Second):
 			t.Error("agent did not stop")
 		}
@@ -270,7 +275,6 @@ func TestChannelLifecycleCommandsAndRemoval(t *testing.T) {
 		if !errors.Is(err, ErrRemoved) {
 			t.Fatalf("run returned %v", err)
 		}
-		h.errc <- err
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not finish the removal")
 	}
@@ -321,11 +325,19 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 		<-release
 	}
 	written := make(chan struct{})
+	var finishWriterOnce sync.Once
+	finishWriter := func() {
+		finishWriterOnce.Do(func() {
+			close(release)
+			waitClosed(t, written, "the status write to finish")
+		})
+	}
+	t.Cleanup(finishWriter)
 	go func() {
 		defer close(written)
 		a.writeStatus()
 	}()
-	<-entered
+	waitClosed(t, entered, "the status write to enter the hook")
 
 	removed := make(chan error, 1)
 	go func() { removed <- a.removeDevice(context.Background()) }()
@@ -334,7 +346,7 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 		t.Fatalf("removal finished while a status write was in flight: %v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
-	close(release)
+	finishWriter()
 	select {
 	case err := <-removed:
 		if !errors.Is(err, ErrRemoved) {
@@ -343,7 +355,6 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("removal did not finish")
 	}
-	<-written
 	requireEmptyStateDir(t, st)
 
 	// The writer stays fenced: later writes do nothing.
@@ -487,7 +498,6 @@ func TestRemovalNoticeAtAuthenticate(t *testing.T) {
 		if !errors.Is(err, ErrRemoved) {
 			t.Fatalf("run returned %v", err)
 		}
-		h.errc <- err
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not finish the removal")
 	}
@@ -597,7 +607,6 @@ func TestDeviceRemovalFencesDispatchedCreate(t *testing.T) {
 			close(confirm.resume)
 			select {
 			case err := <-h.errc:
-				h.errc <- err
 				if !errors.Is(err, ErrRemoved) {
 					t.Fatalf("run returned %v, want ErrRemoved", err)
 				}
@@ -663,7 +672,6 @@ func TestRemovalCleansUpHostNetwork(t *testing.T) {
 				if !errors.Is(err, ErrRemoved) {
 					t.Fatalf("run returned %v", err)
 				}
-				h.errc <- err
 			case <-time.After(20 * time.Second):
 				t.Fatal("agent did not finish the removal")
 			}
@@ -729,7 +737,6 @@ func TestRemovalRetriesFailedSandboxDeletion(t *testing.T) {
 		if err == nil || errors.Is(err, ErrRemoved) {
 			t.Fatalf("run returned %v, want the failed deletion", err)
 		}
-		h.errc <- err
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not finish the first removal attempt")
 	}
@@ -756,7 +763,6 @@ func TestRemovalRetriesFailedSandboxDeletion(t *testing.T) {
 		if !errors.Is(err, ErrRemoved) {
 			t.Fatalf("retry returned %v", err)
 		}
-		h2.errc <- err
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not finish the retried removal")
 	}
@@ -782,7 +788,6 @@ func TestInterruptedRemovalTreatsUnknownDeviceAsConfirmed(t *testing.T) {
 		if !errors.Is(err, ErrRemoved) {
 			t.Fatalf("run returned %v", err)
 		}
-		h.errc <- err
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not finish the removal")
 	}
@@ -1161,46 +1166,89 @@ func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
 	f.requireRestorable(t, id)
 }
 
-// TestImportStopsWithItsChannelContext checks that an import whose channel
-// context ends during a download publishes nothing: no ready snapshot, no
-// content directory and no leftover files, and that an import of the same
-// snapshot afterwards still succeeds.
+// TestImportStopsWithItsChannelContext checks the command result and log
+// when the context ends during a download. A later import can restore the
+// snapshot after the interrupted attempt removes its partial files.
 func TestImportStopsWithItsChannelContext(t *testing.T) {
-	id, _ := uuidv7.NewString()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var downloads atomic.Int32
-	f := newImportFixture(t, func(r *http.Request) int {
-		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/"+id+"/") && downloads.Add(1) == 2 {
-			// The channel closes while the import still downloads.
-			cancel()
-		}
-		return 0
-	})
-	cmd := f.stage(t, id, false).GetImportSnapshot()
-	if len(cmd.GetParts()) < 3 {
-		t.Fatalf("the fixture needs at least 3 parts, has %d", len(cmd.GetParts()))
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+		code    ownsandv1.ErrorCode
+		message string
+	}{
+		{"canceled", 10 * time.Second, ownsandv1.ErrorCode_ERROR_CODE_CANCELED, "snapshot import canceled"},
+		{"deadline", 2 * time.Second, ownsandv1.ErrorCode_ERROR_CODE_DEADLINE_EXCEEDED, "snapshot import deadline exceeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, _ := uuidv7.NewString()
+			secondDownload := make(chan struct{})
+			var downloads atomic.Int32
+			rec := newRecordingHandler()
+			f := newImportFixtureWith(t, func(r *http.Request) int {
+				if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/"+id+"/") && downloads.Add(1) == 2 {
+					close(secondDownload)
+					<-r.Context().Done()
+				}
+				return 0
+			}, func(o *Options) { o.Logger = slog.New(rec) })
+			cmd := f.stage(t, id, false)
+			if parts := len(cmd.GetImportSnapshot().GetParts()); parts < 3 {
+				t.Fatalf("the fixture needs at least 3 parts, has %d", parts)
+			}
+			cmd.CommandId, _ = uuidv7.NewString()
+			ctx, cancel := context.WithTimeout(context.Background(), tc.timeout)
+			defer cancel()
+			if tc.code == ownsandv1.ErrorCode_ERROR_CODE_CANCELED {
+				go func() {
+					select {
+					case <-secondDownload:
+						cancel()
+					case <-ctx.Done():
+					}
+				}()
+			}
+			f.h.agent.handleCommand(ctx, context.Background(), cmd, 0)
+			if got := downloads.Load(); got != 2 {
+				t.Fatalf("interrupted after %d downloads, want 2", got)
+			}
+			if res := f.h.result(cmd.GetCommandId()); res.GetError().GetCode() != tc.code || res.GetError().GetMessage() != tc.message || res.GetImportSnapshot() != nil {
+				t.Fatalf("interrupted import = %v, want %v (%s)", res, tc.code, tc.message)
+			}
+			rec.mu.Lock()
+			var loggedCode, loggedError string
+			for _, r := range *rec.records {
+				if r.Message != "command failed" {
+					continue
+				}
+				attrs := map[string]string{}
+				r.Attrs(func(a slog.Attr) bool { attrs[a.Key] = a.Value.String(); return true })
+				if attrs["command_id"] == cmd.GetCommandId() {
+					loggedCode, loggedError = attrs["code"], attrs["error"]
+				}
+			}
+			rec.mu.Unlock()
+			if loggedCode != tc.code.String() || loggedError != tc.message {
+				t.Fatalf("command failed log = (%q, %q), want (%q, %q)", loggedCode, loggedError, tc.code, tc.message)
+			}
+			if _, _, ok := f.h.agent.Sandboxes.SnapshotContent(id); ok {
+				t.Fatal("an interrupted import left a ready snapshot")
+			}
+			dir, err := f.h.st.SnapshotDir(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("snapshot directory after an interrupted import: %v", err)
+			}
+			if left, err := filepath.Glob(filepath.Join(f.h.st.Path(store.SnapshotsDir), ".import-*")); err != nil || len(left) != 0 {
+				t.Fatalf("temporary archives after interruption: %v, %v", left, err)
+			}
+			if res := f.h.command(f.command(id, false)); res.GetError() != nil {
+				t.Fatalf("import after the interrupted one = %v", res)
+			}
+			f.requireRestorable(t, id)
+		})
 	}
-	if _, err := f.h.agent.importSnapshot(ctx, cmd); err == nil {
-		t.Fatal("import succeeded with a closed channel context")
-	}
-	if _, _, ok := f.h.agent.Sandboxes.SnapshotContent(id); ok {
-		t.Fatal("a cancelled import left a ready snapshot")
-	}
-	dir, err := f.h.st.SnapshotDir(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("snapshot directory after a cancelled import: %v", err)
-	}
-	if left, _ := filepath.Glob(filepath.Join(f.h.st.Path(store.SnapshotsDir), ".import-*")); len(left) != 0 {
-		t.Fatalf("temporary archives left: %v", left)
-	}
-	if res := f.h.command(f.command(id, false)); res.GetError() != nil {
-		t.Fatalf("import after the cancelled one = %v", res)
-	}
-	f.requireRestorable(t, id)
 }
 
 // TestImportCanceledBeforeSnapshotPublication cancels the channel after
@@ -1209,14 +1257,15 @@ func TestImportCanceledBeforeSnapshotPublication(t *testing.T) {
 	f := newImportFixture(t, nil)
 	a := f.h.agent
 	id, _ := uuidv7.NewString()
-	cmd := f.stage(t, id, false).GetImportSnapshot()
+	cmd := f.stage(t, id, false)
+	cmd.CommandId, _ = uuidv7.NewString()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	a.beforeSnapshotPublishHook = cancel
-	entry, err := a.importSnapshot(ctx, cmd)
+	a.handleCommand(ctx, context.Background(), cmd, 0)
 	a.beforeSnapshotPublishHook = nil
-	if entry != nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("import at publication = (%v, %v), want (nil, context canceled)", entry, err)
+	if res := f.h.result(cmd.GetCommandId()); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_CANCELED || res.GetImportSnapshot() != nil {
+		t.Fatalf("import at publication = %v, want CANCELED and no snapshot", res)
 	}
 	if a.Sandboxes.HasSnapshot(id) {
 		t.Fatal("the canceled import left a snapshot record in memory")
@@ -1236,7 +1285,7 @@ func TestImportCanceledBeforeSnapshotPublication(t *testing.T) {
 
 	retryCtx, cancelRetry := context.WithCancel(context.Background())
 	defer cancelRetry()
-	entry, err = a.importSnapshot(retryCtx, cmd)
+	entry, err := a.importSnapshot(retryCtx, cmd.GetImportSnapshot())
 	cancelRetry()
 	if err != nil || entry.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
 		t.Fatalf("retry import = (%v, %v), want READY", entry, err)
@@ -1258,7 +1307,7 @@ func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
 		}
 	})
 	a := f.h.agent
-	for _, name := range []string{"ready record write fails", "channel context ends"} {
+	for _, name := range []string{"record promotion fails", "channel context ends"} {
 		t.Run(name, func(t *testing.T) {
 			id, _ := uuidv7.NewString()
 			cmd := f.stage(t, id, false).GetImportSnapshot()
@@ -1293,8 +1342,8 @@ func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("import error = %v, want context.Canceled", err)
 				}
-			} else if err == nil || !strings.Contains(err.Error(), "save imported snapshot") {
-				t.Fatalf("import error = %v, want a ready record write failure", err)
+			} else if err == nil || !strings.Contains(err.Error(), "publish imported snapshot") {
+				t.Fatalf("import error = %v, want a record promotion failure", err)
 			}
 			if _, _, ok := a.Sandboxes.SnapshotContent(id); ok {
 				t.Error("an aborted import left a ready snapshot")
@@ -1842,6 +1891,79 @@ func TestUpdateDefersToSandboxDuringTransfers(t *testing.T) {
 	}
 }
 
+type resumeGateRuntime struct {
+	vmruntime.Runtime
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *resumeGateRuntime) Resume(ctx context.Context, vm vmruntime.VM) error {
+	close(r.started)
+	select {
+	case <-r.release:
+		return r.Runtime.Resume(ctx, vm)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestResumeFenceWaitsAcrossAgentChannels(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	var gate *resumeGateRuntime
+	h := startWith(t, cp, st, id, func(o *Options) {
+		gate = &resumeGateRuntime{Runtime: o.Runtime, started: make(chan struct{}), release: make(chan struct{})}
+		o.Runtime = gate
+	})
+	h.wait(0, "resume fence capability", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCapabilityReport().GetResumeFenceSupported()
+	})
+	sandboxID, _ := uuidv7.NewString()
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatalf("create: %v", res.GetError())
+	}
+	if res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_PauseSandbox{
+		PauseSandbox: &ownsandv1.PauseSandboxCommand{SandboxId: sandboxID},
+	}}); res.GetSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("pause: %v", res)
+	}
+	resumeID, _ := uuidv7.NewString()
+	if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: &ownsandv1.AgentCommand{
+		CommandId: resumeID,
+		Command:   &ownsandv1.AgentCommand_ResumeSandbox{ResumeSandbox: &ownsandv1.ResumeSandboxCommand{SandboxId: sandboxID}},
+	}}}) {
+		t.Fatal("no original channel")
+	}
+	select {
+	case <-gate.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the resume did not reach the runtime")
+	}
+	from := cp.Received()
+	cp.Current().Close()
+	h.wait(from, "replacement channel's PAUSED report", func(e *ownsandv1.AgentEnvelope) bool {
+		for _, entry := range e.GetStateReport().GetSandboxes() {
+			if entry.GetSandboxId() == sandboxID && entry.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+				return true
+			}
+		}
+		return false
+	})
+
+	fence := &ownsandv1.FenceResumeCommand{SandboxId: sandboxID, ResumeCommandId: resumeID}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if res, err := h.agent.fenceResume(ctx, fence); res != nil || err == nil || errorDetail(err).GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("fence while resume is blocked = %v, %v", res, err)
+	}
+	close(gate.release)
+	res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_FenceResume{FenceResume: fence}})
+	if ack := res.GetFenceResume(); res.GetError() != nil || ack.GetResumeCommandId() != resumeID ||
+		ack.GetSandbox().GetSandboxId() != sandboxID || ack.GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("fence after releasing the resume = %v", res)
+	}
+}
+
 // gateRuntime holds Create until the test releases it, and reports whether
 // the context of Create ended first.
 type gateRuntime struct {
@@ -2202,6 +2324,65 @@ func TestSnapshotRemovalFencesCapturesAfterLookup(t *testing.T) {
 		t.Errorf("runtime captures after removal = %d, want 0", got)
 	}
 	requireEmptyStateDir(t, st)
+}
+
+// snapshotCtxRuntime records the context error that Snapshot sees.
+type snapshotCtxRuntime struct {
+	vmruntime.Runtime
+	cancel context.CancelFunc
+	ctxErr chan error
+}
+
+func (r *snapshotCtxRuntime) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+	r.cancel()
+	r.ctxErr <- ctx.Err()
+	return r.Runtime.Snapshot(context.WithoutCancel(ctx), vm, dir)
+}
+
+// TestSnapshotCaptureEndsWithItsChannel checks that a snapshot already in
+// progress stays bound to the channel context: a pending capture is not in the state report,
+// so the control plane fails it after a reconnect, and nothing reports a late
+// completion. Remove this test together with that limit.
+func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	chanCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	rt := &snapshotCtxRuntime{cancel: cancel, ctxErr: make(chan error, 1)}
+	h := startWith(t, cp, st, id, func(o *Options) {
+		rt.Runtime = o.Runtime
+		o.Runtime = rt
+	})
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
+	sandboxID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatalf("generate sandbox ID: %v", err)
+	}
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatalf("create %v", res)
+	}
+	snapID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatalf("generate snapshot ID: %v", err)
+	}
+	h.agent.handleCommand(chanCtx, context.Background(), &ownsandv1.AgentCommand{CommandId: snapID, Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}}, 0)
+	select {
+	case err := <-rt.ctxErr:
+		if err != context.Canceled {
+			t.Fatalf("snapshot runtime context error = %v, want %v", err, context.Canceled)
+		}
+	default:
+		t.Fatal("snapshot command returned without calling the runtime's Snapshot method")
+	}
+	// The runtime completed the capture although its channel ended. The
+	// snapshot must not become known or ready.
+	if h.agent.Sandboxes.HasSnapshot(snapID) {
+		t.Fatal("snapshot captured after its channel ended is known to the manager")
+	}
+	for _, s := range h.agent.Sandboxes.StateReport(2, nil).GetSnapshots() {
+		t.Fatalf("state report holds the snapshot %v after its channel ended", s)
+	}
 }
 
 // processSnapshotCopy waits for channel cancellation after the file copy

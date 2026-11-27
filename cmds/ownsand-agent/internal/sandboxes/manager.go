@@ -93,6 +93,9 @@ type sandbox struct {
 	createCancel context.CancelFunc
 	// ending is true while the agent itself stops the VM.
 	ending bool
+	// vmExitPending is set when a confirmed VM exit could not be recorded
+	// as DELETING. Tick retries the end until the record enters DELETING.
+	vmExitPending bool
 	// createCleanupTracked is set when the runtime failed to create this
 	// sandbox. While its record is CREATING, the failed-create transition
 	// still needs to be saved. The pending set tracks runtime cleanup even
@@ -108,7 +111,14 @@ type sandbox struct {
 	lastIdleReport time.Time
 }
 
-type createCleanupAttempt struct {
+type cleanupSource uint8
+
+const (
+	cleanupFromInventory cleanupSource = iota
+	cleanupFromFailedCreate
+)
+
+type cleanupAttempt struct {
 	done chan struct{}
 	err  error // Published by closing done.
 }
@@ -163,15 +173,10 @@ type Manager struct {
 	execs          ExecTracker
 	gate           CreateGate
 	closed         bool
-	// cleanupPending holds the IDs of the sandboxes whose create failed in
-	// the runtime. The runtime reports a failed create as clean, but a
-	// runtime whose stop failed keeps the VM handle and files for a later
-	// stop (see the runtime Create contract); Tick calls the idempotent
-	// runtime Delete for each ID until it succeeds. Removal uses the same
-	// cleanupInFlight attempts to wait for their results. Both maps are in
-	// memory only: the next agent start reconciles through the runtime.
-	cleanupPending  map[string]struct{}
-	cleanupInFlight map[string]*createCleanupAttempt
+	// cleanupPending holds IDs whose runtime files still need cleanup. The
+	// source determines whether cleanup must also clear a durable marker.
+	cleanupPending  map[string]cleanupSource
+	cleanupInFlight map[string]*cleanupAttempt
 	// runningAttempts and runningBackoff bound the retries of the first
 	// RUNNING commit of a create; see publishRunning. Tests override them.
 	runningAttempts int
@@ -224,7 +229,7 @@ func New(ctx context.Context, opts Options) (*Manager, error) {
 	m := &Manager{
 		st: opts.Store, rt: opts.Runtime, logger: opts.Logger, now: opts.Now, freeDisk: opts.FreeDisk,
 		runningAttempts: DefaultRunningAttempts, runningBackoff: DefaultRunningBackoff,
-		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, pending: map[string]*pendingSnapshot{}, cleanupPending: map[string]struct{}{}, cleanupInFlight: map[string]*createCleanupAttempt{}, importLocks: map[string]*importLock{}, reports: map[uint64]map[string]uint64{},
+		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, pending: map[string]*pendingSnapshot{}, cleanupPending: map[string]cleanupSource{}, cleanupInFlight: map[string]*cleanupAttempt{}, importLocks: map[string]*importLock{}, reports: map[uint64]map[string]uint64{},
 	}
 	agentState, err := m.st.UpdateAgent(func(a *store.AgentState) error {
 		if a.StateEpoch == "" {
@@ -253,6 +258,13 @@ func New(ctx context.Context, opts Options) (*Manager, error) {
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	cleanups, err := m.st.LoadSandboxCleanups()
+	if err != nil {
+		return nil, fmt.Errorf("sandboxes: load pending cleanups: %w", err)
+	}
+	for _, id := range cleanups {
+		m.cleanupPending[id] = cleanupFromFailedCreate
 	}
 	if err := m.loadSnapshots(); err != nil {
 		return nil, err
@@ -288,12 +300,18 @@ func (m *Manager) reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("sandboxes: list runtime VMs: %w", err)
 	}
-	// cleaned holds the sandboxes whose runtime Delete already succeeded.
+	// cleaned records the result of each startup Delete.
 	cleaned := map[string]bool{}
 	for _, id := range running {
 		m.logger.Warn("stopping a VM that outlived its agent process", "sandbox_id", id)
 		if err := m.rt.Delete(ctx, id); err != nil {
 			m.logger.Error("stop surviving VM failed", "sandbox_id", id, "error", err)
+			cleaned[id] = false
+			if sb := m.sandboxes[id]; sb == nil || !sb.rec.Live() {
+				if _, pending := m.cleanupPending[id]; !pending {
+					m.cleanupPending[id] = cleanupFromInventory
+				}
+			}
 			continue
 		}
 		cleaned[id] = true
@@ -332,6 +350,27 @@ func (m *Manager) reconcile(ctx context.Context) error {
 			return err
 		}
 	}
+	// Live records own their deletion. Reuse its result once the record is
+	// terminal. For an ID that inventory did not list, Delete can still
+	// remove files that the old process left behind.
+	for id := range m.cleanupPending {
+		if sb := m.sandboxes[id]; sb != nil && sb.rec.Live() {
+			continue
+		}
+		success, attempted := cleaned[id]
+		if !attempted {
+			if err := m.rt.Delete(ctx, id); err != nil {
+				m.logger.Warn("sandbox cleanup at startup failed", "sandbox_id", id, "error", err)
+				continue
+			}
+			success = true
+		}
+		if success {
+			if err := m.finishCleanupLocked(id); err != nil {
+				m.logger.Warn("sandbox cleanup at startup incomplete", "sandbox_id", id, "error", err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -363,17 +402,29 @@ func (m *Manager) nextRevision() (uint64, error) {
 // commitLocked applies change to the record with a new revision and saves
 // it. The caller holds m.mu or has exclusive access.
 func (m *Manager) commitLocked(rec *Record, change func(*Record)) error {
+	_, err := m.commitRecordLocked(rec, change)
+	return err
+}
+
+type recordCommitStage string
+
+const (
+	recordCommitRevision recordCommitStage = "revision"
+	recordCommitSave     recordCommitStage = "save"
+)
+
+func (m *Manager) commitRecordLocked(rec *Record, change func(*Record)) (recordCommitStage, error) {
 	rev, err := m.nextRevision()
 	if err != nil {
-		return fmt.Errorf("sandboxes: persist revision: %w", err)
+		return recordCommitRevision, fmt.Errorf("sandboxes: persist revision: %w", err)
 	}
 	change(rec)
 	rec.Revision = rev
 	rec.Acked = false
 	if err := m.st.SaveSandbox(rec.SandboxID, rec); err != nil {
-		return fmt.Errorf("sandboxes: save record: %w", err)
+		return recordCommitSave, fmt.Errorf("sandboxes: save record: %w", err)
 	}
-	return nil
+	return "", nil
 }
 
 // errSandboxGone reports that updateIf skipped a stale sandbox: its guard
@@ -607,6 +658,9 @@ func validateCreate(cmd *ownsandv1.CreateSandboxCommand) error {
 func (m *Manager) existingCreateLocked(id string) (entry *ownsandv1.SandboxStateEntry, err error, found bool) {
 	sb, ok := m.sandboxes[id]
 	if !ok {
+		if _, pending := m.cleanupPending[id]; pending {
+			return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox cleanup is pending"), true
+		}
 		return nil, nil, false
 	}
 	entry = sb.rec.Entry(m.epoch)
@@ -736,7 +790,7 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 		// The runtime cleans up a failed create itself, but a runtime whose
 		// stop failed keeps the VM handle and files. Tick retries the stop
 		// until the runtime Delete succeeds.
-		m.cleanupPending[id] = struct{}{}
+		m.cleanupPending[id] = cleanupFromFailedCreate
 		sb.createCleanupTracked = true
 		entry, saveErr := m.commitCreateFailureLocked(sb)
 		outbox := m.outbox
@@ -763,10 +817,13 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 }
 
 // commitCreateFailureLocked keeps the saved CREATING record visible until
-// the failed-create transition commits. The caller holds m.mu and checks
-// that the failed create still owns the sandbox.
+// the cleanup marker and failed-create transition commit. The caller holds
+// m.mu and checks that the failed create still owns the sandbox.
 func (m *Manager) commitCreateFailureLocked(sb *sandbox) (*ownsandv1.SandboxStateEntry, error) {
 	rec := sb.rec
+	if err := m.st.SaveSandboxCleanup(rec.SandboxID); err != nil {
+		return nil, fmt.Errorf("save sandbox cleanup marker: %w", err)
+	}
 	if err := m.commitLocked(&rec, func(r *Record) {
 		r.State = ownsandv1.SandboxState_SANDBOX_STATE_FAILED
 		r.EndReason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED
@@ -782,12 +839,11 @@ func (m *Manager) commitCreateFailureLocked(sb *sandbox) (*ownsandv1.SandboxStat
 // The caller holds sb.cmdMu. A failed commit is recoverable, because the VM
 // runs and a repeated create command would only get the existing creating
 // record: it tries the commit up to m.runningAttempts times with a growing
-// wait. A revision failure leaves the record unchanged (CREATING), while a
-// failed record save leaves the new state in memory and unsaved; the next
-// attempt commits either again with a new revision.
+// wait. On failure, the last saved CREATING record stays visible until a
+// retry saves RUNNING with a new revision.
 //
 // A delete or a TTL end that took over (sb.ending, or a record that left
-// CREATING and RUNNING) keeps control of the teardown: publishRunning commits
+// CREATING) keeps control of the teardown: publishRunning commits
 // nothing more and returns ABORTED, and that end stops the VM after the create
 // released sb.cmdMu. When the attempts are used up and the create can claim
 // teardown, it ends the sandbox as CREATE_FAILED, which stops the VM. When
@@ -797,33 +853,32 @@ func (m *Manager) publishRunning(ctx context.Context, sb *sandbox, vm vmruntime.
 	id := sb.rec.SandboxID
 	attempts := max(m.runningAttempts, 1)
 	live := func() bool {
-		if m.sandboxes[id] != sb || sb.ending {
-			return false
-		}
-		return sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_CREATING || sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
+		return m.sandboxes[id] == sb && !sb.ending && sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_CREATING
 	}
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		entry, err := m.updateIf(sb, live, func(r *Record) {
+		m.mu.Lock()
+		if !live() {
+			m.mu.Unlock()
+			lastErr = errSandboxGone
+			break
+		}
+		rec := sb.rec
+		stage, err := m.commitRecordLocked(&rec, func(r *Record) {
 			r.State = ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
 			r.RestorePath = vm.RestorePath()
 			r.IdleDeadline = m.now().Add(r.IdleTTL)
 		})
 		if err == nil {
+			sb.rec.State, sb.rec.RestorePath, sb.rec.IdleDeadline = rec.State, rec.RestorePath, rec.IdleDeadline
+			sb.rec.Revision, sb.rec.Acked = rec.Revision, rec.Acked
+			entry, outbox := sb.rec.Entry(m.epoch), m.outbox
+			m.mu.Unlock()
+			m.sendUpdate(outbox, ownsandv1.SandboxState_SANDBOX_STATE_CREATING, entry)
 			return entry, nil
 		}
-		lastErr = err
-		if errors.Is(err, errSandboxGone) {
-			break
-		}
-		// The record state after the error tells the failures apart: a
-		// revision failure did not change the record, a save failure did.
-		m.mu.Lock()
-		stage := "revision"
-		if sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-			stage = "save"
-		}
 		m.mu.Unlock()
+		lastErr = err
 		willRetry := attempt < attempts && ctx.Err() == nil
 		m.logger.Error("sandbox running record failed", "sandbox_id", id, "failed_stage", stage, "attempt", attempt, "max_attempts", attempts, "will_retry", willRetry, "error", err)
 		if m.onRunningCommitFailed != nil {
@@ -894,6 +949,11 @@ func (m *Manager) watchVM(sb *sandbox, vm vmruntime.VM) {
 	}
 	m.logger.Warn("sandbox VM ended unexpectedly", "sandbox_id", sb.rec.SandboxID)
 	if _, err := m.endLocked(context.Background(), sb, finalStateFor(reason), reason); err != nil {
+		m.mu.Lock()
+		if sb.vm == vm && sb.rec.Live() && sb.rec.State != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+			sb.vmExitPending = true
+		}
+		m.mu.Unlock()
 		m.logger.Error("record lost sandbox failed", "sandbox_id", sb.rec.SandboxID, "error", err)
 	}
 }
@@ -933,6 +993,7 @@ func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.Sa
 			}
 			r.State = ownsandv1.SandboxState_SANDBOX_STATE_DELETING
 			r.EndReason = reason
+			sb.vmExitPending = false
 		}); err != nil {
 			return nil, err
 		}
@@ -1132,26 +1193,29 @@ func (m *Manager) undoRuntimeMove(sb *sandbox, id string, from ownsandv1.Sandbox
 	return updateErr
 }
 
-// retryEndBeforeDeadline reports whether Tick can retry a failed end before
-// a TTL deadline. The caller holds m.mu.
-func (sb *sandbox) retryEndBeforeDeadline() bool {
+// retryReasonBeforeDeadline returns the reason for a failed end that Tick
+// can retry before a TTL deadline. The caller holds m.mu.
+func (sb *sandbox) retryReasonBeforeDeadline() ownsandv1.SandboxEndReason {
+	if sb.vmExitPending {
+		return ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE
+	}
 	if sb.rec.State != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
-		return false
+		return ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED
 	}
 	switch sb.rec.EndReason {
 	case ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE:
-		return true
+		return sb.rec.EndReason
 	case ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER:
 		if sb.vm != nil {
 			// The watcher may have seen the VM exit while Delete still owned the end.
 			select {
 			case <-sb.vm.Exited():
-				return true
+				return sb.rec.EndReason
 			default:
 			}
 		}
 	}
-	return false
+	return ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED
 }
 
 // Tick enforces the TTLs, retries failed creates and cleanup of exited VMs,
@@ -1192,8 +1256,9 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			}
 			continue
 		}
-		if sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && execs != nil && !now.Before(sb.rec.IdleDeadline) && execs.HasRunningExec(sb.rec.SandboxID) {
-			// A running exec keeps the sandbox active.
+		if sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && !sb.vmExitPending &&
+			execs != nil && !now.Before(sb.rec.IdleDeadline) && execs.HasRunningExec(sb.rec.SandboxID) {
+			// A running exec keeps the sandbox active until the VM exits.
 			sb.rec.IdleDeadline = now.Add(sb.rec.IdleTTL)
 			sb.idleDirty = true
 		}
@@ -1206,9 +1271,9 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 				expired = append(expired, expiry{sb: sb, reason: reason})
 				continue
 			}
-			if sb.retryEndBeforeDeadline() {
+			if reason := sb.retryReasonBeforeDeadline(); reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED {
 				sb.ending = true
-				expired = append(expired, expiry{sb: sb, reason: sb.rec.EndReason, retry: true})
+				expired = append(expired, expiry{sb: sb, reason: reason, retry: true})
 				continue
 			}
 		}
@@ -1229,10 +1294,8 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			unacked = append(unacked, sb.rec.Entry(m.epoch))
 		}
 	}
-	// Collect the failed creates whose runtime clean-up still has to be
-	// confirmed. A sandbox with a live record owns its VM: its own end calls
-	// the runtime Delete, so the retry waits until that record is terminal
-	// or dropped.
+	// A live record owns its VM. Its end calls runtime Delete, so the
+	// background retry waits until the record is terminal or dropped.
 	for id := range m.cleanupPending {
 		if m.cleanupInFlight[id] != nil {
 			continue
@@ -1240,7 +1303,7 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 		if sb, ok := m.sandboxes[id]; ok && sb.rec.Live() {
 			continue
 		}
-		m.startCreateCleanupLocked(ctx, id)
+		m.startCleanupLocked(ctx, id)
 	}
 	outbox := m.outbox
 	m.bg.Add(len(expired))
@@ -1276,44 +1339,58 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 	}
 }
 
-// startCreateCleanupLocked reserves the runtime deletion until it returns.
-// A successful Delete releases the pending ID. A failed Delete leaves it
-// eligible for retry. The caller holds m.mu and checks that the manager is
-// open and that no attempt owns the ID.
-func (m *Manager) startCreateCleanupLocked(ctx context.Context, id string) *createCleanupAttempt {
-	attempt := &createCleanupAttempt{done: make(chan struct{})}
+// startCleanupLocked reserves the ID until runtime deletion and marker
+// removal finish. A failure leaves the ID eligible for retry. The caller
+// holds m.mu and checks that the manager is open and no attempt owns the ID.
+func (m *Manager) startCleanupLocked(ctx context.Context, id string) *cleanupAttempt {
+	attempt := &cleanupAttempt{done: make(chan struct{})}
 	m.cleanupInFlight[id] = attempt
 	m.bg.Add(1)
 	go func() {
 		defer m.bg.Done()
 		err := m.rt.Delete(ctx, id)
 		m.mu.Lock()
-		delete(m.cleanupInFlight, id)
 		if err == nil {
-			delete(m.cleanupPending, id)
+			err = m.finishCleanupLocked(id)
 		}
+		delete(m.cleanupInFlight, id)
 		attempt.err = err
 		close(attempt.done)
 		m.mu.Unlock()
 
 		if err != nil {
-			m.logger.Warn("clean-up of a failed create incomplete", "sandbox_id", id, "error", err)
+			m.logger.Warn("sandbox cleanup incomplete", "sandbox_id", id, "error", err)
 			return
 		}
-		m.logger.Info("clean-up of a failed create complete", "sandbox_id", id)
+		m.logger.Info("sandbox cleanup complete", "sandbox_id", id)
 	}()
 	return attempt
 }
 
-// deleteVM shares failed-create cleanup between sandbox ends, Tick and
-// removal. Once the pending entry is gone, a caller that knows the ID needed
-// this cleanup can skip deletion.
+// finishCleanupLocked releases the ID only after its durable marker clears.
+// The caller holds m.mu or is reconciling at startup.
+func (m *Manager) finishCleanupLocked(id string) error {
+	if m.cleanupPending[id] == cleanupFromFailedCreate {
+		if err := m.st.DeleteSandboxCleanup(id); err != nil {
+			return fmt.Errorf("clear sandbox cleanup marker: %w", err)
+		}
+	}
+	delete(m.cleanupPending, id)
+	if sb := m.sandboxes[id]; sb != nil && sb.rec.Terminal() {
+		sb.stopped = true
+	}
+	return nil
+}
+
+// deleteVM shares pending cleanup between sandbox ends, Tick and removal.
+// Once the pending entry is gone, a caller that already observed it can skip
+// runtime deletion.
 func (m *Manager) deleteVM(ctx context.Context, id string, cleanupTracked bool) error {
 	m.mu.Lock()
 	if _, pending := m.cleanupPending[id]; !pending {
 		m.mu.Unlock()
 		if cleanupTracked {
-			return nil
+			return ctx.Err()
 		}
 		return m.rt.Delete(ctx, id)
 	}
@@ -1327,7 +1404,7 @@ func (m *Manager) deleteVM(ctx context.Context, id string, cleanupTracked bool) 
 			m.mu.Unlock()
 			return errors.New("sandboxes: manager is closed")
 		}
-		attempt = m.startCreateCleanupLocked(ctx, id)
+		attempt = m.startCleanupLocked(ctx, id)
 	}
 	m.mu.Unlock()
 
@@ -1395,6 +1472,16 @@ func (m *Manager) Run(ctx context.Context) {
 			m.Tick(ctx, resend)
 		}
 	}
+}
+
+// StateEntry returns the current entry of a known sandbox.
+func (m *Manager) StateEntry(id string) *ownsandv1.SandboxStateEntry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sb := m.sandboxes[id]; sb != nil {
+		return sb.rec.Entry(m.epoch)
+	}
+	return nil
 }
 
 // StateReport returns the full state of the device for a new channel.
@@ -1493,9 +1580,9 @@ func (m *Manager) Entries() []*ownsandv1.SandboxStateEntry {
 }
 
 // RemoveAll stops and deletes every sandbox and snapshot for a device
-// removal, including failed creates whose terminal records were acknowledged.
-// If a runtime deletion fails, RemoveAll keeps that sandbox tracked and
-// skips the local wipe so removal can retry.
+// removal, including pending cleanup with no sandbox record. If runtime
+// deletion or durable marker removal fails, RemoveAll keeps the ID tracked
+// and skips the local wipe so removal can retry.
 func (m *Manager) RemoveAll(ctx context.Context) error {
 	if err := m.fenceSnapshotImports(ctx); err != nil {
 		return err
@@ -1530,7 +1617,7 @@ func (m *Manager) RemoveAll(ctx context.Context) error {
 			sb.ending = true
 			// An admitted create can add a pending cleanup while removal
 			// waits for its sandbox command lock.
-			target.cleanupTracked = target.cleanupTracked || sb.createCleanupTracked
+			target.cleanupTracked = target.cleanupTracked || sb.createCleanupTracked || sb.stopped
 			m.mu.Unlock()
 		}
 		if err := m.deleteVM(ctx, id, target.cleanupTracked); err != nil {
@@ -1563,10 +1650,7 @@ func (m *Manager) RemoveAll(ctx context.Context) error {
 		// the retry that finds no failure runs it.
 		return errors.Join(errs...)
 	}
-	if err := m.st.WipeLocalData(); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return m.st.WipeLocalData()
 }
 
 // removeDirIfExists removes a directory tree.
