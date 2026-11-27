@@ -53,9 +53,9 @@ type StatusOptions struct {
 	Logger *slog.Logger
 	// Now is the clock of the status rules; nil selects time.Now.
 	Now func() time.Time
-	// Held reports whether this instance holds the instance lease; nil
-	// means always.
-	Held func() bool
+	// Ownership samples the lease epoch and held state together. A nil
+	// function means the instance always holds the same lease period.
+	Ownership func() (epoch uint64, held bool)
 	// Client is the delino-accounts UsageService client. Without it, the
 	// poll and the pending unlinks stay idle, and the RPCs that need
 	// delino-accounts fail with unavailable.
@@ -73,13 +73,13 @@ type StatusOptions struct {
 // suspensions and retries the unlinks that delino-accounts has not
 // confirmed yet. Gated RPCs read only the cache.
 type Statuses struct {
-	db      *db.DB
-	logger  *slog.Logger
-	now     func() time.Time
-	held    func() bool
-	client  accountsv1connect.UsageServiceClient
-	timing  StatusTiming
-	metrics *statusMetrics
+	db        *db.DB
+	logger    *slog.Logger
+	now       func() time.Time
+	ownership func() (epoch uint64, held bool)
+	client    accountsv1connect.UsageServiceClient
+	timing    StatusTiming
+	metrics   *statusMetrics
 
 	pollMu sync.Mutex
 	kick   chan struct{}
@@ -96,15 +96,15 @@ func NewStatuses(opts StatusOptions) *Statuses {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	if opts.Held == nil {
-		opts.Held = func() bool { return true }
+	if opts.Ownership == nil {
+		opts.Ownership = func() (uint64, bool) { return 0, true }
 	}
 	timing := DefaultStatusTiming()
 	if opts.Timing != nil {
 		timing = *opts.Timing
 	}
 	return &Statuses{
-		db: opts.DB, logger: opts.Logger, now: opts.Now, held: opts.Held, client: opts.Client, timing: timing,
+		db: opts.DB, logger: opts.Logger, now: opts.Now, ownership: opts.Ownership, client: opts.Client, timing: timing,
 		metrics: newStatusMetrics(opts.Metrics), kick: make(chan struct{}, 1), staleLogged: map[string]time.Time{},
 	}
 }
@@ -500,7 +500,7 @@ func (s *Statuses) RetryPendingUnlinks(ctx context.Context) error {
 		return err
 	}
 	for _, orgID := range orgs {
-		if !s.held() {
+		if _, held := s.ownership(); !held {
 			return nil
 		}
 		if err := s.UnlinkPending(ctx, orgID); err != nil && ctx.Err() != nil {
@@ -543,12 +543,12 @@ func (s *Statuses) RefreshMetrics(ctx context.Context) error {
 	return nil
 }
 
-// Run runs the status worker until ctx ends: on the lease holder it polls
-// every Poll interval (measured between poll starts) and, every Tick,
-// records time-based suspensions and starts a retry of the due pending
-// unlinks unless the previous retry is still running; every instance
-// refreshes the metrics. A slow UnlinkOrganization call delays none of
-// these steps. Run returns after the running retry ended.
+// Run runs the status worker until ctx ends. It polls on the first step of
+// each lease period and then every Poll interval (measured between poll
+// starts). Every Tick, the lease holder records time-based suspensions and
+// retries due pending unlinks if no retry is running. Every instance
+// refreshes the metrics. Pending unlink retries run independently of
+// these steps. Run waits for an outstanding retry before it returns.
 func (s *Statuses) Run(ctx context.Context) {
 	if s.client == nil {
 		s.logger.Warn("billing_status_sync_disabled",
@@ -564,19 +564,18 @@ func (s *Statuses) Run(ctx context.Context) {
 	defer batch.Wait()
 	var retrying atomic.Bool
 	var lastPoll time.Time
+	var lastPollEpoch uint64
 	for {
-		if s.held() {
+		if epoch, held := s.ownership(); held {
 			if s.client != nil {
-				// The poll interval runs from the start of the previous poll,
-				// not from its end, and a step may run up to half a tick
-				// early: the step is sampled only at a tick, and a step that
-				// runs a few milliseconds before the interval has elapsed
-				// would otherwise wait for the next tick, which stretches
-				// every interval by one Tick.
-				if lastPoll.IsZero() || time.Since(lastPoll) >= s.timing.Poll-s.timing.Tick/2 {
-					// A failed poll is retried at the next poll interval, not
-					// at every tick; Poll logs the failure.
+				// The epoch detects reacquisition even if no step saw the loss.
+				// Within an epoch, measure from the previous poll start and
+				// allow half a tick of slack so tick timing does not add an
+				// extra tick to the interval.
+				if lastPoll.IsZero() || epoch != lastPollEpoch || time.Since(lastPoll) >= s.timing.Poll-s.timing.Tick/2 {
+					// A failed poll also starts the interval. Poll logs the failure.
 					lastPoll = time.Now()
+					lastPollEpoch = epoch
 					_ = s.Poll(ctx)
 				}
 				// Due pending unlinks are retried at every tick, not only at
@@ -608,8 +607,7 @@ func (s *Statuses) Run(ctx context.Context) {
 	}
 }
 
-// KickPoll makes the worker poll at its next step, for example after a
-// lease handover.
+// KickPoll wakes the worker and makes it poll at its next eligible step.
 func (s *Statuses) KickPoll() {
 	select {
 	case s.kick <- struct{}{}:

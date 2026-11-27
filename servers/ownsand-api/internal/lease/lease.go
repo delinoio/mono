@@ -103,9 +103,16 @@ func (l *Lease) heldLocked() bool {
 
 // Held reports whether this instance holds the lease.
 func (l *Lease) Held() bool {
+	_, held := l.Ownership()
+	return held
+}
+
+// Ownership returns the current epoch and whether this instance holds the
+// lease. Renewals keep the same epoch. Each acquisition starts a new epoch.
+func (l *Lease) Ownership() (epoch uint64, held bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.heldLocked()
+	return l.epoch, l.heldLocked()
 }
 
 // WhileHeld runs fn while this instance holds the lease and reports whether
