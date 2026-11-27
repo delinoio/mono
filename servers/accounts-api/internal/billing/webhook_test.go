@@ -266,13 +266,54 @@ func TestWebhookRefundAndChargeback(t *testing.T) {
 	// The approval removes the credit, and the balance becomes negative.
 	f.webhook(paddle.EventAdjustmentUpdated, paddletest.Adjustment("adj_1", "refund", "approved", "txn_buy", 1000))
 	f.webhook(paddle.EventAdjustmentUpdated, paddletest.Adjustment("adj_1", "refund", "approved", "txn_buy", 1000))
-	// Another adjustment cannot remove more than the purchase added.
-	f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_2", "chargeback", "approved", "txn_buy", 1000))
-	f.wantLedger(acct,
-		wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
-		wantEntry{LedgerUsage, -4 * usd, 6 * usd},
-		wantEntry{LedgerRefund, -10 * usd, -4 * usd},
-	)
+
+	type chargebackRecord struct {
+		TransactionID   string
+		AmountUSDMicros int64
+		HasLedgerEntry  bool
+		CreateTime      time.Time
+	}
+	checkChargeback := func(delivery string) chargebackRecord {
+		t.Helper()
+		rows, err := f.db.Pool.Query(ctx(), `SELECT g.paddle_transaction_id, r.amount_usd_micros,
+			r.ledger_entry_id IS NOT NULL, r.create_time
+			FROM credit_refunds r JOIN credit_grants g USING (credit_grant_id)
+			WHERE r.paddle_adjustment_id = 'adj_2'`)
+		if err != nil {
+			t.Fatalf("%s: query chargeback: %v", delivery, err)
+		}
+		record, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[chargebackRecord])
+		if err != nil {
+			t.Fatalf("%s: expected exactly one chargeback record for adj_2: %v", delivery, err)
+		}
+		if record.TransactionID != "txn_buy" || record.AmountUSDMicros != 0 || record.HasLedgerEntry {
+			t.Fatalf("%s: chargeback record = %+v, want txn_buy, zero amount and no ledger entry", delivery, record)
+		}
+		return record
+	}
+	want := []wantEntry{
+		{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
+		{LedgerUsage, -4 * usd, 6 * usd},
+		{LedgerRefund, -10 * usd, -4 * usd},
+	}
+	// Record the chargeback even though the full refund leaves no credit to reverse.
+	chargeback := paddletest.Adjustment("adj_2", "chargeback", "approved", "txn_buy", 1000)
+	if got := f.webhookResult(paddle.EventAdjustmentCreated, chargeback); got != webhookApplied {
+		t.Fatalf("chargeback result = %q, want %q", got, webhookApplied)
+	}
+	first := checkChargeback("first delivery")
+	f.wantLedger(acct, want...)
+
+	// A fresh event exercises adjustment-ID deduplication.
+	f.clock.Advance(time.Second)
+	if got := f.webhookResult(paddle.EventAdjustmentCreated, chargeback); got != webhookIgnored {
+		t.Fatalf("chargeback replay result = %q, want %q", got, webhookIgnored)
+	}
+	replayed := checkChargeback("replay")
+	if !replayed.CreateTime.Equal(first.CreateTime) {
+		t.Fatalf("chargeback creation time after replay = %v, want %v", replayed.CreateTime, first.CreateTime)
+	}
+	f.wantLedger(acct, want...)
 	// An unknown transaction is unmatched and changes nothing.
 	if code := f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_3", "refund", "approved", "txn_unknown", 500)); code != http.StatusOK {
 		t.Fatal(code)
