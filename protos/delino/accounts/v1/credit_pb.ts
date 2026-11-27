@@ -604,9 +604,16 @@ export type CreateTopUpRequest = Message<"delino.accounts.v1.CreateTopUpRequest"
 
   /**
    * UUID v7 that the caller generates for each logical top-up and reuses for
-   * every retry. A repeated key of the same billing account within 24 hours
-   * returns the first result and charges nothing again; a repeated key with
-   * another amount fails with `invalid_argument`.
+   * every retry. Within 24 hours, a retry that matches a stored top-up by
+   * billing account and key uses the recorded outcome without charging again.
+   * A different amount returns `invalid_argument`. A rejection or a verified
+   * payment failure returns `failed_precondition`, even if the initial
+   * request succeeded before the failure webhook arrived. After the 1-hour
+   * timeout, replay succeeds if the server recorded Paddle acceptance. An
+   * outcome that is still unknown returns `unavailable`, including after the
+   * timeout.
+   * If the server removes the top-up because Paddle left the charge unapplied,
+   * a retry with the same key can start a new charge.
    *
    * @generated from field: string idempotency_key = 2;
    */
