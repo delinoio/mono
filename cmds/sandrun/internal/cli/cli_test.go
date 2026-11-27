@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/delinoio/mono/cmds/internal/credstore"
 	"github.com/delinoio/mono/go/sandrun"
@@ -735,6 +736,62 @@ func TestStatus(t *testing.T) {
 	}
 	if r := f.run("", "--org", f.org, "request", "cancel", "r1"); r.code != 0 {
 		t.Fatalf("cancel = %d %s", r.code, r.stderr)
+	}
+}
+
+func TestRunEscapesConnectErrorMessage(t *testing.T) {
+	f := newFixture(t)
+	f.env[EnvOrganization] = f.org
+	f.srv.Fail(sandrunv1connect.DevSessionServiceGetDevSessionProcedure,
+		connect.NewError(connect.CodeInternal, errors.New("sample\x1b\nmessage\u2028")))
+	r := f.run("", "session", "get", "sample")
+	const want = "error: internal: sample\\x1b\\nmessage\\u2028\n"
+	if r.code != ExitError || r.stderr != want {
+		t.Fatalf("session get exit = %d, stderr = %q, want exit %d and %q", r.code, r.stderr, ExitError, want)
+	}
+}
+
+func TestSessionDownloadEscapesGuestEntryNames(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake guest runs POSIX sh commands")
+	}
+	f := newFixture(t)
+	f.srv.AddDevSessionProfile(f.org, "linux", sandrunv1.GuestOs_GUEST_OS_LINUX, f.wd)
+	f.env[EnvAPIKey] = f.srv.APIKey
+	f.env[EnvOrganization] = f.org
+	created := f.ok("", "--output", "json", "session", "create", "linux")
+	var session sandrunv1.DevSession
+	if err := protojson.Unmarshal([]byte(created.stdout), &session); err != nil {
+		t.Fatal(err)
+	}
+	id := session.GetDevSessionId()
+
+	const name = "café\x1b\x07\n\r\t.txt"
+	const escaped = `café\x1b\x07\n\r\t.txt`
+	f.ok("", "session", "exec", id, "--", "sh", "-c",
+		`mkdir rejected warnings && ln -s ../outside-sample "rejected/$1" && mkfifo "warnings/$1"`, "fixture", name)
+
+	const progress = "download: preparing\ndownload: downloading\ndownload: applying\n"
+	rejected := f.run("", "session", "download", id, "rejected", "rejected-output")
+	want := progress + "error: sandrun: the archive entry " + escaped + " is a symbolic link that points outside the destination\n"
+	if rejected.code != ExitError || rejected.stderr != want {
+		t.Fatalf("rejected exit = %d, stderr = %q, want exit %d and %q", rejected.code, rejected.stderr, ExitError, want)
+	}
+
+	const warningSuffix = ": skipped an archive entry of an unsupported type"
+	warned := f.ok("", "session", "download", id, "warnings", "text-output")
+	want = progress + "warning: " + escaped + warningSuffix + "\n"
+	if warned.stderr != want {
+		t.Fatalf("text stderr = %q, want %q", warned.stderr, want)
+	}
+
+	warned = f.ok("", "--output", "json", "session", "download", id, "warnings", "json-output")
+	var download sandrun.DownloadResult
+	if err := json.Unmarshal([]byte(warned.stdout), &download); err != nil {
+		t.Fatal(err)
+	}
+	if warned.stderr != "" || !slices.Equal(download.Warnings, []string{name + warningSuffix}) {
+		t.Fatalf("JSON download warnings = %q, stderr = %q", download.Warnings, warned.stderr)
 	}
 }
 
