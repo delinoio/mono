@@ -1,0 +1,66 @@
+{
+  "gid": "inv-30-service-state-directory-fixtures",
+  "commit": "d2f9ed0b2ee7e36e519b275dc2688895c3b7a05a",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "d2f9ed0b2ee7e36e519b275dc2688895c3b7a05a",
+    "setup": "Run the commands in Bash from a clean disposable checkout at the stated revision using the repository Go toolchain and macOS command-line tools. Stop if any command fails.",
+    "commands": [
+      "test \"$(git rev-parse HEAD)\" = 'd2f9ed0b2ee7e36e519b275dc2688895c3b7a05a' && sw_vers && go version",
+      "mkdir -p '.t3-tmp/service-state/ordinary' '.t3-tmp/service-state/ampersand&tmp'",
+      "env -u OWNSAND_AGENT_STATE_DIR -u OWNSAND_AGENT_API_URL -u OWNSAND_AGENT_RUNTIME -u OWNSAND_AGENT_GUEST_BINARY -u OWNSAND_AGENT_RELEASE_MANIFEST_URL -u OWNSAND_AGENT_RELEASE_PUBLIC_KEYS -u OWNSAND_AGENT_LOG_LEVEL -u OWNSAND_AGENT_FIRECRACKER_BINARY -u OWNSAND_AGENT_LINUX_KERNEL -u OWNSAND_AGENT_LINUX_ROOTFS TMPDIR=\"$(pwd)/.t3-tmp/service-state/ordinary\" CGO_ENABLED=1 go test -mod=readonly -count=1 -json ./cmds/ownsand-agent -run '^(TestCLIMisc|TestServiceDefinitionUsesTheExplicitStateDir)$' > '.t3-tmp/service-state/macos-clean.jsonl'",
+      "env -u OWNSAND_AGENT_STATE_DIR -u OWNSAND_AGENT_API_URL -u OWNSAND_AGENT_RUNTIME -u OWNSAND_AGENT_GUEST_BINARY -u OWNSAND_AGENT_RELEASE_MANIFEST_URL -u OWNSAND_AGENT_RELEASE_PUBLIC_KEYS -u OWNSAND_AGENT_LOG_LEVEL -u OWNSAND_AGENT_FIRECRACKER_BINARY -u OWNSAND_AGENT_LINUX_KERNEL -u OWNSAND_AGENT_LINUX_ROOTFS TMPDIR=\"$(pwd)/.t3-tmp/service-state/ampersand&tmp\" CGO_ENABLED=1 OWNSAND_AGENT_GUEST_BINARY='/var/lib/from-env/ownsand-guest' go test -mod=readonly -count=1 -json ./cmds/ownsand-agent -run '^(TestCLIMisc|TestServiceDefinitionUsesTheExplicitStateDir)$' > '.t3-tmp/service-state/macos-collision.jsonl'"
+    ],
+    "expectedResults": [
+      "Both go test commands exit 0. Neither focused fixture skips.",
+      "TestCLIMisc passes the explicit and fallback subtests for ordinary paths and for paths containing an ampersand. Both assert the decoded value under EnvironmentVariables.",
+      "TestServiceDefinitionUsesTheExplicitStateDir checks the guest-binary entry and the exact state-directory entry in both positive renders. The missing-state and wrong-state controls reject both expected values while the guest-binary entry remains present."
+    ],
+    "files": {
+      "regressionTests": [
+        "cmds/ownsand-agent/main_test.go",
+        "cmds/ownsand-agent/service_unix_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/service-state/macos-clean.jsonl",
+        ".t3-tmp/service-state/macos-collision.jsonl"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-service-state-directory-fixtures/worker/.t3-tmp/service-state/ownsand-agent-darwin-arm64.test"
+      ]
+    },
+    "additionalPlatforms": {
+      "windows": {
+        "status": "pending",
+        "platform": "Windows amd64",
+        "host": "delino-win-1",
+        "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+        "sha": "d2f9ed0b2ee7e36e519b275dc2688895c3b7a05a",
+        "setup": "Run the commands in PowerShell from a short, clean disposable checkout at the stated revision using the repository Go toolchain.",
+        "commands": [
+          "if ((git rev-parse HEAD).Trim() -ne 'd2f9ed0b2ee7e36e519b275dc2688895c3b7a05a') { throw 'Unexpected checkout revision' }; go version",
+          "New-Item -ItemType Directory -Path '.t3-tmp\\service-state' -Force | Out-Null",
+          "$env:TEMP = (Resolve-Path '.t3-tmp\\service-state').Path; $env:TMP = $env:TEMP; $env:TMPDIR = $env:TEMP",
+          "go test -mod=readonly -count=1 -json ./cmds/ownsand-agent -run '^TestCLIMisc$' > '.t3-tmp\\service-state\\windows.jsonl'; if ($LASTEXITCODE -ne 0) { Get-Content '.t3-tmp\\service-state\\windows.jsonl'; throw 'Windows fixture failed' }"
+        ],
+        "expectedResults": [
+          "TestCLIMisc exits 0 without skips.",
+          "Its ordinary explicit and fallback subtests compare the exact OWNSAND_AGENT_STATE_DIR assignment in the printed REG_MULTI_SZ data."
+        ],
+        "files": {
+          "regressionTests": [
+            "cmds/ownsand-agent/main_test.go",
+            "cmds/ownsand-agent/service_windows_test.go"
+          ],
+          "outputLogs": [".t3-tmp\\service-state\\windows.jsonl"],
+          "crossBuildArtifacts": [
+            "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-service-state-directory-fixtures/worker/.t3-tmp/service-state/ownsand-agent-windows-amd64.test.exe"
+          ]
+        }
+      }
+    }
+  }
+}
