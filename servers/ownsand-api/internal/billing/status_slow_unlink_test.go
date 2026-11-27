@@ -127,7 +127,7 @@ func TestRetryPendingUnlinksStopsWithoutLease(t *testing.T) {
 	isHeld := false
 	setHeld := func(v bool) { mu.Lock(); isHeld = v; mu.Unlock() }
 	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: f.fake.Client(),
-		Held: func() bool { mu.Lock(); defer mu.Unlock(); return isHeld }})
+		Ownership: func() (uint64, bool) { mu.Lock(); defer mu.Unlock(); return 0, isHeld }})
 
 	if err := statuses.RetryPendingUnlinks(ctx); err != nil {
 		t.Fatal(err)

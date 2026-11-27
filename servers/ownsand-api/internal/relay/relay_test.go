@@ -528,6 +528,96 @@ func TestConcurrentOpensReachTheAgentInIDOrder(t *testing.T) {
 	waitRun(t, done, time.Second)
 }
 
+func TestOpenRejectsEndedContextBeforeAllocation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func() (context.Context, context.CancelFunc)
+		want error
+	}{
+		{"canceled", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, cancel
+		}, context.Canceled},
+		{"expired", func() (context.Context, context.CancelFunc) {
+			return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		}, context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := tc.end()
+			defer cancel()
+			c := NewConn(context.Background(), "device", 1, testLimits)
+			if s, err := c.Open(ctx, "grant", "sandbox"); s != nil || !errors.Is(err, tc.want) {
+				t.Fatalf("Open = %v, %v, want nil, %v", s, err, tc.want)
+			}
+			if c.next != 0 || c.StreamCount() != 0 || perGrantCount(c, "grant") != 0 ||
+				len(c.openGate) != 0 || len(c.slots) != 0 || len(c.out) != 0 {
+				t.Fatal("Open used admission state with an already ended context")
+			}
+		})
+	}
+}
+
+type openCommitContext struct {
+	context.Context
+	beforeErr func()
+}
+
+func (c openCommitContext) Err() error {
+	c.beforeErr()
+	return c.Context.Err()
+}
+
+func TestOpenCancelAfterTakingOutboundSlot(t *testing.T) {
+	limits := testLimits
+	limits.MaxStreamsPerConn = 1
+	limits.MaxStreamsPerGrant = 1
+	c := NewConn(context.Background(), "device", 1, limits)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := openCommitContext{Context: ctx, beforeErr: func() {
+		// The slot marks the last checkpoint, after provisional admission.
+		if len(c.slots) == 1 {
+			if c.StreamCount() != 1 || perGrantCount(c, "grant") != 1 {
+				t.Fatal("expected a provisional stream when checking the outbound slot")
+			}
+			cancel()
+		}
+	}}
+	if s, err := c.Open(request, "grant", "sandbox"); s != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Open = %v, %v, want nil, context.Canceled", s, err)
+	}
+	if c.StreamCount() != 0 || perGrantCount(c, "grant") != 0 || c.pendingFinals != 0 ||
+		len(c.openGate) != 0 || len(c.slots) != 0 || len(c.out) != 0 {
+		t.Fatal("canceled Open retained admission state or queued a frame")
+	}
+
+	s, err := c.Open(context.Background(), "grant", "sandbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ID != 2 {
+		t.Fatalf("stream ID = %d, want 2 after discarding provisional stream 1", s.ID)
+	}
+	s.Close(true)
+	if got := len(c.out); got != 2 {
+		t.Fatalf("queued frames = %d, want one open and one final close", got)
+	}
+	open, final := <-c.out, <-c.out
+	if open.frame.GetRelayStreamOpen() == nil || open.frame.GetStreamId() != s.ID ||
+		final.frame.GetRelayStreamClose() == nil || final.frame.GetStreamId() != s.ID || !final.final {
+		t.Fatalf("queued frames = %v, %v, want stream %d open and final close", open.frame, final.frame, s.ID)
+	}
+	c.dequeued(open)
+	if len(c.slots) != 0 || c.pendingFinals != 1 || perGrantCount(c, "grant") != 1 {
+		t.Fatal("admission must keep the final reservation until the writer finishes")
+	}
+	c.sent(final)
+	if c.pendingFinals != 0 || perGrantCount(c, "grant") != 0 {
+		t.Fatal("the final frame retained its admission slots after being sent")
+	}
+}
+
 // TestOpenCancelWhileQueueIsFull cancels an Open that waits for room in a full
 // outbound queue and an Open that waits for the gate: both return at once and
 // release their grant and connection slots, and a later Open gets a fresh,

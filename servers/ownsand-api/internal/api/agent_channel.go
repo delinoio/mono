@@ -111,14 +111,17 @@ func abortStalledWrite(ctx context.Context) error {
 	return rc.SetWriteDeadline(time.Unix(1, 0))
 }
 
-// sendCommand sends cmd on conn with a new command ID and remembers it.
+// sendCommand sends cmd on conn and remembers its command ID. A repeat
+// delete on that channel returns the outstanding delete's command ID.
 func (s *Service) sendCommand(ctx context.Context, conn *hub.Conn, info commandInfo, cmd *ownsandv1.AgentCommand) (string, error) {
 	if cmd.CommandId == "" {
 		cmd.CommandId = newID()
 	}
 	info.deviceID = conn.DeviceID
 	info.generation = conn.Generation
-	s.commands.add(cmd.CommandId, info, conn, s.commandRetentionNow())
+	if existingID := s.commands.add(cmd.CommandId, info, conn, s.commandRetentionNow()); existingID != "" {
+		return existingID, nil
+	}
 	if err := conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}); err != nil {
 		s.commands.remove(cmd.CommandId)
 		return "", err

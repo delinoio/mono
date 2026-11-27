@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
@@ -42,8 +43,8 @@ func (k *stepClock) advance(d time.Duration) {
 	k.wallNanos.Add(int64(d))
 }
 
-// stepLimits are limits with real tickers that fire often (Keepalive/3) and
-// thresholds that only the stepClock reaches.
+// The relay checks the stepLimits thresholds every Keepalive/3. The stepClock
+// controls when those thresholds are reached.
 var stepLimits = Limits{
 	StreamBuffer:       datapath.MinWindowSize,
 	MaxStreamsPerConn:  4,
@@ -146,16 +147,26 @@ func (sc *stepConn) expectRunning(t *testing.T, why string) {
 	}
 }
 
-// awaitStoredSend sends f through the writer and waits until the writer has
-// recorded the send time for the current monotonic reading, so the test then
-// knows which reading the keepalive timer counts from.
-func (sc *stepConn) awaitStoredSend(t *testing.T, f *ownsandv1.DataFrame) {
+// awaitStoredSend waits for the writer to send f and record its monotonic time.
+// Call it inside the synctest bubble that runs the writer.
+func (sc *stepConn) awaitStoredSend(t *testing.T, f *ownsandv1.DataFrame, allowDueKeepalive bool) {
 	t.Helper()
-	if err := sc.c.enqueue(context.Background(), f); err != nil {
+	want := sc.clk.Elapsed()
+	if err := sc.c.enqueue(t.Context(), f); err != nil {
 		t.Fatal(err)
 	}
-	sc.awaitFrame(t)
-	awaitStepValue(t, "lastSend", &sc.c.lastSend, int64(sc.clk.Elapsed()))
+	got := sc.awaitFrame(t)
+	if allowDueKeepalive && got != f && isStepKeepalive(got) {
+		got = sc.awaitFrame(t)
+	}
+	if got != f {
+		t.Fatalf("sent frame %p (%T), want queued frame %p (%T)", got, got.GetPayload(), f, f.GetPayload())
+	}
+	// The send callback reports the frame before the writer stores lastSend.
+	synctest.Wait()
+	if got := time.Duration(sc.c.lastSend.Load()); got != want {
+		t.Fatalf("lastSend = %v, want %v for the queued frame", got, want)
+	}
 }
 
 // deliver hands a frame to the connection and waits until the receive time
@@ -253,16 +264,28 @@ func TestKeepaliveIgnoresWallClockSteps(t *testing.T) {
 	limits.IdleTimeout = time.Hour
 	for name, delta := range stepWallDeltas {
 		t.Run(name, func(t *testing.T) {
-			sc := runStepConn(t, limits)
-			sc.awaitFrame(t)
-			sc.clk.advance(time.Second)
-			sc.awaitStoredSend(t, stepKeepaliveFrame())
-			sc.clk.stepWall(delta)
-			sc.expectNoFrame(t, "no monotonic time passed since the last send")
-			sc.clk.advance(limits.Keepalive)
-			if f := sc.awaitFrame(t); !isStepKeepalive(f) {
-				t.Fatalf("frame = %T, want a keepalive", f.GetPayload())
-			}
+			synctest.Test(t, func(t *testing.T) {
+				sc := runStepConn(t, limits)
+				sc.awaitFrame(t)
+				synctest.Wait()
+
+				// Leave a due timer keepalive in the fixture's sent channel.
+				sc.clk.advance(time.Second)
+				time.Sleep(limits.Keepalive / 3)
+				synctest.Wait()
+				if len(sc.sent) != 1 {
+					t.Fatalf("sent %d frames after the keepalive became due, want 1", len(sc.sent))
+				}
+				// Give the queued frame its own monotonic send time.
+				sc.clk.advance(time.Nanosecond)
+				sc.awaitStoredSend(t, stepKeepaliveFrame(), true)
+				sc.clk.stepWall(delta)
+				sc.expectNoFrame(t, "no monotonic time passed since the last send")
+				sc.clk.advance(limits.Keepalive)
+				if f := sc.awaitFrame(t); !isStepKeepalive(f) {
+					t.Fatalf("frame = %T, want a keepalive", f.GetPayload())
+				}
+			})
 		})
 	}
 }
@@ -272,21 +295,24 @@ func TestKeepaliveIgnoresWallClockSteps(t *testing.T) {
 func TestSendResetsKeepaliveTimerOnMonotonicTime(t *testing.T) {
 	limits := stepLimits
 	limits.IdleTimeout = time.Hour
-	sc := runStepConn(t, limits)
-	sc.awaitFrame(t)
-	sc.clk.advance(time.Second)
-	sc.awaitStoredSend(t, stepKeepaliveFrame())
-	sc.clk.advance(limits.Keepalive * 4 / 5)
-	sc.expectNoFrame(t, "80% of the keepalive interval since the last send")
-	sc.awaitStoredSend(t, stepKeepaliveFrame())
-	sc.clk.advance(limits.Keepalive * 4 / 5)
-	// 160% of the keepalive interval since the first send, 80% since the
-	// second.
-	sc.expectNoFrame(t, "the second send restarted the keepalive count")
-	sc.clk.advance(limits.Keepalive * 4 / 5)
-	if f := sc.awaitFrame(t); !isStepKeepalive(f) {
-		t.Fatalf("frame = %T, want a keepalive", f.GetPayload())
-	}
+	synctest.Test(t, func(t *testing.T) {
+		sc := runStepConn(t, limits)
+		sc.awaitFrame(t)
+		synctest.Wait()
+		sc.clk.advance(limits.Keepalive / 2)
+		sc.awaitStoredSend(t, stepKeepaliveFrame(), false)
+		sc.clk.advance(limits.Keepalive * 4 / 5)
+		sc.expectNoFrame(t, "80% of the keepalive interval since the last send")
+		sc.awaitStoredSend(t, stepKeepaliveFrame(), false)
+		sc.clk.advance(limits.Keepalive * 4 / 5)
+		// 160% of the keepalive interval since the first send, 80% since the
+		// second.
+		sc.expectNoFrame(t, "the second send restarted the keepalive count")
+		sc.clk.advance(limits.Keepalive * 4 / 5)
+		if f := sc.awaitFrame(t); !isStepKeepalive(f) {
+			t.Fatalf("frame = %T, want a keepalive", f.GetPayload())
+		}
+	})
 }
 
 // TestObserversReturnWallTimestamps checks that LastReceive and
@@ -309,6 +335,7 @@ func TestObserversReturnWallTimestamps(t *testing.T) {
 	sc.clk.stepWall(-time.Hour)
 	want := sc.clk.Now()
 	sc.deliver(t, stepKeepaliveFrame())
+	awaitStepValue(t, "lastRecvWall", &sc.c.lastRecvWall, want.UnixNano())
 	if got := sc.c.LastReceive(); !got.Equal(want) {
 		t.Fatalf("LastReceive = %v, want the wall time %v of the received frame", got, want)
 	}
