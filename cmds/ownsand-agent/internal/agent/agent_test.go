@@ -325,11 +325,19 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 		<-release
 	}
 	written := make(chan struct{})
+	var finishWriterOnce sync.Once
+	finishWriter := func() {
+		finishWriterOnce.Do(func() {
+			close(release)
+			waitClosed(t, written, "the status write to finish")
+		})
+	}
+	t.Cleanup(finishWriter)
 	go func() {
 		defer close(written)
 		a.writeStatus()
 	}()
-	<-entered
+	waitClosed(t, entered, "the status write to enter the hook")
 
 	removed := make(chan error, 1)
 	go func() { removed <- a.removeDevice(context.Background()) }()
@@ -338,7 +346,7 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 		t.Fatalf("removal finished while a status write was in flight: %v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
-	close(release)
+	finishWriter()
 	select {
 	case err := <-removed:
 		if !errors.Is(err, ErrRemoved) {
@@ -347,7 +355,6 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("removal did not finish")
 	}
-	<-written
 	requireEmptyStateDir(t, st)
 
 	// The writer stays fenced: later writes do nothing.
@@ -1300,7 +1307,7 @@ func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
 		}
 	})
 	a := f.h.agent
-	for _, name := range []string{"ready record write fails", "channel context ends"} {
+	for _, name := range []string{"record promotion fails", "channel context ends"} {
 		t.Run(name, func(t *testing.T) {
 			id, _ := uuidv7.NewString()
 			cmd := f.stage(t, id, false).GetImportSnapshot()
@@ -1335,8 +1342,8 @@ func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("import error = %v, want context.Canceled", err)
 				}
-			} else if err == nil || !strings.Contains(err.Error(), "save imported snapshot") {
-				t.Fatalf("import error = %v, want a ready record write failure", err)
+			} else if err == nil || !strings.Contains(err.Error(), "publish imported snapshot") {
+				t.Fatalf("import error = %v, want a record promotion failure", err)
 			}
 			if _, _, ok := a.Sandboxes.SnapshotContent(id); ok {
 				t.Error("an aborted import left a ready snapshot")
@@ -1881,6 +1888,79 @@ func TestUpdateDefersToSandboxDuringTransfers(t *testing.T) {
 	}
 	if ok, err := f.h.agent.updater.TryInstall(); ok || err != nil || env.installs.Load() != 0 {
 		t.Fatalf("installed with a running sandbox: %v %v", ok, err)
+	}
+}
+
+type resumeGateRuntime struct {
+	vmruntime.Runtime
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *resumeGateRuntime) Resume(ctx context.Context, vm vmruntime.VM) error {
+	close(r.started)
+	select {
+	case <-r.release:
+		return r.Runtime.Resume(ctx, vm)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestResumeFenceWaitsAcrossAgentChannels(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	var gate *resumeGateRuntime
+	h := startWith(t, cp, st, id, func(o *Options) {
+		gate = &resumeGateRuntime{Runtime: o.Runtime, started: make(chan struct{}), release: make(chan struct{})}
+		o.Runtime = gate
+	})
+	h.wait(0, "resume fence capability", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCapabilityReport().GetResumeFenceSupported()
+	})
+	sandboxID, _ := uuidv7.NewString()
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatalf("create: %v", res.GetError())
+	}
+	if res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_PauseSandbox{
+		PauseSandbox: &ownsandv1.PauseSandboxCommand{SandboxId: sandboxID},
+	}}); res.GetSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("pause: %v", res)
+	}
+	resumeID, _ := uuidv7.NewString()
+	if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: &ownsandv1.AgentCommand{
+		CommandId: resumeID,
+		Command:   &ownsandv1.AgentCommand_ResumeSandbox{ResumeSandbox: &ownsandv1.ResumeSandboxCommand{SandboxId: sandboxID}},
+	}}}) {
+		t.Fatal("no original channel")
+	}
+	select {
+	case <-gate.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the resume did not reach the runtime")
+	}
+	from := cp.Received()
+	cp.Current().Close()
+	h.wait(from, "replacement channel's PAUSED report", func(e *ownsandv1.AgentEnvelope) bool {
+		for _, entry := range e.GetStateReport().GetSandboxes() {
+			if entry.GetSandboxId() == sandboxID && entry.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+				return true
+			}
+		}
+		return false
+	})
+
+	fence := &ownsandv1.FenceResumeCommand{SandboxId: sandboxID, ResumeCommandId: resumeID}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if res, err := h.agent.fenceResume(ctx, fence); res != nil || err == nil || errorDetail(err).GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("fence while resume is blocked = %v, %v", res, err)
+	}
+	close(gate.release)
+	res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_FenceResume{FenceResume: fence}})
+	if ack := res.GetFenceResume(); res.GetError() != nil || ack.GetResumeCommandId() != resumeID ||
+		ack.GetSandbox().GetSandboxId() != sandboxID || ack.GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("fence after releasing the resume = %v", res)
 	}
 }
 

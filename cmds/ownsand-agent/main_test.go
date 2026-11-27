@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/identity"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/version"
 )
 
 func TestCLIEnrollStatusReset(t *testing.T) {
@@ -152,6 +154,69 @@ func TestCLIEnrollRejectsHostlessFlagBeforeCreatingIdentity(t *testing.T) {
 	}
 }
 
+func TestCLIOutputWrite(t *testing.T) {
+	clearAgentEnv(t)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := serviceDefinition(exe, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeErr := errors.New("stdout is full")
+	for _, command := range []struct {
+		name      string
+		args      []string
+		want      string
+		operation string
+	}{
+		{"version", []string{"version"}, version.Version + "\n", "write version"},
+		{"service print", []string{"service", "print"}, definition, "write service definition"},
+	} {
+		t.Run(command.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(command.args, nil, &stdout, &stderr); code != exitOK {
+				t.Fatalf("exit code = %d, stderr = %q; want %d", code, stderr.String(), exitOK)
+			}
+			if got := stdout.String(); got != command.want {
+				t.Errorf("stdout = %q; want %q", got, command.want)
+			}
+			if stderr.Len() != 0 {
+				t.Errorf("stderr = %q; want empty", stderr.String())
+			}
+
+			for _, accepted := range []int{0, 2} {
+				t.Run("accepted-"+strconv.Itoa(accepted), func(t *testing.T) {
+					stdout := &cliOutputErrorWriter{accept: accepted, err: writeErr}
+					var stderr bytes.Buffer
+					if code := run(command.args, nil, stdout, &stderr); code != exitError {
+						t.Errorf("exit code = %d; want %d", code, exitError)
+					}
+					if got, want := stdout.output.String(), command.want[:accepted]; got != want {
+						t.Errorf("stdout = %q; want accepted prefix %q", got, want)
+					}
+					if got, want := stderr.String(), "ownsand-agent: "+command.operation+": "+writeErr.Error()+"\n"; got != want {
+						t.Errorf("stderr = %q; want %q", got, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+type cliOutputErrorWriter struct {
+	output bytes.Buffer
+	accept int
+	err    error
+}
+
+func (w *cliOutputErrorWriter) Write(p []byte) (int, error) {
+	n, _ := w.output.Write(p[:min(w.accept, len(p))])
+	return n, w.err
+}
+
 func TestCLIMisc(t *testing.T) {
 	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
 	clearAgentEnv(t)
@@ -184,10 +249,18 @@ func TestCLIMisc(t *testing.T) {
 	}
 	// Linux base images are not built by the agent, and an unknown guest
 	// OS is a usage error; neither touches the state directory.
-	for _, os := range []string{"linux", "plan9"} {
-		if code := run([]string{"image", "build", "--os", os}, nil, &out, &errb); code != exitUsage {
-			t.Fatalf("image build --os %s: %d", os, code)
-		}
+	for _, guestOS := range []string{"linux", "plan9"} {
+		t.Run(guestOS, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), "state")
+			var out, errb bytes.Buffer
+			args := []string{"image", "build", "--os", guestOS, "--state-dir", stateDir}
+			if code := run(args, nil, &out, &errb); code != exitUsage {
+				t.Fatalf("image build exit code = %d, want %d (stderr: %q)", code, exitUsage, errb.String())
+			}
+			if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+				t.Fatalf("state path %q should be absent (stat error: %v)", stateDir, err)
+			}
+		})
 	}
 	t.Setenv("OWNSAND_AGENT_STATE_DIR", t.TempDir())
 	if code := run([]string{"run"}, nil, &out, &errb); code != exitNotEnrolled {
@@ -388,16 +461,57 @@ func TestStatusAbsentStatusFile(t *testing.T) {
 	}
 }
 
-// A valid status.json keeps the existing report and exit 0.
 func TestStatusValidStatusFile(t *testing.T) {
-	st := statusFixture(t)
-	if err := st.SaveStatus(&agent.Status{Connected: true, AgentVersion: "1.2.3", Runtime: "process"}); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name             string
+		snapshot         agent.Status
+		wantCapabilities string
+	}{
+		{
+			name: "with capability report",
+			snapshot: agent.Status{
+				GuestOSes:      []string{"GUEST_OS_LINUX", "GUEST_OS_MACOS"},
+				BaseImages:     []string{"BASE_IMAGE_LINUX"},
+				CapabilitiesAt: time.Date(2026, 11, 22, 14, 25, 28, 0, time.Local),
+				Checks: []agent.StatusCheck{
+					{ID: "virtualization-entitlement", Passed: true, Detail: "the agent executable has the entitlement"},
+					{ID: "macos-base-image", Detail: "the macOS base image is not built"},
+					{ID: "outbound-network", Passed: true},
+				},
+			},
+			wantCapabilities: " guest OSes GUEST_OS_LINUX, GUEST_OS_MACOS; base images BASE_IMAGE_LINUX (report of 2026-11-22 14:25:28)\n" +
+				"  virtualization-entitlement: passed (the agent executable has the entitlement)\n" +
+				"  macos-base-image: failed (the macOS base image is not built)\n" +
+				"  outbound-network: passed",
+		},
+		{
+			name:             "without capability report",
+			wantCapabilities: " unknown (no capability report yet)",
+		},
 	}
-	var out, errb bytes.Buffer
-	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
-	if code != exitOK || !strings.Contains(out.String(), "Connection: connected") || !strings.Contains(out.String(), "Agent: 1.2.3, runtime process") || strings.Contains(out.String(), "has not run") || errb.Len() != 0 {
-		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := statusFixture(t)
+			snapshot := tt.snapshot
+			snapshot.Connected = true
+			snapshot.AgentVersion = "1.2.3"
+			snapshot.Runtime = "process"
+			if err := st.SaveStatus(&snapshot); err != nil {
+				t.Fatal(err)
+			}
+
+			var out, errb bytes.Buffer
+			code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+			stdout := out.String()
+			if code != exitOK || !strings.Contains(stdout, "Connection: connected") || !strings.Contains(stdout, "Agent: 1.2.3, runtime process") || strings.Contains(stdout, "has not run") || errb.Len() != 0 {
+				t.Fatalf("status: %d %q / %q", code, stdout, errb.String())
+			}
+			_, rest, foundStart := strings.Cut(stdout, "\nCapabilities:")
+			capabilities, _, foundEnd := strings.Cut(rest, "\nSandboxes:")
+			if !foundStart || !foundEnd || capabilities != tt.wantCapabilities {
+				t.Fatalf("stdout = %q; want capability section %q", stdout, "Capabilities:"+tt.wantCapabilities)
+			}
+		})
 	}
 }
 
@@ -498,11 +612,8 @@ func TestStatusUnreadableStatusFile(t *testing.T) {
 }
 
 // makeUnlistable removes every permission from the inventory directory at
-// path so that listing it fails. store.Open runs before the inventory reads
-// and fails on a path that is not a directory, so a permission change is the
-// way to make only the read fail. The test is skipped where the change has no
-// effect: on Windows (mode bits do not restrict directory reads) and for a
-// user that bypasses permission checks, such as root.
+// path so that listing it fails. It skips the test if the change has no
+// effect, for example on Windows or when the user is root.
 func makeUnlistable(t *testing.T, path string) {
 	t.Helper()
 	if err := os.Chmod(path, 0); err != nil {
@@ -543,6 +654,85 @@ func TestStatusInventoryCounts(t *testing.T) {
 	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
 	if code != exitOK || !strings.Contains(out.String(), "Sandboxes: 2 records") || !strings.Contains(out.String(), "Snapshots: 1\n") || errb.Len() != 0 {
 		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	}
+}
+
+func TestStatusDamagedOrMissingInventory(t *testing.T) {
+	for _, tc := range []struct {
+		inventory      string
+		wantSandbox    string
+		wantSnapshot   string
+		wantDiagnostic string
+	}{
+		{store.SandboxesDir, "Sandboxes: unavailable (", "Snapshots: 1\n", "ownsand-agent: read sandbox records:"},
+		{store.SnapshotsDir, "Sandboxes: 1 records\n", "Snapshots: unavailable\n", "ownsand-agent: read snapshots:"},
+	} {
+		for _, asFile := range []bool{true, false} {
+			name := tc.inventory + "/missing"
+			if asFile {
+				name = tc.inventory + "/file"
+			}
+			t.Run(name, func(t *testing.T) {
+				st := statusFixture(t)
+				if err := st.SaveStatus(agent.Status{Connected: true}); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.SaveSandbox("sandbox", struct{}{}); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(st.Path(store.SnapshotsDir, "snapshot"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				path := st.Path(tc.inventory)
+				if err := os.RemoveAll(path); err != nil {
+					t.Fatal(err)
+				}
+				const contents = "damaged inventory"
+				if asFile {
+					if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var out, errb bytes.Buffer
+				code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+				if code != exitError || !strings.HasPrefix(errb.String(), tc.wantDiagnostic) {
+					t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+				}
+				for _, want := range []string{
+					"Enrollment: enrolled (device dev-1, organization org-1)",
+					"Connection: connected",
+					tc.wantSandbox,
+					tc.wantSnapshot,
+				} {
+					if !strings.Contains(out.String(), want) {
+						t.Errorf("stdout = %q, want %q", out.String(), want)
+					}
+				}
+				if asFile {
+					data, err := os.ReadFile(path)
+					if err != nil || string(data) != contents {
+						t.Errorf("inventory file = %q, %v, want %q", data, err, contents)
+					}
+				} else if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Errorf("inventory lookup = %v, want a missing path", err)
+				}
+			})
+		}
+	}
+}
+
+func TestStatusMissingStateDirectory(t *testing.T) {
+	clearAgentEnv(t)
+	dir := filepath.Join(t.TempDir(), "missing")
+	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
+	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
+	var out, errb bytes.Buffer
+	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+	if code != exitNotEnrolled || out.String() != "Enrollment: not enrolled\n" || errb.Len() != 0 {
+		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	}
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Errorf("state directory lookup = %v, want a missing path", err)
 	}
 }
 

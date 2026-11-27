@@ -26,11 +26,10 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// maxDownload bounds the manifest and artifact downloads.
-const (
-	maxManifestBytes = 1 << 20
-	maxArtifactBytes = 512 << 20
-)
+const maxManifestBytes = 1 << 20
+
+// MaxArtifactBytes is the inclusive size limit for an update executable.
+const MaxArtifactBytes = 512 << 20
 
 const artifactRetryDelay = time.Second
 
@@ -42,7 +41,7 @@ var ErrInstalling = errors.New("update: an agent update is installing")
 var ErrRunningRevoked = errors.New("update: the running agent version is revoked")
 
 // ErrSuperseded rejects an update command that a newer update or withdrawal
-// command overtook before it published its artifact.
+// command overtook before it recorded its final state or queued its artifact.
 var ErrSuperseded = errors.New("update: a newer update command superseded this one")
 
 // ErrRemoving rejects new update commands during device removal.
@@ -443,7 +442,7 @@ func transientArtifactError(err error) bool {
 }
 
 func (u *Updater) fetchArtifact(ctx context.Context, url, target string, order uint64) ([]byte, error) {
-	data, err := u.fetch(ctx, url, maxArtifactBytes)
+	data, err := u.fetch(ctx, url, MaxArtifactBytes)
 	if err == nil || !transientArtifactError(err) {
 		return data, err
 	}
@@ -468,7 +467,7 @@ func (u *Updater) fetchArtifact(ctx context.Context, url, target string, order u
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return u.fetch(ctx, url, maxArtifactBytes)
+	return u.fetch(ctx, url, MaxArtifactBytes)
 }
 
 // Handle runs an update command up to the verified download. The
@@ -506,18 +505,26 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	u.applied = order
 	u.clearPendingLocked()
 	u.mu.Unlock()
+	return u.prepareAdmittedUpdate(ctx, cmd, order, comparison, comparisonErr)
+}
+
+func (u *Updater) prepareAdmittedUpdate(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand, order uint64, comparison int, comparisonErr error) error {
+	target := cmd.GetTargetVersion()
 	// An invalid target still clears the queued artifact if its command
 	// passed the order check.
 	if _, err := semver.Parse(target); err != nil {
-		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
+		if invalidated := u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target); invalidated != nil {
+			return invalidated
+		}
 		return err
 	}
 	if comparisonErr == nil && comparison == 0 {
-		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
-		return nil
+		return u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
 	}
 	if u.opts.ManifestURL == "" {
-		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
+		if err := u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target); err != nil {
+			return err
+		}
 		return errors.New("update: no release manifest URL is configured")
 	}
 	if err := u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING, target); err != nil {

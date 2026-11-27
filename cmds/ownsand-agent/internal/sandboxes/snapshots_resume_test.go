@@ -43,6 +43,11 @@ func requireSnapshotFailedClean(t *testing.T, e *env, snapID string, entry *owns
 	if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INTERNAL || entry != nil {
 		t.Fatalf("snapshot %v %v, want an INTERNAL error and no entry", entry, err)
 	}
+	requireNoSnapshot(t, e, snapID)
+}
+
+func requireNoSnapshot(t *testing.T, e *env, snapID string) {
+	t.Helper()
 	if e.m.HasSnapshot(snapID) {
 		t.Fatal("failed snapshot is known to the manager")
 	}
@@ -194,6 +199,47 @@ func TestSnapshotRuntimeReportedPausedSourceIsRecorded(t *testing.T) {
 	requireSnapshotFailedClean(t, e, snapID, entry, err)
 	if got := e.sandboxState(id); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 		t.Fatalf("source state %v, want PAUSED", got)
+	}
+	requireResumeReachesRuntime(t, e, id)
+}
+
+func TestSnapshotCanceledWithPausedSourceIsRecorded(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	snapID, _ := uuidv7.NewString()
+	e.rt.mu.Lock()
+	e.rt.snapshotErr = context.Canceled
+	e.rt.snapshotSourceState = ownsandv1.SandboxState_SANDBOX_STATE_PAUSED
+	e.rt.paused[id] = true
+	e.rt.mu.Unlock()
+
+	started, release := make(chan struct{}), make(chan struct{})
+	e.rt.snapStarted, e.rt.snapBlock = started, release
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(release)
+		select {
+		case <-started:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	entry, err := e.m.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+	var ce *CommandError
+	if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED || entry != nil {
+		t.Fatalf("snapshot %v %v, want ABORTED and no entry", entry, err)
+	}
+	requireNoSnapshot(t, e, snapID)
+	report := e.m.StateReport(2, nil).GetSandboxes()
+	if len(report) != 1 || report[0].GetSandboxId() != id || report[0].GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("state report %v, want source %s PAUSED", report, id)
 	}
 	requireResumeReachesRuntime(t, e, id)
 }
