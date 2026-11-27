@@ -25,11 +25,10 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// maxDownload bounds the manifest and artifact downloads.
-const (
-	maxManifestBytes = 1 << 20
-	maxArtifactBytes = 512 << 20
-)
+const maxManifestBytes = 1 << 20
+
+// MaxArtifactBytes is the inclusive size limit for an update executable.
+const MaxArtifactBytes = 512 << 20
 
 // ErrInstalling rejects creates and snapshot transfers once the installation
 // started.
@@ -579,7 +578,7 @@ func (u *Updater) download(ctx context.Context, target string, order uint64) ([]
 	if err != nil {
 		return nil, err
 	}
-	data, err := u.fetch(ctx, art.URL, maxArtifactBytes)
+	data, err := u.fetch(ctx, art.URL, MaxArtifactBytes)
 	if err != nil {
 		return nil, fmt.Errorf("update: download artifact: %w", err)
 	}
