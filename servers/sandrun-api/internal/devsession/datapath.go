@@ -395,6 +395,7 @@ type writeEntry struct {
 	busy     chan struct{} // Holds one token while a chunk or the expiry callback owns the entry.
 	fw       ownsandclient.FileWrite
 	path     string
+	revision string
 	deadline time.Time
 	timer    *time.Timer
 }
@@ -404,12 +405,22 @@ const writeIdle = 20 * time.Minute
 func newWrites() *writes { return &writes{entries: map[string]*writeEntry{}} }
 
 // acquire returns the current entry with exclusive ownership until release.
-func (w *writes) acquire(ctx context.Context, key, path string, open func() (ownsandclient.FileWrite, error)) (*writeEntry, error) {
+func (w *writes) acquire(ctx context.Context, key, path string) (*writeEntry, error) {
 	for {
-		e, err := w.getOrOpen(ctx, key, path, open)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		w.mu.Lock()
+		e := w.entries[key]
+		if e == nil {
+			e = &writeEntry{busy: make(chan struct{}, 1), path: path, deadline: time.Now().Add(writeIdle)}
+			e.busy <- struct{}{}
+			w.entries[key] = e
+			e.timer = time.AfterFunc(time.Until(e.deadline), func() { w.expire(key, e) })
+			w.mu.Unlock()
+			return e, nil
+		}
+		w.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -441,25 +452,6 @@ func (w *writes) acquire(ctx context.Context, key, path string, open func() (own
 	}
 }
 
-func (w *writes) getOrOpen(ctx context.Context, key, path string, open func() (ownsandclient.FileWrite, error)) (*writeEntry, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if e := w.entries[key]; e != nil {
-		return e, nil
-	}
-	fw, err := open()
-	if err != nil {
-		return nil, err
-	}
-	e := &writeEntry{busy: make(chan struct{}, 1), fw: fw, path: path, deadline: time.Now().Add(writeIdle)}
-	w.entries[key] = e
-	e.timer = time.AfterFunc(time.Until(e.deadline), func() { w.expire(key, e) })
-	return e, nil
-}
-
 func (w *writes) expire(key string, e *writeEntry) {
 	e.busy <- struct{}{}
 	defer func() { <-e.busy }()
@@ -486,7 +478,7 @@ func (w *writes) drop(key string, e *writeEntry) {
 
 func (w *writes) release(key string, e *writeEntry, finished bool, err error) {
 	defer func() { <-e.busy }()
-	if finished || connect.CodeOf(err) == connect.CodeNotFound {
+	if e.fw == nil || finished || connect.CodeOf(err) == connect.CodeNotFound {
 		w.drop(key, e)
 	} else if err == nil {
 		e.deadline = time.Now().Add(writeIdle)
@@ -526,21 +518,28 @@ func (h *Handler) WriteDevSessionFile(ctx context.Context, req *connect.Request[
 	if err != nil {
 		return nil, err
 	}
-	client, _, err := h.e.Links().Client(ctx, sess.req.OrganizationID)
-	if err != nil {
-		return nil, h.svc.Internal(ctx, "write dev session file", err)
-	}
 	sandboxID := sess.runner.SandboxID
 	key := sandboxID + "/" + writeID
-	entry, err := h.writes.acquire(ctx, key, path, func() (ownsandclient.FileWrite, error) {
-		fw, err := client.OpenFileWrite(sandboxID, ownsand.FileWriteParams{WriteID: writeID, Path: path, BindingSalt: h.bindingSalt(sandboxID, writeID)})
-		if err != nil {
-			return nil, fileTransferError(err)
-		}
-		return fw, nil
-	})
+	entry, err := h.writes.acquire(ctx, key, path)
 	if err != nil {
 		return nil, err
+	}
+
+	// Read the link after acquiring the entry so a waiting chunk uses the
+	// current credential revision.
+	client, link, err := h.e.Links().Client(ctx, sess.req.OrganizationID)
+	if err != nil {
+		h.writes.release(key, entry, false, err)
+		return nil, h.svc.Internal(ctx, "write dev session file", err)
+	}
+	if entry.fw == nil || entry.revision != link.CredentialRevision {
+		fw, err := client.OpenFileWrite(sandboxID, ownsand.FileWriteParams{WriteID: writeID, Path: path, BindingSalt: h.bindingSalt(sandboxID, writeID)})
+		if err != nil {
+			h.writes.release(key, entry, false, err)
+			return nil, fileTransferError(err)
+		}
+		entry.fw = fw
+		entry.revision = link.CredentialRevision
 	}
 	start := time.Now()
 	var res *sandrunv1.WriteDevSessionFileResponse
