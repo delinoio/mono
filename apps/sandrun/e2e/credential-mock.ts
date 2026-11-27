@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
-import {
-  createMockTransport as createBaseMock,
-  type MockTransportOptions,
-} from "../src/mock/mock-api.ts";
+import type { MockTransportOptions } from "../src/mock/mock-api.ts";
+import { createMockTransport as createInvitationMock } from "./invitation-mock.ts";
 
 export const CREDENTIAL_FIXTURE = "sandrun-e2e-credential";
 export const FIXTURE_KEY = "sandrun_e2e_fixture_key";
@@ -24,8 +22,8 @@ declare global {
   }
 }
 
-export function createMockTransport(options: MockTransportOptions): Transport {
-  const base = createBaseMock(options);
+export function createMockTransport(options?: MockTransportOptions): Transport {
+  const base = createInvitationMock(options);
   const mode = sessionStorage.getItem(CREDENTIAL_FIXTURE);
   if (mode === null) return base;
 

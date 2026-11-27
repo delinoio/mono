@@ -138,6 +138,10 @@ func (s *Session) NeedsConnection() bool {
 	if s.Environment == nil || s.Environment.Type != "self_hosted" || s.Environment.ID == "" || s.Environment.RemoteURL == "" {
 		return false
 	}
+	return s.hasConnectionAction()
+}
+
+func (s *Session) hasConnectionAction() bool {
 	for _, a := range s.RequiredActions {
 		if a.Type == "environment_connection" {
 			return true
@@ -166,9 +170,9 @@ func (v *Vendor) session(ctx context.Context, in integration.Integration, id str
 	return &s, nil
 }
 
-// CheckStarted reads the sessions of STARTING requests: the API clears the
-// environment_connection action when the executor connects, so a session
-// without it (and not failed) means that the executor took the session.
+// CheckStarted reads the sessions of STARTING requests. The API clears the
+// environment_connection action when the executor connects. Confirmation
+// requires a matching session with a non-failed status and no such action.
 func (v *Vendor) CheckStarted(ctx context.Context, in integration.Integration, claims []*agent.Claim) ([]string, error) {
 	var out []string
 	var errs []error
@@ -178,10 +182,16 @@ func (v *Vendor) CheckStarted(ctx context.Context, in integration.Integration, c
 			continue
 		}
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("check Codex startup for request %s: %w", c.RequestID, err))
 			continue
 		}
-		if s.Status != "failed" && !s.NeedsConnection() {
+		status := strings.TrimSpace(s.Status)
+		switch {
+		case s.ID == "" || s.ID != c.VendorRequestID:
+			errs = append(errs, fmt.Errorf("check Codex startup for request %s: session response has a missing or mismatched ID", c.RequestID))
+		case status == "":
+			errs = append(errs, fmt.Errorf("check Codex startup for request %s: session response has no status", c.RequestID))
+		case status != "failed" && !s.hasConnectionAction():
 			out = append(out, c.RequestID)
 		}
 	}

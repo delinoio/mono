@@ -29,11 +29,12 @@ import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Empty,
+  ErrorNotice,
   FormDialog,
   PageHeader,
   QueryBoundary,
   SecretDialog,
-  toastError,
+  useActionSignInNotice,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import { invitationLink } from "../invitation.ts";
@@ -46,6 +47,7 @@ export function MembersPage() {
   const { organizationId, role } = useOrg();
   const { userId } = useAuth();
   const { navigate } = useRouter();
+  const { signInError, reportActionError } = useActionSignInNotice();
   const queryClient = useQueryClient();
   const refresh = () =>
     invalidateServices(queryClient, MemberService, OrganizationService);
@@ -73,6 +75,7 @@ export function MembersPage() {
           ) : undefined
         }
       />
+      {signInError ? <ErrorNotice error={signInError} /> : null}
       <MemberListStatus roster={roster}>
         <ul className="list" aria-label="Members">
           {roster.members.map((m) => {
@@ -103,7 +106,7 @@ export function MembersPage() {
                           });
                           toast.success("The role is changed.");
                         } catch (error) {
-                          toastError(error);
+                          reportActionError(error);
                         }
                       }}
                     >
@@ -130,7 +133,9 @@ export function MembersPage() {
           })}
         </ul>
       </MemberListStatus>
-      {can(role, Permission.ManageInvitations) ? <Invitations /> : null}
+      {can(role, Permission.ManageInvitations) ? (
+        <Invitations reportActionError={reportActionError} />
+      ) : null}
       <ConfirmDialog
         open={removing !== undefined}
         onOpenChange={(open) => !open && setRemoving(undefined)}
@@ -165,7 +170,11 @@ export function MembersPage() {
   );
 }
 
-function Invitations() {
+function Invitations({
+  reportActionError,
+}: {
+  reportActionError: (error: unknown) => void;
+}) {
   const { organizationId } = useOrg();
   const transport = useTransport();
   const queryClient = useQueryClient();
@@ -249,7 +258,7 @@ function Invitations() {
                         });
                         toast.success("The invitation is revoked.");
                       } catch (error) {
-                        toastError(error);
+                        reportActionError(error);
                       }
                     }}
                   >
