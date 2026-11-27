@@ -148,6 +148,116 @@ describe("waitForSandboxStartup", () => {
 });
 
 describe("waitForSnapshotReady", () => {
+  test("abandons stalled creation and cleans up without a snapshot ID", async () => {
+    const clock = new VirtualClock();
+    const reply = Promise.withResolvers<{ snapshotId: string }>();
+    const request = rs.fn((_signal: AbortSignal) => reply.promise);
+    const recordId = rs.fn();
+    const getSnapshot = rs.fn(async () => snap(SnapshotState.READY));
+    const ran: string[] = [];
+    const deletionError = new Error("sandbox deletion failed");
+    const onCleanupError = rs.fn();
+
+    const wait = withCleanup(
+      () =>
+        waitForSnapshotReady(getSnapshot, {
+          timeoutMs: 60_000,
+          pollMs: 200,
+          clock,
+          creation: { request, recordId },
+        }),
+      [
+        () => {
+          ran.push("deleteSandbox");
+          throw deletionError;
+        },
+        () => {
+          ran.push("close");
+        },
+      ],
+      { stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS, clock, onCleanupError },
+    );
+
+    await expect(clock.run(wait)).rejects.toThrow(
+      "snapshot creation timed out after 60000 ms",
+    );
+    expect(clock.now()).toBe(60_000);
+    expect(request.mock.calls[0]?.[0].aborted).toBe(true);
+    expect(ran).toEqual(["deleteSandbox", "close"]);
+    expect(onCleanupError).toHaveBeenCalledWith(deletionError);
+
+    reply.resolve({ snapshotId: "late-snapshot" });
+    await clock.settle();
+    expect(recordId).not.toHaveBeenCalled();
+    expect(getSnapshot).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    { outcome: "READY", finishedAt: 45_000 },
+    { outcome: "stalled", finishedAt: 60_000 },
+  ])(
+    "uses the creation deadline for a $outcome readiness request",
+    async ({ outcome, finishedAt }) => {
+      const clock = new VirtualClock();
+      const ran: string[] = [];
+      let snapshotId = "";
+      const getSnapshot = rs.fn(async (signal: AbortSignal) => {
+        expect(clock.now()).toBe(40_000);
+        expect(snapshotId).toBe("snapshot");
+        if (outcome === "stalled") return new Promise<SnapshotStatus>(() => {});
+        await clock.sleep(5_000, signal);
+        return snap(SnapshotState.READY);
+      });
+      const wait = withCleanup(
+        () =>
+          waitForSnapshotReady(getSnapshot, {
+            timeoutMs: 60_000,
+            pollMs: 200,
+            clock,
+            creation: {
+              async request(signal) {
+                await clock.sleep(40_000, signal);
+                return { snapshotId: "snapshot" };
+              },
+              recordId(id) {
+                snapshotId = id;
+              },
+            },
+          }),
+        [
+          (signal) => {
+            expect(signal.aborted).toBe(false);
+            ran.push(`deleteSnapshot:${snapshotId}`);
+          },
+          (signal) => {
+            expect(signal.aborted).toBe(false);
+            ran.push("deleteSandbox");
+          },
+          () => {
+            ran.push("close");
+          },
+        ],
+        { stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS, clock },
+      );
+
+      if (outcome === "stalled") {
+        await expect(clock.run(wait)).rejects.toThrow(
+          "snapshot did not become READY within 60000 ms",
+        );
+        expect(getSnapshot.mock.calls[0]?.[0].aborted).toBe(true);
+      } else {
+        await clock.run(wait);
+      }
+      expect(clock.now()).toBe(finishedAt);
+      expect(getSnapshot).toHaveBeenCalledOnce();
+      expect(ran).toEqual([
+        "deleteSnapshot:snapshot",
+        "deleteSandbox",
+        "close",
+      ]);
+    },
+  );
+
   test("returns once the snapshot is READY", async () => {
     const clock = new VirtualClock();
     const states = [

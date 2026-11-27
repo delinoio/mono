@@ -126,7 +126,7 @@ export interface SnapshotStatus {
 }
 
 export interface WaitForSnapshotReadyOptions {
-  /** The poll gives up after this long, measured on `clock`. */
+  /** The snapshot phase gives up after this long, measured on `clock`. */
   timeoutMs: number;
   /** The pause between two polls. */
   pollMs: number;
@@ -134,32 +134,41 @@ export interface WaitForSnapshotReadyOptions {
   clock?: Clock;
   /** Cancels the wait; the call rejects with the signal's reason. */
   signal?: AbortSignal;
+  /** Creates the snapshot and records its ID before polling. */
+  creation?: {
+    request(signal: AbortSignal): Promise<{ snapshotId: string }>;
+    recordId(snapshotId: string): void;
+  };
 }
 
 /**
- * Polls until the snapshot is `READY`. The wait ends with an error when the
+ * Optionally creates the snapshot, then polls until it is `READY`. Both use
+ * the same deadline. The wait ends with an error when the
  * snapshot is `FAILED`, when `timeoutMs` has passed, or when the caller's
- * signal aborts. The signal given to `getSnapshot` aborts at the deadline,
- * so a poll that hangs is cancelled too; a `getSnapshot` that ignores the
- * signal is abandoned at the deadline instead of blocking the caller.
+ * signal aborts. The signal passed to each request aborts at the deadline.
+ * The wait ends even if a request ignores that signal.
  */
 export async function waitForSnapshotReady(
   getSnapshot: (signal: AbortSignal) => Promise<SnapshotStatus>,
   options: WaitForSnapshotReadyOptions,
 ): Promise<void> {
   options.signal?.throwIfAborted();
+  const { creation } = options;
   const clock = options.clock ?? systemClock;
   const deadline = clock.now() + options.timeoutMs;
   const stop = new AbortController();
   const onCallerAbort = () => stop.abort(options.signal?.reason);
   options.signal?.addEventListener("abort", onCallerAbort, { once: true });
+  let creating = creation !== undefined;
   let lastState: SnapshotState | undefined;
   const expire = () =>
     stop.abort(
       new Error(
-        `snapshot did not become READY within ${options.timeoutMs} ms: last state ${
-          lastState === undefined ? "unknown" : SnapshotState[lastState]
-        }`,
+        creating
+          ? `snapshot creation timed out after ${options.timeoutMs} ms`
+          : `snapshot did not become READY within ${options.timeoutMs} ms: last state ${
+              lastState === undefined ? "unknown" : SnapshotState[lastState]
+            }`,
       ),
     );
   const checkDeadline = () => {
@@ -167,23 +176,29 @@ export async function waitForSnapshotReady(
     if (clock.now() >= deadline && !stop.signal.aborted) expire();
     stop.signal.throwIfAborted();
   };
-  const poll = async () => {
-    for (;;) {
-      checkDeadline();
-      let snapshot: SnapshotStatus;
-      try {
-        snapshot = await getSnapshot(stop.signal);
-      } catch (error) {
+  const run = async () => {
+    try {
+      if (creation !== undefined) {
         checkDeadline();
-        throw error;
+        const { snapshotId } = await creation.request(stop.signal);
+        checkDeadline();
+        creation.recordId(snapshotId);
+        creating = false;
       }
+      for (;;) {
+        checkDeadline();
+        const snapshot = await getSnapshot(stop.signal);
+        checkDeadline();
+        lastState = snapshot.state;
+        if (lastState === SnapshotState.READY) return;
+        if (lastState === SnapshotState.FAILED) {
+          throw new Error("snapshot reached FAILED");
+        }
+        await clock.sleep(options.pollMs, stop.signal);
+      }
+    } catch (error) {
       checkDeadline();
-      lastState = snapshot.state;
-      if (lastState === SnapshotState.READY) return;
-      if (lastState === SnapshotState.FAILED) {
-        throw new Error("snapshot reached FAILED");
-      }
-      await clock.sleep(options.pollMs, stop.signal);
+      throw error;
     }
   };
 
@@ -192,10 +207,12 @@ export async function waitForSnapshotReady(
       once: true,
     });
   });
-  clock.sleep(options.timeoutMs, stop.signal).then(expire, () => {});
+  clock
+    .sleep(Math.ceil(deadline - clock.now()), stop.signal)
+    .then(expire, () => {});
   try {
-    // Race the whole poll so that an RPC that ignores abort cannot block cleanup.
-    await Promise.race([aborted, poll()]);
+    // Race the whole phase so that an RPC that ignores abort cannot block cleanup.
+    await Promise.race([aborted, run()]);
   } finally {
     options.signal?.removeEventListener("abort", onCallerAbort);
     stop.abort();

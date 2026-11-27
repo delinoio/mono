@@ -43,9 +43,9 @@ const billingUrl = env.OWNSAND_E2E_BILLING_URL ?? "";
 
 // Time budget of the lifecycle test. The rstest limit is 3 minutes and the Go
 // launcher (servers/ownsand-api/e2e/tssdk_test.go) bounds the whole command
-// at 5 minutes. Startup and snapshot polling each have 60 seconds. Each
+// at 5 minutes. Startup and the full snapshot phase each have 60 seconds. Each
 // of the two network cleanup steps has 15 seconds.
-const SNAPSHOT_READY_TIMEOUT_MS = 60_000;
+const SNAPSHOT_TIMEOUT_MS = 60_000;
 const cleanupOptions = {
   stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS,
   onCleanupError: (error: unknown) =>
@@ -215,17 +215,21 @@ async function expectSuspended(
             expect((await sandbox.pause()).state).toBe(SandboxState.PAUSED);
             expect((await sandbox.resume()).state).toBe(SandboxState.RUNNING);
 
-            const snapshot = await sandbox.snapshot();
-            snapshotId = snapshot.snapshotId;
             await waitForSnapshotReady(
               (signal) =>
                 client.snapshots
-                  .getSnapshot(
-                    { organizationId: org, snapshotId: snapshot.snapshotId },
-                    { signal },
-                  )
+                  .getSnapshot({ organizationId: org, snapshotId }, { signal })
                   .then((res) => required(res.snapshot)),
-              { timeoutMs: SNAPSHOT_READY_TIMEOUT_MS, pollMs: 200 },
+              {
+                timeoutMs: SNAPSHOT_TIMEOUT_MS,
+                pollMs: 200,
+                creation: {
+                  request: (signal) => sandbox.snapshot(signal),
+                  recordId: (id) => {
+                    snapshotId = id;
+                  },
+                },
+              },
             );
           },
           [
