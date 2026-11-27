@@ -3,8 +3,11 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -76,6 +79,25 @@ func (f *exportVerifyFixture) wantLog(t *testing.T, parts ...string) {
 		if !strings.Contains(logs, p) {
 			t.Fatalf("logs lack %s", p)
 		}
+	}
+}
+
+func (f *exportVerifyFixture) wantLogCount(t *testing.T, event string, want int, fields ...string) {
+	t.Helper()
+	count := 0
+	for line := range strings.SplitSeq(f.env.Logs.String(), "\n") {
+		if !strings.Contains(line, `"msg":"`+event+`"`) {
+			continue
+		}
+		count++
+		for _, field := range fields {
+			if !strings.Contains(line, field) {
+				t.Errorf("%s event lacks %s: %s", event, field, line)
+			}
+		}
+	}
+	if count != want {
+		t.Errorf("%s event count = %d, want %d", event, count, want)
 	}
 }
 
@@ -267,9 +289,157 @@ func (s exportVerifyStore) ListPrefix(ctx context.Context, prefix string) ([]obj
 	return s.list(ctx, prefix)
 }
 
+func (f *exportVerifyFixture) rejectVerificationUpdate(t *testing.T, trigger string) {
+	t.Helper()
+	for _, sql := range []string{
+		`CREATE FUNCTION reject_verification_update() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'injected verification update failure';
+		END $$`,
+		trigger,
+	} {
+		if _, err := f.env.DB.Pool.Exec(t.Context(), sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func (f *exportVerifyFixture) allowVerificationUpdate(t *testing.T) {
+	t.Helper()
+	if _, err := f.env.DB.Pool.Exec(t.Context(), "DROP TRIGGER reject_verification_update ON snapshots"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExportVerificationScheduleCommitFailure(t *testing.T) {
+	f := newExportVerifyFixture(t)
+	if _, err := f.env.DB.Pool.Exec(t.Context(), "UPDATE snapshots SET export_verify_after = NULL WHERE snapshot_id = $1", f.snapID); err != nil {
+		t.Fatal(err)
+	}
+	f.rejectVerificationUpdate(t, `
+		CREATE CONSTRAINT TRIGGER reject_verification_update AFTER UPDATE ON snapshots
+		DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+		WHEN (OLD.export_verify_after IS NULL AND NEW.export_verify_after IS NOT NULL)
+		EXECUTE FUNCTION reject_verification_update()`)
+	control, requests := r2RetryControl(t, f.env, f.prefix, nil)
+	// PostgreSQL stores the deadline with microsecond precision.
+	f.env.Clock.Advance(verifyDelay + time.Nanosecond)
+	control.RunExportVerifyOnce(t.Context())
+	f.wantExported(t, false)
+	if _, _, after := f.verification(t); after != nil {
+		t.Fatalf("rolled-back deadline = %v, want NULL", after)
+	}
+	f.wantLogCount(t, "export_verification_scan_failed", 1, "injected verification update failure")
+	f.wantLogCount(t, "export_verification_scheduled", 0)
+
+	f.allowVerificationUpdate(t)
+	control.RunExportVerifyOnce(t.Context())
+	control.RunExportVerifyOnce(t.Context())
+	f.wantExported(t, false)
+	_, _, after := f.verification(t)
+	if want := f.env.Clock.Now().Add(verifyDelay).Truncate(time.Microsecond); after == nil || !after.Equal(want) {
+		t.Fatalf("committed deadline = %v, want %v", after, want)
+	}
+	if got := requests(); len(got) != 0 {
+		t.Fatalf("R2 requests while scheduling = %q, want none", got)
+	}
+	f.wantLogCount(t, "export_verification_scheduled", 1, `"level":"INFO"`,
+		`"snapshot_id":"`+f.snapID+`"`, `"verify_after":"`+after.UTC().Format(time.RFC3339Nano)+`"`)
+}
+
+func TestExportVerificationScheduleBatchRollback(t *testing.T) {
+	f := newExportVerifyFixture(t)
+	due := f.seedOlderExportVerifications(t, 1)[0]
+	_, _, originalDue := due.verification(t)
+	if _, err := f.env.DB.Pool.Exec(t.Context(), "UPDATE snapshots SET export_verify_after = NULL WHERE snapshot_id = $1", f.snapID); err != nil {
+		t.Fatal(err)
+	}
+	// The unset deadline sorts first. Reject only the later row's update.
+	f.rejectVerificationUpdate(t, `
+		CREATE TRIGGER reject_verification_update BEFORE UPDATE OF export_verify_after ON snapshots
+		FOR EACH ROW WHEN (OLD.created_by_id = 'verification-fault')
+		EXECUTE FUNCTION reject_verification_update()`)
+	f.run(verifyDelay)
+	if _, _, after := f.verification(t); after != nil {
+		t.Fatalf("rolled-back first deadline = %v, want NULL", after)
+	}
+	if _, _, after := due.verification(t); after == nil || !after.Equal(*originalDue) {
+		t.Fatalf("later deadline = %v, want %v", after, originalDue)
+	}
+	if got := f.env.Objects.ListCalls(); got != 0 {
+		t.Fatalf("R2 listings after failed claim = %d, want 0", got)
+	}
+	f.wantLogCount(t, "export_verification_scan_failed", 1, "injected verification update failure")
+	f.wantLogCount(t, "export_verification_scheduled", 0)
+}
+
+func TestExportVerificationApplyCommitFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		missingPart bool
+	}{
+		{name: "matching listing"},
+		{name: "missing part", missingPart: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newExportVerifyFixture(t)
+			command, _ := exportColumns(t, f.env, f.snapID)
+			snapshotField := `"snapshot_id":"` + f.snapID + `"`
+			commandField := `"command_id":"` + command + `"`
+			before := manifestHashes(t, f.env, f.snapID)
+			f.rejectVerificationUpdate(t, `
+				CREATE CONSTRAINT TRIGGER reject_verification_update AFTER UPDATE ON snapshots
+				DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+				WHEN (OLD.export_state IS DISTINCT FROM NEW.export_state OR OLD.export_verified IS DISTINCT FROM NEW.export_verified)
+				EXECUTE FUNCTION reject_verification_update()`)
+			const partXML = "<Contents><Key>%s</Key><Size>1048576</Size></Contents>"
+			contents := fmt.Sprintf(partXML, f.part1)
+			if !tc.missingPart {
+				contents += fmt.Sprintf(partXML, f.part2)
+			}
+			listing := "<ListBucketResult>" + contents + "</ListBucketResult>"
+			pages := []r2ListingPage{{body: listing}, {body: listing}}
+			control, requests := r2RetryControl(t, f.env, f.prefix, pages)
+			f.env.Clock.Advance(verifyDelay)
+			control.RunExportVerifyOnce(t.Context())
+			f.wantExported(t, false)
+			_, _, after := f.verification(t)
+			if want := f.env.Clock.Now().Add(verifyPoll); after == nil || !after.Equal(want) {
+				t.Fatalf("retry deadline = %v, want %v", after, want)
+			}
+			if got := manifestHashes(t, f.env, f.snapID); !slices.EqualFunc(got, before, bytes.Equal) {
+				t.Fatal("failed commit changed the manifest")
+			}
+			if got := cleanupJobs(t, f.env); len(got) != 0 {
+				t.Fatalf("failed commit queued clean-up: %v", got)
+			}
+			f.wantLogCount(t, "export_verification_retry", 1, snapshotField, commandField, `"reason":"database_error"`, "injected verification update failure")
+			f.wantLogCount(t, "export_verified", 0)
+			f.wantLogCount(t, "export_verification_failed", 0)
+
+			f.allowVerificationUpdate(t)
+			f.env.Clock.Advance(verifyPoll)
+			control.RunExportVerifyOnce(t.Context())
+			if got := requests(); !slices.Equal(got, []string{"list ", "list "}) {
+				t.Fatalf("R2 requests across failed apply and retry = %q, want two listings", got)
+			}
+			if tc.missingPart {
+				f.wantFailed(t, "missing_part", f.part2)
+				f.wantLogCount(t, "export_verification_failed", 1, `"level":"WARN"`, snapshotField, commandField,
+					`"reason":"missing_part"`, `"object_key":"`+f.part2+`"`)
+				f.wantLogCount(t, "export_verified", 0)
+			} else {
+				f.wantExported(t, true)
+				f.wantLogCount(t, "export_verified", 1, `"level":"INFO"`, snapshotField, commandField, `"parts":2`)
+				f.wantLogCount(t, "export_verification_failed", 0)
+			}
+		})
+	}
+}
+
 // seedOlderExportVerifications adds due exports ahead of f's export. Each
 // has a distinct attempt and a one-part manifest that matches the store.
-func (f *exportVerifyFixture) seedOlderExportVerifications(t *testing.T) []*exportVerifyFixture {
+func (f *exportVerifyFixture) seedOlderExportVerifications(t *testing.T, count int) []*exportVerifyFixture {
 	t.Helper()
 	rows, err := f.env.DB.Pool.Query(context.Background(), `
 		WITH older AS (
@@ -282,7 +452,7 @@ func (f *exportVerifyFixture) seedOlderExportVerifications(t *testing.T) []*expo
 				guest_os, host_os, arch, vcpu_count, memory_mib, disk_gib, network_mode,
 				created_by_kind, 'verification-fault', create_time, gen_random_uuid(),
 				export_verify_after - n * interval '1 second'
-			FROM snapshots CROSS JOIN generate_series(1, 50) AS n
+			FROM snapshots CROSS JOIN generate_series(1, $2::integer) AS n
 			WHERE snapshot_id = $1
 			RETURNING snapshot_id, export_command_id
 		), parts AS (
@@ -290,7 +460,7 @@ func (f *exportVerifyFixture) seedOlderExportVerifications(t *testing.T) []*expo
 			SELECT snapshot_id, 1, 1, decode(repeat('00', 32), 'hex') FROM older
 			RETURNING snapshot_id
 		)
-		SELECT snapshot_id::text, export_command_id::text FROM older JOIN parts USING (snapshot_id)`, f.snapID)
+		SELECT snapshot_id::text, export_command_id::text FROM older JOIN parts USING (snapshot_id)`, f.snapID, count)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,8 +478,8 @@ func (f *exportVerifyFixture) seedOlderExportVerifications(t *testing.T) []*expo
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(older) != 50 {
-		t.Fatalf("seeded %d older exports, want 50", len(older))
+	if len(older) != count {
+		t.Fatalf("seeded %d older exports, want %d", len(older), count)
 	}
 	return older
 }
@@ -319,7 +489,7 @@ func TestExportVerificationRotatesRetries(t *testing.T) {
 		t.Run(reason, func(t *testing.T) {
 			ctx := context.Background()
 			f := newExportVerifyFixture(t)
-			older := f.seedOlderExportVerifications(t)
+			older := f.seedOlderExportVerifications(t, 50)
 			faults := true
 			var listed []string
 			f.env.App.Service.Objects = exportVerifyStore{Store: f.env.Objects, list: func(ctx context.Context, prefix string) ([]objectstore.Object, error) {
@@ -448,6 +618,8 @@ func TestExportVerificationIgnoresStaleWork(t *testing.T) {
 			if got := len(cleanupJobs(t, f.env)); got != 0 {
 				t.Fatalf("stale work created %d clean-up jobs, want none", got)
 			}
+			f.wantLogCount(t, "export_verified", 0)
+			f.wantLogCount(t, "export_verification_failed", 0)
 		})
 	}
 }

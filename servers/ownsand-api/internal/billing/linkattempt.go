@@ -91,9 +91,13 @@ func CompleteLinkAttemptTx(ctx context.Context, tx pgx.Tx, orgID, attemptID stri
 // another operation took the attempt over.
 func (s *Statuses) ReleaseLinkAttempt(ctx context.Context, orgID, attemptID string) error {
 	now := s.now()
-	_, err := s.db.Pool.Exec(ctx, `UPDATE billing_pending_unlinks SET link_call_deadline = NULL, attempts = 0, next_attempt_time = $3
-		WHERE organization_id = $1 AND link_attempt_id = $2`, orgID, attemptID, now.Add(s.unlinkBackoff(1)))
-	return err
+	// A client-side timeout can return while Postgres is still waiting on
+	// the row lock. Commit only after the UPDATE reports success.
+	return s.db.InTx(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE billing_pending_unlinks SET link_call_deadline = NULL, attempts = 0, next_attempt_time = $3
+			WHERE organization_id = $1 AND link_attempt_id = $2`, orgID, attemptID, now.Add(s.unlinkBackoff(1)))
+		return err
+	})
 }
 
 // AbandonLinkAttempt deletes the matching attempt if dispatch did not start

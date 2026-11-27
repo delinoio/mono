@@ -181,6 +181,8 @@ message CapabilityReport {
   Arch arch = 2;
   string agent_version = 3;
   DeviceCapabilities capabilities = 4;
+  // This connection can confirm completion of an earlier resume command.
+  bool resume_fence_supported = 5;
 }
 
 // State of one sandbox on the device.
@@ -259,6 +261,7 @@ message AgentCommand {
     UpdateAgentCommand update_agent = 10;
     DeleteSnapshotCommand delete_snapshot = 11;
     WithdrawAgentUpdateCommand withdraw_agent_update = 12;
+    FenceResumeCommand fence_resume = 13;
   }
 }
 
@@ -295,6 +298,12 @@ message PauseSandboxCommand {
 
 message ResumeSandboxCommand {
   string sandbox_id = 1;
+}
+
+// Confirm that the named resume cannot start or change the sandbox again.
+message FenceResumeCommand {
+  string sandbox_id = 1;
+  string resume_command_id = 2;
 }
 
 message CreateSnapshotCommand {
@@ -381,6 +390,12 @@ message ImportSnapshotResult {
   SnapshotStateEntry snapshot = 1;
 }
 
+message FenceResumeResult {
+  string resume_command_id = 1;
+  // State read after the named resume cannot change the sandbox again.
+  SandboxStateEntry sandbox = 2;
+}
+
 message AgentCommandResult {
   string command_id = 1;
   // Absent on success.
@@ -392,6 +407,7 @@ message AgentCommandResult {
     CreateSnapshotResult create_snapshot = 5;
     ExportSnapshotResult export_snapshot = 6;
     ImportSnapshotResult import_snapshot = 7;
+    FenceResumeResult fence_resume = 8;
   }
 }
 

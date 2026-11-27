@@ -284,6 +284,103 @@ func TestStartProcessCrashReleasesLogs(t *testing.T) {
 	assertNoScanners(t, logs)
 }
 
+func TestStartProcessDrainsInheritedLogs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kill bool
+	}{
+		{name: "cleanup"},
+		{name: "force-kill", kill: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = listener.Close() })
+			if err := listener.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+
+			logs := &logSink{}
+			defer logs.dump(t)
+			bin, args := helperArgs()
+			var p *proc
+			var conn net.Conn
+			var stopStarted time.Time
+			if !t.Run("stop", func(tChild *testing.T) {
+				p = startProcess(tChild, logs, "child", []string{
+					envHelperMode + "=" + string(helperSpawn),
+					envHelperOutputHoldAddr + "=" + listener.Addr().String(),
+				}, bin, args...)
+				var err error
+				conn, err = listener.Accept()
+				if err != nil {
+					tChild.Fatalf("descendant did not signal readiness: %v", err)
+				}
+				// Keep the descendant running through child cleanup. Release
+				// its descriptors independently if the harness waits too long.
+				release := time.AfterFunc(6*time.Second, func() { _ = conn.Close() })
+				t.Cleanup(func() {
+					release.Stop()
+					_ = conn.Close()
+				})
+
+				stopStarted = time.Now()
+				if tc.kill {
+					killProcess(tChild, p)
+					select {
+					case <-p.done:
+					default:
+						tChild.Fatal("killProcess returned before process and log cleanup finished")
+					}
+				}
+			}) {
+				return
+			}
+
+			elapsed := time.Since(stopStarted)
+			const stopLimit = 4 * time.Second // Two seconds to drain, plus scheduling time.
+			if elapsed > stopLimit {
+				t.Errorf("process and log cleanup took %s, want at most %s", elapsed, stopLimit)
+			}
+			select {
+			case <-p.done:
+			default:
+				t.Fatal("test cleanup returned before process and log cleanup finished")
+			}
+			state := p.cmd.ProcessState
+			t.Logf("cleanup finished in %s with %v", elapsed, state)
+			if runtime.GOOS == "windows" {
+				// Go's Process.Kill uses TerminateProcess with status 1.
+				if state.ExitCode() != 1 {
+					t.Errorf("process status = %v, want exit status 1", state)
+				}
+			} else {
+				want := syscall.SIGTERM
+				if tc.kill {
+					want = syscall.SIGKILL
+				}
+				if got := state.Sys().(syscall.WaitStatus).Signal(); got != want {
+					t.Errorf("process signal = %v, want %v", got, want)
+				}
+			}
+			assertHelperLines(t, logs, "child")
+			assertNoScanners(t, logs)
+
+			// The descendant keeps the inherited descriptors open until
+			// the test closes its connection.
+			if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			var probe [1]byte
+			if _, err := conn.Read(probe[:]); !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("descendant stopped holding the descriptors before cleanup finished: %v", err)
+			}
+		})
+	}
+}
+
 func TestStartProcessFailureReleasesLogs(t *testing.T) {
 	logs := &logSink{}
 	_, err := launchProcess(logs, "missing", nil, "/nonexistent/ownsand-e2e-binary")

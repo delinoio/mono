@@ -41,7 +41,7 @@ func TestMembershipRevocationCursor(t *testing.T) {
 			}
 			p.Grants.Ack("installed", ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED, "")
 
-			p.HandleEvent(t.Context(), e)
+			p.HandleEvent(t.Context(), e, channelGenerations{})
 
 			if _, exists := p.sessions["session"]; exists == tc.revoked {
 				t.Errorf("session exists = %t, want %t", exists, !tc.revoked)
