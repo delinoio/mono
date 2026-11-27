@@ -309,7 +309,75 @@ describe("organizations", () => {
   }
 });
 
+function measureOrganizationHeading() {
+  const navigation = document.querySelector(
+    '[aria-label="Organization"].sidenav',
+  );
+  const heading = navigation?.querySelector(".sidenav-org");
+  const name = heading?.firstChild;
+  const role = heading?.querySelector(".muted");
+  if (!navigation || !name || !role) {
+    throw new Error("Missing organization name or role in the navigation");
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(name);
+  const nameRects = Array.from(range.getClientRects());
+  range.selectNodeContents(role);
+  const roleRects = Array.from(range.getClientRects());
+  const bounds = navigation.getBoundingClientRect();
+  const fits = (rects: DOMRect[]) =>
+    rects.length > 0 &&
+    rects.every(
+      (rect) => rect.left >= bounds.left && rect.right <= bounds.right,
+    );
+  const lines = (rects: DOMRect[]) =>
+    new Set(rects.map((rect) => rect.top)).size;
+  const root = document.documentElement;
+
+  return {
+    nameLines: lines(nameRects),
+    headingLines: lines([...nameRects, ...roleRects]),
+    nameFits: fits(nameRects),
+    roleFits: fits(roleRects),
+    documentFits: root.scrollWidth === root.clientWidth,
+  };
+}
+
 describe("organization layout", () => {
+  test("wraps a long unbroken organization name inside the navigation", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const name = "W".repeat(100);
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("button", "Create organization").tap();
+    await browser.keyboard.type(name);
+    await screen.getByRole("button", "Create").tap();
+    await expect(browser).toHaveURL(/\/orgs\/[0-9a-f-]+$/);
+
+    const navigation = screen.getByRole("navigation", "Organization");
+    const members = navigation.getByRole("link", "Members");
+    await members.tap();
+    await expect(members).toHaveAttribute("aria-current", "page");
+    await expect(
+      screen.getByRole("heading", "Members", { level: 1 }),
+    ).toBeVisible();
+    await expect(navigation.getByText(name, { exact: false })).toBeVisible();
+    await expect(navigation.getByText("Owner", { exact: false })).toBeVisible();
+
+    for (const width of [320, 760, 761, 1024]) {
+      await browser.setViewport({ width, height: 844 });
+      const layout = await browser.evaluate(measureOrganizationHeading);
+      expect(layout.nameLines, `${width}px name wraps`).toBeGreaterThan(1);
+      expect(layout.nameFits, `${width}px name fits`).toBe(true);
+      expect(layout.roleFits, `${width}px role fits`).toBe(true);
+      expect(layout.documentFits, `${width}px document fits`).toBe(true);
+    }
+  });
+
   test("fits the document and scrolls the section list at narrow widths", async ({
     app,
     screen,
@@ -346,6 +414,12 @@ describe("organization layout", () => {
       expect(layout.listOverflowX, `${width}px section list overflow`).toBe(
         "auto",
       );
+      const heading = await browser.evaluate(measureOrganizationHeading);
+      expect(heading.headingLines, `${width}px short heading`).toBe(1);
+      expect(
+        heading.nameFits && heading.roleFits,
+        `${width}px heading fits`,
+      ).toBe(true);
     }
   });
 
@@ -382,7 +456,31 @@ describe("organization layout", () => {
         layout.secondTop,
         `${width}px section list`,
       ).toBeGreaterThanOrEqual(layout.firstBottom);
+      const heading = await browser.evaluate(measureOrganizationHeading);
+      expect(heading.headingLines, `${width}px short heading`).toBe(1);
+      expect(
+        heading.nameFits && heading.roleFits,
+        `${width}px heading fits`,
+      ).toBe(true);
     }
+
+    const navigation = screen.getByRole("navigation", "Organization");
+    const members = navigation.getByRole("link", "Members");
+    const audit = navigation.getByRole("link", "Audit events");
+    await expect(members).toHaveAttribute("aria-current", "page");
+
+    await audit.tap();
+
+    await expect(browser).toHaveURL(`/orgs/${ACME}/audit`);
+    await expect(audit).toHaveAttribute("aria-current", "page");
+    expect(
+      await browser.evaluate(() =>
+        Array.from(
+          document.querySelectorAll('.sidenav a[aria-current="page"]'),
+          (link) => link.textContent,
+        ),
+      ),
+    ).toEqual(["Audit events"]);
   });
 });
 
