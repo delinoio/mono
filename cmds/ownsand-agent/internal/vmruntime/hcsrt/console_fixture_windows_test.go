@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -33,8 +34,10 @@ type consoleFixture struct {
 	attempts int
 }
 
-func startConsoleFixture(t *testing.T, sandboxID string) *consoleFixture {
+func startConsoleFixture(t *testing.T, name string) *consoleFixture {
 	t.Helper()
+	// Include the process ID because Windows pipe names are shared across test processes.
+	sandboxID := fmt.Sprintf("%s-%d", name, os.Getpid())
 	pipe := consolePipe(sandboxID)
 	l, err := winio.ListenPipe(pipe, nil)
 	if err != nil {
