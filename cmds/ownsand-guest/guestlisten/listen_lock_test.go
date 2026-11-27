@@ -347,8 +347,8 @@ func TestListenUnixLockDeadline(t *testing.T) {
 			if err != nil || !os.SameFile(before, after) {
 				t.Fatalf("socket file changed: %v", err)
 			}
-			if _, err := waiter.Stat(); !errors.Is(err, os.ErrClosed) {
-				t.Fatalf("waiter handle remains open: %v", err)
+			if _, err := waiter.Stat(); !isClosedFileStatError(err) {
+				t.Fatalf("waiter file Stat returned %v, want a closed-file error", err)
 			}
 
 			unixLockTry = tryLockFile
