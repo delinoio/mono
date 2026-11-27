@@ -1,0 +1,43 @@
+{
+  "gid": "inv-01-windows-sync-list-preamble",
+  "commit": "404b80fea5f2421311031a1cad54d187436dca4c",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "404b80fea5f2421311031a1cad54d187436dca4c",
+    "setup": "Use a short, clean, non-production checkout at the stated revision on delino-win-1. Run at the repository root in a non-elevated shell. Run the first command, copy files.copyFrom to files.copyTo, then run the second command. Preserve both test logs and console output.",
+    "commands": [
+      "New-Item -ItemType Directory -Path '.t3-tmp' -Force | Out-Null",
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '.\\.t3-tmp\\validate-windows-sync-list-preamble.ps1' -ExpectedSha '404b80fea5f2421311031a1cad54d187436dca4c'"
+    ],
+    "expectedResults": [
+      "The script confirms the revision and Windows PowerShell 5.1. All selected tests pass without skips.",
+      "Public Sync removes the seeded single deletion and the first and later U+FEFF deletions at their exact paths. The unlisted note.txt survives and removed paths are absent from the manifest.",
+      "Production PowerShell apply removes old files and empty directories at the first and later U+FEFF replacement and prune paths. Reapplying the same lists preserves existing replacement directories and their guest files.",
+      "For both link lists, the original files at the exact paths are removed. On this non-elevated host both link creations fail, yielding two SANDRUN-LINK-FAILED diagnostics per case. If creation succeeds the fixture verifies the actual link target.",
+      "The ASCII public Sync retry control passes initial replacement, retry after the manifest write failure, and termination on ordinary deletion failure. It uses Windows tar.exe and requires no junction."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-windows-sync-list-preamble/worker/.t3-tmp/sync-list-followup/validate-windows-sync-list-preamble.ps1",
+      "copyTo": ".t3-tmp/validate-windows-sync-list-preamble.ps1",
+      "regressionTests": [
+        "go/sandrun/guest_windows_test.go",
+        "go/sandrun/sync_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/windows-sync-list-preamble.jsonl",
+        ".t3-tmp/windows-sync-ascii-retry.jsonl"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-windows-sync-list-preamble/worker/.t3-tmp/sync-list-followup/sandrun-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-windows-sync-list-preamble/worker/.t3-tmp/sync-list-followup/sandrun-windows-amd64.exe"
+      ]
+    },
+    "limits": [
+      "Successful native symbolic-link creation requires a Windows account whose PowerShell can create symbolic links. The non-elevated run validates exact path handling and failure reporting.",
+      "The revised Unicode fixtures exercise the list readers with no archive payload. End-to-end Unicode PAX extraction remains an independent native runtime limit on the reported host."
+    ]
+  }
+}
