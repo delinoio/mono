@@ -173,7 +173,7 @@ test("every shared fixture input selects tests", async (t) => {
     "pnpm-workspace.yaml",
     "rstack.config.ts",
     "lefthook.yml",
-    "scripts/install-git-hooks.sh",
+    "scripts/install-git-hooks.mjs",
     "scripts/droplet/start-caddy.sh",
     "scripts/droplet/configure-docker-logs.sh",
     "scripts/protos.sh",

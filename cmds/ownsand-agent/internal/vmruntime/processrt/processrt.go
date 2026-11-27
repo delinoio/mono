@@ -719,16 +719,19 @@ func recordSocketDir(dir, socketDir string) error {
 
 // recordedSocketDir returns the socket directory that dir records, or "" when
 // dir records none or an unexpected path.
-func recordedSocketDir(dir string) string {
+func recordedSocketDir(dir string) (string, error) {
 	data, err := os.ReadFile(filepath.Join(dir, socketDirFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("processrt: read guest helper socket directory record: %w", err)
 	}
 	socketDir := filepath.Clean(string(data))
 	if !filepath.IsAbs(socketDir) || !strings.HasPrefix(filepath.Base(socketDir), socketDirPrefix) {
-		return ""
+		return "", nil
 	}
-	return socketDir
+	return socketDir, nil
 }
 
 // removeUntracked removes the files of a sandbox that the runtime does not
@@ -750,7 +753,11 @@ func (r *Runtime) removeUntracked(sandboxID string) error {
 		return fmt.Errorf("processrt: sandbox ID %q is not a single path element", sandboxID)
 	}
 	dir := filepath.Join(r.vmsDir, sandboxID)
-	if socketDir := recordedSocketDir(dir); socketDir != "" {
+	socketDir, err := recordedSocketDir(dir)
+	if err != nil {
+		return err
+	}
+	if socketDir != "" {
 		if err := os.RemoveAll(socketDir); err != nil {
 			return err
 		}

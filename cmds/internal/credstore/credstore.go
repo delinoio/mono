@@ -82,9 +82,8 @@ func DefaultDir(program string) (string, error) {
 // Path returns the credential file path.
 func (s Store) Path() string { return filepath.Join(s.Dir, FileName) }
 
-// Load reads the stored credentials.
-func (s Store) Load() (*Credentials, error) {
-	b, err := readFile(s.Path())
+func (s Store) load(read func(string) ([]byte, error)) (*Credentials, error) {
+	b, err := read(s.Path())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound
 	}
@@ -126,7 +125,7 @@ func (s Store) SaveIfSession(sessionID string, c *Credentials) error {
 		return err
 	}
 	defer unlock()
-	cur, err := s.Load()
+	cur, err := s.load(readFile)
 	if err != nil {
 		return err
 	}
@@ -153,7 +152,7 @@ func (s Store) SaveIfCurrent(sessionID, refreshToken string, c *Credentials) err
 		return err
 	}
 	defer unlock()
-	cur, err := s.Load()
+	cur, err := s.load(readFile)
 	if err != nil {
 		return err
 	}

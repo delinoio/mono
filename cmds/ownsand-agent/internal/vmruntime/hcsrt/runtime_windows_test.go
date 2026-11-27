@@ -365,6 +365,12 @@ func TestFailedCreateReleasesWatcherAndKeepsUnconfirmedVM(t *testing.T) {
 			return os.WriteFile(dst, []byte("disk"), 0o600)
 		},
 		makeFixedVHD: func(_ string, size int64, _ bool) (int64, error) { return size, nil },
+		grantVM: func(computeID, path string) error {
+			if computeID != systemID(id) || path != filepath.Join(dir, diskFile) {
+				t.Fatalf("grantVM(%q, %q): unexpected compute system ID or disk path", computeID, path)
+			}
+			return nil
+		},
 		createSystem: func(string, any) (*system, error) {
 			cancel()
 			return sys, nil
@@ -567,6 +573,10 @@ func TestDiskPreparationCancellation(t *testing.T) {
 					return grow(path, size)
 				},
 				growVHDX: grow,
+				grantVM: func(string, string) error {
+					t.Fatal("attempted to grant disk access after cancellation")
+					return nil
+				},
 				createSystem: func(string, any) (*system, error) {
 					t.Fatal("attempted to create a compute system after cancellation")
 					return nil, nil
