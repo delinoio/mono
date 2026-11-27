@@ -68,13 +68,24 @@ func imageBuild(cfg config.Config, f imageBuildFlags, stdout, stderr io.Writer, 
 		}
 		return exitError
 	}
-	st, err := store.Open(cfg.StateDir)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	st, err := store.OpenForRead(cfg.StateDir)
 	if err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	unlock, err := st.LockImageBuild(ctx)
+	if err != nil {
+		fmt.Fprintln(stderr, c.bad("image build failed:"), err)
+		return exitError
+	}
+	defer unlock()
+	st, err = store.Open(cfg.StateDir)
+	if err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent:", err)
+		return exitError
+	}
 	err = prepared.Build(ctx, st.Path(store.ImagesDir), newLogger(cfg))
 	if err != nil {
 		fmt.Fprintln(stderr, c.bad("image build failed:"), err)

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"connectrpc.com/connect"
@@ -227,17 +228,15 @@ func settingsFrom(v any) (settingsValue, bool) {
 }
 
 func (sv settingsValue) validate() error {
-	check := func(field, v string) error {
-		if err := api.ValidateName(field, v, maxSettingLength); err != nil {
-			return err
-		}
-		return nil
-	}
 	switch sv.vendor {
 	case sandrunv1.AgentVendor_AGENT_VENDOR_CURSOR:
-		return check("settings.cursor.pool_name", sv.poolName)
+		const field = "settings.cursor.pool_name"
+		if strings.ContainsRune(sv.poolName, '"') {
+			return api.ErrInvalidf("invalid %s: must not contain a double quote", field)
+		}
+		return api.ValidateName(field, sv.poolName, maxSettingLength)
 	case sandrunv1.AgentVendor_AGENT_VENDOR_DEVIN:
-		return check("settings.devin.outpost_name", sv.outpostName)
+		return api.ValidateName("settings.devin.outpost_name", sv.outpostName, maxSettingLength)
 	}
 	return nil
 }

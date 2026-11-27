@@ -598,6 +598,40 @@ func TestOutboundNetworkCheck(t *testing.T) {
 	}
 }
 
+func TestWindowsGuestOutboundPlacement(t *testing.T) {
+	device := outboundNetworkDevice("hyper-v", true)
+	device.HostOS = ownsandv1.HostOs_HOST_OS_WINDOWS
+	device.Capabilities.GuestOses = append(device.Capabilities.GuestOses, ownsandv1.GuestOs_GUEST_OS_WINDOWS)
+	device.Capabilities.BuiltBaseImages = append(device.Capabilities.BuiltBaseImages, ownsandv1.BaseImage_BASE_IMAGE_WINDOWS)
+
+	linuxOutbound := linuxRequest()
+	windowsOutbound := linuxOutbound
+	windowsOutbound.GuestOS = ownsandv1.GuestOs_GUEST_OS_WINDOWS
+	windowsOutbound.BaseImage = ownsandv1.BaseImage_BASE_IMAGE_WINDOWS
+	windowsNone := windowsOutbound
+	windowsNone.NetworkMode = ownsandv1.NetworkMode_NETWORK_MODE_NONE
+
+	for _, tc := range []struct {
+		name   string
+		req    Request
+		online bool
+		want   Outcome
+	}{
+		{"Windows OUTBOUND online", windowsOutbound, true, Permanent},
+		{"Windows OUTBOUND offline", windowsOutbound, false, Permanent},
+		{"Windows NONE online", windowsNone, true, Eligible},
+		{"Linux OUTBOUND online", linuxOutbound, true, Eligible},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			device.Online, device.LiveChannel = tc.online, tc.online
+			got, reason := Evaluate(tc.req, device, now)
+			if got != tc.want {
+				t.Fatalf("Evaluate = %v (%s), want %v", got, reason, tc.want)
+			}
+		})
+	}
+}
+
 // macSnapshot is an exported macOS snapshot that mac "holder" took.
 func macSnapshot(exported bool) *Snapshot {
 	return &Snapshot{ID: "s", DeviceID: "holder", Exported: exported, HostOS: ownsandv1.HostOs_HOST_OS_MACOS, Arch: ownsandv1.Arch_ARCH_ARM64,

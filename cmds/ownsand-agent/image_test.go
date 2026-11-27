@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 )
 
 func TestImageBuildInputPreflight(t *testing.T) {
@@ -27,19 +29,8 @@ func TestImageBuildInputPreflight(t *testing.T) {
 	missing := filepath.Join(root, "missing-helper")
 	iso := write("placeholder.iso", nil)
 
-	// A PE32+ executable header with no sections suffices for the preflight.
-	pe := make([]byte, 0x58+240)
-	copy(pe, "MZ")
-	pe[0x3c] = 0x40
-	copy(pe[0x40:], "PE\x00\x00")
-	binary.LittleEndian.PutUint16(pe[0x44:], 0x8664)
-	binary.LittleEndian.PutUint16(pe[0x54:], 240)
-	pe[0x56] = 2
-	binary.LittleEndian.PutUint16(pe[0x58:], 0x20b)
-	pe[0x58+108] = 16
-	valid := write("valid-windows.exe", pe)
-	binary.LittleEndian.PutUint16(pe[0x44:], 0x14c)
-	wrongWindows := write("wrong-windows.exe", pe)
+	valid := write("valid-windows.exe", windowsImageBuildTestPE(0x8664))
+	wrongWindows := write("wrong-windows.exe", windowsImageBuildTestPE(0x14c))
 
 	// Mach-O executable header for x86_64.
 	mach := make([]byte, 32)
@@ -117,6 +108,64 @@ func TestImageBuildInputPreflight(t *testing.T) {
 		})
 	}
 	t.Run("valid preflight opens state", func(t *testing.T) {
-		invoke(t, file, []string{"--os", "windows", "--iso", iso, "--guest-binary", valid}, exitError, "store: create "+file)
+		invoke(t, file, []string{"--os", "windows", "--iso", iso, "--guest-binary", valid}, exitError, "store: prepare state directory for image build")
 	})
+}
+
+func windowsImageBuildTestPE(machine uint16) []byte {
+	// A PE32+ executable header with no sections suffices for the preflight.
+	pe := make([]byte, 0x58+240)
+	copy(pe, "MZ")
+	pe[0x3c] = 0x40
+	copy(pe[0x40:], "PE\x00\x00")
+	binary.LittleEndian.PutUint16(pe[0x44:], machine)
+	binary.LittleEndian.PutUint16(pe[0x54:], 240)
+	pe[0x56] = 2
+	binary.LittleEndian.PutUint16(pe[0x58:], 0x20b)
+	pe[0x58+108] = 16
+	return pe
+}
+
+func TestImageBuildRefusedBeforeOpeningStore(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		name, want := "pending", store.ErrRemovalPending
+		if held {
+			name, want = "exclusive", store.ErrEnrollmentBusy
+		}
+		t.Run(name, func(t *testing.T) {
+			clearAgentEnv(t)
+			root := t.TempDir()
+			helper := filepath.Join(root, "ownsand-guest.exe")
+			if err := os.WriteFile(helper, windowsImageBuildTestPE(0x8664), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			st, err := store.OpenForRead(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if held {
+				unlock, err := st.LockEnrollment(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer unlock()
+			} else if _, err := st.UpdateAgent(func(s *store.AgentState) error {
+				s.Removal.NoticeReceived = true
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"image", "build", "--os", "windows", "--iso", "placeholder.iso", "--guest-binary", helper, "--state-dir", st.Dir(), "--no-color"}, nil, &stdout, &stderr)
+			if code != exitError || !strings.Contains(stderr.String(), want.Error()) {
+				t.Fatalf("image build = %d, %q, want %d and %v", code, stderr.String(), exitError, want)
+			}
+			for _, sub := range []string{store.ImagesDir, store.SandboxesDir, store.SnapshotsDir, store.VMsDir, store.UpdateDir} {
+				if _, err := os.Stat(st.Path(sub)); !os.IsNotExist(err) {
+					t.Errorf("refused build changed %s: %v", sub, err)
+				}
+			}
+		})
+	}
 }
