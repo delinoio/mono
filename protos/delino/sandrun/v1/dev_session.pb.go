@@ -1234,12 +1234,15 @@ func (x *DevSessionExecStarted) GetStartTime() *timestamppb.Timestamp {
 	return nil
 }
 
-// The requested offsets are older than the kept output.
+// Output is missing from one or both streams. Each offset gives the next byte
+// position for resuming that stream. If a stream has missing bytes, its offset
+// advances to the end of the missing range. A stream without missing bytes
+// keeps its current offset.
 type DevSessionExecOutputTruncated struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// First available stdout offset.
+	// Next byte offset for resuming stdout.
 	StdoutOffset int64 `protobuf:"varint,1,opt,name=stdout_offset,json=stdoutOffset,proto3" json:"stdout_offset,omitempty"`
-	// First available stderr offset.
+	// Next byte offset for resuming stderr.
 	StderrOffset  int64 `protobuf:"varint,2,opt,name=stderr_offset,json=stderrOffset,proto3" json:"stderr_offset,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

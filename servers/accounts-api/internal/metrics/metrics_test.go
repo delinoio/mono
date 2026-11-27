@@ -9,9 +9,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strings"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/metrics"
 	"github.com/delinoio/mono/servers/internal/telemetry"
@@ -92,26 +95,48 @@ func TestServeAndShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("/metrics status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(resp.Body)
 	resp.Body.Close()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse /metrics: %v", err)
 	}
-	for _, want := range []string{
-		`accounts_paddle_webhooks_total{event_type="transaction.completed",result="applied"} 1`,
-		`accounts_top_up_attempts_total{kind="auto",outcome="rejected"} 1`,
-		`accounts_top_up_results_total{kind="manual",result="completed"} 1`,
-		`accounts_billing_emails_total{kind="low_balance",result="sent"} 1`,
-		`accounts_credit_grants_total{source="subscription_credit"} 1`,
-		`accounts_auto_top_up_disabled_total 1`,
-		`accounts_usage_reports_total{result="charged",service="ownsand"} 1`,
-		`accounts_billing_status_changes_total{status="blocked"} 1`,
-		`accounts_linked_organizations{status="suspended"} 3`,
-		`go_goroutine_count`,
+	for _, want := range []model.Sample{
+		{Metric: model.Metric{model.MetricNameLabel: "accounts_paddle_webhooks_total", "event_type": "transaction.completed", "result": "applied"}, Value: 1},
+		{Metric: model.Metric{model.MetricNameLabel: "accounts_top_up_attempts_total", "kind": "auto", "outcome": "rejected"}, Value: 1},
+		{Metric: model.Metric{model.MetricNameLabel: "accounts_top_up_results_total", "kind": "manual", "result": "completed"}, Value: 1},
+		{Metric: model.Metric{model.MetricNameLabel: "accounts_billing_emails_total", "kind": "low_balance", "result": "sent"}, Value: 1},
+		{Metric: model.Metric{model.MetricNameLabel: "accounts_credit_grants_total", "source": "subscription_credit"}, Value: 1},
+		{Metric: model.Metric{model.MetricNameLabel: "accounts_auto_top_up_disabled_total"}, Value: 1},
+		{Metric: model.Metric{model.MetricNameLabel: "accounts_usage_reports_total", "result": "charged", "service": "ownsand"}, Value: 1},
+		{Metric: model.Metric{model.MetricNameLabel: "accounts_billing_status_changes_total", "status": "blocked"}, Value: 1},
+		{Metric: model.Metric{model.MetricNameLabel: "accounts_linked_organizations", "status": "suspended"}, Value: 3},
 	} {
-		if !strings.Contains(string(body), want) {
-			t.Errorf("metrics lack %q", want)
+		family := families[string(want.Metric[model.MetricNameLabel])]
+		if family == nil {
+			t.Errorf("/metrics lacks %s", want.Metric)
+			continue
 		}
+		samples, err := expfmt.ExtractSamples(&expfmt.DecodeOptions{}, family)
+		if err != nil {
+			t.Errorf("extract %s samples: %v", family.GetName(), err)
+			continue
+		}
+		index := slices.IndexFunc(samples, func(sample *model.Sample) bool {
+			return sample.Metric.Equal(want.Metric)
+		})
+		if index < 0 {
+			t.Errorf("/metrics lacks %s", want.Metric)
+		} else if got := samples[index].Value; got != want.Value {
+			t.Errorf("%s = %v, want %v", want.Metric, got, want.Value)
+		}
+	}
+	if len(families["go_goroutine_count"].GetMetric()) == 0 {
+		t.Error("/metrics lacks go_goroutine_count")
 	}
 	resp, err = client.Get("http://" + listener.Addr().String() + "/healthz")
 	if err != nil {

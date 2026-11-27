@@ -124,8 +124,10 @@ const lists = [
     more: "Show more usage",
     total: 201,
     firstPage: 200,
-    seed: (account: ReturnType<typeof accountOf>) =>
-      addUsageRows(account, 201 - account.usage.length),
+    seed: (account: ReturnType<typeof accountOf>) => {
+      account.usage.length = 0;
+      addUsageRows(account, 201, 1_000_000n);
+    },
   },
 ];
 
@@ -152,11 +154,19 @@ for (const entry of lists) {
         entry,
         new ConnectError("the page service is down", Code.Unavailable),
       );
+      const isUsageSummary = entry.method === "ListUsageSummary";
+      const usageTotal = () => screen.getByLabelText("Usage total").textContent;
+      if (isUsageSummary) {
+        expect(usageTotal()).toBe("$201.00");
+        accountOf(api).usage.at(-1)!.amountUsdMicros = 3_000_000n;
+      }
+
       await click(moreButton(entry.more)!);
       const notice = (await screen.findByText(UNAVAILABLE)).closest(
         '[role="alert"]',
       ) as HTMLElement;
       expect(rowCount(entry.list)).toBe(entry.firstPage);
+      if (isUsageSummary) expect(usageTotal()).toBe("$201.00");
       const requestsBeforeRetry = pageTokens(api, entry.method);
       expect(requestsBeforeRetry).toEqual(["", expect.stringMatching(/./)]);
       const failedToken = requestsBeforeRetry[1];
@@ -165,6 +175,12 @@ for (const entry of lists) {
 
       await click(within(notice).getByRole("button", { name: TRY_AGAIN }));
       await waitFor(() => expect(rowCount(entry.list)).toBe(entry.total));
+      if (isUsageSummary) {
+        expect(usageTotal()).toBe("$203.00");
+        expect(
+          screen.getByText("usage-org-0201").closest("tr")?.textContent,
+        ).toContain("$3.00");
+      }
       // The retry sent the failed cursor, not a refetch of the first page.
       expect(pageTokens(api, entry.method)).toEqual([
         ...requestsBeforeRetry,

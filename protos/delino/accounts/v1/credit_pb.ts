@@ -167,13 +167,16 @@ export type CreditGrant = Message<"delino.accounts.v1.CreditGrant"> & {
   paddleTransactionId: string;
 
   /**
+   * Time the server first processed the webhook that created this grant.
+   *
    * @generated from field: google.protobuf.Timestamp create_time = 6;
    */
   createTime?: Timestamp | undefined;
 
   /**
-   * 12 months after create_time. The unused rest leaves the balance as an
-   * EXPIRY ledger entry at this time.
+   * 12 UTC calendar months after payment capture, or after create_time if
+   * no unambiguous capture time is available. Unused credit is removed with
+   * an EXPIRY ledger entry.
    *
    * @generated from field: google.protobuf.Timestamp expire_time = 7;
    */

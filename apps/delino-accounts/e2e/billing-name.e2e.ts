@@ -77,6 +77,9 @@ async function interceptAccount(browser: Browser, appOrigin: string) {
   });
   return {
     submittedNames,
+    renameElsewhere(name: string) {
+      billingAccount.name = name;
+    },
     holdNext(method: "UpdateBillingAccount" | "GetBillingAccount") {
       let markStarted!: () => void;
       let respond!: (fail: boolean) => void;
@@ -97,6 +100,80 @@ async function interceptAccount(browser: Browser, appOrigin: string) {
 }
 
 describe("billing account name", () => {
+  for (const fetchedName of ["Beta", ORIGINAL_NAME]) {
+    test(`follows a successful post-save read of ${fetchedName}`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      const api = await interceptAccount(browser, app.baseUrl);
+      await app.open(ACCOUNT_PATH);
+      await screen.getByRole("tab", "Settings").click();
+      const field = screen.getByRole("textbox", "Billing account name");
+      const save = screen
+        .getByRole("region", "Name")
+        .getByRole("button", "Save");
+      const refetch = api.holdNext("GetBillingAccount");
+      try {
+        await field.fill("  Alpha  ");
+        await save.click();
+        await refetch.started;
+        await expect(field).toHaveValue("Alpha");
+        await expect(save).toBeDisabled();
+        await app.screenshot("concurrent-rename-pending");
+
+        api.renameElsewhere(fetchedName);
+        refetch.release();
+        await expect(save).toBeEnabled();
+        await expect(
+          screen.getByRole("heading", fetchedName, { level: 1 }),
+        ).toBeVisible();
+        await app.screenshot("concurrent-rename-read-complete");
+        await expect(field).toHaveValue(fetchedName);
+        await save.click();
+        await expect(save).toBeEnabled();
+        expect(api.submittedNames).toEqual(["Alpha", fetchedName]);
+      } finally {
+        refetch.release();
+      }
+    });
+  }
+
+  test("preserves a later draft when the post-save read returns a concurrent rename", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const api = await interceptAccount(browser, app.baseUrl);
+    await app.open(ACCOUNT_PATH);
+    await screen.getByRole("tab", "Settings").click();
+    const field = screen.getByRole("textbox", "Billing account name");
+    const save = screen.getByRole("region", "Name").getByRole("button", "Save");
+    const refetch = api.holdNext("GetBillingAccount");
+    try {
+      await field.fill("  Alpha  ");
+      await save.click();
+      await refetch.started;
+      await expect(field).toHaveValue("Alpha");
+      await field.fill("  Gamma  ");
+      api.renameElsewhere("Beta");
+      refetch.release();
+
+      await expect(
+        screen.getByRole("heading", "Beta", { level: 1 }),
+      ).toBeVisible();
+      await expect(field).toHaveValue("  Gamma  ");
+      await app.screenshot("concurrent-rename-draft-preserved");
+      await save.click();
+      await expect(
+        screen.getByRole("heading", "Gamma", { level: 1 }),
+      ).toBeVisible();
+      expect(api.submittedNames).toEqual(["Alpha", "Gamma"]);
+    } finally {
+      refetch.release();
+    }
+  });
+
   for (const [draft, nextName] of [
     ["  Beta  ", "Beta"],
     [ORIGINAL_NAME, ORIGINAL_NAME],
@@ -197,11 +274,13 @@ describe("billing account name", () => {
       await expect(screen.getByText(BUSY)).toBeVisible();
       await expect(field).toHaveValue("Alpha");
       await app.screenshot("name-after-refetch-failure");
+      api.renameElsewhere("Beta");
       await screen.getByRole("button", "Try again").click();
       await expect(
-        screen.getByRole("heading", "Alpha", { level: 1 }),
+        screen.getByRole("heading", "Beta", { level: 1 }),
       ).toBeVisible();
-      await expect(field).toHaveValue("Alpha");
+      await app.screenshot("name-after-refetch-retry");
+      await expect(field).toHaveValue("Beta");
     } finally {
       refetch.release();
     }

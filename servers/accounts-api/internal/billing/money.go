@@ -19,8 +19,8 @@ const (
 // Amount rules of docs/servers-accounts-api-foundation.md (Payments and
 // credits).
 const (
-	// SubscriptionCreditUSDMicros is the credit grant of each paid
-	// subscription period, and SubscriptionPriceUSDMicros the price.
+	// SubscriptionCreditUSDMicros caps the credit grant of each paid
+	// subscription period, and SubscriptionPriceUSDMicros is the price.
 	SubscriptionCreditUSDMicros = 10 * MicrosPerUSD
 	SubscriptionPriceUSDMicros  = 10 * MicrosPerUSD
 	// MinTopUpUSDMicros and MaxTopUpUSDMicros bound manual top-ups; the
@@ -65,8 +65,8 @@ func WholeCents(micros int64) bool {
 // GrantLifetimeMonths is the lifetime of a credit grant.
 const GrantLifetimeMonths = 12
 
-// GrantExpireTime returns the expiry of a grant created at t: 12 calendar
-// months later, in UTC.
+// GrantExpireTime returns the expiry of a grant 12 calendar months after
+// its expiry basis, in UTC.
 func GrantExpireTime(t time.Time) time.Time {
 	return t.UTC().AddDate(0, GrantLifetimeMonths, 0)
 }

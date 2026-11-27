@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation } from "@connectrpc/connect-query";
+import { createConnectQueryKey, useMutation } from "@connectrpc/connect-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "delino-ui/button";
 import { useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth.tsx";
@@ -10,8 +11,12 @@ import {
   SignInFailureNotice,
 } from "../components/ui.tsx";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
-import { openInvitationFromAddress, pendingInvitation } from "../invitation.ts";
-import { Link, RouteId, routePath, useRouter } from "../router.tsx";
+import {
+  openInvitationFromAddress,
+  pendingInvitation,
+  tokenFromFragment,
+} from "../invitation.ts";
+import { Link, parseRoute, RouteId, routePath, useRouter } from "../router.tsx";
 
 /**
  * Route `billing-invitation`: accepts a billing account invitation as the
@@ -21,6 +26,7 @@ import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 export function InvitationPage({ configured }: { configured: boolean }) {
   const auth = useAuth();
   const { navigate } = useRouter();
+  const queryClient = useQueryClient();
   const [token, setToken] = useState<string | undefined>(() => {
     const fromAddress = openInvitationFromAddress(
       window.location,
@@ -28,6 +34,7 @@ export function InvitationPage({ configured }: { configured: boolean }) {
     );
     return fromAddress ?? pendingInvitation.read();
   });
+  const [needsRecovery, setNeedsRecovery] = useState(false);
   const accept = useMutation(BillingAccountService.method.acceptInvitation);
   const resetAccept = accept.reset;
   const signingIn = useRef(false);
@@ -65,6 +72,7 @@ export function InvitationPage({ configured }: { configured: boolean }) {
         resetAccept();
         setAttempt((n) => n + 1);
         setToken(next);
+        setNeedsRecovery(false);
       }
     };
     window.addEventListener("hashchange", onHash);
@@ -81,6 +89,20 @@ export function InvitationPage({ configured }: { configured: boolean }) {
         <Link to={routePath({ id: RouteId.Billing })}>
           Go to your billing accounts
         </Link>
+      </Page>
+    );
+  }
+
+  if (needsRecovery) {
+    return (
+      <Page narrow>
+        <PageHeader title="Join the billing account" />
+        <div className="notice">
+          <p role="alert">You may have joined the billing account.</p>
+          <Link to={routePath({ id: RouteId.Billing })}>
+            Go to your billing accounts
+          </Link>
+        </div>
       </Page>
     );
   }
@@ -126,34 +148,47 @@ export function InvitationPage({ configured }: { configured: boolean }) {
           key={attempt}
           onClick={async () => {
             const clicked = currentAttempt.current;
-            try {
-              const res = await accept.mutateAsync({
-                invitationToken: token,
-              });
-              if (clicked !== currentAttempt.current) {
-                return;
-              }
-              navigate(
-                routePath({
-                  id: RouteId.BillingAccount,
-                  billingAccountId: res.billingAccount!.billingAccountId,
+            const response = await accept
+              .mutateAsync({ invitationToken: token })
+              .catch(() => undefined);
+            if (response !== undefined) {
+              // A successful request changes membership even after the user leaves.
+              void queryClient.invalidateQueries({
+                queryKey: createConnectQueryKey({
+                  schema: BillingAccountService.method.listBillingAccounts,
+                  cardinality: undefined,
                 }),
-                { replace: true },
-              );
-            } catch {
-              // accept.error shows the failure above. The in-memory token
-              // stays so that the user can try again after, for example,
-              // signing in with the invited address.
-            } finally {
-              // A newer link owns the stored token once it replaced this
-              // attempt: it may have saved its token for a sign-in redirect
-              // that is still in progress. Opening that link already deleted
-              // the token of this attempt, and leaving the flow deletes the
-              // rest.
-              if (clicked === currentAttempt.current) {
-                pendingInvitation.clear();
-              }
+              });
             }
+
+            // The address can change before React unmounts or hashchange runs.
+            // Leave a replacement fragment and its token for the listener.
+            const { pathname, hash } = window.location;
+            const addressToken = tokenFromFragment(hash);
+            if (
+              clicked !== currentAttempt.current ||
+              parseRoute(pathname).id !== RouteId.BillingInvitation ||
+              (addressToken !== undefined && addressToken !== token)
+            ) {
+              return;
+            }
+            pendingInvitation.clear();
+            if (response === undefined) {
+              // The error notice offers recovery. Keep the in-memory token for retry.
+              return;
+            }
+            const billingAccountId =
+              response.billingAccount?.billingAccountId.trim();
+            if (!billingAccountId) {
+              setNeedsRecovery(true);
+              return;
+            }
+            navigate(
+              routePath({ id: RouteId.BillingAccount, billingAccountId }),
+              {
+                replace: true,
+              },
+            );
           }}
         >
           Accept invitation

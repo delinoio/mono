@@ -334,10 +334,12 @@ type CreditGrant struct {
 	// Unused credit of the grant. Between 0 and original_usd_micros.
 	RemainingUsdMicros int64 `protobuf:"varint,4,opt,name=remaining_usd_micros,json=remainingUsdMicros,proto3" json:"remaining_usd_micros,omitempty"`
 	// Paddle transaction of the purchase.
-	PaddleTransactionId string                 `protobuf:"bytes,5,opt,name=paddle_transaction_id,json=paddleTransactionId,proto3" json:"paddle_transaction_id,omitempty"`
-	CreateTime          *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=create_time,json=createTime,proto3" json:"create_time,omitempty"`
-	// 12 months after create_time. The unused rest leaves the balance as an
-	// EXPIRY ledger entry at this time.
+	PaddleTransactionId string `protobuf:"bytes,5,opt,name=paddle_transaction_id,json=paddleTransactionId,proto3" json:"paddle_transaction_id,omitempty"`
+	// Time the server first processed the webhook that created this grant.
+	CreateTime *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=create_time,json=createTime,proto3" json:"create_time,omitempty"`
+	// 12 UTC calendar months after payment capture, or after create_time if
+	// no unambiguous capture time is available. Unused credit is removed with
+	// an EXPIRY ledger entry.
 	ExpireTime    *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=expire_time,json=expireTime,proto3" json:"expire_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -153,7 +153,9 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 - `reason` is `NONE` for `ALLOWED`. Otherwise it is `NO_ACTIVE_SUBSCRIPTION` or `NON_POSITIVE_BALANCE`; when both apply, it is `NO_ACTIVE_SUBSCRIPTION`. `blocked_since` and `suspend_time` are unset for `ALLOWED`.
 - `BLOCKED` and `SUSPENDED` change back to `ALLOWED` when the balance is greater than zero and the subscription is `ACTIVE`.
 - `sequence` is greater than zero and increases with every change of any other status field for any organization of the service.
-- `ListBillingStatusChanges(service, after_sequence, page_size)` returns the current statuses whose `sequence` is greater than `after_sequence`, in `sequence` order, with at most one entry per organization (its latest status). `after_sequence` 0 returns every linked organization of the service; a negative value fails with `invalid_argument`. Only linked organizations appear: an unlink adds no entry. `next_sequence` is the highest returned `sequence`, or `after_sequence` when nothing is returned; fewer than `page_size` statuses mean that the caller is up to date.
+- `ListBillingStatusChanges(service, after_sequence, page_size)` returns a page of current statuses with `sequence` greater than `after_sequence`. Each page lists statuses in ascending `sequence` order, with at most one current status per linked organization. An unlink adds no entry. Set `after_sequence` to 0 to start a paginated traversal of the service's current links. A negative `after_sequence` fails with `invalid_argument`.
+- The effective page size is 50 when `page_size` is omitted or 0, the requested size for values from 1 through 200, and 200 for larger values. A negative `page_size` fails with `invalid_argument`.
+- `next_sequence` is the highest returned `sequence`. On an empty page, it equals the input `after_sequence`. Stop when the page contains fewer statuses than the effective page size. After a full page, make the next request with `after_sequence` set to `next_sequence`.
 - A caller keeps the status with the highest `sequence` and ignores a status whose `billing_account_id` differs from the link that it knows, which can arrive after an unlink.
 
 ### Links
@@ -182,7 +184,7 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 Ledger and credit messages:
 
 - `LedgerEntry` is append-only and kept for 7 years, also after the billing account is deleted. It carries `ledger_entry_id`, `billing_account_id`, `kind`, the signed `amount_usd_micros` (positive for credits; negative or zero for `USAGE`, `EXPIRY` and `REFUND`), `balance_after_usd_micros`, `create_time`, `paddle_transaction_id` (purchases and refunds) and `credit_grant_id` (the grant that a purchase created or that an `EXPIRY` or `REFUND` entry reduced). `USAGE` entries also carry `service`, `organization_id`, `meter`, `window_start` and `quantity`.
-- `CreditGrant` carries `credit_grant_id`, its `source` (`SUBSCRIPTION_CREDIT`, `MANUAL_TOP_UP` or `AUTO_TOP_UP`), `original_usd_micros`, `remaining_usd_micros`, `paddle_transaction_id`, `create_time` and `expire_time` (12 months after `create_time`).
+- `CreditGrant` carries `credit_grant_id`, its `source` (`SUBSCRIPTION_CREDIT`, `MANUAL_TOP_UP` or `AUTO_TOP_UP`), `original_usd_micros`, `remaining_usd_micros`, `paddle_transaction_id`, `create_time` and `expire_time`. The server sets `create_time` to the original webhook processing time and uses it for invoice dates and pagination. For a new grant, `expire_time` is 12 UTC calendar months after payment capture. If the payment has no unambiguous capture time, the server uses `create_time` as the basis. Existing grants keep their stored timestamps.
 - `Invoice` carries `paddle_transaction_id`, `kind`, `amount_usd_micros` (the credit amount, tax excluded) and `create_time`; `GetInvoiceUrl` returns the PDF link.
 
 ## Storage

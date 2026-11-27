@@ -150,9 +150,11 @@ func (f *fixture) grant(accountID string, kind LedgerKind, amount int64) string 
 		if err != nil {
 			return err
 		}
+		now := f.s.timestamp()
 		id, _, err = f.s.addGrant(ctx(), tx, acct, grantInput{
 			Kind: kind, Amount: amount, PaddleTransactionID: fmt.Sprintf("txn_test_%d", txnSeq.Add(1)),
-		}, f.s.timestamp())
+			ExpireTime: GrantExpireTime(now),
+		}, now)
 		return err
 	})
 	return id

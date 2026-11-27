@@ -597,20 +597,23 @@ export const DevSessionExecStartedSchema: GenMessage<DevSessionExecStarted> = /*
   messageDesc(file_delino_sandrun_v1_dev_session, 17);
 
 /**
- * The requested offsets are older than the kept output.
+ * Output is missing from one or both streams. Each offset gives the next byte
+ * position for resuming that stream. If a stream has missing bytes, its offset
+ * advances to the end of the missing range. A stream without missing bytes
+ * keeps its current offset.
  *
  * @generated from message delino.sandrun.v1.DevSessionExecOutputTruncated
  */
 export type DevSessionExecOutputTruncated = Message<"delino.sandrun.v1.DevSessionExecOutputTruncated"> & {
   /**
-   * First available stdout offset.
+   * Next byte offset for resuming stdout.
    *
    * @generated from field: int64 stdout_offset = 1;
    */
   stdoutOffset: bigint;
 
   /**
-   * First available stderr offset.
+   * Next byte offset for resuming stderr.
    *
    * @generated from field: int64 stderr_offset = 2;
    */
