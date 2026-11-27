@@ -1,0 +1,42 @@
+{
+  "gid": "inv-01-windows-fixture-env-precedence",
+  "commit": "89309733942c9a41edfdc62ada9790991fa4f7ed",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "89309733942c9a41edfdc62ada9790991fa4f7ed",
+    "setup": "Use PowerShell at the repository root. Run the first two commands, then copy the standalone probe source to its listed Windows path before running the remaining commands. Record the actual checkout SHA with the results.",
+    "commands": [
+      "git rev-parse HEAD",
+      "New-Item -ItemType Directory -Force .t3-tmp/validation | Out-Null",
+      "$fixtureTemp = (Resolve-Path .t3-tmp/validation).Path",
+      "$env:TEMP = $fixtureTemp; $env:TMP = $fixtureTemp; $env:GOTMPDIR = $fixtureTemp",
+      "go test -count=20 -v ./go/sandrun/sandruntest -run '^TestExecRequestPath$' 2>&1 | Tee-Object .t3-tmp/validation/windows-path-tests.log; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go test -count=1 ./go/sandrun/... 2>&1 | Tee-Object .t3-tmp/validation/windows-sandrun-tests.log; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go run .t3-tmp/validation/exec-path-probe.go 2>&1 | Tee-Object .t3-tmp/validation/windows-real-world.log; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "For this worker checkout, git rev-parse HEAD prints 89309733942c9a41edfdc62ada9790991fa4f7ed.",
+      "The focused test passes 20 runs and the SandRun Go suite passes. The focused test confirms that the local child keeps the request program as argv[0].",
+      "For every probe repetition, Path selects directory B and the child reports directory B as PATH. An empty Path reports PROGRAM_NOT_FOUND even with the tool in both the losing and inherited directories.",
+      "For every PATHEXT repetition, the .com image runs instead of the competing .exe. The child reports PATHEXT=.COM;.EXE, PATH points to B, and the bare argv[0] is preserved. All successful execs report exit 0.",
+      "The standalone probe also confirms lookup with a request PATH, inherited lookup when PATH is absent, failure for explicit empty PATH and explicit-path execution."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-windows-fixture-env-precedence/worker/.t3-tmp/validation/exec-path-probe.go",
+      "copyTo": ".t3-tmp/validation/exec-path-probe.go",
+      "regressionTest": "go/sandrun/sandruntest/devsession_test.go",
+      "outputLogs": [
+        ".t3-tmp/validation/windows-path-tests.log",
+        ".t3-tmp/validation/windows-sandrun-tests.log",
+        ".t3-tmp/validation/windows-real-world.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-windows-fixture-env-precedence/worker/.t3-tmp/validation/sandruntest.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-windows-fixture-env-precedence/worker/.t3-tmp/validation/exec-path-probe.exe"
+      ]
+    }
+  }
+}
