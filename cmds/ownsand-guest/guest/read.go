@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -34,10 +35,9 @@ const (
 // the kernel copy offload (copy_file_range) stays in use.
 const snapshotCopyChunk = 16 << 20
 
-// readCloseGrace is how long Close waits for in-flight snapshot workers. A
-// blocking stat or open of a stalled source cannot be cancelled, so the wait
-// is bounded; after it, the unique snapshot directory fences the worker (see
-// readManager.close). Tests shorten it.
+// readCloseGrace is how long Close waits for in-flight snapshot work.
+// Filesystem calls can outlive the wait, with snapshot paths fenced by the
+// unique directory (see readManager.close). Tests shorten it.
 var readCloseGrace = 2 * time.Second
 
 // errReadsClosed is the error of a snapshot that the shutdown of the helper
@@ -87,6 +87,14 @@ type readEntry struct {
 	lastEnd time.Time
 }
 
+// readRemoval reserves a snapshot path until removal succeeds or finds it
+// absent. Its state is guarded by readManager.mu.
+type readRemoval struct {
+	path   string
+	active bool
+	failed bool
+}
+
 // readManager keeps one private snapshot per read_id.
 type readManager struct {
 	mu sync.Mutex
@@ -96,16 +104,16 @@ type readManager struct {
 	dir     string
 	entries map[string]*readEntry
 	expired map[string]time.Time
-	// pending maps a read_id to the snapshot path whose removal failed. It is
-	// independent of expired. After the read entry is gone, each sweep retries
-	// the removal until it succeeds or the file is already gone. Guarded by mu.
-	pending   map[string]string
+	// pending tracks queued, active and failed removals independently of
+	// expired. After the read entry is gone, each sweep retries failed
+	// removals. Guarded by mu.
+	pending   map[string]*readRemoval
 	now       func() time.Time
 	retention time.Duration
 	logger    *slog.Logger
-	// closed is set by close and guarded by mu; once it is set, no worker
-	// creates a snapshot file and begin fails. stop is closed together with
-	// it and ends the copy of a running worker; wg counts the workers.
+	// closed fences new reads, creates, and publication under mu. Closing
+	// stop also ends running copies. wg counts preparation workers and
+	// removals started by admission or sweep.
 	closed bool
 	stop   chan struct{}
 	wg     sync.WaitGroup
@@ -119,8 +127,9 @@ type readManager struct {
 	// openSnapshot opens a snapshot file for reading chunks; nil means
 	// os.Open. Tests replace it to stall a chunk read.
 	openSnapshot func(path string) (snapshotFile, error)
-	// removeFile removes a snapshot file; nil means os.Remove. Tests replace
-	// it to fail a removal.
+	// Tests replace these filesystem calls to stall or fail snapshot I/O.
+	// Nil uses os.OpenFile or os.Remove.
+	createFile func(path string, flag int, perm os.FileMode) (*os.File, error)
 	removeFile func(path string) error
 }
 
@@ -156,7 +165,7 @@ func newReadManager(root string, now func() time.Time, logger *slog.Logger) (*re
 		dir:       dir,
 		entries:   map[string]*readEntry{},
 		expired:   map[string]time.Time{},
-		pending:   map[string]string{},
+		pending:   map[string]*readRemoval{},
 		now:       now,
 		retention: OperationRetention,
 		logger:    logger,
@@ -216,6 +225,10 @@ func (m *readManager) begin(readID, path string) (*readEntry, error) {
 	if _, gone := m.expired[readID]; gone {
 		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "read expired")
 	}
+	removal := m.pending[readID]
+	if removal != nil && removal.active {
+		return nil, errReadRemovalPending()
+	}
 	if e, ok := m.entries[readID]; ok {
 		if e.path != nativePath(path) {
 			return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS, "read_id is bound to another path")
@@ -225,11 +238,15 @@ func (m *readManager) begin(readID, path string) (*readEntry, error) {
 	}
 	// The new snapshot uses the same path as an earlier failed or expired
 	// snapshot. Settle its pending removal before reusing the path.
-	if path, ok := m.pending[readID]; ok {
-		m.removeSnapshot(readID, path)
-		if _, ok := m.pending[readID]; ok {
-			return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE,
-				"read: the earlier snapshot of this read_id could not be removed yet")
+	if removal != nil {
+		m.wg.Add(1)
+		m.removeSnapshot(readID, removal)
+		m.wg.Done()
+		if m.closed {
+			return nil, errReadsClosed()
+		}
+		if removal.failed {
+			return nil, errReadRemovalPending()
 		}
 	}
 	e := &readEntry{
@@ -245,20 +262,21 @@ func (m *readManager) begin(readID, path string) (*readEntry, error) {
 	return e, nil
 }
 
-// close ends the snapshot work of this manager. After it returns, begin
-// fails and no worker creates a snapshot file. It stops the copy of running
-// workers, which remove their partial output, and waits for them for at most
-// grace, so that the caller can release the state directory lock afterwards.
-// It reports whether every worker ended.
+func errReadRemovalPending() error {
+	return errorf(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE,
+		"read: the earlier snapshot of this read_id could not be removed yet")
+}
+
+// close fences read admission and snapshot publication. It waits for
+// snapshot work for at most grace, so that the caller can release the state
+// directory lock afterwards. It reports whether all snapshot work ended.
 //
-// Behavior when source I/O is still pending (decision): a blocking stat or
-// open of the source cannot be cancelled, so close does not wait for it
-// beyond grace. Such a worker is harmless to a replacement helper: it cannot
-// create a file after the closed flag was set, and its removals address its
-// own unique snapshot directory only. Its open handles can keep that old
-// directory on Windows until they close. A handler that waits for the
-// snapshot is released by its own cancellation, not by close. close is safe
-// to call more than once.
+// Filesystem calls can outlive close. A worker can finish a create reserved
+// before the fence and remove its partial file. These operations address
+// only the worker's unique snapshot directory. On Windows open handles can
+// keep that directory until they close. A waiting handler is released by its
+// own cancellation or the preparation result. close is safe to call more
+// than once.
 func (m *readManager) close(grace time.Duration) bool {
 	m.mu.Lock()
 	if !m.closed {
@@ -309,9 +327,9 @@ func (m *readManager) prepare(readID string, e *readEntry) {
 	defer m.wg.Done()
 	kind, size, created, err := m.makeSnapshot(e.path, e.snapshot)
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	defer close(e.ready)
-	if err == nil && m.entries[readID] != e {
+	if m.closed {
+		err = errReadsClosed()
+	} else if err == nil && m.entries[readID] != e {
 		// Defense in depth: sweep skips an entry whose snapshot is still
 		// being prepared, so no path forgets the entry before this point.
 		// Treat a snapshot with no entry as a preparation failure.
@@ -321,7 +339,12 @@ func (m *readManager) prepare(readID string, e *readEntry) {
 		// makeSnapshot has closed its handles. Only remove a file that it
 		// created, and track a failed removal before publishing the error.
 		if created {
-			m.removeSnapshot(readID, e.snapshot)
+			removal := &readRemoval{path: e.snapshot}
+			m.pending[readID] = removal
+			m.removeSnapshot(readID, removal)
+			if m.closed {
+				err = errReadsClosed()
+			}
 		}
 		e.err = err
 		// No call is left to receive the failure, and sweep keeps no
@@ -329,6 +352,8 @@ func (m *readManager) prepare(readID string, e *readEntry) {
 		if e.open == 0 && m.entries[readID] == e {
 			delete(m.entries, readID)
 		}
+		close(e.ready)
+		m.mu.Unlock()
 		m.logger.Info("read snapshot failed", "read_id", readID, "error", err.Error())
 		return
 	}
@@ -340,6 +365,8 @@ func (m *readManager) prepare(readID string, e *readEntry) {
 		// for a later call of the same read_id for the whole retention time.
 		e.lastEnd = m.now()
 	}
+	close(e.ready)
+	m.mu.Unlock()
 	m.logger.Info("read snapshot ready", "read_id", readID, "kind", kind.String(), "size_bytes", size)
 }
 
@@ -368,19 +395,29 @@ func (m *readManager) makeSnapshot(src, dst string) (kind SnapshotKind, size int
 	if inInfo, err := in.Stat(); err != nil || !inInfo.Mode().IsRegular() || !os.SameFile(before, inInfo) {
 		return 0, 0, false, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
-	// Check and create under mu, so that close cannot interleave: once close
-	// set the flag, no snapshot file is created.
+	// Reserve creation under mu. The registered worker owns dst and the
+	// wait group accounts for its I/O. Close can fence publication while
+	// the create is in progress.
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return 0, 0, false, errReadsClosed()
 	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	m.mu.Unlock()
+	create := m.createFile
+	if create == nil {
+		create = os.OpenFile
+	}
+	out, err := create(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return 0, 0, false, fsError("read snapshot", err)
 	}
 	defer out.Close()
+	select {
+	case <-m.stop:
+		return 0, 0, true, errReadsClosed()
+	default:
+	}
 	if !m.forceCopy && reflink(out, in) == nil {
 		st, err := out.Stat()
 		if err != nil {
@@ -391,8 +428,7 @@ func (m *readManager) makeSnapshot(src, dst string) (kind SnapshotKind, size int
 		}
 		return SnapshotKindReflink, st.Size(), true, nil
 	}
-	// Copy in steps, so that close ends the copy and prepare removes the
-	// partial output before the lock of the state directory is released.
+	// Check for close between copy steps. prepare removes partial output.
 	var n int64
 	for {
 		select {
@@ -441,28 +477,31 @@ func sourceUnchanged(before os.FileInfo, in *os.File, src string) bool {
 	return true
 }
 
-// removeSnapshot removes the snapshot file of readID. The caller holds m.mu.
-// A failure keeps the path in m.pending, so that a later sweep retries it;
-// success or an already absent file clears it. The warning is logged once per
-// pending removal, so retries of a persistent failure do not repeat it.
-func (m *readManager) removeSnapshot(readID, snapshot string) {
+// removeSnapshot starts an idle pending removal. The caller holds m.mu on
+// entry and return and accounts for the work in m.wg. Keep the path reserved
+// while the mutex is unlocked for I/O.
+func (m *readManager) removeSnapshot(readID string, removal *readRemoval) {
+	retry := removal.failed
+	removal.active = true
+	m.mu.Unlock()
 	remove := m.removeFile
 	if remove == nil {
 		remove = os.Remove
 	}
-	_, retry := m.pending[readID]
-	err := remove(snapshot)
-	if err == nil || errors.Is(err, os.ErrNotExist) {
-		delete(m.pending, readID)
-		if retry {
-			m.logger.Info("read snapshot removed after retry", "read_id", readID)
-		}
-		return
+	err := remove(removal.path)
+	removed := err == nil || errors.Is(err, os.ErrNotExist)
+	if removed && retry {
+		m.logger.Info("read snapshot removed after retry", "read_id", readID)
 	}
-	m.pending[readID] = snapshot
-	if !retry {
+	if !removed && !retry {
 		// The error is reduced to its reason: the helper never logs paths.
 		m.logger.Warn("remove read snapshot failed", "read_id", readID, "error", sanitizedError(err))
+	}
+	m.mu.Lock()
+	removal.active = false
+	removal.failed = !removed
+	if removed {
+		delete(m.pending, readID)
 	}
 }
 
@@ -471,13 +510,14 @@ func (m *readManager) removeSnapshot(readID, snapshot string) {
 // expired IDs after ExpiredMemory. It never deletes an entry whose snapshot is
 // still being prepared: the worker has not created the snapshot file yet or
 // still writes it, so deleting the entry would leave a file that nothing
-// tracks. A preparation always ends, so the entry is swept after that.
+// tracks.
 func (m *readManager) sweep(now time.Time) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return
 	}
+	var expired []string
 	for id, e := range m.entries {
 		if e.open > 0 || now.Sub(e.lastEnd) < m.retention {
 			continue
@@ -488,22 +528,35 @@ func (m *readManager) sweep(now time.Time) {
 			continue
 		}
 		delete(m.entries, id)
-		m.removeSnapshot(id, e.snapshot)
+		m.pending[id] = &readRemoval{path: e.snapshot}
 		m.expired[id] = now
-		m.logger.Info("read expired", "read_id", id)
-	}
-	// Retry removals that failed during expiry or preparation. Wait for the
-	// last caller of a failed read to release its entry before retrying.
-	for id, path := range m.pending {
-		if _, live := m.entries[id]; live {
-			continue
-		}
-		m.removeSnapshot(id, path)
+		expired = append(expired, id)
 	}
 	for id, at := range m.expired {
 		if now.Sub(at) >= ExpiredMemory {
 			delete(m.expired, id)
 		}
+	}
+	removals := maps.Clone(m.pending)
+	m.mu.Unlock()
+	for _, id := range expired {
+		m.logger.Info("read expired", "read_id", id)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Recheck each reservation after unlocking. A reader or another sweep
+	// can have removed it, and a failed read can still have callers.
+	for id, removal := range removals {
+		if m.closed {
+			return
+		}
+		if m.pending[id] != removal || removal.active || m.entries[id] != nil {
+			continue
+		}
+		m.wg.Add(1)
+		m.removeSnapshot(id, removal)
+		m.wg.Done()
 	}
 }
 
