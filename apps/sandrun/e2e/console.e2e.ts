@@ -886,6 +886,33 @@ describe("integrations", () => {
     ).toBeVisible();
   });
 
+  test("moves the running GitHub job into request history after removing the OwnSand link", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}`);
+    await expect(
+      screen.getByText("1 request is starting or running."),
+    ).toBeVisible();
+
+    await screen.getByRole("link", "Integrations", { exact: true }).tap();
+    await screen.getByRole("button", "Remove link").tap();
+    const confirm = screen.getByRole("alertdialog", "Remove the OwnSand link?");
+    await confirm.getByRole("button", "Remove link").tap();
+    await expect(screen.getByRole("button", "Link OwnSand")).toBeVisible();
+
+    await screen.getByRole("link", "Requests", { exact: true }).tap();
+    await expect(screen.getByText("No requests match")).toBeVisible();
+    await screen.getByRole("checkbox", "Show ended requests").tap();
+    const job = screen
+      .getByRole("row")
+      .filter({ hasText: "acme-robotics/firmware · build (ubuntu)" });
+    await expect(job.getByRole("cell", "Failed")).toBeVisible();
+    await expect(job.getByRole("cell", "Integration removed")).toBeVisible();
+  });
+
   test("the GitHub callback links the installation and removes code and state", async ({
     app,
     screen,
