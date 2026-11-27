@@ -168,6 +168,7 @@ func run() error {
 		Objects:               objects,
 		SnapshotPartSizeBytes: cfg.SnapshotPartSizeBytes,
 		UsageClient:           usageClient,
+		WriteOwnerUnlinks:     cfg.Accounts.WriteOwnerUnlinks,
 		// The metrics are recorded whether or not the internal listener
 		// runs.
 		Metrics: tel.MeterProvider,

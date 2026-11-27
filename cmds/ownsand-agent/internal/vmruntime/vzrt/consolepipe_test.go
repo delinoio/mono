@@ -27,12 +27,14 @@ func TestDrainConsoleKeepsTheCapAndNeverBlocksTheProducer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	t.Cleanup(func() { _ = w.Close() })
 	r, pw, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	drained := make(chan struct{})
+	producerDone := make(chan struct{})
+	t.Cleanup(func() { cleanupConsolePipe(t, r, pw, producerDone, drained) })
 	go func() {
 		drainConsole(r, w)
 		close(drained)
@@ -41,6 +43,7 @@ func TestDrainConsoleKeepsTheCapAndNeverBlocksTheProducer(t *testing.T) {
 	want := make([]byte, 0, 1<<20)
 	written := make(chan error, 1)
 	go func() {
+		defer close(producerDone)
 		defer pw.Close()
 		chunk := make([]byte, 4096)
 		for i := 0; i < (1<<20)/len(chunk); i++ {
@@ -78,6 +81,30 @@ func TestDrainConsoleKeepsTheCapAndNeverBlocksTheProducer(t *testing.T) {
 	// drainConsole closed the read end.
 	if _, err := r.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("read after drainConsole = %v, want os.ErrClosed", err)
+	}
+}
+
+func cleanupConsolePipe(t *testing.T, r, w *os.File, producerDone, drained <-chan struct{}) {
+	t.Helper()
+	// Close both ends before waiting so a blocked read or write can return.
+	for _, end := range []*os.File{r, w} {
+		if err := end.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			t.Errorf("close console pipe %s: %v", end.Name(), err)
+		}
+	}
+
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	for producerDone != nil || drained != nil {
+		select {
+		case <-producerDone:
+			producerDone = nil
+		case <-drained:
+			drained = nil
+		case <-timer.C:
+			t.Errorf("console pipe cleanup timed out (producer pending: %t, drain pending: %t)", producerDone != nil, drained != nil)
+			return
+		}
 	}
 }
 

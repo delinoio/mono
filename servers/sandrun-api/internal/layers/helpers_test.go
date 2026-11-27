@@ -4,11 +4,15 @@ package layers_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
@@ -58,49 +62,92 @@ func countAudit(t *testing.T, env *testenv.Env, orgID string, action sandrunv1.A
 	return n
 }
 
-// holdTx runs sql in a transaction that stays open until the returned
-// function commits it, so a test can make an RPC wait on its row locks.
-func holdTx(t *testing.T, env *testenv.Env, sql string, args ...any) (commit func()) {
+const lockWaitTimeout = 10 * time.Second
+
+type heldTx struct {
+	pid    int32
+	commit func()
+}
+
+// holdTx runs sql and holds its locks until commit or test cleanup.
+func holdTx(t *testing.T, env *testenv.Env, sql string, args ...any) heldTx {
 	t.Helper()
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(t.Context(), lockWaitTimeout)
+	defer cancel()
 	tx, err := env.DB.Pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, sql, args...); err != nil {
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), lockWaitTimeout)
+		defer cancel()
 		_ = tx.Rollback(ctx)
+	})
+	if _, err := tx.Exec(ctx, sql, args...); err != nil {
 		t.Fatal(err)
 	}
-	done := false
-	t.Cleanup(func() {
-		if !done {
-			_ = tx.Rollback(ctx)
-		}
-	})
-	return func() {
-		t.Helper()
-		done = true
-		if err := tx.Commit(ctx); err != nil {
-			t.Fatal(err)
-		}
+	return heldTx{
+		pid: int32(tx.Conn().PgConn().PID()),
+		commit: func() {
+			t.Helper()
+			ctx, cancel := context.WithTimeout(t.Context(), lockWaitTimeout)
+			defer cancel()
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+		},
 	}
 }
 
-// waitForLockWaiter waits until a session of the test database waits on a
-// lock.
-func waitForLockWaiter(t *testing.T, env *testenv.Env) {
+type lockWait struct {
+	blockerPID int32
+	waiterPID  int32
+	query      string
+	// A second row-lock waiter can queue behind the first waiter.
+	earlierWaiterPID int32
+}
+
+func waitForLockWaiter(t *testing.T, env *testenv.Env, wait lockWait) int32 {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		var n int
-		if err := env.DB.Pool.QueryRow(context.Background(),
-			"SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'").Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		if n > 0 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), lockWaitTimeout)
+	defer cancel()
+	pid, err := observeLockWaiter(ctx, env.DB.Pool, wait)
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Fatal("no session waits on a lock")
+	return pid
+}
+
+// observeLockWaiter matches the fixture holder and the expected waiter.
+// The same context bounds pool acquisition, query execution, and polling.
+func observeLockWaiter(ctx context.Context, pool *pgxpool.Pool, wait lockWait) (int32, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var pid int32
+		err := pool.QueryRow(ctx, `
+			SELECT pid FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			  AND ($2::int = 0 OR pid = $2)
+			  AND strpos(query, $3) > 0
+			  AND pid <> $4
+			  AND pg_blocking_pids(pid) && ARRAY[$1::int, NULLIF($4::int, 0)]
+			LIMIT 1`, wait.blockerPID, wait.waiterPID, wait.query, wait.earlierWaiterPID).Scan(&pid)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+		if err == nil {
+			return pid, nil
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			select {
+			case <-ticker.C:
+				continue
+			case <-ctx.Done():
+				err = ctx.Err()
+			}
+		}
+		return 0, fmt.Errorf("wait for PostgreSQL lock held by PID %d (waiter PID %d, SQL fragment %q, earlier waiter PID %d): %w",
+			wait.blockerPID, wait.waiterPID, wait.query, wait.earlierWaiterPID, err)
+	}
 }

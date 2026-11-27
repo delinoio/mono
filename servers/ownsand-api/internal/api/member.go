@@ -28,40 +28,49 @@ var _ ownsandv1connect.MemberServiceHandler = MemberHandler{}
 const invitationColumns = `invitation_id::text, organization_id::text, role, secret_prefix, created_by_kind, created_by_id,
 	create_time, expire_time, accept_time, revoke_time`
 
-// scanInvitation decodes an invitation row and derives its state from the
-// current clock.
-func (s *Service) scanInvitation(row pgx.Row) (*ownsandv1.Invitation, error) {
-	return s.scanInvitationAt(row, s.now())
+type invitationRow struct {
+	invitation        ownsandv1.Invitation
+	expires           time.Time
+	accepted, revoked *time.Time
 }
 
-// scanInvitationAt decodes an invitation row and derives its state as of now.
-// A caller that selects rows with a time predicate passes the cutoff of that
-// predicate, so that the state of a selected row cannot disagree with the
-// selection when the clock moves between the query and the decode.
-func (s *Service) scanInvitationAt(row pgx.Row, now time.Time) (*ownsandv1.Invitation, error) {
-	var inv ownsandv1.Invitation
+func scanInvitation(row pgx.Row) (*invitationRow, error) {
+	var decoded invitationRow
+	inv := &decoded.invitation
 	var role, kind int16
 	var createdBy string
-	var created, expires time.Time
-	var accepted, revoked *time.Time
-	if err := row.Scan(&inv.InvitationId, &inv.OrganizationId, &role, &inv.SecretPrefix, &kind, &createdBy, &created, &expires, &accepted, &revoked); err != nil {
+	var created time.Time
+	if err := row.Scan(&inv.InvitationId, &inv.OrganizationId, &role, &inv.SecretPrefix, &kind, &createdBy, &created, &decoded.expires, &decoded.accepted, &decoded.revoked); err != nil {
 		return nil, err
 	}
 	inv.Role = ownsandv1.Role(role)
 	inv.CreatedBy = principalProto(kind, createdBy)
 	inv.CreateTime = ts(created)
-	inv.ExpireTime = ts(expires)
+	inv.ExpireTime = ts(decoded.expires)
+	return &decoded, nil
+}
+
+func (r *invitationRow) at(now time.Time) *ownsandv1.Invitation {
+	inv := &r.invitation
 	switch {
-	case accepted != nil:
+	case r.accepted != nil:
 		inv.State = ownsandv1.InvitationState_INVITATION_STATE_ACCEPTED
-	case revoked != nil:
+	case r.revoked != nil:
 		inv.State = ownsandv1.InvitationState_INVITATION_STATE_REVOKED
-	case !now.Before(expires):
+	case !now.Before(r.expires):
 		inv.State = ownsandv1.InvitationState_INVITATION_STATE_EXPIRED
 	default:
 		inv.State = ownsandv1.InvitationState_INVITATION_STATE_PENDING
 	}
-	return &inv, nil
+	return inv
+}
+
+func scanInvitationAt(row pgx.Row, now time.Time) (*ownsandv1.Invitation, error) {
+	inv, err := scanInvitation(row)
+	if err != nil {
+		return nil, err
+	}
+	return inv.at(now), nil
 }
 
 func (h MemberHandler) CreateInvitation(ctx context.Context, req *connect.Request[ownsandv1.CreateInvitationRequest]) (*connect.Response[ownsandv1.CreateInvitationResponse], error) {
@@ -94,7 +103,7 @@ func (h MemberHandler) CreateInvitation(ctx context.Context, req *connect.Reques
 		row := tx.QueryRow(ctx, `INSERT INTO invitations (invitation_id, organization_id, role, secret_sha256, secret_prefix, created_by_kind, created_by_id, create_time, expire_time)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING `+invitationColumns,
 			id, orgID, int16(role), secret.Hash, secret.DisplayPrefix, int16(p.Kind), p.ID, now, now.Add(invitationLifetime))
-		inv, err := h.scanInvitation(row)
+		inv, err := scanInvitationAt(row, h.now())
 		if err != nil {
 			return err
 		}
@@ -138,7 +147,7 @@ func (h MemberHandler) ListInvitations(ctx context.Context, req *connect.Request
 	defer rows.Close()
 	resp := &ownsandv1.ListInvitationsResponse{}
 	for rows.Next() {
-		inv, err := h.scanInvitationAt(rows, cutoff)
+		inv, err := scanInvitationAt(rows, cutoff)
 		if err != nil {
 			return nil, h.internal(ctx, "list invitations", err)
 		}
@@ -171,17 +180,19 @@ func (h MemberHandler) RevokeInvitation(ctx context.Context, req *connect.Reques
 		if err != nil {
 			return err
 		}
-		inv, err := h.scanInvitation(tx.QueryRow(ctx, "SELECT "+invitationColumns+" FROM invitations WHERE organization_id = $1 AND invitation_id = $2 FOR UPDATE", orgID, invID))
+		locked, err := scanInvitation(tx.QueryRow(ctx, "SELECT "+invitationColumns+" FROM invitations WHERE organization_id = $1 AND invitation_id = $2 FOR UPDATE", orgID, invID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return errNotFound("invitation")
 		}
 		if err != nil {
 			return err
 		}
-		if inv.GetState() != ownsandv1.InvitationState_INVITATION_STATE_PENDING {
+		// Scan can wait for the locked row even after QueryRow returns.
+		now := h.now()
+		if locked.at(now).GetState() != ownsandv1.InvitationState_INVITATION_STATE_PENDING {
 			return errPrecondition("only a pending invitation can be revoked")
 		}
-		inv, err = h.scanInvitation(tx.QueryRow(ctx, "UPDATE invitations SET revoke_time = $3 WHERE organization_id = $1 AND invitation_id = $2 RETURNING "+invitationColumns, orgID, invID, h.now()))
+		inv, err := scanInvitationAt(tx.QueryRow(ctx, "UPDATE invitations SET revoke_time = $3 WHERE organization_id = $1 AND invitation_id = $2 RETURNING "+invitationColumns, orgID, invID, now), now)
 		if err != nil {
 			return err
 		}

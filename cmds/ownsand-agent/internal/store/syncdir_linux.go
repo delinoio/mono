@@ -12,10 +12,13 @@ import (
 	"syscall"
 )
 
-// SyncPendingIdentityDirectories flushes the directory entries that make an
-// existing pending key reachable. An earlier process may have created any
-// of the ancestors and exited before flushing them, so start at the resolved
-// state directory and flush each parent up to and including the root.
+// syncDir lets tests record or fail directory flushes.
+var syncDir = syncDirectory
+
+// SyncPendingIdentityDirectories flushes the directory entries that make the
+// pending key reachable. Any ancestor may be visible before an earlier opener
+// flushes it, so start at the resolved state directory and flush each parent
+// up to and including the root.
 func (s *Store) SyncPendingIdentityDirectories() error {
 	dir, err := filepath.Abs(s.dir)
 	if err == nil {
@@ -34,6 +37,14 @@ func (s *Store) SyncPendingIdentityDirectories() error {
 		}
 		dir = parent
 	}
+}
+
+func (s *Store) syncSandboxCleanupDirectory() error {
+	dir := s.Path(SandboxesDir)
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("store: sync directory %s: %w", dir, err)
+	}
+	return nil
 }
 
 // syncDirectory flushes the entries of a directory (a file created, renamed

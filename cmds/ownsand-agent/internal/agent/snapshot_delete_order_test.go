@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,6 +66,180 @@ func waitForPauseEntry(cp *testcp.Server, entered <-chan struct{}, pauseID strin
 		default:
 			return fmt.Errorf("pause command returned before runtime entry: %v", res)
 		}
+	}
+}
+
+type snapshotDeleteLogGate struct {
+	slog.Handler
+	isDelete bool
+	entered  chan struct{}
+	release  chan struct{}
+}
+
+func (g snapshotDeleteLogGate) WithAttrs(attrs []slog.Attr) slog.Handler {
+	g.Handler = g.Handler.WithAttrs(attrs)
+	for _, attr := range attrs {
+		if attr.Key == "command" {
+			g.isDelete = attr.Value.String() == "delete_snapshot"
+		}
+	}
+	return g
+}
+
+func (g snapshotDeleteLogGate) Handle(ctx context.Context, record slog.Record) error {
+	if g.isDelete && record.Message == "command received" {
+		g.entered <- struct{}{}
+		<-g.release
+	}
+	return g.Handler.Handle(ctx, record)
+}
+
+func waitForSnapshotGate(t *testing.T, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("command did not reach the gate")
+	}
+}
+
+func TestCreateReceivedAfterDeleteIsNotCanceledOnSameChannel(t *testing.T) {
+	for _, afterPublish := range []bool{false, true} {
+		name := "before_capture"
+		if afterPublish {
+			name = "after_publication"
+		}
+		t.Run(name, func(t *testing.T) {
+			cp := testcp.New(t)
+			st, id := enrollDevice(t, cp)
+			rt := &gatedPauseRuntime{entered: make(chan struct{}), release: make(chan struct{})}
+			gate := snapshotDeleteLogGate{entered: make(chan struct{}, 1), release: make(chan struct{})}
+			releaseDelete := sync.OnceFunc(func() { close(gate.release) })
+			releasePause := sync.OnceFunc(func() { close(rt.release) })
+			h := startWith(t, cp, st, id, func(o *Options) {
+				rt.Runtime = o.Runtime
+				o.Runtime = rt
+				gate.Handler = o.Logger.Handler()
+				o.Logger = slog.New(gate)
+			})
+			defer releaseDelete()
+			defer releasePause()
+			h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+			cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
+			sandboxID, _ := uuidv7.NewString()
+			if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+				t.Fatalf("create sandbox: %v", res)
+			}
+			channels := cp.Channels()
+
+			var pauseID string
+			if !afterPublish {
+				pauseID = h.sendCommand(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_PauseSandbox{PauseSandbox: &ownsandv1.PauseSandboxCommand{SandboxId: sandboxID}}})
+				waitForSnapshotGate(t, rt.entered)
+			}
+			snapID, _ := uuidv7.NewString()
+			deleteID := h.sendCommand(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSnapshot{DeleteSnapshot: &ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}}})
+			waitForSnapshotGate(t, gate.entered)
+			createID := h.sendCommand(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}})
+			if !afterPublish {
+				// The export response confirms receipt of the preceding create
+				// while the pause still holds the sandbox lock.
+				res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{SnapshotId: snapID}}})
+				if res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
+					t.Fatalf("export before capture: %v, want NOT_FOUND", res)
+				}
+				releaseDelete()
+				if res := h.result(deleteID); res.GetError() != nil {
+					t.Fatalf("delete before capture: %v", res)
+				}
+				releasePause()
+				if res := h.result(pauseID); res.GetError() != nil {
+					t.Fatalf("pause: %v", res)
+				}
+			}
+			if res := h.result(createID); res.GetCreateSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+				t.Fatalf("create received after delete: %v, want READY", res)
+			}
+			if afterPublish {
+				releaseDelete()
+				if res := h.result(deleteID); res.GetError() != nil {
+					t.Fatalf("delete after publication: %v", res)
+				}
+			}
+			if n := rt.snapshots.Load(); n != 1 {
+				t.Errorf("runtime captures = %d, want 1", n)
+			}
+			report := h.agent.Sandboxes.StateReport(2, nil)
+			snapshots := report.GetSnapshots()
+			if len(snapshots) != 1 || snapshots[0].GetSnapshotId() != snapID || snapshots[0].GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+				t.Errorf("state report snapshots = %v, want %s READY", snapshots, snapID)
+			}
+			dir, err := st.SnapshotDir(snapID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "record.json")); err != nil {
+				t.Errorf("published snapshot record: %v", err)
+			}
+			if got := cp.Channels(); got != channels {
+				t.Errorf("channels = %d, want %d: the agent reconnected", got, channels)
+			}
+		})
+	}
+}
+
+func TestDeleteSnapshotReceiptKeepsChannelResponsiveDuringCleanup(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	gate := snapshotDeleteLogGate{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	releaseDelete := sync.OnceFunc(func() { close(gate.release) })
+	h := startWith(t, cp, st, id, func(o *Options) {
+		gate.Handler = o.Logger.Handler()
+		o.Logger = slog.New(gate)
+	})
+	defer releaseDelete()
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
+	sandboxID, _ := uuidv7.NewString()
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatalf("create sandbox: %v", res)
+	}
+	snapID, _ := uuidv7.NewString()
+	if res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}}); res.GetError() != nil {
+		t.Fatalf("create snapshot: %v", res)
+	}
+
+	removing := make(chan struct{})
+	removed := make(chan struct{})
+	releaseCleanup := sync.OnceFunc(func() { close(removed) })
+	defer releaseCleanup()
+	h.agent.Sandboxes.SetSnapshotRemovalHookForTest(func(string) error {
+		close(removing)
+		<-removed
+		return nil
+	})
+	channels := cp.Channels()
+	deleteID := h.sendCommand(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSnapshot{DeleteSnapshot: &ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}}})
+	waitForSnapshotGate(t, gate.entered)
+	if _, release, ok := h.agent.Sandboxes.AcquireSnapshot(snapID); ok {
+		release()
+		t.Error("snapshot still accepts readers after delete receipt")
+	}
+	releaseDelete()
+	waitForSnapshotGate(t, removing)
+	res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{SnapshotId: snapID}}})
+	if res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
+		t.Fatalf("export during cleanup: %v, want NOT_FOUND", res)
+	}
+	releaseCleanup()
+	if res := h.result(deleteID); res.GetError() != nil {
+		t.Fatalf("delete: %v", res)
+	}
+	if h.agent.Sandboxes.HasSnapshot(snapID) {
+		t.Error("snapshot is known to the manager after cleanup")
+	}
+	if got := cp.Channels(); got != channels {
+		t.Errorf("channels = %d, want %d: the agent reconnected", got, channels)
 	}
 }
 
@@ -256,7 +431,6 @@ func TestDeleteSnapshotAfterStagingWithFailedCleanup(t *testing.T) {
 				h.stop()
 				select {
 				case err := <-h.errc:
-					h.errc <- err // The harness cleanup still waits for this result.
 					if err != nil && !errors.Is(err, context.Canceled) {
 						t.Fatalf("agent stopped with an error: %v", err)
 					}

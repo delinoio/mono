@@ -176,7 +176,8 @@ func (s *Service) endSandboxTx(ctx context.Context, tx pgx.Tx, r *sandboxRow, st
 		return nil
 	}
 	now := s.now()
-	if _, err := tx.Exec(ctx, `UPDATE sandboxes SET agent_state = $2, end_reason = $3, end_time = $4, delete_pending = false WHERE sandbox_id = $1`,
+	if _, err := tx.Exec(ctx, `UPDATE sandboxes SET agent_state = $2, end_reason = $3, end_time = $4, delete_pending = false,
+		billing_resume_command_id = NULL WHERE sandbox_id = $1`,
 		r.ID, int16(state), int16(reason), now); err != nil {
 		return err
 	}

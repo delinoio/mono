@@ -50,11 +50,11 @@ cleanup() {
         continue
       fi
       if [ -e "$stage/previous/$name" ] || [ -L "$stage/previous/$name" ]; then
-        if ! mv -f -- "$stage/previous/$name" "$out_dir/" 9>&-; then
+        if ! mv -f -- "$stage/previous/$name" "$out_dir/"; then
           echo "could not restore $out_dir/$name" >&2
           keep_stage=true
         fi
-      elif ! rm -f -- "$out_dir/$name" 9>&-; then
+      elif ! rm -f -- "$out_dir/$name"; then
         keep_stage=true
       fi
     done
@@ -110,7 +110,8 @@ if [ -L "$publish_lock" ] || { [ -e "$publish_lock" ] && [ ! -f "$publish_lock" 
 fi
 
 # The helper locks the same open file description that Bash retains on fd 9.
-# Close it in publication children so an orphan cannot keep the lock held.
+# Destination renames and removals inherit it so they stay locked if Bash exits
+# while they run. Backup copies and staging cleanup close it.
 exec 9<>"$publish_lock"
 "$stage/publish-lock" "$publish_lock" <&9 9>&-
 
@@ -131,7 +132,7 @@ done
 publishing=true
 for name in "${outputs[@]}"; do
   # Let mv append the basename, so a directory at the final filename fails.
-  mv -f -- "$stage/out/$name" "$out_dir/" 9>&-
+  mv -f -- "$stage/out/$name" "$out_dir/"
 done
 publishing=false
 echo "wrote $out_dir/vmlinux, $out_dir/vmlinux.config and $out_dir/rootfs.ext4"

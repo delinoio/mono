@@ -131,6 +131,11 @@ func waitState(t *testing.T, what string, pid int, want ...string) {
 // returns the process IDs of the shell and of the sleep process.
 func startWorker(t *testing.T, v vmruntime.VM) (shell, sleeper int) {
 	t.Helper()
+	return startWorkerCommand(t, v, "sleep 300 & echo $! $$; wait")
+}
+
+func startWorkerCommand(t *testing.T, v vmruntime.VM, script string) (shell, child int) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	client := guestclient.New(v.Dial)
@@ -145,7 +150,7 @@ func startWorker(t *testing.T, v vmruntime.VM) (shell, sleeper int) {
 		OrganizationId: "0192f4b6-7c3a-7def-8abc-0123456789ab",
 		SandboxId:      v.SandboxID(),
 		ExecId:         execID,
-		Command:        []string{"sh", "-c", "sleep 300 & echo $! $$; wait"},
+		Command:        []string{"sh", "-c", script},
 		BindingSalt:    make([]byte, 32),
 	}
 	if err := s.Send(&ownsandv1.ServeRequest{Frame: datapath.MustNewFrame(1, v.SandboxID(), req)}); err != nil {
@@ -163,7 +168,7 @@ func startWorker(t *testing.T, v vmruntime.VM) (shell, sleeper int) {
 		}
 		out.Write(ev.GetStdout().GetData())
 		if fields := strings.Fields(out.String()); len(fields) == 2 && strings.HasSuffix(out.String(), "\n") {
-			sleeper, err = strconv.Atoi(fields[0])
+			child, err = strconv.Atoi(fields[0])
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -171,7 +176,7 @@ func startWorker(t *testing.T, v vmruntime.VM) (shell, sleeper int) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			return shell, sleeper
+			return shell, child
 		}
 	}
 }
@@ -616,8 +621,8 @@ func TestHelperStoppedObservesRealHelper(t *testing.T) {
 		"ps": func() (bool, error) { return psStopped(context.Background(), pid) },
 	}
 	if runtime.GOOS == "linux" {
-		readers["proc"] = func() (bool, error) { return procThreadsStopped(pid) }
-		readers["helperStopped"] = func() (bool, error) { return helperStopped(context.Background(), pid) }
+		readers["proc"] = func() (bool, error) { return procThreadsStopped(context.Background(), pid) }
+		readers["processStopped"] = func() (bool, error) { return processStopped(context.Background(), pid) }
 	}
 	wait := func(name string, want bool, read func() (bool, error)) {
 		t.Helper()
@@ -673,7 +678,7 @@ func countingObserver(falseCalls int, onFalse func(call int)) (func(context.Cont
 			}
 			return false, nil
 		}
-		return helperStopped(ctx, pid)
+		return processStopped(ctx, pid)
 	}
 	return observe, func() int { return int(calls.Load()) }
 }
@@ -1116,7 +1121,7 @@ func TestDeleteRetryAfterListingFailure(t *testing.T) {
 			return false, err
 		}
 		defer os.Setenv("PATH", emptyPath)
-		return helperStopped(ctx, pid)
+		return processStopped(ctx, pid)
 	}, 0)
 	if err := os.Setenv("PATH", emptyPath); err != nil {
 		t.Fatal(err)

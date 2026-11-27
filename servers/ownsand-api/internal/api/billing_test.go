@@ -47,6 +47,7 @@ func billingEnvWith(t *testing.T, extra ...testenv.Option) (*testenv.Env, *accou
 	var env *testenv.Env
 	fake := accountstest.New(t, func() time.Time { return env.Clock.Now() })
 	opts := append([]testenv.Option{testenv.WithAccounts(fake), func(o *app.Options) {
+		o.WriteOwnerUnlinks = true
 		o.BillingStatusTiming = &billing.StatusTiming{Poll: time.Hour, Tick: time.Hour, UnlinkBackoffMin: time.Second, UnlinkBackoffMax: 5 * time.Minute}
 		o.BillingEnforceInterval = time.Hour
 		// No usage report in the background: its statuses would refresh the
@@ -426,8 +427,14 @@ func TestBillingPhasesOfLinkedOrganization(t *testing.T) {
 	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 	enforceBilling(t, env)
 	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
-	if !strings.Contains(env.Logs.String(), `"msg":"billing_sandbox_paused"`) {
+	const pauseEvent = `"msg":"billing_sandbox_paused"`
+	if countLogs(env, pauseEvent) == 0 {
 		t.Fatal("billing_sandbox_paused not logged")
+	}
+	for line := range strings.SplitSeq(env.Logs.String(), "\n") {
+		if strings.Contains(line, pauseEvent) && !strings.Contains(line, `"state":"SANDBOX_STATE_PAUSED"`) {
+			t.Errorf("billing pause event must show PAUSED: %s", line)
+		}
 	}
 
 	// Recovery: only the sandbox that billing paused resumes.
@@ -1019,7 +1026,11 @@ func newLinkAttemptFixture(t *testing.T, owner string, opts ...testenv.Option) *
 }
 
 func (f *linkAttemptFixture) link(c *testenv.Clients, account string) error {
-	_, err := c.Billing.LinkBillingAccount(context.Background(), connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: f.org.ID, BillingAccountId: account}))
+	return f.linkWithContext(context.Background(), c, account)
+}
+
+func (f *linkAttemptFixture) linkWithContext(ctx context.Context, c *testenv.Clients, account string) error {
+	_, err := c.Billing.LinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: f.org.ID, BillingAccountId: account}))
 	return err
 }
 
@@ -1349,9 +1360,10 @@ func TestBillingLinkStaleCompletionDoesNothing(t *testing.T) {
 	f := newLinkAttemptFixture(t, "rosa")
 	ctx := context.Background()
 	gate := f.fake.Hold(accountstest.MethodLinkOrganization)
+	t.Cleanup(gate.Release)
 	done := make(chan error, 1)
 	go func() { done <- f.link(f.org.OwnerClient, billingAccountA) }()
-	<-gate.Entered
+	gate.WaitForEntry(t, done)
 	f.wantRows(t, 1, 1)
 
 	// While the call runs, other link operations wait for it.
@@ -1375,7 +1387,7 @@ func TestBillingLinkStaleCompletionDoesNothing(t *testing.T) {
 
 	// The old call lands and its completion records nothing.
 	gate.Release()
-	if err := <-done; testenv.Code(err) != connect.CodeAborted {
+	if err := gate.WaitForResult(t, done); testenv.Code(err) != connect.CodeAborted {
 		t.Fatalf("stale completion: %v, want aborted", err)
 	}
 	f.wantLocalLink(t, false)
@@ -1418,9 +1430,10 @@ func TestBillingTakeoverGuardBlocksOwnerRequests(t *testing.T) {
 	f := newLinkAttemptFixture(t, "tess")
 	ctx := context.Background()
 	gate := f.fake.Hold(accountstest.MethodLinkOrganization)
+	t.Cleanup(gate.Release)
 	done := make(chan error, 1)
 	go func() { done <- f.link(f.org.OwnerClient, billingAccountA) }()
-	<-gate.Entered
+	gate.WaitForEntry(t, done)
 	if _, err := f.org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: f.org.ID, UserId: f.org.Admin})); err != nil {
 		t.Fatal(err)
 	}
@@ -1451,7 +1464,7 @@ func TestBillingTakeoverGuardBlocksOwnerRequests(t *testing.T) {
 
 	// The old call lands; its completion cannot record the link.
 	gate.Release()
-	if err := <-done; testenv.Code(err) != connect.CodeAborted {
+	if err := gate.WaitForResult(t, done); testenv.Code(err) != connect.CodeAborted {
 		t.Fatalf("old completion: %v, want aborted", err)
 	}
 	f.wantLocalLink(t, false)
@@ -1498,7 +1511,7 @@ func (f *linkAttemptFixture) holdPendingUnlinkOfNewOwner(t *testing.T) (*account
 	t.Cleanup(gate.Release)
 	done := make(chan error, 1)
 	go func() { done <- f.link(f.env.User(f.org.Admin), billingAccountB) }()
-	<-gate.Entered
+	gate.WaitForEntry(t, done)
 	return gate, done
 }
 
@@ -1515,7 +1528,7 @@ func TestBillingLinkExpiredBeforeDispatchStartsNoCall(t *testing.T) {
 	// recorded deadline was computed from the time before it.
 	f.env.Clock.Advance(time.Minute)
 	gate.Release()
-	if err := <-done; testenv.Code(err) != connect.CodeUnavailable {
+	if err := gate.WaitForResult(t, done); testenv.Code(err) != connect.CodeUnavailable {
 		t.Fatalf("link after a delayed first transaction: %v, want unavailable", err)
 	}
 	if n := f.fake.Calls(accountstest.MethodLinkOrganization); n != linkCalls {
@@ -1551,20 +1564,14 @@ func TestBillingLinkBoundsCallToRemainingWindow(t *testing.T) {
 	linkGate := f.fake.Hold(accountstest.MethodLinkOrganization)
 	t.Cleanup(linkGate.Release)
 	gate.Release()
-	select {
-	case <-linkGate.Entered:
-	case err := <-done:
-		t.Fatalf("link returned before reaching Accounts: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Accounts did not receive the link")
-	}
+	linkGate.WaitForEntry(t, done)
 	select {
 	case err := <-done:
 		if testenv.Code(err) != connect.CodeUnavailable {
 			t.Fatalf("link with a stalled call: %v, want unavailable", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("the stalled call was not bounded to the remaining window")
+		t.Fatal("timed out waiting for LinkOrganization result within the remaining dispatch window")
 	}
 
 	// Move past the ordinary first retry delay while Accounts still holds
