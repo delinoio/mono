@@ -200,31 +200,31 @@ func (s *Statuses) warnStale(ctx context.Context, st Status, now time.Time) {
 // response.
 func (s *Statuses) ApplyReportStatuses(ctx context.Context, statuses []*accountsv1.OrganizationBillingStatus) {
 	for _, r := range statuses {
-		if err := s.applyRemote(ctx, r, SourceReport); err != nil {
+		if _, err := s.applyRemote(ctx, r, SourceReport); err != nil {
 			s.logger.WarnContext(ctx, "billing_status_apply_failed", slog.String("organization_id", r.GetOrganizationId()),
 				slog.String("source", SourceReport), slog.Any("error", err))
 		}
 	}
 }
 
-func (s *Statuses) applyRemote(ctx context.Context, r *accountsv1.OrganizationBillingStatus, source string) error {
+func (s *Statuses) applyRemote(ctx context.Context, r *accountsv1.OrganizationBillingStatus, source string) (bool, error) {
 	var change Change
+	var deferred bool
 	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		change, _, err = ApplyRemoteTx(ctx, tx, r, source, s.now())
+		change, deferred, err = applyRemoteTx(ctx, tx, r, source, s.now())
 		return err
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	s.Committed(ctx, change)
-	return nil
+	return deferred, nil
 }
 
-// Poll reads the statuses that changed after the stored cursor, applies
-// them, advances the cursor and then refreshes the sync time of every linked
-// organization, because a successful poll proves that the cached statuses
-// are current.
+// Poll reads the statuses after the stored cursor and checkpoints the
+// results it handles. A status for a pending first link ends the pass.
+// Only a complete pass refreshes the sync time of every linked organization.
 func (s *Statuses) Poll(ctx context.Context) error {
 	if s.client == nil {
 		return ErrReportingDisabled
@@ -237,7 +237,7 @@ func (s *Statuses) Poll(ctx context.Context) error {
 		s.logger.WarnContext(ctx, "billing_status_poll_failed", slog.String("code", "internal"), slog.Any("error", err))
 		return err
 	}
-	applied := 0
+	handled := 0
 	for {
 		resp, err := s.client.ListBillingStatusChanges(ctx, connect.NewRequest(&accountsv1.ListBillingStatusChangesRequest{
 			Service: ServiceID, AfterSequence: after, PageSize: StatusPageSize,
@@ -251,25 +251,42 @@ func (s *Statuses) Poll(ctx context.Context) error {
 			s.logger.WarnContext(ctx, "billing_status_poll_failed", slog.String("code", code), slog.Int64("after_sequence", after), slog.Any("error", err))
 			return err
 		}
+		var deferredStatus *accountsv1.OrganizationBillingStatus
+		next := after
 		for _, r := range resp.Msg.GetStatuses() {
-			if err := s.applyRemote(ctx, r, SourcePoll); err != nil {
+			deferred, err := s.applyRemote(ctx, r, SourcePoll)
+			if err != nil {
 				s.logger.WarnContext(ctx, "billing_status_apply_failed", slog.String("organization_id", r.GetOrganizationId()),
 					slog.String("source", SourcePoll), slog.Any("error", err))
 				return err
 			}
-			applied++
+			if deferred {
+				deferredStatus = r
+				break
+			}
+			next = r.GetSequence()
+			handled++
 		}
-		next := resp.Msg.GetNextSequence()
-		if next > after {
+		if deferredStatus == nil {
+			next = resp.Msg.GetNextSequence()
+		}
+		advanced := next > after
+		if advanced {
 			if _, err := s.db.Pool.Exec(ctx, "UPDATE billing_status_cursor SET after_sequence = $1 WHERE singleton AND after_sequence < $1", next); err != nil {
 				return err
 			}
+			after = next
+		}
+		if deferredStatus != nil {
+			s.logger.DebugContext(ctx, "billing_status_poll_deferred",
+				slog.String("organization_id", deferredStatus.GetOrganizationId()),
+				slog.Int64("sequence", deferredStatus.GetSequence()), slog.Int64("after_sequence", after))
+			return nil
 		}
 		full := len(resp.Msg.GetStatuses()) >= StatusPageSize
-		if !full || next <= after {
+		if !full || !advanced {
 			break
 		}
-		after = next
 	}
 	if _, err := s.db.Pool.Exec(ctx, `UPDATE organization_billing SET status_sync_time = $1
 		WHERE billing_account_id IS NOT NULL AND (status_sync_time IS NULL OR status_sync_time < $1)`, start); err != nil {
@@ -278,7 +295,7 @@ func (s *Statuses) Poll(ctx context.Context) error {
 	if _, err := s.db.Pool.Exec(ctx, "UPDATE billing_status_cursor SET poll_time = $1 WHERE singleton", start); err != nil {
 		return err
 	}
-	s.logger.DebugContext(ctx, "billing_status_polled", slog.Int("statuses", applied), slog.Int64("after_sequence", after))
+	s.logger.DebugContext(ctx, "billing_status_polled", slog.Int("statuses", handled), slog.Int64("after_sequence", after))
 	return nil
 }
 

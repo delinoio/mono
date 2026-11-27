@@ -1288,6 +1288,14 @@ func TestBillingLinkLocalCommitFailure(t *testing.T) {
 	f.wantLocalLink(t, false)
 	f.wantRows(t, 1, 1)
 
+	// Finalization failed and cleared the call deadline. The live remote
+	// link is eligible for cleanup, so its status does not stop the poll.
+	pollBilling(t, f.env)
+	if cursor, _ := f.pollCheckpoint(t); cursor != f.fake.Status(f.org.ID).GetSequence() {
+		t.Fatalf("cursor after failed link finalization = %d, want %d", cursor, f.fake.Status(f.org.ID).GetSequence())
+	}
+	f.wantLocalLink(t, false)
+
 	// After a restart the lease holder removes the unconfirmed link.
 	f.env.Clock.Advance(2 * time.Second)
 	if err := f.restart().RetryPendingUnlinks(ctx); err != nil {
