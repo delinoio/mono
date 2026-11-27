@@ -248,6 +248,9 @@ func (e *BillingEnforcer) pauseOrdered(ctx context.Context, t billingTarget) {
 		return
 	}
 	state, _ := sb.shownState()
+	if state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		return
+	}
 	s.Logger.InfoContext(ctx, "billing_sandbox_paused", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID),
 		slog.String("device_id", t.deviceID), slog.String("state", state.String()))
 }

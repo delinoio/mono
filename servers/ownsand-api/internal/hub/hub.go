@@ -69,12 +69,12 @@ type Conn struct {
 	// last update target sent).
 	values map[any]any
 
-	// updateMu serializes the update decisions of the channel, from reading
+	// updateLock serializes the update decisions of the channel, from reading
 	// the policy to queueing the command; see LockUpdates.
-	updateMu sync.Mutex
-	// configMu serializes the configuration sends of the channel, from
+	updateLock chan struct{}
+	// configLock serializes the configuration sends of the channel, from
 	// reading the device limits to queueing the message; see LockConfig.
-	configMu sync.Mutex
+	configLock chan struct{}
 	// configWaiters counts the senders that are blocked in LockConfig; see
 	// ConfigLockWaiters.
 	configWaiters atomic.Int32
@@ -171,9 +171,8 @@ func (c *Conn) SetValue(key, value any) {
 // older policy can queue its command after the command of a newer decision,
 // and the agent then applies the older decision last. Hold the lock from
 // reading the policy until the command is queued.
-func (c *Conn) LockUpdates() (unlock func()) {
-	c.updateMu.Lock()
-	return c.updateMu.Unlock
+func (c *Conn) LockUpdates(ctx context.Context) (unlock func(), err error) {
+	return c.lock(ctx, c.updateLock)
 }
 
 // LockConfig takes the per-channel configuration lock and returns its release
@@ -184,17 +183,31 @@ func (c *Conn) LockUpdates() (unlock func()) {
 // send, and the agent then keeps the older limits. Hold the lock from reading
 // the limits until the message is queued, so the sender that runs later also
 // reads the newer committed limits.
-func (c *Conn) LockConfig() (unlock func()) {
+func (c *Conn) LockConfig(ctx context.Context) (unlock func(), err error) {
 	c.configWaiters.Add(1)
-	c.configMu.Lock()
-	c.configWaiters.Add(-1)
-	return c.configMu.Unlock
+	defer c.configWaiters.Add(-1)
+	return c.lock(ctx, c.configLock)
+}
+
+func (c *Conn) lock(ctx context.Context, gate chan struct{}) (func(), error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.Done():
+		return nil, ErrChannelClosed
+	case gate <- struct{}{}:
+	}
+	unlock := func() { <-gate }
+	if err := ctx.Err(); err != nil {
+		unlock()
+		return nil, err
+	}
+	return unlock, nil
 }
 
 // ConfigLockWaiters reports the number of senders that wait in LockConfig for
-// the holder to release the lock. A sync.Mutex cannot report its waiters, so a
-// test uses this count to see that a second sender reached the lock instead of
-// sleeping for an assumed time. Production code does not read it.
+// the holder to release the lock. A test uses this count to observe that a
+// second sender reached the lock. Production code does not read it.
 func (c *Conn) ConfigLockWaiters() int { return int(c.configWaiters.Load()) }
 
 // Hub is the registry of agent channels.
@@ -311,7 +324,11 @@ func (h *Hub) register(parent context.Context, deviceID, orgID string) *Conn {
 	}
 	h.mu.Lock()
 	h.gen++
-	c := &Conn{DeviceID: deviceID, OrganizationID: orgID, Generation: h.gen, ID: id, out: make(chan *ownsandv1.AgentEnvelope, outboundQueue), ctx: ctx, cancel: cancel, queueFullWait: h.QueueFullWait}
+	c := &Conn{
+		DeviceID: deviceID, OrganizationID: orgID, Generation: h.gen, ID: id,
+		out: make(chan *ownsandv1.AgentEnvelope, outboundQueue), ctx: ctx, cancel: cancel,
+		queueFullWait: h.QueueFullWait, updateLock: make(chan struct{}, 1), configLock: make(chan struct{}, 1),
+	}
 	old := h.conns[deviceID]
 	h.conns[deviceID] = c
 	h.mu.Unlock()
@@ -397,6 +414,13 @@ func (h *Hub) Live(deviceID string) *Conn {
 		return nil
 	}
 	return c
+}
+
+// LastGeneration returns the highest channel generation assigned so far.
+func (h *Hub) LastGeneration() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.gen
 }
 
 // All returns every current channel.

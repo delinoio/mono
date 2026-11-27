@@ -73,6 +73,18 @@ type usageKey struct {
 	month time.Time // first instant of the UTC month of the window start
 }
 
+type usageReportKey struct {
+	service     accountsv1.ServiceId
+	org         string
+	meter       accountsv1.Meter
+	windowStart time.Time
+}
+
+type usageAttribution struct {
+	billingAccountID string
+	unattributed     bool
+}
+
 // utcMonth returns the first instant of the UTC calendar month of t.
 func utcMonth(t time.Time) time.Time {
 	t = t.UTC()
@@ -95,7 +107,7 @@ type Server struct {
 	// Current links are also in the history. Unlink closes the interval in place.
 	linkHistory map[string][]*link
 	usage       map[usageKey][2]int64
-	reported    map[string]bool
+	reported    map[usageReportKey]usageAttribution
 	failures    map[string]error
 	// replyFailures fail a call after it took effect: a lost response.
 	replyFailures map[string]error
@@ -106,6 +118,7 @@ type Server struct {
 // Gate holds the calls of one method before they take effect, until
 // Release. Tests use it to keep a call in flight while other operations run.
 type Gate struct {
+	method string
 	// Entered receives one value when a held call reaches the gate and can
 	// notify before release. Calls that observe release skip notification.
 	Entered chan struct{}
@@ -124,7 +137,7 @@ func New(t testing.TB, now func() time.Time) *Server {
 	}
 	f := &Server{now: now, accounts: map[string]*account{}, links: map[string]*link{}, usage: map[usageKey][2]int64{},
 		linkHistory: map[string][]*link{},
-		reported:    map[string]bool{}, failures: map[string]error{}, replyFailures: map[string]error{}, gates: map[string]*Gate{}, calls: map[string]int{}}
+		reported:    map[usageReportKey]usageAttribution{}, failures: map[string]error{}, replyFailures: map[string]error{}, gates: map[string]*Gate{}, calls: map[string]int{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /oidc/token", f.token)
 	path, h := accountsv1connect.NewUsageServiceHandler(handler{f}, connect.WithInterceptors(authCheck{}))
@@ -266,7 +279,7 @@ func (f *Server) FailReply(method string, err error) {
 // Hold makes every later call of method wait before it takes effect until
 // the returned gate is released.
 func (f *Server) Hold(method string) *Gate {
-	g := &Gate{Entered: make(chan struct{}, 16), release: make(chan struct{})}
+	g := &Gate{method: method, Entered: make(chan struct{}, 16), release: make(chan struct{})}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gates[method] = g
@@ -356,22 +369,24 @@ func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.
 	for _, r := range req.Msg.GetReports() {
 		org := r.GetOrganizationId()
 		windowStart := r.GetWindowStart().AsTime()
-		key := org + "/" + r.GetMeter().String() + "/" + windowStart.String()
-		res := &accountsv1.UsageReportResult{Service: r.GetService(), OrganizationId: org, Meter: r.GetMeter(), WindowStart: r.GetWindowStart(),
-			Duplicate: f.reported[key]}
-		if !f.reported[key] {
-			f.reported[key] = true
-			k := usageKey{org: org, meter: r.GetMeter(), month: utcMonth(windowStart)}
+		key := usageReportKey{service: r.GetService(), org: org, meter: r.GetMeter(), windowStart: windowStart}
+		attribution, duplicate := f.reported[key]
+		if !duplicate {
+			k := usageKey{org: org, meter: key.meter, month: utcMonth(windowStart)}
 			u := f.usage[k]
 			f.usage[k] = [2]int64{u[0] + r.GetQuantity(), u[1] + r.GetAmountUsdMicros()}
 			if l := f.usageLinkLocked(org, windowStart); l != nil {
-				res.BillingAccountId = l.account
+				attribution.billingAccountID = l.account
 				f.accounts[l.account].balance -= r.GetAmountUsdMicros()
 			} else {
-				res.Unattributed = true
+				attribution.unattributed = true
 			}
+			f.reported[key] = attribution
 		}
-		resp.Results = append(resp.Results, res)
+		resp.Results = append(resp.Results, &accountsv1.UsageReportResult{
+			Service: key.service, OrganizationId: org, Meter: key.meter, WindowStart: r.GetWindowStart(),
+			Duplicate: duplicate, BillingAccountId: attribution.billingAccountID, Unattributed: attribution.unattributed,
+		})
 		named[org] = true
 	}
 	orgs := make([]string, 0, len(named))

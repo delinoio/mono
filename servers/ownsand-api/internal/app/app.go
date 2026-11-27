@@ -170,7 +170,7 @@ func New(opts Options) (*App, error) {
 		DeadlineNow: opts.LeaseDeadlineNow, OnLose: control.LeaseLost}
 	svc.Lease = l
 	statuses := billing.NewStatuses(billing.StatusOptions{
-		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Held: l.Held, Client: opts.UsageClient,
+		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Ownership: l.Ownership, Client: opts.UsageClient,
 		Metrics: opts.Metrics, Timing: opts.BillingStatusTiming,
 	})
 	svc.Billing = statuses
@@ -224,12 +224,11 @@ func New(opts Options) (*App, error) {
 	add(unary(ownsandv1connect.NewSnapshotServiceHandler(api.SnapshotHandler{Service: svc}, handlerOpts...)))
 	add(unary(ownsandv1connect.NewDataPathServiceHandler(api.DataPathHandler{DataPlane: plane}, handlerOpts...)))
 	add(unary(ownsandv1connect.NewBillingServiceHandler(api.BillingHandler{Service: svc}, handlerOpts...)))
-	// The relay gate opens the relay stream and arms the request deadline
-	// before Connect reads the request body; RelayReadDeadlines gives it the
-	// means to interrupt a body read that blocks.
+	// The relay gate arms transport deadlines from stream allocation, before
+	// Connect reads the body or writes the response.
 	relayOpts := append(slices.Clone(handlerOpts), connect.WithRequestGate(plane.RelayGate(authn, opts.ClientAddressMode)))
 	relayPath, relayHandler := ownsandv1connect.NewRelayServiceHandler(api.RelayHandler{DataPlane: plane}, relayOpts...)
-	add(relayPath, api.RelayReadDeadlines(plane.MeterRelayEgress(relayHandler)))
+	add(relayPath, api.WithRelayResponseController(plane.MeterRelayEgress(relayHandler)))
 	relayAgentPath, relayAgentHandler := ownsandv1connect.NewRelayAgentServiceHandler(api.RelayAgentHandler{DataPlane: plane, Clock: opts.RelayClock}, handlerOpts...)
 	add(relayAgentPath, api.RelayAgentWriteInterrupt(relayAgentHandler))
 

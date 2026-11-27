@@ -112,14 +112,17 @@ func abortStalledWrite(ctx context.Context) error {
 	return rc.SetWriteDeadline(time.Unix(1, 0))
 }
 
-// sendCommand sends cmd on conn with a new command ID and remembers it.
+// sendCommand sends cmd on conn and remembers its command ID. A repeat
+// delete on that channel returns the outstanding delete's command ID.
 func (s *Service) sendCommand(ctx context.Context, conn *hub.Conn, info commandInfo, cmd *ownsandv1.AgentCommand) (string, error) {
 	if cmd.CommandId == "" {
 		cmd.CommandId = newID()
 	}
 	info.deviceID = conn.DeviceID
 	info.generation = conn.Generation
-	s.commands.add(cmd.CommandId, info, conn, s.commandRetentionNow())
+	if existingID := s.commands.add(cmd.CommandId, info, conn, s.commandRetentionNow()); existingID != "" {
+		return existingID, nil
+	}
 	if err := conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}); err != nil {
 		s.commands.remove(cmd.CommandId)
 		return "", err
@@ -299,7 +302,7 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 		}
 	}()
 
-	if err := h.sendConfiguration(ctx, conn); err != nil {
+	if err := h.sendConfiguration(conn.Context(), conn); err != nil {
 		return nil
 	}
 	timer := time.NewTimer(h.Timing.HeartbeatTimeout)
@@ -427,12 +430,19 @@ func (s *Service) deviceLimits(ctx context.Context, deviceID string) (*ownsandv1
 // of the message one step, so the message that is queued last always carries
 // the newest committed limits.
 func (s *Service) sendConfiguration(ctx context.Context, conn *hub.Conn) error {
-	defer conn.LockConfig()()
+	unlock, err := conn.LockConfig(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	limits, err := s.deviceLimits(ctx, conn.DeviceID)
 	if hook := s.afterConfigLimitsRead.Load(); hook != nil && err == nil {
 		(*hook)(conn.DeviceID)
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return err
+		}
 		s.Logger.WarnContext(ctx, "device_limits_load_failed", slog.String("device_id", conn.DeviceID), slog.Any("error", err))
 		conn.Close(err)
 		return err
@@ -905,7 +915,11 @@ func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDeci
 // per-channel update lock. A decision that read an older policy then cannot
 // send its command after the command of a newer decision.
 func (s *Service) evaluateUpdate(ctx context.Context, conn *hub.Conn) error {
-	defer conn.LockUpdates()()
+	unlock, err := conn.LockUpdates(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if conn.Context().Err() != nil {
 		return nil
 	}

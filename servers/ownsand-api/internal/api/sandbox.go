@@ -761,15 +761,17 @@ func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[
 			return err
 		}
 		sb, err = loadSandbox(ctx, tx, orgID, sandboxID, true)
-		if err != nil || isTerminal(sb.AgentState) || sb.DeletePending {
+		if err != nil || isTerminal(sb.AgentState) {
 			return err
 		}
-		// Any instance records the pending delete; the lease holder sends the
-		// delete command, at once or when the device reconnects.
-		if _, err := tx.Exec(ctx, `UPDATE sandboxes SET delete_pending = true, delete_end_reason = $2, delete_actor_kind = $3, delete_actor_id = $4
-			WHERE sandbox_id = $1`, sandboxID, int16(ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER), int16(p.Kind), p.ID); err != nil {
-			return err
+		if !sb.DeletePending {
+			if _, err := tx.Exec(ctx, `UPDATE sandboxes SET delete_pending = true, delete_end_reason = $2, delete_actor_kind = $3, delete_actor_id = $4
+				WHERE sandbox_id = $1`, sandboxID, int16(ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER), int16(p.Kind), p.ID); err != nil {
+				return err
+			}
 		}
+		// Any instance can request dispatch by the lease holder. A retry
+		// writes the same event and preserves the original delete intent.
 		return events.Write(ctx, tx, events.Event{Kind: events.KindSandboxDeleteRequested, OrganizationID: orgID, SandboxID: sandboxID, DeviceID: sb.DeviceID})
 	})
 	if err != nil {

@@ -57,7 +57,11 @@ func setOrgPhase(t *testing.T, env *testenv.Env, org *testenv.Org, phase ownsand
 
 // pauseRPC calls PauseSandbox with the caller's clients.
 func pauseRPC(c *testenv.Clients, orgID, sandboxID string) (*ownsandv1.Sandbox, error) {
-	resp, err := c.Sandbox.PauseSandbox(context.Background(), connect.NewRequest(&ownsandv1.PauseSandboxRequest{OrganizationId: orgID, SandboxId: sandboxID}))
+	return pauseRPCWithContext(context.Background(), c, orgID, sandboxID)
+}
+
+func pauseRPCWithContext(ctx context.Context, c *testenv.Clients, orgID, sandboxID string) (*ownsandv1.Sandbox, error) {
+	resp, err := c.Sandbox.PauseSandbox(ctx, connect.NewRequest(&ownsandv1.PauseSandboxRequest{OrganizationId: orgID, SandboxId: sandboxID}))
 	if err != nil {
 		return nil, err
 	}
@@ -349,8 +353,9 @@ type resumeHold struct {
 	sandbox  string
 	received chan struct{}
 
-	mu   sync.Mutex
-	held *ownsandv1.AgentCommand
+	mu       sync.Mutex
+	held     *ownsandv1.AgentCommand
+	released bool
 }
 
 func holdResume(agent *testenv.FakeAgent, sandboxID string) *resumeHold {
@@ -359,7 +364,7 @@ func holdResume(agent *testenv.FakeAgent, sandboxID string) *resumeHold {
 		if cmd.GetResumeSandbox().GetSandboxId() == h.sandbox {
 			h.mu.Lock()
 			defer h.mu.Unlock()
-			if h.held == nil {
+			if !h.released && h.held == nil {
 				h.held = cmd
 				close(h.received)
 				return nil
@@ -373,7 +378,14 @@ func holdResume(agent *testenv.FakeAgent, sandboxID string) *resumeHold {
 // Release answers the withheld resume as the agent would have: it resumes
 // the sandbox and sends the result.
 func (h *resumeHold) Release() {
-	cmd := h.command()
+	h.mu.Lock()
+	cmd := h.held
+	h.held = nil
+	h.released = true
+	h.mu.Unlock()
+	if cmd == nil {
+		return
+	}
 	h.sendResult(cmd.GetCommandId(), h.agent.DefaultAnswer(cmd))
 }
 
@@ -469,6 +481,14 @@ func expectMarkRetained(t *testing.T, f *markerFixture, sandboxID string) {
 	}
 }
 
+func newResumeInFlightFixture(t *testing.T) *markerFixture {
+	t.Helper()
+	return newMarkerFixtureWith(t, func(o *app.Options) {
+		// Keep the withheld command from timing out during the lock observation.
+		o.Timing.CommandWait = 3 * sandboxOrderObservationTimeout
+	})
+}
+
 // startResumeInFlight suspends the organization, then recovers it and runs a
 // pass in which the agent withholds the result of the resume of the returned
 // adopted sandbox, until the resume is sent. The control sandbox is a second
@@ -478,11 +498,14 @@ func startResumeInFlight(t *testing.T, f *markerFixture) (adopted, control strin
 	adopted, control = f.create(t), f.create(t)
 	f.suspendAll(t, adopted, control)
 	hold = holdResume(f.agent, adopted)
+	t.Cleanup(hold.Release)
 	setOrgPhase(t, f.env, f.org, billing.PhaseAllowed)
 	passDone = make(chan error, 1)
-	go func() { passDone <- f.env.App.Enforcer.Pass(context.Background()) }()
+	go func() { passDone <- f.env.App.Enforcer.Pass(t.Context()) }()
 	select {
 	case <-hold.received:
+	case err := <-passDone:
+		t.Fatalf("the enforcement pass finished before sending the held resume: %v", err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("the resume of the adopted sandbox was not sent")
 	}
@@ -506,23 +529,13 @@ type pauseOutcome struct {
 	err error
 }
 
-func pauseAsync(c *testenv.Clients, orgID, sandboxID string) chan pauseOutcome {
+func pauseAsync(ctx context.Context, c *testenv.Clients, orgID, sandboxID string) chan pauseOutcome {
 	out := make(chan pauseOutcome, 1)
 	go func() {
-		sb, err := pauseRPC(c, orgID, sandboxID)
+		sb, err := pauseRPCWithContext(ctx, c, orgID, sandboxID)
 		out <- pauseOutcome{sb, err}
 	}()
 	return out
-}
-
-// expectPending fails when the pause finished within a short time.
-func expectPending(t *testing.T, name string, out chan pauseOutcome) {
-	t.Helper()
-	select {
-	case o := <-out:
-		t.Fatalf("the pause %s finished while the resume was in flight: state=%v err=%v", name, o.sb.GetState(), o.err)
-	case <-time.After(500 * time.Millisecond):
-	}
 }
 
 func waitOutcome(t *testing.T, name string, out chan pauseOutcome) pauseOutcome {
@@ -542,11 +555,12 @@ func waitOutcome(t *testing.T, name string, out chan pauseOutcome) pauseOutcome 
 // sandbox actually resumed, it then pauses it through the normal pause
 // path, and no recovery command can undo the pause afterwards.
 func TestCallerPauseWaitsForResumeInFlight(t *testing.T) {
-	f := newMarkerFixture(t)
+	f := newResumeInFlightFixture(t)
 	adopted, control, hold, passDone := startResumeInFlight(t, f)
 
-	out := pauseAsync(f.org.OwnerClient, f.org.ID, adopted)
-	expectPending(t, "", out)
+	holderPID := sandboxOrderLockHolder(t, f.env, adopted)
+	out := pauseAsync(t.Context(), f.org.OwnerClient, f.org.ID, adopted)
+	waitSandboxOrderBlocked(t, f.env, adopted, holderPID, "caller pause", out)
 	hold.Release()
 	o := waitOutcome(t, "", out)
 	if o.err != nil {
@@ -585,12 +599,13 @@ func TestCallerPauseWaitsForResumeInFlight(t *testing.T) {
 // that the resume produced, so it reports unavailable and never a success
 // that a resume undid; the retry on the instance with the channel pauses.
 func TestCallerPauseThroughSecondInstanceWaitsForResumeInFlight(t *testing.T) {
-	f := newMarkerFixture(t)
+	f := newResumeInFlightFixture(t)
 	adopted, _, hold, passDone := startResumeInFlight(t, f)
 	peer := f.env.StartPeer()
 
-	out := pauseAsync(peer.User(f.org.Owner), f.org.ID, adopted)
-	expectPending(t, "through the second instance", out)
+	holderPID := sandboxOrderLockHolder(t, f.env, adopted)
+	out := pauseAsync(t.Context(), peer.User(f.org.Owner), f.org.ID, adopted)
+	waitSandboxOrderBlocked(t, f.env, adopted, holderPID, "caller pause through the second instance", out)
 	hold.Release()
 	o := waitOutcome(t, "through the second instance", out)
 	if connect.CodeOf(o.err) != connect.CodeUnavailable {
@@ -826,14 +841,80 @@ func TestBillingResumeQueueRejectionClearsAttempt(t *testing.T) {
 }
 
 const sandboxOrderLockTestKey = "hashtextextended('ownsand.sandbox-order:' || $1::text, 0)"
+const sandboxOrderObservationTimeout = 10 * time.Second
+
+// PostgreSQL stores the high and low halves of a bigint advisory key in
+// classid and objid. objsubid distinguishes it from the two-integer key form.
+const sandboxOrderTestLocks = `
+WITH target_locks AS (
+    SELECT pid, granted
+    FROM pg_locks, (SELECT ` + sandboxOrderLockTestKey + ` AS key) AS target
+    WHERE locktype = 'advisory'
+      AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND classid::bigint = ((target.key >> 32) & 4294967295)
+      AND objid::bigint = (target.key & 4294967295)
+      AND objsubid = 1
+      AND mode = 'ExclusiveLock'
+)
+`
+
+// sandboxOrderLockHolder identifies the worker's backend after the fake agent
+// receives the target resume and before a caller can try to take the lock.
+func sandboxOrderLockHolder(t *testing.T, env *testenv.Env, sandboxID string) int32 {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), sandboxOrderObservationTimeout)
+	defer cancel()
+	var pid int32
+	if err := env.DB.Pool.QueryRow(ctx, sandboxOrderTestLocks+"SELECT pid FROM target_locks WHERE granted", sandboxID).Scan(&pid); err != nil {
+		t.Fatalf("find the billing resume's ordering lock holder for sandbox %s: %v", sandboxID, err)
+	}
+	return pid
+}
+
+// waitSandboxOrderBlocked observes the PostgreSQL wait from a separate
+// connection. Each phase starts only one operation that can wait for this key.
+func waitSandboxOrderBlocked[T any](t *testing.T, env *testenv.Env, sandboxID string, holderPID int32, operation string, done <-chan T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), sandboxOrderObservationTimeout)
+	defer cancel()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+
+	const query = sandboxOrderTestLocks + `
+SELECT pid FROM target_locks
+WHERE NOT granted AND $2 = ANY(pg_blocking_pids(pid))
+  AND EXISTS (SELECT 1 FROM target_locks WHERE granted AND pid = $2)
+`
+	for ctx.Err() == nil {
+		select {
+		case outcome := <-done:
+			t.Fatalf("%s finished before waiting on the ordering lock for sandbox %s: %+v", operation, sandboxID, outcome)
+		case <-ctx.Done():
+			continue
+		case <-tick.C:
+		}
+
+		var waiterPID int32
+		err := env.DB.Pool.QueryRow(ctx, query, sandboxID, holderPID).Scan(&waiterPID)
+		switch {
+		case err == nil:
+			t.Logf("%s waits on the ordering lock for sandbox %s (backend %d blocked by %d)", operation, sandboxID, waiterPID, holderPID)
+			return
+		case ctx.Err() == nil && !errors.Is(err, pgx.ErrNoRows):
+			t.Fatalf("observe the ordering lock wait for %s on sandbox %s: %v", operation, sandboxID, err)
+		}
+	}
+	t.Fatalf("timed out waiting for %s to block on the ordering lock for sandbox %s (holder %d): %v", operation, sandboxID, holderPID, ctx.Err())
+}
 
 // holdSandboxOrderLock takes the Postgres advisory lock that serializes the
 // caller pause and the billing worker of one sandbox, as another API
 // instance in the middle of its own critical section would hold it, and
-// returns the function that releases it.
-func holdSandboxOrderLock(t *testing.T, env *testenv.Env, sandboxID string) (release func()) {
+// returns the holder PID and the function that releases it.
+func holdSandboxOrderLock(t *testing.T, env *testenv.Env, sandboxID string) (int32, func()) {
 	t.Helper()
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(t.Context(), sandboxOrderObservationTimeout)
+	defer cancel()
 	conn, err := env.DB.Pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -846,16 +927,23 @@ func holdSandboxOrderLock(t *testing.T, env *testenv.Env, sandboxID string) (rel
 		t.Fatal(err)
 	}
 	var once sync.Once
-	release = func() {
+	release := func() {
 		once.Do(func() {
-			if _, err := conn.Exec(ctx, "SELECT pg_advisory_unlock("+sandboxOrderLockTestKey+")", sandboxID); err != nil {
-				t.Errorf("release the sandbox ordering lock: %v", err)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var unlocked bool
+			if err := conn.QueryRow(ctx, "SELECT pg_advisory_unlock("+sandboxOrderLockTestKey+")", sandboxID).Scan(&unlocked); err != nil || !unlocked {
+				closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer closeCancel()
+				_ = conn.Hijack().Close(closeCtx)
+				t.Errorf("release the sandbox ordering lock: unlocked=%v err=%v", unlocked, err)
+				return
 			}
 			conn.Release()
 		})
 	}
 	t.Cleanup(release)
-	return release
+	return int32(conn.Conn().PgConn().PID()), release
 }
 
 func TestSandboxOrderLockQueryFailureClosesConnection(t *testing.T) {
@@ -951,7 +1039,7 @@ func TestSandboxOrderLockQuerySuccessReleasesConnection(t *testing.T) {
 		}
 	}
 	t.Run("explicit release", func(t *testing.T) {
-		release := holdSandboxOrderLock(t, env, sandboxID)
+		_, release := holdSandboxOrderLock(t, env, sandboxID)
 		assertLockAvailable(t, false)
 		release()
 		assertLockAvailable(t, true)
@@ -973,9 +1061,9 @@ func TestCallerPauseWaitsForTheSandboxOrderLock(t *testing.T) {
 	adopted, control := f.create(t), f.create(t)
 	f.suspendAll(t, adopted, control)
 
-	release := holdSandboxOrderLock(t, f.env, adopted)
-	out := pauseAsync(f.org.OwnerClient, f.org.ID, adopted)
-	expectPending(t, "while another holder has the sandbox lock", out)
+	holderPID, release := holdSandboxOrderLock(t, f.env, adopted)
+	out := pauseAsync(t.Context(), f.org.OwnerClient, f.org.ID, adopted)
+	waitSandboxOrderBlocked(t, f.env, adopted, holderPID, "caller pause", out)
 	release()
 	if o := waitOutcome(t, "after the lock was released", out); o.err != nil || o.sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 		t.Fatalf("PauseSandbox = %v, %v", o.sb.GetState(), o.err)
@@ -989,16 +1077,12 @@ func TestCallerPauseWaitsForTheSandboxOrderLock(t *testing.T) {
 	if _, err := f.env.DB.Pool.Exec(context.Background(), "UPDATE sandboxes SET paused_by_billing = true WHERE sandbox_id = $1", adopted); err != nil {
 		t.Fatal(err)
 	}
-	release = holdSandboxOrderLock(t, f.env, adopted)
+	holderPID, release = holdSandboxOrderLock(t, f.env, adopted)
 	setOrgPhase(t, f.env, f.org, billing.PhaseAllowed)
 	passDone := make(chan error, 1)
-	go func() { passDone <- f.env.App.Enforcer.Pass(context.Background()) }()
+	go func() { passDone <- f.env.App.Enforcer.Pass(t.Context()) }()
+	waitSandboxOrderBlocked(t, f.env, adopted, holderPID, "billing resume", passDone)
 	waitState(t, f.org.OwnerClient, f.org.ID, control, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
-	select {
-	case err := <-passDone:
-		t.Fatalf("the pass finished while the lock of a target was held: %v", err)
-	case <-time.After(300 * time.Millisecond):
-	}
 	if _, err := f.env.DB.Pool.Exec(context.Background(), "UPDATE sandboxes SET paused_by_billing = false WHERE sandbox_id = $1", adopted); err != nil {
 		t.Fatal(err)
 	}
