@@ -93,7 +93,8 @@ type OrganizationDeletionHook struct {
 // They can capture state acquired during Prepare.
 type OrganizationDeletionSteps struct {
 	// PrepareContext, when set, is derived from the caller's context and used
-	// for the remaining preparation hooks and final transaction.
+	// for remaining preparation, to start the transaction, and to lock and
+	// verify the organization. InTx receives the caller's deletion context.
 	PrepareContext context.Context
 	// InTx runs after the core locks the organization and verifies the intent, before
 	// the core revokes the keys and deletes the rows.
