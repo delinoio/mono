@@ -1035,8 +1035,8 @@ func TestExecStartsOnceWhenTheFirstDialFails(t *testing.T) {
 			}
 		}}
 	}})
-	count := filepath.Join(t.TempDir(), "count")
-	req := e.execReq("/bin/sh", "-c", "echo run >> "+count+"; echo done")
+	count := filepath.Join(t.TempDir(), "run count")
+	req := e.execReq("/bin/sh", "-c", `echo run >> "$1"; echo done`, "sh", count)
 	out, frames, accepted := e.handle(req, nil)
 	if !out.Finished || !accepted {
 		t.Fatalf("outcome %+v accepted %v", out, accepted)
@@ -1083,8 +1083,8 @@ func TestExecAttachesAfterTheStartWasDelivered(t *testing.T) {
 			}
 		}}
 	}})
-	count := filepath.Join(t.TempDir(), "count")
-	req := e.execReq("/bin/sh", "-c", "echo run >> "+count+"; echo before; sleep 2; echo after")
+	count := filepath.Join(t.TempDir(), "run count")
+	req := e.execReq("/bin/sh", "-c", `echo run >> "$1"; echo before; sleep 2; echo after`, "sh", count)
 	go func() {
 		// Cut the connection of the start request after the command started.
 		deadline := time.Now().Add(10 * time.Second)
@@ -1154,8 +1154,8 @@ func TestExecDoesNotRestartWhenTheHelperHasNoRecord(t *testing.T) {
 			}
 		}}
 	}})
-	count := filepath.Join(t.TempDir(), "count")
-	req := e.execReq("/bin/sh", "-c", "echo run >> "+count+"; sleep 5")
+	count := filepath.Join(t.TempDir(), "run count")
+	req := e.execReq("/bin/sh", "-c", `echo run >> "$1"; sleep 5`, "sh", count)
 	go func() {
 		deadline := time.Now().Add(10 * time.Second)
 		for readCount(t, count) < 1 && time.Now().Before(deadline) {

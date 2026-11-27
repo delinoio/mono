@@ -72,6 +72,8 @@ type Org struct {
 	// creates the sandbox (or finds the one of its key) and returns this
 	// error instead of it.
 	CreateResponseError error
+	// GetError, when set, is returned by GetSandbox for existing sandboxes.
+	GetError error
 	// DeleteError, when set, is the error of the next DeleteSandbox calls
 	// (for example a transient OwnSand failure).
 	DeleteError error
@@ -379,11 +381,14 @@ func (c *client) sandbox(rpc, id string) (*Org, *fakeSandbox, error) {
 }
 
 func (c *client) GetSandbox(ctx context.Context, sandboxID string) (*ownsandv1.Sandbox, error) {
-	_, s, err := c.sandbox("GetSandbox", sandboxID)
+	o, s, err := c.sandbox("GetSandbox", sandboxID)
 	if err != nil {
 		return nil, err
 	}
 	defer c.f.mu.Unlock()
+	if o.GetError != nil {
+		return nil, o.GetError
+	}
 	return proto.Clone(s.sb).(*ownsandv1.Sandbox), nil
 }
 

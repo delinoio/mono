@@ -4,6 +4,7 @@ package sandboxes
 
 import (
 	"context"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -12,6 +13,45 @@ import (
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
+
+func TestDeleteSnapshotCompletionSkipsReplacement(t *testing.T) {
+	e := newEnv(t)
+	sandboxID := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	snapID, _ := uuidv7.NewString()
+	ctx := context.Background()
+	create := &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}
+	del := &ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}
+	if _, err := e.m.CreateSnapshot(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	earlierClaim := e.m.ClaimSnapshotCreate(snapID)
+	defer earlierClaim.Release()
+
+	completeDelete := e.m.ReceiveSnapshotDelete(del)
+	// A second delete removes the old entry while the first worker waits.
+	if err := e.m.DeleteSnapshot(del); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.m.CreateSnapshot(ctx, create); err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+	if err := completeDelete(); err != nil {
+		t.Fatalf("complete earlier delete: %v", err)
+	}
+	dir, entry, ok := e.m.SnapshotContent(snapID)
+	if !ok || entry.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("replacement = %v, want READY", entry)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("replacement content: %v", err)
+	}
+
+	entry, err := e.m.CreateClaimedSnapshot(ctx, create, earlierClaim)
+	requireErrCode(t, err, ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "create received before the delete")
+	if entry != nil {
+		t.Fatalf("earlier create returned replacement %v", entry)
+	}
+}
 
 func TestDeletePublishedSnapshotCancelsWaitingDuplicate(t *testing.T) {
 	for _, tc := range []struct {

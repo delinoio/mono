@@ -33,8 +33,8 @@ const (
 // $STUB_CALLS, optionally waits until two stubs run at the same time
 // ($STUB_BARRIER: each creates a marker file and waits for the second one,
 // so the overlap does not depend on timing), then writes $STUB_BODY to the
-// -o file. With STUB_PARTIAL set it writes only the first bytes and fails
-// with the curl exit status 18 (partial file), like an interrupted download.
+// -o file. With STUB_FAIL set, it writes the full body before returning a
+// curl error so that a matching checksum cannot hide an ignored exit status.
 // With STUB_MKDIR set it first creates that directory, like another process
 // that puts a directory at the archive path during the download.
 const stubCurl = `#!/usr/bin/env bash
@@ -60,11 +60,10 @@ if [ -n "${STUB_BARRIER:-}" ]; then
     exit 1
   fi
 fi
-if [ -n "${STUB_PARTIAL:-}" ]; then
-  head -c 3 "$STUB_BODY" > "$out"
-  exit 18
+cp "$STUB_BODY" "$out" || exit $?
+if [ -n "${STUB_FAIL:-}" ]; then
+  exit 56
 fi
-cp "$STUB_BODY" "$out"
 `
 
 type fill struct {
@@ -340,23 +339,17 @@ func TestDirectoryAppearingBeforePublishIsRejected(t *testing.T) {
 	f.requireNoLeftovers()
 }
 
-func TestInterruptedDownloadLeavesTheCacheUntouched(t *testing.T) {
+func TestFailedDownloadLeavesTheCacheUntouched(t *testing.T) {
 	f := newFill(t)
 	stale := []byte("a stale archive")
 	f.seed(stale)
 	body := f.body("good", goodBody)
-	out, err := f.run(body, "STUB_PARTIAL=1")
-	if err == nil {
-		t.Fatalf("fill succeeded with an interrupted download\n%s", out)
+	out, err := f.run(body, "STUB_FAIL=1")
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		t.Fatalf("want a nonzero exit after curl fails with a complete body, got %v\n%s", err, out)
 	}
-	got, err := os.ReadFile(f.archive())
-	if err != nil {
-		t.Fatalf("read the archive: %v", err)
-	}
-	if string(got) != string(stale) {
-		t.Fatalf("a failed download changed the archive to %q", got)
-	}
-	f.requireNoLeftovers()
+	f.requireArchive(stale)
 }
 
 func TestOverlappingColdFillsBothEndWithTheVerifiedArchive(t *testing.T) {

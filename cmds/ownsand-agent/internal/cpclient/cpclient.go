@@ -55,10 +55,22 @@ func (c *Client) authTimeout() time.Duration {
 	return DefaultAuthTimeout
 }
 
-// authContext bounds one authentication attempt with the authentication
-// deadline.
-func (c *Client) authContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx, c.authTimeout())
+type authAttempt struct {
+	ctx    context.Context
+	parent context.Context
+	// timeout is zero when the caller supplies the effective deadline.
+	timeout time.Duration
+}
+
+func (c *Client) startAuthAttempt(parent context.Context) (authAttempt, context.CancelFunc) {
+	timeout := c.authTimeout()
+	deadline := time.Now().Add(timeout)
+	if callerDeadline, ok := parent.Deadline(); ok && !deadline.Before(callerDeadline) {
+		ctx, cancel := context.WithCancel(parent)
+		return authAttempt{ctx: ctx, parent: parent}, cancel
+	}
+	ctx, cancel := context.WithDeadline(parent, deadline)
+	return authAttempt{ctx: ctx, parent: parent, timeout: timeout}, cancel
 }
 
 // EnrollTimeout is the deadline of the unary Enroll call: AuthTimeout, or
@@ -173,16 +185,12 @@ type Session struct {
 	OrganizationID string
 }
 
-// attemptError wraps the error of the step of one authentication attempt.
-// When the attempt deadline ended it, and not the caller's context, the
-// error says so and still matches context.DeadlineExceeded; it is never
-// ErrUnknownDevice. The server sees the same deadline through the Connect
-// timeout header and can answer deadline_exceeded just before the client
-// timer fires, so that code counts as the deadline too.
-func (c *Client) attemptError(parent, attempt context.Context, step string, err error) error {
-	timedOut := errors.Is(attempt.Err(), context.DeadlineExceeded) || connect.CodeOf(err) == connect.CodeDeadlineExceeded
-	if parent.Err() == nil && timedOut {
-		return fmt.Errorf("cpclient: %s: no answer within %s: %w", step, c.authTimeout(), context.DeadlineExceeded)
+// stepError identifies the failing RPC. Connect sends the effective deadline
+// to the server, which can return deadline_exceeded before the local timer fires.
+func (a authAttempt) stepError(step string, err error) error {
+	timedOut := errors.Is(a.ctx.Err(), context.DeadlineExceeded) || connect.CodeOf(err) == connect.CodeDeadlineExceeded
+	if a.timeout > 0 && a.parent.Err() == nil && timedOut {
+		return fmt.Errorf("cpclient: %s: no answer within %s: %w", step, a.timeout, context.DeadlineExceeded)
 	}
 	return fmt.Errorf("cpclient: %s: %w", step, err)
 }
@@ -197,31 +205,29 @@ type AuthResult struct {
 	Removal *ownsandv1.RemovalNotice
 }
 
-// challenge creates a nonce under attempt, which is the bounded context of
-// the attempt that parent started.
-func (c *Client) challenge(parent, attempt context.Context, deviceID string) ([]byte, error) {
-	resp, err := c.Agent.CreateChallenge(attempt, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: deviceID}))
+// challenge creates a nonce under the shared attempt deadline.
+func (c *Client) challenge(attempt authAttempt, deviceID string) ([]byte, error) {
+	resp, err := c.Agent.CreateChallenge(attempt.ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: deviceID}))
 	if err != nil {
 		if connect.CodeOf(err) == connect.CodeNotFound {
 			return nil, ErrUnknownDevice
 		}
-		return nil, c.attemptError(parent, attempt, "create challenge", err)
+		return nil, attempt.stepError("create challenge", err)
 	}
 	return resp.Msg.GetNonce(), nil
 }
 
 // Authenticate gets a new device session credential, or the removal notice.
-// The challenge and the signed call share one attempt deadline
-// (Client.AuthTimeout); an attempt that exceeds it returns an error that
-// matches context.DeadlineExceeded, so the caller can back off and retry.
+// The challenge and the signed call share one deadline. When the agent's
+// timeout controls the attempt, a timeout error matches context.DeadlineExceeded.
 func (c *Client) Authenticate(ctx context.Context, deviceID string, key *identity.Key, stateEpoch string) (*AuthResult, error) {
-	actx, cancel := c.authContext(ctx)
+	attempt, cancel := c.startAuthAttempt(ctx)
 	defer cancel()
-	nonce, err := c.challenge(ctx, actx, deviceID)
+	nonce, err := c.challenge(attempt, deviceID)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.Agent.Authenticate(actx, connect.NewRequest(&ownsandv1.AuthenticateRequest{
+	resp, err := c.Agent.Authenticate(attempt.ctx, connect.NewRequest(&ownsandv1.AuthenticateRequest{
 		DeviceId:   deviceID,
 		Nonce:      nonce,
 		Signature:  key.Sign(identity.PurposeAuthenticate, nonce),
@@ -231,7 +237,7 @@ func (c *Client) Authenticate(ctx context.Context, deviceID string, key *identit
 		if connect.CodeOf(err) == connect.CodeNotFound {
 			return nil, ErrUnknownDevice
 		}
-		return nil, c.attemptError(ctx, actx, "authenticate", err)
+		return nil, attempt.stepError("authenticate", err)
 	}
 	switch r := resp.Msg.GetResult().(type) {
 	case *ownsandv1.AuthenticateResponse_Session:
@@ -252,16 +258,16 @@ func (c *Client) Authenticate(ctx context.Context, deviceID string, key *identit
 
 // ConfirmRemoval confirms the local clean-up of a removed device. An
 // unknown device gives ErrUnknownDevice, which the caller treats as an
-// earlier confirmation whose response was lost. Like Authenticate, one
-// attempt has the deadline Client.AuthTimeout.
+// earlier confirmation whose response was lost. Like Authenticate, both
+// RPCs share one attempt deadline.
 func (c *Client) ConfirmRemoval(ctx context.Context, deviceID string, key *identity.Key) error {
-	actx, cancel := c.authContext(ctx)
+	attempt, cancel := c.startAuthAttempt(ctx)
 	defer cancel()
-	nonce, err := c.challenge(ctx, actx, deviceID)
+	nonce, err := c.challenge(attempt, deviceID)
 	if err != nil {
 		return err
 	}
-	_, err = c.Agent.ConfirmRemoval(actx, connect.NewRequest(&ownsandv1.ConfirmRemovalRequest{
+	_, err = c.Agent.ConfirmRemoval(attempt.ctx, connect.NewRequest(&ownsandv1.ConfirmRemovalRequest{
 		DeviceId:  deviceID,
 		Nonce:     nonce,
 		Signature: key.Sign(identity.PurposeConfirmRemoval, nonce),
@@ -270,7 +276,7 @@ func (c *Client) ConfirmRemoval(ctx context.Context, deviceID string, key *ident
 		if connect.CodeOf(err) == connect.CodeNotFound {
 			return ErrUnknownDevice
 		}
-		return c.attemptError(ctx, actx, "confirm removal", err)
+		return attempt.stepError("confirm removal", err)
 	}
 	return nil
 }

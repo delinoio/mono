@@ -8,6 +8,7 @@ import {
 import { Input } from "@ui-sdk/react/input";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
+import { renderFieldLabel } from "./field-label-render.tsx";
 import { useFieldAutoFocus } from "./panel-autofocus.ts";
 
 export type TextFieldProps = React.ComponentProps<typeof Input> & {
@@ -53,7 +54,12 @@ export function TextField({
       disabled={disabled}
       invalid={hasError && !disabled ? true : undefined}
     >
-      <FieldLabel className="dui-text-field-label">{label}</FieldLabel>
+      <FieldLabel
+        className="dui-text-field-label"
+        render={renderFieldLabel(props.id, props.render != null)}
+      >
+        {label}
+      </FieldLabel>
       <Input
         className={mergeClassName("dui-text-field-input", className)}
         disabled={disabled}
