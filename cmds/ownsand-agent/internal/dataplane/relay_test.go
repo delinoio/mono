@@ -1282,6 +1282,7 @@ func (f *revokeFixture) grant(deadlineIn time.Duration, received time.Time, ids 
 		st := &rstream{id: id, g: g, conn: f.c, ctx: ctx, cancel: cancel}
 		g.streams[st] = true
 		f.c.streams[id] = st
+		f.c.highest = max(f.c.highest, id)
 		streams = append(streams, st)
 	}
 	return g, streams
@@ -1606,10 +1607,10 @@ func closeFrame(id uint64) *ownsandv1.DataFrame {
 // queue drains, and that no frame of the closed stream is queued afterwards,
 // while the connection keeps serving other streams.
 func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
-	f, g, st := blockedSendFixture(t)
+	f, _, st := blockedSendFixture(t)
 	frame := datapath.MustNewFrame(1, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("payload")}}})
 	result := make(chan error, 1)
-	go func() { result <- relaySink{st}.Send(st.ctx, frame) }()
+	go func() { result <- relaySink{f.r, st}.Send(st.ctx, frame) }()
 	select {
 	case err := <-result:
 		t.Fatalf("send returned %v while the queue was full", err)
@@ -1638,7 +1639,7 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 		t.Fatalf("a frame of the closed stream was queued after the drain: %d frames", len(f.c.out))
 	}
 	// A send on the canceled stream context queues nothing, even with room.
-	if err := (relaySink{st}).Send(st.ctx, frame); !errors.Is(err, context.Canceled) || len(f.c.out) != 0 {
+	if err := (relaySink{f.r, st}).Send(st.ctx, frame); !errors.Is(err, context.Canceled) || len(f.c.out) != 0 {
 		t.Fatalf("send after the close returned %v with %d queued", err, len(f.c.out))
 	}
 
@@ -1646,14 +1647,34 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 	if f.c.ctx.Err() != nil {
 		t.Fatal("the connection was closed")
 	}
-	ctx, cancel := context.WithCancel(f.c.ctx)
-	defer cancel()
-	other := &rstream{id: 3, g: g, conn: f.c, ctx: ctx, cancel: cancel}
+	_, otherStreams := f.grant(time.Hour, time.Now(), 3)
+	other := otherStreams[0]
 	other.send, _ = datapath.NewSendWindow(1 << 20)
-	if err := (relaySink{other}).Send(ctx, datapath.MustNewFrame(3, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("other")}}})); err != nil {
-		t.Fatalf("send on another stream: %v", err)
+	probe := newWaitProbeContext(other.ctx)
+	other.ctx = probe
+	probe.arm()
+	f.fillQueue()
+	go func() {
+		result <- (relaySink{f.r, other}).Send(probe, relayStdout(other.id, "other"))
+	}()
+	select {
+	case <-probe.waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second stream did not reach the full queue")
 	}
-	if got := <-f.c.out; got.GetStreamId() != 3 {
+	if got := <-f.c.out; got.GetRelayKeepalive() == nil {
+		t.Fatalf("first queued frame %v, want connection keepalive", got)
+	}
+	f.r.outboundDequeued(f.c)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("send on another stream: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second stream did not resume when the queue had space")
+	}
+	if got := <-f.c.out; got.GetStreamId() != other.id {
 		t.Fatalf("queued frame %v", got)
 	}
 }
@@ -1666,7 +1687,7 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 // original keepalive. The test proves with a probe context (see
 // waitProbeContext) that the notice reached its wait on the stream context
 // with a live stream and a full queue before it delivers the close. A close
-// that arrived earlier would take the early return of enqueueCtx and pass
+// that arrived earlier would take the early return of enqueueStream and pass
 // without the wait. After the close, the dispatcher must return while the
 // queue is still full, which a wait on the connection context would not allow
 // because nothing cancels the connection. Every wait has a bound that only
