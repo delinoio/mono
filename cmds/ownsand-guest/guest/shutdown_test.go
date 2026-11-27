@@ -21,6 +21,7 @@ import (
 type shutdownRig struct {
 	srv            *Server
 	client         ownsandv1connect.GuestServiceClient
+	clock          *fakeClock
 	stop           context.CancelFunc
 	listenerClosed <-chan struct{}
 	// result receives the return value of Run.
@@ -42,7 +43,8 @@ func (l *shutdownListener) Close() error {
 
 func startShutdownRig(t *testing.T) *shutdownRig {
 	t.Helper()
-	srv, err := New(Config{StateDir: t.TempDir(), Version: "test", Clock: ClockModeIgnore, KeepaliveInterval: time.Hour, SweepInterval: time.Hour})
+	clock := &fakeClock{now: time.Now()}
+	srv, err := New(Config{StateDir: t.TempDir(), Version: "test", Clock: ClockModeIgnore, Now: clock.Now, KeepaliveInterval: time.Hour, SweepInterval: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +86,7 @@ func startShutdownRig(t *testing.T) *shutdownRig {
 	return &shutdownRig{
 		srv:            srv,
 		client:         ownsandv1connect.NewGuestServiceClient(hc, "http://guest"),
+		clock:          clock,
 		stop:           cancel,
 		listenerClosed: listener.closed,
 		result:         result,
@@ -137,7 +140,7 @@ func TestRunReturnsPromptlyWhenIdle(t *testing.T) {
 		t.Fatalf("idle Run took %v to return", d)
 	}
 	rig.srv.Close()
-	openReplacement(t, rig.srv.cfg.StateDir, 0)
+	openReplacement(t, Config{StateDir: rig.srv.cfg.StateDir}, 0)
 }
 
 func waitForRun(t *testing.T, rig *shutdownRig) {
@@ -163,11 +166,11 @@ func requireStateDirBusy(t *testing.T, dir string) {
 	}
 }
 
-func openReplacement(t *testing.T, dir string, wait time.Duration) *Server {
+func openReplacement(t *testing.T, cfg Config, wait time.Duration) *Server {
 	t.Helper()
 	deadline := time.Now().Add(wait)
 	for {
-		replacement, err := New(Config{StateDir: dir})
+		replacement, err := New(cfg)
 		if err == nil {
 			t.Cleanup(func() { replacement.Close() })
 			return replacement
@@ -176,6 +179,19 @@ func openReplacement(t *testing.T, dir string, wait time.Duration) *Server {
 			t.Fatalf("replacement start: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func requireWriteArtifacts(t *testing.T, srv *Server, req *ownsandv1.WriteFileRequest, present bool) {
+	t.Helper()
+	for _, path := range []string{tempPath(req.GetPath(), req.GetWriteId()), srv.writes.recordPath(req.GetWriteId())} {
+		_, err := os.Stat(path)
+		if present && err != nil {
+			t.Fatalf("expected staging file or recovery record %s: %v", path, err)
+		}
+		if !present && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected staging file or recovery record %s to be absent: %v", path, err)
+		}
 	}
 }
 
@@ -192,6 +208,9 @@ func TestRunWriteShutdownLockHandoff(t *testing.T) {
 			target := filepath.Join(t.TempDir(), "target")
 			rig := startShutdownRig(t)
 			dir := rig.srv.cfg.StateDir
+			h := &harness{t: t, srv: rig.srv, client: rig.client, clock: rig.clock}
+			idle := writePartialTo(t, h, filepath.Join(filepath.Dir(target), "idle"))
+			staging := requireWriteEntry(t, rig.srv.writes, idle.GetWriteId()).file
 			req := &ownsandv1.WriteFileRequest{
 				SandboxId: testSandbox, WriteId: newID(t), Path: target,
 				BindingSalt: make([]byte, 32), Data: []byte("x"),
@@ -231,6 +250,9 @@ func TestRunWriteShutdownLockHandoff(t *testing.T) {
 				}
 				rig.srv.Close()
 				requireStateDirBusy(t, dir)
+				if _, err := staging.Stat(); err != nil {
+					t.Fatalf("idle staging handle before the held write drains: %v", err)
+				}
 				release()
 			} else {
 				rig.waitForShutdownWithOpenRequest(t, 50*time.Millisecond)
@@ -250,7 +272,14 @@ func TestRunWriteShutdownLockHandoff(t *testing.T) {
 			if forced {
 				wait = 10 * time.Second
 			}
-			replacement := openReplacement(t, dir, wait)
+			replacement := openReplacement(t, Config{StateDir: dir, Now: rig.clock.Now}, wait)
+			requireWriteArtifacts(t, rig.srv, idle, true)
+			rig.clock.Advance(OperationRetention + time.Second)
+			replacement.Sweep()
+			requireWriteArtifacts(t, rig.srv, idle, false)
+			if _, err := staging.Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("idle staging handle after handoff: %v, want os.ErrClosed", err)
+			}
 			if contents, err := os.ReadFile(target); err != nil || string(contents) != "x" {
 				t.Fatalf("published target: %q, %v", contents, err)
 			}
@@ -308,25 +337,19 @@ func TestWriteSweepRetainsStateDirDuringConcurrentClose(t *testing.T) {
 			t.Fatalf("expired staging file or recovery record %s: %v", path, err)
 		}
 	}
-	replacement := openReplacement(t, dir, 0)
+	replacement := openReplacement(t, Config{StateDir: dir}, 0)
 	h.srv.Close()
 	requireStateDirBusy(t, replacement.cfg.StateDir)
 }
 
 func TestWriteCloseRejectsNewWork(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "target")
 	h := newHarness(t, nil)
 	dir := h.srv.cfg.StateDir
-	target, req := startPartialWrite(t, h)
-	staging := tempPath(target, req.GetWriteId())
-	record := h.srv.writes.recordPath(req.GetWriteId())
+	req := writePartialTo(t, h, target)
+	entry := requireWriteEntry(t, h.srv.writes, req.GetWriteId())
+	staging := entry.file
 	h.srv.Close()
-	h.clock.Advance(time.Hour)
-	h.srv.Sweep()
-	for _, path := range []string{staging, record} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("sweep worked after Close: %s: %v", path, err)
-		}
-	}
 	late := &ownsandv1.WriteFileRequest{
 		SandboxId: testSandbox, WriteId: newID(t), Path: filepath.Join(filepath.Dir(target), "late"),
 		BindingSalt: make([]byte, 32), Data: []byte("y"),
@@ -335,6 +358,24 @@ func TestWriteCloseRejectsNewWork(t *testing.T) {
 	if _, detail := h.write(late); detail.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
 		t.Fatalf("write after Close: %v, want unavailable", detail)
 	}
-	releaseWriteFiles(h)
-	openReplacement(t, dir, 0)
+	replacement := newHarness(t, func(cfg *Config) {
+		cfg.StateDir = dir
+		cfg.Now = h.clock.Now
+	})
+	requireWriteArtifacts(t, h.srv, req, true)
+	assertWriteLostAfterRestart(t, replacement, req)
+	h.clock.Advance(OperationRetention + time.Second)
+	h.srv.Sweep()
+	requireWriteArtifacts(t, h.srv, req, true)
+	replacement.srv.Sweep()
+	requireWriteArtifacts(t, h.srv, req, false)
+	if _, err := staging.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("idle staging handle after Close: %v, want os.ErrClosed", err)
+	}
+	if entry.file != nil {
+		t.Fatal("primary staging handle still registered after Close")
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
+		t.Fatalf("original target after expiry: %q, %v", got, err)
+	}
 }

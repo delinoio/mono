@@ -88,14 +88,19 @@ func startPartialWrite(t *testing.T, h *harness) (target string, req *ownsandv1.
 	t.Helper()
 	target = filepath.Join(t.TempDir(), "f")
 	releaseOnCleanup(t, h)
+	return target, writePartialTo(t, h, target)
+}
+
+func writePartialTo(t *testing.T, h *harness, target string) *ownsandv1.WriteFileRequest {
+	t.Helper()
 	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	req = &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("partial")}
+	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("partial")}
 	if _, errd := h.write(req); errd != nil {
 		t.Fatal(errd)
 	}
-	return target, req
+	return req
 }
 
 func TestWriteRecoveryExpiresStagingFileAfterRestart(t *testing.T) {
