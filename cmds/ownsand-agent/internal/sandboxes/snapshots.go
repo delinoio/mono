@@ -747,11 +747,11 @@ func (m *Manager) ImportDir(id string) (string, error) {
 }
 
 // AddImportedSnapshot records an imported snapshot as ready after its
-// content was verified and extracted into ImportDir(id)/content. It refuses
-// once the device removal started: the check, the save and the insert run
-// under mu, so that no record is written after the removal fenced the
-// imports. It also checks the channel context before and after saving the
-// record. The caller removes the record and content of an unpublished import.
+// content was verified and extracted into ImportDir(id)/content. The removal
+// check, staging and publication run under mu. The final context check runs
+// before promotion, so startup ignores abandoned staging even if the caller
+// cannot remove the directory. Once promoted, the record is also installed
+// in memory.
 func (m *Manager) AddImportedSnapshot(ctx context.Context, entry *ownsandv1.SnapshotStateEntry) (*ownsandv1.SnapshotStateEntry, error) {
 	dir, err := m.st.SnapshotDir(entry.GetSnapshotId())
 	if err != nil {
@@ -778,11 +778,14 @@ func (m *Manager) AddImportedSnapshot(ctx context.Context, entry *ownsandv1.Snap
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := m.st.SaveSnapshot(snap.rec.SnapshotID, snap.rec); err != nil {
-		return nil, fmt.Errorf("sandboxes: save imported snapshot: %w", err)
+	if err := m.st.StageSnapshot(snap.rec.SnapshotID, snap.rec); err != nil {
+		return nil, fmt.Errorf("sandboxes: stage imported snapshot: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if err := m.st.PublishSnapshot(snap.rec.SnapshotID); err != nil {
+		return nil, fmt.Errorf("sandboxes: publish imported snapshot: %w", err)
 	}
 	m.snapshots[snap.rec.SnapshotID] = snap
 	return snap.entry(), nil

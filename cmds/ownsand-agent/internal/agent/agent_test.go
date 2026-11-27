@@ -1258,7 +1258,7 @@ func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
 		}
 	})
 	a := f.h.agent
-	for _, name := range []string{"ready record write fails", "channel context ends"} {
+	for _, name := range []string{"record promotion fails", "channel context ends"} {
 		t.Run(name, func(t *testing.T) {
 			id, _ := uuidv7.NewString()
 			cmd := f.stage(t, id, false).GetImportSnapshot()
@@ -1293,8 +1293,8 @@ func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("import error = %v, want context.Canceled", err)
 				}
-			} else if err == nil || !strings.Contains(err.Error(), "save imported snapshot") {
-				t.Fatalf("import error = %v, want a ready record write failure", err)
+			} else if err == nil || !strings.Contains(err.Error(), "publish imported snapshot") {
+				t.Fatalf("import error = %v, want a record promotion failure", err)
 			}
 			if _, _, ok := a.Sandboxes.SnapshotContent(id); ok {
 				t.Error("an aborted import left a ready snapshot")
