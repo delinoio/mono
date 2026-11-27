@@ -246,14 +246,26 @@ func TestFailedInstallKeepsRunningRevocation(t *testing.T) {
 func TestFailedInstallReleasesInstallingFlag(t *testing.T) {
 	r := newRelease(t, nil)
 	u, inst, _ := newUpdater(t, r, "1.0.0", &atomic.Bool{})
-	inst.err = errors.New("boom")
+	installErr := errors.New("injected installer failure")
+	inst.err = installErr
 	if err := update(u, "1.1.0", false); err != nil {
 		t.Fatal(err)
 	}
-	u.TryInstall()
-	if _, err := u.BeginCreate(); errors.Is(err, ErrInstalling) {
-		t.Fatal("installing flag not released")
+	installed, err := u.TryInstall()
+	if calls := inst.installed.Load(); calls != 1 {
+		t.Fatalf("installer calls = %d, want 1", calls)
 	}
+	if installed || !errors.Is(err, installErr) {
+		t.Fatalf("TryInstall() = (%t, %v), want (false, error wrapping %v)", installed, err, installErr)
+	}
+	releaseCreate, err := u.BeginCreate()
+	if err != nil {
+		t.Fatalf("BeginCreate() after failed install: %v", err)
+	}
+	if releaseCreate == nil {
+		t.Fatal("BeginCreate() returned no release callback")
+	}
+	releaseCreate()
 }
 
 func TestPinnedLowerVersionAndSameVersion(t *testing.T) {

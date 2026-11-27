@@ -379,10 +379,8 @@ func testFirecrackerIntegration(t *testing.T, diskSizing bool) {
 	if baseGrown.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_BASE_IMAGE {
 		t.Fatalf("larger-disk base-image restore path %v", baseGrown.GetRestorePath())
 	}
-	baseDf, _ := e.exec(baseGrown.GetSandboxId(), "/bin/sh", "-c", "df -k / | tail -1")
-	baseFields := strings.Fields(baseDf)
-	if blocks, err := strconv.ParseInt(fieldOr(baseFields, 1), 10, 64); err != nil || blocks < 3<<19 {
-		t.Fatalf("larger-disk base-image root file system %q", baseDf)
+	if out, ex := e.exec(baseGrown.GetSandboxId(), "/bin/sh", "-c", "df -k / | tail -1"); !hasLargerRootFilesystem(out, ex) {
+		t.Fatalf("larger-disk base-image root file system %q exited %q", out, ex)
 	}
 	for _, id := range []string{sb.GetSandboxId(), restored.GetSandboxId(), cold.GetSandboxId(), grown.GetSandboxId(), baseGrown.GetSandboxId()} {
 		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {

@@ -86,48 +86,46 @@ func TestDuplicateCreateSnapshotDoesNotRaceDelete(t *testing.T) {
 func TestDuplicateCreateSnapshotAfterSandboxLockDoesNotRaceDelete(t *testing.T) {
 	e := newEnv(t)
 	sandboxID := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
-	e.m.mu.Lock()
-	sb := e.m.sandboxes[sandboxID]
-	e.m.mu.Unlock()
-
 	for range 200 {
 		snapID, _ := uuidv7.NewString()
-		// Hold the sandbox lock as the first create does, so the duplicate
-		// blocks on it before its second lookup.
-		sb.cmdMu.Lock()
-		started := make(chan struct{})
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			close(started)
-			entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID})
-			requireDuplicateCreateOutcome(t, snapID, entry, err)
-		}()
-		<-started
-		// Publish the snapshot as the first create does, then let the
-		// duplicate continue while a delete marks it.
-		if _, err := e.m.AddImportedSnapshot(context.Background(), &ownsandv1.SnapshotStateEntry{SnapshotId: snapID, GuestOs: ownsandv1.GuestOs_GUEST_OS_LINUX}); err != nil {
-			sb.cmdMu.Unlock()
-			t.Fatal(err)
-		}
-		_, release, ok := e.m.AcquireSnapshot(snapID)
-		if !ok {
-			sb.cmdMu.Unlock()
-			t.Fatalf("snapshot %s is not usable", snapID)
-		}
-		start := make(chan struct{})
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}); err != nil {
-				t.Errorf("delete = %v", err)
-			}
-		}()
-		close(start)
-		sb.cmdMu.Unlock()
-		wg.Wait()
-		release()
+		raceWaitingDuplicateCreateAndDelete(t, e, sandboxID, snapID)
 	}
+}
+
+func raceWaitingDuplicateCreateAndDelete(t *testing.T, e *env, sandboxID, snapID string) {
+	t.Helper()
+	unlock := lockSandbox(t, e, sandboxID)
+	var wg sync.WaitGroup
+	var release func()
+	defer func() {
+		unlock()
+		wg.Wait()
+		if release != nil {
+			release()
+		}
+	}()
+
+	wg.Go(func() {
+		entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID})
+		requireDuplicateCreateOutcome(t, snapID, entry, err)
+	})
+	awaitSnapshotCreateLockWait(t)
+
+	// Publish only after the duplicate misses its first lookup. Keep a
+	// reader until both commands finish so delete only marks the snapshot.
+	if _, err := e.m.AddImportedSnapshot(context.Background(), &ownsandv1.SnapshotStateEntry{SnapshotId: snapID, GuestOs: ownsandv1.GuestOs_GUEST_OS_LINUX}); err != nil {
+		t.Fatal(err)
+	}
+	_, release, ok := e.m.AcquireSnapshot(snapID)
+	if !ok {
+		t.Fatalf("snapshot %s is not usable", snapID)
+	}
+	start := make(chan struct{})
+	wg.Go(func() {
+		<-start
+		if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}); err != nil {
+			t.Errorf("delete = %v", err)
+		}
+	})
+	close(start)
 }

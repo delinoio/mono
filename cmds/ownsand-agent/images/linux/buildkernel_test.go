@@ -14,8 +14,7 @@ import (
 
 // stubKernelDocker replaces docker for build-kernel.sh. It records its
 // arguments, one per line, in $STUB_LOG_DIR/docker.args and writes the kernel
-// and config using the production copy commands against the host output
-// directory, so the script runs without Docker.
+// and config using the production copy commands against the mounted stage.
 const stubKernelDocker = `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$@" >"$STUB_LOG_DIR/docker.args"
@@ -41,27 +40,43 @@ printf 'config' >.config
 if [ "${STUB_KERNEL_LATE_DIRECTORY:-}" = yes ]; then
   mkdir "$out_dir/$out_name"
   printf 'keep' >"$out_dir/$out_name/sentinel"
+  # Record the directory before the host removes the stage on failure.
+  trap 'command cp -R -- "$out_dir/$out_name" "$STUB_LOG_DIR/staged-directory"' EXIT
+fi
+if [ -n "${STUB_KERNEL_FINAL_DIRECTORY:-}" ]; then
+  mkdir "$STUB_KERNEL_FINAL_DIRECTORY"
+  printf 'keep' >"$STUB_KERNEL_FINAL_DIRECTORY/sentinel"
 fi
 cp() {
   # Model the container's GNU cp -T on both Linux and macOS hosts.
+  local no_target_directory=false
   if [ "$1" = -T ]; then
-    shift 2
-    if [ -d "$out_dir/${2#/out/}" ]; then
-      echo "output path is a directory: $2" >&2
-      return 1
-    fi
+    no_target_directory=true
+    shift
   fi
-  command cp "$1" "$out_dir/${2#/out/}"
+  if [ "$1" = -- ]; then
+    shift
+  fi
+  if "$no_target_directory" && [ -d "$out_dir/${2#/out/}" ]; then
+    echo "output path is a directory: $2" >&2
+    return 1
+  fi
+  if [ "${STUB_KERNEL_CONFIG_COPY_FAIL:-}" = yes ] && [ "$1" = .config ]; then
+    exit 37
+  fi
+  command cp -- "$1" "$out_dir/${2#/out/}"
 }
 copies="$(printf '%s\n' "${!#}" | sed -n '/^    cp /p')"
 [ -n "$copies" ]
 eval "$copies"
+exit "${STUB_KERNEL_BUILD_STATUS:-0}"
 `
 
-// stubShasum replaces shasum, which a Linux host may not have; the script
-// only prints the checksum of the kernel it built.
+// stubShasum checks the input and prints the known fixture checksum.
 const stubShasum = `#!/usr/bin/env bash
-echo "0000000000000000000000000000000000000000000000000000000000000000  ${3:--}"
+IFS= read -r input || :
+[ "$#" -eq 2 ] && [ "$1" = -a ] && [ "$2" = 256 ] && [ "$input" = kernel ] || exit 4
+printf '%s  -\n' '` + fixtureKernelSHA256 + `'
 `
 
 const stubFailedShasum = "#!/usr/bin/env bash\nexit 3\n"
@@ -114,7 +129,7 @@ func newKernelBuild(t *testing.T) *kernelBuild {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"bash", "basename", "cp", "cut", "dirname", "mkdir", "sed"} {
+	for _, name := range []string{"bash", "basename", "cp", "dirname", "mkdir", "mktemp", "mv", "rm", "rmdir", "sed"} {
 		path, err := exec.LookPath(name)
 		if err != nil {
 			t.Fatal(err)
@@ -280,38 +295,236 @@ func TestBuildKernelCachePathThatIsAFileFailsBeforeDocker(t *testing.T) {
 }
 
 func TestBuildKernelRejectsDirectoryAtOutput(t *testing.T) {
-	for _, when := range []string{"existing", "during build"} {
-		t.Run(when, func(t *testing.T) {
+	for _, name := range []string{"vmlinux", "vmlinux.config"} {
+		for _, when := range []string{"existing", "during build"} {
+			t.Run(name+"/"+when, func(t *testing.T) {
+				b := newKernelBuild(t)
+				path := filepath.Join(b.work, name)
+				other := "vmlinux"
+				if name == other {
+					other = "vmlinux.config"
+				}
+				b.writeOutput(other, "old-"+other)
+				var env []string
+				if when == "existing" {
+					if err := os.Mkdir(path, 0o755); err != nil {
+						t.Fatal(err)
+					}
+					b.writeOutput(filepath.Join(name, "sentinel"), "keep")
+				} else {
+					env = append(env, "STUB_KERNEL_FINAL_DIRECTORY="+path)
+				}
+				out, err := b.run(nil, env...)
+				requireBuildFailure(t, out, err, "kernel output path is a directory:")
+				if !strings.Contains(out, name+"\n") {
+					t.Fatalf("failure did not name %s:\n%s", name, out)
+				}
+				if ran := b.dockerArgs() != nil; ran != (when == "during build") {
+					t.Fatalf("docker ran = %t with %s directory", ran, when)
+				}
+				requireSentinelDirectory(t, path)
+				b.requireOutput(other, "old-"+other)
+				b.requireNoStage()
+			})
+		}
+	}
+}
+
+func TestBuildKernelRejectsDirectoryAtStagedKernel(t *testing.T) {
+	t.Run("during build", func(t *testing.T) {
+		b := newKernelBuild(t)
+		out, err := b.run(nil, "STUB_KERNEL_LATE_DIRECTORY=yes")
+		requireSentinelDirectory(t, filepath.Join(b.logs, "staged-directory"))
+		requireBuildFailure(t, out, err, "output path is a directory: /out/vmlinux")
+		b.requireOutputPair("", "")
+		b.requireNoStage()
+	})
+}
+
+func requireSentinelDirectory(t *testing.T, path string) {
+	t.Helper()
+	entries, err := os.ReadDir(path)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "sentinel" {
+		t.Fatalf("directory %s should contain only the sentinel, got %v, %v", path, entries, err)
+	}
+	data, err := os.ReadFile(filepath.Join(path, "sentinel"))
+	if err != nil || string(data) != "keep" {
+		t.Fatalf("sentinel = %q, %v", data, err)
+	}
+}
+
+func requireBuildFailure(t *testing.T, out string, err error, diagnostic string) {
+	t.Helper()
+	if err == nil || !strings.Contains(out, diagnostic) || strings.Contains(out, "wrote ") {
+		t.Fatalf("want a failure with %q and no success message, got %v\n%s", diagnostic, err, out)
+	}
+}
+
+func (b *kernelBuild) writeOutput(name, contents string) {
+	b.t.Helper()
+	if err := os.WriteFile(filepath.Join(b.work, name), []byte(contents), 0o644); err != nil {
+		b.t.Fatal(err)
+	}
+}
+
+func (b *kernelBuild) requireOutput(name, want string) {
+	b.t.Helper()
+	got, err := os.ReadFile(filepath.Join(b.work, name))
+	if want == "" && os.IsNotExist(err) {
+		return
+	}
+	if want == "" || err != nil || string(got) != want {
+		b.t.Fatalf("%s = %q, %v, want %q (empty means absent)", name, got, err, want)
+	}
+}
+
+func (b *kernelBuild) requireOutputPair(kernel, config string) {
+	b.t.Helper()
+	b.requireOutput("vmlinux", kernel)
+	b.requireOutput("vmlinux.config", config)
+}
+
+func (b *kernelBuild) requireNoStage() {
+	b.t.Helper()
+	matches, err := filepath.Glob(filepath.Join(b.work, ".ownsand-kernel-*"))
+	if err != nil || len(matches) != 0 {
+		b.t.Fatalf("want no staging or lock items, got %v, %v", matches, err)
+	}
+}
+
+func TestBuildKernelContainerFailurePreservesOutputs(t *testing.T) {
+	for _, failure := range []string{"STUB_KERNEL_CONFIG_COPY_FAIL=yes", "STUB_KERNEL_BUILD_STATUS=23"} {
+		for _, prior := range []string{"first build", "rebuild"} {
+			t.Run(failure+"/"+prior, func(t *testing.T) {
+				b := newKernelBuild(t)
+				kernel, config := "", ""
+				if prior == "rebuild" {
+					kernel, config = "old-kernel", "old-config"
+					b.writeOutput("vmlinux", kernel)
+					b.writeOutput("vmlinux.config", config)
+				}
+				out, err := b.run(nil, failure)
+				requireBuildFailure(t, out, err, "kernel build failed for ./vmlinux")
+				b.requireOutputPair(kernel, config)
+				b.requireNoStage()
+			})
+		}
+	}
+}
+
+const stubKernelMove = `#!/usr/bin/env bash
+set -euo pipefail
+case "$3" in
+  */out/vmlinux.config)
+    case "${STUB_KERNEL_MOVE_FAILURE:-}" in
+      sidecar) exit 42 ;;
+      late-directory)
+        mkdir "${4}vmlinux.config"
+        printf 'keep' >"${4}vmlinux.config/sentinel"
+        ;;
+    esac
+    ;;
+  */previous/vmlinux)
+    if [ "${STUB_KERNEL_RESTORE_FAILURE:-}" = yes ]; then
+      exit 43
+    fi
+    ;;
+esac
+exec "$STUB_REAL_MV" "$@"
+`
+
+func (b *kernelBuild) stubMove() string {
+	b.t.Helper()
+	path := filepath.Join(b.stub, "mv")
+	realMV, err := os.Readlink(path)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		b.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(stubKernelMove), 0o755); err != nil {
+		b.t.Fatal(err)
+	}
+	return "STUB_REAL_MV=" + realMV
+}
+
+func TestBuildKernelPublicationRollsBack(t *testing.T) {
+	for _, prior := range []string{"first build", "rebuild"} {
+		t.Run(prior, func(t *testing.T) {
 			b := newKernelBuild(t)
-			path := filepath.Join(b.work, "vmlinux")
-			var env []string
-			if when == "existing" {
-				if err := os.Mkdir(path, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(path, "sentinel"), []byte("keep"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				env = append(env, "STUB_KERNEL_LATE_DIRECTORY=yes")
+			realMV := b.stubMove()
+			kernel, config := "", ""
+			if prior == "rebuild" {
+				kernel, config = "old-kernel", "old-config"
+				b.writeOutput("vmlinux", kernel)
+				b.writeOutput("vmlinux.config", config)
 			}
-			out, err := b.run(nil, env...)
-			if err == nil || !strings.Contains(out, "./vmlinux") || strings.Contains(out, "wrote ") {
-				t.Fatalf("want a failed build naming ./vmlinux, got %v\n%s", err, out)
+			out, err := b.run(nil, realMV, "STUB_KERNEL_MOVE_FAILURE=sidecar")
+			requireBuildFailure(t, out, err, "could not publish kernel output: "+filepath.Join(realPath(t, b.work), "vmlinux.config"))
+			b.requireOutputPair(kernel, config)
+			b.requireNoStage()
+
+			out, err = b.run(nil, realMV)
+			if err != nil || !strings.Contains(out, "wrote ./vmlinux ("+fixtureKernelSHA256+")") {
+				t.Fatalf("retry failed: %v\n%s", err, out)
 			}
-			if ran := b.dockerArgs() != nil; ran != (when == "during build") {
-				t.Fatalf("docker ran = %t with %s directory", ran, when)
-			}
-			entries, err := os.ReadDir(path)
-			if err != nil || len(entries) != 1 || entries[0].Name() != "sentinel" {
-				t.Fatalf("output directory contents changed: %v, %v", entries, err)
-			}
-			data, err := os.ReadFile(filepath.Join(path, "sentinel"))
-			if err != nil || string(data) != "keep" {
-				t.Fatalf("sentinel = %q, %v", data, err)
-			}
+			b.requireOutputPair("kernel", "config")
+			b.requireNoStage()
 		})
 	}
+}
+
+func TestBuildKernelPublicationPreservesLateDirectory(t *testing.T) {
+	b := newKernelBuild(t)
+	b.writeOutput("vmlinux", "old-kernel")
+	path := filepath.Join(realPath(t, b.work), "vmlinux.config")
+	out, err := b.run(nil, b.stubMove(), "STUB_KERNEL_MOVE_FAILURE=late-directory")
+	requireBuildFailure(t, out, err, "could not publish kernel output: "+path)
+	requireSentinelDirectory(t, path)
+	b.requireOutput("vmlinux", "old-kernel")
+	b.requireNoStage()
+}
+
+func TestBuildKernelPublicationDoesNotTakeAnOccupiedLock(t *testing.T) {
+	b := newKernelBuild(t)
+	b.writeOutput("vmlinux", "old-kernel")
+	b.writeOutput("vmlinux.config", "old-config")
+	const lock = ".ownsand-kernel-publish.lock"
+	path := filepath.Join(b.work, lock)
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b.writeOutput(filepath.Join(lock, "sentinel"), "keep")
+	out, err := b.run(nil)
+	requireBuildFailure(t, out, err, "could not acquire kernel publication lock:")
+	b.requireOutputPair("old-kernel", "old-config")
+	requireSentinelDirectory(t, path)
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	b.requireNoStage()
+}
+
+func TestBuildKernelRetainsRecoveryFiles(t *testing.T) {
+	b := newKernelBuild(t)
+	b.writeOutput("vmlinux", "old-kernel")
+	b.writeOutput("vmlinux.config", "old-config")
+	out, err := b.run(nil, b.stubMove(), "STUB_KERNEL_MOVE_FAILURE=sidecar", "STUB_KERNEL_RESTORE_FAILURE=yes")
+	work := realPath(t, b.work)
+	requireBuildFailure(t, out, err, "could not restore "+filepath.Join(work, "vmlinux")+"\n")
+	stages, err := filepath.Glob(filepath.Join(work, ".ownsand-kernel-stage.*"))
+	if err != nil || len(stages) != 1 {
+		t.Fatalf("want one retained stage, got %v, %v", stages, err)
+	}
+	if !strings.Contains(out, "kernel rollback incomplete; recovery files are in "+stages[0]) {
+		t.Fatalf("failure did not identify the retained stage:\n%s", out)
+	}
+	saved, err := os.ReadFile(filepath.Join(stages[0], "previous", "vmlinux"))
+	if err != nil || string(saved) != "old-kernel" {
+		t.Fatalf("saved kernel = %q, %v", saved, err)
+	}
+	b.requireOutputPair("kernel", "old-config")
 }
 
 func TestBuildKernelChecksumTools(t *testing.T) {
@@ -322,37 +535,43 @@ func TestBuildKernelChecksumTools(t *testing.T) {
 		want     string
 	}{
 		{"preferred tool fails", stubFailedShasum, true, "could not compute SHA-256 for ./vmlinux"},
+		{"malformed checksum", "#!/usr/bin/env bash\nprintf 'bad checksum\\n'\n", true, "could not compute SHA-256 for ./vmlinux"},
 		{"both tools absent", "", false, "install shasum or sha256sum"},
 		{"fallback succeeds", "", true, "wrote ./vmlinux (" + fixtureKernelSHA256 + ")"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			b := newKernelBuild(t)
-			path := filepath.Join(b.stub, "shasum")
-			if tc.shasum == "" {
-				if err := os.Remove(path); err != nil {
+		for _, prior := range []string{"first build", "rebuild"} {
+			t.Run(tc.name+"/"+prior, func(t *testing.T) {
+				b := newKernelBuild(t)
+				kernel, config := "", ""
+				if prior == "rebuild" {
+					kernel, config = "old-kernel", "old-config"
+					b.writeOutput("vmlinux", kernel)
+					b.writeOutput("vmlinux.config", config)
+				}
+				path := filepath.Join(b.stub, "shasum")
+				if tc.shasum == "" {
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(path, []byte(tc.shasum), 0o755); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := os.WriteFile(path, []byte(tc.shasum), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if tc.fallback {
-				if err := os.WriteFile(filepath.Join(b.stub, "sha256sum"), []byte(stubSha256sum), 0o755); err != nil {
-					t.Fatal(err)
-				}
-			}
-			out, err := b.run(nil)
-			wantSuccess := tc.shasum == "" && tc.fallback
-			if (err == nil) != wantSuccess || strings.Contains(out, "wrote ") != wantSuccess || !strings.Contains(out, tc.want) {
-				t.Fatalf("want %q (success = %t), got %v\n%s", tc.want, wantSuccess, err, out)
-			}
-			if tc.fallback {
-				for name, want := range map[string]string{"vmlinux": "kernel", "vmlinux.config": "config"} {
-					got, err := os.ReadFile(filepath.Join(b.work, name))
-					if err != nil || string(got) != want {
-						t.Fatalf("%s = %q, %v, want %q", name, got, err, want)
+				if tc.fallback {
+					if err := os.WriteFile(filepath.Join(b.stub, "sha256sum"), []byte(stubSha256sum), 0o755); err != nil {
+						t.Fatal(err)
 					}
 				}
-			}
-		})
+				out, err := b.run(nil)
+				wantSuccess := tc.shasum == "" && tc.fallback
+				if (err == nil) != wantSuccess || strings.Contains(out, "wrote ") != wantSuccess || !strings.Contains(out, tc.want) {
+					t.Fatalf("want %q (success = %t), got %v\n%s", tc.want, wantSuccess, err, out)
+				}
+				if wantSuccess {
+					kernel, config = "kernel", "config"
+				}
+				b.requireOutputPair(kernel, config)
+				b.requireNoStage()
+			})
+		}
 	}
 }

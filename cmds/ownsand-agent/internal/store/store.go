@@ -13,6 +13,7 @@
 //	                          counter, removal record, pending update
 //	status.json               last status of the running agent (for `status`)
 //	sandboxes/<id>.json       sandbox records with TTL deadlines
+//	sandboxes/<id>.cleanup     pending failed-create cleanup markers
 //	snapshots/<id>/           snapshot record and content
 //	execs.json                exec_id records for at-most-once execution
 //	vms/<sandbox-id>/         runtime-owned VM files (disks, memory state)
@@ -54,25 +55,26 @@ const (
 	UpdateDir      = "update"
 	snapshotRecord = "record.json"
 	stagedSnapshot = ".record.pending"
+
+	sandboxCleanupSuffix = ".cleanup"
 )
 
 // ErrNotFound reports a missing record.
 var ErrNotFound = errors.New("store: record not found")
 
-// syncDir flushes a directory's entries to stable storage; see
-// syncDirectory. It is a variable so that a test can record the calls or make
-// one fail. Production code never assigns it.
-var syncDir = syncDirectory
-
 // Store is the agent state directory. It is safe for concurrent use.
 type Store struct {
 	dir string
 	mu  sync.Mutex
-	// createdParents lists the parent of every directory that Open created
-	// on the way to the state directory (the state directory itself
-	// included), deepest first. Their entries are flushed with the first
-	// durable identity write.
-	createdParents []string
+}
+
+// OpenForRead returns a store for read operations without accessing the
+// filesystem. Each read reports errors for its own path.
+func OpenForRead(dir string) (*Store, error) {
+	if dir == "" {
+		return nil, errors.New("store: state directory is required")
+	}
+	return &Store{dir: dir}, nil
 }
 
 // Open creates the state directory and its subdirectories and restricts the
@@ -80,10 +82,10 @@ type Store struct {
 // protected ACL for SYSTEM and Administrators on Windows (see
 // restrictStateDir).
 func Open(dir string) (*Store, error) {
-	if dir == "" {
-		return nil, errors.New("store: state directory is required")
+	s, err := OpenForRead(dir)
+	if err != nil {
+		return nil, err
 	}
-	createdParents := missingDirParents(dir)
 	for _, sub := range []string{"", SandboxesDir, SnapshotsDir, VMsDir, ImagesDir, UpdateDir} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
 			return nil, fmt.Errorf("store: create %s: %w", filepath.Join(dir, sub), err)
@@ -93,26 +95,7 @@ func Open(dir string) (*Store, error) {
 	if err := restrictStateDir(dir); err != nil {
 		return nil, fmt.Errorf("store: restrict state directory: %w", err)
 	}
-	return &Store{dir: dir, createdParents: createdParents}, nil
-}
-
-// missingDirParents returns the parent of dir and of each of its ancestors
-// that does not exist yet, deepest first. Open is about to create these
-// directories.
-func missingDirParents(dir string) []string {
-	var parents []string
-	for p := filepath.Clean(dir); ; {
-		if _, err := os.Lstat(p); err == nil || !errors.Is(err, fs.ErrNotExist) {
-			break
-		}
-		parent := filepath.Dir(p)
-		if parent == p {
-			break
-		}
-		parents = append(parents, parent)
-		p = parent
-	}
-	return parents
+	return s, nil
 }
 
 // Dir returns the state directory.
@@ -203,23 +186,14 @@ func (s *Store) SaveIdentity(id *Identity) error {
 	return s.writeJSON(s.Path(IdentityFile), id)
 }
 
-// SaveIdentityDurable writes the identity like SaveIdentity and then, on
-// Linux, flushes the directory entries that make the file reachable after a
-// power loss: the state directory and the parent of every directory that
-// Open created for it. Enrollment uses it for the pending key, which must
-// survive before the one-time token is spent: the control plane accepts a
-// retry of the token only for the key of the first call. When a flush
-// fails, the error is returned and the caller must not go on.
+// SaveIdentityDurable saves the pending identity and, on Linux, flushes the
+// resolved state directory and its ancestors before enrollment can spend the
+// token. If a flush fails, it returns the error and keeps the key for retry.
 func (s *Store) SaveIdentityDurable(id *Identity) error {
 	if err := s.SaveIdentity(id); err != nil {
 		return err
 	}
-	for _, d := range append([]string{s.dir}, s.createdParents...) {
-		if err := syncDir(d); err != nil {
-			return fmt.Errorf("store: sync directory %s: %w", d, err)
-		}
-	}
-	return nil
+	return s.SyncPendingIdentityDirectories()
 }
 
 // DeleteIdentity deletes the device key.
@@ -251,6 +225,12 @@ type ManifestCheckpoint struct {
 	SHA256   string `json:"sha256"`
 }
 
+// RunningRevocation records a verified revocation and its recovery target.
+type RunningRevocation struct {
+	Version       string `json:"version"`
+	TargetVersion string `json:"target_version"`
+}
+
 // AgentState is the agent record apart from the identity.
 type AgentState struct {
 	APIURL string `json:"api_url"`
@@ -258,10 +238,11 @@ type AgentState struct {
 	// reset state directory.
 	StateEpoch string `json:"state_epoch"`
 	// RevisionCounter is the last sandbox revision counter of the epoch.
-	RevisionCounter uint64              `json:"revision_counter"`
-	Removal         RemovalRecord       `json:"removal"`
-	PendingUpdate   *PendingUpdate      `json:"pending_update,omitempty"`
-	ReleaseManifest *ManifestCheckpoint `json:"release_manifest,omitempty"`
+	RevisionCounter   uint64              `json:"revision_counter"`
+	Removal           RemovalRecord       `json:"removal"`
+	PendingUpdate     *PendingUpdate      `json:"pending_update,omitempty"`
+	RunningRevocation *RunningRevocation  `json:"running_revocation,omitempty"`
+	ReleaseManifest   *ManifestCheckpoint `json:"release_manifest,omitempty"`
 	// Limits and STUN URLs of the last configuration message.
 	Limits   *Limits  `json:"limits,omitempty"`
 	STUNURLs []string `json:"stun_urls,omitempty"`
@@ -356,6 +337,51 @@ func (s *Store) LoadSandboxes(decode func(data []byte) error) error {
 	return nil
 }
 
+// SaveSandboxCleanup records a failed create before its sandbox record can
+// become terminal and be acknowledged.
+func (s *Store) SaveSandboxCleanup(id string) error {
+	if err := validID(id); err != nil {
+		return err
+	}
+	if err := WriteFileAtomic(s.Path(SandboxesDir, id+sandboxCleanupSuffix), nil, 0o600); err != nil {
+		return err
+	}
+	return s.syncSandboxCleanupDirectory()
+}
+
+// DeleteSandboxCleanup removes the marker after runtime Delete succeeds.
+// Sync even if the marker is missing, in case a previous removal succeeded
+// but its directory sync failed.
+func (s *Store) DeleteSandboxCleanup(id string) error {
+	if err := validID(id); err != nil {
+		return err
+	}
+	if err := os.Remove(s.Path(SandboxesDir, id+sandboxCleanupSuffix)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return s.syncSandboxCleanupDirectory()
+}
+
+// LoadSandboxCleanups returns failed creates that still need runtime cleanup.
+func (s *Store) LoadSandboxCleanups() ([]string, error) {
+	entries, err := os.ReadDir(s.Path(SandboxesDir))
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, entry := range entries {
+		id, marker := strings.CutSuffix(entry.Name(), sandboxCleanupSuffix)
+		// Only regular files with valid marker names belong to the inventory.
+		// A conflicting directory can prevent a marker save while the live
+		// record still needs startup reconciliation.
+		if !marker || !entry.Type().IsRegular() || validID(id) != nil {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // SnapshotDir returns the directory of one snapshot.
 func (s *Store) SnapshotDir(id string) (string, error) {
 	if err := validID(id); err != nil {
@@ -369,7 +395,7 @@ func (s *Store) SaveSnapshot(id string, v any) error {
 	return s.writeSnapshotRecord(id, snapshotRecord, v)
 }
 
-// StageSnapshot saves a capture record under a name that LoadSnapshots ignores.
+// StageSnapshot saves a snapshot record under a name that LoadSnapshots ignores.
 func (s *Store) StageSnapshot(id string, v any) error {
 	return s.writeSnapshotRecord(id, stagedSnapshot, v)
 }
@@ -385,8 +411,8 @@ func (s *Store) writeSnapshotRecord(id, name string, v any) error {
 	return s.writeJSON(filepath.Join(dir, name), v)
 }
 
-// PublishSnapshot installs the staged capture record under the loader's name.
-// The caller serializes publication with the decision to discard the capture.
+// PublishSnapshot installs the staged snapshot record under the loader's name.
+// The caller serializes publication with the decision to discard the snapshot.
 func (s *Store) PublishSnapshot(id string) error {
 	dir, err := s.SnapshotDir(id)
 	if err != nil {
@@ -455,9 +481,9 @@ func (s *Store) LoadExecs(v any) error {
 	return s.readJSON(s.Path(ExecsFile), v)
 }
 
-// WipeLocalData deletes every sandbox record, snapshot, VM file, base image
-// and update download, and the exec records. It keeps the identity and
-// agent.json.
+// WipeLocalData deletes the sandbox records, cleanup markers, snapshots, VM
+// files, base images, update downloads and exec records. It keeps the identity
+// and agent.json.
 func (s *Store) WipeLocalData() error {
 	for _, sub := range []string{SandboxesDir, SnapshotsDir, VMsDir, ImagesDir, UpdateDir} {
 		if err := removeAll(s.Path(sub)); err != nil {

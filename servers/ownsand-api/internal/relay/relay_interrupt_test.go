@@ -47,13 +47,15 @@ func TestRunWaitsForInterruptedSend(t *testing.T) {
 	limits.IdleTimeout = time.Minute
 	c := NewConn(context.Background(), "device", 1, limits)
 	send, interrupt, entered, returned := interruptibleSend()
+	t.Cleanup(func() { _ = interrupt() })
+	t.Cleanup(func() { c.Close(ErrConnClosed) })
 	var interrupts atomic.Int32
 	c.SetSendInterrupt(func() error {
 		interrupts.Add(1)
 		return interrupt()
 	})
 	done := runConn(c, blockingRecv(c), send)
-	<-entered
+	awaitSendEntry(t, entered, done)
 	c.Close(ErrReplaced)
 	if err := waitRun(t, done, 5*time.Second); !errors.Is(err, ErrReplaced) {
 		t.Fatalf("Run = %v, want %v", err, ErrReplaced)
@@ -77,7 +79,7 @@ func TestRunInterruptsBlockedSendOfIdleConnection(t *testing.T) {
 	t.Cleanup(func() { _ = interrupt() })
 	c.SetSendInterrupt(interrupt)
 	done := runConn(c, blockingRecv(c), send)
-	awaitIdleSendEntry(t, entered, done)
+	awaitSendEntry(t, entered, done)
 	clk.advance(testLimits.IdleTimeout + time.Millisecond)
 	if err := waitRun(t, done, 5*time.Second); !errors.Is(err, ErrIdle) {
 		t.Fatalf("Run = %v, want %v", err, ErrIdle)
@@ -92,9 +94,10 @@ func TestRunBoundsWaitWhenInterruptFails(t *testing.T) {
 	limits.IdleTimeout = time.Minute
 	c := NewConn(context.Background(), "device", 1, limits)
 	send, entered := blockedSend(t)
+	t.Cleanup(func() { c.Close(ErrConnClosed) })
 	c.SetSendInterrupt(func() error { return errors.New("interrupt not supported") })
 	done := runConn(c, blockingRecv(c), send)
-	<-entered
+	awaitSendEntry(t, entered, done)
 	c.Close(ErrReplaced)
 	// The send stays blocked, so Run falls back to the bounded wait.
 	if err := waitRun(t, done, time.Second); !errors.Is(err, ErrReplaced) {

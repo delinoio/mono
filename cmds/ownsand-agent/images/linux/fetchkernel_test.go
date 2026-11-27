@@ -22,8 +22,8 @@ var fetchKernelBody = []byte("the pinned guest kernel")
 // call to $STUB_OUTS, optionally waits until two stubs run at the same time
 // ($STUB_BARRIER: each creates a marker file and waits for the second one, so
 // the overlap does not depend on timing), then writes $STUB_BODY to the -o
-// file. With STUB_PARTIAL set it writes only the first bytes and fails with
-// the curl exit status 18 (partial file), like an interrupted download.
+// file. With STUB_FAIL set, it writes the full body before returning a curl
+// error so that a matching checksum cannot hide an ignored exit status.
 // STUB_DESTINATION_DIRECTORY makes the destination a directory during the download.
 const fetchKernelStubCurl = `#!/usr/bin/env bash
 set -e
@@ -34,7 +34,7 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
-echo "$out" >> "$STUB_OUTS"
+printf '%s\0' "$out" >> "$STUB_OUTS"
 if [ -n "${STUB_BARRIER:-}" ]; then
   : > "$STUB_BARRIER/started.$$"
   for _ in $(seq 1 600); do
@@ -46,15 +46,14 @@ if [ -n "${STUB_BARRIER:-}" ]; then
     exit 1
   fi
 fi
-if [ -n "${STUB_PARTIAL:-}" ]; then
-  head -c 3 "$STUB_BODY" > "$out"
-  exit 18
-fi
 if [ -n "${STUB_DESTINATION_DIRECTORY:-}" ]; then
   mkdir "$STUB_DESTINATION_DIRECTORY"
   cp "$STUB_BODY" "$STUB_DESTINATION_DIRECTORY/sentinel"
 fi
 cp "$STUB_BODY" "$out"
+if [ -n "${STUB_FAIL:-}" ]; then
+  exit 56
+fi
 `
 
 // fetchKernelStubUname reports the architecture in $STUB_ARCH, so the tests
@@ -64,12 +63,13 @@ echo "${STUB_ARCH:-x86_64}"
 `
 
 type kernelFetch struct {
-	t       *testing.T
-	script  string // temporary copy of fetch-kernel.sh pinned to the fixture
-	stub    string // directory with the stub curl and uname
-	outDir  string
-	outputs string // file that records the -o path of every download
-	sum     string // SHA-256 of the fixture kernel
+	t          *testing.T
+	script     string // temporary copy of fetch-kernel.sh pinned to the fixture
+	stub       string // directory with the stub curl and uname
+	outDir     string
+	kernelName string
+	outputs    string // file that records the -o path of every download
+	sum        string // SHA-256 of the fixture kernel
 }
 
 // newKernelFetch copies fetch-kernel.sh and replaces its pinned URL and
@@ -125,16 +125,17 @@ func newKernelFetch(t *testing.T) *kernelFetch {
 		t.Fatal(err)
 	}
 	return &kernelFetch{
-		t:       t,
-		script:  script,
-		stub:    stub,
-		outDir:  outDir,
-		outputs: filepath.Join(dir, "outputs"),
-		sum:     digest,
+		t:          t,
+		script:     script,
+		stub:       stub,
+		outDir:     outDir,
+		kernelName: "vmlinux",
+		outputs:    filepath.Join(dir, "outputs"),
+		sum:        digest,
 	}
 }
 
-func (k *kernelFetch) kernel() string { return filepath.Join(k.outDir, "vmlinux") }
+func (k *kernelFetch) kernel() string { return filepath.Join(k.outDir, k.kernelName) }
 
 // body writes a download body next to the stub and returns its path.
 func (k *kernelFetch) body(name string, data []byte) string {
@@ -176,7 +177,7 @@ func (k *kernelFetch) downloads() []string {
 	if err != nil {
 		k.t.Fatal(err)
 	}
-	return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	return strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
 }
 
 // requireKernel checks that the published kernel holds exactly want, is
@@ -223,6 +224,33 @@ func TestFetchKernelSinglePublishesReadableKernel(t *testing.T) {
 	k.requireKernel(fetchKernelBody)
 	if got := k.downloads(); len(got) != 1 {
 		t.Fatalf("downloads = %v, want 1", got)
+	}
+}
+
+func TestFetchKernelPublishesAtPathsWithNewlines(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		outDir     string
+		kernelName string
+	}{
+		{name: "parent directory", outDir: "out\npath", kernelName: "vmlinux"},
+		{name: "basename", outDir: "out", kernelName: "vmlinux\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			k := newKernelFetch(t)
+			k.outDir = filepath.Join(filepath.Dir(k.outDir), test.outDir)
+			k.kernelName = test.kernelName
+			if err := os.MkdirAll(k.outDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if out, err := k.run(k.body("good", fetchKernelBody)); err != nil {
+				t.Fatalf("fetch: %v\n%s", err, out)
+			}
+			k.requireKernel(fetchKernelBody)
+			if got := k.downloads(); len(got) != 1 {
+				t.Fatalf("downloads = %q, want 1", got)
+			}
+		})
 	}
 }
 
@@ -357,20 +385,31 @@ func TestFetchKernelFailedFetchNeverReplacesAKernelAnotherFetchPublished(t *test
 	k.requireKernel(fetchKernelBody)
 }
 
-func TestFetchKernelChecksumMismatchLeavesAnExistingKernel(t *testing.T) {
-	k := newKernelFetch(t)
-	older := []byte("an older kernel")
-	k.seed(older)
-	body := k.body("bad", []byte("wrong bytes"))
-	out, err := k.run(body)
-	if err == nil {
-		t.Fatalf("fetch succeeded with a wrong download\n%s", out)
+func TestFetchKernelVerificationFailureLeavesAnExistingKernel(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		body     []byte
+		hashFail bool
+	}{
+		{name: "digest mismatch", body: []byte("wrong bytes")},
+		{name: "hash command fails", body: fetchKernelBody, hashFail: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			k := newKernelFetch(t)
+			k.kernelName = "vm\nlinux"
+			older := []byte("an older kernel")
+			k.seed(older)
+			if test.hashFail {
+				writeFailingSHA256Sum(t, k.stub, k.sum)
+			}
+			out, err := k.run(k.body("fixture", test.body))
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				t.Fatalf("fetch with failed verification: err = %v, want nonzero exit\n%s", err, out)
+			}
+			k.requireKernel(older)
+		})
 	}
-	var exit *exec.ExitError
-	if !errors.As(err, &exit) {
-		t.Fatalf("fetch did not run to an exit status: %T", err)
-	}
-	k.requireKernel(older)
 }
 
 func TestFetchKernelChecksumMismatchPublishesNothing(t *testing.T) {
@@ -390,8 +429,10 @@ func TestFetchKernelFailedDownloadLeavesAnExistingKernel(t *testing.T) {
 	older := []byte("an older kernel")
 	k.seed(older)
 	body := k.body("good", fetchKernelBody)
-	if out, err := k.run(body, "STUB_PARTIAL=1"); err == nil {
-		t.Fatalf("fetch succeeded with an interrupted download\n%s", out)
+	out, err := k.run(body, "STUB_FAIL=1")
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		t.Fatalf("want a nonzero exit after curl fails with a complete body, got %v\n%s", err, out)
 	}
 	k.requireKernel(older)
 }

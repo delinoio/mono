@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"connectrpc.com/connect"
@@ -524,19 +525,24 @@ type lateRejectionFixture struct {
 	calls  [2]chan error
 }
 
+func newGatedUsageClient(t *testing.T, src *TokenSource) (*gatedUsageHandler, accountsv1connect.UsageServiceClient) {
+	t.Helper()
+	h := &gatedUsageHandler{gated: "Bearer token-1", arrived: make(chan struct{}, 2), reject: make(chan struct{})}
+	mux := http.NewServeMux()
+	mux.Handle(accountsv1connect.NewUsageServiceHandler(h))
+	api := httptest.NewServer(mux)
+	t.Cleanup(api.Close)
+	// Runs before api.Close, so a failed test never hangs on a held call.
+	t.Cleanup(func() { close(h.reject) })
+	return h, NewUsageClient(api.Client(), api.URL+"/", src)
+}
+
 func newLateRejectionFixture(t *testing.T) *lateRejectionFixture {
 	t.Helper()
 	c := &clock{now: time.Now()}
 	f := &lateRejectionFixture{ts: &tokenServer{t: t, expires: 3600}}
 	f.src = newSource(t, f.ts, c)
-	f.h = &gatedUsageHandler{gated: "Bearer token-1", arrived: make(chan struct{}, 2), reject: make(chan struct{})}
-	mux := http.NewServeMux()
-	mux.Handle(accountsv1connect.NewUsageServiceHandler(f.h))
-	api := httptest.NewServer(mux)
-	t.Cleanup(api.Close)
-	// Runs before api.Close, so a failed test never hangs on a held call.
-	t.Cleanup(func() { close(f.h.reject) })
-	f.client = NewUsageClient(api.Client(), api.URL+"/", f.src)
+	f.h, f.client = newGatedUsageClient(t, f.src)
 	for i := range f.calls {
 		f.calls[i] = make(chan error, 1)
 		go func() {
@@ -557,17 +563,76 @@ func newLateRejectionFixture(t *testing.T) *lateRejectionFixture {
 // rejectOne makes the API reject one held call and returns that call's error.
 func (f *lateRejectionFixture) rejectOne(t *testing.T) error {
 	t.Helper()
-	f.h.reject <- struct{}{}
-	for {
-		for _, ch := range f.calls {
-			select {
-			case err := <-ch:
-				return err
-			default:
-			}
-		}
-		time.Sleep(time.Millisecond)
+	rpcErr, fixtureErr := f.waitForRejection(5 * time.Second)
+	if fixtureErr != nil {
+		t.Fatal(fixtureErr)
 	}
+	return rpcErr
+}
+
+func (f *lateRejectionFixture) waitForRejection(timeout time.Duration) (rpcErr, fixtureErr error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case f.h.reject <- struct{}{}:
+	case <-timer.C:
+		return nil, errors.New("timed out sending the rejection to the fake API")
+	}
+
+	select {
+	case err := <-f.calls[0]:
+		return err, nil
+	case err := <-f.calls[1]:
+		return err, nil
+	case <-timer.C:
+		return nil, errors.New("timed out waiting for the rejected RPC result")
+	}
+}
+
+func TestLateRejectionFixtureDeadline(t *testing.T) {
+	const timeout = 20 * time.Millisecond
+
+	t.Run("no rejection recipient", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := &lateRejectionFixture{
+				h:     &gatedUsageHandler{reject: make(chan struct{})},
+				calls: [2]chan error{make(chan error, 1), make(chan error, 1)},
+			}
+			f.calls[0] <- errors.New("early RPC result")
+
+			start := time.Now()
+			rpcErr, fixtureErr := f.waitForRejection(timeout)
+			if rpcErr != nil || fixtureErr == nil || fixtureErr.Error() != "timed out sending the rejection to the fake API" {
+				t.Fatalf("RPC error = %v, fixture error = %v", rpcErr, fixtureErr)
+			}
+			if elapsed := time.Since(start); elapsed != timeout {
+				t.Fatalf("send wait = %v, want %v", elapsed, timeout)
+			}
+		})
+	})
+
+	t.Run("no RPC result", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := &lateRejectionFixture{
+				h:     &gatedUsageHandler{reject: make(chan struct{})},
+				calls: [2]chan error{make(chan error, 1), make(chan error, 1)},
+			}
+			go func() {
+				time.Sleep(timeout / 2)
+				<-f.h.reject
+			}()
+
+			start := time.Now()
+			rpcErr, fixtureErr := f.waitForRejection(timeout)
+			if rpcErr != nil || fixtureErr == nil || fixtureErr.Error() != "timed out waiting for the rejected RPC result" {
+				t.Fatalf("RPC error = %v, fixture error = %v", rpcErr, fixtureErr)
+			}
+			if elapsed := time.Since(start); elapsed != timeout {
+				t.Fatalf("combined send and result wait = %v, want %v", elapsed, timeout)
+			}
+		})
+	})
 }
 
 func TestUsageClientLateRejectionKeepsTheReplacementToken(t *testing.T) {
@@ -618,6 +683,54 @@ func TestUsageClientLateRejectionKeepsTheReplacementRefreshInProgress(t *testing
 	// did not start a third request.
 	if tok, err := f.src.Token(context.Background()); err != nil || tok != "token-2" || f.ts.calls.Load() != 2 {
 		t.Fatalf("cached token = %q, %v (token requests %d)", tok, err, f.ts.calls.Load())
+	}
+}
+
+func TestUsageClientRejectionKeepsTheTimeBasedRefreshInProgress(t *testing.T) {
+	c := &clock{now: time.Now()}
+	ts := &tokenServer{t: t, expires: 3600}
+	src := newSource(t, ts, c)
+	h, client := newGatedUsageClient(t, src)
+	ctx := t.Context()
+	report := make(chan error, 1)
+	go func() {
+		_, err := client.ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{}))
+		report <- err
+	}()
+	select {
+	case <-h.arrived:
+	case err := <-report:
+		t.Fatalf("ReportUsage returned before reaching Accounts with token-1: %v", err)
+	case <-time.After(entryTimeout):
+		t.Fatal("ReportUsage with token-1 did not reach Accounts")
+	}
+
+	ts.block, ts.entered = make(chan struct{}), make(chan struct{}, 4)
+	c.Advance(59 * time.Minute)
+	refresh := tokenAsync(src, ctx)
+	awaitEntry(t, ts.entered, refresh, "the time-based refresh")
+
+	h.reject <- struct{}{}
+	select {
+	case err := <-report:
+		if connect.CodeOf(err) != connect.CodeUnauthenticated {
+			t.Fatalf("ReportUsage rejection = %v", err)
+		}
+	case <-time.After(entryTimeout):
+		t.Fatal("ReportUsage did not return after Accounts rejected token-1")
+	}
+
+	waiter := tokenAsync(src, ctx)
+	waitForFlightWaiters(t, src, 2)
+	ts.release()
+	if r := receive(t, refresh, "the caller that started the refresh"); r.err != nil || r.token != "token-2" {
+		t.Fatalf("refresh = %+v", r)
+	}
+	if r := receive(t, waiter, "the caller that joined the refresh"); r.err != nil || r.token != "token-2" {
+		t.Fatalf("waiter = %+v", r)
+	}
+	if tok, err := src.Token(ctx); err != nil || tok != "token-2" || ts.calls.Load() != 2 {
+		t.Fatalf("cached token = %q, %v (token requests %d)", tok, err, ts.calls.Load())
 	}
 }
 

@@ -191,9 +191,14 @@ func TestDeletePrefix(t *testing.T) {
 	}
 }
 
+type listPage struct {
+	body   string
+	status int
+}
+
 // listServer serves the ListObjectsV2 pages that pages maps by continuation
 // token ("" is the first page) and records every request token.
-func listServer(t *testing.T, prefix string, pages map[string]string) (*R2, func() []string) {
+func listServer(t *testing.T, prefix string, pages map[string]listPage) (*R2, func() []string) {
 	t.Helper()
 	var mu sync.Mutex
 	var tokens []string
@@ -203,12 +208,15 @@ func listServer(t *testing.T, prefix string, pages map[string]string) (*R2, func
 		query := req.URL.Query()
 		token := query.Get("continuation-token")
 		tokens = append(tokens, token)
-		body, ok := pages[token]
+		page, ok := pages[token]
 		if req.Method != http.MethodGet || query.Get("list-type") != "2" || query.Get("prefix") != prefix || !ok || len(tokens) > len(pages) {
-			w.WriteHeader(http.StatusBadRequest)
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		_, _ = w.Write([]byte(body))
+		if page.status != 0 {
+			w.WriteHeader(page.status)
+		}
+		_, _ = w.Write([]byte(page.body))
 	}))
 	t.Cleanup(srv.Close)
 	return &R2{Endpoint: srv.URL, Bucket: "bucket", AccessKeyID: "k", SecretAccessKey: "s"}, func() []string {
@@ -222,12 +230,12 @@ func listServer(t *testing.T, prefix string, pages map[string]string) (*R2, func
 // every key and its size is returned in order.
 func TestListPrefixFollowsContinuationTokens(t *testing.T) {
 	const prefix = "organizations/o/snapshots/s/attempts/a/"
-	r, tokens := listServer(t, prefix, map[string]string{
-		"": `<ListBucketResult><Contents><Key>` + prefix + `1</Key><Size>5242880</Size></Contents>` +
-			`<IsTruncated>true</IsTruncated><NextContinuationToken>page-2</NextContinuationToken></ListBucketResult>`,
-		"page-2": `<ListBucketResult><Contents><Key>` + prefix + `2</Key><Size>17</Size></Contents>` +
-			`<IsTruncated>true</IsTruncated><NextContinuationToken>page-3</NextContinuationToken></ListBucketResult>`,
-		"page-3": `<ListBucketResult><Contents><Key>` + prefix + `3</Key><Size>3</Size></Contents></ListBucketResult>`,
+	r, tokens := listServer(t, prefix, map[string]listPage{
+		"": {body: `<ListBucketResult><Contents><Key>` + prefix + `1</Key><Size>5242880</Size></Contents>` +
+			`<IsTruncated>true</IsTruncated><NextContinuationToken>page-2</NextContinuationToken></ListBucketResult>`},
+		"page-2": {body: `<ListBucketResult><Contents><Key>` + prefix + `2</Key><Size>17</Size></Contents>` +
+			`<IsTruncated>true</IsTruncated><NextContinuationToken>page-3</NextContinuationToken></ListBucketResult>`},
+		"page-3": {body: `<ListBucketResult><Contents><Key>` + prefix + `3</Key><Size>3</Size></Contents></ListBucketResult>`},
 	})
 	got, err := r.ListPrefix(context.Background(), prefix)
 	if err != nil {
@@ -247,14 +255,39 @@ func TestListPrefixFollowsContinuationTokens(t *testing.T) {
 // partial list.
 func TestListPrefixRejectsIncompleteListing(t *testing.T) {
 	const prefix = "p/"
-	r, _ := listServer(t, prefix, map[string]string{
-		"": `<ListBucketResult><Contents><Key>p/1</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult>`,
-	})
-	if got, err := r.ListPrefix(context.Background(), prefix); err == nil {
-		t.Fatalf("ListPrefix = %v, want an error for a truncated page without a token", got)
-	}
-	if got, err := r.ListPrefix(context.Background(), "other/"); err == nil {
-		t.Fatalf("ListPrefix of an unexpected prefix = %v, want the status error", got)
+	const firstPage = `<ListBucketResult><Contents><Key>p/1</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated>`
+	for _, tc := range []struct {
+		name       string
+		pages      map[string]listPage
+		wantTokens []string
+		wantError  string
+	}{
+		{
+			name:       "missing continuation token",
+			pages:      map[string]listPage{"": {body: firstPage + "</ListBucketResult>"}},
+			wantTokens: []string{""},
+			wantError:  "objectstore: truncated list without a continuation token",
+		},
+		{
+			name: "second page returns HTTP 400",
+			pages: map[string]listPage{
+				"":       {body: firstPage + "<NextContinuationToken>page-2</NextContinuationToken></ListBucketResult>"},
+				"page-2": {status: http.StatusBadRequest},
+			},
+			wantTokens: []string{"", "page-2"},
+			wantError:  "objectstore: list status 400",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, tokens := listServer(t, prefix, tc.pages)
+			got, err := r.ListPrefix(t.Context(), prefix)
+			if len(got) != 0 || err == nil || err.Error() != tc.wantError {
+				t.Errorf("ListPrefix = (%v, %v), want zero objects and error %q", got, err, tc.wantError)
+			}
+			if got := tokens(); !slices.Equal(got, tc.wantTokens) {
+				t.Errorf("request tokens = %q, want %q", got, tc.wantTokens)
+			}
+		})
 	}
 }
 
@@ -267,32 +300,32 @@ func TestListPrefixAndDeletePrefixRejectInvalidPages(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name       string
-		pages      map[string]string
+		pages      map[string]listPage
 		wantTokens []string
 		wantError  string
 	}{
 		{
-			name: "omitted token", pages: map[string]string{"": truncatedPage + "</ListBucketResult>"},
+			name: "omitted token", pages: map[string]listPage{"": {body: truncatedPage + "</ListBucketResult>"}},
 			wantTokens: []string{""}, wantError: "objectstore: truncated list without a continuation token",
 		},
 		{
-			name: "empty token", pages: map[string]string{"": pageWithToken("")},
+			name: "empty token", pages: map[string]listPage{"": {body: pageWithToken("")}},
 			wantTokens: []string{""}, wantError: "objectstore: truncated list without a continuation token",
 		},
 		{
-			name: "wrong root on first page", pages: map[string]string{"": wrongRoot},
+			name: "wrong root on first page", pages: map[string]listPage{"": {body: wrongRoot}},
 			wantTokens: []string{""}, wantError: "expected element type <ListBucketResult> but have <Error>",
 		},
 		{
-			name: "wrong root on later page", pages: map[string]string{"": pageWithToken("next"), "next": wrongRoot},
+			name: "wrong root on later page", pages: map[string]listPage{"": {body: pageWithToken("next")}, "next": {body: wrongRoot}},
 			wantTokens: []string{"", "next"}, wantError: "expected element type <ListBucketResult> but have <Error>",
 		},
 		{
-			name: "immediate repeat", pages: map[string]string{"": pageWithToken("page-2"), "page-2": pageWithToken("page-2")},
+			name: "immediate repeat", pages: map[string]listPage{"": {body: pageWithToken("page-2")}, "page-2": {body: pageWithToken("page-2")}},
 			wantTokens: []string{"", "page-2"}, wantError: "objectstore: repeated list continuation token",
 		},
 		{
-			name: "cycle", pages: map[string]string{"": pageWithToken("page-2"), "page-2": pageWithToken("page-3"), "page-3": pageWithToken("page-2")},
+			name: "cycle", pages: map[string]listPage{"": {body: pageWithToken("page-2")}, "page-2": {body: pageWithToken("page-3")}, "page-3": {body: pageWithToken("page-2")}},
 			wantTokens: []string{"", "page-2", "page-3"}, wantError: "objectstore: repeated list continuation token",
 		},
 	} {
@@ -323,8 +356,8 @@ func TestListPrefixAndDeletePrefixRejectInvalidPages(t *testing.T) {
 
 func TestListPrefixAcceptsNamespacedEmptyListing(t *testing.T) {
 	const prefix = "p/"
-	r, _ := listServer(t, prefix, map[string]string{
-		"": `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListBucketResult>`,
+	r, _ := listServer(t, prefix, map[string]listPage{
+		"": {body: `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListBucketResult>`},
 	})
 	if got, err := r.ListPrefix(context.Background(), prefix); err != nil || len(got) != 0 {
 		t.Fatalf("ListPrefix = (%v, %v), want an empty listing", got, err)

@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -131,6 +132,12 @@ func (f *fixture) writeSignedCurrent(t *testing.T, path string, raw []byte) {
 func TestManifestSchemaMatchesTheAgent(t *testing.T) {
 	if manifestSchema != update.ManifestSchema {
 		t.Fatalf("manifestSchema = %d, update.ManifestSchema = %d", manifestSchema, update.ManifestSchema)
+	}
+}
+
+func TestArtifactLimitMatchesTheAgent(t *testing.T) {
+	if maxArtifactBytes != update.MaxArtifactBytes {
+		t.Fatalf("maxArtifactBytes = %d, update.MaxArtifactBytes = %d", maxArtifactBytes, update.MaxArtifactBytes)
 	}
 }
 
@@ -351,6 +358,37 @@ func TestAddReleaseRejections(t *testing.T) {
 	}
 	if _, err := os.Stat(out); !os.IsNotExist(err) {
 		t.Errorf("a rejected release wrote %s", out)
+	}
+}
+
+func TestAddReleaseRejectsOversizedArtifact(t *testing.T) {
+	f := newFixture(t)
+	dir := f.artifacts(t, "artifacts", "executable", PlatformLinuxAmd64, PlatformDarwinArm64)
+	path := filepath.Join(dir, assetName("ownsand-agent", PlatformDarwinArm64))
+	if err := os.Truncate(path, maxArtifactBytes+1); err != nil {
+		t.Fatal(err)
+	}
+
+	out := filepath.Join(f.dir, "out.json")
+	want := fmt.Sprintf("artifact of darwin-arm64 (%q) is 536870913 bytes, exceeds the 536870912-byte update limit", path)
+	for _, existing := range []bool{false, true} {
+		previous := []byte("previous manifest\n")
+		if existing {
+			if err := os.WriteFile(out, previous, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		err := f.addRelease(t, "", "1.0.0", dir, out, "linux-amd64,darwin-arm64")
+		if err == nil || err.Error() != want {
+			t.Fatalf("add-release error = %v, want %q", err, want)
+		}
+		got, err := os.ReadFile(out)
+		if !existing && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reading output after a rejected release: got error %v, want os.ErrNotExist", err)
+		}
+		if existing && (err != nil || !bytes.Equal(got, previous)) {
+			t.Fatalf("output after a rejected release = %q, %v, want %q", got, err, previous)
+		}
 	}
 }
 
