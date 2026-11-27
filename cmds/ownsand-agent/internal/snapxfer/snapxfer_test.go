@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -896,32 +897,42 @@ func TestLargePartTransferUsesBoundedMemory(t *testing.T) {
 // TestPutSendsAnExactLengthReplayableBody checks the upload request: exact
 // Content-Length, the bytes of the archive and a body that can be replayed.
 func TestPutSendsAnExactLengthReplayableBody(t *testing.T) {
-	data := []byte(strings.Repeat("0123456789", 1000))
+	data := strings.Repeat("0123456789", 1000)
 	f, err := os.CreateTemp(t.TempDir(), "part")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	f.Write(append([]byte("prefix"), data...))
-	var got []byte
-	var length int64
-	var redirected bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/first" {
-			// A 307 makes the client replay the body through GetBody.
-			http.Redirect(w, r, "/second", http.StatusTemporaryRedirect)
-			redirected = true
-			return
-		}
-		length = r.ContentLength
-		got, _ = io.ReadAll(r.Body)
-	}))
-	defer srv.Close()
-	tr := &Transfer{HTTP: srv.Client(), Logger: quietLogger()}
-	if err := tr.put(context.Background(), srv.URL+"/first", f, 6, int64(len(data))); err != nil {
+	if _, err := f.WriteString("prefix" + data); err != nil {
 		t.Fatal(err)
 	}
-	if !redirected || length != int64(len(data)) || !bytes.Equal(got, data) {
-		t.Fatalf("redirected=%v length=%d body ok=%v", redirected, length, bytes.Equal(got, data))
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		got, err := io.ReadAll(r.Body)
+		if r.Method != http.MethodPut || r.ContentLength != int64(len(data)) || string(got) != data || err != nil {
+			t.Errorf("PUT replay: method=%s length=%d body matches=%v err=%v", r.Method, r.ContentLength, string(got) == data, err)
+		}
+		if r.Referer() != "" {
+			t.Error("storage received a Referer header")
+		}
+		switch r.URL.Path {
+		case "/first":
+			http.Redirect(w, r, "/second?sig=next", http.StatusTemporaryRedirect)
+		case "/second":
+			http.Redirect(w, r, "/final?sig=last", http.StatusPermanentRedirect)
+		case "/final":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	tr := &Transfer{HTTP: NewHTTPClient(5 * time.Second), Logger: quietLogger()}
+	if err := tr.put(t.Context(), srv.URL+"/first?sig=initial", f, 6, int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("storage received %d requests, want 3", got)
 	}
 }

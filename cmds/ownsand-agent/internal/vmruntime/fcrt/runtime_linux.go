@@ -421,10 +421,15 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 				return nil, err
 			}
 			clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			if err := guestclient.New(v.Dial).SetClock(clockCtx, time.Now()); err != nil {
-				r.logger.Warn("set guest clock after memory restore failed", "sandbox_id", v.id, "error", err)
-			}
+			clockErr := guestclient.New(v.Dial).SetClock(clockCtx, time.Now())
 			cancel()
+			if err := ctx.Err(); err != nil {
+				cleanup()
+				return nil, fmt.Errorf("fcrt: restore memory state: %w", err)
+			}
+			if clockErr != nil {
+				r.logger.Warn("set guest clock after memory restore failed", "sandbox_id", v.id, "error", clockErr)
+			}
 			r.logger.Info("microVM restored from memory state", "sandbox_id", v.id)
 			return v, nil
 		}

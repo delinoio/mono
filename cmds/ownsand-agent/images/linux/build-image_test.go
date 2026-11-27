@@ -3,8 +3,10 @@
 package linux
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -610,6 +612,130 @@ exec "$STUB_REAL_CP" "$@"
 	if err != nil || !slices.Equal(stages, []string{holderStage}) {
 		t.Fatalf("want only the killed publisher's stage, got %v (glob error: %v)", stages, err)
 	}
+}
+
+func TestPublicationLockOutlivesWrapperDuringMutation(t *testing.T) {
+	for _, operation := range []string{"publish", "restore", "remove"} {
+		t.Run(operation, func(t *testing.T) {
+			b := newImageBuild(t)
+			initial := "amd64"
+			if operation == "remove" {
+				initial = ""
+			} else {
+				b.seedImage(initial)
+			}
+			const mutator = `#!/usr/bin/env bash
+case "${STUB_PAUSE_MUTATOR:-}:${0##*/}:$3" in
+  publish:mv:*/out/vmlinux|restore:mv:*/previous/vmlinux|remove:rm:*/vmlinux)
+    printf 'ready\n'
+    read -r release && [ "$release" = go ] || exit 89
+    ;;
+  restore:mv:*/out/vmlinux.config|remove:mv:*/out/vmlinux.config)
+    exit 87
+    ;;
+esac
+if [ "${0##*/}" = mv ]; then
+  exec "$STUB_REAL_MV" "$@"
+fi
+exec "$STUB_REAL_RM" "$@"
+`
+			for _, tool := range []string{"mv", "rm"} {
+				real, err := exec.LookPath(tool)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b.env = append(b.env, "STUB_REAL_"+strings.ToUpper(tool)+"="+real)
+				if err := os.WriteFile(filepath.Join(b.dir, "bin", tool), []byte(mutator), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			release, notify := imageMutationBarrier(t, b, "STUB_PAUSE_MUTATOR="+operation)
+			lock := b.requireRegularLock()
+			kernel := filepath.Join(b.out, "vmlinux")
+			if operation == "publish" {
+				b.requireImage(initial)
+			} else if got, err := os.ReadFile(kernel); err != nil || string(got) != "kernel-arm64" {
+				t.Fatalf("first rename should precede %s: got %q, %v", operation, got, err)
+			}
+
+			if out, err := b.run("arm64"); err == nil ||
+				!strings.Contains(out, b.lockPath()+": another publisher holds the lock") {
+				t.Fatalf("want contention after wrapper exit while %s is paused, got %v\n%s", operation, err, out)
+			}
+			if _, err := io.WriteString(release, "go\n"); err != nil {
+				t.Fatal(err)
+			}
+			// The shim execs the real mutator. EOF means it has closed its
+			// inherited writer, even though the wrapper already exited.
+			if line, err := notify.ReadString('\n'); line != "" || err != io.EOF {
+				t.Fatalf("waiting for %s to finish: got %q, %v", operation, line, err)
+			}
+			if operation == "publish" {
+				if got, err := os.ReadFile(kernel); err != nil || string(got) != "kernel-arm64" {
+					t.Fatalf("the orphaned rename did not complete: got %q, %v", got, err)
+				}
+			} else {
+				b.requireImage(initial)
+			}
+
+			if out, err := b.run("arm64"); err != nil {
+				t.Fatalf("retry after %s finished failed: %v\n%s", operation, err, out)
+			}
+			b.requireImage("arm64")
+			if !os.SameFile(lock, b.requireRegularLock()) {
+				t.Fatal("the retry replaced the persistent lock file")
+			}
+		})
+	}
+}
+
+func imageMutationBarrier(t *testing.T, b *imageBuild, env ...string) (*os.File, *bufio.Reader) {
+	t.Helper()
+	gateRead, gateWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { gateRead.Close(); gateWrite.Close() })
+	notifyRead, notifyWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { notifyRead.Close(); notifyWrite.Close() })
+	log, err := os.Create(filepath.Join(b.logs, "publisher.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { log.Close() })
+
+	holder := b.command("arm64", env...)
+	holder.Stdin, holder.Stdout, holder.Stderr = gateRead, notifyWrite, log
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	gateRead.Close()
+	notifyWrite.Close()
+	t.Cleanup(func() {
+		_ = gateWrite.Close()
+		if holder.ProcessState == nil {
+			_ = holder.Process.Kill()
+			_ = holder.Wait()
+		}
+		_, _ = io.Copy(io.Discard, notifyRead)
+	})
+	if err := notifyRead.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	notify := bufio.NewReader(notifyRead)
+	if line, err := notify.ReadString('\n'); line != "ready\n" || err != nil {
+		t.Fatalf("publisher did not reach the mutator: got %q, %v\n%s", line, err, b.readLog("publisher.log"))
+	}
+	if err := holder.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Wait(); err == nil {
+		t.Fatal("the killed publisher reported success")
+	}
+	return gateWrite, notify
 }
 
 func TestPublicationRejectsLegacyLockDirectory(t *testing.T) {
