@@ -39,6 +39,34 @@ func TestSafeText(t *testing.T) {
 	}
 }
 
+func TestErrorAndWarningLinesEscapeControlCharacters(t *testing.T) {
+	const message = "café　sample\x1b\x07\n\r\t\x00\x7f\u009b\u2028\u202e\U000e0001\xff"
+	const escaped = "café　sample" + `\x1b\x07\n\r\t\x00\x7f\x9b\u2028\u202e\U000e0001\xff`
+	for _, tc := range []struct {
+		name, errorPrefix, warningPrefix string
+		color                            bool
+	}{
+		{"plain", "error:", "warning:", false},
+		{"color", ansiRed + "error:" + ansiReset, ansiYellow + "warning:" + ansiReset, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			a := &app{env: Env{Stderr: &stderr}, color: tc.color}
+			a.errorf("detail: %s", message)
+			if err := a.warnf("detail: %s", message); err != nil {
+				t.Fatal(err)
+			}
+			a.errorf("local message")
+			want := tc.errorPrefix + " detail: " + escaped + "\n" +
+				tc.warningPrefix + " detail: " + escaped + "\n" +
+				tc.errorPrefix + " local message\n"
+			if got := stderr.String(); got != want {
+				t.Fatalf("stderr = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestPrintFieldsEscapesControlCharacters(t *testing.T) {
 	var buf bytes.Buffer
 	a := &app{}
