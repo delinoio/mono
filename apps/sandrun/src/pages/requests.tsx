@@ -153,8 +153,16 @@ export function RequestsPage() {
       <RunnerProfileNotice query={profiles} />
       <QueryBoundary query={list} loading="Loading requests">
         {(data) => {
-          const requests = data.pages.flatMap((p) => p.requests);
-          return requests.length === 0 ? (
+          const requests = new Map<string, Request>();
+          // A change in queue order can repeat a request at a page boundary.
+          for (const page of data.pages) {
+            for (const request of page.requests) {
+              if (!requests.has(request.requestId)) {
+                requests.set(request.requestId, request);
+              }
+            }
+          }
+          return requests.size === 0 ? (
             <SetupEmpty
               organizationId={organizationId}
               title="No requests match"
@@ -181,7 +189,7 @@ export function RequestsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {requests.map((r) => {
+                  {Array.from(requests.values(), (r) => {
                     const wait = queueWaitMs(r, now);
                     return (
                       <tr key={r.requestId}>

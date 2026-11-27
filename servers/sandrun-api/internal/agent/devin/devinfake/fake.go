@@ -52,6 +52,7 @@ type entry struct {
 	Phase         string
 	AcceptorID    string
 	SessionStatus string
+	EmptyLookup   bool
 }
 
 func (e *entry) object(outpost string) map[string]any {
@@ -157,6 +158,10 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case r.Method == http.MethodGet && action == "":
+			if e.EmptyLookup {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			writeJSON(w, http.StatusOK, e.object(f.OutpostID))
 		case r.Method == http.MethodPost && action == "claim":
 			f.claimAttempts = append(f.claimAttempts, sid)
@@ -185,13 +190,13 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 				// A terminated session leaves the queue.
 				delete(f.entries, sid)
 				f.broadcastLocked("DELETED", e)
-				writeJSON(w, http.StatusOK, e.object(f.OutpostID))
+				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 			// The session returns to the queue at once.
 			e.Phase, e.AcceptorID = "pending", ""
 			f.broadcastLocked("MODIFIED", e)
-			writeJSON(w, http.StatusOK, e.object(f.OutpostID))
+			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && action == "operator-message":
 			f.messages[sid] = append(f.messages[sid], body.Message)
 			writeJSON(w, http.StatusOK, map[string]string{})
@@ -299,6 +304,13 @@ func (f *Fake) SetSessionStatusSilently(sid, status string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.entries[sid].SessionStatus = status
+}
+
+// SetEmptyLookup controls whether a queue-entry lookup returns a bodyless 200.
+func (f *Fake) SetEmptyLookup(sid string, empty bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries[sid].EmptyLookup = empty
 }
 
 // Forget removes a session without a watch event, so that reading its

@@ -129,13 +129,16 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
   const orgs = useOrganizations(organizationId !== undefined);
   const section: OrgRouteId =
     "organizationId" in route ? route.id : RouteId.Overview;
-  return (
-    <header className="topbar">
-      <Link to="/" className="brand">
-        SandRun
-      </Link>
-      {organizationId !== undefined && orgs.data !== undefined ? (
-        <div className="org-switcher">
+  let switcher: ReactNode;
+  if (organizationId !== undefined) {
+    if (showsFullError(orgs)) {
+      switcher = (
+        <ErrorNotice error={orgs.error} onRetry={() => void orgs.refetch()} />
+      );
+    } else if (orgs.data !== undefined) {
+      switcher = (
+        <>
+          {orgs.error ? <RefreshFailedNotice query={orgs} /> : null}
           <Select
             label="Organization"
             value={organizationId}
@@ -150,8 +153,17 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
               </SelectOption>
             ))}
           </Select>
-        </div>
-      ) : null}
+        </>
+      );
+    }
+  }
+
+  return (
+    <header className="topbar">
+      <Link to="/" className="brand">
+        SandRun
+      </Link>
+      {switcher ? <div className="org-switcher">{switcher}</div> : null}
       <nav className="topbar-links" aria-label="Account">
         <a href={OWNSAND_CONSOLE_URL} target="_blank" rel="noreferrer">
           OwnSand console

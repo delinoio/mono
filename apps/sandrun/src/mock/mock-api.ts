@@ -109,6 +109,7 @@ import {
 import {
   MAX_DISK_GIB,
   MAX_MEMORY_MIB,
+  MAX_QUEUE_WAIT_MS,
   MAX_TTL_MS,
   MAX_VCPU_COUNT,
 } from "../forms.ts";
@@ -173,6 +174,13 @@ export const MOCK_IDS = {
 const OTHER_ADMIN = "mock-user-ada";
 const OTHER_MEMBER = "mock-user-lin";
 const LATER_MEMBER = "mock-user-nora";
+
+const IDLE_GITHUB_RUNNER_STATES = new Set([
+  RunnerState.CREATING,
+  RunnerState.PREPARING,
+  RunnerState.WARM,
+  RunnerState.WAITING_FOR_WORK,
+]);
 
 const now = () => Date.now();
 const ts = (offsetSeconds = 0): Timestamp =>
@@ -1577,6 +1585,16 @@ export function createMockTransport(
               RequestEndReason.INTEGRATION_REMOVED,
             );
         }
+        for (const r of org.runners) {
+          if (
+            r.kind === WorkloadKind.GITHUB_JOB &&
+            r.githubInstallationId === i.githubInstallationId &&
+            r.requestId === "" &&
+            IDLE_GITHUB_RUNNER_STATES.has(r.state)
+          ) {
+            endRunner(org, r, RunnerEndReason.CLEAN_UP);
+          }
+        }
         audit(
           org,
           AuditAction.GITHUB_INSTALLATION_UNLINKED,
@@ -1913,24 +1931,26 @@ export function createMockTransport(
         const { org } = membership(req.organizationId);
         validateListFilter("kind", WorkloadKindSchema, [req.kind]);
         validateListFilter("states", RequestStateSchema, req.states);
+        const hasStateFilter = req.states.length > 0;
         const active = org.requests
           .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
           .sort(compareQueueOrder);
-        const ended = req.includeEnded
-          ? org.requests
-              .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
-              .sort(
-                (a, b) =>
-                  compareTimestamps(b.endedAt, a.endedAt) ||
-                  a.requestId.localeCompare(b.requestId),
-              )
-          : [];
+        const ended =
+          hasStateFilter || req.includeEnded
+            ? org.requests
+                .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
+                .sort(
+                  (a, b) =>
+                    compareTimestamps(b.endedAt, a.endedAt) ||
+                    a.requestId.localeCompare(b.requestId),
+                )
+            : [];
         const items = [...active, ...ended].filter(
           (r) =>
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
             (req.kind === WorkloadKind.UNSPECIFIED || r.kind === req.kind) &&
-            (req.states.length === 0 || req.states.includes(r.state)),
+            (!hasStateFilter || req.states.includes(r.state)),
         );
         const p = page(items, req);
         return { requests: p.items, nextPageToken: p.nextPageToken };
@@ -1972,10 +1992,11 @@ export function createMockTransport(
         validateListFilter("states", RunnerStateSchema, req.states);
         const items = org.runners.filter(
           (r) =>
-            (req.includeEnded || !TERMINAL_RUNNER_STATES.has(r.state)) &&
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
-            (req.states.length === 0 || req.states.includes(r.state)),
+            (req.states.length > 0
+              ? req.states.includes(r.state)
+              : req.includeEnded || !TERMINAL_RUNNER_STATES.has(r.state)),
         );
         const p = page(items, req);
         return { runners: p.items, nextPageToken: p.nextPageToken };
@@ -1993,6 +2014,12 @@ export function createMockTransport(
         const r = org.runners.find((x) => x.runnerId === req.runnerId);
         if (r === undefined)
           throw new ConnectError("runner not found", Code.NotFound);
+        if (
+          r.state === RunnerState.DELETING ||
+          TERMINAL_RUNNER_STATES.has(r.state)
+        ) {
+          return { runner: r };
+        }
         endRunner(org, r, RunnerEndReason.DELETED_BY_USER);
         audit(
           org,
@@ -2136,15 +2163,17 @@ export function createMockTransport(
         );
         if (k === undefined)
           throw new ConnectError("API key not found", Code.NotFound);
-        k.state = ApiKeyState.REVOKED;
-        k.revokedAt = ts();
-        audit(
-          org,
-          AuditAction.API_KEY_REVOKED,
-          AuditTargetKind.API_KEY,
-          k.apiKeyId,
-          userId,
-        );
+        if (k.state !== ApiKeyState.REVOKED) {
+          k.state = ApiKeyState.REVOKED;
+          k.revokedAt = ts();
+          audit(
+            org,
+            AuditAction.API_KEY_REVOKED,
+            AuditTargetKind.API_KEY,
+            k.apiKeyId,
+            userId,
+          );
+        }
         const { userId: _u, ...apiKey } = k;
         return { apiKey };
       },
@@ -2191,7 +2220,6 @@ export function createMockTransport(
         validateListFilter("states", RequestStateSchema, req.states);
         const items = org.devSessions.filter(
           (s) =>
-            (req.includeEnded || !TERMINAL_REQUEST_STATES.has(s.state)) &&
             (req.owner.case !== "ownedByCaller" ||
               !req.owner.value ||
               s.ownerUserId === userId) &&
@@ -2199,7 +2227,9 @@ export function createMockTransport(
               s.ownerUserId === req.owner.value) &&
             (req.runnerProfileId === "" ||
               s.runnerProfileId === req.runnerProfileId) &&
-            (req.states.length === 0 || req.states.includes(s.state)),
+            (req.states.length > 0
+              ? req.states.includes(s.state)
+              : req.includeEnded || !TERMINAL_REQUEST_STATES.has(s.state)),
         );
         const p = page(items, req);
         return { devSessions: p.items, nextPageToken: p.nextPageToken };
@@ -2293,6 +2323,26 @@ function validateProfile(p: RunnerProfile): void {
   function fail(message: string): never {
     throw new ConnectError(message, Code.InvalidArgument);
   }
+
+  function durationMilliseconds(
+    field: string,
+    duration: Duration | undefined,
+  ): bigint {
+    if (
+      duration === undefined ||
+      duration.seconds < 0n ||
+      duration.seconds > 315_576_000_000n ||
+      duration.nanos < 0 ||
+      duration.nanos >= 1_000_000_000 ||
+      (duration.seconds === 0n && duration.nanos === 0)
+    )
+      fail(`${field} must be a valid positive duration`);
+    if (duration.nanos % 1_000_000 !== 0)
+      fail(`${field} must be a whole number of milliseconds`);
+
+    return duration.seconds * 1_000n + BigInt(duration.nanos / 1_000_000);
+  }
+
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(p.name) || p.name.length > 40)
     fail("name must be lowercase kebab-case with 1 to 40 characters");
   if (p.workloadKind === WorkloadKind.UNSPECIFIED)
@@ -2327,18 +2377,14 @@ function validateProfile(p: RunnerProfile): void {
   if (r.diskGib > BigInt(MAX_DISK_GIB))
     fail(`invalid resources.disk_gib: must be at most ${MAX_DISK_GIB}`);
 
-  const nanoseconds = (duration: Duration | undefined) =>
-    (duration?.seconds ?? 0n) * 1_000_000_000n + BigInt(duration?.nanos ?? 0);
-  const idleTtl = nanoseconds(p.idleTtl);
-  const maxTtl = nanoseconds(p.maxTtl);
-  if (idleTtl <= 0n) fail("idle_ttl must be greater than zero");
-  if (maxTtl <= 0n || maxTtl > BigInt(MAX_TTL_MS) * 1_000_000n)
-    fail("max_ttl must be at most 7 days");
+  const idleTtl = durationMilliseconds("idle_ttl", p.idleTtl);
+  const maxTtl = durationMilliseconds("max_ttl", p.maxTtl);
+  if (maxTtl > BigInt(MAX_TTL_MS)) fail("max_ttl must be at most 7 days");
   if (idleTtl > maxTtl)
     fail("invalid ttl: invalid idle_ttl: must not be greater than max_ttl");
 
-  const maxQueueWaitSeconds = p.maxQueueWait?.seconds ?? 0n;
-  if (maxQueueWaitSeconds <= 0n || maxQueueWaitSeconds > 86_400n)
+  const maxQueueWait = durationMilliseconds("max_queue_wait", p.maxQueueWait);
+  if (maxQueueWait > BigInt(MAX_QUEUE_WAIT_MS))
     fail("max_queue_wait must be at most 24 hours");
   if (p.warmCount < 0 || p.warmCount > 10) fail("warm_count must be 0 to 10");
 }
