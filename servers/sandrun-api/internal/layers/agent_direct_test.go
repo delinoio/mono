@@ -44,7 +44,7 @@ func holdDirectAdmission(t *testing.T, env *testenv.Env) func() {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return holdTx(t, env, "SELECT pg_advisory_xact_lock(42)")
+	return holdTx(t, env, "SELECT pg_advisory_xact_lock(42)").commit
 }
 
 func waitForDirectAdmission(t *testing.T, env *testenv.Env, query string) {

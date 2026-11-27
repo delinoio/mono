@@ -4,12 +4,9 @@
 
 package store
 
-// SyncPendingIdentityDirectories does nothing outside Linux. See syncDirectory.
+// SyncPendingIdentityDirectories does nothing outside Linux. Windows has no
+// directory fsync. Add macOS directory flushing when its durability behavior
+// has been validated.
 func (s *Store) SyncPendingIdentityDirectories() error { return nil }
 
-// syncDirectory does nothing outside Linux. Flushing the directory entry of
-// the pending identity is a Linux guarantee only: Windows has no directory
-// fsync, and macOS stays unchanged until its own durability behavior is
-// decided and validated. Remove this no-op for a platform when that
-// platform gets its own implementation.
-func syncDirectory(string) error { return nil }
+func (s *Store) syncSandboxCleanupDirectory() error { return nil }

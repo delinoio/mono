@@ -29,15 +29,31 @@ func holdWriteResponse(t *testing.T, c *writeResultCall) <-chan struct{} {
 	return reached
 }
 
+func (c *writeResultCall) requireNoResultCreditReturn(t *testing.T, waiting <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-waiting:
+		t.Fatalf("stream %d: credit return for the late result reached the full outbound queue", c.stream)
+	default:
+	}
+	c.requireCallFrames(t, 0)
+	for _, f := range c.relay.Frames() {
+		if f.GetStreamId() == c.stream && f.GetRelayWindowUpdate() != nil {
+			t.Fatalf("stream %d: received a window update for the late result", c.stream)
+		}
+	}
+}
+
 // TestRelayWriteFileLateResultIsRejected checks that a write result that is
 // already queued when the call budget expires does not end the call with
 // success: the call fails with deadline_exceeded, the stream close frame
 // reaches the agent, and the expired result is neither counted in the call
 // record nor consumed (no window update returns its credit).
 func TestRelayWriteFileLateResultIsRejected(t *testing.T) {
-	c := startWriteResultCall(t, 3*time.Second)
+	c := startWriteResultCall(t, 4*time.Second)
+	waiting := fillOutboundQueue(t, c).WatchWindowUpdateWaitForTest(c.stream)
 	reached := holdWriteResponse(t, c)
-	c.sendWriteResult()
+	c.releaseWriteResult()
 	select {
 	case <-reached:
 	case <-time.After(10 * time.Second):
@@ -48,42 +64,33 @@ func TestRelayWriteFileLateResultIsRejected(t *testing.T) {
 		t.Fatalf("WriteFile = %v, want deadline_exceeded", err)
 	}
 	waitRelayRPC(t, c.env, c.grant, connect.CodeDeadlineExceeded)
-	// Frames of one stream leave in order, so once the close frame is there
-	// every window update the handler queued before it is there too.
-	c.relay.WaitFrame("stream close", func(f *ownsandv1.DataFrame) bool {
-		return f.GetStreamId() == c.stream && f.GetRelayStreamClose() != nil
-	})
-	if n, ok := c.callFrames(); !ok || n != 0 {
-		t.Fatalf("relay_rpc frames = %d (record found: %v), want 0: an expired result is not counted", n, ok)
-	}
-	result := &ownsandv1.WriteFileResponse{Length: int64(len("chunk"))}
-	if n := c.resultCreditReturns(result); n != 0 {
-		t.Fatalf("credit returns of the expired result = %d, want none", n)
-	}
+	c.relay.ResumeReads()
+	c.waitStreamClose(t)
+	c.requireNoResultCreditReturn(t, waiting)
 }
 
 // TestRelayWriteFileLateResultCallerCancelWins checks that a caller that left
 // before the handler looked at the queued result keeps its precedence over the
 // expired call deadline.
 func TestRelayWriteFileLateResultCallerCancelWins(t *testing.T) {
-	c := startWriteResultCall(t, 3*time.Second)
+	c := startWriteResultCall(t, 30*time.Second)
+	waiting := fillOutboundQueue(t, c).WatchWindowUpdateWaitForTest(c.stream)
 	reached := holdWriteResponse(t, c)
-	c.sendWriteResult()
+	c.releaseWriteResult()
 	select {
 	case <-reached:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the handler never took the write result off the queue")
 	}
-	// The caller leaves while the handler waits; the deadline expires after
-	// that, so both contexts are done when the handler goes on.
+	// Cancel while the handler holds the result before accounting for it.
 	c.cancel()
 	if err := c.waitDone(t, 10*time.Second); testenv.Code(err) != connect.CodeCanceled {
 		t.Fatalf("WriteFile = %v, want canceled", err)
 	}
 	waitRelayRPC(t, c.env, c.grant, connect.CodeCanceled)
-	c.relay.WaitFrame("stream close", func(f *ownsandv1.DataFrame) bool {
-		return f.GetStreamId() == c.stream && f.GetRelayStreamClose() != nil
-	})
+	c.relay.ResumeReads()
+	c.waitStreamClose(t)
+	c.requireNoResultCreditReturn(t, waiting)
 }
 
 // TestRelayWriteFileLateTerminalResponse checks that local cancellation and
@@ -93,7 +100,7 @@ func TestRelayWriteFileLateTerminalResponse(t *testing.T) {
 		for _, code := range []connect.Code{connect.CodeDeadlineExceeded, connect.CodeCanceled} {
 			t.Run(terminal.name+"/"+code.String(), func(t *testing.T) {
 				c := startWriteResultCall(t, 3*time.Second)
-				defer c.sendWriteResult()
+				defer c.releaseWriteResult()
 				reached := holdWriteResponse(t, c)
 				c.relay.SendFrame(datapath.MustNewFrame(c.stream, c.sandboxID, terminal.payload))
 				select {

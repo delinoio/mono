@@ -14,6 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
 )
 
 const cleanupFixtureName = "sandrun_test_0011223344556677"
@@ -186,24 +188,51 @@ func TestDropDatabaseSuccessDropsOnlyTheGeneratedDatabase(t *testing.T) {
 
 func TestNewURLDropsDatabaseOnCleanup(t *testing.T) {
 	admin := URL(t)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	t.Cleanup(cancel)
-
-	connect := func(t *testing.T, databaseURL string) *pgx.Conn {
-		t.Helper()
-		conn, err := pgx.Connect(ctx, databaseURL)
-		if err != nil {
-			t.Fatal("connect to the database failed")
+	t.Run("configured URL", func(t *testing.T) {
+		checkDatabaseLifecycle(t, admin, false)
+	})
+	t.Run("pool options", func(t *testing.T) {
+		separator := "?"
+		if strings.Contains(admin, "?") {
+			separator = "&"
 		}
-		t.Cleanup(func() { _ = conn.Close(ctx) })
-		return conn
-	}
+		const options = "pool_max_conns=4&application_name=sandrun-dbtest"
+		checkDatabaseLifecycle(t, admin+separator+options, true)
+	})
+}
+
+func checkDatabaseLifecycle(t *testing.T, admin string, checkPoolOptions bool) {
+	t.Helper()
+	t.Setenv(EnvTestDatabaseURL, admin)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 
 	var name string
 	if !t.Run("fixture", func(t *testing.T) {
-		conn := connect(t, NewURL(t))
-		if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&name); err != nil {
-			t.Fatal("read the generated database name failed")
+		d, err := db.Open(ctx, NewURL(t))
+		if err != nil {
+			t.Fatal("connect to the child database failed")
+		}
+		defer d.Close()
+		var migrated bool
+		if err := d.Pool.QueryRow(ctx, "SELECT current_database(), to_regclass('organizations') IS NOT NULL").Scan(&name, &migrated); err != nil {
+			t.Fatalf("read the child database name and schema: %v", err)
+		}
+		if !migrated {
+			t.Fatal("child database has no organizations table")
+		}
+		if checkPoolOptions {
+			if maxConns := d.Pool.Config().MaxConns; maxConns != 4 {
+				t.Errorf("child pool MaxConns = %d, want 4", maxConns)
+			}
+			var applicationName string
+			if err := d.Pool.QueryRow(ctx, "SHOW application_name").Scan(&applicationName); err != nil {
+				t.Fatalf("show application_name: %v", err)
+			}
+			if applicationName != "sandrun-dbtest" {
+				t.Errorf("application_name = %q, want sandrun-dbtest", applicationName)
+			}
+			t.Logf("child pool MaxConns = %d, application_name = %q", d.Pool.Config().MaxConns, applicationName)
 		}
 	}) {
 		return
@@ -212,12 +241,30 @@ func TestNewURLDropsDatabaseOnCleanup(t *testing.T) {
 		t.Fatalf("unexpected generated database name %q", name)
 	}
 
-	conn := connect(t, admin)
+	config, err := parseAdminConfig(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Fatal("connect to the admin database failed")
+	}
+	defer func() { _ = conn.Close(ctx) }()
 	var exists bool
 	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists); err != nil {
 		t.Fatal("query pg_database failed")
 	}
 	if exists {
 		t.Fatalf("database %s still exists after cleanup", name)
+	}
+	t.Logf("migrated database %s is absent from pg_database after cleanup", name)
+}
+
+func TestParseAdminConfigRejectsInvalidPoolOption(t *testing.T) {
+	admin := "postgres://fixture:fake-password@db.example.test/postgres?pool_max_conns=invalid"
+	_, err := parseAdminConfig(admin)
+	const want = "invalid PostgreSQL configuration in " + EnvTestDatabaseURL
+	if err == nil || err.Error() != want {
+		t.Fatalf("configuration error = %v, want %q", err, want)
 	}
 }

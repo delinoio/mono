@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/delinoio/mono/servers/internal/dbtesturl"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
@@ -55,14 +56,15 @@ func newURL(t testing.TB, maxVersion int64) string {
 	admin := URL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	config, err := pgx.ParseConfig(admin)
+	adminConfig, err := parseAdminConfig(admin)
 	if err != nil {
-		t.Fatalf("connect to test database: %v", err)
+		t.Fatal(err)
 	}
 	// This connection runs one statement. Close on a server error so pgx
 	// returns the error even if the connection fails before ReadyForQuery.
-	config.OnPgError = func(*pgconn.PgConn, *pgconn.PgError) bool { return false }
-	conn, err := pgx.ConnectConfig(ctx, config)
+	createConfig := adminConfig.Copy()
+	createConfig.OnPgError = func(*pgconn.PgConn, *pgconn.PgError) bool { return false }
+	conn, err := pgx.ConnectConfig(ctx, createConfig)
 	if err != nil {
 		t.Fatalf("connect to test database: %v", err)
 	}
@@ -76,7 +78,7 @@ func newURL(t testing.TB, maxVersion int64) string {
 	}, func() {
 		t.Cleanup(func() {
 			dropDatabase(t, name, func(ctx context.Context) (adminConn, error) {
-				return pgx.Connect(ctx, admin)
+				return pgx.ConnectConfig(ctx, adminConfig)
 			})
 		})
 	})
@@ -97,6 +99,15 @@ func newURL(t testing.TB, maxVersion int64) string {
 		t.Fatalf("migrate test database: %v", err)
 	}
 	return child
+}
+
+func parseAdminConfig(admin string) (*pgx.ConnConfig, error) {
+	config, err := pgxpool.ParseConfig(admin)
+	if err != nil {
+		// The parser error can include credentials from the connection string.
+		return nil, errors.New("invalid PostgreSQL configuration in " + EnvTestDatabaseURL)
+	}
+	return config.ConnConfig, nil
 }
 
 func createDatabase(name string, exec func(string) error, registerCleanup func()) error {

@@ -9,8 +9,10 @@ package scheduler
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 	"sort"
 	"time"
@@ -294,24 +296,35 @@ func allocatedVCPU(alloc *ownsandv1.DeviceAllocation) int64 {
 	return int64(alloc.GetVcpuCount())
 }
 
-// share returns the allocated share of the device's most constrained
-// resource.
-func share(d Device) float64 {
+type resourceShare struct {
+	used, limit uint64
+}
+
+func newResourceShare(used, limit int64) resourceShare {
+	if limit <= 0 {
+		return resourceShare{used: 1, limit: 1}
+	}
+	return resourceShare{used: uint64(used), limit: uint64(limit)}
+}
+
+func compareShares(a, b resourceShare) int {
+	// Compare both words of the cross-products to preserve the exact order.
+	aHigh, aLow := bits.Mul64(a.used, b.limit)
+	bHigh, bLow := bits.Mul64(b.used, a.limit)
+	if aHigh != bHigh {
+		return cmp.Compare(aHigh, bHigh)
+	}
+	return cmp.Compare(aLow, bLow)
+}
+
+// share returns the allocated share of the device's most constrained resource.
+func share(d Device) resourceShare {
 	alloc := d.Allocation
-	if alloc == nil {
-		alloc = &ownsandv1.DeviceAllocation{}
-	}
-	ratio := func(used, limit int64) float64 {
-		if limit <= 0 {
-			return 1
-		}
-		return float64(used) / float64(limit)
-	}
-	return max(
-		ratio(allocatedVCPU(alloc), validate.EffectiveVCPULimit(d.Limits)),
-		ratio(alloc.GetMemoryMib(), d.Limits.GetMemoryMib()),
-		ratio(alloc.GetDiskGib(), d.Limits.GetDiskGib()),
-	)
+	return slices.MaxFunc([]resourceShare{
+		newResourceShare(allocatedVCPU(alloc), validate.EffectiveVCPULimit(d.Limits)),
+		newResourceShare(alloc.GetMemoryMib(), d.Limits.GetMemoryMib()),
+		newResourceShare(alloc.GetDiskGib(), d.Limits.GetDiskGib()),
+	}, compareShares)
 }
 
 // Place selects a device. Among eligible devices it prefers the snapshot
@@ -363,9 +376,8 @@ func Place(req Request, devices []Device, now time.Time) (Decision, error) {
 		if ui != uj {
 			return uj
 		}
-		si, sj := share(eligible[i]), share(eligible[j])
-		if si != sj {
-			return si < sj
+		if order := compareShares(share(eligible[i]), share(eligible[j])); order != 0 {
+			return order < 0
 		}
 		return eligible[i].ID < eligible[j].ID
 	})

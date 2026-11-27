@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -510,13 +511,20 @@ func TestAPIKeyFailureRateLimit(t *testing.T) {
 	}
 	env := testenv.New(t, func(o *app.Options) { o.Limits = &limits })
 	ctx := context.Background()
-	bad := env.Clients("osk_BBBBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	const badKey = "osk_BBBBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	prefix := auth.DisplayPrefix(badKey)
+	list := func(key string) error {
+		req := connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: "01900000-0000-7000-8000-000000000000"})
+		req.Header().Set("X-Forwarded-For", "192.0.2.1")
+		_, err := env.Clients(key).Device.ListDevices(ctx, req)
+		return err
+	}
 	for i := 0; i < 3; i++ {
-		if _, err := bad.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: "01900000-0000-7000-8000-000000000000"})); testenv.Code(err) != connect.CodeUnauthenticated {
+		if err := list(badKey); testenv.Code(err) != connect.CodeUnauthenticated {
 			t.Fatalf("attempt %d: %v", i, err)
 		}
 	}
-	_, err := bad.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: "01900000-0000-7000-8000-000000000000"}))
+	err := list(badKey)
 	if testenv.Code(err) != connect.CodeResourceExhausted {
 		t.Fatalf("after failures: %v", err)
 	}
@@ -528,6 +536,97 @@ func TestAPIKeyFailureRateLimit(t *testing.T) {
 	if detail, ok := v.(*ownsandv1.ErrorDetail); derr != nil || !ok || detail.GetRetryAfter().AsDuration() <= 0 {
 		t.Fatalf("retry detail = %v, %v", v, derr)
 	}
+	env.Clock.Advance(9 * time.Second)
+	if err := list(prefix); testenv.Code(err) != connect.CodeResourceExhausted {
+		t.Fatalf("bare prefix after failures: %v", err)
+	}
+	env.Clock.Advance(time.Second)
+	if err := list(prefix); testenv.Code(err) != connect.CodeResourceExhausted {
+		t.Fatalf("bare prefix after warning interval: %v", err)
+	}
+
+	logs := env.Logs.String()
+	if strings.Contains(logs, badKey) {
+		t.Fatal("logs contain the full API key")
+	}
+	var prefixes []string
+	for line := range strings.SplitSeq(strings.TrimSpace(logs), "\n") {
+		var record struct {
+			Message string `json:"msg"`
+			Level   string `json:"level"`
+			Prefix  string `json:"key_prefix"`
+			Client  string `json:"client_address"`
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Message == "api_key_prefix_rate_limited" {
+			if record.Level != "WARN" || record.Client != "127.0.0.1" {
+				t.Fatalf("prefix warning level = %q and client = %q", record.Level, record.Client)
+			}
+			prefixes = append(prefixes, record.Prefix)
+		}
+	}
+	if !slices.Equal(prefixes, []string{prefix, "[redacted]"}) {
+		t.Fatal("expected one display prefix warning and one redacted warning 10 seconds later")
+	}
+}
+
+func TestValidAPIKeyAcceptedWhenPrefixIsRateLimited(t *testing.T) {
+	env := testenv.New(t, func(o *app.Options) {
+		o.Limits.PerPrefix = ratelimit.New(0.001, 3, o.Now)
+		// Organization setup accepts two invitations from the same client.
+		o.Limits.PerClient = ratelimit.New(0.001, 6, o.Now)
+	})
+	org := env.NewOrg("alice")
+	bad := env.Clients(otherAPIKeyWithSamePrefix(org.APIKey))
+	for i := 0; i < 3; i++ {
+		_, err := bad.Device.ListDevices(t.Context(), connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID}))
+		if testenv.Code(err) != connect.CodeUnauthenticated {
+			t.Fatalf("failed validation %d: %v", i, err)
+		}
+	}
+	_, err := bad.Device.ListDevices(t.Context(), connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID}))
+	if testenv.Code(err) != connect.CodeResourceExhausted {
+		t.Fatalf("exhausted prefix: %v", err)
+	}
+	if _, err := env.Clients(org.APIKey).Device.ListDevices(t.Context(), connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID})); err != nil {
+		t.Fatalf("valid key with exhausted prefix: %v", err)
+	}
+}
+
+func TestValidAPIKeyTakesNoRateLimitToken(t *testing.T) {
+	env := testenv.New(t, func(o *app.Options) {
+		o.Limits.PerPrefix = ratelimit.New(0.001, 3, o.Now)
+		// Organization setup accepts two invitations from the same client.
+		o.Limits.PerClient = ratelimit.New(0.001, 5, o.Now)
+	})
+	org := env.NewOrg("alice")
+	client := env.Clients(org.APIKey)
+	for i := 0; i < 5; i++ {
+		if _, err := client.Device.ListDevices(t.Context(), connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID})); err != nil {
+			t.Fatalf("valid key attempt %d: %v", i, err)
+		}
+	}
+	bad := env.Clients(otherAPIKeyWithSamePrefix(org.APIKey))
+	for i := 0; i < 3; i++ {
+		_, err := bad.Device.ListDevices(t.Context(), connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID}))
+		if testenv.Code(err) != connect.CodeUnauthenticated {
+			t.Fatalf("failed validation %d: %v", i, err)
+		}
+	}
+	if _, err := client.Device.ListDevices(t.Context(), connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID})); testenv.Code(err) != connect.CodeResourceExhausted {
+		t.Fatalf("valid key from a rate-limited client: %v", err)
+	}
+}
+
+func otherAPIKeyWithSamePrefix(key string) string {
+	n := len(auth.DisplayPrefix(key))
+	replacement := "A"
+	if key[n] == 'A' {
+		replacement = "B"
+	}
+	return key[:n] + replacement + key[n+1:]
 }
 
 func TestEnrollment(t *testing.T) {

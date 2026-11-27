@@ -6,13 +6,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
@@ -20,6 +25,7 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/devin"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/devin/devinfake"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/app"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
@@ -40,14 +46,20 @@ type devinWorld struct {
 func newDevinWorld(t *testing.T, guest sandrunv1.GuestOs) *devinWorld {
 	t.Helper()
 	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
-	w := createDevinWorld(t, guest, fake, agent.Timing{})
+	w := createDevinWorld(t, guest, fake)
 	eventually(t, "the Devin watch", func() bool { return fake.Streams() == 1 })
 	return w
 }
 
-func createDevinWorld(t *testing.T, guest sandrunv1.GuestOs, fake *devinfake.Fake, timing agent.Timing, extra ...testenv.Option) *devinWorld {
+func createDevinWorld(t *testing.T, guest sandrunv1.GuestOs, fake *devinfake.Fake, extra ...testenv.Option) *devinWorld {
 	t.Helper()
-	w := newAgentWorld(t, layers.Options{Devin: devin.Options{BaseURL: fake.Server.URL, ReleaseGrace: time.Minute}, AgentTiming: timing}, extra...)
+	return createDevinWorldWithOptions(t, guest, fake,
+		layers.Options{Devin: devin.Options{BaseURL: fake.Server.URL, ReleaseGrace: time.Minute}}, extra...)
+}
+
+func createDevinWorldWithOptions(t *testing.T, guest sandrunv1.GuestOs, fake *devinfake.Fake, opts layers.Options, extra ...testenv.Option) *devinWorld {
+	t.Helper()
+	w := newAgentWorld(t, opts, extra...)
 	dw := &devinWorld{agentWorld: w, devin: fake}
 	id := w.createIntegration(t, &sandrunv1.CreateAgentIntegrationRequest{
 		Vendor: sandrunv1.AgentVendor_AGENT_VENDOR_DEVIN, Name: "devin",
@@ -278,14 +290,15 @@ func TestDevinClaimLossAfterDispatchWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commitBinding := holdTx(t, w.env, "SELECT pg_advisory_xact_lock(42)")
+	binding := holdTx(t, w.env, "SELECT pg_advisory_xact_lock(42)")
 	const sid = "ses-dispatch-wins"
 	w.devin.AddSession(sid, true)
 	req := w.requestBySource(t, sid)
 	id := req.GetRequestId()
-	waitForLockWaiter(t, w.env)
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: binding.pid,
+		query: "UPDATE requests SET state = $2, runner_id = $3, update_time = $4"})
 	// Keep the claim change uncommitted until the fake guest starts.
-	commitClaim := holdTx(t, w.env, "SELECT 1 FROM agent_claims WHERE request_id = $1 FOR UPDATE", id)
+	claim := holdTx(t, w.env, "SELECT 1 FROM agent_claims WHERE request_id = $1 FOR UPDATE", id)
 	// Use a separate connection to observe the locks. The two fixture
 	// transactions, dispatch and claim loss can fill the default pool.
 	observer, err := pgx.ConnectConfig(ctx, w.env.DB.Pool.Config().ConnConfig)
@@ -304,9 +317,9 @@ func TestDevinClaimLossAfterDispatchWins(t *testing.T) {
 		}
 		return waiting
 	})
-	commitBinding()
+	binding.commit()
 	w.waitRunner(t, warm.GetRunnerId(), sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)
-	commitClaim()
+	claim.commit()
 	eventually(t, "the lost claim is released locally", func() bool {
 		claim, err := w.l.Agents.Claim(ctx, id)
 		return err == nil && claim.State == agent.ClaimReleased
@@ -363,12 +376,12 @@ func TestDevinClaimLossBeforeDispatchWins(t *testing.T) {
 			w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 			warm := w.warmRunner(t)
 			// Dispatch selects the warm runner and waits for its lock.
-			resumeDispatch := holdTx(t, w.env, "SELECT 1 FROM runners WHERE runner_id = $1 FOR UPDATE", warm.GetRunnerId())
+			dispatch := holdTx(t, w.env, "SELECT 1 FROM runners WHERE runner_id = $1 FOR UPDATE", warm.GetRunnerId())
 			const sid = "ses-loss-wins"
 			w.devin.AddSession(sid, true)
 			req := w.requestBySource(t, sid)
 			id := req.GetRequestId()
-			waitForLockWaiter(t, w.env)
+			waitForLockWaiter(t, w.env, lockWait{blockerPID: dispatch.pid, query: "FROM runners WHERE runner_id = $1 FOR UPDATE"})
 			w.assertClaim(t, id, agent.ClaimHeld)
 
 			tc.lost(w.devin, sid)
@@ -377,7 +390,7 @@ func TestDevinClaimLossBeforeDispatchWins(t *testing.T) {
 				t.Fatalf("unexpected cancellation: %v", canceled)
 			}
 			w.assertClaim(t, id, agent.ClaimReleased)
-			resumeDispatch()
+			dispatch.commit()
 
 			tc.lost(w.devin, sid)
 			stays(t, "the canceled request and the unassigned warm runner", func() bool {
@@ -588,29 +601,179 @@ func testDevinStartCheckPartialFailure(t *testing.T, failLookup func(*devinfake.
 	}
 }
 
-// TestDevinWatchReconnect: a stream end (scheduled, at most 5 minutes) and
-// failing watch calls (backoff) both lead to a new list, so a session whose
-// event SandRun missed is claimed; repeated events create no second request.
 func TestDevinWatchReconnect(t *testing.T) {
-	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
-	w.full()
-	lists := w.devin.Lists()
-	w.devin.FailWatches(2)
-	w.devin.EndStreams()
-	w.devin.AddSession("ses-missed", false)
-	req := w.requestBySource(t, "ses-missed")
-	// One list after the scheduled end and one after each failed watch.
-	eventually(t, "the watch is back", func() bool { return w.devin.Streams() == 1 && w.devin.Lists() >= lists+3 })
-	logs := w.env.Logs.String()
-	if !strings.Contains(logs, `"cause":"scheduled"`) || !strings.Contains(logs, `"cause":"error"`) {
-		t.Fatal("reconnects were not logged")
+	for _, protoMajor := range []int{1, 2} {
+		t.Run(fmt.Sprintf("HTTP%d", protoMajor), func(t *testing.T) {
+			const (
+				headerBudget = 300 * time.Millisecond
+				bodyBudget   = 200 * time.Millisecond
+				refresh      = 1500 * time.Millisecond
+				firstBackoff = 50 * time.Millisecond
+			)
+			fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
+			lists := make(chan time.Time, 32)
+			watches := make(chan time.Time, 32)
+			canceled := make(chan time.Time, 32)
+			var attempts atomic.Int32
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				query := r.URL.Query()
+				if r.Method == http.MethodGet && r.URL.Path == "/opbeta/outposts/devins" {
+					if query.Get("phase") == "pending" {
+						lists <- time.Now()
+					}
+					if query.Get("watch") == "true" {
+						if r.ProtoMajor != protoMajor {
+							t.Errorf("watch used %s, want HTTP/%d", r.Proto, protoMajor)
+						}
+						attempt := attempts.Add(1)
+						watches <- time.Now()
+						switch attempt {
+						case 1:
+							<-r.Context().Done()
+							canceled <- time.Now()
+							return
+						case 2:
+							w.Header().Set("Retry-After", "7")
+							w.WriteHeader(http.StatusServiceUnavailable)
+							fmt.Fprint(w, "incomplete diagnostic")
+							w.(http.Flusher).Flush()
+							<-r.Context().Done()
+							canceled <- time.Now()
+							return
+						case 3:
+							w.WriteHeader(http.StatusServiceUnavailable)
+							return
+						case 4, 5:
+							w.Header().Set("Content-Type", "text/event-stream")
+							w.WriteHeader(http.StatusOK)
+							return
+						case 7:
+							if protoMajor == 1 {
+								<-r.Context().Done()
+								canceled <- time.Now()
+								return
+							}
+						}
+					}
+				}
+				fake.Server.Config.Handler.ServeHTTP(w, r)
+			}))
+			if protoMajor == 2 {
+				server.EnableHTTP2 = true
+				server.StartTLS()
+			} else {
+				server.Start()
+			}
+			t.Cleanup(server.Close)
+			transport := server.Client().Transport.(*http.Transport).Clone()
+			transport.ResponseHeaderTimeout = headerBudget
+			t.Cleanup(transport.CloseIdleConnections)
+
+			reader := sdkmetric.NewManualReader()
+			provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+			timing := fastAgentTiming()
+			timing.BackoffMin, timing.BackoffMax = firstBackoff, 2*time.Second
+			opts := layers.Options{AgentTiming: timing, Devin: devin.Options{
+				BaseURL: server.URL, HTTP: &http.Client{Transport: transport}, WatchRefreshInterval: refresh, WatchErrorBodyTimeout: bodyBudget,
+			}}
+			w := createDevinWorldWithOptions(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, opts,
+				func(o *app.Options) { o.Metrics = provider })
+			w.full()
+			receiveDevinWatchTime(t, lists, "initial list")
+			for i, failure := range []struct {
+				budget time.Duration
+				missed string
+			}{{headerBudget, "ses-headers"}, {bodyBudget, "ses-body"}, {}, {}, {}} {
+				start := receiveDevinWatchTime(t, watches, "failing watch")
+				if failure.missed != "" {
+					fake.AddSession(failure.missed, false)
+					receiveDevinWatchTime(t, canceled, "stalled request cancellation")
+				}
+				relist := receiveDevinWatchTime(t, lists, "relist after failure")
+				backoff := firstBackoff << i
+				if elapsed := relist.Sub(start); elapsed < failure.budget+backoff {
+					t.Fatalf("attempt %d relisted after %s, want at least %s", i+1, elapsed, failure.budget+backoff)
+				}
+				if failure.missed != "" {
+					w.requestBySource(t, failure.missed)
+				}
+				t.Logf("attempt %d relisted after %s (timeout budget %s, backoff %s)", i+1, relist.Sub(start), failure.budget, backoff)
+			}
+
+			opened := receiveDevinWatchTime(t, watches, "healthy watch")
+			eventually(t, "healthy stream", func() bool { return fake.Streams() == 1 })
+			time.Sleep(time.Until(opened.Add(headerBudget + bodyBudget)))
+			fake.AddSession("ses-event", true)
+			w.requestBySource(t, "ses-event")
+			fake.Announce("ses-event")
+			fake.AddSession("ses-rotation", false)
+			rotated := receiveDevinWatchTime(t, lists, "scheduled relist")
+			receiveDevinWatchTime(t, watches, "watch after rotation")
+			if protoMajor == 2 {
+				eventually(t, "stream after rotation", func() bool { return fake.Streams() == 1 })
+			}
+			w.env.Stop()
+			if protoMajor == 1 {
+				receiveDevinWatchTime(t, canceled, "parent canceled while awaiting headers")
+			}
+			if len(lists) != 0 || attempts.Load() != 7 {
+				t.Fatalf("extra requests after cancellation: %d lists, %d total watch attempts", len(lists), attempts.Load())
+			}
+			want := []string{"ses-body", "ses-event", "ses-headers", "ses-rotation"}
+			for _, sid := range want {
+				if claims := fake.Claims(sid); claims != 1 {
+					t.Errorf("%s has %d claims, want one", sid, claims)
+				}
+			}
+			rows, err := w.env.DB.Pool.Query(t.Context(), "SELECT source_key FROM requests WHERE organization_id = $1 ORDER BY source_key", w.org.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(got, want) {
+				t.Fatalf("persisted request keys = %q, want %q, error %v", got, want, err)
+			}
+			logs := w.env.Logs.String()
+			if failed, scheduled := strings.Count(logs, `"cause":"error"`), strings.Count(logs, `"cause":"scheduled"`); failed != 5 || scheduled != 1 {
+				t.Fatalf("reconnect causes: %d errors and %d scheduled, want 5 and 1", failed, scheduled)
+			}
+			if !strings.Contains(logs, "timeout awaiting response headers") ||
+				strings.Count(logs, `"error":"the Devin queue stream ended before scheduled rotation"`) != 2 ||
+				strings.Count(logs, `"op":"watch_queue","status":503`) != 2 {
+				t.Fatal("missing reconnect or vendor status diagnostics")
+			}
+			var metrics metricdata.ResourceMetrics
+			if err := reader.Collect(t.Context(), &metrics); err != nil {
+				t.Fatal(err)
+			}
+			var reconnects int64
+			for _, scope := range metrics.ScopeMetrics {
+				for _, m := range scope.Metrics {
+					if m.Name == "sandrun_vendor_watch_reconnects" {
+						for _, point := range m.Data.(metricdata.Sum[int64]).DataPoints {
+							if vendor, _ := point.Attributes.Value("vendor"); vendor.AsString() == "DEVIN" {
+								reconnects += point.Value
+							}
+						}
+					}
+				}
+			}
+			if reconnects != 5 {
+				t.Fatalf("DEVIN reconnect count = %d, want 5", reconnects)
+			}
+			t.Logf("scheduled relist after %s, no retry on shutdown, %d failure reconnects, one claim and one stored request per session", rotated.Sub(opened), reconnects)
+		})
 	}
-	for range 3 {
-		w.devin.Announce("ses-missed")
-	}
-	stays(t, "one request", func() bool { return len(w.requests(t)) == 1 && w.devin.Claims("ses-missed") == 1 })
-	if w.request(t, req.GetRequestId()).GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
-		t.Fatal("the request left the queue")
+}
+
+func receiveDevinWatchTime(t *testing.T, observations <-chan time.Time, what string) time.Time {
+	t.Helper()
+	select {
+	case at := <-observations:
+		return at
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		return time.Time{}
 	}
 }
 
@@ -620,7 +783,7 @@ func TestDevinWatchDefaultPagination(t *testing.T) {
 	for _, sid := range sessionIDs {
 		fake.AddSession(sid, false)
 	}
-	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, agent.Timing{})
+	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake)
 	eventually(t, "the Devin watch after the default pages", func() bool {
 		return fake.Streams() == 1 || fake.Lists() > len(sessionIDs)
 	})
@@ -643,6 +806,65 @@ func TestDevinWatchDefaultPagination(t *testing.T) {
 	}
 	t.Logf("SandRun listed %d pages, claimed %q, persisted requests for %q and opened a watch at %q",
 		fake.Lists(), fake.ClaimAttempts(), sources, fake.WatchCursors())
+}
+
+func TestDevinWatchRejectsMaintenancePages(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
+	fake.ServeHTMLWatches(2)
+	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, func(o *app.Options) {
+		o.Metrics = provider
+	})
+	w.full()
+	eventually(t, "the recovered Devin stream", func() bool { return fake.Streams() == 1 })
+	fake.AddSession("ses-restored-stream", true)
+	w.requestBySource(t, "ses-restored-stream")
+
+	lists := fake.ListTimes()
+	if len(lists) != 3 {
+		t.Fatalf("list calls = %d, want one per watch attempt", len(lists))
+	}
+	backoff := fastAgentTiming().BackoffMin
+	for i := 1; i < len(lists); i++ {
+		elapsed := lists[i].Sub(lists[i-1])
+		if elapsed < backoff {
+			t.Errorf("list %d started after %v, want at least %v", i+1, elapsed, backoff)
+		}
+		backoff *= 2
+	}
+
+	logs := w.env.Logs.String()
+	if strings.Count(logs, `"msg":"vendor_watch_reconnect"`) != 2 || strings.Count(logs, `"cause":"error"`) != 2 {
+		t.Error("expected one error reconnect log per maintenance page")
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var reconnects int64
+	for _, scope := range rm.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			if metric.Name != "sandrun_vendor_watch_reconnects" {
+				continue
+			}
+			for _, point := range metric.Data.(metricdata.Sum[int64]).DataPoints {
+				vendor, _ := point.Attributes.Value("vendor")
+				if vendor.AsString() == "DEVIN" {
+					reconnects += point.Value
+				}
+			}
+		}
+	}
+	if reconnects != 2 {
+		t.Errorf("DEVIN error reconnects = %d, want 2", reconnects)
+	}
 }
 
 func TestDevinWatchPagination(t *testing.T) {
@@ -682,6 +904,27 @@ func TestDevinWatchPagination(t *testing.T) {
 			stalled:     true,
 		},
 		{
+			name: "earlier cursor repeats",
+			pages: map[string]devinfake.QueuePage{
+				"":       {SessionIDs: []string{"ses-1"}, Cursor: "page-1", HasNextPage: true},
+				"page-1": {SessionIDs: []string{"ses-2"}, Cursor: "page-2", HasNextPage: true},
+				"page-2": {SessionIDs: []string{"ses-1", "ses-3"}, Cursor: "page-1", HasNextPage: true},
+			},
+			sessions:    []string{"ses-1", "ses-2", "ses-3"},
+			watchCursor: "page-2",
+			stalled:     true,
+		},
+		{
+			name: "terminal page returns an earlier cursor",
+			pages: map[string]devinfake.QueuePage{
+				"":       {SessionIDs: []string{"ses-1"}, Cursor: "page-1", HasNextPage: true},
+				"page-1": {SessionIDs: []string{"ses-2"}, Cursor: "page-2", HasNextPage: true},
+				"page-2": {SessionIDs: []string{"ses-3"}, Cursor: "page-1"},
+			},
+			sessions:    []string{"ses-1", "ses-2", "ses-3"},
+			watchCursor: "page-1",
+		},
+		{
 			name: "advancing cursors",
 			pages: map[string]devinfake.QueuePage{
 				"":       {SessionIDs: []string{"ses-1"}, Cursor: "page-1", HasNextPage: true},
@@ -701,7 +944,7 @@ func TestDevinWatchPagination(t *testing.T) {
 				fake.AddSession(sid, false)
 			}
 			fake.SetQueuePages(t, tc.pages)
-			w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, agent.Timing{})
+			w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake)
 			eventually(t, "the Devin watch after the listed pages", func() bool {
 				return fake.Streams() == 1 || fake.Lists() > len(tc.pages)
 			})
@@ -717,9 +960,135 @@ func TestDevinWatchPagination(t *testing.T) {
 			for _, sid := range tc.sessions {
 				w.requestBySource(t, sid)
 			}
-			if warned := strings.Contains(w.env.Logs.String(), `"level":"WARN","msg":"devin_queue_pagination_stalled"`); warned != tc.stalled {
-				t.Fatalf("pagination warning present = %t, want %t", warned, tc.stalled)
+			var warnings int
+			for line := range strings.Lines(w.env.Logs.String()) {
+				if !strings.Contains(line, `"msg":"devin_queue_pagination_stalled"`) {
+					continue
+				}
+				warnings++
+				if !strings.Contains(line, `"level":"WARN"`) ||
+					!strings.Contains(line, fmt.Sprintf(`"request_cursor_present":%t`, tc.watchCursor != "")) ||
+					!strings.Contains(line, fmt.Sprintf(`"response_cursor_present":%t`, tc.pages[tc.watchCursor].Cursor != "")) {
+					t.Fatalf("unexpected pagination warning: %s", line)
+				}
+				for _, page := range tc.pages {
+					if page.Cursor != "" && strings.Contains(line, page.Cursor) {
+						t.Fatalf("pagination warning contains a cursor: %s", line)
+					}
+				}
 			}
+			wantWarnings := 0
+			if tc.stalled {
+				wantWarnings = 1
+			}
+			if warnings != wantWarnings {
+				t.Fatalf("pagination warnings = %d, want %d", warnings, wantWarnings)
+			}
+			t.Logf("Queue list calls %d, claims %q, watch cursors %q, stall warnings %d",
+				fake.Lists(), fake.ClaimAttempts(), fake.WatchCursors(), warnings)
+		})
+	}
+}
+
+func TestDevinOutpostPagination(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		lastCursor string
+		hasNext    bool
+		match      bool
+	}{
+		{name: "unmatched cycle retries", lastCursor: "page-1", hasNext: true},
+		{name: "match on the page that repeats a cursor", lastCursor: "page-1", hasNext: true, match: true},
+		{name: "match on the final page", lastCursor: "page-3", match: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
+			cursors := map[string]string{"": "page-1", "page-1": "page-2", "page-2": tc.lastCursor}
+			type lookup struct {
+				cursor string
+				at     time.Time
+			}
+			lookups := make(chan lookup, 4)
+			var count atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/opbeta/outposts" {
+					fake.Server.Config.Handler.ServeHTTP(w, r)
+					return
+				}
+				cursor := r.URL.Query().Get("cursor")
+				n := count.Add(1)
+				if n <= 4 {
+					lookups <- lookup{cursor: cursor, at: time.Now()}
+				}
+				if n == 4 && cursor == "" && !tc.match {
+					// Hold the retry before it can list the pending queue.
+					<-r.Context().Done()
+					return
+				}
+				items := "[]"
+				if cursor == "page-2" && tc.match {
+					items = fmt.Sprintf(`[{"metadata":{"outpost_id":%q},"spec":{"name":%q}}]`, fake.OutpostID, fake.OutpostName)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"items":%s,"cursor":%q,"has_next_page":%t}`, items, cursors[cursor], cursor != "page-2" || tc.hasNext)
+			}))
+			t.Cleanup(server.Close)
+
+			timing := fastAgentTiming()
+			timing.BackoffMin = 100 * time.Millisecond
+			w := createDevinWorldWithOptions(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake,
+				layers.Options{AgentTiming: timing, Devin: devin.Options{BaseURL: server.URL}})
+			want := []string{"", "page-1", "page-2"}
+			if !tc.match {
+				want = append(want, "")
+			}
+			var closingPage time.Time
+			for i, cursor := range want {
+				select {
+				case got := <-lookups:
+					if got.cursor != cursor {
+						t.Fatalf("outpost request %d used cursor %q, want %q", i+1, got.cursor, cursor)
+					}
+					if i == 2 {
+						closingPage = got.at
+					}
+					if i == 3 {
+						delay := got.at.Sub(closingPage)
+						if delay < timing.BackoffMin {
+							t.Fatalf("outpost retry after %s, want at least %s", delay, timing.BackoffMin)
+						}
+						t.Logf("Outpost retry restarted after %s", delay)
+					}
+				case <-time.After(15 * time.Second):
+					t.Fatalf("timed out waiting for outpost request %d", i+1)
+				}
+			}
+			if tc.match {
+				eventually(t, "the Devin watch after outpost lookup", func() bool {
+					return fake.Streams() == 1 || count.Load() > 3
+				})
+				if fake.Lists() != 1 || len(fake.WatchCursors()) != 1 {
+					t.Fatalf("queue list calls = %d, watch cursors = %q, want one list and one watch",
+						fake.Lists(), fake.WatchCursors())
+				}
+			} else {
+				if fake.Lists() != 0 || len(fake.WatchCursors()) != 0 {
+					t.Fatalf("queue list calls = %d, watch cursors = %q before outpost lookup succeeded",
+						fake.Lists(), fake.WatchCursors())
+				}
+				if !slices.ContainsFunc(strings.Split(w.env.Logs.String(), "\n"), func(line string) bool {
+					return strings.Contains(line, `"msg":"vendor_watch_reconnect"`) &&
+						strings.Contains(line, `"cause":"error"`) &&
+						strings.Contains(line, `"error":"no Devin outpost is named \"sandrun-outpost\""`)
+				}) {
+					t.Fatal("missing the outpost lookup error on reconnect")
+				}
+			}
+			if got := count.Load(); int(got) != len(want) {
+				t.Fatalf("outpost requests = %d, want %d", got, len(want))
+			}
+			t.Logf("Outpost request cursors %q, queue lists %d, watch cursors %q",
+				want, fake.Lists(), fake.WatchCursors())
 		})
 	}
 }

@@ -43,6 +43,14 @@ func TestEnrollStopsBeforeCallWhenPendingKeyIsNotDurable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if tc.reopen {
+				// Open the existing tree with a second Store before the first
+				// enrollment, while it still has no identity.
+				st, err = store.Open(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
 			blocked := filepath.Join(root, tc.failed)
 			// Write and search access allow the identity write. Flushing
 			// the directory entries also requires read access.
@@ -67,8 +75,7 @@ func TestEnrollStopsBeforeCallWhenPendingKeyIsNotDurable(t *testing.T) {
 			requireSyncFailure()
 			pendingKey := requirePendingKey(t, st)
 			if tc.reopen {
-				// A later enrollment process has no record of which
-				// directories the first Store created.
+				// Retry from a fresh Store that sees the saved pending key.
 				st, err = store.Open(dir)
 				if err != nil {
 					t.Fatal(err)

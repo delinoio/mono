@@ -180,6 +180,9 @@ func ErrRateLimited(retry time.Duration) error {
 // Internal passes through Connect errors and maps context errors to their
 // Connect codes. It logs unexpected errors and returns a generic message.
 func (s *Service) Internal(ctx context.Context, op string, err error) error {
+	if db.IsOwnSandTeardownPaused(err) {
+		return ErrUnavailable("OwnSand teardown is paused for rollback; retry after deployment")
+	}
 	if ce := new(connect.Error); errors.As(err, &ce) {
 		return err
 	}
