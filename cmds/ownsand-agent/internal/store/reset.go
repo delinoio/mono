@@ -31,19 +31,15 @@ func resetDir(ctx context.Context, dir string) error {
 	if dir == "" {
 		return errors.New("store: state directory is required")
 	}
-	// Stat before ReadDir: on Windows, reading a regular file as a directory
-	// fails with ERROR_PATH_NOT_FOUND, which Go maps to os.ErrNotExist, so the
-	// ReadDir error alone cannot tell an absent directory from a file.
-	info, err := os.Stat(dir)
+	closeRoot, err := prepareResetDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("store: stat state directory: %w", err)
+		return err
 	}
-	if !info.IsDir() {
-		return fmt.Errorf("store: state directory %q is not a directory", dir)
-	}
+	defer closeRoot()
+
 	unlock, err := acquireEnrollmentLock(ctx, dir)
 	if err != nil {
 		return err

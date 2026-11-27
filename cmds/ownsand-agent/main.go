@@ -265,6 +265,10 @@ func runAgentWithInstaller(ctx context.Context, cfg config.Config, installer upd
 	defer shutdown()
 	st, err := store.Open(cfg.StateDir)
 	if err != nil {
+		var rejection *store.StatePathError
+		if errors.As(err, &rejection) {
+			logger = logger.With("path", rejection.Path, "reason", string(rejection.Reason), "owner_sid", rejection.OwnerSID)
+		}
 		logger.Error("open state directory failed", "error", err)
 		return exitError, false
 	}

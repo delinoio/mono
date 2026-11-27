@@ -13,11 +13,12 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/service"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 )
 
 func setupServiceLog(stateDir string) (*os.File, string) {
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return nil, serviceLogFailure("could not create the service state directory", err)
+	if err := store.PrepareDir(stateDir); err != nil {
+		return nil, serviceLogFailure("could not prepare the service state directory", err)
 	}
 	f, err := openServiceLog(filepath.Join(stateDir, "agent.log"))
 	if err != nil {
@@ -29,6 +30,10 @@ func setupServiceLog(stateDir string) (*os.File, string) {
 func serviceLogFailure(operation string, err error) string {
 	// PathError can contain the value of OWNSAND_AGENT_STATE_DIR. Only report
 	// the operating system error code and its system-supplied description.
+	var rejection *store.StatePathError
+	if errors.As(err, &rejection) {
+		return fmt.Sprintf("%s (%s)", operation, rejection.Reason)
+	}
 	var code windows.Errno
 	if errors.As(err, &code) {
 		return fmt.Sprintf("%s (Windows error %d: %v)", operation, code, code)
@@ -89,15 +94,31 @@ func openServiceLog(path string) (*os.File, error) {
 	// as O_APPEND does in os.OpenFile.
 	h, err := windows.CreateFile(
 		name,
-		windows.FILE_APPEND_DATA,
+		windows.FILE_APPEND_DATA|windows.FILE_READ_ATTRIBUTES,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil,
 		windows.OPEN_ALWAYS,
-		windows.FILE_ATTRIBUTE_NORMAL,
+		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_ATTRIBUTE_NORMAL,
 		0,
 	)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	var info windows.ByHandleFileInformation
+	err = windows.GetFileInformationByHandle(h, &info)
+	if err == nil {
+		switch {
+		case info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0:
+			err = &store.StatePathError{Path: path, Reason: store.StatePathReparsePoint}
+		case info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0:
+			err = &store.StatePathError{Path: path, Reason: store.StatePathNotRegularFile}
+		case info.NumberOfLinks != 1:
+			err = &store.StatePathError{Path: path, Reason: store.StatePathMultipleLinks}
+		}
+	}
+	if err != nil {
+		windows.CloseHandle(h)
+		return nil, err
 	}
 	return os.NewFile(uintptr(h), path), nil
 }
