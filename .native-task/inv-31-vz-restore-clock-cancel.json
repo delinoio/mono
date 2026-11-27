@@ -1,0 +1,109 @@
+{
+  "gid": "inv-31-vz-restore-clock-cancel",
+  "commit": "8152d26a417b2ab1cad91f8a8807805e427a282e",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "8152d26a417b2ab1cad91f8a8807805e427a282e",
+    "reason": "The implementation worker is Linux and cannot reach the Apple silicon host. The host has no macOS guest image. A real Linux guest also needs a compatible arm64 kernel and root disk with the OwnSand guest helper.",
+    "targets": [
+      {
+        "host": "m3-16",
+        "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+        "platform": "darwin/arm64"
+      }
+    ],
+    "commands": {
+      "m3-16": [
+        "set -e",
+        "set -o pipefail",
+        "test \"$(git rev-parse HEAD)\" = \"8152d26a417b2ab1cad91f8a8807805e427a282e\"",
+        "test \"$(uname -m)\" = arm64",
+        "go version",
+        "mkdir -p \"$PWD/.t3-tmp\"",
+        "export TMPDIR=\"$PWD/.t3-tmp\" COPYFILE_DISABLE=1 CGO_ENABLED=1 GOOS=darwin GOARCH=arm64",
+        "go vet ./cmds/ownsand-agent/internal/vmruntime/vzrt ./cmds/ownsand-agent/internal/sandboxes",
+        "go test -c -race -o \"$TMPDIR/vzrt.test\" ./cmds/ownsand-agent/internal/vmruntime/vzrt",
+        "codesign --force --sign - --entitlements cmds/ownsand-agent/entitlements.plist \"$TMPDIR/vzrt.test\"",
+        "codesign --verify --strict \"$TMPDIR/vzrt.test\"",
+        "\"$TMPDIR/vzrt.test\" -test.count=1 -test.v -test.run '^(TestRestoreClock|TestRestoreClockLiveRPC|TestCanceledRestoreKeepsVMWhenStopIsUnconfirmed|TestFailedRestoreAfterTerminalNotification|TestVirtualizationCanceledBootAndRestoreSkipConfiguration|TestVirtualizationEntitlementPlist)$' | tee \"$TMPDIR/vz-restore-no-image.log\"",
+        "if grep -E '^[[:space:]]*--- SKIP:' \"$TMPDIR/vz-restore-no-image.log\"; then exit 1; fi",
+        "go test -count=1 -race -v -run '^(TestDeleteCancelsRunningCreate|TestTTLExpiryCancelsRunningCreate|TestFailedCreateRetriesStopUntilItSucceeds)$' ./cmds/ownsand-agent/internal/sandboxes | tee \"$TMPDIR/vz-manager-cleanup.log\""
+      ],
+      "m3-16-with-linux-fixtures": [
+        "test -f \"${OWNSAND_VZ_TEST_KERNEL:?Set the arm64 OwnSand Linux kernel path}\"",
+        "test -f \"${OWNSAND_VZ_TEST_ROOTFS:?Set the arm64 OwnSand Linux root disk path}\"",
+        "unset OWNSAND_VZ_TEST_OUTBOUND",
+        "\"$TMPDIR/vzrt.test\" -test.count=1 -test.timeout=25m -test.v -test.run '^TestVirtualizationIntegration$/^restored-clock$' | tee \"$TMPDIR/vz-restore-linux.log\"",
+        "for scenario in parent-canceled parent-canceled-as-clock-succeeds unconfirmed-stop-retry clock-error-only clock-deadline-only; do grep -F -- \"--- PASS: TestVirtualizationIntegration/restored-clock/$scenario (\" \"$TMPDIR/vz-restore-linux.log\" || exit 1; done"
+      ],
+      "m3-16-with-macos-fixtures": [
+        "test -d \"${OWNSAND_VZ_TEST_MACOS_IMAGE:?Set the path to a built OwnSand macOS guest image directory}\"",
+        "unset OWNSAND_VZ_TEST_OUTBOUND",
+        "\"$TMPDIR/vzrt.test\" -test.count=1 -test.timeout=25m -test.v -test.run '^TestVirtualizationMacOSIntegration$/^restored-clock$' | tee \"$TMPDIR/vz-restore-macos.log\"",
+        "for scenario in parent-canceled parent-canceled-as-clock-succeeds unconfirmed-stop-retry clock-error-only clock-deadline-only; do grep -F -- \"--- PASS: TestVirtualizationMacOSIntegration/restored-clock/$scenario (\" \"$TMPDIR/vz-restore-macos.log\" || exit 1; done"
+      ]
+    },
+    "expectedResults": [
+      "Run the signed no-image test first. Vet, the native cgo test build and ad hoc signature verification pass. The clock deadline, parent deadline, cancellation, successful RPC race and cleanup fixtures pass with zero skips. The sandbox manager tests pass.",
+      "When compatible guest fixtures exist, run the matching image-dependent commands in the same shell. The integration test creates a real memory-state snapshot with network NONE. All five restored-clock subtests run and pass.",
+      "The canceled cases return a nil VM and context.Canceled with no disk fallback. Confirmed stop removes the directory. Injected unconfirmed stop retains the real VM and its files until Delete confirms stop and removes them.",
+      "The clock-only error and child-only timeout each log a warning and return MEMORY_STATE. The signed no-image clock matrix also checks the parent deadline with a deterministic test clock."
+    ],
+    "files": [
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/create_cancel_darwin_test.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/export_darwin_test.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_darwin_test.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_macos_darwin_test.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_restore_clock_darwin_test.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/macos_runtime_darwin.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/restore.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/restore_clock_test.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/runtime_darwin.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/entitlements.plist"
+      },
+      {
+        "path": ".t3-tmp/vzrt.test",
+        "generatedOnHost": true
+      },
+      {
+        "path": ".t3-tmp/vz-restore-no-image.log",
+        "generatedOnHost": true
+      },
+      {
+        "path": ".t3-tmp/vz-manager-cleanup.log",
+        "generatedOnHost": true
+      },
+      {
+        "path": ".t3-tmp/vz-restore-linux.log",
+        "generatedOnHost": true
+      },
+      {
+        "path": ".t3-tmp/vz-restore-macos.log",
+        "generatedOnHost": true
+      }
+    ],
+    "cannotRunWithKnownHostLimits": [
+      "A real macOS guest restore requires a built OwnSand macOS guest image. No such image is available on m3-16.",
+      "A real Linux guest restore requires an existing compatible arm64 OwnSand kernel and root disk with the guest helper. Run it only if these fixtures are available. The signed no-image commands need neither guest fixture, administrator access nor CMake."
+    ]
+  }
+}
