@@ -17,6 +17,7 @@ import { SandRunConfigError } from "./errors.ts";
 import {
   type ExecCaller,
   type ExecEvent,
+  type ExecOutcome,
   ExecEventKind,
   execDevSession,
   OutputStream,
@@ -286,6 +287,143 @@ describe("exec helper", () => {
     });
     expect(isUuidV7(result.execId)).toBe(true);
   });
+
+  test.each([
+    { source: "initial", finish: "next" },
+    { source: "initial", finish: "return" },
+    { source: "attach", finish: "next" },
+    { source: "attach", finish: "return" },
+  ])(
+    "completes with $finish after terminal cleanup rejects on the $source stream",
+    async ({ source, finish }) => {
+      let closes = 0;
+      let attaches = 0;
+      const clock = new RecordingClock();
+      async function* terminalStream<T>(wrap: (event: EventInit) => T) {
+        try {
+          yield wrap(out(0, "x"));
+          yield wrap(exited(0));
+        } finally {
+          closes++;
+          throw new ConnectError("cleanup failed", Code.Unavailable);
+        }
+      }
+      const caller: ExecCaller = {
+        async *execDevSession() {
+          if (source === "initial") {
+            yield* terminalStream(response);
+          }
+        },
+        async *attachDevSessionExec() {
+          attaches++;
+          if (source === "attach" && attaches === 1) {
+            yield* terminalStream((event) =>
+              create(AttachDevSessionExecResponseSchema, { event: { event } }),
+            );
+          } else {
+            yield create(AttachDevSessionExecResponseSchema, {
+              event: { event: exited(99) },
+            });
+          }
+        },
+      };
+      const events = execDevSession(caller, execInput, { clock });
+      if (source === "attach") {
+        expect((await events.next()).value).toMatchObject({
+          kind: ExecEventKind.Reattached,
+          cause: undefined,
+        });
+      }
+      expect((await events.next()).value).toMatchObject({
+        kind: ExecEventKind.Stdout,
+        data: text.encode("x"),
+      });
+      expect((await events.next()).value).toMatchObject({
+        kind: ExecEventKind.Exited,
+        exitCode: 0n,
+      });
+      const completion =
+        finish === "return"
+          ? await events.return(undefined)
+          : await events.next();
+      expect(completion).toEqual({ done: true, value: undefined });
+      expect(await events.next()).toEqual({ done: true, value: undefined });
+      expect(closes).toBe(1);
+      expect(attaches).toBe(source === "attach" ? 1 : 0);
+      expect(clock.sleeps).toEqual([]);
+    },
+  );
+
+  test("propagates an error thrown by the consumer after a terminal event", async () => {
+    const consumerError = new ConnectError(
+      "consumer failed",
+      Code.PermissionDenied,
+    );
+    const caller = execCaller(async function* () {
+      try {
+        yield response(exited(0));
+      } finally {
+        throw new ConnectError("cleanup failed", Code.Unavailable);
+      }
+    });
+    const events = execDevSession(caller, execInput);
+    expect((await events.next()).value).toMatchObject({
+      kind: ExecEventKind.Exited,
+    });
+    await expect(events.throw(consumerError)).rejects.toBe(consumerError);
+  });
+
+  test.each<{ event: EventInit; outcome: ExecOutcome }>([
+    {
+      event: exited(0),
+      outcome: {
+        kind: ExecEventKind.Exited,
+        exitCode: 0n,
+        signal: undefined,
+        timedOut: false,
+      },
+    },
+    {
+      event: {
+        case: "failed",
+        value: {
+          reason: ExecFailureReason.PROGRAM_NOT_FOUND,
+          message: "no such program",
+        },
+      },
+      outcome: {
+        kind: ExecEventKind.Failed,
+        reason: ExecFailureReason.PROGRAM_NOT_FOUND,
+        message: "no such program",
+      },
+    },
+    {
+      event: { case: "sandboxEnded", value: { reason: "MAX_TTL" } },
+      outcome: { kind: ExecEventKind.SandboxEnded, reason: "MAX_TTL" },
+    },
+  ])(
+    "keeps the $outcome.kind outcome and output when terminal cleanup rejects",
+    async ({ event, outcome }) => {
+      const clock = new RecordingClock();
+      let closes = 0;
+      const caller = execCaller(async function* () {
+        try {
+          yield response(out(0, "a"));
+          yield response(err(0, "b"));
+          yield response(event);
+        } finally {
+          closes++;
+          throw new ConnectError("cleanup denied", Code.PermissionDenied);
+        }
+      });
+      const result = await runDevSessionExec(caller, execInput, { clock });
+      expect(result.outcome).toEqual(outcome);
+      expect(result.stdout).toEqual(text.encode("a"));
+      expect(result.stderr).toEqual(text.encode("b"));
+      expect(closes).toBe(1);
+      expect(clock.sleeps).toEqual([]);
+    },
+  );
 
   test("reports a start failure and a sandbox end as outcomes", async () => {
     const failed = execServer(
