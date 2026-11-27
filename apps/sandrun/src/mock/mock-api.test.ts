@@ -11,7 +11,14 @@ import {
   AuditService,
   AuditTargetKind,
 } from "@delino/sandrun-protos/v1/audit_pb";
-import { AgentVendor, ApiKeyState } from "@delino/sandrun-protos/v1/common_pb";
+import {
+  AgentVendor,
+  ApiKeyState,
+  RequestState,
+  RunnerState,
+  WorkloadKind,
+} from "@delino/sandrun-protos/v1/common_pb";
+import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
 import { WorkService } from "@delino/sandrun-protos/v1/work_pb";
 import { expect, rs, test } from "@rstest/core";
@@ -21,6 +28,169 @@ const invalidInstallationState = {
   code: Code.FailedPrecondition,
   rawMessage: "the installation state is not valid or has expired",
 };
+
+test("request states override includeEnded before pagination", async () => {
+  const work = createClient(WorkService, createMockTransport());
+  const organizationId = MOCK_IDS.acme;
+  const terminalStates = [RequestState.ENDED];
+  const mixedStates = [RequestState.RUNNING, RequestState.ENDED];
+  const activeIds = [
+    MOCK_IDS.runningJob,
+    MOCK_IDS.queuedJob,
+    MOCK_IDS.queuedAgent,
+    MOCK_IDS.queuedDev,
+  ];
+
+  for (const includeEnded of [undefined, false, true]) {
+    const terminal = await work.listRequests({
+      organizationId,
+      includeEnded,
+      states: terminalStates,
+    });
+    expect(terminal.requests.map((request) => request.requestId)).toEqual([
+      MOCK_IDS.endedJob,
+    ]);
+    const mixed = await work.listRequests({
+      organizationId,
+      includeEnded,
+      states: mixedStates,
+    });
+    expect(mixed.requests.map((request) => request.requestId)).toEqual([
+      MOCK_IDS.runningJob,
+      MOCK_IDS.endedJob,
+    ]);
+    const defaults = await work.listRequests({ organizationId, includeEnded });
+    expect(defaults.requests.map((request) => request.requestId)).toEqual(
+      includeEnded ? [...activeIds, MOCK_IDS.endedJob] : activeIds,
+    );
+  }
+
+  for (const filter of [
+    { runnerProfileId: MOCK_IDS.devProfile },
+    { kind: WorkloadKind.DEV_SESSION },
+  ]) {
+    const result = await work.listRequests({
+      organizationId,
+      states: terminalStates,
+      ...filter,
+    });
+    expect(result.requests).toEqual([]);
+  }
+
+  const page = { organizationId, states: mixedStates, pageSize: 1 };
+  const first = await work.listRequests(page);
+  expect(first.requests.map((request) => request.requestId)).toEqual([
+    MOCK_IDS.runningJob,
+  ]);
+  expect(first.nextPageToken).not.toBe("");
+  const last = await work.listRequests({
+    ...page,
+    pageToken: first.nextPageToken,
+  });
+  expect(last.requests.map((request) => request.requestId)).toEqual([
+    MOCK_IDS.endedJob,
+  ]);
+  expect(last.nextPageToken).toBe("");
+});
+
+test("runner states override includeEnded and respect the profile filter", async () => {
+  const work = createClient(WorkService, createMockTransport());
+  const organizationId = MOCK_IDS.acme;
+  const terminalStates = [RunnerState.DELETED];
+  const activeIds = [MOCK_IDS.busyRunner, MOCK_IDS.warmRunner];
+
+  for (const includeEnded of [undefined, false, true]) {
+    const terminal = await work.listRunners({
+      organizationId,
+      includeEnded,
+      states: terminalStates,
+    });
+    expect(terminal.runners.map((runner) => runner.runnerId)).toEqual([
+      MOCK_IDS.deletedRunner,
+    ]);
+    const mixed = await work.listRunners({
+      organizationId,
+      includeEnded,
+      states: [RunnerState.BUSY, RunnerState.DELETED],
+    });
+    expect(mixed.runners.map((runner) => runner.runnerId)).toEqual([
+      MOCK_IDS.busyRunner,
+      MOCK_IDS.deletedRunner,
+    ]);
+    const defaults = await work.listRunners({ organizationId, includeEnded });
+    expect(defaults.runners.map((runner) => runner.runnerId)).toEqual(
+      includeEnded ? [...activeIds, MOCK_IDS.deletedRunner] : activeIds,
+    );
+  }
+
+  const otherProfile = await work.listRunners({
+    organizationId,
+    states: terminalStates,
+    runnerProfileId: MOCK_IDS.devProfile,
+  });
+  expect(otherProfile.runners).toEqual([]);
+});
+
+test("dev session states override includeEnded and respect owner and profile filters", async () => {
+  const sessions = createClient(DevSessionService, createMockTransport());
+  const organizationId = MOCK_IDS.acme;
+  const terminalStates = [RequestState.ENDED];
+  const mixedIds = [MOCK_IDS.queuedDev, MOCK_IDS.devSessionOther];
+
+  for (const includeEnded of [undefined, false, true]) {
+    const terminal = await sessions.listDevSessions({
+      organizationId,
+      includeEnded,
+      states: terminalStates,
+    });
+    expect(terminal.devSessions.map((session) => session.devSessionId)).toEqual(
+      [MOCK_IDS.devSessionOther],
+    );
+    const mixed = await sessions.listDevSessions({
+      organizationId,
+      includeEnded,
+      states: [RequestState.QUEUED, RequestState.ENDED],
+    });
+    expect(mixed.devSessions.map((session) => session.devSessionId)).toEqual(
+      mixedIds,
+    );
+    const defaults = await sessions.listDevSessions({
+      organizationId,
+      includeEnded,
+    });
+    expect(defaults.devSessions.map((session) => session.devSessionId)).toEqual(
+      includeEnded ? mixedIds : [MOCK_IDS.queuedDev],
+    );
+  }
+
+  const filters = {
+    organizationId,
+    states: terminalStates,
+    includeEnded: false,
+  };
+  const { devSession } = await sessions.getDevSession({
+    organizationId,
+    devSessionId: MOCK_IDS.devSessionOther,
+  });
+  if (!devSession) throw new Error("Expected the seeded ended dev session");
+  const matchingOwner = await sessions.listDevSessions({
+    ...filters,
+    owner: { case: "ownerUserId", value: devSession.ownerUserId },
+  });
+  expect(
+    matchingOwner.devSessions.map((session) => session.devSessionId),
+  ).toEqual([MOCK_IDS.devSessionOther]);
+  const caller = await sessions.listDevSessions({
+    ...filters,
+    owner: { case: "ownedByCaller", value: true },
+  });
+  expect(caller.devSessions).toEqual([]);
+  const otherProfile = await sessions.listDevSessions({
+    ...filters,
+    runnerProfileId: MOCK_IDS.linuxProfile,
+  });
+  expect(otherProfile.devSessions).toEqual([]);
+});
 
 test("listing personal API keys reports expiry at the current time", async () => {
   const issuedAt = Date.UTC(2026, 0, 1);
