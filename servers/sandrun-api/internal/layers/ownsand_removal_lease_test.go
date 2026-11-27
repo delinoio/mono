@@ -262,8 +262,10 @@ func TestOwnSandRemovalLeaseFinalization(t *testing.T) {
 					var replicaLayers layers.Layers
 					replica := w.env.NewReplica(t, w.layerOptions(&replicaLayers, false), testenv.WithExtension(func(r *app.Registry) error {
 						replicaLayers.Links.OnRemoval(link.RemovalHook{
-							Name:        "observe_commit",
-							AfterCommit: func(ctx context.Context, _ string) { recordCommit(ctx) },
+							Name: "observe_commit",
+							InTx: func(context.Context, pgx.Tx, string) (func(context.Context), error) {
+								return recordCommit, nil
+							},
 						})
 						r.OnOrganizationDeletion(api.OrganizationDeletionHook{
 							Name: "observe_commit",

@@ -5,6 +5,7 @@ package vendorhttp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -119,10 +120,52 @@ func TestReadEventsReaderErrorAndLineLimit(t *testing.T) {
 	}
 }
 
-// TestClientErrorsAndLogs: a non-2xx answer is a StatusError with the code
-// and error text, it is logged with the status, and neither the credential
-// nor the request body nor query values reach the log.
-func TestClientErrorsAndLogs(t *testing.T) {
+func TestClientRequiresJSONForDestination(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"empty 200", http.StatusOK, ""},
+		{"whitespace 200", http.StatusOK, " \t\r\n"},
+		{"bodyless 204", http.StatusNoContent, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				if tc.body != "" {
+					fmt.Fprint(w, tc.body)
+				}
+			}))
+			defer srv.Close()
+			c := &Client{Vendor: "TEST", BaseURL: srv.URL}
+			var out struct{ Value string }
+			err := c.Do(t.Context(), "get", http.MethodGet, "/", nil, nil, &out)
+			if err == nil || err.Error() != "TEST get: decode response: empty body" {
+				t.Fatalf("required JSON: got %v, want an empty-body decode error", err)
+			}
+			if err := c.Do(t.Context(), "release", http.MethodPost, "/", nil, nil, nil); err != nil {
+				t.Fatalf("no destination: %v", err)
+			}
+		})
+	}
+}
+
+func TestClientMalformedJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"value":`)
+	}))
+	defer srv.Close()
+	c := &Client{Vendor: "TEST", BaseURL: srv.URL}
+	var out struct{ Value string }
+	err := c.Do(t.Context(), "get", http.MethodGet, "/", nil, nil, &out)
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || !strings.HasPrefix(err.Error(), "TEST get: decode response: ") {
+		t.Fatalf("malformed JSON: got %v, want a wrapped JSON syntax error", err)
+	}
+}
+
+func TestClientSuccessfulJSONAndSSE(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer secret-token" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -135,34 +178,101 @@ func TestClientErrorsAndLogs(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			fmt.Fprint(w, "event: a\nid: 1\ndata: {}\n\n")
 		default:
-			w.Header().Set("Retry-After", "7")
-			w.WriteHeader(http.StatusConflict)
-			fmt.Fprint(w, `{"code":"worker_in_use","error":"Worker in use: turn running","token":"leaked-token"}`)
+			http.NotFound(w, r)
 		}
 	}))
 	defer srv.Close()
-	var logs bytes.Buffer
-	c := &Client{Vendor: "TEST", BaseURL: srv.URL, Auth: Bearer("secret-token"), Logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+	c := &Client{Vendor: "TEST", BaseURL: srv.URL, Auth: Bearer("secret-token")}
 	ctx := context.Background()
 	var out struct{ Value string }
 	if err := c.Do(ctx, "get", http.MethodGet, "/ok", nil, nil, &out); err != nil || out.Value != "v" {
 		t.Fatalf("ok: %v %+v", err, out)
 	}
-	err := c.Do(ctx, "claim", http.MethodPost, "/claim", map[string][]string{"q": {"query-value"}}, map[string]string{"apiKey": "body-secret"}, nil)
-	se, ok := AsStatus(err)
-	if !ok || se.Status != http.StatusConflict || se.Code != "worker_in_use" || se.Text != "Worker in use: turn running" || se.RetryAfter != 7*time.Second || Status(err) != 409 {
-		t.Fatalf("status error %#v", err)
-	}
-	for _, secret := range []string{"secret-token", "body-secret", "query-value", "leaked-token"} {
-		if strings.Contains(logs.String(), secret) || strings.Contains(err.Error(), secret) {
-			t.Fatalf("%q leaked: %s / %v", secret, logs.String(), err)
-		}
-	}
-	if !strings.Contains(logs.String(), `"msg":"vendor_api_error"`) || !strings.Contains(logs.String(), `"status":409`) {
-		t.Fatalf("log %s", logs.String())
-	}
 	var events []Event
 	if err := c.Stream(ctx, "watch", "/stream", nil, nil, func(e Event) error { events = append(events, e); return nil }); err != nil || len(events) != 1 || events[0].ID != "1" {
 		t.Fatalf("stream: %v %+v", err, events)
+	}
+}
+
+func TestClientErrorsAndLogs(t *testing.T) {
+	for _, tc := range []struct {
+		name, vendor, body, wantCode string
+	}{
+		{"known nested code", "OPENAI_CODEX", `{"error":{"code":"invalid_api_key","message":"fixture-message"}}`, "invalid_api_key"},
+		{"known top-level code", "OPENAI_CODEX", `{"code":"invalid_api_key","error":"fixture-error","message":"fixture-message"}`, "invalid_api_key"},
+		{"unknown codes", "OPENAI_CODEX", `{"code":"fixture-code","message":"fixture-message","error":{"code":"fixture-nested-code","message":"fixture-nested-message"},"token":"fixture-response-token"}`, ""},
+		{"object code", "OPENAI_CODEX", `{"code":{"code":"invalid_api_key","message":"fixture-message"}}`, ""},
+		{"numeric code", "OPENAI_CODEX", `{"error":{"code":123,"message":"fixture-message"}}`, ""},
+		{"message with known text", "OPENAI_CODEX", `{"message":"invalid_api_key","error":{"message":"invalid_api_key"}}`, ""},
+		{"plain error with known text", "OPENAI_CODEX", `{"error":"invalid_api_key"}`, ""},
+		{"different case", "OPENAI_CODEX", `{"code":"INVALID_API_KEY","error":{"Code":"invalid_api_key"}}`, ""},
+		{"extra whitespace in code", "OPENAI_CODEX", `{"code":"invalid_api_key "}`, ""},
+		{"malformed JSON", "OPENAI_CODEX", `{"code":"invalid_api_key","error":"fixture-truncated"`, ""},
+		{"plain body", "OPENAI_CODEX", "fixture-plain-body", ""},
+		{"empty body", "OPENAI_CODEX", "", ""},
+		{"oversized body", "OPENAI_CODEX", `{"code":"invalid_api_key"}` + strings.Repeat(" ", maxErrorBody) + "fixture-trailing-body", ""},
+		{"cursor", "CURSOR", `{"code":"invalid_api_key","message":"fixture-message"}`, ""},
+		{"devin", "DEVIN", `{"error":{"code":"invalid_api_key","message":"fixture-message"}}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "Bearer fixture-credential" {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				w.Header().Set("Retry-After", "7")
+				w.WriteHeader(http.StatusConflict)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer srv.Close()
+
+			for _, op := range []string{"claim", "watch"} {
+				t.Run(op, func(t *testing.T) {
+					var logs bytes.Buffer
+					c := &Client{Vendor: tc.vendor, BaseURL: srv.URL, Auth: Bearer("fixture-credential"), Logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+					query := map[string][]string{"q": {"fixture-query"}}
+					var err error
+					switch op {
+					case "claim":
+						var out struct{ Value string }
+						err = c.Do(t.Context(), op, http.MethodPost, "/", query, map[string]string{"data": "fixture-request"}, &out)
+					case "watch":
+						err = c.Stream(t.Context(), op, "/", query, nil, func(e Event) error {
+							t.Fatalf("unexpected event: %+v", e)
+							return nil
+						})
+					}
+
+					se, ok := AsStatus(err)
+					wantStatus := StatusError{Vendor: tc.vendor, Op: op, Status: http.StatusConflict, Code: tc.wantCode, RetryAfter: 7 * time.Second}
+					if !ok || *se != wantStatus || Status(err) != http.StatusConflict {
+						t.Fatalf("status error = %#v, want %+v", err, wantStatus)
+					}
+					wantError := fmt.Sprintf("%s %s: HTTP %d", tc.vendor, op, http.StatusConflict)
+					if tc.wantCode != "" {
+						wantError += " " + tc.wantCode
+					}
+					if err.Error() != wantError {
+						t.Errorf("formatted error = %q, want %q", err, wantError)
+					}
+
+					var gotLog map[string]any
+					if err := json.Unmarshal(logs.Bytes(), &gotLog); err != nil {
+						t.Fatalf("decode warning: %v", err)
+					}
+					delete(gotLog, slog.TimeKey)
+					wantLog := map[string]any{
+						"level": "WARN", "msg": "vendor_api_error", "vendor": tc.vendor,
+						"op": op, "status": float64(http.StatusConflict),
+					}
+					if tc.wantCode != "" {
+						wantLog["code"] = tc.wantCode
+					}
+					if !reflect.DeepEqual(gotLog, wantLog) {
+						t.Errorf("warning = %v, want %v", gotLog, wantLog)
+					}
+				})
+			}
+		})
 	}
 }

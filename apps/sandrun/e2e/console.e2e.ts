@@ -119,6 +119,27 @@ describe("sign-in", () => {
 });
 
 describe("organizations", () => {
+  test("keeps the Requests section when switching organizations", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${ACME}/requests`);
+    const requests = screen.getByRole("heading", "Requests", { level: 1 });
+    await expect(requests).toBeVisible();
+
+    const switcher = screen.getByRole("combobox", "Organization");
+    await switcher.tap();
+    await screen.getByRole("option", "Northwind Labs").tap();
+
+    await expect(browser).toHaveURL(`/orgs/${NORTHWIND}/requests`);
+    await expect(switcher).toContainText("Northwind Labs");
+    await expect(requests).toBeVisible();
+  });
+
   test("shows the full error when the organization cannot load", async ({
     app,
     screen,
@@ -734,6 +755,46 @@ describe("setup with an invalid OwnSand link", () => {
   });
 });
 
+describe("runners", () => {
+  test("shows the new and existing outcomes after deleting a warm runner", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/runners`);
+
+    const runners = screen.getByRole("table", "Runners");
+    const warm = runners.getByRole("row").filter({ hasText: "0193b000…00f2" });
+    const completed = runners
+      .getByRole("row")
+      .filter({ hasText: "0193b000…00f3" });
+    await screen.getByRole("checkbox", "Show ended runners").tap();
+    await expect(warm.getByRole("cell", "Warm")).toBeVisible();
+    await expect(completed.getByRole("cell", "Work done")).toBeVisible();
+
+    await warm.getByRole("button", "Delete").tap();
+    const dialog = screen.getByRole("alertdialog", "Delete this runner?");
+    await dialog.getByRole("button", "Delete runner").tap();
+
+    await expect(dialog).toBeHidden();
+    await expect(warm.getByRole("cell", "Deleted by user")).toBeVisible();
+    await expect(completed.getByRole("cell", "Work done")).toBeVisible();
+    await screen.getByRole("link", "Audit events").tap();
+    await expect(screen.getByRole("cell", "Runner deleted")).toBeVisible();
+    const deletions = await browser.evaluate(
+      () =>
+        Array.from(
+          document.querySelectorAll(
+            'table[aria-label="Audit events"] tbody td',
+          ),
+        ).filter((cell) => cell.textContent === "Runner deleted").length,
+    );
+    expect(deletions).toBe(1);
+  });
+});
+
 describe("audit", () => {
   test("shows the newest event first", async ({ app, browser, screen }) => {
     await app.open("/");
@@ -919,13 +980,19 @@ describe("requests", () => {
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${ACME}/requests`);
 
-    await screen.getByRole("checkbox", "Show ended requests").tap();
     const table = screen.getByRole("table", "Requests");
+    const endedRequest = screen.getByText("acme-robotics/site · deploy", {
+      exact: true,
+    });
+    await expect(table).toContainText("build (ubuntu)");
+    await expect(endedRequest).toBeHidden();
+    await screen.getByRole("checkbox", "Show ended requests").tap();
     await expect(table).toContainText("deploy");
     const queuedJob = table
       .getByRole("row")
       .filter({ hasText: "acme-robotics/firmware · test (ubuntu)" });
     await expect(queuedJob.getByRole("button", "Cancel")).toBeVisible();
+    await expect(endedRequest).toBeVisible();
     const sources = await browser.evaluate(() =>
       Array.from(
         document.querySelectorAll(
@@ -941,6 +1008,9 @@ describe("requests", () => {
       "—",
       "acme-robotics/site · deploy",
     ]);
+    await screen.getByRole("checkbox", "Show ended requests").tap();
+    await expect(table).toContainText("build (ubuntu)");
+    await expect(endedRequest).toBeHidden();
   });
 });
 
@@ -1895,15 +1965,24 @@ describe("API key revocation", () => {
     await expect(screen.getByText("claude-on-laptop · Active")).toBeVisible();
   });
 
-  test("confirming revokes the key", async ({ app, screen }) => {
+  test("confirming revokes the key and records it in Audit events", async ({
+    app,
+    browser,
+    screen,
+  }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${ACME}/api-keys`);
     await screen.getByRole("button", "Revoke", { exact: true }).tap();
     const dialog = screen.getByRole("alertdialog", "Revoke claude-on-laptop?");
     await dialog.getByRole("button", "Revoke key").tap();
-    await expect(dialog).toBeHidden();
+    await expect(browser.locator(".dui-dialog-backdrop")).toBeHidden();
     await expect(screen.getByText("claude-on-laptop · Revoked")).toBeVisible();
+
+    await screen.getByRole("link", "Audit events").tap();
+    await expect(browser).toHaveURL(`/orgs/${ACME}/audit`);
+    const events = screen.getByRole("table", "Audit events");
+    await expect(events.getByRole("cell", "API key revoked")).toBeVisible();
   });
 });
 

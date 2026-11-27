@@ -37,6 +37,25 @@ describe("home", () => {
     );
   });
 
+  test("keeps search disabled on the marketing site", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await expect(screen.getByRole("image", "Delino logo")).toBeVisible();
+    await browser.keyboard.press("ControlOrMeta+K");
+
+    const hasSearch = await browser.evaluate(() =>
+      Boolean(
+        document.querySelector(
+          ".rp-search-button, .rp-search-button--mobile, .rp-search-panel__modal",
+        ),
+      ),
+    );
+    expect(hasSearch).toBe(false);
+  });
+
   test("gives every feature card a distinct title", async ({
     app,
     browser,

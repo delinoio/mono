@@ -91,16 +91,17 @@ type Querier interface {
 // InTx runs fn in a read-committed transaction and commits it when fn
 // returns nil.
 func (d *DB) InTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
-	return pgx.BeginTxFunc(ctx, d.Pool, pgx.TxOptions{}, fn)
+	return InTxWithContexts(ctx, ctx, d.Pool.Begin, fn)
 }
 
 // InTxWithContexts begins a transaction under beginCtx and ends it under
 // endCtx. The callback chooses the context for each statement.
 func InTxWithContexts(beginCtx, endCtx context.Context, begin func(context.Context) (pgx.Tx, error), fn func(pgx.Tx) error) error {
-	tx, err := begin(beginCtx)
+	raw, err := begin(beginCtx)
 	if err != nil {
 		return err
 	}
+	tx := &commitTx{Tx: raw}
 	defer func() { _ = tx.Rollback(endCtx) }()
 	if err := fn(tx); err != nil {
 		return err

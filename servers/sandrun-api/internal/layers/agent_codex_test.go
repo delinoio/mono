@@ -116,6 +116,13 @@ func TestCodexSessionLifecycle(t *testing.T) {
 	w.openai.AddSession("sess_1", "ccarenv_1")
 	w.openai.Update("sess_1", func(s *codexfake.Session) { s.RemoteURL = remoteURL })
 	body := codexfake.ActionRequired("sess_1")
+	const pendingWithoutEnvironment = `{"id":"sess_1","status":"requires_action","required_actions":[{"type":"environment_connection","environment_id":"ccarenv_1"}]}`
+	w.openai.Respond("sess_1", http.StatusOK, pendingWithoutEnvironment)
+	if code := w.deliver(t, "wh_missing_environment", body); code != http.StatusOK {
+		t.Fatalf("delivery without environment %d", code)
+	}
+	w.assertNoRequestsOrClaims(t)
+	w.openai.Respond("sess_1", 0, "")
 	if code := w.deliver(t, "wh_1", body); code != http.StatusOK {
 		t.Fatalf("delivery %d", code)
 	}
@@ -175,9 +182,56 @@ func TestCodexSessionLifecycle(t *testing.T) {
 			t.Fatal("a sandrun-only credential reached a guest file")
 		}
 	}
-	stays(t, "STARTING while the session waits for the executor", func() bool {
-		return w.request(t, req.GetRequestId()).GetState() == sandrunv1.RequestState_REQUEST_STATE_STARTING
-	})
+	in, err := w.l.Integrations.Get(t.Context(), w.env.DB.Pool, w.org.ID, w.integrationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.openai.AddSession("sess_connected", "ccarenv_connected")
+	w.openai.Update("sess_connected", func(s *codexfake.Session) { s.NeedsConnection, s.Status = false, "in_progress" })
+	claims := []*agent.Claim{
+		{RequestID: req.GetRequestId(), VendorRequestID: "sess_1"},
+		{RequestID: "connected_request", VendorRequestID: "sess_connected"},
+	}
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		wantErr bool
+	}{
+		{"pending", 0, "", false},
+		{"empty", http.StatusOK, "", true},
+		{"whitespace", http.StatusOK, " \t\n", true},
+		{"no-content", http.StatusNoContent, "", true},
+		{"null", http.StatusOK, "null", true},
+		{"empty-object", http.StatusOK, "{}", true},
+		{"wrong-id", http.StatusOK, `{"id":"sess_other","status":"in_progress"}`, true},
+		{"missing-status", http.StatusOK, `{"id":"sess_1"}`, true},
+		{"blank-status", http.StatusOK, `{"id":"sess_1","status":" "}`, true},
+		{"pending-without-environment", http.StatusOK, pendingWithoutEnvironment, false},
+		{"pending-without-remote", http.StatusOK, `{"id":"sess_1","status":"requires_action","required_actions":[{"type":"environment_connection","environment_id":"ccarenv_1"}],"environment":{"type":"self_hosted","id":"ccarenv_1"}}`, false},
+		{"failed", http.StatusOK, `{"id":"sess_1","status":"failed"}`, false},
+		{"not-found", http.StatusNotFound, "", false},
+	} {
+		if !t.Run(tc.name, func(t *testing.T) {
+			w.openai.Respond("sess_1", tc.status, tc.body)
+			w.l.Agents.Poll(t.Context())
+			requestState := w.request(t, req.GetRequestId()).GetState()
+			runnerState := w.runner(t, runner.GetRunnerId()).GetState()
+			if requestState != sandrunv1.RequestState_REQUEST_STATE_STARTING || runnerState != sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK {
+				t.Fatalf("request %s, runner %s, want STARTING and WAITING_FOR_WORK", requestState, runnerState)
+			}
+			confirmed, err := w.l.Codex.CheckStarted(t.Context(), in, claims)
+			if len(confirmed) != 1 || confirmed[0] != "connected_request" {
+				t.Fatalf("confirmed %v, want only connected_request", confirmed)
+			}
+			if (err != nil) != tc.wantErr || (err != nil && !strings.Contains(err.Error(), req.GetRequestId())) {
+				t.Fatalf("startup error = %v, want error for the pending claim = %t", err, tc.wantErr)
+			}
+		}) {
+			return
+		}
+	}
+	w.openai.Respond("sess_1", 0, "")
 	w.openai.Update("sess_1", func(s *codexfake.Session) { s.NeedsConnection, s.Status = false, "in_progress" })
 	w.waitRunner(t, runner.GetRunnerId(), sandrunv1.RunnerState_RUNNER_STATE_BUSY)
 	w.waitRequest(t, req.GetRequestId(), sandrunv1.RequestState_REQUEST_STATE_RUNNING)

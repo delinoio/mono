@@ -16,6 +16,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -407,6 +408,11 @@ func insert(ctx context.Context, tx pgx.Tx, p *Profile) error {
 		p.IdleTTL.Milliseconds(), p.MaxTTL.Milliseconds(), int16(p.Priority), p.MaxQueueWait.Milliseconds(), p.WarmCount, p.CreateTime, p.UpdateTime)
 	if db.IsUniqueViolation(err) {
 		return api.ErrAlreadyExists("a runner profile with this name exists")
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23503" &&
+		pgErr.ConstraintName == "runner_profiles_organization_id_agent_integration_id_fkey" {
+		return api.ErrNotFound("agent integration")
 	}
 	return err
 }

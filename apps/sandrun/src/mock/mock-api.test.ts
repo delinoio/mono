@@ -580,6 +580,169 @@ test.each(
   },
 );
 
+test("request states override includeEnded before pagination", async () => {
+  const work = createClient(WorkService, createMockTransport());
+  const organizationId = MOCK_IDS.acme;
+  const terminalStates = [RequestState.ENDED];
+  const mixedStates = [RequestState.RUNNING, RequestState.ENDED];
+  const activeIds = [
+    MOCK_IDS.runningJob,
+    MOCK_IDS.queuedJob,
+    MOCK_IDS.queuedAgent,
+    MOCK_IDS.queuedDev,
+  ];
+
+  for (const includeEnded of [undefined, false, true]) {
+    const terminal = await work.listRequests({
+      organizationId,
+      includeEnded,
+      states: terminalStates,
+    });
+    expect(terminal.requests.map((request) => request.requestId)).toEqual([
+      MOCK_IDS.endedJob,
+    ]);
+    const mixed = await work.listRequests({
+      organizationId,
+      includeEnded,
+      states: mixedStates,
+    });
+    expect(mixed.requests.map((request) => request.requestId)).toEqual([
+      MOCK_IDS.runningJob,
+      MOCK_IDS.endedJob,
+    ]);
+    const defaults = await work.listRequests({ organizationId, includeEnded });
+    expect(defaults.requests.map((request) => request.requestId)).toEqual(
+      includeEnded ? [...activeIds, MOCK_IDS.endedJob] : activeIds,
+    );
+  }
+
+  for (const filter of [
+    { runnerProfileId: MOCK_IDS.devProfile },
+    { kind: WorkloadKind.DEV_SESSION },
+  ]) {
+    const result = await work.listRequests({
+      organizationId,
+      states: terminalStates,
+      ...filter,
+    });
+    expect(result.requests).toEqual([]);
+  }
+
+  const page = { organizationId, states: mixedStates, pageSize: 1 };
+  const first = await work.listRequests(page);
+  expect(first.requests.map((request) => request.requestId)).toEqual([
+    MOCK_IDS.runningJob,
+  ]);
+  expect(first.nextPageToken).not.toBe("");
+  const last = await work.listRequests({
+    ...page,
+    pageToken: first.nextPageToken,
+  });
+  expect(last.requests.map((request) => request.requestId)).toEqual([
+    MOCK_IDS.endedJob,
+  ]);
+  expect(last.nextPageToken).toBe("");
+});
+
+test("runner states override includeEnded and respect the profile filter", async () => {
+  const work = createClient(WorkService, createMockTransport());
+  const organizationId = MOCK_IDS.acme;
+  const terminalStates = [RunnerState.DELETED];
+  const activeIds = [MOCK_IDS.busyRunner, MOCK_IDS.warmRunner];
+
+  for (const includeEnded of [undefined, false, true]) {
+    const terminal = await work.listRunners({
+      organizationId,
+      includeEnded,
+      states: terminalStates,
+    });
+    expect(terminal.runners.map((runner) => runner.runnerId)).toEqual([
+      MOCK_IDS.deletedRunner,
+    ]);
+    const mixed = await work.listRunners({
+      organizationId,
+      includeEnded,
+      states: [RunnerState.BUSY, RunnerState.DELETED],
+    });
+    expect(mixed.runners.map((runner) => runner.runnerId)).toEqual([
+      MOCK_IDS.busyRunner,
+      MOCK_IDS.deletedRunner,
+    ]);
+    const defaults = await work.listRunners({ organizationId, includeEnded });
+    expect(defaults.runners.map((runner) => runner.runnerId)).toEqual(
+      includeEnded ? [...activeIds, MOCK_IDS.deletedRunner] : activeIds,
+    );
+  }
+
+  const otherProfile = await work.listRunners({
+    organizationId,
+    states: terminalStates,
+    runnerProfileId: MOCK_IDS.devProfile,
+  });
+  expect(otherProfile.runners).toEqual([]);
+});
+
+test("dev session states override includeEnded and respect owner and profile filters", async () => {
+  const sessions = createClient(DevSessionService, createMockTransport());
+  const organizationId = MOCK_IDS.acme;
+  const terminalStates = [RequestState.ENDED];
+  const mixedIds = [MOCK_IDS.queuedDev, MOCK_IDS.devSessionOther];
+
+  for (const includeEnded of [undefined, false, true]) {
+    const terminal = await sessions.listDevSessions({
+      organizationId,
+      includeEnded,
+      states: terminalStates,
+    });
+    expect(terminal.devSessions.map((session) => session.devSessionId)).toEqual(
+      [MOCK_IDS.devSessionOther],
+    );
+    const mixed = await sessions.listDevSessions({
+      organizationId,
+      includeEnded,
+      states: [RequestState.QUEUED, RequestState.ENDED],
+    });
+    expect(mixed.devSessions.map((session) => session.devSessionId)).toEqual(
+      mixedIds,
+    );
+    const defaults = await sessions.listDevSessions({
+      organizationId,
+      includeEnded,
+    });
+    expect(defaults.devSessions.map((session) => session.devSessionId)).toEqual(
+      includeEnded ? mixedIds : [MOCK_IDS.queuedDev],
+    );
+  }
+
+  const filters = {
+    organizationId,
+    states: terminalStates,
+    includeEnded: false,
+  };
+  const { devSession } = await sessions.getDevSession({
+    organizationId,
+    devSessionId: MOCK_IDS.devSessionOther,
+  });
+  if (!devSession) throw new Error("Expected the seeded ended dev session");
+  const matchingOwner = await sessions.listDevSessions({
+    ...filters,
+    owner: { case: "ownerUserId", value: devSession.ownerUserId },
+  });
+  expect(
+    matchingOwner.devSessions.map((session) => session.devSessionId),
+  ).toEqual([MOCK_IDS.devSessionOther]);
+  const caller = await sessions.listDevSessions({
+    ...filters,
+    owner: { case: "ownedByCaller", value: true },
+  });
+  expect(caller.devSessions).toEqual([]);
+  const otherProfile = await sessions.listDevSessions({
+    ...filters,
+    runnerProfileId: MOCK_IDS.linuxProfile,
+  });
+  expect(otherProfile.devSessions).toEqual([]);
+});
+
 test("listing personal API keys reports expiry at the current time", async () => {
   const issuedAt = Date.UTC(2026, 0, 1);
   const expiresAt = timestampFromMs(issuedAt + 2_250);
@@ -641,6 +804,64 @@ test("listing personal API keys reports expiry at the current time", async () =>
       { ...revoked, expiresAt, state: ApiKeyState.REVOKED },
     ]);
     expect(lastPage.nextPageToken).toBe("");
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test("repeating an API key revocation preserves its timestamp and audit event", async () => {
+  const revokedAt = Date.UTC(2026, 0, 1);
+  const clock = rs.spyOn(Date, "now").mockReturnValue(revokedAt);
+  try {
+    const transport = createMockTransport();
+    const apiKeys = createClient(ApiKeyService, transport);
+    const audit = createClient(AuditService, transport);
+    const organizationId = MOCK_IDS.acme;
+    const { apiKey } = await apiKeys.createApiKey({
+      organizationId,
+      name: "repeat-revoke",
+    });
+    if (!apiKey) throw new Error("Expected a key to revoke");
+    const { apiKeyId } = apiKey;
+    const input = { organizationId, apiKeyId };
+
+    const first = await apiKeys.revokeApiKey(input);
+    expect(first.apiKey).toEqual({
+      ...apiKey,
+      state: ApiKeyState.REVOKED,
+      revokedAt: timestampFromMs(revokedAt),
+    });
+    const afterFirst = await audit.listAuditEvents({ organizationId });
+    const revocations = afterFirst.events.filter(
+      (event) =>
+        event.action === AuditAction.API_KEY_REVOKED &&
+        event.targetId === apiKeyId,
+    );
+    expect(revocations).toHaveLength(1);
+    expect(revocations[0]).toMatchObject({
+      targetKind: AuditTargetKind.API_KEY,
+      subjectUserId: MOCK_USER,
+      createTime: timestampFromMs(revokedAt),
+    });
+
+    clock.mockReturnValue(revokedAt + 1000);
+    expect(await apiKeys.revokeApiKey(input)).toEqual(first);
+    const { apiKeys: listed } = await apiKeys.listApiKeys({ organizationId });
+    expect(listed.find((key) => key.apiKeyId === apiKeyId)).toEqual(
+      first.apiKey,
+    );
+    expect(await audit.listAuditEvents({ organizationId })).toEqual(afterFirst);
+
+    await expect(
+      apiKeys.revokeApiKey({ ...input, apiKeyId: "unknown-key" }),
+    ).rejects.toMatchObject({ code: Code.NotFound });
+    await expect(
+      apiKeys.revokeApiKey({ ...input, organizationId: MOCK_IDS.contoso }),
+    ).rejects.toMatchObject({
+      code: Code.NotFound,
+      rawMessage: "organization not found",
+    });
+    expect(await audit.listAuditEvents({ organizationId })).toEqual(afterFirst);
   } finally {
     clock.mockRestore();
   }
@@ -810,6 +1031,93 @@ test.each([
     }
   },
 );
+
+test("capacity refreshes device counts after a runner is deleted", async () => {
+  const organizationId = MOCK_IDS.acme;
+  const work = createClient(WorkService, createMockTransport());
+  const { devices: before } = await work.getCapacity({ organizationId });
+  expect(
+    before.map(({ ownsandDeviceId, runners }) => [
+      ownsandDeviceId,
+      Object.fromEntries(runners.map(({ state, count }) => [state, count])),
+    ]),
+  ).toEqual([
+    [MOCK_IDS.linuxDevice, { [RunnerState.WARM]: 1, [RunnerState.BUSY]: 1 }],
+    [MOCK_IDS.macDevice, {}],
+    [MOCK_IDS.windowsDevice, {}],
+  ]);
+
+  const { runner } = await work.deleteRunner({
+    organizationId,
+    runnerId: MOCK_IDS.warmRunner,
+  });
+  expect(runner?.state).toBe(RunnerState.DELETED);
+
+  const { devices: after } = await work.getCapacity({ organizationId });
+  expect(after).toEqual(
+    before.map((device) =>
+      device.ownsandDeviceId === MOCK_IDS.linuxDevice
+        ? {
+            ...device,
+            runners: device.runners.filter(
+              (count) => count.state === RunnerState.BUSY,
+            ),
+          }
+        : device,
+    ),
+  );
+});
+
+test("capacity groups only open runners assigned to devices in the organization", async () => {
+  const organizationId = MOCK_IDS.acme;
+  const ownsandDeviceId = MOCK_IDS.macDevice;
+  const work = createClient(
+    WorkService,
+    createMockTransport({
+      workFixtures: [
+        {
+          organizationId,
+          runners: [
+            ...[
+              RunnerState.DELETING,
+              RunnerState.BUSY,
+              RunnerState.WAITING_FOR_WORK,
+              RunnerState.WARM,
+              RunnerState.WARM,
+              RunnerState.PREPARING,
+              RunnerState.CREATING,
+              RunnerState.FAILED,
+              RunnerState.UNSPECIFIED,
+            ].map((state, index) => ({
+              runnerId: `mac-runner-${index}`,
+              ownsandDeviceId,
+              state,
+            })),
+            { runnerId: "unassigned", state: RunnerState.WARM },
+          ],
+        },
+        {
+          organizationId: MOCK_IDS.globex,
+          runners: [
+            { runnerId: "other-org", ownsandDeviceId, state: RunnerState.WARM },
+          ],
+        },
+      ],
+    }),
+  );
+  const { devices } = await work.getCapacity({ organizationId });
+  expect(
+    devices.find((device) => device.ownsandDeviceId === ownsandDeviceId)
+      ?.runners,
+  ).toEqual([
+    expect.objectContaining({ state: RunnerState.CREATING, count: 1 }),
+    expect.objectContaining({ state: RunnerState.PREPARING, count: 1 }),
+    expect.objectContaining({ state: RunnerState.WARM, count: 2 }),
+    expect.objectContaining({ state: RunnerState.WAITING_FOR_WORK, count: 1 }),
+    expect.objectContaining({ state: RunnerState.BUSY, count: 1 }),
+    expect.objectContaining({ state: RunnerState.DELETING, count: 1 }),
+  ]);
+});
 
 test.each([
   [MOCK_IDS.globex, "the organization has no OwnSand link"],
@@ -1042,6 +1350,21 @@ test("removing OwnSand ends each active request and publishes its terminal outco
     fresh.abort();
   }
 });
+
+test.each([
+  [MOCK_IDS.northwind, MOCK_IDS.deletedRunner, Code.PermissionDenied],
+  [MOCK_IDS.acme, MOCK_IDS.queuedJob, Code.NotFound],
+])(
+  "delete runner in %s returns the existing error code",
+  async (organizationId, runnerId, code) => {
+    const work = createClient(WorkService, createMockTransport());
+    await expect(
+      work.deleteRunner({ organizationId, runnerId }),
+    ).rejects.toMatchObject({
+      code,
+    });
+  },
+);
 
 test("GitHub installation state is scoped to its organization and can be used once before expiry", async () => {
   const issuedAt = Date.UTC(2026, 0, 1) + 123;

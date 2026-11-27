@@ -29,6 +29,8 @@ type Session struct {
 	EnvironmentID      string
 	RemoteURL          string
 	WorkspaceDirectory string
+	responseStatus     int
+	responseBody       string
 }
 
 // Fake is the fake Agents API.
@@ -64,6 +66,13 @@ func (f *Fake) Update(id string, fn func(*Session)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	fn(f.sessions[id])
+}
+
+// Respond sets a session's raw HTTP response. Status 0 restores the normal response.
+func (f *Fake) Respond(id string, status int, body string) {
+	f.Update(id, func(s *Session) {
+		s.responseStatus, s.responseBody = status, body
+	})
 }
 
 // Delete removes a session.
@@ -119,6 +128,13 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		actions = append(actions, map[string]string{"type": "environment_connection", "environment_id": cp.EnvironmentID})
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if cp.responseStatus != 0 {
+		w.WriteHeader(cp.responseStatus)
+		if cp.responseBody != "" {
+			_, _ = w.Write([]byte(cp.responseBody))
+		}
+		return
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"id": cp.ID, "object": "agent.session", "status": cp.Status, "required_actions": actions,
 		"environment": map[string]any{"type": "self_hosted", "id": cp.EnvironmentID, "remote_url": cp.RemoteURL,

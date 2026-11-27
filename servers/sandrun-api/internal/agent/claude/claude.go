@@ -20,6 +20,7 @@ package claude
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -600,18 +601,22 @@ func (p *execProcess) Wait() error                { return p.cmd.Wait() }
 func (p *execProcess) Signal(sig os.Signal) error { return p.cmd.Process.Signal(sig) }
 func (p *execProcess) Kill() error                { return p.cmd.Process.Kill() }
 
-// logWriter logs the orchestrator's output line by line as
-// claude_orchestrator_output. The orchestrator keeps secrets out of its
-// output, and the hook writes none; e-mail addresses and JWT-like values
-// are masked anyway.
+// logWriter masks complete lines before logging them as
+// claude_orchestrator_output. It discards oversized lines because a fragment
+// might omit the text that a mask needs to recognize a value.
 type logWriter struct {
-	log *slog.Logger
-	ctx context.Context
-	mu  sync.Mutex
-	buf []byte
+	log       *slog.Logger
+	ctx       context.Context
+	mu        sync.Mutex
+	buf       [maxLogLine]byte
+	pending   int
+	oversized bool
 }
 
-const maxLogLine = 2048
+const (
+	maxLogLine          = 2048
+	oversizedDiagnostic = "<oversized diagnostic omitted>"
+)
 
 var (
 	emailPattern = regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`)
@@ -621,36 +626,44 @@ var (
 func (l *logWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.buf = append(l.buf, p...)
-	for {
-		i := strings.IndexByte(string(l.buf), '\n')
-		if i < 0 {
-			if len(l.buf) > maxLogLine {
-				l.emit(l.buf)
-				l.buf = l.buf[:0]
+	for remaining := p; len(remaining) > 0; {
+		line, rest, complete := bytes.Cut(remaining, []byte{'\n'})
+		if !l.oversized {
+			if len(line) > len(l.buf)-l.pending {
+				l.pending = 0
+				l.oversized = true
+			} else {
+				l.pending += copy(l.buf[l.pending:], line)
 			}
-			return len(p), nil
 		}
-		l.emit(l.buf[:i])
-		l.buf = l.buf[i+1:]
+		if complete {
+			l.emitLine()
+		}
+		remaining = rest
 	}
+	return len(p), nil
 }
 
 func (l *logWriter) flush() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.buf) > 0 {
-		l.emit(l.buf)
-		l.buf = nil
-	}
+	l.emitLine()
 }
 
-func (l *logWriter) emit(line []byte) {
-	s := strings.TrimRight(string(line), "\r")
-	if len(s) > maxLogLine {
-		s = s[:maxLogLine]
+func (l *logWriter) emitLine() {
+	if l.pending == 0 && !l.oversized {
+		return
 	}
-	s = jwtPattern.ReplaceAllString(emailPattern.ReplaceAllString(s, "<email>"), "<token>")
+	s := oversizedDiagnostic
+	if !l.oversized {
+		s = strings.TrimRight(string(l.buf[:l.pending]), "\r")
+		s = jwtPattern.ReplaceAllString(emailPattern.ReplaceAllString(s, "<email>"), "<token>")
+		if len(s) > maxLogLine {
+			s = oversizedDiagnostic
+		}
+	}
+	l.pending = 0
+	l.oversized = false
 	if strings.TrimSpace(s) == "" {
 		return
 	}

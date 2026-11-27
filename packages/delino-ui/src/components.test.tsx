@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { readdirSync, readFileSync } from "node:fs";
-import { afterEach, describe, expect, test } from "@rstest/core";
+import { afterEach, describe, expect, rs, test } from "@rstest/core";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
@@ -1027,6 +1027,120 @@ describe("panel autofocus boundaries", () => {
         screen.getByRole("button", { name: "Cancel" }),
       );
     });
+  });
+
+  describe("Dialog autofocus across opens", () => {
+    for (const Field of fields) {
+      for (const autoFocus of [true, undefined]) {
+        test(`skips a disabled ${Field.name} marker when the next field has autoFocus=${autoFocus}`, async () => {
+          render(
+            <PanelFixture panel={panels[0]} useTrigger>
+              <Field label="Unavailable" disabled autoFocus />
+              <Field label="Critical" autoFocus={autoFocus} />
+            </PanelFixture>,
+          );
+          const opener = await openPanel();
+          expect(
+            screen.getByLabelText("Unavailable").hasAttribute("data-autofocus"),
+          ).toBe(false);
+          const target = autoFocus
+            ? screen.getByLabelText("Critical")
+            : screen.getByRole("button", { name: "Cancel" });
+          await waitFor(() => expect(document.activeElement).toBe(target));
+
+          await closePanel(autoFocus ? "Escape" : "Cancel");
+          await waitFor(() => expect(document.activeElement).toBe(opener));
+        });
+      }
+    }
+
+    function EditDialog({
+      Field,
+      autoFocus,
+      useTrigger,
+      keepMounted,
+    }: {
+      Field: (typeof fields)[number];
+      autoFocus?: boolean;
+      useTrigger?: boolean;
+      keepMounted?: boolean;
+    }) {
+      const [open, setOpen] = React.useState(false);
+      const [editing, setEditing] = React.useState(false);
+      return (
+        <>
+          {useTrigger ? null : (
+            <button type="button" onClick={() => setOpen(true)}>
+              Open
+            </button>
+          )}
+          <Dialog
+            open={useTrigger ? undefined : open}
+            onOpenChange={(nextOpen) => {
+              setOpen(nextOpen);
+              if (!nextOpen) setEditing(false);
+            }}
+          >
+            {useTrigger ? <DialogTrigger>Open</DialogTrigger> : null}
+            <DialogContent keepMounted={keepMounted}>
+              <DialogTitle>Rename</DialogTitle>
+              <button type="button" onClick={() => setEditing(true)}>
+                Edit
+              </button>
+              {editing && <Field label="Critical" autoFocus={autoFocus} />}
+              <DialogClose>Cancel</DialogClose>
+            </DialogContent>
+          </Dialog>
+        </>
+      );
+    }
+
+    async function revealField() {
+      const edit = screen.getByRole("button", { name: "Edit" });
+      await waitFor(() => expect(document.activeElement).toBe(edit));
+      await act(async () => {
+        fireEvent.click(edit);
+      });
+      return edit;
+    }
+
+    for (const Field of fields) {
+      for (const dismissal of ["Escape", "Cancel"] as const) {
+        test(`focuses a late ${Field.name} and returns focus after ${dismissal}`, async () => {
+          render(<EditDialog Field={Field} autoFocus />);
+          const opener = await openPanel();
+          await revealField();
+          expect(document.activeElement).toBe(
+            screen.getByLabelText("Critical"),
+          );
+
+          await closePanel(dismissal);
+          await waitFor(() => expect(document.activeElement).toBe(opener));
+        });
+      }
+
+      test(`keeps focus on Edit when a late ${Field.name} has no autoFocus`, async () => {
+        render(<EditDialog Field={Field} />);
+        await openPanel();
+        const edit = await revealField();
+        expect(screen.getByLabelText("Critical")).toBeTruthy();
+        expect(document.activeElement).toBe(edit);
+      });
+
+      test(`focuses a late ${Field.name} on successive trigger opens`, async () => {
+        render(<EditDialog Field={Field} autoFocus useTrigger keepMounted />);
+        for (const dismissal of ["Escape", "Cancel"] as const) {
+          const opener = await openPanel();
+          await revealField();
+          expect(document.activeElement).toBe(
+            screen.getByLabelText("Critical"),
+          );
+
+          await closePanel(dismissal);
+          await waitFor(() => expect(document.activeElement).toBe(opener));
+        }
+      });
+    }
   });
 
   test("defers autofocus for fields created by a custom content render", async () => {
@@ -2240,6 +2354,68 @@ describe("Avatar", () => {
       fallback.closest("[data-slot='avatar']")?.getAttribute("data-size"),
     ).toBe("large");
   });
+
+  test("shows decorative initials without exposing them when there is no source", () => {
+    render(<Avatar alt="" fallback="AL" />);
+
+    const fallback = screen.getByText("AL");
+    expect(fallback.getAttribute("aria-hidden")).toBe("true");
+    expect(fallback.hasAttribute("role")).toBe(false);
+    expect(fallback.hasAttribute("aria-label")).toBe(false);
+    expect(screen.queryByRole("img")).toBeNull();
+  });
+
+  test("keeps the decorative fallback hidden while loading and after an error", async () => {
+    using complete = rs.spyOn(HTMLImageElement.prototype, "complete", "get");
+    complete.mockReturnValue(false);
+    const { container } = render(
+      <Avatar alt="" fallback="AL" src="/ada.png" />,
+    );
+
+    const image = container.querySelector("img")!;
+    const fallback = screen.getByText("AL");
+    expect(fallback.getAttribute("data-loading-status")).toBe("loading");
+    expect(fallback.getAttribute("aria-hidden")).toBe("true");
+    expect(screen.queryByRole("img")).toBeNull();
+
+    await act(async () => {
+      fireEvent.error(image);
+    });
+
+    expect(screen.getByText("AL")).toBe(fallback);
+    expect(fallback.getAttribute("data-loading-status")).toBe("error");
+    expect(fallback.getAttribute("aria-hidden")).toBe("true");
+    expect(screen.queryByRole("img")).toBeNull();
+  });
+
+  test.each(["", "Ada Lovelace"])(
+    "uses only the native image after loading with alt %j",
+    async (alt) => {
+      const { container } = render(
+        <Avatar alt={alt} fallback="AL" src="/ada.png" />,
+      );
+
+      const fallback = screen.getByText("AL");
+      const image = container.querySelector("img")!;
+      expect(screen.queryAllByRole("img")).toEqual(alt ? [fallback] : []);
+      if (alt) {
+        expect(screen.getByRole("img", { name: alt })).toBe(fallback);
+      }
+
+      await act(async () => {
+        fireEvent.load(image);
+      });
+
+      expect(screen.queryByText("AL")).toBeNull();
+      expect(container.querySelector("img")).toBe(image);
+      expect(image.getAttribute("alt")).toBe(alt);
+      expect(image.hasAttribute("aria-hidden")).toBe(false);
+      expect(screen.queryAllByRole("img")).toEqual(alt ? [image] : []);
+      if (alt) {
+        expect(screen.getByRole("img", { name: alt })).toBe(image);
+      }
+    },
+  );
 
   test.each(["", "   "])("treats the blank src %j as no image", (src) => {
     const { container } = render(
