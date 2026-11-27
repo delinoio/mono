@@ -188,6 +188,11 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			if err != nil || !ok || !regular[target] {
 				return st, fmt.Errorf("sandrun: the archive entry %s is a hard link to a path outside the archive", filepath.ToSlash(name))
 			}
+			key := foldCase(name)
+			names := fileNames[key]
+			if err := checkArchiveCaseCollision(root, name, hdr.Name, names); err != nil {
+				return st, err
+			}
 			if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
 				return st, err
 			}
@@ -197,6 +202,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 					return st, err
 				}
 			}
+			fileNames[key] = rememberArchiveFileName(names, name, hdr.Name)
 			regular[name] = true
 			st.files++
 		default:
