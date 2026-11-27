@@ -144,21 +144,33 @@ func assertUserOnlyDACL(t *testing.T, path string) {
 		t.Fatalf("credential store DACL is not protected: %v", err)
 	}
 	dacl, _, err := sd.DACL()
-	if err != nil || dacl == nil || dacl.AceCount != 1 {
-		t.Fatalf("credential store DACL must have one entry: %v", err)
-	}
-	var ace *windows.ACCESS_ALLOWED_ACE
-	if err := windows.GetAce(dacl, 0, &ace); err != nil {
-		t.Fatal(err)
+	if err != nil || dacl == nil {
+		t.Fatalf("credential store must have a DACL: %v", err)
 	}
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		t.Fatal(err)
 	}
-	sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE ||
-		ace.Header.AceFlags&windows.INHERITED_ACE != 0 || !sid.Equals(user.User.Sid) {
-		t.Fatal("credential store DACL must grant access only to the current user")
+	// A directory can have separate grants for itself and its children.
+	hasDirectGrant := false
+	for i := range uint32(dacl.AceCount) {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, i, &ace); err != nil {
+			t.Fatal(err)
+		}
+		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+			t.Fatalf("credential store DACL entry %d must be an allow entry", i)
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if !sid.Equals(user.User.Sid) {
+			t.Fatalf("credential store DACL entry %d grants access to a different principal", i)
+		}
+		if ace.Mask != 0 && ace.Header.AceFlags&windows.INHERIT_ONLY_ACE == 0 {
+			hasDirectGrant = true
+		}
+	}
+	if !hasDirectGrant {
+		t.Fatal("credential store DACL must grant the current user access to this object")
 	}
 }
 
