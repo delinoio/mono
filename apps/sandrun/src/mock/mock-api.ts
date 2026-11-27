@@ -1406,6 +1406,8 @@ export function createMockTransport(
       removeOwnSandLink(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
+        if (org.link === undefined)
+          throw new ConnectError("OwnSand link not found", Code.NotFound);
         const requestsOnNewlyDeletedRunners = new Set<string>();
         for (const runner of org.runners) {
           if (TERMINAL_RUNNER_STATES.has(runner.state)) continue;

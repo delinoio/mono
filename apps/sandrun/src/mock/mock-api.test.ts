@@ -40,7 +40,12 @@ import {
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
 import { expect, rs, test } from "@rstest/core";
-import { createMockTransport, MOCK_IDS, MOCK_USER } from "./mock-api.ts";
+import {
+  createMockTransport,
+  MOCK_IDS,
+  MOCK_INVITATION_SECRET,
+  MOCK_USER,
+} from "./mock-api.ts";
 
 test("ends the departing member's queued dev session and publishes one update", async () => {
   const transport = createMockTransport();
@@ -1136,6 +1141,58 @@ test.each([
   },
 );
 
+const missingOwnSandLink = {
+  code: Code.NotFound,
+  rawMessage: "OwnSand link not found",
+};
+
+test("removing an absent OwnSand link leaves work and audit history unchanged", async () => {
+  const request = { organizationId: MOCK_IDS.globex };
+  const listWork = { ...request, includeEnded: true };
+  const transport = createMockTransport({
+    workFixtures: [
+      {
+        ...request,
+        requests: [{ requestId: "queued-job", state: RequestState.QUEUED }],
+        runners: [{ runnerId: "warm-runner", state: RunnerState.WARM }],
+      },
+    ],
+  });
+  const link = createClient(OwnSandLinkService, transport);
+  const work = createClient(WorkService, transport);
+  const audit = createClient(AuditService, transport);
+  const requests = structuredClone(await work.listRequests(listWork));
+  const runners = structuredClone(await work.listRunners(listWork));
+  const events = structuredClone(await audit.listAuditEvents(request));
+
+  await expect(link.removeOwnSandLink(request)).rejects.toMatchObject(
+    missingOwnSandLink,
+  );
+
+  expect(await work.listRequests(listWork)).toEqual(requests);
+  expect(await work.listRunners(listWork)).toEqual(runners);
+  expect(await audit.listAuditEvents(request)).toEqual(events);
+  expect((await link.getOwnSandLink(request)).link).toBeUndefined();
+});
+
+test("removing an absent OwnSand link checks membership and role first", async () => {
+  const transport = createMockTransport();
+  const link = createClient(OwnSandLinkService, transport);
+  const members = createClient(MemberService, transport);
+  const request = { organizationId: MOCK_IDS.contoso };
+
+  await expect(link.removeOwnSandLink(request)).rejects.toMatchObject({
+    code: Code.NotFound,
+    rawMessage: "organization not found",
+  });
+
+  await members.acceptInvitation({ invitationSecret: MOCK_INVITATION_SECRET });
+  await expect(link.removeOwnSandLink(request)).rejects.toMatchObject({
+    code: Code.PermissionDenied,
+    rawMessage: "needs the admin role",
+  });
+});
+
 test("removing OwnSand ends each active request and publishes its terminal outcome once", async () => {
   const organizationId = MOCK_IDS.acme;
   const otherOrgId = MOCK_IDS.globex;
@@ -1326,13 +1383,24 @@ test("removing OwnSand ends each active request and publishes its terminal outco
       state: RunnerState.DELETED,
       endReason: RunnerEndReason.CLEAN_UP,
     });
+    const events = (await audit.listAuditEvents({ organizationId })).events;
     expect(
-      (await audit.listAuditEvents({ organizationId })).events[0],
-    ).toMatchObject({
-      action: AuditAction.OWNSAND_LINK_REMOVED,
-      targetKind: AuditTargetKind.OWNSAND_LINK,
-      targetId: organizationId,
-    });
+      events.filter(
+        (event) => event.action === AuditAction.OWNSAND_LINK_REMOVED,
+      ),
+    ).toMatchObject([
+      {
+        action: AuditAction.OWNSAND_LINK_REMOVED,
+        targetKind: AuditTargetKind.OWNSAND_LINK,
+        targetId: organizationId,
+      },
+    ]);
+    await expect(
+      link.removeOwnSandLink({ organizationId }),
+    ).rejects.toMatchObject(missingOwnSandLink);
+    expect((await audit.listAuditEvents({ organizationId })).events).toEqual(
+      events,
+    );
 
     const snapshot = work
       .watchQueue(

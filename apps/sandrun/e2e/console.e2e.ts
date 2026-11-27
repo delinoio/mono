@@ -1050,7 +1050,7 @@ describe("integrations", () => {
     ).toBeVisible();
   });
 
-  test("removes the OwnSand link only after confirmation", async ({
+  test("removes and audits the OwnSand link only after confirmation", async ({
     app,
     browser,
     screen,
@@ -1070,6 +1070,10 @@ describe("integrations", () => {
     await dialog.getByRole("button", "Remove link").tap();
     await expect(dialog).toBeHidden();
     await expect(screen.getByText("OwnSand is not linked")).toBeVisible();
+
+    await screen.getByRole("link", "Audit events", { exact: true }).tap();
+    const audit = screen.getByRole("table", "Audit events");
+    await expect(audit.getByRole("cell", "OwnSand link removed")).toBeVisible();
   });
 
   test("opens management actions for an integration on the next page", async ({
