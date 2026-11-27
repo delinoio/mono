@@ -813,6 +813,41 @@ describe("requests", () => {
 });
 
 describe("integrations", () => {
+  test("offers a newly created integration in the runner profile form", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}/integrations`);
+    await expect(screen.getByText("No agent integrations")).toBeVisible();
+
+    await screen.getByRole("button", "Create agent integration").tap();
+    const integration = screen.getByRole(
+      "dialog",
+      "Create an agent integration",
+    );
+    await integration.getByLabel("Name").tap();
+    await browser.keyboard.type("first-integration");
+    await integration.getByLabel("Environment key", { exact: true }).tap();
+    await browser.keyboard.type("fixture-key");
+    await integration.getByRole("button", "Create integration").tap();
+    await expect(
+      screen.getByText("first-integration · Claude Code"),
+    ).toBeVisible();
+
+    await screen.getByRole("link", "Runner profiles").tap();
+    await screen.getByRole("button", "Create runner profile").tap();
+    const profile = screen.getByRole("dialog", "Create a runner profile");
+    await profile.getByRole("combobox", "Workload kind").tap();
+    await screen.getByRole("option", "Agent session").tap();
+    await profile.getByRole("combobox", "Agent integration").tap();
+    await expect(
+      screen.getByRole("option", "first-integration (Claude Code)"),
+    ).toBeVisible();
+  });
+
   test("removes the OwnSand link only after confirmation", async ({
     app,
     browser,
