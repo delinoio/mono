@@ -90,7 +90,8 @@ func TestJobLifecycle(t *testing.T) {
 		if strings.Contains(joined, reg.JIT) {
 			t.Fatal("a command contains the JIT configuration")
 		}
-		install = install || strings.Contains(joined, "actions-runner-linux-$arch-"+github.RunnerVersion+".tar.gz") && strings.Contains(joined, "baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40")
+		install = install || strings.Contains(joined, "actions-runner-linux-$arch-"+github.RunnerVersion+".tar.gz") &&
+			strings.Contains(joined, `if [ "$actual" != "$sum" ]; then`)
 		start = start || strings.Contains(joined, "./run.sh --jitconfig") && strings.Contains(joined, github.LogFilePath(sandrunv1.GuestOs_GUEST_OS_LINUX))
 	}
 	if !install || !start {
