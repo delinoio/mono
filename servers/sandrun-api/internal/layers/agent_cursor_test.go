@@ -88,6 +88,96 @@ func TestCursorClaimDuringProfileDeletion(t *testing.T) {
 	w.assertNoRequestsOrClaims(t)
 }
 
+func TestCursorClaimDuringProfileDeletionRetriesRelease(t *testing.T) {
+	for _, scenario := range []string{"poll", "repeated_demand", "lease_turnover"} {
+		t.Run(scenario, func(t *testing.T) {
+			timing := fastAgentTiming()
+			timing.PollInterval = time.Hour // Each step runs one poll explicitly.
+			const guest = sandrunv1.GuestOs_GUEST_OS_LINUX
+			const id = "bc-deleted-profile"
+			w := newCursorWorldTiming(t, guest, timing)
+			w.cursor.FailClaimCalls(true)
+			holder := holdTx(t, w.env, "DELETE FROM runner_profiles WHERE runner_profile_id = $1", w.profileID)
+			w.cursor.AddRequest(id, true)
+			waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+				query: "SELECT 1 FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR SHARE"})
+			if n := w.cursor.ClaimCount(id); n != 1 {
+				t.Fatalf("%d claims while admission waits for the profile, want 1", n)
+			}
+			holder.commit()
+			eventually(t, "failed release of the unused vendor claim", func() bool {
+				return w.cursor.ReleaseAttempts(id) == 1
+			})
+			if _, held := w.cursor.Claim(id); !held {
+				t.Fatal("the vendor claim disappeared after the release failed")
+			}
+			w.assertNoRequestsOrClaims(t)
+
+			failedAttempts := 1
+			switch scenario {
+			case "poll":
+				eventually(t, "the watch to stop after profile deletion", func() bool {
+					return w.cursor.Streams() == 0
+				})
+			case "repeated_demand":
+				w.createProfile(t, agentProfileProto("replacement", w.integrationID, guest, time.Hour))
+				w.cursor.AddRequest(id, true)
+				eventually(t, "release retry on the repeated demand", func() bool {
+					return w.cursor.ReleaseAttempts(id) == 2
+				})
+				failedAttempts++
+			case "lease_turnover":
+				w.l.Agents.Poll(t.Context())
+				if attempts := w.cursor.ReleaseAttempts(id); attempts != 2 {
+					t.Fatalf("release attempts under the original lease = %d, want 2", attempts)
+				}
+				w.env.Stop()
+				w.cursor.FailClaimCalls(false)
+				// Reacquire the lease on the same app and hub, which held
+				// the earlier cleanup entry in memory.
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					w.env.App.Run(ctx)
+				}()
+				t.Cleanup(func() { cancel(); <-done })
+				eventually(t, "a new lease", w.env.App.Lease.Held)
+				w.l.Agents.Poll(t.Context())
+				if attempts := w.cursor.ReleaseAttempts(id); attempts != 2 {
+					t.Fatalf("release attempts after lease turnover = %d, want 2", attempts)
+				}
+				if _, held := w.cursor.Claim(id); !held {
+					t.Fatal("the new lease released the old claim")
+				}
+				w.assertNoRequestsOrClaims(t)
+				t.Log("The same app reacquired the lease. Two failures occurred under the original lease, and the new lease sent no release.")
+				return
+			}
+
+			w.cursor.FailClaimCalls(false)
+			w.l.Agents.Poll(t.Context())
+			w.l.Agents.Poll(t.Context())
+			if attempts, releases := w.cursor.ReleaseAttempts(id), w.cursor.Released(id); attempts != failedAttempts+1 || releases != 1 {
+				t.Fatalf("release attempts = %d, successes = %d, want %d and 1", attempts, releases, failedAttempts+1)
+			}
+			if _, held := w.cursor.Claim(id); held {
+				t.Fatal("the vendor claim is still active")
+			}
+			_, claims, _ := w.cursor.WatchCalls()
+			if len(claims) != 1 {
+				t.Fatalf("claim attempts = %v, want only the original claim", claims)
+			}
+			w.assertNoRequestsOrClaims(t)
+			t.Logf("A poll without a vendor event released the claim after %d failed attempts. A second poll made no release call.", failedAttempts)
+			if scenario == "repeated_demand" {
+				w.cursor.Announce(id, 2)
+				w.requestBySource(t, id)
+			}
+		})
+	}
+}
+
 // TestCursorRequestLifecycle: a pending request is claimed with a SandRun
 // worker ID and becomes a request; the runner installs nothing new, gets
 // the key only in its credential file, starts `agent worker ... start` with

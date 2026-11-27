@@ -53,6 +53,21 @@ func rotateLog(path string, limit int64) error {
 	return os.Rename(path, path+".1")
 }
 
+type logSetupOperation string
+
+const (
+	createLogStateDir logSetupOperation = "could not create the service state directory"
+	openGuestLog      logSetupOperation = "could not open " + logFile
+)
+
+type logSetupError struct {
+	operation logSetupOperation
+	cause     error
+}
+
+func (e *logSetupError) Error() string { return string(e.operation) + ": " + e.cause.Error() }
+func (e *logSetupError) Unwrap() error { return e.cause }
+
 // openLogFile opens the log file of the state directory for appending and
 // rotates it first when it is larger than limit bytes. A failed rotation
 // does not stop the helper: the log keeps growing in the active file until a
@@ -61,7 +76,7 @@ func rotateLog(path string, limit int64) error {
 // error.
 func openLogFile(stateDir string, limit int64) (logOutput, error) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return logOutput{}, err
+		return logOutput{}, &logSetupError{operation: createLogStateDir, cause: err}
 	}
 	path := filepath.Join(stateDir, logFile)
 	var out logOutput
@@ -73,7 +88,7 @@ func openLogFile(stateDir string, limit int64) (logOutput, error) {
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return logOutput{}, err
+		return logOutput{}, &logSetupError{operation: openGuestLog, cause: err}
 	}
 	out.W = f
 	out.Close = f.Close

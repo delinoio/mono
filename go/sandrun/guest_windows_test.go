@@ -44,7 +44,7 @@ func requireRemoved(t *testing.T, path string) {
 }
 
 func TestWindowsGuestSyncRetryFileToDirectory(t *testing.T) {
-	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", func(t *testing.T, link, target string) {
+	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", "top/-a with [space]", func(t *testing.T, link, target string) {
 		t.Helper()
 		// A junction is a directory reparse point and needs no symlink privilege.
 		const script = `$ErrorActionPreference = 'Stop'

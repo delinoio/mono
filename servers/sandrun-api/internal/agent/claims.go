@@ -285,7 +285,8 @@ func (h *Hub) admit(ctx, leaseContext context.Context, v Vendor, in integration.
 	vendorKey := vendorRequestKey{in.OrganizationID, in.Vendor, d.VendorRequestID}
 	unlock := h.lockVendorRequest(vendorKey)
 	defer unlock()
-	if h.reconcileAdmission(leaseContext, vendorKey) == admissionUnresolved {
+	switch h.reconcileAdmission(vendorKey) {
+	case admissionUnresolved, admissionReleasePending:
 		return nil
 	}
 	c, req, err := h.latestClaim(ctx, h.svc.DB.Pool, in.OrganizationID, in.Vendor, d.VendorRequestID)
@@ -381,22 +382,22 @@ func (h *Hub) admit(ctx, leaseContext context.Context, v Vendor, in integration.
 		transactionID = xid
 		return nil
 	})
-	admission := pendingAdmission{claim: claim, integration: in, profileID: profileID, transactionID: transactionID, leaseDone: leaseContext.Done()}
-	switch {
-	case transactionID == "" || errors.Is(err, pgx.ErrTxCommitRollback):
-		h.releaseUnusedClaim(context.WithoutCancel(ctx), admission)
-	case err == nil:
+	admission := pendingAdmission{claim: claim, integration: in, profileID: profileID, transactionID: transactionID, lease: leaseContext}
+	if transactionID != "" && err == nil {
 		h.admissionCommitted(ctx, admission)
-	default:
-		h.claimLocksMu.Lock()
-		h.pendingAdmissions[vendorKey] = admission
-		h.claimLocksMu.Unlock()
-		switch h.reconcileAdmission(leaseContext, vendorKey) {
-		case admissionCommitted:
-			return nil
-		case admissionUnresolved:
-			h.log.LogAttrs(ctx, slog.LevelWarn, "agent_admission_outcome_unknown", append(logAttrs, slog.String("request_id", requestID))...)
-		}
+		return nil
+	}
+	if errors.Is(err, pgx.ErrTxCommitRollback) {
+		admission.transactionID = ""
+	}
+	h.claimLocksMu.Lock()
+	h.pendingAdmissions[vendorKey] = admission
+	h.claimLocksMu.Unlock()
+	switch h.reconcileAdmission(vendorKey) {
+	case admissionCommitted:
+		return nil
+	case admissionUnresolved:
+		h.log.LogAttrs(ctx, slog.LevelWarn, "agent_admission_outcome_unknown", append(logAttrs, slog.String("request_id", requestID))...)
 	}
 	if err != nil {
 		return fmt.Errorf("store request: %w", err)
@@ -405,20 +406,22 @@ func (h *Hub) admit(ctx, leaseContext context.Context, v Vendor, in integration.
 }
 
 type pendingAdmission struct {
-	claim         *Claim
-	integration   integration.Integration
-	profileID     string
+	claim       *Claim
+	integration integration.Integration
+	profileID   string
+	lease       context.Context
+	// An empty transactionID means no request committed and only release remains.
 	transactionID string
-	leaseDone     <-chan struct{}
 }
 
 type admissionOutcome string
 
 const (
-	admissionUnresolved admissionOutcome = "in progress"
-	admissionCommitted  admissionOutcome = "committed"
-	admissionAborted    admissionOutcome = "aborted"
-	admissionAbsent     admissionOutcome = ""
+	admissionUnresolved     admissionOutcome = "in progress"
+	admissionCommitted      admissionOutcome = "committed"
+	admissionAborted        admissionOutcome = "aborted"
+	admissionReleasePending admissionOutcome = "release pending"
+	admissionAbsent         admissionOutcome = ""
 )
 
 const admissionProbeTimeout = 2 * time.Second
@@ -431,13 +434,15 @@ func (h *Hub) admissionCommitted(ctx context.Context, p pendingAdmission) {
 	h.svc.WorkChanged(p.claim.OrganizationID)
 }
 
-func (h *Hub) releaseUnusedClaim(ctx context.Context, p pendingAdmission) {
-	probe := &work.Request{ID: p.claim.RequestID, OrganizationID: p.claim.OrganizationID, State: sandrunv1.RequestState_REQUEST_STATE_CANCELED,
+func (h *Hub) releaseUnusedClaim(ctx context.Context, p pendingAdmission) bool {
+	req := &work.Request{ID: p.claim.RequestID, OrganizationID: p.claim.OrganizationID, State: sandrunv1.RequestState_REQUEST_STATE_CANCELED,
 		EndReason: sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE}
-	if _, err := h.vendors[p.claim.Vendor].Release(ctx, p.integration, p.claim, probe); err != nil {
+	done, err := h.vendors[p.claim.Vendor].Release(ctx, p.integration, p.claim, req)
+	if err != nil {
 		h.log.WarnContext(ctx, "agent_claim_release_failed", slog.String("organization_id", p.claim.OrganizationID),
 			slog.String("request_id", p.claim.RequestID), slog.Any("error", err))
 	}
+	return done
 }
 
 func (h *Hub) reconcileAdmissions(ctx context.Context) {
@@ -449,14 +454,14 @@ func (h *Hub) reconcileAdmissions(ctx context.Context) {
 			return
 		}
 		unlock := h.lockVendorRequest(key)
-		h.reconcileAdmission(ctx, key)
+		h.reconcileAdmission(key)
 		unlock()
 	}
 }
 
 // reconcileAdmission runs under the vendor request lock. The poller retries
-// a failed or inconclusive probe even when the vendor sends no new events.
-func (h *Hub) reconcileAdmission(ctx context.Context, key vendorRequestKey) admissionOutcome {
+// unresolved outcomes and incomplete releases even without vendor events.
+func (h *Hub) reconcileAdmission(key vendorRequestKey) admissionOutcome {
 	h.claimLocksMu.Lock()
 	p, found := h.pendingAdmissions[key]
 	h.claimLocksMu.Unlock()
@@ -464,14 +469,28 @@ func (h *Hub) reconcileAdmission(ctx context.Context, key vendorRequestKey) admi
 		return admissionAbsent
 	}
 	outcome := admissionAbsent
-	select {
-	case <-p.leaseDone:
-		// A new lease holder can have claimed the same vendor ID. Leave
-		// the old claim alone after the original lease term ends.
-	default:
-		outcome = h.probeAdmission(ctx, p)
-		if outcome == admissionUnresolved {
+	// A new lease holder can have claimed the same vendor ID. Use the
+	// original lease for both the probe and the release.
+	if p.lease.Err() == nil {
+		outcome = admissionAborted
+		if p.transactionID != "" {
+			outcome = h.probeAdmission(p.lease, p)
+		}
+		switch outcome {
+		case admissionUnresolved:
 			return outcome
+		case admissionCommitted:
+			h.admissionCommitted(p.lease, p)
+		case admissionAborted:
+			if p.transactionID != "" {
+				p.transactionID = ""
+				h.claimLocksMu.Lock()
+				h.pendingAdmissions[key] = p
+				h.claimLocksMu.Unlock()
+			}
+			if p.lease.Err() == nil && !h.releaseUnusedClaim(p.lease, p) {
+				return admissionReleasePending
+			}
 		}
 	}
 	h.claimLocksMu.Lock()
@@ -495,15 +514,8 @@ func (h *Hub) probeAdmission(ctx context.Context, p pendingAdmission) admissionO
 	}
 	switch admissionOutcome(*status) {
 	case admissionCommitted:
-		h.admissionCommitted(ctx, p)
 		return admissionCommitted
 	case admissionAborted:
-		// The vendor call honors the lease context, independently of the
-		// failed admission and the probe's deadline.
-		if ctx.Err() != nil {
-			return admissionUnresolved
-		}
-		h.releaseUnusedClaim(ctx, p)
 		return admissionAborted
 	default:
 		return admissionUnresolved

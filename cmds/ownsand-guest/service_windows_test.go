@@ -5,10 +5,72 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
 )
+
+func TestServiceLogSetupFailurePreservesExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		prepare   func(*testing.T, string)
+		operation string
+		code      windows.Errno
+	}{
+		{
+			name: "mkdir",
+			prepare: func(t *testing.T, state string) {
+				writeFile(t, state, "occupied")
+			},
+			operation: "could not create the service state directory",
+			code:      windows.ERROR_PATH_NOT_FOUND,
+		},
+		{
+			name: "open",
+			prepare: func(t *testing.T, state string) {
+				if err := os.MkdirAll(filepath.Join(state, logFile), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			operation: "could not open guest.log",
+			code:      windows.ERROR_ACCESS_DENIED,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := filepath.Join(t.TempDir(), "private-state")
+			tc.prepare(t, state)
+			var events []string
+			h := &serviceHandler{
+				args: []string{"--state-dir", state, "--log-level", "info"},
+				reportStartupError: func(message string) error {
+					events = append(events, message)
+					return errors.New("event log unavailable")
+				},
+			}
+			specific, code := h.Execute(nil, nil, make(chan svc.Status, 2))
+			if !specific || code != 1 || h.code != 1 {
+				t.Fatalf("service-specific = %t, code = %d, process exit = %d; want true, 1, 1", specific, code, h.code)
+			}
+			want := fmt.Sprintf("%s (Windows error %d: %v)", tc.operation, tc.code, tc.code)
+			if len(events) != 1 || events[0] != want || strings.Contains(events[0], "private-state") {
+				t.Fatalf("got events %q, want one event %q", events, want)
+			}
+		})
+	}
+}
+
+func TestServiceLogFailureOmitsUnknownCause(t *testing.T) {
+	err := &logSetupError{operation: openGuestLog, cause: errors.New("private state path")}
+	if got := serviceLogFailure(err); got != "could not open guest.log" {
+		t.Fatalf("unexpected diagnostic %q", got)
+	}
+}
 
 // TestOpenServiceLogKeepsArchiveHeldByAnotherHandle reproduces the Windows
 // failure that the portable tests stand in for: a handle without
@@ -42,7 +104,11 @@ func TestOpenServiceLogKeepsArchiveHeldByAnotherHandle(t *testing.T) {
 		}
 	})
 
-	first, err := openServiceLog(dir)
+	h := &serviceHandler{reportStartupError: func(message string) error {
+		t.Errorf("unexpected startup event: %s", message)
+		return nil
+	}}
+	first, err := h.openServiceLog(dir)
 	if err != nil {
 		t.Fatalf("openServiceLog with a held archive: %v", err)
 	}
@@ -60,7 +126,7 @@ func TestOpenServiceLogKeepsArchiveHeldByAnotherHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	heldOpen = false
-	second, err := openServiceLog(dir)
+	second, err := h.openServiceLog(dir)
 	if err != nil {
 		t.Fatalf("openServiceLog after the release: %v", err)
 	}

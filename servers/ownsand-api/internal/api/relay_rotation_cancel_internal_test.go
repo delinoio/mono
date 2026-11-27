@@ -42,7 +42,7 @@ type rotationHarness struct {
 	sent   chan *ownsandv1.DataFrame
 }
 
-func newRotationHarness(t *testing.T, timing RelayTiming) *rotationHarness {
+func newRotationHarness(t *testing.T, timing RelayTiming, beforeSend func(*ownsandv1.DataFrame)) *rotationHarness {
 	t.Helper()
 	limits := relay.Limits{StreamBuffer: datapath.MinWindowSize, MaxStreamsPerConn: 4, MaxStreamsPerGrant: 4, Keepalive: time.Minute, IdleTimeout: time.Hour}
 	h := &rotationHarness{
@@ -68,6 +68,12 @@ func newRotationHarness(t *testing.T, timing RelayTiming) *rotationHarness {
 		}
 	}
 	send := func(f *ownsandv1.DataFrame) error {
+		if beforeSend != nil {
+			beforeSend(f)
+		}
+		if f.GetRelayKeepalive() != nil {
+			return nil
+		}
 		select {
 		case h.sent <- f:
 		default:
@@ -223,7 +229,7 @@ func stdout(data string) *ownsandv1.ExecEvent {
 // queued. The call is logged as canceled, the queued frame stays unsent, and
 // the agent receives a stream close frame.
 func TestRotationAfterRequestCancelReturnsContextError(t *testing.T) {
-	h := newRotationHarness(t, pastRotation)
+	h := newRotationHarness(t, pastRotation, nil)
 	h.feed(&ownsandv1.RequestAccepted{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -267,7 +273,7 @@ func (c *expiringContext) Err() error {
 // TestRotationAfterRequestDeadlineReturnsDeadlineExceeded is the same check
 // for a request context that ended with its deadline.
 func TestRotationAfterRequestDeadlineReturnsDeadlineExceeded(t *testing.T) {
-	h := newRotationHarness(t, pastRotation)
+	h := newRotationHarness(t, pastRotation, nil)
 	h.feed(&ownsandv1.RequestAccepted{})
 	ctx := &expiringContext{Context: context.Background()}
 	err := h.serve(ctx, func() {
@@ -291,7 +297,7 @@ func TestRotationAfterRequestDeadlineReturnsDeadlineExceeded(t *testing.T) {
 func TestRotationWithEmptyQueueAfterRequestCancel(t *testing.T) {
 	timing := pastRotation
 	timing.Keepalive = 4 * time.Millisecond // the handler wakes every millisecond
-	h := newRotationHarness(t, timing)
+	h := newRotationHarness(t, timing, nil)
 	h.feed(&ownsandv1.RequestAccepted{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -310,7 +316,7 @@ func TestRotationWithEmptyQueueAfterRequestCancel(t *testing.T) {
 // deadline is not forwarded, no extra event is sent and the agent still gets
 // its stream close frame.
 func TestRotationWithLiveContextReturnsOK(t *testing.T) {
-	h := newRotationHarness(t, pastRotation)
+	h := newRotationHarness(t, pastRotation, nil)
 	h.feed(&ownsandv1.RequestAccepted{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -327,6 +333,82 @@ func TestRotationWithLiveContextReturnsOK(t *testing.T) {
 	if h.call.frames != 0 || h.call.bytes != 0 {
 		t.Errorf("forwarded %d frames and %d bytes, want none", h.call.frames, h.call.bytes)
 	}
+	h.waitClose()
+}
+
+// TestRotationWhileReturningRelayCredit holds the connection writer after
+// request acceptance, so returning credit for delivered output must wait
+// for room. Rotation still returns OK and reserves a close frame.
+func TestRotationWhileReturningRelayCredit(t *testing.T) {
+	timing := pastRotation
+	timing.Rotation = time.Second
+	writerBlocked := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	var block sync.Once
+	h := newRotationHarness(t, timing, func(f *ownsandv1.DataFrame) {
+		if f.GetStreamId() != 0 && f.GetRelayKeepalive() != nil {
+			block.Do(func() {
+				close(writerBlocked)
+				<-releaseWriter
+			})
+		}
+	})
+	release := sync.OnceFunc(func() { close(releaseWriter) })
+	t.Cleanup(release)
+	h.call.stream.Started = time.Now()
+	rotateAt := h.call.stream.Started.Add(timing.Rotation)
+	ctx, cancel := context.WithDeadline(context.Background(), rotateAt.Add(time.Second))
+	defer cancel()
+	h.feed(&ownsandv1.RequestAccepted{})
+	err := h.serve(ctx, func() {
+		fillCtx, stop := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer stop()
+		f := datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})
+		if err := h.call.stream.Send(fillCtx, f); err != nil {
+			t.Fatalf("send the frame that gates the writer: %v", err)
+		}
+		select {
+		case <-writerBlocked:
+		case <-fillCtx.Done():
+			t.Fatal("the writer did not reach the gate")
+		}
+		// Use a fresh frame for each send because Send sets its identifiers.
+		filled := 0
+		for {
+			f := datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})
+			err := h.call.stream.Send(fillCtx, f)
+			if errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("fill the agent connection's queue: %v", err)
+			}
+			filled++
+		}
+		if filled != 1024 {
+			t.Fatalf("queued %d frames, want all 1024 ordinary slots filled", filled)
+		}
+		h.feed(stdout("before rotation"))
+		if !time.Now().Before(rotateAt) {
+			t.Fatal("the setup exceeded the rotation deadline")
+		}
+	})
+	if err != nil {
+		t.Fatalf("serveStream = %v, want clean rotation with credit pending", err)
+	}
+	if time.Now().Before(rotateAt) {
+		t.Fatal("the stream ended before its rotation deadline")
+	}
+	if got := h.eventKinds(); len(got) != 2 || got[0] != "accepted" || got[1] != "stdout" {
+		t.Fatalf("events = %v, want accepted and stdout without a final event", got)
+	}
+	if h.call.frames != 1 || h.call.bytes <= 0 {
+		t.Fatalf("forwarded %d frames and %d bytes, want one payload frame", h.call.frames, h.call.bytes)
+	}
+	if got := h.logCode(); got != "ok" {
+		t.Errorf("logged code = %q, want ok", got)
+	}
+	release()
 	h.waitClose()
 }
 
@@ -374,7 +456,7 @@ func TestRotationInFutureWithQueuedTerminalReply(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := newRotationHarness(t, timing)
+			h := newRotationHarness(t, timing, nil)
 			h.feed(&ownsandv1.RequestAccepted{})
 			ctx := &queuedReplyContext{Context: context.Background(), err: tc.wantErr}
 			exited := &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{
