@@ -1,0 +1,49 @@
+{
+  "gid": "inv-30-process-helper-stop-deadline",
+  "commit": "de0d480b620a74a53de1f11197b9b4e2589304be",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "de0d480b620a74a53de1f11197b9b4e2589304be",
+    "setup": "Run in one Bash shell from a short disposable checkout at the stated Git revision. Use Go 1.26.1. The tests use the process runtime and run as an ordinary account. The short worktree-local TMPDIR accommodates the macOS Unix socket limit.",
+    "commands": [
+      "set -euo pipefail",
+      "test \"$(uname -s)\" = Darwin",
+      "test \"$(git rev-parse HEAD)\" = de0d480b620a74a53de1f11197b9b4e2589304be",
+      "mkdir -p .t3-tmp/native-process-helper-stop",
+      "export TMPDIR=\"$(git rev-parse --show-toplevel)/.t3-tmp\" COPYFILE_DISABLE=1 CGO_ENABLED=0 GOTOOLCHAIN=go1.26.1",
+      "test \"$(printf %s \"$TMPDIR\" | wc -c | tr -d '[:space:]')\" -le 80",
+      "go version",
+      "go test -mod=readonly -count=3 -timeout=90s -v ./cmds/ownsand-agent/internal/vmruntime/processrt -run '^(TestPSStoppedDeadlineRetainsCompletedFailure|TestWaitHelperStoppedReportsPSFailureAtCallerDeadline|TestLifecycleEnumeratesOnlyAfterHelperPSStopped)$' 2>&1 | tee .t3-tmp/native-process-helper-stop/ps-regression.log",
+      "go test -mod=readonly -count=1 -timeout=90s -v ./cmds/ownsand-agent/internal/vmruntime/processrt -run '^(TestBinaryWithProcessRuntime|TestHelperStoppedObservesRealHelper|TestLifecycleSignalsReachExecWorkers|TestPauseEnumeratesOnlyAfterHelperIsObservedStopped|TestPauseRollsBackWhenHelperDoesNotStop|TestDeleteFailsWhenHelperDoesNotStop|TestLifecycleEnumeratesOnlyAfterHelperPSStopped|TestPauseFailureContinuesHelper|TestPSStoppedDeadlineRetainsCompletedFailure|TestWaitHelperStopped.*|TestDeleteWithCanceledContextKillsWorkers)$' 2>&1 | tee .t3-tmp/native-process-helper-stop/processrt.log",
+      "go test -mod=readonly -count=1 -timeout=120s -v ./cmds/ownsand-agent -run '^(TestBinaryWithProcessRuntime|TestBinaryWithProcessRuntimeDarwin)$' 2>&1 | tee .t3-tmp/native-process-helper-stop/agent.log"
+    ],
+    "expectedResults": [
+      "All three commands exit zero, and the named tests run. The first command repeats the macOS failure regression three times.",
+      "Both persistent Pause and Delete cases wrap context.DeadlineExceeded and an exec.ExitError with status 2. The caller deadline regression makes the same assertions.",
+      "The completed exit-status 2 remains available when the probe deadline fires before the status is interpreted.",
+      "With no completed probe failure the timeout contains only the deadline cause. The blocked ps process is killed and reaped. A late stopped result cannot start worker enumeration.",
+      "Pause resumes the helper after timeout or caller cancellation. Delete stays tracked on timeout and completes on retry or with an already canceled caller. The agent starts a real macOS guest helper and completes its process-runtime lifecycle."
+    ],
+    "files": {
+      "copyFrom": null,
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/vmruntime/processrt/processrt_test.go",
+        "cmds/ownsand-agent/binary_test.go",
+        "cmds/ownsand-agent/binary_darwin_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/native-process-helper-stop/ps-regression.log",
+        ".t3-tmp/native-process-helper-stop/processrt.log",
+        ".t3-tmp/native-process-helper-stop/agent.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-process-helper-stop-deadline/worker/.t3-tmp/process-helper-stop/processrt-darwin-arm64-followup.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-process-helper-stop-deadline/worker/.t3-tmp/process-helper-stop/ownsand-agent-darwin-arm64-followup.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-process-helper-stop-deadline/worker/.t3-tmp/process-helper-stop/ownsand-agent-darwin-arm64-followup"
+      ]
+    }
+  }
+}
