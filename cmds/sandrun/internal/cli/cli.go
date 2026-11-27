@@ -563,6 +563,10 @@ func (a *app) requireOrg() (string, error) {
 // sdk returns the SDK client. SANDRUN_API_KEY takes precedence over the
 // stored Logto tokens.
 func (a *app) sdk() (*sandrun.Client, error) {
+	return a.sdkWithTokenSource(a.tokenSource)
+}
+
+func (a *app) sdkWithTokenSource(loadTokenSource func() (sandrun.TokenSource, error)) (*sandrun.Client, error) {
 	if a.client != nil {
 		return a.client, nil
 	}
@@ -571,7 +575,7 @@ func (a *app) sdk() (*sandrun.Client, error) {
 		opts.APIKey = key
 		a.logger.Debug("SandRun credential selected", "kind", "api_key")
 	} else {
-		src, err := a.tokenSource()
+		src, err := loadTokenSource()
 		if err != nil {
 			return nil, err
 		}
