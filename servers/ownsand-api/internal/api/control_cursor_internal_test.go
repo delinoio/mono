@@ -40,7 +40,7 @@ func newCursorHarness(t *testing.T, n int64) *cursorHarness {
 	for id := int64(1); id <= n; id++ {
 		h.all = append(h.all, events.Event{ID: id, Kind: events.KindDeviceConfigChanged})
 	}
-	s := &Service{Hub: hub.New(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	s := &Service{Hub: hub.New(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Lease: &ownershipLease{held: true}}
 	h.c = &Control{S: s, kick: make(chan struct{}, 1), cursor: -1}
 	h.c.latestID = func(context.Context) (int64, error) { return h.latest, h.latestErr }
 	h.c.readEvents = func(_ context.Context, after int64, limit int) ([]events.Event, error) {
@@ -55,7 +55,7 @@ func newCursorHarness(t *testing.T, n int64) *cursorHarness {
 		}
 		return out, nil
 	}
-	h.c.handleEvent = func(_ context.Context, e events.Event) error {
+	h.c.handleEvent = func(_ context.Context, e events.Event, _ channelGenerations) error {
 		if h.onHandle != nil {
 			h.onHandle(e.ID)
 		}

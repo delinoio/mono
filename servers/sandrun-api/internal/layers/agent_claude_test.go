@@ -779,19 +779,32 @@ func TestClaudeRealProcesses(t *testing.T) {
 	if out, err := exec.Command("go", "build", "-o", bin, "github.com/delinoio/mono/servers/sandrun-api/cmd/sandrun-api").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
-	scratch := t.TempDir()
+	for _, name := range []string{"ordinary", "with'apostrophe"} {
+		t.Run(name, func(t *testing.T) {
+			scratch := filepath.Join(t.TempDir(), name)
+			if err := os.Mkdir(scratch, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			testClaudeRealProcesses(t, bin, scratch)
+		})
+	}
+}
+
+func testClaudeRealProcesses(t *testing.T, bin, scratch string) {
+	t.Helper()
 	script := filepath.Join(scratch, "claude")
 	if err := os.WriteFile(script, []byte(`#!/bin/sh
+scratch=${0%/*}
 hooks=
 while [ $# -gt 0 ]; do
   if [ "$1" = --hooks-dir ]; then hooks=$2; fi
   shift
 done
-printf '%s' '`+claudeWorkOrder+`' > '`+scratch+`/wo'
+printf '%s' '`+claudeWorkOrder+`' > "$scratch/wo"
 spawn() {
   env -i PATH=/usr/bin:/bin CLAUDE_RUNNER_ORDER_ID="$1" CLAUDE_RUNNER_SESSION_ID=session_real \
-    CLAUDE_RUNNER_WORK_ORDER_FILE='`+scratch+`/wo' "$hooks/spawn-runner" 2>"`+scratch+`/$2.stderr"
-  echo $? > "`+scratch+`/$2.code"
+    CLAUDE_RUNNER_WORK_ORDER_FILE="$scratch/wo" "$hooks/spawn-runner" 2>"$scratch/$2.stderr"
+  echo $? > "$scratch/$2.code"
 }
 trap 'spawn order-drain drain; exit 0' TERM
 spawn order-real normal
@@ -823,6 +836,7 @@ while :; do sleep 0.05; done
 			t.Fatalf("%s hook exit %s: %s", phase, code, stderr)
 		}
 		w.requestBySource(t, order)
+		t.Logf("%s hook exited 0 and stored %s", phase, order)
 	}
 	checkHook("normal", "order-real")
 	// Rotating the credential stops the orchestrator while the profile still

@@ -127,17 +127,18 @@ function logFailure(error) {
 // private channel (file descriptor 3) to the launcher. The supervisor runs the
 // build or server as its child in the same group. The build supervisor reads
 // stop requests from the channel and signals its whole group. The server
-// supervisor relays OS signals to the server once per delivery. When the
-// launcher dies, the kernel closes the channel. The supervisor then sends
-// SIGTERM to its group so a server can drain. A group stop ends with SIGKILL
-// when the child exits or the grace period expires. This ends surviving
-// descendants. The launcher's end of the channel stays in the launcher. The
-// supervisor's child gets /dev/null as descriptor 3, so the pipe does not
-// reach the build, the server or their descendants.
+// supervisor relays OS signals to the server once per delivery and sends
+// SIGKILL to the group after the server exits. When the launcher dies, the
+// kernel closes the channel. The supervisor then sends SIGTERM to its group
+// so a server can drain. A group stop ends with SIGKILL when the child exits
+// or the grace period expires. This ends surviving descendants. The
+// launcher's end of the channel stays in the launcher. The supervisor gives
+// its child /dev/null as descriptor 3 to keep the channel private.
 // Windows starts the child directly (`useSupervisor` is false there).
 function supervise(phase, command, args) {
   const isBuild = phase === Phase.Build;
   let stoppingGroup = false;
+  let serverStopRequested = false;
   let child = null;
   let childStatus = null;
   // The supervisor leads its group (the launcher starts it detached), so the
@@ -149,11 +150,14 @@ function supervise(phase, command, args) {
     process.on(signal, () => {
       // A group signal reaches the supervisor too. Only the server supervisor
       // relays OS signals, and only before a group stop.
-      if (!isBuild && !stoppingGroup) child?.kill(signal);
+      if (!isBuild && !stoppingGroup) {
+        serverStopRequested = true;
+        child?.kill(signal);
+      }
     });
   }
   const finish = () => {
-    if (stoppingGroup) stopGroup("SIGKILL");
+    if (stoppingGroup || serverStopRequested) stopGroup("SIGKILL");
     process.exit(childStatus);
   };
   const requestGroupStop = (signal) => {

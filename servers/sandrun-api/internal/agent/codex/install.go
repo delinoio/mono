@@ -59,7 +59,7 @@ var installCodes = map[int64]string{
 	12: "the Node.js download or extraction failed",
 	13: "the Node.js archive does not match its pinned SHA-256",
 	14: "npm could not install @openai/codex@" + CodexVersion,
-	15: "codex is missing after the installation",
+	15: "the guest has no usable codex launcher after npm installation",
 	16: "the guest platform has no official Node.js archive (Linux and macOS on x64 or arm64 only)",
 	17: "the guest uses musl libc, for which Node.js publishes no official archive; use a template with Node.js 16 or later",
 	18: "the OpenAI Codex adapter supports Linux and macOS guests only",
@@ -71,7 +71,7 @@ var installCodes = map[int64]string{
 // script downloads the official Node.js archive of NodeVersion for the
 // machine, verifies its pinned SHA-256 and extracts it to $HOME/<nodeDir>;
 // then `npm install -g @openai/codex@<CodexVersion>` installs codex with
-// the npm prefix $HOME/.local, so no root access is needed.
+// the npm prefix $HOME/.local and verifies that codex --version succeeds.
 func InstallScript(guest sandrunv1.GuestOs) string {
 	if agent.IsWindows(guest) {
 		return "exit 18\n"
@@ -128,6 +128,8 @@ if ! node_ok; then
   node_ok || exit 12
 fi
 npm install -g "@openai/codex@` + CodexVersion + `" >/dev/null 2>&1 || exit 14
-command -v codex >/dev/null 2>&1 || exit 15
+# A failed probe may have cached an older codex later on PATH.
+hash -r 2>/dev/null || true
+codex --version >/dev/null 2>&1 || exit 15
 `
 }

@@ -5,11 +5,13 @@ package api_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
@@ -160,6 +162,41 @@ func TestImportResultBeforeSnapshotDeletionIsInFanout(t *testing.T) {
 	}
 }
 
+// waitForImportResultLock observes the expected statement waiting on the
+// fixture transaction. pg_stat_activity includes sessions in other databases.
+func waitForImportResultLock(t *testing.T, env *testenv.Env, blockerPID uint32, statement string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+
+	const query = `
+SELECT pid FROM pg_stat_activity
+WHERE datname = current_database()
+  AND state = 'active'
+  AND wait_event_type = 'Lock'
+  AND query = $1
+  AND $2 = ANY(pg_blocking_pids(pid))
+LIMIT 1`
+	for {
+		var waiterPID int32
+		err := env.DB.Pool.QueryRow(ctx, query, statement, int32(blockerPID)).Scan(&waiterPID)
+		if err == nil {
+			t.Logf("observed backend %d waiting on backend %d: %s", waiterPID, blockerPID, statement)
+			return
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("observe import result query %q blocked by backend %d: %v", statement, blockerPID, err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for import result query %q to block on backend %d: %v", statement, blockerPID, ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
 // TestImportResultWaitsForInFlightSnapshotDeletion checks the lock order: a
 // result that arrives while a deletion holds the snapshot row waits for it
 // and, when the deletion commits, finds no snapshot.
@@ -181,7 +218,8 @@ func TestImportResultWaitsForInFlightSnapshotDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	sendImportResult(agentB, cmdID)
-	time.Sleep(500 * time.Millisecond)
+	waitForImportResultLock(t, env, tx.Conn().PgConn().PID(),
+		"SELECT 1 FROM snapshots WHERE snapshot_id = $1 FOR SHARE")
 	if n := deleteSnapshotCommands(agentB, snapID); n != 0 {
 		t.Fatalf("the result was applied while the deletion was uncommitted: %d delete commands", n)
 	}

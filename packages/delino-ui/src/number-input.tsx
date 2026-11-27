@@ -16,7 +16,7 @@ import {
 import { useImperativeHandle, useRef } from "react";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
-import { useForwardedAutoFocus } from "./panel-autofocus.ts";
+import { useFieldAutoFocus } from "./panel-autofocus.ts";
 
 export interface NumberInputDraft {
   /** Whether the text currently contains a fractional value. */
@@ -116,7 +116,10 @@ export function NumberInput({
   } = props as typeof props & {
     "data-autofocus"?: unknown;
   };
-  const forwardedAutoFocus = useForwardedAutoFocus(autoFocus);
+  const { autoFocus: forwardedAutoFocus, marker } = useFieldAutoFocus(
+    autoFocus,
+    disabled,
+  );
   const inputRef = useRef<HTMLInputElement>(null);
   useImperativeHandle(
     draftRef,
@@ -161,20 +164,6 @@ export function NumberInput({
               />
             </svg>
           </NumberInputDecrement>
-          {/*
-            Workaround: the UI SDK Dialog chooses its initial focus target with a
-            `[autofocus], [data-autofocus]` DOM query, but React handles the
-            `autoFocus` prop by calling `focus()` and renders no `autofocus`
-            attribute. Without `data-autofocus` on the control `<input>`, a Dialog
-            focuses its first tabbable element (usually the close button) instead
-            of this input. The attribute must be on the control, not the root:
-            the root `<div>` is not tabbable, so a caller `data-autofocus` is dropped
-            from the root props above.
-            Exception: the caller ARIA props are not dropped but routed to the
-            control (see above), because the root has no role.
-            Scope: only when `autoFocus` is true. Remove when the UI SDK reads the
-            React `autoFocus` prop itself.
-          */}
           <NumberInputControl
             className="dui-number-input-control"
             placeholder={placeholder}
@@ -182,7 +171,7 @@ export function NumberInput({
             aria-describedby={ariaDescribedBy}
             aria-label={ariaLabel}
             aria-labelledby={ariaLabelledBy}
-            data-autofocus={autoFocus ? "" : undefined}
+            data-autofocus={marker}
             // The UI SDK snaps typed text before the form submits on Enter or
             // after blur. Skip only those SDK handlers for fractional drafts.
             // The browser still submits on Enter and the SDK still handles steps.

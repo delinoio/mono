@@ -11,7 +11,7 @@ import {
 import * as React from "react";
 import { ButtonSize, ButtonVariant } from "./button.tsx";
 import { mergeClassName } from "./class-name.ts";
-import { DeferAutoFocusContext } from "./panel-autofocus.ts";
+import { PanelAutoFocus, PanelAutoFocusContext } from "./panel-autofocus.ts";
 
 export { createDrawerController } from "@ui-sdk/react/drawer";
 export type { DrawerController, DrawerSide } from "@ui-sdk/react/drawer";
@@ -93,12 +93,12 @@ export function DrawerContent({ className, ...props }: DrawerContentProps) {
       {modal === undefined || modal === true ? (
         <DrawerBackdrop className="dui-drawer-backdrop" />
       ) : null}
-      <DeferAutoFocusContext value={true}>
+      <PanelAutoFocusContext value={PanelAutoFocus.Deferred}>
         <DrawerContentPart
           className={mergeClassName("dui-drawer-content", className)}
           {...props}
         />
-      </DeferAutoFocusContext>
+      </PanelAutoFocusContext>
     </>
   );
 }

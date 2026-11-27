@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import {
   chmodSync,
+  existsSync,
+  mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import test from "node:test";
 import { resolveChildEnv } from "./dev.mjs";
 
@@ -18,6 +24,8 @@ import { resolveChildEnv } from "./dev.mjs";
 // `go` whose build output prints the environment it received.
 const launcher = fileURLToPath(new URL("./dev.mjs", import.meta.url));
 const Timeout = 120_000;
+// Allow the POSIX supervisor's five-second grace period plus time for stdio.
+const CleanupTimeout = 10_000;
 // The tests that put a fake `go` first on PATH run a POSIX shell script, so
 // Windows is skipped like the accounts-api launcher tests.
 const skip = process.platform === "win32";
@@ -102,7 +110,7 @@ test("POSIX keeps differently cased settings distinct", () => {
   });
 });
 
-function start(env) {
+function start(t, env, buildTmp) {
   const child = spawn(process.execPath, [launcher], {
     env,
     stdio: ["ignore", "pipe", "pipe"],
@@ -111,20 +119,182 @@ function start(env) {
   let output = "";
   child.stdout.on("data", (d) => (output += d));
   child.stderr.on("data", (d) => (output += d));
-  const exited = new Promise((resolve) =>
-    child.once("close", (code, signal) => resolve({ code, signal })),
-  );
-  return { child, exited, output: () => output };
+  const closed = once(child, "close").then(([code, signal]) => ({
+    code,
+    signal,
+  }));
+  t.after(async () => {
+    let timer;
+    try {
+      if (child.pid && child.exitCode === null && child.signalCode === null) {
+        // Killing the launcher closes the supervisor's private channel and
+        // makes it stop the entire phase group on POSIX.
+        child.kill("SIGKILL");
+      }
+      const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error(
+            `launcher output did not close within ${CleanupTimeout}ms\n${output}`,
+          );
+          // Node reports the test timeout in preference to a teardown error.
+          t.diagnostic(error.message);
+          reject(error);
+        }, CleanupTimeout);
+      });
+      await Promise.race([closed, deadline]);
+    } finally {
+      clearTimeout(timer);
+      // Release our ends even if an inherited pipe missed the cleanup deadline.
+      child.stdout.destroy();
+      child.stderr.destroy();
+      child.unref();
+      if (buildTmp) rmSync(buildTmp, { recursive: true, force: true });
+    }
+  });
+  return { child, closed, output: () => output };
 }
 
-test("skips without DATABASE_URL", { timeout: Timeout }, async () => {
+test("skips without DATABASE_URL", { timeout: Timeout }, async (t) => {
   const env = { ...process.env };
   delete env.DATABASE_URL;
-  const run = start(env);
-  const { code } = await run.exited;
+  const run = start(t, env);
+  const { code } = await run.closed;
   assert.equal(code, 0);
   assert.match(run.output(), /sandrun_api_dev_skipped/);
 });
+
+function readPids(file) {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, "utf8")
+    .trim()
+    .split(/\s+/)
+    .map(Number)
+    .filter((pid) => Number.isInteger(pid) && pid > 1);
+}
+
+function runningPids(pids) {
+  try {
+    const states = execFileSync(
+      "ps",
+      ["-o", "pid=,stat=", "-p", pids.join(",")],
+      { encoding: "utf8" },
+    );
+    return states
+      .trim()
+      .split("\n")
+      .flatMap((line) => {
+        const [pid, state] = line.trim().split(/\s+/);
+        // An orphaned zombie has exited and holds no output pipe.
+        return state && !state.startsWith("Z") ? [Number(pid)] : [];
+      });
+  } catch (error) {
+    if (error.status !== 1) throw error;
+    return [];
+  }
+}
+
+const TimeoutProbe = "stalled launcher fixture";
+const ProbeTimeout = 3_000;
+const probeDir = process.env.SANDRUN_LAUNCHER_TIMEOUT_PROBE;
+if (probeDir) {
+  test(TimeoutProbe, { skip, timeout: ProbeTimeout }, async (t) => {
+    const buildTmp = join(probeDir, "builds");
+    const run = start(t, { ...process.env, TMPDIR: buildTmp }, buildTmp);
+    writeFileSync(join(probeDir, "launcher-pid"), String(run.child.pid));
+    await run.closed;
+  });
+} else {
+  test(
+    "a fixture timeout stops the launcher and clears its build output",
+    { skip, timeout: Timeout },
+    async (t) => {
+      const dir = mkdtempSync(join(tmpdir(), "sandrun-api-timeout-probe-"));
+      const buildTmp = join(dir, "builds");
+      mkdirSync(buildTmp);
+      const fixturePids = join(dir, "fixture-pids");
+      const getPids = () => [
+        ...readPids(join(dir, "launcher-pid")),
+        ...readPids(fixturePids),
+      ];
+      const goDir = fakeGo(
+        t,
+        [
+          // The build and its descendant hold inherited output through SIGTERM.
+          "trap '' TERM",
+          "sleep 90 &",
+          'printf "%s %s %s\\n" "$PPID" "$$" "$!" > "$FIXTURE_PIDS.tmp"',
+          'mv "$FIXTURE_PIDS.tmp" "$FIXTURE_PIDS"',
+          "wait",
+        ].join("\n"),
+      );
+      const env = { ...process.env };
+      // Run an independent TAP reporter instead of sending events to our runner.
+      delete env.NODE_TEST_CONTEXT;
+      try {
+        // The subprocess must report an actual node:test timeout. The independent
+        // deadline and PID cleanup also bound the regression if the fixture leaks.
+        await assert.rejects(
+          promisify(execFile)(
+            process.execPath,
+            [
+              "--test",
+              "--test-isolation=none",
+              "--test-reporter=tap",
+              `--test-name-pattern=^${TimeoutProbe}$`,
+              fileURLToPath(import.meta.url),
+            ],
+            {
+              env: {
+                ...env,
+                DATABASE_URL: "postgres://launcher-test",
+                PATH: `${goDir}${delimiter}${process.env.PATH}`,
+                SANDRUN_LAUNCHER_TIMEOUT_PROBE: dir,
+                FIXTURE_PIDS: fixturePids,
+              },
+              timeout: ProbeTimeout + CleanupTimeout + 10_000,
+              killSignal: "SIGKILL",
+            },
+          ),
+          (error) => {
+            const output = error.stdout + error.stderr;
+            assert.equal(error.code, 1, output);
+            assert.match(output, /failureType: 'testTimeoutFailure'/);
+            assert.doesNotMatch(output, /launcher output did not close/);
+            return true;
+          },
+        );
+        const pids = getPids();
+        assert.equal(
+          new Set(pids).size,
+          4,
+          "expected launcher, supervisor, build and descendant PIDs",
+        );
+        const deadline = performance.now() + 1_000;
+        let running = runningPids(pids);
+        while (running.length && performance.now() < deadline) {
+          await delay(25);
+          running = runningPids(pids);
+        }
+        assert.deepEqual(running, [], "fixture processes survived the timeout");
+        assert.equal(
+          existsSync(buildTmp),
+          false,
+          "fixture build directory survived",
+        );
+      } finally {
+        const pids = getPids();
+        for (const pid of pids.length ? runningPids(pids) : []) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch (error) {
+            if (error.code !== "ESRCH") throw error;
+          }
+        }
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+}
 
 function fakeGo(t, script) {
   const dir = mkdtempSync(join(tmpdir(), "sandrun-api-fake-go-"));
@@ -157,7 +327,6 @@ JS
 // Runs the launcher with a test-owned TMPDIR, so a build directory is visible.
 async function runLauncher(t, { env, goDir }) {
   const tmp = mkdtempSync(join(tmpdir(), "sandrun-api-dev-test-"));
-  t.after(() => rmSync(tmp, { recursive: true, force: true }));
   const childEnv = {
     ...process.env,
     PATH: `${goDir}${delimiter}${process.env.PATH}`,
@@ -169,8 +338,8 @@ async function runLauncher(t, { env, goDir }) {
   delete childEnv.ALLOW_DIRECT_CLIENT_ADDRESS;
   delete childEnv.METRICS_ADDR;
   Object.assign(childEnv, env);
-  const run = start(childEnv);
-  const { code } = await run.exited;
+  const run = start(t, childEnv, tmp);
+  const { code } = await run.closed;
   return { code, output: run.output(), tmp };
 }
 

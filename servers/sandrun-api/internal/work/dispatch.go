@@ -128,7 +128,11 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 				continue
 			}
 		}
-		res := e.createRunner(ctx, client, p, req, req.PoolKey, "")
+		res := e.createRunner(ctx, client, p, req, req.PoolKey, activeLink.CredentialRevision)
+		if res == createLinkChanged {
+			// The next pass loads the current client and queue.
+			return nil
+		}
 		if res == createUnavailable && !reclaimed {
 			reclaimed = e.reclaimWarm(ctx, queued, runners, p.ID)
 		}
@@ -398,6 +402,7 @@ const (
 	createFailed
 	createSkipped
 	createWarmDeferred
+	createLinkChanged
 	// createStalled: the call reached CreateTimeout (an uncertain result).
 	createStalled
 )
@@ -434,8 +439,9 @@ func sandboxRequest(p *profile.Profile, r *Runner) *ownsandv1.CreateSandboxReque
 }
 
 // createRunner stores a new runner with its idempotency key, binds the
-// request for binding kinds, and calls CreateSandbox. req is nil for a warm
-// runner; pool is the runner pool of a kind without BindsAtDispatch.
+// request for binding kinds, and calls CreateSandbox. linkRevision is the
+// credential revision of client. req is nil for a warm runner. pool is the
+// runner pool of a kind without BindsAtDispatch.
 func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, p *profile.Profile, req *Request, pool, linkRevision string) createResult {
 	a := e.adapters[p.Kind]
 	r := &Runner{
@@ -472,9 +478,8 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		if err := api.LockOrganizationShare(ctx, tx, p.OrganizationID); err != nil {
 			return err
 		}
-		// The link row lock serializes the creation with RemoveOwnSandLink
-		// and organization deletion, which mark the link as being removed
-		// before they delete runners.
+		// The link row lock serializes reservation with credential changes
+		// and with the removal mark set before teardown deletes runners.
 		var removing bool
 		var state int16
 		var currentLinkRevision string
@@ -484,10 +489,10 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		if removing || sandrunv1.OwnSandLinkState(state) != sandrunv1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE {
 			return errSkip
 		}
+		if currentLinkRevision != linkRevision {
+			return errLinkChanged
+		}
 		if req == nil {
-			if currentLinkRevision != linkRevision {
-				return errWarmDeferred
-			}
 			if err := e.allowWarmCreate(ctx, tx, r); err != nil {
 				return err
 			}
@@ -524,11 +529,14 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 			return err
 		}
 		*r = *created
-		e.logRunner(ctx, r, sandrunv1.RunnerState_RUNNER_STATE_UNSPECIFIED)
+		e.observeRunnerTransition(ctx, tx, r, sandrunv1.RunnerState_RUNNER_STATE_UNSPECIFIED, now, false)
 		return nil
 	})
 	if errors.Is(err, errSkip) {
 		return createSkipped
+	}
+	if errors.Is(err, errLinkChanged) {
+		return createLinkChanged
 	}
 	if errors.Is(err, errWarmDeferred) {
 		return createWarmDeferred
@@ -560,7 +568,10 @@ func (e *Engine) storedCreateRequest(ctx context.Context, runnerID string) (*own
 	return req, nil
 }
 
-var errSkip = errors.New("skip")
+var (
+	errSkip        = errors.New("skip")
+	errLinkChanged = errors.New("OwnSand link credential revision changed")
+)
 
 // applyCreate applies a CreateSandbox result to a stored CREATING runner.
 func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandbox, err error) createResult {
@@ -607,7 +618,7 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 		e.dropRunner(ctx, r, false)
 		return createUnavailable
 	case rejected(err, connect.CodeFailedPrecondition):
-		// No device of the OwnSand organization can ever run the profile.
+		// No device in the OwnSand organization is eligible for the profile.
 		e.dropRunner(ctx, r, true)
 		return createFailed
 	case rejected(err, connect.CodeInvalidArgument), rejected(err, connect.CodeNotFound), rejected(err, connect.CodePermissionDenied):
@@ -645,10 +656,29 @@ func rejected(err error, code connect.Code) bool {
 
 // dropRunner handles a runner whose sandbox was never created. For a
 // capacity rejection it removes the runner. For a no-device rejection it
-// records the failure and ends the request if it is still queued.
+// records the failure, backs off warm fill, or ends demand that is still queued.
 func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool) {
 	var ended *Request
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+		if noDevice {
+			if err := lockWarmOutcomeProfile(ctx, tx, r); err != nil {
+				return err
+			}
+		}
+		if noDevice && r.RequestID == "" && r.sponsorRequestID != "" {
+			// Profile deletion locks queued requests before runners. Hold the
+			// profile lock before taking those same locks in the reverse order.
+			err := api.LockOrganizationShare(ctx, tx, r.OrganizationID)
+			if err == nil {
+				err = profile.LockShare(ctx, tx, r.OrganizationID, r.ProfileID)
+			}
+			if isCode(err, connect.CodeNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+		}
 		cur, err := e.lockRunner(ctx, tx, r.ID)
 		if err != nil || cur.State != runCreating {
 			return err
@@ -666,6 +696,11 @@ func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool) {
 			requestID = cur.sponsorRequestID
 		}
 		if requestID == "" {
+			if cur.warmProfileRevision != "" {
+				// Device eligibility can change without a profile or link edit.
+				_, err := e.recordWarmFailure(ctx, tx, cur, false)
+				return err
+			}
 			return nil
 		}
 		req, err := e.LockRequest(ctx, tx, requestID)
@@ -726,12 +761,13 @@ func (e *Engine) requeueTx(ctx context.Context, tx pgx.Tx, requestID string) err
 	if err != nil || req.State != reqStarting {
 		return err
 	}
+	now := e.svc.NowUTC()
 	r, err := scanRequest(tx.QueryRow(ctx, "UPDATE requests SET state = $2, runner_id = NULL, update_time = $3 WHERE request_id = $1 RETURNING "+requestColumns,
-		requestID, int16(reqQueued), e.svc.NowUTC()))
+		requestID, int16(reqQueued), now))
 	if err != nil {
 		return err
 	}
-	e.logRequest(ctx, r, reqStarting)
+	e.observeRequestTransition(ctx, tx, r, reqStarting, now)
 	return nil
 }
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
@@ -24,7 +25,7 @@ import (
 )
 
 func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
-	for _, scenario := range []string{"queued", "canceled", "started", "warm_fill", "legacy", "removed_sponsor"} {
+	for _, scenario := range []string{"queued", "expired", "canceled", "started", "warm_fill", "legacy", "removed_sponsor", "capacity"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := t.Context()
 			w := newGHWorld(t, worldOpts{manualDispatch: true})
@@ -42,27 +43,20 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 			var calls atomic.Int32
 			requests := make(chan *ownsandv1.CreateSandboxRequest, 2)
 			firstResponse := make(chan struct{})
-			mux := http.NewServeMux()
-			mux.Handle(ownsandv1connect.SandboxServiceCreateSandboxProcedure, connect.NewUnaryHandler(
-				ownsandv1connect.SandboxServiceCreateSandboxProcedure,
-				func(_ context.Context, req *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
-					call := calls.Add(1)
-					if call <= 2 {
-						requests <- req.Msg
-					}
-					if call == 1 {
-						<-firstResponse
-						return nil, context.DeadlineExceeded
-					}
-					return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
-				},
-			))
-			peer := httptest.NewUnstartedServer(mux)
-			peer.Config.Protocols = new(http.Protocols)
-			peer.Config.Protocols.SetUnencryptedHTTP2(true)
-			peer.Start()
-			t.Cleanup(peer.Close)
-			factory := ownsandclient.SDKFactory{BaseURL: peer.URL}
+			factory := newCreateSandboxPeer(t, func(_ context.Context, req *ownsandv1.CreateSandboxRequest) error {
+				call := calls.Add(1)
+				if call <= 2 {
+					requests <- req
+				}
+				if call == 1 {
+					<-firstResponse
+					return context.DeadlineExceeded
+				}
+				if scenario == "capacity" {
+					return connect.NewError(connect.CodeUnavailable, errors.New("no free capacity"))
+				}
+				return connect.NewError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
+			})
 			client, err := factory.New(w.osOrg, "osk_"+strings.Repeat("a", 43))
 			if err != nil {
 				t.Fatal(err)
@@ -89,6 +83,9 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 			}
 			runnerID := runners[0].GetRunnerId()
 
+			if scenario == "expired" {
+				w.env.Clock.Advance(2 * time.Hour)
+			}
 			w.send(t, "workflow_job", job("queued", installation, other, sandRunLinux, ""))
 			switch scenario {
 			case "canceled", "removed_sponsor":
@@ -130,7 +127,7 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 			if otherBefore.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
 				t.Fatalf("other job before retry: %v", otherBefore)
 			}
-			if scenario == "queued" || scenario == "legacy" {
+			if scenario == "queued" || scenario == "expired" || scenario == "legacy" || scenario == "capacity" {
 				if before.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
 					t.Fatalf("sponsor before retry: %v", before)
 				}
@@ -149,18 +146,27 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 			}()
 			t.Cleanup(func() { stop(); <-done })
 
-			eventually(t, "the original runner records its rejected create", func() bool {
-				return w.runner(t, runnerID).GetState() == sandrunv1.RunnerState_RUNNER_STATE_FAILED
-			})
-			runner := w.runner(t, runnerID)
-			if runner.GetRequestId() != "" || runner.GetOwnsandSandboxId() != "" ||
-				runner.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
-				t.Fatalf("runner after retry: %v", runner)
+			if scenario == "capacity" {
+				eventually(t, "the capacity rejection removes the reservation", func() bool {
+					return len(w.runners(t)) == 0
+				})
+			} else {
+				eventually(t, "the original runner records its rejected create", func() bool {
+					return w.runner(t, runnerID).GetState() == sandrunv1.RunnerState_RUNNER_STATE_FAILED
+				})
+				runner := w.runner(t, runnerID)
+				if runner.GetRequestId() != "" || runner.GetOwnsandSandboxId() != "" ||
+					runner.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+					t.Fatalf("runner after retry: %v", runner)
+				}
 			}
 			after := w.requestOfJob(t, sponsor)
-			if scenario == "queued" {
-				if after.GetState() != sandrunv1.RequestState_REQUEST_STATE_FAILED ||
-					after.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE ||
+			if scenario == "queued" || scenario == "expired" {
+				state, reason := sandrunv1.RequestState_REQUEST_STATE_FAILED, sandrunv1.RequestEndReason_REQUEST_END_REASON_NO_ELIGIBLE_DEVICE
+				if scenario == "expired" {
+					state, reason = sandrunv1.RequestState_REQUEST_STATE_EXPIRED, sandrunv1.RequestEndReason_REQUEST_END_REASON_MAX_QUEUE_WAIT
+				}
+				if after.GetState() != state || after.GetEndReason() != reason ||
 					after.GetStartAttempts() != 0 || after.GetRunnerId() != "" {
 					t.Fatalf("sponsoring job after retry: %v", after)
 				}
@@ -177,7 +183,24 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 			if first.GetIdempotencyKey() == "" || !proto.Equal(first, second) {
 				t.Fatal("the retry changed the OwnSand create parameters or idempotency key")
 			}
-			t.Logf("OwnSand received identical creates before and after restart. Recovered runner recorded START_FAILED. Sponsor state: %s. Other job stayed QUEUED.", after.GetState())
+			t.Logf("OwnSand received identical creates before and after restart. Sponsor state after rejection: %s. Other job stayed QUEUED.", after.GetState())
 		})
 	}
+}
+
+func newCreateSandboxPeer(t *testing.T, create func(context.Context, *ownsandv1.CreateSandboxRequest) error) ownsandclient.SDKFactory {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.Handle(ownsandv1connect.SandboxServiceCreateSandboxProcedure, connect.NewUnaryHandler(
+		ownsandv1connect.SandboxServiceCreateSandboxProcedure,
+		func(ctx context.Context, req *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
+			return nil, create(ctx, req.Msg)
+		},
+	))
+	peer := httptest.NewUnstartedServer(mux)
+	peer.Config.Protocols = new(http.Protocols)
+	peer.Config.Protocols.SetUnencryptedHTTP2(true)
+	peer.Start()
+	t.Cleanup(peer.Close)
+	return ownsandclient.SDKFactory{BaseURL: peer.URL}
 }

@@ -97,6 +97,7 @@ import {
   RequestSchema,
   type Runner,
   RunnerSchema,
+  RunnerStateCountSchema,
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
@@ -180,6 +181,15 @@ const IDLE_GITHUB_RUNNER_STATES = new Set([
   RunnerState.PREPARING,
   RunnerState.WARM,
   RunnerState.WAITING_FOR_WORK,
+]);
+
+const OPEN_RUNNER_STATES: ReadonlySet<RunnerState> = new Set([
+  RunnerState.CREATING,
+  RunnerState.PREPARING,
+  RunnerState.WARM,
+  RunnerState.WAITING_FOR_WORK,
+  RunnerState.BUSY,
+  RunnerState.DELETING,
 ]);
 
 const now = () => Date.now();
@@ -610,10 +620,6 @@ function seed(
       },
       effectiveVcpuLimit: 24n,
       allocation: { vcpuCount: 8n, memoryMib: 16384n, diskGib: 128n },
-      runners: [
-        { state: RunnerState.BUSY, count: 1 },
-        { state: RunnerState.WARM, count: 1 },
-      ],
     }),
     create(DeviceCapacitySchema, {
       ownsandDeviceId: MOCK_IDS.macDevice,
@@ -849,6 +855,8 @@ export interface MockTransportOptions {
   userId?: string;
   /** The Acme runner profile count. Larger lists put linux-build last. */
   runnerProfileCount?: number;
+  /** Fail the first Acme roster continuation for retry tests. Default: true. */
+  failFirstAcmeMemberContinuation?: boolean;
   /** Caps integration pages and seeds a profile that uses the second page. */
   agentIntegrationPageSize?: number;
   /** Adds work fixtures to seeded organizations without changing the defaults. */
@@ -901,7 +909,7 @@ export function createMockTransport(
       ),
     );
   }
-  let failAcmeContinuation = true;
+  let failAcmeContinuation = options.failFirstAcmeMemberContinuation ?? true;
   const watchers = new Map<string, Set<Watcher>>();
   const issuedStates = new Map<
     string,
@@ -2014,6 +2022,12 @@ export function createMockTransport(
         const r = org.runners.find((x) => x.runnerId === req.runnerId);
         if (r === undefined)
           throw new ConnectError("runner not found", Code.NotFound);
+        if (
+          r.state === RunnerState.DELETING ||
+          TERMINAL_RUNNER_STATES.has(r.state)
+        ) {
+          return { runner: r };
+        }
         endRunner(org, r, RunnerEndReason.DELETED_BY_USER);
         audit(
           org,
@@ -2035,7 +2049,27 @@ export function createMockTransport(
             "the OwnSand link is invalid; an admin must set a new OwnSand API key",
             Code.FailedPrecondition,
           );
-        return { devices: org.devices };
+        const countsByDevice = new Map<string, Map<RunnerState, number>>();
+        for (const { ownsandDeviceId, state } of org.runners) {
+          if (ownsandDeviceId === "" || !OPEN_RUNNER_STATES.has(state)) {
+            continue;
+          }
+          const counts = countsByDevice.get(ownsandDeviceId) ?? new Map();
+          counts.set(state, (counts.get(state) ?? 0) + 1);
+          countsByDevice.set(ownsandDeviceId, counts);
+        }
+        return {
+          devices: org.devices.map((device) => ({
+            ...device,
+            runners: Array.from(
+              countsByDevice.get(device.ownsandDeviceId) ?? [],
+            )
+              .sort(([a], [b]) => a - b)
+              .map(([state, count]) =>
+                create(RunnerStateCountSchema, { state, count }),
+              ),
+          })),
+        };
       },
       async *watchQueue(req, ctx: HandlerContext) {
         const { org } = membership(req.organizationId);

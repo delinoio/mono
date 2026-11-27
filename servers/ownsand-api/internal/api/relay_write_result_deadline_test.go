@@ -19,6 +19,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/relay"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
@@ -30,8 +31,13 @@ type writeResultCall struct {
 	grant     string
 	stream    uint64
 	sandboxID string
+	writeID   string
 	// release makes the fake agent send the write result.
 	release chan struct{}
+	// The callback closes these channels when it receives the write chunk
+	// and when it exits through fixture cleanup, respectively.
+	callbackEntered chan struct{}
+	callbackStopped chan struct{}
 	// done receives the result of the call.
 	done   chan error
 	cancel context.CancelFunc
@@ -50,25 +56,38 @@ func startWriteResultCall(t *testing.T, deadline time.Duration) *writeResultCall
 	return c
 }
 
-func startWriteCall(t *testing.T, deadline time.Duration, initialCredit int64) *writeResultCall {
+func startWriteCall(t *testing.T, deadline time.Duration, initialCredit int64, opts ...testenv.Option) *writeResultCall {
 	t.Helper()
-	env := testenv.New(t, func(o *app.Options) {
+	opts = append(opts, func(o *app.Options) {
 		o.RelayTiming = &api.RelayTiming{Rotation: 3 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: time.Second,
 			RequestDeadline: deadline, GrantAck: time.Second, Signaling: 2 * time.Second}
 	})
+	env := testenv.New(t, opts...)
 	org, agent, sandboxID := runningSandbox(t, env)
-	c := &writeResultCall{deadline: deadline, sandboxID: sandboxID, env: env, release: make(chan struct{}), done: make(chan error, 1), resp: make(chan *ownsandv1.WriteFileResponse, 1)}
+	writeID, _ := uuidv7.NewString()
+	c := &writeResultCall{
+		env: env, deadline: deadline, sandboxID: sandboxID, writeID: writeID,
+		release: make(chan struct{}), callbackEntered: make(chan struct{}), callbackStopped: make(chan struct{}),
+		done: make(chan error, 1), resp: make(chan *ownsandv1.WriteFileResponse, 1),
+	}
+	stop := make(chan struct{})
 	c.relay = agent.ConnectRelayWithWindow(initialCredit, func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
 		w := f.GetFileWriteChunk()
-		if w == nil {
+		if w == nil || w.GetWriteId() != writeID {
 			return
 		}
-		<-c.release
-		s.Send(&ownsandv1.WriteFileResponse{WriteId: w.GetWriteId(), Offset: w.GetOffset(), Length: int64(len(w.GetData()))})
+		close(c.callbackEntered)
+		select {
+		case <-stop:
+			close(c.callbackStopped)
+		case <-c.release:
+			s.Send(&ownsandv1.WriteFileResponse{WriteId: w.GetWriteId(), Offset: w.GetOffset(), Length: int64(len(w.GetData()))})
+		}
 	})
+	// This cleanup runs before the relay closes.
+	t.Cleanup(func() { close(stop) })
 	c.relay.WaitFrame("supported frame kinds", func(f *ownsandv1.DataFrame) bool { return f.GetSupportedFrameKinds() != nil })
 
-	writeID, _ := uuidv7.NewString()
 	salt, _ := relaybinding.NewSalt()
 	write := &ownsandv1.WriteFileRequest{OrganizationId: org.ID, SandboxId: sandboxID, WriteId: writeID, Path: "/tmp/x", BindingSalt: salt, Data: []byte("chunk")}
 	c.grant = authorize(t, org.OwnerClient, org.ID, sandboxID, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE, writeID, relaybinding.WriteFileDigest(write))
@@ -93,7 +112,7 @@ func startWriteCall(t *testing.T, deadline time.Duration, initialCredit int64) *
 // flow control window of the connection stream is full, and then the 1024
 // ordinary places of the queue fill up behind it. It uses extra streams of
 // the same connection, so the write call under test does not take part.
-func fillOutboundQueue(t *testing.T, c *writeResultCall) {
+func fillOutboundQueue(t *testing.T, c *writeResultCall) *relay.Conn {
 	t.Helper()
 	plane := c.env.App.Plane
 	g := plane.Grants.Get(c.grant)
@@ -153,12 +172,28 @@ func fillOutboundQueue(t *testing.T, c *writeResultCall) {
 			t.Fatalf("fill the outbound queue: %v", err)
 		}
 	}
+	return conn
 }
 
-// sendWriteResult releases the agent's write result and waits until the
-// control plane has it, which shows as the call's result frame reaching the
-// stream queue: the call then waits in the credit return.
-func (c *writeResultCall) sendWriteResult() { close(c.release) }
+// releaseWriteResult lets the fake agent send its result.
+func (c *writeResultCall) releaseWriteResult() { close(c.release) }
+
+func (c *writeResultCall) waitResultCreditReturn(t *testing.T, waiting <-chan struct{}, within time.Duration) {
+	t.Helper()
+	select {
+	case <-waiting:
+		t.Logf("stream %d: result credit return reached the full outbound queue", c.stream)
+	case <-time.After(within):
+		t.Fatalf("stream %d: timed out after %v waiting for the result credit return to reach the full outbound queue", c.stream, within)
+	}
+}
+
+func (c *writeResultCall) waitStreamClose(t *testing.T) {
+	t.Helper()
+	c.relay.WaitFrame("stream close", func(f *ownsandv1.DataFrame) bool {
+		return f.GetStreamId() == c.stream && f.GetRelayStreamClose() != nil
+	})
+}
 
 func (c *writeResultCall) waitDone(t *testing.T, within time.Duration) error {
 	t.Helper()
@@ -200,6 +235,33 @@ func (c *writeResultCall) callFrames() (int, bool) {
 	return 0, false
 }
 
+func (c *writeResultCall) requireCallFrames(t *testing.T, want int) {
+	t.Helper()
+	if n, ok := c.callFrames(); !ok || n != want {
+		t.Fatalf("relay_rpc frames = %d (record found: %v), want %d", n, ok, want)
+	}
+}
+
+func TestRelayWriteFileResultCallbackStopsOnCleanup(t *testing.T) {
+	var c *writeResultCall
+	if !t.Run("withheld result", func(t *testing.T) {
+		c = startWriteResultCall(t, 15*time.Second)
+		select {
+		case <-c.callbackEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the fake agent did not enter the write-result callback")
+		}
+	}) || c == nil {
+		return
+	}
+
+	select {
+	case <-c.callbackStopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fixture cleanup did not stop the callback while the result was withheld")
+	}
+}
+
 // TestRelayWriteFileResultCreditReturnHonorsDeadline checks that a credit
 // return that waits for room in a full outbound queue cannot hold a WriteFile
 // call beyond its request deadline: the call fails with deadline_exceeded at
@@ -209,15 +271,16 @@ func TestRelayWriteFileResultCreditReturnHonorsDeadline(t *testing.T) {
 	// The deadline counts from the stream allocation, and stalling the
 	// connection takes a while, so it leaves room for that.
 	c := startWriteResultCall(t, 4*time.Second)
-	fillOutboundQueue(t, c)
+	waiting := fillOutboundQueue(t, c).WatchWindowUpdateWaitForTest(c.stream)
 	remaining := time.Until(c.startedAt.Add(c.deadline))
 	if remaining < 500*time.Millisecond {
 		t.Fatalf("stalling the connection took %v of the %v deadline; too slow to test the credit return", c.deadline-remaining, c.deadline)
 	}
-	c.sendWriteResult()
+	c.releaseWriteResult()
+	c.waitResultCreditReturn(t, waiting, remaining)
 	// The agent answered before the deadline. A credit return that waits
 	// without the call deadline never ends on its own.
-	err := c.waitDone(t, remaining+2*time.Second)
+	err := c.waitDone(t, time.Until(c.startedAt.Add(c.deadline+2*time.Second)))
 	took := time.Since(c.startedAt)
 	if testenv.Code(err) != connect.CodeDeadlineExceeded {
 		t.Fatalf("WriteFile = %v after %v, want deadline_exceeded", err, took)
@@ -226,13 +289,12 @@ func TestRelayWriteFileResultCreditReturnHonorsDeadline(t *testing.T) {
 		t.Fatalf("WriteFile ended after %v, before its %v deadline", took, c.deadline)
 	}
 	waitRelayRPC(t, c.env, c.grant, connect.CodeDeadlineExceeded)
+	c.requireCallFrames(t, 1)
 
 	// The reserved final place holds the stream close frame although the
 	// queue is full; it reaches the agent once the agent reads again.
 	c.relay.ResumeReads()
-	c.relay.WaitFrame("stream close", func(f *ownsandv1.DataFrame) bool {
-		return f.GetStreamId() == c.stream && f.GetRelayStreamClose() != nil
-	})
+	c.waitStreamClose(t)
 }
 
 // TestRelayWriteFileCallerCancelDuringCreditReturn checks that a caller that
@@ -240,19 +302,18 @@ func TestRelayWriteFileResultCreditReturnHonorsDeadline(t *testing.T) {
 // deadline: the handler ends with the caller's cancellation.
 func TestRelayWriteFileCallerCancelDuringCreditReturn(t *testing.T) {
 	c := startWriteResultCall(t, 30*time.Second)
-	fillOutboundQueue(t, c)
-	c.sendWriteResult()
-	time.Sleep(200 * time.Millisecond)
+	waiting := fillOutboundQueue(t, c).WatchWindowUpdateWaitForTest(c.stream)
+	c.releaseWriteResult()
+	c.waitResultCreditReturn(t, waiting, 5*time.Second)
 	c.cancel()
 	err := c.waitDone(t, 5*time.Second)
 	if testenv.Code(err) != connect.CodeCanceled {
 		t.Fatalf("WriteFile = %v, want canceled", err)
 	}
 	waitRelayRPC(t, c.env, c.grant, connect.CodeCanceled)
+	c.requireCallFrames(t, 1)
 	c.relay.ResumeReads()
-	c.relay.WaitFrame("stream close", func(f *ownsandv1.DataFrame) bool {
-		return f.GetStreamId() == c.stream && f.GetRelayStreamClose() != nil
-	})
+	c.waitStreamClose(t)
 }
 
 // TestRelayWriteFileResultWithinBudget checks that a result that arrives in
@@ -260,19 +321,18 @@ func TestRelayWriteFileCallerCancelDuringCreditReturn(t *testing.T) {
 // the credit once.
 func TestRelayWriteFileResultWithinBudget(t *testing.T) {
 	c := startWriteResultCall(t, 2*time.Second)
-	c.sendWriteResult()
+	c.releaseWriteResult()
 	if err := c.waitDone(t, 5*time.Second); err != nil {
 		t.Fatalf("WriteFile = %v, want success", err)
 	}
 	resp := <-c.resp
-	if resp.GetLength() != int64(len("chunk")) || resp.GetOffset() != 0 {
+	if resp.GetWriteId() != c.writeID || resp.GetOffset() != 0 || resp.GetLength() != int64(len("chunk")) {
 		t.Fatalf("response = %v, want the agent's result for the 5 byte chunk", resp)
 	}
 	testenv.Eventually(t, "relay_rpc record of the call", func() bool { _, ok := c.callFrames(); return ok })
-	if n, _ := c.callFrames(); n != 1 {
-		t.Fatalf("relay_rpc frames = %d, want 1 (the result counted once)", n)
-	}
-	testenv.Eventually(t, "credit return of the result", func() bool { return c.resultCreditReturns(resp) >= 1 })
+	c.requireCallFrames(t, 1)
+	// The close is last on the stream, so all queued updates have arrived.
+	c.waitStreamClose(t)
 	if n := c.resultCreditReturns(resp); n != 1 {
 		t.Fatalf("credit returns of the result on stream %d = %d, want exactly one", c.stream, n)
 	}
