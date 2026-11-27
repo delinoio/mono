@@ -1290,6 +1290,130 @@ describe("OwnSand link", () => {
 });
 
 describe("integrations", () => {
+  function renderCreateIntegrationFixture({ holdFirstPage = false } = {}) {
+    const { transport, calls } = gatedTransport("CreateAgentIntegration");
+    const listRequested = rs.fn();
+    let releaseFirstPage = () => {};
+    const firstPage = new Promise<void>((resolve) => {
+      releaseFirstPage = resolve;
+    });
+    renderConsole(`/orgs/${MOCK_IDS.globex}/integrations`, {
+      staleTime: 10_000,
+      transport: {
+        ...transport,
+        async unary(method, ...args) {
+          const response = await transport.unary(method, ...args);
+          const request = create(method.input, args[3]);
+          if (
+            isMessage(request, ListAgentIntegrationsRequestSchema) &&
+            request.pageSize === MAX_PAGE_SIZE
+          ) {
+            listRequested(request);
+            if (holdFirstPage && listRequested.mock.calls.length === 1) {
+              // Hold the response after the mock has captured the empty page.
+              await firstPage;
+            }
+          }
+          return response;
+        },
+      },
+    });
+    return { calls, listRequested, releaseFirstPage };
+  }
+
+  async function submitFirstIntegration() {
+    await click(
+      await screen.findByRole("button", { name: "Create agent integration" }),
+    );
+    const form = within(
+      screen.getByRole("dialog", { name: "Create an agent integration" }),
+    );
+    await type(
+      form.getByRole("textbox", { name: "Name" }),
+      "first-integration",
+    );
+    await type(form.getByLabelText("Environment key"), "fixture-key");
+    await click(form.getByRole("button", { name: "Create integration" }));
+    return form;
+  }
+
+  const firstIntegrationPage = expect.objectContaining({
+    organizationId: MOCK_IDS.globex,
+    pageSize: MAX_PAGE_SIZE,
+    pageToken: "",
+  });
+
+  test("restarts an uncached first integration page after creating an integration", async () => {
+    const { calls, listRequested, releaseFirstPage } =
+      renderCreateIntegrationFixture({ holdFirstPage: true });
+    try {
+      await waitFor(() => expect(listRequested).toHaveBeenCalledTimes(1));
+      await submitFirstIntegration();
+      expect(calls).toHaveLength(1);
+      await act(async () => calls[0].settle());
+
+      await screen.findByText("first-integration · Claude Code");
+      expect(listRequested.mock.calls).toEqual([
+        [firstIntegrationPage],
+        [firstIntegrationPage],
+      ]);
+    } finally {
+      await act(async () => releaseFirstPage());
+    }
+    expect(screen.getByText("first-integration · Claude Code")).toBeTruthy();
+    expect(window.location.pathname).toBe(
+      `/orgs/${MOCK_IDS.globex}/integrations`,
+    );
+  });
+
+  test("refreshes the cached integration page shared with the profile form", async () => {
+    const { calls, listRequested } = renderCreateIntegrationFixture();
+    await screen.findByText("No agent integrations");
+    await submitFirstIntegration();
+    expect(calls).toHaveLength(1);
+    await act(async () => calls[0].settle());
+
+    await screen.findByText("first-integration · Claude Code");
+    expect(listRequested.mock.calls).toEqual([
+      [firstIntegrationPage],
+      [firstIntegrationPage],
+    ]);
+
+    await click(screen.getByRole("link", { name: "Runner profiles" }));
+    await click(screen.getByRole("button", { name: "Create runner profile" }));
+    const form = within(
+      screen.getByRole("dialog", { name: "Create a runner profile" }),
+    );
+    await click(form.getByRole("combobox", { name: "Workload kind" }));
+    await click(await screen.findByRole("option", { name: "Agent session" }));
+    await click(form.getByRole("combobox", { name: "Agent integration" }));
+    await screen.findByRole("option", {
+      name: "first-integration (Claude Code)",
+    });
+    expect(listRequested).toHaveBeenCalledTimes(2);
+  });
+
+  test("keeps the pending first integration page when creation fails", async () => {
+    const { calls, listRequested, releaseFirstPage } =
+      renderCreateIntegrationFixture({ holdFirstPage: true });
+    try {
+      await waitFor(() => expect(listRequested).toHaveBeenCalledTimes(1));
+      const form = await submitFirstIntegration();
+      expect(calls).toHaveLength(1);
+      await act(async () =>
+        calls[0].settle(
+          new ConnectError("Integration rejected", Code.InvalidArgument),
+        ),
+      );
+
+      await form.findByText("Integration rejected");
+    } finally {
+      await act(async () => releaseFirstPage());
+    }
+    await screen.findByText("No agent integrations");
+    expect(listRequested.mock.calls).toEqual([[firstIntegrationPage]]);
+  });
+
   test("retries the failed cursor and scopes loaded integrations to the active organization", async () => {
     const mock = createMockTransport({ agentIntegrationPageSize: 1 });
     const requests: Array<[string, number, string]> = [];
