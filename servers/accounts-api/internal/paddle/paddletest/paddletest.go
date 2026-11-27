@@ -396,6 +396,7 @@ type TransactionData struct {
 	// charges).
 	TopUpID       string
 	SubtotalCents int64
+	DiscountCents int64
 	TaxCents      int64
 	Currency      string
 	PeriodEnd     time.Time
@@ -426,9 +427,9 @@ func Transaction(d TransactionData) map[string]any {
 		"items":         []any{map[string]any{"price": price, "quantity": 1}},
 		"details": map[string]any{"totals": map[string]any{
 			"subtotal":      fmt.Sprint(d.SubtotalCents),
-			"discount":      "0",
+			"discount":      fmt.Sprint(d.DiscountCents),
 			"tax":           fmt.Sprint(d.TaxCents),
-			"total":         fmt.Sprint(d.SubtotalCents + d.TaxCents),
+			"total":         fmt.Sprint(d.SubtotalCents - d.DiscountCents + d.TaxCents),
 			"currency_code": d.Currency,
 		}},
 		"created_at": time.Now().UTC(),

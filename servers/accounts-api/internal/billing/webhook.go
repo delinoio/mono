@@ -296,6 +296,9 @@ func creditOf(txn paddle.Transaction) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if subtotal < 0 || discount < 0 {
+		return 0, errors.New("paddle subtotal and discount must be nonnegative")
+	}
 	return CentsToMicros(subtotal - discount)
 }
 
@@ -313,9 +316,8 @@ func loadTopUpForCharge(ctx context.Context, tx pgx.Tx, accountID, topUpID strin
 	return t, err == nil, err
 }
 
-// onTransactionCompleted adds the credit of a completed purchase: the $10
-// grant of a subscription payment, or the pre-tax amount of a one-time
-// top-up charge.
+// onTransactionCompleted adds the tax-exclusive credit of a completed
+// purchase. A subscription payment grants at most $10.
 func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, ev paddle.Event, now time.Time) (eventOutcome, error) {
 	var txn paddle.Transaction
 	if err := json.Unmarshal(ev.Data, &txn); err != nil || txn.ID == "" {
@@ -402,15 +404,36 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, ev padd
 			}
 		}
 	case hasPrice(txn, s.priceID):
+		paid, amountErr := creditOf(txn)
+		var granted int64
+		if amountErr == nil && paid > 0 {
+			granted = min(paid, SubscriptionCreditUSDMicros)
+		}
 		if _, out.Grant, err = s.addGrant(ctx, tx, acct, grantInput{
-			Kind: LedgerSubscriptionCredit, Amount: SubscriptionCreditUSDMicros, PaddleTransactionID: txn.ID, ExpireTime: expireTime,
+			Kind: LedgerSubscriptionCredit, Amount: granted, PaddleTransactionID: txn.ID, ExpireTime: expireTime,
 		}, now); err != nil {
 			return out, err
+		}
+		attrs := []slog.Attr{
+			slog.String("paddle_event_id", ev.EventID),
+			slog.String("billing_account_id", accountID),
+			slog.String("paddle_transaction_id", txn.ID),
+			slog.Int64("paid_usd_micros", paid),
+		}
+		if granted == 0 {
+			s.logger.LogAttrs(ctx, slog.LevelError, "billing_subscription_credit_skipped", attrs...)
+		} else if granted < SubscriptionCreditUSDMicros && out.Grant != nil {
+			s.logger.LogAttrs(ctx, slog.LevelWarn, "billing_subscription_credit_reduced",
+				append(attrs, slog.Int64("granted_usd_micros", granted))...)
 		}
 		if source == accountSourceCustomData {
 			// The custom data of a checkout that the browser opened can name
 			// any billing account, so it may add credit but never binds or
 			// activates a subscription.
+			if granted == 0 {
+				out.Result = webhookIgnored
+				return out, nil
+			}
 			s.logger.WarnContext(ctx, "billing_subscription_payment_unbound",
 				slog.String("paddle_event_id", ev.EventID), slog.String("billing_account_id", accountID),
 				slog.String("paddle_subscription_id", txn.SubscriptionID),

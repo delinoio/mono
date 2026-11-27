@@ -19,8 +19,8 @@ const (
 // Amount rules of docs/servers-accounts-api-foundation.md (Payments and
 // credits).
 const (
-	// SubscriptionCreditUSDMicros is the credit grant of each paid
-	// subscription period, and SubscriptionPriceUSDMicros the price.
+	// SubscriptionCreditUSDMicros caps the credit grant of each paid
+	// subscription period, and SubscriptionPriceUSDMicros is the price.
 	SubscriptionCreditUSDMicros = 10 * MicrosPerUSD
 	SubscriptionPriceUSDMicros  = 10 * MicrosPerUSD
 	// MinTopUpUSDMicros and MaxTopUpUSDMicros bound manual top-ups; the

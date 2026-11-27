@@ -233,12 +233,13 @@ type grantTelemetry struct {
 // entry, then applies the pending adjustments of the purchase. It returns
 // telemetry only for a new grant. A purchase that already has a grant still
 // applies its pending adjustments, because a release that predates the
-// pending adjustment table creates grants without draining it.
+// pending adjustment table creates grants without draining it. A zero amount
+// reconciles an existing grant and skips creation.
 // A webhook caller holds the purchase lock (lockPurchase) before the lock of
 // acct.
 func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, processTime time.Time) (grantID string, telemetry *grantTelemetry, err error) {
-	if in.Amount <= 0 {
-		return "", nil, fmt.Errorf("credit grant amount %d is not positive", in.Amount)
+	if in.Amount < 0 {
+		return "", nil, fmt.Errorf("credit grant amount %d is negative", in.Amount)
 	}
 	// Use the time after both locks to account for credit that expired while
 	// the webhook waited. Keep the processing time for the grant's creation.
@@ -258,6 +259,9 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return "", nil, err
+	}
+	if in.Amount == 0 {
+		return "", nil, nil
 	}
 	// The balance before the inline expiry is the baseline of the low-balance
 	// check: an expiry that the new grant does not make up for is a decrease.
