@@ -152,29 +152,38 @@ func TestVirtualizationRejectsUndersizedSparseBaseDisk(t *testing.T) {
 			if err := os.WriteFile(marker, nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			_, err := rt.Create(context.Background(), spec)
+			vm, err := rt.Create(context.Background(), spec)
 			want := fmt.Sprintf("requires %d bytes, but the request allocates %d bytes", 2*baseDiskGiB, baseDiskGiB)
-			if !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), want) {
-				t.Fatalf("direct create error = %v, want unsupported with %q", err, want)
+			if vm != nil || !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), want) {
+				t.Fatalf("direct create = %v, %v, want no VM and unsupported with %q", vm, err, want)
 			}
 			if _, err := os.Stat(marker); err != nil {
 				t.Fatalf("runtime touched the sandbox directory before rejecting the create: %v", err)
 			}
 			entry, err := e.m.Create(context.Background(), cmd)
 			var cmdErr *sandboxes.CommandError
-			if !errors.As(err, &cmdErr) || cmdErr.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+			if !errors.As(err, &cmdErr) || cmdErr == nil || cmdErr.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
 				t.Fatalf("manager create error = %v, want FAILED_PRECONDITION", err)
 			}
-			if entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || entry.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+			if entry == nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || entry.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
 				t.Fatalf("manager entry = %v, want FAILED / CREATE_FAILED", entry)
 			}
 			ids, err := rt.Running(context.Background())
-			if err != nil || len(ids) != 0 || e.m.Busy() {
-				t.Fatalf("rejected create left runtime VMs %v (error %v) or a busy manager", ids, err)
+			if err != nil || len(ids) != 0 {
+				t.Fatalf("runtime VMs after rejected create = %v, error = %v, want none", ids, err)
 			}
 			if _, err := os.Stat(e.st.Path(store.VMsDir, cmd.GetSandboxId())); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("rejected create left a sandbox directory: stat error %v", err)
 			}
+			if !e.m.Busy() {
+				t.Fatal("manager is idle before failed-create cleanup")
+			}
+			// Keep Tick and the manager's teardown outside a synctest bubble
+			// because they use the same background WaitGroup.
+			e.m.Tick(t.Context(), false)
+			waitFor(t, "the manager to become idle after failed-create cleanup", func() bool {
+				return !e.m.Busy()
+			})
 		})
 	}
 }
