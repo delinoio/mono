@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+import { execFileSync } from "node:child_process";
 import { getEventListeners } from "node:events";
+import { fileURLToPath } from "node:url";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
@@ -297,6 +299,22 @@ describe("organization", () => {
       expect(h.api.fetchedUrls).toHaveLength(0);
     });
   });
+});
+
+test("direct relay opening failures are safe before the first read", () => {
+  const fixture = fileURLToPath(
+    new URL("./testing/relay-opening-rejection.ts", import.meta.url),
+  );
+  execFileSync(
+    process.execPath,
+    [
+      "--unhandled-rejections=strict",
+      "--experimental-transform-types",
+      "--test",
+      fixture,
+    ],
+    { timeout: 10_000 },
+  );
 });
 
 describe("credentials", () => {

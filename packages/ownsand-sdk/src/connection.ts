@@ -169,14 +169,15 @@ export function createApiTransport(options: ConnectionOptions): Transport {
       credentialInterceptor(options),
     ],
   });
-  if (options.logger === undefined) {
-    return transport;
-  }
   return {
-    ...transport,
+    unary: transport.unary,
     stream(method, signal, timeoutMs, header, input, contextValues) {
       let callContext = contextValues;
-      if (method.parent === RelayService && signal !== undefined) {
+      if (
+        options.logger !== undefined &&
+        method.parent === RelayService &&
+        signal !== undefined
+      ) {
         // Connect gives interceptors a linked signal. Keep the original signal
         // per call so the logger can recognize an explicit caller abort. Use a
         // distinct context identity even if callers reuse their context values.
@@ -196,7 +197,7 @@ export function createApiTransport(options: ConnectionOptions): Transport {
               };
         relayCallerSignals.set(callContext, signal);
       }
-      return transport.stream(
+      const opening = transport.stream(
         method,
         signal,
         timeoutMs,
@@ -204,6 +205,10 @@ export function createApiTransport(options: ConnectionOptions): Transport {
         input,
         callContext,
       );
+      // Connect starts the call now and first awaits it when the caller reads.
+      // Handle an early rejection while keeping it on the original promise.
+      void opening.catch(() => {});
+      return opening;
     },
   };
 }
