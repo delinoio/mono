@@ -685,6 +685,67 @@ func TestDevSessionFiles(t *testing.T) {
 	}
 }
 
+func TestDevSessionFileReadSnapshotEOF(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	session, sandboxID := w.runningSession(t)
+	owner := w.env.User(w.org.Member)
+	const path = "/home/dev/work/read.txt"
+	w.fake.SetFile(w.osOrg, sandboxID, path, []byte("abc"))
+
+	read := func(readID string, offset int64) ([]*sandrunv1.ReadDevSessionFileResponse, error) {
+		stream, err := owner.DevSession.ReadDevSessionFile(t.Context(), connect.NewRequest(&sandrunv1.ReadDevSessionFileRequest{
+			OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(),
+			ReadId: readID, Path: path, Offset: offset,
+		}))
+		if err != nil {
+			return nil, err
+		}
+		var events []*sandrunv1.ReadDevSessionFileResponse
+		for stream.Receive() {
+			events = append(events, stream.Msg())
+		}
+		return events, stream.Err()
+	}
+	wantPastEOF := func(t *testing.T, readID string) {
+		t.Helper()
+		events, err := read(readID, 4)
+		if len(events) != 0 {
+			t.Errorf("past EOF returned events: %v", events)
+		}
+		wantCode(t, "past EOF", err, connect.CodeOutOfRange)
+		var ce *connect.Error
+		if !errors.As(err, &ce) || ce.Message() != "OwnSand: offset is beyond the end of the file" {
+			t.Fatalf("past EOF returned %v", err)
+		}
+	}
+
+	t.Run("fresh read past EOF", func(t *testing.T) {
+		wantPastEOF(t, api.NewID())
+	})
+	readID := api.NewID()
+	t.Run("read suffix", func(t *testing.T) {
+		events, err := read(readID, 2)
+		if err != nil || len(events) != 2 {
+			t.Fatalf("suffix read returned %v, error %v", events, err)
+		}
+		chunk, end := events[0].GetChunk(), events[1].GetEnd()
+		if chunk.GetOffset() != 2 || string(chunk.GetData()) != "c" || end.GetSizeBytes() != 3 {
+			t.Fatalf("suffix read returned %v", events)
+		}
+	})
+
+	w.fake.SetFile(w.osOrg, sandboxID, path, []byte("replaced"))
+	t.Run("resumed read past snapshot EOF", func(t *testing.T) {
+		wantPastEOF(t, readID)
+	})
+	t.Run("resumed read at snapshot EOF", func(t *testing.T) {
+		events, err := read(readID, 3)
+		if err != nil || len(events) != 1 || events[0].GetEnd().GetSizeBytes() != 3 {
+			t.Fatalf("read at EOF returned %v, error %v", events, err)
+		}
+	})
+}
+
 func TestDevSessionWindowsUNCPaths(t *testing.T) {
 	w := newWorkWorld(t, devsession.Timing{})
 	const workspace = `C:\work`

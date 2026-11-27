@@ -481,17 +481,21 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 	if onRead != nil {
 		onRead(ctx, p)
 	}
-	for off := p.Offset; off < int64(len(snap)); {
+	size := int64(len(snap))
+	if p.Offset > size {
+		return p.Offset, connect.NewWireError(connect.CodeOutOfRange, errors.New("offset is beyond the end of the file"))
+	}
+	for off := p.Offset; off < size; {
 		if err := ctx.Err(); err != nil {
 			return off, err
 		}
-		end := min(off+readChunk, int64(len(snap)))
+		end := min(off+readChunk, size)
 		if _, err := w.Write(snap[off:end]); err != nil {
 			return off, err
 		}
 		off = end
 	}
-	return int64(len(snap)), nil
+	return size, nil
 }
 
 func (c *client) OpenFileWrite(sandboxID string, p ownsand.FileWriteParams) (ownsandclient.FileWrite, error) {
