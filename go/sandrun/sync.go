@@ -282,7 +282,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	applyEnv := map[string]string{
 		guestEnvWorkspace: s.GetWorkspacePath(), guestEnvStaleManifest: "",
 		guestEnvArchive: "", guestEnvDeletes: "", guestEnvReplaceFiles: "",
-		guestEnvPrunes: "", guestEnvLinks: "",
+		guestEnvPrunes: "", guestEnvAliasPrunes: "", guestEnvLinks: "",
 	}
 
 	if workspaceMissing {
@@ -322,10 +322,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		}
 	}
 	strictDeletes, replacedFiles := splitSyncDeletions(deleted, changed)
-	if !windows {
-		applyEnv[guestEnvAliasPrunes] = ""
-	}
-	prunes, aliasPrunes := pruneDirs(deleted, changed, osys == sandrunv1.GuestOs_GUEST_OS_MACOS)
+	prunes, aliasPrunes := pruneDirs(deleted, changed, osys)
 	for _, list := range []struct {
 		suffix string
 		env    string
@@ -621,19 +618,23 @@ func splitSyncDeletions(deleted []string, changed []localFile) (strict, replaced
 // to the alias list: the old ancestor, the incoming spelling, and the
 // directory to remove. The guest checks that both spellings name the same
 // directory before it prunes an alias candidate.
-func pruneDirs(deleted []string, changed []localFile, matchAliases bool) (exact, aliases []string) {
+func pruneDirs(deleted []string, changed []localFile, osys sandrunv1.GuestOs) (exact, aliases []string) {
 	if len(deleted) == 0 || len(changed) == 0 {
 		return nil, nil
 	}
 	key := func(p string) string {
-		if matchAliases {
-			return foldCase(p)
-		}
 		return p
 	}
-	incoming := map[string]string{}
-	for _, f := range changed {
-		incoming[key(f.rel)] = f.rel
+	switch osys {
+	case sandrunv1.GuestOs_GUEST_OS_MACOS:
+		key = foldNormalizedCase
+	case sandrunv1.GuestOs_GUEST_OS_WINDOWS:
+		key = foldCase
+	}
+	incoming := make(map[string]*localFile, len(changed))
+	for i := range changed {
+		f := &changed[i]
+		incoming[key(f.rel)] = f
 	}
 	type alias struct{ old, incoming string }
 	dirs := map[string]alias{}
@@ -643,8 +644,11 @@ func pruneDirs(deleted []string, changed []localFile, matchAliases bool) (exact,
 			chain = append(chain, dir)
 			if replacement, ok := incoming[key(dir)]; ok {
 				var names alias
-				if replacement != dir {
-					names = alias{old: dir, incoming: replacement}
+				if replacement.rel != dir {
+					if osys == sandrunv1.GuestOs_GUEST_OS_WINDOWS && replacement.entry.Mode == modeSymlink {
+						continue
+					}
+					names = alias{old: dir, incoming: replacement.rel}
 				}
 				for _, c := range chain {
 					dirs[c] = names

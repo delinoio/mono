@@ -1667,26 +1667,39 @@ func TestSyncRejectsLocalIdentityChangeBeforeUpload(t *testing.T) {
 
 func TestPruneDirs(t *testing.T) {
 	changed := []localFile{{rel: "a"}, {rel: "x/y"}}
-	got, aliases := pruneDirs([]string{"a/b/c/old", "a/d", "x/y/z", "other/dir/f", "a"}, changed, false)
+	got, aliases := pruneDirs([]string{"a/b/c/old", "a/d", "x/y/z", "other/dir/f", "a"}, changed, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	want := []string{"a/b/c", "a/b", "x/y", "a"}
 	if !slices.Equal(got, want) || len(aliases) != 0 {
 		t.Fatalf("pruneDirs = %q, %q; want %q and no aliases", got, aliases, want)
 	}
 }
 
-func TestPruneDirsCaseOnlyReplacement(t *testing.T) {
-	deleted := []string{"Assets/nested/old.txt", "Assets/nested/another.txt", "Exact/sub/old.txt"}
-	changed := []localFile{{rel: "assets"}, {rel: "Exact"}}
+func TestPruneDirsAliases(t *testing.T) {
+	deleted := []string{"Assets/nested/old.txt", "Assets/nested/another.txt", "Exact/sub/old.txt", "caf\u00e9/nested/old.txt"}
+	changed := []localFile{{rel: "assets"}, {rel: "Exact"}, {rel: "cafe\u0301"}}
 	wantExact := []string{"Exact/sub", "Exact"}
-	for _, matchAliases := range []bool{false, true} {
-		var wantAliases []string
-		if matchAliases {
-			wantAliases = []string{"Assets", "assets", "Assets/nested", "Assets", "assets", "Assets"}
-		}
-		exact, aliases := pruneDirs(deleted, changed, matchAliases)
-		if !slices.Equal(exact, wantExact) || !slices.Equal(aliases, wantAliases) {
-			t.Fatalf("pruneDirs(matchAliases=%t) = %q, %q; want %q, %q", matchAliases, exact, aliases, wantExact, wantAliases)
-		}
+	for _, tc := range []struct {
+		osys sandrunv1.GuestOs
+		want []string
+	}{
+		{osys: sandrunv1.GuestOs_GUEST_OS_LINUX},
+		{osys: sandrunv1.GuestOs_GUEST_OS_WINDOWS, want: []string{
+			"Assets", "assets", "Assets/nested",
+			"Assets", "assets", "Assets",
+		}},
+		{osys: sandrunv1.GuestOs_GUEST_OS_MACOS, want: []string{
+			"Assets", "assets", "Assets/nested",
+			"caf\u00e9", "cafe\u0301", "caf\u00e9/nested",
+			"Assets", "assets", "Assets",
+			"caf\u00e9", "cafe\u0301", "caf\u00e9",
+		}},
+	} {
+		t.Run(tc.osys.String(), func(t *testing.T) {
+			exact, aliases := pruneDirs(deleted, changed, tc.osys)
+			if !slices.Equal(exact, wantExact) || !slices.Equal(aliases, tc.want) {
+				t.Fatalf("pruneDirs = %q, %q; want %q, %q", exact, aliases, wantExact, tc.want)
+			}
+		})
 	}
 }
 
