@@ -243,19 +243,29 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 		return resp.Body
 	}
 	retiredBody := open(retired)
-	read := func(body io.ReadCloser) <-chan struct{} {
+	read := func(gate *gatedBody, body io.Reader) func() {
 		done := make(chan struct{})
+		release := sync.OnceFunc(func() { close(gate.release) })
+		releaseAndWait := func() {
+			release()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("relay response reader did not finish after release")
+			}
+		}
+		t.Cleanup(releaseAndWait)
 		go func() {
 			defer close(done)
 			if _, err := body.Read(make([]byte, 16)); err != nil {
 				t.Errorf("read: %v", err)
 			}
 		}()
-		return done
+		return releaseAndWait
 	}
 	// The retired response has a read in flight while the loop installs the
 	// replacement connection.
-	lateRead := read(retiredBody)
+	finishRetiredRead := read(bodies[retired], retiredBody)
 	<-bodies[retired].started
 	r.mu.Lock()
 	r.conn = active
@@ -265,8 +275,7 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 	old := int64(time.Hour)
 	retired.lastRecv.Store(old)
 	active.lastRecv.Store(old)
-	close(bodies[retired].release)
-	<-lateRead
+	finishRetiredRead()
 	if got := active.lastRecv.Load(); got != old {
 		t.Fatalf("a late read of the retired response moved the replacement's receive clock by %v", time.Duration(got-old))
 	}
@@ -276,13 +285,12 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 
 	// A partial frame of the active response refreshes the active clock
 	// before any frame is decoded.
-	activeRead := read(activeBody)
+	finishActiveRead := read(bodies[active], activeBody)
 	<-bodies[active].started
 	if active.lastRecv.Load() != old {
 		t.Fatal("the receive clock moved before any byte arrived")
 	}
-	close(bodies[active].release)
-	<-activeRead
+	finishActiveRead()
 	if active.lastRecv.Load() == old {
 		t.Fatal("a read of the active response did not refresh its receive clock")
 	}
