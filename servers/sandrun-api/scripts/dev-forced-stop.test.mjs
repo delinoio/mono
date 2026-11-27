@@ -62,13 +62,12 @@ async function runFixture(phase, args) {
     });
   }
 
-  let descendant;
-  if (phase === "build" || process.env.FIXTURE_STOP !== "wait") {
-    descendant = spawn(process.execPath, [fixture, "--fixture", "descendant"], {
-      stdio: ["ignore", "inherit", "inherit", "ipc"],
-    });
-    await once(descendant, "message");
-  }
+  const descendant = spawn(
+    process.execPath,
+    [fixture, "--fixture", "descendant"],
+    { stdio: ["ignore", "inherit", "inherit", "ipc"] },
+  );
+  await once(descendant, "message");
 
   const ports = [];
   if (phase === "server") {
@@ -91,7 +90,7 @@ async function runFixture(phase, args) {
     event: "ready",
     phase,
     pid: process.pid,
-    descendant: descendant?.pid,
+    descendant: descendant.pid,
     ports,
     hasNullFd,
   });
@@ -264,34 +263,47 @@ if (process.argv[2] === "--fixture") {
     );
   }
 
-  for (const [phase, signal, code] of [
-    ["server", "SIGINT", 130],
-    ["server", "SIGTERM", 143],
-    ["server", "SIGQUIT", 131],
+  for (const [requests, code] of [
+    [["SIGINT"], 130],
+    [["SIGTERM"], 143],
+    [["SIGQUIT", "SIGINT"], 131],
   ]) {
     test(
-      `${signal} reaches the ${phase} once and the launcher waits (status ${code})`,
+      `${requests.join(" then ")} reaches the server once per request and stops its descendants after drain (status ${code})`,
       options,
       async (t) => {
-        const run = startLauncher(t, phase, "wait");
+        const run = startLauncher(t, "server", "wait");
         const active = await ready(run);
+        assert.equal(active.phase, "server");
+        assert.ok(active.descendant > 1);
+        assert.equal(ps("pgid", active.pid), ps("pgid", active.descendant));
 
-        process.kill(
-          signal === "SIGTERM" ? run.task.pid : -run.task.pid,
-          signal,
-        );
-        await waitFor(
-          run,
-          () => observedSignals(run).length,
-          "the forwarded signal",
-        );
+        for (const [index, signal] of requests.entries()) {
+          process.kill(
+            signal === "SIGTERM" ? run.task.pid : -run.task.pid,
+            signal,
+          );
+          await waitFor(
+            run,
+            () => observedSignals(run).length > index,
+            `the server to receive ${signal}`,
+          );
+        }
         assert.equal(run.exit, null, "the launcher exited before its phase");
-        assert.ok(isRunning(active.pid));
+        assert.ok(isRunning(active.pid) && isRunning(active.descendant));
+        assert.equal(readdirSync(run.buildTmp).length, 1);
         writeFileSync(run.exitFile, "");
 
+        await waitFor(
+          run,
+          () => !isRunning(active.pid) && !isRunning(active.descendant),
+          "the server and its descendant to stop",
+          4_000,
+        );
         assert.deepEqual(await run.exited, { code, signal: null });
         await run.closed;
-        assert.deepEqual(observedSignals(run), [signal]);
+        assert.deepEqual(observedSignals(run), requests);
+        assert.deepEqual(observedSignals(run, "descendant_signal"), []);
         assert.equal(
           run.records.filter(({ event }) => event === "completed").length,
           1,
@@ -301,6 +313,7 @@ if (process.argv[2] === "--fixture") {
           1,
         );
         assert.deepEqual(readdirSync(run.buildTmp), []);
+        assert.equal(active.ports.length, 2);
         await assertPortsReleased(active.ports);
       },
     );

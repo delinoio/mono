@@ -56,6 +56,9 @@ func main() {
 	if hookMode(os.Args) {
 		os.Exit(claude.RunHook(os.Getenv, os.Args[0], os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == ownsandRollbackCommand {
+		os.Exit(runOwnSandRollback(os.Args[2:]))
+	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

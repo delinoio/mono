@@ -38,7 +38,6 @@ func (h *harness) requireRunResult(want error) {
 	h.t.Helper()
 	select {
 	case err := <-h.errc:
-		h.errc <- err
 		if !errors.Is(err, want) {
 			h.t.Fatalf("Run returned %v, want %v", err, want)
 		}
