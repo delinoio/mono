@@ -14,6 +14,7 @@ package ownsandfake
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"math"
@@ -73,6 +74,8 @@ type Org struct {
 	// creates the sandbox (or finds the one of its key) and returns this
 	// error instead of it.
 	CreateResponseError error
+	// GetError, when set, is returned by GetSandbox for existing sandboxes.
+	GetError error
 	// DeleteError, when set, is the error of the next DeleteSandbox calls
 	// (for example a transient OwnSand failure).
 	DeleteError error
@@ -95,15 +98,22 @@ type Org struct {
 type fakeSandbox struct {
 	sb    *ownsandv1.Sandbox
 	files map[string][]byte
-	// writes of FileWrite operations, by write ID.
+	// writes holds FileWrite operations by ID. A nil entry marks an expired
+	// completion so a late retry cannot start a new write.
 	writes map[string]*fakeWrite
-	// reads keeps the snapshot of each read ID.
-	reads map[string][]byte
+	// reads keeps the path and snapshot of each read ID.
+	reads map[string]fakeRead
+}
+
+type fakeRead struct {
+	path string
+	data []byte
 }
 
 type fakeWrite struct {
-	path   string
-	ranges []writeRange // sorted, with overlaps and adjacent ranges merged
+	path       string
+	ranges     []writeRange // sorted, with overlaps and adjacent ranges merged
+	completion *fakeWriteCompletion
 }
 
 type writeRange struct {
@@ -114,6 +124,15 @@ type writeRange struct {
 func (r writeRange) end() int64 {
 	return r.start + int64(len(r.data))
 }
+
+type fakeWriteCompletion struct {
+	result    *ownsandv1.WriteFileResponse
+	digest    [sha256.Size]byte
+	mode      uint32
+	expiresAt time.Time
+}
+
+const writeReplayRetention = 15 * time.Minute
 
 // New returns an empty fake.
 func New() *Fake {
@@ -350,7 +369,7 @@ func (c *client) CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandbox
 		SandboxId: id, OrganizationId: o.ID, DeviceId: "device-" + strconv.Itoa(len(o.sandboxes)%2), State: state,
 		Source: req.GetSource(), Resources: req.GetResources(), Labels: req.GetLabels(), IdleTtl: req.GetIdleTtl(), MaxTtl: req.GetMaxTtl(),
 	}
-	o.sandboxes[id] = &fakeSandbox{sb: sb, files: map[string][]byte{}, writes: map[string]*fakeWrite{}, reads: map[string][]byte{}}
+	o.sandboxes[id] = &fakeSandbox{sb: sb, files: map[string][]byte{}, writes: map[string]*fakeWrite{}, reads: map[string]fakeRead{}}
 	o.keys[req.GetIdempotencyKey()] = id
 	o.requests[req.GetIdempotencyKey()] = encoded
 	if o.CreateResponseError != nil {
@@ -373,11 +392,14 @@ func (c *client) sandbox(rpc, id string) (*Org, *fakeSandbox, error) {
 }
 
 func (c *client) GetSandbox(ctx context.Context, sandboxID string) (*ownsandv1.Sandbox, error) {
-	_, s, err := c.sandbox("GetSandbox", sandboxID)
+	o, s, err := c.sandbox("GetSandbox", sandboxID)
 	if err != nil {
 		return nil, err
 	}
 	defer c.f.mu.Unlock()
+	if o.GetError != nil {
+		return nil, o.GetError
+	}
 	return proto.Clone(s.sb).(*ownsandv1.Sandbox), nil
 }
 
@@ -478,13 +500,17 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 	}
 	s := org.sandboxes[sandboxID]
 	snap, ok := s.reads[p.ReadID]
+	if ok && snap.path != p.Path {
+		c.f.mu.Unlock()
+		return 0, connect.NewWireError(connect.CodePermissionDenied, errors.New("request does not match the recorded operation"))
+	}
 	if !ok {
 		src, exists := s.files[p.Path]
 		if !exists {
 			c.f.mu.Unlock()
 			return 0, connect.NewWireError(connect.CodeNotFound, errors.New("no such file"))
 		}
-		snap = append([]byte(nil), src...)
+		snap = fakeRead{path: p.Path, data: bytes.Clone(src)}
 		s.reads[p.ReadID] = snap
 	}
 	onRead := org.OnFileRead
@@ -492,17 +518,21 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 	if onRead != nil {
 		onRead(ctx, p)
 	}
-	for off := p.Offset; off < int64(len(snap)); {
+	size := int64(len(snap.data))
+	if p.Offset > size {
+		return p.Offset, connect.NewWireError(connect.CodeOutOfRange, errors.New("offset is beyond the end of the file"))
+	}
+	for off := p.Offset; off < size; {
 		if err := ctx.Err(); err != nil {
 			return off, err
 		}
-		end := min(off+readChunk, int64(len(snap)))
-		if _, err := w.Write(snap[off:end]); err != nil {
+		end := min(off+readChunk, size)
+		if _, err := w.Write(snap.data[off:end]); err != nil {
 			return off, err
 		}
 		off = end
 	}
-	return int64(len(snap)), nil
+	return size, nil
 }
 
 func (c *client) OpenFileWrite(sandboxID string, p ownsand.FileWriteParams) (ownsandclient.FileWrite, error) {
@@ -520,10 +550,10 @@ func (w *fileWrite) WriteChunk(ctx context.Context, offset int64, data []byte) (
 }
 
 func (w *fileWrite) Finish(ctx context.Context, offset int64, data []byte, sizeBytes int64, mode uint32) (*ownsandv1.WriteFileResponse, error) {
-	return w.send(offset, data, &sizeBytes)
+	return w.send(offset, data, &ownsandv1.WriteFileFinish{SizeBytes: sizeBytes, Mode: mode})
 }
 
-func (w *fileWrite) send(offset int64, data []byte, size *int64) (*ownsandv1.WriteFileResponse, error) {
+func (w *fileWrite) send(offset int64, data []byte, finish *ownsandv1.WriteFileFinish) (*ownsandv1.WriteFileResponse, error) {
 	if err := w.c.running("WriteFile", w.sandboxID); err != nil {
 		return nil, err
 	}
@@ -537,27 +567,54 @@ func (w *fileWrite) send(offset int64, data []byte, size *int64) (*ownsandv1.Wri
 		return nil, connect.NewWireError(connect.CodeInvalidArgument, errors.New("invalid write range"))
 	}
 	s := org.sandboxes[w.sandboxID]
-	fw := s.writes[w.p.WriteID]
-	if fw == nil {
+	fw, exists := s.writes[w.p.WriteID]
+	if !exists {
 		fw = &fakeWrite{path: w.p.Path}
 		s.writes[w.p.WriteID] = fw
+	} else if fw == nil {
+		return nil, connect.NewWireError(connect.CodeNotFound, errors.New("write expired"))
+	} else if completed := fw.completion; completed != nil {
+		if !time.Now().Before(completed.expiresAt) {
+			s.writes[w.p.WriteID] = nil
+			return nil, connect.NewWireError(connect.CodeNotFound, errors.New("write expired"))
+		}
+		if w.p.Path != fw.path {
+			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("write_id is bound to another path"))
+		}
+		if finish == nil {
+			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("write already finished"))
+		}
+		if offset != completed.result.GetOffset() || finish.GetSizeBytes() != completed.result.GetSizeBytes() ||
+			finish.GetMode() != completed.mode || sha256.Sum256(data) != completed.digest {
+			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("write already finished with other finish fields"))
+		}
+		return proto.CloneOf(completed.result), nil
 	}
 	if err := fw.stage(offset, data); err != nil {
 		return nil, err
 	}
 	res := &ownsandv1.WriteFileResponse{WriteId: w.p.WriteID, Offset: offset, Length: int64(len(data))}
-	if size != nil {
+	if finish != nil {
 		var contents []byte
 		switch {
-		case *size == 0 && len(fw.ranges) == 0:
-		case len(fw.ranges) == 1 && fw.ranges[0].start == 0 && fw.ranges[0].end() == *size:
+		case len(fw.ranges) == 0:
+		case len(fw.ranges) == 1 && fw.ranges[0].start == 0:
 			contents = fw.ranges[0].data
 		default:
-			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("written ranges do not cover exactly [0, size_bytes)"))
+			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("the written ranges do not cover the file"))
+		}
+		if int64(len(contents)) != finish.GetSizeBytes() {
+			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("the written ranges do not cover the size"))
 		}
 		s.files[fw.path] = contents
-		res.Finished, res.SizeBytes = true, *size
-		delete(s.writes, w.p.WriteID)
+		res.Finished, res.SizeBytes = true, finish.GetSizeBytes()
+		fw.ranges = nil
+		fw.completion = &fakeWriteCompletion{
+			result:    proto.CloneOf(res),
+			digest:    sha256.Sum256(data),
+			mode:      finish.GetMode(),
+			expiresAt: time.Now().Add(writeReplayRetention),
+		}
 	}
 	return res, nil
 }

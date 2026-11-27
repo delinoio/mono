@@ -5,6 +5,7 @@ package api_test
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -19,6 +20,26 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/auth"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
 )
+
+func walkPages(rpc string, maxPages int, listPage func(token string) (string, error)) error {
+	seen := make(map[string]struct{})
+	token := ""
+	for page := 1; page <= maxPages; page++ {
+		next, err := listPage(token)
+		if err != nil {
+			return fmt.Errorf("%s page %d: %w", rpc, page, err)
+		}
+		if next == "" {
+			return nil
+		}
+		if _, repeated := seen[next]; repeated {
+			return fmt.Errorf("%s page %d returned a repeated continuation token", rpc, page)
+		}
+		seen[next] = struct{}{}
+		token = next
+	}
+	return fmt.Errorf("%s page %d returned a continuation token at the request limit", rpc, maxPages)
+}
 
 func TestOrganizationLifecycleAndPagination(t *testing.T) {
 	env := testenv.New(t)
@@ -37,18 +58,17 @@ func TestOrganizationLifecycleAndPagination(t *testing.T) {
 		ids = append(ids, o.GetOrganizationId())
 	}
 	var listed []string
-	token := ""
-	for {
+	if err := walkPages("ListOrganizations", 3, func(token string) (string, error) {
 		resp, err := alice.Organization.ListOrganizations(ctx, connect.NewRequest(&sandrunv1.ListOrganizationsRequest{PageSize: 2, PageToken: token}))
 		if err != nil {
-			t.Fatal(err)
+			return "", err
 		}
 		for _, o := range resp.Msg.GetOrganizations() {
 			listed = append(listed, o.GetOrganizationId())
 		}
-		if token = resp.Msg.GetNextPageToken(); token == "" {
-			break
-		}
+		return resp.Msg.GetNextPageToken(), nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if strings.Join(listed, ",") != strings.Join(ids, ",") {
 		t.Fatalf("listed %v, want %v", listed, ids)
@@ -373,16 +393,17 @@ func TestAuditEventsNewestFirst(t *testing.T) {
 	org := env.NewOrg("alice")
 	keyID, _ := env.NewAPIKey(org.ID, org.Member)
 	var events []*sandrunv1.AuditEvent
-	token := ""
-	for {
-		resp, err := env.User(org.Member).Audit.ListAuditEvents(ctx, connect.NewRequest(&sandrunv1.ListAuditEventsRequest{OrganizationId: org.ID, PageSize: 2, PageToken: token}))
+	member := env.User(org.Member)
+	// Three full pages of two events are followed by an empty terminal page.
+	if err := walkPages("ListAuditEvents", 4, func(token string) (string, error) {
+		resp, err := member.Audit.ListAuditEvents(ctx, connect.NewRequest(&sandrunv1.ListAuditEventsRequest{OrganizationId: org.ID, PageSize: 2, PageToken: token}))
 		if err != nil {
-			t.Fatal(err)
+			return "", err
 		}
 		events = append(events, resp.Msg.GetEvents()...)
-		if token = resp.Msg.GetNextPageToken(); token == "" {
-			break
-		}
+		return resp.Msg.GetNextPageToken(), nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	// Created, 2 invitations, 2 joins, 1 key.
 	if len(events) != 6 {

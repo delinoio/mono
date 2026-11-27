@@ -71,12 +71,11 @@ func (l Link) proto() *sandrunv1.OwnSandLink {
 // OwnSand with Links.ClientForRemoval (for example, to delete the runners'
 // sandboxes); an error stops the removal and keeps the link. InTx runs in
 // the transaction that deletes the link, after the organization row lock.
+// Its optional callback runs only if that transaction commits.
 type RemovalHook struct {
 	Name    string
 	Prepare func(ctx context.Context, orgID string) error
-	InTx    func(ctx context.Context, tx pgx.Tx, orgID string) error
-	// AfterCommit runs after the link is deleted (best effort).
-	AfterCommit func(ctx context.Context, orgID string)
+	InTx    func(ctx context.Context, tx pgx.Tx, orgID string) (afterCommit func(context.Context), err error)
 }
 
 // Links reads links and builds the OwnSand clients of organizations.
@@ -89,11 +88,16 @@ type Links struct {
 
 	mu      sync.Mutex
 	clients map[string]cachedClient
+	lookups map[string]*clientLookups
 }
 
 type cachedClient struct {
 	revision string
 	client   ownsandclient.Client
+}
+
+type clientLookups struct {
+	active int
 }
 
 // Register mounts OwnSandLinkService and its daily re-encryption job and
@@ -102,8 +106,20 @@ func Register(r *app.Registry, factory ownsandclient.Factory, m *metrics.Metrics
 	if removal.LeaseDuration <= 0 {
 		removal.LeaseDuration = time.Minute
 	}
-	l := &Links{svc: r.Service, factory: factory, metrics: m, removal: removal, clients: map[string]cachedClient{}}
+	l := &Links{
+		svc: r.Service, factory: factory, metrics: m, removal: removal,
+		clients: make(map[string]cachedClient),
+		lookups: make(map[string]*clientLookups),
+	}
 	r.Handle(sandrunv1connect.NewOwnSandLinkServiceHandler(&Handler{links: l}, r.HandlerOptions()...))
+	r.OnOrganizationDeletion(api.OrganizationDeletionHook{
+		Name: "ownsand_link",
+		Prepare: func(_ context.Context, d api.OrganizationDeletion) (api.OrganizationDeletionSteps, error) {
+			return api.OrganizationDeletionSteps{
+				AfterCommit: func(context.Context) { l.forget(d.OrganizationID) },
+			}, nil
+		},
+	})
 	r.AddDailyJob(jobs.Job{Name: "reencrypt_ownsand_links", Run: func(ctx context.Context, _ time.Time) (int64, error) { return l.Reencrypt(ctx, l.svc.Secrets) }})
 	return l
 }
@@ -143,6 +159,12 @@ func (l *Links) ClientForRemoval(ctx context.Context, orgID string) (ownsandclie
 }
 
 func (l *Links) client(ctx context.Context, orgID string, any bool) (ownsandclient.Client, Link, error) {
+	// Register before reading the link so eviction can invalidate a lookup
+	// whose read overlaps the commit.
+	lookups := l.beginLookup(orgID)
+	var built cachedClient
+	defer func() { l.finishLookup(orgID, lookups, built) }()
+
 	s := l.svc
 	var lk Link
 	var state int16
@@ -178,10 +200,37 @@ func (l *Links) client(ctx context.Context, orgID string, any bool) (ownsandclie
 	}
 	revision := lk.CredentialRevision
 	c := l.instrument(orgID, inner, func() { l.markInvalid(orgID, revision) })
-	l.mu.Lock()
-	l.clients[orgID] = cachedClient{revision: revision, client: c}
-	l.mu.Unlock()
+	built = cachedClient{revision: revision, client: c}
 	return c, lk, nil
+}
+
+func (l *Links) beginLookup(orgID string) *clientLookups {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lookups := l.lookups[orgID]
+	if lookups == nil {
+		lookups = &clientLookups{}
+		l.lookups[orgID] = lookups
+	}
+	lookups.active++
+	return lookups
+}
+
+func (l *Links) finishLookup(orgID string, lookups *clientLookups, built cachedClient) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Eviction detaches the old group of lookups. Only lookups in the
+	// current group may publish a client or update its count.
+	if l.lookups[orgID] != lookups {
+		return
+	}
+	if built.client != nil {
+		l.clients[orgID] = built
+	}
+	lookups.active--
+	if lookups.active == 0 {
+		delete(l.lookups, orgID)
+	}
 }
 
 func (l *Links) instrument(orgID string, inner ownsandclient.Client, onUnauthenticated func()) ownsandclient.Client {
@@ -208,6 +257,7 @@ func (l *Links) markInvalid(orgID, revision string) {
 func (l *Links) forget(orgID string) {
 	l.mu.Lock()
 	delete(l.clients, orgID)
+	delete(l.lookups, orgID)
 	l.mu.Unlock()
 }
 
@@ -398,6 +448,9 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[sa
 	if err != nil {
 		return nil, err
 	}
+	if err := s.DB.CheckOwnSandTeardownAdmission(ctx); err != nil {
+		return nil, s.Internal(ctx, "check OwnSand teardown admission", err)
+	}
 	claim, err := l.ClaimRemoval(ctx, c.OrganizationID)
 	if err != nil {
 		return nil, s.Internal(ctx, "claim ownsand link removal", err)
@@ -426,6 +479,7 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[sa
 			return nil, s.Internal(ctx, "prepare ownsand link removal", err)
 		}
 	}
+	var afterCommit []func(context.Context)
 	err = db.InTxWithContexts(cleanupCtx, ctx, s.DB.Pool.Begin, func(tx pgx.Tx) error {
 		if err := api.LockOrganization(cleanupCtx, tx, c.OrganizationID); err != nil {
 			return err
@@ -440,8 +494,12 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[sa
 			if hook.InTx == nil {
 				continue
 			}
-			if err := hook.InTx(ctx, tx, c.OrganizationID); err != nil {
+			after, err := hook.InTx(ctx, tx, c.OrganizationID)
+			if err != nil {
 				return fmt.Errorf("ownsand link removal hook %s: %w", hook.Name, err)
+			}
+			if after != nil {
+				afterCommit = append(afterCommit, after)
 			}
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM ownsand_links WHERE ownsand_link_id = $1", claim.linkID); err != nil {
@@ -458,10 +516,8 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[sa
 	}
 	committed = true
 	l.forget(c.OrganizationID)
-	for _, hook := range l.hooks {
-		if hook.AfterCommit != nil {
-			hook.AfterCommit(context.WithoutCancel(ctx), c.OrganizationID)
-		}
+	for _, after := range afterCommit {
+		after(context.WithoutCancel(ctx))
 	}
 	s.Logger.InfoContext(ctx, "ownsand_link_removed", slog.String("organization_id", c.OrganizationID))
 	return connect.NewResponse(&sandrunv1.RemoveOwnSandLinkResponse{}), nil

@@ -10,7 +10,7 @@ import {
   RadioGroup as RadioGroupPart,
   RadioIndicator,
 } from "@ui-sdk/react/radio";
-import type * as React from "react";
+import * as React from "react";
 import { mergeClassName } from "./class-name.ts";
 
 export type RadioGroupProps = React.ComponentProps<typeof RadioGroupPart> & {
@@ -88,18 +88,86 @@ export type RadioGroupItemProps = Omit<
   children: React.ReactNode;
 };
 
+function activateCustomRadio(event: React.MouseEvent<HTMLLabelElement>) {
+  const label = event.currentTarget;
+  const target = event.target;
+  if (
+    event.defaultPrevented ||
+    !(target instanceof Element) ||
+    !label.control?.matches('[data-slot="radio-input"]')
+  ) {
+    return;
+  }
+
+  const radio = label.querySelector<HTMLElement>('[data-slot="radio"]');
+  const interactive = target.closest(
+    "a[href], audio[controls], button, details, embed, iframe, img[usemap], input, label, select, textarea, video[controls]",
+  );
+  if (!radio || radio.contains(target) || interactive !== label) {
+    return;
+  }
+
+  // The SDK cancels clicks forwarded to the hidden input for non-labelable
+  // radios. That makes the browser restore the previous checked input after the
+  // SDK has selected a new value. Forward the label click to the visible radio
+  // instead. Remove this when the SDK keeps the input in sync after label clicks.
+  event.preventDefault();
+  if (radio.getAttribute("aria-disabled") !== "true") {
+    radio.focus();
+    radio.click();
+  }
+}
+
+function withRadioLabel(
+  radio: React.ReactElement<React.AriaAttributes>,
+  labelId: string,
+  itemProps?: React.AriaAttributes,
+) {
+  const {
+    "aria-label": ariaLabel = itemProps?.["aria-label"],
+    "aria-labelledby": ariaLabelledBy = itemProps?.["aria-labelledby"],
+  } = radio.props;
+  return ariaLabel?.trim() || ariaLabelledBy?.trim()
+    ? radio
+    : React.cloneElement(radio, { "aria-labelledby": labelId });
+}
+
 /** One option of a `RadioGroup`. Pressing its text checks it. */
 export function RadioGroupItem({
   children,
   className,
+  render,
   ...props
 }: RadioGroupItemProps) {
+  const labelId = React.useId();
+  // The SDK names a non-labelable custom radio from its hidden input after
+  // mount. Supply the visible label during render until the SDK can do so
+  // before hydration. Check the composed element for any caller name first.
+  const renderRadio: RadioGroupItemProps["render"] =
+    typeof render === "function"
+      ? (radioProps, state) => {
+          const radio = render(radioProps, state);
+          return React.isValidElement<React.AriaAttributes>(radio)
+            ? withRadioLabel(radio, labelId)
+            : radio;
+        }
+      : render && withRadioLabel(render, labelId, props);
+
   return (
-    <label className="dui-radio-item">
-      <Radio className={mergeClassName("dui-radio", className)} {...props}>
+    <label
+      className="dui-radio-item"
+      onClick={render ? activateCustomRadio : undefined}
+    >
+      <Radio
+        className={mergeClassName("dui-radio", className)}
+        render={renderRadio}
+        {...props}
+      >
         <RadioIndicator className="dui-radio-indicator" />
       </Radio>
-      <span className="dui-radio-item-label">{children}</span>
+      <span className="dui-radio-item-label" id={render ? labelId : undefined}>
+        {children}
+      </span>
     </label>
   );
 }
