@@ -16,7 +16,10 @@ import {
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
+import {
+  BillingAccountRole,
+  InvitationState,
+} from "@delino/accounts-protos/v1/billing_account_pb";
 import { SubscriptionStatus } from "@delino/accounts-protos/v1/credit_pb";
 import { pendingInvitation } from "./invitation.ts";
 import { afterSignInPath } from "./pages/callback.tsx";
@@ -1745,10 +1748,11 @@ describe("invitation acceptance", () => {
   test("accepts the new link and not the stored token of an earlier link", async () => {
     const api = createFakeApi();
     api.userId = OUTSIDER;
-    api.invitationTokens.set(EARLIER_INVITATION_TOKEN, {
-      accountId: ACCOUNT_ID,
-      role: BillingAccountRole.ADMIN,
-    });
+    api.addInvitationToken(
+      EARLIER_INVITATION_TOKEN,
+      ACCOUNT_ID,
+      BillingAccountRole.ADMIN,
+    );
     pendingInvitation.save(EARLIER_INVITATION_TOKEN);
     renderApp(`/billing/invitations/accept#token=${INVITATION_TOKEN}`, { api });
     await click(
@@ -1781,10 +1785,11 @@ describe("invitation acceptance", () => {
   test("a replacement link opened while an earlier request is pending can be accepted once", async () => {
     const api = createFakeApi();
     api.userId = OUTSIDER;
-    api.invitationTokens.set(EARLIER_INVITATION_TOKEN, {
-      accountId: ACCOUNT_ID,
-      role: BillingAccountRole.ADMIN,
-    });
+    api.addInvitationToken(
+      EARLIER_INVITATION_TOKEN,
+      ACCOUNT_ID,
+      BillingAccountRole.ADMIN,
+    );
     // Hold the request of the earlier link so that it stays pending.
     let release!: () => void;
     api.gates.set(
@@ -1837,19 +1842,20 @@ describe("invitation acceptance", () => {
     "a replacement link keeps its stored token for the sign-in return when the earlier request $outcome meanwhile",
     async ({ registered }) => {
       const api = createFakeApi();
-      api.userId = OUTSIDER;
       // The earlier link joins another account, so its late success cannot
       // block the acceptance of the replacement link.
       addBillingAccounts(api, 1);
       const earlierAccountId = [...api.accounts.keys()].find(
         (id) => id !== ACCOUNT_ID,
       )!;
-      if (registered) {
-        api.invitationTokens.set(EARLIER_INVITATION_TOKEN, {
-          accountId: earlierAccountId,
-          role: BillingAccountRole.ADMIN,
-        });
-      }
+      const earlierInvitationId = registered
+        ? api.addInvitationToken(
+            EARLIER_INVITATION_TOKEN,
+            earlierAccountId,
+            BillingAccountRole.ADMIN,
+          )
+        : undefined;
+      api.userId = OUTSIDER;
       // Hold the request of the earlier link so that it settles after the
       // replacement link started its sign-in redirect.
       let release!: () => void;
@@ -1887,6 +1893,16 @@ describe("invitation acceptance", () => {
       // The earlier request settles during the sign-in redirect.
       release();
       await settle(60);
+      const earlierAccount = api.accounts.get(earlierAccountId)!;
+      expect(
+        earlierAccount.members.find((member) => member.userId === OUTSIDER)
+          ?.role,
+      ).toBe(registered ? BillingAccountRole.ADMIN : undefined);
+      expect(
+        earlierAccount.invitations.find(
+          (invitation) => invitation.invitationId === earlierInvitationId,
+        )?.state,
+      ).toBe(registered ? InvitationState.ACCEPTED : undefined);
       expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
       expect(window.location.pathname).toBe("/billing/invitations/accept");
 

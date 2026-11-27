@@ -5,17 +5,24 @@ package db_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
+	"maps"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
 	"github.com/delinoio/mono/servers/accounts-api/internal/db/dbtest"
@@ -42,58 +49,178 @@ func TestOpenDoesNotConnect(t *testing.T) {
 	d.Close()
 }
 
+// The accounts-api storage contract specifies this advisory lock key.
+const accountsMigrationLockID int64 = 0x6163636f756e7473
+
 func TestMigrateAppliesEveryMigrationOnceUnderConcurrency(t *testing.T) {
 	url := dbtest.NewEmptyURL(t)
-	ctx := context.Background()
-	var wg sync.WaitGroup
-	errs := make(chan error, 3)
+	want := embeddedMigrationVersions(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	defer cancel()
+
+	holder, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("connect migration lock holder: %v", err)
+	}
+	defer holder.Close(ctx)
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_lock($1)", accountsMigrationLockID); err != nil {
+		t.Fatalf("hold accounts migration lock: %v", err)
+	}
+
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		t.Fatalf("parse migration worker pool config: %v", err)
+	}
+	// Goose polls with pg_try_advisory_lock, so there is no waiting row in
+	// pg_locks. A completed probe on a separate session with the same key
+	// must have returned false while the holder still owns the lock.
+	tracer := &migrationLockTracer{attempted: make(chan struct{})}
+	cfg.ConnConfig.Tracer = tracer
 	var logs [3]bytes.Buffer
-	for i := range 3 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			d, err := db.Open(ctx, url)
+	var errs [len(logs)]error
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+	for i := range logs {
+		wg.Go(func() {
+			pool, err := pgxpool.NewWithConfig(ctx, cfg.Copy())
 			if err != nil {
-				errs <- err
+				errs[i] = err
 				return
 			}
+			d := &db.DB{Pool: pool}
 			defer d.Close()
-			errs <- d.Migrate(ctx, slog.New(slog.NewJSONHandler(&logs[i], nil)))
-		}()
+			errs[i] = d.Migrate(ctx, slog.New(slog.NewJSONHandler(&logs[i], nil)))
+		})
+	}
+
+	select {
+	case <-tracer.attempted:
+		t.Log("observed a competing attempt while the accounts migration lock was held")
+	case <-time.After(10 * time.Second):
+		t.Fatal("no competing attempt on the accounts migration lock within 10 seconds while the holder owned it")
+	}
+	var released bool
+	if err := holder.QueryRow(ctx, "SELECT pg_advisory_unlock($1)", accountsMigrationLockID).Scan(&released); err != nil || !released {
+		t.Fatalf("release accounts migration lock: released = %t, error = %v", released, err)
 	}
 	wg.Wait()
-	close(errs)
-	for err := range errs {
+	for i, err := range errs {
 		if err != nil {
-			t.Fatalf("Migrate() error = %v", err)
+			t.Fatalf("Migrate() call %d: %v", i+1, err)
 		}
 	}
-	applied := 0
-	for i := range logs {
-		applied += strings.Count(logs[i].String(), `"db_migration_applied"`)
-	}
+
 	d, err := db.Open(ctx, url)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	var versions int
-	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM goose_db_version WHERE version_id > 0").Scan(&versions); err != nil {
-		t.Fatalf("read goose_db_version: %v", err)
+	rows, err := d.Pool.Query(ctx, "SELECT version_id FROM goose_db_version WHERE is_applied AND version_id <> 0")
+	if err != nil {
+		t.Fatalf("query applied migration versions: %v", err)
 	}
-	if applied != versions {
-		t.Fatalf("%d migrations logged as applied across instances, %d recorded", applied, versions)
+	versions, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		t.Fatalf("read applied migration versions: %v", err)
 	}
-	if versions == 0 {
-		t.Fatal("no migration was applied")
+	recorded := make(map[int64]int)
+	for _, version := range versions {
+		recorded[version]++
 	}
-	// A second run finds nothing to apply.
+	assertMigrationVersions(t, "database", want, recorded)
+	assertMigrationVersions(t, "logs", want, loggedMigrationVersions(t, io.MultiReader(&logs[0], &logs[1], &logs[2])))
+
 	var again bytes.Buffer
 	if err := d.Migrate(ctx, slog.New(slog.NewJSONHandler(&again, nil))); err != nil {
-		t.Fatalf("second Migrate() error = %v", err)
+		t.Fatalf("subsequent Migrate() error = %v", err)
 	}
-	if strings.Contains(again.String(), "db_migration_applied") {
-		t.Fatalf("second run applied migrations: %s", again.String())
+	assertMigrationVersions(t, "subsequent run logs", nil, loggedMigrationVersions(t, &again))
+}
+
+type migrationLockTracer struct {
+	attempted chan struct{}
+	once      sync.Once
+}
+
+type migrationLockProbeKey struct{}
+
+func (*migrationLockTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	// pgx's database/sql adapter prepends a result-format option.
+	if data.SQL == "SELECT pg_try_advisory_lock($1)" && len(data.Args) > 0 && data.Args[len(data.Args)-1] == accountsMigrationLockID {
+		return context.WithValue(ctx, migrationLockProbeKey{}, true)
+	}
+	return ctx
+}
+
+func (tracer *migrationLockTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	if ctx.Value(migrationLockProbeKey{}) == true && data.Err == nil && data.CommandTag.RowsAffected() == 1 {
+		tracer.once.Do(func() { close(tracer.attempted) })
+	}
+}
+
+func embeddedMigrationVersions(t *testing.T) map[int64]bool {
+	t.Helper()
+	files, err := fs.Glob(db.Migrations(), "*.sql")
+	if err != nil {
+		t.Fatalf("list embedded migrations: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no embedded migrations")
+	}
+	versions := make(map[int64]bool, len(files))
+	for _, name := range files {
+		prefix, _, found := strings.Cut(name, "_")
+		version, err := strconv.ParseInt(prefix, 10, 64)
+		if !found || err != nil || version <= 0 {
+			t.Fatalf("invalid embedded migration version in %q", name)
+		}
+		if versions[version] {
+			t.Fatalf("duplicate embedded migration version %d in %q", version, name)
+		}
+		versions[version] = true
+	}
+	return versions
+}
+
+func loggedMigrationVersions(t *testing.T, logs io.Reader) map[int64]int {
+	t.Helper()
+	counts := make(map[int64]int)
+	decoder := json.NewDecoder(logs)
+	for {
+		var event struct {
+			Message string `json:"msg"`
+			Version int64  `json:"version"`
+		}
+		err := decoder.Decode(&event)
+		if errors.Is(err, io.EOF) {
+			return counts
+		}
+		if err != nil {
+			t.Fatalf("decode structured migration log: %v", err)
+		}
+		if event.Message == "db_migration_applied" {
+			counts[event.Version]++
+		}
+	}
+}
+
+func assertMigrationVersions(t *testing.T, source string, want map[int64]bool, counts map[int64]int) {
+	t.Helper()
+	for _, version := range slices.Sorted(maps.Keys(want)) {
+		if counts[version] == 0 {
+			t.Errorf("%s: missing migration version %d", source, version)
+		}
+	}
+	for _, version := range slices.Sorted(maps.Keys(counts)) {
+		if !want[version] {
+			t.Errorf("%s: unexpected migration version %d", source, version)
+		}
+		if counts[version] > 1 {
+			t.Errorf("%s: duplicate migration version %d (%d entries)", source, version, counts[version])
+		}
 	}
 }
 

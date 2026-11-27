@@ -604,9 +604,16 @@ export type CreateTopUpRequest = Message<"delino.accounts.v1.CreateTopUpRequest"
 
   /**
    * UUID v7 that the caller generates for each logical top-up and reuses for
-   * every retry. A repeated key of the same billing account within 24 hours
-   * returns the first result and charges nothing again; a repeated key with
-   * another amount fails with `invalid_argument`.
+   * every retry. Within 24 hours, a retry that matches a stored top-up by
+   * billing account and key uses the recorded outcome without charging again.
+   * A different amount returns `invalid_argument`. A rejection or a verified
+   * payment failure returns `failed_precondition`, even if the initial
+   * request succeeded before the failure webhook arrived. After the 1-hour
+   * timeout, replay succeeds if the server recorded Paddle acceptance. An
+   * outcome that is still unknown returns `unavailable`, including after the
+   * timeout.
+   * If the server removes the top-up because Paddle left the charge unapplied,
+   * a retry with the same key can start a new charge.
    *
    * @generated from field: string idempotency_key = 2;
    */
@@ -1055,10 +1062,13 @@ export const CreditService: GenService<{
    * accounts-api creates a Paddle checkout transaction for the subscription
    * price with the billing account ID in its custom data and returns its ID
    * for Paddle.js checkout. The subscription becomes ACTIVE only after the
-   * verified payment webhook. While the status is PENDING, the call returns
-   * the open checkout transaction again, so that a user can retry a closed
-   * checkout. Fails with `already_exists` while the status is ACTIVE or
-   * PAST_DUE.
+   * verified payment webhook.
+   * While the subscription is PENDING and has a stored checkout, the call
+   * reuses the checkout if Paddle confirms it is payable. If Paddle confirms
+   * the checkout is canceled or missing, the call returns a new checkout ID.
+   * An inconclusive lookup or a payment awaiting the verified webhook returns
+   * retryable `unavailable` and preserves the pending checkout.
+   * Fails with `already_exists` while the status is ACTIVE or PAST_DUE.
    *
    * @generated from rpc delino.accounts.v1.CreditService.StartSubscription
    */

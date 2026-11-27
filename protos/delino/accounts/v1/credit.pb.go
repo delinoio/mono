@@ -1292,9 +1292,16 @@ type CreateTopUpRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	BillingAccountId string                 `protobuf:"bytes,1,opt,name=billing_account_id,json=billingAccountId,proto3" json:"billing_account_id,omitempty"`
 	// UUID v7 that the caller generates for each logical top-up and reuses for
-	// every retry. A repeated key of the same billing account within 24 hours
-	// returns the first result and charges nothing again; a repeated key with
-	// another amount fails with `invalid_argument`.
+	// every retry. Within 24 hours, a retry that matches a stored top-up by
+	// billing account and key uses the recorded outcome without charging again.
+	// A different amount returns `invalid_argument`. A rejection or a verified
+	// payment failure returns `failed_precondition`, even if the initial
+	// request succeeded before the failure webhook arrived. After the 1-hour
+	// timeout, replay succeeds if the server recorded Paddle acceptance. An
+	// outcome that is still unknown returns `unavailable`, including after the
+	// timeout.
+	// If the server removes the top-up because Paddle left the charge unapplied,
+	// a retry with the same key can start a new charge.
 	IdempotencyKey string `protobuf:"bytes,2,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
 	// At least 25 USD (25,000,000) and at most 10,000 USD (10,000,000,000),
 	// whole cents. Other values fail with `invalid_argument`.

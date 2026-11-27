@@ -9,6 +9,7 @@ export default mergeRsbuildConfig(appConfig, {
       "auto-top-up": "./e2e/auto-top-up-fixture.tsx",
       "billing-confirmations": "./e2e/billing-confirmations.fixture.tsx",
       "billing-settings": "./e2e/billing-settings.fixture.tsx",
+      "billing-usage": "./e2e/billing-usage.fixture.tsx",
     },
   },
 });
