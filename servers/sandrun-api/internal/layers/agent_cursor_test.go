@@ -73,13 +73,14 @@ func startCursorWorldRelisting(t *testing.T, guest sandrunv1.GuestOs, timing age
 func TestCursorClaimDuringProfileDeletion(t *testing.T) {
 	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	const id = "bc-deleted-profile"
-	commit := holdTx(t, w.env, "DELETE FROM runner_profiles WHERE runner_profile_id = $1", w.profileID)
+	holder := holdTx(t, w.env, "DELETE FROM runner_profiles WHERE runner_profile_id = $1", w.profileID)
 	w.cursor.AddRequest(id, true)
-	waitForLockWaiter(t, w.env)
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+		query: "SELECT 1 FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR SHARE"})
 	if n := w.cursor.ClaimCount(id); n != 1 {
 		t.Fatalf("%d claims while admission waits for the profile, want 1", n)
 	}
-	commit()
+	holder.commit()
 	eventually(t, "release of the unused vendor claim", func() bool { return w.cursor.Released(id) == 1 })
 	if _, held := w.cursor.Claim(id); held {
 		t.Error("the vendor claim is still active")
@@ -341,26 +342,18 @@ func TestCursorClaimExpiresAtRunnerBinding(t *testing.T) {
 			}
 
 			if tc.raceSweep {
-				commit := holdTx(t, w.env, "SELECT 1 FROM requests WHERE request_id = $1 FOR UPDATE", req.GetRequestId())
+				holder := holdTx(t, w.env, "SELECT 1 FROM requests WHERE request_id = $1 FOR UPDATE", req.GetRequestId())
+				const query = "FROM requests WHERE request_id = $1 FOR UPDATE"
 				w.env.Clock.Advance(time.Hour)
 				resume()
-				waitForLockWaiter(t, w.env)
+				bindingPID := waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid, query: query})
 				done := make(chan struct{})
 				go func() {
 					defer close(done)
 					w.l.Engine.Pass(ctx, w.org.ID)
 				}()
-				eventually(t, "binding and the sweep both wait for the request lock", func() bool {
-					var n int
-					err := w.env.DB.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-						WHERE datname = current_database() AND wait_event_type = 'Lock'
-						AND query LIKE '%FROM requests WHERE request_id = $1 FOR UPDATE%'`).Scan(&n)
-					if err != nil {
-						t.Fatal(err)
-					}
-					return n == 2
-				})
-				commit()
+				waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid, query: query, earlierWaiterPID: bindingPID})
+				holder.commit()
 				<-done
 			} else {
 				w.env.Clock.Advance(time.Hour)
@@ -406,15 +399,15 @@ func TestCursorClaimRejectedWithoutEligibleDevice(t *testing.T) {
 			w.cursor.AddRequest(key, true)
 			wait()
 			req := w.requestBySource(t, key)
-			commit := holdTx(t, w.env, "SELECT 1 FROM requests WHERE request_id = $1 FOR UPDATE", req.GetRequestId())
+			holder := holdTx(t, w.env, "SELECT 1 FROM requests WHERE request_id = $1 FOR UPDATE", req.GetRequestId())
 			resume()
-			waitForLockWaiter(t, w.env)
+			waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid, query: "FROM requests WHERE request_id = $1 FOR UPDATE"})
 			w.env.Clock.Advance(tc.advance)
 
 			if _, held := w.cursor.Claim(key); !held || w.cursor.FailAttempts(key) != 0 {
 				t.Fatal("Cursor claim changed before the terminal transaction could commit")
 			}
-			commit()
+			holder.commit()
 
 			r := w.waitRequest(t, req.GetRequestId(), tc.state)
 			if r.GetEndReason() != tc.reason || r.GetStartAttempts() != 0 || r.GetRunnerId() != "" {

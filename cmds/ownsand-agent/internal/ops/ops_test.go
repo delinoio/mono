@@ -690,7 +690,10 @@ func TestAttachOffsetsAndPaused(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, frames, accepted := e.handle(attach, nil)
-	if !accepted || out.Finished || stdout(frames) != "456789" || last(frames).GetExecEvent().GetPaused() == nil {
+	if !accepted || out.Finished || len(frames) != 3 ||
+		frames[0].GetExecEvent().GetStarted().GetStartTime() == nil ||
+		frames[1].GetExecEvent().GetStdout().GetOffset() != 4 ||
+		stdout(frames) != "456789" || frames[2].GetExecEvent().GetPaused() == nil {
 		t.Fatalf("paused attach: %+v %v", out, frames)
 	}
 	// Exec on a paused sandbox fails the state rule.
@@ -1011,6 +1014,97 @@ func (a *admittedSandboxes) WithRunning(id string, fn func()) bool {
 	return ok
 }
 
+func TestAttachPausedBeforeGuestStart(t *testing.T) {
+	var gate *admittedSandboxes
+	e := newEnvWith(t, envOptions{wrap: func(m *sandboxes.Manager) ops.Sandboxes {
+		gate = newAdmittedSandboxes(m)
+		return gate
+	}})
+	t.Cleanup(gate.Release)
+	marker := filepath.Join(t.TempDir(), "starts")
+	req := e.execReq("/bin/sh", "-c", `printf x >> "$1" || exit 1; printf 0123456789`, "exec", marker)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	original := &sink{}
+	handled := make(chan ops.Outcome, 1)
+	go func() {
+		handled <- e.d.Handle(ctx, ops.Request{
+			Frame: datapath.MustNewFrame(1, e.sandbox, req), SandboxID: e.sandbox,
+		}, original)
+	}()
+	select {
+	case <-gate.admitted:
+	case <-ctx.Done():
+		t.Fatal("exec was not admitted")
+	}
+	if _, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: e.sandbox}); err != nil {
+		t.Fatal(err)
+	}
+	attach := &ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: e.sandbox, ExecId: req.GetExecId()}
+	for _, transport := range []string{"direct", "relay"} {
+		t.Run(transport, func(t *testing.T) {
+			response := &sink{}
+			request := ops.Request{Frame: datapath.MustNewFrame(2, e.sandbox, attach), SandboxID: e.sandbox}
+			wantFrames := 2
+			if transport == "relay" {
+				request.Grant = &ops.GrantCheck{
+					Kind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC, OperationID: req.GetExecId(),
+				}
+				request.OnAccepted = func() {
+					_ = response.Send(ctx, datapath.MustNewFrame(2, e.sandbox, &ownsandv1.RequestAccepted{}))
+				}
+				wantFrames++
+			}
+			out := e.d.Handle(ctx, request, response)
+			frames := response.frames
+			if out.Finished || out.Error != nil || len(frames) != wantFrames {
+				t.Fatalf("paused attach: %+v %v", out, frames)
+			}
+			if transport == "relay" && frames[0].GetRequestAccepted() == nil {
+				t.Fatalf("expected relay acceptance first: %v", frames)
+			}
+			start := frames[wantFrames-2].GetExecEvent().GetStarted()
+			if start.GetExecId() != req.GetExecId() || start.GetStartTime() != nil ||
+				frames[wantFrames-1].GetExecEvent().GetPaused() == nil {
+				t.Fatalf("expected start without timestamp followed by paused: %v", frames)
+			}
+		})
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("before resume, expected no command start: %v", err)
+	}
+	if _, err := e.m.Resume(ctx, &ownsandv1.ResumeSandboxCommand{SandboxId: e.sandbox}); err != nil {
+		t.Fatal(err)
+	}
+	gate.Release()
+	select {
+	case out := <-handled:
+		if !out.Finished || out.Error != nil || last(original.frames).GetExecEvent().GetExited() == nil {
+			t.Fatalf("original exec: %+v %v", out, original.frames)
+		}
+	case <-ctx.Done():
+		t.Fatal("original exec did not finish")
+	}
+	start := original.frames[0].GetExecEvent().GetStarted()
+	if start.GetExecId() != req.GetExecId() || start.GetStartTime() == nil || !start.GetStartTime().IsValid() {
+		t.Fatalf("expected a valid guest start timestamp: %v", start)
+	}
+	if _, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: e.sandbox}); err != nil {
+		t.Fatal(err)
+	}
+	attach.StdoutOffset = 4
+	out, frames, accepted := e.handle(attach, nil)
+	if !accepted || !out.Finished || out.Error != nil || len(frames) != 3 ||
+		!proto.Equal(frames[0].GetExecEvent().GetStarted(), start) ||
+		frames[1].GetExecEvent().GetStdout().GetOffset() != 4 || stdout(frames) != "456789" ||
+		!proto.Equal(frames[2].GetExecEvent(), last(original.frames).GetExecEvent()) {
+		t.Fatalf("completed attach on paused sandbox: %+v %v", out, frames)
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "x" {
+		t.Fatalf("command start marker: %q, %v; want one start", data, err)
+	}
+}
+
 // TestCloseWaitsForAdmittedExec covers a shutdown that starts after an exec
 // was admitted and before its forwarding goroutine started: Close does not
 // return until that worker has finished, and an exec that arrives once
@@ -1324,8 +1418,8 @@ func TestExecStartsOnceWhenTheFirstDialFails(t *testing.T) {
 			}
 		}}
 	}})
-	count := filepath.Join(t.TempDir(), "count")
-	req := e.execReq("/bin/sh", "-c", "echo run >> "+count+"; echo done")
+	count := filepath.Join(t.TempDir(), "run count")
+	req := e.execReq("/bin/sh", "-c", `echo run >> "$1"; echo done`, "sh", count)
 	out, frames, accepted := e.handle(req, nil)
 	if !out.Finished || !accepted {
 		t.Fatalf("outcome %+v accepted %v", out, accepted)
@@ -1372,8 +1466,8 @@ func TestExecAttachesAfterTheStartWasDelivered(t *testing.T) {
 			}
 		}}
 	}})
-	count := filepath.Join(t.TempDir(), "count")
-	req := e.execReq("/bin/sh", "-c", "echo run >> "+count+"; echo before; sleep 2; echo after")
+	count := filepath.Join(t.TempDir(), "run count")
+	req := e.execReq("/bin/sh", "-c", `echo run >> "$1"; echo before; sleep 2; echo after`, "sh", count)
 	go func() {
 		// Cut the connection of the start request after the command started.
 		deadline := time.Now().Add(10 * time.Second)
@@ -1443,8 +1537,8 @@ func TestExecDoesNotRestartWhenTheHelperHasNoRecord(t *testing.T) {
 			}
 		}}
 	}})
-	count := filepath.Join(t.TempDir(), "count")
-	req := e.execReq("/bin/sh", "-c", "echo run >> "+count+"; sleep 5")
+	count := filepath.Join(t.TempDir(), "run count")
+	req := e.execReq("/bin/sh", "-c", `echo run >> "$1"; sleep 5`, "sh", count)
 	go func() {
 		deadline := time.Now().Add(10 * time.Second)
 		for readCount(t, count) < 1 && time.Now().Before(deadline) {

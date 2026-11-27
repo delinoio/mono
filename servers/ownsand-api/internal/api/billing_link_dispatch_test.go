@@ -23,7 +23,8 @@ import (
 // linkDispatchTrace controls the service clock around the actual Postgres
 // queries. The lookup end hook runs after the ownership result was read.
 type linkDispatchTrace struct {
-	insert, lookupStart, lookupEnd func()
+	insert, lookupEnd func()
+	lookupStart       func(context.Context)
 }
 
 type linkDispatchLookupKey struct{}
@@ -33,7 +34,7 @@ func (q linkDispatchTrace) TraceQueryStart(ctx context.Context, _ *pgx.Conn, dat
 	case strings.HasPrefix(data.SQL, "INSERT INTO billing_pending_unlinks") && strings.Contains(data.SQL, "link_attempt_id"):
 		q.insert()
 	case strings.HasPrefix(data.SQL, "SELECT EXISTS (SELECT 1 FROM billing_pending_unlinks") && strings.Contains(data.SQL, "link_call_deadline IS NOT NULL"):
-		q.lookupStart()
+		q.lookupStart(ctx)
 		return context.WithValue(ctx, linkDispatchLookupKey{}, true)
 	}
 	return ctx
@@ -93,7 +94,7 @@ func TestBillingLinkDispatchAfterOwnershipLookup(t *testing.T) {
 				insert: func() {
 					f.env.Clock.Advance(time.Duration(tc.lookupStartSeconds) * time.Second)
 				},
-				lookupStart: func() {
+				lookupStart: func(context.Context) {
 					switch tc.change {
 					case removeBeforeLookup:
 						if _, err := testDB.Pool.Exec(t.Context(), "DELETE FROM billing_pending_unlinks WHERE organization_id = $1", f.org.ID); err != nil {
@@ -113,14 +114,7 @@ func TestBillingLinkDispatchAfterOwnershipLookup(t *testing.T) {
 			budgets := make(chan time.Duration, 1)
 			f = newLinkAttemptFixture(t, "dispatch-owner", func(o *app.Options) {
 				testDB = o.DB
-				cfg := testDB.Pool.Config()
-				cfg.ConnConfig.Tracer = trace
-				pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(pool.Close)
-				o.DB = &db.DB{Pool: pool}
+				o.DB = linkDispatchDB(t, testDB, trace)
 				o.UsageClient = linkDispatchClient{UsageServiceClient: o.UsageClient, budget: budgets}
 			})
 
@@ -159,4 +153,16 @@ func TestBillingLinkDispatchAfterOwnershipLookup(t *testing.T) {
 			f.wantLocalLink(t, false)
 		})
 	}
+}
+
+func linkDispatchDB(t *testing.T, database *db.DB, trace linkDispatchTrace) *db.DB {
+	t.Helper()
+	cfg := database.Pool.Config()
+	cfg.ConnConfig.Tracer = trace
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return &db.DB{Pool: pool}
 }

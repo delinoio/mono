@@ -38,6 +38,8 @@ const maxHeaderID = 200
 // errSignature is a missing or invalid signature.
 var errSignature = errors.New("invalid webhook signature")
 
+var errRunnerBindingChanged = errors.New("request runner binding changed during Codex failure delivery")
+
 // SecretKey returns the HMAC key of a webhook secret, as the Standard
 // Webhooks specification and the OpenAI SDKs define it: the base64
 // (standard alphabet) decoding of the part after `whsec_`, or, for a
@@ -236,6 +238,9 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lctx, cancel := context.WithTimeout(ctx, v.opts.LookupTimeout)
 		sess, err = v.session(lctx, in, ev.Data.ID)
 		cancel()
+		if err == nil && sess.ID != ev.Data.ID {
+			err = errors.New("the agent session ID does not match the webhook session ID")
+		}
 		if err != nil && !errors.Is(err, errSessionGone) {
 			if ctx.Err() == nil {
 				svc.Logger.WarnContext(ctx, "openai_session_lookup_failed", slog.String("agent_integration_id", in.ID), slog.Any("error", err))
@@ -244,7 +249,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	err = svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+	recordDelivery := func(tx pgx.Tx) error {
 		o.after, o.requestID, o.runnerID, o.detail = nil, "", "", ""
 		isNew, err := webhook.Record(ctx, tx, webhook.SenderOpenAI, deliveryID, svc.NowUTC())
 		if err != nil {
@@ -263,7 +268,12 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		o.ignore("event not handled")
 		return nil
-	})
+	}
+	err = svc.DB.InTx(ctx, recordDelivery)
+	if errors.Is(err, errRunnerBindingChanged) {
+		// The first attempt rolled back. Read the binding again before taking locks.
+		err = svc.DB.InTx(ctx, recordDelivery)
+	}
 	if err != nil {
 		if ctx.Err() == nil {
 			svc.Logger.ErrorContext(ctx, "openai_webhook_failed", slog.String("delivery_id", safe(deliveryID)), slog.Any("error", err))
@@ -362,8 +372,34 @@ func (v *Vendor) sessionFailed(ctx context.Context, tx pgx.Tx, in integration.In
 		o.ignore("no open request")
 		return nil
 	}
-	o.requestID = req.ID
 	engine := v.hub.Engine()
+	runnerID := req.RunnerID
+	var runner *work.Runner
+	if runnerID != "" {
+		runner, err = engine.LockOrganizationRunner(ctx, tx, req.OrganizationID, runnerID)
+		if err != nil && !isNotFound(err) {
+			return err
+		}
+	}
+	// Dispatch locks the runner before the request. Retry the transaction
+	// if the binding changed instead of taking a new runner lock here.
+	req, err = engine.LockRequest(ctx, tx, req.ID)
+	if isNotFound(err) {
+		o.ignore("no open request")
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if work.RequestTerminal(req.State) {
+		o.ignore("no open request")
+		return nil
+	}
+	if req.RunnerID != runnerID {
+		return errRunnerBindingChanged
+	}
+
+	o.requestID, o.runnerID = req.ID, req.RunnerID
 	end := work.RequestEnd{State: sandrunv1.RequestState_REQUEST_STATE_FAILED, Reason: sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE}
 	if req.State == sandrunv1.RequestState_REQUEST_STATE_QUEUED {
 		end.State = sandrunv1.RequestState_REQUEST_STATE_CANCELED
@@ -371,12 +407,11 @@ func (v *Vendor) sessionFailed(ctx context.Context, tx pgx.Tx, in integration.In
 	if _, err := engine.EndRequestTx(ctx, tx, req.ID, end); err != nil {
 		return err
 	}
-	if req.RunnerID != "" {
-		d, err := engine.DeleteRunnerTx(ctx, tx, req.OrganizationID, req.RunnerID, sandrunv1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP, 0)
-		if err != nil && !isNotFound(err) {
+	if runner != nil {
+		d, err := engine.DeleteRunnerTx(ctx, tx, req.OrganizationID, runner.ID, sandrunv1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP, 0)
+		if err != nil {
 			return err
 		}
-		o.runnerID = req.RunnerID
 		o.after = append(o.after, func(ctx context.Context) { engine.FinishDeletion(ctx, d) })
 	}
 	orgID := in.OrganizationID

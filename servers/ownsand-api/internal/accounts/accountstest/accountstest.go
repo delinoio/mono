@@ -57,10 +57,11 @@ type account struct {
 }
 
 type link struct {
-	account string
-	name    string
-	since   time.Time
-	status  *accountsv1.OrganizationBillingStatus
+	account    string
+	name       string
+	since      time.Time
+	unlinkedAt *time.Time
+	status     *accountsv1.OrganizationBillingStatus
 }
 
 // usageKey identifies the usage of one organization and meter in one UTC
@@ -91,9 +92,11 @@ type Server struct {
 	seq      int64
 	accounts map[string]*account
 	links    map[string]*link
-	usage    map[usageKey][2]int64
-	reported map[string]bool
-	failures map[string]error
+	// Current links are also in the history. Unlink closes the interval in place.
+	linkHistory map[string][]*link
+	usage       map[usageKey][2]int64
+	reported    map[string]bool
+	failures    map[string]error
 	// replyFailures fail a call after it took effect: a lost response.
 	replyFailures map[string]error
 	gates         map[string]*Gate
@@ -103,6 +106,7 @@ type Server struct {
 // Gate holds the calls of one method before they take effect, until
 // Release. Tests use it to keep a call in flight while other operations run.
 type Gate struct {
+	method string
 	// Entered receives one value when a held call reaches the gate and can
 	// notify before release. Calls that observe release skip notification.
 	Entered chan struct{}
@@ -120,7 +124,8 @@ func New(t testing.TB, now func() time.Time) *Server {
 		now = time.Now
 	}
 	f := &Server{now: now, accounts: map[string]*account{}, links: map[string]*link{}, usage: map[usageKey][2]int64{},
-		reported: map[string]bool{}, failures: map[string]error{}, replyFailures: map[string]error{}, gates: map[string]*Gate{}, calls: map[string]int{}}
+		linkHistory: map[string][]*link{},
+		reported:    map[string]bool{}, failures: map[string]error{}, replyFailures: map[string]error{}, gates: map[string]*Gate{}, calls: map[string]int{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /oidc/token", f.token)
 	path, h := accountsv1connect.NewUsageServiceHandler(handler{f}, connect.WithInterceptors(authCheck{}))
@@ -262,7 +267,7 @@ func (f *Server) FailReply(method string, err error) {
 // Hold makes every later call of method wait before it takes effect until
 // the returned gate is released.
 func (f *Server) Hold(method string) *Gate {
-	g := &Gate{Entered: make(chan struct{}, 16), release: make(chan struct{})}
+	g := &Gate{method: method, Entered: make(chan struct{}, 16), release: make(chan struct{})}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gates[method] = g
@@ -322,6 +327,24 @@ func (f *Server) begin(method string) error {
 
 type handler struct{ f *Server }
 
+// usageLinkLocked returns the latest nonempty link that overlaps the usage window.
+func (f *Server) usageLinkLocked(org string, windowStart time.Time) *link {
+	windowEnd := windowStart.Add(5 * time.Minute)
+	var latest *link
+	for _, l := range f.linkHistory[org] {
+		if !l.since.Before(windowEnd) {
+			continue
+		}
+		if l.unlinkedAt != nil && (!l.unlinkedAt.After(windowStart) || !l.unlinkedAt.After(l.since)) {
+			continue
+		}
+		if latest == nil || !l.since.Before(latest.since) {
+			latest = l
+		}
+	}
+	return latest
+}
+
 func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.ReportUsageRequest]) (*connect.Response[accountsv1.ReportUsageResponse], error) {
 	f := h.f
 	if err := f.begin(MethodReportUsage); err != nil {
@@ -332,15 +355,17 @@ func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.
 	resp := &accountsv1.ReportUsageResponse{}
 	named := map[string]bool{}
 	for _, r := range req.Msg.GetReports() {
-		key := r.GetOrganizationId() + "/" + r.GetMeter().String() + "/" + r.GetWindowStart().AsTime().String()
-		res := &accountsv1.UsageReportResult{Service: r.GetService(), OrganizationId: r.GetOrganizationId(), Meter: r.GetMeter(), WindowStart: r.GetWindowStart(),
+		org := r.GetOrganizationId()
+		windowStart := r.GetWindowStart().AsTime()
+		key := org + "/" + r.GetMeter().String() + "/" + windowStart.String()
+		res := &accountsv1.UsageReportResult{Service: r.GetService(), OrganizationId: org, Meter: r.GetMeter(), WindowStart: r.GetWindowStart(),
 			Duplicate: f.reported[key]}
 		if !f.reported[key] {
 			f.reported[key] = true
-			k := usageKey{org: r.GetOrganizationId(), meter: r.GetMeter(), month: utcMonth(r.GetWindowStart().AsTime())}
+			k := usageKey{org: org, meter: r.GetMeter(), month: utcMonth(windowStart)}
 			u := f.usage[k]
 			f.usage[k] = [2]int64{u[0] + r.GetQuantity(), u[1] + r.GetAmountUsdMicros()}
-			if l, ok := f.links[r.GetOrganizationId()]; ok {
+			if l := f.usageLinkLocked(org, windowStart); l != nil {
 				res.BillingAccountId = l.account
 				f.accounts[l.account].balance -= r.GetAmountUsdMicros()
 			} else {
@@ -348,7 +373,7 @@ func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.
 			}
 		}
 		resp.Results = append(resp.Results, res)
-		named[r.GetOrganizationId()] = true
+		named[org] = true
 	}
 	orgs := make([]string, 0, len(named))
 	for org := range named {
@@ -414,19 +439,22 @@ func (h handler) LinkOrganization(_ context.Context, req *connect.Request[accoun
 	if role != accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER && role != accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN {
 		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("the user must be owner or admin of the billing account"))
 	}
-	if l, ok := f.links[m.GetOrganizationId()]; ok {
+	org := m.GetOrganizationId()
+	if l, ok := f.links[org]; ok {
 		if l.account != a.id {
 			return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("the organization is linked to another billing account"))
 		}
 		l.name = m.GetOrganizationName()
 	} else {
-		f.links[m.GetOrganizationId()] = &link{account: a.id, name: m.GetOrganizationName(), since: f.now().UTC()}
-		f.refreshLocked(m.GetOrganizationId())
+		l := &link{account: a.id, name: m.GetOrganizationName(), since: f.now().UTC()}
+		f.links[org] = l
+		f.linkHistory[org] = append(f.linkHistory[org], l)
+		f.refreshLocked(org)
 	}
 	if err := f.replyFailures[MethodLinkOrganization]; err != nil {
 		return nil, err
 	}
-	return connect.NewResponse(&accountsv1.LinkOrganizationResponse{Status: proto.Clone(f.links[m.GetOrganizationId()].status).(*accountsv1.OrganizationBillingStatus),
+	return connect.NewResponse(&accountsv1.LinkOrganizationResponse{Status: proto.Clone(f.links[org].status).(*accountsv1.OrganizationBillingStatus),
 		BillingAccountName: a.name}), nil
 }
 
@@ -436,7 +464,12 @@ func (h handler) UnlinkOrganization(_ context.Context, req *connect.Request[acco
 		return nil, err
 	}
 	f.mu.Lock()
-	delete(f.links, req.Msg.GetOrganizationId())
+	org := req.Msg.GetOrganizationId()
+	if l, ok := f.links[org]; ok {
+		unlinkedAt := f.now().UTC()
+		l.unlinkedAt = &unlinkedAt
+		delete(f.links, org)
+	}
 	err := f.replyFailures[MethodUnlinkOrganization]
 	f.mu.Unlock()
 	if err != nil {
