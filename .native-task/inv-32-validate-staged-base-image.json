@@ -1,0 +1,144 @@
+{
+  "gid": "inv-32-validate-staged-base-image",
+  "commit": "eefe7fa77bf0d17d066eae07f48516a595515ab0",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "eefe7fa77bf0d17d066eae07f48516a595515ab0",
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-validate-staged-base-image/worker/.t3-tmp/validation/verify-image-cli.mjs",
+      "copyTo": ".t3-tmp/native-image/verify-image-cli.mjs",
+      "sha256": "9e615561f5a58c60eb5dbef49195b1b66ff0be172704625182da7ea7383b9d8c"
+    },
+    "windows": {
+      "platform": "Windows",
+      "host": "delino-win-1",
+      "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+      "status": "pending",
+      "setup": "Run in one PowerShell session from the root of the exact checkout. Use native Go and Node 24. Run the first two commands, copy the probe, then run the rest. Clear any host-specific GOOS or GOARCH overrides before running.",
+      "commands": [
+        "if ((git rev-parse HEAD).Trim() -ne 'eefe7fa77bf0d17d066eae07f48516a595515ab0') { throw 'Wrong checkout revision' }",
+        "$dir = Join-Path (Get-Location).Path '.t3-tmp/native-image'; New-Item -ItemType Directory -Force -Path $dir | Out-Null; $env:TMP = $dir; $env:TEMP = $dir; $env:TMPDIR = $dir; $env:GOTMPDIR = $dir",
+        "go test -mod=readonly -count=1 -v ./cmds/ownsand-agent/internal/images ./cmds/ownsand-agent/internal/imagebuild; if ($LASTEXITCODE -ne 0) { throw 'Native image fixtures failed' }",
+        "go test -mod=readonly -count=1 -v -run '^TestWindowsBaseImageGeneration' ./cmds/ownsand-agent/internal/vmruntime/hcsrt; if ($LASTEXITCODE -ne 0) { throw 'Native Windows generation fixtures failed' }",
+        "node (Join-Path $dir 'verify-image-cli.mjs'); if ($LASTEXITCODE -ne 0) { throw 'Native publisher CLI fixture failed' }"
+      ],
+      "expectedResults": [
+        "The images fixtures, imagebuild fixtures and Windows generation regressions pass. The real-media imagebuild test may skip when no ISO is configured.",
+        "The CLI probe prints PASS for all twelve cases. Its build overlay replaces VM setup only for fixture invocations."
+      ],
+      "crossBuild": {
+        "status": "passed",
+        "sha": "eefe7fa77bf0d17d066eae07f48516a595515ab0",
+        "commands": [
+          {
+            "command": "GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./cmds/ownsand-agent/...",
+            "status": "passed",
+            "sha": "eefe7fa77bf0d17d066eae07f48516a595515ab0",
+            "exitCode": 0,
+            "startedAt": "2026-11-27T18:05:21Z",
+            "finishedAt": "2026-11-27T18:05:30Z",
+            "logPath": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-validate-staged-base-image/worker/.t3-tmp/validation/windows-vet.log"
+          },
+          {
+            "command": "GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o .t3-tmp/validation/ ./cmds/ownsand-agent/internal/images ./cmds/ownsand-agent/internal/imagebuild ./cmds/ownsand-agent/internal/vmruntime/hcsrt",
+            "status": "passed",
+            "sha": "eefe7fa77bf0d17d066eae07f48516a595515ab0",
+            "exitCode": 0,
+            "startedAt": "2026-11-27T18:05:30Z",
+            "finishedAt": "2026-11-27T18:05:33Z",
+            "logPath": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-validate-staged-base-image/worker/.t3-tmp/validation/windows-test-build.log"
+          },
+          {
+            "command": "GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o .t3-tmp/validation/ownsand-agent.exe ./cmds/ownsand-agent",
+            "status": "passed",
+            "sha": "eefe7fa77bf0d17d066eae07f48516a595515ab0",
+            "exitCode": 0,
+            "startedAt": "2026-11-27T18:05:33Z",
+            "finishedAt": "2026-11-27T18:05:36Z",
+            "logPath": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-validate-staged-base-image/worker/.t3-tmp/validation/windows-agent-build.log"
+          }
+        ]
+      },
+      "unmodifiedBuilder": {
+        "setup": "If the host has Hyper-V and an elevated PowerShell session is available, run these commands after the fixture commands in that session.",
+        "commands": [
+          "$agent = Join-Path $dir 'ownsand-agent.exe'; $guest = Join-Path $dir 'ownsand-guest.exe'; go build -mod=readonly -o $agent ./cmds/ownsand-agent; if ($LASTEXITCODE -ne 0) { throw 'Agent build failed' }; go build -mod=readonly -o $guest ./cmds/ownsand-guest; if ($LASTEXITCODE -ne 0) { throw 'Guest build failed' }",
+          "$state = Join-Path $dir ([guid]::NewGuid().ToString()); $canonical = Join-Path $state 'images/windows'; $metadata = Join-Path $canonical 'image.json'; $disk = Join-Path $canonical 'disk.vhdx'; New-Item -ItemType Directory -Force -Path $canonical | Out-Null; [IO.File]::WriteAllText($metadata, '{\"guest_os\":3,\"source\":\"previous\"}'); [IO.File]::WriteAllText($disk, 'previous')",
+          "$out = Join-Path $dir 'missing-iso.stdout'; $err = Join-Path $dir 'missing-iso.stderr'; & $agent image build --state-dir $state --os windows --iso (Join-Path $state 'missing.iso') --guest-binary $guest --no-color 1>$out 2>$err; $rc = $LASTEXITCODE; if ($rc -ne 1 -or (Get-Content $out -Raw) -match '(?m)^Built ' -or (Get-Content $err -Raw) -notmatch 'ISO file is not readable' -or [IO.File]::ReadAllText($disk) -ne 'previous' -or (Get-Content $metadata -Raw | ConvertFrom-Json).source -ne 'previous') { throw 'Missing-ISO run did not preserve the prior image' }"
+        ],
+        "expectedResults": [
+          "The real builder exits 1 for a missing ISO, prints no success message and preserves the entire prior fixture generation."
+        ]
+      },
+      "successfulVMBuild": {
+        "setup": "If the elevated Hyper-V host has a detached x64 ISO with an installable edition, set OWNSAND_IMAGEBUILD_TEST_ISO to its path. Run these commands after unmodifiedBuilder in the same shell. Report the build as pending with the missing prerequisite if one is unavailable.",
+        "commands": [
+          "$iso = $env:OWNSAND_IMAGEBUILD_TEST_ISO; if (-not $iso -or -not (Test-Path -LiteralPath $iso -PathType Leaf)) { throw 'A real detached x64 Windows installation ISO is required' }",
+          "$out = Join-Path $dir 'real-build.stdout'; $err = Join-Path $dir 'real-build.stderr'; & $agent image build --state-dir $state --os windows --iso $iso --guest-binary $guest --no-color 1>$out 2>$err; $rc = $LASTEXITCODE; if ($rc -ne 0 -or (Get-Content $out -Raw) -notmatch '(?m)^Built the GUEST_OS_WINDOWS base image') { throw 'Native Windows build failed' }; $meta = Get-Content $metadata -Raw | ConvertFrom-Json; if ($meta.guest_os -ne 3 -or $meta.source -eq 'previous' -or $meta.disk_bytes -le 0 -or (Get-Item -LiteralPath $disk).Length -le 8 -or (Test-Path -LiteralPath ($canonical + '.old')) -or (Test-Path -LiteralPath ($canonical + '.build'))) { throw 'Native Windows build did not publish a complete replacement' }"
+        ],
+        "expectedResults": [
+          "The Windows build boots the guest, exits 0 and prints success. The new Windows metadata and VHDX replace the prior fixture without leaving backup or staging directories."
+        ]
+      }
+    },
+    "macos": {
+      "platform": "macOS",
+      "host": "m3-16",
+      "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+      "status": "pending",
+      "setup": "Run in one unprivileged shell from the root of the exact checkout. Use native arm64 Go and Node 24. Run the first two commands, copy the probe, then run the rest.",
+      "commands": [
+        "test \"$(git rev-parse HEAD)\" = \"eefe7fa77bf0d17d066eae07f48516a595515ab0\" && test \"$(uname -m)\" = arm64",
+        "mkdir -p .t3-tmp/native-image && export TMPDIR=\"$PWD/.t3-tmp/native-image\" GOTMPDIR=\"$PWD/.t3-tmp/native-image\" COPYFILE_DISABLE=1 CGO_ENABLED=1",
+        "go test -mod=readonly -count=1 -v ./cmds/ownsand-agent/internal/images",
+        "go test -mod=readonly -c -o \"$TMPDIR/imagebuild.test\" ./cmds/ownsand-agent/internal/imagebuild && codesign --force --sign - --entitlements cmds/ownsand-agent/entitlements.plist \"$TMPDIR/imagebuild.test\" && \"$TMPDIR/imagebuild.test\" -test.v -test.run '^TestMacOSImageFirstBootShutdown$'",
+        "go test -mod=readonly -c -o \"$TMPDIR/vzrt.test\" ./cmds/ownsand-agent/internal/vmruntime/vzrt && codesign --force --sign - --entitlements cmds/ownsand-agent/entitlements.plist \"$TMPDIR/vzrt.test\" && \"$TMPDIR/vzrt.test\" -test.v -test.run '^TestMacOSBaseImageGeneration'",
+        "node \"$TMPDIR/verify-image-cli.mjs\"",
+        "go build -mod=readonly -o \"$TMPDIR/ownsand-agent\" ./cmds/ownsand-agent && codesign --force --sign - --entitlements cmds/ownsand-agent/entitlements.plist \"$TMPDIR/ownsand-agent\" && CGO_ENABLED=0 go build -mod=readonly -o \"$TMPDIR/ownsand-guest\" ./cmds/ownsand-guest",
+        "test \"$(id -u)\" != 0 && state=\"$(mktemp -d \"$TMPDIR/macos-smoke.XXXXXXXX\")\" && canonical=\"$state/images/macos\" && mkdir -p \"$canonical\" && printf '%s' '{\"guest_os\":2,\"source\":\"previous\"}' > \"$canonical/image.json\" && for name in disk.img aux.img hardware-model; do printf '%s' previous > \"$canonical/$name\"; done",
+        "rc=0; \"$TMPDIR/ownsand-agent\" image build --state-dir \"$state\" --os macos --ipsw \"$state/missing.ipsw\" --guest-binary \"$TMPDIR/ownsand-guest\" --no-color >\"$state/stdout\" 2>\"$state/stderr\" || rc=$?; test \"$rc\" -eq 1 && grep -q 'the macOS image build needs root' \"$state/stderr\" && ! grep -q '^Built ' \"$state/stdout\" && test \"$(cat \"$canonical/image.json\")\" = '{\"guest_os\":2,\"source\":\"previous\"}' && for name in disk.img aux.img hardware-model; do test \"$(cat \"$canonical/$name\")\" = previous || exit 1; done"
+      ],
+      "expectedResults": [
+        "The shared regressions pass. The signed imagebuild test passes publication after a confirmed shutdown and rejects missing aux.img while preserving the previous image. The signed source-generation tests pass.",
+        "The CLI probe prints PASS for all twelve cases. The separate unmodified agent rejects a build without root, exits 1, prints no success and preserves all prior files."
+      ],
+      "crossBuild": {
+        "status": "passed",
+        "sha": "eefe7fa77bf0d17d066eae07f48516a595515ab0",
+        "commands": [
+          {
+            "command": "GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./cmds/ownsand-agent/...",
+            "status": "passed",
+            "sha": "eefe7fa77bf0d17d066eae07f48516a595515ab0",
+            "exitCode": 0,
+            "startedAt": "2026-11-27T18:05:21Z",
+            "finishedAt": "2026-11-27T18:05:30Z",
+            "logPath": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-validate-staged-base-image/worker/.t3-tmp/validation/macos-vet.log"
+          },
+          {
+            "command": "GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go test -c -o .t3-tmp/validation/ ./cmds/ownsand-agent/internal/images ./cmds/ownsand-agent/internal/imagebuild ./cmds/ownsand-agent/internal/vmruntime/vzrt",
+            "status": "passed",
+            "sha": "eefe7fa77bf0d17d066eae07f48516a595515ab0",
+            "exitCode": 0,
+            "startedAt": "2026-11-27T18:05:30Z",
+            "finishedAt": "2026-11-27T18:05:32Z",
+            "logPath": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-validate-staged-base-image/worker/.t3-tmp/validation/macos-test-build.log"
+          },
+          {
+            "command": "GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o .t3-tmp/validation/ownsand-agent-darwin-arm64 ./cmds/ownsand-agent",
+            "status": "passed",
+            "sha": "eefe7fa77bf0d17d066eae07f48516a595515ab0",
+            "exitCode": 0,
+            "startedAt": "2026-11-27T18:05:32Z",
+            "finishedAt": "2026-11-27T18:05:35Z",
+            "logPath": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-validate-staged-base-image/worker/.t3-tmp/validation/macos-agent-build.log"
+          }
+        ],
+        "limit": "CGO_ENABLED=0 validates shared Darwin/arm64 code and stubs. The arm64 cgo Virtualization.framework builder and its native test require the macOS commands above."
+      },
+      "unavailable": [
+        "A real macOS restore and first boot require root and a supported IPSW. Those resources are unavailable on the assigned host."
+      ]
+    }
+  }
+}
