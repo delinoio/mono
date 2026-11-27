@@ -223,14 +223,13 @@ func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, 
 		}
 	}
 	sb, err := client.GetSandbox(ctx, r.SandboxID)
-	if err != nil {
-		if isCode(err, connect.CodeNotFound) {
-			e.startFailed(ctx, r, "sandbox_not_found")
-		}
-		return e.timing.SandboxPoll
-	}
 	switch {
-	case sb.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING:
+	case ctx.Err() != nil:
+		return e.timing.SandboxPoll
+	case isCode(err, connect.CodeNotFound):
+		e.startFailed(ctx, r, "sandbox_not_found")
+		return e.timing.SandboxPoll
+	case err == nil && sb.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING:
 		err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 			_, err := e.setRunnerTx(ctx, tx, r.ID, []sandrunv1.RunnerState{runCreating}, runPrep, "ownsand_device_id = $4", sb.GetDeviceId())
 			return err
@@ -239,12 +238,15 @@ func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, 
 			e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
 		}
 		return 0
-	case ownsand.IsTerminal(sb.GetState()):
+	case err == nil && ownsand.IsTerminal(sb.GetState()):
 		e.startFailed(ctx, r, "sandbox_ended_while_creating")
 		return 0
 	case e.svc.NowUTC().Sub(r.CreateTime) > e.timing.StartTimeout:
 		e.startFailed(ctx, r, "sandbox_start_timeout")
 		return 0
+	}
+	if err != nil {
+		return e.timing.SandboxPoll
 	}
 	return min(e.timing.SandboxPoll, 2*time.Second)
 }

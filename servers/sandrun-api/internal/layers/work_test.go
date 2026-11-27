@@ -1136,6 +1136,126 @@ func TestDeleteSandboxRetry(t *testing.T) {
 	}
 }
 
+func TestStartFailureAfterSandboxStatusDeadline(t *testing.T) {
+	timing := testenv.FastWorkTiming()
+	w := newWorkWorldWithTiming(t, devsession.Timing{}, &timing)
+	unavailable := connect.NewWireError(connect.CodeUnavailable, errors.New("OwnSand temporarily unavailable"))
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.StartRunning = false
+		o.GetError = unavailable
+	})
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	session := w.createSession(t, w.env.User(w.org.Member), profileID)
+	requestID := session.GetDevSessionId()
+	getRequest := func() *work.Request {
+		t.Helper()
+		req, err := w.l.Engine.GetRequest(t.Context(), w.env.DB.Pool, w.org.ID, requestID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}
+	queueTime := getRequest().QueueTime
+
+	for attempt := int32(1); attempt <= work.MaxStartAttempts; attempt++ {
+		starting := w.waitState(t, requestID, sandrunv1.RequestState_REQUEST_STATE_STARTING)
+		runnerID := starting.GetRunnerId()
+		runner := w.runner(t, runnerID)
+		if runner.GetOwnsandSandboxId() == "" {
+			t.Fatal("starting runner has no sandbox ID")
+		}
+		// Prevent replacement sandboxes while checking the result of this attempt.
+		w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateError = unavailable })
+
+		w.env.Clock.Advance(timing.StartTimeout)
+		calls := w.fake.Calls("GetSandbox")
+		eventually(t, "repeated status errors at the startup limit", func() bool {
+			return w.fake.Calls("GetSandbox") >= calls+3
+		})
+		if state := w.runner(t, runnerID).GetState(); state != sandrunv1.RunnerState_RUNNER_STATE_CREATING {
+			t.Fatalf("runner state at startup limit = %s", state)
+		}
+		if req := getRequest(); req.State != sandrunv1.RequestState_REQUEST_STATE_STARTING || req.StartAttempts != attempt {
+			t.Fatalf("request at startup limit has state %s and %d attempts, want STARTING and %d attempts", req.State, req.StartAttempts, attempt)
+		}
+		w.env.Clock.Advance(time.Millisecond)
+
+		eventually(t, "runner start failure after the status deadline", func() bool {
+			return w.runner(t, runnerID).GetState() == sandrunv1.RunnerState_RUNNER_STATE_FAILED
+		})
+		if reason := w.runner(t, runnerID).GetEndReason(); reason != sandrunv1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+			t.Fatalf("runner end reason = %s", reason)
+		}
+		eventually(t, "failed sandbox deleted and cleanup mark cleared", func() bool {
+			var pending bool
+			if err := w.env.DB.Pool.QueryRow(t.Context(), "SELECT sandbox_cleanup FROM runners WHERE runner_id = $1", runnerID).Scan(&pending); err != nil {
+				t.Fatal(err)
+			}
+			return !pending && w.fake.Active(w.osOrg) == 0
+		})
+
+		req := getRequest()
+		if req.StartAttempts != attempt || !req.QueueTime.Equal(queueTime) {
+			t.Fatalf("request has %d attempts and queue time %v, want %d and %v", req.StartAttempts, req.QueueTime, attempt, queueTime)
+		}
+		if attempt == work.MaxStartAttempts {
+			if req.State != sandrunv1.RequestState_REQUEST_STATE_FAILED || req.EndReason != sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED {
+				t.Fatalf("exhausted request state = %s, end reason = %s", req.State, req.EndReason)
+			}
+			break
+		}
+		if req.State != sandrunv1.RequestState_REQUEST_STATE_QUEUED || req.RunnerID != "" {
+			t.Fatalf("retry request state = %s, runner = %q", req.State, req.RunnerID)
+		}
+		w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateError = nil })
+	}
+}
+
+func TestStartFailureSandboxStatusBeforeDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		recovered bool
+	}{
+		{name: "recovers", recovered: true},
+		{name: "not found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWorkWorld(t, devsession.Timing{})
+			unavailable := connect.NewWireError(connect.CodeUnavailable, errors.New("OwnSand temporarily unavailable"))
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.StartRunning = false
+				o.GetError = unavailable
+			})
+			profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+			session := w.createSession(t, w.env.User(w.org.Member), profileID)
+			starting := w.waitState(t, session.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_STARTING)
+			runnerID := starting.GetRunnerId()
+			eventually(t, "sandbox status lookup", func() bool { return w.fake.Calls("GetSandbox") > 0 })
+
+			if tc.recovered {
+				w.fake.SetRunning(w.osOrg, w.runner(t, runnerID).GetOwnsandSandboxId())
+				w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.GetError = nil })
+				running := w.waitState(t, session.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_RUNNING)
+				if running.GetRunnerId() != runnerID {
+					t.Fatalf("recovered session runner = %q, want %q", running.GetRunnerId(), runnerID)
+				}
+				return
+			}
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.CreateError = unavailable
+				o.GetError = connect.NewWireError(connect.CodeNotFound, errors.New("sandbox not found"))
+			})
+			eventually(t, "runner start failure without advancing the clock", func() bool {
+				return w.runner(t, runnerID).GetState() == sandrunv1.RunnerState_RUNNER_STATE_FAILED
+			})
+			if reason := w.runner(t, runnerID).GetEndReason(); reason != sandrunv1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+				t.Fatalf("runner end reason = %s", reason)
+			}
+			w.waitState(t, session.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_QUEUED)
+		})
+	}
+}
+
 // TestStartFailureCleanupRetry: when the sandbox deletion after a start
 // failure fails, SandRun retries it until OwnSand deletes the sandbox.
 func TestStartFailureCleanupRetry(t *testing.T) {
