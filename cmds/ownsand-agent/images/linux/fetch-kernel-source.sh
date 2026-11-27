@@ -10,18 +10,13 @@
 #   downloaded. A cached archive that does not match (a truncated or corrupt
 #   file that an earlier build published) counts as a cache miss and is
 #   replaced.
-# - A download goes to a unique temporary file in the cache directory and is
-#   verified before it is published. The rename that publishes it is atomic
-#   because both paths are on one file system, so no build ever sees a
-#   partial archive, and a download that fails or does not match the checksum
-#   leaves the published path (and any valid archive there) untouched.
-# - A directory at the archive path is an error that the helper never fixes:
-#   it exits non-zero, names the path and leaves the directory, its contents
-#   and the rest of the cache untouched. A directory that appears after the
-#   check is caught after the final rename: a plain mv then moved the archive
-#   into the directory, so the helper removes that copy again and fails. It
-#   avoids mv -T, which only GNU coreutils supports (the BSD mv of macOS
-#   hosts, where the tests also run, rejects it).
+# - A download goes to a private staging directory in the cache and is
+#   verified before an atomic rename publishes it. Both paths are on one
+#   file system, so no build sees a partial archive. A failed download or
+#   checksum mismatch leaves the published path untouched.
+# - A directory at the archive path stays untouched, even if it appears
+#   during the download. The helper reports the conflict and exits nonzero.
+#   It removes its staging directory on exit, including on INT and TERM.
 #
 # The helper needs no lock: concurrent fills each publish a verified archive
 # with identical content. A lock would not help either, because flock is
@@ -39,7 +34,8 @@ sha256="$2"
 url="$3"
 cache="$4"
 
-archive="$cache/linux-$version.tar.xz"
+archive_name="linux-$version.tar.xz"
+archive="$cache/$archive_name"
 
 # Prints nothing; the exit status says whether the file has the pinned checksum.
 verify() {
@@ -59,28 +55,26 @@ if [ -e "$archive" ]; then
 fi
 
 mkdir -p "$cache"
-tmp="$(mktemp "$archive.download.XXXXXX")"
-# Remove the temporary file whatever way the helper ends, also on a signal.
-trap 'rm -f "$tmp"' EXIT
+stage="$(mktemp -d "$archive.download.XXXXXX")"
+trap 'rm -rf -- "$stage"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+tmp="$stage/$archive_name"
 
 curl -fsSL -o "$tmp" "$url"
 if ! verify "$tmp"; then
   echo "the downloaded kernel source from $url does not match SHA-256 $sha256" >&2
   exit 1
 fi
-# mktemp creates the file with mode 0600; a published archive is readable.
 chmod 0644 "$tmp"
-# When a directory appeared at $archive since the check above, mv moves $tmp
-# into it under its own name instead of replacing it. Portable mv has no
-# option to refuse that (-T is GNU only), so detect it afterwards, remove the
-# copy the move left in the directory and fail. The directory ends up as it
-# was before.
-mv -f "$tmp" "$archive"
-if [ -d "$archive" ]; then
-  rm -f "$archive/${tmp##*/}"
-  echo "the kernel source path $archive became a directory; remove it and run the build again" >&2
+# Let mv append the archive basename to the cache directory. The rename then
+# fails if the final archive path has become a directory.
+if ! mv -f -- "$tmp" "$cache/"; then
+  if [ -d "$archive" ]; then
+    echo "the kernel source path $archive became a directory; remove it and run the build again" >&2
+  else
+    echo "could not publish the kernel source $archive" >&2
+  fi
   exit 1
 fi
 echo "cached the kernel source $archive" >&2
