@@ -31,6 +31,11 @@ import (
 // keeps a read snapshot or a write for 15 minutes after its last use.
 const fileOpRetention = 15 * time.Minute
 
+const (
+	maxHeldExecsPerSandbox   = 32
+	execRejectionLogInterval = 5 * time.Second
+)
+
 // persistedExecRetention: an exec_id older than 15 minutes (plus 5 minutes
 // of tolerated clock skew) fails the admission window, so a persisted
 // exec record is needed only until 20 minutes after its exec_id time.
@@ -110,6 +115,11 @@ type execOp struct {
 	cancel context.CancelFunc
 }
 
+type execRejections struct {
+	lastWarning time.Time
+	rejected    int
+}
+
 type fileOp struct {
 	sandboxID string
 	digest    []byte
@@ -127,10 +137,11 @@ type persistedExec struct {
 
 // Dispatcher serves data path operations. It is safe for concurrent use.
 type Dispatcher struct {
-	sb     Sandboxes
-	st     *store.Store
-	logger *slog.Logger
-	now    func() time.Time
+	sb           Sandboxes
+	st           *store.Store
+	logger       *slog.Logger
+	now          func() time.Time
+	maxHeldExecs int
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -143,8 +154,9 @@ type Dispatcher struct {
 	closed bool
 	// execs are the execs with an in-memory log.
 	execs map[string]*execOp
-	// lost are exec_ids accepted by an earlier agent process; their
-	// output is gone, but they never run again.
+	// execRejections tracks capacity warnings until the sandbox ends.
+	execRejections map[string]execRejections
+	// lost remembers accepted exec IDs whose results are no longer kept.
 	lost   map[string]persistedExec
 	reads  map[string]*fileOp
 	writes map[string]*fileOp
@@ -156,6 +168,9 @@ type Dispatcher struct {
 type Options struct {
 	Now    func() time.Time
 	Logger *slog.Logger
+
+	// maxHeldExecs overrides the per-sandbox limit in tests.
+	maxHeldExecs int
 }
 
 // New returns a dispatcher and loads the exec records of an earlier agent
@@ -167,13 +182,24 @@ func New(sb Sandboxes, st *store.Store, opts Options) (*Dispatcher, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.maxHeldExecs == 0 {
+		opts.maxHeldExecs = maxHeldExecsPerSandbox
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Dispatcher{
-		sb: sb, st: st, logger: opts.Logger, now: opts.Now,
-		ctx: ctx, cancel: cancel,
-		execs: map[string]*execOp{}, lost: map[string]persistedExec{},
-		reads: map[string]*fileOp{}, writes: map[string]*fileOp{},
-		ended: map[string]time.Time{},
+		sb:             sb,
+		st:             st,
+		logger:         opts.Logger,
+		now:            opts.Now,
+		maxHeldExecs:   opts.maxHeldExecs,
+		ctx:            ctx,
+		cancel:         cancel,
+		execs:          map[string]*execOp{},
+		execRejections: map[string]execRejections{},
+		lost:           map[string]persistedExec{},
+		reads:          map[string]*fileOp{},
+		writes:         map[string]*fileOp{},
+		ended:          map[string]time.Time{},
 	}
 	var saved []persistedExec
 	if err := st.LoadExecs(&saved); err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -229,8 +255,8 @@ func (d *Dispatcher) HasRunningExec(sandboxID string) bool {
 
 // ExecEnded reports whether the exec with execID was accepted and has
 // ended, so the data plane can release a relay grant whose stream closed
-// before the exec ended. An exec of an earlier agent process counts as
-// ended; an unknown exec_id does not.
+// before the exec ended. An exec with a discarded result counts as ended
+// while its ID is still remembered.
 func (d *Dispatcher) ExecEnded(execID string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -248,6 +274,7 @@ func (d *Dispatcher) ExecEnded(execID string) bool {
 // sandbox_ended event and stops its guest forwarding.
 func (d *Dispatcher) SandboxEnded(sandboxID string, reason ownsandv1.SandboxEndReason) {
 	d.mu.Lock()
+	delete(d.execRejections, sandboxID)
 	var ops []*execOp
 	for _, e := range d.execs {
 		if e.sandboxID == sandboxID {
@@ -270,13 +297,8 @@ func (d *Dispatcher) Sweep() {
 	changed := false
 	for id, e := range d.execs {
 		if end := e.log.EndTime(); !end.IsZero() && now.Sub(end) >= execlog.Retention {
-			delete(d.execs, id)
+			d.forgetExecLocked(id, e, now)
 			d.ended[id] = now
-			// Keep the at-most-once record while the exec_id can still pass
-			// the admission window.
-			if now.Sub(e.idTime) < persistedExecRetention {
-				d.lost[id] = persistedExec{ExecID: id, SandboxID: e.sandboxID, Digest: e.digest, IDTime: e.idTime}
-			}
 			changed = true
 		}
 	}
@@ -304,6 +326,28 @@ func (d *Dispatcher) Sweep() {
 			d.logger.Warn("persist exec records failed", "error", err)
 		}
 	}
+}
+
+// forgetExecLocked discards the result of an ended exec. Keep its accepted
+// record on disk while the exec ID can still pass the admission window.
+func (d *Dispatcher) forgetExecLocked(id string, e *execOp, now time.Time) {
+	delete(d.execs, id)
+	if now.Sub(e.idTime) < persistedExecRetention {
+		d.lost[id] = persistedExec{ExecID: id, SandboxID: e.sandboxID, Digest: e.digest, IDTime: e.idTime}
+	}
+}
+
+// logExecRejectionLocked counts capacity refusals since the previous warning.
+func (d *Dispatcher) logExecRejectionLocked(sandboxID string, now time.Time) {
+	r, warned := d.execRejections[sandboxID]
+	r.rejected++
+	if !warned || now.Sub(r.lastWarning) >= execRejectionLogInterval {
+		d.logger.Warn("exec rejected at sandbox capacity", "sandbox_id", sandboxID,
+			"limit", d.maxHeldExecs, "rejected", r.rejected)
+		r.lastWarning = now
+		r.rejected = 0
+	}
+	d.execRejections[sandboxID] = r
 }
 
 // Run sweeps every 30 seconds until ctx ends.

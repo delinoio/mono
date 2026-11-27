@@ -60,18 +60,19 @@ type Fake struct {
 	// connected are the worker IDs whose worker is connected.
 	connected map[string]bool
 	// Failed and Released record the fail messages and releases by request.
-	failed        map[string]string
-	failAttempts  map[string]int
-	released      map[string]int
-	claimsN       map[string]int
-	streams       map[int]chan string
-	nextID        int
-	pages         []Page
-	listCalls     []ListCall
-	claimCalls    []string
-	blockedClaim  *blockedClaim
-	streamCursors []string
-	auth          []string
+	failed          map[string]string
+	failAttempts    map[string]int
+	releaseAttempts map[string]int
+	released        map[string]int
+	claimsN         map[string]int
+	streams         map[int]chan string
+	nextID          int
+	pages           []Page
+	listCalls       []ListCall
+	claimCalls      []string
+	blockedClaim    *blockedClaim
+	streamCursors   []string
+	auth            []string
 	// failClaimCalls makes release and fail answer 503.
 	failClaimCalls bool
 }
@@ -79,7 +80,7 @@ type Fake struct {
 // New starts a fake for a pool with one service account key.
 func New(t testing.TB, key, pool string) *Fake {
 	f := &Fake{Key: key, Pool: pool, claims: map[string]string{}, connected: map[string]bool{}, failed: map[string]string{},
-		failAttempts: map[string]int{}, released: map[string]int{}, claimsN: map[string]int{}, streams: map[int]chan string{}}
+		failAttempts: map[string]int{}, releaseAttempts: map[string]int{}, released: map[string]int{}, claimsN: map[string]int{}, streams: map[int]chan string{}}
 	f.Server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(func() {
 		f.DropStreams()
@@ -174,8 +175,11 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		id, action, _ := strings.Cut(rest, "/")
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if action == "fail" {
+		switch action {
+		case "fail":
 			f.failAttempts[id]++
+		case "release":
+			f.releaseAttempts[id]++
 		}
 		if f.failClaimCalls {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
@@ -385,6 +389,13 @@ func (f *Fake) FailAttempts(id string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.failAttempts[id]
+}
+
+// ReleaseAttempts returns the number of release calls, including rejected calls.
+func (f *Fake) ReleaseAttempts(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.releaseAttempts[id]
 }
 
 // Released returns how often the claim of a request was released.

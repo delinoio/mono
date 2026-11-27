@@ -46,6 +46,7 @@ const (
 	guestEnvArchive       = "SANDRUN_SYNC_ARCHIVE"
 	guestEnvDeletes       = "SANDRUN_SYNC_DELETE_LIST"
 	guestEnvReplaceFiles  = "SANDRUN_SYNC_REPLACE_FILE_LIST"
+	guestEnvAliasReplace  = "SANDRUN_SYNC_REPLACE_ALIAS_LIST"
 	guestEnvPrunes        = "SANDRUN_SYNC_PRUNE_LIST"
 	guestEnvAliasPrunes   = "SANDRUN_SYNC_PRUNE_ALIAS_LIST"
 	guestEnvLinks         = "SANDRUN_SYNC_LINK_LIST"
@@ -80,6 +81,16 @@ if [ -n "$SANDRUN_SYNC_STALE_MANIFEST" ]; then rm -f "$SANDRUN_SYNC_STALE_MANIFE
 mkdir -p "$SANDRUN_SYNC_WORKSPACE"
 cd "$SANDRUN_SYNC_WORKSPACE"
 if [ -n "$SANDRUN_SYNC_DELETE_LIST" ]; then xargs -0 rm -f -- < "$SANDRUN_SYNC_DELETE_LIST"; fi
+if [ -n "$SANDRUN_SYNC_REPLACE_ALIAS_LIST" ]; then
+  # Apple xargs with -0 and -x splits records even with -n 2.
+  xargs -0 -n 2 sh -c '
+    [ "$#" -eq 2 ] || exit 255
+    old=$1 incoming=$2
+    if [ ! -L "$old" ] && [ ! -L "$incoming" ] && [ -d "$old" ] && [ "$old" -ef "$incoming" ]; then
+      exit 0
+    fi
+    rm -f -- "$old"' sandrun < "$SANDRUN_SYNC_REPLACE_ALIAS_LIST"
+fi
 if [ -n "$SANDRUN_SYNC_REPLACE_FILE_LIST" ]; then
   xargs -0 sh -c 'for p do
     if [ ! -L "$p" ] && [ -d "$p" ]; then continue; fi
@@ -98,7 +109,7 @@ if [ -n "$SANDRUN_SYNC_PRUNE_ALIAS_LIST" ]; then
 fi
 if [ -n "$SANDRUN_SYNC_ARCHIVE" ]; then tar -x -m -o -f "$SANDRUN_SYNC_ARCHIVE"; fi`,
 	opCleanup: `status=0
-for f in "$SANDRUN_SYNC_ARCHIVE" "$SANDRUN_SYNC_DELETE_LIST" "$SANDRUN_SYNC_REPLACE_FILE_LIST" "$SANDRUN_SYNC_PRUNE_LIST" "$SANDRUN_SYNC_PRUNE_ALIAS_LIST"; do
+for f in "$SANDRUN_SYNC_ARCHIVE" "$SANDRUN_SYNC_DELETE_LIST" "$SANDRUN_SYNC_REPLACE_FILE_LIST" "$SANDRUN_SYNC_REPLACE_ALIAS_LIST" "$SANDRUN_SYNC_PRUNE_LIST" "$SANDRUN_SYNC_PRUNE_ALIAS_LIST"; do
   if [ -n "$f" ]; then rm -f "$f" || status=1; fi
 done
 if [ -n "$SANDRUN_SYNC_LOCK" ]; then rm -rf "$SANDRUN_SYNC_LOCK" || status=1; fi

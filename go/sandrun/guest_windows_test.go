@@ -43,7 +43,7 @@ func requireRemoved(t *testing.T, path string) {
 }
 
 func TestWindowsGuestSyncRetryFileToDirectory(t *testing.T) {
-	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", createWindowsJunction)
+	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", "top/-a with [space]", createWindowsJunction)
 }
 
 func createWindowsJunction(t *testing.T, link, target string) {

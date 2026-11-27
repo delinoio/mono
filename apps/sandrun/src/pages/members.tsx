@@ -205,7 +205,9 @@ function Invitations({
     await invalidateServices(queryClient, MemberService);
   };
   const createInvitation = useMutation(MemberService.method.createInvitation, {
-    onSuccess: refresh,
+    onSuccess: () => {
+      void refresh();
+    },
   });
   const revoke = useMutation(MemberService.method.revokeInvitation, {
     onSuccess: refresh,

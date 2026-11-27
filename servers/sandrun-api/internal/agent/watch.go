@@ -284,8 +284,8 @@ func (w *Watch) Run(ctx context.Context, session func() error) {
 }
 
 // runPoller is the agent_claims lease component: every PollInterval it
-// reconciles uncertain admissions, releases the held claims of ended
-// requests and checks whether STARTING requests took their sessions.
+// reconciles admissions, releases unused claims and claims of ended requests,
+// and checks whether STARTING requests took their sessions.
 func (h *Hub) runPoller(ctx context.Context) error {
 	t := time.NewTicker(h.timing.PollInterval)
 	defer t.Stop()

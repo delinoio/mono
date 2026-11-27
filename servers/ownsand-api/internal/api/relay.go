@@ -530,6 +530,7 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 	lastEmit := time.Now()
 	accepted := false
 	rotateAt := c.stream.Started.Add(p.Timing.Rotation)
+	creditCtx := ctx
 	for {
 		if uploadDone != nil {
 			select {
@@ -602,6 +603,9 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 					uploadDone = nil
 				}
 				accepted = true
+				var cancelCredit context.CancelFunc
+				creditCtx, cancelCredit = context.WithDeadline(ctx, rotateAt)
+				defer cancelCredit()
 				if err := relayResponseError(ctx, ev.accepted()); err != nil {
 					return err
 				}
@@ -619,9 +623,14 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 		c.frames++
 		c.bytes += datapath.FrameCost(f)
 		lastEmit = now
-		c.stream.Consumed(ctx, f)
+		// Returning credit can wait for room on the agent connection. Use
+		// the rotation deadline once the agent has accepted the request.
+		c.stream.Consumed(creditCtx, f)
 		if terminal {
-			return nil
+			return nil // the caller already received the final event
+		}
+		if creditCtx.Err() != nil {
+			return ctx.Err() // preserve caller cancellation or return OK at rotation
 		}
 	}
 }

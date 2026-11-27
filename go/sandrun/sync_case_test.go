@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -128,5 +130,63 @@ func testSyncDirectoryAliasReplacement(t *testing.T, osys sandrunv1.GuestOs, old
 				t.Fatalf("temporary files after sync: %v, glob error: %v", matches, err)
 			}
 		})
+	}
+}
+
+func TestSplitSyncDeletionsCaseOnlyReplacement(t *testing.T) {
+	deleted := []string{"Assets", "Assets/Subdir", "Exact", "Same-File", "unrelated"}
+	changed := []localFile{{rel: "assets/subdir/new"}, {rel: "Exact/new"}, {rel: "same-file"}}
+	exact := []string{"Exact"}
+	for _, matchAliases := range []bool{false, true} {
+		wantStrict := deleted[:2]
+		var wantAliases []string
+		if matchAliases {
+			wantStrict = nil
+			wantAliases = []string{"Assets", "assets", "Assets/Subdir", "assets/subdir"}
+		}
+		wantStrict = append(slices.Clone(wantStrict), "Same-File", "unrelated")
+		strict, replaced, aliases := splitSyncDeletions(deleted, changed, matchAliases)
+		if !slices.Equal(strict, wantStrict) || !slices.Equal(replaced, exact) || !slices.Equal(aliases, wantAliases) {
+			t.Fatalf("splitSyncDeletions(matchAliases=%t) = %q, %q, %q; want %q, %q, %q", matchAliases, strict, replaced, aliases, wantStrict, exact, wantAliases)
+		}
+	}
+}
+
+func TestSyncCaseOnlyReplacementApplyAliasRecords(t *testing.T) {
+	needPOSIX(t)
+	root := t.TempDir()
+	ws := filepath.Join(root, "work")
+	oldDir := "-Assets\n'"
+	oldFile := "-File\n'"
+	if err := os.MkdirAll(filepath.Join(ws, oldDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(ws, oldDir, "guest.txt")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, oldFile), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A spelling with ./ resolves to the same entry on case-sensitive volumes too.
+	list := filepath.Join(root, "replace-alias")
+	if err := os.WriteFile(list, pathList([]string{oldDir, "./" + oldDir, oldFile, "./" + oldFile}, false), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args, err := guestCommand(sandrunv1.GuestOs_GUEST_OS_MACOS, opApply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), args[0], args[1:]...)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), guestEnvWorkspace + "=" + ws, guestEnvAliasReplace + "=" + list}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("apply alias replacements: %v: %s", err, out)
+	}
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "keep" {
+		t.Fatalf("guest-only file = %q, %v", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(ws, oldFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("former file was not removed, stat returned %v", err)
 	}
 }

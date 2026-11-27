@@ -219,7 +219,11 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	if p.Force {
 		force = "1"
 	}
+	windows := osys == sandrunv1.GuestOs_GUEST_OS_WINDOWS
 	cleanupEnv := map[string]string{guestEnvLock: lock}
+	if !windows {
+		cleanupEnv[guestEnvAliasReplace] = ""
+	}
 	lr, err := c.runGuest(ctx, s, opLock, map[string]string{
 		guestEnvLock: lock, guestEnvForce: force, guestEnvWorkspace: s.GetWorkspacePath(),
 	})
@@ -278,7 +282,6 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	if err != nil {
 		return nil, err
 	}
-	windows := osys == sandrunv1.GuestOs_GUEST_OS_WINDOWS
 	applyEnv := map[string]string{
 		guestEnvWorkspace: s.GetWorkspacePath(), guestEnvStaleManifest: "",
 		guestEnvArchive: "", guestEnvDeletes: "", guestEnvReplaceFiles: "",
@@ -321,7 +324,10 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 			return nil, err
 		}
 	}
-	strictDeletes, replacedFiles := splitSyncDeletions(deleted, changed)
+	strictDeletes, replacedFiles, aliasReplacements := splitSyncDeletions(deleted, changed, osys == sandrunv1.GuestOs_GUEST_OS_MACOS)
+	if !windows {
+		applyEnv[guestEnvAliasReplace] = ""
+	}
 	prunes, aliasPrunes := pruneDirs(deleted, changed, osys)
 	for _, list := range []struct {
 		suffix string
@@ -329,6 +335,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		paths  []string
 	}{
 		{".delete", guestEnvDeletes, strictDeletes},
+		{".replace-alias", guestEnvAliasReplace, aliasReplacements},
 		{".replace", guestEnvReplaceFiles, replacedFiles},
 		{".prune", guestEnvPrunes, prunes},
 		{".prune-alias", guestEnvAliasPrunes, aliasPrunes},
@@ -590,27 +597,38 @@ func pathList(paths []string, windows bool) []byte {
 	return b.Bytes()
 }
 
-// splitSyncDeletions separates former files that incoming paths need
-// as directories. If the manifest write failed after apply, those paths may
-// already be directories and must stay in place when the SDK retries.
-func splitSyncDeletions(deleted []string, changed []localFile) (strict, replacedFiles []string) {
+// splitSyncDeletions separates former files that incoming paths need as
+// directories. Alias records carry both spellings so the guest can check
+// whether it is safe to keep a directory created before a failed manifest write.
+func splitSyncDeletions(deleted []string, changed []localFile, matchAliases bool) (strict, replacedFiles, aliases []string) {
 	if len(deleted) == 0 || len(changed) == 0 {
-		return deleted, nil
+		return deleted, nil, nil
 	}
-	parents := map[string]bool{}
+	key := func(p string) string { return p }
+	if matchAliases {
+		key = foldCase
+	}
+	parents := map[string]string{}
 	for _, f := range changed {
-		for dir := path.Dir(f.rel); dir != "." && !parents[dir]; dir = path.Dir(dir) {
-			parents[dir] = true
+		for dir := path.Dir(f.rel); dir != "."; dir = path.Dir(dir) {
+			k := key(dir)
+			if _, ok := parents[k]; ok {
+				break
+			}
+			parents[k] = dir
 		}
 	}
 	for _, rel := range deleted {
-		if parents[rel] {
-			replacedFiles = append(replacedFiles, rel)
-		} else {
+		switch incoming := parents[key(rel)]; incoming {
+		case "":
 			strict = append(strict, rel)
+		case rel:
+			replacedFiles = append(replacedFiles, rel)
+		default:
+			aliases = append(aliases, rel, incoming)
 		}
 	}
-	return strict, replacedFiles
+	return strict, replacedFiles, aliases
 }
 
 // pruneDirs lists the directories to remove after the deletions and before

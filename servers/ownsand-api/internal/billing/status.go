@@ -334,6 +334,15 @@ func remoteOrganization(r *accountsv1.OrganizationBillingStatus) (string, bool) 
 // sync time and can fill a missing remote block start for the same interval.
 // It returns the change and whether a newer status was applied.
 func ApplyRemoteTx(ctx context.Context, tx pgx.Tx, r *accountsv1.OrganizationBillingStatus, source string, now time.Time) (Change, bool, error) {
+	change, _, err := applyRemoteTx(ctx, tx, r, source, now)
+	return change, change.OrganizationID != "", err
+}
+
+// applyRemoteTx applies a status to a matching cached link. An equal
+// sequence refreshes the sync time and can fill a missing remote block
+// start. The deferred result tells the poll
+// that a matching first link can still complete.
+func applyRemoteTx(ctx context.Context, tx pgx.Tx, r *accountsv1.OrganizationBillingStatus, source string, now time.Time) (Change, bool, error) {
 	orgID, ok := remoteOrganization(r)
 	if !ok {
 		return Change{}, false, nil
@@ -341,6 +350,17 @@ func ApplyRemoteTx(ctx context.Context, tx pgx.Tx, r *accountsv1.OrganizationBil
 	st, ok, err := LoadStatus(ctx, tx, orgID, true)
 	if err != nil || !ok {
 		return Change{}, false, err
+	}
+	if source == SourcePoll && !st.Linked() {
+		// Beginning and completing a link both lock the billing row. Read
+		// the attempt without taking its lock, which completion can already
+		// hold while waiting for this row. A deadline can pass before the
+		// attempt is released, removed or taken over.
+		var deferred bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM billing_pending_unlinks
+			WHERE organization_id = $1 AND billing_account_id::text = lower($2)
+			AND link_attempt_id IS NOT NULL AND link_call_deadline IS NOT NULL)`, orgID, r.GetBillingAccountId()).Scan(&deferred)
+		return Change{}, deferred, err
 	}
 	if !st.Linked() || !strings.EqualFold(st.BillingAccountID, r.GetBillingAccountId()) || r.GetSequence() < st.Sequence {
 		return Change{}, false, nil
@@ -366,7 +386,7 @@ func ApplyRemoteTx(ctx context.Context, tx pgx.Tx, r *accountsv1.OrganizationBil
 		return Change{}, false, err
 	}
 	return Change{OrganizationID: orgID, BillingAccountID: next.BillingAccountID, From: st.Confirmed(now), To: next.Confirmed(now),
-		Linked: true, BlockedSince: next.BlockedSince, Source: source}, true, nil
+		Linked: true, BlockedSince: next.BlockedSince, Source: source}, false, nil
 }
 
 // LinkTx records the link of the organization to billingAccountID with the
