@@ -3280,6 +3280,191 @@ describe("peer-to-peer data path", () => {
       }
     });
 
+    describe("closing a peer exec with queued events", () => {
+      const command = ["x"];
+      const execId = "0192f4b6-8000-7000-8000-000000000001";
+
+      function bufferedAgent(offset = 0): FakeAgent {
+        return (frame, peer) => {
+          if (
+            frame.kind !== DataFrameKind.EXEC_REQUEST &&
+            frame.kind !== DataFrameKind.EXEC_ATTACH_REQUEST
+          ) {
+            return;
+          }
+          execEvent(peer, frame.streamId, ev.started());
+          execEvent(peer, frame.streamId, ev.stdout(offset, "x"));
+          execEvent(peer, frame.streamId, ev.exited(0));
+        };
+      }
+
+      for (const [route, transport] of [
+        ["automatic", undefined],
+        ["forced peer", DataPathTransport.PEER_TO_PEER],
+      ] as const) {
+        for (const operation of ["exec", "attachExec"] as const) {
+          test(`${route} ${operation} rejects the next read and wait after close`, async () => {
+            const { h } = p2pSetup(bufferedAgent(), { transport });
+            const sandbox = h.client.sandbox(SANDBOX);
+            const handle =
+              operation === "exec"
+                ? sandbox.exec({ command })
+                : sandbox.attachExec(execId);
+            const events = handle[Symbol.asyncIterator]();
+            expect((await h.clock.run(events.next())).value).toMatchObject({
+              type: ExecEventType.Started,
+            });
+            await h.clock.settle();
+
+            sandbox.close();
+
+            await expect(h.clock.run(events.next())).rejects.toBeInstanceOf(
+              OwnSandHandleClosedError,
+            );
+            await expect(h.clock.run(handle.wait())).rejects.toBeInstanceOf(
+              OwnSandHandleClosedError,
+            );
+            expect(handle.transport).toBe(DataPathTransport.PEER_TO_PEER);
+            expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+          });
+        }
+      }
+
+      test("an open peer exec delivers the same output and exit result", async () => {
+        const { h } = p2pSetup(bufferedAgent());
+        const result = await h.clock.run(
+          h.client.sandbox(SANDBOX).run({ command }),
+        );
+        expect(text(result.stdout)).toBe("x");
+        expect(result.result).toMatchObject({
+          kind: ExecResultKind.Exited,
+          exitCode: 0n,
+        });
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
+
+      test("wait rejects after a successful delete with output and exit queued", async () => {
+        const { h } = p2pSetup(bufferedAgent());
+        h.api.unary(SandboxService, "DeleteSandbox", (req) => ({
+          sandbox: { sandboxId: req.sandboxId },
+        }));
+        const sandbox = h.client.sandbox(SANDBOX);
+        const handle = sandbox.exec({ command });
+        const events = handle[Symbol.asyncIterator]();
+        await h.clock.run(events.next());
+        await h.clock.run(sandbox.delete());
+
+        await expect(h.clock.run(handle.wait())).rejects.toBeInstanceOf(
+          OwnSandHandleClosedError,
+        );
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
+
+      test.each(["before", "after"] as const)(
+        "a close %s reading Started suppresses events from a retired session",
+        async (readStarted) => {
+          const { h, rtc } = p2pSetup(bufferedAgent());
+          const sandbox = h.client.sandbox(SANDBOX);
+          const handle = sandbox.exec({ command });
+          const events = handle[Symbol.asyncIterator]();
+          if (readStarted === "after") {
+            expect((await h.clock.run(events.next())).value).toMatchObject({
+              type: ExecEventType.Started,
+            });
+          }
+          await h.clock.advance(1_000);
+          expect(rtc.frames).toHaveLength(1);
+          rtc.peers[0]!.endSession(SessionEndReason.EXPIRED);
+          await h.clock.settle();
+          await h.clock.run(sandbox.exec({ command }).wait());
+          expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+
+          sandbox.close();
+
+          await expect(h.clock.run(events.next())).rejects.toBeInstanceOf(
+            OwnSandHandleClosedError,
+          );
+          await expect(h.clock.run(handle.wait())).rejects.toBeInstanceOf(
+            OwnSandHandleClosedError,
+          );
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        },
+      );
+
+      test("a close suppresses a chunk retained across an output-gap event", async () => {
+        const { h } = p2pSetup(bufferedAgent(4));
+        const sandbox = h.client.sandbox(SANDBOX);
+        const handle = sandbox.exec({ command });
+        const events = handle[Symbol.asyncIterator]();
+        await h.clock.run(events.next());
+        expect((await h.clock.run(events.next())).value).toMatchObject({
+          type: ExecEventType.OutputTruncated,
+        });
+
+        sandbox.close();
+
+        await expect(h.clock.run(events.next())).rejects.toBeInstanceOf(
+          OwnSandHandleClosedError,
+        );
+        await expect(h.clock.run(handle.wait())).rejects.toBeInstanceOf(
+          OwnSandHandleClosedError,
+        );
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
+
+      test("the caller abort reason takes precedence over closure", async () => {
+        const { h } = p2pSetup(bufferedAgent());
+        const sandbox = h.client.sandbox(SANDBOX);
+        const caller = new AbortController();
+        const handle = sandbox.attachExec(execId, {
+          signal: caller.signal,
+        });
+        const events = handle[Symbol.asyncIterator]();
+        await h.clock.run(events.next());
+        await h.clock.settle();
+
+        sandbox.close();
+        caller.abort(null);
+
+        await expect(h.clock.run(events.next())).rejects.toBe(null);
+        await expect(h.clock.run(handle.wait())).rejects.toBe(null);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
+
+      test("a channel failure on an open handle drains output before recovering", async () => {
+        const { h, rtc } = p2pSetup((frame, peer) => {
+          if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+            execEvent(peer, frame.streamId, ev.started());
+            execEvent(peer, frame.streamId, ev.stdout(0, "x"));
+          }
+        });
+        h.api.stream(RelayService, "AttachExec", function* (req) {
+          expect(req.stdoutOffset).toBe(1n);
+          yield attachMsg(ev.accepted());
+          yield attachMsg(ev.exited(0));
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const handle = sandbox.exec({ command });
+        const events = handle[Symbol.asyncIterator]();
+        await h.clock.run(events.next());
+        await h.clock.settle();
+
+        rtc.peers[0]!.fail();
+
+        expect((await h.clock.run(events.next())).value).toMatchObject({
+          type: ExecEventType.Stdout,
+          data: new TextEncoder().encode("x"),
+        });
+        expect(await h.clock.run(handle.wait())).toMatchObject({
+          kind: ExecResultKind.Exited,
+          exitCode: 0n,
+        });
+        expect(handle.transport).toBe(DataPathTransport.RELAY);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+        expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+      });
+    });
+
     describe("an operation in flight at the close", () => {
       /** Accepts every request and never finishes it. */
       const hanging: FakeAgent = (frame, peer) => {

@@ -56,7 +56,7 @@ export class DataPathSelector {
   #session: PeerSession | undefined;
   #setup: SessionSetup | undefined;
   #onRelay: boolean;
-  #closed = false;
+  readonly #peerClose = new AbortController();
 
   constructor(
     ctx: OperationContext,
@@ -77,6 +77,11 @@ export class DataPathSelector {
       : DataPathTransport.PEER_TO_PEER;
   }
 
+  /** Ends work on any peer session of this handle, even a retired one. */
+  get peerCloseSignal(): AbortSignal {
+    return this.#peerClose.signal;
+  }
+
   /**
    * Returns the peer session to use, or undefined for the relay. Concurrent
    * callers share one session setup. The setup has its own abort signal, so
@@ -92,9 +97,7 @@ export class DataPathSelector {
     if (this.#onRelay) {
       return undefined;
     }
-    if (this.#closed) {
-      throw new OwnSandHandleClosedError();
-    }
+    throwIfAborted(this.peerCloseSignal);
     if (this.#session !== undefined && !this.#session.closed) {
       return this.#session;
     }
@@ -191,14 +194,12 @@ export class DataPathSelector {
   async #open(signal: AbortSignal): Promise<PeerSession | undefined> {
     try {
       const session = await PeerSession.open(this.#ctx, this.#Peer!, signal);
-      if (signal.aborted || this.#closed) {
+      if (signal.aborted || this.peerCloseSignal.aborted) {
         // The setup finished at the moment that its last caller aborted or
         // the handle closed. The close aborts the setup signal too; the
-        // `#closed` check is a second guard so a session never outlives it.
+        // handle close check is a second guard so a session never outlives it.
         session.close();
-        throw this.#closed && !signal.aborted
-          ? new OwnSandHandleClosedError()
-          : signal.reason;
+        throw signal.aborted ? signal.reason : this.peerCloseSignal.reason;
       }
       this.#session = session;
       this.#log(DataPathTransport.PEER_TO_PEER);
@@ -249,9 +250,7 @@ export class DataPathSelector {
    * old session, and an automatic handle still moves to the relay.
    */
   peerFailed(cause: unknown, session?: PeerSession): void {
-    if (this.#closed) {
-      throw new OwnSandHandleClosedError();
-    }
+    throwIfAborted(this.peerCloseSignal);
     if (session === undefined || this.#session === session) {
       this.#session?.close();
       this.#session = undefined;
@@ -286,10 +285,12 @@ export class DataPathSelector {
    * with the same error. It is idempotent and also works with no session.
    */
   close(): void {
-    this.#closed = true;
+    if (this.peerCloseSignal.aborted) return;
+    const reason = new OwnSandHandleClosedError();
+    this.#peerClose.abort(reason);
     const setup = this.#setup;
     this.#setup = undefined;
-    setup?.controller.abort(new OwnSandHandleClosedError());
+    setup?.controller.abort(reason);
     this.#session?.close();
     this.#session = undefined;
   }

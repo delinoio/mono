@@ -228,6 +228,8 @@ export class Sandbox {
       ),
       this.#selector,
       hold,
+      false,
+      options.signal,
     );
   }
 

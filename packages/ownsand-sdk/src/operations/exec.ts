@@ -104,6 +104,12 @@ export interface ExecPlan {
   stderrOffset: bigint;
 }
 
+/** Carries the attempt's transport through the async iterator to the reader. */
+interface ExecDelivery<T> {
+  value: T;
+  peer: boolean;
+}
+
 enum Mode {
   Exec = "exec",
   Attach = "attach",
@@ -122,7 +128,7 @@ export async function* runExec(
   plan: ExecPlan,
   signal: AbortSignal | undefined,
   hold?: ConsumerHold,
-): AsyncGenerator<ExecStreamEvent, ExecResult> {
+): AsyncGenerator<ExecDelivery<ExecStreamEvent>, ExecDelivery<ExecResult>> {
   const request = plan.request;
   const attachOnly = request === undefined;
   const grants = new GrantKeeper(
@@ -152,9 +158,10 @@ export async function* runExec(
    */
   const resumeFromPause = async (
     cause: unknown,
+    attemptSignal: AbortSignal | undefined,
   ): Promise<ExecResult | undefined> => {
     window.end();
-    const waited = await waitForSandboxToResume(ctx, signal);
+    const waited = await waitForSandboxToResume(ctx, attemptSignal);
     if (!waited.resumed) {
       return {
         kind: ExecResultKind.SandboxEnded,
@@ -187,6 +194,21 @@ export async function* runExec(
     throwIfAborted(signal);
     const session = await selector.select(signal);
     const onRelay = session === undefined;
+    const peerClose = onRelay ? undefined : selector.peerCloseSignal;
+    const attemptSignal =
+      signal !== undefined && peerClose !== undefined
+        ? AbortSignal.any([signal, peerClose])
+        : (peerClose ?? signal);
+    const checkPeer = () => {
+      if (peerClose === undefined) return;
+      throwIfAborted(signal);
+      throwIfAborted(peerClose);
+    };
+    const deliverEvent = (value: ExecStreamEvent) => ({
+      value,
+      peer: !onRelay,
+    });
+    const deliverResult = (value: ExecResult) => ({ value, peer: !onRelay });
     let events: AsyncIterable<ExecEvent | undefined>;
     if (onRelay) {
       let grantId: string;
@@ -230,7 +252,7 @@ export async function* runExec(
         mode === Mode.Exec
           ? { case: "execRequest", value: request! }
           : { case: "execAttachRequest", value: attachRequest() },
-        signal,
+        attemptSignal,
       );
     }
 
@@ -240,6 +262,7 @@ export async function* runExec(
     let failure: unknown;
     try {
       for await (const event of events) {
+        checkPeer();
         const e = event?.event;
         switch (e?.case) {
           case "accepted":
@@ -249,7 +272,10 @@ export async function* runExec(
           case "started":
             if (!started) {
               started = true;
-              yield { type: ExecEventType.Started, execId: plan.execId };
+              yield deliverEvent({
+                type: ExecEventType.Started,
+                execId: plan.execId,
+              });
             }
             break;
           case "outputTruncated": {
@@ -265,7 +291,11 @@ export async function* runExec(
               complete = false;
               if (stdout) stdoutNext = stdout.end;
               if (stderr) stderrNext = stderr.end;
-              yield { type: ExecEventType.OutputTruncated, stdout, stderr };
+              yield deliverEvent({
+                type: ExecEventType.OutputTruncated,
+                stdout,
+                stderr,
+              });
             }
             break;
           }
@@ -278,12 +308,13 @@ export async function* runExec(
               // Output between the delivered offset and this chunk is gone;
               // report it instead of presenting the output as complete.
               complete = false;
-              yield {
+              yield deliverEvent({
                 type: ExecEventType.OutputTruncated,
                 stdout: isStdout ? { start: next, end: offset } : undefined,
                 stderr: isStdout ? undefined : { start: next, end: offset },
-              };
+              });
               throwIfAborted(signal);
+              throwIfAborted(peerClose);
             }
             const end = offset + BigInt(data.length);
             const from = offset > next ? offset : next;
@@ -294,16 +325,16 @@ export async function* runExec(
             if (isStdout) stdoutNext = end;
             else stderrNext = end;
             window.end();
-            yield {
+            yield deliverEvent({
               type: isStdout ? ExecEventType.Stdout : ExecEventType.Stderr,
               offset: from,
               data: fresh,
-            };
+            });
             break;
           }
           case "exited":
             window.end();
-            return {
+            return deliverResult({
               kind: ExecResultKind.Exited,
               exitCode:
                 e.value.status.case === "exitCode"
@@ -315,22 +346,22 @@ export async function* runExec(
                   : undefined,
               timedOut: e.value.timedOut,
               complete,
-            };
+            });
           case "failed":
             window.end();
-            return {
+            return deliverResult({
               kind: ExecResultKind.Failed,
               reason: e.value.reason,
               message: e.value.message,
               complete,
-            };
+            });
           case "sandboxEnded":
             window.end();
-            return {
+            return deliverResult({
               kind: ExecResultKind.SandboxEnded,
               reason: e.value.reason,
               complete,
-            };
+            });
           case "paused":
             paused = true;
             break;
@@ -347,13 +378,14 @@ export async function* runExec(
         // resume or end.
         window.end();
         if (onRelay) grants.streamEnded();
-        const waited = await waitForSandboxToResume(ctx, signal);
+        const waited = await waitForSandboxToResume(ctx, attemptSignal);
+        checkPeer();
         if (!waited.resumed) {
-          return {
+          return deliverResult({
             kind: ExecResultKind.SandboxEnded,
             reason: waited.reason,
             complete,
-          };
+          });
         }
         mode = Mode.Attach;
         continue;
@@ -374,6 +406,7 @@ export async function* runExec(
     }
 
     throwIfAborted(signal);
+    throwIfAborted(peerClose);
     if (failure instanceof SessionEndedError) {
       if (session !== undefined) selector.sessionEnded(session);
       mode = Mode.Attach;
@@ -397,9 +430,10 @@ export async function* runExec(
       // request (the same exec_id makes this safe).
       let current;
       try {
-        current = await sandboxStateWithin(ctx, signal, window);
+        current = await sandboxStateWithin(ctx, attemptSignal, window);
       } catch (error) {
         throwIfAborted(signal);
+        throwIfAborted(peerClose);
         if (error instanceof RecoveryDeadlineError) {
           // The lookup outlasted the recovery window: end with the window's
           // last relay failure and send no further request.
@@ -407,18 +441,21 @@ export async function* runExec(
         }
         current = undefined;
       }
+      checkPeer();
       if (current?.state === SandboxState.PAUSED) {
-        const ended = await resumeFromPause(failure);
-        if (ended !== undefined) return ended;
+        const ended = await resumeFromPause(failure, attemptSignal).finally(
+          checkPeer,
+        );
+        if (ended !== undefined) return deliverResult(ended);
       } else if (
         current?.state === SandboxState.DELETED ||
         current?.state === SandboxState.FAILED
       ) {
-        return {
+        return deliverResult({
           kind: ExecResultKind.SandboxEnded,
           reason: current.endReason,
           complete,
-        };
+        });
       }
       resending = true;
       mode = Mode.Exec;
@@ -438,14 +475,18 @@ export async function* runExec(
       // error.
       let current;
       try {
-        current = await sandboxStateWithin(ctx, signal, window);
+        current = await sandboxStateWithin(ctx, attemptSignal, window);
       } catch {
         throwIfAborted(signal);
+        throwIfAborted(peerClose);
         current = undefined;
       }
+      checkPeer();
       if (current?.state === SandboxState.PAUSED) {
-        const ended = await resumeFromPause(failure);
-        if (ended !== undefined) return ended;
+        const ended = await resumeFromPause(failure, attemptSignal).finally(
+          checkPeer,
+        );
+        if (ended !== undefined) return deliverResult(ended);
         mode = Mode.Exec;
         continue;
       }
@@ -453,16 +494,18 @@ export async function* runExec(
         current?.state === SandboxState.DELETED ||
         current?.state === SandboxState.FAILED
       ) {
-        return {
+        return deliverResult({
           kind: ExecResultKind.SandboxEnded,
           reason: current.endReason,
           complete,
-        };
+        });
       }
     }
     if (onRelay) grants.discardFor(failure);
     lastRelayFailure = failure;
-    await recoverOrThrow(ctx, window, failure, signal);
+    await recoverOrThrow(ctx, window, failure, attemptSignal).finally(
+      checkPeer,
+    );
     mode = Mode.Attach;
   }
 }
@@ -486,7 +529,11 @@ async function* mapEvents(
  */
 export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
   readonly execId: string;
-  readonly #generator: AsyncGenerator<ExecStreamEvent, ExecResult | undefined>;
+  readonly #generator: AsyncGenerator<
+    ExecDelivery<ExecStreamEvent>,
+    ExecDelivery<ExecResult> | undefined
+  >;
+  readonly #callerSignal: AbortSignal | undefined;
   readonly #selector: DataPathSelector;
   readonly #hold: ConsumerHold | undefined;
   #iterated = false;
@@ -506,10 +553,14 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
   #primed:
     | {
         readonly read: Promise<
-          | { readonly next: IteratorResult<ExecStreamEvent, ExecResult> }
+          | {
+              readonly next: IteratorResult<
+                ExecDelivery<ExecStreamEvent>,
+                ExecDelivery<ExecResult>
+              >;
+            }
           | { readonly error: unknown }
         >;
-        readonly callerSignal: AbortSignal | undefined;
       }
     | undefined;
 
@@ -524,7 +575,10 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
    */
   constructor(
     execId: string,
-    generator: AsyncGenerator<ExecStreamEvent, ExecResult>,
+    generator: AsyncGenerator<
+      ExecDelivery<ExecStreamEvent>,
+      ExecDelivery<ExecResult>
+    >,
     selector: DataPathSelector,
     hold?: ConsumerHold,
     startNow = false,
@@ -534,13 +588,13 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
     this.execId = execId;
     this.#generator = generator;
     this.#selector = selector;
+    this.#callerSignal = callerSignal;
     if (startNow) {
       this.#primed = {
         read: generator.next().then(
           (next) => ({ next }),
           (error: unknown) => ({ error }),
         ),
-        callerSignal,
       };
     }
   }
@@ -626,7 +680,11 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
     if (this.#failure !== undefined && this.#result === undefined) {
       throw this.#failure.error;
     }
-    let next: IteratorResult<ExecStreamEvent, ExecResult | undefined>;
+    let next: IteratorResult<
+      ExecDelivery<ExecStreamEvent>,
+      ExecDelivery<ExecResult> | undefined
+    >;
+    let fromPrime = false;
     try {
       const primed = this.#primed;
       if (primed !== undefined) {
@@ -634,21 +692,19 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
         // reader, so the idle clock pauses until the reader asks for more.
         this.#hold?.claim();
         const settled = await primed.read;
-        // Readers wait for the same first read. Only the first reader can
-        // take the cached event or close the stream and record cancellation.
+        // Readers wait for the same first read. Only the first reader takes it.
         if (this.#primed === primed) {
           this.#primed = undefined;
           if ("error" in settled) throw settled.error;
-          if (!settled.next.done && primed.callerSignal?.aborted) {
-            this.#failure = { error: primed.callerSignal.reason };
-            await this.#generator.return(undefined);
-            throw this.#failure.error;
-          }
-          return settled.next;
+          next = settled.next;
+          fromPrime = true;
+        } else {
+          if (this.#failure !== undefined) throw this.#failure.error;
+          next = await this.#generator.next();
         }
-        if (this.#failure !== undefined) throw this.#failure.error;
+      } else {
+        next = await this.#generator.next();
       }
-      next = await this.#generator.next();
     } catch (error) {
       this.#failure ??= { error };
       throw this.#failure.error;
@@ -660,7 +716,24 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
     ) {
       throw this.#failure.error;
     }
-    return next;
+
+    // The producer can already have yielded into an eager read or finished
+    // its await. Apply the close check before this reader receives that value.
+    const peer = next.value?.peer === true;
+    try {
+      if (peer || (fromPrime && !next.done)) {
+        throwIfAborted(this.#callerSignal);
+      }
+      if (peer) throwIfAborted(this.#selector.peerCloseSignal);
+    } catch (error) {
+      // Record the rejection before cleanup so concurrent reads see it.
+      this.#failure ??= { error };
+      await this.#generator.return(undefined).catch(() => {});
+      throw this.#failure.error;
+    }
+    return next.done
+      ? { done: true, value: next.value?.value }
+      : { done: false, value: next.value.value };
   }
 }
 
