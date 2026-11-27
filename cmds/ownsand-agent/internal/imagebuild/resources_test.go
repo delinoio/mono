@@ -4,7 +4,10 @@ package imagebuild
 
 import (
 	"context"
+	"errors"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -64,22 +67,61 @@ func TestValidateResources(t *testing.T) {
 	}
 }
 
-// TestBuildRejectsOversizedResources checks the programmatic entry point: the
-// check runs before the guest OS is dispatched, so no host is needed. The vCPU
-// count is an int32 there and cannot exceed its limit.
+// TestBuildRejectsOversizedResources checks that the programmatic entry point
+// rejects oversized disk and memory values before creating image state. The
+// vCPU count is an int32 there and cannot exceed its limit.
 func TestBuildRejectsOversizedResources(t *testing.T) {
-	for _, guest := range []ownsandv1.GuestOs{ownsandv1.GuestOs_GUEST_OS_MACOS, ownsandv1.GuestOs_GUEST_OS_WINDOWS} {
-		dir := t.TempDir()
-		for name, opts := range map[string]Options{
-			"--disk-gib":   {DiskGiB: MaxDiskGiB + 1},
-			"--memory-mib": {MemoryMiB: MaxMemoryMiB + 1},
-		} {
-			opts.ImagesDir = dir
-			opts.GuestOS = guest
-			err := Build(context.Background(), opts)
-			if err == nil || !strings.Contains(err.Error(), name) {
-				t.Fatalf("%v %s: Build error = %v", guest, name, err)
+	guests := []struct {
+		name string
+		os   ownsandv1.GuestOs
+	}{
+		{name: "macos", os: ownsandv1.GuestOs_GUEST_OS_MACOS},
+		{name: "windows", os: ownsandv1.GuestOs_GUEST_OS_WINDOWS},
+	}
+	resources := []struct {
+		flag string
+		opts Options
+	}{
+		{flag: "--disk-gib", opts: Options{DiskGiB: MaxDiskGiB + 1}},
+		{flag: "--memory-mib", opts: Options{MemoryMiB: MaxMemoryMiB + 1}},
+	}
+	for _, guest := range guests {
+		for _, resource := range resources {
+			checkBuildError := func(t *testing.T, imagesDir string) {
+				t.Helper()
+				opts := resource.opts
+				opts.ImagesDir = imagesDir
+				opts.GuestOS = guest.os
+				err := Build(context.Background(), opts)
+				if err == nil || !strings.Contains(err.Error(), resource.flag) {
+					t.Errorf("Build error = %v, want %q", err, resource.flag)
+				}
 			}
+			t.Run(guest.name+"/"+resource.flag+"/missing images directory", func(t *testing.T) {
+				imagesDir := filepath.Join(t.TempDir(), "images")
+				checkBuildError(t, imagesDir)
+				if _, err := os.Lstat(imagesDir); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("Lstat(%q) = %v, want path not found", imagesDir, err)
+				}
+			})
+			t.Run(guest.name+"/"+resource.flag+"/empty images directory", func(t *testing.T) {
+				imagesDir := filepath.Join(t.TempDir(), "images")
+				if err := os.Mkdir(imagesDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				checkBuildError(t, imagesDir)
+				lockPath := filepath.Join(imagesDir, guest.name+".build.lock")
+				if _, err := os.Lstat(lockPath); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("Lstat(%q) = %v, want path not found", lockPath, err)
+				}
+				entries, err := os.ReadDir(imagesDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(entries) != 0 {
+					t.Errorf("images directory entries = %v, want empty", entries)
+				}
+			})
 		}
 	}
 }
