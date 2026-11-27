@@ -1,0 +1,72 @@
+{
+  "gid": "inv-31-windows-startup-diagnostic-directory",
+  "commit": "20fa20aa8c5ab35854266cc8d79a893b48b2834d",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "20fa20aa8c5ab35854266cc8d79a893b48b2834d",
+    "setup": "Run in a fresh non-elevated PowerShell process from a disposable checkout at the worker revision. Use regular file transfer for the optional probe. These checks require no symbolic links, tar extraction, service registration, or Hyper-V.",
+    "commands": [
+      "$ErrorActionPreference = 'Stop'",
+      "if ((git rev-parse HEAD).Trim() -ne '20fa20aa8c5ab35854266cc8d79a893b48b2834d') { throw 'Unexpected validation revision' }",
+      "$work = (New-Item -ItemType Directory -Path '.t3-tmp\\windows-startup-diagnostic' -Force).FullName; $env:TEMP = $work; $env:TMP = $work; $env:GOTMPDIR = $work",
+      "go test -count=1 -v -run '^(TestRunConfigErrorUsesRunStateDirFlagGrammar|TestStartupDiagnosticForInvalidConfiguration|TestConfigErrorStateDir|TestServiceMigrationPreservesRunArguments)$' ./cmds/ownsand-agent | Tee-Object -FilePath (Join-Path $work 'windows-regression.log'); if ($LASTEXITCODE -ne 0) { throw 'Windows regression failed' }",
+      "$exe = Join-Path $work 'ownsand-agent.exe'; go build -o $exe ./cmds/ownsand-agent; if ($LASTEXITCODE -ne 0) { throw 'Windows agent build failed' }",
+      "$fixture = Join-Path $work (\"foreground-\" + [Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $fixture | Out-Null; $explicit = Join-Path $fixture 'Agent State'; $fallback = Join-Path $fixture 'Fallback State'",
+      "Get-Item Env:OWNSAND_AGENT_* -ErrorAction SilentlyContinue | Remove-Item; $env:OWNSAND_AGENT_STATE_DIR = $fallback; $env:OWNSAND_AGENT_LOG_LEVEL = 'fixture-invalid-level'",
+      "$proc = Start-Process -FilePath $exe -ArgumentList ('run --state-dir \"{0}\" --unknown' -f $explicit) -Wait -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $fixture 'invalid-stdout.txt') -RedirectStandardError (Join-Path $fixture 'invalid-stderr.txt'); $errText = Get-Content -Raw -LiteralPath (Join-Path $fixture 'invalid-stderr.txt'); if ($proc.ExitCode -ne 2 -or $errText -notmatch 'invalid OWNSAND_AGENT_LOG_LEVEL \"fixture-invalid-level\"' -or $errText -match 'flag provided but not defined' -or (Test-Path -LiteralPath $explicit) -or (Test-Path -LiteralPath $fallback)) { throw 'Unexpected foreground invalid configuration behavior' }",
+      "New-Item -ItemType File -Path $explicit | Out-Null; $env:OWNSAND_AGENT_LOG_LEVEL = 'info'; $proc = Start-Process -FilePath $exe -ArgumentList ('run --state-dir \"{0}\"' -f $explicit) -Wait -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $fixture 'valid-stdout.txt') -RedirectStandardError (Join-Path $fixture 'valid-stderr.txt'); $errText = Get-Content -Raw -LiteralPath (Join-Path $fixture 'valid-stderr.txt'); if ($proc.ExitCode -ne 1 -or $errText -notmatch 'open state directory failed' -or $errText -notmatch 'Agent State' -or (Test-Path -LiteralPath $fallback)) { throw 'Valid configuration did not reach startup with the explicit directory' }; Write-Output \"Foreground evidence: $fixture\""
+    ],
+    "expectedResults": [
+      "All four named Windows tests pass. Direct and migrated command handling reaches the Windows handler, which records one redacted file error and reports service-specific exit 2 through an injected SCM dispatcher.",
+      "Directory creation and agent.log open failures reach the injected Event Log callback and retain service-specific exit 2. Missing and unusable flags use the environment fallback; blank or unset environment state selects the Windows default.",
+      "The foreground invalid log-level process exits 2 and writes only the original configuration error to stderr. It creates neither state directory.",
+      "With a valid log level and a regular file at the explicit state path, the foreground process reaches normal store startup, names Agent State in its failure, exits 1, and leaves the fallback directory absent."
+    ],
+    "requiresElevation": {
+      "status": "pending",
+      "reason": "Creating and starting disposable LocalSystem services and registering the Application Event Log source all require an elevated Windows session.",
+      "setup": "Use an elevated PowerShell session in an isolated Windows VM with no existing ownsand-agent service or Application Event Log source. Copy the PowerShell probe to files.copyTo after creating the scratch directory. The probe refuses a host with either existing registration, then removes its service and event source after testing.",
+      "commands": [
+        "$ErrorActionPreference = 'Stop'",
+        "if ((git rev-parse HEAD).Trim() -ne '20fa20aa8c5ab35854266cc8d79a893b48b2834d') { throw 'Unexpected validation revision' }",
+        "$work = (New-Item -ItemType Directory -Path '.t3-tmp\\windows-startup-diagnostic' -Force).FullName; $env:TEMP = $work; $env:TMP = $work; $env:GOTMPDIR = $work",
+        "$exe = Join-Path $work 'ownsand-agent.exe'; go build -o $exe ./cmds/ownsand-agent; if ($LASTEXITCODE -ne 0) { throw 'Windows agent build failed' }",
+        "$probe = Join-Path $work 'scm-probe.ps1'; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe).Hash.ToLowerInvariant() -ne '8da401afab3a8bb31c83f0ff56060ab0f55e467b7fd25ee6907bc3a202ee465c') { throw 'Unexpected SCM probe checksum' }",
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File $probe -Binary $exe -Scratch $work | Tee-Object -FilePath (Join-Path $work 'windows-scm.log'); if ($LASTEXITCODE -ne 0) { throw 'SCM probe failed' }"
+      ],
+      "expectedResults": [
+        "Direct and migrated command forms each append one redacted invalid configuration record to the explicit directory. The blank flag value logs to the environment directory. SCM reports exit 1066 and service-specific exit 2 in each case.",
+        "A directory at the explicit agent.log path causes one redacted Application Event Log entry under the ownsand-agent provider. SCM still reports exit 1066 and service-specific exit 2.",
+        "With a valid log level, the direct service writes its normal missing-enrollment diagnostic to the explicit path and stops with SCM exit 0."
+      ]
+    },
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-startup-diagnostic-directory/worker/.t3-tmp/windows-startup-diagnostic/scm-probe.ps1",
+      "copyTo": ".t3-tmp\\windows-startup-diagnostic\\scm-probe.ps1",
+      "sha256": "8da401afab3a8bb31c83f0ff56060ab0f55e467b7fd25ee6907bc3a202ee465c",
+      "regressionTests": [
+        "cmds/ownsand-agent/main_test.go",
+        "cmds/ownsand-agent/service_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp\\windows-startup-diagnostic\\windows-regression.log",
+        ".t3-tmp\\windows-startup-diagnostic\\foreground-*\\*-stderr.txt",
+        ".t3-tmp\\windows-startup-diagnostic\\windows-scm.log",
+        ".t3-tmp\\windows-startup-diagnostic\\scm-*\\*\\scm-status.json",
+        ".t3-tmp\\windows-startup-diagnostic\\scm-*\\*\\* State\\agent.log",
+        ".t3-tmp\\windows-startup-diagnostic\\scm-*\\blocked-log\\application-event.txt"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-startup-diagnostic-directory/worker/.t3-tmp/windows-startup-diagnostic/ownsand-agent-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-startup-diagnostic-directory/worker/.t3-tmp/windows-startup-diagnostic/ownsand-agent-windows-amd64.test.exe"
+      ],
+      "crossBuildArtifactSha256": {
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-startup-diagnostic-directory/worker/.t3-tmp/windows-startup-diagnostic/ownsand-agent-windows-amd64.exe": "98cd861c9479e82468157eadd316dc8aa4e23ce1651d6010de95c4fcf540f205",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-startup-diagnostic-directory/worker/.t3-tmp/windows-startup-diagnostic/ownsand-agent-windows-amd64.test.exe": "5e96994405e4908b4f516654fe1aed221fd40763662bfe6f391246aaf9c37212"
+      }
+    }
+  }
+}
