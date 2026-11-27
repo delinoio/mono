@@ -56,11 +56,15 @@ func TestStateWhileDownloadFollowsRunningRevocation(t *testing.T) {
 }
 
 func TestRetryKeepsVerifiedRevocation(t *testing.T) {
-	for _, tc := range []struct{ path, failure string }{
-		{"/manifest.json", "update: download manifest: update: download returned HTTP 503"},
-		{"/manifest.json.sig", "update: download manifest signature: update: download returned HTTP 503"},
+	for _, tc := range []struct {
+		name, path, failure string
+		status              int
+	}{
+		{"manifest unavailable", "/manifest.json", "update: download manifest: update: download returned HTTP 503", http.StatusServiceUnavailable},
+		{"signature unavailable", "/manifest.json.sig", "update: download manifest signature: update: download returned HTTP 503", http.StatusServiceUnavailable},
+		{"invalid signature", "/manifest.json.sig", ErrBadSignature.Error(), http.StatusOK},
 	} {
-		t.Run(tc.path[1:], func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			r := newRelease(t, nil)
 			busy := &atomic.Bool{}
 			busy.Store(true)
@@ -73,20 +77,27 @@ func TestRetryKeepsVerifiedRevocation(t *testing.T) {
 			revoked := ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
 			requireUpdateState(t, u, revoked, "1.1.0")
 
-			failure := &statusTransport{base: base, path: tc.path, status: http.StatusServiceUnavailable}
+			u, err := New(u.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireUpdateState(t, u, revoked, "1.1.0")
+			requireRevokedCreate(t, u)
+
+			failure := &statusTransport{base: base, path: tc.path, status: tc.status}
 			gate := newGateTransport(t, failure)
 			gate.path = tc.path
 			u.opts.HTTP = &http.Client{Transport: gate}
 			done, _ := startUpdateWorker(t, u, &ownsandv1.UpdateAgentCommand{TargetVersion: "1.2.0", RevocationRecovery: true}, u.NextOrder())
 			gate.awaitStartedOrEnd(t, done)
-			requireUpdateState(t, u, revoked, "1.2.0")
+			requireUpdateState(t, u, revoked, "1.1.0")
 			requireRevokedCreate(t, u)
 			gate.open()
-			err := awaitDone(t, done)
+			err = awaitDone(t, done)
 			if err == nil || err.Error() != tc.failure {
-				t.Fatalf("retry lost the original HTTP error: %v", err)
+				t.Fatalf("retry lost the original error: %v", err)
 			}
-			requireUpdateState(t, u, revoked, "1.2.0")
+			requireUpdateState(t, u, revoked, "1.1.0")
 			requireRevokedCreate(t, u)
 		})
 	}
@@ -126,7 +137,7 @@ func TestVerifiedRetryClearsRevocationAfterSupersedingOlderManifest(t *testing.T
 	if err := waitStarted(signatureStarted, stale, gateTimeout); err != nil {
 		t.Fatal(err)
 	}
-	requireUpdateState(t, u, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE, "1.2.0")
+	requireUpdateState(t, u, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE, "1.1.0")
 	latest.Store(current)
 	retry, _ := startUpdateWorker(t, u, &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}, u.NextOrder())
 	artifact.awaitStartedOrEnd(t, retry)
@@ -149,6 +160,17 @@ func TestVerifiedRetryClearsRevocationAfterSupersedingOlderManifest(t *testing.T
 	release, err = u.BeginCreate()
 	if err != nil {
 		t.Fatalf("create after the older manifest completed: %v", err)
+	}
+	release()
+
+	after, err := New(u.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireUpdateState(t, after, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
+	release, err = after.BeginCreate()
+	if err != nil {
+		t.Fatalf("create after restarting with the revocation cleared: %v", err)
 	}
 	release()
 }
@@ -230,5 +252,65 @@ func TestFailedInstallReportsRevokedStateWithTarget(t *testing.T) {
 				t.Fatalf("the failed installation left %v", names)
 			}
 		})
+	}
+}
+
+func TestStartupRestoresRevocationWithPendingInstall(t *testing.T) {
+	r := newRelease(t, nil)
+	u, _, _ := newUpdater(t, r, "0.9.0", &atomic.Bool{})
+	if err := update(u, "1.1.0", true); err != nil {
+		t.Fatal(err)
+	}
+	st := u.opts.Store
+	if installed, err := u.TryInstall(); err != nil || !installed {
+		t.Fatalf("idle install: %t, %v", installed, err)
+	}
+	requireUpdateEntries(t, st)
+	writeUpdateFile(t, st, "ownsand-agent-1.1.0-2", 10)
+
+	// The previous executable started again, so installation did not take
+	// effect. The gate still applies, even though the artifact is gone.
+	after, err := New(Options{Store: st, Running: "v0.9.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireUpdateState(t, after, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE, "1.1.0")
+	requireRevokedCreate(t, after)
+	requireUpdateEntries(t, st)
+	if installed, err := after.TryInstall(); err != nil || installed {
+		t.Fatalf("install without a queued artifact: %t, %v", installed, err)
+	}
+	saved, err := st.LoadAgent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.PendingUpdate != nil || saved.RunningRevocation == nil {
+		t.Fatalf("state after restart: %+v", saved)
+	}
+
+	// A later start of the new executable still confirms its installation
+	// and admits creates when the record describes another version.
+	if _, err := st.UpdateAgent(func(a *store.AgentState) error {
+		a.PendingUpdate = &store.PendingUpdate{PreviousVersion: "0.9.0", TargetVersion: "1.1.0"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after, err = New(Options{Store: st, Running: "1.1.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireUpdateState(t, after, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
+	release, err := after.BeginCreate()
+	if err != nil {
+		t.Fatalf("create on the new version: %v", err)
+	}
+	release()
+	saved, err = st.LoadAgent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.PendingUpdate != nil || saved.RunningRevocation == nil {
+		t.Fatalf("state after confirming the installation: %+v", saved)
 	}
 }
