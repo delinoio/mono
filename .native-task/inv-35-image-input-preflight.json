@@ -1,0 +1,80 @@
+{
+  "gid": "inv-35-image-input-preflight",
+  "commit": "ae62733af2f34725bd166f9c2e1abe6f576e9e6e",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "ae62733af2f34725bd166f9c2e1abe6f576e9e6e",
+    "setup": "Use a non-elevated Windows PowerShell session in the repository root at the stated revision. Run commands 1 and 2, copy files.copyFrom to files.copyTo, then run the remaining commands in the same session. The probe uses a private scratch tree, holds a sharing-denied handle on its unreadable helper and cleans up its fixtures.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne 'ae62733af2f34725bd166f9c2e1abe6f576e9e6e') { throw 'Unexpected validation revision' }",
+      "$scratch = (New-Item -ItemType Directory -Force -Path '.t3-tmp/image-preflight').FullName; $env:TEMP = $scratch; $env:TMP = $scratch; $env:GOTMPDIR = $scratch",
+      "$env:CGO_ENABLED = '0'; $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; go build -o (Join-Path $scratch 'agent.exe') ./cmds/ownsand-agent; if ($LASTEXITCODE -ne 0) { throw 'Agent build failed' }",
+      "go build -o (Join-Path $scratch 'windows-guest-amd64.exe') ./cmds/ownsand-guest; if ($LASTEXITCODE -ne 0) { throw 'Windows amd64 helper build failed' }",
+      "$env:GOARCH = 'arm64'; go build -o (Join-Path $scratch 'windows-guest-arm64.exe') ./cmds/ownsand-guest; if ($LASTEXITCODE -ne 0) { throw 'Windows arm64 helper build failed' }",
+      "$env:GOOS = 'darwin'; go build -o (Join-Path $scratch 'macos-guest-arm64') ./cmds/ownsand-guest; if ($LASTEXITCODE -ne 0) { throw 'macOS arm64 helper build failed' }",
+      "$env:GOARCH = 'amd64'; go build -o (Join-Path $scratch 'macos-guest-amd64') ./cmds/ownsand-guest; if ($LASTEXITCODE -ne 0) { throw 'macOS amd64 helper build failed' }",
+      "$env:GOOS = 'windows'; $env:OWNSAND_IMAGEBUILD_REAL_DARWIN_ARM64 = (Join-Path $scratch 'macos-guest-arm64'); $env:OWNSAND_IMAGEBUILD_REAL_WINDOWS_AMD64 = (Join-Path $scratch 'windows-guest-amd64.exe'); go test './cmds/ownsand-agent' './cmds/ownsand-agent/internal/imagebuild' '-count=1' '-v' '-run=^(TestImageBuildInputPreflight|TestImageBuildResourceRanges|TestBuildChecksTheGuestBinary|TestBuildRefusesWhileAnotherProcessBuilds|TestCheckRealCrossBuiltGuestHelpers)$' 2>&1 | Tee-Object -FilePath (Join-Path $scratch 'windows-tests.log'); if ($LASTEXITCODE -ne 0) { throw 'Windows focused tests failed' }",
+      "& (Join-Path $scratch 'probe-cli.ps1') -Agent (Join-Path $scratch 'agent.exe') -WindowsAmd64Helper $env:OWNSAND_IMAGEBUILD_REAL_WINDOWS_AMD64 -WindowsArm64Helper (Join-Path $scratch 'windows-guest-arm64.exe') -MacOSAmd64Helper (Join-Path $scratch 'macos-guest-amd64') -MacOSArm64Helper $env:OWNSAND_IMAGEBUILD_REAL_DARWIN_ARM64 -Scratch $scratch 6>&1 | Tee-Object -FilePath (Join-Path $scratch 'windows-cli.log')"
+    ],
+    "expectedResults": [
+      "Focused tests pass on Windows. The CLI probe prints “CLI matrix passed. Rejected inputs preserved entries, contents and DACLs.”",
+      "Missing Windows ISO or explicit invalid executable format or architecture exits 2 on fresh, existing and file state paths. Missing or sharing-denied helper exits 1 and reports lookup or open errors. Valid helpers reach the expected store error on the file state path.",
+      "The absent path remains absent. The existing directory and child retain their SDDL and contents. The regular-file state marker stays unchanged."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-image-input-preflight/worker/.t3-tmp/checks/probe-cli.ps1",
+      "copyTo": ".t3-tmp/image-preflight/probe-cli.ps1",
+      "sha256": "647783fe7b8f9201b2c5cb5fc0a38f6d45a6eb5dea0c3186d293b6c1bbcad70a",
+      "regressionTests": [
+        "cmds/ownsand-agent/image_test.go",
+        "cmds/ownsand-agent/internal/imagebuild/imagebuild_test.go",
+        "cmds/ownsand-agent/internal/imagebuild/lock_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/image-preflight/windows-tests.log",
+        ".t3-tmp/image-preflight/windows-cli.log"
+      ]
+    },
+    "privilegedUnperformed": [
+      "Hyper-V provisioning, ISO mounting and protected state-store ACL setup require elevation and are outside the preflight acceptance. The test-owned directory DACL comparison requires no elevation."
+    ],
+    "additionalPlatform": {
+      "status": "pending",
+      "platform": "macOS",
+      "host": "m3-16",
+      "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+      "sha": "ae62733af2f34725bd166f9c2e1abe6f576e9e6e",
+      "setup": "Use the arm64 macOS host with Go, the native compiler and Python 3. Run commands 1 and 2, copy files.copyFrom to files.copyTo, then run the remaining commands in the same shell. No administrator access is needed.",
+      "commands": [
+        "test \"$(git rev-parse HEAD)\" = ae62733af2f34725bd166f9c2e1abe6f576e9e6e || exit 1",
+        "set -eo pipefail; mkdir -p .t3-tmp/image-preflight; export TMPDIR=\"$PWD/.t3-tmp/image-preflight\" GOTMPDIR=\"$PWD/.t3-tmp/image-preflight\" COPYFILE_DISABLE=1",
+        "CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -o \"$TMPDIR/agent\" ./cmds/ownsand-agent",
+        "CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o \"$TMPDIR/windows-guest-amd64.exe\" ./cmds/ownsand-guest",
+        "CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -o \"$TMPDIR/windows-guest-arm64.exe\" ./cmds/ownsand-guest",
+        "CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o \"$TMPDIR/macos-guest-arm64\" ./cmds/ownsand-guest",
+        "CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -o \"$TMPDIR/macos-guest-amd64\" ./cmds/ownsand-guest",
+        "CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 OWNSAND_IMAGEBUILD_REAL_DARWIN_ARM64=\"$TMPDIR/macos-guest-arm64\" OWNSAND_IMAGEBUILD_REAL_WINDOWS_AMD64=\"$TMPDIR/windows-guest-amd64.exe\" go test ./cmds/ownsand-agent ./cmds/ownsand-agent/internal/imagebuild -count=1 -v -run '^(TestImageBuildInputPreflight|TestImageBuildResourceRanges|TestBuildChecksTheGuestBinary|TestBuildRefusesWhileAnotherProcessBuilds|TestCheckRealCrossBuiltGuestHelpers)$' 2>&1 | tee \"$TMPDIR/macos-tests.log\"",
+        "python3 \"$TMPDIR/probe-cli.py\" \"$TMPDIR/agent\" \"$TMPDIR/windows-guest-amd64.exe\" \"$TMPDIR/windows-guest-arm64.exe\" \"$TMPDIR/macos-guest-amd64\" \"$TMPDIR/macos-guest-arm64\" | tee \"$TMPDIR/macos-cli.log\""
+      ],
+      "expectedResults": [
+        "Focused tests pass with cgo enabled. The CLI probe prints “CLI matrix passed. Rejected inputs preserved entries, contents and POSIX mode.”",
+        "Exit codes and diagnostics match the Linux CLI matrix. The test-owned directory retains mode 0755 and its sentinel."
+      ],
+      "files": {
+        "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-image-input-preflight/worker/.t3-tmp/checks/probe-cli.py",
+        "copyTo": ".t3-tmp/image-preflight/probe-cli.py",
+        "sha256": "9dab872e782b4034765423bc0e135832dc387b82ed238c96f52de9f2b059907d",
+        "outputLogs": [
+          ".t3-tmp/image-preflight/macos-tests.log",
+          ".t3-tmp/image-preflight/macos-cli.log"
+        ]
+      },
+      "privilegedUnperformed": [
+        "Virtualization.framework installation, IPSW use and macOS guest boot need extra privileges and assets and are outside the preflight acceptance."
+      ]
+    }
+  }
+}
