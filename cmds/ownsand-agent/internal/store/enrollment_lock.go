@@ -52,7 +52,7 @@ func (s *Store) LockImageBuild(ctx context.Context) (unlock func(), err error) {
 	if err := enrollmentWaitError(ctx); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+	if err := PrepareDir(s.dir); err != nil {
 		return nil, fmt.Errorf("store: prepare state directory for image build: %w", err)
 	}
 	unlock, err = acquireEnrollmentLock(ctx, s.dir, enrollmentShared)

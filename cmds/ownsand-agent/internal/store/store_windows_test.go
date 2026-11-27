@@ -3,8 +3,10 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -46,7 +48,11 @@ func wellKnown(t *testing.T, kind windows.WELL_KNOWN_SID_TYPE) *windows.SID {
 // dacl returns the entries of the DACL of path and whether it is protected.
 func dacl(t *testing.T, path string) ([]aceInfo, bool) {
 	t.Helper()
-	aces, protected, _, release, err := readDACL(path)
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aces, protected, _, release, err := readDACL(path, sd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +524,12 @@ func TestCheckOwnerProcessUser(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = checkOwner(dir, p, p.rootOwners)
+		h, _, err := openStateEntry(dir, windows.READ_CONTROL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = checkHandleOwner(dir, h, p.rootOwners)
+		windows.CloseHandle(h)
 		if elevated && err != nil {
 			t.Errorf("elevated: owner %s rejected: %v", owner, err)
 		}
@@ -531,10 +542,6 @@ func TestCheckOwnerProcessUser(t *testing.T) {
 // Open fails closed, with a message that names the owner, when the owner of
 // the state directory is not trusted.
 func TestCheckOwnerRejectsUntrustedOwner(t *testing.T) {
-	p, err := loadPrincipals()
-	if err != nil {
-		t.Fatal(err)
-	}
 	dir := t.TempDir()
 	sd, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
@@ -547,7 +554,12 @@ func TestCheckOwnerRejectsUntrustedOwner(t *testing.T) {
 	// Allow only an unrelated SID, so the real owner of the directory is
 	// untrusted whoever it is.
 	other := wellKnown(t, windows.WinNullSid)
-	err = checkOwner(dir, p, []*windows.SID{other})
+	h, _, err := openStateEntry(dir, windows.READ_CONTROL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(h)
+	err = checkHandleOwner(dir, h, []*windows.SID{other})
 	if err == nil {
 		t.Fatalf("owner %s accepted", owner)
 	}
@@ -674,5 +686,312 @@ func TestConcurrentStatusReadsDoNotLoseWrites(t *testing.T) {
 	var last report
 	if err := reader.LoadStatus(&last); err != nil || last.Seq != 300 || last.Padding != padding {
 		t.Fatalf("last report: %v (sequence %d, padding %d bytes)", err, last.Seq, len(last.Padding))
+	}
+}
+
+func junction(t *testing.T, path, target string) {
+	t.Helper()
+	output, err := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", path, target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("create fixture junction: %v: %s", err, output)
+	}
+	t.Cleanup(func() {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("remove fixture junction: %v", err)
+		}
+	})
+}
+
+func requireStatePathReason(t *testing.T, err error, path string, reason StatePathReason) {
+	t.Helper()
+	var rejected *StatePathError
+	if !errors.Is(err, ErrUntrustedStateDir) || !errors.As(err, &rejected) || rejected.Path != path || rejected.Reason != reason {
+		t.Fatalf("state path error = %v, want %s at %q", err, reason, path)
+	}
+}
+
+func securityDescriptorString(t *testing.T, path string) string {
+	t.Helper()
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sd.String()
+}
+
+func TestWindowsStateRejectsRootJunction(t *testing.T) {
+	target := t.TempDir()
+	sentinel := filepath.Join(target, IdentityFile)
+	if err := os.WriteFile(sentinel, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := securityDescriptorString(t, target)
+	root := filepath.Join(t.TempDir(), "state")
+	junction(t, root, target)
+
+	requireStatePathReason(t, PrepareDir(root), root, StatePathReparsePoint)
+	s, err := OpenForRead(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := s.LockImageBuild(t.Context())
+	if unlock != nil {
+		unlock()
+	}
+	requireStatePathReason(t, err, root, StatePathReparsePoint)
+	_, err = Open(root)
+	requireStatePathReason(t, err, root, StatePathReparsePoint)
+	requireStatePathReason(t, ResetDir(root), root, StatePathReparsePoint)
+
+	entries, err := os.ReadDir(target)
+	if err != nil || len(entries) != 1 || entries[0].Name() != IdentityFile {
+		t.Fatalf("junction target entries = %v, %v", entries, err)
+	}
+	if b, err := os.ReadFile(sentinel); err != nil || string(b) != "fixture" {
+		t.Fatalf("junction target sentinel = %q, %v", b, err)
+	}
+	if after := securityDescriptorString(t, target); before != after {
+		t.Fatal("junction target security descriptor changed")
+	}
+}
+
+func TestWindowsStateRejectsUntrustedRootOwner(t *testing.T) {
+	user, elevated, err := processIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := newPrincipals(user, elevated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownerAllowed(user, p.rootOwners) {
+		t.Skip("requires an account outside the list of trusted owners")
+	}
+
+	root := t.TempDir()
+	before := securityDescriptorString(t, root)
+	requireStatePathReason(t, PrepareDir(root), root, StatePathUntrustedOwner)
+	_, err = Open(root)
+	requireStatePathReason(t, err, root, StatePathUntrustedOwner)
+	requireStatePathReason(t, ResetDir(root), root, StatePathUntrustedOwner)
+	if after := securityDescriptorString(t, root); before != after {
+		t.Fatal("untrusted root security descriptor changed")
+	}
+	if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
+		t.Fatalf("untrusted root entries = %v, %v", entries, err)
+	}
+}
+
+func TestWindowsStateRejectsFixedDirectoryJunctionBeforeOpen(t *testing.T) {
+	testFixedDirectoryJunctions(t, false)
+}
+
+func TestOpenRejectsFixedSubdirectoryJunction(t *testing.T) {
+	requireTrustedProcess(t)
+	testFixedDirectoryJunctions(t, true)
+}
+
+func testFixedDirectoryJunctions(t *testing.T, fullOpen bool) {
+	t.Helper()
+	for _, sub := range stateSubdirs {
+		t.Run(sub, func(t *testing.T) {
+			root, target := t.TempDir(), t.TempDir()
+			before := securityDescriptorString(t, target)
+			path := filepath.Join(root, sub)
+			junction(t, path, target)
+
+			var err error
+			if fullOpen {
+				_, err = Open(root)
+			} else {
+				err = prepareStateSubdir(path)
+			}
+			requireStatePathReason(t, err, path, StatePathReparsePoint)
+			if fullOpen {
+				if err := ResetDir(root); err != nil {
+					t.Fatalf("ResetDir with damaged layout: %v", err)
+				}
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("junction after ResetDir = %v, want absent", err)
+				}
+			}
+			if entries, err := os.ReadDir(target); err != nil || len(entries) != 0 {
+				t.Fatalf("junction target entries = %v, %v", entries, err)
+			}
+			if after := securityDescriptorString(t, target); before != after {
+				t.Fatal("junction target security descriptor changed")
+			}
+		})
+	}
+}
+
+func TestWindowsStateChecksDeepJunctionOwner(t *testing.T) {
+	root, target := t.TempDir(), t.TempDir()
+	content := filepath.Join(root, SnapshotsDir, "record", "content")
+	if err := os.MkdirAll(content, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(content, "link")
+	junction(t, path, target)
+	targetBefore := securityDescriptorString(t, target)
+	readJunction := func() (uint32, *windows.SECURITY_DESCRIPTOR) {
+		t.Helper()
+		h, info, err := openStateEntry(path, windows.READ_CONTROL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer windows.CloseHandle(h)
+		sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			t.Fatalf("read junction security descriptor: %v", err)
+		}
+		return info.FileAttributes, sd
+	}
+	attributesBefore, sd := readJunction()
+	if attributesBefore&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+		t.Fatalf("fixture is missing the reparse point attribute: %#x", attributesBefore)
+	}
+	owner, _, err := sd.Owner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := loadPrincipals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.childOwners = []*windows.SID{wellKnown(t, windows.WinNullSid)}
+	_, err = resetChild(path, p, false)
+	requireStatePathReason(t, err, path, StatePathUntrustedOwner)
+	var rejection *StatePathError
+	if !errors.As(err, &rejection) || rejection.OwnerSID != owner.String() {
+		t.Fatalf("junction owner = %v, want %s", err, owner)
+	}
+	p.childOwners = []*windows.SID{owner}
+	reparse, err := resetChild(path, p, false)
+	if err != nil || !reparse {
+		t.Fatalf("reset trusted junction: reparse point %v, error %v", reparse, err)
+	}
+	attributes, after := readJunction()
+	if attributes != attributesBefore {
+		t.Fatalf("resetChild changed junction attributes from %#x to %#x", attributesBefore, attributes)
+	}
+	if after.String() != sd.String() {
+		t.Fatalf("resetChild changed the junction security descriptor from %q to %q", sd.String(), after.String())
+	}
+
+	// Windows can update inherited ACEs on the junction when the walk
+	// repairs an ancestor's DACL.
+	if err := resetChildren(root, p); err != nil {
+		t.Fatalf("walk with a trusted junction: %v", err)
+	}
+	h, info, err := openStateEntry(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	windows.CloseHandle(h)
+	if info.FileAttributes != attributesBefore {
+		t.Fatalf("walk changed junction attributes from %#x to %#x", attributesBefore, info.FileAttributes)
+	}
+	if after := securityDescriptorString(t, target); targetBefore != after {
+		t.Fatalf("walk changed the junction target security descriptor from %q to %q", targetBefore, after)
+	}
+}
+
+func TestOpenKeepsTrustedDeepJunction(t *testing.T) {
+	requireTrustedProcess(t)
+	root, target := t.TempDir(), t.TempDir()
+	if _, err := Open(root); err != nil {
+		t.Fatal(err)
+	}
+	content := filepath.Join(root, SnapshotsDir, "record", "content")
+	if err := os.MkdirAll(content, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(content, "link")
+	junction(t, path, target)
+	before := securityDescriptorString(t, target)
+	if _, err := Open(root); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode().IsRegular() {
+		t.Fatalf("trusted junction was lost: %v, %v", info, err)
+	}
+	if after := securityDescriptorString(t, target); before != after {
+		t.Fatal("Open changed the deep junction target security descriptor")
+	}
+	if err := ResetDir(root); err != nil {
+		t.Fatalf("ResetDir with a deep junction: %v", err)
+	}
+	if after := securityDescriptorString(t, target); before != after {
+		t.Fatal("ResetDir changed the deep junction target security descriptor")
+	}
+}
+
+func TestOpenEnrollmentLockAcquiresRegularFile(t *testing.T) {
+	root := t.TempDir()
+	release, err := acquireEnrollmentLock(t.Context(), root, enrollmentExclusive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	release, err = acquireEnrollmentLock(t.Context(), root, enrollmentExclusive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+}
+
+func TestOpenEnrollmentLockRejectsReparsePoint(t *testing.T) {
+	root, target := t.TempDir(), t.TempDir()
+	path := filepath.Join(root, EnrollmentLockFile)
+	junction(t, path, target)
+	before := securityDescriptorString(t, target)
+	if f, err := openEnrollmentLock(root); err == nil || f != nil {
+		if f != nil {
+			f.Close()
+		}
+		t.Fatalf("openEnrollmentLock on a junction = %v, %v", f, err)
+	}
+	if after := securityDescriptorString(t, target); before != after {
+		t.Fatal("enrollment lock changed the junction target security descriptor")
+	}
+}
+
+func TestOpenEnrollmentLockRejectsFileSymlink(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, EnrollmentLockFile)
+	target := filepath.Join(t.TempDir(), "fixture")
+	if err := os.WriteFile(target, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		if errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) || errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			t.Skipf("file symlink creation is unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	f, err := openEnrollmentLock(root)
+	if f != nil {
+		f.Close()
+		t.Fatal("openEnrollmentLock returned a handle for a symlink")
+	}
+	requireStatePathReason(t, err, path, StatePathReparsePoint)
+}
+
+func TestOpenEnrollmentLockRejectsHardLink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(t.TempDir(), "fixture")
+	if err := os.WriteFile(target, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, EnrollmentLockFile)
+	if err := os.Link(target, path); err != nil {
+		t.Fatal(err)
+	}
+	_, err := acquireEnrollmentLock(t.Context(), root, enrollmentExclusive)
+	requireStatePathReason(t, err, path, StatePathMultipleLinks)
+	if b, err := os.ReadFile(target); err != nil || string(b) != "fixture" {
+		t.Fatalf("hard-link target = %q, %v", b, err)
 	}
 }

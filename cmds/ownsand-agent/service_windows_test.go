@@ -145,6 +145,7 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 	clearAgentEnv(t)
 	const rawLevel = "fixture-invalid-level"
 	const rawPath = "Private Fixture State"
+	const fallbackPath = "Fallback State"
 	t.Setenv(config.EnvLogLevel, rawLevel)
 	wantSetting := "invalid OWNSAND_AGENT_LOG_LEVEL: expected debug, info, warn or error"
 	buildDirectArgs := func(dir string) []string {
@@ -164,7 +165,7 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 	}{
 		{name: "direct service", args: buildDirectArgs},
 		{name: "migrated service", args: buildLauncherArgs},
-		{name: "directory creation fails", args: buildDirectArgs, blockMkdir: true, wantEvent: "could not create the service state directory"},
+		{name: "directory creation fails", args: buildDirectArgs, blockMkdir: true, wantEvent: "could not prepare the service state directory"},
 		{name: "file open fails", args: buildLauncherArgs, blockOpen: true, wantEvent: "could not open agent.log"},
 		{name: "Event Log write fails", args: buildDirectArgs, blockOpen: true, eventError: errors.New("write failed"), wantEvent: "could not open agent.log"},
 		{name: "missing flag", args: func(string) []string { return []string{"run"} }, fallback: true},
@@ -172,9 +173,12 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 		{name: "missing value", args: func(string) []string { return []string{"run", "--state-dir"} }, fallback: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if !tc.blockMkdir {
+				requireElevatedServiceLogTest(t)
+			}
 			root := t.TempDir()
 			explicit := filepath.Join(root, rawPath)
-			fallback := filepath.Join(root, "Fallback State")
+			fallback := filepath.Join(root, fallbackPath)
 			t.Setenv(config.EnvStateDir, " "+fallback+" ")
 			dir := explicit
 			otherDir := fallback
@@ -195,6 +199,13 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 			dispatch := func(name string, h svc.Handler) error {
 				if name != service.Name {
 					t.Fatalf("dispatched service %q, want %q", name, service.Name)
+				}
+				if tc.wantEvent == "" {
+					assertServiceStateACL(t, dir, true)
+					assertServiceStateACL(t, path, false)
+					if before, err := os.ReadFile(path); err != nil || len(before) != 0 {
+						t.Fatalf("log before the configuration error = %q, %v", before, err)
+					}
 				}
 				status := make(chan svc.Status, 8)
 				specific, exit := h.Execute(nil, make(chan svc.ChangeRequest), status)
@@ -236,7 +247,7 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 				t.Fatal(err)
 			}
 			log := string(data)
-			if strings.Count(log, `"msg":"invalid configuration"`) != 1 || !strings.Contains(log, wantSetting) || strings.Contains(log, rawPath) || strings.Contains(log, rawLevel) {
+			if strings.Count(log, `"msg":"invalid configuration"`) != 1 || !strings.Contains(log, wantSetting) || strings.Contains(log, rawPath) || strings.Contains(log, fallbackPath) || strings.Contains(log, rawLevel) {
 				t.Fatalf("unexpected log contents: %s", log)
 			}
 		})
