@@ -22,7 +22,7 @@ const ACCOUNT_NAME = "Example billing account";
 async function installInvoiceFixture(
   browser: Browser,
   appOrigin: string,
-  popupBlocked = false,
+  { popupBlocked = false, unauthenticatedFirst = false } = {},
 ) {
   await seedFixtureSession(browser, appOrigin);
   if (popupBlocked) {
@@ -80,9 +80,12 @@ async function installInvoiceFixture(
     ],
   ]);
 
+  let failNextInvoiceRequest = unauthenticatedFirst;
+  let invoiceRequests = 0;
   await browser.route(`${API_ORIGIN}/**`, async (route) => {
     const path = new URL(route.request.url).pathname;
     if (path === INVOICE_PATH) {
+      invoiceRequests++;
       await route.fulfill({
         contentType: "text/html",
         body: "<title>Fixture invoice</title><h1>Fixture invoice</h1>",
@@ -100,6 +103,16 @@ async function installInvoiceFixture(
     }
     const method = path.split("/").pop()!;
     if (method === "GetInvoiceUrl") {
+      if (failNextInvoiceRequest) {
+        failNextInvoiceRequest = false;
+        await route.fulfill({
+          status: 401,
+          contentType: "application/json",
+          headers,
+          body: JSON.stringify({ code: "unauthenticated" }),
+        });
+        return;
+      }
       markStarted();
       await responseGate;
     }
@@ -120,6 +133,9 @@ async function installInvoiceFixture(
     });
   });
   return {
+    get invoiceRequests() {
+      return invoiceRequests;
+    },
     async refetchAs(role: BillingAccountRole) {
       account.callerRole = role;
       await browser.evaluate(async () => {
@@ -197,7 +213,9 @@ describe("invoice navigation", () => {
         ? "keeps the reopened Invoices panel after a blocked pop-up"
         : "keeps the billing list after a blocked pop-up",
       async ({ app, browser, screen }) => {
-        const invoice = await installInvoiceFixture(browser, app.baseUrl, true);
+        const invoice = await installInvoiceFixture(browser, app.baseUrl, {
+          popupBlocked: true,
+        });
         try {
           await app.open(ACCOUNT_PATH);
           await screen.getByRole("tab", "Invoices").click();
@@ -242,7 +260,9 @@ describe("invoice navigation", () => {
     browser,
     screen,
   }) => {
-    const invoice = await installInvoiceFixture(browser, app.baseUrl, true);
+    const invoice = await installInvoiceFixture(browser, app.baseUrl, {
+      popupBlocked: true,
+    });
     try {
       await app.open(ACCOUNT_PATH);
       await screen.getByRole("tab", "Invoices").click();
@@ -260,42 +280,78 @@ describe("invoice navigation", () => {
     }
   });
 
-  for (const closePopup of [false, true]) {
-    test(
-      closePopup
-        ? "discards the link when the user closes the invoice pop-up"
-        : "loads the link in an open pop-up after leaving Invoices",
-      async ({ app, browser, screen }) => {
-        const invoice = await installInvoiceFixture(browser, app.baseUrl);
-        try {
-          await app.open(ACCOUNT_PATH);
-          await screen.getByRole("tab", "Invoices").click();
-          const [billingTab] = browser.tabs();
-          const popup = await browser.waitForPopup(() =>
-            screen.getByRole("button", /Open the invoice/).click(),
-          );
-          await invoice.started;
-          await billingTab!.activate();
-          await screen.getByRole("link", "Billing accounts").click();
-          if (closePopup) await popup.close();
+  test("loads the link in an open pop-up after leaving Invoices", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const invoice = await installInvoiceFixture(browser, app.baseUrl);
+    try {
+      await app.open(ACCOUNT_PATH);
+      await screen.getByRole("tab", "Invoices").click();
+      const [billingTab] = browser.tabs();
+      const popup = await browser.waitForPopup(() =>
+        screen.getByRole("button", /Open the invoice/).click(),
+      );
+      await invoice.started;
+      await billingTab!.activate();
+      await screen.getByRole("link", "Billing accounts").click();
 
-          await invoice.respond();
+      await invoice.respond();
 
-          await expect(
-            screen.getByRole("heading", "Billing accounts", { level: 1 }),
-          ).toBeVisible();
-          if (closePopup) {
-            expect(browser.tabs()).toHaveLength(1);
-          } else {
-            await popup.activate();
-            await expect(
-              screen.getByRole("heading", "Fixture invoice"),
-            ).toBeVisible();
-          }
-        } finally {
-          invoice.release();
-        }
-      },
-    );
-  }
+      await expect(
+        screen.getByRole("heading", "Billing accounts", { level: 1 }),
+      ).toBeVisible();
+      await popup.activate();
+      await expect(
+        screen.getByRole("heading", "Fixture invoice"),
+      ).toBeVisible();
+    } finally {
+      invoice.release();
+    }
+  });
+
+  test("discards the link when the user closes the invoice pop-up with Invoices open", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const invoice = await installInvoiceFixture(browser, app.baseUrl, {
+      unauthenticatedFirst: true,
+    });
+    try {
+      await app.open(ACCOUNT_PATH);
+      const invoices = screen.getByRole("tab", "Invoices");
+      const invoicePanel = screen.getByRole("tabpanel", "Invoices");
+      const openInvoice = screen.getByRole("button", /Open the invoice/);
+      const sessionEnded = screen.getByText(
+        "Your session ended. Sign in again.",
+      );
+      await invoices.click();
+      const [billingTab] = browser.tabs();
+
+      await openInvoice.click();
+      await expect(sessionEnded).toBeVisible();
+      await app.screenshot("invoice-session-ended");
+
+      const popup = await browser.waitForPopup(() => openInvoice.click());
+      await invoice.started;
+      await popup.close();
+      await billingTab!.activate();
+      await expect(sessionEnded).toBeVisible();
+
+      await invoice.respond();
+
+      // The success handler clears the notice after handling navigation.
+      await expect(sessionEnded).toBeHidden();
+      await expect(invoicePanel).toBeVisible();
+      await expect(invoices).toHaveAttribute("aria-selected", "true");
+      await expect(browser).toHaveURL(app.baseUrl + ACCOUNT_PATH);
+      expect(browser.tabs()).toHaveLength(1);
+      expect(invoice.invoiceRequests).toBe(0);
+      await app.screenshot("invoice-popup-closed");
+    } finally {
+      invoice.release();
+    }
+  });
 });
