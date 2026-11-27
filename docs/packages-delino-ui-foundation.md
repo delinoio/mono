@@ -49,6 +49,7 @@ Each export is a stable interface. Exported enums are the stable identifiers for
   - `Textarea`: a labeled multi-line text input. Props: `label` (required), `description`, `error`, and all UI SDK `Textarea` props such as `value`, `defaultValue`, `onValueChange`, `name`, `rows`, `autoResize` and `autoFocus`. It follows the same error and focus rules as `TextField`.
 - `delino-ui/checkbox`
   - `Checkbox`: a labeled checkbox. Props: `label` (required), `description`, and all UI SDK `Checkbox` props such as `checked`, `defaultChecked`, `onCheckedChange`, `name`, `value` and `disabled`. Pressing the label toggles it. The description describes the checkbox through `aria-describedby`; a caller `aria-describedby` is added before the description id instead of replacing it. It shows a check while checked and a dash while indeterminate. It wraps the checkbox in a native `label` instead of a UI SDK `Field`, so that it also works inside `CheckboxGroup`, which assigns each checkbox its own id.
+  - A custom checkbox control uses the visible label as its accessible name before and after hydration. An explicit `aria-label` or `aria-labelledby` on the checkbox props or on the rendered element takes precedence.
   - `CheckboxGroup`: a styled UI SDK `CheckboxGroup` that keeps one list of checked `Checkbox` values. Consumers name it with `aria-label` or `aria-labelledby`.
   - The `CheckedState` type is re-exported from UI SDK.
 - `delino-ui/radio-group`

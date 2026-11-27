@@ -4,6 +4,7 @@ import {
   CheckboxGroup as CheckboxGroupPart,
   CheckboxIndicator,
 } from "@ui-sdk/react/checkbox";
+import { renderElement } from "@ui-sdk/react/primitive";
 import * as React from "react";
 import { mergeClassName } from "./class-name.ts";
 
@@ -32,9 +33,11 @@ export function Checkbox({
   label,
   description,
   className,
+  render,
   "aria-describedby": ariaDescribedBy,
   ...props
 }: CheckboxProps) {
+  const labelId = React.useId();
   const descriptionId = React.useId();
   const hasDescription =
     description !== undefined &&
@@ -50,12 +53,49 @@ export function Checkbox({
     .filter(Boolean)
     .join(" ");
 
+  // The SDK folds a render element's own description into a parent Field.
+  // Give it that reference as a prop because the composed render is a callback.
+  const elementDescription = React.isValidElement<React.AriaAttributes>(render)
+    ? render.props["aria-describedby"]
+    : undefined;
+  const customRender =
+    React.isValidElement<React.AriaAttributes>(render) &&
+    elementDescription !== undefined
+      ? React.cloneElement(render, { "aria-describedby": undefined })
+      : render;
+  const renderControl: CheckboxProps["render"] = customRender
+    ? (controlProps, state) => {
+        const control = renderElement(
+          "button",
+          controlProps,
+          customRender,
+          state,
+        );
+        // The SDK links non-labelable controls to the native label on mount.
+        // Remove this fallback when the SDK names custom controls during SSR.
+        if (
+          React.isValidElement<React.AriaAttributes>(control) &&
+          control.type !== React.Fragment &&
+          !control.props["aria-label"]?.trim() &&
+          !control.props["aria-labelledby"]?.trim()
+        ) {
+          return React.cloneElement(control, { "aria-labelledby": labelId });
+        }
+        return control;
+      }
+    : undefined;
+
   return (
     <div className="dui-checkbox-field">
       <label className="dui-checkbox-item">
         <CheckboxPart
           className={mergeClassName("dui-checkbox", className)}
-          aria-describedby={describedBy || undefined}
+          aria-describedby={
+            elementDescription === undefined
+              ? describedBy || undefined
+              : elementDescription
+          }
+          render={renderControl}
           {...props}
         >
           <CheckboxIndicator className="dui-checkbox-indicator">
@@ -72,7 +112,9 @@ export function Checkbox({
             )}
           </CheckboxIndicator>
         </CheckboxPart>
-        <span className="dui-checkbox-label">{label}</span>
+        <span id={labelId} className="dui-checkbox-label">
+          {label}
+        </span>
       </label>
       {hasDescription ? (
         <p id={descriptionId} className="dui-checkbox-description">
