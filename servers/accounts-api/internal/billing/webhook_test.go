@@ -283,16 +283,46 @@ func TestWebhookFailedRenewalAndChargeFailure(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
 	subID := f.activate(acct)
+	paymentFailedCount := func() int {
+		t.Helper()
+		var count int
+		if err := f.db.Pool.QueryRow(ctx(), `SELECT count(*) FROM billing_notifications
+			WHERE billing_account_id = $1 AND kind = $2`, acct, NotifyPaymentFailed).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
 	failed := paddletest.Transaction(paddletest.TransactionData{
 		ID: "txn_renew", SubscriptionID: subID, Origin: paddle.OriginSubscriptionRecurring, PriceID: priceID,
 		SubtotalCents: 1000, Status: "past_due",
 	})
-	f.webhook(paddle.EventTransactionPaymentFailed, failed)
-	f.webhook(paddle.EventTransactionPaymentFailed, failed) // Paddle retries: one email per transaction
-	// A failed attempt inside the checkout sends nothing.
-	f.webhook(paddle.EventTransactionPaymentFailed, paddletest.Transaction(paddletest.TransactionData{
-		ID: "txn_checkout", Origin: paddle.OriginWeb, BillingAccountID: acct, PriceID: priceID, SubtotalCents: 1000,
-	}))
+	// Distinct events for the same renewal transaction queue one notification.
+	for attempt := range 2 {
+		if code := f.webhook(paddle.EventTransactionPaymentFailed, failed); code != http.StatusOK {
+			t.Fatalf("renewal delivery %d: status = %d, want %d", attempt+1, code, http.StatusOK)
+		}
+		if got := paymentFailedCount(); got != 1 {
+			t.Fatalf("renewal delivery %d: payment-failed notifications = %d, want 1", attempt+1, got)
+		}
+	}
+
+	// The recorded subscription would qualify these failures for renewal
+	// notifications if the handler did not check the checkout origin.
+	for _, origin := range []string{paddle.OriginWeb, paddle.OriginAPI} {
+		before := paymentFailedCount()
+		data := paddletest.Transaction(paddletest.TransactionData{
+			ID: "txn_checkout_" + origin, SubscriptionID: subID, Origin: origin, PriceID: priceID,
+			SubtotalCents: 1000, Status: "past_due",
+		})
+		if got := f.webhookResult(paddle.EventTransactionPaymentFailed, data); got != webhookIgnored {
+			t.Errorf("%s checkout: webhook result = %q, want %q", origin, got, webhookIgnored)
+		}
+		if got := paymentFailedCount(); got != before {
+			t.Errorf("%s checkout: payment-failed notifications = %d, want %d", origin, got, before)
+		}
+	}
+
 	if err := f.s.DeliverNotifications(ctx()); err != nil {
 		t.Fatal(err)
 	}
@@ -319,8 +349,11 @@ func TestWebhookFailedRenewalAndChargeFailure(t *testing.T) {
 		ID: "txn_charge", SubscriptionID: subID, Origin: paddle.OriginSubscriptionCharge,
 		TopUpID: paddletest.ChargeTopUpID(charge), SubtotalCents: 2500, Status: "past_due",
 	})
-	f.webhook(paddle.EventTransactionPaymentFailed, data)
-	f.webhook(paddle.EventTransactionPaymentFailed, data)
+	for attempt := range 2 {
+		if code := f.webhook(paddle.EventTransactionPaymentFailed, data); code != http.StatusOK {
+			t.Fatalf("one-time charge delivery %d: status = %d, want %d", attempt+1, code, http.StatusOK)
+		}
+	}
 	st, _ := loadSettings(ctx(), f.db.Pool, acct)
 	if st.ConsecutiveFailures != 1 {
 		t.Fatalf("failures %d, want 1", st.ConsecutiveFailures)
