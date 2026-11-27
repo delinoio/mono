@@ -1053,7 +1053,9 @@ type ReadFileRequest struct {
 	// Absolute guest path. Sandbox content: never log.
 	Path        string `protobuf:"bytes,4,opt,name=path,proto3" json:"path,omitempty"`
 	BindingSalt []byte `protobuf:"bytes,5,opt,name=binding_salt,json=bindingSalt,proto3" json:"binding_salt,omitempty"`
-	// Start offset. Zero on the first call.
+	// Byte position at which to start reading. Defaults to zero when omitted.
+	// The first call can start at a nonzero offset.
+	// To resume, use the same read_id and the offset of the next undelivered byte.
 	Offset        int64 `protobuf:"varint,6,opt,name=offset,proto3" json:"offset,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
