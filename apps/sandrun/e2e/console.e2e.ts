@@ -1897,6 +1897,9 @@ describe("invitations", () => {
     );
     expect(link).toContain("/invitations/accept#secret=");
     await invitation.getByRole("button", "Done").tap();
+    // Wait for the dialog to close first. A Settings tap during the close is
+    // ignored because the page behind the dialog is still inert.
+    await expect(invitation).toBeHidden();
 
     await screen.getByRole("link", "Settings").tap();
     await screen.getByRole("combobox", "New owner").tap();
