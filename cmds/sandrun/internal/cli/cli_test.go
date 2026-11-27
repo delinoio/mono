@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -520,6 +521,81 @@ func TestCredentialInput(t *testing.T) {
 	r = f.run("not json super-secret", "--org", f.org, "integration", "create", "--vendor", "cursor", "--name", "c")
 	if r.code != ExitUsage || strings.Contains(r.stderr, "super-secret") {
 		t.Fatalf("invalid credentials = %d %s", r.code, r.stderr)
+	}
+}
+
+func TestAPIKeyCreateExpiry(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		flag     string
+		duration time.Duration
+		invalid  bool
+	}{
+		{name: "empty", flag: "--expires-in=", invalid: true},
+		{name: "zero", flag: "--expires-in=0", invalid: true},
+		{name: "zero seconds", flag: "--expires-in=0s", invalid: true},
+		{name: "zero days", flag: "--expires-in=0d", invalid: true},
+		{name: "negative", flag: "--expires-in=-1s", invalid: true},
+		{name: "malformed", flag: "--expires-in=invalid", invalid: true},
+		{name: "hours", flag: "--expires-in=1h", duration: time.Hour},
+		{name: "days", flag: "--expires-in=1d", duration: 24 * time.Hour},
+		{name: "omitted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			var mu sync.Mutex
+			var requests []*sandrunv1.CreateApiKeyRequest
+			const procedure = sandrunv1connect.ApiKeyServiceCreateApiKeyProcedure
+			mux := http.NewServeMux()
+			mux.Handle(procedure, connect.NewUnaryHandler(procedure, func(_ context.Context, req *connect.Request[sandrunv1.CreateApiKeyRequest]) (*connect.Response[sandrunv1.CreateApiKeyResponse], error) {
+				mu.Lock()
+				requests = append(requests, req.Msg)
+				mu.Unlock()
+				return connect.NewResponse(&sandrunv1.CreateApiKeyResponse{
+					ApiKey: &sandrunv1.ApiKey{Name: "fixture"},
+					Secret: "fixture-secret",
+				}), nil
+			}))
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			f.env[EnvAPIURL] = srv.URL
+			f.httpClient = srv.Client()
+			args := []string{"--org", f.org, "api-key", "create", "--name", "fixture"}
+			if tc.flag != "" {
+				args = append(args, tc.flag)
+			}
+			start := time.Now()
+			r := f.run("", args...)
+			end := time.Now()
+
+			mu.Lock()
+			defer mu.Unlock()
+			if tc.invalid {
+				if r.code != ExitUsage || r.stdout != "" || !strings.Contains(r.stderr, "--expires-in:") {
+					t.Errorf("exit = %d, stdout = %q, stderr = %q, want an expiry usage error and empty stdout", r.code, r.stdout, r.stderr)
+				}
+				if len(requests) != 0 {
+					t.Errorf("create requests = %d, want 0", len(requests))
+				}
+				return
+			}
+			if r.code != ExitOK || r.stdout != "fixture-secret\n" || len(requests) != 1 {
+				t.Fatalf("exit = %d, stdout = %q, stderr = %q, create requests = %d, want success and 1 request", r.code, r.stdout, r.stderr, len(requests))
+			}
+			expiresAt := requests[0].GetExpiresAt()
+			if tc.duration == 0 {
+				if expiresAt != nil {
+					t.Errorf("expiry = %v, want absent", expiresAt)
+				}
+				return
+			}
+			if err := expiresAt.CheckValid(); err != nil {
+				t.Fatalf("invalid expiry: %v", err)
+			}
+			if got := expiresAt.AsTime(); got.Before(start.Add(tc.duration)) || got.After(end.Add(tc.duration)) {
+				t.Errorf("expiry = %v, want %v after a time between %v and %v", got, tc.duration, start, end)
+			}
+		})
 	}
 }
 
