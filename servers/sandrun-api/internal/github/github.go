@@ -275,13 +275,18 @@ func (l *Layer) deactivateTx(ctx context.Context, tx pgx.Tx, inst *Installation,
 	return deleted, nil
 }
 
+var idleRunnerStates = []int16{
+	int16(sandrunv1.RunnerState_RUNNER_STATE_CREATING),
+	int16(sandrunv1.RunnerState_RUNNER_STATE_PREPARING),
+	int16(sandrunv1.RunnerState_RUNNER_STATE_WARM),
+	int16(sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK),
+}
+
 // idleRunners returns the GITHUB_JOB runners of a pool that wait for a job
 // (CREATING, PREPARING, WARM or WAITING_FOR_WORK without a request).
 func (l *Layer) idleRunners(ctx context.Context, q db.Querier, orgID, pool string) ([]*work.Runner, error) {
 	rows, err := q.Query(ctx, "SELECT "+work.RunnerColumns+` FROM runners WHERE organization_id = $1 AND kind = $2 AND pool_key = $3 AND request_id IS NULL
-		AND state = ANY($4) ORDER BY create_time DESC, runner_id DESC`, orgID, int16(sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB), pool,
-		[]int16{int16(sandrunv1.RunnerState_RUNNER_STATE_CREATING), int16(sandrunv1.RunnerState_RUNNER_STATE_PREPARING), int16(sandrunv1.RunnerState_RUNNER_STATE_WARM),
-			int16(sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)})
+		AND state = ANY($4) ORDER BY create_time DESC, runner_id DESC`, orgID, int16(sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB), pool, idleRunnerStates)
 	if err != nil {
 		return nil, err
 	}
@@ -329,9 +334,14 @@ func (l *Layer) removeRegistration(ctx context.Context, q db.Querier, inst *Inst
 	if err != nil || reg == nil || reg.removed || reg.githubRunnerID == 0 {
 		return false, err
 	}
+	return l.removeKnownRegistration(ctx, q, inst, runnerID, reg)
+}
+
+// removeKnownRegistration removes the given registration and marks that same ID as removed.
+func (l *Layer) removeKnownRegistration(ctx context.Context, q db.Querier, inst *Installation, runnerID string, reg *registration) (bool, error) {
 	deleteCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	err = l.gh.DeleteRunner(deleteCtx, inst.GitHubID, inst.Login, reg.githubRunnerID)
+	err := l.gh.DeleteRunner(deleteCtx, inst.GitHubID, inst.Login, reg.githubRunnerID)
 	if errors.Is(err, githubapi.ErrRunnerRefused) {
 		l.svc.Logger.InfoContext(ctx, "github_runner_removal_refused", slog.String("organization_id", inst.OrganizationID), slog.String("runner_id", runnerID),
 			slog.Int64("github_runner_id", reg.githubRunnerID))

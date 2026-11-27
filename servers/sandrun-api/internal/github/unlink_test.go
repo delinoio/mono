@@ -202,6 +202,216 @@ func TestJITRegistrationWaitsForUnlink(t *testing.T) {
 	t.Log("PostgreSQL observed the second JIT start waiting on unlink. One JIT call registered the first runner. The second start made no GitHub JIT call.")
 }
 
+func TestUnlinkRetiresRegisteredRunnersOnFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		jobs bool
+	}{
+		{name: "queued jobs", jobs: true},
+		{name: "warm reserve"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, installationID, first, second := unlinkWorld(t, tc.jobs)
+			ctx := t.Context()
+			failed, ok := w.gh.RunnerByName("sandrun-" + second.GetRunnerId())
+			if !ok {
+				t.Fatal("second runner has no registration")
+			}
+			w.gh.Update(func() {
+				w.gh.DeleteGate = func(id int64) {
+					if id == failed.ID {
+						w.gh.Update(func() { w.gh.FailDelete = http.StatusServiceUnavailable })
+					}
+				}
+			})
+
+			wantCode(t, "partial unlink", w.unlink(t, installationID), connect.CodeUnavailable)
+			w.assertUnlinkRetired(t, first.GetRunnerId())
+			if !installationPresent(t, w, installationID) {
+				t.Fatal("partial unlink removed the installation")
+			}
+			if state := w.runner(t, second.GetRunnerId()).GetState(); state != sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK {
+				t.Fatalf("runner that GitHub failed to remove changed state: %v", state)
+			}
+			if _, ok := w.gh.RunnerByName(failed.Name); !ok || w.os.Active(w.osOrg) != 1 {
+				t.Fatal("partial unlink did not preserve the second registration and sandbox")
+			}
+			if tc.jobs {
+				for _, id := range []int64{1, 2} {
+					if r := w.requestOfJob(t, id); r.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+						t.Fatalf("job %d changed state: %v", id, r)
+					}
+				}
+			}
+			if calls := w.gh.Calls("delete_runner"); calls != 2 {
+				t.Fatalf("GitHub DELETE calls = %d, want 2", calls)
+			}
+			w.l.Engine.Pass(ctx, w.org.ID)
+			if got := len(w.runners(t)); got != 3 || w.os.Active(w.osOrg) != 2 {
+				t.Fatalf("replacement pass left %d stored runners and %d active sandboxes, want 3 and 2", got, w.os.Active(w.osOrg))
+			}
+			t.Log("GitHub 503 kept the installation active. One replacement sandbox started on the next dispatch pass.")
+
+			w.gh.Update(func() { w.gh.FailDelete, w.gh.DeleteGate = 0, nil })
+			if err := w.unlink(t, installationID); err != nil {
+				t.Fatal(err)
+			}
+			if installationPresent(t, w, installationID) || len(w.gh.Runners()) != 0 || w.os.Active(w.osOrg) != 0 {
+				t.Fatal("retry left the installation, a registration or a sandbox")
+			}
+		})
+	}
+}
+
+func TestUnlinkRetirementSurvivesFinalCommitFailure(t *testing.T) {
+	w, installationID, first, second := unlinkWorld(t, true)
+	ctx := t.Context()
+	if _, err := w.env.DB.Pool.Exec(ctx, `
+		CREATE FUNCTION fail_runner_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'injected runner retirement commit failure' USING ERRCODE = '40001';
+		END;
+		$$;
+		CREATE CONSTRAINT TRIGGER fail_runner_retirement
+			AFTER UPDATE ON github_runners DEFERRABLE INITIALLY DEFERRED
+			FOR EACH ROW WHEN (NEW.registration_removed) EXECUTE FUNCTION fail_runner_retirement();`); err != nil {
+		t.Fatal(err)
+	}
+	wantCode(t, "failed runner retirement commit", w.unlink(t, installationID), connect.CodeInternal)
+	if _, ok := w.gh.RunnerByName("sandrun-" + first.GetRunnerId()); ok || w.gh.Calls("delete_runner") != 1 {
+		t.Fatal("the failed commit must stop unlink after the first GitHub DELETE")
+	}
+	if state := w.runner(t, first.GetRunnerId()).GetState(); state != sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK ||
+		!installationPresent(t, w, installationID) || w.os.Active(w.osOrg) != 2 {
+		t.Fatalf("the failed retirement commit left runner state %v or changed the installation or sandboxes", state)
+	}
+	var removed bool
+	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT registration_removed FROM github_runners WHERE runner_id = $1", first.GetRunnerId()).
+		Scan(&removed); err != nil || removed {
+		t.Fatalf("removal marker after failed retirement commit = %v, error = %v", removed, err)
+	}
+	t.Log("GitHub accepted the first removal. The failed runner commit rolled back the marker and state and stopped unlink.")
+
+	if _, err := w.env.DB.Pool.Exec(ctx, "DROP TRIGGER fail_runner_retirement ON github_runners"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a marker left by an older unlink implementation.
+	if _, err := w.env.DB.Pool.Exec(ctx, "UPDATE github_runners SET registration_removed = true WHERE runner_id = $1", second.GetRunnerId()); err != nil {
+		t.Fatal(err)
+	}
+	reg, ok := w.gh.RunnerByName("sandrun-" + second.GetRunnerId())
+	if !ok {
+		t.Fatal("second runner has no registration")
+	}
+	w.gh.ForgetRunner(reg.ID)
+	if _, err := w.env.DB.Pool.Exec(ctx, `
+		CREATE FUNCTION fail_final_unlink() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'injected unlink commit failure' USING ERRCODE = '40001';
+		END;
+		$$;
+		CREATE CONSTRAINT TRIGGER fail_final_unlink
+			AFTER DELETE ON github_installations DEFERRABLE INITIALLY DEFERRED
+			FOR EACH ROW EXECUTE FUNCTION fail_final_unlink();`); err != nil {
+		t.Fatal(err)
+	}
+	wantCode(t, "failed final unlink commit", w.unlink(t, installationID), connect.CodeInternal)
+	w.assertUnlinkRetired(t, first.GetRunnerId())
+	w.assertUnlinkRetired(t, second.GetRunnerId())
+	if !installationPresent(t, w, installationID) || w.os.Active(w.osOrg) != 0 {
+		t.Fatal("final rollback failed to preserve the link or kept retired sandboxes")
+	}
+	for _, id := range []int64{1, 2} {
+		if r := w.requestOfJob(t, id); r.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+			t.Fatalf("final rollback did not preserve job %d: %v", id, r)
+		}
+	}
+	if w.gh.Calls("delete_runner") != 2 || !strings.Contains(w.ghLogs.String(), `"op":"delete_runner","status":404`) {
+		t.Fatal("expected only one additional GitHub DELETE, returning 404 for the first registration")
+	}
+	t.Log("Existing marker and GitHub 404 retired both runners. PostgreSQL rejected the final commit and kept both jobs queued.")
+
+	if _, err := w.env.DB.Pool.Exec(ctx, "DROP TRIGGER fail_final_unlink ON github_installations"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.unlink(t, installationID); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{1, 2} {
+		r := w.requestOfJob(t, id)
+		if r.GetState() != sandrunv1.RequestState_REQUEST_STATE_CANCELED ||
+			r.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_INTEGRATION_REMOVED {
+			t.Fatalf("unlink retry did not cancel job %d: %v", id, r)
+		}
+	}
+	var audits int
+	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND action = $2",
+		w.org.ID, int16(sandrunv1.AuditAction_AUDIT_ACTION_GITHUB_INSTALLATION_UNLINKED)).Scan(&audits); err != nil || audits != 1 {
+		t.Fatalf("unlink audit count = %d, error = %v, want 1", audits, err)
+	}
+}
+
+func unlinkWorld(t *testing.T, queuedJobs bool) (*ghWorld, string, *sandrunv1.Runner, *sandrunv1.Runner) {
+	t.Helper()
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = w.l.Engine.RunReconciler(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	inst := w.link(t, 501, "acme")
+	if queuedJobs {
+		w.createProfile(t, ghProfile("linux", 0))
+		for _, id := range []int64{1, 2} {
+			w.send(t, "workflow_job", job("queued", 501, id, sandRunLinux, ""))
+		}
+	} else {
+		w.createProfile(t, ghProfile("linux", 2))
+	}
+	w.l.Engine.Pass(ctx, w.org.ID)
+	waiting := sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+	eventually(t, "two registered idle runners", func() bool { return len(w.runnersIn(t, waiting)) == 2 })
+	runners := w.runnersIn(t, waiting)
+	var firstID string
+	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT runner_id FROM runners ORDER BY create_time DESC, runner_id DESC LIMIT 1").Scan(&firstID); err != nil {
+		t.Fatal(err)
+	}
+	if runners[0].GetRunnerId() != firstID {
+		runners[0], runners[1] = runners[1], runners[0]
+	}
+	return w, inst.GetInstallationId(), runners[0], runners[1]
+}
+
+func (w *ghWorld) unlink(t *testing.T, installationID string) error {
+	t.Helper()
+	_, err := w.env.User(w.org.Admin).GitHub.UnlinkGitHubInstallation(t.Context(), connect.NewRequest(&sandrunv1.UnlinkGitHubInstallationRequest{
+		OrganizationId: w.org.ID, InstallationId: installationID,
+	}))
+	return err
+}
+
+func (w *ghWorld) assertUnlinkRetired(t *testing.T, runnerID string) {
+	t.Helper()
+	r := w.runner(t, runnerID)
+	if state := r.GetState(); (state != sandrunv1.RunnerState_RUNNER_STATE_DELETING && state != sandrunv1.RunnerState_RUNNER_STATE_DELETED) ||
+		r.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP {
+		t.Fatalf("runner %s did not retire with CLEAN_UP: %v", runnerID, r)
+	}
+	var removed bool
+	if err := w.env.DB.Pool.QueryRow(t.Context(), "SELECT registration_removed FROM github_runners WHERE runner_id = $1", runnerID).
+		Scan(&removed); err != nil || !removed {
+		t.Fatalf("runner %s registration removed = %v, error = %v", runnerID, removed, err)
+	}
+	if _, ok := w.gh.RunnerByName("sandrun-" + runnerID); ok {
+		t.Fatalf("runner %s still registered at GitHub", runnerID)
+	}
+}
+
 func awaitUnlinkStep[T any](t *testing.T, step string, ch <-chan T) T {
 	t.Helper()
 	select {
