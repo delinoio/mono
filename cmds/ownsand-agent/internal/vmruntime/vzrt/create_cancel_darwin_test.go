@@ -100,34 +100,33 @@ func TestVirtualizationCreateCancelsDiskPreparation(t *testing.T) {
 			defer cancel()
 			ctx := &cancelStreamedCopy{Context: base, cancel: cancel}
 			copies, grows, fits := 0, 0, 0
-			ops := vmCreateOps{
-				cloneFile: func(_, dst string, _ int) error {
-					copies++
-					if tc.cancelAt == stream && copies == tc.copyNumber {
-						ctx.path = dst
-						return unix.EXDEV
-					}
-					write(dst, data)
-					if tc.cancelAt == clone && copies == tc.copyNumber {
-						cancel()
-					}
-					return nil
-				},
-				growFile: func(path string, size int64) error {
-					grows++
-					err := growFile(path, size)
-					if tc.cancelAt == grow {
-						cancel()
-					}
-					return err
-				},
-				fitGPT: func(string) error {
-					fits++
-					if tc.cancelAt == fit {
-						cancel()
-					}
-					return nil
-				},
+			ops := r.createOps()
+			ops.cloneFile = func(_, dst string, _ int) error {
+				copies++
+				if tc.cancelAt == stream && copies == tc.copyNumber {
+					ctx.path = dst
+					return unix.EXDEV
+				}
+				write(dst, data)
+				if tc.cancelAt == clone && copies == tc.copyNumber {
+					cancel()
+				}
+				return nil
+			}
+			ops.growFile = func(path string, size int64) error {
+				grows++
+				err := growFile(path, size)
+				if tc.cancelAt == grow {
+					cancel()
+				}
+				return err
+			}
+			ops.fitGPT = func(string) error {
+				fits++
+				if tc.cancelAt == fit {
+					cancel()
+				}
+				return nil
 			}
 			got, err := r.createVM(ctx, spec, ops)
 			if got != nil || !errors.Is(err, context.Canceled) {

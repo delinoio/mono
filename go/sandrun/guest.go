@@ -182,6 +182,77 @@ if ($env:SANDRUN_SYNC_PRUNE_LIST) {
     if (Test-Path -LiteralPath $t -PathType Container) { [System.IO.Directory]::Delete($t) }
   }
 }
+if ($env:SANDRUN_SYNC_PRUNE_ALIAS_LIST) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class SandRunDirectoryIdentity {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FileInformation {
+        public FileAttributes Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime, LastAccessTime, LastWriteTime;
+        public uint VolumeSerial, SizeHigh, SizeLow, LinkCount, IndexHigh, IndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(string path, uint access, FileShare share,
+        IntPtr security, FileMode mode, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInformation info);
+
+    private static bool IsRegularDirectory(FileAttributes attributes) {
+        return (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == FileAttributes.Directory;
+    }
+
+    public static string Read(string workspace, string relativePath) {
+        string[] parts = relativePath.Split('\\');
+        string path = workspace;
+        // Check each parent before descending so alias pruning cannot traverse a junction.
+        try {
+            for (int i = 0; i < parts.Length - 1; i++) {
+                path = Path.Combine(path, parts[i]);
+                if (!IsRegularDirectory(File.GetAttributes(path))) return null;
+            }
+        } catch (FileNotFoundException) {
+            return null;
+        } catch (DirectoryNotFoundException) {
+            return null;
+        }
+
+        path = Path.Combine(path, parts[parts.Length - 1]);
+        const uint backupSemantics = 0x02000000, openReparsePoint = 0x00200000;
+        using (SafeFileHandle handle = CreateFileW(path, 0, FileShare.ReadWrite | FileShare.Delete,
+                IntPtr.Zero, FileMode.Open, backupSemantics | openReparsePoint, IntPtr.Zero)) {
+            if (handle.IsInvalid) {
+                int error = Marshal.GetLastWin32Error();
+                const int fileNotFound = 2, pathNotFound = 3, notADirectory = 267;
+                if (error == fileNotFound || error == pathNotFound || error == notADirectory) return null;
+                throw new Win32Exception(error);
+            }
+            FileInformation info;
+            if (!GetFileInformationByHandle(handle, out info)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (!IsRegularDirectory(info.Attributes)) return null;
+            return String.Format("{0}:{1}:{2}", info.VolumeSerial, info.IndexHigh, info.IndexLow);
+        }
+    }
+}
+'@
+  $paths = [System.IO.File]::ReadAllLines($env:SANDRUN_SYNC_PRUNE_ALIAS_LIST, [System.Text.Encoding]::UTF8)
+  if ($paths.Length % 3 -ne 0) { throw 'Incomplete sync alias prune record' }
+  for ($i = 0; $i -lt $paths.Length; $i += 3) {
+    $old = [SandRunDirectoryIdentity]::Read($ws, $paths[$i])
+    if ($null -eq $old -or $old -ne [SandRunDirectoryIdentity]::Read($ws, $paths[$i+1])) { continue }
+    $dir = $paths[$i+2]
+    if ($null -ne [SandRunDirectoryIdentity]::Read($ws, $dir)) {
+      [System.IO.Directory]::Delete((Join-Path $ws $dir))
+    }
+  }
+}
 if ($env:SANDRUN_SYNC_ARCHIVE) {
   & "$env:SystemRoot\System32\tar.exe" -x -m -f $env:SANDRUN_SYNC_ARCHIVE -C $ws
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -203,7 +274,7 @@ if ($env:SANDRUN_SYNC_LINK_LIST) {
 exit 0`,
 	opCleanup: `$ProgressPreference = 'SilentlyContinue'
 $status = 0
-foreach ($f in @($env:SANDRUN_SYNC_ARCHIVE, $env:SANDRUN_SYNC_DELETE_LIST, $env:SANDRUN_SYNC_REPLACE_FILE_LIST, $env:SANDRUN_SYNC_PRUNE_LIST, $env:SANDRUN_SYNC_LINK_LIST)) {
+foreach ($f in @($env:SANDRUN_SYNC_ARCHIVE, $env:SANDRUN_SYNC_DELETE_LIST, $env:SANDRUN_SYNC_REPLACE_FILE_LIST, $env:SANDRUN_SYNC_PRUNE_LIST, $env:SANDRUN_SYNC_PRUNE_ALIAS_LIST, $env:SANDRUN_SYNC_LINK_LIST)) {
   try {
     if ($f -and (Test-Path -LiteralPath $f -ErrorAction Stop)) {
       Remove-Item -LiteralPath $f -Force -ErrorAction Stop

@@ -63,6 +63,7 @@ func (v *fakeVM) stop()                   { v.once.Do(func() { close(v.exited) }
 
 type fakeRuntime struct {
 	mu        sync.Mutex
+	kind      config.RuntimeKind
 	vms       map[string]*fakeVM
 	paused    map[string]bool
 	createErr error
@@ -119,10 +120,10 @@ func (r *fakeRuntime) startCount() int {
 }
 
 func newFakeRuntime() *fakeRuntime {
-	return &fakeRuntime{vms: map[string]*fakeVM{}, paused: map[string]bool{}, files: map[string]bool{}}
+	return &fakeRuntime{kind: config.RuntimeKindProcess, vms: map[string]*fakeVM{}, paused: map[string]bool{}, files: map[string]bool{}}
 }
 
-func (r *fakeRuntime) Kind() config.RuntimeKind { return config.RuntimeKindProcess }
+func (r *fakeRuntime) Kind() config.RuntimeKind { return r.kind }
 func (r *fakeRuntime) Capabilities(context.Context) vmruntime.Capabilities {
 	return vmruntime.Capabilities{}
 }
@@ -313,6 +314,20 @@ type env struct {
 	logger *slog.Logger
 
 	freeDiskCalls atomic.Int64
+}
+
+// removeAllAndWipe includes the store wipe that follows successful runtime
+// deletion during authenticated device removal.
+func (e *env) removeAllAndWipe(ctx context.Context) error {
+	cleanup, err := e.st.LockCleanup(ctx)
+	if err != nil {
+		return err
+	}
+	defer cleanup.Close()
+	if err := e.m.RemoveAll(ctx); err != nil {
+		return err
+	}
+	return cleanup.WipeLocalData()
 }
 
 func newEnv(t *testing.T) *env { return newEnvWithLogger(t, nil) }
@@ -1002,6 +1017,129 @@ func TestCreateLimits(t *testing.T) {
 	}
 }
 
+func TestCreateMemoryLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		existing  int64
+		request   int64
+		scheduled int64
+		current   int64
+		state     ownsandv1.SandboxState
+		windows   bool
+		process   bool
+		reject    bool
+	}{
+		{name: "existing odd", existing: 511, request: 512, scheduled: 1024, current: 1023, reject: true},
+		{name: "incoming odd", existing: 512, request: 511, scheduled: 1024, current: 1023, reject: true},
+		{name: "both odd", existing: 511, request: 511, scheduled: 1024, current: 1023, reject: true},
+		{name: "Windows guest", existing: 2047, request: 2049, scheduled: 4098, current: 4097, windows: true, reject: true},
+		{name: "odd boundary", existing: 511, request: 511, scheduled: 1024, current: 1024},
+		{name: "even boundary", existing: 512, request: 512, scheduled: 1024, current: 1024},
+		{name: "scheduled limit is stricter", existing: 511, request: 511, scheduled: 1023, current: 1024, reject: true},
+		{name: "process uses raw sizes", existing: 511, request: 512, scheduled: 1024, current: 1023, process: true},
+		{name: "rounded request overflow", request: math.MaxInt64, scheduled: math.MaxInt64, current: math.MaxInt64, reject: true},
+		{name: "total overflow", existing: math.MaxInt64 - 1, request: 2, scheduled: math.MaxInt64, current: math.MaxInt64, reject: true},
+		{name: "creating", existing: 511, request: 512, scheduled: 1024, current: 1023, state: ownsandv1.SandboxState_SANDBOX_STATE_CREATING, reject: true},
+		{name: "paused", existing: 511, request: 512, scheduled: 1024, current: 1023, state: ownsandv1.SandboxState_SANDBOX_STATE_PAUSED, reject: true},
+		{name: "deleting", existing: 511, request: 512, scheduled: 1024, current: 1023, state: ownsandv1.SandboxState_SANDBOX_STATE_DELETING, reject: true},
+		{name: "deleted", existing: 511, request: 512, scheduled: 1024, current: 1023, state: ownsandv1.SandboxState_SANDBOX_STATE_DELETED},
+		{name: "failed", existing: 511, request: 512, scheduled: 1024, current: 1023, state: ownsandv1.SandboxState_SANDBOX_STATE_FAILED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Set up the fixture directories directly so it also runs on
+			// Windows under an account that cannot apply the service ACL.
+			st, err := store.OpenForRead(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, dir := range []string{store.SandboxesDir, store.SnapshotsDir} {
+				if err := os.Mkdir(st.Path(dir), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rt := newFakeRuntime()
+			if !tc.process {
+				rt.kind = config.RuntimeKindHyperV
+			}
+			e := &env{t: t, st: st, rt: rt, clk: &clock{now: time.Now()}, out: &outbox{}, ex: &execs{running: map[string]bool{}, ended: map[string]ownsandv1.SandboxEndReason{}}}
+			e.restart()
+			t.Cleanup(func() {
+				e.m.Close()
+				for _, vm := range rt.vms {
+					vm.stop()
+				}
+			})
+
+			scheduled := proto.CloneOf(limits)
+			scheduled.MemoryMib = tc.scheduled
+			current := proto.CloneOf(scheduled)
+			current.MemoryMib = tc.current
+			lastSpec := vmruntime.Spec{}
+			rt.onCreate = func(spec vmruntime.Spec) { lastSpec = spec }
+			newCommand := func(memory int64) *ownsandv1.CreateSandboxCommand {
+				cmd := e.createCmd(1, time.Hour, time.Hour)
+				cmd.Limits = scheduled
+				cmd.Resources.MemoryMib = memory
+				if tc.windows {
+					cmd.GuestOs = ownsandv1.GuestOs_GUEST_OS_WINDOWS
+					cmd.Source = &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_WINDOWS}
+				}
+				return cmd
+			}
+			checkAdmitted := func(cmd *ownsandv1.CreateSandboxCommand, entry *ownsandv1.SandboxStateEntry, err error, wantMemory int64) {
+				t.Helper()
+				id := cmd.GetSandboxId()
+				if err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+					t.Fatalf("create requested %d MiB: entry = %v, error = %v", wantMemory, entry, err)
+				}
+				stored := persistedRecord(t, st, id)
+				if cmd.GetResources().GetMemoryMib() != wantMemory || stored.MemoryMiB != wantMemory ||
+					lastSpec.SandboxID != id || lastSpec.Resources.GetMemoryMib() != wantMemory {
+					t.Fatalf("memory MiB in command, record, runtime spec = %d, %d, %d, want %d in each",
+						cmd.GetResources().GetMemoryMib(), stored.MemoryMiB, lastSpec.Resources.GetMemoryMib(), wantMemory)
+				}
+			}
+			if tc.existing != 0 {
+				cmd := newCommand(tc.existing)
+				entry, err := e.m.Create(t.Context(), cmd)
+				checkAdmitted(cmd, entry, err, tc.existing)
+				if tc.state != ownsandv1.SandboxState_SANDBOX_STATE_UNSPECIFIED {
+					e.m.mu.Lock()
+					e.m.sandboxes[cmd.GetSandboxId()].rec.State = tc.state
+					e.m.mu.Unlock()
+				}
+			}
+			e.m.SetLimits(current)
+			starts, diskProbes := rt.startCount(), e.freeDiskCalls.Load()
+			cmd := newCommand(tc.request)
+			entry, err := e.m.Create(t.Context(), cmd)
+			if !tc.reject {
+				checkAdmitted(cmd, entry, err, tc.request)
+				if got := rt.startCount() - starts; got != 1 {
+					t.Fatalf("runtime create calls = %d, want 1", got)
+				}
+				return
+			}
+			var ce *CommandError
+			if entry != nil || !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED || ce.Message != "device memory limit reached" {
+				t.Fatalf("entry = %v, error = %v, want RESOURCE_EXHAUSTED (device memory limit reached)", entry, err)
+			}
+			if got := rt.startCount() - starts; got != 0 {
+				t.Fatalf("runtime create calls = %d, want 0", got)
+			}
+			if got := e.freeDiskCalls.Load() - diskProbes; got != 0 {
+				t.Fatalf("free disk probes = %d, want 0", got)
+			}
+			if state, found := e.m.State(cmd.GetSandboxId()); found {
+				t.Errorf("rejected create has an in-memory record in state %s", state)
+			}
+			if _, err := os.Stat(st.Path(store.SandboxesDir, cmd.GetSandboxId()+".json")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("stat rejected record: %v, want file not found", err)
+			}
+		})
+	}
+}
+
 // TestCreateRejectsDiskThatOverflowsBytes sends a disk_gib whose byte count
 // does not fit in a signed 64-bit integer. The agent rejects it as
 // INVALID_ARGUMENT that names resources.disk_gib, before the limit check, the
@@ -1684,7 +1822,7 @@ func TestRemoveAllRetriesFailedDeletion(t *testing.T) {
 	failed := e.create(time.Hour, 2*time.Hour).GetSandboxId()
 	other := e.create(time.Hour, 2*time.Hour).GetSandboxId()
 	e.rt.deleteFails = 1
-	if err := e.m.RemoveAll(ctx); err == nil {
+	if err := e.removeAllAndWipe(ctx); err == nil {
 		t.Fatal("RemoveAll returned nil although a runtime Delete failed")
 	}
 	if e.rt.deleteCalls != 2 {
@@ -1706,7 +1844,7 @@ func TestRemoveAllRetriesFailedDeletion(t *testing.T) {
 		t.Fatalf("record of the failed sandbox was wiped: %v", err)
 	}
 
-	if err := e.m.RemoveAll(ctx); err != nil {
+	if err := e.removeAllAndWipe(ctx); err != nil {
 		t.Fatalf("retry returned %v", err)
 	}
 	if e.rt.deleteCalls != 3 {
@@ -1719,7 +1857,7 @@ func TestRemoveAllRetriesFailedDeletion(t *testing.T) {
 		t.Fatalf("record kept after the complete clean-up: %v", err)
 	}
 
-	if err := e.m.RemoveAll(ctx); err != nil {
+	if err := e.removeAllAndWipe(ctx); err != nil {
 		t.Fatalf("RemoveAll after a complete clean-up returned %v", err)
 	}
 	if e.rt.deleteCalls != 3 {
@@ -1741,7 +1879,7 @@ func TestRemoveAllCancelsCreateAndRetriesFailedDeletion(t *testing.T) {
 	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_CREATING)
 
 	removed := make(chan error, 1)
-	go func() { removed <- e.m.RemoveAll(t.Context()) }()
+	go func() { removed <- e.removeAllAndWipe(t.Context()) }()
 	select {
 	case err := <-created:
 		if err == nil {
@@ -1777,7 +1915,7 @@ func TestRemoveAllCancelsCreateAndRetriesFailedDeletion(t *testing.T) {
 		}
 	}
 	requireCreateRefused()
-	if err := e.m.RemoveAll(t.Context()); err != nil {
+	if err := e.removeAllAndWipe(t.Context()); err != nil {
 		t.Fatalf("removal retry failed: %v", err)
 	}
 	requireCreateRefused()
@@ -3926,7 +4064,7 @@ func TestRemoveAllRetriesAcknowledgedFailedCreate(t *testing.T) {
 	id := retainedFailedCreate(t, e, true)
 	e.rt.deleteFails = 1
 
-	if err := e.m.RemoveAll(t.Context()); err == nil {
+	if err := e.removeAllAndWipe(t.Context()); err == nil {
 		t.Fatal("RemoveAll succeeded despite the failed VM deletion")
 	}
 	if calls := e.rt.deleteCallCount(); calls != 1 {
@@ -3939,7 +4077,7 @@ func TestRemoveAllRetriesAcknowledgedFailedCreate(t *testing.T) {
 	checkFailedCreateFiles(t, e, id, true)
 
 	for range 2 {
-		if err := e.m.RemoveAll(t.Context()); err != nil {
+		if err := e.removeAllAndWipe(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -4033,7 +4171,7 @@ func TestRemoveAllWaitsForFailedCreateCleanup(t *testing.T) {
 						t.Error("failed background Delete dropped pending cleanup")
 					}
 				}
-				if err := e.m.RemoveAll(t.Context()); err != nil {
+				if err := e.removeAllAndWipe(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 				if calls := e.rt.deleteCallCount(); calls != 1+tc.deleteFailures {

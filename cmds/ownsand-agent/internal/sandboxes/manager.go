@@ -599,14 +599,18 @@ func (m *Manager) checkLimitsLocked(cmd *ownsandv1.CreateSandboxCommand) error {
 	if res.GetVcpuCount() > l.GetVcpuCount() {
 		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox vCPU count exceeds the device vCPU limit")
 	}
-	var vcpu, mem, disk int64
+	kind := m.rt.Kind()
+	remainingMemory := uint64(max(0, l.GetMemoryMib()))
+	var vcpu, disk int64
 	macos := 0
 	for _, sb := range m.sandboxes {
 		if !sb.rec.Live() {
 			continue
 		}
 		vcpu += int64(sb.rec.VCPUCount)
-		mem += sb.rec.MemoryMiB
+		// Clamp the remaining budget to zero. Any positive request will
+		// fail the memory check once the existing VMs use the full budget.
+		remainingMemory -= min(remainingMemory, vmruntime.EffectiveMemoryMiB(kind, sb.rec.MemoryMiB))
 		disk += sb.rec.DiskGiB
 		if sb.rec.GuestOS == ownsandv1.GuestOs_GUEST_OS_MACOS {
 			macos++
@@ -615,7 +619,7 @@ func (m *Manager) checkLimitsLocked(cmd *ownsandv1.CreateSandboxCommand) error {
 	switch {
 	case vcpu+int64(res.GetVcpuCount()) > validate.EffectiveVCPULimit(l):
 		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, "device vCPU limit reached")
-	case mem+res.GetMemoryMib() > l.GetMemoryMib():
+	case vmruntime.EffectiveMemoryMiB(kind, res.GetMemoryMib()) > remainingMemory:
 		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, "device memory limit reached")
 	case disk+res.GetDiskGib() > l.GetDiskGib():
 		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, "device disk limit reached")
@@ -1583,10 +1587,10 @@ func (m *Manager) Entries() []*ownsandv1.SandboxStateEntry {
 	return out
 }
 
-// RemoveAll stops and deletes every sandbox and snapshot for a device
-// removal, including pending cleanup with no sandbox record. If runtime
-// deletion or durable marker removal fails, RemoveAll keeps the ID tracked
-// and skips the local wipe so removal can retry.
+// RemoveAll stops and deletes every sandbox in the runtime for device
+// removal, including pending cleanup with no sandbox record. It also clears
+// the snapshot inventory. If runtime deletion or durable marker removal
+// fails, it keeps the ID tracked so removal can retry before the local wipe.
 func (m *Manager) RemoveAll(ctx context.Context) error {
 	if err := m.fenceSnapshotImports(ctx); err != nil {
 		return err
@@ -1648,13 +1652,7 @@ func (m *Manager) RemoveAll(ctx context.Context) error {
 		m.snapshots = map[string]*snapshot{}
 	}
 	m.mu.Unlock()
-	if len(errs) > 0 {
-		// Do not wipe the local data: the wipe would remove the records
-		// and VM files of the failed sandboxes. The wipe is idempotent, so
-		// the retry that finds no failure runs it.
-		return errors.Join(errs...)
-	}
-	return m.st.WipeLocalData()
+	return errors.Join(errs...)
 }
 
 // removeDirIfExists removes a directory tree.

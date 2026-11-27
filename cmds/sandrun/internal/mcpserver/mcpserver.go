@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -723,30 +724,36 @@ func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) 
 	if err != nil {
 		return nil, execResult{}, err
 	}
-	env := map[string]string{}
-	for k, v := range in.Env {
-		env[k] = v
-	}
-	// --pass-env values come from the server's own environment at exec
-	// time and win over the tool arguments. They never appear in results
-	// or logs.
-	var missing []string
-	for _, name := range s.cfg.PassEnv {
-		if v, ok := s.cfg.LookupEnv(name); ok {
-			env[name] = v
-		} else {
-			delete(env, name)
-			missing = append(missing, name)
-		}
-	}
-	sort.Strings(missing)
+	env, missing, aliases := s.execEnvironment(in.Env)
 	execID, err := uuidv7.NewString()
 	if err != nil {
 		return nil, execResult{}, toolError(err)
 	}
 	col := newCollector(0, 0)
-	s.cfg.Logger.InfoContext(ctx, "sandrun mcp exec", "dev_session_id", in.SessionID, "exec_id", execID)
+	var guestOSResolved atomic.Bool
 	res, err := s.runWithWait(ctx, wait, col, func(sctx context.Context) (*sandrun.ExecResult, error) {
+		if len(aliases) != 0 {
+			session, err := c.DevSessions().GetDevSession(sctx, connect.NewRequest(&sandrunv1.GetDevSessionRequest{
+				OrganizationId: s.cfg.OrganizationID, DevSessionId: in.SessionID,
+			}))
+			if err != nil {
+				return nil, err
+			}
+			switch session.Msg.GetDevSession().GetGuestOs() {
+			case sandrunv1.GuestOs_GUEST_OS_WINDOWS:
+				for _, name := range aliases {
+					delete(env, name)
+				}
+			case sandrunv1.GuestOs_GUEST_OS_LINUX, sandrunv1.GuestOs_GUEST_OS_MACOS:
+			default:
+				return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("cannot determine the dev session guest OS for environment precedence"))
+			}
+			guestOSResolved.Store(true)
+		}
+		if err := sctx.Err(); err != nil {
+			return nil, err
+		}
+		s.cfg.Logger.InfoContext(sctx, "sandrun mcp exec", "dev_session_id", in.SessionID, "exec_id", execID)
 		return c.Exec(sctx, sandrun.ExecParams{
 			OrganizationID: s.cfg.OrganizationID, DevSessionID: in.SessionID, ExecID: execID,
 			Command: in.Command, Env: env, WorkingDirectory: in.Cwd,
@@ -754,6 +761,10 @@ func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) 
 		})
 	})
 	if errors.Is(err, errExecUnconfirmed) {
+		if len(aliases) != 0 && !guestOSResolved.Load() {
+			return nil, execResult{}, toolError(connect.NewError(connect.CodeDeadlineExceeded,
+				errors.New("the dev session guest OS lookup did not finish before the exec wait expired")))
+		}
 		s.cfg.Logger.WarnContext(ctx, "sandrun mcp exec start unconfirmed", "dev_session_id", in.SessionID, "exec_id", execID)
 		return nil, execResult{}, toolError(connect.NewError(connect.CodeDeadlineExceeded, fmt.Errorf(
 			"exec %s did not confirm its start before the wait passed, so it may not run; exec_output with this exec_id returns not_found if it did not start", execID)))
@@ -774,6 +785,41 @@ func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) 
 	out := col.result(execID, res)
 	out.MissingEnv = missing
 	return nil, out, nil
+}
+
+// execEnvironment overlays configured values and reports tool keys that
+// match a configured key only after Windows case folding.
+func (s *Server) execEnvironment(toolEnv map[string]string) (env map[string]string, missing, aliases []string) {
+	env = make(map[string]string, len(toolEnv))
+	for name, value := range toolEnv {
+		env[name] = value
+	}
+
+	configured := map[string]struct{}{}
+	folded := map[string]struct{}{}
+	for _, name := range s.cfg.PassEnv {
+		if value, ok := s.cfg.LookupEnv(name); ok {
+			env[name] = value
+			configured[name] = struct{}{}
+			// Match OwnSand's Windows guest helper and os/exec.
+			folded[strings.ToLower(name)] = struct{}{}
+		} else {
+			delete(env, name)
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	if len(folded) != 0 {
+		for name := range env {
+			if _, exact := configured[name]; exact {
+				continue
+			}
+			if _, collision := folded[strings.ToLower(name)]; collision {
+				aliases = append(aliases, name)
+			}
+		}
+	}
+	return env, missing, aliases
 }
 
 func (s *Server) execOutput(ctx context.Context, _ *mcp.CallToolRequest, in execOutputArgs) (*mcp.CallToolResult, execResult, error) {
