@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -30,6 +31,8 @@ const (
 	maxManifestBytes = 1 << 20
 	maxArtifactBytes = 512 << 20
 )
+
+const artifactRetryDelay = time.Second
 
 // ErrInstalling rejects creates and snapshot transfers once the installation
 // started.
@@ -393,6 +396,12 @@ func (u *Updater) recordRunningRevocation(order uint64, revoked bool, target str
 	return nil
 }
 
+type downloadStatusError int
+
+func (e downloadStatusError) Error() string {
+	return fmt.Sprintf("update: download returned HTTP %d", e)
+}
+
 func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -404,7 +413,7 @@ func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("update: download returned HTTP %d", resp.StatusCode)
+		return nil, downloadStatusError(resp.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
@@ -414,6 +423,52 @@ func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, e
 		return nil, errors.New("update: download is larger than its limit")
 	}
 	return data, nil
+}
+
+func transientArtifactError(err error) bool {
+	var status downloadStatusError
+	if errors.As(err, &status) {
+		switch int(status) {
+		case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError,
+			http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	var networkError net.Error
+	return (errors.As(err, &networkError) && networkError.Timeout()) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) || transientSocketError(err)
+}
+
+func (u *Updater) fetchArtifact(ctx context.Context, url, target string, order uint64) ([]byte, error) {
+	data, err := u.fetch(ctx, url, maxArtifactBytes)
+	if err == nil || !transientArtifactError(err) {
+		return data, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	u.opts.Logger.Info("agent update artifact download will retry", "target_version", target, "delay", artifactRetryDelay)
+	timer := time.NewTimer(artifactRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+	}
+
+	u.mu.Lock()
+	invalidated := u.commandInvalidationLocked(order)
+	u.mu.Unlock()
+	if invalidated != nil {
+		return nil, invalidated
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return u.fetch(ctx, url, maxArtifactBytes)
 }
 
 // Handle runs an update command up to the verified download. The
@@ -604,7 +659,7 @@ func (u *Updater) download(ctx context.Context, target string, order uint64) ([]
 	if err != nil {
 		return nil, err
 	}
-	data, err := u.fetch(ctx, art.URL, maxArtifactBytes)
+	data, err := u.fetchArtifact(ctx, art.URL, target, order)
 	if err != nil {
 		return nil, fmt.Errorf("update: download artifact: %w", err)
 	}
