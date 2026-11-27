@@ -69,7 +69,7 @@ func TestLinkPresenceRotatesPastErrorsAndStopsOnLeaseLoss(t *testing.T) {
 		}
 		return f.fake.Client().GetOrganizationBilling(ctx, req)
 	}}
-	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: client, Held: func() bool { return held }})
+	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: client, Ownership: func() (uint64, bool) { return 0, held }})
 	changes := 0
 	statuses.OnChange(func() { changes++ })
 

@@ -731,12 +731,16 @@ func TestRunDoesNotSpinOnUnknownMeterRows(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { m.Run(ctx); close(done) }()
+	stop := func() {
+		cancel()
+		<-done
+	}
+	t.Cleanup(stop)
 	eventually(t, "the first report pass", func() bool {
 		return strings.Contains(f.logText(), `"msg":"billing_usage_unknown_meter_unsent"`)
 	})
 	time.Sleep(300 * time.Millisecond)
-	cancel()
-	<-done
+	stop()
 	// One pass at the start; a spin would add one per BackoffMin.
 	if n := strings.Count(f.logText(), `"msg":"billing_usage_unknown_meter_unsent"`); n > 2 {
 		t.Fatalf("the reporter ran %d passes for a row it never reports", n)

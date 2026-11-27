@@ -53,9 +53,8 @@ func TestImportResultWaitsForInFlightDeviceRemoval(t *testing.T) {
 	}
 
 	sendImportResult(agentB, cmdID)
-	// The result must be blocked on the device row, not applied: the row it
-	// would insert is checked after the removal commits.
-	time.Sleep(500 * time.Millisecond)
+	waitForImportResultLock(t, env, tx.Conn().PgConn().PID(),
+		"SELECT state FROM devices WHERE device_id = $1 FOR SHARE")
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}

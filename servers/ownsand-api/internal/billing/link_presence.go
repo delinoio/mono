@@ -29,9 +29,6 @@ func (s *Statuses) CheckLinkPresence(ctx context.Context) error {
 	}
 	s.presenceMu.Lock()
 	defer s.presenceMu.Unlock()
-	if !s.held() {
-		return nil
-	}
 	if s.whileHeld != nil {
 		var period *lease.Period
 		if !s.whileHeld(func(p *lease.Period) { period = p }) {
@@ -40,6 +37,8 @@ func (s *Statuses) CheckLinkPresence(ctx context.Context) error {
 		periodCtx, cancel := period.ContextUntilLoss(ctx)
 		defer cancel()
 		ctx = periodCtx
+	} else if _, held := s.ownership(); !held {
+		return nil
 	}
 
 	listCtx, cancel := context.WithTimeout(ctx, linkPresenceTimeout)
@@ -65,7 +64,7 @@ func (s *Statuses) CheckLinkPresence(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !s.held() {
+		if _, held := s.ownership(); !held {
 			return nil
 		}
 		if err := s.checkOrganizationLink(ctx, orgID); err != nil {
@@ -96,8 +95,11 @@ func (s *Statuses) checkOrganizationLink(ctx context.Context, orgID string) erro
 			return err
 		}
 		st, ok, err := LoadStatus(bounded, tx, orgID, false)
-		if err != nil || !ok || !st.Linked() || !s.held() {
+		if err != nil || !ok || !st.Linked() {
 			return err
+		}
+		if _, held := s.ownership(); !held {
+			return nil
 		}
 		_, err = s.client.GetOrganizationBilling(bounded, connect.NewRequest(&accountsv1.GetOrganizationBillingRequest{
 			Service: ServiceID, OrganizationId: orgID,

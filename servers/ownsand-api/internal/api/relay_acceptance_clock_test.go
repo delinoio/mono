@@ -51,6 +51,11 @@ func TestRelayAcceptanceWallClockSteps(t *testing.T) {
 				o.RelayClock = clock
 				o.RelayTiming.Acceptance = 30 * time.Second
 				o.RelayTiming.Keepalive = 40 * time.Millisecond
+				// Set the idle keepalive interval beyond the fake clock's
+				// 40-second maximum so each barrier waits for its own echo.
+				limits := relay.DefaultLimits()
+				limits.Keepalive = time.Minute
+				o.RelayLimits = &limits
 			})
 			org, agent, sandboxID := runningSandbox(t, env)
 			r := agent.ConnectRelay(nil)

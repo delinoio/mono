@@ -409,7 +409,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if v := get(EnvAccountsAPIOrigin); v != "" {
 		u, err := url.Parse(v)
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
+		if err != nil || !validHTTPURL(u) || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
 			// A bare "?" leaves u.RawQuery empty and only sets u.ForceQuery, so check it too. The origin has no query, empty or not.
 			// User information (user, user:password or an empty "@") is not part of an origin,
 			// and it would send credentials to the accounts API in every request URL.
@@ -481,10 +481,23 @@ func parseKey(name, value string) ([]byte, error) {
 
 func validateURL(name, value string) error {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
+	if err != nil || !validHTTPURL(u) {
 		return fmt.Errorf("%s must be an http or https URL", name)
 	}
 	return nil
+}
+
+func validHTTPURL(u *url.URL) bool {
+	if (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
+		return false
+	}
+	port := u.Port()
+	if port == "" {
+		return true
+	}
+	// url.Parse checks the port syntax but accepts decimal values above 65535.
+	_, err := strconv.ParseUint(port, 10, 16)
+	return err == nil
 }
 
 // validateR2Endpoint requires a root HTTP or HTTPS account endpoint.

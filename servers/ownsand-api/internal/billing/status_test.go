@@ -19,6 +19,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts/accountstest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 )
 
 const (
@@ -474,7 +475,7 @@ func TestRunRetriesPendingUnlinksEveryTick(t *testing.T) {
 	var mu sync.Mutex
 	isHeld := false
 	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: f.fake.Client(), Timing: &timing,
-		Held: func() bool { mu.Lock(); defer mu.Unlock(); return isHeld }})
+		Ownership: func() (uint64, bool) { mu.Lock(); defer mu.Unlock(); return 0, isHeld }})
 	setHeld := func(v bool) { mu.Lock(); isHeld = v; mu.Unlock() }
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -559,8 +560,8 @@ func (p *pollRecorder) startTimes() []time.Time {
 
 // runStatuses runs the status worker of a lease holder with the timing and
 // the client until the returned stop function is called.
-func (f *statusFixture) runStatuses(timing billing.StatusTiming, client accountsv1connect.UsageServiceClient, held func() bool) (*billing.Statuses, func(), <-chan error) {
-	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: client, Timing: &timing, Held: held})
+func (f *statusFixture) runStatuses(timing billing.StatusTiming, client accountsv1connect.UsageServiceClient, ownership func() (uint64, bool)) (*billing.Statuses, func(), <-chan error) {
+	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: client, Timing: &timing, Ownership: ownership})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
 	go func() { statuses.Run(ctx); close(done) }()
@@ -614,13 +615,13 @@ func TestRunPollTriggers(t *testing.T) {
 	f := newStatusFixture(t, time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC))
 	var mu sync.Mutex
 	isHeld := false
-	held := func() bool { mu.Lock(); defer mu.Unlock(); return isHeld }
+	ownership := func() (uint64, bool) { mu.Lock(); defer mu.Unlock(); return 0, isHeld }
 	setHeld := func(v bool) { mu.Lock(); isHeld = v; mu.Unlock() }
 	polls := func() int { return f.fake.Calls(accountstest.MethodListBillingStatusChanges) }
 
 	// The poll interval is far longer than the test: only the first step and
 	// a kick poll.
-	statuses, stop, _ := f.runStatuses(billing.StatusTiming{Poll: time.Hour, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, f.fake.Client(), held)
+	statuses, stop, _ := f.runStatuses(billing.StatusTiming{Poll: time.Hour, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, f.fake.Client(), ownership)
 	defer stop()
 	time.Sleep(200 * time.Millisecond)
 	if n := polls(); n != 0 {
@@ -637,6 +638,74 @@ func TestRunPollTriggers(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if n := polls(); n != 2 {
 		t.Fatalf("polls = %d, want 2 after the kick", n)
+	}
+}
+
+func TestRunPollOnLeaseReacquisition(t *testing.T) {
+	for _, observeLoss := range []bool{true, false} {
+		name := "loss between steps"
+		if observeLoss {
+			name = "loss observed on a step"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newStatusFixture(t, time.Now())
+			timing := billing.DefaultStatusTiming()
+			timing.Poll = time.Hour
+			timing.Tick = 10 * time.Millisecond
+
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan struct{})
+			type ownership struct {
+				epoch uint64
+				held  bool
+			}
+			samples := make(chan struct{})
+			states := make(chan ownership)
+			statuses := billing.NewStatuses(billing.StatusOptions{
+				DB: f.db, Logger: f.logger, Client: f.fake.Client(), Timing: &timing,
+				// Only the poll loop takes a step on the fixture's channel.
+				WhileHeld: func(func(*lease.Period)) bool { return false },
+				Ownership: func() (uint64, bool) {
+					select {
+					case samples <- struct{}{}:
+					case <-ctx.Done():
+						return 0, false
+					}
+					select {
+					case state := <-states:
+						return state.epoch, state.held
+					case <-ctx.Done():
+						return 0, false
+					}
+				},
+			})
+			go func() { defer close(done); statuses.Run(ctx) }()
+			defer func() { cancel(); <-done }()
+
+			// The next sample proves that the worker finished the previous step.
+			step := func(state ownership, previousPolls int) {
+				t.Helper()
+				select {
+				case <-samples:
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for the next ownership sample")
+				}
+				if got := f.fake.Calls(accountstest.MethodListBillingStatusChanges); got != previousPolls {
+					t.Fatalf("before sample %+v: got %d polls, want %d", state, got, previousPolls)
+				}
+				states <- state
+			}
+			first := ownership{epoch: 1, held: true}
+			next := ownership{epoch: 3, held: true}
+			step(first, 0)
+			step(first, 1) // Renewal keeps this epoch and the existing cadence.
+			if observeLoss {
+				step(ownership{epoch: 2}, 1)
+			}
+			step(next, 1)
+			step(next, 2)
+			step(next, 2)
+		})
 	}
 }
 
