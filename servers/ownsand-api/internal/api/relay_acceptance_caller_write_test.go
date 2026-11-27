@@ -80,6 +80,10 @@ func TestRelayAcceptanceWhileCallerWriteStalls(t *testing.T) {
 				o.RelayTiming.Rotation = 30 * time.Second
 				o.RelayTiming.RequestDeadline = 10 * time.Second
 				o.RelayTiming.Keepalive = 20 * time.Millisecond
+				// Keep idle relay frames out of the test's echo barriers.
+				limits := relay.DefaultLimits()
+				limits.Keepalive = time.Minute
+				o.RelayLimits = &limits
 			})
 			org, agent, sandboxID := runningSandbox(t, env)
 			entered, resume := make(chan struct{}), make(chan struct{})

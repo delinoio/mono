@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +21,7 @@ import (
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/grants"
@@ -176,8 +179,18 @@ func TestRelayExecReadWrite(t *testing.T) {
 	if !relaybinding.Equal(g.GetRequestDigest(), relaybinding.ExecDigest(req)) || g.GetStreamDeadlineIn().AsDuration() != 30*time.Minute || g.GetExpiresIn().AsDuration() != 15*time.Minute {
 		t.Fatalf("grant = %v", g)
 	}
-	relayClient := env.ClientsWith(org.APIKey, grantHeader(grant.GetGrantId())).Relay
-	stream, err := relayClient.Exec(ctx, connect.NewRequest(req))
+	armed := make(chan string, 4)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		env.App.Handler().ServeHTTP(&relayDeadlineWriter{
+			ResponseWriter: w,
+			onArm:          func(time.Time) { armed <- r.URL.Path },
+		}, r)
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+	relayClient := ownsandv1connect.NewRelayServiceClient(srv.Client(), srv.URL)
+	stream, err := relayClient.Exec(ctx, relayRequestWithGrant(org.APIKey, grant.GetGrantId(), req))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +223,7 @@ func TestRelayExecReadWrite(t *testing.T) {
 	r.WaitFrame("stream close", func(f *ownsandv1.DataFrame) bool { return f.GetStreamId() == 1 && f.GetRelayStreamClose() != nil })
 
 	// AttachExec under the EXEC grant uses a new stream_id.
-	attach, err := relayClient.AttachExec(ctx, connect.NewRequest(&ownsandv1.AttachExecRequest{OrganizationId: org.ID, SandboxId: sandboxID, ExecId: req.GetExecId()}))
+	attach, err := relayClient.AttachExec(ctx, relayRequestWithGrant(org.APIKey, grant.GetGrantId(), &ownsandv1.AttachExecRequest{OrganizationId: org.ID, SandboxId: sandboxID, ExecId: req.GetExecId()}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +243,7 @@ func TestRelayExecReadWrite(t *testing.T) {
 	salt, _ := relaybinding.NewSalt()
 	read := &ownsandv1.ReadFileRequest{OrganizationId: org.ID, SandboxId: sandboxID, ReadId: readID, Path: "/etc/secret-path", BindingSalt: salt}
 	rg := authorize(t, key, org.ID, sandboxID, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_READ_FILE, readID, relaybinding.ReadFileDigest(read))
-	rs, err := env.ClientsWith(org.APIKey, grantHeader(rg)).Relay.ReadFile(ctx, connect.NewRequest(read))
+	rs, err := relayClient.ReadFile(ctx, relayRequestWithGrant(org.APIKey, rg, read))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,9 +261,17 @@ func TestRelayExecReadWrite(t *testing.T) {
 	writeID, _ := uuidv7.NewString()
 	write := &ownsandv1.WriteFileRequest{OrganizationId: org.ID, SandboxId: sandboxID, WriteId: writeID, Path: "/tmp/x", BindingSalt: salt, Data: []byte("secret-chunk")}
 	wg := authorize(t, key, org.ID, sandboxID, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE, writeID, relaybinding.WriteFileDigest(write))
-	wr, err := env.ClientsWith(org.APIKey, grantHeader(wg)).Relay.WriteFile(ctx, connect.NewRequest(write))
+	wr, err := relayClient.WriteFile(ctx, relayRequestWithGrant(org.APIKey, wg, write))
 	if err != nil || wr.Msg.GetLength() != 12 {
 		t.Fatalf("write: %v %v", wr, err)
+	}
+	var procedures []string
+	for len(armed) > 0 {
+		procedures = append(procedures, <-armed)
+	}
+	wantArmed := []string{ownsandv1connect.RelayServiceExecProcedure, ownsandv1connect.RelayServiceAttachExecProcedure, ownsandv1connect.RelayServiceReadFileProcedure}
+	if !slices.Equal(procedures, wantArmed) {
+		t.Fatalf("responses with write deadlines: %v, want %v", procedures, wantArmed)
 	}
 	// Forwarding without persistence or logging of content.
 	logs := env.Logs.String()
@@ -659,12 +680,15 @@ func TestAuthorizeRelayRequestBindingAfterAdmissionExpiry(t *testing.T) {
 	t.Log("Connect rejected the conflicting retry with invalid_argument and the agent acknowledged a fresh grant for the identical retry")
 }
 
-// TestAuthorizeRelayChannelLostWhilePending covers a pending grant whose
-// agent channel closes without an acknowledgement: the caller gets
-// unavailable without a retry delay (not the grant-limit resource_exhausted
-// result) and the pending grant is removed.
+// TestAuthorizeRelayChannelLostWhilePending verifies that closing the agent
+// channel removes its pending grant and ends the RPC with unavailable and
+// no retry delay.
 func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
-	env := testenv.New(t)
+	env := testenv.New(t, func(o *app.Options) {
+		// Give grant delivery, channel shutdown, and the RPC response time
+		// to complete before the acknowledgement timer can fire.
+		o.RelayTiming.GrantAck = 30 * time.Second
+	})
 	org, agent, sandboxID := runningSandbox(t, env)
 	req := newExec(org.ID, sandboxID)
 	authID, _ := uuidv7.NewString()
@@ -684,15 +708,14 @@ func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("waiting for the relay grant: %v", err)
 	}
-	// The channel closes while the caller waits, well before the
-	// acknowledgement timeout, so the removal of the pending grant ends the wait.
 	agent.Close()
 	select {
 	case err = <-errCh:
 	case <-time.After(10 * time.Second):
 		t.Fatal("AuthorizeRelay did not return after the agent channel closed")
 	}
-	if testenv.Code(err) != connect.CodeUnavailable {
+	var connectErr *connect.Error
+	if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeUnavailable {
 		t.Fatalf("channel lost while pending: %v", err)
 	}
 	if errDetail(err).GetRetryAfter() != nil {
@@ -700,6 +723,9 @@ func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
 	}
 	if env.App.Plane.Grants.Get(received.GetGrantId()) != nil {
 		t.Fatal("pending grant kept after the channel closed")
+	}
+	if connectErr.Message() != "the agent channel closed before it acknowledged the relay grant" {
+		t.Fatalf("expected the agent channel closure to end the grant wait, got %v", err)
 	}
 }
 
