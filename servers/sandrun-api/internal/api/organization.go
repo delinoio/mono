@@ -259,8 +259,8 @@ func (h OrganizationHandler) TransferOwnership(ctx context.Context, req *connect
 		if deleting {
 			return ErrPrecondition("organization deletion is in progress; try again")
 		}
-		if target == "" {
-			return ErrInvalidf("invalid user_id: is required")
+		if err := validateMembershipTargetUserID(target); err != nil {
+			return err
 		}
 		if target == c.UserID {
 			return ErrInvalidf("invalid user_id: the caller is already the owner")

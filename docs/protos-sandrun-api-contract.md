@@ -94,6 +94,7 @@ The control plane serves every public service at `https://sandrun.api.delino.io`
 
 ### Organization and member messages
 
+- After authorization and any ownership-transfer deletion check, `UpdateMemberRole`, `RemoveMember` and `TransferOwnership` reject an empty target `user_id` with `invalid_argument` and the message `invalid user_id: is required`. A target containing U+0000 returns `invalid_argument` with `invalid user_id: must not contain NUL`. The server looks up other IDs as supplied, preserving case. An unknown target returns `not_found`.
 - `Organization` carries `settings` (`OrganizationSettings`) with the optional `max_dev_sessions_per_user`. `UpdateOrganizationSettings` takes the settings and a field mask; a masked path with no value clears the setting.
 - Invitation secrets are `sri_` followed by 32 random bytes in unpadded base64url. `CreateInvitationResponse` returns the secret once.
 
@@ -105,6 +106,8 @@ The control plane serves every public service at `https://sandrun.api.delino.io`
 ### Runner profile messages
 
 `RunnerProfile` carries the fields of the [control plane runner profile table](servers-sandrun-api-foundation.md#runner-profiles). `source` is a `oneof` of `base_image` (`GuestOs`) and `ownsand_template_id`. `CreateRunnerProfile` sets every field. `UpdateRunnerProfile` uses a field mask and rejects a change of `workload_kind` or `agent_integration_id` with `invalid_argument`.
+
+If the selected agent integration is missing during validation or when SandRun saves the profile, `CreateRunnerProfile` returns `not_found` with `agent integration not found`. The failed request creates no profile or profile-created audit event.
 
 Use `resources` to replace all resource values. Use `resources.vcpu_count`, `resources.memory_mib` or `resources.disk_gib` to change individual values. The server keeps the current value of each omitted resource and validates the resulting profile.
 

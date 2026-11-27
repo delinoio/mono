@@ -178,3 +178,66 @@ func TestDevSessionFileWriteWaitHonorsContext(t *testing.T) {
 		})
 	}
 }
+
+func TestDevSessionReplaysLostWriteFinish(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	session, sandboxID := w.runningSession(t)
+	owner := w.env.User(w.org.Member)
+	ctx := t.Context()
+	const path = "fixture.txt"
+
+	writeID := api.NewID()
+	if _, err := owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&sandrunv1.WriteDevSessionFileRequest{
+		OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(), WriteId: writeID,
+		Path: path, Data: []byte("abc"),
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	// Send the final request over HTTP but drop its response before Connect
+	// can deliver it to the caller.
+	client := sandrunv1connect.NewDevSessionServiceClient(dropWriteResponse{owner.HTTP}, w.env.Server.URL)
+	final := &sandrunv1.WriteDevSessionFileRequest{
+		OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(), WriteId: writeID,
+		Path: path, Offset: 3, Data: []byte("def"), Final: true, Mode: 0o600,
+	}
+	_, err := client.WriteDevSessionFile(ctx, connect.NewRequest(final))
+	wantCode(t, "lost finish response", err, connect.CodeUnavailable)
+	checkFile := func(want string) {
+		t.Helper()
+		got, ok := w.fake.File(w.osOrg, sandboxID, "/home/dev/work/"+path)
+		if !ok || string(got) != want {
+			t.Fatalf("file = %q (exists %t), want %q", got, ok, want)
+		}
+	}
+	checkFile("abcdef")
+
+	if _, err := owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(&sandrunv1.WriteDevSessionFileRequest{
+		OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(), WriteId: api.NewID(),
+		Path: path, Data: []byte("newer"), Final: true, Mode: 0o644,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	got, err := owner.DevSession.WriteDevSessionFile(ctx, connect.NewRequest(final))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := got.Msg; r.GetWriteId() != writeID || r.GetOffset() != 3 || r.GetLength() != 3 || !r.GetFinished() || r.GetSizeBytes() != 6 {
+		t.Fatalf("replayed finish = %v, want write %s finished at offset 3 with length 3 and size 6", r, writeID)
+	}
+	checkFile("newer")
+}
+
+type dropWriteResponse struct{ client *http.Client }
+
+func (d dropWriteResponse) Do(req *http.Request) (*http.Response, error) {
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, errors.New("expected a successful response before simulating its loss")
+	}
+	return nil, connect.NewError(connect.CodeUnavailable, errors.New("finish response lost"))
+}

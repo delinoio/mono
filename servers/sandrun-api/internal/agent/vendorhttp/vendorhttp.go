@@ -205,10 +205,10 @@ func cut(s string) string {
 	return s
 }
 
-// Do sends one JSON request and decodes a 2xx JSON answer into out (nil
-// ignores the body). op names the operation in errors and logs (for
-// example "claim"); it never contains IDs or credentials. A non-2xx
-// answer returns a *StatusError.
+// Do sends one JSON request. A non-nil out requires a JSON document in a
+// 2xx response. A nil out ignores the body. op names the operation in errors
+// and logs (for example "claim") and never contains IDs or credentials.
+// A non-2xx answer returns a *StatusError.
 func (c *Client) Do(ctx context.Context, op, method, path string, query url.Values, body, out any) error {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -243,7 +243,7 @@ func (c *Client) Do(ctx context.Context, op, method, path string, query url.Valu
 		return fmt.Errorf("%s %s: response larger than %d bytes", c.Vendor, op, maxBody)
 	}
 	if len(bytes.TrimSpace(b)) == 0 {
-		return nil
+		return fmt.Errorf("%s %s: decode response: empty body", c.Vendor, op)
 	}
 	if err := json.Unmarshal(b, out); err != nil {
 		return fmt.Errorf("%s %s: decode response: %w", c.Vendor, op, err)

@@ -127,9 +127,6 @@ type Engine struct {
 	// runCtx and runWG belong to the running reconciler component.
 	runCtx context.Context
 	runWG  *sync.WaitGroup
-	// pendingReleases holds the requests that a clean-up hook ended in a
-	// transaction, for the claim releases after the commit.
-	pendingReleases sync.Map
 }
 
 // New returns an engine. Register adapters before the app runs.

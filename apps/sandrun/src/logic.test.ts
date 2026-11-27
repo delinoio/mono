@@ -54,6 +54,14 @@ import {
 import { parseRoute, RouteId, routePath } from "./router.tsx";
 
 describe("configuration", () => {
+  const malformedAuthorities = [
+    "https://ap\ti.test",
+    "https://ap\ni.test",
+    "https://ap\ri.test",
+    "https://@api.test",
+  ];
+  const authorityError = "must use an authority without @, tabs or line breaks";
+
   describe.each([false, true])("production=%s", (production) => {
     test("normalizes a complete Logto registration and requests sandrun:use", () => {
       const config = readConsoleConfig(
@@ -73,7 +81,22 @@ describe("configuration", () => {
       });
     });
 
+    test.each(malformedAuthorities)("rejects API origin %j", (value) => {
+      expect(() =>
+        readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production }),
+      ).toThrow(new Error(`PUBLIC_API_ORIGIN ${authorityError}`));
+    });
+
     describe.each([undefined, "", "   ", "app"])("app ID %j", (appId) => {
+      test.each(malformedAuthorities)("rejects Logto authority %j", (value) => {
+        expect(() =>
+          readConsoleConfig(
+            { PUBLIC_LOGTO_ENDPOINT: value, PUBLIC_LOGTO_APP_ID: appId },
+            { production },
+          ),
+        ).toThrow(new Error(`PUBLIC_LOGTO_ENDPOINT ${authorityError}`));
+      });
+
       test.each([
         ["not-a-url", "is not a valid URL"],
         [
@@ -152,6 +175,7 @@ describe("configuration", () => {
     ["https://api.test", "https://api.test"],
     ["https://api.test/", "https://api.test"],
     ["http://localhost:8080", "http://localhost:8080"],
+    [" \thttp://[::1]:18400/ \n", "http://[::1]:18400"],
     ["HTTPS://api.test", "https://api.test"],
     [" https://api.test/ ", "https://api.test"],
   ])("normalizes %j to a bare origin", (value, origin) => {
@@ -706,11 +730,25 @@ describe("queue view", () => {
     expect(view.requests.size).toBe(0);
   });
 
-  test("keeps the loading state when the stream fails before the first snapshot", () => {
-    const view = initialQueueView();
-    expect(
-      applyQueueEvent(view, { kind: QueueViewActionKind.StreamFailed }),
-    ).toBe(view);
+  test("discards an incomplete first snapshot when the stream fails", () => {
+    let view = applyQueueEvent(initialQueueView(), {
+      kind: WatchQueueEventKind.Request,
+      request: request("partial", RequestState.QUEUED),
+    });
+    view = applyQueueEvent(view, { kind: QueueViewActionKind.StreamFailed });
+    expect(view.live).toBe(LiveState.Disconnected);
+    expect(view.hasSnapshot).toBe(false);
+    expect(view.pending).toBeUndefined();
+    expect(view.requests.size).toBe(0);
+
+    view = applyQueueEvent(view, { kind: QueueViewActionKind.Restart });
+    expect(view.live).toBe(LiveState.Connecting);
+    view = applyQueueEvent(view, {
+      kind: WatchQueueEventKind.SnapshotComplete,
+    });
+    expect(view.live).toBe(LiveState.Live);
+    expect(view.hasSnapshot).toBe(true);
+    expect(view.requests.size).toBe(0);
   });
 
   test("keeps the last state across a gap and replaces it with the new snapshot", () => {

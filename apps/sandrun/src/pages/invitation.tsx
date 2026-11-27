@@ -14,7 +14,7 @@ import {
   takeSecretFromAddress,
 } from "../invitation.ts";
 import { refreshOrganizations } from "../organizations.ts";
-import { orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
+import { Link, orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
 
 /**
  * Accepts an invitation as the signed-in user. The form starts with the
@@ -25,10 +25,11 @@ export function InvitationPage({
 }: {
   initialSecret: string | undefined;
 }) {
-  const { navigate } = useRouter();
+  const { isCurrentVisit, navigate } = useRouter();
   const queryClient = useQueryClient();
   const [value, setValue] = useState(initialSecret ?? "");
   const [inputError, setInputError] = useState<string>();
+  const [showRecovery, setShowRecovery] = useState(false);
   const currentAttempt = useRef(0);
   const accept = useMutation(MemberService.method.acceptInvitation, {
     // Joining changes the organization list even if the user has moved on.
@@ -57,6 +58,7 @@ export function InvitationPage({
       currentAttempt.current += 1;
       setValue(secret);
       setInputError(undefined);
+      setShowRecovery(false);
       resetAccept();
     };
     window.addEventListener("hashchange", consumeInvitation);
@@ -80,13 +82,18 @@ export function InvitationPage({
       // The address can change before React unmounts or hashchange runs.
       if (
         attempt !== currentAttempt.current ||
-        parseRoute(window.location.pathname).id !== RouteId.Invitation ||
+        !isCurrentVisit() ||
         secretFromFragment(window.location.hash) !== undefined
       ) {
         return;
       }
       setValue("");
-      navigate(orgPath(RouteId.Overview, res.organization!.organizationId), {
+      const organizationId = res.organization?.organizationId;
+      if (!organizationId?.trim()) {
+        setShowRecovery(true);
+        return;
+      }
+      navigate(orgPath(RouteId.Overview, organizationId), {
         replace: true,
       });
     } catch {
@@ -100,30 +107,41 @@ export function InvitationPage({
       <main className="content content-narrow">
         <PageHeader
           title="Accept an invitation"
-          description="Join a SandRun organization with the one-time invitation that an admin sent you. An invitation works for 7 days."
+          description={
+            showRecovery
+              ? undefined
+              : "Join a SandRun organization with the one-time invitation that an admin sent you. An invitation works for 7 days."
+          }
         />
-        <form className="form" onSubmit={submit} noValidate>
-          <PasswordInput
-            label="Invitation link or secret"
-            toggleLabel="Show invitation"
-            value={value}
-            onValueChange={(v: string) => {
-              currentAttempt.current += 1;
-              setValue(v);
-              setInputError(undefined);
-              resetAccept();
-            }}
-            error={inputError}
-            autoFocus
-            autoComplete="off"
-          />
-          {accept.error ? <ErrorNotice error={accept.error} /> : null}
-          <div className="actions">
-            <Button type="submit" disabled={accept.isPending}>
-              Join organization
-            </Button>
+        {showRecovery ? (
+          <div className="notice">
+            <p role="alert">You may have joined the organization.</p>
+            <Link to="/">Go to your organizations</Link>
           </div>
-        </form>
+        ) : (
+          <form className="form" onSubmit={submit} noValidate>
+            <PasswordInput
+              label="Invitation link or secret"
+              toggleLabel="Show invitation"
+              value={value}
+              onValueChange={(v: string) => {
+                currentAttempt.current += 1;
+                setValue(v);
+                setInputError(undefined);
+                resetAccept();
+              }}
+              error={inputError}
+              autoFocus
+              autoComplete="off"
+            />
+            {accept.error ? <ErrorNotice error={accept.error} /> : null}
+            <div className="actions">
+              <Button type="submit" disabled={accept.isPending}>
+                Join organization
+              </Button>
+            </div>
+          </form>
+        )}
       </main>
     </>
   );
