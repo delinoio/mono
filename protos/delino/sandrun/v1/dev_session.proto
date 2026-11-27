@@ -177,11 +177,14 @@ message DevSessionExecStarted {
   google.protobuf.Timestamp start_time = 2;
 }
 
-// The requested offsets are older than the kept output.
+// Output is missing from one or both streams. Each offset gives the next byte
+// position for resuming that stream. If a stream has missing bytes, its offset
+// advances to the end of the missing range. A stream without missing bytes
+// keeps its current offset.
 message DevSessionExecOutputTruncated {
-  // First available stdout offset.
+  // Next byte offset for resuming stdout.
   int64 stdout_offset = 1;
-  // First available stderr offset.
+  // Next byte offset for resuming stderr.
   int64 stderr_offset = 2;
 }
 
