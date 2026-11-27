@@ -317,14 +317,20 @@ func TestRegisterAdmittedRefusedLeavesHubUnchanged(t *testing.T) {
 func TestConfigLockWaitersCountsBlockedSenders(t *testing.T) {
 	h := New()
 	conn := h.Register(context.Background(), "device", "org")
-	unlockFirst := conn.LockConfig()
+	unlockFirst, err := conn.LockConfig(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got := conn.ConfigLockWaiters(); got != 0 {
 		t.Fatalf("waiters with the lock held and nobody waiting = %d, want 0", got)
 	}
-	acquired := make(chan struct{})
+	acquired := make(chan error, 1)
 	go func() {
-		defer close(acquired)
-		conn.LockConfig()()
+		unlock, err := conn.LockConfig(t.Context())
+		if err == nil {
+			unlock()
+		}
+		acquired <- err
 	}()
 	deadline := time.Now().Add(10 * time.Second)
 	for conn.ConfigLockWaiters() != 1 {
@@ -334,7 +340,9 @@ func TestConfigLockWaitersCountsBlockedSenders(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	unlockFirst()
-	<-acquired
+	if err := <-acquired; err != nil {
+		t.Fatal(err)
+	}
 	if got := conn.ConfigLockWaiters(); got != 0 {
 		t.Fatalf("waiters after both released = %d, want 0", got)
 	}
