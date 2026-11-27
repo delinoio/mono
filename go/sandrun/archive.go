@@ -136,7 +136,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 		}
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return st, verifyLinks(ctx, dir)
+			return st, finishArchiveLinks(ctx, root, st)
 		}
 		if err != nil {
 			return st, err
@@ -179,7 +179,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			if err := root.Symlink(filepath.FromSlash(hdr.Linkname), name); err != nil {
 				// A Windows account without the symbolic link privilege
 				// cannot create links; the download keeps the rest.
-				st.warnings = append(st.warnings, fmt.Sprintf("%s: the symbolic link could not be created", filepath.ToSlash(name)))
+				st.warnSymlink(name)
 				continue
 			}
 			st.files++
@@ -203,6 +203,10 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			st.warnings = append(st.warnings, fmt.Sprintf("%s: skipped an archive entry of an unsupported type", filepath.ToSlash(name)))
 		}
 	}
+}
+
+func (st *extractStats) warnSymlink(name string) {
+	st.warnings = append(st.warnings, fmt.Sprintf("%s: the symbolic link could not be created", filepath.ToSlash(name)))
 }
 
 type archiveFileName struct {
@@ -407,7 +411,8 @@ const maxLinkHops = 255
 // checks a target only as text, and an entry name or a target that passes
 // through another link can point elsewhere: with a/b -> .., the link
 // a/b/l -> ../x is the link l in dir, whose target leaves dir.
-func verifyLinks(ctx context.Context, dir string) error {
+// If visit is set, it receives each link after that link passes the check.
+func verifyLinks(ctx context.Context, dir string, visit func(string, resolvedArchiveLink) error) error {
 	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -422,22 +427,29 @@ func verifyLinks(ctx context.Context, dir string) error {
 		if err != nil {
 			return err
 		}
-		ok, err := resolvesInside(dir, rel)
+		target, ok, err := resolveArchiveLink(dir, rel)
 		if err != nil {
 			return err
 		}
 		if !ok {
 			return fmt.Errorf("sandrun: the archive entry %s is a symbolic link that resolves outside the destination", filepath.ToSlash(rel))
 		}
+		if visit != nil {
+			return visit(rel, target)
+		}
 		return nil
 	})
 }
 
-// resolvesInside resolves the local path rel inside dir like the operating
-// system does: element by element, following each symbolic link. It reports
-// whether every step stays inside dir. After an element that does not
-// exist, the rest of the path is checked as text.
-func resolvesInside(dir, rel string) (bool, error) {
+type resolvedArchiveLink struct {
+	path string // Relative to the extraction root. Empty for a dangling link.
+	hops int
+}
+
+// resolveArchiveLink follows each path component and reports whether every
+// step stays inside dir. After a missing component, it checks the remaining
+// path as text.
+func resolveArchiveLink(dir, rel string) (resolvedArchiveLink, bool, error) {
 	pending := splitPath(rel)
 	var cur []string
 	missing := false
@@ -450,7 +462,7 @@ func resolvesInside(dir, rel string) (bool, error) {
 			continue
 		case "..":
 			if len(cur) == 0 {
-				return false, nil
+				return resolvedArchiveLink{}, false, nil
 			}
 			cur = cur[:len(cur)-1]
 			continue
@@ -466,20 +478,20 @@ func resolvesInside(dir, rel string) (bool, error) {
 			continue
 		}
 		if err != nil {
-			return false, err
+			return resolvedArchiveLink{}, false, err
 		}
 		if info.Mode()&fs.ModeSymlink == 0 {
 			continue
 		}
 		if hops++; hops > maxLinkHops {
-			return false, nil
+			return resolvedArchiveLink{}, false, nil
 		}
 		target, err := os.Readlink(full)
 		if err != nil {
-			return false, err
+			return resolvedArchiveLink{}, false, err
 		}
 		if target == "" || filepath.IsAbs(target) || filepath.VolumeName(target) != "" || os.IsPathSeparator(target[0]) {
-			return false, nil
+			return resolvedArchiveLink{}, false, nil
 		}
 		// The target replaces the link, relative to the link's directory.
 		// It is not cleaned: a ".." after a link leaves the link's target,
@@ -487,7 +499,11 @@ func resolvesInside(dir, rel string) (bool, error) {
 		cur = cur[:len(cur)-1]
 		pending = append(splitPath(target), pending...)
 	}
-	return true, nil
+	target := resolvedArchiveLink{hops: hops}
+	if !missing {
+		target.path = filepath.Join(append([]string{"."}, cur...)...)
+	}
+	return target, true, nil
 }
 
 // splitPath splits a local path at every separator of the local system.
