@@ -1591,6 +1591,129 @@ describe("API key revocation", () => {
 });
 
 describe("invitations", () => {
+  const invitationPath = "/invitations/accept";
+  const recoveryNotice = "You may have joined the organization.";
+  const invalidInvitationNotice =
+    "It was not found, or you no longer have access to it.";
+  const followUpSecret = "sri_follow_up_invitation";
+
+  for (const { mode, response } of [
+    { mode: "missing", response: "an omitted organization" },
+    { mode: "empty", response: "an empty organization ID" },
+    { mode: "whitespace", response: "a whitespace-only organization ID" },
+  ]) {
+    test(`offers Organizations after an incomplete invitation response with ${response}`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await expect(
+        screen.getByRole("link", "Acme Robotics Owner"),
+      ).toBeVisible();
+      await expect(screen.getByRole("link", "Contoso Member")).toBeHidden();
+      await screen
+        .getByLabel("Invitation link or secret")
+        .fill(INVITATION_SECRET);
+      await screen.getByRole("button", "Continue").tap();
+      await browser.evaluate((mode) => {
+        sessionStorage.setItem("sandrun-e2e-invitation-response", mode);
+        return null;
+      }, mode);
+
+      const join = screen.getByRole("button", "Join organization");
+      await join.tap();
+
+      const alert = screen.getByRole("main").getByRole("alert");
+      await expect(alert).toHaveText(recoveryNotice);
+      await expect(browser).toHaveURL(invitationPath);
+      await expect(join).toHaveCount(0);
+      await expect(screen.getByLabel("Invitation link or secret")).toHaveCount(
+        0,
+      );
+      await app.screenshot(`invitation-recovery-${mode}`);
+
+      await screen.getByRole("link", "Go to your organizations").tap();
+      await expect(browser).toHaveURL("/");
+      await expect(screen.getByRole("link", "Contoso Member")).toBeVisible();
+    });
+  }
+
+  test("restores the form from a replacement link after invitation recovery", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`${invitationPath}#secret=${INVITATION_SECRET}`);
+    await browser.evaluate(() => {
+      sessionStorage.setItem("sandrun-e2e-invitation-response", "missing");
+      return null;
+    });
+    const join = screen.getByRole("button", "Join organization");
+    await join.tap();
+    await expect(screen.getByText(recoveryNotice)).toBeVisible();
+
+    await browser.evaluate((secret) => {
+      window.location.hash = `secret=${secret}`;
+      return null;
+    }, followUpSecret);
+
+    await expect(browser).toHaveURL(invitationPath);
+    await expect(screen.getByText(recoveryNotice)).toHaveCount(0);
+    await expect(screen.getByLabel("Invitation link or secret")).toBeFocused();
+    await expect(join).toBeEnabled();
+    await join.tap();
+    await expect(screen.getByText(invalidInvitationNotice)).toBeVisible();
+  });
+
+  test("keeps a replacement link after a late incomplete invitation response", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`${invitationPath}#secret=${INVITATION_SECRET}`);
+    await browser.evaluate(() => {
+      sessionStorage.setItem("sandrun-e2e-invitation-response", "held");
+      return null;
+    });
+    const join = screen.getByRole("button", "Join organization");
+    await join.tap();
+    await expect
+      .poll(() =>
+        browser.evaluate(() =>
+          sessionStorage.getItem("sandrun-e2e-invitation-held"),
+        ),
+      )
+      .toBe("true");
+
+    await browser.evaluate((secret) => {
+      window.location.hash = `secret=${secret}`;
+      return null;
+    }, followUpSecret);
+    await expect(join).toBeEnabled();
+    await browser.evaluate(async () => {
+      window.dispatchEvent(new Event("sandrun-e2e-release-invitation"));
+      // Let the successful response and its cache refresh settle.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      return null;
+    });
+
+    await expect(browser).toHaveURL(invitationPath);
+    await expect(screen.getByText(recoveryNotice)).toHaveCount(0);
+    await expect(join).toBeEnabled();
+    await join.tap();
+    await expect(screen.getByText(invalidInvitationNotice)).toBeVisible();
+    await screen.getByRole("link", "SandRun", { exact: true }).tap();
+    await expect(screen.getByRole("link", "Contoso Member")).toBeVisible();
+  });
+
   test("creates and revokes an invitation as an admin and hides the controls from members", async ({
     app,
     screen,
