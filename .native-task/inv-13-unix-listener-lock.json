@@ -1,0 +1,62 @@
+{
+  "gid": "inv-13-unix-listener-lock",
+  "commit": "5edab55b977eee0af681c40abecbb8eb2edf9dbc",
+  "nativeValidation": {
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "platform": "darwin/arm64",
+    "status": "pending",
+    "sha": "5edab55b977eee0af681c40abecbb8eb2edf9dbc",
+    "reason": "The implementation worker has no access to the assigned macOS host. Darwin/arm64 vet and cross-compilation completed on Linux.",
+    "commands": [
+      "set -euo pipefail",
+      "test \"$(git rev-parse HEAD)\" = \"5edab55b977eee0af681c40abecbb8eb2edf9dbc\"",
+      "test \"$(go env GOOS)\" = darwin && test \"$(go env GOARCH)\" = arm64 && test \"$(id -u)\" -ne 0",
+      "mkdir -p \"$PWD/.t3-tmp\"",
+      "printf \"%s  %s\\n\" \"24d6026f8ae46c6be5565105b5d509912010c7048ffea5baf59e3784b90ddc9b\" .t3-tmp/guestlisten-native-probes.tar.gz | shasum -a 256 -c -",
+      "probe_dir=\"$(mktemp -d \"$PWD/.t3-tmp/guestlisten-native.XXXXXX\")\"",
+      "/bin/chmod -N \"$probe_dir\"",
+      "/bin/ls -lde \"$probe_dir\"",
+      "export TMPDIR=\"$probe_dir\"",
+      "tar -xzf .t3-tmp/guestlisten-native-probes.tar.gz -C \"$probe_dir\"",
+      "go version",
+      "go vet -mod=readonly ./cmds/ownsand-guest/...",
+      "go test -mod=readonly -count=1 -v ./cmds/ownsand-guest/guestlisten -run '^(TestUnixLockPermissions|TestListenUnix.*|TestLockUnixAddressSkipsAddressesWithoutLockFile)$' | tee .t3-tmp/guestlisten-native-tests.log",
+      "if grep -q -- '--- SKIP:' .t3-tmp/guestlisten-native-tests.log; then exit 1; fi",
+      "go build -mod=readonly -buildvcs=true -o \"$probe_dir/ownsand-guest\" ./cmds/ownsand-guest",
+      "go build -mod=readonly -o \"$probe_dir/guestlisten-only\" \"$probe_dir/guestlisten-only.go\"",
+      "go version -m \"$probe_dir/ownsand-guest\" | sed -n '1p;/vcs/p'",
+      "python3 -u \"$probe_dir/verify-guestlisten.py\" --helper \"$probe_dir/ownsand-guest\" --listener \"$probe_dir/guestlisten-only\" --scratch \"$probe_dir\" | tee .t3-tmp/guestlisten-native-runtime.log"
+    ],
+    "expectedResults": [
+      "The scratch directory has no ACL. The commands run as a non-root user on Darwin arm64. The focused Go tests pass without skips.",
+      "The production listener binds under umasks 0200, 0200, and 0077. The persistent sidecar retains mode 0600 and the same inode.",
+      "The real helper times out when another process holds flock for five seconds, reports a path-free lock timeout, and leaves the stale socket inode intact. When the holder releases within the budget, a waiter binds.",
+      "A legacy mode-0400 sidecar reports path-free permission denied, retains its inode and mode, and permits startup after chmod 0600 in place. A waiter during permission restoration respects the existing flock and binds after that flock is released."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-unix-listener-lock/worker/.t3-tmp/guestlisten-native-probes.tar.gz",
+      "copyTo": ".t3-tmp/guestlisten-native-probes.tar.gz",
+      "sha256": "24d6026f8ae46c6be5565105b5d509912010c7048ffea5baf59e3784b90ddc9b",
+      "probeSourceFiles": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-unix-listener-lock/worker/.t3-tmp/verify-guestlisten.py",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-unix-listener-lock/worker/.t3-tmp/guestlisten-only.go"
+      ],
+      "regressionTests": [
+        "cmds/ownsand-guest/guestlisten/listen_lock_permissions_test.go",
+        "cmds/ownsand-guest/guestlisten/listen_lock_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/guestlisten-native-tests.log",
+        ".t3-tmp/guestlisten-native-runtime.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-unix-listener-lock/worker/.t3-tmp/guestlisten-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-unix-listener-lock/worker/.t3-tmp/ownsand-guest-darwin-arm64",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-unix-listener-lock/worker/.t3-tmp/guestlisten-only-darwin-arm64",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-unix-listener-lock/worker/.t3-tmp/guestlisten-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-unix-listener-lock/worker/.t3-tmp/ownsand-guest-windows-amd64.exe"
+      ]
+    }
+  }
+}
