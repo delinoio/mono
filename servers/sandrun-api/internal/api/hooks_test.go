@@ -179,7 +179,10 @@ func TestDeleteOrganizationHooks(t *testing.T) {
 	wantCode(t, "after deletion", err, connect.CodeNotFound)
 	for _, table := range []string{"memberships", "invitations", "api_keys"} {
 		var n int
-		_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE organization_id = $1", org.ID).Scan(&n)
+		if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE organization_id = $1", org.ID).Scan(&n); err != nil {
+			t.Errorf("count rows in %s after deletion: %v", table, err)
+			continue
+		}
 		if n != 0 {
 			t.Errorf("%d rows left in %s", n, table)
 		}
