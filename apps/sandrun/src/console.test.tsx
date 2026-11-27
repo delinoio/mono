@@ -474,6 +474,7 @@ describe("organization member pagination", () => {
     const updateRole = rs.fn(memberApi.updateMemberRole);
     const remove = rs.fn(memberApi.removeMember);
     const transfer = rs.fn(organizationApi.transferOwnership);
+    let refreshError: ConnectError | undefined;
     const roster = createRouterTransport((router) => {
       router.service(MemberService, {
         async listMembers(req) {
@@ -481,6 +482,7 @@ describe("organization member pagination", () => {
           if (req.organizationId !== MOCK_IDS.acme) {
             return memberApi.listMembers(req);
           }
+          if (refreshError) throw refreshError;
           if (req.pageToken === "p2") await beforeContinuation;
           if (req.pageToken === failToken) {
             failToken = undefined;
@@ -526,7 +528,43 @@ describe("organization member pagination", () => {
           : mock.unary(method, ...args);
       },
     };
-    return { transport, lists, updateRole, remove, transfer };
+    return {
+      transport,
+      lists,
+      members,
+      updateRole,
+      remove,
+      transfer,
+      setRefreshError(error: ConnectError | undefined) {
+        refreshError = error;
+      },
+    };
+  }
+
+  async function refreshRoster(client: QueryClient) {
+    await act(async () => {
+      await invalidateServices(client, MemberService);
+    });
+  }
+
+  function transferConfirmation() {
+    return screen.queryByRole("alertdialog", {
+      name: `Make ${laterMemberId} the owner?`,
+    });
+  }
+
+  async function openTransfer() {
+    const picker = await screen.findByRole<HTMLButtonElement>("combobox", {
+      name: "New owner",
+    });
+    await waitFor(() => {
+      expect(picker.disabled).toBe(false);
+      expect(screen.queryByText("Loading more members")).toBeNull();
+    });
+    await click(picker);
+    await click(await screen.findByRole("option", { name: laterMemberId }));
+    await click(screen.getByRole("button", { name: "Transfer" }));
+    expect(transferConfirmation()).toBeTruthy();
   }
 
   function memberRows() {
@@ -621,6 +659,86 @@ describe("organization member pagination", () => {
       }),
     );
     expect(tokens(lists)).toEqual(["", "p2", "", "p2"]);
+  });
+
+  test.each(["absent", "ineligible", "permission denied"] as const)(
+    "requires a new ownership confirmation after the roster recovers from %s",
+    async (reason) => {
+      const { transport, members, transfer, setRefreshError } =
+        await rosterFixture();
+      const client = renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+        transport,
+      });
+      await openTransfer();
+
+      const member = members.at(-1)!;
+      switch (reason) {
+        case "absent":
+          members.pop();
+          break;
+        case "ineligible":
+          member.role = Role.OWNER;
+          break;
+        case "permission denied":
+          setRefreshError(
+            new ConnectError("access revoked", Code.PermissionDenied),
+          );
+          break;
+      }
+      await refreshRoster(client);
+      await waitFor(() => expect(transferConfirmation()).toBeNull());
+      expect(
+        screen.getByRole<HTMLButtonElement>("button", { name: "Transfer" })
+          .disabled,
+      ).toBe(true);
+
+      if (reason === "absent") members.push(member);
+      member.role = Role.MEMBER;
+      setRefreshError(undefined);
+      await refreshRoster(client);
+
+      await waitFor(() => {
+        expect(transferConfirmation()).toBeNull();
+        expect(
+          screen.getByRole<HTMLButtonElement>("button", { name: "Transfer" })
+            .disabled,
+        ).toBe(false);
+      });
+      expect(transfer).not.toHaveBeenCalled();
+
+      await click(screen.getByRole("button", { name: "Transfer" }));
+      await click(
+        within(transferConfirmation()!).getByRole("button", {
+          name: "Transfer ownership",
+        }),
+      );
+      expect(transfer).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          organizationId: MOCK_IDS.acme,
+          userId: laterMemberId,
+        }),
+      );
+    },
+  );
+
+  test("keeps an ownership confirmation open across an eligible refresh until Escape", async () => {
+    const { transport, lists, transfer } = await rosterFixture();
+    const client = renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      transport,
+    });
+    await openTransfer();
+    const dialog = transferConfirmation()!;
+
+    await refreshRoster(client);
+    expect(tokens(lists)).toEqual(["", "p2", "", "p2"]);
+    expect(transferConfirmation()).toBe(dialog);
+
+    await act(async () => fireEvent.keyDown(dialog, { key: "Escape" }));
+    await waitFor(() => expect(transferConfirmation()).toBeNull());
+    await refreshRoster(client);
+    expect(tokens(lists)).toEqual(["", "p2", "", "p2", "", "p2"]);
+    expect(transferConfirmation()).toBeNull();
+    expect(transfer).not.toHaveBeenCalled();
   });
 
   test("shares loaded pages and retries a failed continuation from either view", async () => {

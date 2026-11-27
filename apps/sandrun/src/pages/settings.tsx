@@ -149,13 +149,18 @@ function OwnerActions() {
   });
   const remove = useMutation(OrganizationService.method.deleteOrganization);
   const [target, setTarget] = useState<string | null>(null);
-  const [confirmTransfer, setConfirmTransfer] = useState(false);
+  const [transferTarget, setTransferTarget] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const hasRoster = roster.hasData && !showsFullError(roster.query);
   const candidates = hasRoster
     ? roster.members.filter((m) => m.role !== Role.OWNER)
     : [];
   const candidate = candidates.find((m) => m.userId === target);
+  const transferCandidate =
+    candidate?.userId === transferTarget ? candidate : undefined;
+  if (transferTarget !== null && transferCandidate === undefined) {
+    setTransferTarget(null);
+  }
 
   return (
     <>
@@ -182,7 +187,7 @@ function OwnerActions() {
           <Button
             variant={ButtonVariant.Secondary}
             disabled={candidate === undefined}
-            onClick={() => setConfirmTransfer(true)}
+            onClick={() => setTransferTarget(candidate?.userId ?? null)}
           >
             Transfer
           </Button>
@@ -205,14 +210,20 @@ function OwnerActions() {
         </Button>
       </section>
       <ConfirmDialog
-        open={confirmTransfer && candidate !== undefined}
-        onOpenChange={setConfirmTransfer}
+        open={transferCandidate !== undefined}
+        onOpenChange={(open) => {
+          if (!open) setTransferTarget(null);
+        }}
         title={`Make ${candidate ? displayName(candidate) : ""} the owner?`}
         description="You become an admin. Only the new owner can give ownership back."
         confirmLabel="Transfer ownership"
-        onConfirm={() =>
-          transfer.mutateAsync({ organizationId, userId: candidate!.userId })
-        }
+        onConfirm={async () => {
+          if (transferCandidate === undefined) return;
+          await transfer.mutateAsync({
+            organizationId,
+            userId: transferCandidate.userId,
+          });
+        }}
       />
       <ConfirmDialog
         open={confirmDelete}
