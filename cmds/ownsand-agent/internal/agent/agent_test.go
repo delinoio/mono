@@ -311,7 +311,7 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	t.Cleanup(a.shutdown)
 
 	// Normal renewal is unchanged: the writer creates the status file.
-	a.writeStatus()
+	a.writeStatus(t.Context())
 	var status Status
 	if err := st.LoadStatus(&status); err != nil || status.DeviceID != id.DeviceID {
 		t.Fatalf("status file before the removal: %+v, %v", status, err)
@@ -335,7 +335,7 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	t.Cleanup(finishWriter)
 	go func() {
 		defer close(written)
-		a.writeStatus()
+		a.writeStatus(t.Context())
 	}()
 	waitClosed(t, entered, "the status write to enter the hook")
 
@@ -358,9 +358,9 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	requireEmptyStateDir(t, st)
 
 	// The writer stays fenced: later writes do nothing.
-	a.writeStatus()
-	a.setConnected(true)
-	a.setConnected(false)
+	a.writeStatus(t.Context())
+	a.setConnected(t.Context(), true)
+	a.setConnected(t.Context(), false)
 	requireEmptyStateDir(t, st)
 }
 
@@ -481,7 +481,7 @@ func TestFailedRemovalResumesStatusWrites(t *testing.T) {
 	if _, err := st.LoadIdentity(); err != nil {
 		t.Fatalf("device key after a failed removal: %v", err)
 	}
-	a.writeStatus()
+	a.writeStatus(t.Context())
 	var status Status
 	if err := st.LoadStatus(&status); err != nil || status.DeviceID != id.DeviceID {
 		t.Fatalf("status file after a failed removal: %+v, %v", status, err)

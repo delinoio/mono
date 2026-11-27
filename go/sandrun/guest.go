@@ -39,19 +39,20 @@ const (
 
 // Environment variable names of the guest commands.
 const (
-	guestEnvLock          = "SANDRUN_SYNC_LOCK"
-	guestEnvForce         = "SANDRUN_SYNC_FORCE"
-	guestEnvWorkspace     = "SANDRUN_SYNC_WORKSPACE"
-	guestEnvStaleManifest = "SANDRUN_SYNC_STALE_MANIFEST"
-	guestEnvArchive       = "SANDRUN_SYNC_ARCHIVE"
-	guestEnvDeletes       = "SANDRUN_SYNC_DELETE_LIST"
-	guestEnvReplaceFiles  = "SANDRUN_SYNC_REPLACE_FILE_LIST"
-	guestEnvAliasReplace  = "SANDRUN_SYNC_REPLACE_ALIAS_LIST"
-	guestEnvPrunes        = "SANDRUN_SYNC_PRUNE_LIST"
-	guestEnvAliasPrunes   = "SANDRUN_SYNC_PRUNE_ALIAS_LIST"
-	guestEnvLinks         = "SANDRUN_SYNC_LINK_LIST"
-	guestEnvPath          = "SANDRUN_DOWNLOAD_PATH"
-	guestEnvDLArchive     = "SANDRUN_DOWNLOAD_ARCHIVE"
+	guestEnvLock           = "SANDRUN_SYNC_LOCK"
+	guestEnvForce          = "SANDRUN_SYNC_FORCE"
+	guestEnvWorkspace      = "SANDRUN_SYNC_WORKSPACE"
+	guestEnvStaleManifest  = "SANDRUN_SYNC_STALE_MANIFEST"
+	guestEnvPendingUpdates = "SANDRUN_SYNC_PENDING_UPDATES"
+	guestEnvArchive        = "SANDRUN_SYNC_ARCHIVE"
+	guestEnvDeletes        = "SANDRUN_SYNC_DELETE_LIST"
+	guestEnvReplaceFiles   = "SANDRUN_SYNC_REPLACE_FILE_LIST"
+	guestEnvAliasReplace   = "SANDRUN_SYNC_REPLACE_ALIAS_LIST"
+	guestEnvPrunes         = "SANDRUN_SYNC_PRUNE_LIST"
+	guestEnvAliasPrunes    = "SANDRUN_SYNC_PRUNE_ALIAS_LIST"
+	guestEnvLinks          = "SANDRUN_SYNC_LINK_LIST"
+	guestEnvPath           = "SANDRUN_DOWNLOAD_PATH"
+	guestEnvDLArchive      = "SANDRUN_DOWNLOAD_ARCHIVE"
 )
 
 // exitLocked is the exit code of the lock command when the lock exists.
@@ -59,6 +60,10 @@ const exitLocked = 75
 
 // exitWorkspaceMissing means the lock was acquired but the workspace is missing.
 const exitWorkspaceMissing = 76
+
+// exitPendingCleanupFailed is the sync cleanup exit status bit for a
+// failure to remove the pending update list. Bit 1 covers other cleanup.
+const exitPendingCleanupFailed = 2
 
 // exitNotFound is the exit code of the download probe for a missing path.
 const exitNotFound = 66
@@ -112,7 +117,8 @@ if [ -n "$SANDRUN_SYNC_ARCHIVE" ]; then tar -x -m -o -f "$SANDRUN_SYNC_ARCHIVE";
 for f in "$SANDRUN_SYNC_ARCHIVE" "$SANDRUN_SYNC_DELETE_LIST" "$SANDRUN_SYNC_REPLACE_FILE_LIST" "$SANDRUN_SYNC_REPLACE_ALIAS_LIST" "$SANDRUN_SYNC_PRUNE_LIST" "$SANDRUN_SYNC_PRUNE_ALIAS_LIST"; do
   if [ -n "$f" ]; then rm -f "$f" || status=1; fi
 done
-if [ -n "$SANDRUN_SYNC_LOCK" ]; then rm -rf "$SANDRUN_SYNC_LOCK" || status=1; fi
+if [ -n "$SANDRUN_SYNC_PENDING_UPDATES" ]; then rm -f "$SANDRUN_SYNC_PENDING_UPDATES" || status=$((status | 2)); fi
+if [ -n "$SANDRUN_SYNC_LOCK" ]; then rm -rf "$SANDRUN_SYNC_LOCK" || status=$((status | 1)); fi
 exit "$status"`,
 	opProbe: `p="$SANDRUN_DOWNLOAD_PATH"
 if [ -d "$p" ]; then
@@ -284,13 +290,21 @@ foreach ($f in @($env:SANDRUN_SYNC_ARCHIVE, $env:SANDRUN_SYNC_DELETE_LIST, $env:
     Write-Error -ErrorRecord $_ -ErrorAction Continue
   }
 }
+try {
+  if ($env:SANDRUN_SYNC_PENDING_UPDATES) {
+    [System.IO.File]::Delete($env:SANDRUN_SYNC_PENDING_UPDATES)
+  }
+} catch {
+  $status = $status -bor 2
+  Write-Error -ErrorRecord $_ -ErrorAction Continue
+}
 $l = $env:SANDRUN_SYNC_LOCK
 try {
   if ($l -and (Test-Path -LiteralPath $l -ErrorAction Stop)) {
     Remove-Item -LiteralPath $l -Recurse -Force -ErrorAction Stop
   }
 } catch {
-  $status = 1
+  $status = $status -bor 1
   Write-Error -ErrorRecord $_ -ErrorAction Continue
 }
 exit $status`,

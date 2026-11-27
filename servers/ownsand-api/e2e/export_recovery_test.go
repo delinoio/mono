@@ -134,11 +134,11 @@ func TestSnapshotExportRecoversAfterAgentRestart(t *testing.T) {
 	s, c, ctx, snapID, data := exportRecoveryFixture(t)
 	sourceID := s.agents[0].deviceID
 	position := s.logs.position()
-	s.killAgent(0)
+	s.killAgent(t, 0)
 	// The API process is unchanged. Use the disconnect to exclude reports
 	// from the channel that carried the abandoned export.
 	position = s.waitForAgentChannelEvent(ctx, sourceID, agentChannelDisconnected, position)
-	s.restartAgent(0)
+	s.restartAgent(t, 0)
 	waitExportState(ctx, t, c, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
 	s.waitForAgentChannelEvent(ctx, sourceID, agentStateReport, position)
 	retryExport(ctx, t, s, c, snapID)
@@ -151,9 +151,9 @@ func TestSnapshotExportRecoversAfterAgentRestart(t *testing.T) {
 // explicit retry exports it.
 func TestSnapshotExportRecoversAfterControlPlaneRestart(t *testing.T) {
 	s, c, ctx, snapID, data := exportRecoveryFixture(t)
-	s.killAPI()
+	s.killAPI(t)
 	position := s.logs.position()
-	s.restartAPI()
+	s.restartAPI(t)
 	waitExportState(ctx, t, c, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
 	s.waitForAgentChannelEvent(ctx, s.agents[0].deviceID, agentStateReport, position)
 	retryExport(ctx, t, s, c, snapID)

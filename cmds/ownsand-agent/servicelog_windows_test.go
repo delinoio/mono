@@ -31,6 +31,7 @@ func TestResetDeletesStateWhileServiceLogIsOpen(t *testing.T) {
 	if _, err := f.WriteString("{\"msg\":\"first\"}\n"); err != nil {
 		t.Fatal(err)
 	}
+	// ResetDir can use a temporary directory owned by a standard Windows user.
 	if err := store.ResetDir(dir); err != nil {
 		t.Fatalf("Reset with the log open: %v", err)
 	}
