@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// EnrollmentLockFile is the lock file of the enrollment sequence inside the
-// state directory. It holds no data; the lock is on its first byte.
+// EnrollmentLockFile coordinates enrollment, image builds and destructive
+// cleanup in the state directory. The file is empty. The lock uses its first byte.
 const EnrollmentLockFile = "enrollment.lock"
 
 // enrollmentLockPoll is the interval at which a waiting LockEnrollment tries
@@ -20,9 +20,18 @@ const EnrollmentLockFile = "enrollment.lock"
 // with its context on every platform.
 const enrollmentLockPoll = 25 * time.Millisecond
 
-// ErrEnrollmentBusy reports that the wait ended before the enrollment lock
-// could be accepted.
+// ErrEnrollmentBusy reports that the enrollment lock could not be acquired.
 var ErrEnrollmentBusy = errors.New("store: the enrollment lock is busy for this state directory")
+
+// ErrRemovalPending reports that an authenticated removal notice blocks a build.
+var ErrRemovalPending = errors.New("store: device removal is pending for this state directory")
+
+type enrollmentLockAccess uint8
+
+const (
+	enrollmentExclusive enrollmentLockAccess = iota
+	enrollmentShared
+)
 
 // LockEnrollment takes the exclusive enrollment lock of the state directory
 // and returns the function that releases it. The lock is an advisory file
@@ -33,10 +42,35 @@ var ErrEnrollmentBusy = errors.New("store: the enrollment lock is busy for this 
 // be accepted, it returns ErrEnrollmentBusy together with the context error.
 // Different state directories use different locks and never wait for each other.
 func (s *Store) LockEnrollment(ctx context.Context) (unlock func(), err error) {
-	return acquireEnrollmentLock(ctx, s.dir)
+	return acquireEnrollmentLock(ctx, s.dir, enrollmentExclusive)
 }
 
-func acquireEnrollmentLock(ctx context.Context, dir string) (unlock func(), err error) {
+// LockImageBuild admits a builder before it creates the store layout. It tries
+// the shared enrollment lock once. While holding it, the builder checks the
+// removal notice and keeps the lock until all build cleanup has returned.
+func (s *Store) LockImageBuild(ctx context.Context) (unlock func(), err error) {
+	if err := enrollmentWaitError(ctx); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return nil, fmt.Errorf("store: prepare state directory for image build: %w", err)
+	}
+	unlock, err = acquireEnrollmentLock(ctx, s.dir, enrollmentShared)
+	if err != nil {
+		return nil, err
+	}
+	state, err := s.LoadAgent()
+	if err == nil && state.Removal.NoticeReceived {
+		err = ErrRemovalPending
+	}
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		unlock()
+		return nil, err
+	}
+	return unlock, nil
+}
+
+func acquireEnrollmentLock(ctx context.Context, dir string, mode enrollmentLockAccess) (unlock func(), err error) {
 	if err := enrollmentWaitError(ctx); err != nil {
 		return nil, err
 	}
@@ -44,7 +78,7 @@ func acquireEnrollmentLock(ctx context.Context, dir string) (unlock func(), err 
 	if err != nil {
 		return nil, fmt.Errorf("store: open enrollment lock: %w", err)
 	}
-	if err := waitEnrollmentLock(ctx, f, tryLockFile); err != nil {
+	if err := waitEnrollmentLock(ctx, f, mode, tryLockFile); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
@@ -59,12 +93,12 @@ func acquireEnrollmentLock(ctx context.Context, dir string) (unlock func(), err 
 	}, nil
 }
 
-func waitEnrollmentLock(ctx context.Context, f *os.File, tryLock func(*os.File) (bool, error)) error {
+func waitEnrollmentLock(ctx context.Context, f *os.File, mode enrollmentLockAccess, tryLock func(*os.File, enrollmentLockAccess) (bool, error)) error {
 	for {
 		if err := enrollmentWaitError(ctx); err != nil {
 			return err
 		}
-		ok, err := tryLock(f)
+		ok, err := tryLock(f, mode)
 		if err != nil {
 			return fmt.Errorf("store: lock enrollment: %w", err)
 		}
@@ -74,6 +108,9 @@ func waitEnrollmentLock(ctx context.Context, f *os.File, tryLock func(*os.File) 
 				return err
 			}
 			return nil
+		}
+		if mode == enrollmentShared {
+			return ErrEnrollmentBusy
 		}
 		timer := time.NewTimer(enrollmentLockPoll)
 		select {
