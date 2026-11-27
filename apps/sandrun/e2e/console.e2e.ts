@@ -1092,6 +1092,50 @@ describe("integrations", () => {
 });
 
 describe("runner profiles", () => {
+  for (const mode of ["create", "edit"] as const) {
+    test(`blocks ${mode} when no OpenAI Codex guest OS is verified`, async ({
+      app,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(`/orgs/${ACME}/profiles`);
+      if (mode === "create") {
+        await screen.getByRole("button", "Create runner profile").tap();
+        await screen.getByRole("combobox", "Workload kind").tap();
+        await screen.getByRole("option", "Agent session").tap();
+        await screen.getByRole("combobox", "Agent integration").tap();
+        await screen.getByRole("option", "codex-prod (OpenAI Codex)").tap();
+      } else {
+        await screen
+          .getByRole("listitem")
+          .filter({ hasText: "codex-linux ·" })
+          .getByRole("button", "Edit")
+          .tap();
+      }
+
+      const dialog = screen.getByRole(
+        "dialog",
+        mode === "create" ? "Create a runner profile" : "Edit codex-linux",
+      );
+      await expect(
+        dialog.getByText(
+          "SandRun has not verified a guest OS for OpenAI Codex. You cannot save this profile yet.",
+        ),
+      ).toBeVisible();
+      await expect(dialog.getByRole("combobox", "Guest OS")).toHaveAttribute(
+        "disabled",
+        "",
+      );
+      await expect(
+        dialog.getByRole(
+          "button",
+          mode === "create" ? "Create profile" : "Save changes",
+        ),
+      ).toHaveAttribute("disabled", "");
+    });
+  }
+
   test("uses a later profile across pages and refreshes after profile changes", async ({
     app,
     browser,

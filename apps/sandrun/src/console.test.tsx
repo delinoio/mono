@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create, isMessage } from "@bufbuild/protobuf";
-import { timestampMs } from "@bufbuild/protobuf/wkt";
+import { durationFromMs, timestampMs } from "@bufbuild/protobuf/wkt";
 import {
   afterEach,
   beforeEach,
@@ -40,6 +40,7 @@ import {
 import { AuditAction, AuditService } from "@delino/sandrun-protos/v1/audit_pb";
 import {
   AgentVendor,
+  GuestOs,
   OwnSandLinkState,
   RequestState,
   Role,
@@ -88,6 +89,16 @@ import {
 } from "./mock/mock-api.ts";
 import { organizationPages } from "./mock/organization-pages.ts";
 import { externalNavigation } from "./navigation.ts";
+import { getVerifiedCodexGuestOses } from "./verified-codex-guest-oses.ts";
+import * as actualCodexGuestOses from "./verified-codex-guest-oses.ts" with {
+  rstest: "importActual",
+};
+
+rs.mock(import("./verified-codex-guest-oses.ts"), () => ({
+  getVerifiedCodexGuestOses: rs.fn(
+    actualCodexGuestOses.getVerifiedCodexGuestOses,
+  ),
+}));
 
 const config = {
   apiOrigin: "https://api.test",
@@ -1708,6 +1719,166 @@ describe("GitHub setup callback", () => {
 });
 
 describe("runner profiles", () => {
+  async function selectProfileOption(
+    form: HTMLElement,
+    name: string,
+    option: string,
+  ) {
+    await click(within(form).getByRole("combobox", { name }));
+    await click(await screen.findByRole("option", { name: option }));
+  }
+
+  test.each(["create", "edit"] as const)(
+    "blocks the %s request when no Codex guest OS is verified",
+    async (mode) => {
+      const mock = createMockTransport();
+      const saveProfile = rs.fn();
+      renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+        transport: {
+          ...mock,
+          unary(method, ...args) {
+            if (
+              method.name ===
+                RunnerProfileService.method.createRunnerProfile.name ||
+              method.name ===
+                RunnerProfileService.method.updateRunnerProfile.name
+            ) {
+              saveProfile();
+            }
+            return mock.unary(method, ...args);
+          },
+        },
+      });
+      const creating = mode === "create";
+      if (creating) {
+        await click(
+          await screen.findByRole("button", { name: "Create runner profile" }),
+        );
+      } else {
+        const row = (
+          await screen.findByText("codex-linux · Agent session · Linux")
+        ).closest("li")!;
+        await click(within(row).getByRole("button", { name: "Edit" }));
+      }
+      const dialog = await screen.findByRole("dialog", {
+        name: creating ? "Create a runner profile" : "Edit codex-linux",
+      });
+      const form = within(dialog);
+      const name = form.getByRole("textbox", { name: "Name" });
+      await type(name, "codex-check");
+      if (creating) {
+        await selectProfileOption(dialog, "Workload kind", "Agent session");
+        await selectProfileOption(
+          dialog,
+          "Agent integration",
+          "codex-prod (OpenAI Codex)",
+        );
+        const wait = form.getByLabelText("Maximum queue wait (minutes)");
+        await type(wait, "5");
+        fireEvent.blur(wait);
+      }
+      expect(
+        await form.findByText(
+          /SandRun has not verified a guest OS for OpenAI Codex/,
+        ),
+      ).toBeTruthy();
+      const guestOs = form.getByRole("combobox", { name: "Guest OS" });
+      expect(guestOs).toHaveProperty("disabled", true);
+      await click(guestOs);
+      expect(
+        screen.queryAllByRole("option", { name: /^(Linux|macOS|Windows)$/ }),
+      ).toHaveLength(0);
+      expect(
+        form.getByRole("button", {
+          name: creating ? "Create profile" : "Save changes",
+        }),
+      ).toHaveProperty("disabled", true);
+      await act(async () => {
+        fireEvent.submit(name.closest("form")!);
+      });
+      expect(saveProfile).not.toHaveBeenCalled();
+    },
+  );
+
+  test("clears a stale OS and enforces the queue wait when only Linux is verified", async () => {
+    await rs.mocked(getVerifiedCodexGuestOses).withImplementation(
+      () => [GuestOs.LINUX],
+      async () => {
+        const mock = createMockTransport();
+        const createProfile = rs.fn();
+        renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+          transport: {
+            ...mock,
+            unary(method, ...args) {
+              const request = create(method.input, args[3]);
+              if (isMessage(request, CreateRunnerProfileRequestSchema)) {
+                createProfile(request.profile);
+              }
+              return mock.unary(method, ...args);
+            },
+          },
+        });
+        await click(
+          await screen.findByRole("button", { name: "Create runner profile" }),
+        );
+        const dialog = await screen.findByRole("dialog", {
+          name: "Create a runner profile",
+        });
+        const form = within(dialog);
+        await type(
+          form.getByRole("textbox", { name: "Name" }),
+          "codex-verified-check",
+        );
+        await selectProfileOption(dialog, "Guest OS", "Windows");
+        await selectProfileOption(dialog, "Workload kind", "Agent session");
+        await selectProfileOption(
+          dialog,
+          "Agent integration",
+          "codex-prod (OpenAI Codex)",
+        );
+        const wait = form.getByLabelText("Maximum queue wait (minutes)");
+        await type(wait, "5");
+        fireEvent.blur(wait);
+        const submit = form.getByRole("button", { name: "Create profile" });
+        await click(submit);
+        expect(form.getByText("Select a guest OS.")).toBeTruthy();
+        expect(createProfile).not.toHaveBeenCalled();
+
+        const guestOs = form.getByRole("combobox", { name: "Guest OS" });
+        expect(guestOs.textContent).toContain("Select a guest OS");
+        await click(guestOs);
+        const options = screen.getAllByRole("option", {
+          name: /^(Linux|macOS|Windows)$/,
+        });
+        expect(options.map((option) => option.textContent)).toEqual(["Linux"]);
+        await click(options[0]!);
+        await type(wait, "6");
+        fireEvent.blur(wait);
+        await click(submit);
+        expect(
+          form.getByText("OpenAI waits at most 5 minutes for an executor."),
+        ).toBeTruthy();
+        expect(createProfile).not.toHaveBeenCalled();
+
+        await type(wait, "5");
+        fireEvent.blur(wait);
+        await click(submit);
+        expect(
+          await screen.findByText(
+            "codex-verified-check · Agent session · Linux",
+          ),
+        ).toBeTruthy();
+        expect(createProfile).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            guestOs: GuestOs.LINUX,
+            source: { case: "baseImage", value: GuestOs.LINUX },
+            maxQueueWait: durationFromMs(300_000),
+          }),
+        );
+      },
+    );
+  });
+
   test("resolves a later-page integration's name, vendor and ID", async () => {
     const mock = createMockTransport({ agentIntegrationPageSize: 1 });
     const createProfile = rs.fn();

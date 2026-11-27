@@ -6,6 +6,7 @@ import { NumberInput } from "delino-ui/number-input";
 import { Select, SelectOption } from "delino-ui/select";
 import { TextField } from "delino-ui/text-field";
 import {
+  AgentVendor,
   GuestOs,
   NetworkMode,
   Priority,
@@ -29,6 +30,7 @@ import {
   showsFullError,
 } from "../components/ui.tsx";
 import {
+  CODEX_GUEST_OS_UNAVAILABLE,
   emptyProfileForm,
   formFromProfile,
   type ProfileErrors,
@@ -44,6 +46,7 @@ import {
   refreshRunnerProfiles,
   useRunnerProfiles,
 } from "../runner-profiles.ts";
+import { getVerifiedCodexGuestOses } from "../verified-codex-guest-oses.ts";
 
 const KINDS = [
   WorkloadKind.GITHUB_JOB,
@@ -249,11 +252,41 @@ function ProfileDialog({
     setErrors((e) => ({ ...e, [key]: undefined }));
   };
   const integrationsUnavailable = showsFullError(query);
-  const vendor = integrationsUnavailable
-    ? undefined
-    : integrations.find(
-        (i) => i.agentIntegrationId === values.agentIntegrationId,
-      )?.vendor;
+  const integrationVendor = (id: string) =>
+    integrationsUnavailable
+      ? undefined
+      : integrations.find((i) => i.agentIntegrationId === id)?.vendor;
+  const vendor = integrationVendor(values.agentIntegrationId);
+  const agentSession = values.workloadKind === WorkloadKind.AGENT_SESSION;
+  const codexGuestOses = getVerifiedCodexGuestOses();
+  const guestOsOptions =
+    agentSession && vendor === AgentVendor.OPENAI_CODEX
+      ? codexGuestOses
+      : GUEST_OSES;
+  const guestOsUnavailable = guestOsOptions.length === 0;
+  const setAgentSelection = (
+    workloadKind: WorkloadKind,
+    integrationId: string,
+  ) => {
+    setValues((current) => ({
+      ...current,
+      workloadKind,
+      agentIntegrationId: integrationId,
+      guestOs:
+        workloadKind === WorkloadKind.AGENT_SESSION &&
+        integrationVendor(integrationId) === AgentVendor.OPENAI_CODEX &&
+        !codexGuestOses.includes(current.guestOs)
+          ? GuestOs.UNSPECIFIED
+          : current.guestOs,
+    }));
+    setErrors((current) => ({
+      ...current,
+      workloadKind: undefined,
+      agentIntegrationId: undefined,
+      guestOs: undefined,
+      maxQueueWaitMinutes: undefined,
+    }));
+  };
   const creating = profile === undefined;
 
   return (
@@ -269,8 +302,11 @@ function ProfileDialog({
       }
       submitLabel={creating ? "Create profile" : "Save changes"}
       submitDisabled={
-        values.workloadKind === WorkloadKind.AGENT_SESSION &&
-        (query.isPending || integrationsUnavailable)
+        agentSession &&
+        (query.isPending ||
+          integrationsUnavailable ||
+          (values.agentIntegrationId !== "" && vendor === undefined) ||
+          guestOsUnavailable)
       }
       onSubmit={async (opening) => {
         const found = profileErrors(values, vendor);
@@ -312,7 +348,11 @@ function ProfileDialog({
           label="Workload kind"
           value={String(values.workloadKind)}
           onValueChange={(v) =>
-            v && set("workloadKind", Number(v) as WorkloadKind)
+            v &&
+            setAgentSelection(
+              Number(v) as WorkloadKind,
+              values.agentIntegrationId,
+            )
           }
           disabled={!creating}
         >
@@ -324,18 +364,27 @@ function ProfileDialog({
         </Select>
         <Select
           label="Guest OS"
-          value={String(values.guestOs)}
+          value={
+            guestOsOptions.includes(values.guestOs)
+              ? String(values.guestOs)
+              : null
+          }
+          placeholder={guestOsUnavailable ? "Unavailable" : "Select a guest OS"}
           onValueChange={(v) => v && set("guestOs", Number(v) as GuestOs)}
+          disabled={guestOsUnavailable}
+          description={
+            guestOsUnavailable ? CODEX_GUEST_OS_UNAVAILABLE : undefined
+          }
           error={errors.guestOs}
         >
-          {GUEST_OSES.map((g) => (
+          {guestOsOptions.map((g) => (
             <SelectOption key={g} value={String(g)}>
               {labels.guestOs[g]}
             </SelectOption>
           ))}
         </Select>
       </div>
-      {values.workloadKind === WorkloadKind.AGENT_SESSION ? (
+      {agentSession ? (
         <QueryBoundary query={query} loading="Loading agent integrations">
           {() => (
             <>
@@ -349,7 +398,9 @@ function ProfileDialog({
                     ? null
                     : values.agentIntegrationId
                 }
-                onValueChange={(v) => v && set("agentIntegrationId", v)}
+                onValueChange={(v) =>
+                  v && setAgentSelection(values.workloadKind, v)
+                }
                 error={errors.agentIntegrationId}
                 disabled={!creating}
               >
