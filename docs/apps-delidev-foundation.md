@@ -5,7 +5,8 @@
 This contract owns both components of [`delidev`](project-delidev.md):
 
 - `apps/delidev/package.json`: workspace package `delidev` with the frontend scripts and the `tauri` CLI script.
-- `apps/delidev/tauri.mjs` and `apps/delidev/cef-deb-notices.mjs`: the Tauri CLI entry point and Debian notice staging hook.
+- `apps/delidev/tauri.mjs`: the Tauri CLI entry point.
+- `apps/delidev/cef-deb-notices.mjs` and `apps/delidev/tauri-debian-cli.mjs`: the Debian notice staging hook and Tauri CLI backport.
 - `apps/delidev/rsbuild.config.ts`, `apps/delidev/index.html`, `apps/delidev/src/` and `apps/delidev/public/`: the `delidev-frontend` web frontend.
 - `apps/delidev/turbo.json`: package-local Turbo task configuration.
 - `apps/delidev/src-tauri/`: the `delidev-shell` Rust crate:
@@ -89,12 +90,14 @@ Run from the repository root:
 - `pnpm --filter delidev dev`: frontend development server at `http://127.0.0.1:13200` without the native shell. The server fails when the port is in use.
 - `pnpm --filter delidev tauri dev`: desktop app on CEF. The Tauri CLI starts `pnpm dev` and loads `http://127.0.0.1:13200`. On macOS the CLI runs the app from an `.app` bundle.
 - `pnpm --filter delidev tauri build`: desktop bundles. The CLI ships `libcef`, its resources and the `en-US` locale with the app.
-- `pnpm --filter delidev tauri build --bundles deb` or `pnpm --filter delidev tauri bundle --bundles deb` for an existing build. Both commands install the original CEF `LICENSE.txt` and `CREDITS.html` under `/usr/share/doc/delidev/cef/`. If the selected CEF distribution has no unpacked `LICENSE.txt`, the bundling hook uses `tar` to read it from the distribution's cached archive. The wrapper stages the notices before running the effective Tauri `beforeBundleCommand` in its configured working directory. If staging or the custom hook fails, Tauri stops before packaging. The wrapper removes the staging directory when Tauri exits.
+- `pnpm --filter delidev tauri build --bundles deb` or `pnpm --filter delidev tauri bundle --bundles deb` for an existing build. When the effective configuration embeds CEF, both commands install the original CEF `LICENSE.txt` and `CREDITS.html` under `/usr/share/doc/delidev/cef/`. If the selected CEF distribution has no unpacked `LICENSE.txt`, the bundling hook uses `tar` to read it from the distribution's cached archive. The wrapper stages the notices before running the effective Tauri `beforeBundleCommand` in its configured working directory. If staging or the custom hook fails, Tauri stops before packaging. The wrapper removes the staging directory when Tauri exits.
 - `pnpm exec turbo run typecheck build --filter=delidev`: frontend type check and production build into `apps/delidev/dist/`.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test`: Rust checks of the root workspace on the host desktop target.
 - `pnpm --filter delidev tauri android init` and `pnpm --filter delidev tauri ios init`: generate the Android and iOS host projects under `src-tauri/gen/`. Then use `tauri android dev`, `tauri android build`, `tauri ios dev` and `tauri ios build`.
 
 `tauri dev` and `tauri build` for desktop compile the Rust crate with CEF. Physical Android and iOS devices load the development server through the LAN address in `TAURI_DEV_HOST`, which the Tauri CLI sets; `rsbuild.config.ts` binds to that address instead of the loopback address, and `turbo.json` passes `TAURI_DEV_HOST` to the `dev` task. Remove `apps/delidev/dist/` after validation.
+
+The wrapper uses the explicit bundle list when present, including an empty list. Otherwise it uses the effective Tauri configuration after the Linux platform file and ordered CLI overrides. When the selection includes Debian and embeds CEF, the wrapper builds and caches the pinned Tauri CLI with the Debian portion of the [upstream ANGLE fix](https://github.com/tauri-apps/tauri/commit/6620118f0fe85472abfdccea8d99fd0ec9447c3f). It verifies both published source archives and builds with the CLI's published Cargo lockfile. This path uses Cargo and `tar` and caches the CLI under `$XDG_CACHE_HOME/delidev/tauri-debian-cli` or `~/.cache/delidev/tauri-debian-cli`. The stock CLI handles shared CEF and other selections. Remove the backport when the published CLI pin includes the fix.
 
 The Debian notice hook reads the CEF version from `Cargo.lock` with LF or CRLF line endings.
 
