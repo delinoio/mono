@@ -82,24 +82,18 @@ describe("UuidV7Generator after a failed generation", () => {
     // greatest one issued.
     const gen = new UuidV7Generator(() => MAX_TIMESTAMP_MS);
     let last = gen.next();
-    let failures = 0;
-    for (let i = 0; i < 0x2000 && failures === 0; i++) {
-      try {
-        const id = gen.next();
-        expect(id > last).toBe(true);
-        last = id;
-      } catch {
-        failures++;
-      }
+    for (let counter = counterOf(last); counter < 0xfff; counter++) {
+      const id = gen.next();
+      expect(id > last).toBe(true);
+      last = id;
     }
-    expect(failures).toBe(1);
     expect(uuidV7TimestampMs(last)).toBe(MAX_TIMESTAMP_MS);
     expect(counterOf(last)).toBe(0xfff);
 
-    // The state is still the last successful one, so every retry fails the
-    // same way instead of drifting into an out-of-range timestamp.
-    expect(() => gen.next()).toThrow();
-    expect(() => gen.next()).toThrow();
+    expect(() => gen.next()).toThrow(RangeError);
+    // Both retries start from the last successful state and fail the same way.
+    expect(() => gen.next()).toThrow(RangeError);
+    expect(() => gen.next()).toThrow(RangeError);
   });
 });
 
