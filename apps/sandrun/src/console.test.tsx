@@ -66,6 +66,7 @@ import {
   CreateRunnerProfileRequestSchema,
   type ListRunnerProfilesRequest,
   RunnerProfileService,
+  type UpdateRunnerProfileRequest,
 } from "@delino/sandrun-protos/v1/runner_profile_pb";
 import {
   type ListRequestsRequest,
@@ -2188,6 +2189,82 @@ describe("runner profiles", () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
     const label = await screen.findByLabelText("runs-on label of linux-build");
     expect(label.textContent).toBe("sandrun-linux-build");
+  });
+
+  test("preserves a newer memory and disk save when a stale dialog edits vCPUs", async () => {
+    const mock = createMockTransport();
+    const profiles = createClient(RunnerProfileService, mock);
+    const target = {
+      organizationId: MOCK_IDS.acme,
+      runnerProfileId: MOCK_IDS.linuxProfile,
+    };
+    const saveResources = (
+      vcpuCount: number,
+      memoryMib: bigint,
+      diskGib: bigint,
+    ) =>
+      profiles.updateRunnerProfile({
+        ...target,
+        profile: { resources: { vcpuCount, memoryMib, diskGib } },
+        updateMask: { paths: ["resources"] },
+      });
+    await saveResources(2, 4096n, 32n);
+
+    const requests: UpdateRunnerProfileRequest[] = [];
+    // The profile fixture supports the API's nested mask independently of the mock.
+    const fixture = createRouterTransport((router) => {
+      router.rpc(
+        RunnerProfileService.method.updateRunnerProfile,
+        async (request) => {
+          requests.push(request);
+          if (!request.updateMask?.paths.includes("resources.vcpu_count")) {
+            return profiles.updateRunnerProfile(request);
+          }
+          const { profile } = await profiles.getRunnerProfile(target);
+          return saveResources(
+            request.profile!.resources!.vcpuCount,
+            profile!.resources!.memoryMib,
+            profile!.resources!.diskGib,
+          );
+        },
+      );
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+      transport: {
+        ...mock,
+        unary(method, ...args) {
+          return method.name ===
+            RunnerProfileService.method.updateRunnerProfile.name
+            ? fixture.unary(method, ...args)
+            : mock.unary(method, ...args);
+        },
+      },
+    });
+
+    const label = await screen.findByLabelText("runs-on label of linux-build");
+    const row = within(label.closest("li")!);
+    expect(row.getByText(/2 vCPU · 4096 MiB · 32 GiB/)).toBeTruthy();
+    await click(row.getByRole("button", { name: "Edit" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Edit linux-build",
+    });
+    const form = within(dialog);
+    const vcpus = form.getByLabelText<HTMLInputElement>("vCPUs");
+    expect(vcpus.value).toBe("2");
+    await saveResources(2, 8192n, 64n);
+    await type(vcpus, "4");
+    await click(form.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(dialog.isConnected).toBe(false));
+    expect(requests.map((request) => request.updateMask?.paths)).toEqual([
+      ["resources.vcpu_count"],
+    ]);
+    const { profile } = await profiles.getRunnerProfile(target);
+    expect(profile?.resources).toMatchObject({
+      vcpuCount: 4,
+      memoryMib: 8192n,
+      diskGib: 64n,
+    });
   });
 
   test("rejects a duplicate rename without changing profiles or audit events", async () => {

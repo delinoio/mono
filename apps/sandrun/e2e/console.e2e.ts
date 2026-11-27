@@ -1243,6 +1243,24 @@ describe("runner profiles", () => {
     ).toBeVisible();
   });
 
+  test("closes the runner profile editor after an unchanged save", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+
+    const profile = screen
+      .getByRole("listitem")
+      .filter({ hasText: "linux-build ·" });
+    await profile.getByRole("button", "Edit").tap();
+    const dialog = screen.getByRole("dialog", "Edit linux-build");
+    await dialog.getByRole("button", "Save changes").tap();
+    await expect(dialog).toBeHidden();
+    await expect(profile).toBeVisible();
+  });
+
   test("lets the user retry an edit when a runner profile name already exists", async ({
     app,
     screen,

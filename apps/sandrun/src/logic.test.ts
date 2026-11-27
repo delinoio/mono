@@ -380,6 +380,29 @@ describe("runner profile form", () => {
     },
   );
 
+  test.each([
+    [{}, []],
+    [{ name: "linux-large" }, ["name"]],
+    [{ vcpuCount: 4 }, ["resources.vcpu_count"]],
+    [{ memoryMib: 8192 }, ["resources.memory_mib"]],
+    [{ diskGib: 64 }, ["resources.disk_gib"]],
+    [
+      { vcpuCount: 4, memoryMib: 8192, diskGib: 64 },
+      ["resources.vcpu_count", "resources.memory_mib", "resources.disk_gib"],
+    ],
+  ] as const)("masks only the fields changed by %j", (changes, paths) => {
+    const before = {
+      ...emptyProfileForm(),
+      name: "linux-build",
+      vcpuCount: 2,
+      memoryMib: 4096,
+      diskGib: 32,
+    };
+    expect(profileUpdateMask(before, { ...before, ...changes }).paths).toEqual(
+      paths,
+    );
+  });
+
   test("serializes a resource-only update with a stored whole-millisecond TTL", () => {
     const idleTtl = durationFromMs(60_060);
     const before = formFromProfile({
@@ -398,7 +421,7 @@ describe("runner profile form", () => {
     );
     expect(decoded.profile?.idleTtl).toEqual(idleTtl);
     expect(decoded.profile?.resources?.vcpuCount).toBe(3);
-    expect(decoded.updateMask?.paths).toEqual(["resources"]);
+    expect(decoded.updateMask?.paths).toEqual(["resources.vcpu_count"]);
   });
 
   test.each([
