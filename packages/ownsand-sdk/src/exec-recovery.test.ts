@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
-import { DataPathError } from "./errors.ts";
+import { DataPathError, OwnSandError } from "./errors.ts";
 import { ExecResultKind } from "./operations/exec.ts";
 
 import { Disconnect } from "./testing/fake-api.ts";
@@ -50,6 +50,32 @@ function disconnectThenNoRecord(h: Harness): void {
   });
 }
 
+/** Lets a state reply cross the deadline before the virtual timer runs. */
+function latePausedLookup(replyAt: number, lookupIndex = 0): Harness {
+  let monotonicOffset = 0;
+  const h = setup((clock) => ({
+    clock: {
+      now: () => clock.now() + monotonicOffset,
+      wallNow: () => clock.wallNow(),
+      sleep: (ms, signal) => clock.sleep(ms, signal),
+    },
+  }));
+  h.api.unary(SandboxService, "GetSandbox", (req, call) => {
+    const late = call.index === lookupIndex;
+    if (late) {
+      expect(call.signal.aborted).toBe(false);
+      monotonicOffset = replyAt - h.clock.now();
+    }
+    return {
+      sandbox: {
+        sandboxId: req.sandboxId,
+        state: late ? SandboxState.PAUSED : SandboxState.RUNNING,
+      },
+    };
+  });
+  return h;
+}
+
 describe("the pre-start state lookup after AttachExec not_found", () => {
   test("a stalled GetSandbox ends at the recovery deadline with the last relay failure and sends no further Exec", async () => {
     const h = setup();
@@ -66,6 +92,19 @@ describe("the pre-start state lookup after AttachExec not_found", () => {
     expect(lookupSignal?.aborted).toBe(true);
     expect(h.api.callsOf("Exec")).toHaveLength(1);
   });
+
+  test.each([MIN, MIN + 1])(
+    "a PAUSED reply at %i ms returns the last relay failure",
+    async (replyAt) => {
+      const h = latePausedLookup(replyAt);
+      disconnectThenNoRecord(h);
+      const error = await h.clock.run(runExec(h)).catch((e) => e);
+      expectTransportInterruption(error);
+      expect(h.api.callsOf("GetSandbox")).toHaveLength(1);
+      expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+      expect(h.api.callsOf("Exec")).toHaveLength(1);
+    },
+  );
 
   test("a caller abort before the deadline cancels the lookup and returns the caller's reason exactly", async () => {
     const h = setup();
@@ -102,12 +141,55 @@ describe("the pre-start state lookup after AttachExec not_found", () => {
     const h = setup();
     disconnectThenNoRecord(h);
     h.state.value = SandboxState.PAUSED;
+    h.api.unary(SandboxService, "GetSandbox", (req, call) => {
+      if (call.index === 1) {
+        throw new ConnectError("lookup failed", Code.Unavailable);
+      }
+      return {
+        sandbox: {
+          sandboxId: req.sandboxId,
+          state: call.index === 2 ? SandboxState.UNREACHABLE : h.state.value,
+        },
+      };
+    });
     after(h, 3 * MIN, () => {
       h.state.value = SandboxState.RUNNING;
     });
     const result = await h.clock.run(runExec(h));
     expect(result.kind).toBe(ExecResultKind.Exited);
     expect(h.clock.now()).toBeGreaterThan(MIN);
+    const execs = h.api.callsOf("Exec");
+    expect(execs).toHaveLength(2);
+    expect(execs[1]?.request).toEqual(execs[0]?.request);
+  });
+
+  test("rejects a missing sandbox on the first resume poll", async () => {
+    const h = setup();
+    disconnectThenNoRecord(h);
+    h.api.unary(SandboxService, "GetSandbox", (req, call) => {
+      if (call.index === 1) return {};
+      return {
+        sandbox: {
+          sandboxId: req.sandboxId,
+          state: call.index === 0 ? SandboxState.PAUSED : SandboxState.RUNNING,
+        },
+      };
+    });
+    const error = await h.clock.run(runExec(h)).catch((e) => e);
+    expect(error).toBeInstanceOf(OwnSandError);
+    expect(error.message).toBe("the response carried no sandbox");
+    expect(h.api.callsOf("GetSandbox")).toHaveLength(2);
+    expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+  });
+
+  test("a missing sandbox in the advisory lookup still allows the resend", async () => {
+    const h = setup();
+    disconnectThenNoRecord(h);
+    h.api.unary(SandboxService, "GetSandbox", () => ({}));
+    const result = await h.clock.run(runExec(h));
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    expect(h.api.callsOf("GetSandbox")).toHaveLength(1);
     expect(h.api.callsOf("Exec")).toHaveLength(2);
   });
 
@@ -143,6 +225,23 @@ describe("a resent ExecRequest that the agent rejects with failed_precondition",
       throw new ConnectError("no exec record", Code.NotFound);
     });
   }
+
+  test.each([MIN, MIN + 1])(
+    "a PAUSED reply at %i ms returns the original failed_precondition",
+    async (replyAt) => {
+      const h = latePausedLookup(replyAt, 1);
+      rejectedResend(h, () => {});
+      const error = await h.clock.run(runExec(h)).catch((e) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error).toMatchObject({
+        code: Code.FailedPrecondition,
+        rawMessage: "sandbox is paused",
+      });
+      expect(h.api.callsOf("GetSandbox")).toHaveLength(2);
+      expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+      expect(h.api.callsOf("Exec")).toHaveLength(2);
+    },
+  );
 
   test("waits for a pause that outlasts the 60-second window and resends the identical request", async () => {
     const h = setup();

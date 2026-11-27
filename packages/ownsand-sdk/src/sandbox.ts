@@ -35,7 +35,7 @@ import {
   validateGuestPath,
   validateOffset,
 } from "./validate.ts";
-import { OwnSandError } from "./errors.ts";
+import { MissingSandboxError, OwnSandError } from "./errors.ts";
 
 /** Options of one exec. */
 export interface ExecOptions {
@@ -301,7 +301,7 @@ export class Sandbox {
 
   #keep(sandbox: SandboxMessage | undefined): SandboxMessage {
     if (sandbox === undefined) {
-      throw new OwnSandError("the response carried no sandbox");
+      throw new MissingSandboxError();
     }
     this.info = sandbox;
     return sandbox;

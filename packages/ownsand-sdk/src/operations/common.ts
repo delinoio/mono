@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError } from "@connectrpc/connect";
-import { classifyFailure, FailureClass, retryAfterMs } from "../errors.ts";
+import {
+  classifyFailure,
+  FailureClass,
+  MissingSandboxError,
+  retryAfterMs,
+} from "../errors.ts";
 import {
   SandboxEndReason,
   SandboxState,
@@ -78,18 +83,24 @@ export async function recoverOrThrow(
 export type SandboxWaitResult =
   { resumed: true } | { resumed: false; reason: SandboxEndReason };
 
-/** Reads the sandbox state once. */
-export async function sandboxState(
+interface SandboxStatus {
+  state: SandboxState;
+  endReason: SandboxEndReason;
+}
+
+/** Reads the sandbox state when the reply contains a sandbox. */
+async function readSandboxState(
   ctx: OperationContext,
   signal: AbortSignal | undefined,
-): Promise<{ state: SandboxState; endReason: SandboxEndReason }> {
+): Promise<SandboxStatus | undefined> {
   const { sandbox } = await ctx.sandboxes.getSandbox(
     { organizationId: ctx.organizationId, sandboxId: ctx.sandboxId },
     { signal },
   );
+  if (sandbox === undefined) return undefined;
   return {
-    state: sandbox?.state ?? SandboxState.UNSPECIFIED,
-    endReason: sandbox?.endReason ?? SandboxEndReason.UNSPECIFIED,
+    state: sandbox.state,
+    endReason: sandbox.endReason ?? SandboxEndReason.UNSPECIFIED,
   };
 }
 
@@ -106,6 +117,7 @@ export class RecoveryDeadlineError extends Error {
  * Reads the sandbox state once, bounded by the relay recovery window. While
  * the window is active, a lookup that is still pending when the window's
  * remaining time has passed is aborted and throws `RecoveryDeadlineError`.
+ * Replies at or after expiry are rejected even if the timer has not run.
  * The lookup does not run when the window has no time left. A caller abort
  * cancels the lookup and rejects with the caller's own reason. An inactive
  * window does not bound the lookup.
@@ -114,12 +126,12 @@ export async function sandboxStateWithin(
   ctx: OperationContext,
   signal: AbortSignal | undefined,
   window: RecoveryWindow,
-): Promise<{ state: SandboxState; endReason: SandboxEndReason }> {
+): Promise<SandboxStatus | undefined> {
   const remaining = window.active
     ? window.remainingMs()
     : Number.POSITIVE_INFINITY;
   if (!Number.isFinite(remaining)) {
-    return sandboxState(ctx, signal);
+    return readSandboxState(ctx, signal);
   }
   if (remaining <= 0) {
     throwIfAborted(signal);
@@ -134,8 +146,9 @@ export async function sandboxStateWithin(
     () => controller.abort(deadline),
     () => {},
   );
+  let current;
   try {
-    return await sandboxState(ctx, controller.signal);
+    current = await readSandboxState(ctx, controller.signal);
   } catch (error) {
     // The caller's abort wins over the deadline.
     throwIfAborted(signal);
@@ -147,6 +160,11 @@ export async function sandboxStateWithin(
     stop.abort();
     dispose();
   }
+  throwIfAborted(signal);
+  if (controller.signal.reason === deadline || window.remainingMs() <= 0) {
+    throw deadline;
+  }
+  return current;
 }
 
 /**
@@ -164,12 +182,17 @@ export async function waitForSandboxToResume(
     delay = Math.min(delay * 2, Timing.pausedPollMaxMs);
     let current;
     try {
-      current = await sandboxState(ctx, signal);
+      current = await readSandboxState(ctx, signal);
     } catch (error) {
-      if (signal?.aborted || classifyFailure(error) === FailureClass.Terminal) {
+      throwIfAborted(signal);
+      if (classifyFailure(error) === FailureClass.Terminal) {
         throw error;
       }
       continue;
+    }
+    throwIfAborted(signal);
+    if (current === undefined) {
+      throw new MissingSandboxError();
     }
     switch (current.state) {
       case SandboxState.RUNNING:
