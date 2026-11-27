@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"connectrpc.com/connect"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 
@@ -68,20 +69,47 @@ func TestEnumsHaveUnspecifiedZeroValue(t *testing.T) {
 // ErrorCode values equal the Connect error codes, so components can convert
 // without a table.
 func TestErrorCodeNumbersMatchConnect(t *testing.T) {
-	cases := map[ownsandv1.ErrorCode]int32{
-		ownsandv1.ErrorCode_ERROR_CODE_CANCELED:            1,
-		ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT:    3,
-		ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND:           5,
-		ownsandv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED:   7,
-		ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED:  8,
-		ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION: 9,
-		ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE:         14,
-		ownsandv1.ErrorCode_ERROR_CODE_UNAUTHENTICATED:     16,
+	codes := []connect.Code{
+		connect.CodeCanceled,
+		connect.CodeUnknown,
+		connect.CodeInvalidArgument,
+		connect.CodeDeadlineExceeded,
+		connect.CodeNotFound,
+		connect.CodeAlreadyExists,
+		connect.CodePermissionDenied,
+		connect.CodeResourceExhausted,
+		connect.CodeFailedPrecondition,
+		connect.CodeAborted,
+		connect.CodeOutOfRange,
+		connect.CodeUnimplemented,
+		connect.CodeInternal,
+		connect.CodeUnavailable,
+		connect.CodeDataLoss,
+		connect.CodeUnauthenticated,
 	}
-	for code, want := range cases {
-		if int32(code) != want {
-			t.Errorf("%s = %d, want %d", code, int32(code), want)
+	want := make(map[protoreflect.Name]protoreflect.EnumNumber, len(codes))
+	for _, code := range codes {
+		name := protoreflect.Name("ERROR_CODE_" + strings.ToUpper(code.String()))
+		want[name] = protoreflect.EnumNumber(code)
+	}
+	values := ownsandv1.ErrorCode(0).Descriptor().Values()
+	for i := 0; i < values.Len(); i++ {
+		value := values.Get(i)
+		if value.Number() == 0 {
+			continue
 		}
+		number, ok := want[value.Name()]
+		if !ok {
+			t.Errorf("unexpected %s = %d: no matching Connect code", value.Name(), value.Number())
+			continue
+		}
+		if value.Number() != number {
+			t.Errorf("%s = %d, want Connect code %d", value.Name(), value.Number(), number)
+		}
+		delete(want, value.Name())
+	}
+	for name, number := range want {
+		t.Errorf("missing %s = %d for Connect code", name, number)
 	}
 }
 
