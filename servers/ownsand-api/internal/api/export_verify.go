@@ -139,9 +139,13 @@ func (c *Control) RunExportVerifyOnce(ctx context.Context) {
 // The R2 listing runs outside the transaction. When applying a result, the
 // verifier locks the row again and checks that it still names the same attempt.
 func (s *Service) claimExportVerifyJobs(ctx context.Context) ([]exportVerifyJob, error) {
+	type scheduledVerification struct {
+		snapshotID string
+		after      time.Time
+	}
 	var jobs []exportVerifyJob
+	var scheduled []scheduledVerification
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
-		jobs = nil
 		now := s.now()
 		type row struct {
 			snapshotID, orgID, commandID string
@@ -169,17 +173,18 @@ func (s *Service) claimExportVerifyJobs(ctx context.Context) ([]exportVerifyJob,
 		}
 		retryAfter := now.Add(s.exportVerifyPoll())
 		for _, r := range due {
-			after := retryAfter
 			if r.after == nil {
 				// Upload URLs can still be valid for a full lifetime.
-				after = now.Add(s.exportVerifyDelay())
-			}
-			if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_verify_after = $2 WHERE snapshot_id = $1", r.snapshotID, after); err != nil {
-				return err
-			}
-			if r.after == nil {
-				s.Logger.InfoContext(ctx, "export_verification_scheduled", slog.String("snapshot_id", r.snapshotID), slog.Time("verify_after", after))
+				var after time.Time
+				if err := tx.QueryRow(ctx, "UPDATE snapshots SET export_verify_after = $2 WHERE snapshot_id = $1 RETURNING export_verify_after",
+					r.snapshotID, now.Add(s.exportVerifyDelay())).Scan(&after); err != nil {
+					return err
+				}
+				scheduled = append(scheduled, scheduledVerification{snapshotID: r.snapshotID, after: after})
 				continue
+			}
+			if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_verify_after = $2 WHERE snapshot_id = $1", r.snapshotID, retryAfter); err != nil {
+				return err
 			}
 			parts, err := loadManifest(ctx, tx, r.snapshotID)
 			if err != nil {
@@ -189,7 +194,13 @@ func (s *Service) claimExportVerifyJobs(ctx context.Context) ([]exportVerifyJob,
 		}
 		return nil
 	})
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range scheduled {
+		s.Logger.InfoContext(ctx, "export_verification_scheduled", slog.String("snapshot_id", r.snapshotID), slog.Time("verify_after", r.after.UTC()))
+	}
+	return jobs, nil
 }
 
 // loadManifest returns the part sizes that the agent reported for snapshotID.
@@ -257,7 +268,8 @@ func compareExport(job exportVerifyJob, objects []objectstore.Object) (ExportVer
 // prefix.
 func (s *Service) applyExportVerification(ctx context.Context, job exportVerifyJob, objects []objectstore.Object) error {
 	reason, key := compareExport(job, objects)
-	return s.DB.InTx(ctx, func(tx pgx.Tx) error {
+	var applied bool
+	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		var export int16
 		var owner string
 		var verified bool
@@ -276,7 +288,7 @@ func (s *Service) applyExportVerification(ctx context.Context, job exportVerifyJ
 			if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_verified = true WHERE snapshot_id = $1", job.snapshotID); err != nil {
 				return err
 			}
-			s.Logger.InfoContext(ctx, "export_verified", slog.String("snapshot_id", job.snapshotID), slog.String("command_id", job.commandID), slog.Int("parts", len(job.parts)))
+			applied = true
 			return nil
 		}
 		if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", job.snapshotID,
@@ -289,8 +301,17 @@ func (s *Service) applyExportVerification(ctx context.Context, job exportVerifyJ
 		if err := s.startCleanupJobTx(ctx, tx, job.orgID, attemptPrefix(job.orgID, job.snapshotID, job.commandID)); err != nil {
 			return err
 		}
-		s.Logger.WarnContext(ctx, "export_verification_failed", slog.String("snapshot_id", job.snapshotID), slog.String("command_id", job.commandID),
-			slog.String("reason", string(reason)), slog.String("object_key", key))
+		applied = true
 		return nil
 	})
+	if err != nil || !applied {
+		return err
+	}
+	if reason == "" {
+		s.Logger.InfoContext(ctx, "export_verified", slog.String("snapshot_id", job.snapshotID), slog.String("command_id", job.commandID), slog.Int("parts", len(job.parts)))
+		return nil
+	}
+	s.Logger.WarnContext(ctx, "export_verification_failed", slog.String("snapshot_id", job.snapshotID), slog.String("command_id", job.commandID),
+		slog.String("reason", string(reason)), slog.String("object_key", key))
+	return nil
 }
