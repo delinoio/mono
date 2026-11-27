@@ -82,6 +82,8 @@ A personal API key authorizes as its user in the organization of the key. The se
 - A personal API key can call only the dev session rows and nothing else; it cannot create, list or revoke API keys.
 - An organization has exactly one `owner`, with the same ownership rules as OwnSand.
 - Invitations are one-time secrets that expire after 7 days. The server stores only their hashes.
+- After it locks the organization row, `CreateInvitation` takes a shared lock on the caller's membership row and checks the caller's role again. It returns `not_found` if the membership ended and `permission_denied` if the role no longer allows member management.
+- If a membership ends or a role change removes member-management permission, the server revokes the creator's pending invitations in that organization in the same transaction. It records one `INVITATION_REVOKED` audit event per invitation. If creation commits before the membership change, this rule also revokes the new invitation. A revoked secret returns `not_found` from `AcceptInvitation`.
 - `AcceptInvitation` checks expiry after locking the organization and invitation rows. It returns `not_found` if the check reaches or passes the expiry time. A successful acceptance uses the time of that check for the membership join and invitation acceptance timestamps.
 
 ### OwnSand link
@@ -342,7 +344,7 @@ Gaps in the OpenAI documentation (NOT DOCUMENTED; SandRun implements them defens
 - The server stores only the SHA-256 hash of the secret and a short non-secret prefix for display. A lookup hashes the presented value, loads the row by that hash and compares the stored hash in constant time. A value with the `sandrun_` prefix but a wrong shape gets `unauthenticated`.
 - A revoked or expired key gets `unauthenticated`. The server records the last use time of each key with at most one write per key per minute. Only an accepted use counts: a valid key that an RPC other than `DevSessionService` rejects does not change the last use time.
 - The display prefix is `sandrun_` and the first 4 characters after it, like the invitation display prefix (`sri_` and 4 characters). The rate limit of authentication failures keys on it.
-- When a membership ends (removal by an admin or leaving), the server revokes every key of that user in that organization in the same transaction. It then ends the user's dev sessions of the organization as described in [Dev sessions](#dev-sessions). The dev session layer does this through the membership end hook of the core: one step in the same transaction and one step after the commit.
+- When a membership ends (removal by an admin or leaving), the server revokes every personal API key and pending invitation of that user in that organization in the same transaction. It then ends the user's dev sessions of the organization as described in [Dev sessions](#dev-sessions). The dev session layer does this through the membership end hook of the core: one step in the same transaction and one step after the commit.
 - Organization deletion revokes every key of the organization and records an `API_KEY_REVOKED` audit event for each, then deletes the keys with the organization.
 
 ### Dev sessions
