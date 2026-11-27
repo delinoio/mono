@@ -111,6 +111,7 @@ export function InvitationPage({
               currentAttempt.current += 1;
               setValue(v);
               setInputError(undefined);
+              resetAccept();
             }}
             error={inputError}
             autoFocus

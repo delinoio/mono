@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create, isMessage } from "@bufbuild/protobuf";
-import { timestampMs } from "@bufbuild/protobuf/wkt";
+import { durationFromMs, timestampMs } from "@bufbuild/protobuf/wkt";
 import {
   afterEach,
   beforeEach,
@@ -40,6 +40,7 @@ import {
 import { AuditAction, AuditService } from "@delino/sandrun-protos/v1/audit_pb";
 import {
   AgentVendor,
+  GuestOs,
   OwnSandLinkState,
   RequestState,
   Role,
@@ -88,6 +89,16 @@ import {
 } from "./mock/mock-api.ts";
 import { organizationPages } from "./mock/organization-pages.ts";
 import { externalNavigation } from "./navigation.ts";
+import { getVerifiedCodexGuestOses } from "./verified-codex-guest-oses.ts";
+import * as actualCodexGuestOses from "./verified-codex-guest-oses.ts" with {
+  rstest: "importActual",
+};
+
+rs.mock(import("./verified-codex-guest-oses.ts"), () => ({
+  getVerifiedCodexGuestOses: rs.fn(
+    actualCodexGuestOses.getVerifiedCodexGuestOses,
+  ),
+}));
 
 const config = {
   apiOrigin: "https://api.test",
@@ -1182,7 +1193,7 @@ describe("integrations", () => {
     expect(screen.getAllByText(/Webhook secret: Set at/).length).toBe(1);
   });
 
-  test("creates a Devin integration with password credential fields", async () => {
+  test("creates a Claude Code integration with a password credential field", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`);
     await click(
       await screen.findByRole("button", { name: "Create agent integration" }),
@@ -1210,6 +1221,60 @@ describe("integrations", () => {
     await settle(80);
     expect(await screen.findByText(/claude-2/)).toBeTruthy();
     expect(document.body.textContent).not.toContain("env_key_value");
+  });
+
+  test("creates a Devin integration with two masked credentials", async () => {
+    const { transport, calls } = gatedTransport("CreateAgentIntegration");
+    const name = "devin-fixture";
+    const outpostName = "fixture-outpost";
+    const apiToken = "fixture-api-token";
+    const outpostToken = "fixture-outpost-token";
+    renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`, { transport });
+    await click(
+      await screen.findByRole("button", { name: "Create agent integration" }),
+    );
+    const form = within(
+      await screen.findByRole("dialog", {
+        name: "Create an agent integration",
+      }),
+    );
+    await click(form.getByRole("combobox", { name: "Vendor" }));
+    await click(await screen.findByRole("option", { name: "Devin" }));
+
+    const apiTokenInput = form.getByLabelText<HTMLInputElement>("API token");
+    const outpostTokenInput =
+      form.getByLabelText<HTMLInputElement>("Outpost token");
+    expect(apiTokenInput.type).toBe("password");
+    expect(outpostTokenInput.type).toBe("password");
+    await type(form.getByRole("textbox", { name: "Name" }), name);
+    await type(
+      form.getByRole("textbox", { name: "Devin outpost name" }),
+      outpostName,
+    );
+    await type(apiTokenInput, apiToken);
+    await type(outpostTokenInput, outpostToken);
+    await click(form.getByRole("button", { name: "Create integration" }));
+    expect(calls).toHaveLength(1);
+    await act(async () => calls[0].settle());
+
+    const list = within(
+      await screen.findByRole("list", { name: "Agent integrations" }),
+    );
+    expect(await list.findByText(`${name} · Devin`)).toBeTruthy();
+    expect(calls.map(({ input }) => input)).toEqual([
+      expect.objectContaining({
+        organizationId: MOCK_IDS.acme,
+        vendor: AgentVendor.DEVIN,
+        name,
+        settings: { case: "devin", value: { outpostName } },
+        credentials: {
+          case: "devinCredentials",
+          value: { apiToken, outpostToken },
+        },
+      }),
+    ]);
+    expect(document.body.textContent).not.toContain(apiToken);
+    expect(document.body.textContent).not.toContain(outpostToken);
   });
 
   test("Connect GitHub opens the installation URL from the control plane", async () => {
@@ -1708,6 +1773,166 @@ describe("GitHub setup callback", () => {
 });
 
 describe("runner profiles", () => {
+  async function selectProfileOption(
+    form: HTMLElement,
+    name: string,
+    option: string,
+  ) {
+    await click(within(form).getByRole("combobox", { name }));
+    await click(await screen.findByRole("option", { name: option }));
+  }
+
+  test.each(["create", "edit"] as const)(
+    "blocks the %s request when no Codex guest OS is verified",
+    async (mode) => {
+      const mock = createMockTransport();
+      const saveProfile = rs.fn();
+      renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+        transport: {
+          ...mock,
+          unary(method, ...args) {
+            if (
+              method.name ===
+                RunnerProfileService.method.createRunnerProfile.name ||
+              method.name ===
+                RunnerProfileService.method.updateRunnerProfile.name
+            ) {
+              saveProfile();
+            }
+            return mock.unary(method, ...args);
+          },
+        },
+      });
+      const creating = mode === "create";
+      if (creating) {
+        await click(
+          await screen.findByRole("button", { name: "Create runner profile" }),
+        );
+      } else {
+        const row = (
+          await screen.findByText("codex-linux · Agent session · Linux")
+        ).closest("li")!;
+        await click(within(row).getByRole("button", { name: "Edit" }));
+      }
+      const dialog = await screen.findByRole("dialog", {
+        name: creating ? "Create a runner profile" : "Edit codex-linux",
+      });
+      const form = within(dialog);
+      const name = form.getByRole("textbox", { name: "Name" });
+      await type(name, "codex-check");
+      if (creating) {
+        await selectProfileOption(dialog, "Workload kind", "Agent session");
+        await selectProfileOption(
+          dialog,
+          "Agent integration",
+          "codex-prod (OpenAI Codex)",
+        );
+        const wait = form.getByLabelText("Maximum queue wait (minutes)");
+        await type(wait, "5");
+        fireEvent.blur(wait);
+      }
+      expect(
+        await form.findByText(
+          /SandRun has not verified a guest OS for OpenAI Codex/,
+        ),
+      ).toBeTruthy();
+      const guestOs = form.getByRole("combobox", { name: "Guest OS" });
+      expect(guestOs).toHaveProperty("disabled", true);
+      await click(guestOs);
+      expect(
+        screen.queryAllByRole("option", { name: /^(Linux|macOS|Windows)$/ }),
+      ).toHaveLength(0);
+      expect(
+        form.getByRole("button", {
+          name: creating ? "Create profile" : "Save changes",
+        }),
+      ).toHaveProperty("disabled", true);
+      await act(async () => {
+        fireEvent.submit(name.closest("form")!);
+      });
+      expect(saveProfile).not.toHaveBeenCalled();
+    },
+  );
+
+  test("clears a stale OS and enforces the queue wait when only Linux is verified", async () => {
+    await rs.mocked(getVerifiedCodexGuestOses).withImplementation(
+      () => [GuestOs.LINUX],
+      async () => {
+        const mock = createMockTransport();
+        const createProfile = rs.fn();
+        renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+          transport: {
+            ...mock,
+            unary(method, ...args) {
+              const request = create(method.input, args[3]);
+              if (isMessage(request, CreateRunnerProfileRequestSchema)) {
+                createProfile(request.profile);
+              }
+              return mock.unary(method, ...args);
+            },
+          },
+        });
+        await click(
+          await screen.findByRole("button", { name: "Create runner profile" }),
+        );
+        const dialog = await screen.findByRole("dialog", {
+          name: "Create a runner profile",
+        });
+        const form = within(dialog);
+        await type(
+          form.getByRole("textbox", { name: "Name" }),
+          "codex-verified-check",
+        );
+        await selectProfileOption(dialog, "Guest OS", "Windows");
+        await selectProfileOption(dialog, "Workload kind", "Agent session");
+        await selectProfileOption(
+          dialog,
+          "Agent integration",
+          "codex-prod (OpenAI Codex)",
+        );
+        const wait = form.getByLabelText("Maximum queue wait (minutes)");
+        await type(wait, "5");
+        fireEvent.blur(wait);
+        const submit = form.getByRole("button", { name: "Create profile" });
+        await click(submit);
+        expect(form.getByText("Select a guest OS.")).toBeTruthy();
+        expect(createProfile).not.toHaveBeenCalled();
+
+        const guestOs = form.getByRole("combobox", { name: "Guest OS" });
+        expect(guestOs.textContent).toContain("Select a guest OS");
+        await click(guestOs);
+        const options = screen.getAllByRole("option", {
+          name: /^(Linux|macOS|Windows)$/,
+        });
+        expect(options.map((option) => option.textContent)).toEqual(["Linux"]);
+        await click(options[0]!);
+        await type(wait, "6");
+        fireEvent.blur(wait);
+        await click(submit);
+        expect(
+          form.getByText("OpenAI waits at most 5 minutes for an executor."),
+        ).toBeTruthy();
+        expect(createProfile).not.toHaveBeenCalled();
+
+        await type(wait, "5");
+        fireEvent.blur(wait);
+        await click(submit);
+        expect(
+          await screen.findByText(
+            "codex-verified-check · Agent session · Linux",
+          ),
+        ).toBeTruthy();
+        expect(createProfile).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            guestOs: GuestOs.LINUX,
+            source: { case: "baseImage", value: GuestOs.LINUX },
+            maxQueueWait: durationFromMs(300_000),
+          }),
+        );
+      },
+    );
+  });
+
   test("resolves a later-page integration's name, vendor and ID", async () => {
     const mock = createMockTransport({ agentIntegrationPageSize: 1 });
     const createProfile = rs.fn();
@@ -3456,6 +3681,11 @@ describe("failed query refreshes", () => {
     const group = await within(dialog).findByRole("combobox", {
       name: "Runner group",
     });
+    const selectedGroup = "sandrun-private · selected";
+    expect(group.textContent).toBe("Default (default) · all");
+    await click(group);
+    await click(await screen.findByRole("option", { name: selectedGroup }));
+    expect(group.textContent).toBe(selectedGroup);
 
     fixture.fail(new ConnectError("offline", Code.Internal));
     await refetch(client);
@@ -3464,10 +3694,15 @@ describe("failed query refreshes", () => {
     expect(within(dialog).getByRole("combobox", { name: "Runner group" })).toBe(
       group,
     );
+    expect(group.textContent).toBe(selectedGroup);
     fixture.fail(undefined);
     await click(within(dialog).getByRole("button", { name: "Try again" }));
     expect(screen.getByRole("dialog")).toBe(dialog);
     expect(within(dialog).queryByText(refreshNotice)).toBeNull();
+    expect(
+      within(dialog).getByRole("combobox", { name: "Runner group" })
+        .textContent,
+    ).toBe(selectedGroup);
   });
 
   const infiniteLists = [
@@ -4017,9 +4252,14 @@ describe("invitations", () => {
     expect(invitationInput().value).toBe(MOCK_INVITATION_SECRET);
   });
 
-  test.each(["success", "error"] as const)(
-    "keeps a replacement link active after a late accept %s",
-    async (result) => {
+  test.each([
+    { replacement: "link", result: "success" },
+    { replacement: "link", result: "error" },
+    { replacement: "edit", result: "success" },
+    { replacement: "edit", result: "error" },
+  ] as const)(
+    "keeps a replacement $replacement active after a late accept $result",
+    async ({ replacement, result }) => {
       const { transport, release, requested } = holdInvitationAccept();
       const queryClient = renderConsole("/", {
         transport,
@@ -4045,9 +4285,14 @@ describe("invitations", () => {
       });
       await click(join);
       expect(join.disabled).toBe(true);
-      await changeInvitationHash("#secret=sri_follow_up_invitation");
+      const replacementSecret = "sri_follow_up_invitation";
+      if (replacement === "link") {
+        await changeInvitationHash(`#secret=${replacementSecret}`);
+      } else {
+        await type(invitationInput(), replacementSecret);
+      }
 
-      expect(join.disabled).toBe(false);
+      await waitFor(() => expect(join.disabled).toBe(false));
       expect(requested).toHaveBeenCalledTimes(1);
       await act(async () => release());
       await waitFor(() =>
@@ -4056,7 +4301,8 @@ describe("invitations", () => {
         ),
       );
       expect(window.location.pathname).toBe("/invitations/accept");
-      expect(invitationInput().value).toBe("sri_follow_up_invitation");
+      expect(invitationInput().value).toBe(replacementSecret);
+      expect(join.disabled).toBe(false);
       expect(screen.queryByText(invalidInvitationNotice)).toBeNull();
 
       if (result === "success") {
@@ -4202,28 +4448,6 @@ describe("invitations", () => {
       ).toBeTruthy();
     },
   );
-
-  test("keeps the new invitation when an earlier accept succeeds", async () => {
-    const { transport, release, requested } = holdInvitationAccept();
-    renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`, {
-      transport,
-    });
-    const join = screen.getByRole<HTMLButtonElement>("button", {
-      name: "Join organization",
-    });
-    await click(join);
-    expect(requested).toHaveBeenCalledTimes(1);
-
-    const input = screen.getByLabelText<HTMLInputElement>(
-      "Invitation link or secret",
-    );
-    await type(input, "sri_follow_up_invitation");
-    await act(async () => release());
-    await waitFor(() => expect(join.disabled).toBe(false));
-
-    expect(window.location.pathname).toBe("/invitations/accept");
-    expect(input.value).toBe("sri_follow_up_invitation");
-  });
 
   test("asks a signed-out user to sign in and open the link again", async () => {
     renderConsole("/invitations/accept", { signedIn: false });
