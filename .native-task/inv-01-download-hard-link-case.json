@@ -1,0 +1,62 @@
+{
+  "gid": "inv-01-download-hard-link-case",
+  "commit": "5e5d7f954a7f0237bc7232bb3d0b641fbf22641b",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "5e5d7f954a7f0237bc7232bb3d0b641fbf22641b",
+    "reason": "The assigned implementation worker cannot reach native hosts. The available Linux ext4 volume stores both names separately and does not support enabling casefold on the scratch directory.",
+    "expectedResults": [
+      "The log shows that the destination volume aliases \"Report.txt\" and \"report.txt\": true.",
+      "All seven TestDownloadDestinationCaseCollision subtests run without skips. Both destination states pass for every subtest.",
+      "Download returns failed_precondition with both archive names for both orders of a regular file and a hard link, and for two hard links. The existing destination keeps only keep.txt with the original contents. The absent destination stays absent. Local staging and the guest archive are removed.",
+      "The native link scenarios and the injected fallback scenarios both pass. Exact-name replacements and the hard-link extraction limits pass. TestDownloadHardLinkFallback runs on macOS and may skip its POSIX fixture on Windows."
+    ],
+    "files": [
+      "go/sandrun/archive.go",
+      "go/sandrun/download.go",
+      "go/sandrun/download_case_test.go",
+      "go/sandrun/download_progress_test.go",
+      "go/sandrun/sync_test.go",
+      ".t3-tmp/download-native.log"
+    ],
+    "targets": [
+      {
+        "host": "m3-16",
+        "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+        "platform": "darwin/arm64",
+        "volume": "Case-insensitive APFS, with the repository and its .t3-tmp directory on that volume."
+      },
+      {
+        "host": "delino-win-1",
+        "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+        "platform": "windows/amd64",
+        "volume": "Case-insensitive NTFS, with the repository and its .t3-tmp directory on that volume.",
+        "shell": "PowerShell"
+      }
+    ],
+    "commands": {
+      "m3-16": [
+        "set -e",
+        "set -o pipefail",
+        "test \"$(git rev-parse HEAD)\" = \"5e5d7f954a7f0237bc7232bb3d0b641fbf22641b\"",
+        "go version",
+        "mkdir -p \"$PWD/.t3-tmp\"",
+        "export TMPDIR=\"$PWD/.t3-tmp\"",
+        "go test -count=1 -v ./go/sandrun -run '^TestDownload(DestinationCaseCollision|ArchiveRepeated.*Name|HardLinkFallback)$|^TestExtractHardLinkLimits$' | tee '.t3-tmp/download-native.log'",
+        "grep -F 'the destination volume aliases \"Report.txt\" and \"report.txt\": true' '.t3-tmp/download-native.log'",
+        "if grep -E '^[[:space:]]*--- SKIP: TestDownloadDestinationCaseCollision' '.t3-tmp/download-native.log'; then exit 1; fi",
+        "go vet ./go/sandrun/... ./cmds/sandrun/..."
+      ],
+      "delino-win-1": [
+        "if ((git rev-parse HEAD) -ne \"5e5d7f954a7f0237bc7232bb3d0b641fbf22641b\") { throw \"Unexpected source revision\" }",
+        "go version",
+        "New-Item -ItemType Directory -Force -Path '.t3-tmp' | Out-Null",
+        "$env:TMP = (Resolve-Path '.t3-tmp').Path; $env:TEMP = $env:TMP; $env:TMPDIR = $env:TMP",
+        "go test -count=1 -v ./go/sandrun -run '^TestDownload(DestinationCaseCollision|ArchiveRepeated.*Name|HardLinkFallback)$|^TestExtractHardLinkLimits$' | Tee-Object -FilePath '.t3-tmp/download-native.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        "if (-not (Select-String -Quiet -SimpleMatch 'the destination volume aliases \"Report.txt\" and \"report.txt\": true' '.t3-tmp/download-native.log')) { throw \"The test directory must alias the two case spellings\" }",
+        "if (Select-String -Quiet -Pattern '^\\s*--- SKIP: TestDownloadDestinationCaseCollision' '.t3-tmp/download-native.log') { throw \"The case collision matrix must run without skips\" }",
+        "go vet ./go/sandrun/... ./cmds/sandrun/...; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+      ]
+    }
+  }
+}
