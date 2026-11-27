@@ -91,7 +91,7 @@ func TestDevSessionFileWriteWaitHonorsContext(t *testing.T) {
 			s, sandboxID := w.runningSession(t)
 
 			handler := w.env.App.Handler()
-			httpClient, baseURL := startDevSessionH2C(t, http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			httpClient, baseURL := startStreamH2C(t, http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 				if req.Header.Get("X-Test-Write-Waiter") == "true" {
 					// End the server context first so the test observes the
 					// handler's RPC response while the client still waits.
