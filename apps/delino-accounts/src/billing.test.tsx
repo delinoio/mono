@@ -964,6 +964,8 @@ describe("usage", () => {
     await click(screen.getByRole("button", { name: "Previous month" }));
     await settle(60);
     expect(await screen.findByText("No usage in this month")).toBeTruthy();
+    expect(screen.getByLabelText("Usage total").textContent).toBe("$0.00");
+    expect(pageTokens(api, "ListUsageSummary")).toEqual(["", ""]);
     const months = calls(api, "ListUsageSummary");
     expect(months[0]).toEqual(
       expect.objectContaining({ year: 2027, month: 1 }),
@@ -3039,6 +3041,21 @@ describe("failed background refetches", () => {
 });
 
 describe("continuation of the billing history lists", () => {
+  const usageSummary = {
+    name: "usage summary",
+    method: "ListUsageSummary",
+    tab: "Usage",
+    list: undefined,
+    more: "Show more usage",
+    total: 201,
+    firstPage: 200,
+    seed: (account: ReturnType<typeof accountOf>) =>
+      addUsageRows(account, 201 - account.usage.length),
+    shrink: (account: ReturnType<typeof accountOf>) => {
+      account.usage.length = 10;
+    },
+  };
+
   /**
    * The three lists that read on with a button. `seed` gives the account more
    * rows than one page, so that the button shows after the first page; `rows`
@@ -3075,20 +3092,7 @@ describe("continuation of the billing history lists", () => {
         account.ledger.length = 10;
       },
     },
-    {
-      name: "usage summary",
-      method: "ListUsageSummary",
-      tab: "Usage",
-      list: undefined,
-      more: "Show more usage",
-      total: 201,
-      firstPage: 200,
-      seed: (account: ReturnType<typeof accountOf>) =>
-        addUsageRows(account, 201 - account.usage.length),
-      shrink: (account: ReturnType<typeof accountOf>) => {
-        account.usage.length = 10;
-      },
-    },
+    usageSummary,
   ];
 
   function accountOf(api: ReturnType<typeof createFakeApi>) {
@@ -3118,6 +3122,52 @@ describe("continuation of the billing history lists", () => {
 
   const moreButton = (entry: (typeof lists)[number]) =>
     screen.getByRole("button", { name: entry.more }) as HTMLButtonElement;
+
+  describe("usage summary totals", () => {
+    const entry = usageSummary;
+    const usageTotal = () => screen.getByLabelText("Usage total").textContent;
+
+    async function openUsageWithTwoPages() {
+      const api = createFakeApi();
+      const account = accountOf(api);
+      account.usage.length = 0;
+      addUsageRows(account, 201, 1_000_000n);
+      await renderAccount(OWNER, { api });
+      await openTab("Usage");
+      await waitFor(() => expect(moreButton(entry).disabled).toBe(false));
+      expect(rowCount(entry.list)).toBe(200);
+      expect(usageTotal()).toBe("$201.00");
+      expect(pageTokens(api, entry.method)).toEqual([""]);
+      return { account, api };
+    }
+
+    test("updates the full-month total when the final row costs more", async () => {
+      const { account, api } = await openUsageWithTwoPages();
+      account.usage.at(-1)!.amountUsdMicros = 3_000_000n;
+
+      await click(moreButton(entry));
+
+      await waitFor(() => expect(usageTotal()).toBe("$203.00"));
+      expect(rowCount(entry.list)).toBe(201);
+      expect(
+        screen.getByText("usage-org-0201").closest("tr")?.textContent,
+      ).toContain("$3.00");
+      expect(pageTokens(api, entry.method)).toEqual(["", nonemptyPageToken]);
+    });
+
+    test("uses the total of an empty continuation", async () => {
+      const { account, api } = await openUsageWithTwoPages();
+      account.usage.pop();
+      account.usage[0]!.amountUsdMicros = 4_000_000n;
+
+      await click(moreButton(entry));
+
+      await waitFor(() => expect(usageTotal()).toBe("$203.00"));
+      expect(rowCount(entry.list)).toBe(200);
+      expect(screen.queryByText(entry.more, { selector: "button" })).toBeNull();
+      expect(pageTokens(api, entry.method)).toEqual(["", nonemptyPageToken]);
+    });
+  });
 
   for (const entry of lists) {
     describe(entry.name, () => {
