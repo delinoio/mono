@@ -1,0 +1,77 @@
+{
+  "gid": "inv-33-macos-installed-image-files",
+  "commit": "3d519ecabd4a8ada63a2ce36a016a6c18df33564",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "3d519ecabd4a8ada63a2ce36a016a6c18df33564",
+    "setup": "Run in order in one shell from a clean checkout of the worker commit on an APFS volume. These focused checks use the Xcode C toolchain and an ad-hoc entitlement signature. They require no administrator password, CMake, IPSW, or guest image.",
+    "commands": [
+      "test \"$(git rev-parse HEAD)\" = '3d519ecabd4a8ada63a2ce36a016a6c18df33564' && test \"$(uname -m)\" = arm64",
+      "export TMPDIR=\"$(git rev-parse --show-toplevel)/.t3-tmp/macos-installed-image-files\" COPYFILE_DISABLE=1",
+      "mkdir -p \"$TMPDIR\"",
+      "diskutil info \"$(df -P \"$TMPDIR\" | awk 'END { print $1 }')\" | grep -i 'File System Personality:.*APFS'",
+      "CGO_ENABLED=1 go vet ./cmds/ownsand-agent/internal/images ./cmds/ownsand-agent/internal/vmruntime/vzrt > \"$TMPDIR/native-vet.log\" 2>&1",
+      "CGO_ENABLED=1 go test -count=1 -v ./cmds/ownsand-agent/internal/images > \"$TMPDIR/images.log\" 2>&1",
+      "CGO_ENABLED=1 go test -c -o \"$TMPDIR/vzrt.test\" ./cmds/ownsand-agent/internal/vmruntime/vzrt",
+      "codesign --force --sign - --entitlements \"cmds/ownsand-agent/entitlements.plist\" \"$TMPDIR/vzrt.test\"",
+      "codesign --verify --strict \"$TMPDIR/vzrt.test\"",
+      "\"$TMPDIR/vzrt.test\" -test.run '^(TestMacOSRuntimeRejectsLinkedBaseStorage|TestMacOSBaseImageRecoversLinkedStorageWithNativeCopies|TestMacOSBaseImageGenerationWithNativeCopies)$' -test.count=1 -test.timeout=5m -test.v > \"$TMPDIR/vzrt.log\" 2>&1",
+      "grep -F -- '--- PASS: TestMacOSImageRecoveryRejectsLinkedStorage' \"$TMPDIR/images.log\"",
+      "grep -F -- '--- PASS: TestMacOSRuntimeRejectsLinkedBaseStorage' \"$TMPDIR/vzrt.log\"",
+      "grep -F -- '--- PASS: TestMacOSBaseImageRecoversLinkedStorageWithNativeCopies' \"$TMPDIR/vzrt.log\"",
+      "grep -F -- '--- PASS: TestMacOSBaseImageGenerationWithNativeCopies' \"$TMPDIR/vzrt.log\"",
+      "test \"$(grep -Fc 'clonefile disk.img: <nil>' \"$TMPDIR/vzrt.log\")\" -eq 2 && test \"$(grep -Fc 'clonefile aux.img: <nil>' \"$TMPDIR/vzrt.log\")\" -eq 2",
+      "! grep -Eq '^[[:space:]]*--- SKIP: (TestMacOSImageRecoveryRejectsLinkedStorage|TestMacOSRuntimeRejectsLinkedBaseStorage|TestMacOSBaseImageRecoversLinkedStorageWithNativeCopies|TestMacOSBaseImageGenerationWithNativeCopies)' \"$TMPDIR/images.log\" \"$TMPDIR/vzrt.log\""
+    ],
+    "expectedResults": [
+      "Native vet, builds, signature verification and targeted tests exit 0. Neither storage case skips.",
+      "For linked disk.img and linked aux.img, capabilities report an incomplete image and omit the macOS base image. Runtime.Create returns the existing unsupported precondition.",
+      "Backup rotation installs two regular files and preserves the linked target. Native source preparation uses the backup. APFS clonefile succeeds for both disk and auxiliary storage in each scenario. Growing the sandbox disk leaves the base disk at its original size."
+    ],
+    "files": {
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/images/images_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/vzrt/macos_source_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/vzrt/macos_source_darwin_test.go"
+      ],
+      "entitlements": "cmds/ownsand-agent/entitlements.plist",
+      "outputLogs": [
+        ".t3-tmp/macos-installed-image-files/native-vet.log",
+        ".t3-tmp/macos-installed-image-files/images.log",
+        ".t3-tmp/macos-installed-image-files/vzrt.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-macos-installed-image-files/worker/.t3-tmp/images.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-macos-installed-image-files/worker/.t3-tmp/vzrt.test"
+      ]
+    },
+    "guestValidation": {
+      "status": "pending-missing-prerequisite",
+      "reason": "The assigned host has no built macOS guest image or IPSW. A supported regular-file guest image on the same APFS volume as TMPDIR is required for positive capability advertisement, a real boot, GPT and in-guest growth checks.",
+      "setup": "Once an existing development image is available, run the signed focused binary from the commands above. Set OWNSAND_VZ_TEST_MACOS_IMAGE to the absolute directory of the built image. Use an image of a positive whole number of GiB for the disk capacity fixture and the existing 64 GiB development image for the lifecycle fixture.",
+      "commands": [
+        "test -n \"$OWNSAND_VZ_TEST_MACOS_IMAGE\" && test -f \"$OWNSAND_VZ_TEST_MACOS_IMAGE/image.json\"",
+        "\"$TMPDIR/vzrt.test\" -test.run '^TestVirtualizationBaseImageDiskCapacity$/^macOS$' -test.count=1 -test.v -test.timeout=10m > \"$TMPDIR/guest-capacity.log\" 2>&1",
+        "\"$TMPDIR/vzrt.test\" -test.run '^TestVirtualizationMacOSIntegration$' -test.count=1 -test.v -test.timeout=20m > \"$TMPDIR/guest-lifecycle.log\" 2>&1",
+        "grep -F -- '--- PASS: TestVirtualizationBaseImageDiskCapacity/macOS' \"$TMPDIR/guest-capacity.log\" && grep -F -- '--- PASS: TestVirtualizationMacOSIntegration' \"$TMPDIR/guest-lifecycle.log\""
+      ],
+      "expectedResults": [
+        "A regular-file image is advertised when its hardware model is supported. A base-image sandbox boots and the guest helper responds.",
+        "The signed test verifies requested guest disk capacity, backup GPT at the grown disk end, and unchanged source disk identity, size and modification time. The lifecycle fixture verifies APFS container growth inside the guest."
+      ],
+      "files": {
+        "regressionTests": [
+          "cmds/ownsand-agent/internal/vmruntime/vzrt/base_disk_darwin_test.go",
+          "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_macos_darwin_test.go"
+        ],
+        "outputLogs": [
+          ".t3-tmp/macos-installed-image-files/guest-capacity.log",
+          ".t3-tmp/macos-installed-image-files/guest-lifecycle.log"
+        ]
+      }
+    }
+  }
+}
