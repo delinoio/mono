@@ -14,6 +14,16 @@ import (
 	"testing"
 )
 
+func wipeLocalData(t *testing.T, s *Store) error {
+	t.Helper()
+	cleanup, err := s.LockCleanup(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup.Close()
+	return cleanup.WipeLocalData()
+}
+
 func TestIdentityAndAgentState(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {
@@ -48,7 +58,7 @@ func TestIdentityAndAgentState(t *testing.T) {
 		t.Fatalf("agent state %+v", a)
 	}
 	// Wiping local data keeps the identity.
-	if err := s.WipeLocalData(); err != nil {
+	if err := wipeLocalData(t, s); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.LoadIdentity(); err != nil {
@@ -220,7 +230,7 @@ func TestResetAndWipeRemoveSandboxCleanupMarkers(t *testing.T) {
 			if action == "reset" {
 				err = st.Reset()
 			} else {
-				err = st.WipeLocalData()
+				err = wipeLocalData(t, st)
 			}
 			if err != nil {
 				t.Fatal(err)

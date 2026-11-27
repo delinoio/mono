@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,7 +34,8 @@ const fixtureHelperVersion = "first-boot-fixture"
 
 type firstBootGuest struct {
 	ownsandv1connect.UnimplementedGuestServiceHandler
-	commands chan []string
+	mu       sync.Mutex
+	commands [][]string
 	shutdown func()
 }
 
@@ -48,7 +50,9 @@ func (g *firstBootGuest) Serve(_ context.Context, stream *connect.BidiStream[own
 	}
 	frame := req.GetFrame()
 	command := frame.GetExecRequest().GetCommand()
-	g.commands <- command
+	g.mu.Lock()
+	g.commands = append(g.commands, command)
+	g.mu.Unlock()
 	if slices.Equal(command, []string{"/sbin/shutdown", "-h", "now"}) {
 		g.shutdown()
 		panic(http.ErrAbortHandler) // The guest disconnects without a shutdown reply.
@@ -60,7 +64,17 @@ func (g *firstBootGuest) Serve(_ context.Context, stream *connect.BidiStream[own
 
 func TestMacOSImageFirstBootShutdown(t *testing.T) {
 	const guestOS = ownsandv1.GuestOs_GUEST_OS_MACOS
-	shutdownCommand := []string{"/sbin/shutdown", "-h", "now"}
+	// Keep the expected sequence independent of the builder's command list.
+	wantCommands := [][]string{
+		{"/usr/sbin/networksetup", "-detectnewhardware"},
+		{"/bin/sh", "-c", "/usr/sbin/networksetup -listnetworkserviceorder | /usr/bin/grep -q 'Device: en'"},
+		{"/usr/bin/pmset", "-a", "sleep", "0", "displaysleep", "0", "disksleep", "0"},
+		{"/usr/bin/mdutil", "-a", "-i", "off"},
+		{"/usr/bin/defaults", "write", "/Library/Preferences/com.apple.SoftwareUpdate", "AutomaticCheckEnabled", "-bool", "false"},
+		{"/usr/bin/defaults", "write", "/Library/Preferences/com.apple.SoftwareUpdate", "AutomaticDownload", "-bool", "false"},
+		{"/bin/sync"},
+		{"/sbin/shutdown", "-h", "now"},
+	}
 	tests := []struct {
 		name       string
 		states     []vz.VirtualMachineState
@@ -101,7 +115,6 @@ func TestMacOSImageFirstBootShutdown(t *testing.T) {
 			exit := vzrt.WatchVMExit(states)
 			t.Cleanup(func() { close(states) })
 			guest := &firstBootGuest{
-				commands: make(chan []string, len(macOSProvisionCommands)+1),
 				shutdown: func() {
 					if tt.cancel {
 						cancel()
@@ -123,18 +136,14 @@ func TestMacOSImageFirstBootShutdown(t *testing.T) {
 				return d.DialContext(ctx, "tcp", srv.Listener.Addr().String())
 			}
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			err := finishMacOSImage(t.Context(), dir, images.Metadata{GuestOS: guestOS}, "", func() (string, error) {
+			err := finishMacOSImage(ctx, dir, images.Metadata{GuestOS: guestOS}, "", func() (string, error) {
 				return provisionAndShutdownMacOS(ctx, dial, exit, logger, time.Now(), 100*time.Millisecond)
 			})
-			for _, command := range append(slices.Clone(macOSProvisionCommands), shutdownCommand) {
-				select {
-				case got := <-guest.commands:
-					if !slices.Equal(got, command) {
-						t.Fatalf("guest command = %q, want %q", got, command)
-					}
-				default:
-					t.Fatalf("guest did not receive %q (build error: %v)", command, err)
-				}
+			guest.mu.Lock()
+			gotCommands := slices.Clone(guest.commands)
+			guest.mu.Unlock()
+			if !slices.EqualFunc(gotCommands, wantCommands, slices.Equal[[]string]) {
+				t.Fatalf("guest command sequence = %q, want %q (build error: %v)", gotCommands, wantCommands, err)
 			}
 			if tt.err == "" {
 				if err != nil {
@@ -159,29 +168,5 @@ func TestMacOSImageFirstBootShutdown(t *testing.T) {
 			}
 			assertMacOSFixture(t, dir, "previous", "previous")
 		})
-	}
-}
-
-func writeMacOSFixture(t *testing.T, dir, contents string) {
-	t.Helper()
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	for _, file := range []string{images.MacOSDisk, images.MacOSAuxStorage, images.MacOSHardwareModel} {
-		if err := os.WriteFile(filepath.Join(dir, file), []byte(contents), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func assertMacOSFixture(t *testing.T, dir, helperVersion, diskContents string) {
-	t.Helper()
-	metadata, err := images.ReadMetadata(dir)
-	if err != nil || metadata.GuestVersion != helperVersion {
-		t.Fatalf("installed helper version = %q, %v, want %q", metadata.GuestVersion, err, helperVersion)
-	}
-	disk, err := os.ReadFile(filepath.Join(dir, images.MacOSDisk))
-	if err != nil || string(disk) != diskContents {
-		t.Fatalf("installed disk = %q, %v, want %q", disk, err, diskContents)
 	}
 }

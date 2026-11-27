@@ -90,6 +90,12 @@ func windowsGenerationFixture(t *testing.T) (*Runtime, vmruntime.Spec, vmCreateO
 	ops := vmCreateOps{
 		copyFile: copyFile,
 		growVHDX: func(_ string, size int64) (int64, error) { return size, nil },
+		grantVM: func(id, path string) error {
+			if id != systemID(spec.SandboxID) || path != filepath.Join(spec.Dir, windowsDiskFile) {
+				t.Fatalf("grantVM(%q, %q): unexpected compute system ID or disk path", id, path)
+			}
+			return nil
+		},
 		createSystem: func(string, any) (*system, error) {
 			return nil, reachedHCS
 		},

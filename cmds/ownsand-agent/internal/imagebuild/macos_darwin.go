@@ -46,7 +46,7 @@ const (
 // buildMacOS installs macOS from an Apple restore image into a new disk,
 // installs the guest helper as a launchd daemon, boots the guest once until
 // the helper answers and installs the image.
-func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
+func buildMacOS(ctx context.Context, dir string, opts Options) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -56,27 +56,12 @@ func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
 		// which only root can write.
 		return errors.New("imagebuild: the macOS image build needs root; run it with sudo")
 	}
-	build := images.BuildDir(dir)
-	if err := os.RemoveAll(build); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(build, 0o700); err != nil {
-		return err
-	}
-	defer func() {
-		if err == nil {
-			return
-		}
-		if errors.Is(err, vzrt.ErrVMMayRun) {
-			// The build VM may still use the staged disk, so deleting
-			// it could corrupt a running guest; keep it. The next build
-			// removes the directory at its start.
-			logger.Error("keeping the macOS build directory because the build VM may still run", "build_dir", build)
-			return
-		}
-		os.RemoveAll(build)
-	}()
+	return withMacOSBuildDir(dir, logger, func(build string) error {
+		return buildAndInstallMacOS(ctx, dir, build, opts, logger)
+	})
+}
 
+func buildAndInstallMacOS(ctx context.Context, dir, build string, opts Options, logger *slog.Logger) error {
 	ipsw := opts.IPSW
 	if ipsw == "" {
 		ipsw = filepath.Join(build, "restore.ipsw")
@@ -172,22 +157,6 @@ func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
 	}
 	logger.Info("macOS image installed", "source", source)
 	return nil
-}
-
-func finishMacOSImage(ctx context.Context, dir string, metadata images.Metadata, downloadedIPSW string, firstBoot func() (string, error)) error {
-	helper, err := firstBoot()
-	if err != nil {
-		return err
-	}
-	metadata.BuiltAt = time.Now().UTC()
-	metadata.GuestVersion = helper
-	if err := images.WriteMetadata(images.BuildDir(dir), metadata); err != nil {
-		return err
-	}
-	if downloadedIPSW != "" {
-		os.Remove(downloadedIPSW)
-	}
-	return images.Install(ctx, dir, ownsandv1.GuestOs_GUEST_OS_MACOS)
 }
 
 // downloadRestoreImage downloads the latest restore image that this Mac
