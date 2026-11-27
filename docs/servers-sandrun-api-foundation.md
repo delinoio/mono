@@ -539,6 +539,8 @@ For allocated vCPUs, `GetCapacity` uses the [exact OwnSand total](protos-ownsand
 
 The server records its metrics with the OpenTelemetry SDK through the shared `servers/internal/telemetry` package, like `accounts-api` ([accounts-api metrics](servers-accounts-api-foundation.md#metrics)). `GET /metrics` on `METRICS_ADDR` serves them in the Prometheus format through the OpenTelemetry Prometheus exporter. Caddy does not route `METRICS_ADDR`, so the endpoint is not public. Metric labels never contain organization IDs, user IDs, repository names or other user data.
 
+SandRun records request-ended, queue-wait and runner-start measurements after the transaction commits. Durations use the time of the state change. A failed transaction produces no measurements for its state changes.
+
 If `METRICS_ADDR` is empty, SandRun starts without a metrics listener. If the configured address cannot bind, startup fails before the lease workers start. If the listener fails permanently after binding, SandRun logs the cause, stops the lease workers and releases the lease, and then drains public HTTP within the shutdown timeout. The process exits with a nonzero status and logs the original listener error, even if a termination signal arrives during the same shutdown. A clean signal shutdown exits successfully.
 
 | Metric                                       | Type      | Labels                        |
@@ -668,7 +670,7 @@ Each entry requires a host and permits an optional port. Startup fails if an ent
 
 - Structured `log/slog` records with `organization_id`, `request_id`, `runner_id`, `runner_profile_id`, the OwnSand `sandbox_id`, the GitHub job ID and delivery ID, the vendor request ID, the dev session `exec_id`, `read_id` or `write_id`, and the personal API key ID where they apply.
 - Log every dev session exec end with its result, exit code or failure reason and duration, and every relayed file operation with its size and duration.
-- Log every request and runner state change with the previous state, the new state and the end reason.
+- Log every request and runner state change after its transaction commits, with the previous state, the new state and the end reason.
 - Log every OwnSand call result with the RPC and the Connect code, every GitHub API error with its status, every vendor watch reconnect and every orchestrator restart.
 - Never log credentials, tokens, API key secrets, JIT configurations, work orders, webhook bodies, exec commands that carry credentials, runner output, or dev session command arguments, environment values, output and file contents.
 - CLI-style output of the development launcher uses ANSI color by default, with the `NO_COLOR` opt-out.

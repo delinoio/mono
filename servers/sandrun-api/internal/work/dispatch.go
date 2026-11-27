@@ -529,7 +529,7 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 			return err
 		}
 		*r = *created
-		e.logRunner(ctx, r, sandrunv1.RunnerState_RUNNER_STATE_UNSPECIFIED)
+		e.observeRunnerTransition(ctx, tx, r, sandrunv1.RunnerState_RUNNER_STATE_UNSPECIFIED, now, false)
 		return nil
 	})
 	if errors.Is(err, errSkip) {
@@ -751,12 +751,13 @@ func (e *Engine) requeueTx(ctx context.Context, tx pgx.Tx, requestID string) err
 	if err != nil || req.State != reqStarting {
 		return err
 	}
+	now := e.svc.NowUTC()
 	r, err := scanRequest(tx.QueryRow(ctx, "UPDATE requests SET state = $2, runner_id = NULL, update_time = $3 WHERE request_id = $1 RETURNING "+requestColumns,
-		requestID, int16(reqQueued), e.svc.NowUTC()))
+		requestID, int16(reqQueued), now))
 	if err != nil {
 		return err
 	}
-	e.logRequest(ctx, r, reqStarting)
+	e.observeRequestTransition(ctx, tx, r, reqStarting, now)
 	return nil
 }
 
