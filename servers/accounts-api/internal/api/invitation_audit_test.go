@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"strings"
+	"sync"
 	"testing"
 
 	"connectrpc.com/connect"
@@ -116,11 +117,19 @@ func TestInvitationAcceptedDuringSendKeepsCreationAudit(t *testing.T) {
 	guest := newPerson(env, "guest")
 	env.Directory.Set(guest.ID, directoryUser("guest@example.com"))
 
-	var createdAtSend int
-	var acceptErr error
+	type sendResult struct {
+		called        bool
+		creationCount int
+		acceptErr     error
+	}
+	var hookMu sync.Mutex
+	var hookResult sendResult
 	env.Email.SetOnSend(func(msg email.Message) {
-		createdAtSend = auditRowCount(t, env, accountID, api.AuditInvitationCreated)
-		_, acceptErr = accept(guest, tokenOf(t, msg))
+		creationCount := auditRowCount(t, env, accountID, api.AuditInvitationCreated)
+		_, acceptErr := accept(guest, tokenOf(t, msg))
+		hookMu.Lock()
+		hookResult = sendResult{called: true, creationCount: creationCount, acceptErr: acceptErr}
+		hookMu.Unlock()
 	})
 	resp, err := owner.Client.CreateInvitation(ctx(), connect.NewRequest(&accountsv1.CreateInvitationRequest{
 		BillingAccountId: accountID, Email: "guest@example.com", Role: roleViewer,
@@ -128,11 +137,17 @@ func TestInvitationAcceptedDuringSendKeepsCreationAudit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateInvitation with a concurrent acceptance: %v", err)
 	}
-	if acceptErr != nil {
-		t.Fatalf("AcceptInvitation during the send: %v", acceptErr)
+	hookMu.Lock()
+	result := hookResult
+	hookMu.Unlock()
+	if !result.called {
+		t.Fatal("the send hook did not run during CreateInvitation")
 	}
-	if createdAtSend != 1 {
-		t.Errorf("%d invitation_created rows at the send, want 1: the creation audit is stored before the email", createdAtSend)
+	if result.acceptErr != nil {
+		t.Fatalf("AcceptInvitation during the send: %v", result.acceptErr)
+	}
+	if result.creationCount != 1 {
+		t.Errorf("%d invitation_created rows at the send, want 1: the creation audit is stored before the email", result.creationCount)
 	}
 	if resp.Msg.GetInvitation().GetEmail() != "guest@example.com" {
 		t.Errorf("response invitation email = %q", resp.Msg.GetInvitation().GetEmail())
