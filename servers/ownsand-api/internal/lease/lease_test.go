@@ -610,6 +610,7 @@ func TestLeaseReleaseDrain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); a.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
 	if err := a.Wait(ctx); err != nil {
 		t.Fatal(err)
 	}
