@@ -426,8 +426,14 @@ func TestBillingPhasesOfLinkedOrganization(t *testing.T) {
 	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 	enforceBilling(t, env)
 	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
-	if !strings.Contains(env.Logs.String(), `"msg":"billing_sandbox_paused"`) {
+	const pauseEvent = `"msg":"billing_sandbox_paused"`
+	if countLogs(env, pauseEvent) == 0 {
 		t.Fatal("billing_sandbox_paused not logged")
+	}
+	for line := range strings.SplitSeq(env.Logs.String(), "\n") {
+		if strings.Contains(line, pauseEvent) && !strings.Contains(line, `"state":"SANDBOX_STATE_PAUSED"`) {
+			t.Errorf("billing pause event must show PAUSED: %s", line)
+		}
 	}
 
 	// Recovery: only the sandbox that billing paused resumes.
