@@ -252,7 +252,7 @@ func (v *vm) signalHelper(sig syscall.Signal) error {
 //
 // A helper that was reaped counts as stopped: it starts no worker, and the
 // runtime sends no signal to it (see signalHelper). All observations share
-// the earlier of the caller's deadline and helperStopTimeout. A local timeout
+// the earlier of the caller's deadline and helperStopTimeout. A timeout
 // includes the last probe failure to help diagnose a broken or missing `ps`.
 func (v *vm) waitHelperStopped(ctx context.Context) error {
 	if v.helper.pid == 0 {
@@ -302,11 +302,13 @@ func (v *vm) waitHelperStopped(ctx context.Context) error {
 	if callerDeadline, ok := ctx.Deadline(); callerErr == nil && ok && callerDeadline.Equal(deadline) {
 		callerErr = context.DeadlineExceeded
 	}
-	if callerErr != nil {
-		return fmt.Errorf("processrt: wait for the helper of sandbox %s to stop: %w", v.id, callerErr)
+	var err error
+	if callerErr == nil {
+		err = fmt.Errorf("processrt: sandbox %s helper did not stop within %s: %w", v.id, timeout, context.DeadlineExceeded)
+	} else {
+		err = fmt.Errorf("processrt: wait for the helper of sandbox %s to stop: %w", v.id, callerErr)
 	}
-	err := fmt.Errorf("processrt: sandbox %s helper did not stop within %s: %w", v.id, timeout, context.DeadlineExceeded)
-	if observeErr != nil {
+	if observeErr != nil && errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("%w: %w", err, observeErr)
 	}
 	return err
