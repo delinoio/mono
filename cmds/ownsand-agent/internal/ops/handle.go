@@ -214,7 +214,7 @@ func (h *handler) exec(ctx context.Context, req *ownsandv1.ExecRequest) (Outcome
 		defer d.wg.Done()
 		// Release the child context from d.ctx once forwarding is over (final
 		// event, guest error final or d.ctx end). The kept result in op.log
-		// stays available until Sweep.
+		// stays available until expiry or eviction at capacity.
 		defer op.cancel()
 		d.forwardExec(op.ctx, op, req)
 	}()
@@ -251,9 +251,34 @@ func (h *handler) admitExec(req *ownsandv1.ExecRequest, digest []byte) (op *exec
 	if d.closed {
 		return nil, false, fail(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
 	}
+	sandboxID := req.GetSandboxId()
+	held := 0
+	var oldestID string
+	var oldestEnd time.Time
+	for id, op := range d.execs {
+		if op.sandboxID != sandboxID {
+			continue
+		}
+		held++
+		if end := op.log.EndTime(); !end.IsZero() && (oldestID == "" || end.Before(oldestEnd)) {
+			oldestID, oldestEnd = id, end
+		}
+	}
+	var evicted *execOp
+	var evictedAt time.Time
+	if held >= d.maxHeldExecs {
+		now := d.now()
+		if oldestID == "" {
+			d.logExecRejectionLocked(sandboxID, now)
+			return nil, false, fail(ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, "agent exec capacity for this sandbox reached")
+		}
+		evicted, evictedAt = d.execs[oldestID], now
+		d.forgetExecLocked(oldestID, evicted, evictedAt)
+	}
+
 	execCtx, cancel := context.WithCancel(d.ctx)
 	op = &execOp{
-		sandboxID: req.GetSandboxId(),
+		sandboxID: sandboxID,
 		digest:    digest,
 		idTime:    idTime(req.GetExecId()),
 		log:       execlog.New(req.GetExecId(), execlog.KeptOutputBytes),
@@ -265,9 +290,17 @@ func (h *handler) admitExec(req *ownsandv1.ExecRequest, digest []byte) (op *exec
 		// The at-most-once rule needs the record on disk before the
 		// command runs.
 		delete(d.execs, req.GetExecId())
+		if evicted != nil {
+			d.execs[oldestID] = evicted
+			delete(d.lost, oldestID)
+		}
 		cancel()
 		d.logger.Error("persist exec record failed", "exec_id", req.GetExecId(), "error", err)
 		return nil, false, fail(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent could not record the exec")
+	}
+	if evicted != nil {
+		d.ended[oldestID] = evictedAt
+		d.logger.Debug("evicted ended exec at sandbox capacity", "sandbox_id", sandboxID, "exec_id", oldestID)
 	}
 	d.wg.Add(1)
 	return op, false, nil

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -86,6 +87,9 @@ type envOptions struct {
 	// wrap lets a test observe or pause the calls of the dispatcher into the
 	// sandbox manager; nil passes the manager itself.
 	wrap func(*sandboxes.Manager) ops.Sandboxes
+	// maxHeldExecs overrides the per-sandbox limit, and execLog captures dispatcher logs.
+	maxHeldExecs int
+	execLog      *slog.Logger
 }
 
 func newEnvWith(t *testing.T, o envOptions) *env {
@@ -108,7 +112,11 @@ func newEnvWith(t *testing.T, o envOptions) *env {
 	if o.wrap != nil {
 		dispatcherSandboxes = o.wrap(m)
 	}
-	e.d, err = ops.New(dispatcherSandboxes, st, ops.Options{Now: e.clk.Now, Logger: logger})
+	if o.execLog == nil {
+		o.execLog = logger
+	}
+	dispatcherOpts := ops.Options{Now: e.clk.Now, Logger: o.execLog}
+	e.d, err = ops.New(dispatcherSandboxes, st, ops.WithMaxHeldExecsForTest(dispatcherOpts, o.maxHeldExecs))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,12 +126,18 @@ func newEnvWith(t *testing.T, o envOptions) *env {
 		m.Close()
 		rt.Close()
 	})
-	e.sandbox = newID(t)
+	e.sandbox = e.createSandbox()
+	return e
+}
+
+func (e *env) createSandbox() string {
+	e.t.Helper()
+	id := newID(e.t)
 	now := time.Now()
 	// The process runtime runs only guests of the host OS.
 	guestOS, baseImage := processrt.HostGuest()
-	if _, err := m.Create(context.Background(), &ownsandv1.CreateSandboxCommand{
-		SandboxId:   e.sandbox,
+	if _, err := e.m.Create(context.Background(), &ownsandv1.CreateSandboxCommand{
+		SandboxId:   id,
 		Source:      &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: baseImage},
 		Resources:   &ownsandv1.Resources{VcpuCount: 1, MemoryMib: 256, DiskGib: 1},
 		NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE,
@@ -132,11 +146,11 @@ func newEnvWith(t *testing.T, o envOptions) *env {
 		MaxTtl:      durationpb.New(time.Hour),
 		CreateTime:  timestamppb.New(now),
 		MaxDeadline: timestamppb.New(now.Add(time.Hour)),
-		Limits:      &ownsandv1.DeviceLimits{VcpuCount: 8, MemoryMib: 8192, DiskGib: 1, VcpuOvercommitPercent: 100},
+		Limits:      &ownsandv1.DeviceLimits{VcpuCount: 8, MemoryMib: 8192, DiskGib: 2, VcpuOvercommitPercent: 100},
 	}); err != nil {
-		t.Fatal(err)
+		e.t.Fatal(err)
 	}
-	return e
+	return id
 }
 
 func newID(t *testing.T) string {
@@ -333,6 +347,281 @@ func TestExecAtMostOnce(t *testing.T) {
 	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS {
 		t.Fatalf("other after restart: %+v", out)
 	}
+}
+
+// detachOnStart closes the caller stream as soon as the guest reports a start.
+type detachOnStart struct {
+	sink
+	cancel context.CancelFunc
+}
+
+func (s *detachOnStart) Send(ctx context.Context, f *ownsandv1.DataFrame) error {
+	if f.GetExecEvent().GetStarted() != nil {
+		s.cancel()
+	}
+	return s.sink.Send(ctx, f)
+}
+
+func (e *env) detachExec(req *ownsandv1.ExecRequest) (ops.Outcome, []*ownsandv1.DataFrame) {
+	ctx, cancel := context.WithTimeout(context.Background(), waitBound)
+	defer cancel()
+	s := &detachOnStart{cancel: cancel}
+	out := e.d.Handle(ctx, ops.Request{
+		Frame: datapath.MustNewFrame(7, req.GetSandboxId(), req), SandboxID: req.GetSandboxId(),
+	}, s)
+	return out, s.frames
+}
+
+// heldExec starts a command that waits for a file, with a deadline so failed
+// tests do not leave a waiting process.
+func (e *env) heldExec() (*ownsandv1.ExecRequest, string) {
+	e.t.Helper()
+	gate := filepath.Join(e.t.TempDir(), "release")
+	req := e.execReq("/bin/sh", "-c", `i=0; until test -e "$1"; do
+		i=$((i+1)); if test "$i" -ge 600; then exit 1; fi; sleep 0.1
+	done`, "hold", gate)
+	out, frames := e.detachExec(req)
+	if out.Error != nil || !started(frames) {
+		e.t.Fatalf("held exec failed to start: outcome %+v frames %v", out, frames)
+	}
+	return req, gate
+}
+
+func (e *env) savedExecIDs() map[string]bool {
+	e.t.Helper()
+	var records []struct {
+		ExecID string `json:"exec_id"`
+	}
+	if err := e.st.LoadExecs(&records); err != nil {
+		e.t.Fatal(err)
+	}
+	ids := make(map[string]bool)
+	for _, rec := range records {
+		if ids[rec.ExecID] {
+			e.t.Fatalf("duplicate saved record %s", rec.ExecID)
+		}
+		ids[rec.ExecID] = true
+	}
+	return ids
+}
+
+func requireCapacityRejection(t *testing.T, out ops.Outcome, frames []*ownsandv1.DataFrame) {
+	t.Helper()
+	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED ||
+		out.Error.GetMessage() != "agent exec capacity for this sandbox reached" ||
+		out.Finished || out.Terminal || len(frames) != 1 || !proto.Equal(frames[0].GetError(), out.Error) {
+		t.Fatalf("outcome %+v frames %v, want a retryable capacity error", out, frames)
+	}
+}
+
+func TestExecHeldLimitRejectsWhenAllRunning(t *testing.T) {
+	e := newEnvWith(t, envOptions{maxHeldExecs: 2})
+	first, gate := e.heldExec()
+	second, _ := e.heldExec()
+	count := filepath.Join(t.TempDir(), "count")
+	retry := e.execReq("/bin/sh", "-c", `echo run >> "$1"`, "count", count)
+
+	out, frames, accepted := e.handle(retry, nil)
+	requireCapacityRejection(t, out, frames)
+	if accepted || readCount(t, count) != 0 {
+		t.Fatal("the rejected exec reached admission or ran in the guest")
+	}
+	if ids := e.savedExecIDs(); len(ids) != 2 || !ids[first.GetExecId()] || !ids[second.GetExecId()] {
+		t.Fatalf("saved execs %v, want only the two running IDs", ids)
+	}
+	// An identical request can attach to a held exec even at capacity.
+	out, frames = e.detachExec(second)
+	if out.Error != nil || !started(frames) {
+		t.Fatalf("retry of a held exec: outcome %+v frames %v", out, frames)
+	}
+	if err := os.WriteFile(gate, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	attach := &ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: e.sandbox, ExecId: first.GetExecId()}
+	_, frames, _ = e.handle(attach, nil)
+	requireCleanExit(t, frames)
+
+	out, frames, accepted = e.handle(retry, nil)
+	if !out.Finished || !accepted || readCount(t, count) != 1 {
+		t.Fatalf("retry: outcome %+v accepted %v", out, accepted)
+	}
+	requireCleanExit(t, frames)
+	if ids := e.savedExecIDs(); len(ids) != 3 || !ids[first.GetExecId()] || !ids[second.GetExecId()] || !ids[retry.GetExecId()] {
+		t.Fatalf("saved execs %v, want both first IDs and the retried ID", ids)
+	}
+}
+
+func TestExecHeldLimitConcurrentAdmission(t *testing.T) {
+	e := newEnvWith(t, envOptions{maxHeldExecs: 2})
+	first, _ := e.heldExec()
+	type response struct {
+		out    ops.Outcome
+		frames []*ownsandv1.DataFrame
+		id     string
+	}
+	ready := make(chan struct{})
+	done := make(chan response, 2)
+	for range 2 {
+		req := e.execReq("/bin/sleep", "60")
+		go func() {
+			<-ready
+			out, frames := e.detachExec(req)
+			done <- response{out: out, frames: frames, id: req.GetExecId()}
+		}()
+	}
+	close(ready)
+	var admitted, rejected string
+	for range 2 {
+		r := <-done
+		if r.out.Error == nil && started(r.frames) {
+			admitted = r.id
+		} else {
+			requireCapacityRejection(t, r.out, r.frames)
+			rejected = r.id
+		}
+	}
+	if admitted == "" || rejected == "" {
+		t.Fatalf("admitted %q, rejected %q, want one of each", admitted, rejected)
+	}
+	if ids := e.savedExecIDs(); len(ids) != 2 || !ids[first.GetExecId()] || !ids[admitted] {
+		t.Fatalf("saved execs %v, want the original and the winner of concurrent admission", ids)
+	}
+}
+
+func TestExecHeldLimitEvictsOldestEnded(t *testing.T) {
+	e := newEnvWith(t, envOptions{maxHeldExecs: 2})
+	count := filepath.Join(t.TempDir(), "count")
+	// Admit this request first but let it end second.
+	later, gate := e.heldExec()
+	oldest := e.execReq("/bin/sh", "-c", `echo run >> "$1"`, "count", count)
+	_, frames, _ := e.handle(oldest, nil)
+	requireCleanExit(t, frames)
+	e.clk.Advance(time.Second)
+	if err := os.WriteFile(gate, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	laterAttach := &ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: e.sandbox, ExecId: later.GetExecId()}
+	_, frames, _ = e.handle(laterAttach, nil)
+	requireCleanExit(t, frames)
+
+	// A failed save leaves the oldest result attachable and permits a retry.
+	next := e.execReq("/bin/true")
+	path := e.st.Path(store.ExecsFile)
+	backup := path + ".backup"
+	if err := os.Rename(path, backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	out, _, accepted := e.handle(next, nil)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(backup, path); err != nil {
+		t.Fatal(err)
+	}
+	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE || accepted {
+		t.Fatalf("failed save: outcome %+v accepted %v", out, accepted)
+	}
+	oldestAttach := &ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: e.sandbox, ExecId: oldest.GetExecId()}
+	_, frames, _ = e.handle(oldestAttach, nil)
+	requireCleanExit(t, frames)
+
+	_, frames, _ = e.handle(next, nil)
+	requireCleanExit(t, frames)
+	out, _, _ = e.handle(oldestAttach, nil)
+	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND ||
+		out.Error.GetMessage() != "exec is unknown or its result is no longer kept" || !e.d.ExecEnded(oldest.GetExecId()) {
+		t.Fatalf("attach to the evicted result: %+v", out)
+	}
+	_, frames, _ = e.handle(laterAttach, nil)
+	requireCleanExit(t, frames)
+	out, _, accepted = e.handle(oldest, nil)
+	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND ||
+		out.Error.GetMessage() != "the exec result is no longer kept; its outcome is unknown" || accepted || readCount(t, count) != 1 {
+		t.Fatalf("retry of the evicted exec: outcome %+v accepted %v", out, accepted)
+	}
+	if ids := e.savedExecIDs(); len(ids) != 3 || !ids[oldest.GetExecId()] || !ids[later.GetExecId()] || !ids[next.GetExecId()] {
+		t.Fatalf("saved execs %v, want the two held records and the evicted ID", ids)
+	}
+	restarted, err := ops.New(e.m, e.st, ops.Options{Now: e.clk.Now, Logger: slog.New(slog.NewJSONHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	out = restarted.Handle(context.Background(), ops.Request{
+		Frame: datapath.MustNewFrame(7, e.sandbox, oldest), SandboxID: e.sandbox,
+	}, &sink{})
+	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND || readCount(t, count) != 1 {
+		t.Fatalf("retry of the evicted exec after restart: %+v", out)
+	}
+	// The persisted record expires before the in-memory ended ID.
+	e.clk.Advance(21 * time.Minute)
+	e.d.Sweep()
+	if ids := e.savedExecIDs(); ids[oldest.GetExecId()] || !e.d.ExecEnded(oldest.GetExecId()) {
+		t.Fatal("ended ID must survive expiry of the persisted record")
+	}
+	e.clk.Advance(10 * time.Minute)
+	e.d.Sweep()
+	if e.d.ExecEnded(oldest.GetExecId()) {
+		t.Fatal("ended ID survived the end of its retention window")
+	}
+}
+
+func TestExecHeldLimitPerSandbox(t *testing.T) {
+	e := newEnvWith(t, envOptions{maxHeldExecs: 1})
+	e.heldExec()
+	out, frames, _ := e.handle(e.execReq("/bin/true"), nil)
+	requireCapacityRejection(t, out, frames)
+	e.sandbox = e.createSandbox()
+	out, frames, accepted := e.handle(e.execReq("/bin/true"), nil)
+	if !out.Finished || !accepted {
+		t.Fatalf("other sandbox: outcome %+v accepted %v", out, accepted)
+	}
+	requireCleanExit(t, frames)
+}
+
+func TestExecHeldLimitRejectLog(t *testing.T) {
+	var logs bytes.Buffer
+	e := newEnvWith(t, envOptions{maxHeldExecs: 1, execLog: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))})
+	e.heldExec()
+	req := e.execReq("/bin/true")
+	reject := func() {
+		out, frames, _ := e.handle(req, nil)
+		requireCapacityRejection(t, out, frames)
+	}
+	readWarning := func(count int) {
+		t.Helper()
+		line, err := logs.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("warning missing: %v", err)
+		}
+		var rec struct {
+			Level     string `json:"level"`
+			Message   string `json:"msg"`
+			SandboxID string `json:"sandbox_id"`
+			Limit     int    `json:"limit"`
+			Rejected  int    `json:"rejected"`
+		}
+		if err := json.Unmarshal(line, &rec); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Level != "WARN" || rec.Message != "exec rejected at sandbox capacity" ||
+			rec.SandboxID != e.sandbox || rec.Limit != 1 || rec.Rejected != count {
+			t.Fatalf("warning %s, want sandbox %s limit 1 rejected %d", line, e.sandbox, count)
+		}
+		if logs.Len() != 0 {
+			t.Fatalf("unexpected extra logs: %s", &logs)
+		}
+	}
+	for range 10 {
+		reject()
+	}
+	readWarning(1)
+	e.clk.Advance(5 * time.Second)
+	reject()
+	readWarning(10)
 }
 
 func TestExecAdmissionWindow(t *testing.T) {
