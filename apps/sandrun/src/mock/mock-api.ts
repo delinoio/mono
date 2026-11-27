@@ -102,6 +102,7 @@ import {
 import {
   MAX_DISK_GIB,
   MAX_MEMORY_MIB,
+  MAX_QUEUE_WAIT_MS,
   MAX_TTL_MS,
   MAX_VCPU_COUNT,
 } from "../forms.ts";
@@ -2251,6 +2252,26 @@ function validateProfile(p: RunnerProfile): void {
   function fail(message: string): never {
     throw new ConnectError(message, Code.InvalidArgument);
   }
+
+  function durationMilliseconds(
+    field: string,
+    duration: Duration | undefined,
+  ): bigint {
+    if (
+      duration === undefined ||
+      duration.seconds < 0n ||
+      duration.seconds > 315_576_000_000n ||
+      duration.nanos < 0 ||
+      duration.nanos >= 1_000_000_000 ||
+      (duration.seconds === 0n && duration.nanos === 0)
+    )
+      fail(`${field} must be a valid positive duration`);
+    if (duration.nanos % 1_000_000 !== 0)
+      fail(`${field} must be a whole number of milliseconds`);
+
+    return duration.seconds * 1_000n + BigInt(duration.nanos / 1_000_000);
+  }
+
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(p.name) || p.name.length > 40)
     fail("name must be lowercase kebab-case with 1 to 40 characters");
   if (p.workloadKind === WorkloadKind.UNSPECIFIED)
@@ -2285,18 +2306,14 @@ function validateProfile(p: RunnerProfile): void {
   if (r.diskGib > BigInt(MAX_DISK_GIB))
     fail(`invalid resources.disk_gib: must be at most ${MAX_DISK_GIB}`);
 
-  const nanoseconds = (duration: Duration | undefined) =>
-    (duration?.seconds ?? 0n) * 1_000_000_000n + BigInt(duration?.nanos ?? 0);
-  const idleTtl = nanoseconds(p.idleTtl);
-  const maxTtl = nanoseconds(p.maxTtl);
-  if (idleTtl <= 0n) fail("idle_ttl must be greater than zero");
-  if (maxTtl <= 0n || maxTtl > BigInt(MAX_TTL_MS) * 1_000_000n)
-    fail("max_ttl must be at most 7 days");
+  const idleTtl = durationMilliseconds("idle_ttl", p.idleTtl);
+  const maxTtl = durationMilliseconds("max_ttl", p.maxTtl);
+  if (maxTtl > BigInt(MAX_TTL_MS)) fail("max_ttl must be at most 7 days");
   if (idleTtl > maxTtl)
     fail("invalid ttl: invalid idle_ttl: must not be greater than max_ttl");
 
-  const maxQueueWaitSeconds = p.maxQueueWait?.seconds ?? 0n;
-  if (maxQueueWaitSeconds <= 0n || maxQueueWaitSeconds > 86_400n)
+  const maxQueueWait = durationMilliseconds("max_queue_wait", p.maxQueueWait);
+  if (maxQueueWait > BigInt(MAX_QUEUE_WAIT_MS))
     fail("max_queue_wait must be at most 24 hours");
   if (p.warmCount < 0 || p.warmCount > 10) fail("warm_count must be 0 to 10");
 }

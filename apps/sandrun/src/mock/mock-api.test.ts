@@ -119,27 +119,24 @@ const invalidIdleTtl = {
   rawMessage: "invalid ttl: invalid idle_ttl: must not be greater than max_ttl",
 };
 
-test.each([1, 1_000_000])(
-  "rejects a runner profile with idle TTL %i nanoseconds above maximum TTL",
-  async (nanos) => {
-    const { profiles, organizationId, seeded, state } =
-      await runnerProfileFixture();
-    const before = await state();
+test("rejects a runner profile with idle TTL one millisecond above maximum TTL", async () => {
+  const { profiles, organizationId, seeded, state } =
+    await runnerProfileFixture();
+  const before = await state();
 
-    await expect(
-      profiles.createRunnerProfile({
-        organizationId,
-        profile: {
-          ...seeded,
-          name: "over-idle-ttl-limit",
-          idleTtl: create(DurationSchema, { seconds: 60n, nanos }),
-          maxTtl: durationFromMs(60_000),
-        },
-      }),
-    ).rejects.toMatchObject(invalidIdleTtl);
-    expect(await state()).toEqual(before);
-  },
-);
+  await expect(
+    profiles.createRunnerProfile({
+      organizationId,
+      profile: {
+        ...seeded,
+        name: "over-idle-ttl-limit",
+        idleTtl: durationFromMs(60_001),
+        maxTtl: durationFromMs(60_000),
+      },
+    }),
+  ).rejects.toMatchObject(invalidIdleTtl);
+  expect(await state()).toEqual(before);
+});
 
 test.each([
   ["idle_ttl", { idleTtl: durationFromMs(60_001) }],
@@ -202,6 +199,142 @@ test("creates and updates runner profiles at the resource limits with equal posi
     expect(profile).toMatchObject(limits);
   }
 });
+
+test.each([
+  {
+    name: "a 500 ms idle TTL",
+    values: { idleTtl: create(DurationSchema, { nanos: 500_000_000 }) },
+    paths: ["idle_ttl"],
+  },
+  {
+    name: "subsecond idle and maximum TTLs",
+    values: {
+      idleTtl: create(DurationSchema, { nanos: 1_000_000 }),
+      maxTtl: create(DurationSchema, { nanos: 500_000_000 }),
+    },
+    paths: ["idle_ttl", "max_ttl"],
+  },
+  {
+    name: "a 1 ms queue wait",
+    values: { maxQueueWait: create(DurationSchema, { nanos: 1_000_000 }) },
+    paths: ["max_queue_wait"],
+  },
+  {
+    name: "the exact maximum TTL and queue wait caps",
+    values: {
+      maxTtl: create(DurationSchema, { seconds: 604_800n }),
+      maxQueueWait: create(DurationSchema, { seconds: 86_400n }),
+    },
+    paths: ["max_ttl", "max_queue_wait"],
+  },
+])(
+  "preserves $name on runner profile create and update",
+  async ({ values, paths }) => {
+    const { profiles, organizationId, seededRequest, seeded } =
+      await runnerProfileFixture();
+    const { profile: created } = await profiles.createRunnerProfile({
+      organizationId,
+      profile: { ...seeded, ...values, name: "precise-durations" },
+    });
+    if (!created) throw new Error("Expected the created profile");
+    expect(created).toMatchObject(values);
+    expect(
+      (
+        await profiles.getRunnerProfile({
+          organizationId,
+          runnerProfileId: created.runnerProfileId,
+        })
+      ).profile,
+    ).toMatchObject(values);
+
+    const { profile: updated } = await profiles.updateRunnerProfile({
+      ...seededRequest,
+      profile: values,
+      updateMask: { paths },
+    });
+    expect(updated).toMatchObject(values);
+    expect(
+      (await profiles.getRunnerProfile(seededRequest)).profile,
+    ).toMatchObject(values);
+  },
+);
+
+const durationFields = [
+  ["idleTtl", "idle_ttl"],
+  ["maxTtl", "max_ttl"],
+  ["maxQueueWait", "max_queue_wait"],
+] as const;
+
+test.each(
+  durationFields
+    .flatMap(([field, path]) => [
+      { field, path, name: "missing", components: undefined },
+      { field, path, name: "zero", components: { seconds: 0n } },
+      {
+        field,
+        path,
+        name: "negative",
+        components: { seconds: -1n },
+      },
+      {
+        field,
+        path,
+        name: "above the protobuf seconds bound",
+        components: { seconds: 315_576_000_001n },
+      },
+      ...[1, -1, -1_000_000, 1_000_000_000].map((nanos) => ({
+        field,
+        path,
+        name: `${nanos} invalid nanos`,
+        components: { nanos },
+      })),
+    ])
+    .concat([
+      {
+        field: "maxTtl",
+        path: "max_ttl",
+        name: "1 ms above 7 days",
+        components: { seconds: 604_800n, nanos: 1_000_000 },
+      },
+      {
+        field: "maxQueueWait",
+        path: "max_queue_wait",
+        name: "1 ms above 24 hours",
+        components: { seconds: 86_400n, nanos: 1_000_000 },
+      },
+    ]),
+)(
+  "rejects $path with $name without changing profiles or audits",
+  async ({ field, path, components }) => {
+    const { profiles, organizationId, seededRequest, seeded, state } =
+      await runnerProfileFixture();
+    const duration =
+      components === undefined
+        ? undefined
+        : create(DurationSchema, {
+            seconds: seeded[field]?.seconds ?? 0n,
+            ...components,
+          });
+    const before = await state();
+    const error = { code: Code.InvalidArgument };
+    await expect(
+      profiles.createRunnerProfile({
+        organizationId,
+        profile: { ...seeded, name: "invalid-duration", [field]: duration },
+      }),
+    ).rejects.toMatchObject(error);
+    expect(await state()).toEqual(before);
+
+    await expect(
+      profiles.updateRunnerProfile({
+        ...seededRequest,
+        profile: { [field]: duration },
+        updateMask: { paths: [path] },
+      }),
+    ).rejects.toMatchObject(error);
+    expect(await state()).toEqual(before);
+  },
+);
 
 test("listing personal API keys reports expiry at the current time", async () => {
   const issuedAt = Date.UTC(2026, 0, 1);
