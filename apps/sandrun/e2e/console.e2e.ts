@@ -815,7 +815,12 @@ describe("requests", () => {
     await app.open(`/orgs/${ACME}/requests`);
 
     await screen.getByRole("checkbox", "Show ended requests").tap();
-    await expect(screen.getByRole("table", "Requests")).toContainText("deploy");
+    const table = screen.getByRole("table", "Requests");
+    await expect(table).toContainText("deploy");
+    const queuedJob = table
+      .getByRole("row")
+      .filter({ hasText: "acme-robotics/firmware · test (ubuntu)" });
+    await expect(queuedJob.getByRole("button", "Cancel")).toBeVisible();
     const sources = await browser.evaluate(() =>
       Array.from(
         document.querySelectorAll(

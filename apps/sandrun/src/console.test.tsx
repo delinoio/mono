@@ -73,6 +73,7 @@ import {
 } from "@delino/sandrun-protos/v1/runner_profile_pb";
 import {
   type ListRequestsRequest,
+  type ListRequestsResponseSchema,
   type ListRunnersRequest,
   type WatchQueueResponseSchema,
   WorkService,
@@ -3785,6 +3786,124 @@ describe("work", () => {
         { name: "Cancel" },
       ).length,
     ).toBe(2);
+  });
+
+  describe("request pagination", () => {
+    const path = (organizationId: string) => `/orgs/${organizationId}/requests`;
+    const request = (number: number, sourceKey = `request-${number}`) => ({
+      requestId: `request-${number}`,
+      state: RequestState.QUEUED,
+      sourceKey,
+    });
+    const firstPage = Array.from({ length: PAGE_SIZE }, (_, i) =>
+      request(i + 1),
+    );
+
+    function requestPages(
+      listRequests: (
+        token: string,
+      ) => MessageInitShape<typeof ListRequestsResponseSchema>,
+    ) {
+      const mock = createMockTransport();
+      const calls: ListRequestsRequest[] = [];
+      const pages = createRouterTransport((router) => {
+        router.service(WorkService, {
+          listRequests(req) {
+            calls.push(req);
+            return listRequests(req.pageToken);
+          },
+        });
+      });
+      const transport: Transport = {
+        ...mock,
+        unary: (method, ...args) =>
+          (method.name === WorkService.method.listRequests.name
+            ? pages
+            : mock
+          ).unary(method, ...args),
+      };
+      return { transport, calls };
+    }
+
+    function rows() {
+      return within(screen.getByRole("table", { name: "Requests" }))
+        .getAllByRole("row")
+        .slice(1);
+    }
+
+    const sources = () =>
+      rows().map((row) => within(row).getAllByRole("cell")[3]?.textContent);
+
+    test.each([
+      { role: "admin", organizationId: MOCK_IDS.globex, overlap: true },
+      { role: "admin", organizationId: MOCK_IDS.globex, overlap: false },
+      { role: "member", organizationId: MOCK_IDS.northwind, overlap: true },
+    ])(
+      "shows unique requests in order for a $role (overlap: $overlap)",
+      async ({ organizationId, role, overlap }) => {
+        const later = [request(51), request(52)];
+        const continuation = overlap
+          ? [request(50, "changed source"), ...later]
+          : later;
+        const { transport, calls } = requestPages((token) =>
+          token === ""
+            ? { requests: firstPage, nextPageToken: "50" }
+            : { requests: continuation },
+        );
+        renderConsole(path(organizationId), { transport });
+
+        await click(await screen.findByRole("button", { name: "Show more" }));
+
+        expect(sources()).toEqual(
+          [...firstPage, ...later].map((row) => row.sourceKey),
+        );
+        const boundary = screen.getByRole("row", { name: /\brequest-50\b/ });
+        expect(
+          within(boundary).queryAllByRole("button", { name: "Cancel" }),
+        ).toHaveLength(role === "admin" ? 1 : 0);
+        expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+        expect(
+          calls.map(({ pageSize, pageToken }) => [pageSize, pageToken]),
+        ).toEqual([
+          [PAGE_SIZE, ""],
+          [PAGE_SIZE, "50"],
+        ]);
+      },
+    );
+
+    test("keeps the next token after a duplicate-only page", async () => {
+      const { transport, calls } = requestPages((token) => {
+        switch (token) {
+          case "":
+            return { requests: firstPage, nextPageToken: "50" };
+          case "50":
+            return { requests: firstPage, nextPageToken: "100" };
+          case "100":
+            return { requests: [request(51)] };
+          default:
+            throw new ConnectError(
+              "Unexpected page token",
+              Code.InvalidArgument,
+            );
+        }
+      });
+      renderConsole(path(MOCK_IDS.globex), { transport });
+
+      await click(await screen.findByRole("button", { name: "Show more" }));
+      expect(sources()).toEqual(firstPage.map((row) => row.sourceKey));
+
+      await click(screen.getByRole("button", { name: "Show more" }));
+      expect(sources()).toEqual([
+        ...firstPage.map((row) => row.sourceKey),
+        "request-51",
+      ]);
+      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+      expect(calls.map(({ pageToken }) => pageToken)).toEqual([
+        "",
+        "50",
+        "100",
+      ]);
+    });
   });
 
   test("dev sessions show only metadata and delete actions by role", async () => {
