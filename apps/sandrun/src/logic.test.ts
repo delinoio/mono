@@ -5,6 +5,7 @@ import { describe, expect, test } from "@rstest/core";
 import {
   AgentVendor,
   GuestOs,
+  OwnSandLinkState,
   Priority,
   RequestState,
   Role,
@@ -53,6 +54,14 @@ import {
 import { parseRoute, RouteId, routePath } from "./router.tsx";
 
 describe("configuration", () => {
+  const malformedAuthorities = [
+    "https://ap\ti.test",
+    "https://ap\ni.test",
+    "https://ap\ri.test",
+    "https://@api.test",
+  ];
+  const authorityError = "must use an authority without @, tabs or line breaks";
+
   describe.each([false, true])("production=%s", (production) => {
     test("normalizes a complete Logto registration and requests sandrun:use", () => {
       const config = readConsoleConfig(
@@ -72,7 +81,22 @@ describe("configuration", () => {
       });
     });
 
+    test.each(malformedAuthorities)("rejects API origin %j", (value) => {
+      expect(() =>
+        readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production }),
+      ).toThrow(new Error(`PUBLIC_API_ORIGIN ${authorityError}`));
+    });
+
     describe.each([undefined, "", "   ", "app"])("app ID %j", (appId) => {
+      test.each(malformedAuthorities)("rejects Logto authority %j", (value) => {
+        expect(() =>
+          readConsoleConfig(
+            { PUBLIC_LOGTO_ENDPOINT: value, PUBLIC_LOGTO_APP_ID: appId },
+            { production },
+          ),
+        ).toThrow(new Error(`PUBLIC_LOGTO_ENDPOINT ${authorityError}`));
+      });
+
       test.each([
         ["not-a-url", "is not a valid URL"],
         [
@@ -151,6 +175,7 @@ describe("configuration", () => {
     ["https://api.test", "https://api.test"],
     ["https://api.test/", "https://api.test"],
     ["http://localhost:8080", "http://localhost:8080"],
+    [" \thttp://[::1]:18400/ \n", "http://[::1]:18400"],
     ["HTTPS://api.test", "https://api.test"],
     [" https://api.test/ ", "https://api.test"],
   ])("normalizes %j to a bare origin", (value, origin) => {
@@ -380,6 +405,29 @@ describe("runner profile form", () => {
     },
   );
 
+  test.each([
+    [{}, []],
+    [{ name: "linux-large" }, ["name"]],
+    [{ vcpuCount: 4 }, ["resources.vcpu_count"]],
+    [{ memoryMib: 8192 }, ["resources.memory_mib"]],
+    [{ diskGib: 64 }, ["resources.disk_gib"]],
+    [
+      { vcpuCount: 4, memoryMib: 8192, diskGib: 64 },
+      ["resources.vcpu_count", "resources.memory_mib", "resources.disk_gib"],
+    ],
+  ] as const)("masks only the fields changed by %j", (changes, paths) => {
+    const before = {
+      ...emptyProfileForm(),
+      name: "linux-build",
+      vcpuCount: 2,
+      memoryMib: 4096,
+      diskGib: 32,
+    };
+    expect(profileUpdateMask(before, { ...before, ...changes }).paths).toEqual(
+      paths,
+    );
+  });
+
   test("serializes a resource-only update with a stored whole-millisecond TTL", () => {
     const idleTtl = durationFromMs(60_060);
     const before = formFromProfile({
@@ -398,7 +446,7 @@ describe("runner profile form", () => {
     );
     expect(decoded.profile?.idleTtl).toEqual(idleTtl);
     expect(decoded.profile?.resources?.vcpuCount).toBe(3);
-    expect(decoded.updateMask?.paths).toEqual(["resources"]);
+    expect(decoded.updateMask?.paths).toEqual(["resources.vcpu_count"]);
   });
 
   test.each([
@@ -577,11 +625,25 @@ describe("queue view", () => {
     expect(view.requests.size).toBe(0);
   });
 
-  test("keeps the loading state when the stream fails before the first snapshot", () => {
-    const view = initialQueueView();
-    expect(
-      applyQueueEvent(view, { kind: QueueViewActionKind.StreamFailed }),
-    ).toBe(view);
+  test("discards an incomplete first snapshot when the stream fails", () => {
+    let view = applyQueueEvent(initialQueueView(), {
+      kind: WatchQueueEventKind.Request,
+      request: request("partial", RequestState.QUEUED),
+    });
+    view = applyQueueEvent(view, { kind: QueueViewActionKind.StreamFailed });
+    expect(view.live).toBe(LiveState.Disconnected);
+    expect(view.hasSnapshot).toBe(false);
+    expect(view.pending).toBeUndefined();
+    expect(view.requests.size).toBe(0);
+
+    view = applyQueueEvent(view, { kind: QueueViewActionKind.Restart });
+    expect(view.live).toBe(LiveState.Connecting);
+    view = applyQueueEvent(view, {
+      kind: WatchQueueEventKind.SnapshotComplete,
+    });
+    expect(view.live).toBe(LiveState.Live);
+    expect(view.hasSnapshot).toBe(true);
+    expect(view.requests.size).toBe(0);
   });
 
   test("keeps the last state across a gap and replaces it with the new snapshot", () => {
@@ -701,21 +763,25 @@ describe("queue view", () => {
 describe("setup guide", () => {
   test("names the steps in the contract order", () => {
     const none = {
-      linked: false,
+      linkState: null,
       hasGitHubInstallation: false,
       hasAgentIntegration: false,
       hasRunnerProfile: false,
     };
     expect(nextSetupStep(none)).toBe(SetupStep.LinkOwnSand);
-    expect(nextSetupStep({ ...none, linked: true })).toBe(
+    expect(nextSetupStep({ ...none, linkState: OwnSandLinkState.ACTIVE })).toBe(
       SetupStep.ConnectWorkSource,
     );
     expect(
-      nextSetupStep({ ...none, linked: true, hasAgentIntegration: true }),
+      nextSetupStep({
+        ...none,
+        linkState: OwnSandLinkState.ACTIVE,
+        hasAgentIntegration: true,
+      }),
     ).toBe(SetupStep.CreateRunnerProfile);
     expect(
       nextSetupStep({
-        linked: true,
+        linkState: OwnSandLinkState.ACTIVE,
         hasGitHubInstallation: true,
         hasAgentIntegration: false,
         hasRunnerProfile: true,
@@ -724,18 +790,27 @@ describe("setup guide", () => {
   });
 
   const unknown = {
-    linked: undefined,
+    linkState: undefined,
     hasGitHubInstallation: undefined,
     hasAgentIntegration: undefined,
     hasRunnerProfile: undefined,
   };
 
   test.each([
-    ["no OwnSand link", { linked: false }, SetupStep.LinkOwnSand],
+    ["no OwnSand link", { linkState: null }, SetupStep.LinkOwnSand],
+    [
+      "an invalid link and completed later steps",
+      {
+        linkState: OwnSandLinkState.INVALID,
+        hasGitHubInstallation: true,
+        hasRunnerProfile: true,
+      },
+      SetupStep.LinkOwnSand,
+    ],
     [
       "neither work source",
       {
-        linked: true,
+        linkState: OwnSandLinkState.ACTIVE,
         hasGitHubInstallation: false,
         hasAgentIntegration: false,
       },
@@ -743,28 +818,44 @@ describe("setup guide", () => {
     ],
     [
       "a GitHub installation and no profile",
-      { linked: true, hasGitHubInstallation: true, hasRunnerProfile: false },
+      {
+        linkState: OwnSandLinkState.ACTIVE,
+        hasGitHubInstallation: true,
+        hasRunnerProfile: false,
+      },
       SetupStep.CreateRunnerProfile,
     ],
     [
       "an agent integration and no profile",
-      { linked: true, hasAgentIntegration: true, hasRunnerProfile: false },
+      {
+        linkState: OwnSandLinkState.ACTIVE,
+        hasAgentIntegration: true,
+        hasRunnerProfile: false,
+      },
       SetupStep.CreateRunnerProfile,
     ],
     [
       "an agent integration and a profile",
-      { linked: true, hasAgentIntegration: true, hasRunnerProfile: true },
+      {
+        linkState: OwnSandLinkState.ACTIVE,
+        hasAgentIntegration: true,
+        hasRunnerProfile: true,
+      },
       SetupStep.Done,
     ],
     ["an unknown link", { hasGitHubInstallation: true }, undefined],
     [
       "an empty list and an unknown work source",
-      { linked: true, hasGitHubInstallation: false, hasRunnerProfile: false },
+      {
+        linkState: OwnSandLinkState.ACTIVE,
+        hasGitHubInstallation: false,
+        hasRunnerProfile: false,
+      },
       undefined,
     ],
     [
       "an unknown profile list",
-      { linked: true, hasGitHubInstallation: true },
+      { linkState: OwnSandLinkState.ACTIVE, hasGitHubInstallation: true },
       undefined,
     ],
   ] as const)("resolves partial setup data with %s", (_name, facts, step) => {
