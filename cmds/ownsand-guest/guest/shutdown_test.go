@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -195,6 +197,18 @@ func requireWriteArtifacts(t *testing.T, srv *Server, req *ownsandv1.WriteFileRe
 	}
 }
 
+func requireStagingHandleClosed(t *testing.T, staging *os.File) {
+	t.Helper()
+	_, err := staging.Stat()
+	// On Windows, File.Stat calls Win32 with the file handle and can
+	// report ERROR_INVALID_HANDLE directly.
+	const windowsInvalidHandle = syscall.Errno(6)
+	if errors.Is(err, os.ErrClosed) || (runtime.GOOS == "windows" && errors.Is(err, windowsInvalidHandle)) {
+		return
+	}
+	t.Fatalf("staging handle at handoff: %v, want a closed handle", err)
+}
+
 func TestRunWriteShutdownLockHandoff(t *testing.T) {
 	for _, forced := range []bool{false, true} {
 		name := "within_grace"
@@ -265,21 +279,22 @@ func TestRunWriteShutdownLockHandoff(t *testing.T) {
 					t.Fatal(err)
 				}
 				waitForRun(t, rig)
-				rig.srv.Close()
+				// Let the replacement contend for the lock during Close so
+				// the check can observe a premature handoff.
+				closed := make(chan struct{})
+				go func() {
+					defer close(closed)
+					rig.srv.Close()
+				}()
+				t.Cleanup(func() { waitClosed(t, closed) })
 			}
 
-			var wait time.Duration
-			if forced {
-				wait = 10 * time.Second
-			}
-			replacement := openReplacement(t, Config{StateDir: dir, Now: rig.clock.Now}, wait)
+			replacement := openReplacement(t, Config{StateDir: dir, Now: rig.clock.Now}, 10*time.Second)
+			requireStagingHandleClosed(t, staging)
 			requireWriteArtifacts(t, rig.srv, idle, true)
 			rig.clock.Advance(OperationRetention + time.Second)
 			replacement.Sweep()
 			requireWriteArtifacts(t, rig.srv, idle, false)
-			if _, err := staging.Stat(); !errors.Is(err, os.ErrClosed) {
-				t.Fatalf("idle staging handle after handoff: %v, want os.ErrClosed", err)
-			}
 			if contents, err := os.ReadFile(target); err != nil || string(contents) != "x" {
 				t.Fatalf("published target: %q, %v", contents, err)
 			}
@@ -350,6 +365,10 @@ func TestWriteCloseRejectsNewWork(t *testing.T) {
 	entry := requireWriteEntry(t, h.srv.writes, req.GetWriteId())
 	staging := entry.file
 	h.srv.Close()
+	requireStagingHandleClosed(t, staging)
+	if entry.file != nil {
+		t.Fatal("primary staging handle still registered after Close")
+	}
 	late := &ownsandv1.WriteFileRequest{
 		SandboxId: testSandbox, WriteId: newID(t), Path: filepath.Join(filepath.Dir(target), "late"),
 		BindingSalt: make([]byte, 32), Data: []byte("y"),
@@ -369,12 +388,6 @@ func TestWriteCloseRejectsNewWork(t *testing.T) {
 	requireWriteArtifacts(t, h.srv, req, true)
 	replacement.srv.Sweep()
 	requireWriteArtifacts(t, h.srv, req, false)
-	if _, err := staging.Stat(); !errors.Is(err, os.ErrClosed) {
-		t.Fatalf("idle staging handle after Close: %v, want os.ErrClosed", err)
-	}
-	if entry.file != nil {
-		t.Fatal("primary staging handle still registered after Close")
-	}
 	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
 		t.Fatalf("original target after expiry: %q, %v", got, err)
 	}
