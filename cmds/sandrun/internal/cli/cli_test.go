@@ -640,6 +640,62 @@ func TestOutputFormats(t *testing.T) {
 	}
 }
 
+func TestEmptyJSONLists(t *testing.T) {
+	f := newFixture(t)
+	r := f.ok("", "--output", "json", "--org", f.org, "api-key", "list")
+	if r.stdout != "{\"api_keys\":[]}\n" || r.stderr != "" {
+		t.Errorf("empty API key list: stdout = %q, stderr = %q", r.stdout, r.stderr)
+	}
+
+	f.ok("", "org", "delete", f.org)
+	r = f.ok("", "--output", "json", "org", "list")
+	if r.stdout != "{\"organizations\":[]}\n" || r.stderr != "" {
+		t.Errorf("empty organization list: stdout = %q, stderr = %q", r.stdout, r.stderr)
+	}
+}
+
+func TestJSONListIncludesAllPages(t *testing.T) {
+	f := newFixture(t)
+	handler := connect.NewUnaryHandler(sandrunv1connect.OrganizationServiceListOrganizationsProcedure,
+		func(_ context.Context, req *connect.Request[sandrunv1.ListOrganizationsRequest]) (*connect.Response[sandrunv1.ListOrganizationsResponse], error) {
+			switch req.Msg.GetPageToken() {
+			case "":
+				return connect.NewResponse(&sandrunv1.ListOrganizationsResponse{
+					Organizations: []*sandrunv1.Organization{{OrganizationId: "first", CallerRole: sandrunv1.Role_ROLE_OWNER}},
+					NextPageToken: "second-page",
+				}), nil
+			case "second-page":
+				return connect.NewResponse(&sandrunv1.ListOrganizationsResponse{
+					Organizations: []*sandrunv1.Organization{{OrganizationId: "second", Name: "Dev <team>"}},
+				}), nil
+			default:
+				return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("unexpected page token"))
+			}
+		})
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	f.env[EnvAPIURL] = srv.URL
+	f.httpClient = srv.Client()
+
+	r := f.ok("", "--output", "json", "org", "list")
+	if r.stderr != "" || !strings.HasSuffix(r.stdout, "\n") || strings.Count(r.stdout, "\n") != 1 {
+		t.Fatalf("want one JSON line: stdout = %q, stderr = %q", r.stdout, r.stderr)
+	}
+	var got map[string][]map[string]string
+	if err := json.Unmarshal([]byte(r.stdout), &got); err != nil {
+		t.Fatalf("decode list JSON %q: %v", r.stdout, err)
+	}
+	want := map[string][]map[string]string{
+		"organizations": {
+			{"organization_id": "first", "caller_role": "ROLE_OWNER"},
+			{"organization_id": "second", "name": "Dev <team>"},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("organization list = %s, want %v", r.stdout, want)
+	}
+}
+
 const wantGitHubInstallBrowserSignIn = "Before you open the URL, sign in to the SandRun console in the browser you will use. Use the same SandRun account you used to generate the URL."
 
 func TestGitHubInstallURLHelp(t *testing.T) {
