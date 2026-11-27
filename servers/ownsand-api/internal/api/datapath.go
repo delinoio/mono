@@ -164,8 +164,11 @@ func (p *DataPlane) sendGrant(ctx context.Context, conn *hub.Conn, env *ownsandv
 
 // RelayTiming holds the relay stream durations; tests shorten them.
 type RelayTiming struct {
-	// Rotation ends a server stream before 14 minutes.
+	// Rotation ends a writable server stream with OK after 13 min 50 s.
 	Rotation time.Duration
+	// ResponseWriteDeadline bounds server-streaming response writes from
+	// stream_id allocation. Zero uses the production limit of 13 min 59 s.
+	ResponseWriteDeadline time.Duration
 	// Keepalive is the caller-side keepalive interval (at most 60 s).
 	Keepalive time.Duration
 	// Acceptance is the wait for the agent's accepted notice (30 s).
@@ -187,6 +190,8 @@ type RelayTiming struct {
 // defaultRelayConnWait is the contract wait for the agent relay connection.
 const defaultRelayConnWait = 10 * time.Second
 
+const defaultRelayResponseWriteDeadline = 14*time.Minute - time.Second
+
 // connWait returns the wait for the agent relay connection; a zero ConnWait
 // keeps the contract value.
 func (t RelayTiming) connWait() time.Duration {
@@ -198,12 +203,16 @@ func (t RelayTiming) connWait() time.Duration {
 
 // DefaultRelayTiming returns the contract values.
 func DefaultRelayTiming() RelayTiming {
-	return RelayTiming{Rotation: 14*time.Minute - 10*time.Second, Keepalive: 50 * time.Second, Acceptance: 30 * time.Second, RequestDeadline: 5 * time.Minute,
+	return RelayTiming{Rotation: 14*time.Minute - 10*time.Second, ResponseWriteDeadline: defaultRelayResponseWriteDeadline,
+		Keepalive: 50 * time.Second, Acceptance: 30 * time.Second, RequestDeadline: 5 * time.Minute,
 		GrantAck: 10 * time.Second, Signaling: 30 * time.Second, ConnWait: defaultRelayConnWait}
 }
 
 // NewDataPlane wires the data path into s.
 func NewDataPlane(s *Service, limits relay.Limits, timing RelayTiming) *DataPlane {
+	if timing.ResponseWriteDeadline <= 0 {
+		timing.ResponseWriteDeadline = defaultRelayResponseWriteDeadline
+	}
 	p := &DataPlane{
 		S: s, Grants: grants.New(s.Now), Relays: relay.NewRegistry(), Limits: limits, Timing: timing,
 		limiter:     ratelimit.New(authorizeRate, authorizeRate, s.Now),
