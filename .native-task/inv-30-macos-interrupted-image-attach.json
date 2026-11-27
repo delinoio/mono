@@ -1,0 +1,52 @@
+{
+  "gid": "inv-30-macos-interrupted-image-attach",
+  "commit": "40a4bb0230afb03ff4ffea2b9862b4663a8cd169",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "40a4bb0230afb03ff4ffea2b9862b4663a8cd169",
+    "setup": "Run in one Bash session at the repository root of a disposable checkout. Run the first three commands, copy files.copyFrom to files.copyTo, then run the remaining commands in order. Use a non-elevated account. The probe uses unmounted disposable raw images and calls no Virtualization.framework methods.",
+    "commands": [
+      "set -euo pipefail",
+      "test \"$(git rev-parse HEAD)\" = \"40a4bb0230afb03ff4ffea2b9862b4663a8cd169\" && test \"$(go env GOOS)/$(go env GOARCH)\" = \"darwin/arm64\" || exit 1",
+      "mkdir -p \".t3-tmp/macos-interrupted-attach\"",
+      "export TMPDIR=\"$(git rev-parse --show-toplevel)/.t3-tmp\" COPYFILE_DISABLE=1 CGO_ENABLED=1",
+      "go vet -mod=readonly ./cmds/ownsand-agent/internal/imagebuild 2>&1 | tee \".t3-tmp/macos-interrupted-attach/native-vet.log\"",
+      "go test -mod=readonly -count=1 -v ./cmds/ownsand-agent/internal/imagebuild -run '^(TestWithAttachedDisk|TestAttachedWholeDisk|TestDataVolumeUnmountBeforeDetach)' 2>&1 | tee \".t3-tmp/macos-interrupted-attach/native-tests.log\"",
+      "test \"$(shasum -a 256 \".t3-tmp/macos-interrupted-attach/interrupted_attach_native_probe_darwin_test.go\" | awk '{print $1}')\" = \"b02e1c7fdcc4fdce1fb92152ebca1844f710d78bbdfa8df24490fb9d3ad63e68\"",
+      "python3 -c 'import json; from pathlib import Path; root = Path.cwd(); name = \"interrupted_attach_native_probe_darwin_test.go\"; scratch = root / \".t3-tmp/macos-interrupted-attach\"; virtual = root / \"cmds/ownsand-agent/internal/imagebuild\" / name; (scratch / \"native-overlay.json\").write_text(json.dumps({\"Replace\": {str(virtual): str(scratch / name)}}))'",
+      "go test -mod=readonly -overlay \".t3-tmp/macos-interrupted-attach/native-overlay.json\" -count=1 -timeout=4m -v ./cmds/ownsand-agent/internal/imagebuild -run '^TestNativeInterruptedAttach$' 2>&1 | tee \".t3-tmp/macos-interrupted-attach/native-probe.log\""
+    ],
+    "expectedResults": [
+      "The cgo-enabled macOS package builds and vets. The success and unmount-order checks pass.",
+      "The shell process fixtures preserve the original nonzero attach exit status. A complete or truncated device entry permits cleanup only with a current association. Forced cleanup checks the association again. Ambiguity, absence, and device reuse cannot trigger an unrelated detach.",
+      "The real inventory shows the control image before the attach, both disposable images at cancellation, and only the original inventory after recovery. The normal detach targets the staged image exactly once. The call returns the attach subprocess SIGKILL error and skips provisioning.",
+      "The probe cleans up the control image on exit. Its log records inventory counts and the disposable image verdicts without retaining raw host inventory or unrelated paths."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-macos-interrupted-image-attach/worker/.t3-tmp/macos-interrupted-attach/interrupted_attach_native_probe_darwin_test.go",
+      "copyTo": ".t3-tmp/macos-interrupted-attach/interrupted_attach_native_probe_darwin_test.go",
+      "sha256": "b02e1c7fdcc4fdce1fb92152ebca1844f710d78bbdfa8df24490fb9d3ad63e68",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/imagebuild/attach_test.go",
+        "cmds/ownsand-agent/internal/imagebuild/attach_unix_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/macos-interrupted-attach/native-vet.log",
+        ".t3-tmp/macos-interrupted-attach/native-tests.log",
+        ".t3-tmp/macos-interrupted-attach/native-probe.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-macos-interrupted-image-attach/worker/.t3-tmp/macos-interrupted-attach/imagebuild-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-macos-interrupted-image-attach/worker/.t3-tmp/macos-interrupted-attach/native-probe-darwin-arm64.test"
+      ]
+    },
+    "unperformed": [
+      "Actual hdiutil execution remains pending on m3-16. The Linux worker cannot reach the host.",
+      "The native probe lets the real hdiutil attach complete and keeps its stdout-forwarding subprocess alive for deterministic cancellation after the device appears. It does not time a signal inside hdiutil itself.",
+      "The disposable probe does not require an administrator account, signed entitlements, or a guest installer. No full VM image build was run."
+    ]
+  }
+}
