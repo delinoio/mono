@@ -31,6 +31,31 @@ window.addEventListener("billing-fixture:refresh-cap-usage", () => {
   void invalidateServices(queryClient, CreditService);
 });
 
+const capUsageFixture = {
+  setUsage(micros: string, failNextRead = false) {
+    account.autoTopUp = {
+      ...account.autoTopUp,
+      monthToDateUsdMicros: BigInt(micros),
+    };
+    if (failNextRead) {
+      api.failNext.set(
+        "GetAutoTopUpSettings",
+        new ConnectError("busy", Code.ResourceExhausted),
+      );
+    }
+    return null;
+  },
+  readCount() {
+    return api.calls.filter(({ method }) => method === "GetAutoTopUpSettings")
+      .length;
+  },
+  saveCount() {
+    return api.calls.filter(
+      ({ method }) => method === "UpdateAutoTopUpSettings",
+    ).length;
+  },
+};
+
 const updateMethod = "UpdateAlertSettings";
 const readMethod = "GetAlertSettings";
 let save: ReturnType<typeof deferNextCall>;
@@ -79,10 +104,12 @@ const fixture = {
 declare global {
   interface Window {
     alertSettingsFixture: typeof fixture;
+    capUsageFixture: typeof capUsageFixture;
   }
 }
 
 window.alertSettingsFixture = fixture;
+window.capUsageFixture = capUsageFixture;
 window.history.replaceState(null, "", `/billing/${ACCOUNT_ID}`);
 createRoot(document.getElementById("root")!).render(
   <AuthContextProvider

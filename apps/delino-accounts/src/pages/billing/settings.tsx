@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import {
+  createConnectQueryKey,
+  useMutation,
+  useQuery,
+  useTransport,
+} from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { Switch } from "delino-ui/switch";
 import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
-import { type FormEvent, type ReactNode, useState } from "react";
+import {
+  type FormEvent,
+  type ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { invalidateServices } from "../../api.ts";
 import { useBillingAccount } from "../../components/shell.tsx";
 import {
@@ -15,14 +26,18 @@ import {
   RefetchNotice,
   Loading,
 } from "../../components/ui.tsx";
+import { useCurrentUtcMonth } from "../../current-utc-month.ts";
 import {
   type AutoTopUpErrors,
   type AutoTopUpInput,
   type AutoTopUpValues,
+  AUTO_TOP_UP_MIN_AMOUNT_USD_MICROS,
+  AUTO_TOP_UP_MIN_THRESHOLD_USD_MICROS,
   checkAccountName,
   checkAlertThreshold,
   checkAutoTopUp,
   DEFAULT_ALERT_THRESHOLD_USD_MICROS,
+  TOP_UP_MAX_USD_MICROS,
 } from "../../forms.ts";
 import { formatCount } from "../../format.ts";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
@@ -158,19 +173,38 @@ function NameSettings() {
 
 function AutoTopUpSection() {
   const { billingAccountId } = useBillingAccount();
-  const settings = useQuery(CreditService.method.getAutoTopUpSettings, {
-    billingAccountId,
-  });
+  const queryClient = useQueryClient();
+  const transport = useTransport();
+  const schema = CreditService.method.getAutoTopUpSettings;
+  const settings = useQuery(schema, { billingAccountId });
+  const { refetch } = settings;
+  const { year, month } = useCurrentUtcMonth();
+  const currentMonth = year * 12 + month;
+  const previousMonth = useRef(currentMonth);
+
+  useEffect(() => {
+    if (previousMonth.current === currentMonth) return;
+    previousMonth.current = currentMonth;
+    const queryKey = createConnectQueryKey({
+      schema,
+      transport,
+      input: { billingAccountId },
+      cardinality: "finite",
+    });
+    // Refetch replaces a pending refresh but would reuse a pending first read.
+    if (queryClient.getQueryData(queryKey) === undefined) {
+      void queryClient.cancelQueries({ queryKey, exact: true });
+    }
+    void refetch();
+  }, [billingAccountId, currentMonth, queryClient, refetch, schema, transport]);
+
   return settings.isPending ? (
     <section className="section" aria-label="Automatic top-up">
       <Loading label="Loading automatic top-up" />
     </section>
   ) : settings.isLoadingError ? (
     <section className="section" aria-label="Automatic top-up">
-      <ErrorNotice
-        error={settings.error}
-        onRetry={() => void settings.refetch()}
-      />
+      <ErrorNotice error={settings.error} onRetry={() => void refetch()} />
     </section>
   ) : (
     // The notice and the form are siblings in a fragment in every loaded
@@ -179,7 +213,7 @@ function AutoTopUpSection() {
     <>
       <RefetchNotice
         error={settings.isRefetchError ? settings.error : undefined}
-        onRetry={() => void settings.refetch()}
+        onRetry={() => void refetch()}
       />
       <AutoTopUpForm settings={settings.data.settings} />
     </>
@@ -283,13 +317,22 @@ function AutoTopUpForm({
     >
       <Switch
         label="Automatic top-up"
+        description={
+          draft.enabled
+            ? undefined
+            : "Enter amounts of $0.00 or more in whole cents. Blank fields save as $0.00. Saved values are available when you turn automatic top-up on."
+        }
         checked={draft.enabled}
         onCheckedChange={(enabled) => editDraft({ enabled })}
         disabled={!editable}
       />
       <TextField
         label="Threshold (USD)"
-        description="At least $10.00."
+        description={
+          draft.enabled
+            ? `At least ${formatUsd(AUTO_TOP_UP_MIN_THRESHOLD_USD_MICROS)}.`
+            : undefined
+        }
         value={draft.threshold}
         onChange={(event) => editDraft({ threshold: event.target.value })}
         error={errors.threshold}
@@ -299,7 +342,11 @@ function AutoTopUpForm({
       />
       <TextField
         label="Top-up amount (USD)"
-        description="At least $25.00. Tax is added on top."
+        description={
+          draft.enabled
+            ? `${formatUsd(AUTO_TOP_UP_MIN_AMOUNT_USD_MICROS)} to ${formatUsd(TOP_UP_MAX_USD_MICROS)}. Tax is added on top.`
+            : "Tax is added on top."
+        }
         value={draft.amount}
         onChange={(event) => editDraft({ amount: event.target.value })}
         error={errors.amount}
@@ -309,7 +356,9 @@ function AutoTopUpForm({
       />
       <TextField
         label="Monthly cap (USD)"
-        description="Required. At least the top-up amount."
+        description={
+          draft.enabled ? "Required. At least the top-up amount." : undefined
+        }
         value={draft.monthlyCap}
         onChange={(event) => editDraft({ monthlyCap: event.target.value })}
         error={errors.monthlyCap}

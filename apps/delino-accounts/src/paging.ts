@@ -46,7 +46,7 @@ export interface AllPages<Item> {
    */
   continuationError: unknown;
   refetch: () => void;
-  retryContinuation: () => void;
+  retryContinuation: () => Promise<unknown>;
 }
 
 /**
@@ -167,6 +167,6 @@ export function useAllPages<I extends DescMessage, O extends DescMessage, Item>(
     isLoadingMore: hasNextPage && !isFetchNextPageError && !isRefetchError,
     continuationError: isFetchNextPageError ? query.error : undefined,
     refetch: () => void refetch(),
-    retryContinuation: () => void fetchNextPage(),
+    retryContinuation: () => fetchNextPage({ cancelRefetch: false }),
   };
 }
