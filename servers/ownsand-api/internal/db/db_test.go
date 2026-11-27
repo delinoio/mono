@@ -4,6 +4,7 @@ package db_test
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"net"
 	"reflect"
@@ -20,6 +21,21 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
+
+func TestOpenRejectsMalformedDatabaseURL(t *testing.T) {
+	database, err := db.Open(t.Context(), "postgres://test:synthetic-password@127.0.0.1:badport/test")
+	if database != nil {
+		database.Close()
+		t.Fatal("Open returned a pool for a malformed database URL")
+	}
+	const want = "parse database url: invalid connection string"
+	if err == nil || err.Error() != want {
+		t.Errorf("Open did not return %q", want)
+	}
+	if errors.Unwrap(err) != nil {
+		t.Error("Open wrapped the parser error")
+	}
+}
 
 func TestOpenRejectsSingleConnectionPool(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

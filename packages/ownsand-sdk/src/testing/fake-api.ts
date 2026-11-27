@@ -36,7 +36,7 @@ export class Trickle {
     readonly gapMs: number,
   ) {}
 }
-/** Hangs until the client cancels the call. */
+/** Hangs until the request is aborted or the reader cancels. */
 export class Hang {}
 
 export type StreamStep = Message | Sleep | Disconnect | Eof | Trickle | Hang;
@@ -272,88 +272,88 @@ export class FakeApi {
       : (async function* (): AsyncGenerator<StreamStep> {
           throw new ConnectError(`no fake for ${path}`, Code.Unimplemented);
         })();
-    let finished = false;
+    const readerCancellation = new AbortController();
+    const bodySignal = AbortSignal.any([signal, readerCancellation.signal]);
     const stream = new ReadableStream<Uint8Array>({
       async pull(controller) {
-        for (;;) {
-          if (finished) return;
-          let next: IteratorResult<StreamStep>;
-          try {
-            next = await steps.next();
-          } catch (error) {
-            finished = true;
-            controller.enqueue(
-              envelope(
-                2,
-                new TextEncoder().encode(
-                  JSON.stringify({
-                    error: errorJson(ConnectError.from(error)),
-                  }),
+        try {
+          for (;;) {
+            bodySignal.throwIfAborted();
+            let next: IteratorResult<StreamStep>;
+            try {
+              next = await steps.next();
+            } catch (error) {
+              bodySignal.throwIfAborted();
+              controller.enqueue(
+                envelope(
+                  2,
+                  new TextEncoder().encode(
+                    JSON.stringify({
+                      error: errorJson(ConnectError.from(error)),
+                    }),
+                  ),
                 ),
-              ),
-            );
-            controller.close();
-            return;
-          }
-          if (next.done) {
-            finished = true;
-            controller.enqueue(envelope(2, new TextEncoder().encode("{}")));
-            controller.close();
-            return;
-          }
-          const step = next.value;
-          if (step instanceof Sleep) {
-            await clock.sleep(step.ms, signal).catch(() => {});
-            // A Sleep step enqueues nothing, and a web stream pulls again only
-            // when a read is outstanding while a pull runs. Keep reading steps
-            // in this pull so consecutive Sleep steps cannot stall the stream.
-            // Stop once the reader cancelled. When the call is aborted, error
-            // the body with the reason so a pending read rejects instead of
-            // hanging, and do not advance the script.
-            if (finished) return;
-            if (signal.aborted) {
-              finished = true;
-              controller.error(signal.reason);
+              );
+              controller.close();
               return;
             }
-            continue;
-          }
-          if (step instanceof Disconnect) {
-            finished = true;
-            controller.error(new TypeError("terminated: other side closed"));
-            return;
-          }
-          if (step instanceof Eof) {
-            finished = true;
-            controller.close();
-            return;
-          }
-          if (step instanceof Hang) {
-            await new Promise<void>((resolve) => {
-              if (signal.aborted) resolve();
-              signal.addEventListener("abort", () => resolve(), { once: true });
-            });
-            finished = true;
-            controller.error(signal.reason ?? new TypeError("aborted"));
-            return;
-          }
-          if (step instanceof Trickle) {
-            const bytes = envelope(0, toBinary(output, step.message as never));
-            const size = Math.ceil(bytes.length / step.pieces);
-            for (let i = 0; i < bytes.length; i += size) {
-              if (i > 0) {
-                await clock.sleep(step.gapMs, signal).catch(() => {});
-              }
-              controller.enqueue(bytes.subarray(i, i + size));
+            bodySignal.throwIfAborted();
+            if (next.done) {
+              controller.enqueue(envelope(2, new TextEncoder().encode("{}")));
+              controller.close();
+              return;
             }
+            const step = next.value;
+            if (step instanceof Sleep) {
+              await clock.sleep(step.ms, bodySignal);
+              // Keep consecutive Sleep steps in this pull. The stream can
+              // wait for more data without calling pull again.
+              continue;
+            }
+            if (step instanceof Disconnect) {
+              controller.error(new TypeError("terminated: other side closed"));
+              return;
+            }
+            if (step instanceof Eof) {
+              controller.close();
+              return;
+            }
+            if (step instanceof Hang) {
+              return await new Promise<never>((_, reject) => {
+                bodySignal.addEventListener(
+                  "abort",
+                  () => reject(bodySignal.reason),
+                  { once: true },
+                );
+              });
+            }
+            if (step instanceof Trickle) {
+              const bytes = envelope(
+                0,
+                toBinary(output, step.message as never),
+              );
+              const size = Math.ceil(bytes.length / step.pieces);
+              for (let i = 0; i < bytes.length; i += size) {
+                if (i > 0) {
+                  await clock.sleep(step.gapMs, bodySignal);
+                  bodySignal.throwIfAborted();
+                }
+                controller.enqueue(bytes.subarray(i, i + size));
+              }
+              return;
+            }
+            controller.enqueue(envelope(0, toBinary(output, step as never)));
             return;
           }
-          controller.enqueue(envelope(0, toBinary(output, step as never)));
-          return;
+        } catch (error) {
+          if (readerCancellation.signal.aborted) return;
+          if (!signal.aborted) throw error;
+          controller.error(signal.reason);
+          await steps.return(undefined);
         }
       },
-      async cancel() {
-        finished = true;
+      async cancel(reason) {
+        readerCancellation.abort(reason);
         await steps.return(undefined);
       },
     });

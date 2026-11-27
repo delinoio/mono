@@ -170,7 +170,7 @@ func New(opts Options) (*App, error) {
 		DeadlineNow: opts.LeaseDeadlineNow, OnLose: control.LeaseLost}
 	svc.Lease = l
 	statuses := billing.NewStatuses(billing.StatusOptions{
-		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Held: l.Held, Client: opts.UsageClient,
+		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Ownership: l.Ownership, Client: opts.UsageClient,
 		Metrics: opts.Metrics, Timing: opts.BillingStatusTiming,
 	})
 	svc.Billing = statuses
