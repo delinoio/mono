@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
@@ -98,6 +99,141 @@ func TestGetOrganizationBillingCountsOnlyTheCurrentMonth(t *testing.T) {
 	}
 	if q, a, _ := usage(); q != 3 || a != 30 {
 		t.Fatalf("April usage after duplicate = %d, %d; want 3, 30", q, a)
+	}
+}
+
+func TestReportUsageRefreshesBillingStatusOnBalanceExhaustion(t *testing.T) {
+	const (
+		account   = "ba-1"
+		user      = "owner"
+		allowed   = accountsv1.BillingStatus_BILLING_STATUS_ALLOWED
+		blocked   = accountsv1.BillingStatus_BILLING_STATUS_BLOCKED
+		suspended = accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED
+		service   = accountsv1.ServiceId_SERVICE_ID_OWNSAND
+	)
+	orgs := []string{"org-1", "org-2"}
+	start := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	type charge struct {
+		windowOffset    time.Duration
+		amount, balance int64
+		duplicate       bool
+	}
+	tests := []struct {
+		name         string
+		initialPhase accountsv1.BillingStatus
+		wantBlock    bool
+		charges      []charge
+	}{
+		{
+			name: "exact exhaustion then replay and further debit", initialPhase: allowed, wantBlock: true,
+			charges: []charge{
+				{amount: 10_000_000, balance: 0},
+				{amount: 10_000_000, balance: 0, duplicate: true},
+				{windowOffset: 5 * time.Minute, amount: 1, balance: -1},
+			},
+		},
+		{
+			name: "cross below zero", initialPhase: allowed, wantBlock: true,
+			charges: []charge{{amount: 10_000_001, balance: -1}},
+		},
+		{
+			name: "balance stays positive", initialPhase: allowed,
+			charges: []charge{{amount: 9_999_999, balance: 1}},
+		},
+		{
+			name: "explicitly blocked", initialPhase: blocked,
+			charges: []charge{{amount: 10_000_000, balance: 0}},
+		},
+		{
+			name: "explicitly suspended", initialPhase: suspended,
+			charges: []charge{{amount: 10_000_000, balance: 0}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var elapsed atomic.Int64
+			f := New(t, func() time.Time { return start.Add(time.Duration(elapsed.Load())) })
+			f.AddAccount(account, "Account", map[string]accountsv1.BillingAccountRole{user: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+			client := f.Client()
+			ctx := t.Context()
+			statuses := make([]*accountsv1.OrganizationBillingStatus, len(orgs))
+			for i, org := range orgs {
+				link, err := client.LinkOrganization(ctx, connect.NewRequest(&accountsv1.LinkOrganizationRequest{
+					Service: service, OrganizationId: org, OrganizationName: org, BillingAccountId: account, UserId: user,
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				statuses[i] = link.Msg.GetStatus()
+			}
+			if tt.initialPhase != allowed {
+				f.SetAccountStatus(account, tt.initialPhase, start.Add(-72*time.Hour))
+				for i, org := range orgs {
+					statuses[i] = f.Status(org)
+				}
+			}
+			cursor := statuses[len(statuses)-1].GetSequence()
+
+			for i, c := range tt.charges {
+				chargeTime := c.windowOffset + 5*time.Minute
+				elapsed.Store(int64(chargeTime))
+				report, err := client.ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{Reports: []*accountsv1.UsageReport{{
+					Service: service, OrganizationId: orgs[0], Meter: accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC,
+					WindowStart: timestamppb.New(start.Add(c.windowOffset)), Quantity: 1, AmountUsdMicros: c.amount,
+				}}}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				results := report.Msg.GetResults()
+				if len(results) != 1 || results[0].GetDuplicate() != c.duplicate ||
+					(!c.duplicate && results[0].GetBillingAccountId() != account) {
+					t.Fatalf("charge %d: unexpected report results %v", i, results)
+				}
+				poll, err := client.ListBillingStatusChanges(ctx, connect.NewRequest(&accountsv1.ListBillingStatusChangesRequest{
+					Service: service, AfterSequence: cursor,
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				changes := poll.Msg.GetStatuses()
+				wantCursor := cursor
+				if tt.wantBlock && i == 0 {
+					if len(changes) != len(orgs) {
+						t.Fatalf("poll after %d = %v, want new statuses for both organizations", cursor, changes)
+					}
+					for j, change := range changes {
+						blockTime := start.Add(chargeTime)
+						if change.GetOrganizationId() != orgs[j] || change.GetBillingAccountId() != account ||
+							change.GetStatus() != blocked || change.GetReason() != accountsv1.BillingStatusReason_BILLING_STATUS_REASON_NON_POSITIVE_BALANCE ||
+							change.GetSequence() <= wantCursor || !change.GetBlockedSince().AsTime().Equal(blockTime) ||
+							!change.GetSuspendTime().AsTime().Equal(blockTime.Add(72*time.Hour)) {
+							t.Fatalf("unexpected status change: %v", change)
+						}
+						wantCursor = change.GetSequence()
+					}
+					statuses = changes
+				} else if len(changes) != 0 {
+					t.Fatalf("charge %d: poll after %d = %v, want no changes", i, cursor, changes)
+				}
+				if cursor = poll.Msg.GetNextSequence(); cursor != wantCursor {
+					t.Fatalf("charge %d: next cursor = %d, want %d", i, cursor, wantCursor)
+				}
+				if got := report.Msg.GetStatuses(); len(got) != 1 || !proto.Equal(got[0], statuses[0]) {
+					t.Fatalf("charge %d: report statuses = %v, want only %v", i, got, statuses[0])
+				}
+				for j, org := range orgs {
+					billing, err := client.GetOrganizationBilling(ctx, connect.NewRequest(&accountsv1.GetOrganizationBillingRequest{
+						Service: service, OrganizationId: org,
+					}))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got := billing.Msg; got.GetBalanceUsdMicros() != c.balance || !proto.Equal(got.GetStatus(), statuses[j]) {
+						t.Fatalf("charge %d: billing for %s = %v, want balance %d with status %v", i, org, got, c.balance, statuses[j])
+					}
+				}
+			}
+		})
 	}
 }
 
