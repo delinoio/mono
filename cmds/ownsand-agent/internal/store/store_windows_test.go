@@ -833,15 +833,23 @@ func TestWindowsStateChecksDeepJunctionOwner(t *testing.T) {
 	}
 	path := filepath.Join(content, "link")
 	junction(t, path, target)
-	before := securityDescriptorString(t, target)
-	h, _, err := openStateEntry(path, windows.READ_CONTROL)
-	if err != nil {
-		t.Fatal(err)
+	targetBefore := securityDescriptorString(t, target)
+	readJunction := func() (uint32, *windows.SECURITY_DESCRIPTOR) {
+		t.Helper()
+		h, info, err := openStateEntry(path, windows.READ_CONTROL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer windows.CloseHandle(h)
+		sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			t.Fatalf("read junction security descriptor: %v", err)
+		}
+		return info.FileAttributes, sd
 	}
-	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-	windows.CloseHandle(h)
-	if err != nil {
-		t.Fatal(err)
+	attributesBefore, sd := readJunction()
+	if attributesBefore&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+		t.Fatalf("fixture is missing the reparse point attribute: %#x", attributesBefore)
 	}
 	owner, _, err := sd.Owner()
 	if err != nil {
@@ -859,20 +867,33 @@ func TestWindowsStateChecksDeepJunctionOwner(t *testing.T) {
 		t.Fatalf("junction owner = %v, want %s", err, owner)
 	}
 	p.childOwners = []*windows.SID{owner}
+	reparse, err := resetChild(path, p, false)
+	if err != nil || !reparse {
+		t.Fatalf("reset trusted junction: reparse point %v, error %v", reparse, err)
+	}
+	attributes, after := readJunction()
+	if attributes != attributesBefore {
+		t.Fatalf("resetChild changed junction attributes from %#x to %#x", attributesBefore, attributes)
+	}
+	if after.String() != sd.String() {
+		t.Fatalf("resetChild changed the junction security descriptor from %q to %q", sd.String(), after.String())
+	}
+
+	// Windows can update inherited ACEs on the junction when the walk
+	// repairs an ancestor's DACL.
 	if err := resetChildren(root, p); err != nil {
 		t.Fatalf("walk with a trusted junction: %v", err)
 	}
-	h, info, err := openStateEntry(path, windows.READ_CONTROL)
+	h, info, err := openStateEntry(path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	after, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	windows.CloseHandle(h)
-	if err != nil || info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0 || after.String() != sd.String() {
-		t.Fatalf("trusted junction changed: attributes %#x, error %v", info.FileAttributes, err)
+	if info.FileAttributes != attributesBefore {
+		t.Fatalf("walk changed junction attributes from %#x to %#x", attributesBefore, info.FileAttributes)
 	}
-	if after := securityDescriptorString(t, target); before != after {
-		t.Fatal("deep junction target security descriptor changed")
+	if after := securityDescriptorString(t, target); targetBefore != after {
+		t.Fatalf("walk changed the junction target security descriptor from %q to %q", targetBefore, after)
 	}
 }
 
