@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"math"
 	"slices"
 	"strings"
@@ -1730,60 +1731,134 @@ func TestWatchQueueCommitOrder(t *testing.T) {
 }
 
 func TestWatchQueueSnapshotAcrossTables(t *testing.T) {
-	env := testenv.New(t, testenv.WithLayers(ownsandfake.New(), &layers.Layers{}))
+	// Keep the work components from waiting on the same runners lock as the watch.
+	seed := testenv.New(t)
+	eventually(t, "core instance holds lease", seed.App.Lease.Held)
+	env := seed.NewReplica(t, testenv.WithLayers(ownsandfake.New(), &layers.Layers{}))
 	org := env.NewOrg("alice")
 	requestID := seedQueueWatchRow(t, env, org.ID, false)
 	runnerID := seedQueueWatchRow(t, env, org.ID, true)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	writer, err := env.DB.Pool.Begin(ctx)
+	setupCtx, cancelSetup := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancelSetup()
+	config := env.DB.Pool.Config().ConnConfig
+	observer, err := pgx.ConnectConfig(setupCtx, config)
+	if err != nil {
+		t.Fatalf("connect queue snapshot lock observer: %v", err)
+	}
+	defer observer.Close(t.Context())
+	writer, err := env.DB.Pool.Begin(setupCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer writer.Rollback(t.Context())
-	if _, err := writer.Exec(ctx, "LOCK TABLE runners IN ACCESS EXCLUSIVE MODE"); err != nil {
+	if _, err := writer.Exec(setupCtx, "LOCK TABLE runners IN ACCESS EXCLUSIVE MODE"); err != nil {
 		t.Fatal(err)
 	}
+	writerPID := writer.Conn().PgConn().PID()
+	cancelSetup()
+
+	watchCtx, cancelWatch := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelWatch()
 	type watchResult struct {
 		stream *connect.ServerStreamForClient[sandrunv1.WatchQueueResponse]
 		err    error
 	}
-	started := make(chan watchResult, 1)
+	firstEvent := make(chan watchResult, 1)
 	go func() {
-		stream, err := env.User(org.Member).Work.WatchQueue(ctx, connect.NewRequest(&sandrunv1.WatchQueueRequest{OrganizationId: org.ID}))
-		started <- watchResult{stream, err}
+		stream, err := env.User(org.Member).Work.WatchQueue(watchCtx, connect.NewRequest(&sandrunv1.WatchQueueRequest{OrganizationId: org.ID}))
+		// Connect can report a server error on Receive even if WatchQueue returned a stream.
+		if err == nil && !stream.Receive() {
+			err = stream.Err()
+			if err == nil {
+				err = io.EOF
+			}
+		}
+		firstEvent <- watchResult{stream, err}
 	}()
 
 	// Commit only after the watch read requests and is blocked reading runners.
-	eventually(t, "watch reading the runner snapshot", func() bool {
-		var waiting bool
-		err := env.DB.Pool.QueryRow(ctx, `SELECT EXISTS (
-			SELECT 1 FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock'
-				AND query LIKE '% FROM runners WHERE organization_id = $1 AND state = ANY($2)%'
-		)`).Scan(&waiting)
-		if err != nil {
-			t.Fatal(err)
+	observeCtx, cancelObservation := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancelObservation()
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	var readerPID uint32
+	for readerPID == 0 && observeCtx.Err() == nil {
+		select {
+		case result := <-firstEvent:
+			if result.err != nil {
+				t.Fatalf("WatchQueue ended before waiting for writer PID %d: %v", writerPID, result.err)
+			}
+			t.Fatalf("WatchQueue emitted an event before waiting for writer PID %d", writerPID)
+		case <-observeCtx.Done():
+			continue
+		case <-tick.C:
 		}
-		return waiting
-	})
-	endQueueWatchRow(t, ctx, writer, requestID, false)
-	endQueueWatchRow(t, ctx, writer, runnerID, true)
-	if err := writer.Commit(ctx); err != nil {
+		err := observer.QueryRow(observeCtx, `SELECT COALESCE(min(a.pid), 0)
+			FROM pg_stat_activity a JOIN pg_locks l ON l.pid = a.pid AND l.database = a.datid
+			WHERE a.datname = current_database()
+			  AND l.relation = 'runners'::regclass AND l.locktype = 'relation'
+			  AND l.mode = 'AccessShareLock' AND NOT l.granted
+			  AND $1 = ANY(pg_blocking_pids(a.pid))`, writerPID).Scan(&readerPID)
+		if err != nil && observeCtx.Err() == nil {
+			logQueueSnapshotLocks(t, config)
+			t.Fatalf("observe queue snapshot reader blocked by writer PID %d: %v", writerPID, err)
+		}
+	}
+	if readerPID == 0 {
+		logQueueSnapshotLocks(t, config)
+		t.Fatalf("timed out waiting for the queue snapshot reader to be blocked by writer PID %d: %v", writerPID, observeCtx.Err())
+	}
+	tick.Stop()
+	cancelObservation()
+	t.Logf("queue snapshot reader PID %d waited for writer PID %d on runners", readerPID, writerPID)
+
+	endQueueWatchRow(t, watchCtx, writer, requestID, false)
+	endQueueWatchRow(t, watchCtx, writer, runnerID, true)
+	if err := writer.Commit(watchCtx); err != nil {
 		t.Fatal(err)
 	}
-	watch := <-started
+	watch := <-firstEvent
 	if watch.err != nil {
-		t.Fatal(watch.err)
+		t.Fatalf("receive the first WatchQueue event: %v", watch.err)
 	}
-	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), requestID, watchRequestOpen, watchRunnerOpen)
+	defer watch.stream.Close()
+	expectQueueWatchState(t, watch.stream.Msg(), requestID, watchRequestOpen, watchRunnerOpen)
 	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), runnerID, watchRequestOpen, watchRunnerOpen)
 	if msg := nextQueueWatchEvent(t, watch.stream); msg.GetSnapshotComplete() == nil {
 		t.Fatalf("expected snapshot_complete, got %v", msg)
 	}
 	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), requestID, watchRequestEnd, watchRunnerEnd)
 	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), runnerID, watchRequestEnd, watchRunnerEnd)
+}
+
+func logQueueSnapshotLocks(t *testing.T, config *pgx.ConnConfig) {
+	t.Helper()
+	// Use a fresh connection in case the observation deadline interrupted a query.
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Logf("connect to collect queue snapshot lock diagnostics: %v", err)
+		return
+	}
+	defer conn.Close(ctx)
+
+	var locks string
+	err = conn.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(to_jsonb(activity) ORDER BY pid), '[]'::jsonb)::text
+		FROM (
+			SELECT a.pid, a.state, a.wait_event_type, a.wait_event, pg_blocking_pids(a.pid) AS blocked_by,
+				l.locktype, l.relation::regclass::text AS relation, l.mode, l.granted
+			FROM pg_stat_activity a
+			LEFT JOIN pg_locks l ON l.pid = a.pid AND (NOT l.granted OR
+				(l.database = a.datid AND l.relation IN ('requests'::regclass, 'runners'::regclass)))
+			WHERE a.datname = current_database() AND a.pid <> pg_backend_pid()
+		) activity`).Scan(&locks)
+	if err != nil {
+		t.Logf("collect queue snapshot lock diagnostics: %v", err)
+		return
+	}
+	t.Logf("queue snapshot lock diagnostics: %s", locks)
 }
 
 func seedQueueWatchRow(t *testing.T, env *testenv.Env, orgID string, runner bool) string {
