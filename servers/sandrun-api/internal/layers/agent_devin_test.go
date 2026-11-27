@@ -13,6 +13,8 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
@@ -20,6 +22,7 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/devin"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/devin/devinfake"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/app"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
@@ -531,6 +534,65 @@ func TestDevinWatchReconnect(t *testing.T) {
 	stays(t, "one request", func() bool { return len(w.requests(t)) == 1 && w.devin.Claims("ses-missed") == 1 })
 	if w.request(t, req.GetRequestId()).GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
 		t.Fatal("the request left the queue")
+	}
+}
+
+func TestDevinWatchRejectsMaintenancePages(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
+	fake.ServeHTMLWatches(2)
+	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, func(o *app.Options) {
+		o.Metrics = provider
+	})
+	w.full()
+	eventually(t, "the recovered Devin stream", func() bool { return fake.Streams() == 1 })
+	fake.AddSession("ses-restored-stream", true)
+	w.requestBySource(t, "ses-restored-stream")
+
+	lists := fake.ListTimes()
+	if len(lists) != 3 {
+		t.Fatalf("list calls = %d, want one per watch attempt", len(lists))
+	}
+	backoff := fastAgentTiming().BackoffMin
+	for i := 1; i < len(lists); i++ {
+		elapsed := lists[i].Sub(lists[i-1])
+		if elapsed < backoff {
+			t.Errorf("list %d started after %v, want at least %v", i+1, elapsed, backoff)
+		}
+		backoff *= 2
+	}
+
+	logs := w.env.Logs.String()
+	if strings.Count(logs, `"msg":"vendor_watch_reconnect"`) != 2 || strings.Count(logs, `"cause":"error"`) != 2 {
+		t.Error("expected one error reconnect log per maintenance page")
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var reconnects int64
+	for _, scope := range rm.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			if metric.Name != "sandrun_vendor_watch_reconnects" {
+				continue
+			}
+			for _, point := range metric.Data.(metricdata.Sum[int64]).DataPoints {
+				vendor, _ := point.Attributes.Value("vendor")
+				if vendor.AsString() == "DEVIN" {
+					reconnects += point.Value
+				}
+			}
+		}
+	}
+	if reconnects != 2 {
+		t.Errorf("DEVIN error reconnects = %d, want 2", reconnects)
 	}
 }
 

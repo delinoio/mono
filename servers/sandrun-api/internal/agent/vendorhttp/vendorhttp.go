@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -274,6 +275,7 @@ type Event struct {
 // Stream opens an event stream with GET and calls fn for each event until
 // the stream ends (nil), ctx ends (ctx.Err()), fn returns an error (that
 // error) or the connection fails. A non-2xx answer returns a *StatusError.
+// A 2xx answer must have a text/event-stream media type.
 // header adds request headers, for example Last-Event-ID.
 func (c *Client) Stream(ctx context.Context, op, path string, query url.Values, header http.Header, fn func(Event) error) error {
 	req, err := c.newRequest(ctx, http.MethodGet, path, query, nil)
@@ -295,6 +297,13 @@ func (c *Client) Stream(ctx context.Context, op, path string, query url.Values, 
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return c.statusError(ctx, op, resp)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || mediaType != "text/event-stream" {
+		return fmt.Errorf("%s %s: expected Content-Type text/event-stream", c.Vendor, op)
 	}
 	err = ReadEvents(resp.Body, fn)
 	if ctx.Err() != nil {

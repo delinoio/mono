@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -31,8 +32,9 @@ type Fake struct {
 	order           []string
 	streams         map[int]chan string
 	nextID          int
-	lists           int
+	listTimes       []time.Time
 	failWatch       int
+	htmlWatches     int
 	failRelease     bool
 	queuePages      map[string]map[string]any
 	claimAttempts   []string
@@ -99,7 +101,7 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
-		f.lists++
+		f.listTimes = append(f.listTimes, time.Now())
 		if f.queuePages != nil {
 			page, ok := f.queuePages[q.Get("cursor")]
 			f.mu.Unlock()
@@ -203,6 +205,13 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 
 func (f *Fake) watch(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
+	if f.htmlWatches > 0 {
+		f.htmlWatches--
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html>Maintenance</html>")
+		return
+	}
 	if f.failWatch > 0 {
 		f.failWatch--
 		f.mu.Unlock()
@@ -345,6 +354,13 @@ func (f *Fake) FailWatches(n int) {
 	f.failWatch = n
 }
 
+// ServeHTMLWatches returns a maintenance page for the next n watch calls.
+func (f *Fake) ServeHTMLWatches(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.htmlWatches = n
+}
+
 // FailReleases sets whether release calls fail with 503.
 func (f *Fake) FailReleases(fail bool) {
 	f.mu.Lock()
@@ -363,7 +379,14 @@ func (f *Fake) Streams() int {
 func (f *Fake) Lists() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.lists
+	return len(f.listTimes)
+}
+
+// ListTimes returns the start times of calls for the outpost queue.
+func (f *Fake) ListTimes() []time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.listTimes)
 }
 
 // QueuePage describes a scripted list response for a request cursor.
