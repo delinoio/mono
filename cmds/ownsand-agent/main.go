@@ -132,6 +132,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err := fs.Parse(rest); err != nil {
 		return exitUsage
 	}
+	if cmd == "reset" && fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "ownsand-agent: reset: unexpected argument %q\n", fs.Arg(0))
+		return exitUsage
+	}
 	switch service.Manager(*manager) {
 	case "", service.ManagerLaunchd:
 	default:
