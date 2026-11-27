@@ -232,6 +232,7 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 			}
 			continue
 		}
+		var payloadConflict bool
 		if user.PrimaryEmail != "" {
 			msg, err := email.NoticeMessage(email.Notice{
 				Kind:               email.Kind(n.Kind),
@@ -248,7 +249,13 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 			if n.Kind == NotifyCreditExpiry && !expiry.After(s.timestamp()) {
 				return s.abandonCreditExpiryNotice(ctx, n, "credit_expired")
 			}
-			if err := s.email.Send(ctx, msg); err != nil {
+			err = s.email.Send(ctx, msg)
+			switch {
+			case err == nil:
+				s.metrics.Email(string(n.Kind), "sent")
+			case errors.Is(err, email.ErrIdempotencyPayloadConflict):
+				payloadConflict = true
+			default:
 				if ctx.Err() != nil {
 					// The pass ended while the send was in flight, so the
 					// outcome is unknown. The next attempt sends again with
@@ -262,17 +269,22 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 				}
 				continue
 			}
-			s.metrics.Email(string(n.Kind), "sent")
 		}
-		// Record the recipient at once, so a pass that ends early keeps it.
-		// A recipient without a primary email is recorded too, so it is not
-		// read again on a retry.
+		// Record processed recipients immediately, including members without
+		// a primary email and conflicts with a previously used key.
 		if err := s.settle(ctx, func(ctx context.Context) error {
 			_, err := s.db.Pool.Exec(ctx, `INSERT INTO billing_notification_deliveries (notification_id, user_id, send_time)
 				VALUES ($1, $2, $3) ON CONFLICT (notification_id, user_id) DO NOTHING`, n.ID, userID, s.timestamp())
 			return err
 		}); err != nil {
 			return err
+		}
+		if payloadConflict {
+			s.logger.InfoContext(ctx, "billing_notification_recipient_skipped",
+				slog.String("billing_account_id", n.BillingAccountID),
+				slog.String("kind", string(n.Kind)),
+				slog.String("notification_id", n.ID),
+				slog.String("reason", "idempotency_payload_conflict"))
 		}
 	}
 	return s.settle(ctx, func(ctx context.Context) error {

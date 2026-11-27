@@ -77,7 +77,13 @@ func NewResend(cfg ResendConfig) (*Resend, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	client := resend.NewCustomClient(cfg.Client, cfg.APIKey)
+	httpClient := *cfg.Client
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	httpClient.Transport = resendTransport{transport}
+	client := resend.NewCustomClient(&httpClient, cfg.APIKey)
 	if cfg.BaseURL != "" {
 		if err := setBaseURL(client, cfg.BaseURL); err != nil {
 			return nil, err
@@ -97,13 +103,27 @@ func (r *Resend) Send(ctx context.Context, msg Message) error {
 		Html:    msg.HTML,
 		Tags:    []resend.Tag{{Name: "kind", Value: string(msg.Kind)}},
 	}
-	resp, err := r.client.Emails.SendWithOptions(ctx, req, &resend.SendEmailOptions{IdempotencyKey: msg.IdempotencyKey})
-	if err != nil {
+	var payloadConflict bool
+	sendCtx := context.WithValue(ctx, resendConflictKey{}, &payloadConflict)
+	resp, err := r.client.Emails.SendWithOptions(sendCtx, req, &resend.SendEmailOptions{IdempotencyKey: msg.IdempotencyKey})
+	if err != nil && payloadConflict {
+		r.logger.InfoContext(ctx, "billing_email_idempotency_conflict",
+			slog.String("kind", string(msg.Kind)),
+			slog.String("billing_account_id", msg.BillingAccountID),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+			slog.String("outcome", resendPayloadConflictCode))
+		return ErrIdempotencyPayloadConflict
+	}
+	if err != nil || resp == nil || strings.TrimSpace(resp.Id) == "" {
+		kind := "provider"
+		if err != nil {
+			kind = errorKind(ctx, err)
+		}
 		r.logger.WarnContext(ctx, "billing_email_failed",
 			slog.String("kind", string(msg.Kind)),
 			slog.String("billing_account_id", msg.BillingAccountID),
 			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
-			slog.String("error_kind", errorKind(ctx, err)))
+			slog.String("error_kind", kind))
 		return fmt.Errorf("send %s email: %w", msg.Kind, errSendFailed)
 	}
 	r.logger.InfoContext(ctx, "billing_email_sent",
@@ -114,8 +134,11 @@ func (r *Resend) Send(ctx context.Context, msg Message) error {
 	return nil
 }
 
-// errSendFailed is the error that callers see; the provider error stays in
-// the log.
+// ErrIdempotencyPayloadConflict means Resend already used the key with a
+// different payload. The current request did not send another email.
+var ErrIdempotencyPayloadConflict = errors.New("email idempotency key used with a different payload")
+
+// errSendFailed is the sanitized error for other send failures.
 var errSendFailed = errors.New("email delivery failed")
 
 // errorKind classifies a Resend error for the log. The log never carries the

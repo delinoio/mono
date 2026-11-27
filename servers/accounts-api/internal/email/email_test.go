@@ -109,8 +109,100 @@ func TestResendSend(t *testing.T) {
 			t.Fatalf("log contains %q: %s", secret, logs.String())
 		}
 	}
-	if !strings.Contains(logs.String(), `"billing_email_sent"`) || !strings.Contains(logs.String(), `"kind":"invitation"`) {
+	if !strings.Contains(logs.String(), `"billing_email_sent"`) || !strings.Contains(logs.String(), `"kind":"invitation"`) || !strings.Contains(logs.String(), `"resend_email_id":"email-1"`) {
 		t.Fatalf("log = %s", logs.String())
+	}
+}
+
+func TestResendUnusableAcknowledgement(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"no content", http.StatusNoContent, ""},
+		{"null", http.StatusOK, "null"},
+		{"missing ID", http.StatusOK, `{"private":"provider-only-text"}`},
+		{"empty ID", http.StatusOK, `{"id":""}`},
+		{"blank ID", http.StatusOK, `{"id":" \t "}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				if tc.body != "" {
+					_, _ = w.Write([]byte(tc.body))
+				}
+			}))
+			defer srv.Close()
+			var logs bytes.Buffer
+			sender, err := email.NewResend(email.ResendConfig{
+				APIKey: "k", From: "billing@example.com", BaseURL: srv.URL,
+				Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = sender.Send(context.Background(), email.Message{
+				Kind: email.KindInvitation, To: "recipient@example.com", Text: "private-body",
+			})
+			if err == nil || err.Error() != "send invitation email: email delivery failed" {
+				t.Fatalf("Send() error = %v", err)
+			}
+			log := logs.String()
+			if !strings.Contains(log, `"msg":"billing_email_failed"`) || !strings.Contains(log, `"error_kind":"provider"`) {
+				t.Fatalf("missing provider failure: %s", log)
+			}
+			for _, excluded := range []string{"billing_email_sent", "provider-only-text", "recipient@example.com", "private-body"} {
+				if strings.Contains(log, excluded) {
+					t.Errorf("unexpected %q in log", excluded)
+				}
+			}
+		})
+	}
+}
+
+func TestResendIdempotencyConflict(t *testing.T) {
+	const code = "invalid_idempotent_request"
+	for _, tc := range []struct {
+		name     string
+		status   int
+		body     string
+		conflict bool
+	}{
+		{"matching status and name", http.StatusConflict, `{"name":"` + code + `","message":"recipient@example.com"}`, true},
+		{"concurrent", http.StatusConflict, `{"name":"concurrent_idempotent_requests","message":"recipient@example.com"}`, false},
+		{"message only", http.StatusConflict, `{"name":"unknown","message":"` + code + ` recipient@example.com"}`, false},
+		{"wrong status", http.StatusBadRequest, `{"name":"` + code + `","message":"recipient@example.com"}`, false},
+		{"oversized response", http.StatusConflict, `{"name":"` + code + `","message":"` + strings.Repeat("x", 4096) + `"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			var logs bytes.Buffer
+			sender, err := email.NewResend(email.ResendConfig{
+				APIKey: "k", From: "billing@example.com", BaseURL: srv.URL,
+				Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = sender.Send(context.Background(), email.Message{Kind: "notice", To: "recipient@example.com"})
+			if tc.conflict {
+				if !errors.Is(err, email.ErrIdempotencyPayloadConflict) || !strings.Contains(logs.String(), `"outcome":"`+code+`"`) {
+					t.Fatalf("Send() = %v, logs = %s", err, logs.String())
+				}
+			} else if err == nil || err.Error() != "send notice email: email delivery failed" ||
+				!strings.Contains(logs.String(), `"error_kind":"provider"`) {
+				t.Fatalf("Send() = %v, logs = %s", err, logs.String())
+			}
+			if strings.Contains(logs.String(), "recipient@example.com") || strings.Contains(logs.String(), "billing_email_sent") {
+				t.Fatalf("unexpected send or recipient details: %s", logs.String())
+			}
+		})
 	}
 }
 
