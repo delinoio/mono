@@ -1769,6 +1769,24 @@ export function createMockTransport(
             case "resources":
               next.resources = input.resources;
               break;
+            case "resources.vcpu_count":
+              next.resources = {
+                ...(next.resources ?? create(ResourcesSchema)),
+                vcpuCount: input.resources?.vcpuCount ?? 0,
+              };
+              break;
+            case "resources.memory_mib":
+              next.resources = {
+                ...(next.resources ?? create(ResourcesSchema)),
+                memoryMib: input.resources?.memoryMib ?? 0n,
+              };
+              break;
+            case "resources.disk_gib":
+              next.resources = {
+                ...(next.resources ?? create(ResourcesSchema)),
+                diskGib: input.resources?.diskGib ?? 0n,
+              };
+              break;
             case "network_mode":
               next.networkMode = input.networkMode;
               break;

@@ -25,7 +25,7 @@ import {
   createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
-import type { MessageInitShape } from "@bufbuild/protobuf";
+import type { DescMethodUnary, MessageInitShape } from "@bufbuild/protobuf";
 import {
   createConnectQueryKey,
   createQueryOptions,
@@ -60,6 +60,7 @@ import {
 } from "@delino/sandrun-protos/v1/organization_pb";
 import {
   OwnSandLinkService,
+  type RemoveOwnSandLinkRequest,
   type SetOwnSandLinkRequest,
 } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import {
@@ -316,6 +317,49 @@ describe("entry URLs during session restoration", () => {
     },
   );
 
+  test("discards replacement invitation fragments while signed out", async () => {
+    const { transport, calls } = gatedTransport(
+      MemberService.method.acceptInvitation.name,
+    );
+    const visit = openEntry(invitationUrl, transport, false);
+    expect(screen.getByText(invitationNotice)).toBeTruthy();
+
+    await act(async () => {
+      window.history.replaceState(null, "", "#secret=sri_replacement_fixture");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+
+    visit.expectScrubbed(invitationPath);
+    expect(screen.getByText(invitationNotice)).toBeTruthy();
+    expect(calls).toHaveLength(0);
+
+    visit.resolveAuth(true);
+
+    expect(
+      screen.getByLabelText<HTMLInputElement>("Invitation link or secret")
+        .value,
+    ).toBe("");
+    visit.expectScrubbed(invitationPath);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("preserves fragments after the address leaves the signed-out invitation route", async () => {
+    const visit = openEntry(invitationUrl, createMockTransport(), false);
+    expect(screen.getByText(invitationNotice)).toBeTruthy();
+
+    await act(async () => {
+      // Change the address before the router has rendered the new route.
+      window.history.replaceState(null, "", "/?source=fixture#other-route");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    visit.expectScrubbed("/?source=fixture#other-route");
+
+    await act(async () => {
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(screen.queryByText(invitationNotice)).toBeNull();
+  });
+
   test("fills the invitation form after sign-in and accepts only on submit", async () => {
     const { transport, calls } = gatedTransport(
       MemberService.method.acceptInvitation.name,
@@ -485,6 +529,7 @@ describe("organization member pagination", () => {
     const updateRole = rs.fn(memberApi.updateMemberRole);
     const remove = rs.fn(memberApi.removeMember);
     const transfer = rs.fn(organizationApi.transferOwnership);
+    let refreshError: ConnectError | undefined;
     const roster = createRouterTransport((router) => {
       router.service(MemberService, {
         async listMembers(req) {
@@ -492,6 +537,7 @@ describe("organization member pagination", () => {
           if (req.organizationId !== MOCK_IDS.acme) {
             return memberApi.listMembers(req);
           }
+          if (refreshError) throw refreshError;
           if (req.pageToken === "p2") await beforeContinuation;
           if (req.pageToken === failToken) {
             failToken = undefined;
@@ -537,7 +583,43 @@ describe("organization member pagination", () => {
           : mock.unary(method, ...args);
       },
     };
-    return { transport, lists, updateRole, remove, transfer };
+    return {
+      transport,
+      lists,
+      members,
+      updateRole,
+      remove,
+      transfer,
+      setRefreshError(error: ConnectError | undefined) {
+        refreshError = error;
+      },
+    };
+  }
+
+  async function refreshRoster(client: QueryClient) {
+    await act(async () => {
+      await invalidateServices(client, MemberService);
+    });
+  }
+
+  function transferConfirmation() {
+    return screen.queryByRole("alertdialog", {
+      name: `Make ${laterMemberId} the owner?`,
+    });
+  }
+
+  async function openTransfer() {
+    const picker = await screen.findByRole<HTMLButtonElement>("combobox", {
+      name: "New owner",
+    });
+    await waitFor(() => {
+      expect(picker.disabled).toBe(false);
+      expect(screen.queryByText("Loading more members")).toBeNull();
+    });
+    await click(picker);
+    await click(await screen.findByRole("option", { name: laterMemberId }));
+    await click(screen.getByRole("button", { name: "Transfer" }));
+    expect(transferConfirmation()).toBeTruthy();
   }
 
   function memberRows() {
@@ -632,6 +714,86 @@ describe("organization member pagination", () => {
       }),
     );
     expect(tokens(lists)).toEqual(["", "p2", "", "p2"]);
+  });
+
+  test.each(["absent", "ineligible", "permission denied"] as const)(
+    "requires a new ownership confirmation after the roster recovers from %s",
+    async (reason) => {
+      const { transport, members, transfer, setRefreshError } =
+        await rosterFixture();
+      const client = renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+        transport,
+      });
+      await openTransfer();
+
+      const member = members.at(-1)!;
+      switch (reason) {
+        case "absent":
+          members.pop();
+          break;
+        case "ineligible":
+          member.role = Role.OWNER;
+          break;
+        case "permission denied":
+          setRefreshError(
+            new ConnectError("access revoked", Code.PermissionDenied),
+          );
+          break;
+      }
+      await refreshRoster(client);
+      await waitFor(() => expect(transferConfirmation()).toBeNull());
+      expect(
+        screen.getByRole<HTMLButtonElement>("button", { name: "Transfer" })
+          .disabled,
+      ).toBe(true);
+
+      if (reason === "absent") members.push(member);
+      member.role = Role.MEMBER;
+      setRefreshError(undefined);
+      await refreshRoster(client);
+
+      await waitFor(() => {
+        expect(transferConfirmation()).toBeNull();
+        expect(
+          screen.getByRole<HTMLButtonElement>("button", { name: "Transfer" })
+            .disabled,
+        ).toBe(false);
+      });
+      expect(transfer).not.toHaveBeenCalled();
+
+      await click(screen.getByRole("button", { name: "Transfer" }));
+      await click(
+        within(transferConfirmation()!).getByRole("button", {
+          name: "Transfer ownership",
+        }),
+      );
+      expect(transfer).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          organizationId: MOCK_IDS.acme,
+          userId: laterMemberId,
+        }),
+      );
+    },
+  );
+
+  test("keeps an ownership confirmation open across an eligible refresh until Escape", async () => {
+    const { transport, lists, transfer } = await rosterFixture();
+    const client = renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      transport,
+    });
+    await openTransfer();
+    const dialog = transferConfirmation()!;
+
+    await refreshRoster(client);
+    expect(tokens(lists)).toEqual(["", "p2", "", "p2"]);
+    expect(transferConfirmation()).toBe(dialog);
+
+    await act(async () => fireEvent.keyDown(dialog, { key: "Escape" }));
+    await waitFor(() => expect(transferConfirmation()).toBeNull());
+    await refreshRoster(client);
+    expect(tokens(lists)).toEqual(["", "p2", "", "p2", "", "p2"]);
+    expect(transferConfirmation()).toBeNull();
+    expect(transfer).not.toHaveBeenCalled();
   });
 
   test("shares loaded pages and retries a failed continuation from either view", async () => {
@@ -866,9 +1028,10 @@ describe("OwnSand link", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  function renderLinkReplacement() {
+  function renderLinkFixture() {
     const mock = createMockTransport();
     let target: string | undefined = MOCK_IDS.ownsandAcme;
+    let createTime = { seconds: 1_700_000_000n, nanos: 0 };
     const readLink = rs.fn(() => {
       if (target === undefined) return {};
       return {
@@ -877,15 +1040,22 @@ describe("OwnSand link", () => {
           ownsandOrganizationId: target,
           state: OwnSandLinkState.ACTIVE,
           credentialSet: true,
+          createTime,
         },
       };
     });
     const writes: SetOwnSandLinkRequest[] = [];
+    const removals: RemoveOwnSandLinkRequest[] = [];
     const linkTransport = createRouterTransport((router) => {
       router.service(OwnSandLinkService, {
         getOwnSandLink: readLink,
         setOwnSandLink(request) {
           writes.push(request);
+          return {};
+        },
+        removeOwnSandLink(request) {
+          removals.push(request);
+          target = undefined;
           return {};
         },
       });
@@ -902,9 +1072,11 @@ describe("OwnSand link", () => {
     });
     return {
       writes,
+      removals,
       readLink,
-      async refresh(next: string | undefined) {
+      async refresh(next: string | undefined, creationNanos = 0) {
         target = next;
+        createTime = { ...createTime, nanos: creationNanos };
         await act(() => invalidateServices(queryClient, OwnSandLinkService));
       },
     };
@@ -931,7 +1103,7 @@ describe("OwnSand link", () => {
   ] as const)(
     "disables a replacement opening when the link is %s",
     async (_, next) => {
-      const { writes, refresh } = renderLinkReplacement();
+      const { writes, refresh } = renderLinkFixture();
       const { dialog, input, submit } = await openReplacement("osk_stale");
 
       await refresh(next);
@@ -971,7 +1143,7 @@ describe("OwnSand link", () => {
   );
 
   test("replaces the key for the original organization after an unchanged refresh", async () => {
-    const { writes, readLink, refresh } = renderLinkReplacement();
+    const { writes, readLink, refresh } = renderLinkFixture();
     const { input, submit } = await openReplacement("osk_replacement");
 
     await refresh(MOCK_IDS.ownsandAcme);
@@ -999,6 +1171,44 @@ describe("OwnSand link", () => {
     expect(dialog.textContent).toContain("deletes every runner");
     await click(within(dialog).getByRole("button", { name: "Cancel" }));
     expect(screen.getByRole("button", { name: "Remove link" })).toBeTruthy();
+  });
+
+  test.each([
+    ["removed", undefined, 0],
+    ["changed", MOCK_IDS.ownsandNorthwind, 0],
+    ["recreated", MOCK_IDS.ownsandAcme, 1],
+  ] as const)(
+    "clears a removal confirmation when the link is %s",
+    async (_, next, creationNanos) => {
+      const { removals, refresh } = renderLinkFixture();
+      await click(await screen.findByRole("button", { name: "Remove link" }));
+      await screen.findByRole("alertdialog");
+
+      await refresh(next, creationNanos);
+      await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+      expect(removals).toHaveLength(0);
+
+      await refresh(MOCK_IDS.ownsandAcme);
+      const remove = await screen.findByRole("button", { name: "Remove link" });
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(removals).toHaveLength(0);
+      await click(remove);
+      const fresh = await screen.findByRole("alertdialog");
+      await click(within(fresh).getByRole("button", { name: "Remove link" }));
+      expect(removals).toMatchObject([{ organizationId: MOCK_IDS.acme }]);
+    },
+  );
+
+  test("removes the OwnSand link once after an unchanged refresh", async () => {
+    const { removals, refresh } = renderLinkFixture();
+    await click(await screen.findByRole("button", { name: "Remove link" }));
+
+    await refresh(MOCK_IDS.ownsandAcme);
+
+    const dialog = await screen.findByRole("alertdialog");
+    await click(within(dialog).getByRole("button", { name: "Remove link" }));
+    expect(await screen.findByText("OwnSand is not linked")).toBeTruthy();
+    expect(removals).toMatchObject([{ organizationId: MOCK_IDS.acme }]);
   });
 });
 
@@ -2614,24 +2824,100 @@ describe("setup guidance", () => {
     empty: (
       "ListGitHubInstallations" | "ListAgentIntegrations" | "ListRunnerProfiles"
     )[],
+    linkState = OwnSandLinkState.ACTIVE,
   ): Transport {
     const mock = createMockTransport();
-    const emptyLists = createRouterTransport((router) => {
+    const fixture = createRouterTransport((router) => {
+      router.service(OwnSandLinkService, {
+        getOwnSandLink: ({ organizationId }) => ({
+          link: { organizationId, state: linkState },
+        }),
+      });
       router.service(GitHubService, { listGitHubInstallations: () => ({}) });
       router.service(AgentIntegrationService, {
         listAgentIntegrations: () => ({}),
       });
       router.service(RunnerProfileService, { listRunnerProfiles: () => ({}) });
+      router.service(WorkService, { listRunners: () => ({}) });
     });
-    const emptyMethods = new Set<string>(empty);
+    const fixtureMethods = new Set<string>([
+      ...empty,
+      "GetOwnSandLink",
+      "ListRunners",
+    ]);
     return {
       ...mock,
       unary(method, ...args) {
-        const transport = emptyMethods.has(method.name) ? emptyLists : mock;
+        const transport = fixtureMethods.has(method.name) ? fixture : mock;
         return transport.unary(method, ...args);
       },
     };
   }
+
+  test.each([
+    [
+      OwnSandLinkState.INVALID,
+      false,
+      "Replace OwnSand API key",
+      "integrations",
+    ],
+    [OwnSandLinkState.INVALID, true, "Replace OwnSand API key", "integrations"],
+    [
+      OwnSandLinkState.ACTIVE,
+      false,
+      "Connect GitHub or create an agent integration",
+      "integrations",
+    ],
+    [OwnSandLinkState.ACTIVE, true, "Create a runner profile", "profiles"],
+  ] as const)(
+    "shows the next action with link state %s and GitHub connected: %s",
+    async (linkState, hasGitHub, actionName, destination) => {
+      const emptyLists: Parameters<typeof linkedSetupTransport>[0] = [
+        "ListAgentIntegrations",
+        "ListRunnerProfiles",
+      ];
+      if (!hasGitHub) emptyLists.push("ListGitHubInstallations");
+      const transport = linkedSetupTransport(emptyLists, linkState);
+      const client = renderConsole(acmePath, { transport });
+      const setupMethods: DescMethodUnary[] = [
+        GitHubService.method.listGitHubInstallations,
+        AgentIntegrationService.method.listAgentIntegrations,
+        RunnerProfileService.method.listRunnerProfiles,
+      ];
+      for (const method of setupMethods) {
+        await waitFor(() =>
+          expect(
+            client.getQueryState(
+              createConnectQueryKey({
+                schema: method,
+                input: { organizationId: MOCK_IDS.acme, pageSize: 1 },
+                transport,
+                cardinality: "finite",
+              }),
+            )?.status,
+          ).toBe("success"),
+        );
+      }
+
+      const checklist = await screen.findByRole("region", {
+        name: "Set up SandRun",
+      });
+      const ownSandStep = within(checklist)
+        .getByText("Link OwnSand")
+        .closest("li");
+      expect(ownSandStep?.getAttribute("data-done")).toBe(
+        String(linkState === OwnSandLinkState.ACTIVE),
+      );
+      const href = `${acmePath}/${destination}`;
+      const action = within(checklist).getByRole("link", { name: actionName });
+      expect(action.getAttribute("href")).toBe(href);
+
+      await click(screen.getByRole("link", { name: "Runners" }));
+      expect(await screen.findByText("No runners match")).toBeTruthy();
+      const emptyAction = await screen.findByRole("link", { name: actionName });
+      expect(emptyAction.getAttribute("href")).toBe(href);
+    },
+  );
 
   test("offers a work source when both lists are empty and profiles fail", async () => {
     const mock = linkedSetupTransport([

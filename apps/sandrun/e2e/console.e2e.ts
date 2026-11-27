@@ -38,6 +38,46 @@ describe("sign-in", () => {
     });
   }
 
+  test("clears a replacement invitation fragment while signed out", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const path = "/invitations/accept?source=fixture";
+    const notice = screen.getByText(
+      "Sign in, then open the invitation link again.",
+    );
+    await app.open(path);
+    await expect(notice).toBeVisible();
+
+    const historyLength = await browser.evaluate(async () => {
+      const length = window.history.length;
+      const changed = new Promise<void>((resolve) => {
+        window.addEventListener("hashchange", () => resolve(), { once: true });
+      });
+      window.location.replace("#secret=sri_replacement_fixture");
+      await changed;
+      return length;
+    });
+
+    await expect(browser).toHaveURL(path);
+    await expect(notice).toBeVisible();
+    expect(
+      await browser.evaluate(() => ({
+        historyLength: window.history.length,
+        historyState: window.history.state,
+        localStorageLength: window.localStorage.length,
+        sessionStorageLength: window.sessionStorage.length,
+      })),
+    ).toEqual({
+      historyLength,
+      historyState: null,
+      localStorageLength: 0,
+      sessionStorageLength: 0,
+    });
+    await app.screenshot("signed-out-invitation-fragment-cleared");
+  });
+
   test("returns to sign-in from a direct mock callback visit", async ({
     app,
     browser,
@@ -403,11 +443,23 @@ describe("organization member pagination", () => {
     await picker.tap();
     await expect(screen.getByRole("option", "Mina Kim")).toBeHidden();
     await screen.getByRole("option", "Nora Lee").tap();
-    await screen.getByRole("button", "Transfer").tap();
-    await expect(
-      screen.getByRole("alertdialog", "Make Nora Lee the owner?"),
-    ).toBeVisible();
-    await screen.getByRole("button", "Transfer ownership").tap();
+    const transfer = screen.getByRole("button", "Transfer");
+    const confirmation = screen.getByRole(
+      "alertdialog",
+      "Make Nora Lee the owner?",
+    );
+    await transfer.tap();
+    await expect(confirmation).toBeVisible();
+    await confirmation.getByRole("button", "Cancel").tap();
+    await expect(confirmation).toBeHidden();
+
+    await transfer.tap();
+    await expect(confirmation).toBeVisible();
+    await browser.keyboard.press("Escape");
+    await expect(confirmation).toBeHidden();
+
+    await transfer.tap();
+    await confirmation.getByRole("button", "Transfer ownership").tap();
     await expect(
       screen.getByRole("heading", "Transfer ownership"),
     ).toBeHidden();
@@ -539,6 +591,48 @@ describe("overview", () => {
     await expect(
       screen.getByRole("link", "Go to integrations"),
     ).toHaveAttribute("href", `/orgs/${NORTHWIND}/integrations`);
+  });
+});
+
+describe("setup with an invalid OwnSand link", () => {
+  const organizationPath = `/orgs/${NORTHWIND}`;
+  const integrationsPath = `${organizationPath}/integrations`;
+
+  test("keeps OwnSand incomplete on Overview", async ({ app, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(organizationPath);
+
+    const checklist = screen.getByRole("region", "Set up SandRun");
+    const ownSandStep = checklist.getByRole("listitem").filter({
+      hasText: "Link OwnSand",
+    });
+    await expect(ownSandStep).toHaveAttribute("data-done", "false");
+    await expect(
+      ownSandStep.getByRole("link", "Replace OwnSand API key"),
+    ).toHaveAttribute("href", integrationsPath);
+    await app.screenshot("invalid-ownsand-overview");
+  });
+
+  test("opens the organization's Integrations from empty Runners", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`${organizationPath}/runners`);
+
+    await expect(screen.getByText("No runners match")).toBeVisible();
+    const action = screen.getByRole("link", "Replace OwnSand API key");
+    await expect(action).toBeVisible();
+    await app.screenshot("invalid-ownsand-runners");
+    await action.tap();
+
+    await expect(browser).toHaveURL(integrationsPath);
+    await expect(
+      screen.getByRole("heading", "Integrations", { level: 1 }),
+    ).toBeVisible();
   });
 });
 
@@ -719,6 +813,28 @@ describe("requests", () => {
 });
 
 describe("integrations", () => {
+  test("removes the OwnSand link only after confirmation", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+
+    const dialog = screen.getByRole("alertdialog", "Remove the OwnSand link?");
+    const remove = screen.getByRole("button", "Remove link", { exact: true });
+    await remove.tap();
+    await expect(dialog).toBeVisible();
+    await browser.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+
+    await remove.tap();
+    await dialog.getByRole("button", "Remove link").tap();
+    await expect(dialog).toBeHidden();
+    await expect(screen.getByText("OwnSand is not linked")).toBeVisible();
+  });
+
   test("opens management actions for an integration on the next page", async ({
     app,
     screen,
@@ -1272,11 +1388,17 @@ describe("runner profiles", () => {
     await dialog.getByLabel("Name").tap();
     await browser.keyboard.press("ControlOrMeta+A");
     await browser.keyboard.type("linux-build-retry");
+    await dialog.getByLabel("Memory (MiB)").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("12288");
     await dialog.getByRole("button", "Save changes").tap();
     await expect(dialog).toBeHidden();
     await expect(
       screen.getByLabel("runs-on label of linux-build-retry"),
     ).toHaveText("sandrun-linux-build-retry");
+    await expect(
+      screen.getByRole("listitem").filter({ hasText: "linux-build-retry ·" }),
+    ).toContainText("4 vCPU · 12288 MiB · 64 GiB");
   });
 
   test("validates whole milliseconds on click and Enter", async ({

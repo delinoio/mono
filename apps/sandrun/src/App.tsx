@@ -45,6 +45,7 @@ import { SettingsPage } from "./pages/settings.tsx";
 import {
   Link,
   type OrgRouteId,
+  parseRoute,
   RouteId,
   RouterProvider,
   useRouter,
@@ -211,8 +212,20 @@ function EntryRoute({
   }, [id]);
 
   useLayoutEffect(() => {
-    if (signedOut) setInput({});
-  }, [signedOut]);
+    if (!signedOut) return;
+    setInput({});
+    if (id !== RouteId.Invitation) return;
+
+    const discardInvitation = () => {
+      const { location, history } = window;
+      if (parseRoute(location.pathname).id === RouteId.Invitation) {
+        takeSecretFromAddress(location, history);
+      }
+    };
+    window.addEventListener("hashchange", discardInvitation);
+    discardInvitation();
+    return () => window.removeEventListener("hashchange", discardInvitation);
+  }, [id, signedOut]);
 
   if (isLoading || input === undefined) return null;
   if (signedOut) {

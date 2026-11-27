@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useQuery } from "@connectrpc/connect-query";
 import { AgentIntegrationService } from "@delino/sandrun-protos/v1/agent_integration_pb";
+import { OwnSandLinkState } from "@delino/sandrun-protos/v1/common_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
 import { OwnSandLinkService } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import { RunnerProfileService } from "@delino/sandrun-protos/v1/runner_profile_pb";
@@ -16,7 +17,7 @@ export enum SetupStep {
 }
 
 interface SetupState {
-  linked: boolean | undefined;
+  linkState: OwnSandLinkState | null | undefined;
   hasGitHubInstallation: boolean | undefined;
   hasAgentIntegration: boolean | undefined;
   hasRunnerProfile: boolean | undefined;
@@ -24,8 +25,8 @@ interface SetupState {
 
 /** Returns the next step when its prerequisites are known. */
 export function nextSetupStep(state: SetupState): SetupStep | undefined {
-  if (state.linked === undefined) return undefined;
-  if (!state.linked) return SetupStep.LinkOwnSand;
+  if (state.linkState === undefined) return undefined;
+  if (state.linkState !== OwnSandLinkState.ACTIVE) return SetupStep.LinkOwnSand;
   if (
     state.hasGitHubInstallation === false &&
     state.hasAgentIntegration === false
@@ -41,14 +42,14 @@ export function nextSetupStep(state: SetupState): SetupStep | undefined {
   return undefined;
 }
 
-const STEP_TEXT: Record<
-  Exclude<SetupStep, SetupStep.Done>,
-  {
-    title: string;
-    detail: string;
-    route: RouteId.Integrations | RouteId.Profiles;
-  }
-> = {
+interface StepText {
+  title: string;
+  detail: string;
+  route: RouteId.Integrations | RouteId.Profiles;
+  action?: string;
+}
+
+const STEP_TEXT: Record<Exclude<SetupStep, SetupStep.Done>, StepText> = {
   [SetupStep.LinkOwnSand]: {
     title: "Link OwnSand",
     detail:
@@ -69,13 +70,20 @@ const STEP_TEXT: Record<
   },
 };
 
+const INVALID_LINK_TEXT: StepText = {
+  ...STEP_TEXT[SetupStep.LinkOwnSand],
+  action: "Replace OwnSand API key",
+  detail:
+    "OwnSand rejected the saved API key. An admin must replace it to resume dispatch.",
+};
+
 const ORDER = [
   SetupStep.LinkOwnSand,
   SetupStep.ConnectWorkSource,
   SetupStep.CreateRunnerProfile,
 ] as const;
 
-function useNextSetupStep(organizationId: string): SetupStep | undefined {
+function useSetupGuidance(organizationId: string) {
   const link = useQuery(OwnSandLinkService.method.getOwnSandLink, {
     organizationId,
   });
@@ -91,40 +99,48 @@ function useNextSetupStep(organizationId: string): SetupStep | undefined {
     organizationId,
     pageSize: 1,
   });
-  return nextSetupStep({
-    linked: link.data && link.data.link !== undefined,
+  const linkState = link.data && (link.data.link?.state ?? null);
+  const step = nextSetupStep({
+    linkState,
     hasGitHubInstallation:
       installations.data && installations.data.installations.length > 0,
     hasAgentIntegration:
       integrations.data && integrations.data.integrations.length > 0,
     hasRunnerProfile: profiles.data && profiles.data.profiles.length > 0,
   });
+  if (step === undefined || step === SetupStep.Done) return undefined;
+  const text =
+    linkState === OwnSandLinkState.INVALID
+      ? INVALID_LINK_TEXT
+      : STEP_TEXT[step];
+  return { step, text };
 }
 
 /** The setup checklist of the overview, while a step is not done. */
 export function SetupGuide({ organizationId }: { organizationId: string }) {
-  const next = useNextSetupStep(organizationId);
-  if (next === undefined || next === SetupStep.Done) return null;
-  const nextIndex = ORDER.indexOf(next);
+  const guidance = useSetupGuidance(organizationId);
+  if (guidance === undefined) return null;
+  const nextIndex = ORDER.indexOf(guidance.step);
   return (
     <section className="section" aria-labelledby="setup-title">
       <h2 id="setup-title">Set up SandRun</h2>
       <ol className="setup-steps">
         {ORDER.map((step, index) => {
-          const text = STEP_TEXT[step];
+          const current = index === nextIndex;
+          const text = current ? guidance.text : STEP_TEXT[step];
           const done = index < nextIndex;
           return (
             <li key={step} className="setup-step" data-done={done}>
               <span className="muted">{done ? "Done" : `${index + 1}.`}</span>
               <span>
                 <span className="setup-step-title">{text.title}</span>
-                {step === next ? (
+                {current ? (
                   <>
                     <br />
                     <span className="muted">{text.detail}</span>
                     <br />
                     <Link to={orgPath(text.route, organizationId)}>
-                      {text.title}
+                      {text.action ?? text.title}
                     </Link>
                   </>
                 ) : null}
@@ -149,18 +165,19 @@ export function SetupEmpty({
   title: string;
   children?: React.ReactNode;
 }) {
-  const next = useNextSetupStep(organizationId);
-  if (next === undefined || next === SetupStep.Done) {
+  const guidance = useSetupGuidance(organizationId);
+  if (guidance === undefined) {
     return <Empty title={title}>{children}</Empty>;
   }
-  const text = STEP_TEXT[next];
+  const { text } = guidance;
+  const action = text.action ?? text.title;
   return (
     <div className="empty">
       <p className="empty-title">{title}</p>
       <p className="muted">
-        Next step: {text.title.toLowerCase()}. {text.detail}
+        Next step: {action.toLowerCase()}. {text.detail}
       </p>
-      <Link to={orgPath(text.route, organizationId)}>{text.title}</Link>
+      <Link to={orgPath(text.route, organizationId)}>{action}</Link>
     </div>
   );
 }
