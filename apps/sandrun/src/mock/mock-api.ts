@@ -1255,6 +1255,19 @@ export function createMockTransport(
             k.revokedAt = ts();
           }
         }
+        for (const r of org.requests) {
+          if (
+            r.kind === WorkloadKind.DEV_SESSION &&
+            r.state === RequestState.QUEUED &&
+            r.ownerUserId === m.userId
+          )
+            endRequest(
+              org,
+              r,
+              RequestState.CANCELED,
+              RequestEndReason.MEMBER_REMOVED,
+            );
+        }
         audit(
           org,
           AuditAction.MEMBER_REMOVED,

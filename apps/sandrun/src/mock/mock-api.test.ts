@@ -11,11 +11,108 @@ import {
   AuditService,
   AuditTargetKind,
 } from "@delino/sandrun-protos/v1/audit_pb";
-import { AgentVendor } from "@delino/sandrun-protos/v1/common_pb";
+import {
+  AgentVendor,
+  RequestEndReason,
+  RequestState,
+  Role,
+} from "@delino/sandrun-protos/v1/common_pb";
+import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
+import { MemberService } from "@delino/sandrun-protos/v1/member_pb";
+import { OrganizationService } from "@delino/sandrun-protos/v1/organization_pb";
 import { WorkService } from "@delino/sandrun-protos/v1/work_pb";
 import { expect, rs, test } from "@rstest/core";
-import { createMockTransport, MOCK_IDS } from "./mock-api.ts";
+import { createMockTransport, MOCK_IDS, MOCK_USER } from "./mock-api.ts";
+
+test("ends the departing member's queued dev session and publishes one update", async () => {
+  const transport = createMockTransport();
+  const organizationId = MOCK_IDS.acme;
+  const members = createClient(MemberService, transport);
+  const organizations = createClient(OrganizationService, transport);
+  const sessions = createClient(DevSessionService, transport);
+  const work = createClient(WorkService, transport);
+  const getSession = (devSessionId: string) =>
+    sessions.getDevSession({ organizationId, devSessionId });
+  const getRequest = (requestId: string) =>
+    work.getRequest({ organizationId, requestId });
+
+  const { invitationSecret } = await members.createInvitation({
+    organizationId,
+    role: Role.ADMIN,
+  });
+  await organizations.transferOwnership({
+    organizationId,
+    userId: "mock-user-ada",
+  });
+  const queuedJob = await getRequest(MOCK_IDS.queuedJob);
+  expect(queuedJob.request?.state).toBe(RequestState.QUEUED);
+  const endedSession = await getSession(MOCK_IDS.devSessionOther);
+  expect(endedSession.devSession?.state).toBe(RequestState.ENDED);
+
+  const watch = new AbortController();
+  const stream = work
+    .watchQueue({ organizationId }, { signal: watch.signal })
+    [Symbol.asyncIterator]();
+  try {
+    const initialRequestIds: string[] = [];
+    for (;;) {
+      const { value, done } = await stream.next();
+      if (done) throw new Error("Expected a complete snapshot");
+      if (value.event.case === "snapshotComplete") break;
+      if (value.event.case === "request")
+        initialRequestIds.push(value.event.value.requestId);
+    }
+    expect(initialRequestIds).toContain(MOCK_IDS.queuedDev);
+
+    await members.removeMember({ organizationId, userId: MOCK_USER });
+    await expect(getSession(MOCK_IDS.queuedDev)).rejects.toMatchObject({
+      code: Code.NotFound,
+    });
+    await expect(getRequest(MOCK_IDS.queuedDev)).rejects.toMatchObject({
+      code: Code.NotFound,
+    });
+    const { member } = await members.acceptInvitation({ invitationSecret });
+    expect(member).toMatchObject({ userId: MOCK_USER, role: Role.ADMIN });
+
+    const terminal = {
+      state: RequestState.CANCELED,
+      endReason: RequestEndReason.MEMBER_REMOVED,
+    };
+    const { devSession } = await getSession(MOCK_IDS.queuedDev);
+    const { request } = await getRequest(MOCK_IDS.queuedDev);
+    expect(devSession).toMatchObject(terminal);
+    expect(request).toMatchObject(terminal);
+    expect(request?.endedAt).toBeDefined();
+    expect(devSession?.endedAt).toEqual(request?.endedAt);
+    expect(await getRequest(MOCK_IDS.queuedJob)).toEqual(queuedJob);
+    expect(await getSession(MOCK_IDS.devSessionOther)).toEqual(endedSession);
+
+    // Publish another update to check that removal emitted exactly one.
+    const { request: canceledAgent } = await work.cancelRequest({
+      organizationId,
+      requestId: MOCK_IDS.queuedAgent,
+    });
+    for (const update of [request, canceledAgent]) {
+      await expect(stream.next()).resolves.toMatchObject({
+        done: false,
+        value: { event: { case: "request", value: update } },
+      });
+    }
+  } finally {
+    watch.abort();
+    await stream.return?.();
+  }
+
+  const rejoinedRequestIds: string[] = [];
+  for await (const { event } of work.watchQueue({ organizationId })) {
+    if (event.case === "snapshotComplete") break;
+    if (event.case === "request")
+      rejoinedRequestIds.push(event.value.requestId);
+  }
+  expect(rejoinedRequestIds).toContain(MOCK_IDS.queuedJob);
+  expect(rejoinedRequestIds).not.toContain(MOCK_IDS.queuedDev);
+});
 
 const invalidInstallationState = {
   code: Code.FailedPrecondition,
