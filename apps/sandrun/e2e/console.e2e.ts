@@ -1577,11 +1577,41 @@ describe("invitations", () => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
     await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
-    await screen.getByLabel("Invitation link or secret").tap();
-    await browser.keyboard.type(INVITATION_SECRET);
-    await screen.getByRole("button", "Continue").tap();
+    const input = screen.getByLabel("Invitation link or secret");
+    const toggle = screen.getByRole("button", "Show invitation");
+    const maskedInput = browser.locator('main form input[type="password"]');
+    const revealedInput = browser.locator('main form input[type="text"]');
+    await expect(maskedInput).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-pressed", "false");
 
+    await input.tap();
+    await browser.keyboard.type("not a valid secret");
+    await toggle.tap();
+    await expect(revealedInput).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-pressed", "true");
+    await toggle.tap();
+    await expect(maskedInput).toBeVisible();
+
+    await toggle.tap();
+    await input.tap();
+    await browser.keyboard.press("Enter");
+    const error = screen.getByText(
+      "Paste the whole invitation link or the secret.",
+    );
+    await expect(error).toBeVisible();
+    await expect(maskedInput).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-pressed", "false");
+
+    await input.tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.press("Backspace");
+    await expect(error).toBeHidden();
+    await browser.keyboard.type(
+      `https://sandrun.delino.io/invitations/accept#secret=${INVITATION_SECRET}`,
+    );
+    await browser.keyboard.press("Enter");
     await expect(browser).toHaveURL("/invitations/accept");
+    await expect(maskedInput).toBeVisible();
     await screen.getByRole("button", "Join organization").tap();
 
     await expect(browser).toHaveURL(`/orgs/${CONTOSO}`);

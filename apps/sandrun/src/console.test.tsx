@@ -416,7 +416,10 @@ describe("organizations", () => {
     ).toContain("Member");
     await click(screen.getByRole("button", { name: "Create organization" }));
     await settle(60);
-    const input = screen.getByRole("textbox", { name: "Organization name" });
+    const input = screen.getByRole<HTMLInputElement>("textbox", {
+      name: "Organization name",
+    });
+    expect(input.type).toBe("text");
     expect(document.activeElement).toBe(input);
     await type(input, "Fabrikam");
     await click(screen.getByRole("button", { name: "Create" }));
@@ -424,6 +427,70 @@ describe("organizations", () => {
     expect(window.location.pathname).toMatch(/^\/orgs\/[0-9a-f-]+$/);
     expect(await screen.findByText("Set up SandRun")).toBeTruthy();
   });
+
+  test("masks invitations by default and re-masks after invalid submission", async () => {
+    renderConsole("/");
+    const input = screen.getByLabelText<HTMLInputElement>(
+      "Invitation link or secret",
+    );
+    const toggle = screen.getByRole("button", { name: "Show invitation" });
+    const error = "Paste the whole invitation link or the secret.";
+
+    expect(input.type).toBe("password");
+    expect(input.getAttribute("autocomplete")).toBe("off");
+    expect(input.getAttribute("autocapitalize")).toBe("off");
+    expect(input.getAttribute("autocorrect")).toBe("off");
+    expect(input.getAttribute("spellcheck")).toBe("false");
+    expect(document.activeElement).not.toBe(input);
+    expect(toggle.getAttribute("type")).toBe("button");
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+
+    await type(input, "not a valid secret");
+    await click(toggle);
+    expect(input.type).toBe("text");
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    await click(toggle);
+    expect(input.type).toBe("password");
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+
+    await click(toggle);
+    await click(screen.getByRole("button", { name: "Continue" }));
+    expect(screen.getByText(error)).toBeTruthy();
+    expect(input.type).toBe("password");
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    await type(input, "editing the invitation");
+    expect(screen.queryByText(error)).toBeNull();
+  });
+
+  test.each([
+    [
+      "link",
+      `https://sandrun.delino.io/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+    ],
+    ["bare secret", MOCK_INVITATION_SECRET],
+  ])(
+    "clears the invitation input after continuing with a %s",
+    async (_, value) => {
+      renderConsole("/");
+      const inputLabel = "Invitation link or secret";
+      const input = screen.getByLabelText<HTMLInputElement>(inputLabel);
+      await type(input, value);
+      await click(screen.getByRole("button", { name: "Show invitation" }));
+      await click(screen.getByRole("button", { name: "Continue" }));
+
+      await screen.findByRole("heading", { name: "Accept an invitation" });
+      expect(window.location.pathname).toBe("/invitations/accept");
+      expect(window.location.hash).toBe("");
+      const destination = screen.getByLabelText<HTMLInputElement>(inputLabel);
+      expect(destination.type).toBe("password");
+      expect(destination.value).toBe(MOCK_INVITATION_SECRET);
+
+      await click(screen.getByRole("link", { name: "SandRun" }));
+      expect(screen.getByLabelText<HTMLInputElement>(inputLabel).value).toBe(
+        "",
+      );
+    },
+  );
 
   test("links to account settings and to the OwnSand console", async () => {
     renderConsole("/");
