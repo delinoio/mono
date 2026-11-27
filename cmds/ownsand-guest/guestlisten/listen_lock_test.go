@@ -20,8 +20,9 @@ const failureBound = 30 * time.Second
 // restoreLockSeams resets the seams of the lock wait when the test ends.
 func restoreLockSeams(t *testing.T) {
 	t.Helper()
-	sleep, budget, hook := unixLockSleep, unixLockBudget, beforeUnixRemove
+	now, try, sleep, budget, hook := unixLockNow, unixLockTry, unixLockSleep, unixLockBudget, beforeUnixRemove
 	t.Cleanup(func() {
+		unixLockNow, unixLockTry = now, try
 		unixLockSleep, unixLockBudget, beforeUnixRemove = sleep, budget, hook
 	})
 }
@@ -209,8 +210,8 @@ func TestListenUnixConcurrentStartsOnStaleSocket(t *testing.T) {
 
 // TestListenUnixLockWaitTimesOut checks that a start gives up after its wait
 // budget when another start never releases the lock, without a path in the
-// error, and that it leaves the socket path untouched. The wait counts its
-// pauses, so the test replaces them with a counter.
+// error, and that it leaves the socket path untouched. The test advances the
+// clock during each pause and checks that the final pause fits the budget.
 func TestListenUnixLockWaitTimesOut(t *testing.T) {
 	restoreLockSeams(t)
 	t.Chdir(t.TempDir())
@@ -232,14 +233,17 @@ func TestListenUnixLockWaitTimesOut(t *testing.T) {
 		}
 	}()
 
-	const polls = 3
-	unixLockBudget = polls * unixLockPollInterval
-	var pauses int
+	pauses := []time.Duration{unixLockPollInterval, unixLockPollInterval, unixLockPollInterval / 2}
+	unixLockBudget = 2*unixLockPollInterval + unixLockPollInterval/2
+	now := time.Now()
+	unixLockNow = func() time.Time { return now }
+	var polls int
 	unixLockSleep = func(d time.Duration) {
-		if d != unixLockPollInterval {
-			t.Errorf("pause = %v, want %v", d, unixLockPollInterval)
+		if polls >= len(pauses) || d != pauses[polls] {
+			t.Fatalf("unexpected pause %d of %v", polls+1, d)
 		}
-		pauses++
+		polls++
+		now = now.Add(d)
 	}
 	l, err := Listen("unix://" + path)
 	if err == nil {
@@ -252,8 +256,8 @@ func TestListenUnixLockWaitTimesOut(t *testing.T) {
 	if strings.Contains(err.Error(), path) {
 		t.Fatalf("error contains the path: %v", err)
 	}
-	if pauses != polls {
-		t.Fatalf("paused %d times, want %d", pauses, polls)
+	if polls != len(pauses) {
+		t.Fatalf("paused %d times, want %d", polls, len(pauses))
 	}
 	after, err := os.Lstat(path)
 	if err != nil || !os.SameFile(before, after) {
@@ -271,6 +275,91 @@ func TestListenUnixLockWaitTimesOut(t *testing.T) {
 	defer l.Close()
 	go serveOnce(l)
 	requireAnswers(t, path)
+}
+
+func TestListenUnixLockDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		pause        time.Duration
+		lockDuration time.Duration
+		wantTimeout  bool
+		wantAttempts int
+	}{
+		{"before deadline", unixLockWaitBudget - time.Nanosecond, 0, false, 2},
+		{"at deadline", unixLockWaitBudget, 0, true, 1},
+		{"late wake", unixLockWaitBudget + time.Millisecond, 0, true, 1},
+		{"late acquisition", unixLockWaitBudget - time.Nanosecond, time.Millisecond, true, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restoreLockSeams(t)
+			t.Chdir(t.TempDir())
+			const path = "deadline.sock"
+			makeStaleSocket(t, path)
+			before, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			release, err := lockUnixAddress(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			release = sync.OnceFunc(release)
+			defer release()
+
+			now := time.Now()
+			unixLockBudget = unixLockWaitBudget
+			unixLockNow = func() time.Time { return now }
+			unixLockSleep = func(d time.Duration) {
+				if d != unixLockPollInterval {
+					t.Fatalf("pause = %v, want %v", d, unixLockPollInterval)
+				}
+				now = now.Add(tc.pause)
+				release()
+			}
+			var waiter *os.File
+			var attempts int
+			unixLockTry = func(f *os.File) (bool, error) {
+				waiter = f
+				attempts++
+				locked, err := tryLockFile(f)
+				if locked {
+					now = now.Add(tc.lockDuration)
+				}
+				return locked, err
+			}
+			l, err := Listen("unix://" + path)
+			if l != nil {
+				defer l.Close()
+			}
+			if attempts != tc.wantAttempts {
+				t.Fatalf("lock attempts = %d, want %d", attempts, tc.wantAttempts)
+			}
+			if !tc.wantTimeout {
+				if err != nil || l == nil {
+					t.Fatalf("Listen before the deadline: listener %v, error %v", l, err)
+				}
+				return
+			}
+			if l != nil || !errors.Is(err, ErrLockTimeout) || strings.Contains(err.Error(), path) {
+				t.Fatalf("Listen = (%v, %v), want nil and a path-free timeout", l, err)
+			}
+			after, err := os.Lstat(path)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("socket file changed: %v", err)
+			}
+			if _, err := waiter.Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("waiter handle remains open: %v", err)
+			}
+
+			unixLockTry = tryLockFile
+			unixLockBudget = 0
+			l, err = Listen("unix://" + path)
+			if err != nil {
+				t.Fatalf("Listen after timeout: %v", err)
+			}
+			defer l.Close()
+		})
+	}
 }
 
 // TestListenUnixReleasesLockAfterFailure checks that a start that fails

@@ -57,7 +57,9 @@ func TestUnixLockPermissions(t *testing.T) {
 		createRestrictedLock(t, socket)
 		restoreLockSeams(t)
 		first := requireLockMode(t, socket, 0o400)
-		unixLockBudget = unixLockPollInterval
+		unixLockBudget = 2 * unixLockPollInterval
+		now := time.Now()
+		unixLockNow = func() time.Time { return now }
 		unixLockSleep = func(time.Duration) {
 			if err := os.Chmod(socket+unixLockSuffix, 0o600); err != nil {
 				t.Fatal(err)
@@ -79,7 +81,9 @@ func TestUnixLockPermissions(t *testing.T) {
 		restoreLockSeams(t)
 		first := requireLockMode(t, socket, 0o400)
 		unixLockBudget = unixLockPollInterval
-		unixLockSleep = func(time.Duration) {}
+		now := time.Now()
+		unixLockNow = func() time.Time { return now }
+		unixLockSleep = func(d time.Duration) { now = now.Add(d) }
 		if listener, err := Listen("unix://" + socket); err == nil {
 			listener.Close()
 			t.Fatal("listener opened an inaccessible sidecar")
