@@ -39,7 +39,7 @@ func newExecCommand(ctx context.Context, args []string, requestEnv map[string]st
 		cmd.Err = err
 	}
 	cmd.Env = env
-	configureExecCommand(cmd)
+	configureExecCommand(ctx, cmd)
 	return cmd
 }
 
