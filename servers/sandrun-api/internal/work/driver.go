@@ -740,7 +740,7 @@ func (e *Engine) deleteRunnerMatching(ctx context.Context, orgID, runnerID strin
 	var ended *Request
 	var prevReq sandrunv1.RequestState
 	err := e.svc.InOrganizationDeletionTx(ctx, func(tx pgx.Tx) error {
-		cur, err := e.lockOrganizationRunner(ctx, tx, orgID, runnerID)
+		cur, err := e.LockOrganizationRunner(ctx, tx, orgID, runnerID)
 		if err != nil {
 			return err
 		}
@@ -811,7 +811,7 @@ type Deletion struct {
 // adapter says for cause, in one transaction. It returns nil when the runner
 // is already ended or being deleted. After the commit, call FinishDeletion.
 func (e *Engine) DeleteRunnerTx(ctx context.Context, tx pgx.Tx, orgID, runnerID string, reason sandrunv1.RunnerEndReason, cause DeleteCause) (*Deletion, error) {
-	cur, err := e.lockOrganizationRunner(ctx, tx, orgID, runnerID)
+	cur, err := e.LockOrganizationRunner(ctx, tx, orgID, runnerID)
 	if err != nil {
 		return nil, err
 	}
