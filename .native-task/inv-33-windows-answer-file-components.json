@@ -1,0 +1,47 @@
+{
+  "gid": "inv-33-windows-answer-file-components",
+  "commit": "f116ce6df3bfa5c37aea060b14d96e576a9877cb",
+  "nativeValidation": {
+    "platform": "Windows",
+    "status": "pending",
+    "sha": "f116ce6df3bfa5c37aea060b14d96e576a9877cb",
+    "environment": "Native Windows amd64 (delino-win-1), non-elevated PowerShell",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "host": "delino-win-1",
+    "setup": "Use a short, disposable checkout of the stated commit and a non-elevated PowerShell session at its repository root. Run commands 1 and 2, copy files.copyFrom to files.copyTo, then run the remaining commands in order. The omission probe uses Go overlays and writes scratch files under .t3-tmp.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne 'f116ce6df3bfa5c37aea060b14d96e576a9877cb') { throw 'Unexpected validation revision' }",
+      "New-Item -ItemType Directory -Path '.t3-tmp' -Force | Out-Null",
+      "$probe = (Resolve-Path '.t3-tmp/answer-file-components-probe.go').Path; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe).Hash.ToLowerInvariant() -ne '33b5bb6fcdf9d2048df06f3e78e944a5e18b2bf98c79a03bacbf6cf82ada3028') { throw 'Unexpected probe checksum' }",
+      "$env:TEMP = (Resolve-Path '.t3-tmp').Path; $env:TMP = $env:TEMP; $env:GOTMPDIR = $env:TEMP",
+      "go test '-v' '-count=1' '-run' '^TestUnattendXML$' './cmds/ownsand-agent/internal/imagebuild' 2>&1 | Tee-Object -FilePath '.t3-tmp/answer-file-components-native.log'; if ($LASTEXITCODE -ne 0) { throw 'Native answer-file fixture failed' }",
+      "go run $probe 2>&1 | Tee-Object -FilePath '.t3-tmp/answer-file-components-omissions.log'; if ($LASTEXITCODE -ne 0) { throw 'Native answer-file omissions probe failed' }"
+    ],
+    "expectedResults": [
+      "The native fixture logs a PASS for TestUnattendXML with the current generated answer file.",
+      "The first omission reports pass \"specialize\" is missing required component \"Microsoft-Windows-Shell-Setup\".",
+      "The second omission reports pass \"oobeSystem\" is missing required component \"Microsoft-Windows-Shell-Setup\".",
+      "The third omission reports pass \"oobeSystem\" is missing required component \"Microsoft-Windows-International-Core\".",
+      "The probe exits zero after observing one successful fixture run and three expected fixture failures."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-windows-answer-file-components/worker/.t3-tmp/answer-file-components/probe.go",
+      "copyTo": ".t3-tmp/answer-file-components-probe.go",
+      "sha256": "33b5bb6fcdf9d2048df06f3e78e944a5e18b2bf98c79a03bacbf6cf82ada3028",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/imagebuild/windows_windows_test.go"
+      ],
+      "generator": "cmds/ownsand-agent/internal/imagebuild/unattend_windows.go",
+      "outputLogs": [
+        ".t3-tmp/answer-file-components-native.log",
+        ".t3-tmp/answer-file-components-omissions.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-windows-answer-file-components/worker/.t3-tmp/answer-file-components/imagebuild.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-windows-answer-file-components/worker/.t3-tmp/answer-file-components/probe.exe"
+      ]
+    },
+    "requiresElevation": [],
+    "outOfScope": ["Windows Setup, Hyper-V, and native guest acceptance."]
+  }
+}
