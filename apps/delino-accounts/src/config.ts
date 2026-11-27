@@ -92,24 +92,29 @@ export function readAccountsConfig(env: AccountsAppBuildEnv): AccountsConfig {
 }
 
 /**
- * Returns the raw text that follows the authority of a URL string, before the
- * URL parser normalizes it. `url.pathname` collapses `/..`, `/.`, `/%2e` and
- * `/a/..` to `/` and treats a backslash as a slash, so a validator that must
- * accept only a bare origin checks this text as well.
+ * Splits the written authority and suffix before the URL parser drops empty
+ * userinfo or normalizes dot segments and backslashes in the path.
  *
  * The URL parser removes leading and trailing C0 control characters and
- * spaces, and drops tab, CR and LF anywhere; the scheme is followed by any run
- * of `/` or `\` (`https:host` and `https:///host` are accepted by the parser),
- * which is stripped together with the authority. The control characters are
- * matched by code point range through `RegExp` so the pattern mirrors the
- * parser without a control character in a regular expression literal.
+ * spaces, and drops tab, CR and LF anywhere. It accepts any number of slashes
+ * or backslashes after an HTTP(S) scheme, as in `https:host` and `https:///host`.
  */
-function rawPathAfterAuthority(raw: string): string {
-  return raw
+function splitWrittenOrigin(raw: string): {
+  authority: string;
+  suffix: string;
+} {
+  const afterScheme = raw
     .replace(PARSER_EDGE_STRIP, "")
     .replace(/[\t\n\r]/g, "")
-    .replace(/^[A-Za-z][A-Za-z0-9+.-]*:[/\\]*/, "")
-    .replace(/^[^/\\?#]*/, "");
+    .replace(/^[A-Za-z][A-Za-z0-9+.-]*:[/\\]*/, "");
+  const authorityEnd = afterScheme.search(/[/\\?#]/);
+  if (authorityEnd === -1) {
+    return { authority: afterScheme, suffix: "" };
+  }
+  return {
+    authority: afterScheme.slice(0, authorityEnd),
+    suffix: afterScheme.slice(authorityEnd),
+  };
 }
 
 function resolveLogtoEndpoint(value: string): string {
@@ -119,24 +124,31 @@ function resolveLogtoEndpoint(value: string): string {
   } catch {
     throw new Error("PUBLIC_LOGTO_ENDPOINT is not a valid URL");
   }
-  if (url.username !== "" || url.password !== "") {
+  const { authority, suffix } = splitWrittenOrigin(value);
+  const isHttp = url.protocol === "https:" || url.protocol === "http:";
+  if (
+    url.username !== "" ||
+    url.password !== "" ||
+    (isHttp && authority.includes("@"))
+  ) {
     throw new Error("PUBLIC_LOGTO_ENDPOINT must not contain credentials");
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
+  if (!isHttp) {
     throw new Error("PUBLIC_LOGTO_ENDPOINT must use http or https");
   }
-  // `url.pathname` hides dot segments and backslashes, so the raw text after
-  // the authority is checked too. The message never echoes the value.
-  const rawPath = rawPathAfterAuthority(value);
   if (
     url.pathname !== "/" ||
     value.includes("?") ||
     value.includes("#") ||
-    (rawPath !== "" && rawPath !== "/")
+    (suffix !== "" && suffix !== "/")
   ) {
     throw new Error(
       "PUBLIC_LOGTO_ENDPOINT must be an origin without a path, query or fragment",
     );
+  }
+  // The URL parser also accepts backslashes between the scheme and host.
+  if (value.includes("\\")) {
+    throw new Error("PUBLIC_LOGTO_ENDPOINT must not contain backslashes");
   }
   return url.origin;
 }
@@ -206,11 +218,17 @@ export function resolveAccountsApiOrigin(value: string | undefined): string {
     throw new Error("PUBLIC_API_ORIGIN is not a valid URL");
   }
   // The credential check runs first so that no later diagnostic can leak it.
-  // `url.origin` silently drops userinfo, so it has to be checked explicitly.
-  if (url.username !== "" || url.password !== "") {
+  // An empty username and password can still have a written userinfo delimiter.
+  const { authority, suffix } = splitWrittenOrigin(raw);
+  const isHttp = url.protocol === "https:" || url.protocol === "http:";
+  if (
+    url.username !== "" ||
+    url.password !== "" ||
+    (isHttp && authority.includes("@"))
+  ) {
     throw new Error("PUBLIC_API_ORIGIN must not contain credentials");
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
+  if (!isHttp) {
     // The scheme text can itself be a credential (`sk-proj-abc123://host`,
     // `token123:secret@host`), so the message never echoes it.
     throw new Error("PUBLIC_API_ORIGIN must use http or https");
@@ -222,14 +240,13 @@ export function resolveAccountsApiOrigin(value: string | undefined): string {
   // `url.pathname` is normalized, so `/..`, `/.`, `/%2e` and `/a/..` collapse to
   // `/` and a backslash acts as a slash. The raw text after the authority is
   // therefore checked too.
-  const rawPath = rawPathAfterAuthority(raw);
   if (
     url.pathname !== "/" ||
     url.search !== "" ||
     url.hash !== "" ||
     raw.includes("?") ||
     raw.includes("#") ||
-    (rawPath !== "" && rawPath !== "/")
+    (suffix !== "" && suffix !== "/")
   ) {
     throw new Error(
       "PUBLIC_API_ORIGIN must be an origin without a path, query or fragment",

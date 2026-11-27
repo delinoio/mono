@@ -30,6 +30,51 @@ describe("readAccountsApiOrigin", () => {
   });
 });
 
+describe.each([
+  {
+    setting: "PUBLIC_API_ORIGIN",
+    read: (value: string) =>
+      readAccountsApiOrigin({ PUBLIC_API_ORIGIN: value }),
+  },
+  {
+    setting: "PUBLIC_LOGTO_ENDPOINT",
+    read: (value: string) =>
+      readAccountsConfig({
+        PUBLIC_LOGTO_ENDPOINT: value,
+        PUBLIC_LOGTO_APP_ID: "fixture",
+      }).logto?.endpoint,
+  },
+])("$setting authority", ({ setting, read }) => {
+  test.each([
+    "https://@accounts.example.test",
+    "https://:@accounts.example.test/",
+    "\u0001htt\tps://:\r@accounts.example.test/tenant",
+  ])("rejects empty userinfo in %j without echoing it", (value) => {
+    expect(() => read(value)).toThrow(
+      new Error(`${setting} must not contain credentials`),
+    );
+  });
+
+  test.each([
+    "https://accounts.example.test/path@fixture",
+    "https://accounts.example.test/?q=@",
+    "https://accounts.example.test/#@fixture",
+  ])("reports an invalid suffix for %j", (value) => {
+    expect(() => read(value)).toThrow(
+      new Error(
+        `${setting} must be an origin without a path, query or fragment`,
+      ),
+    );
+  });
+
+  test.each([
+    ["https://accounts.example.test/", "https://accounts.example.test"],
+    ["http://[::1]:8080/", "http://[::1]:8080"],
+  ])("normalizes %s to %s", (value, origin) => {
+    expect(read(value)).toBe(origin);
+  });
+});
+
 describe("resolveAccountsApiOrigin", () => {
   test("uses the production origin when the value is unset or empty", () => {
     expect(resolveAccountsApiOrigin(undefined)).toBe(
@@ -317,6 +362,20 @@ describe("readAccountsConfig", () => {
       }).logto?.endpoint,
     ).toBe(origin);
   });
+
+  test.each(["https:\\\\auth.example.com", "https:/\\auth.example.com"])(
+    "rejects the Logto scheme separator in %j without echoing it",
+    (endpoint) => {
+      expect(() =>
+        readAccountsConfig({
+          PUBLIC_LOGTO_ENDPOINT: endpoint,
+          PUBLIC_LOGTO_APP_ID: "fixture-app",
+        }),
+      ).toThrow(
+        new Error("PUBLIC_LOGTO_ENDPOINT must not contain backslashes"),
+      );
+    },
+  );
 
   // The URL parser collapses these paths to `/` or treats a backslash as a
   // slash, so the raw text after the authority has to be rejected.

@@ -52,10 +52,11 @@ export default {
           // The runner passes only PATH, HOME and temporary-directory variables
           // to the app command. Pass a nondefault API origin explicitly so
           // `e2e/home.e2e.ts` can observe that the build-time variable reaches
-          // the client bundle. Keep it equal to `E2E_API_ORIGIN` in that file.
+          // the client bundle. Its normalized value must equal
+          // `E2E_API_ORIGIN` in that file.
           env: {
-            PUBLIC_API_ORIGIN: API_ORIGIN,
-            PUBLIC_LOGTO_ENDPOINT: LOGTO_ENDPOINT,
+            PUBLIC_API_ORIGIN: `${API_ORIGIN}/`,
+            PUBLIC_LOGTO_ENDPOINT: `${LOGTO_ENDPOINT}/`,
             PUBLIC_LOGTO_APP_ID: LOGTO_APP_ID,
           },
           log: ".e2e/logs/app.log",
