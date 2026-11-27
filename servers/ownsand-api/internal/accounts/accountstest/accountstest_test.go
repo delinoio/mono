@@ -5,6 +5,7 @@ package accountstest
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,10 +54,20 @@ func TestGetOrganizationBillingCountsOnlyTheCurrentMonth(t *testing.T) {
 		t.Fatal("meter missing from the response")
 		return 0, 0, time.Time{}
 	}
+	balance := func() int64 {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.accounts[account].balance
+	}
 
-	// The last window of March starts in March and counts for March.
+	// A March window before the link still counts for March.
 	march := time.Date(2026, time.March, 31, 23, 0, 0, 0, time.UTC)
-	report(march, 10, 100)
+	if res := report(march, 10, 100); !res.GetUnattributed() || res.GetBillingAccountId() != "" {
+		t.Fatalf("March result = %v, want unattributed with no account", res)
+	}
+	if got := balance(); got != 10_000_000 {
+		t.Fatalf("balance after unattributed March report = %d, want 10000000", got)
+	}
 	if q, a, ms := usage(); q != 10 || a != 100 || !ms.Equal(time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)) {
 		t.Fatalf("March usage = %d, %d, month start %s; want 10, 100", q, a, ms)
 	}
@@ -67,26 +78,141 @@ func TestGetOrganizationBillingCountsOnlyTheCurrentMonth(t *testing.T) {
 		t.Fatalf("April usage before any April report = %d, %d, month start %s; want 0, 0", q, a, ms)
 	}
 	april := time.Date(2026, time.April, 1, 0, 0, 0, 0, time.UTC)
-	report(april, 3, 30)
+	if res := report(april, 3, 30); res.GetUnattributed() || res.GetBillingAccountId() != account {
+		t.Fatalf("April result = %v, want attributed to %s", res, account)
+	}
+	if got := balance(); got != 9_999_970 {
+		t.Fatalf("balance after April report = %d, want 9999970", got)
+	}
 	if q, a, _ := usage(); q != 3 || a != 30 {
 		t.Fatalf("April usage = %d, %d; want 3, 30", q, a)
 	}
 
 	// A duplicate report is neither counted nor deducted again.
-	f.mu.Lock()
-	before := f.accounts[account].balance
-	f.mu.Unlock()
+	before := balance()
 	if res := report(april, 3, 30); !res.GetDuplicate() {
 		t.Fatalf("duplicate result = %v", res)
 	}
-	f.mu.Lock()
-	after := f.accounts[account].balance
-	f.mu.Unlock()
-	if after != before {
+	if after := balance(); after != before {
 		t.Fatalf("balance after duplicate = %d, want %d", after, before)
 	}
 	if q, a, _ := usage(); q != 3 || a != 30 {
 		t.Fatalf("April usage after duplicate = %d, %d; want 3, 30", q, a)
+	}
+}
+
+func TestReportUsageUsesBillingLinkHistory(t *testing.T) {
+	const (
+		org  = "org-1"
+		user = "user-1"
+		a    = "ba-a"
+		b    = "ba-b"
+	)
+	type linkChange struct {
+		minute        int64
+		account, name string // An empty account unlinks the organization.
+	}
+	tests := []struct {
+		name                        string
+		changes                     []linkChange
+		charged, active, activeName string
+	}{
+		{
+			name:    "delayed after relink",
+			changes: []linkChange{{0, a, "Org"}, {minute: 6}, {7, b, "Org"}},
+			charged: a, active: b, activeName: "Org",
+		},
+		{
+			name:    "delayed after unlink",
+			changes: []linkChange{{0, a, "Org"}, {minute: 6}},
+			charged: a,
+		},
+		{
+			name:    "latest overlap ends inside window",
+			changes: []linkChange{{0, a, "Org"}, {minute: 2}, {3, b, "Org"}, {minute: 4}},
+			charged: b,
+		},
+		{
+			name:    "unlink at window start",
+			changes: []linkChange{{-2, a, "Org"}, {minute: 0}, {minute: 8}},
+		},
+		{
+			name:    "link at window end",
+			changes: []linkChange{{5, a, "Org"}},
+			active:  a, activeName: "Org",
+		},
+		{
+			name:    "ignore empty latest interval",
+			changes: []linkChange{{0, a, "Org"}, {minute: 2}, {3, b, "Org"}, {minute: 3}},
+			charged: a,
+		},
+		{
+			name:    "link retry preserves start and updates name",
+			changes: []linkChange{{0, a, "Org"}, {6, a, "Renamed"}},
+			charged: a, active: a, activeName: "Renamed",
+		},
+	}
+	window := time.Date(2026, time.March, 31, 12, 0, 0, 0, time.UTC)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var minute atomic.Int64
+			f := New(t, func() time.Time { return window.Add(time.Duration(minute.Load()) * time.Minute) })
+			members := map[string]accountsv1.BillingAccountRole{user: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER}
+			f.AddAccount(a, "Account A", members)
+			f.AddAccount(b, "Account B", members)
+			client := f.Client()
+			for _, change := range tt.changes {
+				minute.Store(change.minute)
+				if change.account == "" {
+					if _, err := client.UnlinkOrganization(t.Context(), connect.NewRequest(&accountsv1.UnlinkOrganizationRequest{OrganizationId: org})); err != nil {
+						t.Fatal(err)
+					}
+				} else if _, err := client.LinkOrganization(t.Context(), connect.NewRequest(&accountsv1.LinkOrganizationRequest{
+					OrganizationId: org, OrganizationName: change.name, BillingAccountId: change.account, UserId: user,
+				})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if id, name, ok := f.Link(org); id != tt.active || name != tt.activeName || ok != (tt.active != "") {
+				t.Fatalf("current link = (%q, %q, %t), want account %q and name %q", id, name, ok, tt.active, tt.activeName)
+			}
+
+			minute.Store(10)
+			report := &accountsv1.UsageReport{
+				Service: accountsv1.ServiceId_SERVICE_ID_OWNSAND, OrganizationId: org,
+				Meter: accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC, WindowStart: timestamppb.New(window),
+				Quantity: 10, AmountUsdMicros: 100,
+			}
+			for _, duplicate := range []bool{false, true} {
+				resp, err := client.ReportUsage(t.Context(), connect.NewRequest(&accountsv1.ReportUsageRequest{Reports: []*accountsv1.UsageReport{report}}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				results := resp.Msg.GetResults()
+				if len(results) != 1 || results[0].GetDuplicate() != duplicate {
+					t.Fatalf("results = %v, want one result with duplicate=%t", results, duplicate)
+				}
+				if res := results[0]; !duplicate && (res.GetBillingAccountId() != tt.charged || res.GetUnattributed() != (tt.charged == "")) {
+					t.Fatalf("result = %v, want billing account %q and unattributed=%t", res, tt.charged, tt.charged == "")
+				}
+				statuses := resp.Msg.GetStatuses()
+				if tt.active == "" && len(statuses) != 0 || tt.active != "" && (len(statuses) != 1 || statuses[0].GetBillingAccountId() != tt.active) {
+					t.Fatalf("current statuses = %v, want current account %q", statuses, tt.active)
+				}
+				for _, id := range []string{a, b} {
+					want := int64(10_000_000)
+					if id == tt.charged {
+						want -= report.GetAmountUsdMicros()
+					}
+					f.mu.Lock()
+					got := f.accounts[id].balance
+					f.mu.Unlock()
+					if got != want {
+						t.Fatalf("account %s balance with duplicate=%t = %d, want %d", id, duplicate, got, want)
+					}
+				}
+			}
+		})
 	}
 }
 

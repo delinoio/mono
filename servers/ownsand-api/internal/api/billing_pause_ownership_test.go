@@ -149,6 +149,9 @@ func TestLateBillingPauseKeepsOwnershipAfterRecovery(t *testing.T) {
 	id := f.create(t)
 	f.suspendedPass(t, id)
 	pauseID := f.waitPauses(t, 1)[0]
+	if got := countLogs(f.env, `"msg":"billing_sandbox_paused"`); got != 0 {
+		t.Errorf("billing_sandbox_paused logged %d times after a timeout, want 0", got)
+	}
 	f.recoverWhileRunning(t, id)
 
 	// The agent's pause completes now, with a newer valid revision.
@@ -162,6 +165,64 @@ func TestLateBillingPauseKeepsOwnershipAfterRecovery(t *testing.T) {
 	}
 	if got := countLogs(f.env, `"msg":"billing_sandbox_unmarked"`); got != 0 {
 		t.Fatalf("billing_sandbox_unmarked logged %d times for a live sandbox", got)
+	}
+}
+
+func TestBillingPauseChannelLostBeforeConfirmation(t *testing.T) {
+	f := newLateFixture(t, func(o *app.Options) { o.Timing.CommandWait = 30 * time.Second })
+	id := f.create(t)
+	setOrgPhase(t, f.env, f.org, billing.PhaseSuspended)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.env.App.Enforcer.Pass(ctx) }()
+	f.waitPauses(t, 1)
+
+	// A device can be recorded offline before the command wait reloads its sandbox.
+	if _, err := f.env.DB.Pool.Exec(ctx, "UPDATE devices SET state = $2 WHERE device_id = $1",
+		f.dev.ID, int16(ownsandv1.DeviceState_DEVICE_STATE_OFFLINE)); err != nil {
+		t.Fatal(err)
+	}
+	f.agent.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if state := getSandbox(t, f.org.OwnerClient, f.org.ID, id).GetState(); state != ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE {
+		t.Fatalf("sandbox state = %v, want UNREACHABLE", state)
+	}
+	if !pausedByBilling(t, f.env, id) {
+		t.Fatal("billing did not keep its mark after channel loss")
+	}
+	for _, message := range []string{`"msg":"billing_sandbox_paused"`, `"msg":"billing_sandbox_pause_failed"`} {
+		if got := countLogs(f.env, message); got != 0 {
+			t.Errorf("%s logged %d times after channel loss, want 0", message, got)
+		}
+	}
+}
+
+func TestBillingPauseExplicitRejection(t *testing.T) {
+	f := newMarkerFixture(t)
+	id := f.create(t)
+	f.agent.SetOnCommand(func(a *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+		if cmd.GetPauseSandbox() == nil {
+			return a.DefaultAnswer(cmd)
+		}
+		return &ownsandv1.AgentCommandResult{
+			CommandId: cmd.GetCommandId(),
+			Error:     &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, Message: "pause rejected"},
+		}
+	})
+	setOrgPhase(t, f.env, f.org, billing.PhaseSuspended)
+	enforceBilling(t, f.env)
+	if state := getSandbox(t, f.org.OwnerClient, f.org.ID, id).GetState(); state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("sandbox state = %v, want RUNNING", state)
+	}
+	if got := countLogs(f.env, `"msg":"billing_sandbox_pause_failed"`); got != 1 {
+		t.Errorf("billing_sandbox_pause_failed logged %d times after explicit rejection, want 1", got)
+	}
+	if got := countLogs(f.env, `"msg":"billing_sandbox_paused"`); got != 0 {
+		t.Errorf("billing_sandbox_paused logged %d times after explicit rejection, want 0", got)
 	}
 }
 

@@ -36,14 +36,15 @@ func assertEntriesGone(t *testing.T, dir string, names ...string) {
 
 // Reset deletes the identity and a regular file at images, which store.Open
 // rejects, and exits 0 when the clean-up succeeds. A second reset on the
-// emptied directory also exits 0.
+// emptied directory also exits 0. Both resets skip host cleanup.
 func TestResetDamagedLayoutDeletesEverything(t *testing.T) {
 	dir := damagedStateDir(t)
 	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
+	calls := stubCleanupHost(t, errors.New("unexpected host cleanup during process reset"))
 	for i := 0; i < 2; i++ {
 		var out, errb bytes.Buffer
-		if code := run([]string{"reset", "--yes"}, nil, &out, &errb); code != exitOK {
-			t.Fatalf("reset %d: %d, stderr %q", i, code, errb.String())
+		if code := run([]string{"reset", "--yes"}, nil, &out, &errb); code != exitOK || *calls != 0 {
+			t.Fatalf("reset %d: exit %d, host cleanup calls %d, stderr %q", i+1, code, *calls, errb.String())
 		}
 		assertEntriesGone(t, dir, "identity.json", "images", "marker")
 	}

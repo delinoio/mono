@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/pion/webrtc/v4"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/cpclient"
@@ -116,6 +117,7 @@ func newRelayEnvWrapped(t *testing.T, timing Timing, limits RelayLimits, wrap fu
 	}
 	dp := New(Options{
 		Dispatcher: w.d, Sandboxes: w.m, Logger: logger(), Timing: timing, Limits: limits,
+		IncludeLoopback: true, InterfaceFilter: loopbackOnly,
 		Auth: authFunc(func(ctx context.Context) (string, error) {
 			if hook := e.beforeAuth.Load(); hook != nil {
 				if err := (*hook)(ctx); err != nil {
@@ -243,19 +245,29 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 		return resp.Body
 	}
 	retiredBody := open(retired)
-	read := func(body io.ReadCloser) <-chan struct{} {
+	read := func(gate *gatedBody, body io.Reader) func() {
 		done := make(chan struct{})
+		release := sync.OnceFunc(func() { close(gate.release) })
+		releaseAndWait := func() {
+			release()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("relay response reader did not finish after release")
+			}
+		}
+		t.Cleanup(releaseAndWait)
 		go func() {
 			defer close(done)
 			if _, err := body.Read(make([]byte, 16)); err != nil {
 				t.Errorf("read: %v", err)
 			}
 		}()
-		return done
+		return releaseAndWait
 	}
 	// The retired response has a read in flight while the loop installs the
 	// replacement connection.
-	lateRead := read(retiredBody)
+	finishRetiredRead := read(bodies[retired], retiredBody)
 	<-bodies[retired].started
 	r.mu.Lock()
 	r.conn = active
@@ -265,8 +277,7 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 	old := int64(time.Hour)
 	retired.lastRecv.Store(old)
 	active.lastRecv.Store(old)
-	close(bodies[retired].release)
-	<-lateRead
+	finishRetiredRead()
 	if got := active.lastRecv.Load(); got != old {
 		t.Fatalf("a late read of the retired response moved the replacement's receive clock by %v", time.Duration(got-old))
 	}
@@ -276,13 +287,12 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 
 	// A partial frame of the active response refreshes the active clock
 	// before any frame is decoded.
-	activeRead := read(activeBody)
+	finishActiveRead := read(bodies[active], activeBody)
 	<-bodies[active].started
 	if active.lastRecv.Load() != old {
 		t.Fatal("the receive clock moved before any byte arrived")
 	}
-	close(bodies[active].release)
-	<-activeRead
+	finishActiveRead()
 	if active.lastRecv.Load() == old {
 		t.Fatal("a read of the active response did not refresh its receive clock")
 	}
@@ -1168,16 +1178,10 @@ func TestRelayCancelsPendingCredentialOnChannelLoss(t *testing.T) {
 func TestRelayDropsCredentialOfClosedChannel(t *testing.T) {
 	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
 	var calls atomic.Int32
-	entered := make(chan struct{}, 1)
-	gate := make(chan struct{})
-	hook := func(context.Context) error {
-		// The old response completes during the teardown and ignores the
-		// cancellation of its request.
-		if calls.Add(1) == 1 {
-			entered <- struct{}{}
-			<-gate
-		}
-		return nil
+	waitForRelease, entered, release := newRelayCredentialGate(t)
+	hook := func(ctx context.Context) error {
+		calls.Add(1)
+		return waitForRelease(ctx)
 	}
 	e.beforeAuth.Store(&hook)
 	e.execGrant(e.execReq("/bin/true"))
@@ -1188,7 +1192,7 @@ func TestRelayDropsCredentialOfClosedChannel(t *testing.T) {
 	}
 	e.ch.Close()
 	e.dp.ChannelLost(e.ch)
-	close(gate)
+	release()
 	e.noConn(500 * time.Millisecond)
 	// A new channel without a grant gets no relay dial either.
 	e.ch = newChannel(2)
@@ -1282,6 +1286,7 @@ func (f *revokeFixture) grant(deadlineIn time.Duration, received time.Time, ids 
 		st := &rstream{id: id, g: g, conn: f.c, ctx: ctx, cancel: cancel}
 		g.streams[st] = true
 		f.c.streams[id] = st
+		f.c.highest = max(f.c.highest, id)
 		streams = append(streams, st)
 	}
 	return g, streams
@@ -1486,20 +1491,69 @@ func (e *relayEnv) relayRunning() bool {
 	return e.dp.relay.running
 }
 
-// gatedGrant installs one exec grant and returns once the loop waits in
-// the credential request. The returned function releases the request.
-func (e *relayEnv) gatedGrant(t *testing.T) (*ownsandv1.RelayGrant, func()) {
-	t.Helper()
-	var calls atomic.Int32
-	entered := make(chan struct{}, 1)
+// newRelayCredentialGate holds the first credential callback until release.
+// The callback ignores cancellation so tests can model a late response.
+func newRelayCredentialGate(t *testing.T) (func(context.Context) error, <-chan struct{}, func()) {
+	var started atomic.Bool
+	entered := make(chan struct{})
 	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+
 	hook := func(context.Context) error {
-		if calls.Add(1) == 1 {
-			entered <- struct{}{}
+		if !started.Swap(true) {
+			close(entered)
 			<-gate
 		}
 		return nil
 	}
+	return hook, entered, release
+}
+
+func TestRelayCredentialGate(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		explicitRelease bool
+	}{
+		{name: "cleanup releases callback"},
+		{name: "cleanup after explicit release", explicitRelease: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			returned := make(chan struct{})
+			waitForReturn := func(t *testing.T) {
+				t.Helper()
+				select {
+				case <-returned:
+				case <-time.After(5 * time.Second):
+					t.Fatal("credential callback did not return after release")
+				}
+			}
+			t.Run("credential request", func(t *testing.T) {
+				hook, entered, release := newRelayCredentialGate(t)
+				go func() {
+					defer close(returned)
+					_ = hook(context.Background())
+				}()
+				select {
+				case <-entered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("credential callback did not enter its gate")
+				}
+				if tc.explicitRelease {
+					release()
+					waitForReturn(t)
+				}
+			})
+			waitForReturn(t)
+		})
+	}
+}
+
+// gatedGrant installs one exec grant and returns once the loop waits in
+// the credential request. The returned function releases the request.
+func (e *relayEnv) gatedGrant(t *testing.T) (*ownsandv1.RelayGrant, func()) {
+	t.Helper()
+	hook, entered, release := newRelayCredentialGate(t)
 	e.beforeAuth.Store(&hook)
 	g := e.execGrant(e.execReq("/bin/true"))
 	select {
@@ -1507,7 +1561,7 @@ func (e *relayEnv) gatedGrant(t *testing.T) (*ownsandv1.RelayGrant, func()) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("relay loop did not request a credential")
 	}
-	return g, func() { close(gate) }
+	return g, release
 }
 
 func (e *relayEnv) revokeGrant(g *ownsandv1.RelayGrant) {
@@ -1606,10 +1660,10 @@ func closeFrame(id uint64) *ownsandv1.DataFrame {
 // queue drains, and that no frame of the closed stream is queued afterwards,
 // while the connection keeps serving other streams.
 func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
-	f, g, st := blockedSendFixture(t)
+	f, _, st := blockedSendFixture(t)
 	frame := datapath.MustNewFrame(1, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("payload")}}})
 	result := make(chan error, 1)
-	go func() { result <- relaySink{st}.Send(st.ctx, frame) }()
+	go func() { result <- relaySink{f.r, st}.Send(st.ctx, frame) }()
 	select {
 	case err := <-result:
 		t.Fatalf("send returned %v while the queue was full", err)
@@ -1638,7 +1692,7 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 		t.Fatalf("a frame of the closed stream was queued after the drain: %d frames", len(f.c.out))
 	}
 	// A send on the canceled stream context queues nothing, even with room.
-	if err := (relaySink{st}).Send(st.ctx, frame); !errors.Is(err, context.Canceled) || len(f.c.out) != 0 {
+	if err := (relaySink{f.r, st}).Send(st.ctx, frame); !errors.Is(err, context.Canceled) || len(f.c.out) != 0 {
 		t.Fatalf("send after the close returned %v with %d queued", err, len(f.c.out))
 	}
 
@@ -1646,14 +1700,34 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 	if f.c.ctx.Err() != nil {
 		t.Fatal("the connection was closed")
 	}
-	ctx, cancel := context.WithCancel(f.c.ctx)
-	defer cancel()
-	other := &rstream{id: 3, g: g, conn: f.c, ctx: ctx, cancel: cancel}
+	_, otherStreams := f.grant(time.Hour, time.Now(), 3)
+	other := otherStreams[0]
 	other.send, _ = datapath.NewSendWindow(1 << 20)
-	if err := (relaySink{other}).Send(ctx, datapath.MustNewFrame(3, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("other")}}})); err != nil {
-		t.Fatalf("send on another stream: %v", err)
+	probe := newWaitProbeContext(other.ctx)
+	other.ctx = probe
+	probe.arm()
+	f.fillQueue()
+	go func() {
+		result <- (relaySink{f.r, other}).Send(probe, relayStdout(other.id, "other"))
+	}()
+	select {
+	case <-probe.waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second stream did not reach the full queue")
 	}
-	if got := <-f.c.out; got.GetStreamId() != 3 {
+	if got := <-f.c.out; got.GetRelayKeepalive() == nil {
+		t.Fatalf("first queued frame %v, want connection keepalive", got)
+	}
+	f.r.outboundDequeued(f.c)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("send on another stream: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second stream did not resume when the queue had space")
+	}
+	if got := <-f.c.out; got.GetStreamId() != other.id {
 		t.Fatalf("queued frame %v", got)
 	}
 }
@@ -1666,7 +1740,7 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 // original keepalive. The test proves with a probe context (see
 // waitProbeContext) that the notice reached its wait on the stream context
 // with a live stream and a full queue before it delivers the close. A close
-// that arrived earlier would take the early return of enqueueCtx and pass
+// that arrived earlier would take the early return of enqueueStream and pass
 // without the wait. After the close, the dispatcher must return while the
 // queue is still full, which a wait on the connection context would not allow
 // because nothing cancels the connection. Every wait has a bound that only
@@ -1886,18 +1960,54 @@ func TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker(t *testing.T)
 		t.Run(tc, func(t *testing.T) {
 			_, c := newManualConn(t, Timing{}, 4)
 			c.flushDeadline = deadline
+			var markerReceived chan bool
 			switch tc {
 			case "marker_taken_close_request_stalls":
-				// The writer dequeues the marker and then blocks in the
-				// request close; it never starts its own 2-second timer.
-				go func() { <-c.out; select {} }()
+				markerReceived = make(chan bool, 1)
+				release := make(chan struct{})
+				writerDone := make(chan struct{})
+				t.Cleanup(func() {
+					close(release)
+					select {
+					case <-writerDone:
+					case <-time.After(5 * time.Second):
+						t.Error("the simulated writer did not exit after release")
+					}
+				})
+				go func() {
+					defer close(writerDone)
+					select {
+					case frame, ok := <-c.out:
+						markerReceived <- ok && frame == nil
+					case <-release:
+						return
+					}
+					// Stall the request close until cleanup releases the writer.
+					<-release
+				}()
 			case "queue_full":
 				for i := 0; i < cap(c.out); i++ {
 					c.out <- keepaliveFrame(false)
 				}
 			}
 			start := time.Now()
+			c.armFlushDeadline(start)
 			go c.closeAfterFlush()
+			if markerReceived != nil {
+				select {
+				case received := <-markerReceived:
+					if !received {
+						t.Fatal("the writer did not dequeue the nil flush marker")
+					}
+					if c.ctx.Err() != nil {
+						t.Fatal("the connection was canceled before the test observed the flush marker")
+					}
+				case <-c.ctx.Done():
+					t.Fatal("the connection was canceled before the test observed the flush marker")
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for the writer to dequeue the flush marker")
+				}
+			}
 			select {
 			case <-c.ctx.Done():
 			case <-time.After(5 * time.Second):
@@ -1920,6 +2030,7 @@ func TestRelayCloseAfterFlushStopsItsTimerWhenTheConnectionEnds(t *testing.T) {
 	inner := c.cancel
 	c.cancel = func() { canceled <- struct{}{}; inner() }
 	go func() { <-c.out; inner() }()
+	c.armFlushDeadline(time.Now())
 	c.closeAfterFlush()
 	time.Sleep(600 * time.Millisecond)
 	if len(canceled) != 0 {
@@ -1932,9 +2043,8 @@ func TestRelayCloseAfterFlushStopsItsTimerWhenTheConnectionEnds(t *testing.T) {
 // relay stream, so HTTP/2 flow control blocks the agent's writer while the
 // outbound queue still has room and the control plane keeps sending bytes.
 // The queue takes the flush marker, but the writer never reaches it. The
-// agent must still cancel the connection at the shutdown deadline, and the
-// live grant of the new channel must get a new connection after the bounded
-// teardown.
+// agent must still cancel the connection at the shutdown deadline while
+// the old peer drains. A live grant on the new channel gets a connection.
 func TestRelayChannelLossCancelsConnectionWithBlockedWriter(t *testing.T) {
 	const flush = time.Second
 	e := newRelayEnv(t, Timing{FlushDeadline: flush, ReceiveTimeout: time.Hour, KeepaliveInterval: time.Hour, ProbeIdle: time.Hour}, RelayLimits{})
@@ -2005,17 +2115,31 @@ func TestRelayChannelLossCancelsConnectionWithBlockedWriter(t *testing.T) {
 		t.Fatalf("the outbound queue is full (%d frames), so the test does not cover a queue with free slots", len(old.out))
 	}
 
-	e.dp.ChannelLost(e.ch)
-	e.ch.Close()
+	peer, caller, releasePeer := e.bufferPeer()
+	// Keep Done open until the callback claims the peer. Otherwise the peer
+	// watcher can win the transition and hide a synchronous drain here.
 	lost := time.Now()
+	e.loseChannelWithBufferedPeer(peer)
 	select {
 	case <-old.ctx.Done():
-	case <-time.After(flush + 3*time.Second):
+	case <-time.After(time.Until(lost.Add(flush + 500*time.Millisecond))):
 		t.Fatalf("the connection was not canceled %v after the channel loss", time.Since(lost))
 	}
-	if d := time.Since(lost); d < flush*8/10 {
-		t.Fatalf("the connection was canceled after %v, before the %v flush deadline", d, flush)
+	if d := time.Since(lost); d < flush*8/10 || d > flush+500*time.Millisecond {
+		t.Fatalf("the connection was canceled after %v, want about %v from channel loss", d, flush)
 	}
+	select {
+	case <-peer.ctx.Done():
+		t.Fatal("the peer finished draining before the relay cancellation")
+	default:
+	}
+	releasePeer()
+	caller.waitClosed()
+	waitFor(t, "lost peer removal", func() bool {
+		e.dp.mu.Lock()
+		defer e.dp.mu.Unlock()
+		return e.dp.sessions[peer.id] == nil
+	})
 	// The grant of the new channel gets a new connection after the bounded
 	// teardown.
 	e.ch = newChannel(2)
@@ -2028,6 +2152,50 @@ func TestRelayChannelLossCancelsConnectionWithBlockedWriter(t *testing.T) {
 	}
 	if d := time.Since(lost); d > flush+teardownGrace+4*time.Second {
 		t.Fatalf("the new connection took %v after the channel loss", d)
+	}
+}
+
+func (e *relayEnv) bufferPeer() (*session, *caller, func()) {
+	e.t.Helper()
+	c, id := e.session(e.t, e.dp, e.ch, time.Hour)
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	e.t.Cleanup(release)
+	c.dc.OnMessage(func(webrtc.DataChannelMessage) { <-gate })
+	c.send(datapath.MustNewFrame(1, e.sandbox, e.execReq("/bin/sh", "-c", "head -c 100000000 /dev/zero")))
+	e.dp.mu.Lock()
+	s := e.dp.sessions[id]
+	e.dp.mu.Unlock()
+	waitFor(e.t, "a backpressured peer", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.dc != nil && s.dc.BufferedAmount() > maxBuffered
+	})
+	return s, c, release
+}
+
+func (e *relayEnv) loseChannelWithBufferedPeer(s *session) {
+	e.t.Helper()
+	e.dp.ChannelLost(e.ch)
+	e.ch.Close()
+	if ended, reason := s.endState(); !ended || reason != ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST {
+		e.t.Fatalf("peer ended %v with reason %v after ChannelLost", ended, reason)
+	}
+	select {
+	case <-s.ctx.Done():
+		e.t.Fatal("ChannelLost waited for the peer drain")
+	default:
+	}
+	req := datapath.MustNewFrame(2, e.sandbox, e.execReq("/bin/sh", "-c", "sleep 30"))
+	if err := s.send(e.t.Context(), req); !errors.Is(err, errSessionEnding) {
+		e.t.Fatalf("operation send after channel loss returned %v", err)
+	}
+	s.onFrame(req)
+	s.mu.Lock()
+	_, admitted := s.streams[2]
+	s.mu.Unlock()
+	if admitted {
+		e.t.Fatal("lost peer admitted a request")
 	}
 }
 
@@ -2065,10 +2233,12 @@ func TestRelayChannelLossFlushesSessionEndBeforeClosingRequest(t *testing.T) {
 	e.openOK(rc, 1, g.GetGrantId())
 	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
 	rc.nextOn(1)
+	peer, caller, releasePeer := e.bufferPeer()
+	oldChannel := e.ch
 	lost := time.Now()
-	e.dp.ChannelLost(e.ch)
-	e.ch.Close()
+	e.loseChannelWithBufferedPeer(peer)
 	var sawSessionEnd bool
+waitForClose:
 	for {
 		select {
 		case ev := <-events:
@@ -2087,11 +2257,29 @@ func TestRelayChannelLossFlushesSessionEndBeforeClosingRequest(t *testing.T) {
 			if d := time.Since(lost); d > flush/2 {
 				t.Fatalf("the request closed %v after the channel loss, not at the end of the flush", d)
 			}
-			return
+			break waitForClose
 		case <-time.After(flush):
 			t.Fatal("the request side never closed")
 		}
 	}
+	e.ch = newChannel(2)
+	e.dp.ChannelOpened(e.ch)
+	req = e.execReq("/bin/true")
+	g = e.execGrant(req)
+	rc = e.conn()
+	e.dp.ChannelLost(oldChannel)
+	e.openOK(rc, 1, g.GetGrantId())
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	if f := rc.nextOn(1); f.GetRequestAccepted() == nil {
+		t.Fatalf("new generation did not accept its request: %v", f)
+	}
+	select {
+	case <-peer.ctx.Done():
+		t.Fatal("the new generation did not serve a request during the old peer drain")
+	default:
+	}
+	releasePeer()
+	caller.waitClosed()
 }
 
 // relayAttempt is one relay connection of a scripted control plane.

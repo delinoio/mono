@@ -164,8 +164,11 @@ func (p *DataPlane) sendGrant(ctx context.Context, conn *hub.Conn, env *ownsandv
 
 // RelayTiming holds the relay stream durations; tests shorten them.
 type RelayTiming struct {
-	// Rotation ends a server stream before 14 minutes.
+	// Rotation ends a writable server stream with OK after 13 min 50 s.
 	Rotation time.Duration
+	// ResponseWriteDeadline bounds server-streaming response writes from
+	// stream_id allocation. Zero uses the production limit of 13 min 59 s.
+	ResponseWriteDeadline time.Duration
 	// Keepalive is the caller-side keepalive interval (at most 60 s).
 	Keepalive time.Duration
 	// Acceptance is the wait for the agent's accepted notice (30 s).
@@ -187,6 +190,8 @@ type RelayTiming struct {
 // defaultRelayConnWait is the contract wait for the agent relay connection.
 const defaultRelayConnWait = 10 * time.Second
 
+const defaultRelayResponseWriteDeadline = 14*time.Minute - time.Second
+
 // connWait returns the wait for the agent relay connection; a zero ConnWait
 // keeps the contract value.
 func (t RelayTiming) connWait() time.Duration {
@@ -198,12 +203,16 @@ func (t RelayTiming) connWait() time.Duration {
 
 // DefaultRelayTiming returns the contract values.
 func DefaultRelayTiming() RelayTiming {
-	return RelayTiming{Rotation: 14*time.Minute - 10*time.Second, Keepalive: 50 * time.Second, Acceptance: 30 * time.Second, RequestDeadline: 5 * time.Minute,
+	return RelayTiming{Rotation: 14*time.Minute - 10*time.Second, ResponseWriteDeadline: defaultRelayResponseWriteDeadline,
+		Keepalive: 50 * time.Second, Acceptance: 30 * time.Second, RequestDeadline: 5 * time.Minute,
 		GrantAck: 10 * time.Second, Signaling: 30 * time.Second, ConnWait: defaultRelayConnWait}
 }
 
 // NewDataPlane wires the data path into s.
 func NewDataPlane(s *Service, limits relay.Limits, timing RelayTiming) *DataPlane {
+	if timing.ResponseWriteDeadline <= 0 {
+		timing.ResponseWriteDeadline = defaultRelayResponseWriteDeadline
+	}
 	p := &DataPlane{
 		S: s, Grants: grants.New(s.Now), Relays: relay.NewRegistry(), Limits: limits, Timing: timing,
 		limiter:     ratelimit.New(authorizeRate, authorizeRate, s.Now),
@@ -267,7 +276,7 @@ func (p *DataPlane) HandleEnvelope(ctx context.Context, conn *hub.Conn, env *own
 
 // HandleEvent implements DataPathHooks: it revokes the sessions and relay
 // grants that a revocation event matches.
-func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event) {
+func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event, channels channelGenerations) {
 	matchPrincipal := func(orgID string, pr auth.Principal, membership auth.MembershipSnapshot) bool {
 		switch e.Kind {
 		case events.KindAPIKeyRevoked:
@@ -283,22 +292,22 @@ func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event) {
 		return (e.Kind == events.KindSandboxDeleted && sandboxID == e.SandboxID) || (e.Kind == events.KindDeviceRemoved && deviceID == e.DeviceID)
 	}
 	revoked := p.Grants.RemoveMatching(func(g *grants.Grant) bool {
-		return matchPrincipal(g.OrgID, g.Principal, g.Membership) || matchSandbox(g.SandboxID, g.DeviceID)
+		return channels.contains(g.ChannelGen) && (matchPrincipal(g.OrgID, g.Principal, g.Membership) || matchSandbox(g.SandboxID, g.DeviceID))
 	})
 	p.mu.Lock()
 	if e.Kind == events.KindDeviceRemoved {
-		if conn := p.S.Hub.Get(e.DeviceID); conn != nil {
+		if conn := p.S.Hub.Get(e.DeviceID); channels.includes(conn) {
 			conn.SetValue(removedDeviceKey{}, true)
 		}
 		for id, r := range p.revocations {
-			if r.deviceID == e.DeviceID {
+			if r.deviceID == e.DeviceID && channels.contains(r.gen) {
 				delete(p.revocations, id)
 			}
 		}
 	}
 	var sessions []*session
 	for id, s := range p.sessions {
-		if matchPrincipal(s.orgID, s.principal, s.membership) || matchSandbox(s.sandboxID, s.deviceID) {
+		if channels.contains(s.gen) && (matchPrincipal(s.orgID, s.principal, s.membership) || matchSandbox(s.sandboxID, s.deviceID)) {
 			sessions = append(sessions, s)
 			delete(p.sessions, id)
 		}
@@ -319,7 +328,6 @@ func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event) {
 // sendRevocation makes the initial bounded enqueue. The pending record owns
 // delivery after a failed enqueue on a channel that stays live.
 func (p *DataPlane) sendRevocation(ctx context.Context, deviceID string, gen uint64, target revocationTarget, expireAt time.Time, message *ownsandv1.SessionRevocation) {
-	p.sweepRevocations(ctx, p.S.now(), false)
 	p.mu.Lock()
 	conn := p.S.Hub.Get(deviceID)
 	if conn == nil || conn.Generation != gen || conn.Value(removedDeviceKey{}) != nil {
@@ -523,6 +531,7 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 			defer cancel()
 			h.S.Logger.WarnContext(rctx, "data_path_session_abandoned", slog.String("session_id", sess.id), slog.String("sandbox_id", sb.ID),
 				slog.String("device_id", sess.deviceID), slog.String("cause", cause))
+			h.sweepRevocations(rctx, h.S.now(), false)
 			h.sendRevocation(rctx, sess.deviceID, sess.gen, revocationTargetSession, sess.expireAt, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_SessionId{SessionId: sess.id}})
 		}
 		return nil, err

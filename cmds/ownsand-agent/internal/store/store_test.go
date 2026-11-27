@@ -200,3 +200,38 @@ func TestResetDeletesIdentityWhenAnotherEntryFails(t *testing.T) {
 		}
 	}
 }
+
+func TestResetAndWipeRemoveSandboxCleanupMarkers(t *testing.T) {
+	for _, action := range []string{"wipe", "reset"} {
+		t.Run(action, func(t *testing.T) {
+			st, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ids, err := st.LoadSandboxCleanups(); err != nil || len(ids) != 0 {
+				t.Fatalf("markers in an existing store without inventory = %v, %v", ids, err)
+			}
+			if err := st.SaveSandboxCleanup("sandbox"); err != nil {
+				t.Fatal(err)
+			}
+			if ids, err := st.LoadSandboxCleanups(); err != nil || !reflect.DeepEqual(ids, []string{"sandbox"}) {
+				t.Fatalf("saved cleanup inventory = %v, %v", ids, err)
+			}
+			if action == "reset" {
+				err = st.Reset()
+			} else {
+				err = st.WipeLocalData()
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := Open(st.Dir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ids, err := reopened.LoadSandboxCleanups(); err != nil || len(ids) != 0 {
+				t.Fatalf("remaining cleanup inventory = %v, %v", ids, err)
+			}
+		})
+	}
+}

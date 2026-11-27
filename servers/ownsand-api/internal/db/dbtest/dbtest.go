@@ -11,6 +11,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -161,19 +162,33 @@ const testPoolMaxConns = "32"
 // New returns an open pool on a fresh, migrated database.
 func New(t testing.TB) *db.DB {
 	t.Helper()
-	u := NewURL(t)
-	// The API serializes pauses and resumes of one sandbox with advisory
-	// locks that each hold a pooled connection, and allows half of the pool
-	// to hold them at once. pgx sizes the default pool by the CPU count, so a
-	// small CI runner would otherwise run fewer than the 8 commands that the
-	// billing worker keeps in flight.
-	if !strings.Contains(u, "pool_max_conns") {
-		u += "&pool_max_conns=" + testPoolMaxConns
-	}
-	d, err := db.Open(context.Background(), u)
+	d, err := db.Open(context.Background(), withTestPoolDefault(NewURL(t)))
 	if err != nil {
 		t.Fatalf("open test database: %v", err)
 	}
 	t.Cleanup(d.Close)
 	return d
+}
+
+func withTestPoolDefault(child string) string {
+	const poolKey = "pool_max_conns"
+	_, query, _ := strings.Cut(child, "?")
+	// pgx splits on ampersands, trims literal spaces and percent-decodes
+	// keys without translating plus signs. Keep the raw pairs in order so
+	// pgx can validate their values and resolve duplicates itself.
+	for pair := range strings.SplitSeq(query, "&") {
+		rawKey, _, _ := strings.Cut(pair, "=")
+		key, err := url.PathUnescape(strings.Trim(rawKey, " "))
+		if err == nil && key == poolKey {
+			return child
+		}
+	}
+
+	// The API serializes pauses and resumes of one sandbox with advisory
+	// locks that each hold a pooled connection, and allows half of the pool
+	// to hold them at once. pgx sizes the default pool by the CPU count, so a
+	// small CI runner would otherwise run fewer than the 8 commands that the
+	// billing worker keeps in flight.
+	// NewURL always supplies a query with the generated dbname.
+	return child + "&" + poolKey + "=" + testPoolMaxConns
 }

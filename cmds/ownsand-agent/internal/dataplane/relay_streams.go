@@ -10,17 +10,10 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
+	"github.com/delinoio/mono/cmds/ownsand-guest/execlog"
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
-
-func (r *relay) sendFrame(c *rconn, id uint64, sandboxID string, payload proto.Message) {
-	_ = c.enqueue(datapath.MustNewFrame(id, sandboxID, payload))
-}
-
-func (r *relay) errorFrame(c *rconn, id uint64, sandboxID string, code ownsandv1.ErrorCode, msg string) {
-	r.sendFrame(c, id, sandboxID, &ownsandv1.ErrorDetail{Code: code, Message: msg})
-}
 
 // onFrame handles one frame of the control plane.
 func (r *relay) onFrame(c *rconn, f *ownsandv1.DataFrame) {
@@ -56,7 +49,7 @@ func (r *relay) onFrame(c *rconn, f *ownsandv1.DataFrame) {
 		r.mu.Unlock()
 		if st != nil {
 			// Releases the output subscription; the operation continues.
-			r.finishStream(st, nil)
+			r.finishStream(st, nil, nil)
 		}
 	case *ownsandv1.DataFrame_Error:
 		// The control plane ended the stream with an error frame (for example
@@ -69,7 +62,7 @@ func (r *relay) onFrame(c *rconn, f *ownsandv1.DataFrame) {
 		st := c.streams[f.GetStreamId()]
 		r.mu.Unlock()
 		if st != nil {
-			r.finishStream(st, nil)
+			r.finishStream(st, nil, nil)
 		}
 	case *ownsandv1.DataFrame_RelayWindowUpdate:
 		r.mu.Lock()
@@ -93,23 +86,35 @@ func (r *relay) onFrame(c *rconn, f *ownsandv1.DataFrame) {
 func (r *relay) abortStream(c *rconn, id uint64, sandboxID string, code ownsandv1.ErrorCode, msg string) {
 	r.mu.Lock()
 	st := c.streams[id]
+	if st == nil {
+		if id <= c.highest {
+			r.mu.Unlock()
+			return // The stream already ended or was rejected.
+		}
+		// A malformed first frame consumes its ID, just like a rejected open.
+		c.highest = id
+	}
 	r.mu.Unlock()
-	if st != nil {
-		sandboxID = st.g.sandboxID
+	detail := &ownsandv1.ErrorDetail{Code: code, Message: msg}
+	if st == nil {
+		r.rejectStream(c, id, sandboxID, detail)
+		return
 	}
-	r.errorFrame(c, id, sandboxID, code, msg)
-	if st != nil {
-		r.finishStream(st, &ops.Outcome{Terminal: true})
-	}
+	r.finishStream(st, &ops.Outcome{Terminal: true}, detail)
 }
 
-// openStream admits a relay stream open frame for a live grant of the
-// current channel, within the stream and credit caps, and sends the first
-// receive window.
+// openStream admits a stream on the active relay connection for a live
+// grant of the current channel and sends the first receive window.
 func (r *relay) openStream(c *rconn, f *ownsandv1.DataFrame, open *ownsandv1.RelayStreamOpen) {
 	id := f.GetStreamId()
 	now := time.Now()
 	r.mu.Lock()
+	// Check under the same lock as connClosed's stream snapshot so every
+	// admitted stream is visible to cleanup.
+	if r.conn != c || c.ctx.Err() != nil {
+		r.mu.Unlock()
+		return
+	}
 	if id <= c.highest {
 		// The control plane never reuses a stream_id; drop the frame.
 		r.mu.Unlock()
@@ -122,20 +127,20 @@ func (r *relay) openStream(c *rconn, f *ownsandv1.DataFrame, open *ownsandv1.Rel
 	if !live {
 		r.mu.Unlock()
 		r.d.logger.Info("relay stream rejected: no live grant", "grant_id", open.GetGrantId(), "stream_id", id)
-		r.sendFrame(c, id, f.GetSandboxId(), &ownsandv1.SessionEnd{Reason: ownsandv1.SessionEndReason_SESSION_END_REASON_GRANT_INVALID})
+		r.rejectStream(c, id, f.GetSandboxId(), &ownsandv1.SessionEnd{Reason: ownsandv1.SessionEndReason_SESSION_END_REASON_GRANT_INVALID})
 		return
 	}
 	if len(g.streams) >= r.limits.MaxStreamsPerGrant || len(c.streams) >= r.limits.MaxStreamsPerConnection ||
 		c.credit+r.limits.StreamReceiveWindow > r.limits.MaxConnectionCredit {
 		r.mu.Unlock()
 		r.d.logger.Warn("relay stream rejected at capacity", "grant_id", g.id, "stream_id", id)
-		r.errorFrame(c, id, g.sandboxID, ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, "agent relay stream or credit capacity reached")
+		r.rejectStream(c, id, g.sandboxID, &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, Message: "agent relay stream or credit capacity reached"})
 		return
 	}
 	sendWin, err := datapath.NewSendWindow(open.GetInitialWindowBytes())
 	if err != nil {
 		r.mu.Unlock()
-		r.errorFrame(c, id, g.sandboxID, ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid initial window")
+		r.rejectStream(c, id, g.sandboxID, &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, Message: "invalid initial window"})
 		return
 	}
 	recvWin, _ := datapath.NewReceiveWindow(r.limits.StreamReceiveWindow)
@@ -145,7 +150,7 @@ func (r *relay) openStream(c *rconn, f *ownsandv1.DataFrame, open *ownsandv1.Rel
 	c.credit += r.limits.StreamReceiveWindow
 	g.streams[st] = true
 	r.mu.Unlock()
-	r.sendFrame(c, id, g.sandboxID, &ownsandv1.RelayWindowUpdate{IncrementBytes: recvWin.InitialWindow()})
+	_ = r.enqueueStream(st.ctx, st, datapath.MustNewFrame(id, g.sandboxID, &ownsandv1.RelayWindowUpdate{IncrementBytes: recvWin.InitialWindow()}))
 }
 
 // request handles the first request frame of a stream.
@@ -173,8 +178,7 @@ func (r *relay) request(c *rconn, f *ownsandv1.DataFrame) {
 	admittable := held && g.admittable(time.Now(), r.d.timing.AdmissionTolerance)
 	r.mu.Unlock()
 	if !admittable {
-		r.sendFrame(c, st.id, g.sandboxID, &ownsandv1.SessionEnd{Reason: ownsandv1.SessionEndReason_SESSION_END_REASON_GRANT_INVALID})
-		r.finishStream(st, &ops.Outcome{})
+		r.finishStream(st, nil, &ownsandv1.SessionEnd{Reason: ownsandv1.SessionEndReason_SESSION_END_REASON_GRANT_INVALID})
 		return
 	}
 	go func() {
@@ -189,15 +193,18 @@ func (r *relay) request(c *rconn, f *ownsandv1.DataFrame) {
 				r.mu.Lock()
 				g.opened = true
 				r.mu.Unlock()
-				_ = c.enqueueCtx(st.ctx, datapath.MustNewFrame(st.id, g.sandboxID, &ownsandv1.RequestAccepted{}))
+				_ = r.enqueueStream(st.ctx, st, datapath.MustNewFrame(st.id, g.sandboxID, &ownsandv1.RequestAccepted{}))
 			},
-		}, relaySink{st})
+		}, relaySink{r, st})
 		_, _ = st.recv.Release(datapath.FrameCost(f))
-		r.finishStream(st, &out)
+		r.finishStream(st, &out, nil)
 	}()
 }
 
-type relaySink struct{ st *rstream }
+type relaySink struct {
+	r  *relay
+	st *rstream
+}
 
 // Send sends payload frames only within the credit window that the control
 // plane granted for the stream. A wait for a free outbound slot ends with
@@ -209,18 +216,78 @@ func (k relaySink) Send(ctx context.Context, f *ownsandv1.DataFrame) error {
 			return err
 		}
 	}
-	return k.st.conn.enqueueCtx(ctx, f)
+	return k.r.enqueueStream(ctx, k.st, f)
 }
 
-// finishStream removes a stream. out is the operation outcome when the
-// agent ended the stream after a request.
-func (r *relay) finishStream(st *rstream, out *ops.Outcome) {
+// enqueueStream admits a frame under the same lock as stream termination.
+// When the queue is full, the sender waits without the lock and rechecks
+// admission before it offers the frame again.
+func (r *relay) enqueueStream(ctx context.Context, st *rstream, f *ownsandv1.DataFrame) error {
+	c := st.conn
+	final := isRelayFinal(f)
+	for {
+		r.mu.Lock()
+		if err := st.ctx.Err(); err != nil {
+			r.mu.Unlock()
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			r.mu.Unlock()
+			return err
+		}
+		if st.terminalQueued {
+			r.mu.Unlock()
+			return context.Canceled
+		}
+		if c.tryEnqueue(f) {
+			st.terminalQueued = final
+			r.mu.Unlock()
+			return nil
+		}
+		// The writer takes this lock to publish free space, so a dequeue
+		// after tryEnqueue fails cannot be lost.
+		if c.outSpace == nil {
+			c.outSpace = make(chan struct{})
+		}
+		space := c.outSpace
+		r.mu.Unlock()
+		select {
+		case <-space:
+		case <-st.ctx.Done():
+			return st.ctx.Err()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// isRelayFinal identifies the last response of an operation on this stream.
+func isRelayFinal(f *ownsandv1.DataFrame) bool {
+	return f.GetError() != nil || execlog.IsFinal(f.GetExecEvent()) || f.GetExecEvent().GetPaused() != nil ||
+		f.GetFileReadEvent().GetEnd() != nil || f.GetFileWriteResult() != nil
+}
+
+// finishStream closes admission and offers a terminal frame, if any, as
+// one action. out is the dispatcher outcome or a relay request rejection.
+func (r *relay) finishStream(st *rstream, out *ops.Outcome, terminal proto.Message) {
 	r.mu.Lock()
 	if st.ended {
 		r.mu.Unlock()
 		return
 	}
 	st.ended = true
+	var fallback *ownsandv1.DataFrame
+	if terminal != nil {
+		if st.terminalQueued {
+			out = nil // The dispatcher already sent a final response.
+		} else {
+			f := datapath.MustNewFrame(st.id, st.g.sandboxID, terminal)
+			if st.conn.offerTerminal(f) {
+				fallback = f
+			}
+		}
+	}
+	st.cancel()
 	if st.conn.streams[st.id] == st {
 		delete(st.conn.streams, st.id)
 		st.conn.credit -= r.limits.StreamReceiveWindow
@@ -232,7 +299,9 @@ func (r *relay) finishStream(st *rstream, out *ops.Outcome) {
 		g.done = true
 	}
 	r.mu.Unlock()
-	st.cancel()
+	if fallback != nil {
+		r.logTerminalFallback(st.conn, fallback, g.id)
+	}
 	r.poke()
 }
 
@@ -251,31 +320,41 @@ func (r *relay) endGrantStreams(g *grant, reason ownsandv1.SessionEndReason) {
 	}
 	r.mu.Unlock()
 	for _, st := range streams {
-		r.sendSessionEnd(st, g, reason)
-		r.finishStream(st, nil)
+		r.finishStream(st, nil, &ownsandv1.SessionEnd{Reason: reason})
 	}
 }
 
-// sendSessionEnd offers the session-end frame of a stream without waiting.
-// When the queue has no free slot, the connection is canceled: the caller
-// of the stream learns of the end from the closed connection, and
-// connClosed finishes the remaining streams of the connection. Streams
-// whose frame was queued keep their frame order; the fallback is logged
-// once per connection.
-func (r *relay) sendSessionEnd(st *rstream, g *grant, reason ownsandv1.SessionEndReason) {
-	c := st.conn
-	if c.ctx.Err() != nil {
-		// The connection is already closing; no frame can follow.
-		return
-	}
-	if c.tryEnqueue(datapath.MustNewFrame(st.id, g.sandboxID, &ownsandv1.SessionEnd{Reason: reason})) {
-		return
-	}
-	if c.queueFullLogged.CompareAndSwap(false, true) {
-		r.d.logger.Warn("relay outbound queue is full; closing the connection instead of queueing a session end",
-			"generation", c.gen, "termination_reason", reason.String(), "grant_id", g.id)
+// offerTerminal cancels the connection when it cannot queue a terminal frame
+// immediately. It reports whether the queue was full. A caller ending an
+// admitted stream holds relay.mu so a blocked sender cannot overtake it.
+func (c *rconn) offerTerminal(f *ownsandv1.DataFrame) bool {
+	if c.ctx.Err() != nil || c.tryEnqueue(f) {
+		return false
 	}
 	c.cancel()
+	return true
+}
+
+// rejectStream sends a terminal response for an ID without admitted state.
+// The receiver already consumed the ID in c.highest.
+func (r *relay) rejectStream(c *rconn, id uint64, sandboxID string, terminal proto.Message) {
+	f := datapath.MustNewFrame(id, sandboxID, terminal)
+	if c.offerTerminal(f) {
+		r.logTerminalFallback(c, f, "")
+	}
+}
+
+func (r *relay) logTerminalFallback(c *rconn, f *ownsandv1.DataFrame, grantID string) {
+	if !c.queueFullLogged.CompareAndSwap(false, true) {
+		return
+	}
+	if end := f.GetSessionEnd(); end != nil {
+		r.d.logger.Warn("relay outbound queue is full; closing the connection instead of queueing a session end",
+			"generation", c.gen, "termination_reason", end.GetReason().String(), "grant_id", grantID)
+		return
+	}
+	r.d.logger.Warn("relay outbound queue is full; closing the connection instead of queueing a stream error",
+		"generation", c.gen, "error_code", f.GetError().GetCode().String(), "grant_id", grantID)
 }
 
 // revoke ends a grant at once.
@@ -292,21 +371,28 @@ func (r *relay) revoke(grantID string) {
 
 // channelLost ends every grant of the channel with AGENT_CHANNEL_LOST and
 // closes the relay connection of the channel.
-func (r *relay) channelLost(ch interface{ Generation() uint64 }) {
+func (r *relay) channelLost(ch interface{ Generation() uint64 }, lostAt time.Time) {
+	gen := ch.Generation()
 	r.mu.Lock()
+	c := r.conn
+	if c != nil && c.gen == gen && !c.flushing {
+		c.flushing = true
+		c.armFlushDeadline(lostAt)
+	} else {
+		c = nil
+	}
 	var lost []*grant
 	for id, g := range r.grants {
-		if g.ch.Generation() == ch.Generation() {
+		if g.ch.Generation() == gen {
 			lost = append(lost, g)
 			delete(r.grants, id)
 		}
 	}
-	c := r.conn
 	r.mu.Unlock()
 	for _, g := range lost {
 		r.endGrantStreams(g, ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST)
 	}
-	if c != nil && c.gen == ch.Generation() {
+	if c != nil {
 		// The session-end frames leave before the connection closes.
 		go c.closeAfterFlush()
 	}
