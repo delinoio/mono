@@ -2,13 +2,7 @@
 import { useEffect, useState } from "react";
 import { type UtcMonth, utcMonthOf } from "./format.ts";
 
-/**
- * The longest delay that `setTimeout` accepts. A larger delay overflows a
- * signed 32-bit integer and fires at once, and a UTC month lasts up to about
- * 2.68e9 ms (more than the limit of about 2.15e9 ms), so the wait for the next
- * month is split into steps of at most this length.
- */
-export const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+const WALL_CLOCK_RECHECK_MS = 60_000;
 
 /** Milliseconds from `now` to the first instant of the next UTC month. */
 function untilNextUtcMonth(now: Date): number {
@@ -16,20 +10,15 @@ function untilNextUtcMonth(now: Date): number {
   return next - now.getTime();
 }
 
-/**
- * The current UTC calendar month. It updates without a reload when the UTC
- * month changes while the component is mounted: a timer fires at the start of
- * the next month, and a return to the tab (`visibilitychange` to visible)
- * reads the clock at once, because a hidden tab may delay its timers. The
- * state changes only when the month changes, so a re-evaluation that finds the
- * same month does not render.
- */
+/** Tracks the current UTC month while the tab is visible. */
 export function useCurrentUtcMonth(): UtcMonth {
   const [current, setCurrent] = useState(() => utcMonthOf(new Date()));
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const refresh = () => {
       clearTimeout(timer);
+      if (document.visibilityState !== "visible") return;
+
       const now = new Date();
       const month = utcMonthOf(now);
       setCurrent((previous) =>
@@ -37,22 +26,19 @@ export function useCurrentUtcMonth(): UtcMonth {
           ? previous
           : month,
       );
-      // At least 1 ms, so that an early timer cannot loop without waiting.
+      // Limit the wait in case the wall clock jumps across the boundary.
       const delay = Math.min(
         Math.max(untilNextUtcMonth(now), 1),
-        MAX_TIMER_DELAY_MS,
+        WALL_CLOCK_RECHECK_MS,
       );
       timer = setTimeout(refresh, delay);
     };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") refresh();
-    };
     // Also covers a clock that moved between the render and this effect.
     refresh();
-    window.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("visibilitychange", refresh);
     return () => {
       clearTimeout(timer);
-      window.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("visibilitychange", refresh);
     };
   }, []);
   return current;
