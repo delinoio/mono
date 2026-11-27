@@ -1,0 +1,55 @@
+{
+  "gid": "inv-26-windows-runner-argument-guard",
+  "commit": "9b451ba8c4656a58e23addcf908eec11005ab602",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows amd64",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "setup": "Use an isolated Windows checkout at the stated revision, with Go 1.26.1 or later, a normal user profile, and Windows PowerShell 5.1. Run these commands in one PowerShell session from the repository root. After creating the directory, transfer the probe source to copyTo. Use the same revision and a short checkout path.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne '9b451ba8c4656a58e23addcf908eec11005ab602') { throw 'Unexpected validation revision' }",
+      "New-Item -ItemType Directory -Path '.t3-tmp\\argument-guard' -Force | Out-Null",
+      "$scratch = (Resolve-Path '.t3-tmp\\argument-guard').Path; $env:TMP = $scratch; $env:TEMP = $scratch",
+      "$probe = (Resolve-Path '.t3-tmp\\argument-guard\\argument_guard_validation_probe_test.go').Path; $target = Join-Path (Get-Location).Path 'servers\\sandrun-api\\internal\\agent\\argument_guard_validation_probe_test.go'; $replace = @{}; $replace[$target] = $probe; $overlay = Join-Path $scratch 'overlay.json'; [IO.File]::WriteAllText($overlay, (ConvertTo-Json -InputObject @{ Replace = $replace } -Depth 4 -Compress))",
+      "go test -count=1 -v -overlay $overlay ./servers/sandrun-api/internal/agent -run '^(TestArgumentGuardNativeProbe|TestStartProgramRejectsDoubleQuoteOnWindows|TestStartScriptWindows)$' 2>&1 | Tee-Object -FilePath (Join-Path $scratch 'windows-argument-guard.log'); if ($LASTEXITCODE -ne 0) { throw 'Windows argument guard validation failed' }"
+    ],
+    "expectedResults": [
+      "The probe verifies and reports Windows PowerShell 5.1.",
+      "The simulated stored Cursor pool containing a double quote returns an empty start result, no exec calls, and no native argument record. The result is a StepError with step 'start the runner program', code -1, and message 'a runner argument contains a double quote, which Windows PowerShell 5.1 cannot pass to a native program'.",
+      "The supported pool Bob's team’s pool reaches the inert native executable as exactly one argument after --pool. All trailing arguments match, and StartProgram returns an exec ID.",
+      "All selected tests pass without skips. The native fixture uses no symlinks, Hyper-V, service control, vendor credentials, or database."
+    ],
+    "optionalApiReplay": {
+      "prerequisite": "A disposable Postgres URL on Windows loopback with permission to create databases. The coordinator may use a running disposable instance or a user-mode instance. The same RPC already ran on Linux.",
+      "commands": [
+        "if (-not $env:DISPOSABLE_DATABASE_URL -or -not ([uri]$env:DISPOSABLE_DATABASE_URL).IsLoopback) { throw 'Set DISPOSABLE_DATABASE_URL to a disposable loopback instance' }; $env:SANDRUN_TEST_DATABASE_URL = $env:DISPOSABLE_DATABASE_URL",
+        "go test -count=1 -v ./servers/sandrun-api/internal/layers -run '^TestCreateAndUpdateAgentIntegrationValidateCursorPoolName$' 2>&1 | Tee-Object -FilePath (Join-Path $scratch 'windows-cursor-pool-rpc.log'); if ($LASTEXITCODE -ne 0) { throw 'Cursor RPC validation failed' }"
+      ],
+      "expectedResults": [
+        "The RPC test runs without a skip. Create and settings update return the exact invalid_argument diagnostic for a double quote and persist the supported names."
+      ]
+    },
+    "elevationRequiredFor": [
+      "Creating or controlling a new Hyper-V guest or changing OwnSand services requires an elevated account. The unprivileged fixture covers the actual runner program and native PowerShell process boundary through a local OwnSand exec stand-in."
+    ],
+    "notCoveredByProbe": [
+      "End-to-end execution inside an OwnSand-managed Windows VM with a live Cursor worker and account."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-26-windows-runner-argument-guard/worker/.t3-tmp/argument-guard/argument_guard_validation_probe_test.go",
+      "copyTo": ".t3-tmp/argument-guard/argument_guard_validation_probe_test.go",
+      "outputLogs": [
+        ".t3-tmp/argument-guard/windows-argument-guard.log",
+        ".t3-tmp/argument-guard/windows-cursor-pool-rpc.log (optional)"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-26-windows-runner-argument-guard/worker/.t3-tmp/argument-guard/agent-windows.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-26-windows-runner-argument-guard/worker/.t3-tmp/argument-guard/layers-windows.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-26-windows-runner-argument-guard/worker/.t3-tmp/argument-guard/argument-guard-probe-windows.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-26-windows-runner-argument-guard/worker/.t3-tmp/argument-guard/sandrun-api-windows.exe"
+      ]
+    },
+    "sha": "9b451ba8c4656a58e23addcf908eec11005ab602"
+  }
+}
