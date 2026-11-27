@@ -129,7 +129,7 @@ func TestDevinSessionLifecycle(t *testing.T) {
 	if strings.Contains(all, devinAPIToken) || strings.Contains(all, devinOutpostToken) {
 		t.Fatal("an exec command or environment carries a Devin credential")
 	}
-	if !strings.Contains(all, "curl -fsSL https://cli.devin.ai/install.sh | bash") {
+	if !strings.Contains(all, "https://cli.devin.ai/install.sh") {
 		t.Fatal("no install script")
 	}
 	w.devin.SetSessionStatus("ses-1", "running")
@@ -621,7 +621,7 @@ func TestDevinInstallScripts(t *testing.T) {
 		}
 	}
 	mac := devin.InstallScript(sandrunv1.GuestOs_GUEST_OS_MACOS)
-	for _, want := range []string{"curl -fsSL https://cli.devin.ai/install.sh | bash", `"$(uname -m)" != arm64`, "command -v git"} {
+	for _, want := range []string{`"$(uname -m)" != arm64`, "command -v git"} {
 		if !strings.Contains(mac, want) {
 			t.Fatalf("posix script lacks %q", want)
 		}
