@@ -184,10 +184,18 @@ func TestCLIMisc(t *testing.T) {
 	}
 	// Linux base images are not built by the agent, and an unknown guest
 	// OS is a usage error; neither touches the state directory.
-	for _, os := range []string{"linux", "plan9"} {
-		if code := run([]string{"image", "build", "--os", os}, nil, &out, &errb); code != exitUsage {
-			t.Fatalf("image build --os %s: %d", os, code)
-		}
+	for _, guestOS := range []string{"linux", "plan9"} {
+		t.Run(guestOS, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), "state")
+			var out, errb bytes.Buffer
+			args := []string{"image", "build", "--os", guestOS, "--state-dir", stateDir}
+			if code := run(args, nil, &out, &errb); code != exitUsage {
+				t.Fatalf("image build exit code = %d, want %d (stderr: %q)", code, exitUsage, errb.String())
+			}
+			if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+				t.Fatalf("state path %q should be absent (stat error: %v)", stateDir, err)
+			}
+		})
 	}
 	t.Setenv("OWNSAND_AGENT_STATE_DIR", t.TempDir())
 	if code := run([]string{"run"}, nil, &out, &errb); code != exitNotEnrolled {
