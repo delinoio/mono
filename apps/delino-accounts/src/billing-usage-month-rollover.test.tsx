@@ -84,6 +84,8 @@ async function returnToTab() {
 describe("usage month limit", () => {
   test("Next becomes available when the UTC month changes while the page is open", async () => {
     const api = await renderUsage("2026-12-31T23:59:59Z");
+    const initialSummaryMonths = summaryMonths(api);
+    expect(initialSummaryMonths).toEqual([[2026, 12]]);
     expect(monthLabel()).toBe("December 2026 (UTC)");
     expect(nextButton().disabled).toBe(true);
 
@@ -91,9 +93,7 @@ describe("usage month limit", () => {
     // The selected month stays and its data is not read again.
     expect(monthLabel()).toBe("December 2026 (UTC)");
     expect(nextButton().disabled).toBe(false);
-    expect(new Set(summaryMonths(api).map(String))).toEqual(
-      new Set(["2026,12"]),
-    );
+    expect(summaryMonths(api)).toEqual(initialSummaryMonths);
 
     // The new current month is requested and is the limit again.
     await act(async () => {
