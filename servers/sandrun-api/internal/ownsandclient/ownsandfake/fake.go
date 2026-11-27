@@ -84,6 +84,8 @@ type Org struct {
 	// OnFileRead observes the context and parameters before any chunks are
 	// written. It runs without the fake lock.
 	OnFileRead func(context.Context, ownsand.FileReadParams)
+	// OnFileWriteFinish runs before finalizing a file write, without the fake lock.
+	OnFileWriteFinish func(context.Context, ownsand.FileWriteParams) error
 	// StartRunning makes new sandboxes RUNNING at once (the default);
 	// false keeps them CREATING until the test calls SetRunning.
 	StartRunning bool
@@ -550,6 +552,14 @@ func (w *fileWrite) WriteChunk(ctx context.Context, offset int64, data []byte) (
 }
 
 func (w *fileWrite) Finish(ctx context.Context, offset int64, data []byte, sizeBytes int64, mode uint32) (*ownsandv1.WriteFileResponse, error) {
+	w.c.f.mu.Lock()
+	onWrite := w.c.f.orgs[w.c.org].OnFileWriteFinish
+	w.c.f.mu.Unlock()
+	if onWrite != nil {
+		if err := onWrite(ctx, w.p); err != nil {
+			return nil, err
+		}
+	}
 	return w.send(offset, data, &ownsandv1.WriteFileFinish{SizeBytes: sizeBytes, Mode: mode})
 }
 
