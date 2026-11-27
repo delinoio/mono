@@ -119,6 +119,7 @@ Installation and linking:
 - One GitHub installation links to exactly one SandRun organization. A SandRun organization can link several installations.
 - Installations of personal accounts fail with `failed_precondition`, because SandRun registers only organization-level runners.
 - When GitHub sends an `installation` event with `deleted` or `suspend`, the server marks the installation inactive, ends its queued requests with `CANCELED` and deletes its runners that wait for a job.
+- The installation webhook locks the SandRun organization before it locks the installation and its work. It uses the locked installation state and ignores the delivery if the organization or link disappears or the link moves to another organization while it waits.
 
 Job matching:
 
