@@ -20,11 +20,18 @@ import (
 
 func TestSyncCaseOnlyReplacement(t *testing.T) {
 	needPOSIX(t)
-	const (
-		old       = "Assets/nested/old.txt"
-		guestOnly = "Assets/nested/guest.txt"
-		incoming  = "assets"
-	)
+	testSyncDirectoryAliasReplacement(t, sandrunv1.GuestOs_GUEST_OS_MACOS, "Assets", "assets", nil)
+}
+
+func TestSyncNormalizationDirectoryReplacement(t *testing.T) {
+	needPOSIX(t)
+	testSyncDirectoryAliasReplacement(t, sandrunv1.GuestOs_GUEST_OS_MACOS, "caf\u00e9", "cafe\u0301", nil)
+}
+
+func testSyncDirectoryAliasReplacement(t *testing.T, osys sandrunv1.GuestOs, oldDir, incoming string, prepareWorkspace func(*testing.T, string)) {
+	t.Helper()
+	old := oldDir + "/nested/old.txt"
+	guestOnly := oldDir + "/nested/guest.txt"
 	c, srv, org := newTestClient(t, "")
 	ctx := context.Background()
 	for _, scenario := range []struct {
@@ -35,19 +42,27 @@ func TestSyncCaseOnlyReplacement(t *testing.T) {
 		{name: "guest-only-file", guestFile: true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
-			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_MACOS)
+			ds := newSession(t, c, srv, org, osys)
+			ws := ds.GetWorkspacePath()
+			if prepareWorkspace != nil {
+				prepareWorkspace(t, ws)
+			}
 			dir := newRepo(t, map[string]string{old: "old"}, nil, "")
+			// Preserve the original spellings when Git lists the staged paths on macOS.
+			git(t, dir, "config", "core.precomposeUnicode", "false")
 			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
 			if _, err := c.Sync(ctx, params); err != nil {
 				t.Fatal(err)
 			}
-			ws := ds.GetWorkspacePath()
+			if readGuest(t, ds, old) != "old" || len(guestManifest(t, ds).Files) != 1 {
+				t.Fatal("first sync did not install the tracked file")
+			}
 			info, err := os.Stat(filepath.Join(ws, incoming))
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				t.Fatal(err)
 			}
 			aliases := err == nil && info.IsDir()
-			t.Logf("guest aliases Assets and assets: %t", aliases)
+			t.Logf("guest aliases %q and %q: %t", oldDir, incoming, aliases)
 			before, err := os.ReadFile(ws + manifestSuffix)
 			if err != nil {
 				t.Fatal(err)
@@ -57,7 +72,7 @@ func TestSyncCaseOnlyReplacement(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			git(t, dir, "rm", "-q", "-r", "Assets")
+			git(t, dir, "rm", "-q", "-r", oldDir)
 			if err := os.WriteFile(filepath.Join(dir, incoming), []byte("new"), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -88,17 +103,31 @@ func TestSyncCaseOnlyReplacement(t *testing.T) {
 			if scenario.guestFile && readGuest(t, ds, guestOnly) != "guest" {
 				t.Fatal("guest-only file contents changed")
 			}
-			if !aliases {
-				entries, err := os.ReadDir(filepath.Join(ws, "Assets/nested"))
-				if err != nil {
-					t.Fatalf("distinct guest directory was not preserved: %v", err)
-				}
+			if !aliases || scenario.guestFile {
 				if _, err := os.Stat(filepath.Join(ws, old)); !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("old tracked file in distinct guest directory: %v (entries: %v)", err, entries)
+					t.Fatalf("old tracked file was not removed: %v", err)
 				}
 			}
-			if matches, _ := filepath.Glob(ws + ".sandrun-sync-*"); len(matches) != 0 {
-				t.Fatalf("temporary files left: %v", matches)
+			if !aliases {
+				if _, err := os.ReadDir(filepath.Join(ws, oldDir, "nested")); err != nil {
+					t.Fatalf("distinct guest directory was not preserved: %v", err)
+				}
+			}
+			requests := srv.ExecRequests()
+			apply, cleanup := requests[len(requests)-2], requests[len(requests)-1]
+			aliasList := apply.GetEnv()[guestEnvAliasPrunes]
+			if oldDir == incoming {
+				if aliasList != "" || apply.GetEnv()[guestEnvPrunes] == "" {
+					t.Fatal("exact-spelling replacement should use the ordinary prune list")
+				}
+			} else if aliasList == "" || cleanup.GetEnv()[guestEnvAliasPrunes] != aliasList {
+				t.Fatal("apply and cleanup did not receive the same alias prune list")
+			}
+			if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("sync lock was not removed: %v", err)
+			}
+			if matches, err := filepath.Glob(ws + ".sandrun-sync-*"); err != nil || len(matches) != 0 {
+				t.Fatalf("temporary files after sync: %v, glob error: %v", matches, err)
 			}
 		})
 	}
