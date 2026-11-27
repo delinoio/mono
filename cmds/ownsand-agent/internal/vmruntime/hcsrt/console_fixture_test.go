@@ -19,9 +19,8 @@ import (
 // the load of CI.
 const consoleFixtureBound = 30 * time.Second
 
-// consoleFixtureReclaimBound is the wait for a pending Accept to return after
-// its listener closed. Closing the listener ends Accept at once, so the bound
-// only guards against a broken listener.
+// consoleFixtureReclaimBound limits the wait for Accept to return after
+// listener closure, including the probe that verifies closure.
 const consoleFixtureReclaimBound = 10 * time.Second
 
 // errConsoleFixtureTimeout marks an accept or a write that exceeded its bound.
@@ -105,9 +104,27 @@ func TestAcceptWithinTimeoutNamesAttemptAndClosesListener(t *testing.T) {
 	if !strings.Contains(err.Error(), "accept attempt 2 timed out") {
 		t.Fatalf("the error does not name the attempt: %q", err.Error())
 	}
-	// The listener is closed: a second Accept fails at once.
-	if _, err := l.Accept(); err == nil {
-		t.Fatal("the listener still accepts after the timeout")
+	timer := time.NewTimer(consoleFixtureReclaimBound)
+	defer timer.Stop()
+	probeResult := make(chan error, 1)
+	go func() {
+		conn, err := l.Accept()
+		if conn != nil {
+			conn.Close()
+		}
+		probeResult <- err
+	}()
+
+	select {
+	case err := <-probeResult:
+		if err == nil {
+			t.Fatal("listener closure check accepted a connection")
+		}
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("listener closure check returned %v, want net.ErrClosed", err)
+		}
+	case <-timer.C:
+		t.Fatalf("listener closure check timed out after %s", consoleFixtureReclaimBound)
 	}
 }
 
