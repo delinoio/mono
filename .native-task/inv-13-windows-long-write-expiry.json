@@ -1,0 +1,46 @@
+{
+  "gid": "inv-13-windows-long-write-expiry",
+  "commit": "d83f3ca4a762857c1f877b76da8996cf643ef00b",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "d83f3ca4a762857c1f877b76da8996cf643ef00b",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "setup": "Use a disposable Windows guest on delino-win-1 with LongPathsEnabled disabled before the processes start. Windows Server 2016 build 14393 is a candidate. Use a short ASCII repository path on a local NTFS volume. Run the commands at the repository root in one PowerShell session. Copy the qualification file after the first command. If the fixed run cannot qualify both APIs in one process, preserve the log and keep acceptance pending until a compatible guest is available.",
+    "commands": [
+      "$root = (Get-Location).Path; New-Item -ItemType Directory -Force -Path '.t3-tmp', '.t3-tmp\\go-temp' | Out-Null; $env:TEMP = Join-Path $root '.t3-tmp\\go-temp'; $env:TMP = $env:TEMP",
+      "if ((git rev-parse HEAD) -ne 'd83f3ca4a762857c1f877b76da8996cf643ef00b') { throw 'Check out the implementation revision before validating' }; go version; Get-CimInstance Win32_OperatingSystem | Select-Object Caption, BuildNumber; Get-ItemProperty -LiteralPath 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem' -Name LongPathsEnabled -ErrorAction SilentlyContinue | Select-Object LongPathsEnabled",
+      "$virtual = Join-Path $root 'cmds\\ownsand-guest\\guest\\win32_path_limit_windows_test.go'; $probe = Join-Path $root '.t3-tmp\\win32_path_limit_windows_test.go'; if (!(Test-Path -LiteralPath $probe)) { throw 'Copy the qualification probe first' }; $replace = @{}; $replace[$virtual] = $probe; $fixedOverlay = Join-Path $root '.t3-tmp\\win32-fixed-overlay.json'; @{Replace=$replace} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fixedOverlay -Encoding Ascii",
+      "go test -mod=readonly \"-overlay=$fixedOverlay\" -json -count=1 -timeout=2m -run '^TestWrite(Expiry|Recovery|FinishedRecordFailureIsRetriedBySweep)' ./cmds/ownsand-guest/guest | Tee-Object -FilePath '.t3-tmp\\win32-fixed-write-expiry.jsonl'; if ($LASTEXITCODE -ne 0) { throw 'Qualification or fixed-revision validation failed. Inspect the JSON log.' }",
+      "$baselineSource = Join-Path $root '.t3-tmp\\baseline-writestate_windows.go'; $baselineCode = git show '8c90863a7ecce91e40fb0ac20ce57e67d5200bda:cmds/ownsand-guest/guest/writestate_windows.go'; if ($LASTEXITCODE -ne 0) { throw 'Baseline source is missing' }; $baselineCode | Set-Content -LiteralPath $baselineSource -Encoding Ascii; $replace[(Join-Path $root 'cmds\\ownsand-guest\\guest\\writestate_windows.go')] = $baselineSource; $baselineOverlay = Join-Path $root '.t3-tmp\\win32-baseline-overlay.json'; @{Replace=$replace} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $baselineOverlay -Encoding Ascii",
+      "go test -mod=readonly \"-overlay=$baselineOverlay\" -json -count=1 -timeout=2m -run '^TestWriteExpiry(WindowsPathLimitQualification|OfLongStagingPath)$' ./cmds/ownsand-guest/guest | Tee-Object -FilePath '.t3-tmp\\win32-baseline-write-expiry.jsonl'; if ($LASTEXITCODE -ne 1) { throw 'Expected the baseline regression run to exit 1' }; $events = Get-Content '.t3-tmp\\win32-baseline-write-expiry.jsonl' | ForEach-Object { $_ | ConvertFrom-Json }; if (-not ($events | Where-Object { $_.Action -eq 'pass' -and $_.Test -eq 'TestWriteExpiryWindowsPathLimitQualification' })) { throw 'Baseline process did not qualify' }; foreach ($case in 'live','recovered','recovered_replacement') { $name = 'TestWriteExpiryOfLongStagingPath/' + $case; if (-not ($events | Where-Object { $_.Action -eq 'fail' -and $_.Test -eq $name })) { throw ('Expected baseline failure in ' + $name) } }"
+    ],
+    "expectedResults": [
+      "The fixed test process creates the ordinary absolute path using os.OpenFile. Raw unprefixed CreateFileW rejects that same path with ERROR_FILENAME_EXCED_RANGE.",
+      "The ordinary and already-prefixed fixtures remove the original staging file and its record for live and recovered writes. The recovered replacement case keeps the replacement and removes the record. Each case checks that the upload target still contains its original bytes.",
+      "The fixed run exits zero. Existing short-path recovery and cleanup retry cases also pass, including the Windows record-sharing fixture.",
+      "The baseline control qualifies in its own test process and exits one. The live and recovered matching cases report remaining staging. The recovered replacement case reports a retained record. Inspect the JSON lines for these specific failures."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-long-write-expiry/worker/.t3-tmp/windows-write-expiry/win32_path_limit_windows_test.go",
+      "copyTo": ".t3-tmp/win32_path_limit_windows_test.go",
+      "regressionTests": [
+        "cmds/ownsand-guest/guest/writestate_test.go",
+        "cmds/ownsand-guest/guest/writestate_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/win32-fixed-write-expiry.jsonl",
+        ".t3-tmp/win32-baseline-write-expiry.jsonl"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-long-write-expiry/worker/.t3-tmp/windows-write-expiry/ownsand-guest-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-long-write-expiry/worker/.t3-tmp/windows-write-expiry/ownsand-guest-arm64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-long-write-expiry/worker/.t3-tmp/windows-write-expiry/guest-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-long-write-expiry/worker/.t3-tmp/windows-write-expiry/guest-arm64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-long-write-expiry/worker/.t3-tmp/windows-write-expiry/guest-qualified-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-long-write-expiry/worker/.t3-tmp/windows-write-expiry/guest-baseline-qualified-amd64.test.exe"
+      ]
+    }
+  }
+}
