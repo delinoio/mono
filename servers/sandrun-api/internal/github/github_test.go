@@ -424,7 +424,9 @@ func TestCanceledJobSurplus(t *testing.T) {
 	// yet): GitHub refuses the removal, and the runner stays.
 	w.gh.SetBusy("sandrun-"+first.GetRunnerId(), true)
 	w.send(t, "workflow_job", job("completed", 501, 2, sandRunLinux, ""))
-	w.l.GitHub.Wait()
+	eventually(t, "GitHub runner removal refused", func() bool {
+		return strings.Contains(w.env.Logs.String(), "github_runner_removal_refused")
+	})
 	stays(t, "refused runner", func() bool {
 		return w.runner(t, first.GetRunnerId()).GetState() == sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
 	})
@@ -512,7 +514,12 @@ func TestCanceledJobSurplusReserve(t *testing.T) {
 			}
 
 			w.send(t, "workflow_job", job("completed", 501, 1, sandRunLinux, ""))
-			w.l.GitHub.Wait()
+			w.l.GitHub.CheckSurplusOnce(t.Context())
+			if !tc.failLookup {
+				eventually(t, "surplus sandbox cleanup", func() bool {
+					return len(w.runnersIn(t, sandrunv1.RunnerState_RUNNER_STATE_DELETED)) == len(idle)-tc.retained
+				})
+			}
 			if req := w.requestOfJob(t, 1); req.GetState() != sandrunv1.RequestState_REQUEST_STATE_CANCELED || req.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE {
 				t.Fatalf("request after completion: %v", req)
 			}
@@ -581,7 +588,9 @@ func TestSurplusWhileStarting(t *testing.T) {
 		// GitHub gave the runner a job; its in_progress event has not come.
 		w.gh.SetBusy("sandrun-"+id, true)
 		w.send(t, "workflow_job", job("completed", 501, 1, sandRunLinux, ""))
-		w.l.GitHub.Wait()
+		eventually(t, "GitHub runner removal refused", func() bool {
+			return strings.Contains(w.env.Logs.String(), "github_runner_removal_refused")
+		})
 		if got := w.runner(t, id).GetState(); got != sandrunv1.RunnerState_RUNNER_STATE_PREPARING {
 			t.Fatalf("the busy runner changed to %v", got)
 		}
@@ -617,16 +626,19 @@ func TestSurplusWhileStarting(t *testing.T) {
 		}
 		id := starting[0].GetRunnerId()
 		w.send(t, "workflow_job", job("completed", 501, 1, sandRunLinux, ""))
-		w.l.GitHub.Wait()
-		if r := w.runner(t, id); r.GetState() != sandrunv1.RunnerState_RUNNER_STATE_DELETED || r.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_SURPLUS {
-			t.Fatalf("surplus runner %v", r)
-		}
+		eventually(t, "unregistered surplus runner marked for deletion", func() bool {
+			return w.runner(t, id).GetState() == sandrunv1.RunnerState_RUNNER_STATE_DELETING
+		})
 		w.gh.Update(func() { w.gh.JITGate = nil })
 		close(release)
 		released = true
 		eventually(t, "the late registration removed", func() bool {
 			_, ok := w.gh.RunnerByName("sandrun-" + id)
 			return w.gh.Calls("generate_jitconfig") == 1 && !ok
+		})
+		eventually(t, "surplus runner sandbox deleted", func() bool {
+			r := w.runner(t, id)
+			return r.GetState() == sandrunv1.RunnerState_RUNNER_STATE_DELETED && r.GetEndReason() == sandrunv1.RunnerEndReason_RUNNER_END_REASON_SURPLUS
 		})
 		stays(t, "no runner program", func() bool {
 			for _, cmd := range w.progs.all() {
@@ -954,15 +966,15 @@ func TestCompletedBeforeQueued(t *testing.T) {
 // deactivation of the installation holds the link waits for it and then
 // stores no request for the inactive installation.
 func TestJobWaitsForDeactivation(t *testing.T) {
-	w := newGHWorld(t, worldOpts{})
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
-	ctx := context.Background()
+	ctx := t.Context()
 	tx, err := w.env.DB.Pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer func() { _ = tx.Rollback(context.Background()) }()
 	if _, err := tx.Exec(ctx, "SELECT 1 FROM github_installations WHERE github_installation_id = 501 FOR UPDATE"); err != nil {
 		t.Fatal(err)
 	}
@@ -971,11 +983,7 @@ func TestJobWaitsForDeactivation(t *testing.T) {
 		_, status := w.gh.Send("workflow_job", job("queued", 501, 60, sandRunLinux, ""))
 		done <- status
 	}()
-	select {
-	case status := <-done:
-		t.Fatalf("the delivery did not wait for the deactivation (status %d)", status)
-	case <-time.After(500 * time.Millisecond):
-	}
+	waitForDeactivationLookup(t, w, tx.Conn().PgConn().PID(), done)
 	if _, err := tx.Exec(ctx, "UPDATE github_installations SET state = $1 WHERE github_installation_id = 501",
 		int16(sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_SUSPENDED)); err != nil {
 		t.Fatal(err)
@@ -988,6 +996,46 @@ func TestJobWaitsForDeactivation(t *testing.T) {
 	}
 	if n := len(w.requests(t)); n != 0 {
 		t.Fatalf("%d requests for a suspended installation", n)
+	}
+}
+
+func waitForDeactivationLookup(t *testing.T, w *ghWorld, blocker uint32, done <-chan int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	observer, err := w.env.DB.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire installation lock observer: %v", err)
+	}
+	defer observer.Release()
+
+	const lookupSuffix = " FROM github_installations WHERE github_installation_id = $1 FOR SHARE"
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case status := <-done:
+			t.Fatalf("delivery finished before the installation lock wait was observed (status %d)", status)
+		case <-ctx.Done():
+			t.Fatalf("waiting for the delivery's installation lock: %v", ctx.Err())
+		case <-ticker.C:
+		}
+
+		var waiting bool
+		if err := observer.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+				AND starts_with(query, 'SELECT ') AND right(query, length($2::text)) = $2
+				AND $1 = ANY(pg_blocking_pids(pid))
+		)`, blocker, lookupSuffix).Scan(&waiting); err != nil {
+			t.Fatalf("observe the delivery's installation lock: %v", err)
+		}
+		if waiting {
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("waiting for the delivery's installation lock: %v", err)
+			}
+			return
+		}
 	}
 }
 

@@ -8,6 +8,7 @@ import {
 import { Textarea as TextareaPart } from "@ui-sdk/react/textarea";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
+import { renderFieldLabel } from "./field-label-render.tsx";
 import { useFieldAutoFocus } from "./panel-autofocus.ts";
 
 export type TextareaProps = React.ComponentProps<typeof TextareaPart> & {
@@ -52,7 +53,12 @@ export function Textarea({
       disabled={disabled}
       invalid={hasError && !disabled ? true : undefined}
     >
-      <FieldLabel className="dui-text-field-label">{label}</FieldLabel>
+      <FieldLabel
+        className="dui-text-field-label"
+        render={renderFieldLabel(props.id, props.render != null)}
+      >
+        {label}
+      </FieldLabel>
       <TextareaPart
         className={mergeClassName("dui-textarea", className)}
         disabled={disabled}

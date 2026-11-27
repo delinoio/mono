@@ -250,6 +250,65 @@ func TestRunners(t *testing.T) {
 	}
 }
 
+func TestFakeDeleteRunnerOrganization(t *testing.T) {
+	c, f, _ := newClient(t)
+	const ownerID, otherID = 1, 2
+	f.AddInstallation(ownerID, "acme", "Organization")
+	f.AddInstallation(otherID, "other", "Organization")
+	ctx := t.Context()
+
+	register := func(name string) int64 {
+		t.Helper()
+		jit, err := c.GenerateJITConfig(ctx, ownerID, "acme", name, 1, []string{"sandrun-linux"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return jit.Runner.ID
+	}
+	idle := register("idle")
+	busy := register("busy")
+	f.SetBusy("busy", true)
+
+	// The client treats 404 and 204 as success. Check the fake's HTTP status directly.
+	checkDelete := func(installationID int64, org string, runnerID int64, wantStatus int) {
+		t.Helper()
+		token, err := c.InstallationToken(ctx, installationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		url := fmt.Sprintf("%s/orgs/%s/actions/runners/%d", f.Server.URL, org, runnerID)
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := f.Server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != wantStatus {
+			t.Errorf("delete runner %d through %s: got HTTP %d, want %d", runnerID, org, resp.StatusCode, wantStatus)
+		}
+	}
+
+	checkDelete(otherID, "other", idle, http.StatusNotFound)
+	checkDelete(otherID, "other", busy, http.StatusNotFound)
+	for _, name := range []string{"idle", "busy"} {
+		if runner, ok := f.RunnerByName(name); !ok || runner.Org != "acme" {
+			t.Errorf("runner %q no longer registered to acme after out-of-scope deletion", name)
+		}
+	}
+
+	f.Update(func() { f.FailDelete = http.StatusServiceUnavailable })
+	checkDelete(otherID, "other", busy, http.StatusServiceUnavailable)
+	f.Update(func() { f.FailDelete = 0 })
+
+	checkDelete(ownerID, "ACME", busy, http.StatusUnprocessableEntity)
+	checkDelete(ownerID, "ACME", idle, http.StatusNoContent)
+	checkDelete(ownerID, "ACME", idle, http.StatusNotFound)
+}
+
 func TestOAuth(t *testing.T) {
 	c, f, logs := newClient(t)
 	f.AddInstallation(1, "acme", "Organization", "octo")

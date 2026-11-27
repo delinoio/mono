@@ -463,7 +463,7 @@ func (f *Fake) serveOrg(w http.ResponseWriter, r *http.Request, org string, rest
 		switch {
 		case f.FailDelete != 0:
 			writeJSON(w, f.FailDelete, map[string]string{"message": "failed"})
-		case x == nil:
+		case x == nil || !strings.EqualFold(x.Org, org):
 			writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
 		case x.Busy:
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"message": "Validation Failed", "documentation_url": "x"})

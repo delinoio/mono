@@ -67,8 +67,10 @@ function fakeGo(t, script) {
 // A fake `go` whose "build" writes a program that prints the variables it
 // received and exits.
 function fakeGoBuildingEnvPrinter(t) {
-  const program = `#!${process.execPath}
+  const program = `#!/bin/sh
+exec "$FIXTURE_NODE" - <<'SERVER_JS'
 console.log(JSON.stringify({ event: "env", cors: process.env.CORS_ORIGINS, direct: process.env.ALLOW_DIRECT_CLIENT_ADDRESS, database: process.env.DATABASE_URL }));
+SERVER_JS
 `;
   return fakeGo(
     t,
@@ -86,6 +88,7 @@ async function runLauncher(t, { env, goDir }) {
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   const childEnv = {
     ...process.env,
+    FIXTURE_NODE: process.execPath,
     PATH: `${goDir}${delimiter}${process.env.PATH}`,
     TMPDIR: tmp,
   };

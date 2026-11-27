@@ -226,8 +226,14 @@ func TestRelayAdmissionStreamOpenWait(t *testing.T) {
 		}
 	}
 
-	expect := func(t *testing.T, name string) {
+	expect := func(t *testing.T, name string, activeStreams int) {
 		t.Helper()
+		checkStreams := func(t *testing.T) {
+			t.Helper()
+			if got := conn.StreamCount(); got != activeStreams {
+				t.Fatalf("open streams after rejected admission = %d, want %d", got, activeStreams)
+			}
+		}
 		t.Run(name+"/deadline", func(t *testing.T) {
 			before := countRPCCode(env, readFileProcedure, connect.CodeDeadlineExceeded)
 			start := time.Now()
@@ -240,6 +246,7 @@ func TestRelayAdmissionStreamOpenWait(t *testing.T) {
 				t.Fatalf("the call ended after %v, want about the 200 ms server deadline", took)
 			}
 			waitRPCCode(t, env, readFileProcedure, connect.CodeDeadlineExceeded, before)
+			checkStreams(t)
 		})
 		t.Run(name+"/cancel", func(t *testing.T) {
 			before := countRPCCode(env, readFileProcedure, connect.CodeCanceled)
@@ -254,10 +261,12 @@ func TestRelayAdmissionStreamOpenWait(t *testing.T) {
 				t.Fatalf("cancellation during the stream open: %v, want canceled", err)
 			}
 			waitRPCCode(t, env, readFileProcedure, connect.CodeCanceled, before)
+			checkStreams(t)
 		})
 	}
 	// The call itself waits for room in the full queue.
-	expect(t, "queue full")
+	fillerStreams := conn.StreamCount()
+	expect(t, "queue full", fillerStreams)
 
 	// Another open holds the open order while it waits for room, so the call
 	// waits for its turn.
@@ -267,8 +276,22 @@ func TestRelayAdmissionStreamOpenWait(t *testing.T) {
 		_, err := conn.Open(holderCtx, "holder", sandboxID)
 		holderDone <- err
 	}()
-	time.Sleep(200 * time.Millisecond) // the holder takes the open order and blocks
-	expect(t, "open order held")
+	t.Cleanup(func() {
+		stopHolder()
+		select {
+		case <-holderDone:
+		case <-time.After(5 * time.Second):
+			t.Error("the open order holder did not return")
+		}
+	})
+	waitUntil := time.Now().Add(5 * time.Second)
+	for conn.StreamCount() != fillerStreams+1 {
+		if time.Now().After(waitUntil) {
+			t.Fatal("the holder did not allocate its stream")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	expect(t, "open order held", fillerStreams+1)
 
 	// A connection that closes while the call waits stays unavailable, and
 	// the call does not report a context error.
@@ -282,6 +305,4 @@ func TestRelayAdmissionStreamOpenWait(t *testing.T) {
 	if testenv.Code(err) != connect.CodeUnavailable {
 		t.Fatalf("connection closed during the stream open: %v after %v, want unavailable", err, time.Since(start))
 	}
-	stopHolder()
-	<-holderDone
 }

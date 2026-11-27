@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -38,6 +39,8 @@ const (
 	maxBody = 4 << 20
 	// maxEventLine bounds one line of an event stream.
 	maxEventLine = 1 << 20
+	// maxEventData bounds the joined data lines of one event.
+	maxEventData = 1 << 20
 	// maxErrorBody bounds the body used to check for a known error code.
 	maxErrorBody = 64 << 10
 	// DefaultCallTimeout bounds one unary call when the caller's context has
@@ -68,6 +71,9 @@ type Client struct {
 	Auth Auth
 	// Logger receives vendor_api_error records.
 	Logger *slog.Logger
+	// StreamErrorBodyTimeout limits reads after non-2xx stream headers.
+	// Zero selects DefaultCallTimeout.
+	StreamErrorBodyTimeout time.Duration
 }
 
 // StatusError is a vendor API answer that is not 2xx.
@@ -255,9 +261,12 @@ type Event struct {
 // Stream opens an event stream with GET and calls fn for each event until
 // the stream ends (nil), ctx ends (ctx.Err()), fn returns an error (that
 // error) or the connection fails. A non-2xx answer returns a *StatusError.
+// A 2xx answer must have a text/event-stream media type.
 // header adds request headers, for example Last-Event-ID.
 func (c *Client) Stream(ctx context.Context, op, path string, query url.Values, header http.Header, fn func(Event) error) error {
-	req, err := c.newRequest(ctx, http.MethodGet, path, query, nil)
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req, err := c.newRequest(reqCtx, http.MethodGet, path, query, nil)
 	if err != nil {
 		return err
 	}
@@ -275,7 +284,21 @@ func (c *Client) Stream(ctx context.Context, op, path string, query url.Values, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		timeout := c.StreamErrorBodyTimeout
+		if timeout == 0 {
+			timeout = DefaultCallTimeout
+		}
+		// Cancel the HTTP request to interrupt a blocked response-body read.
+		timer := time.AfterFunc(timeout, cancel)
+		defer timer.Stop()
 		return c.statusError(ctx, op, resp)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || mediaType != "text/event-stream" {
+		return fmt.Errorf("%s %s: expected Content-Type text/event-stream", c.Vendor, op)
 	}
 	err = ReadEvents(resp.Body, fn)
 	if ctx.Err() != nil {
@@ -291,12 +314,13 @@ func (c *Client) Stream(ctx context.Context, op, path string, query url.Values, 
 // following the WHATWG event stream rules. It skips one leading UTF-8 BOM
 // and accepts LF, CRLF, and CR line endings. Comment lines start with `:`.
 // A blank line dispatches an event with data, joining its `data:` lines with `\n`.
+// A payload above maxEventData ends the stream with an error before dispatch.
 func ReadEvents(r io.Reader, fn func(Event) error) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), maxEventLine)
 	sc.Split(splitEventLines())
 	var ev Event
-	var data [][]byte
+	data := []byte{}
 	hasData := false
 	firstLine := true
 	for sc.Scan() {
@@ -307,7 +331,7 @@ func ReadEvents(r io.Reader, fn func(Event) error) error {
 		}
 		if len(line) == 0 {
 			if hasData {
-				ev.Data = bytes.Join(data, []byte("\n"))
+				ev.Data = data
 				if ev.Name == "" {
 					ev.Name = "message"
 				}
@@ -315,7 +339,7 @@ func ReadEvents(r io.Reader, fn func(Event) error) error {
 					return err
 				}
 			}
-			ev, data, hasData = Event{ID: ev.ID}, nil, false
+			ev, data, hasData = Event{ID: ev.ID}, []byte{}, false
 			continue
 		}
 		if line[0] == ':' {
@@ -327,7 +351,17 @@ func ReadEvents(r io.Reader, fn func(Event) error) error {
 		case "event":
 			ev.Name = string(value)
 		case "data":
-			data = append(data, append([]byte(nil), value...))
+			size := len(data) + len(value)
+			if hasData {
+				size++ // Include the newline between data lines.
+			}
+			if size > maxEventData {
+				return fmt.Errorf("event stream payload exceeds %d bytes", maxEventData)
+			}
+			if hasData {
+				data = append(data, '\n')
+			}
+			data = append(data, value...)
 			hasData = true
 		case "id":
 			if !bytes.ContainsRune(value, 0) {

@@ -34,6 +34,8 @@ type FakeAgent struct {
 	Capabilities *ownsandv1.DeviceCapabilities
 	// AgentVersion is the running agent version reported at connect.
 	AgentVersion string
+	// ResumeFenceSupported is reported when the next channel opens.
+	ResumeFenceSupported bool
 	// OnCommand, when set, answers a command instead of the default
 	// behavior; returning nil sends no result.
 	OnCommand func(a *FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult
@@ -163,7 +165,7 @@ func (a *FakeAgent) OpenChannel() {
 	a.closed = make(chan struct{})
 	go a.read()
 	a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CapabilityReport{CapabilityReport: &ownsandv1.CapabilityReport{
-		HostOs: a.HostOS, Arch: a.Arch, AgentVersion: a.AgentVersion, Capabilities: a.Capabilities,
+		HostOs: a.HostOS, Arch: a.Arch, AgentVersion: a.AgentVersion, Capabilities: a.Capabilities, ResumeFenceSupported: a.ResumeFenceSupported,
 	}}})
 	seq := a.SendStateReport()
 	a.mu.Lock()
@@ -276,6 +278,8 @@ func (a *FakeAgent) ResumeReads() {
 
 func (a *FakeAgent) read() {
 	defer close(a.closed)
+	// Release the gate before reporting that the channel has closed.
+	defer a.ResumeReads()
 	for {
 		a.mu.Lock()
 		gate := a.readGate
