@@ -271,9 +271,12 @@ type OrganizationBillingStatus struct {
 	// ListBillingStatusChanges. A caller keeps the status with the highest
 	// sequence and ignores a status whose billing_account_id differs from the
 	// link that it knows, which can arrive after an unlink.
-	Sequence      int64 `protobuf:"varint,8,opt,name=sequence,proto3" json:"sequence,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Sequence int64 `protobuf:"varint,8,opt,name=sequence,proto3" json:"sequence,omitempty"`
+	// Sequence of the most recent recovery from BLOCKED or SUSPENDED to
+	// ALLOWED for this link. Zero means no recovery was recorded.
+	LastAllowedSequence int64 `protobuf:"varint,9,opt,name=last_allowed_sequence,json=lastAllowedSequence,proto3" json:"last_allowed_sequence,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *OrganizationBillingStatus) Reset() {
@@ -358,6 +361,13 @@ func (x *OrganizationBillingStatus) GetSuspendTime() *timestamppb.Timestamp {
 func (x *OrganizationBillingStatus) GetSequence() int64 {
 	if x != nil {
 		return x.Sequence
+	}
+	return 0
+}
+
+func (x *OrganizationBillingStatus) GetLastAllowedSequence() int64 {
+	if x != nil {
+		return x.LastAllowedSequence
 	}
 	return 0
 }
@@ -1753,7 +1763,7 @@ var File_delino_accounts_v1_usage_proto protoreflect.FileDescriptor
 
 const file_delino_accounts_v1_usage_proto_rawDesc = "" +
 	"\n" +
-	"\x1edelino/accounts/v1/usage.proto\x12\x12delino.accounts.v1\x1a(delino/accounts/v1/billing_account.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc3\x03\n" +
+	"\x1edelino/accounts/v1/usage.proto\x12\x12delino.accounts.v1\x1a(delino/accounts/v1/billing_account.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xf7\x03\n" +
 	"\x19OrganizationBillingStatus\x127\n" +
 	"\aservice\x18\x01 \x01(\x0e2\x1d.delino.accounts.v1.ServiceIdR\aservice\x12'\n" +
 	"\x0forganization_id\x18\x02 \x01(\tR\x0eorganizationId\x12,\n" +
@@ -1762,7 +1772,8 @@ const file_delino_accounts_v1_usage_proto_rawDesc = "" +
 	"\x06reason\x18\x05 \x01(\x0e2'.delino.accounts.v1.BillingStatusReasonR\x06reason\x12?\n" +
 	"\rblocked_since\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\fblockedSince\x12=\n" +
 	"\fsuspend_time\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\vsuspendTime\x12\x1a\n" +
-	"\bsequence\x18\b \x01(\x03R\bsequence\"\xa7\x02\n" +
+	"\bsequence\x18\b \x01(\x03R\bsequence\x122\n" +
+	"\x15last_allowed_sequence\x18\t \x01(\x03R\x13lastAllowedSequence\"\xa7\x02\n" +
 	"\vUsageReport\x127\n" +
 	"\aservice\x18\x01 \x01(\x0e2\x1d.delino.accounts.v1.ServiceIdR\aservice\x12'\n" +
 	"\x0forganization_id\x18\x02 \x01(\tR\x0eorganizationId\x12/\n" +

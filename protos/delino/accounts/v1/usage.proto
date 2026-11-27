@@ -168,6 +168,9 @@ message OrganizationBillingStatus {
   // sequence and ignores a status whose billing_account_id differs from the
   // link that it knows, which can arrive after an unlink.
   int64 sequence = 8;
+  // Sequence of the most recent recovery from BLOCKED or SUSPENDED to
+  // ALLOWED for this link. Zero means no recovery was recorded.
+  int64 last_allowed_sequence = 9;
 }
 
 // Usage of one organization, meter and 5-minute window.
