@@ -4,11 +4,14 @@ package imagebuild
 
 import (
 	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode"
@@ -18,31 +21,57 @@ import (
 
 func TestSelectEdition(t *testing.T) {
 	list := []wimImage{
+		{4, "Windows Server 2025 Datacenter Evaluation (Desktop Experience)"},
 		{1, "Windows Server 2025 Standard Evaluation"},
 		{2, "Windows Server 2025 Standard Evaluation (Desktop Experience)"},
-		{4, "Windows Server 2025 Datacenter Evaluation (Desktop Experience)"},
 	}
 	for _, tc := range []struct {
+		name    string
 		edition string
 		want    int
 		ok      bool
 	}{
-		{"", 1, true},
-		{"2", 2, true},
-		{" 4 ", 4, true},
-		{"3", 0, false},
-		{"Windows Server 2025 Datacenter Evaluation (Desktop Experience)", 4, true},
-		{"windows server 2025 standard evaluation", 1, true},
-		{"Windows 11 Pro", 0, false},
+		{"default index", "", 1, true},
+		{"numeric index", "2", 2, true},
+		{"trimmed numeric index", " 4 ", 4, true},
+		{"missing index", "3", 0, false},
+		{"exact name", "Windows Server 2025 Datacenter Evaluation (Desktop Experience)", 4, true},
+		{"unique folded name", "windows server 2025 standard evaluation", 1, true},
+		{"missing name", "Windows 11 Pro", 0, false},
 	} {
-		got, err := selectEdition(list, tc.edition)
-		if (err == nil) != tc.ok || (tc.ok && got.Index != tc.want) {
-			t.Errorf("selectEdition(%q) = %+v, %v", tc.edition, got, err)
-		}
-		if err != nil && !strings.Contains(err.Error(), "4: Windows Server 2025 Datacenter") {
-			t.Errorf("error %q does not list the editions", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := selectEdition(list, tc.edition)
+			if (err == nil) != tc.ok || (tc.ok && got.Index != tc.want) {
+				t.Errorf("selectEdition(%q) = %+v, %v", tc.edition, got, err)
+			}
+			if err != nil && !strings.Contains(err.Error(), "4: Windows Server 2025 Datacenter") {
+				t.Errorf("error %q does not list the editions", err)
+			}
+		})
 	}
+
+	caseVariants := []wimImage{
+		{4, "WINDOWS 11 PRO"},
+		{1, "Windows 11 Pro"},
+	}
+	t.Run("exact mixed-case name", func(t *testing.T) {
+		got, err := selectEdition(caseVariants, "Windows 11 Pro")
+		if err != nil || got.Index != 1 {
+			t.Errorf("selectEdition(%q) = %+v, %v; want index 1", "Windows 11 Pro", got, err)
+		}
+	})
+	t.Run("exact uppercase name", func(t *testing.T) {
+		got, err := selectEdition(caseVariants, "WINDOWS 11 PRO")
+		if err != nil || got.Index != 4 {
+			t.Errorf("selectEdition(%q) = %+v, %v; want index 4", "WINDOWS 11 PRO", got, err)
+		}
+	})
+	t.Run("ambiguous folded name", func(t *testing.T) {
+		got, err := selectEdition(caseVariants, "windows 11 pro")
+		if err == nil {
+			t.Errorf("selectEdition(%q) = %+v, nil; want an error", "windows 11 pro", got)
+		}
+	})
 }
 
 func TestParseImageList(t *testing.T) {
@@ -125,10 +154,16 @@ func TestUnattendXML(t *testing.T) {
 	if err := xml.Unmarshal(b, &doc); err != nil {
 		t.Fatal(err)
 	}
+	type componentKey struct {
+		pass string
+		name string
+	}
 	passes := map[string]bool{}
+	components := map[componentKey]bool{}
 	for _, s := range doc.Settings {
 		passes[s.Pass] = true
 		for _, c := range s.Components {
+			components[componentKey{pass: s.Pass, name: c.Name}] = true
 			if c.Arch != "amd64" {
 				t.Errorf("component %s architecture %q", c.Name, c.Arch)
 			}
@@ -149,6 +184,15 @@ func TestUnattendXML(t *testing.T) {
 	}
 	if !passes["specialize"] || !passes["oobeSystem"] || len(passes) != 2 {
 		t.Errorf("passes %v", passes)
+	}
+	for _, required := range []componentKey{
+		{pass: "specialize", name: "Microsoft-Windows-Shell-Setup"},
+		{pass: "oobeSystem", name: "Microsoft-Windows-Shell-Setup"},
+		{pass: "oobeSystem", name: "Microsoft-Windows-International-Core"},
+	} {
+		if !components[required] {
+			t.Errorf("pass %q is missing required component %q", required.pass, required.name)
+		}
 	}
 	if _, err := unattendXML(unattendSettings{Language: "en-US<x>", Password: password}); err == nil {
 		t.Error("invalid language accepted")
@@ -194,12 +238,17 @@ func TestBuildLogsHoldNoPassword(t *testing.T) {
 	if string(script) != setupCompleteCmd() {
 		t.Errorf("SetupComplete.cmd differs from setupCompleteCmd:\n%s", script)
 	}
-	answer, err := os.ReadFile(filepath.Join(root, "Windows", "Panther", "unattend.xml"))
+	answerPath := filepath.Join(root, "Windows", "Panther", "unattend.xml")
+	wantAnswer, err := unattendXML(unattendSettings{Language: "en-US", Password: password})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(answer), password) {
-		t.Error("unattend.xml lacks the synthetic password")
+	answer, err := os.ReadFile(answerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(answer, wantAnswer) {
+		t.Error("unattend.xml differs from the generated answer")
 	}
 	installed, err := os.ReadFile(filepath.Join(root, hcsrt.WindowsGuestBinary[len(`C:\`):]))
 	if err != nil {
@@ -207,6 +256,93 @@ func TestBuildLogsHoldNoPassword(t *testing.T) {
 	}
 	if !bytes.Equal(installed, guest) {
 		t.Error("guest helper copy differs from the source")
+	}
+
+	// Existing regular files, including any older trailing bytes, are replaced.
+	if err := os.WriteFile(answerPath, bytes.Repeat([]byte{'x'}, len(wantAnswer)+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := installSetupFiles(logger, root, guestPath, "en-US", newPassword); err != nil {
+		t.Fatal(err)
+	}
+	if answer, err := os.ReadFile(answerPath); err != nil || !bytes.Equal(answer, wantAnswer) {
+		t.Errorf("unattend.xml was not replaced with the generated answer: %v", err)
+	}
+}
+
+func TestInstallSetupFilesRejectsJunction(t *testing.T) {
+	const password = "Synthetic-Pw-9f3a1c7e!"
+	const answerPath = `Windows\Panther\unattend.xml`
+	guestPath := filepath.Join(t.TempDir(), "ownsand-guest.exe")
+	if err := os.WriteFile(guestPath, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	guestDestination := hcsrt.WindowsGuestBinary[len(`C:\`):]
+	for _, tc := range []struct {
+		junction    string
+		destination string
+	}{
+		{`Windows`, answerPath},
+		{`Windows\Panther`, answerPath},
+		{`Windows\Setup\Scripts`, `Windows\Setup\Scripts\SetupComplete.cmd`},
+		{filepath.Dir(guestDestination), guestDestination},
+		{answerPath, answerPath},
+	} {
+		t.Run(tc.junction, func(t *testing.T) {
+			base := t.TempDir()
+			root := filepath.Join(base, "image")
+			target := filepath.Join(base, "target")
+			relativeJunction := filepath.Join("image", tc.junction)
+			junction := filepath.Join(base, relativeJunction)
+			if err := os.MkdirAll(filepath.Dir(junction), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(target, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// A junction on a local NTFS volume needs no symlink privilege.
+			cmd := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", relativeJunction, "target")
+			cmd.Dir = base
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("create test junction: %v: %s", err, out)
+			}
+			t.Cleanup(func() {
+				if err := os.Remove(junction); err != nil {
+					t.Error(err)
+				}
+			})
+			targetInfo, err := os.Stat(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			junctionInfo, err := os.Stat(junction)
+			if err != nil || !os.SameFile(targetInfo, junctionInfo) {
+				t.Fatalf("junction does not resolve to its test target: %v", err)
+			}
+
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			err = installSetupFiles(logger, root, guestPath, "en-US", func() (string, error) { return password, nil })
+			if err == nil || !strings.Contains(err.Error(), strconv.Quote(tc.junction)) || !strings.Contains(err.Error(), "reparse point") {
+				t.Fatalf("install error = %v, want a reparse point error for %q", err, tc.junction)
+			}
+			var entry struct {
+				RelativePath string `json:"relative_path"`
+				Reason       string `json:"reason"`
+			}
+			if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+				t.Fatal(err)
+			}
+			if entry.RelativePath != tc.destination || entry.Reason != err.Error() {
+				t.Error("the log lacks the relative setup path or rejection reason")
+			}
+			if strings.Contains(logs.String(), password) || strings.Contains(err.Error(), password) {
+				t.Error("a diagnostic includes the password")
+			}
+			if entries, err := os.ReadDir(target); err != nil || len(entries) != 0 {
+				t.Errorf("junction target is no longer empty: %v, %v", entries, err)
+			}
+		})
 	}
 }
 

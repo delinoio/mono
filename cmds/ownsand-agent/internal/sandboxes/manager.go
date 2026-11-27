@@ -1583,10 +1583,10 @@ func (m *Manager) Entries() []*ownsandv1.SandboxStateEntry {
 	return out
 }
 
-// RemoveAll stops and deletes every sandbox and snapshot for a device
-// removal, including pending cleanup with no sandbox record. If runtime
-// deletion or durable marker removal fails, RemoveAll keeps the ID tracked
-// and skips the local wipe so removal can retry.
+// RemoveAll stops and deletes every sandbox in the runtime for device
+// removal, including pending cleanup with no sandbox record. It also clears
+// the snapshot inventory. If runtime deletion or durable marker removal
+// fails, it keeps the ID tracked so removal can retry before the local wipe.
 func (m *Manager) RemoveAll(ctx context.Context) error {
 	if err := m.fenceSnapshotImports(ctx); err != nil {
 		return err
@@ -1648,13 +1648,7 @@ func (m *Manager) RemoveAll(ctx context.Context) error {
 		m.snapshots = map[string]*snapshot{}
 	}
 	m.mu.Unlock()
-	if len(errs) > 0 {
-		// Do not wipe the local data: the wipe would remove the records
-		// and VM files of the failed sandboxes. The wipe is idempotent, so
-		// the retry that finds no failure runs it.
-		return errors.Join(errs...)
-	}
-	return m.st.WipeLocalData()
+	return errors.Join(errs...)
 }
 
 // removeDirIfExists removes a directory tree.

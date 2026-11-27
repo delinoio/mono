@@ -131,6 +131,10 @@ type Decision struct {
 func Evaluate(req Request, d Device, now time.Time) (Outcome, string) {
 	// Permanent rules first: they decide the code even when a transient
 	// condition also holds.
+	// A passing Hyper-V outbound check covers Linux guests.
+	if req.GuestOS == ownsandv1.GuestOs_GUEST_OS_WINDOWS && req.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
+		return Permanent, "Windows guests require NONE networking"
+	}
 	if req.HostOS != ownsandv1.HostOs_HOST_OS_UNSPECIFIED && d.HostOS != req.HostOS {
 		return Permanent, "host OS does not match"
 	}
