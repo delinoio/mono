@@ -119,6 +119,49 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 }
 
+func TestExportImportRoundTripWithForwardDirectoryLinks(t *testing.T) {
+	src := t.TempDir()
+	if err := os.Mkdir(filepath.Join(src, "z-dir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "z-dir", "file"), []byte("snapshot data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	// Export walks entries in lexical order, so both links precede z-dir.
+	if err := root.Symlink("z-dir", "b-dir"); err != nil {
+		t.Skipf("rooted directory symlinks are not available: %v", err)
+	}
+	if err := root.Symlink("b-dir", "a-chain"); err != nil {
+		t.Fatal(err)
+	}
+
+	b := newBucket(t)
+	tr := &Transfer{HTTP: b.srv.Client(), URLs: b, Logger: quietLogger(), TempDir: t.TempDir()}
+	ctx := context.Background()
+	parts, _, err := tr.Export(ctx, "snap", src, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "content")
+	if err := tr.Import(ctx, "snap", parts, dst); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"z-dir/file", "b-dir/file", "a-chain/file"} {
+		got, err := os.ReadFile(filepath.Join(dst, name))
+		if err != nil || string(got) != "snapshot data" {
+			t.Errorf("ReadFile(%q) = %q, %v; want snapshot data", name, got, err)
+		}
+	}
+	if got, err := os.Readlink(filepath.Join(dst, "a-chain")); err != nil || got != "b-dir" {
+		t.Errorf("Readlink(a-chain) = %q, %v; want b-dir", got, err)
+	}
+}
+
 func makeProcessSnapshot(t *testing.T, root, data string) {
 	t.Helper()
 	t.Cleanup(func() { removeTestTree(t, root) })

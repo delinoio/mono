@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -289,7 +290,7 @@ func requireLinkInside(t *testing.T, dir, name string) {
 }
 
 func TestRecoverStatReturnsPanicAsError(t *testing.T) {
-	err := recoverStat(func() (fs.FileInfo, error) {
+	_, err := recoverStat(func() (fs.FileInfo, error) {
 		var parts []string
 		_ = parts[1] // index out of range, like os.doInRoot on Windows
 		return nil, nil
@@ -304,10 +305,10 @@ func TestRecoverStatReturnsPanicAsError(t *testing.T) {
 
 func TestRecoverStatKeepsStatResult(t *testing.T) {
 	want := fs.ErrNotExist
-	if err := recoverStat(func() (fs.FileInfo, error) { return nil, want }); !errors.Is(err, want) {
+	if _, err := recoverStat(func() (fs.FileInfo, error) { return nil, want }); !errors.Is(err, want) {
 		t.Fatalf("error changed: %v", err)
 	}
-	if err := recoverStat(func() (fs.FileInfo, error) { return nil, nil }); err != nil {
+	if _, err := recoverStat(func() (fs.FileInfo, error) { return nil, nil }); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -483,6 +484,57 @@ func TestReadTarAcceptsConfinedLinks(t *testing.T) {
 	}
 	if got, err := os.Readlink(filepath.Join(dir, "dangling")); err != nil || got != "missing" {
 		t.Fatalf("dangling: %q, %v", got, err)
+	}
+}
+
+func TestReadTarDirectoryLinksInEitherOrder(t *testing.T) {
+	for _, order := range []string{"links-first", "targets-first"} {
+		t.Run(order, func(t *testing.T) {
+			probe, err := os.OpenRoot(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer probe.Close()
+			if err := probe.Symlink(".", "link"); err != nil {
+				t.Skipf("rooted directory symlinks are not available: %v", err)
+			}
+
+			links := []tarEntry{
+				{hdr: tar.Header{Name: "a-chain", Typeflag: tar.TypeSymlink, Linkname: "b-dir"}},
+				{hdr: tar.Header{Name: "b-dir", Typeflag: tar.TypeSymlink, Linkname: "z-dir"}},
+				{hdr: tar.Header{Name: "file-link", Typeflag: tar.TypeSymlink, Linkname: "z-dir/file"}},
+				{hdr: tar.Header{Name: "dangling", Typeflag: tar.TypeSymlink, Linkname: "missing"}},
+			}
+			targets := []tarEntry{
+				{hdr: tar.Header{Name: "z-dir", Typeflag: tar.TypeDir, Mode: 0o755}},
+				{hdr: tar.Header{Name: "z-dir/file", Typeflag: tar.TypeReg, Mode: 0o644}, data: "x"},
+			}
+			entries := append(links, targets...)
+			if order == "targets-first" {
+				slices.Reverse(links)
+				entries = append(targets, links...)
+			}
+
+			dir := t.TempDir()
+			if err := ReadTar(buildTar(t, entries), dir); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"z-dir/file", "a-chain/file", "b-dir/file", "file-link"} {
+				got, err := os.ReadFile(filepath.Join(dir, name))
+				if err != nil || string(got) != "x" {
+					t.Errorf("ReadFile(%q) = %q, %v; want x", name, got, err)
+				}
+			}
+			for _, link := range links {
+				got, err := os.Readlink(filepath.Join(dir, link.hdr.Name))
+				if err != nil || filepath.ToSlash(got) != link.hdr.Linkname {
+					t.Errorf("Readlink(%q) = %q, %v; want %q", link.hdr.Name, got, err, link.hdr.Linkname)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(dir, "dangling")); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("Stat(dangling) = %v; want missing target", err)
+			}
+		})
 	}
 }
 

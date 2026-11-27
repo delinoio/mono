@@ -359,7 +359,8 @@ func WriteTarContext(ctx context.Context, w io.Writer, dir string) error {
 // directory component, such as "a" -> "." followed by "b" -> "a/..". After
 // the last entry, ReadTar therefore resolves every symbolic link that it
 // created through the os.Root again and fails when one leaves dir. A link
-// that resolves to nothing stays allowed.
+// that resolves to nothing stays allowed. On Windows, links to directories
+// must also have the directory attribute, even if the target appears later.
 //
 // On Unix, regular files and explicitly archived directories receive the
 // ordinary permission bits from their headers, regardless of the umask.
@@ -381,7 +382,7 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 	tr := tar.NewReader(ctxReader{ctx: ctx, r: r})
 	// links holds the names of the symbolic links that the archive created.
 	// A later entry can turn a path component of an earlier link into
-	// another link, so the links are resolved once, after the last entry.
+	// another link, so validate the links after the last entry.
 	var links []string
 	dirs := make(map[string]dirMode)
 	for {
@@ -448,8 +449,20 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 			return fmt.Errorf("fsutil: unsupported tar entry type %d", hdr.Typeflag)
 		}
 	}
-	if err := checkLinksConfined(root, links); err != nil {
-		return err
+	for {
+		directoryLinks, err := checkLinksConfined(ctx, root, links)
+		if err != nil {
+			return err
+		}
+		repaired, err := repairTarDirectoryLinks(ctx, root, directoryLinks)
+		if err != nil {
+			return err
+		}
+		if !repaired {
+			break
+		}
+		// Recheck confinement after repairs. On Windows, a trailing separator
+		// can make a link appear dangling until its target link is repaired.
 	}
 	// A tar can list a directory after its children. Apply the deepest
 	// modes first so that every parent stays searchable until its children
@@ -557,7 +570,8 @@ func setTarDirectoryMode(root *os.Root, name string, mode fs.FileMode) error {
 }
 
 // checkLinksConfined resolves each symbolic link in links through root and
-// fails when the resolution leaves root or does not finish.
+// fails when the resolution leaves root or does not finish. On Windows, it
+// also returns the names of the links that resolve to a directory.
 //
 // confinedLinkTarget cleans ".." elements lexically, as if every component
 // of the target were a real directory. A component can be a link that the
@@ -567,18 +581,27 @@ func setTarDirectoryMode(root *os.Root, name string, mode fs.FileMode) error {
 // ("path escapes from parent"), and it reports ELOOP for a chain that is too
 // deep. A link that resolves to nothing, or through a file that is not a
 // directory, is dangling and stays allowed.
-func checkLinksConfined(root *os.Root, links []string) error {
+func checkLinksConfined(ctx context.Context, root *os.Root, links []string) ([]string, error) {
+	var directoryLinks []string
 	for _, name := range links {
-		err := recoverStat(func() (fs.FileInfo, error) { return root.Stat(name) })
-		if err == nil || errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-			continue
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		if errors.Is(err, errRootStatPanic) {
-			return fmt.Errorf("fsutil: tar symbolic link %q cannot be confirmed inside the target directory: %w", name, err)
+		info, err := recoverStat(func() (fs.FileInfo, error) { return root.Stat(name) })
+		switch {
+		case err == nil:
+			if runtime.GOOS == "windows" && info.IsDir() {
+				directoryLinks = append(directoryLinks, name)
+			}
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
+			// Allow confined dangling links.
+		case errors.Is(err, errRootStatPanic):
+			return nil, fmt.Errorf("fsutil: tar symbolic link %q cannot be confirmed inside the target directory: %w", name, err)
+		default:
+			return nil, fmt.Errorf("fsutil: tar symbolic link %q resolves outside the target directory: %w", name, err)
 		}
-		return fmt.Errorf("fsutil: tar symbolic link %q resolves outside the target directory: %w", name, err)
 	}
-	return nil
+	return directoryLinks, nil
 }
 
 // errRootStatPanic marks a panic of os.Root.Stat that recoverStat turned
@@ -602,14 +625,13 @@ var errRootStatPanic = errors.New("os.Root.Stat panicked")
 // os.Root.Stat returns a result or an error for such a link on Windows. The
 // doInRoot source of Go 1.27.4 still compares len(newparts) < i without the
 // equal case.
-func recoverStat(stat func() (fs.FileInfo, error)) (err error) {
+func recoverStat(stat func() (fs.FileInfo, error)) (_ fs.FileInfo, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%w: %v", errRootStatPanic, r)
 		}
 	}()
-	_, err = stat()
-	return err
+	return stat()
 }
 
 // confinedLinkTarget reports whether the symbolic link target linkname of
