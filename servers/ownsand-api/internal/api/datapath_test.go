@@ -610,12 +610,14 @@ func TestAuthorizeRelayRules(t *testing.T) {
 	}
 }
 
-// TestAuthorizeRelayChannelLostWhilePending covers a pending grant whose
-// agent channel closes without an acknowledgement: the caller gets
-// unavailable without a retry delay (not the grant-limit resource_exhausted
-// result) and the pending grant is removed.
+// TestAuthorizeRelayChannelLostWhilePending verifies that closing the agent
+// channel removes the pending grant and ends the RPC wait.
 func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
-	env := testenv.New(t)
+	env := testenv.New(t, func(o *app.Options) {
+		// Give grant delivery, channel shutdown, and the RPC response time
+		// to complete before the acknowledgement timer can fire.
+		o.RelayTiming.GrantAck = 30 * time.Second
+	})
 	org, agent, sandboxID := runningSandbox(t, env)
 	req := newExec(org.ID, sandboxID)
 	authID, _ := uuidv7.NewString()
@@ -635,15 +637,14 @@ func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("waiting for the relay grant: %v", err)
 	}
-	// The channel closes while the caller waits, well before the
-	// acknowledgement timeout, so the removal of the pending grant ends the wait.
 	agent.Close()
 	select {
 	case err = <-errCh:
 	case <-time.After(10 * time.Second):
 		t.Fatal("AuthorizeRelay did not return after the agent channel closed")
 	}
-	if testenv.Code(err) != connect.CodeUnavailable {
+	var connectErr *connect.Error
+	if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeUnavailable {
 		t.Fatalf("channel lost while pending: %v", err)
 	}
 	if errDetail(err).GetRetryAfter() != nil {
@@ -651,6 +652,9 @@ func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
 	}
 	if env.App.Plane.Grants.Get(received.GetGrantId()) != nil {
 		t.Fatal("pending grant kept after the channel closed")
+	}
+	if connectErr.Message() != "the agent channel closed before it acknowledged the relay grant" {
+		t.Fatalf("expected the agent channel closure to end the grant wait, got %v", err)
 	}
 }
 
