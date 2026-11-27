@@ -16,11 +16,16 @@ import (
 
 const testWriteKey = "sandbox/write"
 
+type testFileWrite struct{ ownsandclient.FileWrite }
+
 func acquireTestWrite(t *testing.T, w *writes) *writeEntry {
 	t.Helper()
-	e, err := w.acquire(t.Context(), testWriteKey, "/file", func() (ownsandclient.FileWrite, error) { return nil, nil })
+	e, err := w.acquire(t.Context(), testWriteKey, "/file")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if e.fw == nil {
+		e.fw = testFileWrite{}
 	}
 	return e
 }
@@ -145,12 +150,9 @@ func TestWriteWaitHonorsContext(t *testing.T) {
 					ctx, cancel = context.WithCancel(t.Context())
 				}
 				defer cancel()
-				open := func() (ownsandclient.FileWrite, error) {
-					return nil, errors.New("unexpected handle open")
-				}
 				result := make(chan error, 1)
 				go func() {
-					entry, err := w.acquire(ctx, testWriteKey, "/file", open)
+					entry, err := w.acquire(ctx, testWriteKey, "/file")
 					if err == nil {
 						w.release(testWriteKey, entry, false, nil)
 					}
@@ -179,10 +181,26 @@ func TestWriteWaitHonorsContext(t *testing.T) {
 				}
 				checkCachedWrite(t, w, active)
 
-				if _, err := w.acquire(ctx, "new/write", "/file", open); !errors.Is(err, tc.want) {
+				if _, err := w.acquire(ctx, "new/write", "/file"); !errors.Is(err, tc.want) {
 					t.Fatalf("new write with ended context = %v, want %v", err, tc.want)
 				}
 			})
 		})
 	}
+}
+
+func TestWriteFailedSetupDoesNotBindPath(t *testing.T) {
+	w := newWrites()
+	entry, err := w.acquire(t.Context(), testWriteKey, "/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.release(testWriteKey, entry, false, errors.New("setup failed"))
+	checkCachedWrite(t, w, nil)
+
+	retry, err := w.acquire(t.Context(), testWriteKey, "/other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.release(testWriteKey, retry, false, errors.New("setup failed"))
 }
