@@ -11,6 +11,7 @@ import (
 	"io"
 	"maps"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -32,12 +33,13 @@ const (
 
 // Guest file names next to the workspace path.
 const (
-	manifestSuffix = ".sandrun-sync.json"
-	lockSuffix     = ".sandrun-sync.lock"
+	manifestSuffix       = ".sandrun-sync.json"
+	lockSuffix           = ".sandrun-sync.lock"
+	pendingUpdatesSuffix = ".sandrun-sync-pending"
 )
 
-// syncManifestLimit bounds the encoded manifest that sync reads and writes.
-const syncManifestLimit int64 = 256 << 20
+// syncMetadataLimit bounds the encoded manifest and pending update list.
+const syncMetadataLimit int64 = 256 << 20
 
 // SyncParams describes a sync of a local working tree into the workspace
 // path of a dev session.
@@ -54,7 +56,7 @@ type SyncParams struct {
 
 // SyncResult is the result of a sync.
 type SyncResult struct {
-	// Uploaded counts the new and changed files, Deleted the files that
+	// Uploaded counts the new, changed and retried files, Deleted the files that
 	// the sync removed from the guest, and Skipped the unchanged files and
 	// the submodules and nested repositories that sync does not enter.
 	Uploaded int `json:"uploaded"`
@@ -62,10 +64,10 @@ type SyncResult struct {
 	Skipped  int `json:"skipped"`
 	// Submodules lists the skipped submodules and nested repositories.
 	Submodules []string `json:"submodules,omitempty"`
-	// BytesSent counts the bytes of the uploaded archive and lists.
+	// BytesSent counts the bytes of the uploaded archive and temporary lists.
 	BytesSent int64 `json:"bytes_sent"`
-	// Warnings lists paths that the sync could not apply, for example
-	// symbolic links that a Windows guest could not create.
+	// Warnings reports incomplete apply or cleanup, for example symbolic
+	// links that a Windows guest could not create.
 	Warnings []string `json:"warnings,omitempty"`
 }
 
@@ -80,13 +82,14 @@ type SyncResult struct {
 //     counts as empty unless it exceeds the manifest size limit. If the
 //     lock command finds a missing workspace, sync replans against an
 //     empty manifest.
-//  3. New and changed files are uploaded. Manifest paths that are no longer
-//     listed are deleted. Guest files that are not in the manifest stay.
+//  3. New and changed files and pending regular-file updates are uploaded.
+//     Manifest paths no longer listed are deleted. Guest files that are
+//     not in the manifest stay.
 //     With an older manifest that lacks UTF-8 validation, sync leaves an
 //     absent path with U+FFFD on the guest and drops its entry with a warning.
 //  4. A changed file above 100 MiB or changed files above 2 GiB in total
 //     fail the sync before any upload (*LimitError). A guest or candidate
-//     manifest above 256 MiB fails with failed_precondition.
+//     manifest or pending update list above 256 MiB fails with failed_precondition.
 //  5. Paths that are not valid UTF-8 (all guests), paths that differ only
 //     in case (Windows and macOS guests), paths that collide after canonical
 //     normalization and case mapping (macOS guests), and paths that are not
@@ -94,24 +97,25 @@ type SyncResult struct {
 //     (*PathRuleError).
 //  6. The lock directory <workspace_path>.sandrun-sync.lock is created with one
 //     exec; an existing lock fails with ErrSyncLocked unless Force is set.
-//     Sync checks the manifest under the lock before returning an unchanged result.
+//     Sync checks the manifest and reads the pending update list under the lock.
 //  7. The changed files go in one tar archive next to the workspace, which
-//     the guest tar extracts into the workspace; then the new manifest is
-//     written and the archive and the lock are removed.
+//     the guest tar extracts into the workspace. Before apply, sync records
+//     regular-file overwrites in the pending list. After confirming the new
+//     manifest, sync removes the list, archive and lock.
 //
 // The deleted files are removed before the archive is extracted, so that a
 // path can change between a file and a directory; the directories that
 // held deleted files under the path of a new file are removed when they are
 // empty. A sync that stops before the new manifest is written leaves the
 // old manifest unless apply removed a stale one during workspace recovery.
-// The next sync sends the same files again once it can take the lock. If
-// the SDK loses the lock acquisition stream, it releases the lock only
-// if it recovers a result that confirms acquisition. If the SDK loses
-// the apply stream, it keeps the lock and inputs until it
-// observes a terminal result. If the result is unknown after a bounded
-// wait, the lock and inputs stay in the guest.
+// A later sync uses the pending list to resend selected regular files even
+// if they match the old manifest. If the SDK loses the lock acquisition
+// stream, it releases the lock only if a recovered result confirms
+// acquisition. If the SDK loses the apply stream, it keeps the lock and
+// inputs until it observes a terminal result. If the result is unknown
+// after a bounded wait, the lock and inputs stay in the guest.
 func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
-	result, err := c.sync(ctx, p, syncManifestLimit)
+	result, err := c.sync(ctx, p, syncMetadataLimit)
 	var changed *syncFileChangedError
 	if errors.As(err, &changed) {
 		c.logger.DebugContext(ctx, "sandrun sync file changed after listing",
@@ -120,7 +124,7 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	return result, err
 }
 
-func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*SyncResult, error) {
+func (c *Client) sync(ctx context.Context, p SyncParams, metadataLimit int64) (*SyncResult, error) {
 	report := func(tp TransferProgress) {
 		if p.Progress != nil {
 			p.Progress(tp)
@@ -161,12 +165,12 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleInvalidUTF8, Paths: invalidUTF8})
 	}
 
-	old, err := c.readManifest(ctx, s, manifestLimit)
+	old, err := c.readManifest(ctx, s, metadataLimit)
 	if err != nil {
 		return nil, err
 	}
 
-	plan, err := planSync(local, old)
+	plan, err := planSync(local, old, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -209,8 +213,8 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(body)) > manifestLimit {
-		return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sync candidate manifest exceeds the size limit of %d bytes (encoded size %d bytes)", manifestLimit, len(body)))
+	if int64(len(body)) > metadataLimit {
+		return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sync candidate manifest exceeds the size limit of %d bytes (encoded size %d bytes)", metadataLimit, len(body)))
 	}
 
 	// Step 6: the lock.
@@ -220,7 +224,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		force = "1"
 	}
 	windows := osys == sandrunv1.GuestOs_GUEST_OS_WINDOWS
-	cleanupEnv := map[string]string{guestEnvLock: lock}
+	cleanupEnv := map[string]string{guestEnvLock: lock, guestEnvPendingUpdates: ""}
 	if !windows {
 		cleanupEnv[guestEnvAliasReplace] = ""
 	}
@@ -255,18 +259,22 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	// is missing, plan against an empty manifest to restore all local files.
 	var cur manifest
 	if !workspaceMissing {
-		cur, err = c.readManifest(ctx, s, manifestLimit)
+		cur, err = c.readManifest(ctx, s, metadataLimit)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if workspaceMissing || cur.PathsValidated != old.PathsValidated || !maps.Equal(cur.Files, old.Files) {
+	pending, err := c.readPendingUpdates(ctx, s, metadataLimit)
+	if err != nil {
+		return nil, err
+	}
+	if workspaceMissing || len(pending) > 0 || cur.PathsValidated != old.PathsValidated || !maps.Equal(cur.Files, old.Files) {
 		c.logger.DebugContext(ctx, "sandrun sync replanning under the lock", "dev_session_id", s.GetDevSessionId(), "workspace_missing", workspaceMissing)
-		if plan, err = planSync(local, cur); err != nil {
+		if plan, err = planSync(local, cur, pending); err != nil {
 			return nil, err
 		}
 	}
-	if plan.empty() && !workspaceMissing {
+	if plan.empty() && !workspaceMissing && len(pending) == 0 {
 		cleanupOnError = false
 		res := plan.res
 		if r, err := c.runGuest(ctx, s, opCleanup, cleanupEnv); err != nil || r.exitCode != 0 {
@@ -363,6 +371,24 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		}
 	}
 
+	// Persist the union before apply can overwrite files whose manifest
+	// entries still describe their previous contents.
+	previousCount := len(pending)
+	for _, f := range changed {
+		if f.entry.Mode == modeSymlink {
+			continue
+		}
+		switch cur.Files[f.rel].Mode {
+		case modeFile, modeExecutable:
+			pending[f.rel] = struct{}{}
+		}
+	}
+	if len(pending) > previousCount {
+		if err := c.writePendingUpdates(ctx, s, pending, metadataLimit); err != nil {
+			return nil, err
+		}
+	}
+
 	report(TransferProgress{Phase: TransferApplying, BytesDone: res.BytesSent, BytesTotal: res.BytesSent})
 	var failedLinks map[string]bool
 	if workspaceMissing || plan.hasFileChanges() {
@@ -405,9 +431,16 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	}
 	cleanupOnError = false
 
+	// Only confirmed manifest publication allows cleanup of pending updates.
+	if len(pending) > 0 {
+		cleanupEnv[guestEnvPendingUpdates] = guestSibling(s, pendingUpdatesSuffix)
+	}
 	cr, err := c.runGuest(ctx, s, opCleanup, cleanupEnv)
-	if err != nil || cr.exitCode != 0 {
+	if err != nil || (cr.exitCode != 0 && cr.exitCode != exitPendingCleanupFailed) {
 		res.Warnings = append(res.Warnings, "the guest could not remove the sync archive or release the sync lock; the next sync may need force")
+	}
+	if len(pending) > 0 && (err != nil || cr.exitCode&exitPendingCleanupFailed != 0) {
+		res.Warnings = append(res.Warnings, "the guest could not remove the pending sync updates; the next sync may upload those files again")
 	}
 	report(TransferProgress{Phase: TransferDone, BytesDone: res.BytesSent, BytesTotal: res.BytesSent})
 	return res, nil
@@ -468,6 +501,51 @@ func (c *Client) readManifest(ctx context.Context, s *sandrunv1.DevSession, mani
 	return parseManifest(b.Bytes()), nil
 }
 
+// Pending updates use NUL-separated workspace-relative paths on every OS.
+// The SDK consumes the list itself, so guest shell path conventions do not apply.
+func (c *Client) readPendingUpdates(ctx context.Context, s *sandrunv1.DevSession, limit int64) (map[string]struct{}, error) {
+	pending := make(map[string]struct{})
+	var b bytes.Buffer
+	n, err := c.readGuestFile(ctx, s, guestSibling(s, pendingUpdatesSuffix), limit, &b, nil)
+	if err != nil {
+		if n == 0 && connect.CodeOf(err) == connect.CodeNotFound {
+			return pending, nil
+		}
+		var limitError *LimitError
+		if errors.As(err, &limitError) {
+			return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sync pending updates exceed the size limit of %d bytes", limit))
+		}
+		return nil, fmt.Errorf("read sync pending updates: %w", err)
+	}
+	body := b.Bytes()
+	if len(body) == 0 || body[len(body)-1] != 0 || !utf8.Valid(body) {
+		return nil, localError(connect.CodeFailedPrecondition, errors.New("invalid sync pending update list"))
+	}
+	for name := range bytes.SplitSeq(body[:len(body)-1], []byte{0}) {
+		rel := string(name)
+		if !validRelPath(rel) {
+			return nil, localError(connect.CodeFailedPrecondition, errors.New("invalid path in sync pending update list"))
+		}
+		pending[rel] = struct{}{}
+	}
+	return pending, nil
+}
+
+func (c *Client) writePendingUpdates(ctx context.Context, s *sandrunv1.DevSession, pending map[string]struct{}, limit int64) error {
+	var size int64
+	for rel := range pending {
+		size += int64(len(rel)) + 1
+	}
+	if size > limit {
+		return localError(connect.CodeFailedPrecondition, fmt.Errorf("sync pending updates exceed the size limit of %d bytes", limit))
+	}
+	body := pathList(slices.Sorted(maps.Keys(pending)), false)
+	if _, err := c.writeGuestFile(ctx, s, guestSibling(s, pendingUpdatesSuffix), 0o644, bytes.NewReader(body), nil); err != nil {
+		return fmt.Errorf("write sync pending updates: %w", err)
+	}
+	return nil
+}
+
 // linkOutcome returns the symbolic links of a Windows apply command that
 // the new manifest leaves out, so that the next sync creates them again,
 // and their warnings. These are the links that the guest reported with
@@ -519,16 +597,18 @@ func (m manifest) ambiguousPath(rel string) bool {
 	return !m.PathsValidated && strings.ContainsRune(rel, utf8.RuneError)
 }
 
-// planSync compares the local files with the guest manifest old (steps 3
-// and 4): the new and changed files, the deleted manifest paths and the
-// size limits of the changed files.
-func planSync(local *localList, old manifest) (*syncPlan, error) {
+// planSync selects new, changed and pending files for upload, applies the
+// changed-file limits and derives deletions from the guest manifest.
+func planSync(local *localList, old manifest, pending map[string]struct{}) (*syncPlan, error) {
 	plan := &syncPlan{res: &SyncResult{Submodules: local.skipped, Skipped: len(local.skipped)}}
 	current := map[string]bool{}
 	for _, f := range local.files {
 		current[f.rel] = true
-		// Re-upload an ambiguous entry before claiming it as a validated path.
-		if prev, ok := old.Files[f.rel]; ok && prev == f.entry && !old.ambiguousPath(f.rel) {
+		_, retry := pending[f.rel]
+		// Re-upload ambiguous paths and selected regular files that a
+		// previous apply may have changed without publishing the manifest.
+		if prev, ok := old.Files[f.rel]; ok && prev == f.entry && !old.ambiguousPath(f.rel) &&
+			!(retry && f.entry.Mode != modeSymlink) {
 			plan.res.Skipped++
 			continue
 		}
