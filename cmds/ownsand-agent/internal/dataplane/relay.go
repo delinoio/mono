@@ -121,8 +121,10 @@ type rconn struct {
 	outSpace chan struct{}
 	ctx      context.Context
 	cancel   context.CancelFunc
-	// flushDeadline bounds closeAfterFlush; zero uses Timing's default.
+	// flushDeadline bounds the flush from channel loss; zero uses Timing's default.
 	flushDeadline time.Duration
+	// flushing records that channel loss claimed the flush. relay.mu guards it.
+	flushing bool
 	// lastRecv is the monotonic reading (see monotonicNow) of the last byte
 	// received, so a wall-clock step never changes when the receive timeout
 	// or the echo probe is due.
@@ -145,27 +147,22 @@ type rconn struct {
 	kinds           map[ownsandv1.DataFrameKind]bool
 }
 
-// closeAfterFlush closes the connection after every queued frame was
-// sent.
-//
-// The connection is canceled at the latest after c.flushDeadline (5 seconds
-// by default), whatever the writer does. The deadline runs from the call, as
-// one independent timer, and not only while the marker waits for a free
-// queue slot: a writer that HTTP/2 flow control blocks never reaches a
-// marker that the queue accepted, and a request close that never returns
-// never starts the writer's own 2-second follow-up timer. Inbound bytes
-// (keepalives of the control plane, or frames of another stream) keep the
-// receive timeout from firing, so without this timer such a connection would
-// stay open and a live grant of the new agent channel would wait for it.
-// After the cancel, the relay loop bounds the teardown with awaitTeardown and
-// dials for the current channel. The timer stops with the connection.
-func (c *rconn) closeAfterFlush() {
+// armFlushDeadline bounds the entire flush from channel loss. HTTP/2 flow
+// control can stall the writer while inbound keepalives keep the connection
+// open. The timer covers enqueueing terminal frames, reaching the marker and
+// closing the request side. It stops when the connection ends.
+func (c *rconn) armFlushDeadline(lostAt time.Time) {
 	deadline := c.flushDeadline
 	if deadline <= 0 {
 		deadline = DefaultTiming().FlushDeadline
 	}
-	timer := time.AfterFunc(deadline, c.cancel)
+	timer := time.AfterFunc(time.Until(lostAt.Add(deadline)), c.cancel)
 	context.AfterFunc(c.ctx, func() { timer.Stop() })
+}
+
+// closeAfterFlush queues the marker that closes the request side after all
+// frames already queued. The caller arms cancellation before queuing it.
+func (c *rconn) closeAfterFlush() {
 	select {
 	case c.out <- nil:
 	case <-c.ctx.Done():

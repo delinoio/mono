@@ -558,12 +558,16 @@ func TestChannelLostDuringOfferGathering(t *testing.T) {
 	lost.Close()
 	dp.ChannelLost(lost)
 	requireEndedAnswer(t, lostAnswers, ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION)
+	waitFor(t, "lost offer cleanup", func() bool {
+		dp.mu.Lock()
+		defer dp.mu.Unlock()
+		return dp.sessions[lostID] == nil
+	})
 	dp.mu.Lock()
-	_, lostKept := dp.sessions[lostID]
 	_, liveKept := dp.sessions[liveID]
 	dp.mu.Unlock()
-	if lostKept || !liveKept {
-		t.Fatalf("lost session in map: %v, live session in map: %v", lostKept, liveKept)
+	if !liveKept {
+		t.Fatal("the live session was removed")
 	}
 	if st := lostSession.pc.ConnectionState(); st != webrtc.PeerConnectionStateClosed {
 		t.Fatalf("peer connection state %v", st)

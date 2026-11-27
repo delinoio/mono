@@ -569,14 +569,19 @@ func (s *session) endIdle() bool {
 // end closes the session. With a reason, it first sends a session-end
 // frame on every open stream.
 func (s *session) end(reason ownsandv1.SessionEndReason) {
-	s.mu.Lock()
-	if s.ended {
-		s.mu.Unlock()
-		return
+	if teardown, ok := s.beginEnd(reason); ok {
+		s.finishEnd(teardown)
 	}
-	t := s.beginEndLocked(reason)
-	s.mu.Unlock()
-	s.finishEnd(t)
+}
+
+// beginEnd claims teardown and stops admission and operation sends.
+func (s *session) beginEnd(reason ownsandv1.SessionEndReason) (sessionEnd, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ended {
+		return sessionEnd{}, false
+	}
+	return s.beginEndLocked(reason), true
 }
 
 // sessionEnd is the state that the transition into the ended state captures
