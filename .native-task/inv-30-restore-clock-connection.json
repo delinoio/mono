@@ -1,0 +1,83 @@
+{
+  "gid": "inv-30-restore-clock-connection",
+  "commit": "37ce6a364b6e4c12bfa609a7ddba38aad9d58e0e",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "37ce6a364b6e4c12bfa609a7ddba38aad9d58e0e",
+    "platform": "darwin/arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "reason": "This worker cannot access the native macOS host. The signed cgo build, real Virtualization.framework execution and probe for both guest OSes remain pending on m3-16.",
+    "setup": [
+      "Check out the specified SHA in an Apple silicon macOS worktree. Install the macOS command line developer tools with an SDK that supplies Virtualization.framework.",
+      "Set OWNSAND_VZ_TEST_KERNEL and OWNSAND_VZ_TEST_ROOTFS to the prepared Linux arm64 guest fixtures. Set OWNSAND_VZ_TEST_MACOS_IMAGE to a compatible prepared macOS image directory. Use disposable guest images that contain the guest helper.",
+      "Copy the probe script to the path in files.copyTo. The script sets COPYFILE_DISABLE=1, enables cgo, and signs each test binary with the repository virtualization entitlements."
+    ],
+    "commands": [
+      "set -euo pipefail",
+      "test \"$(git rev-parse HEAD)\" = \"37ce6a364b6e4c12bfa609a7ddba38aad9d58e0e\"",
+      "test \"$(go env GOOS)\" = darwin && test \"$(go env GOARCH)\" = arm64",
+      "mkdir -p \"$PWD/.t3-tmp\"",
+      "printf \"%s  %s\\n\" \"d2a7b987674c8563e48d311af0fc404ddf82c08d1a99ccdab7d4ca1034aa7803\" \".t3-tmp/native-macos-clock.sh\" | shasum -a 256 -c -",
+      "COPYFILE_DISABLE=1 bash \"$PWD/.t3-tmp/native-macos-clock.sh\""
+    ],
+    "expectedResults": [
+      "The native cgo vet and the race-enabled HTTP/2 fixture pass.",
+      "The signed, unmodified Virtualization.framework test binary passes both integration tests. Each guest type must actually take a memory-state restore path.",
+      "The signed overlay also passes both integration tests in normal and injected failure modes. Each guest type dials at least one real virtio socket connection and closes every observed connection before the clock helper returns.",
+      "The normal clock RPC succeeds. The injected vsock write failure produces the warning while the existing integration assertions still confirm a memory-state restore."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-restore-clock-connection/worker/.t3-tmp/clock-validation/native-macos-clock.sh",
+      "copyTo": ".t3-tmp/native-macos-clock.sh",
+      "sha256": "d2a7b987674c8563e48d311af0fc404ddf82c08d1a99ccdab7d4ca1034aa7803",
+      "outputLogs": [
+        ".t3-tmp/clock-connection-macos/http2.log",
+        ".t3-tmp/clock-connection-macos/vzrt.log",
+        ".t3-tmp/clock-connection-macos/vzrt-normal.log",
+        ".t3-tmp/clock-connection-macos/vzrt-reject.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-restore-clock-connection/worker/.t3-tmp/clock-validation/guestclient-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-restore-clock-connection/worker/.t3-tmp/clock-validation/vzrt-darwin-nocgo-arm64.test"
+      ]
+    },
+    "crossBuild": [
+      {
+        "id": "darwin-vet-final",
+        "command": "GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./cmds/ownsand-agent/...",
+        "status": "passed",
+        "sha": "37ce6a364b6e4c12bfa609a7ddba38aad9d58e0e",
+        "exitCode": 0,
+        "startedAt": "2026-11-27T17:27:52Z",
+        "finishedAt": "2026-11-27T17:27:52Z",
+        "durationSeconds": 0,
+        "log": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-restore-clock-connection/worker/.t3-tmp/clock-validation/darwin-vet-final.log"
+      },
+      {
+        "id": "darwin-guestclient-final",
+        "command": "GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go test -mod=readonly -c -o \"$SCRATCH/guestclient-darwin-arm64.test\" ./cmds/ownsand-agent/internal/guestclient",
+        "status": "passed",
+        "sha": "37ce6a364b6e4c12bfa609a7ddba38aad9d58e0e",
+        "exitCode": 0,
+        "startedAt": "2026-11-27T17:27:52Z",
+        "finishedAt": "2026-11-27T17:27:52Z",
+        "durationSeconds": 0,
+        "log": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-restore-clock-connection/worker/.t3-tmp/clock-validation/darwin-guestclient-final.log",
+        "notes": "Produced a Darwin arm64 Mach-O test binary."
+      },
+      {
+        "id": "darwin-nocgo",
+        "command": "GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go test -mod=readonly -c -o \"$SCRATCH/vzrt-darwin-nocgo-arm64.test\" ./cmds/ownsand-agent/internal/vmruntime/vzrt",
+        "status": "passed",
+        "sha": "37ce6a364b6e4c12bfa609a7ddba38aad9d58e0e",
+        "exitCode": 0,
+        "startedAt": "2026-11-27T17:27:27Z",
+        "finishedAt": "2026-11-27T17:27:30Z",
+        "durationSeconds": 3,
+        "log": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-restore-clock-connection/worker/.t3-tmp/clock-validation/darwin-nocgo.log",
+        "notes": "Produced a Darwin arm64 Mach-O test binary for the non-cgo variant. The Virtualization.framework runtime requires cgo."
+      }
+    ]
+  }
+}
