@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -48,7 +49,7 @@ func TestCursorAdmissionCommitOutcome(t *testing.T) {
 					return strings.Contains(w.env.Logs.String(), "agent_admit_failed")
 				})
 				w.assertNoRequestsOrClaims(t)
-				if got := fake.Released(key); got != 0 {
+				if got := fake.ReleaseAttempts(key); got != 0 {
 					t.Fatalf("release count while the transaction is open = %d", got)
 				}
 				if got := kicks.Load(); got != 0 {
@@ -59,10 +60,10 @@ func TestCursorAdmissionCommitOutcome(t *testing.T) {
 
 			req := w.requestBySource(t, key)
 			eventually(t, "a dispatch notification or a vendor release", func() bool {
-				return kicks.Load() > 0 || fake.Released(key) > 0
+				return kicks.Load() > 0 || fake.ReleaseAttempts(key) > 0
 			})
-			if proxy.armed.Load() || kicks.Load() != 1 || fake.Released(key) != 0 {
-				t.Fatalf("fault armed = %t, dispatch notifications = %d, vendor releases = %d", proxy.armed.Load(), kicks.Load(), fake.Released(key))
+			if proxy.armed.Load() || kicks.Load() != 1 || fake.ReleaseAttempts(key) != 0 {
+				t.Fatalf("fault armed = %t, dispatch notifications = %d, vendor release attempts = %d", proxy.armed.Load(), kicks.Load(), fake.ReleaseAttempts(key))
 			}
 			c, err := w.l.Agents.Claim(t.Context(), req.GetRequestId())
 			if err != nil || c.State != agent.ClaimHeld {
@@ -72,7 +73,7 @@ func TestCursorAdmissionCommitOutcome(t *testing.T) {
 				t.Fatalf("Cursor claim = %q, held = %t, want %q", worker, held, c.WorkerID)
 			}
 			stays(t, "one request and no release after commit", func() bool {
-				return len(w.requests(t)) == 1 && fake.Released(key) == 0 && kicks.Load() == 1
+				return len(w.requests(t)) == 1 && fake.ReleaseAttempts(key) == 0 && kicks.Load() == 1
 			})
 		})
 	}
@@ -82,7 +83,9 @@ func TestDevinAdmissionConfirmedRollback(t *testing.T) {
 	proxy := newAdmissionProxy(t, admissionDelayRollback)
 	var kicks atomic.Int32
 	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
-	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, proxy.option(t, &kicks))
+	timing := fastAgentTiming()
+	timing.PollInterval = time.Hour // Each step runs one poll explicitly.
+	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, timing, proxy.option(t, &kicks))
 	eventually(t, "the Devin stream", func() bool { return fake.Streams() == 1 })
 	kicks.Store(0)
 	const key = "devin-admission"
@@ -91,17 +94,37 @@ func TestDevinAdmissionConfirmedRollback(t *testing.T) {
 		return strings.Contains(w.env.Logs.String(), "agent_admit_failed")
 	})
 	w.assertNoRequestsOrClaims(t)
+	w.l.Agents.Poll(t.Context())
 	if got := fake.ReleaseAttempts(key); got != 0 {
 		t.Fatalf("release count while the transaction is open = %d", got)
 	}
 	// The release of a terminal session leaves no second pending entry.
-	fake.SetSessionStatus(key, "terminated")
+	fake.SetSessionStatusSilently(key, "terminated")
+	fake.FailReleases(true)
 	proxy.finish()
-	eventually(t, "release after rollback", func() bool { return fake.Releases(key) == 1 })
-	stays(t, "one release and no dispatch notification", func() bool {
-		return fake.ReleaseAttempts(key) == 1 && kicks.Load() == 0
+	eventually(t, "failed release after rollback", func() bool {
+		w.l.Agents.Poll(t.Context())
+		return fake.ReleaseAttempts(key) == 1
 	})
+	if phase, _ := fake.State(key); phase != "claimed" {
+		t.Fatalf("session phase after the failure = %s, want claimed", phase)
+	}
 	w.assertNoRequestsOrClaims(t)
+
+	fake.FailReleases(false)
+	w.l.Agents.Poll(t.Context())
+	w.l.Agents.Poll(t.Context())
+	if attempts, releases := fake.ReleaseAttempts(key), fake.Releases(key); attempts != 2 || releases != 1 {
+		t.Fatalf("release attempts = %d, successes = %d, want 2 and 1", attempts, releases)
+	}
+	if phase, _ := fake.State(key); phase != "deleted" {
+		t.Fatalf("session phase after release = %s, want deleted", phase)
+	}
+	if got := kicks.Load(); got != 0 {
+		t.Fatalf("dispatch notifications = %d, want none", got)
+	}
+	w.assertNoRequestsOrClaims(t)
+	t.Log("No release while COMMIT was unresolved. After rollback, release failed once and a poll retried it without a vendor event.")
 }
 
 type admissionFault uint8

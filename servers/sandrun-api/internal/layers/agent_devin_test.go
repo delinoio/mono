@@ -40,14 +40,14 @@ type devinWorld struct {
 func newDevinWorld(t *testing.T, guest sandrunv1.GuestOs) *devinWorld {
 	t.Helper()
 	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
-	w := createDevinWorld(t, guest, fake)
+	w := createDevinWorld(t, guest, fake, agent.Timing{})
 	eventually(t, "the Devin watch", func() bool { return fake.Streams() == 1 })
 	return w
 }
 
-func createDevinWorld(t *testing.T, guest sandrunv1.GuestOs, fake *devinfake.Fake, extra ...testenv.Option) *devinWorld {
+func createDevinWorld(t *testing.T, guest sandrunv1.GuestOs, fake *devinfake.Fake, timing agent.Timing, extra ...testenv.Option) *devinWorld {
 	t.Helper()
-	w := newAgentWorld(t, layers.Options{Devin: devin.Options{BaseURL: fake.Server.URL, ReleaseGrace: time.Minute}}, extra...)
+	w := newAgentWorld(t, layers.Options{Devin: devin.Options{BaseURL: fake.Server.URL, ReleaseGrace: time.Minute}, AgentTiming: timing}, extra...)
 	dw := &devinWorld{agentWorld: w, devin: fake}
 	id := w.createIntegration(t, &sandrunv1.CreateAgentIntegrationRequest{
 		Vendor: sandrunv1.AgentVendor_AGENT_VENDOR_DEVIN, Name: "devin",
@@ -620,7 +620,7 @@ func TestDevinWatchDefaultPagination(t *testing.T) {
 	for _, sid := range sessionIDs {
 		fake.AddSession(sid, false)
 	}
-	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake)
+	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, agent.Timing{})
 	eventually(t, "the Devin watch after the default pages", func() bool {
 		return fake.Streams() == 1 || fake.Lists() > len(sessionIDs)
 	})
@@ -701,7 +701,7 @@ func TestDevinWatchPagination(t *testing.T) {
 				fake.AddSession(sid, false)
 			}
 			fake.SetQueuePages(t, tc.pages)
-			w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake)
+			w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, agent.Timing{})
 			eventually(t, "the Devin watch after the listed pages", func() bool {
 				return fake.Streams() == 1 || fake.Lists() > len(tc.pages)
 			})
