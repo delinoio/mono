@@ -192,6 +192,86 @@ func openStream(t *testing.T, c *Conn) *Stream {
 	return s
 }
 
+func TestStreamQueueBoundsFramesWithCredit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	limits := testLimits
+	limits.MaxQueuedFrames = 3
+	c := NewConn(ctx, "device", 1, limits)
+	slow, healthy := openStream(t, c), openStream(t, c)
+	drainOut(c)
+	send := func(s *Stream) *ownsandv1.DataFrame {
+		t.Helper()
+		f := datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.ExecEvent{
+			Event: &ownsandv1.ExecEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}},
+		})
+		if err := c.dispatch(f); err != nil {
+			t.Fatalf("dispatch on stream %d: %v", s.ID, err)
+		}
+		return f
+	}
+	if err := c.dispatch(acceptedFrame(slow)); err != nil {
+		t.Fatal(err)
+	}
+	for range limits.MaxQueuedFrames {
+		send(slow)
+	}
+	if slow.queuedFrames != 3 || len(slow.queue) != 4 {
+		t.Fatalf("queue held %d credit frames and %d total frames, want 3 and 4", slow.queuedFrames, len(slow.queue))
+	}
+	send(slow)
+	if frame, err := slow.Next(ctx, nil); frame != nil || !errors.Is(err, ErrQueueLimit) {
+		t.Fatalf("Next = %v, %v, want only ErrQueueLimit", frame, err)
+	}
+	if slow.queuedFrames != 0 || slow.controlFrames != 0 || slow.controlBytes != 0 || len(slow.queue) != 0 {
+		t.Fatal("the closed stream retained queued frames or counts")
+	}
+	send(slow) // A late frame must leave the closed stream unchanged.
+	slow.Close(true)
+	out := drainOut(c)
+	if len(out) != 1 || out[0].GetStreamId() != slow.ID || out[0].GetRelayStreamClose() == nil {
+		t.Fatalf("outbound frames = %v, want one close for stream %d", out, slow.ID)
+	}
+	want := send(healthy)
+	if frame, err := healthy.Next(ctx, nil); frame != want || err != nil {
+		t.Fatalf("healthy stream Next = %v, %v, want %v", frame, err, want)
+	}
+	if c.Err() != nil || c.StreamCount() != 1 {
+		t.Fatalf("connection: error = %v, open streams = %d", c.Err(), c.StreamCount())
+	}
+}
+
+func TestStreamQueueCountFollowsNext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	limits := testLimits
+	limits.MaxQueuedFrames = 2
+	c := NewConn(ctx, "device", 1, limits)
+	s := openStream(t, c)
+	enqueue := func() {
+		t.Helper()
+		f := datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.ExecEvent{
+			Event: &ownsandv1.ExecEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}},
+		})
+		if err := c.dispatch(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	enqueue()
+	enqueue()
+	for range 5 {
+		f, err := s.Next(ctx, nil)
+		if err != nil || f.GetExecEvent().GetKeepalive() == nil || s.queuedFrames != 1 {
+			t.Fatalf("Next = %v, %v with %d frames left, want one remaining frame", f, err, s.queuedFrames)
+		}
+		s.Consumed(ctx, f)
+		enqueue()
+	}
+	if s.queuedFrames != 2 || s.isClosed() {
+		t.Fatalf("queue count = %d, closed = %v, want two queued frames on the open stream", s.queuedFrames, s.isClosed())
+	}
+}
+
 func TestStreamQueueBoundsFramesWithoutCredit(t *testing.T) {
 	limits := testLimits
 	limits.MaxQueuedControlFrames = 3
@@ -267,7 +347,8 @@ func TestCompliantExchangeStaysWithinDefaultLimits(t *testing.T) {
 
 func TestDefaultLimitsApplyToZeroValues(t *testing.T) {
 	c := NewConn(context.Background(), "device", 1, Limits{StreamBuffer: datapath.MinWindowSize, MaxStreamsPerConn: 1, MaxStreamsPerGrant: 1})
-	if c.limits.MaxQueuedControlFrames != DefaultLimits().MaxQueuedControlFrames || c.limits.MaxQueuedControlBytes != DefaultLimits().MaxQueuedControlBytes {
+	if c.limits.MaxQueuedFrames != 4096 || c.limits.MaxQueuedFrames != DefaultLimits().MaxQueuedFrames ||
+		c.limits.MaxQueuedControlFrames != DefaultLimits().MaxQueuedControlFrames || c.limits.MaxQueuedControlBytes != DefaultLimits().MaxQueuedControlBytes {
 		t.Fatalf("limits = %+v, want the defaults", c.limits)
 	}
 }
