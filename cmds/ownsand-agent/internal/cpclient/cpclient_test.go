@@ -117,8 +117,7 @@ const authTestTimeout = 300 * time.Millisecond
 // timer precision. Keep it well under authTestTimeout.
 const authTestSlack = 50 * time.Millisecond
 
-// authTestMaxElapsed is the generous upper bound of a stalled attempt. It only
-// proves that the attempt ends instead of hanging.
+// authTestMaxElapsed bounds fixture waits without testing timer precision.
 const authTestMaxElapsed = 10 * time.Second
 
 // enrolled returns a client with a short attempt deadline and a device that
@@ -135,7 +134,9 @@ func enrolled(t *testing.T) (*testcp.Server, *Client, string, *identity.Key) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := c.Agent.Enroll(context.Background(), connect.NewRequest(&ownsandv1.EnrollRequest{
+	ctx, cancel := context.WithTimeout(context.Background(), authTestMaxElapsed)
+	defer cancel()
+	resp, err := c.Agent.Enroll(ctx, connect.NewRequest(&ownsandv1.EnrollRequest{
 		EnrollmentToken: testcp.Token,
 		PublicKey:       key.PublicKey(),
 		Name:            "host",
@@ -245,7 +246,7 @@ func TestAuthenticateEndsWhenTheControlPlaneStalls(t *testing.T) {
 		stall func(*testcp.Server)
 	}{
 		{"create challenge", (*testcp.Server).StallNextCreateChallenge},
-		{"authenticate", (*testcp.Server).StallNextAuthenticate},
+		{"authenticate", func(cp *testcp.Server) { cp.StallNextAuthenticate() }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cp, c, id, key := enrolled(t)
@@ -285,10 +286,30 @@ func TestAuthenticateEndsWhenTheControlPlaneStalls(t *testing.T) {
 func TestAuthenticateKeepsTheCallerContext(t *testing.T) {
 	cp, c, id, key := enrolled(t)
 	c.AuthTimeout = time.Hour
-	cp.StallNextAuthenticate()
+	entered := cp.StallNextAuthenticate()
 	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(100*time.Millisecond, cancel)
-	_, err := c.Authenticate(ctx, id, key, "")
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Authenticate(ctx, id, key, "")
+		done <- err
+	}()
+
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("Authenticate returned before the handler entered the stall: %v", err)
+	case <-time.After(authTestMaxElapsed):
+		t.Fatal("Authenticate handler did not enter the stall")
+	}
+	cancel()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(authTestMaxElapsed):
+		t.Fatal("Authenticate did not return after caller cancellation")
+	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error %v does not match context.Canceled", err)
 	}

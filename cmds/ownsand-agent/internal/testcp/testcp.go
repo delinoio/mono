@@ -76,7 +76,7 @@ type Server struct {
 	urlBase    string
 	stallNext  bool
 	stallCh    bool
-	stallAuth  bool
+	stallAuth  *authenticateStall
 	stallEnr   bool
 	enrollKeys []ed25519.PublicKey
 	// Enroll hooks; see ConsumeEnrollToken, DropNextEnrollResponse,
@@ -170,13 +170,22 @@ func (s *Server) StallNextCreateChallenge() {
 	s.mu.Unlock()
 }
 
-// StallNextAuthenticate makes the fake accept the next Authenticate call
-// and never answer it. The call ends when its client gives up. Later calls
-// answer normally.
-func (s *Server) StallNextAuthenticate() {
+type authenticateStall struct {
+	entered chan struct{}
+	stop    chan struct{}
+}
+
+// StallNextAuthenticate stalls the next Authenticate call until its client
+// gives up or the test ends. It returns a channel that closes when the
+// handler enters the stall. Later calls answer normally.
+func (s *Server) StallNextAuthenticate() <-chan struct{} {
+	stall := &authenticateStall{entered: make(chan struct{}), stop: make(chan struct{})}
 	s.mu.Lock()
-	s.stallAuth = true
+	s.stallAuth = stall
 	s.mu.Unlock()
+	// Let the handler exit before server shutdown if the client loses its context.
+	s.t.Cleanup(func() { close(stall.stop) })
+	return stall.entered
 }
 
 // stalled reports whether the unary call that flag guards must stall, and
@@ -323,11 +332,18 @@ func (s *Server) checkSignature(deviceID string, nonce, sig []byte, purpose stri
 
 // Authenticate implements AgentService.
 func (s *Server) Authenticate(ctx context.Context, req *connect.Request[ownsandv1.AuthenticateRequest]) (*connect.Response[ownsandv1.AuthenticateResponse], error) {
-	if s.stalled(&s.stallAuth) {
-		<-ctx.Done()
-		return nil, ctx.Err()
-	}
 	s.mu.Lock()
+	if stall := s.stallAuth; stall != nil {
+		s.stallAuth = nil
+		s.mu.Unlock()
+		close(stall.entered)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-stall.stop:
+			return nil, context.Canceled
+		}
+	}
 	defer s.mu.Unlock()
 	d, err := s.checkSignature(req.Msg.GetDeviceId(), req.Msg.GetNonce(), req.Msg.GetSignature(), identity.PurposeAuthenticate)
 	if err != nil {
