@@ -111,7 +111,7 @@ func TestMacOSImageFirstBootShutdown(t *testing.T) {
 				return d.DialContext(ctx, "tcp", srv.Listener.Addr().String())
 			}
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			err := finishMacOSImage(t.Context(), dir, images.Metadata{GuestOS: guestOS}, "", func() (string, error) {
+			err := finishMacOSImage(ctx, dir, images.Metadata{GuestOS: guestOS}, "", func() (string, error) {
 				return provisionAndShutdownMacOS(ctx, dial, exit, logger, time.Now(), 100*time.Millisecond)
 			})
 			for _, command := range append(slices.Clone(macOSProvisionCommands), shutdownCommand) {
@@ -142,29 +142,5 @@ func TestMacOSImageFirstBootShutdown(t *testing.T) {
 			}
 			assertMacOSFixture(t, dir, "previous", "previous")
 		})
-	}
-}
-
-func writeMacOSFixture(t *testing.T, dir, contents string) {
-	t.Helper()
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	for _, file := range []string{images.MacOSDisk, images.MacOSAuxStorage, images.MacOSHardwareModel} {
-		if err := os.WriteFile(filepath.Join(dir, file), []byte(contents), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func assertMacOSFixture(t *testing.T, dir, helperVersion, diskContents string) {
-	t.Helper()
-	metadata, err := images.ReadMetadata(dir)
-	if err != nil || metadata.GuestVersion != helperVersion {
-		t.Fatalf("installed helper version = %q, %v, want %q", metadata.GuestVersion, err, helperVersion)
-	}
-	disk, err := os.ReadFile(filepath.Join(dir, images.MacOSDisk))
-	if err != nil || string(disk) != diskContents {
-		t.Fatalf("installed disk = %q, %v, want %q", disk, err, diskContents)
 	}
 }
