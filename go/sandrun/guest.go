@@ -9,11 +9,20 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf16"
 
 	"connectrpc.com/connect"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
+)
+
+const (
+	// cleanupTimeout bounds the guest clean-up after a failed sync or download.
+	cleanupTimeout = 30 * time.Second
+	// guestExecRecoveryWait bounds the wait for a terminal result after a
+	// guest command loses its exec stream.
+	guestExecRecoveryWait = 30 * time.Second
 )
 
 // The guest commands of sync and download. Every command gets its paths
@@ -420,6 +429,18 @@ func (c *Client) runGuest(ctx context.Context, s *sandrunv1.DevSession, op guest
 		r.exitCode = *res.ExitCode
 	}
 	return r, nil
+}
+
+func (c *Client) recoverGuestExec(ctx context.Context, s *sandrunv1.DevSession, streamErr *ExecStreamError) (*ExecResult, error) {
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), guestExecRecoveryWait)
+	defer cancel()
+	return c.AttachExec(waitCtx, AttachParams{
+		OrganizationID: s.GetOrganizationId(),
+		DevSessionID:   s.GetDevSessionId(),
+		ExecID:         streamErr.ExecID,
+		StdoutOffset:   streamErr.StdoutOffset,
+		StderrOffset:   streamErr.StderrOffset,
+	})
 }
 
 // failure returns the error of a guest command that exited with a nonzero
