@@ -1,0 +1,63 @@
+{
+  "gid": "inv-31-windows-status-test-privilege",
+  "commit": "f192231ed52ab70854cde414b0ad1226e3d9a8ff",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "setup": "Run these commands from the root of a disposable checkout in non-elevated PowerShell. The test creates ordinary files in the checkout's temporary directory.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne 'f192231ed52ab70854cde414b0ad1226e3d9a8ff') { throw 'Unexpected validation revision' }",
+      "New-Item -ItemType Directory -Path '.t3-tmp/windows-status-privilege' -Force | Out-Null",
+      "$work = (Resolve-Path '.t3-tmp/windows-status-privilege').Path; $env:TEMP = $work; $env:TMP = $work; $env:GOTMPDIR = $work",
+      "$result = go test -count=1 -v -run '^TestConcurrentStatusReadsDoNotLoseWrites$' ./cmds/ownsand-agent/internal/store 2>&1; $code = $LASTEXITCODE; $result | Tee-Object -FilePath (Join-Path $work 'windows-unelevated.log'); if ($code -ne 0 -or (($result | Out-String) -notmatch '--- SKIP: TestConcurrentStatusReadsDoNotLoseWrites' -or ($result | Out-String) -notmatch 'the test process is not an elevated administrator')) { throw 'Expected the explicit elevation skip' }",
+      "$result = go test -count=1 -v -run '^TestWriteFileAtomic(RetriesWhileReaderHoldsFile|GivesUpOnStuckReader)$' ./cmds/ownsand-agent/internal/store 2>&1; $code = $LASTEXITCODE; $result | Tee-Object -FilePath (Join-Path $work 'windows-replacement-controls.log'); if ($code -ne 0 -or ($result | Out-String) -notmatch '--- PASS: TestWriteFileAtomicRetriesWhileReaderHoldsFile' -or ($result | Out-String) -notmatch '--- PASS: TestWriteFileAtomicGivesUpOnStuckReader') { throw 'Expected both unprivileged replacement controls to pass' }"
+    ],
+    "expectedResults": [
+      "TestConcurrentStatusReadsDoNotLoseWrites reports SKIP and “the test process is not an elevated administrator.” The command exits 0.",
+      "Both replacement controls pass on the Windows filesystem."
+    ],
+    "requiresElevation": {
+      "status": "pending",
+      "reason": "The available account is non-elevated. The store test needs an elevated administrator token to pass the gate and run its setup and assertions.",
+      "setup": "Use an elevated PowerShell session in an isolated checkout at the same revision. After creating the temporary directory, copy the probe source to files.copyTo. The negative case uses a Go overlay and leaves tracked files intact.",
+      "commands": [
+        "if ((git rev-parse HEAD).Trim() -ne 'f192231ed52ab70854cde414b0ad1226e3d9a8ff') { throw 'Unexpected validation revision' }",
+        "New-Item -ItemType Directory -Path '.t3-tmp/windows-status-privilege' -Force | Out-Null",
+        "$work = (Resolve-Path '.t3-tmp/windows-status-privilege').Path; $env:TEMP = $work; $env:TMP = $work; $env:GOTMPDIR = $work",
+        "$result = go test -count=1 -v -run '^TestConcurrentStatusReadsDoNotLoseWrites$' ./cmds/ownsand-agent/internal/store 2>&1; $code = $LASTEXITCODE; $result | Tee-Object -FilePath (Join-Path $work 'windows-elevated.log'); if ($code -ne 0 -or ($result | Out-String) -notmatch '--- PASS: TestConcurrentStatusReadsDoNotLoseWrites') { throw 'Expected the elevated concurrency test to pass' }",
+        "$probe = (Resolve-Path '.t3-tmp/windows-status-privilege/store_windows_invalid_directory_test.go').Path; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe).Hash.ToLowerInvariant() -ne 'c79da3bbdac94e3a1e90a36ed36a146315e51d7947df6b60be85fdd281744109') { throw 'Unexpected probe checksum' }",
+        "$source = (Resolve-Path 'cmds/ownsand-agent/internal/store/store_windows_test.go').Path; $overlay = Join-Path $work 'invalid-directory-overlay.json'; $replace = @{}; $replace[$source] = $probe; [IO.File]::WriteAllText($overlay, (ConvertTo-Json -InputObject @{ Replace = $replace } -Depth 4))",
+        "$result = go test -count=1 -v -overlay $overlay -run '^TestConcurrentStatusReadsDoNotLoseWrites$' ./cmds/ownsand-agent/internal/store 2>&1; $code = $LASTEXITCODE; $result | Tee-Object -FilePath (Join-Path $work 'windows-elevated-invalid-directory.log'); $log = $result | Out-String; if ($code -ne 1 -or $log -notmatch '--- FAIL: TestConcurrentStatusReadsDoNotLoseWrites' -or $log -notmatch 'open the store: store: create .*not-a-directory') { throw 'Expected a failing test with the store setup diagnostic' }"
+      ],
+      "expectedResults": [
+        "Normal setup passes the 300 writes, concurrent reader assertions, and final sequence check.",
+        "With a regular file supplied as the directory, the test reports FAIL and includes the wrapped store directory-creation error."
+      ]
+    },
+    "sha": "f192231ed52ab70854cde414b0ad1226e3d9a8ff",
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-status-test-privilege/worker/.t3-tmp/windows-status-privilege/store_windows_invalid_directory_test.go",
+      "copyTo": ".t3-tmp/windows-status-privilege/store_windows_invalid_directory_test.go",
+      "sha256": "c79da3bbdac94e3a1e90a36ed36a146315e51d7947df6b60be85fdd281744109",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/store/store_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/windows-status-privilege/windows-unelevated.log",
+        ".t3-tmp/windows-status-privilege/windows-replacement-controls.log",
+        ".t3-tmp/windows-status-privilege/windows-elevated.log",
+        ".t3-tmp/windows-status-privilege/windows-elevated-invalid-directory.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-status-test-privilege/worker/.t3-tmp/windows-status-privilege/store-windows-amd64-invalid-directory.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-status-test-privilege/worker/.t3-tmp/windows-status-privilege/store-windows-amd64.test.exe"
+      ],
+      "crossBuildArtifactSha256": {
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-status-test-privilege/worker/.t3-tmp/windows-status-privilege/store-windows-amd64-invalid-directory.test.exe": "8f860766e80a2e4ddbd757351e5129d5a9a50a1c6a02107fefc6d72956294ffc",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-status-test-privilege/worker/.t3-tmp/windows-status-privilege/store-windows-amd64.test.exe": "2a5c0e457319ce6cf5772df9f26e8b22f0a0c9290bf8695466811c3fccf1813e"
+      }
+    }
+  }
+}
