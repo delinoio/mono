@@ -172,7 +172,7 @@ func (e *Engine) drive(ctx context.Context, runnerID string, kick chan struct{})
 		case runWaiting, runBusy:
 			if r.ProgramExecID != "" && !following {
 				following = true
-				go e.followProgram(followCtx, client, r)
+				go e.followProgram(followCtx, r)
 			}
 			e.checkSandbox(ctx, client, r)
 		case runDeleting:
@@ -447,21 +447,24 @@ func (e *Engine) sandboxEnded(ctx context.Context, runnerID string, reason ownsa
 }
 
 // followProgram follows the runner program with AttachExec. The SDK
-// resumes the stream after each relay rotation; when the result arrives,
-// the request ends as the adapter says and SandRun deletes the sandbox. The
-// follower keeps the result until the exit transaction succeeds or its
-// context ends. When SandRun misses the exit (for example, the exec result
+// resumes the stream after each relay rotation. Before starting a new attach,
+// the follower looks up the active link in case the API key changed. Once it
+// receives the result, it keeps the result until the exit transaction succeeds
+// or its context ends. If SandRun misses the exit (for example, the exec result
 // expired), the profile's idle_ttl deletes the sandbox.
-func (e *Engine) followProgram(ctx context.Context, client ownsandclient.Client, r *Runner) {
+func (e *Engine) followProgram(ctx context.Context, r *Runner) {
 	var result *ownsand.ExecResult
 	for ctx.Err() == nil {
 		if result == nil {
-			res, err := client.AttachExec(ctx, r.SandboxID, r.ProgramExecID, ownsand.AttachParams{OnEvent: func(ownsand.ExecEvent) error { return nil }})
-			if isCode(err, connect.CodeNotFound) {
-				return
-			}
+			client, _, err := e.links.Client(ctx, r.OrganizationID)
 			if err == nil {
-				result = res
+				res, err := client.AttachExec(ctx, r.SandboxID, r.ProgramExecID, ownsand.AttachParams{OnEvent: func(ownsand.ExecEvent) error { return nil }})
+				if isCode(err, connect.CodeNotFound) {
+					return
+				}
+				if err == nil {
+					result = res
+				}
 			}
 		}
 		if result != nil && e.programExited(ctx, r.ID, result) == nil {

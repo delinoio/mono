@@ -47,18 +47,43 @@ func (a programAdapter) Start(ctx context.Context, g *work.Guest) (work.StartRes
 	return work.StartResult{ProgramExecID: execID}, nil
 }
 
+type programAttachScenario int
+
+const (
+	attachOnce programAttachScenario = iota
+	attachAfterKeyRotation
+	attachAfterInactiveLink
+	attachNotFound
+)
+
+type runnerProgramCase struct {
+	name         string
+	exitCode     int64
+	runnerReason sandrunv1.RunnerEndReason
+	requestEnd   work.RequestEnd
+	endRequest   bool
+	deleteRunner bool
+	attach       programAttachScenario
+}
+
 func TestRunnerProgramLifecycle(t *testing.T) {
-	for _, tc := range []struct {
-		name         string
-		exitCode     int64
-		runnerReason sandrunv1.RunnerEndReason
-		requestEnd   work.RequestEnd
-		endRequest   bool
-		deleteRunner bool
-	}{
+	for _, tc := range []runnerProgramCase{
 		{
 			name: "successful exit", runnerReason: sandrunv1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE,
 			requestEnd: work.RequestEnd{State: sandrunv1.RequestState_REQUEST_STATE_ENDED, Reason: sandrunv1.RequestEndReason_REQUEST_END_REASON_COMPLETED},
+		},
+		{
+			name: "key rotation during attach", attach: attachAfterKeyRotation,
+			runnerReason: sandrunv1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE,
+			requestEnd:   work.RequestEnd{State: sandrunv1.RequestState_REQUEST_STATE_ENDED, Reason: sandrunv1.RequestEndReason_REQUEST_END_REASON_COMPLETED},
+		},
+		{
+			name: "temporarily inactive link", attach: attachAfterInactiveLink,
+			runnerReason: sandrunv1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE,
+			requestEnd:   work.RequestEnd{State: sandrunv1.RequestState_REQUEST_STATE_ENDED, Reason: sandrunv1.RequestEndReason_REQUEST_END_REASON_COMPLETED},
+		},
+		{
+			name: "exec not found", attach: attachNotFound,
 		},
 		{
 			name: "nonzero exit", exitCode: 7, runnerReason: sandrunv1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE,
@@ -74,12 +99,12 @@ func TestRunnerProgramLifecycle(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testRunnerProgramExit(t, tc.exitCode, tc.runnerReason, tc.requestEnd, tc.endRequest, tc.deleteRunner)
+			testRunnerProgramExit(t, tc)
 		})
 	}
 }
 
-func testRunnerProgramExit(t *testing.T, exitCode int64, runnerReason sandrunv1.RunnerEndReason, requestEnd work.RequestEnd, endRequest, deleteRunner bool) {
+func testRunnerProgramExit(t *testing.T, tc runnerProgramCase) {
 	t.Helper()
 	fake := ownsandfake.New()
 	l := &layers.Layers{}
@@ -93,12 +118,40 @@ func testRunnerProgramExit(t *testing.T, exitCode int64, runnerReason sandrunv1.
 	if _, err := w.setLink(w.org.Admin, w.osOrg, ownsandKey('a')); err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
+	type execTarget struct{ sandboxID, execID string }
+	firstAttach := make(chan execTarget, 1)
+	allowRetry := make(chan struct{})
 	exit := make(chan struct{})
-	fake.SetExec(nil, func(ctx context.Context, sandboxID, execID string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
+	exitTarget := make(chan execTarget, 1)
+	first := true // Only the program follower calls AttachExec.
+	fake.SetExec(nil, func(ctx context.Context, sandboxID, execID string, _ ownsand.AttachParams) (*ownsand.ExecResult, error) {
+		target := execTarget{sandboxID, execID}
+		if first {
+			first = false
+			firstAttach <- target
+			switch tc.attach {
+			case attachNotFound:
+				return nil, connect.NewWireError(connect.CodeNotFound, errors.New("exec not found"))
+			case attachAfterKeyRotation, attachAfterInactiveLink:
+				select {
+				case <-allowRetry:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				if tc.attach == attachAfterKeyRotation {
+					return nil, connect.NewWireError(connect.CodeUnauthenticated, errors.New("old key revoked"))
+				}
+				return nil, connect.NewError(connect.CodeUnavailable, errors.New("attach interrupted"))
+			}
+		}
 		select {
 		case <-exit:
-			return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &exitCode}, nil
+			select {
+			case exitTarget <- target:
+			default:
+			}
+			return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &tc.exitCode}, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -153,6 +206,40 @@ func testRunnerProgramExit(t *testing.T, exitCode int64, runnerReason sandrunv1.
 	if err := l.Engine.MarkBusy(ctx, w.org.ID, runnerID, ""); err != nil {
 		t.Fatal(err)
 	}
+	var original execTarget
+	select {
+	case original = <-firstAttach:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the follower did not attach")
+	}
+	active := sandrunv1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE
+	switch tc.attach {
+	case attachAfterKeyRotation:
+		fake.AddOrg(w.osOrg, ownsandKey('b'))
+		replacement, err := w.setLink(w.org.Admin, w.osOrg, ownsandKey('b'))
+		if err != nil || replacement.GetState() != active {
+			t.Fatalf("replace the OwnSand key: %v, %v", replacement, err)
+		}
+		close(allowRetry)
+	case attachAfterInactiveLink:
+		const setLinkState = "UPDATE ownsand_links SET state = $2 WHERE organization_id = $1"
+		if _, err := env.DB.Pool.Exec(ctx, setLinkState, w.org.ID, int16(sandrunv1.OwnSandLinkState_OWN_SAND_LINK_STATE_INVALID)); err != nil {
+			t.Fatal(err)
+		}
+		close(allowRetry)
+		eventually(t, "the interrupted attach", func() bool {
+			return strings.Contains(env.Logs.String(), `"rpc":"AttachExec","code":"unavailable"`)
+		})
+		stays(t, "attach count while the link is inactive", func() bool { return fake.Calls("AttachExec") == 1 })
+		if _, err := env.DB.Pool.Exec(ctx, setLinkState, w.org.ID, int16(active)); err != nil {
+			t.Fatal(err)
+		}
+	case attachNotFound:
+		stays(t, "busy runner with one attach after not_found", func() bool {
+			return fake.Calls("AttachExec") == 1 && w.runner(t, runnerID).GetState() == sandrunv1.RunnerState_RUNNER_STATE_BUSY
+		})
+		return
+	}
 	restore := env.FailProgramExitCommits()
 	close(exit)
 	eventually(t, "PostgreSQL rejecting the exit commit", func() bool {
@@ -163,12 +250,21 @@ func testRunnerProgramExit(t *testing.T, exitCode int64, runnerReason sandrunv1.
 		w.runner(t, runnerID).GetState() != sandrunv1.RunnerState_RUNNER_STATE_BUSY || fake.Active(w.osOrg) != 1 {
 		t.Fatalf("after failed commit: request %+v, error %v", got, err)
 	}
-	if endRequest {
-		if _, err := l.Engine.EndRequest(ctx, w.org.ID, req.ID, requestEnd); err != nil {
+	if target := <-exitTarget; target != original {
+		t.Fatalf("exit attach targeted %+v, want %+v", target, original)
+	}
+	if tc.attach == attachAfterKeyRotation {
+		lk, err := env.User(w.org.Admin).OwnSandLink.GetOwnSandLink(ctx, connect.NewRequest(&sandrunv1.GetOwnSandLinkRequest{OrganizationId: w.org.ID}))
+		if err != nil || lk.Msg.GetLink().GetState() != active {
+			t.Fatalf("late rejection of the old key affected the active link: %v, %v", lk, err)
+		}
+	}
+	if tc.endRequest {
+		if _, err := l.Engine.EndRequest(ctx, w.org.ID, req.ID, tc.requestEnd); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if deleteRunner {
+	if tc.deleteRunner {
 		// Keep the runner in DELETING while the follower retries the exit.
 		fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = errors.New("sandbox deletion temporarily unavailable") })
 		resp, err := env.User(w.org.Admin).Work.DeleteRunner(ctx, connect.NewRequest(&sandrunv1.DeleteRunnerRequest{
@@ -179,20 +275,24 @@ func testRunnerProgramExit(t *testing.T, exitCode int64, runnerReason sandrunv1.
 		}
 	}
 	restore()
-	if deleteRunner {
+	if tc.deleteRunner {
 		stays(t, "the user's deletion", func() bool {
 			r := w.runner(t, runnerID)
-			return r.GetState() == sandrunv1.RunnerState_RUNNER_STATE_DELETING && r.GetEndReason() == runnerReason
+			return r.GetState() == sandrunv1.RunnerState_RUNNER_STATE_DELETING && r.GetEndReason() == tc.runnerReason
 		})
 		fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
 	}
 	eventually(t, "runner deleted", func() bool { return w.runner(t, runnerID).GetState() == sandrunv1.RunnerState_RUNNER_STATE_DELETED })
 	r := w.runner(t, runnerID)
 	got, err = l.Engine.GetRequest(ctx, env.DB.Pool, w.org.ID, req.ID)
-	if err != nil || r.GetEndReason() != runnerReason || got.State != requestEnd.State || got.EndReason != requestEnd.Reason || fake.Active(w.osOrg) != 0 {
+	if err != nil || r.GetEndReason() != tc.runnerReason || got.State != tc.requestEnd.State || got.EndReason != tc.requestEnd.Reason || fake.Active(w.osOrg) != 0 {
 		t.Fatalf("after exit: runner %v request %+v active %d error %v", r, got, fake.Active(w.osOrg), err)
 	}
-	if attach, exec := fake.Calls("AttachExec"), fake.Calls("Exec"); attach != 1 || exec != 1 {
-		t.Fatalf("program used %d attach calls and %d execs, want one each", attach, exec)
+	wantAttach := 1
+	if tc.attach != attachOnce {
+		wantAttach = 2
+	}
+	if attach, exec := fake.Calls("AttachExec"), fake.Calls("Exec"); attach != wantAttach || exec != 1 {
+		t.Fatalf("program used %d attach calls and %d execs, want %d attach calls and one exec", attach, exec, wantAttach)
 	}
 }
