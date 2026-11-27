@@ -108,6 +108,7 @@ func newFakeManager(t *testing.T) (*Manager, *fakeHost) {
 	m.refresh = func() error { return nil }
 	m.setForwarding = func() error { return nil }
 	m.run = h.run
+	m.tableState = func() (nftTableState, error) { return nftTablePresent, nil }
 	m.startDNS = func(listen netip.AddrPort, _ string, _ *slog.Logger) (dnsCloser, error) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -575,6 +576,131 @@ func useRealRefresh(m *Manager) (applied func() []string, setApplyErr func(error
 		}
 }
 
+func TestRefreshReappliesMissingTable(t *testing.T) {
+	m, h := newFakeManager(t)
+	applied, _ := useRealRefresh(m)
+	mustAttach(t, m, "sandbox-a")
+
+	m.tableState = func() (nftTableState, error) { return nftTableAbsent, nil }
+	if err := m.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	scripts := applied()
+	if len(scripts) != 2 || scripts[0] != scripts[1] {
+		t.Fatalf("expected the same ruleset to be applied twice, got %d applications", len(scripts))
+	}
+	log := h.log()
+	if strings.Count(log, `"level":"ERROR","msg":"network policy table missing; reapplying","table":"ownsand","attached_sandboxes":1`) != 1 {
+		t.Fatalf("expected one missing-table error, got %s", log)
+	}
+	if strings.Count(log, `"level":"INFO","msg":"network policy applied"`) != 2 {
+		t.Fatalf("expected two successful application records, got %s", log)
+	}
+}
+
+func TestRefreshSkipsPresentTable(t *testing.T) {
+	m, h := newFakeManager(t)
+	applied, _ := useRealRefresh(m)
+	probes := 0
+	m.tableState = func() (nftTableState, error) {
+		probes++
+		return nftTablePresent, nil
+	}
+	mustAttach(t, m, "sandbox-a")
+	if probes != 0 {
+		t.Fatalf("initial attach probed the table %d times", probes)
+	}
+
+	before := h.log()
+	if err := m.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if probes != 1 || len(applied()) != 1 {
+		t.Fatalf("got %d probes and %d applications, want one of each", probes, len(applied()))
+	}
+	if after := h.log(); after != before {
+		t.Fatalf("refresh of a present table logged %s", strings.TrimPrefix(after, before))
+	}
+}
+
+func TestRefreshReappliesWhenTableProbeFails(t *testing.T) {
+	m, h := newFakeManager(t)
+	applied, _ := useRealRefresh(m)
+	mustAttach(t, m, "sandbox-a")
+
+	m.tableState = func() (nftTableState, error) {
+		return nftTableUnknown, errors.New("operation not permitted")
+	}
+	if err := m.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	scripts := applied()
+	if len(scripts) != 2 || scripts[0] != scripts[1] {
+		t.Fatalf("expected the same ruleset to be applied twice, got %d applications", len(scripts))
+	}
+	if log := h.log(); strings.Count(log, `"level":"WARN","msg":"network policy table check failed; reapplying","table":"ownsand","error":"operation not permitted"`) != 1 {
+		t.Fatalf("expected one warning with the probe error, got %s", log)
+	}
+}
+
+func TestRefreshRetriesFailedReapply(t *testing.T) {
+	m, _ := newFakeManager(t)
+	applied, setApplyErr := useRealRefresh(m)
+	mustAttach(t, m, "sandbox-a")
+	before := m.rules
+	probes := 0
+	m.tableState = func() (nftTableState, error) {
+		probes++
+		return nftTableAbsent, nil
+	}
+
+	applyErr := errors.New("apply failed")
+	setApplyErr(applyErr)
+	if err := m.Refresh(); !errors.Is(err, applyErr) {
+		t.Fatalf("Refresh error = %v, want %v", err, applyErr)
+	}
+	if m.rules != before || len(applied()) != 1 {
+		t.Fatal("failed reapplication changed the cached rules or recorded a new script")
+	}
+
+	setApplyErr(nil)
+	if err := m.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	scripts := applied()
+	if probes != 2 || len(scripts) != 2 || scripts[1] != before {
+		t.Fatalf("expected two probes and a successful reapplication, got %d probes and %d applications", probes, len(scripts))
+	}
+}
+
+func TestTableStateMapsNftErrors(t *testing.T) {
+	probeErr := errors.New("operation not permitted")
+	for _, tc := range []struct {
+		name  string
+		input error
+		state nftTableState
+		err   error
+	}{
+		{name: "present", state: nftTablePresent},
+		{name: "missing table", input: errors.New("Error: No such file or directory"), state: nftTableAbsent},
+		{name: "missing executable", input: fmt.Errorf("run nft: %w", exec.ErrNotFound), state: nftTableAbsent},
+		{name: "unknown", input: probeErr, state: nftTableUnknown, err: probeErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(discardLogger())
+			m.run = func(name string, args ...string) error {
+				if name != "nft" || !slices.Equal(args, []string{"list", "table", "inet", "ownsand"}) {
+					t.Fatalf("unexpected table probe: %s %q", name, args)
+				}
+				return tc.input
+			}
+			if state, err := m.tableState(); state != tc.state || !errors.Is(err, tc.err) {
+				t.Fatalf("tableState() = (%v, %v), want (%v, %v)", state, err, tc.state, tc.err)
+			}
+		})
+	}
+}
+
 func dnsRuleLines(rules string) []string {
 	var out []string
 	for _, l := range strings.Split(rules, "\n") {
@@ -981,7 +1107,8 @@ func TestManagerRefreshInFlightDuringCleanupHost(t *testing.T) {
 	}
 	waitRefresh := startGatedWorker(t, openRelease, "Refresh during CleanupHost", m.Refresh)
 	waitFor(t, entered, "the route read before CleanupHost")
-	if err := m.CleanupHost(); err != nil {
+	waitCleanup := startGatedWorker(t, openRelease, "CleanupHost while Refresh is paused", m.CleanupHost)
+	if err := waitCleanup(); err != nil {
 		t.Fatalf("CleanupHost: %v", err)
 	}
 	n := len(applied())
