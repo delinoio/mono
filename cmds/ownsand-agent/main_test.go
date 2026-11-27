@@ -562,8 +562,18 @@ func TestStatusUnreadableSandboxRecord(t *testing.T) {
 	if code != exitError {
 		t.Fatalf("status exit code = %d, want %d (%q / %q)", code, exitError, out.String(), errb.String())
 	}
-	if !strings.Contains(out.String(), "Sandboxes: unavailable (") || strings.Contains(out.String(), "records") || !strings.Contains(out.String(), "Snapshots: 0\n") {
-		t.Fatalf("stdout = %q, want an unavailable sandbox count and the snapshot count", out.String())
+	stdout := out.String()
+	var sandboxLines []string
+	for line := range strings.SplitSeq(stdout, "\n") {
+		if strings.HasPrefix(line, "Sandboxes:") {
+			sandboxLines = append(sandboxLines, line)
+		}
+	}
+	if len(sandboxLines) != 1 || !strings.HasPrefix(sandboxLines[0], "Sandboxes: unavailable (") {
+		t.Fatalf("stdout = %q, want exactly one Sandboxes: line with an unavailable count", stdout)
+	}
+	if !strings.Contains(stdout, "Snapshots: 0\n") {
+		t.Fatalf("stdout = %q, want the snapshot count", stdout)
 	}
 	if !strings.Contains(errb.String(), "ownsand-agent: read sandbox records:") {
 		t.Fatalf("stderr = %q, want a read sandbox records diagnostic", errb.String())
