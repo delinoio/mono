@@ -1,0 +1,74 @@
+{
+  "gid": "inv-35-windows-state-path-verification",
+  "commit": "13f483b5282e195402b09af16539b62b92bff6d8",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "13f483b5282e195402b09af16539b62b92bff6d8",
+    "tree": "99e50103dd75a85daa28adf942cf4b94d59475a9",
+    "setup": "Use a non-production Windows checkout with the stated source tree. Run the commands from its root in one non-elevated PowerShell 7 session on NTFS. Copy the probe after the first command. The tests create disposable junctions and hard links and need no symlink privilege.",
+    "commands": [
+      "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $false; if ((git rev-parse 'HEAD^{tree}').Trim() -ne '99e50103dd75a85daa28adf942cf4b94d59475a9') { throw 'Unexpected validation source tree' }; if ((go env GOOS).Trim() -ne 'windows') { throw 'Set Go to target native Windows' }; $scratch = (New-Item -ItemType Directory -Path '.t3-tmp/windows-state-path' -Force).FullName; $temp = (New-Item -ItemType Directory -Path (Join-Path $scratch 'tmp') -Force).FullName; $env:TEMP = $temp; $env:TMP = $temp; $env:GOTMPDIR = $temp",
+      "$log = Join-Path $scratch 'native-main.log'; go test '-v' '-count=1' '-run=^(TestOpenServiceLogAppends|TestOpenServiceLogAllowsConcurrentRead|TestSetupServiceLogRejectsRootJunction|TestOpenServiceLogRejectsLeafJunction|TestOpenServiceLogRejectsHardLink)$' './cmds/ownsand-agent' 2>&1 | Tee-Object -FilePath $log; if ($LASTEXITCODE -ne 0) { throw 'native-main.log failed' }; $report = Get-Content -LiteralPath $log -Raw; foreach ($name in @('TestOpenServiceLogAppends','TestOpenServiceLogAllowsConcurrentRead','TestSetupServiceLogRejectsRootJunction','TestOpenServiceLogRejectsLeafJunction','TestOpenServiceLogRejectsHardLink')) { if ($report -notmatch ('(?m)^--- PASS: ' + [regex]::Escape($name) + ' \\(')) { throw \"$name did not pass\" } }",
+      "$log = Join-Path $scratch 'native-store.log'; go test '-v' '-count=1' '-run=^(TestWindowsStateRejectsRootJunction|TestWindowsStateRejectsUntrustedRootOwner|TestWindowsStateRejectsFixedDirectoryJunctionBeforeOpen|TestWindowsStateChecksDeepJunctionOwner|TestOpenEnrollmentLockRejectsReparsePoint|TestOpenEnrollmentLockRejectsHardLink|TestOpenEnrollmentLockAcquiresRegularFile)$' './cmds/ownsand-agent/internal/store' 2>&1 | Tee-Object -FilePath $log; if ($LASTEXITCODE -ne 0) { throw 'native-store.log failed' }; $report = Get-Content -LiteralPath $log -Raw; foreach ($name in @('TestWindowsStateRejectsRootJunction','TestWindowsStateRejectsUntrustedRootOwner','TestWindowsStateRejectsFixedDirectoryJunctionBeforeOpen','TestWindowsStateChecksDeepJunctionOwner','TestOpenEnrollmentLockRejectsReparsePoint','TestOpenEnrollmentLockRejectsHardLink','TestOpenEnrollmentLockAcquiresRegularFile')) { if ($report -notmatch ('(?m)^--- PASS: ' + [regex]::Escape($name) + ' \\(')) { throw \"$name did not pass\" } }",
+      "$log = Join-Path $scratch 'native-config-fallback.log'; go test '-v' '-count=1' '-run=^TestStartupDiagnosticForInvalidConfiguration$/^directory_creation_fails$' './cmds/ownsand-agent' 2>&1 | Tee-Object -FilePath $log; if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath $log -Raw) -notmatch '(?m)^\\s+--- PASS: TestStartupDiagnosticForInvalidConfiguration/directory_creation_fails ') { throw 'Configuration fallback fixture did not pass' }",
+      "$probe = Join-Path $scratch 'windows-cli.ps1'; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe).Hash.ToLowerInvariant() -ne 'aebf3672ad726edf42b607f1f7d307da3d73b1f26271d963280ff32088d97041') { throw 'Unexpected probe contents' }; $agent = Join-Path $scratch 'ownsand-agent.exe'; go build '-o' $agent './cmds/ownsand-agent'; if ($LASTEXITCODE -ne 0) { throw 'Agent build failed' }; & $probe -Agent $agent | Tee-Object -FilePath (Join-Path $scratch 'native-cli.log')"
+    ],
+    "expectedResults": [
+      "Every named standard-account fixture passes. The type, owner, junction and hard-link checks leave unrelated files and ACLs unchanged. The regular log still appends and permits concurrent reads.",
+      "The configuration-error test observes one redacted startup fallback and the expected usage status through the injected service dispatcher and event writer.",
+      "The native CLI probe reports PASS for run and reset. Both exit 1 with a reparse-point diagnostic. The target retains exactly the sentinel file with its original hash and DACL."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-windows-state-path-verification/worker/.t3-tmp/state-path/windows-cli.ps1",
+      "copyTo": ".t3-tmp/windows-state-path/windows-cli.ps1",
+      "sha256": "aebf3672ad726edf42b607f1f7d307da3d73b1f26271d963280ff32088d97041",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/store/store_windows_test.go",
+        "cmds/ownsand-agent/internal/store/reset_dir_test.go",
+        "cmds/ownsand-agent/service_windows_test.go",
+        "cmds/ownsand-agent/servicelog_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/windows-state-path/native-main.log",
+        ".t3-tmp/windows-state-path/native-store.log",
+        ".t3-tmp/windows-state-path/native-config-fallback.log",
+        ".t3-tmp/windows-state-path/native-cli.log",
+        ".t3-tmp/windows-state-path/elevated-main.log",
+        ".t3-tmp/windows-state-path/elevated-store.log",
+        ".t3-tmp/windows-state-path/file-symlink-main.log",
+        ".t3-tmp/windows-state-path/file-symlink-store.log"
+      ]
+    },
+    "requiresElevation": [
+      "Create and inspect the production SYSTEM and Administrators DACL, verify the first log entry on invalid configuration, upgrade legacy ACLs while retaining Hyper-V entries, and reset a trusted damaged root.",
+      "Real Windows service control and Application Event Log registration require elevated access on a disposable machine with no existing OwnSand service."
+    ],
+    "elevatedCommands": [
+      "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $false; if ((git rev-parse 'HEAD^{tree}').Trim() -ne '99e50103dd75a85daa28adf942cf4b94d59475a9') { throw 'Unexpected validation source tree' }; if ((go env GOOS).Trim() -ne 'windows') { throw 'Set Go to target native Windows' }; $scratch = (New-Item -ItemType Directory -Path '.t3-tmp/windows-state-path' -Force).FullName; $temp = (New-Item -ItemType Directory -Path (Join-Path $scratch 'tmp') -Force).FullName; $env:TEMP = $temp; $env:TMP = $temp; $env:GOTMPDIR = $temp",
+      "$log = Join-Path $scratch 'elevated-main.log'; go test '-v' '-count=1' '-run=^(TestSetupServiceLogProtectsNewStateDir|TestStartupDiagnosticForInvalidConfiguration|TestResetDeletesStateWhileServiceLogIsOpen)$' './cmds/ownsand-agent' 2>&1 | Tee-Object -FilePath $log; if ($LASTEXITCODE -ne 0) { throw 'elevated-main.log failed' }; $report = Get-Content -LiteralPath $log -Raw; foreach ($name in @('TestSetupServiceLogProtectsNewStateDir','TestStartupDiagnosticForInvalidConfiguration','TestResetDeletesStateWhileServiceLogIsOpen')) { if ($report -notmatch ('(?m)^--- PASS: ' + [regex]::Escape($name) + ' \\(')) { throw \"$name did not pass\" } }",
+      "$log = Join-Path $scratch 'elevated-store.log'; go test '-v' '-count=1' '-run=^(TestOpenRestrictsStateDirACL|TestOpenCorrectsExistingStateDirACL|TestWipeLocalDataKeepsACL|TestOpenRejectsFixedSubdirectoryJunction|TestOpenKeepsTrustedDeepJunction|TestResetDirDeletesDamagedLayout|TestResetDirKeepsHeldLockAndStateUntilRetry|TestResetDirRejectsMalformedEnrollmentLock|TestResetDirAbsentDirectoryIsEmpty)$' './cmds/ownsand-agent/internal/store' 2>&1 | Tee-Object -FilePath $log; if ($LASTEXITCODE -ne 0) { throw 'elevated-store.log failed' }; $report = Get-Content -LiteralPath $log -Raw; foreach ($name in @('TestOpenRestrictsStateDirACL','TestOpenCorrectsExistingStateDirACL','TestWipeLocalDataKeepsACL','TestOpenRejectsFixedSubdirectoryJunction','TestOpenKeepsTrustedDeepJunction','TestResetDirDeletesDamagedLayout','TestResetDirKeepsHeldLockAndStateUntilRetry','TestResetDirRejectsMalformedEnrollmentLock','TestResetDirAbsentDirectoryIsEmpty')) { if ($report -notmatch ('(?m)^--- PASS: ' + [regex]::Escape($name) + ' \\(')) { throw \"$name did not pass\" } }"
+    ],
+    "elevatedExpectedResults": [
+      "No elevated fixture skips. A new root has the protected two-principal DACL, its empty log inherits both entries before the first configuration error write, and the configuration-error path preserves the usage status.",
+      "Open rejects each fixed junction without touching its target. Reset clears the damaged layout and preserves the target. Open keeps a trusted deep junction. Older ACLs are corrected and Hyper-V entries stay."
+    ],
+    "requiresSymlinkPrivilege": [
+      "Direct file symlink cases for the log and enrollment lock. These can run with symlink capability available through the elevated token or Windows Developer Mode."
+    ],
+    "symlinkCommands": [
+      "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $false; if ((git rev-parse 'HEAD^{tree}').Trim() -ne '99e50103dd75a85daa28adf942cf4b94d59475a9') { throw 'Unexpected validation source tree' }; if ((go env GOOS).Trim() -ne 'windows') { throw 'Set Go to target native Windows' }; $scratch = (New-Item -ItemType Directory -Path '.t3-tmp/windows-state-path' -Force).FullName; $temp = (New-Item -ItemType Directory -Path (Join-Path $scratch 'tmp') -Force).FullName; $env:TEMP = $temp; $env:TMP = $temp; $env:GOTMPDIR = $temp",
+      "$log = Join-Path $scratch 'file-symlink-main.log'; go test '-v' '-count=1' '-run=^(TestOpenServiceLogRejectsFileSymlink)$' './cmds/ownsand-agent' 2>&1 | Tee-Object -FilePath $log; if ($LASTEXITCODE -ne 0) { throw 'file-symlink-main.log failed' }; $report = Get-Content -LiteralPath $log -Raw; foreach ($name in @('TestOpenServiceLogRejectsFileSymlink')) { if ($report -notmatch ('(?m)^--- PASS: ' + [regex]::Escape($name) + ' \\(')) { throw \"$name did not pass\" } }",
+      "$log = Join-Path $scratch 'file-symlink-store.log'; go test '-v' '-count=1' '-run=^(TestOpenEnrollmentLockRejectsFileSymlink)$' './cmds/ownsand-agent/internal/store' 2>&1 | Tee-Object -FilePath $log; if ($LASTEXITCODE -ne 0) { throw 'file-symlink-store.log failed' }; $report = Get-Content -LiteralPath $log -Raw; foreach ($name in @('TestOpenEnrollmentLockRejectsFileSymlink')) { if ($report -notmatch ('(?m)^--- PASS: ' + [regex]::Escape($name) + ' \\(')) { throw \"$name did not pass\" } }"
+    ],
+    "symlinkExpectedResults": [
+      "Both file symlink fixtures pass. Windows refuses the operation on the link itself and the log target stays intact."
+    ],
+    "unperformed": [
+      "No SCM installation, real Event Log source registration, or Hyper-V execution was performed. Native service tests use the injected dispatcher and Event Log writer.",
+      "The validation host does not have elevation or symlink creation privilege. Leave positive protected-ACL and file-symlink acceptance pending unless run with the corresponding capabilities."
+    ]
+  }
+}
