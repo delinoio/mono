@@ -542,6 +542,46 @@ describe("overview", () => {
   });
 });
 
+describe("runners", () => {
+  test("shows the new and existing outcomes after deleting a warm runner", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/runners`);
+
+    const runners = screen.getByRole("table", "Runners");
+    const warm = runners.getByRole("row").filter({ hasText: "0193b000…00f2" });
+    const completed = runners
+      .getByRole("row")
+      .filter({ hasText: "0193b000…00f3" });
+    await screen.getByRole("checkbox", "Show ended runners").tap();
+    await expect(warm.getByRole("cell", "Warm")).toBeVisible();
+    await expect(completed.getByRole("cell", "Work done")).toBeVisible();
+
+    await warm.getByRole("button", "Delete").tap();
+    const dialog = screen.getByRole("alertdialog", "Delete this runner?");
+    await dialog.getByRole("button", "Delete runner").tap();
+
+    await expect(dialog).toBeHidden();
+    await expect(warm.getByRole("cell", "Deleted by user")).toBeVisible();
+    await expect(completed.getByRole("cell", "Work done")).toBeVisible();
+    await screen.getByRole("link", "Audit events").tap();
+    await expect(screen.getByRole("cell", "Runner deleted")).toBeVisible();
+    const deletions = await browser.evaluate(
+      () =>
+        Array.from(
+          document.querySelectorAll(
+            'table[aria-label="Audit events"] tbody td',
+          ),
+        ).filter((cell) => cell.textContent === "Runner deleted").length,
+    );
+    expect(deletions).toBe(1);
+  });
+});
+
 describe("audit", () => {
   test("shows the newest event first", async ({ app, browser, screen }) => {
     await app.open("/");
