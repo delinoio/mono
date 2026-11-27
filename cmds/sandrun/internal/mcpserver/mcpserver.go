@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"math"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -46,6 +47,8 @@ const (
 // response before the tool can report the command as running.
 const confirmationGrace = 10 * time.Second
 
+const transferHistoryLimit = 64
+
 // Config configures a Server.
 type Config struct {
 	// Client returns the SDK client. It returns an error when no credential
@@ -70,12 +73,15 @@ type Config struct {
 
 // Server is the MCP server.
 type Server struct {
-	cfg       Config
-	mcp       *mcp.Server
-	ctx       context.Context
-	cancel    context.CancelFunc
-	mu        sync.Mutex
-	transfers map[string]*transfer
+	cfg    Config
+	mcp    *mcp.Server
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu               sync.Mutex
+	transfers        map[string]*transfer
+	completeIDs      [transferHistoryLimit]string
+	nextCompleteSlot int
 }
 
 // New returns a server.
@@ -284,7 +290,7 @@ func (s *Server) register() {
 		"When it ends within the wait: the uploaded, deleted and skipped file counts, the bytes sent and the warnings. Otherwise: a transfer_id for transfer_status."}, s.sync)
 	mcp.AddTool(s.mcp, &mcp.Tool{Name: "download", Description: "Copy a guest file or directory to a local path; an existing local path is replaced. " +
 		"When it ends within the wait: the local path, the file count and the bytes. Otherwise: a transfer_id for transfer_status."}, s.download)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "transfer_status", Description: "Return the progress or the result of a sync or download that this server process runs. A transfer stops when the server process exits; a later sync sends the same files again."}, s.transferStatus)
+	mcp.AddTool(s.mcp, &mcp.Tool{Name: "transfer_status", Description: fmt.Sprintf("Return the progress or outcome of a sync or download in this server process. The process keeps all active transfers and the %d most recent outcomes, including failures. Older IDs return not_found. Active transfers stop when the process exits.", transferHistoryLimit)}, s.transferStatus)
 }
 
 // withToolDeadline passes one deadline through every RPC and lets the tool
@@ -601,7 +607,7 @@ func (c *collector) result(execID string, res *sandrun.ExecResult) execResult {
 	defer c.mu.Unlock()
 	r := execResult{
 		ExecID: execID, Stdout: c.out.output(), Stderr: c.err.output(),
-		NextStdoutOffset: c.out.next, NextStderrOffset: c.err.next, OutputTruncated: c.truncated,
+		NextStdoutOffset: c.out.next, NextStderrOffset: c.err.next, OutputTruncated: slices.Clone(c.truncated),
 	}
 	if res == nil {
 		r.Running = true
@@ -630,44 +636,53 @@ type execOutcome struct {
 
 // runWithWait waits for fn to return. After wait, it allows up to
 // confirmationGrace for the first callback or outcome, within MaxWait
-// overall. It then cancels the stream and lets the command keep running
-// in the guest. Without confirmation, it returns errExecUnconfirmed.
+// overall. It then cancels the stream without waiting for SDK cleanup.
+// The command can keep running in the guest. Without confirmation,
+// runWithWait returns errExecUnconfirmed.
 func (s *Server) runWithWait(ctx context.Context, wait time.Duration, col *collector, fn func(context.Context) (*sandrun.ExecResult, error)) (*sandrun.ExecResult, error) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	graceDeadline := time.Now().Add(min(wait+confirmationGrace, s.cfg.maxWait))
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	// A worker that finishes after the tool returns can still send its outcome.
 	done := make(chan execOutcome, 1)
 	go func() {
 		res, err := fn(sctx)
 		done <- execOutcome{res, err}
 	}()
-	start := time.Now()
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
 	select {
 	case o := <-done:
 		return o.res, o.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-timer.C:
 	}
-	grace := min(confirmationGrace, max(s.cfg.maxWait-time.Since(start), 0))
+	timer.Reset(time.Until(graceDeadline))
 	select {
 	case o := <-done:
 		return o.res, o.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-col.confirmed:
-	case <-time.After(grace):
+	case <-timer.C:
 	}
 	cancel()
-	o := <-done
-	if o.err == nil {
-		return o.res, nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	// The wait can cancel credential acquisition before the exec stream opens.
-	if errors.Is(o.err, context.Canceled) && ctx.Err() == nil {
-		if !col.hasConfirmation() {
-			return nil, errExecUnconfirmed
+	select {
+	case o := <-done:
+		// The tool's cancellation can interrupt credential acquisition or the stream.
+		if !errors.Is(o.err, context.Canceled) {
+			return o.res, o.err
 		}
-		return nil, nil // still running
+	default:
 	}
-	return nil, o.err
+	if !col.hasConfirmation() {
+		return nil, errExecUnconfirmed
+	}
+	return nil, nil // still running
 }
 
 func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) (*mcp.CallToolResult, execResult, error) {
@@ -826,12 +841,26 @@ func (s *Server) startTransfer(kind string, run func(ctx context.Context, t *tra
 	s.transfers[id] = t
 	s.mu.Unlock()
 	go func() {
-		defer close(t.done)
+		defer s.finishTransfer(t)
 		// The transfer runs on the server context, not the tool call, so
 		// it continues after the call returns.
 		run(s.ctx, t)
 	}()
 	return t, nil
+}
+
+// finishTransfer records the outcome and signals waiters under the same
+// lock as registry lookups. A waiter that already has t can still use it.
+func (s *Server) finishTransfer(t *transfer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if oldest := s.completeIDs[s.nextCompleteSlot]; oldest != "" {
+		delete(s.transfers, oldest)
+	}
+	s.completeIDs[s.nextCompleteSlot] = t.id
+	s.nextCompleteSlot = (s.nextCompleteSlot + 1) % transferHistoryLimit
+	close(t.done)
 }
 
 // awaitTransfer waits up to wait and returns the result or the progress.
@@ -929,7 +958,7 @@ func (s *Server) transferStatus(ctx context.Context, _ *mcp.CallToolRequest, in 
 		if _, err := s.client(ctx); err != nil {
 			return nil, transferResult{}, err
 		}
-		return nil, transferResult{}, toolError(connect.NewError(connect.CodeNotFound, errors.New("no transfer with this transfer_id runs in this server process; transfers stop when the server exits, so sync again")))
+		return nil, transferResult{}, toolError(connect.NewError(connect.CodeNotFound, fmt.Errorf("no transfer with this transfer_id is available in this server process. The process keeps only the %d most recent sync or download outcomes, including failures", transferHistoryLimit)))
 	}
 	r, err := s.awaitTransfer(ctx, t, wait)
 	return nil, r, err
