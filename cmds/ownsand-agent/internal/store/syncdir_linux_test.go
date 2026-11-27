@@ -200,3 +200,33 @@ func TestSaveIdentityDurableDoesNotSyncAfterWriteFailure(t *testing.T) {
 		t.Fatalf("synced directories after a failed write = %v", *calls)
 	}
 }
+
+func TestFailedCreateCleanupResyncsAfterMarkerRemoval(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("injected directory sync failure")
+	var fail bool
+	calls := recordSyncDir(t, func(string) error {
+		if fail {
+			return cause
+		}
+		return nil
+	})
+	if err := st.SaveSandboxCleanup("sandbox"); err != nil {
+		t.Fatal(err)
+	}
+	fail = true
+	if err := st.DeleteSandboxCleanup("sandbox"); !errors.Is(err, cause) {
+		t.Fatalf("clear marker = %v, want a directory sync error", err)
+	}
+	fail = false
+	if err := st.DeleteSandboxCleanup("sandbox"); err != nil {
+		t.Fatal(err)
+	}
+	dir := st.Path(SandboxesDir)
+	if want := []string{dir, dir, dir}; !slices.Equal(*calls, want) {
+		t.Fatalf("directory sync calls = %v, want %v", *calls, want)
+	}
+}

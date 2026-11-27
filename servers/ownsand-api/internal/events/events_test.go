@@ -4,6 +4,7 @@ package events_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -17,9 +18,9 @@ import (
 
 // poll reads the events after the cursor the way Control.processEvents does
 // and returns the device IDs of the events and the advanced cursor.
-func poll(t *testing.T, d *db.DB, cursor int64) ([]string, int64) {
+func poll(t *testing.T, ctx context.Context, q db.Querier, cursor int64) ([]string, int64) {
 	t.Helper()
-	batch, err := events.After(context.Background(), d.Pool, cursor, 500)
+	batch, err := events.After(ctx, q, cursor, 500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,26 +41,35 @@ func newID(t *testing.T) string {
 	return id
 }
 
-func begin(t *testing.T, d *db.DB) pgx.Tx {
+func begin(t *testing.T, ctx context.Context, d *db.DB) pgx.Tx {
 	t.Helper()
-	tx, err := d.Pool.Begin(context.Background())
+	tx, err := d.Pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	t.Cleanup(func() { rollback(t, tx) })
 	return tx
 }
 
-func write(t *testing.T, tx pgx.Tx, device string) {
+func rollback(t *testing.T, tx pgx.Tx) {
 	t.Helper()
-	if err := events.Write(context.Background(), tx, events.Event{Kind: events.KindDeviceConfigChanged, DeviceID: device}); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		t.Errorf("rollback event writer: %v", err)
+	}
+}
+
+func write(t *testing.T, ctx context.Context, tx pgx.Tx, device string) {
+	t.Helper()
+	if err := events.Write(ctx, tx, events.Event{Kind: events.KindDeviceConfigChanged, DeviceID: device}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func commit(t *testing.T, tx pgx.Tx) {
+func commit(t *testing.T, ctx context.Context, tx pgx.Tx) {
 	t.Helper()
-	if err := tx.Commit(context.Background()); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -89,22 +99,22 @@ func TestReverseCommitOrderIsDeliveredOnce(t *testing.T) {
 	}
 	devA, devB := newID(t), newID(t)
 
-	txA, txB := begin(t, d), begin(t, d)
-	write(t, txA, devA) // the lower insert-time ID
-	write(t, txB, devB)
-	commit(t, txB)
+	txA, txB := begin(t, ctx, d), begin(t, ctx, d)
+	write(t, ctx, txA, devA) // the lower insert-time ID
+	write(t, ctx, txB, devB)
+	commit(t, ctx, txB)
 
-	got, cursor := poll(t, d, start)
+	got, cursor := poll(t, ctx, d.Pool, start)
 	if !sameDevices(got, []string{devB}) {
 		t.Fatalf("first poll = %v, want [B]", got)
 	}
-	commit(t, txA)
-	got, cursor = poll(t, d, cursor)
+	commit(t, ctx, txA)
+	got, cursor = poll(t, ctx, d.Pool, cursor)
 	if !sameDevices(got, []string{devA}) {
 		t.Fatalf("second poll = %v, want [A]: the event that committed later was skipped", got)
 	}
 	// Nothing replays.
-	got, _ = poll(t, d, cursor)
+	got, _ = poll(t, ctx, d.Pool, cursor)
 	if len(got) != 0 {
 		t.Fatalf("third poll = %v, want no events", got)
 	}
@@ -121,21 +131,21 @@ func TestRolledBackEventIsNeverDelivered(t *testing.T) {
 	}
 	devA, devB, devC := newID(t), newID(t), newID(t)
 
-	txA, txB := begin(t, d), begin(t, d)
-	write(t, txA, devA)
-	write(t, txB, devB)
+	txA, txB := begin(t, ctx, d), begin(t, ctx, d)
+	write(t, ctx, txA, devA)
+	write(t, ctx, txB, devB)
 	if err := txA.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	commit(t, txB)
-	got, cursor := poll(t, d, start)
+	commit(t, ctx, txB)
+	got, cursor := poll(t, ctx, d.Pool, start)
 	if !sameDevices(got, []string{devB}) {
 		t.Fatalf("poll after rollback = %v, want [B]", got)
 	}
-	txC := begin(t, d)
-	write(t, txC, devC)
-	commit(t, txC)
-	got, _ = poll(t, d, cursor)
+	txC := begin(t, ctx, d)
+	write(t, ctx, txC, devC)
+	commit(t, ctx, txC)
+	got, _ = poll(t, ctx, d.Pool, cursor)
 	if !sameDevices(got, []string{devC}) {
 		t.Fatalf("poll after a later commit = %v, want [C]", got)
 	}
@@ -145,58 +155,55 @@ func TestRolledBackEventIsNeverDelivered(t *testing.T) {
 // events delivers each of them once, in insert order.
 func TestSeveralEventsInOneTransaction(t *testing.T) {
 	d := dbtest.New(t)
-	start, err := events.LatestID(context.Background(), d.Pool)
+	ctx := context.Background()
+	start, err := events.LatestID(ctx, d.Pool)
 	if err != nil {
 		t.Fatal(err)
 	}
 	devs := []string{newID(t), newID(t), newID(t)}
-	tx := begin(t, d)
+	tx := begin(t, ctx, d)
 	for _, dev := range devs {
-		write(t, tx, dev)
+		write(t, ctx, tx, dev)
 	}
-	commit(t, tx)
-	got, cursor := poll(t, d, start)
+	commit(t, ctx, tx)
+	got, cursor := poll(t, ctx, d.Pool, start)
 	if !sameDevices(got, devs) {
 		t.Fatalf("poll = %v, want %v", got, devs)
 	}
-	if got, _ = poll(t, d, cursor); len(got) != 0 {
+	if got, _ = poll(t, ctx, d.Pool, cursor); len(got) != 0 {
 		t.Fatalf("replayed %v", got)
 	}
 }
 
-// waitForAdvisoryLockWait polls pg_stat_activity from a separate connection
-// until the backend pid waits for an advisory lock. It fails the test when
-// the commit finishes first or the wait is not observed within the deadline.
-func waitForAdvisoryLockWait(t *testing.T, d *db.DB, pid int, committed <-chan error) {
+// The bigint advisory lock key from 0006_control_events_delivery_id.sql.
+const eventDeliveryLockID int64 = 0x6f776e5f6374
+
+// PostgreSQL splits a bigint advisory lock key across classid and objid.
+// objsubid = 1 identifies the bigint key space.
+func waitForAdvisoryLockWait(t *testing.T, ctx context.Context, observer *pgx.Conn, pid int, committed <-chan struct{}, commitErr *error) {
 	t.Helper()
-	ctx := context.Background()
-	deadline := time.Now().Add(10 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	for {
-		var waitType, waitEvent *string
-		describe := func(v *string) string {
-			if v == nil {
-				return "none"
-			}
-			return *v
-		}
-		err := d.Pool.QueryRow(ctx,
-			"SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1", pid,
-		).Scan(&waitType, &waitEvent)
+		var waiting bool
+		err := observer.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_locks
+			WHERE pid = $1 AND locktype = 'advisory' AND NOT granted AND objsubid = 1
+				AND classid = ($2::bigint >> 32)::oid AND objid = ($2::bigint & 4294967295)::oid
+		)`, pid, eventDeliveryLockID).Scan(&waiting)
 		if err != nil {
-			t.Fatalf("read the wait event of backend %d: %v", pid, err)
+			t.Fatalf("observe backend %d waiting for advisory event lock %#x: %v", pid, eventDeliveryLockID, err)
 		}
-		if waitType != nil && waitEvent != nil && *waitType == "Lock" && *waitEvent == "advisory" {
+		if waiting {
 			return
 		}
 		select {
-		case err := <-committed:
-			t.Fatalf("B committed without waiting for the event lock while A held it: %v", err)
-		default:
+		case <-committed:
+			t.Fatalf("backend %d finished committing before it waited for advisory event lock %#x: %v", pid, eventDeliveryLockID, *commitErr)
+		case <-ctx.Done():
+			t.Fatalf("observe backend %d waiting for advisory event lock %#x: %v", pid, eventDeliveryLockID, ctx.Err())
+		case <-ticker.C:
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("backend %d did not wait for the advisory event lock within 10s (wait event %s/%s)", pid, describe(waitType), describe(waitEvent))
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -207,41 +214,76 @@ func waitForAdvisoryLockWait(t *testing.T, d *db.DB, pid int, committed <-chan e
 // event before the first one.
 func TestCommitsOfEventWritersAreSerialized(t *testing.T) {
 	d := dbtest.New(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
 	start, err := events.LatestID(ctx, d.Pool)
 	if err != nil {
 		t.Fatal(err)
 	}
 	devA, devB := newID(t), newID(t)
 
-	txA, txB := begin(t, d), begin(t, d)
-	write(t, txA, devA)
+	txA, txB := begin(t, ctx, d), begin(t, ctx, d)
+	write(t, ctx, txA, devA)
 	if _, err := txA.Exec(ctx, "SET CONSTRAINTS ALL IMMEDIATE"); err != nil {
 		t.Fatal(err)
 	}
-	write(t, txB, devB)
+	write(t, ctx, txB, devB)
 	var pidB int
 	if err := txB.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidB); err != nil {
-		t.Fatal(err)
+		t.Fatalf("read backend PID for writer B: %v", err)
 	}
-	committed := make(chan error, 1)
-	go func() { committed <- txB.Commit(ctx) }()
-	// Wait until the backend of B reports that it waits for an advisory
-	// lock. A sleep alone would also pass when B committed only after A.
-	waitForAdvisoryLockWait(t, d, pidB, committed)
+
+	// A and B can occupy the entire writer pool. Use a dedicated connection
+	// to the same database for the lock observation and the pre-commit read.
+	observeCtx, cancelObservation := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelObservation()
+	observer, err := pgx.ConnectConfig(observeCtx, d.Pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatalf("connect observer for backend %d waiting for advisory event lock %#x: %v", pidB, eventDeliveryLockID, err)
+	}
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := observer.Close(closeCtx); err != nil {
+			t.Errorf("close event lock observer: %v", err)
+		}
+	})
+
+	commitCtx, cancelCommit := context.WithTimeout(ctx, 20*time.Second)
+	committed := make(chan struct{})
+	var commitErr error
+	t.Cleanup(func() {
+		cancelCommit()
+		rollback(t, txA)
+		// The commit has a deadline and cancellation interrupts its I/O.
+		// Join it before the cleanup registered by begin can touch B.
+		<-committed
+	})
+	go func() {
+		defer close(committed)
+		commitErr = txB.Commit(commitCtx)
+	}()
+
+	waitForAdvisoryLockWait(t, observeCtx, observer, pidB, committed, &commitErr)
+	if got, _ := poll(t, observeCtx, observer, start); len(got) != 0 {
+		t.Fatalf("poll while A holds the event lock = %v, want none", got)
+	}
 	select {
-	case err := <-committed:
-		t.Fatalf("B committed while A held the event lock: %v", err)
+	case <-committed:
+		t.Fatalf("B finished committing while A held the event lock: %v", commitErr)
 	default:
 	}
-	if got, _ := poll(t, d, start); len(got) != 0 {
-		t.Fatalf("poll while A is committing = %v, want none", got)
+	cancelObservation()
+	commit(t, commitCtx, txA)
+	select {
+	case <-committed:
+		if commitErr != nil {
+			t.Fatalf("commit B (backend %d): %v", pidB, commitErr)
+		}
+	case <-commitCtx.Done():
+		t.Fatalf("wait for B (backend %d) to finish committing: %v", pidB, commitCtx.Err())
 	}
-	commit(t, txA)
-	if err := <-committed; err != nil {
-		t.Fatal(err)
-	}
-	got, _ := poll(t, d, start)
+	got, _ := poll(t, ctx, d.Pool, start)
 	if !sameDevices(got, []string{devA, devB}) {
 		t.Fatalf("poll = %v, want [A B]", got)
 	}

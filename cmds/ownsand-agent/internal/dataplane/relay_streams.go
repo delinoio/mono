@@ -371,21 +371,28 @@ func (r *relay) revoke(grantID string) {
 
 // channelLost ends every grant of the channel with AGENT_CHANNEL_LOST and
 // closes the relay connection of the channel.
-func (r *relay) channelLost(ch interface{ Generation() uint64 }) {
+func (r *relay) channelLost(ch interface{ Generation() uint64 }, lostAt time.Time) {
+	gen := ch.Generation()
 	r.mu.Lock()
+	c := r.conn
+	if c != nil && c.gen == gen && !c.flushing {
+		c.flushing = true
+		c.armFlushDeadline(lostAt)
+	} else {
+		c = nil
+	}
 	var lost []*grant
 	for id, g := range r.grants {
-		if g.ch.Generation() == ch.Generation() {
+		if g.ch.Generation() == gen {
 			lost = append(lost, g)
 			delete(r.grants, id)
 		}
 	}
-	c := r.conn
 	r.mu.Unlock()
 	for _, g := range lost {
 		r.endGrantStreams(g, ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST)
 	}
-	if c != nil && c.gen == ch.Generation() {
+	if c != nil {
 		// The session-end frames leave before the connection closes.
 		go c.closeAfterFlush()
 	}

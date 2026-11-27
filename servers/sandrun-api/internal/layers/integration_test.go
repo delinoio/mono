@@ -369,20 +369,22 @@ func TestReencryptKeepsConcurrentReplacement(t *testing.T) {
 	ring, _ := secrets.NewKeyring(append([]secrets.Key{newKey}, keyOf(t, w)...)...)
 	replaced := []byte("replaced")
 	for _, tc := range []struct {
-		name, hold, read string
-		arg              string
-		run              func() (int64, error)
+		name, hold, read, reseal string
+		arg                      string
+		run                      func() (int64, error)
 	}{
 		{"credential", "UPDATE agent_integration_credentials SET ciphertext = $2 WHERE agent_integration_id = $1",
-			"SELECT key_id, ciphertext FROM agent_integration_credentials WHERE agent_integration_id = $1", integrationID,
+			"SELECT key_id, ciphertext FROM agent_integration_credentials WHERE agent_integration_id = $1",
+			"UPDATE agent_integration_credentials SET key_id = $3, ciphertext = $4", integrationID,
 			func() (int64, error) { return w.l.Integrations.Reencrypt(ctx, ring) }},
 		{"ownsand link", "UPDATE ownsand_links SET api_key_ciphertext = $2 WHERE organization_id = $1",
-			"SELECT api_key_key_id, api_key_ciphertext FROM ownsand_links WHERE organization_id = $1", w.org.ID,
+			"SELECT api_key_key_id, api_key_ciphertext FROM ownsand_links WHERE organization_id = $1",
+			"UPDATE ownsand_links SET api_key_key_id = $2, api_key_ciphertext = $3", w.org.ID,
 			func() (int64, error) { return w.l.Links.Reencrypt(ctx, ring) }},
 	} {
 		// The held update stands in for a replacement that commits after
 		// the job's scan.
-		commit := holdTx(t, w.env, tc.hold, tc.arg, replaced)
+		holder := holdTx(t, w.env, tc.hold, tc.arg, replaced)
 		type result struct {
 			n   int64
 			err error
@@ -392,8 +394,8 @@ func TestReencryptKeepsConcurrentReplacement(t *testing.T) {
 			n, err := tc.run()
 			done <- result{n, err}
 		}()
-		waitForLockWaiter(t, w.env)
-		commit()
+		waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid, query: tc.reseal})
+		holder.commit()
 		if r := <-done; r.err != nil || r.n != 0 {
 			t.Fatalf("%s: resealed %d, %v; want 0", tc.name, r.n, r.err)
 		}

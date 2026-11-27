@@ -39,6 +39,14 @@ func (s *Store) SyncPendingIdentityDirectories() error {
 	}
 }
 
+func (s *Store) syncSandboxCleanupDirectory() error {
+	dir := s.Path(SandboxesDir)
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("store: sync directory %s: %w", dir, err)
+	}
+	return nil
+}
+
 // syncDirectory flushes the entries of a directory (a file created, renamed
 // or removed in it, or a subdirectory created in it) to stable storage. A
 // file fsync does not do that: after a power loss, a file that was synced

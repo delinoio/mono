@@ -325,11 +325,19 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 		<-release
 	}
 	written := make(chan struct{})
+	var finishWriterOnce sync.Once
+	finishWriter := func() {
+		finishWriterOnce.Do(func() {
+			close(release)
+			waitClosed(t, written, "the status write to finish")
+		})
+	}
+	t.Cleanup(finishWriter)
 	go func() {
 		defer close(written)
 		a.writeStatus()
 	}()
-	<-entered
+	waitClosed(t, entered, "the status write to enter the hook")
 
 	removed := make(chan error, 1)
 	go func() { removed <- a.removeDevice(context.Background()) }()
@@ -338,7 +346,7 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 		t.Fatalf("removal finished while a status write was in flight: %v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
-	close(release)
+	finishWriter()
 	select {
 	case err := <-removed:
 		if !errors.Is(err, ErrRemoved) {
@@ -347,7 +355,6 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("removal did not finish")
 	}
-	<-written
 	requireEmptyStateDir(t, st)
 
 	// The writer stays fenced: later writes do nothing.
@@ -1300,7 +1307,7 @@ func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
 		}
 	})
 	a := f.h.agent
-	for _, name := range []string{"ready record write fails", "channel context ends"} {
+	for _, name := range []string{"record promotion fails", "channel context ends"} {
 		t.Run(name, func(t *testing.T) {
 			id, _ := uuidv7.NewString()
 			cmd := f.stage(t, id, false).GetImportSnapshot()
@@ -1335,8 +1342,8 @@ func TestImportCleansUnpublishedReadOnlyContent(t *testing.T) {
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("import error = %v, want context.Canceled", err)
 				}
-			} else if err == nil || !strings.Contains(err.Error(), "save imported snapshot") {
-				t.Fatalf("import error = %v, want a ready record write failure", err)
+			} else if err == nil || !strings.Contains(err.Error(), "publish imported snapshot") {
+				t.Fatalf("import error = %v, want a record promotion failure", err)
 			}
 			if _, _, ok := a.Sandboxes.SnapshotContent(id); ok {
 				t.Error("an aborted import left a ready snapshot")
