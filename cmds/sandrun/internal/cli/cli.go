@@ -290,7 +290,11 @@ func (a *app) printFlags(fs *flag.FlagSet) error {
 	// PrintDefaults has no error return. Capture the first write error
 	// across the header and flag list.
 	w := &stickyWriter{w: a.env.Stdout}
-	fmt.Fprintf(w, "Usage: sandrun %s [flags]\n\nFlags:\n", fs.Name())
+	fmt.Fprintf(w, "Usage: sandrun %s [flags]\n\n", fs.Name())
+	if fs.Name() == "github install-url" {
+		fmt.Fprintf(w, "%s\n\n", githubInstallBrowserSignIn)
+	}
+	fmt.Fprintln(w, "Flags:")
 	previousOutput := fs.Output()
 	fs.SetOutput(w)
 	fs.PrintDefaults()

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/cmds/internal/credstore"
 	"github.com/delinoio/mono/go/sandrun"
@@ -531,16 +532,50 @@ func TestOutputFormats(t *testing.T) {
 	}
 }
 
+const wantGitHubInstallBrowserSignIn = "Before you open the URL, sign in to the SandRun console in the browser you will use. Use the same SandRun account you used to generate the URL."
+
+func TestGitHubInstallURLHelp(t *testing.T) {
+	f := newFixture(t)
+	r := f.ok("", "github", "install-url", "--org", f.org, "--help")
+	if !strings.Contains(r.stdout, wantGitHubInstallBrowserSignIn) || r.stderr != "" {
+		t.Errorf("help stdout = %q, stderr = %q, want the browser instruction on stdout only", r.stdout, r.stderr)
+	}
+	if calls := f.srv.Calls(sandrunv1connect.GitHubServiceCreateGitHubInstallUrlProcedure); calls != 0 {
+		t.Errorf("help made %d install URL requests, want 0", calls)
+	}
+}
+
+type gitHubInstallURLFixture struct {
+	sandrunv1connect.UnimplementedGitHubServiceHandler
+	response *sandrunv1.CreateGitHubInstallUrlResponse
+}
+
+func (f gitHubInstallURLFixture) CreateGitHubInstallUrl(context.Context, *connect.Request[sandrunv1.CreateGitHubInstallUrlRequest]) (*connect.Response[sandrunv1.CreateGitHubInstallUrlResponse], error) {
+	return connect.NewResponse(f.response), nil
+}
+
 func TestGitHubInstallURLOutput(t *testing.T) {
 	f := newFixture(t)
 	const url = "https://github.com/apps/sandrun/installations/new?state=test-state"
+	const expiry = "2030-01-02T03:04:05Z"
+	_, handler := sandrunv1connect.NewGitHubServiceHandler(gitHubInstallURLFixture{
+		response: &sandrunv1.CreateGitHubInstallUrlResponse{
+			Url:        url,
+			ExpireTime: timestamppb.New(time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)),
+		},
+	})
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	f.env[EnvAPIURL] = srv.URL
+	f.httpClient = srv.Client()
+
 	text := f.ok("", "github", "install-url", "--org", f.org)
 	if text.stdout != url+"\n" {
 		t.Errorf("text stdout = %q, want the URL and a newline", text.stdout)
 	}
-	if !strings.HasPrefix(text.stderr, "Open the URL in a browser before ") ||
-		!strings.HasSuffix(text.stderr, "; the SandRun console completes the link.\n") {
-		t.Errorf("text stderr = %q, want the browser instruction", text.stderr)
+	wantStderr := wantGitHubInstallBrowserSignIn + "\nOpen the URL before " + expiry + ". The SandRun console completes the link.\n"
+	if text.stderr != wantStderr {
+		t.Errorf("text stderr = %q, want %q", text.stderr, wantStderr)
 	}
 
 	jsonOutput := f.ok("", "github", "install-url", "--org", f.org, "--output", "json")
@@ -548,7 +583,7 @@ func TestGitHubInstallURLOutput(t *testing.T) {
 	if err := json.Unmarshal([]byte(jsonOutput.stdout), &response); err != nil {
 		t.Fatalf("decode install URL JSON: %v", err)
 	}
-	if len(response) != 2 || response["url"] != url || response["expire_time"] == "" || jsonOutput.stderr != "" {
+	if len(response) != 2 || response["url"] != url || response["expire_time"] != expiry || jsonOutput.stderr != "" {
 		t.Errorf("JSON stdout = %q, stderr = %q, want the URL and expiry on stdout only", jsonOutput.stdout, jsonOutput.stderr)
 	}
 }

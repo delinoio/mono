@@ -454,6 +454,8 @@ func (a *app) ownsandUnlink(ctx context.Context, name string, args []string) err
 
 // GitHub.
 
+const githubInstallBrowserSignIn = "Before you open the URL, sign in to the SandRun console in the browser you will use. Use the same SandRun account you used to generate the URL."
+
 func (a *app) githubInstallURL(ctx context.Context, name string, args []string) error {
 	fs := a.newFlags(name)
 	if _, err := a.positional(fs, args); err != nil {
@@ -473,7 +475,8 @@ func (a *app) githubInstallURL(ctx context.Context, name string, args []string) 
 	if _, err := fmt.Fprintln(a.env.Stdout, res.Msg.GetUrl()); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.env.Stderr, "Open the URL in a browser before %s; the SandRun console completes the link.\n", ts(res.Msg.GetExpireTime()))
+	fmt.Fprintln(a.env.Stderr, githubInstallBrowserSignIn)
+	fmt.Fprintf(a.env.Stderr, "Open the URL before %s. The SandRun console completes the link.\n", ts(res.Msg.GetExpireTime()))
 	return nil
 }
 
