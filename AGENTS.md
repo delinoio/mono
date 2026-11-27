@@ -166,7 +166,7 @@
 
 - Charge users in USD only.
 - Store and compute prices, usage costs, credits and balances with 0.000001 USD (micro-USD) precision as signed 64-bit integers named with a `_usd_micros` suffix. Never use binary floating-point types for monetary values.
-- Document rounding at payment-provider boundaries and in sub-micro-USD calculations in the owning domain contract; round only for display.
+- Use the rounding direction documented in the owning domain contract when rounding is required to produce a whole micro-USD amount or to convert at a payment-provider boundary. Preserve exact conversions. Never store rounded display values or use them in calculations.
 - Use `delino-accounts` for billing in every service. `delino-accounts` owns payment methods, payment-provider integration, balances, credits, charges and invoices. Other services report billable usage or charges to `https://accounts.api.delino.io` and link users to `https://accounts.delino.io` for billing management. Do not integrate a payment provider directly or keep a service-local balance.
 - Follow `docs/repository-billing-contract.md` and `docs/project-delino-accounts.md`.
 
