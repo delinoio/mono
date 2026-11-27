@@ -2014,6 +2014,12 @@ export function createMockTransport(
         const r = org.runners.find((x) => x.runnerId === req.runnerId);
         if (r === undefined)
           throw new ConnectError("runner not found", Code.NotFound);
+        if (
+          r.state === RunnerState.DELETING ||
+          TERMINAL_RUNNER_STATES.has(r.state)
+        ) {
+          return { runner: r };
+        }
         endRunner(org, r, RunnerEndReason.DELETED_BY_USER);
         audit(
           org,

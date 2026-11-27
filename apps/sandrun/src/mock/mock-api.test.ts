@@ -1264,6 +1264,21 @@ test("removing OwnSand ends each active request and publishes its terminal outco
   }
 });
 
+test.each([
+  [MOCK_IDS.northwind, MOCK_IDS.deletedRunner, Code.PermissionDenied],
+  [MOCK_IDS.acme, MOCK_IDS.queuedJob, Code.NotFound],
+])(
+  "delete runner in %s returns the existing error code",
+  async (organizationId, runnerId, code) => {
+    const work = createClient(WorkService, createMockTransport());
+    await expect(
+      work.deleteRunner({ organizationId, runnerId }),
+    ).rejects.toMatchObject({
+      code,
+    });
+  },
+);
+
 test("GitHub installation state is scoped to its organization and can be used once before expiry", async () => {
   const issuedAt = Date.UTC(2026, 0, 1) + 123;
   const clock = rs.spyOn(Date, "now").mockReturnValue(issuedAt);
