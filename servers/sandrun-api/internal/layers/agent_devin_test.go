@@ -476,6 +476,60 @@ func TestDevinCancelReleasedByPoller(t *testing.T) {
 	})
 }
 
+func TestDevinLookupFailureReleaseGrace(t *testing.T) {
+	const sid = "ses-release-grace"
+	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	w.full()
+	w.devin.AddSession(sid, true)
+	requestID := w.requestBySource(t, sid).GetRequestId()
+	// Stop background polling so each test step owns one round of release.
+	w.env.Stop()
+	ctx := t.Context()
+	endedAt := w.env.Clock.Now()
+	if _, err := w.env.DB.Pool.Exec(ctx, `
+		UPDATE requests SET state = $2, end_reason = $3, start_time = $4
+		WHERE request_id = $1`, requestID, sandrunv1.RequestState_REQUEST_STATE_ENDED,
+		sandrunv1.RequestEndReason_REQUEST_END_REASON_COMPLETED, endedAt.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	w.devin.FailLookups(true)
+
+	w.l.Agents.Poll(ctx)
+	w.assertClaim(t, requestID, agent.ClaimHeld)
+	w.assertNoRelease(t, sid)
+	if !strings.Contains(w.env.Logs.String(), "agent_claim_release_failed") {
+		t.Fatal("the poller did not report the lookup error")
+	}
+
+	if _, err := w.env.DB.Pool.Exec(ctx, "UPDATE requests SET end_time = $2 WHERE request_id = $1", requestID, endedAt); err != nil {
+		t.Fatal(err)
+	}
+	// The test world configures one minute of release grace.
+	w.env.Clock.Advance(time.Minute - time.Microsecond)
+	w.l.Agents.Poll(ctx)
+	w.assertClaim(t, requestID, agent.ClaimHeld)
+	w.assertNoRelease(t, sid)
+
+	w.env.Clock.Advance(time.Microsecond)
+	w.devin.FailReleases(true)
+	w.l.Agents.Poll(ctx)
+	w.assertClaim(t, requestID, agent.ClaimHeld)
+	if attempts := w.devin.ReleaseAttempts(sid); attempts != 1 {
+		t.Fatalf("release attempts at grace = %d, want 1", attempts)
+	}
+
+	w.devin.FailReleases(false)
+	w.l.Agents.Poll(ctx)
+	w.assertClaim(t, requestID, agent.ClaimReleased)
+	// The fake only accepts release with the original acceptor ID.
+	if attempts, releases := w.devin.ReleaseAttempts(sid), w.devin.Releases(sid); attempts != 2 || releases != 1 {
+		t.Fatalf("release attempts = %d and successes = %d, want 2 and 1", attempts, releases)
+	}
+	if len(w.devin.Messages(sid)) != 0 {
+		t.Fatal("operator message for a served session")
+	}
+}
+
 // TestDevinStartCheckPartialFailure: when the poller cannot read the queue
 // entry of one STARTING session, it still marks the runner of another
 // session BUSY when that session runs (a missed watch event).

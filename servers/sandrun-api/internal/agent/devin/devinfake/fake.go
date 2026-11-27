@@ -33,6 +33,7 @@ type Fake struct {
 	nextID          int
 	lists           int
 	failWatch       int
+	failLookup      bool
 	failRelease     bool
 	queuePages      map[string]map[string]any
 	claimAttempts   []string
@@ -155,6 +156,10 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case r.Method == http.MethodGet && action == "":
+			if f.failLookup {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
+				return
+			}
 			writeJSON(w, http.StatusOK, e.object(f.OutpostID))
 		case r.Method == http.MethodPost && action == "claim":
 			f.claimAttempts = append(f.claimAttempts, sid)
@@ -343,6 +348,13 @@ func (f *Fake) FailWatches(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failWatch = n
+}
+
+// FailLookups sets whether an existing queue entry lookup fails with 503.
+func (f *Fake) FailLookups(fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failLookup = fail
 }
 
 // FailReleases sets whether release calls fail with 503.

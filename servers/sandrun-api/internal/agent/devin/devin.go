@@ -335,10 +335,10 @@ func operatorMessage(req *work.Request) string {
 }
 
 // Release gives up a claim. For a session that a worker served, SandRun first
-// confirms that session_status is suspended or terminated (or that the
-// release grace passed). For a session that SandRun gave up before a worker
-// took it, SandRun shows an operator message in the session first. The
-// release returns the session to the queue at once. Devin documents no
+// checks whether session_status is suspended or terminated. Once the release
+// grace passes, a lookup error also permits a release attempt. If SandRun
+// gave up before a worker took the session, it shows an operator message first.
+// The release returns the session to the queue at once. Devin documents no
 // release status codes: a 2xx and a 404 count as done, other 4xx answers
 // except 429 also count as done (the claim is not SandRun's), and 429 and
 // 5xx keep the claim for a retry.
@@ -351,15 +351,17 @@ func (v *Vendor) Release(ctx context.Context, in integration.Integration, cl *ag
 	base := "/opbeta/outposts/devins/" + url.PathEscape(sid)
 	if req.StartTime != nil {
 		e, err := v.entry(ctx, c, sid)
+		graceElapsed := req.EndTime != nil && v.hub.Service().NowUTC().Sub(*req.EndTime) >= v.opts.ReleaseGrace
 		switch {
 		case vendorhttp.Status(err) == http.StatusNotFound:
 			return true, nil
 		case err != nil:
-			return false, err
+			if !graceElapsed {
+				return false, err
+			}
 		case e.Status.AcceptorID != cl.WorkerID:
 			return true, nil
-		case e.Status.SessionStatus != "suspended" && e.Status.SessionStatus != "terminated" &&
-			(req.EndTime == nil || v.hub.Service().NowUTC().Sub(*req.EndTime) < v.opts.ReleaseGrace):
+		case !graceElapsed && e.Status.SessionStatus != "suspended" && e.Status.SessionStatus != "terminated":
 			return false, nil
 		}
 	} else if req.EndReason != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE {
