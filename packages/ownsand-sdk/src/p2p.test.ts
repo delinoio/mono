@@ -1517,6 +1517,48 @@ describe("peer-to-peer data path", () => {
     expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
   });
 
+  test("checks the final size on the data channel without retrying or falling back", async () => {
+    const writes: bigint[] = [];
+    const { h } = p2pSetup((frame, peer) => {
+      if (frame.payload.case !== "fileWriteChunk") return;
+      const req = frame.payload.value;
+      writes.push(req.offset);
+      peer.send({
+        streamId: frame.streamId,
+        sandboxId: SANDBOX,
+        kind: DataFrameKind.FILE_WRITE_RESULT,
+        payload: {
+          case: "fileWriteResult",
+          value: {
+            writeId: req.writeId,
+            offset: req.offset,
+            length: BigInt(req.data.length),
+            finished: req.finish !== undefined,
+            sizeBytes: req.path === "/bad" ? 6n : (req.finish?.sizeBytes ?? 0n),
+          },
+        },
+      });
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const failure = await h.clock
+      .run(sandbox.writeFile("/bad", "hello"))
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DataPathError);
+    expect(failure).toMatchObject({ code: Code.Internal });
+    expect(writes).toEqual([0n]);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+
+    const empty = await h.clock.run(
+      sandbox.writeFile("/empty", new Uint8Array(0)),
+    );
+    expect(empty.sizeBytes).toBe(0n);
+    const data = new Uint8Array((1 << 20) + 1);
+    const multiple = await h.clock.run(sandbox.writeFile("/multiple", data));
+    expect(multiple.sizeBytes).toBe(BigInt(data.length));
+    expect(writes).toEqual([0n, 0n, 0n, 1048576n]);
+  });
+
   test("an error frame ends the operation with its Connect code", async () => {
     const { h } = p2pSetup((frame, peer) => {
       peer.send({
