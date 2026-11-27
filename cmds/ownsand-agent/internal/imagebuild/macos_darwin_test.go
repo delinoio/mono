@@ -76,12 +76,19 @@ func TestMacOSImageFirstBootShutdown(t *testing.T) {
 		{"/sbin/shutdown", "-h", "now"},
 	}
 	tests := []struct {
-		name   string
-		states []vz.VirtualMachineState
-		cancel bool
-		err    string
+		name       string
+		states     []vz.VirtualMachineState
+		cancel     bool
+		missingAux bool
+		err        string
 	}{
 		{name: "stopped", states: []vz.VirtualMachineState{vz.VirtualMachineStateStopped}},
+		{
+			name:       "stopped with incomplete stage",
+			states:     []vz.VirtualMachineState{vz.VirtualMachineStateStopped},
+			missingAux: true,
+			err:        images.MacOSAuxStorage,
+		},
 		{name: "VM error", states: []vz.VirtualMachineState{vz.VirtualMachineStateError}, err: "the first-boot VM failed during shutdown (VirtualMachineStateError)"},
 		{name: "timeout", states: []vz.VirtualMachineState{vz.VirtualMachineStateStopping}, err: "the guest did not shut down"},
 		{name: "canceled", cancel: true, err: context.Canceled.Error()},
@@ -93,6 +100,11 @@ func TestMacOSImageFirstBootShutdown(t *testing.T) {
 			build := images.BuildDir(dir)
 			writeMacOSFixture(t, dir, "previous")
 			writeMacOSFixture(t, build, "staged")
+			if tt.missingAux {
+				if err := os.Remove(filepath.Join(build, images.MacOSAuxStorage)); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := images.WriteMetadata(dir, images.Metadata{GuestOS: guestOS, GuestVersion: "previous"}); err != nil {
 				t.Fatal(err)
 			}
@@ -146,7 +158,12 @@ func TestMacOSImageFirstBootShutdown(t *testing.T) {
 			if tt.cancel && !errors.Is(err, context.Canceled) {
 				t.Fatalf("build error = %v, want context.Canceled", err)
 			}
-			if _, err := os.Stat(filepath.Join(build, images.MetadataFile)); !errors.Is(err, os.ErrNotExist) {
+			if tt.missingAux {
+				metadata, err := images.ReadMetadata(build)
+				if err != nil || metadata.GuestVersion != fixtureHelperVersion {
+					t.Fatalf("staged metadata = %+v, %v, want first boot helper version", metadata, err)
+				}
+			} else if _, err := os.Stat(filepath.Join(build, images.MetadataFile)); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("staged metadata stat error = %v, want os.ErrNotExist", err)
 			}
 			assertMacOSFixture(t, dir, "previous", "previous")
