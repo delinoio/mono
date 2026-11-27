@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { describe, expect, test } from "@rstest/core";
+import { describe, expect, rs, test } from "@rstest/core";
 import { ExecFailureReason } from "@delino/sandrun-protos/v1/common_pb";
 import {
   type AttachDevSessionExecRequest,
@@ -31,6 +31,7 @@ import { isUuidV7 } from "./uuidv7.ts";
 
 const ORG = "0193a000-0000-7000-8000-000000000001";
 const SESSION = "0193a000-0000-7000-8000-0000000000f1";
+const EXEC = "0193a000-0000-7000-8000-0000000000e1";
 
 type EventInit = MessageInitShape<typeof DevSessionExecEventSchema>["event"];
 type Script = (EventInit | ConnectError)[];
@@ -131,6 +132,123 @@ function describeEvent(event: ExecEvent): string {
 }
 
 describe("exec helper", () => {
+  test.each([undefined, EXEC])(
+    "handles a pre-aborted signal before resolving exec ID %s",
+    async (execId) => {
+      const abort = new AbortController();
+      const reason = new Error("exec canceled");
+      abort.abort(reason);
+      const now = rs.fn(() => 2 ** 48);
+      const sleep = rs.fn(async () => {});
+      const rpc = rs.fn(() => {
+        throw new ConnectError("unexpected RPC", Code.FailedPrecondition);
+      });
+      const caller: ExecCaller = {
+        execDevSession: rpc,
+        attachDevSessionExec: rpc,
+      };
+      const input = { ...execInput, execId, signal: abort.signal };
+      const options = { clock: { now, sleep } };
+
+      expect(await execDevSession(caller, input, options).next()).toEqual({
+        done: true,
+        value: undefined,
+      });
+      await expect(runDevSessionExec(caller, input, options)).rejects.toBe(
+        reason,
+      );
+      expect(now).not.toHaveBeenCalled();
+      expect(sleep).not.toHaveBeenCalled();
+      expect(rpc).not.toHaveBeenCalled();
+    },
+  );
+
+  test("surfaces ID generation errors for active calls with no exec ID", async () => {
+    const now = rs.fn(() => 2 ** 48);
+    const sleep = rs.fn(async () => {});
+    const rpc = rs.fn(() => {
+      throw new ConnectError("unexpected RPC", Code.FailedPrecondition);
+    });
+    const caller: ExecCaller = {
+      execDevSession: rpc,
+      attachDevSessionExec: rpc,
+    };
+    const input = { ...execInput, signal: new AbortController().signal };
+    const options = { clock: { now, sleep } };
+    const message = "UUID v7 timestamp exceeds the 48-bit limit";
+
+    await expect(execDevSession(caller, input, options).next()).rejects.toThrow(
+      message,
+    );
+    await expect(runDevSessionExec(caller, input, options)).rejects.toThrow(
+      message,
+    );
+    expect(now).toHaveBeenCalledTimes(2);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(rpc).not.toHaveBeenCalled();
+  });
+
+  test.each([Number.NaN, Infinity, -Infinity])(
+    "rejects a non-finite timeout %s before dispatch or retry",
+    async (timeoutMs) => {
+      const clock = new RecordingClock();
+      const start = rs.fn(() => {
+        throw new ConnectError("unexpected exec", Code.FailedPrecondition);
+      });
+      const attach = rs.fn(() => {
+        throw new ConnectError("unknown exec", Code.NotFound);
+      });
+      const caller: ExecCaller = {
+        execDevSession: start,
+        attachDevSessionExec: attach,
+      };
+      const input = { ...execInput, execId: EXEC, timeoutMs };
+
+      await expect(
+        execDevSession(caller, input, { clock }).next(),
+      ).rejects.toThrow(RangeError);
+      await expect(runDevSessionExec(caller, input, { clock })).rejects.toThrow(
+        RangeError,
+      );
+      expect(start).not.toHaveBeenCalled();
+      expect(attach).not.toHaveBeenCalled();
+      expect(clock.sleeps).toEqual([]);
+    },
+  );
+
+  test.each([
+    { timeoutMs: 1000.1, timeout: { seconds: 1n, nanos: 100_000 } },
+    { timeoutMs: 999.9999996, timeout: { seconds: 1n, nanos: 0 } },
+    { timeoutMs: 1000.5, timeout: { seconds: 1n, nanos: 500_000 } },
+    { timeoutMs: 90_000, timeout: { seconds: 90n, nanos: 0 } },
+    { timeoutMs: 0.0000004, timeout: { seconds: 0n, nanos: 0 } },
+    { timeoutMs: 0.0000005, timeout: { seconds: 0n, nanos: 1 } },
+    { timeoutMs: undefined, timeout: undefined },
+  ])(
+    "encodes timeout $timeoutMs on the wire",
+    async ({ timeoutMs, timeout }) => {
+      const { server, execs, attachRequests } = execServer([exited(0)], []);
+      const result = await client(server.fetch).runDevSessionExec({
+        ...execInput,
+        execId: EXEC,
+        timeoutMs,
+      });
+
+      expect(result.outcome).toMatchObject({
+        kind: ExecEventKind.Exited,
+        exitCode: 0n,
+      });
+      expect(server.calls).toHaveLength(1);
+      expect(execs).toHaveLength(1);
+      expect(execs[0]!.timeout).toEqual(
+        timeout === undefined
+          ? undefined
+          : { $typeName: "google.protobuf.Duration", ...timeout },
+      );
+      expect(attachRequests).toEqual([]);
+    },
+  );
+
   test.each(["throws", "rejects"])(
     "ends the first read when the token source %s",
     async (failure) => {
@@ -330,16 +448,19 @@ describe("exec helper", () => {
       [new ConnectError("overloaded", Code.Unavailable)],
       [[new ConnectError("unknown exec", Code.NotFound)]],
     );
-    const error = await client(server.fetch)
+    const clock = new RecordingClock();
+    const error = await client(server.fetch, clock)
       .runDevSessionExec({
-        organizationId: ORG,
-        devSessionId: SESSION,
-        command: ["true"],
+        ...execInput,
+        timeoutMs: 90_000,
       })
       .catch((e: unknown) => e);
     expect((error as ConnectError).code).toBe(Code.Unavailable);
     expect(execs.length).toBe(1);
+    expect(execs[0]!.timeout).toMatchObject({ seconds: 90n, nanos: 0 });
     expect(attachRequests.length).toBe(1);
+    expect(attachRequests[0]!.execId).toBe(execs[0]!.execId);
+    expect(clock.sleeps).toEqual([1_000]);
   });
 
   test.each(["with", "without"])(
