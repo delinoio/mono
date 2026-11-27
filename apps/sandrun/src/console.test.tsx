@@ -5448,7 +5448,30 @@ describe("settings", () => {
   });
 
   test("an admin changes the dev session limit; the owner actions stay hidden", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.globex}/settings`);
+    const organizationId = MOCK_IDS.globex;
+    const mock = createMockTransport();
+    const client = createClient(OrganizationService, mock);
+    const { organization: before } = await client.getOrganization({
+      organizationId,
+    });
+    expect(before?.settings?.maxDevSessionsPerUser).toBeUndefined();
+
+    const updates: unknown[] = [];
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (
+          method.name ===
+          OrganizationService.method.updateOrganizationSettings.name
+        ) {
+          updates.push(args[3]);
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    const queryClient = renderConsole(`/orgs/${organizationId}/settings`, {
+      transport,
+    });
     const input = await screen.findByRole("textbox", {
       name: "Limit per user",
     });
@@ -5456,9 +5479,23 @@ describe("settings", () => {
       screen.queryByRole("button", { name: "Delete organization" }),
     ).toBeNull();
     await type(input, "3");
-    await click(screen.getByRole("button", { name: "Save limit" }));
-    await settle(60);
-    expect(document.body.textContent).not.toContain("Enter a whole number");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+    });
+    await waitFor(() => {
+      expect(updates).toMatchObject([
+        {
+          organizationId,
+          settings: { maxDevSessionsPerUser: 3 },
+          updateMask: { paths: [limitPath] },
+        },
+      ]);
+      expect(queryClient.isMutating()).toBe(0);
+    });
+    const { organization: after } = await client.getOrganization({
+      organizationId,
+    });
+    expect(after?.settings?.maxDevSessionsPerUser).toBe(3);
   });
 
   test.each([
