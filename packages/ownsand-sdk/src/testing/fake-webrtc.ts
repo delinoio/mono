@@ -52,6 +52,8 @@ export interface FakeAgentPeer {
   endSession(reason: number): void;
   /** Closes the channel without a session-end frame. */
   fail(): void;
+  /** Emits a data channel error before the close event. */
+  failWithError(): void;
 }
 
 export type FakeAgent = (frame: DataFrame, peer: FakeAgentPeer) => void;
@@ -264,6 +266,7 @@ export function fakeWebRtc(
           queueMicrotask(() => queueMicrotask(() => channel.close()));
         },
         fail: () => channel.close(),
+        failWithError: () => channel.emit("error"),
       };
       record.peers.push(peer);
       channel.onSend = (bytes) => {

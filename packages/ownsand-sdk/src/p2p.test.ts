@@ -1880,6 +1880,94 @@ describe("peer-to-peer data path", () => {
     });
   });
 
+  describe("idle peer sessions", () => {
+    const readEmptyFile: FakeAgent = (frame, peer) => {
+      if (frame.kind !== DataFrameKind.FILE_READ_REQUEST) return;
+      peer.send({
+        streamId: frame.streamId,
+        sandboxId: SANDBOX,
+        kind: DataFrameKind.FILE_READ_EVENT,
+        payload: {
+          case: "fileReadEvent",
+          value: { event: { case: "end", value: { sizeBytes: 0n } } },
+        },
+      });
+    };
+
+    test.each([
+      ["close", (peer: FakeAgentPeer) => peer.fail()],
+      ["error", (peer: FakeAgentPeer) => peer.failWithError()],
+    ] as const)(
+      "an idle channel %s switches concurrent and later reads to relay",
+      async (_event, fail) => {
+        const records: LogRecord[] = [];
+        const { h, rtc } = p2pSetup(readEmptyFile, {
+          logger: (record) => records.push(record),
+        });
+        h.api.stream(RelayService, "ReadFile", function* () {
+          yield file.accepted();
+          yield file.chunk(0, "relay");
+          yield file.end(5);
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const read = () => sandbox.readFileBytes("/file");
+        expect(await h.clock.run(read())).toHaveLength(0);
+
+        fail(rtc.peers[0]!);
+        await h.clock.settle();
+        expect(rtc.closedConnections).toBe(1);
+
+        const concurrent = await h.clock.run(Promise.all([read(), read()]));
+        const later = await h.clock.run(read());
+        expect([...concurrent, later].map(text)).toEqual([
+          "relay",
+          "relay",
+          "relay",
+        ]);
+        expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(3);
+        expect(h.api.callsOf("ReadFile")).toHaveLength(3);
+        expect(
+          records.filter((r) => r.event === LogEvent.TransportSelected),
+        ).toHaveLength(2);
+      },
+    );
+
+    test.each([
+      { scenario: "a healthy session", sessions: 1 },
+      {
+        scenario: "a routine session end",
+        sessions: 2,
+        end: (peer: FakeAgentPeer) => peer.endSession(SessionEndReason.EXPIRED),
+      },
+      {
+        scenario: "a channel close on a forced peer handle",
+        sessions: 2,
+        transport: DataPathTransport.PEER_TO_PEER,
+        end: (peer: FakeAgentPeer) => peer.fail(),
+      },
+    ])(
+      "keeps peer routing after $scenario",
+      async ({ sessions, transport, end }) => {
+        const { h, rtc } = p2pSetup(readEmptyFile, { transport });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const read = () => sandbox.readFileBytes("/file");
+        expect(await h.clock.run(read())).toHaveLength(0);
+
+        end?.(rtc.peers[0]!);
+        await h.clock.settle();
+
+        expect(await h.clock.run(read())).toHaveLength(0);
+        expect(h.api.callsOf("GetIceServers")).toHaveLength(sessions);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(sessions);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      },
+    );
+  });
+
   describe("slow consumers", () => {
     /** Deterministic file content, so that a gap or a duplicate shows. */
     function source(size: number): Uint8Array {
@@ -2313,24 +2401,32 @@ describe("peer-to-peer data path", () => {
         expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
       });
 
-      test("an automatic handle still falls back to the relay and does not close the replacement session", async () => {
+      test("a paused peer read resumes on relay after another read detects the failure", async () => {
         const p = p2pSetup(stallingAgent());
         const { h, rtc } = p;
-        h.api.stream(RelayService, "ReadFile", function* () {
+        h.api.stream(RelayService, "ReadFile", function* (request) {
+          const offset = Number(
+            (request as unknown as { offset: bigint }).offset,
+          );
           yield file.accepted();
-          yield file.chunk(0, "relay");
-          yield file.end(5);
+          yield file.chunk(offset, "relay");
+          yield file.end(offset + 5);
         });
         const { sandbox, wait, done } = await pausedReadThatLosesItsChannel(p);
-        await h.clock.run(sandbox.run({ command: ["a"] }));
-        expect(rtc.channels).toHaveLength(2);
+        expect(text(await h.clock.run(sandbox.readFileBytes("/other")))).toBe(
+          "relay",
+        );
         wait.open();
-        // The read continues on the relay from its delivered offset.
-        await h.clock.run(done);
+        expect(await h.clock.run(done)).toBe("completed");
+
+        const reads = h.api.callsOf("ReadFile");
+        expect(reads.map(({ request }) => request)).toMatchObject([
+          { path: "/other", offset: 0n },
+          { path: "/big", offset: 3072n },
+        ]);
         expect(sandbox.transport).toBe(DataPathTransport.RELAY);
-        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
-        // The stale failure does not close the session of the other operation.
-        expect(rtc.channels[1]!.readyState).toBe("open");
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(2);
+        expect(rtc.channels).toHaveLength(1);
       });
 
       test("an exec of an old session that fails late keeps the healthy replacement", async () => {
