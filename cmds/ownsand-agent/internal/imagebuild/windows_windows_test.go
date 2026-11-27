@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"unicode"
@@ -228,12 +229,21 @@ func TestSetupCompleteCmd(t *testing.T) {
 }
 
 func TestDiskpartScript(t *testing.T) {
-	s := diskpartScript(3, "S", "W")
-	i, j := strings.Index(s, "create partition efi"), strings.Index(s, "create partition primary")
-	if !strings.HasPrefix(s, "select disk 3\r\n") || i < 0 || j < i || strings.Contains(s[j:], "create partition") && strings.Count(s[j:], "create partition") > 1 {
-		t.Fatalf("script:\n%s", s)
+	want := []string{
+		"select disk 3",
+		"clean",
+		"convert gpt",
+		"create partition efi size=260",
+		`format quick fs=fat32 label="System"`,
+		"assign letter=S",
+		"create partition msr size=16",
+		"create partition primary",
+		`format quick fs=ntfs label="Windows"`,
+		"assign letter=W",
+		"exit",
+		"",
 	}
-	if !strings.Contains(s, "convert gpt") || !strings.Contains(s, "assign letter=W") {
-		t.Fatalf("script:\n%s", s)
+	if got := strings.Split(diskpartScript(3, "S", "W"), "\r\n"); !slices.Equal(got, want) {
+		t.Fatalf("diskpartScript commands:\ngot  %q\nwant %q", got, want)
 	}
 }
