@@ -43,7 +43,7 @@ func requireRemoved(t *testing.T, path string) {
 }
 
 func TestWindowsGuestSyncRetryFileToDirectory(t *testing.T) {
-	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", func(t *testing.T, link, target string) {
+	makeJunction := func(t *testing.T, link, target string) {
 		t.Helper()
 		// A junction is a directory reparse point and needs no symlink privilege.
 		const script = `$ErrorActionPreference = 'Stop'
@@ -55,7 +55,58 @@ New-Item -ItemType Junction -Path $parent -Name $name -Value $env:SANDRUN_TEST_T
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("create junction: %v: %s", err, out)
 		}
+	}
+	t.Run("nested path", func(t *testing.T) {
+		testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", makeJunction)
 	})
+	t.Run("leading U+FEFF", func(t *testing.T) {
+		testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "\ufeffconfig", makeJunction)
+	})
+}
+
+func TestWindowsGuestSyncListPaths(t *testing.T) {
+	testSyncListPaths(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+}
+
+func TestWindowsGuestSyncLinkListPaths(t *testing.T) {
+	for _, tc := range []struct{ name, first string }{
+		{"U+FEFF first", "\ufefffirst"},
+		{"ordinary first", "plain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			names := []string{tc.first, "\ufefflater"}
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+			target := filepath.Join(ds.GetWorkspacePath(), "target.txt")
+			if err := os.WriteFile(target, []byte("target"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			dir := newRepo(t, nil, nil, "")
+			for _, name := range names {
+				if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
+					if errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
+						t.Skipf("creating Windows symbolic links requires privilege: %v", err)
+					}
+					t.Fatal(err)
+				}
+			}
+			p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			res, err := c.Sync(t.Context(), p)
+			if err != nil || res.Uploaded != len(names) || len(res.Warnings) != 0 {
+				t.Fatalf("link sync = %+v, %v", res, err)
+			}
+			files := guestManifest(t, ds).Files
+			for _, name := range names {
+				got, err := os.Readlink(filepath.Join(ds.GetWorkspacePath(), name))
+				if err != nil || got != target {
+					t.Errorf("guest link %q target = %q, %v, want %q", name, got, err, target)
+				}
+				if files[name].Mode != modeSymlink {
+					t.Errorf("manifest omits link %q: %+v", name, files)
+				}
+			}
+		})
+	}
 }
 
 func TestWindowsGuestCleanup(t *testing.T) {
