@@ -554,6 +554,48 @@ describe("overview", () => {
   });
 });
 
+describe("setup with an invalid OwnSand link", () => {
+  const organizationPath = `/orgs/${NORTHWIND}`;
+  const integrationsPath = `${organizationPath}/integrations`;
+
+  test("keeps OwnSand incomplete on Overview", async ({ app, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(organizationPath);
+
+    const checklist = screen.getByRole("region", "Set up SandRun");
+    const ownSandStep = checklist.getByRole("listitem").filter({
+      hasText: "Link OwnSand",
+    });
+    await expect(ownSandStep).toHaveAttribute("data-done", "false");
+    await expect(
+      ownSandStep.getByRole("link", "Replace OwnSand API key"),
+    ).toHaveAttribute("href", integrationsPath);
+    await app.screenshot("invalid-ownsand-overview");
+  });
+
+  test("opens the organization's Integrations from empty Runners", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`${organizationPath}/runners`);
+
+    await expect(screen.getByText("No runners match")).toBeVisible();
+    const action = screen.getByRole("link", "Replace OwnSand API key");
+    await expect(action).toBeVisible();
+    await app.screenshot("invalid-ownsand-runners");
+    await action.tap();
+
+    await expect(browser).toHaveURL(integrationsPath);
+    await expect(
+      screen.getByRole("heading", "Integrations", { level: 1 }),
+    ).toBeVisible();
+  });
+});
+
 describe("audit", () => {
   test("shows the newest event first", async ({ app, browser, screen }) => {
     await app.open("/");
