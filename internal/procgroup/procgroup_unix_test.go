@@ -5,7 +5,6 @@
 package procgroup
 
 import (
-	"errors"
 	"io"
 	"os/exec"
 	"syscall"
@@ -26,11 +25,13 @@ const childExitDeadline = 5 * time.Second
 // zombie, but a zombie holds no file descriptors, so the check does not depend
 // on reaping.
 func TestSignalStopsTheGroup(t *testing.T) {
+	// The child's sleep outlasts the signal check and bounds a failed run.
 	cmd := exec.Command("sh", "-c", "sleep 60 & echo $!; wait")
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer out.Close()
 	Set(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -46,13 +47,6 @@ func TestSignalStopsTheGroup(t *testing.T) {
 			childPID = childPID*10 + int(c-'0')
 		}
 	}
-	// Remove the child if the group signal fails to reach it, so a failing run
-	// does not leave a sleeping process behind. ESRCH means the child is gone.
-	t.Cleanup(func() {
-		if err := syscall.Kill(childPID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			t.Errorf("clean up child %d: %v", childPID, err)
-		}
-	})
 	if pgid, err := syscall.Getpgid(cmd.Process.Pid); err != nil || pgid != cmd.Process.Pid {
 		t.Fatalf("leader process group = %d, %v; want %d", pgid, err, cmd.Process.Pid)
 	}

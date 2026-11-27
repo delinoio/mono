@@ -510,6 +510,23 @@ describe("file write", () => {
     expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
   });
 
+  test("rejects a conflicting final size on the relay without retrying", async () => {
+    const h = setup();
+    h.api.unary(RelayService, "WriteFile", (req) => ({
+      writeId: req.writeId,
+      offset: req.offset,
+      length: BigInt(req.data.length),
+      finished: true,
+      sizeBytes: 6n,
+    }));
+    const failure = await h.clock
+      .run(h.client.sandbox(SANDBOX).writeFile("/out", "hello"))
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DataPathError);
+    expect(failure).toMatchObject({ code: Code.Internal });
+    expect(h.api.callsOf("WriteFile")).toHaveLength(1);
+  });
+
   test("resends the exact unacknowledged chunk after deadline_exceeded", async () => {
     const h = setup();
     h.api.unary(RelayService, "WriteFile", (req, call) => {
@@ -641,9 +658,10 @@ describe("file write", () => {
       finished: true,
       sizeBytes: 0n,
     }));
-    await h.clock.run(
+    const written = await h.clock.run(
       h.client.sandbox(SANDBOX).writeFile("/empty", new Uint8Array(0)),
     );
+    expect(written.sizeBytes).toBe(0n);
     const [write] = h.api.callsOf("WriteFile").map((c) => c.request as any);
     expect(write.finish.sizeBytes).toBe(0n);
     expect(write.path).toBe("/empty");

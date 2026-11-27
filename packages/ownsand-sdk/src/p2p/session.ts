@@ -168,9 +168,9 @@ export class PeerSession {
     );
   }
 
-  /** True after the session ended or failed. */
-  get closed(): boolean {
-    return this.#ended !== undefined;
+  /** The cause of termination, or undefined while the session is open. */
+  get terminalError(): Error | undefined {
+    return this.#ended;
   }
 
   /**

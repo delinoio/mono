@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import type { MessageInitShape } from "@bufbuild/protobuf";
-import { durationFromMs } from "@bufbuild/protobuf/wkt";
+import { type MessageInitShape, protoInt64 } from "@bufbuild/protobuf";
 import { Code, type CallOptions, ConnectError } from "@connectrpc/connect";
 import type { ExecFailureReason } from "@delino/sandrun-protos/v1/common_pb";
 import type {
@@ -98,7 +97,10 @@ export interface ExecInput {
   env?: Readonly<Record<string, string>>;
   /** An absolute guest path, or a path relative to the workspace path. */
   workingDirectory?: string;
-  /** Stops the command after this many milliseconds. Absent means no timeout. */
+  /**
+   * Stops the command after this many milliseconds, rounded to the nearest
+   * nanosecond with halves rounded up. Absent means no timeout.
+   */
   timeoutMs?: number;
   /** A UUID v7 that identifies the exec. Default: a new one. */
   execId?: string;
@@ -139,10 +141,13 @@ export async function* execDevSession(
   input: ExecInput,
   options: ExecHelperOptions = {},
 ): AsyncGenerator<ExecEvent, void, undefined> {
+  const signal = input.signal;
+  if (abortedBy(signal)) {
+    return;
+  }
   const clock = options.clock ?? systemClock;
   const ids = options.ids ?? new UuidV7Generator(() => clock.now());
   const execId = input.execId ?? ids.next();
-  const signal = input.signal;
   let stdoutOffset = 0n;
   let stderrOffset = 0n;
   let started = false;
@@ -245,28 +250,29 @@ export async function* execDevSession(
   }
 
   for (let attempt = 0; !abortedBy(signal); attempt++) {
+    const initialRequest =
+      attempt === 0
+        ? {
+            organizationId: input.organizationId,
+            devSessionId: input.devSessionId,
+            execId,
+            command: [...input.command],
+            env: { ...input.env },
+            workingDirectory: input.workingDirectory ?? "",
+            timeout:
+              input.timeoutMs === undefined
+                ? undefined
+                : execTimeoutFromMs(input.timeoutMs),
+          }
+        : undefined;
     let cause: unknown;
     let progressed = false;
     try {
       const stream: AsyncIterable<
         ExecDevSessionResponse | AttachDevSessionExecResponse
       > =
-        attempt === 0
-          ? devSessions.execDevSession(
-              {
-                organizationId: input.organizationId,
-                devSessionId: input.devSessionId,
-                execId,
-                command: [...input.command],
-                env: { ...input.env },
-                workingDirectory: input.workingDirectory ?? "",
-                timeout:
-                  input.timeoutMs === undefined
-                    ? undefined
-                    : durationFromMs(input.timeoutMs),
-              },
-              { signal },
-            )
+        initialRequest !== undefined
+          ? devSessions.execDevSession(initialRequest, { signal })
           : devSessions.attachDevSessionExec(
               {
                 organizationId: input.organizationId,
@@ -347,6 +353,18 @@ export async function* execDevSession(
   }
 }
 
+function execTimeoutFromMs(ms: number): { seconds: bigint; nanos: number } {
+  const whole = Math.trunc(ms);
+  const fraction = ms - whole;
+  // Convert separately to keep large whole-millisecond values exact.
+  const nanos =
+    BigInt(whole) * 1_000_000n + BigInt(Math.round(fraction * 1_000_000));
+  return {
+    seconds: protoInt64.parse(nanos / 1_000_000_000n),
+    nanos: Number(nanos % 1_000_000_000n),
+  };
+}
+
 function lost(stream: OutputStream, start: bigint, end: bigint): ExecEvent {
   return { kind: ExecEventKind.OutputLost, range: { stream, start, end } };
 }
@@ -377,6 +395,7 @@ export async function runDevSessionExec(
   input: ExecInput,
   options: ExecHelperOptions = {},
 ): Promise<ExecResult> {
+  input.signal?.throwIfAborted();
   const clock = options.clock ?? systemClock;
   const ids = options.ids ?? new UuidV7Generator(() => clock.now());
   const execId = input.execId ?? ids.next();

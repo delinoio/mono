@@ -137,6 +137,64 @@ func TestLogSinkStateReportMatching(t *testing.T) {
 	}
 }
 
+func TestWaitForFreshAgentStateReport(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		logs := &logSink{}
+		const sourceReport = `api: {"msg":"agent_state_report","device_id":"source"}`
+		const disconnect = `api: {"msg":"agent_channel_disconnected","device_id":"source","current":true}`
+		appendLines(logs, sourceReport, disconnect)
+		beforeKill := logs.position()
+		appendLines(logs,
+			`api: {"msg":"agent_channel_disconnected","device_id":"source","current":false}`,
+			`api: {"msg":"agent_channel_disconnected","device_id":"destination","current":true}`,
+			sourceReport,
+			disconnect,
+			`api: {"msg":"agent_state_report","device_id":"destination"}`,
+			`api-previous: {"msg":"agent_state_report","device_id":"source"}`,
+		)
+		position, err := logs.waitForAgentChannelEvent(ctx, "api", "source", agentChannelDisconnected, beforeKill)
+		if err != nil || position != beforeKill+4 {
+			t.Fatalf("disconnect position = %d, err = %v, want position %d", position, err, beforeKill+4)
+		}
+
+		result := make(chan error, 1)
+		go func() {
+			_, err := logs.waitForAgentChannelEvent(ctx, "api", "source", agentStateReport, position)
+			result <- err
+		}()
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("wait returned before a fresh source report: %v", err)
+		default:
+		}
+
+		appendLines(logs, sourceReport)
+		if err := <-result; err != nil {
+			t.Fatalf("wait failed after a fresh source report: %v", err)
+		}
+	})
+}
+
+func TestWaitForAgentChannelEventDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		logs := &logSink{}
+		_, err := logs.waitForAgentChannelEvent(ctx, "api-restarted", "destination", agentStateReport, logs.position())
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("wait returned %v, want context deadline exceeded", err)
+		}
+		for _, want := range []string{"api-restarted", "destination", "agent_state_report"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not contain %q", err, want)
+			}
+		}
+	})
+}
+
 func TestWaitForAgentConfigurationMatchesProcessAndLimits(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		logs := &logSink{}

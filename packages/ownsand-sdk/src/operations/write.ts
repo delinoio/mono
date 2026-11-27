@@ -295,11 +295,17 @@ export async function runWriteFile(
     }
     offset += BigInt(chunk.data.length);
     first = false;
-    if (chunk.last) {
+    if (request.finish !== undefined) {
       if (!response.finished) {
         throw new DataPathError("the agent did not finish the write", {
           code: Code.Internal,
         });
+      }
+      if (response.sizeBytes !== request.finish.sizeBytes) {
+        throw new DataPathError(
+          "the agent reported a final size that differs from the requested size",
+          { code: Code.Internal },
+        );
       }
       return { writeId, sizeBytes: response.sizeBytes };
     }
