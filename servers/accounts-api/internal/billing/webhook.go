@@ -135,7 +135,7 @@ func (s *Service) webhookRejected(ctx context.Context, w http.ResponseWriter, st
 // applyEvent records the event ID and applies the event in one transaction.
 func (s *Service) applyEvent(ctx context.Context, ev paddle.Event) (eventOutcome, error) {
 	var out eventOutcome
-	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+	err := s.inTopUpTx(ctx, func(tx pgx.Tx, observations *topUpObservations) error {
 		now := s.timestamp()
 		out = eventOutcome{}
 		tag, err := tx.Exec(ctx, `INSERT INTO paddle_events (paddle_event_id, event_type, occurred_at, result, process_time)
@@ -150,9 +150,9 @@ func (s *Service) applyEvent(ctx context.Context, ev paddle.Event) (eventOutcome
 		}
 		switch {
 		case ev.EventType == paddle.EventTransactionCompleted:
-			out, err = s.onTransactionCompleted(ctx, tx, ev, now)
+			out, err = s.onTransactionCompleted(ctx, tx, observations, ev, now)
 		case ev.EventType == paddle.EventTransactionPaymentFailed:
-			out, err = s.onPaymentFailed(ctx, tx, ev, now)
+			out, err = s.onPaymentFailed(ctx, tx, observations, ev, now)
 		case paddle.IsSubscriptionEvent(ev.EventType):
 			out, err = s.onSubscription(ctx, tx, ev, now)
 		case ev.EventType == paddle.EventAdjustmentCreated, ev.EventType == paddle.EventAdjustmentUpdated:
@@ -318,7 +318,7 @@ func loadTopUpForCharge(ctx context.Context, tx pgx.Tx, accountID, topUpID strin
 
 // onTransactionCompleted adds the tax-exclusive credit of a completed
 // purchase. A subscription payment grants at most $10.
-func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, ev paddle.Event, now time.Time) (eventOutcome, error) {
+func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, observations *topUpObservations, ev paddle.Event, now time.Time) (eventOutcome, error) {
 	var txn paddle.Transaction
 	if err := json.Unmarshal(ev.Data, &txn); err != nil || txn.ID == "" {
 		return eventOutcome{Result: webhookInvalidPayload}, nil
@@ -399,7 +399,7 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, ev padd
 			return out, err
 		}
 		if found {
-			if err := s.completeTopUp(ctx, tx, t, txn.ID, now); err != nil {
+			if err := s.completeTopUp(ctx, tx, observations, t, txn.ID, now); err != nil {
 				return out, err
 			}
 		}
@@ -456,7 +456,7 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, ev padd
 // its top-up, and a failed renewal of the subscription emails the owners and
 // admins. Failed attempts inside the checkout are ignored; the user sees
 // them there.
-func (s *Service) onPaymentFailed(ctx context.Context, tx pgx.Tx, ev paddle.Event, now time.Time) (eventOutcome, error) {
+func (s *Service) onPaymentFailed(ctx context.Context, tx pgx.Tx, observations *topUpObservations, ev paddle.Event, now time.Time) (eventOutcome, error) {
 	var txn paddle.Transaction
 	if err := json.Unmarshal(ev.Data, &txn); err != nil || txn.ID == "" {
 		return eventOutcome{Result: webhookInvalidPayload}, nil
@@ -483,7 +483,14 @@ func (s *Service) onPaymentFailed(ctx context.Context, tx pgx.Tx, ev paddle.Even
 			out.Result = webhookIgnored
 			return out, nil
 		}
-		if err := s.failTopUp(ctx, tx, acct, t.ID, FailurePaymentFailed, now); err != nil {
+		if t.Kind == TopUpAuto && t.Status == TopUpFailed && t.FailureReason == FailureTimedOut {
+			// Release the cap reservation. The timeout already counted the
+			// failure and queued the notice.
+			if _, err := tx.Exec(ctx, `UPDATE top_ups SET failure_reason = $2, update_time = $3
+				WHERE top_up_id = $1`, t.ID, FailurePaymentFailed, now); err != nil {
+				return out, err
+			}
+		} else if err := s.failTopUp(ctx, tx, observations, acct, t.ID, FailurePaymentFailed, now); err != nil {
 			return out, err
 		}
 	case txn.Origin == paddle.OriginWeb || txn.Origin == paddle.OriginAPI || acct.Deleted:
