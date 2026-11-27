@@ -3,7 +3,7 @@
 // Package testenv runs accounts-api in process for integration tests: a
 // fresh Postgres database (skipped without ACCOUNTS_TEST_DATABASE_URL), the
 // production handler from internal/app, a test Logto issuer, the fake Logto
-// directory, the email fake, a fake Paddle API and a controllable clock.
+// directory, a test email sender, a fake Paddle API and a controllable clock.
 package testenv
 
 import (
@@ -101,7 +101,7 @@ type Env struct {
 	URL       string
 	Issuer    *authtest.Issuer
 	Directory *directory.Fake // Available when New starts the server.
-	Email     *email.Fake
+	Email     *email.Fake     // Available when the environment uses the fake sender.
 	Paddle    *paddletest.Server
 	Billing   *billing.Service
 	Clock     *Clock
@@ -111,8 +111,15 @@ type Env struct {
 // New starts accounts-api on a fresh database.
 func New(t testing.TB) *Env {
 	t.Helper()
+	return NewWithResend(t, "")
+}
+
+// NewWithResend starts accounts-api with Resend pointed at a test endpoint.
+// An empty base URL selects the fake sender.
+func NewWithResend(t testing.TB, baseURL string) *Env {
+	t.Helper()
 	fake := directory.NewFake()
-	env := NewWithDirectory(t, fake)
+	env := newEnv(t, fake, baseURL)
 	env.Directory = fake
 	return env
 }
@@ -121,6 +128,11 @@ func New(t testing.TB) *Env {
 // Use Client and Issuer to authenticate users from that directory.
 func NewWithDirectory(t testing.TB, lookup directory.Directory) *Env {
 	t.Helper()
+	return newEnv(t, lookup, "")
+}
+
+func newEnv(t testing.TB, lookup directory.Directory, resendURL string) *Env {
+	t.Helper()
 	database := dbtest.New(t)
 	logs := &SafeBuffer{}
 	logger := slog.New(slog.NewJSONHandler(io.MultiWriter(logs), &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -128,16 +140,28 @@ func NewWithDirectory(t testing.TB, lookup directory.Directory) *Env {
 		t:      t,
 		DB:     database,
 		Issuer: authtest.NewIssuer(t),
-		Email:  email.NewFake(),
 		Paddle: paddletest.New(t),
 		Clock:  &Clock{now: time.Now().UTC().Truncate(time.Microsecond)},
 		Logs:   logs,
+	}
+	var sender email.Sender
+	if resendURL == "" {
+		env.Email = email.NewFake()
+		sender = env.Email
+	} else {
+		resend, err := email.NewResend(email.ResendConfig{
+			APIKey: "test-key", From: "billing@example.com", BaseURL: resendURL, Logger: logger,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sender = resend
 	}
 	env.Billing = billing.New(billing.Config{
 		DB:                  database,
 		Paddle:              paddle.New(paddle.Config{BaseURL: env.Paddle.URL, APIKey: paddletest.APIKey}),
 		Directory:           lookup,
-		Email:               env.Email,
+		Email:               sender,
 		Logger:              logger,
 		Now:                 env.Clock.Now,
 		WebhookSecret:       PaddleWebhookSecret,
@@ -152,7 +176,7 @@ func NewWithDirectory(t testing.TB, lookup directory.Directory) *Env {
 			Issuer: env.Issuer.URL, Audience: authtest.Audience, Logger: logger,
 		}),
 		Directory:   lookup,
-		Email:       env.Email,
+		Email:       sender,
 		Logger:      logger,
 		Now:         env.Clock.Now,
 		Audience:    authtest.Audience,

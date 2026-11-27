@@ -17,11 +17,13 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/cmds/internal/credstore"
 	"github.com/delinoio/mono/go/sandrun"
@@ -523,6 +525,81 @@ func TestCredentialInput(t *testing.T) {
 	}
 }
 
+func TestAPIKeyCreateExpiry(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		flag     string
+		duration time.Duration
+		invalid  bool
+	}{
+		{name: "empty", flag: "--expires-in=", invalid: true},
+		{name: "zero", flag: "--expires-in=0", invalid: true},
+		{name: "zero seconds", flag: "--expires-in=0s", invalid: true},
+		{name: "zero days", flag: "--expires-in=0d", invalid: true},
+		{name: "negative", flag: "--expires-in=-1s", invalid: true},
+		{name: "malformed", flag: "--expires-in=invalid", invalid: true},
+		{name: "hours", flag: "--expires-in=1h", duration: time.Hour},
+		{name: "days", flag: "--expires-in=1d", duration: 24 * time.Hour},
+		{name: "omitted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			var mu sync.Mutex
+			var requests []*sandrunv1.CreateApiKeyRequest
+			const procedure = sandrunv1connect.ApiKeyServiceCreateApiKeyProcedure
+			mux := http.NewServeMux()
+			mux.Handle(procedure, connect.NewUnaryHandler(procedure, func(_ context.Context, req *connect.Request[sandrunv1.CreateApiKeyRequest]) (*connect.Response[sandrunv1.CreateApiKeyResponse], error) {
+				mu.Lock()
+				requests = append(requests, req.Msg)
+				mu.Unlock()
+				return connect.NewResponse(&sandrunv1.CreateApiKeyResponse{
+					ApiKey: &sandrunv1.ApiKey{Name: "fixture"},
+					Secret: "fixture-secret",
+				}), nil
+			}))
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			f.env[EnvAPIURL] = srv.URL
+			f.httpClient = srv.Client()
+			args := []string{"--org", f.org, "api-key", "create", "--name", "fixture"}
+			if tc.flag != "" {
+				args = append(args, tc.flag)
+			}
+			start := time.Now()
+			r := f.run("", args...)
+			end := time.Now()
+
+			mu.Lock()
+			defer mu.Unlock()
+			if tc.invalid {
+				if r.code != ExitUsage || r.stdout != "" || !strings.Contains(r.stderr, "--expires-in:") {
+					t.Errorf("exit = %d, stdout = %q, stderr = %q, want an expiry usage error and empty stdout", r.code, r.stdout, r.stderr)
+				}
+				if len(requests) != 0 {
+					t.Errorf("create requests = %d, want 0", len(requests))
+				}
+				return
+			}
+			if r.code != ExitOK || r.stdout != "fixture-secret\n" || len(requests) != 1 {
+				t.Fatalf("exit = %d, stdout = %q, stderr = %q, create requests = %d, want success and 1 request", r.code, r.stdout, r.stderr, len(requests))
+			}
+			expiresAt := requests[0].GetExpiresAt()
+			if tc.duration == 0 {
+				if expiresAt != nil {
+					t.Errorf("expiry = %v, want absent", expiresAt)
+				}
+				return
+			}
+			if err := expiresAt.CheckValid(); err != nil {
+				t.Fatalf("invalid expiry: %v", err)
+			}
+			if got := expiresAt.AsTime(); got.Before(start.Add(tc.duration)) || got.After(end.Add(tc.duration)) {
+				t.Errorf("expiry = %v, want %v after a time between %v and %v", got, tc.duration, start, end)
+			}
+		})
+	}
+}
+
 func TestOutputFormats(t *testing.T) {
 	f := newFixture(t)
 	r := f.ok("", "org", "list")
@@ -563,16 +640,50 @@ func TestOutputFormats(t *testing.T) {
 	}
 }
 
+const wantGitHubInstallBrowserSignIn = "Before you open the URL, sign in to the SandRun console in the browser you will use. Use the same SandRun account you used to generate the URL."
+
+func TestGitHubInstallURLHelp(t *testing.T) {
+	f := newFixture(t)
+	r := f.ok("", "github", "install-url", "--org", f.org, "--help")
+	if !strings.Contains(r.stdout, wantGitHubInstallBrowserSignIn) || r.stderr != "" {
+		t.Errorf("help stdout = %q, stderr = %q, want the browser instruction on stdout only", r.stdout, r.stderr)
+	}
+	if calls := f.srv.Calls(sandrunv1connect.GitHubServiceCreateGitHubInstallUrlProcedure); calls != 0 {
+		t.Errorf("help made %d install URL requests, want 0", calls)
+	}
+}
+
+type gitHubInstallURLFixture struct {
+	sandrunv1connect.UnimplementedGitHubServiceHandler
+	response *sandrunv1.CreateGitHubInstallUrlResponse
+}
+
+func (f gitHubInstallURLFixture) CreateGitHubInstallUrl(context.Context, *connect.Request[sandrunv1.CreateGitHubInstallUrlRequest]) (*connect.Response[sandrunv1.CreateGitHubInstallUrlResponse], error) {
+	return connect.NewResponse(f.response), nil
+}
+
 func TestGitHubInstallURLOutput(t *testing.T) {
 	f := newFixture(t)
 	const url = "https://github.com/apps/sandrun/installations/new?state=test-state"
+	const expiry = "2030-01-02T03:04:05Z"
+	_, handler := sandrunv1connect.NewGitHubServiceHandler(gitHubInstallURLFixture{
+		response: &sandrunv1.CreateGitHubInstallUrlResponse{
+			Url:        url,
+			ExpireTime: timestamppb.New(time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)),
+		},
+	})
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	f.env[EnvAPIURL] = srv.URL
+	f.httpClient = srv.Client()
+
 	text := f.ok("", "github", "install-url", "--org", f.org)
 	if text.stdout != url+"\n" {
 		t.Errorf("text stdout = %q, want the URL and a newline", text.stdout)
 	}
-	if !strings.HasPrefix(text.stderr, "Open the URL in a browser before ") ||
-		!strings.HasSuffix(text.stderr, "; the SandRun console completes the link.\n") {
-		t.Errorf("text stderr = %q, want the browser instruction", text.stderr)
+	wantStderr := wantGitHubInstallBrowserSignIn + "\nOpen the URL before " + expiry + ". The SandRun console completes the link.\n"
+	if text.stderr != wantStderr {
+		t.Errorf("text stderr = %q, want %q", text.stderr, wantStderr)
 	}
 
 	jsonOutput := f.ok("", "github", "install-url", "--org", f.org, "--output", "json")
@@ -580,7 +691,7 @@ func TestGitHubInstallURLOutput(t *testing.T) {
 	if err := json.Unmarshal([]byte(jsonOutput.stdout), &response); err != nil {
 		t.Fatalf("decode install URL JSON: %v", err)
 	}
-	if len(response) != 2 || response["url"] != url || response["expire_time"] == "" || jsonOutput.stderr != "" {
+	if len(response) != 2 || response["url"] != url || response["expire_time"] != expiry || jsonOutput.stderr != "" {
 		t.Errorf("JSON stdout = %q, stderr = %q, want the URL and expiry on stdout only", jsonOutput.stdout, jsonOutput.stderr)
 	}
 }

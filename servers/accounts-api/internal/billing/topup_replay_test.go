@@ -58,6 +58,7 @@ func (f *fixture) wantCredit(acct string, grants, entries int) {
 
 func TestManualTopUpReplayAfterAcceptedChargeTimedOutSucceeds(t *testing.T) {
 	f := newFixture(t)
+	telemetry := f.captureGrantTelemetry()
 	acct := f.account()
 	f.activate(acct)
 
@@ -98,6 +99,7 @@ func TestManualTopUpReplayAfterAcceptedChargeTimedOutSucceeds(t *testing.T) {
 	if got := f.balance(acct); got != 25*usd {
 		t.Fatalf("balance = %d, want one credit", got)
 	}
+	telemetry.want(t, f.ledger(acct)[0])
 	if err := f.manualTopUp(acct, topUpKey); err != nil {
 		t.Fatalf("replay after the completion: %v", err)
 	}

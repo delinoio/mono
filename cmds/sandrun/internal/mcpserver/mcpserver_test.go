@@ -18,12 +18,14 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
@@ -85,7 +87,12 @@ func newHarness(t *testing.T, cfg Config) *harness {
 // returns the text content and whether the result is an error.
 func (h *harness) call(name string, args map[string]any, out any) (string, bool) {
 	h.t.Helper()
-	res, err := h.session.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+	return h.callContext(context.Background(), name, args, out)
+}
+
+func (h *harness) callContext(ctx context.Context, name string, args map[string]any, out any) (string, bool) {
+	h.t.Helper()
+	res, err := h.session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
 		h.t.Fatalf("%s: %v", name, err)
 	}
@@ -164,6 +171,79 @@ func TestToolList(t *testing.T) {
 	}
 }
 
+func TestToolArgumentErrors(t *testing.T) {
+	var clientCalls atomic.Int32
+	h := newHarness(t, Config{Client: func(context.Context) (*sandrun.Client, error) {
+		clientCalls.Add(1)
+		return nil, errors.New("unexpected client initialization")
+	}})
+
+	for _, tc := range []struct {
+		tool string
+		args string
+		want string
+	}{
+		{"wait_session", `{"session_id":"test-session","wait_seconds":"1"}`, `validating "arguments":`},
+		{"wait_session", `{"session_id":"test-session","wait_seconds":1.5}`, `validating "arguments":`},
+		{"wait_session", `{"session_id":"test-session","wait_seconds":9223372036854775808}`, "json: cannot unmarshal"},
+		{"get_session", `{}`, `validating "arguments":`},
+	} {
+		res, err := h.session.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.tool, Arguments: json.RawMessage(tc.args)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.IsError || len(res.Content) != 1 {
+			t.Fatalf("%s %s: result = %+v", tc.tool, tc.args, res)
+		}
+		msg, ok := res.Content[0].(*mcp.TextContent)
+		if !ok || !strings.HasPrefix(msg.Text, "invalid_argument: "+tc.want) {
+			t.Errorf("%s %s: content = %+v, want invalid_argument: %s", tc.tool, tc.args, res.Content[0], tc.want)
+		}
+	}
+
+	_, err := h.session.CallTool(context.Background(), &mcp.CallToolParams{Name: "unknown_tool"})
+	var rpcErr *jsonrpc.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+		t.Errorf("unknown tool error = %v, want JSON-RPC invalid params", err)
+	}
+	if n := clientCalls.Load(); n != 0 {
+		t.Errorf("invalid calls initialized %d SandRun clients", n)
+	}
+}
+
+func TestFractionalToolWaits(t *testing.T) {
+	var clientCalls atomic.Int32
+	h := newHarness(t, Config{Client: func(context.Context) (*sandrun.Client, error) {
+		clientCalls.Add(1)
+		return nil, errors.New("unexpected client initialization")
+	}})
+
+	for tool, args := range map[string]map[string]any{
+		"wait_session":    {"session_id": "test-session"},
+		"exec":            {"session_id": "test-session", "command": []string{"true"}},
+		"exec_output":     {"session_id": "test-session", "exec_id": "exec", "stderr_offset": 0, "stdout_offset": 0},
+		"sync":            {"session_id": "test-session"},
+		"download":        {"session_id": "test-session", "guest_path": "in", "local_path": "out"},
+		"transfer_status": {"transfer_id": "transfer"},
+	} {
+		for _, seconds := range []json.RawMessage{
+			json.RawMessage("1.0000000000000000001"),
+			json.RawMessage("50.0000000000000000001"),
+			json.RawMessage("1e-1000000"),
+			json.RawMessage("1e1000000"),
+		} {
+			args["wait_seconds"] = seconds
+			text, isErr := h.call(tool, args, nil)
+			if !isErr || !strings.HasPrefix(text, "invalid_argument: ") || !strings.Contains(text, "wait_seconds") {
+				t.Errorf("%s wait_seconds %s = %q, isError = %v", tool, seconds, text, isErr)
+			}
+		}
+	}
+	if n := clientCalls.Load(); n != 0 {
+		t.Errorf("fractional waits initialized %d SandRun clients", n)
+	}
+}
+
 func TestWaitLimit(t *testing.T) {
 	h := newHarness(t, Config{})
 	id := h.running()
@@ -174,8 +254,16 @@ func TestWaitLimit(t *testing.T) {
 		t.Fatalf("wait_seconds -1 accepted: %q", text)
 	}
 	var r sessionResult
-	if text, isErr := h.call("wait_session", map[string]any{"session_id": id, "wait_seconds": 50}, &r); isErr || r.Session.State != "running" {
-		t.Fatalf("wait_seconds 50 = %q %+v", text, r)
+	args := map[string]any{"session_id": id}
+	for _, wait := range []string{"0", "50", "50.0", "5e1", "50000e-3", "null"} {
+		args["wait_seconds"] = json.RawMessage(wait)
+		if text, isErr := h.call("wait_session", args, &r); isErr || r.Session.State != "running" {
+			t.Errorf("wait_seconds %s = %q %+v", wait, text, r)
+		}
+	}
+	delete(args, "wait_seconds")
+	if text, isErr := h.call("wait_session", args, &r); isErr || r.Session.State != "running" {
+		t.Errorf("omitted wait_seconds = %q %+v", text, r)
 	}
 
 	// A queued session returns its state when the wait passes.
@@ -422,13 +510,13 @@ func TestExecTimeoutRange(t *testing.T) {
 	h := newHarness(t, Config{})
 	args := map[string]any{"session_id": h.running(), "command": []string{"sh", "-c", "exit 0"}}
 
-	for _, seconds := range []int64{-1, 9223372037, 18446744074} {
-		args["timeout_seconds"] = seconds
-		if text, isErr := h.call("exec", args, nil); !isErr || !strings.HasPrefix(text, "invalid_argument:") {
-			t.Errorf("timeout_seconds %d = %q, isError = %v", seconds, text, isErr)
+	for _, seconds := range []string{"-1", "9223372037", "18446744074", "9223372036.0000000001", "1.0000000000000000001"} {
+		args["timeout_seconds"] = json.RawMessage(seconds)
+		if text, isErr := h.call("exec", args, nil); !isErr || !strings.HasPrefix(text, "invalid_argument:") || !strings.Contains(text, "timeout_seconds") {
+			t.Errorf("timeout_seconds %s = %q, isError = %v", seconds, text, isErr)
 		}
 		if got := len(h.srv.ExecRequests()); got != 0 {
-			t.Fatalf("timeout_seconds %d sent %d exec requests", seconds, got)
+			t.Fatalf("timeout_seconds %s sent %d exec requests", seconds, got)
 		}
 	}
 
@@ -448,12 +536,18 @@ func TestExecTimeoutRange(t *testing.T) {
 	if text, isErr := h.call("exec", args, nil); isErr {
 		t.Fatalf("zero timeout: %s", text)
 	}
-	requests = h.srv.ExecRequests()
-	if len(requests) != 2 {
-		t.Fatalf("got %d exec requests, want 2", len(requests))
+	delete(args, "timeout_seconds")
+	if text, isErr := h.call("exec", args, nil); isErr {
+		t.Fatalf("omitted timeout: %s", text)
 	}
-	if requests[1].GetTimeout() != nil {
-		t.Fatalf("zero timeout sent %v, want absent field", requests[1].GetTimeout())
+	requests = h.srv.ExecRequests()
+	if len(requests) != 3 {
+		t.Fatalf("got %d exec requests, want 3", len(requests))
+	}
+	for _, request := range requests[1:] {
+		if request.GetTimeout() != nil {
+			t.Errorf("zero or omitted timeout sent %v, want absent field", request.GetTimeout())
+		}
 	}
 }
 
@@ -498,6 +592,157 @@ func TestExecWithinAndBeyondWait(t *testing.T) {
 	// A timeout stops the command.
 	if _, isErr := h.call("exec", map[string]any{"session_id": id, "command": []string{"sleep", "10"}, "timeout_seconds": 1}, &r); isErr || !r.TimedOut {
 		t.Fatalf("timeout exec = %+v", r)
+	}
+}
+
+func TestRunWithWaitReturnsBeforeSDKCleanup(t *testing.T) {
+	const (
+		execID = "test-exec"
+		wait   = 20 * time.Millisecond
+	)
+	tests := []struct {
+		name         string
+		stdoutOffset int64
+		stderrOffset int64
+		events       []sandrun.ExecEvent
+		want         execResult
+	}{
+		{name: "unconfirmed"},
+		{
+			name: "started",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStarted, ExecID: execID},
+				{Kind: sandrun.ExecEventStderr, ExecID: execID, Data: []byte("log")},
+			},
+			want: execResult{
+				ExecID: execID, Running: true, NextStderrOffset: 3, Stderr: Output{Text: "log", To: 3},
+			},
+		},
+		{
+			name:         "attach output",
+			stdoutOffset: 12,
+			stderrOffset: 34,
+			events:       []sandrun.ExecEvent{{Kind: sandrun.ExecEventStdout, ExecID: execID, Offset: 12, Data: []byte("hi")}},
+			want: execResult{
+				ExecID: execID, Running: true, NextStdoutOffset: 14, NextStderrOffset: 34,
+				Stdout: Output{Text: "hi", From: 12, To: 14}, Stderr: Output{From: 34, To: 34},
+			},
+		},
+		{
+			name:         "attach missing range",
+			stdoutOffset: 12,
+			stderrOffset: 34,
+			events: []sandrun.ExecEvent{{
+				Kind: sandrun.ExecEventOutputTruncated, ExecID: execID,
+				MissingStdout: sandrun.ByteRange{From: 12, To: 16},
+			}},
+			want: execResult{
+				ExecID: execID, Running: true, NextStdoutOffset: 16, NextStderrOffset: 34,
+				Stdout: Output{From: 12, To: 16}, Stderr: Output{From: 34, To: 34},
+				OutputTruncated: []Truncated{{MissingStdout: &sandrun.ByteRange{From: 12, To: 16}}},
+			},
+		},
+	}
+	for _, tc := range tests {
+		run := func(t *testing.T) {
+			s := New(Config{maxWait: wait})
+			defer s.Close()
+			col := newCollector(tc.stdoutOffset, tc.stderrOffset)
+			if len(tc.want.OutputTruncated) > 0 {
+				// Leave room for the collector to append in place after the response.
+				col.truncated = make([]Truncated, 0, 2)
+			}
+			canceled, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			releaseSDK := sync.OnceFunc(func() { close(release) })
+			defer func() {
+				releaseSDK()
+				<-finished
+			}()
+			returned := make(chan execOutcome, 1)
+			go func() {
+				res, err := s.runWithWait(context.Background(), wait, col, func(ctx context.Context) (*sandrun.ExecResult, error) {
+					defer close(finished)
+					for _, ev := range tc.events {
+						_ = col.on(ev)
+					}
+					<-ctx.Done()
+					close(canceled)
+					<-release
+					_ = col.on(sandrun.ExecEvent{
+						Kind: sandrun.ExecEventOutputTruncated, ExecID: execID,
+						MissingStderr: sandrun.ByteRange{From: 37, To: 40},
+					})
+					return nil, ctx.Err()
+				})
+				returned <- execOutcome{res, err}
+			}()
+			<-canceled
+			var o execOutcome
+			select {
+			case o = <-returned:
+			case <-time.After(100 * time.Millisecond):
+				t.Fatal("tool still waiting while SDK cleanup is blocked")
+			}
+			if len(tc.events) == 0 {
+				if o.res != nil || !errors.Is(o.err, errExecUnconfirmed) {
+					t.Fatalf("unconfirmed call returned %+v, %v", o.res, o.err)
+				}
+				return
+			}
+			if o.res != nil || o.err != nil {
+				t.Fatalf("confirmed call returned %+v, %v", o.res, o.err)
+			}
+			got := col.result(execID, o.res)
+			releaseSDK()
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("result = %+v, want %+v", got, tc.want)
+			}
+			<-finished
+			if len(got.OutputTruncated) > 0 && &got.OutputTruncated[0] == &col.truncated[0] {
+				t.Error("response shares its truncation slice with the collector")
+			}
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, run)
+		})
+	}
+}
+
+func TestRunWithWaitStopsOnCallerCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wait time.Duration
+	}{
+		{name: "during wait", wait: MaxWait},
+		{name: "during grace", wait: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Config{})
+			t.Cleanup(s.Close)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			started, release := make(chan struct{}), make(chan struct{})
+			defer close(release)
+			returned := make(chan error, 1)
+			go func() {
+				_, err := s.runWithWait(ctx, tc.wait, newCollector(0, 0), func(ctx context.Context) (*sandrun.ExecResult, error) {
+					close(started)
+					<-release
+					return nil, ctx.Err()
+				})
+				returned <- err
+			}()
+			<-started
+			cancel()
+			select {
+			case err := <-returned:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("canceled caller received %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("tool still waiting after caller cancellation")
+			}
+		})
 	}
 }
 
@@ -770,6 +1015,108 @@ func TestExecOutputWindowAndOffsetsWithGaps(t *testing.T) {
 	}
 }
 
+func TestExecOutputWindowUTF8Boundaries(t *testing.T) {
+	prefix := strings.Repeat("a", headBytes-1)
+	for _, tc := range []struct {
+		name          string
+		events        []sandrun.ExecEvent
+		wantStdout    Output
+		wantStderr    Output
+		wantTruncated []Truncated
+	}{
+		{
+			name: "stdout gap with adjacent stderr",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStdout, Data: []byte{0xC3}},
+				{Kind: sandrun.ExecEventStderr, Data: []byte{0xC3}},
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{From: 1, To: 3}},
+				{Kind: sandrun.ExecEventStdout, Offset: 3, Data: []byte{0xA9}},
+				{Kind: sandrun.ExecEventStderr, Offset: 1, Data: []byte{0xA9}},
+			},
+			wantStdout:    Output{Text: "��", To: 4},
+			wantStderr:    Output{Text: "é", To: 2},
+			wantTruncated: []Truncated{{MissingStdout: &sandrun.ByteRange{From: 1, To: 3}}},
+		},
+		{
+			name: "stderr gap with adjacent stdout",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStderr, Data: []byte{0xC2}},
+				{Kind: sandrun.ExecEventStdout, Data: []byte{0xC2}},
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStderr: sandrun.ByteRange{From: 1, To: 3}},
+				{Kind: sandrun.ExecEventStderr, Offset: 3, Data: []byte{0xA9}},
+				{Kind: sandrun.ExecEventStdout, Offset: 1, Data: []byte{0xA9}},
+			},
+			wantStdout:    Output{Text: "©", To: 2},
+			wantStderr:    Output{Text: "��", To: 4},
+			wantTruncated: []Truncated{{MissingStderr: &sandrun.ByteRange{From: 1, To: 3}}},
+		},
+		{
+			name: "gap between head and tail",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStdout, Data: []byte(prefix + "\xC2")},
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{From: headBytes, To: headBytes + 2}},
+				{Kind: sandrun.ExecEventStdout, Offset: headBytes + 2, Data: []byte{0xA9}},
+			},
+			wantStdout:    Output{Text: prefix + "��", To: headBytes + 3},
+			wantTruncated: []Truncated{{MissingStdout: &sandrun.ByteRange{From: headBytes, To: headBytes + 2}}},
+		},
+		{
+			name: "adjacent head and tail",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStdout, Data: []byte(prefix + "\xC2")},
+				{Kind: sandrun.ExecEventStdout, Offset: headBytes, Data: []byte{0xA9}},
+			},
+			wantStdout: Output{Text: prefix + "©", To: headBytes + 1},
+		},
+		{
+			name: "leading gap",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{To: 3}},
+				{Kind: sandrun.ExecEventStdout, Offset: 3, Data: []byte{0xC2, 0xA9}},
+			},
+			wantStdout:    Output{Text: "©", To: 5},
+			wantTruncated: []Truncated{{MissingStdout: &sandrun.ByteRange{To: 3}}},
+		},
+		{
+			name: "multiple gaps in head",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStdout, Data: []byte{0xC2}},
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{From: 1, To: 3}},
+				{Kind: sandrun.ExecEventStdout, Offset: 3, Data: []byte{0xA9}},
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{From: 4, To: 6}},
+				{Kind: sandrun.ExecEventStdout, Offset: 6, Data: []byte{0xC2, 0xA9}},
+			},
+			wantStdout: Output{Text: "��©", To: 8},
+			wantTruncated: []Truncated{
+				{MissingStdout: &sandrun.ByteRange{From: 1, To: 3}},
+				{MissingStdout: &sandrun.ByteRange{From: 4, To: 6}},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCollector(0, 0)
+			for _, ev := range tc.events {
+				if err := c.on(ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := c.result("exec", nil)
+			if r.Stdout.Text != tc.wantStdout.Text || r.Stderr.Text != tc.wantStderr.Text {
+				t.Error("preview text differs from the expected text")
+			}
+			if r.Stdout.From != tc.wantStdout.From || r.Stdout.To != tc.wantStdout.To || r.NextStdoutOffset != tc.wantStdout.To || r.Stdout.Omitted != nil {
+				t.Errorf("stdout from = %d, to = %d, next = %d, omitted = %+v", r.Stdout.From, r.Stdout.To, r.NextStdoutOffset, r.Stdout.Omitted)
+			}
+			if r.Stderr.From != tc.wantStderr.From || r.Stderr.To != tc.wantStderr.To || r.NextStderrOffset != tc.wantStderr.To || r.Stderr.Omitted != nil {
+				t.Errorf("stderr from = %d, to = %d, next = %d, omitted = %+v", r.Stderr.From, r.Stderr.To, r.NextStderrOffset, r.Stderr.Omitted)
+			}
+			if !reflect.DeepEqual(r.OutputTruncated, tc.wantTruncated) {
+				t.Errorf("truncated = %+v, want %+v", r.OutputTruncated, tc.wantTruncated)
+			}
+		})
+	}
+}
+
 func TestPassEnvValuesNeverInResults(t *testing.T) {
 	needPOSIX(t)
 	const secret = "s3cr3t-value-for-test"
@@ -842,19 +1189,69 @@ func TestSyncAndDownloadThroughTransferStatus(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "main.c"), []byte("int main(){}"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h := newHarness(t, Config{WorkDir: repo})
+	type transferGate struct {
+		arrived chan struct{}
+		release <-chan struct{}
+	}
+	var activeGate atomic.Pointer[transferGate]
+	transport := toolDeadlineTransport(func(req *http.Request) (*http.Response, error) {
+		// Both SDK transfers look up the running session before moving any files.
+		if gate := activeGate.Load(); gate != nil && req.URL.Path == sandrunv1connect.DevSessionServiceGetDevSessionProcedure {
+			select {
+			case gate.arrived <- struct{}{}:
+			default:
+			}
+			select {
+			case <-gate.release:
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+	var h *harness
+	h = newHarness(t, Config{WorkDir: repo, Client: func(context.Context) (*sandrun.Client, error) {
+		return sandrun.New(sandrun.Options{BaseURL: h.srv.URL, APIKey: h.srv.APIKey,
+			HTTPClient: &http.Client{Transport: transport}})
+	}})
 	id := h.running()
 
-	var r transferResult
-	text, isErr := h.call("sync", map[string]any{"session_id": id, "wait_seconds": 0}, &r)
-	if isErr || r.TransferID == "" || r.Kind != "sync" {
-		t.Fatalf("sync = %q %+v", text, r)
+	runTransfer := func(kind string, args map[string]any) transferResult {
+		t.Helper()
+		paused, resume := context.WithCancel(t.Context())
+		defer resume()
+		gate := &transferGate{arrived: make(chan struct{}, 1), release: paused.Done()}
+		activeGate.Store(gate)
+		defer activeGate.Store(nil)
+
+		startCtx, cancelStart := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancelStart()
+		var initial transferResult
+		text, isErr := h.callContext(startCtx, kind, args, &initial)
+		if isErr || initial.TransferID == "" || initial.Kind != kind || !initial.Running ||
+			initial.Progress == nil || initial.Sync != nil || initial.Download != nil {
+			t.Fatalf("%s start = %q %+v, want a running transfer with progress only", kind, text, initial)
+		}
+		select {
+		case <-gate.arrived:
+		case <-startCtx.Done():
+			t.Fatalf("%s did not reach GetDevSession: %v", kind, startCtx.Err())
+		}
+		resume()
+
+		statusCtx, cancelStatus := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancelStatus()
+		var terminal transferResult
+		text, isErr = h.callContext(statusCtx, "transfer_status", map[string]any{"transfer_id": initial.TransferID}, &terminal)
+		if isErr || terminal.TransferID != initial.TransferID || terminal.Kind != kind || terminal.Running || terminal.Progress != nil {
+			t.Fatalf("%s transfer_status = %q %+v, want the terminal result for %s", kind, text, terminal, initial.TransferID)
+		}
+		return terminal
 	}
-	if r.Running && r.Progress == nil {
-		t.Fatal("a running transfer has no progress")
-	}
-	if text, isErr := h.call("transfer_status", map[string]any{"transfer_id": r.TransferID}, &r); isErr || r.Running || r.Sync == nil || r.Sync.Uploaded != 1 {
-		t.Fatalf("transfer_status = %q %+v", text, r)
+
+	synced := runTransfer("sync", map[string]any{"session_id": id, "wait_seconds": 0})
+	if synced.Sync == nil || synced.Sync.Uploaded != 1 || synced.Download != nil {
+		t.Fatalf("sync result = %+v, want one uploaded file", synced)
 	}
 	if b, err := os.ReadFile(filepath.Join(h.ws, "main.c")); err != nil || string(b) != "int main(){}" {
 		t.Fatal("the sync did not copy the file")
@@ -863,15 +1260,15 @@ func TestSyncAndDownloadThroughTransferStatus(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(h.ws, "a.out"), []byte("built"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	text, isErr = h.call("download", map[string]any{"session_id": id, "guest_path": "a.out", "local_path": "out/a.out", "wait_seconds": 0}, &r)
-	if isErr || r.TransferID == "" || r.Kind != "download" {
-		t.Fatalf("download = %q %+v", text, r)
+	downloaded := runTransfer("download", map[string]any{
+		"session_id": id, "guest_path": "a.out", "local_path": "out/a.out", "wait_seconds": 0,
+	})
+	localPath := filepath.Join(repo, "out/a.out")
+	if downloaded.Download == nil || downloaded.Download.Files != 1 || downloaded.Download.LocalPath != localPath || downloaded.Sync != nil {
+		t.Fatalf("download result = %+v, want one file at %s", downloaded, localPath)
 	}
-	if text, isErr = h.call("transfer_status", map[string]any{"transfer_id": r.TransferID}, &r); isErr || r.Running {
-		t.Fatalf("transfer_status = %q %+v", text, r)
-	}
-	if r.Download == nil || r.Download.Files != 1 || r.Download.LocalPath != filepath.Join(repo, "out/a.out") {
-		t.Fatalf("download result %+v", r)
+	if b, err := os.ReadFile(localPath); err != nil || string(b) != "built" {
+		t.Fatalf("downloaded file = %q, err = %v, want %q", b, err, "built")
 	}
 	if text, isErr := h.call("transfer_status", map[string]any{"transfer_id": "missing"}, nil); !isErr || !strings.HasPrefix(text, "not_found") {
 		t.Fatalf("unknown transfer = %q", text)

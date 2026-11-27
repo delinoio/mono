@@ -100,10 +100,31 @@ func TestCleanupDropsGeneratedDatabase(t *testing.T) {
 
 func TestCleanupDatabaseSucceeds(t *testing.T) {
 	admin := URL(t)
+	var name string
+	if !t.Run("create", func(t *testing.T) {
+		child := NewEmptyURL(t)
+		cfg, err := pgx.ParseConfig(child)
+		if err != nil {
+			t.Fatal("parse child database configuration failed")
+		}
+		name = cfg.Database
+		if !databaseExists(t, admin, name) {
+			t.Fatalf("database %s missing while the test runs", name)
+		}
+	}) {
+		return
+	}
+	if databaseExists(t, admin, name) {
+		t.Fatalf("database %s still exists after cleanup", name)
+	}
+
 	rec := &recordingTB{TB: t}
-	cleanupDatabase(rec, admin, "accounts_test_does_not_exist")
+	cleanupDatabase(rec, admin, name)
 	if len(rec.errors) != 0 {
 		t.Errorf("cleanup of a missing database reported errors: %q", rec.errors)
+	}
+	if databaseExists(t, admin, name) {
+		t.Errorf("database %s exists after the second cleanup", name)
 	}
 }
 
