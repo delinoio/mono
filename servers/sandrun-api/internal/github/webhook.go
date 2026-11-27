@@ -638,14 +638,29 @@ func (l *Layer) installationEvent(ctx context.Context, tx pgx.Tx, body []byte, o
 	if ev.Installation.ID <= 0 {
 		return o.ignore("no installation")
 	}
-	inst, err := l.byGitHubID(ctx, tx, ev.Installation.ID, lockUpdate)
+	inst, err := l.byGitHubID(ctx, tx, ev.Installation.ID, lockNone)
 	if err != nil {
 		return err
 	}
 	if inst == nil {
 		return o.ignore("installation not linked")
 	}
-	o.organizationID = inst.OrganizationID
+	org := inst.OrganizationID
+	o.organizationID = org
+	// Organization deletion locks the organization before work and cascades
+	// to the installation. Lock the organization first, then recheck the link.
+	if err := api.LockOrganizationShare(ctx, tx, org); err != nil {
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			return o.ignore("organization is being deleted")
+		}
+		return err
+	}
+	if inst, err = l.byGitHubID(ctx, tx, ev.Installation.ID, lockUpdate); err != nil {
+		return err
+	}
+	if inst == nil || inst.OrganizationID != org {
+		return o.ignore("installation not linked to this organization")
+	}
 	now := l.svc.NowUTC()
 	if login := ev.Installation.Account.Login; login != "" && login != inst.Login {
 		if _, err := tx.Exec(ctx, "UPDATE github_installations SET github_account_login = $2, update_time = $3 WHERE installation_id = $1", inst.ID, login, now); err != nil {
@@ -684,7 +699,6 @@ func (l *Layer) installationEvent(ctx context.Context, tx pgx.Tx, body []byte, o
 	if err != nil {
 		return err
 	}
-	org := inst.OrganizationID
 	o.after = append(o.after, func(ctx context.Context) {
 		for _, id := range deleted {
 			l.engine.DeleteSandboxOf(ctx, org, id)

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import {
+  create,
+  type DescEnum,
+  type MessageInitShape,
+} from "@bufbuild/protobuf";
 import {
   type Duration,
   DurationSchema,
@@ -45,11 +49,14 @@ import {
   Priority,
   RequestEndReason,
   RequestState,
+  RequestStateSchema,
   Role,
   RunnerEndReason,
   ResourcesSchema,
   RunnerState,
+  RunnerStateSchema,
   WorkloadKind,
+  WorkloadKindSchema,
 } from "@delino/sandrun-protos/v1/common_pb";
 import {
   type DevSession,
@@ -100,6 +107,13 @@ import {
   TERMINAL_RUNNER_STATES,
   timestampMs,
 } from "../format.ts";
+import {
+  MAX_DISK_GIB,
+  MAX_MEMORY_MIB,
+  MAX_QUEUE_WAIT_MS,
+  MAX_TTL_MS,
+  MAX_VCPU_COUNT,
+} from "../forms.ts";
 import {
   AGENT_INTEGRATION_NAME_LIMIT,
   API_KEY_NAME_LIMIT,
@@ -161,6 +175,13 @@ export const MOCK_IDS = {
 const OTHER_ADMIN = "mock-user-ada";
 const OTHER_MEMBER = "mock-user-lin";
 const LATER_MEMBER = "mock-user-nora";
+
+const IDLE_GITHUB_RUNNER_STATES = new Set([
+  RunnerState.CREATING,
+  RunnerState.PREPARING,
+  RunnerState.WARM,
+  RunnerState.WAITING_FOR_WORK,
+]);
 
 const OPEN_RUNNER_STATES: ReadonlySet<RunnerState> = new Set([
   RunnerState.CREATING,
@@ -810,6 +831,21 @@ function page<T>(
   return { items: slice, nextPageToken: next };
 }
 
+function validateListFilter(
+  field: string,
+  schema: DescEnum,
+  values: readonly number[],
+): void {
+  for (const value of values) {
+    if (schema.value[value] === undefined) {
+      throw new ConnectError(
+        `invalid ${field}: must be a defined ${schema.name} value`,
+        Code.InvalidArgument,
+      );
+    }
+  }
+}
+
 function hasPath(mask: FieldMask | undefined, path: string): boolean {
   return mask?.paths.includes(path) ?? false;
 }
@@ -819,6 +855,8 @@ export interface MockTransportOptions {
   userId?: string;
   /** The Acme runner profile count. Larger lists put linux-build last. */
   runnerProfileCount?: number;
+  /** Fail the first Acme roster continuation for retry tests. Default: true. */
+  failFirstAcmeMemberContinuation?: boolean;
   /** Caps integration pages and seeds a profile that uses the second page. */
   agentIntegrationPageSize?: number;
   /** Adds work fixtures to seeded organizations without changing the defaults. */
@@ -871,7 +909,7 @@ export function createMockTransport(
       ),
     );
   }
-  let failAcmeContinuation = true;
+  let failAcmeContinuation = options.failFirstAcmeMemberContinuation ?? true;
   const watchers = new Map<string, Set<Watcher>>();
   const issuedStates = new Map<
     string,
@@ -1289,6 +1327,19 @@ export function createMockTransport(
             k.revokedAt = ts();
           }
         }
+        for (const r of org.requests) {
+          if (
+            r.kind === WorkloadKind.DEV_SESSION &&
+            r.state === RequestState.QUEUED &&
+            r.ownerUserId === m.userId
+          )
+            endRequest(
+              org,
+              r,
+              RequestState.CANCELED,
+              RequestEndReason.MEMBER_REMOVED,
+            );
+        }
         audit(
           org,
           AuditAction.MEMBER_REMOVED,
@@ -1542,6 +1593,16 @@ export function createMockTransport(
               RequestEndReason.INTEGRATION_REMOVED,
             );
         }
+        for (const r of org.runners) {
+          if (
+            r.kind === WorkloadKind.GITHUB_JOB &&
+            r.githubInstallationId === i.githubInstallationId &&
+            r.requestId === "" &&
+            IDLE_GITHUB_RUNNER_STATES.has(r.state)
+          ) {
+            endRunner(org, r, RunnerEndReason.CLEAN_UP);
+          }
+        }
         audit(
           org,
           AuditAction.GITHUB_INSTALLATION_UNLINKED,
@@ -1720,6 +1781,9 @@ export function createMockTransport(
       },
       listRunnerProfiles(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("workload_kind", WorkloadKindSchema, [
+          req.workloadKind,
+        ]);
         const items = org.profiles.filter(
           (p) =>
             req.workloadKind === WorkloadKind.UNSPECIFIED ||
@@ -1761,6 +1825,24 @@ export function createMockTransport(
               break;
             case "resources":
               next.resources = input.resources;
+              break;
+            case "resources.vcpu_count":
+              next.resources = {
+                ...(next.resources ?? create(ResourcesSchema)),
+                vcpuCount: input.resources?.vcpuCount ?? 0,
+              };
+              break;
+            case "resources.memory_mib":
+              next.resources = {
+                ...(next.resources ?? create(ResourcesSchema)),
+                memoryMib: input.resources?.memoryMib ?? 0n,
+              };
+              break;
+            case "resources.disk_gib":
+              next.resources = {
+                ...(next.resources ?? create(ResourcesSchema)),
+                diskGib: input.resources?.diskGib ?? 0n,
+              };
               break;
             case "network_mode":
               next.networkMode = input.networkMode;
@@ -1855,24 +1937,28 @@ export function createMockTransport(
     router.service(WorkService, {
       listRequests(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("kind", WorkloadKindSchema, [req.kind]);
+        validateListFilter("states", RequestStateSchema, req.states);
+        const hasStateFilter = req.states.length > 0;
         const active = org.requests
           .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
           .sort(compareQueueOrder);
-        const ended = req.includeEnded
-          ? org.requests
-              .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
-              .sort(
-                (a, b) =>
-                  compareTimestamps(b.endedAt, a.endedAt) ||
-                  a.requestId.localeCompare(b.requestId),
-              )
-          : [];
+        const ended =
+          hasStateFilter || req.includeEnded
+            ? org.requests
+                .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
+                .sort(
+                  (a, b) =>
+                    compareTimestamps(b.endedAt, a.endedAt) ||
+                    a.requestId.localeCompare(b.requestId),
+                )
+            : [];
         const items = [...active, ...ended].filter(
           (r) =>
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
             (req.kind === WorkloadKind.UNSPECIFIED || r.kind === req.kind) &&
-            (req.states.length === 0 || req.states.includes(r.state)),
+            (!hasStateFilter || req.states.includes(r.state)),
         );
         const p = page(items, req);
         return { requests: p.items, nextPageToken: p.nextPageToken };
@@ -1911,12 +1997,14 @@ export function createMockTransport(
       },
       listRunners(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("states", RunnerStateSchema, req.states);
         const items = org.runners.filter(
           (r) =>
-            (req.includeEnded || !TERMINAL_RUNNER_STATES.has(r.state)) &&
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
-            (req.states.length === 0 || req.states.includes(r.state)),
+            (req.states.length > 0
+              ? req.states.includes(r.state)
+              : req.includeEnded || !TERMINAL_RUNNER_STATES.has(r.state)),
         );
         const p = page(items, req);
         return { runners: p.items, nextPageToken: p.nextPageToken };
@@ -1934,6 +2022,12 @@ export function createMockTransport(
         const r = org.runners.find((x) => x.runnerId === req.runnerId);
         if (r === undefined)
           throw new ConnectError("runner not found", Code.NotFound);
+        if (
+          r.state === RunnerState.DELETING ||
+          TERMINAL_RUNNER_STATES.has(r.state)
+        ) {
+          return { runner: r };
+        }
         endRunner(org, r, RunnerEndReason.DELETED_BY_USER);
         audit(
           org,
@@ -2097,15 +2191,17 @@ export function createMockTransport(
         );
         if (k === undefined)
           throw new ConnectError("API key not found", Code.NotFound);
-        k.state = ApiKeyState.REVOKED;
-        k.revokedAt = ts();
-        audit(
-          org,
-          AuditAction.API_KEY_REVOKED,
-          AuditTargetKind.API_KEY,
-          k.apiKeyId,
-          userId,
-        );
+        if (k.state !== ApiKeyState.REVOKED) {
+          k.state = ApiKeyState.REVOKED;
+          k.revokedAt = ts();
+          audit(
+            org,
+            AuditAction.API_KEY_REVOKED,
+            AuditTargetKind.API_KEY,
+            k.apiKeyId,
+            userId,
+          );
+        }
         const { userId: _u, ...apiKey } = k;
         return { apiKey };
       },
@@ -2149,9 +2245,9 @@ export function createMockTransport(
       },
       listDevSessions(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("states", RequestStateSchema, req.states);
         const items = org.devSessions.filter(
           (s) =>
-            (req.includeEnded || !TERMINAL_REQUEST_STATES.has(s.state)) &&
             (req.owner.case !== "ownedByCaller" ||
               !req.owner.value ||
               s.ownerUserId === userId) &&
@@ -2159,7 +2255,9 @@ export function createMockTransport(
               s.ownerUserId === req.owner.value) &&
             (req.runnerProfileId === "" ||
               s.runnerProfileId === req.runnerProfileId) &&
-            (req.states.length === 0 || req.states.includes(s.state)),
+            (req.states.length > 0
+              ? req.states.includes(s.state)
+              : req.includeEnded || !TERMINAL_REQUEST_STATES.has(s.state)),
         );
         const p = page(items, req);
         return { devSessions: p.items, nextPageToken: p.nextPageToken };
@@ -2250,9 +2348,29 @@ const VENDOR_CREDENTIAL_CASE: Record<AgentVendor, string | undefined> = {
 
 /** The runner profile rules of the control plane contract. */
 function validateProfile(p: RunnerProfile): void {
-  const fail = (message: string) => {
+  function fail(message: string): never {
     throw new ConnectError(message, Code.InvalidArgument);
-  };
+  }
+
+  function durationMilliseconds(
+    field: string,
+    duration: Duration | undefined,
+  ): bigint {
+    if (
+      duration === undefined ||
+      duration.seconds < 0n ||
+      duration.seconds > 315_576_000_000n ||
+      duration.nanos < 0 ||
+      duration.nanos >= 1_000_000_000 ||
+      (duration.seconds === 0n && duration.nanos === 0)
+    )
+      fail(`${field} must be a valid positive duration`);
+    if (duration.nanos % 1_000_000 !== 0)
+      fail(`${field} must be a whole number of milliseconds`);
+
+    return duration.seconds * 1_000n + BigInt(duration.nanos / 1_000_000);
+  }
+
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(p.name) || p.name.length > 40)
     fail("name must be lowercase kebab-case with 1 to 40 characters");
   if (p.workloadKind === WorkloadKind.UNSPECIFIED)
@@ -2280,12 +2398,21 @@ function validateProfile(p: RunnerProfile): void {
     r.diskGib <= 0n
   )
     fail("resources must be greater than zero");
-  const seconds = (d: Duration | undefined) =>
-    d === undefined ? 0 : Number(d.seconds);
-  if (seconds(p.idleTtl) <= 0) fail("idle_ttl must be greater than zero");
-  if (seconds(p.maxTtl) <= 0 || seconds(p.maxTtl) > 7 * 86400)
-    fail("max_ttl must be at most 7 days");
-  if (seconds(p.maxQueueWait) <= 0 || seconds(p.maxQueueWait) > 86400)
+  if (r.vcpuCount > MAX_VCPU_COUNT)
+    fail(`invalid resources.vcpu_count: must be at most ${MAX_VCPU_COUNT}`);
+  if (r.memoryMib > BigInt(MAX_MEMORY_MIB))
+    fail(`invalid resources.memory_mib: must be at most ${MAX_MEMORY_MIB}`);
+  if (r.diskGib > BigInt(MAX_DISK_GIB))
+    fail(`invalid resources.disk_gib: must be at most ${MAX_DISK_GIB}`);
+
+  const idleTtl = durationMilliseconds("idle_ttl", p.idleTtl);
+  const maxTtl = durationMilliseconds("max_ttl", p.maxTtl);
+  if (maxTtl > BigInt(MAX_TTL_MS)) fail("max_ttl must be at most 7 days");
+  if (idleTtl > maxTtl)
+    fail("invalid ttl: invalid idle_ttl: must not be greater than max_ttl");
+
+  const maxQueueWait = durationMilliseconds("max_queue_wait", p.maxQueueWait);
+  if (maxQueueWait > BigInt(MAX_QUEUE_WAIT_MS))
     fail("max_queue_wait must be at most 24 hours");
   if (p.warmCount < 0 || p.warmCount > 10) fail("warm_count must be 0 to 10");
 }

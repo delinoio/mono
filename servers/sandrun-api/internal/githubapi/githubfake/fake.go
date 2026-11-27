@@ -64,6 +64,8 @@ type Fake struct {
 	JITGate func()
 	// DeleteGate runs before the fake serves a runner deletion, without the fake lock.
 	DeleteGate func(runnerID int64)
+	// RunnerGroupsGate runs before the fake serves a runner group listing, without the fake lock.
+	RunnerGroupsGate func()
 }
 
 // Installation is a fake installation.
@@ -265,6 +267,14 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		if gate != nil {
 			id, _ := strconv.ParseInt(parts[4], 10, 64)
 			gate(id)
+		}
+	}
+	if r.Method == http.MethodGet && len(parts) == 4 && parts[0] == "orgs" && parts[2] == "actions" && parts[3] == "runner-groups" {
+		f.mu.Lock()
+		gate := f.RunnerGroupsGate
+		f.mu.Unlock()
+		if gate != nil {
+			gate()
 		}
 	}
 	f.mu.Lock()
